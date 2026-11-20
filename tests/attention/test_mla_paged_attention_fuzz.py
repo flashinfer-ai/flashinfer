@@ -37,14 +37,6 @@ LEDGER = FuzzLedger(
     "batch-mla",
     [
         Finding(
-            match=lambda mutation: (
-                mutation in ("page_id_out_of_pool", "page_id_negative", "kv_pool_short")
-            ),
-            backend="cutlass",
-            reason="#6741: CUTLASS does not validate page indices against the runtime KV pool",
-            quarantine=True,
-        ),
-        Finding(
             match=lambda phase: phase == "poisoned_padding",
             backend="cutlass",
             reason="#6860: CUTLASS MLA propagates NaNs from last-page tails and dense-table padding",
@@ -650,9 +642,23 @@ def test_mla_fuzz_graph_replan(backend, lse_mode, workspace):
         kv_layout="adjacent",
     )
     if backend == "cutlass":
-        cfg = replace(cfg, q_lengths=(1, 1, 1), heads=128)
+        cfg = replace(
+            cfg,
+            q_lengths=(1, 1, 1),
+            heads=128,
+            metadata_form="dense",
+            metadata_device="cuda",
+        )
     with _case(cfg, backend, "graph_replan"):
         p = make_problem(cfg, poison_padding=False)
+        if backend == "cutlass":
+            table = p.metadata.block_tables
+            p.metadata = replace(
+                p.metadata,
+                block_tables=torch.nn.functional.pad(
+                    table, (0, -table.shape[1] % (128 // cfg.page_size))
+                ),
+            )
         wrapper = _wrapper(p, backend, workspace, graph=True)
         out = torch.empty((*p.q.shape[:2], CKV), dtype=cfg.dtype, device=p.q.device)
         lse = torch.empty(p.q.shape[:2], dtype=torch.float32, device=p.q.device)
@@ -679,6 +685,14 @@ def test_mla_fuzz_graph_replan(backend, lse_mode, workspace):
         other = make_problem(
             replace(cfg, q_lengths=cfg.q_lengths[:2], kv_lengths=(31, 65))
         )
+        if backend == "cutlass":
+            table = other.metadata.block_tables
+            other.metadata = replace(
+                other.metadata,
+                block_tables=torch.nn.functional.pad(
+                    table, (0, -table.shape[1] % (128 // cfg.page_size))
+                ),
+            )
         # Non-FA graph plans reject all replanning as a lifecycle error.
         error = RuntimeError if backend == "cutlass" else CLEAN_ERRORS
         message = (
@@ -836,3 +850,48 @@ def test_mla_problem_seed_and_padding():
     assert all(first.nan_page not in ids for ids in first.pages)
     for ids, length in zip(first.pages, cfg.kv_lengths, strict=True):
         assert torch.isnan(first.cache[ids[-1], length % cfg.page_size :]).all()
+
+
+@pytest.mark.parametrize("metadata_form", ["csr", "dense"])
+@pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
+def test_mla_cutlass_planned_metadata_cross_stream(
+    workspace, metadata_form, metadata_device
+):
+    _require_backend("cutlass")
+    cfg = Config(
+        0,
+        (1, 1),
+        (63, 129),
+        heads=128,
+        page_size=64,
+        dtype=torch.bfloat16,
+        metadata_form=metadata_form,
+        metadata_device=metadata_device,
+        query_layout="packed",
+        kv_layout="packed",
+        lse_mode="none",
+    )
+    p = make_problem(cfg, poison_padding=False)
+    if metadata_form == "csr":
+        ids = p.metadata.kv_indices
+        # Unused capacity after kv_indptr[-1] does not address the pool.
+        p.metadata = replace(
+            p.metadata, kv_indices=torch.cat((ids, ids.new_tensor([p.cache.size(0)])))
+        )
+    reference = reference_mla(p)
+    torch.cuda.synchronize()
+    plan_stream, run_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(plan_stream):
+        torch.cuda._sleep(2_000_000)
+        wrapper = _wrapper(p, "cutlass", workspace)
+    # Caller metadata may change as soon as plan returns.
+    if metadata_form == "csr":
+        p.metadata.kv_indices.fill_(-1)
+        p.metadata.kv_len_arr.zero_()
+    else:
+        p.metadata.block_tables.fill_(-1)
+        p.metadata.seq_lens.zero_()
+    with torch.cuda.stream(run_stream):
+        out = wrapper.run(query=p.query, kv_cache=p.kv_cache)
+    run_stream.synchronize()
+    _check_numeric(out, None, p, reference)

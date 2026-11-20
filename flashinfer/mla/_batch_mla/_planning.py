@@ -8,9 +8,11 @@ you may not use this file except in compliance with the License.
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from functools import wraps
+from itertools import pairwise
 import math
 from typing import Any, Callable, Iterator, Literal, Optional, TypeVar, cast
 
+import numpy as np
 import torch
 
 from ._contracts import MLAPlanMetadata, MLAStructuralInputKind
@@ -21,11 +23,20 @@ _PlanResultT = TypeVar("_PlanResultT")
 
 
 @dataclass(frozen=True)
+class _HostPlanRows:
+    q_lengths: np.ndarray
+    kv_lengths: np.ndarray
+    page_counts: np.ndarray
+    kv_indptr: Optional[np.ndarray] = None
+
+
+@dataclass(frozen=True)
 class _CSRPlanMetadata:
     qo_indptr: torch.Tensor
     kv_indptr: torch.Tensor
     kv_indices: torch.Tensor
     kv_len_arr: torch.Tensor
+    host_rows: Optional[_HostPlanRows] = None
 
 
 @dataclass(frozen=True)
@@ -34,6 +45,7 @@ class _DensePlanMetadata:
     block_tables: torch.Tensor
     seq_lens: torch.Tensor
     max_q_len: int
+    host_rows: Optional[_HostPlanRows] = None
 
 
 def _validate_metadata_tensor(
@@ -63,22 +75,16 @@ def _validate_metadata_tensor(
     return tensor
 
 
-def _indptr_values(name: str, indptr: torch.Tensor) -> torch.Tensor:
+def _indptr_values(name: str, indptr: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
     if indptr.numel() == 0:
         raise ValueError(f"{name} metadata must contain at least one element.")
-    values = indptr.to(device="cpu", dtype=torch.int64)
-    if int(values[0].item()) != 0:
+    values = indptr.to(device="cpu", dtype=torch.int64).numpy()
+    if values[0] != 0:
         raise ValueError(f"{name} metadata must start at zero.")
-    if bool(torch.any(values[1:] < values[:-1]).item()):
+    counts = np.diff(values)
+    if (counts < 0).any():
         raise ValueError(f"{name} metadata must be nondecreasing.")
-    return values
-
-
-def _max_q_len(cum_seq_lens_q: torch.Tensor) -> int:
-    values = _indptr_values("cum_seq_lens_q", cum_seq_lens_q)
-    if values.numel() <= 1:
-        return 0
-    return int((values[1:] - values[:-1]).max().item())
+    return values, counts
 
 
 def _validate_csr_metadata(
@@ -105,37 +111,31 @@ def _validate_csr_metadata(
     validated_kv_len_arr = _validate_metadata_tensor(
         "kv_len_arr", kv_len_arr, rank=1, device=device
     )
-    qo_values = _indptr_values("qo_indptr", validated_qo_indptr)
-    kv_values = _indptr_values("kv_indptr", validated_kv_indptr)
-    batch_size = qo_values.numel() - 1
+    qo_values, q_lengths = _indptr_values("qo_indptr", validated_qo_indptr)
+    kv_values, actual_pages = _indptr_values("kv_indptr", validated_kv_indptr)
+    batch_size = qo_values.size - 1
     has_canonical_batch_shape = (
-        kv_values.numel() == batch_size + 1
-        and validated_kv_len_arr.numel() == batch_size
+        kv_values.size == batch_size + 1 and validated_kv_len_arr.numel() == batch_size
     )
     if strict and not has_canonical_batch_shape:
         raise ValueError(
             "CSR metadata batch dimensions must agree: "
             f"qo_indptr describes {batch_size}, kv_indptr describes "
-            f"{kv_values.numel() - 1}, and kv_len_arr has "
+            f"{kv_values.size - 1}, and kv_len_arr has "
             f"{validated_kv_len_arr.numel()} entries."
         )
-    kv_end = int(kv_values[-1].item())
+    kv_end = int(kv_values[-1])
     if (strict or has_canonical_batch_shape) and kv_end > validated_kv_indices.numel():
         raise ValueError(
             f"kv_indices metadata has {validated_kv_indices.numel()} entries but "
             f"kv_indptr[-1] is {kv_end}."
         )
-    kv_lens_values = validated_kv_len_arr.to(device="cpu", dtype=torch.int64)
-    if bool(torch.any(kv_lens_values < 0).item()):
+    kv_lens_values = validated_kv_len_arr.to(device="cpu", dtype=torch.int64).numpy()
+    if (kv_lens_values < 0).any():
         raise ValueError("kv_len_arr metadata must be nonnegative.")
     if strict or has_canonical_batch_shape:
-        expected_pages = torch.div(
-            kv_lens_values + page_size - 1,
-            page_size,
-            rounding_mode="floor",
-        )
-        actual_pages = kv_values[1:] - kv_values[:-1]
-        if not torch.equal(expected_pages, actual_pages):
+        expected_pages = (kv_lens_values + page_size - 1) // page_size
+        if not np.array_equal(expected_pages, actual_pages):
             raise ValueError(
                 "CSR metadata page counts in kv_indptr must equal ceil(kv_len_arr / "
                 "page_size)."
@@ -145,6 +145,7 @@ def _validate_csr_metadata(
         kv_indptr=validated_kv_indptr,
         kv_indices=validated_kv_indices,
         kv_len_arr=validated_kv_len_arr,
+        host_rows=_HostPlanRows(q_lengths, kv_lens_values, actual_pages, kv_values),
     )
 
 
@@ -169,7 +170,7 @@ def _validate_dense_metadata(
     validated_seq_lens = _validate_metadata_tensor(
         "seq_lens", seq_lens, rank=1, device=device
     )
-    _indptr_values("cum_seq_lens_q", validated_cum_seq_lens_q)
+    qo_values, q_lengths = _indptr_values("cum_seq_lens_q", validated_cum_seq_lens_q)
     batch_size = validated_cum_seq_lens_q.numel() - 1
     if (
         validated_block_tables.shape[0] != batch_size
@@ -181,18 +182,11 @@ def _validate_dense_metadata(
             f"{validated_block_tables.shape[0]}, and seq_lens has "
             f"{validated_seq_lens.numel()}."
         )
-    seq_lens_values = validated_seq_lens.to(device="cpu", dtype=torch.int64)
-    if bool(torch.any(seq_lens_values < 0).item()):
+    seq_lens_values = validated_seq_lens.to(device="cpu", dtype=torch.int64).numpy()
+    if (seq_lens_values < 0).any():
         raise ValueError("seq_lens metadata must be nonnegative.")
-    live_pages = torch.div(
-        seq_lens_values + page_size - 1,
-        page_size,
-        rounding_mode="floor",
-    )
-    if (
-        live_pages.numel()
-        and int(live_pages.max().item()) > validated_block_tables.shape[1]
-    ):
+    live_pages = (seq_lens_values + page_size - 1) // page_size
+    if live_pages.max(initial=0) > validated_block_tables.shape[1]:
         raise ValueError(
             "block_tables metadata width is smaller than the live page count "
             "implied by seq_lens and page_size."
@@ -208,7 +202,7 @@ def _validate_dense_metadata(
                 f"{table_width_alignment}, got {validated_block_tables.shape[1]}."
             )
 
-    actual_max_q_len = _max_q_len(validated_cum_seq_lens_q)
+    actual_max_q_len = int(q_lengths.max(initial=0))
     if max_q_len is None:
         resolved_max_q_len = actual_max_q_len
     elif not isinstance(max_q_len, int) or isinstance(max_q_len, bool):
@@ -225,6 +219,7 @@ def _validate_dense_metadata(
         block_tables=validated_block_tables,
         seq_lens=validated_seq_lens,
         max_q_len=resolved_max_q_len,
+        host_rows=_HostPlanRows(q_lengths, seq_lens_values, live_pages),
     )
 
 
@@ -267,9 +262,14 @@ def _derive_dense_from_csr(
     *,
     table_width_alignment: Optional[int],
 ) -> _DensePlanMetadata:
-    kv_indptr_host = csr.kv_indptr.to(device="cpu", dtype=torch.int64)
-    page_counts = kv_indptr_host[1:] - kv_indptr_host[:-1]
-    max_pages = int(page_counts.max().item()) if page_counts.numel() else 0
+    if csr.host_rows is not None and csr.host_rows.kv_indptr is not None:
+        offsets = csr.host_rows.kv_indptr
+        page_counts = csr.host_rows.page_counts
+        q_lengths = csr.host_rows.q_lengths
+    else:
+        offsets, page_counts = _indptr_values("kv_indptr", csr.kv_indptr)
+        _, q_lengths = _indptr_values("qo_indptr", csr.qo_indptr)
+    max_pages = int(page_counts.max(initial=0))
     if table_width_alignment is None:
         table_width = max(1, max_pages)
     else:
@@ -280,20 +280,19 @@ def _derive_dense_from_csr(
             * table_width_alignment,
         )
     block_tables = torch.zeros(
-        (page_counts.numel(), table_width),
+        (page_counts.size, table_width),
         dtype=torch.int32,
         device=csr.kv_indices.device,
     )
-    for row in range(page_counts.numel()):
-        start = int(kv_indptr_host[row].item())
-        end = int(kv_indptr_host[row + 1].item())
+    for row, (start, end) in enumerate(pairwise(offsets.tolist())):
         if end > start:
             block_tables[row, : end - start].copy_(csr.kv_indices[start:end])
     return _DensePlanMetadata(
         cum_seq_lens_q=csr.qo_indptr,
         block_tables=block_tables,
         seq_lens=csr.kv_len_arr,
-        max_q_len=_max_q_len(csr.qo_indptr),
+        max_q_len=int(q_lengths.max(initial=0)),
+        host_rows=csr.host_rows,
     )
 
 
@@ -493,7 +492,7 @@ class _MLAPlanMetadataResolver:
         return self._derive_csr(self._validate_dense(None))
 
     def _csr_for_dense(self) -> _CSRPlanMetadata:
-        csr = self._validate_csr()
+        csr = self.resolve_csr()
         # Historical flat CSR accepts independent batch-array sizes for FA.
         # Such metadata cannot describe one dense row per request.
         if (
@@ -552,6 +551,7 @@ class _MLAPlanMetadataResolver:
             block_tables=dense.block_tables.to(device=self.device, non_blocking=True),
             seq_lens=dense.seq_lens.to(device=self.device, non_blocking=True),
             max_q_len=dense.max_q_len,
+            host_rows=dense.host_rows,
         )
 
     def resolve_device_dense(
@@ -761,6 +761,10 @@ class _MLAPlanArguments:
     def csr(self) -> _CSRPlanMetadata:
         self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_csr()
+
+    def csr_for_dense(self) -> _CSRPlanMetadata:
+        self._record_metadata_argument_access()
+        return self._metadata_resolver._csr_for_dense()
 
     def dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
         self._record_metadata_argument_access()

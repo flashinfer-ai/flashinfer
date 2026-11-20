@@ -6,9 +6,11 @@ you may not use this file except in compliance with the License.
 """
 
 import functools
+from itertools import pairwise
 import math
 from typing import ClassVar, Optional, Union, cast
 
+import numpy as np
 import torch
 
 from ....autotuner import TunableRunner
@@ -19,6 +21,7 @@ from ._capabilities import (
     _BackendPlanUnsupportedError,
     plan_capability_rejection_reason,
 )
+from .._planning import _CSRPlanMetadata, _DensePlanMetadata, _validate_dense_metadata
 from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
 from .._contracts import _resolve_structural_mla_input
 
@@ -42,16 +45,12 @@ def _validate_cutlass_page_size(page_size: int) -> int:
     return 128 // page_size
 
 
-def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
+def _check_cutlass_inputs(q_nope_pe, ckv_kpe_cache):
     if q_nope_pe.ndim != 3:
         raise ValueError(f"Expected q_nope_pe.ndim == 3, got {q_nope_pe.ndim}")
     if ckv_kpe_cache.ndim != 3:
         raise ValueError(f"Expected ckv_kpe_cache.ndim == 3, got {ckv_kpe_cache.ndim}")
-    if kv_len.ndim != 1:
-        raise ValueError(f"Expected kv_len.ndim == 1, got {kv_len.ndim}")
-    if page_table.ndim != 2:
-        raise ValueError(f"Expected page_table.ndim == 2, got {page_table.ndim}")
-    B_q, H, D_q = q_nope_pe.shape
+    _, H, D_q = q_nope_pe.shape
     D_ckv = ckv_kpe_cache.shape[2]
     if H != 128:
         raise ValueError(f"Expected 128 heads for q_nope_pe, got {H}")
@@ -60,6 +59,15 @@ def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
             "Expected head dim 576 for q_nope_pe and ckv_kpe_cache, "
             f"got {D_q} and {D_ckv}"
         )
+
+
+def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
+    _check_cutlass_inputs(q_nope_pe, ckv_kpe_cache)
+    B_q = q_nope_pe.shape[0]
+    if kv_len.ndim != 1:
+        raise ValueError(f"Expected kv_len.ndim == 1, got {kv_len.ndim}")
+    if page_table.ndim != 2:
+        raise ValueError(f"Expected page_table.ndim == 2, got {page_table.ndim}")
     B_block_table, block_num = page_table.shape
     block_size = ckv_kpe_cache.shape[1]
     if B_q != B_block_table:
@@ -86,27 +94,65 @@ def _validate_cutlass_launch_tensors(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     out: torch.Tensor,
-    kv_len: torch.Tensor,
-    page_table: torch.Tensor,
+    kv_len: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
 ) -> None:
-    for name, tensor in (
-        ("query", query),
-        ("KV cache", kv_cache),
-        ("out", out),
-        ("kv_len", kv_len),
-        ("page_table", page_table),
-    ):
+    launch_tensors = (("query", query), ("KV cache", kv_cache), ("out", out))
+    tensors = launch_tensors
+    if kv_len is not None:
+        tensors += (("kv_len", kv_len), ("page_table", page_table))
+    for name, tensor in tensors:
         if tensor.device != device:
             raise ValueError(
                 f"CUTLASS launch tensor {name} must be on workspace device "
                 f"{device}, got {tensor.device}."
             )
-    for name, tensor in (("query", query), ("KV cache", kv_cache), ("out", out)):
+    for name, tensor in launch_tensors:
         if not tensor.is_contiguous():
             raise ValueError(
                 f"CUTLASS launch tensor {name} must be contiguous because "
                 "the native kernel uses fixed compact strides."
             )
+
+
+def _required_kv_pages(ids: np.ndarray) -> Union[int, float]:
+    return math.inf if ids.min(initial=0) < 0 else int(ids.max(initial=-1)) + 1
+
+
+def _snapshot_cutlass_metadata(
+    metadata: Union[_CSRPlanMetadata, _DensePlanMetadata],
+    alignment: int,
+    device: torch.device,
+):
+    rows = metadata.host_rows
+    assert rows is not None
+    counts = rows.page_counts
+    batch = counts.size
+    max_count = int(counts.max(initial=0))
+    is_csr = isinstance(metadata, _CSRPlanMetadata)
+    width = max_count if is_csr else metadata.block_tables.shape[1]
+    width = max(alignment, (width + alignment - 1) // alignment * alignment)
+    packed = np.zeros(batch + batch * width, dtype=np.int32)
+    packed[:batch] = rows.kv_lengths
+    table = packed[batch:].reshape(batch, width)
+    if is_csr:
+        assert rows.kv_indptr is not None
+        offsets = rows.kv_indptr.tolist()
+        live = metadata.kv_indices[: offsets[-1]].to("cpu").numpy()
+        for row, (start, end) in enumerate(pairwise(offsets)):
+            table[row, : end - start] = live[start:end]
+    else:
+        source = metadata.block_tables.to("cpu").numpy()
+        if max_count and np.all(counts == max_count):
+            table[:, :max_count] = source[:, :max_count]
+        else:
+            for row, count in enumerate(counts):
+                table[row, :count] = source[row, :count]
+        live = table[:, :max_count]
+    required = _required_kv_pages(live)
+    # The blocking transfer makes both plan-owned views ready on other streams.
+    data = torch.from_numpy(packed).to(device)
+    return data[:batch], data[batch:].view(batch, width), required
 
 
 def _validate_cutlass_planned_page_size(page_size):
@@ -132,7 +178,7 @@ def _validate_cutlass_plan_contract(
     output_dtype,
     output_scale,
     use_profiler,
-):
+) -> int:
     for name, value, minimum in (
         ("num_heads", num_heads, 1),
         ("head_dim_ckv", head_dim_ckv, 1),
@@ -190,13 +236,14 @@ def _validate_cutlass_plan_contract(
             "cutlass backend uses a fixed MLA softmax scale of "
             f"{expected_sm_scale}, got {sm_scale}."
         )
-    _validate_cutlass_planned_page_size(page_size)
+    alignment = _validate_cutlass_planned_page_size(page_size)
     major, minor = _get_compute_capability(device)
     if major not in (10, 11):
         raise _BackendPlanUnsupportedError(
             "cutlass backend supports only compute capability major versions "
             f"10 and 11, got SM{major}{minor}."
         )
+    return alignment
 
 
 @functools.lru_cache(maxsize=1)
@@ -222,10 +269,20 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
 
     @classmethod
     def preflight_plan_from_wrapper(cls, args: _MLAPlanArguments) -> None:
-        dense = args.native_dense()  # Preserve errors from malformed caller metadata.
+        cls._prepare_plan_metadata(args)
+
+    @classmethod
+    def _prepare_plan_metadata(
+        cls, args: _MLAPlanArguments
+    ) -> tuple[Union[_CSRPlanMetadata, _DensePlanMetadata], int]:
+        metadata = (
+            args.csr_for_dense()
+            if args.metadata.block_tables is None
+            else args.native_dense()
+        )
         if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
             raise _BackendPlanUnsupportedError(reason)
-        _validate_cutlass_plan_contract(
+        alignment = _validate_cutlass_plan_contract(
             device=args._float_workspace_buffer.device,
             num_heads=args.num_heads,
             head_dim_ckv=args.head_dim_ckv,
@@ -238,27 +295,41 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
             output_scale=args.output_scale,
             use_profiler=args.use_profiler,
         )
-        offsets = dense.cum_seq_lens_q.to(device="cpu", dtype=torch.int64)
-        q_lens = offsets[1:] - offsets[:-1]
-        if q_lens.numel() == 0 or bool(torch.any(q_lens != 1).item()):
+        if args._use_cuda_graph:
+            args.require_cuda_graph_dense_metadata("cutlass")
+            metadata = args.device_dense(table_width_alignment=alignment)
+        rows = metadata.host_rows
+        assert rows is not None
+        q_lens = rows.q_lengths
+        if not q_lens.size or not (q_lens == 1).all():
             raise _BackendPlanUnsupportedError(
                 "cutlass backend requires exactly one query token per request."
             )
         # Causal and noncausal Q=1 have the same bottom-right mask. Capacity
         # max_q_len may exceed one; only actual offset differences matter.
-        args.dense(
-            table_width_alignment=_validate_cutlass_planned_page_size(args.page_size)
-        )
+        return metadata, alignment
 
     @classmethod
     @_audit_plan_from_wrapper_arguments
     def plan_from_wrapper(
         cls, args: _MLAPlanArguments
     ) -> "_BatchMLAPagedAttentionCutlassBackend":
-        cls.preflight_plan_from_wrapper(args)
-        table_width_alignment = _validate_cutlass_planned_page_size(args.page_size)
-        dense = args.dense(table_width_alignment=table_width_alignment)
-        batch_size = dense.cum_seq_lens_q.shape[0] - 1
+        metadata, alignment = cls._prepare_plan_metadata(args)
+        if args._use_cuda_graph:
+            dense = cast(_DensePlanMetadata, metadata)
+            kv_len, page_table = dense.seq_lens, dense.block_tables
+            # Capture binds these caller-owned buffers. Only the initially live
+            # entries contribute to the cache extent checked at capture.
+            assert dense.host_rows is not None
+            counts = dense.host_rows.page_counts
+            width = int(counts.max(initial=0))
+            ids = page_table[:, :width].to("cpu").numpy()
+            required = _required_kv_pages(ids[np.arange(width) < counts[:, None]])
+        else:
+            kv_len, page_table, required = _snapshot_cutlass_metadata(
+                metadata, alignment, args._float_workspace_buffer.device
+            )
+        batch_size = kv_len.numel()
         backend = cls(args._float_workspace_buffer)
         backend.plan(
             num_heads=args.num_heads,
@@ -273,8 +344,9 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
             output_scale=args.output_scale,
             use_profiler=args.use_profiler,
             batch_size=batch_size,
-            kv_len=dense.seq_lens.to(args._float_workspace_buffer.device),
-            page_table=dense.block_tables.to(args._float_workspace_buffer.device),
+            kv_len=kv_len,
+            page_table=page_table,
+            _required_pages=required,
         )
         return backend
 
@@ -295,23 +367,40 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
         batch_size: int,
         kv_len: torch.Tensor,
         page_table: torch.Tensor,
+        _required_pages: Optional[Union[int, float]] = None,
     ) -> None:
         # ---------------------------------------------------------------------------
         # Validate the CUTLASS plan contract
         # ---------------------------------------------------------------------------
-        _validate_cutlass_plan_contract(
-            device=self.device,
-            num_heads=num_heads,
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
-            page_size=page_size,
-            sm_scale=sm_scale,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            output_dtype=output_dtype,
-            output_scale=output_scale,
-            use_profiler=use_profiler,
-        )
+        if _required_pages is None:
+            alignment = _validate_cutlass_plan_contract(
+                device=self.device,
+                num_heads=num_heads,
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+                page_size=page_size,
+                sm_scale=sm_scale,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                output_dtype=output_dtype,
+                output_scale=output_scale,
+                use_profiler=use_profiler,
+            )
+
+            metadata = _validate_dense_metadata(
+                cum_seq_lens_q=torch.arange(
+                    batch_size + 1, dtype=torch.int32, device="cpu"
+                ),
+                block_tables=page_table,
+                seq_lens=kv_len,
+                max_q_len=1,
+                page_size=page_size,
+                device=self.device,
+                table_width_alignment=alignment,
+            )
+            kv_len, page_table, _required_pages = _snapshot_cutlass_metadata(
+                metadata, alignment, self.device
+            )
 
         # ---------------------------------------------------------------------------
         # Publish the validated plan state
@@ -324,6 +413,7 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
         self._kv_data_type = kv_data_type
         self._output_dtype = output_dtype
         self._output_scale = output_scale
+        self._planned_required_pages = _required_pages
         self._kv_len = kv_len
         self._page_table = page_table
         self._cached_module = get_mla_module()
@@ -381,6 +471,7 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
             raise ValueError(
                 "run-time kv_len and page_table must both be omitted or both be provided."
             )
+        use_planned_metadata = kv_len is None
         kv_len = self._kv_len if kv_len is None else kv_len
         page_table = self._page_table if page_table is None else page_table
         q_nope_pe = cast(torch.Tensor, query)
@@ -395,20 +486,14 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
                 f"KV cache dtype {ckv_kpe_cache.dtype} does not match planned "
                 f"kv_data_type {self._kv_data_type}."
             )
-        for name, tensor in (("kv_len", kv_len), ("page_table", page_table)):
-            if tensor.dtype != torch.int32:
-                raise ValueError(f"{name} must have dtype torch.int32.")
-        _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table)
-        if q_nope_pe.shape[0] != self._batch_size:
-            raise ValueError(
-                f"query batch size {q_nope_pe.shape[0]} does not match planned "
-                f"batch size {self._batch_size}."
-            )
-        if ckv_kpe_cache.shape[1] != self._page_size:
-            raise ValueError(
-                f"KV cache page size {ckv_kpe_cache.shape[1]} does not match "
-                f"planned page size {self._page_size}."
-            )
+        if use_planned_metadata:
+            _check_cutlass_inputs(q_nope_pe, ckv_kpe_cache)
+        else:
+            for name, tensor in (("kv_len", kv_len), ("page_table", page_table)):
+                if tensor.dtype != torch.int32:
+                    raise ValueError(f"{name} must have dtype torch.int32.")
+            _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table)
+        self._check_planned_geometry(q_nope_pe, ckv_kpe_cache, use_planned_metadata)
 
         # ---------------------------------------------------------------------------
         # Prepare the output buffer and scale
@@ -459,8 +544,8 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
             query=q_nope_pe,
             kv_cache=ckv_kpe_cache,
             out=out,
-            kv_len=kv_len,
-            page_table=page_table,
+            kv_len=None if use_planned_metadata else kv_len,
+            page_table=None if use_planned_metadata else page_table,
         )
         self._cached_module.cutlass_mla_paged_attention(
             self._float_workspace_buffer,
@@ -473,6 +558,20 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
             output_scale,
         )
         return out
+
+    def _check_planned_geometry(self, query, cache, use_planned_metadata):
+        if query.shape[0] != self._batch_size:
+            raise ValueError(
+                f"query batch size {query.shape[0]} does not match planned "
+                f"batch size {self._batch_size}."
+            )
+        if cache.shape[1] != self._page_size:
+            raise ValueError(
+                f"KV cache page size {cache.shape[1]} does not match "
+                f"planned page size {self._page_size}."
+            )
+        if use_planned_metadata and cache.shape[0] < self._planned_required_pages:
+            raise ValueError("KV cache does not cover the planned page indices.")
 
     # Autotuning support for the current wrapper plan.
 
@@ -509,6 +608,7 @@ class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
             split_leaf_names=("ckv_cache", "kpe_cache"),
         )
         _check_cutlass_shape(query, cache, self._kv_len, self._page_table)
+        self._check_planned_geometry(query, cache, True)
         out = inputs[2]
         if out is not None:
             check_shape_dtype_device(
