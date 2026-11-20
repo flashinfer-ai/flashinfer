@@ -20,8 +20,8 @@ Benchmark routines for sparse attention and KV selection:
   Precision is chosen via ``--q_dtype`` / ``--kv_dtype``.
 * paged_mqa_logits: the DSA indexer logits (``fp8_paged_mqa_logits`` /
   ``fp4_paged_mqa_logits``), precision chosen via ``--mqa_dtype``.
-* BlockSparseAttentionWrapper / VariableBlockSparseAttentionWrapper: block-sparse
-  (VSA-style) attention over a random block pattern of ``--block_density``.
+* BlockSparseAttentionWrapper: block-sparse (VSA-style) attention over a random
+  block pattern of ``--block_density``.
 
 Per-cc backend support comes from ``routine_cc_to_supported_backends``; on top of
 that each MSA backend skips the dtype/layout combinations its library route does
@@ -64,20 +64,16 @@ _ROUTINE_BACKENDS = {
     "MSATopKSelect": ["cudsl"],
     "paged_mqa_logits": ["cute-dsl"],
     "BlockSparseAttentionWrapper": [
-        "fa2",
-        "fa3",
         "cutile",
         "vsa_sm100_blk128",
         "vsa_sm100_blk64",
         "vsa_sm120_blk64",
     ],
-    "VariableBlockSparseAttentionWrapper": ["fa2", "fa3"],
 }
 # Backend used when a line passes no --backends.
 _DEFAULT_BACKEND = {
     "paged_mqa_logits": "cute-dsl",
-    "BlockSparseAttentionWrapper": "fa2",
-    "VariableBlockSparseAttentionWrapper": "fa2",
+    "BlockSparseAttentionWrapper": "cutile",
 }
 _MSA_ROUTINES = (
     "MSAProxyScore",
@@ -109,8 +105,6 @@ def run_sparse_attention_test(args):
         return testPagedMqaLogits(args)
     elif args.routine == "BlockSparseAttentionWrapper":
         return testBlockSparseAttentionWrapper(args)
-    elif args.routine == "VariableBlockSparseAttentionWrapper":
-        return testVariableBlockSparseAttentionWrapper(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -129,8 +123,8 @@ def parse_sparse_attention_args(line, parser):
             "(CuTe-DSL on SM12x, the CUDA C++ Blackwell backend on 10.0/10.3); "
             "MSASparseDecode also takes 'trtllm-gen' "
             "(trtllm_batch_decode_with_kv_cache block-sparse). "
-            "Default: cudsl for MSA, cute-dsl for paged_mqa_logits, fa2 for the "
-            "block-sparse wrappers."
+            "Default: cudsl for MSA, cute-dsl for paged_mqa_logits, cutile for "
+            "BlockSparseAttentionWrapper."
         ),
     )
     parser.add_argument("--batch_size", type=int, default=1, help="Number of requests.")
@@ -1161,22 +1155,19 @@ def testBlockSparseAttentionWrapper(args):
             )
             continue
         wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(workspace, backend=b)
-        if b == "cutile" or b.startswith("vsa_"):
-            # These compile at plan or first run (cutile needs cuda-tile + tileiras,
-            # the vsa_* kernels a CuTe DSL build); a failed compile drops the backend.
-            try:
-                wrapper.plan(indptr, indices, M, N, R, C, Hq, Hkv, D, **plan_kw)
-                wrapper.run(q, k, v)
-            except torch.OutOfMemoryError:
-                raise
-            except BACKEND_REJECTION_ERRORS as e:
-                print(
-                    f"[WARNING] {b} backend rejected this configuration and "
-                    f"is dropped from the line: {type(e).__name__}: {e}"
-                )
-                continue
-        else:
+        # Every backend compiles at plan or first run (cutile needs cuda-tile +
+        # tileiras, the vsa_* kernels a CuTe DSL build); a failed compile drops it.
+        try:
             wrapper.plan(indptr, indices, M, N, R, C, Hq, Hkv, D, **plan_kw)
+            wrapper.run(q, k, v)
+        except torch.OutOfMemoryError:
+            raise
+        except BACKEND_REJECTION_ERRORS as e:
+            print(
+                f"[WARNING] {b} backend rejected this configuration and "
+                f"is dropped from the line: {type(e).__name__}: {e}"
+            )
+            continue
         if args.refcheck:
             outputs[b] = wrapper.run(q, k, v).detach().clone()
         times = _time(args, lambda _b, w=wrapper: w.run(q, k, v), b)
@@ -1193,83 +1184,6 @@ def testBlockSparseAttentionWrapper(args):
                 total_kv=N,
                 causal=False,
                 topk=nnz,
-                page_size=0,
-            )
-        )
-    _refcheck(args, outputs)
-    return res
-
-
-def testVariableBlockSparseAttentionWrapper(args):
-    """VariableBlockSparseAttentionWrapper plan/run with uniform --block_r x
-    --block_c blocks (last block takes the remainder) and a random per-kv-head
-    block mask of --block_density. q/k/v are HND."""
-    if args.verbose >= 1:
-        print(
-            "[INFO] Running testVariableBlockSparseAttentionWrapper | "
-            f"FlashInfer {flashinfer.__version__}"
-        )
-    device = _common(args)
-    if device is None:
-        return []
-    backends = _resolve_backends(args, device)
-    if not backends:
-        return []
-
-    M, N = args.s_qo, args.s_kv
-    Hq, Hkv, D = args.num_qo_heads, args.num_kv_heads, args.head_dim
-    q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
-
-    def sizes(total, blk):
-        n = -(-total // blk)
-        sz = torch.full((n,), blk, dtype=torch.int32)
-        sz[-1] = total - blk * (n - 1)
-        return sz.unsqueeze(0).repeat(Hkv, 1)
-
-    block_row_sz, block_col_sz = sizes(M, args.block_r), sizes(N, args.block_c)
-    mask = (
-        torch.rand(Hkv, block_row_sz.shape[1], block_col_sz.shape[1])
-        < args.block_density
-    )
-    q = torch.randn(Hq, M, D, device=device, dtype=q_dtype)
-    k = torch.randn(Hkv, N, D, device=device, dtype=q_dtype)
-    v = torch.randn(Hkv, N, D, device=device, dtype=q_dtype)
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
-    # Attended (row, col) token pairs per kv head, summed over heads.
-    attended = (
-        block_row_sz.unsqueeze(2).float() * block_col_sz.unsqueeze(1).float() * mask
-    ).sum()
-
-    res, outputs = [], {}
-    for b in backends:
-        wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(
-            workspace, backend=b
-        )
-        wrapper.plan(
-            block_mask_map=mask,
-            block_row_sz=block_row_sz,
-            block_col_sz=block_col_sz,
-            num_qo_heads=Hq,
-            num_kv_heads=Hkv,
-            head_dim=D,
-            q_data_type=q_dtype,
-        )
-        if args.refcheck:
-            outputs[b] = wrapper.run(q, k, v).detach().clone()
-        times = _time(args, lambda _b, w=wrapper: w.run(q, k, v), b)
-        median = float(np.median(times))
-        flops = 4 * attended.item() * (Hq // Hkv) * D
-        # Planned non-causal; the per-row block count varies, so topk is n/a (0).
-        res.append(
-            _record(
-                args,
-                b,
-                times,
-                tflops=flops / (1e9 * median),
-                total_q=M,
-                total_kv=N,
-                causal=False,
-                topk=0,
                 page_size=0,
             )
         )

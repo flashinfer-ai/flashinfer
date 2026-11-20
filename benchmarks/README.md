@@ -37,7 +37,6 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` (cudnn-native) and  `trtllm_ragged_attention_deepseek` (`trtllm-native`, and `cute-dsl` with `backend="cute-dsl"`). `auto` is the wrapper's auto selection (the CSV `resolved_backend` names the pick); `cutile` needs equal q/kv lengths.
     - The three dense routines accept `--window_left`, `--logits_soft_cap` and `--sinks`; backends that cannot serve a requested mode are skipped rather than run without it.
     - `append_paged_kv_cache` - KV-cache write path: `append_paged_kv_cache`, `append_paged_mla_kv_cache` (`--kv_cache_kind mla`) and their NVFP4 quantize-append variants (`--kv_dtype nvfp4`, optional `--slot_mapping`). `--s_qo` is the per-request append length and `--s_kv` the cache length after the append; reports bandwidth only.
-    - `single_decode_with_kv_cache` / `single_prefill_with_kv_cache` - one request over a contiguous (non-paged) KV tensor. Decode backends `fa2` (CUDA cores) and `fa2_tc` (tensor cores); prefill backends `fa2`, `fa3` (SM90) and `auto`.
     - `merge_states` - cascade attention-state merge: `merge_state` for `--num_states 2`, `merge_states` for more. `--batch_size` is the token count; reports bandwidth only.
     - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
         - Wrapper backends: `fa2`, `fa3`, `cutlass`, `cutile` (SM100/SM103/SM107/SM12x, BF16, `s_qo=1`), `trtllm-gen` (the wrapper's own trtllm-gen backend, SM100/SM103/SM107) and `cute-dsl-rubin-mtp` (SM107 only).
@@ -51,7 +50,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 - Sparse attention / DSA indexer:
     - `MSAProxyScore`, `MSASparseAttention`, `MSASparseDecode`, `MSAPipeline`, `MSATopKSelect` - MiniMax Sparse Attention ops (`flashinfer.msa_ops`, backend `cudsl` = the public call; `MSASparseDecode` also `trtllm-gen` = `trtllm_batch_decode_with_kv_cache(enable_block_sparse_attention=True)`).
     - `paged_mqa_logits` - DSA lightning-indexer logits over a paged KV cache (`fp8_paged_mqa_logits` / `fp4_paged_mqa_logits`, `cute-dsl`).
-    - `BlockSparseAttentionWrapper`, `VariableBlockSparseAttentionWrapper` - block-sparse (VSA) attention, backends `fa2`, `fa3`, `cutile`, `vsa_sm100_blk64`, `vsa_sm120_blk64`.
+    - `BlockSparseAttentionWrapper` - block-sparse (VSA) attention, backends `cutile`, `vsa_sm100_blk64`, `vsa_sm120_blk64`.
     - `top_k_varlen` - DSA indexer top-K KV selection (`radix`, `gvr`, `gvr_2`, `radix_cutlass`, `radix_filter`, `auto`); `--topk_mode prefill` (windowed `row_starts` mode) and `--page_size` (fused page-table output) are served by `gvr_2`/`auto`.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.

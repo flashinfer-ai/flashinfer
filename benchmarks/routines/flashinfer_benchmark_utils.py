@@ -308,8 +308,6 @@ benchmark_apis = {
         "concat_mla_k",
         "concat_mla_kv_quant_fp8",
         "append_paged_kv_cache",
-        "single_decode_with_kv_cache",
-        "single_prefill_with_kv_cache",
         "merge_states",
     ],
     "gemm": [
@@ -423,7 +421,6 @@ benchmark_apis = {
         "MSATopKSelect",
         "paged_mqa_logits",
         "BlockSparseAttentionWrapper",
-        "VariableBlockSparseAttentionWrapper",
     ],
 }
 
@@ -809,33 +806,6 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
-    "single_decode_with_kv_cache": {
-        # NOTE: fa2_tc = use_tensor_cores=True (prefill kernel); fa2 JIT is built
-        #       for every supported arch (utils.determine_attention_backend)
-        "7.5": ["fa2"],
-        "8.0": ["fa2", "fa2_tc"],
-        "8.6": ["fa2", "fa2_tc"],
-        "8.9": ["fa2", "fa2_tc"],
-        "9.0": ["fa2", "fa2_tc"],
-        "10.0": ["fa2", "fa2_tc"],
-        "10.3": ["fa2", "fa2_tc"],
-        "10.7": ["fa2", "fa2_tc"],
-        "12.0": ["fa2", "fa2_tc"],
-        "12.1": ["fa2", "fa2_tc"],
-    },
-    "single_prefill_with_kv_cache": {
-        # NOTE: fa3 needs is_sm90a_supported (utils.py)
-        "7.5": [],
-        "8.0": ["fa2", "auto"],
-        "8.6": ["fa2", "auto"],
-        "8.9": ["fa2", "auto"],
-        "9.0": ["fa2", "fa3", "auto"],
-        "10.0": ["fa2", "auto"],
-        "10.3": ["fa2", "auto"],
-        "10.7": ["fa2", "auto"],
-        "12.0": ["fa2", "auto"],
-        "12.1": ["fa2", "auto"],
-    },
     "merge_states": {
         # NOTE: cuda = flashinfer.cascade.merge_state / merge_states (generic JIT,
         #       no arch guard). The triton variants are Hopper-only (triton/cascade.py).
@@ -889,30 +859,14 @@ routine_cc_to_supported_backends = {
         "10.7": ["cute-dsl"],
     },
     "BlockSparseAttentionWrapper": {
-        # fa3: SM90 (utils.py determine_attention_backend); vsa_sm100_*:
-        # 10.0/10.3/10.7 (sparse.py vsa_sm100_* plan checks); vsa_sm120_blk64:
-        # cc major 12 (sparse.py:1071). Non-CI rows are guard-backed only.
+        # vsa_sm100_*: 10.0/10.3/10.7 (sparse.py vsa_sm100_* plan checks);
+        # vsa_sm120_blk64: cc major 12. Non-CI rows are guard-backed only.
         # vsa_sm100_blk128 is guard-admitted on 10.0/10.3 but needs `quack-kernels`.
-        "8.0": ["fa2"],
-        "8.6": ["fa2"],
-        "8.9": ["fa2"],
-        "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutile", "vsa_sm100_blk64"],
-        "10.3": ["fa2", "cutile", "vsa_sm100_blk64"],
-        "10.7": ["fa2", "cutile", "vsa_sm100_blk64"],
-        "12.0": ["fa2", "vsa_sm120_blk64"],
-        "12.1": ["fa2", "vsa_sm120_blk64"],
-    },
-    "VariableBlockSparseAttentionWrapper": {
-        "8.0": ["fa2"],
-        "8.6": ["fa2"],
-        "8.9": ["fa2"],
-        "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2"],
-        "10.3": ["fa2"],
-        "10.7": ["fa2"],
-        "12.0": ["fa2"],
-        "12.1": ["fa2"],
+        "10.0": ["cutile", "vsa_sm100_blk64"],
+        "10.3": ["cutile", "vsa_sm100_blk64"],
+        "10.7": ["cutile", "vsa_sm100_blk64"],
+        "12.0": ["vsa_sm120_blk64"],
+        "12.1": ["vsa_sm120_blk64"],
     },
     # GEMM
     "gemm_fp8_nt_groupwise": {
