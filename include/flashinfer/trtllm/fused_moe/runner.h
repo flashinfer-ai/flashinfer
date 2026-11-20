@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <string>
 
 #include "DevKernel.h"
@@ -261,7 +262,12 @@ class Runner {
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
            int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
-           int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1);
+           int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1,
+           tensorrt_llm::kernels::TrtllmGenBatchedGemmPartition const& partition = {});
+
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const {
+    return mRunner.supportsPartition(configIndex, smCount);
+  }
 
  private:
   friend class MoE::Runner;
@@ -308,7 +314,12 @@ class Runner {
            int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
            int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
            int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
-           int32_t validIntermediateSize = -1, int32_t validHiddenSize = -1);
+           int32_t validIntermediateSize = -1, int32_t validHiddenSize = -1,
+           tensorrt_llm::kernels::TrtllmGenBatchedGemmPartition const& partition = {});
+
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const {
+    return mRunner.supportsPartition(configIndex, smCount);
+  }
 
  private:
   friend class MoE::Runner;
@@ -413,6 +424,14 @@ struct MoERunnerArgs {
   // decoded by resolveNVFP4Recipe() (nvfp4Recipe.h). The default
   // (kNVFP44Over6FromEnv) reads FLASHINFER_NVFP4_4OVER6* on every launch.
   int64_t nvfp4_4over6_code{-1};
+
+  // Optional copy of the per-token NvFP4 GEMM2 input in (token, slot) order:
+  // packed E2M1 [num_tokens, top_k, intermediate_size / 2], linear E4M3 block scales
+  // [num_tokens, top_k, intermediate_size / 16] and per-row decode scales [num_tokens, top_k].
+  // Set all three or none.
+  uint8_t* fc2_input_out = nullptr;
+  uint8_t* fc2_input_scale_out = nullptr;
+  float* fc2_input_token_scale_out = nullptr;
 };
 
 struct MoEWorkspace {
@@ -467,6 +486,27 @@ struct MoEWorkspace {
   void* bmm2_workspace = nullptr;
 };
 
+// Two-way uGPU localization of the MoE GEMMs (Rubin locality domains). Each domain runs FC1 and
+// FC2 on its own stream over its own weight shard and writes its output columns into slices of
+// the shared GEMM outputs: FC1 produces intermediate columns [d * I/2, (d + 1) * I/2) and FC2
+// hidden columns [d * H/2, (d + 1) * H/2). Routing and finalize stay on the caller's stream.
+struct LocalizedMoE {
+  static constexpr int kNumDomains = 2;
+  // Per-domain shuffled weight shards: FC1 [E, I, H/2] (the domain's halves of the up and gate
+  // rows) and FC2 [E, H/2, I/2] (the domain's hidden rows over the full intermediate size).
+  std::array<void*, kNumDomains> gemm1Weights{};
+  std::array<void*, kNumDomains> gemm1WeightsScale{};
+  std::array<void*, kNumDomains> gemm2Weights{};
+  std::array<void*, kNumDomains> gemm2WeightsScale{};
+  // One stream per domain, each limited to that domain's SMs (for example a green context).
+  std::array<cudaStream_t, kNumDomains> streams{};
+  // SMs available to each domain stream.
+  int32_t smCount{0};
+  // Per-domain BMM scratch, sized like MoEWorkspace::bmm1_workspace / bmm2_workspace.
+  std::array<void*, kNumDomains> bmm1Workspaces{};
+  std::array<void*, kNumDomains> bmm2Workspaces{};
+};
+
 // Config indices to be used with Batched GEMM runners
 struct MoEConfig {
   int64_t gemm1Config;
@@ -514,6 +554,23 @@ class Runner {
                                                    int32_t intermediateSize,
                                                    int32_t numLocalExperts, int32_t numTokens,
                                                    int32_t hiddenSizeOutput = -1) const;
+
+  // Run with the GEMMs split across locality domains (see LocalizedMoE). The config must be one
+  // of getValidLocalizedConfigIndices().
+  void runLocalized(MoERunnerArgs const& args, MoEWorkspace const& workspace,
+                    LocalizedMoE const& localized, int device, cudaStream_t stream,
+                    int64_t configIndex, bool enable_pdl);
+
+  // Configs whose GEMMs are valid on one domain's share (FC1 at intermediate I/2, FC2 at hidden
+  // H/2) and can write slices on a stream with smCount SMs.
+  [[nodiscard]] std::vector<int64_t> getValidLocalizedConfigIndices(
+      int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numLocalExperts,
+      int32_t numTokens, int32_t smCount) const;
+
+  [[nodiscard]] bool isValidLocalizedConfigIndex(int64_t configIndex, int32_t topK,
+                                                 int32_t hiddenSize, int32_t intermediateSize,
+                                                 int32_t numLocalExperts, int32_t numTokens,
+                                                 int32_t smCount) const;
 
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, bool const enablePdl,

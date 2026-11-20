@@ -67,56 +67,77 @@ using tensorrt_llm::kernels::cutlass_kernels::Fp4Type;
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
+// The Windows port splits the nested generic lambdas into an explicit template: the MSVC host
+// compiler fails on the original form. Behaviour is identical.
+template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
+          EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool IsMXFPX,
+          bool DynamicCga, bool SwapAB>
+auto getDispatchFunctionForSM100Impl(cutlass_extensions::EpilogueScheduleType epilogue_schedule) {
+#if defined(ENABLE_FP4)
+  constexpr bool is_block_scaled =
+      IsMXFPX || std::is_same_v<T, Fp4Type> || std::is_same_v<WeightType, Fp4Type>;
+#else
+  constexpr bool is_block_scaled = IsMXFPX;
+#endif
+  if constexpr ((!is_block_scaled || Arch::kMinComputeCapability == 103) &&
+                FUSION != EpilogueFusion::FINALIZE && FUSION != EpilogueFusion::ACTIVATION) {
+    auto func_map = std::array{
+        &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
+            Arch, T, WeightType, OutputType, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized,
+            EpilogueTag, FUSION, TileShape, ClusterShape, IsMXFPX, DynamicCga, false, SwapAB>,
+        &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
+            Arch, T, WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized,
+            EpilogueTag, FUSION, TileShape, ClusterShape, IsMXFPX, DynamicCga, false, SwapAB>
+
+    };
+    bool const tma_epilogue = epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA;
+    return func_map[tma_epilogue];
+  } else {
+    static_assert(FUSION == EpilogueFusion::FINALIZE || Arch::kMinComputeCapability != 103,
+                  "SM103 should support both epilogue schedules");
+    TLLM_CHECK_WITH_INFO(
+        epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA,
+        "No Smem epilogue schedule is not supported for block scaled types, finalize "
+        "fusion, or activation fusion");
+    return &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
+        Arch, T, WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag,
+        FUSION, TileShape, ClusterShape, IsMXFPX, DynamicCga, false, SwapAB>;
+  }
+}
+
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
           EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool IsMXFPX>
 auto getDispatchFunctionForSM100(cutlass_extensions::EpilogueScheduleType epilogue_schedule,
                                  bool dynamic_cga, bool swap_ab) {
-  auto select_swap_ab = [dynamic_cga, epilogue_schedule](auto swap_ab_t) {
-    auto select_dynamic_cga = [epilogue_schedule](auto dynamic_cga_t) {
-#if defined(ENABLE_FP4)
-      constexpr bool is_block_scaled =
-          IsMXFPX || std::is_same_v<T, Fp4Type> || std::is_same_v<WeightType, Fp4Type>;
-#else
-      constexpr bool is_block_scaled = IsMXFPX;
-#endif
-      if constexpr ((!is_block_scaled || Arch::kMinComputeCapability == 103) &&
-                    FUSION != EpilogueFusion::FINALIZE && FUSION != EpilogueFusion::ACTIVATION) {
-        auto func_map = std::array{
-            &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
-                Arch, T, WeightType, OutputType, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized,
-                EpilogueTag, FUSION, TileShape, ClusterShape, IsMXFPX,
-                decltype(dynamic_cga_t)::value, false, decltype(swap_ab_t)::value>,
-            &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
-                Arch, T, WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized,
-                EpilogueTag, FUSION, TileShape, ClusterShape, IsMXFPX,
-                decltype(dynamic_cga_t)::value, false, decltype(swap_ab_t)::value>
-
-        };
-        bool const tma_epilogue =
-            epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA;
-        return func_map[tma_epilogue];
-      } else {
-        static_assert(FUSION == EpilogueFusion::FINALIZE || Arch::kMinComputeCapability != 103,
-                      "SM103 should support both epilogue schedules");
-        TLLM_CHECK_WITH_INFO(
-            epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA,
-            "No Smem epilogue schedule is not supported for block scaled types, finalize "
-            "fusion, or activation fusion");
-        return &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
-            Arch, T, WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized,
-            EpilogueTag, FUSION, TileShape, ClusterShape, IsMXFPX, decltype(dynamic_cga_t)::value,
-            false, decltype(swap_ab_t)::value>;
-      }
-    };
-    return dynamic_cga ? select_dynamic_cga(tensorrt_llm::common::ConstBool<true>{})
-                       : select_dynamic_cga(tensorrt_llm::common::ConstBool<false>{});
-  };
   if constexpr (FUSION == EpilogueFusion::ACTIVATION) {
     TLLM_CHECK_WITH_INFO(!swap_ab, "Activation epilogue fusion does not support swap_ab tactics");
-    return select_swap_ab(tensorrt_llm::common::ConstBool<false>{});
+    if (dynamic_cga) {
+      return getDispatchFunctionForSM100Impl<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
+                                             TileShape, ClusterShape, IsMXFPX, true, false>(
+          epilogue_schedule);
+    }
+    return getDispatchFunctionForSM100Impl<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
+                                           TileShape, ClusterShape, IsMXFPX, false, false>(
+        epilogue_schedule);
   } else {
-    return swap_ab ? select_swap_ab(tensorrt_llm::common::ConstBool<true>{})
-                   : select_swap_ab(tensorrt_llm::common::ConstBool<false>{});
+    if (swap_ab) {
+      if (dynamic_cga) {
+        return getDispatchFunctionForSM100Impl<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
+                                               TileShape, ClusterShape, IsMXFPX, true, true>(
+            epilogue_schedule);
+      }
+      return getDispatchFunctionForSM100Impl<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
+                                             TileShape, ClusterShape, IsMXFPX, false, true>(
+          epilogue_schedule);
+    }
+    if (dynamic_cga) {
+      return getDispatchFunctionForSM100Impl<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
+                                             TileShape, ClusterShape, IsMXFPX, true, false>(
+          epilogue_schedule);
+    }
+    return getDispatchFunctionForSM100Impl<Arch, T, WeightType, OutputType, EpilogueTag, FUSION,
+                                           TileShape, ClusterShape, IsMXFPX, false, false>(
+        epilogue_schedule);
   }
 }
 
@@ -519,10 +540,12 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
       if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<
                         T, WeightType, EpilogueTag, FUSION>()) {
         switch (gemm_config.tile_config_sm120) {
+#if !defined(_WIN32)
           SHAPE_CASE(120, 128, 32, 64)
           SHAPE_CASE(120, 128, 32, 128)
           SHAPE_CASE(120, 128, 64, 64)
           SHAPE_CASE(120, 128, 64, 128)
+#endif
           SHAPE_CASE(120, 128, 128, 64)
           SHAPE_CASE(120, 128, 128, 128)
           SHAPE_CASE(120, 128, 256, 64)

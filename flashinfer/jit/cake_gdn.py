@@ -52,12 +52,19 @@ _RECORD_NAME = re.compile(r"^(decode|prefill)_(.+)_[0-9a-f]{12}$")
 _RECORD_TMA_ABI = {"decode": "pointer", "prefill": "grid_constant"}
 # A decode record whose kernel takes its state as a ``const __grid_constant__ CUtensorMap``
 # (the TMA-state bodies) spells ``"tma_abi": "grid_constant"``; its host template encodes the
-# tensor map (``_DECODE_TMA_TEMPLATES``).  Every other decode record derives ``pointer``.
+# tensor map (``_DECODE_TMA_TEMPLATES``: the whole-GPU body's, and the locality-domain twin's,
+# which also passes the twin's row cut, claim counters and SM table).  Every other decode
+# record derives ``pointer``.
 _RECORD_TMA_ABI_SPELLED = {
     "decode": ("pointer", "grid_constant"),
     "prefill": ("grid_constant",),
 }
-_DECODE_TMA_TEMPLATES = frozenset({"host/templates/decode_fp32_t1_tma_state.cc.in"})
+_DECODE_TMA_TEMPLATES = frozenset(
+    {
+        "host/templates/decode_fp32_t1_tma_state.cc.in",
+        "host/templates/cake_decode_fp32_t1_tma_state_domain.cc.in",
+    }
+)
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -90,7 +97,8 @@ def _sha256(path: Path) -> str:
 
 
 def _nvcc_identity() -> tuple[Path, str]:
-    nvcc = (Path(get_cuda_path()) / "bin" / "nvcc").resolve()
+    nvcc_name = "nvcc.exe" if os.name == "nt" else "nvcc"
+    nvcc = (Path(get_cuda_path()) / "bin" / nvcc_name).resolve()
     if not nvcc.is_file():
         raise RuntimeError(f"nvcc was not found at {nvcc}")
     result = subprocess.run(
@@ -1993,10 +2001,72 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
     "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3": 1,
 }
 # The decode schedules whose kernel takes its state as a tensor map (records spelling
-# ``"tma_abi": "grid_constant"``).
+# ``"tma_abi": "grid_constant"``): the whole-GPU `hqsplit_tma3` body and its locality-domain
+# twin (``CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES``).
 CAKE_GDN_DECODE_TMA_STATE_SCHEDULES = frozenset(
-    {"gdn_decode_nontranspose_fp32_t1_hqsplit_tma3"}
+    {
+        "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+        "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain",
+    }
 )
+
+# The locality-domain twin of the fp32-state T=1 K-major decode on a dual-die SM107a GPU
+# (Rubin, two dies with their own SMs and memory): the `hqsplit_tma3` body in one launch over
+# both dies, for a state homed by batch rows -- rows [0, rows0) in die 0's memory, the rest in
+# die 1's, in one virtual address range (``localize_gdn_decode_state``).  Each CTA claims
+# (batch row, value head) items from its own die's rows first, then from the other die's,
+# and runs each item as the whole body's CTA does: the output and the state are the whole
+# body's bit for bit, for any rows0 and any grid.  Its kernel takes the whole body's
+# arguments, the batch size, rows0, one claim counter per die (zero before a launch and left
+# zero by it) and the SM table by value; its grid is the resident CTAs, at most B * HV (not a
+# multiple of the state heads: the twin is not in CTAS_PER_STATE).
+#
+# Routes: (architecture, SM count) -> (whole schedule, die class, batch class) -> the twin
+# schedule run in its place.  Die class: "even" when the two dies' SM counts differ by at
+# most 4, else "uneven" (``flashinfer.cake_locality.die_class``); batch class: "B<32",
+# "B32-47", "B48-63", "B64-127", "B128-255" or "B>=256"
+# (``cake_gdn_nontranspose_fp32_t1_domain_batch_class``).  A listed cell runs the twin only
+# for a state homed as a whole allocation on a device with an SM table; every other call
+# runs the whole route.  The cells are the twin routes of the Cake decode kernel program,
+# where the twin on a homed state ran faster than the whole body on 212-SM boards of
+# both die classes, timed through the public call in CUDA graphs with the L2 flushed by
+# a read before each replay (clean lines, ``flashinfer.utils.make_l2_flush``): from 48
+# rows on.  Below 48 rows the twin was timed at 32, 34, 36, 37, 40, 44 and 47 rows (at
+# scale 1.0, 34, 36, 40 and 44 on one board only).  Up to 44 rows it was not faster at
+# most timed batches, in CUDA graphs (read flush before each replay) or in back-to-back
+# eager calls (no flush between calls); at 47 rows it was faster, which the 48-row bound
+# gives up.  So "B32-47" lists no cell.  Other SM counts (216-SM boards are untimed)
+# list no cell.
+CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES: dict[
+    tuple[str, int], dict[tuple[str, str, str], str]
+] = {
+    ("sm_107a", 212): {
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "even", "B48-63"): (
+            "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
+        ),
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "even", "B64-127"): (
+            "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
+        ),
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "even", "B128-255"): (
+            "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
+        ),
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "even", "B>=256"): (
+            "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
+        ),
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "uneven", "B48-63"): (
+            "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
+        ),
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "uneven", "B64-127"): (
+            "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
+        ),
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "uneven", "B128-255"): (
+            "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
+        ),
+        ("gdn_decode_nontranspose_fp32_t1_hqsplit_tma3", "uneven", "B>=256"): (
+            "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain"
+        ),
+    },
+}
 
 
 def cake_gdn_nontranspose_fp32_t1_rule_band(batch_size: int) -> str:
@@ -2051,6 +2121,65 @@ def cake_gdn_nontranspose_fp32_t1_ctas_per_state(variant_name: str) -> int:
             f"{variant_name!r} ({schedule}) is not an fp32-state T=1 nontranspose record"
         )
     return ctas_per_state
+
+
+def cake_gdn_nontranspose_fp32_t1_domain_batch_class(batch_size: int) -> str:
+    """Batch class of ``batch_size`` rows in the locality-domain routes: ``B<32``, ``B32-47``, ``B48-63``, ``B64-127``, ``B128-255`` or ``B>=256``."""
+
+    batch_size = int(batch_size)
+    if batch_size < 32:
+        return "B<32"
+    if batch_size < 48:
+        return "B32-47"
+    if batch_size < 64:
+        return "B48-63"
+    if batch_size < 128:
+        return "B64-127"
+    if batch_size < 256:
+        return "B128-255"
+    return "B>=256"
+
+
+@functools.lru_cache(maxsize=1024)
+def select_cake_gdn_decode_domain_variant(
+    *,
+    arch: CakeGDNArch,
+    whole_variant: str,
+    sm_count: int,
+    die_class: str,
+    batch_size: int,
+) -> str | None:
+    """The locality-domain twin record that runs in place of the fp32-state T=1 K-major record ``whole_variant``.
+
+    ``None`` unless ``CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES`` lists the cell of
+    ``(arch, sm_count)`` for the record's schedule, ``die_class`` and the batch class of
+    ``batch_size``, and the manifest ships the twin for the record's specializations on
+    ``arch``.  The caller runs the twin only for a homed state (see
+    ``flashinfer.gdn_decode``).
+    """
+
+    record = _kernel_record(whole_variant)
+    schedule = record["source_schedule"].rsplit(":", 1)[-1]
+    twin = CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES.get(
+        (arch, int(sm_count)), {}
+    ).get(
+        (
+            schedule,
+            die_class,
+            cake_gdn_nontranspose_fp32_t1_domain_batch_class(batch_size),
+        )
+    )
+    if twin is None:
+        return None
+    try:
+        return _variant_for(
+            arch=arch,
+            domain="decode",
+            schedule_attr=twin,
+            specializations=record["specializations"],
+        )["name"]
+    except CakeGDNUnsupportedError:
+        return None
 
 
 def cake_gdn_bf16_wide_schedule(
@@ -2454,6 +2583,7 @@ __all__ = [
     "compile_cake_gdn_cubin",
     "load_cake_gdn_kernel",
     "render_cake_gdn_host_shim",
+    "select_cake_gdn_decode_domain_variant",
     "select_cake_gdn_decode_variant",
     "select_cake_gdn_prefill_variant",
 ]

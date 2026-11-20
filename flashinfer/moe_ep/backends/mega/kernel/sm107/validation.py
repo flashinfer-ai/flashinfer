@@ -36,6 +36,10 @@ def make_workspace_config(
         if tuning.get(name) is None:
             tuning.pop(name, None)
     try:
+        from ..sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_metadata,
+        )
+
         return Sm107BlockScaledMoeConfig(
             num_total_experts=fleet_params.num_experts,
             max_tokens_per_rank=fleet_params.max_tokens_per_rank,
@@ -51,8 +55,18 @@ def make_workspace_config(
             activation=k.activation,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
+            **(
+                dict(swiglu_alpha=k.swiglu_alpha, swiglu_beta=k.swiglu_beta)
+                if getattr(k, "batch_invariant", False)
+                else {}
+            ),
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
+            shared_expert=k.shared_expert,
+            combine_dedup=k.combine_dedup,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
+            **block_scaled_batch_invariant_metadata(k),
             **tuning,
         )
     except (TypeError, ValueError) as exc:
