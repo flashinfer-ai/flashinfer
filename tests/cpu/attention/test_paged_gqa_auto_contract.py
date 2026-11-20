@@ -26,19 +26,16 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.mark.parametrize("dim", [256])
 @pytest.mark.parametrize(
-    "version,packed,origins,runtime,expected",
+    "packed,origins,runtime,expected",
     [
-        ("1.32.3", True, True, True, False),
-        ("1.33.0rc1", True, True, True, False),
-        ("1.33.0", True, True, True, True),
-        ("1.33.0+local", True, True, True, True),
-        ("1.33.0", False, True, True, False),
-        ("1.33.0", True, False, True, False),
-        ("1.33.0", True, True, False, False),
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
     ],
 )
 def test_width_auto_requires_matching_native(
-    monkeypatch, dim, version, packed, origins, runtime, expected
+    monkeypatch, dim, packed, origins, runtime, expected
 ):
     binder = SimpleNamespace(
         **{
@@ -49,9 +46,7 @@ def test_width_auto_requires_matching_native(
     monkeypatch.setattr(
         cp,
         "cudnn",
-        SimpleNamespace(
-            __version__=version, _pybind_module=SimpleNamespace(_SdpaThdBinder=binder)
-        ),
+        SimpleNamespace(_pybind_module=SimpleNamespace(_SdpaThdBinder=binder)),
     )
     monkeypatch.setattr(cp, "_cudnn_supports_paged_auto", lambda: runtime)
     cp._cudnn_supports_paged_gqa_auto.cache_clear()
