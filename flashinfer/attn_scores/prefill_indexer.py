@@ -72,8 +72,6 @@ KILL_SWITCH_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 
 def _jit_nvcc_release() -> str:
     """Probe the selected compiler, independently of torch's build release."""
-    import shutil
-
     nvcc = _os.environ.get("FLASHINFER_NVCC")
     if nvcc is None:
         from ..jit.cpp_ext import get_cuda_path
@@ -82,8 +80,30 @@ def _jit_nvcc_release() -> str:
             nvcc = _os.path.join(get_cuda_path(), "bin", "nvcc")
         except (OSError, RuntimeError):
             return ""
+    # Default JIT compiler selections are absolute. Cache these stable
+    # selections, while resolving relative/bare overrides afresh so PATH
+    # precedence and CWD changes retain shutil.which semantics.
+    if not _os.path.isabs(nvcc):
+        import shutil
+
+        path = shutil.which(nvcc)
+        return _probe_nvcc(_os.path.abspath(path)) if path else ""
+    try:
+        return _probe_nvcc(_resolve_nvcc(nvcc))
+    except FileNotFoundError:
+        return ""
+
+
+@functools.lru_cache(maxsize=16)
+def _resolve_nvcc(nvcc: str) -> str:
+    """Cache absolute selections; missing compilers may be installed later."""
+    import shutil
+
     path = shutil.which(nvcc)
-    return _probe_nvcc(_os.path.abspath(path)) if path else ""
+    if path is None:
+        # Exceptions are not cached by lru_cache.
+        raise FileNotFoundError(nvcc)
+    return path
 
 
 @functools.cache
