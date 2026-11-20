@@ -224,7 +224,8 @@ __device__ __forceinline__ int share_of(const int* __restrict__ sl, int B, int i
 }
 
 template <bool ASYNC_Q, bool SINGLE>
-__global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
+// Give the two FP32 PV fragments more register budget without changing the split grid.
+__global__ __launch_bounds__(NTHREAD, 3) void attn_kernel(
     const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
     const int* __restrict__ bt, const int* __restrict__ sl, const float* __restrict__ qd,
     const float* __restrict__ kd, __nv_bfloat16* __restrict__ po, float* __restrict__ plse,
