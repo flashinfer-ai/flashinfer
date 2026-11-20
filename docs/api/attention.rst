@@ -266,6 +266,33 @@ PageAttention for MLA
     cake_dsv4_nvfp4_rope_quantize_insert
     cake_dsv4_nvfp4_kv_rope_quantize_insert
 
+Batch-invariant mode: ``trtllm_batch_decode_with_kv_cache_mla(..., sparse_mla_top_k=K,
+backend="auto", batch_invariant=True)`` and ``trtllm_prefill_with_kv_cache_mla`` with
+the same flag run the batch-invariant classes ``mla.sparse.<dtype>.d<576|512>`` of
+:mod:`flashinfer.batch_invariant` on SM100 / SM103 / SM107: every query token is one
+row of one fixed schedule, so a token's output is bit for bit the same from a
+prefill-sized call, a chunk, a decode step or a multi-token row, whatever the batch.
+Inputs outside the classes raise ``BatchInvariantUnsupportedError``; nothing falls
+back. ``flashinfer.batch_invariant.mla.plan(device, num_qo_heads, q_dtype=...,
+qk_rope_head_dim=..., softmax_scale=...)`` returns the same class as a
+``SparseMLAPlan`` for callers that plan once: ``plan.run(query, kv_cache, indices,
+lengths)`` checks its arguments, ``plan.launch(...)`` does not, and
+``flashinfer.batch_invariant.mla.clear_plans()`` forgets the cached plans (captured
+graphs keep replaying). ``out`` and ``lse`` must not share memory with an input. The
+contract (list layout, live counts, scales, CUDA graphs, refused arguments, and what a
+row computes when an unvalidated list breaks it) is in
+``flashinfer/batch_invariant/README.md``.
+
+.. currentmodule:: flashinfer.batch_invariant.mla
+
+.. autosummary::
+    :toctree: ../generated
+
+    plan
+    SparseMLAPlan
+
+.. currentmodule:: flashinfer.mla
+
 .. note::
 
     Experimental ``SparseMLASm120Wrapper.run_mega`` for FP8 caches with ``backend="sparse"``

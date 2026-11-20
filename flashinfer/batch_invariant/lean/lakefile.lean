@@ -37,6 +37,9 @@ lean_exe gdnconformance where
 lean_exe kdaconformance where
   root := `KdaMain
 
+lean_exe mlasparseconformance where
+  root := `MlaSparseMain
+
 lean_exe axioms where
   root := `Axioms
   supportInterpreter := true

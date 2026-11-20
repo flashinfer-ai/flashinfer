@@ -5,7 +5,7 @@
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
 ``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
 proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``) or, for the
-operators without a package of their own, in a subpackage here (``quantization``, ``sampling``, ``gdn``, ``kda``). ``README.md``
+operators without a package of their own, in a subpackage here (``quantization``, ``sampling``, ``gdn``, ``kda``, ``mla``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
@@ -723,6 +723,13 @@ def fingerprint(op: str, **dims) -> str:
     sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
     class's no-window sample row and covers windowed calls too.
 
+    ``trtllm_batch_decode_with_kv_cache_mla`` and ``trtllm_prefill_with_kv_cache_mla`` (sparse MLA on SM100 / SM103 /
+    SM107) take the Q / KV ``dtype`` (``torch.float8_e4m3fn`` or ``torch.bfloat16``) and ``head_dim`` (576 for RoPE rows,
+    512 for NoPE rows): the classes ``mla.sparse.<dtype>.d<head_dim>`` are a two-CTA sparse MLA kernel on one pinned
+    schedule whose sources the classes own (``flashinfer/batch_invariant/mla/kernel``), and the receipt digests that
+    schedule, those sources and the installed ``nvidia-cutlass-dsl`` version. The head count, the list width, the batch
+    and the call shape (prefill, chunk, decode, multi-token) are not dimensions.
+
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
@@ -793,7 +800,10 @@ from .kda.classes import register as _register_kda  # noqa: E402
 from .quantization.classes import register as _register_quantization  # noqa: E402
 from .sampling.classes import register as _register_sampling  # noqa: E402
 
+from .mla.classes import register as _register_mla  # noqa: E402
+
 _register_quantization(CLASSES, ClassInfo)
 _register_sampling(CLASSES, ClassInfo)
 _register_gdn(CLASSES, ClassInfo)
 _register_kda(CLASSES, ClassInfo)
+_register_mla(CLASSES, ClassInfo)

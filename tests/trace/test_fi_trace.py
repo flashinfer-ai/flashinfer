@@ -1683,6 +1683,14 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
     ]
     assert ragged["inputs"]["max_q_len"]["shape"] is None
 
+    flagged = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+        query=torch.empty(2, 1, 128, 576, dtype=torch.bfloat16),
+        sparse_mla_top_k=1,
+        batch_invariant=True,
+        **common,
+    )
+    assert flagged == {}
+
 
 @pytest.mark.parametrize("layout", ["dense", "ragged", "sparse"])
 @pytest.mark.parametrize("return_lse_base", ["basee", "base2", None])

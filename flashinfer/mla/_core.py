@@ -905,6 +905,57 @@ def _normalize_dsv4_topk_lens(
     return topk_lens
 
 
+_sparse_mla_batch_invariant = None
+
+
+def _mla_batch_invariant(
+    query,
+    kv_cache,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    block_tables,
+    sparse_mla_top_k,
+    out,
+    bmm1_scale,
+    bmm2_scale,
+    backend,
+    lse,
+    return_lse,
+    return_lse_base,
+    cum_seq_lens_q,
+    sparse_mla_top_k_lens,
+    batch_invariant,
+    refused,
+):
+    """``batch_invariant=True`` on the MLA functions: the sparse MLA classes of ``flashinfer.batch_invariant.mla``."""
+    if batch_invariant is not True:
+        raise TypeError("batch_invariant must be bool")
+    global _sparse_mla_batch_invariant
+    if _sparse_mla_batch_invariant is None:
+        from ..batch_invariant.mla.api import sparse_mla_batch_invariant
+
+        _sparse_mla_batch_invariant = sparse_mla_batch_invariant
+    return _sparse_mla_batch_invariant(
+        query,
+        kv_cache,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        block_tables,
+        sparse_mla_top_k,
+        out,
+        bmm1_scale,
+        bmm2_scale,
+        backend,
+        lse,
+        return_lse,
+        return_lse_base,
+        cum_seq_lens_q,
+        sparse_mla_top_k_lens,
+        _validate_dsv4_sync_checks(query.device),
+        refused,
+    )
+
+
 def _validate_dsv4_sync_checks(device: torch.device) -> bool:
     if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("0", ""):
         return False
@@ -3568,6 +3619,7 @@ def _mla_with_kv_cache_impl(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Execute MLA decode or prefill through the selected backend:
     TRTLLM-GEN, CuteDSL, XQA, Cake, or SM120/SM121 sparse kernels.
@@ -3793,6 +3845,42 @@ def _mla_with_kv_cache_impl(
     causal_seqlens_kv_global : Optional[torch.Tensor] = None
         Contiguous CUDA int32 tensor ``[batch_size]`` containing the global
         exclusive causal bound for the newest query token. Required with DCP.
+    batch_invariant : bool = False
+        Make each query token's output independent of the other tokens and
+        requests in the call. On SM100/SM103/SM107 with
+        ``sparse_mla_top_k > 0`` and ``backend="auto"``, ``True`` runs the
+        batch-invariant sparse MLA classes ``mla.sparse.<dtype>.d<576|512>``
+        (``flashinfer.batch_invariant``) in place of TRTLLM-GEN: every query
+        token is one row of the classes' own kernel on one fixed schedule,
+        so its output bits depend on its query, its selected-key list, the
+        cache rows and the scales only, and a token gives the same bits from
+        a prefill-sized call, a chunk, a decode step or a multi-token row.
+        ``block_tables`` holds the selected storage rows
+        (``page * page_size + offset``) of each query token in list order,
+        live entries before any ``-1``; ``sparse_mla_top_k_lens`` is accepted
+        for both layouts and defaults to the full width; ``seq_lens``,
+        ``max_seq_len``, ``workspace_buffer``, ``qk_nope_head_dim``,
+        ``is_var_seq``, ``enable_pdl`` and ``max_q_len`` are not read, and
+        ``cum_seq_lens_q`` only marks a ``[total_q, heads, head_dim]`` query
+        (every query token is its own row). Contiguous
+        16-byte-aligned BF16 or E4M3 query and KV cache of width 576 or 512,
+        any list width, 1 to 128 heads; a BF16 call takes at most 65,535
+        query tokens (split a larger call, the rows do not depend on the
+        split). LSE output is natural-log and needs
+        ``return_lse_base="basee"``. Any other backend, architecture or input
+        (sinks, DCP, packed uint8 caches, skip-softmax, ``use_fp16_softmax``,
+        ``multi_ctas_kv_counter_buffer``) raises
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`;
+        nothing falls back. CUDA graphs: run one call of the shape before
+        capture and pass ``out``; the graph reads the plan cached for that
+        shape. ``out`` and ``lse`` must not share memory with an input.
+        The list is the caller's contract (``0 <= live count <= top_k``,
+        live indices inside the cache); set
+        ``FLASHINFER_VALIDATE_INPUTS=1`` to check it on the
+        host (synchronizes; a ``-1`` tail passes, a live entry after a
+        ``-1`` is refused). Callers that plan once can use
+        ``flashinfer.batch_invariant.mla.plan`` directly. A flagged call is
+        not traced by ``fi_trace``.
 
     Note
     ----
@@ -3839,6 +3927,38 @@ def _mla_with_kv_cache_impl(
     the production page-sharing pattern of your workload (e.g., heavily shared
     prefix → smaller pool; independent contexts → larger pool).
     """
+    if batch_invariant is not False:
+        return _mla_batch_invariant(
+            query,
+            kv_cache,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            block_tables,
+            sparse_mla_top_k,
+            out,
+            bmm1_scale,
+            bmm2_scale,
+            backend,
+            lse,
+            return_lse,
+            return_lse_base,
+            cum_seq_lens_q,
+            sparse_mla_top_k_lens,
+            batch_invariant,
+            (
+                sinks,
+                skip_softmax_threshold_scale_factor,
+                enable_dcp,
+                cp_world,
+                cp_rank,
+                causal_seqlens_kv_global,
+                use_fp16_softmax,
+                multi_ctas_kv_counter_buffer,
+                uses_shared_paged_kv_idx,
+                cute_dsl_impl,
+                kv_scale_format,
+            ),
+        )
     # Shared argument validation. Packed sparse inputs keep their own contract.
     if return_lse_base is not None and (
         not isinstance(return_lse_base, str)
@@ -4554,6 +4674,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """See :func:`_mla_with_kv_cache_impl` for parameter documentation."""
     return _mla_with_kv_cache_impl(
@@ -4590,6 +4711,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
         return_lse_base=return_lse_base,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -5226,6 +5348,7 @@ def trtllm_prefill_with_kv_cache_mla(
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     return_lse_base: Optional[Literal["basee", "base2"]] = None,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Run MLA with decode-compatible semantics for prefill callers.
 
@@ -5279,6 +5402,7 @@ def trtllm_prefill_with_kv_cache_mla(
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
         return_lse_base=return_lse_base,
+        batch_invariant=batch_invariant,
     )
 
 
