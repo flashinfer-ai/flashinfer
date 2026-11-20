@@ -466,6 +466,30 @@ def test_positive_gate_absolute_accuracy(route, lengths, monkeypatch):
     assert_close_at_gate(out, ref)
 
 
+@pytest.mark.parametrize(
+    "route,lengths",
+    [("w6", (2046, 2045, 2045, 2045)), ("w7", (6001, 5999))],
+)
+def test_small_attention_gate_boundary(route, lengths, monkeypatch):
+    x = make_uniform_dense_prefix_inputs(lengths)
+    x["q"].zero_()
+    x["v_cache"].fill_(2.0)  # Every nonempty prefix gives att_half = 1.
+    gate = x["output_gate"]
+    values = torch.tensor(
+        [-16, -10.0625, -10, -9.9375, -9, -8, -6, -4, -1, -1 / 128, 0, 1 / 128, 4],
+        dtype=torch.bfloat16,
+        device=gate.device,
+    )
+    # Bands wider than a W6/W7 tile: -10 cannot trigger the tile redo on
+    # behalf of every nearby negative gate, and nonnegative tiles stay packed.
+    band = torch.arange(gate.shape[0], device=gate.device) // 128
+    g = values[band % values.numel()][:, None, None]
+    gate.copy_(g)
+    out = run_route(x, route, monkeypatch)
+    ref = (2.0 * g.float().sigmoid()).bfloat16().expand_as(out)
+    assert_close_at_gate(out, ref)
+
+
 def make_negative_gate_inputs(lengths):
     """Large in-contract attention values under a strongly negative gate:
     V is a constant 256 (E4M3-exact), K all ones (uniform softmax, so the

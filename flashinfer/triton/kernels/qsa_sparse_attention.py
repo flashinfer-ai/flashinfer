@@ -193,8 +193,8 @@ def _gate_redo(att, g):
     return (att.to(tl.float32) * _sigm_f32(g)).to(tl.bfloat16)
 
 
-# Guard by attention magnitude, not gate sign: even a small positive-gate
-# sigmoid error can move the result across a BF16 rounding boundary. Keep
+# The mixed-format _gmul guard uses attention magnitude: even a small
+# positive-gate sigmoid error can cross a BF16 rounding boundary. Keep
 # the packed path for |att| <= 2, where one BF16 step below the maximum
 # output is at most 1/128 (at |att| = 4 it would already exceed 0.01).
 
@@ -223,9 +223,10 @@ def _gmul_bf(att_half, g):
     """Fully packed BF16 gate with sigmoid's 0.5 already folded into
     att_half: one bf16x2 multiply, one bf16x2 tanh, one bf16x2 add and one
     bf16x2 multiply replace the FP32 widening, FP32 halving and FP16
-    narrowing that the mixed-format gate needs.  Exact tile redo for
-    large attention values."""
-    bad = tl.abs(att_half) > 1.0
+    narrowing that the mixed-format gate needs. For negative gates,
+    1 + tanh(g/2) subtracts nearly equal magnitudes as tanh approaches -1.
+    Use the non-cancelling FP32 sigmoid there, even for small attention."""
+    bad = (tl.abs(att_half) > 1.0) | (g < 0.0)
     if tl.max(bad.to(tl.int32)) > 0:
         out = _gate_redo2(att_half, g)
     else:
@@ -2230,8 +2231,6 @@ def _qsa_w6(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, T, NSLOT,
     if GATEPTX:
         outv = _gmul_bf(att, gg)
     else:
-        # Both gate helpers carry the same exact-tile-redo guard; the branch
-        # is kept so the operand types match each route's tuning.
         outv = _gmul(att, gg.to(tl.float32))
     tl.store(O + qoff, outv, mask=rv[:, None])
 
