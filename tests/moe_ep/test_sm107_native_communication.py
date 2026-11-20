@@ -17,14 +17,14 @@ def _component(
     split=False,
 ):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.api import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.api import (
         ImplDesc,
         ProblemDesc,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.communication.nvlink_domain.token_comm import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.communication.nvlink_domain.token_comm import (
         TokenCommNonDeterministic,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.quant_def import (
         CombineFormat,
     )
 
@@ -81,7 +81,7 @@ def test_multistage_dispatch_accepts_complete_scale_groups(split, depth):
 @pytest.mark.parametrize("depth", [1, 2, 3])
 def test_token_back_chunks_fit_registered_stages(kind, hidden, mode, depth):
     component = _component(kind=kind, hidden=hidden, depths=(1, depth), mode=mode)
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.helpers.smem_workspace import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.helpers.smem_workspace import (
         SmemWorkspace,
     )
 
@@ -114,10 +114,8 @@ def test_token_back_chunks_fit_registered_stages(kind, hidden, mode, depth):
 def test_native_multistage_copies_graph(
     ep_runtime, monkeypatch, kind, hidden, depths, mode
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import src
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.api import (
-        ImplDesc,
-    )
+    from flashinfer.moe_ep.kernels import cutedsl_megamoe as src
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.api import ImplDesc
 
     construct = src.RubinInferenceMegaMoE
 

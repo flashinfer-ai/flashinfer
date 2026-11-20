@@ -619,9 +619,10 @@ def test_draw_support_ir_uses_only_declared_forms(
     tmp_path, dtype, N, cfg, from_logits, fset, trow, idx, lp, lpk
 ):
     """Compile one kernel per code path with no GPU visible and check the PTX: `.rn` arithmetic only, `ex2.approx` iff
-    logits and `lg2.approx` iff the log-probability, the declared `cvt.rzi.s64.f32` iff top-p, the divisions declared
+    logits and `lg2.approx` iff a log-probability is formed, the declared `cvt.rzi.s64.f32` iff top-p, the divisions declared
     (`div(2^44, S)` for top-p, the per-row temperature's), the shared-memory integer adds of the histograms, the cluster
-    forms only in cluster members, no fast-math anywhere."""
+    forms only in cluster members, `griddepcontrol` in every kernel (PDL is a runtime launch argument), no fast-math
+    anywhere."""
     pytest.importorskip("cutlass")
     f = SETS[fset]
     code = (
@@ -642,6 +643,7 @@ def test_draw_support_ir_uses_only_declared_forms(
     assert ("cvt.rzi.s64.f32" in ptx) == (f.top_p is not None)
     divs = (1 if trow else 0) + (1 if f.top_p is not None else 0)
     assert ptx.count("div.rn.f32") == divs, (ptx.count("div.rn.f32"), divs)
+    assert "griddepcontrol.wait" in ptx and "griddepcontrol.launch_dependents" in ptx
     assert "red.shared.add.u32" in ptx
     Cc = cfg[4] if len(cfg) > 4 else 1
     assert ("barrier.cluster" in ptx) == (Cc > 1) and (
@@ -653,13 +655,13 @@ def test_draw_support_ir_uses_only_declared_forms(
 _WORKER_CODE = r"""
 import ast, sys
 from flashinfer.batch_invariant.sampling.schedule import LSEConfig
-from flashinfer.batch_invariant.sampling.draw_support_kernel import get_compiled_kernel
+from flashinfer.batch_invariant.sampling.draw_support_kernel import precompile
 from flashinfer.batch_invariant.sampling.support_spec import Filters
 bad = []
 for s in ast.literal_eval(sys.argv[1]):
     try:
         ds, N, cfg, from_logits, fset, trow, idx, lp, pdl, *rest = s
-        get_compiled_kernel(ds, N, LSEConfig(*cfg), from_logits, Filters(**dict(fset)), trow, idx, lp, pdl, *rest)
+        precompile(ds, N, LSEConfig(*cfg), from_logits, Filters(**dict(fset)), trow, idx, lp, pdl, *rest)   # outside the module lock
     except Exception as e:  # noqa: BLE001
         bad.append((s, repr(e)[:300]))
 print("BAD", repr(bad))
@@ -695,6 +697,7 @@ def _spec(
     ef="mass",
     cl=None,
 ):
+    del pdl  # a runtime launch argument: not a compile dimension
     return (
         ds,
         N,
@@ -704,7 +707,7 @@ def _spec(
         trow,
         idx,
         lp,
-        pdl,
+        False,
         ef,
         lpk,
         score,
@@ -1654,6 +1657,44 @@ def test_determinism_graph_replay_and_pdl():
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(tp, ref_p) and torch.equal(tx, ref_x)
+
+
+@needs_device
+def test_scalar_filter_cache_is_ordered_across_streams():
+    """The per-row tensor of a Python-scalar filter is cached on its first use; a call on ANOTHER stream must not read it
+    before the creating stream's fill has run (the review of #9695 reproduced 521 of 601 wrong rows with the fill queued
+    behind busy work on the creating stream). The entry carries its fill's event and other streams wait on it, device side.
+    The (value, rows) pair is this test's own, so its first use is here."""
+    N, M, k = 1000, 601, 43
+    p = weights(M, N, torch.bfloat16)
+    s, o = keys(M, 11)
+    k_rows = torch.full(
+        (M,), k, dtype=torch.int32, device="cuda"
+    )  # a per-row tensor: no cache involved
+    ref = flashinfer.sampling.top_k_sampling_from_probs(
+        p, k_rows, seed=s, offset=o, batch_invariant=True
+    )
+    torch.cuda.synchronize()
+    a, b = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(a):
+        busy = torch.randn(8192, 8192, device="cuda")
+        for _ in range(
+            4
+        ):  # tens of milliseconds: the scalar's fill queues behind it on this stream
+            busy = busy @ busy / 128.0
+        out_a = flashinfer.sampling.top_k_sampling_from_probs(
+            p, k, seed=s, offset=o, batch_invariant=True
+        )
+    with torch.cuda.stream(b):  # the cached tensor, before the fill on stream a has run
+        out_b = flashinfer.sampling.top_k_sampling_from_probs(
+            p, k, seed=s, offset=o, batch_invariant=True
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(out_a, ref)
+    assert torch.equal(out_b, ref), (
+        f"{int((out_b != ref).sum())} of {M} rows read the scalar filter before its fill"
+    )
+    del busy
 
 
 @needs_device

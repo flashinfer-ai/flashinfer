@@ -10,25 +10,25 @@ from types import SimpleNamespace
 import pytest
 
 
-_PACKAGE_NAME = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
+_PACKAGE_NAME = "flashinfer.moe_ep.shims.sm90.push_style_megamoe"
 _PACKAGE_ROOT = (
     Path(__file__).resolve().parents[3]
     / "flashinfer"
     / "moe_ep"
-    / "kernel_src"
+    / "shims"
     / "sm90"
     / "push_style_megamoe"
 )
 
 
 def _package_text(*parts: str) -> str:
-    source_tree = _PACKAGE_ROOT.joinpath(*parts)
-    if source_tree.is_file():
-        return source_tree.read_text(encoding="utf-8")
-
-    resource = resources.files(_PACKAGE_NAME)
-    for part in parts:
-        resource = resource / part
+    if parts[0] == "src":
+        package = "flashinfer.moe_ep.kernels.flashinfer.push_style_megamoe"
+    else:
+        package = _PACKAGE_NAME
+    resource = resources.files(package)
+    for part in parts[1:]:
+        resource = resource.joinpath(part)
     return resource.read_text(encoding="utf-8")
 
 
@@ -89,7 +89,7 @@ class _FakeGemmRunner:
 
 @pytest.mark.cpu_only
 def test_pipe_ep_size_validation_uses_guarded_handshake_with_a_comm() -> None:
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import Sm90PushPipe
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import Sm90PushPipe
 
     arguments = {
         "ep_size": 0,
@@ -177,9 +177,7 @@ class _FakePipe:
 
 
 def _runner():
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
-        runner as module,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import runner as module
 
     log = []
     pipe = _FakePipe(log)
@@ -226,7 +224,7 @@ def _runner():
 def _weight_bundle(*, num_experts: int = 1):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import Sm90PushWeights
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import Sm90PushWeights
 
     return Sm90PushWeights(
         w13_fp8=torch.empty(num_experts, 256, 128, dtype=torch.float8_e4m3fn),
@@ -261,9 +259,7 @@ def test_runner_rebinds_same_geometry_weights_without_reallocating_scratch():
 def test_runner_weight_rebind_is_idle_only_and_transactional():
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
-        runner as module,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import runner as module
 
     runner, pipe, _log = _runner()
     pipe.device = torch.device("cpu")
@@ -295,9 +291,7 @@ def test_runner_weight_rebind_is_idle_only_and_transactional():
 def test_gemm_jit_collective_elects_one_leader_per_cache_and_tactic_identity(
     monkeypatch, rank, prepare_phase
 ):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
-        runner as module,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import runner as module
 
     cache_identities = [
         ("host-a", "cache-a", 9, 0, 132, True, 128, 4, 256, 256, False, False),
@@ -327,9 +321,7 @@ def test_gemm_jit_collective_elects_one_leader_per_cache_and_tactic_identity(
 
 @pytest.mark.cpu_only
 def test_gemm_jit_cache_identity_includes_tactic_inputs(monkeypatch, tmp_path):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
-        runner as module,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import runner as module
 
     instance = object.__new__(module.Sm90PushMoERunner)
     instance.pipe = SimpleNamespace(
@@ -372,9 +364,7 @@ def test_gemm_jit_cache_identity_includes_tactic_inputs(monkeypatch, tmp_path):
 
 @pytest.mark.cpu_only
 def test_gemm_jit_allows_warm_cache_without_nvcc(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
-        runner as module,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import runner as module
 
     instance = object.__new__(module.Sm90PushMoERunner)
     instance.pipe = SimpleNamespace(
@@ -397,9 +387,7 @@ def test_gemm_jit_allows_warm_cache_without_nvcc(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_gemm_jit_rejects_cold_cache_without_nvcc(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
-        runner as module,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import runner as module
 
     instance = object.__new__(module.Sm90PushMoERunner)
     instance.pipe = SimpleNamespace(
@@ -425,9 +413,7 @@ def test_gemm_jit_rejects_cold_cache_without_nvcc(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_fused_fc1_rejects_disabled_deepgemm(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
-        runner as module,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import runner as module
 
     instance = object.__new__(module.Sm90PushMoERunner)
     instance.pipe = SimpleNamespace(
@@ -603,7 +589,7 @@ def test_runner_destroy_is_idempotent():
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("round_open", [True, False])
 def test_pipe_abort_uses_control_stream_and_device_anchor(monkeypatch, round_open):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import protocol
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import protocol
 
     log = []
     pipe = object.__new__(protocol.Sm90PushPipe)
@@ -634,7 +620,7 @@ def test_pipe_abort_uses_control_stream_and_device_anchor(monkeypatch, round_ope
 
 @pytest.mark.cpu_only
 def test_pipe_abort_keeps_local_poison_when_cuda_is_sticky(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import protocol
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import protocol
 
     log = []
     pipe = object.__new__(protocol.Sm90PushPipe)

@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 
 from flashinfer import moe_ep
-from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
 
 @pytest.mark.arch_blackwell
@@ -108,7 +108,7 @@ def test_standard_features(
         )
     if kind == "nvfp4":
         config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
             combine_dtype=wire,
             enable_fc1_activation_per_token_scale=activation.endswith("scale"),
             **options,
@@ -117,7 +117,7 @@ def test_standard_features(
         config = moe_ep.Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**options)
     else:
         config = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
-            kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next",
+            kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl",
             kind=kind,
             **options,
         )
@@ -280,12 +280,12 @@ def test_standard_padded_mxfp8_staging(kind, fused, monkeypatch):
                 intermediate_size=128,
                 top_k=2,
                 kind=kind,
-                kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next",
+                kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl",
             )
         ),
     )
     try:
-        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             kernel_helpers as helpers,
         )
 
@@ -344,7 +344,7 @@ def test_standard_cake_finalizer(mode, monkeypatch):
                 intermediate_size=128,
                 top_k=6,
                 finalize_mode=moe_ep.FinalizeMode[mode],
-                kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+                kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
             )
         ),
     )

@@ -533,7 +533,7 @@ def test_numerical_contract_covers_activation_recipe_and_combine(monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.automatic import (
         ep_tuning_contract,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledMoeConfig,
     )
     from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
@@ -1057,7 +1057,7 @@ def test_shared_stager_does_not_bootstrap_a_kernel_package():
                 )
                 staged = plan._stage(tensors)
                 assert (staged.topk_ids[1:] == -1).all()
-                assert "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" not in sys.modules
+                assert "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification" not in sys.modules
                 assert sys.modules["common"] is other
             """),
         ],

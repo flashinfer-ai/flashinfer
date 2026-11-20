@@ -445,7 +445,7 @@ def check_device_resources(
 
     from concurrent.futures import ThreadPoolExecutor
 
-    from ......kernel_src.sm120.cake_mxfp4_megamoe import (
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import (
         GIN_BACKENDS,
         cuobjdump_path,
         device_cubin_resource_usage,
@@ -969,7 +969,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
     def _allocate_workspace(self, fleet_params: FleetParams) -> _CakeWorkspace:
         import torch.distributed as dist
 
-        from ......kernel_src.sm120.cake_mxfp4_megamoe import (
+        from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import (
             device_cubin,
             load_cake_sm120_megamoe_module,
         )
@@ -1157,7 +1157,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
         device_parameters = kernel["params"].device_parameters()
         gin_backend = _NO_GIN_BACKEND
         if session.gin_available:
-            from ......kernel_src.sm120.cake_mxfp4_megamoe import gin_backend_name
+            from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import gin_backend_name
 
             gin_backend = gin_backend_name(session.gin_type)
         for inst_name, spec in specs.items():
@@ -1172,7 +1172,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             loaded_functions.append(function)
             local_bytes = int(module.function_local_bytes(function))
             if local_bytes > LOCAL_BYTES_LIMIT:
-                from ......kernel_src.sm120.cake_mxfp4_megamoe import (
+                from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import (
                     cuobjdump_path,
                     device_cubin_resource_usage,
                     nvcc_version,

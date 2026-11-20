@@ -10,9 +10,7 @@ from flashinfer import autotune_v2, moe_ep
 from flashinfer.autotuner import AutoTuner
 from flashinfer.autotune_cache import MeasurementPolicy
 from flashinfer.moe_ep.backends.mega.kernel.sm107 import variant_selection as selection
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
-    autotune as native,
-)
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import autotune as native
 from tests.moe_ep.sm107_test_utils import (
     assert_prepared_eager_execution,
     assert_reference,
@@ -57,7 +55,7 @@ def test_variant_search_replay_and_handoff(
     bootstrap = rubin_bootstrap
     rank, world = bootstrap.rank, bootstrap.world_size
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE as NATIVE_NAMESPACE,
     )
 

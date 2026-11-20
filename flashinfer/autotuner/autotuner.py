@@ -912,6 +912,30 @@ class TunableRunner(ABC):
         """
         return ()
 
+    def get_tactic_cache_key(
+        self, inputs: list[torch.Tensor]
+    ) -> tuple[Any, ...] | None:
+        """Optionally identify the tactic pool for tuning-cache reuse.
+
+        Return a cheap, hashable, cross-process-stable signature that changes
+        when tactics become available under the same runner identity. Like
+        cache-key extras, it must be invariant under input synthesis. Do not
+        build plans, profile, enumerate tactics, or launch GPU work here: this
+        runs before preparation, including on warm tuning hits and during a
+        CUDA Graph capture inside ``autotune(True)``. Lookups outside tuning
+        never call it. Coverage records persist the signature as text:
+        frozensets are written in a canonical order, and other values must
+        have a ``str()`` that is stable across processes.
+        Coverage keeps the signature read before tactic enumeration, so
+        preparation that changes it leads to a retune on the next pass.
+
+        ``None`` preserves the existing assumption that the runner identity
+        determines its tactic pool. A changed signature requires retuning,
+        including for a single runner, without invalidating serving lookups.
+        ``rank_tactics(k > 1)`` also re-ranks a shortlist when it changes.
+        """
+        return None
+
     def precompile_tactics(
         self,
         inputs: List[torch.Tensor],
@@ -1515,8 +1539,8 @@ def _sticky_cuda_error() -> Exception | None:
 
     The capture check comes before both: a device synchronize during capture
     does not merely fail, it invalidates the capture, and suppressing its
-    exception would hide that. ``rank_tactics`` reaches here with no capture
-    pre-check of its own, unlike ``choose_one``.
+    exception would hide that. ``choose_one`` and ``rank_tactics`` refuse to
+    start profiling during capture; this check remains as a backstop.
     """
     if not torch.cuda.is_initialized():
         return None
@@ -1572,21 +1596,69 @@ class ProfilingCacheKey:
         return str(self.key_fields)
 
 
+class _SortedFrozensetText(tuple):
+    """A frozenset's items in sorted order that still prints as a frozenset."""
+
+    def __repr__(self) -> str:
+        return f"frozenset({{{', '.join(map(repr, self))}}})" if self else "frozenset()"
+
+
+def _canonical_signature(value: Any) -> Any:
+    """Order frozensets so a signature's persisted text is process-stable.
+
+    ``str()`` of a frozenset of strings depends on the per-process hash seed,
+    so equal signatures could otherwise be written differently. Frozensets
+    keep their ``frozenset(...)`` text so they never match an equal tuple.
+    """
+    if isinstance(value, frozenset):
+        return _SortedFrozensetText(
+            sorted((_canonical_signature(v) for v in value), key=repr)
+        )
+    if isinstance(value, tuple):
+        items = tuple(_canonical_signature(v) for v in value)
+        return (
+            value if all(a is b for a, b in zip(items, value, strict=True)) else items
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class _ProfilingCandidates:
-    runtime_keys: frozenset[tuple[str, int, tuple[Any, ...]]] | None
+    runtime_keys: (
+        frozenset[tuple[str, int, tuple[Any, ...], tuple[Any, ...] | None]] | None
+    )
     file_keys: tuple[str, ...] | None
+
+    @staticmethod
+    def tactic_keys(
+        runners: list[TunableRunner], inputs: list[torch.Tensor]
+    ) -> list[tuple[Any, ...] | None]:
+        return [r.get_tactic_cache_key(inputs) for r in runners]
 
     @classmethod
     def from_runners(
-        cls, runners: list[TunableRunner], inputs: list[torch.Tensor]
+        cls,
+        runners: list[TunableRunner],
+        inputs: list[torch.Tensor],
+        tactic_keys: list[tuple[Any, ...] | None] | None = None,
     ) -> "_ProfilingCandidates | None":
-        if len(runners) == 1:
+        """Build coverage keys; ``tactic_keys`` reuses signatures read earlier."""
+        if tactic_keys is None:
+            tactic_keys = cls.tactic_keys(runners, inputs)
+        if len(runners) == 1 and tactic_keys[0] is None:
             return None
         runtime_keys = frozenset(
-            (type(r).__name__, hash(r), r.get_cache_key_extras(inputs)) for r in runners
+            (type(r).__name__, hash(r), r.get_cache_key_extras(inputs), tactic_key)
+            for r, tactic_key in zip(runners, tactic_keys, strict=True)
         )
-        file_keys = {str((name, extras)) for name, _, extras in runtime_keys}
+        file_keys = {
+            str(
+                (name, extras)
+                if tactic_key is None
+                else (name, extras, _canonical_signature(tactic_key))
+            )
+            for name, _, extras, tactic_key in runtime_keys
+        }
         # Persisted keys omit runtime hashes, so collisions make coverage ambiguous.
         return cls(
             runtime_keys,
@@ -1987,8 +2059,9 @@ class AutoTuner:
         # Ranked shortlists are process-local. Persisted configs retain the
         # selected winner; a later tuning session rebuilds the shortlist when
         # compound refinement needs more than one candidate. Each shortlist is
-        # stored with the replay/L2 policy it was measured under, because the
-        # cache key does not include that policy.
+        # stored with the replay/L2 policy it was measured under and the
+        # runner's tactic-pool signature, because the cache key includes
+        # neither.
         self._ranked_tactics_cache: dict[
             ProfilingCacheKey, tuple[tuple[Any, ...], tuple[Any, ...]]
         ] = {}
@@ -3359,10 +3432,14 @@ class AutoTuner:
             plan_error = None
             profiles = []
             profiling_candidates = None
+            # Signatures read before enumeration; coverage keeps them even if
+            # preparation changes a runner's pool (see get_tactic_cache_key).
+            tactic_keys = None
             try:
                 profiles = self._generate_optimization_profiles(tuning_config, inputs)
+                tactic_keys = _ProfilingCandidates.tactic_keys(runners, inputs)
                 profiling_candidates = _ProfilingCandidates.from_runners(
-                    runners, inputs
+                    runners, inputs, tactic_keys
                 )
             except (_TuningGroupError, _StickyCudaError):
                 raise
@@ -3702,9 +3779,10 @@ class AutoTuner:
                                 self._tie_tolerance,
                             )
                             _, runner_id, tactic = measured[winner]
-                            # Publish and look up coverage using the prepared runners.
+                            # Publish and look up coverage using the prepared runners'
+                            # hashes, but the pool signatures read before enumeration.
                             profiling_candidates = _ProfilingCandidates.from_runners(
-                                runners, inputs
+                                runners, inputs, tactic_keys
                             )
                             cache_key = self._get_cache_key(
                                 custom_op,
@@ -4062,10 +4140,14 @@ class AutoTuner:
                 )
 
             plan_error = None
+            # Read before enumeration, as choose_one() does, so a pool that
+            # changes during preparation is ranked again on the next pass.
+            tactic_key = None
             try:
                 input_shapes = tuple(self._get_input_sizes(inputs))
                 profiles = self._generate_optimization_profiles(tuning_config, inputs)
                 runner = runners[0]
+                tactic_key = runner.get_tactic_cache_key(inputs)
                 runner_arg_names = {
                     param.name
                     for param in inspect.signature(runner.forward).parameters.values()
@@ -4108,11 +4190,13 @@ class AutoTuner:
                 tuning_config,
                 runner.get_cache_key_extras(inputs),
             )
-            policy = self._profiling_policy(tuning_config)
+            # A shortlist is reused only for the same measurement policy and
+            # the same declared tactic pool (see get_tactic_cache_key).
+            shortlist_identity = (self._profiling_policy(tuning_config), tactic_key)
             ranked_cache = self._ranked_cache()
             cached = ranked_cache.get(cache_key)
             if _all_ranks_hit_cache(
-                cached is not None and cached[0] == policy,
+                cached is not None and cached[0] == shortlist_identity,
                 (type(runner).__name__, k, cached[1][:k]) if cached else None,
             ):
                 assert cached is not None
@@ -4127,6 +4211,13 @@ class AutoTuner:
             input_preparation_oom = False
             input_error = None
             try:
+                # As in choose_one(): a warm shortlist hit is safe during an
+                # outer capture, but synthesis or profiling would mutate the
+                # caller's graph, so a miss there fails instead of falling back.
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "AutoTuner profiling cannot begin during an active outer CUDA Graph capture"
+                    )
                 tensors = self._prepare_input_tensors(profile, inputs)
                 if tuning_config.inputs_pre_hook is not None:
                     tensors = list(tuning_config.inputs_pre_hook(tensors))
@@ -4264,7 +4355,7 @@ class AutoTuner:
                 ranked[0],
                 self._selection_record([t for t, _ in scored], 0),
             )
-            ranked_cache[cache_key] = (policy, tuple(ranked))
+            ranked_cache[cache_key] = (shortlist_identity, tuple(ranked))
 
             return ranked[:k]
 

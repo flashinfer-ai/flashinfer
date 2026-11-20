@@ -2414,12 +2414,10 @@ def _oracle(
 ) -> torch.Tensor:
     """Pure-Torch block-32 MXFP8 reference (same construction as the FlashInfer sm100 oracle)."""
 
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
-        weights as wh,
-    )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-        compute_megamoe_reference_mxfp8,
-        mxfp8_quantize_per_block_32,
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.kernel_helpers import (
+        compute_megamoe_reference_block_scaled,
+        interleave_gate_up_16,
+        quantize_mxfp8_block32,
     )
 
     tokens = t.num_tokens
@@ -2432,46 +2430,36 @@ def _oracle(
     gathered_hidden = _all_gather_rows(hidden).reshape(WORLD * bound, HIDDEN)
     gathered_ids = _all_gather_rows(ids).reshape(WORLD * bound, TOP_K)
     gathered_weights = _all_gather_rows(weights).reshape(WORLD * bound, TOP_K)
-    activation_q, activation_sf = mxfp8_quantize_per_block_32(
+    activation_q, activation_sf = quantize_mxfp8_block32(
         gathered_hidden.float(), torch.float8_e4m3fn
     )
-    fc1_logical = wh._fc1_weight_from_w13(w13, intermediate_size=INTERMEDIATE)
-    fc1_q, fc1_sf, fc2_q, fc2_sf = [], [], [], []
-    for expert in range(LOCAL_EXPERTS):
-        q, sf = wh._quantize_mxfp8_weight_k_major(
-            fc1_logical[expert].transpose(0, 1), kind="mxfp8_e4m3"
-        )
-        fc1_q.append(q.transpose(0, 1))
-        fc1_sf.append(sf)
-        q, sf = wh._quantize_mxfp8_weight_k_major(w2[expert], kind="mxfp8_e4m3")
-        fc2_q.append(q.transpose(0, 1))
-        fc2_sf.append(sf)
-    offset = ep16.rank * LOCAL_EXPERTS
-    owned = (gathered_ids >= offset) & (gathered_ids < offset + LOCAL_EXPERTS)
-    local_ids = torch.where(
-        owned, gathered_ids - offset, torch.full_like(gathered_ids, -1)
+    q1, sf1 = quantize_mxfp8_block32(
+        interleave_gate_up_16(w13, intermediate_size=INTERMEDIATE).float(),
+        torch.float8_e4m3fn,
     )
-    local_terms = compute_megamoe_reference_mxfp8(
-        input_activation=activation_q.unsqueeze(0),
-        input_activation_sf=activation_sf.unsqueeze(0),
-        input_topk_idx=local_ids.unsqueeze(0),
-        input_topk_weights=gathered_weights.unsqueeze(0),
-        fc1_weight=torch.stack(fc1_q).unsqueeze(0),
-        fc1_weight_sf=torch.stack(fc1_sf).unsqueeze(0),
-        fc2_weight=torch.stack(fc2_q).unsqueeze(0),
-        fc2_weight_sf=torch.stack(fc2_sf).unsqueeze(0),
-        ab_dtype=torch.float8_e4m3fn,
-        gate_up_clamp=None,
-        apply_topk_in_fc1=True,
-    )[0]
-    received = torch.empty_like(local_terms)
-    dist.all_to_all_single(received, local_terms.contiguous())
-    received = received.reshape(WORLD, bound, TOP_K, HIDDEN)
-    combined = torch.zeros((bound, HIDDEN), dtype=torch.float32, device=ep16.device)
+    q2, sf2 = quantize_mxfp8_block32(w2.float(), torch.float8_e4m3fn)
+    combined = torch.zeros_like(gathered_hidden, dtype=torch.float32)
     for route in range(TOP_K):
-        for owner in range(WORLD):
-            combined.add_(received[owner, :, route, :].float())
-    return combined.to(torch.bfloat16)[:tokens]
+        local_terms = compute_megamoe_reference_block_scaled(
+            activation_q,
+            activation_sf,
+            gathered_ids[:, route : route + 1],
+            gathered_weights[:, route : route + 1],
+            q1,
+            sf1,
+            q2,
+            sf2,
+            quant_kind="mxfp8_e4m3",
+            local_expert_offset=ep16.rank * LOCAL_EXPERTS,
+            gate_up_clamp=None,
+            apply_routing_weights_before_fc2=True,
+            return_fp32=True,
+        )
+        dist.all_reduce(local_terms)
+        combined.add_(local_terms)
+    return combined[ep16.rank * bound : (ep16.rank + 1) * bound].to(torch.bfloat16)[
+        :tokens
+    ]
 
 
 def _check(output: torch.Tensor, expected: torch.Tensor) -> None:

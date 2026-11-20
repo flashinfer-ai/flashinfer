@@ -727,9 +727,9 @@ def test_mega_layer_workspace_alloc_raises_during_capture():
 
 def test_shim_capture_guard_raises_when_capturing():
     """ensure_not_capturing raises with a warmup hint during capture."""
-    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+    pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification")
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         ensure_not_capturing,
     )
 

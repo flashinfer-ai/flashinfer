@@ -18,7 +18,7 @@ from flashinfer.moe_ep.core.runtime import (
     finalize_moe_ep_runtime,
     sm107_block_scaled_runtime_requirements,
 )
-from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 
 pytestmark = [pytest.mark.gpu_2, pytest.mark.arch_rubin]
 
@@ -316,10 +316,10 @@ def test_sparse_to_dense_genphase_quiescence(ep_runtime, monkeypatch, early):
     """Stress empty-work reset with slower payload progress per pusher warp."""
     pkg.require_sm107_dsl()
     pkg.bootstrap_paths()
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe import (
         RubinInferenceGenphaseMegaMoE,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.kernel_src.rubin.inference.mega.token_comm_gen_specialized import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.kernel_src.rubin.inference.mega.token_comm_gen_specialized import (
         GenphaseTokenComm,
     )
 
