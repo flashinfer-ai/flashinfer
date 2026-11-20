@@ -496,10 +496,17 @@ def stage_unit(
 
 
 @cute.jit
-def load_group(st, key: Int32, rbase: Int32, sRaw: cute.Tensor, r_g8: cute.Tensor):
-    """The staged bytes of one group (stage key ``key``, clamped to the stage; ``rbase`` the byte offset of the thread's ``d0`` of
-    the stage's key 0) into ``r_g8``."""
-    EB = GROUP // 2 if st.fp4 else GROUP
+def load_group(
+    st,
+    key: Int32,
+    rbase: Int32,
+    sRaw: cute.Tensor,
+    r_g8: cute.Tensor,
+    G: cutlass.Constexpr,
+):
+    """The staged bytes of ``G`` consecutive groups (stage key ``key``, clamped to the stage; ``rbase`` the byte offset of the
+    thread's ``d0`` of the stage's key 0) into ``r_g8``."""
+    EB = G * (GROUP // 2 if st.fp4 else GROUP)
     if key > st.raw_keys - 1:
         key = Int32(st.raw_keys - 1)
     if cutlass.const_expr(st.raw_box_stride == st.raw_bw * st.raw_box_rows):
@@ -534,28 +541,29 @@ def convert_slot(
 ):
     """One ring slot (``slot_keys`` keys of K or V from absolute key ``key0``) from its staged raw bytes (``sRaw``: fp8 bytes, or
     packed NVFP4 nibbles with the block scales ``mSF`` ``(D / 16, page, Hkv, num_pages)`` read from global memory through the
-    stage's page entries ``sPg``): acquire it, convert stage after stage in 16-element groups and commit. Thread ``ctid`` of the stage holds group ``ctid % (D / 16)`` of the
-    keys ``ctid // (D / 16) + round * KPI`` of a stage; the loop is compact and reads a round ahead of its conversion.
+    stage's page entries ``sPg``): acquire it, convert stage after stage in 16-element groups and commit. Thread ``ctid`` of the
+    stage holds ``convert_groups`` consecutive groups (unit ``ctid % UPK`` of ``UPK`` per key) of the keys ``ctid // UPK + round *
+    KPI`` of a stage; the loop is compact and reads a round ahead of its conversion.
     ``sf_swizzled``: the block scales of ``mSF`` are stored in the 4-token swizzle (``sf_offset``)."""
     CT = st.roles.convert_threads
-    GPK = st.D // GROUP  # groups per key
-    KPI = CT // GPK  # keys the stage's threads cover per round
-    NI = (st.raw_keys + KPI - 1) // KPI
+    G = st.convert_groups  # consecutive groups of one key a thread converts per round
+    UPK = st.D // (GROUP * G)  # thread units per key
+    KPI = CT // UPK  # keys the stage's threads cover per round
     EB = GROUP // 2 if st.fp4 else GROUP  # bytes of one group in the cache
     EW = EB // 4
     h = kv_prod.acquire_and_advance()
-    r_in = cute.make_rmem_tensor(cute.make_layout((2 * EW,)), Uint32)
+    r_in = cute.make_rmem_tensor(cute.make_layout((2 * G * EW,)), Uint32)
     r_in8 = cute.make_tensor(
         cute.recast_ptr(r_in.iterator, dtype=cutlass.Uint8),
-        cute.make_layout((2 * EB,)),
+        cute.make_layout((2 * G * EB,)),
     )
-    r_sf = cute.make_rmem_tensor(cute.make_layout((SF_AHEAD + 1,)), Uint32)
+    r_sf = cute.make_rmem_tensor(cute.make_layout(((SF_AHEAD + 1) * G,)), Uint32)
     r_out = cute.make_rmem_tensor(cute.make_layout((GROUP // 2,)), Uint32)
-    kt = ctid // GPK
-    d0 = (ctid % GPK) * GROUP
+    kt = ctid // UPK
+    d0 = (ctid % UPK) * (GROUP * G)
     e0 = (
         d0 // 2 if cutlass.const_expr(st.fp4) else d0
-    )  # the group's first byte in the cache row
+    )  # the unit's first byte in the cache row
     for sub in cutlass.range_constexpr(st.raw_per_slot):
         rh = raw_cons.wait_and_advance()
         rbase = (
@@ -565,58 +573,71 @@ def convert_slot(
         )
         skey = sub * st.raw_keys
         pg0 = rh.index * st.raw_boxes
-        load_group(st, kt, rbase, sRaw, r_in8)
+        # the thread's rounds of the stage: its keys kt, kt + KPI, ... below raw_keys (none for a thread past a small stage)
+        n_rounds = (st.raw_keys - kt + KPI - 1) // KPI
+        if cutlass.const_expr(st.raw_keys % KPI == 0):
+            n_rounds = Int32(st.raw_keys // KPI)
+        load_group(st, kt, rbase, sRaw, r_in8, G)
         if cutlass.const_expr(st.fp4):
             for a in cutlass.range_constexpr(SF_AHEAD):
-                load_sf(
-                    st,
-                    kt + a * KPI,
-                    key0 + skey,
-                    d0 // GROUP,
-                    pg0,
-                    mSF,
-                    sPg,
-                    kv_ptr0,
-                    kv_head,
-                    cute.make_tensor(r_sf.iterator + a, cute.make_layout((1,))),
-                    sf_swizzled,
-                )
-        for i in cutlass.range(NI, unroll=1):
+                for g in cutlass.range_constexpr(G):
+                    load_sf(
+                        st,
+                        kt + a * KPI,
+                        key0 + skey,
+                        d0 // GROUP + g,
+                        pg0,
+                        mSF,
+                        sPg,
+                        kv_ptr0,
+                        kv_head,
+                        cute.make_tensor(
+                            r_sf.iterator + a * G + g, cute.make_layout((1,))
+                        ),
+                        sf_swizzled,
+                    )
+        for i in cutlass.range(n_rounds, unroll=1):
             key = kt + i * KPI
             load_group(
                 st,
                 key + KPI,
                 rbase,
                 sRaw,
-                cute.make_tensor(r_in8.iterator + EB, cute.make_layout((EB,))),
+                cute.make_tensor(r_in8.iterator + G * EB, cute.make_layout((G * EB,))),
+                G,
             )
             if cutlass.const_expr(st.fp4):
-                load_sf(
-                    st,
-                    key + SF_AHEAD * KPI,
-                    key0 + skey,
-                    d0 // GROUP,
-                    pg0,
-                    mSF,
-                    sPg,
-                    kv_ptr0,
-                    kv_head,
-                    cute.make_tensor(r_sf.iterator + SF_AHEAD, cute.make_layout((1,))),
-                    sf_swizzled,
-                )
-            if key < st.raw_keys:
+                for g in cutlass.range_constexpr(G):
+                    load_sf(
+                        st,
+                        key + SF_AHEAD * KPI,
+                        key0 + skey,
+                        d0 // GROUP + g,
+                        pg0,
+                        mSF,
+                        sPg,
+                        kv_ptr0,
+                        kv_head,
+                        cute.make_tensor(
+                            r_sf.iterator + SF_AHEAD * G + g, cute.make_layout((1,))
+                        ),
+                        sf_swizzled,
+                    )
+            skk = skey + key
+            for g in cutlass.range_constexpr(G):
+                r_g = cute.make_tensor(r_in.iterator + g * EW, cute.make_layout((EW,)))
                 if cutlass.const_expr(st.fp4):
-                    dequant_group(r_in, e4m3_byte_to_f32(r_sf[0]), r_out)
+                    dequant_group(r_g, e4m3_byte_to_f32(r_sf[g]), r_out)
                 else:
-                    widen_group(st, r_in, r_out)
+                    widen_group(st, r_g, r_out)
                 # the two 16-byte granules of the group in the SW128 slot (bf16 element offsets, then 32-bit words)
-                skk = skey + key
+                dg = d0 + g * GROUP
                 base = (
                     h.index * st.kv_slot_elems
-                    + (d0 // HALF) * (st.slot_keys * HALF)
+                    + (dg // HALF) * (st.slot_keys * HALF)
                     + skk * HALF
                 )
-                gran = (d0 % HALF) // 8
+                gran = (dg % HALF) // 8
                 g0 = base + ((gran ^ (skk % 8)) * 8)
                 g1 = base + (((gran + 1) ^ (skk % 8)) * 8)
                 cute.autovec_copy(
@@ -633,11 +654,11 @@ def convert_slot(
                         cute.make_layout((4,)),
                     ),
                 )
-            for j in cutlass.range_constexpr(EW):
-                r_in[j] = r_in[EW + j]
+            for j in cutlass.range_constexpr(G * EW):
+                r_in[j] = r_in[G * EW + j]
             if cutlass.const_expr(st.fp4):
-                for a in cutlass.range_constexpr(SF_AHEAD):
-                    r_sf[a] = r_sf[a + 1]
+                for a in cutlass.range_constexpr(SF_AHEAD * G):
+                    r_sf[a] = r_sf[a + G]
         rh.release()
     cute.arch.fence_view_async_shared()
     h.commit()

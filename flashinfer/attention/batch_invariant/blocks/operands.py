@@ -561,6 +561,9 @@ class StaticPlan:
         # raw_box_rows keys (one page slab, the whole cache row wide); a ring slot is raw_per_slot consecutive stages
         self.raw_w = (D // 2 if self.fp4 else D) if self.lowbit else 0
         self.raw_keys = self.raw_stages = self.raw_stage_bytes = 0
+        # 16-element groups a conversion thread takes per round: two for NVFP4 at D = 128 (its per-group scale fetch and round
+        # overhead amortise), one elsewhere (measured)
+        self.convert_groups = 2 if self.fp4 and D == 128 else 1
         if self.lowbit:
             for raw_keys, raw_stages in RAW_STAGING:
                 self.raw_keys, self.raw_stages = raw_keys, raw_stages
