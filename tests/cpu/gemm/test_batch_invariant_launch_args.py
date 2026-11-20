@@ -5,6 +5,7 @@ the raster order reach the kernel as arguments, so an invalid forced value is a 
 failure, and a forced grid overrides the device's co-resident count."""
 
 import dataclasses
+import re
 
 import pytest
 
@@ -52,3 +53,32 @@ def test_object_record_drops_the_runtime_values_only():
     rec = object_record(dataclasses.replace(KNOBS, grid_clusters=8))
     assert (rec.raster_along, rec.swizzle_size, rec.grid_clusters) == ("m", 1, 0)
     assert (rec.tile_m, rec.tile_n, rec.cluster_shape_mn) == (128, 128, (1, 2))
+
+
+PLACEMENT_FIELDS = {"raster_along", "swizzle_size", "grid_clusters"}
+
+
+def _changed(value):
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, tuple):
+        return (value[0] * 2, value[1])
+    if isinstance(value, str):
+        return "n" if value == "m" else "m"
+    return value + 1
+
+
+@pytest.mark.parametrize("field", [f.name for f in dataclasses.fields(Knobs)])
+def test_every_compile_time_knob_is_in_the_object_identity(field):
+    """``describe_object()`` is ``describe()`` minus the placement tokens: a change to any other knob changes the object's
+    name (two kernels never share an on-disk object), a change to a placement does not."""
+    cfg = dataclasses.replace(KNOBS, grid_clusters=3)
+    new = dataclasses.replace(cfg, **{field: _changed(getattr(cfg, field))})
+    assert new.describe() != cfg.describe()
+    if field in PLACEMENT_FIELDS:
+        assert new.describe_object() == cfg.describe_object()
+    else:
+        assert new.describe_object() != cfg.describe_object()
+    assert re.search(r"_r[mn]_sw\d|_g\d", new.describe_object()) is None, (
+        new.describe_object()
+    )
