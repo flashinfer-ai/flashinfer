@@ -6985,6 +6985,60 @@ Array<Optional<Tensor>> trtllm_mxint4_block_scale_moe(
       .to_ffi();
 }
 
+// The tile_N the FP4 block-scale MoE runs without a tuned tactic: the first tile of
+// tileFallbackOrder() whose default config is valid and loads, as trtllm_fp4_block_scale_moe
+// retries. -1 when no tile can run. Call it on the launch's device (cubin loads are per context).
+int64_t trtllm_fp4_moe_default_tile_n(int64_t const dtype_act_, int64_t const dtype_weights_,
+                                      int64_t const num_tokens, int64_t const top_k,
+                                      int64_t const hidden_size, int64_t const hidden_size_output,
+                                      int64_t const intermediate_size,
+                                      int64_t const num_local_experts, int64_t const act_type,
+                                      bool const use_per_token_scaling) {
+  using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+  auto const dtype_act = static_cast<btg::Dtype>(dtype_act_);
+  auto const dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
+  auto const bias_type = batchedGemm::gemm::BiasType::None;
+  auto const tile_ns =
+      FP4BlockScaleLauncher::getSupportedTileNums(dtype_act, dtype_weights, bias_type);
+  std::map<int32_t, bool> tiles;  // tileFallbackOrder() reads the keys only.
+  for (auto const tile_N : tile_ns) {
+    tiles[tile_N] = true;
+  }
+  // The runner filters its configs for the current GPU: key the cache by device and arch, as the
+  // launcher's runner cache does.
+  int device = -1, major = 0, minor = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  static thread_local std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool, int, int, int>,
+                               RunnerType>
+      runners;
+  for (int64_t const tile_N : tileFallbackOrder(
+           selectDefaultTileN(tile_ns, num_tokens, top_k, num_local_experts), tiles)) {
+    std::tuple const key{dtype_act_, dtype_weights_, tile_N, act_type, use_per_token_scaling,
+                         major,      minor,          device};
+    auto it = runners.find(key);
+    if (it == runners.end()) {
+      // The runner prepare_moe_runner() builds for an FP4 launch (see getValidConfigs).
+      it = runners
+               .try_emplace(key, dtype_act, dtype_weights, /*useDeepSeekFp8=*/false,
+                            static_cast<int32_t>(tile_N), static_cast<ActivationType>(act_type),
+                            /*useShuffledMatrix=*/true, batchedGemm::gemm::MatrixLayout::MajorK,
+                            bias_type, use_per_token_scaling,
+                            use_per_token_scaling && dtype_act == btg::Dtype::E2m1)
+               .first;
+    }
+    try {
+      (void)it->second.getDefaultValidConfigIndex(
+          top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, hidden_size_output);
+      return tile_N;
+    } catch (tensorrt_llm::kernels::NoLoadableKernelError const&) {
+    } catch (tensorrt_llm::kernels::NoValidConfigError const&) {
+    }
+  }
+  return -1;
+}
+
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     int64_t const dtype_act_, int64_t const dtype_weights_,
     Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
@@ -7562,6 +7616,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_moe_default_tile_n, trtllm_fp4_moe_default_tile_n);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_localized_moe_configs,
                               trtllm_get_valid_localized_moe_configs);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_factorizations,

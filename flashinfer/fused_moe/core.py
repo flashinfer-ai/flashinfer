@@ -3832,6 +3832,165 @@ def _build_trtllm_moe_namespace(module):
             num_fused_shared_experts=num_fused_shared_experts,
         )
 
+    def _fp4_moe_runner_and_tuning_config(
+        moe_inputs: MoeRunnerInputs,
+        *,
+        routing_input_mode: int,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        num_fused_shared_experts: int,
+        intermediate_size: int,
+        num_local_experts: int,
+        activation_type: int,
+        tune_max_num_tokens: int,
+        valid_hidden_size: Optional[int],
+        hidden_states_scale_layout: Optional[int],
+        nvfp4_4over6_code: int,
+        localized_sm_count: int,
+    ) -> Tuple["TrtllmMoERunner", TuningConfig]:
+        """The FP4 runner and tuning config: with the inputs, they key the call's tactic."""
+        hidden_states = moe_inputs.hidden_states
+        hidden_states_scale = moe_inputs.hidden_states_scale
+        hidden_size = hidden_states.shape[-1]
+        if hidden_states.dtype == torch.uint8:
+            hidden_size = hidden_size * 2
+        moe_runner = TrtllmMoERunner(
+            moe_op,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            dtype_act=deduce_trtllm_gen_tensor_dtype(
+                hidden_states, hidden_states_scale
+            ),
+            dtype_weights=deduce_trtllm_gen_tensor_dtype(
+                gemm1_weights, gemm1_weights_scale
+            ),
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+            hidden_size=hidden_size,
+            # GEMM2's N. hidden_size_output only narrows the GEMM when valid dims were
+            # supplied; otherwise a caller-supplied narrow output must NOT shrink N,
+            # because the FP4 weights are row-shuffled over the full hidden_size and
+            # shrinking N would reinterpret them as a scrambled subset rather than a
+            # prefix. Mirrors getGemm2OutputHiddenSize() in
+            # csrc/trtllm_fused_moe_runner.cu.
+            hidden_size_output=_infer_trtllm_moe_output_hidden_size(
+                hidden_size, valid_hidden_size
+            ),
+            intermediate_size=intermediate_size,
+            activation_type=activation_type,
+            weight_layout=WeightLayout.MajorK,
+            use_shuffled_weight=True,
+            use_per_token_scaling=moe_inputs.per_token_scale is not None,
+            num_experts=num_experts,
+            num_fused_shared_experts=num_fused_shared_experts,
+            nvfp4_4over6_code=nvfp4_4over6_code,
+            localized_sm_count=localized_sm_count,
+        )
+        tuning_config = moe_runner._make_tuning_config(
+            moe_inputs,
+            tune_max_num_tokens=tune_max_num_tokens,
+            routing_input_mode=RoutingInputMode(routing_input_mode),
+            hidden_states_scale_layout=hidden_states_scale_layout,
+            use_cold_l2_cache=True,
+            use_cuda_graph=True,
+        )
+        return moe_runner, tuning_config
+
+    def trtllm_fp4_block_scale_moe_routing_tile_n(
+        routing_input_mode: int,
+        topk_ids: torch.Tensor,
+        topk_weights: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        hidden_states_scale: Optional[torch.Tensor],
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        per_token_scale: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        intermediate_size: int,
+        num_local_experts: int,
+        do_finalize: bool,
+        activation_type: int,
+        tune_max_num_tokens: int,
+        valid_hidden_size: Optional[int],
+        hidden_states_scale_layout: Optional[int],
+        nvfp4_4over6_code: int,
+        output: Optional[torch.Tensor],
+    ) -> Optional[int]:
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[-1] * (
+            2 if hidden_states.dtype == torch.uint8 else 1
+        )
+        # Shape-only stand-ins for the buffers the operation allocates.
+        meta = torch.device("meta")
+        if topk_weights is None:
+            topk_weights = torch.empty(
+                num_tokens, top_k, dtype=torch.bfloat16, device=meta
+            )
+        if output is None:
+            output = _alloc_trtllm_moe_output(
+                num_tokens,
+                _trtllm_moe_output_width(hidden_size, valid_hidden_size),
+                do_finalize,
+                meta,
+            )
+        moe_inputs = MoeRunnerInputs(
+            output=output,
+            routing_logits=None,
+            topk_ids=topk_ids,
+            expert_weights=topk_weights,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_lora_delta=None,
+            per_token_scale=per_token_scale,
+        )
+        moe_runner, tuning_config = _fp4_moe_runner_and_tuning_config(
+            moe_inputs,
+            routing_input_mode=routing_input_mode,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_fused_shared_experts=0,
+            intermediate_size=intermediate_size,
+            num_local_experts=num_local_experts,
+            activation_type=activation_type,
+            tune_max_num_tokens=tune_max_num_tokens,
+            valid_hidden_size=valid_hidden_size,
+            hidden_states_scale_layout=hidden_states_scale_layout,
+            nvfp4_4over6_code=nvfp4_4over6_code,
+            localized_sm_count=0,
+        )
+        tuner = AutoTuner.get()
+        # Outside tuning mode choose_one is the call's own cache lookup; it never profiles.
+        if not tuner.is_tuning_mode:
+            _, tactic = tuner.choose_one(
+                "flashinfer::trtllm_fp4_block_scale_moe",
+                [moe_runner],
+                tuning_config,
+                moe_inputs.to_list(),
+            )
+            if tactic != -1:
+                return int(tactic[0])
+        # The launch's tile fallback loads cubins in the device's context.
+        with torch.cuda.device(topk_ids.device):
+            tile_n = int(
+                moe_op.trtllm_fp4_moe_default_tile_n(
+                    int(moe_runner.dtype_act),
+                    int(moe_runner.dtype_weights),
+                    num_tokens,
+                    top_k,
+                    moe_runner.hidden_size,
+                    moe_runner.hidden_size_output,
+                    intermediate_size,
+                    num_local_experts,
+                    activation_type,
+                    moe_runner.use_per_token_scaling,
+                )
+            )
+        return None if tile_n == -1 else tile_n
+
     @register_custom_op(
         "flashinfer::trtllm_fp4_block_scale_moe",
         mutates_args=("routing_replay_out", "workspace_buffer", "fc2_input_out"),
@@ -3926,12 +4085,9 @@ def _build_trtllm_moe_namespace(module):
                 "workspace_buffer nor fc2_input_out"
             )
         total_experts_per_token = top_k + n_fused_shared
-        # GEMM2's N (what the FC2 weights are sized for) and the narrower
-        # caller-visible output width. They differ exactly when valid_hidden_size
+        # The caller-visible output width; GEMM2's N is set in
+        # _fp4_moe_runner_and_tuning_config. They differ exactly when valid_hidden_size
         # is not 128-aligned; matching TRT-LLM, the caller sees valid_hidden_size.
-        output_hidden_size = _infer_trtllm_moe_output_hidden_size(
-            hidden_size, valid_hidden_size
-        )
         output_width = _trtllm_moe_output_width(hidden_size, valid_hidden_size)
         _check_valid_hidden_size_supports_finalize(
             valid_hidden_size, do_finalize, hidden_size
@@ -3986,37 +4142,6 @@ def _build_trtllm_moe_namespace(module):
                 )
 
         tuner = AutoTuner.get()
-        dtype_act = deduce_trtllm_gen_tensor_dtype(hidden_states, hidden_states_scale)
-        dtype_weights = deduce_trtllm_gen_tensor_dtype(
-            gemm1_weights, gemm1_weights_scale
-        )
-        moe_runner = TrtllmMoERunner(
-            moe_op,
-            top_k=top_k,
-            num_local_experts=num_local_experts,
-            dtype_act=dtype_act,
-            dtype_weights=dtype_weights,
-            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
-            hidden_size=hidden_size,
-            # GEMM2's N. hidden_size_output only narrows the GEMM when valid dims were
-            # supplied; otherwise a caller-supplied narrow output must NOT shrink N,
-            # because the FP4 weights are row-shuffled over the full hidden_size and
-            # shrinking N would reinterpret them as a scrambled subset rather than a
-            # prefix. Mirrors getGemm2OutputHiddenSize() in
-            # csrc/trtllm_fused_moe_runner.cu.
-            hidden_size_output=(
-                output_hidden_size if valid_hidden_size is not None else hidden_size
-            ),
-            intermediate_size=intermediate_size,
-            activation_type=activation_type,
-            weight_layout=WeightLayout.MajorK,
-            use_shuffled_weight=True,
-            use_per_token_scaling=per_token_scale is not None,
-            num_experts=num_experts,
-            num_fused_shared_experts=n_fused_shared,
-            nvfp4_4over6_code=nvfp4_4over6_code,
-            localized_sm_count=localized_sm_count if localized_weights else 0,
-        )
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
@@ -4027,13 +4152,22 @@ def _build_trtllm_moe_namespace(module):
             gemm1_lora_delta=gemm1_lora_delta,
             per_token_scale=per_token_scale,
         )
-        tuning_config = moe_runner._make_tuning_config(
+        moe_runner, tuning_config = _fp4_moe_runner_and_tuning_config(
             moe_inputs,
+            routing_input_mode=routing_input_mode,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_fused_shared_experts=n_fused_shared,
+            intermediate_size=intermediate_size,
+            num_local_experts=num_local_experts,
+            activation_type=activation_type,
             tune_max_num_tokens=tune_max_num_tokens,
-            routing_input_mode=RoutingInputMode(routing_input_mode),
+            valid_hidden_size=valid_hidden_size,
             hidden_states_scale_layout=hidden_states_scale_layout,
-            use_cold_l2_cache=True,
-            use_cuda_graph=True,
+            nvfp4_4over6_code=nvfp4_4over6_code,
+            localized_sm_count=localized_sm_count if localized_weights else 0,
         )
 
         runner_kwargs = {
@@ -4647,6 +4781,9 @@ def _build_trtllm_moe_namespace(module):
         trtllm_fp8_per_channel_scale_moe=trtllm_fp8_per_channel_scale_moe_op,
         trtllm_fp8_block_scale_moe=trtllm_fp8_block_scale_moe_op,
         trtllm_fp4_block_scale_moe=trtllm_fp4_block_scale_moe_op,
+        trtllm_fp4_block_scale_moe_routing_tile_n=(
+            trtllm_fp4_block_scale_moe_routing_tile_n
+        ),
         trtllm_mxint4_block_scale_moe=trtllm_mxint4_block_scale_moe_op,
         allocate_routing_metadata_multi_tile=(
             moe_op.trtllm_moe_allocate_routing_metadata_multi_tile
@@ -4765,6 +4902,59 @@ def trtllm_moe_allocate_routing_metadata(
         routing_input_mode=routing_input_mode,
         topk_weights=topk_weights,
     ).slots[0]
+
+
+def trtllm_fp4_block_scale_moe_routing_tile_n(
+    topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    intermediate_size: int,
+    local_num_experts: int,
+    *,
+    do_finalize: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    per_token_scale: Optional[torch.Tensor] = None,
+    tune_max_num_tokens: int = 8192,
+    valid_hidden_size: Optional[int] = None,
+    hidden_states_scale_layout: Optional[SfLayout] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    output: Optional[torch.Tensor] = None,
+) -> Optional[int]:
+    """The tile_N :func:`trtllm_fp4_block_scale_routed_moe` runs with the same arguments:
+    the autotuned tile if the tactic cache has one, else the default tile after the call's
+    tile fallback. ``None`` when no tile can run, so route inside the call instead.
+
+    It only looks the cache up (inside a tuning context it returns the default tile,
+    so tune the call without ``routing_metadata``). Only the shapes and dtypes of the
+    activation tensors and ``output`` are read, so they may be ``meta`` tensors; pass the
+    call's ``output`` when it is narrower than the default, since its width keys the cache.
+    """
+    topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
+    return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe_routing_tile_n(
+        int(routing_mode),
+        topk_ids_tensor,
+        topk_weights,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        per_token_scale,
+        num_experts,
+        top_k,
+        intermediate_size,
+        local_num_experts,
+        do_finalize,
+        activation_type,
+        tune_max_num_tokens,
+        valid_hidden_size,
+        hidden_states_scale_layout,
+        _trtllm_fp4_nvfp4_4over6_code(nvfp4_4over6, per_token_scale, hidden_states),
+        output,
+    )
 
 
 def populate_trtllm_moe_routing_metadata_(
@@ -7772,7 +7962,9 @@ def trtllm_fp4_block_scale_routed_moe(
         the slot from the same ``topk_ids`` and order that population before
         this call. Autotuning still profiles the ordinary routed operation,
         routing included; the autotuned config is used only when the tuner chose
-        the slot's tile, otherwise that tile's default config runs. The body
+        the slot's tile, otherwise that tile's default config runs.
+        :func:`trtllm_fp4_block_scale_moe_routing_tile_n` gives the tile this
+        call runs, the tuned one when there is one. The body
         allocates its own buffers. Not supported with ``gemm1_lora_delta``,
         fused shared experts or ``workspace_buffer`` (``ValueError``).
         Default ``None`` (route inside the call).
