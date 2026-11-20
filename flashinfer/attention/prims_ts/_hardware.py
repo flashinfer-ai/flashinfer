@@ -16,6 +16,12 @@
 
 import functools
 
+from ...cute_dsl.availability import is_rubin_cute_dsl_available
+
+# Probed once at import: is_sm107_compile_target is also evaluated while
+# tracing task bodies, where CuTe DSL 4.9 rejects calls to memoized functions.
+_RUBIN_CUTE_DSL_AVAILABLE = is_rubin_cute_dsl_available()
+
 
 @functools.cache
 def _cluster_limits(device_index: int) -> tuple[int, int]:
@@ -71,7 +77,6 @@ def is_sm107_compile_target() -> bool:
     """Whether generated code may use resources exclusive to native SM107."""
     from cutlass.base_dsl.arch import Arch
     from cutlass.cutlass_dsl import BaseDSL
-    from ...cute_dsl.availability import is_rubin_cute_dsl_available
 
     arch = BaseDSL._get_dsl().get_arch_enum()
-    return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f
+    return _RUBIN_CUTE_DSL_AVAILABLE and Arch.sm_107 <= arch <= Arch.sm_107f

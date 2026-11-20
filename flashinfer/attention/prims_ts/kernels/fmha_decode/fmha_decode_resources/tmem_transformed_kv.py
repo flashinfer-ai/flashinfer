@@ -36,6 +36,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...task_compat import consumer_work_stage
 from ......cute_dsl.availability import is_rubin_cute_dsl_available
 from ...placeholder_helpers import _placeholder_local_array
 from ..fmha_decode_config import FmhaDecodeConfig
@@ -51,6 +52,11 @@ from .helpers_common import (
 from .smem_resources import SmemKvResource, SmemKvTileResource
 
 
+# Probed once at import: the converters below are traced inside task bodies,
+# where CuTe DSL 4.9 rejects calls to memoized functions.
+_RUBIN_CUTE_DSL_AVAILABLE = is_rubin_cute_dsl_available()
+
+
 def _has_packed_e4m3_e2m1_mul() -> bool:
     """Whether the compile target has the packed E4M3 x E2M1 multiply.
 
@@ -59,7 +65,7 @@ def _has_packed_e4m3_e2m1_mul() -> bool:
     """
     if not cutlass.target_version(min_version="13.4"):
         return False
-    if not is_rubin_cute_dsl_available():
+    if not _RUBIN_CUTE_DSL_AVAILABLE:
         return True
     arch = BaseDSL._get_dsl().get_arch_enum()
     return not (Arch.sm_107 <= arch <= Arch.sm_107f)
@@ -468,7 +474,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
         ring; interleaved rows keep packed payload and scales in one stage.
         """
         cfg = self.cfg
-        src_stage_idx = self.src_smem_kv.state_src.consumer_work_stage
+        src_stage_idx = consumer_work_stage(self.src_smem_kv)
         src_byte_base = self.src_smem_kv._smem_base_kv.subview(
             src_stage_idx * cfg.smem_kv_tile_elements
         )
@@ -1410,7 +1416,7 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
         )
         dst_base = Int32(self._stage_base(stage_info).data_ptr().toint())
         slab_bytes = cfg.tile_size_kv * 128
-        src_stage = raw.state_src.consumer_work_stage
+        src_stage = consumer_work_stage(raw)
         captured = raw.uses_register_capture
         token, _, half = raw.bf16_unit(0)
         if cutlass.const_expr(not captured):
@@ -1497,7 +1503,7 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
         half_scale_blocks = cfg.headdim // 32
         slab_bytes = cfg.tile_size_kv * 128
         raw = self.raw_src
-        src_stage = raw.state_src.consumer_work_stage
+        src_stage = consumer_work_stage(raw)
         for rep in cutlass.range_constexpr(units // num_threads):
             unit = thread + Int32(rep * num_threads)
             token = unit % Int32(cfg.tile_size_kv)

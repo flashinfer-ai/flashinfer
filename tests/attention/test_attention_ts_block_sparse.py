@@ -33,9 +33,10 @@ import warnings
 import pytest
 import torch
 
+# Version strings are unreliable (internal builds report 0.x), so detect the
+# task-scheduling API the PrimTS kernels need instead.
 pytest.importorskip(
-    "cutlass",
-    minversion="4.7.0",
+    "cutlass.experimental.task_scheduling",
     reason="PrimTS attention tests require nvidia-cutlass-dsl>=4.7.0",
 )
 
@@ -1727,6 +1728,40 @@ def test_block_sparse_static_profile_rejects_unsupported_gqa_groups(
         _validate_static_block_sparse_heads(num_qo_heads, num_kv_heads)
 
 
+def _loop_schedule(task):
+    """Return the task's loop steps as ``(resource, stage, ..., label)`` tuples.
+
+    DSL < 4.9 tasks expose ``loop_schedule_list``; tree-walking tasks keep the
+    schedule tree, whose first ``DomainLoop`` holds the loop steps.
+    """
+    if hasattr(task, "loop_schedule_list"):
+        return task.loop_schedule_list
+    from cutlass.experimental.task_scheduling.schedule_builder import (
+        DomainLoop,
+        Step,
+    )
+
+    def steps(nodes):
+        for node in nodes:
+            if isinstance(node, Step):
+                yield (node.memory_resource, node.schedule_stage, node.label)
+            elif hasattr(node, "body"):
+                yield from steps(node.body)
+
+    def first_domain_loop(nodes):
+        for node in nodes:
+            if isinstance(node, DomainLoop):
+                return node
+            if hasattr(node, "body"):
+                found = first_domain_loop(node.body)
+                if found is not None:
+                    return found
+        return None
+
+    loop = first_domain_loop(task.schedule.body)
+    return [] if loop is None else list(steps(loop.body))
+
+
 @pytest.mark.parametrize(
     (
         "q_block_size",
@@ -1827,15 +1862,16 @@ def test_block_sparse_builds_standard_decode_schedule(
             if resource.name == resource_name
         )
         assert type(tmem_s) is TmemSResource
+        loop_schedule = _loop_schedule(softmax_task)
         consumer_labels = [
             entry[-1]
-            for entry in softmax_task.loop_schedule_list
+            for entry in loop_schedule
             if entry[0] is tmem_s and entry[1] == ScheduleStage.ConsumerWork
         ]
         assert consumer_labels == ["compute_block_sparse_softmax_loop"]
         schedule_positions = {
             (entry[0].name, entry[1], entry[-1]): position
-            for position, entry in enumerate(softmax_task.loop_schedule_list)
+            for position, entry in enumerate(loop_schedule)
         }
         metadata_wait = schedule_positions[
             (metadata_name, ScheduleStage.ConsumerWait, None)
