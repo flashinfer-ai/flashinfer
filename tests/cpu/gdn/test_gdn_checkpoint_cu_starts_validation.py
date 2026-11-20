@@ -167,14 +167,22 @@ def test_checkpoint_state_indices_bounds(validate):
         _check([0, 256, 384], [0], rows=10, indices=[0, 1, 2, 3, 4, 5])
 
 
-def test_malformed_shapes_are_left_to_the_backends(validate):
-    # Not 1-D: the backends raise their own shape errors.
+@pytest.mark.parametrize(
+    "starts,indices",
+    [
+        # Not 1-D, or not an integer dtype: the backends raise their own errors.
+        (_i64([[0, 256, 384]]), None),
+        (torch.tensor([0.0, 4.0]), _i64([0, 1, 2, 3, 4, 5])),
+        (_i64([0, 4]), torch.tensor([0.5, 1.0, 2.0, 3.0, 4.0, 5.0])),
+    ],
+)
+def test_malformed_inputs_are_left_to_the_backends(validate, starts, indices):
     gdn_prefill._validate_checkpoint_cu_starts(
         cu_seqlens=_i64([0, 256, 384]),
-        checkpoint_cu_starts=_i64([[0, 256, 384]]),
+        checkpoint_cu_starts=starts,
         checkpoint_every_n_tokens=EVERY,
         state_checkpoints=torch.zeros(6, HV, 1, 1),
-        checkpoint_state_indices=None,
+        checkpoint_state_indices=indices,
         prefix_lens=None,
     )
 
@@ -200,7 +208,7 @@ def test_skipped_during_graph_capture(validate, monkeypatch):
         gdn_prefill.torch.cuda, "is_current_stream_capturing", lambda: True
     )
     # Reading this fake's values would fail, so the check must return first.
-    cu = types.SimpleNamespace(is_cuda=True, device="cuda:1", ndim=1)
+    cu = types.SimpleNamespace(is_cuda=True, device="cuda:1", ndim=1, dtype=torch.int64)
     gdn_prefill._validate_checkpoint_cu_starts(
         cu_seqlens=cu,
         checkpoint_cu_starts=_i64([0, 256, 384]),
