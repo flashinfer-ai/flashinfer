@@ -1166,12 +1166,16 @@ RDMA MoE AlltoAll
 ----------------
 
 Expert-major dispatch and weighted combine on SM120 with RDMA-capable NICs.
-Supports BF16, FP8 and NVFP4 communication with a fixed per-buffer precision.
+Supports independent BF16, FP8 and NVFP4 dispatch/combine codecs, optional
+BF16 receive conversion, and opaque byte-preserving dispatch.
 The implementation uses JIT compilation against the validated NCCL/GDAKI SDK.
 See the :doc:`usage and numerical contracts <rdma_moe_alltoall>` and
 :doc:`dependency requirements <../development/rdma_moe_alltoall_dependencies>`.
 
 .. currentmodule:: flashinfer.comm
+
+.. autoclass:: RdmaDispatchLayout
+    :members:
 
 .. autoclass:: RdmaMoeAlltoAllConfig
     :members:

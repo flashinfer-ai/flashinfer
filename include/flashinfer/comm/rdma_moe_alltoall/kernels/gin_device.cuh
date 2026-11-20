@@ -30,13 +30,15 @@ struct GinLaunch {
   uint64_t* epochs;
   int signal_base;
   bool coalesced = false;
+  // Opaque dispatch copies fixed byte rows; combine retains its own numerical codec.
+  int dispatch_data_bytes = 0, dispatch_scale_bytes = 0;
   bool bf16_local_partial = false;
   bool bf16_local_partial_planned = false;
   // Typed NVFP4 legacy buffers pass the exact GDAKI completion admission.
   // Untyped and coalesced buffers retain their existing transport protocol.
   bool nvfp4_legacy_rank_dedup = false;
-  // Typed NVFP4 rank packets; legacy/default buffer layouts stay unchanged.
-  bool nvfp4_rank_packet = false;
+  // Typed NVFP4 and opaque rank packets retain independent combine codecs.
+  bool dispatch_rank_packet = false;
   const float* planned_input_weights = nullptr;
   int64_t* planned_rows = nullptr;
   float* planned_owner_weights = nullptr;

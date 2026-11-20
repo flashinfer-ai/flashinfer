@@ -15,7 +15,8 @@ namespace deep_ep {
 
 // GIN-only memory layout. The inherited NVSHMEM layout remains unchanged.
 // precision: -1 preserves its BF16 upper bound and two send slots; explicit
-// 0/1/2 selects FP8/NVFP4/BF16 and shares one send slot across both operations.
+// 0/1/2 selects the combine codec and shares one send slot across both operations.
+// Dispatch can independently select a typed codec or an opaque fixed-byte row.
 // NCCL 2.30.7 GDAKI source completion is checked by the host before reuse.
 struct GinArenaLayout {
   LowLatencyBuffer buffers[2];
@@ -28,16 +29,26 @@ struct GinArenaLayout {
   }
 
   GinArenaLayout(void* arena, int capacity, int hidden, int ranks, int experts, int precision,
-                 bool planned = false, bool compact_rank = false, bool nvfp4_rank_packet = false) {
+                 bool planned = false, bool compact_rank = false, bool dispatch_rank_packet = false,
+                 int dispatch_precision = -2, int data_bytes = 0, int scale_bytes = 0) {
     const size_t h = size_t(hidden), c = size_t(capacity), e = size_t(experts);
     const bool rank_capacity = compact_rank && planned && precision == 2;
     data_capacity_rows = (rank_capacity ? size_t(ranks) : e) * c;
+    const int dp = dispatch_precision == -2 ? precision : dispatch_precision;
     const size_t payload = precision == 0 ? h : precision == 1 ? h / 2 : 2 * h;
     const size_t scales = precision == 0 ? (h / 128) * sizeof(float) : precision == 1 ? h / 16 : 0;
-    dispatch_msg_bytes = (planned                               ? 80
-                          : nvfp4_rank_packet && precision == 1 ? 48
-                                                                : 16) +
-                         payload + scales;
+    const size_t dispatch_payload = dp == 3   ? aligned(size_t(data_bytes), 16)
+                                    : dp == 0 ? h
+                                    : dp == 1 ? h / 2
+                                              : 2 * h;
+    const size_t dispatch_scales = dp == 3   ? aligned(size_t(scale_bytes), 16)
+                                   : dp == 0 ? (h / 128) * sizeof(float)
+                                   : dp == 1 ? h / 16
+                                             : 0;
+    dispatch_msg_bytes = (planned                ? 80
+                          : dispatch_rank_packet ? 48
+                                                 : 16) +
+                         dispatch_payload + dispatch_scales;
     combine_msg_bytes = aligned(payload + scales + (precision == 1 ? sizeof(float) : 0), 16);
     metadata_bytes = aligned(e * sizeof(int), 128);
     if (precision < 0) {
@@ -49,11 +60,10 @@ struct GinArenaLayout {
       recv_bytes = e * c * (16 + 2 * h);
       return;
     }
-    // Planned BF16 rank references retain immutable 16-byte headers. Reserve
-    // the worst K=8 tail explicitly; for E>=2 the combine arena dominates it.
-    // Rank-fanout sends full token records, including its hook/grid fallback;
-    // only legacy planned dispatch can use the per-expert reference tail.
-    const size_t reference_tail = planned && experts >= 2 && !rank_capacity ? c * 8 * 16 : 0;
+    // BF16 dispatch references retain immutable 16-byte headers. Reserve K=8
+    // explicitly: with independent codecs, the combine arena may be smaller.
+    // Compact planned rank fanout only sends full token records.
+    const size_t reference_tail = dp == 2 && experts >= 2 && !rank_capacity ? c * 8 * 16 : 0;
     send_bytes = aligned(
         std::max(c * dispatch_msg_bytes + reference_tail, data_capacity_rows * combine_msg_bytes),
         128);

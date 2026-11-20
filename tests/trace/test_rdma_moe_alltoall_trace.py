@@ -25,3 +25,27 @@ def test_distributed_replay_is_explicitly_unsupported(tmp_path, method, world_si
     assert method.fi_trace(save_dir=tmp_path, **kwargs) == {}
     assert list(tmp_path.iterdir()) == []
     assert torch.cuda.is_initialized() == was_initialized
+
+
+@pytest.mark.parametrize(
+    "dispatch_kwargs",
+    [
+        {"input_dtype": "raw", "x_scales": object()},
+        {"input_dtype": "bf16", "output_dtype": "bf16"},
+        {"input_dtype": "prequantized", "output_dtype": "bf16", "x_scales": object()},
+    ],
+)
+def test_new_dispatch_formats_do_not_initialize_local_replay(tmp_path, dispatch_kwargs):
+    was_initialized = torch.cuda.is_initialized()
+    assert (
+        RdmaMoeAlltoAll.dispatch.fi_trace(
+            save_dir=tmp_path,
+            self=SimpleNamespace(num_ranks=4),
+            x=object(),
+            topk_idx=object(),
+            **dispatch_kwargs,
+        )
+        == {}
+    )
+    assert list(tmp_path.iterdir()) == []
+    assert torch.cuda.is_initialized() == was_initialized

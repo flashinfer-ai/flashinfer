@@ -36,7 +36,8 @@ class GinBuffer {
             int communication_precision, const std::string& dispatch_mode,
             const std::string& combine_mode, int dispatch_num_sms, int combine_num_sms,
             int dispatch_num_contexts, int combine_num_contexts,
-            const std::string& combine_reduction);
+            const std::string& combine_reduction, int dispatch_precision = -2,
+            int dispatch_data_bytes = 0, int dispatch_scale_bytes = 0);
   void dispatch(int precision, TensorView x, Optional<TensorView> scales, TensorView topk_idx,
                 Optional<TensorView> recv_stats, TensorView recv_x, TensorView recv_scales,
                 TensorView counts, TensorView src_info, TensorView ranges, int phases, int slot,
@@ -69,9 +70,10 @@ class GinBuffer {
   int num_sms_requested_ = -1, num_contexts_requested_ = -1, num_contexts_ = 0;
   int runtime_version_ = 0;
   int traffic_class_ = -1;
-  int communication_precision_ = -1;
+  int communication_precision_ = -1, dispatch_precision_ = -1;
+  int dispatch_data_bytes_ = 0, dispatch_scale_bytes_ = 0;
   bool bf16_local_partial_ = false, bf16_local_partial_planned_ = false;
-  bool compact_rank_arena_ = false, nvfp4_rank_packet_ = false;
+  bool compact_rank_arena_ = false, dispatch_rank_packet_ = false;
   size_t rank_packet_ready_offset_ = 0, rank_packet_ready_bytes_ = 0;
   size_t partial_arena_offset_ = 0, partial_meta_stride_ = 0, partial_scratch_bytes_ = 0;
   int signal_count_ = 0;
@@ -94,7 +96,8 @@ GinBuffer::GinBuffer(int rank, int world_size, const std::string& unique_id, int
                      int communication_precision, const std::string& dispatch_mode,
                      const std::string& combine_mode, int dispatch_num_sms, int combine_num_sms,
                      int dispatch_num_contexts, int combine_num_contexts,
-                     const std::string& combine_reduction)
+                     const std::string& combine_reduction, int dispatch_precision,
+                     int dispatch_data_bytes, int dispatch_scale_bytes)
     : rank_(rank),
       world_size_(world_size),
       max_tokens_(max_tokens),
@@ -105,6 +108,9 @@ GinBuffer::GinBuffer(int rank, int world_size, const std::string& unique_id, int
       num_contexts_requested_(num_contexts),
       traffic_class_(traffic_class),
       communication_precision_(communication_precision),
+      dispatch_precision_(dispatch_precision == -2 ? communication_precision : dispatch_precision),
+      dispatch_data_bytes_(dispatch_data_bytes),
+      dispatch_scale_bytes_(dispatch_scale_bytes),
       bf16_local_partial_(combine_reduction != "fp32"),
       bf16_local_partial_planned_(combine_reduction == "bf16_local_partial_planned"),
       communication_mode_(communication_mode),
@@ -113,6 +119,23 @@ GinBuffer::GinBuffer(int rank, int world_size, const std::string& unique_id, int
            "communication_mode must be 'legacy' or 'coalesced'");
   LL_CHECK(communication_precision >= -1 && communication_precision <= 2,
            "communication precision must be -1 (untyped), 0 (FP8), 1 (NVFP4), or 2 (BF16)");
+  LL_CHECK(
+      dispatch_precision == -2 || (dispatch_precision >= 0 && dispatch_precision <= 3),
+      "dispatch precision must be inherited (-2), FP8 (0), NVFP4 (1), BF16 (2), or opaque (3)");
+  LL_CHECK(dispatch_precision == -2 || communication_precision >= 0,
+           "independent dispatch requires a typed combine codec");
+  if (dispatch_precision_ == 3) {
+    LL_CHECK(dispatch_data_bytes > 0 && dispatch_scale_bytes >= 0 &&
+                 int64_t(dispatch_data_bytes) + dispatch_scale_bytes <=
+                     std::numeric_limits<int>::max() - 96,
+             "opaque dispatch requires positive data bytes and nonnegative scale bytes; "
+             "their sum must fit an int32 message");
+  } else {
+    LL_CHECK(dispatch_data_bytes == 0 && dispatch_scale_bytes == 0,
+             "raw byte widths are only valid for opaque dispatch");
+  }
+  LL_CHECK(!bf16_local_partial_planned_ || dispatch_precision_ == 2,
+           "planned combine requires typed BF16 dispatch");
   LL_CHECK(combine_reduction == "fp32" || combine_reduction == "bf16_local_partial" ||
                combine_reduction == "bf16_local_partial_planned",
            "unsupported combine_reduction");
@@ -180,12 +203,16 @@ GinBuffer::GinBuffer(int rank, int world_size, const std::string& unique_id, int
       resolve_strategy("dispatch", dispatch_mode, dispatch_num_sms, dispatch_num_contexts);
   combine_strategy_ =
       resolve_strategy("combine", combine_mode, combine_num_sms, combine_num_contexts);
+  LL_CHECK(dispatch_precision_ != 3 || dispatch_strategy_.mode == "coalesced" ||
+               (max_tokens_ > 32 && num_experts_ >= 2),
+           "opaque legacy dispatch requires capacity > 32 and at least two experts");
   // The resolved strategies are immutable. Only this path dispatches rank
   // records and combines rank partials; legacy/default arenas retain E*C.
   compact_rank_arena_ = communication_precision_ == 2 && bf16_local_partial_planned_ &&
                         dispatch_strategy_.mode == "coalesced";
-  nvfp4_rank_packet_ = communication_precision_ == 1 && dispatch_strategy_.mode == "legacy" &&
-                       max_tokens_ > 32 && num_experts_ >= 2;
+  dispatch_rank_packet_ = (dispatch_precision_ == 1 || dispatch_precision_ == 3) &&
+                          dispatch_strategy_.mode == "legacy" && max_tokens_ > 32 &&
+                          num_experts_ >= 2;
   communication_mode_ =
       dispatch_strategy_.mode == combine_strategy_.mode ? dispatch_strategy_.mode : "mixed";
   const bool any_coalesced =
@@ -219,14 +246,15 @@ GinBuffer::GinBuffer(int rank, int world_size, const std::string& unique_id, int
         "its shared-context source-completion protocol has only been audited for GDAKI");
     arena_bytes_ = GinArenaLayout(nullptr, max_tokens_, hidden_, world_size_, num_experts_,
                                   communication_precision_, bf16_local_partial_planned_,
-                                  compact_rank_arena_, nvfp4_rank_packet_)
+                                  compact_rank_arena_, dispatch_rank_packet_, dispatch_precision_,
+                                  dispatch_data_bytes_, dispatch_scale_bytes_)
                        .total_bytes;
-    if (any_coalesced || nvfp4_rank_packet_) {
+    if (any_coalesced || dispatch_rank_packet_) {
       // Each slot owns distinct send/recv vectors. Planned rank fanout adds
       // one packet count per rank to the E expert counts; other modes retain E.
       const bool rank_fanout =
           (bf16_local_partial_planned_ && dispatch_strategy_.mode == "coalesced") ||
-          nvfp4_rank_packet_;
+          dispatch_rank_packet_;
       const size_t count_entries = size_t(num_experts_) + (rank_fanout ? world_size_ : 0);
       count_arena_offset_ = arena_bytes_;
       count_array_bytes_ = GinArenaLayout::aligned(sizeof(int) * count_entries, 128);
@@ -235,7 +263,7 @@ GinBuffer::GinBuffer(int rank, int world_size, const std::string& unique_id, int
         fanout_cursor_offset_ = arena_bytes_;
         fanout_cursor_bytes_ = GinArenaLayout::aligned(sizeof(int) * size_t(num_experts_), 128);
         arena_bytes_ += 2 * fanout_cursor_bytes_;
-        if (nvfp4_rank_packet_) {
+        if (dispatch_rank_packet_) {
           rank_packet_ready_offset_ = arena_bytes_;
           rank_packet_ready_bytes_ =
               GinArenaLayout::aligned(sizeof(int) * size_t(world_size_), 128);
@@ -339,24 +367,31 @@ void GinBuffer::dispatch(int precision, TensorView x, Optional<TensorView> scale
   check_phases(phases);
   LL_CHECK(slot == 0 || slot == 1, "slot must be zero or one");
   ffi::CUDADeviceGuard guard(device_);
-  LL_CHECK(precision >= 0 && precision <= 2, "precision must be FP8, NVFP4, or BF16");
-  LL_CHECK(communication_precision_ < 0 || precision == communication_precision_,
-           "dispatch precision must match this typed GinBuffer's communication_dtype");
+  LL_CHECK(precision >= 0 && precision <= 3, "precision must be FP8, NVFP4, BF16, or opaque");
+  LL_CHECK(dispatch_precision_ < 0 || precision == dispatch_precision_,
+           "dispatch precision must match this GinBuffer's dispatch dtype/layout");
+  LL_CHECK(precision != 3 || dispatch_precision_ == 3,
+           "opaque dispatch requires an explicit byte layout");
   const auto payload_dtype = precision == 2 ? dl_bfloat16 : dl_uint8;
   const auto scale_dtype = precision == 0 ? dl_float32 : dl_uint8;
-  const int payload_width = precision == 1 ? hidden_ / 2 : hidden_;
-  const int scale_width = precision == 0 ? hidden_ / 128 : precision == 1 ? hidden_ / 16 : 0;
+  const int payload_width = precision == 3   ? dispatch_data_bytes_
+                            : precision == 1 ? hidden_ / 2
+                                             : hidden_;
+  const int scale_width = precision == 3   ? dispatch_scale_bytes_
+                          : precision == 0 ? hidden_ / 128
+                          : precision == 1 ? hidden_ / 16
+                                           : 0;
   check_tensor(x, "x", payload_dtype, 2);
-  check_vector_alignment(x, "x");
+  if (precision != 3) check_vector_alignment(x, "x");
   LL_CHECK(x.size(1) == payload_width, "dispatch hidden mismatch");
-  if (precision != 2) {
-    LL_CHECK(scales.has_value(), "FP8/NVFP4 dispatch requires block scales");
+  if (scale_width > 0) {
+    LL_CHECK(scales.has_value(), "dispatch layout requires scales");
     check_tensor(scales.value(), "scales", scale_dtype, 2);
-    check_vector_alignment(scales.value(), "scales");
+    if (precision != 3) check_vector_alignment(scales.value(), "scales");
     LL_CHECK(scales.value().size(0) == x.size(0) && scales.value().size(1) == scale_width,
              "dispatch block scale shape mismatch");
   } else {
-    LL_CHECK(!scales.has_value(), "BF16 dispatch requires scales=None");
+    LL_CHECK(!scales.has_value(), "a zero-scale dispatch layout requires scales=None");
   }
   check_tensor(topk_idx, "topk_idx", dl_int32, 2);
   LL_CHECK(x.size(0) <= max_tokens_ && topk_idx.size(0) == x.size(0),
@@ -376,9 +411,9 @@ void GinBuffer::dispatch(int precision, TensorView x, Optional<TensorView> scale
   }
   const int64_t cap = int64_t(world_size_) * max_tokens_;
   check_tensor(recv_x, "out.recv_x", payload_dtype, 3);
-  check_vector_alignment(recv_x, "out.recv_x");
+  if (precision != 3) check_vector_alignment(recv_x, "out.recv_x");
   check_tensor(recv_scales, "out.recv_scales", scale_dtype, 3);
-  check_vector_alignment(recv_scales, "out.recv_scales");
+  if (precision != 3) check_vector_alignment(recv_scales, "out.recv_scales");
   check_tensor(counts, "out.counts", dl_int32, 1);
   check_tensor(src_info, "out.src_info", dl_int32, 2);
   check_tensor(ranges, "out.ranges", dl_int64, 2);
@@ -404,16 +439,19 @@ void GinBuffer::dispatch(int precision, TensorView x, Optional<TensorView> scale
   check_dispatch_overlap(outputs, inputs);
   GinArenaLayout layout(arena_, max_tokens_, hidden_, world_size_, num_experts_,
                         communication_precision_, bf16_local_partial_planned_, compact_rank_arena_,
-                        nvfp4_rank_packet_);
+                        dispatch_rank_packet_, dispatch_precision_, dispatch_data_bytes_,
+                        dispatch_scale_bytes_);
   auto buffer = layout.buffers[slot];
   GinLaunch gin{devcomm_, window_, arena_, epochs_, slot * (2 * num_experts_)};
   gin.coalesced = dispatch_strategy_.mode == "coalesced";
-  gin.nvfp4_rank_packet = nvfp4_rank_packet_;
-  gin.nvfp4_legacy_rank_dedup = !nvfp4_rank_packet_ && communication_precision_ == 1 &&
+  gin.dispatch_data_bytes = dispatch_data_bytes_;
+  gin.dispatch_scale_bytes = dispatch_scale_bytes_;
+  gin.dispatch_rank_packet = dispatch_rank_packet_;
+  gin.nvfp4_legacy_rank_dedup = !dispatch_rank_packet_ && dispatch_precision_ == 1 &&
                                 !gin.coalesced && max_tokens_ > 32 && num_experts_ >= 2;
   gin.num_ctas = dispatch_strategy_.num_ctas;
   gin.active_context_count = dispatch_strategy_.num_contexts;
-  if (gin.coalesced || gin.nvfp4_rank_packet) {
+  if (gin.coalesced || gin.dispatch_rank_packet) {
     auto* counts = static_cast<char*>(arena_) + count_arena_offset_ + slot * 2 * count_array_bytes_;
     gin.send_counts = reinterpret_cast<int*>(counts);
     gin.recv_counts = reinterpret_cast<int*>(counts + count_array_bytes_);
@@ -421,9 +459,9 @@ void GinBuffer::dispatch(int precision, TensorView x, Optional<TensorView> scale
       gin.planned_fanout_cursors = reinterpret_cast<int*>(
           static_cast<char*>(arena_) + fanout_cursor_offset_ + slot * fanout_cursor_bytes_);
   }
-  if (gin.nvfp4_rank_packet) {
+  if (gin.dispatch_rank_packet) {
     // Only native count/range helpers reuse these pointers. No BF16 plan is
-    // allocated, exposed in a handle, or read by NVFP4 combine.
+    // allocated, exposed in a handle, or read by combine.
     gin.planned_counts = reinterpret_cast<int*>(
         static_cast<char*>(arena_) + rank_packet_ready_offset_ + slot * rank_packet_ready_bytes_);
   }
@@ -507,7 +545,8 @@ void GinBuffer::combine(int precision, TensorView x, Optional<TensorView> global
     LL_CHECK(!overlaps(output, input), "combine output must not overlap inputs");
   GinArenaLayout layout(arena_, max_tokens_, hidden_, world_size_, num_experts_,
                         communication_precision_, bf16_local_partial_planned_, compact_rank_arena_,
-                        nvfp4_rank_packet_);
+                        dispatch_rank_packet_, dispatch_precision_, dispatch_data_bytes_,
+                        dispatch_scale_bytes_);
   auto buffer = layout.buffers[slot];
   GinLaunch gin{devcomm_, window_, arena_, epochs_, slot * (2 * num_experts_) + num_experts_};
   gin.coalesced = combine_strategy_.mode == "coalesced";
@@ -580,7 +619,7 @@ Info GinBuffer::backend_info() const {
                                 : bf16_local_partial_       ? "bf16_local_partial"
                                                             : "fp32");
   info.Set("dispatch_full_header_bytes", bf16_local_partial_planned_ ? 80
-                                         : nvfp4_rank_packet_        ? 48
+                                         : dispatch_rank_packet_     ? 48
                                                                      : 16);
   const bool planned_rank_major =
       bf16_local_partial_planned_ && dispatch_strategy_.mode == "coalesced";
@@ -640,38 +679,56 @@ Info GinBuffer::backend_info() const {
   info.Set("combine_planned_grid_joins", bf16_local_partial_planned_ ? Any(2) : Any(nullptr));
   info.Set("combine_planned_self_transport",
            bf16_local_partial_planned_ ? Any("direct_producer_store_to_receive") : Any(nullptr));
-  info.Set("dispatch_kernel", nvfp4_rank_packet_   ? "dispatch_channels_nvfp4_rank_packet"
-                              : planned_rank_major ? "dispatch_channels_planned_rank_fanout"
+  const bool nvfp4_packet = dispatch_rank_packet_ && dispatch_precision_ == 1;
+  info.Set("dispatch_kernel", dispatch_precision_ == 3
+                                  ? (dispatch_rank_packet_ ? "dispatch_channels_rank_packet_opaque"
+                                                           : "dispatch_channels_opaque")
+                              : dispatch_rank_packet_ ? "dispatch_channels_nvfp4_rank_packet"
+                              : planned_rank_major    ? "dispatch_channels_planned_rank_fanout"
                               : dispatch_strategy_.mode == "coalesced" ? "dispatch_channels"
                                                                        : "dispatch_low_precision");
-  info.Set("dispatch_nvfp4_rank_dedup", !nvfp4_rank_packet_ && communication_precision_ == 1 &&
+  info.Set("dispatch_nvfp4_rank_dedup", !nvfp4_packet && dispatch_precision_ == 1 &&
                                             dispatch_strategy_.mode == "legacy" &&
                                             max_tokens_ > 32 && num_experts_ >= 2);
   info.Set("dispatch_nvfp4_rank_dedup_min_capacity", 33);
-  info.Set("dispatch_nvfp4_reference_bytes", nvfp4_rank_packet_ ? 0 : 16);
-  info.Set("dispatch_nvfp4_rank_packet", nvfp4_rank_packet_);
+  info.Set("dispatch_nvfp4_reference_bytes", nvfp4_packet ? 0 : 16);
+  info.Set("dispatch_nvfp4_rank_packet", nvfp4_packet);
   info.Set("dispatch_nvfp4_rank_packet_min_capacity", 33);
   info.Set("dispatch_nvfp4_packet_payload",
-           nvfp4_rank_packet_ ? Any("one_full_record_per_token_owner_payload_and_scales_unchanged")
-                              : Any(nullptr));
+           nvfp4_packet ? Any("one_full_record_per_token_owner_payload_and_scales_unchanged")
+                        : Any(nullptr));
   info.Set("dispatch_nvfp4_packet_wire_layout",
-           nvfp4_rank_packet_ ? Any("source_rank_capacity_48B_header_full_records") : Any(nullptr));
-  info.Set("dispatch_nvfp4_packet_max_records_per_put", nvfp4_rank_packet_ ? Any(1) : Any(nullptr));
+           nvfp4_packet ? Any("source_rank_capacity_48B_header_full_records") : Any(nullptr));
+  info.Set("dispatch_nvfp4_packet_max_records_per_put", nvfp4_packet ? Any(1) : Any(nullptr));
   info.Set("dispatch_nvfp4_packet_qp_seed",
-           nvfp4_rank_packet_ ? Any("first_route_global_warp") : Any(nullptr));
+           nvfp4_packet ? Any("first_route_global_warp") : Any(nullptr));
   info.Set("dispatch_nvfp4_packet_count_stride",
-           nvfp4_rank_packet_ ? Any(local_experts_ + 1) : Any(nullptr));
-  info.Set("dispatch_nvfp4_packet_source_ready", nvfp4_rank_packet_ && source_ready_ctas != 0);
+           nvfp4_packet ? Any(local_experts_ + 1) : Any(nullptr));
+  info.Set("dispatch_nvfp4_packet_source_ready", nvfp4_packet && source_ready_ctas != 0);
   info.Set("dispatch_nvfp4_packet_source_ready_leader_ctas",
-           nvfp4_rank_packet_ ? Any(source_ready_ctas) : Any(nullptr));
-  info.Set(
-      "dispatch_nvfp4_packet_data_ctas",
-      nvfp4_rank_packet_ ? Any(dispatch_strategy_.num_ctas - source_ready_ctas) : Any(nullptr));
+           nvfp4_packet ? Any(source_ready_ctas) : Any(nullptr));
+  info.Set("dispatch_nvfp4_packet_data_ctas",
+           nvfp4_packet ? Any(dispatch_strategy_.num_ctas - source_ready_ctas) : Any(nullptr));
   info.Set("dispatch_nvfp4_packet_hook_receive",
-           nvfp4_rank_packet_ ? Any("all_context_wait_reserve_then_grid_join") : Any(nullptr));
+           nvfp4_packet ? Any("all_context_wait_reserve_then_grid_join") : Any(nullptr));
   info.Set("dispatch_nvfp4_packet_source_completion",
-           nvfp4_rank_packet_ ? Any("inline_publish_flush_kernel_completion_before_send_reuse")
-                              : Any(nullptr));
+           nvfp4_packet ? Any("inline_publish_flush_kernel_completion_before_send_reuse")
+                        : Any(nullptr));
+  info.Set("dispatch_rank_packet", dispatch_rank_packet_);
+  info.Set("dispatch_rank_packet_min_capacity", 33);
+  info.Set("dispatch_packet_count_stride",
+           dispatch_rank_packet_ ? Any(local_experts_ + 1) : Any(nullptr));
+  info.Set("dispatch_packet_source_ready", dispatch_rank_packet_ && source_ready_ctas != 0);
+  info.Set("dispatch_packet_source_ready_leader_ctas",
+           dispatch_rank_packet_ ? Any(source_ready_ctas) : Any(nullptr));
+  info.Set("dispatch_packet_data_ctas", dispatch_rank_packet_
+                                            ? Any(dispatch_strategy_.num_ctas - source_ready_ctas)
+                                            : Any(nullptr));
+  info.Set("dispatch_packet_wire_layout", dispatch_rank_packet_
+                                              ? Any("source_rank_capacity_48B_header_full_records")
+                                              : Any(nullptr));
+  info.Set("dispatch_packet_hook_receive",
+           dispatch_rank_packet_ ? Any("all_context_wait_reserve_then_grid_join") : Any(nullptr));
   info.Set("rank_packet_ready_bytes_per_slot", rank_packet_ready_bytes_);
   info.Set("dispatch_planned_payload",
            planned_rank_major ? Any("one_full_record_per_destination_token") : Any(nullptr));
@@ -758,6 +815,15 @@ Info GinBuffer::backend_info() const {
                                       : Any(communication_precision_ == 0   ? "fp8"
                                             : communication_precision_ == 1 ? "nvfp4"
                                                                             : "bf16"));
+  info.Set("dispatch_dtype", dispatch_precision_ < 0 ? Any(nullptr)
+                                                     : Any(dispatch_precision_ == 0   ? "fp8"
+                                                           : dispatch_precision_ == 1 ? "nvfp4"
+                                                           : dispatch_precision_ == 2 ? "bf16"
+                                                                                      : "opaque"));
+  info.Set("dispatch_data_bytes",
+           dispatch_precision_ == 3 ? Any(dispatch_data_bytes_) : Any(nullptr));
+  info.Set("dispatch_scale_bytes",
+           dispatch_precision_ == 3 ? Any(dispatch_scale_bytes_) : Any(nullptr));
   info.Set("typed_shared_send", communication_precision_ >= 0);
   info.Set("arena_layout",
            communication_precision_ < 0 ? "legacy_bf16_upper_bound_double_send_double_recv"
@@ -766,7 +832,8 @@ Info GinBuffer::backend_info() const {
   info.Set("registered_arena_compact_rank_capacity", compact_rank_arena_);
   GinArenaLayout layout(nullptr, max_tokens_, hidden_, world_size_, num_experts_,
                         communication_precision_, bf16_local_partial_planned_, compact_rank_arena_,
-                        nvfp4_rank_packet_);
+                        dispatch_rank_packet_, dispatch_precision_, dispatch_data_bytes_,
+                        dispatch_scale_bytes_);
   info.Set("registered_data_capacity_rows", layout.data_capacity_rows);
   info.Set("send_buffer_bytes", layout.send_bytes);
   info.Set("recv_buffer_bytes_per_slot", layout.recv_bytes);
@@ -801,8 +868,9 @@ Info GinBuffer::backend_info() const {
   auto gin_signals = [&](const OperationStrategy& strategy) {
     return rdma_peers * (strategy.mode == "coalesced" ? strategy.num_contexts : local_experts_);
   };
-  const int dispatch_gin_signals = nvfp4_rank_packet_ ? rdma_peers * dispatch_strategy_.num_contexts
-                                                      : gin_signals(dispatch_strategy_);
+  const int dispatch_gin_signals = dispatch_rank_packet_
+                                       ? rdma_peers * dispatch_strategy_.num_contexts
+                                       : gin_signals(dispatch_strategy_);
   const int combine_gin_signals = bf16_local_partial_
                                       ? (bf16_local_partial_planned_ ? rdma_peers : 2 * rdma_peers)
                                       : gin_signals(combine_strategy_);
@@ -916,6 +984,21 @@ int64_t gin_create(int rank, int world_size, Array<int64_t> unique_id, int max_t
       dispatch_contexts, combine_contexts, std::string(combine_reduction));
   return gin_registry.insert(std::move(runtime));
 }
+int64_t gin_create_with_dispatch(int rank, int world_size, Array<int64_t> unique_id, int max_tokens,
+                                 int hidden, int num_experts, bool require_gdaki, int traffic_class,
+                                 String mode, int num_sms, int num_contexts, int precision,
+                                 String dispatch_mode, String combine_mode, int dispatch_sms,
+                                 int combine_sms, int dispatch_contexts, int combine_contexts,
+                                 String combine_reduction, int dispatch_precision,
+                                 int dispatch_data_bytes, int dispatch_scale_bytes) {
+  auto runtime = std::make_shared<GinBuffer>(
+      rank, world_size, decode_bytes(unique_id, sizeof(ncclUniqueId)), max_tokens, hidden,
+      num_experts, require_gdaki, traffic_class, std::string(mode), num_sms, num_contexts,
+      precision, std::string(dispatch_mode), std::string(combine_mode), dispatch_sms, combine_sms,
+      dispatch_contexts, combine_contexts, std::string(combine_reduction), dispatch_precision,
+      dispatch_data_bytes, dispatch_scale_bytes);
+  return gin_registry.insert(std::move(runtime));
+}
 Info gin_info(int64_t handle) { return gin_registry.get(handle)->backend_info(); }
 void gin_close(int64_t handle) {
   auto runtime = gin_registry.get(handle);
@@ -933,6 +1016,12 @@ void gin_dispatch(int64_t handle, int precision, TensorView x, Optional<TensorVi
                   int phases, int slot) {
   gin_registry.get(handle)->dispatch(precision, x, scales, topk, stats, recv_x, recv_scales, counts,
                                      src, ranges, phases, slot);
+}
+void gin_dispatch_raw(int64_t handle, TensorView x, Optional<TensorView> scales, TensorView topk,
+                      Optional<TensorView> stats, TensorView recv_x, TensorView recv_scales,
+                      TensorView counts, TensorView src, TensorView ranges, int phases, int slot) {
+  gin_registry.get(handle)->dispatch(3, x, scales, topk, stats, recv_x, recv_scales, counts, src,
+                                     ranges, phases, slot);
 }
 void gin_combine(int64_t handle, int precision, TensorView x, Optional<TensorView> global_scale,
                  TensorView topk, TensorView weights, TensorView src, TensorView ranges,
@@ -964,10 +1053,12 @@ void gin_combine_planned(int64_t handle, TensorView x, TensorView src, TensorVie
 }  // namespace deep_ep
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_get_unique_id, deep_ep::gin_get_unique_id);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_create, deep_ep::gin_create);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_create_with_dispatch, deep_ep::gin_create_with_dispatch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_info, deep_ep::gin_info);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_close, deep_ep::gin_close);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_abort, deep_ep::gin_abort);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_dispatch, deep_ep::gin_dispatch);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_dispatch_raw, deep_ep::gin_dispatch_raw);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_combine, deep_ep::gin_combine);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gin_dispatch_planned, deep_ep::gin_dispatch_planned);

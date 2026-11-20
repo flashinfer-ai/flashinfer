@@ -27,6 +27,9 @@ void quantize_bf16_to_fp8(const void* input, void* fp8_output, void* fp32_scales
                           int hidden_dim, cudaStream_t stream);
 void dequantize_fp8_to_bf16(const void* fp8_input, const void* fp32_scales, void* output,
                             int token_num, int hidden_dim, cudaStream_t stream);
+void dequantize_dispatch_recv(int precision, const void* packed, const void* scales,
+                              const int* counts, float global_scale, void* output, int rows,
+                              int rows_per_expert, int hidden, cudaStream_t stream);
 // Precision IDs are kept compatible with combine: FP8=0, NVFP4=1, BF16=2.
 // Dispatch transports prequantized values/scales; BF16 uses null scales.
 #ifdef DEEP_EP_USE_GIN

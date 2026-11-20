@@ -53,8 +53,8 @@ def pytest_generate_tests(metafunc):
 
 @pytest.fixture(scope="session")
 def distributed_device():
-    if int(os.environ.get("WORLD_SIZE", "1")) not in (4, 8, 16, 32):
-        pytest.skip("Launch with torchrun using a total of 4, 8, 16, or 32 ranks")
+    if int(os.environ.get("WORLD_SIZE", "1")) not in (2, 4, 8, 16, 32):
+        pytest.skip("Launch with torchrun using a total of 2, 4, 8, 16, or 32 ranks")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     local_rank = int(os.environ["LOCAL_RANK"])
