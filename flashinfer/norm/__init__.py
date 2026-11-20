@@ -99,16 +99,16 @@ except (ImportError, AttributeError):
     RMSNORM_BACKENDS = ("auto", "specialized", "cuda", "cutedsl")
 
 try:
-    from .kernels.gated_residual_rmsnorm import (
+    from .kernels import (
         gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
     )
-    from .kernels.gated_residual_next_rmsnorm import (
+    from .kernels import (
         gated_residual_next_rmsnorm as _gated_residual_next_rmsnorm_cute,
     )
-    from .kernels.rmsnorm_sigmoid_gate import (
+    from .kernels import (
         rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
     )
-    from .kernels.rmsnorm_sigmoid_gate import (
+    from .kernels import (
         supports_rmsnorm_sigmoid_gate as _cute_supports_rmsnorm_sigmoid_gate,
     )
 
