@@ -28,6 +28,12 @@ def _require():
 
 def _configs(kind):
     from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.validation.common import (
+        is_bf16_mxfp8_cutedsl_supported,
+    )
+
+    if kind == "w8a16" and not is_bf16_mxfp8_cutedsl_supported():
+        pytest.skip("W8A16 MegaMoE requires CUDA 13+")
 
     if kind == "bf16":
         first = moe_ep.Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(

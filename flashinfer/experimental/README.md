@@ -317,7 +317,7 @@ Stable CI lanes and PR checks must never fail because of experimental code:
 - `tests/experimental/` is excluded from `pytest tests/` via `norecursedirs`
   in `pytest.ini`; experimental tests run only in their own lane, invoked
   explicitly as `pytest tests/experimental/`.
-- Trace-registry tooling (`tests/trace/`) and `scripts/pr_checks/` match
+- Trace-registry tooling (`tests/trace/`) and `scripts/infra/pr_checks/` match
   `@flashinfer_api` by literal name on purpose; `@flashinfer_experimental_api`
   functions are excluded from the stable trace-consistency tests and from the
   docstring and API/RST coverage checks.

@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Lean coupling of the sampling class ``lse.row`` (``flashinfer/batch_invariant/lean/``: ``Sampling.lean`` and the
 generated ``SamplingCases.lean``), of the draw class ``sample.icdf.v1`` (``Draw.lean``, the ``draw*`` cases) and of the
-request-keyed stream (``Stream.lean``, the ``stream*`` cases).
+request-keyed stream (``Stream.lean``, the ``stream*`` cases) and of the support class ``support.row.v1``
+(``SupportRow.lean``, the ``sup*`` cases).
 
 Device-free (every CI job): the committed ``SamplingCases.lean`` is byte for byte what the Python spec and engine emit,
 so a change to the dataflow, the engine or a placement that was not propagated to the Lean cases fails here without a
@@ -40,6 +41,10 @@ def test_generated_cases_are_current():
         len(c["prefixes"]) >= 2 for c in lean_cases.draw_cases()
     )  # N = 8: elements 0 and 7
     assert len(lean_cases.stream_cases()) == len(lean_cases.STREAM_KEYS) >= 6
+    assert len(lean_cases.support_cases()) == len(lean_cases.SUPPORT_NS) == 2
+    assert all(
+        len(c["ks"]) == 6 and len(c["ps"]) == 6 for c in lean_cases.support_cases()
+    )
     assert "sorry" not in committed and "native_decide" not in committed
 
 
@@ -90,6 +95,15 @@ def test_lean_model_matches_python_engine_and_spec():
                 int(w2),
                 int(w3),
             )
+        elif tag == "supk":
+            _, N, k, pat = line.split(" ")
+            lean[("supk", int(N), int(k))] = int(pat)
+        elif tag == "supp":
+            _, N, tgt, pat = line.split(" ")
+            lean[("supp", int(N), int(tgt))] = int(pat)
+        elif tag in ("supmass", "suprenorm", "supkeptlogp"):
+            _, N, sx = line.split(" ", 2)
+            lean[(tag, int(N))] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -118,6 +132,22 @@ def test_lean_model_matches_python_engine_and_spec():
         for i, sx in c["prefixes"].items():
             assert lean[("draw", c["N"], i)] == sx, ("draw prefix", c["N"], i)
             checked += 1
+    # the support: the threshold procedures on the generated pattern lists equal the Python reference at every
+    # vocabulary (the small one also pinned in Lean), and the kept mass / renormalisation terms node for node
+    for c in lean_cases.support_cases():
+        for k, pt in c["ks"]:
+            assert lean[("supk", c["N"], k)] == pt, ("support top-k", c["N"], k)
+            checked += 1
+        for tgt, pt in c["ps"]:
+            assert lean[("supp", c["N"], tgt)] == pt, ("support top-p", c["N"], tgt)
+            checked += 1
+        assert lean[("supmass", c["N"])] == c["mass"], ("support mass", c["N"])
+        assert lean[("suprenorm", c["N"])] == c["renorm"], ("support renorm", c["N"])
+        assert lean[("supkeptlogp", c["N"])] == c["keptlogp"], (
+            "support kept-set log-probability",
+            c["N"],
+        )
+        checked += 3
     # the stream: the Lean model's blocks are the Python specification's words
     for s, o, n, w in lean_cases.stream_cases():
         assert lean[("stream", s, o, n)] == tuple(w), ("stream block", s, o, n)

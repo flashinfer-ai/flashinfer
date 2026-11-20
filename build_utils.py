@@ -92,6 +92,35 @@ def get_cuda_tile_compile_dependency_requirements() -> list[str]:
     return list(CUDA_TILE_COMPILE_DEPENDENCY_REQUIREMENTS)
 
 
+def apply_cutlass_patches(cutlass_dir: Path) -> None:
+    """Patch populated CUTLASS sources before packaging or native compilation."""
+    header = (
+        cutlass_dir
+        / "include"
+        / "cutlass"
+        / "gemm"
+        / "kernel"
+        / "sm103_blockscaled_gemm_tma_warpspecialized.hpp"
+    )
+    original = header.read_bytes()
+    newline = b"\r\n" if b"\r\n" in original else b"\n"
+    before = b"    EpiLoadPipeline epi_load_pipeline(shared_storage.pipelines.epi_load, epi_load_pipeline_params);"
+    # NoSmem has no epilogue-load producers; only real load pipelines need init.
+    after = (
+        b"    EpiLoadPipeline epi_load_pipeline(\n"
+        b"        shared_storage.pipelines.epi_load,\n"
+        b"        epi_load_pipeline_params,\n"
+        b"        cute::bool_constant<!IsNoSmemEpilogue>{});"
+    ).replace(b"\n", newline)
+    if before in original:
+        header.write_bytes(original.replace(before, after))
+        print(f"Applied CUTLASS SM103 NoSmem pipeline fix: {header}")
+    elif after not in original:
+        raise RuntimeError(
+            f"Expected original or patched SM103 epilogue-load constructor in {header}"
+        )
+
+
 def get_git_version(cwd: Optional[Path] = None) -> str:
     """
     Get git commit hash.
@@ -115,3 +144,7 @@ def get_git_version(cwd: Optional[Path] = None) -> str:
         return git_version
     except Exception:
         return "unknown"
+
+
+if __name__ == "__main__":
+    apply_cutlass_patches(Path(__file__).resolve().parent / "3rdparty" / "cutlass")
