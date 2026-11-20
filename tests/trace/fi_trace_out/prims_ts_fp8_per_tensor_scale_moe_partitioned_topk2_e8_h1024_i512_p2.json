@@ -1,0 +1,256 @@
+{
+  "name": "prims_ts_fp8_per_tensor_scale_moe_partitioned_topk2_e8_h1024_i512_p2",
+  "description": "Two-way partitioned Prims-TS FP8 per-tensor-scale MoE.",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_per_tensor_scale_moe_partitioned",
+    "status:experimental",
+    "backend:prims-ts",
+    "partitioning:two-way",
+    "partition-strategy:tp_n_tp_k",
+    "weight-layout:major_k",
+    "quantization:float8_e4m3fn"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Number of input tokens."
+    },
+    "num_experts": {
+      "type": "const",
+      "value": 8,
+      "description": "Total number of experts."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 2,
+      "description": "Experts selected per token."
+    },
+    "num_local_experts": {
+      "type": "const",
+      "value": 8,
+      "description": "Experts resident on this rank."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 1024,
+      "description": "Logical activation width."
+    },
+    "intermediate_size": {
+      "type": "const",
+      "value": 512,
+      "description": "Logical FFN width."
+    },
+    "partition_count": {
+      "type": "const",
+      "value": 2,
+      "description": "Number of concurrent weight partitions."
+    },
+    "fc1_shard_rows": {
+      "type": "const",
+      "value": 512,
+      "description": "Physical prepared FC1 rows per partition."
+    },
+    "fc2_shard_rows": {
+      "type": "const",
+      "value": 1024,
+      "description": "Physical prepared FC2 rows per partition."
+    },
+    "fc1_storage_k": {
+      "type": "const",
+      "value": 1024,
+      "description": "Physical prepared FC1 K storage."
+    },
+    "fc2_storage_k": {
+      "type": "const",
+      "value": 256,
+      "description": "Physical prepared FC2 K storage."
+    }
+  },
+  "constraints": [
+    "do_finalize == True"
+  ],
+  "inputs": {
+    "routing_logits": {
+      "shape": [
+        "seq_len",
+        "num_experts"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Optional routing logits; omitted for precomputed routing."
+    },
+    "routing_bias": {
+      "shape": [
+        "num_experts"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Optional routing bias."
+    },
+    "topk_ids": {
+      "shape": [
+        "seq_len",
+        "top_k"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Optional precomputed expert ids."
+    },
+    "hidden_states": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Input hidden states."
+    },
+    "num_experts": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Total number of experts."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Experts selected per token."
+    },
+    "n_group": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Expert routing groups."
+    },
+    "topk_group": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Expert groups retained by routing."
+    },
+    "intermediate_size": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Logical FFN width."
+    },
+    "local_expert_offset": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "First local expert in global expert space."
+    },
+    "local_num_experts": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Experts resident on this rank."
+    },
+    "routed_scaling_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Optional routing-weight scale."
+    },
+    "routing_method_type": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "RoutingMethodType value."
+    },
+    "partition_strategy": {
+      "shape": null,
+      "dtype": "string",
+      "description": "Two-way FC partition strategy."
+    },
+    "weight_layout": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "do_finalize": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
+    },
+    "enable_pdl": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true,
+      "description": "Enable Programmatic Dependent Launch."
+    },
+    "gemm1_weights_0": {
+      "shape": [
+        "num_local_experts",
+        "fc1_shard_rows",
+        "fc1_storage_k"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Prepared FC1 payload owned by partition 0."
+    },
+    "gemm1_weights_1": {
+      "shape": [
+        "num_local_experts",
+        "fc1_shard_rows",
+        "fc1_storage_k"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Prepared FC1 payload owned by partition 1."
+    },
+    "gemm2_weights_0": {
+      "shape": [
+        "num_local_experts",
+        "fc2_shard_rows",
+        "fc2_storage_k"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Prepared FC2 payload owned by partition 0."
+    },
+    "gemm2_weights_1": {
+      "shape": [
+        "num_local_experts",
+        "fc2_shard_rows",
+        "fc2_storage_k"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Prepared FC2 payload owned by partition 1."
+    },
+    "expert_weights": {
+      "shape": [
+        "seq_len",
+        "top_k"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Optional precomputed routing weights."
+    },
+    "output1_scales_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "description": "Per-expert output scale."
+    },
+    "output1_scales_gate_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "description": "Per-expert output scale."
+    },
+    "output2_scales_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "description": "Per-expert output scale."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Finalized MoE output."
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

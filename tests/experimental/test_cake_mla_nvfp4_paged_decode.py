@@ -199,27 +199,76 @@ def _make_case(
     cp_rank=0,
     packed_cache=False,
     return_lse=False,
+    values="normal",
+    sigma=1.0,
+    global_scale=1.0,
+    poison=None,
 ):
+    """``values``: ``"normal"`` quantizes a normal latent with a calibrated global
+    scale; ``"fixed"`` a latent of standard deviation ``sigma`` under ``ckv_scale =
+    global_scale``: under the default global scale 1 its block scales stay below
+    2^-3 (E4M3 bytes below 0x20) for sigma up to 0.1 and mostly at 0.3, and lie
+    mostly above it at sigma 1; ``"mixed"`` such a latent whose standard deviation
+    is drawn per token, log-uniform in [0.01, 1] x ``sigma``.  ``poison`` is a byte
+    written into the block scales of the slots past each request's keys in its last
+    page and of every page no request holds (page 0 among them, which a page id
+    below 0 reads); their codes become 0x77 and their rope bytes 0x7F (an E4M3
+    NaN)."""
     gen = torch.Generator(device=device).manual_seed(seed)
     batch = len(kv_lens)
     pages_per_seq = [max(1, (k + page_size - 1) // page_size) for k in kv_lens]
     width = max(pages_per_seq)
     total_pages = sum(pages_per_seq)
     pool_pages = pool_pages or total_pages + 4
-    ckv = (
-        torch.randn((pool_pages, page_size, LATENT), generator=gen, device=device)
-        .to(torch.bfloat16)
-        .float()
-    )
+    if values == "normal":
+        ckv = (
+            torch.randn((pool_pages, page_size, LATENT), generator=gen, device=device)
+            .to(torch.bfloat16)
+            .float()
+        )
+    elif values in ("fixed", "mixed"):
+        ckv = (
+            torch.randn((pool_pages, page_size, LATENT), generator=gen, device=device)
+            * sigma
+        )
+        if values == "mixed":
+            log_sigma = torch.empty((pool_pages, page_size, 1), device=device).uniform_(
+                math.log(0.01), 0.0, generator=gen
+            )
+            ckv = ckv * log_sigma.exp()
+    else:
+        raise ValueError(f"values must be normal, fixed or mixed, got {values!r}")
     kpe = (
         (torch.randn((pool_pages, page_size, ROPE), generator=gen, device=device) * 2.5)
         .to(torch.bfloat16)
         .float()
     )
-    ckv_scale = float(ckv.abs().amax()) / (E2M1_MAX * E4M3_MAX)
+    if values == "normal":
+        ckv_scale = float(ckv.abs().amax()) / (E2M1_MAX * E4M3_MAX)
+    else:
+        ckv_scale = global_scale
     kpe_scale = float(kpe.abs().amax()) / E4M3_MAX
     ckv_packed, ckv_sf = _quantize_blocks(ckv, ckv_scale)
     kpe_fp8 = _fp8(kpe / kpe_scale)
+    # With poison, page 0 holds no request's keys.
+    first = 0 if poison is None else 1
+    perm = first + torch.randperm(pool_pages - first, generator=gen, device=device)[
+        :total_pages
+    ].to(torch.int32)
+    block_tables = torch.full((batch, width), -1, dtype=torch.int32, device=device)
+    off = 0
+    for b, n in enumerate(pages_per_seq):
+        block_tables[b, :n] = perm[off : off + n]
+        off += n
+    if poison is not None:
+        stale = torch.ones((pool_pages, page_size), dtype=torch.bool, device=device)
+        stale[perm.long()] = False
+        for b, kv in enumerate(kv_lens):
+            if kv % page_size:
+                stale[int(block_tables[b, kv // page_size]), kv % page_size :] = True
+        ckv_sf.view(torch.uint8)[stale] = poison
+        ckv_packed[stale] = 0x77
+        kpe_fp8.view(torch.uint8)[stale] = 0x7F
     if packed_cache:
         # vLLM-style single allocation: 256 FP4 bytes | 64 rope bytes | 32 scale bytes per token.
         buffer = torch.empty(
@@ -239,14 +288,6 @@ def _make_case(
             ckv_sf.contiguous(),
             kpe_fp8.contiguous(),
         )
-    perm = torch.randperm(pool_pages, generator=gen, device=device)[:total_pages].to(
-        torch.int32
-    )
-    block_tables = torch.full((batch, width), -1, dtype=torch.int32, device=device)
-    off = 0
-    for b, n in enumerate(pages_per_seq):
-        block_tables[b, :n] = perm[off : off + n]
-        off += n
     total_q = sum(q_lens)
     q = torch.randn((total_q, num_heads, QK_DIM), generator=gen, device=device).to(
         torch.bfloat16
@@ -439,22 +480,41 @@ def _check_lse(lse, ref_lse, *, atol=0.01):
 # ---------------------------------------------------------------------------
 
 
+# The #7163 reproducer's cache: a latent of standard deviation 0.05 under a unit
+# global scale, whose block scale bytes lie below 0x20.  The old wide route decoded
+# its V rows to zero; the narrow routes served it.
+REPRODUCER_SIGMA = 0.05
+
+
+def _latent(sigma):
+    """``_make_case`` arguments: the calibrated normal latent for ``None``, else a
+    latent of standard deviation ``sigma`` under a unit global scale."""
+    return {} if sigma is None else dict(values="fixed", sigma=sigma)
+
+
+def _route(num_heads, max_q_len):
+    rows = max_q_len * num_heads
+    return "main_wide" if use_wide_route(rows) else f"main_rt{rt_for_rows(rows)[0]}"
+
+
+@pytest.mark.parametrize("sigma", [None, REPRODUCER_SIGMA])
 @pytest.mark.parametrize("num_heads", [12, 96])
 @pytest.mark.parametrize(
     "kv_lens", [[1, 65, 700], [4095, 777, 129], [20000, 16384, 17001]]
 )
-def test_decode_q1(num_heads, kv_lens):
+def test_decode_q1(num_heads, kv_lens, sigma):
     _skip_unless_supported()
     device = torch.device("cuda")
     case = _make_case(
-        [1] * len(kv_lens), kv_lens, num_heads, seed=625001, device=device
+        [1] * len(kv_lens),
+        kv_lens,
+        num_heads,
+        seed=625001,
+        device=device,
+        **_latent(sigma),
     )
     out, _, runner = _run(case, dense_q_len=1)
-    assert runner.plan.main_kind == (
-        "main_wide"
-        if use_wide_route(num_heads)
-        else f"main_rt{rt_for_rows(num_heads)[0]}"
-    )
+    assert runner.plan.main_kind == _route(num_heads, 1)
     ref, _ = _reference(case)
     _check(out, ref)
 
@@ -462,19 +522,27 @@ def test_decode_q1(num_heads, kv_lens):
 @pytest.mark.parametrize(
     "num_heads,q_lens,kv_lens",
     [
-        (12, [1, 4, 8], [300, 4096, 777]),  # 96 packed rows: two 48-row tiles
-        (24, [2, 1], [4100, 999]),  # 48 rows per request
+        (12, [1, 4, 8], [300, 4096, 777]),  # 96 packed rows: the wide route
+        (24, [2, 1], [4100, 999]),  # 48 rows per request: the 48-row tile
         (96, [4, 4], [2048, 3001]),
         (128, [1, 1, 1], [100, 3000, 6001]),  # DeepSeek-V3 TP1 head count
     ],
 )
-def test_packed_variable_query(num_heads, q_lens, kv_lens):
+@pytest.mark.parametrize("sigma", [None, REPRODUCER_SIGMA])
+def test_packed_variable_query(num_heads, q_lens, kv_lens, sigma):
     _skip_unless_supported()
     device = torch.device("cuda")
     case = _make_case(
-        q_lens, kv_lens, num_heads, seed=625003, device=device, return_lse=True
+        q_lens,
+        kv_lens,
+        num_heads,
+        seed=625003,
+        device=device,
+        return_lse=True,
+        **_latent(sigma),
     )
-    out, lse, _ = _run(case)
+    out, lse, runner = _run(case)
+    assert runner.plan.main_kind == _route(num_heads, max(q_lens))
     ref, ref_lse = _reference(case)
     _check(out, ref)
     _check_lse(lse, ref_lse)
@@ -587,6 +655,133 @@ def test_warp_reducer_instantiations(warps, num_heads, q_lens, kv_lens, num_spli
         runner.plan.reduce_kind == "reduce_warp" and runner.plan.reduce_warps == warps
     )
     assert runner.num_split == num_split
+    ref, ref_lse = _reference(case)
+    _check(out, ref)
+    _check_lse(lse, ref_lse)
+
+
+# Wide route V scales (#7163): the wide kernel shifts each token's V block scales by
+# 2^-k, k in 0..3 the smallest that keeps 6 x max(scale) x 2^-k within E4M3, and
+# reads a token past the keys as zero.  Small block scales under a unit global scale
+# at H96 and H128, unsplit and split, and the 64-row MTP request: bytes below 0x20
+# for sigma up to 0.1 (subnormal at the smallest sigma) and most bytes at 0.3.
+# Sigma 1, whose bytes lie mostly above 0x20, is the top-of-range control; a latent
+# of 1 keeps every element of O under the absolute gate.
+WIDE_SIGMAS = (0.01, 0.03, 0.05, 0.1, 0.3, 1.0)
+
+
+def _wide_scale_shifts(case):
+    """The wide route's shift of every key: the smallest k in 0..3 with
+    6 x max(sf) x 2^-k <= 448 over the key's 32 block scales."""
+    page_size = case["page_size"]
+    sf_max = case["ckv_sf_cache"].float().amax(dim=-1)
+    shifts = []
+    for b, kv in enumerate(case["kv_lens"]):
+        pages = case["block_tables"][b, : (kv + page_size - 1) // page_size].long()
+        m = sf_max[pages].reshape(-1)[:kv]
+        shifts.append(sum((E2M1_MAX * m > E4M3_MAX * 2**j).long() for j in range(3)))
+    return torch.cat(shifts)
+
+
+@pytest.mark.parametrize("sigma", WIDE_SIGMAS)
+@pytest.mark.parametrize("num_heads", [96, 128])
+@pytest.mark.parametrize(
+    "q_lens,kv_lens,num_split", [([1], [2500], 1), ([1, 1], [3000, 1100], 4)]
+)
+def test_wide_route_small_block_scales(sigma, num_heads, q_lens, kv_lens, num_split):
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _make_case(
+        q_lens,
+        kv_lens,
+        num_heads,
+        seed=625060,
+        device=device,
+        values="fixed",
+        sigma=sigma,
+        return_lse=True,
+    )
+    out, lse, runner = _run(case, dense_q_len=1, num_split=num_split)
+    assert runner.plan.main_kind == "main_wide" and runner.num_split == num_split
+    ref, ref_lse = _reference(case)
+    _check(out, ref)
+    _check_lse(lse, ref_lse)
+
+
+@pytest.mark.parametrize("sigma,num_split", [(0.01, 1), (0.1, 3)])
+def test_wide_route_small_block_scales_mtp(sigma, num_split):
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _make_case(
+        [4],
+        [2000],
+        16,
+        seed=625061,
+        device=device,
+        values="fixed",
+        sigma=sigma,
+        return_lse=True,
+    )
+    out, lse, runner = _run(case, dense_q_len=4, num_split=num_split)
+    assert runner.plan.main_kind == "main_wide" and runner.num_split == num_split
+    ref, ref_lse = _reference(case)
+    _check(out, ref)
+    _check_lse(lse, ref_lse)
+
+
+@pytest.mark.parametrize(
+    "num_heads,kv_lens,num_split",
+    [(96, [3000, 1100], None), (128, [3000], 1)],
+)
+def test_wide_route_per_token_scale_shifts(num_heads, kv_lens, num_split):
+    """Per-token latent magnitudes over two decades under a 2^-9 global scale: the
+    tokens' largest block scales spread over every shift k in 0..3."""
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _make_case(
+        [1] * len(kv_lens),
+        kv_lens,
+        num_heads,
+        seed=625080,
+        device=device,
+        values="mixed",
+        global_scale=2.0**-9,
+        return_lse=True,
+    )
+    assert set(_wide_scale_shifts(case).tolist()) == {0, 1, 2, 3}
+    out, lse, runner = _run(case, dense_q_len=1, num_split=num_split)
+    assert runner.plan.main_kind == "main_wide"
+    ref, ref_lse = _reference(case)
+    _check(out, ref)
+    _check_lse(lse, ref_lse)
+
+
+@pytest.mark.parametrize(
+    "kv_lens,poison,num_split",
+    [
+        ([65, 95], 0xFF, None),
+        ([97, 63], 0x7F, None),
+        ([33, 95], 0x97, None),
+        ([33, 95], 0x97, 1),
+        ([1, 65, 4129], 0x97, 9),
+    ],
+)
+def test_wide_route_stale_scale_bytes_past_the_keys(kv_lens, poison, num_split):
+    """E4M3 NaN scale bytes (0x7F, 0xFF) and 0x97 in the slots past the keys and in
+    the pages no request holds never reach the output."""
+    _skip_unless_supported()
+    device = torch.device("cuda")
+    case = _make_case(
+        [1] * len(kv_lens),
+        kv_lens,
+        96,
+        seed=625070,
+        device=device,
+        poison=poison,
+        return_lse=True,
+    )
+    out, lse, runner = _run(case, dense_q_len=1, num_split=num_split)
+    assert runner.plan.main_kind == "main_wide"
     ref, ref_lse = _reference(case)
     _check(out, ref)
     _check_lse(lse, ref_lse)

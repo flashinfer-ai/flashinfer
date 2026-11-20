@@ -41,23 +41,3 @@ dim 64); check the matching ``supports_*`` helper and fall back otherwise.
     supports_gated_residual_next_rmsnorm
     rmsnorm_sigmoid_gate
     supports_rmsnorm_sigmoid_gate
-
-Training RMSNorm (Cake)
------------------------
-
-Fused BF16 RMSNorm forward / backward for training on SM100, SM103 and SM107:
-FP32 statistics and accumulation, one FP32 reciprocal RMS saved per row,
-fused ``dx`` + deterministic FP32 ``dw`` backward, optional residual-add
-fusion and an autograd wrapper.
-
-.. currentmodule:: flashinfer.cake_rmsnorm_train
-
-.. autosummary::
-    :toctree: ../generated
-
-    cake_rmsnorm
-    cake_rmsnorm_train_forward
-    cake_rmsnorm_train_backward
-    cake_rmsnorm_train_backward_workspace_bytes
-    cake_rmsnorm_train_backward_workspace
-    CakeRMSNormFunction

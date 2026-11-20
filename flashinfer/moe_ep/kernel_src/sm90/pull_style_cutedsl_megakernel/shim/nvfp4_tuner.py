@@ -11,6 +11,8 @@ from typing import Any
 
 from .nvfp4_policy import split_nvfp4_conversion_tactic, validate_nvfp4_kperm
 from .mxfp4_optimization import (
+    _row_tile_variants,
+    _row_tiled,
     hopper_mxfp4_candidates,
     normalize_mxfp4_optimization_tactic,
     resolve_mxfp4_tactic_optimizations,
@@ -19,15 +21,27 @@ from .nvfp4_candidate_data import (
     NVFP4_SF0_CANDIDATE_SEEDS,
     _H200_REFERENCE,
     NVFP4_DEFAULT_TACTICS_BY_TOKENS,
+    NVFP4_SF0_DEFAULT_CORES_BY_TOKENS,
+    NVFP4_SF2_CANDIDATE_SEEDS,
+    _scale_ring_tactic,
 )
 
-NVFP4_TUNING_VERSION = "nvfp4_single_k64_candidates_v2"
+# v3: the candidates include the N72/N80 tilings of the bucket default.
+NVFP4_TUNING_VERSION = "nvfp4_single_k64_scale_ring_candidates_v3"
 
 
 def normalize_hopper_nvfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
     """Validate the complete MX core and NV conversion fields."""
     core, conversion = split_nvfp4_conversion_tactic(tactic)
+    # The MX schema checks the pull buffer against the dispatch-pull fields.
+    core["compact_pull_buffer"] = conversion["compact_pull_buffer"]
     return dict(normalize_mxfp4_optimization_tactic(core), **conversion)
+
+
+def _default_bucket(max_tokens: int) -> int:
+    """Smallest adequate capacity bucket; larger capacities use the largest."""
+    buckets = tuple(NVFP4_DEFAULT_TACTICS_BY_TOKENS)
+    return next((value for value in buckets if value >= max_tokens), buckets[-1])
 
 
 def nvfp4_candidate_sha256(candidates: Iterable[Mapping[str, Any]]) -> str:
@@ -51,7 +65,49 @@ def _validate_candidate(tactic, *, hidden, intermediate, num_experts, world_size
         num_experts=num_experts,
         world_size=world_size,
     )
+    if selected["nvfp4_sf_stages"] and (
+        selected["mma_tiler_mnk"][1:] != (64, 256) or selected["pingpong"]
+    ):
+        raise ValueError("NVFP4 scale-ring candidates require non-pingpong N64/K256")
     return selected
+
+
+def expand_nvfp4_sf2_candidates(
+    seeds: Iterable[Mapping[str, Any]],
+    *,
+    hidden: int,
+    intermediate: int,
+    num_experts: int,
+    world_size: int,
+    kperm: int = 64,
+) -> list[dict[str, Any]]:
+    """Keep unique legal sf0 seeds and append R1/R2 for N64/K256 cores.
+
+    No device-name, clamp, live-token or overlap gate is applied. The kernel
+    constructor checks the real layout budget and requires four AB stages.
+    """
+    validate_nvfp4_kperm(kperm)
+    shape = dict(
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        world_size=world_size,
+    )
+    result = []
+    for seed in seeds:
+        selected = _validate_candidate(seed, **shape)
+        if selected["nvfp4_sf_stages"]:
+            raise ValueError("scale-ring expansion requires sf0 seeds")
+        if selected not in result:
+            result.append(selected)
+    for seed in tuple(result):
+        if seed["mma_tiler_mnk"][1:] != (64, 256) or seed["pingpong"]:
+            continue
+        for replicas in (1, 2):
+            candidate = _scale_ring_tactic(seed, replicas)
+            if candidate not in result:
+                result.append(candidate)
+    return result
 
 
 def hopper_nvfp4_candidates(
@@ -76,14 +132,22 @@ def hopper_nvfp4_candidates(
         num_experts=num_experts,
         world_size=world_size,
     )
+    # The MXFP4 per-bucket defaults were measured for MXFP4 only.
     seeds = list(
         hopper_mxfp4_candidates(
             max_tokens,
             routing_profile=routing_profile,
+            include_fused_defaults=False,
             **shape,
         )
     )
     seeds.extend(NVFP4_SF0_CANDIDATE_SEEDS)
+    seeds.extend(NVFP4_SF2_CANDIDATE_SEEDS)
+    # One N72/N80 task holds an expert's 65-72/65-80 rows where N64 needs a
+    # second, nearly empty tile; offer both tilings of this capacity's default
+    # (of its sf0 core, as the scale ring fits only N64 tiles).
+    core = NVFP4_SF0_DEFAULT_CORES_BY_TOKENS[_default_bucket(max_tokens)]
+    seeds.extend(_row_tile_variants(core).values())
     result = []
     for seed in seeds:
         try:
@@ -136,11 +200,14 @@ def hopper_nvfp4_default_profile(
         for name, value in _H200_REFERENCE.items()
     ):
         return None
-    buckets = tuple(NVFP4_DEFAULT_TACTICS_BY_TOKENS)
-    bucket = next((value for value in buckets if value >= max_tokens), buckets[-1])
-    profile = NVFP4_DEFAULT_TACTICS_BY_TOKENS[bucket]
+    profile = NVFP4_DEFAULT_TACTICS_BY_TOKENS[_default_bucket(max_tokens)]
+    tactic = profile["requested_tactic"]
+    if not tactic.get("nvfp4_sf_stages"):
+        # As for MXFP4: the token-tile width with the fewest tiles for the
+        # balanced rows per expert (the scale ring fits only N64 tiles).
+        tactic = _row_tiled(tactic, max_tokens * num_topk * world_size, num_experts)
     return dict(
-        requested_tactic=normalize_hopper_nvfp4_tactic(profile["requested_tactic"]),
+        requested_tactic=normalize_hopper_nvfp4_tactic(tactic),
         requested_config=dict(profile["requested_config"]),
     )
 
@@ -172,6 +239,7 @@ def hopper_nvfp4_cache_provenance_sha256(
         overlap=overlap,
         geometry_provenance=hopper_mxfp4_cache_provenance_sha256(
             routing_profile=routing_profile,
+            include_fused_defaults=False,
         ),
     )
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

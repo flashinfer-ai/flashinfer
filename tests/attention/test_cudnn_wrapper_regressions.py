@@ -1040,14 +1040,17 @@ def test_paged_query_lengths_are_independent_of_storage_offsets(
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
-def test_paged_auto_device_lengths_do_not_add_readback(metadata_device):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_auto_device_lengths_do_not_add_readback(dtype, metadata_device):
+    if dtype == torch.float16 and not prefill._cudnn_supports_paged_fp16_auto():
+        pytest.skip("FP16 auto requires stable FE 1.33")
     if (
         torch.cuda.get_device_capability() != (10, 0)
         or not prefill._cudnn_supports_paged_auto()
     ):
         pytest.skip("requires the qualified SM100 paged-auto runtime")
     device = torch.device("cuda")
-    q = torch.randn(128, 16, 128, device=device, dtype=torch.bfloat16)
+    q = torch.randn(128, 16, 128, device=device, dtype=dtype)
     k = torch.randn(512, 4, 16, 128, device=device, dtype=q.dtype)
     v = torch.randn_like(k)
     table = torch.arange(512, device=device, dtype=torch.int32).reshape(1, -1)
@@ -1213,15 +1216,17 @@ def test_decode_rebinds_sinks_without_repreparing(monkeypatch, strided):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
-@pytest.mark.parametrize("kind", ["paged", "ragged"])
 @pytest.mark.parametrize(
-    "unsupported",
+    "kind,unsupported",
     [
-        dict(window_left=4),
-        dict(pos_encoding_mode="ALIBI"),
-        dict(logits_soft_cap=2),
-        dict(packed_custom_mask=torch.ones(1, dtype=torch.uint8)),
-        dict(prefix_len_ptr=torch.ones(1, dtype=torch.int32)),
+        (kind, unsupported)
+        for kind in ("paged", "ragged")
+        for unsupported in (
+            dict(pos_encoding_mode="ALIBI"),
+            dict(logits_soft_cap=2),
+            dict(packed_custom_mask=torch.ones(1, dtype=torch.uint8)),
+            dict(prefix_len_ptr=torch.ones(1, dtype=torch.int32)),
+        )
     ],
 )
 def test_prefill_rejects_unsupported_semantics(kind, unsupported):
@@ -1378,11 +1383,30 @@ def test_prefill_scales_capture_replay(paged, scale_type, dtype):
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize(
-    "q_lengths,kv_lengths",
-    [([128], [8192]), ([1024, 1536], [1024, 1536]), ([128, 1536], [1024, 1536])],
-    ids=["prefix", "full", "mixed_equal_maxima"],
+    "q_lengths,kv_lengths,expected_backend",
+    [
+        ([128], [8192], "cudnn"),
+        ([1024, 1536], [1024, 1536], "cudnn"),
+        ([128, 1536], [1024, 1536], "fa2"),
+        ([256] * 6, [4096] * 6, "cudnn"),
+        ([2048], [4096], "cudnn"),
+        ([1024] * 6, [1024] * 6, "cudnn"),
+    ],
+    ids=[
+        "prefix",
+        "full",
+        "mixed_equal_maxima",
+        "large_batch",
+        "long_query",
+        "large_full",
+    ],
 )
-def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_auto_preserves_runtime_scales(
+    dtype, q_lengths, kv_lengths, expected_backend
+):
+    if dtype == torch.float16 and not prefill._cudnn_supports_paged_fp16_auto():
+        pytest.skip("FP16 auto requires stable FE 1.33")
     if (
         torch.cuda.get_device_capability() != (10, 0)
         or not prefill._cudnn_supports_paged_auto()
@@ -1390,7 +1414,7 @@ def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths):
         pytest.skip("requires the qualified SM100 paged-auto runtime")
     torch.manual_seed(19)
     counts = [length // 16 for length in kv_lengths]
-    q = torch.randn(sum(q_lengths), 16, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(sum(q_lengths), 16, 128, device="cuda", dtype=dtype)
     k = torch.randn(sum(counts), 16, 4, 128, device=q.device, dtype=q.dtype)
     v = torch.randn_like(k)
     qo = torch.tensor([0, *q_lengths], dtype=torch.int32).cumsum(0).int()
@@ -1403,6 +1427,7 @@ def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths):
         backend="auto",
     )
     wrapper.plan(qo, ip, ix, last, 16, 4, 128, 16, causal=True, q_data_type=q.dtype)
+    assert wrapper._backend == expected_backend
     # Float scales work across auto providers. The explicit cuDNN capture/replay
     # test above covers device scales; FA2 requires a host softmax scale.
     for values in ((0.5, 1.0, 1.0), (1.0, 0.25, 1.0), (1.0, 1.0, 0.75)):
@@ -1899,22 +1924,22 @@ def test_paged_capture_replan_changes_indices_and_lengths(
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize("lse_layout", ["NH", "HN"])
 @pytest.mark.parametrize("device_lengths", [False, True])
-@pytest.mark.parametrize("external_table", [False, True])
+@pytest.mark.parametrize("table_mode", ["owned", "owned_to_external", "external"])
 @pytest.mark.parametrize("capture_backend", ["cudnn", "fa2"])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_paged_auto_fallback_refreshes_retained_capture(
     monkeypatch,
     lse_layout,
     device_lengths,
-    external_table,
+    table_mode,
     capture_backend,
     use_cuda_graph,
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
-        or torch.cuda.get_device_capability() != (10, 0)
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires a supported paged-auto runtime")
     # Override shape admission only after checking the real runtime capability:
     # older backends can reject the reserved page table before capture begins.
     # Control admission to exercise the transition independently of performance
@@ -1940,10 +1965,19 @@ def test_paged_auto_fallback_refreshes_retained_capture(
         paged_kv_last_page_len_buf=torch.empty_like(last, device=q.device),
     )
 
+    caller_table = torch.zeros((2, 8), device=q.device, dtype=torch.int32)
+
     def plan(use_external=False):
         kwargs = {}
         if use_external:
-            table = torch.zeros((2, 8), device=q.device, dtype=torch.int32)
+            # A caller can keep the captured table alive and update it in place.
+            # Its presence must not prevent refreshing wrapper-owned lengths.
+            table = (
+                caller_table
+                if table_mode == "external"
+                else torch.zeros_like(caller_table)
+            )
+            table.zero_()
             for i in range(2):
                 table[i, : ip[i + 1] - ip[i]].copy_(ix[ip[i] : ip[i + 1]])
             kwargs["block_tables"] = table
@@ -1976,7 +2010,7 @@ def test_paged_auto_fallback_refreshes_retained_capture(
             lse if lse_layout == "NH" else lse.T, stats, atol=0.001, rtol=0.001
         )
 
-    plan()
+    plan(table_mode == "external")
     assert wrapper._backend == capture_backend
     run()
     check()
@@ -1991,7 +2025,7 @@ def test_paged_auto_fallback_refreshes_retained_capture(
             qo = torch.tensor([0, 2, 5], dtype=torch.int32)
             ip = torch.tensor([0, 2, 5], dtype=torch.int32)
             ix = torch.tensor([5, 2, 4, 3, 1], device=q.device, dtype=torch.int32)
-            plan(external_table)
+            plan(table_mode != "owned")
             # Both sequences reach FA2 before the first retained replay.
             # Graph wrappers keep its planner; eager wrappers may switch back.
             expected_backend = "cudnn" if selected and not use_cuda_graph else "fa2"

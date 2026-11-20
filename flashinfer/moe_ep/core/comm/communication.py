@@ -165,6 +165,10 @@ class MoEEpCommunication(ABC):
     # Whether a dispatch/combine pair may be recorded into a CUDA graph (after
     # an eager warmup with the same shapes).
     supports_cuda_graph: ClassVar[bool] = True
+    # Whether combine reads only the expert-output rows whose received token
+    # has an expert on this rank, so the expert computation may leave the
+    # other rows unwritten.
+    combine_reads_only_local_expert_rows: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -235,7 +239,7 @@ class MoEEpCommunication(ABC):
             ``hidden_states``, forwarded row-aligned with them.
         runtime_max_tokens_per_rank : int, optional
             Largest ``local_num_tokens`` over all ranks for this step, at most
-            ``MoEEpCommParams.max_tokens_per_rank``; it sets
+            ``MoEEpCommParams.max_tokens_per_rank`` and greater than zero; it sets
             ``tokens_per_rank`` of the result. Every rank must pass the same
             value. ``None`` uses ``MoEEpCommParams.max_tokens_per_rank``, which
             keeps shapes static (e.g. for CUDA graphs).

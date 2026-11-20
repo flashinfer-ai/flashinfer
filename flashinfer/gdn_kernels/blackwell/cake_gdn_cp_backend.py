@@ -27,17 +27,22 @@ fixup, so no external implementation is used by a supported route.
 
 from __future__ import annotations
 
+import dataclasses
 import math
+import os
 from dataclasses import dataclass
 
 import torch
 import tvm_ffi
 
 from ...jit.cake_gdn_cp_backend import (
+    MODULES,
     GDNCPArch,
     has_gdn_cp_kernel,
     load_gdn_cp_kernel,
+    program_for,
 )
+from ...jit.cpp_ext import is_cuda_version_at_least
 
 _BLOCK = 64
 _HEAD_DIM = 128
@@ -46,6 +51,49 @@ _TENSOR_MAP_BYTES = 128
 _PREFILL_TENSOR_MAPS = 5
 _STATE_IO_THREADS = 256
 _STATE_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+_PREFILL_PARAMETERS = (
+    "cp_chunk_len",
+    "source_cp_chunk_len",
+    "num_q_heads",
+    "num_k_heads",
+    "num_v_heads",
+    "num_sab_heads",
+)
+# A stage-4 program may take fast divisors of the chunk length and of the
+# state-head count after ``num_sab_heads``; each is passed as its plain value
+# (the binding builds the divisor constants).
+_PREFILL_DIVISORS = ("cp_chunk_len_fdd", "num_sab_heads_fdd")
+# The scalar parameters a paged stage-4 program takes after ``scale``.
+_PAGED_PREFILL_PARAMETERS = ("state_stride0", "page_size")
+
+
+def _prefill_divisors(kernel: str, arch: GDNCPArch) -> tuple[str, ...]:
+    """The fast-divisor parameters the stage-4 program of ``kernel`` takes, in order."""
+
+    program = program_for(kernel, arch)
+    params = [
+        name for role, name in MODULES[program]["arg_plan"] if role == "parameter"
+    ]
+    head = len(_PREFILL_PARAMETERS)
+    # A paged program takes its page parameters after ``scale``.
+    tail = params[params.index("scale") :] if "scale" in params else []
+    divisors = tuple(params[head : len(params) - len(tail)])
+    expected_tail = (
+        ["scale", *_PAGED_PREFILL_PARAMETERS]
+        if kernel.endswith("_paged")
+        else ["scale"]
+    )
+    if (
+        tuple(params[:head]) != _PREFILL_PARAMETERS
+        or tail != expected_tail
+        or not set(divisors) <= set(_PREFILL_DIVISORS)
+    ):
+        raise ValueError(
+            f"{program} ({kernel} on {arch}): unexpected stage-4 parameters {params}"
+        )
+    return divisors
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -233,6 +281,82 @@ def _default_physical_chunk_len(
     )
 
 
+# The sm_107a row-split fixup builds, by parallel-state count: (logical kernel,
+# row CTAs per state, CTAs per SM the grid must fit in, minimum CP chunks per
+# sequence).  A build gives each CTA 3, 5, 7, 8 or 10 state rows instead of 4
+# (43, 26, 19, 16 or 13 row CTAs per state); every element keeps its FMA
+# chain, so the outputs are bitwise those of the 4-row builds.
+_SM107_ROW_SPLIT_FIXUPS = {
+    4: ("state_fixup_simt_row3_sb2", 43, 1, 6),
+    8: ("state_fixup_simt_row3_sb2", 43, 2, 1),
+    14: ("state_fixup_simt_row5_mb3", 26, 2, 1),
+    16: ("state_fixup_simt_row5_mb3", 26, 2, 1),
+    22: ("state_fixup_simt_row7_sb2_mb3", 19, 2, 1),
+    24: ("state_fixup_simt_row8_sb2_mb3", 16, 2, 1),
+    26: ("state_fixup_simt_row8_mb3", 16, 2, 1),
+    32: ("state_fixup_simt_row10_sb2", 13, 2, 1),
+    36: ("state_fixup_simt_row8_sb2_mb3", 16, 3, 1),
+    48: ("state_fixup_simt_row10_mb3", 13, 3, 1),
+}
+_FIXUP_ROW_CTAS = {
+    "state_fixup_simt_row3_sb2": 43,
+    "state_fixup_simt_row4": 32,
+    "state_fixup_simt_row4_mb3": 32,
+    "state_fixup_simt_row5_mb3": 26,
+    "state_fixup_simt_row7_sb2_mb3": 19,
+    "state_fixup_simt_row8_mb3": 16,
+    "state_fixup_simt_row8_sb2_mb3": 16,
+    "state_fixup_simt_row10_mb3": 13,
+    "state_fixup_simt_row10_sb2": 13,
+    "state_fixup_utcmma64": 2,
+    "state_fixup_utcmma128": 1,
+    "state_fixup_simt_row4_paged": 32,
+    "state_fixup_simt_row4_mb3_paged": 32,
+    "state_fixup_utcmma64_paged": 2,
+    "state_fixup_utcmma128_paged": 1,
+}
+
+
+def _choose_sm107_fixup_kind(
+    num_parallel_states: int,
+    num_sms: int,
+    *,
+    all_sequences_equal: bool,
+    cp_chunks_per_seq: int,
+) -> str:
+    """The sm_107a SIMT fixup build.
+
+    Over sequences of one length with a parallel-state count of
+    ``_SM107_ROW_SPLIT_FIXUPS``, its row-split build when its grid fits the
+    listed CTAs per SM and each sequence has at least the listed CP chunks:
+    its grid fills the SMs evenly where the 32 row CTAs per state do not.
+
+    Otherwise the ``_mb3`` build (``__launch_bounds__(128, 3)``) once the 32
+    row CTAs per (sequence, head) exceed the 2 CTAs per SM of the default
+    build, but only when every sequence has the same number of CP chunks:
+    unequal sequences leave the longer ones' CTAs to finish alone, where the
+    default build runs them faster.  Equal lengths are the host-provable form
+    of that condition.  Every build computes the same outputs bit for bit.
+    """
+    split = _SM107_ROW_SPLIT_FIXUPS.get(num_parallel_states)
+    if (
+        all_sequences_equal
+        and split is not None
+        and num_parallel_states * split[1] <= split[2] * num_sms
+        and cp_chunks_per_seq >= split[3]
+        and has_gdn_cp_kernel(split[0], "sm_107a")
+    ):
+        return split[0]
+    rows = num_parallel_states * (_HEAD_DIM // 4)
+    if (
+        all_sequences_equal
+        and rows > 2 * num_sms
+        and has_gdn_cp_kernel("state_fixup_simt_row4_mb3", "sm_107a")
+    ):
+        return "state_fixup_simt_row4_mb3"
+    return "state_fixup_simt_row4"
+
+
 def _choose_fixup_kind(num_parallel_states: int, num_sms: int) -> str:
     if num_parallel_states <= num_sms * 2 // (_HEAD_DIM // 4):
         return "state_fixup_simt_row4"
@@ -381,11 +505,7 @@ class GDNCPPrefillPlan:
 
     @property
     def fixup_grid(self) -> tuple[int, int, int]:
-        row_ctas = {
-            "state_fixup_simt_row4": 32,
-            "state_fixup_utcmma64": 2,
-            "state_fixup_utcmma128": 1,
-        }[self.fixup_kernel]
+        row_ctas = _FIXUP_ROW_CTAS[self.fixup_kernel]
         return (self.num_seqs * self.num_sab_heads * row_ctas, 1, 1)
 
 
@@ -418,9 +538,10 @@ def _head_mapping_is_legal(hq: int, hk: int, hv: int) -> bool:
 
 # Architectures whose BF16 CP kernels are native: output and final state pass
 # the FP32 recurrence oracle at 1e-2 without a token-serial repair (measured at
-# <= 5.4e-4 state error on B200 and GB300).  Every other architecture keeps the
-# BF16 state repair recurrences.
-_NATIVE_BF16_ARCHES = ("sm_100a", "sm_103a")
+# <= 5.4e-4 state error on B200 and GB300; the sm_107a programs pass the same
+# oracle on R200).  Any other architecture keeps the BF16 state repair
+# recurrences.
+_NATIVE_BF16_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 
 
 def _recurrence_requirements(
@@ -436,11 +557,11 @@ def _recurrence_requirements(
     A recurrence runs where the chunked kernels do not produce the requested
     value: the normalized final state when Q/K are normalized in the kernel,
     and both the output and the final state when alpha is absent.  On compute
-    capability 10.0 and 10.3 (``_NATIVE_BF16_ARCHES``) the BF16 kernels are
-    native, so ``io_dtype`` selects no recurrence there.  Every other
-    architecture (sm_107a) keeps the BF16 state repair: the final-state
-    recurrence for BF16 I/O, and the block-64 output recurrence when alpha is
-    present and Q/K are not normalized in the kernel.
+    capability 10.0, 10.3 and 10.7 (``_NATIVE_BF16_ARCHES``) the BF16 kernels
+    are native, so ``io_dtype`` selects no recurrence there.  Any other
+    architecture keeps the BF16 state repair: the final-state recurrence for
+    BF16 I/O, and the block-64 output recurrence when alpha is present and Q/K
+    are not normalized in the kernel.
     """
 
     bf16_repair = io_dtype == torch.bfloat16 and arch not in _NATIVE_BF16_ARCHES
@@ -551,9 +672,15 @@ def _build_plan(
         t_kernel = f"{t_kernel}_cu32"
     # Without reading prefix-sum payloads, the full-block path is provably safe
     # only when the host bound and total force every sequence to have the same
-    # aligned length. All other batches use the tail-safe generic kernel.
+    # aligned length and every CP chunk is whole 128-token block pairs (the
+    # full-block kernel reads the gates of whole pairs, past the end of a chunk
+    # that ends inside one). All other batches use the tail-safe generic kernel.
     all_sequences_equal = total_tokens == num_seqs * max_seqlen
-    generic_tail = not (all_sequences_equal and max_seqlen % (2 * _BLOCK) == 0)
+    generic_tail = not (
+        all_sequences_equal
+        and max_seqlen % (2 * _BLOCK) == 0
+        and cp_chunk_len % (2 * _BLOCK) == 0
+    )
     if q.dtype == torch.float16 and not generic_tail and hq == hk == hv:
         prefill_kernel = (
             "cp_prefill_equal_head_h32"
@@ -592,8 +719,15 @@ def _build_plan(
         # sm_107a runs the fp32 SIMT fixup only (no TF32 UTCMMA recurrence);
         # sm_100a/sm_103a keep the parallelism-based choice unchanged.
         fixup_kernel=(
-            "state_fixup_simt_row4"
-            if arch == "sm_107a" or total_tokens <= (num_seqs - 1) * max_seqlen
+            _choose_sm107_fixup_kind(
+                num_seqs * num_sab_heads,
+                num_sms,
+                all_sequences_equal=all_sequences_equal,
+                cp_chunks_per_seq=_ceil_div(max_seqlen, cp_chunk_len),
+            )
+            if arch == "sm_107a"
+            else "state_fixup_simt_row4"
+            if total_tokens <= (num_seqs - 1) * max_seqlen
             else _choose_fixup_kind(num_seqs * num_sab_heads, num_sms)
         ),
         prefill_kernel=prefill_kernel,
@@ -828,6 +962,7 @@ class GDNCPPrefill:
         self._mn = load_gdn_cp_kernel(plan.mn_kernel, plan.arch)
         self._fixup = load_gdn_cp_kernel(plan.fixup_kernel, plan.arch)
         self._prefill = load_gdn_cp_kernel(plan.prefill_kernel, plan.arch)
+        self._prefill_divisors = _prefill_divisors(plan.prefill_kernel, plan.arch)
         self._gather = None
         self._gather_source = None
         self._scatter = None
@@ -1207,6 +1342,10 @@ class GDNCPPrefill:
                 p.num_k_heads,
                 p.num_v_heads,
                 p.num_sab_heads,
+                *(
+                    getattr(p, name.removesuffix("_fdd"))
+                    for name in self._prefill_divisors
+                ),
                 self.scale,
                 *p.cp_grid,
             )
@@ -1614,3 +1753,488 @@ __all__ = [
     "chunk_gated_delta_rule_gdn_cp_sm100",
     "prepare_gdn_cp_prefill",
 ]
+
+
+# The paged route's logical kernels: the state fixup and the stage-4 program of
+# the unpaged plan, each in its paged build.  The paged fixups exist in the
+# 4-row SIMT, UTCMMA64 and UTCMMA128 forms (and on sm_107a in the 4-row ring
+# form, at 2 or 3 CTAs per SM), so a row-split sm_107a choice runs its 4-row
+# build; the stage-4 equal-head specializations run the general build.
+_PAGED_FIXUP = {
+    "state_fixup_simt_row4": "state_fixup_simt_row4_paged",
+    "state_fixup_simt_row4_mb3": "state_fixup_simt_row4_mb3_paged",
+    "state_fixup_utcmma64": "state_fixup_utcmma64_paged",
+    "state_fixup_utcmma128": "state_fixup_utcmma128_paged",
+}
+
+
+def _paged_fixup_kernel(fixup_kernel: str) -> str:
+    if fixup_kernel in _PAGED_FIXUP:
+        return _PAGED_FIXUP[fixup_kernel]
+    if fixup_kernel.endswith("_mb3"):
+        return _PAGED_FIXUP["state_fixup_simt_row4_mb3"]
+    return _PAGED_FIXUP["state_fixup_simt_row4"]
+
+
+def _paged_prefill_kernel(plan: GDNCPPrefillPlan) -> str:
+    dtype_suffix = "_bf16" if plan.io_dtype == torch.bfloat16 else ""
+    generic = plan.prefill_kernel.startswith("cp_prefill_generic")
+    return f"cp_prefill{'_generic' if generic else ''}{dtype_suffix}_paged"
+
+
+# Same opt-in as the slot checks of ``gdn_prefill.py`` and ``gdn_decode.py``.
+_VALIDATE_SLOTS = os.environ.get("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", "0") == "1"
+
+
+def _assert_paged_slots(
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_state_indices: torch.Tensor,
+    checkpoint_state_indices: torch.Tensor,
+    checkpoint_cu_starts: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    *,
+    page_size: int,
+    pool_size: int,
+    max_seqlen: int,
+) -> None:
+    """Check the paged rows on the device without a host synchronization.
+
+    Every row read or written is ``-1`` or in ``[0, pool_size)``, and no row
+    is written twice: sequence ``b`` writes ``output_state_indices[b]`` and
+    the ``checkpoint_state_indices`` entries from ``checkpoint_cu_starts[b]``
+    on, one per page boundary its new tokens cross.  Every sequence with new
+    tokens has a 64-aligned prefix, and none has more than ``max_seqlen`` new
+    tokens.  Only active when ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``.
+    """
+
+    if not _VALIDATE_SLOTS:
+        return
+    num_entries = int(checkpoint_state_indices.shape[0])
+    prefix = prefix_lens.long()
+    new_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    # The fixup fills the rows of a misaligned prefix with NaN; an empty span
+    # writes nothing, so its prefix may be anything.
+    torch._assert_async(
+        ((new_lens == 0) | (prefix % 64 == 0)).all(),
+        'GDN paged prefill backend="cake_gdn" needs 64-aligned prefix lengths',
+    )
+    torch._assert_async(
+        (new_lens <= max_seqlen).all(),
+        "GDN paged prefill max_seqlen is smaller than a sequence's new tokens",
+    )
+    crossed = (prefix + new_lens) // page_size - prefix // page_size
+    starts = checkpoint_cu_starts.long()
+    torch._assert_async(
+        ((crossed == 0) | ((starts >= 0) & (starts + crossed <= num_entries))).all(),
+        "GDN paged prefill checkpoint_cu_starts must address page_indices",
+    )
+    # How many sequences write each checkpoint entry: +1 at each range start,
+    # -1 past its end, then a running sum.
+    edges = torch.zeros(num_entries + 1, dtype=torch.int64, device=starts.device)
+    live = (crossed > 0).long()
+    edges.index_add_(0, starts.clamp(0, num_entries), live)
+    edges.index_add_(0, (starts + crossed).clamp(0, num_entries), -live)
+    coverage = edges.cumsum(0)[:-1]
+    rows = torch.cat(
+        (
+            torch.where(coverage > 0, checkpoint_state_indices.long(), -1),
+            output_state_indices.long(),
+        )
+    )
+    # An entry in the ranges of two sequences counts its row twice.
+    writes = torch.cat((coverage, torch.ones_like(output_state_indices.long())))
+    for name, tensor in (
+        ("state_indices", state_indices.long()),
+        ("written rows", rows),
+    ):
+        torch._assert_async(
+            ((tensor == -1) | ((tensor >= 0) & (tensor < pool_size))).all(),
+            f"GDN paged prefill {name} must contain -1 or slots in [0, {pool_size})",
+        )
+    counts = torch.zeros(pool_size + 1, dtype=torch.int64, device=rows.device)
+    counts.index_add_(0, rows.clamp(-1, pool_size - 1) + 1, writes)
+    torch._assert_async(
+        (counts[1:] <= 1).all(),
+        "GDN paged prefill must not write a state row twice",
+    )
+
+
+def _paged_plan(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    num_seqs: int,
+    max_seqlen: int | None,
+    cu_seqlens_dtype: torch.dtype,
+) -> GDNCPPrefillPlan:
+    """The unpaged plan of the batch with its paged fixup and stage-4 builds."""
+
+    plan = _build_plan(
+        q,
+        k,
+        v,
+        num_seqs=num_seqs,
+        # The hint is an upper bound; the plan wants it no larger than the batch.
+        max_seqlen=int(q.shape[0])
+        if max_seqlen is None
+        else min(max_seqlen, int(q.shape[0])),
+        cu_seqlens_dtype=cu_seqlens_dtype,
+    )
+    return dataclasses.replace(
+        plan,
+        fixup_kernel=_paged_fixup_kernel(plan.fixup_kernel),
+        prefill_kernel=_paged_prefill_kernel(plan),
+    )
+
+
+# Stage 4 places CTA ``i``'s tensor maps at byte ``i * 640 + 128 * map`` of the
+# tensor-map workspace, computed in 32-bit integers.
+_MAX_TENSOR_MAP_OFFSET = 2**31 - 1
+# T, MN and stage 4 launch one grid row per sequence.
+_MAX_GRID_Y = 65535
+
+
+def _paged_grid_rejection_reason(plan: GDNCPPrefillPlan) -> str | None:
+    """Why the T, MN and stage-4 grids of a paged plan cannot launch, or
+    ``None``.  Without new tokens only the one-dimensional fixup grid runs."""
+
+    if not plan.total_tokens:
+        return None
+    if plan.num_seqs > _MAX_GRID_Y:
+        return f"supports at most {_MAX_GRID_Y} sequences, got {plan.num_seqs}"
+    # The byte offset of the last map of the last CTA.
+    last_map = (math.prod(plan.cp_grid) * _PREFILL_TENSOR_MAPS - 1) * _TENSOR_MAP_BYTES
+    if last_map > _MAX_TENSOR_MAP_OFFSET:
+        return (
+            f"supports at most {_MAX_TENSOR_MAP_OFFSET} bytes of stage-4 tensor-map "
+            f"offsets, got {last_map} for the grid {plan.cp_grid}"
+        )
+    return None
+
+
+def gdn_cp_paged_rejection_reason(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state_pool: torch.Tensor,
+    *,
+    page_size: int,
+) -> str | None:
+    """Why the paged CP route cannot serve this call, or ``None``.
+
+    Reads only shapes, dtypes, strides, addresses and the device: no host
+    synchronization.
+    """
+
+    if not q.is_cuda:
+        return "requires CUDA tensors"
+    if any(tensor.device != q.device for tensor in (k, v, state_pool)):
+        return "requires q, k, v and state_pool on one device"
+    try:
+        arch = _arch_for(q.device)
+    except ValueError as error:
+        return str(error)
+    cuda_version = tuple(
+        int(part) for part in (torch.version.cuda or "0.0").split(".")[:2]
+    )
+    if cuda_version < (12, 8):
+        return "requires CUDA 12.8 or newer"
+    # The paged programs compile on first use, so the toolkit (nvcc) must meet
+    # the same floor as the torch runtime.
+    if not is_cuda_version_at_least("12.8"):
+        return "requires a CUDA 12.8 or newer toolkit"
+    # The sm_107a programs need CUDA 13.4, as tinygemm2_sm100 does on SM107.
+    if arch == "sm_107a" and not is_cuda_version_at_least("13.4"):
+        return "requires CUDA 13.4 or newer on sm_107a"
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        return "requires float16 or bfloat16 q/k/v"
+    if (
+        q.ndim != 3
+        or k.ndim != 3
+        or v.ndim != 3
+        or k.dtype != q.dtype
+        or v.dtype != q.dtype
+    ):
+        return "requires rank-3 q/k/v of one dtype"
+    if int(k.shape[0]) != int(q.shape[0]) or int(v.shape[0]) != int(q.shape[0]):
+        return "requires q, k and v of the same token count"
+    hq, hk, hv = int(q.shape[1]), int(k.shape[1]), int(v.shape[1])
+    head_sizes = (int(q.shape[2]), int(k.shape[2]), int(v.shape[2]))
+    if head_sizes != (_HEAD_DIM,) * 3 or not _head_mapping_is_legal(hq, hk, hv):
+        return "requires head size 128 and an equal-head, GQA or GVA mapping"
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        return "requires contiguous q/k/v"
+    if any(tensor.data_ptr() % 16 for tensor in (q, k, v)):
+        return "requires 16-byte aligned q/k/v"
+    num_sab_heads = max(hq, hv)
+    if state_pool.dtype != torch.float32:
+        return "requires a float32 state pool"
+    if state_pool.ndim != 4 or tuple(state_pool.shape[1:]) != (
+        num_sab_heads,
+        _HEAD_DIM,
+        _HEAD_DIM,
+    ):
+        return "requires a state pool [num_pages, num_sab_heads, 128, 128]"
+    inner = (num_sab_heads > 1 and state_pool.stride(1) != _HEAD_DIM * _HEAD_DIM) or (
+        state_pool.stride(2) != _HEAD_DIM or state_pool.stride(3) != 1
+    )
+    if inner:
+        return "requires dense [H, 128, 128] state pool rows"
+    # Stage 4 takes the row stride in 16-byte groups even for a one-row pool.
+    stride0 = int(state_pool.stride(0))
+    if stride0 % 4 or (
+        state_pool.shape[0] > 1 and stride0 < num_sab_heads * _HEAD_DIM * _HEAD_DIM
+    ):
+        return "requires a state pool row stride of whole 16-byte groups"
+    if state_pool.data_ptr() % 16:
+        return "requires a 16-byte aligned state pool"
+    if page_size <= 0 or page_size % _BLOCK:
+        return "requires a page size that is a positive multiple of 64"
+    plan_kernels = (
+        "state_fixup_simt_row4_paged",
+        f"cp_prefill_generic{'_bf16' if q.dtype == torch.bfloat16 else ''}_paged",
+    )
+    if not all(has_gdn_cp_kernel(name, arch) for name in plan_kernels):
+        return f"ships no paged CP programs for {arch}"
+    return None
+
+
+def chunk_gated_delta_rule_gdn_cp_paged_sm100(
+    output: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    *,
+    state_pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_state_indices: torch.Tensor,
+    checkpoint_state_indices: torch.Tensor,
+    checkpoint_cu_starts: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    page_size: int,
+    max_seqlen: int | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> None:
+    """The four-stage CP prefill against a paged FP32 state pool.
+
+    The state fixup reads each sequence's initial state from its pool row
+    (``state_indices``; ``-1`` is the zero state), writes the final state to
+    ``output_state_indices`` (``-1`` skips) and the checkpoint of every CP
+    chunk that ends on a page boundary; stage 4 writes the checkpoints of the
+    64-token block boundaries inside a CP chunk.  The CP chunk length is the
+    unpaged plan's, independent of ``page_size``.  Every prefix length must be
+    a multiple of 64; for a sequence that breaks this, every row it would
+    write (its ``checkpoint_state_indices`` entries and its final row, where
+    not ``-1``) is filled with NaN instead of a state.
+
+    Each call plans from shapes alone and allocates its workspaces from the
+    caching allocator, so it holds no state between calls and may be captured
+    in a CUDA graph.  Index tensors are int32 or int64 (int64 is narrowed on
+    the device); ``alpha`` and ``beta`` are FP32 ``[T, num_sab_heads]``.
+    With ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`` the rows are checked on the
+    device (``_assert_paged_slots``).
+    """
+
+    device = q.device
+    num_seqs = int(cu_seqlens.shape[0]) - 1
+    plan = _paged_plan(
+        q,
+        k,
+        v,
+        num_seqs=num_seqs,
+        max_seqlen=max_seqlen,
+        cu_seqlens_dtype=cu_seqlens.dtype,
+    )
+    gate_shape = (int(q.shape[0]), plan.num_sab_heads)
+    _validate_contiguous_tensor(
+        alpha, name="alpha", shape=gate_shape, dtype=torch.float32, device=device
+    )
+    _validate_contiguous_tensor(
+        beta, name="beta", shape=gate_shape, dtype=torch.float32, device=device
+    )
+    _validate_contiguous_tensor(
+        output,
+        name="output",
+        shape=(int(q.shape[0]), plan.num_sab_heads, _HEAD_DIM),
+        dtype=q.dtype,
+        device=device,
+    )
+    # Rejected before any launch: stage 4 checks the output alignment only after
+    # the fixup has written the pool, and does not check its tensor-map offsets.
+    if output.data_ptr() % 16:
+        raise ValueError("output must be 16-byte aligned")
+    reason = _paged_grid_rejection_reason(plan)
+    if reason is not None:
+        raise ValueError(f"GDN CP paged prefill {reason}")
+
+    def as_i32(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor if tensor.dtype == torch.int32 else tensor.to(torch.int32)
+
+    state_indices = as_i32(state_indices)
+    output_state_indices = as_i32(output_state_indices)
+    checkpoint_state_indices = as_i32(checkpoint_state_indices)
+    checkpoint_cu_starts = as_i32(checkpoint_cu_starts)
+    prefix_lens = as_i32(prefix_lens)
+    stride0 = int(state_pool.stride(0))
+    _assert_paged_slots(
+        cu_seqlens,
+        state_indices,
+        output_state_indices,
+        checkpoint_state_indices,
+        checkpoint_cu_starts,
+        prefix_lens,
+        page_size=page_size,
+        pool_size=int(state_pool.shape[0]),
+        max_seqlen=plan.max_seqlen,
+    )
+
+    if plan.cu_seqlens_dtype == torch.int64:
+        cu_seqlens_i64 = cu_seqlens
+    else:
+        cu_seqlens_i64 = torch.empty((num_seqs + 1,), dtype=torch.int64, device=device)
+        if plan.host_stages_cu_seqlens:
+            cu_seqlens_i64.copy_(cu_seqlens)
+    matrix_shape = (plan.total_cp_chunks, plan.num_sab_heads, _HEAD_DIM, _HEAD_DIM)
+    state_shape = (num_seqs, plan.num_sab_heads, _HEAD_DIM, _HEAD_DIM)
+    t = torch.empty(
+        (plan.total_t_blocks, plan.num_sab_heads, _BLOCK, _BLOCK),
+        dtype=q.dtype,
+        device=device,
+    )
+    local_transfer = torch.empty(matrix_shape, dtype=torch.float32, device=device)
+    local_state = torch.empty(matrix_shape, dtype=torch.float32, device=device)
+    fixed_state = torch.empty(matrix_shape, dtype=torch.float32, device=device)
+    initial_state_workspace = torch.empty(
+        state_shape, dtype=torch.float32, device=device
+    )
+    tensormap_workspace = torch.empty(
+        (
+            num_seqs
+            * plan.num_sab_heads
+            * plan.max_cp_chunks_per_seq
+            * _PREFILL_TENSOR_MAPS
+            * _TENSOR_MAP_BYTES,
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    pool = _state_carrier(state_pool)
+
+    with torch.cuda.device(device), tvm_ffi.use_torch_stream():
+        q_in, k_in = q, k
+        if use_qk_l2norm_in_kernel and plan.total_tokens:
+            q_in, k_in = torch.empty_like(q), torch.empty_like(k)
+            load_gdn_cp_kernel(
+                "qk_norm_bf16" if q.dtype == torch.bfloat16 else "qk_norm", plan.arch
+            )(
+                q,
+                k,
+                q_in,
+                k_in,
+                plan.num_q_heads,
+                plan.num_k_heads,
+                plan.total_tokens,
+                max(plan.num_q_heads, plan.num_k_heads),
+                1,
+            )
+        if plan.total_tokens:
+            t_kernel = load_gdn_cp_kernel(plan.t_kernel, plan.arch)
+            if plan.cu_seqlens_dtype == torch.int32 and not plan.host_stages_cu_seqlens:
+                t_kernel(
+                    k_in,
+                    beta,
+                    t,
+                    cu_seqlens,
+                    cu_seqlens_i64,
+                    plan.num_k_heads,
+                    plan.num_sab_heads,
+                    plan.total_t_blocks,
+                    num_seqs,
+                    *plan.t_grid,
+                )
+            else:
+                t_kernel(
+                    k_in,
+                    beta,
+                    t,
+                    cu_seqlens_i64,
+                    plan.num_k_heads,
+                    plan.num_sab_heads,
+                    plan.total_t_blocks,
+                    num_seqs,
+                    *plan.t_grid,
+                )
+            load_gdn_cp_kernel(plan.mn_kernel, plan.arch)(
+                k_in,
+                v,
+                t,
+                alpha,
+                local_transfer,
+                local_state,
+                cu_seqlens_i64,
+                plan.cp_chunk_len,
+                plan.num_k_heads,
+                plan.num_v_heads,
+                plan.num_sab_heads,
+                plan.total_cp_chunks,
+                num_seqs,
+                *plan.cp_grid,
+            )
+        load_gdn_cp_kernel(plan.fixup_kernel, plan.arch)(
+            local_transfer,
+            local_state,
+            pool,
+            initial_state_workspace,
+            fixed_state,
+            pool,
+            cu_seqlens_i64,
+            plan.cp_chunk_len,
+            plan.total_cp_chunks,
+            num_seqs,
+            plan.num_sab_heads,
+            state_indices,
+            output_state_indices,
+            checkpoint_state_indices,
+            checkpoint_cu_starts,
+            prefix_lens,
+            stride0,
+            page_size,
+            *plan.fixup_grid,
+        )
+        if plan.total_tokens:
+            load_gdn_cp_kernel(plan.prefill_kernel, plan.arch)(
+                q_in,
+                k_in,
+                v,
+                t,
+                output,
+                alpha,
+                cu_seqlens_i64,
+                fixed_state,
+                initial_state_workspace,
+                tensormap_workspace,
+                plan.cp_chunk_len,
+                plan.source_cp_chunk_len,
+                plan.num_q_heads,
+                plan.num_k_heads,
+                plan.num_v_heads,
+                plan.num_sab_heads,
+                *(
+                    getattr(plan, name.removesuffix("_fdd"))
+                    for name in _prefill_divisors(plan.prefill_kernel, plan.arch)
+                ),
+                scale,
+                pool,
+                checkpoint_state_indices,
+                checkpoint_cu_starts,
+                prefix_lens,
+                stride0,
+                page_size,
+                *plan.cp_grid,
+            )

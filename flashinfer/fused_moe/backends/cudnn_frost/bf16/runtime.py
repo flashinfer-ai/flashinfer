@@ -70,6 +70,10 @@ class CudnnFrostGroupedGemm1Kernel:
         return False
 
     @property
+    def gathers_input(self) -> bool:
+        return self.contract.get("moe_mode") == "gather"
+
+    @property
     def tactic(self) -> tuple[str, str, str]:
         """Stable identity suitable for FlashInfer's persisted autotuner."""
 
@@ -90,7 +94,9 @@ def _cached_artifact_roots() -> tuple[Path, ...]:
     return (packaged,) if packaged.is_dir() else ()
 
 
-def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
+def _read_root(
+    root: Path, *, include_gather: bool = False
+) -> list[CudnnFrostGroupedGemm1Kernel]:
     path = root / _MANIFEST
     if not path.is_file():
         return []
@@ -114,7 +120,15 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
             for key in ("token_dtype", "weight_dtype", "output_dtype")
         ):
             raise RuntimeError(f"invalid BF16 numerical contract: {artifact_id}")
-        _validate_abi(raw, op)
+        gather = raw["contract"].get("moe_mode") == "gather"
+        _validate_abi(raw, f"{op}_gather" if gather else op)
+        if gather and (
+            raw["arch"] != "sm_107a"
+            or raw.get("launch", {}).get("prefix") != ["token_index"]
+        ):
+            raise RuntimeError(f"invalid BF16 GATHER contract: {artifact_id}")
+        if gather and not include_gather:
+            continue
         source_path, actual = _read_source(root, raw)
         workspace_bytes = int(raw.get("workspace_bytes", -1))
         if workspace_bytes < 0 or workspace_bytes % 128:
@@ -152,8 +166,14 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
 @cache_discovery
 def _discover(
     roots: tuple[Path, ...],
+    *,
+    include_gather: bool = False,
 ) -> tuple[CudnnFrostGroupedGemm1Kernel, ...]:
-    kernels = [kernel for root in roots for kernel in _read_root(root)]
+    kernels = [
+        kernel
+        for root in roots
+        for kernel in _read_root(root, include_gather=include_gather)
+    ]
     identities = [kernel.artifact_id for kernel in kernels]
     if len(identities) != len(set(identities)):
         raise RuntimeError("duplicate cuDNN Frost kernel id across artifact roots")

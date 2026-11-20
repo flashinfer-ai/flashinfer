@@ -93,13 +93,16 @@ def test_cupti_does_not_prepare_delay_helper(monkeypatch):
 def test_delay_helper_failure_still_reaches_group_reduction(monkeypatch):
     import math
     import torch.distributed as dist
+    import torch.distributed.distributed_c10d as c10d
 
     implementation = importlib.import_module("flashinfer.autotuner.autotuner")
     tuner = AutoTuner()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
     monkeypatch.setattr(implementation, "_tune_process_group", object())
-    monkeypatch.setattr(dist, "get_backend", lambda group: "gloo")
+    # The reduction picks its tensor device from the group; the fake group here
+    # is a plain object, so stub the lookup to the CPU device a gloo group uses.
+    monkeypatch.setattr(c10d, "_get_object_coll_device", lambda group: "cpu")
     monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
     reduced = []
     monkeypatch.setattr(

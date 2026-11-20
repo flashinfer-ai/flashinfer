@@ -258,6 +258,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
             num_segments,
             dtype,
             MnnvlMemory.dev_id,
+            owner=self,
         )
 
     @staticmethod

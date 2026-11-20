@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
+from packaging.version import Version
 
 from flashinfer import (
     autotune,
@@ -9,14 +12,104 @@ from flashinfer import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
-from flashinfer.autotuner import AutoTuner
+from flashinfer import utils
+from flashinfer.autotuner import AutoTuner, TunableRunner
 from flashinfer.fp8_quantization import mxfp8_quantize
-from flashinfer.gemm import gemm_base
+from flashinfer.gemm import gemm_base, gemm_mm_mxfp8_cute_dsl
 from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
 from flashinfer.utils import get_compute_capability
 
 
 _MIN_COS_SIM = 0.98
+
+
+def test_mm_mxfp8_auto_retunes_when_cudnn_becomes_eligible(monkeypatch):
+    # Exercise the real SM120 backend filters with CPU tensors and fake runners.
+    def capability(device):
+        return 12, 0
+
+    monkeypatch.setattr(utils, "get_compute_capability", capability)
+    monkeypatch.setattr(gemm_base, "get_compute_capability", capability)
+    monkeypatch.setattr(torch.version, "cuda", "13.4")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(gemm_base, "_check_cute_dsl_arch", lambda device: None)
+    monkeypatch.setattr(
+        gemm_mm_mxfp8_cute_dsl, "get_cuda_version", lambda: Version("13.4")
+    )
+    monkeypatch.setattr(
+        gemm_mm_mxfp8_cute_dsl, "_b12x_mxfp8_dsl_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        gemm_base, "_get_stream_cache_buf", lambda *args: torch.empty(0)
+    )
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+
+    profiled, dispatched = [], []
+
+    class Runner(TunableRunner):
+        def __init__(self, backend):
+            self.backend = backend
+
+        def get_cache_key_extras(self, inputs):
+            return (self.backend,)
+
+        def get_valid_tactics(self, inputs, profile):
+            return [0]
+
+        def forward(self, inputs, tactic=-1):
+            dispatched.append(self.backend)
+
+    def profile(runner, inputs, tactic, config, **kwargs):
+        profiled.append(runner.backend)
+        return {"cutlass": 3.0, "b12x": 2.0, "cudnn": 1.0}[runner.backend]
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    monkeypatch.setattr(
+        gemm_base,
+        "get_cutlass_mxfp8_gemm_module",
+        lambda major: SimpleNamespace(
+            cutlass_mxfp8_gemm_runner=lambda: Runner("cutlass")
+        ),
+    )
+    monkeypatch.setattr(
+        gemm_base, "_b12x_gemm_mxfp8_runner", lambda *args: Runner("b12x")
+    )
+    monkeypatch.setattr(gemm_base, "_cudnn_mm_mxfp8_runner", lambda: Runner("cudnn"))
+
+    a = torch.zeros(128, 128, dtype=torch.float8_e4m3fn)
+    scale = torch.zeros(512, dtype=torch.uint8)
+    monkeypatch.setattr(gemm_base, "CUDNN_AVAILABLE", False)
+    with autotune(tuning_buckets=(128,)):
+        mm_mxfp8(a, a.t(), scale, scale, backend="cutlass", use_8x4_sf_layout=False)
+        assert profiled == ["cutlass"]
+        profiled.clear()
+        mm_mxfp8(a, a.t(), scale, scale, use_8x4_sf_layout=False)
+        assert profiled == ["b12x", "cutlass"]
+        assert dispatched[-1] == "b12x"
+        profiled.clear()
+
+        monkeypatch.setattr(gemm_base, "CUDNN_AVAILABLE", True)
+        mm_mxfp8(a, a.t(), scale, scale, use_8x4_sf_layout=False)
+        assert profiled == ["b12x", "cutlass", "cudnn"]
+        assert dispatched[-1] == "cudnn"
+
+    profiled.clear()
+    monkeypatch.setattr(gemm_base, "CUDNN_AVAILABLE", False)
+    mm_mxfp8(a, a.t(), scale, scale, use_8x4_sf_layout=False)
+    assert dispatched[-1] == "b12x"
+    assert profiled == []
+
+
+def test_mm_mxfp8_cute_dsl_low_m_runner_has_distinct_cache_extras():
+    pytest.importorskip("cutlass")
+    dtype = torch.bfloat16
+    regular = gemm_base._cute_dsl_gemm_mxfp8_runner(10, 7, True, dtype)
+    low_m = gemm_base._cute_dsl_gemm_mxfp8_runner(10, 7, True, dtype, low_m_only=True)
+    inputs = [None, None, None, None, dtype, torch.empty(0, dtype=dtype), None]
+
+    assert regular.get_cache_key_extras(inputs) == (str(dtype), True)
+    assert low_m.get_cache_key_extras(inputs) != regular.get_cache_key_extras(inputs)
 
 
 def _assert_cosine_similarity(
@@ -591,6 +684,89 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
         _assert_cosine_similarity(reference, out)
 
 
+@pytest.mark.parametrize(
+    "m,n,k", [(4, 6144, 1024), (129, 256, 4096), (2048, 256, 4096)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mm_mxfp8_cute_dsl_quantize_pdl_cuda_graph(m, n, k, dtype):
+    """A PDL GEMM must consume this replay's quantized values and scales."""
+    _skip_if_unsupported("cute-dsl")
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=dtype, generator=generator)
+    weight = torch.randn((n, k), device="cuda", dtype=dtype, generator=generator)
+    out = torch.empty((m, n), device="cuda", dtype=dtype)
+    reference = torch.empty_like(out)
+    torch.cuda.synchronize()
+    weight_q, weight_sf = mxfp8_quantize(
+        weight,
+        backend="cute-dsl",
+        enable_pdl=False,
+        sf_swizzle_layout=SfLayout.layout_128x4,
+    )
+    torch.cuda.synchronize()
+
+    def quantize(enable_pdl):
+        return mxfp8_quantize(
+            x,
+            backend="cute-dsl",
+            enable_pdl=enable_pdl,
+            sf_swizzle_layout=SfLayout.layout_128x4,
+        )
+
+    def gemm(x_q, x_sf, destination):
+        return mm_mxfp8(
+            x_q,
+            weight_q.T,
+            x_sf,
+            weight_sf,
+            out=destination,
+            out_dtype=dtype,
+            backend="cute-dsl",
+        )
+
+    # Use the same tactic for both paths, independent of earlier autotuning.
+    with autotune(False, skip_ops={"mxfp8_gemm"}):
+        warmup_q, warmup_sf = quantize(enable_pdl=True)
+        gemm(warmup_q, warmup_sf, out)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_q, graph_sf = quantize(enable_pdl=True)
+            gemm(graph_q, graph_sf, out)
+
+        for magnitude in (0.125, 1.0, 8.0, 0.5) * 2:
+            x.normal_(generator=generator).mul_(magnitude)
+            # Isolate the quantizer-to-GEMM dependency from input preparation.
+            torch.cuda.synchronize()
+            reference_q, reference_sf = quantize(enable_pdl=False)
+            torch.cuda.synchronize()
+            gemm(reference_q, reference_sf, reference)
+            torch.cuda.synchronize()
+
+            # Unwritten buffers must not retain a valid result from a prior replay.
+            graph_q.view(torch.uint8).zero_()
+            graph_sf.zero_()
+            out.fill_(float("nan"))
+            torch.cuda.synchronize()
+            graph.replay()
+            torch.cuda.synchronize()
+
+            assert torch.isfinite(out).all(), "Output contains NaN/Inf values"
+            for actual, expected in (
+                (graph_q, reference_q),
+                (graph_sf, reference_sf),
+                (out, reference),
+            ):
+                torch.testing.assert_close(
+                    actual.view(torch.uint8),
+                    expected.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+
+
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
     """A low-M cached tactic must not fail when reused for a larger M."""
     _skip_if_unsupported("cute-dsl")
@@ -1017,3 +1193,45 @@ def test_trtllm_raises_for_linear_b_descale():
             a_descale,
             b_descale,
         )
+
+
+@pytest.mark.parametrize(
+    "cc, suitable, expected",
+    [
+        ((10, 7), ["cudnn", "cute-dsl", "cutlass"], ["cutlass", "cute-dsl", "cudnn"]),
+        ((10, 7), ["cutlass", "cute-dsl"], ["cutlass", "cute-dsl"]),
+        ((10, 7), ["cutlass", "cudnn"], ["cutlass", "cudnn"]),
+        ((10, 0), ["cutlass", "cute-dsl", "cudnn"], ["cutlass"]),
+        ((10, 3), ["cutlass", "cute-dsl", "cudnn"], ["cutlass"]),
+    ],
+)
+def test_mm_mxfp8_auto_ranks_cute_dsl_and_cudnn_after_cutlass_on_sm107(
+    monkeypatch, cc, suitable, expected
+):
+    """Untuned ``backend="auto"`` calls keep CUTLASS first; on SM107 the autotuner also ranks the suitable CuTe-DSL and cuDNN backends."""
+    monkeypatch.setattr(gemm_base, "get_compute_capability", lambda device: cc)
+    a = torch.zeros(4, 128).to(torch.float8_e4m3fn)
+    b = torch.zeros(128, 128).to(torch.float8_e4m3fn).t()
+    sf = torch.zeros(512, dtype=torch.uint8)
+    assert gemm_base._heuristic_func_mm_mxfp8(suitable, a, b, sf, sf) == expected
+
+
+@pytest.mark.parametrize("override_shape", [True, False])
+def test_mm_mxfp8_cudnn_runner_declined_graph_has_no_tactics(
+    monkeypatch, override_shape
+):
+    """A cuDNN graph the backend declines yields no tactics, so ``auto`` tuning keeps the other candidates."""
+    cudnn = pytest.importorskip("cudnn")
+    runner = gemm_base._cudnn_mm_mxfp8_runner()
+    monkeypatch.setattr(runner, "_use_override_shape", override_shape)
+
+    def decline(*args, **kwargs):
+        raise cudnn.cudnnGraphNotSupportedError("declined")
+
+    monkeypatch.setattr(runner, "_get_override_graph", decline)
+    monkeypatch.setattr(gemm_base, "build_cudnn_gemm_mxfp8_graph", decline)
+    a = torch.zeros(128, 128).to(torch.float8_e4m3fn)
+    b = torch.zeros(128, 128).to(torch.float8_e4m3fn).t()
+    out = torch.empty(128, 128, dtype=torch.bfloat16)
+    inputs = [a, b, None, None, torch.bfloat16, out, None]
+    assert runner.get_valid_tactics(inputs, None) == []

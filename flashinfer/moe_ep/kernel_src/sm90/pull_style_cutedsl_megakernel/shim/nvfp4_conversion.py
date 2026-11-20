@@ -3,7 +3,7 @@
 """SM90 NVFP4 x FP8 layouts and conversion primitives.
 
 Weights remain packed E2M1, with one raw nonnegative E4M3 scale per K16.
-The caller appends a replicated shared conversion table (8, 16 or 32 KiB, see
+The caller appends a replicated shared conversion table (1 to 32 KiB, see
 ``Nvfp4ConversionLayout``) to the scale ring and initializes it once before
 warp specialization. Promotion computes RN_E4M3(q*s/8) and supplies register
 operand A to K32 RS WGMMA; the existing epilogue applies 8G. MXFP4-prefixed
@@ -209,9 +209,13 @@ def nvfp4_initialize_lut(lookup: cute.Tensor, tidx: Int32):
 def nvfp4_word_smem(
     src: Int32, scale: Int32, upper: cutlass.Constexpr, lookup: cute.Tensor
 ):
-    # Lane-quad replica: valid for every table size (all replicas are equal).
+    # Lane-quad replica (all replicas are equal); tables with fewer than eight
+    # replicas fold the eight quads onto the ones they have.
     replicas = cute.size(lookup) // 128
-    bits = lookup[scale * Int32(replicas) + cute.arch.lane_idx() // Int32(4)]
+    replica = cute.arch.lane_idx() // Int32(4)
+    if cutlass.const_expr(replicas < 8):
+        replica = replica & Int32(replicas - 1)
+    bits = lookup[scale * Int32(replicas) + replica]
     lo = Int32(bits & cutlass.Uint64(0xFFFFFFFF))
     hi = Int32(bits >> cutlass.Uint64(32))
     selector = src & Int32(0x77777777)

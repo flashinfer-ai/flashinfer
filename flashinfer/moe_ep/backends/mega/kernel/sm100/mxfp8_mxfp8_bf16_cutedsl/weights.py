@@ -22,7 +22,7 @@ TransformedMegaWeights = Tuple[
     Tuple["torch.Tensor", "torch.Tensor"],
 ]
 
-Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
+Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 
 
 def _fc1_weight_from_w13(
@@ -88,8 +88,6 @@ def preprocess_mega_weights(
             preprocess_genphase_weights,
         )
 
-        if kind != "mxfp8_e4m3":
-            raise ValueError("Blackwell GenPhase requires MXFP8 E4M3 weights.")
         if isinstance(weights, PrequantizedMoEWeights):
             return preprocess_genphase_prequantized_weights(
                 weights.w13,

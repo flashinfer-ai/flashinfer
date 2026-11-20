@@ -378,7 +378,8 @@ kernel_cake_fused_qk_rope_fp8_append_c0f0b47d168812a2c23f(const __nv_bfloat16* _
                     ss = ss + _shfl_xor_sync_15;
                     float _shfl_xor_sync_16 = __shfl_xor_sync(grp_mask, ss, 1);
                     ss = ss + _shfl_xor_sync_16;
-                    float inv_rms = rsqrtf(__fmaf_rn(ss, 0.0078125f, 1e-06f));
+                    float inv_rms;
+                    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv_rms) : "f"(__fmaf_rn(ss, 0.0078125f, 1e-06f)));
                     #pragma unroll
                     for (int j_3 = 0; j_3 < 8; j_3++) {
                         x_lo[j_3] = x_lo[j_3] * (inv_rms * w_lo[j_3]);
@@ -405,7 +406,8 @@ kernel_cake_fused_qk_rope_fp8_append_c0f0b47d168812a2c23f(const __nv_bfloat16* _
                     ss1 = ss1 + _shfl_xor_sync_18;
                     float _shfl_xor_sync_19 = __shfl_xor_sync(grp_mask, ss1, 1);
                     ss1 = ss1 + _shfl_xor_sync_19;
-                    float inv_rms1 = rsqrtf(__fmaf_rn(ss1, 0.0078125f, 1e-06f));
+                    float inv_rms1;
+                    asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv_rms1) : "f"(__fmaf_rn(ss1, 0.0078125f, 1e-06f)));
                     #pragma unroll
                     for (int j_6 = 0; j_6 < 8; j_6++) {
                         x_lo[j_6] = x_lo[j_6] * (inv_rms1 * w_lo[j_6]);

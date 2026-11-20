@@ -57,14 +57,22 @@ def is_supported(
     *, m: int, n: int, k: int, rank: int, has_bias: bool, device: torch.device
 ) -> bool:
     """Whether ``device`` is an exported target and ``(M, N, K, rank, has_bias)``
-    has a route on its architecture (the shape rule of
+    has a route on its architecture and SM count (the shape rule of
     :func:`cake_jit.select_record`)."""
     device = torch.device(device)
     if device.type != "cuda":
         return False
     try:
-        arch = _loader.device_arch(_device_index(device))
-        select_record(m=m, n=n, k=k, rank=rank, has_bias=has_bias, arch=arch)
+        index = _device_index(device)
+        select_record(
+            m=m,
+            n=n,
+            k=k,
+            rank=rank,
+            has_bias=has_bias,
+            arch=_loader.device_arch(index),
+            sm_count=_loader.sm_count(index),
+        )
         return True
     except (RuntimeError, ValueError):
         return False
@@ -86,7 +94,8 @@ def run(
     """Launch the routed program for one problem and return ``out``.
 
     The route is :func:`cake_jit.select_record` over the host scalars and the
-    device's architecture; the arguments are :func:`cake_jit.plan_values`
+    device's architecture and SM count (both read once per device); the
+    arguments are :func:`cake_jit.plan_values`
     (scale-factor views, bias carrier, kernel scalars, grid).  ``enable_pdl``
     must be ``None`` or equal to the selected program's launch attribute; a
     program's programmatic dependent launch is a property of its rendered
@@ -105,6 +114,7 @@ def run(
         rank=rank,
         has_bias=has_bias,
         arch=_loader.device_arch(device_index),
+        sm_count=_loader.sm_count(device_index),
     )
     record = MODULES[name]
     program_pdl = bool(record["launch"]["use_pdl"])

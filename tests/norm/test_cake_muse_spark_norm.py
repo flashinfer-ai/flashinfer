@@ -157,6 +157,7 @@ def test_every_window_matches_the_reference(form):
 
     try:
         loader.run_module = spy
+        checked = 0
         for rows in _edge_rows(route):
             torch.manual_seed(1000 + rows)
             inputs = _inputs(rows, tensor_alpha=tensor_alpha)
@@ -181,8 +182,10 @@ def test_every_window_matches_the_reference(form):
                     )
                     assert len(launched) == before
                 continue
+            checked += 1
             _assert_close(_call(inputs, **kwargs), _reference(inputs, **kwargs))
             assert launched[-1] == (loader.selected_module(_arch(), route, rows), rows)
+        assert checked, f"route {route} admits none of its edge rows on {_arch()}"
     finally:
         loader.run_module = original
 
@@ -295,6 +298,35 @@ def test_warm_up_loads_every_route():
                 assert loader.cluster_capacity(name, _arch(), device.index) >= 1
 
 
+def _tokens_heads_launch_cluster(rule) -> tuple[int, int, int]:
+    """The launch cluster of a ``tokens_heads`` record: ``cluster`` CTAs over the head
+    blocks (the grid's first dimension) when the rule names one above one; otherwise the
+    token cluster along the token dimension, the first grid dimension in token-major
+    order and the second in head-major order."""
+    cluster, tcluster = int(rule["cluster"]), int(rule.get("tcluster", 1))
+    if cluster > 1:
+        return (cluster, 1, 1)
+    if rule.get("order") == "heads":
+        return (1, tcluster, 1)
+    return (tcluster, 1, 1)
+
+
+def _tokens_heads_grid(rule, tokens: int, heads: int) -> tuple[int, int, int]:
+    """The grid a ``tokens_heads`` rule prescribes: a CTA of ``tpc`` tokens covers
+    ``rows_per_cta / tpc`` heads each; otherwise a CTA covers ``rows_per_cta`` heads of
+    one token, the token count rounded up to the token cluster (or the interleave), the
+    head blocks first under a cluster over them or the head-major order."""
+    rows_per_cta, tpc = int(rule["rows_per_cta"]), int(rule.get("tpc", 1))
+    if tpc > 1:
+        return (-(-tokens // tpc), -(-heads // (rows_per_cta // tpc)), 1)
+    blocks = -(-heads // rows_per_cta)
+    tcluster, interleave = int(rule.get("tcluster", 1)), int(rule.get("interleave", 1))
+    if int(rule["cluster"]) > 1 or rule.get("order") == "heads":
+        return (blocks, -(-tokens // tcluster) * tcluster, 1)
+    step = max(tcluster, interleave)
+    return (-(-tokens // step) * step, blocks, 1)
+
+
 def test_launch_grid_follows_the_record_rule():
     """Every record delivered for this device launches the grid its ``grid_rule`` spells: ``rows x row_ctas`` CTAs
     for a ``rows`` rule (``row_ctas`` the rule's CTAs per row, the cluster when it names none), ``min(rows, co-resident
@@ -311,13 +343,10 @@ def test_launch_grid_follows_the_record_rule():
         rule = record["grid_rule"]
         cluster = int(rule["cluster"])
         kind = rule["kind"]
-        tcluster = int(rule.get("tcluster", 1))
-        if kind != "tokens_heads" or cluster > 1:
-            launch_cluster = (cluster, 1, 1)
-        elif rule.get("order") == "heads":
-            launch_cluster = (1, tcluster, 1)
+        if kind == "tokens_heads":
+            launch_cluster = _tokens_heads_launch_cluster(rule)
         else:
-            launch_cluster = (tcluster, 1, 1)
+            launch_cluster = (cluster, 1, 1)
         assert tuple(record["launch"]["cluster"]) == launch_cluster, (
             name,
             rule,
@@ -338,30 +367,34 @@ def test_launch_grid_follows_the_record_rule():
                 assert grid == (min(rows, capacity) * cluster, 1, 1), (name, rows, grid)
             else:
                 assert kind == "tokens_heads", (name, rule)
-                rows_per_cta = int(rule["rows_per_cta"])
-                interleave = int(rule.get("interleave", 1))
+                # the two-dimensional grid of ``rows`` tokens and the given heads; a launch without a head count
+                # is refused
+                with pytest.raises(ValueError, match="must carry 'heads'"):
+                    loader.launch_grid(record, rows, device_index=device.index)
                 # the head counts the record's windows name on any device (the only ones its head blocks fill a
                 # whole cluster for), or its CTA's own when it names none
                 heads_named = {
                     int(heads)
-                    for windows in record["select_rule"]["windows"].values()
+                    for windows in (record.get("select_rule") or {})
+                    .get("windows", {})
+                    .values()
                     for heads, _above, _at_most in windows
-                } or {rows_per_cta}
-                for heads in sorted(heads_named):
+                } or {int(rule["rows_per_cta"])}
+                for heads in sorted({1, 16, 32, 128} | heads_named):
                     grid = loader.launch_grid(
                         record, rows, device_index=device.index, values={"heads": heads}
                     )
-                    blocks = -(-heads // rows_per_cta)
-                    if cluster > 1 or rule.get("order") == "heads":
-                        expected = (blocks, -(-rows // tcluster) * tcluster, 1)
-                    else:
-                        step = max(tcluster, interleave)
-                        expected = (-(-rows // step) * step, blocks, 1)
-                    assert grid == expected, (name, rows, heads, grid)
-                    assert all(
-                        extent % size == 0
-                        for extent, size in zip(grid, launch_cluster, strict=True)
-                    ), (name, rows, heads, grid, launch_cluster)
+                    assert grid == _tokens_heads_grid(rule, rows, heads), (
+                        name,
+                        rows,
+                        heads,
+                        grid,
+                    )
+                    if heads in heads_named:
+                        assert all(
+                            extent % size == 0
+                            for extent, size in zip(grid, launch_cluster, strict=True)
+                        ), (name, rows, heads, grid, launch_cluster)
             checked += 1
     assert checked
 

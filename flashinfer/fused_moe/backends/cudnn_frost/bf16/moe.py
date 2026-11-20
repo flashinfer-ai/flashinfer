@@ -38,6 +38,7 @@ from ..shortlist import capture_profiles
 from ..shortlist import _read
 from ..catalog import can_implement, select_kernels as select_catalog
 from ..heuristics import POLICY_VERSION
+from ..runtime import cluster_capacities
 from ..tuning import prepared_state, ranked_tactics
 
 _WEIGHT_KEYS = frozenset(("fc1_expert_weights", "fc2_expert_weights"))
@@ -69,7 +70,7 @@ def _matching_kernels(roots, arch, rows, hidden, intermediate, experts, name):
     values = dict(s=rows, n=intermediate, k=hidden, experts=experts, groups=experts)
     first = tuple(
         k
-        for k in runtime._discover(roots)
+        for k in runtime._discover(roots, include_gather=True)
         if k.arch == arch and k.activation == name and can_implement(k, values)
     )
     values = dict(s=rows, n=hidden, k=intermediate, experts=experts, groups=experts)
@@ -94,6 +95,7 @@ def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activ
         experts,
         topk,
         activation_name(activation),
+        cluster_capacities(device),
     )
 
 
@@ -110,6 +112,7 @@ def _selected_kernels_cached(
     experts,
     topk,
     name,
+    cluster_capacities=(),
 ):
     # Admission and packing share sealed artifact metadata, never runtime tensors
     # or pointers. Explicit artifact refresh advances the version in this key.
@@ -128,6 +131,7 @@ def _selected_kernels_cached(
         experts=experts,
         topk=topk,
         sm_count=sm_count,
+        cluster_capacities=cluster_capacities,
     )
 
 
@@ -148,14 +152,21 @@ def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation, device)
     return fma.tactic(activation_name(activation))
 
 
-def _capture_selection(roots, arch, sm_count, activation):
+def _capture_selection(roots, arch, sm_count, activation, cluster_capacities=()):
     name = activation_name(activation)
-    first = seal_kernels(runtime._discover(roots))
+    first = seal_kernels(runtime._discover(roots, include_gather=True))
     second = seal_kernels(fc2.discover(roots))
     select_fma, validate_fma_sources = capture_fma_selection(fma, name, arch)
     return SelectionSnapshot(
         make_kernel_selector(
-            first, second, (), capture_profiles(roots), arch, name, sm_count
+            first,
+            second,
+            (),
+            capture_profiles(roots),
+            arch,
+            name,
+            sm_count,
+            cluster_capacities=cluster_capacities,
         ),
         select_fma,
         validate_fma_sources,
@@ -190,7 +201,10 @@ class _Plans:
             executor_key = (hidden, intermediate, experts, topk, False, key)
             plan = executor_cache.get(executor_key)
             if plan is None:
-                plan = module.make_runner(
+                factory = (
+                    module.make_gather_runner if a.gathers_input else module.make_runner
+                )
+                plan = factory(
                     [runtime._load_kernel(a, device)],
                     [runtime._load_kernel(b, device)],
                     hidden,
@@ -300,7 +314,10 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
             sorted(
                 {
                     (kernel.source_path, kernel.source_sha256)
-                    for kernel in (*runtime._discover(roots), *fc2.discover(roots))
+                    for kernel in (
+                        *runtime._discover(roots, include_gather=True),
+                        *fc2.discover(roots),
+                    )
                     if kernel.arch == arch
                     and (
                         not isinstance(kernel, runtime.CudnnFrostGroupedGemm1Kernel)
@@ -326,7 +343,11 @@ class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
             require_assembler=get_compute_capability(device) == (10, 7),
             refresh_artifacts=runtime.clear_artifact_cache,
             capture_selection=lambda roots, arch, sm_count: _capture_selection(
-                roots, arch, sm_count, activation
+                roots,
+                arch,
+                sm_count,
+                activation,
+                cluster_capacities(device),
             ),
             build_plan=lambda shape, metadata, workspace_pool, executor_cache: _Plans(
                 *shape,
