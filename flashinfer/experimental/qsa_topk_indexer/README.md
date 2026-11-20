@@ -32,8 +32,15 @@ deferred handoff to this package.
 - Tests: `tests/experimental/test_qsa_topk_indexer.py` (exact PyTorch
   reference, validated on SM107).
 
-The experimental lifecycle owner and the tracking issue are linked from the
-pull request that adds the package.
+Owner: [Brandon Zhang (@brandonfzhang)](https://github.com/brandonfzhang).
+Use-case tracking: [QSA indexer coverage #8086](https://github.com/flashinfer-ai/flashinfer/issues/8086).
+Study and implementation tracking: [Rubin kernel study #9593](https://github.com/flashinfer-ai/flashinfer/issues/9593).
+
+Graduation requires settling the packed request-local index/count contract
+with its serving consumer, validating that integration on SM107, and
+completing the stable API/build checklist. This follows the experimental
+policy's four-week review target after introduction; it is not a promise
+of a stable release or automatic backend admission.
 
 ## Runnable example
 
