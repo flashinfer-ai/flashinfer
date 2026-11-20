@@ -4129,6 +4129,20 @@ def test_gvr2_route_unsplit_slab_regime():
     assert _host._big_regime(149, 1, 8192) is False  # b > 148: never big
 
 
+def test_gvr2_route_split_rows_bound(monkeypatch):
+    """The workspace holds the SPLIT arrival words of _MAXC rows (row _MAXC's word
+    would be row 0's slab offset), so route() and route_streaming() refuse a SPLIT
+    launch of more rows. Reachable plans split only up to 74 rows, so the bound
+    is lowered to show the refusal."""
+    assert _host.route(16, 1048640, 1048640, 1024)["tpl"][5]
+    monkeypatch.setattr(_host, "_MAXC", 15)
+    with pytest.raises(RuntimeError, match="at most 15 rows"):
+        _host.route(16, 1048640, 1048640, 1024)
+    with pytest.raises(RuntimeError, match="at most 15 rows"):
+        _host.route_streaming(16, 1048640, 1048640, 1024, force_main=True)
+    assert _host.route(15, 1048640, 1048640, 1024)["tpl"][5]  # the bound itself
+
+
 def test_gvr2_route_reg_clus_sm_count_aware():
     """The clustered-register admission (`av`) follows the SM count on parts with
     >= 148 SMs (Rubin/B300: bigger clusters, reg_clus where B200 falls to the
