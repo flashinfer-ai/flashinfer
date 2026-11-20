@@ -75,7 +75,7 @@ def dropin_case(B, T, H, dev="cuda", seed=0):
     sidx = torch.arange(1, B + 1, dtype=torch.int32, device=dev)
     out = torch.empty_like(v)
 
-    def run(be):
+    def run(be, check=False):
         kda_recoverssm_verify(
             q,
             k,
@@ -94,7 +94,7 @@ def dropin_case(B, T, H, dev="cuda", seed=0):
             out=out,
             backend=be,
         )
-        return out.clone(), corr.clone()
+        return (out.clone(), corr.clone()) if check else None
 
     return run
 
@@ -120,8 +120,8 @@ def main():
                 if a.mode == "dense"
                 else dropin_case(B, T, a.heads)
             )
-            ref = run("wy")
-            got = run("umma")
+            ref = run("wy", True) if a.mode == "dropin" else run("wy")
+            got = run("umma", True) if a.mode == "dropin" else run("umma")
             ref = ref if isinstance(ref, tuple) else (ref,)
             got = got if isinstance(got, tuple) else (got,)
             for r, x in zip(ref, got, strict=True):

@@ -2047,13 +2047,23 @@ def _compile_options(device: torch.device) -> tuple:
     return (cute.GPUArch(f"sm_{major}{minor}a"),) if major == 12 else ()
 
 
-def _select_umma(backend: str, device: torch.device, T_in: int, api: str) -> bool:
+# backend="auto" (with FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1) picks the UMMA
+# kernel up to this many tokens: B200 / H=12 measured it 1.05-1.28x faster than the
+# WY kernel at T <= 8 (dense) and 1.12-1.89x (drop-in), but 0.84-0.97x at T = 16.
+_UMMA_AUTO_T_MAX = 8
+
+
+def _select_umma(
+    backend: str, device: torch.device, T_in: int, api: str, auto_ok: bool = True
+) -> bool:
     """Whether to run the experimental tcgen05 / UMMA backend
     (``flashinfer.experimental.kda_output_only_umma``). ``backend="umma"`` is the
     explicit opt-in (raises when it cannot run); ``"auto"`` picks it only when
-    ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` and it can run."""
+    ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``, ``auto_ok`` (the caller's
+    own dispatch would use the WY kernel), T <= _UMMA_AUTO_T_MAX and it can run."""
     from ..api_logging import (
         experimental_auto_backends_allowed,
+        require_experimental_auto_backends,
         warn_experimental_backend_once,
     )
 
@@ -2067,12 +2077,18 @@ def _select_umma(backend: str, device: torch.device, T_in: int, api: str) -> boo
             raise ValueError(f"{api}: backend='umma' unavailable: {why}")
         warn_experimental_backend_once(api, "umma")
         return True
-    if backend == "auto" and experimental_auto_backends_allowed():
+    if (
+        backend == "auto"
+        and auto_ok
+        and T_in <= _UMMA_AUTO_T_MAX
+        and experimental_auto_backends_allowed()
+    ):
         from ..experimental.kda_output_only_umma import (
             kda_oo_umma_unavailable_reason,
         )
 
         if kda_oo_umma_unavailable_reason(device, T_in) is None:
+            require_experimental_auto_backends(f"{api} -> umma")
             warn_experimental_backend_once(api, "umma", automatic=True)
             return True
     return False
@@ -2131,7 +2147,8 @@ def kda_wy_output_only(
             grouped recurrence), ``"wy"``, ``"recurrent"``, or ``"umma"`` -- the
             experimental tcgen05 / UMMA kernel (SM10x;
             ``flashinfer.experimental.kda_output_only_umma``). ``"auto"`` selects
-            ``"umma"`` only with ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``.
+            ``"umma"`` only with ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``,
+            at T <= 8, where it would otherwise run the WY kernel.
 
     Returns:
         ``[B, T, HV, 128]`` bf16 output.
@@ -2278,7 +2295,6 @@ def kda_wy_output_only(
     # in-kernel gate the recurrence pays per-element transform cost, shifting
     # every crossover toward WY — thresholds are halved there (measured at
     # T=8 where WY already wins at every batch; interior points estimated).
-    use_umma = _select_umma(backend, device, T_in, "kda_wy_output_only")
     _bh = B * HV
     _scale = 1 if gate_mode == GATE_PRECOMPUTED else 2
     if T_in == 1:
@@ -2289,8 +2305,9 @@ def kda_wy_output_only(
         _rec_max = _REC_DISPATCH_MAX_BH // (8 * _scale)
     else:
         _rec_max = 0
-    use_rec = backend == "recurrent" or (
-        backend == "auto" and _bh <= _rec_max and not use_umma
+    use_rec = backend == "recurrent" or (backend == "auto" and _bh <= _rec_max)
+    use_umma = _select_umma(
+        backend, device, T_in, "kda_wy_output_only", auto_ok=not use_rec
     )
     if use_rec:
         rec_args = [
@@ -2526,7 +2543,8 @@ def kda_recoverssm_verify(
     ``backend``: ``"auto"`` / ``"wy"`` run the WY kernel; ``"umma"`` the
     experimental tcgen05 / UMMA kernel (SM10x,
     ``flashinfer.experimental.kda_output_only_umma``), which ``"auto"`` selects
-    only with ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``.
+    only with ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` and
+    ``spec_query_len <= 8``.
     """
     if backend not in ("auto", "wy", "umma"):
         raise ValueError(

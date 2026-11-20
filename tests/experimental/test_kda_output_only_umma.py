@@ -192,8 +192,9 @@ def test_umma_dropin_matches_wy(spec_len):
 
 
 def test_umma_auto_needs_experimental_opt_in(monkeypatch):
-    """``backend="auto"`` never picks the experimental kernel unless
-    FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1."""
+    """``backend="auto"`` picks the experimental kernel only with
+    FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1, at T <= 8, and never where the
+    dense dispatch would run the grouped recurrence (small batch)."""
     args, kw = _inputs(64, 8, 4, 4, "lb", seed=3)
     monkeypatch.delenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False)
     n0 = _launches()
@@ -205,6 +206,16 @@ def test_umma_auto_needs_experimental_opt_in(monkeypatch):
     out = _WY_DENSE(*args, **kw, backend="auto")
     assert _launches() == n0 + 1
     assert torch.equal(out, ref)
+    # T = 16: the WY kernel stays the automatic choice
+    args16, kw16 = _inputs(64, 16, 4, 4, "lb", seed=4)
+    n0 = _launches()
+    _WY_DENSE(*args16, **kw16, backend="auto")
+    assert _launches() == n0
+    # small batch at T = 1: the grouped recurrence stays the automatic choice
+    args1, kw1 = _inputs(2, 1, 4, 4, "pre", seed=5)
+    n0 = _launches()
+    _WY_DENSE(*args1, **kw1, backend="auto")
+    assert _launches() == n0
 
 
 def test_umma_backend_rejects_bad_values():
