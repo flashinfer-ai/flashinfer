@@ -380,7 +380,9 @@ rebased. Metadata records ``original_storage_offset`` for provenance. Mixed-dtyp
 storage aliases, views whose non-overlap cannot be proven from their strides,
 conjugate/negative views, and unnamed mutation declarations are rejected with a dump error rather than
 producing an incorrect snapshot. Read-only inputs outside a mutated storage
-group retain the default deferred-reference behavior.
+group retain the default deferred-reference behavior. Their values are sampled
+at flush, so preserve the values consumed by the call until then, including
+across later graph nodes, for offline replay to reproduce the call.
 Gaps between read-only alias views are zeroed during CPU materialization,
 without adding device copy nodes during capture.
 
