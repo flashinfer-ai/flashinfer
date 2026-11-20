@@ -1277,7 +1277,7 @@ def test_refused_replan_preserves_graph_and_eager(monkeypatch, change):
         if change == "short_auto":
             ki = ki.new_tensor([0, 16, 32])
             ids = ids[:32]
-            last = last.new_tensor([PAGE, PAGE])
+            last = last.new_tensor([PAGE - 1, PAGE])
         elif change == "disabled":
             m.setenv(DISABLE_ENV, "1")
         elif change == "dtype":
