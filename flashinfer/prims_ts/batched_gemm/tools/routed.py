@@ -83,8 +83,13 @@ def routed_inputs(runner, fixture, *, seed=1111):
             dtype=torch.uint8,
             device=device,
         )
-        indices = runner._random_uint8(storage_shape, high=16, device=device)
-        return lookup[indices.long()]
+        packed = torch.empty(storage_shape, dtype=torch.uint8, device=device)
+        flat = packed.view(-1)
+        for start in range(0, flat.numel(), 1 << 20):
+            chunk = flat[start : start + (1 << 20)]
+            indices = runner._random_uint8(chunk.shape, high=16, device=device)
+            chunk.copy_(lookup[indices.long()])
+        return packed
 
     def sf_values(shape, *, cfg, device, layout_kind):
         assert not cfg.uses_mx_scale_factors
@@ -132,6 +137,8 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--timer", choices=("cupti", "events"), default="cupti")
     args = parser.parse_args()
+    if min(args.cluster_shape) <= 0:
+        parser.error("Both cluster-shape dimensions must be positive.")
     prefix = (
         args.output
         or Path("routed-results") / f"{args.case}-{args.mode}-{time.time_ns()}"

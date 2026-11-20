@@ -348,6 +348,16 @@ def test_local_async_keeps_thread_arrivals_and_transaction_bytes(kind):
     }
     for operand, (num_bytes, consumers) in expected.items():
         resource = resources[operand]
+        if kind == "routed_sfa":
+            from flashinfer.prims_ts.batched_gemm.smem_sf_resources import (
+                SmemSfGatherAResource,
+            )
+
+            # Device assembly uses the gather resource with this pipeline.
+            resource = SmemSfGatherAResource(
+                cfg=cfg, pipeline_config=resource.pipeline_config, name="SmemSfA"
+            )
+            assert resource.mixed_cga_kind == "sfa"
         control = cga.input_tma_control(cfg, operand)
         assert control.full_arming == "local_async"
         assert control.issuers == control.participants == cga.CgaPolicy.ALL
@@ -399,6 +409,8 @@ def test_independent_pair_ring_reuse_gpu(monkeypatch, shape, partitioned, schedu
 
     def compile_with_graph(io, stream):
         compiled = original_compile(io, stream)
+        assert not io["cfg"].is_swap_ab and not io["c_row_stride"]
+        output_bytes = io["shape"][0] * io["shape"][1] * io["cfg"].dtype_c_bits // 8
         warmed = False
 
         def launch(*args):
@@ -424,6 +436,13 @@ def test_independent_pair_ring_reuse_gpu(monkeypatch, shape, partitioned, schedu
             )
             for _ in range(32):
                 graph.replay()
+            # Poison only C's logical storage, retaining the allocation guards.
+            # The final checked replay must overwrite it on the same stream.
+            (status,) = cuda_drv.cuMemsetD8Async(
+                io["c0_dp"]._pointer, 0xFF, output_bytes, stream
+            )
+            assert status == cuda_drv.CUresult.CUDA_SUCCESS
+            graph.replay()
             graphs.append(graph)
 
         return launch

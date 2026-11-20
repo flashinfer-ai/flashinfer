@@ -152,7 +152,7 @@ def test_plain_step_grouped_emission():
         (4, 1, -2, 0, "MajorK"),
     ],
 )
-def test_fc1_step_reference(warps, stages, prefix, ahead, layout):
+def test_fc1_step_reference(warps, stages, prefix, ahead, layout, streaming=0):
     from tests.prims_ts.test_batched_gemm_rubin_shuffled import shuffled_profile
     from flashinfer.prims_ts.batched_gemm import batched_gemm_run as runner
     from flashinfer.tllm_enums import WeightLayout
@@ -171,6 +171,7 @@ def test_fc1_step_reference(warps, stages, prefix, ahead, layout):
             max(0, prefix), finalize=False, gated=True, warps=warps, read_ahead=ahead
         ),
         use_global_scales=1,
+        dense_streaming_c=streaming,
     )
     if prefix == -1:
         options["epilogue_steps"] = (
@@ -258,3 +259,9 @@ def test_fc1_step_moe_replay(monkeypatch, warps, stages, layout, tactic, streami
             ),
         ),
     )
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fc1_step_streaming_reference():
+    test_fc1_step_reference(8, 2, 4, 0, "BlockMajorK", streaming=1)

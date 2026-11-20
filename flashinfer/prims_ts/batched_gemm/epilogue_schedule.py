@@ -203,6 +203,7 @@ class PreloadEpiloguePreset:
 
     def overrides(self):
         return dict(
+            epilogue_steps=(),
             dense_preload_epilogue=1,
             dense_epilogue_warps=self.warps,
             fuse_moe_finalize=int(self.finalize),
@@ -260,7 +261,14 @@ class EpilogueStep:
 
 
 def normalize_epilogue_steps(steps):
-    """Accept immutable Python steps or their JSON dictionary representation."""
+    """Normalize one plan: Python steps or a JSON array of step dictionaries.
+
+    JSON config sweeps wrap each plan in another array. The JSON expander
+    selects one plan before calling this function; an empty tuple disables
+    explicit scheduling in Python configurations.
+    """
+    if isinstance(steps, list) and not steps:
+        raise ValueError("epilogue_steps must contain a nonempty plan")
     result = []
     for entry in steps:
         try:

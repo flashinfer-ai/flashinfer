@@ -2071,19 +2071,12 @@ def _active_route_output(output, active_route_mask, *, is_swap_ab):
 
 
 def _same_launch_output(first: torch.Tensor, current: torch.Tensor) -> bool:
-    """Whether two launches produced the same C buffer.
-
-    Elements the epilogue never stores keep their poison, so plain equality
-    would read the unwritten NaNs as a difference and report a deterministic
-    kernel as nondeterministic. Treat two NaNs in the same position as equal
-    and let the NaN coverage check downstream report them instead.
-    """
-    if torch.equal(first, current):
-        return True
-    if not first.dtype.is_floating_point:
+    """Compare observable output bits, including signed zeros and NaN payloads."""
+    if first.dtype != current.dtype or first.shape != current.shape:
         return False
-    matches = (first == current) | (torch.isnan(first) & torch.isnan(current))
-    return bool(matches.all().item())
+    return torch.equal(
+        first.contiguous().view(torch.uint8), current.contiguous().view(torch.uint8)
+    )
 
 
 def _partition_view(storage, width, cols, pitch):

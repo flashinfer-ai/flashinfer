@@ -7721,6 +7721,12 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
         self._inner: Any = None
 
+    def _cache_key_extras(self) -> tuple:
+        return super()._cache_key_extras() + (
+            bool(self.config.finalize.use_fused_finalize),
+            self._weight_layout(),
+        )
+
     def _weight_layout(self, view: Optional[dict] = None) -> int:
         from flashinfer.tllm_enums import WeightLayout
 

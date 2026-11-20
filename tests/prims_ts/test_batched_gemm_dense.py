@@ -445,7 +445,7 @@ def _eight_warp_config(tile_m=512, epi_n=32, c_stages=2, **overrides):
         epilogue_regs=128,
         dense_single_expert=1,
         dense_rolled_epilogue=1,
-        dense_dkg_store_order=1,
+        dense_dkg_store_order=0,
         dense_rolled_mma=1,
         dense_async_sf=1,
         dense_fuse_tma_loads=1,
@@ -591,6 +591,7 @@ def test_dense_epilogue_warps_cli():
 
 
 @pytest.mark.gpu
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize(
     "tile_m,epi_n,c_stages", [(256, 32, 2), (512, 32, 2), (512, 64, 1), (512, 64, 2)]
 )
@@ -808,6 +809,7 @@ def test_streaming_c_rejects_unsupported_configs(overrides):
 
 
 @pytest.mark.gpu
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize("cluster_y,mixed", [(1, False), (4, False), (4, True)])
 @pytest.mark.parametrize("dtype", ["FP16", "BF16"])
 def test_preloaded_epilogue_gpu(monkeypatch, cluster_y, mixed, dtype):
@@ -843,6 +845,7 @@ def test_preloaded_epilogue_gpu(monkeypatch, cluster_y, mixed, dtype):
 
 
 @pytest.mark.gpu
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize("preload", [0, 1])
 @pytest.mark.parametrize("raster", ["ALONG_M", "ALONG_N"])
 @pytest.mark.parametrize(
@@ -1016,6 +1019,7 @@ def test_grouped_n_raster_early_exit_preserves_valid_tiles(monkeypatch, group_m)
 
 
 @pytest.mark.gpu
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize("weight_layout", ["MajorK", "BlockMajorK"])
 @pytest.mark.parametrize("early_exit", [0, 1])
 @pytest.mark.parametrize(
@@ -1088,7 +1092,9 @@ def test_dense_fused_cga4_elects_weight_payload_issuers(monkeypatch, dim_x, dim_
     cfg = _preloaded_epilogue_config(cluster_dim_x=4, cluster_dim_y=dim_y)
     monkeypatch.setattr(cga, "Int32", int)
     issued = []
-    monkeypatch.setattr(cga, "_issue_tma_load_impl", lambda *args: issued.append(args))
+    monkeypatch.setattr(
+        cga, "_issue_tma_load_impl", lambda *args, **kwargs: issued.append(args)
+    )
     for operand in ("a", "b", "sfa", "sfb"):
         issued.clear()
         for y in range(dim_y):
@@ -1112,6 +1118,7 @@ def test_dense_fused_cga4_elects_weight_payload_issuers(monkeypatch, dim_x, dim_
 
 
 @pytest.mark.gpu
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize("weight_layout", ["MajorK", "BlockMajorK"])
 @pytest.mark.parametrize("cluster_y", [1, 2, 4])
 @pytest.mark.parametrize("raster", ["ALONG_M", "ALONG_N"])
@@ -1329,6 +1336,7 @@ def test_split_tma_releases_all_and_only_pair_users(monkeypatch, dim_x, dim_y, w
 
 
 @pytest.mark.gpu
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize(
     "x,y,stages_a,stages_b,dtype,layout,raster,specialized,preload,shape",
     [
@@ -1462,6 +1470,7 @@ def test_cooperative_preloaded_epilogue_resources(
 
 
 @pytest.mark.gpu
+@pytest.mark.arch_rubin
 @pytest.mark.parametrize(
     "split,dtype,experts,tokens,top_k,n,k,x,raster,stages_a,stages_b,registers,c_stages",
     [
@@ -1572,10 +1581,12 @@ def test_retain_a_cache_policy_preserves_payload_and_barriers(
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
     for operand in ("a", "sfa", "b", "sfb"):
+        calls.clear()
         python_body(cga._issue_tma_load_impl)(
             cfg, operand, "dst", "desc", "coords", "barrier", 0x5
         )
-        args, kw = calls[-1]
+        assert len(calls) == 1
+        args, kw = calls[0]
         assert args == ("dst", "desc", "coords", "barrier", [])
         assert kw["multicast_mask"] == (None if local else 0x5)
         assert kw["group"] == cfg.cta_group
@@ -1721,3 +1732,23 @@ def test_cooperative_split_mma_schedule_and_six_stage_storage(stages_b, unroll):
                 first.offset + first.size_bytes <= second.offset
                 or second.offset + second.size_bytes <= first.offset
             )
+
+
+@pytest.mark.parametrize("warps,preload", [(4, 0), (4, 1), (8, 0), (8, 1)])
+def test_dkg_store_order_requires_supported_store_protocol(warps, preload):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+
+    cfg = _preloaded_epilogue_config(
+        dense_epilogue_warps=warps,
+        dense_preload_epilogue=preload,
+        epilogue_regs=(144 if preload else 128) if warps == 8 else 248,
+        num_stages_a=4,
+        num_stages_b=4,
+        num_stages_smem_sfa=4,
+        num_stages_smem_sfb=4,
+    )
+    if warps == 8 and not preload:
+        with pytest.raises(ValueError, match="eight warps requires preload"):
+            validate_config(cfg)
+    else:
+        validate_config(cfg)

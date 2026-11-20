@@ -226,6 +226,8 @@ def main():
     saved_tactics = {}
     if args.tactics_from:
         saved = json.loads(args.tactics_from.read_text())
+        if saved.get("default_only", False):
+            parser.error("A default-only report does not contain sweep winners.")
         if tuple(
             saved.get(key) for key in ("experts", "hidden", "intermediate", "top_k")
         ) != (32, 10240, 4096, 8):
@@ -234,6 +236,7 @@ def main():
             row["tokens"]: _tuple_tree(row["tactic"])
             for row in saved["results"]
             if row["backend"] == "cute_best_from_logits"
+            and row.get("is_sweep_winner", True)
         }
         if any(tokens not in saved_tactics for tokens in args.tokens):
             parser.error(
@@ -278,7 +281,12 @@ def main():
         timer="CUDA events; 10 blocks per graph; 30 samples per round; warm L2",
         gate_gemm_included=False,
         routing="Balanced Renormalize logits; CuTe from-logits uses trtllm_gen_routing plus FP32 router-weight cast",
-        selection="Explicit shape-valid tactic sweep using actual inputs and CUDA graphs",
+        selection=(
+            "CuTe default tactic only; no sweep winner"
+            if args.default_only
+            else "Explicit shape-valid CuTe tactic sweep using actual inputs and CUDA graphs"
+        ),
+        default_only=args.default_only,
         tactics_from=str(args.tactics_from) if args.tactics_from else None,
         breakdown=args.breakdown,
         cute_fused_finalize=not args.cute_unfused_finalize,
@@ -451,7 +459,7 @@ def main():
             del graph, outputs
             gc.collect()
             save()
-        sweep["winner"] = best[1]
+        sweep["winner"] = None if args.default_only else best[1]
         for name, tactic in (("default", DEFAULT_RUBIN_MOE_TACTIC), ("best", best[1])):
             for from_logits in (True, False):
                 label = f"cute_{name}_{'from_logits' if from_logits else 'prerouted'}"
@@ -489,6 +497,8 @@ def main():
                 samples_us=times,
                 output_stats=graphs[label][2],
                 tactic=graphs[label][3],
+                is_sweep_winner=label.startswith("cute_best_")
+                and not args.default_only,
             )
             result["moe_tflops"] = 6 * tokens * k * h * i / (result["median_us"] * 1e6)
             if args.breakdown:

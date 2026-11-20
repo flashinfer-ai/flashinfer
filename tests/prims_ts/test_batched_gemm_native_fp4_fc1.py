@@ -245,6 +245,8 @@ def test_native_fp4_fc1_padding_graph_replay(
         valid = rows[None, :] < counts[:, None]
         graphs[0].replay()
         expected = decoded_output()[valid].clone()
+        output.fill_(0xFF)
+        scales.fill_(0x7F)
         graphs[1].replay()
         torch.testing.assert_close(decoded_output()[valid], expected, rtol=0, atol=0)
 
@@ -387,3 +389,20 @@ def test_native_fp4_fc1_optimized_persistent_ring_gpu(c_stages):
         **options,
     )
     assert result
+
+
+@pytest.mark.parametrize("n", [1344, 1408])
+def test_grouped_weights_require_complete_gate_up_groups(n):
+    from tests.prims_ts.test_batched_gemm_eight_warp_fp4_fc1 import (
+        eight_warp_fc1_options,
+    )
+
+    options = eight_warp_fc1_options(512, (2, 1), routed=False)
+    options["dense_single_expert"] = 1
+    cfg = make_config(**options)
+    assert cfg.gated_weight_group_size == 64
+    if n == 1344:
+        with pytest.raises(ValueError, match="complete gate/up groups"):
+            validate_config(cfg, problem_mnk=(512, n, 768))
+    else:
+        validate_config(cfg, problem_mnk=(512, n, 768))
