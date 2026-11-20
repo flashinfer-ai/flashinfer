@@ -713,7 +713,7 @@ def test_auto_exhausted_configuration_raises():
         )
 
 
-def _region_fixture(*, backend="auto", max_bs=1, declared=False):
+def _region_fixture(*, backend="auto", max_bs=1, declared=False, chunk_capacity=8192):
     inp = _mk([8192], [8192], seed=91)
     # Exact quarter-integer scores keep the sampled ranking oracle strict.
     inp["q"] = (inp["q"].float() * 4).round().div(4).to(torch.float8_e4m3fn)
@@ -722,7 +722,7 @@ def _region_fixture(*, backend="auto", max_bs=1, declared=False):
     wrapper = FP8MQATopKWrapper(
         backend=backend,
         max_context_length=8192,
-        max_chunk_size=8192,
+        max_chunk_size=chunk_capacity,
         max_batch_size=max_bs,
         device="cuda",
         num_heads=H,
@@ -743,7 +743,7 @@ def _plan_live(wrapper, length):
 def _check_live_prefix(inp, out, length):
     assert out.shape == (8192, TOPK)
     assert bool((out[length:] == -1).all())
-    for i in sorted({0, 3, length // 2, length - 1}):
+    for i in sorted({v for v in (0, 3, length // 2, length - 1) if v < length}):
         sample = dict(
             q=inp["q"][i : i + 1],
             k=inp["k"],
@@ -757,13 +757,13 @@ def _check_live_prefix(inp, out, length):
 
 @requires_sm103
 @requires_validated_toolkit
-@pytest.mark.parametrize("length", [122, 2047, 2048, 4096, 4097, 8192])
+@pytest.mark.parametrize(
+    "length", [1, 3, 4, 63, 64, 65, 121, 122, 2047, 2048, 4096, 4097, 8192]
+)
 def test_auto_live_length_performance_region(length):
     inp, wrapper = _region_fixture()
     _plan_live(wrapper, length)
-    assert wrapper.resolved_backend == (
-        "specialized" if 2048 <= length <= 4096 else "cutedsl"
-    )
+    assert wrapper.resolved_backend == ("specialized" if length <= 4096 else "cutedsl")
     out = wrapper.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"])
     _check_live_prefix(inp, out, length)
 
@@ -907,19 +907,9 @@ def test_auto_region_failed_replacement_is_retryable(
 @requires_sm103
 @requires_validated_toolkit
 def test_auto_region_keeps_specialized_only_capacity():
-    inp = _mk([122], [122], seed=92)
-    wrapper = FP8MQATopKWrapper(
-        backend="auto",
-        max_context_length=122,
-        max_chunk_size=122,  # CuTe requires a multiple of 64.
-        max_batch_size=1,
-        device="cuda",
-        num_heads=H,
-        compression_ratio=RATIO,
-        num_keys=inp["k"].shape[0],
-    )
-    wrapper.prepare_pool(inp["k"], k_scale=inp["k_scale"])
-    wrapper.plan(inp["qo"], inp["kv"], num_query_rows=122)
+    # CuTe requires a multiple of 64, but specialized accepts this capacity.
+    inp, wrapper = _region_fixture(chunk_capacity=8193)
+    _plan_live(wrapper, 8192)
     assert wrapper.resolved_backend == "specialized"
     out = wrapper.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"])
-    _assert_weighted_topk(inp, out, inp["weights"])
+    _check_live_prefix(inp, out, 8192)

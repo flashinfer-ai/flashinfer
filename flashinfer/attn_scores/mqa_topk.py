@@ -82,7 +82,7 @@ class FP8MQATopKWrapper:
     rather than a selection computed from stale values.
 
     For single-request capacity (max_batch_size=1), auto prefers specialized
-    only for full-prefill live lengths 2048 through 4096. This is a bounded
+    only for full-prefill live lengths up to 4096. This is a bounded
     completed-call performance policy measured on GB300/CUDA 13.0, not a
     universal latency guarantee. Other lengths use CuTe when it can serve the
     configuration; that resolution stays CuTe on later replans. Explicit
@@ -478,9 +478,7 @@ class _AutoTopKPlan:
                 # bounded B1 region. Use validated live prefixes, not capacity.
                 # CuTe cannot serve max_batch_size > 1, even with one live
                 # request, so those configurations retain specialized support.
-                if self._options["max_batch_size"] == 1 and not (
-                    2048 <= state["T"] <= 4096
-                ):
+                if self._options["max_batch_size"] == 1 and state["T"] > 4096:
                     reason = "single-request length outside measured auto region"
                     performance_miss = True
                 else:
