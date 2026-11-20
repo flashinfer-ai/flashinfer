@@ -729,7 +729,15 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         w.run(pr.q, pr.cache("NHD"), k_scale=lp.k_scale)
     with pytest.raises(bi.BatchInvariantUnsupportedError):  # the other fp8 format
         w.run(pr.q, (k.view(E5), v.view(E5)), k_scale=lp.k_scale)
-    for bad in (0.5, 2.0, torch.tensor([0.5], device=pr.device), torch.ones(2), "x"):
+    for bad in (
+        0.5,
+        2.0,
+        torch.tensor([0.5], device=pr.device),
+        torch.ones(2),
+        "x",
+        "1.0",  # a string is not a scale, whatever it spells
+        True,
+    ):
         with pytest.raises(
             bi.BatchInvariantUnsupportedError, match="q_scale"
         ):  # a scaled query
@@ -2112,14 +2120,18 @@ def test_device_tensor_scale_is_read_once_per_tensor_version(kind, readbacks):
     on_dev["q_scale"].fill_(1.0)
     run(**on_dev)
     assert readbacks[0] == seen + 2
-    # forms that are not a scale keep their typed refusals
+    # forms that are not a scale keep their typed refusals; the refusal quotes the limit of the class asked: the forms of an
+    # operand where the class owns the scale, the unit-scale rule where it does not
+    limit = "k_scale as the class's per-tensor scale" if owned else "unscaled bf16"
     for bad in (
         torch.ones(2, device=dev),
         torch.ones(1, dtype=torch.int32, device=dev),
         True,
+        "1.0",
     ):
-        with pytest.raises(bi.BatchInvariantUnsupportedError, match="k_scale"):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="k_scale") as e:
             run(k_scale=bad)
+        assert limit in str(e.value)
     assert readbacks[0] == seen + 2
 
 
