@@ -67,8 +67,15 @@ def run_kda_oo_umma(
 
     from .kda_output_only_umma import KdaOutputOnlyUmma
 
+    # SM107 (Rubin): min_blocks_per_mp > 1 makes the DSL auto-derive an SMEM carveout
+    # that faults (#4957); the WY kernel forces 1 there too. Other SM10x parts keep
+    # the build's own occupancy bound (ctas_per_sm).
+    min_blocks = (
+        1 if tuple(torch.cuda.get_device_capability(device)) == (10, 7) else None
+    )
     key = (
         gdn_device_target(device).compile_key,
+        min_blocks,
         T,
         int(gate_mode),
         bool(has_dt_bias),
@@ -91,6 +98,7 @@ def run_kda_oo_umma(
             vllm_dropin=vllm_dropin,
             null_min=null_min,
             kg_v4=kg_v4,
+            min_blocks=min_blocks,
         )
         fn = cute.compile[gdn_compile_options(device)](kernel, *args)
         _KERNELS[key] = fn

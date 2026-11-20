@@ -2681,13 +2681,14 @@ def require_experimental_auto_backends(feature: str) -> None:
 
 
 def warn_experimental_backend_once(
-    api_name: str, backend: str, *, automatic: bool = False
+    api_name: str, backend: str, *, automatic: bool = False, stacklevel: int = 3
 ) -> None:
     """Emit :class:`ExperimentalWarning` once per ``(api_name, backend)`` pair.
 
     Used by ``@backend_requirement`` when a stable API selects a backend marked
     with ``@experimental_backend``, whether explicitly (``automatic=False``) or
     through ``backend="auto"`` with the opt-in set (``automatic=True``).
+    ``stacklevel`` is passed to :func:`warnings.warn` (default: the caller's caller).
     """
     key = (api_name, backend)
     if key in _WARNED_EXPERIMENTAL_BACKENDS:
@@ -2699,7 +2700,7 @@ def warn_experimental_backend_once(
         f"compatibility guarantees and may change or be removed without "
         f"deprecation.",
         ExperimentalWarning,
-        stacklevel=3,
+        stacklevel=stacklevel,
     )
 
 

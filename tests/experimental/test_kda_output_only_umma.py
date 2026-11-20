@@ -71,6 +71,8 @@ _NO_LAUNCH_EXPECTED = {
     "test_umma_backend_rejects_bad_values",
     "test_dropin_rejects_misaligned_token_stride",
     "test_dense_rejects_unknown_backend",
+    "test_dropin_rejects_negative_null_min",
+    "test_dropin_explicit_umma_raises_on_empty_batch_off_sm10x",
 }
 
 
@@ -104,22 +106,33 @@ def _inputs(B, T, H, HV, gate, seed):
 @pytest.mark.parametrize("gate", ["pre", "lb", "sp"])
 @pytest.mark.parametrize("H,HV", [(4, 4), (2, 4)])
 def test_umma_matches_wy(T, gate, H, HV):
-    """UMMA vs the WY kernel on identical inputs: outputs, corrections and the kg
-    cache (emit mode) within bf16 rounding; the pool is never written."""
+    """UMMA vs the WY kernel and the fp32 grouped recurrence on identical inputs:
+    outputs and corrections within bf16 rounding of the fp32 reference and no less
+    accurate than WY, the kg cache within bf16 rounding of WY; the pool is never
+    written."""
     B = 5
     args, kw = _inputs(B, T, H, HV, gate, seed=100 + T)
     pool_before = args[5].clone()
-    ref = _WY_DENSE(*args, **kw, emit_corrections=True, backend="wy")
+    ref = _WY_DENSE(*args, **kw, emit_corrections=True, backend="recurrent")
+    wy = _WY_DENSE(*args, **kw, emit_corrections=True, backend="wy")
     out = _WY_DENSE(*args, **kw, emit_corrections=True, backend="umma")
     torch.cuda.synchronize()
     assert torch.equal(args[5], pool_before)
-    # absolute tolerances scale with the output magnitude once it exceeds 1 (both
-    # kernels round to bf16; at the default scale |out| < 1 and they are unchanged)
-    for got, want, atol in zip(out, ref, (2e-3, 3e-2, 2e-3), strict=True):
-        mag = max(1.0, want.float().abs().max().item())
-        torch.testing.assert_close(
-            got.float(), want.float(), atol=atol * mag, rtol=1e-2
-        )
+    _check_vs_reference(out[:2], wy[:2], ref[:2])
+    torch.testing.assert_close(out[2].float(), wy[2].float(), atol=2e-3, rtol=1e-2)
+
+
+def _check_vs_reference(got, wy, ref):
+    """Scale-invariant accuracy check of bf16 outputs against an fp32 reference:
+    element-wise within 1 bf16 ulp of the tensor's max magnitude (+1 % relative),
+    and the worst error no larger than WY's (25 % slack) or that ulp."""
+    for g_, w_, r_ in zip(got, wy, ref, strict=True):
+        g_, w_, r_ = g_.float(), w_.float(), r_.float()
+        ulp = 2.0**-7 * r_.abs().max().item()  # bf16 ulp at the tensor's max magnitude
+        torch.testing.assert_close(g_, r_, atol=ulp, rtol=1e-2)
+        err_g = (g_ - r_).abs().max().item()
+        err_w = (w_ - r_).abs().max().item()
+        assert err_g <= max(ulp, 1.25 * err_w), (err_g, err_w, ulp)
 
 
 @pytest.mark.parametrize("T", [1, 4, 8, 16])
@@ -331,3 +344,88 @@ def test_dense_rejects_unknown_backend(be):
     args, kw = _inputs(2, 4, 4, 4, "lb", seed=1)
     with pytest.raises(ValueError, match="backend must be"):
         _WY_DENSE(*args, **kw, backend=be)
+
+
+def _dropin_inputs(tot, T=4, H=4, nblk=4):
+    """Minimal packed drop-in inputs: two sequences, ``tot`` tokens in total."""
+    dev = "cuda"
+    K = 128
+    q = torch.randn(1, tot, H, K, dtype=torch.bfloat16, device=dev)
+    args = (
+        q,
+        torch.randn_like(q),
+        torch.randn_like(q),
+        torch.randn_like(q),
+        torch.randn(1, tot, H, dtype=torch.bfloat16, device=dev),
+        torch.zeros(H, device=dev),
+        torch.zeros(H * K, device=dev),
+        -5.0,
+        torch.zeros(nblk, H, K, K, dtype=torch.bfloat16, device=dev),
+        torch.zeros(nblk, H, T, K, device=dev),
+        torch.zeros(nblk, H, T, 2 * K, dtype=torch.bfloat16, device=dev),
+        torch.tensor([0, min(tot, T), tot], dtype=torch.int32, device=dev),
+        torch.tensor([1, 2], dtype=torch.int32, device=dev),
+        T,
+    )
+    return args
+
+
+@pytest.mark.parametrize("be", ["wy", "umma"])
+def test_dropin_rejects_negative_null_min(be):
+    """``null_min < 0`` would let negative slots index memory before the cache
+    buffers (the UMMA kernel wrote there silently, the WY kernel faulted): every
+    backend rejects it."""
+    with pytest.raises(ValueError, match="null_min must be >= 0"):
+        _WY_DROPIN(*_dropin_inputs(6), backend=be, null_min=-1)
+
+
+def test_dropin_explicit_umma_raises_on_empty_batch_off_sm10x(monkeypatch):
+    """An explicit ``backend="umma"`` raises on an unsupported device even when the
+    packed batch is empty (the support check runs before the early return)."""
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+    with pytest.raises(ValueError, match="backend='umma' unavailable"):
+        _WY_DROPIN(*_dropin_inputs(0), backend="umma")
+
+
+def test_umma_experimental_warning_names_the_caller(monkeypatch):
+    """The ExperimentalWarning points at the user's call site (this file) from every
+    entry: dense, drop-in, and recurrent_kda(disable_state_update=True) through the
+    automatic route."""
+    import warnings
+
+    import flashinfer.api_logging as _api_logging
+
+    def check(call):
+        monkeypatch.setattr(_api_logging, "_WARNED_EXPERIMENTAL_BACKENDS", set())
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            call()
+        hits = [
+            w for w in rec if issubclass(w.category, _api_logging.ExperimentalWarning)
+        ]
+        assert hits, "no ExperimentalWarning"
+        assert all(w.filename == __file__ for w in hits), [
+            (w.filename, w.lineno) for w in hits
+        ]
+
+    args, kw = _inputs(64, 4, 4, 4, "lb", seed=11)
+    check(lambda: _WY_DENSE(*args, **kw, backend="umma"))
+    check(lambda: _WY_DROPIN(*_dropin_inputs(6), backend="umma"))
+    # recurrent_kda -> kda_decode -> kda_wy_output_only(backend="auto") -> UMMA
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
+    monkeypatch.setattr(_kda_decode, "_run_kda_output_only", _WY_DENSE)
+    q, k, v, g, beta, pool, idx = args
+    check(
+        lambda: _kda_decode.recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=pool,
+            initial_state_indices=idx,
+            disable_state_update=True,
+            use_qk_l2norm_in_kernel=True,
+            **kw,
+        )
+    )

@@ -2047,6 +2047,22 @@ def _compile_options(device: torch.device) -> tuple:
     return (cute.GPUArch(f"sm_{major}{minor}a"),) if major == 12 else ()
 
 
+def _user_stacklevel() -> int:
+    """``warnings.warn`` stacklevel, as seen from ``warn_experimental_backend_once``,
+    that names the first frame outside the flashinfer package (the user's call site),
+    whichever public entry point (and wrapper chain) led here."""
+    import sys
+
+    pkg = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))) + _os.sep
+    f = sys._getframe(1)  # the public entry point that emits the warning
+    n = 0
+    while f is not None and _os.path.abspath(f.f_code.co_filename).startswith(pkg):
+        f = f.f_back
+        n += 1
+    # 1 = warn_experimental_backend_once, 2 = the entry point, 2 + n = the user
+    return n + 2
+
+
 def _select_umma(
     backend: str, device: torch.device, T_in: int, api: str, auto_ok: bool = True
 ) -> Optional[bool]:
@@ -2306,7 +2322,10 @@ def kda_wy_output_only(
         from ..api_logging import warn_experimental_backend_once
 
         warn_experimental_backend_once(
-            "kda_wy_output_only", "umma", automatic=umma_auto
+            "kda_wy_output_only",
+            "umma",
+            automatic=umma_auto,
+            stacklevel=_user_stacklevel(),
         )
     if use_rec:
         rec_args = [
@@ -2554,6 +2573,12 @@ def kda_recoverssm_verify(
         raise ValueError(
             f"kda_recoverssm_verify: backend must be 'auto', 'wy' or 'umma'; got {backend!r}"
         )
+    if int(null_min) < 0:
+        # slots < null_min are null; a negative bound would let negative slots index
+        # memory before the cache buffers
+        raise ValueError(
+            f"kda_recoverssm_verify: null_min must be >= 0; got {null_min}"
+        )
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA RecoverSSM q must have shape [1, tokens, heads, dim]")
     _, total_tokens, num_heads, key_dim = q.shape
@@ -2634,6 +2659,9 @@ def kda_recoverssm_verify(
         )
     ):
         raise ValueError("KDA RecoverSSM tensors must share one device")
+    if backend == "umma":
+        # explicit opt-in: raise on an unsupported device even for an empty batch
+        _select_umma(backend, q.device, spec_query_len, "kda_recoverssm_verify")
     if total_tokens == 0:
         return out
 
@@ -2730,7 +2758,10 @@ def kda_recoverssm_verify(
         from ..experimental.kda_output_only_umma import run_kda_oo_umma
 
         warn_experimental_backend_once(
-            "kda_recoverssm_verify", "umma", automatic=umma_auto
+            "kda_recoverssm_verify",
+            "umma",
+            automatic=umma_auto,
+            stacklevel=_user_stacklevel(),
         )
         run_kda_oo_umma(
             args,

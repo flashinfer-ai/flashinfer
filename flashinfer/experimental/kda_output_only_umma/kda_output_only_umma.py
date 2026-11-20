@@ -46,6 +46,8 @@ strides, ragged lengths, null slots and slot-indexed caches).
 
 from __future__ import annotations
 
+from typing import Optional
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32, Uint64
@@ -312,6 +314,7 @@ class KdaOutputOnlyUmma:
         vllm_dropin: bool = False,
         null_min: int = 1,
         kg_v4: bool = True,
+        min_blocks: Optional[int] = None,
     ):
         assert 1 <= T <= 16, T
         self.T = T
@@ -327,7 +330,7 @@ class KdaOutputOnlyUmma:
         self.NX = 16 if T <= 8 else 32  # X_r / X_c rows (2T live)
         self.KT = 8 if T <= 8 else 16  # Ktil rows (T live)
         self.num_threads = 192
-        self.min_blocks = ctas_per_sm(T)
+        self.min_blocks = ctas_per_sm(T) if min_blocks is None else int(min_blocks)
 
     @cute.jit
     def __call__(
