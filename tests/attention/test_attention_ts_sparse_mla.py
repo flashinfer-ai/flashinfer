@@ -7,6 +7,9 @@ The test-only preparer adapts vLLM's page-stride mapping and stable compaction
 (0aee727ff6131a1b647941186ceef8f4777bdac2); native Q/KV are never repacked.
 """
 
+from unittest.mock import patch
+import weakref
+
 import pytest
 import torch
 
@@ -801,14 +804,14 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     out = torch.empty_like(q, dtype=torch.bfloat16)
     lse = torch.empty(q.shape[:-1], device=q.device)
 
-    def run(checked=False, target_lse=lse):
+    def run(checked=False, target_lse=lse, target_offsets=offsets):
         """Launch into caller-owned outputs using the current host-composed scales."""
         return w.run(
             q,
             primary,
             **meta,
             extra_kv_cache=secondary if extra else None,
-            qo_indptr=offsets,
+            qo_indptr=target_offsets,
             out=out,
             lse=target_lse,
             validate=checked,
@@ -889,9 +892,11 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     assert torch.count_nonzero(out.reshape(rows, heads, 512)[-1]) == 0
     assert torch.isneginf(lse.reshape(rows, heads)[-1]).all()
     if packed:
+        with pytest.raises(TypeError, match="qo_indptr must be a torch.Tensor"):
+            run(target_offsets=None)
         unaligned = torch.empty(lse.numel() + 1, device=q.device)[1:].view_as(lse)
         with pytest.raises(ValueError, match="16-byte-aligned"):
-            run(target_lse=unaligned)
+            run(checked=True, target_lse=unaligned)
     if packed and heads == 6 and dtype == torch.bfloat16:
         empty_meta = prepare_sparse_mla_indices(
             w,
@@ -1171,7 +1176,19 @@ def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
     _plan_with_deferred_compilation(wrapper, **args)
     assert wrapper.is_kernel_cached() == (not cute_dsl_core.cute_dsl_cache_disabled())
     metadata = prepare_sparse_mla_indices(wrapper, q, kv, indices)
-    result, lse = wrapper.run(q, kv, **metadata)
+    with (
+        patch.object(
+            mla_decode_module,
+            "_validate_query",
+            side_effect=AssertionError("query validation"),
+        ),
+        patch.object(
+            mla_decode_module,
+            "_validate_out",
+            side_effect=AssertionError("output validation"),
+        ),
+    ):
+        result, lse = wrapper.run(q, kv, **metadata, validate=False)
     torch.testing.assert_close(result, torch.full_like(q, 1.5))
     eager, eager_lse = batch_sparse_mla_decode_with_paged_kv_cache(
         q, kv, **metadata, return_lse=True
@@ -1185,6 +1202,7 @@ def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
     _, next_lse = wrapper.run(q, kv, **shorter)
     torch.testing.assert_close(next_lse, torch.zeros_like(next_lse), atol=0, rtol=0)
     torch.testing.assert_close(lse, first_lse, atol=0, rtol=0)
+    torch.testing.assert_close(result, eager, atol=0, rtol=0)
     short = BatchSparseMLADecodePagedTSWrapper(workspace[:-1])
     for compile_kernel in (False, True):
         with pytest.raises(ValueError, match="workspace"):
@@ -1195,6 +1213,44 @@ def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
         wrapper.run(q, kv, **dict(metadata, indices=bad.view(1, 3)))
     with pytest.raises(ValueError, match="positive"):
         wrapper.run(q, kv, **metadata, softmax_scale=1e-100)
+
+    # Repeated bindings must keep reading live storage when only one input changes.
+    for _ in range(2):
+        wrapper.run(q, kv, **metadata, out=result, lse=lse, validate=False)
+    kv.add_(2)
+    wrapper.run(q, kv, **metadata, out=result, lse=lse, validate=False)
+    torch.testing.assert_close(result, torch.full_like(result, 3.5))
+    replacement_kv = kv + 4
+    wrapper.run(q, replacement_kv, **metadata, out=result, lse=lse, validate=False)
+    torch.testing.assert_close(result, torch.full_like(result, 7.5))
+    replacement_q = torch.ones_like(q)
+    wrapper.run(replacement_q, kv, **metadata, out=result, lse=lse, validate=False)
+    torch.testing.assert_close(result, torch.full_like(result, 4.0))
+    replacement_indices = torch.zeros_like(metadata["indices"])
+    replacement_out = torch.full_like(result, torch.nan)
+    wrapper.run(
+        replacement_q,
+        kv,
+        **dict(metadata, indices=replacement_indices),
+        out=replacement_out,
+        lse=lse,
+        validate=False,
+    )
+    torch.testing.assert_close(replacement_out, torch.full_like(result, 3.0))
+
+    # Same object/address, different pool extent: checked calls must use the new bound.
+    pointer = kv.data_ptr()
+    kv.resize_(1, 1, 512)
+    assert kv.data_ptr() == pointer
+    with pytest.raises(ValueError, match="outside pool"):
+        wrapper.run(q, kv, **metadata)
+
+    # Replanning releases bindings to prior caller allocations.
+    previous_query = weakref.ref(replacement_q)
+    del replacement_q
+    wrapper.plan(**args)
+    torch.cuda.synchronize()
+    assert previous_query() is None
 
 
 def test_valid_prefix_eager_contract():
