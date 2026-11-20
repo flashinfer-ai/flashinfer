@@ -27,6 +27,7 @@ import cutlass.cute as cute
 from ....batch_invariant import jit
 from ..plan import GROUP_FIELDS
 from .kernel import AttentionKernel
+from .operands import split_pages
 
 MODULE = "batch_invariant_attention"
 
@@ -48,6 +49,7 @@ def kernel_name(
         f"attn_d{D}_g{g}_p{page}_s{kv_slots}_w{n_wg}"
         + ("_q2" if q2 else "")
         + ("_rg" if ragged else "")
+        + ("_sp" if split_pages(page, ragged) else "")
         + ("_hwm" if hw_rowmax else "")
         + (f"_c{cap >> 10}" if cap else "")
         + ("_sink" if sinks else "")

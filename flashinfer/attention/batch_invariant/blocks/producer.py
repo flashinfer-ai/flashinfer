@@ -22,6 +22,66 @@ from .operands import HALF, Q_ROWS, REP_ROWS
 
 
 @cute.jit
+def slot_page_ids(
+    st,
+    key0: Int32,
+    mKvIndices: cute.Tensor,
+    kv_ptr0: Int32,
+    n_pages: Int32,
+):
+    """The page indices of the ``slot_keys`` keys from ``key0``, read by the whole warp at once: element ``j`` holds, in lane ``l``,
+    the index of the page of key ``key0 + 32 j + l`` (clamped to the request's last page as the boxes are). The box of a key takes
+    its index from the lane that holds it by a warp shuffle, so no box waits on an index load of its own."""
+    ids = []
+    lane = cute.arch.lane_idx()
+    for j in cutlass.range_constexpr(st.slot_keys // 32):
+        pslot = (key0 + 32 * j + lane) // st.page
+        if pslot > n_pages - 1:
+            pslot = n_pages - 1
+        ids.append(mKvIndices[kv_ptr0 + pslot])
+    return ids
+
+
+@cute.jit
+def issue_slot_split(
+    st,
+    key0: Int32,
+    d_half0: cutlass.Constexpr,
+    part: cutlass.Constexpr,
+    kv_prod,
+    atom: cute.CopyAtom,
+    tg: cute.Tensor,
+    ts: cute.Tensor,
+    mKvIndices: cute.Tensor,
+    kv_ptr0: Int32,
+    n_pages: Int32,
+    kv_head: Int32,
+):
+    """One ring slot under the split placement, as issuing warp ``part`` of ``kv_warps``: its share of the slot's boxes (box ``i``
+    with ``i % kv_warps == part``; the same boxes as ``issue_slot`` issues, into the same smem bytes) onto the slot's barrier, armed
+    with the bytes this warp's boxes move, so the barrier completes when every warp's boxes have landed. ``d_half0``: the first
+    64-wide half of the pool's dims the slot holds."""
+    n_mine = (st.boxes_per_slot - part + st.kv_warps - 1) // st.kv_warps
+    h = kv_prod.acquire_and_advance(
+        expected_tx=Int32(n_mine * st.halves * HALF * st.box_rows * 2)
+    )
+    ids = slot_page_ids(st, key0, mKvIndices, kv_ptr0, n_pages)
+    for i in cutlass.range_constexpr(part, st.boxes_per_slot, st.kv_warps):
+        kb = (
+            i * st.box_rows
+        )  # the box's first key in the slot; its page index is in lane kb % 32 of element kb // 32
+        page_id = cute.arch.shuffle_sync(ids[kb // 32], kb % 32)
+        for half in cutlass.range_constexpr(st.halves):
+            cute.copy(
+                atom,
+                tg[(None, (d_half0 + half, 0, kv_head, page_id))],
+                ts[(None, i, half, h.index)],
+                tma_bar_ptr=h.barrier,
+            )
+    return kv_prod
+
+
+@cute.jit
 def issue_slot(
     st,
     key0: Int32,
@@ -82,21 +142,39 @@ def issue_tile(
     kv_ptr0: Int32,
     n_pages: Int32,
     kv_head: Int32,
+    part: cutlass.Constexpr,
 ):
-    """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order."""
+    """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order (``part``: the issuing warp under the split
+    placement, 0 otherwise)."""
     for sl in cutlass.range_constexpr(st.slots_per_tile):
-        kv_prod = issue_slot(
-            st,
-            t * st.T + sl * st.slot_keys,
-            kv_prod,
-            atom,
-            tg,
-            ts,
-            mKvIndices,
-            kv_ptr0,
-            n_pages,
-            kv_head,
-        )
+        if cutlass.const_expr(st.split):
+            kv_prod = issue_slot_split(
+                st,
+                t * st.T + sl * st.slot_keys,
+                0,
+                part,
+                kv_prod,
+                atom,
+                tg,
+                ts,
+                mKvIndices,
+                kv_ptr0,
+                n_pages,
+                kv_head,
+            )
+        else:
+            kv_prod = issue_slot(
+                st,
+                t * st.T + sl * st.slot_keys,
+                kv_prod,
+                atom,
+                tg,
+                ts,
+                mKvIndices,
+                kv_ptr0,
+                n_pages,
+                kv_head,
+            )
     return kv_prod
 
 
@@ -124,24 +202,29 @@ def load_loop(
     rows_valid: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    part: cutlass.Constexpr,
 ):
+    """One unit's loads as issuing warp ``part``: the load warp (0) loads Q and its K / V boxes; under the split placement the other
+    issuing warps load their share of every K / V slot in the same order."""
     LA = st.qk_ahead  # K tiles issued ahead of V: 1 (the MMA issues QK(n+1), PV(n)) or 2 (PV(n), QK(n+2))
     kv_ptr0 = mKvIndptr[req]
     n_pages = mKvIndptr[req + 1] - kv_ptr0
-    # Q: the tile's tokens start at the packed row tok_abs; the offset is applied to the TMA tensor's domain
-    tQ_off = cute.domain_offset((0, 0, tok_abs), tQ)
-    gQ = cute.zipped_divide(tQ_off, st.q_box)  # ((64, g, tpt), (halves, Hq/g, rest))
-    tQsQ, tQgQ = cpasync.tma_partition(
-        atom_q, 0, cute.make_layout(1), cute.group_modes(sQ_view, 0, 3), gQ
-    )  # smem ((box), halves, stages)
-    # the replicated load (units of <= 32 live rows): the first 32 rows into every 32-row quadrant
-    tQr_off = cute.domain_offset((0, 0, tok_abs), tQr)
-    gQr = cute.zipped_divide(
-        tQr_off, st.q_box_rep
-    )  # ((64, g, 32/g), (halves, Hq/g, rest))
-    tQsQr, tQgQr = cpasync.tma_partition(
-        atom_q_rep, 0, cute.make_layout(1), cute.group_modes(sQ_rep_view, 0, 3), gQr
-    )  # smem ((box), quadrants, halves, stages)
+    if cutlass.const_expr(part == 0):
+        qh = q_prod.acquire_and_advance(expected_tx=q_tx_bytes(st, rows_valid))
+        load_q_tile(
+            st,
+            atom_q,
+            tQ,
+            atom_q_rep,
+            tQr,
+            sQ_view,
+            sQ_rep_view,
+            qh,
+            qh.index,
+            tok_abs,
+            kv_head,
+            rows_valid,
+        )
     if cutlass.const_expr(st.ragged):
         # the ragged pool: shift the K / V domains by the request's token offset, so the boxes below address the request's own keys
         # (box i of the shifted domain = its keys [i box_rows, (i + 1) box_rows))
@@ -154,43 +237,20 @@ def load_loop(
     sKVg = cute.group_modes(sKV_view, 0, 4)  # ((64, rows, 1, 1), boxes, halves, slots)
     tKsK, tKgK = cpasync.tma_partition(atom_k, 0, cute.make_layout(1), sKVg, gK)
     tVsV, tVgV = cpasync.tma_partition(atom_v, 0, cute.make_layout(1), sKVg, gV)
-    # the transaction count of this unit's Q load: the replicated boxes move 4 x rep_rows rows, the full-tile box rows_per_tile rows
-    # (both equal 128 rows only when g divides 32); armed per acquire so that the barrier completes for every GQA group
-    q_tx = Int32(st.q_bytes_full)
-    if cutlass.const_expr(st.rep_ok):
-        if rows_valid <= st.rep_rows:
-            q_tx = Int32(st.q_bytes_rep)
-    qh = q_prod.acquire_and_advance(expected_tx=q_tx)
-    if cutlass.const_expr(st.rep_ok):
-        if rows_valid <= st.rep_rows:
-            for quad in cutlass.range_constexpr(Q_ROWS // REP_ROWS):
-                for half in cutlass.range_constexpr(st.halves):
-                    cute.copy(
-                        atom_q_rep,
-                        tQgQr[(None, (half, kv_head, 0))],
-                        tQsQr[(None, quad, half, qh.index)],
-                        tma_bar_ptr=qh.barrier,
-                    )
-        else:
-            for half in cutlass.range_constexpr(st.halves):
-                cute.copy(
-                    atom_q,
-                    tQgQ[(None, (half, kv_head, 0))],
-                    tQsQ[(None, half, qh.index)],
-                    tma_bar_ptr=qh.barrier,
-                )
-    else:
-        for half in cutlass.range_constexpr(st.halves):
-            cute.copy(
-                atom_q,
-                tQgQ[(None, (half, kv_head, 0))],
-                tQsQ[(None, half, qh.index)],
-                tma_bar_ptr=qh.barrier,
-            )
     N = tile_hi - tile_lo
     # the ring is consumed in the MMA warp's order: K_0 [K_1] then, per tile n, (K_{n+1}, V_n) with QK one tile ahead or (V_n, K_{n+2}) with two
     kv_prod = issue_tile(
-        st, tile_lo, kv_prod, atom_k, tKgK, tKsK, mKvIndices, kv_ptr0, n_pages, kv_head
+        st,
+        tile_lo,
+        kv_prod,
+        atom_k,
+        tKgK,
+        tKsK,
+        mKvIndices,
+        kv_ptr0,
+        n_pages,
+        kv_head,
+        part,
     )
     if cutlass.const_expr(LA == 2):
         if N > 1:
@@ -205,6 +265,7 @@ def load_loop(
                 kv_ptr0,
                 n_pages,
                 kv_head,
+                part,
             )
         for n in range(N):
             kv_prod = issue_tile(
@@ -218,6 +279,7 @@ def load_loop(
                 kv_ptr0,
                 n_pages,
                 kv_head,
+                part,
             )
             if n + 2 < N:
                 kv_prod = issue_tile(
@@ -231,6 +293,7 @@ def load_loop(
                     kv_ptr0,
                     n_pages,
                     kv_head,
+                    part,
                 )
     else:
         for n in range(N):
@@ -246,6 +309,7 @@ def load_loop(
                     kv_ptr0,
                     n_pages,
                     kv_head,
+                    part,
                 )
             kv_prod = issue_tile(
                 st,
@@ -258,6 +322,7 @@ def load_loop(
                 kv_ptr0,
                 n_pages,
                 kv_head,
+                part,
             )
     return q_prod, kv_prod
 
@@ -354,6 +419,7 @@ def load_loop_q2(
     rows_b: Int32,
     lo_b: Int32,
     hi_b: Int32,
+    part: cutlass.Constexpr,
 ):
     """The paired placement's load warp: Q tiles A and B of the unit into tiles ``2 s``, ``2 s + 1`` of one Q stage (one barrier, armed
     with the bytes of the tiles present; B is absent when its tile range is empty), then K and V of the union of the two tile ranges in
@@ -362,25 +428,11 @@ def load_loop_q2(
     kv_ptr0 = mKvIndptr[req]
     n_pages = mKvIndptr[req + 1] - kv_ptr0
     has_b = hi_b > lo_b
-    q_tx = q_tx_bytes(st, rows_a)
-    if has_b:
-        q_tx = q_tx + q_tx_bytes(st, rows_b)
-    qh = q_prod.acquire_and_advance(expected_tx=q_tx)
-    load_q_tile(
-        st,
-        atom_q,
-        tQ,
-        atom_q_rep,
-        tQr,
-        sQ_view,
-        sQ_rep_view,
-        qh,
-        2 * qh.index,
-        tok_a,
-        kv_head,
-        rows_a,
-    )
-    if has_b:
+    if cutlass.const_expr(part == 0):
+        q_tx = q_tx_bytes(st, rows_a)
+        if has_b:
+            q_tx = q_tx + q_tx_bytes(st, rows_b)
+        qh = q_prod.acquire_and_advance(expected_tx=q_tx)
         load_q_tile(
             st,
             atom_q,
@@ -390,11 +442,26 @@ def load_loop_q2(
             sQ_view,
             sQ_rep_view,
             qh,
-            2 * qh.index + 1,
-            tok_b,
+            2 * qh.index,
+            tok_a,
             kv_head,
-            rows_b,
+            rows_a,
         )
+        if has_b:
+            load_q_tile(
+                st,
+                atom_q,
+                tQ,
+                atom_q_rep,
+                tQr,
+                sQ_view,
+                sQ_rep_view,
+                qh,
+                2 * qh.index + 1,
+                tok_b,
+                kv_head,
+                rows_b,
+            )
     lo = lo_a
     hi = hi_a
     if has_b:
@@ -414,7 +481,17 @@ def load_loop_q2(
     tVsV, tVgV = cpasync.tma_partition(atom_v, 0, cute.make_layout(1), sKVg, gV)
     if hi > lo:
         kv_prod = issue_tile(
-            st, lo, kv_prod, atom_k, tKgK, tKsK, mKvIndices, kv_ptr0, n_pages, kv_head
+            st,
+            lo,
+            kv_prod,
+            atom_k,
+            tKgK,
+            tKsK,
+            mKvIndices,
+            kv_ptr0,
+            n_pages,
+            kv_head,
+            part,
         )
         for t in range(lo, hi):
             if cutlass.const_expr(not st.p_over_s):
@@ -430,6 +507,7 @@ def load_loop_q2(
                         kv_ptr0,
                         n_pages,
                         kv_head,
+                        part,
                     )
             kv_prod = issue_tile(
                 st,
@@ -442,6 +520,7 @@ def load_loop_q2(
                 kv_ptr0,
                 n_pages,
                 kv_head,
+                part,
             )
             if cutlass.const_expr(st.p_over_s):
                 if t + 1 < hi:
@@ -456,5 +535,6 @@ def load_loop_q2(
                         kv_ptr0,
                         n_pages,
                         kv_head,
+                        part,
                     )
     return q_prod, kv_prod

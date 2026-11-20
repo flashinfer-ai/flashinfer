@@ -45,6 +45,21 @@ RING_BYTES = (
     128 << 10
 )  # K/V bytes in flight per CTA at every D: 512 / D ring slots of 128 x D bf16
 SMEM_CAP = 227 << 10  # the opt-in dynamic smem of one CTA on sm_100 / sm_107
+SPLIT_WARPS = 3  # the warps that issue K / V boxes under the split placement: the load warp and the two otherwise idle warps
+SPLIT_PAGE_MAX = (
+    4  # pages of at most this many keys take the split placement (split_pages)
+)
+
+
+def split_pages(page: int, ragged: bool = False) -> bool:
+    """Whether the K / V boxes of a paged pool of ``page`` keys per page are issued under the split placement. A tile of small pages
+    is hundreds of boxes of one to four 128-byte rows each (``128 / page`` per 64-wide half of a 128-key slot), and the load warp,
+    not the softmax, paces the unit: every box waits on the global load of its own page index, and the boxes of one warp are
+    issued one at a time. Under the split placement the slot's page indices are read once, ahead of its boxes
+    (``producer.slot_page_ids``), and ``SPLIT_WARPS`` warps issue a third of the boxes each onto the slot's one barrier. The
+    boxes, and the bytes they deliver, are those of the unsplit placement. From 8 keys per page up the boxes hide under the
+    tile's softmax; the ragged pool is one box per half at any length."""
+    return not ragged and page <= SPLIT_PAGE_MAX
 
 
 def slot_bytes(D: int) -> int:
@@ -224,6 +239,9 @@ class StaticPlan:
         )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB
         self.D, self.g, self.page, self.kv_slots = D, g, page, kv_slots
         self.roles = Roles(n_wg, D, q2)
+        # the K / V boxes of small pages are issued under the split placement, by kv_warps warps (the load warp alone otherwise)
+        self.split = split_pages(page, ragged)
+        self.kv_warps = SPLIT_WARPS if self.split else 1
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (

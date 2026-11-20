@@ -88,6 +88,94 @@ def tmem_views(
     return tStS, tOtOc, tOtOm, tOrP
 
 
+@cute.jit
+def load_units(
+    st,
+    atom_q: cute.CopyAtom,
+    tQ: cute.Tensor,
+    atom_q_rep: cute.CopyAtom,
+    tQr: cute.Tensor,
+    atom_k: cute.CopyAtom,
+    tK: cute.Tensor,
+    atom_v: cute.CopyAtom,
+    tV: cute.Tensor,
+    sQ_view: cute.Tensor,
+    sQ_rep_view: cute.Tensor,
+    sKV_view: cute.Tensor,
+    q_prod,
+    kv_prod,
+    mKvIndptr: cute.Tensor,
+    mKvIndices: cute.Tensor,
+    mDesc: cute.Tensor,
+    first: Int32,
+    num_units: Int32,
+    walk: Int32,
+    part: cutlass.Constexpr,
+):
+    """The unit walk of issuing warp ``part``: the load warp (0: Q, then its K / V boxes) or, under the split placement, one of the
+    other issuing warps (its share of every K / V slot)."""
+    if cutlass.const_expr(st.q2):
+        for u in range(first, num_units, walk):
+            ua = 2 * u
+            ub = ua + 1
+            q_prod, kv_prod = load_loop_q2(
+                st,
+                atom_q,
+                tQ,
+                atom_q_rep,
+                tQr,
+                atom_k,
+                tK,
+                atom_v,
+                tV,
+                sQ_view,
+                sQ_rep_view,
+                sKV_view,
+                q_prod,
+                kv_prod,
+                mKvIndptr,
+                mKvIndices,
+                mDesc[(ua, F_REQ)],
+                mDesc[(ua, F_KVHEAD)],
+                mDesc[(ua, F_QBASE)] + mDesc[(ua, F_QTOK0)],
+                mDesc[(ua, F_ROWS)],
+                mDesc[(ua, F_TILE_LO)],
+                mDesc[(ua, F_TILE_HI)],
+                mDesc[(ub, F_QBASE)] + mDesc[(ub, F_QTOK0)],
+                mDesc[(ub, F_ROWS)],
+                mDesc[(ub, F_TILE_LO)],
+                mDesc[(ub, F_TILE_HI)],
+                part,
+            )
+    if cutlass.const_expr(not st.q2):
+        for u in range(first, num_units, walk):
+            q_prod, kv_prod = load_loop(
+                st,
+                atom_q,
+                tQ,
+                atom_q_rep,
+                tQr,
+                atom_k,
+                tK,
+                atom_v,
+                tV,
+                sQ_view,
+                sQ_rep_view,
+                sKV_view,
+                q_prod,
+                kv_prod,
+                mKvIndptr,
+                mKvIndices,
+                mDesc[(u, F_REQ)],
+                mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
+                mDesc[(u, F_KVHEAD)],
+                mDesc[(u, F_ROWS)],
+                mDesc[(u, F_TILE_LO)],
+                mDesc[(u, F_TILE_HI)],
+                part,
+            )
+
+
 class AttentionKernel:
     """``AttentionKernel(D, g, page, kv_slots, n_wg, q2, ragged, cap)`` compiled once per static tuple; shapes, strides, the
     page table, the work units and the scale are runtime arguments. ``cap`` is the shared-memory capacity the smem plan is
@@ -268,6 +356,10 @@ class AttentionKernel:
             cpasync.prefetch_descriptor(atom_q_rep)
             cpasync.prefetch_descriptor(atom_k)
             cpasync.prefetch_descriptor(atom_v)
+        if cutlass.const_expr(st.kv_warps > 1):
+            if warp_idx >= R.empty_warps[0]:
+                cpasync.prefetch_descriptor(atom_k)
+                cpasync.prefetch_descriptor(atom_v)
         Hq = tK.shape[2] * st.g  # heads of Q = kv heads x group
 
         # ---- scaffolding
@@ -284,7 +376,9 @@ class AttentionKernel:
         kv_prod, kv_cons = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.kv_mbar.data_ptr(),
             num_stages=st.n_slots,
-            producer_group=_thread_group(1),
+            producer_group=_thread_group(
+                st.kv_warps
+            ),  # one arrival per issuing warp, each armed with the bytes of its own boxes
             consumer_group=_thread_group(1),
             tx_count=st.kv_slot_bytes,
             defer_sync=True,
@@ -395,64 +489,29 @@ class AttentionKernel:
         # ---- roles: every role walks the same units in the same order (u = bidx, bidx + grid, ...)
         if warp_idx == R.load_warp:
             cute.arch.setmaxregister_decrease(R.regs_other)
-            if cutlass.const_expr(st.q2):
-                for u in range(first, num_units, walk):
-                    ua = 2 * u
-                    ub = ua + 1
-                    q_prod, kv_prod = load_loop_q2(
-                        st,
-                        atom_q,
-                        tQ,
-                        atom_q_rep,
-                        tQr,
-                        atom_k,
-                        tK,
-                        atom_v,
-                        tV,
-                        sQ_view,
-                        sQ_rep_view,
-                        sKV_view,
-                        q_prod,
-                        kv_prod,
-                        mKvIndptr,
-                        mKvIndices,
-                        mDesc[(ua, F_REQ)],
-                        mDesc[(ua, F_KVHEAD)],
-                        mDesc[(ua, F_QBASE)] + mDesc[(ua, F_QTOK0)],
-                        mDesc[(ua, F_ROWS)],
-                        mDesc[(ua, F_TILE_LO)],
-                        mDesc[(ua, F_TILE_HI)],
-                        mDesc[(ub, F_QBASE)] + mDesc[(ub, F_QTOK0)],
-                        mDesc[(ub, F_ROWS)],
-                        mDesc[(ub, F_TILE_LO)],
-                        mDesc[(ub, F_TILE_HI)],
-                    )
-            if cutlass.const_expr(not st.q2):
-                for u in range(first, num_units, walk):
-                    q_prod, kv_prod = load_loop(
-                        st,
-                        atom_q,
-                        tQ,
-                        atom_q_rep,
-                        tQr,
-                        atom_k,
-                        tK,
-                        atom_v,
-                        tV,
-                        sQ_view,
-                        sQ_rep_view,
-                        sKV_view,
-                        q_prod,
-                        kv_prod,
-                        mKvIndptr,
-                        mKvIndices,
-                        mDesc[(u, F_REQ)],
-                        mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
-                        mDesc[(u, F_KVHEAD)],
-                        mDesc[(u, F_ROWS)],
-                        mDesc[(u, F_TILE_LO)],
-                        mDesc[(u, F_TILE_HI)],
-                    )
+            load_units(
+                st,
+                atom_q,
+                tQ,
+                atom_q_rep,
+                tQr,
+                atom_k,
+                tK,
+                atom_v,
+                tV,
+                sQ_view,
+                sQ_rep_view,
+                sKV_view,
+                q_prod,
+                kv_prod,
+                mKvIndptr,
+                mKvIndices,
+                mDesc,
+                first,
+                num_units,
+                walk,
+                0,
+            )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
             cute.arch.setmaxregister_decrease(R.regs_other)
@@ -778,3 +837,31 @@ class AttentionKernel:
             tmem.free(tmem_ptr)
         if warp_idx >= R.empty_warps[0]:
             cute.arch.setmaxregister_decrease(R.regs_other)
+            if cutlass.const_expr(st.kv_warps > 1):
+                # the split placement's other issuing warps: the same K / V slots in the same order, their share of each slot's boxes
+                for k in cutlass.range_constexpr(st.kv_warps - 1):
+                    if warp_idx == R.empty_warps[k]:
+                        load_units(
+                            st,
+                            atom_q,
+                            tQ,
+                            atom_q_rep,
+                            tQr,
+                            atom_k,
+                            tK,
+                            atom_v,
+                            tV,
+                            sQ_view,
+                            sQ_rep_view,
+                            sKV_view,
+                            q_prod,
+                            kv_prod,
+                            mKvIndptr,
+                            mKvIndices,
+                            mDesc,
+                            first,
+                            num_units,
+                            walk,
+                            k + 1,
+                        )
+                cute.arch.griddepcontrol_launch_dependents()
