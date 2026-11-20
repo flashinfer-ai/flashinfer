@@ -4015,7 +4015,7 @@ def _mla_cake_margin_tuning_config(
     so only those are timed."""
     spec, *others = config.dynamic_tensor_specs
     buckets = tuple(sorted(set(spec.gen_tuning_buckets)))
-    kept = set()
+    kept: Set[int] = set()
     for index, bucket in enumerate(buckets):
         if any(first <= bucket <= last for first, last in batch_ranges):
             kept.update(buckets[index : index + 2])
