@@ -1539,8 +1539,8 @@ def _sticky_cuda_error() -> Exception | None:
 
     The capture check comes before both: a device synchronize during capture
     does not merely fail, it invalidates the capture, and suppressing its
-    exception would hide that. ``rank_tactics`` reaches here with no capture
-    pre-check of its own, unlike ``choose_one``.
+    exception would hide that. ``choose_one`` and ``rank_tactics`` refuse to
+    start profiling during capture; this check remains as a backstop.
     """
     if not torch.cuda.is_initialized():
         return None
@@ -4211,6 +4211,13 @@ class AutoTuner:
             input_preparation_oom = False
             input_error = None
             try:
+                # As in choose_one(): a warm shortlist hit is safe during an
+                # outer capture, but synthesis or profiling would mutate the
+                # caller's graph, so a miss there fails instead of falling back.
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "AutoTuner profiling cannot begin during an active outer CUDA Graph capture"
+                    )
                 tensors = self._prepare_input_tensors(profile, inputs)
                 if tuning_config.inputs_pre_hook is not None:
                     tensors = list(tuning_config.inputs_pre_hook(tensors))

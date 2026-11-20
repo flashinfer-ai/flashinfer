@@ -216,6 +216,9 @@ tactic-pool changes.
 stores each one with the signature read before enumeration. A shortlist is
 reused only when both the measurement policy and the signature match, so a
 compound runner that ranks each stage re-ranks a stage whose pool changed.
+As with ``choose_one()``, a shortlist miss during a CUDA Graph capture inside
+``autotune(True)`` fails instead of falling back, because profiling cannot
+start during capture; an unchanged shortlist is still returned.
 
 Caching in the Benchmark Harness
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

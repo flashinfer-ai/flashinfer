@@ -298,3 +298,23 @@ def test_rank_tactics_without_signature_keeps_shortlist(setup):
         calls.clear()
         assert tuner.rank_tactics("unsigned", [runner], config, inputs, k=2) == [3, 1]
         assert calls == []
+
+
+def test_rank_tactics_shortlist_miss_fails_during_capture(setup, monkeypatch):
+    tuner, calls = setup
+    runner = PoolRunner([1, 3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with autotune():
+        assert tuner.rank_tactics("captured", [runner], config, inputs, k=2) == [3, 1]
+        calls.clear()
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        monkeypatch.setattr(
+            tuner, "_prepare_input_tensors", lambda *args: pytest.fail("synthesis")
+        )
+        # An unchanged shortlist is safe to return during capture.
+        assert tuner.rank_tactics("captured", [runner], config, inputs, k=2) == [3, 1]
+        # A changed pool must fail rather than fall back to tactic -1.
+        runner.tactics.append(2)
+        with pytest.raises(RuntimeError, match="active outer CUDA Graph capture"):
+            tuner.rank_tactics("captured", [runner], config, inputs, k=2)
+        assert calls == []
