@@ -37,9 +37,10 @@ The host side owns:
   NCCL communicator): symmetric windows, LSA peer pointers, GIN device comm;
 * the transport table (setup probe or a pinned table) and, from it, the
   instance pair to launch: with or without the LSA copier CTAs;
-* the two row schedules of that pair (M64 for at most ``m64_max_rows`` tokens
-  on every rank, M128 otherwise), chosen per call from the largest per-rank row
-  count, exactly as the generator's qualification harness chose them;
+* the two row schedules of that pair (64- or 128-row expert tiles), chosen per
+  call from rank-uniform row counts (:func:`_row_schedule`: a tile-count model
+  on GPUs with a measured tile cost ratio, else at most ``m64_max_rows`` rows ->
+  M64, the generator's qualification rule);
 * fixed-capacity scratch shared by both schedules (each schedule binds views
   with its own extents), TMA descriptor carriers, and the kernel-ordered
   argument list, rebuilt per call from a static template.
@@ -75,6 +76,9 @@ bound is refused (the routing exchange reads device data back).
 from __future__ import annotations
 
 import ctypes
+import functools
+import math
+import os
 import struct
 import warnings
 from dataclasses import dataclass, field
@@ -94,6 +98,7 @@ from ......core.validation.common import (
 from ......weights import MoEWeightPack
 from .cake_config import (
     RETURN_CODECS,
+    ROW_SCHEDULES,
     TRANSPORT_TABLE_AUTO,
     TRANSPORT_TABLE_TUNED,
     Sm120CakeMegaMoeConfigBase,
@@ -124,6 +129,51 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 KERNEL_NAME = "sm120_mxfp4_mxfp8_bf16_cake"
+
+# Row schedule model.  An expert with n routed rows runs ceil(n / m) tiles of the m-row schedule; with
+# n ~ Poisson(lam), lam = routed rows / experts, the m128 schedule is chosen when
+# E[ceil(n / 128)] * r < E[ceil(n / 64)], r = time of a 128-row tile over a 64-row tile.  The count
+# ratio is 1 below 64 rows per expert (m64 always), 2 in (64, 128], ~1.5 near 160, so the choice is not
+# monotonic in the rows.  r per (SM count, activation codec), from forced-m64 / forced-m128 sweeps
+# (EP4, 1..4 busy ranks, 256..2048 rows per rank, DeepSeek-V4-Flash routing; the model picks the faster
+# schedule in all 288 cells).  RTX 6000D (156 SMs): m64 is faster in every cell (4-27 %), r = inf.
+# Other GPUs keep the closure threshold (``m64_max_rows``).
+_ROW_TILE_COST_RATIO: dict[tuple[int, int], float] = {
+    (110, 0): 1.70,  # RTX PRO 5000 Blackwell, MXFP8 activations (W4A8)
+    (110, 1): 1.80,  # NVFP4 activations
+    (110, 2): 1.80,  # MXFP4 activations
+    (156, 0): math.inf,  # RTX 6000D
+    (156, 1): math.inf,
+    (156, 2): math.inf,
+}
+_ROW_SCHEDULE_ENV = "FLASHINFER_CAKE_ROW_SCHEDULE"
+
+
+@functools.lru_cache(maxsize=4096)
+def _expected_tiles(routed_rows: int, num_experts: int, tile_m: int) -> float:
+    """E[ceil(n / tile_m)] per expert for n ~ Poisson(routed_rows / num_experts)."""
+
+    lam = routed_rows / num_experts
+    if lam <= 0:
+        return 0.0
+    span = 12.0 * math.sqrt(lam) + 16.0
+    log_lam = math.log(lam)
+    return sum(
+        math.exp(n * log_lam - lam - math.lgamma(n + 1)) * -(-n // tile_m)
+        for n in range(max(0, int(lam - span)), int(lam + span) + 1)
+    )
+
+
+def _row_schedule_setting(config_value: str) -> str:
+    env = os.environ.get(_ROW_SCHEDULE_ENV, "").strip()
+    value = env or config_value
+    if value not in ROW_SCHEDULES:
+        raise MoEEpConfigError(
+            f"{KERNEL_NAME}: {_ROW_SCHEDULE_ENV}={value!r} must be one of {list(ROW_SCHEDULES)}"
+        )
+    return value
+
+
 _TENSOR_MAP_BYTES = 128
 _PER_CALL_NAMES = (
     "W1_B",
@@ -707,6 +757,10 @@ class _CakeWorkspace:
     num_experts: int
     local_experts: int
     m64_max_rows: int
+    # ``auto`` / ``m64`` / ``m128`` (config ``row_schedule`` or FLASHINFER_CAKE_ROW_SCHEDULE) and the
+    # tile cost ratio of the ``auto`` model on this GPU and codec (None: the m64_max_rows threshold).
+    row_schedule: str
+    tile_cost_ratio: float | None
     stats: torch.Tensor  # int32 [1 + E] per-call row count + expert histogram
     gathered_stats: torch.Tensor  # int32 [world, 1 + E]
     epoch: int = (
@@ -926,6 +980,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             config.return_codec,
             config.variant,
             config.transport_table,
+            config.row_schedule,
             knobs_pool_key(config.knobs),
         )
 
@@ -1332,6 +1387,8 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             num_experts=E,
             local_experts=int(kernel["local_experts"]),
             m64_max_rows=int(kernel["transport"]["m64_max_rows"]),
+            row_schedule=_row_schedule_setting(self._kernel_config.row_schedule),
+            tile_cost_ratio=_ROW_TILE_COST_RATIO.get((sm_count, self.ACT_CODEC)),
             stats=torch.zeros(1 + E, dtype=torch.int32, device=device),
             gathered_stats=torch.zeros(
                 (world_size, 1 + E), dtype=torch.int32, device=device
@@ -1570,6 +1627,33 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
         # results), so a hint that misstates the rows changes speed, never correctness.
         return min(collective_rows, -(-sum(hint) // ws.world_size))
 
+    @classmethod
+    def _row_schedule(cls, ws: _CakeWorkspace, rows_by_rank: list[int]) -> str:
+        """``"m64"`` or ``"m128"`` for a call with these rank-uniform per-rank rows.
+
+        A pinned ``row_schedule`` wins.  ``auto`` on a GPU with a measured tile cost ratio applies the
+        tile-count model (:data:`_ROW_TILE_COST_RATIO`) to the routed rows of the call: the hint's
+        total when there is one (capped by the bound), else the rows the grid is sized for.  Other GPUs
+        keep the closure threshold on :meth:`_schedule_rows`.  Only rank-uniform values are read, so
+        every rank launches the same schedule."""
+
+        if ws.row_schedule != "auto":
+            return ws.row_schedule
+        if ws.tile_cost_ratio is None:
+            return (
+                "m64"
+                if cls._schedule_rows(ws, rows_by_rank) <= ws.m64_max_rows
+                else "m128"
+            )
+        if math.isinf(ws.tile_cost_ratio):
+            return "m64"
+        rows = sum(rows_by_rank)
+        if ws.staged_bound is not None and ws.rows_hint is not None:
+            rows = min(rows, sum(ws.rows_hint))
+        routed = rows * ws.top_k
+        m128 = _expected_tiles(routed, ws.num_experts, 128) * ws.tile_cost_ratio
+        return "m128" if m128 < _expected_tiles(routed, ws.num_experts, 64) else "m64"
+
     def stage_inputs(
         self, t: MoEEpTensors, workspace: Any, *, quantize_input: bool
     ) -> None:
@@ -1674,7 +1758,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
                 return output[:0]
             return out
         schedule_rows = self._schedule_rows(ws, rows_by_rank)
-        inst = ws.instances["m64" if schedule_rows <= ws.m64_max_rows else "m128"]
+        inst = ws.instances[self._row_schedule(ws, rows_by_rank)]
         grid_args: dict[str, Any] = dict(
             task_m=inst.task_m,
             with_shared_expert=ws.variant == "fp8shared",
