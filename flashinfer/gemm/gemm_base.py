@@ -7088,6 +7088,25 @@ def get_cutlass_mxfp8_gemm_module(
         raise ValueError(f"Unsupported SM major version: {sm_major}")
 
 
+def _check_mm_mxfp8_tensor_devices(a, b, a_descale, b_descale, out):
+    device = a.device
+    if device.type != "cuda":
+        raise ValueError(f"a must be a CUDA tensor, got {device}.")
+    for name, tensor in (
+        ("b", b),
+        ("a_descale", a_descale),
+        ("b_descale", b_descale),
+    ):
+        if tensor.device != device:
+            raise ValueError(
+                f"{name} must be on the same CUDA device as a ({device}), got {tensor.device}."
+            )
+    if out is not None and out.device != device:
+        raise ValueError(
+            f"Output device mismatch. Expected {device}, got {out.device}."
+        )
+
+
 def _check_mm_mxfp8_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7099,7 +7118,7 @@ def _check_mm_mxfp8_problem_size(
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",  # unused
     batch_invariant: bool = False,
 ) -> bool:
-    # Generic checks
+    _check_mm_mxfp8_tensor_devices(a, b, a_descale, b_descale, out)
     ## pre-check the input tensors and block scale tensors
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"mm_mxfp8 accepts 2d tensors, got {a.shape=} and {b.shape=}")
@@ -7193,10 +7212,6 @@ def _check_mm_mxfp8_problem_size(
         if out.shape != expected_shape:
             raise ValueError(
                 f"Output shape mismatch. Expected {expected_shape}, got {out.shape}."
-            )
-        if out.device != a.device:
-            raise ValueError(
-                f"Output device mismatch. Expected {a.device}, got {out.device}."
             )
         if out.dtype != out_dtype:
             raise ValueError(

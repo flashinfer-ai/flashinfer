@@ -30,6 +30,8 @@ class Runner:
 
 @pytest.fixture
 def dispatch(monkeypatch):
+    # This fixture exercises dispatch with CPU buffers; placement has its own tests.
+    monkeypatch.setattr(gemm, "_check_mm_mxfp8_tensor_devices", lambda *args: None)
     # backend_requirement captures the checker table at decoration time. Limit
     # this test to two backends without rebinding or redecorating the public API.
     checks = getclosurevars(mm_mxfp8.has_backend).nonlocals["backend_checks"]

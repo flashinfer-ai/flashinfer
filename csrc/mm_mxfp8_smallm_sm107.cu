@@ -235,6 +235,12 @@ static void gen_m(const Args& A, cudaStream_t st) {
 // is_sf_swizzled_layout=True) produces. The Python dispatch gate guarantees
 // layout, dtype and shape preconditions; only cheap invariants are re-checked.
 void Run(TensorView aq, TensorView bq, TensorView a_sf, TensorView b_sf, TensorView result) {
+  check_cuda_tensor(aq, "aq");
+  check_same_device(bq, aq, "bq", "aq");
+  check_same_device(a_sf, aq, "a_sf", "aq");
+  check_same_device(b_sf, aq, "b_sf", "aq");
+  check_same_device(result, aq, "result", "aq");
+
   const int64_t M = aq.shape()[0];
   const int64_t K = aq.shape()[1];
   const int64_t N = bq.shape()[0];

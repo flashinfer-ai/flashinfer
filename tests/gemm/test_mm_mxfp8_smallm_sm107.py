@@ -166,6 +166,44 @@ def test_specialized_misaligned_refusal(index, offset, monkeypatch):
 
 
 @requires_sm107
+@pytest.mark.parametrize("other_gpu", [False, True], ids=["cpu", "other_gpu"])
+@pytest.mark.parametrize("index", range(5))
+def test_direct_ffi_rejects_misplaced_tensor(other_gpu, index):
+    if other_gpu and torch.cuda.device_count() < 2:
+        pytest.skip("requires two GPUs")
+    module = specialized._get_specialized_module()
+    assert module is not None
+    m, n, k = 4, 6144, 384
+    a, sa = _const_operand(m, k, 1, 127)
+    b, sb = _const_operand(n, k, 1, 127)
+    out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
+    args = [a, b, sa, sb, out]
+    args[index] = (
+        args[index].to(
+            torch.device("cuda", (a.device.index + 1) % torch.cuda.device_count())
+        )
+        if other_gpu
+        else args[index].cpu()
+    )
+    names = ["aq", "bq", "a_sf", "b_sf", "result"]
+    expected = (
+        "aq must be a CUDA tensor"
+        if index == 0 and not other_gpu
+        else (
+            "bq must be on the same device as aq"
+            if index == 0
+            else names[index] + " must be on the same device as aq"
+        )
+    )
+    with pytest.raises(ValueError, match=expected):
+        module.mm_mxfp8_smallm_sm107_run(*args)
+
+    # The same buffers with the original scale must still launch correctly.
+    module.mm_mxfp8_smallm_sm107_run(a, b, sa, sb, out)
+    assert torch.equal(out, torch.full_like(out, k))
+
+
+@requires_sm107
 def test_generic_launch_error_crosses_ffi():
     # M=1 enters gen_m<1>; K=128 gives one valid K group. N=0 makes
     # grid.x zero at the reachable, non-clustered launch_gen site.
