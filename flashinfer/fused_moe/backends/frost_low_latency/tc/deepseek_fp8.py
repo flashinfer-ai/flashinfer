@@ -80,8 +80,16 @@ def execute(inputs, config, tactic):
     from ..runtime import _COMPILED, _COMPILE_LOCK
     from .....utils import get_compute_capability
 
-    if tactic not in _TACTICS or tactic[0] not in ("wgmma", "warp_mma"):
-        raise ValueError("Grouped DeepSeek FP8 requires a valid SM90/SM120 tactic")
+    # One scale is selected per tile; K256 would span two distinct 128-column
+    # scale blocks. Shared W8A16 tactics must not leak into this entry point.
+    if (
+        tactic not in _TACTICS
+        or tactic[0] not in ("wgmma", "warp_mma")
+        or tactic[3] not in (64, 128)
+    ):
+        raise ValueError(
+            "Grouped DeepSeek FP8 requires a valid SM90/SM120 K64/K128 tactic"
+        )
     if len(inputs) != 15:
         raise ValueError("Grouped DeepSeek FP8 requires canonical block-scale inputs")
     x, qx, xs, w1, s1, w2, s2, ids, scores, raw, mid, ms, routes, out, narrow = inputs

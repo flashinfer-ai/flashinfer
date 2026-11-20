@@ -134,26 +134,26 @@ kernel_cake_qsa_nvfp4_aa2349948b0a711974f9(float* __restrict__ partial_out, floa
             }
         }
         float lane_max = -CUDART_INF_F;
-        float lse_g = -CUDART_INF_F;
+        float lse_g_3_0 = -CUDART_INF_F;
         if (lane_1 < num_splits) {
-            lse_g = partial_lse[(long long)lane_1 * split_pitch + row_head];
+            lse_g_3_0 = partial_lse[(long long)lane_1 * split_pitch + row_head];
         }
-        lane_max = fmaxf(lane_max, lse_g);
-        float lse_g_0 = -CUDART_INF_F;
+        lane_max = fmaxf(lane_max, lse_g_3_0);
+        float lse_g_3_1 = -CUDART_INF_F;
         if (32 + lane_1 < num_splits) {
-            lse_g_0 = partial_lse[(long long)(32 + lane_1) * split_pitch + row_head];
+            lse_g_3_1 = partial_lse[(long long)(32 + lane_1) * split_pitch + row_head];
         }
-        lane_max = fmaxf(lane_max, lse_g_0);
-        float lse_g_1 = -CUDART_INF_F;
+        lane_max = fmaxf(lane_max, lse_g_3_1);
+        float lse_g_3_2 = -CUDART_INF_F;
         if (64 + lane_1 < num_splits) {
-            lse_g_1 = partial_lse[(long long)(64 + lane_1) * split_pitch + row_head];
+            lse_g_3_2 = partial_lse[(long long)(64 + lane_1) * split_pitch + row_head];
         }
-        lane_max = fmaxf(lane_max, lse_g_1);
-        float lse_g_2 = -CUDART_INF_F;
+        lane_max = fmaxf(lane_max, lse_g_3_2);
+        float lse_g_3_3 = -CUDART_INF_F;
         if (96 + lane_1 < num_splits) {
-            lse_g_2 = partial_lse[(long long)(96 + lane_1) * split_pitch + row_head];
+            lse_g_3_3 = partial_lse[(long long)(96 + lane_1) * split_pitch + row_head];
         }
-        lane_max = fmaxf(lane_max, lse_g_2);
+        lane_max = fmaxf(lane_max, lse_g_3_3);
         float lse = -CUDART_INF_F;
         if (lane_1 < mine) {
             lse = partial_lse[(long long)(first + lane_1) * split_pitch + row_head];
@@ -727,125 +727,125 @@ kernel_cake_qsa_nvfp4_aa2349948b0a711974f9(float* __restrict__ partial_out, floa
                 }
 #else
             int _min_10 = ((0) < (last) ? (0) : (last));
-            float weight = __shfl_sync(0xFFFFFFFF, weight_lane, _min_10);
+            float weight_7_0 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_10);
             if (last < 0) {
-                weight = 0.0f;
+                weight_7_0 = 0.0f;
 #endif
             }
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             if (chunk <= 4) {
                 int _min_28 = ((0) < (last) ? (0) : (last));
-                float weight_9 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_28);
+                float weight_8_0 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_28);
                 if (last < 0) {
-                    weight_9 = 0.0f;
+                    weight_8_0 = 0.0f;
                 }
-                den += weight_9;
-                acc[0] = __fmaf_rn(weight_9, pre[0], acc[0]);
-                acc[4] = __fmaf_rn(weight_9, pre[4], acc[4]);
-                acc[1] = __fmaf_rn(weight_9, pre[1], acc[1]);
-                acc[5] = __fmaf_rn(weight_9, pre[5], acc[5]);
-                acc[2] = __fmaf_rn(weight_9, pre[2], acc[2]);
-                acc[6] = __fmaf_rn(weight_9, pre[6], acc[6]);
-                acc[3] = __fmaf_rn(weight_9, pre[3], acc[3]);
-                acc[7] = __fmaf_rn(weight_9, pre[7], acc[7]);
+                den += weight_8_0;
+                acc[0] = __fmaf_rn(weight_8_0, pre[0], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_0, pre[4], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_0, pre[1], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_0, pre[5], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_0, pre[2], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_0, pre[6], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_0, pre[3], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_0, pre[7], acc[7]);
                 int _min_29 = ((1) < (last) ? (1) : (last));
-                float weight_0 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_29);
+                float weight_8_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_29);
                 if (last < 1) {
-                    weight_0 = 0.0f;
+                    weight_8_1 = 0.0f;
                 }
-                den += weight_0;
-                acc[0] = __fmaf_rn(weight_0, pre[8], acc[0]);
-                acc[4] = __fmaf_rn(weight_0, pre[12], acc[4]);
-                acc[1] = __fmaf_rn(weight_0, pre[9], acc[1]);
-                acc[5] = __fmaf_rn(weight_0, pre[13], acc[5]);
-                acc[2] = __fmaf_rn(weight_0, pre[10], acc[2]);
-                acc[6] = __fmaf_rn(weight_0, pre[14], acc[6]);
-                acc[3] = __fmaf_rn(weight_0, pre[11], acc[3]);
-                acc[7] = __fmaf_rn(weight_0, pre[15], acc[7]);
+                den += weight_8_1;
+                acc[0] = __fmaf_rn(weight_8_1, pre[8], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_1, pre[12], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_1, pre[9], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_1, pre[13], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_1, pre[10], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_1, pre[14], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_1, pre[11], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_1, pre[15], acc[7]);
                 int _min_30 = ((2) < (last) ? (2) : (last));
-                float weight_1_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_30);
+                float weight_8_2 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_30);
                 if (last < 2) {
-                    weight_1_1 = 0.0f;
+                    weight_8_2 = 0.0f;
                 }
-                den += weight_1_1;
-                acc[0] = __fmaf_rn(weight_1_1, pre[16], acc[0]);
-                acc[4] = __fmaf_rn(weight_1_1, pre[20], acc[4]);
-                acc[1] = __fmaf_rn(weight_1_1, pre[17], acc[1]);
-                acc[5] = __fmaf_rn(weight_1_1, pre[21], acc[5]);
-                acc[2] = __fmaf_rn(weight_1_1, pre[18], acc[2]);
-                acc[6] = __fmaf_rn(weight_1_1, pre[22], acc[6]);
-                acc[3] = __fmaf_rn(weight_1_1, pre[19], acc[3]);
-                acc[7] = __fmaf_rn(weight_1_1, pre[23], acc[7]);
+                den += weight_8_2;
+                acc[0] = __fmaf_rn(weight_8_2, pre[16], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_2, pre[20], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_2, pre[17], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_2, pre[21], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_2, pre[18], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_2, pre[22], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_2, pre[19], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_2, pre[23], acc[7]);
                 int _min_31 = ((3) < (last) ? (3) : (last));
-                float weight_2_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_31);
+                float weight_8_3 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_31);
                 if (last < 3) {
-                    weight_2_1 = 0.0f;
+                    weight_8_3 = 0.0f;
                 }
-                den += weight_2_1;
-                acc[0] = __fmaf_rn(weight_2_1, pre[24], acc[0]);
-                acc[4] = __fmaf_rn(weight_2_1, pre[28], acc[4]);
-                acc[1] = __fmaf_rn(weight_2_1, pre[25], acc[1]);
-                acc[5] = __fmaf_rn(weight_2_1, pre[29], acc[5]);
-                acc[2] = __fmaf_rn(weight_2_1, pre[26], acc[2]);
-                acc[6] = __fmaf_rn(weight_2_1, pre[30], acc[6]);
-                acc[3] = __fmaf_rn(weight_2_1, pre[27], acc[3]);
-                acc[7] = __fmaf_rn(weight_2_1, pre[31], acc[7]);
+                den += weight_8_3;
+                acc[0] = __fmaf_rn(weight_8_3, pre[24], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_3, pre[28], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_3, pre[25], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_3, pre[29], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_3, pre[26], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_3, pre[30], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_3, pre[27], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_3, pre[31], acc[7]);
 #else
-            den += weight;
-            acc[0] = __fmaf_rn(weight, pre[0], acc[0]);
-            acc[4] = __fmaf_rn(weight, pre[4], acc[4]);
-            acc[1] = __fmaf_rn(weight, pre[1], acc[1]);
-            acc[5] = __fmaf_rn(weight, pre[5], acc[5]);
-            acc[2] = __fmaf_rn(weight, pre[2], acc[2]);
-            acc[6] = __fmaf_rn(weight, pre[6], acc[6]);
-            acc[3] = __fmaf_rn(weight, pre[3], acc[3]);
-            acc[7] = __fmaf_rn(weight, pre[7], acc[7]);
+            den += weight_7_0;
+            acc[0] = __fmaf_rn(weight_7_0, pre[0], acc[0]);
+            acc[4] = __fmaf_rn(weight_7_0, pre[4], acc[4]);
+            acc[1] = __fmaf_rn(weight_7_0, pre[1], acc[1]);
+            acc[5] = __fmaf_rn(weight_7_0, pre[5], acc[5]);
+            acc[2] = __fmaf_rn(weight_7_0, pre[2], acc[2]);
+            acc[6] = __fmaf_rn(weight_7_0, pre[6], acc[6]);
+            acc[3] = __fmaf_rn(weight_7_0, pre[3], acc[3]);
+            acc[7] = __fmaf_rn(weight_7_0, pre[7], acc[7]);
             int _min_11 = ((1) < (last) ? (1) : (last));
-            float weight_0 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_11);
+            float weight_7_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_11);
             if (last < 1) {
-                weight_0 = 0.0f;
+                weight_7_1 = 0.0f;
 #endif
             }
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             for (int split_group = 9; split_group < mine; split_group += 9) {
 #else
-            den += weight_0;
-            acc[0] = __fmaf_rn(weight_0, pre[8], acc[0]);
-            acc[4] = __fmaf_rn(weight_0, pre[12], acc[4]);
-            acc[1] = __fmaf_rn(weight_0, pre[9], acc[1]);
-            acc[5] = __fmaf_rn(weight_0, pre[13], acc[5]);
-            acc[2] = __fmaf_rn(weight_0, pre[10], acc[2]);
-            acc[6] = __fmaf_rn(weight_0, pre[14], acc[6]);
-            acc[3] = __fmaf_rn(weight_0, pre[11], acc[3]);
-            acc[7] = __fmaf_rn(weight_0, pre[15], acc[7]);
+            den += weight_7_1;
+            acc[0] = __fmaf_rn(weight_7_1, pre[8], acc[0]);
+            acc[4] = __fmaf_rn(weight_7_1, pre[12], acc[4]);
+            acc[1] = __fmaf_rn(weight_7_1, pre[9], acc[1]);
+            acc[5] = __fmaf_rn(weight_7_1, pre[13], acc[5]);
+            acc[2] = __fmaf_rn(weight_7_1, pre[10], acc[2]);
+            acc[6] = __fmaf_rn(weight_7_1, pre[14], acc[6]);
+            acc[3] = __fmaf_rn(weight_7_1, pre[11], acc[3]);
+            acc[7] = __fmaf_rn(weight_7_1, pre[15], acc[7]);
             int _min_12 = ((2) < (last) ? (2) : (last));
-            float weight_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_12);
+            float weight_7_2 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_12);
             if (last < 2) {
-                weight_1 = 0.0f;
+                weight_7_2 = 0.0f;
             }
-            den += weight_1;
-            acc[0] = __fmaf_rn(weight_1, pre[16], acc[0]);
-            acc[4] = __fmaf_rn(weight_1, pre[20], acc[4]);
-            acc[1] = __fmaf_rn(weight_1, pre[17], acc[1]);
-            acc[5] = __fmaf_rn(weight_1, pre[21], acc[5]);
-            acc[2] = __fmaf_rn(weight_1, pre[18], acc[2]);
-            acc[6] = __fmaf_rn(weight_1, pre[22], acc[6]);
-            acc[3] = __fmaf_rn(weight_1, pre[19], acc[3]);
-            acc[7] = __fmaf_rn(weight_1, pre[23], acc[7]);
+            den += weight_7_2;
+            acc[0] = __fmaf_rn(weight_7_2, pre[16], acc[0]);
+            acc[4] = __fmaf_rn(weight_7_2, pre[20], acc[4]);
+            acc[1] = __fmaf_rn(weight_7_2, pre[17], acc[1]);
+            acc[5] = __fmaf_rn(weight_7_2, pre[21], acc[5]);
+            acc[2] = __fmaf_rn(weight_7_2, pre[18], acc[2]);
+            acc[6] = __fmaf_rn(weight_7_2, pre[22], acc[6]);
+            acc[3] = __fmaf_rn(weight_7_2, pre[19], acc[3]);
+            acc[7] = __fmaf_rn(weight_7_2, pre[23], acc[7]);
             int _min_13 = ((3) < (last) ? (3) : (last));
-            float weight_2 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_13);
+            float weight_7_3 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_13);
             if (last < 3) {
-                weight_2 = 0.0f;
+                weight_7_3 = 0.0f;
             }
-            den += weight_2;
-            acc[0] = __fmaf_rn(weight_2, pre[24], acc[0]);
-            acc[4] = __fmaf_rn(weight_2, pre[28], acc[4]);
-            acc[1] = __fmaf_rn(weight_2, pre[25], acc[1]);
-            acc[5] = __fmaf_rn(weight_2, pre[29], acc[5]);
-            acc[2] = __fmaf_rn(weight_2, pre[26], acc[2]);
-            acc[6] = __fmaf_rn(weight_2, pre[30], acc[6]);
-            acc[3] = __fmaf_rn(weight_2, pre[27], acc[3]);
-            acc[7] = __fmaf_rn(weight_2, pre[31], acc[7]);
+            den += weight_7_3;
+            acc[0] = __fmaf_rn(weight_7_3, pre[24], acc[0]);
+            acc[4] = __fmaf_rn(weight_7_3, pre[28], acc[4]);
+            acc[1] = __fmaf_rn(weight_7_3, pre[25], acc[1]);
+            acc[5] = __fmaf_rn(weight_7_3, pre[29], acc[5]);
+            acc[2] = __fmaf_rn(weight_7_3, pre[26], acc[2]);
+            acc[6] = __fmaf_rn(weight_7_3, pre[30], acc[6]);
+            acc[3] = __fmaf_rn(weight_7_3, pre[27], acc[3]);
+            acc[7] = __fmaf_rn(weight_7_3, pre[31], acc[7]);
             for (int split_group = 4; split_group < mine; split_group += 4) {
 #endif
                 if (mine > split_group) {
@@ -1003,204 +1003,204 @@ kernel_cake_qsa_nvfp4_aa2349948b0a711974f9(float* __restrict__ partial_out, floa
                     }
                 }
                 int _min_50 = ((split_group) < (last) ? (split_group) : (last));
-                float weight_10 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_50);
+                float weight_8_4 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_50);
 #else
                 int _min_22 = ((split_group) < (last) ? (split_group) : (last));
-                float weight_3 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_22);
+                float weight_7_4 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_22);
 #endif
                 if (last < split_group) {
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
-                    weight_10 = 0.0f;
+                    weight_8_4 = 0.0f;
 #else
-                    weight_3 = 0.0f;
+                    weight_7_4 = 0.0f;
 #endif
                 }
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
-                den += weight_10;
-                acc[0] = __fmaf_rn(weight_10, pre[0], acc[0]);
-                acc[4] = __fmaf_rn(weight_10, pre[4], acc[4]);
-                acc[1] = __fmaf_rn(weight_10, pre[1], acc[1]);
-                acc[5] = __fmaf_rn(weight_10, pre[5], acc[5]);
-                acc[2] = __fmaf_rn(weight_10, pre[2], acc[2]);
-                acc[6] = __fmaf_rn(weight_10, pre[6], acc[6]);
-                acc[3] = __fmaf_rn(weight_10, pre[3], acc[3]);
-                acc[7] = __fmaf_rn(weight_10, pre[7], acc[7]);
+                den += weight_8_4;
+                acc[0] = __fmaf_rn(weight_8_4, pre[0], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_4, pre[4], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_4, pre[1], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_4, pre[5], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_4, pre[2], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_4, pre[6], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_4, pre[3], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_4, pre[7], acc[7]);
                 int _min_51 = ((split_group + 1) < (last) ? (split_group + 1) : (last));
-                float weight_0_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_51);
+                float weight_8_5 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_51);
 #else
-                den += weight_3;
-                acc[0] = __fmaf_rn(weight_3, pre[0], acc[0]);
-                acc[4] = __fmaf_rn(weight_3, pre[4], acc[4]);
-                acc[1] = __fmaf_rn(weight_3, pre[1], acc[1]);
-                acc[5] = __fmaf_rn(weight_3, pre[5], acc[5]);
-                acc[2] = __fmaf_rn(weight_3, pre[2], acc[2]);
-                acc[6] = __fmaf_rn(weight_3, pre[6], acc[6]);
-                acc[3] = __fmaf_rn(weight_3, pre[3], acc[3]);
-                acc[7] = __fmaf_rn(weight_3, pre[7], acc[7]);
+                den += weight_7_4;
+                acc[0] = __fmaf_rn(weight_7_4, pre[0], acc[0]);
+                acc[4] = __fmaf_rn(weight_7_4, pre[4], acc[4]);
+                acc[1] = __fmaf_rn(weight_7_4, pre[1], acc[1]);
+                acc[5] = __fmaf_rn(weight_7_4, pre[5], acc[5]);
+                acc[2] = __fmaf_rn(weight_7_4, pre[2], acc[2]);
+                acc[6] = __fmaf_rn(weight_7_4, pre[6], acc[6]);
+                acc[3] = __fmaf_rn(weight_7_4, pre[3], acc[3]);
+                acc[7] = __fmaf_rn(weight_7_4, pre[7], acc[7]);
                 int _min_23 = ((split_group + 1) < (last) ? (split_group + 1) : (last));
-                float weight_4 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_23);
+                float weight_7_5 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_23);
 #endif
                 if (last < split_group + 1) {
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
-                    weight_0_1 = 0.0f;
+                    weight_8_5 = 0.0f;
 #else
-                    weight_4 = 0.0f;
+                    weight_7_5 = 0.0f;
 #endif
                 }
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
-                den += weight_0_1;
-                acc[0] = __fmaf_rn(weight_0_1, pre[8], acc[0]);
-                acc[4] = __fmaf_rn(weight_0_1, pre[12], acc[4]);
-                acc[1] = __fmaf_rn(weight_0_1, pre[9], acc[1]);
-                acc[5] = __fmaf_rn(weight_0_1, pre[13], acc[5]);
-                acc[2] = __fmaf_rn(weight_0_1, pre[10], acc[2]);
-                acc[6] = __fmaf_rn(weight_0_1, pre[14], acc[6]);
-                acc[3] = __fmaf_rn(weight_0_1, pre[11], acc[3]);
-                acc[7] = __fmaf_rn(weight_0_1, pre[15], acc[7]);
+                den += weight_8_5;
+                acc[0] = __fmaf_rn(weight_8_5, pre[8], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_5, pre[12], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_5, pre[9], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_5, pre[13], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_5, pre[10], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_5, pre[14], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_5, pre[11], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_5, pre[15], acc[7]);
                 int _min_52 = ((split_group + 2) < (last) ? (split_group + 2) : (last));
-                float weight_1_2 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_52);
+                float weight_8_6 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_52);
 #else
-                den += weight_4;
-                acc[0] = __fmaf_rn(weight_4, pre[8], acc[0]);
-                acc[4] = __fmaf_rn(weight_4, pre[12], acc[4]);
-                acc[1] = __fmaf_rn(weight_4, pre[9], acc[1]);
-                acc[5] = __fmaf_rn(weight_4, pre[13], acc[5]);
-                acc[2] = __fmaf_rn(weight_4, pre[10], acc[2]);
-                acc[6] = __fmaf_rn(weight_4, pre[14], acc[6]);
-                acc[3] = __fmaf_rn(weight_4, pre[11], acc[3]);
-                acc[7] = __fmaf_rn(weight_4, pre[15], acc[7]);
+                den += weight_7_5;
+                acc[0] = __fmaf_rn(weight_7_5, pre[8], acc[0]);
+                acc[4] = __fmaf_rn(weight_7_5, pre[12], acc[4]);
+                acc[1] = __fmaf_rn(weight_7_5, pre[9], acc[1]);
+                acc[5] = __fmaf_rn(weight_7_5, pre[13], acc[5]);
+                acc[2] = __fmaf_rn(weight_7_5, pre[10], acc[2]);
+                acc[6] = __fmaf_rn(weight_7_5, pre[14], acc[6]);
+                acc[3] = __fmaf_rn(weight_7_5, pre[11], acc[3]);
+                acc[7] = __fmaf_rn(weight_7_5, pre[15], acc[7]);
                 int _min_24 = ((split_group + 2) < (last) ? (split_group + 2) : (last));
-                float weight_5 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_24);
+                float weight_7_6 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_24);
 #endif
                 if (last < split_group + 2) {
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
-                    weight_1_2 = 0.0f;
+                    weight_8_6 = 0.0f;
 #else
-                    weight_5 = 0.0f;
+                    weight_7_6 = 0.0f;
 #endif
                 }
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
-                den += weight_1_2;
-                acc[0] = __fmaf_rn(weight_1_2, pre[16], acc[0]);
-                acc[4] = __fmaf_rn(weight_1_2, pre[20], acc[4]);
-                acc[1] = __fmaf_rn(weight_1_2, pre[17], acc[1]);
-                acc[5] = __fmaf_rn(weight_1_2, pre[21], acc[5]);
-                acc[2] = __fmaf_rn(weight_1_2, pre[18], acc[2]);
-                acc[6] = __fmaf_rn(weight_1_2, pre[22], acc[6]);
-                acc[3] = __fmaf_rn(weight_1_2, pre[19], acc[3]);
-                acc[7] = __fmaf_rn(weight_1_2, pre[23], acc[7]);
+                den += weight_8_6;
+                acc[0] = __fmaf_rn(weight_8_6, pre[16], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_6, pre[20], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_6, pre[17], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_6, pre[21], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_6, pre[18], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_6, pre[22], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_6, pre[19], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_6, pre[23], acc[7]);
                 int _min_53 = ((split_group + 3) < (last) ? (split_group + 3) : (last));
-                float weight_2_2 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_53);
+                float weight_8_7 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_53);
 #else
-                den += weight_5;
-                acc[0] = __fmaf_rn(weight_5, pre[16], acc[0]);
-                acc[4] = __fmaf_rn(weight_5, pre[20], acc[4]);
-                acc[1] = __fmaf_rn(weight_5, pre[17], acc[1]);
-                acc[5] = __fmaf_rn(weight_5, pre[21], acc[5]);
-                acc[2] = __fmaf_rn(weight_5, pre[18], acc[2]);
-                acc[6] = __fmaf_rn(weight_5, pre[22], acc[6]);
-                acc[3] = __fmaf_rn(weight_5, pre[19], acc[3]);
-                acc[7] = __fmaf_rn(weight_5, pre[23], acc[7]);
+                den += weight_7_6;
+                acc[0] = __fmaf_rn(weight_7_6, pre[16], acc[0]);
+                acc[4] = __fmaf_rn(weight_7_6, pre[20], acc[4]);
+                acc[1] = __fmaf_rn(weight_7_6, pre[17], acc[1]);
+                acc[5] = __fmaf_rn(weight_7_6, pre[21], acc[5]);
+                acc[2] = __fmaf_rn(weight_7_6, pre[18], acc[2]);
+                acc[6] = __fmaf_rn(weight_7_6, pre[22], acc[6]);
+                acc[3] = __fmaf_rn(weight_7_6, pre[19], acc[3]);
+                acc[7] = __fmaf_rn(weight_7_6, pre[23], acc[7]);
                 int _min_25 = ((split_group + 3) < (last) ? (split_group + 3) : (last));
-                float weight_6 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_25);
+                float weight_7_7 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_25);
 #endif
                 if (last < split_group + 3) {
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
-                    weight_2_2 = 0.0f;
+                    weight_8_7 = 0.0f;
 #else
-                    weight_6 = 0.0f;
+                    weight_7_7 = 0.0f;
 #endif
                 }
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
-                den += weight_2_2;
-                acc[0] = __fmaf_rn(weight_2_2, pre[24], acc[0]);
-                acc[4] = __fmaf_rn(weight_2_2, pre[28], acc[4]);
-                acc[1] = __fmaf_rn(weight_2_2, pre[25], acc[1]);
-                acc[5] = __fmaf_rn(weight_2_2, pre[29], acc[5]);
-                acc[2] = __fmaf_rn(weight_2_2, pre[26], acc[2]);
-                acc[6] = __fmaf_rn(weight_2_2, pre[30], acc[6]);
-                acc[3] = __fmaf_rn(weight_2_2, pre[27], acc[3]);
-                acc[7] = __fmaf_rn(weight_2_2, pre[31], acc[7]);
+                den += weight_8_7;
+                acc[0] = __fmaf_rn(weight_8_7, pre[24], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_7, pre[28], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_7, pre[25], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_7, pre[29], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_7, pre[26], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_7, pre[30], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_7, pre[27], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_7, pre[31], acc[7]);
                 int _min_54 = ((split_group + 4) < (last) ? (split_group + 4) : (last));
-                float weight_3_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_54);
+                float weight_8_8 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_54);
                 if (last < split_group + 4) {
-                    weight_3_1 = 0.0f;
+                    weight_8_8 = 0.0f;
                 }
-                den += weight_3_1;
-                acc[0] = __fmaf_rn(weight_3_1, pre[32], acc[0]);
-                acc[4] = __fmaf_rn(weight_3_1, pre[36], acc[4]);
-                acc[1] = __fmaf_rn(weight_3_1, pre[33], acc[1]);
-                acc[5] = __fmaf_rn(weight_3_1, pre[37], acc[5]);
-                acc[2] = __fmaf_rn(weight_3_1, pre[34], acc[2]);
-                acc[6] = __fmaf_rn(weight_3_1, pre[38], acc[6]);
-                acc[3] = __fmaf_rn(weight_3_1, pre[35], acc[3]);
-                acc[7] = __fmaf_rn(weight_3_1, pre[39], acc[7]);
+                den += weight_8_8;
+                acc[0] = __fmaf_rn(weight_8_8, pre[32], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_8, pre[36], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_8, pre[33], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_8, pre[37], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_8, pre[34], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_8, pre[38], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_8, pre[35], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_8, pre[39], acc[7]);
                 int _min_55 = ((split_group + 5) < (last) ? (split_group + 5) : (last));
-                float weight_4_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_55);
+                float weight_8_9 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_55);
                 if (last < split_group + 5) {
-                    weight_4_1 = 0.0f;
+                    weight_8_9 = 0.0f;
                 }
-                den += weight_4_1;
-                acc[0] = __fmaf_rn(weight_4_1, pre[40], acc[0]);
-                acc[4] = __fmaf_rn(weight_4_1, pre[44], acc[4]);
-                acc[1] = __fmaf_rn(weight_4_1, pre[41], acc[1]);
-                acc[5] = __fmaf_rn(weight_4_1, pre[45], acc[5]);
-                acc[2] = __fmaf_rn(weight_4_1, pre[42], acc[2]);
-                acc[6] = __fmaf_rn(weight_4_1, pre[46], acc[6]);
-                acc[3] = __fmaf_rn(weight_4_1, pre[43], acc[3]);
-                acc[7] = __fmaf_rn(weight_4_1, pre[47], acc[7]);
+                den += weight_8_9;
+                acc[0] = __fmaf_rn(weight_8_9, pre[40], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_9, pre[44], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_9, pre[41], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_9, pre[45], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_9, pre[42], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_9, pre[46], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_9, pre[43], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_9, pre[47], acc[7]);
                 int _min_56 = ((split_group + 6) < (last) ? (split_group + 6) : (last));
-                float weight_5_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_56);
+                float weight_8_10 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_56);
                 if (last < split_group + 6) {
-                    weight_5_1 = 0.0f;
+                    weight_8_10 = 0.0f;
                 }
-                den += weight_5_1;
-                acc[0] = __fmaf_rn(weight_5_1, pre[48], acc[0]);
-                acc[4] = __fmaf_rn(weight_5_1, pre[52], acc[4]);
-                acc[1] = __fmaf_rn(weight_5_1, pre[49], acc[1]);
-                acc[5] = __fmaf_rn(weight_5_1, pre[53], acc[5]);
-                acc[2] = __fmaf_rn(weight_5_1, pre[50], acc[2]);
-                acc[6] = __fmaf_rn(weight_5_1, pre[54], acc[6]);
-                acc[3] = __fmaf_rn(weight_5_1, pre[51], acc[3]);
-                acc[7] = __fmaf_rn(weight_5_1, pre[55], acc[7]);
+                den += weight_8_10;
+                acc[0] = __fmaf_rn(weight_8_10, pre[48], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_10, pre[52], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_10, pre[49], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_10, pre[53], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_10, pre[50], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_10, pre[54], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_10, pre[51], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_10, pre[55], acc[7]);
                 int _min_57 = ((split_group + 7) < (last) ? (split_group + 7) : (last));
-                float weight_6_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_57);
+                float weight_8_11 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_57);
                 if (last < split_group + 7) {
-                    weight_6_1 = 0.0f;
+                    weight_8_11 = 0.0f;
                 }
-                den += weight_6_1;
-                acc[0] = __fmaf_rn(weight_6_1, pre[56], acc[0]);
-                acc[4] = __fmaf_rn(weight_6_1, pre[60], acc[4]);
-                acc[1] = __fmaf_rn(weight_6_1, pre[57], acc[1]);
-                acc[5] = __fmaf_rn(weight_6_1, pre[61], acc[5]);
-                acc[2] = __fmaf_rn(weight_6_1, pre[58], acc[2]);
-                acc[6] = __fmaf_rn(weight_6_1, pre[62], acc[6]);
-                acc[3] = __fmaf_rn(weight_6_1, pre[59], acc[3]);
-                acc[7] = __fmaf_rn(weight_6_1, pre[63], acc[7]);
+                den += weight_8_11;
+                acc[0] = __fmaf_rn(weight_8_11, pre[56], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_11, pre[60], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_11, pre[57], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_11, pre[61], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_11, pre[58], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_11, pre[62], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_11, pre[59], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_11, pre[63], acc[7]);
                 int _min_58 = ((split_group + 8) < (last) ? (split_group + 8) : (last));
-                float weight_7_1 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_58);
+                float weight_8_12 = __shfl_sync(0xFFFFFFFF, weight_lane, _min_58);
                 if (last < split_group + 8) {
-                    weight_7_1 = 0.0f;
+                    weight_8_12 = 0.0f;
                 }
-                den += weight_7_1;
-                acc[0] = __fmaf_rn(weight_7_1, pre[64], acc[0]);
-                acc[4] = __fmaf_rn(weight_7_1, pre[68], acc[4]);
-                acc[1] = __fmaf_rn(weight_7_1, pre[65], acc[1]);
-                acc[5] = __fmaf_rn(weight_7_1, pre[69], acc[5]);
-                acc[2] = __fmaf_rn(weight_7_1, pre[66], acc[2]);
-                acc[6] = __fmaf_rn(weight_7_1, pre[70], acc[6]);
-                acc[3] = __fmaf_rn(weight_7_1, pre[67], acc[3]);
-                acc[7] = __fmaf_rn(weight_7_1, pre[71], acc[7]);
+                den += weight_8_12;
+                acc[0] = __fmaf_rn(weight_8_12, pre[64], acc[0]);
+                acc[4] = __fmaf_rn(weight_8_12, pre[68], acc[4]);
+                acc[1] = __fmaf_rn(weight_8_12, pre[65], acc[1]);
+                acc[5] = __fmaf_rn(weight_8_12, pre[69], acc[5]);
+                acc[2] = __fmaf_rn(weight_8_12, pre[66], acc[2]);
+                acc[6] = __fmaf_rn(weight_8_12, pre[70], acc[6]);
+                acc[3] = __fmaf_rn(weight_8_12, pre[67], acc[3]);
+                acc[7] = __fmaf_rn(weight_8_12, pre[71], acc[7]);
 #else
-                den += weight_6;
-                acc[0] = __fmaf_rn(weight_6, pre[24], acc[0]);
-                acc[4] = __fmaf_rn(weight_6, pre[28], acc[4]);
-                acc[1] = __fmaf_rn(weight_6, pre[25], acc[1]);
-                acc[5] = __fmaf_rn(weight_6, pre[29], acc[5]);
-                acc[2] = __fmaf_rn(weight_6, pre[26], acc[2]);
-                acc[6] = __fmaf_rn(weight_6, pre[30], acc[6]);
-                acc[3] = __fmaf_rn(weight_6, pre[27], acc[3]);
-                acc[7] = __fmaf_rn(weight_6, pre[31], acc[7]);
+                den += weight_7_7;
+                acc[0] = __fmaf_rn(weight_7_7, pre[24], acc[0]);
+                acc[4] = __fmaf_rn(weight_7_7, pre[28], acc[4]);
+                acc[1] = __fmaf_rn(weight_7_7, pre[25], acc[1]);
+                acc[5] = __fmaf_rn(weight_7_7, pre[29], acc[5]);
+                acc[2] = __fmaf_rn(weight_7_7, pre[26], acc[2]);
+                acc[6] = __fmaf_rn(weight_7_7, pre[30], acc[6]);
+                acc[3] = __fmaf_rn(weight_7_7, pre[27], acc[3]);
+                acc[7] = __fmaf_rn(weight_7_7, pre[31], acc[7]);
 #endif
             }
         }
@@ -1215,15 +1215,15 @@ kernel_cake_qsa_nvfp4_aa2349948b0a711974f9(float* __restrict__ partial_out, floa
         __syncthreads();
         if (warp_1 == 0) {
             float other[8];
-            int other_base = lane_1 * 8 * 4;
+            int other_base_1_0 = lane_1 * 8 * 4;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&other[0])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 3]))
-                : "r"(warp_acc_addr + (unsigned int)other_base));
+                : "r"(warp_acc_addr + (unsigned int)other_base_1_0));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&other[4])), "=r"(*reinterpret_cast<uint32_t*>(&other[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&other[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&other[(4) + 3]))
-                : "r"(warp_acc_addr + (unsigned int)(other_base + 16)));
-            float other_den = warp_den[1];
-            den += other_den;
+                : "r"(warp_acc_addr + (unsigned int)(other_base_1_0 + 16)));
+            float other_den_2_0 = warp_den[1];
+            den += other_den_2_0;
             acc[0] = acc[0] + other[0];
             acc[4] = acc[4] + other[4];
             acc[1] = acc[1] + other[1];
@@ -1232,15 +1232,15 @@ kernel_cake_qsa_nvfp4_aa2349948b0a711974f9(float* __restrict__ partial_out, floa
             acc[6] = acc[6] + other[6];
             acc[3] = acc[3] + other[3];
             acc[7] = acc[7] + other[7];
-            int other_base_0 = (256 + lane_1 * 8) * 4;
+            int other_base_1_1 = (256 + lane_1 * 8) * 4;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&other[0])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 3]))
-                : "r"(warp_acc_addr + (unsigned int)other_base_0));
+                : "r"(warp_acc_addr + (unsigned int)other_base_1_1));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&other[4])), "=r"(*reinterpret_cast<uint32_t*>(&other[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&other[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&other[(4) + 3]))
-                : "r"(warp_acc_addr + (unsigned int)(other_base_0 + 16)));
-            float other_den_1 = warp_den[2];
-            den += other_den_1;
+                : "r"(warp_acc_addr + (unsigned int)(other_base_1_1 + 16)));
+            float other_den_2_1 = warp_den[2];
+            den += other_den_2_1;
             acc[0] = acc[0] + other[0];
             acc[4] = acc[4] + other[4];
             acc[1] = acc[1] + other[1];
@@ -1249,15 +1249,15 @@ kernel_cake_qsa_nvfp4_aa2349948b0a711974f9(float* __restrict__ partial_out, floa
             acc[6] = acc[6] + other[6];
             acc[3] = acc[3] + other[3];
             acc[7] = acc[7] + other[7];
-            int other_base_2 = (512 + lane_1 * 8) * 4;
+            int other_base_1_2 = (512 + lane_1 * 8) * 4;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&other[0])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 3]))
-                : "r"(warp_acc_addr + (unsigned int)other_base_2));
+                : "r"(warp_acc_addr + (unsigned int)other_base_1_2));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&other[4])), "=r"(*reinterpret_cast<uint32_t*>(&other[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&other[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&other[(4) + 3]))
-                : "r"(warp_acc_addr + (unsigned int)(other_base_2 + 16)));
-            float other_den_3 = warp_den[3];
-            den += other_den_3;
+                : "r"(warp_acc_addr + (unsigned int)(other_base_1_2 + 16)));
+            float other_den_2_2 = warp_den[3];
+            den += other_den_2_2;
             acc[0] = acc[0] + other[0];
             acc[4] = acc[4] + other[4];
             acc[1] = acc[1] + other[1];
@@ -1277,85 +1277,85 @@ kernel_cake_qsa_nvfp4_aa2349948b0a711974f9(float* __restrict__ partial_out, floa
 #endif
             }
             float result[8];
-            float attn_lo = (float)(__nv_bfloat16)(acc[0] * inv);
+            float attn_lo_1_0 = (float)(__nv_bfloat16)(acc[0] * inv);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_61 = approx_exp2((-gate_vals[0]) * 1.442695f);
             float _rcp_60 = approx_rcp(1.0f + _exp2_61);
-            result[0] = attn_lo * _rcp_60;
+            result[0] = attn_lo_1_0 * _rcp_60;
 #else
             float _exp2_28 = approx_exp2((-gate_vals[0]) * 1.442695f);
             float _rcp_27 = approx_rcp(1.0f + _exp2_28);
-            result[0] = attn_lo * _rcp_27;
+            result[0] = attn_lo_1_0 * _rcp_27;
 #endif
-            float attn_hi = (float)(__nv_bfloat16)(acc[4] * inv);
+            float attn_hi_1_0 = (float)(__nv_bfloat16)(acc[4] * inv);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_63 = approx_exp2((-gate_vals[4]) * 1.442695f);
             float _rcp_62 = approx_rcp(1.0f + _exp2_63);
-            result[4] = attn_hi * _rcp_62;
+            result[4] = attn_hi_1_0 * _rcp_62;
 #else
             float _exp2_30 = approx_exp2((-gate_vals[4]) * 1.442695f);
             float _rcp_29 = approx_rcp(1.0f + _exp2_30);
-            result[4] = attn_hi * _rcp_29;
+            result[4] = attn_hi_1_0 * _rcp_29;
 #endif
-            float attn_lo_4 = (float)(__nv_bfloat16)(acc[1] * inv);
+            float attn_lo_1_1 = (float)(__nv_bfloat16)(acc[1] * inv);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_65 = approx_exp2((-gate_vals[1]) * 1.442695f);
             float _rcp_64 = approx_rcp(1.0f + _exp2_65);
-            result[1] = attn_lo_4 * _rcp_64;
+            result[1] = attn_lo_1_1 * _rcp_64;
 #else
             float _exp2_32 = approx_exp2((-gate_vals[1]) * 1.442695f);
             float _rcp_31 = approx_rcp(1.0f + _exp2_32);
-            result[1] = attn_lo_4 * _rcp_31;
+            result[1] = attn_lo_1_1 * _rcp_31;
 #endif
-            float attn_hi_5 = (float)(__nv_bfloat16)(acc[5] * inv);
+            float attn_hi_1_1 = (float)(__nv_bfloat16)(acc[5] * inv);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_67 = approx_exp2((-gate_vals[5]) * 1.442695f);
             float _rcp_66 = approx_rcp(1.0f + _exp2_67);
-            result[5] = attn_hi_5 * _rcp_66;
+            result[5] = attn_hi_1_1 * _rcp_66;
 #else
             float _exp2_34 = approx_exp2((-gate_vals[5]) * 1.442695f);
             float _rcp_33 = approx_rcp(1.0f + _exp2_34);
-            result[5] = attn_hi_5 * _rcp_33;
+            result[5] = attn_hi_1_1 * _rcp_33;
 #endif
-            float attn_lo_6 = (float)(__nv_bfloat16)(acc[2] * inv);
+            float attn_lo_1_2 = (float)(__nv_bfloat16)(acc[2] * inv);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_69 = approx_exp2((-gate_vals[2]) * 1.442695f);
             float _rcp_68 = approx_rcp(1.0f + _exp2_69);
-            result[2] = attn_lo_6 * _rcp_68;
+            result[2] = attn_lo_1_2 * _rcp_68;
 #else
             float _exp2_36 = approx_exp2((-gate_vals[2]) * 1.442695f);
             float _rcp_35 = approx_rcp(1.0f + _exp2_36);
-            result[2] = attn_lo_6 * _rcp_35;
+            result[2] = attn_lo_1_2 * _rcp_35;
 #endif
-            float attn_hi_7 = (float)(__nv_bfloat16)(acc[6] * inv);
+            float attn_hi_1_2 = (float)(__nv_bfloat16)(acc[6] * inv);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_71 = approx_exp2((-gate_vals[6]) * 1.442695f);
             float _rcp_70 = approx_rcp(1.0f + _exp2_71);
-            result[6] = attn_hi_7 * _rcp_70;
+            result[6] = attn_hi_1_2 * _rcp_70;
 #else
             float _exp2_38 = approx_exp2((-gate_vals[6]) * 1.442695f);
             float _rcp_37 = approx_rcp(1.0f + _exp2_38);
-            result[6] = attn_hi_7 * _rcp_37;
+            result[6] = attn_hi_1_2 * _rcp_37;
 #endif
-            float attn_lo_8 = (float)(__nv_bfloat16)(acc[3] * inv);
+            float attn_lo_1_3 = (float)(__nv_bfloat16)(acc[3] * inv);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_73 = approx_exp2((-gate_vals[3]) * 1.442695f);
             float _rcp_72 = approx_rcp(1.0f + _exp2_73);
-            result[3] = attn_lo_8 * _rcp_72;
+            result[3] = attn_lo_1_3 * _rcp_72;
 #else
             float _exp2_40 = approx_exp2((-gate_vals[3]) * 1.442695f);
             float _rcp_39 = approx_rcp(1.0f + _exp2_40);
-            result[3] = attn_lo_8 * _rcp_39;
+            result[3] = attn_lo_1_3 * _rcp_39;
 #endif
-            float attn_hi_9 = (float)(__nv_bfloat16)(acc[7] * inv);
+            float attn_hi_1_3 = (float)(__nv_bfloat16)(acc[7] * inv);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_75 = approx_exp2((-gate_vals[7]) * 1.442695f);
             float _rcp_74 = approx_rcp(1.0f + _exp2_75);
-            result[7] = attn_hi_9 * _rcp_74;
+            result[7] = attn_hi_1_3 * _rcp_74;
 #else
             float _exp2_42 = approx_exp2((-gate_vals[7]) * 1.442695f);
             float _rcp_41 = approx_rcp(1.0f + _exp2_42);
-            result[7] = attn_hi_9 * _rcp_41;
+            result[7] = attn_hi_1_3 * _rcp_41;
 #endif
             unsigned int words[4];
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
@@ -1553,80 +1553,80 @@ kernel_cake_qsa_nvfp4_aa2349948b0a711974f9(float* __restrict__ partial_out, floa
                 float weight_b = approx_exp2(lse_b - lse_max_b);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
                 int _min_90 = ((0) < (last_b) ? (0) : (last_b));
-                float w_b = __shfl_sync(0xFFFFFFFF, weight_b, _min_90);
+                float w_b_3_0 = __shfl_sync(0xFFFFFFFF, weight_b, _min_90);
 #else
                 int _min_57 = ((0) < (last_b) ? (0) : (last_b));
-                float w_b = __shfl_sync(0xFFFFFFFF, weight_b, _min_57);
+                float w_b_3_0 = __shfl_sync(0xFFFFFFFF, weight_b, _min_57);
 #endif
                 if (last_b < 0) {
-                    w_b = 0.0f;
+                    w_b_3_0 = 0.0f;
                 }
-                den_b += w_b;
-                acc_b[0] = __fmaf_rn(w_b, pre_b[0], acc_b[0]);
-                acc_b[4] = __fmaf_rn(w_b, pre_b[4], acc_b[4]);
-                acc_b[1] = __fmaf_rn(w_b, pre_b[1], acc_b[1]);
-                acc_b[5] = __fmaf_rn(w_b, pre_b[5], acc_b[5]);
-                acc_b[2] = __fmaf_rn(w_b, pre_b[2], acc_b[2]);
-                acc_b[6] = __fmaf_rn(w_b, pre_b[6], acc_b[6]);
-                acc_b[3] = __fmaf_rn(w_b, pre_b[3], acc_b[3]);
-                acc_b[7] = __fmaf_rn(w_b, pre_b[7], acc_b[7]);
+                den_b += w_b_3_0;
+                acc_b[0] = __fmaf_rn(w_b_3_0, pre_b[0], acc_b[0]);
+                acc_b[4] = __fmaf_rn(w_b_3_0, pre_b[4], acc_b[4]);
+                acc_b[1] = __fmaf_rn(w_b_3_0, pre_b[1], acc_b[1]);
+                acc_b[5] = __fmaf_rn(w_b_3_0, pre_b[5], acc_b[5]);
+                acc_b[2] = __fmaf_rn(w_b_3_0, pre_b[2], acc_b[2]);
+                acc_b[6] = __fmaf_rn(w_b_3_0, pre_b[6], acc_b[6]);
+                acc_b[3] = __fmaf_rn(w_b_3_0, pre_b[3], acc_b[3]);
+                acc_b[7] = __fmaf_rn(w_b_3_0, pre_b[7], acc_b[7]);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
                 int _min_91 = ((1) < (last_b) ? (1) : (last_b));
-                float w_b_0 = __shfl_sync(0xFFFFFFFF, weight_b, _min_91);
+                float w_b_3_1 = __shfl_sync(0xFFFFFFFF, weight_b, _min_91);
 #else
                 int _min_58 = ((1) < (last_b) ? (1) : (last_b));
-                float w_b_0 = __shfl_sync(0xFFFFFFFF, weight_b, _min_58);
+                float w_b_3_1 = __shfl_sync(0xFFFFFFFF, weight_b, _min_58);
 #endif
                 if (last_b < 1) {
-                    w_b_0 = 0.0f;
+                    w_b_3_1 = 0.0f;
                 }
-                den_b += w_b_0;
-                acc_b[0] = __fmaf_rn(w_b_0, pre_b[8], acc_b[0]);
-                acc_b[4] = __fmaf_rn(w_b_0, pre_b[12], acc_b[4]);
-                acc_b[1] = __fmaf_rn(w_b_0, pre_b[9], acc_b[1]);
-                acc_b[5] = __fmaf_rn(w_b_0, pre_b[13], acc_b[5]);
-                acc_b[2] = __fmaf_rn(w_b_0, pre_b[10], acc_b[2]);
-                acc_b[6] = __fmaf_rn(w_b_0, pre_b[14], acc_b[6]);
-                acc_b[3] = __fmaf_rn(w_b_0, pre_b[11], acc_b[3]);
-                acc_b[7] = __fmaf_rn(w_b_0, pre_b[15], acc_b[7]);
+                den_b += w_b_3_1;
+                acc_b[0] = __fmaf_rn(w_b_3_1, pre_b[8], acc_b[0]);
+                acc_b[4] = __fmaf_rn(w_b_3_1, pre_b[12], acc_b[4]);
+                acc_b[1] = __fmaf_rn(w_b_3_1, pre_b[9], acc_b[1]);
+                acc_b[5] = __fmaf_rn(w_b_3_1, pre_b[13], acc_b[5]);
+                acc_b[2] = __fmaf_rn(w_b_3_1, pre_b[10], acc_b[2]);
+                acc_b[6] = __fmaf_rn(w_b_3_1, pre_b[14], acc_b[6]);
+                acc_b[3] = __fmaf_rn(w_b_3_1, pre_b[11], acc_b[3]);
+                acc_b[7] = __fmaf_rn(w_b_3_1, pre_b[15], acc_b[7]);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
                 int _min_92 = ((2) < (last_b) ? (2) : (last_b));
-                float w_b_1 = __shfl_sync(0xFFFFFFFF, weight_b, _min_92);
+                float w_b_3_2 = __shfl_sync(0xFFFFFFFF, weight_b, _min_92);
 #else
                 int _min_59 = ((2) < (last_b) ? (2) : (last_b));
-                float w_b_1 = __shfl_sync(0xFFFFFFFF, weight_b, _min_59);
+                float w_b_3_2 = __shfl_sync(0xFFFFFFFF, weight_b, _min_59);
 #endif
                 if (last_b < 2) {
-                    w_b_1 = 0.0f;
+                    w_b_3_2 = 0.0f;
                 }
-                den_b += w_b_1;
-                acc_b[0] = __fmaf_rn(w_b_1, pre_b[16], acc_b[0]);
-                acc_b[4] = __fmaf_rn(w_b_1, pre_b[20], acc_b[4]);
-                acc_b[1] = __fmaf_rn(w_b_1, pre_b[17], acc_b[1]);
-                acc_b[5] = __fmaf_rn(w_b_1, pre_b[21], acc_b[5]);
-                acc_b[2] = __fmaf_rn(w_b_1, pre_b[18], acc_b[2]);
-                acc_b[6] = __fmaf_rn(w_b_1, pre_b[22], acc_b[6]);
-                acc_b[3] = __fmaf_rn(w_b_1, pre_b[19], acc_b[3]);
-                acc_b[7] = __fmaf_rn(w_b_1, pre_b[23], acc_b[7]);
+                den_b += w_b_3_2;
+                acc_b[0] = __fmaf_rn(w_b_3_2, pre_b[16], acc_b[0]);
+                acc_b[4] = __fmaf_rn(w_b_3_2, pre_b[20], acc_b[4]);
+                acc_b[1] = __fmaf_rn(w_b_3_2, pre_b[17], acc_b[1]);
+                acc_b[5] = __fmaf_rn(w_b_3_2, pre_b[21], acc_b[5]);
+                acc_b[2] = __fmaf_rn(w_b_3_2, pre_b[18], acc_b[2]);
+                acc_b[6] = __fmaf_rn(w_b_3_2, pre_b[22], acc_b[6]);
+                acc_b[3] = __fmaf_rn(w_b_3_2, pre_b[19], acc_b[3]);
+                acc_b[7] = __fmaf_rn(w_b_3_2, pre_b[23], acc_b[7]);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
                 int _min_93 = ((3) < (last_b) ? (3) : (last_b));
-                float w_b_2 = __shfl_sync(0xFFFFFFFF, weight_b, _min_93);
+                float w_b_3_3 = __shfl_sync(0xFFFFFFFF, weight_b, _min_93);
 #else
                 int _min_60 = ((3) < (last_b) ? (3) : (last_b));
-                float w_b_2 = __shfl_sync(0xFFFFFFFF, weight_b, _min_60);
+                float w_b_3_3 = __shfl_sync(0xFFFFFFFF, weight_b, _min_60);
 #endif
                 if (last_b < 3) {
-                    w_b_2 = 0.0f;
+                    w_b_3_3 = 0.0f;
                 }
-                den_b += w_b_2;
-                acc_b[0] = __fmaf_rn(w_b_2, pre_b[24], acc_b[0]);
-                acc_b[4] = __fmaf_rn(w_b_2, pre_b[28], acc_b[4]);
-                acc_b[1] = __fmaf_rn(w_b_2, pre_b[25], acc_b[1]);
-                acc_b[5] = __fmaf_rn(w_b_2, pre_b[29], acc_b[5]);
-                acc_b[2] = __fmaf_rn(w_b_2, pre_b[26], acc_b[2]);
-                acc_b[6] = __fmaf_rn(w_b_2, pre_b[30], acc_b[6]);
-                acc_b[3] = __fmaf_rn(w_b_2, pre_b[27], acc_b[3]);
-                acc_b[7] = __fmaf_rn(w_b_2, pre_b[31], acc_b[7]);
+                den_b += w_b_3_3;
+                acc_b[0] = __fmaf_rn(w_b_3_3, pre_b[24], acc_b[0]);
+                acc_b[4] = __fmaf_rn(w_b_3_3, pre_b[28], acc_b[4]);
+                acc_b[1] = __fmaf_rn(w_b_3_3, pre_b[25], acc_b[1]);
+                acc_b[5] = __fmaf_rn(w_b_3_3, pre_b[29], acc_b[5]);
+                acc_b[2] = __fmaf_rn(w_b_3_3, pre_b[26], acc_b[2]);
+                acc_b[6] = __fmaf_rn(w_b_3_3, pre_b[30], acc_b[6]);
+                acc_b[3] = __fmaf_rn(w_b_3_3, pre_b[27], acc_b[3]);
+                acc_b[7] = __fmaf_rn(w_b_3_3, pre_b[31], acc_b[7]);
             }
             float inv_b = 0.0f;
             if (den_b > 0.0f) {
@@ -1639,85 +1639,85 @@ kernel_cake_qsa_nvfp4_aa2349948b0a711974f9(float* __restrict__ partial_out, floa
 #endif
             }
             float result_b[8];
-            float attn_lo_b = (float)(__nv_bfloat16)(acc_b[0] * inv_b);
+            float attn_lo_b_1_0 = (float)(__nv_bfloat16)(acc_b[0] * inv_b);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_96 = approx_exp2((-gate_b[0]) * 1.442695f);
             float _rcp_95 = approx_rcp(1.0f + _exp2_96);
-            result_b[0] = attn_lo_b * _rcp_95;
+            result_b[0] = attn_lo_b_1_0 * _rcp_95;
 #else
             float _exp2_63 = approx_exp2((-gate_b[0]) * 1.442695f);
             float _rcp_62 = approx_rcp(1.0f + _exp2_63);
-            result_b[0] = attn_lo_b * _rcp_62;
+            result_b[0] = attn_lo_b_1_0 * _rcp_62;
 #endif
-            float attn_hi_b = (float)(__nv_bfloat16)(acc_b[4] * inv_b);
+            float attn_hi_b_2_0 = (float)(__nv_bfloat16)(acc_b[4] * inv_b);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_98 = approx_exp2((-gate_b[4]) * 1.442695f);
             float _rcp_97 = approx_rcp(1.0f + _exp2_98);
-            result_b[4] = attn_hi_b * _rcp_97;
+            result_b[4] = attn_hi_b_2_0 * _rcp_97;
 #else
             float _exp2_65 = approx_exp2((-gate_b[4]) * 1.442695f);
             float _rcp_64 = approx_rcp(1.0f + _exp2_65);
-            result_b[4] = attn_hi_b * _rcp_64;
+            result_b[4] = attn_hi_b_2_0 * _rcp_64;
 #endif
-            float attn_lo_b_0 = (float)(__nv_bfloat16)(acc_b[1] * inv_b);
+            float attn_lo_b_1_1 = (float)(__nv_bfloat16)(acc_b[1] * inv_b);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_100 = approx_exp2((-gate_b[1]) * 1.442695f);
             float _rcp_99 = approx_rcp(1.0f + _exp2_100);
-            result_b[1] = attn_lo_b_0 * _rcp_99;
+            result_b[1] = attn_lo_b_1_1 * _rcp_99;
 #else
             float _exp2_67 = approx_exp2((-gate_b[1]) * 1.442695f);
             float _rcp_66 = approx_rcp(1.0f + _exp2_67);
-            result_b[1] = attn_lo_b_0 * _rcp_66;
+            result_b[1] = attn_lo_b_1_1 * _rcp_66;
 #endif
-            float attn_hi_b_1 = (float)(__nv_bfloat16)(acc_b[5] * inv_b);
+            float attn_hi_b_2_1 = (float)(__nv_bfloat16)(acc_b[5] * inv_b);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_102 = approx_exp2((-gate_b[5]) * 1.442695f);
             float _rcp_101 = approx_rcp(1.0f + _exp2_102);
-            result_b[5] = attn_hi_b_1 * _rcp_101;
+            result_b[5] = attn_hi_b_2_1 * _rcp_101;
 #else
             float _exp2_69 = approx_exp2((-gate_b[5]) * 1.442695f);
             float _rcp_68 = approx_rcp(1.0f + _exp2_69);
-            result_b[5] = attn_hi_b_1 * _rcp_68;
+            result_b[5] = attn_hi_b_2_1 * _rcp_68;
 #endif
-            float attn_lo_b_2 = (float)(__nv_bfloat16)(acc_b[2] * inv_b);
+            float attn_lo_b_1_2 = (float)(__nv_bfloat16)(acc_b[2] * inv_b);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_104 = approx_exp2((-gate_b[2]) * 1.442695f);
             float _rcp_103 = approx_rcp(1.0f + _exp2_104);
-            result_b[2] = attn_lo_b_2 * _rcp_103;
+            result_b[2] = attn_lo_b_1_2 * _rcp_103;
 #else
             float _exp2_71 = approx_exp2((-gate_b[2]) * 1.442695f);
             float _rcp_70 = approx_rcp(1.0f + _exp2_71);
-            result_b[2] = attn_lo_b_2 * _rcp_70;
+            result_b[2] = attn_lo_b_1_2 * _rcp_70;
 #endif
-            float attn_hi_b_3 = (float)(__nv_bfloat16)(acc_b[6] * inv_b);
+            float attn_hi_b_2_2 = (float)(__nv_bfloat16)(acc_b[6] * inv_b);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_106 = approx_exp2((-gate_b[6]) * 1.442695f);
             float _rcp_105 = approx_rcp(1.0f + _exp2_106);
-            result_b[6] = attn_hi_b_3 * _rcp_105;
+            result_b[6] = attn_hi_b_2_2 * _rcp_105;
 #else
             float _exp2_73 = approx_exp2((-gate_b[6]) * 1.442695f);
             float _rcp_72 = approx_rcp(1.0f + _exp2_73);
-            result_b[6] = attn_hi_b_3 * _rcp_72;
+            result_b[6] = attn_hi_b_2_2 * _rcp_72;
 #endif
-            float attn_lo_b_4 = (float)(__nv_bfloat16)(acc_b[3] * inv_b);
+            float attn_lo_b_1_3 = (float)(__nv_bfloat16)(acc_b[3] * inv_b);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_108 = approx_exp2((-gate_b[3]) * 1.442695f);
             float _rcp_107 = approx_rcp(1.0f + _exp2_108);
-            result_b[3] = attn_lo_b_4 * _rcp_107;
+            result_b[3] = attn_lo_b_1_3 * _rcp_107;
 #else
             float _exp2_75 = approx_exp2((-gate_b[3]) * 1.442695f);
             float _rcp_74 = approx_rcp(1.0f + _exp2_75);
-            result_b[3] = attn_lo_b_4 * _rcp_74;
+            result_b[3] = attn_lo_b_1_3 * _rcp_74;
 #endif
-            float attn_hi_b_5 = (float)(__nv_bfloat16)(acc_b[7] * inv_b);
+            float attn_hi_b_2_3 = (float)(__nv_bfloat16)(acc_b[7] * inv_b);
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070
             float _exp2_110 = approx_exp2((-gate_b[7]) * 1.442695f);
             float _rcp_109 = approx_rcp(1.0f + _exp2_110);
-            result_b[7] = attn_hi_b_5 * _rcp_109;
+            result_b[7] = attn_hi_b_2_3 * _rcp_109;
 #else
             float _exp2_77 = approx_exp2((-gate_b[7]) * 1.442695f);
             float _rcp_76 = approx_rcp(1.0f + _exp2_77);
-            result_b[7] = attn_hi_b_5 * _rcp_76;
+            result_b[7] = attn_hi_b_2_3 * _rcp_76;
 #endif
             unsigned int words_b[4];
 #if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070

@@ -87,9 +87,9 @@ When a FlashInfer operation executes, the autotuner resolves the best
    environment variable is set and tuning mode is off).
 5. **Fallback tactic (−1)** — a safe default that every runner must implement.
 
-Notably, user-loaded file configs (level 2) are
-**always consulted, even during tuning mode**, so that already-tuned shapes
-from a cache file are never re-profiled.
+User-loaded file configs (level 2) are also consulted during tuning. A
+multi-runner tune can re-profile a loaded winner whose recorded coverage omits
+a current candidate. See `Cache Hit Behavior During Tuning`_.
 
 Config Caching
 --------------
@@ -170,14 +170,25 @@ sizes or sequence lengths -- and accumulate all configs in a single file:
 Cache Hit Behavior During Tuning
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-When ``autotune(True, cache=path)`` is active and a matching config is found in
-the cache file, the autotuner uses it directly **without re-profiling**.  This
-means:
+During tuning, ``AutoTuner.choose_one()`` can reuse the first eligible cached
+winner for multiple runners if its record covers every candidate and the
+measurement policy matches. Reordering or reducing candidates can reuse that
+winner. If an earlier cached result would shadow it during inference, the
+tuner profiles the candidates again and replaces the old selection.
 
-- Shapes that were already tuned are skipped, saving time.
-- Only truly new shapes trigger profiling.
-- A log message is printed once per ``(operation, runner)`` pair when a cache
-  hit is detected.
+A comparison that leaves a runner unmeasured because of a retryable failure
+can serve the current call with the best available measurement and allows a
+subsequent tune to retry. In single-process tuning it also preserves the
+previous cached result.
+
+Both JSON and managed v2 caches record this coverage on new multi-runner
+results. Existing files remain usable for inference
+and single-runner tuning, subject to the usual environment, policy, and
+tactic checks. If a multi-runner tune encounters an older entry with no
+coverage information, it profiles the eligible runners and saves the
+result with coverage. The SM107 MXFP8 low-M CuTe-DSL runner uses a distinct
+entry from the regular CuTe-DSL runner, so its first tune can miss an older
+entry.
 
 Caching in the Benchmark Harness
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -209,7 +220,8 @@ Cache File Format
 
 The cache file is a plain JSON dictionary. Each tuning-entry key is a string representation
 of ``(custom_op, runner_class_name, optimization_profile)``; its value starts with
-``[runner_class_name, tactic]`` and may include a measurement policy. The reserved
+``[runner_class_name, tactic]`` and may include a measurement policy, followed by a
+record of how the tactic was chosen (see `Auditing Tuned Configs`_). The reserved
 ``_metadata``, ``_records``, and ``_generation`` keys contain cache bookkeeping:
 
 .. code-block:: json
@@ -272,6 +284,67 @@ JSON arrays and restored to tuples on load.
 The file is human-readable but not portable. Config ordering is not guaranteed to be
 stable across FlashInfer, CUDA, cuDNN, or cuBLAS versions.
 
+Auditing Tuned Configs
+^^^^^^^^^^^^^^^^^^^^^^
+
+A cache file preserves the tactic chosen by the process that tunes an entry.
+Later tuning can measure again when the measurement policy differs or the
+recorded comparison lacks coverage for a current runner.
+Tuning again into a fresh file is a new measurement, not a check; when several
+tactics measure within timing noise of each other, separate runs can pick
+different ones.
+
+So that a file can be audited, each tuned entry ends with a record of how its
+tactic was chosen, as in this ``trtllm_bf16_moe`` entry tuned on a GB300:
+
+.. code-block:: json
+
+    {
+      "('flashinfer::trtllm_bf16_moe', 'MoERunner', ((16, 7168), (16, 256), ...), ...)": [
+        "MoERunner",
+        [8, 17],
+        ["cuda_graph_profile_replays", 1, "l2_cache_policy", "cold"],
+        {"time_ms": 1.25184, "runner_up_ms": 1.252848, "margin": 0.000805, "candidates": 352}
+      ]
+    }
+
+``time_ms`` is the winner's measured time, ``runner_up_ms`` the fastest other
+candidate's, and ``candidates`` the number of tactics that measured successfully.
+``margin`` is ``runner_up_ms / time_ms - 1``; one within the run-to-run noise of the
+measurement, like the 0.08% above, marks a near-tie that another tuning run may
+resolve differently. ``runner_up_ms`` and ``margin`` are ``null`` when only one
+tactic measured. These timing fields are for auditing. Multi-runner tuning
+checks the optional ``candidate_keys`` field, which records the compared
+runners. Entries without that field can still serve inference and compatible
+single-runner tuning.
+
+To make near-tied picks more consistent across processes, set a tie tolerance:
+``autotune(True, tie_tolerance=0.005)`` treats tactics measured within 0.5% of the
+fastest as tied with it. Those that the runners enumerate before the fastest (at
+most four) are re-timed against it in that order, over two alternating rounds, and
+the first whose mean stays within the tolerance is kept; otherwise the fastest is.
+Their order in one measurement changes from process to process, but their
+enumeration order does not. Re-timing is itself a measurement, so separate
+processes can still keep different tactics; the ranks of a group passed to
+``set_autotune_process_group`` see the same reduced times and always agree. The
+kept tactic can measure up to the tolerance slower; the record keeps the first
+measurement's times, not the re-timed means, so ``runner_up_ms`` is then below
+``time_ms`` and ``margin`` negative. Tuning takes a few extra measurements per
+shape. The default, ``0``, keeps the fastest. The tolerance is not part of the
+cache identity, and ``AutoTuner.rank_tactics`` with ``k > 1`` and custom tuning
+protocols ignore it.
+
+The sample budget is ``AutoTuner.get().repeat``, the number of timed runs of each
+tactic (default 10; some operations set their own through
+``TuningConfig.profiling_repeat``). A larger budget makes each measurement less
+noisy but does not make near-ties reproducible. It is not part of the cache
+identity either, so set it before tuning into a fresh file.
+
+To keep compilation out of tuning, run the workload once with autotuning off
+before entering ``autotune(True)``, so that each operation's modules are compiled
+and loaded first (each tactic's own kernels still load in its untimed warmup
+runs). This shortens tuning but does not make near-ties reproducible.
+
 API Reference
 -------------
 
@@ -300,7 +373,11 @@ Context manager for autotuning with optional file-based caching.
    * - ``cache``
      - ``str | None``
      - Optional path to a JSON config file.
-       On entry, configs are loaded from this file if it exists.
+       On entry, configs are loaded from this file if it exists and added
+       to those already loaded in this process (for a key present in several
+       files, the file loaded last wins; entries for the same workload under
+       different runner classes are distinct keys, so between them the
+       caller's runner order decides, as with ``load_configs()``).
        On exit, configs are saved back to this file when ``tune_mode=True``.
 
 **Behavior matrix:**
@@ -472,6 +549,31 @@ skip state changes, or when caches are cleared or reloaded. Use it to invalidate
 prepared selections. Protocol records are separate from v1 JSON import/export.
 Existing ``autotune()`` controls can be nested as specified by v2; they do not
 import or export protocol records.
+
+Cake Backends as Autotuning Candidates
+--------------------------------------
+
+Some GEMM APIs append their Cake backend as the **last** runner of the
+``backend="auto"`` candidate list: ``bmm_bf16``, ``mm_nvfp4_svdquant`` (SM100/SM103)
+and the per-token-alpha path of ``mm_fp4``. The Cake runner is offered only for
+inputs it serves. Being last, it never changes the untuned default or a cache-miss
+fallback (``runners[0]``, tactic ``-1``); under ``flashinfer.autotune()`` it is
+measured with the other runners and is used only when it is the fastest.
+Tuning under an autotune process group
+(:func:`flashinfer.autotuner.set_autotune_process_group`) does not measure Cake:
+every rank of the group must list the same runners, and Cake is offered per
+rank-local operands. Outside
+tuning, the Cake runner is listed only while the autotuner can select it: it holds
+a Cake result tuned in this process or loaded from a cache file, or an
+``autotune_v2`` store is active (``AutoTuner.may_select_runner_class``). Untuned
+calls therefore keep the runner list and host cost of the other backends. Explicit
+``backend="cake"`` is unchanged. The per-token ``mm_fp4`` Cake backend is
+experimental and additionally needs ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``.
+To remove all automatic Cake candidates, set:
+
+.. code-block:: bash
+
+    export FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1
 
 cuTile Autotuning
 -----------------

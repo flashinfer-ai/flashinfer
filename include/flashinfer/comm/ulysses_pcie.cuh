@@ -24,7 +24,7 @@
 // Device half of the experimental PCIe Ulysses backend: the epoch barrier
 // kernels and the raw-pointer enqueue helpers.  The host verbs/mlx5 transport
 // that drives them speaks TVM-FFI types and therefore lives with its binding
-// in csrc/ulysses_pcie_transport.cuh, per the include//csrc split in CLAUDE.md.
+// in csrc/ulysses_pcie_transport.cuh, per the include//csrc split in AGENTS.md.
 
 namespace flashinfer {
 namespace comm {

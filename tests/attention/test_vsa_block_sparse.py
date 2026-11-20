@@ -18,6 +18,7 @@ import importlib.util
 import math
 import os
 import statistics
+import sys
 
 import pytest
 import torch
@@ -51,6 +52,21 @@ _requires_sm100_or_sm103 = pytest.mark.skipif(
     reason="vsa_sm100_blk64 requires SM100, SM103 or SM107",
 )
 
+# Only blk128 uses the external quack package. Keep blk64 tests runnable when
+# quack is absent or unsupported, and retain the hardware skip reason first.
+_requires_quack = pytest.mark.skipif(
+    torch.cuda.is_available()
+    and _is_vsa_sm100_or_sm103_supported(torch.device("cuda"))
+    and (sys.platform == "win32" or not _HAS_QUACK),
+    reason=(
+        "quack-kernels is unsupported on native Windows pending "
+        "https://github.com/Dao-AILab/quack/pull/216"
+        if sys.platform == "win32"
+        else "VSA blk128 backend requires the quack package "
+        "(pip install --no-deps quack-kernels==0.6.4)"
+    ),
+)
+
 from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
 
 pytestmark = [
@@ -58,11 +74,6 @@ pytestmark = [
         not torch.cuda.is_available()
         or not _is_vsa_sm100_or_sm103_supported(torch.device("cuda")),
         reason="VSA blk128 backend requires SM100, SM103 or SM107",
-    ),
-    pytest.mark.skipif(
-        not _HAS_QUACK,
-        reason="VSA SM100 backend requires the quack package "
-        "(pip install --no-deps quack-kernels==0.6.4)",
     ),
     pytest.mark.skipif(
         torch.cuda.is_available()
@@ -175,6 +186,7 @@ def _make_wrapper(workspace):
         (torch.float16, 0.75, 4, 8),
     ],
 )
+@_requires_quack
 def test_vsa_accuracy(dtype, density, num_blocks, num_heads, workspace):
     """VSA output must match PyTorch dense reference."""
     device = torch.device("cuda")
@@ -208,6 +220,7 @@ def test_vsa_accuracy(dtype, density, num_blocks, num_heads, workspace):
 
 
 @pytest.mark.parametrize("sm_scale", [0.5])
+@_requires_quack
 def test_vsa_sm_scale(sm_scale, workspace):
     """User-supplied sm_scale must propagate correctly."""
     device = torch.device("cuda")
@@ -242,6 +255,7 @@ def test_vsa_sm_scale(sm_scale, workspace):
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-2)
 
 
+@_requires_quack
 def test_vsa_vs_auto_80k(workspace):
     """Cross-validate VSA backend against auto backend at 80k context (1250 blocks × 64).
 
@@ -300,6 +314,7 @@ def test_vsa_vs_auto_80k(workspace):
 # ---------------------------------------------------------------------------
 
 
+@_requires_quack
 def test_vsa_per_head_mask_correctness(workspace):
     """Per-head block_mask path must match PyTorch dense reference per head."""
     device = torch.device("cuda")
@@ -358,6 +373,7 @@ def test_vsa_per_head_mask_correctness(workspace):
     torch.testing.assert_close(o_ref, o_vsa, atol=1e-2, rtol=1e-2)
 
 
+@_requires_quack
 def test_vsa_per_head_mask_differs_across_heads(workspace):
     """Per-head masks produce different per-head outputs; head-averaged BSR cannot replicate."""
     device = torch.device("cuda")
@@ -523,6 +539,7 @@ _SWEEP_CONFIGS = [
     reason="performance sweep, set FLASHINFER_TEST_PERF=1 to run",
 )
 @pytest.mark.parametrize("seqlen,topk_frac", _SWEEP_CONFIGS)
+@_requires_quack
 def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
     """Accuracy: full fastvideo VSA (compress + select) vs full dense attention.
 
@@ -598,6 +615,7 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
     not os.environ.get("FLASHINFER_TEST_PERF"),
     reason="performance benchmark, set FLASHINFER_TEST_PERF=1 to run",
 )
+@_requires_quack
 def test_vsa_performance_vs_dense(workspace):
     """Performance table: full fastvideo VSA (compress + select) vs dense FlashInfer prefill.
 
@@ -1401,6 +1419,7 @@ def _pytorch_ref_gqa(
         (8, 4, torch.float16),  # GQA 2x, fp16
     ],
 )
+@_requires_quack
 def test_vsa_gqa_native_bsr(num_qo_heads, num_kv_heads, dtype, workspace):
     """Native GQA via BSR path: plan() with num_qo_heads != num_kv_heads.
 
@@ -1445,6 +1464,7 @@ def test_vsa_gqa_native_bsr(num_qo_heads, num_kv_heads, dtype, workspace):
         (8, 2),  # GQA 4x
     ],
 )
+@_requires_quack
 def test_vsa_gqa_native_block_mask(num_qo_heads, num_kv_heads, workspace):
     """Native GQA via per-head block_mask: accepts (num_qo_heads, MB, NB) shape.
 
@@ -1525,6 +1545,7 @@ def test_vsa_gqa_native_block_mask(num_qo_heads, num_kv_heads, workspace):
         (96, 0.25, 16),
     ],
 )
+@_requires_quack
 def test_vsa_head_dim_accuracy(head_dim, density, num_blocks, workspace):
     """VSA blk128 with head_dim=64/96 must match PyTorch dense reference."""
     device = torch.device("cuda")
@@ -1571,6 +1592,7 @@ def test_vsa_head_dim_accuracy(head_dim, density, num_blocks, workspace):
         (2, 16, 4, 0.25),
     ],
 )
+@_requires_quack
 def test_vsa_asymmetric_seqlen(MB, NB, num_heads, density, workspace):
     """VSA blk128 with seqlen_q != seqlen_k must match PyTorch dense reference."""
     device = torch.device("cuda")
@@ -1661,6 +1683,7 @@ def test_vsa_blk64_asymmetric_seqlen(MB64, NB64, density, workspace):
         (torch.float16, 8, 4),
     ],
 )
+@_requires_quack
 def test_vsa_return_lse(dtype, num_blocks, num_heads, workspace):
     """return_lse=True must produce LSE values consistent with the attention output."""
     device = torch.device("cuda")
@@ -1758,6 +1781,7 @@ def test_vsa_blk64_return_lse(workspace):
 # ---------------------------------------------------------------------------
 
 
+@_requires_quack
 def test_vsa_variable_blocks_per_q(workspace):
     """Per-head block_mask with variable KV count per Q-block must match per-head PyTorch ref.
 

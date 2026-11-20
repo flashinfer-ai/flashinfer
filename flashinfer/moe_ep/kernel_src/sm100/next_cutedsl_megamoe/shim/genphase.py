@@ -36,9 +36,10 @@ from .kernel_helpers import (
 @deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
-    """MXFP8 E4M3, BF16 combine, grouped GenPhase on SM100/103.
+    """Block-scaled weights, BF16 combine, grouped GenPhase on SM100/103.
 
-    Defaults to N128/CGA4; N64/CGA2 and N64/CGA4 are explicit alternatives.
+    NVFP4 uses K256/N128/CGA4. MXFP8 E4M3/E5M2 and mixed MXFP4/MXFP8
+    use K128/N128/CGA4, with N64 alternatives for sparse expert batches.
     """
 
     kernel_variant: Literal["inference", "genphase"] = "genphase"
@@ -47,32 +48,44 @@ class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
 
     @property
     def instruction_k(self) -> int:
-        return 32
+        """Return the native block-scaled MMA K extent for the quantization kind."""
+        return 64 if self.quant_kind == "nvfp4" else 32
+
+    @property
+    def gather_tile_k(self) -> int:
+        """Pack each activation row into one 128-byte Gather4 swizzle atom."""
+        return 256 if self.quant_kind == "nvfp4" else 128
 
     @property
     def resolved_mma_tiler_mnk(self) -> tuple[int, int, int]:
-        return self.mma_tiler_mnk or (256, 128, 128)
+        """Use explicit geometry or the dtype's N128 Gather4 default."""
+        return self.mma_tiler_mnk or (256, 128, self.gather_tile_k)
+
+    @property
+    def admitted_geometries(self):
+        """Enumerate the dtype's supported Gather4 tile and cluster pairs."""
+        geometries = (((256, 128, self.gather_tile_k), (4, 1)),)
+        if self.quant_kind != "nvfp4":
+            geometries += (((256, 64, 128), (4, 1)),)
+        if self.quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2"):
+            geometries += (((256, 64, 128), (2, 1)),)
+        return geometries
 
     def __post_init__(self) -> None:
+        """Restrict GenPhase to admitted Gather4 geometries and BF16 reduction."""
         super().__post_init__()
         geometry = (self.resolved_mma_tiler_mnk, self.cluster_shape_mn)
         if (
             self.kernel_variant != "genphase"
-            or self.quant_kind != "mxfp8_e4m3"
-            or geometry
-            not in (
-                ((256, 128, 128), (4, 1)),
-                ((256, 64, 128), (4, 1)),
-                ((256, 64, 128), (2, 1)),
-            )
+            or geometry not in self.admitted_geometries
             or self.schedule_policy[0] != "grouped"
             or self.reduce_topk_in_kernel
-            or self.activation != "swiglu"
+            or (not self.batch_invariant and self.activation != "swiglu")
         ):
             raise ValueError(
-                "Blackwell GenPhase requires MXFP8 E4M3, SwiGLU, tile "
-                "(256, 128, 128) at cluster (4, 1), or (256, 64, 128) at "
-                "cluster (2, 1) or (4, 1), grouped scheduling and "
+                "Blackwell GenPhase requires SwiGLU, N128/CGA4 or an admitted "
+                "N64 geometry, K256 for NVFP4 or K128 for MXFP8 and mixed "
+                "MXFP4/MXFP8, grouped scheduling and "
                 "separate BF16 reduction."
             )
 
@@ -107,10 +120,10 @@ class Sm100GenphaseSymmBuffer(BlockScaledSymmBuffer):
                 f"Restart Python with CUTE_DSL_ARCH={target} before importing CuTe DSL."
             )
 
-    def __init__(self, config: Sm100GenphaseMoeConfig) -> None:
+    def __init__(self, config: Sm100GenphaseMoeConfig, *, process_group=None) -> None:
         if not isinstance(config, Sm100GenphaseMoeConfig):
             raise TypeError("Blackwell GenPhase requires Sm100GenphaseMoeConfig.")
-        super().__init__(config)
+        super().__init__(config, process_group=process_group)
 
     def retune(self, knobs) -> None:
         """Collectively replace kernel storage before capture, preserving I/O views.
@@ -121,23 +134,36 @@ class Sm100GenphaseSymmBuffer(BlockScaledSymmBuffer):
         from . import comm
         from .tuning import is_valid_sm100_genphase_knobs
 
-        comm.ensure_not_capturing("Blackwell GenPhase retune")
-        if self._destroyed:
-            raise RuntimeError("cannot retune a destroyed workspace")
-        if not is_valid_sm100_genphase_knobs(knobs, self.config):
-            raise ValueError("invalid Blackwell GenPhase tuning knobs")
-        config = dataclasses.replace(self.config, **knobs)
-        if config == self.config:
+        def prepare_replacement():
+            comm.ensure_not_capturing("Blackwell GenPhase retune")
+            if self._destroyed or self._tuning_state.graph_captured:
+                raise RuntimeError("cannot retune a destroyed or captured workspace")
+            if not is_valid_sm100_genphase_knobs(knobs, self.config):
+                raise ValueError("invalid Blackwell GenPhase tuning knobs")
+            config = dataclasses.replace(self.config, **knobs)
+            if config == self.config:
+                return None
+            kernel = self._build_kernel(config)
+            local = self._prepare_kernel_workspace_local(kernel)
+            torch.cuda.synchronize()
+            return config, kernel, local
+
+        prepared = comm.prepare_local(
+            prepare_replacement,
+            self.config.world_size,
+            self._process_group,
+            phase="retune local allocation",
+        )
+        if prepared is None:
             return
-        kernel = self._build_kernel(config)
-        torch.cuda.synchronize()
+        config, kernel, local = prepared
         self._compiled = self._launch_key = self._launch_kwargs = None
         self._launch_weights = None
         self._pre_reduced_activation = self._pre_reduced_activation_sf = None
         comm.free_sym_tensor(self.shared_workspace)
         self.shared_workspace = self.local_workspace = None
         self.config, self.kernel = config, kernel
-        self._allocate_kernel_workspace(kernel)
+        self._allocate_kernel_workspace(kernel, local_workspace=local)
 
 
 def validate_genphase_weights(transformed, config, device: torch.device) -> None:

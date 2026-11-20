@@ -205,6 +205,7 @@ def recurrent_kda(
         "small-bh",
         "cudnn",
     ] = "auto",
+    batch_invariant: bool = False,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -240,9 +241,17 @@ def recurrent_kda(
             Query of shape ``[B, T, H, K]``, or
             ``[1, total_tokens, H, K]`` when using ``cu_seqlens``. Must be
             bfloat16. ``T=1`` selects decode; eligible ``T>1`` calls may select
-            the frozen prefill backend. Ordinary prefill accepts strided Q/K:
-            dense-only providers pack them internally, while cuDNN retains
-            supported strides. Other inputs keep their layout requirements.
+            the frozen prefill backend. Ordinary prefill with ``"auto"``,
+            ``"cake"`` or ``"small-bh"`` packs strided Q/K; ``"auto"`` can
+            select CuTe prefill with supported token-strided V. Explicit
+            ``"cute-dsl"`` and ``"cute-dsl-persistent"`` read Q/K/V views
+            directly when head/features are contiguous, base pointers and
+            token pitches are 16-byte aligned, and fixed batches flatten
+            without a copy. Ordinary ``"cute-dsl"`` packs unsupported Q/K
+            layouts; persistent CuTe requires the supported layout. V is never
+            packed automatically and must meet the selected backend's layout
+            requirements. cuDNN retains its supported strides. Other inputs
+            keep their layout requirements.
         k (torch.Tensor):
             Key with the same shape as ``q``. Must be bfloat16.
         v (torch.Tensor):
@@ -270,14 +279,17 @@ def recurrent_kda(
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
             Initial state of shape ``[N, HV, V, K]``. Eligible prefill
-            backends accept bfloat16 or float32; other modes may be stricter.
+            backends accept bfloat16 or float32; decode, speculative decode and
+            packed calls with no more tokens than sequences accept bfloat16 or
+            float32 on the CuTe DSL kernels (Cake requires bfloat16).
             If ``None``, zero-initialized. Updated in-place. For
             batched spec decode without ``cu_seqlens``, ``N`` is the packed
             checkpoint-slot count ``B * (1 + num_spec_tokens)`` when
-            ``ssm_state_indices`` is omitted. For eligible frozen prefill with
-            ``ssm_state_indices``, this is a state pool
-            ``[N_pool, H, 128, 128]`` whose inner slots are contiguous;
-            padding between pool slots is allowed.
+            ``ssm_state_indices`` is omitted. For eligible frozen prefill and
+            ``backend="small-bh"`` prefill with ``ssm_state_indices``, this is
+            a state pool ``[N_pool, H, 128, 128]`` whose inner slots are
+            contiguous; padding between pool slots is allowed. The small-BH
+            pool must be bfloat16.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -307,9 +319,13 @@ def recurrent_kda(
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
-            be set). Eligible frozen packed prefill accepts contiguous CUDA
-            int32 ``[N_seq]`` indices and updates the selected
-            ``initial_state`` pool slots directly.
+            be set). Eligible frozen packed prefill and ``backend="small-bh"``
+            prefill accept contiguous CUDA int32 ``[N_seq]`` indices and update
+            the selected ``initial_state`` pool slots directly. For
+            ``backend="small-bh"``, every index must be a unique slot in
+            ``[0, N_pool)``: the kernel addresses the pool with the raw index,
+            so a negative padding index reads and writes outside the pool, and
+            a repeated index makes sequences race on one slot.
         num_spec_tokens (Optional[int]):
             Number of speculative tokens (S). When set, processes 1+S tokens in
             a single fused kernel launch. Must be >= 1.
@@ -396,9 +412,10 @@ def recurrent_kda(
             64 or a larger cache-page-aligned multiple.
         backend (Literal["auto", "cute-dsl", "cute-dsl-persistent", "tirx", "ptx", "cake", "small-bh", "cudnn"]):
             Implementation backend. ``"cute-dsl-persistent"`` explicitly selects
-            the SM100/SM103 persistent prefill kernel with contiguous BF16
-            inputs, D128, heads divisible by eight, FP32 state, fused Q/K
-            normalization and beta sigmoid, and a gate bound in [-5, 0).
+            the SM100/SM103 persistent prefill kernel with token-strided BF16
+            Q/K/V and contiguous G/beta, D128, heads divisible by eight,
+            FP32 state, fused Q/K normalization and beta sigmoid, and a gate
+            bound in [-5, 0).
             Packed sequences must be nonempty. Graph capture requires an
             explicit workspace and output, warmed with the exact tensors;
             sequence offsets must remain fixed throughout replay.
@@ -427,7 +444,8 @@ def recurrent_kda(
             strictly. The Cake prefill path chooses among direct, persistent,
             small-BH, and two-stage BT16 schedules from the input shape and
             physical device. ``"small-bh"`` selects the small-BH CuTe DSL KDA
-            prefill kernel. The SM100-family CuTe DSL kernels (not including
+            prefill kernel; ``"auto"`` does not route ``ssm_state_indices``
+            calls to it. The SM100-family CuTe DSL kernels (not including
             small-BH) additionally need ``nvidia-cutlass-dsl>=4.7``; below that
             ``"auto"`` uses Cake there and an explicitly selected CuTe backend
             raises :class:`ImportError`.
@@ -441,6 +459,43 @@ def recurrent_kda(
             selected slots of ``initial_state`` in place. ``output_final_state``
             returns that pool, not a gathered per-sequence copy. State-pool calls
             are not automatically selected for cuDNN.
+        batch_invariant (bool):
+            Keyword-only. ``True`` runs the batch-invariant class ``kda.bf16.c16``
+            (``flashinfer.batch_invariant``) in place of the backends: every
+            output row and every state at a multiple of 16 tokens is the
+            native SM100 / SM103 / SM107 chunked prefill kernel's, so decode row ``p``
+            of a request is bit for bit the row a prefill of the whole sequence
+            gives at ``p``, whatever the batch, the neighbours or the slot. The
+            state is an fp32 pool ``initial_state`` ``[slots, HV, 128, 128]``
+            addressed by ``ssm_state_indices`` (``arange`` when omitted) and
+            updated in place; a slot holds the state at the sequence's last
+            16-token boundary and the class keeps what the open chunk needs
+            next to the pool, so a chunked prefill cuts at multiples of 16
+            tokens except for its last piece (a prefill discards the slot's
+            open rows), and a call with one token per sequence is a decode step
+            (one launch of a step kernel that reads nothing back to the host:
+            its ``cu_seqlens`` are taken as ``arange(N + 1)`` and its slots as
+            unique, unchecked; a sequence whose slot is outside the pool gets
+            NaN rows). A slot whose state the caller replaced starts a new
+            chunk. A slot recycled after a request shorter than 16 tokens
+            still holds that request's open rows and an unchanged state (for
+            example zeros written over zeros), which the class cannot see:
+            call ``flashinfer.batch_invariant.kda.api.recurrent_kda_batch_invariant_reset(pool, slots)``
+            before the new request, or prefill it with more than one token;
+            otherwise its decode rows are wrong without an error. The
+            guarantee is stated for finite inputs: a non-finite value inside
+            a 16-token chunk shows from the chunk's first row in a prefill
+            and from its own row in a decode step.
+            Requires ``backend="auto"``, bf16 activations, head dim 128,
+            ``HV == H`` (a multiple of 8, or 1 to 10 or 12), ``A_log`` / ``dt_bias`` with
+            ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
+            ``beta_is_logit``, a finite negative ``lower_bound``; speculative
+            decode, checkpoints, ``initial_state_source``, ``seq_order``,
+            ``prefill_workspace`` and the frozen-verify arguments are not in
+            the class. Unsupported inputs raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+            instead of falling back. ``fingerprint("recurrent_kda")`` names the
+            class; see ``flashinfer/batch_invariant/README.md``.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -466,6 +521,44 @@ def recurrent_kda(
         raise ValueError(
             "backend must be 'auto', 'cute-dsl', 'cute-dsl-persistent', 'tirx', 'ptx', 'cake', 'small-bh', or 'cudnn', "
             f"got {backend!r}"
+        )
+    if batch_invariant:
+        from .batch_invariant.kda.api import recurrent_kda_batch_invariant
+
+        return recurrent_kda_batch_invariant(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            output=output,
+            beta_is_logit=beta_is_logit,
+            backend=backend,
+            refused=dict(
+                num_spec_tokens=num_spec_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                initial_state_source=initial_state_source,
+                initial_state_indices=initial_state_indices,
+                seq_order=seq_order,
+                prefill_workspace=prefill_workspace,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                checkpoint_state_indices=checkpoint_state_indices,
+                disable_state_update=disable_state_update,
+                correction_cache=correction_cache,
+                kg_cache=kg_cache,
+            ),
         )
     if backend == "cute-dsl-persistent":
         from .kda_prefill_persistent import _run_persistent_kda
@@ -770,7 +863,14 @@ def recurrent_kda(
                 beta=beta,
                 initial_state=initial_state,
             )
-        q, k = q.contiguous(), k.contiguous()
+        if backend != "cute-dsl" or not (
+            q.ndim == 4 and _kda_prefill._supports_strided_qkv(q)
+        ):
+            q = q.contiguous()
+        if backend != "cute-dsl" or not (
+            k.ndim == 4 and _kda_prefill._supports_strided_qkv(k)
+        ):
+            k = k.contiguous()
     if backend in ("auto", "small-bh"):
         small_bh_available = (
             is_cute_dsl_available()
@@ -817,7 +917,7 @@ def recurrent_kda(
                 "backend='small-bh' does not support this recurrent_kda prefill contract"
             )
         use_small_bh = backend == "small-bh"
-        if eligible and backend == "auto":
+        if eligible and backend == "auto" and ssm_state_indices is None:
             batch_size = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
             use_small_bh = (
                 2 * batch_size * q.shape[2]
@@ -859,6 +959,7 @@ def recurrent_kda(
                 cu_seqlens=cu_seqlens,
                 output=output,
                 prefill_workspace=prefill_workspace,
+                ssm_state_indices=ssm_state_indices,
             )
 
     # SM120 is an architecture-specific CuTe DSL implementation. Try it before

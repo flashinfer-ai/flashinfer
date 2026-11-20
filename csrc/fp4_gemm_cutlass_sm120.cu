@@ -181,7 +181,14 @@ int64_t fp4_gemm_tactic_num() {
   return totalTactics;
 }
 
+bool fp4_gemm_tactic_is_stream_k(int64_t tactic) {
+  // Looks up the tactic with getFp4GemmConfig, the lookup fp4_gemm uses.
+  // getFp4GemmConfig ignores m, n and k, so they are passed as 0.
+  return getFp4GemmConfig(/*m=*/0, /*n=*/0, /*k=*/0, tactic).use_stream_k;
+}
+
 }  // namespace torch_ext
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_gemm, torch_ext::fp4_gemm);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_gemm_tactic_num, torch_ext::fp4_gemm_tactic_num);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp4_gemm_tactic_is_stream_k, torch_ext::fp4_gemm_tactic_is_stream_k);

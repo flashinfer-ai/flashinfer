@@ -90,8 +90,68 @@ program is shared by every route (route `sm120:metadata`).
 
 The launch grid of the logits program **is** the CTA budget: no compile-line
 definition carries an SM count, so one delivered text serves every SM count and
-every `sm_count` override. The only compile-line definitions are the page size
-and `next_n` of the texts that several routes share (see "Layout").
+every `sm_count` override. The compile-line definitions only select between
+texts that several routes share: the page size and `next_n` of a shared default
+route text, and the kernel symbol and host-shim namespace of a shared device
+route binding (see "Layout").
+
+## Device routes
+
+The catalog also carries routes tuned for two devices, chosen by the
+device's physical SM count (170: RTX 5090, 188: RTX PRO 6000). The SM count
+is the only key: another part with the same SM count (the RTX PRO 6000 Max-Q,
+or a board with a lower power limit) takes the same table without having been
+measured on it. A prepared call takes a device route only when all of these hold:
+the device's SM count keys a table of `policy.device_rule`, the CTA budget
+equals that SM count (no `sm_count` override; for the one-shot entry,
+`schedule_meta` has `num_sms + 1` rows), and `max_context_hint` lies in one
+of the rule's context windows (half-open, in KV tokens). The table key is
+`h<H>:p<page_kv>:n<next_n>:a<atom>:<window>`, with the atom the default rule
+selects; its value lists `[batch, route]` pairs by batch. A listed batch takes
+its route; a batch strictly between two listed batches takes their route only
+when both list the same one; any other batch, and a `null` entry, runs the
+default route. Every other call runs the default route above.
+`resolve_route(...)` gives the route a call runs; `plan.route_name`,
+`plan.atom_variant` and `plan.num_next_n_atoms` follow it.
+
+The device routes are built without fast math. Their logits are bitwise
+equal to DeepGEMM's on all inputs, including tiny-magnitude ones whose
+partial results reach the FP32 denormal range. The default routes were built with
+`--use_fast_math`, which flushes denormals to zero: on tiny-magnitude inputs
+their logits can differ from DeepGEMM's and from a device route's, and on
+normal-magnitude inputs every route is bitwise equal to DeepGEMM. A call that
+no device table selects keeps its default route, so its bits and its timing
+are unchanged.
+
+A device route named `sm120:fp8:h<H>:p<page_kv>:n<next_n>:a<atom>:<tag>` may
+run a different Q atom than the default rule, and its schedule is `static`
+(the shared scheduler, or its CTA-parallel version on a `par` route, below)
+or `dyn`: the CTAs first walk static items, then draw
+items from a pool by ticket. A `dyn` route schedules into a plan-private int32
+`[(1 + dyn_slots) * num_sms + 2, 2]` buffer (`plan.dyn_schedule`), allocated
+at prepare time; its scheduler writes every row, including the ticket counter,
+on every launch, so replay and repeated runs need no fill. On a `dyn` route
+the caller's `schedule_meta` keeps its `[num_sms + 1, 2]` shape and is checked
+but not written.
+
+A `static` device route whose tag ends in `par` runs the CTA-parallel version
+of the scheduler: one 256-thread CTA instead of one warp, writing the same
+`schedule_meta` bit for bit into the caller's buffer. There are two kinds:
+
+- `<tag>_par` is the twin of the tuned route `<tag>`: the same Q atom and the
+  same logits program (its unit is the tuned unit's text with the kernel
+  symbol renamed). Where a `<tag>_par` entry sits next to a `<tag>` entry with
+  unlisted batches between them, an extra `<tag>` entry at the batch nearest
+  the `<tag>_par` entry that can reach the key keeps `<tag>` on every batch
+  between them that can reach the key.
+- `par` (`sm120:fp8:h<H>:p<page_kv>:n<next_n>:a<atom>:par`) runs the default
+  route's Q atom with a logits program built without fast math. A table
+  selects it only at its own listed batches: between two `par` entries a
+  `null` entry keeps the default route.
+
+The standalone metadata route (`sm120:metadata`) keeps the single-warp
+scheduler, so `get_paged_mqa_logits_metadata` returns the schedule that a
+`par` route writes.
 
 ## Operands
 
@@ -181,6 +241,10 @@ exported head counts select different schedules — `next_n` 5 and 6 at
 `B > 8` — in which case the `ValueError` names it; for `next_n` 1–4 and for
 every `B <= 8` without a long-context hint the DeepGEMM-shaped call without
 `num_heads` is exact (the hint changes this for `next_n` 5 and 6; see below).
+On RTX 5090 and RTX PRO 6000 at the full CTA budget, with a `max_context_hint`
+inside a route context window, a device route can also make the two head counts
+select different schedules for other `next_n` values and batches; `num_heads`
+is then required there too, and the `ValueError` names it.
 `clean_logits=True` is rejected for two-dimensional context lengths exactly as
 DeepGEMM does, and `indices` (variable-length request selection) must be
 `None` — that scheduling branch is not ported.
@@ -259,13 +323,20 @@ definition set preprocesses to the kernel it replaced. Each definition set also
 keeps the kernel symbol and host-shim namespace of the unit it replaced (the
 `CAKE_PROGRAM_KERNEL` / `CAKE_PROGRAM_SHIM` ladder at the top of the text), so
 every JIT module exports its own symbols although the modules share one
-process. The runtime and the
+process. Device-route programs have one device source each; their sequence
+bindings export `run` (the records' `ffi_entry`), and the bindings that differ
+only in the logits kernel symbol and the host-shim namespace are one file: each
+record that lists it carries `-DCAKE_LOGITS_KERNEL=<its kernel>` and
+`-DCAKE_LOGITS_SHIM=<its namespace>` in `compile_flags`, and the values written
+in the file are those of the program it was exported for. The runtime and the
 program/route catalog are in this directory; the public API is
 `flashinfer/sm120_paged_mqa_logits.py`.
 
 ```bash
 pytest tests/experimental/test_sm120_paged_mqa_logits.py -q
+pytest tests/experimental/test_cake_sm120_paged_mqa_device_routes.py -q
 python benchmarks/bench_sm120_paged_mqa_logits.py
+python benchmarks/bench_sm120_paged_mqa_logits.py --hint none  # default routes only
 ```
 
 The test covers every shipped `(heads, page_kv, next_n, atom)` program — both
@@ -279,10 +350,12 @@ batch-only selection, and that the logits entries rebuild the schedule under
 their own hint) and
 the architecture-target gate. It skips on devices without catalogued programs.
 
-## Catalog schema `sm120_paged_mqa.v1`
+## Catalog schema `sm120_paged_mqa.v2`
 
-`sm120_paged_mqa_catalog.json` carries `arches`, `policy`, `programs` and
-`routes`. Policy keys: `head_dim`, `fused_row_bytes` (132), `heads`, `page_kv`,
+`sm120_paged_mqa_catalog.json` carries `arches`, `policy`, `programs`,
+`routes` and `device_routes` (schema v2 adds `device_routes`,
+`policy.device_rule` and, with a `dyn` route, `policy.threads.metadata_dyn`;
+the runtime refuses a v1 catalog). Policy keys: `head_dim`, `fused_row_bytes` (132), `heads`, `page_kv`,
 `next_n`, `split_kv` (128 for every exported program, so the metadata entry
 needs no page size), `atom_rule` (the Q-atom selection rule as data:
 `batch_class_min` — the first batch of every batch class, the last class open
@@ -302,4 +375,8 @@ kernel, its logits kernel and the binding of its text), `standalone`, `compile_f
 `ffi_entry` and `arg_plan`. A logits route record has `sequence` (the
 prepared-sequence binding), `kernel_launches` (2), `num_heads`, `page_kv`,
 `next_n`, `next_n_atom`, `atom_variant` and `clean_logits`; the metadata route
-has `stages` (`[["metadata", program]]`) and `sequence: null`.
+has `stages` (`[["metadata", program]]`) and `sequence: null`. A device route
+record has the keys of a logits route plus `schedule` (`{"kind": "static"}`
+or `{"kind": "dyn", "dyn_slots", "dyn_pct", "dyn_seg"}`); `policy.device_rule`
+holds `ctx_windows` (`{name: [low, high]}`) and `tables` (`{sm_count: {key:
+[[batch, device route or null], ...]}}`), as in "Device routes".

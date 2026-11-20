@@ -22,7 +22,7 @@ from flashinfer.sampling import (
     get_sampling_module,
     softmax as sampling_softmax,
 )
-from flashinfer.topk import _ROW_STATES_NBYTES
+from flashinfer.topk import _get_row_states_buffer
 from flashinfer.utils import device_support_pdl
 
 from .op import ParameterizedOp
@@ -133,9 +133,8 @@ class ProbsTopKOp(ParameterizedOp):
         ):
             raise ValueError("top_k must be a positive integer or a tensor array")
 
-        # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
-        row_states_buffer = torch.zeros(
-            _ROW_STATES_NBYTES, dtype=torch.uint8, device=tensor.data.device
+        row_states_buffer = _get_row_states_buffer(
+            "top_k_renorm_probs_row_states", tensor.data.device
         )
         renorm_probs = get_sampling_module().top_k_renorm_probs(
             tensor.data, maybe_top_k_arr, top_k_val, row_states_buffer
@@ -176,9 +175,8 @@ class LogitsTopKOp(ParameterizedOp):
         ):
             raise ValueError("top_k must be a positive integer or a tensor array")
 
-        # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
-        row_states_buffer = torch.zeros(
-            _ROW_STATES_NBYTES, dtype=torch.uint8, device=tensor.data.device
+        row_states_buffer = _get_row_states_buffer(
+            "top_k_mask_logits_row_states", tensor.data.device
         )
         masked_logits = get_sampling_module().top_k_mask_logits(
             tensor.data, maybe_top_k_arr, top_k_val, row_states_buffer

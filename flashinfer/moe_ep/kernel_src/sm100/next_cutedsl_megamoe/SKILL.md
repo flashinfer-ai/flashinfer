@@ -15,7 +15,8 @@ staging calls on the existing package API until staging is migrated separately.
 Run the Blackwell standard and GenPhase cases in
 `tests/moe_ep/test_mega_workspace_knobs.py` and
 `tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py`, plus
-`tests/moe_ep/test_sm100_standard_features.py`. Check weight layouts,
+`tests/moe_ep/test_sm100_standard_features.py` and
+`tests/moe_ep/test_sm100_genphase_dtypes.py`. Check weight layouts,
 early and late routing weights, masked routes, repeated staging and graph
 replay. Preserve GenPhase's default FC2 staging depth and update its tuning
 cache revision when kernel behavior or resource use changes.

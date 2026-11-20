@@ -185,7 +185,15 @@ class Pipeline:
         self.gate_up(first, (partials, midq, midsf), stream)
         self.down_project(second, stream)
         if cutlass.const_expr(finalize):
-            combine(routes, weights, output, narrow_weights, stream)
+            combine(
+                routes,
+                ids,
+                weights,
+                output,
+                self.geometry.experts,
+                narrow_weights,
+                stream,
+            )
 
     @cute.jit
     def gate_up(self, pointers: Tuple, activation: Tuple, stream):

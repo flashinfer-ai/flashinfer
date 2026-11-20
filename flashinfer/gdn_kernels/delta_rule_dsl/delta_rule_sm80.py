@@ -18,7 +18,12 @@ from .collective_inverse_hmma import CollectiveInverse
 from .delta_rule_sm120 import _FullyFusedDeltaRuleSm120
 from .helpers import SM80, state_dtype_to_cutlass
 from .schedule import WorkDesc
-from .varlen_helper import is_integer_dtype
+from .varlen_helper import (
+    check_checkpoint_key_range,
+    check_slot_args,
+    checkpoint_row_align,
+    is_integer_dtype,
+)
 
 
 @functools.cache
@@ -127,6 +132,13 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         init_state_inner_strides: tuple[int, ...] | None = None,
         blk_v: int | None = None,
         v32: bool = False,
+        use_output_state_indices: bool = False,
+        use_checkpoint_state_indices: bool = False,
+        use_prefix_lens: bool = False,
+        output_state_indices_dtype: torch.dtype | None = None,
+        checkpoint_state_indices_dtype: torch.dtype | None = None,
+        prefix_lens_dtype: torch.dtype | None = None,
+        checkpoint_row_align: int | None = None,
     ):
         self.needs_alpha = needs_alpha
         self.needs_beta = needs_beta
@@ -143,6 +155,15 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         self.checkpoint_cu_starts_dtype = checkpoint_cu_starts_dtype
         self.state_inner_strides = state_inner_strides
         self.init_state_inner_strides = init_state_inner_strides
+        self._set_slot_flags(
+            use_output_state_indices,
+            use_checkpoint_state_indices,
+            use_prefix_lens,
+            output_state_indices_dtype,
+            checkpoint_state_indices_dtype,
+            prefix_lens_dtype,
+            checkpoint_row_align,
+        )
         self.inverse_dtype = cutlass.Float16
         self.BLK_Q = 64
         self.BLK_KV = 64
@@ -201,6 +222,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             "checkpoint_cu_starts_dtype",
             "state_inner_strides",
             "init_state_inner_strides",
+            *self.SLOT_KEY_ATTRS,
             "inverse_dtype",
             "v32",
             "BLK_Q",
@@ -417,8 +439,10 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         row_limit: cutlass.Int32,
         d_is_mode1: cutlass.Constexpr,
         d: cutlass.Constexpr = None,
+        row_first=None,
     ):
-        """Issue one tile with cp.async, zero-filling rows past ``row_limit``."""
+        """Issue one tile with cp.async, zero-filling rows past ``row_limit``
+        (and, when ``row_first`` is given, rows before it)."""
         # The tile's own d: a split V is narrower than Q and K.
         tile_d = cutlass.const_expr(self.D if d is None else d)
         if cutlass.const_expr(d_is_mode1):
@@ -442,14 +466,26 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         for rep in cutlass.range_constexpr(cute.size(tSrc, mode=[rep_mode])):
             row = cutlass.Int32(rep) * rows_at_a_time + lane_row
             # Zero, not skip: the math reads the whole tile and masking needs zeros.
-            if row < row_limit:
-                cute.copy(
-                    load_atom,
-                    self._aligned(self._rep_slice(tSrc, rep, d_is_mode1)),
-                    self._rep_slice(tDst, rep, d_is_mode1),
-                )
+            if cutlass.const_expr(row_first is None):
+                if row < row_limit:
+                    cute.copy(
+                        load_atom,
+                        self._aligned(self._rep_slice(tSrc, rep, d_is_mode1)),
+                        self._rep_slice(tDst, rep, d_is_mode1),
+                    )
+                else:
+                    self._rep_slice(tDst, rep, d_is_mode1).fill(self.dtype(0.0))
             else:
-                self._rep_slice(tDst, rep, d_is_mode1).fill(self.dtype(0.0))
+                # Rows before the sequence (virtual left padding) are never
+                # read: they may lie before the tensor.
+                if row < row_limit and row >= row_first:
+                    cute.copy(
+                        load_atom,
+                        self._aligned(self._rep_slice(tSrc, rep, d_is_mode1)),
+                        self._rep_slice(tDst, rep, d_is_mode1),
+                    )
+                else:
+                    self._rep_slice(tDst, rep, d_is_mode1).fill(self.dtype(0.0))
 
     @cute.jit
     def load_qkv_cpasync(
@@ -474,11 +510,18 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         v_head_idx: cutlass.Int32,
         v_row_offset: cutlass.Int32,
         tid: cutlass.Int32,
+        tok_begin=None,
     ):
-        """Issue this block's share of the Q, K and V tiles on `cp.async`."""
+        """Issue this block's share of the Q, K and V tiles on `cp.async`.
+
+        With ``tok_begin`` (virtual left padding) rows before it are zeroed.
+        """
         blk_tok = tok_start + blk * cutlass.Int32(self.BLK_KV)
         # Rows of this tile the sequence owns.
         rows_live = tok_end - blk_tok
+        row_first = None
+        if cutlass.const_expr(tok_begin is not None):
+            row_first = tok_begin - blk_tok
 
         # K first, then Q, then V -- the order the math side waits in.
         sK = sK_DS[None, None, k_producer_state.index]
@@ -489,7 +532,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             ((None, None), (cutlass.Int32(0), cutlass.Int32(0)))
         ]
         k_pipeline.producer_acquire(k_producer_state)
-        self._copy_tile(gK, sK, self.BLK_KV, tid, rows_live, False)
+        self._copy_tile(gK, sK, self.BLK_KV, tid, rows_live, False, row_first=row_first)
         cute.arch.cp_async_commit_group()
         k_pipeline.producer_commit(k_producer_state)
         k_producer_state.advance()
@@ -502,7 +545,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             ((None, None), (cutlass.Int32(0), cutlass.Int32(0)))
         ]
         q_pipeline.producer_acquire(q_producer_state)
-        self._copy_tile(gQ, sQ, self.BLK_Q, tid, rows_live, True)
+        self._copy_tile(gQ, sQ, self.BLK_Q, tid, rows_live, True, row_first=row_first)
         cute.arch.cp_async_commit_group()
         q_pipeline.producer_commit(q_producer_state)
         q_producer_state.advance()
@@ -516,7 +559,9 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             ((None, None), (cutlass.Int32(0), cutlass.Int32(0)))
         ]
         v_pipeline.producer_acquire(v_producer_state)
-        self._copy_tile(gV, sV, self.BLK_KV, tid, rows_live, False, d=self.D_v)
+        self._copy_tile(
+            gV, sV, self.BLK_KV, tid, rows_live, False, d=self.D_v, row_first=row_first
+        )
         cute.arch.cp_async_commit_group()
         v_pipeline.producer_commit(v_producer_state)
         v_producer_state.advance()
@@ -558,8 +603,13 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         num_sab_heads: cutlass.Int32,
         tid: cutlass.Int32,
         warp_idx: cutlass.Int32,
+        tok_begin=None,
     ):
-        """Fetch one block's Q/K/V (cp.async) and alpha/beta (plain loads)."""
+        """Fetch one block's Q/K/V (cp.async) and alpha/beta (plain loads).
+
+        ``tok_begin``: the sequence's first row when the block may start
+        before it (virtual left padding); earlier rows are identity rows.
+        """
         (
             q_producer_state,
             k_producer_state,
@@ -585,6 +635,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             v_head_idx,
             v_row_offset,
             tid,
+            tok_begin=tok_begin,
         )
 
         # One warp each for alpha's in-place scan (a second would race it) and
@@ -601,6 +652,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                     sab_head_idx,
                     num_sab_heads,
                     alpha_producer_state.index,
+                    tok_begin,
                 )
                 AlphaProcessor().run(
                     sAlpha[None, None, alpha_producer_state.index], scale
@@ -608,20 +660,39 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             alpha_pipeline.producer_commit(alpha_producer_state)
             alpha_producer_state.advance()
 
-        beta_producer_state = self.issue_beta_stage(
-            sBeta,
-            g_beta,
-            beta_pipeline,
-            beta_producer_state,
-            blk,
-            t_block_start,
-            tok_start,
-            tok_end,
-            sab_head_idx,
-            num_sab_heads,
-            tid,
-            warp_idx,
-        )
+        # The context-parallel subclass overrides issue_beta_stage without a
+        # tok_begin parameter, so pass it only when it is set.
+        if cutlass.const_expr(tok_begin is None):
+            beta_producer_state = self.issue_beta_stage(
+                sBeta,
+                g_beta,
+                beta_pipeline,
+                beta_producer_state,
+                blk,
+                t_block_start,
+                tok_start,
+                tok_end,
+                sab_head_idx,
+                num_sab_heads,
+                tid,
+                warp_idx,
+            )
+        else:
+            beta_producer_state = self.issue_beta_stage(
+                sBeta,
+                g_beta,
+                beta_pipeline,
+                beta_producer_state,
+                blk,
+                t_block_start,
+                tok_start,
+                tok_end,
+                sab_head_idx,
+                num_sab_heads,
+                tid,
+                warp_idx,
+                tok_begin=tok_begin,
+            )
 
         return (
             q_producer_state,
@@ -646,6 +717,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         num_sab_heads: cutlass.Int32,
         tid: cutlass.Int32,
         warp_idx: cutlass.Int32,
+        tok_begin=None,
     ):
         """Load beta into stage five; `CPDeltaRulePrefillSm80` overrides it with T."""
         if cutlass.const_expr(self.needs_beta):
@@ -660,6 +732,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                     sab_head_idx,
                     num_sab_heads,
                     beta_producer_state.index,
+                    tok_begin,
                 )
             beta_pipeline.producer_commit(beta_producer_state)
             beta_producer_state.advance()
@@ -731,6 +804,22 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             tKVrKV[i] = gKV[k_idx, v_idx].to(self.acc_dtype)
 
     @cute.jit
+    def kv_load_if(
+        self,
+        tKVrKV: cute.Tensor,
+        gKV: cute.Tensor,
+        kv_thr_mma,
+        pred,
+    ):
+        """``kv_load`` of each element under ``pred`` (else it is kept)."""
+        c_kv = cute.make_identity_tensor((self.D_v, self.D))
+        tKVcKV = kv_thr_mma.partition_C(c_kv)
+        for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
+            if pred:
+                v_idx, k_idx = tKVcKV[i]
+                tKVrKV[i] = gKV[k_idx, v_idx].to(self.acc_dtype)
+
+    @cute.jit
     def kv_store(
         self,
         tKVrKV: cute.Tensor,
@@ -742,6 +831,12 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             v_idx, k_idx = tKVcKV[i]
             gKV[k_idx, v_idx] = tKVrKV[i].to(gKV.element_type)
+
+    @property
+    def slot_ckpt(self) -> bool:
+        """Checkpoints at absolute positions or into pool rows (``prefix_lens``
+        or ``checkpoint_state_indices``), scheduled in shared memory."""
+        return self.use_prefix_lens or self.use_checkpoint_state_indices
 
     @cute.jit
     def maybe_store_checkpoint(
@@ -758,9 +853,19 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         total_checkpoints: cutlass.Int32,
         block_end: cutlass.Int32,
         seq_len: cutlass.Int32,
+        s_ckpt: cute.Tensor = None,
     ):
-        """Checkpoint when the block ends on a period multiple; the tail is not one."""
-        if cutlass.const_expr(self.needs_checkpointing):
+        """Checkpoint when the block ends on a period multiple; the tail is not one.
+
+        With ``prefix_lens`` or ``checkpoint_state_indices`` (``slot_ckpt``)
+        ``stage_checkpoint`` has already decided for this block: its slot in
+        ``s_ckpt`` holds the pool row (``checkpoint_state_indices``) or the
+        packed entry of the checkpoint due at ``block_end``, or -1. No key,
+        entry or row stays in a register across the block loop (the sm_80
+        math loop already uses all 255 registers; one more live value made
+        ptxas spill in the loop), and the store path does no division.
+        """
+        if cutlass.const_expr(self.needs_checkpointing and not self.slot_ckpt):
             if (
                 block_end <= seq_len
                 and block_end % checkpoint_every_n_tokens == cutlass.Int32(0)
@@ -782,6 +887,113 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                     mCheckpoint[None, None, o_head_idx, checkpoint_idx],
                 )
                 self.kv_store(tKVrKV, gCheckpointKV, kv_thr_mma)
+        elif cutlass.const_expr(self.needs_checkpointing):
+            target = s_ckpt[self._ckpt_slot(block_end)]
+            if target >= cutlass.Int32(0):
+                if cutlass.const_expr(self.use_checkpoint_state_indices):
+                    self._store_slot_checkpoint(
+                        tKVrKV,
+                        g_state_checkpoints,
+                        checkpoint_cu_starts,
+                        checkpoint_every_n_tokens,
+                        kv_thr_mma,
+                        seq_idx,
+                        o_head_idx,
+                        num_sab_heads,
+                        total_checkpoints,
+                        block_end,
+                        seq_len,
+                        None,
+                        target,
+                        v_row_offset=v_row_offset,
+                    )
+                else:
+                    checkpoint_layout = cute.make_ordered_layout(
+                        (
+                            self.D,
+                            self.D,
+                            cutlass.Int64(num_sab_heads),
+                            total_checkpoints,
+                        ),
+                        order=(0, 1, 2, 3),
+                    )
+                    mCheckpoint = cute.make_tensor(
+                        g_state_checkpoints.iterator, checkpoint_layout
+                    )
+                    gCheckpointKV = cute.domain_offset(
+                        (cutlass.Int32(0), v_row_offset),
+                        mCheckpoint[None, None, o_head_idx, target],
+                    )
+                    self.kv_store(tKVrKV, gCheckpointKV, kv_thr_mma)
+
+    def _ckpt_slot(self, block_end: cutlass.Int32):
+        """``s_ckpt`` slot of the block ending at ``block_end``: 2 + block parity."""
+        return cutlass.Int32(2) + (
+            block_end // cutlass.Int32(self.BLK_KV)
+        ) % cutlass.Int32(2)
+
+    @cute.jit
+    def init_checkpoint_schedule(
+        self,
+        s_ckpt: cute.Tensor,
+        checkpoint_cu_starts: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        seq_idx: cutlass.Int32,
+        ckpt_origin,
+        tidx: cutlass.Int32,
+    ):
+        """Thread 0 writes the work item's first due block end (``s_ckpt[0]``)
+        and its entry (``s_ckpt[1]``) before the barrier that starts the math.
+
+        A checkpoint is due where the absolute position is a multiple of N
+        (``checkpoint_every_n_tokens``, a multiple of the 64-token block):
+        at block end N without ``prefix_lens``, at N - origin % N with it
+        (``origin``: absolute position of the first, 64-aligned row). The
+        first due checkpoint is entry ``checkpoint_cu_starts[seq]``.
+        """
+        if cutlass.const_expr(self.needs_checkpointing and self.slot_ckpt):
+            if tidx == cutlass.Int32(0):
+                due = checkpoint_every_n_tokens
+                if cutlass.const_expr(self.use_prefix_lens):
+                    due = (
+                        checkpoint_every_n_tokens
+                        - ckpt_origin % checkpoint_every_n_tokens
+                    )
+                s_ckpt[0] = due
+                s_ckpt[1] = cutlass.Int32(checkpoint_cu_starts[seq_idx])
+
+    @cute.jit
+    def stage_checkpoint(
+        self,
+        g_checkpoint_rows,
+        s_ckpt: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        block_end: cutlass.Int32,
+        seq_len: cutlass.Int32,
+        tidx: cutlass.Int32,
+    ):
+        """Thread 0 decides whether a checkpoint is due at ``block_end`` and
+        writes its pool row (``checkpoint_state_indices``) or packed entry to
+        the block's ``s_ckpt`` slot, or -1, for ``maybe_store_checkpoint``.
+
+        Called after the block's tile loads are issued: the row load overlaps
+        theirs, and the barrier after the first tile wait publishes the slot.
+        Loading the row at the store put one global-load latency on every due
+        block (every block with a 64-token period). The due test compares
+        with the next due block end, so no thread divides by N in the loop.
+        Two slots by block parity: the previous block's store may still read
+        the other one.
+        """
+        if cutlass.const_expr(self.needs_checkpointing and self.slot_ckpt):
+            if tidx == cutlass.Int32(0):
+                target = cutlass.Int32(-1)
+                if block_end == s_ckpt[0] and block_end <= seq_len:
+                    target = s_ckpt[1]
+                    s_ckpt[0] = block_end + checkpoint_every_n_tokens
+                    s_ckpt[1] = target + cutlass.Int32(1)
+                    if cutlass.const_expr(self.use_checkpoint_state_indices):
+                        target = cutlass.Int32(g_checkpoint_rows[target])
+                s_ckpt[self._ckpt_slot(block_end)] = target
 
     # ─── compute_loop_body ───────────────────────────────────────────────────
     # Translates the C++ compute_loop_body lambda captured inside compute().
@@ -1226,6 +1438,10 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         num_seqs: cutlass.Int32,
         total_checkpoints: cutlass.Int32,
         checkpoint_every_n_tokens: cutlass.Int32,
+        g_output_state_indices: cute.Tensor = None,
+        g_checkpoint_rows: cute.Tensor = None,
+        s_ckpt: cute.Tensor = None,
+        tok_begin=None,
     ):
         self._math_order_init(wg_idx)
         q_consumer_state = pipeline.make_pipeline_state(
@@ -1289,10 +1505,14 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         mState = cute.make_tensor(g_state.iterator, state_layout)
         # (k, v) of this block's V band; bands are disjoint across blocks.
         v_row_offset = work_desc.v_row_offset(self.D_v)
-        gStateKV = cute.domain_offset(
-            (cutlass.Int32(0), v_row_offset),
-            mState[None, None, o_head_idx, state_idx],
-        )
+        # With output_state_indices the final row is read after the block loop
+        # (as are the checkpoint rows), so it holds no register during it.
+        gStateKV = None
+        if cutlass.const_expr(not self.use_output_state_indices):
+            gStateKV = cute.domain_offset(
+                (cutlass.Int32(0), v_row_offset),
+                mState[None, None, o_head_idx, state_idx],
+            )
         if cutlass.const_expr(self.needs_init_state):
             init_state_ref_layout = cute.make_layout(
                 state_ref_shape, stride=g_init_state.stride
@@ -1309,289 +1529,382 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 (cutlass.Int32(0), v_row_offset),
                 mInitState[None, None, o_head_idx, state_idx],
             )
-            self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
+            if cutlass.const_expr(self.slot_mode):
+                # A negative read row starts from the zero state. Each thread
+                # reads its state elements here, before it writes any
+                # checkpoint or final state, so read and write rows may alias.
+                self.kv_load_if(
+                    tKVrKV, gInitKV, kv_thr_mma, state_idx >= cutlass.Int32(0)
+                )
+            else:
+                self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
 
-        first_B = work_desc.seq_len
-        if first_B > cutlass.Int32(self.BLK_KV):
-            first_B = cutlass.Int32(self.BLK_KV)
-        if cutlass.const_expr(self.needs_init_state):
-            (
-                q_producer_state,
-                k_producer_state,
-                v_producer_state,
-                alpha_producer_state,
-                beta_producer_state,
-            ) = self.issue_block_loads(
-                sQ_SD,
-                sK_DS,
-                sV_DS,
-                sAlpha,
-                sBeta,
-                gQ_full,
-                gK_full,
-                gV_full,
-                g_alpha,
-                g_beta,
-                q_pipeline,
-                q_producer_state,
-                k_pipeline,
-                k_producer_state,
-                v_pipeline,
-                v_producer_state,
-                alpha_pipeline,
-                alpha_producer_state,
-                beta_pipeline,
-                beta_producer_state,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                work_desc.tok_offset,
-                tok_end,
-                scale,
-                work_desc.q_head_idx(),
-                work_desc.k_head_idx(num_q_heads, num_v_heads),
-                work_desc.v_head_idx(),
-                work_desc.v_row_offset(self.D_v),
-                work_desc.o_head_idx(num_q_heads, num_v_heads),
-                num_sab_heads,
-                tidx,
-                warp_idx,
-            )
-            (
-                q_consumer_state,
-                k_consumer_state,
-                v_consumer_state,
-                alpha_consumer_state,
-                beta_consumer_state,
-            ) = self.compute_loop_body(
-                sQ_SD,
-                sK_SD,
-                sK_DS,
-                sV_DS,
-                sQK,
-                sKK_inv,
-                sKK_opd,
-                sO,
-                sAlpha,
-                sBeta,
-                kv_tiled_mma,
-                q_pipeline,
-                q_consumer_state,
-                k_pipeline,
-                k_consumer_state,
-                v_pipeline,
-                v_consumer_state,
-                alpha_pipeline,
-                alpha_consumer_state,
-                beta_pipeline,
-                beta_consumer_state,
-                False,
-                True,
-                first_B,
-                tKVrKV,
-                scale,
-                wg_idx,
-                sHandoff=sHandoff,
-            )
-            self.o_writer.run(
-                sO[None, None, 0],
-                gO_full,
-                work_desc,
-                cutlass.Int32(0),
-                num_q_heads,
-                num_v_heads,
-                tidx,
-            )
-        else:
-            (
-                q_producer_state,
-                k_producer_state,
-                v_producer_state,
-                alpha_producer_state,
-                beta_producer_state,
-            ) = self.issue_block_loads(
-                sQ_SD,
-                sK_DS,
-                sV_DS,
-                sAlpha,
-                sBeta,
-                gQ_full,
-                gK_full,
-                gV_full,
-                g_alpha,
-                g_beta,
-                q_pipeline,
-                q_producer_state,
-                k_pipeline,
-                k_producer_state,
-                v_pipeline,
-                v_producer_state,
-                alpha_pipeline,
-                alpha_producer_state,
-                beta_pipeline,
-                beta_producer_state,
-                cutlass.Int32(0),
-                cutlass.Int32(0),
-                work_desc.tok_offset,
-                tok_end,
-                scale,
-                work_desc.q_head_idx(),
-                work_desc.k_head_idx(num_q_heads, num_v_heads),
-                work_desc.v_head_idx(),
-                work_desc.v_row_offset(self.D_v),
-                work_desc.o_head_idx(num_q_heads, num_v_heads),
-                num_sab_heads,
-                tidx,
-                warp_idx,
-            )
-            (
-                q_consumer_state,
-                k_consumer_state,
-                v_consumer_state,
-                alpha_consumer_state,
-                beta_consumer_state,
-            ) = self.compute_loop_body(
-                sQ_SD,
-                sK_SD,
-                sK_DS,
-                sV_DS,
-                sQK,
-                sKK_inv,
-                sKK_opd,
-                sO,
-                sAlpha,
-                sBeta,
-                kv_tiled_mma,
-                q_pipeline,
-                q_consumer_state,
-                k_pipeline,
-                k_consumer_state,
-                v_pipeline,
-                v_consumer_state,
-                alpha_pipeline,
-                alpha_consumer_state,
-                beta_pipeline,
-                beta_consumer_state,
-                True,
-                True,
-                first_B,
-                tKVrKV,
-                scale,
-                wg_idx,
-                sHandoff=sHandoff,
-            )
-            self.o_writer.run(
-                sO[None, None, 0],
-                gO_full,
-                work_desc,
-                cutlass.Int32(0),
-                num_q_heads,
-                num_v_heads,
-                tidx,
-            )
-        self.maybe_store_checkpoint(
-            tKVrKV,
-            g_state_checkpoints,
-            checkpoint_cu_starts,
-            checkpoint_every_n_tokens,
-            kv_thr_mma,
-            work_desc.seq_idx,
-            o_head_idx,
-            v_row_offset,
-            num_sab_heads,
-            total_checkpoints,
-            cutlass.Int32(self.BLK_KV),
-            work_desc.seq_len,
-        )
-
-        for blk in cutlass.range(
-            cutlass.Int32(1), num_blocks - cutlass.Int32(1), cutlass.Int32(1), unroll=1
+        if cutlass.const_expr(
+            self.needs_init_state and (self.slot_mode or self.needs_checkpointing)
         ):
-            (
-                q_producer_state,
-                k_producer_state,
-                v_producer_state,
-                alpha_producer_state,
-                beta_producer_state,
-            ) = self.issue_block_loads(
-                sQ_SD,
-                sK_DS,
-                sV_DS,
-                sAlpha,
-                sBeta,
-                gQ_full,
-                gK_full,
-                gV_full,
-                g_alpha,
-                g_beta,
-                q_pipeline,
-                q_producer_state,
-                k_pipeline,
-                k_producer_state,
-                v_pipeline,
-                v_producer_state,
-                alpha_pipeline,
-                alpha_producer_state,
-                beta_pipeline,
-                beta_producer_state,
-                blk,
-                cutlass.Int32(0),
-                work_desc.tok_offset,
-                tok_end,
-                scale,
-                work_desc.q_head_idx(),
-                work_desc.k_head_idx(num_q_heads, num_v_heads),
-                work_desc.v_head_idx(),
-                work_desc.v_row_offset(self.D_v),
-                work_desc.o_head_idx(num_q_heads, num_v_heads),
-                num_sab_heads,
-                tidx,
-                warp_idx,
-            )
-            (
-                q_consumer_state,
-                k_consumer_state,
-                v_consumer_state,
-                alpha_consumer_state,
-                beta_consumer_state,
-            ) = self.compute_loop_body(
-                sQ_SD,
-                sK_SD,
-                sK_DS,
-                sV_DS,
-                sQK,
-                sKK_inv,
-                sKK_opd,
-                sO,
-                sAlpha,
-                sBeta,
-                kv_tiled_mma,
-                q_pipeline,
-                q_consumer_state,
-                k_pipeline,
-                k_consumer_state,
-                v_pipeline,
-                v_consumer_state,
-                alpha_pipeline,
-                alpha_consumer_state,
-                beta_pipeline,
-                beta_consumer_state,
-                False,
-                False,
-                cutlass.Int32(self.BLK_KV),
-                tKVrKV,
-                scale,
-                wg_idx,
-                sHandoff=sHandoff,
-            )
-            self.o_writer.run(
-                sO[None, None, 0],
-                gO_full,
-                work_desc,
-                blk,
-                num_q_heads,
-                num_v_heads,
-                tidx,
-            )
+            # One loop over every block: one code copy of the masked block body
+            # (first and last block) and one of the full one. The schedule
+            # below instantiates the masked body twice and the loads, O store
+            # and checkpoint store three times; a work item of a few blocks
+            # runs mostly that straight-line code, and the larger slot and
+            # checkpoint kernels paid for it in instruction fetch. Later blocks
+            # take tok_begin too: no row of theirs lies before it, so nothing
+            # changes.
+            for blk in cutlass.range(
+                cutlass.Int32(0), num_blocks, cutlass.Int32(1), unroll=1
+            ):
+                blk_end = (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV)
+                (
+                    q_producer_state,
+                    k_producer_state,
+                    v_producer_state,
+                    alpha_producer_state,
+                    beta_producer_state,
+                ) = self.issue_block_loads(
+                    sQ_SD,
+                    sK_DS,
+                    sV_DS,
+                    sAlpha,
+                    sBeta,
+                    gQ_full,
+                    gK_full,
+                    gV_full,
+                    g_alpha,
+                    g_beta,
+                    q_pipeline,
+                    q_producer_state,
+                    k_pipeline,
+                    k_producer_state,
+                    v_pipeline,
+                    v_producer_state,
+                    alpha_pipeline,
+                    alpha_producer_state,
+                    beta_pipeline,
+                    beta_producer_state,
+                    blk,
+                    cutlass.Int32(0),
+                    work_desc.tok_offset,
+                    tok_end,
+                    scale,
+                    work_desc.q_head_idx(),
+                    work_desc.k_head_idx(num_q_heads, num_v_heads),
+                    work_desc.v_head_idx(),
+                    work_desc.v_row_offset(self.D_v),
+                    work_desc.o_head_idx(num_q_heads, num_v_heads),
+                    num_sab_heads,
+                    tidx,
+                    warp_idx,
+                    tok_begin=tok_begin,
+                )
+                self.stage_checkpoint(
+                    g_checkpoint_rows,
+                    s_ckpt,
+                    checkpoint_every_n_tokens,
+                    blk_end,
+                    work_desc.seq_len,
+                    tidx,
+                )
+                if blk == cutlass.Int32(0) or blk_end >= work_desc.seq_len:
+                    # First or last block: masked to its live rows.
+                    blk_B = work_desc.seq_len - blk * cutlass.Int32(self.BLK_KV)
+                    if blk_B > cutlass.Int32(self.BLK_KV):
+                        blk_B = cutlass.Int32(self.BLK_KV)
+                    (
+                        q_consumer_state,
+                        k_consumer_state,
+                        v_consumer_state,
+                        alpha_consumer_state,
+                        beta_consumer_state,
+                    ) = self.compute_loop_body(
+                        sQ_SD,
+                        sK_SD,
+                        sK_DS,
+                        sV_DS,
+                        sQK,
+                        sKK_inv,
+                        sKK_opd,
+                        sO,
+                        sAlpha,
+                        sBeta,
+                        kv_tiled_mma,
+                        q_pipeline,
+                        q_consumer_state,
+                        k_pipeline,
+                        k_consumer_state,
+                        v_pipeline,
+                        v_consumer_state,
+                        alpha_pipeline,
+                        alpha_consumer_state,
+                        beta_pipeline,
+                        beta_consumer_state,
+                        False,
+                        True,
+                        blk_B,
+                        tKVrKV,
+                        scale,
+                        wg_idx,
+                        sHandoff=sHandoff,
+                    )
+                else:
+                    (
+                        q_consumer_state,
+                        k_consumer_state,
+                        v_consumer_state,
+                        alpha_consumer_state,
+                        beta_consumer_state,
+                    ) = self.compute_loop_body(
+                        sQ_SD,
+                        sK_SD,
+                        sK_DS,
+                        sV_DS,
+                        sQK,
+                        sKK_inv,
+                        sKK_opd,
+                        sO,
+                        sAlpha,
+                        sBeta,
+                        kv_tiled_mma,
+                        q_pipeline,
+                        q_consumer_state,
+                        k_pipeline,
+                        k_consumer_state,
+                        v_pipeline,
+                        v_consumer_state,
+                        alpha_pipeline,
+                        alpha_consumer_state,
+                        beta_pipeline,
+                        beta_consumer_state,
+                        False,
+                        False,
+                        cutlass.Int32(self.BLK_KV),
+                        tKVrKV,
+                        scale,
+                        wg_idx,
+                        sHandoff=sHandoff,
+                    )
+                self.o_writer.run(
+                    sO[None, None, 0],
+                    gO_full,
+                    work_desc,
+                    blk,
+                    num_q_heads,
+                    num_v_heads,
+                    tidx,
+                    tok_begin=tok_begin,
+                )
+                self.maybe_store_checkpoint(
+                    tKVrKV,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    checkpoint_every_n_tokens,
+                    kv_thr_mma,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    v_row_offset,
+                    num_sab_heads,
+                    total_checkpoints,
+                    blk_end,
+                    work_desc.seq_len,
+                    s_ckpt=s_ckpt,
+                )
+        else:
+            first_B = work_desc.seq_len
+            if first_B > cutlass.Int32(self.BLK_KV):
+                first_B = cutlass.Int32(self.BLK_KV)
+            if cutlass.const_expr(self.needs_init_state):
+                (
+                    q_producer_state,
+                    k_producer_state,
+                    v_producer_state,
+                    alpha_producer_state,
+                    beta_producer_state,
+                ) = self.issue_block_loads(
+                    sQ_SD,
+                    sK_DS,
+                    sV_DS,
+                    sAlpha,
+                    sBeta,
+                    gQ_full,
+                    gK_full,
+                    gV_full,
+                    g_alpha,
+                    g_beta,
+                    q_pipeline,
+                    q_producer_state,
+                    k_pipeline,
+                    k_producer_state,
+                    v_pipeline,
+                    v_producer_state,
+                    alpha_pipeline,
+                    alpha_producer_state,
+                    beta_pipeline,
+                    beta_producer_state,
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    work_desc.tok_offset,
+                    tok_end,
+                    scale,
+                    work_desc.q_head_idx(),
+                    work_desc.k_head_idx(num_q_heads, num_v_heads),
+                    work_desc.v_head_idx(),
+                    work_desc.v_row_offset(self.D_v),
+                    work_desc.o_head_idx(num_q_heads, num_v_heads),
+                    num_sab_heads,
+                    tidx,
+                    warp_idx,
+                    tok_begin=tok_begin,
+                )
+                self.stage_checkpoint(
+                    g_checkpoint_rows,
+                    s_ckpt,
+                    checkpoint_every_n_tokens,
+                    cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    tidx,
+                )
+                (
+                    q_consumer_state,
+                    k_consumer_state,
+                    v_consumer_state,
+                    alpha_consumer_state,
+                    beta_consumer_state,
+                ) = self.compute_loop_body(
+                    sQ_SD,
+                    sK_SD,
+                    sK_DS,
+                    sV_DS,
+                    sQK,
+                    sKK_inv,
+                    sKK_opd,
+                    sO,
+                    sAlpha,
+                    sBeta,
+                    kv_tiled_mma,
+                    q_pipeline,
+                    q_consumer_state,
+                    k_pipeline,
+                    k_consumer_state,
+                    v_pipeline,
+                    v_consumer_state,
+                    alpha_pipeline,
+                    alpha_consumer_state,
+                    beta_pipeline,
+                    beta_consumer_state,
+                    False,
+                    True,
+                    first_B,
+                    tKVrKV,
+                    scale,
+                    wg_idx,
+                    sHandoff=sHandoff,
+                )
+                self.o_writer.run(
+                    sO[None, None, 0],
+                    gO_full,
+                    work_desc,
+                    cutlass.Int32(0),
+                    num_q_heads,
+                    num_v_heads,
+                    tidx,
+                    tok_begin=tok_begin,
+                )
+            else:
+                (
+                    q_producer_state,
+                    k_producer_state,
+                    v_producer_state,
+                    alpha_producer_state,
+                    beta_producer_state,
+                ) = self.issue_block_loads(
+                    sQ_SD,
+                    sK_DS,
+                    sV_DS,
+                    sAlpha,
+                    sBeta,
+                    gQ_full,
+                    gK_full,
+                    gV_full,
+                    g_alpha,
+                    g_beta,
+                    q_pipeline,
+                    q_producer_state,
+                    k_pipeline,
+                    k_producer_state,
+                    v_pipeline,
+                    v_producer_state,
+                    alpha_pipeline,
+                    alpha_producer_state,
+                    beta_pipeline,
+                    beta_producer_state,
+                    cutlass.Int32(0),
+                    cutlass.Int32(0),
+                    work_desc.tok_offset,
+                    tok_end,
+                    scale,
+                    work_desc.q_head_idx(),
+                    work_desc.k_head_idx(num_q_heads, num_v_heads),
+                    work_desc.v_head_idx(),
+                    work_desc.v_row_offset(self.D_v),
+                    work_desc.o_head_idx(num_q_heads, num_v_heads),
+                    num_sab_heads,
+                    tidx,
+                    warp_idx,
+                    tok_begin=tok_begin,
+                )
+                self.stage_checkpoint(
+                    g_checkpoint_rows,
+                    s_ckpt,
+                    checkpoint_every_n_tokens,
+                    cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    tidx,
+                )
+                (
+                    q_consumer_state,
+                    k_consumer_state,
+                    v_consumer_state,
+                    alpha_consumer_state,
+                    beta_consumer_state,
+                ) = self.compute_loop_body(
+                    sQ_SD,
+                    sK_SD,
+                    sK_DS,
+                    sV_DS,
+                    sQK,
+                    sKK_inv,
+                    sKK_opd,
+                    sO,
+                    sAlpha,
+                    sBeta,
+                    kv_tiled_mma,
+                    q_pipeline,
+                    q_consumer_state,
+                    k_pipeline,
+                    k_consumer_state,
+                    v_pipeline,
+                    v_consumer_state,
+                    alpha_pipeline,
+                    alpha_consumer_state,
+                    beta_pipeline,
+                    beta_consumer_state,
+                    True,
+                    True,
+                    first_B,
+                    tKVrKV,
+                    scale,
+                    wg_idx,
+                    sHandoff=sHandoff,
+                )
+                self.o_writer.run(
+                    sO[None, None, 0],
+                    gO_full,
+                    work_desc,
+                    cutlass.Int32(0),
+                    num_q_heads,
+                    num_v_heads,
+                    tidx,
+                    tok_begin=tok_begin,
+                )
             self.maybe_store_checkpoint(
                 tKVrKV,
                 g_state_checkpoints,
@@ -1603,114 +1916,254 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 v_row_offset,
                 num_sab_heads,
                 total_checkpoints,
-                (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                cutlass.Int32(self.BLK_KV),
                 work_desc.seq_len,
+                s_ckpt=s_ckpt,
             )
 
-        if num_blocks != cutlass.Int32(1):
-            last_blk = num_blocks - cutlass.Int32(1)
-            last_B = work_desc.seq_len - last_blk * cutlass.Int32(self.BLK_KV)
-            (
-                q_producer_state,
-                k_producer_state,
-                v_producer_state,
-                alpha_producer_state,
-                beta_producer_state,
-            ) = self.issue_block_loads(
-                sQ_SD,
-                sK_DS,
-                sV_DS,
-                sAlpha,
-                sBeta,
-                gQ_full,
-                gK_full,
-                gV_full,
-                g_alpha,
-                g_beta,
-                q_pipeline,
-                q_producer_state,
-                k_pipeline,
-                k_producer_state,
-                v_pipeline,
-                v_producer_state,
-                alpha_pipeline,
-                alpha_producer_state,
-                beta_pipeline,
-                beta_producer_state,
-                last_blk,
-                cutlass.Int32(0),
-                work_desc.tok_offset,
-                tok_end,
-                scale,
-                work_desc.q_head_idx(),
-                work_desc.k_head_idx(num_q_heads, num_v_heads),
-                work_desc.v_head_idx(),
-                work_desc.v_row_offset(self.D_v),
-                work_desc.o_head_idx(num_q_heads, num_v_heads),
-                num_sab_heads,
-                tidx,
-                warp_idx,
-            )
-            (
-                q_consumer_state,
-                k_consumer_state,
-                v_consumer_state,
-                alpha_consumer_state,
-                beta_consumer_state,
-            ) = self.compute_loop_body(
-                sQ_SD,
-                sK_SD,
-                sK_DS,
-                sV_DS,
-                sQK,
-                sKK_inv,
-                sKK_opd,
-                sO,
-                sAlpha,
-                sBeta,
-                kv_tiled_mma,
-                q_pipeline,
-                q_consumer_state,
-                k_pipeline,
-                k_consumer_state,
-                v_pipeline,
-                v_consumer_state,
-                alpha_pipeline,
-                alpha_consumer_state,
-                beta_pipeline,
-                beta_consumer_state,
-                False,
-                True,
-                last_B,
-                tKVrKV,
-                scale,
-                wg_idx,
-                sHandoff=sHandoff,
-            )
-            self.o_writer.run(
-                sO[None, None, 0],
-                gO_full,
-                work_desc,
-                last_blk,
-                num_q_heads,
-                num_v_heads,
-                tidx,
-            )
-            self.maybe_store_checkpoint(
-                tKVrKV,
-                g_state_checkpoints,
-                checkpoint_cu_starts,
-                checkpoint_every_n_tokens,
-                kv_thr_mma,
-                work_desc.seq_idx,
-                o_head_idx,
-                v_row_offset,
-                num_sab_heads,
-                total_checkpoints,
-                (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
-                work_desc.seq_len,
-            )
-        self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
+            # Virtual left padding (fewer than BLK_KV rows) lies in block 0 only:
+            # later blocks take no tok_begin, so it is not live across the loop.
+            for blk in cutlass.range(
+                cutlass.Int32(1),
+                num_blocks - cutlass.Int32(1),
+                cutlass.Int32(1),
+                unroll=1,
+            ):
+                (
+                    q_producer_state,
+                    k_producer_state,
+                    v_producer_state,
+                    alpha_producer_state,
+                    beta_producer_state,
+                ) = self.issue_block_loads(
+                    sQ_SD,
+                    sK_DS,
+                    sV_DS,
+                    sAlpha,
+                    sBeta,
+                    gQ_full,
+                    gK_full,
+                    gV_full,
+                    g_alpha,
+                    g_beta,
+                    q_pipeline,
+                    q_producer_state,
+                    k_pipeline,
+                    k_producer_state,
+                    v_pipeline,
+                    v_producer_state,
+                    alpha_pipeline,
+                    alpha_producer_state,
+                    beta_pipeline,
+                    beta_producer_state,
+                    blk,
+                    cutlass.Int32(0),
+                    work_desc.tok_offset,
+                    tok_end,
+                    scale,
+                    work_desc.q_head_idx(),
+                    work_desc.k_head_idx(num_q_heads, num_v_heads),
+                    work_desc.v_head_idx(),
+                    work_desc.v_row_offset(self.D_v),
+                    work_desc.o_head_idx(num_q_heads, num_v_heads),
+                    num_sab_heads,
+                    tidx,
+                    warp_idx,
+                )
+                self.stage_checkpoint(
+                    g_checkpoint_rows,
+                    s_ckpt,
+                    checkpoint_every_n_tokens,
+                    (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    tidx,
+                )
+                (
+                    q_consumer_state,
+                    k_consumer_state,
+                    v_consumer_state,
+                    alpha_consumer_state,
+                    beta_consumer_state,
+                ) = self.compute_loop_body(
+                    sQ_SD,
+                    sK_SD,
+                    sK_DS,
+                    sV_DS,
+                    sQK,
+                    sKK_inv,
+                    sKK_opd,
+                    sO,
+                    sAlpha,
+                    sBeta,
+                    kv_tiled_mma,
+                    q_pipeline,
+                    q_consumer_state,
+                    k_pipeline,
+                    k_consumer_state,
+                    v_pipeline,
+                    v_consumer_state,
+                    alpha_pipeline,
+                    alpha_consumer_state,
+                    beta_pipeline,
+                    beta_consumer_state,
+                    False,
+                    False,
+                    cutlass.Int32(self.BLK_KV),
+                    tKVrKV,
+                    scale,
+                    wg_idx,
+                    sHandoff=sHandoff,
+                )
+                self.o_writer.run(
+                    sO[None, None, 0],
+                    gO_full,
+                    work_desc,
+                    blk,
+                    num_q_heads,
+                    num_v_heads,
+                    tidx,
+                )
+                self.maybe_store_checkpoint(
+                    tKVrKV,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    checkpoint_every_n_tokens,
+                    kv_thr_mma,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    v_row_offset,
+                    num_sab_heads,
+                    total_checkpoints,
+                    (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    s_ckpt=s_ckpt,
+                )
+
+            if num_blocks != cutlass.Int32(1):
+                last_blk = num_blocks - cutlass.Int32(1)
+                last_B = work_desc.seq_len - last_blk * cutlass.Int32(self.BLK_KV)
+                (
+                    q_producer_state,
+                    k_producer_state,
+                    v_producer_state,
+                    alpha_producer_state,
+                    beta_producer_state,
+                ) = self.issue_block_loads(
+                    sQ_SD,
+                    sK_DS,
+                    sV_DS,
+                    sAlpha,
+                    sBeta,
+                    gQ_full,
+                    gK_full,
+                    gV_full,
+                    g_alpha,
+                    g_beta,
+                    q_pipeline,
+                    q_producer_state,
+                    k_pipeline,
+                    k_producer_state,
+                    v_pipeline,
+                    v_producer_state,
+                    alpha_pipeline,
+                    alpha_producer_state,
+                    beta_pipeline,
+                    beta_producer_state,
+                    last_blk,
+                    cutlass.Int32(0),
+                    work_desc.tok_offset,
+                    tok_end,
+                    scale,
+                    work_desc.q_head_idx(),
+                    work_desc.k_head_idx(num_q_heads, num_v_heads),
+                    work_desc.v_head_idx(),
+                    work_desc.v_row_offset(self.D_v),
+                    work_desc.o_head_idx(num_q_heads, num_v_heads),
+                    num_sab_heads,
+                    tidx,
+                    warp_idx,
+                )
+                self.stage_checkpoint(
+                    g_checkpoint_rows,
+                    s_ckpt,
+                    checkpoint_every_n_tokens,
+                    (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    tidx,
+                )
+                (
+                    q_consumer_state,
+                    k_consumer_state,
+                    v_consumer_state,
+                    alpha_consumer_state,
+                    beta_consumer_state,
+                ) = self.compute_loop_body(
+                    sQ_SD,
+                    sK_SD,
+                    sK_DS,
+                    sV_DS,
+                    sQK,
+                    sKK_inv,
+                    sKK_opd,
+                    sO,
+                    sAlpha,
+                    sBeta,
+                    kv_tiled_mma,
+                    q_pipeline,
+                    q_consumer_state,
+                    k_pipeline,
+                    k_consumer_state,
+                    v_pipeline,
+                    v_consumer_state,
+                    alpha_pipeline,
+                    alpha_consumer_state,
+                    beta_pipeline,
+                    beta_consumer_state,
+                    False,
+                    True,
+                    last_B,
+                    tKVrKV,
+                    scale,
+                    wg_idx,
+                    sHandoff=sHandoff,
+                )
+                self.o_writer.run(
+                    sO[None, None, 0],
+                    gO_full,
+                    work_desc,
+                    last_blk,
+                    num_q_heads,
+                    num_v_heads,
+                    tidx,
+                )
+                self.maybe_store_checkpoint(
+                    tKVrKV,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    checkpoint_every_n_tokens,
+                    kv_thr_mma,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    v_row_offset,
+                    num_sab_heads,
+                    total_checkpoints,
+                    (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    s_ckpt=s_ckpt,
+                )
+        if cutlass.const_expr(self.use_output_state_indices):
+            write_idx = cutlass.Int32(g_output_state_indices[work_desc.seq_idx])
+            if write_idx >= cutlass.Int32(0):
+                gFinalKV = cute.domain_offset(
+                    (cutlass.Int32(0), v_row_offset),
+                    mState[None, None, o_head_idx, write_idx],
+                )
+                self.kv_store(tKVrKV, gFinalKV, kv_thr_mma)
+        elif cutlass.const_expr(self.slot_mode):
+            if state_idx >= cutlass.Int32(0):
+                self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
+        else:
+            self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
 
     # ─── Kernel entry point ───────────────────────────────────────────────────
 
@@ -1737,6 +2190,9 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         num_seqs: cutlass.Int32,
         total_checkpoints: cutlass.Int32,
         checkpoint_every_n_tokens: cutlass.Int32,
+        g_output_state_indices: cute.Tensor,
+        g_checkpoint_rows: cute.Tensor,
+        g_prefix_lens: cute.Tensor,
         grid_x: int,
         stream,
     ):
@@ -1870,6 +2326,17 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 type("SharedStorage", (), {"__annotations__": annotations})
             )
 
+        if cutlass.const_expr(self.needs_checkpointing and self.slot_ckpt):
+            # The checkpoint schedule: next due block end, its entry, and one
+            # slot per block parity (see stage_checkpoint).
+            annotations = dict(storage_cls._annotations)  # type: ignore[attr-defined]
+            annotations["smem_ckpt"] = cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 4], 16
+            ]
+            storage_cls = cute.struct(
+                type("SharedStorage", (), {"__annotations__": annotations})
+            )
+
         self.shared_storage = storage_cls
 
         self.kernel(
@@ -1893,6 +2360,9 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             num_seqs,
             total_checkpoints,
             checkpoint_every_n_tokens,
+            g_output_state_indices,
+            g_checkpoint_rows,
+            g_prefix_lens,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(LOAD_THREADS, 1, 1),
@@ -1925,6 +2395,9 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         num_seqs: cutlass.Int32,
         total_checkpoints: cutlass.Int32,
         checkpoint_every_n_tokens: cutlass.Int32,
+        g_output_state_indices: cute.Tensor,
+        g_checkpoint_rows: cute.Tensor,
+        g_prefix_lens: cute.Tensor,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1935,6 +2408,13 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             num_v_heads,
             num_sab_heads,
         )
+        tok_begin = None
+        ckpt_origin = None
+        if cutlass.const_expr(self.use_prefix_lens):
+            tok_begin = work_desc.tok_offset
+            work_desc, _, ckpt_origin = work_desc.left_padded(
+                g_prefix_lens, self.BLK_KV
+            )
         tok_end = work_desc.tok_offset + work_desc.seq_len
         num_blocks = (
             work_desc.seq_len + cutlass.Int32(self.BLK_KV) - cutlass.Int32(1)
@@ -1947,6 +2427,17 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         # ── Smem allocation ───────────────────────────────────────────────────
         allocator = cutlass.utils.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
+        s_ckpt = None
+        if cutlass.const_expr(self.needs_checkpointing and self.slot_ckpt):
+            s_ckpt = storage.smem_ckpt.get_tensor(cute.make_layout(4))
+            self.init_checkpoint_schedule(
+                s_ckpt,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                work_desc.seq_idx,
+                ckpt_origin,
+                tidx,
+            )
 
         qkv_smem_layout_atom = warpgroup.make_smem_layout_atom(
             warpgroup.SmemLayoutAtomKind.K_SW128,
@@ -2089,6 +2580,10 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 num_seqs,
                 total_checkpoints,
                 checkpoint_every_n_tokens,
+                g_output_state_indices,
+                g_checkpoint_rows,
+                s_ckpt,
+                tok_begin,
             )
 
 
@@ -2146,6 +2641,10 @@ def _get_prefill_kernel(
     init_state_inner_strides,
     blk_v,
     v32=False,
+    output_state_indices_dtype=None,
+    checkpoint_state_indices_dtype=None,
+    prefix_lens_dtype=None,
+    checkpoint_row_align=None,
 ):
     """One cached kernel object per compile key; the arguments are its fields."""
     return _FullyFusedDeltaRuleSm80(
@@ -2165,6 +2664,13 @@ def _get_prefill_kernel(
         init_state_inner_strides=init_state_inner_strides,
         blk_v=blk_v,
         v32=v32,
+        use_output_state_indices=output_state_indices_dtype is not None,
+        use_checkpoint_state_indices=checkpoint_state_indices_dtype is not None,
+        use_prefix_lens=prefix_lens_dtype is not None,
+        output_state_indices_dtype=output_state_indices_dtype,
+        checkpoint_state_indices_dtype=checkpoint_state_indices_dtype,
+        prefix_lens_dtype=prefix_lens_dtype,
+        checkpoint_row_align=checkpoint_row_align,
     )
 
 
@@ -2186,7 +2692,22 @@ def delta_rule_prefill_dsl(
     # Private: the dispatcher's offer of v32, from host data this function lacks;
     # `_v32_applies` still gates it.
     _v32: bool = False,
+    output_state_indices: torch.Tensor | None = None,
+    checkpoint_state_indices: torch.Tensor | None = None,
+    prefix_lens: torch.Tensor | None = None,
 ):
+    """GDN prefill (CuTe DSL, sm_80).
+
+    ``output_state_indices`` ([num_seqs]; needs ``state_indices``) writes
+    sequence i's final state to row ``output_state_indices[i]`` of ``state``
+    instead of row ``state_indices[i]``; ``checkpoint_state_indices`` maps
+    checkpoint entry e to row ``checkpoint_state_indices[e]`` of the pool
+    ``state_checkpoints`` [C, H, D, D]; ``prefix_lens`` ([num_seqs]) makes
+    checkpoints absolute: one is due after local token n when
+    ``(prefix_lens[i] + n) % checkpoint_every_n_tokens == 0``. Negative rows
+    skip the write; with any of them a negative ``state_indices`` row starts
+    from the zero state. ``prefix_lens`` needs ``beta``.
+    """
     import cuda.bindings.driver as cuda_driver
 
     device = q.device
@@ -2267,8 +2788,12 @@ def delta_rule_prefill_dsl(
         ("alpha", alpha),
         ("beta", beta),
         ("state_indices", state_indices),
-        # Passed as reshape(-1), which copies a strided tensor and loses the writes.
-        ("state_checkpoints", state_checkpoints),
+        # Passed as reshape(-1), which copies a strided tensor and loses the
+        # writes. A pool addressed by checkpoint_state_indices is passed whole.
+        (
+            "state_checkpoints",
+            state_checkpoints if checkpoint_state_indices is None else None,
+        ),
         # The compile cache key has no strides; a baked unit stride would be reused.
         ("checkpoint_cu_starts", checkpoint_cu_starts),
     ):
@@ -2279,6 +2804,35 @@ def delta_rule_prefill_dsl(
             continue
         if not use_state_indices and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
+    use_output_state_indices = output_state_indices is not None
+    use_checkpoint_state_indices = checkpoint_state_indices is not None
+    use_prefix_lens = prefix_lens is not None
+    check_slot_args(
+        num_seqs,
+        num_sab_heads,
+        D,
+        device,
+        use_state_indices,
+        needs_checkpointing,
+        beta,
+        state_checkpoints,
+        output_state_indices,
+        checkpoint_state_indices,
+        prefix_lens,
+    )
+    row_align = (
+        checkpoint_row_align(state_checkpoints)
+        if use_checkpoint_state_indices
+        else None
+    )
+    if use_checkpoint_state_indices or use_prefix_lens:
+        check_checkpoint_key_range(
+            checkpoint_state_indices.numel()
+            if use_checkpoint_state_indices
+            else state_checkpoints.shape[0],
+            checkpoint_every_n_tokens,
+            q.shape[0],
+        )
 
     total_seqlen = q.shape[0]
     num_o_heads = o.shape[1]
@@ -2348,7 +2902,25 @@ def delta_rule_prefill_dsl(
         ),
         blk_v=_BLK_V // (2 if use_v32 else 1),
         v32=use_v32,
+        output_state_indices_dtype=(
+            output_state_indices.dtype if use_output_state_indices else None
+        ),
+        checkpoint_state_indices_dtype=(
+            checkpoint_state_indices.dtype if use_checkpoint_state_indices else None
+        ),
+        prefix_lens_dtype=prefix_lens.dtype if use_prefix_lens else None,
+        checkpoint_row_align=row_align,
     )
+    # A checkpoint pool is addressed by its row stride (which may be padded),
+    # so it is passed whole, never flattened through a copy.
+    checkpoints_align = 16
+    if not needs_checkpointing:
+        checkpoints_arg = None
+    elif use_checkpoint_state_indices:
+        checkpoints_arg = state_checkpoints
+        checkpoints_align = row_align * state_checkpoints.element_size()
+    else:
+        checkpoints_arg = state_checkpoints.reshape(-1)
     # One block per (sequence, head, value slice).
     grid_x = num_seqs * num_sab_heads * delta_rule_kernel.num_v_splits
 
@@ -2386,7 +2958,7 @@ def delta_rule_prefill_dsl(
             ),
             (
                 from_dlpack(
-                    state_checkpoints.reshape(-1), assumed_align=16
+                    checkpoints_arg, assumed_align=checkpoints_align
                 ).mark_layout_dynamic()
                 if needs_checkpointing
                 else None
@@ -2405,6 +2977,18 @@ def delta_rule_prefill_dsl(
             cutlass.Int32(num_seqs),
             cutlass.Int32(total_checkpoints),
             cutlass.Int32(checkpoint_every_n_tokens),
+            *(
+                (
+                    from_dlpack(tensor, assumed_align=4).mark_layout_dynamic()
+                    if tensor is not None
+                    else None
+                )
+                for tensor in (
+                    output_state_indices,
+                    checkpoint_state_indices,
+                    prefix_lens,
+                )
+            ),
             grid_x,
             stream,
         )
@@ -2423,7 +3007,7 @@ def delta_rule_prefill_dsl(
         state,
         init_state if needs_init_state else None,
         state_indices if use_state_indices else None,
-        state_checkpoints.reshape(-1) if needs_checkpointing else None,
+        checkpoints_arg,
         checkpoint_cu_starts if needs_checkpointing else None,
         cu_seqlens,
         scale,
@@ -2434,6 +3018,9 @@ def delta_rule_prefill_dsl(
         num_seqs,
         total_checkpoints,
         checkpoint_every_n_tokens,
+        output_state_indices,
+        checkpoint_state_indices,
+        prefix_lens,
         grid_x,
         stream,
     )

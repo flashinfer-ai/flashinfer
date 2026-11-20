@@ -27,6 +27,7 @@
 //   7. routingIndicesOffsetsKernel    — prefix-scan + permutation (defined in RoutingKernel.cuh)
 
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <type_traits>
 
@@ -50,6 +51,8 @@ bool launchClusterKernelBlockDim256(Data const& data, void* stream);
 bool launchClusterKernelBlockDim512(Data const& data, void* stream);
 bool launchClusterKernelBlockDim1024(Data const& data, void* stream);
 bool launchClusterKernel(Data const& data, void* stream);
+bool launchBlockPermutationKernel(Data const& data, void* stream);
+bool launchSmallClusterPermutationKernel(Data const& data, void* stream);
 bool launchHistogramScoresKernel(Data const& data, uint32_t maxNumBlocks, uint32_t numThreadsHist,
                                  void* stream);
 bool launchBlockScoresKernel(Data const& data, void* stream);
@@ -93,8 +96,8 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
   static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
   static constexpr int totalExpertCounts = BlockKernelMaxNumTokens * MaxNumExperts;
-  __shared__ int8_t __attribute((aligned(128))) smemOffset[totalExpertCounts];
-  __shared__ int8_t __attribute((aligned(128))) smemKIdx[totalExpertCounts];
+  __shared__ int8_t __align__(128) smemOffset[totalExpertCounts];
+  __shared__ int8_t __align__(128) smemKIdx[totalExpertCounts];
 
   using Scan = cub::BlockScan<int32_t, NumThreadsBlock>;
   __shared__ typename Scan::TempStorage tempStorage;
@@ -763,10 +766,10 @@ __device__ __forceinline__ void routingIndicesClusterKernelBody(
     }
   }
 
-  __cluster_barrier_arrive();
-  __cluster_barrier_wait();
-
   if (params.mPtrScores != nullptr) {
+    // The permutation reads the top-k results of the whole cluster from shared memory.
+    __cluster_barrier_arrive();
+    __cluster_barrier_wait();
     routingPermutation<KernelParams, BaseType, ClusterBlockDim, ClusterNumWarps,
                        KernelParams::MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/false>(
         params, smemPackedScoreIdx, warpIdx, clusterBlockRank);
@@ -787,8 +790,8 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Cl
   static constexpr int NumWarpsBlock = ClusterBlockDim / WarpSize;
   static_assert(ClusterBlockDim % WarpSize == 0);
   static_assert(ClusterBlockDim <= NumThreads);
-  __shared__ TypePacked __attribute((
-      aligned(128))) smemPackedScoreIdx[NumWarpsBlock * KernelParams::MaxNumTopExperts];
+  __shared__ TypePacked __align__(128)
+      smemPackedScoreIdx[NumWarpsBlock * KernelParams::MaxNumTopExperts];
   routingIndicesClusterKernelBody<KernelParams, BaseType, ClusterBlockDim, NumWarpsBlock>(
       params, smemPackedScoreIdx);
 }
@@ -896,6 +899,62 @@ bool launchClusterKernelBlockDim1024(Data const& data, void* stream) {
                         stream);
   return queryPolicyHasCompiledTier(data);
 }
+
+// Single-CTA permutation of precomputed top-k ids: the cluster kernel's histogram, scan and
+// permutation without its cluster barriers and distributed shared memory reads.
+template <typename KernelParams>
+__global__ void __launch_bounds__(NumThreads)
+    routingIndicesBlockPermutationKernel(KernelParams params) {
+  using InputT = typename KernelParams::InputT;
+  using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
+  int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  if (params.mUsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+  routingPermutation<KernelParams, BaseType, NumThreads, NumThreads / WarpSize,
+                     KernelParams::MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/true, int32_t,
+                     /*NumBlocks=*/1>(params, /*smemPackedScoreIdx=*/nullptr, warpIdx,
+                                      /*clusterBlockRank=*/0);
+}
+
+bool launchBlockPermutationKernel(Data const& data, void* stream) {
+  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesBlockPermutationKernel, /*numBlocks=*/1,
+                        NumThreads, /*smemSize=*/0, stream);
+  return queryPolicyHasCompiledTier(data);
+}
+
+// Permutation of precomputed top-k ids over a cluster of NumBlocksPerSmallCluster CTAs: fewer
+// distributed shared memory reads and cheaper cluster barriers than the full cluster for batches
+// a single CTA permutes too slowly.
+template <typename KernelParams>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+__global__ void __cluster_dims__(NumBlocksPerSmallCluster, 1, 1) __launch_bounds__(NumThreads)
+    routingIndicesSmallClusterPermutationKernel(KernelParams params) {
+  using InputT = typename KernelParams::InputT;
+  using BaseType = typename KernelParams::ExpertSelectPolicy::template BaseType<InputT>;
+  int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+  if (params.mUsePdl) {
+    cudaGridDependencySynchronize();
+  }
+  routingPermutation<KernelParams, BaseType, NumThreads, NumThreads / WarpSize,
+                     KernelParams::MaxNumTopExperts, /*LoadExpertIdxFromGlobal=*/true, int32_t,
+                     NumBlocksPerSmallCluster>(params, /*smemPackedScoreIdx=*/nullptr, warpIdx,
+                                               blockIdx.x);
+}
+#else
+__global__ void __launch_bounds__(NumThreads)
+    routingIndicesSmallClusterPermutationKernel(KernelParams /* params */) {
+  assert(false && "routingIndicesSmallClusterPermutationKernel is only supported on SM90+");
+}
+#endif
+
+bool launchSmallClusterPermutationKernel(Data const& data, void* stream) {
+  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesSmallClusterPermutationKernel,
+                        NumBlocksPerSmallCluster, NumThreads, /*smemSize=*/0, stream);
+  return queryPolicyHasCompiledTier(data);
+}
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE)
 
 #endif  // FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL || FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE
@@ -913,6 +972,11 @@ bool launchClusterKernel(Data const& data, void* stream) {
       data.mNumTokens >= 32 && data.mNumTokens <= 64;
   if (useWidePermutationCluster) {
     return launchClusterKernelBlockDim512(data, stream);
+  }
+  // A permutation-only launch has no warp-per-token score phase; its per-expert histogram,
+  // offsets and permutation spread over all threads, so the full-width cluster is the fastest.
+  if (data.mPtrScores == nullptr) {
+    return launchClusterKernelBlockDim1024(data, stream);
   }
 
   // Each warp owns one token, so the reduced-thread cluster variants have lower token capacity.
@@ -1200,14 +1264,14 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
     static constexpr bool kNeedsAux = PolicyPairNeedsAux<PreProc, PostProc>::value;
     static constexpr int kAuxSize = kNeedsAux ? MaxNumExperts : 1;
 
-    static constexpr float invalidScoreFloat = -INFINITY;
+    static constexpr float invalidScoreFloat = -std::numeric_limits<float>::infinity();
 
     // Per-expert smem arrays:
     //   smemBiased[e] = topK selection key for expert e
     //   smemAux[e]    = auxiliary data for expert e (only used / written when
     //                   PolicyPairNeedsAux<PreProc, PostProc>::value is true)
-    __shared__ BaseType __attribute((aligned(128))) smemBiased[MaxNumExperts];
-    __shared__ BaseType __attribute((aligned(128))) smemAuxStorage[kAuxSize];
+    __shared__ BaseType __align__(128) smemBiased[MaxNumExperts];
+    __shared__ BaseType __align__(128) smemAuxStorage[kAuxSize];
     BaseType* auxPtr = kNeedsAux ? smemAuxStorage : smemBiased;
 
     auto block = cg::this_thread_block();
@@ -1262,10 +1326,8 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
                   LaneTopKNumWorkerWarps <= kBlockScoresKernelBlockDim / WarpSize &&
                   LaneTopKMergeValuesPerLane <= 64 &&
                   PostprocessSupportsLaneOwnedTopK<PostProc>::value) {
-      __shared__ BaseType
-          __attribute((aligned(128))) smemIntermediateScores[LaneTopKNumIntermediate];
-      __shared__ int32_t
-          __attribute((aligned(128))) smemIntermediateExperts[LaneTopKNumIntermediate];
+      __shared__ BaseType __align__(128) smemIntermediateScores[LaneTopKNumIntermediate];
+      __shared__ int32_t __align__(128) smemIntermediateExperts[LaneTopKNumIntermediate];
 
       if (warpIdx < LaneTopKNumWorkerWarps) {
         BaseType localScores[LaneTopKValuesPerWorkerLane];

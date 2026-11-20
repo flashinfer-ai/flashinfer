@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU: the geometry (the Qwen 3.5 fields first, the indexer appended), the support probe (never raises; the decode form only), the
-version probe shared with the Qwen 3.5 package (one vendored tree, one manifest), the mirrored constants."""
+"""CPU: the geometry (the Qwen 3.5 fields first, the indexer appended), the support probe (never raises; the three forms served
+together), the version probe shared with the Qwen 3.5 package (one vendored tree, one manifest), the mirrored constants."""
 
 import pytest
 import torch
@@ -42,11 +42,26 @@ def test_geometry_validation_and_derived_facts():
     assert "top_k=516" in _flash_next(top_k=516).unsupported_reason()
     assert "top_k=6" in _flash_next(top_k=6).unsupported_reason()
     assert _flash_next(top_k=4).unsupported_reason() is None
+    # the compressed-key cache dtypes: bf16 and e4m3 served on every form (the 4c8e24355 re-vendor); another dtype declined by name
+    e4 = _flash_next(index_cache_dtype=torch.float8_e4m3fn)
     assert (
-        "e4m3"
-        in _flash_next(index_cache_dtype=torch.float8_e4m3fn).unsupported_reason()
+        e4.unsupported_reason() is None
+        and e4.resolved_index_cache_dtype == torch.float8_e4m3fn
     )
     assert _flash_next(index_cache_dtype=torch.bfloat16).unsupported_reason() is None
+    assert _flash_next().resolved_index_cache_dtype == torch.bfloat16
+    assert (
+        "index_cache_dtype=torch.float16"
+        in _flash_next(index_cache_dtype=torch.float16).unsupported_reason()
+    )
+    # the indexer writers' rounding convention: a frozen geometry field (part of every plan key), validated against the mirrored vocabulary
+    assert (
+        _flash_next().index_compress_rounding == "single"
+        and _flash_next(index_compress_rounding="hf").unsupported_reason() is None
+    )
+    assert _flash_next(index_compress_rounding="hf") != _flash_next()
+    with pytest.raises(ValueError, match="index_compress_rounding must be one of"):
+        _flash_next(index_compress_rounding="bf16")
     assert (
         "selects per row" in _flash_next(index_list_form="shared").unsupported_reason()
     )
@@ -63,6 +78,7 @@ def test_geometry_validation_and_derived_facts():
 
 
 def test_support_probe_on_cpu_never_raises_and_names_the_device():
+    from flashinfer.experimental.qwen_3_8_block import support
     from flashinfer.qwen_3_8_block import qwen_3_8_block_support
 
     g = _flash_next()
@@ -70,11 +86,24 @@ def test_support_probe_on_cpu_never_raises_and_names_the_device():
     assert qwen_3_8_block_support.is_experimental is True
     assert sup.served is False and sup.forms == () and "SM107" in sup.reason
     assert sup.decode.reason == sup.reason and sup.decode.declines == {}
-    # the prefill / extend forms are never served by this package: the follow-up named
+    # the prefill / extend forms are ONE vendored form with the decode step's: not served here for the same (device) reason, no table
     assert (
-        sup.prefill.served is False and "later cuDNN Frontend PR" in sup.prefill.reason
+        sup.prefill.served is False
+        and sup.prefill.reason == sup.reason
+        and sup.prefill.declines == {}
     )
-    assert sup.extend.served is False and sup.extend.reason == sup.prefill.reason
+    assert (
+        sup.extend.served is False
+        and sup.extend.reason == sup.reason
+        and sup.extend.declines == {}
+    )
+    # no FlashInfer-side rows bound on the extend forms since the 6b21be0e0 pin (the previous pin's field / constants are retired)
+    assert not hasattr(sup, "extend_rows_max") and not hasattr(
+        support, "EXTEND_ROWS_MAX"
+    )
+    assert support.DECODE_CAPTURE_ROWS_MAX == 128
+    # the one FlashInfer-side rows bound that remains: one extend / prefill run's launch-grid bound at this pin (the probe reports it)
+    assert sup.extend_rows_grid_max == support.EXTEND_ROWS_GRID_MAX == 65535
     assert sup.page_sizes == (16, 32, 64, 128) and sup.kv_layouts == (
         "NHD",
         "HND",
@@ -91,6 +120,14 @@ def test_support_probe_on_cpu_never_raises_and_names_the_device():
     )
     assert sup.index_query_rows_max == 0 and sup.fuse_prepare_default is False
     assert (
+        sup.sparse_tiles == () and sup.sparse_tile_lean_default is False
+    )  # the lean-tile rows: READ off the envelope, empty on a CPU probe
+    # the extend step's rows: READ off the envelope too, empty / 0 on a CPU probe
+    assert sup.index_select_forms == () and sup.index_extend_ring_rows_min == 0
+    assert (
+        sup.index_extend_select_budget_bytes == 0 and sup.index_compress_roundings == ()
+    )
+    assert (
         "bfloat16"
         in qwen_3_8_block_support(torch.device("cpu"), g, dtype=torch.float16).reason
     )
@@ -102,7 +139,13 @@ def test_support_probe_on_cpu_never_raises_and_names_the_device():
     e4m3 = qwen_3_8_block_support(
         torch.device("cpu"), _flash_next(index_cache_dtype=torch.float8_e4m3fn)
     )
-    assert not e4m3.served and "e4m3" in e4m3.reason
+    assert (
+        not e4m3.served and "SM107" in e4m3.reason
+    )  # the e4m3 cache passes the geometry gate: the device speaks
+    f16c = qwen_3_8_block_support(
+        torch.device("cpu"), _flash_next(index_cache_dtype=torch.float16)
+    )
+    assert not f16c.served and "index_cache_dtype=torch.float16" in f16c.reason
     assert (
         "head_dim=256"
         in qwen_3_8_block_support(torch.device("cpu"), _flash_next(head_dim=128)).reason
@@ -125,14 +168,25 @@ def test_support_probe_on_the_local_device():
     elif not sup.cutedsl_ok:
         assert not sup.served and "cutlass-dsl" in sup.reason
     else:
-        assert sup.served and sup.forms == ("decode",)
+        assert sup.served and sup.forms == ("prefill", "extend", "decode")
+        assert (
+            sup.prefill.served
+            and sup.extend.served
+            and sup.prefill.declines == sup.extend.declines
+        )
         assert sup.index_sources == ("caller", "indexer") and sup.index_list_forms == (
             "per_row",
         )
         assert sup.index_list_form_default == "per_row"
-        assert sup.index_cache_dtypes == (torch.bfloat16,) and sup.kv_cache_dtypes == (
+        assert sup.index_cache_dtypes == (
             torch.bfloat16,
-        )
+            torch.float8_e4m3fn,
+        ) and sup.kv_cache_dtypes == (torch.bfloat16,)
+        # the extend step's rows off the envelope
+        assert sup.index_select_forms == ("auto", "decode", "extend")
+        assert sup.index_extend_ring_rows_min == 3 == sup.index_state_rows_extra
+        assert sup.index_extend_select_budget_bytes == 512 << 20
+        assert sup.index_compress_roundings == ("single", "hf")
         assert (
             sup.index_head_dims == (128,)
             and sup.index_kv_heads == (1,)
@@ -146,14 +200,46 @@ def test_support_probe_on_the_local_device():
             128,
         )
         assert sup.fuse_prepare_default is True and sup.pdl_default is False
+        # the sparse core's two bodies on cc 10.7 and the AUTO pin consulting the lean rule there (the envelope's rows, mirrored by name)
+        from flashinfer.experimental.qwen_3_8_block import support
+
+        assert (
+            sup.sparse_tiles
+            == (support.SPARSE_TILE_TCGEN05, support.SPARSE_TILE_LEAN)
+            == ("sparse_d256_f16", "sparse_lean_d256_f16")
+        )
+        assert sup.sparse_tile_lean_default is True
         for key in (
-            "indexer_e4m3_cache",
             "indexer_e4m3_pool",
             "indexer_shared_list",
             "indexer_query_rows",
             "indexer_page_size",
+            "indexer_extend_fuse_prepare",
+            "indexer_extend_ring_slots",
+            "indexer_extend_rope_tables_only",
+            "indexer_extend_ring_rows",
+            "indexer_extend_chunk_rows",
         ):
-            assert key in sup.decode.declines, key
+            assert key in sup.decode.declines and key in sup.extend.declines, key
+        assert (
+            "indexer_e4m3_cache" not in sup.decode.declines
+        )  # the e4m3 cache is served (the FlashInfer-side row retired)
+        # ONE decline table for the three forms: the vendored rows + the FlashInfer-side launch-grid row of one run on EVERY record (the
+        # DECODE step's query compress shares the extend step's launch; `indexer_extend_grid_rows`, 65,535 rows per run); the previous
+        # pin's projection bound (`extend_proj_slab_rows`) stays retired
+        grid = support.EXTEND_GRID_ROWS_KEY
+        assert sup.extend.declines == sup.prefill.declines == sup.decode.declines
+        assert grid in sup.decode.declines
+        assert (
+            "65535" in sup.extend.declines[grid]
+            and "several uniform chunks" in sup.extend.declines[grid]
+        )
+        assert sup.extend_rows_grid_max == 65535
+        assert "extend_proj_slab_rows" not in sup.extend.declines
+        # the e4m3 compressed-key cache: served on the device too
+        assert qwen_3_8_block_support(
+            torch.device("cuda", 0), _flash_next(index_cache_dtype=torch.float8_e4m3fn)
+        ).served
         # the e4m3 pool: declined by the vendored text through the probe's kv_cache_dtype
         fp8 = qwen_3_8_block_support(
             torch.device("cuda", 0), g, kv_cache_dtype=torch.float8_e4m3fn
@@ -164,6 +250,178 @@ def test_support_probe_on_the_local_device():
         )
 
 
+def test_mirrored_sparse_tile_vocabulary():
+    """The sparse core's body knob as this module mirrors it (``check_vendored_rules`` re-reads every value off the vendored rules module
+    ``sdpa.fwd.sparse_tile_rules``): the vocabulary, the two bodies' kernel_template names, the AUTO placement bound in CTAs per chunk and
+    its unit as the rule's reading over (batch, q_len) cells; the light gate refuses another spelling by name."""
+    from flashinfer.experimental.qwen_3_8_block import api, support
+
+    assert (
+        support.SPARSE_TILE_FORMS == ("auto", "lean", "tcgen05")
+        and support.SPARSE_TILE_FORM_AUTO == "auto"
+    )
+    assert (
+        support.SPARSE_TILE_LEAN == "sparse_lean_d256_f16"
+        and support.SPARSE_TILE_TCGEN05 == "sparse_d256_f16"
+    )
+    assert support.SPARSE_TILE_LEAN_MAX_UNITS == 4
+    # the unit: True iff batch x 2 <= 4 at every step width (the 7301fad21 pin's B x H_kv x q_len count read (1, 3) / (1, 4) / (2, 4) False)
+    assert support.SPARSE_TILE_LEAN_RULE_CELLS == (
+        (1, 1, True),
+        (1, 3, True),
+        (1, 4, True),
+        (2, 1, True),
+        (2, 4, True),
+        (3, 1, False),
+        (4, 1, False),
+        (4, 4, False),
+    )
+    g = _flash_next()
+    for form in support.SPARSE_TILE_FORMS:
+        api._light_decode_gates(g, 16, 1, None, None, form, batch_size=1)
+    with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+        api._light_decode_gates(g, 16, 1, None, None, "fast", batch_size=1)
+    with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+        api._light_decode_gates(g, 16, 1, None, None, None, batch_size=1)
+    with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+        support.sparse_tile(
+            torch.device("cpu"), g, batch_size=1, sparse_tile_form="fast"
+        )
+
+
+def test_mirrored_extend_vocabulary():
+    """The extend step's rows as this module mirrors them (``check_vendored_rules`` re-reads every value off the vendored envelope and the
+    tree's DSL-free constants): the step forms, the ring floor (one spelling with the ring's extra rows), the select-window budget, the
+    rounding conventions; the launch-grid bound of one run (the FlashInfer-side rows bound that remains at this pin) and its reason; the
+    served forms."""
+    from flashinfer.experimental.qwen_3_8_block import api, support
+
+    assert support.FORMS == ("prefill", "extend", "decode") == support.ALL_FORMS
+    assert support.EXTEND_FORMS == ("prefill", "extend")
+    assert support.INDEX_SELECT_FORMS == ("auto", "decode", "extend")
+    assert (
+        support.INDEX_SELECT_FORM_EXTEND == "extend"
+        and support.INDEX_SELECT_FORM_AUTO == "auto"
+    )
+    assert support.INDEX_EXTEND_RING_ROWS_MIN == 3 == support.INDEX_STATE_ROWS_EXTRA
+    assert support.INDEX_EXTEND_SELECT_BUDGET_BYTES == 512 << 20
+    assert (
+        support.INDEX_COMPRESS_ROUNDINGS == ("single", "hf")
+        and support.INDEX_COMPRESS_ROUNDING_DEFAULT == "single"
+    )
+    assert set(support.DECLINE_KEYS) >= {
+        "indexer_extend_fuse_prepare",
+        "indexer_extend_ring_slots",
+        "indexer_extend_rope_tables_only",
+        "indexer_extend_ring_rows",
+        "indexer_extend_chunk_rows",
+    }
+    g = _flash_next()
+    # the projection rows bound of the previous pin is retired: no reason function, no `EXTEND_ROWS_*` vocabulary
+    assert not hasattr(support, "extend_rows_reason") and not hasattr(
+        support, "EXTEND_ROWS_KEY"
+    )
+    # the one rows bound that remains, on EVERY form: one run's rows (batch_size x q_len_per_req) at most 65,535 at this pin -- the
+    # vendored indexer's query compress (the decode step's and the extend step's share the launch) runs with the run's row count as a
+    # CUDA grid dimension; a FlashInfer-side row, not an envelope row (the tripwire reads DECLINE_KEYS off the envelope, so the key is
+    # published beside them, never among them)
+    assert support.EXTEND_ROWS_GRID_MAX == 65535
+    assert support.EXTEND_GRID_ROWS_KEY == "indexer_extend_grid_rows"
+    assert support.EXTEND_GRID_ROWS_KEY not in support.DECLINE_KEYS
+    assert support.extend_rows_grid_reason(g, "extend", 1, 65535) is None
+    assert support.extend_rows_grid_reason(g, "extend", 65535, 1) is None
+    assert support.extend_rows_grid_reason(g, "prefill", 32, 2047) is None
+    assert support.extend_rows_grid_reason(g, "decode", 4095, 16) is None
+    assert support.extend_rows_grid_reason(g, "decode", 65535, 1) is None
+    for form, batch, q_len in (
+        ("extend", 1, 65536),
+        ("prefill", 32, 2048),
+        ("extend", 65536, 1),
+        ("decode", 4096, 16),
+        ("decode", 65536, 1),
+    ):
+        why = support.extend_rows_grid_reason(g, form, batch, q_len)
+        assert (
+            why is not None and f"= {batch * q_len} rows" in why and "65535" in why
+        ), why
+        remedy = (
+            "several decode steps" if form == "decode" else "several uniform chunks"
+        )
+        assert form in why and remedy in why and "smaller batch" in why, why
+    # the decode form's light gate applies the same row (the typed text with the decode prefix); 4095 x 16 = 65,520 rows pass
+    api._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4095)
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        api._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4096)
+    assert str(info.value).startswith(
+        "qwen_3_8_block (decode):"
+    ) and "= 65536 rows" in str(info.value), str(info.value)
+    # the probe's text of the row (no batch, no chunk): the bound and the remedy
+    text = support.extend_rows_grid_text()
+    assert (
+        "65535" in text and "several uniform chunks" in text and "smaller batch" in text
+    )
+    # the light gates of the extend forms: the page sizes, the launch-grid bound, the pool dtype, the types -- before any vendored code
+    api._light_extend_gates(
+        g, "extend", 16, None, None, None, "auto", batch_size=1, q_len_per_req=16
+    )
+    api._light_extend_gates(
+        g, "prefill", 16, None, None, None, "auto", batch_size=1, q_len_per_req=65535
+    )
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        api._light_extend_gates(
+            g,
+            "prefill",
+            16,
+            None,
+            None,
+            None,
+            "auto",
+            batch_size=32,
+            q_len_per_req=2048,
+        )
+    assert str(info.value).startswith(
+        "qwen_3_8_block (prefill):"
+    ) and "= 65536 rows" in str(info.value)
+    with pytest.raises(NotImplementedError, match="page_size must be one of"):
+        api._light_extend_gates(
+            g, "extend", 48, None, None, None, "auto", batch_size=1, q_len_per_req=16
+        )
+    with pytest.raises(NotImplementedError, match="e4m3 pool"):
+        api._light_extend_gates(
+            g,
+            "extend",
+            16,
+            torch.float8_e4m3fn,
+            None,
+            None,
+            "auto",
+            batch_size=1,
+            q_len_per_req=16,
+        )
+    with pytest.raises(TypeError, match="use_pdl"):
+        api._light_extend_gates(
+            g, "extend", 16, None, 1, None, "auto", batch_size=1, q_len_per_req=16
+        )
+    with pytest.raises(TypeError, match="fuse_prepare"):
+        api._light_extend_gates(
+            g, "extend", 16, None, None, 1, "auto", batch_size=1, q_len_per_req=16
+        )
+    with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+        api._light_extend_gates(
+            g, "extend", 16, None, None, None, "fast", batch_size=1, q_len_per_req=16
+        )
+    with pytest.raises(ValueError, match="exceed the block table's reach"):
+        api._check_extend_chunk_rows("extend", 129, 8, 16)
+    api._check_extend_chunk_rows("extend", 128, 8, 16)
+    # the contract flags per form: None reads the form's default; an explicit value is kept; another type refused
+    assert api._resolve_contract_flags("decode", None, None) == (True, False)
+    assert api._resolve_contract_flags("extend", None, None) == (False, True)
+    assert api._resolve_contract_flags("prefill", None, None) == (False, True)
+    assert api._resolve_contract_flags("extend", True, False) == (True, False)
+    with pytest.raises(TypeError, match="ring_slots must be None"):
+        api._resolve_contract_flags("extend", None, 1)
+
+
 def test_version_probe_is_the_qwen_3_5_tree():
     """ONE vendored tree for both packages: the 3.8 source record equals the 3.5 one field for field, and names the pinned commit."""
     from flashinfer.experimental.qwen_3_5_block import support as s35
@@ -172,6 +430,6 @@ def test_version_probe_is_the_qwen_3_5_tree():
 
     a, b = s38.source(), s35.source()
     assert Qwen38BlockSource is type(b) and a == b
-    assert a.commit.startswith("f2aa360e5") and a.version == "1.32.0" and a.files == 114
+    assert a.commit.startswith("6b21be0e0") and a.version == "1.33.0" and a.files == 161
     assert a.validated_cutedsl == "4.8.0" and a.validated_compute_capability == "10.7"
     assert qwen_3_8_block_support.is_experimental is True

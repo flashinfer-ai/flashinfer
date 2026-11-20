@@ -37,7 +37,7 @@ FlashInfer supports two timing methods:
 > `cudaEventElapsedTime` is unreliable (can go negative), which would corrupt
 > tactic ranking — the globaltimer path avoids that. CC auto-detection can be
 > overridden with `FLASHINFER_CONFIDENTIAL_COMPUTE=0/1`. (Full env-var reference
-> in `CLAUDE.md`.)
+> in `AGENTS.md`.)
 
 ## Installation
 
@@ -429,4 +429,4 @@ python benchmarks/flashinfer_benchmark.py \
 
 - See `benchmarks/README.md` for full flag documentation
 - See `benchmarks/samples/sample_testlist.txt` for more examples
-- See CLAUDE.md "Benchmarking" section for technical details
+- See AGENTS.md "Benchmarking" section for technical details

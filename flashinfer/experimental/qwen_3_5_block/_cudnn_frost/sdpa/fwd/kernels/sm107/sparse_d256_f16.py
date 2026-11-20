@@ -477,6 +477,9 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.tmem imp
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.scheduler import Sched, read_clc_payload, read_tile_id_arrive, scheduler_warp_loop, scheduler_warp_loop_persistent
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.thd import THD_CTR_OFF, THD_CU_Q_TOTAL_OFF, THD_LIVE_OFF, THD_META_WORDS, THD_SETUP_THREADS, exit_if_dead_thd_cluster
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.pointwise import fp32_to_fp16
+
+# The visible-set helper shared with the lean mma.sync decode tile (ONE helper for both bodies; the SELECT spellings travel with it).
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.sm107._sparse_item_common import _select_f32, _select_i32, block_id_at, visible_bounds
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels._common_blackwell import _bshd, _vec, gate_epilogue_pairs, gate_half_opaque, gate_inv_sum, row_max_for_exp2
 
 # The THD metadata setup launch (per-sequence lengths -> [seq_kv_lens | cu_q | cu_k | remap | live | ctr]) is the shared one of
@@ -661,16 +664,6 @@ def make_sparse_bars() -> SparseBars:
 
 
 @cute.jit
-def _select_i32(cond, a, b):
-    return cutlass.Int32(arith.select(cond.ir_value(), cutlass.Int32(a).ir_value(), cutlass.Int32(b).ir_value()))
-
-
-@cute.jit
-def _select_f32(cond, a, b):
-    return cutlass.Float32(arith.select(cond.ir_value(), a.ir_value(), b.ir_value()))
-
-
-@cute.jit
 def _item_bounds(tok, batch, item_row, eff_seqlen_q, block_lens_tensor: Optional[cute.Tensor], seq_kv_lens_tensor, seqlen_kv, split):
     """THE ONE HELPER (header): the row's key-space position, the entries read from the item's list, the appended tail block(s),
     the dead flag, the tile count and -- under CFG.SPLIT_KV -- this work item's chunk of the tiles, computed by EVERY role that
@@ -678,56 +671,32 @@ def _item_bounds(tok, batch, item_row, eff_seqlen_q, block_lens_tensor: Optional
     ``block_ids`` / ``block_lens`` row ``item_row``, the sequence's Q length ``eff_seqlen_q`` and the split index), nothing
     staged through SMEM.
 
-    eff_seqlen_kv = seq_kv_lens[b] under SEQ_KV_LENS_PRESENT (the THD metadata's first B words are exactly that) else the
-    dense extent; pos = tok (top-left) or tok + (eff_seqlen_kv - eff_seqlen_q) (BOTTOM_RIGHT); n_vis = clamp(min(pos + 1,
-    eff_seqlen_kv), 0): the visible range.  The count and the tail are anchored at ``anchor`` = pos, or the STEP-0 position
-    pos_0 = eff_seqlen_kv - eff_seqlen_q under LIST_PER_SEQUENCE (the shared list of the decode / MTP rows): n_sel_default =
-    min(BLOCK_TOPK, floor((anchor + 1) / BLOCK_SIZE)); count = clamp(block_lens[item_row], 0, n_sel_default) when the pointer is
-    given (a device min / max, never a host read, never a fault), else n_sel_default.  The tail = the blocks from tail_lo =
-    floor(n_anchor / BLOCK_SIZE) (the first block not complete at the anchor) to the block holding the row's last visible key:
-    n_tail = max(0, ceil(n_vis / BLOCK_SIZE) - tail_lo) -- the open block of the row's own position (0 or 1) when anchor = pos,
-    0..2 under the shared list at S_q <= 4 (every token from the step-0 tail start to the row's own position stays visible); the
-    per-lane mask removes the rows past pos / past the length.
-    dead = (pos < 0) | (tok >= eff_seqlen_q) | (eff_seqlen_kv == 0) | (count + n_tail == 0).
+    The VISIBLE SET (position, count, tail, dead) is ``_sparse_item_common.visible_bounds`` -- the helper this module SHARES with the
+    lean ``mma.sync`` decode tile (``sparse_lean_d256_f16.py``), every CFG knob handed over as a constexpr parameter (the cubins of
+    this module are byte-identical with the arithmetic inlined and with it shared, the md5 record in
+    ``test_sdpa_fwd_sparse_lean_sm107.py``; the visible-token count the helper returns is unused here); its arithmetic (eff_seqlen_kv, pos, the anchor, n_sel_default, count, tail_lo, n_tail,
+    dead) is documented there and in the header above.  This module's own geometry follows:
     n_tiles = max(1, ceil((count + n_tail) / BLOCKS_PER_TILE)) -- CLAMPED >= 1: a dead item runs ONE tile of -1 rows.
     SPLIT_KV > 1: the item's tiles are cut into SPLIT_KV contiguous chunks (per = n // S, rem = n % S: chunk s = [s per + min(s, rem),
     + per + (s < rem))) and this work item runs chunk ``split`` from ``tile0``; an EMPTY chunk is a dead item (one clamped tile).
     The store predicate is the Q ROW's liveness (``tok < eff_seqlen_q``), computed by the softmax group at the store.
     """
-    eff_seqlen_kv = seqlen_kv
-    if cutlass.const_expr(CFG.SEQ_KV_LENS_PRESENT == 1):
-        eff_seqlen_kv = cutlass.Int32(cutlass.make_array_view(seq_kv_lens_tensor)[batch])
+    pos, count, n_tail, tail_lo, dead, n_listed, eff_seqlen_kv, _n_vis = visible_bounds(
+        tok,
+        batch,
+        item_row,
+        eff_seqlen_q,
+        block_lens_tensor,
+        seq_kv_lens_tensor,
+        seqlen_kv,
+        seq_kv_lens_present=CFG.SEQ_KV_LENS_PRESENT,
+        bottom_right=BOTTOM_RIGHT,
+        list_per_sequence=LIST_PER_SEQUENCE,
+        include_open_block=CFG.INCLUDE_OPEN_BLOCK,
+        block_size=BLOCK_SIZE,
+        block_topk=BLOCK_TOPK,
+    )
     zero = cutlass.Int32(0)
-    one = cutlass.Int32(1)
-    bs = cutlass.Int32(BLOCK_SIZE)
-    # Every arm below is a const_expr fold spelled so the dense rendering (no arm) traces EXACTLY the prefill form's program.
-    pos = tok
-    if cutlass.const_expr(BOTTOM_RIGHT == 1):
-        pos = tok + (eff_seqlen_kv - eff_seqlen_q)
-    n_vis = cute.math.max(cute.math.min(pos + one, eff_seqlen_kv), zero)
-    anchor = pos
-    n_anchor = n_vis
-    if cutlass.const_expr(LIST_PER_SEQUENCE == 1):
-        anchor = eff_seqlen_kv - eff_seqlen_q  # pos_0: the step-0 position (BOTTOM_RIGHT is forced by the config)
-        n_anchor = cute.math.max(cute.math.min(anchor + one, eff_seqlen_kv), zero)
-    n_sel_default = cute.math.min(cutlass.Int32(BLOCK_TOPK), cute.math.max(anchor + one, zero) // bs)
-    count = n_sel_default
-    if cutlass.const_expr(block_lens_tensor is not None):
-        given = cutlass.Int32(cutlass.make_array_view(block_lens_tensor)[item_row])
-        count = cute.math.min(cute.math.max(given, zero), n_sel_default)
-    tail_lo = n_anchor // bs
-    n_tail = zero
-    if cutlass.const_expr(CFG.INCLUDE_OPEN_BLOCK == 1):
-        if cutlass.const_expr(LIST_PER_SEQUENCE == 1):
-            n_tail = cute.math.max((n_vis + bs - one) // bs - tail_lo, zero)
-        else:
-            # anchor = pos: the same count spelled as the prefill form's has_open
-            n_tail = _select_i32((n_vis % bs) != zero, 1, 0)
-    n_listed = count + n_tail
-    dead = (pos < zero) | (pos >= eff_seqlen_q) | (eff_seqlen_kv <= zero) | (n_listed == zero)
-    if cutlass.const_expr(BOTTOM_RIGHT == 1):
-        # the padded-row term is on the Q ROW, not the key-space position (identical when the diagonal is top-left)
-        dead = (pos < zero) | (tok >= eff_seqlen_q) | (eff_seqlen_kv <= zero) | (n_listed == zero)
     n_tiles = cute.math.max(cutlass.Int32(1), (n_listed + cutlass.Int32(BLOCKS_PER_TILE - 1)) // cutlass.Int32(BLOCKS_PER_TILE))
     tile0 = zero
     if cutlass.const_expr(SPLIT_KV > 1):
@@ -742,20 +711,10 @@ def _item_bounds(tok, batch, item_row, eff_seqlen_q, block_lens_tensor: Optional
 
 @cute.jit
 def _block_id_at(idx, loaded, count, n_tail, tail_lo, dead):
-    """The block id at list index ``idx`` of the current item: the staged word while ``idx < count``, the tail blocks
-    ``tail_lo .. tail_lo + n_tail - 1`` at ``idx == count .. count + n_tail - 1`` (0, 1 or 2 of them), -1 past that -- and -1
-    for every index of a dead item.  ``loaded`` is the word the caller read unconditionally at an in-bounds address; this
-    SELECT decides whether it means anything."""
-    if cutlass.const_expr(LIST_PER_SEQUENCE == 1):
-        rel = idx - count
-        tail = _select_i32((rel >= cutlass.Int32(0)) & (rel < n_tail), tail_lo + rel, cutlass.Int32(-1))
-    else:
-        # one tail id at most (n_tail in {0, 1}): the prefill form's spelling, so the dense rendering traces its own program
-        tail = _select_i32((idx == count) & (n_tail != cutlass.Int32(0)), tail_lo, cutlass.Int32(-1))
-    blk = _select_i32(idx < count, loaded, tail)
-    # Bound the block domain BEFORE forming 4 * blk + lane: a large positive Int32 id must not wrap into a live key.
-    invalid = dead | (blk < cutlass.Int32(0)) | (blk > cutlass.Int32((2**31 - 1) // BLOCK_SIZE))
-    return _select_i32(invalid, cutlass.Int32(-1), blk)
+    """The block id at list index ``idx`` of the current item (the staged word while ``idx < count``, the tail blocks at
+    ``idx == count .. count + n_tail - 1``, -1 past that and for every index of a dead item): the shared
+    ``_sparse_item_common.block_id_at`` with this module's constants -- ONE spelling of the visible set for both bodies."""
+    return block_id_at(idx, loaded, count, n_tail, tail_lo, dead, list_per_sequence=LIST_PER_SEQUENCE, block_size=BLOCK_SIZE)
 
 
 @cute.jit

@@ -66,12 +66,13 @@ from .vc_attention.vc_resources import SmemMuResource
 
 @dataclass(kw_only=True)
 class PackedContextWorkQueue(WorkQueue):
-    """Persistent queue that skips empty Q/KV requests and padded Q tiles."""
+    """Skip padded Q tiles, retaining empty KV rows when outputs must be written."""
 
     cfg: cutlass.Constexpr[FmhaConfig] = field(init=False, default=None)
     cum_seqlen_q: Any = field(init=False, default=None)
     cum_seqlen_k: Any = field(init=False, default=None)
     seq_lens_kv: Any = field(init=False, default=None)
+    keep_empty_kv: cutlass.Constexpr[bool] = field(init=False, default=False)
 
     def __init__(
         self,
@@ -79,6 +80,7 @@ class PackedContextWorkQueue(WorkQueue):
         cum_seqlen_q: cute.Tensor | None,
         cum_seqlen_k: cute.Tensor | None = None,
         seq_lens_kv: cute.Pointer | None = None,
+        keep_empty_kv: bool = False,
         **kwargs: Any,
     ) -> None:
         """Attach the live packed-Q metadata used by the skip predicate."""
@@ -87,6 +89,7 @@ class PackedContextWorkQueue(WorkQueue):
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
         self.seq_lens_kv = seq_lens_kv
+        self.keep_empty_kv = keep_empty_kv
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: Any) -> cutlass.Boolean:
@@ -103,10 +106,12 @@ class PackedContextWorkQueue(WorkQueue):
             q_begin = Int32(self.cum_seqlen_q[batch_coord])
             q_end = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
             skip = seq_coord * Int32(self.cfg.cta_tiler[0]) >= q_end - q_begin
-        if cutlass.const_expr(self.seq_lens_kv is not None):
+        if cutlass.const_expr(not self.keep_empty_kv and self.seq_lens_kv is not None):
             skip = skip or Int32(self.seq_lens_kv[batch_coord]) <= Int32(0)
         elif cutlass.const_expr(
-            self.cum_seqlen_k is not None and not self.cfg.has_uniform_varlen
+            not self.keep_empty_kv
+            and self.cum_seqlen_k is not None
+            and not self.cfg.has_uniform_varlen
         ):
             skip = (
                 skip
@@ -1464,7 +1469,13 @@ def create_mma_task(
         pb1: SmemPResource | None = None,
         smu: SmemMuResource | None = None,
     ) -> None:
-        """Interleave paired QK/PV while retaining each K slice for both Qs."""
+        """Interleave paired QK/PV while retaining each K slice for both Qs.
+
+        MXFP8 Q/K keeps each QK step's scales in the tail of the peer S tile.
+        S1 is acquired before the first query tile's step and S0 again before
+        the second's, which waits for softmax0's load of S0. The repeated
+        acquire of a stage not yet committed passes at once.
+        """
         # VC-Attention: the current tile's mean-operand descriptor, waited and
         # released in lockstep with V.
         mu_state: dict[str, Any] = {"desc": None}
@@ -1542,6 +1553,8 @@ def create_mma_task(
                         vd0.acquire()
                     sp0.acquire()
                     seed_scores(sp0)
+                    if smem_q.cfg.use_mxfp8_qk:
+                        sp1.acquire()
                 qk_mma_slice(
                     sp0, desc_q0_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
@@ -1555,6 +1568,8 @@ def create_mma_task(
                     if not smem_q.cfg.stats_via_smem:
                         vd1.acquire()
                     sp1.acquire()
+                    if smem_q.cfg.use_mxfp8_qk:
+                        sp0.acquire()
                     seed_scores(sp1)
                 qk_mma_slice(
                     sp1, desc_q1_base, desc_k, FmhaStage.Head, head_dim_stage_idx
@@ -1627,6 +1642,8 @@ def create_mma_task(
                 with domain_loop(loop_start, loop_end, loop_step):
                     sp0.acquire()
                     seed_scores(sp0)
+                    if smem_q.cfg.use_mxfp8_qk:
+                        sp1.acquire()
                     k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
                     sp0.commit()
                     # Wait for the mean operand here, off the QK issue path.
@@ -1642,6 +1659,8 @@ def create_mma_task(
                     )
                     to.commit()
                     sp1.acquire()
+                    if smem_q.cfg.use_mxfp8_qk:
+                        sp0.acquire()
                     seed_scores(sp1)
                     qk_mma_stages(
                         sk, sp1, desc_q1_base, FmhaStage.Loop, descriptors=k_descriptors

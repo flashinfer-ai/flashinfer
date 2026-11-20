@@ -33,29 +33,6 @@ namespace cake_host_shim_29de62dc31281e80 {
 
 using tvm::ffi::TensorView;
 
-// Opt the linked kernel into its dynamic shared memory once for every device
-// that accepts it. Function-local static initialization already serializes
-// the first call; no lock or per-device cache is needed.
-inline bool CakeSetMaxDynamicSmem(const void* symbol, int smem_bytes) {
-  cudaKernel_t kernel = nullptr;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetKernel(&kernel, symbol));
-  int device_count = 0;
-  TVM_FFI_CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count));
-  int configured = 0;
-  for (int device = 0; device < device_count; ++device) {
-    if (cudaKernelSetAttributeForDevice(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes, device) ==
-        cudaSuccess) {
-      ++configured;
-    } else {
-      (void)cudaGetLastError();
-    }
-  }
-  TVM_FFI_CHECK(configured > 0, RuntimeError)
-      << "no CUDA device accepts " << smem_bytes << " B of dynamic shared memory";
-  return true;
-}
-
 void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, TensorView arg_output, int64_t arg_tokens, int64_t arg_hidden, int64_t arg_ctas, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_shared.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
@@ -97,16 +74,14 @@ void Run(TensorView arg_shared, TensorView arg_routed, TensorView arg_scores, Te
   int32_t v_ctas = (int32_t)arg_ctas;
   void* kargs[] = {&p_shared, &p_routed, &p_scores, &p_output, &v_tokens, &v_hidden, &v_ctas};
 
-  static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(CAKE_MOK_KERNEL), 111616);
-  (void)smem_ready;
+
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(256u, 1u, 1u);
 
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 111616u;
+  config.dynamicSmemBytes = 0u;
   config.stream = stream;
   cudaError_t launch_status = cudaLaunchKernelExC(
       &config, reinterpret_cast<const void*>(CAKE_MOK_KERNEL), kargs);
