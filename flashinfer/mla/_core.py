@@ -4055,14 +4055,18 @@ _CAKE_MLA_RUNNER = _CakeTrtllmMlaBlackwellRunner.__name__
 _MLA_DECODE_OP = "trtllm_batch_decode_mla"
 _MLA_CAKE_MARGIN_OP = "trtllm_batch_decode_mla_cake_margin"
 
-# The second stage's tie, in ms: Cake is kept unless the first-stage winner
-# measures faster by more than this. The tuner times a single cold replay as
-# the median of ten CUDA-event samples; on SM100a and SM103a these samples step
-# in units of 2.048 us, so a median lies on a 1.024 us grid and a decode kernel
-# of about 10 us measures a real gap of up to one step as either no difference
-# or one full step. 1.25 steps (between one and one and a half steps) covers a
-# one-step difference plus its jitter, and a first-stage winner faster by one
-# and a half steps or more still wins. The offer table admits only units where
+# The second stage's tie, in ms, at the time the first stage measured for its
+# winner (I1). The tuner times a single cold replay as the median of ten
+# CUDA-event samples; on SM100a and SM103a these samples step in units of
+# 2.048 us, so a median lies on a 1.024 us grid and a decode kernel of about
+# 10 us measures a real gap of up to one step as either no difference or one
+# full step. 1.25 steps (between one and one and a half steps) covers a
+# one-step difference plus its jitter. The tuner's tolerance is relative, so a
+# bucket is timed under this tie divided by I1, and the tuner applies that
+# fraction to its second-stage measurement of the winner (I2): Cake is kept
+# unless the winner measures faster by more than this tie times I2 / I1. The
+# two measurements of the winner can differ by a timer step or more, so the
+# bound is not exactly 1.25 steps. The offer table admits only units where
 # Cake measured faster offline, so the second stage only guards against a
 # measurable regression.
 _MLA_CAKE_STAGE_TWO_TIE_MS = 1.25 * 2.048e-3
@@ -4382,11 +4386,12 @@ def _mla_cake_stage_two_runners(
     quantizes a microsecond decode kernel to steps of about 2 us, so a gap of
     up to one step in an offered unit is the timer's resolution, not evidence
     that the first stage's winner is faster. ``_mla_cake_stage_two_tune``
-    therefore times each bucket under a tolerance that keeps Cake against a
-    first-stage winner faster by at most ``_MLA_CAKE_STAGE_TWO_TIE_MS`` (or by
-    ``autotune(tie_tolerance=...)`` when that is wider): the tuner re-times
-    Cake and keeps it while its mean stays within the tolerance, and a
-    first-stage winner faster by more still wins.
+    therefore times each bucket under the relative tolerance that is
+    ``_MLA_CAKE_STAGE_TWO_TIE_MS`` at the first stage's time of its winner (or
+    under ``autotune(tie_tolerance=...)`` when that is wider): the tuner
+    re-times Cake and keeps it while its mean stays within the tolerance of
+    its second-stage measurement of the winner, and a first-stage winner
+    faster by more still wins.
 
     Inside an ``autotune_v2`` context the tuner also races the default tactic
     ``-1`` of the first candidate, even where that candidate offers no tactic
@@ -4412,15 +4417,17 @@ def _mla_cake_stage_two_tune(
     ``pair``, ``_mla_cake_stage_two_runners``) and returns its selection for
     ``inputs``.
 
-    Outside ``autotune_v2`` contexts Cake is kept in a bucket unless the
-    first-stage winner measures faster by more than
-    ``_MLA_CAKE_STAGE_TWO_TIE_MS``. The tuner's ``tie_tolerance`` is relative
-    and holds for a whole ``choose_one``, so each bucket within
-    ``batch_ranges`` is timed under the tolerance that is this absolute tie at
-    the time the first stage measured for its winner there
+    Outside ``autotune_v2`` contexts the tuner's ``tie_tolerance`` is
+    relative and holds for a whole ``choose_one``, so each bucket within
+    ``batch_ranges`` is timed under the tolerance ``T / I1`` (at most 0.5),
+    where ``T`` is ``_MLA_CAKE_STAGE_TWO_TIE_MS`` and ``I1`` the time the
+    first stage measured for its winner there
     (``_MlaStageOneWinnerRunner.profile_time``), or under
     ``autotune(tie_tolerance=...)`` when that is larger or there is no such
-    time. The buckets of one tolerance are timed in one ``choose_one``, in
+    time. The tuner applies the tolerance to its own measurement of the
+    first-stage winner, ``I2``, so Cake is kept in a bucket unless that winner
+    measures faster by more than ``T * I2 / I1``: ``T`` where both stages
+    measure the winner alike. The buckets of one tolerance are timed in one ``choose_one``, in
     which the other buckets offer no tactic. The buckets, their profiles and
     every cache key are the ones a single ``choose_one`` uses; with one
     tolerance for every bucket it is that single ``choose_one``. Inside an
@@ -4456,7 +4463,7 @@ def _mla_cake_stage_two_tune(
             incumbent._timed_batches = batches
             pushed = tolerance != default
             if pushed:
-                stack.append((top[0], top[1], top[2], tolerance))
+                stack.append((*top[:3], tolerance, *top[4:]))
             try:
                 # Every choose_one ends with the same lookup of the call's
                 # bucket, so the last one returns the call's selection.
@@ -5645,8 +5652,10 @@ def _mla_with_kv_cache_impl(
     ``"trtllm_batch_decode_mla_cake_margin"``, compares that winner with Cake per
     tuning bucket, under the same ``autotune()`` settings, and (outside
     ``autotune_v2`` contexts) keeps Cake unless the first-stage winner measures
-    faster by more than about 2.6 us (1.25 steps of the timer's resolution) or
-    by ``tie_tolerance``, whichever is wider; it profiles Cake only against a
+    faster by more than ``tie_tolerance`` or by a tie of about 2.6 us (1.25
+    steps of the timer's resolution) at the first stage's time of the winner,
+    whichever is wider (a relative tolerance, so it scales with the second
+    stage's measurement of the winner); it profiles Cake only against a
     first-stage winner, and a Cake result is valid only while the first stage
     keeps the winner Cake beat or tied. The second stage runs only for the units the device's offer table
     (``_CAKE_MLA_AUTO_OFFERS``: device, dtype, page size, ``q_len``,

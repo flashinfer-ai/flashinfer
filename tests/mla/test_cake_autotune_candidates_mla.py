@@ -1487,6 +1487,10 @@ class _Stages:
         # (profiled class, batch, the tuner's tie tolerance) of every
         # measurement.
         self.tolerances = []
+        # A factor per profiled class of the second stage (incumbent, Cake)
+        # on its times, so the second stage can measure the first stage's
+        # winner differently from the first stage.
+        self.stage_two_scale = {}
         self.ranges = ((1, 15),)
 
         def profile(tuner, runner, inputs, tactic, tuning_config, **kwargs):
@@ -1497,7 +1501,8 @@ class _Stages:
             self.profiled.append((type(runner).__name__, timed, batch))
             self.tolerances.append((type(runner).__name__, batch, tuner._tie_tolerance))
             time = self.times[timed]
-            return time(batch) if callable(time) else time
+            time = time(batch) if callable(time) else time
+            return time * self.stage_two_scale.get(type(runner).__name__, 1.0)
 
         monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
         monkeypatch.setattr(
@@ -1776,7 +1781,11 @@ def test_second_stage_keeps_cake_within_each_buckets_absolute_tie(
     )
     with context:
         stack = list(stages.tuner._get_override_stack())
-        stages.select(4, tune=True)
+        # Bucket 4 is timed in a pass before the last; the last pass's lookup
+        # still returns the call's selection.
+        assert _decision(stages.select(4, tune=True)) == (
+            ("cake", WINNER) if 4 in kept else (stages.runners[1], -1)
+        )
         assert stages.tuner._get_override_stack() == stack
     assert stages.entries(core._MLA_DECODE_OP) == {
         bucket: ("_FakeCuteDsl", -1) for bucket in stages.BUCKETS
@@ -1811,6 +1820,61 @@ def test_second_stage_keeps_cake_within_each_buckets_absolute_tie(
         bucket = 1 << (batch_size.bit_length() - 1)
         expected = ("cake", WINNER) if bucket in kept else (stages.runners[1], -1)
         assert _decision(stages.select(batch_size)) == expected, batch_size
+
+
+@pytest.mark.parametrize(
+    "scale,cake_scaled,gap_ties,kept",
+    [
+        # The second stage measures the first stage's winner 30 % slower than
+        # the first stage did: the tolerance spans 1.3 ties there.
+        (1.3, False, 1.2, True),
+        (1.3, False, 1.4, False),
+        # 20 % faster: it spans 0.8 ties.
+        (0.8, False, 0.7, True),
+        (0.8, False, 0.9, False),
+        # Both candidates measured 30 % slower: one tie at the first stage's
+        # scale.
+        (1.3, True, 0.9, True),
+        (1.3, True, 1.1, False),
+    ],
+)
+def test_second_stage_tie_follows_the_second_stages_time_of_the_winner(
+    stages, scale, cake_scaled, gap_ties, kept
+):
+    """The tolerance is relative: ``_MLA_CAKE_STAGE_TWO_TIE_MS`` divided by
+    the first stage's time of its winner (``I1``), which the tuner applies to
+    its second-stage measurement of that winner (``I2``). Cake is therefore
+    kept within ``_MLA_CAKE_STAGE_TWO_TIE_MS * I2 / I1`` of ``I2``; where both
+    candidates' second-stage times scale alike, that is the tie at the first
+    stage's scale. No GPU needed."""
+    cake = core._CAKE_MLA_RUNNER
+    stages.times["_FakeCuteDsl"] = _first_stage_ms
+    stages.times["_FakeTrtllmGen"] = lambda batch: 2 * _first_stage_ms(batch)
+    stages.stage_two_scale = {"_MlaStageOneWinnerRunner": scale}
+    if cake_scaled:
+        stages.stage_two_scale[cake] = scale
+        stages.times[cake] = lambda batch: _first_stage_ms(batch) + gap_ties * _TIE_MS
+    else:
+        stages.times[cake] = lambda batch: (
+            scale * _first_stage_ms(batch) + gap_ties * _TIE_MS
+        )
+    expected = ("cake", WINNER) if kept else (stages.runners[1], -1)
+    assert _decision(stages.select(4, tune=True)) == expected
+    winner = cake if kept else "_MlaStageOneWinnerRunner"
+    assert stages.entries(core._MLA_CAKE_MARGIN_OP) == {
+        bucket: (winner, WINNER) for bucket in (1, 2, 4, 8)
+    }
+    margin = ("_MlaStageOneWinnerRunner", cake)
+    for bucket in (1, 2, 4, 8):
+        timed = [
+            tolerance
+            for name, batch, tolerance in stages.tolerances
+            if name in margin and batch == bucket
+        ]
+        assert len(timed) == (6 if kept else 2), bucket
+        assert timed == pytest.approx(
+            [_TIE_MS / _first_stage_ms(bucket)] * len(timed)
+        ), bucket
 
 
 def test_second_stage_without_a_first_stage_time_keeps_the_tuners_tolerance(
