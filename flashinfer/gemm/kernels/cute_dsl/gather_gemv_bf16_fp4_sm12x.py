@@ -32,6 +32,8 @@ lane ``l`` always meets the same K slice, ``32 * (16 * i + l) + [0, 32)``.
 A ``row_ids`` entry below zero is skipped, so callers can pad.
 """
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -149,7 +151,9 @@ class GatherGemvBf16Fp4Sm12x:
     loads in flight together.
 
     ``hidden`` is compile-time (it sizes the register-resident activation
-    slice) and must be a multiple of 32.
+    slice) and must be a multiple of 32.  Above ``max_resident_iters * 512``
+    elements the row is walked in stripes of that many chunks per lane,
+    reloading the activation stripe each time, so register use stays bounded.
     """
 
     def __init__(
@@ -158,6 +162,7 @@ class GatherGemvBf16Fp4Sm12x:
         rows_per_hw: int = 2,
         unroll: int = 2,
         num_warps: int = 4,
+        max_resident_iters: int = 8,
         enable_pdl: bool = True,
     ):
         if hidden % 32 != 0:
@@ -168,6 +173,9 @@ class GatherGemvBf16Fp4Sm12x:
         self.chunks = hidden // 32  # 16B packed chunks per row
         self.iters = (self.chunks + 15) // 16  # chunks per lane
         self.full = self.chunks % 16 == 0
+        num_stripes = (self.iters + max_resident_iters - 1) // max_resident_iters
+        self.stripe = (self.iters + num_stripes - 1) // num_stripes
+        self.resident = self.stripe == self.iters
         self.rows_per_hw = rows_per_hw
         self.unroll = unroll
         self.num_threads = num_warps * 32
@@ -181,7 +189,7 @@ class GatherGemvBf16Fp4Sm12x:
         mX: cute.Tensor,  # (M, hidden) bf16
         mB: cute.Tensor,  # (R, hidden/2) uint8, compact rows
         mSF: cute.Tensor,  # (R, hidden/16) uint8 E4M3, compact rows
-        mAlpha: cute.Tensor,  # (1,) f32
+        mAlpha: Optional[cute.Tensor],  # (1,) f32, or None for 1
         mIds: cute.Tensor,  # (M, J) int32/int64
         mOut: cute.Tensor,  # (M, N) bf16/fp16/fp32
         col_offset: Int32,
@@ -206,7 +214,7 @@ class GatherGemvBf16Fp4Sm12x:
         mX: cute.Tensor,
         mB: cute.Tensor,
         mSF: cute.Tensor,
-        mAlpha: cute.Tensor,
+        mAlpha: Optional[cute.Tensor],
         mIds: cute.Tensor,
         mOut: cute.Tensor,
         col_offset: Int32,
@@ -225,57 +233,80 @@ class GatherGemvBf16Fp4Sm12x:
         # elements [32c, 32c + 32) = 64 bytes = 16 bf16x2 words.
         x_row = get_ptr_as_int64(mX, cute.crd2idx((token, 0), mX.layout))
         xr = []
-        for i in cutlass.range_constexpr(self.iters):
-            c = Int32(16 * i) + lane
-            if cutlass.const_expr(not self.full):
-                c = cutlass.min(c, Int32(self.chunks - 1))
-            for q in cutlass.range_constexpr(4):
-                v = ld_global_nc_v4_u32(x_row + Int64(c) * Int64(64) + Int64(16 * q))
-                xr += list(v)
+        if cutlass.const_expr(self.resident):
+            xr = self._load_x(x_row, lane, 0, self.iters)
 
-        alpha = mAlpha[0]
+        alpha = Float32(1.0)
+        if cutlass.const_expr(mAlpha is not None):
+            alpha = mAlpha[0]
         b_base = get_ptr_as_int64(mB, Int32(0))
         sf_base = get_ptr_as_int64(mSF, Int32(0))
+        num_rows = Int64(cute.size(mB, mode=[0]))
         slot0 = bidx * self.rows_per_cta + hw * self.rows_per_hw
 
         for r0 in cutlass.range_constexpr(0, self.rows_per_hw, self.unroll):
             slots = []
             ids = []
+            b_rows = []
+            sf_rows = []
+            accs = []
             for u in cutlass.range_constexpr(self.unroll):
                 slots.append(slot0 + Int32(r0 + u))
                 s = cutlass.min(slots[u], num_slots - 1)
                 ids.append(Int64(mIds[token, s]))
-            # Issue every load of the unrolled rows before any math.
-            ws = []
-            sfs = []
+                rid = cutlass.min(cutlass.max(ids[u], Int64(0)), num_rows - 1)
+                b_rows.append(b_base + rid * Int64(row_bytes))
+                sf_rows.append(sf_base + rid * Int64(sf_bytes))
+                accs.append(Float32(0.0))
+            for i0 in cutlass.range_constexpr(0, self.iters, self.stripe):
+                n = min(self.stripe, self.iters - i0)
+                xs = xr[16 * i0 : 16 * (i0 + n)]
+                if cutlass.const_expr(not self.resident):
+                    xs = self._load_x(x_row, lane, i0, n)
+                # Issue every load of the unrolled rows before any math.
+                ws = []
+                sfs = []
+                for u in cutlass.range_constexpr(self.unroll):
+                    for i in cutlass.range_constexpr(i0, i0 + n):
+                        c = self._chunk(lane, i)
+                        ws.append(ld_global_nc_v4_u32(b_rows[u] + Int64(c) * Int64(16)))
+                        sfs.append(_ld_global_nc_u16(sf_rows[u] + Int64(c) * Int64(2)))
+                for u in cutlass.range_constexpr(self.unroll):
+                    for t in cutlass.range_constexpr(n):
+                        d = _nvfp4x32_dot_bf16(
+                            ws[u * n + t], xs[16 * t : 16 * t + 16], sfs[u * n + t]
+                        )
+                        if cutlass.const_expr(
+                            not self.full and i0 + t == self.iters - 1
+                        ):
+                            if Int32(16 * (i0 + t)) + lane >= Int32(self.chunks):
+                                d = Float32(0.0)
+                        accs[u] = accs[u] + d
             for u in cutlass.range_constexpr(self.unroll):
-                rid = cutlass.max(ids[u], Int64(0))
-                b_row = b_base + rid * Int64(row_bytes)
-                sf_row = sf_base + rid * Int64(sf_bytes)
-                for i in cutlass.range_constexpr(self.iters):
-                    c = Int32(16 * i) + lane
-                    if cutlass.const_expr(not self.full):
-                        c = cutlass.min(c, Int32(self.chunks - 1))
-                    ws.append(ld_global_nc_v4_u32(b_row + Int64(c) * Int64(16)))
-                    sfs.append(_ld_global_nc_u16(sf_row + Int64(c) * Int64(2)))
-            for u in cutlass.range_constexpr(self.unroll):
-                acc = Float32(0.0)
-                for i in cutlass.range_constexpr(self.iters):
-                    d = _nvfp4x32_dot_bf16(
-                        ws[u * self.iters + i],
-                        xr[16 * i : 16 * i + 16],
-                        sfs[u * self.iters + i],
-                    )
-                    if cutlass.const_expr(not self.full and i == self.iters - 1):
-                        if Int32(16 * i) + lane >= Int32(self.chunks):
-                            d = Float32(0.0)
-                    acc = acc + d
+                acc = accs[u]
                 for off in cutlass.range_constexpr(4):
                     acc = acc + cute.arch.shuffle_sync_bfly(acc, 8 >> off)
                 if lane == 0:
                     if slots[u] < num_slots:
                         if ids[u] >= Int64(0):
-                            col = col_offset + Int32(ids[u])
-                            mOut[token, col] = mOut.element_type(acc * alpha)
+                            if ids[u] < num_rows:
+                                col = col_offset + Int32(ids[u])
+                                mOut[token, col] = mOut.element_type(acc * alpha)
 
         cute.arch.griddepcontrol_launch_dependents()
+
+    def _chunk(self, lane, i):
+        c = Int32(16 * i) + lane
+        if not self.full:
+            c = cutlass.min(c, Int32(self.chunks - 1))
+        return c
+
+    def _load_x(self, x_row, lane, i0, n):
+        xs = []
+        for i in range(i0, i0 + n):
+            c = self._chunk(lane, i)
+            for q in range(4):
+                xs += list(
+                    ld_global_nc_v4_u32(x_row + Int64(c) * Int64(64) + Int64(16 * q))
+                )
+        return xs

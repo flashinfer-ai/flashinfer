@@ -11,13 +11,15 @@ from ..trace.templates.gemm import gemv_bf16_fp4_gather_trace
 from ..utils import backend_requirement, supported_compute_capability
 
 _KERNEL_CACHE: dict = {}
-_ALPHA_ONE: dict = {}
 
 # Within 2% of the best measured tile at K in {2048, 2560}, J = 16384,
 # M in {1, 4, 5, 8, 32} on GB10.
 _ROWS_PER_HALF_WARP = 2
 _UNROLL = 2
 _NUM_WARPS = 4
+# Activation chunks kept in registers per lane (512 elements each); larger K is
+# walked in stripes of this size so the kernel does not spill.
+_MAX_RESIDENT_ITERS = 8
 
 _OUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _ID_DTYPES = (torch.int32, torch.int64)
@@ -27,12 +29,24 @@ def _get_kernel(
     hidden: int,
     ids_dtype: torch.dtype,
     out_dtype: torch.dtype,
+    has_alpha: bool,
     rows_per_hw: int,
     unroll: int,
     num_warps: int,
+    max_resident_iters: int,
     enable_pdl: bool,
 ):
-    key = (hidden, ids_dtype, out_dtype, rows_per_hw, unroll, num_warps, enable_pdl)
+    key = (
+        hidden,
+        ids_dtype,
+        out_dtype,
+        has_alpha,
+        rows_per_hw,
+        unroll,
+        num_warps,
+        max_resident_iters,
+        enable_pdl,
+    )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
@@ -61,11 +75,13 @@ def _get_kernel(
         cutlass.Uint8, (r, hidden // 2), stride_order=(1, 0), assumed_align=16
     )
     sf = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (r, hidden // 16), stride_order=(1, 0), assumed_align=4
+        cutlass.Uint8, (r, hidden // 16), stride_order=(1, 0), assumed_align=2
     )
-    alpha = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (1,), assumed_align=4
-    )
+    alpha = None
+    if has_alpha:
+        alpha = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (1,), assumed_align=4
+        )
     ids = cute.runtime.make_fake_compact_tensor(
         dtypes[ids_dtype], (m, j), stride_order=(1, 0)
     )
@@ -79,6 +95,7 @@ def _get_kernel(
             rows_per_hw=rows_per_hw,
             unroll=unroll,
             num_warps=num_warps,
+            max_resident_iters=max_resident_iters,
             enable_pdl=enable_pdl,
         ),
         x,
@@ -122,8 +139,12 @@ def _check_gemv_bf16_fp4_gather(
         raise ValueError("b and b_descale must be contiguous.")
     if a.data_ptr() % 16 or b.data_ptr() % 16 or b_descale.data_ptr() % 2:
         raise ValueError("a and b must be 16B aligned, b_descale 2B aligned.")
-    if alpha is not None and (alpha.dtype != torch.float32 or alpha.numel() != 1):
-        raise ValueError("alpha must be a (1,) float32 tensor.")
+    if m > 1 and a.stride(0) % 8:
+        raise ValueError("a rows must be 16B aligned: a.stride(0) % 8 == 0.")
+    if alpha is not None and (
+        alpha.dtype != torch.float32 or alpha.shape != (1,) or alpha.device != a.device
+    ):
+        raise ValueError("alpha must be a (1,) float32 tensor on a.device.")
     if row_ids.dtype not in _ID_DTYPES or row_ids.dim() != 2:
         raise ValueError("row_ids must be a (M, J) int32 or int64 tensor.")
     if row_ids.shape[0] != m or not row_ids.is_contiguous():
@@ -163,14 +184,14 @@ def gemv_bf16_fp4_gather(
     This is the dynamic-row half of a sparse LM head for speculative drafters.
 
     Args:
-        a: ``(M, K)`` bfloat16 activations.
+        a: ``(M, K)`` bfloat16 activations, unit inner stride, rows 16B aligned.
         b: ``(R, K/2)`` uint8, row-major packed E2M1 (low nibble = even column).
         b_descale: ``(R, K/16)`` E4M3 block scales (block size 16), row-major,
             not swizzled.
         alpha: ``(1,)`` float32 global dequantization scale, or ``None`` for 1.
-        row_ids: ``(M, J)`` int32/int64 row indices into ``b``, in ``[0, R)``;
-            negative entries are skipped.  Duplicates within a row write the
-            same value.
+        row_ids: ``(M, J)`` int32/int64 row indices into ``b``; entries outside
+            ``[0, R)`` (e.g. ``-1`` padding) are skipped.  Duplicates within a
+            row write the same value.
         out: ``(M, N)`` output, unit inner stride, ``N >= out_col_offset + R``.
         out_col_offset: Column of ``out`` that row 0 of ``b`` maps to.
         enable_pdl: Launch with programmatic dependent launch.
@@ -178,20 +199,17 @@ def gemv_bf16_fp4_gather(
     Returns:
         ``out``.
     """
-    if alpha is None:
-        alpha = _ALPHA_ONE.get(a.device)
-        if alpha is None:
-            alpha = torch.ones(1, dtype=torch.float32, device=a.device)
-            _ALPHA_ONE[a.device] = alpha
-    if a.shape[0] == 0 or row_ids.shape[1] == 0:
+    if a.shape[0] == 0 or row_ids.shape[1] == 0 or b.shape[0] == 0:
         return out
     kernel = _get_kernel(
         a.shape[1],
         row_ids.dtype,
         out.dtype,
+        alpha is not None,
         _ROWS_PER_HALF_WARP,
         _UNROLL,
         _NUM_WARPS,
+        _MAX_RESIDENT_ITERS,
         bool(enable_pdl),
     )
     kernel(
