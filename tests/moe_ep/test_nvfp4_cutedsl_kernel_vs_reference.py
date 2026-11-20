@@ -1522,7 +1522,7 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
             graph.replay()
             assert_w4a16_bits(actual_graph, expected)
         if alpha_source == "runtime":
-            # Like W4A4, omitting an override retains the workspace's values.
+            # Omitted overrides restore the layer's configured defaults.
             actual = layer.forward(
                 MoEEpTensors(
                     **{
@@ -1531,7 +1531,11 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
                     }
                 )
             )
-            assert_w4a16_bits(actual, expected)
+            default_reference = _nvfp4_reference_from_weights(
+                problem, weights, mode="w4a16"
+            )
+            assert not torch.equal(default_reference, expected)
+            assert_w4a16_bits(actual, default_reference)
     finally:
         if graph is not None:
             graph.reset()
