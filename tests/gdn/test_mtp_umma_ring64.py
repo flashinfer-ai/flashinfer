@@ -1505,6 +1505,23 @@ def test_public_restart_cursor_check_takes_ring64_histories(T, bases):
     )
 
 
+@pytest.mark.parametrize("T,fm", [(4, 13), (8, 9)])
+@pytest.mark.parametrize("bases", ["base0", "wrap", "high"])
+def test_public_restart_cursor_check_takes_deep_histories_at_small_flush_min(
+    T, fm, bases
+):
+    """hist_len beyond flush_min - 1 + T (up to nu = 32) is legal on ring64 and matches the fp32 oracle."""
+    _skip_if_not_sm100()
+    hist = [fm - 1 + T + 1, 20, 24, 28, 30, 31, 32, 17]
+    base = {"base0": [0] * 8, "wrap": _B8W, "high": [40] * 8}[bases]
+    public = _public_restart_fn(restart_hist_on_flush=True)
+
+    def fn(*args, window_rows=None, **kw):
+        return public(*args, **kw)
+
+    _check_case(T, hist, base, fm, 62, fn=fn)
+
+
 def test_public_restart_cursor_check_commits_like_the_direct_call():
     """The public eager call is bit-identical to the direct kernel call, cursors included."""
     _skip_if_not_sm100()
@@ -1523,15 +1540,12 @@ def test_public_restart_cursor_check_commits_like_the_direct_call():
     "T,flush_min,hist,bases,match",
     [
         (4, None, 33, 0, "hist_len out of legal range"),
-        (4, 13, 17, 0, "hist_len out of legal range"),
-        (8, 9, 17, 0, "hist_len out of legal range"),
         (4, None, 4, 64, "cache_base out of legal"),
         (4, None, 4, -1, "cache_base out of legal"),
     ],
 )
 def test_public_restart_cursor_check_bounds_ring64(T, flush_min, hist, bases, match):
-    """Ring64 limits: hist_len up to the built window min(nu, flush_min - 1 + T) (silently truncated
-    beyond it), cache_base below 64."""
+    """Ring64 limits: hist_len up to nu = 32, cache_base below 64."""
     _skip_if_not_sm100()
     case = _make_case(1, T, [4], 7, [0])
     case[11].copy_(torch.tensor([hist], dtype=torch.int32))

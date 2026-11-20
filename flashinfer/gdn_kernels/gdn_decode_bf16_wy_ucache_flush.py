@@ -3545,7 +3545,7 @@ def gated_delta_rule_mtp_ucache_flush(
                         f"{_win + 1 - T} (= {_win + 1} - T) is not supported on {_slots}-slot "
                         f"rings (merged-kernel contract only); use {_UMMA_RING64_SLOTS}-slot rings."
                     )
-                if T == 1:
+                if T == 1 or _slots == _UMMA_RING64_SLOTS:
                     _hl_cap = _nu
                 else:
                     _fm = _nu - T + 1 if flush_min is None else flush_min
