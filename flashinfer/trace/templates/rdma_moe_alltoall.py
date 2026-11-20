@@ -5,8 +5,8 @@
 Dispatch and combine require a live, collectively initialized communicator,
 matching calls on every rank, and owner-bound dispatch metadata. A local tensor
 does not describe their remote inputs or synchronization state. There is no
-single-rank reference or initializer for these APIs, including their planned
-reduction mode.
+single-rank reference or initializer for these APIs, including opaque payloads,
+receive-side conversion, mixed codecs, and planned reduction mode.
 
 Returning ``None`` uses the standard trace-dispatch convention: ``fi_trace``
 returns an empty dict and writes no replay JSON. In particular, these hooks do

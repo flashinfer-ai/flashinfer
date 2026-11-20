@@ -111,6 +111,31 @@ void dequantize_fp8(TensorView packed, TensorView scales, TensorView output) {
                                      tokens, hidden, get_stream(packed.device()));
   LL_CUDA(cudaGetLastError());
 }
+
+void dequantize_dispatch_recv(int precision, TensorView packed, TensorView scales,
+                              TensorView counts, float global_scale, TensorView output) {
+  LL_CHECK(precision == 0 || precision == 1, "received dequantization requires FP8 or NVFP4");
+  LL_CHECK(packed.ndim() == 3 && packed.size(1) > 0,
+           "received payload must have shape [experts, capacity, packed_hidden]");
+  LL_CHECK(precision != 1 || (std::isfinite(global_scale) && global_scale > 0.f),
+           "global_scale must be a positive finite float32 scalar");
+  int rows;
+  const int hidden = hidden_and_tokens(packed, dl_uint8, precision == 1 ? 2 : 1, rows);
+  check_row_shape(scales, packed, "scales", precision == 1 ? dl_uint8 : dl_float32,
+                  hidden / (precision == 1 ? 16 : 128));
+  check_row_shape(output, packed, "output", dl_bfloat16, hidden);
+  check_vector_alignment(output, "output");
+  check_tensor(counts, "counts", dl_int32, 1, packed.device().device_id);
+  LL_CHECK(counts.size(0) == packed.size(0), "counts must have one entry per local expert");
+  LL_CHECK(packed.size(1) <= std::numeric_limits<int>::max(), "receive capacity is too large");
+  check_dispatch_overlap({output}, {packed, scales, counts});
+  ffi::CUDADeviceGuard guard(packed.device().device_id);
+  extensions::dequantize_dispatch_recv(precision, packed.data_ptr(), scales.data_ptr(),
+                                       pointer<int>(counts), global_scale, output.data_ptr(), rows,
+                                       static_cast<int>(packed.size(1)), hidden,
+                                       get_stream(packed.device()));
+  LL_CUDA(cudaGetLastError());
+}
 }  // namespace deep_ep
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(quantize_nvfp4, deep_ep::quantize_nvfp4);
@@ -118,3 +143,4 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(quantize_nvfp4_uniform, deep_ep::quantize_nvfp4_un
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dequantize_nvfp4, deep_ep::dequantize_nvfp4);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(quantize_fp8, deep_ep::quantize_fp8);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dequantize_fp8, deep_ep::dequantize_fp8);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(dequantize_dispatch_recv, deep_ep::dequantize_dispatch_recv);

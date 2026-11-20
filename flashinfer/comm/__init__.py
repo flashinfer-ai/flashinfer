@@ -20,6 +20,7 @@ from .cake_fp4_allreduce import (
 from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
 from .rdma_moe_alltoall import (
+    RdmaDispatchLayout as RdmaDispatchLayout,
     RdmaMoeAlltoAll as RdmaMoeAlltoAll,
     RdmaMoeAlltoAllConfig as RdmaMoeAlltoAllConfig,
 )

@@ -24,7 +24,9 @@ or end-to-end decode improvement.
   are assigned to each rank. `num_experts * capacity` and signal IDs must fit
   signed 32-bit indices; the registered arena must fit device memory.
 - BF16, E4M3 FP8 with FP32 block scales per 128 values, and NVFP4 E2M1 with
-  E4M3 block scales per 16 values. Communication dtype is fixed per buffer.
+  E4M3 block scales per 16 values. Dispatch and combine codecs are fixed per
+  buffer and may differ. Opaque dispatch additionally transports arbitrary
+  contiguous per-token data and metadata bytes without interpreting them.
 - Audited **NCCL 2.30.7 GDAKI** host/device headers and runtime, with a working
   GPUDirect RDMA provider. Version/provider checks fail before communication
   when these requirements are unmet. InfiniBand/RoCE device setup is external.
@@ -113,8 +115,8 @@ for the configured wire format. Use `input_dtype="prequantized"` with
 scale shapes `[E_local,C,…]`, INT32 counts `[E_local]`, and an opaque handle.
 BF16 receives an empty final scale dimension. Only `counts[e]` rows are valid;
 padded rows are not expert inputs. A handle belongs to its originating buffer
-and dtype. Keep it intact; converting it to a plain tuple or using it with
-another buffer is rejected.
+and combine codec. Keep it intact; converting it to a plain tuple or using it
+with another buffer is rejected.
 
 For BF16 legacy dispatch with fixed capacity greater than eight and at least
 two experts, routes from one token to the same remote rank share one full
@@ -137,9 +139,21 @@ current token count or a requested auto mode. Packet dispatch retains the
 expert-capacity arena needed by NVFP4 combine; it does not use the compact
 BF16 planned arena.
 
-The buffer's `communication_dtype` selects the wire format. BF16 wire sends
-the input directly; FP8 and NVFP4 wire quantize BF16 rows on the current stream
-before transport, including on each CUDA Graph replay.
+The buffer's `communication_dtype` selects the combine wire format and the
+initial dispatch format. Set `dispatch_dtype="bf16"`, `"fp8"`, or `"nvfp4"` to
+choose a different dispatch format. BF16 dispatch sends the input directly;
+FP8 and NVFP4 dispatch quantize BF16 rows on the current stream before transport,
+including on each CUDA Graph replay. Automatic launch selection uses each
+operation's own codec.
+
+`output_dtype="bf16"` on `dispatch()` converts received FP8/NVFP4 rows back to
+BF16 and returns an empty scale tensor. This is opt-in: the default
+`output_dtype="wire"` retains packed data and block scales. Conversion runs
+after the receive completes, including when a receive hook is requested, and
+is captured by CUDA Graphs. It reads only valid rows and writes zeros to padded
+rows. NVFP4 conversion uses the externally agreed `nvfp4_global_scale`, also
+for prequantized inputs. BF16 output requires temporary wire-format receive
+storage; `out=` reuses the visible BF16 result, not that temporary storage.
 
 ```python
 from flashinfer.comm import RdmaMoeAlltoAll, RdmaMoeAlltoAllConfig
@@ -161,6 +175,61 @@ combined = buffer.combine(
 output = combined.data
 # All ranks retire GPU/Graph users, then call buffer.close() collectively.
 ```
+
+### Opaque dispatch
+
+Use `RdmaDispatchLayout(data_bytes, scale_bytes=0)` to reserve fixed per-token
+byte widths instead of a typed dispatch codec. This enables bitwise routing of
+prequantized MXFP8, MXFP4, NVFP4, FP8 or other caller-defined encodings without
+adding a codec to the communication kernel. The two lanes are contiguous
+`x[T, ...]` and optional `x_scales[T, ...]`; tensor dtypes and trailing dimensions
+are preserved in the returned `[E_local,C,...]` tensors. Each lane's trailing
+dimensions times its element size must equal its configured byte width.
+Widths need not be multiples of 16 bytes. CUDA strided tensor storage is
+required; sparse and quantized tensor wrappers are not accepted.
+
+```python
+from flashinfer.comm import RdmaDispatchLayout, RdmaMoeAlltoAll, RdmaMoeAlltoAllConfig
+
+# Example: caller-prepared MXFP8 bytes and one exponent-scale byte per 32 values.
+# Both tensors use contiguous token-major rows; no GEMM-specific swizzle here.
+buffer = RdmaMoeAlltoAll(
+    group, num_max_dispatch_tokens_per_rank=8, hidden=5120, num_experts=384,
+    config=RdmaMoeAlltoAllConfig(
+        communication_dtype="bf16",  # Expert output combine remains BF16.
+        dispatch_layout=RdmaDispatchLayout(data_bytes=5120, scale_bytes=160),
+    ),
+)
+received = buffer.dispatch(
+    mxfp8_data, topk_idx, x_scales=mxfp8_scales, input_dtype="raw",
+)
+# received.data and received.scales preserve the routed bytes exactly.
+# Feed an appropriate expert GEMM, then combine its BF16 output with the handle.
+```
+
+Opaque dispatch supports `output_dtype="wire"` only, and does not accept
+`dispatch_dtype` in its configuration. With `auto`, fixed capacity greater
+than 32 and at least two experts selects rank-packet dispatch: one unchanged
+data/scales packet is sent per token and destination rank, then expanded into
+its local expert rows. Other capacities use the coalesced per-expert protocol.
+This decision depends on fixed capacity, not the actual token count, and does
+not depend on hidden width or EP size. Combine is selected independently.
+
+Explicit `communication_mode="coalesced"` (or the corresponding
+`dispatch_mode` override) retains per-expert opaque dispatch at every capacity,
+providing a direct control for the packet optimization. Explicit `legacy`
+opaque dispatch uses rank packets and requires capacity greater than 32 and at
+least two experts; smaller capacities are rejected before native allocation.
+Both protocols preserve valid-row bytes and the public output layout exactly.
+All ranks must agree on both lane layouts and the meaning of the bytes. This
+agreement does not reformat a backend-specific GEMM scale layout or transmit
+external/global scales automatically. With `scale_bytes=0`, pass
+`x_scales=None`; the returned scale tensor is UINT8 `[E_local,C,0]`.
+
+`hidden` still describes the BF16 expert output consumed by combine and must
+be one of the supported hidden widths. Opaque dispatch does not change combine's
+numeric contract. The planned BF16 reduction requires typed BF16 dispatch;
+use the ordinary FP32 reduction for mixed codecs or opaque dispatch.
 
 Empty tensors, including BF16's UINT8 `[E_local,C,0]` receive scales and
 zero-token inputs, retain the same device, rank and dtype checks as nonempty

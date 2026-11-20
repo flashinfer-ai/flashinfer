@@ -114,6 +114,20 @@ class _CombinePlan:
 
 
 @dataclass(frozen=True)
+class RdmaDispatchLayout:
+    """Opaque bytes transmitted for each token, without numeric conversion.
+
+    ``data_bytes`` is positive; ``scale_bytes`` may be zero. Both lanes contain
+    contiguous token rows, with no required byte alignment or padding. Tensor
+    dtypes and trailing dimensions are preserved at dispatch output. Every rank
+    must agree on the meaning and layout of those bytes.
+    """
+
+    data_bytes: int
+    scale_bytes: int = 0
+
+
+@dataclass(frozen=True)
 class RdmaMoeAlltoAllConfig:
     """Fixed communication precision and launch policy for an all-to-all buffer.
 
@@ -127,7 +141,11 @@ class RdmaMoeAlltoAllConfig:
     The two BF16 local-partial modes have a separate rounding contract described
     in :meth:`RdmaMoeAlltoAll.combine`. The planned mode exchanges routes and
     weights in dispatch and retains their snapshot in the returned handle.
-    All ranks must construct the same configuration.
+    ``communication_dtype`` selects the combine codec and, by default, the
+    dispatch codec. ``dispatch_dtype`` selects a different typed dispatch codec.
+    Alternatively, ``dispatch_layout`` enables opaque data/scales transport;
+    it cannot be combined with ``dispatch_dtype``. Planned BF16 reduction
+    requires typed BF16 dispatch. All ranks must use the same configuration.
     """
 
     communication_dtype: str = "nvfp4"
@@ -142,6 +160,8 @@ class RdmaMoeAlltoAllConfig:
     dispatch_num_contexts: Optional[int] = None
     combine_num_contexts: Optional[int] = None
     combine_reduction: str = "fp32"
+    dispatch_dtype: Optional[str] = None
+    dispatch_layout: Optional[RdmaDispatchLayout] = None
 
 
 class DispatchResult(NamedTuple):
@@ -149,7 +169,8 @@ class DispatchResult(NamedTuple):
 
     When requested, ``recv_hook`` completes the receive phase on the same CUDA
     stream as the send phase; invoke it exactly once before consuming outputs.
-    BF16 communication returns an empty last dimension in ``scales``.
+    BF16 output and opaque transport without scales return an empty last
+    dimension in ``scales``. Only ``counts[e]`` rows are valid for expert ``e``.
     """
 
     data: torch.Tensor
@@ -236,6 +257,14 @@ class RdmaMoeAlltoAll:
         dispatch_num_contexts = settings.dispatch_num_contexts
         combine_num_contexts = settings.combine_num_contexts
         combine_reduction = settings.combine_reduction
+        dispatch_layout = settings.dispatch_layout
+        dispatch_dtype = (
+            "raw"
+            if dispatch_layout is not None
+            else communication_dtype
+            if settings.dispatch_dtype is None
+            else settings.dispatch_dtype
+        )
         self.config = settings
         self.group = group
         self.rank = dist.get_rank(group)
@@ -244,6 +273,8 @@ class RdmaMoeAlltoAll:
         self.hidden = hidden
         self.num_experts = num_experts
         self.communication_dtype = communication_dtype
+        self.dispatch_dtype = dispatch_dtype
+        self.dispatch_layout = dispatch_layout
         self.combine_reduction = combine_reduction
         self._handle = None
         self._closed = False
@@ -270,6 +301,8 @@ class RdmaMoeAlltoAll:
             dispatch_num_contexts=dispatch_num_contexts,
             combine_num_contexts=combine_num_contexts,
             combine_reduction=combine_reduction,
+            dispatch_dtype=dispatch_dtype,
+            dispatch_layout=dispatch_layout,
         )
         budgets = {
             key: collective_config[key]
@@ -315,6 +348,38 @@ class RdmaMoeAlltoAll:
                 raise ValueError(
                     "communication_dtype must be 'bf16', 'fp8', or 'nvfp4'"
                 )
+            if dispatch_layout is not None:
+                if not isinstance(dispatch_layout, RdmaDispatchLayout):
+                    raise TypeError(
+                        "dispatch_layout must be RdmaDispatchLayout or None"
+                    )
+                if settings.dispatch_dtype is not None:
+                    raise ValueError(
+                        "dispatch_layout and dispatch_dtype are mutually exclusive"
+                    )
+                if (
+                    type(dispatch_layout.data_bytes) is not int
+                    or not 0 < dispatch_layout.data_bytes < 2**31
+                    or type(dispatch_layout.scale_bytes) is not int
+                    or not 0 <= dispatch_layout.scale_bytes < 2**31
+                    or dispatch_layout.data_bytes + dispatch_layout.scale_bytes
+                    > 2**31 - 97
+                ):
+                    raise ValueError(
+                        "dispatch row bytes must leave 96 bytes of int32 header/padding space, with data_bytes > 0 and scale_bytes >= 0"
+                    )
+                if (dispatch_mode or mode) == "legacy" and not (
+                    num_max_dispatch_tokens_per_rank > 32 and num_experts >= 2
+                ):
+                    raise ValueError(
+                        "opaque legacy dispatch requires capacity > 32 and at least two experts"
+                    )
+            elif dispatch_dtype not in _PRECISION:
+                raise ValueError(
+                    "dispatch_dtype must be None, 'bf16', 'fp8', or 'nvfp4'"
+                )
+            if combine_reduction == _PLANNED_REDUCTION and dispatch_dtype != "bf16":
+                raise ValueError("planned reduction requires typed BF16 dispatch")
             if combine_reduction not in (
                 "fp32",
                 "bf16_local_partial",
@@ -403,11 +468,36 @@ class RdmaMoeAlltoAll:
                 capability,
                 sms,
             )
-            dispatch_mode = selection["dispatch"]["mode"]
+            dispatch_selection = selection
+            if dispatch_dtype == "raw":
+                rank_packet = num_max_dispatch_tokens_per_rank > 32 and num_experts >= 2
+                dispatch_selection = {
+                    "dispatch": dict(
+                        mode="legacy" if rank_packet else "coalesced",
+                        num_sms=None,
+                        num_contexts=None,
+                    ),
+                    "profile": None,
+                    "reason": "opaque capacity > 32 uses rank-packet dispatch"
+                    if rank_packet
+                    else "opaque rows use coalesced dispatch below the rank-packet threshold",
+                }
+            elif dispatch_dtype != communication_dtype:
+                dispatch_selection = select_rdma_strategy(
+                    hidden,
+                    dispatch_dtype,
+                    num_max_dispatch_tokens_per_rank,
+                    self.num_ranks,
+                    num_experts,
+                    name,
+                    capability,
+                    sms,
+                )
+            dispatch_mode = dispatch_selection["dispatch"]["mode"]
             combine_mode = selection["combine"]["mode"]
-            dispatch_num_sms = selection["dispatch"]["num_sms"]
+            dispatch_num_sms = dispatch_selection["dispatch"]["num_sms"]
             combine_num_sms = selection["combine"]["num_sms"]
-            dispatch_num_contexts = selection["dispatch"]["num_contexts"]
+            dispatch_num_contexts = dispatch_selection["dispatch"]["num_contexts"]
             combine_num_contexts = selection["combine"]["num_contexts"]
             runtime_mode = "legacy"
             self._strategy_selection.update(
@@ -417,6 +507,8 @@ class RdmaMoeAlltoAll:
                 selection_reason=selection["reason"]
                 if homogeneous
                 else "heterogeneous devices: legacy fallback",
+                dispatch_selection_profile=dispatch_selection["profile"],
+                dispatch_selection_reason=dispatch_selection["reason"],
             )
         error = None
         try:
@@ -434,8 +526,17 @@ class RdmaMoeAlltoAll:
         self._raise_errors([item[1] for item in ids], "creating NCCL unique ID")
         error = None
         try:
+            create = self._module.gin_create
+            dispatch_args: tuple[int, ...] = ()
+            if dispatch_layout is not None or dispatch_dtype != communication_dtype:
+                create = self._module.gin_create_with_dispatch
+                dispatch_args = (
+                    3 if dispatch_layout is not None else _PRECISION[dispatch_dtype],
+                    dispatch_layout.data_bytes if dispatch_layout is not None else 0,
+                    dispatch_layout.scale_bytes if dispatch_layout is not None else 0,
+                )
             self._handle = _call(
-                self._module.gin_create,
+                create,
                 self.rank,
                 self.num_ranks,
                 ids[0][0],
@@ -455,6 +556,7 @@ class RdmaMoeAlltoAll:
                 -1 if dispatch_num_contexts is None else dispatch_num_contexts,
                 -1 if combine_num_contexts is None else combine_num_contexts,
                 combine_reduction,
+                *dispatch_args,
             )
         except Exception as exc:
             error = _error(exc)
@@ -579,68 +681,120 @@ class RdmaMoeAlltoAll:
         *,
         x_scales=None,
         input_dtype="bf16",
+        output_dtype="wire",
         nvfp4_global_scale=256.0,
         topk_weights=None,
         out=None,
         cumulative_local_expert_recv_stats=None,
         return_recv_hook=False,
     ) -> DispatchResult:
-        """Dispatch tokens into expert-major rows and return a :class:`DispatchResult`.
+        """Route token rows and return a :class:`DispatchResult`.
 
-        ``input_dtype="prequantized"`` preserves the wire-format input contract.
-        With ``input_dtype="bf16"``, ``x`` is BF16 ``[tokens, hidden]`` and
-        ``x_scales`` must be None. FP8/NVFP4 inputs are dynamically block
-        quantized on the current stream before dispatch; BF16 is sent directly.
-        NVFP4 uses the positive finite host scalar ``nvfp4_global_scale``.
-        All ranks and receiving experts must externally agree on that value:
-        dispatch transmits block scales, but not the global scale.
+        ``input_dtype="bf16"`` accepts BF16 ``[tokens, hidden]`` and quantizes
+        to the configured dispatch codec on the current stream. BF16 wire
+        needs no conversion. ``input_dtype="prequantized"`` accepts that codec's
+        packed data and scales unchanged. NVFP4 uses the positive finite host
+        scalar ``nvfp4_global_scale``; all ranks must agree on it externally,
+        because only block scales are transmitted.
 
-        ``out`` reuses recv_x, recv_scales, counts, src_info and ranges.
-        BF16 recv_scales has
-        shape ``[local_experts, world_size * capacity, 0]`` and uint8 dtype.
-        Routing must contain distinct expert ids per token, with -1 for unused
-        picks. Value checks are the caller's responsibility and do not run here.
+        ``output_dtype="wire"`` preserves the wire-format output by default.
+        ``output_dtype="bf16"`` additionally dequantizes FP8/NVFP4 receives,
+        including within a receive hook or CUDA Graph. It returns empty scales
+        and zeros invalid rows without reading their uninitialized payload.
+        It requires temporary wire-format receive storage even with ``out=``.
 
-        ``bf16_local_partial_planned`` requires float32 ``topk_weights`` with
-        the same shape as ``topk_idx``. Dispatch snapshots routes and weights,
-        transmits them with the tokens, and builds a handle-owned combine plan.
-        That work is part of dispatch. Consume it with ``combine(x, handle)``;
-        later changes to caller routes/weights do not alter the handle's plan.
-        Other reduction modes reject ``topk_weights`` here and take weights
-        at combine time as before. Input tensors must remain valid and unchanged
-        until this asynchronous dispatch completes.
+        A buffer with ``dispatch_layout`` accepts only ``input_dtype="raw"``.
+        Contiguous CUDA ``x[tokens, ...]`` and optional ``x_scales[tokens, ...]``
+        must match the configured per-token byte sizes. Their dtypes, trailing
+        dimensions and valid-row bytes are preserved exactly; no conversion
+        or interpretation occurs. All ranks must agree on their row layouts.
+        Opaque input only supports ``output_dtype="wire"``.
+
+        ``out`` reuses data, scales, counts, src_info and ranges in that order.
+        Data/scales use the requested output format. BF16 output and opaque
+        dispatch without scales use UINT8 ``[local_experts, world*capacity, 0]``
+        scales. Only ``counts[e]`` rows are valid for expert ``e``. Routing must
+        contain distinct expert ids per token, with -1 for unused picks; value
+        validation is the caller's responsibility.
+
+        ``bf16_local_partial_planned`` requires typed BF16 dispatch and float32
+        ``topk_weights`` matching ``topk_idx``. Dispatch snapshots routes and
+        weights in the returned handle. Other reductions take weights at
+        combine time. Inputs must remain valid and unchanged until the
+        asynchronous operation completes. When returned, invoke ``recv_hook``
+        exactly once before consuming results or submitting another operation.
         """
         stream = self._check_call()
-        precision = self.communication_dtype
-        precision_id = self._precision(precision)
-        if input_dtype not in ("prequantized", "bf16"):
-            raise ValueError("input_dtype must be 'prequantized' or 'bf16'")
-        if not isinstance(x, torch.Tensor) or x.ndim != 2:
-            raise ValueError("x must be a two-dimensional token tensor")
+        precision = self.dispatch_dtype
+        raw = self.dispatch_layout is not None
+        if input_dtype not in (("raw",) if raw else ("prequantized", "bf16")):
+            raise ValueError(
+                "opaque dispatch requires input_dtype='raw'"
+                if raw
+                else "input_dtype must be 'prequantized' or 'bf16' for typed dispatch"
+            )
+        if output_dtype not in ("wire", "bf16") or (raw and output_dtype != "wire"):
+            raise ValueError(
+                "output_dtype must be 'wire' or 'bf16'; opaque dispatch requires 'wire'"
+            )
+        if not isinstance(x, torch.Tensor) or x.ndim < 1:
+            raise ValueError("x must be a token tensor with a leading token dimension")
         tokens = x.shape[0]
-        width = self.hidden // 2 if precision == "nvfp4" else self.hidden
-        scale_width = {
-            "bf16": 0,
-            "fp8": self.hidden // 128,
-            "nvfp4": self.hidden // 16,
-        }[precision]
-        dtype = torch.bfloat16 if precision == "bf16" else torch.uint8
-        scale_dtype = torch.float32 if precision == "fp8" else torch.uint8
-        if input_dtype == "bf16":
-            self._tensor(x, "x", torch.bfloat16, (tokens, self.hidden))
-            if x_scales is not None:
-                raise ValueError("BF16 input dispatch requires x_scales=None")
-            if precision == "nvfp4":
-                nvfp4_global_scale = self._uniform_nvfp4_scale(nvfp4_global_scale)
-        else:
-            self._tensor(x, "x", dtype, (tokens, width))
         if tokens > self.num_max_dispatch_tokens_per_rank:
             raise ValueError("token count exceeds the fixed dispatch capacity")
-        if precision == "bf16":
-            if x_scales is not None:
+        dequantize = output_dtype == "bf16" and precision != "bf16"
+        if raw:
+
+            def check_lane(tensor, name, row_bytes):
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or tensor.layout != torch.strided
+                    or tensor.is_quantized
+                    or tensor.ndim < 1
+                    or tensor.shape[0] != tokens
+                    or tensor.device != self.device
+                    or not tensor.is_contiguous()
+                    or math.prod(tensor.shape[1:]) * tensor.element_size() != row_bytes
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous on {self.device} with {tokens} token rows of {row_bytes} bytes"
+                    )
+
+            check_lane(x, "x", self.dispatch_layout.data_bytes)
+            data_shape, dtype = tuple(x.shape[1:]), x.dtype
+            if self.dispatch_layout.scale_bytes:
+                check_lane(x_scales, "x_scales", self.dispatch_layout.scale_bytes)
+                scale_shape, scale_dtype = tuple(x_scales.shape[1:]), x_scales.dtype
+            else:
+                if x_scales is not None:
+                    raise ValueError("zero scale_bytes requires x_scales=None")
+                scale_shape, scale_dtype = (0,), torch.uint8
+            precision_id = 3
+        else:
+            precision_id = _PRECISION[precision]
+            width = self.hidden // 2 if precision == "nvfp4" else self.hidden
+            scale_width = {
+                "bf16": 0,
+                "fp8": self.hidden // 128,
+                "nvfp4": self.hidden // 16,
+            }[precision]
+            dtype = torch.bfloat16 if precision == "bf16" else torch.uint8
+            scale_dtype = torch.float32 if precision == "fp8" else torch.uint8
+            data_shape, scale_shape = (width,), (scale_width,)
+            if input_dtype == "bf16":
+                self._tensor(x, "x", torch.bfloat16, (tokens, self.hidden))
+                if x_scales is not None:
+                    raise ValueError("BF16 input dispatch requires x_scales=None")
+            else:
+                self._tensor(x, "x", dtype, (tokens, width))
+                if precision != "bf16":
+                    self._tensor(
+                        x_scales, "x_scales", scale_dtype, (tokens, scale_width)
+                    )
+            if precision == "bf16" and x_scales is not None:
                 raise ValueError("BF16 dispatch requires x_scales=None")
-        elif input_dtype == "prequantized":
-            self._tensor(x_scales, "x_scales", scale_dtype, (tokens, scale_width))
+            if precision == "nvfp4" and (input_dtype == "bf16" or dequantize):
+                nvfp4_global_scale = self._uniform_nvfp4_scale(nvfp4_global_scale)
         if (
             not isinstance(topk_idx, torch.Tensor)
             or topk_idx.ndim != 2
@@ -662,14 +816,21 @@ class RdmaMoeAlltoAll:
         stats = cumulative_local_expert_recv_stats
         if stats is not None:
             self._tensor(stats, "recv_stats", torch.int32, (local_experts,))
+        prefix = (local_experts, cap)
         shapes = [
-            (local_experts, cap, width),
-            (local_experts, cap, scale_width),
+            (*prefix, self.hidden) if dequantize else (*prefix, *data_shape),
+            (*prefix, 0) if dequantize else (*prefix, *scale_shape),
             (local_experts,),
-            (local_experts, cap),
+            prefix,
             (local_experts, self.num_ranks),
         ]
-        dtypes = [dtype, scale_dtype, torch.int32, torch.int32, torch.int64]
+        dtypes = [
+            torch.bfloat16 if dequantize else dtype,
+            torch.uint8 if dequantize else scale_dtype,
+            torch.int32,
+            torch.int32,
+            torch.int64,
+        ]
         if out is None:
             outputs = [
                 torch.empty(shape, dtype=dt, device=self.device)
@@ -684,10 +845,25 @@ class RdmaMoeAlltoAll:
             ):
                 self._tensor(tensor, f"out[{i}]", dt, shape)
             self._disjoint(outputs, [x, x_scales, topk_idx, topk_weights, stats])
-        recv_x, recv_scales, counts, src, ranges = outputs[:5]
+        recv_x, recv_scales, counts, src, ranges = outputs
+        wire_outputs = outputs
+        quantization = None
+        if dequantize:
+            if recv_x.numel() and recv_x.data_ptr() % 16:
+                raise ValueError("out[0] must have a 16-byte aligned data pointer")
+            quantization = get_quantization_module()
+            wire_outputs = [
+                torch.empty((*prefix, *data_shape), dtype=dtype, device=self.device),
+                torch.empty(
+                    (*prefix, *scale_shape), dtype=scale_dtype, device=self.device
+                ),
+                counts,
+                src,
+                ranges,
+            ]
         source_x = x
         if input_dtype == "bf16":
-            # Reject invalid output metadata before submitting any quantization.
+            # Validate output metadata before submitting any quantization.
             for name, tensor in (("x", x), ("out[0]", recv_x), ("out[1]", recv_scales)):
                 if tensor.numel() and tensor.data_ptr() % 16:
                     raise ValueError(f"{name} must have a 16-byte aligned data pointer")
@@ -696,7 +872,7 @@ class RdmaMoeAlltoAll:
                 x_scales = torch.empty(
                     (tokens, scale_width), dtype=scale_dtype, device=self.device
                 )
-                quantization = get_quantization_module()
+                quantization = quantization or get_quantization_module()
                 if precision == "fp8":
                     _call(quantization.quantize_fp8, source_x, x, x_scales)
                 else:
@@ -707,19 +883,54 @@ class RdmaMoeAlltoAll:
                         x,
                         x_scales,
                     )
-        args = [self._handle, precision_id, x, x_scales, topk_idx, stats, *outputs]
+        if raw:
+            layout = self.dispatch_layout
+            # A byte view changes neither storage nor the public tensor layout.
+            x = x.view(torch.uint8).reshape(tokens, layout.data_bytes)
+            if x_scales is not None:
+                x_scales = x_scales.view(torch.uint8).reshape(
+                    tokens, layout.scale_bytes
+                )
+            wire_outputs = [
+                recv_x.view(torch.uint8).reshape(*prefix, layout.data_bytes),
+                recv_scales.view(torch.uint8).reshape(*prefix, layout.scale_bytes),
+                counts,
+                src,
+                ranges,
+            ]
+            args = [self._handle, x, x_scales, topk_idx, stats, *wire_outputs]
+            function = self._module.gin_dispatch_raw
+        else:
+            args = [
+                self._handle,
+                precision_id,
+                x,
+                x_scales,
+                topk_idx,
+                stats,
+                *wire_outputs,
+            ]
+            function = self._module.gin_dispatch
         slot = self._slot
-        function = self._module.gin_dispatch
         plan = None
         if planned:
             plan = _CombinePlan(self, tokens, topk_idx.shape[1])
             args.extend([topk_weights, *plan.tensors])
             function = self._module.gin_dispatch_planned
 
-        # A pending receive hook owns both the quantized send buffers in args
-        # and the original BF16 source. Quantization runs only before send.
+        # Hooks retain original and packed inputs and temporary wire receives.
         def launch(phases, _source=source_x):
             _call(function, *args, phases, slot)
+            if dequantize and phases & 2:
+                _call(
+                    quantization.dequantize_dispatch_recv,
+                    precision_id,
+                    wire_outputs[0],
+                    wire_outputs[1],
+                    counts,
+                    nvfp4_global_scale if precision == "nvfp4" else 1.0,
+                    recv_x,
+                )
 
         hook = self._launch(launch, return_recv_hook, stream)
         values = (
@@ -730,7 +941,10 @@ class RdmaMoeAlltoAll:
             self.num_experts,
         )
         handle = DispatchHandle(
-            values, owner=self._owner, precision=precision, combine_plan=plan
+            values,
+            owner=self._owner,
+            precision=self.communication_dtype,
+            combine_plan=plan,
         )
         return DispatchResult(recv_x, recv_scales, counts, handle, hook)
 

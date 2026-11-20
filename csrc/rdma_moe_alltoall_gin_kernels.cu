@@ -376,10 +376,31 @@ void dispatch(int precision, void* packed_recv_x, void* packed_recv_x_scales,
               int num_max_dispatch_tokens_per_rank, int num_topk, int num_experts, int rank,
               int num_ranks, void* workspace, int num_device_sms, cudaStream_t stream,
               int phases EP_GIN_HOST_ARG) {
-  EP_HOST_ASSERT(precision >= 0 && precision <= 2);
-  EP_HOST_ASSERT(precision == 2 ||
+  EP_HOST_ASSERT(precision >= 0 && precision <= 3);
+  EP_HOST_ASSERT(precision >= 2 ||
                  ((num_tokens == 0 || x_scales != nullptr) && packed_recv_x_scales != nullptr));
-  if (gin_launch.nvfp4_rank_packet) {
+  if (precision == 3) {
+    EP_HOST_ASSERT((gin_launch.coalesced || gin_launch.dispatch_rank_packet) &&
+                   gin_launch.dispatch_data_bytes > 0 && gin_launch.dispatch_scale_bytes >= 0 &&
+                   !gin_launch.bf16_local_partial_planned);
+    EP_HOST_ASSERT(gin_launch.num_ctas > 0 && gin_launch.num_ctas <= num_device_sms);
+    EP_HOST_ASSERT(gin_launch.send_counts != nullptr && gin_launch.recv_counts != nullptr);
+    SETUP_LAUNCH_CONFIG(gin_launch.num_ctas, kGinChannelThreads, stream);
+    auto dispatch_func = dispatch_channels<GinOpaqueDispatch, 0, true>;
+    if (gin_launch.dispatch_rank_packet) {
+      EP_HOST_ASSERT(num_max_dispatch_tokens_per_rank > 32 && num_experts >= 2 &&
+                     gin_launch.planned_counts != nullptr &&
+                     gin_launch.planned_fanout_cursors != nullptr);
+      dispatch_func = dispatch_channels_rank_packet<0, true>;
+    }
+    LAUNCH_KERNEL(&cfg, dispatch_func, packed_recv_x, packed_recv_x_scales, packed_recv_src_info,
+                  packed_recv_layout_range, packed_recv_count, cumulative_local_expert_recv_stats,
+                  rdma_recv_x, rdma_x, x, x_scales, topk_idx, num_tokens,
+                  num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks, phases,
+                  gin_launch);
+    return;
+  }
+  if (gin_launch.dispatch_rank_packet) {
     EP_HOST_ASSERT(precision == 1 && num_max_dispatch_tokens_per_rank > 32 && num_ranks > 0 &&
                    gin_launch.num_ctas > 0 && gin_launch.num_ctas <= num_device_sms &&
                    num_topk > 0 && num_topk <= 8 && gin_launch.send_counts != nullptr &&
@@ -387,7 +408,7 @@ void dispatch(int precision, void* packed_recv_x, void* packed_recv_x_scales,
                    gin_launch.planned_fanout_cursors != nullptr);
 #define NVFP4_RANK_PACKET_LAUNCH_CASE(hidden)                                                      \
   {                                                                                                \
-    auto dispatch_func = dispatch_channels_nvfp4_rank_packet<hidden>;                              \
+    auto dispatch_func = dispatch_channels_rank_packet<hidden>;                                    \
     LAUNCH_KERNEL(&cfg, dispatch_func, packed_recv_x, packed_recv_x_scales, packed_recv_src_info,  \
                   packed_recv_layout_range, packed_recv_count, cumulative_local_expert_recv_stats, \
                   rdma_recv_x, rdma_x, x, x_scales, topk_idx, num_tokens,                          \

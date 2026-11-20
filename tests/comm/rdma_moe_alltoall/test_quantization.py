@@ -119,3 +119,61 @@ def test_misaligned_payloads_are_rejected_before_launch(quant_device, precision)
             RdmaMoeAlltoAll.dequantize_fp8_to_bf16(packed, scales)
         else:
             RdmaMoeAlltoAll.dequantize_nvfp4_to_bf16(packed, global_scale, scales)
+
+
+@pytest.mark.parametrize("precision", ("fp8", "nvfp4"))
+@pytest.mark.parametrize("global_scale", (1.0, 128.0))
+def test_received_dequantization_masks_padding_in_graph(
+    quant_device, precision, global_scale
+):
+    from flashinfer.comm import RdmaMoeAlltoAll
+    from flashinfer.jit.rdma_moe_alltoall import get_quantization_module
+
+    hidden, experts, capacity = 5120, 3, 4
+    x = (
+        torch.arange(experts * capacity * hidden, device=quant_device)
+        .remainder(29)
+        .sub_(14)
+        .to(torch.bfloat16)
+        .reshape(experts, capacity, hidden)
+        / 8
+    )
+    if precision == "nvfp4":
+        packed, scales = RdmaMoeAlltoAll.quantize_bf16_to_nvfp4(
+            x, torch.full((experts, capacity, 1), global_scale, device=quant_device)
+        )
+    else:
+        packed, scales = RdmaMoeAlltoAll.quantize_bf16_to_fp8(x)
+    original_scales = scales.clone()
+    counts = torch.tensor([0, 1, 4], dtype=torch.int32, device=quant_device)
+    out = torch.empty_like(x)
+    module = get_quantization_module()
+
+    def run():
+        module.dequantize_dispatch_recv(
+            1 if precision == "nvfp4" else 0, packed, scales, counts, global_scale, out
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    with torch.cuda.stream(stream):
+        for values in ([0, 1, 4], [2, 4, 0], [0, 0, 0]):
+            counts.copy_(torch.tensor(values, dtype=torch.int32, device=quant_device))
+            valid = torch.arange(capacity, device=quant_device)[None] < counts[:, None]
+            scales.copy_(original_scales)
+            # Poison invalid rows; the receive helper must not propagate NaNs.
+            scales[~valid] = 127 if precision == "nvfp4" else float("nan")
+            graph.replay()
+            expected = decode(
+                packed, scales, precision, global_scale, kernel_arithmetic=True
+            ).to(torch.bfloat16)
+            expected[~valid] = 0
+            torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=False)
+    torch.cuda.synchronize()
+    graph.reset()

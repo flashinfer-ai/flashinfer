@@ -171,12 +171,82 @@ __device__ __forceinline__ int gin_planned_acquire_source_ready(const int* ready
   return count;
 }
 
-// Isolated NVFP4 packet protocol. Public expert-major rows/ranges remain the
-// old Combine contract; only native ready/cursors reuse the BF16 fanout helpers.
-// A packet contains token/T/K/flag, eight expert IDs, packed NVFP4, and scales.
+// Wire rows are 16-byte padded, while public tensors retain their exact byte width.
+// Only aligned full vectors use int4 accesses; byte tails never read past a row.
+template <bool kRemote>
+__device__ __forceinline__ void gin_copy_bytes(uint8_t* dst, const uint8_t* src, size_t bytes,
+                                               int lane, int stride) {
+  if ((reinterpret_cast<uintptr_t>(dst) | reinterpret_cast<uintptr_t>(src)) % 16 == 0) {
+    for (size_t i = lane; i < bytes / 16; i += stride) {
+      const auto* input = reinterpret_cast<const int4*>(src) + i;
+      reinterpret_cast<int4*>(dst)[i] = kRemote ? ld_nc_global(input) : __ldg(input);
+    }
+    const size_t tail = bytes / 16 * 16;
+    for (size_t i = tail + lane; i < bytes; i += stride)
+      dst[i] = kRemote ? ld_nc_global(src + i) : __ldg(src + i);
+  } else {
+    for (size_t i = lane; i < bytes; i += stride)
+      dst[i] = kRemote ? ld_nc_global(src + i) : __ldg(src + i);
+  }
+}
+
+// Load each wire value once and broadcast it to the selected local expert rows.
+// Unlike reference headers, packet fanout does not depend on payload size.
+template <typename T>
+__device__ __forceinline__ void gin_packet_fanout_store(uint8_t* output, size_t row_bytes,
+                                                        size_t offset, const T& value,
+                                                        unsigned mask, uint64_t row0, uint64_t row1,
+                                                        uint64_t row2, uint64_t row3, uint64_t row4,
+                                                        uint64_t row5, uint64_t row6,
+                                                        uint64_t row7) {
+#define GIN_PACKET_STORE_ROW(i)                          \
+  if (mask & (1u << i)) {                                \
+    auto* dst = output + row##i * row_bytes + offset;    \
+    if constexpr (sizeof(T) == 16)                       \
+      st_na_global(reinterpret_cast<int4*>(dst), value); \
+    else                                                 \
+      *dst = value;                                      \
+  }
+  GIN_PACKET_STORE_ROW(0)
+  GIN_PACKET_STORE_ROW(1)
+  GIN_PACKET_STORE_ROW(2)
+  GIN_PACKET_STORE_ROW(3)
+  GIN_PACKET_STORE_ROW(4)
+  GIN_PACKET_STORE_ROW(5)
+  GIN_PACKET_STORE_ROW(6)
+  GIN_PACKET_STORE_ROW(7)
+#undef GIN_PACKET_STORE_ROW
+}
+
+__device__ __forceinline__ void gin_packet_fanout_bytes(void* output, const uint8_t* input,
+                                                        size_t bytes, unsigned mask, uint64_t row0,
+                                                        uint64_t row1, uint64_t row2, uint64_t row3,
+                                                        uint64_t row4, uint64_t row5, uint64_t row6,
+                                                        uint64_t row7) {
+  auto* dst = static_cast<uint8_t*>(output);
+  const int lane = threadIdx.x % 32;
+  // All public rows are aligned exactly when the base and row stride are.
+  if ((reinterpret_cast<uintptr_t>(dst) | bytes) % 16 == 0) {
+    for (size_t i = lane; i < bytes / 16; i += 32) {
+      const int4 value = ld_nc_global(reinterpret_cast<const int4*>(input) + i);
+      gin_packet_fanout_store(dst, bytes, i * 16, value, mask, row0, row1, row2, row3, row4, row5,
+                              row6, row7);
+    }
+  } else {
+    for (size_t i = lane; i < bytes; i += 32) {
+      const uint8_t value = ld_nc_global(input + i);
+      gin_packet_fanout_store(dst, bytes, i, value, mask, row0, row1, row2, row3, row4, row5, row6,
+                              row7);
+    }
+  }
+}
+
+// Rank-packet dispatch retains public expert-major rows/ranges for combine.
+// Native ready/cursors reuse the existing fanout helpers. A packet contains
+// token/T/K/flag, eight expert IDs, payload bytes, and optional scale bytes.
 // No weights or BF16 partial plan are transported or constructed.
-template <int kHidden>
-__global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_nvfp4_rank_packet(
+template <int kHidden, bool kOpaque = false>
+__global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_rank_packet(
     void* packed_recv_x, void* packed_recv_x_scales, int* packed_recv_src_info,
     int64_t* packed_recv_layout_range, int* packed_recv_count,
     int* cumulative_local_expert_recv_stats, void* rdma_recv_x, void* rdma_x, const void* x,
@@ -185,7 +255,11 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_nvfp4
   constexpr size_t kHeaderBytes = 48;
   constexpr size_t kDataVecs = size_t(kHidden) / 2 / sizeof(int4);
   constexpr size_t kScaleVecs = size_t(kHidden) / 16 / sizeof(int4);
-  constexpr size_t kMsgBytes = kHeaderBytes + size_t(kHidden) / 2 + size_t(kHidden) / 16;
+  const size_t data_bytes = kOpaque ? size_t(launch.dispatch_data_bytes) : size_t(kHidden) / 2;
+  const size_t scale_bytes = kOpaque ? size_t(launch.dispatch_scale_bytes) : size_t(kHidden) / 16;
+  const size_t data_stride = (data_bytes + 15) / 16 * 16;
+  const size_t scale_stride = (scale_bytes + 15) / 16 * 16;
+  const size_t kMsgBytes = kHeaderBytes + data_stride + scale_stride;
   constexpr int kWarps = kGinChannelThreads / 32;
   const int lane = threadIdx.x % 32, local_warp = threadIdx.x / 32;
   const int global_thread = blockIdx.x * blockDim.x + threadIdx.x;
@@ -199,7 +273,7 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_nvfp4
   const bool source_ready = source_ready_ctas != 0;
   const int data_ctas = int(gridDim.x) - source_ready_ctas;
   auto grid = cg::this_grid();
-  EP_DEVICE_ASSERT(launch.nvfp4_rank_packet && !launch.bf16_local_partial_planned &&
+  EP_DEVICE_ASSERT(launch.dispatch_rank_packet && !launch.bf16_local_partial_planned &&
                    num_ranks > 0 && num_topk >= 1 && num_topk <= 8 &&
                    launch.planned_counts != nullptr && launch.planned_fanout_cursors != nullptr);
   if (phases & LOW_LATENCY_SEND_PHASE) {
@@ -222,13 +296,27 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_nvfp4
         EP_DEVICE_ASSERT(expert < num_experts);
         reinterpret_cast<int*>(message + 16)[threadIdx.x] = expert;
       }
-      auto* data = reinterpret_cast<int4*>(message + kHeaderBytes);
-      auto* scales = data + kDataVecs;
-      for (size_t vector = threadIdx.x; vector < kDataVecs; vector += blockDim.x)
-        data[vector] = __ldg(static_cast<const int4*>(x) + size_t(token) * kDataVecs + vector);
-      for (size_t vector = threadIdx.x; vector < kScaleVecs; vector += blockDim.x)
-        scales[vector] =
-            __ldg(static_cast<const int4*>(x_scales) + size_t(token) * kScaleVecs + vector);
+      if constexpr (kOpaque) {
+        gin_copy_bytes<false>(message + kHeaderBytes,
+                              static_cast<const uint8_t*>(x) + size_t(token) * data_bytes,
+                              data_bytes, threadIdx.x, blockDim.x);
+        if (scale_bytes)
+          gin_copy_bytes<false>(message + kHeaderBytes + data_stride,
+                                static_cast<const uint8_t*>(x_scales) + size_t(token) * scale_bytes,
+                                scale_bytes, threadIdx.x, blockDim.x);
+        for (size_t i = data_bytes + threadIdx.x; i < data_stride; i += blockDim.x)
+          message[kHeaderBytes + i] = 0;
+        for (size_t i = scale_bytes + threadIdx.x; i < scale_stride; i += blockDim.x)
+          message[kHeaderBytes + data_stride + i] = 0;
+      } else {
+        auto* data = reinterpret_cast<int4*>(message + kHeaderBytes);
+        auto* scales = data + kDataVecs;
+        for (size_t vector = threadIdx.x; vector < kDataVecs; vector += blockDim.x)
+          data[vector] = __ldg(static_cast<const int4*>(x) + size_t(token) * kDataVecs + vector);
+        for (size_t vector = threadIdx.x; vector < kScaleVecs; vector += blockDim.x)
+          scales[vector] =
+              __ldg(static_cast<const int4*>(x_scales) + size_t(token) * kScaleVecs + vector);
+      }
       __syncthreads();
 
       const int expert =
@@ -378,45 +466,62 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_nvfp4
       const uint32_t hi = __shfl_sync(0xffffffff, uint32_t(row >> 32), 7);
       row7 = (uint64_t(hi) << 32) | lo;
     }
-    const auto* data = reinterpret_cast<const int4*>(message + kHeaderBytes);
-    for (size_t vector = lane; vector < kDataVecs; vector += 32) {
-      const int4 value = ld_nc_global(data + vector);
-      if (selected_mask & (1u << 0))
-        st_na_global(static_cast<int4*>(packed_recv_x) + row0 * kDataVecs + vector, value);
-      if (selected_mask & (1u << 1))
-        st_na_global(static_cast<int4*>(packed_recv_x) + row1 * kDataVecs + vector, value);
-      if (selected_mask & (1u << 2))
-        st_na_global(static_cast<int4*>(packed_recv_x) + row2 * kDataVecs + vector, value);
-      if (selected_mask & (1u << 3))
-        st_na_global(static_cast<int4*>(packed_recv_x) + row3 * kDataVecs + vector, value);
-      if (selected_mask & (1u << 4))
-        st_na_global(static_cast<int4*>(packed_recv_x) + row4 * kDataVecs + vector, value);
-      if (selected_mask & (1u << 5))
-        st_na_global(static_cast<int4*>(packed_recv_x) + row5 * kDataVecs + vector, value);
-      if (selected_mask & (1u << 6))
-        st_na_global(static_cast<int4*>(packed_recv_x) + row6 * kDataVecs + vector, value);
-      if (selected_mask & (1u << 7))
-        st_na_global(static_cast<int4*>(packed_recv_x) + row7 * kDataVecs + vector, value);
-    }
-    const auto* scales = reinterpret_cast<const int4*>(message + kHeaderBytes) + kDataVecs;
-    for (size_t vector = lane; vector < kScaleVecs; vector += 32) {
-      const int4 value = ld_nc_global(scales + vector);
-      if (selected_mask & (1u << 0))
-        st_na_global(static_cast<int4*>(packed_recv_x_scales) + row0 * kScaleVecs + vector, value);
-      if (selected_mask & (1u << 1))
-        st_na_global(static_cast<int4*>(packed_recv_x_scales) + row1 * kScaleVecs + vector, value);
-      if (selected_mask & (1u << 2))
-        st_na_global(static_cast<int4*>(packed_recv_x_scales) + row2 * kScaleVecs + vector, value);
-      if (selected_mask & (1u << 3))
-        st_na_global(static_cast<int4*>(packed_recv_x_scales) + row3 * kScaleVecs + vector, value);
-      if (selected_mask & (1u << 4))
-        st_na_global(static_cast<int4*>(packed_recv_x_scales) + row4 * kScaleVecs + vector, value);
-      if (selected_mask & (1u << 5))
-        st_na_global(static_cast<int4*>(packed_recv_x_scales) + row5 * kScaleVecs + vector, value);
-      if (selected_mask & (1u << 6))
-        st_na_global(static_cast<int4*>(packed_recv_x_scales) + row6 * kScaleVecs + vector, value);
-      if (selected_mask & (1u << 7))
-        st_na_global(static_cast<int4*>(packed_recv_x_scales) + row7 * kScaleVecs + vector, value);
+    if constexpr (kOpaque) {
+      gin_packet_fanout_bytes(packed_recv_x, message + kHeaderBytes, data_bytes, selected_mask,
+                              row0, row1, row2, row3, row4, row5, row6, row7);
+      if (scale_bytes)
+        gin_packet_fanout_bytes(packed_recv_x_scales, message + kHeaderBytes + data_stride,
+                                scale_bytes, selected_mask, row0, row1, row2, row3, row4, row5,
+                                row6, row7);
+    } else {
+      const auto* data = reinterpret_cast<const int4*>(message + kHeaderBytes);
+      for (size_t vector = lane; vector < kDataVecs; vector += 32) {
+        const int4 value = ld_nc_global(data + vector);
+        if (selected_mask & (1u << 0))
+          st_na_global(static_cast<int4*>(packed_recv_x) + row0 * kDataVecs + vector, value);
+        if (selected_mask & (1u << 1))
+          st_na_global(static_cast<int4*>(packed_recv_x) + row1 * kDataVecs + vector, value);
+        if (selected_mask & (1u << 2))
+          st_na_global(static_cast<int4*>(packed_recv_x) + row2 * kDataVecs + vector, value);
+        if (selected_mask & (1u << 3))
+          st_na_global(static_cast<int4*>(packed_recv_x) + row3 * kDataVecs + vector, value);
+        if (selected_mask & (1u << 4))
+          st_na_global(static_cast<int4*>(packed_recv_x) + row4 * kDataVecs + vector, value);
+        if (selected_mask & (1u << 5))
+          st_na_global(static_cast<int4*>(packed_recv_x) + row5 * kDataVecs + vector, value);
+        if (selected_mask & (1u << 6))
+          st_na_global(static_cast<int4*>(packed_recv_x) + row6 * kDataVecs + vector, value);
+        if (selected_mask & (1u << 7))
+          st_na_global(static_cast<int4*>(packed_recv_x) + row7 * kDataVecs + vector, value);
+      }
+      const auto* scales = reinterpret_cast<const int4*>(message + kHeaderBytes) + kDataVecs;
+      for (size_t vector = lane; vector < kScaleVecs; vector += 32) {
+        const int4 value = ld_nc_global(scales + vector);
+        if (selected_mask & (1u << 0))
+          st_na_global(static_cast<int4*>(packed_recv_x_scales) + row0 * kScaleVecs + vector,
+                       value);
+        if (selected_mask & (1u << 1))
+          st_na_global(static_cast<int4*>(packed_recv_x_scales) + row1 * kScaleVecs + vector,
+                       value);
+        if (selected_mask & (1u << 2))
+          st_na_global(static_cast<int4*>(packed_recv_x_scales) + row2 * kScaleVecs + vector,
+                       value);
+        if (selected_mask & (1u << 3))
+          st_na_global(static_cast<int4*>(packed_recv_x_scales) + row3 * kScaleVecs + vector,
+                       value);
+        if (selected_mask & (1u << 4))
+          st_na_global(static_cast<int4*>(packed_recv_x_scales) + row4 * kScaleVecs + vector,
+                       value);
+        if (selected_mask & (1u << 5))
+          st_na_global(static_cast<int4*>(packed_recv_x_scales) + row5 * kScaleVecs + vector,
+                       value);
+        if (selected_mask & (1u << 6))
+          st_na_global(static_cast<int4*>(packed_recv_x_scales) + row6 * kScaleVecs + vector,
+                       value);
+        if (selected_mask & (1u << 7))
+          st_na_global(static_cast<int4*>(packed_recv_x_scales) + row7 * kScaleVecs + vector,
+                       value);
+      }
     }
   }
 }
@@ -720,7 +825,14 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_plann
   }
 }
 
-template <typename Precision, int kHidden>
+// Opaque rows have no numerical element or scale interpretation. These neutral
+// compile-time values leave all dimensions to the immutable launch byte layout.
+struct GinOpaqueDispatch {
+  static constexpr int kNumElemsPerUnit = 1, kUnitBytes = 1;
+  static constexpr int kNumElemsPerScale = 1, kBytesPerScale = 0;
+};
+
+template <typename Precision, int kHidden, bool kOpaque = false>
 __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels(
     void* packed_recv_x, void* packed_recv_x_scales, int* packed_recv_src_info,
     int64_t* packed_recv_layout_range, int* packed_recv_count,
@@ -735,7 +847,11 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels(
   constexpr size_t kDataVecs = kHiddenBytes / sizeof(int4);
   constexpr size_t kScaleVecs = kScalesBytes / sizeof(int4);
   const size_t header_bytes = launch.bf16_local_partial_planned ? 80 : sizeof(int4);
-  const size_t kMsgBytes = header_bytes + kHiddenBytes + kScalesBytes;
+  const size_t data_bytes = kOpaque ? size_t(launch.dispatch_data_bytes) : kHiddenBytes;
+  const size_t scale_bytes = kOpaque ? size_t(launch.dispatch_scale_bytes) : kScalesBytes;
+  const size_t data_stride = (data_bytes + 15) / 16 * 16;
+  const size_t scale_stride = (scale_bytes + 15) / 16 * 16;
+  const size_t kMsgBytes = header_bytes + data_stride + scale_stride;
   const int lane = threadIdx.x % 32;
   const int local_warp = threadIdx.x / 32;
   const int global_thread = blockIdx.x * blockDim.x + threadIdx.x;
@@ -744,9 +860,8 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels(
   const int total_warps = total_threads / 32;
   const int local_experts = num_experts / num_ranks;
   auto grid = cg::this_grid();
-  // BF16 references fit in the registered send arena's idle combine space:
-  // C * (16 + 2H + 16K) <= E * C * 2H for E >= 2, H >= 4096, K <= 8.
-  const bool rank_dedup = Precision::kBytesPerScale == 0 && num_experts >= 2;
+  // BF16 references use an explicitly reserved immutable tail after token records.
+  const bool rank_dedup = !kOpaque && Precision::kBytesPerScale == 0 && num_experts >= 2;
   __shared__ int route_slots[kGinChannelThreads / 32];
 
   if (phases & LOW_LATENCY_SEND_PHASE) {
@@ -781,12 +896,26 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels(
         else
           *reinterpret_cast<int4*>(message) = make_int4(token, 0, 0, 0);
       }
-      for (int i = threadIdx.x; i < kDataVecs; i += blockDim.x)
-        data[i] = __ldg(static_cast<const int4*>(x) + token * kDataVecs + i);
-      if constexpr (kScalesBytes > 0) {
-        auto* scales = reinterpret_cast<int4*>(message + header_bytes + kHiddenBytes);
-        for (int i = threadIdx.x; i < kScaleVecs; i += blockDim.x)
-          scales[i] = __ldg(static_cast<const int4*>(x_scales) + token * kScaleVecs + i);
+      if constexpr (kOpaque) {
+        gin_copy_bytes<false>(message + header_bytes,
+                              static_cast<const uint8_t*>(x) + size_t(token) * data_bytes,
+                              data_bytes, threadIdx.x, blockDim.x);
+        if (scale_bytes)
+          gin_copy_bytes<false>(message + header_bytes + data_stride,
+                                static_cast<const uint8_t*>(x_scales) + size_t(token) * scale_bytes,
+                                scale_bytes, threadIdx.x, blockDim.x);
+        for (size_t i = data_bytes + threadIdx.x; i < data_stride; i += blockDim.x)
+          message[header_bytes + i] = 0;
+        for (size_t i = scale_bytes + threadIdx.x; i < scale_stride; i += blockDim.x)
+          message[header_bytes + data_stride + i] = 0;
+      } else {
+        for (int i = threadIdx.x; i < kDataVecs; i += blockDim.x)
+          data[i] = __ldg(static_cast<const int4*>(x) + token * kDataVecs + i);
+        if constexpr (kScalesBytes > 0) {
+          auto* scales = reinterpret_cast<int4*>(message + header_bytes + kHiddenBytes);
+          for (int i = threadIdx.x; i < kScaleVecs; i += blockDim.x)
+            scales[i] = __ldg(static_cast<const int4*>(x_scales) + token * kScaleVecs + i);
+        }
       }
       __syncthreads();
 
@@ -876,15 +1005,24 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels(
       if (launch.bf16_local_partial_planned && lane == 0)
         planned_record_row(payload, peer, rank * local_experts + expert,
                            output_base + begin + token, capacity, num_experts, launch);
-      const auto* data = reinterpret_cast<const int4*>(payload + header_bytes);
-      auto* out_data =
-          static_cast<int4*>(packed_recv_x) + (output_base + begin + token) * kDataVecs;
-      for (int i = lane; i < kDataVecs; i += 32) out_data[i] = ld_nc_global(data + i);
-      if constexpr (kScalesBytes > 0) {
-        const auto* scales = reinterpret_cast<const int4*>(message + header_bytes + kHiddenBytes);
-        auto* out_scales =
-            static_cast<int4*>(packed_recv_x_scales) + (output_base + begin + token) * kScaleVecs;
-        for (int i = lane; i < kScaleVecs; i += 32) out_scales[i] = ld_nc_global(scales + i);
+      if constexpr (kOpaque) {
+        const size_t row = output_base + begin + token;
+        gin_copy_bytes<true>(static_cast<uint8_t*>(packed_recv_x) + row * data_bytes,
+                             payload + header_bytes, data_bytes, lane, 32);
+        if (scale_bytes)
+          gin_copy_bytes<true>(static_cast<uint8_t*>(packed_recv_x_scales) + row * scale_bytes,
+                               payload + header_bytes + data_stride, scale_bytes, lane, 32);
+      } else {
+        const auto* data = reinterpret_cast<const int4*>(payload + header_bytes);
+        auto* out_data =
+            static_cast<int4*>(packed_recv_x) + (output_base + begin + token) * kDataVecs;
+        for (int i = lane; i < kDataVecs; i += 32) out_data[i] = ld_nc_global(data + i);
+        if constexpr (kScalesBytes > 0) {
+          const auto* scales = reinterpret_cast<const int4*>(message + header_bytes + kHiddenBytes);
+          auto* out_scales =
+              static_cast<int4*>(packed_recv_x_scales) + (output_base + begin + token) * kScaleVecs;
+          for (int i = lane; i < kScaleVecs; i += 32) out_scales[i] = ld_nc_global(scales + i);
+        }
       }
     }
   }

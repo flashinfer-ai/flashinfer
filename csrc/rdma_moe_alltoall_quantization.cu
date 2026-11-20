@@ -160,5 +160,51 @@ void dequantize_fp8_to_bf16(const void* fp8_input, const void* fp32_scales, void
                 hidden_dim / 8);
 }
 
+// The receive allocation contains capacity rows, but only counts[expert] rows
+// have been written by dispatch. Never read payload or scales in the padding.
+template <bool Nvfp4>
+__global__ __launch_bounds__(256) void dequantize_dispatch_recv_kernel(
+    const void* packed, const void* scales, const int* counts, float global_scale, void* output,
+    int rows, int rows_per_expert, int hidden_access_num) {
+  for (int token = blockIdx.x; token < rows; token += gridDim.x) {
+    const bool valid = token % rows_per_expert < __ldg(counts + token / rows_per_expert);
+    const size_t row = size_t(token) * hidden_access_num;
+    for (int i = threadIdx.x; i < hidden_access_num; i += blockDim.x) {
+      int4 result = make_int4(0, 0, 0, 0);
+      if (valid) {
+        float values[8];
+        if constexpr (Nvfp4) {
+          const auto value = __ldg(static_cast<const uint32_t*>(packed) + row + i);
+          const auto scale = __ldg(static_cast<const uint8_t*>(scales) + row / 2 + i / 2);
+          dequantize_nvfp4_to_bf16<false>(value, global_scale, scale, values);
+        } else {
+          const auto value = __ldg(static_cast<const int2*>(packed) + row + i);
+          const auto scale = __ldg(static_cast<const float*>(scales) + row / 16 + i / 16);
+          dequantize_fp8_to_bf16<false>(value, scale, values);
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          reinterpret_cast<nv_bfloat16*>(&result)[j] = static_cast<nv_bfloat16>(values[j]);
+      }
+      static_cast<int4*>(output)[row + i] = result;
+    }
+  }
+}
+
+void dequantize_dispatch_recv(int precision, const void* packed, const void* scales,
+                              const int* counts, float global_scale, void* output, int rows,
+                              int rows_per_expert, int hidden, cudaStream_t stream) {
+  EP_HOST_ASSERT((precision == 0 || precision == 1) && rows >= 0 && rows_per_expert > 0);
+  if (rows == 0) return;
+  SETUP_LAUNCH_CONFIG(std::min(rows, get_sm_count()), 256, stream);
+  if (precision == 1) {
+    LAUNCH_KERNEL(&cfg, dequantize_dispatch_recv_kernel<true>, packed, scales, counts, global_scale,
+                  output, rows, rows_per_expert, hidden / 8);
+  } else {
+    LAUNCH_KERNEL(&cfg, dequantize_dispatch_recv_kernel<false>, packed, scales, counts,
+                  global_scale, output, rows, rows_per_expert, hidden / 8);
+  }
+}
+
 }  // namespace extensions
 }  // namespace deep_ep
