@@ -16,17 +16,12 @@
 
 #pragma once
 
-#include "../../arch/cp_async.cuh"
-#include "../../arch/matrix_memory.cuh"
-#include "../../arch/mma_sm120.cuh"
-#include "../../arch/mma_sm120_nvfp4.cuh"
 #include "../../common/lse.cuh"
 #include "../../common/zero_row.cuh"
 #include "../../compute/nvfp4_vt.cuh"
-#include "../../compute/warp_tiles.cuh"
-#include "../../pipeline/staged_pipeline.cuh"
-#include "gather.cuh"
-#include "q_stage.cuh"
+#include "../cute_prefill/nvfp4_gather.cuh"
+#include "../cute_prefill/nvfp4_mma.cuh"
+#include "../cute_prefill/nvfp4_q_stage.cuh"
 #include "resources.cuh"
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
@@ -40,7 +35,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     const int32_t* __restrict__ extra_indices, const int* __restrict__ extra_topk_length_ptr,
     int extra_topk, int extra_page_block_size, size_t extra_page_stride_bytes, int num_tokens,
     int scratch_split_stride, int chunks_per_block, float sm_scale, int page_block_size,
-    size_t page_stride_bytes, bool write_direct, float lse_scale) {
+    size_t page_stride_bytes, bool write_direct, float lse_scale, SparseMlaMegaParams mega = {}) {
   using KV = KVCacheTraits<MT>;
   static_assert(MT == ModelType::DSV4);
   constexpr int D_NOPE = KV::D_NOPE;
@@ -80,7 +75,13 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     if (!is_io) {
       if (write_direct) {
         for (int i = threadIdx.x; i < VALID_HPB * D_V_C; i += DECODE_MATH_THREADS) {
-          output[((size_t)token_idx * NUM_HEADS + h_start) * D_V_C + i] = __float2bfloat16(0.f);
+          const size_t offset = ((size_t)token_idx * NUM_HEADS + h_start) * D_V_C + i;
+          if (mega.output) {
+            mega.output[offset] = 0;
+            // ceil_pow2(1e-4/448) = 2^-22, UE8M0 = 105.
+            if ((i & 31) == 0) mega.scales[offset / 32] = 105;
+          } else
+            output[offset] = __float2bfloat16(0.f);
         }
         if (threadIdx.x < VALID_HPB) {
           const int h = h_start + threadIdx.x;
@@ -101,12 +102,20 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
   __shared__ bf16 sm_p_full[HPB][DECODE_CAND_WINDOW];
   const int32_t* idx_base = indices + (size_t)token_idx * TOPK;
 
-  using Ring = pipeline::AsyncRing<DECODE_KV_BUF_COUNT>;
-  if (threadIdx.x == 0) Ring::init(sm.mbar_full(0), sm.mbar_empty(0));
+  // Every consumer publishes completion of its reads before the producer
+  // reuses a raw slot, matching the streaming kernel's counted handoff.
+  using Barrier = cutlass::arch::ClusterBarrier;
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int slot = 0; slot < DECODE_KV_BUF_COUNT; ++slot) {
+      Barrier::init(sm.mbar_full(slot), 1);
+      Barrier::init(sm.mbar_empty(slot), DECODE_MATH_THREADS);
+    }
+  }
   __syncthreads();
 
   auto issue_gather = [&](int chunk, int buf) {
-    gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, DECODE_KV_SMEM_STRIDE, DECODE_IO_WARPS * 32>(
+    cute_gather_tile<PAGE_BLOCK_SIZE, DUAL_CACHE, DECODE_KV_SMEM_STRIDE, DECODE_IO_WARPS * 32>(
         kv_cache, idx_base, chunk, topk_len, false, page_block_size, page_stride_bytes,
         (warp_id - DECODE_N_WARPS) * 32 + lane, sm.kv_fp4(buf), sm.kv_rope(buf), sm.kv_sc(buf),
         sm.mbar_full(buf), num_main_chunks, extra_topk_len, extra_kv_cache,
@@ -119,9 +128,12 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     int raw_slot = 0;
     for (int chunk = chunk_lo; chunk < chunk_hi; ++chunk) {
       const int buf = (chunk - chunk_lo) % DECODE_KV_BUF_COUNT;
-      Ring::Free::wait(sm.mbar_empty(raw_slot), raw_free_phase);
+      Barrier::wait(sm.mbar_empty(raw_slot), raw_free_phase);
       issue_gather(chunk, buf);
-      Ring::advance(raw_slot, raw_free_phase);
+      if (++raw_slot == DECODE_KV_BUF_COUNT) {
+        raw_slot = 0;
+        raw_free_phase ^= 1;
+      }
     }
     return;
   }
@@ -129,14 +141,17 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
   const int gid = lane >> 2;
   const int tid = lane & 3;
   const bf16* q_base = q + (size_t)token_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_nvfp4_to_smem<DECODE_MATH_THREADS>(sm.q_fp4(), sm.q_sc(), sm.q_rope(), q_base,
-                                                VALID_HPB);
+  cute_quantize_prefill_q_nvfp4_to_smem<DECODE_MATH_THREADS, DSV4_NVFP4_Q_PACKED_STRIDE,
+                                        DSV4_NVFP4_SCALE_STRIDE>(
+      sm.q_fp4(), sm.q_sc(), sm.q_rope(), q_base, VALID_HPB, mega.row(token_idx));
 
   float acc_nope_groups[1][PV_GROUPS_PER_WARP][PV_N8_TILES_PER_GROUP][4] = {0};
   auto& acc_nope = acc_nope_groups[0];
   float acc_rope[ROPE_N_TILES][4] = {0};
   float global_max[2] = {-1e30f, -1e30f};
   float global_sum[2] = {0.f, 0.f};
+  const auto copy_rope_a = cute::make_tiled_copy_A(
+      cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, uint16_t>{}, cute::make_tiled_mma(RopeMma{}));
   uint32_t raw_ready_phase = 0;
   int raw_consumer_slot = 0;
 
@@ -156,7 +171,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     }
     const int chunk_start = section_chunk * DECODE_CAND_WINDOW;
     const int chunk_end = min(chunk_start + DECODE_CAND_WINDOW, section_len);
-    Ring::Ready::wait(sm.mbar_full(raw_consumer_slot), raw_ready_phase);
+    Barrier::wait(sm.mbar_full(raw_consumer_slot), raw_ready_phase);
 
     uint8_t* sm_kv_fp4 = sm.kv_fp4(buf);
     uint8_t* sm_kv_sc = sm.kv_sc(buf);
@@ -165,26 +180,26 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     float qk_groups[1][DECODE_QK_N_TILES][4] = {0};
     auto& qk = qk_groups[0];
     const int warp_first_cand = warp_id * DECODE_ENTRIES_PER_WARP;
-    qk_nvfp4_nope_16x8<1, DSV4_NVFP4_Q_PACKED_STRIDE, DSV4_NVFP4_SCALE_STRIDE,
-                       DECODE_KV_SMEM_STRIDE, DECODE_SCALE_BYTES_PER_TOKEN, NUM_K64_TILES>(
+    cute_qk_nvfp4<1, DSV4_NVFP4_Q_PACKED_STRIDE, DSV4_NVFP4_SCALE_STRIDE, DECODE_KV_SMEM_STRIDE,
+                  DECODE_SCALE_BYTES_PER_TOKEN, NUM_K64_TILES>(
         qk_groups, sm.q_fp4(), sm.q_sc(), sm_kv_fp4, sm_kv_sc, warp_first_cand, lane);
 
 #pragma unroll
     for (int ks = 0; ks < D_ROPE_C / 16; ++ks) {
-      uint32_t a0, a1, a2, a3;
-      ldmatrix_load_A_bf16(a0, a1, a2, a3, sm.q_rope() + ks * 16, D_ROPE_C, lane);
+      auto rA = cute::make_tensor<uint32_t>(cute::make_layout(cute::_4{}));
+      auto sQ = cute::make_tensor(cute::make_smem_ptr(sm.q_rope()), CutePrefillQRopeLayout{});
+      auto sQTile = cute::local_tile(sQ, cute::Shape<cute::_16, cute::_16>{},
+                                     cute::make_coord(cute::_0{}, ks));
+      copy_mma_operand<uint16_t, 8>(copy_rope_a, cute::recast<uint16_t>(sQTile), rA, lane);
 #pragma unroll
       for (int nt = 0; nt < DECODE_QK_N_TILES; ++nt) {
         const int cand_row_base = warp_first_cand + nt * 8;
         const bf16* rope_row = sm_kv_rope + (size_t)(cand_row_base + gid) * D_ROPE_C + ks * 16;
-        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2);
-        const uint32_t b1 = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2 + 8);
-        MmaBf16Result r =
-            mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, qk[nt][0], qk[nt][1], qk[nt][2], qk[nt][3]);
-        qk[nt][0] = r.d0;
-        qk[nt][1] = r.d1;
-        qk[nt][2] = r.d2;
-        qk[nt][3] = r.d3;
+        auto rB = cute::make_tensor<uint32_t>(cute::make_layout(cute::_2{}));
+        rB(0) = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2);
+        rB(1) = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2 + 8);
+        auto rC = cute::make_tensor(&qk[nt][0], cute::make_layout(cute::_4{}));
+        cute::MMA_Atom<RopeMma>{}.call(rA, rB, rC);
       }
     }
 
@@ -240,7 +255,9 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       sm.reduce_scratch_second()[warp_id * HPB + gid] = local_sum[0];
       sm.reduce_scratch_second()[warp_id * HPB + gid + 8] = local_sum[1];
     }
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, DECODE_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        DECODE_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
     if (threadIdx.x < VALID_HPB) {
       const int h = threadIdx.x;
       float block_max = -1e30f;
@@ -255,7 +272,9 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       sm.reduce_scratch()[h] = block_max;
       sm.reduce_scratch_second()[h] = block_sum;
     }
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, DECODE_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        DECODE_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
     const float block_max0 = sm.reduce_scratch()[gid];
     const float block_max1 = sm.reduce_scratch()[gid + 8];
@@ -316,10 +335,14 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     // transpose/dequantize/requantize token-major paged V into the single
     // ephemeral CTA-local V^T stage; the producer warps have already started
     // gathering the next candidate tile into the other source buffer.
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, DECODE_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        DECODE_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
     prepare_nvfp4_vt_from_smem<DECODE_MATH_THREADS, DECODE_KV_SMEM_STRIDE>(
         sm_kv_fp4, sm_kv_sc, sm.vt_data(), sm.vt_sc());
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, DECODE_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        DECODE_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
     for (int task = threadIdx.x; task < HPB * DECODE_VT_SCALE_GROUPS; task += DECODE_MATH_THREADS) {
       const int head = task / DECODE_VT_SCALE_GROUPS;
@@ -329,17 +352,22 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
           sm.p_fp4() + head * DECODE_W_PACKED_STRIDE + cand_group * FP4_PACKED_PER_GROUP,
           sm.w_sc() + head * DECODE_VT_SCALE_GROUPS + cand_group);
     }
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, DECODE_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        DECODE_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
-    pv_nvfp4_vt_16x16<1, DECODE_W_PACKED_STRIDE, DECODE_N_WARPS>(
+    cute_pv_nvfp4<1, DECODE_W_PACKED_STRIDE, DECODE_N_WARPS>(
         acc_nope_groups, sm.p_fp4(), sm.w_sc(), sm.vt_data(), sm.vt_sc(), warp_id, lane);
 
     const int rope_dim_base = warp_id * ROPE_DIMS_PER_WARP;
 #pragma unroll
     for (int ks = 0; ks < ROPE_K_ITERS; ++ks) {
-      uint32_t a0, a1, a2, a3;
-      ldmatrix_load_A_bf16(a0, a1, a2, a3, reinterpret_cast<const bf16*>(&sm_p_full[0][ks * 16]),
-                           DECODE_CAND_WINDOW, lane);
+      auto rA = cute::make_tensor<uint32_t>(cute::make_layout(cute::_4{}));
+      auto sP =
+          cute::make_tensor(cute::make_smem_ptr(&sm_p_full[0][ks * 16]),
+                            cute::Layout<cute::Shape<cute::_16, cute::_16>,
+                                         cute::Stride<cute::Int<DECODE_CAND_WINDOW>, cute::_1>>{});
+      copy_mma_operand<uint16_t, 8>(copy_rope_a, cute::recast<uint16_t>(sP), rA, lane);
 #pragma unroll
       for (int nt = 0; nt < ROPE_N_TILES; ++nt) {
         const int n_col = rope_dim_base + nt * 8;
@@ -357,20 +385,22 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
             *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent8 * D_ROPE_C + col);
         const uint16_t v9 =
             *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent9 * D_ROPE_C + col);
-        const uint32_t b0 = (uint32_t)v0 | ((uint32_t)v1 << 16);
-        const uint32_t b1 = (uint32_t)v8 | ((uint32_t)v9 << 16);
-        MmaBf16Result r = mma_bf16_m16n8k16(a0, a1, a2, a3, b0, b1, acc_rope[nt][0],
-                                            acc_rope[nt][1], acc_rope[nt][2], acc_rope[nt][3]);
-        acc_rope[nt][0] = r.d0;
-        acc_rope[nt][1] = r.d1;
-        acc_rope[nt][2] = r.d2;
-        acc_rope[nt][3] = r.d3;
+        auto rB = cute::make_tensor<uint32_t>(cute::make_layout(cute::_2{}));
+        rB(0) = (uint32_t)v0 | ((uint32_t)v1 << 16);
+        rB(1) = (uint32_t)v8 | ((uint32_t)v9 << 16);
+        auto rC = cute::make_tensor(&acc_rope[nt][0], cute::make_layout(cute::_4{}));
+        cute::MMA_Atom<RopeMma>{}.call(rA, rB, rC);
       }
     }
 
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, DECODE_MATH_THREADS>();
-    if (threadIdx.x == 0) Ring::Free::publish(sm.mbar_empty(raw_consumer_slot));
-    Ring::advance(raw_consumer_slot, raw_ready_phase);
+    cutlass::arch::NamedBarrier::sync(
+        DECODE_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
+    Barrier::arrive(sm.mbar_empty(raw_consumer_slot));
+    if (++raw_consumer_slot == DECODE_KV_BUF_COUNT) {
+      raw_consumer_slot = 0;
+      raw_ready_phase ^= 1;
+    }
   }
 
   if (write_direct) {
@@ -404,7 +434,9 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
         sm.reduce_scratch_second()[gid + 8] = lse1;
       }
     }
-    bar_sync_t<Dsv4Nvfp4Sync::MATH, DECODE_MATH_THREADS>();
+    cutlass::arch::NamedBarrier::sync(
+        DECODE_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
   }
 
   const float direct_scale0 = write_direct ? sm.reduce_scratch()[gid] : 1.f;
@@ -418,6 +450,9 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
                        split_idx) *
                           D_V_C;
   const size_t head_stride = write_direct ? D_V_C : (size_t)scratch_split_stride * D_V_C;
+  // Both raw KV buffers are dead after the final tile and normalization barrier.
+  static_assert(2 * DecodeNVFP4Smem<MT>::SMEM_KV_FP4_BUF >= HPB * D_V_C * sizeof(bf16));
+  if (write_direct && mega.output) destination = reinterpret_cast<bf16*>(sm.kv_fp4(0));
 
 #pragma unroll
   for (int slot = 0; slot < PV_GROUPS_PER_WARP; ++slot) {
@@ -448,6 +483,15 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       *reinterpret_cast<__nv_bfloat162*>(&destination[(size_t)(gid + 8) * head_stride + d0]) = hi;
     }
   }
+  if (write_direct && mega.output) {
+    cutlass::arch::NamedBarrier::sync(
+        DECODE_MATH_THREADS,
+        static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::Q_STAGE));
+    for (int i = threadIdx.x; i < VALID_HPB * D_V_C / 8; i += DECODE_MATH_THREADS) {
+      mega_store8(*reinterpret_cast<const uint4*>(destination + i * 8),
+                  ((size_t)token_idx * NUM_HEADS + h_start) * D_V_C + i * 8, token_idx, mega);
+    }
+  }
   if (warp_id == 0 && tid == 0) {
     if (write_direct) {
       out_lse[(size_t)token_idx * NUM_HEADS + h_start + gid] =
@@ -476,7 +520,7 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
                                                bf16* __restrict__ output,
                                                float* __restrict__ out_lse,
                                                const float* __restrict__ attn_sink, int num_tokens,
-                                               float lse_scale) {
+                                               float lse_scale, SparseMlaMegaParams mega = {}) {
   constexpr int D_V = 512;
   constexpr int VECS_PER_HEAD = D_V / 8;
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
@@ -546,7 +590,12 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
     }
     bf16* final_output =
         output + ((size_t)token_idx * NUM_HEADS + h_start + local_head) * D_V + dim;
-    *reinterpret_cast<uint4*>(final_output) = merged;
+    if (mega.output) {
+      mega_store8(merged, ((size_t)token_idx * NUM_HEADS + h_start + local_head) * D_V + dim,
+                  token_idx, mega);
+    } else {
+      *reinterpret_cast<uint4*>(final_output) = merged;
+    }
   }
 }
 
