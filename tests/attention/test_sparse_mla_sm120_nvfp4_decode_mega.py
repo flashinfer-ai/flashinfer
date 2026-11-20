@@ -98,7 +98,14 @@ def test_nvfp4_decode_mega_query_alignment(tokens, chunks_per_block, offset):
 
 @pytest.mark.parametrize(
     "tokens,heads,topk,extra_topk",
-    [(7, 8, 128, 0), (14, 64, 512, 0), (7, 64, 128, 512), (14, 64, 128, 512)],
+    [
+        (7, 8, 128, 0),
+        (14, 64, 512, 0),
+        (7, 64, 128, 512),
+        (14, 64, 128, 512),
+        (140, 64, 128, 0),
+        (140, 64, 128, 512),
+    ],
 )
 def test_nvfp4_public_run_mega_decode(tokens, heads, topk, extra_topk):
     """Exercise wrapper-selected decode with single and dual caches."""
