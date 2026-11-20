@@ -25,9 +25,39 @@ deferred handoff to this package.
   composable fallback exists).
 - The kernel is bitwise deterministic, allocation-free at run time and
   CUDA-graph safe (warm up once before capture to build the JIT module).
-- JIT-only: no AOT registration, so it never ships in pre-built packages.
+- JIT-only: no AOT registration or precompiled kernels. Source-enabled wheels
+  include the CUDA sources and headers needed for JIT compilation. Release
+  wheels built with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` omit
+  these sources; use a source checkout or source-enabled wheel.
 - Tests: `tests/experimental/test_qsa_topk_indexer.py` (exact PyTorch
   reference, validated on SM107).
 
 The experimental lifecycle owner and the tracking issue are linked from the
 pull request that adds the package.
+
+## Runnable example
+
+Run on SM107 with a CUDA toolkit supporting that architecture. Calling the
+API explicitly opts into the experimental feature and warns once.
+
+```python
+import torch
+from flashinfer import qsa_topk_indexer
+
+# One request of 2600 tokens, with 650 compressed blocks in 11 pages.
+assert torch.cuda.get_device_capability() == (10, 7)
+qi = torch.zeros((2600, 4, 128), device="cuda").to(torch.float8_e4m3fn)
+ck = torch.ones((11, 64, 1, 128), device="cuda").to(torch.float8_e4m3fn)
+cu = torch.tensor([0, 2600], dtype=torch.int32, device="cuda")
+base = torch.tensor([0], dtype=torch.int32, device="cuda")
+packed = qsa_topk_indexer(qi, ck, cu, base)
+# All scores tie, so the last row retains the first 512 four-token blocks.
+assert packed.shape == (2600, 2052)
+assert packed[-1, -1].item() == 2048
+assert torch.equal(packed[-1, :2048], torch.arange(2048, device="cuda"))
+assert (packed[-1, 2048:-1] == -1).all()
+```
+
+The result contains request-local token IDs and a trailing count. It is not
+an input to qsa_indexed_forward, which uses a different index layout and
+device contract. A consumer must implement this packed SM107 layout.
