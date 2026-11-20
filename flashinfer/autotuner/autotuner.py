@@ -912,6 +912,29 @@ class TunableRunner(ABC):
         """
         return ()
 
+    def get_tactic_cache_key(
+        self, inputs: list[torch.Tensor]
+    ) -> tuple[Any, ...] | None:
+        """Optionally identify the tactic pool for tuning-cache reuse.
+
+        Return a cheap, hashable, cross-process-stable signature that changes
+        when tactics become available under the same runner identity. Like
+        cache-key extras, it must be invariant under input synthesis. Do not
+        build plans, profile, enumerate tactics, or launch GPU work here: this
+        runs before preparation, including on warm tuning hits and during a
+        CUDA Graph capture inside ``autotune(True)``. Lookups outside tuning
+        never call it. Coverage records persist the signature as text:
+        frozensets are written in a canonical order, and other values must
+        have a ``str()`` that is stable across processes.
+        Coverage keeps the signature read before tactic enumeration, so
+        preparation that changes it leads to a retune on the next pass.
+
+        ``None`` preserves the existing assumption that the runner identity
+        determines its tactic pool. A changed signature requires retuning,
+        including for a single runner, without invalidating serving lookups.
+        """
+        return None
+
     def precompile_tactics(
         self,
         inputs: List[torch.Tensor],
@@ -1572,21 +1595,69 @@ class ProfilingCacheKey:
         return str(self.key_fields)
 
 
+class _SortedFrozensetText(tuple):
+    """A frozenset's items in sorted order that still prints as a frozenset."""
+
+    def __repr__(self) -> str:
+        return f"frozenset({{{', '.join(map(repr, self))}}})" if self else "frozenset()"
+
+
+def _canonical_signature(value: Any) -> Any:
+    """Order frozensets so a signature's persisted text is process-stable.
+
+    ``str()`` of a frozenset of strings depends on the per-process hash seed,
+    so equal signatures could otherwise be written differently. Frozensets
+    keep their ``frozenset(...)`` text so they never match an equal tuple.
+    """
+    if isinstance(value, frozenset):
+        return _SortedFrozensetText(
+            sorted((_canonical_signature(v) for v in value), key=repr)
+        )
+    if isinstance(value, tuple):
+        items = tuple(_canonical_signature(v) for v in value)
+        return (
+            value if all(a is b for a, b in zip(items, value, strict=True)) else items
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class _ProfilingCandidates:
-    runtime_keys: frozenset[tuple[str, int, tuple[Any, ...]]] | None
+    runtime_keys: (
+        frozenset[tuple[str, int, tuple[Any, ...], tuple[Any, ...] | None]] | None
+    )
     file_keys: tuple[str, ...] | None
+
+    @staticmethod
+    def tactic_keys(
+        runners: list[TunableRunner], inputs: list[torch.Tensor]
+    ) -> list[tuple[Any, ...] | None]:
+        return [r.get_tactic_cache_key(inputs) for r in runners]
 
     @classmethod
     def from_runners(
-        cls, runners: list[TunableRunner], inputs: list[torch.Tensor]
+        cls,
+        runners: list[TunableRunner],
+        inputs: list[torch.Tensor],
+        tactic_keys: list[tuple[Any, ...] | None] | None = None,
     ) -> "_ProfilingCandidates | None":
-        if len(runners) == 1:
+        """Build coverage keys; ``tactic_keys`` reuses signatures read earlier."""
+        if tactic_keys is None:
+            tactic_keys = cls.tactic_keys(runners, inputs)
+        if len(runners) == 1 and tactic_keys[0] is None:
             return None
         runtime_keys = frozenset(
-            (type(r).__name__, hash(r), r.get_cache_key_extras(inputs)) for r in runners
+            (type(r).__name__, hash(r), r.get_cache_key_extras(inputs), tactic_key)
+            for r, tactic_key in zip(runners, tactic_keys, strict=True)
         )
-        file_keys = {str((name, extras)) for name, _, extras in runtime_keys}
+        file_keys = {
+            str(
+                (name, extras)
+                if tactic_key is None
+                else (name, extras, _canonical_signature(tactic_key))
+            )
+            for name, _, extras, tactic_key in runtime_keys
+        }
         # Persisted keys omit runtime hashes, so collisions make coverage ambiguous.
         return cls(
             runtime_keys,
@@ -3359,10 +3430,14 @@ class AutoTuner:
             plan_error = None
             profiles = []
             profiling_candidates = None
+            # Signatures read before enumeration; coverage keeps them even if
+            # preparation changes a runner's pool (see get_tactic_cache_key).
+            tactic_keys = None
             try:
                 profiles = self._generate_optimization_profiles(tuning_config, inputs)
+                tactic_keys = _ProfilingCandidates.tactic_keys(runners, inputs)
                 profiling_candidates = _ProfilingCandidates.from_runners(
-                    runners, inputs
+                    runners, inputs, tactic_keys
                 )
             except (_TuningGroupError, _StickyCudaError):
                 raise
@@ -3702,9 +3777,10 @@ class AutoTuner:
                                 self._tie_tolerance,
                             )
                             _, runner_id, tactic = measured[winner]
-                            # Publish and look up coverage using the prepared runners.
+                            # Publish and look up coverage using the prepared runners'
+                            # hashes, but the pool signatures read before enumeration.
                             profiling_candidates = _ProfilingCandidates.from_runners(
-                                runners, inputs
+                                runners, inputs, tactic_keys
                             )
                             cache_key = self._get_cache_key(
                                 custom_op,
