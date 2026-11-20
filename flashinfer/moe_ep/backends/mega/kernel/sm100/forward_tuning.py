@@ -55,7 +55,9 @@ class ForwardExecution:
         }
 
     def make_trial(self, workspace):
-        from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import knob_keys
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
+            knob_keys,
+        )
 
         config = dataclasses.replace(
             self.backend._config,

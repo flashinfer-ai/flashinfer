@@ -1,46 +1,23 @@
-"""flashinfer.moe_ep — MoE Expert-Parallel (split + mega kernels).
+"""MoE expert parallelism with split and whole-layer kernel backends.
 
-Package layout::
+``backends/mega/kernel/<sm>/`` selects whole-layer implementations and adapts
+weights and inputs to the framework interfaces. Split mode selects compute and
+communication backends independently under ``backends/split/``.
 
-    moe_ep/
-      core/                 shared comm + kernel abstractions and validation
-      backends/
-        split/
-          comm/             MoE communication backends (NVLink one-sided with
-                            TRT-LLM or Cake kernels, NVLink two-sided, NCCL-EP)
-                            and the NCCL-EP / NIXL-EP Fleet transports
-          kernel/           post-dispatch inner kernels
-        mega/
-          kernel/           fused comm + local MoE kernels
-      modes/                split and mega orchestration layers
-      cute_dsl/             FlashInfer-maintained CuTe DSL implementations
-      kernel_src/           vendored kernel drops (verbatim src/ + shim/)
+``kernels/`` groups source implementations by their update owner. Provider
+exports keep their recorded revisions and dependencies; ``kernels/flashinfer``
+contains implementations maintained here. ``shims/<sm>/`` adapts provider APIs,
+prepares workspaces and owns compilation and tuning integration. SM dispatch
+belongs to the backend and shim even when a source family supports several SMs.
 
-Import layering (strict, one direction)::
+The layer, modes and core consume backend interfaces. Backends consume shim
+package exports or FI-owned implementation APIs. Only shims import provider
+source modules. Numerical oracle tests may exercise sources directly. Direct
+imports from the removed ``kernel_src`` and ``cute_dsl`` packages must use the
+new paths documented in ``docs/design_docs/moe_ep_architecture.md``.
 
-    layer / modes / core  -->  backends  -->  cute_dsl or kernel_src.<drop>
-    cute_dsl  -->  kernel_src.<drop> public helpers  -->  shim/  -->  src/
-
-    backends / drop shims / benchmarks  -->  sm90_routing (pure-host leaf)
-
-- Only a drop's ``shim/`` may import that drop's vendored ``src/`` tree;
-  nothing else imports ``src/``, ever.
-- Only ``backends/`` and ``cute_dsl/`` may import a drop's shim, and only
-  through the drop's package ``__init__`` (``kernel_src.<drop>``), never shim
-  submodules.
-- The layer, ``modes/``, ``core/``, and everything above use backend APIs
-  only (config classes + the ``core.kernel.registry``) — no ``kernel_src``,
-  no shim.
-- ``sm90_routing`` is a shared, zero-dependency host contract leaf. Backends,
-  drop shims, and benchmarks may import it, but it must never import a
-  backend, ``kernel_src``, PyTorch, or CUDA, and it is not re-exported here.
-- Sole exceptions are isolated tests below the backend boundary: kernel-oracle
-  tests import a drop's package ``__init__``, while host-only white-box tests
-  may import shim submodules. Tests still never import vendored ``src/``
-  modules, and the SM90/SM100 white-box suites run in separate processes.
-
-Keeping upper layers off ``kernel_src`` is what makes a drop swappable (see
-``kernel_src/README.md``) without touching user-facing APIs.
+``sm90_routing`` is a pure host routing leaf shared by backends, adapters and
+benchmarks. It must not import backend implementations, PyTorch or CUDA.
 """
 
 from __future__ import annotations
@@ -58,6 +35,7 @@ from .algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobAllocator,
     FleetAlgoKnobFaultTolerance,
+    FleetAlgoKnobNcclEpConfig,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobNumQpsPerRank,
     FleetAlgoKnobQuantization,
@@ -97,7 +75,7 @@ from .backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl import (
 )
 from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
     Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
-    preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
+    preprocess_standard_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
 from .backends.mega.kernel.sm103.bf16_nvfp4_bf16_cake import (
     Sm103_Bf16_Nvfp4_Bf16_Cake_MegaMoeConfig,
@@ -164,12 +142,8 @@ from .backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl import (
     preprocess_mega_weights as preprocess_sm107_nvfp4_mega_weights,
 )
 
-# Deprecated aliases (pre-taxonomy names, kept for external callers such as
-# the vLLM integration patch). New code should use the Sm<arch>... names.
-# These WILL BE REMOVED in a future release, together with the matching
-# deprecated kernel_name registry aliases ("deep_gemm_mega", "nvfp4_cutedsl",
-# "mxfp8_cutedsl", "bf16_cutedsl", "sm90_pull_fp8", "sm90_push_fp8" — see
-# core/kernel/registry.py).
+# Deprecated config-class aliases. Use the SM-qualified classes in new code.
+# The old NVFP4 and MXFP8 kernel_name aliases have been removed.
 Bf16CutedslMegaMoeConfig = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
 DeepGemmMegaMoeConfig = Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig
 Mxfp8CutedslMegaMoeConfig = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
@@ -309,6 +283,7 @@ __all__ = [
     "EpLayout",
     "Fleet",
     "FleetAlgoKnobAllocator",
+    "FleetAlgoKnobNcclEpConfig",
     "FleetAlgoKnobFaultTolerance",
     "FleetAlgoKnobNumChannelsPerRank",
     "FleetAlgoKnobNumQpsPerRank",

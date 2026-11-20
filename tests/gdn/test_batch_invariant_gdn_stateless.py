@@ -673,9 +673,11 @@ def test_train_states_are_the_series_the_cudnn_backward_takes():
     dO = torch.randn(offs[-1], 8, D, device="cuda").to(torch.bfloat16)
     _, states = _with_states(x, lens)
     kw = dict(use_qk_l2norm_in_kernel=True, gate_domain="log")
-    _, _, own = torch.ops.cudnn.gated_delta_net_fwd(
+    # The third output is the checkpoint series. cuDNN Frontend 1.33 appends
+    # more outputs after it, so index instead of unpacking.
+    own = torch.ops.cudnn.gated_delta_net_fwd(
         *x, _i32(offs), SCALE, checkpoint_every_n_tokens=CHUNK, **kw
-    )
+    )[2]
     used = states.shape[0]
     assert own.shape[0] >= used and tuple(own.shape[1:]) == tuple(states.shape[1:])
     lead = [rows[0] for rows in training_state_rows(lens)]
