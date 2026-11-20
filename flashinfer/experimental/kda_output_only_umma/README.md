@@ -26,9 +26,11 @@ argument list and contract unchanged.
 
 SM10x only (tcgen05); K == V == 128; bf16 inputs and state pool (as the WY
 kernel); T in [1, 16]. B200, H = 12, ncu: faster than the WY kernel at T <= 8
-(1.03-1.25x dense, 1.14-2.02x drop-in); at T = 16 about even (dense 0.96-1.16x,
-0.96-0.98x at B >= 512; drop-in 0.94-1.06x), so automatic selection stays at
-T <= 8. Kernels are JIT-compiled per process.
+(1.09-1.32x dense, 1.23-1.99x drop-in); at T = 16 about even (dense 0.95-1.10x,
+0.98-0.99x at B >= 512; drop-in 0.93-1.06x), so automatic selection stays at
+T <= 8. Kernels are JIT-compiled per process. The persistent grid (T > 8, drop-in
+T <= 4) is tuned on B200; SM107 runs one work item per CTA (its launch forces
+`min_blocks_per_mp=1`, so the resident CTAs per SM are not known), unmeasured there.
 
 Shared with the WY kernel (not checked; same behaviour on both backends unless
 noted):
