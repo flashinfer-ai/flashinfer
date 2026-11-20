@@ -34,7 +34,12 @@ def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, requ
         return result
 
     monkeypatch.setattr(compile_cache, "_compile_target_key", lambda _io: target[0])
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
     monkeypatch.setattr(compile_cache, "_compile_or_load", fake_compile)
+    monkeypatch.setattr(
+        batched_gemm_run, "_prepare_tma_descriptors", lambda io, stream: None
+    )
     compile_cache._COMPILED_GEMM_CACHE.clear()
     request.addfinalizer(compile_cache._COMPILED_GEMM_CACHE.clear)
 
@@ -93,6 +98,12 @@ def _fake_launch_io(address: int = 1 << 20, *, align: int = 16, shape=None) -> d
     io["launch_early_exit_max_token_ctas"] = 96
     io["c_row_stride"] = io["shape"][0]
     io["cfg"] = SimpleNamespace(fused_finalize_top_k=0)
+    io["tma_desc_storage_dp"] = make_ptr(
+        cutlass.Uint8,
+        address + 8192,
+        cutlass.AddressSpace.generic,
+        assumed_align=64,
+    )
     return io
 
 
@@ -129,6 +140,9 @@ def test_disk_kernel_name_covers_compile_time_inputs(monkeypatch):
         cutlass.BFloat16, 1 << 20, cutlass.AddressSpace.gmem, assumed_align=16
     )
     others.append(compile_cache._disk_kernel_name("cfg", "fc1", io))
+    io = _fake_launch_io()
+    io["tma_desc_storage_dp"] = None
+    others.append(compile_cache._disk_kernel_name("cfg", "fc1", io))
     monkeypatch.setenv("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 3")
     others.append(compile_cache._disk_kernel_name("cfg", "fc1", _fake_launch_io()))
     monkeypatch.delenv("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS")
@@ -143,6 +157,11 @@ def test_disk_kernel_name_covers_compile_time_inputs(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_compiled_gemm_targets_the_launch_device(monkeypatch, request):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
+    monkeypatch.setattr(
+        batched_gemm_run, "_prepare_tma_descriptors", lambda io, stream: None
+    )
     # The launch tensors live on device 1 (SM103) while device 0 (SM100) is
     # current: the GEMM must be keyed, named, compiled and persisted for SM103.
     capabilities = {0: (10, 0), 1: (10, 3)}
@@ -196,3 +215,103 @@ def test_compiled_gemm_targets_the_launch_device(monkeypatch, request):
     assert spec.module_dir_name == f"{compile_cache._DISK_MODULE_NAME}_sm103a_cute_dsl"
     assert spec.expected_meta["arch"] == "sm103a"
     assert spec.kernel_name.startswith("fc1_sm103_")
+
+
+@pytest.mark.cpu_only
+def test_compiled_gemm_cache_prepares_new_workspace_on_cache_hit(monkeypatch, request):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
+    compiled = []
+    prepared = []
+
+    def prepare(io, stream):
+        io["descriptor_binding"] = io["binding"]
+        prepared.append((io, stream))
+
+    def compile_for_launch(cfg_hash, fc1_or_fc2, io, stream, device_index):
+        prepare(io, stream)
+        fn = object()
+        compiled.append(fn)
+        return fn
+
+    monkeypatch.setattr(compile_cache, "_compile_target_key", lambda io: (0, "sm107a"))
+    monkeypatch.setattr(compile_cache, "_compile_or_load", compile_for_launch)
+    monkeypatch.setattr(batched_gemm_run, "_prepare_tma_descriptors", prepare)
+    compile_cache.clear_compiled_gemm_cache()
+    request.addfinalizer(compile_cache.clear_compiled_gemm_cache)
+
+    first_io = {"binding": "first shard"}
+    second_io = {"binding": "second shard"}
+    first = compile_cache.get_compiled_gemm("cfg", "fc1", first_io, "first stream")
+    second = compile_cache.get_compiled_gemm("cfg", "fc1", second_io, "second stream")
+    assert first is second
+    assert len(compiled) == 1
+    assert second_io["descriptor_binding"] == "second shard"
+    assert prepared == [(first_io, "first stream"), (second_io, "second stream")]
+
+    second_io["binding"] = "rebound shard"
+    assert (
+        compile_cache.get_compiled_gemm("cfg", "fc1", second_io, "second stream")
+        is first
+    )
+    assert second_io["descriptor_binding"] == "rebound shard"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("disk_hit", [False, True])
+def test_disk_cache_prepares_each_workspace_before_keying(monkeypatch, disk_hit):
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_run
+
+    current = [0]
+    prepared = []
+    compiled = []
+    kernel = object()
+
+    @contextlib.contextmanager
+    def device(index):
+        previous, current[0] = current[0], index
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    def prepare(io, stream):
+        assert current[0] == 1
+        io["descriptor_binding"] = io["binding"]
+        prepared.append((io["binding"], stream))
+
+    def name(cfg_hash, fc1_or_fc2, io):
+        assert io["descriptor_binding"] == io["binding"]
+        return "gemm"
+
+    class Spec:
+        def __init__(self, module, name, compile_fn, source, **kwargs):
+            self.compile_fn = compile_fn
+
+        def try_load(self):
+            return kernel if disk_hit else None
+
+        def compile_and_persist(self):
+            compiled.append(self.compile_fn())
+
+        def load(self):
+            return kernel
+
+    monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setattr(compile_cache, "_kernel_source_sha256", lambda: "sources")
+    monkeypatch.setattr(compile_cache, "_disk_kernel_name", name)
+    monkeypatch.setattr(cute_dsl_core, "cute_dsl_cache_disabled", lambda: False)
+    monkeypatch.setattr(cute_dsl_core, "JitSpecCuteDsl", Spec)
+    monkeypatch.setattr(batched_gemm_run, "_prepare_tma_descriptors", prepare)
+    monkeypatch.setattr(
+        batched_gemm_run, "_compile_for_launch", lambda io, stream: kernel
+    )
+
+    # Fresh IO objects simulate separate processes loading the same artifact.
+    for binding in ("first shard", "second shard"):
+        io = {"binding": binding}
+        assert compile_cache._compile_or_load("cfg", "fc1", io, "stream", 1) is kernel
+        assert io["descriptor_binding"] == binding
+    assert current[0] == 0
+    assert prepared == [("first shard", "stream"), ("second shard", "stream")]
+    assert len(compiled) == (0 if disk_hit else 2)

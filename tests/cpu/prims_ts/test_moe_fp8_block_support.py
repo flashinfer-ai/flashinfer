@@ -22,6 +22,7 @@ from flashinfer.fused_moe.shared.inputs import RoutingInputMode
 from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_fp8_per_tensor_moe_tactic,
+    map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp8_mxfp8_moe_tactic,
 )
 from flashinfer.prims_ts.moe import support
@@ -75,9 +76,14 @@ def _first_buildable_pair(mapper, tile_n, **kwargs):
 
 
 @pytest.mark.cpu_only
-def test_mxfp8_mxfp8_mapper_supports_tile256():
-    pair = map_trtllm_mxfp8_mxfp8_moe_tactic(
+@pytest.mark.parametrize("sm_arch", [100, 107])
+@pytest.mark.parametrize(
+    "mapper", [map_trtllm_mxfp4_mxfp8_moe_tactic, map_trtllm_mxfp8_mxfp8_moe_tactic]
+)
+def test_mxfp_mapper_supports_tile256(mapper, sm_arch):
+    pair = mapper(
         [256, 0],
+        sm_arch=sm_arch,
         activation_type=int(ActivationType.Swiglu),
         num_tokens=128,
         top_k=8,
@@ -91,6 +97,10 @@ def test_mxfp8_mxfp8_mapper_supports_tile256():
     assert fc2.tile_n == 256
     assert fc1.uses_mxfp8_output_quant
     assert not fc2.has_output_block_scaling
+    # The last control warp group donates enough registers to admit the
+    # epilogue without exhausting the CTA's initial register allocation.
+    assert fc1.padding_regs == fc1.workid_regs == 80
+    assert fc1.sync_regs == fc1.mma_regs == 88
 
 
 @pytest.mark.cpu_only

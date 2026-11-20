@@ -412,6 +412,7 @@ def is_prims_ts_nvfp4_supported(
     try:
         if pair is None:
             from .config_mapper import map_trtllm_nvfp4_moe_tactic
+            from .epilogue_policy import fused_finalize_requested
 
             pair = map_trtllm_nvfp4_moe_tactic(
                 tactic,
@@ -426,6 +427,7 @@ def is_prims_ts_nvfp4_supported(
                 use_per_token_sf_b=moe_inputs.per_token_scale is not None,
                 per_token_sf_dtype=1,
                 enable_pdl=bool(kwargs.get("enable_pdl", False)),
+                use_fused_finalize=fused_finalize_requested(runner, kwargs),
                 **_gemm1_oa_flags(kwargs),
             )
         ok, reason = _validate_block_major_k_storage_matches_config(

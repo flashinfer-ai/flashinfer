@@ -1,0 +1,198 @@
+{
+  "description": "Rubin tile512 GEMM configuration profiles for generated or explicitly supplied matched inputs.",
+  "common_options": {
+    "sm_arch": 107,
+    "batch_mode": 1,
+    "transpose_mma_output": 0,
+    "dtype_a": 4,
+    "dtype_b": 4,
+    "sf_layout_a": 3,
+    "sf_layout_b": 3,
+    "weight_layout": 2,
+    "umma_cta_count": 2,
+    "fallback_cluster_dim_x": 2,
+    "fallback_cluster_dim_y": 1,
+    "tile_n": 256,
+    "tile_k": 256,
+    "mma_m": 256,
+    "mma_n": 256,
+    "mma_k": 128,
+    "tmem_ldst_max_num_regs": 64,
+    "num_stages_a": 5,
+    "num_stages_b": 6,
+    "num_stages_smem_sfa": 5,
+    "num_stages_smem_sfb": 6,
+    "num_stages_tmem_acc": 1,
+    "num_stages_tmem_sfa": 1,
+    "num_stages_tmem_sfb": 1,
+    "tile_scheduler": 1,
+    "cta_raster_order": 1,
+    "use_tma_oob_opt": 0,
+    "use_tma_store": 1,
+    "use_max_tmem_overlap": 0,
+    "use_early_exit": 0,
+    "use_pdl": 0,
+    "use_unroll_loop_2x_for_mma": 0,
+    "fuse_sf_copy_to_mma": 1,
+    "epilogue_regs": 144,
+    "dense_m_repeats": 2,
+    "dense_b_reuse": 1,
+    "dense_rolled_mma": 1,
+    "dense_async_sf": 1,
+    "dense_rolled_epilogue": 1,
+    "dense_epilogue_warps": 8,
+    "dense_split_tma_pipeline": 1,
+    "dense_fuse_tma_loads": 1,
+    "dense_partition_tma_loads": 1,
+    "dense_specialize_tma_cga": 1,
+    "dense_local_barrier": 1,
+    "dense_retain_a": 1,
+    "dense_a_l2_promotion": 256,
+    "num_stages_workid": 1,
+    "use_work_throttle": 0,
+    "routed_low_smem": 0
+  },
+  "mode_options": {
+    "fc1": {
+      "route_act": 1,
+      "route_sfs_act": 2,
+      "dtype_c": 4,
+      "act_kind": 1,
+      "epi_tile_n": 128,
+      "num_stages_c_smem": 2,
+      "use_global_scales": 1,
+      "num_load_a_warps": 8,
+      "num_load_sfa_warps": 4,
+      "mma_regs": 48,
+      "load_regs": 48,
+      "load_sf_regs": 48,
+      "copy_sf_regs": 48,
+      "sync_regs": 48,
+      "workid_regs": 48,
+      "padding_regs": 48,
+      "dense_preload_epilogue": 0,
+      "dense_dkg_store_order": 0,
+      "dense_streaming_c": 0,
+      "load_a_regs": 48,
+      "routed_native_sfa": 1,
+      "sf_layout_c": 3,
+      "gated_weight_group_size": 64,
+      "load_sfa_regs": 48,
+      "routed_sfa_first": 1
+    },
+    "routed-bf16": {
+      "route_act": 1,
+      "route_sfs_act": 2,
+      "dtype_c": 3,
+      "act_kind": 0,
+      "epi_tile_n": 64,
+      "num_stages_c_smem": 1,
+      "use_global_scales": 0,
+      "num_load_a_warps": 8,
+      "num_load_sfa_warps": 4,
+      "mma_regs": 48,
+      "load_regs": 48,
+      "load_sf_regs": 48,
+      "copy_sf_regs": 48,
+      "sync_regs": 48,
+      "workid_regs": 48,
+      "padding_regs": 48,
+      "dense_preload_epilogue": 1,
+      "dense_dkg_store_order": 1,
+      "dense_streaming_c": 1,
+      "load_a_regs": 48,
+      "routed_native_sfa": 1,
+      "routed_sfa_first": 1
+    },
+    "dense-bf16": {
+      "route_act": 0,
+      "route_sfs_act": 0,
+      "dtype_c": 3,
+      "act_kind": 0,
+      "epi_tile_n": 64,
+      "num_stages_c_smem": 1,
+      "use_global_scales": 0,
+      "num_load_a_warps": 1,
+      "num_load_sfa_warps": 1,
+      "mma_regs": 80,
+      "load_regs": 80,
+      "load_sf_regs": 80,
+      "copy_sf_regs": 80,
+      "sync_regs": 80,
+      "workid_regs": 80,
+      "padding_regs": 80,
+      "dense_preload_epilogue": 1,
+      "dense_dkg_store_order": 1,
+      "dense_streaming_c": 1,
+      "load_a_regs": 80,
+      "routed_native_sfa": 0,
+      "dense_fuse_tma_pipeline": 1,
+      "routed_sfa_first": 0
+    }
+  },
+  "cases": {
+    "e32": {
+      "num_experts": 32,
+      "num_tokens": 4096,
+      "top_k": 8,
+      "problem_n": 8192,
+      "problem_k": 10240,
+      "cga": {
+        "fc1": [
+          4,
+          2
+        ],
+        "routed-bf16": [
+          4,
+          2
+        ],
+        "dense-bf16": [
+          4,
+          2
+        ]
+      }
+    },
+    "e256": {
+      "num_experts": 256,
+      "num_tokens": 512,
+      "top_k": 256,
+      "problem_n": 4096,
+      "problem_k": 7168,
+      "cga": {
+        "fc1": [
+          2,
+          2
+        ],
+        "routed-bf16": [
+          2,
+          4
+        ],
+        "dense-bf16": [
+          2,
+          2
+        ]
+      }
+    },
+    "e384": {
+      "num_experts": 384,
+      "num_tokens": 512,
+      "top_k": 384,
+      "problem_n": 6144,
+      "problem_k": 7168,
+      "cga": {
+        "fc1": [
+          2,
+          4
+        ],
+        "routed-bf16": [
+          2,
+          4
+        ],
+        "dense-bf16": [
+          2,
+          2
+        ]
+      }
+    }
+  }
+}

@@ -19,7 +19,7 @@ Map Prims-TS MoE autotuner tactics to local Prims-TS GEMM configs.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from importlib import resources
 import math
@@ -30,6 +30,7 @@ from flashinfer.tllm_enums import ActivationType, WeightLayout
 
 SUPPORTED_BF16_TILE_N = (8, 16, 32, 64, 128, 192, 256)
 SUPPORTED_NVFP4_TILE_N = (8, 16, 32, 64, 128, 256)
+SUPPORTED_RUBIN_NVFP4_TILE_N = (*SUPPORTED_NVFP4_TILE_N, 512, 1024)
 SUPPORTED_FP8_TILE_N = (8, 16, 32, 64, 128, 256)
 SUPPORTED_MXFP4_MXFP8_TILE_N = (8, 16, 32, 64, 128, 192, 256)
 SUPPORTED_MXFP4_BF16_TILE_N = (8, 16, 32, 64, 128)
@@ -61,7 +62,7 @@ from ..batched_gemm.config_types import (
 class PrimsTsConfigSpec:
     """Lazy config spec that can materialize a full BatchedGemmConfig."""
 
-    kwargs: dict[str, int]
+    kwargs: dict[str, object]
 
     def build(self) -> object:
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
@@ -100,7 +101,38 @@ class _JsonBatchedGemmConfig:
     is_scheduler_union_variant: bool = False
 
 
-_SUPPORTED_JSON_OPTION_KEYS = frozenset(
+_RUBIN_JSON_INT_OPTIONS = frozenset(
+    {
+        "dense_a_l2_promotion",
+        "dense_async_sf",
+        "dense_b_reuse",
+        "dense_dkg_store_order",
+        "dense_epilogue_warps",
+        "dense_fuse_tma_loads",
+        "dense_fuse_tma_pipeline",
+        "dense_local_barrier",
+        "dense_m_repeats",
+        "dense_partition_tma_loads",
+        "dense_preload_epilogue",
+        "dense_preload_store_prefix_fragments",
+        "epilogue_tmem_load_width",
+        "epilogue_tmem_load_ahead",
+        "epilogue_smem_staging",
+        "epilogue_tmem_release",
+        "dense_retain_a",
+        "dense_rolled_epilogue",
+        "dense_rolled_mma",
+        "dense_specialize_tma_cga",
+        "dense_split_tma_pipeline",
+        "dense_streaming_c",
+        "routed_low_smem",
+        "routed_native_sfa",
+        "routed_sfa_first",
+        "sync_regs",
+    }
+)
+
+_SUPPORTED_JSON_OPTION_KEYS = _RUBIN_JSON_INT_OPTIONS | frozenset(
     {
         "act",
         "bias_type",
@@ -117,6 +149,7 @@ _SUPPORTED_JSON_OPTION_KEYS = frozenset(
         "epi_tile_m",
         "epi_tile_n",
         "epilogue_regs",
+        "epilogue_steps",
         "fused_act",
         "fuse_operand_sf_loads",
         "fuse_sf_copy_to_mma",
@@ -260,6 +293,14 @@ def _selected_tile_ns(
 def _fp8_per_tensor_supported_tiles(*, use_per_token_sf_b: bool) -> tuple[int, ...]:
     del use_per_token_sf_b
     return SUPPORTED_FP8_TILE_N
+
+
+def _nvfp4_supported_tiles(sm_arch: int | None) -> tuple[int, ...]:
+    return (
+        SUPPORTED_RUBIN_NVFP4_TILE_N
+        if _resolve_moe_sm_arch(sm_arch) == 107
+        else SUPPORTED_NVFP4_TILE_N
+    )
 
 
 def _default_tile_n(
@@ -626,6 +667,9 @@ def _expanded_prims_ts_json_configs_for_arch(
     for cfg in original_configs:
         if str(cfg.options.get("tile_scheduler", "static")).lower() != "persistent":
             continue
+        if cfg.options.get("dense_m_repeats", 1) == 2:
+            # These native Rubin pipelines have their own validated schedule.
+            continue
         options = {
             **cfg.options,
             "use_clc_fast_drain": True,
@@ -710,12 +754,20 @@ def _json_config_matches_moe(
     if json_weight_layout != int(weight_layout):
         return False
     transposed = _bool_value(options.get("transpose_mma_output", True))
-    if not transposed and (dtype_a != int(_DType.BF16) or dtype_b != int(_DType.BF16)):
-        return False
+    if not transposed:
+        bf16 = dtype_a == dtype_b == int(_DType.BF16)
+        rubin_nvfp4 = (
+            dtype_a == dtype_b == int(_DType.E2M1)
+            and int(options.get("dense_m_repeats", 1)) == 2
+            and activation_type == int(ActivationType.Swiglu)
+        )
+        if not (bf16 or rubin_nvfp4):
+            return False
     token_tile = (
         int(options.get("tile_n", -1))
         if transposed
         else 128
+        * int(options.get("dense_m_repeats", 1))
         * (
             int(options.get("cluster_dim_x", 0))
             or int(options.get("umma_cta_count", 1))
@@ -1023,7 +1075,7 @@ def _json_config_kwargs(
     _ensure_json_config_supported_by_ts(cfg)
     options = cfg.options
     if has_bias and not _bool_value(options.get("transpose_mma_output", True)):
-        raise ValueError("Prims-TS BF16 BatchM MoE does not support per-expert bias")
+        raise ValueError("Prims-TS BatchM MoE does not support per-expert bias")
     use_max_tmem_overlap = int(_bool_value(options.get("use_max_tmem_overlap", False)))
     tmem_acc_stages = int(options["num_stages_tmem_acc"])
     mma_regs = int(options.get("mma_regs", 48))
@@ -1032,6 +1084,8 @@ def _json_config_kwargs(
     copy_sf_regs = int(options.get("copy_sf_regs", load_regs))
     padding_regs = int(options.get("padding_regs", load_regs))
     workid_regs = int(options.get("workid_regs", load_regs))
+    # The LDGSTS relay shares the control warp group with MMA and loaders.
+    sync_regs = int(options.get("sync_regs", load_regs))
     epilogue_regs = int(options.get("epilogue_regs", 160))
     load_a_regs = int(options.get("load_a_regs", 0))
     load_b_regs = int(options.get("load_b_regs", 0))
@@ -1053,7 +1107,7 @@ def _json_config_kwargs(
         "sm_arch": sm_arch,
         "batch_mode": batch_mode,
         # Prims-TS MoE consumes weights shuffled offline by
-        # prepare_trtllm_bf16_weights. Batch-N implies this layout in the
+        # the MoE preparation helpers. Batch-N implies this layout in the
         # kernel; Batch-M needs the explicit opt-in.
         "use_shuffled_matrix": int(batch_mode == int(_BatchMode.BATCH_M)),
         "dtype_a": _json_dtype_value(
@@ -1129,6 +1183,7 @@ def _json_config_kwargs(
         "copy_sf_regs": copy_sf_regs,
         "padding_regs": padding_regs,
         "workid_regs": workid_regs,
+        "sync_regs": sync_regs,
     }
     if "num_stages_workid" in options:
         kwargs["num_stages_workid"] = int(options["num_stages_workid"])
@@ -1184,6 +1239,12 @@ def _json_config_kwargs(
         kwargs["num_load_sfa_warps"] = int(options["num_load_sfa_warps"])
     if "num_load_sfb_warps" in options:
         kwargs["num_load_sfb_warps"] = int(options["num_load_sfb_warps"])
+    for key in _RUBIN_JSON_INT_OPTIONS & options.keys():
+        kwargs[key] = int(options[key])
+    if "epilogue_steps" in options:
+        from ..batched_gemm.epilogue_schedule import normalize_epilogue_steps
+
+        kwargs["epilogue_steps"] = normalize_epilogue_steps(options["epilogue_steps"])
     if (128 * kwargs["umma_cta_count"]) % kwargs["mma_m"] != 0:
         raise ValueError(
             "Prims-TS requires cluster-wide tile_m to be a multiple of mma_m "
@@ -1192,7 +1253,7 @@ def _json_config_kwargs(
     return kwargs
 
 
-def _make_config_spec(**kwargs: int) -> PrimsTsConfigSpec:
+def _make_config_spec(**kwargs: object) -> PrimsTsConfigSpec:
     return PrimsTsConfigSpec(kwargs=kwargs)
 
 
@@ -1326,6 +1387,9 @@ def _with_spec_overrides_pair(
 
 
 def _with_pdl_pair(pair: PrimsTsGemmPair, *, enable_pdl: bool) -> PrimsTsGemmPair:
+    # Native routed Rubin loaders do not implement PDL. The MoE runner also
+    # disables PDL on routing/finalize for this pair, preserving stream order.
+    enable_pdl = enable_pdl and not pair.fc1.cfg.kwargs.get("routed_native_sfa", 0)
     return PrimsTsGemmPair(
         tile_n=pair.tile_n,
         moe_config_index=pair.moe_config_index,
@@ -1640,7 +1704,7 @@ def _make_default_json_moe_config_pair(
     )
     if not fc1_indices or not fc2_indices:
         return None
-    moe_config_index = _default_moe_config_index(
+    preferred_index = _default_moe_config_index(
         tile_n,
         sm_arch=sm_arch,
         prefer_persistent_scheduler=prefer_persistent_scheduler,
@@ -1658,31 +1722,59 @@ def _make_default_json_moe_config_pair(
         per_token_sf_dtype=per_token_sf_dtype,
         weight_layout=weight_layout,
     )
-    return _make_json_moe_config_pair(
-        sm_arch=sm_arch,
-        tile_n=tile_n,
-        moe_config_index=moe_config_index,
-        activation_type=activation_type,
-        dtype_a=dtype_a,
-        dtype_b=dtype_b,
-        fc1_dtype_c=fc1_dtype_c,
-        fc2_dtype_c=fc2_dtype_c,
-        dtype_label=dtype_label,
-        fc1_has_bias=fc1_has_bias,
-        fc2_has_bias=fc2_has_bias,
-        use_deepseek_fp8=use_deepseek_fp8,
-        fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
-        fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
-        fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
-        fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
-        per_token_sf_dtype=per_token_sf_dtype,
-        weight_layout=weight_layout,
-        has_gemm1_alpha=has_gemm1_alpha,
-        has_gemm1_beta=has_gemm1_beta,
-        has_gemm1_clamp_limit=has_gemm1_clamp_limit,
-        enable_pdl=enable_pdl,
-        deepseek_fp8_block_size=deepseek_fp8_block_size,
+    # JSON compatibility alone does not establish a runnable schedule. In
+    # particular, legacy rows may have incompatible warp-group register
+    # budgets. Try the preferred pair, then remaining stable tactic IDs;
+    # returning None lets the caller continue with its fallback token tiles.
+    pair_count = sum(
+        _same_batch_mode(a, b, sm_arch=sm_arch)
+        for a in fc1_indices
+        for b in fc2_indices
     )
+    candidate_indices = [preferred_index] + [
+        index for index in range(pair_count) if index != preferred_index
+    ]
+    for moe_config_index in candidate_indices:
+        try:
+            pair = _make_json_moe_config_pair(
+                sm_arch=sm_arch,
+                tile_n=tile_n,
+                moe_config_index=moe_config_index,
+                activation_type=activation_type,
+                dtype_a=dtype_a,
+                dtype_b=dtype_b,
+                fc1_dtype_c=fc1_dtype_c,
+                fc2_dtype_c=fc2_dtype_c,
+                dtype_label=dtype_label,
+                fc1_has_bias=fc1_has_bias,
+                fc2_has_bias=fc2_has_bias,
+                use_deepseek_fp8=use_deepseek_fp8,
+                fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
+                fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
+                fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
+                fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
+                per_token_sf_dtype=per_token_sf_dtype,
+                weight_layout=weight_layout,
+                has_gemm1_alpha=has_gemm1_alpha,
+                has_gemm1_beta=has_gemm1_beta,
+                has_gemm1_clamp_limit=has_gemm1_clamp_limit,
+                enable_pdl=enable_pdl,
+                deepseek_fp8_block_size=deepseek_fp8_block_size,
+            )
+            if pair is None:
+                continue
+            _ensure_pair_buildable(
+                pair,
+                dtype_label=dtype_label,
+                num_tokens=num_tokens,
+                top_k=top_k,
+                num_experts=num_experts,
+            )
+        except ValueError:
+            # Match the runner's admission rule for explicit tuning candidates.
+            continue
+        return pair
+    return None
 
 
 def _required_json_moe_config_pair(
@@ -1822,7 +1914,9 @@ def _valid_json_moe_tactics(
             for b in fc2_indices
         )
         for moe_config_index in range(pair_count):
-            if dtype_label == "BF16" and (fc1_has_bias or fc2_has_bias):
+            if dtype_label in ("BF16", "NVFP4xNVFP4") and (
+                fc1_has_bias or fc2_has_bias
+            ):
                 pair = _resolve_moe_json_config_pair(
                     tile_n,
                     moe_config_index,
@@ -1834,6 +1928,12 @@ def _valid_json_moe_tactics(
                     fc2_dtype_c=fc2_dtype_c,
                     dtype_label=dtype_label,
                     weight_layout=weight_layout,
+                    use_deepseek_fp8=use_deepseek_fp8,
+                    fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
+                    fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
+                    fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
+                    fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
+                    per_token_sf_dtype=per_token_sf_dtype,
                 )
                 if pair is not None and not _bool_value(
                     pair[0].options.get("transpose_mma_output", True)
@@ -1882,6 +1982,58 @@ def valid_prims_ts_bf16_moe_tactics(
     )
 
 
+@lru_cache(maxsize=None)
+def _nvfp4_epilogue_tactics(
+    *,
+    sm_arch: int,
+    activation_type: int,
+    weight_layout: int,
+    use_per_token_sf_b: bool,
+    per_token_sf_dtype: int,
+) -> tuple[tuple[int, int], ...]:
+    """Stable (base pair index, epilogue policy) entries for tile512.
+
+    Retain every original pair index, then append seven policies per eligible
+    native pair. Enumeration and mapping both consume this exact catalog.
+    """
+    from .epilogue_policy import NVFP4_EPILOGUE_POLICIES
+
+    if (
+        sm_arch != 107
+        or activation_type != int(ActivationType.Swiglu)
+        or use_per_token_sf_b
+    ):
+        return ()
+    pairs = _sorted_moe_json_config_pairs(
+        512,
+        sm_arch=sm_arch,
+        activation_type=activation_type,
+        dtype_a=int(_DType.E2M1),
+        dtype_b=int(_DType.E2M1),
+        fc1_dtype_c=int(_DType.E2M1),
+        fc2_dtype_c=int(_DType.BF16),
+        dtype_label="NVFP4xNVFP4",
+        fc1_use_per_token_sf_b=False,
+        fc2_use_per_token_sf_b=False,
+        per_token_sf_dtype=per_token_sf_dtype,
+        weight_layout=weight_layout,
+    )
+    catalog = [(index, 0) for index in range(len(pairs))]
+    for index, pair in enumerate(pairs):
+        options = [
+            _json_config_by_global_index(i, sm_arch=sm_arch).options for i in pair
+        ]
+        if all(
+            not _bool_value(o.get("transpose_mma_output", True))
+            and int(o.get("dense_m_repeats", 1)) == 2
+            for o in options
+        ):
+            catalog.extend(
+                (index, policy) for policy in range(1, len(NVFP4_EPILOGUE_POLICIES))
+            )
+    return tuple(catalog)
+
+
 def valid_prims_ts_nvfp4_moe_tactics(
     *,
     sm_arch: int | None = None,
@@ -1899,10 +2051,12 @@ def valid_prims_ts_nvfp4_moe_tactics(
     has_gemm1_clamp_limit: bool = False,
     enable_pdl: bool = False,
     weight_layout: int = int(WeightLayout.MajorK),
+    use_fused_finalize: bool = False,
 ) -> list[list[int]]:
-    return _valid_json_moe_tactics(
+    sm_arch = _resolve_moe_sm_arch(sm_arch)
+    tactics = _valid_json_moe_tactics(
         sm_arch=sm_arch,
-        supported_tiles=SUPPORTED_NVFP4_TILE_N,
+        supported_tiles=_nvfp4_supported_tiles(sm_arch),
         num_tokens=num_tokens,
         top_k=top_k,
         num_local_experts=num_local_experts,
@@ -1924,6 +2078,21 @@ def valid_prims_ts_nvfp4_moe_tactics(
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
     )
+    base_indices = {index for tile, index in tactics if tile == 512}
+    if use_fused_finalize and base_indices:
+        catalog = _nvfp4_epilogue_tactics(
+            sm_arch=sm_arch,
+            activation_type=activation_type,
+            weight_layout=weight_layout,
+            use_per_token_sf_b=use_per_token_sf_b,
+            per_token_sf_dtype=per_token_sf_dtype,
+        )
+        tactics.extend(
+            [512, index]
+            for index, (base, policy) in enumerate(catalog)
+            if policy and base in base_indices
+        )
+    return tactics
 
 
 def valid_prims_ts_fp8_per_tensor_moe_tactics(
@@ -2196,6 +2365,7 @@ def map_trtllm_nvfp4_moe_tactic(
     has_gemm1_clamp_limit: bool = False,
     enable_pdl: bool = False,
     weight_layout: int = int(WeightLayout.MajorK),
+    use_fused_finalize: bool = False,
 ) -> PrimsTsGemmPair:
     """Return Prims-TS FC1/FC2 configs for a Prims-TS NVFP4xNVFP4 MoE tactic."""
 
@@ -2205,14 +2375,32 @@ def map_trtllm_nvfp4_moe_tactic(
         top_k=top_k,
         num_local_experts=num_local_experts,
         num_experts=num_experts,
+        # Keep the untuned default on the general-purpose swapAB path. The
+        # native Batch-M profiles are selected explicitly or by autotuning.
         supported_tiles=SUPPORTED_NVFP4_TILE_N,
     )
-    if tile_n not in SUPPORTED_NVFP4_TILE_N:
+    if tile_n not in _nvfp4_supported_tiles(sm_arch):
         raise ValueError(f"Unsupported Prims-TS NVFP4 tile_N={tile_n}")
     if moe_config_index < -1:
         raise ValueError(f"Unsupported MoE config index={moe_config_index}")
 
-    return _required_json_moe_config_pair(
+    sm_arch = _resolve_moe_sm_arch(sm_arch)
+    requested_index = moe_config_index
+    policy_index = 0
+    if use_fused_finalize and tile_n == 512 and moe_config_index >= 0:
+        catalog = _nvfp4_epilogue_tactics(
+            sm_arch=sm_arch,
+            activation_type=activation_type,
+            weight_layout=weight_layout,
+            use_per_token_sf_b=use_per_token_sf_b,
+            per_token_sf_dtype=per_token_sf_dtype,
+        )
+        if catalog:
+            if moe_config_index >= len(catalog):
+                raise ValueError(f"Unsupported MoE config index={moe_config_index}")
+            moe_config_index, policy_index = catalog[moe_config_index]
+
+    pair = _required_json_moe_config_pair(
         sm_arch=sm_arch,
         tile_n=tile_n,
         moe_config_index=moe_config_index,
@@ -2237,6 +2425,30 @@ def map_trtllm_nvfp4_moe_tactic(
         enable_pdl=enable_pdl,
         weight_layout=weight_layout,
     )
+    if policy_index:
+        from .epilogue_policy import nvfp4_epilogue_overrides
+
+        first, second = nvfp4_epilogue_overrides(policy_index)
+        pair = replace(
+            pair,
+            moe_config_index=requested_index,
+            fc1=replace(
+                pair.fc1,
+                cfg=PrimsTsConfigSpec({**pair.fc1.cfg.kwargs, **first}),
+            ),
+            fc2=replace(
+                pair.fc2,
+                cfg=PrimsTsConfigSpec({**pair.fc2.cfg.kwargs, **second}),
+            ),
+        )
+        _ensure_pair_buildable(
+            pair,
+            dtype_label="NVFP4xNVFP4",
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_experts=num_local_experts,
+        )
+    return pair
 
 
 def map_trtllm_fp8_per_tensor_moe_tactic(

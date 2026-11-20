@@ -120,7 +120,7 @@ class GmemSfAResource(MemoryResource):
                 problem_m_tiles = Int32(1)
             coord_sfa_mn = expert_idx * problem_m_tiles + tile_coord_m
         else:
-            coord_sfa_mn = tile_coord_m
+            coord_sfa_mn = tile_coord_m * Int32(self.cfg.dense_m_repeats)
         return coord_sfa_mn
 
     # Head vs loop differ only in the K coordinate: the head call uses its
@@ -193,7 +193,9 @@ class GmemSfBResource(MemoryResource):
         """Compute the SFB M/N coordinate and cache the per-tile expert index."""
         tile_coord_m, tile_coord_n, _ = stage_info.work_tile.tile_idx
         self.tile_expert_idx = Int32(0)
-        if cutlass.const_expr(not self.cfg.is_swap_ab):
+        if cutlass.const_expr(
+            not self.cfg.is_swap_ab and not self.cfg.dense_single_expert
+        ):
             token_cga = tile_coord_m // Int32(self.cfg.token_cluster_dim)
             if cutlass.const_expr(self.tile_idx_view is not None):
                 self.tile_expert_idx = self.tile_idx_view.load(

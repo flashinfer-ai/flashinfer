@@ -14,9 +14,10 @@
 
 """BatchedGemm-local Task Scheduling extensions for physical CGAs.
 
-The installed TS framework intentionally remains untouched.  These subclasses
-add only the runtime CTA policy and TMA-UMMA mask behavior needed by this
-kernel; legacy resources continue to use the wheel implementations unchanged.
+The installed TS framework intentionally remains untouched. These subclasses
+supply input-TMA ownership for every cluster shape. Single-atom pipelines
+reuse the wheel's synchronization operations with centrally resolved masks
+and arming predicates; wider CGAs also need atom-relative synchronization.
 
 The extensions cover two independent synchronization layers:
 
@@ -28,7 +29,7 @@ The extensions cover two independent synchronization layers:
   documented in :mod:`batched_gemm_cga`.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cutlass
 import cutlass.cute as cute
@@ -40,12 +41,22 @@ from cutlass.experimental.task_scheduling.pipeline import (
     TSPipelineUmmaUmma,
 )
 from cutlass.experimental.task_scheduling.task import Task
+from cutlass.experimental.task_scheduling.resources import MemoryResource
+from cutlass.experimental.task_scheduling.enums import PipelineType
+from cutlass.experimental.task_scheduling.pipeline_group import PipelineGroup
 from cutlass.pipeline.sm100 import PipelineTmaUmma, PipelineUmmaAsync
 
 from .batched_gemm_cga import (
     CgaPolicy,
     cga_policy_selected,
     cga_tma_masks,
+    input_tma_control,
+    input_tma_group_control,
+    input_tma_release,
+    input_tma_arrival_count,
+    input_tma_full_armer_cta,
+    input_tma_umma_group,
+    has_multiple_umma_atoms,
 )
 
 
@@ -80,7 +91,21 @@ class CgaTask(Task):
             and resource.pipeline_config is not None
         )
         super().__init__(*args, **kwargs)
-        self.cga_policy = int(cga_policy)
+        self.cga_policy = cga_policy
+
+    def _check_leader_cta_signaling(self, resource, signaling_threads, side):
+        if (
+            self.cfg.is_static_persistent
+            and resource.name == "WorkQueue"
+            and side == "consumer"
+        ):
+            # The local queue's per-rank census accounts for every atom
+            # leader and multicast loader. The task-manager check verifies
+            # it against actual consumer releases on all physical ranks.
+            assert resource.pipeline_config.cta_layout_vmnk is None
+            assert self.run_only_on_cta_id in (None, 0)
+            return
+        return super()._check_leader_cta_signaling(resource, signaling_threads, side)
 
     @cute.jit
     def is_selected(self) -> bool:
@@ -173,6 +198,160 @@ class CgaTask(Task):
                 self._set_max_register()
 
 
+class InputTmaTask(CgaTask):
+    """Gate independent input rings inside the union of their task owners.
+
+    Aux work still computes coordinates uniformly. Payload work has no routed
+    outputs; only its issuer CTAs execute it. TMA commit has no hardware
+    arrival, so its cursor advances uniformly, including inactive members.
+    This keeps loop-carried TS state dominating subsequent stages while no
+    inactive member probes, acquires, issues or drains an empty barrier.
+    """
+
+    def input_control(self, resource):
+        kind = getattr(resource, "mixed_cga_kind", None)
+        return input_tma_control(self.cfg, kind) if kind else None
+
+    def _member_policy(self, resource):
+        control = self.input_control(resource)
+        return CgaPolicy.ALL if control is None else control.participants
+
+    def _member_needs_gate(self, resource):
+        policy = self._member_policy(resource)
+        return policy != CgaPolicy.ALL and policy != self.cga_policy
+
+    @cute.jit
+    def _producer_try_acquire(self, resource, stage_info):
+        if cutlass.const_expr(self._member_needs_gate(resource)):
+            # TS uses an explicit if-result to preserve SSA dominance of the
+            # producer status across the surrounding persistent/K loops.
+            self._producer_try_acquire_if(
+                resource, cga_policy_selected(self.cfg, self._member_policy(resource))
+            )
+        else:
+            Task._producer_try_acquire(self, resource, stage_info)
+
+    @cute.jit
+    def _producer_acquire(self, resource, stage_info):
+        if cutlass.const_expr(self._member_needs_gate(resource)):
+            if cga_policy_selected(self.cfg, self._member_policy(resource)):
+                Task._producer_acquire(self, resource, stage_info)
+        else:
+            Task._producer_acquire(self, resource, stage_info)
+
+    @cute.jit
+    def _producer_work(self, resource, stage_info, work_method, work_kwargs=None):
+        control = self.input_control(resource)
+        if cutlass.const_expr(
+            control is not None
+            and control.issuers != CgaPolicy.ALL
+            and control.issuers != self.cga_policy
+        ):
+            if cga_policy_selected(self.cfg, control.issuers):
+                Task._producer_work(
+                    self, resource, stage_info, work_method, work_kwargs
+                )
+        else:
+            Task._producer_work(self, resource, stage_info, work_method, work_kwargs)
+
+    @cute.jit
+    def _producer_tail(self, resource):
+        if cutlass.const_expr(self._member_needs_gate(resource)):
+            if cga_policy_selected(self.cfg, self._member_policy(resource)):
+                Task._producer_tail(self, resource)
+        else:
+            Task._producer_tail(self, resource)
+
+
+class DenseTmaLoadTask(InputTmaTask):
+    """Advance one cursor for the union of this task's issuers/full owners.
+
+    Task selection also gates the producer tail and WorkQueue consumption.
+    A CTA that neither issues a member's payload nor arms its full barrier
+    must not observe the operand ring: it can miss a parity transition when
+    the actual producers and MMA advance without it.
+    """
+
+    def _is_fused_cursor_alias(self, resource):
+        return (
+            self.cfg.fuse_operand_sf_loads
+            and resource.pipeline_group is not None
+            and resource.name != self.dst_resources[0].name
+        )
+
+    @cute.jit
+    def _producer_try_acquire(self, resource, stage_info):
+        if cutlass.const_expr(not self._is_fused_cursor_alias(resource)):
+            super()._producer_try_acquire(resource, stage_info)
+
+    @cute.jit
+    def _producer_acquire(self, resource, stage_info):
+        # Keep both logical members in the schedule verifier, but acquire
+        # their shared physical stage only once in the fused loader.
+        if cutlass.const_expr(not self._is_fused_cursor_alias(resource)):
+            super()._producer_acquire(resource, stage_info)
+
+    @cute.jit
+    def _create_stage_info(
+        self,
+        resource,
+        idx,
+        work_tile=None,
+        is_producer=None,
+        resolved_domain=None,
+        label=None,
+        schedule_stage=None,
+        routing_slot=None,
+    ):
+        # The fused loader uses B's cursor; a split loader uses its operand's.
+        # Its scale-factor member shares that cursor and never advances twice.
+        stage_resource = (
+            self.dst_resources[
+                0
+                if self.cfg.dense_split_tma_pipeline or self.cfg.fuse_operand_sf_loads
+                else 1
+            ]
+            if cutlass.const_expr(resource.pipeline_group is not None)
+            else resource
+        )
+        return super()._create_stage_info(
+            stage_resource,
+            idx,
+            work_tile,
+            is_producer,
+            resolved_domain,
+            label,
+            schedule_stage,
+            routing_slot,
+        )
+
+    @cute.jit
+    def _producer_commit_memory_resource(self, resource):
+        if cutlass.const_expr(
+            resource.pipeline_group is None
+            or resource.name
+            == self.dst_resources[
+                0
+                if self.cfg.dense_split_tma_pipeline or self.cfg.fuse_operand_sf_loads
+                else 1
+            ].name
+        ):
+            super()._producer_commit_memory_resource(resource)
+
+    @cute.jit
+    def _producer_tail(self, resource):
+        if cutlass.const_expr(
+            resource.pipeline_group is None
+            or resource.name
+            == self.dst_resources[
+                0
+                if self.cfg.dense_split_tma_pipeline or self.cfg.fuse_operand_sf_loads
+                else 1
+            ].name
+        ):
+            super()._producer_tail(resource)
+
+
 @dataclass(frozen=True)
 class CgaPipelineTmaUmma(PipelineTmaUmma):
     """TMA-UMMA pipeline with active-shape full/release masks.
@@ -239,27 +418,227 @@ class CgaPipelineTmaUmma(PipelineTmaUmma):
         if_generate(self.is_leader_cta, arrive_owners, loc=loc, ip=ip)
 
 
+@dataclass(frozen=True)
+class DenseOperandPipeline(PipelineTmaUmma):
+    """One local operand producer arms the total bytes for its pipeline group."""
+
+    arms_full: cutlass.Constexpr[bool]
+    total_tx_bytes: cutlass.Constexpr[int]
+    shared_loader: cutlass.Constexpr[bool] = False
+
+    def producer_try_acquire(self, state, *, loc=None, ip=None):
+        if self.shared_loader and not self.arms_full:
+            return Boolean(True)
+        return super().producer_try_acquire(state, loc=loc, ip=ip)
+
+    def producer_acquire(
+        self, state, try_acquire_token=None, *, expected_tx=None, loc=None, ip=None
+    ):
+        if cutlass.const_expr(self.arms_full):
+            super().producer_acquire(
+                state,
+                try_acquire_token,
+                expected_tx=Int32(self.total_tx_bytes),
+                loc=loc,
+                ip=ip,
+            )
+        elif not self.shared_loader:
+            if_generate(
+                try_acquire_token is None or try_acquire_token == 0,
+                lambda: self.sync_object_empty.wait(
+                    state.index, state.phase, loc=loc, ip=ip
+                ),
+                loc=loc,
+                ip=ip,
+            )
+
+
+@dataclass(kw_only=True)
+class LdgstsPipelineGroup(PipelineGroup):
+    """CTA-local A/SFA completion with one atom-relative MMA release."""
+
+    gemm_cfg: cutlass.Constexpr[object]
+
+    def _make_full_sync_object(self, cfg, full_ptr):
+        if (
+            self.gemm_cfg.fuse_operand_sf_loads
+            and not self.gemm_cfg.is_swap_ab
+            and self.gemm_cfg.fused_a_single_commit
+        ):
+            cfg = replace(
+                cfg,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    self.gemm_cfg.warp_layout.num_load_a_warps * 32,
+                ),
+            )
+        return super()._make_full_sync_object(cfg, full_ptr)
+
+    def _build_member_pipeline(
+        self, member, member_cfg, sync_object_full, sync_object_empty, cta_layout
+    ):
+        base = super()._build_member_pipeline(
+            member, member_cfg, sync_object_full, sync_object_empty, cta_layout
+        )
+        if has_multiple_umma_atoms(self.gemm_cfg):
+            return override_umma_atom_pipeline(base)
+        return base
+
+
+@dataclass(kw_only=True)
+class DenseTmaPipelineGroup(PipelineGroup):
+    """Shared A/B/SF barriers for a 2xY cluster or fused-loader 4xY cluster.
+
+    For multi-atom CGAs, B arms each local full barrier for all operand bytes;
+    this avoids remote A/SFA full-barrier arrivals. A single atom retains four
+    local operand arrivals, which benchmarks faster. The MMA release covers
+    the row/column union with one release per atom, using the active shape.
+    A split group instead covers only A/SFA or B/SFB and releases along that
+    pair's sharing dimension. Each local operand producer arms its pair's bytes.
+    """
+
+    gemm_cfg: cutlass.Constexpr[object]
+    split_operand: cutlass.Constexpr[str] = ""
+
+    @property
+    def input_control(self):
+        return input_tma_group_control(self.gemm_cfg, self.split_operand)
+
+    def _release_mask_and_count(self):
+        control = self.input_control
+        return input_tma_release(
+            self.gemm_cfg, control.release_scope, control.participants
+        )
+
+    def _make_full_sync_object(self, cfg, full_ptr):
+        if not self.input_control.single_full_arrival:
+            return super()._make_full_sync_object(cfg, full_ptr)
+        # The owning operand advances in every atom, even when another atom
+        # supplies its multicast payload. The even CTA arms the local barrier
+        # once for all bytes in this group.
+        return super()._make_full_sync_object(
+            replace(
+                cfg, producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
+            ),
+            full_ptr,
+        )
+
+    def _make_empty_sync_object(self, cfg, empty_ptr):
+        if not has_multiple_umma_atoms(self.gemm_cfg):
+            count = input_tma_arrival_count(
+                self.input_control.release_scope,
+                *self.gemm_cfg.preferred_cluster_shape[:2],
+                self.gemm_cfg.umma_cta_count,
+            )
+            return super()._make_empty_sync_object(
+                replace(
+                    cfg,
+                    consumer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread, count
+                    ),
+                ),
+                empty_ptr,
+            )
+        _, count = self._release_mask_and_count()
+        return PipelineTmaUmma._make_sync_object(
+            empty_ptr,
+            cfg.num_stages,
+            (
+                pipeline.PipelineOp.TCGen05Mma,
+                pipeline.CooperativeGroup(pipeline.Agent.Thread, count),
+            ),
+        )
+
+    def _build_member_pipeline(
+        self, member, member_cfg, sync_object_full, sync_object_empty, cta_layout
+    ):
+        base = super()._build_member_pipeline(
+            member, member_cfg, sync_object_full, sync_object_empty, cta_layout
+        )
+        if not self.input_control.single_full_arrival:
+            return _local_input_tma_pipeline(self.gemm_cfg, base, member)
+        # Signal every issuer/full owner that acquires these operands. Split groups
+        # exclude the other pair's users, avoiding unnecessary cross-dimension
+        # dependencies; the shared group retains the row/column union.
+        consumer_mask, _ = self._release_mask_and_count()
+        return DenseOperandPipeline(
+            sync_object_full,
+            sync_object_empty,
+            base.num_stages,
+            base.producer_mask,
+            consumer_mask,
+            _input_tma_full_armer(self.gemm_cfg, member),
+            base.cta_group,
+            arms_full=member.mixed_cga_kind == self.input_control.primary_operand,
+            total_tx_bytes=self.pipeline_config.num_bytes,
+            shared_loader=self.input_control.shared_loader,
+        )
+
+
+def _input_tma_full_armer(cfg, resource):
+    """CTA ownership and TS producer-warp election are independent predicates."""
+    leader = input_tma_full_armer_cta(cfg)
+    if resource.pipeline_config.producer_signaling_threads.has_task_warp_leader():
+        warp_leader = resource._producer_task_warp_leader_predicate()
+        leader = (
+            warp_leader if isinstance(leader, bool) and leader else leader & warp_leader
+        )
+    return leader
+
+
+def _local_input_tma_pipeline(cfg, base, resource):
+    """Keep the stock acquire instructions, with ownership supplied centrally."""
+    producer_mask, consumer_mask = None, None
+    if cfg.uses_two_cta_mma:
+        _, producer_mask, consumer_mask, _ = cga_tma_masks(cfg, resource.mixed_cga_kind)
+    return replace(
+        base,
+        producer_mask=producer_mask,
+        consumer_mask=consumer_mask,
+        is_leader_cta=_input_tma_full_armer(cfg, resource),
+        cta_group=input_tma_umma_group(cfg),
+    )
+
+
+def create_input_tma_pipeline(resource, pipeline_config):
+    """Every input TmaUmma, including 1x1/2x1, resolves its ownership here."""
+    cfg = resource.cfg
+    if (
+        pipeline_config.pipeline_type == PipelineType.TmaUmma
+        and not has_multiple_umma_atoms(cfg)
+    ):
+        control = input_tma_control(cfg, resource.mixed_cga_kind)
+        count = input_tma_arrival_count(
+            control.release_scope, *cfg.preferred_cluster_shape[:2], cfg.umma_cta_count
+        )
+        pipeline_config = replace(
+            pipeline_config,
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, count),
+        )
+    base = MemoryResource.create_pipeline(resource, pipeline_config)
+    if isinstance(base, PipelineTmaUmma):
+        return override_tma_umma_pipeline(cfg, base, resource.mixed_cga_kind, resource)
+    return base
+
+
 def override_tma_umma_pipeline(
     cfg: cutlass.Constexpr[object],
     base,
     mask_kind: cutlass.Constexpr[str],
+    resource,
 ):
     """Return ``base`` with active-shape masks for one TMA-to-UMMA operand.
 
-    Callers gate this override on physical multi-atom topology, independently
-    of whether the operand uses extended payload multicast.  A local payload
-    in the second or later UMMA atom still needs atom-relative full/empty
-    barrier ownership. Fixed wider launches use compile-time dimensions;
-    flexible launches query the active preferred/fallback shape.
-
-    ``cga_tma_masks`` also maps the operand to the TRT-LLM-equivalent multicast
-    direction: A/SFA use Row/physical-Y releases and B/SFB use
-    Col/physical-X-atom releases. FlashInfer has no RowCol case because these
-    resources own separate pipelines.
+    Single-atom launches retain the stock pipeline operations and one barrier
+    initialization. Multi-atom launches retain their existing local/remote
+    arming implementations and runtime empty-barrier initialization.
     """
+    if not has_multiple_umma_atoms(cfg):
+        return _local_input_tma_pipeline(cfg, base, resource)
     _, producer_mask, consumer_mask, consumer_arrival_count = cga_tma_masks(
         cfg, mask_kind
     )
+    control = input_tma_control(cfg, mask_kind)
 
     # The stock pipeline was materialized with the static 2x1 UMMA atom layout,
     # so its empty barrier expects one release. Wider physical CGAs route
@@ -278,13 +657,19 @@ def override_tma_umma_pipeline(
             ),
         ),
     )
-    # ``MemoryResource.create_pipeline`` has already narrowed the base
-    # pipeline's static even-X CTA predicate with TaskWarpLeader when the
-    # resource aggregates multiple producer warps.  Physical mixed-CGA X is
-    # required to be even, so the static 2x1 atom predicate remains exactly
-    # the runtime even-X predicate.  Preserve it here instead of replacing it
-    # and accidentally letting every producer warp arm the same barriers.
-    is_leader_cta = base.is_leader_cta
+    is_leader_cta = _input_tma_full_armer(cfg, resource)
+    if control.full_arming == "local_atom":
+        return DenseOperandPipeline(
+            base.sync_object_full,
+            sync_object_empty,
+            base.num_stages,
+            base.producer_mask,
+            consumer_mask,
+            is_leader_cta,
+            base.cta_group,
+            arms_full=True,
+            total_tx_bytes=base.sync_object_full.tx_count,
+        )
     return CgaPipelineTmaUmma(
         base.sync_object_full,
         sync_object_empty,

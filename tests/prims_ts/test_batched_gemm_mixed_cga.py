@@ -16,6 +16,8 @@
 
 import pytest
 
+from tests.prims_ts.python_body import python_body
+
 
 def _bf16_mixed_config(**overrides):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -244,6 +246,7 @@ def test_4x4_reference_task_participant_counts():
         ("MCAST_A", 0x0F, 0x3),
         ("MCAST_B", 0x33, 0x3),
         ("MCAST_SFB", 0x11, 0x1),
+        ("TMA_B_OR_FULL_OWNER", 0x77, 0x3),
     ),
 )
 def test_policy_selection_matches_documented_rank_diagram(
@@ -375,7 +378,7 @@ def test_local_a_payload_keeps_multi_atom_tma_umma_barrier_routing(monkeypatch):
     from cutlass.experimental.task_scheduling.resources import MemoryResource
     from cutlass.pipeline.sm100 import PipelineTmaUmma
 
-    from flashinfer.prims_ts.batched_gemm import smem_ab_resources
+    from flashinfer.prims_ts.batched_gemm import smem_ab_resources, mixed_cga_ts
     from flashinfer.prims_ts.batched_gemm.batched_gemm_cga import (
         has_multiple_umma_atoms,
         needs_extended_tma_multicast,
@@ -409,16 +412,16 @@ def test_local_a_payload_keeps_multi_atom_tma_umma_barrier_routing(monkeypatch):
         lambda _self, _pipeline_config: base,
     )
     monkeypatch.setattr(
-        smem_ab_resources,
+        mixed_cga_ts,
         "override_tma_umma_pipeline",
-        lambda actual_cfg, actual_base, operand: (
+        lambda actual_cfg, actual_base, operand, resource: (
             calls.append((actual_cfg, actual_base, operand)),
             wrapped,
         )[1],
     )
     resource = object.__new__(smem_ab_resources.SmemAResource)
     object.__setattr__(resource, "cfg", cfg)
-    assert resource.create_pipeline(None) is wrapped
+    assert resource.create_pipeline(_make_pipeline_configs(cfg)["smem_a"]) is wrapped
     assert calls == [(cfg, base, "a")]
 
 
@@ -491,9 +494,12 @@ def test_class_a_rank_gated_tasks_redistribute_registers_on_peer_cta():
 
     expected = {
         "CopySfATask": (18, 1, 32),
-        "MmaTask0": (19, 1, 32),
-        "WorkScheduleTask": (20, 1, 48),
+        # The LDGSTS SFB completion relay occupies warp 19, including when
+        # A itself uses TMA. MMA and CLC follow that relay warp.
+        "MmaTask0": (20, 1, 32),
+        "WorkScheduleTask": (21, 1, 48),
     }
+    assert tasks_by_name["SyncTask"].warp_idx == 19
     for name, (warp_idx, num_warps, num_registers) in expected.items():
         task = tasks_by_name[name]
         assert isinstance(task, CgaTask)
@@ -533,8 +539,8 @@ def test_rank_gated_register_verifier_rejects_stock_task():
             "require umma_cta_count=2",
         ),
         (
-            {"fallback_cluster_dim_x": 4, "fallback_cluster_dim_y": 2},
-            "must differ|must divide",
+            {"fallback_cluster_dim_x": 4, "fallback_cluster_dim_y": 4},
+            "must divide",
         ),
     ),
 )
@@ -768,3 +774,80 @@ def test_validation_schedule_uses_active_shape_task_policies():
     assert tasks_by_name["LoadBTask"].cga_policy == int(CgaPolicy.MCAST_B)
     assert tasks_by_name["MmaTask0"].cga_policy == int(CgaPolicy.ATOM_LEADER)
     assert tasks_by_name["WorkScheduleTask"].run_only_on_cta_id == 0
+
+
+@pytest.mark.parametrize(
+    "shape", [(2, 1, 1), (2, 4, 1), (4, 1, 1), (4, 2, 1), (4, 4, 1)]
+)
+@pytest.mark.parametrize("mode", ["fixed", "specialized", "runtime"])
+def test_tma_instruction_matches_payload_receivers(monkeypatch, shape, mode):
+    """Only issuer-local masks become unicast, including runtime fallbacks."""
+    from dataclasses import replace
+    from flashinfer.prims_ts.batched_gemm import batched_gemm_cga as cga
+
+    # Execute both Python bodies so the host-only payload audit does not
+    # attempt to JIT-compile sentinel pointers and empty coordinate tuples.
+    monkeypatch.setattr(
+        cga, "_issue_tma_load_impl", python_body(cga._issue_tma_load_impl)
+    )
+
+    flexible = mode != "fixed" and shape != (2, 1, 1)
+    cfg = _fp4_fc2_mixed_config(
+        cluster_dim_x=shape[0],
+        cluster_dim_y=shape[1],
+        fallback_cluster_dim_x=2 if flexible else 0,
+    )
+    calls = []
+    barrier = object()
+    monkeypatch.setattr(cga, "Int32", int)
+    monkeypatch.setattr(cga.cute.arch, "make_warp_uniform", lambda x: x)
+    monkeypatch.setattr(
+        cga.prims,
+        "cp_async_bulk_tensor_shared_cluster_global",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    shapes = [shape, (2, 1, 1)] if flexible else [shape]
+    for active in shapes:
+        body_cfg = (
+            replace(cfg, _active_cga_shape=active) if mode == "specialized" else cfg
+        )
+        topo = cga.HostCgaTopology(*active)
+        for operand in ("a", "b", "sfa", "sfb"):
+            for rank in range(active[0] * active[1]):
+                x, y = rank % active[0], rank // active[0]
+                mask = 1 << rank
+                if cga.needs_extended_tma_multicast(cfg, operand):
+                    if operand in ("a", "sfa"):
+                        mask = topo.payload_mask_a(x)
+                    elif operand == "b":
+                        mask = topo.payload_mask_b(x, y)
+                    else:
+                        mask = topo.payload_mask_sfb(y)
+                monkeypatch.setattr(cga.cute.arch, "block_idx_in_cluster", lambda: rank)
+                monkeypatch.setattr(
+                    cga, "active_cga_coords", lambda cfg: (*active, rank, x, y)
+                )
+                monkeypatch.setattr(
+                    cga, "cga_policy_selected", python_body(cga.cga_policy_selected)
+                )
+                python_body(cga.issue_tma_load)(
+                    body_cfg, operand, None, None, (), barrier, mask
+                )
+                elected = True
+                if cga.needs_extended_tma_multicast(cfg, operand):
+                    elected = (
+                        y == 0
+                        if operand in ("a", "sfa")
+                        else x < 2
+                        if operand == "b"
+                        else x == 0
+                    )
+                if not elected:
+                    assert not calls
+                    continue
+                args, kwargs = calls.pop()
+                assert args[3] is barrier
+                assert kwargs["group"] == cfg.cta_group
+                assert kwargs.get("multicast_mask") == (
+                    None if mask == 1 << rank else mask
+                )
