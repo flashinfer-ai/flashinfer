@@ -772,13 +772,18 @@ def _own_bound() -> None:
 
     The parent may have held the lock at the fork, which would block the child
     for good instead of refusing; the parent's bindings refuse every call by
-    pid anyway, and the parent is the one to tear them down.
+    pid anyway, and the parent is the one to tear them down. A binding released
+    by its own ``release()`` leaves the registry here, frozen or not, so a later
+    ``import_entry`` binds afresh.
     """
     global _bound_lock, _bound, _bound_pid
     if _bound_pid != os.getpid():
         _bound_lock = threading.Lock()
         _bound = {}
         _bound_pid = os.getpid()
+    with _bound_lock:
+        for key in [key for key, bound in _bound.items() if bound.released]:
+            del _bound[key]
 
 
 def _sealed_symbol(
@@ -994,13 +999,14 @@ def release_packages(*, allow_frozen: bool = False) -> None:
 def installed_packages() -> list[tuple[SealedPackage, Callable[..., Any]]]:
     """The sealed packages installed, each with its callable for this process.
 
-    What ``load_packages`` installed, minus what ``release_packages`` released,
-    one per Definition: a later load for a Definition replaces its entry, and
-    a package refused at load is never listed. An engine that routes its own
-    call sites pairs each Definition with the callable of the same package,
-    without repeating the load. A forked child gets a binding of its own.
+    What ``load_packages`` installed (nothing with ``enable=False``), minus what
+    ``release_packages`` released, one per Definition: a later load for a
+    Definition replaces its entry, and a package refused at load is never
+    listed. An engine that routes its own call sites pairs each Definition with
+    the callable of the same package, without repeating the load. A forked
+    child gets a binding of its own.
     """
-    return [(package, import_entry(package)) for package in _installed.values()]
+    return [(package, import_entry(package)) for package in list(_installed.values())]
 
 
 def setup_stats() -> dict[str, dict[str, Any]]:

@@ -206,7 +206,9 @@ binding that a CUDA-graph capture has observed is never released, by
 captured graphs replay against the state addresses, so the state is kept for
 the life of the process and stays in ``setup_stats()``. An engine that has
 destroyed every graph that captured the binding passes ``allow_frozen=True`` to
-either call, and the binding releases like any other. A setup-bearing
+either call, and the binding releases like any other. A binding released by
+its own ``release()`` leaves the registry, so a later ``import_entry`` binds
+afresh; its routes stay until ``release_packages()``. A setup-bearing
 solution loaded through the curated path is bound the same way but registered
 nowhere: ``disable_apply()`` drops it without teardown, and neither call sees
 it. Nothing runs at process exit.
@@ -319,7 +321,8 @@ Programmatic use
    result.applied         # enable_apply() return value
 
 ``installed_packages()`` returns ``[(package, callable)]`` for the packages
-``load_packages`` installed and ``release_packages`` has not released, one per
+``load_packages`` installed (none with ``enable=False``) and
+``release_packages`` has not released, one per
 Definition: a later load for a Definition replaces its entry. An
 engine that routes its own call sites uses it to pair each Definition with the
 callable of the same package; a package refused at load is not listed, and a

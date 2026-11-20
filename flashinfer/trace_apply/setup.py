@@ -606,6 +606,11 @@ class SetupBoundCallable:
         frozen and its states are kept for the life of the process."""
         return self._frozen
 
+    @property
+    def released(self) -> bool:
+        """Whether ``release`` ran: the states are gone and every call is refused."""
+        return self._released
+
     def release(self, *, allow_frozen: bool = False) -> None:
         """Tear down every retained state (when a teardown is declared), then forget them.
 

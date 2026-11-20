@@ -786,6 +786,29 @@ def test_installed_packages_follow_load_release_and_fork(sm_gate_off, monkeypatc
     assert pk.setup_stats()[GOLDEN_SETUP_KEY[0]]["runs"] == 1
 
 
+def test_a_binding_released_directly_leaves_the_registry(sm_gate_off, monkeypatch):
+    """After a binding's own release(), the next import binds afresh."""
+    monkeypatch.setattr(
+        pk, "_bound", {}
+    )  # the frozen binding must not outlive the test
+    monkeypatch.setattr(pk, "_installed", {})
+    pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST])
+    [(_, bound)] = pk.installed_packages()
+    hidden, weight, out = torch.randn(2, 16), torch.randn(16), torch.empty(2, 16)
+    bound(hidden_states=hidden, weight=weight, output=out)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    bound(hidden_states=hidden, weight=weight, output=out)  # freezes the binding
+    monkeypatch.setattr(su, "_is_capturing", lambda device: False)
+
+    bound.release(allow_frozen=True)
+    assert pk.setup_stats() == {}
+    [(_, fresh)] = pk.installed_packages()
+    assert fresh is not bound
+    fresh(hidden_states=hidden, weight=weight, output=out)
+    pk.release_packages()  # the released binding no longer keeps its Definition
+    assert pk.installed_packages() == []
+
+
 def test_a_wrapper_kept_across_release_routes_nowhere(sm_gate_off, monkeypatch):
     """A wrapped API kept across release routes to stock, never to the loader."""
     import flashinfer.trace_apply.apply as apply_module
