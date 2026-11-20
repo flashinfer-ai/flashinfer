@@ -31,11 +31,14 @@ matrix and quantizes them to E4M3 with one scale per 128-token Q block and per
 * ``vc_quantize`` permutes K, subtracts the V tile means, quantizes the
   residuals per channel to E4M3 and packs the kernel operands with the CuTe
   DSL kernels of ``prepare``.
-* ``vc_quantize_fp8`` does the same plus the E4M3 Q/K operands and scales.
+* ``vc_quantize_fp8`` does the same plus the E4M3 Q/K operands and scales;
+  ``vc_quantize_int8`` writes INT8 Q/K codes instead, for the INT8 tensor core
+  of SM100 (B200).
 * ``vc_quantize_repair`` writes V repair rows instead of tile means, for
-  either recipe.
+  either recipe; ``vc_quantize_repair_int8`` with INT8 Q/K codes.
 * ``VCAttentionPreprocessor`` applies the paper's V-Smooth schedule over the
-  denoising steps on top of the two.
+  denoising steps on top of them, with the Q/K code type of the device
+  (``vc_qk8_dtype``: INT8 on B200, E4M3 elsewhere, as the paper configures).
 
 The operand contract the kernel consumes is defined in
 ``flashinfer.attention.prims_ts.vc_attention``.
@@ -53,6 +56,7 @@ import torch
 from . import (
     VC_HEAD_DIM,
     VCAttentionParams,
+    vc_qk8_dtype,
     vc_repair_tiles,
 )
 
@@ -66,6 +70,8 @@ VC_SMOOTH_STEP_FRACTION = 0.25
 VC_PERM_REFRESH_EVERY = 4
 VC_KMEANS_CLUSTERS = 64
 VC_KMEANS_ITERS = 3
+# Host seed of the k-means rows a cold start begins from.
+VC_KMEANS_SEED = 0
 
 
 @dataclass(frozen=True)
@@ -128,6 +134,15 @@ def hadamard_matrix(d: int, device: torch.device) -> torch.Tensor:
     return _hadamard_matrix_cached(d, str(device))
 
 
+@functools.lru_cache(maxsize=None)
+def _seed_rows(seq_len: int, num_clusters: int, device: torch.device) -> torch.Tensor:
+    """Rows a cold k-means start takes the centroids from. One host draw from
+    ``VC_KMEANS_SEED`` per sequence length is kept per device. A CUDA graph of
+    the cold start therefore captures no random draw."""
+    generator = torch.Generator().manual_seed(VC_KMEANS_SEED)
+    return torch.randperm(seq_len, generator=generator)[:num_clusters].to(device)
+
+
 @torch.no_grad()
 def vc_token_permutation(
     v: torch.Tensor,
@@ -136,6 +151,7 @@ def vc_token_permutation(
     iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
     init_centroids: torch.Tensor | None = None,
+    grouped_tokens: tuple[int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Group similar value rows by k-means per batch and head, then argsort the labels.
 
@@ -144,8 +160,37 @@ def vc_token_permutation(
     tiles hold similar values and their tile means remove most of the value
     energy. ``init_centroids`` from a previous call warm-starts the clustering,
     as the paper does when the grouping is refreshed a few denoising steps later.
+    A cold start uses one set of seed rows for every batch element and head.
+    The rows come from ``generator`` or without one from the fixed rows of
+    ``VC_KMEANS_SEED``. No element's grouping depends on the others.
+    ``grouped_tokens=(start, stop)`` groups only that token range. In a joint
+    sequence the range holds the video tokens. The other tokens follow in input
+    order. A text or audio key grouped with the video keys would precede the
+    long video tail in the rows attending to it. That tail would round to zero
+    against the row maximum.
     """
     b, s, h, d = v.shape
+    if grouped_tokens is not None:
+        start, stop = grouped_tokens
+        if not 0 <= start < stop <= s:
+            raise ValueError(
+                "grouped_tokens must be a non-empty range within the sequence"
+            )
+        perm, centroids = vc_token_permutation(
+            v[:, start:stop],
+            num_clusters=num_clusters,
+            iters=iters,
+            generator=generator,
+            init_centroids=init_centroids,
+        )
+        rest = torch.cat(
+            [
+                torch.arange(start, device=v.device),
+                torch.arange(stop, s, device=v.device),
+            ]
+        )
+        perm = torch.cat([perm + start, rest.expand(b, h, -1)], dim=-1)
+        return perm, centroids
     if num_clusters is None:
         num_clusters = VC_KMEANS_CLUSTERS
     # Seeding draws distinct value rows, so a short sequence caps the clusters.
@@ -164,6 +209,13 @@ def vc_token_permutation(
         num_clusters,
         d,
     )
+    if not warm:
+        if generator is None:
+            seed_rows = _seed_rows(s, num_clusters, v.device)
+        else:
+            seed_rows = torch.randperm(s, device=v.device, generator=generator)[
+                :num_clusters
+            ]
     for bi in range(b):
         for h0 in range(0, h, chunk_h):
             h1 = min(h, h0 + chunk_h)
@@ -173,17 +225,7 @@ def vc_token_permutation(
             if warm:
                 centroids = init_centroids[g0 : g0 + gsz].to(x.dtype)
             else:
-                idx = torch.stack(
-                    [
-                        torch.randperm(s, device=v.device, generator=generator)[
-                            :num_clusters
-                        ]
-                        for _ in range(gsz)
-                    ]
-                )  # [G, k]
-                centroids = torch.gather(
-                    x, 1, idx.unsqueeze(-1).expand(-1, -1, d)
-                )  # [G, k, D]
+                centroids = x[:, seed_rows]  # [G, k, D]
             x_sq = (x * x).sum(-1, keepdim=True)  # [G, S, 1]
             labels = None
             for _ in range(iters):
@@ -274,18 +316,20 @@ def vc_quantize(
 
 
 @torch.no_grad()
-def vc_quantize_fp8(
+def _quantize_qk8(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    perm: torch.Tensor | None = None,
-    kmeans_iters: int = VC_KMEANS_ITERS,
-    generator: torch.Generator | None = None,
-    demean: bool = True,
+    prepare_fn,
+    perm: torch.Tensor | None,
+    kmeans_iters: int,
+    generator: torch.Generator | None,
+    demean: bool,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` bf16/fp16 Q/K/V into VC-Attention-QK8 kernel
-    operands with four CuTe DSL kernels (``prepare``).
+    operands with four CuTe DSL kernels (``prepare_fn``, the E4M3 or INT8
+    ``vc_prepare_*`` of ``prepare``).
 
     Keys are centred by their per-(batch, head) channel mean over tokens
     (softmax-invariant), permuted with the values, rotated with Q by the
@@ -306,11 +350,9 @@ def vc_quantize_fp8(
             "q, k, v must be [B, S, H, D] with matching batch, heads, head_dim and dtype"
         )
     _check_prepare_inputs(q)
-    from .prepare import vc_prepare_fp8
-
     if perm is None:
         perm = vc_token_permutation(v, iters=kmeans_iters, generator=generator)[0]
-    q8, k8, v8, q_scale, k_scale, v_scale, mean, mu = vc_prepare_fp8(
+    q8, k8, v8, q_scale, k_scale, v_scale, mean, mu = prepare_fn(
         q.contiguous(), k.contiguous(), v.contiguous(), perm, demean=demean
     )
     return VCAttentionOperands(
@@ -328,15 +370,66 @@ def vc_quantize_fp8(
 
 
 @torch.no_grad()
-def vc_quantize_repair(
+def vc_quantize_fp8(
+    q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     *,
+    perm: torch.Tensor | None = None,
+    kmeans_iters: int = VC_KMEANS_ITERS,
+    generator: torch.Generator | None = None,
+    demean: bool = True,
+) -> VCAttentionOperands:
+    """``_quantize_qk8`` with E4M3 Q/K codes."""
+    from .prepare import vc_prepare_fp8
+
+    return _quantize_qk8(
+        q,
+        k,
+        v,
+        prepare_fn=vc_prepare_fp8,
+        perm=perm,
+        kmeans_iters=kmeans_iters,
+        generator=generator,
+        demean=demean,
+    )
+
+
+def vc_quantize_int8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    perm: torch.Tensor | None = None,
+    kmeans_iters: int = VC_KMEANS_ITERS,
+    generator: torch.Generator | None = None,
+    demean: bool = True,
+) -> VCAttentionOperands:
+    """``_quantize_qk8`` with INT8 Q/K codes, for the INT8 tensor core of SM100."""
+    from .prepare import vc_prepare_int8
+
+    return _quantize_qk8(
+        q,
+        k,
+        v,
+        prepare_fn=vc_prepare_int8,
+        perm=perm,
+        kmeans_iters=kmeans_iters,
+        generator=generator,
+        demean=demean,
+    )
+
+
+def _quantize_repair(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    prepare_fn,
     budget: float,
-    q: torch.Tensor | None = None,
+    q: torch.Tensor | None,
 ) -> VCAttentionOperands:
     """Turn ``[B, S, H, D]`` K/V into V repair operands, of VC-Attention-QK8
-    with ``q``.
+    with ``q`` (``prepare_fn``: the E4M3 or INT8 ``vc_prepare_repair*``).
 
     Values are quantized to E4M3 in input order with one scale per batch,
     head and channel. The ``budget`` fraction of tokens with the largest
@@ -356,12 +449,10 @@ def vc_quantize_repair(
             "q must be [B, S, H, D] with the batch, heads, head_dim and dtype of k"
         )
     _check_prepare_inputs(k)
-    from .prepare import vc_prepare_repair
-
     s_k = k.shape[1]
     repair_tiles = vc_repair_tiles(s_k, budget)
     repair_tokens = max(1, round(budget * s_k))
-    q8, k_all, v_all, q_scale, k_scale, v_scale = vc_prepare_repair(
+    q8, k_all, v_all, q_scale, k_scale, v_scale = prepare_fn(
         None if q is None else q.contiguous(),
         k.contiguous(),
         v.contiguous(),
@@ -384,6 +475,32 @@ def vc_quantize_repair(
     )
 
 
+def vc_quantize_repair(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    budget: float,
+    q: torch.Tensor | None = None,
+) -> VCAttentionOperands:
+    """``_quantize_repair`` with E4M3 Q/K codes under QK8."""
+    from .prepare import vc_prepare_repair
+
+    return _quantize_repair(k, v, prepare_fn=vc_prepare_repair, budget=budget, q=q)
+
+
+def vc_quantize_repair_int8(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    budget: float,
+    q: torch.Tensor,
+) -> VCAttentionOperands:
+    """``_quantize_repair`` with INT8 Q/K codes, for the INT8 tensor core of SM100."""
+    from .prepare import vc_prepare_repair_int8
+
+    return _quantize_repair(k, v, prepare_fn=vc_prepare_repair_int8, budget=budget, q=q)
+
+
 class VCAttentionPreprocessor:
     """Caller-owned preparation of bf16 K/V with the paper's V-Smooth schedule.
 
@@ -392,9 +509,12 @@ class VCAttentionPreprocessor:
     recomputed every ``perm_refresh_every`` steps (k-means warm-started from
     the previous centroids) and kept afterwards, when the plain per-channel
     E4M3 V runs with zero tile means. ``kmeans_clusters`` (``None`` = 64) and
-    ``kmeans_iters`` parametrize the online k-means. Without a denoise step
-    the grouping is computed once per K/V geometry and kept. With ``q`` the
-    preparation is the VC-Attention-QK8 one (one E4M3 Q scale per 128 tokens).
+    ``kmeans_iters`` parametrize the online k-means. Step 0 or a step behind
+    the last one seen starts a generation cold from the fixed seed rows of
+    ``VC_KMEANS_SEED``. No centroids carry over and the caller's global
+    generator is untouched. Without a denoise step the grouping is computed
+    once per K/V geometry and kept. With ``q`` the preparation is the
+    VC-Attention-QK8 one (one E4M3 Q scale per 128 tokens).
     """
 
     def __init__(
@@ -417,8 +537,14 @@ class VCAttentionPreprocessor:
         self.perm_refresh_every = perm_refresh_every
         self.kmeans_clusters = kmeans_clusters
         self.kmeans_iters = kmeans_iters
-        # Per (batch, seq_len_k, num_kv_heads): perm, centroids, step of the last refresh.
-        self._groupings: dict[tuple[int, int, int], dict[str, Any]] = {}
+        # A rewind of the denoise step starts a new generation for every grouping.
+        self._generation = 0
+        self._last_step: int | None = None
+        # Per (batch, seq_len_k, num_kv_heads, grouped token range): perm,
+        # centroids, last refresh step, generation.
+        self._groupings: dict[
+            tuple[int, int, int, tuple[int, int] | None], dict[str, Any]
+        ] = {}
 
     @torch.no_grad()
     @torch.compiler.disable
@@ -429,25 +555,59 @@ class VCAttentionPreprocessor:
         *,
         q: torch.Tensor | None = None,
         denoise_step: tuple[int, int] | None = None,
+        grouped_tokens: tuple[int, int] | None = None,
+        mode: str | None = None,
     ) -> VCAttentionOperands:
         """Return the operands of one run for ``[B, S, H, D]`` bf16 K/V, and Q
         under VC-Attention-QK8.
 
         ``denoise_step`` is the sampler's ``(step_index, num_steps)``. Kept
         out of torch.compile so the step index and the k-means refresh do not
-        recompile the caller per step.
+        recompile the caller per step. ``grouped_tokens=(start, stop)`` groups
+        only that token range. In a joint sequence the range holds the video
+        tokens. The other tokens follow in input order. ``None`` groups the
+        whole sequence. Outside the smooth window no tile means are subtracted.
+        A shape with no grouping yet keeps the input order there.
+        ``mode`` names the step kind outright for a CUDA graph runner that
+        replays one graph per kind. ``cold`` regroups from the seed rows,
+        ``warm`` refreshes from the current centroids, ``keep`` demeans on the
+        current grouping and ``plain`` runs without tile means. A mode replaces
+        the step in the bookkeeping. A missing grouping starts cold in every
+        mode.
         """
-        key = (k.shape[0], k.shape[1], k.shape[2])
+        if grouped_tokens is not None:
+            start, stop = grouped_tokens
+            if not 0 <= start < stop <= k.shape[1]:
+                raise ValueError(
+                    "grouped_tokens must be a non-empty range within the sequence"
+                )
+            grouped_tokens = (int(start), int(stop))
+        key = (k.shape[0], k.shape[1], k.shape[2], grouped_tokens)
         entry = self._groupings.get(key)
         smooth = True
-        refresh = entry is None
-        if denoise_step is not None:
+        cold = refresh = entry is None
+        if mode is not None:
+            if mode not in ("cold", "warm", "keep", "plain"):
+                raise ValueError("mode must be cold, warm, keep or plain")
+            smooth = mode != "plain"
+            cold = entry is None or mode == "cold"
+            refresh = smooth and (cold or mode == "warm")
+        elif denoise_step is not None:
             step_idx, num_steps = denoise_step
             smooth = step_idx < math.ceil(self.smooth_step_fraction * num_steps)
-            # Step 0 starts a new generation, so it always regroups.
-            refresh = smooth and (
+            # Step 0 starts cold, as does a grouping from before the last step
+            # rewind of a sampler that begins after step 0. Later refreshes
+            # warm-start from this generation's centroids.
+            if self._last_step is not None and step_idx < self._last_step:
+                self._generation += 1
+            self._last_step = step_idx
+            cold = (
                 entry is None
                 or step_idx == 0
+                or entry["generation"] != self._generation
+            )
+            refresh = smooth and (
+                cold
                 or (
                     step_idx % self.perm_refresh_every == 0
                     and entry["step"] != step_idx
@@ -459,14 +619,20 @@ class VCAttentionPreprocessor:
                     v,
                     num_clusters=self.kmeans_clusters,
                     iters=self.kmeans_iters,
-                    init_centroids=None if entry is None else entry["centroids"],
+                    init_centroids=None if cold else entry["centroids"],
+                    grouped_tokens=grouped_tokens,
                 )
-                step = None if denoise_step is None else denoise_step[0]
+                step = (
+                    None
+                    if mode is not None or denoise_step is None
+                    else denoise_step[0]
+                )
                 if entry is None:
                     entry = {
                         "perm": perm.to(torch.int32),
                         "centroids": centroids,
                         "step": step,
+                        "generation": self._generation,
                     }
                     self._groupings[key] = entry
                 else:
@@ -475,22 +641,30 @@ class VCAttentionPreprocessor:
                     entry["perm"].copy_(perm.to(torch.int32))
                     entry["centroids"].copy_(centroids)
                     entry["step"] = step
+                    entry["generation"] = self._generation
             perm = entry["perm"]
-        elif entry is not None:
+        elif entry is not None and entry["generation"] == self._generation:
             # V-Smooth off (paper Section 3.4). The plain kernel runs on the last
-            # permutation with zero tile means.
+            # permutation of this generation with zero tile means.
             perm = entry["perm"]
         else:
             perm = torch.arange(k.shape[1], device=k.device, dtype=torch.int32)
             perm = perm.view(1, 1, -1).expand(k.shape[0], k.shape[2], -1).contiguous()
         if q is not None:
-            return vc_quantize_fp8(q, k, v, perm=perm, demean=smooth)
+            # The paper's Q/K code type of the device: INT8 on B200, E4M3 elsewhere.
+            quantize = (
+                vc_quantize_int8
+                if vc_qk8_dtype(k.device) is torch.int8
+                else vc_quantize_fp8
+            )
+            return quantize(q, k, v, perm=perm, demean=smooth)
         return vc_quantize(k, v, perm=perm, demean=smooth)
 
 
 __all__ = [
     "VC_KMEANS_CLUSTERS",
     "VC_KMEANS_ITERS",
+    "VC_KMEANS_SEED",
     "VC_PERM_REFRESH_EVERY",
     "VC_SMOOTH_STEP_FRACTION",
     "VCAttentionOperands",
@@ -498,6 +672,8 @@ __all__ = [
     "hadamard_matrix",
     "vc_quantize",
     "vc_quantize_fp8",
+    "vc_quantize_int8",
     "vc_quantize_repair",
+    "vc_quantize_repair_int8",
     "vc_token_permutation",
 ]

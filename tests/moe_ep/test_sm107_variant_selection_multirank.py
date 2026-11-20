@@ -179,7 +179,7 @@ def test_variant_search_replay_and_handoff(
         graph.replay()
         torch.cuda.synchronize()
         assert_reference(old_output, expected, kind)
-        transformed = layer._get_transformed_weights()
+        transformed = layer.get_transformed_weights()
         fixed = moe_ep.MoEEpLayer(
             bootstrap,
             fleet,
