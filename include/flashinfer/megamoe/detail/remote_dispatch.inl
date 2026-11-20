@@ -241,8 +241,8 @@ const auto remote_early_return = [&]() {
         // accumulation and BF16 rounding. Hidden4096 gives eight columns per
         // lane with two warps/row, so this batch introduces no padded loads.
         constexpr uint32_t kColumnStride = 32 * kReturnWarpsPerRow;
-        constexpr uint32_t kColumnBatch = 2;
-        static_assert(kUint4PerRow % (kColumnStride * kColumnBatch) == 0);
+        constexpr uint32_t kColumnBatch = kUint4PerRow % (kColumnStride * 2) == 0 ? 2 : 1;
+        static_assert(kUint4PerRow % 32 == 0);
         for (uint32_t c = (warp_idx % kReturnWarpsPerRow) * 32 + lane_idx; c < kUint4PerRow;
              c += kColumnStride * kColumnBatch) {
           uint4 values[kNumTopk][kColumnBatch];
