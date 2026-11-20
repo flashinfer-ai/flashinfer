@@ -6,8 +6,8 @@ causal KV length and pages from the caller's ``seq_lens`` and ``block_tables`` o
 the device and cuts the row's KV tiles into ``plan_kv_split`` equal ranges; its
 reducer merges the BF16 partials in a fixed order and applies the sink and
 ``bmm2_scale``. These tests check, on every Blackwell device (the fixture lists the
-current device from max_seq_len 1025, the way GB300 is listed, so B200 is checked
-below the max_seq_len 2049 where its listed range starts too):
+current device from max_seq_len 1025, so the split-KV program is also checked below
+the max_seq_len 2049 where the listed ranges of B200 and GB300 start):
 
 - accuracy against an FP64 reference at the level of TRTLLM-GEN (its maximum
   absolute error plus one BF16 rounding of the partials), with sinks,
@@ -58,10 +58,9 @@ def _require_blackwell() -> None:
 
 @pytest.fixture
 def splitkv_device(monkeypatch):
-    """List the current device in ``_SPLITKV_RANGE`` as GB300 is listed (from
-    max_seq_len 1025, up to 18 query rows), so these tests reach the split-KV
-    program on B200 from max_seq_len 1025 as well (its listed range starts at
-    2049)."""
+    """List the current device in ``_SPLITKV_RANGE`` from max_seq_len 1025, up
+    to 18 query rows, so these tests reach the split-KV program from max_seq_len
+    1025 as well (the listed ranges of B200 and GB300 start at 2049)."""
     _require_blackwell()
     arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
     monkeypatch.setattr(cake_module, "_SPLITKV_RANGE", {(arch, num_sms): (1025, 18)})

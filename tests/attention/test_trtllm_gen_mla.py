@@ -2006,7 +2006,7 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
             "mla_fp8_tail",
         ),
         # The split-KV domain serves the devices _SPLITKV_RANGE lists (GB300: from
-        # max_seq_len 1025, the first max_seq_len of tuning bucket 2048, up to 18
+        # max_seq_len 2049, the first max_seq_len of tuning bucket 4096, up to 18
         # query rows), sinks, page 64, bmm2_scale != 1 and q_len > 1 included.
         (
             {
@@ -2016,16 +2016,6 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
                 "total_q": 1,
                 "max_seq_len": 2048,
             },
-            "mla_bf16_splitkv",
-        ),
-        (
-            {
-                "arch": "sm_103a",
-                "num_sms": 152,
-                "q_len": 1,
-                "total_q": 1,
-                "max_seq_len": 1024,
-            },
             "mla_bf16_vquarter",
         ),
         (
@@ -2034,7 +2024,7 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
                 "num_sms": 152,
                 "q_len": 1,
                 "total_q": 1,
-                "max_seq_len": 1025,
+                "max_seq_len": 2049,
             },
             "mla_bf16_splitkv",
         ),
@@ -2601,7 +2591,7 @@ def _list_splitkv_device(domain: str, monkeypatch) -> None:
     """For a split-KV case, list the current device in ``_SPLITKV_RANGE`` from
     max_seq_len 1025 up to 18 query rows, so the case reaches the split-KV
     program on every Blackwell device, also one that is not listed or whose
-    listed range starts at a longer max_seq_len (B200: 2049)."""
+    listed range starts at a longer max_seq_len (B200 and GB300: 2049)."""
     from flashinfer.mla import cake_trtllm_mla_blackwell as module
 
     if domain != "mla_bf16_splitkv":

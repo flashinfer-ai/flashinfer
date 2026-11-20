@@ -2153,7 +2153,7 @@ def test_cake_miss_runs_the_tuned_first_stage_winner(monkeypatch, fresh_tuner, m
 # domain. Sinks make every BF16 row VQUARTER, with several work items per cluster
 # above 18 rows. The split-KV geometries (max_seq_len bucket 4096, few rows) reach
 # the split-KV program on the devices whose ``_SPLITKV_RANGE`` covers them (B200
-# from 2049, GB300 from 1025). The tail domains never join backend="auto".
+# and GB300 from 2049). The tail domains never join backend="auto".
 _PARITY_GEOMETRIES = {
     "bf16_p32_vquarter": (torch.bfloat16, 32, 4),
     "bf16_p32_vhalf": (torch.bfloat16, 32, 32),
@@ -2720,7 +2720,7 @@ def _normalized_runs(runs, roles):
 
 # (dtype, page size, query rows, max_seq_len) of every program the candidate
 # launches. The last three reach the split-KV program on both simulated devices
-# (``_SPLITKV_RANGE``: B200 from 2049, GB300 from 1025, up to 18 rows).
+# (``_SPLITKV_RANGE``: B200 and GB300 from 2049, up to 18 rows).
 _LAUNCH_GEOMETRIES = (
     (torch.bfloat16, 32, 4, 1024),
     (torch.bfloat16, 32, 32, 1024),
