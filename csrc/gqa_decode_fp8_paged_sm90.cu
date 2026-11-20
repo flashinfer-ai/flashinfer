@@ -27,9 +27,9 @@
 // one-wave CTA budget (`share_of`, identical arithmetic in producer and
 // reducer); QK^T runs as fp8 mma (m16n8k32 e4m3, fp32 accumulate) on
 // cp.async-staged K pages; softmax statistics are fp32 online-softmax; the
-// P.V product uses fp16 operands and fp32 accumulation. Stage P as
-// exp2(s - m + PSHIFT) to retain small probabilities; V converts exactly
-// from finite e4m3. Divide by the shifted row sum before storing bf16
+// P.V uses bf16 operands and fp32 accumulation. Stage P as
+// exp2(s - m + PSHIFT); finite e4m3 V converts exactly to bf16. Wider
+// exponent range does not eliminate P rounding. Normalize before storing bf16
 // split partials: their exponent range preserves small normalized values
 // until the reducer applies the V descale. The partials and LSEs (fp32, carrying
 // the same +PSHIFT bias, which cancels in the shift-invariant split merge)
@@ -73,10 +73,8 @@
 #define TMAX 512
 #define GMB 660
 #define SMAX 660
-// P is staged into fp16 as exp2(s - m + PSHIFT): probabilities down to
-// ~2^-(24+PSHIFT) of the running maximum survive the conversion instead of
-// flushing at fp16's 2^-24 subnormal floor. The same shift in the fp32
-// row sum cancels it at normalization.
+// Keep the common shift in the bf16 P operands and the fp32 row sum.
+// It cancels at normalization; it does not make P an exact probability.
 #define PSHIFT 11
 
 __device__ __forceinline__ int sw8(int row, int byte) {
@@ -90,7 +88,21 @@ __device__ __forceinline__ int sw16(int row, int h) {
 }
 __device__ __forceinline__ uint32_t cvt8x2(uint32_t x) {
   uint32_t r;
-  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"((unsigned short)(x & 0xffffu)));
+  // Widen both finite e4m3 lanes exactly. The packed bf16 conversion
+  // places its first source in the high half of the destination.
+  asm volatile(
+      "{\n\t"
+      ".reg .b32 h;\n\t"
+      ".reg .b16 lo, hi;\n\t"
+      ".reg .f32 flo, fhi;\n\t"
+      "cvt.rn.f16x2.e4m3x2 h, %1;\n\t"
+      "mov.b32 {lo, hi}, h;\n\t"
+      "cvt.f32.f16 flo, lo;\n\t"
+      "cvt.f32.f16 fhi, hi;\n\t"
+      "cvt.rn.bf16x2.f32 %0, fhi, flo;\n\t"
+      "}"
+      : "=r"(r)
+      : "h"(static_cast<unsigned short>(x & 0xffffu)));
   return r;
 }
 __device__ __forceinline__ uint32_t smaddr(const void* p) {
@@ -138,7 +150,7 @@ __device__ __forceinline__ void async_wait1() { asm volatile("cp.async.wait_grou
 #define PV_D4(D, O) "+f"(D[O]), "+f"(D[(O) + 1]), "+f"(D[(O) + 2]), "+f"(D[(O) + 3])
 #define WGMMA_PV_N64(D, O, A0, A1, A2, A3, B)                                              \
   asm volatile(                                                                            \
-      "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "                                \
+      "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "                              \
       "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"                            \
       "%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, "                 \
       "{%32,%33,%34,%35}, %36, 1, 1, 1, 1;"                                                \
@@ -236,7 +248,7 @@ __global__ __launch_bounds__(NTHREAD, 3) void attn_kernel(
   __shared__ __align__(1024) uint8_t qs[64 * 128];
   // Each stage's raw K/V pair is contiguous.  Once QK has consumed K and
   // the V bytes have been loaded into registers, reuse the same 12 KiB as
-  // the two f16 V halves for PV and, finally, as the partial-output tile.
+  // the two bf16 V halves for PV and, finally, as the partial-output tile.
   __shared__ __align__(1024) uint8_t kv[2][2][BN * 128];
 
   const int tid = threadIdx.x;
@@ -438,22 +450,21 @@ __global__ __launch_bounds__(NTHREAD, 3) void attn_kernel(
     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
     asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
 
-    // Stage V as f16 after the QK MMAs have issued: the ldmatrix/MMA
-    // stream covers the LDS->cvt->STS latency, and the barrier that makes
-    // converted V visible is deferred to just before PV instead of stalling here.
+    // Stage V as bf16 after QK; the barrier making converted V visible
+    // to the warpgroup is deferred to just before PV.
     uint2 vlo[4], vhi[4];
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
       int cr = copy_row0 + 16 * j;
       // Each lane owns chunk cg in each 64-byte half.  The matching
-      // f16 stores below therefore touch consecutive 16-byte chunks
+      // bf16 stores below therefore touch consecutive 16-byte chunks
       // across the eight lanes of a row instead of every other chunk.
       vlo[j] = *reinterpret_cast<const uint2*>(kv[stage][1] + sw8(cr, copy_c * 8));
       vhi[j] = *reinterpret_cast<const uint2*>(kv[stage][1] + sw8(cr, 64 + copy_c * 8));
     }
     // Every logical row is owned by one 8-lane subgroup inside a single
     // warp.  Publish completion of all raw-V reads before lanes 4..7
-    // overwrite that same row with the expanded second f16 half.
+    // overwrite that same row with the expanded second bf16 half.
     __syncwarp();
 #pragma unroll
     for (int j = 0; j < 3; ++j) {
@@ -471,7 +482,7 @@ __global__ __launch_bounds__(NTHREAD, 3) void attn_kernel(
       *reinterpret_cast<uint4*>((char*)kv[stage][0] + sw8(cr, copy_c * 16)) = h0;
       *reinterpret_cast<uint4*>((char*)kv[stage][1] + sw8(cr, copy_c * 16)) = h1;
     }
-    // The f16 V tile above is written through the generic proxy, while the
+    // The bf16 V tile above is written through the generic proxy, while the
     // PV WGMMAs read it through the async proxy via shared-memory
     // descriptors; wgmma.fence only orders register accesses.  Publish the
     // generic stores to the async proxy here, before the __syncthreads()
@@ -522,10 +533,8 @@ __global__ __launch_bounds__(NTHREAD, 3) void attn_kernel(
       m_a = mna;
       m_b = mnb;
       float sa = 0.f, sb = 0.f;
-      // Stage P as exp2(s - m + PSHIFT): the shift rides the fp16 P operands,
-      // the O accumulators and the row sums alike and cancels at the vsc/l
-      // normalization, while probabilities down to ~2^-(24+PSHIFT) of the
-      // maximum survive the __floats2half2_rn conversion below.
+      // Sum shifted weights in fp32. Round only the PV operands to bf16;
+      // the shift is common to the numerator and denominator.
       const float nega = (float)PSHIFT - mna, negb = (float)PSHIFT - mnb;
 #pragma unroll
       for (int j = 0; j < 6; ++j) {
@@ -550,17 +559,17 @@ __global__ __launch_bounds__(NTHREAD, 3) void attn_kernel(
     __syncthreads();
     // PV as one warpgroup WGMMA per 64-dim half: A (the probabilities)
     // comes straight out of the softmax registers in the warpgroup RS
-    // layout, B is the f16 V tile read MN-major from shared memory.  This
+    // layout, B is the bf16 V tile read MN-major from shared memory. This
     // removes every ldmatrix from the inner loop -- each of the three
     // compute warps used to re-read the whole 12 KiB V tile through the
     // LSU -- and lets all four subcores issue the PV math.
     asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
 #pragma unroll
     for (int kstep = 0; kstep < 3; ++kstep) {
-      __half2 t0 = __floats2half2_rn(sm[2 * kstep][0], sm[2 * kstep][1]);
-      __half2 t1 = __floats2half2_rn(sm[2 * kstep][2], sm[2 * kstep][3]);
-      __half2 t2 = __floats2half2_rn(sm[2 * kstep + 1][0], sm[2 * kstep + 1][1]);
-      __half2 t3 = __floats2half2_rn(sm[2 * kstep + 1][2], sm[2 * kstep + 1][3]);
+      __nv_bfloat162 t0 = __floats2bfloat162_rn(sm[2 * kstep][0], sm[2 * kstep][1]);
+      __nv_bfloat162 t1 = __floats2bfloat162_rn(sm[2 * kstep][2], sm[2 * kstep][3]);
+      __nv_bfloat162 t2 = __floats2bfloat162_rn(sm[2 * kstep + 1][0], sm[2 * kstep + 1][1]);
+      __nv_bfloat162 t3 = __floats2bfloat162_rn(sm[2 * kstep + 1][2], sm[2 * kstep + 1][3]);
       uint32_t a0 = *reinterpret_cast<uint32_t*>(&t0);
       uint32_t a1 = *reinterpret_cast<uint32_t*>(&t1);
       uint32_t a2 = *reinterpret_cast<uint32_t*>(&t2);
@@ -815,8 +824,8 @@ __global__ __launch_bounds__(NTH, 2) void reduce_u4(
 #pragma unroll
     for (int w2 = 0; w2 < NW; ++w2) acc += sA[w2 * DPC + tid];
     size_t od = (size_t)g * 128 + ds * DPC + tid;
-    // The per-sequence V descale lands here, in FP32, so it can neither
-    // overflow nor underflow the FP16 split partials.
+    // Apply the per-sequence V descale in fp32, after merging the
+    // normalized bf16 partials.
     out[od] = __float2bfloat16(acc * sInv * vd[r]);
   }
 }

@@ -2526,8 +2526,12 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # (1/sqrt(128)), and the measured envelope (batch <= 128, kv_len <= 262144).
 #
 # PRECISION (part of the API contract, stated in the dispatch docstring):
-# the kernel stages shifted P and exact e4m3-to-fp16 V, accumulates P.V
-# in fp32, and merges normalized bf16 split partials in fp32.
+# shifted P rounds from fp32 to bf16; finite e4m3 V converts exactly to
+# bf16. PV accumulates in fp32; normalized bf16 split partials merge in
+# fp32 before V descale. Wider P exponent range is not extra significand
+# precision: small contributions can still round away.
+# Auto prefers stock for whole batches with maximum KV length <= 64;
+# this tuning preference does not constrain explicit specialized plans.
 #
 # All allocation and compilation happen at plan time, outside CUDA-graph
 # capture; run() only launches on the current stream (re-queried per call),
@@ -2562,6 +2566,8 @@ _GQA_DEC_FP8Q_SM90_COMPUTE_CAPABILITY = (9, 0)
 # dispatcher fails closed (dequant + stock path) outside it.
 _GQA_DEC_FP8Q_SM90_MAX_BATCH = 128
 _GQA_DEC_FP8Q_SM90_MAX_KV_LEN = 262144
+# Provisional auto preference, not a kernel eligibility bound.
+_GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX = 64
 
 _gqa_dec_fp8q_sm90_counters: Dict[str, int] = {
     "plans_seen": 0,  # fp8-Q fa2 SM90 plans that reached the hook
@@ -2770,10 +2776,11 @@ def _gqa_dec_fp8q_sm90_auto_admits(
                 reason = "kv lengths unavailable on the host at plan time"
             else:
                 kv_lens = kv_meta[2][:batch_size].to(torch.int64)
+                max_kv = int(kv_lens.max())
                 if bool((kv_lens < _GQA_DEC_FP8Q_SM90_Q_LEN).any()):
                     reason = "kv_len < q_len (not a verify-decode batch)"
-                elif int(kv_lens.max()) > _GQA_DEC_FP8Q_SM90_MAX_KV_LEN:
-                    reason = f"kv_len={int(kv_lens.max())} above measured envelope"
+                elif max_kv > _GQA_DEC_FP8Q_SM90_MAX_KV_LEN:
+                    reason = f"kv_len={max_kv} above measured envelope"
                 elif kv_meta[0] is not None:
                     # kv_meta may carry lengths without a host indptr (then
                     # the span check runs in prepare, which always has one)
@@ -2802,6 +2809,8 @@ def _gqa_dec_fp8q_sm90_auto_admits(
                                 "explicit seq_lens differ from the "
                                 "page-derived KV lengths"
                             )
+                if reason is None and max_kv <= _GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX:
+                    reason = f"all KV lengths <= {_GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX} (prefer stock auto)"
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
