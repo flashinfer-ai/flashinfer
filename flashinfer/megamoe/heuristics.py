@@ -246,11 +246,12 @@ def select_mxfp4_fused_plan(
         return bm * num_logical_experts // (num_ranks * num_topk)
 
     if weight_tile_bytes != 8704:
-        supported_tokens = (1, 4, 8, 16, 32, 64)
-        if num_ranks == 8:
-            supported_tokens = (1, 2, 4, 8, 16, 32, 64)
-            if weight_tile_bytes == 16384:
-                supported_tokens += (128,)
+        if weight_tile_bytes == 8448:
+            supported_tokens = (1, 2, 4, 8) if num_ranks == 8 else (1, 4, 8)
+        else:
+            supported_tokens = (1, 4, 8, 16, 32, 64)
+            if num_ranks == 8:
+                supported_tokens = (1, 2, 4, 8, 16, 32, 64, 128)
         if (
             num_sms != H20_NUM_SMS
             or num_ranks not in (8, 16)
@@ -260,7 +261,8 @@ def select_mxfp4_fused_plan(
             or num_logical_experts != num_experts
         ):
             raise ValueError(
-                "noncanonical MXFP4 storage requires H20, EP8 or EP16, "
+                f"noncanonical MXFP4 storage ({weight_tile_bytes}-byte records) "
+                "requires H20, EP8 or EP16, "
                 f"E256/H4096/I2048/top6 and M in {supported_tokens}, without expert slots"
             )
         epw, swap = 16, True

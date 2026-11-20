@@ -158,8 +158,10 @@ def test_push_needs_one_publishing_sm_per_local_expert():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("ep", [8, 16])
-@pytest.mark.parametrize("tile_bytes", [8448, 16384])
-@pytest.mark.parametrize("tokens", [1, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize(
+    "tile_bytes,tokens",
+    [(8448, m) for m in (1, 4, 8)] + [(16384, m) for m in (1, 4, 8, 16, 32, 64)],
+)
 def test_mxfp4_explicit_storage_plans(ep, tile_bytes, tokens):
     plan = select_mxfp4_fused_plan(
         78, ep, 256, 6, 4096, 2048, 64, tokens, weight_tile_bytes=tile_bytes
@@ -303,8 +305,11 @@ def _mxfp4_call_inputs(tokens, tile_bytes, ep=16, nodes=2):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("tile_bytes", [8704, 8448, 16384])
-@pytest.mark.parametrize("tokens", [1, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize(
+    "tile_bytes,tokens",
+    [(8448, m) for m in (1, 4, 8)]
+    + [(tile_bytes, m) for tile_bytes in (8704, 16384) for m in (1, 4, 8, 16, 32, 64)],
+)
 def test_mxfp4_public_api_routes_actual_weight_records(monkeypatch, tile_bytes, tokens):
     y, w1, w2, buffer = _mxfp4_call_inputs(tokens, tile_bytes)
     calls = []
@@ -588,3 +593,18 @@ def test_replica_plan_rejects_all_bad_inputs_before_mutating_tables(invalid):
         slots.set_replica_plan(table, copies, base)
     for name in names:
         assert torch.equal(getattr(slots, name), before[name]), name
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("ep", [8, 16])
+@pytest.mark.parametrize("tokens", [16, 32, 64, 128])
+def test_compact_prefill_rejected_before_kernel_dispatch(monkeypatch, ep, tokens):
+    y, w1, w2, buffer = _mxfp4_call_inputs(tokens, 8448, ep=ep, nodes=ep // 8)
+    buffer.num_max_tokens_per_rank = buffer.num_staged_tokens = 128
+    monkeypatch.setattr(
+        megamoe,
+        "_run_kernel",
+        lambda *a, **kw: pytest.fail("unsupported compact plan launched"),
+    )
+    with pytest.raises(ValueError, match="8448-byte records"):
+        megamoe.mxfp4_mega_moe(y, w1, w2, buffer)
