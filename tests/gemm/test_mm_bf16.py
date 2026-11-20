@@ -16,6 +16,7 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
+from tests.utils.test_helpers.pdl import late_store
 
 
 # Curated smoke set. Randomized breadth over {m,n,k} x out-dtype x backend (tight
@@ -198,6 +199,44 @@ def test_mm_bf16_autotune_unaligned_n(monkeypatch, n, k):
         torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize(
+    "backend,runner", [("tgv", "TGVRunner"), ("tinygemm", "TinyGemmBf16GemmRunner")]
+)
+@pytest.mark.parametrize("k", [2049, 2052])
+def test_mm_bf16_tma_unaligned_k(monkeypatch, backend, runner, k):
+    """TGV/TinyGEMM need K % 8 == 0 (TMA strides): reject them, keep them out of auto."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported(backend, cc_num):
+        pytest.skip(f"{backend} backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(16, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    w = torch.randn(128, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    with pytest.raises(ValueError, match="requires K divisible by 8"):
+        mm_bf16(a, w.T, backend=backend)
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    profiled = set()
+    profile_single_kernel = AutoTuner._profile_single_kernel
+
+    def record_runner(self, runner, *args, **kwargs):
+        profiled.add(type(runner).__name__)
+        return profile_single_kernel(self, runner, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_runner)
+
+    with autotune(True, tuning_buckets=[1, 16]):
+        mm_bf16(a, w.T, backend="auto")
+    assert profiled, "autotuning profiled nothing, so the assertion below is vacuous"
+    assert runner not in profiled, profiled
+
+    for m in (1, 16):
+        out = mm_bf16(a[:m], w.T, backend="auto")
+        reference = (a[:m].float() @ w.float().T).to(torch.bfloat16)
+        torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
 @pytest.mark.parametrize("pdl", [False, True])
 def test_mm_bf16_tgv_single_element_output(pdl):
     """M = N = 1: the 1x1 output's batch dim also has stride 1."""
@@ -368,6 +407,43 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     reference = F.linear(a, b, bias)
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+
+
+def test_mm_bf16_cute_dsl_warp_splitk_pdl_waits_for_bias():
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
+        default_tactic,
+        run_warp_splitk_dense,
+    )
+
+    m, n, k = 8, 768, 7168
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((n,), device="cuda", dtype=torch.bfloat16)
+    tactic = default_tactic(m, n, k)
+
+    def run():
+        out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        return run_warp_splitk_dense(a, b.T, out, True, tactic, bias)
+
+    expected = run()
+
+    # The first two bias elements are what the previous kernel is still producing.
+    # No other kernel may run between that producer and the GEMM.
+    words = bias.view(torch.int32)[:1]
+    value = words.item()
+    words.fill_(0)
+    late_store(words, value)
+    out = run()
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("pdl", [False, True])

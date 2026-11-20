@@ -117,6 +117,7 @@ from ...sage.int32_scores import (
 from ...sage.index import load_sage_q_scale, sage_section_word, sage_sequence_words
 from ...sage.layout import _FLOAT4_WORDS, _SageScaleLayout
 from ...sage.modes import SageKTransport, SageScoreScaling
+from .helpers_paged import _load_block_table_row_bounds, _load_runtime_seq_len_kv
 from .helpers import (
     add_f16x2_to_f32x2,
     _resolve_kv_tile_idx_context,
@@ -589,7 +590,9 @@ class FmhaConfig:
 
     @property
     def vc_qk8(self) -> bool:
-        """VC-Attention-QK8, the E4M3 Q/K recipe with per-block dequant scales."""
+        """VC-Attention-QK8, the E4M3 or INT8 Q/K recipe with per-block dequant
+        scales. INT8 scores arrive on the ``INT32_SCORE_BIAS`` float bias, which
+        the row max and the exp2 remove where they apply the tile scale."""
         return self.vc_attention is not None and self.q_dtype.width == 8
 
     @property
@@ -1454,8 +1457,6 @@ class GmemQKVResource(MemoryResource):
                 if cutlass.const_expr(self.cfg.has_uniform_varlen):
                     seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                 else:
-                    from .helpers_paged import _load_runtime_seq_len_kv
-
                     seqlen_k = _load_runtime_seq_len_kv(
                         self.seqlens_kv, self.max_seq_len_kv, batch_coord
                     )
@@ -1478,11 +1479,9 @@ class GmemQKVResource(MemoryResource):
                     kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
                     kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
                 else:
-                    from .helpers_paged import _load_block_table_row_bounds
-
                     kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                         Int32(self.block_table_row_stride),
-                        self.cfg,
+                        self.cfg.num_tokens_per_page,
                         seqlen_k,
                         batch_coord,
                     )
@@ -1566,16 +1565,12 @@ class GmemQKVResource(MemoryResource):
             kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
             kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
         else:
-            from .helpers_paged import _load_runtime_seq_len_kv
-
             cached_seqlen_kv = _load_runtime_seq_len_kv(
                 self.seqlens_kv, self.max_seq_len_kv, batch_coord
             )
-            from .helpers_paged import _load_block_table_row_bounds
-
             kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                 Int32(self.block_table_row_stride),
-                self.cfg,
+                self.cfg.num_tokens_per_page,
                 cached_seqlen_kv,
                 batch_coord,
             )
@@ -3921,9 +3916,14 @@ class TmemSPResource(MemoryResource):
         self._init_work_tile_state(stage_info)
         if cutlass.const_expr(self.cfg.fixed_dense_k_tail > 0):
             # Bind after the softmax register allocation, like its TMEM addresses.
-            self.k_tail_rows = (Int32(self.max_seq_len_kv) - Int32(1)) % Int32(
-                self.cfg.kv_tile_n
-            ) + Int32(1)
+            # V repair pads the K/V rows to whole tiles and the row count holds
+            # no tail. A repair plan is fixed and knows the tail at compile time.
+            if cutlass.const_expr(self.vc_repair_tiles > 0):
+                self.k_tail_rows = Int32(self.cfg.fixed_dense_k_tail)
+            else:
+                self.k_tail_rows = (Int32(self.max_seq_len_kv) - Int32(1)) % Int32(
+                    self.cfg.kv_tile_n
+                ) + Int32(1)
         return (
             Float32(_SOFTMAX_MASK_VALUE),
             Float32(_SOFTMAX_MASK_VALUE),
@@ -4284,6 +4284,8 @@ class TmemSPResource(MemoryResource):
             row_vector = cutlass.Vector.from_elements(row_values, self.cfg.qk_acc_dtype)
             tile_row_max = row_vector.reduce("max")
             if cutlass.const_expr(self.cfg.vc_attention):
+                if cutlass.const_expr(self.cfg.uses_int32_scores):
+                    tile_row_max = tile_row_max - Float32(INT32_SCORE_BIAS)
                 tile_row_max = tile_row_max * tile_scale
                 _tmem_sp_tile_scale[id(self)] = tile_scale
             if cutlass.const_expr(sage_q_scale is not None):
@@ -4301,14 +4303,17 @@ class TmemSPResource(MemoryResource):
         causal_loop_mask: cutlass.Constexpr[bool] = False,
         q_offset: Int32 = 0,
         tile_scale: SoftmaxScalar | None = None,
+        dense_k_mask: cutlass.Constexpr[bool] = False,
+        seqlen_k: Int32 = 0,
+        section: cutlass.Constexpr[FmhaStage] = FmhaStage.Loop,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """LDTM.STAT: fuse S load and per-chunk row_max via tcgen05.ld.red.max.
 
         Instead of loading each S chunk with ``tcgen05.ld`` and then folding
         a per-lane max in registers, use ``tcgen05.ld.red.max`` so the
-        reduction happens as part of the TMEM load. For causal loop masking,
-        only tiles crossing the runtime right bound need a software reduction
-        of masked scores; wholly visible tiles retain the hardware maximum.
+        reduction happens as part of the TMEM load. For causal or packed dense
+        masking, only tiles crossing the runtime right bound need a software
+        reduction of masked scores; full tiles retain the hardware maximum.
 
         VC-Attention keeps the row max in log2 units. ``tile_scale`` is
         the softmax scale, applied to the hardware tile maximum before the
@@ -4332,37 +4337,50 @@ class TmemSPResource(MemoryResource):
             chunk_maxima, self.cfg.qk_acc_dtype
         ).reduce("max")
         if cutlass.const_expr(self.cfg.vc_attention):
+            if cutlass.const_expr(self.cfg.uses_int32_scores):
+                tile_max = tile_max - Float32(INT32_SCORE_BIAS)
             tile_max = tile_max * tile_scale
             _tmem_sp_tile_scale[id(self)] = tile_scale
         row_max = cute.math.max(row_max, tile_max)
-        if cutlass.const_expr(causal_loop_mask):
-            seq_coord, _, _ = _resolve_work_tile_coords(
-                self.cfg, stage_info.work_tile.tile_idx
-            )
-            q_min = (
-                q_offset
-                + seq_coord * self.cfg.cta_tiler[0]
-                + self.q_half * self.cfg.q_tile_m
-            )
-            kv_base = stage_info.loop_offset * self.cfg.kv_tile_n
-            k_max = kv_base + self.cfg.qk_mma_tiler[1] - Int32(1)
-            if q_min < k_max:
-                q_idx = (
-                    q_min
-                    + (cute.arch.warp_idx() % 4) * cute.arch.WARP_SIZE
-                    + cute.arch.lane_idx()
+        if cutlass.const_expr(causal_loop_mask or dense_k_mask):
+            if cutlass.const_expr(causal_loop_mask):
+                seq_coord, _, _ = _resolve_work_tile_coords(
+                    self.cfg, stage_info.work_tile.tile_idx
                 )
-                # Discard the unmasked maxima when any key can be invisible.
+                q_min = (
+                    q_offset
+                    + seq_coord * self.cfg.cta_tiler[0]
+                    + self.q_half * self.cfg.q_tile_m
+                )
+                kv_base = stage_info.loop_offset * self.cfg.kv_tile_n
+                needs_mask = q_min < kv_base + self.cfg.qk_mma_tiler[1] - Int32(1)
+            else:
+                if cutlass.const_expr(section == FmhaStage.Loop):
+                    kv_tile_idx = stage_info.loop_offset
+                else:
+                    kv_tile_idx = stage_info.loop_end
+                kv_base = kv_tile_idx * self.cfg.kv_tile_n
+                needs_mask = seqlen_k < kv_base + Int32(self.cfg.kv_tile_n)
+            if needs_mask:
+                if cutlass.const_expr(causal_loop_mask):
+                    right_bound = (
+                        q_min
+                        + (cute.arch.warp_idx() % 4) * cute.arch.WARP_SIZE
+                        + cute.arch.lane_idx()
+                        + Int32(1)
+                    )
+                else:
+                    right_bound = seqlen_k
+                # Invalid lanes can contain another request's scores or TMA
+                # padding. Neither may contribute to the maximum or softmax.
                 masked_row_max = old_row_max
                 for chunk_idx in cutlass.range_constexpr(num_chunks):
-                    num_valid = cute.math.min(
-                        cute.math.max(
-                            q_idx - kv_base - chunk_idx * tmem_x + Int32(1),
-                            Int32(0),
-                        ),
+                    chunk_base = kv_base + Int32(chunk_idx * tmem_x)
+                    valid_in_chunk = cute.math.min(
+                        cute.math.max(right_bound - chunk_base, Int32(0)),
                         Int32(tmem_x),
                     )
-                    mask = cutlass.vector.create_mask([tmem_x], [num_valid])
+                    mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
                     masked_values = cutlass.vector.full_like(
                         s_data[chunk_idx], Float32(_SOFTMAX_MASK_VALUE)
                     )
@@ -4442,7 +4460,12 @@ class TmemSPResource(MemoryResource):
         if cutlass.const_expr(self.cfg.vc_attention):
             # The paper's 2^8 P scaling is part of VC_EXPCAST_CODE_BIAS, so
             # p_scale_log2 is not added here.
-            return self._exp2_p_store_expcast(scale, Float32(0.0) - row_max)
+            minus_row_max = Float32(0.0) - row_max
+            if cutlass.const_expr(self.cfg.uses_int32_scores):
+                # INT32 scores carry the float bias; fold its removal into the
+                # exp2 addend so the per-score FFMA stays one instruction.
+                minus_row_max = minus_row_max - Float32(INT32_SCORE_BIAS) * scale
+            return self._exp2_p_store_expcast(scale, minus_row_max)
         minus_row_max_scale = _softmax_exp2_bias(row_max, scale, p_scale_log2)
         # The exp2 addend of a score pair; a block-scaled INT32 plan folds
         # the score bias into it per block.
@@ -5419,6 +5442,14 @@ class TmemSPResource(MemoryResource):
         section: cutlass.Constexpr[FmhaStage],
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Mask scores beyond one packed request's K/V right edge."""
+        if cutlass.const_expr(self.cfg.uses_ldtm_stat):
+            return self._load_s_chunks_and_reduce_row_max(
+                stage_info,
+                row_max,
+                dense_k_mask=True,
+                seqlen_k=seqlen_k,
+                section=section,
+            )
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         s_data = self._load_s_chunks(stage_info)
@@ -7542,6 +7573,10 @@ class SmemOResource(MemoryResource):
         # in TmemStats.consumer_work.
         correction_scale = vec_scale
         scale = output_scale * correction_scale / vec_row_sum
+        if cutlass.const_expr(self.cfg.lse_mode != "none"):
+            # Empty dense requests publish a neutral output alongside -inf LSE.
+            if vec_row_sum == Float32(0.0):
+                scale = Float32(0.0)
 
         num_correction_warps = 4
         tidx, _, _ = cute.arch.thread_idx()

@@ -207,7 +207,7 @@ def test_layer_situ_prequantized_weights_and_scaling(
             tuned = torch.empty_like(reference)
             winner = autotune_sm107_block_scaled_mega_moe(
                 tuned,
-                *layers[-1]._get_transformed_weights(),
+                *layers[-1].get_transformed_weights(),
                 layers[-1]._workspace,
                 candidates=[{}],
                 warmup_iters=1,

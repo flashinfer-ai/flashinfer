@@ -25,6 +25,7 @@ import flashinfer.utils as flashinfer_utils
 from flashinfer.topk import can_implement_filtered_topk
 from flashinfer.utils import get_compute_capability
 from tests.infra.test_helpers.parametrize import parametrize_product
+from tests.utils.test_helpers.pdl import late_store
 
 
 @pytest.fixture
@@ -533,6 +534,51 @@ def test_multi_cta_reuses_row_states_buffer_on_one_stream_across_regimes(
         run_and_check(multi_cta_logits, deterministic=True)
         assert _cached_row_states_buffer(multi_cta_logits.device) is buf
     torch.cuda.synchronize()
+
+
+def test_multi_cta_top_k_under_torch_compile_keeps_row_states_per_stream(
+    set_topk_algo,
+):
+    """``top_k`` traced by ``torch.compile(dynamic=True)`` runs, and its cached
+    ``row_states`` still follow the stream the compiled code runs on.
+
+    With dynamic shapes Dynamo may hand the stream-cache lookup a symbolic
+    device index, which raw CUDA bindings such as
+    ``torch._C._cuda_getCurrentRawStream`` reject while tracing.
+    """
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    batch_size, k = 4, 512
+    logits = _build_strictly_descending_logits(batch_size, 131072, device)
+    expected_indices = (
+        torch.arange(k, device=device, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+
+    def fn(x):
+        values, indices = flashinfer.top_k(x, k, sorted=True)
+        return values * 2, indices
+
+    compiled = torch.compile(fn, dynamic=True, backend="eager")
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    try:
+        for stream in (stream_a, stream_b):
+            with torch.cuda.stream(stream):
+                values, indices = compiled(logits)
+                torch.testing.assert_close(values, logits[:, :k] * 2)
+                assert torch.equal(indices, expected_indices)
+        torch.cuda.synchronize()
+    finally:
+        torch._dynamo.reset()
+
+    with torch.cuda.stream(stream_a):
+        buf_a = _cached_row_states_buffer(logits.device)
+    with torch.cuda.stream(stream_b):
+        buf_b = _cached_row_states_buffer(logits.device)
+    assert buf_a is not None and buf_b is not None
+    assert buf_a is not buf_b
 
 
 def test_multi_cta_row_states_graph_replay_isolated_from_eager_stream(set_topk_algo):
@@ -3691,6 +3737,58 @@ def test_topk_clusters_exact_variable_seq_lens(batch_size, seq_len, k, dtype):
         row_accuracy = len(test_set & ref_set) / k
         acc = 0.95 if dtype == torch.bfloat16 else 0.99
         assert row_accuracy >= acc, f"Row {i} accuracy {row_accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize("variant", ["exact", "page_table", "ragged"])
+def test_topk_clusters_pdl_waits_before_reading(variant):
+    _require_sm100_or_sm103()
+    torch.manual_seed(42)
+    batch_size, top_k, seq_len = 4, 2048, 1000
+    width = seq_len if variant == "exact" else 4096
+    logits = torch.randn(batch_size, width, device="cuda")
+    seq_lens = torch.full((batch_size,), seq_len, device="cuda", dtype=torch.int32)
+    page_table = torch.arange(
+        batch_size * width, device="cuda", dtype=torch.int32
+    ).view(batch_size, width)
+    offsets = torch.arange(batch_size, device="cuda", dtype=torch.int32) * width
+    # Each row is shorter than top_k, so the kernel takes its copy-through path.
+    if variant == "exact":
+        late_input, late_value, run = (
+            logits,
+            logits[0, 0].item(),
+            # Values past seq_len are left unwritten.
+            lambda: tuple(
+                t[:, :seq_len]
+                for t in flashinfer.topk.topk_clusters_exact(
+                    logits, top_k, output_values=True, pdl=True
+                )
+            ),
+        )
+    elif variant == "page_table":
+        late_input, late_value, run = (
+            seq_lens,
+            seq_len,
+            lambda: flashinfer.topk.topk_clusters_page_table_transform(
+                logits, seq_lens, page_table, top_k, pdl=True
+            ),
+        )
+    else:
+        late_input, late_value, run = (
+            offsets,
+            0,
+            lambda: flashinfer.topk.topk_clusters_ragged_transform(
+                logits, seq_lens, offsets, top_k, pdl=True
+            ),
+        )
+    expected = run()
+
+    # Row 0's first input is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the top-k kernel.
+    late_input.view(-1)[0] = 1
+    late_store(late_input, late_value)
+    out = run()
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_rows", [1, 16, 64])

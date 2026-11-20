@@ -82,6 +82,12 @@ def _inputs(kind, rank, world, hidden=384, intermediate=192):
 
 def _config(kind, early, recipe=None, **kwargs):
     from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.validation.common import (
+        is_bf16_mxfp8_cutedsl_supported,
+    )
+
+    if kind != "w4a16" and not is_bf16_mxfp8_cutedsl_supported():
+        pytest.skip("W8A16 MegaMoE requires CUDA 13+")
 
     common = dict(
         intermediate_size=192,
@@ -184,8 +190,8 @@ def test_a16_batch_invariant_batches_plans_and_graphs(
     _device("standard")
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
-    x, scores, ids, weights = _inputs(kind, 0, 1)
     config = _config(kind, early, recipe)
+    x, scores, ids, weights = _inputs(kind, 0, 1)
     with _layer(config, weights, 0, 1, 257, 384) as layer:
         anchor = layer.forward(MoEEpTensors(x, ids, scores)).clone()
         receipt = layer.batch_invariant_fingerprint
@@ -383,8 +389,8 @@ def test_a16_batch_invariant_deferred_partials(kind, early, monkeypatch):
         pytest.skip("single-rank case")
     _device("standard")
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    x, scores, ids, weights = _inputs(kind, 0, 1)
     config = _config(kind, early, finalize_mode=FinalizeMode.NONE)
+    x, scores, ids, weights = _inputs(kind, 0, 1)
     with _layer(config, weights, 0, 1, 129, 384) as layer:
         partials, wire_weights, _ = layer.forward_unfinalized(
             MoEEpTensors(x[:129], ids[:129], scores[:129])
@@ -513,6 +519,7 @@ def test_a16_batch_invariant_public_autotune_disk_reload(
         pytest.skip("single-rank case")
     _device("standard")
     monkeypatch.setenv("MEGA_NO_DIST", "1")
+    config = _config(kind, early, {"swiglu_alpha": 1.702, "swiglu_beta": 1.0})
     from ._megamoe_bi_helpers import autotune_disk_reload
 
     if kind == "w4a16":
@@ -528,7 +535,6 @@ def test_a16_batch_invariant_public_autotune_disk_reload(
     candidates = getattr(module, name)(batch_invariant=True)[:2]
     monkeypatch.setattr(module, name, lambda **kwargs: candidates)
     x, scores, ids, weights = _inputs(kind, 0, 1)
-    config = _config(kind, early, {"swiglu_alpha": 1.702, "swiglu_beta": 1.0})
     autotune_disk_reload(
         make_config=lambda knobs: replace(config, knobs=knobs),
         weights=weights,
@@ -551,8 +557,8 @@ def test_w8a16_batch_invariant_persistent_live_count(kind, monkeypatch):
         pytest.skip("single-rank case")
     _device("standard")
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    x, scores, ids, weights = _inputs(kind, 0, 1)
     config = _config(kind, True)
+    x, scores, ids, weights = _inputs(kind, 0, 1)
     with _layer(config, weights, 0, 1, 129, 384) as layer:
         anchor = layer.forward(MoEEpTensors(x[:129], ids[:129], scores[:129])).clone()
         receipt = layer.batch_invariant_fingerprint

@@ -20,6 +20,7 @@
 #include <cutlass/numeric_types.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -418,6 +419,376 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Persistent DeepSeek FP8 activation: one kernel for every token count, taking over from the
+// per-pair activationDeepSeekKernel for callers that provide the permuted row -> token map (the
+// fused MoE runner). Its output is bit-identical to that kernel's; launched behind GEMM1 with
+// PDL, as the fused MoE launches it, its critical-path time is at or below the old kernel's at
+// every token count (the pull request that added it carries the measurements).
+//
+// A piece is one scale block (SfBlock columns) of one permuted row; a GEMM1 output row holds the
+// linear half then the gate half, innerDim / 2 columns each. L lanes of one warp own a piece,
+// each lane SfBlock / L consecutive columns of both halves; the block amax is a register max plus
+// log2(L) xor-shuffles. No shared memory, no block barrier.
+//
+// The grid is fixed (at most DEEP_SEEK_ACTIVATION_PERSISTENT_CTAS_PER_SM blocks per SM, one
+// resident wave) and every block strides over the pieces of a work list. The kernel decides on
+// the device, uniformly over the grid, from the live padded row count P (a routing output) and
+// the host-known pair count numTokens * topK:
+//   1. The work list: the permuted rows (tile padding rows, token index -1, are skipped) when
+//      P <= pairs, else the (token, slot) pairs (pairs routed to other ranks, permuted index -1,
+//      are skipped). Neither padding nor remote pairs cost a data load. The old kernel walks
+//      every pair, 7 of 8 remote under EP8; a row walk would visit up to 63 padding rows per live
+//      row (a 64-row GEMM tile holding one live row).
+//   2. Lanes per piece: 4 bytes per lane (32 lanes per 128-wide e4m3 block, 4 elements each)
+//      while the list has at most DEEP_SEEK_ACTIVATION_PERSISTENT_FINE_MAX_PIECES pieces, else
+//      16 bytes per lane (8 lanes, 16 elements). Few pieces want many short dependent chains in
+//      flight, many pieces want wide loads; the crossover is a measured value (148 SMs, one
+//      resident wave).
+// The list entry of a piece is fetched two pieces ahead and its data one piece ahead, so each
+// piece costs one memory round trip and the first piece's data is requested right after the PDL
+// wait.
+//
+// Pre-wait reads under PDL. P, the two index tables and the tile -> expert map are routing
+// outputs. GEMM1, the kernel this one waits on, is a trtllm-gen cubin whose every CTA executes
+// griddepcontrol.wait before it triggers the dependent launch or exits (TrtllmGenBatchedGemmRunner
+// rules out the kernel options that would allow otherwise). griddepcontrol.wait returns only once
+// the routing grid has completed and its writes are visible, so by the time any GEMM1 CTA has
+// triggered, those tables are final, whatever point the routing kernel triggered at (the
+// small-batch routing kernels trigger at their start). Reading them before
+// cudaGridDependencySynchronize() is therefore sound here; it would not be in a kernel launched
+// directly after routing. GEMM1's output (inPtr, inDqSfsPtr) is read only after the wait. A
+// caller whose primary is not a trtllm-gen GEMM (the standalone activation op) does not provide
+// the row map and keeps activationDeepSeekKernel.
+//
+// Numerics are activationDeepSeekKernel's, operation for operation: x = scale * float(e4m3),
+// gatedSilu (its per-expert controls looked up once per piece instead of once per element),
+// scale = max(amax / 448, FLT_MIN), e4m3(out / scale) with the saturating round-to-nearest-even
+// conversion. The block amax is reduced with fmaxf, as the old kernel's 2- and 4-token
+// instantiations do; its 1-token instantiation reduces with cuda::maximum<>, which CCCL
+// implements as fmax for floating-point types, so a NaN from GEMM1 is dropped alike in all of
+// them. Padding rows are not written, as before.
+
+constexpr int DEEP_SEEK_ACTIVATION_PERSISTENT_THREADS_PER_CTA = 128;
+// One resident wave: 8 x 128 threads at <= 64 registers per thread (58 for e4m3 in this module's
+// sm_100a build), no shared memory; __launch_bounds__ holds ptxas to the budget.
+constexpr int DEEP_SEEK_ACTIVATION_PERSISTENT_CTAS_PER_SM = 8;
+// Largest piece count of the chosen list handled at 4 bytes per lane, for 128-wide blocks.
+constexpr int DEEP_SEEK_ACTIVATION_PERSISTENT_FINE_MAX_PIECES = 8192;
+// The scale block width instantiated below. The kernel template also handles 32 (a quarter-size
+// piece: 8 and 2 lanes), but a 32-wide block reaches activation::run only through the standalone
+// op, which keeps the old kernel (see persistentActivationSupported).
+constexpr int DEEP_SEEK_ACTIVATION_PERSISTENT_SF_BLOCK = 128;
+
+template <int Bytes>
+struct PersistentActivationVec;
+template <>
+struct PersistentActivationVec<16> {
+  using Type = uint4;
+};
+template <>
+struct PersistentActivationVec<8> {
+  using Type = uint2;
+};
+template <>
+struct PersistentActivationVec<4> {
+  using Type = uint32_t;
+};
+
+// Lanes per piece for a block of SfBlock elements of Type: fine = 4 bytes per lane (at most one
+// warp), coarse = 16 bytes per lane.
+template <typename Type, int SfBlock>
+struct PersistentActivationLanes {
+  static constexpr int kBlockBytes = SfBlock * static_cast<int>(sizeof(Type));
+  static constexpr int kFine = kBlockBytes / 4 > 32 ? 32 : kBlockBytes / 4;
+  static constexpr int kCoarse = kBlockBytes / 16;
+  static_assert(kBlockBytes % 16 == 0 && kCoarse >= 1,
+                "a scale block must span a multiple of 16 bytes");
+};
+
+// Piece q (row-major over (list entry, scale block)) -> entry and block: a shift when the block
+// count is a power of two, a 32-bit division otherwise (I = 640 gives 5 blocks of 128).
+struct PersistentActivationPieceMap {
+  int numBlocks;  // scale blocks per row
+  int shift;      // log2(numBlocks) when it is a power of two, else -1
+
+  __device__ __forceinline__ void split(int q, int& entry, int& block) const {
+    if (shift >= 0) {
+      entry = q >> shift;
+      block = q - (entry << shift);
+    } else {
+      entry = q / numBlocks;
+      block = q - entry * numBlocks;
+    }
+  }
+};
+
+// gatedSilu with the per-expert controls already in registers: the same operations in the same
+// order, so the bytes are the same.
+__device__ __forceinline__ float gatedSiluFromControls(bool hasControls, bool hasClamp, float alpha,
+                                                       float beta, float limit, float xLinear,
+                                                       float xGlu) {
+  if (!hasControls) {
+    return silu(xGlu) * xLinear;
+  }
+  if (hasClamp) {
+    xGlu = fminf(xGlu, limit);
+    xLinear = fmaxf(fminf(xLinear, limit), -limit);
+  }
+  float const act = xGlu / (1.0f + expf(-alpha * xGlu));
+  return act * (xLinear + beta);
+}
+
+template <typename KernelParams, int SfBlock, int L>
+struct PersistentActivationPiece {
+  using Type = typename KernelParams::Type;
+  static constexpr int kElts = SfBlock / L;
+  static constexpr int kBytes = kElts * static_cast<int>(sizeof(Type));
+  static_assert(kBytes == 4 || kBytes == 8 || kBytes == 16, "a lane owns 4, 8 or 16 bytes");
+  using Vec = typename PersistentActivationVec<kBytes>::Type;
+
+  int row = -1;    // -1: a padding row (rows list) or a pair on another rank (pairs list)
+  int block = 0;   // scale block within the row
+  int entry = 0;   // the list entry: the row itself (rows list) or the pair (pairs list)
+  int expert = 0;  // local expert of the row, only with the per-expert controls
+  Vec x1{}, x2{};
+  float scale1 = 0.f, scale2 = 0.f;
+
+  // The list entry of piece q: the rows list reads row -> token (the row is the entry), the
+  // pairs list reads pair -> row.
+  __device__ __forceinline__ void index(KernelParams const& params,
+                                        PersistentActivationPieceMap const& map, int q,
+                                        bool pairsList) {
+    map.split(q, entry, block);
+    if (pairsList) {
+      row = params.expandedIdxToPermutedIdx[entry];
+    } else {
+      row = params.permutedIdxToTokenIdx[entry] == -1 ? -1 : entry;
+    }
+  }
+
+  // Local expert of row r: routing's tile -> batch map, tileTokensDim rows per tile.
+  __device__ __forceinline__ void lookUpExpert(KernelParams const& params, int r) {
+    expert = params.ctaIdxXyToBatchIdx[r / params.tileTokensDim];
+  }
+
+  // One lane's bytes of both halves of the row, and the two block scales (block-major with
+  // stride P; the gate blocks follow the linear ones).
+  __device__ __forceinline__ void load(KernelParams const& params,
+                                       PersistentActivationPieceMap const& map, int P, int outDim,
+                                       int lane) {
+    int64_t const base = (int64_t)row * params.innerDim;
+    int const col = block * SfBlock + lane * kElts;
+    x1 = *reinterpret_cast<Vec const*>(params.inPtr + base + col);
+    x2 = *reinterpret_cast<Vec const*>(params.inPtr + base + outDim + col);
+    scale1 = params.inDqSfsPtr[(int64_t)row + (int64_t)P * block];
+    scale2 = params.inDqSfsPtr[(int64_t)row + (int64_t)P * (block + map.numBlocks)];
+  }
+};
+
+// L lanes per piece. A group's exit depends on blockIdx and the group index only, so it is
+// uniform and the shuffles never wait for an exited lane; groups of one warp may sit at different
+// pieces, hence the mask covers the group alone.
+template <typename KernelParams, int SfBlock, int L>
+__device__ __forceinline__ void activationDeepSeekPersistentBody(
+    KernelParams const& params, int P, int outDim, PersistentActivationPieceMap const map,
+    int numPieces, bool pairsList) {
+  using Piece = PersistentActivationPiece<KernelParams, SfBlock, L>;
+  using Type = typename KernelParams::Type;
+  using Vec = typename Piece::Vec;
+  constexpr int kElts = Piece::kElts;
+  constexpr int kGroupsPerCta = DEEP_SEEK_ACTIVATION_PERSISTENT_THREADS_PER_CTA / L;
+  static_assert(L >= 1 && L <= 32 && (L & (L - 1)) == 0,
+                "lanes per piece: a power of two within one warp");
+  float constexpr E4m3MaxVal{448.f};
+
+  int const lane = threadIdx.x % L;
+  int const group = threadIdx.x / L;
+  unsigned const groupMask =
+      L == 32 ? 0xffffffffu : ((1u << L) - 1u) << (((threadIdx.x % 32) / L) * L);
+  bool const hasControls = params.gatedActAlphaPtr != nullptr ||
+                           params.gatedActBetaPtr != nullptr ||
+                           params.gatedActClampLimitPtr != nullptr;
+  bool const hasClamp = params.gatedActClampLimitPtr != nullptr;
+
+  int const stride = gridDim.x * kGroupsPerCta;
+  int q0 = blockIdx.x * kGroupsPerCta + group;
+  int q1 = q0 + stride;
+
+  // Routing outputs for the first two pieces, read before the wait (see the kernel comment). With
+  // the rows list the expert of a row follows from the row alone; with the pairs list it needs the
+  // table entry first, so it moves one stage later.
+  Piece p0, p1;
+  if (q0 < numPieces) p0.index(params, map, q0, pairsList);
+  if (q1 < numPieces) p1.index(params, map, q1, pairsList);
+  if (hasControls) {
+    if (q0 < numPieces && (!pairsList || p0.row != -1)) {
+      p0.lookUpExpert(params, pairsList ? p0.row : p0.entry);
+    }
+    if (!pairsList && q1 < numPieces) p1.lookUpExpert(params, p1.entry);
+  }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+  if (q0 >= numPieces) {
+    return;
+  }
+  if (p0.row != -1) p0.load(params, map, P, outDim, lane);
+
+  while (q0 < numPieces) {
+    // Prefetch: the list entry two pieces ahead, the data one piece ahead.
+    int const q2 = q1 + stride;
+    Piece p2;
+    if (q2 < numPieces) {
+      p2.index(params, map, q2, pairsList);
+      if (hasControls && !pairsList) p2.lookUpExpert(params, p2.entry);
+    }
+    if (q1 < numPieces && p1.row != -1) {
+      p1.load(params, map, P, outDim, lane);
+      if (hasControls && pairsList) p1.lookUpExpert(params, p1.row);
+    }
+
+    if (p0.row != -1) {
+      float alpha = 1.0f, beta = 0.0f, limit = 0.0f;
+      if (hasControls) {
+        if (hasClamp) limit = params.gatedActClampLimitPtr[p0.expert];
+        if (params.gatedActAlphaPtr != nullptr) alpha = params.gatedActAlphaPtr[p0.expert];
+        if (params.gatedActBetaPtr != nullptr) beta = params.gatedActBetaPtr[p0.expert];
+      }
+      Type const* x1 = reinterpret_cast<Type const*>(&p0.x1);
+      Type const* x2 = reinterpret_cast<Type const*>(&p0.x2);
+      float out[kElts];
+      float aMax = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kElts; ++i) {
+        float const xLinear = p0.scale1 * static_cast<float>(x1[i]);
+        float const xGlu = p0.scale2 * static_cast<float>(x2[i]);
+        out[i] = gatedSiluFromControls(hasControls, hasClamp, alpha, beta, limit, xLinear, xGlu);
+        aMax = fmaxf(aMax, fabsf(out[i]));
+      }
+#pragma unroll
+      for (int offset = L / 2; offset > 0; offset >>= 1) {
+        aMax = fmaxf(aMax, __shfl_xor_sync(groupMask, aMax, offset));
+      }
+      // Strictly positive, so the division below is defined for an all-zero block.
+      float const scaleOut = fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
+      Vec outVec{};
+      Type* outElts = reinterpret_cast<Type*>(&outVec);
+#pragma unroll
+      for (int i = 0; i < kElts; ++i) {
+        outElts[i] = static_cast<Type>(out[i] / scaleOut);
+      }
+      int const col = p0.block * SfBlock + lane * kElts;
+      *reinterpret_cast<Vec*>(params.outPtr + (int64_t)p0.row * outDim + col) = outVec;
+      if (lane == 0) {
+        params.outDqSfsPtr[(int64_t)p0.row + (int64_t)P * p0.block] = scaleOut;
+      }
+    }
+
+    q0 = q1;
+    q1 = q2;
+    p0 = p1;
+    p1 = p2;
+  }
+}
+
+template <typename KernelParams, int SfBlock>
+__device__ __forceinline__ void activationDeepSeekPersistent(KernelParams const& params) {
+  static_assert(SfBlock == 128 || SfBlock == 32, "DeepSeek FP8 scale blocks are 128 or 32 wide");
+  using Lanes = PersistentActivationLanes<typename KernelParams::Type, SfBlock>;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Let GEMM2 launch at once; it waits for this kernel's completion itself.
+  if constexpr (KernelParams::UsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+#endif
+
+  int const outDim = params.innerDim / 2;
+  PersistentActivationPieceMap map;
+  map.numBlocks = outDim / SfBlock;
+  map.shift = (map.numBlocks & (map.numBlocks - 1)) == 0 ? __ffs(map.numBlocks) - 1 : -1;
+  // The live padded row count: a routing output, read before the wait (see the kernel comment).
+  int const P = params.totalNumPaddedTokens[0];
+  int const pairs = params.numTokens * params.topK;
+  bool const pairsList = P > pairs;
+  int const numPieces = (pairsList ? pairs : P) * map.numBlocks;
+  // A 32-wide piece is a quarter of a 128-wide one: the same capacity holds four times as many.
+  constexpr int kFineMaxPieces = DEEP_SEEK_ACTIVATION_PERSISTENT_FINE_MAX_PIECES * (128 / SfBlock);
+  if (numPieces <= kFineMaxPieces) {
+    activationDeepSeekPersistentBody<KernelParams, SfBlock, Lanes::kFine>(params, P, outDim, map,
+                                                                          numPieces, pairsList);
+  } else {
+    activationDeepSeekPersistentBody<KernelParams, SfBlock, Lanes::kCoarse>(params, P, outDim, map,
+                                                                            numPieces, pairsList);
+  }
+}
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(DEEP_SEEK_ACTIVATION_PERSISTENT_THREADS_PER_CTA,
+                                  DEEP_SEEK_ACTIVATION_PERSISTENT_CTAS_PER_SM)
+    activationDeepSeekKernelPersistent128(KernelParams params) {
+  activationDeepSeekPersistent<KernelParams, 128>(params);
+}
+
+// The persistent kernel is launched with NumTokensPerCta fixed to 1 (the parameter is unused
+// there); LAUNCH_ACTIVATION would also instantiate the 2- and 4-token variants.
+#define LAUNCH_ACTIVATION_PERSISTENT(data, kernel, numBlocks, numThreads, smemSize, stream)      \
+  if (data.mDtypeElt == tg::Dtype::Fp16) {                                                       \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, 1), kernel, numBlocks, numThreads,       \
+               smemSize, stream);                                                                \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3) {                                                \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, 1), kernel, numBlocks, numThreads, \
+               smemSize, stream);                                                                \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                            \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, 1), kernel, numBlocks, numThreads,   \
+               smemSize, stream);                                                                \
+  } else {                                                                                       \
+    FLASHINFER_WARN("Unsupported dtypeElt");                                                     \
+  }
+
+inline bool isAligned16(void const* ptr) {
+  return (reinterpret_cast<std::uintptr_t>(ptr) & 15u) == 0;
+}
+
+// Whether activationDeepSeekKernelPersistent128 can run: the row -> token map and its bound (the
+// fused MoE runner sets them; the standalone activation op does not, and its primary is not a
+// trtllm-gen GEMM, so it keeps activationDeepSeekKernel), whole scale blocks of the width the
+// kernel is built for, 16-byte aligned rows and pointers, and the tile -> expert map when the
+// per-expert controls are set.
+inline bool persistentActivationSupported(Data const& data) {
+  int const outputDim = data.innerDim / 2;
+  int const eltBytes = tg::dtypeGetNumBits(data.mDtypeElt) / 8;
+  bool const hasControls = data.gatedActAlphaPtr != nullptr || data.gatedActBetaPtr != nullptr ||
+                           data.gatedActClampLimitPtr != nullptr;
+  return data.permutedIdxToTokenIdx != nullptr && data.totalMaxPaddedTokens > 0 &&
+         data.expandedIdxToPermutedIdx != nullptr &&
+         data.mDeepSeekSfBlockSize == DEEP_SEEK_ACTIVATION_PERSISTENT_SF_BLOCK && outputDim > 0 &&
+         outputDim % DEEP_SEEK_ACTIVATION_PERSISTENT_SF_BLOCK == 0 &&
+         (outputDim * eltBytes) % 16 == 0 && isAligned16(data.inPtr) && isAligned16(data.outPtr) &&
+         (!hasControls || (data.ctaIdxXyToBatchIdx != nullptr && data.tileTokensDim > 0));
+}
+
+// The device walks the shorter of the two lists (the rows, at most the bound, or the pairs); the
+// grid covers that list at fine-mode occupancy, capped at one resident wave, and the kernel
+// strides over the rest. Any grid is correct; this one only avoids idle blocks at small T.
+inline int persistentActivationNumCtas(Data const& data, int numSms) {
+  int const outputDim = data.innerDim / 2;
+  int const eltBytes = tg::dtypeGetNumBits(data.mDtypeElt) / 8;
+  int const numBlocks = outputDim / DEEP_SEEK_ACTIVATION_PERSISTENT_SF_BLOCK;
+  int const fineLanes = std::min(32, DEEP_SEEK_ACTIVATION_PERSISTENT_SF_BLOCK * eltBytes / 4);
+  int const piecesPerCta = DEEP_SEEK_ACTIVATION_PERSISTENT_THREADS_PER_CTA / fineLanes;
+  int64_t const entries =
+      std::min<int64_t>(data.totalMaxPaddedTokens, (int64_t)data.numTokens * data.topK);
+  int64_t const needed = (entries * numBlocks + piecesPerCta - 1) / piecesPerCta;
+  int64_t const cap = (int64_t)numSms * DEEP_SEEK_ACTIVATION_PERSISTENT_CTAS_PER_SM;
+  return static_cast<int>(std::min(std::max<int64_t>(needed, 1), cap));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void run(Data const& data, void* stream) {
   if (data.mDtypeElt == tg::Dtype::E2m1) {
     // Note: this should be unreachable because the options are checked beforehand.
@@ -427,8 +798,6 @@ void run(Data const& data, void* stream) {
   }
 
   if (data.mUseDeepSeekFp8) {
-    constexpr int NUM_ELTS_PER_LOAD = 1;
-    constexpr int NUM_ELTS_PER_CTA = DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA;
     FLASHINFER_CHECK(data.mDeepSeekSfBlockSize == 128 || data.mDeepSeekSfBlockSize == 32,
                      "DeepSeek FP8 activation: scale block must be 128 or 32.");
 
@@ -436,6 +805,16 @@ void run(Data const& data, void* stream) {
     cudaGetDevice(&device);
     int numSms = 0;
     cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
+
+    if (persistentActivationSupported(data)) {
+      dim3 const grid(persistentActivationNumCtas(data, numSms));
+      LAUNCH_ACTIVATION_PERSISTENT(data, activationDeepSeekKernelPersistent128, grid,
+                                   DEEP_SEEK_ACTIVATION_PERSISTENT_THREADS_PER_CTA, 0, stream);
+      return;
+    }
+
+    constexpr int NUM_ELTS_PER_LOAD = 1;
+    constexpr int NUM_ELTS_PER_CTA = DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA;
 
     // Output dimension is innerDim / 2; each CTA covers 128 elements, i.e. one scale block
     // at block 128 or four warp-owned blocks at block 32.
@@ -669,13 +1048,13 @@ __global__ void permuteKernel(KernelParams params) {
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {
       // Load chunk of token into registers
-      const Type data = params.inPtr[tokenIdx * params.hiddenDim + hiddenIdx];
+      const Type data = params.inPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx];
 
       // Write to topK places
       for (int k = 0; k < params.topK; k++) {
         int const expandedIdx = tokenIdx * params.topK + k;
         int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
-        params.outPtr[permutedIdx * params.hiddenDim + hiddenIdx] = data;
+        params.outPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDim + hiddenIdx] = data;
       }
     }
     if (params.useDeepSeekFp8) {
@@ -720,6 +1099,22 @@ namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Whether the token's output row is written: always with zeroRowsWithoutLocalExpert, else only
+// when one of its topK experts is local. A kernel skipping a row still waits on the primary first,
+// so that a grid skipping every token completes after it.
+template <typename KernelParams>
+__device__ __forceinline__ bool writesTokenRow(KernelParams const& params, int64_t tokenIdx) {
+  if (params.zeroRowsWithoutLocalExpert) {
+    return true;
+  }
+  for (int k = 0; k < params.topK; k++) {
+    if (params.expandedIdxToPermutedIdx[tokenIdx * params.topK + k] != -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
 template <typename KernelParams>
 __global__ void finalizeKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -733,6 +1128,9 @@ __global__ void finalizeKernel(KernelParams params) {
 #endif
 
   for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
+    if (!writesTokenRow(params, tokenIdx)) {
+      continue;
+    }
     // Loop over hidden dim
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {
@@ -750,8 +1148,10 @@ __global__ void finalizeKernel(KernelParams params) {
 
         if constexpr (KernelParams::UseSecondInput) {
           float const input =
-              float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]} +
-              float{params.inPtr2[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+              float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                 hiddenIdx]} +
+              float{params.inPtr2[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                  hiddenIdx]};
           if (params.expertWeightsPtr != nullptr) {
             TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
             data += float{scale} * input;
@@ -762,14 +1162,17 @@ __global__ void finalizeKernel(KernelParams params) {
           if (params.expertWeightsPtr != nullptr) {
             TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
             data += float{scale} *
-                    float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+                    float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                       hiddenIdx]};
           } else {
-            data += float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+            data += float{params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                       hiddenIdx]};
           }
         }
       }
 
-      params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
+      params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] =
+          static_cast<Type>(data);
     }
   }
 }
@@ -940,6 +1343,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   }
 #endif
 
+  bool hasLocalExpert = false;
   for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
        kChunkIdx += blockDim.x) {
     int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
@@ -951,13 +1355,23 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
 
     scaleArrSmem[kChunkIdx] = scalePacked;
     permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
+    auto const permutedIdxArr = *reinterpret_cast<IdxArrayType const*>(&permutedIdxPacked);
+#pragma unroll
+    for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+      hasLocalExpert = hasLocalExpert || permutedIdxArr[ki] != -1;
+    }
   }
+  // writesTokenRow from the expanded indices read above, each thread holding some of the chunks.
+  bool const writeRow = params.zeroRowsWithoutLocalExpert || __syncthreads_or(hasLocalExpert);
 
-  auto const offset = tokenIdx * params.hiddenDim;
+  int64_t const offset = static_cast<int64_t>(tokenIdx) * params.hiddenDim;
   Type* outputPtr = params.outPtr + offset;
   auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
 
+  if (!writeRow) {
+    return;
+  }
   __syncthreads();
 
   auto const* inElemPtr2 = reinterpret_cast<InputElem const*>(params.inPtr2);
@@ -1007,6 +1421,139 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
     OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
     outElemPtr[elemIndex] = outputElem;
   }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Warp-per-token finalize: each warp reduces one token row, or the blockIdx.y-th of gridDim.y
+// slices of it when there are too few tokens to fill the GPU. Lane k < topK reads the token's k-th
+// expanded index and weight, and the warp then walks its slice FINALIZE_WARP_VECS 128-bit vectors
+// per lane at a time, issuing the loads of all of them before accumulating, for every local expert.
+constexpr int FINALIZE_WARP_THREADS = 256;
+constexpr int FINALIZE_WARP_VECS = 4;
+// Row slices are added until the launch has at least this many warps.
+constexpr int FINALIZE_WARP_MIN_WARPS = 2048;
+// A prime, so coprime to every token count it does not divide.
+constexpr int64_t FINALIZE_TOKEN_SPREAD_STRIDE = 1000003;
+
+// With SingleExpertTokensDone, the GEMM producing the input already wrote every token that has
+// exactly one local expert to the output (see finalizeKernelMultiExpertTokens): such tokens are
+// skipped, and tokens without a local expert only get their zero row.
+// Without zeroRowsWithoutLocalExpert, tokens without a local expert write nothing.
+template <typename KernelParams, bool SingleExpertTokensDone>
+__device__ __forceinline__ void finalizeWarpPerToken(KernelParams const& params) {
+  using Type = typename KernelParams::Type;
+  using TypeExpW = typename KernelParams::TypeExpW;
+  constexpr int ElemPerVec = 128 / cutlass::sizeof_bits<Type>::value;
+  using VecElem = cutlass::Array<Type, ElemPerVec>;
+  using ComputeElem = cutlass::Array<float, ElemPerVec>;
+  constexpr int WarpsPerBlock = FINALIZE_WARP_THREADS / 32;
+  constexpr unsigned FullMask = 0xffffffffu;
+
+  int const lane = threadIdx.x % 32;
+  int64_t tokenIdx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + threadIdx.x / 32;
+  if (tokenIdx >= params.numTokens) {
+    return;
+  }
+  if constexpr (SingleExpertTokensDone) {
+    // The tokens left are typically consecutive (rows without a local expert are packed at the
+    // end of each source rank's block); a stride coprime to numTokens spreads them over the CTAs.
+    if (params.numTokens % FINALIZE_TOKEN_SPREAD_STRIDE != 0) {
+      tokenIdx = tokenIdx * FINALIZE_TOKEN_SPREAD_STRIDE % params.numTokens;
+    }
+  }
+  int64_t const numVecs = params.hiddenDim / ElemPerVec;
+  int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
+  int64_t const vecsPerStep = 32 * FINALIZE_WARP_VECS;
+  int64_t const stepsPerSlice =
+      ((numVecs + vecsPerStep - 1) / vecsPerStep + gridDim.y - 1) / gridDim.y;
+  int64_t const vecBegin = blockIdx.y * stepsPerSlice * vecsPerStep;
+  int64_t const vecEnd = min(numVecs, vecBegin + stepsPerSlice * vecsPerStep);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Wait on the primary kernel before reading anything another kernel wrote, including the
+  // permutation and expert weights below.
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  int permutedIdx = -1;
+  float scale = 0.f;
+  if (lane < params.topK) {
+    int64_t const expandedIdx = tokenIdx * params.topK + lane;
+    permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+    scale = params.expertWeightsPtr != nullptr
+                ? static_cast<float>(params.expertWeightsPtr[expandedIdx])
+                : 1.f;
+  }
+  unsigned const localMask = __ballot_sync(FullMask, permutedIdx != -1);
+  auto* outVecPtr = reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim);
+  if constexpr (SingleExpertTokensDone) {
+    int const numLocal = __popc(localMask);
+    if (numLocal == 0 && params.zeroRowsWithoutLocalExpert) {
+      VecElem zero;
+      zero.fill(Type(0.f));
+      for (int64_t vec = vecBegin + lane; vec < vecEnd; vec += 32) {
+        outVecPtr[vec] = zero;
+      }
+    }
+    if (numLocal <= 1) {
+      return;
+    }
+  }
+
+  // Warp-uniform bound: every lane takes part in the shuffles below, and the lanes past the end of
+  // the slice skip their loads and stores.
+  for (int64_t stepBegin = vecBegin; stepBegin < vecEnd; stepBegin += vecsPerStep) {
+    int64_t const vecBase = stepBegin + lane;
+    ComputeElem acc[FINALIZE_WARP_VECS];
+#pragma unroll
+    for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
+      acc[u].fill(0.f);
+    }
+    for (unsigned mask = localMask; mask != 0; mask &= mask - 1) {
+      int const k = __ffs(mask) - 1;
+      int64_t const row = __shfl_sync(FullMask, permutedIdx, k);
+      float const w = __shfl_sync(FullMask, scale, k);
+      auto const* inVecPtr = reinterpret_cast<float4 const*>(params.inPtr) + row * numVecsPadded;
+      VecElem in[FINALIZE_WARP_VECS];
+#pragma unroll
+      for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
+        if (vecBase + u * 32 < vecEnd) {
+          float4 const v = vectorizedLoadPtx(inVecPtr + vecBase + u * 32);
+          in[u] = *reinterpret_cast<VecElem const*>(&v);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
+        if (vecBase + u * 32 < vecEnd) {
+          acc[u] = acc[u] + w * arrayConvert<VecElem, ComputeElem>(in[u]);
+        }
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
+      if (vecBase + u * 32 < vecEnd && (localMask != 0 || params.zeroRowsWithoutLocalExpert)) {
+        outVecPtr[vecBase + u * 32] = arrayConvert<ComputeElem, VecElem>(acc[u]);
+      }
+    }
+  }
+}
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
+    finalizeKernelWarpPerToken(KernelParams params) {
+  finalizeWarpPerToken<KernelParams, /*SingleExpertTokensDone=*/false>(params);
+}
+
+// Finalize after a GEMM whose epilogue stored each token with exactly one local expert straight
+// into the output, scaled by its expert weight: writes the zero rows of tokens without a local
+// expert (with zeroRowsWithoutLocalExpert) and reduces the tokens with several.
+template <typename KernelParams>
+__global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
+    finalizeKernelMultiExpertTokens(KernelParams params) {
+  finalizeWarpPerToken<KernelParams, /*SingleExpertTokensDone=*/true>(params);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1073,6 +1620,19 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
     }
   }
 
+  if (!params.zeroRowsWithoutLocalExpert) {
+    // writesTokenRow from the expanded indices read above: the block's first vector is always
+    // active and holds every topK slot of the token.
+    bool hasLocalExpert = false;
+#pragma unroll
+    for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+      hasLocalExpert = hasLocalExpert || permutedIdx[j] != -1;
+    }
+    if (!__syncthreads_or(hasLocalExpert)) {
+      return;
+    }
+  }
+
   ComputeElem acc;
   acc.fill(0.f);
   if (active) {
@@ -1118,7 +1678,8 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
         acc[e] += partialSmem[g * blockDim.x + threadIdx.x][e];
       }
     }
-    reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim)[vecIdx] =
+    reinterpret_cast<VecElem*>(params.outPtr +
+                               static_cast<int64_t>(tokenIdx) * params.hiddenDim)[vecIdx] =
         arrayConvert<ComputeElem, VecElem>(acc);
   }
 }
@@ -1141,6 +1702,9 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
 #endif
 
   for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
+    if (!writesTokenRow(params, tokenIdx)) {
+      continue;
+    }
     // Loop over hidden dim
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {
@@ -1160,8 +1724,9 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
         float const expertProb = (float)params.expertWeightsPtr[tokenIdx * params.topK + k];
 
         float const scale = expertProb * blockScale;
-        acc += scale *
-               static_cast<float>(params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]);
+        acc += scale * static_cast<float>(
+                           params.inPtr[static_cast<int64_t>(permutedIdx) * params.hiddenDimPadded +
+                                        hiddenIdx]);
       }
 
       // The largest (finite) value that can be represented using E4m3.
@@ -1182,13 +1747,42 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
       __syncthreads();
       float const scaleOut = s_scaleOut;
       __syncthreads();
-      params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = (Type)(acc / scaleOut);
+      params.outPtr[static_cast<int64_t>(tokenIdx) * params.hiddenDim + hiddenIdx] =
+          (Type)(acc / scaleOut);
     }
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Grid of the warp-per-token kernels: one warp per token, and row slices over blockIdx.y. Each row
+// splits into slices of stepsPerSlice steps, enough of them to reach FINALIZE_WARP_MIN_WARPS warps.
+// Only slices that hold steps are launched, and the kernel derives the same stepsPerSlice from
+// their number.
+dim3 warpPerTokenGrid(Data const& data, int elemPerVec) {
+  int const warpsPerBlock = FINALIZE_WARP_THREADS / 32;
+  int const vecsPerStep = 32 * FINALIZE_WARP_VECS;
+  int const numSteps = (data.hiddenDim / elemPerVec + vecsPerStep - 1) / vecsPerStep;
+  int const maxSlices =
+      std::min(numSteps, (FINALIZE_WARP_MIN_WARPS + data.numTokens - 1) / data.numTokens);
+  int const stepsPerSlice = (numSteps + maxSlices - 1) / maxSlices;
+  int const numSlices = (numSteps + stepsPerSlice - 1) / stepsPerSlice;
+  return dim3((data.numTokens + warpsPerBlock - 1) / warpsPerBlock, numSlices);
+}
+
 void run(Data const& data, void* stream) {
+  if (data.mSingleExpertTokensDone) {
+    int const elemPerVec = data.mDtypeElt == tg::Dtype::E4m3 ? 16 : 8;
+    FLASHINFER_CHECK(!data.mUseDeepSeekFp8 && data.inPtr2 == nullptr &&
+                         data.hiddenDim % elemPerVec == 0 &&
+                         data.hiddenDimPadded % elemPerVec == 0 && data.topK <= 32,
+                     "Finalize of multi-expert tokens needs one input, 128-bit aligned rows "
+                     "and topK <= 32");
+    LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelMultiExpertTokens, 1,
+                warpPerTokenGrid(data, elemPerVec),
+                /*numThreads=*/FINALIZE_WARP_THREADS, 0, stream);
+    return;
+  }
   if (data.mUseDeepSeekFp8) {
     FLASHINFER_CHECK(data.inPtr2 == nullptr,
                      "DeepSeek FP8 finalize does not support a second input");
@@ -1233,6 +1827,10 @@ void run(Data const& data, void* stream) {
       // vectorized loading.
       dim3 numBlocks(numBlocksX, numBlocksY);
       LAUNCH_TOPK_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);
+    } else if (vectorWidthAligned && data.topK <= 32 && data.inPtr2 == nullptr) {
+      LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelWarpPerToken, 1,
+                  warpPerTokenGrid(data, finalizeElemsPerVector),
+                  /*numThreads=*/FINALIZE_WARP_THREADS, 0, stream);
     } else {
       FLASHINFER_CHECK(
           data.topK <= MaxTopK,

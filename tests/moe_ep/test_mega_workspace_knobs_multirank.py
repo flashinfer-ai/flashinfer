@@ -74,7 +74,7 @@ def test_explicit_workspace_knobs_and_graph_replay(monkeypatch, tmp_path):
             MegaConfig(
                 megakernel=dataclasses.replace(config, knobs=None),
                 preprocess_weights=False,
-                transformed_weights=reference._get_transformed_weights(),
+                transformed_weights=reference.get_transformed_weights(),
             ),
         )
         selected = fixed.create_workspace(fleet.max_tokens_per_rank, knobs=knobs)

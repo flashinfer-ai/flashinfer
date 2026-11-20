@@ -1,5 +1,6 @@
 import struct
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -85,6 +86,72 @@ def test_generate_ninja_propagates_cuda_arch_flags_to_nvcc_link(monkeypatch, tmp
     assert "cuda_arch_flags = -gencode=arch=compute_103a,code=sm_103a" in ninja
     assert "command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out" in ninja
     assert "cuda_arch_flags = -DNDEBUG" not in ninja
+
+
+@pytest.mark.cpu_only
+def test_generate_ninja_forwards_libpath_to_host_linker_on_windows(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(cpp_ext, "is_windows", True)
+    monkeypatch.setattr(cpp_ext.platform, "machine", lambda: "ARM64")
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
+    monkeypatch.delenv("FLASHINFER_EXTRA_LDFLAGS", raising=False)
+
+    def generate(needs_device_linking):
+        return cpp_ext.generate_ninja_build_for_op(
+            name="test_module",
+            sources=[tmp_path / "generated" / "kernel.cu"],
+            extra_cflags=None,
+            extra_cuda_cflags=None,
+            extra_ldflags=None,
+            extra_include_dirs=None,
+            needs_device_linking=needs_device_linking,
+        )
+
+    ninja = generate(True)
+    assert "command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out" in ninja
+    global_ldflags = ninja.split("\nldflags = ", 1)[1].split("\n\n", 1)[0]
+    assert global_ldflags.count('"/LIBPATH:') == 4
+    assert "-Xlinker" not in global_ldflags
+    nvcc_link_edge = ninja.split(": nvcc_link ", 1)[1].split("\ndefault ", 1)[0]
+    override = nvcc_link_edge.split("\n  ldflags = ", 1)[1]
+    assert '-Xlinker "/LIBPATH:$cuda_home\\lib\\arm64"' in override
+    assert override.count("-Xlinker ") == 4
+    assert "-Xlinker c10.lib" not in override
+    assert " c10.lib " in override
+
+    ninja = generate(False)
+    assert "\n  ldflags = " not in ninja
+
+
+@pytest.mark.cpu_only
+def test_generate_ninja_takes_windows_library_dirs_from_packages(monkeypatch, tmp_path):
+    monkeypatch.setattr(cpp_ext, "is_windows", True)
+    monkeypatch.setattr(cpp_ext.platform, "machine", lambda: "ARM64")
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
+    fake_venv = tmp_path / "venv"
+    monkeypatch.setattr(
+        cpp_ext.sys, "executable", str(fake_venv / "Scripts" / "python.exe")
+    )
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "kernel.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+
+    torch_lib = Path(torch.__file__).parent / "lib"
+    tvm_ffi_lib = Path(cpp_ext.tvm_ffi.__file__).parent / "lib"
+    assert f'"/LIBPATH:{torch_lib}"' in ninja
+    assert f'"/LIBPATH:{tvm_ffi_lib}"' in ninja
+    assert str(fake_venv) not in ninja
 
 
 @pytest.mark.cpu_only
@@ -251,14 +318,16 @@ def test_generate_ninja_embeds_cubins_as_coff_objects_on_windows(monkeypatch, tm
     cubin_obj = (
         tmp_path / "jit" / "test_module" / "embedded_cubin_alphamoe_small_sm_103a.o"
     ).resolve()
+    # The generator escapes paths for ninja ("C:\" -> "C$:\"); expect them escaped.
+    escape = cpp_ext._ninja_windows_path
     assert "tvm_ffi.utils.embed_cubin" not in ninja
     assert "embed_cubin_coff.py" in ninja
     assert (
         '--machine arm64 --name $cubin_name --cubin "$in" --output-obj "$out"' in ninja
     )
-    assert f"build {cubin_obj}: embed_cubin {cubin.resolve()}" in ninja
+    assert f"build {escape(cubin_obj)}: embed_cubin {escape(cubin.resolve())}" in ninja
     assert "  cubin_name = alphamoe_small_sm_103a" in ninja
-    assert f": link {host_obj} {cubin_obj}" in ninja
+    assert f": link {escape(host_obj)} {escape(cubin_obj)}" in ninja
 
 
 @pytest.mark.cpu_only
