@@ -122,7 +122,7 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     ]
     raster_along_m_candidates = [False]
 
-    tactics = [
+    tactics: List[Tuple] = [
         (mma_tiler_mn, cluster_shape_mn, raster_along_m)
         for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
             mma_tiler_mn_candidates,

@@ -1389,6 +1389,14 @@ def _moe_core_impl(
         raise ValueError(
             "gemm2_epilogue is not supported on the localized or swap_ab path"
         )
+    if gemm2_epilogue is not None:
+        gemm2_options.update(
+            raster_along_m=gemm2_raster_along_m,
+            num_c_stage=gemm2_epilogue[0],
+            num_store_warps=gemm2_epilogue[1],
+            swizzle_size=gemm2_epilogue[2],
+            use_l2_hints=len(gemm2_epilogue) > 3 and bool(gemm2_epilogue[3]),
+        )
     if use_localized_path:
         # Both domains read the joined FC1 output and write disjoint hidden
         # columns. Each contracts the full intermediate, so no reduction is needed.
@@ -1455,17 +1463,6 @@ def _moe_core_impl(
             enable_pdl=enable_pdl,
             use_fused_finalize=use_fused_finalize,
             **gemm2_options,
-            **(
-                dict(
-                    raster_along_m=gemm2_raster_along_m,
-                    num_c_stage=gemm2_epilogue[0],
-                    num_store_warps=gemm2_epilogue[1],
-                    swizzle_size=gemm2_epilogue[2],
-                    use_l2_hints=len(gemm2_epilogue) > 3 and bool(gemm2_epilogue[3]),
-                )
-                if gemm2_epilogue is not None
-                else {}
-            ),
         )
 
     # Step 4: Deterministic routing-weight reduction
