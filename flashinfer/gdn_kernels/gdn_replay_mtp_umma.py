@@ -1019,7 +1019,7 @@ class GdnReplayMtpUmma:
                 Float32,
             )
             words.append(U.pack_f16x2(lo, hi))
-        U.tmem_st_u32(twarp + dcol, words)
+        U.tmem_st_u32(0, twarp + dcol, words)
         U.tmem_wait_st()
         U.fence_before_sync()
         cute.arch.mbarrier_arrive(ctx["d_ready"][hh])
@@ -1042,16 +1042,16 @@ class GdnReplayMtpUmma:
         hv = hv0 + hh
         cb = hh * _COEF
         nld = 1 << (T - 1).bit_length()  # tcgen05.ld widths are powers of two
-        rk = U.tmem_ld(twarp + rcol, nld)
-        yk = U.tmem_ld(twarp + rcol + 16, nld)
+        rk = U.tmem_ld(0, twarp + rcol, nld)
+        yk = U.tmem_ld(0, twarp + rcol + 16, nld)
         U.tmem_wait_ld()
         egp = s_coef[cb + _CO_EGP]
         if early_release:
             # verify rows: all four column groups first, then release the head buffer
             # (the readout two heads ahead waits on it)
             hks = [egp * rk[t] + yk[t] for t in range(T)]
-            rq = U.tmem_ld(twarp + rcol + T, nld)
-            yq = U.tmem_ld(twarp + rcol + 16 + T, nld)
+            rq = U.tmem_ld(0, twarp + rcol + T, nld)
+            yq = U.tmem_ld(0, twarp + rcol + 16 + T, nld)
             U.tmem_wait_ld()
             U.fence_before_sync()
             cute.arch.mbarrier_arrive(ctx["epi_done"][hh])
@@ -1071,8 +1071,8 @@ class GdnReplayMtpUmma:
         if not early_release:
             # flush rows (register-bound): the u solve runs before the q columns are read,
             # so the k-side (hk, v) and q-side (rq, yq) values are never live together
-            rq = U.tmem_ld(twarp + rcol + T, nld)
-            yq = U.tmem_ld(twarp + rcol + 16 + T, nld)
+            rq = U.tmem_ld(0, twarp + rcol + T, nld)
+            yq = U.tmem_ld(0, twarp + rcol + 16 + T, nld)
             U.tmem_wait_ld()
             U.fence_before_sync()
             cute.arch.mbarrier_arrive(ctx["epi_done"][hh])
@@ -1155,7 +1155,7 @@ class GdnReplayMtpUmma:
             for _ in range(3):
                 lx.append(lx[-1] * Uint32(U.LCG_A) + Uint32(U.LCG_C))
         for grp in range(64 // ldn):
-            fv = U.tmem_ld(twarp + 64 + grp * ldn, ldn)
+            fv = U.tmem_ld(0, twarp + 64 + grp * ldn, ldn)
             if self.sr_rounds > 0:
                 # one Philox draw per 8-element chunk (word i -> pair i), all of the load's
                 # chunks in one call, issued under the TMEM load. off_row is a multiple of 64, so
