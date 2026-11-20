@@ -53,6 +53,14 @@ EP8 and EP16 reproduction
 
 The ``flash`` preset is a generated routed-MoE layer fixture with the following
 structure. It does not load a checkpoint or represent a complete model.
+Its routed-layer dimensions match
+`DeepSeek-V4-Flash-0731 config.json <https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/raw/7872f01b1d1fe23eabc4c98b48bffcef5a386062/config.json>`_.
+That checkpoint declares 43 hidden layers, 1 shared expert, 3 hash layers and
+1 next-token prediction layer. It uses 64 attention heads, 1 key/value head
+and a maximum context length of 1,048,576; these model components are outside
+this benchmark. Its router uses ``sqrtsoftplus``, normalized top-k probabilities
+and a scaling factor of 1.5; the generated fixture instead supplies the routing
+indices and coefficients described below.
 
 .. list-table:: Routed layer geometry
     :header-rows: 1
