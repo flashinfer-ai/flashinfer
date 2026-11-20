@@ -3582,7 +3582,7 @@ def test_sampling_rejects_unaligned_input(api):
     call, is_logits = _UNALIGNED_INPUT_CALLS[api]
     aligned = _unaligned_input(is_logits, 128)
     for shift in (1, 2, 3):
-        with pytest.raises(ValueError, match="must start on a 16-byte boundary"):
+        with pytest.raises(ValueError, match="must be 16-byte aligned"):
             call(_storage_offset_view(aligned, shift))
     # the refusal comes before any launch: the context still works
     call(aligned)
@@ -3609,7 +3609,7 @@ def test_top_k_rejects_unaligned_half_precision_input(api, dtype):
     call, is_logits = _UNALIGNED_INPUT_CALLS[api]
     aligned = _unaligned_input(is_logits, 128, dtype)
     for shift in (1, 4):
-        with pytest.raises(ValueError, match="must start on a 16-byte boundary"):
+        with pytest.raises(ValueError, match="must be 16-byte aligned"):
             call(_storage_offset_view(aligned, shift))
     assert torch.equal(call(_storage_offset_view(aligned, 8)), call(aligned))
 
@@ -3636,11 +3636,30 @@ def test_top_k_top_p_sampling_rejects_unaligned_input_as_stored(api, vocab_size,
     """
     call, is_logits = _UNALIGNED_INPUT_CALLS[api]
     aligned = _unaligned_input(is_logits, vocab_size, dtype)
-    with pytest.raises(ValueError, match="must start on a 16-byte boundary"):
+    with pytest.raises(ValueError, match="must be 16-byte aligned"):
         call(_storage_offset_view(aligned, 1))
     # an offset of 16 bytes is still read in place
     in_place = _storage_offset_view(aligned, 16 // aligned.element_size())
     assert torch.equal(call(in_place), call(aligned))
+
+
+@pytest.mark.parametrize(
+    "api",
+    [
+        "top_p_sampling_from_probs",
+        "top_k_sampling_from_probs",
+        "top_k_top_p_sampling_from_probs_joint",
+    ],
+)
+def test_split_row_sampling_reads_scalar_loaded_offset_view_in_place(api):
+    # 8194 tokens make the SM90 split-row launch stage rows with scalar loads, which need
+    # no alignment; the single-CTA kernels of other architectures read 8 bytes at once.
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("split-row rejection sampling requires SM90")
+
+    call, is_logits = _UNALIGNED_INPUT_CALLS[api]
+    aligned = _unaligned_input(is_logits, 8194)
+    assert torch.equal(call(_storage_offset_view(aligned, 1)), call(aligned))
 
 
 def test_chain_speculative_sampling_rejects_unaligned_probs():
@@ -3652,9 +3671,9 @@ def test_chain_speculative_sampling_rejects_unaligned_probs():
         0, vocab_size, (2, 2), device="cuda:0", dtype=torch.int32
     )
     sample = partial(flashinfer.sampling.chain_speculative_sampling, seed=7, offset=0)
-    with pytest.raises(ValueError, match="draft_probs must start on a 16-byte"):
+    with pytest.raises(ValueError, match="draft_probs must be 16-byte aligned"):
         sample(_storage_offset_view(draft_probs, 1), draft_token_ids, target_probs)
-    with pytest.raises(ValueError, match="target_probs must start on a 16-byte"):
+    with pytest.raises(ValueError, match="target_probs must be 16-byte aligned"):
         sample(draft_probs, draft_token_ids, _storage_offset_view(target_probs, 1))
     sample(draft_probs, draft_token_ids, target_probs)
     torch.cuda.synchronize()
@@ -3667,5 +3686,5 @@ def test_blackwell_softmax_rejects_unaligned_logits():
         pytest.skip("Blackwell Softmax routes require SM100 or SM103")
 
     logits = _storage_offset_view(_unaligned_input(True, 128), 1)
-    with pytest.raises(ValueError, match="logits must start on a 16-byte boundary"):
+    with pytest.raises(ValueError, match="logits must be 16-byte aligned"):
         flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)

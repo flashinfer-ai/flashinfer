@@ -39,10 +39,11 @@ inline void check_vector_load_alignment(const TensorView& tensor, const char* na
       std::gcd(kSamplingVectorLoadBytes / element_bytes, vocab_size) * element_bytes;
   const uint64_t address = reinterpret_cast<uint64_t>(tensor.data_ptr());
   if (address % load_bytes != 0) {
-    TVM_FFI_THROW(ValueError) << name << " must start on a " << load_bytes
-                              << "-byte boundary for a last dimension of " << vocab_size
+    TVM_FFI_THROW(ValueError) << name << " must be " << load_bytes
+                              << "-byte aligned for a last dimension of " << vocab_size
                               << ", but its data pointer is " << address % load_bytes
-                              << " bytes past one. Pass a copy (for example with .clone()).";
+                              << " bytes past such a boundary. Pass a copy (for example with "
+                              << ".clone()).";
   }
 }
 
