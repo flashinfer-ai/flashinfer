@@ -721,3 +721,210 @@ def test_frozen_mode_caches_presigmoided_beta():
     torch.testing.assert_close(
         kg[idx.long(), :, :, :128].permute(0, 2, 1, 3).float(), kraw
     )
+
+
+# =============================================================================
+# 64-bit addressing (offsets past 2^31 elements) and stride validation
+# =============================================================================
+
+
+def _skip_if_free_mem_below(gib):
+    """Skip a large-allocation test when the device is short on memory."""
+    if torch.cuda.mem_get_info()[0] < gib * (1 << 30):
+        pytest.skip(f"needs >= {gib} GiB free GPU memory to cross 2^31 elements")
+
+
+def _dropin_inputs(lens, H, seed):
+    """Packed varlen drop-in activations + gate params."""
+    torch.manual_seed(seed)
+    dev = "cuda"
+    tot = sum(lens)
+    q = torch.randn(1, tot, H, 128, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = torch.randn_like(q)
+    beta = torch.randn(1, tot, H, dtype=torch.bfloat16, device=dev)
+    A_log = torch.randn(H, dtype=torch.float32, device=dev) * 0.3
+    dt = torch.randn(H * 128, dtype=torch.float32, device=dev) * 0.1
+    qsl = torch.tensor(
+        [0] + torch.tensor(lens).cumsum(0).tolist(), dtype=torch.int32, device=dev
+    )
+    return q, k, v, g, beta, A_log, dt, qsl
+
+
+@pytest.mark.parametrize("T", [4, 16])
+def test_recoverssm_dropin_cache_offsets_past_int32(T):
+    """Slot offsets past 2^31 elements in the kg / correction caches.
+
+    The caches are strided views whose block stride is 2^30 elements, so slot
+    2 starts at element 2^31: the kg write (bf16) and the correction write
+    (fp32) must land there (64-bit address math), not wrap to a negative
+    offset or onto slot 0. Results must be bitwise equal to a compact-cache
+    run of the same inputs.
+    """
+    from flashinfer.kda_kernels.kda_decode_wy_output_only import (
+        kda_recoverssm_verify,
+    )
+
+    # kg storage ~4 GiB (bf16) + correction storage ~8 GiB (fp32)
+    _skip_if_free_mem_below(14)
+    dev = "cuda"
+    H, nblk, blk = 2, 3, 1 << 30
+    lens = [T, max(T - 1, 1)]
+    q, k, v, g, beta, A_log, dt, qsl = _dropin_inputs(lens, H, seed=T)
+    state = torch.randn(nblk, H, 128, 128, dtype=torch.bfloat16, device=dev) * 0.1
+    sidx = torch.tensor([2, 1], dtype=torch.int32, device=dev)
+
+    kg_span = (nblk - 1) * blk + H * T * 256
+    c_span = (nblk - 1) * blk + H * T * 128
+    kg_store = torch.empty(kg_span, dtype=torch.bfloat16, device=dev)
+    kg = kg_store.as_strided((nblk, H, T, 256), (blk, T * 256, 256, 1))
+    kg.fill_(7.0)
+    c_store = torch.empty(c_span, dtype=torch.float32, device=dev)
+    corr = c_store.as_strided((nblk, H, T, 128), (blk, T * 128, 128, 1))
+    corr.fill_(7.0)
+    assert kg.storage_offset() == 0 and 2 * blk >= 1 << 31
+
+    out = kda_recoverssm_verify(
+        q, k, v, g, beta, A_log, dt, -5.0, state, corr, kg, qsl, sidx, T
+    )
+    kg_ref = torch.full((nblk, H, T, 256), 7.0, dtype=torch.bfloat16, device=dev)
+    corr_ref = torch.full((nblk, H, T, 128), 7.0, dtype=torch.float32, device=dev)
+    out_ref = kda_recoverssm_verify(
+        q, k, v, g, beta, A_log, dt, -5.0, state, corr_ref, kg_ref, qsl, sidx, T
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_ref)
+    # slot 0 is the (untouched) null slot; a wrapped 32-bit offset lands there
+    assert torch.equal(corr, corr_ref), "correction cache mismatch past 2^31"
+    assert torch.equal(kg, kg_ref), "kg cache mismatch past 2^31"
+
+
+@pytest.mark.parametrize("backend", ["wy", "recurrent"])
+def test_output_only_state_pool_past_int32(backend):
+    """Dense output-only decode reading a state slot past 2^31 elements."""
+    _skip_if_free_mem_below(6)
+    dev = "cuda"
+    H = HV = 1
+    T, B = 4, 2
+    pool = (1 << 31) // (128 * 128) + 2  # ~4 GiB bf16 pool
+    torch.manual_seed(5)
+    q = torch.randn(B, T, H, 128, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = (-torch.rand(B, T, HV, 128, device=dev) * 0.3).to(torch.bfloat16)
+    beta = torch.rand(B, T, HV, dtype=torch.bfloat16, device=dev)
+    h0 = torch.empty(pool, HV, 128, 128, dtype=torch.bfloat16, device=dev)
+    h0[0].normal_(0, 0.1)
+    h0[pool - 1].normal_(0, 0.1)
+    idx = torch.tensor([pool - 1, 0], dtype=torch.int32, device=dev)
+    out = kda_output_only_decode(q, k, v, g, beta, h0, idx, backend=backend)
+    small = h0[[pool - 1, 0]].clone()
+    ref = kda_output_only_decode(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        small,
+        torch.tensor([0, 1], dtype=torch.int32, device=dev),
+        backend=backend,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("backend", ["wy", "recurrent"])
+def test_output_only_emit_tokens_past_int32(backend):
+    """Dense emit path whose kg cache spans more than 2^31 elements.
+
+    B * T * HV * 2K > 2^31: the per-sequence token offset of the last
+    sequences must be computed in 64-bit for q/k/v/g/out/corr/kg.
+    """
+    _skip_if_free_mem_below(24)
+    dev = "cuda"
+    H = HV = 64
+    T = 16
+    B = (1 << 31) // (T * HV * 256) + 8
+    torch.manual_seed(9)
+    q = torch.randn(B, T, H, 128, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    g = (-torch.rand(B, T, HV, 128, device=dev) * 0.3).to(torch.bfloat16)
+    beta = torch.rand(B, T, HV, dtype=torch.bfloat16, device=dev)
+    h0 = torch.randn(4, HV, 128, 128, dtype=torch.bfloat16, device=dev) * 0.1
+    idx = torch.arange(B, dtype=torch.int32, device=dev) % 4
+    out, corr, kg = kda_output_only_decode(
+        q, k, v, g, beta, h0, idx, backend=backend, emit_corrections=True
+    )
+    tail = slice(B - 8, B)
+    out_r, corr_r, kg_r = kda_output_only_decode(
+        q[tail].contiguous(),
+        k[tail].contiguous(),
+        v[tail].contiguous(),
+        g[tail].contiguous(),
+        beta[tail].contiguous(),
+        h0,
+        idx[tail].contiguous(),
+        backend=backend,
+        emit_corrections=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out[tail], out_r)
+    assert torch.equal(corr[tail], corr_r)
+    assert torch.equal(kg[tail], kg_r)
+
+
+@pytest.mark.parametrize("name", ["q", "k", "v", "g", "out"])
+def test_recoverssm_dropin_token_stride_validation(name):
+    """Token strides that break the 16 B row vectors raise ValueError; padded
+    strides that keep them aligned give bitwise-identical results."""
+    from flashinfer.kda_kernels.kda_decode_wy_output_only import (
+        kda_recoverssm_verify,
+    )
+
+    dev = "cuda"
+    H, T = 4, 4
+    lens = [3, 4, 2]
+    q, k, v, g, beta, A_log, dt, qsl = _dropin_inputs(lens, H, seed=3)
+    tot = sum(lens)
+    state = torch.randn(4, H, 128, 128, dtype=torch.bfloat16, device=dev) * 0.1
+    sidx = torch.tensor([1, 2, 3], dtype=torch.int32, device=dev)
+
+    def run(pad):
+        acts = {"q": q, "k": k, "v": v, "g": g, "out": torch.zeros_like(v)}
+        if pad:
+            base = torch.zeros(1, tot, H * 128 + pad, dtype=torch.bfloat16, device=dev)
+            view = base[:, :, : H * 128].unflatten(2, (H, 128))
+            view.copy_(acts[name])
+            acts[name] = view
+        corr = torch.zeros(4, H, T, 128, dtype=torch.float32, device=dev)
+        kg = torch.zeros(4, H, T, 256, dtype=torch.bfloat16, device=dev)
+        o = kda_recoverssm_verify(
+            acts["q"],
+            acts["k"],
+            acts["v"],
+            acts["g"],
+            beta,
+            A_log,
+            dt,
+            -5.0,
+            state,
+            corr,
+            kg,
+            qsl,
+            sidx,
+            T,
+            acts["out"],
+        )
+        torch.cuda.synchronize()
+        return o.clone(), corr, kg
+
+    with pytest.raises(ValueError, match="token stride"):
+        run(2)
+    with pytest.raises(ValueError, match="token stride"):
+        run(4)
+    ref = run(0)
+    got = run(8)
+    for a, b in zip(got, ref, strict=True):
+        assert torch.equal(a, b)
