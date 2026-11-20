@@ -324,7 +324,23 @@ class _Delegates:
                 )
             )
             # what the delegate reads off the engine's planned record
-            return SimpleNamespace(kv_indptr=None, has_sinks=has_sinks)
+            # a plan record without tensors: nothing for a run's buffers to overlap
+            return SimpleNamespace(
+                has_sinks=has_sinks,
+                **dict.fromkeys(
+                    (
+                        "kv_indptr",
+                        "workspace",
+                        "ws",
+                        "scratch",
+                        "desc",
+                        "groups",
+                        "fixup_groups",
+                        "fold_counters",
+                        "counts",
+                    )
+                ),
+            )
 
         def launch(
             planned,
