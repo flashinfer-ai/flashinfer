@@ -1956,6 +1956,77 @@ def test_shared_expert(request, capacity, knobs, fields):
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
+@pytest.mark.parametrize("shared", [False, True], ids=["routed", "shared_expert"])
+def test_prequantized_staging(monkeypatch, shared):
+    """Pre-quantized inputs stage in one launch to the bytes of the Torch staging.
+
+    Covers the sentinel rewrites (E4M3 and UE8M0 ``0xFF``), int64 ids narrowed to
+    the workspace's int32, masked tails after a larger batch and, with a shared
+    expert, its scale plane, from no token to the whole capacity.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm103.mxfp8_mxfp4_bf16_nvlink_one_sided_cutedsl import (
+        staging,
+    )
+
+    rank, world = _init_distributed()
+    group = dist.group.WORLD
+    capacity = COUNTER_DISPATCH_CAPACITY
+    weights = _make_weights(EXPERTS // world, seed=6151 * rank + 1)
+    weights.w13_bf16 = weights.w2_bf16 = None
+    pack = (
+        _shared_pack(weights, _make_shared_expert(seed=6173))
+        if shared
+        else _prequantized_pack(weights)
+    )
+    layer = _layer(
+        capacity,
+        pack,
+        rank=rank,
+        world=world,
+        quantize_input=False,
+        **({"shared_expert": "fp8_in_kernel"} if shared else {}),
+    )
+    try:
+        workspace = layer._ensure_workspace()
+        planes = [
+            workspace.x.view(torch.uint8),
+            workspace.x_sf.view(torch.uint8),
+            workspace.topk_idx,
+            workspace.topk_weights,
+        ]
+        if shared:
+            planes.append(workspace.shared_expert_scale_layout()[0])
+        # A whole batch first, so every row of the scale plane holds staged scales.
+        full = _tensors(_make_batch(capacity, 6197 + rank), quantize_input=False)
+        staging.stage_inputs(full, workspace, quantize_input=False)
+        for count in (capacity // 2, 0, 1, 37, capacity):
+            batch = _make_batch(count, 6211 + 31 * rank + count, holes=True)
+            batch.x_fp8.view(torch.uint8)[::5, ::7] = 0xFF
+            batch.x_sf_codes[::3, ::5] = 0xFF
+            t = _tensors(batch, quantize_input=False)
+            assert staging._fused_prequantized_layouts(t, workspace)
+            before = [plane.clone() for plane in planes]
+            staging.stage_inputs(t, workspace, quantize_input=False)
+            fused = [plane.clone() for plane in planes]
+            assert workspace.staged_tokens() == count
+            for plane, saved in zip(planes, before, strict=True):
+                plane.copy_(saved)
+            with monkeypatch.context() as patch:
+                patch.setattr(staging, "_fused_prequantized_layouts", lambda *_: False)
+                staging.stage_inputs(t, workspace, quantize_input=False)
+            same = all(torch.equal(a, b) for a, b in zip(fused, planes, strict=True))
+            _assert_all_ranks(same, group, f"count {count}: one-launch staging differs")
+    finally:
+        torch.cuda.synchronize()
+        layer.destroy()
+        dist.barrier()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "capacity, knobs, fields",
     [
