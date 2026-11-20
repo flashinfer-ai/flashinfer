@@ -53,7 +53,7 @@ import math
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, NamedTuple, Optional, Union
 
 import torch
 
@@ -1264,6 +1264,326 @@ def _work_order_buffer(device: torch.device, stream: int) -> torch.Tensor:
         return buffer
 
 
+# Kinds of ``DeviceRowLaunch``: the bindings that derive their rows on the device.
+_LAUNCH_CLC = 0
+_LAUNCH_VALUE_SPLIT = 1
+_LAUNCH_FP8_PAGE64 = 2
+_LAUNCH_SPLITKV = 3
+
+
+class DeviceRowLaunch(NamedTuple):
+    """The host-known part of a launch of a binding that derives its rows on the
+    device (generic CLC, value-split, FP8 page 64, split-KV): the families and
+    the scalar kernel arguments, a pure function of the request's sizes and
+    scales (``device_row_launch``). ``launch_device_rows`` adds the tensors,
+    the per-call scratch and the stream."""
+
+    kind: int
+    family: str
+    # Generic CLC: the longest-first order family when the launch takes the
+    # device work order, else ``None``.
+    order_family: Optional[str]
+    order_ctas: int
+    # The scalar arguments between the sink pointer (or, FP8 page 64 and
+    # split-KV, the partial statistics) and the per-call arguments.
+    args: tuple
+    num_heads: int
+    q_len: int
+    total_q: int
+    # Value split: 1 for page 64 (two 32-token halves per page), else 0.
+    page_shift: int
+    # FP8 page 64: (work items, split-K count) of the scratch; split-KV:
+    # (query rows, KV split count).
+    scratch: Optional[tuple]
+
+
+def device_row_launch(
+    domain: str,
+    family: str,
+    *,
+    arch: str,
+    num_sms: int,
+    num_heads: int,
+    has_sink: bool,
+    softmax_scale_log2: float,
+    bmm2: float,
+    total_q: int,
+    batch_size: int,
+    q_len: int,
+    table_width: int,
+    page_size: int,
+    max_seq_len: int,
+) -> Optional[DeviceRowLaunch]:
+    """The launch of ``family`` (serving ``domain``) when its binding derives
+    the rows on the device, else ``None`` (the binding reads a host-built row
+    plan). The branch order is the dispatcher's: the generic CLC, value-split
+    and split-KV bindings by binding, FP8 page 64 after the exact-length
+    domains."""
+    binding = FAMILIES[family]["binding"]
+    if binding == _CLC_BINDING:
+        # One persistent work item per query row (non-ragged, page 32).  A launch of
+        # more rows than one wave of clusters and at most _MAX_ORDERED_ROWS rows takes
+        # the longest-first order the order program writes right before it on this
+        # stream; every other launch keeps the launch order (null work order).
+        use_work_order = _uses_work_order(num_sms, total_q)
+        return DeviceRowLaunch(
+            kind=_LAUNCH_CLC,
+            family=family,
+            order_family=(
+                family_for(DOMAIN_BF16_CLC_ORDER, arch, num_sms)
+                if use_work_order
+                else None
+            ),
+            order_ctas=-(-total_q // _ORDER_ROWS_PER_CTA),
+            args=(
+                softmax_scale_log2,
+                bmm2,
+                total_q,
+                q_len,
+                table_width,
+                int(has_sink),
+                2 * q_len,
+                batch_size,
+            ),
+            num_heads=num_heads,
+            q_len=q_len,
+            total_q=total_q,
+            page_shift=0,
+            scratch=None,
+        )
+    if binding in _VALUE_SPLIT_BINDINGS:
+        # Pages are the caller's block_tables entries (page_shift: page 64 = two
+        # 32-token halves).
+        split = _VALUE_SPLIT_BINDINGS[binding]
+        work = total_q * split
+        resident = max(1, num_sms // _CLUSTER_SIZE)
+        return DeviceRowLaunch(
+            kind=_LAUNCH_VALUE_SPLIT,
+            family=family,
+            order_family=None,
+            order_ctas=0,
+            args=(
+                softmax_scale_log2,
+                bmm2,
+                work,
+                split,
+                table_width,
+                int(has_sink),
+                min(work, resident) * 2,
+                1,
+            ),
+            num_heads=num_heads,
+            q_len=q_len,
+            total_q=total_q,
+            page_shift=1 if page_size == 64 else 0,
+            scratch=None,
+        )
+    if binding == _SPLITKV_BINDING:
+        # The program derives each row's request, causal KV length and pages from
+        # seq_lens, q_len and block_tables on the device (non-ragged) and cuts the
+        # row's KV tiles into num_split ranges; the reducer applies the sink and
+        # bmm2_scale.  The split count, grid and scratch shape come from shapes,
+        # max_seq_len and the device facts alone.
+        num_split = plan_kv_split(total_q, int(max_seq_len), num_sms)
+        resident = max(1, num_sms // _CLUSTER_SIZE)
+        return DeviceRowLaunch(
+            kind=_LAUNCH_SPLITKV,
+            family=family,
+            order_family=None,
+            order_ctas=0,
+            args=(
+                softmax_scale_log2,
+                bmm2,
+                num_split,
+                total_q,
+                q_len,
+                1 if page_size == 64 else 0,
+                table_width,
+                int(has_sink),
+                min(total_q * num_split, resident) * _CLUSTER_SIZE,
+            ),
+            num_heads=num_heads,
+            q_len=q_len,
+            total_q=total_q,
+            page_shift=1 if page_size == 64 else 0,
+            scratch=(total_q, num_split),
+        )
+    if (
+        binding == _FP8_PAGE64_BINDING
+        and domain != DOMAIN_BF16_NATIVE_SPLIT8
+        and domain not in _CLC_DOMAINS
+        and domain != DOMAIN_FP8_P32
+    ):
+        # The program derives each row's request, causal KV length and pages from
+        # seq_lens, q_len and block_tables (non-ragged).
+        work_items = total_q
+        num_split = plan_num_split(work_items, int(max_seq_len), num_sms)
+        reduce_ctas = min(64, max(1, (num_sms * 2) // max(1, work_items * 2)))
+        return DeviceRowLaunch(
+            kind=_LAUNCH_FP8_PAGE64,
+            family=family,
+            order_family=None,
+            order_ctas=0,
+            args=(
+                softmax_scale_log2,
+                bmm2,
+                num_split,
+                work_items,
+                table_width,
+                reduce_ctas,
+                q_len,
+            ),
+            num_heads=num_heads,
+            q_len=q_len,
+            total_q=total_q,
+            page_shift=0,
+            scratch=(work_items, num_split),
+        )
+    return None
+
+
+def launch_device_rows(
+    launch: DeviceRowLaunch,
+    *,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    out: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    sink_arg: Optional[torch.Tensor],
+    device: torch.device,
+    stream: int,
+    stateless: bool,
+    row_batches: Optional[torch.Tensor] = None,
+    row_seq_lens: Optional[torch.Tensor] = None,
+) -> None:
+    """Launch ``launch`` on ``stream``.
+
+    ``sink_arg`` is the sink tensor, or the placeholder the generic CLC and
+    value-split bindings take without a sink (the head prefix of the FP8 decode
+    table), or ``None`` for that placeholder. ``row_batches`` and
+    ``row_seq_lens`` are the per-row metadata of a ragged value-split call
+    (``None``: the program derives them from ``seq_lens`` and ``q_len``).
+    ``stateless`` allocates the work order and the FP8 split-K scratch on the
+    current stream per call; otherwise they are cached per stream and shape.
+    The split-KV scratch is allocated per call under stream capture too, so a
+    captured graph owns its scratch (a cached one could leave the LRU cache
+    while the graph still launches with it).
+    """
+    run = get_cake_trtllm_mla_blackwell_family(launch.family).run
+    kind = launch.kind
+    if kind == _LAUNCH_SPLITKV:
+        total_q, num_split = launch.scratch
+        state = _scratch(
+            ("splitkv", device, total_q, num_split),
+            lambda: {
+                "partial_output": torch.empty(
+                    (total_q, _ALIGNED_HEADS, num_split, _ALIGNED_VALUE_DIM),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "partial_lse": torch.empty(
+                    (total_q, _ALIGNED_HEADS, num_split),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            },
+            stateless or torch.cuda.is_current_stream_capturing(),
+        )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM),
+            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            seq_lens,
+            block_tables,
+            sink_arg if sink_arg is not None else _fp8_lut(device)[: launch.num_heads],
+            state["partial_output"],
+            state["partial_lse"],
+            *launch.args,
+            stream,
+        )
+        return
+    if kind == _LAUNCH_FP8_PAGE64:
+        work_items, num_split = launch.scratch
+        state = _scratch(
+            ("fp8_page64", device, work_items, num_split),
+            lambda: {
+                "partial_output": torch.empty(
+                    (work_items, num_split, _ALIGNED_HEADS, _ALIGNED_VALUE_DIM),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "partial_stats": torch.empty(
+                    (work_items, num_split, _ALIGNED_HEADS, 2),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "lse": torch.empty(
+                    (work_items, _ALIGNED_HEADS), dtype=torch.float32, device=device
+                ),
+            },
+            stateless,
+        )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
+            kv_cache.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            state["lse"],
+            seq_lens,
+            block_tables.reshape(-1),
+            state["partial_output"],
+            state["partial_stats"],
+            *launch.args,
+            stream,
+        )
+        return
+    if kind == _LAUNCH_CLC:
+        work_order = seq_lens
+        if launch.order_family is not None:
+            work_order = (
+                torch.empty(2 * _MAX_ORDERED_ROWS, dtype=torch.int32, device=device)
+                if stateless
+                else _work_order_buffer(device, stream)
+            )
+            get_cake_trtllm_mla_blackwell_family(launch.order_family).run(
+                seq_lens,
+                work_order,
+                launch.q_len,
+                launch.total_q,
+                launch.order_ctas,
+                stream,
+            )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM),
+            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            seq_lens,
+            block_tables,
+            sink_arg if sink_arg is not None else _fp8_lut(device)[: launch.num_heads],
+            *launch.args,
+            work_order,
+            int(launch.order_family is not None),
+            stream,
+        )
+        return
+    ragged = row_batches is not None
+    run(
+        query.reshape(-1, _ALIGNED_QK_DIM),
+        kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+        out.reshape(-1, _ALIGNED_VALUE_DIM),
+        seq_lens,
+        block_tables,
+        sink_arg if sink_arg is not None else _fp8_lut(device)[: launch.num_heads],
+        *launch.args,
+        row_batches if ragged else seq_lens,
+        row_seq_lens if ragged else seq_lens,
+        int(ragged),
+        launch.q_len,
+        launch.page_shift,
+        stream,
+    )
+
+
 def _check_tensor(
     tensor: torch.Tensor, *, name: str, dtype: torch.dtype, device: torch.device
 ) -> None:
@@ -1497,9 +1817,6 @@ def trtllm_mla_blackwell_decode(
         arch=arch,
     )
     family = launch_family(domain, arch, num_sms, total_q)
-    # The launched binding, not the domain, decides the row inputs: the exact-geometry
-    # routes of the sm_100a and 152-SM sm_103a modules launch the generic CLC binding.
-    binding = FAMILIES[family]["binding"]
     stream = int(torch.cuda.current_stream(device).cuda_stream)
     run = get_cake_trtllm_mla_blackwell_family(family).run
     softmax_scale_log2 = bmm1 * log2e
@@ -1518,126 +1835,46 @@ def trtllm_mla_blackwell_decode(
             stateless=stateless,
         )
 
-    if binding == _CLC_BINDING:
-        # One persistent work item per query row (non-ragged, page 32).  A launch of
-        # more rows than one wave of clusters and at most _MAX_ORDERED_ROWS rows takes
-        # the longest-first order the order program writes right before it on this
-        # stream; every other launch keeps the launch order (null work order).
-        use_work_order = _uses_work_order(num_sms, total_q)
-        work_order = seq_lens
-        if use_work_order:
-            work_order = (
-                torch.empty(2 * _MAX_ORDERED_ROWS, dtype=torch.int32, device=device)
-                if stateless
-                else _work_order_buffer(device, stream)
-            )
-            get_cake_trtllm_mla_blackwell_family(
-                family_for(DOMAIN_BF16_CLC_ORDER, arch, num_sms)
-            ).run(
-                seq_lens,
-                work_order,
-                q_len,
-                total_q,
-                -(-total_q // _ORDER_ROWS_PER_CTA),
-                stream,
-            )
-        run(
-            query.reshape(-1, _ALIGNED_QK_DIM),
-            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
-            out.reshape(-1, _ALIGNED_VALUE_DIM),
-            seq_lens,
-            block_tables,
-            sink if sink is not None else _fp8_lut(device)[:num_heads],
-            softmax_scale_log2,
-            bmm2,
-            total_q,
-            q_len,
-            table_width,
-            int(sink is not None),
-            2 * q_len,
-            batch_size,
-            work_order,
-            int(use_work_order),
-            stream,
-        )
-    elif binding in _VALUE_SPLIT_BINDINGS:
-        # A ragged call passes each row's request and causal KV length; otherwise the
-        # program derives them from seq_lens and q_len (null row arrays).  Pages are
-        # the caller's block_tables entries (page_shift: page 64 = two 32-token halves).
-        split = _VALUE_SPLIT_BINDINGS[binding]
-        work = total_q * split
-        resident = max(1, num_sms // _CLUSTER_SIZE)
-        row_batches = row_seq_lens = seq_lens
-        if ragged_query:
+    device_rows = device_row_launch(
+        domain,
+        family,
+        arch=arch,
+        num_sms=num_sms,
+        num_heads=num_heads,
+        has_sink=sink is not None,
+        softmax_scale_log2=softmax_scale_log2,
+        bmm2=bmm2,
+        total_q=total_q,
+        batch_size=batch_size,
+        q_len=q_len,
+        table_width=table_width,
+        page_size=page_size,
+        max_seq_len=int(max_seq_len),
+    )
+    if device_rows is not None:
+        # The launched binding, not the domain, decides the row inputs
+        # (``device_row_launch``): the exact-geometry routes of the sm_100a and
+        # 152-SM sm_103a modules launch the generic CLC binding. Generic CLC
+        # (non-ragged, page 32), value split, split-KV (non-ragged) and FP8 page
+        # 64 derive each row on the device; a ragged value-split call passes each
+        # row's request and causal KV length.
+        row_batches = row_seq_lens = None
+        if ragged_query and device_rows.kind == _LAUNCH_VALUE_SPLIT:
             plan = row_plan("rows")
             row_batches, row_seq_lens = plan["row_batches"], plan["row_seq_lens"]
-        run(
-            query.reshape(-1, _ALIGNED_QK_DIM),
-            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
-            out.reshape(-1, _ALIGNED_VALUE_DIM),
-            seq_lens,
-            block_tables,
-            sink if sink is not None else _fp8_lut(device)[:num_heads],
-            softmax_scale_log2,
-            bmm2,
-            work,
-            split,
-            table_width,
-            int(sink is not None),
-            min(work, resident) * 2,
-            1,
-            row_batches,
-            row_seq_lens,
-            int(ragged_query),
-            q_len,
-            1 if page_size == 64 else 0,
-            stream,
-        )
-    elif binding == _SPLITKV_BINDING:
-        # The program derives each row's request, causal KV length and pages from
-        # seq_lens, q_len and block_tables on the device (non-ragged) and cuts the
-        # row's KV tiles into num_split ranges; the reducer applies the sink and
-        # bmm2_scale.  The split count, grid and scratch shape come from shapes,
-        # max_seq_len and the device facts alone.  Under stream capture the scratch
-        # is allocated per call, so a captured graph owns its scratch (a cached one
-        # could leave the LRU cache while the graph still launches with it).
-        num_split = plan_kv_split(total_q, int(max_seq_len), num_sms)
-        resident = max(1, num_sms // _CLUSTER_SIZE)
-        state = _scratch(
-            ("splitkv", device, total_q, num_split),
-            lambda: {
-                "partial_output": torch.empty(
-                    (total_q, _ALIGNED_HEADS, num_split, _ALIGNED_VALUE_DIM),
-                    dtype=torch.bfloat16,
-                    device=device,
-                ),
-                "partial_lse": torch.empty(
-                    (total_q, _ALIGNED_HEADS, num_split),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            },
-            stateless or torch.cuda.is_current_stream_capturing(),
-        )
-        run(
-            query.reshape(-1, _ALIGNED_QK_DIM),
-            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
-            out.reshape(-1, _ALIGNED_VALUE_DIM),
-            seq_lens,
-            block_tables,
-            sink if sink is not None else _fp8_lut(device)[:num_heads],
-            state["partial_output"],
-            state["partial_lse"],
-            softmax_scale_log2,
-            bmm2,
-            num_split,
-            total_q,
-            q_len,
-            1 if page_size == 64 else 0,
-            table_width,
-            int(sink is not None),
-            min(total_q * num_split, resident) * _CLUSTER_SIZE,
-            stream,
+        launch_device_rows(
+            device_rows,
+            query=query,
+            kv_cache=kv_cache,
+            out=out,
+            seq_lens=seq_lens,
+            block_tables=block_tables,
+            sink_arg=sink,
+            device=device,
+            stream=stream,
+            stateless=stateless,
+            row_batches=row_batches,
+            row_seq_lens=row_seq_lens,
         )
     elif domain == DOMAIN_BF16_NATIVE_SPLIT8:
         plan = row_plan("table")
@@ -1741,49 +1978,6 @@ def trtllm_mla_blackwell_decode(
             _P32_KV_CTAS,
             softmax_scale_log2,
             bmm2,
-            stream,
-        )
-    elif binding == _FP8_PAGE64_BINDING:
-        # The program derives each row's request, causal KV length and pages from
-        # seq_lens, q_len and block_tables (non-ragged).
-        work_items = total_q
-        num_split = plan_num_split(work_items, int(max_seq_len), num_sms)
-        reduce_ctas = min(64, max(1, (num_sms * 2) // max(1, work_items * 2)))
-        state = _scratch(
-            ("fp8_page64", device, work_items, num_split),
-            lambda: {
-                "partial_output": torch.empty(
-                    (work_items, num_split, _ALIGNED_HEADS, _ALIGNED_VALUE_DIM),
-                    dtype=torch.bfloat16,
-                    device=device,
-                ),
-                "partial_stats": torch.empty(
-                    (work_items, num_split, _ALIGNED_HEADS, 2),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                "lse": torch.empty(
-                    (work_items, _ALIGNED_HEADS), dtype=torch.float32, device=device
-                ),
-            },
-            stateless,
-        )
-        run(
-            query.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
-            kv_cache.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
-            out.reshape(-1, _ALIGNED_VALUE_DIM),
-            state["lse"],
-            seq_lens,
-            block_tables.reshape(-1),
-            state["partial_output"],
-            state["partial_stats"],
-            softmax_scale_log2,
-            bmm2,
-            num_split,
-            work_items,
-            table_width,
-            reduce_ctas,
-            q_len,
             stream,
         )
     else:

@@ -261,6 +261,23 @@ def _offer_case(monkeypatch, case, domain=None):
     monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {key: (unit,)})
 
 
+@pytest.fixture(autouse=True)
+def _clear_cake_mla_memos():
+    """Every test starts and ends without memoized Cake host facts or
+    second-stage decisions (they are process-global)."""
+
+    def clear():
+        core._CAKE_MLA_STAGE_TWO_MEMO.clear()
+        core._CAKE_MLA_TABLE_MEMO.clear()
+        core._CAKE_MLA_TABLE_MEMO_OWNER[0] = None
+        core._CAKE_MLA_NO_PROGRAM_DEVICES.clear()
+        core._cake_mla_auto_static_reason.cache_clear()
+
+    clear()
+    yield
+    clear()
+
+
 @pytest.fixture
 def clean_tuner(monkeypatch):
     monkeypatch.delenv(DISABLE_ENV, raising=False)
@@ -327,10 +344,11 @@ def test_first_stage_is_unchanged_and_cake_joins_the_second(
     )
 
 
-def test_committed_offer_table_runs_the_first_stage_only(monkeypatch, fresh_tuner):
-    """With the committed (empty) offer table a tuned call makes only the
-    first selection."""
+def test_unlisted_unit_runs_the_first_stage_only(monkeypatch, fresh_tuner):
+    """With no unit listed for the device a tuned call makes only the first
+    selection."""
     _require_cake_arch()
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {})
     calls = _candidate_calls(monkeypatch, _make_case(), tune=True)
     assert _ops(calls) == [core._MLA_DECODE_OP] and "cake" not in _names(calls)
 
@@ -947,6 +965,14 @@ def test_offer_table_well_formed():
     formed. No GPU needed."""
     _check_offer_table(core._CAKE_MLA_AUTO_OFFERS)
     _check_offer_table(_SYNTHETIC_OFFERS)
+    # The measurements the committed table derives from timed no split-KV
+    # unit, so it lists none; _check_offer_table holds every listed unit on
+    # its measured domain under the committed _SPLITKV_RANGE.
+    assert not any(
+        unit[0] == cake_module.DOMAIN_BF16_SPLITKV
+        for units in core._CAKE_MLA_AUTO_OFFERS.values()
+        for unit in units
+    )
 
 
 def test_committed_offer_table_unlisted_units_offer_nothing(monkeypatch, cake_families):
@@ -1138,13 +1164,21 @@ class _Stages:
         finally:
             self.tuner.is_tuning_mode = False
 
-    def select(self, batch_size=4, *, inputs=None, tune=False, selected=None):
-        """The two stages for a call; ``selected`` skips the first."""
+    def select(
+        self, batch_size=4, *, inputs=None, tune=False, selected=None, memo=False
+    ):
+        """The two stages for a call; ``selected`` skips the first. ``memo``
+        passes the dispatcher's memo key (here the input sizes, which with the
+        fixed runners and config decide the lookups), so a lookup-only decision
+        is memoized and reused."""
         if inputs is None:
             inputs = _cpu_inputs(torch.bfloat16, batch_size)
         if selected is None:
             selected = self.stage_one(inputs, tune)
         self.tuner.is_tuning_mode = tune
+        memo_key = None
+        if memo and not tune:
+            memo_key = ("stages", self.tuner._get_input_sizes(inputs))
         try:
             return core._mla_cake_stage_two(
                 self.tuner,
@@ -1152,8 +1186,9 @@ class _Stages:
                 self.config,
                 inputs,
                 selected,
-                _cpu_runner(torch.bfloat16, 64),
+                lambda: _cpu_runner(torch.bfloat16, 64),
                 self.ranges,
+                memo_key,
             )
         finally:
             self.tuner.is_tuning_mode = False
@@ -1177,7 +1212,9 @@ class _Stages:
 
 @pytest.fixture
 def stages(monkeypatch, fresh_tuner, cake_families, synthetic_offers):
-    return _Stages(monkeypatch, fresh_tuner)
+    staged = _Stages(monkeypatch, fresh_tuner)
+    staged.families = cake_families
+    return staged
 
 
 # Bucket 16 bounds bucket 8; Cake is not offered there, so it is not timed.
@@ -1406,6 +1443,308 @@ def test_failed_second_stage_tuning_runs_the_first_stage_winner(monkeypatch, sta
     monkeypatch.setattr(cake_module, "_fp8_lut", fail)
     assert stages.select(4, tune=True) == (stages.runners[1], -1)
     assert not stages.cake_profiled()
+
+
+# --- The memoized second stage (the eager host path of a tuned call) ---
+
+
+def _count_margin_lookups(monkeypatch):
+    """Counts the second stage's cache lookups."""
+    counts = [0]
+    original = AutoTuner.search_cache
+
+    def search_cache(self, op, *args, **kwargs):
+        if op == core._MLA_CAKE_MARGIN_OP:
+            counts[0] += 1
+        return original(self, op, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "search_cache", search_cache)
+    return counts
+
+
+def _decision(result):
+    """``(runner, tactic)`` with a Cake runner (one per call) named ``cake``."""
+    runner, tactic = result
+    if isinstance(runner, core._CakeTrtllmMlaBlackwellRunner):
+        return "cake", tactic
+    return runner, tactic
+
+
+@pytest.mark.parametrize(
+    "scenario", ["cake_won", "first_stage_kept", "untuned", "other_first_stage"]
+)
+def test_memoized_second_stage_matches_the_lookup(monkeypatch, stages, scenario):
+    """With the dispatcher's memo key the second stage looks up once per request
+    sizes and first-stage selection, then returns the memoized decision without
+    a lookup: the (runner, tactic) the lookup returns, for every batch of the
+    offered buckets, and the first stage's selection without a lookup outside
+    them. No GPU needed."""
+    if scenario == "first_stage_kept":
+        stages.times[core._CAKE_MLA_RUNNER] = stages.times["_FakeCuteDsl"]
+    if scenario != "untuned":
+        stages.select(4, tune=True)
+    selected = (stages.runners[0], -1) if scenario == "other_first_stage" else None
+    expected = {
+        "cake_won": ("cake", WINNER),
+        "first_stage_kept": (stages.runners[1], -1),
+        "untuned": (stages.runners[0], -1),
+        "other_first_stage": (stages.runners[0], -1),
+    }[scenario]
+    lookups = _count_margin_lookups(monkeypatch)
+    for batch_size in (1, 4, 9, 15, 16, 31):
+        inputs = _cpu_inputs(torch.bfloat16, batch_size)
+        offered = batch_size <= 15
+        looked_up = _decision(stages.select(inputs=inputs, selected=selected))
+        before = lookups[0]
+        first = _decision(stages.select(inputs=inputs, selected=selected, memo=True))
+        assert lookups[0] - before == int(offered), (scenario, batch_size)
+        again = _decision(stages.select(inputs=inputs, selected=selected, memo=True))
+        assert lookups[0] - before == int(offered), (scenario, batch_size)
+        assert first == again == looked_up, (scenario, batch_size)
+        if offered:
+            assert looked_up == expected, (scenario, batch_size)
+        elif scenario != "untuned":
+            assert looked_up == (selected or (stages.runners[1], -1))
+
+
+def test_memoized_cake_decision_under_capture(monkeypatch, stages):
+    """A memoized Cake decision is reused during stream capture while its
+    families are loaded; a capture without them looks up, misses, runs the
+    first stage's winner and memoizes nothing, so the next eager call loads
+    them and runs Cake again. No GPU needed."""
+    _, state = stages.families
+    stages.select(4, tune=True)
+    lookups = _count_margin_lookups(monkeypatch)
+    assert _decision(stages.select(4, memo=True)) == ("cake", WINNER)
+    assert lookups[0] == 1
+    state["capturing"] = True
+    assert _decision(stages.select(4, memo=True)) == ("cake", WINNER)
+    assert lookups[0] == 1
+    assert _decision(stages.select(4)) == ("cake", WINNER)
+    assert lookups[0] == 2
+
+    monkeypatch.setattr(core, "_CAKE_MLA_LOADED_FAMILIES", set())
+    for _ in range(2):
+        assert stages.select(4, memo=True) == (stages.runners[1], -1)
+    assert lookups[0] == 4
+    state["capturing"] = False
+    assert _decision(stages.select(4, memo=True)) == ("cake", WINNER)
+    assert lookups[0] == 5
+    assert _decision(stages.select(4, memo=True)) == ("cake", WINNER)
+    assert lookups[0] == 5
+
+
+def test_second_stage_memo_skipped_under_replay_diagnostics(monkeypatch, stages):
+    """Under strict ``autotune_v2`` replay every call looks up (and records
+    nothing in the second stage), as without the memo. No GPU needed."""
+    stages.select(4, tune=True)
+    lookups = _count_margin_lookups(monkeypatch)
+    local = stages.tuner._v2_local
+    report = ReplayCoverage()
+    monkeypatch.setattr(local, "replay_report", report)
+    monkeypatch.setattr(local, "strict_replay", True)
+    for _ in range(3):
+        assert _decision(stages.select(4, memo=True)) == ("cake", WINNER)
+    assert lookups[0] == 3
+    assert not any(
+        entry[0]() is stages.tuner for entry in core._CAKE_MLA_STAGE_TWO_MEMO.values()
+    )
+    assert [record["op"] for record in report.records] == [core._MLA_DECODE_OP] * 3
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "second_stage_entries",
+        "first_stage_winner",
+        "unavailable_family",
+        "new_tuner",
+        "unrelated_entry",
+        "offer_table",
+        "splitkv_range",
+    ],
+)
+def test_memoized_decision_follows_tuner_and_family_changes(
+    monkeypatch, stages, change
+):
+    """A memoized decision is dropped when any tuner's winners or loaded
+    configs change, the tuner, the offer table or the split-KV device ranges
+    are replaced, or a family it launches becomes unavailable: the next call
+    looks up and returns what the lookup returns. No GPU needed."""
+    stages.select(4, tune=True)
+    assert _decision(stages.select(4, memo=True)) == ("cake", WINNER)
+    lookups = _count_margin_lookups(monkeypatch)
+    expected = ("cake", WINNER)
+    if change == "second_stage_entries":
+        winners = stages.tuner._winner_cache()
+        for key in [
+            key for key in winners if key.custom_op == core._MLA_CAKE_MARGIN_OP
+        ]:
+            del winners[key]
+        expected = (stages.runners[1], -1)
+    elif change == "first_stage_winner":
+        winners = stages.tuner._winner_cache()
+        for key in [key for key in winners if key.custom_op == core._MLA_DECODE_OP]:
+            del winners[key]
+        stages.times["_FakeTrtllmGen"] = 0.8
+        stages.stage_one(_cpu_inputs(torch.bfloat16, 4), tune=True)
+        # The Cake entry names CuTe DSL, which the first stage no longer selects.
+        expected = (stages.runners[0], -1)
+    elif change == "unavailable_family":
+        family = cake_module.launch_family(
+            cake_module.DOMAIN_BF16_VQUARTER, "sm_100a", 148, 4
+        )
+        monkeypatch.setattr(core, "_CAKE_MLA_UNAVAILABLE_FAMILIES", {family})
+        expected = (stages.runners[1], -1)
+    elif change == "new_tuner":
+        tuner = AutoTuner()
+        # The same winners, copied without advancing the winner-source
+        # generation: only the tuner differs.
+        dict.update(tuner.profiling_cache, stages.tuner.profiling_cache)
+        stages.tuner = tuner
+        monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    elif change == "unrelated_entry":
+        _hold_cake_entry(stages.tuner)
+    elif change == "splitkv_range":
+        # The same ranges in a new object: the domain could have changed.
+        monkeypatch.setattr(
+            cake_module, "_SPLITKV_RANGE", dict(cake_module._SPLITKV_RANGE)
+        )
+    else:
+        monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", dict(_SYNTHETIC_OFFERS))
+    assert _decision(stages.select(4, memo=True)) == expected
+    assert lookups[0] == 1
+    assert _decision(stages.select(4)) == expected
+    assert lookups[0] == 2
+    # A decision no readiness check took part in is memoized again.
+    if change != "unavailable_family":
+        assert _decision(stages.select(4, memo=True)) == expected
+        assert lookups[0] == 2
+
+
+def test_offered_batch_ranges_follow_the_offer_table(monkeypatch, cake_families):
+    """The memoized offered batch ranges equal the offer table's ranges for
+    every committed unit, follow a replaced table, and are empty with sinks,
+    for unlisted units and on devices other than SM100a/SM103a. No GPU
+    needed."""
+    devices = {(arch, num_sms) for arch, num_sms, *_ in core._CAKE_MLA_AUTO_OFFERS}
+    for arch, num_sms in sorted(devices):
+        monkeypatch.setattr(
+            cake_module, "_device_facts", lambda index, facts=(arch, num_sms): facts
+        )
+        for key, units in core._CAKE_MLA_AUTO_OFFERS.items():
+            if key[:2] != (arch, num_sms):
+                continue
+            _, _, dtype_name, page_size, q_len, _ = key
+            dtype = getattr(torch, dtype_name)
+            for bucket in {unit[1] for unit in units}:
+                for max_seq_len in (bucket // 2 + 1, bucket):
+                    expected = tuple(
+                        (first, last)
+                        for _, first, last in core._cake_mla_auto_offer_ranges(
+                            arch, num_sms, dtype, page_size, q_len, False, max_seq_len
+                        )
+                    )
+                    assert expected
+                    for _ in range(2):
+                        assert (
+                            core._cake_mla_auto_batch_ranges(
+                                0, dtype, page_size, q_len, False, max_seq_len
+                            )
+                            == expected
+                        ), (key, max_seq_len)
+                    assert not core._cake_mla_auto_batch_ranges(
+                        0, dtype, page_size, q_len, True, max_seq_len
+                    )
+
+    bf16 = torch.bfloat16
+    monkeypatch.setattr(cake_module, "_device_facts", lambda index: ("sm_100a", 148))
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", dict(_SYNTHETIC_OFFERS))
+    assert core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 1024) == ((1, 15),)
+    assert core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 600) == ((1, 15),)
+    assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 2048)
+    assert not core._cake_mla_auto_batch_ranges(0, bf16, 32, 1, False, 1024)
+    assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 2, False, 1024)
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {})
+    assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 1024)
+
+    queries = []
+
+    def not_blackwell(index):
+        queries.append(index)
+        raise RuntimeError("requires compute capability 10.0 or 10.3")
+
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", dict(_SYNTHETIC_OFFERS))
+    monkeypatch.setattr(cake_module, "_device_facts", not_blackwell)
+    for _ in range(3):
+        assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 1024)
+    # A device without Cake programs is queried once, not on every call.
+    assert queries == [0]
+
+
+def test_cake_families_memo_follows_the_offer_table(
+    monkeypatch, cake_families, offer_everything
+):
+    """The memoized families of a batch equal their derivation from the
+    domain, the offer table and the routes, for batches on both sides of every
+    program boundary and the row cap, and follow a replaced table. No GPU
+    needed."""
+    for dtype, page_size in ((torch.bfloat16, 32), (torch.bfloat16, 64)):
+        runner = _cpu_runner(dtype, page_size)
+        for batch_size in (1, 4, 18, 19, 37, 38, 64, 74, 75, 128, 300, 512, 513):
+            inputs = _cpu_inputs(dtype, batch_size)
+            expected = runner._launched_families(
+                dtype, 1, NUM_HEADS, QK_DIM, 32, batch_size, "sm_100a", 148
+            )
+            for _ in range(2):
+                assert runner._families(inputs, (batch_size,)) == expected, (
+                    page_size,
+                    batch_size,
+                )
+            if page_size == 32:
+                # Every page-32 batch within the row cap launches a program.
+                assert (expected is None) == (batch_size > core._CAKE_MLA_MAX_ROWS)
+    runner = _cpu_runner(torch.bfloat16, 32)
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {})
+    assert runner._families(_cpu_inputs(torch.bfloat16, 4), (4,)) is None
+
+
+@pytest.mark.parametrize("facts", [("sm_100a", 148), ("sm_103a", 152)])
+def test_cake_families_memo_follows_the_splitkv_range(
+    monkeypatch, cake_families, facts
+):
+    """The memoized families of a long-KV batch follow the device's split-KV
+    range: a unit listed on the split-KV domain launches the split-KV family
+    while the range covers its max_seq_len, and nothing once the range is
+    replaced or changed in place (the domain is then the value-split one, which
+    that unit does not list); a unit listed on the value-split domain only
+    then. No GPU needed."""
+    arch, num_sms = facts
+    monkeypatch.setattr(cake_module, "_device_facts", lambda index: facts)
+    monkeypatch.setattr(cake_module, "_SPLITKV_RANGE", dict(cake_module._SPLITKV_RANGE))
+    key = (arch, num_sms, "bfloat16", 32, 1, False)
+    splitkv = (cake_module.DOMAIN_BF16_SPLITKV, 4096, 1, 15)
+    vquarter = (cake_module.DOMAIN_BF16_VQUARTER, 4096, 1, 15)
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {key: (splitkv,)})
+    runner = _cpu_runner(torch.bfloat16, 32, 4096)
+    inputs = _cpu_inputs(torch.bfloat16, 4)
+    expected = frozenset(
+        cake_module.launch_families(cake_module.DOMAIN_BF16_SPLITKV, arch, num_sms, 4)
+    )
+    for _ in range(2):
+        assert runner._families(inputs, (4,)) == expected
+    # Changed in place: the range no longer reaches max_seq_len 4096.
+    cake_module._SPLITKV_RANGE[facts] = (4097, 18)
+    assert runner._families(inputs, (4,)) is None
+    # Replaced: the device is no longer listed.
+    monkeypatch.setattr(cake_module, "_SPLITKV_RANGE", {})
+    assert runner._families(inputs, (4,)) is None
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {key: (vquarter,)})
+    assert runner._families(inputs, (4,)) == frozenset(
+        cake_module.launch_families(cake_module.DOMAIN_BF16_VQUARTER, arch, num_sms, 4)
+    )
+    monkeypatch.setattr(cake_module, "_SPLITKV_RANGE", {facts: (2049, 18)})
+    assert runner._families(inputs, (4,)) is None
 
 
 def test_cake_preparation_launches_nothing():
@@ -1750,6 +2089,9 @@ def test_cake_miss_runs_the_tuned_first_stage_winner(monkeypatch, fresh_tuner, m
             "validate_tactic",
             lambda self, inputs, tactic: False,
         )
+        # The memoized decision was derived from the validator replaced here;
+        # in a process the validator never changes.
+        core._CAKE_MLA_STAGE_TWO_MEMO.clear()
     elif miss == "switch_off":
         monkeypatch.setenv(DISABLE_ENV, "1")
         assert fresh_tuner.may_select_runner_class(core._CAKE_MLA_RUNNER)
@@ -2320,3 +2662,289 @@ def test_cake_build_failure_drops_cake_from_tuning(monkeypatch, clean_tuner):
     assert profiled and all(tactics == [] for tactics in profiled)
     assert core._CAKE_MLA_UNAVAILABLE_FAMILIES
     _assert_matches_reference(output, case, f"winner {_name(runner)}")
+
+
+# --- The resolved Cake launch and the memoized second stage on a device ---
+
+
+def _record_runs(monkeypatch):
+    """Replace every family by a recorder of its ``run`` calls (nothing is
+    built or launched)."""
+    runs = []
+
+    class _Recorder:
+        def __init__(self, name):
+            self.name = name
+
+        def run(self, *args):
+            runs.append((self.name, args))
+
+    monkeypatch.setattr(cake_module, "get_cake_trtllm_mla_blackwell_family", _Recorder)
+    return runs
+
+
+def _normalized_runs(runs, roles):
+    """Each run with its tensors named by role (a caller tensor or the FP8
+    decode table, by address) or as per-call scratch, with shape, strides and
+    dtype; the other arguments as they are."""
+    normalized = []
+    for name, args in runs:
+        values = []
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                values.append(
+                    (
+                        roles.get(arg.data_ptr(), "scratch"),
+                        tuple(arg.shape),
+                        tuple(arg.stride()),
+                        arg.dtype,
+                    )
+                )
+            else:
+                values.append(arg)
+        normalized.append((name, tuple(values)))
+    return normalized
+
+
+# (dtype, page size, query rows, max_seq_len) of every program the candidate
+# launches. The last three reach the split-KV program on both simulated devices
+# (``_SPLITKV_RANGE``: B200 from 2049, GB300 from 1025, up to 18 rows).
+_LAUNCH_GEOMETRIES = (
+    (torch.bfloat16, 32, 4, 1024),
+    (torch.bfloat16, 32, 32, 1024),
+    (torch.bfloat16, 32, 64, 1024),
+    (torch.bfloat16, 32, 128, 1024),
+    (torch.bfloat16, 32, 300, 1024),
+    (torch.bfloat16, 64, 4, 1024),
+    (torch.bfloat16, 64, 32, 1024),
+    (torch.float8_e4m3fn, 64, 4, 1024),
+    (torch.float8_e4m3fn, 64, 64, 1024),
+    (torch.float8_e4m3fn, 64, 128, 1024),
+    (torch.bfloat16, 32, 4, 4096),
+    (torch.bfloat16, 32, 18, 2049),
+    (torch.bfloat16, 64, 2, 16384),
+)
+
+
+@pytest.mark.parametrize("bmm2_scale", [1.0, 0.5])
+@pytest.mark.parametrize("q_len", [1, 2])
+@pytest.mark.parametrize("facts", [("sm_100a", 148), ("sm_103a", 152)])
+def test_resolved_cake_launch_matches_the_dispatcher(
+    monkeypatch, facts, q_len, bmm2_scale
+):
+    """The launch the second stage resolves once (``_launch_plan``) makes the
+    same family calls with the same arguments as the stateless dispatcher on
+    every program the candidate reaches (split-KV included), both simulated
+    devices, q_len 1 and 2 and bmm2_scale != 1: the same caller tensors
+    (address, shape, strides, dtype), the same scalars and stream, per-call
+    scratch of the same sizes. The resolved launch takes the device's domain,
+    so a split-KV geometry resolves the split-KV program. Nothing is built or
+    launched; any CUDA device."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    monkeypatch.setattr(cake_module, "_device_facts", lambda index: facts)
+    runs = _record_runs(monkeypatch)
+    device = torch.device("cuda", torch.cuda.current_device())
+    lut = cake_module._fp8_lut(device)
+    checked = splitkv = 0
+    for dtype, page_size, rows, max_seq_len in _LAUNCH_GEOMETRIES:
+        batch_size = rows // q_len
+        width = -(-max_seq_len // page_size)
+        query = torch.empty(
+            batch_size, q_len, NUM_HEADS, QK_DIM, dtype=dtype, device=device
+        )
+        # Every page-table entry names page 0: a small pool suffices.
+        kv_cache = torch.empty(4, page_size, QK_DIM, dtype=dtype, device=device)
+        block_tables = torch.zeros(batch_size, width, dtype=torch.int32, device=device)
+        seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+        out = torch.empty(
+            batch_size, q_len, NUM_HEADS, LATENT, dtype=torch.bfloat16, device=device
+        )
+        inputs = [query, block_tables, seq_lens, out]
+        runner = _cpu_runner(
+            dtype,
+            page_size,
+            max_seq_len,
+            kv_cache=kv_cache,
+            bmm1_scale=1.0 / (192**0.5),
+            bmm2_scale=bmm2_scale,
+        )
+        label = (facts, dtype, page_size, rows, q_len, max_seq_len, bmm2_scale)
+        domain = runner._domain(inputs, facts[1], arch=facts[0])
+        is_splitkv = domain == cake_module.DOMAIN_BF16_SPLITKV
+        assert is_splitkv == (max_seq_len > 1024), label
+        if domain is None:
+            # BF16 page 64 beyond a half-value split, CLC with bmm2_scale != 1.
+            assert page_size == 64 or bmm2_scale != 1.0, label
+            assert runner._launch_plan(inputs) is None, label
+            continue
+        plan = runner._launch_plan(inputs)
+        assert plan is not None, label
+        roles = {
+            query.data_ptr(): "query",
+            kv_cache.data_ptr(): "kv_cache",
+            block_tables.data_ptr(): "block_tables",
+            seq_lens.data_ptr(): "seq_lens",
+            out.data_ptr(): "out",
+            lut.data_ptr(): "fp8_table",
+        }
+        runs.clear()
+        runner._plan = plan
+        assert runner.forward(inputs) is out
+        resolved = _normalized_runs(runs, roles)
+        runs.clear()
+        runner._plan = None
+        runner.forward(inputs)
+        dispatched = _normalized_runs(runs, roles)
+        assert resolved == dispatched, label
+        assert [name for name, _ in resolved] == list(
+            cake_module.launch_families(domain, facts[0], facts[1], rows)
+        ), label
+        checked += 1
+        splitkv += is_splitkv
+    assert checked >= 6 and splitkv >= 2
+
+
+@pytest.mark.parametrize("q_len", [1, 2])
+@pytest.mark.parametrize("geometry", _STATELESS_GEOMETRIES)
+def test_memoized_cake_call_matches_explicit_cake_bitwise(
+    monkeypatch, clean_tuner, geometry, q_len
+):
+    """A repeated call reuses the second stage's decision and its resolved
+    launch without a second lookup; its output equals, bit for bit, the first
+    call's, explicit ``backend="cake"`` on the same values and the stateless
+    dispatcher, with padded requests."""
+    _require_cake_arch()
+    arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
+    _skip_unserved_geometry(geometry, "plain", arch, num_sms)
+    case = _parity_case(geometry, q_len)
+    _pad(case["seq_lens"], q_len)
+    selected = _force_cake(monkeypatch, case)
+    launches = _spy_cake_forward(monkeypatch)
+    results = _spy_stage_two(monkeypatch)
+    first = _decode(dict(case, out=_nan_out(case)))
+    looked_up = len(selected)
+    second = _decode(dict(case, out=_nan_out(case)))
+    third = _decode(dict(case, out=_nan_out(case)))
+    assert len(selected) == looked_up == 1
+    assert [_name(runner) for runner, _ in results] == ["cake"] * 3
+    assert len(launches) == 3 and all(runner._plan is not None for runner in launches)
+    explicit = _explicit_cake(case, case["seq_lens"], case["block_tables"])
+    stateless = cake_module.trtllm_mla_blackwell_decode(
+        case["query"],
+        case["kv_cache"],
+        case["block_tables"],
+        case["seq_lens"],
+        case["max_seq_len"],
+        qk_nope_head_dim=128,
+        kv_lora_rank=LATENT,
+        qk_rope_head_dim=QK_DIM - LATENT,
+        sparse_mla_top_k=0,
+        out=_nan_out(case),
+        bmm1_scale=case["bmm1_scale"],
+        bmm2_scale=case["bmm2_scale"],
+        sinks=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_pdl=None,
+        uses_shared_paged_kv_idx=True,
+        lse=None,
+        return_lse=False,
+        cum_seq_lens_q=None,
+        max_q_len=None,
+        multi_ctas_kv_counter_buffer=None,
+        sparse_mla_top_k_lens=None,
+        enable_dcp=False,
+        stateless=True,
+    )
+    torch.cuda.synchronize()
+    for label, output in (("second", second), ("third", third)):
+        assert torch.equal(output, first), label
+    assert torch.equal(first, explicit)
+    assert torch.equal(first, stateless)
+    _assert_live_and_padded(first, case, f"{geometry} memoized")
+
+
+@pytest.mark.parametrize("cake_wins", [True, False])
+def test_tuned_auto_looks_up_the_second_stage_once(monkeypatch, fresh_tuner, cake_wins):
+    """After tuning, repeated calls of one request look up the second stage
+    once and then reuse its decision: Cake where it measured faster, equal to
+    explicit ``backend="cake"`` bit for bit, and the first stage's winner
+    otherwise."""
+    _require_cake_arch()
+    case = _make_case(batch_size=4, page_size=64)
+    _offer_case(monkeypatch, case)
+    monkeypatch.setattr(
+        core.AutoTuner,
+        "_profile_single_kernel",
+        _profile_times(
+            {
+                "_BatchMLAPagedAttentionTrtllmGenBackend": 3.0,
+                core._CAKE_MLA_RUNNER: 1.0 if cake_wins else 9.0,
+            }
+        ),
+    )
+    with autotune(True, tuning_buckets=TUNING_BUCKETS):
+        _decode(case)
+    lookups = _count_margin_lookups(monkeypatch)
+    results = _spy_stage_two(monkeypatch)
+    with autotune(False):
+        outputs = [_decode(dict(case, out=_nan_out(case))) for _ in range(3)]
+    torch.cuda.synchronize()
+    assert lookups[0] == 1
+    names = [_name(runner) for runner, _ in results]
+    if cake_wins:
+        assert names == ["cake"] * 3
+        explicit = _explicit_cake(case, case["seq_lens"], case["block_tables"])
+        torch.cuda.synchronize()
+        for output in outputs:
+            assert torch.equal(output, explicit)
+    else:
+        assert names == [names[0]] * 3 and names[0] != "cake"
+    for output in outputs:
+        _assert_matches_reference(output, case, f"memoized {names[0]}")
+
+
+def test_unoffered_calls_build_no_cake_runner(monkeypatch, clean_tuner):
+    """With Cake entries held, an untuned call whose batch is outside every
+    listed range, or whose unit is not listed, makes the first selection only:
+    no Cake eligibility check, no second stage, no Cake runner."""
+    _require_cake_arch()
+    case = _make_case(batch_size=4)
+    _offer_case(monkeypatch, case)
+    monkeypatch.setattr(
+        core.AutoTuner, "may_select_runner_class", lambda self, name: True
+    )
+    built, reasons = [], []
+    original_init = core._CakeTrtllmMlaBlackwellRunner.__init__
+    original_reason = core._cake_mla_auto_candidate_reason
+
+    def init(self, **kwargs):
+        built.append(self)
+        original_init(self, **kwargs)
+
+    def reason(**kwargs):
+        reasons.append(kwargs)
+        return original_reason(**kwargs)
+
+    monkeypatch.setattr(core._CakeTrtllmMlaBlackwellRunner, "__init__", init)
+    monkeypatch.setattr(core, "_cake_mla_auto_candidate_reason", reason)
+    results = _spy_stage_two(monkeypatch)
+    calls = _spy_choose_one(monkeypatch)
+    beyond = _make_case(batch_size=_bucket_range(4)[1] + 1)
+    with autotune(False):
+        output = _decode(beyond)
+    assert not built and not reasons and not results
+    assert [op for op, _, _ in calls] == [core._MLA_DECODE_OP]
+    _assert_matches_reference(output, beyond, "outside the listed batches")
+
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {})
+    with autotune(False):
+        output = _decode(case)
+    assert not built and not reasons and not results
+    _assert_matches_reference(output, case, "unlisted unit")
+
+    # The listed batch joins the second stage (a lookup; nothing is tuned).
+    _offer_case(monkeypatch, case)
+    with autotune(False):
+        _decode(case)
+    assert reasons and results
