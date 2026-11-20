@@ -1,10 +1,11 @@
-"""Per-token NVFP4 MoE: reject a GEMM1 K that is not 256-aligned (#9333).
+"""NVFP4 MoE: reject a GEMM1 K that is not 256-aligned (#9333).
 
-With ``per_token_scale`` the trtllm-gen FP4 MoE ran on a ``hidden_size`` that
-is 128- but not 256-aligned (Nemotron Nano's 2688) and silently returned wrong
-output, NaN included.  Both public entry points now reject that shape before
-any device work.  The compiled module is replaced by a recorder, so these tests
-only check which calls reach it and run on CPU.
+With NVFP4 activations the trtllm-gen FP4 MoE ran on a ``hidden_size`` that is
+128- but not 256-aligned (Nemotron Nano's 2688) and silently returned wrong
+output, NaN included, with static and per-token scales alike.  Both public
+entry points now reject that shape before any device work.  The compiled module
+is replaced by a recorder, so these tests only check which calls reach it and
+run on CPU.
 """
 
 import pytest
@@ -38,11 +39,13 @@ def module(monkeypatch):
     return recorder
 
 
-def _common_args(hidden_size, per_token, nvfp4=True):
-    if nvfp4:
+def _common_args(hidden_size, per_token, act="nvfp4"):
+    # NVFP4 uses one scale per 16 elements, MxFP4 one per 32.
+    sf_vec = 32 if act == "mxfp4" else 16
+    if act in ("nvfp4", "mxfp4"):
         hidden_states = torch.zeros(NUM_TOKENS, hidden_size // 2, dtype=torch.uint8)
         hidden_states_scale = torch.zeros(
-            NUM_TOKENS, hidden_size // 16, dtype=torch.uint8
+            NUM_TOKENS, hidden_size // sf_vec, dtype=torch.uint8
         )
     else:
         hidden_states = torch.zeros(NUM_TOKENS, hidden_size, dtype=torch.bfloat16)
@@ -51,13 +54,13 @@ def _common_args(hidden_size, per_token, nvfp4=True):
         NUM_EXPERTS, 2 * INTERMEDIATE_SIZE, hidden_size // 2, dtype=torch.uint8
     )
     w1_scale = torch.zeros(
-        NUM_EXPERTS, 2 * INTERMEDIATE_SIZE, hidden_size // 16, dtype=torch.uint8
+        NUM_EXPERTS, 2 * INTERMEDIATE_SIZE, hidden_size // sf_vec, dtype=torch.uint8
     )
     w2 = torch.zeros(
         NUM_EXPERTS, hidden_size, INTERMEDIATE_SIZE // 2, dtype=torch.uint8
     )
     w2_scale = torch.zeros(
-        NUM_EXPERTS, hidden_size, INTERMEDIATE_SIZE // 16, dtype=torch.uint8
+        NUM_EXPERTS, hidden_size, INTERMEDIATE_SIZE // sf_vec, dtype=torch.uint8
     )
     scalar = torch.ones(NUM_EXPERTS, dtype=torch.float32)
     return dict(
@@ -90,8 +93,8 @@ def _common_args(hidden_size, per_token, nvfp4=True):
     )
 
 
-def _call(entry, hidden_size, per_token, nvfp4=True):
-    kwargs = _common_args(hidden_size, per_token, nvfp4)
+def _call(entry, hidden_size, per_token, act="nvfp4"):
+    kwargs = _common_args(hidden_size, per_token, act)
     if entry == "routed":
         topk_ids = torch.zeros(NUM_TOKENS, TOP_K, dtype=torch.int32)
         topk_weights = torch.ones(NUM_TOKENS, TOP_K, dtype=torch.bfloat16)
@@ -104,35 +107,37 @@ ENTRIES = ["routed", "logits"]
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("per_token", [True, False], ids=["per_token", "static"])
 @pytest.mark.parametrize("hidden_size", [2688, 1152, 384])
-def test_per_token_rejects_hidden_not_256_aligned(module, entry, hidden_size):
+def test_nvfp4_rejects_hidden_not_256_aligned(module, entry, per_token, hidden_size):
     with pytest.raises(ValueError, match="multiple of 256") as excinfo:
-        _call(entry, hidden_size, per_token=True)
+        _call(entry, hidden_size, per_token=per_token)
     assert str(hidden_size) in str(excinfo.value)
     assert "valid_hidden_size" in str(excinfo.value)
     assert module.calls == 0
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
+@pytest.mark.parametrize("per_token", [True, False], ids=["per_token", "static"])
 @pytest.mark.parametrize("hidden_size", [2816, 3072, 4096])
-def test_per_token_accepts_256_aligned_hidden(module, entry, hidden_size):
-    _call(entry, hidden_size, per_token=True)
+def test_nvfp4_accepts_256_aligned_hidden(module, entry, per_token, hidden_size):
+    _call(entry, hidden_size, per_token=per_token)
     assert module.calls == 1
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
-def test_without_per_token_scale_is_unchanged(module, entry):
-    # Only the per-token path is known to miscompute at 2688; the other FP4
-    # paths keep their current behaviour.
-    _call(entry, 2688, per_token=False)
+def test_mxfp4_hidden_states_are_not_checked_here(module, entry):
+    # MxFP4 activations share the uint8 packing but are not the NVFP4 path
+    # reported in #9333; the launcher's dtype deduction tells them apart.
+    _call(entry, 2688, per_token=False, act="mxfp4")
     assert module.calls == 1
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
-def test_non_nvfp4_hidden_states_are_not_checked_here(module, entry):
+def test_non_fp4_hidden_states_are_not_checked_here(module, entry):
     # per_token_scale with non-NVFP4 activations is rejected by the launcher
     # with its own message; this guard only covers the packed FP4 width.
-    _call(entry, 2688, per_token=True, nvfp4=False)
+    _call(entry, 2688, per_token=True, act="bf16")
     assert module.calls == 1
 
 

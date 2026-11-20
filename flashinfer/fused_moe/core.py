@@ -5146,33 +5146,41 @@ def _validate_routing_replay_out(
         raise ValueError("routing_replay_out must be contiguous (packed row-major)")
 
 
-# GEMM1 K alignment the per-token NVFP4 kernels need; see pad_trtllm_moe_weights.
-_TRTLLM_FP4_PER_TOKEN_HIDDEN_ALIGNMENT = 256
+# GEMM1 K alignment the NVFP4 kernels need; see pad_trtllm_moe_weights.
+_TRTLLM_FP4_NVFP4_HIDDEN_ALIGNMENT = 256
 
 
-def _validate_fp4_per_token_hidden_size(
-    per_token_scale: Optional[torch.Tensor],
+def _validate_fp4_nvfp4_hidden_size(
     hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
 ) -> None:
-    """Reject a per-token NVFP4 GEMM1 K that is not a multiple of 256.
+    """Reject an NVFP4 GEMM1 K that is not a multiple of 256.
 
-    With ``per_token_scale`` the trtllm-gen FP4 MoE accepts a ``hidden_size``
+    With NVFP4 activations the trtllm-gen FP4 MoE accepts a ``hidden_size``
     that is 128- but not 256-aligned (e.g. Nemotron Nano's 2688) and silently
-    returns wrong output, NaN included (#9333).  ``hidden_size`` here is what
-    the kernel sees, i.e. the padded width; a caller with such a model pads to
-    a multiple of 256 (:func:`pad_trtllm_moe_weights` plus zero-padded
-    activations) and passes the real width as ``valid_hidden_size``.
+    returns wrong output, NaN included, with static and per-token scales alike
+    (#9333).  ``hidden_size`` here is what the kernel sees, i.e. the padded
+    width; a caller with such a model pads to a multiple of 256
+    (:func:`pad_trtllm_moe_weights` plus zero-padded activations) and passes the
+    real width as ``valid_hidden_size``.  Other activations (BF16, MxFP8,
+    MxFP4) are not checked here.
     """
-    if per_token_scale is None or hidden_states.dtype != torch.uint8:
+    if hidden_states.dtype != torch.uint8 or hidden_states_scale is None:
+        return
+    # Same deduction the launcher uses to pick the activation type.
+    if (
+        deduce_trtllm_gen_tensor_dtype(hidden_states, hidden_states_scale)
+        != DtypeTrtllmGen.E2m1
+    ):
         return
     hidden_size = hidden_states.shape[-1] * 2  # packed FP4: two elements per byte
-    if hidden_size % _TRTLLM_FP4_PER_TOKEN_HIDDEN_ALIGNMENT:
+    if hidden_size % _TRTLLM_FP4_NVFP4_HIDDEN_ALIGNMENT:
         raise ValueError(
-            "per_token_scale with NVFP4 hidden_states requires hidden_size to be a "
-            f"multiple of {_TRTLLM_FP4_PER_TOKEN_HIDDEN_ALIGNMENT}, got {hidden_size}; "
-            "otherwise the kernel returns wrong results without an error. Pad the "
-            "weights (pad_trtllm_moe_weights) and activations to a multiple of "
-            f"{_TRTLLM_FP4_PER_TOKEN_HIDDEN_ALIGNMENT} and pass the real width as "
+            "NVFP4 hidden_states require hidden_size to be a multiple of "
+            f"{_TRTLLM_FP4_NVFP4_HIDDEN_ALIGNMENT}, got {hidden_size}; otherwise the "
+            "kernel returns wrong results without an error. Pad the weights "
+            "(pad_trtllm_moe_weights) and activations to a multiple of "
+            f"{_TRTLLM_FP4_NVFP4_HIDDEN_ALIGNMENT} and pass the real width as "
             "valid_hidden_size."
         )
 
@@ -7237,7 +7245,7 @@ def trtllm_fp4_block_scale_moe(
     nvfp4_4over6_code_value = _trtllm_fp4_nvfp4_4over6_code(
         nvfp4_4over6, per_token_scale, hidden_states
     )
-    _validate_fp4_per_token_hidden_size(per_token_scale, hidden_states)
+    _validate_fp4_nvfp4_hidden_size(hidden_states, hidden_states_scale)
     _nfse = _validate_fused_shared_experts(
         num_fused_shared_experts,
         local_expert_offset,
@@ -7551,7 +7559,7 @@ def trtllm_fp4_block_scale_routed_moe(
     nvfp4_4over6_code_value = _trtllm_fp4_nvfp4_4over6_code(
         nvfp4_4over6, per_token_scale, hidden_states
     )
-    _validate_fp4_per_token_hidden_size(per_token_scale, hidden_states)
+    _validate_fp4_nvfp4_hidden_size(hidden_states, hidden_states_scale)
     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
 
     _nfse = _validate_fused_shared_experts(
