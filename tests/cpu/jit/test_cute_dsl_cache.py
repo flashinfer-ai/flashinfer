@@ -569,6 +569,16 @@ def test_cache_read_discards_a_replaced_generation(cute_dsl_cache, monkeypatch):
     assert first.try_load() is None
     assert not first.is_compiled and replacement.is_compiled
 
+    def deny_read(*args, **kwargs):
+        raise PermissionError("cache read denied")
+
+    with monkeypatch.context() as denied:
+        denied.setattr(Path, "open", deny_read)
+        assert not replacement.is_compiled
+    monkeypatch.setattr(replacement, "_load_from_disk", deny_read)
+    with pytest.raises(PermissionError, match="cache read denied"):
+        replacement.load()
+
 
 @pytest.mark.cpu_only
 def test_same_kernel_lock_is_held_until_publication(cute_dsl_cache, monkeypatch):
