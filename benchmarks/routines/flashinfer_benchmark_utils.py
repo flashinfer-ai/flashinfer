@@ -162,6 +162,8 @@ output_column_dict = {
         "conv_tokens_per_sequence",
         "conv_seq_lens",
         "conv_bias",
+        "conv_width",
+        "conv_activation",
         "conv_speculative",
         "conv_initial_state",
         "conv_layout",

@@ -24,6 +24,11 @@ def _require_blackwell():
     torch.manual_seed(7967)
 
 
+# The Triton reference implements widths up to four; wider taps are checked
+# against the FP64 reference only.
+_TRITON_MAX_WIDTH = 4
+
+
 def _state(slots, channels, history, layout, padding=0):
     padding = 16 if layout == "padded" else padding
     stride = channels * history + padding
@@ -51,7 +56,10 @@ def _reference(
     initial=None,
     accepted=None,
     bias=None,
+    activation="silu",
 ):
+    width = w.shape[1]
+    depth = width - 1
     raw, weights, pool = x.cpu(), w.cpu().double(), state.cpu().clone()
     result = torch.zeros_like(raw)
     b = (
@@ -66,17 +74,19 @@ def _reference(
             start = stop
             continue
         offset = 0 if accepted is None else accepted[i] - 1
-        history = pool[slot, :, offset : offset + 3].clone()
+        history = pool[slot, :, offset : offset + depth].clone()
         if prefill and (initial is None or not initial[i]):
             history.zero_()
         extended = torch.cat((history, raw[start:stop].T), dim=1)
         for t in range(length):
-            value = (extended[:, t : t + 4].double() * weights).sum(1) + b
-            result[start + t] = F.silu(value).bfloat16()
+            value = (extended[:, t : t + width].double() * weights).sum(1) + b
+            if activation == "silu":
+                value = F.silu(value)
+            result[start + t] = value.bfloat16()
         if accepted is None:
-            pool[slot, :, :3] = extended[:, -3:]
+            pool[slot, :, :depth] = extended[:, -depth:]
         else:
-            pool[slot, :, : length + 2] = extended[:, 1:]
+            pool[slot, :, : length + depth - 1] = extended[:, 1:]
         start = stop
     return result.to(x.device), pool.to(state.device)
 
@@ -89,6 +99,9 @@ def _assert_result(out, state, expected):
 
 
 @pytest.mark.parametrize(
+    "width,activation", [(4, "silu"), (3, None), (7, None), (7, "silu")]
+)
+@pytest.mark.parametrize(
     "layout,channels,weight_dtype,bias_dtype,offset",
     [
         ("sd", 129, torch.float32, None, 0),
@@ -99,46 +112,67 @@ def _assert_result(out, state, expected):
         ("ds", 129, torch.bfloat16, None, 1),
     ],
 )
-def test_prefill_matches_references(layout, channels, weight_dtype, bias_dtype, offset):
+def test_prefill_matches_references(
+    layout, channels, weight_dtype, bias_dtype, offset, width, activation
+):
     lengths = [1, 2, 3, 17, 1024 if channels == 4096 else 35]
     slot_ids, initial = [0, 3, 1, 5, 4], [True, False, True, False, True]
     if layout == "padded":
         initial = [False] * len(lengths)
     x = torch.randn(sum(lengths), channels, device="cuda", dtype=torch.bfloat16) * 0.2
-    w = torch.randn(channels * 4 + offset, device="cuda", dtype=weight_dtype)[
+    w = torch.randn(channels * width + offset, device="cuda", dtype=weight_dtype)[
         offset:
-    ].view(channels, 4)
+    ].view(channels, width)
     w.mul_(0.2)
     bias = (
         None
         if bias_dtype is None
         else torch.randn(channels, device="cuda", dtype=bias_dtype) * 0.1
     )
-    state = _state(7, channels, 3, layout)
+    state = _state(7, channels, width - 1, layout)
     reference_state = state.clone()
     expected = _reference(
-        x, w, state, lengths, slot_ids, prefill=True, initial=initial, bias=bias
+        x,
+        w,
+        state,
+        lengths,
+        slot_ids,
+        prefill=True,
+        initial=initial,
+        bias=bias,
+        activation=activation,
     )
     slots = torch.tensor(slot_ids, device="cuda", dtype=torch.int32)
     mask, offsets = torch.tensor(initial, device="cuda"), _offsets(lengths)
-    reference = triton_prefill(
-        x.T,
-        w,
-        bias,
-        reference_state,
-        offsets,
-        lengths,
-        cache_indices=slots,
-        has_initial_state=mask,
-        activation="silu",
-    )
     out = causal_conv1d_fn(
-        x, w, state, offsets, slots, None if layout == "padded" else mask, bias=bias
+        x,
+        w,
+        state,
+        offsets,
+        slots,
+        None if layout == "padded" else mask,
+        bias=bias,
+        activation=activation,
     )
     _assert_result(out, state, expected)
-    _assert_result(reference.T, reference_state, expected)
+    if width <= _TRITON_MAX_WIDTH:
+        reference = triton_prefill(
+            x.T,
+            w,
+            bias,
+            reference_state,
+            offsets,
+            lengths,
+            cache_indices=slots,
+            has_initial_state=mask,
+            activation=activation,
+        )
+        _assert_result(reference.T, reference_state, expected)
 
 
+@pytest.mark.parametrize(
+    "width,activation", [(4, "silu"), (3, None), (7, None), (7, "silu")]
+)
 @pytest.mark.parametrize("layout", ["sd", "ds"])
 @pytest.mark.parametrize(
     "tokens,speculative,channels",
@@ -153,12 +187,14 @@ def test_prefill_matches_references(layout, channels, weight_dtype, bias_dtype, 
         (17, True, 129),
     ],
 )
-def test_update_matches_references(layout, tokens, speculative, channels):
+def test_update_matches_references(
+    layout, tokens, speculative, channels, width, activation
+):
     x = torch.randn(4, tokens, channels, device="cuda", dtype=torch.bfloat16) * 0.2
     weight_dtype = torch.bfloat16 if speculative and tokens == 5 else torch.float32
-    w = torch.randn(channels, 4, device="cuda", dtype=weight_dtype) * 0.2
+    w = torch.randn(channels, width, device="cuda", dtype=weight_dtype) * 0.2
     bias = None if channels == 4096 else torch.randn(channels, device="cuda") * 0.1
-    state = _state(6, channels, tokens + 2, layout)
+    state = _state(6, channels, tokens + width - 2, layout)
     reference_state = state.clone()
     slot_ids = [3, 0, 4, 1]
     slots = torch.tensor(slot_ids, device="cuda", dtype=torch.int32)
@@ -177,15 +213,7 @@ def test_update_matches_references(layout, tokens, speculative, channels):
             slot_ids,
             accepted=counts if speculative else None,
             bias=bias,
-        )
-        reference = triton_update(
-            x.transpose(1, 2),
-            reference_state,
-            w,
-            bias=bias,
-            activation="silu",
-            conv_state_indices=slots,
-            num_accepted_tokens=accepted,
+            activation=activation,
         )
         out = causal_conv1d_update(
             x.flatten(0, 1),
@@ -195,18 +223,30 @@ def test_update_matches_references(layout, tokens, speculative, channels):
             cu_seqlens=offsets,
             num_accepted_tokens=accepted,
             bias=bias,
+            activation=activation,
         )
         _assert_result(out, state, expected)
-        _assert_result(
-            reference.transpose(1, 2).flatten(0, 1), reference_state, expected
-        )
+        if width <= _TRITON_MAX_WIDTH:
+            reference = triton_update(
+                x.transpose(1, 2),
+                reference_state,
+                w,
+                bias=bias,
+                activation=activation,
+                conv_state_indices=slots,
+                num_accepted_tokens=accepted,
+            )
+            _assert_result(
+                reference.transpose(1, 2).flatten(0, 1), reference_state, expected
+            )
 
 
-def test_prefill_chunking_and_decode_are_identical():
+@pytest.mark.parametrize("width", [3, 4, 7])
+def test_prefill_chunking_and_decode_are_identical(width):
     x = torch.randn(43, 65, device="cuda", dtype=torch.bfloat16) * 0.1
     x[0, 0], x[-1, 0] = -0.0, -0.0
-    w = torch.randn(65, 4, device="cuda") * 0.1
-    full = _state(2, 65, 3, "padded")
+    w = torch.randn(65, width, device="cuda") * 0.1
+    full = _state(2, 65, width - 1, "padded")
     split, decode = full.clone(), full.clone()
     slots = torch.tensor([0], device="cuda", dtype=torch.int32)
     mask = torch.ones(1, device="cuda", dtype=torch.bool)
@@ -227,6 +267,7 @@ def test_prefill_chunking_and_decode_are_identical():
         )
 
 
+@pytest.mark.parametrize("width", [3, 4, 7])
 @pytest.mark.parametrize(
     "kind,n,channels,layout,padding,strided",
     [
@@ -243,7 +284,9 @@ def test_prefill_chunking_and_decode_are_identical():
         ("decode", 3, 129, "sd", 0, True),
     ],
 )
-def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, strided):
+def test_graph_replay_updates_live_state(
+    kind, n, channels, layout, padding, strided, width
+):
     prefill, speculative = kind == "prefill", kind == "spec"
     if n == 1:
         lengths = [40]
@@ -254,7 +297,7 @@ def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, str
     else:
         lengths = [1, 0, 16]
     rows = sum(lengths)
-    history = 18 if speculative else 7 if prefill else 3
+    history = 14 + width if speculative else 7 if prefill else width - 1
     backing = (
         torch.randn(
             rows, channels + (23 if strided else 0), device="cuda", dtype=torch.bfloat16
@@ -269,7 +312,7 @@ def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, str
         dtype=torch.bfloat16,
     )
     out = target[:, :channels]
-    w = torch.randn(channels, 4, device="cuda") * 0.1
+    w = torch.randn(channels, width, device="cuda") * 0.1
     state = _state(n + 3, channels, history, layout, padding)
     offsets, slots = (
         _offsets(lengths),
@@ -385,9 +428,14 @@ def test_graph_replay_updates_live_state(kind, n, channels, layout, padding, str
         ("ds", 129, 7, 11),
     ],
 )
-def test_speculative_overflow_preserves_state_bounds(layout, channels, history, tokens):
+@pytest.mark.parametrize("width", [3, 4, 7])
+def test_speculative_overflow_preserves_state_bounds(
+    layout, channels, history, tokens, width
+):
+    history += width - 4
+    capacity = history - (width - 2)
     x = torch.randn(tokens, channels, device="cuda", dtype=torch.bfloat16) * 0.1
-    w = torch.randn(channels, 4, device="cuda") * 0.1
+    w = torch.randn(channels, width, device="cuda") * 0.1
     state = _state(3, channels, history, layout, padding=16)
     slots = torch.tensor([1], device="cuda", dtype=torch.int32)
     accepted = torch.ones(1, device="cuda", dtype=torch.int32)
@@ -411,15 +459,15 @@ def test_speculative_overflow_preserves_state_bounds(layout, channels, history, 
         run()
     for length, count in (
         (tokens, 1),
-        (history - 2, history - 2),
-        (tokens, history - 1),
+        (capacity, capacity),
+        (tokens, capacity + 1),
     ):
         original = state.clone()
         expected_state = original.clone()
         expected_out = torch.full_like(x, -11)
-        if count <= history - 2:
+        if count <= capacity:
             extended = torch.zeros(
-                3, channels, tokens + 2, device="cuda", dtype=torch.bfloat16
+                3, channels, tokens + width - 2, device="cuda", dtype=torch.bfloat16
             )
             extended[:, :, :history] = original
             expected = _reference(
@@ -463,3 +511,17 @@ def test_empty_calls_output_lifetime_and_aliasing():
     offsets = _offsets([1, 1])
     with pytest.raises(ValueError, match="share storage"):
         causal_conv1d_fn(x, w, state, offsets, slots, workspace=offsets)
+
+
+def test_rejects_unsupported_width_activation_and_history():
+    x = torch.randn(2, 32, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="width in"):
+        causal_conv1d_update(
+            x, torch.randn(32, 5, device="cuda"), _state(2, 32, 4, "sd"), slots
+        )
+    w = torch.randn(32, 7, device="cuda")
+    with pytest.raises(ValueError, match="history >= 6"):
+        causal_conv1d_update(x, w, _state(2, 32, 5, "sd"), slots)
+    with pytest.raises(ValueError, match="activation"):
+        causal_conv1d_update(x, w, _state(2, 32, 6, "sd"), slots, activation="relu")

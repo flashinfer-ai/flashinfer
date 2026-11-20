@@ -34,12 +34,14 @@ def _fma(a, b, c, *, loc=None, ip=None):
 
 
 @cute.jit
-def _step(h0, h1, h2, current, w0, w1, w2, w3, bias):
-    value = _fma(h0, w0, bias)
-    value = _fma(h1, w1, value)
-    value = _fma(h2, w2, value)
-    value = _fma(current, w3, value)
-    return value / (cutlass.Float32(1.0) + cute.exp(-value, fastmath=True))
+def _step(history, current, taps, bias, silu: cutlass.Constexpr):
+    value = bias
+    for i in cutlass.range_constexpr(len(history)):
+        value = _fma(history[i], taps[i], value)
+    value = _fma(current, taps[len(history)], value)
+    if cutlass.const_expr(silu):
+        value = value / (cutlass.Float32(1.0) + cute.exp(-value, fastmath=True))
+    return value
 
 
 @cute.jit
@@ -51,32 +53,28 @@ def _token_loop(
     channel,
     start,
     stop,
-    h0,
-    h1,
-    h2,
-    w0,
-    w1,
-    w2,
-    w3,
+    history,
+    taps,
     bias,
     speculative: cutlass.Constexpr,
+    silu: cutlass.Constexpr,
 ):
+    depth = len(history)
     if cutlass.const_expr(speculative):
-        state[slot, channel, 0] = h1.to(cutlass.BFloat16)
-        state[slot, channel, 1] = h2.to(cutlass.BFloat16)
+        for i in cutlass.range_constexpr(depth - 1):
+            state[slot, channel, i] = history[i + 1].to(cutlass.BFloat16)
     for token in cutlass.range(start, stop):
         current = x[token, channel].to(cutlass.Float32)
-        value = _step(h0, h1, h2, current, w0, w1, w2, w3, bias)
+        value = _step(history, current, taps, bias, silu)
         out[token, channel] = value.to(cutlass.BFloat16)
-        h0, h1, h2 = h1, h2, current
+        history = history[1:] + (current,)
         if cutlass.const_expr(speculative):
-            position = token - start + 2
+            position = token - start + depth - 1
             if position < state.shape[2]:
                 state[slot, channel, position] = x[token, channel]
     if cutlass.const_expr(not speculative):
-        state[slot, channel, 0] = h0.to(cutlass.BFloat16)
-        state[slot, channel, 1] = h1.to(cutlass.BFloat16)
-        state[slot, channel, 2] = h2.to(cutlass.BFloat16)
+        for i in cutlass.range_constexpr(depth):
+            state[slot, channel, i] = history[i].to(cutlass.BFloat16)
 
 
 @cute.jit
@@ -88,13 +86,8 @@ def _token_tile(
     channel,
     start,
     stop,
-    h0,
-    h1,
-    h2,
-    w0,
-    w1,
-    w2,
-    w3,
+    history,
+    taps,
     bias,
     tile: cutlass.Constexpr,
     speculative: cutlass.Constexpr,
@@ -102,9 +95,11 @@ def _token_tile(
     state_tile,
     vector_state: cutlass.Constexpr,
     defer_state: cutlass.Constexpr,
+    silu: cutlass.Constexpr,
 ):
+    depth = len(history)
     if cutlass.const_expr(defer_state):
-        prior1, prior2 = h1.to(cutlass.BFloat16), h2.to(cutlass.BFloat16)
+        prior = tuple(value.to(cutlass.BFloat16) for value in history[1:])
     inputs = cute.make_rmem_tensor((tile,), cutlass.BFloat16)
     for i in cutlass.range_constexpr(tile):
         if cutlass.const_expr(full):
@@ -116,23 +111,23 @@ def _token_tile(
     for i in cutlass.range_constexpr(tile):
         if full or start + i < stop:
             current = inputs[i].to(cutlass.Float32)
-            value = _step(h0, h1, h2, current, w0, w1, w2, w3, bias)
+            value = _step(history, current, taps, bias, silu)
             out[start + i, channel] = value.to(cutlass.BFloat16)
-            h0, h1, h2 = h1, h2, current
+            history = history[1:] + (current,)
             if cutlass.const_expr(speculative):
                 if cutlass.const_expr(vector_state):
                     tid, _, _ = cute.arch.thread_idx()
-                    state_tile[i + 2, tid] = inputs[i]
+                    state_tile[i + depth - 1, tid] = inputs[i]
                 elif cutlass.const_expr(not defer_state):
-                    state[slot, channel, i + 2] = inputs[i]
+                    state[slot, channel, i + depth - 1] = inputs[i]
     if cutlass.const_expr(defer_state):
         for i in cutlass.range_constexpr(tile):
             if start + i < stop:
-                state[slot, channel, i + 2] = inputs[i]
-        state[slot, channel, 0] = prior1
-        state[slot, channel, 1] = prior2
+                state[slot, channel, i + depth - 1] = inputs[i]
+        for i in cutlass.range_constexpr(depth - 1):
+            state[slot, channel, i] = prior[i]
 
-    return h0, h1, h2
+    return history
 
 
 @cute.jit
@@ -144,14 +139,16 @@ def _store_state_tile(
     length,
     max_tokens: cutlass.Constexpr,
     block_c: cutlass.Constexpr,
+    depth: cutlass.Constexpr,
 ):
     tid, _, _ = cute.arch.thread_idx()
     cute.arch.sync_threads()
-    for i in cutlass.range_constexpr((max_tokens + 9) // 8):
+    rows = max_tokens + depth - 1
+    for i in cutlass.range_constexpr((rows + 7) // 8):
         offset = (i * block_c + tid) * 8
         row = offset // block_c
         column = offset % block_c
-        if row < cute.min(length + 2, cutlass.Int64(max_tokens + 2)):
+        if row < cute.min(length + depth - 1, cutlass.Int64(rows)):
             values = cute.make_rmem_tensor((8,), cutlass.BFloat16)
             source = cute.make_tensor(
                 state_tile.iterator + offset, cute.make_layout((8,))
@@ -282,14 +279,17 @@ def _conv(
     defer_state: cutlass.Constexpr,
     warp_metadata: cutlass.Constexpr,
     single_sequence: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+    silu: cutlass.Constexpr,
 ):
+    depth = width - 1
     task, channel_tile, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
     channel = cutlass.Int64(channel_tile) * block_c + tid
     if cutlass.const_expr(vector_state):
         state_tile = utils.SmemAllocator().allocate_tensor(
             cutlass.BFloat16,
-            cute.make_layout((max_tokens + 2, block_c), stride=(block_c, 1)),
+            cute.make_layout((max_tokens + depth - 1, block_c), stride=(block_c, 1)),
             byte_alignment=16,
         )
     else:
@@ -346,63 +346,67 @@ def _conv(
         history_offset = cutlass.Int64(0)
         live = slot != -1
         if cutlass.const_expr(speculative):
-            live = live and count > 0 and count <= state.shape[2] - 2
+            live = live and count > 0 and count <= state.shape[2] - (depth - 1)
             history_offset = cutlass.Int64(count) - 1
         if start < stop:
             if live:
-                h0 = cutlass.Float32(0.0)
-                h1 = cutlass.Float32(0.0)
-                h2 = cutlass.Float32(0.0)
+                history = tuple(cutlass.Float32(0.0) for _ in range(depth))
                 if cutlass.const_expr(prefill):
                     if chunk > 0:
-                        h0 = x[start - 3, channel].to(cutlass.Float32)
-                        h1 = x[start - 2, channel].to(cutlass.Float32)
-                        h2 = x[start - 1, channel].to(cutlass.Float32)
+                        history = tuple(
+                            x[start - depth + i, channel].to(cutlass.Float32)
+                            for i in range(depth)
+                        )
                     elif cutlass.const_expr(has_initial):
                         if initial[seq] != 0:
-                            h0 = state[slot, channel, 0].to(cutlass.Float32)
-                            h1 = state[slot, channel, 1].to(cutlass.Float32)
-                            h2 = state[slot, channel, 2].to(cutlass.Float32)
+                            history = tuple(
+                                state[slot, channel, i].to(cutlass.Float32)
+                                for i in range(depth)
+                            )
                 else:
-                    h0 = state[slot, channel, history_offset].to(cutlass.Float32)
-                    h1 = state[slot, channel, history_offset + 1].to(cutlass.Float32)
-                    h2 = state[slot, channel, history_offset + 2].to(cutlass.Float32)
+                    history = tuple(
+                        state[slot, channel, history_offset + i].to(cutlass.Float32)
+                        for i in range(depth)
+                    )
 
                 if cutlass.const_expr(prefill):
                     if chunk == 0:
+                        # Final history = last `depth` values of [history | x[begin:end]].
                         length = end - begin
-                        tail0, tail1 = h1, h2
-                        if length >= 3:
-                            tail0 = x[end - 3, channel].to(cutlass.Float32)
-                            tail1 = x[end - 2, channel].to(cutlass.Float32)
-                        elif length == 2:
-                            tail0 = h2
-                            tail1 = x[begin, channel].to(cutlass.Float32)
-                        state[slot, channel, 0] = tail0.to(cutlass.BFloat16)
-                        state[slot, channel, 1] = tail1.to(cutlass.BFloat16)
-                        state[slot, channel, 2] = x[end - 1, channel]
+                        for i in cutlass.range_constexpr(depth - 1):
+                            tail = history[depth - 1]
+                            for j in cutlass.range_constexpr(1, depth - 1 - i):
+                                if length == j:
+                                    tail = history[i + j]
+                            if length >= depth - i:
+                                tail = x[end - depth + i, channel].to(cutlass.Float32)
+                            state[slot, channel, i] = tail.to(cutlass.BFloat16)
+                        state[slot, channel, depth - 1] = x[end - 1, channel]
                 elif cutlass.const_expr(speculative and max_tokens > 0):
-                    if cutlass.const_expr(vector_state):
-                        state_tile[0, tid] = h1.to(cutlass.BFloat16)
-                        state_tile[1, tid] = h2.to(cutlass.BFloat16)
-                    elif cutlass.const_expr(not defer_state):
-                        state[slot, channel, 0] = h1.to(cutlass.BFloat16)
-                        state[slot, channel, 1] = h2.to(cutlass.BFloat16)
-                taps = cute.make_rmem_tensor((4,), weight.element_type)
-                source = cute.make_tensor(
-                    weight.iterator + cute.assume(channel * 4, divby=4),
-                    cute.make_layout((4,)),
-                )
-                cute.autovec_copy(source, taps)
-                w0 = taps[0].to(cutlass.Float32)
-                w1 = taps[1].to(cutlass.Float32)
-                w2 = taps[2].to(cutlass.Float32)
-                w3 = taps[3].to(cutlass.Float32)
+                    for i in cutlass.range_constexpr(depth - 1):
+                        if cutlass.const_expr(vector_state):
+                            state_tile[i, tid] = history[i + 1].to(cutlass.BFloat16)
+                        elif cutlass.const_expr(not defer_state):
+                            state[slot, channel, i] = history[i + 1].to(
+                                cutlass.BFloat16
+                            )
+                if cutlass.const_expr(width == 4):
+                    packed_taps = cute.make_rmem_tensor((4,), weight.element_type)
+                    source = cute.make_tensor(
+                        weight.iterator + cute.assume(channel * 4, divby=4),
+                        cute.make_layout((4,)),
+                    )
+                    cute.autovec_copy(source, packed_taps)
+                    taps = tuple(packed_taps[i].to(cutlass.Float32) for i in range(4))
+                else:
+                    taps = tuple(
+                        weight[channel, i].to(cutlass.Float32) for i in range(width)
+                    )
                 b = cutlass.Float32(0.0)
                 if cutlass.const_expr(has_bias):
                     b = bias[channel].to(cutlass.Float32)
                 if cutlass.const_expr(speculative and max_tokens > 0):
-                    h0, h1, h2 = _token_tile(
+                    history = _token_tile(
                         x,
                         out,
                         state,
@@ -410,13 +414,8 @@ def _conv(
                         channel,
                         start,
                         stop,
-                        h0,
-                        h1,
-                        h2,
-                        w0,
-                        w1,
-                        w2,
-                        w3,
+                        history,
+                        taps,
                         b,
                         max_tokens,
                         True,
@@ -424,12 +423,13 @@ def _conv(
                         state_tile,
                         vector_state,
                         defer_state,
+                        silu,
                     )
                     for token in cutlass.range(start + max_tokens, stop):
                         current = x[token, channel].to(cutlass.Float32)
-                        value = _step(h0, h1, h2, current, w0, w1, w2, w3, b)
+                        value = _step(history, current, taps, b, silu)
                         out[token, channel] = value.to(cutlass.BFloat16)
-                        h0, h1, h2 = h1, h2, current
+                        history = history[1:] + (current,)
                     if cutlass.const_expr(vector_state):
                         _store_state_tile(
                             state,
@@ -439,6 +439,7 @@ def _conv(
                             stop - start,
                             max_tokens,
                             block_c,
+                            depth,
                         )
                 elif cutlass.const_expr(prefill):
                     if full_tile and stop - start == block_t:
@@ -450,13 +451,8 @@ def _conv(
                             channel,
                             start,
                             stop,
-                            h0,
-                            h1,
-                            h2,
-                            w0,
-                            w1,
-                            w2,
-                            w3,
+                            history,
+                            taps,
                             b,
                             block_t,
                             False,
@@ -464,6 +460,7 @@ def _conv(
                             state_tile,
                             vector_state,
                             defer_state,
+                            silu,
                         )
                     else:
                         _token_tile(
@@ -474,13 +471,8 @@ def _conv(
                             channel,
                             start,
                             stop,
-                            h0,
-                            h1,
-                            h2,
-                            w0,
-                            w1,
-                            w2,
-                            w3,
+                            history,
+                            taps,
                             b,
                             block_t,
                             False,
@@ -488,6 +480,7 @@ def _conv(
                             state_tile,
                             vector_state,
                             defer_state,
+                            silu,
                         )
                 else:
                     _token_loop(
@@ -498,15 +491,11 @@ def _conv(
                         channel,
                         start,
                         stop,
-                        h0,
-                        h1,
-                        h2,
-                        w0,
-                        w1,
-                        w2,
-                        w3,
+                        history,
+                        taps,
                         b,
                         speculative,
+                        silu,
                     )
             else:
                 for token in cutlass.range(start, stop):
@@ -539,6 +528,8 @@ def _launch(
     defer_state: cutlass.Constexpr,
     warp_metadata: cutlass.Constexpr,
     single_sequence: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+    silu: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
     tasks = slots.shape[0]
@@ -574,6 +565,8 @@ def _launch(
         defer_state,
         warp_metadata,
         single_sequence,
+        width,
+        silu,
     ).launch(
         grid=(tasks, cute.ceil_div(x.shape[1], block_c), 1),
         block=(block_c, 1, 1),
@@ -627,6 +620,8 @@ def get_conv_kernel(
     warp_metadata=False,
     static_strides=(),
     single_sequence=False,
+    width=4,
+    silu=True,
 ):
     defer_state = (
         speculative
@@ -662,7 +657,7 @@ def get_conv_kernel(
     weight_dtype = cutlass.Float32 if weight_fp32 else cutlass.BFloat16
     bias_dtype = cutlass.Float32 if bias_kind == "fp32" else cutlass.BFloat16
     weight = cute.runtime.make_fake_tensor(
-        weight_dtype, (channels, 4), (4, 1), assumed_align=weight_alignment
+        weight_dtype, (channels, width), (width, 1), assumed_align=weight_alignment
     )
     bias = _vector(bias_dtype)
     initial_dtype = cutlass.Uint8 if has_initial else cutlass.Int32
@@ -673,12 +668,12 @@ def get_conv_kernel(
         assumed_align=2,
     )
     name = (
-        f"w4_map_p{int(prefill)}_r{int(packed)}_h{int(has_initial)}"
+        f"w{width}_map_p{int(prefill)}_r{int(packed)}_h{int(has_initial)}"
         f"_s{int(speculative)}_w{int(weight_fp32)}_b{bias_kind}"
         f"_l{int(channel_contiguous)}_u{max_tokens}_pfx{int(inline_prefix)}"
         f"_a{weight_alignment}_t{block_t}_c{block_c}_f{int(full_tile)}"
         f"_d{static_channels}_svec{int(vector_state)}_dh{static_history}_wm{int(warp_metadata)}"
-        f"_str{'x'.join(map(str, static_strides))}_ss{int(single_sequence)}_{arch}"
+        f"_str{'x'.join(map(str, static_strides))}_ss{int(single_sequence)}{'' if silu else '_id'}_{arch}"
     )
     return build_and_load_cute_dsl_kernel(
         "causal_conv1d",
@@ -709,6 +704,8 @@ def get_conv_kernel(
             defer_state,
             warp_metadata,
             single_sequence,
+            width,
+            silu,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options=f"--enable-tvm-ffi --gpu-arch={arch}",
         ),

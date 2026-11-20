@@ -63,6 +63,10 @@ def parse_causal_conv1d_args(line, parser):
         help="Count launches in a separate process after timing each case.",
     )
     parser.add_argument("--bias", action="store_true")
+    parser.add_argument(
+        "--width", type=int, choices=(3, 4, 7), default=4, help="Convolution taps."
+    )
+    parser.add_argument("--activation", choices=("silu", "none"), default="silu")
     parser.add_argument("--state_layout", choices=("ds", "sd"), default="sd")
     parser.add_argument(
         "--weight_dtype", choices=("bfloat16", "float32"), default="float32"
@@ -96,6 +100,9 @@ def parse_causal_conv1d_args(line, parser):
                 "seq_lens requires a nonempty prefill batch, one nonnegative length per sequence, and no --varlen"
             )
         args.seq_len = max(args.seq_lens)
+    if args.width > 4 and "triton" in args.backends:
+        parser.error("the Triton reference implements widths up to 4")
+    args.activation = None if args.activation == "none" else args.activation
     if args.speculative and args.routine == "causal_conv1d_fn":
         parser.error("--speculative applies to causal_conv1d_update")
     return args
@@ -131,7 +138,10 @@ def run_causal_conv1d_test(args, *, profile_only=False):
     )
     x = backing[:, :c]
     weight = (
-        torch.randn(c, 4, device=device, dtype=getattr(torch, args.weight_dtype)) * 0.2
+        torch.randn(
+            c, args.width, device=device, dtype=getattr(torch, args.weight_dtype)
+        )
+        * 0.2
     )
     bias = torch.randn(c, device=device) * 0.1 if args.bias else None
     offsets = torch.tensor(
@@ -144,7 +154,7 @@ def run_causal_conv1d_test(args, *, profile_only=False):
     accepted = (
         torch.ones(n, device=device, dtype=torch.int32) if args.speculative else None
     )
-    history = t + 2 if args.speculative else 3
+    history = t + args.width - 2 if args.speculative else args.width - 1
     state_shape = (n, history, c) if args.state_layout == "sd" else (n, c, history)
     clean = torch.randn(state_shape, device=device, dtype=torch.bfloat16) * 0.2
     if args.state_layout == "sd":
@@ -170,6 +180,7 @@ def run_causal_conv1d_test(args, *, profile_only=False):
                     bias=bias,
                     out=output,
                     workspace=workspace,
+                    activation=args.activation,
                 )
             return causal_conv1d_update(
                 x,
@@ -180,6 +191,7 @@ def run_causal_conv1d_test(args, *, profile_only=False):
                 num_accepted_tokens=accepted,
                 bias=bias,
                 out=output,
+                activation=args.activation,
             )
         if prefill:
             return triton_prefill(
@@ -191,14 +203,14 @@ def run_causal_conv1d_test(args, *, profile_only=False):
                 lengths,
                 cache_indices=slots,
                 has_initial_state=initial,
-                activation="silu",
+                activation=args.activation,
             ).T
         value = triton_update(
             x.view(n, t, c).transpose(1, 2),
             state,
             weight,
             bias=bias,
-            activation="silu",
+            activation=args.activation,
             conv_state_indices=slots,
             num_accepted_tokens=accepted,
         )
@@ -227,7 +239,7 @@ def run_causal_conv1d_test(args, *, profile_only=False):
         return counts
 
     passed = graph_passed = None
-    if args.refcheck and "flashinfer" in backends:
+    if args.refcheck and "flashinfer" in backends and "triton" in backends:
         reference_state = clean.clone()
         reference = call("triton", reference_state).clone()
         candidate_state = clean.clone()
@@ -291,7 +303,9 @@ def run_causal_conv1d_test(args, *, profile_only=False):
         torch.cuda.synchronize(device)
         median = float(np.median(times[backend]))
         std = float(np.std(times[backend]))
-        state_reads = n * c * 3 * 2 if not prefill or args.has_initial_state else 0
+        state_reads = (
+            n * c * (args.width - 1) * 2 if not prefill or args.has_initial_state else 0
+        )
         state_writes = n * c * history * 2
         logical_bytes = (
             x.numel() * 4
@@ -321,6 +335,8 @@ def run_causal_conv1d_test(args, *, profile_only=False):
                     num_tokens=rows,
                     conv_tokens_per_sequence=t,
                     conv_bias=args.bias,
+                    conv_width=args.width,
+                    conv_activation=args.activation or "none",
                     conv_speculative=args.speculative,
                     conv_initial_state=args.has_initial_state if prefill else True,
                     conv_layout=args.state_layout,
