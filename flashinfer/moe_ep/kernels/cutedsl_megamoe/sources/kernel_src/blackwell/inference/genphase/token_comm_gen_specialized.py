@@ -445,6 +445,8 @@ class GenphaseTokenComm(KernelComponent):
             )
         if self.expert_count > 16384:
             raise NotImplementedError("Genphase token comm supports at most 16384 global experts.")
+        if self.world_size > TokenSrcMetadata.MAX_RANKS:
+            raise ValueError(f"world_size must not exceed {TokenSrcMetadata.MAX_RANKS}, got {self.world_size}.")
         if self.topk > TokenSrcMetadata.MAX_TOPK:
             raise ValueError(f"topk must not exceed {TokenSrcMetadata.MAX_TOPK}, got {self.topk}.")
         if self.topk > self.expert_count:

@@ -90,6 +90,55 @@ def test_sm90_bf16_reducer_keeps_narrow_fallback(hidden, static, width):
     assert reducer.hidden_per_thread == width
 
 
+@pytest.mark.parametrize(
+    "world_size, topk, expert_count, error",
+    [
+        (256, 1, 256, None),
+        (257, 1, 257, "world_size must not exceed"),
+        (1, 256, 512, None),
+        (1, 257, 512, "topk must not exceed"),
+    ],
+)
+def test_genphase_routing_metadata_limits(world_size, topk, expert_count, error):
+    import cutlass
+
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.api import (
+        ImplDesc,
+        ProblemDesc,
+    )
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.kernel_src.blackwell.inference.genphase.token_comm_gen_specialized import (
+        GenphaseTokenComm,
+    )
+
+    problem = ProblemDesc(
+        dict(
+            world_size=world_size,
+            expert_count=expert_count,
+            topk=topk,
+            max_tokens_per_rank=4,
+            hidden_size=256,
+            quant_kind="nvfp4",
+            topk_index_dtype=cutlass.Int32,
+            apply_topk_at_fc1=False,
+        )
+    )
+    implementation = ImplDesc(
+        dict(
+            token_padding_block=128,
+            sf_padding_block=128,
+            pusher_cta_count=24,
+            refine_participant_groups=2,
+            refine_output_stages=2,
+        )
+    )
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            GenphaseTokenComm(problem, implementation)
+    else:
+        comm = GenphaseTokenComm(problem, implementation)
+        assert (comm.world_size, comm.topk) == (world_size, topk)
+
+
 def test_sm90_reducer_rejects_noncanonical_mxfp8_scales():
     import cutlass
     from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_nvfp4_swapab.topk_reduce import (

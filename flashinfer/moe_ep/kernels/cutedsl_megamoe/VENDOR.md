@@ -28,7 +28,7 @@ cutedsl_megamoe/
 ## Source and export
 
 The source base is `bdd3f1ee86c8d7d03fe6f0a36533beeea7c4d5fd`. The composed source tree is
-`7f3ae2379d1609487c906a395e184642179e9a85`; it includes the retained FlashInfer changes described below.
+`020ada5ef8eed070bfe7121b5e52b117e06fc1d5`; it includes the retained FlashInfer changes described below.
 The exporter SHA-256 is `af1e19aaf36495f170dff6a90b2d76b5ebae21adfc390fddf8ad5ddc41e43e13`.
 `export_manifest.json` records the entry points, direct adapter requirements,
 release-patch checksum and final Python file hashes. Its architecture sections

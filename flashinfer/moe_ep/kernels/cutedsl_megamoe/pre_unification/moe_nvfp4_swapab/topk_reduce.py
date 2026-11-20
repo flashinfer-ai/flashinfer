@@ -475,7 +475,16 @@ class TopkReduce:
         stale or garbage value can never index past the workspace.
         """
         if cutlass.const_expr(
-            self._use_sm90_static
+            (
+                self._use_sm90_static
+                or (
+                    self.use_scalar_math
+                    and not self.persistent
+                    and not self.num_remote_nodes
+                    and not self.batch_invariant
+                    and topk_idx is not None
+                )
+            )
             and internode_combine is None
             and topk_indices is None
         ):
@@ -759,7 +768,8 @@ class TopkReduce:
             )[(None,), (hidden_tile_idx,)]
 
             load_atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128,
+                cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16,
+                num_bits_per_copy=min(128, hidden_per_thread * cutlass.BFloat16.width),
             )
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
 
@@ -857,7 +867,10 @@ class TopkReduce:
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))
             cute.copy(
-                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128),
+                cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), out_dtype,
+                    num_bits_per_copy=min(128, hidden_per_thread * out_dtype.width),
+                ),
                 out, self._mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
             )
 
