@@ -54,6 +54,26 @@ from .batched_gemm_cga import (
 Constexpr = cutlass.Constexpr
 
 
+@dataclass(frozen=True)
+class _RubinClcPipeline(PipelineClcFetchAsync):
+    """CLC pipeline with a short-lived remote arrival address."""
+
+    def consumer_release(self, state, *, loc=None, ip=None) -> None:
+        barrier = self.sync_object_empty.get_barrier(state.index, loc=loc, ip=ip)
+        # Keep mapping and arrival together so the remote address is not
+        # hoisted across the gather loop and spilled by 32-register loaders.
+        prims.inline_ptx_hl(
+            "{\n"
+            ".reg .b32 remote_barrier;\n"
+            "mapa.shared::cluster.u32 remote_barrier, {$r0}, {$r1};\n"
+            "mbarrier.arrive.shared::cluster.b64 _, [remote_barrier], 1;\n"
+            "}",
+            read_only_args=[barrier, cutlass.Int32(self.consumer_mask)],
+            loc=loc,
+            ip=ip,
+        )
+
+
 class MixedCgaClcDynamicPersistentTileScheduler(ClcDynamicPersistentTileScheduler):
     """Decode the shared launch grid for preferred and fallback CGAs.
 
@@ -232,11 +252,20 @@ class BatchedGemmWorkQueue(WorkQueue):
         )
 
     def create_pipeline(self, pipeline_config):
-        if (
-            not has_multiple_umma_atoms(self.cfg)
-            or pipeline_config.pipeline_type != PipelineType.ClcFetchAsync
-        ):
+        if pipeline_config.pipeline_type != PipelineType.ClcFetchAsync:
             return super().create_pipeline(pipeline_config)
+        if not has_multiple_umma_atoms(self.cfg):
+            clc = super().create_pipeline(pipeline_config)
+            if not self.cfg.is_rubin:
+                return clc
+            return _RubinClcPipeline(
+                clc.sync_object_full,
+                clc.sync_object_empty,
+                clc.num_stages,
+                clc.producer_mask,
+                clc.consumer_mask,
+                clc.is_signaling_thread,
+            )
 
         barrier_ptr = pipeline_config.barrier_ptr
         if barrier_ptr is None:
@@ -285,7 +314,8 @@ class BatchedGemmWorkQueue(WorkQueue):
         dim_x, dim_y, _, _, _, _ = active_cga_coords(self.cfg)
         dst_rank = tidx % cutlass.Int32(32)
         is_signaling_thread = dst_rank < dim_x * dim_y
-        return PipelineClcFetchAsync(
+        pipeline_cls = _RubinClcPipeline if self.cfg.is_rubin else PipelineClcFetchAsync
+        return pipeline_cls(
             sync_object_full,
             sync_object_empty,
             pipeline_config.num_stages,
