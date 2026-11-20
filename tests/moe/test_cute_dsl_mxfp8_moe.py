@@ -50,7 +50,9 @@ def _qdq_mxfp8(t: torch.Tensor) -> torch.Tensor:
     shape = t.shape
     blocks = t.float().reshape(-1, shape[-1] // MXFP8_BLOCK, MXFP8_BLOCK)
     amax = blocks.abs().amax(dim=-1, keepdim=True)
-    exp = torch.ceil(torch.log2(torch.clamp(amax, min=1e-30) / FP8_MAX))
+    exp = torch.ceil(
+        torch.log2(torch.clamp(amax, min=torch.finfo(torch.float32).tiny) / FP8_MAX)
+    )
     exp = torch.clamp(exp, -127, 127)
     scale = torch.exp2(exp)
     q = (blocks / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
@@ -283,6 +285,44 @@ def test_mxfp8_clamped_relu2_moe(clamp_limit, tactic, swap_ab):
     assert err_clamped < 0.2 * err_plain, (
         f"clamped err {err_clamped:.4g} vs plain-ReLU^2 err {err_plain:.4g}"
     )
+
+
+def test_mxfp8_clamped_relu2_huge_limit_is_relu2():
+    """A limit whose square overflows fp32 acts as plain ReLU^2, without NaN."""
+    num_tokens, hidden, inter, num_experts, top_k = 33, 896, 1152, 16, 4
+    x, w1, w2, topk_ids, topk_w = _make_case(
+        num_tokens, hidden, inter, num_experts, top_k
+    )
+    out = _run_kernel(
+        x, w1, w2, topk_ids, topk_w, num_experts, clamp_limit=1e20
+    ).float()
+    assert torch.isfinite(out).all()
+    ref_q = _reference(x, w1, w2, topk_ids, topk_w, quantized=True)
+    torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
+
+
+@pytest.mark.parametrize("clamp_limit, fc1_scale", [(16.0, 1.5e-18), (1e20, 2e-10)])
+def test_mxfp8_clamped_relu2_tiny_fc1_block(clamp_limit, fc1_scale):
+    """FC1 blocks of 32 values with a tiny amax get a small E8M0 code. With L ** 2
+    folded into the output scale, 2 ** (127 - code) * L ** 2 exceeds fp32: the
+    block must still quantize like the reference (and never give inf * 0 = NaN).
+    """
+    num_tokens, hidden, inter, num_experts, top_k = 33, 896, 1152, 16, 4
+    x, w1, w2, topk_ids, topk_w = _make_case(
+        num_tokens, hidden, inter, num_experts, top_k
+    )
+    # Scale the first FC1 block so its folded scale overflows (the huge L is
+    # capped at 2 ** 32 in the kernel), and make FC2 read only that block.
+    w1[:, :32] *= fc1_scale
+    w2[:, :, 32:] = 0
+    out = _run_kernel(
+        x, w1, w2, topk_ids, topk_w, num_experts, clamp_limit=clamp_limit
+    ).float()
+    assert torch.isfinite(out).all()
+    ref_q = _reference(
+        x, w1, w2, topk_ids, topk_w, quantized=True, clamp_limit=clamp_limit
+    )
+    torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
 
 
 @pytest.mark.parametrize("swap_ab", [False, True])
