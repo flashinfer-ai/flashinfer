@@ -2059,6 +2059,23 @@ class TestCuteDslMoeW4A16:
             pytest.param(128, 32, ((128, 32, 64), (1, 1), True), id="1cta"),
             pytest.param(256, 64, ((256, 64, 128), (2, 1), True), id="2cta"),
             pytest.param(256, 128, ((128, 128, 256), (2, 1), True), id="cluster2"),
+            # One K stage per tile groups several M tiles into each work unit.
+            pytest.param(512, 16, ((128, 16, 256), (1, 1), True), id="1cta-units4"),
+            pytest.param(768, 32, ((128, 32, 256), (1, 1), True), id="1cta-units3"),
+            pytest.param(512, 64, ((128, 64, 256), (1, 1), True), id="1cta-units2"),
+            pytest.param(
+                1024, 16, ((128, 16, 256), (2, 1), True), id="cluster2-units4"
+            ),
+            # More units than SMs: CTAs reuse both accumulator stages across units.
+            pytest.param(
+                131072, 16, ((128, 16, 256), (1, 1), True), id="1cta-units4-multiwave"
+            ),
+            pytest.param(
+                131072,
+                16,
+                ((128, 16, 256), (2, 1), True),
+                id="cluster2-units4-multiwave",
+            ),
         ],
     )
     def test_weight_scale_mapping(
@@ -2135,43 +2152,96 @@ class TestCuteDslMoeW4A16:
         assert_w4a16_bits(output, expected)
 
     @pytest.mark.parametrize(
-        "route_tile,gemm1_tactic,gemm2_tactic",
+        "route_tile,gemm1_tactic,gemm2_tactic,hidden_size,intermediate_size",
         [
             pytest.param(
                 8,
                 ((128, 8, 256), (2, 1), True),
                 ((128, 8, 256), (2, 1), True),
+                256,
+                512,
                 id="route8-1cta",
             ),
             pytest.param(
                 16,
                 ((128, 16, 256), (1, 1), True),
                 ((128, 16, 256), (1, 1), True),
+                256,
+                512,
                 id="route16-1cta",
             ),
             pytest.param(
                 32,
                 ((128, 32, 256), (2, 1), True),
                 ((256, 32, 256), (2, 1), True),
+                256,
+                512,
                 id="route32-mixed",
             ),
             pytest.param(
                 64,
                 ((256, 64, 256), (2, 1), True),
                 ((128, 64, 256), (2, 1), True),
+                256,
+                512,
                 id="route64-mixed",
             ),
             pytest.param(
                 128,
                 ((256, 128, 256), (2, 1), True),
                 ((256, 128, 256), (2, 1), True),
+                256,
+                512,
                 id="route128-2cta",
             ),
             pytest.param(
                 192,
                 ((256, 192, 256), (2, 1), True),
                 ((256, 192, 256), (2, 1), True),
+                256,
+                512,
                 id="route192",
+            ),
+            # Short GEMM2 K loops group several M tiles into each work unit.
+            pytest.param(
+                8,
+                ((128, 8, 256), (1, 1), True),
+                ((128, 8, 256), (1, 1), True),
+                1024,
+                256,
+                id="route8-1cta-units4",
+            ),
+            pytest.param(
+                16,
+                ((128, 16, 256), (2, 1), True),
+                ((128, 16, 256), (2, 1), True),
+                1024,
+                256,
+                id="route16-cluster2-units4",
+            ),
+            pytest.param(
+                16,
+                ((128, 16, 256), (1, 1), True),
+                ((128, 16, 256), (1, 1), True),
+                768,
+                384,
+                id="route16-1cta-ktail-units2",
+            ),
+            pytest.param(
+                32,
+                ((128, 32, 256), (1, 1), True),
+                ((128, 32, 256), (1, 1), True),
+                1536,
+                256,
+                id="route32-1cta-units4",
+            ),
+            pytest.param(
+                64,
+                ((128, 64, 256), (1, 1), True),
+                ((128, 64, 256), (1, 1), True),
+                512,
+                256,
+                id="route64-1cta-units2",
             ),
         ],
     )
@@ -2179,13 +2249,17 @@ class TestCuteDslMoeW4A16:
         "half_tile_tail", [False, True], ids=["tail1", "tail-half-plus1"]
     )
     @pytest.mark.parametrize("top_k", [2, 3])
+    @pytest.mark.parametrize("enable_pdl", [False, True], ids=["pdl-off", "pdl-on"])
     def test_route_tile_boundary_accuracy(
         self,
         route_tile: int,
         gemm1_tactic: tuple,
         gemm2_tactic: tuple,
+        hidden_size: int,
+        intermediate_size: int,
         half_tile_tail: bool,
         top_k: int,
+        enable_pdl: bool,
     ):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             launch_w4a16_moe,
@@ -2193,7 +2267,6 @@ class TestCuteDslMoeW4A16:
         from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
 
         num_tokens = route_tile + (route_tile // 2 + 1 if half_tile_tail else 1)
-        hidden_size, intermediate_size = 256, 512
         num_experts = 8
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -2228,7 +2301,7 @@ class TestCuteDslMoeW4A16:
                 (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
             ),
             use_fused_finalize=False,
-            enable_pdl=False,
+            enable_pdl=enable_pdl,
             activation_type=ActivationType.Swiglu,
             tactic=tactic,
         )
