@@ -132,6 +132,10 @@ class SwapsKernel:
             tma.tensor_k,
             tma.atom_v,
             tma.tensor_v,
+            tma.atom_k_run,
+            tma.tensor_k_run,
+            tma.atom_v_run,
+            tma.tensor_v_run,
             mO,
             mLse,
             mSink,
@@ -154,6 +158,7 @@ class SwapsKernel:
             st.v_smem_layout,
             st.p_smem_layout,
             st.ring_view_layout,
+            st.run_view_layout,
         ).launch(
             grid=[grid, 1, 1],
             block=[Roles.threads, 1, 1],
@@ -172,6 +177,10 @@ class SwapsKernel:
         tK: cute.Tensor,
         atom_v: cute.CopyAtom,
         tV: cute.Tensor,
+        atom_k_run: cute.CopyAtom,
+        tK_run: cute.Tensor,
+        atom_v_run: cute.CopyAtom,
+        tV_run: cute.Tensor,
         mO: cute.Tensor,
         mLse: cute.Tensor,
         mSink: cute.Tensor,
@@ -194,6 +203,7 @@ class SwapsKernel:
         v_smem_layout: cute.ComposedLayout,
         p_smem_layout: cute.ComposedLayout,
         ring_view_layout: cute.ComposedLayout,
+        run_view_layout: cute.ComposedLayout,
     ):
         st = self.st
         R = Roles
@@ -218,6 +228,10 @@ class SwapsKernel:
             if warp_idx >= R.empty_warps[0]:
                 cpasync.prefetch_descriptor(atom_k)
                 cpasync.prefetch_descriptor(atom_v)
+        if cutlass.const_expr(st.runs):
+            if warp_idx >= R.load_warp:
+                cpasync.prefetch_descriptor(atom_k_run)
+                cpasync.prefetch_descriptor(atom_v_run)
         Hq = tK.shape[2] * st.g
 
         # ---- scaffolding
@@ -342,6 +356,11 @@ class SwapsKernel:
         o_shape = pv_thr_mma.partition_shape_C((st.M_pv, NP))
         o_layout = pv_thr_mma.make_fragment_C(o_shape).layout
 
+        # the split placement's run boxes: the per-pool atoms and the ring as they address it (producer.issue_slot_runs)
+        st.run_tma = ((atom_k_run, tK_run), (atom_v_run, tV_run))
+        st.ring_run = storage.sKV.get_tensor(
+            run_view_layout.outer, swizzle=run_view_layout.inner
+        )
         # ---- roles: every role walks the same units in the same order (u = bidx, bidx + grid, ...)
         if warp_idx == R.load_warp:
             cute.arch.setmaxregister_decrease(R.regs_other)

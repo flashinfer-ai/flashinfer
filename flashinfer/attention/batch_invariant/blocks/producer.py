@@ -18,7 +18,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.cute.nvgpu import cpasync
 
-from .operands import HALF, Q_ROWS, REP_ROWS
+from .operands import HALF, Q_ROWS, REP_ROWS, RUN_KEYS
 
 
 @cute.jit
@@ -40,6 +40,99 @@ def slot_page_ids(
             pslot = n_pages - 1
         ids.append(mKvIndices[kv_ptr0 + pslot])
     return ids
+
+
+@cute.jit
+def slot_runs(st, ids):
+    """Per element of ``slot_page_ids``: 1 in the lanes of an 8-key group whose pages are consecutive in the pool (page ``p + k``
+    for the group's ``k``-th page), 0 in the lanes of any other group. Such a group loads as one box of 8 keys per half."""
+    lane = cute.arch.lane_idx()
+    runs = []
+    for j in cutlass.range_constexpr(len(ids)):
+        first = (
+            ids[j] - (lane % RUN_KEYS) // st.page
+        )  # the group's first page, were the group a run
+        same = Int32(0)
+        if first == cute.arch.shuffle_sync(first, lane - lane % RUN_KEYS):
+            same = Int32(1)
+        for off in cutlass.range_constexpr(3):
+            same = same & cute.arch.shuffle_sync_bfly(same, offset=1 << off)
+        runs.append(same)
+    return runs
+
+
+@cute.jit
+def issue_slot_runs(
+    st,
+    key0: Int32,
+    d_half0: cutlass.Constexpr,
+    part: cutlass.Constexpr,
+    pool: cutlass.Constexpr,
+    kv_prod,
+    atom: cute.CopyAtom,
+    tg: cute.Tensor,
+    ts: cute.Tensor,
+    mKvIndices: cute.Tensor,
+    kv_ptr0: Int32,
+    n_pages: Int32,
+    kv_head: Int32,
+):
+    """One ring slot under the split placement with run boxes, as issuing warp ``part`` of ``kv_warps``: its share of the slot's
+    8-key groups (group ``n`` with ``n % kv_warps == part``) onto the slot's barrier, armed with the bytes of its groups. A group
+    whose pages are consecutive in the pool (``slot_runs``) loads as ONE box per half; any other group as the page boxes
+    ``issue_slot`` issues for its keys. Either way the group's bytes land at the same shared-memory positions, so a pool filled
+    in order loads in an eighth of the boxes (or fewer) and a scattered one as before. One run-time loop over the groups (the
+    block's z index is 0 and keeps the trip count out of the compiler's sight): the code of a group appears once.
+    ``d_half0``: the first 64-wide half of the pool's dims the slot holds; ``pool``: 0 for K, 1 for V (the run atoms are per pool)."""
+    n_groups = st.slot_keys // RUN_KEYS
+    n_mine = (n_groups - part + st.kv_warps - 1) // st.kv_warps
+    h = kv_prod.acquire_and_advance(
+        expected_tx=Int32(n_mine * RUN_KEYS * st.halves * HALF * 2)
+    )
+    ids = slot_page_ids(st, key0, mKvIndices, kv_ptr0, n_pages)
+    runs = slot_runs(st, ids)
+    atom_run, t_run = st.run_tma[pool]
+    _, _, bz = cute.arch.block_idx()
+    for n in range(part, n_groups + bz, st.kv_warps):
+        k0 = (
+            n * RUN_KEYS
+        )  # the group's first key in the slot: its page index is in lane k0 % 32 of element k0 // 32
+        held = ids[0]
+        is_run = runs[0]
+        for j in cutlass.range_constexpr(1, st.slot_keys // 32):
+            if k0 // 32 == j:
+                held = ids[j]
+                is_run = runs[j]
+        if cute.arch.make_warp_uniform(cute.arch.shuffle_sync(is_run, k0 % 32)) != 0:
+            first = cute.arch.shuffle_sync(held, k0 % 32)
+            g_run = cute.zipped_divide(
+                cute.domain_offset((0, 0, 0, first), t_run), st.run_box
+            )
+            ts_run, tg_run = cpasync.tma_partition(
+                atom_run,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(st.ring_run, 0, 4),
+                g_run,
+            )
+            for half in cutlass.range_constexpr(st.halves):
+                cute.copy(
+                    atom_run,
+                    tg_run[(None, (d_half0 + half, 0, kv_head, 0))],
+                    ts_run[(None, n, half, h.index)],
+                    tma_bar_ptr=h.barrier,
+                )
+        else:
+            for b in cutlass.range_constexpr(RUN_KEYS // st.box_rows):
+                page_id = cute.arch.shuffle_sync(held, k0 % 32 + b * st.box_rows)
+                for half in cutlass.range_constexpr(st.halves):
+                    cute.copy(
+                        atom,
+                        tg[(None, (d_half0 + half, 0, kv_head, page_id))],
+                        ts[(None, n * (RUN_KEYS // st.box_rows) + b, half, h.index)],
+                        tma_bar_ptr=h.barrier,
+                    )
+    return kv_prod
 
 
 @cute.jit
@@ -163,11 +256,28 @@ def issue_tile(
     n_pages: Int32,
     kv_head: Int32,
     part: cutlass.Constexpr,
+    pool: cutlass.Constexpr,
 ):
     """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order (``part``: the issuing warp under the split
     placement, 0 otherwise)."""
     for sl in cutlass.range_constexpr(st.slots_per_tile):
-        if cutlass.const_expr(st.split):
+        if cutlass.const_expr(st.runs):
+            kv_prod = issue_slot_runs(
+                st,
+                t * st.T + sl * st.slot_keys,
+                0,
+                part,
+                pool,
+                kv_prod,
+                atom,
+                tg,
+                ts,
+                mKvIndices,
+                kv_ptr0,
+                n_pages,
+                kv_head,
+            )
+        elif cutlass.const_expr(st.split):
             kv_prod = issue_slot_split(
                 st,
                 t * st.T + sl * st.slot_keys,
@@ -271,6 +381,7 @@ def load_loop(
         n_pages,
         kv_head,
         part,
+        0,
     )
     if cutlass.const_expr(LA == 2):
         if N > 1:
@@ -286,6 +397,7 @@ def load_loop(
                 n_pages,
                 kv_head,
                 part,
+                0,
             )
         for n in range(N):
             kv_prod = issue_tile(
@@ -300,6 +412,7 @@ def load_loop(
                 n_pages,
                 kv_head,
                 part,
+                1,
             )
             if n + 2 < N:
                 kv_prod = issue_tile(
@@ -314,6 +427,7 @@ def load_loop(
                     n_pages,
                     kv_head,
                     part,
+                    0,
                 )
     else:
         for n in range(N):
@@ -330,6 +444,7 @@ def load_loop(
                     n_pages,
                     kv_head,
                     part,
+                    0,
                 )
             kv_prod = issue_tile(
                 st,
@@ -343,6 +458,7 @@ def load_loop(
                 n_pages,
                 kv_head,
                 part,
+                1,
             )
     return q_prod, kv_prod
 
@@ -512,6 +628,7 @@ def load_loop_q2(
             n_pages,
             kv_head,
             part,
+            0,
         )
         for t in range(lo, hi):
             if cutlass.const_expr(not st.p_over_s):
@@ -528,6 +645,7 @@ def load_loop_q2(
                         n_pages,
                         kv_head,
                         part,
+                        0,
                     )
             kv_prod = issue_tile(
                 st,
@@ -541,6 +659,7 @@ def load_loop_q2(
                 n_pages,
                 kv_head,
                 part,
+                1,
             )
             if cutlass.const_expr(st.p_over_s):
                 if t + 1 < hi:
@@ -556,5 +675,6 @@ def load_loop_q2(
                         n_pages,
                         kv_head,
                         part,
+                        0,
                     )
     return q_prod, kv_prod

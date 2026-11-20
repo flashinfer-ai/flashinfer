@@ -14,7 +14,7 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..plan import GROUP_FIELDS
-from ..blocks.operands import split_pages
+from ..blocks.operands import run_pages, split_pages
 from .kernel import SwapsKernel
 
 MODULE = "batch_invariant_attention"
@@ -35,6 +35,7 @@ def kernel_name(
         f"attn_swaps_d{D}_g{g}_p{page}_n{n_pad}"
         + ("_rg" if ragged else "")
         + ("_sp" if split_pages(page, ragged) else "")
+        + ("r" if run_pages(page, ragged) else "")
         + (f"_c{cap >> 10}" if cap else "")
         + ("_pdl" if pdl else "")
         + ("_sink" if sinks else "")

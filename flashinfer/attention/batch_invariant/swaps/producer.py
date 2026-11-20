@@ -15,7 +15,7 @@ from cutlass import Int32
 from cutlass.cute.nvgpu import cpasync
 
 from ..blocks.operands import HALF
-from ..blocks.producer import issue_slot_split
+from ..blocks.producer import issue_slot_runs, issue_slot_split
 
 GATE_AFTER_V = 0  # the first unit's burst: Q, K_0, K_1, K_2, V_0 issued, then wait for K_0 before the rest of the ring
 GATE_TILES = 4  # K / V tiles of that burst: the gate exists only when they fit the ring (slot 0 not yet reused)
@@ -84,11 +84,28 @@ def issue_tile(
     n_pages: Int32,
     kv_head: Int32,
     part: cutlass.Constexpr,
+    pool: cutlass.Constexpr,
 ):
     """One K or V tile = ``slots_per_tile`` consecutive ring slots (the dims slices of the same 128 keys); ``part``: the issuing
     warp under the split placement, 0 otherwise."""
     for sl in cutlass.range_constexpr(st.slots_per_tile):
-        if cutlass.const_expr(st.split):
+        if cutlass.const_expr(st.runs):
+            kv_prod = issue_slot_runs(
+                st,
+                t * st.T,
+                sl * st.halves,
+                part,
+                pool,
+                kv_prod,
+                atom,
+                tg,
+                ts,
+                mKvIndices,
+                kv_ptr0,
+                n_pages,
+                kv_head,
+            )
+        elif cutlass.const_expr(st.split):
             kv_prod = issue_slot_split(
                 st,
                 t * st.T,
@@ -194,6 +211,7 @@ def load_loop(
         n_pages,
         kv_head,
         part,
+        0,
     )
     if N > 1:
         kv_prod = issue_tile(
@@ -208,6 +226,7 @@ def load_loop(
             n_pages,
             kv_head,
             part,
+            0,
         )
     for n in range(N):
         if n + 2 < N:
@@ -223,6 +242,7 @@ def load_loop(
                 n_pages,
                 kv_head,
                 part,
+                0,
             )
         kv_prod = issue_tile(
             st,
@@ -236,6 +256,7 @@ def load_loop(
             n_pages,
             kv_head,
             part,
+            1,
         )
         if n == GATE_AFTER_V:
             if cutlass.const_expr(GATE_TILES * st.slots_per_tile <= st.n_slots):
