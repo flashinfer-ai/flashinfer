@@ -216,6 +216,10 @@ class SwapsKernel:
             cpasync.prefetch_descriptor(atom_q)
             cpasync.prefetch_descriptor(atom_k)
             cpasync.prefetch_descriptor(atom_v)
+        if cutlass.const_expr(st.kv_warps > 1):
+            if warp_idx >= R.empty_warps[0]:
+                cpasync.prefetch_descriptor(atom_k)
+                cpasync.prefetch_descriptor(atom_v)
         Hq = tK.shape[2] * st.g
 
         # ---- scaffolding
@@ -232,7 +236,9 @@ class SwapsKernel:
         kv_prod, kv_cons = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.kv_mbar.data_ptr(),
             num_stages=st.n_slots,
-            producer_group=_thread_group(1),
+            producer_group=_thread_group(
+                st.kv_warps
+            ),  # one arrival per issuing warp, each armed with the bytes of its own boxes
             consumer_group=_thread_group(1),
             tx_count=st.kv_slot_bytes,
             defer_sync=True,
@@ -365,6 +371,7 @@ class SwapsKernel:
                     mDesc[(u, F_KVHEAD)],
                     mDesc[(u, F_TILE_LO)],
                     mDesc[(u, F_TILE_HI)],
+                    0,
                 )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
@@ -522,3 +529,32 @@ class SwapsKernel:
             tmem.free(tmem_ptr)
         if warp_idx >= R.empty_warps[0]:
             cute.arch.setmaxregister_decrease(R.regs_other)
+            if cutlass.const_expr(st.kv_warps > 1):
+                # the split placement's other issuing warps: the same K / V slots in the same order, their share of each slot's boxes
+                if cutlass.const_expr(self.pdl):
+                    cute.arch.griddepcontrol_wait()
+                for k in cutlass.range_constexpr(st.kv_warps - 1):
+                    if warp_idx == R.empty_warps[k]:
+                        for u in range(first, num_units, walk):
+                            q_prod, kv_prod = load_loop(
+                                st,
+                                atom_q,
+                                tQ,
+                                atom_k,
+                                tK,
+                                atom_v,
+                                tV,
+                                sQ_view,
+                                sKV_view,
+                                q_prod,
+                                kv_prod,
+                                mKvIndptr,
+                                mKvIndices,
+                                mDesc[(u, F_REQ)],
+                                mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
+                                mDesc[(u, F_KVHEAD)],
+                                mDesc[(u, F_TILE_LO)],
+                                mDesc[(u, F_TILE_HI)],
+                                k + 1,
+                            )
+                cute.arch.griddepcontrol_launch_dependents()
