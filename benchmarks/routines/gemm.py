@@ -2573,6 +2573,16 @@ def testMmTf32(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    # The cuBLAS backend follows the process TF32 setting; restore the caller's.
+    saved_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        return _run_mm_tf32(args)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = saved_allow_tf32
+
+
+def _run_mm_tf32(args):
     if args.verbose >= 1:
         print("[INFO] Running testMmTf32")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -2594,9 +2604,6 @@ def testMmTf32(args):
     # a: (m, k) row-major; b: (n, k) transposed to a (k, n) column-major view.
     a = torch.randn([m, k], device=device, dtype=torch.float32)
     b = torch.randn([n, k], device=device, dtype=torch.float32).transpose(-2, -1)
-
-    # The cuBLAS backend follows the process TF32 setting.
-    torch.backends.cuda.matmul.allow_tf32 = True
 
     def run_backend(backend, a, b, use_pdl):
         return flashinfer.mm_tf32(a, b, pdl=use_pdl, backend=backend)

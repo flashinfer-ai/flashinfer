@@ -176,12 +176,15 @@ def test_mm_tf32_rejects(a_shape, n, dtype, backend, pdl, message):
 
 
 def test_mm_tf32_cublas_requires_allow_tf32():
+    if get_compute_capability(torch.device("cuda")) < (8, 0):
+        pytest.skip("The cuBLAS TF32 backend requires SM80+.")
     a, b = _inputs(8, 256, 4096)
     with _allow_tf32(False), pytest.raises(ValueError, match="allow_tf32"):
         mm_tf32(a, b, backend="cublas")
 
 
 def test_mm_tf32_rejects_row_major_b():
+    _require_cute_dsl()
     a = torch.randn((8, 4096), device="cuda")
     b = torch.randn((4096, 256), device="cuda")
     with pytest.raises(ValueError, match="column-major"):

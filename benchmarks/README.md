@@ -46,7 +46,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mm_fp8` - Matrix multiplication with FP8 inputs using the trtllm-gen low-latency GEMM (Blackwell SM10.0+, small-M optimized, pre-shuffled weights).
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
-    - `mm_tf32` - Matrix multiplication with FP32 inputs and output, TF32 MMAs (CuTe DSL cluster split-K on SM10.0+; cuBLAS).
+    - `mm_tf32` - Matrix multiplication with FP32 inputs and output, TF32 MMAs (CuTe DSL cluster split-K on SM100/SM103/SM107; cuBLAS on SM80+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - Batch-invariant mode: `--backends batch_invariant` runs on supported APIs with `batch_invariant=True` [Batch-invariant mode](#batch-invariant-mode).
 - MOE:
