@@ -380,7 +380,7 @@ raise SystemExit(pytest.main(['-q', '--maxfail=1', *sys.argv[2:]]))
         pytest.param(128, 128, 160, 160, False, id="empty-intersection"),
     ),
 )
-def test_kv_tile_is_fully_visible(
+def test_unmasked_kv_tile_range_selects_fully_visible_tiles(
     tile_offset_k: int,
     tile_size_kv: int,
     visible_begin: int,
@@ -388,17 +388,14 @@ def test_kv_tile_is_fully_visible(
     expected: bool,
 ) -> None:
     pytest.importorskip("cutlass", minversion="4.7.0")
-    from flashinfer.attention.prims_ts.kernels.mask import kv_tile_is_fully_visible
-
-    assert (
-        kv_tile_is_fully_visible(
-            tile_offset_k,
-            tile_size_kv,
-            visible_begin,
-            visible_end,
-        )
-        is expected
+    from flashinfer.attention.prims_ts.kernels.mask import (
+        kv_tile_in_range,
+        unmasked_kv_tile_range,
     )
+
+    begin, end = unmasked_kv_tile_range(visible_begin, visible_end, tile_size_kv)
+    tile_idx = tile_offset_k // tile_size_kv
+    assert kv_tile_in_range(tile_idx, begin, end) is expected
 
 
 @pytest.mark.parametrize(
@@ -420,3 +417,52 @@ def test_kv_tile_needs_right_mask(
     assert (
         kv_tile_needs_right_mask(tile_offset_k, tile_size_kv, visible_end) is expected
     )
+
+
+@pytest.mark.parametrize(
+    ("tile_offset_k", "tile_size_kv", "visible_begin", "visible_end", "expected"),
+    (
+        pytest.param(0, 128, 0, 128, True, id="exact-interval"),
+        pytest.param(128, 128, 0, 255, False, id="crosses-right-boundary"),
+        pytest.param(0, 128, 1, 256, False, id="crosses-window-left-boundary"),
+        pytest.param(128, 128, 160, 160, False, id="empty-intersection"),
+    ),
+)
+def test_kv_tile_is_fully_visible(
+    tile_offset_k: int,
+    tile_size_kv: int,
+    visible_begin: int,
+    visible_end: int,
+    expected: bool,
+) -> None:
+    pytest.importorskip("cutlass", minversion="4.7.0")
+    from flashinfer.attention.prims_ts.kernels.mask import kv_tile_is_fully_visible
+
+    assert (
+        kv_tile_is_fully_visible(tile_offset_k, tile_size_kv, visible_begin, visible_end)
+        is expected
+    )
+
+
+def test_unmasked_kv_tile_range_matches_per_tile_bounds() -> None:
+    """The cached range equals the per-tile visibility test it replaces."""
+    pytest.importorskip("cutlass", minversion="4.7.0")
+    from flashinfer.attention.prims_ts.kernels.mask import (
+        kv_tile_in_range,
+        unmasked_kv_tile_range,
+    )
+
+    for tile_size_kv in (1, 3, 64, 128):
+        for visible_begin in range(-130, 400, 7):
+            for visible_end in range(-130, 400, 11):
+                begin, end = unmasked_kv_tile_range(
+                    visible_begin, visible_end, tile_size_kv
+                )
+                assert 0 <= begin <= end
+                for tile_idx in range(400 // tile_size_kv + 2):
+                    tile_offset_k = tile_idx * tile_size_kv
+                    fully_visible = (
+                        tile_offset_k >= visible_begin
+                        and tile_offset_k + tile_size_kv <= visible_end
+                    )
+                    assert kv_tile_in_range(tile_idx, begin, end) is fully_visible
