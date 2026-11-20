@@ -15,7 +15,7 @@ Supported production backends and APIs:
   ``flashinfer.fused_moe.MoELayer`` with ``CuteDslConfig`` (backend key
   ``"cute_dsl"``), NVFP4 weights/BF16 activations, and unfused finalization.
 * MegaMoE W4A16: ``bf16_nvfp4_mega_moe`` in
-  ``flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4``, and
+  ``flashinfer.moe_ep.kernels.flashinfer.bf16_nvfp4``, and
   ``flashinfer.moe_ep.MoEEpMegaLayer`` with ``MegaConfig`` and
   ``Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig``, using deterministic combine
   (``in_kernel_fc2_reduce=False``).

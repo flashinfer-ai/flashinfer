@@ -5,7 +5,7 @@ Launched via torchrun:
 
 Requires Hopper (exactly sm_90), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel``.
+``flashinfer.moe_ep.shims.sm90.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -34,10 +34,9 @@ identical on every EP rank (the kernel dequantizes peer tokens with the local
 copy), so both the layer config and the direct-shim reference use the same
 fixed calibration constants below.
 
-Process isolation: the SM90 and SM100 kernel trees share top-level module
-names and are mutually exclusive per process — this file is excluded from
-run_tests.sh's ``unit`` target and runs in its own torchrun pytest process via
-the ``mega_sm90`` target.
+This file is excluded from run_tests.sh's ``unit`` target and runs in its own
+torchrun pytest process through ``mega_sm90``. Each invocation owns its
+NVSHMEM session.
 """
 
 from __future__ import annotations
@@ -47,10 +46,10 @@ import os
 import pytest
 
 # This test verifies the mega path only through the pull_style_cutedsl_megakernel
-# shim public API (``flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel``);
+# shim public API (``flashinfer.moe_ep.shims.sm90.cutedsl_megamoe``);
 # it never imports the src/ kernel packages directly, so a new src/ drop can't
 # silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel")
+pytest.importorskip("flashinfer.moe_ep.shims.sm90.cutedsl_megamoe")
 
 E4M3_MAX = 448.0
 # Static per-tensor calibration (identical on all ranks by contract): randn
@@ -222,7 +221,7 @@ def _preprocess_weights(problem: dict):
 def _alloc_symm_buffer(
     problem: dict, rank: int, world_size: int, *, generate_c: bool = False
 ):
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
         get_symm_buffer_for_hopper_fp8_mega_moe,
     )
 
@@ -250,9 +249,7 @@ def _reference_sm90_fp8_mega_moe_staged(problem: dict, *, destroy_buffer: bool =
     from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
-        hopper_fp8_mega_moe,
-    )
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import hopper_fp8_mega_moe
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -296,9 +293,7 @@ def _reference_sm90_fp8_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
-        hopper_fp8_mega_moe,
-    )
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import hopper_fp8_mega_moe
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -1382,7 +1377,7 @@ def _run_mega_torch_oracle(
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
         Fp8BlockScaleK,
         compute_megamoe_reference_fp8,
         hopper_fp8_mega_moe,
