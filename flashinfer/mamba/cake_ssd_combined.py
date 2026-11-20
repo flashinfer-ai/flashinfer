@@ -154,7 +154,7 @@ class _Program:
     packed-varlen ring program loading a work item's initial state as one
     bulk copy, :func:`ibulk_selected`; the fused family's sm_107a
     packed-varlen ring program doing the same, :func:`fused_ibulk_selected`).
-    ``state_slots`` marks a state-slot program (``_SLOT_MODULES``): its
+    ``state_slots`` marks a state-slot program (``_SLOT_PROGRAMS``): its
     ``variant`` is its dense twin's, and it reads initial states from and
     writes final states to caller state pools through per-sequence slot
     vectors (``_SLOT_ARGS``).
@@ -345,7 +345,8 @@ _EXACTONE_MODULES = {
 # ``exactone_<state>_varlen_tablefirstunit``,
 # ``exactone_f32_varlen_tablerolesunit``, :func:`unit_cluster_variant`):
 # their entries are their sole sources (no fold module, never built for
-# another architecture).
+# another architecture).  The claim and wrap programs have state-slot twins
+# on sm_107a alone (``_SM107_SLOT_MODULES``, ``_SM107_ONLY_SLOT_PROGRAMS``).
 _SM107_MODULES = {
     "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_da9777c315",
     "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_a9d2a3654f",
@@ -424,7 +425,10 @@ _SM107_MODULES = {
 # ``_SLOT_ARGS``); every other argument, the launch geometry, SMEM and cluster
 # shape are its dense twin's.  ``_SLOT_MODULES`` names the one unit sm_100a and
 # sm_103a both build (as the dense fold units), ``_SM107_SLOT_MODULES`` the
-# sm_107a render; both tables hold the same keys.
+# sm_107a render; ``_SM107_SLOT_MODULES`` holds every ``_SLOT_MODULES`` key and
+# the twins of the sm_107a-only claim and wrap programs
+# (``exactpre_<state>_varlen_claimslots`` / ``_wrapslots``,
+# ``_SM107_ONLY_SLOT_PROGRAMS``), which no other architecture builds.
 _SLOT_MODULES: dict[str, str] = {
     "exactfused_bf16_varlen_slots": "mamba_ssd_q_tmem_alias_bf16_varlen_slots_0e2ed95965",
     "exactfused_f16_varlen_slots": "mamba_ssd_q_tmem_alias_f16_varlen_slots_b32c1188dc",
@@ -462,6 +466,10 @@ _SM107_SLOT_MODULES: dict[str, str] = {
     "chunkpar_bf16_varlen_slots": "mamba_ssd_chunk_parallel_v3_bf16_varlen_slots_3a9dd1b8b2",
     "chunkpar_f16_varlen_slots": "mamba_ssd_chunk_parallel_v3_f16_varlen_slots_4460f535fc",
     "chunkpar_f32_varlen_slots": "mamba_ssd_chunk_parallel_v3_f32_varlen_slots_614100545c",
+    "exactpre_bf16_varlen_claimslots": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_claim_slots_a58ec59c79",
+    "exactpre_f32_varlen_claimslots": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim_slots_2a9deab04e",
+    "exactpre_bf16_varlen_wrapslots": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_wrap_slots_f8f53690a2",
+    "exactpre_f32_varlen_wrapslots": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_wrap_slots_aeb39a40ef",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -983,10 +991,21 @@ _PROGRAMS.update(
 )
 # The state-slot programs, apart from ``_PROGRAMS``: only a call with slot
 # vectors routes to them (``_WorkspaceKey.state_slots``), and every name the
-# loader resolves goes through :func:`_program_of`.
+# loader resolves goes through :func:`_program_of`.  The sm_107a-only slot
+# programs (the twins of the claim and wrap programs, keys of
+# ``_SM107_SLOT_MODULES`` alone) bind their sm_107a module on every
+# architecture, as the sm_107a-only dense programs do; only capability (10, 7)
+# routes to them, where the same call without slot vectors runs a program of
+# a ``_SM107_SLOT_TWIN_VARIANTS`` variant (``CakeSSDCombined._program_route``).
+_SM107_ONLY_SLOT_PROGRAMS = frozenset(_SM107_SLOT_MODULES) - frozenset(_SLOT_MODULES)
+_SM107_SLOT_TWIN_VARIANTS = ("claim", "wrap")
 _SLOT_PROGRAMS: dict[str, _Program] = {
     name: _program(name, module) for name, module in _SLOT_MODULES.items()
 }
+_SLOT_PROGRAMS.update(
+    (name, _program(name, _SM107_SLOT_MODULES[name]))
+    for name in sorted(_SM107_ONLY_SLOT_PROGRAMS)
+)
 
 
 def _program_of(name: str) -> _Program:
@@ -1007,7 +1026,8 @@ def _program_name(
     ``"tablefirst"``, ``"tableroles"``, ``"tablefirstunit"`` or
     ``"tablerolesunit"`` for the one-launch family).  A state-slot program
     appends ``_SLOTS`` to its dense twin's variant: ``"slots"``,
-    ``"noringslots"`` or ``"tailslots"`` (``_SLOT_MODULES``)."""
+    ``"noringslots"`` or ``"tailslots"`` (``_SLOT_MODULES``), or on sm_107a
+    ``"claimslots"`` or ``"wrapslots"`` (``_SM107_ONLY_SLOT_PROGRAMS``)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -3613,9 +3633,10 @@ class CakeSSDCombined:
     retained start programs run ``exactpre``, the look-back program its own
     twin (the three-phase one with ``_LOOKBACK_STATE_SLOTS`` off or without
     that twin in the architecture's slot table), and the
-    sm_107a claim, bulk, wrap, one-CTA pair and one-CTA-cluster forms, the
+    sm_107a bulk, one-CTA pair and one-CTA-cluster forms, the
     SM100 metadata form and the SM103 / SM107 one-launch table forms the ring
-    two-kernel or fused programs.
+    two-kernel or fused programs.  The sm_107a claim and wrap programs run
+    their own twins (``_SM107_ONLY_SLOT_PROGRAMS``).
     """
 
     #: Program of the most recent :meth:`run` (``exactfused_*``,
@@ -3944,28 +3965,19 @@ class CakeSSDCombined:
         self._workspace = entry.workspace
         return entry.workspace
 
-    def _materialize_workspace(
+    def _program_route(
         self,
         *,
         key: _WorkspaceKey,
-        device: torch.device,
         sm_count: int,
         capability: tuple[int, int],
-    ) -> dict[str, Any]:
-        """Allocate the per-call-shape workspace of ``key`` and select its
-        kernel family.  The chunk-parallel buffers are per device, not per
-        shape: this only grows them to the shape's tile bound (the call binds
-        the device's current buffers, see ``_chunk_parallel_workspace``)."""
+    ) -> str:
+        """The program a call of ``key`` runs on a device of ``sm_count`` SMs
+        and ``capability`` (``workspace["program"]``): a function of the key
+        and the device alone."""
 
         batch, seqlen, nchunks = key.batch, key.seqlen, key.nchunks
         num_segments, num_sequences = key.num_segments, key.num_sequences
-        ids = torch.arange(num_segments, dtype=torch.int32, device=device)
-        chunks = ids % nchunks
-        starts = (ids // nchunks) * seqlen + chunks * _CHUNK_SIZE
-        # Batched segments are physical chunks; the trailing chunk of a
-        # sequence whose length is not a multiple of 128 is partial.
-        lengths = torch.clamp(seqlen - chunks * _CHUNK_SIZE, max=_CHUNK_SIZE)
-        tile_count = num_segments * self.nheads
         # The chunk-parallel rule reads the same host quantities in both
         # varlen metadata forms: the cu_seqlens form only knows the host
         # segment bound, so the triple form selects on that bound too (its
@@ -4355,8 +4367,53 @@ class CakeSSDCombined:
             self.has_varlen,
             variant + _SLOTS if slots else variant,
         )
+        # sm_107a: a slot call whose dense call (the same key without slot
+        # vectors) runs the claim or wrap program runs that program's slot
+        # twin (``_SM107_ONLY_SLOT_PROGRAMS``), bitwise the dense call on the
+        # gathered states; every other slot call keeps the route above.
+        if slots and not chunk_parallel:
+            dense = self._program_route(
+                key=key._replace(state_slots=False),
+                sm_count=sm_count,
+                capability=capability,
+            )
+            twin = f"{dense}{_SLOTS}"
+            if (
+                _program_of(dense).variant in _SM107_SLOT_TWIN_VARIANTS
+                and twin in _SM107_ONLY_SLOT_PROGRAMS
+                and _TARGET_ARCHS.get((int(capability[0]), int(capability[1])))
+                == _SM107_ARCH
+            ):
+                name = twin
         if slots and name not in _SLOT_PROGRAMS:
             raise RuntimeError(f"Cake SSDCombined ships no state-slot program {name}")
+        return name
+
+    def _materialize_workspace(
+        self,
+        *,
+        key: _WorkspaceKey,
+        device: torch.device,
+        sm_count: int,
+        capability: tuple[int, int],
+    ) -> dict[str, Any]:
+        """Allocate the per-call-shape workspace of ``key`` and select its
+        kernel family.  The chunk-parallel buffers are per device, not per
+        shape: this only grows them to the shape's tile bound (the call binds
+        the device's current buffers, see ``_chunk_parallel_workspace``)."""
+
+        batch, seqlen, nchunks = key.batch, key.seqlen, key.nchunks
+        num_segments, num_sequences = key.num_segments, key.num_sequences
+        ids = torch.arange(num_segments, dtype=torch.int32, device=device)
+        chunks = ids % nchunks
+        starts = (ids // nchunks) * seqlen + chunks * _CHUNK_SIZE
+        # Batched segments are physical chunks; the trailing chunk of a
+        # sequence whose length is not a multiple of 128 is partial.
+        lengths = torch.clamp(seqlen - chunks * _CHUNK_SIZE, max=_CHUNK_SIZE)
+        tile_count = num_segments * self.nheads
+        name = self._program_route(key=key, sm_count=sm_count, capability=capability)
+        program_family = name.split("_")[0]
+        chunk_parallel = program_family in ("chunkpar", "chunkpar3")
         workspace: dict[str, Any] = {
             "program": name,
             "starts": starts,
@@ -4392,7 +4449,7 @@ class CakeSSDCombined:
             # Packed copies of strided public inputs (``_contiguous_input``).
             "contiguous": {},
         }
-        if slots:
+        if key.state_slots:
             # The slot vector of a dense state side in a slot call: sequence
             # ``i`` reads / writes row ``i`` of the contiguous states.
             workspace["identity_slots"] = torch.arange(

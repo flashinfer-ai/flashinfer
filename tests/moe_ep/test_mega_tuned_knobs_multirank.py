@@ -82,7 +82,7 @@ def test_tuned_knobs_create_fixed_layer(monkeypatch, tmp_path):
             MegaConfig(
                 megakernel=dataclasses.replace(config, knobs=knobs),
                 preprocess_weights=False,
-                transformed_weights=auto._get_transformed_weights(),
+                transformed_weights=auto.get_transformed_weights(),
             ),
         )
         fixed.warmup(tensors)
