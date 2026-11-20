@@ -117,14 +117,16 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 }
 
 
-__device__ __forceinline__ void tcgen05_mma_mxf8_bs_cta2(
+
+__device__ __forceinline__ void tcgen05_mma_mxf8_bs_cta2_elect(
     int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
     int sfa_taddr, int sfb_taddr, int enable_input_d) {
     asm volatile(
         "{\n\t"
-        ".reg .pred p;\n\t"
+        ".reg .pred leader, p;\n\t"
+        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
         "setp.ne.b32 p, %6, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale"
+        "@leader tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale"
         " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
         "}\n"
         :: "r"(taddr), "l"(a_desc), "l"(b_desc),
@@ -155,6 +157,12 @@ __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16
         :: "r"(mbar_addr), "h"(cta_mask) : "memory");
 }
 
+
+__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
+    asm volatile(
+        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+        :: "r"(mbar_addr) : "memory");
+}
 
 
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
@@ -303,19 +311,19 @@ kernel_cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02(const __grid_constant__ C
             mbarrier_init(smem + 229544, 1);
             mbarrier_init(smem + 229552, 1);
             mbarrier_init(smem + 229560, 1);
-            // empty: 12 barriers, init_count=1
-            mbarrier_init(smem + 229568, 1);
-            mbarrier_init(smem + 229576, 1);
-            mbarrier_init(smem + 229584, 1);
-            mbarrier_init(smem + 229592, 1);
-            mbarrier_init(smem + 229600, 1);
-            mbarrier_init(smem + 229608, 1);
-            mbarrier_init(smem + 229616, 1);
-            mbarrier_init(smem + 229624, 1);
-            mbarrier_init(smem + 229632, 1);
-            mbarrier_init(smem + 229640, 1);
-            mbarrier_init(smem + 229648, 1);
-            mbarrier_init(smem + 229656, 1);
+            // empty: 12 barriers, init_count=33
+            mbarrier_init(smem + 229568, 33);
+            mbarrier_init(smem + 229576, 33);
+            mbarrier_init(smem + 229584, 33);
+            mbarrier_init(smem + 229592, 33);
+            mbarrier_init(smem + 229600, 33);
+            mbarrier_init(smem + 229608, 33);
+            mbarrier_init(smem + 229616, 33);
+            mbarrier_init(smem + 229624, 33);
+            mbarrier_init(smem + 229632, 33);
+            mbarrier_init(smem + 229640, 33);
+            mbarrier_init(smem + 229648, 33);
+            mbarrier_init(smem + 229656, 33);
             // --- pipeline 'acc_pipe' ---
             // acc_full: 2 barriers, init_count=1
             mbarrier_init(smem + 229664, 1);
@@ -416,22 +424,20 @@ kernel_cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02(const __grid_constant__ C
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (elect_sync()) {
-                            int _smem_desc_lo_0 = (((b_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
-                            int _smem_desc_lo_1 = (((a_addr) >> 4) & 0x3FFF) + (stage_1) * 64;
-                            {
-                                uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_0) | ((uint64_t)0x40004040 << 32);
-                                uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x40004040 << 32);
+                        int _smem_desc_lo_0 = (((b_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
+                        int _smem_desc_lo_1 = (((a_addr) >> 4) & 0x3FFF) + (stage_1) * 64;
+                        {
+                            uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_0) | ((uint64_t)0x40004040 << 32);
+                            uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x40004040 << 32);
 
-                                tcgen05_mma_mxf8_bs_cta2((tmem_acc + (acc_stage * 16)), a_desc + 0, b_desc + 0,
-                                    (0x10840000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_b, tmem_sf_a, ((kt_1 == 0) ? 0 : 1));
-                                tcgen05_mma_mxf8_bs_cta2((tmem_acc + (acc_stage * 16)), a_desc + 2, b_desc + 2,
-                                    (0x10840000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_b, tmem_sf_a, 1);
-                                tcgen05_mma_mxf8_bs_cta2((tmem_acc + (acc_stage * 16)), a_desc + 4, b_desc + 4,
-                                    (0x10840000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_b, tmem_sf_a, 1);
-                                tcgen05_mma_mxf8_bs_cta2((tmem_acc + (acc_stage * 16)), a_desc + 6, b_desc + 6,
-                                    (0x10840000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_b, tmem_sf_a, 1);
-                            }
+                            tcgen05_mma_mxf8_bs_cta2_elect((tmem_acc + (acc_stage * 16)), a_desc + 0, b_desc + 0,
+                                (0x10840000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_b, tmem_sf_a, ((kt_1 == 0) ? 0 : 1));
+                            tcgen05_mma_mxf8_bs_cta2_elect((tmem_acc + (acc_stage * 16)), a_desc + 2, b_desc + 2,
+                                (0x10840000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_b, tmem_sf_a, 1);
+                            tcgen05_mma_mxf8_bs_cta2_elect((tmem_acc + (acc_stage * 16)), a_desc + 4, b_desc + 4,
+                                (0x10840000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_b, tmem_sf_a, 1);
+                            tcgen05_mma_mxf8_bs_cta2_elect((tmem_acc + (acc_stage * 16)), a_desc + 6, b_desc + 6,
+                                (0x10840000U | ((((uint32_t)(kt_1) % 4U)) << 29) | ((((uint32_t)(kt_1) % 4U)) << 4)), tmem_sf_b, tmem_sf_a, 1);
                         }
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
@@ -448,9 +454,9 @@ kernel_cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02(const __grid_constant__ C
                     completed += 1;
                 }
                 if (completed > 0) {
-                    unsigned int last_stage = (completed - 1) % 2;
-                    unsigned int last_phase = (completed - 1) / 2 & 1;
-                    mbarrier_wait(acc_empty_addr + (last_stage) * 8, last_phase);
+                    unsigned int _stage_acc_empty = (completed + 1) % 2;
+                    unsigned int _parity_acc_empty = (completed + 1) / 2 % 2 ^ 1;
+                    mbarrier_wait(acc_empty_addr + (_stage_acc_empty) * 8, _parity_acc_empty);
                 }
             }
         }
@@ -491,6 +497,7 @@ kernel_cake_deepgemm_batched_gemm_d9a9c12ba43e831e0a02(const __grid_constant__ C
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((full_addr + (stage_2) * 8) & 0xFEFFFFFF) : "memory");
+                    mbarrier_arrive(empty_addr + (stage_2) * 8);
                     stage_2 += 1;
                     if (stage_2 == 12) { stage_2 = 0; _phase_sf_full ^= 1; }
                 }

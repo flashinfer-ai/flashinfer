@@ -114,13 +114,13 @@ kernel_cake_deepgemm_mixed_gemm_1703f20cc39512449eef(const __grid_constant__ CUt
             mbarrier_init(smem + 72, 66);
             mbarrier_init(smem + 80, 66);
             mbarrier_init(smem + 88, 66);
-            // mma_done: 6 barriers, init_count=1
-            mbarrier_init(smem + 96, 1);
-            mbarrier_init(smem + 104, 1);
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 120, 1);
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 136, 1);
+            // mma_done: 6 barriers, init_count=33
+            mbarrier_init(smem + 96, 33);
+            mbarrier_init(smem + 104, 33);
+            mbarrier_init(smem + 112, 33);
+            mbarrier_init(smem + 120, 33);
+            mbarrier_init(smem + 128, 33);
+            mbarrier_init(smem + 136, 33);
             // --- pipeline 'mainloop_pipe' ---
             // mainloop_done: 2 barriers, init_count=1
             mbarrier_init(smem + 144, 1);
@@ -289,6 +289,9 @@ kernel_cake_deepgemm_mixed_gemm_1703f20cc39512449eef(const __grid_constant__ CUt
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((sf_ready_addr + (transpose_stage) * 8) & 0xFEFFFFFF) : "memory");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                        :: "r"(mma_done_addr + (transpose_stage) * 8) : "memory");
                     transpose_stage += 1;
                     if (transpose_stage == 6) { transpose_stage = 0; _phase_tma_full ^= 1; }
                 }

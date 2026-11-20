@@ -150,14 +150,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap SFA, const __grid_consta
             mbarrier_init(smem + 88, 130);
             mbarrier_init(smem + 96, 130);
             mbarrier_init(smem + 104, 130);
-            // mma_done: 7 barriers, init_count=1
-            mbarrier_init(smem + 112, 1);
-            mbarrier_init(smem + 120, 1);
-            mbarrier_init(smem + 128, 1);
-            mbarrier_init(smem + 136, 1);
-            mbarrier_init(smem + 144, 1);
-            mbarrier_init(smem + 152, 1);
-            mbarrier_init(smem + 160, 1);
+            // mma_done: 7 barriers, init_count=65
+            mbarrier_init(smem + 112, 65);
+            mbarrier_init(smem + 120, 65);
+            mbarrier_init(smem + 128, 65);
+            mbarrier_init(smem + 136, 65);
+            mbarrier_init(smem + 144, 65);
+            mbarrier_init(smem + 152, 65);
+            mbarrier_init(smem + 160, 65);
             // --- pipeline 'mainloop_pipe' ---
             // mainloop_done: 2 barriers, init_count=1
             mbarrier_init(smem + 168, 1);
@@ -388,6 +388,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap SFA, const __grid_consta
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((sf_ready_addr + (transpose_stage) * 8) & 0xFEFFFFFF) : "memory");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                        :: "r"(mma_done_addr + (transpose_stage) * 8) : "memory");
                     transpose_stage += 1;
                     if (transpose_stage == 7) { transpose_stage = 0; _phase_tma_full ^= 1; }
                 }

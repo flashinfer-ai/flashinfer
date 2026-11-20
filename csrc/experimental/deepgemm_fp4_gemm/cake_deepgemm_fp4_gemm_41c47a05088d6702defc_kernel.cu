@@ -108,7 +108,7 @@ kernel_cake_deepgemm_fp4_gemm_41c47a05088d6702defc(const __grid_constant__ CUten
         // --- pipeline 'pipe' ---
         // full: 7 barriers, init_count=130
         // sf_full: 7 barriers, init_count=1
-        // empty: 7 barriers, init_count=1
+        // empty: 7 barriers, init_count=65
         // --- pipeline 'epi_pipe' ---
         // tmem_full: 2 barriers, init_count=1
         // tmem_empty: 2 barriers, init_count=256
@@ -116,6 +116,8 @@ kernel_cake_deepgemm_fp4_gemm_41c47a05088d6702defc(const __grid_constant__ CUten
         // Warp-cooperative initialization in physical record order.
         uint32_t _mbarrier_init_count_1_0 = 256;
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(23), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(21), "r"((uint32_t)(65)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(14), "r"((uint32_t)(1)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_1_0) : "r"(lane), "n"(7), "r"((uint32_t)(130)));
         if (lane < 27) {
             mbarrier_init(smem + 144384 + lane * 8, _mbarrier_init_count_1_0);
@@ -281,6 +283,9 @@ kernel_cake_deepgemm_fp4_gemm_41c47a05088d6702defc(const __grid_constant__ CUten
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((full_addr + (stage_2) * 8) & 0xFEFFFFFF) : "memory");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+                        :: "r"(empty_addr + (stage_2) * 8) : "memory");
                     stage_2 += 1;
                     if (stage_2 == 7) { stage_2 = 0; _phase_sf_full ^= 1; }
                 }
