@@ -977,11 +977,18 @@ def select_domain(
 
 
 def plan_num_split(work_items: int, max_seq_len: int, num_sms: int) -> int:
-    """Split-K factor of the FP8 page-64 producer from host-known sizes."""
+    """Split-K factor of the FP8 page-64 producer from host-known sizes.
+
+    At most one wave of clusters over all work items (``work_items * split <=
+    num_sms // 2``) and at most half the KV tiles of a ``max_seq_len`` row,
+    rounded up; at least one. One split launches the producer alone: its
+    ``num_split == 1`` path writes the normalized output and the LSE, so the
+    reducer does not run.
+    """
     max_tiles = max(1, (max_seq_len + _KV_TILE - 1) // _KV_TILE)
     cap = max(1, (max_tiles + 1) // 2)
     target = max(1, num_sms // max(1, work_items * _CLUSTER_SIZE))
-    return max(2, min(cap, target, max_tiles))
+    return min(cap, target)
 
 
 def plan_kv_split(total_q: int, max_seq_len: int, num_sms: int) -> int:

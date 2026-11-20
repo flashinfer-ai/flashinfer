@@ -2293,12 +2293,42 @@ def test_trtllm_mla_blackwell_row_metadata_is_computed_without_host_reads() -> N
 
 
 def test_trtllm_mla_blackwell_page64_split_plan_is_size_based() -> None:
+    """The FP8 page-64 split count reads the work items, max_seq_len and SM
+    count alone. It is one split when the work items exceed half the clusters
+    of a wave (``4 * work_items > num_sms``) or a ``max_seq_len`` row has at
+    most two KV tiles; otherwise the largest count within one wave of clusters
+    and half the row's KV tiles, rounded up."""
     from flashinfer.mla.cake_trtllm_mla_blackwell import plan_num_split
 
     assert plan_num_split(16, 4096, 148) == 4
     assert plan_num_split(1, 1024, 148) == 4
-    assert plan_num_split(64, 8192, 152) == 2
-    assert plan_num_split(1, 128, 148) == 2
+    assert plan_num_split(2, 600, 148) == 3
+    assert plan_num_split(37, 1024, 148) == 2
+    assert plan_num_split(38, 1024, 152) == 2
+    # One split: the producer writes the output and the LSE, no reducer runs.
+    assert plan_num_split(38, 1024, 148) == 1
+    assert plan_num_split(39, 1024, 152) == 1
+    assert plan_num_split(64, 8192, 152) == 1
+    assert plan_num_split(128, 1024, 148) == 1
+    assert plan_num_split(1, 128, 148) == 1
+    assert plan_num_split(1, 256, 152) == 1
+    assert plan_num_split(1, 257, 152) == 2
+    for num_sms in (148, 152):
+        for work_items in range(1, 257):
+            for max_seq_len in (1, 128, 256, 257, 600, 1024, 4096, 16384):
+                split = plan_num_split(work_items, max_seq_len, num_sms)
+                tiles = -(-max_seq_len // 128)
+                half = -(-tiles // 2)
+                case = (work_items, max_seq_len, num_sms)
+                assert 1 <= split <= half, case
+                assert split == 1 or work_items * split * 2 <= num_sms, case
+                if work_items * 4 > num_sms or tiles <= 2:
+                    assert split == 1, case
+                else:
+                    # The largest count within the wave and the tile cap.
+                    assert split >= 2, case
+                    wave_full = work_items * (split + 1) * 2 > num_sms
+                    assert wave_full or split == half, case
 
 
 def test_trtllm_mla_blackwell_splitkv_plan_matches_rule() -> None:
@@ -2859,6 +2889,38 @@ _PADDED_ROW_CASES = {
         1024,
         "mla_fp8_page64_pdl",
     ),
+    # One split (plan_num_split): 128 and 40 query rows exceed half the
+    # clusters of a wave; a 256-token max_seq_len has two KV tiles.
+    "fp8_page64_one_split": (
+        torch.float8_e4m3fn,
+        128,
+        1,
+        64,
+        False,
+        False,
+        1024,
+        "mla_fp8_page64_pdl",
+    ),
+    "fp8_page64_q2_one_split": (
+        torch.float8_e4m3fn,
+        20,
+        2,
+        64,
+        False,
+        False,
+        1024,
+        "mla_fp8_page64_pdl",
+    ),
+    "fp8_page64_short_one_split": (
+        torch.float8_e4m3fn,
+        4,
+        1,
+        64,
+        False,
+        False,
+        256,
+        "mla_fp8_page64_pdl",
+    ),
     "bf16_tail": (torch.bfloat16, 4, 2, 32, False, True, 1024, "mla_bf16_tail"),
     "fp8_tail": (torch.float8_e4m3fn, 4, 2, 32, False, False, 1024, "mla_fp8_tail"),
     "splitkv": (torch.bfloat16, 4, 2, 32, False, False, 4096, "mla_bf16_splitkv"),
@@ -2896,6 +2958,12 @@ def test_trtllm_mla_blackwell_padded_rows_output_zero(
     )
     sinks = torch.randn(128, device="cuda", dtype=torch.float32) * 2.0 if sink else None
     rows = _query_rows(kv_lens, [q_len] * batch)
+    if domain == "mla_fp8_page64_pdl":
+        from flashinfer.mla.cake_trtllm_mla_blackwell import plan_num_split
+
+        num_sms = get_device_sm_count(torch.device("cuda"))
+        one_split = plan_num_split(len(rows), max_len, num_sms) == 1
+        assert one_split == case.endswith("one_split")
     reference = _blackwell_rows_reference(
         query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size, sinks
     )
@@ -2951,6 +3019,7 @@ _GRAPH_CASES = {
     "clc_one_wave": (torch.bfloat16, 16, 4, 32, 1024),
     "clc_ordered": (torch.bfloat16, 64, 4, 32, 1024),
     "fp8_page64": (torch.float8_e4m3fn, 4, 2, 64, 1024),
+    "fp8_page64_one_split": (torch.float8_e4m3fn, 64, 1, 64, 1024),
     "splitkv": (torch.bfloat16, 4, 2, 32, 4096),
     "splitkv_page64": (torch.bfloat16, 3, 1, 64, 2048),
 }
@@ -3011,6 +3080,8 @@ def test_trtllm_mla_blackwell_graph_replay_reads_current_rows(
         _assert_rows(out, reference, rows, dtype)
     if case.startswith("splitkv"):
         assert set(blackwell_domains) == {"mla_bf16_splitkv"}
+    if case.startswith("fp8_page64"):
+        assert set(blackwell_domains) == {"mla_fp8_page64_pdl"}
 
 
 # name: (batch, q_len, page_size, ragged q_lens with the same total, domain)
@@ -3419,10 +3490,18 @@ void write_after_spin_launch(torch::Tensor dst, torch::Tensor src, int64_t spin_
         (torch.bfloat16, 64, 4, 32, 1024),
         (torch.bfloat16, 16, 4, 32, 1024),
         (torch.float8_e4m3fn, 4, 2, 64, 1024),
+        (torch.float8_e4m3fn, 64, 1, 64, 1024),
         (torch.bfloat16, 4, 2, 32, 2048),
         (torch.bfloat16, 3, 1, 64, 4096),
     ],
-    ids=["clc_ordered", "clc_one_wave", "fp8_page64", "splitkv", "splitkv_page64"],
+    ids=[
+        "clc_ordered",
+        "clc_one_wave",
+        "fp8_page64",
+        "fp8_page64_one_split",
+        "splitkv",
+        "splitkv_page64",
+    ],
 )
 def test_trtllm_mla_blackwell_reads_rows_after_the_dependency_wait(
     dtype, batch, q_len, page_size, max_len, blackwell_domains, monkeypatch

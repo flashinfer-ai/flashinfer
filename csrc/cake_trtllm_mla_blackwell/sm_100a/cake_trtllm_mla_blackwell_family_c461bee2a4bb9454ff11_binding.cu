@@ -403,7 +403,7 @@ void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::
   check_cuda_tensor(arg_seq_lens, "seq_lens");
   check_cuda_tensor(arg_page_table, "page_table");
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream_ptr));
-  if (!(num_split > 1)) {
+  if (!(num_split >= 1)) {
     TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (softmax_scale_log2=" << softmax_scale_log2 << ", bmm2_scale=" << bmm2_scale << ", num_split=" << num_split << ", num_queries=" << num_queries << ", max_pages_per_seq=" << max_pages_per_seq << ", num_reduce_ctas=" << num_reduce_ctas << ")";
   }
   check_cuda_tensor(arg_ws_partial_output, "partial_output");
@@ -424,7 +424,9 @@ void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::
     // work_batch_indices; seq_lens fills that parameter.
     CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS_0::Run(arg_query, arg_kv, arg_kv, arg_ws_partial_output, arg_ws_partial_stats, arg_output, arg_lse, arg_seq_lens, arg_seq_lens, arg_page_table, softmax_scale_log2, bmm2_scale, num_split, num_queries, max_pages_per_seq, q_len, gx, gy, gz, stream);
   }
-  {
+  // One split: the producer writes the normalized output and the LSE itself,
+  // so the reducer is not launched.
+  if (num_split > 1) {
     int64_t gx = num_reduce_ctas;
     int64_t gy = 2;
     int64_t gz = num_queries;

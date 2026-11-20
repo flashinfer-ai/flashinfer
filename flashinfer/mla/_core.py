@@ -2854,11 +2854,12 @@ _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 # Query rows (batch * q_len) up to which the Cake candidate is profiled and
 # runs. It keeps every generic CLC launch within the device work-order window.
 # The FP8 page-64 route allocates its split-K partials on every call (about
-# rows * num_split * 129 KiB, num_split 2 from 37 rows on), also inside every
-# captured graph, so FP8 stops at 128 rows (about 33 MiB). The BF16 split-KV
-# route allocates its partials on every call too, at most one wave of clusters
-# (rows * num_split <= num_sms // 2) of 128.5 KiB each, about 10 MiB. The other
-# routes the candidate takes allocate nothing per call but an 8 KiB work order.
+# rows * num_split * 129 KiB; one split from 38 rows on, 39 on 152 SMs), also
+# inside every captured graph, so FP8 stops at 128 rows (about 16 MiB). The
+# BF16 split-KV route allocates its partials on every call too, at most one
+# wave of clusters (rows * num_split <= num_sms // 2) of 128.5 KiB each, about
+# 10 MiB. The other routes the candidate takes allocate nothing per call but an
+# 8 KiB work order.
 _CAKE_MLA_MAX_ROWS = 512
 _CAKE_MLA_FP8_MAX_ROWS = 128
 
