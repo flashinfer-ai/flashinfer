@@ -36,6 +36,10 @@ def get_activation_matrix_rows() -> tuple[ActivationMatrixRow, ...]:
     """Collect and validate backend × quantization × activation rows."""
     rows = []
     for config_type, runner_type in _BACKEND_RUNNERS.items():
+        if getattr(runner_type, "capabilities_from_kernel_registry", False):
+            # The specialized backend's capabilities are the union of its
+            # registered kernels'; the design doc describes it separately.
+            continue
         pairs = runner_type.supported_quant_variants
         by_quant = runner_type.supported_activation_classes_by_quant
         if by_quant and set(by_quant) != set(pairs):

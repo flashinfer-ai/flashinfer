@@ -1,0 +1,7 @@
+{
+  "op": "MoELayer specialized backend, kernel bf16_decode_sm103_glm52",
+  "path": "BF16 MoE decode on SM103 (CUDA); geometry fixed in kernel.py",
+  "compute_capability": [10, 3],
+  "num_tokens": [1, 2, 6, 10],
+  "note": "Token counts the kernel admits. Keep only counts where the kernel-level A/B (CUDA-graph replay, served inputs) beats the trtllm-gen path beyond noise; MoELayer runs every other count on its other candidates."
+}
