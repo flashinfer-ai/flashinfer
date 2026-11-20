@@ -19,7 +19,6 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
-from benchmarks.bench_rubin_gemm import configuration
 from flashinfer.prims_ts.batched_gemm import batched_gemm_run as runner
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     DType,
@@ -30,12 +29,13 @@ from flashinfer.prims_ts.batched_gemm.gmem_c_resources import GmemCResource
 from flashinfer.tllm_enums import WeightLayout
 from tests.prims_ts.python_body import python_body
 from tests.prims_ts.routing_matrix_utils import CGAS
+from tests.prims_ts.rubin_gemm_test_utils import rubin_gemm_options
 from tests.prims_ts.test_batched_gemm_eight_warp_fp4_fc1 import eight_warp_fc1_options
 from tests.prims_ts.test_batched_gemm_rolled_fp4_fc1 import rolled_fc1_options
 
 
 def shuffled_profile(mode, cga, weight_layout, group_size=1):
-    _, options = configuration("e32", mode)
+    options = rubin_gemm_options(mode, cga)
     flexible = cga != (2, 1)
     options.update(
         cluster_dim_x=cga[0],
@@ -56,7 +56,7 @@ def shuffled_profile(mode, cga, weight_layout, group_size=1):
 def test_grouped_shuffle_accumulator_matches_host_weight_and_scale_rows(
     monkeypatch, group_size, shuffled
 ):
-    _, options = configuration("e32", "fc1")
+    options = rubin_gemm_options("fc1", (4, 2))
     options.update(gated_weight_group_size=group_size, use_shuffled_matrix=shuffled)
     cfg = make_config(**options)
     validate_config(cfg)
@@ -461,13 +461,29 @@ def test_plain_preload_register_allocation_gpu(
     # Cover the opt-in spill-free allocations separately from the retained
     # timing presets. More epilogue registers require smaller loader budgets
     # in the 24-warp routed CTA; the 12-warp dense CTA has enough headroom.
-    _, options = configuration(
-        "e32" if cga == (4, 2) else "e256",
-        mode,
+    options = rubin_gemm_options(mode, cga)
+    options.update(
         use_shuffled_matrix=shuffled,
-        weight_layout="major_k" if layout == WeightLayout.MajorK else "block_major_k",
+        weight_layout=int(layout),
         epilogue_regs=176 if mode == "routed-bf16" else 160,
-        non_epilogue_regs=32 if mode == "routed-bf16" else 80,
+    )
+    options.update(
+        dict.fromkeys(
+            (
+                "load_a_regs",
+                "load_b_regs",
+                "load_sfa_regs",
+                "load_sfb_regs",
+                "load_regs",
+                "load_sf_regs",
+                "copy_sf_regs",
+                "mma_regs",
+                "sync_regs",
+                "workid_regs",
+                "padding_regs",
+            ),
+            32 if mode == "routed-bf16" else 80,
+        )
     )
     compiled = []
     original_compile = runner._compile_for_launch
