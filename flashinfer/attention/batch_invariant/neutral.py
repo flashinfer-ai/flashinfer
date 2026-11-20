@@ -11,15 +11,17 @@ typed error.
 argument                                    accepted (no effect on the bits); everything else raises
 ==========================================  =====================================================================================
 ``q_scale`` / ``o_scale``                   ``None`` or exactly ``1.0`` for every class (the query and the output are bf16 and
-                                            unscaled)
-``k_scale`` / ``v_scale``                   ``None`` or exactly ``1.0`` for a bf16 KV cache and for the token-head-scale classes
-                                            (their scales are the per-key tensors of ``kv_cache_sf``); the per-tensor low-bit KV
+                                            unscaled), as a host number or a one-element CPU tensor (a device tensor would
+                                            cost a readback per ``run()``: refused)
+``k_scale`` / ``v_scale``                   ``None`` or exactly ``1.0`` (host values, as above) for a bf16 KV cache and for the
+                                            token-head-scale classes (their scales are the per-key tensors of
+                                            ``kv_cache_sf``); the per-tensor low-bit KV
                                             classes take them as operands (any value their chain admits,
                                             ``engine.check_sm_scale`` / ``engine.check_v_scale``)
 ==========================================  =====================================================================================
 
-A scale is a Python number or a one-element floating-point tensor (read on the host: a synchronisation for a device tensor,
-so a captured CUDA graph should pass numbers).
+A scale a class takes as an operand is a Python number or a one-element floating-point tensor (read on the host: a
+synchronisation for a device tensor, so a captured CUDA graph should pass numbers); a unit-only scale is a host value.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import torch
 from ...batch_invariant.support import unsupported
 
 SCALE_NAMES = ("q_scale", "k_scale", "v_scale", "o_scale")
+_UNIT_SCALES = "unscaled bf16 operands (q_scale / k_scale / v_scale / o_scale of None or exactly 1.0, as host numbers)"
 
 
 def scale_value(x, name: str, class_name: str) -> float:
@@ -59,20 +62,39 @@ def check_unit_scales(
     class_name: str, scales: Sequence, free: Sequence[str] = ()
 ) -> None:
     """``scales`` in the order of :data:`SCALE_NAMES`: each must be ``None`` or exactly one (compared with ``1.0`` exactly,
-    no tolerance: engines pass the exact value). A unit scale multiplies nothing, so it is the unscaled operand; any other
-    value is a term the class does not have. ``free`` names the scales a class takes as operands (the per-tensor
-    ``k_scale`` / ``v_scale`` of a low-bit KV class): those are not checked here. The query and the output scale are
-    unit-only for every class."""
-    fixed = [n for n in SCALE_NAMES if n not in free]
-    limit = (
-        f"unscaled bf16 operands ({' / '.join(fixed)} of None or exactly 1.0)"
-        if not free
-        else f"an unscaled bf16 query and output ({' / '.join(fixed)} of None or exactly 1.0; "
-        f"{' / '.join(free)} are the class's per-tensor scales)"
-    )
+    no tolerance: engines pass the exact value), as a host number or a one-element CPU tensor -- a device tensor is refused
+    whatever its value, since reading it would synchronise every ``run()``. A unit scale multiplies nothing, so it is the
+    unscaled class; any other value is a term the class does not have. ``free`` names the scales a class takes as operands
+    (the per-tensor ``k_scale`` / ``v_scale`` of a low-bit KV class): those are not checked here. The query and the output
+    scale are unit-only for every class."""
+    limit = _UNIT_SCALES
+    if free:
+        fixed = [n for n in SCALE_NAMES if n not in free]
+        limit = (
+            f"an unscaled bf16 query and output ({' / '.join(fixed)} of None or exactly 1.0, as host numbers; "
+            f"{' / '.join(free)} are the class's per-tensor scales)"
+        )
     for name, value in zip(SCALE_NAMES, scales, strict=False):
         if value is None or name in free:
             continue
-        shown = scale_value(value, name, class_name)
-        if shown != 1.0:
+        shown = value
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                raise unsupported(
+                    class_name,
+                    f"{name} as a tensor on {value.device} (reading it would stall every run())",
+                    limit,
+                )
+            if value.numel() != 1:
+                raise unsupported(
+                    class_name,
+                    f"{name} as a tensor of {value.numel()} elements",
+                    limit,
+                )
+            shown = value.item()
+        try:
+            unit = float(shown) == 1.0
+        except (TypeError, ValueError):
+            unit = False
+        if not unit:
             raise unsupported(class_name, f"{name}={shown!r}", limit)

@@ -728,7 +728,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         w.run(pr.q, pr.cache("NHD"), k_scale=lp.k_scale)
     with pytest.raises(bi.BatchInvariantUnsupportedError):  # the other fp8 format
         w.run(pr.q, (k.view(E5), v.view(E5)), k_scale=lp.k_scale)
-    for bad in (0.5, 2.0, torch.tensor([0.5], device=pr.device), "1.0"):
+    for bad in (0.5, 2.0, torch.tensor([0.5]), torch.ones(2), "x"):
         with pytest.raises(
             bi.BatchInvariantUnsupportedError, match="q_scale"
         ):  # a scaled query
@@ -768,10 +768,21 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert torch.equal(
         bits(w.run(pr.q, (k, v), k_scale=lp.k_scale, v_scale=lp.v_scale)), ref
     )  # the plan survived
-    # q_scale of 1.0 (a number or a 1-element tensor, on the host or the device) is the unscaled query: the bits of no q_scale
-    for unit in (1.0, 1, torch.ones(1), torch.tensor(1.0, device=pr.device)):
+    # q_scale of 1.0 (a host number or a 1-element CPU tensor) is the unscaled query: the bits of no q_scale; a device tensor
+    # is refused whatever it holds (reading it would synchronise every run())
+    for unit in (1.0, 1, torch.ones(1), torch.tensor(1.0)):
         got = w.run(pr.q, (k, v), q_scale=unit, k_scale=lp.k_scale, v_scale=lp.v_scale)
         assert torch.equal(bits(got), ref)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="q_scale as a tensor on cuda"
+    ):
+        w.run(
+            pr.q,
+            (k, v),
+            q_scale=torch.ones(1, device=pr.device),
+            k_scale=lp.k_scale,
+            v_scale=lp.v_scale,
+        )
     # the bf16 class has no scale in its chain: every scale is accepted at None / 1.0 (the same bits) and refused otherwise
     wb = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
     wb.plan(
@@ -782,11 +793,16 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         for bad in (2.0, 0.999, torch.tensor([2.0])):
             with pytest.raises(bi.BatchInvariantUnsupportedError, match=name):
                 wb.run(pr.q, pr.cache("NHD"), **{name: bad})
-    unit = torch.ones(1, device=pr.device)
+    unit = torch.ones(1)
     assert torch.equal(
         bits(wb.run(pr.q, pr.cache("NHD"), q_scale=1.0, k_scale=1.0, v_scale=unit)),
         bref,
     )
+    for name in ("q_scale", "k_scale", "v_scale"):
+        with pytest.raises(
+            bi.BatchInvariantUnsupportedError, match=f"{name} as a tensor on cuda"
+        ):
+            wb.run(pr.q, pr.cache("NHD"), **{name: torch.ones(1, device=pr.device)})
     with pytest.raises(
         bi.BatchInvariantUnsupportedError
     ):  # an fp8 cache over a bf16 plan
@@ -1901,7 +1917,7 @@ def test_serving_call_shape_fp8(layout):
     d.run(
         pr.q[last].contiguous(),
         cache,
-        q_scale=torch.ones(1, device=pr.device),
+        q_scale=torch.ones(1),
         k_scale=ks,
         v_scale=vs,
         out=dout,
