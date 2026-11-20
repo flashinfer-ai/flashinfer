@@ -1186,8 +1186,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653(const __grid_co
                     }
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     uint32_t _smem_stats_line_reg_0[4];
-                    uint32_t _smem_b128_2[4];
-                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_2[0]), "=r"(_smem_b128_2[1]), "=r"(_smem_b128_2[2]), "=r"(_smem_b128_2[3]) : "r"(smem_stats_line_addr + (my_row * 4) * 4));
+                    uint64_t _smem_b128_2[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_b128_2[0]), "=l"(_smem_b128_2[1]) : "r"(smem_stats_line_addr + (my_row * 4) * 4));
                     _smem_stats_line_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[0];
                     _smem_stats_line_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[1];
                     _smem_stats_line_reg_0[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[2];
@@ -2693,8 +2693,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653(const __grid_co
                     }
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     uint32_t _smem_stats_line_reg_1[4];
-                    uint32_t _smem_b128_2[4];
-                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_b128_2[0]), "=r"(_smem_b128_2[1]), "=r"(_smem_b128_2[2]), "=r"(_smem_b128_2[3]) : "r"(smem_stats_line_addr + (256 + my_row_1 * 4) * 4));
+                    uint64_t _smem_b128_2[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_b128_2[0]), "=l"(_smem_b128_2[1]) : "r"(smem_stats_line_addr + (256 + my_row_1 * 4) * 4));
                     _smem_stats_line_reg_1[0] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[0];
                     _smem_stats_line_reg_1[1] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[1];
                     _smem_stats_line_reg_1[2] = reinterpret_cast<const uint32_t*>(&_smem_b128_2)[2];

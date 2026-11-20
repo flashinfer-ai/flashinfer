@@ -9291,17 +9291,17 @@ def test_source_retained_start_programs_are_the_round5_files():
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     source_dir = module._source_dir()
     retained = {
-        "device/mamba_ssd_q_tmem_alias_bf16_batched_3876f7208d.cu": "57c5d59a5d8250d0a0fbb1c502134b19b9c00cac1b92c7140c961155e1fb836a",
-        "device/mamba_ssd_q_tmem_alias_bf16_batched_noring_77156893a6.cu": "efdf7380e0e7d38d23501203377dc689f322e9ac2e579765155422a2d107a6c3",
-        "device/mamba_ssd_q_tmem_alias_bf16_varlen_636342f6cc.cu": "bff217fa7919d49a6c621d412993d23d2763527f05cfa9518391f6d89a58956c",
-        "device/mamba_ssd_q_tmem_alias_bf16_varlen_noring_0f475595b9.cu": "2b039f415c0b44deec949b7190809aad24f5f75f1114c2414c2a95ef2b31653f",
-        "device/mamba_ssd_q_tmem_alias_f16_batched_f074fc128b.cu": "0304e7bf49913c2007b5bdb016904ccba568f25c336b38c04c94b1a589646def",
-        "device/mamba_ssd_q_tmem_alias_f16_batched_noring_d19039c163.cu": "a10529397bf02b4599e0e6f689da069275c519b0f5c0823b63ee86d940d59804",
-        "device/mamba_ssd_q_tmem_alias_f16_varlen_9759edcc11.cu": "0c6f30bebaeb3fefc2daedb50d1fdb5300873d35c28794120d123665bb663eec",
-        "device/mamba_ssd_q_tmem_alias_f16_varlen_noring_d11774ac8e.cu": "493e7eec20646dd16ced49820dce043b3dc70c37f80cd1d834d2d9fd562f081b",
-        "device/mamba_ssd_q_tmem_alias_f32_batched_2dc39c9955.cu": "5f1dbb9c66f05a228fb035e77363bd265d4c6a88fd733234475573ad8ef11f61",
-        "device/mamba_ssd_q_tmem_alias_f32_batched_noring_bbd73b5202.cu": "52b64b0dd5fbb9d5435a4f06f2e248018661c66deb4975e69f35c06eae6854bd",
-        "device/mamba_ssd_q_tmem_alias_f32_varlen_6037fe869d.cu": "6d2318ba0d6a9a64ef3249a34e21b1318773ced96b0aa8d0786c1effb5d3e4b0",
+        "device/mamba_ssd_q_tmem_alias_bf16_batched_57c5d59a5d.cu": "57c5d59a5d8250d0a0fbb1c502134b19b9c00cac1b92c7140c961155e1fb836a",
+        "device/mamba_ssd_q_tmem_alias_bf16_batched_noring_efdf7380e0.cu": "efdf7380e0e7d38d23501203377dc689f322e9ac2e579765155422a2d107a6c3",
+        "device/mamba_ssd_q_tmem_alias_bf16_varlen_bff217fa79.cu": "bff217fa7919d49a6c621d412993d23d2763527f05cfa9518391f6d89a58956c",
+        "device/mamba_ssd_q_tmem_alias_bf16_varlen_noring_2b039f415c.cu": "2b039f415c0b44deec949b7190809aad24f5f75f1114c2414c2a95ef2b31653f",
+        "device/mamba_ssd_q_tmem_alias_f16_batched_0304e7bf49.cu": "0304e7bf49913c2007b5bdb016904ccba568f25c336b38c04c94b1a589646def",
+        "device/mamba_ssd_q_tmem_alias_f16_batched_noring_a10529397b.cu": "a10529397bf02b4599e0e6f689da069275c519b0f5c0823b63ee86d940d59804",
+        "device/mamba_ssd_q_tmem_alias_f16_varlen_0c6f30beba.cu": "0c6f30bebaeb3fefc2daedb50d1fdb5300873d35c28794120d123665bb663eec",
+        "device/mamba_ssd_q_tmem_alias_f16_varlen_noring_493e7eec20.cu": "493e7eec20646dd16ced49820dce043b3dc70c37f80cd1d834d2d9fd562f081b",
+        "device/mamba_ssd_q_tmem_alias_f32_batched_5f1dbb9c66.cu": "5f1dbb9c66f05a228fb035e77363bd265d4c6a88fd733234475573ad8ef11f61",
+        "device/mamba_ssd_q_tmem_alias_f32_batched_noring_52b64b0dd5.cu": "52b64b0dd5fbb9d5435a4f06f2e248018661c66deb4975e69f35c06eae6854bd",
+        "device/mamba_ssd_q_tmem_alias_f32_varlen_6d2318ba0d.cu": "6d2318ba0d6a9a64ef3249a34e21b1318773ced96b0aa8d0786c1effb5d3e4b0",
         "host/mamba_ssd_combined_sequence.cpp": "a992780866f3b70c21f009dfdc74753acecc8573925d219dad5e822821771344",
     }
     assert len(retained) == 12

@@ -8798,26 +8798,26 @@ kernel_h3_out_proj_gemm_fused(const __grid_constant__ CUtensorMap A, const __gri
                         : "=r"(b_frag[12]), "=r"(b_frag[13]), "=r"(b_frag[14]), "=r"(b_frag[15])
                         : "r"(B_stage_addr + mma_stage * 8192 + (unsigned int)((warp_n * 64 + 48 + (lane >> 4 & 1) * 8 + (lane & 7)) * 64) + (unsigned int)((lane >> 3 & 1) * 16 ^ (warp_n * 64 + 48 + (lane >> 4 & 1) * 8 + (lane & 7) >> 1 & 3) << 4))
                         : "memory");
-                    uint32_t _smem_raw_0[4];
-                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_raw_0[0]), "=r"(_smem_raw_0[1]), "=r"(_smem_raw_0[2]), "=r"(_smem_raw_0[3]) : "r"(SFA_slot_addr + (unsigned int)((kp_1 * 2 >> 1 & 1) * 4096) + (unsigned int)((warp_m * 64 + (lane & 1) * 8 + (lane >> 2)) * 16)));
+                    uint64_t _smem_raw_0[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_0[0]), "=l"(_smem_raw_0[1]) : "r"(SFA_slot_addr + (unsigned int)((kp_1 * 2 >> 1 & 1) * 4096) + (unsigned int)((warp_m * 64 + (lane & 1) * 8 + (lane >> 2)) * 16)));
                     sfa_pair[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_0)[0];
                     sfa_pair[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_0)[1];
                     sfa_pair[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_0)[2];
                     sfa_pair[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_0)[3];
-                    uint32_t _smem_raw_1[4];
-                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_raw_1[0]), "=r"(_smem_raw_1[1]), "=r"(_smem_raw_1[2]), "=r"(_smem_raw_1[3]) : "r"(SFA_slot_addr + (unsigned int)((kp_1 * 2 >> 1 & 1) * 4096) + (unsigned int)((warp_m * 64 + 16 + (lane & 1) * 8 + (lane >> 2)) * 16)));
+                    uint64_t _smem_raw_1[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_1[0]), "=l"(_smem_raw_1[1]) : "r"(SFA_slot_addr + (unsigned int)((kp_1 * 2 >> 1 & 1) * 4096) + (unsigned int)((warp_m * 64 + 16 + (lane & 1) * 8 + (lane >> 2)) * 16)));
                     sfa_pair[4] = reinterpret_cast<const uint32_t*>(&_smem_raw_1)[0];
                     sfa_pair[5] = reinterpret_cast<const uint32_t*>(&_smem_raw_1)[1];
                     sfa_pair[6] = reinterpret_cast<const uint32_t*>(&_smem_raw_1)[2];
                     sfa_pair[7] = reinterpret_cast<const uint32_t*>(&_smem_raw_1)[3];
-                    uint32_t _smem_raw_2[4];
-                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_raw_2[0]), "=r"(_smem_raw_2[1]), "=r"(_smem_raw_2[2]), "=r"(_smem_raw_2[3]) : "r"(SFA_slot_addr + (unsigned int)((kp_1 * 2 >> 1 & 1) * 4096) + (unsigned int)((warp_m * 64 + 32 + (lane & 1) * 8 + (lane >> 2)) * 16)));
+                    uint64_t _smem_raw_2[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_2[0]), "=l"(_smem_raw_2[1]) : "r"(SFA_slot_addr + (unsigned int)((kp_1 * 2 >> 1 & 1) * 4096) + (unsigned int)((warp_m * 64 + 32 + (lane & 1) * 8 + (lane >> 2)) * 16)));
                     sfa_pair[8] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[0];
                     sfa_pair[9] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[1];
                     sfa_pair[10] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[2];
                     sfa_pair[11] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[3];
-                    uint32_t _smem_raw_3[4];
-                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_raw_3[0]), "=r"(_smem_raw_3[1]), "=r"(_smem_raw_3[2]), "=r"(_smem_raw_3[3]) : "r"(SFA_slot_addr + (unsigned int)((kp_1 * 2 >> 1 & 1) * 4096) + (unsigned int)((warp_m * 64 + 48 + (lane & 1) * 8 + (lane >> 2)) * 16)));
+                    uint64_t _smem_raw_3[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_3[0]), "=l"(_smem_raw_3[1]) : "r"(SFA_slot_addr + (unsigned int)((kp_1 * 2 >> 1 & 1) * 4096) + (unsigned int)((warp_m * 64 + 48 + (lane & 1) * 8 + (lane >> 2)) * 16)));
                     sfa_pair[12] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[0];
                     sfa_pair[13] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[1];
                     sfa_pair[14] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[2];

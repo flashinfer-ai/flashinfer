@@ -1033,6 +1033,7 @@ def test_device_flags_compile_out_the_libcudacxx_automatic_storage_check(
     support (their libcu++ spells the macro ``_LIBCUDACXX_ATOMIC_UNSAFE_AUTOMATIC_STORAGE``).
     """
     import subprocess
+    import sys
 
     from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim import cake_jit
 
@@ -1057,6 +1058,12 @@ def test_device_flags_compile_out_the_libcudacxx_automatic_storage_check(
                     "-arch=compute_120a",
                     "-std=c++17",
                     "-O3",
+                    # CCCL requires the conforming preprocessor in cl.exe.
+                    *(
+                        ["-Xcompiler", "/Zc:preprocessor"]
+                        if sys.platform == "win32"
+                        else []
+                    ),
                     *defines,
                     str(source),
                     "-o",

@@ -68,7 +68,7 @@
       "sha256": "6aed40c456a1b0887e11945f0228d8d5f8cdd961385078f87c4d9d323083add0"
     },
     {
-      "bytes": 102953,
+      "bytes": 102974,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_kernel.cu",
       "sha256": "6a41357a688cdf2322720ee3cde591e04296a49de6fc782a416417352127c7c9"
@@ -80,7 +80,7 @@
       "sha256": "3d486b7dd6cf08c70fcf89c00b48ccc5e54c7a34effa99358d5da03ec01c92df"
     },
     {
-      "bytes": 110894,
+      "bytes": 110915,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_kernel.cu",
       "sha256": "0a01b54de3ab644b90c93ad006d7a47c3fdf6eb58b1a89dd8c6168f2fe8d01ba"
@@ -92,13 +92,13 @@
       "sha256": "1972105d326989ac23b453d828ee694f2435141d8eb748b0ae9d83e2b4571e99"
     },
     {
-      "bytes": 136724,
+      "bytes": 136745,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_swap_kernel.cu",
       "sha256": "1bc6ee9e65ab79159d854ba3e30904b1432837936b3c1c44b4447b92cf7b6d52"
     },
     {
-      "bytes": 87057,
+      "bytes": 87078,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_kernel.cu",
       "sha256": "a55423047d76bedd09498516ccbe636d93830376d8d96373caea43fea497be87"
@@ -110,7 +110,7 @@
       "sha256": "e2e524cdeaad307de0e6ea903e23dcdf73eb372f1cbf444fb6d5e575f3d2d6fa"
     },
     {
-      "bytes": 94998,
+      "bytes": 95019,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_kernel.cu",
       "sha256": "b585874380a488ccfae3e048610dfe7f176e2a4aea4b36033c25f80321b9b8ae"
@@ -122,7 +122,7 @@
       "sha256": "93285fa7a230c24af2ff53de61288d08a537b54a371dd37e967052ba191dc812"
     },
     {
-      "bytes": 135372,
+      "bytes": 135393,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_swap_kernel.cu",
       "sha256": "721349e7535a173ec570a76835a430932509145fda80baec00945cd662e9bb5c"
@@ -140,7 +140,7 @@
       "sha256": "f593bb2e692f974212848be80e9590514b583f1ae55cd74e47c24ef53c8f0900"
     },
     {
-      "bytes": 103784,
+      "bytes": 103805,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_kernel.cu",
       "sha256": "06842de2383e31797cf213e6e10913cae44fbf42484e0b7d3e57a1eef5ce6cc4"
@@ -152,13 +152,13 @@
       "sha256": "df207749d3f449cf2c642288b0fc0027a4080a313c4a0d47ab0020526085c183"
     },
     {
-      "bytes": 139850,
+      "bytes": 139871,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_swap_kernel.cu",
       "sha256": "bd0dc7590226eb8de4c3b522b633a45a3e915aee05050c026eaaa1dfd4aef4d8"
     },
     {
-      "bytes": 93609,
+      "bytes": 93630,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_kernel.cu",
       "sha256": "2ba7af7d8f9fcd029fa32c539f93232d705fda7a0384b4c09e35e2f284096475"
@@ -226,7 +226,7 @@
       },
       "closure": [
         {
-          "bytes": 87057,
+          "bytes": 87078,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_kernel.cu",
           "sha256": "a55423047d76bedd09498516ccbe636d93830376d8d96373caea43fea497be87"
         },
@@ -236,7 +236,7 @@
           "sha256": "710bf8b7df40825aee86723fff71ea779a158cf142c0c7c74965c7cb6cf8406d"
         }
       ],
-      "closure_sha256": "1929236253070e0aad02cd009d8cc13249f486723fb4d4c331d84a07e01afab0",
+      "closure_sha256": "3f3ef9753b2da680e561c1ff026ce1a922587b489e4b1b7fdfd469a1f03e0a1b",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated",
@@ -351,7 +351,7 @@
       },
       "closure": [
         {
-          "bytes": 102953,
+          "bytes": 102974,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_kernel.cu",
           "sha256": "6a41357a688cdf2322720ee3cde591e04296a49de6fc782a416417352127c7c9"
         },
@@ -361,7 +361,7 @@
           "sha256": "6aed40c456a1b0887e11945f0228d8d5f8cdd961385078f87c4d9d323083add0"
         }
       ],
-      "closure_sha256": "44811d2ab4b1f257aee35b3a67ea5c8718af41a531b09f8f0ba56dde6e4d3f27",
+      "closure_sha256": "79b9f74a63a5cd21ed5c638841181c5b4cd401b5b37724bea6511861ab41a4b4",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp",
@@ -476,7 +476,7 @@
       },
       "closure": [
         {
-          "bytes": 93609,
+          "bytes": 93630,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_kernel.cu",
           "sha256": "2ba7af7d8f9fcd029fa32c539f93232d705fda7a0384b4c09e35e2f284096475"
         },
@@ -486,7 +486,7 @@
           "sha256": "c012efcaed791ef0288eb5e453ffe1b98ca9633f6fe03ed0a3b6d2fdd193bd35"
         }
       ],
-      "closure_sha256": "17746dbcfca36bc7262d46bcc517457a9cabc82fd266543dbb18319dfbaee876",
+      "closure_sha256": "ff57e73b22f3dea2d624950d77bd18841317e821de99522c4238145e70d5a540",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc2",
@@ -605,7 +605,7 @@
       },
       "closure": [
         {
-          "bytes": 94998,
+          "bytes": 95019,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_kernel.cu",
           "sha256": "b585874380a488ccfae3e048610dfe7f176e2a4aea4b36033c25f80321b9b8ae"
         },
@@ -615,7 +615,7 @@
           "sha256": "e2e524cdeaad307de0e6ea903e23dcdf73eb372f1cbf444fb6d5e575f3d2d6fa"
         }
       ],
-      "closure_sha256": "514b47d9e1969a6e9dc06303b3a89f7f22106e8b46d62c566f1d5b7029b3f269",
+      "closure_sha256": "94142cb6ac1397bcbd5615b0b0da04c677af410de58e0bb82f8c31754d59bf57",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_signal",
@@ -735,7 +735,7 @@
       },
       "closure": [
         {
-          "bytes": 110894,
+          "bytes": 110915,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_kernel.cu",
           "sha256": "0a01b54de3ab644b90c93ad006d7a47c3fdf6eb58b1a89dd8c6168f2fe8d01ba"
         },
@@ -745,7 +745,7 @@
           "sha256": "3d486b7dd6cf08c70fcf89c00b48ccc5e54c7a34effa99358d5da03ec01c92df"
         }
       ],
-      "closure_sha256": "5ed60ad85af42f34a5eeb586095294164f254e444bf9f900358ab6b07bd79a8d",
+      "closure_sha256": "7366ae513f2e9c08618181475d5dcd6788f8ef7cd2c74e967fb0dc95e048b644",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp_signal",
@@ -873,7 +873,7 @@
       },
       "closure": [
         {
-          "bytes": 103784,
+          "bytes": 103805,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_kernel.cu",
           "sha256": "06842de2383e31797cf213e6e10913cae44fbf42484e0b7d3e57a1eef5ce6cc4"
         },
@@ -883,7 +883,7 @@
           "sha256": "f593bb2e692f974212848be80e9590514b583f1ae55cd74e47c24ef53c8f0900"
         }
       ],
-      "closure_sha256": "48da12c18b8aea05e3e890aa249a90bb28489b2e904df8074ad373d7a12fe0fc",
+      "closure_sha256": "4339acaa0d8e6cb75e86e41b698c81dee520dab1ba5fa62fd83d7c7e70092135",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc2_early",
@@ -1007,7 +1007,7 @@
       },
       "closure": [
         {
-          "bytes": 135372,
+          "bytes": 135393,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_swap_kernel.cu",
           "sha256": "721349e7535a173ec570a76835a430932509145fda80baec00945cd662e9bb5c"
         },
@@ -1017,7 +1017,7 @@
           "sha256": "93285fa7a230c24af2ff53de61288d08a537b54a371dd37e967052ba191dc812"
         }
       ],
-      "closure_sha256": "ad8d533c7b28b3ddf6d9752ae1b81930cd51c35850993d12443356938e56b372",
+      "closure_sha256": "a2b7ec8fb8550116bd6bcb1a7d20da4c958ae545d006e2719d32834bb09b1959",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_signal_swap",
@@ -1152,7 +1152,7 @@
       },
       "closure": [
         {
-          "bytes": 136724,
+          "bytes": 136745,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_swap_kernel.cu",
           "sha256": "1bc6ee9e65ab79159d854ba3e30904b1432837936b3c1c44b4447b92cf7b6d52"
         },
@@ -1162,7 +1162,7 @@
           "sha256": "1972105d326989ac23b453d828ee694f2435141d8eb748b0ae9d83e2b4571e99"
         }
       ],
-      "closure_sha256": "af512c6c188f8bd112407f94c5f87a3425d05e1f3666c76da801c626c80a0e39",
+      "closure_sha256": "a4909072edd64a7476b9854cca52ef58655d15a61e694b32d8e1b15dd8403786",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_swap",
@@ -1305,7 +1305,7 @@
       },
       "closure": [
         {
-          "bytes": 139850,
+          "bytes": 139871,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_swap_kernel.cu",
           "sha256": "bd0dc7590226eb8de4c3b522b633a45a3e915aee05050c026eaaa1dfd4aef4d8"
         },
@@ -1315,7 +1315,7 @@
           "sha256": "df207749d3f449cf2c642288b0fc0027a4080a313c4a0d47ab0020526085c183"
         }
       ],
-      "closure_sha256": "962fcf698a909316f9480deb2afac6c435913c0658e6287af11f203af1534b7e",
+      "closure_sha256": "2c870ad7de3ddb45068963380837ad435e5b973a1c0b59cd9b1d956da3feb572",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc2_early_swap",

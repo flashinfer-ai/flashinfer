@@ -1165,8 +1165,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_d7765ec55e7dde4ef48d(const __grid_co
                         asm volatile("barrier.sync 2, 64;" ::: "memory");
                     }
                     unsigned int smem_regs[4];
-                    uint32_t _smem_raw_35[4];
-                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_raw_35[0]), "=r"(_smem_raw_35[1]), "=r"(_smem_raw_35[2]), "=r"(_smem_raw_35[3]) : "r"(smem_stats_line_addr + (unsigned int)(my_row * 4 * 4)));
+                    uint64_t _smem_raw_35[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_35[0]), "=l"(_smem_raw_35[1]) : "r"(smem_stats_line_addr + (unsigned int)(my_row * 4 * 4)));
                     smem_regs[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[0];
                     smem_regs[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[1];
                     smem_regs[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[2];
@@ -2620,8 +2620,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_d7765ec55e7dde4ef48d(const __grid_co
                         asm volatile("barrier.sync 5, 64;" ::: "memory");
                     }
                     unsigned int smem_regs_9[4];
-                    uint32_t _smem_raw_35[4];
-                    asm volatile("ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_smem_raw_35[0]), "=r"(_smem_raw_35[1]), "=r"(_smem_raw_35[2]), "=r"(_smem_raw_35[3]) : "r"(smem_stats_line_addr + (unsigned int)((256 + my_row_1 * 4) * 4)));
+                    uint64_t _smem_raw_35[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_35[0]), "=l"(_smem_raw_35[1]) : "r"(smem_stats_line_addr + (unsigned int)((256 + my_row_1 * 4) * 4)));
                     smem_regs_9[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[0];
                     smem_regs_9[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[1];
                     smem_regs_9[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_35)[2];
