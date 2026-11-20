@@ -58,8 +58,8 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
     if (name == "run_gemm") {
       return Function::FromTyped([this](TensorView input, TensorView weight, TensorView output,
                                         Optional<TensorView> scales_a,
-                                        Optional<TensorView> scales_b) {
-        runGemm(input, weight, output, scales_a, scales_b);
+                                        Optional<TensorView> scales_b, bool enable_pdl) {
+        runGemm(input, weight, output, scales_a, scales_b, enable_pdl);
       });
     } else if (name == "fp8_quantize_1x128") {
       return Function::FromTyped([this](TensorView input, TensorView outValueE4M3,
@@ -96,7 +96,8 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
   }
 
   void runGemm(const TensorView& input, const TensorView& weight, const TensorView& output,
-               const Optional<TensorView>& scales_a, const Optional<TensorView>& scales_b) {
+               const Optional<TensorView>& scales_a, const Optional<TensorView>& scales_b,
+               bool enable_pdl) {
     auto stream = get_stream(input.device());
 
     auto input_ptr = input.data_ptr();
@@ -167,11 +168,11 @@ class Fp8BlockScaleGemmRunner : public tvm::ffi::ModuleObj {
       runner->gemm(fp8_input, shape_k,    // input with leading dimension
                    fp8_weight, shape_k,   // weight with leading dimension
                    bf16_output, shape_n,  // output with leading dimension
-                   shape_m, shape_n, shape_k, scales_a_ptr, scales_b_ptr, stream);
+                   shape_m, shape_n, shape_k, scales_a_ptr, scales_b_ptr, stream, enable_pdl);
     } else {
       // BF16+BF16 or BF16+FP8: Use internal quantization path
       runner->gemm(output_ptr, input_ptr, weight_ptr, shape_m, shape_n, shape_k, stream,
-                   scales_a_ptr, scales_b_ptr);
+                   scales_a_ptr, scales_b_ptr, enable_pdl);
     }
   }
 
