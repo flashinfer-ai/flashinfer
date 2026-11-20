@@ -5,7 +5,8 @@
 The same mathematical contract as :func:`flashinfer.gemm.batch_deepgemm_fp8_nt_groupwise`:
 ``out[g, :masked_m[g], :] = (a[g] . b[g]^T)`` with FP8 E4M3 operands, per-row
 128-wide K-block A scales, 128x128 B block scales, FP32 accumulation with the
-block scales applied in DeepGEMM's K order, BF16 output; the contents of rows
+block scales applied in DeepGEMM's K order (the masked pair program below:
+inside its MMAs), BF16 output; the contents of rows
 at or beyond ``masked_m[g]`` are unspecified (whole tiles may be stored), as on
 the DeepGEMM path.
 
@@ -35,6 +36,17 @@ equal within the family's tolerance to the whole-GPU serving program shipped
 here, which is an older build, so falling back to the whole-GPU program may
 change the low bits of the result.  Every other call runs the whole-GPU
 program.
+
+On a 212-SM SM107a device, a packed-scale serving problem whose ``expected_m``
+reaches the low bound of ``PAIR_SERVING_EXPECTED_M`` (its homed bound when ``b``
+is homed, which :func:`localize_weights` does only where the memory runs at its
+full clock) runs the masked pair program instead (:func:`pair_serving_tile`):
+weights-major 2-CTA clusters, one persistent launch of at most half as many
+clusters as SMs.
+It never writes the rows at or beyond ``masked_m[g]`` (the contract still leaves
+them unspecified).  It applies the block scales inside block-scaled tensor-core
+MMAs and accumulates in FP32, so its low bits may differ from the serving
+program's and from DeepGEMM's.
 """
 
 from __future__ import annotations
@@ -53,6 +65,7 @@ from ..jit.gemm.cake_batch_deepgemm_fp8 import (
     ARG_PLANS,
     DOMAIN_SERVING_CELLS,
     DOMAIN_SERVING_PROGRAMS,
+    PAIR_SERVING_EXPECTED_M,
     PROGRAMS,
     SERVING_PROGRAMS,
     SUPPORTED_COMPUTE_CAPABILITIES,
@@ -98,6 +111,15 @@ DOMAIN_SERVING_ROUTE = "seed_serving_m32_packed_domain"
 PAIR_COUNTER_WORDS = 2
 DOMAIN_ARCH = "sm_107a"
 DOMAIN_COUNTERS = ("counters0", "counters1")
+# The masked pair route (SM107a, measured SM counts, expected_m from a low bound
+# of PAIR_SERVING_EXPECTED_M): one persistent launch of 2-CTA clusters, each
+# taking 512 or 256 weight rows of one group (the pair tile) against a 256-row
+# pass of the group's tokens.  The program holds the pass list of at most
+# PAIR_GROUP_MAX groups in shared memory.
+PAIR_SERVING_ROUTE = "seed_serving_pair_packed"
+PAIR_ARCH = "sm_107a"
+PAIR_GROUP_MAX = 1024
+PAIR_PASS_ROWS = 256
 # Values of expected_m at both sides of every bound of serving_config and of
 # expected_m_class: every serving key a weight shape reaches is reached by one.
 DOMAIN_EXPECTED_M_PROBES = (0, 1, 2, 3, 4, 7, 8, 15, 16, 17)
@@ -168,6 +190,73 @@ def serving_program_key(
     n_l2_group: int,
 ) -> str:
     return f"n{n}_k{k}_g{groups}_s{num_stages}e{num_epi_stages}_{a_cache_hint}_l{n_l2_group}"
+
+
+def pair_serving_key(n: int, k: int, pair_w: int) -> str:
+    """The ``SERVING_PROGRAMS`` key (less ``"sm_107a:"``) of the masked pair
+    program whose pair tile covers ``pair_w`` weight rows."""
+    return f"pair_masked_n{n}_k{k}_w{pair_w}"
+
+
+def pair_serving_tile(
+    arch: str,
+    sm_count: int,
+    groups: int,
+    m: int,
+    n: int,
+    k: int,
+    expected_m: int,
+    homed: bool = False,
+) -> Optional[int]:
+    """The pair tile (512 or 256 weight rows) of the masked pair program that
+    serves this packed-scale problem, or ``None`` when the serving program of
+    :func:`serving_config` keeps it: an architecture other than SM107a, an SM
+    count without measured bounds in ``PAIR_SERVING_EXPECTED_M``, a shape outside
+    the serving set (``(N, K)`` in ``PACKED_NK``, ``B`` in ``PACKED_GROUPS``) or
+    the program's limits (``B <= 1024``, ``K % 512 == 0``, ``N`` a multiple of the
+    pair tile, ``M`` a positive multiple of 128), ``expected_m`` below the low
+    bound (the homed low bound when ``homed``: ``b`` homed by groups, whose
+    locality-domain twin is faster below it), or no program registered for the
+    key."""
+    bounds = PAIR_SERVING_EXPECTED_M.get(sm_count)
+    if arch != PAIR_ARCH or bounds is None:
+        return None
+    if (n, k) not in PACKED_NK or groups not in PACKED_GROUPS:
+        return None
+    if not 1 <= groups <= PAIR_GROUP_MAX or k <= 0 or k % PACKED_K_GRANULE:
+        return None
+    if m < BLOCK or m % BLOCK:
+        return None
+    low, high, homed_low = bounds
+    if expected_m < (homed_low if homed else low):
+        return None
+    pair_w = 512 if expected_m >= high else 256
+    if n < pair_w or n % pair_w:
+        return None
+    if f"{arch}:{pair_serving_key(n, k, pair_w)}" not in SERVING_PROGRAMS:
+        return None
+    return pair_w
+
+
+def pair_serving_plan(
+    arch: str, sm_count: int, groups: int, m: int, n: int, k: int, pair_w: int
+) -> RoutePlan:
+    """The masked pair route of pair tile ``pair_w``: one launch of
+    ``min(items, sm_count // 2)`` 2-CTA clusters walking the
+    ``items = (N / pair_w) * B * ceil(M / 256)`` items (one pass of one weight
+    tile each) with the grid's stride, so no cluster is idle while items remain;
+    the output does not depend on the grid."""
+    program = SERVING_PROGRAMS[f"{arch}:{pair_serving_key(n, k, pair_w)}"]
+    items = (n // pair_w) * groups * -(-m // PAIR_PASS_ROWS)
+    clusters = max(1, min(items, sm_count // 2))
+    return RoutePlan(
+        route=PAIR_SERVING_ROUTE,
+        parent=SERVING_ROUTE,
+        stages=(
+            StagePlan(program=program, grid=(2, 1, clusters), args=(n // pair_w,)),
+        ),
+        workspaces={},
+    )
 
 
 def expected_m_class(expected_m: int) -> str:
@@ -260,10 +349,17 @@ def serving_plan(
 ) -> RoutePlan:
     """The packed-scale serving route: one specialised program, grid from the SM count.
 
+    The masked pair program serves the problem when :func:`pair_serving_tile`
+    names a pair tile (by the homed bound when ``counts`` is given).  Otherwise
     ``counts`` (the SMs of each die of a dual-die device whose ``b`` is homed by
     groups) selects the locality-domain twin of the program when the cell is
     listed in ``DOMAIN_SERVING_CELLS``; the twin's grid is one CTA per SM and it
     binds a pair of per-die claim counters."""
+    pair_w = pair_serving_tile(
+        arch, sm_count, groups, m, n, k, expected_m, homed=counts is not None
+    )
+    if pair_w is not None:
+        return pair_serving_plan(arch, sm_count, groups, m, n, k, pair_w)
     num_stages, num_epi_stages, a_cache_hint, cta_reserve, n_l2_group = serving_config(
         m, k, expected_m, sm_count, arch
     )
@@ -459,6 +555,9 @@ _SERVING_VALUES = (
     "counters0",
     "counters1",
 )
+# The masked pair program's names of the same per-call values (its output is
+# bound twice: as the TMA store's tensor map and as the row-guarded stores' base).
+_PAIR_VALUES = {"A": 0, "B": 1, "C": 2, "C_rows": 2, "SFA": 3, "SFB": 4, "masked_m": 5}
 # (device index, arch, program, grid, B, M, N, K, g_cut) -> (FFI entry, the
 # fixed arguments, a getter of the argument tuple from the per-call values
 # followed by the fixed ones, the SM table tensor bound): a serving launch's
@@ -492,15 +591,28 @@ def _serving_launch(
         return cached[0], cached[1], cached[2]
     entry, arg_plan = _program_entry(problem.arch, stage.program)
     domain = problem.plan.route == DOMAIN_SERVING_ROUTE
-    fixed_values: dict[str, Any] = {
-        "num_groups": problem.B,
-        "shape_m": problem.M,
-        "N": problem.N,
-        "K": problem.K,
-    }
-    if domain:
-        fixed_values.update(g_cut=problem.g_cut, sm_table=table)
-    per_call = _SERVING_VALUES if domain else _SERVING_VALUES[:6]
+    fixed_values: dict[str, Any]
+    per_call: dict[str, int]
+    if problem.plan.route == PAIR_SERVING_ROUTE:
+        fixed_values = {
+            "G": problem.B,
+            "M": problem.M,
+            "N": problem.N,
+            "K": problem.K,
+            "fd_w": stage.args[0],
+        }
+        per_call = _PAIR_VALUES
+    else:
+        fixed_values = {
+            "num_groups": problem.B,
+            "shape_m": problem.M,
+            "N": problem.N,
+            "K": problem.K,
+        }
+        if domain:
+            fixed_values.update(g_cut=problem.g_cut, sm_table=table)
+        names = _SERVING_VALUES if domain else _SERVING_VALUES[:6]
+        per_call = {name: _SERVING_VALUES.index(name) for name in names}
     grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
     fixed: list[Any] = []
     picks: list[int] = []
@@ -510,7 +622,7 @@ def _serving_launch(
         elif kind in ("tma_buffer", "buffer", "parameter", "param_array") and (
             name in per_call
         ):
-            picks.append(_SERVING_VALUES.index(name))
+            picks.append(per_call[name])
             continue
         elif (
             kind in ("tma_buffer", "buffer", "parameter", "param_array")
@@ -1292,14 +1404,19 @@ def _serving_arguments(
     (stage,) = problem.plan.stages
     entry, fixed, getter = _serving_launch(problem, stage)
     cols = problem.K // PACKED_K_GRANULE
-    # The logical [B, MN, K/512] int32 scales live in MN-major [B, K/512, MN] storage;
-    # reinterpret that storage as the contiguous 2-D surface the scale tensor maps read.
-    sfa = a_scale.as_strided((problem.B * cols, problem.M), (problem.M, 1)).view(
-        torch.uint32
-    )
-    sfb = b_scale.as_strided((problem.B * cols, problem.N), (problem.N, 1)).view(
-        torch.uint32
-    )
+    # The logical [B, MN, K/512] int32 scales live in MN-major [B, K/512, MN] storage.
+    if problem.plan.route == PAIR_SERVING_ROUTE:
+        # The pair program reads that storage as contiguous int32 [B, K/512, MN].
+        sfa = a_scale.transpose(1, 2)
+        sfb = b_scale.transpose(1, 2)
+    else:
+        # Reinterpret it as the contiguous 2-D surface the scale tensor maps read.
+        sfa = a_scale.as_strided((problem.B * cols, problem.M), (problem.M, 1)).view(
+            torch.uint32
+        )
+        sfb = b_scale.as_strided((problem.B * cols, problem.N), (problem.N, 1)).view(
+            torch.uint32
+        )
     values = (
         a.view(torch.uint8),
         b.view(torch.uint8),
@@ -1524,8 +1641,10 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     ``g_cut`` defaults to the SM-proportional share of die 0,
     ``split_units(B, counts)[0]`` over the device's probed SM table.  Passing the
     copy as ``b`` makes every packed-scale serving problem on it run the
-    locality-domain twin of its serving program; the twin's result is the same
-    bits for any ``g_cut``.
+    locality-domain twin of its serving program, except from the homed low bound
+    of ``PAIR_SERVING_EXPECTED_M`` on, where the masked pair program runs (the
+    same bits as on plain weights); the twin's result is the same bits for any
+    ``g_cut``.
 
     Returns ``b`` itself, unhomed, when the call is under CUDA graph capture, or
     when homing could make a call slower: ``b`` is not float8_e4m3fn weights of a
@@ -1568,6 +1687,14 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     :data:`flashinfer.cake_locality.MEMORY_CLOCK_FRACTION` of its maximum, or
     cannot read (:func:`flashinfer.cake_locality.memory_at_full_clock`), and
     weights homed there take the whole-GPU route.
+
+    The masked pair program reads homed weights more slowly than plain ones:
+    for ``B=64`` weights of ``(4096, 7168)`` on a 212-SM device with its memory
+    at the full clock (driver 620.70.06) it took 1.36-1.47x the time of plain
+    weights at ``expected_m`` 160-512 and 1.00x at 4096, yet less time than the
+    twin route: 0.33-0.76x the twin's time at ``expected_m`` 160-512 and 0.29x
+    at 4096.  Below the full clock this returns ``b`` unhomed, so the homed low
+    bound of ``PAIR_SERVING_EXPECTED_M`` does not apply there.
 
     On 212-SM devices, plain weights run their serving program on the full grid
     from ``expected_m`` 36; the homed twin is unchanged.  For ``B=64`` weights of
@@ -1736,6 +1863,8 @@ __all__ = [
     "PACKED_NK",
     "DOMAIN_SERVING_ROUTE",
     "PAIR_COUNTER_WORDS",
+    "PAIR_GROUP_MAX",
+    "PAIR_SERVING_ROUTE",
     "PreparedBatchDeepGemmFp8NtGroupwise",
     "SUPPORTED_NK",
     "WORKSPACE_DTYPES",
@@ -1747,6 +1876,9 @@ __all__ = [
     "expected_m_class",
     "is_batch_deepgemm_fp8_nt_groupwise_cake_available",
     "localize_weights",
+    "pair_serving_key",
+    "pair_serving_plan",
+    "pair_serving_tile",
     "prepare_batch_deepgemm_fp8_nt_groupwise",
     "run_batch_deepgemm_fp8_nt_groupwise",
     "select_route",
