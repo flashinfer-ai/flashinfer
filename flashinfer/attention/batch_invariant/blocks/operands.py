@@ -6,11 +6,12 @@ numeric order; the numerically visible choices are the two MMA instruction varia
 surface: ``tcgen05.mma.cta_group::1.kind::f16 128x128x16`` for QK^T and ``128xDx16`` for PV, the
 latter with its A operand in TMEM).
 
-The budgets are functions of ``D``: a Q stage and a KV ring slot
-are ``128 x D`` bf16 (16 / 32 / 64 KB at D = 64 / 128 / 256), so the ring takes up to ``512 / D`` slots (8 / 4 / 2:
-128 KB of K/V in flight, the same bytes at every D) next to ``q_stages(D)`` Q stages (2, or 1 at D = 256); TMEM holds
-``S (128) | P (64) | O_c (D) | O_m (D)`` = 320 / 448 columns at D = 64 / 128, and at D = 256 ``S | P | O_c`` = 448 with
-the merged chunk state ``O_m`` in a per-CTA global scratch (``om_in_tmem(D)``: 128 + 64 + 2 D <= 512), as the TS body's
+The budgets are functions of ``D`` and of the class's tile length ``T(D)`` (``spec.tile_keys``): a Q stage is ``128 x D``
+bf16 and a KV ring slot ``slot_keys x D`` bf16 with ``slot_keys = min(T, 128)`` keys (16 / 32 / 64 KB at D = 64 / 128 / 256
+with 128-key slots), so the ring takes up to ``RING_BYTES / slot_bytes(D)`` slots (8 / 4 / 2: 128 KB of K/V in flight, the
+same bytes at every D) next to ``q_stages(D)`` Q stages (2, or 1 at D = 256); TMEM holds
+``S (T) | P (T / 2) | O_c (D) | O_m (D)`` = 320 / 448 columns at D = 64 / 128 with T = 128, and at D = 256 ``S | P | O_c``
+with the merged chunk state ``O_m`` in a per-CTA global scratch (``om_in_tmem(D)``: T + T / 2 + 2 D <= 512), as the TS body's
 two-tile build places it. The same blocks compute every D: the numerics never see the placement.
 
 Built at trace time (inside the ``@cute.jit`` entry point) because the CuTe layout algebra needs
@@ -32,8 +33,8 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, OperandSource
 
 from ..plan import om_in_tmem as _om_in_tmem
-from ..plan import ws_row
-from ..spec import MMA_K, TILE_KEYS, tiles_per_chunk
+from ..plan import slot_keys_for, ws_row
+from ..spec import MMA_K, tile_keys, tiles_per_chunk
 
 ACC_DTYPE = cutlass.Float32
 IN_DTYPE = cutlass.BFloat16
@@ -43,18 +44,22 @@ TMEM_COLS = 512
 HEAD_DIMS_BODY = (64, 128, 256)  # head dims this body implements (``spec.HEAD_DIMS``)
 RING_BYTES = (
     128 << 10
-)  # K/V bytes in flight per CTA at every D: 512 / D ring slots of 128 x D bf16
+)  # K/V bytes in flight per CTA at every D: RING_BYTES / slot_bytes(D) ring slots
 SMEM_CAP = 227 << 10  # the opt-in dynamic smem of one CTA on sm_100 / sm_107
 
 
-def slot_bytes(D: int) -> int:
-    """One KV ring slot (a K or a V tile) or one Q stage: ``128 x D`` bf16."""
+def q_stage_bytes(D: int) -> int:
+    """One Q stage: ``128 x D`` bf16."""
     return Q_ROWS * D * 2
 
 
+def slot_bytes(D: int) -> int:
+    """One KV ring slot (``slot_keys_for(D)`` keys of K or of V): ``slot_keys x D`` bf16."""
+    return slot_keys_for(D) * D * 2
+
+
 def max_kv_slots(D: int) -> int:
-    """The deepest ring at ``D``: ``RING_BYTES`` of K/V in flight (8 / 4 / 2 slots at D = 64 / 128 / 256); ``RLK_RING_BYTES`` raises the
-    budget where the part's shared memory allows it (sm_107: 328 KB per CTA)."""
+    """The deepest ring at ``D``: ``RING_BYTES`` of K/V in flight (8 / 4 / 2 slots of 128 keys at D = 64 / 128 / 256)."""
 
     return RING_BYTES // slot_bytes(D)
 
@@ -70,7 +75,7 @@ def q_stages_for(D: int, q2: bool = False) -> int:
     unit's Q still lands under the last PVs and the epilogue)."""
     if q2 and D == 128:
         return 1
-    return 2 if 2 * slot_bytes(D) + RING_BYTES + (24 << 10) <= SMEM_CAP else 1
+    return 2 if 2 * q_stage_bytes(D) + RING_BYTES + (24 << 10) <= SMEM_CAP else 1
 
 
 def arch_smem_cap(device=None) -> int:
@@ -114,11 +119,11 @@ REGS_SOFTMAX_W2 = 160  # per softmax thread with two softmax warpgroups (64 keys
 REGS_CORRECTION_W2 = 160
 STATS_SLOTS = 4  # softmax -> correction payload ring depth (one entry per tile: alpha, m', r_slices)
 STATS_SLOTS_PP = 8  # the same ring under the ping-pong placement: 2 entries per tile x 4 tiles (both warpgroups' tiles in tile order)
-SLOT_KEYS_256 = 128  # keys per ring slot at D = 256: whole tiles (two 64 KB slots in the 128 KB ring). Half-tile slots (four of 32 KB)
-# let the producer run further ahead, but made QK^T two 128 x 64 x 16 instructions per K-step instead of one 128 x 128 x 16: the
-# MMA warp issues one tcgen05.mma per fixed interval whatever its N, so the tile's 48 instructions cost more issue time than
-# its tensor work; with whole slots the K / V loads of a tile still overlap the previous tile's MMAs (each slot's load is
-# issued when its predecessor's MMAs complete, a tile ahead of its use)
+# Ring slots are never shorter than ``slot_keys_for`` allows: half-tile slots at D = 256 (four of 32 KB) let the producer run
+# further ahead, but made QK^T two 128 x 64 x 16 instructions per K-step instead of one 128 x 128 x 16: the MMA warp issues one
+# tcgen05.mma per fixed interval whatever its N, so the extra instructions cost more issue time than their tensor work; with
+# 128-key slots the K / V loads of a tile still overlap the previous tile's MMAs (each slot's load is issued when its
+# predecessor's MMAs complete, a tile ahead of its use)
 Q_STAGES = 2  # Q tiles in smem: the load warp prefetches the next unit's Q while the MMA finishes this one
 REGS_SOFTMAX, REGS_OTHER = 192, 32
 # the one-warpgroup body at these head dims: 200 per softmax thread and 96 for the correction (16-column pieces). The softmax's
@@ -212,22 +217,22 @@ class StaticPlan:
         # placement at D = 128 fits 328 KB parts only, so the capacity is part of the kernel's identity (compile.kernel_name)
         self.cap = cap or arch_smem_cap()
         # ragged: the K / V of every request packed along the token dimension, viewed as ONE page of total_kv tokens; the producer's
-        # box starts at the request's token offset (producer.issue_slot). The box geometry is the paged one at page = T (128 keys per
-        # box), so the compile passes page = T; a placement (the keys reach the same smem bytes)
+        # box starts at the request's token offset (producer.issue_slot). The box geometry is the paged one at page = slot_keys (one
+        # ring slot per box), so the compile passes page = slot_keys_for(D); a placement (the keys reach the same smem bytes)
         self.ragged = ragged
-        assert not ragged or page == TILE_KEYS, (ragged, page)
+        T = tile_keys(D)
+        SK = slot_keys_for(D)
+        assert not ragged or page == SK, (ragged, page)
         self.n_q = 2 if q2 else 1  # Q tiles per unit
         assert 1 <= g <= Q_ROWS, g
         # any power-of-two page size: a page slab is one TMA box of min(page, slot_keys) keys; the SW128 swizzle is applied by the TMA from the
         # smem address bits, so a slab of fewer than 8 keys (a sub-atom destination) lands where the MMA layout expects it (verified bit
         # for bit against page 128 at every head dim)
-        assert page >= 1 and (
-            page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
-        ), page
+        assert page >= 1 and (page <= SK and SK % page == 0 or page % SK == 0), page
         assert 2 <= kv_slots <= max_kv_slots(D), (
             kv_slots,
             D,
-        )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB
+        )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB; kv_slots counts physical ring slots
         self.D, self.g, self.page, self.kv_slots = D, g, page, kv_slots
         self.roles = Roles(n_wg, D, q2)
         self.n_wg = n_wg
@@ -236,7 +241,7 @@ class StaticPlan:
             32 if self.roles.regs_correction >= 128 else (8 if q2 else 16)
         )  # the correction's TMEM piece (columns): 32 from 128 registers up, 16 below; 8 under the paired placement, whose correction
         # carries two Q tiles' chains and smem O_m pointers at 96 registers (16-column pieces spilled its tile loop in the ragged build)
-        self.T = TILE_KEYS
+        self.T = T
         self.tokens_per_tile = (
             Q_ROWS // g
         )  # Q tile = tokens_per_tile tokens x g heads <= 128 rows
@@ -271,17 +276,15 @@ class StaticPlan:
             self.T // self.n_slices
         )  # keys per thread (full rows): warpgroup k holds keys [k kpt, (k+1) kpt)
         self.kpt_rep = (
-            REP_ROWS // self.n_slices
+            self.T // (4 * self.n_slices)
         )  # keys per thread (replicated rows): warp wq of warpgroup k holds slice 4k + wq
         self.slices_rep = 4 * self.n_slices
         self.stats_slots = STATS_SLOTS_PP if q2 else STATS_SLOTS
-        # ring slots: a whole KV tile (T keys) at every D (SLOT_KEYS_256: the half-tile slots of D = 256 were a placement that cost more
-        # MMA issue than they saved in load latency); the code keeps the general slots_per_tile form
-        self.slot_keys = SLOT_KEYS_256 if D == 256 else self.T
+        # ring slots: slot_keys_for(D) keys each -- a whole KV tile when T <= MAX_SLOT_KEYS, else T / slot_keys consecutive slots per
+        # tile (the general slots_per_tile form: every slot gets its own QK^T instructions and its own run of PV key steps)
+        self.slot_keys = SK
         self.slots_per_tile = self.T // self.slot_keys
-        self.n_slots = (
-            kv_slots * self.slots_per_tile
-        )  # physical ring slots (kv_slots counts whole-tile equivalents)
+        self.n_slots = kv_slots  # physical ring slots
         self.box_rows = min(page, self.slot_keys)  # keys per TMA box
         self.boxes_per_slot = self.slot_keys // self.box_rows  # per 64-wide half
         self.boxes_per_tile = self.T // self.box_rows

@@ -32,6 +32,7 @@ from .plan import (
     GROUP_FIELDS,
     build_plan,
     snake_order,
+    swaps_dim,
     ws_row,
 )
 from .spec import HEAD_DIMS, scale_log2
@@ -85,8 +86,9 @@ def check_sm_scale(sm_scale: float) -> float:
 
 
 def valid_kv_slots(D: int = 128) -> tuple:
-    """The ring depths of the FMHA body at head dim ``D``: ``2 .. 512 / D`` (``blocks.operands.max_kv_slots``: 128 KB of K/V in
-    flight at every D), i.e. 2..8 at D = 64, 2..4 at D = 128, {2} at D = 256."""
+    """The ring depths (physical slots) of the FMHA body at head dim ``D``: ``2 .. max_kv_slots(D)`` (``blocks.operands``: 128 KB
+    of K/V in flight at every D, a slot of ``slot_keys_for(D)`` keys), i.e. 2..8 at D = 64, 2..4 at D = 128, {2} at D = 256
+    with 128-key slots."""
     from .blocks.operands import max_kv_slots
 
     return tuple(range(2, max_kv_slots(D) + 1))
@@ -159,7 +161,7 @@ def _part_has_hw_row_max(device: torch.device) -> bool:
 class AttnConfig:
     """A configuration of the kernel: every member of the space computes the class (R3)."""
 
-    kv_slots: int = 4  # smem ring depth (K or V tiles): 2..4
+    kv_slots: int = 4  # smem ring depth (K or V slots): 2..4
     split_policy: str = "auto"  # "auto" | "split" | "fused": the planner's unit kind
     grid: int = 0  # persistent CTAs (0 = min(units, SMs)); a launch parameter (I10)
     softmax_wgs: int = (
@@ -187,7 +189,7 @@ class AttnConfig:
 
     def well_formed(self, D: int = 128) -> bool:
         """The body's static knob constraints at head dim ``D`` (mirror of ``BIK.Attn.ConfigOKD``: ``2 <= kv_slots``,
-        ``kv_slots * D <= 512``, ``small <= 1``)."""
+        ``kv_slots * slot_keys(D) * D <= 65536``, ``small <= 1``)."""
         return (
             self.kv_slots in valid_kv_slots(D)
             and self.split_policy in ("auto", "split", "fused")
@@ -224,7 +226,9 @@ SWAPS_MAX_ROWS = 8  # units of at most this many live rows take the Swaps-AB ker
 # (n_pad = 8) kernel beats the row body; the 16-row kernel (24/2 heads, g = 12) measured slower than
 # the row body at every D (its per-row chains and register spills), so 9-32-row units keep the row
 # body's replicated placement (the 16 / 32-row kernels stay built and IR-pinned as retired placements)
-SWAPS_DIMS = (64, 128, 256)  # head dims the Swaps-AB kernel implements
+SWAPS_DIMS = tuple(
+    D for D in HEAD_DIMS if swaps_dim(D)
+)  # head dims the Swaps-AB kernel implements: those whose class tile is the body's 128 keys
 
 
 Q2_MIN_UNITS_PER_SM = {
@@ -729,11 +733,11 @@ def _run_attention_validated(
     the device's default, ``device_support_pdl``)."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
-    from .spec import TILE_KEYS
+    from .plan import slot_keys_for
 
     total_q, Hq, D = q.shape
     if ragged:
-        page = TILE_KEYS
+        page = slot_keys_for(D)  # the ragged producer's box: one ring slot of keys
         Hkv = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[0]
         kv_k = _kv_view_ragged(k_cache, kv_layout, Hkv, D)
         kv_v = _kv_view_ragged(v_cache, kv_layout, Hkv, D)

@@ -19,9 +19,10 @@ symbolic spec and the Lean coupling, ``CuteF32`` inside the kernel). Per logical
   is merged with it; absent chunks are dropped);
 * the epilogue is ``cvt_bf16(add(mul(O, div(1, l)), +0))``.
 
-Tile and chunk boundaries are absolute, ``T`` and ``C`` are functions of ``D`` only, so decode at
-position ``p`` and prefill of the token at position ``p`` build the same term (R4), and nothing in
-the term depends on the batch, the page table or the configuration (R2, R3).
+Tile and chunk boundaries are absolute, ``T`` and ``C`` are functions of ``D`` only (``TILE_KEYS_OF``,
+``CHUNK_LEN_OF``: class parameters per head dim), so decode at position ``p`` and prefill of the token at
+position ``p`` build the same term (R4), and nothing in the term depends on the batch, the page table or
+the configuration (R2, R3).
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ from ...batch_invariant.fp_interface.term import Term, TermAlgebra
 
 # ----------------------------------------------------------------------------- the class constants
 
-TILE_KEYS = 128  # T: keys per KV tile (the N extent of one QK^T MMA tile)
 MMA_K = 16  # bf16 K extent of one tcgen05.mma step (shared with the GEMM)
 FLT_MAX = 3.4028234663852886e38  # the largest binary32 number
 MMA_OP = _GEMM_MMA_OP  # "mma_bf16_k16": the same opaque instruction family as the GEMM
@@ -48,16 +48,43 @@ HEAD_DIMS = (
     64,
     128,
     256,
-)  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)))
+)  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, T(D), C(D)))
 NEG_INF = float("-inf")
 
-
-CHUNK_LEN = 512  # C: keys per chunk (4 tiles) -- a class constant (another C would be a different class)
+# T(D): keys per KV tile -- one step of the online softmax (a row maximum, a rescale, a row sum and ``T / 16`` PV steps).
+# A class parameter per head dim: the pairwise trees of the row maximum and the row sum span ``T`` keys and the accumulator
+# is rescaled once per ``T`` keys, so every output bit of the class changes with ``T``
+TILE_KEYS_OF = {
+    64: 128,
+    128: 128,
+    256: 128,
+}
+# C(D): keys per chunk (``C / T`` tiles) -- a class parameter per head dim (another C is a different class). D = 256 takes
+# 2048: its body cannot hold the merged chunk state next to the 256-column accumulator in TMEM (``plan.om_in_tmem``), so a
+# fused unit's chunk merge is a round trip of a 128 x 256 fp32 state through a global scratch during which the tensor core
+# waits; with four times the keys per chunk a prefill row pays a quarter of them. The price is decode parallelism: a decode
+# step has ``Hkv x ceil(L / C)`` work units per request, so a batch with fewer (request, KV head) pairs than SMs runs a context
+# of up to a few chunks on part of the machine (``chunk_len``)
 CHUNK_LEN_OF = {
-    64: CHUNK_LEN,
-    128: CHUNK_LEN,
-    256: CHUNK_LEN,
-}  # C(D): the chunk length per head dim (a class parameter per D; all 512)
+    64: 512,
+    128: 512,
+    256: 2048,
+}
+assert all(
+    D in TILE_KEYS_OF
+    and TILE_KEYS_OF[D] % MMA_K == 0
+    and TILE_KEYS_OF[D] & (TILE_KEYS_OF[D] - 1) == 0
+    and CHUNK_LEN_OF[D] % TILE_KEYS_OF[D] == 0
+    for D in HEAD_DIMS
+), "T(D) is a power of two of whole PV steps and C(D) a whole number of tiles"
+
+
+def tile_keys(D: int) -> int:
+    """The tile length of the class: a function of the head dim ONLY, like ``chunk_len``. Never a function of the batch, the
+    request's length, the page size, the SM count or the configuration: a kernel body may issue its MMAs over other
+    extents (a placement), but the softmax step it computes is the one over ``T(D)`` keys at absolute multiples of ``T(D)``."""
+    assert D in HEAD_DIMS, D
+    return TILE_KEYS_OF[D]
 
 
 def chunk_len(D: int, L: Optional[int] = None) -> int:
@@ -66,19 +93,16 @@ def chunk_len(D: int, L: Optional[int] = None) -> int:
     *new class* without changing call sites; the rule ignores it. Never a function of the
     batch, the request's total length, the SM count or the configuration.
 
-    ``C = 512`` (rather than ``1024``): a B = 1 decode step has ``Hkv x ceil(L / C)``
-    work units, so halving ``C`` doubles its parallelism at the cost of one more chunk merge per 1024 keys
-    (prefill) and twice the split workspace. Every output bit of the class changes with ``C``
-    (``RLK.Attn.output_depends_on_C``); the fingerprint records it. ``C`` is a class parameter PER HEAD DIM
-    (``CHUNK_LEN_OF``): D = 64 and D = 256 take the same 512 (the D = 256 body's merged chunk state
-    lives in a per-CTA global scratch because TMEM holds no second 256-column accumulator, which made a longer
-    C a candidate there; the common constant was kept)."""
+    A B = 1 decode step has ``Hkv x ceil(L / C)`` work units, so a shorter ``C`` raises its parallelism at the
+    cost of one more chunk merge per ``C`` keys (prefill) and a larger split workspace. Every output bit of the
+    class changes with ``C`` (``BIK.Attn.output_depends_on_C``); the fingerprint records it. ``C`` is a class
+    parameter PER HEAD DIM (``CHUNK_LEN_OF``)."""
     assert D in HEAD_DIMS, D
     return CHUNK_LEN_OF[D]
 
 
 def tiles_per_chunk(D: int) -> int:
-    return chunk_len(D) // TILE_KEYS
+    return chunk_len(D) // tile_keys(D)
 
 
 def d_steps(D: int) -> int:
@@ -121,7 +145,7 @@ class RowSpec:
         return self.lo <= k < self.L
 
 
-def visible_keys(row: RowSpec, t: int, T: int = TILE_KEYS) -> List[int]:
+def visible_keys(row: RowSpec, t: int, T: int) -> List[int]:
     """The visible absolute keys of tile ``t`` for ``row`` (empty = the tile is absent)."""
     a, b = max(row.lo, t * T), min(row.L, (t + 1) * T)
     return list(range(a, b)) if a < b else []
@@ -297,13 +321,20 @@ def output_elem(fp, st: State, out_fmt: str = "bf16"):
 
 
 def attention_reduction(
-    row: RowSpec, D: int, d: int, c, nc, T: int = TILE_KEYS, C: Optional[int] = None
+    row: RowSpec,
+    D: int,
+    d: int,
+    c,
+    nc,
+    T: Optional[int] = None,
+    C: Optional[int] = None,
 ) -> Reduction:
     """The per-row dataflow as an engine ``Reduction`` with two ``fold`` digits: ``tile`` (radix
     ``C/T``, the online softmax inside a chunk) and ``chunk`` (radix = chunks of the prefix, the
     merge). Leaves are tile descriptors; absent tiles (no visible key) are ``None`` and dropped, an
     all-absent chunk folds to ``None`` and is dropped by the chunk fold. ``T`` and ``C`` may be
-    shrunk for the Lean cases; the class uses the module constants."""
+    shrunk for the Lean cases; the class uses the head dim's constants (``tile_keys(D)``, ``chunk_len(D)``)."""
+    T = tile_keys(D) if T is None else T
     C = chunk_len(D, row.L) if C is None else C
     assert C % T == 0
     n_chunks = max(1, -(-row.L // C))
@@ -359,11 +390,12 @@ class AttentionSpec:
         self,
         D: int = 128,
         alg: Optional[TermAlgebra] = None,
-        T: int = TILE_KEYS,
+        T: Optional[int] = None,
         C: Optional[int] = None,
         out_fmt: str = "bf16",
     ):
-        self.D, self.T, self.out_fmt = D, T, out_fmt
+        self.D, self.out_fmt = D, out_fmt
+        self.T = tile_keys(D) if T is None else T
         self.C = chunk_len(D) if C is None else C
         self.alg = alg or TermAlgebra()
         self.c, self.nc = self.alg.sym("c"), self.alg.sym("nc")
@@ -379,38 +411,83 @@ class AttentionSpec:
 
 
 _FINGERPRINTS: Dict[tuple, str] = {}
-# the recorded fingerprint of the published class (D = 128, no window) at C = 512 (with C = 1024 it was
-# attn-bf16-d128-3384db6839e66672). ``tests/attention/test_batch_invariant_attention.py`` pins the three head dims' fingerprints.
-FINGERPRINT_D128 = "attn-bf16-d128-027b0379515b82e2"
-# the D = 64 and D = 256 classes: the same term with D as a parameter (D/16 MMA K-steps per
-# score, a D-wide PV accumulator), C(D) = 512 for both; pinned by the same test
+# The recorded fingerprints of the published classes (no window), one per head dim at its ``(T(D), C(D))``: the same term with
+# ``D`` as a parameter (``D / 16`` MMA K-steps per score, a ``D``-wide PV accumulator). ``tests/attention/
+# test_batch_invariant_attention.py`` pins them against ``spec_fingerprint``.
 FINGERPRINT_D64 = "attn-bf16-d64-9a05233ec9351b0d"
-FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
+FINGERPRINT_D128 = "attn-bf16-d128-027b0379515b82e2"
+FINGERPRINT_D256 = "attn-bf16-d256-66130d3648d80cbb"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
 
 
+FINGERPRINT_SAMPLE_KEYS = 512  # the longest chunk the fingerprint's sample rows span (``fingerprint_samples``)
+
+
+def fingerprint_samples(D: int, T: int, C: int, window_left: int = -1) -> List[tuple]:
+    """The sample rows whose terms ``class_fingerprint`` hashes for the class ``(D, T, C)``, as ``(spec, row)`` pairs.
+
+    The digest is taken over the fully expanded canonical S-expression of a row's term, whose length grows with the square of
+    the keys in a chunk, so the rule is a function of the chunk length:
+
+    * ``C <= FINGERPRINT_SAMPLE_KEYS``: ONE row of the class itself at ``p = C + T / 2`` -- one full chunk and half a tile, so
+      the tile fold over every tile of a chunk, the chunk merge of two chunks, the masking of the last tile and the epilogue
+      are all inside.
+    * a longer chunk, whose full row is not materialised: TWO rows.
+      (a) The bounded row of the class itself at ``p = FINGERPRINT_SAMPLE_KEYS + T / 2``: the first tiles of one chunk at the
+      class's own ``T`` and ``D`` -- the score fold, the ``T``-key tile step (row maximum, rescale, row sum, the PV steps), the
+      merge with the init state, the masking and the epilogue -- but no merge of two chunks.
+      (b) A row of the REDUCED instance ``(D, T', C')`` with ``C' = FINGERPRINT_SAMPLE_KEYS`` and ``T' = T C' / C`` at
+      ``p = C' + T' / 2``: the same dataflow with the same number of tiles per chunk (``C' / T' = C / T``), so the tile fold
+      runs over every tile of a chunk and the finished chunk is merged with the next one. It witnesses the shape of the chunk
+      fold and of the chunk-to-chunk merge; its tiles are ``T'`` keys, not the class's ``T`` (those are in (a)).
+
+    ``T'`` must be a tile the term builder expresses (a whole number of ``MMA_K``-key PV steps): a class with more than
+    ``FINGERPRINT_SAMPLE_KEYS / MMA_K`` tiles per chunk has no reduced instance and is refused. A window scales with the
+    reduced instance's keys."""
+    K = FINGERPRINT_SAMPLE_KEYS
+    if C <= K:
+        return [
+            (AttentionSpec(D, T=T, C=C), RowSpec(p=C + T // 2, window_left=window_left))
+        ]
+    Tr = T * K // C
+    if T * K % C or Tr % MMA_K:
+        raise ValueError(
+            f"no reduced fingerprint instance for (T, C) = ({T}, {C}): T * {K} / C must be a multiple of {MMA_K}"
+        )
+    win_r = window_left if window_left < 0 else window_left * Tr // T
+    return [
+        (AttentionSpec(D, T=T, C=C), RowSpec(p=K + T // 2, window_left=window_left)),
+        (AttentionSpec(D, T=Tr, C=K), RowSpec(p=K + Tr // 2, window_left=win_r)),
+    ]
+
+
+def class_fingerprint(D: int, T: int, C: int, window_left: int = -1) -> str:
+    """The identifier of the dataflow at head dim ``D`` with tile ``T`` and chunk ``C``: hashes ``D``, ``T``, ``C`` literally
+    together with the terms of output elements 0 and 1 of every sample row of ``fingerprint_samples`` -- a function of
+    ``(D, T, C)``, injective in the three by construction. A class whose full row is materialised hashes that one row; a
+    class with longer chunks hashes its bounded row and then the reduced instance's row, each second row preceded by the
+    reduced instance's ``(T', C')``."""
+    from ...batch_invariant.fp_interface.term import fingerprint
+
+    samples = fingerprint_samples(D, T, C, window_left)
+    parts = [f"D={D}", f"T={T}", f"C={C}", f"win={window_left}"]
+    for i, (spec, row) in enumerate(samples):
+        if i:
+            parts += [f"T'={spec.T}", f"C'={spec.C}"]
+        parts += [fingerprint(spec.output(row, 0)), fingerprint(spec.output(row, 1))]
+    return (
+        f"attn-bf16-d{D}-" + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+    )
+
+
 def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
-    """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose prefix
-    spans one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
-    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``. The window is a per-call
-    input of the class (like the KV position), not a class dimension: the public receipt (``flashinfer.batch_invariant.fingerprint``)
-    is the digest of the no-window sample row; ``window_left`` here only selects another sample row."""
+    """Identifier of the class at head dim ``D``: ``class_fingerprint`` at the head dim's constants ``(tile_keys(D),
+    chunk_len(D))``. The window is a per-call input of the class (like the KV position), not a class dimension: the public
+    receipt (``flashinfer.batch_invariant.fingerprint``) is the digest of the no-window sample row; ``window_left`` here only
+    selects another sample row."""
     key = (D, window_left)
     if key not in _FINGERPRINTS:
-        from ...batch_invariant.fp_interface.term import fingerprint
-
-        spec = AttentionSpec(D)
-        row = RowSpec(p=spec.C + spec.T // 2, window_left=window_left)
-        parts = [
-            f"D={D}",
-            f"T={spec.T}",
-            f"C={spec.C}",
-            f"win={window_left}",
-            fingerprint(spec.output(row, 0)),
-            fingerprint(spec.output(row, 1)),
-        ]
-        _FINGERPRINTS[key] = (
-            f"attn-bf16-d{D}-"
-            + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        _FINGERPRINTS[key] = class_fingerprint(
+            D, tile_keys(D), chunk_len(D), window_left
         )
     return _FINGERPRINTS[key]
