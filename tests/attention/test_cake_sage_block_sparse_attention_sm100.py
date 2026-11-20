@@ -1026,12 +1026,11 @@ def test_after_one_launch_rule_thresholds():
     """``_TAIL_SPLIT_P3_SERIAL_BELOW`` and ``_SDP3_GIVE_WAY`` with their thresholds
     written out on plans ``(grid, split_from, items)`` of 152 tile slots (SM103): below
     32 selected blocks a row or two waves, a split row whose split tiles fill at most a
-    third of the slots launches without PDL, and so does every split row below 32
-    selected blocks a row on three to four waves; the other rows keep PDL;
+    third of the slots launches without PDL, the other rows keep PDL;
     ``attention_sdp3`` is given up to 22 selected blocks a row below three waves.  SM100
     has neither rule."""
     assert pkg._TAIL_SPLIT_P3_SERIAL == {"sm_100a": ((3, 3, None), (3, 2, 47))}
-    assert pkg._TAIL_SPLIT_P3_SERIAL_BELOW == {"sm_103a": (32, 2, 3, (3, 4))}
+    assert pkg._TAIL_SPLIT_P3_SERIAL_BELOW == {"sm_103a": (32, 2, 3)}
     assert pkg._SDP3_GIVE_WAY == {"sm_103a": (22, 3)}
 
     def plan(tiles, slots):
@@ -1045,14 +1044,9 @@ def test_after_one_launch_rule_thresholds():
         (24, 1088, True),
         (40, 192, True),
         (58, 200, True),
-        (24, 512, True),
-        (28, 512, True),
-        (31, 528, True),
-        (28, 496, True),
-        (28, 228, False),
-        (28, 672, False),
+        (24, 512, False),
+        (28, 512, False),
         (32, 320, False),
-        (32, 512, False),
         (58, 512, False),
         (64, 1224, False),
     ]:

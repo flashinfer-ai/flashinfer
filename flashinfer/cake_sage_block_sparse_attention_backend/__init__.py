@@ -347,17 +347,12 @@ _TAIL_SPLIT_P3_SERIAL = {"sm_100a": ((3, 3, None), (3, 2, 47))}
 #: launches without PDL after the one-launch quantizer where ``_TAIL_SPLIT_P3_SERIAL``
 #: keeps PDL.  On SM103 the eager PDL launch behind that quantizer runs up to 14 %
 #: slower below 32 selected blocks a row and on grids of fewer than two waves, and the
-#: launch after the quantizer ends runs at full speed there.  Between three and four
-#: waves (``3 x SMs <= total_tiles < 4 x SMs``), a row below 32 selected blocks a row
-#: whose split tiles fill more than a third of the slots runs that PDL launch about
-#: 2 us slower in most calls of a long-running process, so it launches without PDL
-#: as well.  ``(sel, waves, parts, (lo, hi))``: a row below ``sel`` selected blocks a
-#: row, or on fewer than ``waves`` waves of the persistent grid
-#: (``total_tiles < waves x SMs``), whose split tiles fill at most ``1/parts`` of the
-#: slots, and a row below ``sel`` selected blocks a row on ``lo`` to ``hi`` waves
-#: (``lo x SMs <= total_tiles < hi x SMs``) launch without PDL; the other rows keep
-#: PDL.  The launch writes the bits of the attention call.
-_TAIL_SPLIT_P3_SERIAL_BELOW = {"sm_103a": (32, 2, 3, (3, 4))}
+#: launch after the quantizer ends runs at full speed there.  ``(sel, waves, parts)``:
+#: a row below ``sel`` selected blocks a row, or on fewer than ``waves`` waves of the
+#: persistent grid (``total_tiles < waves x SMs``), whose split tiles fill at most
+#: ``1/parts`` of the slots launches without PDL; the other rows keep PDL.  The launch
+#: writes the bits of the attention call.
+_TAIL_SPLIT_P3_SERIAL_BELOW = {"sm_103a": (32, 2, 3)}
 #: The ``p3`` build (a fifth warpgroup merges, scales and stores each tile while the
 #: next tile runs) and, per architecture, the band of selected blocks a row
 #: ``(lo, hi, waves)`` in which it replaces the default or ``attention_qs`` build when
@@ -514,11 +509,9 @@ def _p3_serial_below(
     rule = _TAIL_SPLIT_P3_SERIAL_BELOW.get(arch)
     if rule is None:
         return False
-    sel, waves, parts, (lo, hi) = rule
+    sel, waves, parts = rule
     grid, split_from, items = plan
     tail = (items - split_from) // 2
-    if block_sparse_num < sel and lo * sms <= tiles < hi * sms:
-        return True
     return (block_sparse_num < sel or tiles < waves * sms) and parts * tail <= grid
 
 
