@@ -23,6 +23,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    FrozenSet,
     List,
     Literal,
     Optional,
@@ -3916,7 +3917,11 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
     def get_valid_tactics(self, inputs, profile) -> List[Tuple[str, Any]]:
         # Cake is profiled only against a first-stage winner of this profile:
         # alone it would win without a comparison.
-        if self._incumbent is None or profile is None:
+        if (
+            self._incumbent is None
+            or profile is None
+            or not self._incumbent.times_profile(profile)
+        ):
             return []
         winner = self._incumbent.profile_winner(profile)
         if winner is None:
@@ -4050,6 +4055,18 @@ _CAKE_MLA_RUNNER = _CakeTrtllmMlaBlackwellRunner.__name__
 _MLA_DECODE_OP = "trtllm_batch_decode_mla"
 _MLA_CAKE_MARGIN_OP = "trtllm_batch_decode_mla_cake_margin"
 
+# The second stage's tie, in ms: Cake is kept unless the first-stage winner
+# measures faster by more than this. The tuner times a single cold replay as
+# the median of ten CUDA-event samples; on SM100a and SM103a these samples step
+# in units of 2.048 us, so a median lies on a 1.024 us grid and a decode kernel
+# of about 10 us measures a real gap of up to one step as either no difference
+# or one full step. 1.25 steps (between one and one and a half steps) covers a
+# one-step difference plus its jitter, and a first-stage winner faster by one
+# and a half steps or more still wins. The offer table admits only units where
+# Cake measured faster offline, so the second stage only guards against a
+# measurable regression.
+_MLA_CAKE_STAGE_TWO_TIE_MS = 1.25 * 2.048e-3
+
 
 def _mla_effective_tuning_config(tuner: AutoTuner, config: TuningConfig):
     """``config`` as ``AutoTuner.choose_one`` applies it: with the active
@@ -4090,31 +4107,37 @@ class _MlaStageOneWinnerRunner(TunableRunner):
         self._config = tuning_config
         self._inputs = inputs
         self._cake = cake
+        # The batches (profile opt values) the second stage times now; ``None``:
+        # every batch. See ``_mla_cake_stage_two_tune``.
+        self._timed_batches: Optional[FrozenSet[int]] = None
 
-    def _winner(self, shapes, profile) -> Optional[Tuple[str, Any]]:
+    def _lookup(self, tuner: AutoTuner, config: TuningConfig, shapes, profile):
+        """The first stage's lookup of ``shapes`` (under ``tuner._lock``)."""
         from ..autotuner.autotuner import _ProfilingCandidates
 
+        if tuner.is_tuning_mode:
+            # As choose_one's lookups while tuning.
+            return tuner.search_cache(
+                _MLA_DECODE_OP,
+                self._runners,
+                shapes,
+                config,
+                inputs=self._inputs,
+                require_profiling_policy=True,
+                profiling_candidates=_ProfilingCandidates.from_runners(
+                    self._runners, self._inputs
+                ),
+                validation_profile=profile,
+            )
+        return tuner.search_cache(
+            _MLA_DECODE_OP, self._runners, shapes, config, inputs=self._inputs
+        )
+
+    def _winner(self, shapes, profile) -> Optional[Tuple[str, Any]]:
         tuner = AutoTuner.get()
         with tuner._lock:
             config = _mla_effective_tuning_config(tuner, self._config)
-            if tuner.is_tuning_mode:
-                # As choose_one's lookups while tuning.
-                hit, runner_id, tactic, _ = tuner.search_cache(
-                    _MLA_DECODE_OP,
-                    self._runners,
-                    shapes,
-                    config,
-                    inputs=self._inputs,
-                    require_profiling_policy=True,
-                    profiling_candidates=_ProfilingCandidates.from_runners(
-                        self._runners, self._inputs
-                    ),
-                    validation_profile=profile,
-                )
-            else:
-                hit, runner_id, tactic, _ = tuner.search_cache(
-                    _MLA_DECODE_OP, self._runners, shapes, config, inputs=self._inputs
-                )
+            hit, runner_id, tactic, _ = self._lookup(tuner, config, shapes, profile)
         if not hit:
             return None
         return type(self._runners[runner_id]).__name__, tactic
@@ -4123,11 +4146,46 @@ class _MlaStageOneWinnerRunner(TunableRunner):
         """The first-stage winner of a tuning profile, or ``None``."""
         return self._winner(profile.get_opt_shapes(), profile)
 
+    def profile_time(self, profile) -> Optional[float]:
+        """The time (ms) the first stage measured for its winner of a tuning
+        profile, from the winner's selection record (of this process's tuning
+        or of a loaded cache file), or ``None`` without a winner or record."""
+        tuner = AutoTuner.get()
+        shapes = profile.get_opt_shapes()
+        with tuner._lock:
+            config = _mla_effective_tuning_config(tuner, self._config)
+            hit, runner_id, _, _ = self._lookup(tuner, config, shapes, profile)
+            if not hit:
+                return None
+            runner = self._runners[runner_id]
+            key = tuner._get_cache_key(
+                _MLA_DECODE_OP,
+                runner,
+                shapes,
+                config,
+                runner.get_cache_key_extras(self._inputs),
+            )
+            identity = tuner._winner_cache_identity()
+            record = tuner._profiling_cache_selections.get((identity, key))
+            if record is None and identity is None:
+                record = tuner._file_config_selections.get(key.file_key)
+        time_ms = record.get("time_ms") if isinstance(record, dict) else None
+        if not isinstance(time_ms, (int, float)) or not 0 < time_ms < math.inf:
+            return None
+        return float(time_ms)
+
+    def times_profile(self, profile) -> bool:
+        """Whether the second stage times this profile now."""
+        timed = self._timed_batches
+        return timed is None or profile.get_opt_shapes()[0][0] in timed
+
     def call_winner(self, inputs) -> Optional[Tuple[str, Any]]:
         """The first-stage winner for these call inputs, or ``None``."""
         return self._winner(AutoTuner.get()._get_input_sizes(inputs), None)
 
     def get_valid_tactics(self, inputs, profile) -> List[Tuple[str, Any]]:
+        if not self.times_profile(profile):
+            return []
         winner = self.profile_winner(profile)
         if winner is None or (
             self._cake is not None
@@ -4315,18 +4373,20 @@ def _mla_cake_stage_two_runners(
 ) -> List[TunableRunner]:
     """The second stage's candidates in enumeration order: Cake first, so an
     exact tie with the first stage's winner selects Cake (the tuner keeps the
-    first of equal times); a strictly faster first-stage winner still wins.
+    first of equal times), and the tuner's tie tolerance, which keeps an
+    earlier candidate within it, keeps Cake.
 
     Only offered units reach the second stage, and the offer table admits a
     unit only where Cake measured a median of at most 0.98 and every round at
     most 1.00 of the best other candidate. The tuner's single cold replay
-    quantizes a microsecond decode kernel to steps of about 2 us, so a tie in
-    an offered unit is the timer's resolution, not evidence that the first
-    stage's winner is faster. ``autotune(tie_tolerance=...)`` widens a tie to
-    the tolerance: the tuner re-times the earlier candidate and keeps it while
-    its mean stays within the tolerance, so Cake is then kept against a
-    first-stage winner faster by at most the tolerance, and a first-stage
-    winner faster by more still wins.
+    quantizes a microsecond decode kernel to steps of about 2 us, so a gap of
+    up to one step in an offered unit is the timer's resolution, not evidence
+    that the first stage's winner is faster. ``_mla_cake_stage_two_tune``
+    therefore times each bucket under a tolerance that keeps Cake against a
+    first-stage winner faster by at most ``_MLA_CAKE_STAGE_TWO_TIE_MS`` (or by
+    ``autotune(tie_tolerance=...)`` when that is wider): the tuner re-times
+    Cake and keeps it while its mean stays within the tolerance, and a
+    first-stage winner faster by more still wins.
 
     Inside an ``autotune_v2`` context the tuner also races the default tactic
     ``-1`` of the first candidate, even where that candidate offers no tactic
@@ -4338,6 +4398,75 @@ def _mla_cake_stage_two_runners(
     if tuner._in_v2_context:
         return [incumbent, cake]
     return [cake, incumbent]
+
+
+def _mla_cake_stage_two_tune(
+    tuner: AutoTuner,
+    pair: List[TunableRunner],
+    incumbent: _MlaStageOneWinnerRunner,
+    config: TuningConfig,
+    inputs: List[torch.Tensor],
+    batch_ranges: Tuple[Tuple[int, int], ...],
+) -> Tuple[TunableRunner, Any]:
+    """Tunes the second stage (``choose_one`` of ``_MLA_CAKE_MARGIN_OP`` over
+    ``pair``, ``_mla_cake_stage_two_runners``) and returns its selection for
+    ``inputs``.
+
+    Outside ``autotune_v2`` contexts Cake is kept in a bucket unless the
+    first-stage winner measures faster by more than
+    ``_MLA_CAKE_STAGE_TWO_TIE_MS``. The tuner's ``tie_tolerance`` is relative
+    and holds for a whole ``choose_one``, so each bucket within
+    ``batch_ranges`` is timed under the tolerance that is this absolute tie at
+    the time the first stage measured for its winner there
+    (``_MlaStageOneWinnerRunner.profile_time``), or under
+    ``autotune(tie_tolerance=...)`` when that is larger or there is no such
+    time. The buckets of one tolerance are timed in one ``choose_one``, in
+    which the other buckets offer no tactic. The buckets, their profiles and
+    every cache key are the ones a single ``choose_one`` uses; with one
+    tolerance for every bucket it is that single ``choose_one``. Inside an
+    ``autotune_v2`` context (where the first-stage winner is the first
+    candidate) the tuner's own tolerance decides, as for other ops."""
+    if tuner._in_v2_context:
+        return tuner.choose_one(_MLA_CAKE_MARGIN_OP, pair, config, inputs)
+    default = tuner._tie_tolerance
+    groups: Dict[float, Set[int]] = {}
+    for profile in tuner._generate_optimization_profiles(
+        _mla_effective_tuning_config(tuner, config), inputs
+    ):
+        batch = profile.get_opt_shapes()[0][0]
+        if not _in_batch_ranges(batch, batch_ranges):
+            continue  # Cake never serves it, so it is never timed.
+        time_ms = incumbent.profile_time(profile)
+        tolerance = default
+        if time_ms is not None:
+            # autotune() accepts tolerances below 1.
+            tie = min(_MLA_CAKE_STAGE_TWO_TIE_MS / time_ms, 0.5)
+            tolerance = max(default, tie)
+        groups.setdefault(tolerance, set()).add(batch)
+    tolerances: List[Tuple[float, Optional[FrozenSet[int]]]]
+    if len(groups) <= 1:
+        tolerances = [(next(iter(groups), default), None)]
+    else:
+        tolerances = [(tol, frozenset(batches)) for tol, batches in groups.items()]
+    stack = tuner._get_override_stack()
+    top = stack[-1] if stack else (None, False, None, None)
+    selection: Tuple[TunableRunner, Any] = (pair[0], -1)
+    try:
+        for tolerance, batches in tolerances:
+            incumbent._timed_batches = batches
+            pushed = tolerance != default
+            if pushed:
+                stack.append((top[0], top[1], top[2], tolerance))
+            try:
+                # Every choose_one ends with the same lookup of the call's
+                # bucket, so the last one returns the call's selection.
+                selection = tuner.choose_one(_MLA_CAKE_MARGIN_OP, pair, config, inputs)
+            finally:
+                if pushed:
+                    stack.pop()
+    finally:
+        incumbent._timed_batches = None
+    return selection
 
 
 def _mla_cake_stage_two(
@@ -4360,7 +4489,8 @@ def _mla_cake_stage_two(
     on every Cake miss, and when tuning the second stage fails).
 
     While tuning outside stream capture it times the buckets within
-    ``batch_ranges``; otherwise, and during capture, it only looks up. The
+    ``batch_ranges`` (``_mla_cake_stage_two_tune``); otherwise, and during
+    capture, it only looks up. The
     first stage's lookup records the call in ``autotune_v2`` replay
     diagnostics; the second stage's lookups are not recorded, and a miss
     under strict replay runs the first stage's winner instead of raising.
@@ -4443,7 +4573,9 @@ def _mla_cake_stage_two(
         from ..autotuner.autotuner import _StickyCudaError, _TuningGroupError
 
         try:
-            runner, tactic = tuner.choose_one(_MLA_CAKE_MARGIN_OP, pair, config, inputs)
+            runner, tactic = _mla_cake_stage_two_tune(
+                tuner, pair, incumbent, config, inputs, batch_ranges
+            )
         except (_StickyCudaError, _TuningGroupError):
             raise
         except Exception as exc:
@@ -5511,11 +5643,12 @@ def _mla_with_kv_cache_impl(
     selects what it selects without Cake (a repeated lookup-only call of a
     listed batch reuses that result, see below). The second stage, the op
     ``"trtllm_batch_decode_mla_cake_margin"``, compares that winner with Cake per
-    tuning bucket, under the same ``autotune()`` settings including
-    ``tie_tolerance``, and keeps Cake at an exact tie (outside ``autotune_v2``
-    contexts); it profiles Cake only against a first-stage winner, and a
-    Cake result is valid only while the first stage keeps the winner Cake
-    beat or tied. The second stage runs only for the units the device's offer table
+    tuning bucket, under the same ``autotune()`` settings, and (outside
+    ``autotune_v2`` contexts) keeps Cake unless the first-stage winner measures
+    faster by more than about 2.6 us (1.25 steps of the timer's resolution) or
+    by ``tie_tolerance``, whichever is wider; it profiles Cake only against a
+    first-stage winner, and a Cake result is valid only while the first stage
+    keeps the winner Cake beat or tied. The second stage runs only for the units the device's offer table
     (``_CAKE_MLA_AUTO_OFFERS``: device, dtype, page size, ``q_len``,
     ``max_seq_len`` bucket and batch range) lists, where Cake measured faster
     than the other candidates; elsewhere, and on devices the table does not

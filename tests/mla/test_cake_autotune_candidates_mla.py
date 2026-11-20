@@ -10,8 +10,9 @@ that the committed offer table is well formed and lists only measured units; tha
 offers Cake only when every batch the bucket serves is listed and launches the
 programs of the profiled batch; that Cake is profiled only against a first-stage
 winner and a Cake choice stays valid only while that winner does; that both
-stages time a single cold replay and the second keeps Cake at an exact tie with
-the first stage's winner; that the memo state and the tuning buckets are what the tuner's
+stages time a single cold replay and the second keeps Cake unless the first
+stage's winner measures faster by more than the absolute tie of each bucket;
+that the memo state and the tuning buckets are what the tuner's
 accessors and the unmemoized computation give; that an
 untuned call never selects Cake and every Cake miss runs the first stage's
 selection; that a repeated lookup-only call of a listed batch reuses the
@@ -33,6 +34,7 @@ import contextlib
 import itertools
 import math
 import os
+import statistics
 import threading
 from dataclasses import replace
 
@@ -1025,6 +1027,9 @@ class _StubIncumbent:
     def call_winner(self, inputs):
         return self.winner
 
+    def times_profile(self, profile):
+        return True
+
 
 def _staged(runner, winner=WINNER):
     """``runner`` with a first-stage winner, as the second stage sets it."""
@@ -1461,7 +1466,8 @@ class _FakeCuteDsl(_FakeRunner):
 class _Stages:
     """Runs the first and second selection stages on a fresh tuner with fake
     first-stage runners and the Cake runner of a simulated 148-SM SM100a device.
-    Profiling returns ``times`` (ms) per runner class, instead of launching."""
+    Profiling returns ``times`` (ms) per runner class (a number, or a function
+    of the profiled batch), instead of launching."""
 
     BUCKETS = (1, 2, 4, 8, 16, 32)
 
@@ -1478,14 +1484,20 @@ class _Stages:
         }
         # (profiled class, timed class, batch) of every measurement.
         self.profiled = []
+        # (profiled class, batch, the tuner's tie tolerance) of every
+        # measurement.
+        self.tolerances = []
         self.ranges = ((1, 15),)
 
         def profile(tuner, runner, inputs, tactic, tuning_config, **kwargs):
             timed = type(runner).__name__
             if isinstance(runner, core._MlaStageOneWinnerRunner):
                 timed = tactic[0]
-            self.profiled.append((type(runner).__name__, timed, inputs[0].size(0)))
-            return self.times[timed]
+            batch = inputs[0].size(0)
+            self.profiled.append((type(runner).__name__, timed, batch))
+            self.tolerances.append((type(runner).__name__, batch, tuner._tie_tolerance))
+            time = self.times[timed]
+            return time(batch) if callable(time) else time
 
         monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
         monkeypatch.setattr(
@@ -1610,18 +1622,24 @@ def test_cake_selected_where_it_beat_the_first_stage(stages):
         assert stages.select(batch_size) == (stages.runners[1], -1), batch_size
 
 
+_TIE_MS = core._MLA_CAKE_STAGE_TWO_TIE_MS
+
+
 def _tie_times(stages, outcome):
     """Sets Cake's stubbed time against the first stage's winner (CuTe DSL)
     and returns the expected second-stage winner entry and decision."""
     first_stage = stages.times["_FakeCuteDsl"]
     stages.times[core._CAKE_MLA_RUNNER] = {
         "tie": first_stage,
-        # The smallest margin: no bias towards Cake beyond an exact tie.
+        # Within the absolute tie: Cake is re-timed and kept.
         "first_stage_barely_faster": math.nextafter(first_stage, math.inf),
+        "first_stage_faster_within_the_tie": first_stage + 0.5 * _TIE_MS,
+        # Beyond it, by the smallest margin the tie resolves, and by far.
+        "first_stage_faster_beyond_the_tie": first_stage + 1.5 * _TIE_MS,
         "first_stage_faster": first_stage * 1.5,
         "cake_faster": first_stage * 0.5,
     }[outcome]
-    if outcome.startswith("first_stage"):
+    if outcome in ("first_stage_faster_beyond_the_tie", "first_stage_faster"):
         return ("_MlaStageOneWinnerRunner", WINNER), (stages.runners[1], -1)
     return (core._CAKE_MLA_RUNNER, WINNER), ("cake", WINNER)
 
@@ -1629,22 +1647,31 @@ def _tie_times(stages, outcome):
 _TIE_OUTCOMES = [
     "tie",
     "first_stage_barely_faster",
+    "first_stage_faster_within_the_tie",
+    "first_stage_faster_beyond_the_tie",
     "first_stage_faster",
     "cake_faster",
 ]
 
+# Outcomes in which the tuner re-times Cake against the first stage's winner
+# (twice each) before it keeps Cake.
+_RETIMED_OUTCOMES = ("first_stage_barely_faster", "first_stage_faster_within_the_tie")
+
 
 @pytest.mark.parametrize("outcome", _TIE_OUTCOMES)
 def test_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
-    """An exact tie between Cake and the first stage's winner selects Cake: it
-    is stored as the second stage's winner of every offered bucket, selected by
+    """An exact tie between Cake and the first stage's winner selects Cake, and
+    so does a first-stage winner faster by at most the absolute tie
+    (``_MLA_CAKE_STAGE_TWO_TIE_MS``), after the tuner re-times both: Cake is
+    stored as the second stage's winner of every offered bucket, selected by
     the tuned call and by lookups, and memoized for lookup-only calls. A
-    strictly faster first-stage winner still wins, even by the smallest
-    margin, and a strictly faster Cake wins. No GPU needed."""
+    first-stage winner faster by more than the tie still wins, and a strictly
+    faster Cake wins. No GPU needed."""
     winner, expected = _tie_times(stages, outcome)
     assert _decision(stages.select(4, tune=True)) == expected
-    assert stages.cake_profiled() == [1, 2, 4, 8]
-    assert stages.incumbent_profiled() == [1, 2, 4, 8]
+    timed = 3 if outcome in _RETIMED_OUTCOMES else 1
+    assert stages.cake_profiled() == [b for b in (1, 2, 4, 8) for _ in range(timed)]
+    assert stages.incumbent_profiled() == stages.cake_profiled()
     assert stages.entries(core._MLA_CAKE_MARGIN_OP) == {
         bucket: winner for bucket in (1, 2, 4, 8)
     }
@@ -1668,8 +1695,9 @@ def test_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
 @pytest.mark.parametrize("outcome", _TIE_OUTCOMES)
 def test_round_up_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
     """Under ``autotune(round_up=True)`` the second stage uses the first
-    stage's config; there too an exact tie selects Cake, and a strictly faster
-    first-stage winner wins. No GPU needed."""
+    stage's config; there too an exact tie and a first-stage winner faster by
+    at most the absolute tie select Cake, and a first-stage winner faster by
+    more wins. No GPU needed."""
     winner, expected = _tie_times(stages, outcome)
     with autotune(False, round_up=True):
         assert _decision(stages.select(4, tune=True)) == expected
@@ -1683,10 +1711,10 @@ def test_round_up_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
     "cake_ratio,cake_kept", [(1.0, True), (1.02, True), (1.1, False), (0.9, True)]
 )
 def test_second_stage_tie_tolerance_keeps_cake_within_it(stages, cake_ratio, cake_kept):
-    """``autotune(tie_tolerance=0.05)`` widens the second stage's tie to 5 %:
-    Cake is kept against a first-stage winner faster by at most 5 % (its
-    re-timing confirms it), and a first-stage winner faster by more wins.
-    No GPU needed."""
+    """``autotune(tie_tolerance=0.05)``, wider here than the absolute tie,
+    widens the second stage's tie to 5 %: Cake is kept against a first-stage
+    winner faster by at most 5 % (its re-timing confirms it), and a
+    first-stage winner faster by more wins. No GPU needed."""
     stages.times[core._CAKE_MLA_RUNNER] = stages.times["_FakeCuteDsl"] * cake_ratio
     if cake_kept:
         winner, expected = (core._CAKE_MLA_RUNNER, WINNER), ("cake", WINNER)
@@ -1701,6 +1729,144 @@ def test_second_stage_tie_tolerance_keeps_cake_within_it(stages, cake_ratio, cak
         assert _decision(stages.select(4)) == expected
     # The first stage keeps its own winner (CuTe DSL, 2x faster than TRTLLM-GEN).
     assert set(stages.entries(core._MLA_DECODE_OP).values()) == {("_FakeCuteDsl", -1)}
+
+
+def _first_stage_ms(batch):
+    """A first-stage winner time (ms) that grows with the batch, so every
+    offered bucket's absolute tie is a different relative tolerance."""
+    return 0.010 * batch
+
+
+@pytest.mark.parametrize(
+    "cake_gap_ms,tie_tolerance,kept",
+    [
+        # One timer step (2.048 us): 20 % of bucket 1, 2.5 % of bucket 8.
+        ({1: 0.002048, 2: 0.002048, 4: 0.002048, 8: 0.002048}, None, (1, 2, 4, 8)),
+        # One and a half steps: beyond the tie of every bucket.
+        ({1: 0.003072, 2: 0.003072, 4: 0.003072, 8: 0.003072}, None, ()),
+        # Per bucket: within the tie at 1 and 4, beyond it at 2 and 8.
+        ({1: 0.001, 2: 0.003, 4: 0.0025, 8: 0.004}, None, (1, 4)),
+        # A wider autotune(tie_tolerance=0.1) holds where it is wider (8: 5 %).
+        ({1: 0.001, 2: 0.003, 4: 0.0025, 8: 0.004}, 0.1, (1, 4, 8)),
+        # A narrower one leaves each bucket's absolute tie.
+        ({1: 0.001, 2: 0.003, 4: 0.0025, 8: 0.004}, 0.001, (1, 4)),
+    ],
+)
+def test_second_stage_keeps_cake_within_each_buckets_absolute_tie(
+    stages, cake_gap_ms, tie_tolerance, kept
+):
+    """The second stage keeps Cake in a bucket unless the first stage's winner
+    measures faster by more than ``_MLA_CAKE_STAGE_TWO_TIE_MS``, whatever the
+    bucket's time: each offered bucket is timed under the relative tolerance
+    that is this tie at the time the first stage measured for its winner
+    there, or under a wider ``autotune(tie_tolerance=...)``. Every offered
+    bucket is timed in its own pass, Cake against the first-stage winner,
+    once or (when Cake is within the tolerance) three times; no other bucket
+    is timed, the first stage's entries are unchanged, the tolerance stack is
+    restored, and lookups follow the stored winners. No GPU needed."""
+    stages.times["_FakeCuteDsl"] = _first_stage_ms
+    stages.times["_FakeTrtllmGen"] = lambda batch: 2 * _first_stage_ms(batch)
+    stages.times[core._CAKE_MLA_RUNNER] = lambda batch: (
+        _first_stage_ms(batch) + cake_gap_ms.get(batch, 0.0)
+    )
+    context = (
+        contextlib.nullcontext()
+        if tie_tolerance is None
+        else autotune(False, tie_tolerance=tie_tolerance)
+    )
+    with context:
+        stack = list(stages.tuner._get_override_stack())
+        stages.select(4, tune=True)
+        assert stages.tuner._get_override_stack() == stack
+    assert stages.entries(core._MLA_DECODE_OP) == {
+        bucket: ("_FakeCuteDsl", -1) for bucket in stages.BUCKETS
+    }
+    assert stages.entries(core._MLA_CAKE_MARGIN_OP) == {
+        bucket: (
+            (core._CAKE_MLA_RUNNER if bucket in kept else "_MlaStageOneWinnerRunner"),
+            WINNER,
+        )
+        for bucket in (1, 2, 4, 8)
+    }
+    margin = ("_MlaStageOneWinnerRunner", core._CAKE_MLA_RUNNER)
+    for bucket in (1, 2, 4, 8):
+        tie = max(tie_tolerance or 0.0, _TIE_MS / _first_stage_ms(bucket))
+        timed = [
+            tolerance
+            for name, batch, tolerance in stages.tolerances
+            if name in margin and batch == bucket
+        ]
+        within = _first_stage_ms(bucket) + cake_gap_ms[bucket] <= (
+            _first_stage_ms(bucket) * (1 + tie)
+        )
+        assert len(timed) == (6 if within else 2), bucket
+        assert timed == pytest.approx([tie] * len(timed)), bucket
+    assert {batch for name, batch, _ in stages.tolerances if name in margin} == {
+        1,
+        2,
+        4,
+        8,
+    }
+    for batch_size in (1, 2, 4, 9, 15):
+        bucket = 1 << (batch_size.bit_length() - 1)
+        expected = ("cake", WINNER) if bucket in kept else (stages.runners[1], -1)
+        assert _decision(stages.select(batch_size)) == expected, batch_size
+
+
+def test_second_stage_without_a_first_stage_time_keeps_the_tuners_tolerance(
+    monkeypatch, stages
+):
+    """Without the first stage's time of its winner (no selection record) the
+    second stage times every bucket in one pass under the tuner's own
+    tolerance: an exact tie keeps Cake, a first-stage winner faster by any
+    margin wins. No GPU needed."""
+    monkeypatch.setattr(
+        core._MlaStageOneWinnerRunner, "profile_time", lambda self, profile: None
+    )
+    calls = _spy_choose_one(monkeypatch)
+    # Within the absolute tie, which needs the first stage's time.
+    _tie_times(stages, "first_stage_faster_within_the_tie")
+    assert _decision(stages.select(4, tune=True)) == (stages.runners[1], -1)
+    assert [op for op, _, _ in calls].count(core._MLA_CAKE_MARGIN_OP) == 1
+    assert {tolerance for _, _, tolerance in stages.tolerances} == {0.0}
+    assert stages.entries(core._MLA_CAKE_MARGIN_OP) == {
+        bucket: ("_MlaStageOneWinnerRunner", WINNER) for bucket in (1, 2, 4, 8)
+    }
+
+
+def test_first_stage_time_reads_the_winners_selection_record(
+    monkeypatch, stages, tmp_path
+):
+    """``_MlaStageOneWinnerRunner.profile_time`` is the time the first stage
+    measured for its winner of a profile: from this process's tuning, and from
+    a cache file loaded into another tuner; ``None`` without a winner. No GPU
+    needed."""
+    stages.times["_FakeCuteDsl"] = _first_stage_ms
+    inputs = _cpu_inputs(torch.bfloat16, 4)
+    profiles = stages.tuner._generate_optimization_profiles(stages.config, inputs)
+    incumbent = core._MlaStageOneWinnerRunner(stages.runners, stages.config, inputs)
+    assert all(incumbent.profile_time(profile) is None for profile in profiles)
+    stages.stage_one(inputs, tune=True)
+    expected = {
+        profile.get_opt_shapes()[0][0]: _first_stage_ms(profile.get_opt_shapes()[0][0])
+        for profile in profiles
+    }
+    measured = {
+        profile.get_opt_shapes()[0][0]: incumbent.profile_time(profile)
+        for profile in profiles
+    }
+    assert measured == pytest.approx(expected)
+
+    path = str(tmp_path / "configs.json")
+    stages.tuner.save_configs(path)
+    loaded = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", loaded)
+    assert loaded.load_configs(path)
+    measured = {
+        profile.get_opt_shapes()[0][0]: incumbent.profile_time(profile)
+        for profile in profiles
+    }
+    assert measured == pytest.approx(expected)
 
 
 def test_second_stage_lists_cake_first_outside_autotune_v2(fresh_tuner):
@@ -2765,13 +2931,15 @@ def test_second_stage_decision_follows_its_measurements(
     monkeypatch, clean_tuner, dtype, batch_size, q_len, page_size, max_seq_len
 ):
     """Real tuning of a small offered unit: the second stage times the
-    incumbent and Cake once per offered bucket with the single cold replay,
-    finite and without an error, and stores Cake exactly where Cake's time is
-    at most the incumbent's (an exact tie selects Cake). The tuned call and a
+    incumbent and Cake per offered bucket with the single cold replay, finite
+    and without an error, and stores Cake exactly where Cake's time is at most
+    the incumbent's plus the bucket's absolute tie (the relative tolerance
+    ``_MLA_CAKE_STAGE_TWO_TIE_MS`` at the first stage's recorded time of its
+    winner), confirmed by the tuner's re-timing of both. The tuned call and a
     later lookup-only call run what the stored winner of their bucket says,
-    and the output matches the reference. (Whether the two measure equal is up
-    to the timer, so the test checks the decision against the recorded
-    measurements rather than forcing a tie.)"""
+    and the output matches the reference. (Whether the two measure within the
+    tie is up to the timer, so the test checks the decision against the
+    recorded measurements rather than forcing one.)"""
     _require_cake_arch()
     margin_runners = {"_MlaStageOneWinnerRunner", core._CAKE_MLA_RUNNER}
     # {(runner class, profiled batch): [time or exception]}
@@ -2824,18 +2992,34 @@ def test_second_stage_decision_follows_its_measurements(
         for key in clean_tuner._winner_cache()
         if key.custom_op == core._MLA_CAKE_MARGIN_OP
     }
+    # The first stage's recorded time of its winner per bucket.
+    first_stage_ms = {
+        key.nearest_profile[0][0]: selection["time_ms"]
+        for (_, key), selection in clean_tuner._profiling_cache_selections.items()
+        if key.custom_op == core._MLA_DECODE_OP
+    }
     for bucket in buckets:
-        [cake_time] = measured[(core._CAKE_MLA_RUNNER, bucket)]
-        [incumbent_time] = measured[("_MlaStageOneWinnerRunner", bucket)]
-        for result in (cake_time, incumbent_time):
+        cake_times = measured[(core._CAKE_MLA_RUNNER, bucket)]
+        incumbent_times = measured[("_MlaStageOneWinnerRunner", bucket)]
+        for result in cake_times + incumbent_times:
             assert not isinstance(result, BaseException), (bucket, result)
             assert math.isfinite(result) and result > 0, (bucket, result)
-        expected = (
-            core._CAKE_MLA_RUNNER
-            if cake_time <= incumbent_time
-            else "_MlaStageOneWinnerRunner"
-        )
-        assert stored.get(bucket) == expected, (bucket, cake_time, incumbent_time)
+        tie = min(core._MLA_CAKE_STAGE_TWO_TIE_MS / first_stage_ms[bucket], 0.5)
+        cake_time, incumbent_time = cake_times[0], incumbent_times[0]
+        if cake_time <= incumbent_time:
+            # Cake measured fastest: no re-timing.
+            rounds, cake_kept = 1, True
+        elif cake_time <= incumbent_time * (1 + tie):
+            # Within the tie: both re-timed twice, Cake kept on the means.
+            rounds = 3
+            cake_kept = statistics.fmean(cake_times[1:]) <= statistics.fmean(
+                incumbent_times[1:]
+            ) * (1 + tie)
+        else:
+            rounds, cake_kept = 1, False
+        assert (len(cake_times), len(incumbent_times)) == (rounds, rounds), bucket
+        expected = core._CAKE_MLA_RUNNER if cake_kept else "_MlaStageOneWinnerRunner"
+        assert stored.get(bucket) == expected, (bucket, cake_times, incumbent_times)
     assert policies == {("cold", 1)}
     assert set(failed.get(core._MLA_CAKE_MARGIN_OP, ())) == failed_before
     assert _margin_policies(clean_tuner) == {"cold"}
