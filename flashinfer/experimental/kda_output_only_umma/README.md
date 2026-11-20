@@ -14,8 +14,9 @@ argument list and contract unchanged.
 - `kda_wy_output_only(..., backend="umma")` (dense `[B, T, ...]` inputs, optional
   bf16 corrections + kg cache) and `kda_recoverssm_verify(..., backend="umma")`
   (the vLLM drop-in: packed tokens, ragged lengths, null slots, fp32 slot-indexed
-  corrections, raw k|g cache, padded pools). Naming the backend is the opt-in and
-  warns once.
+  corrections, raw k|g cache, padded pools). Naming the backend is the opt-in. An
+  `ExperimentalWarning` is emitted once per entry point (shared with automatic
+  selection: an explicit call after an automatic one does not warn again).
 - `backend="auto"` (also `recurrent_kda(disable_state_update=True)`) selects it
   only with `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`, at T <= 8 and where the
   WY kernel would otherwise run.
@@ -24,8 +25,24 @@ argument list and contract unchanged.
 
 SM10x only (tcgen05); K == V == 128; bf16 inputs and state pool (as the WY
 kernel); T in [1, 16]. Faster than the WY kernel at T <= 8 (B200, H = 12:
-1.05-1.28x dense, 1.12-1.89x drop-in) and slower at T = 16 (0.84-0.97x). Kernels
+1.05-1.28x dense, 1.12-1.89x drop-in) and slower at T = 16 (0.80-0.97x). Kernels
 are JIT-compiled per process.
+
+Shared with the WY kernel (not checked; same behaviour on both backends unless
+noted):
+
+- Per-channel decay: |cumulative log-gate| over the window must stay below ~88
+  (`exp(-cum)` overflows fp32 beyond it and the output becomes NaN). The Kimi K3
+  lower-bound gate with |lower_bound| * T <= 80 is always inside; the precomputed
+  and softplus gates are not bounded.
+- q / k elements above ~1.8e19 overflow the fp32 L2-norm sum of squares.
+- Drop-in: every sequence length must be <= `spec_query_len` (the WY kernel writes
+  past the sequence's cache rows; this kernel processes the first
+  `spec_query_len` tokens). Non-null `state_indices` must be `< num_blocks` and
+  unique; out-of-range slots write out of bounds and duplicate slots leave the
+  caches undefined.
+- Dense mode: a negative `initial_state_indices` entry reads a zero state (as the
+  WY kernel; the grouped recurrence reads slot 0).
 
 Tests: `tests/experimental/test_kda_output_only_umma.py` (re-runs
 `tests/kda/test_kda_output_only.py` on this backend). Benchmark:

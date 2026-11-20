@@ -69,6 +69,8 @@ _NO_LAUNCH_EXPECTED = {
     "test_frozen_mode_shape_validation",
     "test_umma_auto_needs_experimental_opt_in",
     "test_umma_backend_rejects_bad_values",
+    "test_dropin_rejects_misaligned_token_stride",
+    "test_dense_rejects_unknown_backend",
 }
 
 
@@ -111,9 +113,13 @@ def test_umma_matches_wy(T, gate, H, HV):
     out = _WY_DENSE(*args, **kw, emit_corrections=True, backend="umma")
     torch.cuda.synchronize()
     assert torch.equal(args[5], pool_before)
-    torch.testing.assert_close(out[0].float(), ref[0].float(), atol=2e-3, rtol=1e-2)
-    torch.testing.assert_close(out[1].float(), ref[1].float(), atol=3e-2, rtol=1e-2)
-    torch.testing.assert_close(out[2].float(), ref[2].float(), atol=2e-3, rtol=1e-2)
+    # absolute tolerances scale with the output magnitude once it exceeds 1 (both
+    # kernels round to bf16; at the default scale |out| < 1 and they are unchanged)
+    for got, want, atol in zip(out, ref, (2e-3, 3e-2, 2e-3), strict=True):
+        mag = max(1.0, want.float().abs().max().item())
+        torch.testing.assert_close(
+            got.float(), want.float(), atol=atol * mag, rtol=1e-2
+        )
 
 
 @pytest.mark.parametrize("T", [1, 4, 8, 16])
@@ -128,11 +134,16 @@ def test_umma_bitwise_deterministic(T):
             assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("spec_len", [1, 3, 8, 12, 16])
-def test_umma_dropin_matches_wy(spec_len):
+@pytest.mark.parametrize(
+    "spec_len,kg_pad",
+    [(1, 0), (3, 0), (8, 0), (12, 0), (16, 0), (4, 1), (4, 2), (8, 4), (16, 6)],
+)
+def test_umma_dropin_matches_wy(spec_len, kg_pad):
     """Drop-in contract (ragged lengths incl. empty sequences, null slots, padded
     pool, sentinel caches) bitwise-equal on untouched regions and within bf16 /
-    fp32 rounding elsewhere, vs the WY kernel."""
+    fp32 rounding elsewhere, vs the WY kernel. ``kg_pad`` pads the kg cache's
+    position and block strides (strides not multiples of 8 elements take the
+    kernel's 2-byte store path)."""
     torch.manual_seed(spec_len)
     dev = "cuda"
     B, H = 7, 4
@@ -159,9 +170,14 @@ def test_umma_dropin_matches_wy(spec_len):
     res = {}
     for be in ("wy", "umma"):
         corr = torch.full((nblk, H, spec_len, V), 7.0, device=dev)
-        kg = torch.full(
-            (nblk, H, spec_len, 2 * K), 7.0, dtype=torch.bfloat16, device=dev
+        row = 2 * K + kg_pad
+        kg_buf = torch.full(
+            (nblk, H * spec_len * row + 3 * kg_pad),
+            7.0,
+            dtype=torch.bfloat16,
+            device=dev,
         )
+        kg = kg_buf[:, : H * spec_len * row].view(nblk, H, spec_len, row)[..., : 2 * K]
         out = torch.full((1, tot, H, V), 5.0, dtype=torch.bfloat16, device=dev)
         _WY_DROPIN(
             q,
@@ -181,9 +197,10 @@ def test_umma_dropin_matches_wy(spec_len):
             out=out,
             backend=be,
         )
-        res[be] = (out, corr, kg)
+        res[be] = (out, corr, kg, kg_buf)
     torch.cuda.synchronize()
-    (o0, c0, k0), (o1, c1, k1) = res["wy"], res["umma"]
+    (o0, c0, k0, b0), (o1, c1, k1, b1) = res["wy"], res["umma"]
+    assert torch.equal(b0, b1)  # padding of the kg buffer untouched by both
     assert torch.equal(c0 == 7.0, c1 == 7.0) and torch.equal(k0 == 7.0, k1 == 7.0)
     assert torch.equal(o0 == 5.0, o1 == 5.0)
     torch.testing.assert_close(o1.float(), o0.float(), atol=2e-3, rtol=1e-2)
@@ -245,3 +262,72 @@ def test_umma_cuda_graph_replay(T):
         torch.cuda.synchronize()
         for a, b in zip(outs, ref, strict=True):
             assert torch.equal(a, b)
+
+
+def test_umma_dense_negative_slot_reads_zero_state():
+    """Dense mode: a negative ``initial_state_indices`` entry reads a zero state on
+    the UMMA backend, as on the WY kernel (so automatic selection cannot change the
+    output of those rows)."""
+    B, T = 6, 4
+    args, kw = _inputs(B, T, 4, 4, "lb", seed=21)
+    q, k, v, g, beta, pool, idx = args
+    idx[1] = -1
+    idx[4] = -3
+    zero_slot = pool.shape[0]
+    pool_z = torch.cat([pool, torch.zeros_like(pool[:1])])
+    idx_z = torch.where(idx < 0, torch.full_like(idx, zero_slot), idx)
+    out = _WY_DENSE(q, k, v, g, beta, pool, idx, **kw, backend="umma")
+    ref = _WY_DENSE(q, k, v, g, beta, pool_z, idx_z, **kw, backend="umma")
+    wy = _WY_DENSE(q, k, v, g, beta, pool, idx, **kw, backend="wy")
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+    torch.testing.assert_close(out.float(), wy.float(), atol=2e-3, rtol=1e-2)
+
+
+@pytest.mark.parametrize("be", ["wy", "umma"])
+@pytest.mark.parametrize("which", ["q", "k", "v"])
+def test_dropin_rejects_misaligned_token_stride(be, which):
+    """q / k / v token strides that are not multiples of 8 elements raise (both
+    kernels read token rows with 16-byte vector or bulk copies)."""
+    dev = "cuda"
+    H, K, T, tot = 4, 128, 4, 6
+    ten = {}
+    for name in ("q", "k", "v"):
+        pad = 2 if name == which else 0
+        ten[name] = torch.randn(1, tot, H * K + pad, dtype=torch.bfloat16, device=dev)[
+            ..., : H * K
+        ].view(1, tot, H, K)
+    g = torch.randn(1, tot, H, K, dtype=torch.bfloat16, device=dev)
+    beta = torch.randn(1, tot, H, dtype=torch.bfloat16, device=dev)
+    state = torch.zeros(4, H, K, K, dtype=torch.bfloat16, device=dev)
+    corr = torch.zeros(4, H, T, K, device=dev)
+    kg = torch.zeros(4, H, T, 2 * K, dtype=torch.bfloat16, device=dev)
+    qsl = torch.tensor([0, 4, 6], dtype=torch.int32, device=dev)
+    sidx = torch.tensor([1, 2], dtype=torch.int32, device=dev)
+    with pytest.raises(ValueError, match="token strides must be 16B-aligned"):
+        _WY_DROPIN(
+            ten["q"],
+            ten["k"],
+            ten["v"],
+            g,
+            beta,
+            torch.zeros(H, device=dev),
+            torch.zeros(H * K, device=dev),
+            -5.0,
+            state,
+            corr,
+            kg,
+            qsl,
+            sidx,
+            T,
+            backend=be,
+        )
+
+
+@pytest.mark.parametrize("be", ["UMMA", "bogus", None])
+def test_dense_rejects_unknown_backend(be):
+    """``kda_wy_output_only`` validates its backend argument (a typo used to run the
+    WY kernel silently)."""
+    args, kw = _inputs(2, 4, 4, 4, "lb", seed=1)
+    with pytest.raises(ValueError, match="backend must be"):
+        _WY_DENSE(*args, **kw, backend=be)

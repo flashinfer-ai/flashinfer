@@ -28,6 +28,18 @@ def kda_oo_umma_unavailable_reason(device: torch.device, T: int) -> Optional[str
     return None
 
 
+# backend="auto" (with FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1) picks this kernel
+# up to this many tokens: B200 / H=12 measured it 1.05-1.28x faster than the WY
+# kernel at T <= 8 (dense) and 1.12-1.89x (drop-in), but 0.80-0.97x at T = 16.
+_AUTO_T_MAX = 8
+
+
+def kda_oo_umma_auto_ok(device: torch.device, T: int) -> bool:
+    """Whether ``backend="auto"`` (with the experimental opt-in) should pick this
+    kernel: where it is measured faster than the WY kernel and can run."""
+    return T <= _AUTO_T_MAX and kda_oo_umma_unavailable_reason(device, T) is None
+
+
 def run_kda_oo_umma(
     args: list,
     *,
@@ -41,7 +53,7 @@ def run_kda_oo_umma(
     null_min: int,
     HV: int,
     H: int,
-    batch: int = 0,
+    kg_v4: bool = True,
 ) -> None:
     """Compile (once per specialisation) and launch on ``args`` -- the
     ``KdaDecodeWyOutputOnlyKernel`` argument list."""
@@ -66,6 +78,7 @@ def run_kda_oo_umma(
         int(null_min),
         HV,
         H,
+        bool(kg_v4),
     )
     fn = _KERNELS.get(key)
     if fn is None:
@@ -77,6 +90,7 @@ def run_kda_oo_umma(
             emit_corrections=emit_corrections,
             vllm_dropin=vllm_dropin,
             null_min=null_min,
+            kg_v4=kg_v4,
         )
         fn = cute.compile[gdn_compile_options(device)](kernel, *args)
         _KERNELS[key] = fn

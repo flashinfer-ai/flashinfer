@@ -355,7 +355,9 @@ def recurrent_kda(
             state back (``final_state`` is ``None``). See
             :func:`flashinfer.kda_decode.recurrent_kda` for the full mode
             contract, including the optional slot-indexed
-            ``correction_cache`` / ``kg_cache`` verify outputs.
+            ``correction_cache`` / ``kg_cache`` verify outputs. With
+            ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` this mode may run
+            the experimental tcgen05 / UMMA kernel on SM10x at T <= 8.
         correction_cache (Optional[torch.Tensor]):
             Frozen-verify only: slot-indexed float32 per-token delta-rule
             corrections ``[num_slots, HV, T_max, V]``.

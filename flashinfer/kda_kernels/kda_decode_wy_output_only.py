@@ -2047,24 +2047,20 @@ def _compile_options(device: torch.device) -> tuple:
     return (cute.GPUArch(f"sm_{major}{minor}a"),) if major == 12 else ()
 
 
-# backend="auto" (with FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1) picks the UMMA
-# kernel up to this many tokens: B200 / H=12 measured it 1.05-1.28x faster than the
-# WY kernel at T <= 8 (dense) and 1.12-1.89x (drop-in), but 0.84-0.97x at T = 16.
-_UMMA_AUTO_T_MAX = 8
-
-
 def _select_umma(
     backend: str, device: torch.device, T_in: int, api: str, auto_ok: bool = True
-) -> bool:
+) -> Optional[bool]:
     """Whether to run the experimental tcgen05 / UMMA backend
-    (``flashinfer.experimental.kda_output_only_umma``). ``backend="umma"`` is the
-    explicit opt-in (raises when it cannot run); ``"auto"`` picks it only when
-    ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``, ``auto_ok`` (the caller's
-    own dispatch would use the WY kernel), T <= _UMMA_AUTO_T_MAX and it can run."""
+    (``flashinfer.experimental.kda_output_only_umma``): ``None`` (no), ``False``
+    (yes, named explicitly) or ``True`` (yes, picked automatically). The caller
+    emits the ExperimentalWarning so that it points at the user's call site.
+    ``backend="umma"`` is the explicit opt-in (raises when it cannot run);
+    ``"auto"`` picks it only with ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``,
+    ``auto_ok`` (the caller's own dispatch would use the WY kernel) and where the
+    backend's own policy (``kda_oo_umma_auto_ok``) accepts the configuration."""
     from ..api_logging import (
         experimental_auto_backends_allowed,
         require_experimental_auto_backends,
-        warn_experimental_backend_once,
     )
 
     if backend == "umma":
@@ -2075,23 +2071,14 @@ def _select_umma(
         why = kda_oo_umma_unavailable_reason(device, T_in)
         if why is not None:
             raise ValueError(f"{api}: backend='umma' unavailable: {why}")
-        warn_experimental_backend_once(api, "umma")
-        return True
-    if (
-        backend == "auto"
-        and auto_ok
-        and T_in <= _UMMA_AUTO_T_MAX
-        and experimental_auto_backends_allowed()
-    ):
-        from ..experimental.kda_output_only_umma import (
-            kda_oo_umma_unavailable_reason,
-        )
+        return False
+    if backend == "auto" and auto_ok and experimental_auto_backends_allowed():
+        from ..experimental.kda_output_only_umma import kda_oo_umma_auto_ok
 
-        if kda_oo_umma_unavailable_reason(device, T_in) is None:
+        if kda_oo_umma_auto_ok(device, T_in):
             require_experimental_auto_backends(f"{api} -> umma")
-            warn_experimental_backend_once(api, "umma", automatic=True)
             return True
-    return False
+    return None
 
 
 def kda_wy_output_only(
@@ -2157,6 +2144,11 @@ def kda_wy_output_only(
         Q/K L2 normalization is always applied in-kernel (eps 1e-6), matching
         ``recurrent_kda(use_qk_l2norm_in_kernel=True)``.
     """
+    if backend not in ("auto", "wy", "recurrent", "umma"):
+        raise ValueError(
+            "kda_wy_output_only: backend must be 'auto', 'wy', 'recurrent' or "
+            f"'umma'; got {backend!r}"
+        )
     if q.ndim != 4:
         raise ValueError(f"q must be [B, T, H, K]; got {tuple(q.shape)}")
     B, T_in, H, K_dim = q.shape
@@ -2306,9 +2298,16 @@ def kda_wy_output_only(
     else:
         _rec_max = 0
     use_rec = backend == "recurrent" or (backend == "auto" and _bh <= _rec_max)
-    use_umma = _select_umma(
+    umma_auto = _select_umma(
         backend, device, T_in, "kda_wy_output_only", auto_ok=not use_rec
     )
+    use_umma = umma_auto is not None
+    if use_umma:
+        from ..api_logging import warn_experimental_backend_once
+
+        warn_experimental_backend_once(
+            "kda_wy_output_only", "umma", automatic=umma_auto
+        )
     if use_rec:
         rec_args = [
             mk_dyn(q),
@@ -2453,7 +2452,6 @@ def kda_wy_output_only(
             null_min=1,
             HV=HV,
             H=H,
-            batch=B,
         )
         if emit_corrections:
             return out_t, corr_t, kg_t
@@ -2539,6 +2537,12 @@ def kda_recoverssm_verify(
     state GEMMs). Requires SM90+ (validated on SM100a / B200),
     ``K = V = 128``, ``spec_query_len <= 16``, and a bf16 checkpoint pool.
     The checkpoint rows must be dense, but its block stride may include padding.
+    Every sequence length ``query_start_loc[i + 1] - query_start_loc[i]`` must be
+    ``<= spec_query_len`` (not checked: checking would need a host sync); longer
+    sequences are undefined (the WY kernel writes past the sequence's cache rows,
+    the UMMA kernel processes the first ``spec_query_len`` tokens). Duplicate
+    non-null ``state_indices`` give undefined cache contents, and indices must be
+    ``< num_blocks`` (not checked).
 
     ``backend``: ``"auto"`` / ``"wy"`` run the WY kernel; ``"umma"`` the
     experimental tcgen05 / UMMA kernel (SM10x,
@@ -2590,6 +2594,9 @@ def kda_recoverssm_verify(
         raise ValueError("KDA RecoverSSM cache innermost dims must be contiguous")
     if any(s % 4 != 0 for s in correction_cache.stride()[:3]):
         raise ValueError("KDA RecoverSSM correction strides must be 16B-aligned")
+    if any(t.stride(1) % 8 != 0 for t in (q, k, v)):
+        # both kernels load q / k / v token rows with 16-byte vector or bulk copies
+        raise ValueError("KDA RecoverSSM q, k and v token strides must be 16B-aligned")
     if A_log.shape != (num_heads,) or dt_bias.numel() != num_heads * key_dim:
         raise ValueError("KDA RecoverSSM gate parameters are incompatible")
     if not A_log.is_contiguous() or not dt_bias.is_contiguous():
@@ -2713,11 +2720,18 @@ def kda_recoverssm_verify(
         H,
         stream,
     ]
-    if backend != "wy" and _select_umma(
-        backend, device, spec_query_len, "kda_recoverssm_verify"
-    ):
+    umma_auto = (
+        None
+        if backend == "wy"
+        else _select_umma(backend, device, spec_query_len, "kda_recoverssm_verify")
+    )
+    if umma_auto is not None:
+        from ..api_logging import warn_experimental_backend_once
         from ..experimental.kda_output_only_umma import run_kda_oo_umma
 
+        warn_experimental_backend_once(
+            "kda_recoverssm_verify", "umma", automatic=umma_auto
+        )
         run_kda_oo_umma(
             args,
             device=device,
@@ -2730,7 +2744,7 @@ def kda_recoverssm_verify(
             null_min=null_min,
             HV=HV,
             H=H,
-            batch=batch,
+            kg_v4=all(s_ % 8 == 0 for s_ in kg_cache.stride()[:3]),
         )
         return out
     if cache_key not in _CACHE:

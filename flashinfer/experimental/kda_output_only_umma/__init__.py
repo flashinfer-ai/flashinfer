@@ -6,8 +6,9 @@ Selected with ``backend="umma"`` on
 """
 
 from .launch import (
+    kda_oo_umma_auto_ok,
     kda_oo_umma_unavailable_reason,
     run_kda_oo_umma,
 )
 
-__all__ = ["kda_oo_umma_unavailable_reason", "run_kda_oo_umma"]
+__all__ = ["kda_oo_umma_auto_ok", "kda_oo_umma_unavailable_reason", "run_kda_oo_umma"]

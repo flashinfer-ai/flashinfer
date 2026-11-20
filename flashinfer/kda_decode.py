@@ -335,7 +335,11 @@ def recurrent_kda(
             tokens per sequence from the committed state and never write any
             state back; ``final_state`` is always ``None``. Dispatches
             internally to the WY-parallel tensor-core kernel or a grouped
-            register recurrence by problem size. Supports the batched
+            register recurrence by problem size; with
+            ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` it may also pick
+            the experimental tcgen05 / UMMA kernel
+            (``flashinfer.experimental.kda_output_only_umma``) on SM10x at
+            T <= 8. Supports the batched
             ``[B, T, ...]`` form directly and the packed ``cu_seqlens`` form
             (ragged per-sequence lengths). ``backend="cake"`` raises in this
             mode (no frozen-state Cake kernels; no silent fallback), and
@@ -888,7 +892,8 @@ def _run_frozen_recurrent_kda(
 
     - batched ``[B, T, ...]`` without caches -> the output-only dispatcher
       (WY-parallel tensor-core kernel or grouped register recurrence by
-      problem size);
+      problem size; with ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` also
+      the experimental UMMA kernel on SM10x at T <= 8);
     - any call requesting ``correction_cache``/``kg_cache``, and packed
       ``cu_seqlens`` calls, -> the packed frozen-verify kernel (WY, ragged
       lengths and null slots supported), which writes the slot-indexed fp32

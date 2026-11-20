@@ -311,6 +311,7 @@ class KdaOutputOnlyUmma:
         emit_corrections: bool = False,
         vllm_dropin: bool = False,
         null_min: int = 1,
+        kg_v4: bool = True,
     ):
         assert 1 <= T <= 16, T
         self.T = T
@@ -320,6 +321,9 @@ class KdaOutputOnlyUmma:
         self.dropin = bool(vllm_dropin)
         self.emit = bool(emit_corrections) or self.dropin
         self.null_min = int(null_min)
+        # drop-in kg cache rows 16-B aligned (every kg stride a multiple of 8
+        # elements): 16-B stores of the key half, else 2-B stores (separate build)
+        self.kg_v4 = bool(kg_v4)
         self.NX = 16 if T <= 8 else 32  # X_r / X_c rows (2T live)
         self.KT = 8 if T <= 8 else 16  # Ktil rows (T live)
         self.num_threads = 192
@@ -627,7 +631,11 @@ class KdaOutputOnlyUmma:
                 hv = item % HV
                 brow = item // HV
                 raw_idx = Int32(gH0idx[brow])
-                sidx = _sel(raw_idx < 0, 0, raw_idx, Int32)  # in-range state load
+                # dense: a negative slot reads a zero state (TMA out-of-bounds fill), as
+                # the WY kernel; drop-in null slots load slot 0 (their output is zeroed)
+                sidx = raw_idx
+                if cutlass.const_expr(DROPIN):
+                    sidx = _sel(raw_idx < 0, 0, raw_idx, Int32)
                 bos = Int32(0)
                 seq_len = Int32(T)
                 if cutlass.const_expr(DROPIN):
@@ -691,7 +699,8 @@ class KdaOutputOnlyUmma:
             # ============================================================ consumers
             cw = warp - 2
             ct = (tid - 64) & 127  # consumer index: channel / (row, lane) / TMEM lane
-            row = ((warp & 3) << 5) | lane  # V row of this consumer (= TMEM lane)
+            tq = (warp & 3) << 5  # TMEM lane quadrant of this warp (tcgen05.ld base)
+            row = tq | lane  # V row of this consumer (= TMEM lane)
             r8 = ct >> 4
             l16 = ct & 15
             grp = lane >> 2
@@ -746,8 +755,6 @@ class KdaOutputOnlyUmma:
                         dtb = Float32(gDtbias[i_h * K_DIM + ct])
 
                 # -------- P1: L2 norm (row layout), raw k̂ / q̂ into X_r, kg key half.
-                # X_r was last read by the previous item's readout (mma_done waited in
-                # its epilogue).
                 for p in cutlass.range_constexpr(NP):
                     xr = r8 + 8 * p
                     ss = Float32(0.0)
@@ -791,9 +798,14 @@ class KdaOutputOnlyUmma:
                                             hv * s_kg_head + xr * s_kg_pos + l16 * 8
                                         )
                                     ) * Int64(2)
-                                    U.stg_v4(
-                                        kga, xw[p][0], xw[p][1], xw[p][2], xw[p][3]
-                                    )
+                                    if cutlass.const_expr(self.kg_v4):
+                                        U.stg_v4(
+                                            kga, xw[p][0], xw[p][1], xw[p][2], xw[p][3]
+                                        )
+                                    else:  # kg strides not multiples of 8: 2-B stores
+                                        for i in cutlass.range_constexpr(4):
+                                            _stg_u16(kga + 4 * i, xw[p][i])
+                                            _stg_u16(kga + 4 * i + 2, xw[p][i] >> 16)
                             else:
                                 kga = kg_base + (
                                     (Int64(tok0 + xr) * Int64(HV) + Int64(hv))
@@ -889,8 +901,8 @@ class KdaOutputOnlyUmma:
                             Float32(1.0) + _ex2((Float32(0.0) - bv) * Float32(LOG2_E))
                         )
                     s_coef[_CO_BETA + ct] = bv
-                # X_r is read by the readout UMMA (async proxy); the previous item's
-                # TMEM loads are ordered before it (tcgen05 fence)
+                # generic X_r stores -> async-proxy fence -> tcgen05 fence -> x_ready:
+                # the readout UMMA (async proxy) sees the finished X_r tile
                 cute.arch.fence_view_async_shared()
                 U.fence_before_sync()
                 cute.arch.mbarrier_arrive(x_ready)
@@ -951,7 +963,7 @@ class KdaOutputOnlyUmma:
                 cute.arch.mbarrier_wait(mma_done, ph)
                 U.fence_after_sync()
                 nld = 1 << (T - 1).bit_length()
-                hk = U.tmem_ld(ct, tbase, nld)
+                hk = U.tmem_ld(tq, tbase, nld)
                 U.tmem_wait_ld()
                 cute.arch.mbarrier_wait(v_full, ph)
                 uu: list = []
@@ -964,7 +976,7 @@ class KdaOutputOnlyUmma:
                         for jj in cutlass.range_constexpr(min(4, t - s4)):
                             acc_u = acc_u - cf[jj] * uu[s4 + jj]
                     uu.append(acc_u)
-                hq = U.tmem_ld(ct, tbase + T, nld)
+                hq = U.tmem_ld(tq, tbase + T, nld)
                 U.tmem_wait_ld()
                 for t in cutlass.range_constexpr(T):
                     y = hq[t]
