@@ -3030,8 +3030,12 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # The valid tactic ids depend on the arch (SM107-only ids), so a
-            # tuned tactic must not be reused on another arch.
-            return (torch.cuda.get_device_capability(inputs[0].device),)
+            # tuned tactic must not be reused on another arch; BF16 and FP32
+            # output are tuned apart.
+            return (
+                torch.cuda.get_device_capability(inputs[0].device),
+                str(inputs[4].dtype),
+            )
 
         def forward(
             self,
