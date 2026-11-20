@@ -2627,6 +2627,54 @@ def test_top_k_sampling_strided_top_k_arr(use_top_p, filter_apply_order):
     assert torch.equal(actual, expected)
 
 
+def _strided_per_row_indices(rows: int, dtype=torch.int32) -> torch.Tensor:
+    """A per-row gather mapping with a non-unit stride, e.g. ``params[:, 0]``."""
+    backing = torch.tensor(
+        [7, 99, 0, 99, 1, 99, 2, 99, 3, 99, 4, 99, 5, 99, 6, 99],
+        dtype=dtype,
+        device="cuda:0",
+    )
+    idx = backing[::2][:rows]
+    assert not idx.is_contiguous()
+    return idx
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_sampling_strided_indices(dtype):
+    """A strided `indices` mapping must select the same rows as its packed copy.
+
+    The kernels read ``indices[bx]`` linearly, so ``params[::2]`` used to send
+    output row ``i`` to ``params[i]`` instead of ``params[2 * i]``.
+    """
+    torch.manual_seed(42)
+    probs = torch.softmax(torch.randn(8, 128, device="cuda:0"), dim=-1)
+    idx = _strided_per_row_indices(probs.size(0), dtype)
+    packed = idx.contiguous()
+    top_k = torch.full((probs.size(0),), 64, dtype=torch.int32, device="cuda:0")
+
+    cases = {
+        "sampling_from_probs": lambda i: flashinfer.sampling.sampling_from_probs(
+            probs, i, seed=7, offset=0
+        ),
+        "top_k_sampling_from_probs": lambda i: flashinfer.sampling.top_k_sampling_from_probs(
+            probs, top_k, i, seed=7, offset=0
+        ),
+        "top_p_sampling_from_probs": lambda i: flashinfer.sampling.top_p_sampling_from_probs(
+            probs, 0.9, i, seed=7, offset=0
+        ),
+        "min_p_sampling_from_probs": lambda i: flashinfer.sampling.min_p_sampling_from_probs(
+            probs, 0.3, i, seed=7, offset=0
+        ),
+        "top_k_top_p_sampling_from_probs": lambda i: (
+            flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, top_k, 0.9, i, seed=7, offset=0
+            )
+        ),
+    }
+    for name, op in cases.items():
+        assert torch.equal(op(idx), op(packed)), name
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 500])
