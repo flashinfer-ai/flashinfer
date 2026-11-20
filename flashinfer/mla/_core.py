@@ -3031,8 +3031,9 @@ def _cake_mla_module():
 
 
 # Host facts of the Cake candidate that depend only on scalars and on the offer
-# table: per (arch, SM count, dtype, page size, q_len, max_seq_len) the offered
-# batch ranges, and per request sizes and batch the launched families. They are
+# table: per (arch, SM count, dtype, page size, q_len, max_seq_len bucket) the
+# offered batch ranges, and per request sizes and batch the launched families
+# (keyed only by the parts of max_seq_len they read). They are
 # derived from the table object ``_CAKE_MLA_TABLE_MEMO_OWNER`` holds and are
 # dropped when ``_CAKE_MLA_AUTO_OFFERS`` names another object. Bounded: cleared
 # when it grows past ``_CAKE_MLA_MEMO_LIMIT`` entries.
@@ -3057,8 +3058,8 @@ def _cake_mla_table_memo() -> Dict[Any, Any]:
 
 
 # The results of ``_cake_mla_auto_batch_ranges`` per request configuration
-# ``(device index, dtype, page size, q_len, max_seq_len)``: ``(offer table,
-# device facts function, {configuration: ranges})``, replaced as one tuple
+# ``(device index, dtype, page size, q_len, max_seq_len bucket)``: ``(offer
+# table, device facts function, {configuration: ranges})``, replaced as one tuple
 # when the table or the Cake module's ``_device_facts`` is another object
 # (tests patch both). A configuration seen before then pays one dict lookup
 # and two identity checks instead of the device facts and the table memo, also
@@ -3079,10 +3080,12 @@ def _cake_mla_auto_batch_ranges(
     domain), memoized: ``()`` for an unlisted unit or a device that is not
     SM100a/SM103a. A configuration's result is reused while the offer table
     and the Cake module's ``_device_facts`` are the same objects (the ranges
-    read nothing else)."""
+    read nothing else, and only the bucket of ``max_seq_len``, so every
+    ``max_seq_len`` of a bucket shares one entry)."""
     if has_sinks:
         return ()
-    configuration = (device_index, dtype, page_size, q_len, max_seq_len)
+    seq_bucket = _round_to_seq_len_bucket(max_seq_len)
+    configuration = (device_index, dtype, page_size, q_len, seq_bucket)
     device_facts = _cake_mla_module()._device_facts
     table = _CAKE_MLA_AUTO_OFFERS
     memo = _CAKE_MLA_RANGES_MEMO[0]
@@ -3093,7 +3096,7 @@ def _cake_mla_auto_batch_ranges(
     else:
         memo = None
     ranges = _cake_mla_lookup_batch_ranges(
-        device_facts, device_index, dtype, page_size, q_len, max_seq_len
+        device_facts, device_index, dtype, page_size, q_len, seq_bucket
     )
     if _CAKE_MLA_AUTO_OFFERS is table:  # else replaced during the lookup
         if memo is None:
@@ -3111,9 +3114,10 @@ def _cake_mla_lookup_batch_ranges(
     dtype: torch.dtype,
     page_size: int,
     q_len: int,
-    max_seq_len: int,
+    seq_bucket: int,
 ) -> Tuple[Tuple[int, int], ...]:
-    """``_cake_mla_auto_batch_ranges`` without sinks, from the table memo."""
+    """``_cake_mla_auto_batch_ranges`` without sinks for the ``max_seq_len``
+    bucket ``seq_bucket``, from the table memo."""
     if (device_facts, device_index) in _CAKE_MLA_NO_PROGRAM_DEVICES:
         return ()
     try:
@@ -3122,13 +3126,13 @@ def _cake_mla_lookup_batch_ranges(
         _CAKE_MLA_NO_PROGRAM_DEVICES.add((device_facts, device_index))
         return ()
     memo = _cake_mla_table_memo()
-    key = ("ranges", arch, num_sms, dtype, page_size, q_len, max_seq_len)
+    key = ("ranges", arch, num_sms, dtype, page_size, q_len, seq_bucket)
     ranges = memo.get(key)
     if ranges is None:
         ranges = tuple(
             (first, last)
             for _, first, last in _cake_mla_auto_offer_ranges(
-                arch, num_sms, dtype, page_size, q_len, False, max_seq_len
+                arch, num_sms, dtype, page_size, q_len, False, seq_bucket
             )
         )
         memo[key] = ranges
@@ -3722,7 +3726,10 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
             self._qk_nope_head_dim,
             self.sinks is not None,
             self._bmm2_scale,
-            self._max_seq_len,
+            # The families read max_seq_len only through its bucket (the offer
+            # table's units); the domain reads it only to reject the generic
+            # tail, which launches nothing here either way.
+            _round_to_seq_len_bucket(self._max_seq_len),
         )
         memo = _cake_mla_table_memo()
         families = None
@@ -4243,8 +4250,8 @@ def _mla_cake_memo_settings() -> Tuple[str, bool]:
 # reference to the tuner, state, open)``, replaced as one tuple. With a state
 # the gate is a function of the tuner and the state (see
 # ``_mla_cake_memo_state``), so a call that misses ``_CAKE_MLA_AUTO_MEMO``
-# (a new key, such as a new ``max_seq_len``) under the last gate's state pays
-# no gate.
+# (a new key, such as a ``max_seq_len`` of another bucket) under the last
+# gate's state pays no gate.
 _CAKE_MLA_GATE_MEMO: List[Any] = [None]
 
 
@@ -4502,7 +4509,11 @@ def _mla_cake_stage_two(
 #
 # What the two stages' lookups read besides ``_mla_cake_memo_state``: cache
 # keys of the runner class, a per-class hash and the cache-key extras, and a
-# tuning config, all functions of ``memo_key`` fields; and the stored-tactic
+# tuning config, all functions of ``memo_key`` fields (of ``max_seq_len`` the
+# key holds only ``_mla_auto_memo_seq_len``: the extras read its bucket or its
+# KV tile count, the tuning config its KV tile count, for the CuTe DSL batch
+# cap, and its exact value only for the profiling initializers, which a
+# lookup does not run); and the stored-tactic
 # revalidation (``AutoTuner._tactic_still_valid``), which calls no validator
 # for TRTLLM-GEN, modular CuTe DSL or the incumbent, accepts only tactic -1 for
 # functional monolithic CuTe DSL, and for Cake reads the sizes, the contiguity
@@ -4512,7 +4523,24 @@ def _mla_cake_stage_two(
 # to select. A reused Cake decision therefore re-checks the contiguity the
 # eligibility check requires (else the call runs the first stage's selection,
 # as that check makes it) and the families' readiness (else it selects).
+# The launch plan of a Cake decision reads ``max_seq_len`` only through its KV
+# tile count (the split counts), so it is the plan of every ``max_seq_len`` of
+# the key; a reused decision builds the selected runner with the call's exact
+# ``max_seq_len``, which the kernels of the first stage (and a Cake decision
+# without a plan) read.
 _CAKE_MLA_AUTO_MEMO: Dict[Any, Any] = {}
+
+
+def _mla_auto_memo_seq_len(max_seq_len: int) -> Tuple[int, int]:
+    """What a ``backend="auto"`` decision reads of ``max_seq_len``, the field
+    of the dispatcher's memo key that stands for it: its power-of-two bucket
+    (the offer table and the TRTLLM-GEN, modular CuTe DSL and Cake cache keys)
+    and its 128-token KV tile count (the monolithic CuTe DSL cache key and
+    batch cap, and the split counts of a resolved Cake launch). Calls whose
+    ``max_seq_len`` gives the same value select the same runner and tactic and
+    resolve the same Cake launch, so a caller that varies ``max_seq_len``
+    selects once per bucket and KV tile count."""
+    return _round_to_seq_len_bucket(max_seq_len), (max_seq_len + 127) // 128
 
 
 def _mla_cake_auto_memo_get(
@@ -5487,9 +5515,11 @@ def _mla_with_kv_cache_impl(
     joins, nor builds the tuning config, nor looks up, and builds only the
     selected runner; a reused Cake decision checks the contiguity of the
     tensors and that its programs are loaded, and launches the programs it
-    resolved for those sizes. A call with new arguments under the same tuner
-    state (such as a new ``max_seq_len``) selects, but reuses the last check
-    of whether Cake joins.
+    resolved for those sizes. A ``max_seq_len`` counts as the same argument
+    while its power-of-two bucket and its 128-token KV tile count are the
+    same (the decision reads nothing else of it). A call with new arguments
+    under the same tuner state (such as a ``max_seq_len`` of another bucket)
+    selects, but reuses the last check of whether Cake joins.
     Uniform explicit CuTeDSL requests use the same tuner with one candidate.
     Explicit TRTLLM-GEN requests enter the tuner only during tuning; inference
     directly executes its sole tactic. Compact variable-Q requests select an eligible backend directly
@@ -5829,9 +5859,11 @@ def _mla_with_kv_cache_impl(
                             # the sinks (none: ``offered`` is empty with
                             # sinks), and except the arguments the scalar
                             # check above fixed; see the audit at
-                            # ``_CAKE_MLA_AUTO_MEMO``. The sign of
-                            # ``bmm2_scale`` keeps -0.0 and 0.0 apart (the
-                            # launch plan holds it).
+                            # ``_CAKE_MLA_AUTO_MEMO``. Of ``max_seq_len`` only
+                            # what the decision reads, so a caller varying it
+                            # selects once per bucket and KV tile count. The
+                            # sign of ``bmm2_scale`` keeps -0.0 and 0.0 apart
+                            # (the launch plan holds it).
                             cake_memo_key = (
                                 device_index,
                                 query.shape,
@@ -5846,7 +5878,7 @@ def _mla_with_kv_cache_impl(
                                 out.dtype,
                                 workspace_buffer.shape,
                                 workspace_buffer.dtype,
-                                max_seq_len,
+                                _mla_auto_memo_seq_len(max_seq_len),
                                 bmm1_scale,
                                 bmm2_scale,
                                 math.copysign(1.0, bmm2_scale),
