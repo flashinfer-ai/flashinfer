@@ -155,7 +155,7 @@ class GatherGemvBf16Fp4Sm12x:
     def __init__(
         self,
         hidden: int,
-        rows_per_hw: int = 4,
+        rows_per_hw: int = 2,
         unroll: int = 2,
         num_warps: int = 4,
         enable_pdl: bool = True,

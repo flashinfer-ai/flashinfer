@@ -7,10 +7,17 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from ..utils import get_compute_capability
+from ..trace.templates.gemm import gemv_bf16_fp4_gather_trace
+from ..utils import backend_requirement, supported_compute_capability
 
 _KERNEL_CACHE: dict = {}
 _ALPHA_ONE: dict = {}
+
+# Within 2% of the best measured tile at K in {2048, 2560}, J = 16384,
+# M in {1, 4, 5, 8, 32} on GB10.
+_ROWS_PER_HALF_WARP = 2
+_UNROLL = 2
+_NUM_WARPS = 4
 
 _OUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _ID_DTYPES = (torch.int32, torch.int64)
@@ -88,10 +95,18 @@ def _get_kernel(
     return compiled
 
 
-def _check(a, b, b_descale, alpha, row_ids, out, out_col_offset):
-    major, _ = get_compute_capability(a.device)
-    if major != 12:
-        raise ValueError("gemv_bf16_fp4_gather supports SM12x only.")
+@supported_compute_capability([120, 121])
+def _check_gemv_bf16_fp4_gather(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_descale: torch.Tensor,
+    alpha: Optional[torch.Tensor],
+    row_ids: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    out_col_offset: int = 0,
+    enable_pdl: bool = True,
+) -> bool:
     if a.dtype != torch.bfloat16 or a.dim() != 2 or a.stride(1) != 1:
         raise ValueError("a must be a (M, K) bfloat16 tensor with unit inner stride.")
     m, k = a.shape
@@ -121,9 +136,11 @@ def _check(a, b, b_descale, alpha, row_ids, out, out_col_offset):
         raise ValueError("out must have one row per token; out_col_offset >= 0.")
     if out_col_offset + b.shape[0] > out.shape[1]:
         raise ValueError("out_col_offset + R must not exceed out.shape[1].")
+    return True
 
 
-@flashinfer_api
+@backend_requirement({}, common_check=_check_gemv_bf16_fp4_gather)
+@flashinfer_api(trace=gemv_bf16_fp4_gather_trace)
 def gemv_bf16_fp4_gather(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -161,7 +178,6 @@ def gemv_bf16_fp4_gather(
     Returns:
         ``out``.
     """
-    _check(a, b, b_descale, alpha, row_ids, out, out_col_offset)
     if alpha is None:
         alpha = _ALPHA_ONE.get(a.device)
         if alpha is None:
@@ -170,7 +186,13 @@ def gemv_bf16_fp4_gather(
     if a.shape[0] == 0 or row_ids.shape[1] == 0:
         return out
     kernel = _get_kernel(
-        a.shape[1], row_ids.dtype, out.dtype, 4, 2, 4, bool(enable_pdl)
+        a.shape[1],
+        row_ids.dtype,
+        out.dtype,
+        _ROWS_PER_HALF_WARP,
+        _UNROLL,
+        _NUM_WARPS,
+        bool(enable_pdl),
     )
     kernel(
         a,
