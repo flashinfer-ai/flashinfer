@@ -236,6 +236,7 @@ def test_suggest_prims_ts_q_token_kv_block_sparse_group_size_rejects_invalid_ext
         {"q_dtype": torch.float32},
         {"q_dtype": "bfloat16"},
         {"split_kv": 1},
+        {"packed_query": 1},
     ),
 )
 def test_q_token_kv_block_sparse_recommendation_rejects_invalid_recipe(kwargs):
@@ -10018,6 +10019,90 @@ def test_attention_ts_decode_final_statistics(
     graph.replay()
     torch.testing.assert_close(out.float(), ref, atol=0.02, rtol=0.05)
     torch.testing.assert_close(lse, expected, atol=0.015, rtol=0.002)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("packed", (False, True), ids=("uniform_q", "packed_q"))
+def test_attention_ts_decode_persistent_sinks_skip_inactive_requests(packed):
+    """Persistent sink tiles stay in step when live-Q requests have no KV."""
+    from tests.attention.test_attention_ts_context import _softmax_statistics_reference
+
+    # Two requests per SM exceed one CTA wave, so the planner persists.
+    num_requests = 2 * torch.cuda.get_device_properties("cuda").multi_processor_count
+    heads, dim, page_size, nk = 8, 64, 32, 257
+    q_lens = tuple((3, 5, 7)[i % 3] if packed else 3 for i in range(num_requests))
+    case = _make_decode_case(
+        kv_lens=(nk,) * num_requests,
+        num_qo_heads=heads,
+        num_kv_heads=1,
+        head_dim=dim,
+        seq_len_q=max(q_lens),
+        page_size=page_size,
+        qkv_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=12012,
+    )
+    offsets = None
+    if packed:
+        case, offsets = _pack_decode_case(case, q_lens)
+    sinks = torch.linspace(-4, 4, heads, device="cuda")
+    wrapper = BatchDecodePagedTSWrapper("HND")
+    wrapper.plan(
+        device="cuda",
+        batch_size=num_requests,
+        num_qo_heads=heads,
+        num_kv_heads=1,
+        head_dim=dim,
+        page_size=page_size,
+        max_kv_len=nk,
+        max_q_len=max(q_lens),
+        packed_query=packed,
+        q_dtype=torch.bfloat16,
+        mask_type="causal",
+        use_attention_sinks=True,
+        split_kv=False,
+    )
+    assert dict(wrapper._policy)["use_persistent_scheduler"] is True
+
+    # Tasks without skip_if still visit these tiles; they must not wait on the
+    # sink barrier that the skipping tasks never reach.
+    inactive = {1: 0, num_requests // 2: -1}
+    lengths = torch.full((num_requests,), nk, dtype=torch.int32, device="cuda")
+    for request, length in inactive.items():
+        lengths[request] = length
+    out = torch.full_like(case.q, 8)
+    wrapper.run(
+        case.q,
+        (case.k_cache, case.v_cache),
+        lengths,
+        case.block_tables,
+        qo_indptr=offsets,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
+        attention_sinks=sinks,
+        out=out,
+    )
+
+    expected = torch.full_like(out, 8, dtype=torch.float32)
+    pages_per_request = (nk + page_size - 1) // page_size
+    bounds = offsets.tolist() if packed else None
+    for request in range(num_requests):
+        if request in inactive:
+            continue
+        rows = slice(bounds[request], bounds[request + 1]) if packed else request
+        pages = case.block_tables[request, :pages_per_request].long()
+        k, v = (
+            t[pages].transpose(1, 2).reshape(-1, 1, dim)[:nk]
+            for t in (case.k_cache, case.v_cache)
+        )
+        ref, _ = _softmax_statistics_reference(
+            case.q[rows], k, v, scale=case.softmax_scale, sinks=sinks
+        )
+        expected[rows] = ref * case.output_scale
+    torch.testing.assert_close(out.float(), expected, atol=0.02, rtol=0.05)
 
 
 @pytest.mark.parametrize(

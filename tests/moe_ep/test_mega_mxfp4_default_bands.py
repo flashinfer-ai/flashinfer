@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 from flashinfer import moe_ep
-from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
 pytestmark = pytest.mark.node_exclusive
 

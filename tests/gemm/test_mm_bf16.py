@@ -33,6 +33,7 @@ _SMOKE_CASES = [
     (32, 4096, 3072, torch.float32, False, False, "cutlass", False),
     (1, 2048, 1024, torch.bfloat16, True, True, "tgv", False),
     (64, 1024, 2048, torch.bfloat16, False, True, "tgv", True),
+    (16, 2048, 1024, torch.float32, True, True, "tgv", False),
     (16, 2048, 2048, torch.bfloat16, False, False, "cublaslt", True),
     (16, 2048, 2048, torch.bfloat16, True, False, "cublaslt", True),
     (8, 4096, 3072, torch.float16, False, False, "cublaslt", False),
@@ -102,10 +103,8 @@ def test_mm_bf16(
         pytest.skip(
             "mm_bf16 with cuTile backend does not support bias or pdl arguments."
         )
-    if res_dtype != torch.bfloat16 and backend == "tgv":
-        pytest.skip(
-            "mm_bf16 with TGV backend does not support specifying non-bfloat16 result dtypes."
-        )
+    if res_dtype == torch.float16 and backend == "tgv":
+        pytest.skip("mm_bf16 with TGV backend does not support float16 output.")
     if res_dtype != torch.bfloat16 and backend == "tinygemm":
         pytest.skip(
             "mm_bf16 with TinyGEMM backend does not support specifying non-bfloat16 result dtypes."
@@ -199,6 +198,44 @@ def test_mm_bf16_autotune_unaligned_n(monkeypatch, n, k):
         torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize(
+    "backend,runner", [("tgv", "TGVRunner"), ("tinygemm", "TinyGemmBf16GemmRunner")]
+)
+@pytest.mark.parametrize("k", [2049, 2052])
+def test_mm_bf16_tma_unaligned_k(monkeypatch, backend, runner, k):
+    """TGV/TinyGEMM need K % 8 == 0 (TMA strides): reject them, keep them out of auto."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported(backend, cc_num):
+        pytest.skip(f"{backend} backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(16, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    w = torch.randn(128, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    with pytest.raises(ValueError, match="requires K divisible by 8"):
+        mm_bf16(a, w.T, backend=backend)
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    profiled = set()
+    profile_single_kernel = AutoTuner._profile_single_kernel
+
+    def record_runner(self, runner, *args, **kwargs):
+        profiled.add(type(runner).__name__)
+        return profile_single_kernel(self, runner, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_runner)
+
+    with autotune(True, tuning_buckets=[1, 16]):
+        mm_bf16(a, w.T, backend="auto")
+    assert profiled, "autotuning profiled nothing, so the assertion below is vacuous"
+    assert runner not in profiled, profiled
+
+    for m in (1, 16):
+        out = mm_bf16(a[:m], w.T, backend="auto")
+        reference = (a[:m].float() @ w.float().T).to(torch.bfloat16)
+        torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
 @pytest.mark.parametrize("pdl", [False, True])
 def test_mm_bf16_tgv_single_element_output(pdl):
     """M = N = 1: the 1x1 output's batch dim also has stride 1."""
@@ -213,6 +250,83 @@ def test_mm_bf16_tgv_single_element_output(pdl):
     out = mm_bf16(a, w.T, pdl=pdl, backend="tgv")
     reference = (a.float() @ w.float().T).to(torch.bfloat16)
     torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+# 1-CTA and 2-CTA tiles of each cta_m, then SM107-only ids.
+_TGV_TACTICS = [0, 1, 12, 15, 18, 24, 28, 29, 39, 46]
+
+
+@pytest.mark.parametrize("tactic", _TGV_TACTICS)
+@pytest.mark.parametrize("enable_bias", [False, True])
+def test_mm_bf16_tgv_tactic(monkeypatch, tactic, enable_bias):
+    """tactic= runs that TGV tile, skips the autotuner, and the FP32 output
+    rounds to the BF16 output bit for bit."""
+    _skip_unless_runnable("tgv")
+    from flashinfer.gemm.kernels import tgv_gemm_cute_ext
+
+    if tactic not in tgv_gemm_cute_ext.get_tgv_cute_ext_valid_tactics(
+        torch.device("cuda")
+    ):
+        pytest.skip(f"TGV tactic {tactic} is SM107-only.")
+
+    m, n, k = 40, 1056, 2048
+    torch.manual_seed(0)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16) if enable_bias else None
+
+    run = tgv_gemm_cute_ext.run_tgv_cute_ext
+    tactics = []
+
+    def record(*args):
+        tactics.append(args[-1])
+        return run(*args)
+
+    monkeypatch.setattr(tgv_gemm_cute_ext, "run_tgv_cute_ext", record)
+    with autotune(True):
+        out_bf16 = mm_bf16(a, w.T, bias, True, backend="tgv", tactic=tactic)
+        out_fp32 = mm_bf16(
+            a, w.T, bias, True, out_dtype=torch.float32, backend="tgv", tactic=tactic
+        )
+    assert tactics == [tactic, tactic]
+
+    reference = F.linear(a.float(), w.float(), None if bias is None else bias.float())
+    torch.testing.assert_close(out_fp32, reference, rtol=1e-4, atol=1e-3)
+    assert torch.equal(out_fp32.to(torch.bfloat16), out_bf16)
+
+
+def test_mm_bf16_tgv_tactic_rejects():
+    _skip_unless_runnable("tgv")
+    from flashinfer.gemm.kernels import tgv_gemm_cute_ext
+
+    a = torch.randn(8, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(256, 1024, device="cuda", dtype=torch.bfloat16).T
+    with pytest.raises(ValueError, match="TGV backend only"):
+        mm_bf16(a, b, backend="cudnn", tactic=1)
+    with pytest.raises(ValueError, match="TGV backend only"):
+        mm_bf16(a, b, backend="auto", tactic=1)
+    num_tactics = tgv_gemm_cute_ext.get_tgv_cute_ext_tactic_num()
+    with pytest.raises(ValueError, match="not valid"):
+        mm_bf16(a, b, backend="tgv", tactic=num_tactics)
+    with pytest.raises(ValueError, match="batch_invariant"):
+        mm_bf16(a, b, backend="auto", batch_invariant=True, tactic=1)
+    with pytest.raises(ValueError, match="TGV backend supports bfloat16"):
+        mm_bf16(a, b, out_dtype=torch.float16, backend="tgv")
+
+
+def test_tgv_cute_ext_kernel_name():
+    """Profiles name the TGV kernel after its config, through ``__repr__``."""
+    _skip_unless_runnable("tgv")
+    import cutlass
+
+    from flashinfer.gemm.kernels.tgv_gemm_cute_ext import TgvGemmCuteExtKernel
+
+    kernel = TgvGemmCuteExtKernel(
+        cta_m=64, cta_n=16, use_2cta=True, use_pdl=True, out_dtype=cutlass.Float32
+    )
+    assert (
+        repr(kernel) == "TgvGemmCuteExtKernel_cta64x16x128_2cta1_pdl1_bias0_outfloat32"
+    )
 
 
 @pytest.mark.parametrize(
