@@ -667,13 +667,17 @@ plan selects the recipe at compile time with `vc_config=VCAttentionConfig(...)`;
 the plan's Q/K dtype selects the Q/K side:
 
 * **VC-Attention-QK16** (`q_dtype`/`k_dtype` bf16): Q and K stay bf16.
-* **VC-Attention-QK8** (`q_dtype`/`k_dtype` `torch.float8_e4m3fn`): the paper's
-  low-bit Q/K. K is centred by its per-head channel mean, Q and K are rotated by
-  the normalised 128-point Hadamard matrix and quantized to E4M3 with one scale
-  per 128-token Q block and per 128-token K tile.
+* **VC-Attention-QK8** (`q_dtype`/`k_dtype` `torch.int8` on SM100/B200,
+  `torch.float8_e4m3fn` elsewhere): the paper's low-bit Q/K. K is centred by its
+  per-head channel mean, Q and K are rotated by the normalised 128-point Hadamard
+  matrix and quantized with one scale per 128-token Q block and per 128-token K
+  tile. `vc_quantize_fp8` / `vc_quantize_repair` write E4M3 codes and
+  `vc_quantize_int8` / `vc_quantize_repair_int8` INT8 codes (SM100 only);
+  `VCAttentionPreprocessor` follows the device, as the paper configures B200
+  (INT8) and B300 (E4M3), which `vc_qk8_dtype(device)` returns.
 
 Every run passes the (permuted) K, the E4M3 V residuals and
-`vc=VCAttentionParams(...)`; QK8 runs pass the E4M3 Q and the Q/K scales too:
+`vc=VCAttentionParams(...)`; QK8 runs pass the coded Q and the Q/K scales too:
 
 ```text
 K'      = (K - mean_tokens(K)) H,  Q' = Q H              (QK8 only; H: 128-point Hadamard)
@@ -689,16 +693,27 @@ group of 16 tiles, so the row-max correction covers them. `VCAttentionPreprocess
 turns bf16 K/V (and Q under QK8) into the operands with the paper's V-Smooth
 schedule: grouping and demeaning run on the first `smooth_step_fraction` of the
 denoising steps, the permutation is refreshed every `perm_refresh_every` steps
-inside that window and kept afterwards. `vc_quantize` and `vc_quantize_fp8` are
-the two preparations (bf16/fp16 inputs with `head_dim=128`). QK16 plans require
-bf16 Q/K; QK8 preparation accepts bf16 or fp16 inputs and produces E4M3 Q/K.
+inside that window and kept afterwards. A new generation cold-starts the k-means
+from fixed seed rows. The rows are one host draw from `VC_KMEANS_SEED` and every
+batch element and head shares them. A generation depends neither on the previous
+one nor on the other elements of the batch. The caller's global generator is
+untouched. A CUDA graph runner that replays one graph per step kind passes
+`prepare(..., mode=...)` with `cold`, `warm`, `keep` or `plain` in place of a
+step. For a joint sequence pass
+`prepare(..., grouped_tokens=(start, stop))` with the video token range. Only
+those tokens are grouped. The text or audio tokens follow them in input order. A
+text key grouped among the video keys would precede the long video tail in the
+rows attending to it. That tail would round to zero against the row maximum.
+`vc_quantize` and `vc_quantize_fp8` are the two preparations (bf16/fp16 inputs
+with `head_dim=128`). QK16 plans require bf16 Q/K; QK8 preparation accepts bf16
+or fp16 inputs and produces E4M3 Q/K.
 The quantizers live in
 `flashinfer.attention.prims_ts.vc_attention.quantization`; the `vc_attention`
 package holds the operand contract.
 
 | Input | Supported values |
 | --- | --- |
-| Q/K dtype | `torch.bfloat16` (QK16) or `torch.float8_e4m3fn` (QK8) |
+| Q/K dtype | `torch.bfloat16` (QK16); `torch.int8` on SM100/B200 or `torch.float8_e4m3fn` on SM103 (QK8, `vc_qk8_dtype(device)`); VC plans are rejected on SM107 |
 | V dtype | `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` or `torch.float16` |
 | Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed_query=False`, `mask_type="dense"`; QK16 runs the two-CTA UMMA form, QK8 follows the device default |
@@ -726,7 +741,7 @@ off and a positive `repair_tiles`.
 
 ```python
 from flashinfer.attention.prims_ts import (
-    BatchPrefillTSWrapper, VCAttentionConfig, VCAttentionPreprocessor,
+    BatchPrefillTSWrapper, VCAttentionConfig, VCAttentionPreprocessor, vc_qk8_dtype,
 )
 
 wrappers = {}
@@ -742,15 +757,16 @@ prep = VCAttentionPreprocessor()
 ops = prep.prepare(k_bf16, v_bf16, denoise_step=(step, num_steps))
 out = wrappers[ops.demean].run(q_bf16, ops.k, ops.v, vc=ops.params)
 
-# VC-Attention-QK8 plans E4M3 Q/K and passes Q to the preprocessor, again with
-# one plan per demean phase.
+# VC-Attention-QK8 plans the device's Q/K code type and passes Q to the
+# preprocessor, again with one plan per demean phase.
+qk8 = vc_qk8_dtype("cuda")
 wrappers8 = {}
 for demean in (True, False):
     wrappers8[demean] = BatchPrefillTSWrapper()
     wrappers8[demean].plan(
         device="cuda", batch_size=1, max_q_len=S, max_kv_len=S,
         num_qo_heads=H, num_kv_heads=H, head_dim=128,
-        q_dtype=torch.float8_e4m3fn, k_dtype=torch.float8_e4m3fn, v_dtype=torch.float8_e4m3fn,
+        q_dtype=qk8, k_dtype=qk8, v_dtype=torch.float8_e4m3fn,
         out_dtype=torch.bfloat16, vc_config=VCAttentionConfig(demean=demean),
     )
 ops8 = prep.prepare(k_bf16, v_bf16, q=q_bf16, denoise_step=(step, num_steps))

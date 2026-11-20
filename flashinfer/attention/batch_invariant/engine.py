@@ -11,8 +11,10 @@ one class per head dim, ``spec.HEAD_DIMS``).
 
 Q is ``(total_q, Hq, D)`` bf16, K/V caches ``(num_pages, page, Hkv, D)`` (NHD) or ``(num_pages, Hkv, page, D)``
 (HND) bf16, metadata int32 on the device; the output is ``(total_q, Hq, D)`` bf16. The planner runs on
-host copies of the indptr arrays (as FlashInfer's ``plan`` does); ``run`` launches the kernel and, for
-split units, the fixup.
+host copies of the indptr arrays (as FlashInfer's ``plan`` does) and a plan runs with the index offsets it was
+built from: the descriptor table carries every request's query offset, KV length and page-table range, so
+``run_attention`` launches the plan's own ``kv_indptr`` and rejects a differing one (``kv_indices`` is read at
+run time). ``run`` launches the kernel and, for split units, the fixup.
 """
 
 from __future__ import annotations
@@ -546,6 +548,8 @@ class _Planned:
         self.kv_fmt: str = (
             "bf16"  # the KV cache format the plan's configuration was checked for
         )
+        # the plan's kv_indptr (int32 on the device): the page-table offsets the descriptor table holds; the kernels run with it
+        self.kv_indptr: Optional[torch.Tensor] = None
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
@@ -663,6 +667,9 @@ def plan_attention(
     planned.window_left = int(window_left)
     planned.config = config
     planned.page = int(page)
+    planned.kv_indptr = kv_indptr.to(
+        device=device, dtype=torch.int32, copy=True
+    ).contiguous()
     return planned
 
 
@@ -735,6 +742,38 @@ def _output_overlaps_kv(out: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> 
     return False
 
 
+def plan_kv_indptr(planned: _Planned, kv_indptr: torch.Tensor) -> torch.Tensor:
+    """The ``kv_indptr`` a plan runs with. The descriptor table holds every request's page-table offset and page count
+    (``plan.F_KVPTR0`` / ``F_NPAGES``) next to its query offset and KV length, so the kernels take the plan's own snapshot
+    (``plan_attention`` records it); ``kv_indptr`` must be the array the plan was built from. The same storage is accepted as is;
+    another tensor is compared on the device and rejected when it differs, except under CUDA graph capture (no device read), where
+    the snapshot runs as planned. A moved page table needs a new plan; ``kv_indices`` is read at run time."""
+    snap = planned.kv_indptr
+    assert snap is not None, "plan_attention records the plan's kv_indptr"
+    if kv_indptr is snap or (
+        kv_indptr.device == snap.device
+        and kv_indptr.dtype == snap.dtype
+        and kv_indptr.data_ptr() == snap.data_ptr()
+        and kv_indptr.numel() == snap.numel()
+        and kv_indptr.is_contiguous()
+    ):
+        return snap
+    if kv_indptr.numel() != snap.numel():
+        raise ValueError(
+            f"kv_indptr of {kv_indptr.numel()} entries at run_attention over a plan built from {snap.numel()}: the descriptor "
+            "table holds the planned requests' page-table ranges; plan again"
+        )
+    if snap.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return snap
+    if not torch.equal(kv_indptr.to(device=snap.device, dtype=snap.dtype), snap):
+        raise ValueError(
+            "kv_indptr at run_attention differs from the plan's: the descriptor table holds the requests' page-table offsets and "
+            "page counts, so a plan runs with the kv_indptr it was built from; plan again for a changed page table (kv_indices "
+            "may change between runs, kv_indptr may not)"
+        )
+    return snap
+
+
 def run_attention(
     planned: _Planned,
     q: torch.Tensor,
@@ -753,7 +792,11 @@ def run_attention(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     v_sf_swizzled: bool = False,
 ) -> torch.Tensor:
-    """``k_scale`` / ``v_scale``: the low-bit-KV classes' per-tensor scales (Python floats; 1.0 when None), refused for a bf16 cache
+    """Launch a plan from ``plan_attention``. ``kv_indptr`` must be the array the plan was built from (``plan_kv_indptr``: the plan
+    runs with its own snapshot; a differing array is rejected, except under CUDA graph capture, where no device compare is possible
+    and the snapshot runs uncompared); ``kv_indices`` is read at run time.
+
+    ``k_scale`` / ``v_scale``: the low-bit-KV classes' per-tensor scales (Python floats; 1.0 when None), refused for a bf16 cache
     (the bf16 class has no scale in its chain); the token-head-scale classes, whose scales are per key, take them at None or 1.0.
     ``kv_cache_sf``: the NVFP4-KV class's ``(k_sf, v_sf)`` block scales (e4m3 or uint8 bytes of the cache's geometry with
     ``D / 16`` per row), or the token-head-scale classes' ``(k_sf, v_sf)`` float32 scales (the cache's shape minus the head dim,
@@ -907,7 +950,7 @@ def run_attention(
         q,
         k_cache,
         v_cache,
-        kv_indptr,
+        plan_kv_indptr(planned, kv_indptr),
         kv_indices,
         c,
         window_left,
@@ -943,9 +986,9 @@ def _run_attention_validated(
     enable_pdl: Optional[bool] = None,
     v_sf_swizzled: bool = False,
 ) -> torch.Tensor:
-    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale (the key scale inside it for
-    the per-tensor-scale classes), ``vs`` the binary32 value scale (1.0 for the bf16 and the token-head-scale classes, whose
-    kernels ignore it), ``kv_fmt`` the cache format (``spec.KV_FMTS``): the fp8 caches reach the kernels as byte tensors of the
+    """Launch after the public engine or wrapper has checked inputs; ``kv_indptr`` is the plan's snapshot (``plan_kv_indptr``), ``c``
+    is the binary32 log2 scale (the key scale inside it for the per-tensor-scale classes), ``vs`` the binary32 value scale (1.0
+    for the bf16 and the token-head-scale classes, whose kernels ignore it), ``kv_fmt`` the cache format (``spec.KV_FMTS``): the fp8 caches reach the kernels as byte tensors of the
     cache's geometry, the NVFP4 caches as their packed bytes with the block scales ``k_sf`` / ``v_sf`` (bytes, ``D / 16`` per
     row; ``v_sf_swizzled``: ``v_sf`` in the 4-token swizzle of a paged cache, ``check_v_sf_layout``), the token-head-scale
     classes' fp8 caches with their float32 scales ``k_sf`` / ``v_sf`` (the cache's shape minus the head dim), which the softmax
@@ -1032,7 +1075,6 @@ def _run_attention_validated(
             planned.groups,
             planned.fold_counters,
             planned.desc,
-            kv_indptr,
             kv_indices,
             float(c),
             float(-c),
