@@ -73,6 +73,10 @@ output_column_dict = {
         "kv_cache_kind",
         "slot_mapping",
         "num_states",
+        # serving-shaped inputs (routines/value_inputs.py); blank unless set
+        "seq_lens_kv",
+        "seq_lens_q",
+        "decode_max_seq_len",
     ],
     "dsv4_sparse_mla": [
         "swa_topk",
@@ -138,6 +142,8 @@ output_column_dict = {
         "swiglu_alpha",
         "swiglu_beta",
         "gemm_bias",
+        # serving-shaped inputs (routines/value_inputs.py); blank unless set
+        "routing_dist",
     ],
     "allreduce_comm": [
         "num_tokens",
