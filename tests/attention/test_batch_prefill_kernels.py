@@ -2947,3 +2947,65 @@ def test_batch_prefill_plan_max_lens(batch_size, page_size, seq_lens_dtype):
     assert wrapper._max_q_len == int(q_lens.max())
     assert type(wrapper._max_kv_len) is int
     assert wrapper._max_kv_len == int(kv_lens.max())
+
+
+@pytest.mark.parametrize(
+    "use_cuda_graph,retained_cudnn", [(False, False), (True, False), (True, True)]
+)
+def test_batch_prefill_fa2_plan_skips_kv_lens_buffer(use_cuda_graph, retained_cudnn):
+    """fa2 reads kv lengths from the page table, so plan() leaves the device kv
+    length buffer alone instead of copying the host lengths into it. A CUDA graph
+    wrapper still holding a cuDNN capture from an earlier plan keeps the copy,
+    since that graph reads the buffer."""
+    page_size = 16
+    q_lens = torch.tensor([17, 33], dtype=torch.int32)
+    kv_lens = torch.tensor([100, 256], dtype=torch.int32)
+    num_pages = (kv_lens + page_size - 1) // page_size
+    qo_indptr = torch.nn.functional.pad(
+        torch.cumsum(q_lens, 0, dtype=torch.int32), (1, 0)
+    )
+    kv_indptr = torch.nn.functional.pad(
+        torch.cumsum(num_pages, 0, dtype=torch.int32), (1, 0)
+    )
+    num_kv_pages = int(kv_indptr[-1])
+
+    graph_buffers = {}
+    if use_cuda_graph:
+        graph_buffers = dict(
+            use_cuda_graph=True,
+            qo_indptr_buf=torch.empty(3, dtype=torch.int32, device="cuda"),
+            paged_kv_indptr_buf=torch.empty(3, dtype=torch.int32, device="cuda"),
+            paged_kv_indices_buf=torch.empty(
+                num_kv_pages, dtype=torch.int32, device="cuda"
+            ),
+            paged_kv_last_page_len_buf=torch.empty(2, dtype=torch.int32, device="cuda"),
+        )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        backend="fa2",
+        **graph_buffers,
+    )
+    if retained_cudnn:
+        # What a cuDNN capture from an earlier plan leaves on the wrapper.
+        wrapper._cudnn_q_lens_buffer = torch.zeros(2, dtype=torch.int32, device="cuda")
+    wrapper._kv_lens_buffer.fill_(-1)
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        torch.arange(num_kv_pages, dtype=torch.int32, device="cuda"),
+        kv_lens - (num_pages - 1) * page_size,
+        8,
+        8,
+        128,
+        page_size,
+        causal=True,
+        q_data_type=torch.float16,
+    )
+    torch.cuda.synchronize()
+
+    assert wrapper._backend == "fa2"
+    if retained_cudnn:
+        torch.testing.assert_close(wrapper._kv_lens_buffer[:2].cpu(), kv_lens)
+    else:
+        assert bool((wrapper._kv_lens_buffer == -1).all())

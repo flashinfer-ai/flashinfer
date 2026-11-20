@@ -63,10 +63,21 @@ def valid_kv_slots(D: int) -> tuple:
     return tuple(range(2, max_kv_slots(D) + 1))
 
 
-def q_stages_for(D: int) -> int:
+def q_stages_for(D: int, q2: bool = False) -> int:
     """Q stages in smem: 2 (the load warp prefetches the next unit's Q) when the budget allows, 1 at D = 256
-    (a 64 KB stage: ``Q + ring + payloads`` must stay under ``SMEM_CAP``)."""
+    (a 64 KB stage: ``Q + ring + payloads`` must stay under ``SMEM_CAP``) and for the paired placement at D = 128 (a stage is two
+    32 KB Q tiles next to the 128 KB smem ``O_m`` of the two tiles; the stage is released after the unit's last QK, so the next
+    unit's Q still lands under the last PVs and the epilogue)."""
+    if q2 and D == 128:
+        return 1
     return 2 if 2 * slot_bytes(D) + RING_BYTES + (24 << 10) <= SMEM_CAP else 1
+
+
+def arch_smem_cap(device=None) -> int:
+    """The dynamic shared memory one CTA may allocate on the compile target of ``device`` (``swaps.operands.arch_smem_cap``)."""
+    from ..swaps.operands import arch_smem_cap as _cap
+
+    return _cap(device)
 
 
 om_in_tmem = _om_in_tmem  # the TMEM rule for the merged chunk state lives in plan.py (the planner reads it too); re-exported here
@@ -99,20 +110,33 @@ BAR_FOLD = 6  # the correction warpgroup's arrival barrier of the in-kernel chun
 BAR_SOFTMAX_ALL = 7  # every softmax thread has copied S out (P over S with two softmax warpgroups sharing TMEM lanes)
 REP_ROWS = 32  # units with at most this many live rows take the replicated-row placement (one warp's lanes)
 
+REGS_SOFTMAX_W2 = 160  # per softmax thread with two softmax warpgroups (64 keys per thread): 2 x 160 x 128 + 160 x 128 + 32 x 128 = 65536
+REGS_CORRECTION_W2 = 160
 STATS_SLOTS = 4  # softmax -> correction payload ring depth (one entry per tile: alpha, m', r_slices)
 STATS_SLOTS_PP = 8  # the same ring under the ping-pong placement: 2 entries per tile x 4 tiles (both warpgroups' tiles in tile order)
-SLOT_KEYS_256 = 64  # keys per ring slot at D = 256 (half tiles: 32 KB slots, four of them in the 128 KB ring)
+SLOT_KEYS_256 = 128  # keys per ring slot at D = 256: whole tiles (two 64 KB slots in the 128 KB ring). Half-tile slots (four of 32 KB)
+# let the producer run further ahead, but made QK^T two 128 x 64 x 16 instructions per K-step instead of one 128 x 128 x 16: the
+# MMA warp issues one tcgen05.mma per fixed interval whatever its N, so the tile's 48 instructions cost more issue time than
+# its tensor work; with whole slots the K / V loads of a tile still overlap the previous tile's MMAs (each slot's load is
+# issued when its predecessor's MMAs complete, a tile ahead of its use)
 Q_STAGES = 2  # Q tiles in smem: the load warp prefetches the next unit's Q while the MMA finishes this one
 REGS_SOFTMAX, REGS_OTHER = 192, 32
+# the one-warpgroup body at these head dims: 200 per softmax thread and 96 for the correction (16-column pieces). The softmax's
+# exponential stream schedules better with the headroom and the correction's per-tile loop stays spill-free at 96; measured faster at
+# every prefill shape on SM107 (the paired placement keeps 192 / 96: its budget is full)
+REGS_1WG_DIMS = (64,)
+REGS_SOFTMAX_1WG, REGS_CORRECTION_1WG = 200, 96
+REGS_Q2_DIMS = (128,)
+REGS_Q2_128 = (184, 80, 64)
 
 
 class Roles:
     """Warp layout for ``n_wg`` softmax warpgroups (a placement knob): the softmax warpgroups first (all of
     them work on every tile, warpgroup k holding key slice k of the row: the warps of the warpgroups share
     their TMEM lanes), then the correction warpgroup, then MMA, load and empty warps completing the last
-    warpgroup. Register budget: 65536 = 192 x 128 x n_wg + REGS_CORRECTION x 128 + 32 x 128."""
+    warpgroup. Register budget: 65536 >= REGS_SOFTMAX x 128 x n_wg + REGS_CORRECTION x 128 + 32 x 128."""
 
-    def __init__(self, n_wg: int, D: int = 128):
+    def __init__(self, n_wg: int, D: int = 128, q2: bool = False):
         assert n_wg in (1, 2), n_wg
         self.n_wg = n_wg
         self.softmax_warps = tuple(range(4 * n_wg))
@@ -121,15 +145,38 @@ class Roles:
         self.load_warp = self.mma_warp + 1
         self.empty_warps = tuple(range(self.mma_warp + 2, self.mma_warp + 4))
         self.threads = 32 * (self.mma_warp + 4)
-        # the correction warpgroup: 96 with two softmax warpgroups, 128 at D <= 128, 208 when the chunk merge runs through the global scratch
-        # (MERGE_DEPTH O_m pieces in flight); the launch allocates 65536 / threads (168 at 384 threads) and the roles move above or below it
-        self.regs_correction = 96 if n_wg == 2 else (208 if not om_in_tmem(D) else 128)
+        # register budgets: one softmax warpgroup -- 192 per softmax thread (a whole row of scores), the correction 128 at D <= 128 and 208
+        # when the chunk merge runs through the global scratch (O_m pieces in flight); two softmax warpgroups on key slices -- 160 each
+        # (half a row of scores) and 160 for the correction; the paired placement (q2: each warpgroup a whole row) -- 192 and 96 (the
+        # paired placement's MMA warp keeps both Q tiles' descriptors at 32). The launch allocates 65536 / threads (168 at 384 threads)
+        # and the roles move above or below it
+        two_slices = n_wg == 2 and not q2
+        self.regs_softmax = REGS_SOFTMAX_W2 if two_slices else REGS_SOFTMAX
+        self.regs_other = REGS_OTHER
+        if two_slices:
+            self.regs_correction = REGS_CORRECTION_W2
+        elif q2 and D in REGS_Q2_DIMS:
+            # the paired placement at D = 128: the MMA / load warpgroup at 64 so the MMA warp's two Q tiles' descriptors and pipeline
+            # state stay in registers (its spills miss L1 next to the 300 KB smem plan and sit on every tile's chain), the correction
+            # at 80 with 8-column pieces, the softmax at 184 with the streamed exponential form (StaticPlan.streamed)
+            self.regs_softmax, self.regs_correction, self.regs_other = REGS_Q2_128
+        elif q2:
+            self.regs_correction = 96
+        elif D in REGS_1WG_DIMS:
+            self.regs_softmax, self.regs_correction = (
+                REGS_SOFTMAX_1WG,
+                REGS_CORRECTION_1WG,
+            )
+        else:
+            self.regs_correction = 208 if not om_in_tmem(D) else 128
         self.n_tmem_users = 32 * (4 * n_wg + 4 + 1)
         self.regs_launch = (65536 // self.threads) // 8 * 8
         assert (
-            REGS_SOFTMAX * 128 * n_wg + self.regs_correction * 128 + REGS_OTHER * 32 * 4
+            self.regs_softmax * 128 * n_wg
+            + self.regs_correction * 128
+            + self.regs_other * 32 * 4
             <= 65536
-        ), (n_wg, self.regs_correction)
+        ), (n_wg, self.regs_softmax, self.regs_correction, self.regs_other)
 
 
 class StaticPlan:
@@ -144,16 +191,26 @@ class StaticPlan:
         n_wg: int = 1,
         q2: bool = False,
         ragged: bool = False,
+        hw_rowmax: bool = False,
+        cap: int = 0,
     ):
+        """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
+        have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
+        self.hw_rowmax = hw_rowmax
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
         # the SM; the MMA warp issues both tiles' folds off one K / V stream; the correction warpgroup steps both tiles' statistics, A then B
-        # per KV tile. TMEM: S_A | S_B | P_A | P_B | O_c,A | O_c,B = 3 T + 2 D (D = 64: 512) -- P in its own columns, so the MMA warp issues
-        # QK(t + 1) as soon as the softmax has copied S(t) out -- and O_m of both tiles in smem (the row-interleaved OM_VEC layout of the
-        # global-scratch merge, 2 x 128 x D fp32). Every tile's computation is the one-warpgroup body's (a placement)
-        assert not q2 or (n_wg == 2 and D == 64), (q2, n_wg, D)
+        # per KV tile. TMEM at D = 64: S_A | S_B | P_A | P_B | O_c,A | O_c,B = 3 T + 2 D = 512 -- P in its own columns, so the MMA warp issues
+        # QK(t + 1) as soon as the softmax has copied S(t) out; at D = 128: S_A | S_B | O_c,A | O_c,B = 2 T + 2 D = 512 with P_k over the
+        # first T/2 columns of S_k (the D = 256 plan's P-over-S: the softmax stores P after its own copy of S, the MMA warp issues QK_k(t + 1)
+        # behind PV_k(t)). O_m of both tiles in smem either way (the row-interleaved OM_VEC layout of the global-scratch merge, 2 x 128 x D
+        # fp32). Every tile's computation is the one-warpgroup body's (a placement)
+        assert not q2 or (n_wg == 2 and D in (64, 128)), (q2, n_wg, D)
         self.q2 = q2
+        # the shared-memory capacity the smem plan is checked against (the execution device's; the current device's when 0): the paired
+        # placement at D = 128 fits 328 KB parts only, so the capacity is part of the kernel's identity (compile.kernel_name)
+        self.cap = cap or arch_smem_cap()
         # ragged: the K / V of every request packed along the token dimension, viewed as ONE page of total_kv tokens; the producer's
         # box starts at the request's token offset (producer.issue_slot). The box geometry is the paged one at page = T (128 keys per
         # box), so the compile passes page = T; a placement (the keys reach the same smem bytes)
@@ -172,12 +229,13 @@ class StaticPlan:
             D,
         )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB
         self.D, self.g, self.page, self.kv_slots = D, g, page, kv_slots
-        self.roles = Roles(n_wg, D)
+        self.roles = Roles(n_wg, D, q2)
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (
-            32 if n_wg == 1 else 16
-        )  # the correction's TMEM piece (columns): 32 at 128 registers, 16 at 96
+            32 if self.roles.regs_correction >= 128 else (8 if q2 else 16)
+        )  # the correction's TMEM piece (columns): 32 from 128 registers up, 16 below; 8 under the paired placement, whose correction
+        # carries two Q tiles' chains and smem O_m pointers at 96 registers (16-column pieces spilled its tile loop in the ragged build)
         self.T = TILE_KEYS
         self.tokens_per_tile = (
             Q_ROWS // g
@@ -191,12 +249,24 @@ class StaticPlan:
         # 0..rep_rows-1 (g <= 32; 30 rows at g = 6, 24 at g = 12). The Q pipeline's transaction count is armed per unit with the
         # bytes its load pattern moves (rows_per_tile or 4 rep_rows rows): with the full-tile count the barrier never completed
         # for g not dividing 128 (24 / 4 and 24 / 2 heads hung)
-        self.rep_ok = g <= REP_ROWS
+        # the replicated-row placement is off under the paired placement: units of at most 32 live rows take the full-row path there
+        # (the same thread-per-row term; a placement). Its instantiation next to the full-row loop in the same softmax code region made
+        # ptxas schedule the full-row exponential stream with its MUFU issue stalls exposed, which cost the paired softmax a fifth of its
+        # tile whenever one warpgroup worked alone; at D = 128 its P exchange and four-slice stats payload would also not leave room for
+        # the third ring slot next to the two Q tiles and the smem O_m
+        self.rep_ok = g <= REP_ROWS and not q2
+        # the softmax's exponential form: streamed (the P words take the scores' registers) for the one-warpgroup body and the paired
+        # placement at D = 128, where the register split needs the smaller live set; packed for the paired placement at D = 64
+        self.streamed = not q2 or D in (128,)
         self.tokens_rep = REP_ROWS // g if self.rep_ok else 1
         self.rep_rows = self.tokens_rep * g if self.rep_ok else 0
         self.n_slices = (
             1 if q2 else n_wg
         )  # key slices of a tile's row (the correction adds their row-sum partials)
+        # the row-sum partial slots per stats entry (4 n_slices when the replicated placement can run) and the P exchange buffer
+        # (the replicated placement's warps 1..3 -> warp 0 hand-off); a 16-byte stub when no unit of the build takes that placement
+        self.r_slices = 4 * self.n_slices if self.rep_ok else self.n_slices
+        self.s_p_elems = n_wg * 3 * 32 * 16 if self.rep_ok else 4
         self.kpt = (
             self.T // self.n_slices
         )  # keys per thread (full rows): warpgroup k holds keys [k kpt, (k+1) kpt)
@@ -205,9 +275,8 @@ class StaticPlan:
         )  # keys per thread (replicated rows): warp wq of warpgroup k holds slice 4k + wq
         self.slices_rep = 4 * self.n_slices
         self.stats_slots = STATS_SLOTS_PP if q2 else STATS_SLOTS
-        # ring slots: a whole KV tile (T keys) at D <= 128; HALF tiles (64 keys, 32 KB) at D = 256, so that the 128 KB ring holds
-        # four slots instead of two and the producer runs further ahead (a placement: QK^T is then two N = 64 MMAs per tile and the
-        # PV releases its V slot per 4-step half; the per-element folds are unchanged)
+        # ring slots: a whole KV tile (T keys) at every D (SLOT_KEYS_256: the half-tile slots of D = 256 were a placement that cost more
+        # MMA issue than they saved in load latency); the code keeps the general slots_per_tile form
         self.slot_keys = SLOT_KEYS_256 if D == 256 else self.T
         self.slots_per_tile = self.T // self.slot_keys
         self.n_slots = (
@@ -261,7 +330,7 @@ class StaticPlan:
         self.qks_tiler = (Q_ROWS, self.slot_keys, D)
         self.pv_tiler = (Q_ROWS, D, self.T)
         self.pvs_tiler = (Q_ROWS, D, self.slot_keys)
-        self.q_stages = q_stages_for(D)
+        self.q_stages = q_stages_for(D, q2)
         self.q_tiles = (
             self.q_stages * self.n_q
         )  # Q tiles in smem: stage s holds tiles n_q s .. n_q s + n_q - 1
@@ -375,14 +444,19 @@ class StaticPlan:
             self.tmem_plan = "q2"
             self.s_stages = 2  # S / P stage k = Q tile k
             self.qk_ahead = 1
-            # D = 64: S_A | S_B | P_A | P_B | O_c,A | O_c,B; D = 128: ONE S in TMEM for both tiles (each keeps its own barrier stage; the MMA
-            # warp issues a tile's QK only once the OTHER tile's softmax has copied its last S out) | P_A | P_B | O_c,A | O_c,B = 2 T + 2 D
-            self.s_stages = 2  # one barrier stage per Q tile (also over the shared S)
             self.tmem_s = 0
             self.tmem_s_stride = self.T
-            self.tmem_p = 2 * self.T
-            self.tmem_p_stride = self.T // 2
-            self.tmem_oc = self.tmem_p + self.T
+            if D == 64:
+                # S_A | S_B | P_A | P_B | O_c,A | O_c,B: P in its own columns
+                self.tmem_p = 2 * self.T
+                self.tmem_p_stride = self.T // 2
+                self.tmem_oc = self.tmem_p + self.T
+            else:
+                # S_A | S_B | O_c,A | O_c,B: P_k over the first T/2 columns of S_k (p_over_s; the MMA warp's issue order keeps
+                # QK_k(t + 1) behind PV_k(t): mma.mma_loop_q2)
+                self.tmem_p = self.tmem_s
+                self.tmem_p_stride = self.T
+                self.tmem_oc = 2 * self.T
             self.tmem_om = None
             self.tmem_q2_stride = D
             self.om_tmem = False  # O_m in smem (StaticPlan.om_smem)
@@ -413,13 +487,6 @@ class StaticPlan:
         self.p_over_s = (
             self.tmem_p == self.tmem_s
         )  # P shares its S stage's columns: the P store must follow EVERY S load of the tile
-        from ..swaps.operands import arch_smem_cap
-
-        assert (
-            self.q_tiles + kv_slots + (4 * self.n_q if q2 else 0) // 2
-        ) * slot_bytes(D) + ((40 if q2 else 24) << 10) <= max(
-            SMEM_CAP, arch_smem_cap() - (8 << 10)
-        ), (D, kv_slots)
         assert (
             cute.cosize(cute.select(self.q_smem_layout, mode=[0, 1, 2]))
             == self.q_tile_elems
@@ -437,6 +504,53 @@ class StaticPlan:
         self.kv_slot_bytes = (
             self.kv_slot_elems * 2
         )  # the ring pipeline's transaction count (one slot)
+        # the exact smem footprint against the target's capacity (the ring depth is a placement: a shallower ring on a smaller part
+        # gives the same bits); the paired placement at D = 128 (two Q tiles, the 128 KB smem O_m, the ring) needs a 328 KB part
+        self.smem_bytes = shared_storage_struct(self).size_in_bytes()
+        assert self.smem_bytes <= max(SMEM_CAP, self.cap), (
+            f"smem plan of {self.smem_bytes} bytes exceeds the {self.cap}-byte capacity of the target"
+            + (
+                " (the paired placement at D = 128 fits 328 KB parts only)"
+                if q2 and D == 128
+                else ""
+            ),
+            D,
+            kv_slots,
+            q2,
+        )
+
+
+def shared_storage_struct(st: StaticPlan):
+    """The kernel's ``SharedStorage`` for the plan ``st``: the pipeline barriers, the softmax -> correction payload (stats ring, the
+    replicated placement's P exchange), the paired placement's smem ``O_m``, then the 1 KB-aligned Q tiles and the K/V ring. Built here
+    so the plan measures its exact footprint against the part's capacity instead of estimating the payload."""
+    i64, i32, f32, mr = (
+        cutlass.Int64,
+        cutlass.Int32,
+        cutlass.Float32,
+        cute.struct.MemRange,
+    )
+    # built from an annotations dict of real types: this module's postponed annotations would hand ``cute.struct`` strings
+    fields = dict(
+        q_mbar=mr[i64, 2 * st.q_stages],
+        kv_mbar=mr[i64, 2 * st.n_slots],
+        s_mbar=mr[i64, 2 * st.s_stages],
+        p_mbar=mr[i64, 2 * max(st.s_stages, st.n_q)],
+        o_mbar=mr[i64, 2 * st.n_q],
+        stats_mbar=mr[i64, 2 * st.stats_slots],
+        tmem_dealloc_mbar=i64,
+        tmem_holding_buf=i32,
+        s_fold=i32,
+        s_alpha=mr[f32, st.stats_slots * Q_ROWS],
+        s_m=mr[f32, st.stats_slots * Q_ROWS],
+        s_r=mr[f32, st.stats_slots * st.r_slices * Q_ROWS],
+        s_p=cute.struct.Align[mr[f32, st.s_p_elems], 16],
+        s_mx=mr[f32, 2 * st.n_slices * Q_ROWS],
+        sOm=cute.struct.Align[mr[f32, st.n_q * Q_ROWS * st.D if st.om_smem else 4], 16],
+        sQ=cute.struct.Align[mr[IN_DTYPE, st.q_tiles * st.q_tile_elems], 1024],
+        sKV=cute.struct.Align[mr[IN_DTYPE, st.n_slots * st.kv_slot_elems], 1024],
+    )
+    return cute.struct(type("SharedStorage", (), {"__annotations__": fields}))
 
 
 class TmaSetup:

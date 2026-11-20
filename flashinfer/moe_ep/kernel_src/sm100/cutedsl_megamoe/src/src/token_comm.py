@@ -35,6 +35,8 @@ from .ptx_helpers import (
     ldg_b32_raw,
     ldg_f32_raw,
     read_clock64,
+    fence_proxy_alias,
+    multimem_red_add_release_sys_s32_raw,
     red_add_relaxed_sys_u64_raw,
     red_add_release_sys_s32_raw,
     red_add_release_sys_u64_raw,
@@ -48,6 +50,13 @@ from .flag_batch import GpuReleaseFlagBatchTracker
 from .sf_swizzle import sf_atom_int32_offset
 from cutlass._mlir import ir
 from moe_nvfp4_swapab.moe_utils import _nanosleep, spin_wait
+
+
+# POC gate for the opt-in NVLS (multimem) NVLink barrier. Default OFF keeps the
+# bit-identical loop-of-peer-atomics path. When ON, nvlink_barrier replaces the
+# per-rank unicast atomics with one NVSwitch multimem.red, provided the shim
+# resolved a valid multicast base (mc_base != 0) at launch.
+_MEGA_MULTIMEM_BARRIER = os.environ.get("MEGA_MULTIMEM_BARRIER", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +227,7 @@ _MLIR_VALUE_FIELDS = (
     "shared_zero_prefix",
     "peer_rank_ptr_mapper",
     "local_rank",
+    "nvlink_barrier_mc_base",
 )
 
 _CONST_FIELDS = (
@@ -278,6 +288,10 @@ class TokenCommArgs:
         # on the symmetric heap (peer-pulled) and its pool-ordered local copy.
         input_fc1_activation_per_token_scale_buffer: cute.Tensor = None,
         dispatched_fc1_activation_per_token_scale_buffer: cute.Tensor = None,
+        # POC (multimem barrier): multicast VA of nvlink_barrier_signal (0 when
+        # off). A plain runtime i64 scalar carried like local_rank; nvlink_barrier
+        # reads it instead of tagging the single-byval peer_rank_ptr_mapper.
+        nvlink_barrier_mc_base: Int64 = Int64(0),
     ):
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
@@ -311,6 +325,7 @@ class TokenCommArgs:
         self.local_zero_prefix = local_zero_prefix
         self.shared_zero_prefix = shared_zero_prefix
         self.peer_rank_ptr_mapper = peer_rank_ptr_mapper
+        self.nvlink_barrier_mc_base = nvlink_barrier_mc_base
         self.world_size = world_size
         self.local_rank = local_rank
         self.num_total_experts = num_total_experts
@@ -909,6 +924,7 @@ class TokenInPullTokenBackPush:
         local_rank,
         num_sms,
         nvlink_barrier_counter,
+        mc_base: Int64 = Int64(0),
     ):
         # software_grid_sync expects a dispatch-group-relative thread id.
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
@@ -963,6 +979,7 @@ class TokenInPullTokenBackPush:
             prologue_grid_sync=False,
             epilogue_grid_sync=True,
             sync_threads=self.active_dispatch_threads,
+            mc_base=mc_base,
         )
     @cute.jit
     def dispatch_pull(
@@ -1697,6 +1714,7 @@ class TokenInPullTokenBackPush:
         prologue_grid_sync: cutlass.Constexpr[bool],
         epilogue_grid_sync: cutlass.Constexpr[bool],
         sync_threads: cutlass.Constexpr[int] = 0,
+        mc_base: Int64 = Int64(0),
     ):
         # software_grid_sync expects a dispatch-group-relative thread id.
         # sync_threads: per-CTA arrival count for the grid syncs (0 -> the
@@ -1728,12 +1746,38 @@ class TokenInPullTokenBackPush:
                     target = Int32(0)
 
                 nbs_local_base = nvlink_barrier_signal.iterator.toint()
-                if lane_idx < Int32(self.world_size):
-                    lane_peer_addr = peer_rank_ptr_mapper.map(
-                        nbs_local_base, lane_idx,
-                        Int64(signal_phase * Int32(4)),
-                    )
-                    red_add_release_sys_s32_raw(lane_peer_addr, signal_delta)
+                # mc_base is a runtime value: the multicast VA of the signal region
+                # when the NVLS mapping succeeded at launch, else 0. The gate is
+                # compile-time, so even with MEGA_MULTIMEM_BARRIER=1 the mapping can
+                # fail at runtime; in that case multimem.red would run on address 0
+                # (undefined -> fault/hang), so we fall back to the peer-atomic loop
+                # whenever mc_base is 0.
+                use_multimem = False
+                if cutlass.const_expr(_MEGA_MULTIMEM_BARRIER):
+                    use_multimem = Int64(mc_base) != Int64(0)
+                if use_multimem:
+                    # One NVSwitch multimem.red fans +signal_delta to every rank's
+                    # copy of signal[signal_phase]; identical target math (each of
+                    # world_size ranks contributes +delta to every copy) but 1
+                    # instruction instead of world_size unicast peer atomics.
+                    if lane_idx == Int32(0):
+                        mc_signal_addr = Int64(mc_base) + Int64(
+                            signal_phase * Int32(4)
+                        )
+                        multimem_red_add_release_sys_s32_raw(
+                            mc_signal_addr, signal_delta
+                        )
+                        # The multicast add above and the unicast acquire-poll below
+                        # touch the same local copy through different proxies; order
+                        # them so the poll can observe this rank's own contribution.
+                        fence_proxy_alias()
+                else:
+                    if lane_idx < Int32(self.world_size):
+                        lane_peer_addr = peer_rank_ptr_mapper.map(
+                            nbs_local_base, lane_idx,
+                            Int64(signal_phase * Int32(4)),
+                        )
+                        red_add_release_sys_s32_raw(lane_peer_addr, signal_delta)
                 cute.arch.sync_warp()
 
                 if lane_idx == 0:
@@ -1802,6 +1846,7 @@ class TokenInPullTokenBackPush:
             local_rank=token_comm_args.local_rank,
             num_sms=token_comm_args.sm_count,
             nvlink_barrier_counter=token_comm_args.nvlink_barrier_counter,
+            mc_base=token_comm_args.nvlink_barrier_mc_base,
         )
 
         nb_dispatch_to_sched = pipeline.NamedBarrier(
@@ -2058,6 +2103,7 @@ class TokenInPullTokenBackPush:
                     num_sms=token_comm_args.sm_count,
                     prologue_grid_sync=True,
                     epilogue_grid_sync=True,
+                    mc_base=token_comm_args.nvlink_barrier_mc_base,
                 )
             self.nvlink_barrier(
                 token_comm_args.nvlink_barrier_signal,
@@ -2070,6 +2116,7 @@ class TokenInPullTokenBackPush:
                 num_sms=token_comm_args.sm_count,
                 prologue_grid_sync=True,
                 epilogue_grid_sync=True,
+                mc_base=token_comm_args.nvlink_barrier_mc_base,
             )
             # Shared counters between the barriers: the slot=0 barrier below
             # publishes these zeros cross-rank for a back-to-back MegaMoE relaunch.
@@ -2109,6 +2156,7 @@ class TokenInPullTokenBackPush:
                 num_sms=token_comm_args.sm_count,
                 prologue_grid_sync=not single_cta_reset,
                 epilogue_grid_sync=True,
+                mc_base=token_comm_args.nvlink_barrier_mc_base,
             )
             # Local counters last: rank-local, and grid_sync/nvlink_barrier
             # counters above stay live until this final barrier completes.

@@ -133,10 +133,11 @@ def _decode_logits(
     return buf[: num_rows * stride].view(num_rows, stride)
 
 
-def _decode_long_ws(dev: torch.device, num_rows: int) -> torch.Tensor:
+def _decode_long_ws(dev: torch.device, num_rows: int, slot: int = 0) -> torch.Tensor:
     """The long rows' selection state (decode_common.cuh), zero at first use
-    and kept consistent by the kernels from then on."""
-    key = (dev.type, dev.index)
+    and kept consistent by the kernels from then on. Slot 1 is the source
+    rows' block rows'."""
+    key = (dev.type, dev.index, slot)
     words = num_rows * _long_words()
     buf = _LONG_WS.get(key)
     if buf is None or buf.numel() < words:
@@ -383,6 +384,9 @@ def dsa_indexer_det_topk_paged(
     scores: Optional[torch.Tensor] = None,
     return_scores: bool = True,
     enable_pdl: Optional[bool] = None,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = 8,
+    candidate_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """The paged form (see flashinfer.dsa_indexer.dsa_indexer_det_topk).
 
@@ -417,12 +421,84 @@ def dsa_indexer_det_topk_paged(
     w = w.contiguous()
     if fp4:
         q_scale = q_scale.contiguous().view(torch.int32).reshape(num_rows, num_heads)
-    # The cache as [num_pages, page_stride] bytes (pages may carry a gap).
+    # The cache as [num_pages, page bytes] at its page stride. Only the page
+    # bytes need to exist: a page stride past them (padded pages, pages inside
+    # larger blocks) leaves no storage after the last page.
+    # The kernel reads a page's first page_bytes bytes; padding may follow.
+    page_bytes = page_rows * (row_bytes + 4)
+    if kv_cache.shape[0] > 0 and (
+        kv_cache[0].numel() * kv_cache.element_size() < page_bytes
+        or not kv_cache[0].is_contiguous()
+    ):
+        raise ValueError(
+            f"each kv_cache page must hold {page_bytes} contiguous bytes "
+            "(page_rows key rows, then their scales)"
+        )
     page_stride = kv_cache.stride(0) * kv_cache.element_size()
+    # The binding reads the pages through TMA tensor maps, whose global
+    # strides must be 16-byte multiples; it checks this stride too. Raising
+    # here names the cache instead of leaving the binding's check to surface.
+    if kv_cache.shape[0] > 0 and (
+        page_stride < page_bytes or page_stride % 16 or kv_cache.data_ptr() % 16
+    ):
+        raise ValueError(
+            f"the paged cache needs a page stride of at least {page_bytes} bytes "
+            f"and a multiple of 16, on a 16-byte-aligned base: got {page_stride} "
+            f"bytes at {kv_cache.data_ptr():#x}"
+        )
     pages = torch.as_strided(
-        kv_cache.view(torch.uint8), (kv_cache.shape[0], page_stride), (page_stride, 1)
+        kv_cache.view(torch.uint8), (kv_cache.shape[0], page_bytes), (page_stride, 1)
     )
     row_len = context_lens.reshape(num_rows).contiguous()
+    cand = None
+    scan_len = int(max_context_len)
+    bs = int(candidate_block_size)
+    if candidate_blocks is not None or candidate_out is not None:
+        if candidate_blocks is not None and candidate_out is not None:
+            raise ValueError(
+                "candidate_blocks (consumer rows) and candidate_out (source rows) "
+                "are mutually exclusive"
+            )
+        if bs < 8 or bs & (bs - 1) or bs > min(page_rows, 128):
+            raise ValueError(
+                "candidate_block_size must be a power of two from 8 to min(page_rows, 128)"
+            )
+    max_blocks = (int(max_context_len) + bs - 1) // bs
+    if candidate_out is not None:
+        if bs not in (8, 16):
+            # The scan's epilogue scores a warp's blocks; one warp holds 16 keys.
+            raise ValueError("candidate_out takes a candidate_block_size of 8 or 16")
+        if (
+            candidate_out.dtype != torch.int32
+            or candidate_out.device != dev
+            or candidate_out.dim() != 2
+            or candidate_out.shape[0] != num_rows
+            or not 1 <= candidate_out.shape[1] <= _MAX_TOP_K
+            or not candidate_out.is_contiguous()
+        ):
+            raise ValueError(
+                f"candidate_out must be a contiguous int32 [B * next_n, C] tensor "
+                f"on q's device, 1 <= C <= {_MAX_TOP_K}"
+            )
+    if candidate_blocks is not None:
+        if candidate_blocks.dtype != torch.int32 or candidate_blocks.device != dev:
+            raise ValueError("candidate_blocks must be int32, on q's device")
+        if (
+            candidate_blocks.dim() not in (2, 3)
+            or math.prod(candidate_blocks.shape[:-1]) != num_rows
+            or candidate_blocks.shape[-1] < 1
+        ):
+            raise ValueError(
+                "candidate_blocks must be [B * next_n, C] or [B, next_n, C], C >= 1"
+            )
+        cand = candidate_blocks.reshape(num_rows, candidate_blocks.shape[-1])
+        if cand.stride(1) != 1:
+            cand = cand.contiguous()
+        if cand.shape[1] * bs > _row_sel_keys():
+            raise ValueError(
+                f"candidate blocks * candidate_block_size must be at most {_row_sel_keys()}"
+            )
+        scan_len = min(scan_len, cand.shape[1] * bs)
     indices, scores = _outputs(indices, scores, return_scores, num_rows, top_k, dev)
     if num_rows == 0:
         return indices, scores
@@ -433,7 +509,11 @@ def dsa_indexer_det_topk_paged(
     # rows keep one-row units, whose scan builds the long rows' histograms
     # more cheaply.
     unit = (
-        2 if next_n % 2 == 0 and (next_n >= 4 or num_rows > (8 if fp4 else 16)) else 1
+        2
+        if cand is None
+        and next_n % 2 == 0
+        and (next_n >= 4 or num_rows > (8 if fp4 else 16))
+        else 1
     )
     _module().run_decode(
         q,
@@ -449,8 +529,26 @@ def dsa_indexer_det_topk_paged(
         q_scale,
         indices,
         scores,
-        _decode_logits(dev, num_rows, int(max_context_len)),
-        _decode_long_ws(dev, num_rows) if max_context_len > _row_sel_keys() else None,
+        _decode_logits(dev, num_rows, scan_len),
+        _decode_long_ws(dev, num_rows) if scan_len > _row_sel_keys() else None,
         device_support_pdl(dev) if enable_pdl is None else bool(enable_pdl),
+        cand,
+        bs.bit_length() - 1,
+        None
+        if cand is None
+        else torch.empty_like(cand, memory_format=torch.contiguous_format),
+        None if cand is None else torch.empty(num_rows, dtype=torch.int32, device=dev),
+        candidate_out,
+        None
+        if candidate_out is None
+        else torch.empty(
+            num_rows, (max_blocks + 3) // 4 * 4, dtype=torch.float32, device=dev
+        ),
+        None
+        if candidate_out is None
+        else torch.empty(num_rows, dtype=torch.int32, device=dev),
+        _decode_long_ws(dev, num_rows, slot=1)
+        if candidate_out is not None and max_blocks > _row_sel_keys()
+        else None,
     )
     return indices, scores

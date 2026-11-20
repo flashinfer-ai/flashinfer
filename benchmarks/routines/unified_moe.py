@@ -6,6 +6,7 @@ import argparse
 import functools
 import subprocess
 from collections import defaultdict
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -20,11 +21,14 @@ from flashinfer.fused_moe import (
     BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
+    CakeStepFunConfig,
+    CudnnFrostBf16Config,
     CudnnGroupedGemmBf16Config,
     CudnnGroupedGemmFp8PerTensorConfig,
     CudnnGroupedGemmMxfp8Config,
     CudnnGroupedGemmNvfp4Config,
     CutlassBf16Config,
+    CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
     CutlassMxfp8Config,
     CutlassMxfp8Mxfp4Config,
@@ -43,6 +47,7 @@ from flashinfer.fused_moe import (
     CuTileNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
+    FrostLowLatencyConfig,
     GELU,
     GeGLU,
     GeGLUTanh,
@@ -52,17 +57,20 @@ from flashinfer.fused_moe import (
     MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
+    PrimsTsConfig,
     QuantConfig,
     QuantFormat,
     ReLU,
     ReLU2,
     RoutingConfig,
+    RoutingInputMode,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
     SiLU,
     SiTU,
     SwiGLU,
     SwiGLUStep,
+    TrtllmBf16Config,
     TrtllmFp8BlockConfig,
 )
 from flashinfer.fused_moe.prepare import (
@@ -70,6 +78,7 @@ from flashinfer.fused_moe.prepare import (
     _swizzle_cutile_fp4_scales,
 )
 from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
 from .flashinfer_benchmark_utils import (
@@ -89,6 +98,11 @@ _BACKEND_CONFIGS = {
     ("bf16", "cutlass"): CutlassBf16Config,
     ("bf16", "cutile"): CuTileBf16Config,
     ("bf16", "cudnn"): CudnnGroupedGemmBf16Config,
+    ("bf16", "trtllm"): TrtllmBf16Config,
+    ("bf16", "prims_ts"): PrimsTsConfig,
+    ("bf16", "frost_low_latency"): FrostLowLatencyConfig,
+    ("bf16", "cake_stepfun"): CakeStepFunConfig,
+    ("bf16", "cudnn_frost"): CudnnFrostBf16Config,
     ("nvfp4", "cutlass"): CutlassNvfp4Config,
     ("nvfp4", "cutile"): CuTileNvfp4Config,
     ("nvfp4", "b12x"): B12xNvfp4Config,
@@ -103,6 +117,9 @@ _BACKEND_CONFIGS = {
     ("fp8", "cutile"): CuTileFp8PerTensorConfig,
     ("fp8", "cutlass"): CutlassFp8PerTensorConfig,
     ("fp8", "cudnn"): CudnnGroupedGemmFp8PerTensorConfig,
+    ("deepseek_fp8", "cutlass"): CutlassFp8BlockConfig,
+    ("deepseek_fp8", "trtllm"): TrtllmFp8BlockConfig,
+    ("deepseek_fp8", "prims_ts"): PrimsTsConfig,
     ("fp8_w8a16", "cutile"): CuTileFp8PerTensorBf16Config,
     ("mxfp8", "cutile"): CuTileMxfp8Config,
     ("mxfp8", "cutlass"): CutlassMxfp8Config,
@@ -125,9 +142,15 @@ _PREQUANTIZED_ACTIVATIONS = (
     CudnnGroupedGemmNvfp4Config,
     TrtllmFp8BlockConfig,
     CuteDslConfig,
+    PrimsTsConfig,
 )
 # Backends whose weight and activation preparers take the layer's ``quant``.
-_QUANT_AWARE_PREPARERS = (TrtllmFp8BlockConfig, CuteDslConfig)
+_QUANT_AWARE_PREPARERS = (
+    TrtllmFp8BlockConfig,
+    CuteDslConfig,
+    PrimsTsConfig,
+    CakeStepFunConfig,
+)
 # Backends taking pre-quantized activations whose BF16 conversion is timed, to
 # match the API boundary of the backends that quantize in-kernel.
 _TIMED_INPUT_QUANTIZATION = (
@@ -174,7 +197,19 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile", "b12x", "sm12x", "cudnn", "trtllm", "cute_dsl"),
+        choices=(
+            "cutlass",
+            "cutile",
+            "b12x",
+            "sm12x",
+            "cudnn",
+            "trtllm",
+            "cute_dsl",
+            "prims_ts",
+            "frost_low_latency",
+            "cake_stepfun",
+            "cudnn_frost",
+        ),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -380,10 +415,12 @@ def _prepare_weight_view(
     }
     if config_type in _STATIC_FP8_PER_TENSOR:
         common.update(fp8_static_scales)
-    if quant_variant == "bf16" or backend in ("cutlass", "cudnn"):
-        return config_type.prepare_weights(w1, w2, **common)
+    if config_type is FrostLowLatencyConfig:
+        return config_type.prepare_bf16_weights(w1, w2, activation=activation)
     if config_type in _QUANT_AWARE_PREPARERS:
         return config_type.prepare_weights(w1, w2, quant=_quant_config(args), **common)
+    if quant_variant == "bf16" or backend in ("cutlass", "cudnn"):
+        return config_type.prepare_weights(w1, w2, **common)
 
     if quant_variant.startswith(("fp8", "mxfp8")):
         block_scaled = quant_variant.startswith("mxfp8")
@@ -531,6 +568,7 @@ def _quant_config(args) -> QuantConfig:
         "mxfp4": (QuantFormat.MXFP4, QuantFormat.MXFP4),
         "mxfp4_w4a16": (QuantFormat.MXFP4, QuantFormat.BF16),
         "fp8": (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+        "deepseek_fp8": (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
         "fp8_w8a16": (QuantFormat.FP8PerTensor, QuantFormat.BF16),
         "mxfp8": (QuantFormat.MXFP8, QuantFormat.MXFP8),
         "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
@@ -544,6 +582,11 @@ def _config_for_backend(args, activation, backend_config) -> MoEConfig:
         routing=RoutingConfig(
             num_experts=args.num_experts,
             top_k=args.top_k,
+            method=(
+                RoutingMethodType.Renormalize
+                if isinstance(backend_config, CakeStepFunConfig)
+                else RoutingMethodType.Default
+            ),
             routed_scaling_factor=args.routed_scaling_factor,
         ),
         quant=_quant_config(args),
@@ -754,7 +797,11 @@ def run_unified_moe_test(args):
             )
             continue
 
-        backend_config = config_type()
+        backend_config = (
+            config_type(max_num_tokens=8)
+            if config_type is FrostLowLatencyConfig
+            else config_type()
+        )
         backend_activation = activation
         b12x_swiglu_override = (
             backend == "b12x"
@@ -765,6 +812,13 @@ def run_unified_moe_test(args):
             backend_activation = SwiGLU()
         config = _config_for_backend(args, backend_activation, backend_config)
         try:
+            if (
+                isinstance(backend_config, FrostLowLatencyConfig)
+                and args.num_tokens > backend_config.max_num_tokens
+            ):
+                raise NotImplementedError(
+                    f"Frost low-latency supports at most {backend_config.max_num_tokens} tokens"
+                )
             backend_activations = activations
             prepare_activations = getattr(config_type, "prepare_activations", None)
             if config_type in _STATIC_FP8_PER_TENSOR:
@@ -814,6 +868,12 @@ def run_unified_moe_test(args):
                     hidden_states_scale=scale,
                     topk_ids=activations.topk_ids,
                     topk_weights=activations.topk_weights,
+                )
+            if isinstance(backend_config, CakeStepFunConfig):
+                # Cake's precomputed router consumes separate IDs and scores.
+                backend_activations = replace(
+                    backend_activations,
+                    routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
                 )
             inputs = runner.pack_inputs(backend_activations, weights)
             if b12x_swiglu_override:

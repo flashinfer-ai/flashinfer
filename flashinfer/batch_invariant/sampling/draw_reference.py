@@ -163,3 +163,97 @@ def draw_reference(
         "S": torch.tensor(out["S"], dtype=torch.float64).to(torch.float32),
         "t": torch.tensor(out["t"], dtype=torch.float64).to(torch.float32),
     }
+
+
+def draw_support_reference(
+    x: torch.Tensor,
+    seeds: Sequence[int],
+    offsets: Sequence[int],
+    filters,
+    from_logits: bool = False,
+    temperature=None,
+    draw: int = 0,
+    rows: Optional[Sequence[int]] = None,
+) -> Dict[str, torch.Tensor]:
+    """The truncated draw's exact model: ``support.row.v1`` per row (``filters[r]``, a :class:`support_spec.Filters`), then
+    the draw over the kept weights (the others ``+0``): ``{"samples" int64 (-1 where invalid), "valid" bool, "mass" (the
+    masked canonical tree), "S" (the row's canonical tree), "threshold", "u", "logprobs", "kept_logprobs"}`` -- for logits
+    ``logprobs`` is the drawn token's log-probability under the full distribution (``lse.row``'s at the token, over ``S``:
+    ``mul(add(z, neg(lg2(S))), LN2)``) and ``kept_logprobs`` the one renormalised over the kept set (over ``mass``); NaN
+    when invalid -- each over ``rows`` (every row by default)."""
+    from .mufu_device import lg2_device
+    from .spec import LN2_F32
+    from .support_reference import support_row
+
+    x = x.detach().cpu()
+    M, N = x.shape
+    rows = list(range(M)) if rows is None else list(rows)
+    xf = x.to(torch.float32)
+    cs = _scales(temperature, M) if from_logits else None
+    out: Dict[str, list] = {
+        k: []
+        for k in (
+            "samples",
+            "valid",
+            "mass",
+            "S",
+            "threshold",
+            "u",
+            "logprobs",
+            "kept_logprobs",
+        )
+    }
+    for r in rows:
+        if from_logits:
+            m = row_max(xf[r])
+            z = torch.mul(
+                torch.add(xf[r], torch.tensor(fp32.neg(m), dtype=torch.float32)),
+                torch.tensor(cs[r], dtype=torch.float32),
+            )
+            w = ex2_device(z)
+            res = support_row(w, N, filters[r], w_max=1.0)
+        else:
+            w = xf[r]
+            bits = w.view(torch.int32)
+            if bool(((bits < 0) & ((bits & 0x7FFFFFFF) != 0)).any()):
+                # a NEGATIVE weight (the sign bit with a non-zero magnitude; -0.0 is a zero, a negative NaN counts): outside the
+                # class (support_spec.pattern) -- the row is invalid on every path and placement: token -1, NaN mass, NaN log-probs
+                words = stream.words(int(seeds[r]), int(offsets[r]), draw)
+                out["samples"].append(-1)
+                out["valid"].append(False)
+                for key in ("mass", "S", "threshold", "logprobs", "kept_logprobs"):
+                    out[key].append(float("nan"))
+                out["u"].append(stream.uniform32(words[0]))
+                continue
+            res = support_row(w, N, filters[r])
+        wk = torch.where(res["mask"], w, torch.zeros_like(w))
+        S = row_sum(w, N)  # the row's canonical sum tree (lse.row's s for logits)
+        words = stream.words(int(seeds[r]), int(offsets[r]), draw)
+        u = stream.uniform32(words[0])
+        tok, ok, mass, _ = draw_row(wk, N, u)
+        mass_k = float(res["mass"])  # type: ignore[arg-type]
+        if not (0.0 < mass_k < float("inf")):
+            # the support's mass decides validity: a NaN / infinite weight or a tiny-sum row keeps nothing usable
+            tok, ok, mass = -1, False, mass_k
+        lp = lpk = float("nan")
+        if from_logits and ok:
+            lg2S = float(lg2_device(torch.tensor([S], dtype=torch.float32))[0])
+            lg2m = float(lg2_device(torch.tensor([mass], dtype=torch.float32))[0])
+            # the full distribution's (lse.row's logp at the token) and the kept set's
+            lp = fp32.mul(fp32.add(float(z[tok]), fp32.neg(lg2S)), LN2_F32)
+            lpk = fp32.mul(fp32.add(float(z[tok]), fp32.neg(lg2m)), LN2_F32)
+        out["samples"].append(tok)
+        out["valid"].append(ok)
+        out["mass"].append(mass)
+        out["S"].append(S)
+        out["threshold"].append(res["threshold"])
+        out["u"].append(u)
+        out["logprobs"].append(lp)
+        out["kept_logprobs"].append(lpk)
+    ret = {
+        "samples": torch.tensor(out["samples"], dtype=torch.int64),
+        "valid": torch.tensor(out["valid"], dtype=torch.bool),
+    }
+    for k in ("mass", "S", "threshold", "u", "logprobs", "kept_logprobs"):
+        ret[k] = torch.tensor(out[k], dtype=torch.float64).to(torch.float32)
+    return ret

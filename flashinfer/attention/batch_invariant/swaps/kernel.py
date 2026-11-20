@@ -30,11 +30,12 @@ from ..plan import (
     F_GROUP,
     F_KVHEAD,
     F_KVLEN,
+    F_KVPTR0,
     F_MODE,
+    F_NPAGES,
     F_QBASE,
     F_QLEN,
     F_QTOK0,
-    F_REQ,
     F_ROWS,
     F_SLOT,
     F_TILE_HI,
@@ -66,10 +67,18 @@ class SwapsKernel:
     runtime arguments. Every unit must have at most ``n_pad`` live rows (the API selects ``n_pad`` per launch)."""
 
     def __init__(
-        self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+        self,
+        D: int,
+        g: int,
+        page: int,
+        n_pad: int,
+        ragged: bool = False,
+        cap: int = 0,
+        pdl: bool = False,
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
+        self.pdl = pdl  # launched as a programmatic dependent: the load warp waits for the preceding grid before its first TMA
 
     @cute.jit
     def __call__(
@@ -82,7 +91,6 @@ class SwapsKernel:
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
         mDesc: cute.Tensor,
-        mKvIndptr: cute.Tensor,
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
@@ -116,7 +124,6 @@ class SwapsKernel:
             mGroups,
             mCounters,
             mDesc,
-            mKvIndptr,
             mKvIndices,
             c,
             nc,
@@ -136,6 +143,7 @@ class SwapsKernel:
             cluster=[1, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.pdl,
         )
 
     @cute.kernel
@@ -152,7 +160,6 @@ class SwapsKernel:
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
         mDesc: cute.Tensor,
-        mKvIndptr: cute.Tensor,
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
@@ -302,6 +309,10 @@ class SwapsKernel:
         # ---- roles: every role walks the same units in the same order (u = bidx, bidx + grid, ...)
         if warp_idx == R.load_warp:
             cute.arch.setmaxregister_decrease(R.regs_other)
+            if cutlass.const_expr(self.pdl):
+                # the preceding grid's stores (Q, the KV cache, the output and workspace it may have produced) are visible from here;
+                # every store of this kernel depends on loads issued after this point. The descriptors are plan constants
+                cute.arch.griddepcontrol_wait()
             for u in range(bidx, num_units, grid_size):
                 q_prod, kv_prod = load_loop(
                     st,
@@ -315,13 +326,15 @@ class SwapsKernel:
                     sKV_view,
                     q_prod,
                     kv_prod,
-                    mKvIndptr,
                     mKvIndices,
-                    mDesc[(u, F_REQ)],
+                    mDesc[(u, F_KVPTR0)],
+                    mDesc[(u, F_NPAGES)],
                     mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
                     mDesc[(u, F_KVHEAD)],
                     mDesc[(u, F_TILE_LO)],
                     mDesc[(u, F_TILE_HI)],
+                    storage.kv_mbar.data_ptr(),
+                    u == bidx,
                 )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:

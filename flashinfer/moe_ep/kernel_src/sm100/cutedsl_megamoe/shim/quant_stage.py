@@ -67,6 +67,16 @@ def _int32_routing_stager_class(
     from cutlass._mlir.dialects import cf
     from cutlass.cutlass_dsl import dsl_user_op
     from src.inputs_process import DataPreprocess, Fp32Max, cvt_f32_to_f8_to_f32
+    from flashinfer.moe_ep.batch_invariant.mxfp4_device import ScalarF32 as BiMxScalar
+    from flashinfer.moe_ep.batch_invariant.mxfp4_spec import (
+        combine_half_amax,
+        input_half_amax,
+        quantize_amax_precast,
+    )
+    from flashinfer.moe_ep.batch_invariant.mxfp8_device import ScalarF32 as BiMx8Scalar
+    from flashinfer.moe_ep.batch_invariant.mxfp8_spec import (
+        input_quantize_amax_precast as mxfp8_input_quantize_amax_precast,
+    )
 
     @dsl_user_op
     def assert_valid_route(valid, *, loc=None, ip=None):
@@ -263,35 +273,72 @@ def _int32_routing_stager_class(
                         quant_chunk_bf16,
                     )
                     values.store(quant_chunk_bf16.load().to(Float32))
-                    for i in cutlass.range_constexpr(quant_vec):
-                        local_absmax = cute.arch.fmax(
-                            local_absmax, cute.arch.fmax(values[i], -values[i])
+                    if cutlass.const_expr(getattr(self, "batch_invariant", False)):
+                        local_absmax = input_half_amax(
+                            BiMxScalar, tuple(values[i] for i in range(quant_vec))
                         )
+                    else:
+                        for i in cutlass.range_constexpr(quant_vec):
+                            local_absmax = cute.arch.fmax(
+                                local_absmax, cute.arch.fmax(values[i], -values[i])
+                            )
 
                 block_absmax = local_absmax
                 if cutlass.const_expr(chunks_per_scale == 2):
                     paired_absmax = Float32(
                         cute.arch.shuffle_sync_bfly(local_absmax, offset=1)
                     )
-                    block_absmax = cute.arch.fmax(local_absmax, paired_absmax)
+                    if cutlass.const_expr(getattr(self, "batch_invariant", False)):
+                        low_amax, high_amax = local_absmax, paired_absmax
+                        if quant_chunk_idx % Int32(2) != Int32(0):
+                            low_amax, high_amax = paired_absmax, local_absmax
+                        block_absmax = combine_half_amax(
+                            BiMxScalar, low_amax, high_amax
+                        )
+                    else:
+                        block_absmax = cute.arch.fmax(local_absmax, paired_absmax)
                 if quant_chunk_idx < Int32(num_quant_chunks):
                     # Per-32 E8M0 (power-of-2) scale, rounded up (cvt.rp) so the block
                     # fits the quantized range; rcp is exact for a power of two.
                     # The Rubin Torch quantizer clamps to normal FP32 scales.
-                    unrounded_scale = cute.arch.fmax(
-                        block_absmax * data_rcp_limit, Float32(2.0**-126)
-                    )
-                    scale_f32 = Float32(
-                        cvt_f32_to_f8_to_f32(unrounded_scale, cutlass.Float8E8M0FNU)
-                    )
-                    sf_e8m0 = scale_f32.to(cutlass.Float8E8M0FNU)
-                    acc_scale = cute.arch.fmin(
-                        cute.arch.rcp_approx(scale_f32), fp32_max
-                    )
-
                     scaled = cute.make_rmem_tensor((quant_vec,), Float32)
-                    for i in cutlass.range_constexpr(quant_vec):
-                        scaled[i] = values[i] * acc_scale
+                    if cutlass.const_expr(getattr(self, "batch_invariant", False)):
+                        if cutlass.const_expr(
+                            getattr(self, "batch_invariant_quant_kind", None)
+                            in ("mxfp8_e4m3", "mxfp8_e5m2")
+                        ):
+                            scaled_values, sf_e8m0 = mxfp8_input_quantize_amax_precast(
+                                BiMx8Scalar,
+                                tuple(values[i] for i in range(quant_vec)),
+                                block_absmax,
+                                self.batch_invariant_quant_kind,
+                            )
+                        else:
+                            quant_kind = (
+                                "mxfp4" if self.quant_type == "mxfp4" else "mxfp4_mxfp8"
+                            )
+                            scaled_values, sf_e8m0 = quantize_amax_precast(
+                                BiMxScalar,
+                                tuple(values[i] for i in range(quant_vec)),
+                                block_absmax,
+                                quant_kind,
+                                staging=True,
+                            )
+                        for i in cutlass.range_constexpr(quant_vec):
+                            scaled[i] = scaled_values[i]
+                    else:
+                        unrounded_scale = cute.arch.fmax(
+                            block_absmax * data_rcp_limit, Float32(2.0**-126)
+                        )
+                        scale_f32 = Float32(
+                            cvt_f32_to_f8_to_f32(unrounded_scale, cutlass.Float8E8M0FNU)
+                        )
+                        sf_e8m0 = scale_f32.to(cutlass.Float8E8M0FNU)
+                        acc_scale = cute.arch.fmin(
+                            cute.arch.rcp_approx(scale_f32), fp32_max
+                        )
+                        for i in cutlass.range_constexpr(quant_vec):
+                            scaled[i] = values[i] * acc_scale
                     data = cute.make_rmem_tensor((quant_vec,), self.quant_dtype)
                     data.store(scaled.load().to(self.quant_dtype))
 
@@ -395,6 +442,8 @@ def fused_quant_stage(
     num_experts: Optional[int] = None,
     fuse_tail_mask: bool = False,
     zero_masked_scores: bool = True,
+    batch_invariant: bool = False,
+    batch_invariant_quant_kind: Optional[str] = None,
 ) -> None:
     """Quantize + stage one batch into the mega symm-buffer views.
 
@@ -423,6 +472,27 @@ def fused_quant_stage(
         raise ValueError(
             f"quant_type must be one of {_QUANT_TYPES}, got {quant_type!r}"
         )
+    if batch_invariant:
+        if batch_invariant_quant_kind is not None and (
+            batch_invariant_quant_kind not in ("mxfp8_e4m3", "mxfp8_e5m2")
+            or quant_type != batch_invariant_quant_kind
+        ):
+            raise ValueError(
+                "batch_invariant_quant_kind must match the MXFP8 data type"
+            )
+        if quant_type == "nvfp4":
+            # The BI recipe rounds each multiplication separately. A host-folded
+            # norm/6 constant can differ even when norm has the same FP32 bits.
+            scale_multiplier = None
+        elif quant_type not in ("mxfp4", "mxfp8_e4m3", "mxfp8_e5m2") or not (
+            quant_type == "mxfp4" or mxfp8_normal_scales
+        ):
+            raise ValueError(
+                "batch_invariant fused staging requires NVFP4 or normal-scale "
+                "MXFP4/MXFP8"
+            )
+        if quant_type == "mxfp8_e5m2" and batch_invariant_quant_kind is None:
+            raise ValueError("batch_invariant E5M2 requires its MXFP8 numerical recipe")
     normal_scales = mxfp8_normal_scales or quant_type == "mxfp4"
     is_nvfp4 = quant_type == "nvfp4"
     if is_nvfp4 and mxfp8_normal_scales:
@@ -504,6 +574,8 @@ def fused_quant_stage(
         num_experts,
         fuse_tail_mask,
         zero_masked_scores,
+        batch_invariant,
+        batch_invariant_quant_kind,
     )
     stager = _STAGERS.get(key)
     if stager is None:
@@ -522,6 +594,8 @@ def fused_quant_stage(
         stager = _CompiledStager(
             dp=stager_class(topk=topk, hidden=hidden, quant_type=quant_type)
         )
+        stager.dp.batch_invariant = batch_invariant
+        stager.dp.batch_invariant_quant_kind = batch_invariant_quant_kind
         _STAGERS[key] = stager
 
     import cuda.bindings.driver as cuda_driver
