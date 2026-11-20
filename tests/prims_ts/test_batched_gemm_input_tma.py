@@ -61,15 +61,27 @@ def _host_masks(monkeypatch, shape, rank):
         monkeypatch.setattr(cga, name, python_body(getattr(cga, name)))
 
 
-@pytest.mark.parametrize("shape", [(2, 1), (2, 4), (4, 2), (4, 4)])
+@pytest.mark.parametrize(
+    "shape,cluster_dim_x",
+    [
+        ((2, 1), 2),
+        ((2, 4), 2),
+        ((4, 2), 4),
+        ((4, 4), 4),
+        pytest.param((2, 1), 0, id="auto-2x1"),
+        pytest.param((2, 4), 0, id="auto-2x4"),
+    ],
+)
 @pytest.mark.parametrize("fallback", [False, True])
 def test_omitted_gather_bytes_reach_all_full_barrier_owners(
-    monkeypatch, shape, fallback
+    monkeypatch, shape, cluster_dim_x, fallback
 ):
     from types import SimpleNamespace
     from tests.prims_ts.routing_matrix_utils import matrix_options
 
-    cfg = make_config(**matrix_options(512, shape, routed=True))
+    opts = matrix_options(512, shape, routed=True)
+    opts["cluster_dim_x"] = cluster_dim_x
+    cfg = make_config(**opts)
     active_shape = (2, 1) if fallback else shape
     complete = python_body(cga.complete_input_tma_bytes)
     masks = python_body(cga.cga_tma_masks)

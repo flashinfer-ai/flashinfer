@@ -2622,7 +2622,10 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
       result.push_back(gemm1_output_scale.value());
     }
     result.push_back(gemm2_output);
-    result.push_back(permuted_idx_to_expanded_idx);
+    // Only NVFP4 consumers include the fused-finalize routing slot.
+    if (dtype_weights == btg::Dtype::E2m1) {
+      result.push_back(permuted_idx_to_expanded_idx);
+    }
     return result;
   }
 

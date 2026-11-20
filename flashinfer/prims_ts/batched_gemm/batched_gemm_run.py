@@ -2208,6 +2208,10 @@ def reference_check(
     )
     all_zero_input_data = _uses_all_zero_input_data(data_distribution)
     cfg = make_config(**cfg_overrides)
+    if cfg.fuse_moe_finalize:
+        raise ValueError(
+            "standalone GEMM does not provide fused-finalize routing data and a zeroed token output; use the MoE runner"
+        )
     if cfg.dense_single_expert and (num_experts != 1 or top_k != 1):
         raise ValueError("dense_single_expert requires num_experts=top_k=1")
     if require_mixed_cga_runtime:
@@ -3925,6 +3929,10 @@ def _build_launch_io(
     )
     all_zero_input_data = _uses_all_zero_input_data(data_distribution)
     cfg = make_config(**cfg_overrides)
+    if cfg.fuse_moe_finalize:
+        raise ValueError(
+            "standalone GEMM does not provide fused-finalize routing data and a zeroed token output; use the MoE runner"
+        )
     if cfg.dense_single_expert and (num_experts != 1 or top_k != 1):
         raise ValueError("dense_single_expert requires num_experts=top_k=1")
 
@@ -4643,6 +4651,25 @@ def _fused_finalize_args(io: dict) -> tuple:
     return (io["c0_dp"], io["route_map_dp"], io["scale_c_dp"])
 
 
+def _native_finalize_args(io: dict) -> tuple:
+    """Native finalization requires the MoE caller's routing buffers."""
+    names = ("finalize_scale_dp", "finalize_route_dp")
+    if getattr(io["cfg"], "fuse_moe_finalize", False):
+        missing = [name for name in names if io.get(name) is None]
+        if missing:
+            raise ValueError(f"a fused-finalize launch needs {', '.join(missing)}")
+        return tuple(io[name] for name in names)
+    return (
+        io.get("finalize_scale_dp", io["scale_c_dp"]),
+        io.get("finalize_route_dp", io["route_map_dp"]),
+    )
+
+
+def _validate_launch_expert_count(io: dict) -> None:
+    if getattr(io["cfg"], "dense_single_expert", False) and io["shape"][3] != 1:
+        raise ValueError("dense_single_expert requires num_experts_dim=1")
+
+
 def _compile_arg_tuple(io: dict, stream) -> tuple:
     """Positional args for ``cute.compile(gemm, ...)``.
 
@@ -4650,6 +4677,7 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
     ``launch_early_exit_max_token_ctas`` is a runtime launch argument because
     it only controls the over-launched grid size for dynamic-batch reuse.
     """
+    _validate_launch_expert_count(io)
     return (
         io["a_dp"],
         io["b_dp"],
@@ -4672,8 +4700,7 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
         *_fused_finalize_args(io),
-        io.get("finalize_scale_dp", io["scale_c_dp"]),
-        io.get("finalize_route_dp", io["route_map_dp"]),
+        *_native_finalize_args(io),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
@@ -4704,6 +4731,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
     ``JitArguments`` workspaces in :func:`benchmark`: same as
     :func:`_compile_arg_tuple` minus the constexpr ``cfg`` operand.
     """
+    _validate_launch_expert_count(io)
     problem_m, problem_n = (int(value) for value in io["shape"][:2])
     validate_launch_grid(
         io["cfg"],
@@ -4733,8 +4761,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
         *_fused_finalize_args(io),
-        io.get("finalize_scale_dp", io["scale_c_dp"]),
-        io.get("finalize_route_dp", io["route_map_dp"]),
+        *_native_finalize_args(io),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
@@ -4760,17 +4787,21 @@ def _prepare_tma_descriptors(io: dict, stream) -> None:
     # in the same IO object as the device allocations it describes.
     storage = ctypes.create_string_buffer(7 * 128 + 63)
     address = (ctypes.addressof(storage) + 63) & ~63
-    io["tma_desc_storage_dp"] = make_ptr(
+    descriptor_ptr = make_ptr(
         cutlass.Uint8, address, cutlass.AddressSpace.generic, assumed_align=64
     )
+    preparation_io = dict(io, tma_desc_storage_dp=descriptor_ptr)
     with task_scheduling_scope(), BaseDSL.enable_pyir():
-        args = _launch_arg_tuple(io, stream)
+        args = _launch_arg_tuple(preparation_io, stream)
         prepare = cute.compile(
             prepare_gemm_descriptors, args, io["cfg"], options=_cute_compile_options()
         )
     prepare(args)
-    io["_tma_descriptor_storage"] = storage
-    io["_tma_descriptor_key"] = key
+    io.update(
+        tma_desc_storage_dp=descriptor_ptr,
+        _tma_descriptor_storage=storage,
+        _tma_descriptor_key=key,
+    )
 
 
 def _compile_for_launch(io: dict, stream) -> object:

@@ -2630,7 +2630,8 @@ class BatchedGemmConfig:
     @property
     def clc_fast_drain_skip_is_suffix(self) -> bool:
         """Whether one early-exit skip implies the rest of the CLC grid is past the limit."""
-        return self.is_swap_ab == self.raster_along_m
+        # Grouped M rasterization can revisit active M clusters after a skip.
+        return self.cta_raster_group_m == 1 and self.is_swap_ab == self.raster_along_m
 
     @property
     def use_work_throttle_barrier(self) -> bool:
@@ -4572,6 +4573,10 @@ def validate_config(
             "dense epilogue or non-swap dense/native-routed NVFP4/SwiGLU"
         )
     _validate_binary_config_option("dense_fuse_tma_loads", cfg.dense_fuse_tma_loads)
+    if cfg.dense_fuse_tma_loads and cfg.fuse_operand_sf_loads:
+        raise ValueError(
+            "dense_fuse_tma_loads and fuse_operand_sf_loads select competing B/SFB producers"
+        )
     if cfg.dense_fuse_tma_loads and not (
         (cfg.dense_fuse_tma_pipeline or cfg.uses_routed_weight_pipeline)
         and cfg.dense_partition_tma_loads
