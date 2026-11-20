@@ -12,6 +12,8 @@ row's statistics chain**. Per tile it receives from the softmax warpgroups ``alp
 * at an interior chunk end (several chunks, mode 0): ``spec.merge``'s scalar part gives ``(a1, a2)`` from
   ``(m_r, m)`` (``(1, 0)`` for a chunk absent for the row), ``l_r = fma(l, a2, mul(l_r, a1))`` and
   ``O_m = fma(O_c, a2, mul(O_m, a1))`` in TMEM (the unit's first merge takes ``mul(+0, a1) = +0``: the init state);
+* (the explicit-key-set class, ``st.masked``) a row without a visible key ends with ``l = +0``: its reciprocal is replaced by
+  ``+0`` and the row stores ``+0`` (``spec.output_elem_or_zero``);
 * the epilogue, holding the accumulator until its reads are done (the next unit's first PV overwrites
   it): the unit's last chunk merged the same way, then ``cvt_bf16(add(mul(O, div(1, l)), +0))`` to the
   output rows (mode 0), or the raw fp32 ``O_c`` rows and ``(m, l)`` to the workspace slot (mode 1, folded
@@ -780,6 +782,9 @@ def correction_loop(
                 m_r = m
                 l_r = l
     inv = CuteF32.div(Float32(1.0), l_r)
+    if cutlass.const_expr(st.masked):
+        if l_r == Float32(0.0):  # no visible key: the row stores +0
+            inv = Float32(0.0)
     out_row = (q_base + token) * Hq + kv_head * g + row % g
     o_cons = epilogue(
         a1,
@@ -889,6 +894,9 @@ def fold_group(
                         chunk_len(st.D),
                         8 if st.n_wg == 1 else 4,
                         st.ws_row,
+                        getattr(
+                            st, "masked", False
+                        ),  # the row body's plan carries the mode; the Swaps body has none
                     )
             if thread_idx == 0:
                 mCounters[grp] = Int32(
@@ -1189,6 +1197,9 @@ def correction_loop_q2(
             )
     if hi_a > lo_a:
         inv_a = CuteF32.div(Float32(1.0), lr_a)
+        if cutlass.const_expr(st.masked):
+            if lr_a == Float32(0.0):
+                inv_a = Float32(0.0)
         out_a = (q_base + tok_a + row // g) * Hq + kv_head * g + row % g
         o_cons_a = epilogue(
             a1_a,
@@ -1225,6 +1236,9 @@ def correction_loop_q2(
         )
     if has_b:
         inv_b = CuteF32.div(Float32(1.0), lr_b)
+        if cutlass.const_expr(st.masked):
+            if lr_b == Float32(0.0):
+                inv_b = Float32(0.0)
         out_b = (q_base + tok_b + row // g) * Hq + kv_head * g + row % g
         o_cons_b = epilogue(
             a1_b,

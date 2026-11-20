@@ -138,20 +138,25 @@ def pvFold (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :=
     let slice := (pbf.drop (16 * j)).take 16
     .mma acc (String.join (slice.map (fun q => " " ++ q.sexpr))) (vt0 + j) d) o0
 
-/-- `spec.tile_step` on a present tile `t`. -/
-def tileStep (P : Params) (st : State) (t : Nat) : State :=
+/-- `spec.tile_step` on a present tile `t` of a row whose visible keys are `vis`: the one tile step of every attention
+class (the causal rows give `visibleG p win`, the explicit-key-set rows their own key bits). -/
+def tileStepV (steps tbits row d : Nat) (vis : Nat → Bool) (st : State) (t : Nat) : State :=
+  let T := 2 ^ tbits
   let scores : List (Option ATerm) :=
-    (List.range P.T).map (fun i => if P.visible (t * P.T + i) then some (.score P.row (t * P.T + i) P.steps) else none)
-  let mT := (ptree ATerm.fmax P.tbits scores).getD (.const "-inf")
+    (List.range T).map (fun i => if vis (t * T + i) then some (.score row (t * T + i) steps) else none)
+  let mT := (ptree ATerm.fmax tbits scores).getD (.const "-inf")
   let mNew := ATerm.fmax st.m mT
   let alpha := alphaTerm st.m mNew
   let nms := ATerm.mul mNew nc
   let probs : List (Option ATerm) := scores.map (fun s => s.map (fun s => .ex2 (.fma s c nms)))
-  let rT := (ptree ATerm.add P.tbits probs).getD (.const "0.0")
+  let rT := (ptree ATerm.add tbits probs).getD (.const "0.0")
   let lNew := ATerm.fma st.l alpha rT
   let pbf := probs.map (fun q => ATerm.cvt "bf16" (q.getD (.const "0.0")))
-  let oNew := pvFold (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
+  let oNew := pvFold (.mul st.o alpha) pbf (t * (T / 16)) d
   ⟨mNew, lNew, oNew⟩
+
+/-- `spec.tile_step` on a present tile `t` of a causal row. -/
+def tileStep (P : Params) (st : State) (t : Nat) : State := tileStepV P.steps P.tbits P.row P.d P.visible st t
 
 /-- `spec.merge`: the running state `a` with the finished chunk `b`. -/
 def merge (a b : State) : State :=
@@ -322,5 +327,113 @@ theorem config_invariance (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : Params) (
 theorem space_invariant (space : List Config) :
     ∀ b₁ ∈ space, ∀ b₂ ∈ space, ∀ (f₁ f₂ : Bool) (P : Params) (σ τ : Nat → Nat), kernel b₁ f₁ P σ = kernel b₂ f₂ P τ :=
   fun b₁ _ b₂ _ f₁ f₂ P σ τ => config_invariance b₁ b₂ f₁ f₂ P σ τ
+
+/-! ## The explicit-key-set class (custom masks): `attention.bf16.mask`
+
+A row's visible keys are DATA: a list of key bits over its request's keys `[0, keys.length)` (FlashInfer's `custom_mask` row,
+ANDed with the window by the wrapper). The dataflow is the causal class's with that key set in place of the causal range: the
+same tile step (`tileStepV`), the same per-chunk fold, the same merge and epilogue; a key outside the set is an absent leaf, a
+tile or chunk without a visible key is dropped, and a row without one outputs `cvt_bf16(+0)` (`spec.output_elem_or_zero`: a
+declared rule; the kernels take it from the row's own `l`). The term is a function of the row's own key set: no other row's
+set, and nothing of the batch, appears in `maskOutput`. -/
+
+/-- The fixed data of one row of the explicit-key-set class: head dim as `steps = D/16`, tile `T = 2^tbits`, chunk `C`, the
+row's key bits over `[0, keys.length)`, the row id of the Q leaves, the output column `d`. -/
+structure MParams where
+  steps : Nat
+  tbits : Nat
+  C : Nat
+  keys : List Bool
+  row : Nat
+  d : Nat
+
+def MParams.T (P : MParams) : Nat := 2 ^ P.tbits
+def MParams.visible (P : MParams) (k : Nat) : Bool := P.keys.getD k false
+def MParams.tilePresent (P : MParams) (t : Nat) : Bool := (List.range P.T).any (fun i => P.visible (t * P.T + i))
+def MParams.tilesOfChunk (P : MParams) (j : Nat) : List Nat :=
+  ((List.range (P.C / P.T)).map (fun i => j * (P.C / P.T) + i)).filter P.tilePresent
+def MParams.presentChunks (P : MParams) : List Nat :=
+  (List.range ((P.keys.length + P.C - 1) / P.C)).filter (fun j => !(P.tilesOfChunk j).isEmpty)
+
+def mChunkState (P : MParams) (j : Nat) : State :=
+  (P.tilesOfChunk j).foldl (tileStepV P.steps P.tbits P.row P.d P.visible) initState
+
+def mFused (P : MParams) : State := P.presentChunks.foldl (fun acc j => merge acc (mChunkState P j)) initState
+
+/-- The output of a row without a visible key. -/
+def zeroOut : ATerm := .cvt "bf16" (.const "0.0")
+
+/-- `AttentionSpec.output` of a row with an explicit key set. -/
+def maskOutput (P : MParams) : ATerm := if P.presentChunks.isEmpty then zeroOut else epilogue (mFused P)
+
+/-- The split kernel of the class: every chunk's state in its workspace slot whatever CTA `σ` computed it on, the present
+slots folded in index order (a slot is present when its state is not the init state: the row had a visible key in it). -/
+def mSplitKernel (P : MParams) (_σ : Nat → Nat) : ATerm :=
+  if P.presentChunks.isEmpty then zeroOut else epilogue (fixup (fun j => mChunkState P j) P.presentChunks)
+
+theorem mSplitKernel_eq_fused (P : MParams) (σ : Nat → Nat) : mSplitKernel P σ = maskOutput P := rfl
+
+/-- A row without a present chunk outputs `+0`. -/
+theorem mask_empty_row (P : MParams) (h : P.presentChunks = []) : maskOutput P = zeroOut := by
+  simp [maskOutput, h]
+
+/-- A row of a launch of the class: its own key bits, its head, its row id. -/
+structure MRow where
+  keys : List Bool
+  h : Nat
+  row : Nat
+  deriving DecidableEq, Repr
+
+def mRowOutput (steps tbits C d : Nat) (r : MRow) : ATerm := maskOutput ⟨steps, tbits, C, r.keys, r.row, d⟩
+
+/-- The launch applies the per-row term to every row: each row brings its own key set, there is no batch parameter inside. -/
+def mLaunch (M : Nat) (rows : Fin M → MRow) (steps tbits C d : Nat) (r : Fin M) : ATerm :=
+  mRowOutput steps tbits C d (rows r)
+
+/-- **Batch invariance (R2)** with per-row key sets: equal rows give equal outputs whatever the batch size, position or
+neighbours. -/
+theorem mask_batch_invariance (steps tbits C d : Nat) {M₁ M₂ : Nat}
+    (rows₁ : Fin M₁ → MRow) (rows₂ : Fin M₂ → MRow) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
+    mLaunch M₁ rows₁ steps tbits C d r₁ = mLaunch M₂ rows₂ steps tbits C d r₂ := by
+  simp only [mLaunch, h]
+
+/-- **A row's output depends on its own key set alone**: two launches that agree on row `r` agree on its output, whatever
+the key sets of every other row. -/
+theorem mask_row_locality (steps tbits C d : Nat) {M : Nat} (rows rows' : Fin M → MRow) (r : Fin M) (h : rows r = rows' r) :
+    mLaunch M rows steps tbits C d r = mLaunch M rows' steps tbits C d r :=
+  mask_batch_invariance steps tbits C d rows rows' r r h
+
+theorem mask_permutation_invariance (steps tbits C d : Nat) {M : Nat} (rows : Fin M → MRow) (σ : Fin M → Fin M) (r : Fin M) :
+    mLaunch M (rows ∘ σ) steps tbits C d r = mLaunch M rows steps tbits C d (σ r) := rfl
+
+theorem mask_subbatch_invariance (steps tbits C d : Nat) {M k : Nat} (rows : Fin M → MRow) (sel : Fin k → Fin M) (i : Fin k) :
+    mLaunch k (rows ∘ sel) steps tbits C d i = mLaunch M rows steps tbits C d (sel i) := rfl
+
+/-- The key bits of a causal range over a request of `kvLen` keys: the mask row that reproduces the causal row at position
+`p` with window `win`. The generated cases decide `maskOutput` of it equal to the causal `output` on the toy rows. -/
+def causalKeys (kvLen p : Nat) (win : Int) : List Bool := (List.range kvLen).map (visibleG p win)
+
+/-- The wrapper's AND of the window into a mask row: token `i` of `qLen` keeps key `k` when `kvLen - qLen + i - win ≤ k`
+(the regular kernels' rule, also for more query tokens than keys); a negative `win` is no window. -/
+def windowKeys (keys : List Bool) (qLen i : Nat) (win : Int) : List Bool :=
+  if win < 0 then keys
+  else (List.range keys.length).map
+    (fun k => keys.getD k false && decide ((keys.length : Int) - (qLen : Int) + (i : Int) - win ≤ (k : Int)))
+
+/-- A row's output under a configuration, as `kernel` for the causal class. -/
+def mKernel (b : Config) (fusedAuto : Bool) (P : MParams) (σ : Nat → Nat) : ATerm :=
+  if b.policy == 2 || (b.policy == 0 && fusedAuto) then maskOutput P else mSplitKernel P σ
+
+/-- **Configuration invariance (R3)** of the explicit-key-set class. -/
+theorem mask_config_invariance (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : MParams) (σ τ : Nat → Nat) :
+    mKernel b₁ f₁ P σ = mKernel b₂ f₂ P τ := by
+  unfold mKernel
+  split <;> split <;> rfl
+
+/-- **The key set reaches the term**: two key sets differing in one key are different terms (a toy row, decided), so the
+class is a function of the mask and one receipt covers it only because the mask is an input, as the position is. -/
+theorem mask_output_depends_on_keys :
+    maskOutput ⟨4, 4, 32, [true, false, true, true], 0, 0⟩ ≠ maskOutput ⟨4, 4, 32, [true, true, true, true], 0, 0⟩ := by
+  native_decide
 
 end BIK.Attn

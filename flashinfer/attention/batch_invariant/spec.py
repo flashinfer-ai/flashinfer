@@ -1,6 +1,13 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>``.
+"""Canonical dataflow of paged-KV attention: the classes ``attn.bf16.d<D>`` (causal) and ``attn.bf16.d<D>.mask`` (an explicit
+key set per row).
+
+The explicit-key-set class takes, per row, a set of visible keys over its request's keys ``[0, kv_len)`` as data (a custom
+attention mask): the tiles, the chunks, the online softmax and the merge are the same dataflow, a key outside the set is an absent
+leaf exactly as a key outside the causal range is, and a row whose set is empty outputs ``+0`` (``output_elem_or_zero``). The
+term of a row is a function of its own key set alone. A row whose set is the causal range ``[lo, p + 1)`` has the causal class's
+term (``RowSpec.keys`` only replaces where the visible keys come from).
 
 The class is stated for finite bf16 operands: a non-finite Q / K / V value, or scaled scores outside the binary32 range, give
 the NaN that fp32 softmax arithmetic gives (bit for bit, like every other value) and are not guarded against.
@@ -29,7 +36,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence
 
 from ...batch_invariant import canon
 from ...batch_invariant.fp_interface.term import to_f32
@@ -108,27 +115,53 @@ class RowSpec:
     p: int
     window_left: int = -1
     row: int = 0  # the row's identity in the leaf terms (query token / head index)
+    kv_len: Optional[int] = (
+        None  # the request's key count (the explicit-key-set class: the keys are a subset of [0, kv_len))
+    )
+    keys: Optional[FrozenSet[int]] = (
+        None  # the explicit-key-set class: the row's visible keys; ``p`` and ``window_left`` are then unused
+    )
+
+    def __post_init__(self) -> None:
+        if self.keys is not None:
+            assert self.kv_len is not None and self.kv_len >= 1, (
+                "a row with an explicit key set needs the request's kv_len (at least one key)"
+            )
+            assert all(0 <= k < self.kv_len for k in self.keys), (
+                "the key set is a subset of [0, kv_len)"
+            )
 
     @property
     def L(self) -> int:
+        if self.keys is not None:
+            assert self.kv_len is not None
+            return self.kv_len
         return self.p + 1
 
     @property
     def lo(self) -> int:
+        if self.keys is not None:
+            return 0
         return 0 if self.window_left < 0 else max(0, self.p - self.window_left)
 
     def visible(self, k: int) -> bool:
+        if self.keys is not None:
+            return k in self.keys
         return self.lo <= k < self.L
 
 
 def visible_keys(row: RowSpec, t: int, T: int = TILE_KEYS) -> List[int]:
     """The visible absolute keys of tile ``t`` for ``row`` (empty = the tile is absent)."""
     a, b = max(row.lo, t * T), min(row.L, (t + 1) * T)
+    if row.keys is not None:
+        return [k for k in range(a, b) if k in row.keys]
     return list(range(a, b)) if a < b else []
 
 
 def present_chunks(row: RowSpec, D: int) -> List[int]:
     C = chunk_len(D, row.L)
+    if row.keys is not None:
+        return sorted({k // C for k in row.keys})
     return list(range(row.lo // C, -(-row.L // C))) if row.lo < row.L else []
 
 
@@ -293,6 +326,17 @@ def output_elem(fp, st: State, out_fmt: str = "bf16"):
     return fp.cvt_out(fp.add(fp.mul(st.o, inv), fp.const(0.0)), out_fmt)
 
 
+def output_elem_or_zero(fp, st: Optional[State], out_fmt: str = "bf16"):
+    """The output element of the explicit-key-set class: ``output_elem`` of the row's state, or ``cvt(+0)`` for a row without a
+    visible key (``st`` is ``None``: no chunk is present, so there is no state to normalise). The rule is declared, not derived:
+    the init state's ``mul(+0, div(1, +0))`` would be a NaN. The kernels take it from the row's own ``l`` (``l == +0`` exactly
+    when no key of the row is visible: every present tile adds the probability of its maximum, ``ex2`` of a rounding
+    residual), replacing the reciprocal by ``+0``."""
+    if st is None:
+        return fp.cvt_out(fp.const(0.0), out_fmt)
+    return output_elem(fp, st, out_fmt)
+
+
 # ----------------------------------------------------------------------------- the reduction object
 
 
@@ -375,6 +419,8 @@ class AttentionSpec:
         return self.reduction(row, d).canonical(self.alg)
 
     def output(self, row: RowSpec, d: int) -> Term:
+        if row.keys is not None:
+            return output_elem_or_zero(self.alg, self.state(row, d), self.out_fmt)
         return output_elem(self.alg, self.state(row, d), self.out_fmt)
 
 
@@ -387,6 +433,52 @@ FINGERPRINT_D128 = "attn-bf16-d128-027b0379515b82e2"
 FINGERPRINT_D64 = "attn-bf16-d64-9a05233ec9351b0d"
 FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
+# the explicit-key-set class per head dim (``mask_fingerprint``); pinned by the same test
+MASK_FINGERPRINTS = {
+    64: "attn-bf16-d64-mask-a6c0fb6237f4f1da",
+    128: "attn-bf16-d128-mask-79713bfb8fb3c998",
+    256: "attn-bf16-d256-mask-f94e81a34c536168",
+}
+
+
+def sample_key_set(T: int = TILE_KEYS, C: int = CHUNK_LEN) -> FrozenSet[int]:
+    """The declared key set the explicit-key-set class's fingerprint is sampled on, over ``kv_len = C + T // 2 + 1`` keys: key ``k``
+    is visible unless ``k % 3 == 1`` or ``k`` lies in tile 1 -- masked leaves inside every other tile, a tile without a visible key
+    inside a chunk, the chunk merge with the init state and a partial last tile are all in the sample row's term."""
+    return frozenset(
+        k for k in range(C + T // 2 + 1) if k % 3 != 1 and not T <= k < 2 * T
+    )
+
+
+def mask_fingerprint(D: int = 128) -> str:
+    """Identifier of the explicit-key-set class at head dim ``D`` (``attn-bf16-d<D>-mask-*``): the digest of the terms of output
+    elements 0 and 1 of the row with the declared key set ``sample_key_set`` and of a row without a visible key, with ``D``, ``T``,
+    ``C`` and the mode. The key set is DATA of the class, like the KV position of the causal class: one class and one receipt
+    cover every mask, and the mask's values never enter the identifier. The class is distinct from the causal one as a function
+    (its rows take a key set where the causal rows take a position), and contains it: a row whose key set is ``[lo, p + 1)`` has
+    the causal row's term."""
+    key = (D, "mask")
+    if key not in _FINGERPRINTS:
+        from ...batch_invariant.fp_interface.term import fingerprint
+
+        spec = AttentionSpec(D)
+        kv_len = spec.C + spec.T // 2 + 1
+        row = RowSpec(p=0, kv_len=kv_len, keys=sample_key_set(spec.T, spec.C))
+        empty = RowSpec(p=0, kv_len=kv_len, keys=frozenset())
+        parts = [
+            f"D={D}",
+            f"T={spec.T}",
+            f"C={spec.C}",
+            "mask=explicit",
+            fingerprint(spec.output(row, 0)),
+            fingerprint(spec.output(row, 1)),
+            fingerprint(spec.output(empty, 0)),
+        ]
+        _FINGERPRINTS[key] = (
+            f"attn-bf16-d{D}-mask-"
+            + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        )
+    return _FINGERPRINTS[key]
 
 
 def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
