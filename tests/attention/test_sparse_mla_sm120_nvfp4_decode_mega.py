@@ -9,6 +9,7 @@ import torch
 from tests.attention.sparse_mla_prefill_utils import (
     decode_fixture,
     fixture,
+    fused_call,
     native_prefill_calls,
     numerical_metrics,
     poison_mega_destinations,
@@ -89,6 +90,47 @@ def test_nvfp4_decode_mega_query_alignment(tokens, chunks_per_block, offset):
         mega()
     poison_mega_destinations(f["out"], f["scales"], lse, expected[1])
     graph.replay()
+    for actual, reference in zip(
+        (f["out"].float(), f["scales"], lse), expected, strict=True
+    ):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "tokens,heads,topk,extra_topk",
+    [(7, 8, 128, 0), (14, 64, 512, 0), (7, 64, 128, 512), (14, 64, 128, 512)],
+)
+def test_nvfp4_public_run_mega_decode(tokens, heads, topk, extra_topk):
+    """Exercise wrapper-selected decode with single and dual caches."""
+    f = fixture(tokens, heads, "nvfp4", topk=topk, extra_topk=extra_topk)
+    f["lengths"][0][0] = 0
+    if extra_topk:
+        f["lengths"][1][0] = 0
+    out, scales, lse = f["baseline"]()
+    expected = out.float().clone(), scales.clone(), lse.clone()
+    actual_lse = fused_call(f)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_call(f)
+    poison_mega_destinations(out, scales, actual_lse, expected[1])
+    graph.replay()
+    for actual, reference in zip(
+        (out.float(), scales, actual_lse), expected, strict=True
+    ):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("tokens", [1, 14])
+def test_nvfp4_decode_mega_many_splits(tokens):
+    """The general merge reads more than one warp's worth of split LSEs."""
+    f = fixture(tokens, 64, "nvfp4", extra_topk=32 * 64, keep_decoded=False)
+    mega, baseline, lse = native_prefill_calls(
+        f, streaming_prefill=False, chunks_per_block=1
+    )
+    baseline()
+    expected = f["out"].float().clone(), f["scales"].clone(), lse.clone()
+    poison_mega_destinations(f["out"], f["scales"], lse, expected[1])
+    mega()
     for actual, reference in zip(
         (f["out"].float(), f["scales"], lse), expected, strict=True
     ):
