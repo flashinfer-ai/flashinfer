@@ -190,7 +190,10 @@ def test_incompatible_captured_target_declines_only_cute_variant():
 
         serve = importlib.import_module("flashinfer.norm.kernels.rmsnorm_serve_sm90")
         torch.cuda.set_device(int(sys.argv[1]))
-        assert norm._dsl_captured_arch() == 'sm_100a'
+        probe = norm._dsl_captured_arch
+        if probe is None or probe() is None:
+            sys.exit(77)  # This DSL installation has no captured-target probe.
+        assert probe() == 'sm_100a'
         # Use an auto-admitted shape so this exercises the architecture refusal.
         x = torch.randn(4, 2048, dtype=torch.bfloat16, device='cuda')
         w = torch.randn(2048, dtype=x.dtype, device=x.device)
@@ -213,11 +216,12 @@ def test_incompatible_captured_target_declines_only_cute_variant():
         assert serve._rmsnorm_serve_sm90_stats()['variant_dispatches']['cuda'] == 1
         """
     )
-    subprocess.run(
-        [sys.executable, "-c", script, str(torch.cuda.current_device())],
-        env=env,
-        check=True,
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(torch.cuda.current_device())], env=env
     )
+    if result.returncode == 77:
+        pytest.skip("installed DSL exposes no captured target")
+    result.check_returncode()
 
 
 def test_explicit_incumbent_backends_are_never_swapped():
@@ -303,16 +307,16 @@ def test_explicit_specialized_off_envelope_raises():
 def test_kill_switch_and_deprecated_alias_force_incumbent(env, value, monkeypatch):
     _sm90_or_skip()
     monkeypatch.setenv(VARIANT_ENV, "cuda")
-    if env == VARIANT_ENV and not serve._HAS_CUTE_DSL:
-        pytest.skip(
-            "deprecated alias selects default variant; auto bypasses consultation without DSL"
-        )
     x, w = _case()
     monkeypatch.setenv(env, value)
     y = flashinfer.norm.rmsnorm(x, w, backend="auto")
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
-    assert any("kill switch" in r for r in stats["fallback_reasons"]), stats
+    if flashinfer.norm._USE_CUDA_NORM:
+        assert stats["calls"] == 0 and not stats["fallback_reasons"], stats
+    else:
+        assert stats["calls"] == 1, stats
+        assert stats["fallback_reasons"] == {"auto: kill switch": 1}, stats
     assert _matched(y, _ref(x, w)) >= 0.999
     # explicit "specialized" under the kill switch raises (never falls back)
     with pytest.raises(NotImplementedError, match="never falls back"):
@@ -610,7 +614,10 @@ def test_explicit_pdl_preserved(monkeypatch, enable_pdl):
     assert not any(stats["backend_dispatches"].values())
 
 
-def test_cuda_specialist_import_does_not_require_cute_dsl():
+@pytest.mark.parametrize("submit", [False, True], ids=["import", "submit-sm90"])
+def test_cuda_specialist_does_not_require_cute_dsl(submit):
+    if submit:
+        _sm90_or_skip()
     code = """
 import importlib
 import importlib.abc
@@ -633,4 +640,24 @@ assert not serve._HAS_CUTE_DSL
 assert norm._try_rmsnorm_serve_sm90 is serve.try_rmsnorm_serve_sm90
 assert norm._USE_CUDA_NORM
 """
-    subprocess.run([sys.executable, "-c", code], check=True, timeout=60)
+    args = []
+    if submit:
+        args.append(str(torch.cuda.current_device()))
+        code += """
+import torch
+torch.cuda.set_device(int(sys.argv[1]))
+x = torch.randn((2, 2048), device='cuda', dtype=torch.bfloat16)
+w = torch.randn_like(x[0])
+xf = x.double()
+ref = (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6) * w).to(x.dtype)
+y = norm.rmsnorm(x, w, backend='specialized')
+assert serve._rmsnorm_serve_sm90_stats()['variant_dispatches'] == {'cuda': 1, 'cutedsl': 0}
+torch.testing.assert_close(y, ref, atol=0.01, rtol=0.02)
+"""
+    env = {**os.environ, VARIANT_ENV: "cuda", "FLASHINFER_USE_CUDA_NORM": "0"}
+    subprocess.run(
+        [sys.executable, "-c", code, *args],
+        env=env,
+        check=True,
+        timeout=600 if submit else 60,
+    )
