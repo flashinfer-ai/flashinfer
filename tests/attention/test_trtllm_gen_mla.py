@@ -2563,16 +2563,20 @@ def _blackwell_resident() -> int:
     return max(1, get_device_sm_count(torch.device("cuda")) // 2)
 
 
-def _skip_unless_splitkv_device(domain: str) -> None:
-    """Skip a split-KV case on a device ``_SPLITKV_RANGE`` does not list (there the
-    same request takes a value-split program)."""
-    from flashinfer.mla.cake_trtllm_mla_blackwell import _SPLITKV_RANGE, _device_facts
+def _list_splitkv_device(domain: str, monkeypatch) -> None:
+    """For a split-KV case, list the current device in ``_SPLITKV_RANGE`` as GB300
+    is listed (from max_seq_len 1025, up to 18 query rows), so the case reaches the
+    split-KV program of every Blackwell device, including the sm_100a build that no
+    device selects yet."""
+    from flashinfer.mla import cake_trtllm_mla_blackwell as module
 
-    if (
-        domain == "mla_bf16_splitkv"
-        and _device_facts(torch.cuda.current_device()) not in _SPLITKV_RANGE
-    ):
-        pytest.skip("the split-KV domain serves only the devices _SPLITKV_RANGE lists")
+    if domain != "mla_bf16_splitkv":
+        return
+    facts = module._device_facts(torch.cuda.current_device())
+    if facts not in module._SPLITKV_RANGE:
+        monkeypatch.setattr(
+            module, "_SPLITKV_RANGE", {**module._SPLITKV_RANGE, facts: (1025, 18)}
+        )
 
 
 def _blackwell_decode(query, kv_cache, block_tables, seq_lens, max_seq_len, **kwargs):
@@ -2848,7 +2852,9 @@ _PADDED_ROW_CASES = {
 
 
 @pytest.mark.parametrize("case", sorted(_PADDED_ROW_CASES))
-def test_trtllm_mla_blackwell_padded_rows_output_zero(case, blackwell_domains) -> None:
+def test_trtllm_mla_blackwell_padded_rows_output_zero(
+    case, blackwell_domains, monkeypatch
+) -> None:
     """Rows of KV length <= 0 output exact zeros (LSE -inf); live rows are unaffected.
 
     The output is NaN-filled before every call, so a padded row the route leaves
@@ -2859,7 +2865,7 @@ def test_trtllm_mla_blackwell_padded_rows_output_zero(case, blackwell_domains) -
     dtype, batch, q_len, page_size, sink, return_lse, max_len, domain = (
         _PADDED_ROW_CASES[case]
     )
-    _skip_unless_splitkv_device(domain)
+    _list_splitkv_device(domain, monkeypatch)
     kv_lens = _padded_kv_lens(batch, q_len, max_len)
     query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
         kv_lens, q_len, page_size, dtype
@@ -2928,7 +2934,7 @@ _GRAPH_CASES = {
 
 @pytest.mark.parametrize("case", sorted(_GRAPH_CASES))
 def test_trtllm_mla_blackwell_graph_replay_reads_current_rows(
-    case, blackwell_domains
+    case, blackwell_domains, monkeypatch
 ) -> None:
     """A graph captured once follows later in-place changes of seq_lens and block_tables.
 
@@ -2938,7 +2944,7 @@ def test_trtllm_mla_blackwell_graph_replay_reads_current_rows(
     _skip_unless_blackwell()
     dtype, batch, q_len, page_size, max_len = _GRAPH_CASES[case]
     if case.startswith("splitkv"):
-        _skip_unless_splitkv_device("mla_bf16_splitkv")
+        _list_splitkv_device("mla_bf16_splitkv", monkeypatch)
     width = max_len // page_size
     kv_lens = _padded_kv_lens(batch, q_len, max_len)
     query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
@@ -3068,7 +3074,7 @@ _SPLITKV_TABLE_WIDTH_CASES = {
 @pytest.mark.parametrize("width", [17, 19, 33, 34, 35, 37])
 @pytest.mark.parametrize("case", sorted(_SPLITKV_TABLE_WIDTH_CASES))
 def test_trtllm_mla_blackwell_splitkv_reads_no_page_id_past_the_table(
-    case, width, table_end, blackwell_domains
+    case, width, table_end, blackwell_domains, monkeypatch
 ) -> None:
     """The split-KV program reads page ids only inside the caller's table (see
     ``test_trtllm_mla_blackwell_reads_no_page_id_past_the_table``)."""
@@ -3076,10 +3082,77 @@ def test_trtllm_mla_blackwell_splitkv_reads_no_page_id_past_the_table(
     dtype, batch, q_len, page_size, domain = _SPLITKV_TABLE_WIDTH_CASES[case]
     if (page_size == 64) != (width < 32):
         pytest.skip("page 32 takes widths 33-37, page 64 widths 17 and 19")
-    _skip_unless_splitkv_device(domain)
+    _list_splitkv_device(domain, monkeypatch)
     _check_page_ids_inside_the_table(
         dtype, batch, q_len, page_size, domain, width, table_end, blackwell_domains
     )
+
+
+@pytest.mark.parametrize("table_end", ["poison", "allocation_end"])
+@pytest.mark.parametrize("case", sorted(_SPLITKV_TABLE_WIDTH_CASES))
+def test_trtllm_mla_blackwell_splitkv_clamps_rows_to_the_table(
+    case, table_end, blackwell_domains, monkeypatch
+) -> None:
+    """KV lengths past the caller's table width read no page id past the table.
+
+    The first and the last request are 300 keys longer than their table rows hold
+    (the last one ends at the table's allocation, or before poison entries naming a
+    NaN page). The split-KV program clamps every row's causal KV length to its table
+    row, so the output is finite and equals attention over the keys the table row
+    holds; the other rows are unchanged.
+    """
+    _skip_unless_blackwell()
+    dtype, _, q_len, page_size, domain = _SPLITKV_TABLE_WIDTH_CASES[case]
+    _list_splitkv_device(domain, monkeypatch)
+    width = 33 if page_size == 32 else 17
+    batch, capacity = 3, width * page_size
+    kv_lens = [capacity + 300, capacity - 7, capacity + 300]
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens,
+        q_len,
+        page_size,
+        dtype,
+        width=width,
+        trailing_poison=8 if table_end == "poison" else 0,
+    )
+    if table_end == "allocation_end":
+        assert block_tables.untyped_storage().nbytes() == block_tables.nbytes
+    output = _blackwell_decode(query, kv_cache, block_tables, seq_lens, max(kv_lens))
+    torch.cuda.synchronize()
+    assert bool(output.isfinite().all())
+    rows = [
+        (b, min(kv_len - q_len + index + 1, capacity))
+        for b, kv_len in enumerate(kv_lens)
+        for index in range(q_len)
+    ]
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    _assert_rows(output, reference, rows, dtype)
+    assert set(blackwell_domains) == {domain}
+
+
+@pytest.mark.parametrize("kv_len", [0, 500])
+def test_trtllm_mla_blackwell_splitkv_empty_table_outputs_zero(
+    kv_len, blackwell_domains, monkeypatch
+) -> None:
+    """A table of width 0 holds no key: every row outputs exact zeros and the
+    program reads no page id, whatever ``seq_lens`` claims."""
+    _skip_unless_blackwell()
+    _list_splitkv_device("mla_bf16_splitkv", monkeypatch)
+    batch, q_len, page_size = 2, 1, 32
+    query, kv_cache, _, _ = _blackwell_inputs(
+        [1] * batch, q_len, page_size, torch.bfloat16
+    )
+    block_tables = torch.empty((batch, 0), dtype=torch.int32, device="cuda")
+    seq_lens = torch.full((batch,), kv_len, dtype=torch.int32, device="cuda")
+    out = torch.full(
+        (batch, q_len, 128, 512), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    _blackwell_decode(query, kv_cache, block_tables, seq_lens, 2048, out=out)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.zeros_like(out))
+    assert set(blackwell_domains) == {"mla_bf16_splitkv"}
 
 
 @pytest.mark.parametrize("table_end", ["poison", "allocation_end"])
@@ -3328,18 +3401,19 @@ void write_after_spin_launch(torch::Tensor dst, torch::Tensor src, int64_t spin_
     ids=["clc_ordered", "clc_one_wave", "fp8_page64", "splitkv", "splitkv_page64"],
 )
 def test_trtllm_mla_blackwell_reads_rows_after_the_dependency_wait(
-    dtype, batch, q_len, page_size, max_len
+    dtype, batch, q_len, page_size, max_len, blackwell_domains, monkeypatch
 ) -> None:
     """The PDL programs read seq_lens only after their programmatic dependency wait.
 
     A predecessor that triggers its dependents at entry writes seq_lens 200 us later;
-    a program reading it earlier sees all requests empty and outputs zeros.  The
-    split-KV cases also check the reducer: it must not start before the mainloop's
-    partials are complete.
+    a program reading it earlier sees all requests empty and outputs zeros.  In the
+    split-KV cases (the mainloop and its PDL reducer) only the final output is
+    checked, so a reducer reading partials early is caught only when it changes
+    that output.
     """
     _skip_unless_blackwell()
     if max_len > 1024:
-        _skip_unless_splitkv_device("mla_bf16_splitkv")
+        _list_splitkv_device("mla_bf16_splitkv", monkeypatch)
     from torch.utils.cpp_extension import load_inline
 
     predecessor = load_inline(
@@ -3366,6 +3440,8 @@ def test_trtllm_mla_blackwell_reads_rows_after_the_dependency_wait(
         predecessor.write_after_spin_launch(stale, seq_lens, 200_000)
         output = _blackwell_decode(query, kv_cache, block_tables, stale, max_len)
         _assert_rows(output, reference, rows, dtype)
+    if max_len > 1024:
+        assert set(blackwell_domains) == {"mla_bf16_splitkv"}
 
 
 def test_trtllm_mla_blackwell_tail_guards_lengths_beyond_4096() -> None:

@@ -86,8 +86,9 @@ def _inputs(batch, q_len, page_size, max_seq_len, pattern, seed):
 
     ``pattern``: ``uniform`` (every request ``max_seq_len``), ``varied`` (half
     to all of ``max_seq_len``, the last request at ``max_seq_len``), ``padded``
-    (``varied`` with every third request at 0 and, with ``q_len > 1``, the next one
-    at 1: its first query row has no causal KV token), ``all_padded`` and
+    (``varied`` with every third request but the last at 0 and, with
+    ``q_len > 1``, the next one but the last at 1: its first query row has no
+    causal KV token; a single request stays live), ``all_padded`` and
     ``short`` (every request at most a quarter of ``max_seq_len``: most splits of
     a row are empty).
     """
@@ -119,9 +120,11 @@ def _inputs(batch, q_len, page_size, max_seq_len, pattern, seed):
         )
         seq_lens[-1] = max_seq_len
         if pattern == "padded":
-            seq_lens[::3] = 0
+            # The last request keeps max_seq_len: a padded call still has a row
+            # with every split busy.
+            seq_lens[:-1][::3] = 0
             if q_len > 1:
-                seq_lens[1::3] = 1
+                seq_lens[1:-1:3] = 1
         elif pattern == "all_padded":
             seq_lens.zero_()
     return (
@@ -352,6 +355,9 @@ def test_splitkv_is_deterministic(splitkv_device, splitkv_domains, case):
     query, kv_cache, block_tables, seq_lens = _inputs(
         batch, q_len, page_size, max_seq_len, "padded", 0
     )
+    # The request at max_seq_len is live: the bits compared cover every split.
+    assert int(seq_lens[-1]) == max_seq_len
+    assert bool((_row_lengths(seq_lens, q_len) > 0).any())
     sink = None
     if has_sink:
         generator = torch.Generator(device="cuda").manual_seed(7)

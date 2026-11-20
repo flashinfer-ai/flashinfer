@@ -534,6 +534,12 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_half_
                     arg_block_tables.size(1) == (int64_t)table_width,
                 ValueError)
       << "block_tables must have shape (" << num_rows / q_len << ", " << table_width << ")";
+  if (enable_sink != 0) {
+    // The reducer reads sinks[head] of all 128 heads.
+    check_dtype(arg_sinks, DLDataType{kDLFloat, 32, 1}, "sinks");
+    TVM_FFI_CHECK(arg_sinks.numel() >= 128, ValueError)
+        << "sinks numel " << arg_sinks.numel() << " < 128 heads with enable_sink";
+  }
   check_dtype(arg_output, DLDataType{kDLBfloat, 16, 1}, "output");
   TVM_FFI_CHECK(arg_output.numel() == (int64_t)num_rows * 128 * 512, ValueError)
       << "output numel " << arg_output.numel() << " != expected " << (int64_t)num_rows * 128 * 512;
