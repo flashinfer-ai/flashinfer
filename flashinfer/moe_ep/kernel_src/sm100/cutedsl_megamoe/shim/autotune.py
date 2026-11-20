@@ -44,6 +44,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invari
 from .tuner import (
     default_knobs,
     describe_invalid_knobs,
+    fit_bf16_mxfp8_stages,
     is_valid,
     is_valid_bf16,
     is_valid_bf16_for_config,
@@ -217,13 +218,15 @@ def bf16_mxfp8_candidates(
 ) -> List[Dict[str, Any]]:
     """Default BF16/MXFP8 candidate knob dicts (ikr x impl tuple x flag_batch x token-back).
 
-    Eighteen candidates: three legal implementation tuples (N128/tmem,
-    N256/smem, N256/tmem-overlap) x ``flag_batch`` {1, 4} x
+    Twenty-four candidates: four legal implementation tuples (N64/tmem,
+    N128/tmem, N256/smem, N256/tmem-overlap) x ``flag_batch`` {1, 4} x
     ``token_back_mode`` {``epi_warps``, ``reuse_dispatch_warps``}, with the
     dispatch-warp half also timing ``epi_flag_batch=(1, 1)`` (see
-    :func:`_bf16_mxfp8_epi_flag_batches`).  ``standalone_warps`` is
-    unsupported.
-    Enabling IKR doubles the number of candidates to 36.
+    :func:`_bf16_mxfp8_epi_flag_batches`).  The N128 tuple uses the
+    chunked/full-tile MMA issue with 6 weight and 5 activation stages; other
+    tuples use the calculated default activation depth.  ``standalone_warps``
+    is unsupported.
+    Enabling IKR doubles the number of candidates to 48.
     """
     if batch_invariant:
         from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
@@ -239,10 +242,19 @@ def bf16_mxfp8_candidates(
     out: List[Dict[str, Any]] = []
     impl_specs = (
         {
+            "mma_tiler_mnk": (256, 64, 128),
+            "transform_buffer": "tmem",
+            "accumulator_overlap": False,
+            "transform_k_tile": 128,
+        },
+        {
             "mma_tiler_mnk": (256, 128, 128),
             "transform_buffer": "tmem",
             "accumulator_overlap": False,
             "transform_k_tile": 128,
+            "runtime_mma_split": True,
+            "num_weight_stages": 6,
+            "num_activation_stages": 5,
         },
         {
             "mma_tiler_mnk": (256, 256, 128),
@@ -262,6 +274,7 @@ def bf16_mxfp8_candidates(
         "use_2cta_instrs": True,
         "group_hint": 512,
         "load_balance_mode": "static",
+        "direct_bf16_cvt": True,
     }
     for ikr in (False, True) if enable_in_kernel_fc2_reduce else (False,):
         for impl in impl_specs:
@@ -1017,10 +1030,15 @@ def autotune_bf16_mxfp8_mega_moe(
 
     cfg = frontend.config
     if candidates is None:
-        candidates = bf16_mxfp8_candidates(
-            enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
-            batch_invariant=cfg.batch_invariant,
-        )
+        candidates = [
+            fit_bf16_mxfp8_stages(
+                knobs, hidden=cfg.hidden, num_total_experts=cfg.num_total_experts
+            )
+            for knobs in bf16_mxfp8_candidates(
+                enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce,
+                batch_invariant=cfg.batch_invariant,
+            )
+        ]
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
         # Persist for future pure-lookup engine starts; rank 0 writes (the

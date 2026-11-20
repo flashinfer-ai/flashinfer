@@ -100,6 +100,29 @@ replace its own device snapshot.
   Shape-dependent arithmetic-padding and SMEM admission live in the shim
   and FlashInfer policy, outside the vendored device source.
 
+- **BF16xMXFP8 transform and MMA issue (local, 2026-11-09):**
+  `src/moe_mxfp8_bf16_glu/kernel_mxfp8_bf16_glu_fc12.py` adds
+  `direct_bf16_cvt` (direct E4M3x2->BF16x2 convert in the transform warps),
+  `runtime_mma_split` (N128 only: one N64 instruction for tiles of at most 64
+  valid tokens, one N128 instruction above that) and the
+  `((256, 64, 128), "tmem", False, 128)` implementation tuple;
+  `src/moe_mxfp8_bf16_glu/epilogue_mxfp8_bf16.py` stores FC1 hand-off rows in
+  the N128 block-swapped order, which FC2's N128 instruction undoes;
+  `num_weight_stages` decouples the raw weight/scale SMEM stages from the
+  transformed stages, and `megamoe_kernel_mxfp8_bf16.py` forwards the
+  arguments. All are bit-identical to the previous kernel.
+  Upstream candidate.
+
+- **BF16xMXFP8 B-stage count (`bangyus/cutedsl_megamoe!91`, 2026-11-09):**
+  `src/moe_mxfp8_bf16_glu/kernel_mxfp8_bf16_glu_fc12.py` raises the default
+  `"b"` pipeline depth from 2 to 4 (3 for the N256/`smem` implementation, whose
+  4-stage launch exceeds the SM100 shared-memory limit) and adds an optional
+  `num_activation_stages` constructor argument (2 up to that per-implementation
+  maximum) that overrides it. `src/moe_mxfp8_bf16_glu/megamoe_kernel_mxfp8_bf16.py` also
+  forwards the argument (not in the MR) so `MegaMoEBf16Mxfp8Config` can expose
+  it as `num_activation_stages` (default `None`: per-implementation depth).
+  Drop once the MR merges and the tree re-syncs past it.
+
 - **Sparse decode (FlashInfer PR #6447 / #6565, 2026-10-14):** re-ported onto
   this drop in four device files. `src/src/token_comm.py` gives CTA0 ownership
   of small shared reset prefixes (EP1, prefixes above 16 KiB and NCU keep the

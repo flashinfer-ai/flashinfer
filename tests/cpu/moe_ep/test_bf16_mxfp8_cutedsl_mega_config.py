@@ -33,6 +33,7 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
 )
 
 _LEGAL_IMPLS = {
+    ((256, 64, 128), "tmem", False, 128),
     ((256, 128, 128), "tmem", False, 128),
     ((256, 256, 128), "smem", False, 128),
     ((256, 256, 128), "tmem", True, 64),
@@ -66,6 +67,14 @@ def _impl_key(knobs):
 def test_mixed_knobs_and_candidates():
     knobs = default_knobs(256, dtype="bf16_mxfp8")
     assert is_valid_bf16_mxfp8(knobs)
+    assert knobs["load_balance_mode"] == "static"
+    for experts_per_rank, mode in ((4, "static"), (16, "atomic_counter")):
+        assert (
+            default_knobs(256, dtype="bf16_mxfp8", experts_per_rank=experts_per_rank)[
+                "load_balance_mode"
+            ]
+            == mode
+        )
     assert is_valid_bf16_mxfp8(
         {
             **knobs,
@@ -73,6 +82,9 @@ def test_mixed_knobs_and_candidates():
             "transform_buffer": "smem",
             "accumulator_overlap": False,
             "transform_k_tile": 128,
+            "num_weight_stages": None,
+            "num_activation_stages": None,
+            "runtime_mma_split": False,
         }
     )
     assert not is_valid_bf16_mxfp8({**knobs, "mma_tiler_mnk": (256, 256, 128)})
@@ -88,7 +100,31 @@ def test_mixed_knobs_and_candidates():
         )
 
     candidates = bf16_mxfp8_candidates()
-    assert len(candidates) == 18
+    assert len(candidates) == 24
+    smem_n256 = {
+        "mma_tiler_mnk": (256, 256, 128),
+        "transform_buffer": "smem",
+        "accumulator_overlap": False,
+        "transform_k_tile": 128,
+        "hidden": 4096,
+        "num_total_experts": 256,
+    }
+    assert is_valid_bf16_mxfp8({**smem_n256, "num_activation_stages": 3})
+    assert not is_valid_bf16_mxfp8({**smem_n256, "num_activation_stages": 4})
+    # The dispatch buffer grows with hidden: w6a5 fits H4096 but not H7168.
+    assert is_valid_bf16_mxfp8({**knobs, "hidden": 4096, "num_total_experts": 512})
+    assert not is_valid_bf16_mxfp8(
+        {**knobs, "num_activation_stages": 6, "hidden": 4096, "num_total_experts": 512}
+    )
+    assert not is_valid_bf16_mxfp8({**knobs, "hidden": 7168, "num_total_experts": 384})
+    fitted = default_knobs(256, dtype="bf16_mxfp8", hidden=7168, num_total_experts=384)
+    assert (fitted["num_weight_stages"], fitted["num_activation_stages"]) == (5, 5)
+    assert (
+        default_knobs(256, dtype="bf16_mxfp8", hidden=4096, num_total_experts=512)
+        == knobs
+    )
+    assert not is_valid_bf16_mxfp8({**knobs, "num_activation_stages": 1})
+    assert {c.get("num_activation_stages") for c in candidates} == {None, 5}
     assert all(is_valid_bf16_mxfp8(c) for c in candidates)
     assert {_impl_key(c) for c in candidates} == _LEGAL_IMPLS
     assert {c["token_back_mode"] for c in candidates} == {
@@ -100,13 +136,36 @@ def test_mixed_knobs_and_candidates():
     # Permitting ikr adds it as a sweep axis: the deterministic half stays,
     # and stays first so --max-candidates truncates to it.
     permitted = bf16_mxfp8_candidates(enable_in_kernel_fc2_reduce=True)
-    assert len(permitted) == 36
-    assert permitted[:18] == candidates
-    assert all(c["in_kernel_fc2_reduce"] is True for c in permitted[18:])
+    assert len(permitted) == 48
+    assert permitted[:24] == candidates
+    assert all(c["in_kernel_fc2_reduce"] is True for c in permitted[24:])
+
+    assert not is_valid_bf16_mxfp8(
+        {
+            **knobs,
+            "mma_tiler_mnk": (256, 256, 128),
+            "transform_buffer": "tmem",
+            "accumulator_overlap": True,
+            "transform_k_tile": 64,
+            "num_activation_stages": None,
+            "runtime_mma_split": True,
+        }
+    )
+    assert not is_valid_bf16_mxfp8(
+        {
+            **knobs,
+            "mma_tiler_mnk": (256, 256, 128),
+            "transform_buffer": "smem",
+        }
+    )
 
     frontend = MegaMoEBf16Mxfp8Frontend(_config())
     frontend.apply_knobs(knobs)
-    assert frontend.config == _config()
+    assert frontend.config == _config(
+        runtime_mma_split=True,
+        num_weight_stages=6,
+        num_activation_stages=5,
+    )
 
 
 @pytest.mark.cpu_only

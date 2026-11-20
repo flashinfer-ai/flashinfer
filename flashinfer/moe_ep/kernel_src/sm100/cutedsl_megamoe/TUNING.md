@@ -433,6 +433,9 @@ workaround; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
   dispatch-warp half also timing `epi_flag_batch=(1, 1)` (18 candidates, or
   36 when ikr is permitted; per-size winners above are the measured starting
   point).
+  `runtime_mma_split` (N128 only, on in the default knobs): uses an N64 MMA
+  instead of N128 when the selected expert's tokens do not fill the tile
+  (at most 64 valid tokens).
 - Backend configs (`Nvfp4/Mxfp8/Bf16/Bf16_Mxfp8 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
