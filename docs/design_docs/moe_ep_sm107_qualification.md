@@ -143,6 +143,14 @@ tensors must have the stated dtype; explicitly reinterpret raw scale bytes
 with `.view(dtype)` first. Do not pass already interleaved/swizzled tensors
 through this canonical ingestion path; those belong in `transformed_weights`.
 
+`layer.get_transformed_weights()` returns writable aliases of the actual prepared
+weight and scale tensors, in the backend's runtime layout. Serving frameworks
+can register per-expert views of these tensors for EPLB. Migrate both projections
+and both scale tensors together, plus separately supplied per-expert normalization
+state when present. The caller owns logical-to-physical routing and must finish
+old readers and transfers before switching placement. In-place updates retain
+captured bindings when addresses, physical capacity, and EP membership stay fixed.
+
 Select the mixed format with `Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig`.
 The backend name lists activation, weight, and output formats in that order;
 the upstream quantization tag is `mxfp4_mxfp8`. Both FC1 inputs and the
@@ -304,3 +312,36 @@ Engine integration and whole-model serving benchmarks are separate follow-ups.
 
 Device-kernel fixes belong in the upstream kernel repository. Re-export them
 and update `VENDOR.md`; keep `kernel_src/**/src/` byte-identical to that export.
+
+## Distributed tests and caller-managed expert placement
+
+`tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py` runs the same
+format and configuration matrix at EP2, EP4, EP8, EP16 and EP32. Its expert bank
+grows when needed to give every rank physical expert slots. The suite covers
+changing live counts, empty ranks, pooled graphs, masked routing and captured
+expert updates. The expert-update test uses the same 64-slot bank at every
+width and checks both standard and GenPhase kernels.
+
+Use `torchrun` with one process per GPU, matching the total EP width. Every GPU
+must belong to one verified NVLink direct-access domain. The graph/epoch suite
+in `test_sm107_routing_graph_multirank.py` also accepts these widths. EP16/32
+runs remain optional and do not add a mandatory 32-GPU CI job.
+
+Expert placement and replication policy belong to the caller. Route IDs name
+physical slots, with the same contiguous number of slots owned by each rank;
+include replicas in `num_experts`. The caller can supply final backend-layout
+weights through `MegaConfig.transformed_weights`. Preserve the tensor addresses,
+shapes, strides, dtypes and owners across graph replays. Update both packed
+payloads and scales, plus format-specific scalar inputs where applicable.
+Changing the original checkpoint after preprocessing does not update these
+transformed tensors.
+
+Complete previous executions before reusing slots. Order weight, scale and route
+updates before the next replay, and coordinate the placement change across ranks
+before entering the next collective. Keep the layer, workspace, captured inputs
+and transformed weights alive through the final replay. The placement test
+checks MXFP4 weights/MXFP8 activations with both standard and GenPhase kernels:
+it installs replicas, remaps part of the routing to them, then changes replica
+weights while preserving unaffected rows. This validates the storage/routing
+contract; transport of expert weights and serving-framework policy are caller
+responsibilities.

@@ -23,7 +23,7 @@ from __future__ import annotations
 import functools
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .generator import Knobs, enumerate_space
 from .spec import (
@@ -121,7 +121,7 @@ def register_capacity(family: str, sm_count: int, size: int, clusters: int) -> N
     if cap.get(size) == clusters:
         return  # nothing the ranking depends on changed: the cached rankings stay
     cap[size] = clusters
-    rank.cache_clear()
+    clear_rank_cache()
 
 
 # the L2 sizes devices reported at run time, keyed like the capacities
@@ -144,7 +144,7 @@ def register_l2(family: str, sm_count: int, l2_bytes: float) -> None:
     if _QUERIED_L2.get((family, sm_count)) == float(l2_bytes):
         return  # unchanged: the cached rankings stay
     _QUERIED_L2[(family, sm_count)] = float(l2_bytes)
-    rank.cache_clear()
+    clear_rank_cache()
 
 
 # ----------------------------------------------------------------------------- the estimate
@@ -511,6 +511,27 @@ def rank(
     scored.sort(key=lambda t: (t[0], t[1]))
     out = tuple((k, float(t)) for t, _, k in scored)
     return out[:topk] if topk else out
+
+
+# the memos built on a ranking (`schedule.default_config`'s pick, `schedule.rank_topk`'s list) are cleared with it, so a
+# device's registered numbers invalidate them the way they invalidate the rankings
+_RANK_DEPENDENT_CACHES: List[Callable[[], None]] = []
+_rank_cache_clear = rank.cache_clear
+
+
+def clear_rank_cache() -> None:
+    """Forget every cached ranking and every memo built on one."""
+    _rank_cache_clear()
+    for clear in _RANK_DEPENDENT_CACHES:
+        clear()
+
+
+def on_rank_cache_clear(clear: Callable[[], None]) -> None:
+    """Register a memo's ``cache_clear`` to run whenever the rankings are forgotten (``rank.cache_clear()`` included)."""
+    _RANK_DEPENDENT_CACHES.append(clear)
+
+
+rank.cache_clear = clear_rank_cache  # type: ignore[method-assign]
 
 
 def best_record(

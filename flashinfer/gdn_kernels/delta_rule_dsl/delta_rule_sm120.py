@@ -6,6 +6,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import warp, warpgroup, cpasync
+from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
 from ...utils import get_device_sm_count, _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
@@ -16,7 +17,13 @@ from .custom_compile_cache import (
     sm12x_compile_options,
 )
 from .collective_inverse_hmma import CollectiveInverse
-from .helpers import SM80, round_down, state_dtype_to_cutlass
+from .helpers import (
+    SM80,
+    round_down,
+    smid,
+    state_dtype_to_cutlass,
+    tensormap_replace_global_dim_1,
+)
 from .schedule import WorkDesc
 from .varlen_helper import (
     check_checkpoint_key_range,
@@ -583,6 +590,70 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         cute.arch.fence_view_async_shared()
 
     # ─── TMA load helpers ────────────────────────────────────────────────────
+    # The last K and V tiles of a sequence whose length is not a multiple of
+    # BLK_KV also cover the rows after the sequence end: the next sequence's
+    # first tokens, or rows past cu_seqlens[-1]. The math warps mask their
+    # scores, but 0 * NaN is NaN in the products with V and K, so a non-finite
+    # value there would reach this sequence's output and final state. Those
+    # two tiles are loaded through tail descriptors: the base descriptors
+    # with the token extent cut to the sequence end, as the O store does for
+    # its tail (CollectiveStoreTma). TMA writes zeros into the rows past the
+    # end and still delivers the full tile, so the expected transaction count
+    # is unchanged. The descriptors live in two 128-byte slots per SM (K, V),
+    # which relies on one CTA per SM, as the O tail slot does.
+
+    @cute.jit
+    def create_load_tail_tensormaps(
+        self,
+        tma_atom_k: cute.CopyAtom,
+        tma_atom_v: cute.CopyAtom,
+        k_tail_ptr: cute.Pointer,
+        v_tail_ptr: cute.Pointer,
+        tok_end: cutlass.Int32,
+    ):
+        # The steps of CollectiveStoreTma.create_tensormap_for_tail, plus the
+        # acquires. As for O, global dimension 1 of the K and V descriptors
+        # is the token: all three are (D, total_seqlen, H) views whose smem
+        # tiles hold a D chunk innermost, then the tokens. One elected lane
+        # copies and edits both descriptors, so one warp sync before the
+        # release suffices. The acquires come after the release and before
+        # the tail loads (tma_load_tile).
+        with cute.arch.elect_one():
+            cpasync.copy_tensormap(tma_atom_k, k_tail_ptr)
+            cpasync.copy_tensormap(tma_atom_v, v_tail_ptr)
+            tensormap_replace_global_dim_1(k_tail_ptr, tok_end)
+            tensormap_replace_global_dim_1(v_tail_ptr, tok_end)
+        cute.arch.sync_warp()
+        cpasync.fence_tma_desc_release()
+        cpasync.fence_tma_desc_acquire(k_tail_ptr)
+        cpasync.fence_tma_desc_acquire(v_tail_ptr)
+
+    @cute.jit
+    def tma_load_tile(
+        self,
+        tma_atom: cute.CopyAtom,
+        src: cute.Tensor,
+        dst: cute.Tensor,
+        tma_bar_ptr: cute.Pointer,
+        is_tail,
+        tail_tensormap_ptr: cute.Pointer,
+    ):
+        # The tail descriptor (a slot from create_load_tail_tensormaps) for
+        # the last block of an unaligned sequence, else the base descriptor.
+        manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
+        tail_desc_ptr = manager.get_tensormap_ptr(
+            tail_tensormap_ptr, cute.AddressSpace.generic
+        )
+        if is_tail:
+            cute.copy(
+                tma_atom,
+                src,
+                dst,
+                tma_bar_ptr=tma_bar_ptr,
+                tma_desc_ptr=tail_desc_ptr,
+            )
+        else:
+            cute.copy(tma_atom, src, dst, tma_bar_ptr=tma_bar_ptr)
 
     @cute.jit
     def load_qkv_tma(
@@ -607,8 +678,25 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
+        tok_end: cutlass.Int32,
+        k_tail_tensormap_ptr: cute.Pointer,
+        v_tail_tensormap_ptr: cute.Pointer,
     ):
         blk_tok = tok_start + blk * cutlass.Int32(self.BLK_KV)
+        # Only the last block of a sequence whose length is not a multiple of
+        # BLK_KV ends past tok_end. Its K and V tiles go through the tail
+        # descriptors, written here: with two or more blocks, while the math
+        # warps work on the earlier blocks; with one block, before the only
+        # load.
+        is_tail = cutlass.Int32(blk_tok) > tok_end - cutlass.Int32(self.BLK_KV)
+        if is_tail:
+            self.create_load_tail_tensormaps(
+                tma_atom_k,
+                tma_atom_v,
+                k_tail_tensormap_ptr,
+                v_tail_tensormap_ptr,
+                tok_end,
+            )
 
         sK = sK_DS[None, None, k_producer_state.index]
         mK = cute.domain_offset(
@@ -626,11 +714,13 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             cute.group_modes(gK, 0, 2),
         )
         k_pipeline.producer_acquire(k_producer_state)
-        cute.copy(
+        self.tma_load_tile(
             tma_atom_k,
             tKgK,
             tKsK,
-            tma_bar_ptr=k_pipeline.producer_get_barrier(k_producer_state),
+            k_pipeline.producer_get_barrier(k_producer_state),
+            is_tail,
+            k_tail_tensormap_ptr,
         )
         k_pipeline.producer_commit(k_producer_state)
         k_producer_state.advance()
@@ -676,11 +766,13 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             cute.group_modes(gV, 0, 2),
         )
         v_pipeline.producer_acquire(v_producer_state)
-        cute.copy(
+        self.tma_load_tile(
             tma_atom_v,
             tVgV,
             tVsV,
-            tma_bar_ptr=v_pipeline.producer_get_barrier(v_producer_state),
+            v_pipeline.producer_get_barrier(v_producer_state),
+            is_tail,
+            v_tail_tensormap_ptr,
         )
         v_pipeline.producer_commit(v_producer_state)
         v_producer_state.advance()
@@ -1586,6 +1678,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
+        tok_end,
+        g_load_tensormaps: cute.Tensor,
     ):
         q_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.q_stage
@@ -1596,6 +1690,18 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         v_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.v_stage
         )
+        # This SM's K and V tail descriptor slots (see load_qkv_tma). %smid
+        # is read once, so the writes, the fences and the loads address the
+        # same slots.
+        manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
+        slot = smid() * cutlass.Int32(256)
+        k_tail_tensormap_ptr = manager.get_tensormap_ptr(
+            g_load_tensormaps.iterator + slot
+        )
+        v_tail_tensormap_ptr = manager.get_tensormap_ptr(
+            g_load_tensormaps.iterator + (slot + cutlass.Int32(128))
+        )
+        tok_end_i32 = cutlass.Int32(tok_end)
         for blk in cutlass.range(num_blocks, unroll=1):
             (
                 q_producer_state,
@@ -1622,6 +1728,9 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 q_head_idx,
                 k_head_idx,
                 v_head_idx,
+                tok_end_i32,
+                k_tail_tensormap_ptr,
+                v_tail_tensormap_ptr,
             )
 
     @cute.jit
@@ -2220,6 +2329,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
+        g_load_tensormaps: cute.Tensor,
         cu_seqlens: cute.Tensor,
         scale: cutlass.Float32,
         num_q_heads: cutlass.Int32,
@@ -2387,6 +2497,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             g_state_checkpoints,
             checkpoint_cu_starts,
             g_tensormaps,
+            g_load_tensormaps,
             cu_seqlens,
             scale,
             num_q_heads,
@@ -2427,6 +2538,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
+        g_load_tensormaps: cute.Tensor,
         cu_seqlens: cute.Tensor,
         scale: cutlass.Float32,
         num_q_heads: cutlass.Int32,
@@ -2646,6 +2758,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                     work_desc.q_head_idx(),
                     work_desc.k_head_idx(num_q_heads, num_v_heads),
                     work_desc.v_head_idx(),
+                    tok_end,
+                    g_load_tensormaps,
                 )
             elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
                 if cutlass.const_expr(self.use_prefix_lens):
@@ -2978,6 +3092,11 @@ def delta_rule_prefill_dsl(
 
     workspace_size = get_device_sm_count(device) * 128
     tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, device)
+    # The K and V tail descriptors of the load warp: two 128-byte slots per
+    # SM (see create_load_tail_tensormaps).
+    load_tensormaps_t = _get_cache_buf(
+        "gdn_prefill_load_tensormaps", 2 * workspace_size, device
+    )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
     delta_rule_kernel = _get_prefill_kernel(
@@ -3070,6 +3189,7 @@ def delta_rule_prefill_dsl(
                 else None
             ),
             from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(load_tensormaps_t, assumed_align=128).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
             cutlass.Float32(scale),
             cutlass.Int32(num_q_heads),
@@ -3112,6 +3232,7 @@ def delta_rule_prefill_dsl(
         checkpoints_arg,
         checkpoint_cu_starts if needs_checkpointing else None,
         tensormaps_t,
+        load_tensormaps_t,
         cu_seqlens,
         scale,
         num_q_heads,

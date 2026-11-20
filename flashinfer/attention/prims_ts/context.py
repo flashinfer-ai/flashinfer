@@ -430,6 +430,41 @@ def _validate_compact(tensor: torch.Tensor, name: str, layout: str) -> None:
         )
 
 
+def _validate_value_layout(v: torch.Tensor) -> None:
+    """Validate compact V heads/features with aligned, nonoverlapping rows."""
+
+    head_dim = int(v.shape[-1])
+    row_elements = int(v.shape[-2]) * head_dim
+    if v.stride()[-2:] != (head_dim, 1):
+        raise ValueError("v must have compact head and feature strides (D, 1)")
+    token_stride = v.stride(-3)
+    if token_stride < row_elements:
+        raise ValueError("v token stride must not overlap adjacent token rows")
+    if token_stride * v.element_size() % 16:
+        raise ValueError("v token stride must be 16-byte aligned")
+    if v.ndim == 4:
+        batch_span = (int(v.shape[1]) - 1) * token_stride + row_elements
+        if v.stride(0) < batch_span:
+            raise ValueError("v batch stride must not overlap adjacent batches")
+        if v.stride(0) * v.element_size() % 16:
+            raise ValueError("v batch stride must be 16-byte aligned")
+
+
+def _make_context_value_fake(dtype, shape):
+    """Use one compiled V layout for compact and row-padded runtime tensors."""
+
+    import cutlass.cute as cute
+
+    alignment = 128 // dtype.width
+    outer_strides = tuple(cute.sym_int64(divisibility=alignment) for _ in shape[:-2])
+    return cute.runtime.make_fake_tensor(
+        dtype,
+        shape,
+        stride=(*outer_strides, shape[-1], 1),
+        assumed_align=16,
+    )
+
+
 def _validate_alignment(tensor: torch.Tensor, name: str, alignment: int) -> None:
     if tensor.data_ptr() % alignment != 0:
         raise ValueError(f"{name} data pointer must be {alignment}-byte aligned")
@@ -1245,7 +1280,7 @@ def _resolve_geometry(
         _validate_padded_data_extent(total_k, "total_k")
         _validate_compact(q, "q", "[total_q, Hq, D]")
         _validate_compact(k, "k", "[total_k, Hkv, D]")
-        _validate_compact(v, "v", "[total_k, Hkv, D]")
+        _validate_value_layout(v)
         assert qo_indptr is not None and kv_indptr is not None
         _validate_indptr_tensor(qo_indptr, "qo_indptr", device=device)
         _validate_indptr_tensor(kv_indptr, "kv_indptr", device=device)
@@ -1283,7 +1318,7 @@ def _resolve_geometry(
         _validate_padded_data_extent(total_k, "B * seq_len_k")
         _validate_compact(q, "q", "[B, Sq, Hq, D]")
         _validate_compact(k, "k", "[B, Sk, Hkv, D]")
-        _validate_compact(v, "v", "[B, Sk, Hkv, D]")
+        _validate_value_layout(v)
         q_lengths = (max_q_len,) * batch_size
         k_lengths = (max_seq_len_k,) * batch_size
         q_shape = tuple(q.shape)
@@ -1459,11 +1494,6 @@ def _resolve_context_plan_geometry(
     )
     if sage is not None:
         _validate_context_sage_config(geometry, sage)
-    elif qk_dtype == torch.int8:
-        raise NotImplementedError(
-            "int8 Q/K require a Sage recipe (sage=SageAttentionConfig(...)) that "
-            "dequantizes them"
-        )
     # The recipe is rejected before the device, as in block-sparse plans.
     _validate_int8_qk_device(qk_dtype, device_index)
     return geometry
@@ -1722,7 +1752,10 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     # tile-mean ring and row-sum operands leave room for one K/V stage per CTA
     # at one CTA and three in the halved form. The VC tail needs two.
     # VC-Attention-QK8 keeps the E4M3 K ring and follows the device default.
-    vc_qk16 = geometry.vc is not None and geometry.qk_dtype != torch.float8_e4m3fn
+    vc_qk16 = geometry.vc is not None and geometry.qk_dtype not in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    )
     two_cta = _default_two_cta_umma(
         geometry.device_index, geometry.qk_dtype.itemsize * 8
     )
@@ -2025,7 +2058,7 @@ def _get_compiled_context(
     two_cta_umma = compile_spec.two_cta_umma
     vc_attention = compile_spec.vc is not None
     sage_scale_layout = compile_spec.sage_scale_layout
-    vc_qk8 = vc_attention and qk_dtype_key == "float8_e4m3fn"
+    vc_qk8 = vc_attention and qk_dtype_key in ("float8_e4m3fn", "int8")
 
     import cutlass
     import cutlass.cute as cute
@@ -2231,7 +2264,7 @@ def _get_compiled_context(
         kv_indptr_shape = (1,)
     q_fake = fake_compact(qk_data_dtype, q_shape, 16)
     k_fake = fake_compact(qk_data_dtype, kv_shape, 16)
-    v_fake = fake_compact(input_pv_dtype, (*kv_shape[:-1], head_dim_vo), 16)
+    v_fake = _make_context_value_fake(input_pv_dtype, (*kv_shape[:-1], head_dim_vo))
     out_fake = fake_compact(out_dtype, out_shape, 16)
     lse_fake = (
         fake_compact(cutlass.Float32, out_fake.shape[:-1], 4)
@@ -2280,7 +2313,7 @@ def _get_compiled_context(
             head_dim=head_dim_vo or head_dim,
             seq_len_q=max_q_len,
             num_qo_heads=num_qo_heads,
-            qk_fp8=vc_qk8,
+            qk_quant=vc_qk8,
         )
         if compile_spec.vc.demean:
             vc_mu_fake = fake_compact(cutlass.BFloat16, vc_shapes["tile_means"], 16)
@@ -2741,7 +2774,7 @@ def _validate_runtime_inputs(
                     )
         _validate_compact(q, "q", "[total_q, Hq, D]")
         _validate_compact(k, "k", "[total_k, Hkv, D]")
-        _validate_compact(v, "v", "[total_k, Hkv, D]")
+        _validate_value_layout(v)
         return max(q_lengths), max(k_lengths)
     else:
         if qo_indptr is not None or kv_indptr is not None:
@@ -2768,7 +2801,7 @@ def _validate_runtime_inputs(
             )
         _validate_compact(q, "q", "[B, Sq, Hq, D]")
         _validate_compact(k, "k", "[B, Sk, Hkv, D]")
-        _validate_compact(v, "v", "[B, Sk, Hkv, D]")
+        _validate_value_layout(v)
         return int(q.shape[1]), geometry.max_seq_len_k
 
 
@@ -2977,6 +3010,9 @@ class BatchPrefillTSWrapper:
     run() accepts fixed BSHD or packed THD Q/K/V. Plan owns model defaults and
     variable-window fallback metadata, while every run supplies request tensors.
     Supports equal D128/D192/D256 or contiguous non-absorbed MLA QK192/V128 geometry.
+    Q/K/O are compact. V has compact heads/features, with 16-byte-aligned,
+    nonoverlapping token and optional batch strides supplied at runtime.
+    Compact and row-padded V share the same plan and compiled kernel.
     Dense fixed D128 Sage plans bind prepared per-block/channel scale tensors.
     Replanning invalidates graphs; complete prior launches and replays first.
     VC plans also own a refreshed per-channel output-scale buffer; their runs
@@ -3016,7 +3052,7 @@ class BatchPrefillTSWrapper:
         """Select/cache one execution policy, obtain compiled kernels, and bind resources.
 
         ``vc_config`` selects a VC-Attention recipe and the planned Q/K dtype
-        picks its Q/K side. bf16 Q/K runs VC-Attention-QK16 and E4M3
+        picks its Q/K side. bf16 Q/K runs VC-Attention-QK16 and E4M3 or INT8
         Q/K runs VC-Attention-QK8, whose Hadamard-rotated, per-block scaled Q
         and K need ``vc.q_scale`` and ``vc.k_scale`` on every :meth:`run`. V is
         E4M3 in both, stored as per-128-token-tile residuals whose bf16 tile
@@ -3047,7 +3083,7 @@ class BatchPrefillTSWrapper:
             raise TypeError("use_attention_sinks must be a bool")
         if out_dtype is not None:
             resolved_out_dtype = out_dtype
-        elif sage is not None or q_dtype == torch.float8_e8m0fnu:
+        elif sage is not None or q_dtype in (torch.float8_e8m0fnu, torch.int8):
             # As in block-sparse Sage plans; an 8-bit output is not a recipe, and
             # the MXFP8 token is a scale dtype, not an output dtype.
             resolved_out_dtype = torch.bfloat16
@@ -3055,8 +3091,8 @@ class BatchPrefillTSWrapper:
             resolved_out_dtype = q_dtype
         if v_dtype is not None:
             resolved_v_dtype = v_dtype
-        elif k_dtype == torch.float8_e8m0fnu:
-            # MXFP8 Q/K keeps E4M3 V.
+        elif k_dtype in (torch.float8_e8m0fnu, torch.int8):
+            # MXFP8 and INT8 Q/K keep E4M3 V.
             resolved_v_dtype = torch.float8_e4m3fn
         else:
             resolved_v_dtype = k_dtype
@@ -3064,6 +3100,12 @@ class BatchPrefillTSWrapper:
             raise NotImplementedError(
                 "attention-ts context requires Q and K to use the same dtype; "
                 f"got q_dtype={q_dtype} and k_dtype={k_dtype}"
+            )
+        if k_dtype == torch.int8 and sage is None and vc_config is None:
+            raise NotImplementedError(
+                "int8 Q/K require a Sage recipe (sage=SageAttentionConfig(...)) or a "
+                "VC-Attention recipe (vc_config=VCAttentionConfig(...)) that "
+                "dequantizes them"
             )
         geometry = _resolve_context_plan_geometry(
             device=device,
@@ -3135,7 +3177,7 @@ class BatchPrefillTSWrapper:
                 head_dim=geometry.head_dim_vo or geometry.head_dim,
                 seq_len_q=geometry.max_q_len,
                 num_qo_heads=geometry.num_qo_heads,
-                qk_fp8=geometry.qk_dtype == torch.float8_e4m3fn,
+                qk_quant=geometry.qk_dtype in (torch.float8_e4m3fn, torch.int8),
             )
         sage_state = (
             _build_context_sage_state(geometry) if geometry.sage is not None else None
@@ -3195,6 +3237,8 @@ class BatchPrefillTSWrapper:
 
         Uses the policy and compiled kernels prepared by plan(). Batch and query
         shape must match that plan; live K/V lengths stay within its capacity.
+        Q/K are compact; V may have padding between token rows and batches,
+        with compact heads/features and 16-byte-aligned strides.
         Supply output/LSE buffers and validate=False during graph capture, and
         retain the wrapper and captured buffers for every replay.
 
@@ -3202,6 +3246,10 @@ class BatchPrefillTSWrapper:
         with the query shape minus its final dimension. return_lse controls tuple
         return only; an omitted enabled buffer is allocated. Output/LSE/workspace must
         be disjoint from inputs and live buffers. One wrapper serves one ordered lane.
+
+        Ordinary dense plans with LSE enabled write zero output and -inf LSE for
+        empty K/V requests. Packed storage must contain at least one physical
+        K/V token; empty requests are represented by equal adjacent KV offsets.
 
         max_q_len/max_kv_len are launch bounds within plan capacities.
         Validation infers omitted values from existing metadata; trusted packed
@@ -3275,7 +3323,7 @@ class BatchPrefillTSWrapper:
         if vc is not None:
             if validate:
                 validate_vc_params(vc, state.vc_scale_shapes, device=geometry.device)
-            if geometry.qk_dtype == torch.float8_e4m3fn:
+            if geometry.qk_dtype in (torch.float8_e4m3fn, torch.int8):
                 if vc.q_scale is None or vc.k_scale is None:
                     raise ValueError(
                         "VC-Attention-QK8 plans require vc.q_scale and vc.k_scale"
@@ -3285,7 +3333,7 @@ class BatchPrefillTSWrapper:
             elif vc.q_scale is not None or vc.k_scale is not None:
                 raise ValueError(
                     "vc.q_scale and vc.k_scale belong to VC-Attention-QK8 plans with "
-                    "E4M3 Q/K"
+                    "E4M3 or INT8 Q/K"
                 )
             vc_mu = vc.tile_means
             # VC plans have equal Q and K/V head counts, so the per-channel V
@@ -3398,6 +3446,15 @@ class BatchPrefillTSWrapper:
                 q=q,
                 out_dtype=geometry.out_dtype,
                 head_dim_vo=geometry.head_dim_vo,
+            )
+        if (
+            state.lse_mode != "none"
+            and geometry.mask_type == "dense"
+            and q.numel()
+            and not k.numel()
+        ):
+            raise ValueError(
+                "Dense LSE output requires at least one physical K/V token"
             )
         lse = prepare_lse(
             lse,
@@ -3589,6 +3646,8 @@ class BatchPrefillPagedTSWrapper:
 
         Uses the policy and compiled kernels prepared by plan(). Batch and query
         shape must match that plan; live K/V lengths stay within its capacity.
+        Q/K are compact; V may have padding between token rows and batches,
+        with compact heads/features and 16-byte-aligned strides.
         Supply output/LSE buffers and validate=False during graph capture, and
         retain the wrapper and captured buffers for every replay.
 
@@ -3746,7 +3805,8 @@ def batch_prefill(
     q, k, v : torch.Tensor
         Fixed or packed query, key, and value tensors. Q and K share one
         dtype; V matches it or is ``torch.float8_e4m3fn`` with
-        ``torch.bfloat16`` Q/K.
+        ``torch.bfloat16`` Q/K. Q/K are compact; V may have nonoverlapping,
+        16-byte-aligned token and batch strides with compact heads/features.
     qo_indptr, kv_indptr : torch.Tensor, optional
         Cumulative query and K/V offsets for packed-ragged input.
     mask_type : {"dense", "causal", "variable_window"}

@@ -420,15 +420,22 @@ class BatchInvariantAttention:
                     "kv_len >= q_len per request (the causal class)",
                 )
         config = engine.default_config(D=D)
-        if D == 64 and self.kind != "decode":
+        if (
+            D in engine.Q2_DEFAULT_DIMS
+            and self.kind != "decode"
+            and g >= engine.Q2_DEFAULT_MIN_GROUP[D]
+        ):
             from dataclasses import replace
 
             from .swaps.operands import arch_smem_cap
 
-            # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill. Its two Q tiles and the
-            # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103)
-            slots = 4 if arch_smem_cap(self.device) >= (300 << 10) else 3
-            config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
+            # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill (paged and ragged) from GQA
+            # group engine.Q2_DEFAULT_MIN_GROUP up (smaller groups keep the one-warpgroup body). Its two Q tiles and the
+            # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103) at
+            # D = 64; at D = 128 the placement fits the 328 KB parts only (engine.Q2_RING)
+            slots = engine.Q2_RING[D][arch_smem_cap(self.device) >= (300 << 10)]
+            if slots:
+                config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
         try:
             planned = engine.plan_attention(
                 qo_host,
@@ -471,12 +478,10 @@ class BatchInvariantAttention:
                     f"a float workspace buffer of {self.workspace.numel() * self.workspace.element_size()} bytes",
                     f"at least {e.needed} bytes for this batch's split-KV partials",
                 ) from None
-        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from a
-        # snapshot: a later in-place change by the caller cannot reach a plan built from the old values; the plan is published only once
-        # everything it runs with exists
-        kv_indptr_dev = kv_indptr.to(
-            device=self.device, dtype=torch.int32, non_blocking=non_blocking, copy=True
-        ).contiguous()
+        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from
+        # snapshots: kv_indptr's is the plan's own (engine.plan_attention: the descriptor table holds its offsets), kv_indices' is
+        # taken here; a later in-place change by the caller cannot reach a plan built from the old values, and the plan is published
+        # only once everything it runs with exists
         kv_indices_dev = (
             kv_indices.to(
                 device=self.device,
@@ -489,7 +494,7 @@ class BatchInvariantAttention:
         )
         self._planned = planned
         self._config = config
-        self._kv_indptr = kv_indptr_dev
+        self._kv_indptr = planned.kv_indptr
         self._kv_indices = kv_indices_dev
         self._max_page = max_page
         self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
@@ -716,5 +721,6 @@ class BatchInvariantAttention:
             out,
             self._config,
             ragged=self.kind == "ragged",
+            enable_pdl=enable_pdl,
         )
         return out

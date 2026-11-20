@@ -24,6 +24,8 @@ so ``GEMMConfig.lean`` validates the actual spaces (``gemm_space_ok``, ``gemm_fp
 
 from __future__ import annotations
 
+import re
+import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -157,6 +159,10 @@ SWAP_WIDE_FMTS = (
 #: a placement of the class. Dense records only (no swap, no in-cluster split, no in-CTA chunk fold).
 TILE_M_BREUSE = 512
 BREUSE_FMTS = ("nvfp4_k128", "mxfp8_k64", "mxfp4_k128", "mxfp4w8a_k64")
+
+
+#: the ``describe()`` tokens of the launch placements: ``_r<m|n>_sw<s>`` and the forced grid ``_g<n>``
+_PLACEMENT_TOKENS = re.compile(r"_r[mn]_sw\d+|_g\d+")
 
 
 @dataclass(frozen=True)
@@ -311,6 +317,12 @@ class Knobs:
             + ("_ga" if self.gather_a else "")
         )
 
+    def describe_object(self) -> str:
+        """The compile-time identity of the knobs: ``describe()`` without its placement tokens (the raster order, the
+        swizzle size and the grid are launch arguments of the compiled object, ``blocks/scheduler.py``). Derived from
+        ``describe()`` so that a knob added there is part of the object's identity too."""
+        return _PLACEMENT_TOKENS.sub("", self.describe())
+
     def instruction(self, in_fmt: str = "bf16") -> str:
         """The MMA instruction variant these knobs select for the format: the A2 assumption surface."""
         if in_fmt in BLOCK_SCALED:
@@ -423,14 +435,34 @@ def enumerate_space(
 ) -> List[Knobs]:
     """The configuration space for a shape, layout and class: the knob product the kernel body accepts
     (``can_implement``) for ``chunks`` (the class's chunk count). This is the set R3 is claimed over; the GPU
-    configuration-agreement tests check the dispatcher's candidates and sampled records of it against each other."""
+    configuration-agreement tests check the dispatcher's candidates and sampled records of it against each other.
+    Memoised per argument tuple (the acceptance reads M for the swapped and in-cluster records, so M is part of the
+    key); each call returns its own list."""
+    return list(
+        _enumerate_space_cached(
+            M, N, K, tuple(swizzles), tuple(clusters), chunks, b_major, in_fmt
+        )
+    )
+
+
+@functools.lru_cache(maxsize=512)
+def _enumerate_space_cached(
+    M: int,
+    N: int,
+    K: int,
+    swizzles: tuple,
+    clusters: tuple,
+    chunks: int,
+    b_major: str,
+    in_fmt: str,
+) -> Tuple[Knobs, ...]:
     from .blocks.operands import can_implement
 
-    return [
+    return tuple(
         k
         for k in knob_product(swizzles, clusters, cta_chunks=chunks > 1, in_fmt=in_fmt)
         if can_implement(k, M, N, K, b_major, chunks, in_fmt)
-    ]
+    )
 
 
 REFERENCE_SHAPE = (1000, 4096, 4096)  # the shape whose space is emitted to Lean

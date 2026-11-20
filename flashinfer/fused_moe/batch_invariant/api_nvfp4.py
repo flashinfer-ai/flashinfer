@@ -32,22 +32,25 @@ from ...batch_invariant.support import BatchInvariantUnsupportedError, unsupport
 from ...gemm.batch_invariant.api import part_of, persistent_clusters, sm_count_of
 from .schedule import launch_tile_bound
 from ...gemm.batch_invariant.generator import Knobs
-from ...gemm.batch_invariant.schedule import chunks_for
+from ...gemm.batch_invariant.schedule import chunks_for, fp4_class_for
 from ...gemm.batch_invariant.spec import NVFP4_FMTS
 from . import spec as S
 from .api import interleave_fc1, permute_plan, route  # noqa: F401  (route re-exported for the class's callers)
 from .blocks.epilogue import W4A4Chain
-from .spec_nvfp4 import (
-    CLASS,
-    E2M1_MAX,
-    E4M3_MAX,
-    INTERMEDIATES,
-    TE_GS_INV,
-    expert_classes,
-)
+from .spec_nvfp4 import CLASS, E2M1_MAX, E4M3_MAX, INTERMEDIATES, TE_GS_INV
 
 #: 16-byte rows of the packed fp4 operands (the TMA alignment) and whole 64-element scale-factor column groups.
 ALIGN_NVFP4 = 32
+
+
+def expert_classes(
+    H: int, I: int, family: Optional[str], gated: bool = True
+) -> Tuple[str, str]:
+    """The NVFP4 instruction class of each expert weight by the dense rule (`schedule.fp4_class_for`): GEMM1 on ``(2I, H)``
+    (``(I, H)`` ungated), GEMM2 on ``(H, I)``; a function of the weight shapes and the architecture family only."""
+    return fp4_class_for(2 * I if gated else I, H, family), fp4_class_for(H, I, family)
+
+
 MAX_TOP_K = 16
 PATHS = ("dense", "padded")
 #: Rows past the live rows in the dense packing's A buffers (and past the padded rows in its scale-factor buffers) so the

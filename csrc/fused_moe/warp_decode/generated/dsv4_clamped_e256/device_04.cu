@@ -44,7 +44,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(128, 1) void
-kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, __nv_bfloat16* __restrict__ output, int num_tokens, int route_stride, int M)
+kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, __nv_bfloat16* __restrict__ output, int num_tokens, int route_stride, int M, int* __restrict__ route_experts, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -58,6 +58,7 @@ kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* _
     int feature = blockIdx.x * 256 + tid * 2;
     int token = blockIdx.y;
     float preloaded_weights[6];
+    bool route_ok[6];
     if (feature + 1 < M && token < num_tokens) {
         preloaded_weights[0] = (float)route_weights[token * 6];
         preloaded_weights[1] = (float)route_weights[token * 6 + 1];
@@ -65,6 +66,12 @@ kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* _
         preloaded_weights[3] = (float)route_weights[token * 6 + 3];
         preloaded_weights[4] = (float)route_weights[token * 6 + 4];
         preloaded_weights[5] = (float)route_weights[token * 6 + 5];
+        route_ok[0] = (unsigned)route_experts[token * 6] < (unsigned)num_experts;
+        route_ok[1] = (unsigned)route_experts[token * 6 + 1] < (unsigned)num_experts;
+        route_ok[2] = (unsigned)route_experts[token * 6 + 2] < (unsigned)num_experts;
+        route_ok[3] = (unsigned)route_experts[token * 6 + 3] < (unsigned)num_experts;
+        route_ok[4] = (unsigned)route_experts[token * 6 + 4] < (unsigned)num_experts;
+        route_ok[5] = (unsigned)route_experts[token * 6 + 5] < (unsigned)num_experts;
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (feature + 1 < M && token < num_tokens) {
@@ -86,9 +93,9 @@ kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* _
         }
         float weight = preloaded_weights[0];
         float _fma_0 = __fmaf_rn(partial[0], weight, value[0]);
-        value[0] = _fma_0;
+        value[0] = route_ok[0] ? _fma_0 : value[0];
         float _fma_1 = __fmaf_rn(partial[1], weight, value[1]);
-        value[1] = _fma_1;
+        value[1] = route_ok[0] ? _fma_1 : value[1];
         int route_index_0 = route_base + 1;
         int output_row_1 = route_index_0;
         {
@@ -104,9 +111,9 @@ kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* _
         }
         float weight_2 = preloaded_weights[1];
         float _fma_2 = __fmaf_rn(partial[0], weight_2, value[0]);
-        value[0] = _fma_2;
+        value[0] = route_ok[1] ? _fma_2 : value[0];
         float _fma_3 = __fmaf_rn(partial[1], weight_2, value[1]);
-        value[1] = _fma_3;
+        value[1] = route_ok[1] ? _fma_3 : value[1];
         int route_index_3 = route_base + 2;
         int output_row_4 = route_index_3;
         {
@@ -122,9 +129,9 @@ kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* _
         }
         float weight_5 = preloaded_weights[2];
         float _fma_4 = __fmaf_rn(partial[0], weight_5, value[0]);
-        value[0] = _fma_4;
+        value[0] = route_ok[2] ? _fma_4 : value[0];
         float _fma_5 = __fmaf_rn(partial[1], weight_5, value[1]);
-        value[1] = _fma_5;
+        value[1] = route_ok[2] ? _fma_5 : value[1];
         int route_index_6 = route_base + 3;
         int output_row_7 = route_index_6;
         {
@@ -140,9 +147,9 @@ kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* _
         }
         float weight_8 = preloaded_weights[3];
         float _fma_6 = __fmaf_rn(partial[0], weight_8, value[0]);
-        value[0] = _fma_6;
+        value[0] = route_ok[3] ? _fma_6 : value[0];
         float _fma_7 = __fmaf_rn(partial[1], weight_8, value[1]);
-        value[1] = _fma_7;
+        value[1] = route_ok[3] ? _fma_7 : value[1];
         int route_index_9 = route_base + 4;
         int output_row_10 = route_index_9;
         {
@@ -158,9 +165,9 @@ kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* _
         }
         float weight_11 = preloaded_weights[4];
         float _fma_8 = __fmaf_rn(partial[0], weight_11, value[0]);
-        value[0] = _fma_8;
+        value[0] = route_ok[4] ? _fma_8 : value[0];
         float _fma_9 = __fmaf_rn(partial[1], weight_11, value[1]);
-        value[1] = _fma_9;
+        value[1] = route_ok[4] ? _fma_9 : value[1];
         int route_index_12 = route_base + 5;
         int output_row_13 = route_index_12;
         {
@@ -176,9 +183,9 @@ kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100(__nv_bfloat16* _
         }
         float weight_14 = preloaded_weights[5];
         float _fma_10 = __fmaf_rn(partial[0], weight_14, value[0]);
-        value[0] = _fma_10;
+        value[0] = route_ok[5] ? _fma_10 : value[0];
         float _fma_11 = __fmaf_rn(partial[1], weight_14, value[1]);
-        value[1] = _fma_11;
+        value[1] = route_ok[5] ? _fma_11 : value[1];
         {
             __nv_bfloat162 _pk = __floats2bfloat162_rn(value[0 + 0], value[0 + 1]);
             *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(output + (token * M + feature)))[0]) = _pk;

@@ -31,6 +31,12 @@ lean_exe mxfp4megamoeconformance where
 lean_exe mxfp8megamoeconformance where
   root := `MXFP8MegaMoEMain
 
+lean_exe gdnconformance where
+  root := `GdnMain
+
+lean_exe kdaconformance where
+  root := `KdaMain
+
 lean_exe axioms where
   root := `Axioms
   supportInterpreter := true
@@ -40,6 +46,7 @@ lean_exe moeconformance where
 
 lean_exe moemxfp8conformance where
   root := `MoEMxfp8Main
+
 lean_exe numericalmegamoeconformance where
   root := `NumericalMegaMoEMain
 
