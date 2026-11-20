@@ -298,6 +298,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.iterations_qk = self.iterations_qk_latent + self.iterations_qk_rope
         self.iterations_pv_k = self.mma_qk_tiler[1] // self.mma_pv_tiler[2]
         self.iterations_pv_n = self.latent_dim // self.mma_pv_tiler[1]
+        self.use_cta_tail_tma = self.seq_len_q == 1
 
         # Set specialized warp ids
         self.compute_warp_ids = (0, 1, 2, 3)
@@ -451,6 +452,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.q_dtype = q_latent.element_type
         self.k_dtype = c_latent.element_type
         self.v_dtype = c_latent.element_type
+        self.v_vec_elems = 128 // self.v_dtype.width
         self.o_dtype = o.element_type
 
         # check type consistency
@@ -800,6 +802,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             )
         )
 
+        tma_atom_v_tail = None
+        if cutlass.const_expr(self.use_cta_tail_tma):
+            tma_atom_v_tail, _ = self.make_paged_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE),
+                c_latent_transpose,
+                vc_smem_layout,
+                (self.mma_pv_tiler[1], self.mma_pv_tiler[2]),
+                pv_tiled_mma,
+                is_k_load=False,
+            )
+
         q_latent_copy_size = (
             cute.size_in_bytes(self.q_dtype, q_latent_smem_layout)
             * cute.size(qk_tiled_mma.thr_id.shape)
@@ -847,6 +860,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             load_pt_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.load_pt_stage * 2
             ]
+            tail_ready: cute.struct.MemRange[
+                cutlass.Int32, self.load_kv_stage * self.cluster_shape_mnk[0]
+            ]
+            tail_tma_mbar: cutlass.Int64
             # Tmem dealloc cluster barrier
             tmem_dealloc_mbar_ptr: cutlass.Int64
 
@@ -897,6 +914,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             tma_tensor_c_rope,
             tma_atom_c_latent_transpose,
             tma_tensor_c_latent_transpose,
+            c_latent_transpose,
+            tma_atom_v_tail,
             page_table,
             o,
             lse,
@@ -997,6 +1016,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         mKR: cute.Tensor,
         tma_atom_c_latent_transpose: Optional[cute.CopyAtom],
         mCLT: cute.Tensor,
+        raw_v: cute.Tensor,
+        tma_atom_v_tail: Optional[cute.CopyAtom],
         mPT: cute.Tensor,
         mO: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
@@ -1124,6 +1145,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             cpasync.prefetch_descriptor(tma_atom_c_latent)
             cpasync.prefetch_descriptor(tma_atom_c_rope)
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
+            if cutlass.const_expr(self.use_cta_tail_tma):
+                cpasync.prefetch_descriptor(tma_atom_v_tail)
 
         # Alloc
         smem = utils.SmemAllocator()
@@ -1165,6 +1188,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         load_pt_pipeline = self.make_and_init_load_pt_pipeline(
             storage.load_pt_mbar_ptr.data_ptr()
         )
+
+        if cutlass.const_expr(self.use_cta_tail_tma):
+            if warp_idx == self.load_tma_warp_id:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_init(storage.tail_tma_mbar.ptr, 1)
+                cute.arch.mbarrier_init_fence()
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk, is_relaxed=True)
@@ -1263,6 +1292,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 work_tile = tile_sched.get_current_work()
             load_pt_pipeline.producer_tail(load_pt_producer_state)
         if warp_idx == self.load_tma_warp_id:
+            tail_tma_phase = None
+            if cutlass.const_expr(self.use_cta_tail_tma):
+                tail_tma_phase = cute.make_rmem_tensor(
+                    cute.make_layout(1), cutlass.Int32
+                )
+                tail_tma_phase[0] = 0
             _setmaxregister_decrease(self.other_reg_num)
             load_q_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_q_stage
@@ -1302,6 +1337,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         blk_coord=blk_coord,
                         local_split_kv=local_split_kv,
                         q_begin=q_begin,
+                        K=cache_seqs[blk_coord[2]],
+                        tail_ready=storage.tail_ready.data_ptr(),
                         load_q_pipeline=load_q_pipeline,
                         load_kv_pipeline=load_kv_pipeline,
                         mPT=mPT,
@@ -1328,6 +1365,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         mCL=mCL,
                         mKR=mKR,
                         mCLT=mCLT,
+                        raw_v=raw_v,
+                        tma_atom_v_tail=tma_atom_v_tail,
+                        tail_tma_mbar=storage.tail_tma_mbar.ptr,
+                        tail_tma_phase=tail_tma_phase,
                         sVC=sVC_for_tma,
                     )
                     # Load tma
@@ -1415,6 +1456,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         sKC=sKC,
                     )
                     mma_pv_params = SimpleNamespace(
+                        last_k_stages=self.pv_stages_in_tile(
+                            cache_seqs[blk_coord[2]], k_index + (k_tile_count - 1)
+                        ),
                         p_mma_pipeline=p_mma_pipeline,
                         mma_o_pipeline=mma_o_pipeline,
                         sP=sP,
@@ -2080,6 +2124,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 k_index - 1,
                 load_kv_producer_state,
                 load_pt_release_state,
+                is_last_tile=False,
             )
             k_index += 1
             k_tile_count -= 1
@@ -2091,6 +2136,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             k_index - 1,
             load_kv_producer_state,
             load_pt_release_state,
+            is_last_tile=True,
         )
         return (
             load_q_producer_state,
@@ -2232,6 +2278,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         k_index: cutlass.Int32,
         load_kv_producer_state: pipeline.PipelineState,
         load_pt_release_state: pipeline.PipelineState,
+        is_last_tile: cutlass.Constexpr,
     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
         """Load one k-tile of compressed latent transpose tensor(v). Updates the load qkv producer state.
 
@@ -2249,48 +2296,321 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :return: The load kv producer state and load pt release state
         :rtype: tuple[pipeline.PipelineState, pipeline.PipelineState]
         """
-        page_per_tile = self.mma_pv_tiler[2] * self.iterations_pv_k // self.page_size
-        page_per_subtile = ceil_div(page_per_tile, self.iterations_pv_k)
-        k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile), cutlass.Int32)
-        page_table_stage = load_pt_release_state.index
-        for i in cutlass.range(page_per_tile):
-            k_idx[i] = (
-                common_params.sPT[0, page_table_stage]
-                if page_per_tile == 1
-                else common_params.sPT[i, page_table_stage]
+        page_per_tile = self.mma_qk_tiler[1] // self.page_size
+        page_ids = common_params.sPT[None, load_pt_release_state.index]
+        if cutlass.const_expr(is_last_tile):
+            # The producer can recycle this slot once all V copy addresses have been issued.
+            load_kv_producer_state = self.load_last_v_subtiles(
+                common_params, v_params, page_ids, k_index, load_kv_producer_state
             )
-        common_params.load_pt_pipeline.consumer_release(load_pt_release_state)
-        load_pt_release_state.advance()
-        load_kv_pipeline = common_params.load_kv_pipeline
-        tma_bar_ptr = load_kv_pipeline.producer_get_barrier(load_kv_producer_state)
-        for i in cutlass.range(self.iterations_pv_k):
-            for j in cutlass.range(self.iterations_pv_n):
-                # get the mbar ptr from pipeline.
-                tma_bar_ptr = load_kv_pipeline.producer_get_barrier(
-                    load_kv_producer_state
+            common_params.load_pt_pipeline.consumer_release(load_pt_release_state)
+            load_pt_release_state.advance()
+        else:
+            k_idx = cute.make_rmem_tensor(
+                cute.make_layout(page_per_tile), cutlass.Int32
+            )
+            for i in cutlass.range(page_per_tile):
+                k_idx[i] = page_ids[i]
+            common_params.load_pt_pipeline.consumer_release(load_pt_release_state)
+            load_pt_release_state.advance()
+            load_kv_producer_state = self.load_full_v_subtiles(
+                common_params,
+                v_params,
+                k_idx,
+                self.iterations_pv_k,
+                load_kv_producer_state,
+            )
+        return load_kv_producer_state, load_pt_release_state
+
+    @cute.jit
+    def load_last_v_subtiles(
+        self, common_params, v_params, page_ids, k_index, load_kv_producer_state
+    ):
+        rows = min(
+            common_params.K - k_index * self.mma_qk_tiler[1], self.mma_qk_tiler[1]
+        )
+        full_stages = rows // self.mma_pv_tiler[2]
+        load_kv_producer_state = self.load_full_v_subtiles(
+            common_params, v_params, page_ids, full_stages, load_kv_producer_state
+        )
+        pipe = common_params.load_kv_pipeline
+        if rows % self.mma_pv_tiler[2] != 0:
+            for j in cutlass.range_constexpr(self.iterations_pv_n):
+                pipe.producer_acquire(
+                    load_kv_producer_state, expected_tx=4 * self.cluster_shape_mnk[0]
                 )
-                load_kv_pipeline.producer_acquire(load_kv_producer_state)
-                for k in cutlass.range(page_per_subtile):
-                    k_idx_i = k_idx[
-                        k
-                        + i
-                        // ceil_div(self.iterations_pv_k, page_per_tile)
-                        * page_per_subtile
-                    ]
+                self.load_v_tail(
+                    common_params,
+                    v_params,
+                    page_ids,
+                    k_index,
+                    full_stages,
+                    j,
+                    load_kv_producer_state,
+                )
+                load_kv_producer_state.advance()
+        return load_kv_producer_state
+
+    @cute.jit
+    def pv_stages_in_tile(self, kv_length, k_index):
+        rows = min(kv_length - k_index * self.mma_qk_tiler[1], self.mma_qk_tiler[1])
+        return cute.ceil_div(rows, self.mma_pv_tiler[2])
+
+    @cute.jit
+    def load_full_v_subtiles(self, common_params, v_params, page_ids, count, state):
+        pages = self.mma_qk_tiler[1] // self.page_size
+        per_stage = ceil_div(pages, self.iterations_pv_k)
+        stages_per_page = ceil_div(self.iterations_pv_k, pages)
+        pipe = common_params.load_kv_pipeline
+        for i in cutlass.range(count):
+            for j in cutlass.range(self.iterations_pv_n):
+                pipe.producer_acquire(state)
+                for slot in cutlass.range(per_stage):
+                    page = page_ids[i // stages_per_page * per_stage + slot]
                     cute.copy(
                         v_params.tma_atom_c_latent_transpose,
-                        v_params.tCLTgCLT[
-                            None,
-                            j,
-                            i % ceil_div(self.iterations_pv_k, page_per_tile),
-                            k_idx_i,
-                        ],
-                        v_params.tVCsVC[None, 0, k, load_kv_producer_state.index],
-                        tma_bar_ptr=tma_bar_ptr,
+                        v_params.tCLTgCLT[None, j, i % stages_per_page, page],
+                        v_params.tVCsVC[None, 0, slot, state.index],
+                        tma_bar_ptr=pipe.producer_get_barrier(state),
                     )
+                state.advance()
+        return state
 
-                load_kv_producer_state.advance()
-        return load_kv_producer_state, load_pt_release_state
+    @cute.jit
+    def load_v_tail(
+        self, common_params, v_params, page_ids, k_index, k_stage, d_stage, state
+    ):
+        if cutlass.const_expr(self.use_cta_tail_tma):
+            live = (
+                common_params.K
+                - k_index * self.mma_qk_tiler[1]
+                - k_stage * self.mma_pv_tiler[2]
+            )
+            if live >= max(
+                self.mma_pv_tiler[2] * 3 // 4, self.mma_pv_tiler[2] - self.page_size + 1
+            ):
+                self.load_v_tail_tma(
+                    common_params, v_params, page_ids, k_index, k_stage, d_stage, state
+                )
+            else:
+                self.load_v_tail_cpasync(
+                    common_params, v_params, page_ids, k_index, k_stage, d_stage, state
+                )
+        else:
+            self.load_v_tail_cpasync(
+                common_params, v_params, page_ids, k_index, k_stage, d_stage, state
+            )
+
+    @cute.jit
+    def load_v_tail_cpasync(
+        self, common_params, v_params, page_ids, k_index, k_stage, d_stage, state
+    ):
+        # TMA only knows physical page bounds. Mask V before PV, since 0*NaN
+        # remains NaN even when softmax has excluded the corresponding key.
+        ctas = self.cluster_shape_mnk[0]
+        cta = common_params.blk_coord[0]
+        pipeline_kv = common_params.load_kv_pipeline
+        k_width = self.mma_pv_tiler[2]
+        first_row = k_stage * k_width
+        live = common_params.K - k_index * self.mma_qk_tiler[1] - first_row
+        page_tile = min(self.page_size, k_width)
+        page_slots = ceil_div(k_width, self.page_size)
+        for slot in cutlass.range(page_slots, unroll_full=page_slots < 8):
+            row = first_row + slot * page_tile
+            remaining = live - slot * page_tile
+            if cutlass.const_expr(self.page_size < k_width):
+                if remaining >= page_tile:
+                    self.copy_v_page(
+                        v_params,
+                        page_ids[row // self.page_size],
+                        row,
+                        slot,
+                        remaining,
+                        cta,
+                        d_stage,
+                        state.index,
+                        full=True,
+                    )
+                else:
+                    page = cutlass.Int32(0)
+                    if remaining > 0:
+                        page = page_ids[row // self.page_size]
+                    self.copy_v_page(
+                        v_params,
+                        page,
+                        row,
+                        slot,
+                        remaining,
+                        cta,
+                        d_stage,
+                        state.index,
+                        full=False,
+                    )
+            else:
+                self.copy_v_page(
+                    v_params,
+                    page_ids[row // self.page_size],
+                    row,
+                    slot,
+                    remaining,
+                    cta,
+                    d_stage,
+                    state.index,
+                    full=False,
+                )
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_warp()
+        # Each CTA publishes its completed stage to the leader's transaction
+        # barrier. Stage-specific slots cannot race with another pipeline stage.
+        with cute.arch.elect_one():
+            cute.arch.store_async_dsmem(
+                common_params.tail_ready + state.index * ctas + cta,
+                cutlass.Int32(0),
+                pipeline_kv.producer_get_barrier(state),
+                0,
+            )
+
+    @cute.jit
+    def copy_v_page(
+        self,
+        v_params,
+        page,
+        row,
+        slot,
+        live,
+        cta,
+        d_stage,
+        stage,
+        full: cutlass.Constexpr,
+    ):
+        raw_v = v_params.raw_v
+        shared_v = v_params.sVC
+        d_width = self.mma_pv_tiler[1] // self.cluster_shape_mnk[0]
+        page_tile = min(self.page_size, self.mma_pv_tiler[2])
+        lane = cute.arch.lane_idx()
+        first_d = d_stage * self.mma_pv_tiler[1] + cta * d_width
+        lane_d = lane * self.v_vec_elems % d_width
+        atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(), self.v_dtype, num_bits_per_copy=128
+        )
+        integral_rows = 32 * self.v_vec_elems % d_width == 0
+        first = lane * self.v_vec_elems
+        stop = d_width * page_tile
+        step = 32 * self.v_vec_elems
+        base = raw_v.layout(
+            (
+                cutlass.Int64(first_d),
+                cutlass.Int64(row % self.page_size),
+                cutlass.Int64(page),
+            )
+        )
+        if cutlass.const_expr(integral_rows):
+            first = lane * self.v_vec_elems // d_width
+            stop = page_tile
+            step = 32 * self.v_vec_elems // d_width
+            base += raw_v.layout((cutlass.Int64(lane_d), cutlass.Int64(first), 0))
+        row_step = raw_v.layout((0, cutlass.Int64(step), 0))
+        for index in cutlass.range(first, stop, step):
+            if cutlass.const_expr(integral_rows):
+                k = index
+                d = lane_d
+                address = base
+            else:
+                d = index % d_width
+                k = index // d_width
+                address = base + raw_v.layout((cutlass.Int64(d), cutlass.Int64(k), 0))
+            offset = shared_v.layout(((d, k), 0, slot, stage))
+            dst = cute.make_tensor(
+                shared_v.iterator + cute.assume(offset, divby=self.v_vec_elems),
+                cute.make_layout(self.v_vec_elems),
+            )
+            src = cute.make_tensor(
+                raw_v.iterator + cute.assume(address, divby=self.v_vec_elems),
+                cute.make_layout(self.v_vec_elems),
+            )
+            if cutlass.const_expr(full):
+                cute.copy(atom, src, dst)
+            else:
+                pred = cute.make_rmem_tensor(
+                    cute.make_layout(self.v_vec_elems, stride=0), cutlass.Boolean
+                )
+                pred[0] = k < live
+                cute.copy(atom, src, dst, pred=pred)
+            if cutlass.const_expr(integral_rows):
+                base += row_step
+
+    @cute.jit
+    def load_v_tail_tma(
+        self, common_params, v_params, page_ids, k_index, k_stage, d_stage, state
+    ):
+        # TMA only knows physical page bounds. Mask V before PV, since 0*NaN
+        # remains NaN even when softmax has excluded the corresponding key.
+        ctas = self.cluster_shape_mnk[0]
+        cta = common_params.blk_coord[0]
+        d_width = self.mma_pv_tiler[1] // ctas
+        k_width = self.mma_pv_tiler[2]
+        page_tile = min(self.page_size, k_width)
+        pipeline_kv = common_params.load_kv_pipeline
+        shared_v = v_params.sVC
+        kv_length = common_params.K
+        barrier = v_params.tail_tma_mbar
+        phase = v_params.tail_tma_phase[0]
+        page_per_tile = self.mma_qk_tiler[1] // self.page_size
+        pages_per_subtile = ceil_div(page_per_tile, self.iterations_pv_k)
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(
+                barrier, self.tma_copy_kc_bytes // ctas
+            )
+        for page_slot in cutlass.range(pages_per_subtile):
+            page = page_ids[
+                page_slot
+                + k_stage
+                // ceil_div(self.iterations_pv_k, page_per_tile)
+                * pages_per_subtile
+            ]
+            cute.copy(
+                v_params.tma_atom_v_tail,
+                v_params.tCLTgCLT[
+                    None,
+                    d_stage,
+                    k_stage % ceil_div(self.iterations_pv_k, page_per_tile),
+                    page,
+                ],
+                v_params.tVCsVC[None, 0, page_slot, state.index],
+                tma_bar_ptr=barrier,
+            )
+        cute.arch.mbarrier_wait(barrier, phase)
+        first_invalid = kv_length - k_index * self.mma_qk_tiler[1] - k_stage * k_width
+        lane = cute.arch.lane_idx()
+        for index in cutlass.range(
+            first_invalid * d_width + lane * self.v_vec_elems,
+            d_width * k_width,
+            32 * self.v_vec_elems,
+        ):
+            d = index % d_width
+            k = index // d_width
+            offset = shared_v.layout(
+                ((d, k % page_tile), 0, k // page_tile, state.index)
+            )
+            destination = cute.make_tensor(
+                shared_v.iterator + cute.assume(offset, divby=self.v_vec_elems),
+                cute.make_layout(self.v_vec_elems),
+            )
+            destination.fill(0)
+        v_params.tail_tma_phase[0] = phase ^ 1
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_warp()
+        # Each CTA publishes its completed stage to the leader's transaction
+        # barrier. Stage-specific slots cannot race with another pipeline stage.
+        with cute.arch.elect_one():
+            cute.arch.store_async_dsmem(
+                common_params.tail_ready + state.index * ctas + cta,
+                cutlass.Int32(0),
+                pipeline_kv.producer_get_barrier(state),
+                0,
+            )
 
     @cute.jit
     def mma(
@@ -2430,6 +2750,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                     load_kv_consumer_state,
                     p_mma_consumer_state,
                     mma_o_producer_state,
+                    k_stages=self.iterations_pv_k,
                 )
                 k_tile_count -= 1
 
@@ -2448,6 +2769,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 load_kv_consumer_state,
                 p_mma_consumer_state,
                 mma_o_producer_state,
+                k_stages=pv_params.last_k_stages,
             )
 
         return (  # type: ignore[return-value]
@@ -2548,6 +2870,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         load_kv_consumer_state: pipeline.PipelineState,
         p_mma_consumer_state: pipeline.PipelineState,
         mma_o_producer_state: pipeline.PipelineState,
+        k_stages,
     ) -> tuple[
         cute.TiledMma,
         pipeline.PipelineState,
@@ -2569,6 +2892,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param mma_o_producer_state: The MMA o producer state
         :type mma_o_producer_state: pipeline.PipelineState
 
+        :param k_stages: Number of V subtiles issued by the load warp for this tile.
+
         :return: The tiled mma pv, the load qkv consumer state, the P MMA consumer state, and the MMA o producer state
         :rtype: tuple[cute.TiledMma, pipeline.PipelineState, pipeline.PipelineState, pipeline.PipelineState]
         """
@@ -2577,28 +2902,29 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         pv_params.p_mma_pipeline.consumer_wait(p_mma_consumer_state)
         load_kv_pipeline = common_params.load_kv_pipeline
         for p_stage in range(self.iterations_pv_k):
-            accumulate_flag = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
-            for acc_stage in range(self.iterations_pv_n):
-                load_kv_pipeline.consumer_wait(load_kv_consumer_state)
-                tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
-                vc_stage = load_kv_consumer_state.index
-                tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
-                for k_block in cutlass.range(pv_params.tOrP.shape[2]):
-                    cute.gemm(
-                        tiled_mma_pv,
-                        tOtO,
-                        pv_params.tOrP[
-                            None,
-                            None,
-                            k_block,
-                            (p_stage, p_mma_consumer_state.index),
-                        ],
-                        pv_params.tOrVC[None, None, k_block, vc_stage],
-                        tOtO,
-                    )
-                    tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
-                load_kv_pipeline.consumer_release(load_kv_consumer_state)
-                load_kv_consumer_state.advance()
+            if p_stage == 0 or p_stage < k_stages:
+                accumulate_flag = tiled_mma_pv.get(tcgen05.Field.ACCUMULATE)
+                for acc_stage in range(self.iterations_pv_n):
+                    load_kv_pipeline.consumer_wait(load_kv_consumer_state)
+                    tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, accumulate_flag)
+                    vc_stage = load_kv_consumer_state.index
+                    tOtO = pv_params.tOtO_staged[None, None, None, acc_stage]
+                    for k_block in cutlass.range(pv_params.tOrP.shape[2]):
+                        cute.gemm(
+                            tiled_mma_pv,
+                            tOtO,
+                            pv_params.tOrP[
+                                None,
+                                None,
+                                k_block,
+                                (p_stage, p_mma_consumer_state.index),
+                            ],
+                            pv_params.tOrVC[None, None, k_block, vc_stage],
+                            tOtO,
+                        )
+                        tiled_mma_pv.set(tcgen05.Field.ACCUMULATE, True)
+                    load_kv_pipeline.consumer_release(load_kv_consumer_state)
+                    load_kv_consumer_state.advance()
         pv_params.p_mma_pipeline.consumer_release(p_mma_consumer_state)
         p_mma_consumer_state.advance()
         pv_params.mma_o_pipeline.producer_commit(mma_o_producer_state)
