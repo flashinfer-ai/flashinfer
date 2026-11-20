@@ -9,7 +9,8 @@ using WarpAccT = Array2D<InstAcc, exactDiv(m, 16), exactDiv(n, 8)>;
 
 template <uint32_t accRows, uint32_t accCols>
 __device__ inline void applyMask(Warp const& warp, Array2D<InstAcc, accRows, accCols>& acc,
-                                 uint32_t validColBeg, uint32_t validColEnd) {
+                                 uint32_t validColBeg, uint32_t validColEnd,
+                                 float maskValue = mha::numeric_limits<float>::lowest()) {
   uint32_t const idxInQuad = laneId() % 4;
   uint32_t const idxQuad = laneId() / 4;
 #pragma unroll
@@ -24,7 +25,7 @@ __device__ inline void applyMask(Warp const& warp, Array2D<InstAcc, accRows, acc
       for (uint32_t m = 0; m < acc.rows; m++) {
 #pragma unroll
         for (uint32_t i = 0; i < InstAcc::rows; i++) {
-          acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
+          acc(m, n)(i, j) = maskValue;
         }
       }
     }

@@ -20,6 +20,7 @@
 #if !(IS_MLA)
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <math_constants.h>
 
 #include "ldgsts.cuh"
 #include "mha.h"
@@ -57,6 +58,10 @@
 // #define CTA_ROW_MAX_BACKWARD_METHOD 4
 // 1 is 8% slower than 4. 2/3 are 10% slower than 4.
 #define CTA_ROW_MAX_BACKWARD_METHOD 1
+
+// Keep empty softmax states finite so that merging two empty tiles has scale 1.
+// Masked scores use -infinity instead and therefore contribute exactly zero.
+constexpr float initialRowMax = mha::numeric_limits<float>::lowest();
 
 static_assert(inputElemSize >= cacheElemSize);
 
@@ -537,7 +542,7 @@ __device__ inline void applyMaskFromInput(Warp const& warp, WarpAcc& acc, MaskTy
             constexpr bool inWindow = true;
 #endif
             acc(m, n)(i, j) =
-                maskFlag && inWindow && col < nbValidCols ? acc(m, n)(i, j) : safeInitRowMax;
+                maskFlag && inWindow && col < nbValidCols ? acc(m, n)(i, j) : -CUDART_INF_F;
           }
         }
       }
@@ -578,14 +583,15 @@ __device__ inline QuadRegRowMax warpTileOnlineSoftmax(Warp const& warp,
 #pragma unroll
     for (uint32_t i = 0; i < InstAcc::rows; i++) {
       float const maxVal = rowMax[m * InstAcc::rows + i];
-      float const bias = maxVal * log2e;
 #pragma unroll
       for (uint32_t n = 0; n < acc.cols; n++) {
 #pragma unroll
         for (uint32_t j = 0; j < InstAcc::cols; j++) {
           float& elem = acc(m, n)(i, j);
           assert(maxVal >= elem);
-          elem = exp2f(elem * log2e - bias);
+          // Subtract first: an FMA against a rounded maxVal * log2e leaves an
+          // error proportional to |maxVal|, even when elem == maxVal.
+          elem = exp2f((elem - maxVal) * log2e);
         }
       }
     }
@@ -1650,7 +1656,7 @@ CUBIN_EXPORT __global__
 #if CTA_ROW_MAX_BACKWARD_METHOD != 0
   static_assert(ctaSize >= sizeof(smem.ctaRowMax) / sizeof(float));
   if (ctaThrdId < sizeof(smem.ctaRowMax) / sizeof(float)) {
-    reinterpret_cast<float*>(&smem.ctaRowMax[0])[ctaThrdId] = safeInitRowMax;
+    reinterpret_cast<float*>(&smem.ctaRowMax[0])[ctaThrdId] = initialRowMax;
   }
 #endif
 #if GRP_LOAD_V
@@ -1967,7 +1973,7 @@ CUBIN_EXPORT __global__
     }
 #if CTA_ROW_MAX_BACKWARD_METHOD == 2
     ThrdRegRowMax initRowMax;
-    initRowMax.fill(safeInitRowMax);
+    initRowMax.fill(initialRowMax);
 #endif
     for (uint32_t seqIter = seqIterInit; seqIter < nbSeqIters; seqIter += seqStrideIters) {
 #if SHORT_SEQ_OPT
@@ -2054,7 +2060,7 @@ CUBIN_EXPORT __global__
       rescaleAcc(warp, acc, qkScale);
 #if CTA_ROW_MAX_BACKWARD_METHOD == 0
       QuadRegRowMax initRowMaxQuad;
-      initRowMaxQuad.fill(safeInitRowMax);
+      initRowMaxQuad.fill(initialRowMax);
 #elif CTA_ROW_MAX_BACKWARD_METHOD == 1
       // load hint
       xBar.consumed.wait_parity(getAndFlip(xBarConsumedParityNext));
@@ -2112,7 +2118,7 @@ CUBIN_EXPORT __global__
         uint32_t const validTokenEnd =
             (warpTileTokenBeg < cacheSeqLen ? cacheSeqLen - warpTileTokenBeg : 0U);
         if (validTokenBeg > 0 || validTokenEnd < warpTile.x) {
-          applyMask(warp, acc, validTokenBeg, validTokenEnd);
+          applyMask(warp, acc, validTokenBeg, validTokenEnd, -CUDART_INF_F);
         }
       }
 #endif
@@ -2400,7 +2406,7 @@ CUBIN_EXPORT __global__
     // @fixme: do prefetch for next iter tile if last part
 
     ThrdRegRowMax globalRowMax;
-    globalRowMax.fill(safeInitRowMax);
+    globalRowMax.fill(initialRowMax);
     ThrdRegRowMax globalRowSum;
     globalRowSum.fill(0);
     // the accumulators, one per head-dim slice owned by this warp
@@ -2627,7 +2633,11 @@ CUBIN_EXPORT __global__
         addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
 #endif
       }
-      ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
+      ThrdRegRowMax rcpRowSum;
+#pragma unroll
+      for (uint32_t i = 0; i < rcpRowSum.size; i++) {
+        rcpRowSum[i] = globalRowSum[i] > 0.F ? __frcp_rn(globalRowSum[i]) : 0.F;
+      }
 #if LOW_PREC_OUTPUT
       voScale *= rcpOutScale;
 #endif
@@ -2863,7 +2873,12 @@ CUBIN_EXPORT __global__
 #endif
           }
           __syncthreads();
-          rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
+          ThrdRegRowMax rcpMergedRowSum;
+#pragma unroll
+          for (uint32_t i = 0; i < rcpMergedRowSum.size; i++) {
+            rcpMergedRowSum[i] = mergedRowSum[i] > 0.F ? __frcp_rn(mergedRowSum[i]) : 0.F;
+          }
+          rescaleAcc(warp, sumAcc, fullRescaleMask, rcpMergedRowSum);
           GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
           SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
           if (warpGrpIdx == 0) {
