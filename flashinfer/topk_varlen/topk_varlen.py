@@ -1617,7 +1617,10 @@ def top_k_varlen(
     its request's window ``[row_starts[r], row_starts[r] + seq_lens[r])``. The
     result is the ``top_k`` indices of every row's valid columns, ``-1`` padded
     where a row has fewer valid columns than ``top_k``, and with
-    ``return_values=True`` also the selected scores. In decode mode, an index
+    ``return_values=True`` also the selected scores. The set is the contract:
+    the indices within a row come in no specified order, and which of several
+    columns tied at the ``top_k``-th score is kept may differ between
+    backends, launch shapes and runs. In decode mode, an index
     is the logits column, which is also the key's position in its request's
     cache, or the key's physical KV slot when ``page_table`` is given. In
     windowed (prefill) mode, an index is by default the position
