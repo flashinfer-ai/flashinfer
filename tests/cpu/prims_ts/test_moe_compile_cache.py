@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -91,7 +92,7 @@ def _fake_launch_io(address: int = 1 << 20, *, align: int = 16, shape=None) -> d
     io["shape"] = shape or (4608, 1024, 5120, 48, 128)
     io["launch_early_exit_max_token_ctas"] = 96
     io["c_row_stride"] = io["shape"][0]
-    io["cfg"] = object()
+    io["cfg"] = SimpleNamespace(fused_finalize_top_k=0)
     return io
 
 

@@ -93,6 +93,19 @@ def _cudnn_supports_paged_auto() -> bool:
 
 
 @functools.cache
+def _cudnn_supports_paged_fp16_auto() -> bool:
+    """FP16 paged placement follows the BF16 rules starting with stable FE 1.33."""
+    if not _cudnn_supports_paged_auto():
+        return False
+    try:
+        from packaging.version import Version
+
+        return Version(cudnn.__version__) >= Version("1.33.0")
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+@functools.cache
 def _cudnn_supports_paged_gqa_auto(head_dim: int) -> bool:
     """D256 needs FE 1.33 placement and matching native split origins."""
     if head_dim != 256 or not _cudnn_supports_paged_auto():
@@ -109,6 +122,21 @@ def _cudnn_supports_paged_gqa_auto(head_dim: int) -> bool:
                     binder, f"supports_paged_d{head_dim}_split_physical_origins", False
                 )
             )
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+@functools.cache
+def _cudnn_supports_paged_full_prefill_auto(head_dim: int) -> bool:
+    """Full-prefill placement requires stable FE 1.33 and matching native support."""
+    if head_dim not in (128, 256) or not _cudnn_supports_paged_auto():
+        return False
+    try:
+        from packaging.version import Version
+
+        return Version(cudnn.__version__) >= Version("1.33.0") and (
+            head_dim == 128 or _cudnn_supports_paged_gqa_auto(head_dim)
         )
     except (AttributeError, TypeError, ValueError):
         return False
@@ -1042,6 +1070,13 @@ if CUDNN_AVAILABLE:
                 if actual_seq_lens_kv is not None:
                     tensors_to_return.append(cudnn_actual_seq_lens_kv)
 
+            if (
+                not use_cu_seq_lens
+                and (batch_offsets_q is not None or batch_offsets_k is not None)
+                and (actual_seq_lens_q is not None or actual_seq_lens_kv is not None)
+            ):
+                # SM120 prefill derives lengths from ragged offsets and ignores explicit ones.
+                g.deselect_engines(["sdpa_fwd_prefill_sm120"])
             if workspace_limit is not None:
                 # The same constraint applies to backend and Python engines.
                 # This graph has its own cache key; never filter a shared graph.

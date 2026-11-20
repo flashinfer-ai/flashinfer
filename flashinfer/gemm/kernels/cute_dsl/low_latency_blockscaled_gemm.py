@@ -71,9 +71,12 @@ import cutlass.testing
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack, make_fake_stream, make_ptr
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass._mlir.dialects import llvm
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.utils.gemm.tensor_utils import decode_float4e2m1fn
+
+from flashinfer.cute_dsl.utils import mbarrier_wait_acquire_cluster
 from cutlass.pipeline import (
     PipelineAsync,
     PipelineAsyncUmma,
@@ -85,6 +88,20 @@ from cutlass.pipeline import (
     make_pipeline_state,
     PipelineUserType,
 )
+
+
+def _tcgen05_fence(*, before: bool) -> None:
+    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
+    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns)."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 class WorkTileInfo(NamedTuple):
@@ -883,7 +900,7 @@ class LowLatencyBlockscaledGemmKernel:
                     cute.arch.mbarrier_init(tmem_alloc_result_bar, 32 + 128 + 128)
                 else:
                     cute.arch.mbarrier_init(tmem_alloc_result_bar, 32 + 128)
-                if cutlass.const_expr(self.use_bias):
+                if cutlass.const_expr(self.use_scale or self.use_bias):
                     # All 32 B-load threads arrive after issuing activation loads
                     cute.arch.mbarrier_init(tma_epilog_full_bar, 32)
                 if self.split_k > 1:
@@ -1253,8 +1270,8 @@ class LowLatencyBlockscaledGemmKernel:
             )
             ab_state.advance()
 
-        # Release bias loads after the B-load warp satisfies the PDL dependency
-        if cutlass.const_expr(self.use_bias):
+        # Release epilogue input loads after the B-load warp satisfies the PDL dependency
+        if cutlass.const_expr(self.use_scale or self.use_bias):
             cute.arch.mbarrier_arrive(tma_epilog_full_bar)
 
         # Producer tail: keep shared memory alive until MMA releases every stage
@@ -1385,7 +1402,9 @@ class LowLatencyBlockscaledGemmKernel:
             ab_observer.advance()
             sfb_state.advance()
 
-        # Join the TMEM release phase
+        # Join the TMEM release phase (tcgen05.fence::before_thread_sync publishes
+        # the retired tcgen05.st to the MMA warp's dealloc)
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(tmem_alloc_result_bar)
 
     @cute.jit
@@ -1622,8 +1641,15 @@ class LowLatencyBlockscaledGemmKernel:
             tcgen05.commit(mma_epilog_full_bar, None, self.cta_group)
 
         # Release the tensor memory allocation
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open (an epilogue or SFB warp has not arrived yet), it counts toward
+        # phase 0 and the parity-1 wait passes before their tcgen05.ld.
+        cute.arch.mbarrier_wait(tmem_alloc_result_bar, 0)
         cute.arch.mbarrier_arrive(tmem_alloc_result_bar)
         cute.arch.mbarrier_wait(tmem_alloc_result_bar, 1)
+        # tcgen05.fence::after_thread_sync orders the dealloc after the
+        # epilogue's and SFB warps' tcgen05 work handed off by the wait
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols)
 
     @cute.jit
@@ -1747,9 +1773,6 @@ class LowLatencyBlockscaledGemmKernel:
         for i in range(cute.size(tDpredC)):
             tDpredC[i] = cute.elem_less(tDcC[i], mC_mnl.shape)
 
-        if cutlass.const_expr(self.use_scale):
-            scale_value = mScale[0].to(self.acc_dtype)
-
         # Use C's register mapping for the M-broadcast bias
         if cutlass.const_expr(self.use_bias):
             gBias_mnl = cute.local_tile(
@@ -1772,8 +1795,12 @@ class LowLatencyBlockscaledGemmKernel:
             tDrBias = cute.make_rmem_tensor(epi_frag_shape, self.bias_dtype)
             tDrBiasAcc = cute.make_rmem_tensor(epi_frag_shape, self.acc_dtype)
 
-            # Wait for the B-load warp to satisfy the bias producer dependency
+        # Wait for the B-load warp to satisfy the scale and bias producer dependency
+        if cutlass.const_expr(self.use_scale or self.use_bias):
             cute.arch.mbarrier_wait(tma_epilog_full_bar, 0)
+        if cutlass.const_expr(self.use_scale):
+            scale_value = mScale[0].to(self.acc_dtype)
+        if cutlass.const_expr(self.use_bias):
             cute.basic_copy_if(tDpredC, tDgBias, tDrBias)
             tDrBiasAcc.store(tDrBias.load().to(self.acc_dtype))
 
@@ -1794,6 +1821,9 @@ class LowLatencyBlockscaledGemmKernel:
             if k_tile_count == 0:
                 tDrAcc.fill(0.0)
 
+        # tcgen05.fence::before_thread_sync publishes the retired tcgen05.ld to
+        # the MMA warp's dealloc across the mbarrier hand-off
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(tmem_alloc_result_bar)
 
         # Type conversion and GMEM store (with optional DSMEM split-k reduction)
@@ -1838,7 +1868,7 @@ class LowLatencyBlockscaledGemmKernel:
                             cutlass.Int32(peer),
                         )
 
-            cute.arch.mbarrier_wait(mailbox_mbar, 0)
+            mbarrier_wait_acquire_cluster(mailbox_mbar, cutlass.Int32(0))
 
             my_shard_start = split_rank * shard_ept
             for s in range(self.split_k - 1):

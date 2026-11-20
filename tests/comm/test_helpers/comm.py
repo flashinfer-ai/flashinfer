@@ -111,13 +111,15 @@ def _get_master_addr():
     return "localhost"
 
 
-def init_torch_distributed_from_mpi():
+def init_torch_distributed_from_mpi(*, device_id: torch.device | None = None):
     """Initialize torch.distributed using environment rank info.
 
     Supports SLURM (srun), torchrun, or MPI launchers.
     Safe to call multiple times - will skip if already initialized.
 
     Uses explicit init_method to avoid modifying environment variables.
+    Pass device_id to bind NCCL to the selected GPU instead of inferring it
+    from the global rank, which can be wrong for sparse multi-node launches.
     """
     if dist.is_initialized():
         return
@@ -134,6 +136,7 @@ def init_torch_distributed_from_mpi():
         init_method=init_method,
         rank=rank,
         world_size=world_size,
+        device_id=device_id,
     )
 
 

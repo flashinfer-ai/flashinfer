@@ -473,6 +473,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         gated: bool = True,
         use_a_per_token_scale: bool = False,
         pre_fc2_routing: bool = False,
+        clamped_relu2_tanh_approx: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -538,6 +539,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             the soft clamp, the square and the weighting. Requires non-gated
             ClampedRelu2 and the routing_weights tensor.
         :type pre_fc2_routing: bool
+        :param clamped_relu2_tanh_approx: Compute the ClampedRelu2 soft clamp
+            ``L * tanh(x / L)`` with one ``tanh.approx.f32`` per element instead
+            of the sigmoid-based tanh. Compile-time only; False (the default)
+            generates the unchanged epilogue. Requires ClampedRelu2.
+        :type clamped_relu2_tanh_approx: bool
         """
 
         self.sf_vec_size = sf_vec_size
@@ -645,6 +651,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # Weight each route after a BF16-rounded ClampedRelu2 and quantize with
         # one global scale per expert, matching the pre-FC2 reference bit for bit.
         self.pre_fc2_routing = pre_fc2_routing
+        self.clamped_relu2_tanh_approx = clamped_relu2_tanh_approx
+        if clamped_relu2_tanh_approx and not self.use_clamped_relu2:
+            raise ValueError("clamped_relu2_tanh_approx requires ClampedRelu2")
         if pre_fc2_routing and (gated or not self.use_clamped_relu2):
             raise ValueError("pre_fc2_routing requires non-gated ClampedRelu2")
         if pre_fc2_routing and use_a_per_token_scale:
@@ -2902,7 +2911,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         cutlass.Float32(alpha_val),
                                     ),
                                 )
-                                if cutlass.const_expr(self.use_clamped_relu2):
+                                if cutlass.const_expr(self.clamped_relu2_tanh_approx):
+                                    # One MUFU tanh.approx.f32 per element (SM107 MXFP8).
+                                    acc_alpha = (
+                                        clamp_limit
+                                        * _tanh_approx_f32(
+                                            acc_alpha[0] * inv_clamp_limit
+                                        ),
+                                        clamp_limit
+                                        * _tanh_approx_f32(
+                                            acc_alpha[1] * inv_clamp_limit
+                                        ),
+                                    )
+                                elif cutlass.const_expr(self.use_clamped_relu2):
                                     acc_alpha = (
                                         clamp_limit
                                         * tanh_f32(
@@ -2924,7 +2945,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
                                 v = acc_vec[i] * cutlass.Float32(alpha_val)
-                                if cutlass.const_expr(self.use_clamped_relu2):
+                                if cutlass.const_expr(self.clamped_relu2_tanh_approx):
+                                    v = clamp_limit * _tanh_approx_f32(
+                                        v * inv_clamp_limit
+                                    )
+                                elif cutlass.const_expr(self.use_clamped_relu2):
                                     v = clamp_limit * tanh_f32(
                                         v * inv_clamp_limit, fastmath=True
                                     )
@@ -3291,17 +3316,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
 
                         #
-                        # Store SFC to global memory
+                        # Store SFC to global memory (guarded for the N boundary)
                         #
-                        # TODO: Need to think about predicate on it
-                        # if cute.elem_less():
-                        if cutlass.const_expr(self.is_mxfp8_output):
-                            # Preserve those raw codes with scalar byte stores;
-                            # the generic auto-vectorizer requires at least 32 bits.
-                            for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
-                                tCgSFC[vi] = tCrSFC[vi]
-                        else:
-                            cute.autovec_copy(tCrSFC, tCgSFC)
+                        # SF blocks past the last column alias the next 128 rows' SFs.
+                        if sfc_subtile_idx_mn[1] < cute.size(tCgSFC_mn, mode=[4]):
+                            if cutlass.const_expr(self.is_mxfp8_output):
+                                # Preserve those raw codes with scalar byte stores;
+                                # the generic auto-vectorizer requires at least 32 bits.
+                                for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                    tCgSFC[vi] = tCrSFC[vi]
+                            else:
+                                cute.autovec_copy(tCrSFC, tCgSFC)
 
                         #
                         # Compute quantized output values and convert to C type

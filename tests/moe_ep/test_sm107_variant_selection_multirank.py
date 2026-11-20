@@ -42,7 +42,7 @@ from tests.moe_ep import test_moe_ep_sm107_block_scaled_mega_multirank as proble
             "late-situ-empty",
             "inference-only",
             "native-skipped",
-            "inner-reuse",
+            "capacity-change",
         )
     ],
 )
@@ -96,7 +96,7 @@ def test_variant_search_replay_and_handoff(
         max_tokens_per_rank=1025
         if scenario == "inference-only"
         else problem.NUM_TOKENS
-        if scenario == "inner-reuse"
+        if scenario == "capacity-change"
         else problem.MAX_TOKENS,
         token_hidden_size=problem.HIDDEN,
     )
@@ -133,14 +133,16 @@ def test_variant_search_replay_and_handoff(
     layers = [layer]
     graph = None
     calls = []
-    reusing_inner = False
+    retuning_capacity = False
     sweep = native._sweep_sm107_block_scaled_mega_moe
 
     def counted(*args, **kwargs):
         calls.append(args[3].config.kernel_variant)
         assert kwargs["make_trial"] is not None
-        if scenario == "native-skipped" or reusing_inner:
+        if scenario == "native-skipped":
             assert len(kwargs["candidates"]) == 1
+        elif retuning_capacity:
+            assert len(kwargs["candidates"]) > 1
         return sweep(*args, **kwargs)
 
     monkeypatch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", counted)
@@ -177,7 +179,7 @@ def test_variant_search_replay_and_handoff(
         graph.replay()
         torch.cuda.synchronize()
         assert_reference(old_output, expected, kind)
-        transformed = layer._get_transformed_weights()
+        transformed = layer.get_transformed_weights()
         fixed = moe_ep.MoEEpLayer(
             bootstrap,
             fleet,
@@ -231,7 +233,7 @@ def test_variant_search_replay_and_handoff(
         assert all(value == choices for value in values)
         if rank == 0:
             assert records
-        if scenario == "inner-reuse":
+        if scenario == "capacity-change":
             inner = tuner.get_protocol_records(NATIVE_NAMESPACE)
             if rank == 0:
                 assert {r["kernel_variant"] for r in inner.values()} == {
@@ -255,13 +257,26 @@ def test_variant_search_replay_and_handoff(
                 larger.warmup(tensors)
                 assert_reference(larger.forward(tensors), expected, kind)
             assert calls == expected_calls
-            reusing_inner = True
+            retuning_capacity = True
             with autotune_v2(**context_options):
                 larger.warmup(tensors)
             assert calls == expected_calls * 2
             assert_reference(larger.forward(tensors), expected, kind)
             if rank == 0:
-                assert tuner.get_protocol_records(NATIVE_NAMESPACE) == inner
+                updated = tuner.get_protocol_records(NATIVE_NAMESPACE)
+                assert all(updated[key] == record for key, record in inner.items())
+                added = [updated[key] for key in updated.keys() - inner.keys()]
+                assert len(added) == 2
+                assert {record["kernel_variant"] for record in added} == {
+                    "inference",
+                    "genphase",
+                }
+                assert {record["max_tokens"] for record in added} == {
+                    2 * fleet.max_tokens_per_rank
+                }
+                assert {record["live_tokens"] for record in added} == {
+                    record["live_tokens"] for record in inner.values()
+                }
             for variant in ("inference", "genphase"):
                 pinned = moe_ep.MoEEpLayer(
                     bootstrap,
