@@ -2247,6 +2247,66 @@ void finalizeMoeRoutingKernelLauncher(
   }
 }
 
+// Replaces the finalize kernel when the caller does the top-k reduction (do_finalize=false).
+// Writes the token-major [num_rows, experts_per_token] map from each route to the GEMM2 row that
+// holds it, or -1 when the route's expert is not on this rank. unpermuted_row_to_permuted_row is
+// slot-major (slot * num_rows + token), and entries for non-local experts can be stale, so the
+// map is masked by expert id with the same checks as finalizeMoeRoutingKernel.
+__global__ void buildUnfinalizedPermutedIdxKernel(
+    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts,
+    int* unfinalized_permuted_idx, int64_t const num_rows, int64_t const experts_per_token,
+    int const num_experts_per_node, int const start_expert_id) {
+  int64_t const expanded_rows = num_rows * experts_per_token;
+  int64_t const route = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+  // This kernel does not read GEMM2 output, but it runs after GEMM2 and waits for it here, so a
+  // PDL-launched consumer of the GEMM2 rows that waits on this kernel also waits on GEMM2.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+  if (route < expanded_rows) {
+    int64_t const token = route / experts_per_token;
+    int64_t const slot = route % experts_per_token;
+    int const expert_id = token_selected_experts[route] - start_expert_id;
+    int permuted_row = -1;
+    if (expert_id >= 0 && expert_id < num_experts_per_node) {
+      permuted_row = unpermuted_row_to_permuted_row[slot * num_rows + token];
+      if (permuted_row < 0 || permuted_row >= expanded_rows) {
+        permuted_row = -1;
+      }
+    }
+    unfinalized_permuted_idx[route] = permuted_row;
+  }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+void buildUnfinalizedPermutedIdxKernelLauncher(
+    int const* unpermuted_row_to_permuted_row, int const* token_selected_experts,
+    int* unfinalized_permuted_idx, int64_t const num_rows, int64_t const experts_per_token,
+    int const num_experts_per_node, int const start_expert_id, bool enable_pdl,
+    cudaStream_t stream) {
+  int64_t const expanded_rows = num_rows * experts_per_token;
+  if (expanded_rows == 0) {
+    return;
+  }
+  int const threads = 256;
+  cudaLaunchConfig_t config;
+  config.gridDim = static_cast<unsigned int>(tensorrt_llm::common::ceilDiv(expanded_rows, threads));
+  config.blockDim = threads;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  cudaLaunchKernelEx(&config, buildUnfinalizedPermutedIdxKernel, unpermuted_row_to_permuted_row,
+                     token_selected_experts, unfinalized_permuted_idx, num_rows, experts_per_token,
+                     num_experts_per_node, start_expert_id);
+}
+
 #define INSTANTIATE_FINALIZE_MOE_ROUTING(OutputT, GemmOutputT, ScaleBiasT)                  \
   template void finalizeMoeRoutingKernelLauncher<OutputT, GemmOutputT, ScaleBiasT>(         \
       GemmOutputT const* expanded_permuted_rows, OutputT* reduced_unpermuted_output,        \
@@ -3842,7 +3902,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
           bool use_lora, void* fc2_lora, cudaStream_t stream,
           MOEParallelismConfig parallelism_config, bool const enable_alltoall,
           cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
+          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
+          bool do_finalize) {
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
   bool const using_tma_ws_gemm2 = gemm_runner.isTmaWarpSpecialized(config);
@@ -3931,6 +3992,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
                       {}, false, nullptr, nullptr, nullptr, enable_pdl, stream);
     sync_check_cuda_error(stream);
   }
+
+  // The caller reduces the permuted GEMM2 rows itself.
+  if (!do_finalize) return;
 
   bool has_different_output_type_ampere = (use_w4afp8 || use_fp8) && !using_tma_ws_gemm2;
   bool using_fused_finalize =
@@ -4202,7 +4266,8 @@ void CutlassMoeFCRunner<
                     MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                     bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                     bool use_mxfp8_act_scaling, bool min_latency_mode,
-                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
+                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+                    void* unfinalized_gemm2_output, int* unfinalized_permuted_idx) {
   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value ||
                                               std::is_same<WeightType, cutlass::uint4b_t>::value ||
                                               use_wfp4a16;
@@ -4369,6 +4434,27 @@ void CutlassMoeFCRunner<
   int start_expert = num_experts_per_node * parallelism_config.ep_rank;
   int end_expert = start_expert + num_experts_per_node;
 
+  // do_finalize=false: GEMM2 writes its permuted rows to unfinalized_gemm2_output and the caller
+  // does the top-k reduction from unfinalized_permuted_idx. Only the plain unfused finalize path
+  // can hand that reduction over, since the caller applies nothing but the routing weights.
+  bool const do_finalize = unfinalized_gemm2_output == nullptr;
+  TLLM_CHECK_WITH_INFO(
+      do_finalize == (unfinalized_permuted_idx == nullptr),
+      "unfinalized_gemm2_output and unfinalized_permuted_idx must be set together");
+  if (!do_finalize) {
+    TLLM_CHECK_WITH_INFO(!use_fused_finalize_,
+                         "do_finalize=false requires a runner built with use_fused_finalize=false");
+    TLLM_CHECK_WITH_INFO(!min_latency_mode, "do_finalize=false does not support min_latency_mode");
+    TLLM_CHECK_WITH_INFO(!use_deepseek_fp8_block_scale,
+                         "do_finalize=false does not support DeepSeek FP8 block scaling");
+    TLLM_CHECK_WITH_INFO(!enable_alltoall, "do_finalize=false does not support enable_alltoall");
+    TLLM_CHECK_WITH_INFO(!use_lora, "do_finalize=false does not support LoRA");
+    TLLM_CHECK_WITH_INFO(fc2_expert_biases_void == nullptr,
+                         "do_finalize=false does not support fc2_expert_biases");
+    TLLM_CHECK_WITH_INFO(unpadded_hidden_size == hidden_size,
+                         "do_finalize=false does not support a padded hidden size");
+  }
+
   bool const needs_num_valid = parallelism_config.ep_size > 1;
   int64_t const* num_valid_tokens_ptr =
       needs_num_valid ? expert_first_token_offset_ + num_experts_per_node : nullptr;
@@ -4393,7 +4479,7 @@ void CutlassMoeFCRunner<
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
         fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
         min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
-        enable_pdl, stream);
+        enable_pdl, stream, /*unfinalized_gemm2_output=*/nullptr);
 
     // todo: input_activations_void should be nvfp4, waiting for yuxian's mr ready
     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner,
@@ -4510,7 +4596,7 @@ void CutlassMoeFCRunner<
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
         fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
         min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
-        enable_pdl, stream);
+        enable_pdl, stream, unfinalized_gemm2_output);
 
     auto* gemm1_result = fc1_result_;
     auto* gemm2_result = fc2_result_;
@@ -4523,6 +4609,9 @@ void CutlassMoeFCRunner<
         gemm1_result = reinterpret_cast<T*>(fc2_result_);
         gemm2_result = static_cast<void*>(fc1_result_);
       }
+    }
+    if (!do_finalize) {
+      gemm2_result = unfinalized_gemm2_output;
     }
 
     if (use_lora) {
@@ -4568,16 +4657,24 @@ void CutlassMoeFCRunner<
         applyPrequantScale(smoothed_act_, gemm1_result, quant_params.groupwise.fc2.act_scales,
                            num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
     sync_check_cuda_error(stream);
-    Self::gemm2(
-        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
-        gemm_expert_first_token_offset, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
-        fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
-        token_topk_unpermuted_scales, permuted_token_final_scales_, unpermuted_row_to_permuted_row,
-        permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
-        expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
-        experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
-        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
+    Self::gemm2(moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
+                gemm_expert_first_token_offset, gemm2_tma_ws_input, fc2_expert_weights,
+                fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_,
+                quant_params, token_topk_unpermuted_scales, permuted_token_final_scales_,
+                unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
+                token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
+                hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
+                experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
+                parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr,
+                enable_pdl, do_finalize);
     sync_check_cuda_error(stream);
+
+    if (!do_finalize) {
+      buildUnfinalizedPermutedIdxKernelLauncher(
+          unpermuted_row_to_permuted_row, token_selected_experts, unfinalized_permuted_idx,
+          num_rows, experts_per_token, num_experts_per_node, start_expert, enable_pdl, stream);
+      sync_check_cuda_error(stream);
+    }
   }
 }
 
@@ -4701,7 +4798,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
                                   ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
                                   MoeMinLatencyParams& min_latency_params, bool use_lora,
                                   int start_expert, MOEParallelismConfig parallelism_config,
-                                  bool enable_pdl, cudaStream_t stream) {
+                                  bool enable_pdl, cudaStream_t stream,
+                                  void* unfinalized_gemm2_output) {
   auto gemm1_tma_ws_input = tma_ws_grouped_gemm1_input_;
   auto gemm2_tma_ws_input = tma_ws_grouped_gemm2_input_;
 
@@ -4780,6 +4878,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
         TLLM_CHECK_WITH_INFO(fc1_fp4_act_scale_ != fc2_fp4_act_scale_,
                              "Fused GEMM1 input and output scale buffers are overlapping");
       }
+    }
+    if (unfinalized_gemm2_output) {
+      gemm2_output = unfinalized_gemm2_output;
     }
     TLLM_CHECK_WITH_INFO(
         (gemm1_tma_ws_input.swap_ab && gemm2_tma_ws_input.swap_ab) || !use_sm90_mixed_input_gemm,

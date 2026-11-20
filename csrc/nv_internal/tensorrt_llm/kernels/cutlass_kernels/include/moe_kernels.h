@@ -491,8 +491,8 @@ class CutlassMoeFCRunnerInterface {
                       MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                       bool use_mxfp8_act_scaling, bool min_latency_mode,
-                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
-                      cudaStream_t stream) = 0;
+                      MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+                      void* unfinalized_gemm2_output, int* unfinalized_permuted_idx) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -717,8 +717,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora,
               LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
               bool use_mxfp8_act_scaling, bool min_latency_mode,
-              MoeMinLatencyParams& min_latency_params, bool enable_pdl,
-              cudaStream_t stream) override;
+              MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+              void* unfinalized_gemm2_output, int* unfinalized_permuted_idx) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
   static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
@@ -768,7 +768,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
       void* fc2_lora, cudaStream_t stream, MOEParallelismConfig parallelism_config,
       bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config,
       bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
-      bool enable_pdl);
+      bool enable_pdl, bool do_finalize = true);
 
   // Overrides to allow us to forward on to the internal functions with the pointers using the
   // correct type
@@ -904,7 +904,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                                 ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
                                 MoeMinLatencyParams& min_latency_params, bool use_lora,
                                 int start_expert, MOEParallelismConfig parallelism_config,
-                                bool enable_pdl, cudaStream_t stream);
+                                bool enable_pdl, cudaStream_t stream,
+                                void* unfinalized_gemm2_output);
 
   static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecialized(

@@ -350,7 +350,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               Optional<Array<int64_t>> profile_ids, bool enable_pdl,
               ActivationType base_activation_type = ActivationType::Swiglu,
               Optional<TensorView> workspace_buffer = Optional<TensorView>{},
-              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv) {
+              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv,
+              Optional<TensorView> unfinalized_gemm2_output = Optional<TensorView>{},
+              Optional<TensorView> unfinalized_permuted_idx = Optional<TensorView>{}) {
     std::lock_guard<std::mutex> lock(mMutex);
     ffi::CUDADeviceGuard device_guard(input.device().device_id);
 
@@ -446,6 +448,34 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << " for weights";
     }
 
+    // do_finalize=false: both outputs or neither. The kernel runner checks the feature combination.
+    TVM_FFI_ICHECK_EQ(unfinalized_gemm2_output.has_value(), unfinalized_permuted_idx.has_value())
+        << "unfinalized_gemm2_output and unfinalized_permuted_idx must be passed together.";
+    void* unfinalized_gemm2_output_ptr = nullptr;
+    int* unfinalized_permuted_idx_ptr = nullptr;
+    if (unfinalized_gemm2_output.has_value()) {
+      auto const& gemm2_out = unfinalized_gemm2_output.value();
+      auto const& permuted_idx = unfinalized_permuted_idx.value();
+      CHECK_CONTIGUOUS(gemm2_out);
+      CHECK_CONTIGUOUS(permuted_idx);
+      CHECK_DEVICE(gemm2_out, input);
+      CHECK_DEVICE(permuted_idx, input);
+      CHECK_INPUT_TYPE(gemm2_out, mOutputDtype);
+      CHECK_INPUT_TYPE(permuted_idx, dl_int32);
+      CHECK_DIM(2, gemm2_out);
+      CHECK_DIM(2, permuted_idx);
+      TVM_FFI_ICHECK_EQ(gemm2_out.size(0), num_rows * experts_per_token)
+          << "unfinalized_gemm2_output must have num_rows * top_k rows.";
+      TVM_FFI_ICHECK_EQ(gemm2_out.size(1), hidden_size)
+          << "unfinalized_gemm2_output must have hidden_size columns.";
+      TVM_FFI_ICHECK_EQ(permuted_idx.size(0), num_rows)
+          << "unfinalized_permuted_idx must have num_rows rows.";
+      TVM_FFI_ICHECK_EQ(permuted_idx.size(1), experts_per_token)
+          << "unfinalized_permuted_idx must have top_k columns.";
+      unfinalized_gemm2_output_ptr = gemm2_out.data_ptr();
+      unfinalized_permuted_idx_ptr = static_cast<int*>(permuted_idx.data_ptr());
+    }
+
     int const num_experts_on_rank = fc2_expert_weights.size(0);
     auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
     auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
@@ -492,7 +522,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
         enable_alltoall, use_lora, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
-        min_latency_mode, min_latency_params, enable_pdl, stream);
+        min_latency_mode, min_latency_params, enable_pdl, stream, unfinalized_gemm2_output_ptr,
+        unfinalized_permuted_idx_ptr);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -508,7 +539,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
         false, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling, min_latency_mode,
-        min_latency_params, enable_pdl, stream);
+        min_latency_params, enable_pdl, stream, unfinalized_gemm2_output_ptr,
+        unfinalized_permuted_idx_ptr);
 #endif
   }
 
@@ -673,7 +705,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
         enable_alltoall, use_lora_ml, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
-        min_latency_mode, min_latency_params, enable_pdl, stream);
+        min_latency_mode, min_latency_params, enable_pdl, stream,
+        /*unfinalized_gemm2_output=*/nullptr, /*unfinalized_permuted_idx=*/nullptr);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -689,7 +722,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace_ptr),
         output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
         false, use_lora_ml, lora_params, mUseDeepSeekFP8BlockScaling, mUseMxfp8ActScaling,
-        min_latency_mode, min_latency_params, enable_pdl, stream);
+        min_latency_mode, min_latency_params, enable_pdl, stream,
+        /*unfinalized_gemm2_output=*/nullptr, /*unfinalized_permuted_idx=*/nullptr);
 #endif
   }
 
@@ -858,14 +892,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
                  Optional<Array<int64_t>> profile_ids, bool enable_pdl,
                  int64_t base_activation_type, Optional<TensorView> workspace_buffer,
-                 int64_t nvfp4_4over6_code) {
+                 int64_t nvfp4_4over6_code, Optional<TensorView> unfinalized_gemm2_output,
+                 Optional<TensorView> unfinalized_permuted_idx) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                    swiglu_alpha, swiglu_beta, swiglu_limit, clamped_relu2_limit, situ_beta,
                    situ_linear_beta, swizzled_input_sf, tp_size, tp_rank, ep_size, ep_rank,
                    cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
                    enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer,
-                   nvfp4_4over6_code);
+                   nvfp4_4over6_code, unfinalized_gemm2_output, unfinalized_permuted_idx);
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(

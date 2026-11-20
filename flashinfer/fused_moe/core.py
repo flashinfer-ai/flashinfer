@@ -1219,7 +1219,12 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
     @register_custom_op(
         "flashinfer::cutlass_fused_moe",
-        mutates_args=("output", "workspace_buffer"),
+        mutates_args=(
+            "output",
+            "workspace_buffer",
+            "unfinalized_gemm2_output",
+            "unfinalized_permuted_idx",
+        ),
     )
     def cutlass_fused_moe(
         output: torch.Tensor,
@@ -1261,6 +1266,9 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         workspace_buffer: Optional[torch.Tensor] = None,
         # 4over6 recipe (nvfp4_4over6_code()); the default reads the env.
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
+        # do_finalize=False outputs: permuted GEMM2 rows and the route-to-row map.
+        unfinalized_gemm2_output: Optional[torch.Tensor] = None,
+        unfinalized_permuted_idx: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -1390,6 +1398,12 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             activation_type,
             workspace_buffer,
             nvfp4_4over6_code,
+            # run_moe_min_latency has no unfinalized outputs.
+            *(
+                []
+                if min_latency_mode
+                else [unfinalized_gemm2_output, unfinalized_permuted_idx]
+            ),
         )
 
         return (
@@ -1444,6 +1458,9 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         workspace_buffer: Optional[torch.Tensor] = None,
         # 4over6 recipe (nvfp4_4over6_code()); the default reads the env.
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
+        # do_finalize=False outputs: permuted GEMM2 rows and the route-to-row map.
+        unfinalized_gemm2_output: Optional[torch.Tensor] = None,
+        unfinalized_permuted_idx: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -1578,7 +1595,8 @@ def cutlass_fused_moe(
     situ_linear_beta: Optional[torch.Tensor] = None,
     backend: str = "cutlass",
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
-) -> torch.Tensor:
+    do_finalize: bool = True,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
     This function implements a fused MoE layer that combines expert selection, expert computation,
@@ -1788,10 +1806,37 @@ def cutlass_fused_moe(
           ``fc2_act_global_scale``, and ``fc1_act_global_scale`` when
           ``input`` is BF16, must be built for the same ``e4m3_max``.
 
+    do_finalize : bool = True
+        Whether to run the top-k reduction ("finalize"). ``False`` skips it and
+        returns the unreduced intermediates
+        ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``, the
+        same contract as the TRT-LLM-gen MoE APIs, so that the caller can fuse
+        the reduction into what follows, for example
+        :func:`flashinfer.comm.trtllm_moe_finalize_allreduce_fusion`:
+
+        - ``gemm2_output``: ``[seq_len * top_k, hidden_size]`` in ``output_dtype``,
+          the unweighted GEMM2 rows in permuted order. Rows that no local route
+          maps to are not written.
+        - ``expert_weights``: ``token_final_scales`` as passed (float32).
+          :func:`~flashinfer.comm.trtllm_moe_finalize_allreduce_fusion` reads
+          its ``expert_scale_factor`` in the activation dtype, so cast it first.
+        - ``expanded_idx_to_permuted_idx``: ``[seq_len, top_k]`` int32.
+          Entry ``[t, k]`` is the row of ``gemm2_output`` that holds route
+          ``(t, k)``, or ``-1`` when that expert is not on this rank.
+
+        The caller computes ``sum_k expert_weights[t, k] * gemm2_output[row]``
+        over the routes with ``row >= 0``. Requires the unfused finalize path
+        (``use_fused_finalize`` ``None`` or ``False``) and does not support
+        ``output``, ``fc2_expert_biases`` (so no expert biases at all),
+        ``min_latency_mode``,
+        ``use_deepseek_fp8_block_scale``, ``enable_alltoall``, or
+        ``backend="cake"``.
+
     Returns
     -------
-    out: torch.Tensor
-        Output tensor of shape [seq_len, hidden_size].
+    out: torch.Tensor or List[torch.Tensor]
+        Output tensor of shape [seq_len, hidden_size], or the three unreduced
+        tensors described under ``do_finalize`` when it is ``False``.
 
 
     Raises
@@ -1810,6 +1855,23 @@ def cutlass_fused_moe(
         are not implemented for Blackwell architecture.
 
     """
+    if not do_finalize:
+        # The caller reduces the GEMM2 rows with the routing weights only, so
+        # reject everything that the finalize step would otherwise apply.
+        if use_fused_finalize:
+            raise ValueError("do_finalize=False requires use_fused_finalize=False")
+        use_fused_finalize = False
+        unsupported = {
+            "output": output is not None,
+            "fc2_expert_biases": fc2_expert_biases is not None,
+            "min_latency_mode": min_latency_mode,
+            "use_deepseek_fp8_block_scale": use_deepseek_fp8_block_scale,
+            "enable_alltoall": enable_alltoall,
+            "backend='cake'": backend == "cake",
+        }
+        for name, requested in unsupported.items():
+            if requested:
+                raise ValueError(f"do_finalize=False does not support {name}")
     if use_fused_finalize is None:
         use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
     # Reject an unhonorable pinned recipe before any device work. The NVFP4
@@ -1936,8 +1998,19 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
+    unfinalized_gemm2_output = None
+    unfinalized_permuted_idx = None
+    if not do_finalize:
+        top_k = token_selected_experts.shape[1]
+        unfinalized_gemm2_output = torch.empty(
+            (num_rows * top_k, hidden_size), dtype=output_dtype, device=input.device
+        )
+        unfinalized_permuted_idx = torch.empty(
+            (num_rows, top_k), dtype=torch.int32, device=input.device
+        )
+
     with torch.cuda.device(input.device):
-        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
+        result = get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
             output,
             input,
             token_selected_experts,
@@ -1976,7 +2049,12 @@ def cutlass_fused_moe(
             profile_ids=profile_ids,
             workspace_buffer=workspace_buffer,
             nvfp4_4over6_code=nvfp4_4over6_code_value,
+            unfinalized_gemm2_output=unfinalized_gemm2_output,
+            unfinalized_permuted_idx=unfinalized_permuted_idx,
         )
+    if not do_finalize:
+        return [unfinalized_gemm2_output, token_final_scales, unfinalized_permuted_idx]
+    return result
 
 
 def cutlass_fused_moe_workspace_size(
