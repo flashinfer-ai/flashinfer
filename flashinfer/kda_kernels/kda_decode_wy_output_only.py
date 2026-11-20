@@ -2047,6 +2047,37 @@ def _compile_options(device: torch.device) -> tuple:
     return (cute.GPUArch(f"sm_{major}{minor}a"),) if major == 12 else ()
 
 
+def _select_umma(backend: str, device: torch.device, T_in: int, api: str) -> bool:
+    """Whether to run the experimental tcgen05 / UMMA backend
+    (``flashinfer.experimental.kda_output_only_umma``). ``backend="umma"`` is the
+    explicit opt-in (raises when it cannot run); ``"auto"`` picks it only when
+    ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` and it can run."""
+    from ..api_logging import (
+        experimental_auto_backends_allowed,
+        warn_experimental_backend_once,
+    )
+
+    if backend == "umma":
+        from ..experimental.kda_output_only_umma import (
+            kda_oo_umma_unavailable_reason,
+        )
+
+        why = kda_oo_umma_unavailable_reason(device, T_in)
+        if why is not None:
+            raise ValueError(f"{api}: backend='umma' unavailable: {why}")
+        warn_experimental_backend_once(api, "umma")
+        return True
+    if backend == "auto" and experimental_auto_backends_allowed():
+        from ..experimental.kda_output_only_umma import (
+            kda_oo_umma_unavailable_reason,
+        )
+
+        if kda_oo_umma_unavailable_reason(device, T_in) is None:
+            warn_experimental_backend_once(api, "umma", automatic=True)
+            return True
+    return False
+
+
 def kda_wy_output_only(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -2096,6 +2127,11 @@ def kda_wy_output_only(
             otherwise the softplus gate. Only with ``use_gate_in_kernel``.
         beta_is_logit: apply sigmoid to beta inside the kernel.
         output: optional preallocated ``[B, T, HV, 128]`` bf16 output.
+        backend: ``"auto"`` (batch-size dispatch between the WY kernel and the
+            grouped recurrence), ``"wy"``, ``"recurrent"``, or ``"umma"`` -- the
+            experimental tcgen05 / UMMA kernel (SM10x;
+            ``flashinfer.experimental.kda_output_only_umma``). ``"auto"`` selects
+            ``"umma"`` only with ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``.
 
     Returns:
         ``[B, T, HV, 128]`` bf16 output.
@@ -2242,6 +2278,7 @@ def kda_wy_output_only(
     # in-kernel gate the recurrence pays per-element transform cost, shifting
     # every crossover toward WY — thresholds are halved there (measured at
     # T=8 where WY already wins at every batch; interior points estimated).
+    use_umma = _select_umma(backend, device, T_in, "kda_wy_output_only")
     _bh = B * HV
     _scale = 1 if gate_mode == GATE_PRECOMPUTED else 2
     if T_in == 1:
@@ -2252,7 +2289,9 @@ def kda_wy_output_only(
         _rec_max = _REC_DISPATCH_MAX_BH // (8 * _scale)
     else:
         _rec_max = 0
-    use_rec = backend == "recurrent" or (backend == "auto" and _bh <= _rec_max)
+    use_rec = backend == "recurrent" or (
+        backend == "auto" and _bh <= _rec_max and not use_umma
+    )
     if use_rec:
         rec_args = [
             mk_dyn(q),
@@ -2382,6 +2421,25 @@ def kda_wy_output_only(
         H,
         stream,
     ]
+    if use_umma:
+        from ..experimental.kda_output_only_umma import run_kda_oo_umma
+
+        run_kda_oo_umma(
+            args,
+            device=device,
+            T=T_in,
+            gate_mode=gate_mode,
+            has_dt_bias=has_dt_bias,
+            beta_is_logit=beta_is_logit,
+            emit_corrections=emit_corrections,
+            vllm_dropin=False,
+            null_min=1,
+            HV=HV,
+            H=H,
+        )
+        if emit_corrections:
+            return out_t, corr_t, kg_t
+        return out_t
 
     if cache_key not in _CACHE:
         kernel = KdaDecodeWyOutputOnlyKernel(
@@ -2445,6 +2503,7 @@ def kda_recoverssm_verify(
     beta_is_logit: bool = True,
     scale: Optional[float] = None,
     null_min: int = 1,
+    backend: str = "auto",
 ) -> torch.Tensor:
     """Drop-in replacement for vLLM's ``kda_recoverssm_verify`` (Kimi K3).
 
@@ -2462,7 +2521,16 @@ def kda_recoverssm_verify(
     state GEMMs). Requires SM90+ (validated on SM100a / B200),
     ``K = V = 128``, ``spec_query_len <= 16``, and a bf16 checkpoint pool.
     The checkpoint rows must be dense, but its block stride may include padding.
+
+    ``backend``: ``"auto"`` / ``"wy"`` run the WY kernel; ``"umma"`` the
+    experimental tcgen05 / UMMA kernel (SM10x,
+    ``flashinfer.experimental.kda_output_only_umma``), which ``"auto"`` selects
+    only with ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``.
     """
+    if backend not in ("auto", "wy", "umma"):
+        raise ValueError(
+            f"kda_recoverssm_verify: backend must be 'auto', 'wy' or 'umma'; got {backend!r}"
+        )
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA RecoverSSM q must have shape [1, tokens, heads, dim]")
     _, total_tokens, num_heads, key_dim = q.shape
@@ -2626,6 +2694,25 @@ def kda_recoverssm_verify(
         H,
         stream,
     ]
+    if backend != "wy" and _select_umma(
+        backend, device, spec_query_len, "kda_recoverssm_verify"
+    ):
+        from ..experimental.kda_output_only_umma import run_kda_oo_umma
+
+        run_kda_oo_umma(
+            args,
+            device=device,
+            T=spec_query_len,
+            gate_mode=gate_mode,
+            has_dt_bias=(gate_mode != GATE_PRECOMPUTED),
+            beta_is_logit=beta_is_logit,
+            emit_corrections=True,
+            vllm_dropin=True,
+            null_min=null_min,
+            HV=HV,
+            H=H,
+        )
+        return out
     if cache_key not in _CACHE:
         kernel = KdaDecodeWyOutputOnlyKernel(
             min_blocks_per_mp=mbp,
