@@ -46,7 +46,7 @@ from .plan import (
     snake_order,
     ws_row,
 )
-from .spec import HEAD_DIMS, LSE_BASES, scale_log2
+from .spec import HEAD_DIMS, LN2, LOG2E, LSE_BASES, scale_log2
 
 LSE_MODES = {"log2": 1, "ln": 2}  # the kernels' ``lse_mode`` (0: no LSE store)
 
@@ -649,6 +649,8 @@ class _Planned:
         self.scratch = scratch  # the per-CTA O_m scratch (D = 256)
         # the caller's workspace tensor the partials live in (set by plan_attention)
         self.workspace: Optional[torch.Tensor] = None
+        # the packed rows of the requests without keys of a decode plan (None: no such request)
+        self.null_rows: Optional[torch.Tensor] = None
         self.ragged = False  # the packed-token KV layout (set by plan_attention)
         # what the descriptor table was built for; run_attention refuses anything else (the table holds one unit per KV head
         # and per Q tile, the configuration decides pairing and the unit body)
@@ -690,6 +692,7 @@ def plan_attention(
     fixed: Optional[FixedLaunch] = None,
     non_blocking: bool = True,
     has_sinks: Optional[bool] = None,
+    null_requests: bool = False,
 ) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
@@ -798,6 +801,7 @@ def plan_attention(
         swap_max_rows=SWAPS_MAX_ROWS,
         grid=config.grid,
         grid_search=planner_grid_search(device),
+        null_requests=null_requests,
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
     desc = torch.tensor(
@@ -863,7 +867,41 @@ def plan_attention(
     planned.kv_indptr = kv_indptr.to(
         device=device, dtype=torch.int32, copy=True
     ).contiguous()
+    if null_requests:
+        # the packed rows of the requests without keys: they have no unit, and run_attention fills them (null_row_values)
+        qo = qo_indptr.cpu().tolist()
+        kv = kv_indptr.cpu().tolist()
+        rows = [
+            r
+            for b in range(len(qo) - 1)
+            if kv[b + 1] == kv[b]
+            for r in range(qo[b], qo[b + 1])
+        ]
+        if rows:
+            planned.null_rows = torch.tensor(rows, dtype=torch.int64, device=device)
     return planned
+
+
+def null_row_values(sinks: Optional[torch.Tensor], lse_mode: int) -> tuple:
+    """The output element and the LSE of a row without keys, per head (``(Hq,)`` fp32 tensors, or the scalars ``+0`` and
+    ``-inf`` without sinks): what the class's steps give on the fold's init state ``(m, l, O) = (-inf, +0, +0)``, computed
+    here with binary32 operations since such a row has no unit. Without sinks the epilogue is never reached and the row
+    is ``+0`` with the LSE of the init state, ``-inf`` (``spec.lse_term``). With sinks it is the sink step on that state
+    (``spec.sink_merge``, ``c > 0``): ``s2 = mul(sink, LOG2E)``, ``m' = fmax(-inf, s2)``, ``a = EX2(add(-inf, -m'))``,
+    ``b = EX2(add(s2, -m'))``, ``l' = fma(+0, a, b)``, the LSE ``add(m', LG2(l'))`` (times ``LN2`` in base e) and the output
+    ``add(mul(+0, mul(a, div(1, l'))), +0)``. For a finite ``s2`` that is ``a = +0``, ``b = EX2(+0) = 1``, ``l' = 1``: the
+    output ``+0`` and the LSE the sink alone, ``add(s2, +0)``. Where ``s2`` is infinite or NaN, ``b`` or ``a`` is the
+    ``EX2`` of a NaN and the output and the LSE are NaN, as on a row with keys. Both cases are ``z = add(s2, -s2)`` (``+0``,
+    or NaN) for the output and ``add(s2, z)`` for the LSE, which is what is evaluated: ``EX2`` and ``LG2`` enter at
+    ``-inf``, ``+0``, ``1`` and NaN only, where they are exact."""
+    if sinks is None:
+        return 0.0, float("-inf")
+    s2 = sinks * LOG2E
+    z = s2 - s2
+    if not lse_mode:
+        return z, None
+    lse = s2 + z
+    return z, lse * LN2 if lse_mode == LSE_MODES["ln"] else lse
 
 
 def workspace_bytes(
@@ -1279,18 +1317,36 @@ def _run_attention_validated(
     g = Hq // Hkv
     plan = planned.plan
     fixed = planned.fixed
+    # the in-place fills below run under inference mode: legal for the caller's buffers whichever side of it made them
+    if fixed is not None and fixed.null_requests:
+        # a request without keys has no unit: its rows hold what the class gives on the init state (null_row_values: zeros
+        # and an LSE of -inf, or of the sink alone), written here ahead of the kernels. The launch is the same for every
+        # plan, so the captured graph fills every row whatever the batch and the kernels rewrite the rows with keys
+        with torch.inference_mode():
+            o_null, lse_null = null_row_values(sinks, lse_mode)
+            if sinks is None:
+                out.zero_()
+                if lse_mode:
+                    lse.fill_(lse_null)
+            else:
+                out.copy_(o_null.to(out.dtype)[None, :, None].expand_as(out))
+                if lse_mode:
+                    lse.copy_(lse_null.expand_as(lse))
+    elif planned.null_rows is not None:
+        # an eager plan with requests without keys: only their rows are filled, and a plan without any pays nothing
+        with torch.inference_mode():
+            o_null, lse_null = null_row_values(sinks, lse_mode)
+            if sinks is None:
+                out.index_fill_(0, planned.null_rows, o_null)
+                if lse_mode:
+                    lse.index_fill_(0, planned.null_rows, lse_null)
+            else:
+                out[planned.null_rows] = o_null.to(out.dtype)[:, None]
+                if lse_mode:
+                    lse[planned.null_rows] = lse_null
     if total_q == 0 or (fixed is None and plan.num_units == 0):
         return out  # nothing to compute: no TMA descriptor over an empty query extent
     assert plan.g == g
-    if fixed is not None and fixed.null_requests:
-        # a request without keys has no unit: its rows are zeros and its LSE -inf, written here ahead of the kernels (the
-        # launch is the same for every plan, so the captured graph holds these fills whatever the batch)
-        with (
-            torch.inference_mode()
-        ):  # legal for the caller's buffers whichever side of inference mode made them
-            out.zero_()
-            if lse_mode:
-                lse.fill_(float("-inf"))
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
     lse_view = lse.view(-1) if lse_mode else planned.lse_unused

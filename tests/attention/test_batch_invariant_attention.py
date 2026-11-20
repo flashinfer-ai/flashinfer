@@ -3851,6 +3851,20 @@ def _prefix_tables(pr: Problem, kv_lens, reqs=None):
     return mk(indptr), mk(idx), mk(last)
 
 
+def _sink_only_lse(sinks, base="log2"):
+    """The LSE of a row without keys under sinks, per head: the sink step on the init state, ``add(mul(sink, LOG2E), +0)``
+    in base 2 and that times ``LN2`` in base e, in binary32 on the host (finite sinks)."""
+    import numpy as np
+
+    from flashinfer.attention.batch_invariant import spec
+
+    s2 = sinks.detach().cpu().numpy().astype(np.float32) * np.float32(spec.LOG2E)
+    lse = s2 + np.float32(0.0)
+    if base == "ln":
+        lse = lse * np.float32(spec.LN2)
+    return torch.from_numpy(lse.astype(np.float32)).to(sinks.device)
+
+
 def _eager_decode(
     pr: Problem, q, kv_lens, q_len, window_left=-1, run_kw=None, reqs=None
 ):
@@ -3992,7 +4006,7 @@ class _GraphDecode:
 
     def check(self, kv_lens, how="plan", run_kw=None, reqs=None, **kw):
         """Replan to ``kv_lens``, replay, and compare with an eager wrapper: the requests with keys bit for bit, the others
-        zeros (LSE ``-inf``)."""
+        zeros (LSE ``-inf``, or with sinks the LSE of the sink alone)."""
         self.plan(kv_lens, how, reqs, **kw)
         out, lse = self.replay()
         rows, ref = _eager_decode(
@@ -4005,7 +4019,12 @@ class _GraphDecode:
         assert not out[null].any(), kv_lens
         if lse is not None:
             assert ref is None or torch.equal(lse[rows], bits(ref_lse)), kv_lens
-            assert bool((self.lse[null] == float("-inf")).all()), kv_lens
+            sinks = self.run_kw.get("sinks")
+            if sinks is None:
+                assert bool((self.lse[null] == float("-inf")).all()), kv_lens
+            else:
+                want = _sink_only_lse(sinks).expand_as(self.lse)[null]
+                assert torch.equal(bits(self.lse[null]), bits(want)), kv_lens
         return self.w._batch_invariant._planned.plan
 
 
@@ -4201,20 +4220,6 @@ def test_cuda_graph_null_requests(D, q_len, lse):
     if q_len > 1:
         with pytest.raises(bi.BatchInvariantUnsupportedError):
             gd.plan([700, q_len - 1, 0, 9])
-    # outside graph mode a request without keys is refused, as before
-    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        workspace(pr.device), "NHD", batch_invariant=True
-    )
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
-        w.plan(
-            *_prefix_tables(pr, [700, 0, 1300, 0]),
-            32,
-            8,
-            D,
-            16,
-            q_data_type=torch.bfloat16,
-            kv_data_type=torch.bfloat16,
-        )
 
 
 @needs_device
@@ -4242,15 +4247,18 @@ def test_cuda_graph_lse_and_sinks_replay(D, q_len):
 def test_cuda_graph_sliding_window_and_serving_arguments():
     """A sliding window under replan and replay, and the arguments serving engines pass on every plan: ``seq_lens`` equal to
     the page table's KV lengths, ``fixed_split_size`` (-1 or a positive value: accepted and not used) and
-    ``disable_split_kv`` (fused units). None of them changes a bit."""
+    ``disable_split_kv`` (either value: the plan is the default plan). None of them changes a bit."""
     pr = Problem([1] * 3, [5120, 5120, 5120], 32, 8, 128, 16, seed=16)
     gd = _GraphDecode(pr, 1, window_left=700)
     seq = lambda lens: torch.tensor(lens, dtype=torch.int32)  # noqa: E731
     gd.check([300, 40, 129], seq_lens=seq([300, 40, 129]), fixed_split_size=-1)
     gd.check([3000, 1500, 700], "fast")
     split = gd.check([5120, 5120, 2049], fixed_split_size=2048)
-    fused = gd.check([5120, 5120, 2049], fixed_split_size=2048, disable_split_kv=True)
-    assert not fused.groups and fused.num_units == 24 <= split.num_units
+    tables = (split.desc_array.copy(), split.groups_array.copy())
+    same = gd.check([5120, 5120, 2049], fixed_split_size=2048, disable_split_kv=True)
+    assert same.num_groups == split.num_groups and same.num_units == split.num_units
+    assert (same.desc_array == tables[0]).all()
+    assert (same.groups_array == tables[1]).all()
     gd.check([5120, 800, 2049], "fast", fixed_split_size=2048, disable_split_kv=True)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         gd.plan([300, 40, 129], seq_lens=seq([300, 41, 129]))
@@ -4876,8 +4884,11 @@ def test_cuda_graph_prefill_frozen_shape_violations():
         token_pos_in_items_len=0,
         max_item_len_ptr=None,
     )
-    fused = gp.check([100, 100, 100], [3000, 1500, 700], disable_split_kv=True)
-    assert not fused.num_groups
+    plain = gp.check([100, 100, 100], [3000, 1500, 700])
+    tables = (plain.desc_array.copy(), plain.groups_array.copy(), plain.num_groups)
+    same = gp.check([100, 100, 100], [3000, 1500, 700], disable_split_kv=True)
+    assert same.num_groups == tables[2] and (same.desc_array == tables[0]).all()
+    assert (same.groups_array == tables[1]).all()
     cache = pr.cache("NHD")
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         gp.w.run(gp.q, cache, return_lse=True)
@@ -4885,6 +4896,13 @@ def test_cuda_graph_prefill_frozen_shape_violations():
         gp.w.run(gp.q, cache, sinks=sink_logits(pr))
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         gp.w.run(gp.q[:299], cache)  # fewer rows than planned
+    # a slot with query rows and no keys is refused, by name; one with neither is padding
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError,
+        match="request 1 with 7 query tokens over 0 keys",
+    ):
+        gp.plan([100, 7, 30], [300, 0, 129])
+    gp.check([100, 0, 30], [300, 0, 129])
     # without max_total_num_rows the first plan's rows are the capacity
     first = _GraphPrefill(pr, 400, declare=False)
     first.check([100, 100, 50], [300, 1200, 150])
@@ -5122,6 +5140,116 @@ def test_cuda_graph_sinks_declaration_and_neutral_arguments():
     unit.check([3000, 1500, 700], "fast")
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         unit.w.run(unit.q, cache, k_scale=0.5)
+
+
+@needs_device
+@pytest.mark.parametrize("q_len", [1, 3])
+@pytest.mark.parametrize("with_sinks", [False, True])
+def test_eager_decode_requests_without_keys(q_len, with_sinks):
+    """An eager decode batch with requests without keys (no pages: padded slots): they are skipped, the rows of the
+    requests with keys have the bits of the batch of those requests alone, and the skipped rows hold what the class
+    gives on the init state: zeros and an LSE of ``-inf``, or with sinks zeros and the LSE of the sink alone. A request
+    with some keys but fewer than its query tokens is refused, and a batch without any key gives the fills alone."""
+    pr = Problem([1] * 4, [3000] * 4, 32, 8, 128, 16, seed=38)
+    cache = pr.cache("NHD")
+    g = torch.Generator(device="cpu").manual_seed(5)
+    q = (torch.randn(4 * q_len, pr.Hq, pr.D, generator=g) * 1.5).to(torch.bfloat16)
+    q = q.to(pr.device)
+    sinks = sink_logits(pr, seed=9) if with_sinks else None
+    run_kw = dict(return_lse=True, **(dict(sinks=sinks) if with_sinks else {}))
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    opts = dict(
+        q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16, q_len_per_req=q_len
+    )
+    for kv_lens in ([300, 0, 129, 2049], [0, 700, 0, 0], [0, 0, 0, 0]):
+        w.plan(*_prefix_tables(pr, kv_lens), pr.Hq, pr.Hkv, pr.D, pr.page, **opts)
+        assert (w._batch_invariant._planned.null_rows is not None) == (0 in kv_lens)
+        out, lse = w.run(q, cache, **run_kw)
+        rows, ref = _eager_decode(pr, q, kv_lens, q_len, run_kw=run_kw)
+        null = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
+        null[rows] = False
+        if ref is not None:
+            assert torch.equal(bits(out[rows]), bits(ref[0])), kv_lens
+            assert torch.equal(bits(lse[rows]), bits(ref[1])), kv_lens
+        assert not bits(out[null]).any(), kv_lens
+        if with_sinks:
+            want = _sink_only_lse(sinks).expand_as(lse)[null]
+            assert torch.equal(bits(lse[null]), bits(want)), kv_lens
+        else:
+            assert bool((lse[null] == float("-inf")).all()), kv_lens
+    # a plan without such a request records nothing to fill
+    w.plan(
+        *_prefix_tables(pr, [300, 40, 129, 2049]), pr.Hq, pr.Hkv, pr.D, pr.page, **opts
+    )
+    assert w._batch_invariant._planned.null_rows is None
+    if q_len > 1:
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="request 1 with"):
+            w.plan(
+                *_prefix_tables(pr, [300, q_len - 1, 129, 64]),
+                pr.Hq,
+                pr.Hkv,
+                pr.D,
+                pr.page,
+                **opts,
+            )
+
+
+@needs_device
+def test_prefill_empty_row_lse_bases_under_sinks_follow_the_sink_step():
+    """The null-row values in both LSE bases against the declared step on the host, and where the sink's base-2 value is
+    not finite: NaN for the output and the LSE, as the step gives on a row with keys."""
+    from flashinfer.attention.batch_invariant import engine
+
+    dev = torch.device("cuda")
+    sinks = torch.tensor([0.5, -3.25, 7.0, -0.0, 1e-30, 250.0], device=dev)
+    for base in ("log2", "ln"):
+        o, lse = engine.null_row_values(sinks, engine.LSE_MODES[base])
+        assert not bits(o).any()
+        assert torch.equal(bits(lse), bits(_sink_only_lse(sinks, base)))
+    o, lse = engine.null_row_values(
+        torch.tensor([float("inf"), float("-inf"), float("nan"), 3e38], device=dev), 1
+    )
+    assert bool(torch.isnan(o).all()) and bool(torch.isnan(lse).all())
+    assert engine.null_row_values(None, 1) == (0.0, float("-inf"))
+
+
+def test_attention_cuda_graph_wrappers_flag_lists_the_wrappers_that_take_it():
+    """``flashinfer.batch_invariant.ATTENTION_CUDA_GRAPH_WRAPPERS`` names exactly the attention wrappers whose constructor
+    takes ``use_cuda_graph=True`` with ``batch_invariant=True``; the others refuse the flag with the typed error."""
+    assert "ATTENTION_CUDA_GRAPH_WRAPPERS" in bi.__all__
+    assert set(bi.ATTENTION_CUDA_GRAPH_WRAPPERS) == {
+        "BatchDecodeWithPagedKVCacheWrapper",
+        "BatchPrefillWithPagedKVCacheWrapper",
+    }
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ws = torch.empty(1 << 20, dtype=torch.uint8, device=dev)
+    buf = lambda n: torch.zeros(n, dtype=torch.int32, device=dev)  # noqa: E731
+    buffers = {
+        "BatchDecodeWithPagedKVCacheWrapper": dict(
+            paged_kv_indptr_buffer=buf(3),
+            paged_kv_indices_buffer=buf(8),
+            paged_kv_last_page_len_buffer=buf(2),
+        ),
+        "BatchPrefillWithPagedKVCacheWrapper": dict(
+            qo_indptr_buf=buf(3),
+            paged_kv_indptr_buf=buf(3),
+            paged_kv_indices_buf=buf(8),
+            paged_kv_last_page_len_buf=buf(2),
+        ),
+        "BatchPrefillWithRaggedKVCacheWrapper": dict(
+            qo_indptr_buf=buf(3), kv_indptr_buf=buf(3)
+        ),
+    }
+    for name, kw in buffers.items():
+        cls = getattr(flashinfer, name)
+        if name in bi.ATTENTION_CUDA_GRAPH_WRAPPERS:
+            w = cls(ws, "NHD", use_cuda_graph=True, batch_invariant=True, **kw)
+            assert w.is_cuda_graph_enabled and w._batch_invariant.graph
+        else:
+            with pytest.raises(bi.BatchInvariantUnsupportedError):
+                cls(ws, "NHD", use_cuda_graph=True, batch_invariant=True, **kw)
 
 
 @needs_device

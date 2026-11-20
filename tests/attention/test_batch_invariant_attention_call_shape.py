@@ -200,18 +200,19 @@ def test_wrappers_accept_device_unit_scales(kind, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "size,disable,fused",
+    "size,disable",
     [
-        (None, False, False),
-        (-1, False, False),
-        (2048, False, False),
-        (4096, True, True),
-        (1, False, False),
-        (None, True, True),
+        (None, False),
+        (-1, False),
+        (2048, False),
+        (4096, True),
+        (1, False),
+        (None, True),
     ],
 )
-def test_split_requests_the_class_satisfies(size, disable, fused):
-    assert neutral.check_split_request(CLASS, size, disable) is fused
+def test_split_requests_the_class_satisfies(size, disable):
+    """Accepted, and nothing is returned: neither knob selects a placement."""
+    assert neutral.check_split_request(CLASS, size, disable) is None
 
 
 @pytest.mark.parametrize(
@@ -485,18 +486,14 @@ def test_plan_neutral_arguments_reach_the_same_plan(delegates, kind):
             d._page,
             d._max_page,
         ) == state, name
-    # disable_split_kv=True is honoured: the same plan arguments with fused units
+    # disable_split_kv=True selects nothing: the same plan arguments, the default configuration
     for extra in (
         dict(disable_split_kv=True),
         dict(disable_split_kv=True, fixed_split_size=4096),
     ):
         d.plan(**_plan_kwargs(kind, pr, **extra))
-        fused = delegates.calls.pop()
-        assert fused[:5] == minimal[:5]
-        assert fused[5].split_policy == "fused" and minimal[5].split_policy == "auto"
-        from dataclasses import replace
-
-        assert replace(fused[5], split_policy="auto") == minimal[5]
+        assert delegates.calls.pop() == minimal
+        assert minimal[5].split_policy == "auto"
 
 
 def _non_neutral_plan_arguments(kind, pr):
@@ -1105,19 +1102,30 @@ def test_restated_metadata_on_the_device(kind, where):
 
 @needs_device
 @pytest.mark.parametrize("D", [64, 128, 256])
-def test_disable_split_kv_plans_fused_units_with_the_same_bits(D):
-    """Long KV at a small batch, where the default plan splits: ``disable_split_kv=True`` keeps every unit fused (no partials
-    in the workspace) and the bits are the same, on the three wrappers."""
+def test_disable_split_kv_selects_nothing(D):
+    """Long KV at a small batch, where the default plan splits: with ``disable_split_kv=True`` the plan is the default plan
+    (the same descriptor and group tables, split units included) and the bits are the same, on the three wrappers."""
     pr = Problem([1, 300], [9000, 5000], 32, 8, D, 16, seed=51)
     kw = dict(q_data_type=BF16, kv_data_type=BF16)
-    outs = {}
+    outs, tables = {}, {}
+
+    def table(w):
+        planned = w._batch_invariant._planned
+        assert w._batch_invariant._config.split_policy == "auto"
+        return (
+            planned.desc.cpu().clone(),
+            planned.groups.cpu().clone(),
+            planned.plan.num_units,
+            len(planned.plan.groups),
+        )
+
     for disable in (False, True):
         ws = workspace(pr.device)
         w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             ws, "NHD", batch_invariant=True
         )
         w.plan(pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, pr.Hq, pr.Hkv, D, 16, causal=True, disable_split_kv=disable, **kw)  # fmt: skip
-        assert (w._batch_invariant._config.split_policy == "fused") is disable
+        t_paged = table(w)
         paged = w.run(pr.q, pr.cache("NHD"))
         w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             ws, "NHD", batch_invariant=True
@@ -1132,6 +1140,7 @@ def test_disable_split_kv_plans_fused_units_with_the_same_bits(D):
             disable_split_kv=disable,
             **kw,
         )
+        t_ragged = table(w)
         ragged = w.run(pr.q, *pr.ragged("NHD"))
         w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             ws, "NHD", batch_invariant=True
@@ -1147,13 +1156,19 @@ def test_disable_split_kv_plans_fused_units_with_the_same_bits(D):
             disable_split_kv=disable,
             **kw,
         )
+        t_decode = table(w)
         last = (pr.qo_indptr[1:] - 1).long()
         decode = w.run(pr.q[last].contiguous(), pr.cache("NHD"))
         outs[disable] = (paged, ragged, decode)
+        tables[disable] = (t_paged, t_ragged, t_decode)
         assert torch.equal(bits(paged), bits(ragged))
         assert torch.equal(bits(paged[last]), bits(decode))
     for a, b in zip(outs[False], outs[True], strict=True):
         assert torch.equal(bits(a), bits(b))
+    assert any(t[3] > 0 for t in tables[True])  # split units, with the flag as without
+    for a, b in zip(tables[False], tables[True], strict=True):
+        assert a[2:] == b[2:]
+        assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
 
 @needs_device

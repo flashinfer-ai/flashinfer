@@ -33,8 +33,13 @@ the LSE and sinks are asked for; ``plan()`` (or ``flashinfer.decode.fast_decode_
 lengths and the page table, which a captured ``run()`` then follows. The launch of such a wrapper is fixed at its first plan
 (``engine.FixedLaunch``: the kernel, the grid, the tables' addresses and capacities); every plan is written into the same
 tables and held to their capacity by fusing units, a placement like every other planner choice, so a replay's bits are those of
-an eager call on the same batch. A request without pages (a padded slot) is a null request there: its output rows are zeros and
-its LSE ``-inf``, with or without sinks.
+an eager call on the same batch.
+
+A decode request without pages (a padded slot) is a null request, in eager and graph mode alike: it has no unit, and its rows
+hold what the class's steps give on the init state (``engine.null_row_values``): zeros and an LSE of ``-inf``, or with sinks
+zeros and the LSE of the sink alone. An eager ``run()`` fills those rows only, and a plan without such a request pays nothing;
+a captured launch fills every row ahead of its kernels, since it is the same launch for every plan. A request with fewer keys
+than query tokens is refused.
 
 A plan's table copies are stream-ordered work of the stream ``plan()`` is called on (non-blocking unless ``non_blocking=False``):
 a replay on that stream follows them by itself; a replay on another stream must wait for it (``wait_stream``), and the next
@@ -49,8 +54,10 @@ paired placement's kernel where that is the wrapper's default, a batch too small
 -- since the batch can no longer choose the body. ``run()`` is captured on the caller's ``q`` / ``out`` (/ ``lse``) of the
 capture, which are the tensors of every replay: a plan's rows are their first ``qo_indptr[-1]`` rows, and no row beyond is
 written (with ``lse_layout="HN"`` the transposed copy covers the whole buffer). A request with fewer keys than query tokens is
-refused as in eager mode, with no key at all too. The page indices are range-checked at the first plan only (a check is a
-device readback, and later plans run before every replay). The ragged prefill wrapper refuses ``use_cuda_graph=True``.
+refused as in eager mode, with no key at all too (the error names the slot). A full ``plan()`` range-checks the page indices
+and compares ``block_tables``; this wrapper's plans after the first, and ``fast_decode_plan`` on the decode wrapper, do not
+(a check is a device readback, and those plans run before every replay): the caller's page table is trusted there, as on the
+regular wrappers' fast path. The ragged prefill wrapper refuses ``use_cuda_graph=True``.
 
 Memory of a ``use_cuda_graph=True`` wrapper, kept for its lifetime besides the caller's buffers (``engine.FixedLaunch``): one
 int32 table of ``8 + 16 U (32 U under the paired placement) + 10 G + 10 F`` entries on the device and two page-locked host
@@ -354,8 +361,8 @@ class BatchInvariantAttention:
 
         Arguments the class does not consume, at the values serving engines pass on every call (``neutral.py``):
         ``fixed_split_size`` of ``None`` / ``-1`` or any positive size is accepted and not used (the chunk length is a class
-        constant, which is what a fixed split asks for); ``disable_split_kv`` plans fused units (the same bits, no partials
-        in the workspace); ``seq_lens`` / ``seq_lens_q`` must equal the KV / query lengths of the CSR metadata and
+        constant, which is what a fixed split asks for); ``disable_split_kv`` selects nothing (split and fused units compute
+        the same bits, so the plan is the default plan); ``seq_lens`` / ``seq_lens_q`` must equal the KV / query lengths of the CSR metadata and
         ``block_tables`` must list the pages of the CSR triple -- host tensors are compared on the host, and the block-table
         comparison shares the one readback of the page-index bounds.
 
@@ -431,7 +438,7 @@ class BatchInvariantAttention:
                 "use_fp16_qk_reduction",
                 "the fp32 score accumulation of the class",
             )
-        fused = neutral.check_split_request(CLASS, fixed_split_size, disable_split_kv)
+        neutral.check_split_request(CLASS, fixed_split_size, disable_split_kv)
         if use_token_head_sf:
             raise unsupported(CLASS, "use_token_head_sf", "unscaled bf16 K / V")
         if window_left is None:
@@ -657,7 +664,8 @@ class BatchInvariantAttention:
                     f"request {i} with a decreasing qo_indptr / kv_indptr",
                     "non-decreasing offsets",
                 )
-            if ql > kl and not (self.graph and self.kind == "decode" and kl == 0):
+            # a decode request without keys is a null request: no unit, its rows filled at run()
+            if ql > kl and not (self.kind == "decode" and kl == 0):
                 raise unsupported(
                     CLASS,
                     f"request {i} with {ql} query tokens over {kl} keys",
@@ -681,10 +689,6 @@ class BatchInvariantAttention:
                 )
             neutral.check_lengths(CLASS, "seq_lens_q", seq_lens_q, q_lens, "qo_indptr")
         config = engine.default_config(D=D)
-        if fused:
-            from dataclasses import replace
-
-            config = replace(config, split_policy="fused")
         if (
             D in engine.Q2_DEFAULT_DIMS
             and self.kind != "decode"
@@ -743,6 +747,7 @@ class BatchInvariantAttention:
                 self.device,
                 ragged=self.kind == "ragged",
                 has_sinks=has_sinks,
+                null_requests=self.kind == "decode",
             )
         except engine.WorkspaceTooSmall:
             # the planner's split units need more partials space than the caller's workspace holds: plan fused units instead (every unit
@@ -765,6 +770,7 @@ class BatchInvariantAttention:
                     self.device,
                     ragged=self.kind == "ragged",
                     has_sinks=has_sinks,
+                    null_requests=self.kind == "decode",
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(

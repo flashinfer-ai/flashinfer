@@ -3272,7 +3272,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             nothing and raise at every other value -- ``q_scale`` / ``k_scale`` / ``v_scale`` of ``None`` or exactly
             ``1.0``, ``seq_lens`` / ``seq_lens_q`` / ``block_tables`` that restate the CSR metadata,
             ``fixed_split_size`` (``None`` / ``-1`` or any positive size: not used, the chunk length is a class constant)
-            and ``disable_split_kv`` (``True`` plans fused units: the same bits, no split-KV partials). None of them
+            and ``disable_split_kv`` (either value: the plan is the default plan). None of them
             changes an output bit.
 
         jit_args : Optional[List[Any]]
@@ -6076,7 +6076,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             nothing and raise at every other value -- ``q_scale`` / ``k_scale`` / ``v_scale`` / ``o_scale`` of ``None`` or exactly
             ``1.0``, ``seq_lens`` / ``seq_lens_q`` that restate ``kv_indptr`` / ``qo_indptr``,
             ``fixed_split_size`` (``None`` / ``-1`` or any positive size: not used, the chunk length is a class constant)
-            and ``disable_split_kv`` (``True`` plans fused units: the same bits, no split-KV partials). None of them
+            and ``disable_split_kv`` (either value: the plan is the default plan). None of them
             changes an output bit.
 
         jit_args : Optional[List[Any]]

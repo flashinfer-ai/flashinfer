@@ -17,8 +17,9 @@ argument                                    accepted (no effect on the bits); ev
 ``fixed_split_size``                        ``None`` / ``-1`` (no request) and any positive size: the request is a KV split that
                                             does not follow the batch, which the class's 512-key chunks on the absolute KV axis
                                             already are; the size itself is not used
-``disable_split_kv``                        ``False``, and ``True``: every unit keeps its chunks in one CTA (the fused placement
-                                            of the same class, so the same bits) and the partials workspace is not used
+``disable_split_kv``                        ``False`` and ``True``: the request is a result that does not depend on how the
+                                            KV range is split over CTAs, which every placement of the class gives; the flag
+                                            selects nothing and the plan is the default plan
 ``seq_lens``                                the KV lengths the page table (or ``kv_indptr`` of the ragged wrapper) states
 ``seq_lens_q``                              the query lengths ``qo_indptr`` states
 ``block_tables``                            a dense ``[batch, max_pages]`` table whose rows list the pages of the CSR triple
@@ -127,18 +128,18 @@ def check_unit_scales(
             raise unsupported(class_name, f"{name}={shown!r}", _UNIT_SCALES)
 
 
-def check_split_request(class_name: str, fixed_split_size, disable_split_kv) -> bool:
-    """The split knobs of the regular kernels. Returns whether the plan keeps every unit fused (``disable_split_kv``).
+def check_split_request(class_name: str, fixed_split_size, disable_split_kv) -> None:
+    """The split knobs of the regular kernels: validated, and neither selects anything (the plan is the default plan).
 
     The rule for a determinism knob of the regular kernels (these two, and any later one of the kind, such as a fixed query
-    tile): it asks for a placement that does not follow the batch. Every placement of the class already has that property,
-    so a value that asks for it is accepted, and the value itself selects nothing unless the class has a placement that
-    honours it literally (the fused units below).
+    tile): it asks for a result that does not follow the batch. Every placement of the class already has that property,
+    so a value that asks for it is accepted and the value itself selects nothing.
 
     ``fixed_split_size`` asks the regular kernels for a KV split that does not depend on the batch. The class has that property
     by construction (its chunk grid is a class constant on the absolute KV axis), so ``None`` / ``-1`` and every positive size
-    are satisfied and the size is not used. ``disable_split_kv=True`` is honoured with the fused placement, which is the
-    same class: the split kind buys parallelism, never bits."""
+    are satisfied and the size is not used. ``disable_split_kv=True`` asks the regular kernels not to split a request's KV
+    range over CTAs, whose reduction order would follow the batch; the class's split and fused units compute the same
+    bits, so the planner keeps choosing between them as it does without the flag."""
     if fixed_split_size is not None:
         ok = isinstance(fixed_split_size, int) and not isinstance(
             fixed_split_size, bool
@@ -154,7 +155,6 @@ def check_split_request(class_name: str, fixed_split_size, disable_split_kv) -> 
         raise unsupported(
             class_name, f"disable_split_kv={disable_split_kv!r}", "True or False"
         )
-    return disable_split_kv
 
 
 def check_lengths(
