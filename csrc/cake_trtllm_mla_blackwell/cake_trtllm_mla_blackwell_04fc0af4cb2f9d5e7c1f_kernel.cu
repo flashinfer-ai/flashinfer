@@ -457,6 +457,8 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                 }
                 int _max_0 = ((seqlen_kv_b) > (0) ? (seqlen_kv_b) : (0));
                 seqlen_kv_b = _max_0;
+                int _min_1 = ((seqlen_kv_b) < (max_pages_per_seq * 32) ? (seqlen_kv_b) : (max_pages_per_seq * 32));
+                seqlen_kv_b = _min_1;
                 int start_tile = 0;
                 int pt_base = drp_request * max_pages_per_seq;
                 int q_row_global = batch_idx * 128 + cta_rank * 64;
@@ -464,10 +466,11 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                 _phase_q_empty_0 ^= 1;
                 asm volatile("griddepcontrol.wait;" ::: "memory");
                 int k0_page_base = pt_base + 4 * start_tile + 2 * cta_rank;
-                int _min_1 = ((k0_page_base - pt_base) < (drp_last_slot) ? (k0_page_base - pt_base) : (drp_last_slot));
-                int pg_k00 = drp_table[pt_base + _min_1];
-                int _min_2 = ((k0_page_base + 1 - pt_base) < (drp_last_slot) ? (k0_page_base + 1 - pt_base) : (drp_last_slot));
-                int pg_k01 = drp_table[pt_base + _min_2];
+                int drp_k0_limit = ((seqlen_kv_b <= 128) ? drp_last_slot : 2147483647);
+                int _min_2 = ((k0_page_base - pt_base) < (drp_k0_limit) ? (k0_page_base - pt_base) : (drp_k0_limit));
+                int pg_k00 = drp_table[pt_base + _min_2];
+                int _min_3 = ((k0_page_base + 1 - pt_base) < (drp_k0_limit) ? (k0_page_base + 1 - pt_base) : (drp_k0_limit));
+                int pg_k01 = drp_table[pt_base + _min_3];
                 if (cta_rank == 0) {
                     if (elect_sync()) {
                         asm volatile(
@@ -525,10 +528,11 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                     int k_page_base = pt_base + 4 * abs_tile_k + 2 * cta_rank;
                     int pg_k0 = 0;
                     int pg_k1 = 0;
-                    int _min_3 = ((k_page_base - pt_base) < (drp_last_slot) ? (k_page_base - pt_base) : (drp_last_slot));
-                    pg_k0 = drp_table[pt_base + _min_3];
-                    int _min_4 = ((k_page_base + 1 - pt_base) < (drp_last_slot) ? (k_page_base + 1 - pt_base) : (drp_last_slot));
-                    pg_k1 = drp_table[pt_base + _min_4];
+                    int drp_k_limit = ((tile == num_kv_tiles - 1) ? drp_last_slot : 2147483647);
+                    int _min_4 = ((k_page_base - pt_base) < (drp_k_limit) ? (k_page_base - pt_base) : (drp_k_limit));
+                    pg_k0 = drp_table[pt_base + _min_4];
+                    int _min_5 = ((k_page_base + 1 - pt_base) < (drp_k_limit) ? (k_page_base + 1 - pt_base) : (drp_k_limit));
+                    pg_k1 = drp_table[pt_base + _min_5];
                     #pragma unroll
                     for (int n_1 = 0; n_1 < 8; n_1++) {
                         int dst_k = 0;
@@ -567,8 +571,7 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                     int abs_tile_v = start_tile + tile - 1;
                     #pragma unroll
                     for (int ps = 0; ps < 4; ps++) {
-                        int _min_5 = ((pt_base + 4 * abs_tile_v + ps - pt_base) < (drp_last_slot) ? (pt_base + 4 * abs_tile_v + ps - pt_base) : (drp_last_slot));
-                        int pg_v = drp_table[pt_base + _min_5];
+                        int pg_v = drp_table[pt_base + 4 * abs_tile_v + ps];
                         #pragma unroll
                         for (int acc_stage = 0; acc_stage < 2; acc_stage++) {
                             int v_group_half = 0;
@@ -766,6 +769,8 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                 }
                 int _max_0_1 = ((seqlen_kv_b_1) > (0) ? (seqlen_kv_b_1) : (0));
                 seqlen_kv_b_1 = _max_0_1;
+                int _min_1_1 = ((seqlen_kv_b_1) < (max_pages_per_seq * 32) ? (seqlen_kv_b_1) : (max_pages_per_seq * 32));
+                seqlen_kv_b_1 = _min_1_1;
                 int total_kv_tiles_1 = (int)(((unsigned int)seqlen_kv_b_1 + 128 - 1) / 128);
                 int start_tile_1 = 0;
                 int num_kv_tiles_1 = ((total_kv_tiles_1) > (1) ? (total_kv_tiles_1) : (1));
@@ -803,96 +808,96 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                             : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63])
                             : "r"(s_base + 32));
                         int tail_valid = seqlen_kv_b_1 - abs_tile * 128 - n_half * 64;
-                        uint32_t _thresh_mask_1;
+                        uint32_t _thresh_mask_2;
                         {
-                            int _lim_2 = tail_valid;
-                            if (_lim_2 <= 0) { _thresh_mask_1 = 0u; }
-                            else if (_lim_2 >= 32) { _thresh_mask_1 = 0xFFFFFFFFu; }
+                            int _lim_3 = tail_valid;
+                            if (_lim_3 <= 0) { _thresh_mask_2 = 0u; }
+                            else if (_lim_3 >= 32) { _thresh_mask_2 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_1) : "r"(_lim_2));
+                                    "}" : "=r"(_thresh_mask_2) : "r"(_lim_3));
                             }
                         }
-                        if (!(_thresh_mask_1 & (1u << 0))) sv[0] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 1))) sv[1] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 2))) sv[2] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 3))) sv[3] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 4))) sv[4] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 5))) sv[5] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 6))) sv[6] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 7))) sv[7] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 8))) sv[8] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 9))) sv[9] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 10))) sv[10] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 11))) sv[11] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 12))) sv[12] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 13))) sv[13] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 14))) sv[14] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 15))) sv[15] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 16))) sv[16] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 17))) sv[17] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 18))) sv[18] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 19))) sv[19] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 20))) sv[20] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 21))) sv[21] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 22))) sv[22] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 23))) sv[23] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 24))) sv[24] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 25))) sv[25] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 26))) sv[26] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 27))) sv[27] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 28))) sv[28] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 29))) sv[29] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 30))) sv[30] = -CUDART_INF_F;
-                        if (!(_thresh_mask_1 & (1u << 31))) sv[31] = -CUDART_INF_F;
-                        uint32_t _thresh_mask_3;
+                        if (!(_thresh_mask_2 & (1u << 0))) sv[0] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 1))) sv[1] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 2))) sv[2] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 3))) sv[3] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 4))) sv[4] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 5))) sv[5] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 6))) sv[6] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 7))) sv[7] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 8))) sv[8] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 9))) sv[9] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 10))) sv[10] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 11))) sv[11] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 12))) sv[12] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 13))) sv[13] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 14))) sv[14] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 15))) sv[15] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 16))) sv[16] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 17))) sv[17] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 18))) sv[18] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 19))) sv[19] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 20))) sv[20] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 21))) sv[21] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 22))) sv[22] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 23))) sv[23] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 24))) sv[24] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 25))) sv[25] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 26))) sv[26] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 27))) sv[27] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 28))) sv[28] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 29))) sv[29] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 30))) sv[30] = -CUDART_INF_F;
+                        if (!(_thresh_mask_2 & (1u << 31))) sv[31] = -CUDART_INF_F;
+                        uint32_t _thresh_mask_4;
                         {
-                            int _lim_4 = tail_valid - 32;
-                            if (_lim_4 <= 0) { _thresh_mask_3 = 0u; }
-                            else if (_lim_4 >= 32) { _thresh_mask_3 = 0xFFFFFFFFu; }
+                            int _lim_5 = tail_valid - 32;
+                            if (_lim_5 <= 0) { _thresh_mask_4 = 0u; }
+                            else if (_lim_5 >= 32) { _thresh_mask_4 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_thresh_mask_3) : "r"(_lim_4));
+                                    "}" : "=r"(_thresh_mask_4) : "r"(_lim_5));
                             }
                         }
-                        if (!(_thresh_mask_3 & (1u << 0))) sv[32] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 1))) sv[33] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 2))) sv[34] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 3))) sv[35] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 4))) sv[36] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 5))) sv[37] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 6))) sv[38] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 7))) sv[39] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 8))) sv[40] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 9))) sv[41] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 10))) sv[42] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 11))) sv[43] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 12))) sv[44] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 13))) sv[45] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 14))) sv[46] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 15))) sv[47] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 16))) sv[48] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 17))) sv[49] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 18))) sv[50] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 19))) sv[51] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 20))) sv[52] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 21))) sv[53] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 22))) sv[54] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 23))) sv[55] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 24))) sv[56] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 25))) sv[57] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 26))) sv[58] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 27))) sv[59] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 28))) sv[60] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 29))) sv[61] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 30))) sv[62] = -CUDART_INF_F;
-                        if (!(_thresh_mask_3 & (1u << 31))) sv[63] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 0))) sv[32] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 1))) sv[33] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 2))) sv[34] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 3))) sv[35] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 4))) sv[36] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 5))) sv[37] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 6))) sv[38] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 7))) sv[39] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 8))) sv[40] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 9))) sv[41] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 10))) sv[42] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 11))) sv[43] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 12))) sv[44] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 13))) sv[45] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 14))) sv[46] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 15))) sv[47] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 16))) sv[48] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 17))) sv[49] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 18))) sv[50] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 19))) sv[51] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 20))) sv[52] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 21))) sv[53] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 22))) sv[54] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 23))) sv[55] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 24))) sv[56] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 25))) sv[57] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 26))) sv[58] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 27))) sv[59] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 28))) sv[60] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 29))) sv[61] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 30))) sv[62] = -CUDART_INF_F;
+                        if (!(_thresh_mask_4 & (1u << 31))) sv[63] = -CUDART_INF_F;
                     } else {
                         int _stage_s_full_2 = (int)((unsigned int)(softmax_tile_cursor + tile_1) % 2);
                         int _parity_s_full_2 = (int)((unsigned int)(softmax_tile_cursor + tile_1) / 2 % 2);
@@ -909,11 +914,11 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                             : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63])
                             : "r"(s_base + 32));
                     }
-                    float2 _reg_reduce_max2_6 = {-CUDART_INF_F, -CUDART_INF_F};
-                    row_max_x32_accum(&sv[0], _reg_reduce_max2_6);
-                    row_max_x32_accum(&sv[32], _reg_reduce_max2_6);
-                    float _reg_array_reduce_5 = row_max_reduce(_reg_reduce_max2_6);
-                    new_max = _reg_array_reduce_5;
+                    float2 _reg_reduce_max2_7 = {-CUDART_INF_F, -CUDART_INF_F};
+                    row_max_x32_accum(&sv[0], _reg_reduce_max2_7);
+                    row_max_x32_accum(&sv[32], _reg_reduce_max2_7);
+                    float _reg_array_reduce_6 = row_max_reduce(_reg_reduce_max2_7);
+                    new_max = _reg_array_reduce_6;
                     new_max = max_noftz(new_max, row_max_val);
                     smem_softmax_exchange[exchange_idx] = new_max;
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -952,46 +957,46 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                     for (int i = 0; i < 64; i += 2) {
                         float2 score_pair = make_float2(sv[i], sv[i + 1]);
                         float2 affine_pair = fma_f32x2_rn_ftz(score_pair, scale_pair, neg_max_pair);
-                        float _exp2_7 = approx_exp2(affine_pair.x);
-                        sv[i] = _exp2_7;
-                        float _exp2_8 = approx_exp2(affine_pair.y);
-                        sv[i + 1] = _exp2_8;
+                        float _exp2_8 = approx_exp2(affine_pair.x);
+                        sv[i] = _exp2_8;
+                        float _exp2_9 = approx_exp2(affine_pair.y);
+                        sv[i + 1] = _exp2_9;
                     }
-                    float2 _reg_reduce_sum2_10 = make_float2(0.0f, 0.0f);
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[0], sv[1]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[2], sv[3]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[4], sv[5]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[6], sv[7]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[8], sv[9]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[10], sv[11]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[12], sv[13]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[14], sv[15]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[16], sv[17]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[18], sv[19]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[20], sv[21]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[22], sv[23]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[24], sv[25]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[26], sv[27]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[28], sv[29]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[30], sv[31]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[32], sv[33]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[34], sv[35]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[36], sv[37]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[38], sv[39]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[40], sv[41]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[42], sv[43]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[44], sv[45]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[46], sv[47]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[48], sv[49]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[50], sv[51]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[52], sv[53]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[54], sv[55]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[56], sv[57]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[58], sv[59]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[60], sv[61]));
-                    _reg_reduce_sum2_10 = add_f32x2_rn_noftz(_reg_reduce_sum2_10, make_float2(sv[62], sv[63]));
-                    float _reg_array_reduce_9 = _reg_reduce_sum2_10.x + _reg_reduce_sum2_10.y;
-                    row_sum_val = __fmaf_rn(row_sum_val, acc_scale, _reg_array_reduce_9);
+                    float2 _reg_reduce_sum2_11 = make_float2(0.0f, 0.0f);
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[0], sv[1]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[2], sv[3]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[4], sv[5]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[6], sv[7]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[8], sv[9]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[10], sv[11]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[12], sv[13]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[14], sv[15]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[16], sv[17]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[18], sv[19]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[20], sv[21]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[22], sv[23]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[24], sv[25]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[26], sv[27]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[28], sv[29]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[30], sv[31]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[32], sv[33]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[34], sv[35]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[36], sv[37]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[38], sv[39]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[40], sv[41]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[42], sv[43]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[44], sv[45]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[46], sv[47]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[48], sv[49]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[50], sv[51]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[52], sv[53]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[54], sv[55]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[56], sv[57]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[58], sv[59]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[60], sv[61]));
+                    _reg_reduce_sum2_11 = add_f32x2_rn_noftz(_reg_reduce_sum2_11, make_float2(sv[62], sv[63]));
+                    float _reg_array_reduce_10 = _reg_reduce_sum2_11.x + _reg_reduce_sum2_11.y;
+                    row_sum_val = __fmaf_rn(row_sum_val, acc_scale, _reg_array_reduce_10);
                     float meta[4];
                     int meta_addr = taddr + 384 + (unsigned int)(phase * 8) + (unsigned int)(n_half * 4) + (unsigned int)(quarter_lane << 16);
                     int _stage_p_empty = (int)((unsigned int)(softmax_tile_cursor + tile_1) % 2);
@@ -1125,6 +1130,8 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                 }
                 int _max_0_3 = ((seqlen_kv_b_2) > (0) ? (seqlen_kv_b_2) : (0));
                 seqlen_kv_b_2 = _max_0_3;
+                int _min_1_2 = ((seqlen_kv_b_2) < (max_pages_per_seq * 32) ? (seqlen_kv_b_2) : (max_pages_per_seq * 32));
+                seqlen_kv_b_2 = _min_1_2;
                 int total_kv_tiles_2 = (seqlen_kv_b_2 + 128 - 1) / 128;
                 int start_tile_2 = 0;
                 int num_kv_tiles_2 = ((total_kv_tiles_2) > (1) ? (total_kv_tiles_2) : (1));
@@ -1169,10 +1176,10 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                                     float _tmem_load_1[16];
                                     tmem_ld_x16(&_tmem_load_1[0], o_base + c);
                                     asm volatile("tcgen05.wait::ld.sync.aligned;");
-                                    const float2 _scale2_1 = {acc_scale_1, acc_scale_1};
+                                    const float2 _scale2_2 = {acc_scale_1, acc_scale_1};
                                     #pragma unroll
                                     for (int _ls = 0; _ls < 8; _ls++)
-                                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_1);
+                                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_2);
                                     tmem_st_x16_f32(o_base + c, _tmem_load_1);
                                 }
                             }
@@ -1219,9 +1226,9 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float inv_sum = approx_rcp(final_sum_val);
                 int head_idx = cta_rank * 64 + my_row_1;
-                float _log2_2;
-                asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(final_sum_val));
-                float lse_log2 = __fmaf_rn(final_max_val, softmax_scale_log2, _log2_2);
+                float _log2_3;
+                asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_3) : "f"(final_sum_val));
+                float lse_log2 = __fmaf_rn(final_max_val, softmax_scale_log2, _log2_3);
                 int o_offset = (batch_idx_2 * 128 + head_idx) * 512;
                 float output_scale = 1.0f;
                 mbarrier_wait(work_full_addr + (correction_work_stage) * 8, _phase_work_full_3);
@@ -1258,10 +1265,10 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                                     : "=f"(_tmem_load_3[0]), "=f"(_tmem_load_3[1]), "=f"(_tmem_load_3[2]), "=f"(_tmem_load_3[3]), "=f"(_tmem_load_3[4]), "=f"(_tmem_load_3[5]), "=f"(_tmem_load_3[6]), "=f"(_tmem_load_3[7]), "=f"(_tmem_load_3[8]), "=f"(_tmem_load_3[9]), "=f"(_tmem_load_3[10]), "=f"(_tmem_load_3[11]), "=f"(_tmem_load_3[12]), "=f"(_tmem_load_3[13]), "=f"(_tmem_load_3[14]), "=f"(_tmem_load_3[15]), "=f"(_tmem_load_3[16]), "=f"(_tmem_load_3[17]), "=f"(_tmem_load_3[18]), "=f"(_tmem_load_3[19]), "=f"(_tmem_load_3[20]), "=f"(_tmem_load_3[21]), "=f"(_tmem_load_3[22]), "=f"(_tmem_load_3[23]), "=f"(_tmem_load_3[24]), "=f"(_tmem_load_3[25]), "=f"(_tmem_load_3[26]), "=f"(_tmem_load_3[27]), "=f"(_tmem_load_3[28]), "=f"(_tmem_load_3[29]), "=f"(_tmem_load_3[30]), "=f"(_tmem_load_3[31])
                                     : "r"(o_base_epi + c_1));
                                 int gmem_base = o_offset + logical_vs * 64 + c_1;
-                                const float2 _scale2_3 = {inv_sum * output_scale, inv_sum * output_scale};
+                                const float2 _scale2_4 = {inv_sum * output_scale, inv_sum * output_scale};
                                 #pragma unroll
                                 for (int _ls = 0; _ls < 16; _ls++)
-                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_3);
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_4);
                                 unsigned int pair_packed[16];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 16; _lp++) {
@@ -1379,6 +1386,8 @@ kernel_cake_trtllm_mla_blackwell_04fc0af4cb2f9d5e7c1f(const __grid_constant__ CU
                 }
                 int _max_0_4 = ((seqlen_kv_b_3) > (0) ? (seqlen_kv_b_3) : (0));
                 seqlen_kv_b_3 = _max_0_4;
+                int _min_1_3 = ((seqlen_kv_b_3) < (max_pages_per_seq * 32) ? (seqlen_kv_b_3) : (max_pages_per_seq * 32));
+                seqlen_kv_b_3 = _min_1_3;
                 int total_kv_tiles_3 = (seqlen_kv_b_3 + 128 - 1) / 128;
                 int start_tile_3 = 0;
                 int num_kv_tiles_3 = ((total_kv_tiles_3) > (1) ? (total_kv_tiles_3) : (1));
