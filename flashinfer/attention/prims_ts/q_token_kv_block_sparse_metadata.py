@@ -1625,10 +1625,10 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     the dense block table. A map is used only when it fits shared memory and
     requires no extra CTA waves. ``enable_pdl`` is the metadata kernel's PDL
     switch; ``None`` (default) enables it on devices that support PDL. A PDL
-    launch waits for the preceding grid and then releases its dependents at
-    entry, before its output stores, so a PDL-launched consumer must wait for
-    this grid before it reads the outputs. ``False`` keeps plain stream
-    ordering.
+    launch waits for the preceding grid before it reads its inputs and releases
+    its dependents after its last output store; a PDL-launched consumer must
+    still wait for this grid before it reads the outputs. ``False`` keeps plain
+    stream ordering.
     Packed ``qo_indptr`` must be an Int32 device copy of CPU-validated route
     offsets; this builder checks only its structural tensor contract and does
     not read route values back to the host.
@@ -1818,9 +1818,10 @@ def _build_q_token_kv_block_sparse_metadata(
     enable_pdl : Optional[bool]
         Launch with programmatic dependent launch (PDL). ``None`` (default)
         enables it on devices that support PDL. The kernel then waits for the
-        preceding grid and releases its dependents at entry, before its
-        output stores, so a PDL-launched consumer must wait for this grid
-        before it reads the outputs. ``False`` keeps plain stream ordering.
+        preceding grid before it reads its inputs and releases its dependents
+        after its last output store; a PDL-launched consumer must still wait
+        for this grid before it reads the outputs. ``False`` keeps plain
+        stream ordering.
 
     Returns
     -------
@@ -1876,8 +1877,9 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     metadata retains per-fragment membership bytes; Q/K/V layouts, the union,
     and page indices are unchanged. ``enable_pdl`` (``None`` resolves to
     device support) launches the metadata kernel with PDL: it waits for the
-    preceding grid and then releases its dependents at entry. The combined
-    plan passes the enable_pdl it also requests for attention.
+    preceding grid before it reads its inputs and releases its dependents
+    after its last output store. The combined plan passes the enable_pdl it
+    also requests for attention.
     """
 
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)

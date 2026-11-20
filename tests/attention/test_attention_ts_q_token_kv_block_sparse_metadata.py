@@ -550,6 +550,24 @@ def test_q_token_kv_block_sparse_block_size_must_be_integer(
         )
 
 
+def test_q_token_kv_block_sparse_metadata_grids_launch_under_enable_pdl() -> None:
+    """Every metadata grid, including each bitmap instantiation (word rank,
+    summary walk, entry map), waits for the preceding grid at entry and is
+    launched through the PDL launcher rather than a plain <<<>>> launch."""
+    import pathlib
+    import re
+
+    header = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "include/flashinfer/attention/prims_ts/q_token_kv_block_sparse_metadata.cuh"
+    ).read_text()
+    kernels = re.findall(r"__global__[^{]*\{\s*\n\s*(\S+)", header)
+    assert len(kernels) == 3
+    assert all(first == "WaitForPdlPrimary(params);" for first in kernels)
+    assert "<<<" not in header
+    assert header.count("LaunchQTokenKvBlockSparseMetadataKernel<PositionType>(") == 4
+
+
 @pytest.mark.parametrize("enable_pdl", (1, "yes"))
 def test_q_token_kv_block_sparse_metadata_validates_enable_pdl_without_routes(
     monkeypatch: pytest.MonkeyPatch, enable_pdl: object
