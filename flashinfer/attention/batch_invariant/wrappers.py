@@ -29,7 +29,7 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, MASK_CAUSAL, scale_log2
 
 CLASS = "attention.bf16"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
@@ -156,11 +156,13 @@ class BatchInvariantAttention:
         page_size: int,
         window_left: int = -1,
         q_len_per_req: int = 1,
-        masked: bool = False,
+        *,
+        mask_mode: str = MASK_CAUSAL,
     ) -> int:
         """The wrappers' ``workspace_size``: the float workspace bytes the split-KV plan of this batch needs (0 when every unit is
-        fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits). ``masked``: the
-        plan will take a custom mask (the explicit-key-set class spans every request's whole key range)."""
+        fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits). ``mask_mode``
+        (keyword-only): what a row of the plan will see -- ``"key_set"`` for a plan with a custom mask (the explicit-key-set
+        class spans every request's whole key range)."""
         D = int(head_dim)
         if D not in HEAD_DIMS:
             raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
@@ -189,7 +191,7 @@ class BatchInvariantAttention:
             engine.default_config(D=D),
             self.device,
             ragged=self.kind == "ragged",
-            masked=masked and self.kind != "decode",
+            mask_mode=MASK_CAUSAL if self.kind == "decode" else mask_mode,
         )
 
     # ------------------------------------------------------------------ plan

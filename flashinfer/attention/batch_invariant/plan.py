@@ -12,7 +12,7 @@ does not allow. Which of the two kinds a Q tile gets is the planner's choice (it
 count); every choice computes the same bits (R3).
 
 Positions are bottom-right causal: token ``i`` of request ``b`` (``0 <= i < q_len``) sits at
-``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``. Under the explicit-key-set class (``masked``) a row's
+``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``. Under the explicit-key-set class (``mask_mode="key_set"``) a row's
 keys are data inside ``[0, kv_len)``: a row block's range is the tiles between the first and the last tile in which one of its
 rows has a visible key (``key_tiles``, a summary of the sets; the request's whole key range without it), and the unit and
 group construction is otherwise the same. The tiles a block skips hold no visible key of its rows -- absent leaves either way,
@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
-from .spec import TILE_KEYS, chunk_len
+from .spec import MASK_CAUSAL, MASK_KEY_SET, TILE_KEYS, check_mask_mode, chunk_len
 
 DESC_FIELDS = 16
 # descriptor fields (int32); F_QBASE = qo_indptr[req], the packed token index of the request's first token;
@@ -50,12 +50,28 @@ DESC_FIELDS = 16
     F_KVPTR0,
     F_NPAGES,
 ) = range(16)
-F_MASK = F_KVPTR0
+F_VIS = F_KVPTR0
 # F_GROUP: the unit's split group (an index into Plan.groups) when the group's chunk fold runs IN-KERNEL (the unit that completes the
 # group folds it: blocks/correction.py), -1 otherwise (mode 0, or a group left to the fixup kernel)
-# F_MASK (the explicit-key-set class): the table row (16 int32) at which the key-set words of the unit's request start
-# (``engine.plan_attention`` appends them to the table and fills the field). It shares field 14 with F_KVPTR0: the Swaps body, the
-# only reader of F_KVPTR0, never runs the explicit-key-set class
+# F_VIS (every mask mode whose visible keys are data: ``keys_are_data``): the table row (``DESC_FIELDS`` int32) at which the
+# row-visibility block of the unit's request starts. ``engine.plan_attention`` appends the requests' blocks to the table behind the
+# unit rows and fills the field, so the kernels' descriptor argument carries both. The slot is field 14, which the causal mode uses
+# as F_KVPTR0: the Swaps body, the only reader of F_KVPTR0 / F_NPAGES, runs the causal mode alone. The block's layout per mode:
+#   key_set     per query token of the request, in token order, ``ceil(kv_len / 128) * 4`` int32: bit ``k % 32`` of word ``k // 32``
+#               is key ``k`` of the row, bits past ``kv_len`` zero (``engine.pack_key_sets``)
+MASK_SUFFIX = {
+    MASK_CAUSAL: "",
+    MASK_KEY_SET: "_mk",
+}  # the kernel objects' name suffix per mode (the causal names are unchanged)
+
+
+def keys_are_data(mask_mode: str) -> bool:
+    """The modes in which a row's visible keys are data of the row (not a function of its position): the row body reads them from
+    the request's row-visibility block (``F_VIS``), a split group's present chunks are decided by the partials (``m != -inf``), a
+    row without a visible key stores ``+0``, and the units take the row body (the Swaps body implements the causal mode alone)."""
+    return check_mask_mode(mask_mode) != MASK_CAUSAL
+
+
 INKERNEL_MAX_ROWS = 32  # merge == "auto": groups of at most this many rows (every decode unit) and at most INKERNEL_MAX_CHUNKS chunks fold
 INKERNEL_MAX_CHUNKS = 2  # in-kernel (measured faster for small decode batches, within noise at B = 1); wider groups (prefill split
 FUSE2_MIN_ROWS = 8  # D = 256 two-chunk rule (build_plan): fused decode-sized units only from this many live rows (g x q_len) per unit
@@ -391,7 +407,8 @@ def build_plan(
     swap_max_rows: int = INKERNEL_MAX_ROWS,
     grid: int = 0,
     grid_search: bool = True,
-    masked: bool = False,
+    *,
+    mask_mode: str = MASK_CAUSAL,
     key_tiles: Optional[tuple] = None,
 ) -> Plan:
     """``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``
@@ -409,13 +426,17 @@ def build_plan(
     (always in-kernel); the same fold in the same order either way (R3: same bits).
     ``grid``: the persistent grid the launch will use (0: the planner's ``Plan.grid`` if it chose one, else ``min(units, sm_count)``),
     so that the unit order's waves (``snake_order``) are the waves the CTAs actually walk.
-    ``masked``: the explicit-key-set class -- a row block spans its request's tiles ``[0, ceil(kv_len / T))``, or with
+    ``mask_mode`` (keyword-only): what a row sees. ``"key_set"`` (the explicit-key-set class) -- a row block spans its request's tiles ``[0, ceil(kv_len / T))``, or with
     ``key_tiles = (first, last)`` (per query token of the batch, in packed order: the first and the last tile holding a visible
     key of the token, ``first > last`` for a token without one) the tiles from the block's smallest ``first`` to its largest
     ``last``; a block without a visible key walks one tile (its rows end with ``l = +0`` and store ``+0``). ``window_left`` is not
     read (the caller folds the window into the key sets); a request may have more query tokens than keys, and needs at least one
     key."""
     assert merge in ("auto", "fixup", "inkernel"), merge
+    masked = check_mask_mode(mask_mode) == MASK_KEY_SET
+    assert not (small_swap and keys_are_data(mask_mode)), (
+        "the Swaps body runs the causal mode alone"
+    )
     assert Hq % Hkv == 0, (Hq, Hkv)
     g = Hq // Hkv
     assert 1 <= g <= q_rows, g

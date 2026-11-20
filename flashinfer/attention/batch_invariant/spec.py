@@ -58,6 +58,19 @@ HEAD_DIMS = (
 )  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)))
 NEG_INF = float("-inf")
 
+# what a row sees (``mask_mode``): the declared values of the one mode switch every signature of the kernels, the planner and the
+# fold takes by keyword. A mode names where a row's visible keys come from; the tiles, the chunks, the tile step and the merge are
+# the same dataflow under every mode
+MASK_CAUSAL = "causal"  # the keys [max(0, p - window_left), p] of the row's position
+MASK_KEY_SET = "key_set"  # an explicit key set per row (data: a custom mask)
+MASK_MODES = (MASK_CAUSAL, MASK_KEY_SET)
+
+
+def check_mask_mode(mask_mode: str) -> str:
+    if mask_mode not in MASK_MODES:
+        raise ValueError(f"mask_mode {mask_mode!r}: one of {MASK_MODES}")
+    return mask_mode
+
 
 CHUNK_LEN = 512  # C: keys per chunk (4 tiles) -- a class constant (another C would be a different class)
 CHUNK_LEN_OF = {

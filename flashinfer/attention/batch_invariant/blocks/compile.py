@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the attention kernel: one TVM-FFI object per static tuple ``(D, g, page,
-kv_slots, n_wg, q2, ragged, cap, masked)`` with dynamic shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``.
+kv_slots, n_wg, q2, ragged, cap, mask_mode)`` with dynamic shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``.
 ``cap`` is the shared-memory capacity the smem plan is sized for (the execution device's): part of the kernel's identity, in-process
 and on disk, so a kernel compiled for one part is never loaded for another.
 
@@ -9,8 +9,9 @@ Operand views the kernel expects (all built by ``engine.py`` from the FlashInfer
 Q as ``(D, Hq, total_q)`` (strides ``(1, D, Hq*D)`` for a packed ``(total_q, Hq, D)`` tensor), K and V as
 ``(D, page, Hkv, num_pages)`` (NHD or HND pools: runtime strides), O as ``(total_q * Hq, D)``, the fp32
 workspace flat, the fp32 per-CTA ``O_m`` scratch flat (``grid x 128 x D`` at D = 256, one element otherwise), the int32 split-group table ``(num_groups, GROUP_FIELDS)`` and the per-group arrival
-counters (the in-kernel chunk fold), the int32 descriptor table ``(num_units, 16)``, ``kv_indptr`` and ``kv_indices``. Under the
-explicit-key-set class (``masked``) the descriptor table continues with the rows' key-set words (``engine.plan_attention``).
+counters (the in-kernel chunk fold), the int32 descriptor table ``(num_units, 16)``, ``kv_indptr`` and ``kv_indices``. Under a
+mask mode whose keys are data (``plan.keys_are_data``) the descriptor table continues with the requests' row-visibility blocks
+(``plan.F_VIS``, ``engine.plan_attention``).
 """
 
 from __future__ import annotations
@@ -21,7 +22,8 @@ import cutlass
 import cutlass.cute as cute
 
 from ....batch_invariant import jit
-from ..plan import GROUP_FIELDS
+from ..plan import GROUP_FIELDS, MASK_SUFFIX
+from ..spec import MASK_CAUSAL, check_mask_mode
 from .kernel import AttentionKernel
 
 MODULE = "batch_invariant_attention"
@@ -37,15 +39,16 @@ def kernel_name(
     ragged: bool = False,
     hw_rowmax: bool = False,
     cap: int = 0,
-    masked: bool = False,
+    *,
+    mask_mode: str = MASK_CAUSAL,
 ) -> str:
     return jit.sanitize_symbol_name(
         f"attn_d{D}_g{g}_p{page}_s{kv_slots}_w{n_wg}"
         + ("_q2" if q2 else "")
         + ("_rg" if ragged else "")
         + ("_hwm" if hw_rowmax else "")
-        + ("_mk" if masked else "")
         + (f"_c{cap >> 10}" if cap else "")
+        + MASK_SUFFIX[check_mask_mode(mask_mode)]
     )
 
 
@@ -60,15 +63,19 @@ def get_compiled_attention(
     ragged: bool = False,
     hw_rowmax: bool = False,
     cap: int = 0,
-    masked: bool = False,
+    *,
+    mask_mode: str = MASK_CAUSAL,
 ):
     """``hw_rowmax``: the softmax's row maximum from the TMEM load (``engine.hw_row_max_enabled``); part of the kernel's name.
     ``cap``: the shared-memory capacity the smem plan is checked against (the execution device's; the current device's when 0).
-    ``masked``: the explicit-key-set class's body (a separate object, ``_mk``)."""
+    ``mask_mode`` (keyword-only): what a row sees (``spec.MASK_MODES``) -- one object per mode (``plan.MASK_SUFFIX``); the causal
+    mode's objects keep their names."""
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
-    name = kernel_name(D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, masked)
+    name = kernel_name(
+        D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, mask_mode=mask_mode
+    )
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -135,7 +142,16 @@ def get_compiled_attention(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         k = AttentionKernel(
-            D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, masked
+            D,
+            g,
+            page,
+            kv_slots,
+            n_wg,
+            q2,
+            ragged,
+            hw_rowmax,
+            cap,
+            mask_mode=mask_mode,
         )
         return cute.compile(
             k,

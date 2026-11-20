@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 
 from ..plan import ws_row
-from ..spec import MMA_K, TILE_KEYS, tiles_per_chunk
+from ..spec import MASK_CAUSAL, MMA_K, TILE_KEYS, tiles_per_chunk
 from ..blocks.operands import (
     ACC_DTYPE,
     HALF,
@@ -235,6 +235,9 @@ class SwapsPlan:
         )
         assert not ragged or page == TILE_KEYS, (ragged, page)
         self.roles = Roles
+        # the causal mode alone: a batch of another mask mode takes the row body (blocks/operands.StaticPlan.mask_mode)
+        self.mask_mode = MASK_CAUSAL
+        self.keys_are_data = False
         self.n_wg = 1  # one softmax warpgroup (fold_group's prefetch depth reads it)
         self.T = TILE_KEYS
         self.tpc = tiles_per_chunk(D)

@@ -3689,7 +3689,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_qk,
                 page_size,
                 window_left,
-                masked=custom_mask is not None or packed_custom_mask is not None,
+                mask_mode="key_set"
+                if custom_mask is not None or packed_custom_mask is not None
+                else "causal",
             ), 0
         if self._backend == "cute-dsl-prims":
             qo_indptr_host = qo_indptr.to("cpu")

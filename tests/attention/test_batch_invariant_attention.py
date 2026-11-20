@@ -2299,7 +2299,7 @@ def test_mask_planner_geometry():
             }
         )
 
-    kw = dict(split_policy="fused", masked=True)
+    kw = dict(split_policy="fused", mask_mode="key_set")
     p = P.build_plan([0, 300], [0, 1500], [1], 32, 8, 128, 1, **kw)
     assert ranges(p) == [
         (t, 0, 12, 0, 3) for t in (0, 32, 64, 96, 128, 160, 192, 224, 256, 288)
@@ -2309,7 +2309,7 @@ def test_mask_planner_geometry():
     p = P.build_plan([0, 8], [0, 1500], [1], 32, 8, 128, 1, 200, **kw)
     assert ranges(p) == [(0, 0, 12, 0, 3)]  # the window is not read
     with pytest.raises(AssertionError):
-        P.build_plan([0, 4], [0, 0], [0], 32, 8, 128, 1, masked=True)
+        P.build_plan([0, 4], [0, 0], [0], 32, 8, 128, 1, mask_mode="key_set")
     # the summary of the key sets: 70 tokens over 1500 keys (12 tiles), three row blocks of 32 tokens
     m = torch.zeros(70, 1500, dtype=torch.bool)
     m[0, 700] = True  # block 0: tiles 5 .. 9
@@ -2665,7 +2665,7 @@ def test_mask_config_agreement(D):
     cfgs += [replace(base, kv_slots=s) for s in engine.valid_kv_slots(D)[:1]]
     for cfg in cfgs:
         out, planned = _run_masked_engine(pr, masks, cfg)
-        assert planned.masked
+        assert planned.mask_mode == "key_set"
         assert torch.equal(bits(out), ref), cfg
     for sm in (1, 8, 1000):
         out, _ = _run_masked_engine(pr, masks, base, sm_count=sm)

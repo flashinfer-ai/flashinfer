@@ -5,8 +5,9 @@ that all work on every tile and split its **keys**: warpgroup ``k`` holds keys `
 of every row (the warps of the warpgroups share their TMEM lanes, so a row's keys are dealt out to
 ``n_wg`` threads). Per tile a thread
 
-* (the explicit-key-set class, ``st.masked``) loads the row's key bits of the tile, ``T / 32`` int32 from the key-set words behind
-  the descriptor table, before waiting for ``S``, and masks by bit instead of by range;
+* (``st.mask_mode == "key_set"``, the explicit-key-set class) loads the row's key bits of the tile, ``T / 32`` int32 from the
+  request's row-visibility block behind the descriptor table (``plan.F_VIS``), before waiting for ``S``, and masks by bit instead
+  of by range;
 * copies the **whole** row of ``S`` out of TMEM for the ``rowmax`` plan (the canonical 128-leaf pairwise
   tree, recomputed by every slice: a redundant tree costs less than an exchange) and its own slice of
   the row for the exponentials, masks both by absolute key (``select``; only on boundary tiles),
@@ -47,6 +48,7 @@ from ....batch_invariant.fp_interface.cute import CuteF32, fmax3
 
 
 from .. import spec
+from ..spec import MASK_KEY_SET
 from ..plan import DESC_FIELDS
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
@@ -201,7 +203,7 @@ def unit_loop(
     tile_lo: Int32,
     tile_hi: Int32,
     mDesc: cute.Tensor,
-    mask_row: Int32,
+    vis_row: Int32,
 ):
     """One unit for softmax warpgroup ``k``, in the full-row placement (its slice = keys ``[k kpt, (k+1) kpt)``) or the
     replicated-row placement (warp ``wq`` of the warpgroup takes slice ``4k + wq`` of ``4 n_wg``; the warpgroup's four
@@ -332,19 +334,19 @@ def unit_loop(
     m = Float32(_NEG_INF)
     N = tile_hi - tile_lo
     # the explicit-key-set class: the row's visible keys are its key-set words -- one bit per key of [0, kv_len), 32 keys per int32,
-    # WORDS words per tile, the row's tiles consecutive, the request's rows in token order from table row ``mask_row`` (``DESC_FIELDS`` int32
+    # WORDS words per tile, the row's tiles consecutive, the request's rows in token order from table row ``vis_row`` (``DESC_FIELDS`` int32
     # per table row); bits past kv_len are zero. A padding row reads the request's last row (a valid address; its values are never stored)
-    MASKED = st.masked
+    KEY_SET = st.mask_mode == MASK_KEY_SET
     WORDS = T // 32
     row_words = Int64(0)
     mw = None
     msw = None
     n_sw = max(1, kpt // 32)  # the words of the thread's key slice
-    if cutlass.const_expr(MASKED):
+    if cutlass.const_expr(KEY_SET):
         tok_m = token
         if tok_m > q_len - 1:
             tok_m = q_len - 1
-        row_words = mask_row.to(Int64) * DESC_FIELDS + tok_m.to(Int64) * (
+        row_words = vis_row.to(Int64) * DESC_FIELDS + tok_m.to(Int64) * (
             ((kv_len + T - 1) // T) * WORDS
         )
         mw = cute.make_rmem_tensor(cute.make_layout((WORDS,)), Int32)
@@ -353,7 +355,7 @@ def unit_loop(
     for n in range(N):
         t = tile_lo + n
         chunk_first = ((t % TPC) == 0) | (t == tile_lo)
-        if cutlass.const_expr(MASKED):
+        if cutlass.const_expr(KEY_SET):
             # the tile's key bits of this row, loaded before the wait for S (their latency overlaps the QK^T of the tile)
             cute.autovec_copy(
                 cute.make_tensor(
@@ -407,7 +409,7 @@ def unit_loop(
         # are fully visible and padding rows (row >= rows_valid) are never masked: their values are never stored (a
         # warp-uniform decision, no arithmetic involved)
         need_mask = cutlass.Boolean(False)
-        if cutlass.const_expr(MASKED):
+        if cutlass.const_expr(KEY_SET):
             # a tile every live row of the warp sees whole needs no select (the same values: a placement)
             w_all = mw[0]
             for j in cutlass.range_constexpr(1, WORDS):
@@ -420,7 +422,7 @@ def unit_loop(
                 ((k0 < lo_row) | (k0 + T > L_row)) & (row < rows_valid)
             )
         if need_mask:
-            if cutlass.const_expr(MASKED):
+            if cutlass.const_expr(KEY_SET):
                 # a key outside the row's set is an absent leaf: its score becomes -inf before the maximum
                 if cutlass.const_expr(not exchange):
                     for i in cutlass.range_constexpr(T):
@@ -599,7 +601,7 @@ def softmax_loop(
     tile_lo: Int32,
     tile_hi: Int32,
     mDesc: cute.Tensor,
-    mask_row: Int32,
+    vis_row: Int32,
 ):
     """One unit for softmax warpgroup ``k``: the replicated-row placement when the unit has at most ``rep_rows = (32 // g) g``
     live rows (``g <= 32``), the full-row placement otherwise. Returns the advanced pipelines."""
@@ -629,7 +631,7 @@ def softmax_loop(
                 tile_lo,
                 tile_hi,
                 mDesc,
-                mask_row,
+                vis_row,
             )
         else:
             s_cons, p_prod, stats_prod = unit_loop(
@@ -656,7 +658,7 @@ def softmax_loop(
                 tile_lo,
                 tile_hi,
                 mDesc,
-                mask_row,
+                vis_row,
             )
     else:
         s_cons, p_prod, stats_prod = unit_loop(
@@ -683,6 +685,6 @@ def softmax_loop(
             tile_lo,
             tile_hi,
             mDesc,
-            mask_row,
+            vis_row,
         )
     return s_cons, p_prod, stats_prod

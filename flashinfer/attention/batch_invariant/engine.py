@@ -21,22 +21,23 @@ from __future__ import annotations
 
 import functools
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import torch
 
 from .plan import (
     DESC_FIELDS,
-    F_MASK,
     F_REQ,
+    F_VIS,
     GRID_SEARCH_ARCHES,
     GROUP_FIELDS,
     build_plan,
+    keys_are_data,
     snake_order,
     ws_row,
 )
-from .spec import HEAD_DIMS, TILE_KEYS, scale_log2
+from .spec import HEAD_DIMS, MASK_CAUSAL, MASK_KEY_SET, TILE_KEYS, scale_log2
 
 
 PAGE_SIZES = (
@@ -364,20 +365,48 @@ def plan_kv_lens(
 
 
 @dataclass
-class KeySets:
-    """The key sets of a batch in the kernels' layout: ``words`` (int32, flat) holds, per request with query tokens, its rows in
-    token order, each row ``ceil(kv_len / 128) * 4`` int32 -- bit ``k % 32`` of word ``k // 32`` is key ``k`` of the row, bits past
-    ``kv_len`` zero -- and every request starts at a multiple of ``KEY_TABLE_ROW`` words: ``row_start[b]`` table rows from the
-    start. ``q_lens`` / ``kv_lens`` are what the words were packed for (``check``). ``tile_first`` / ``tile_last``: per query
-    token of the batch (packed order), the first and the last 128-key tile holding a visible key of the token (``first > last``
-    for a token without one) -- the summary the planner trims a row block's tile range with (``None``: every block walks its
-    request's whole key range; the same bits either way)."""
+class RowVisibility:
+    """The row-visibility blocks of a batch, the data behind the unit rows of the descriptor table under a mask mode whose keys
+    are data (``plan.F_VIS``): ``words`` (int32, flat) holds one block per request, every block starting at a multiple of
+    ``KEY_TABLE_ROW`` words -- ``row_start[b]`` table rows from the start of ``words`` for request ``b`` -- and ``rows`` is the
+    total in table rows. What a block holds is the mode's layout (``plan.F_VIS``); a row's data sits at an offset that depends on
+    its request's lengths and its token index alone."""
 
     words: torch.Tensor
     row_start: List[int]
     rows: int
-    q_lens: List[int]
-    kv_lens: List[int]
+
+
+def append_row_visibility(
+    desc: torch.Tensor, vis: RowVisibility, has_units: bool = True
+) -> torch.Tensor:
+    """The kernels' descriptor argument under a mask mode whose keys are data: the unit rows ``desc`` followed by the requests'
+    row-visibility blocks (one int32 tensor of plan constants; ``DESC_FIELDS`` int32 per table row), with every unit's ``F_VIS`` set
+    to the table row at which its request's block starts. One layout rule for every such mode."""
+    n_rows = desc.shape[0]
+    if n_rows + vis.rows >= 2**31:
+        raise ValueError(
+            "the row-visibility data of this batch exceeds the descriptor table's int32 row index"
+        )
+    if has_units:
+        starts = torch.tensor(vis.row_start, dtype=torch.int64, device=desc.device)
+        desc[:, F_VIS] = (n_rows + starts[desc[:, F_REQ].long()]).to(torch.int32)
+    return torch.cat(
+        [desc.reshape(-1), vis.words.to(device=desc.device, dtype=torch.int32)]
+    ).reshape(-1, DESC_FIELDS)
+
+
+@dataclass
+class KeySets(RowVisibility):
+    """The key sets of a batch in the kernels' layout (the ``key_set`` mode's row-visibility blocks): ``words`` holds, per request
+    with query tokens, its rows in token order, each row ``ceil(kv_len / 128) * 4`` int32 -- bit ``k % 32`` of word ``k // 32`` is
+    key ``k`` of the row, bits past ``kv_len`` zero. ``q_lens`` / ``kv_lens`` are what the words were packed for (``check``). ``tile_first`` / ``tile_last``: per query
+    token of the batch (packed order), the first and the last 128-key tile holding a visible key of the token (``first > last``
+    for a token without one) -- the summary the planner trims a row block's tile range with (``None``: every block walks its
+    request's whole key range; the same bits either way)."""
+
+    q_lens: List[int] = field(default_factory=list)
+    kv_lens: List[int] = field(default_factory=list)
     tile_first: Optional[List[int]] = None
     tile_last: Optional[List[int]] = None
 
@@ -516,7 +545,8 @@ class _Planned:
         self.page: Optional[int] = None
         # the plan's kv_indptr (int32 on the device): the page-table offsets the descriptor table holds; the kernels run with it
         self.kv_indptr: Optional[torch.Tensor] = None
-        self.masked = False  # the explicit-key-set class: the table continues with the rows' key-set words
+        # what a row sees (spec.MASK_MODES); under a mode whose keys are data the table continues with the requests' row-visibility blocks
+        self.mask_mode = MASK_CAUSAL
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
@@ -558,11 +588,17 @@ def plan_attention(
         if sm_count is not None
         else (device_sm_count(device) if device.type == "cuda" else 204)
     )
-    masked = key_sets is not None
-    if masked:
+    mask_mode = MASK_KEY_SET if key_sets is not None else MASK_CAUSAL
+    vis: Optional[RowVisibility] = None
+    if key_sets is not None:
+        vis = key_sets
         key_sets.check(
             qo_indptr.cpu().tolist(), plan_kv_lens(kv_indptr, kv_last_page_len, page)
         )
+    # a batch whose keys are data takes the row body (the Swaps-AB kernel implements the causal mode alone)
+    small_swap = (
+        config.small == "swap" and D in SWAPS_DIMS and not keys_are_data(mask_mode)
+    )
     plan = build_plan(
         qo_indptr.cpu().tolist(),
         kv_indptr.cpu().tolist(),
@@ -575,11 +611,11 @@ def plan_attention(
         config.split_policy,
         sm,
         merge=config.merge,
-        small_swap=config.small == "swap" and D in SWAPS_DIMS and not masked,
+        small_swap=small_swap,
         swap_max_rows=SWAPS_MAX_ROWS,
         grid=config.grid,
         grid_search=planner_grid_search(device),
-        masked=masked,
+        mask_mode=mask_mode,
         key_tiles=(key_sets.tile_first, key_sets.tile_last)
         if key_sets is not None and key_sets.tile_first is not None
         else None,
@@ -593,31 +629,13 @@ def plan_attention(
     if (
         config.q2
         and len(plan.desc) >= Q2_MIN_UNITS_PER_SM[D] * sm
-        and not (
-            config.small == "swap"
-            and D in SWAPS_DIMS
-            and not masked
-            and swaps_n_pad(plan)
-        )
+        and not (small_swap and swaps_n_pad(plan))
     ):
         paired = pair_units(plan.desc, sm)
         plan.num_launch = len(paired) // 2
         desc = torch.tensor(paired, dtype=torch.int32, device=device)
-    if masked:
-        # the key-set words continue the descriptor table (one int32 tensor of plan constants; 16 int32 per table row): every
-        # unit's F_MASK is the table row at which its request's words start
-        assert key_sets is not None
-        n_rows = desc.shape[0]
-        starts = torch.tensor(key_sets.row_start, dtype=torch.int64, device=device)
-        if n_rows + key_sets.rows >= 2**31:
-            raise ValueError(
-                "the key sets of this batch exceed the descriptor table's int32 row index"
-            )
-        if plan.desc:
-            desc[:, F_MASK] = (n_rows + starts[desc[:, F_REQ].long()]).to(torch.int32)
-        desc = torch.cat(
-            [desc.reshape(-1), key_sets.words.to(device=device, dtype=torch.int32)]
-        ).reshape(-1, DESC_FIELDS)
+    if vis is not None:
+        desc = append_row_visibility(desc, vis, bool(plan.desc))
     groups = torch.tensor(
         plan.groups if plan.groups else [[0] * GROUP_FIELDS],
         dtype=torch.int32,
@@ -666,7 +684,7 @@ def plan_attention(
     planned.kv_indptr = kv_indptr.to(
         device=device, dtype=torch.int32, copy=True
     ).contiguous()
-    planned.masked = masked
+    planned.mask_mode = mask_mode
     return planned
 
 
@@ -682,10 +700,12 @@ def workspace_bytes(
     config: Optional[AttnConfig] = None,
     device=None,
     ragged: bool = False,
-    masked: bool = False,
+    *,
+    mask_mode: str = MASK_CAUSAL,
 ) -> int:
     """The float workspace bytes ``plan_attention`` needs for this batch's split-KV partials (0 when the plan has no split
-    group); the planner runs on the host, nothing is allocated. ``masked``: the explicit-key-set class's geometry."""
+    group); the planner runs on the host, nothing is allocated. ``mask_mode`` (keyword-only): what a row sees -- ``"key_set"``
+    plans the explicit-key-set class's geometry (every request's whole key range)."""
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
@@ -706,10 +726,12 @@ def workspace_bytes(
         config.split_policy,
         sm,
         merge=config.merge,
-        small_swap=config.small == "swap" and D in SWAPS_DIMS and not masked,
+        small_swap=config.small == "swap"
+        and D in SWAPS_DIMS
+        and not keys_are_data(mask_mode),
         swap_max_rows=SWAPS_MAX_ROWS,
         grid_search=planner_grid_search(device),
-        masked=masked,
+        mask_mode=mask_mode,
     )
     return plan.ws_rows * ws_row(D) * 4
 
@@ -934,12 +956,11 @@ def _run_attention_validated(
     assert planned.fold_counters is not None and planned.scratch is not None, (
         "plan_attention must be called with the same (FMHA) config"
     )
-    masked = bool(
-        planned.masked
-    )  # the explicit-key-set class: the row body alone implements it (small units take its replicated rows)
+    # a mode whose keys are data: the row body alone implements it (small units take its replicated rows)
+    mask_mode = planned.mask_mode
     n_pad = (
         swaps_n_pad(plan)
-        if (config.small == "swap" and D in SWAPS_DIMS and not masked)
+        if (config.small == "swap" and D in SWAPS_DIMS and not keys_are_data(mask_mode))
         else 0
     )
     if n_pad:  # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
@@ -983,7 +1004,16 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, masked
+                D,
+                g,
+                page,
+                DEFAULT_RING[D],
+                1,
+                False,
+                ragged,
+                hwm,
+                cap,
+                mask_mode=mask_mode,
             )
         else:
             kernel = get_compiled_attention(
@@ -996,7 +1026,7 @@ def _run_attention_validated(
                 ragged,
                 hwm,
                 cap,
-                masked,
+                mask_mode=mask_mode,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
@@ -1032,7 +1062,7 @@ def _run_attention_validated(
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g, masked)(
+        get_fixup(D, g, mask_mode=mask_mode)(
             planned.ws,
             o_view,
             planned.fixup_groups,
