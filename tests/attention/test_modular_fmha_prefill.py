@@ -34,7 +34,7 @@ if torch.cuda.is_available() and not is_cute_dsl_arch_supported(
         allow_module_level=True,
     )
 
-from tests.test_helpers.sink_attention_reference import sink_softmax
+from tests.attention.test_helpers.sink_attention_reference import sink_softmax
 import cutlass.cute as cute
 
 from flashinfer.cute_dsl.attention import (

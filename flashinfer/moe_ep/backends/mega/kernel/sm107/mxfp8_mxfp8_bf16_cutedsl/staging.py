@@ -8,11 +8,13 @@ import torch
 
 
 def _data_dtype(kind: str) -> torch.dtype:
+    if kind == "mxfp4":
+        return getattr(torch, "float4_e2m1fn_x2", torch.uint8)
     if kind in ("mxfp8_e4m3", "mxfp4_mxfp8"):
         return torch.float8_e4m3fn
     if kind == "mxfp8_e5m2":
         return torch.float8_e5m2
-    raise ValueError(f"unsupported MXFP8 activation kind {kind!r}")
+    raise ValueError(f"unsupported MX activation kind {kind!r}")
 
 
 def stage_mega_moe_inputs(
@@ -25,16 +27,18 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     kind: str = "mxfp8_e4m3",
+    batch_invariant: bool = False,
     num_experts: int | None = None,
     workspace=None,
 ) -> int:
-    """bf16 ``hidden_states`` -> MXFP8 activation + E8M0 block scales.
+    """bf16 ``hidden_states`` -> MXFP4 or MXFP8 with per-32 E8M0 scales.
 
     Returns the staged token count. Unsupported layouts use Torch staging.
     """
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Mxfp8BlockSize,
         ceil_div,
+        quantize_mxfp4_block32,
         quantize_mxfp8_block32,
     )
 
@@ -47,13 +51,26 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
+    if batch_invariant:
+        from ...sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
+            require_batch_invariant_stage_layout,
+        )
+
+        if kind not in ("mxfp4", "mxfp4_mxfp8", "mxfp8_e4m3", "mxfp8_e5m2"):
+            raise ValueError("unsupported batch_invariant MX quantization kind")
+        require_batch_invariant_stage_layout(hidden_states, topk_ids, topk_weights)
+
     fused_stage = (
-        os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
+        (batch_invariant or os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0")
         and hidden_states.is_cuda
         and hidden_states.is_contiguous()
         and hidden_states.data_ptr() % 16 == 0
         and hidden % 128 == 0
-        and x_sf.shape[1] == hidden // 32
+        and (
+            x_sf.shape[1] >= hidden // 32
+            if batch_invariant
+            else x_sf.shape[1] == hidden // 32
+        )
         and topk_ids.shape[1] <= 128
         and topk_ids.is_contiguous()
         and topk_weights.is_contiguous()
@@ -63,7 +80,7 @@ def stage_mega_moe_inputs(
     )
     check_routes = (
         num_experts is not None
-        and os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1") != "0"
+        and os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0") != "0"
     )
     fused_check = (
         check_routes
@@ -91,7 +108,7 @@ def stage_mega_moe_inputs(
             topk_ids,
             topk_weights,
             x_fp8,
-            x_sf,
+            x_sf[:, : hidden // Mxfp8BlockSize] if batch_invariant else x_sf,
             topk_idx_out,
             topk_weights_out,
             quant_type="mxfp8_e4m3" if kind == "mxfp4_mxfp8" else kind,
@@ -99,10 +116,24 @@ def stage_mega_moe_inputs(
             num_experts=num_experts if fused_check else None,
             fuse_tail_mask=os.environ.get("FLASHINFER_SM107_FUSED_TAIL_MASK", "1")
             != "0",
+            zero_masked_scores=False,
+            batch_invariant=batch_invariant,
+            batch_invariant_quant_kind=(
+                kind
+                if batch_invariant and kind in ("mxfp8_e4m3", "mxfp8_e5m2")
+                else None
+            ),
         )
         return num_tokens
 
-    q, sf = quantize_mxfp8_block32(hidden_states.to(torch.float32), _data_dtype(kind))
+    if batch_invariant:
+        raise ValueError("batch_invariant MX requires the fused staging layout")
+
+    q, sf = (
+        quantize_mxfp4_block32(hidden_states.to(torch.float32))
+        if kind == "mxfp4"
+        else quantize_mxfp8_block32(hidden_states.to(torch.float32), _data_dtype(kind))
+    )
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
     if x_sf.shape[1] < hidden_sf_cols:
@@ -115,10 +146,7 @@ def stage_mega_moe_inputs(
     x_sf[:num_tokens].view(torch.uint8).zero_()
     x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
     topk_idx_out[:num_tokens].copy_(topk_ids.to(torch.int32))
-    # Masked scores may be non-finite; zero them before late-weight combine.
-    topk_weights_out[:num_tokens].copy_(
-        topk_weights.to(torch.float32).masked_fill(topk_ids == -1, 0)
-    )
+    topk_weights_out[:num_tokens].copy_(topk_weights)
     if num_tokens < capacity:
         topk_idx_out[num_tokens:capacity].fill_(-1)
     return num_tokens

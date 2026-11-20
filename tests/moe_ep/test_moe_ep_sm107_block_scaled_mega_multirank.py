@@ -1,4 +1,7 @@
-"""EP2/EP4/EP8 SM107 block-scaled MegaMoE: MoEEpLayer vs Torch oracle.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""EP2/EP4/EP8/EP16/EP32 SM107 MegaMoE: MoEEpLayer vs Torch oracle.
 
 Runs ONLY under its own torchrun invocation (``run_tests.sh mega_sm107``)::
 
@@ -33,6 +36,7 @@ from flashinfer.moe_ep import (  # noqa: E402
     MoEWeightPack,
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     bootstrap_moe_ep_runtime,
     ensure_moe_ep_cuda_device,
@@ -52,7 +56,14 @@ NUM_TOKENS = 96
 MAX_TOKENS = 128
 
 # Relative L2 limits for kernel vs Torch outputs, not per-element error bounds.
-_REL_L2_BAND = {"mxfp8_e4m3": 0.02, "mxfp8_e5m2": 0.02, "nvfp4": 0.06}
+_REL_L2_BAND = {"mxfp8_e4m3": 0.02, "mxfp8_e5m2": 0.02, "nvfp4": 0.06, "mxfp4": 0.06}
+
+
+@pytest.fixture(autouse=True)
+def ep_geometry(monkeypatch):
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world > NUM_EXPERTS:
+        monkeypatch.setitem(globals(), "NUM_EXPERTS", max(64, world))
 
 
 def _require_cuda() -> None:
@@ -137,6 +148,10 @@ def _megakernel_config(quant_kind: str, **overrides):
         return Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=INTERMEDIATE, top_k=TOP_K, **overrides
         )
+    if quant_kind == "mxfp4":
+        return Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=INTERMEDIATE, top_k=TOP_K, **overrides
+        )
     if quant_kind == "mxfp4_mxfp8":
         return Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=INTERMEDIATE, top_k=TOP_K, **overrides
@@ -154,7 +169,7 @@ def _megakernel_config(quant_kind: str, **overrides):
     "kind,situ,scaled",
     [
         (kind, True, False)
-        for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+        for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp4_mxfp8")
     ]
     + [("nvfp4", situ, True) for situ in (False, True)],
 )
@@ -255,7 +270,9 @@ def test_prequantized_situ_and_scaling_multirank(
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize(
+    "kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp4_mxfp8"]
+)
 def test_prequantized_situ_pooled_graph_with_scaling(kind):
     import torch.distributed as dist
     from flashinfer.moe_ep import PrequantizedMoEWeights
@@ -383,6 +400,10 @@ def _torch_oracle(
         x_q, x_sf = pkg.quantize_nvfp4_block16(x_rank.to(torch.float32))
         w13_q, w13_sf = pkg.quantize_nvfp4_block16(w13_interleaved)
         w2_q, w2_sf = pkg.quantize_nvfp4_block16(w2_f32)
+    elif quant_kind == "mxfp4":
+        x_q, x_sf = pkg.quantize_mxfp4_block32(x_rank.float())
+        w13_q, w13_sf = pkg.quantize_mxfp4_block32(w13_interleaved)
+        w2_q, w2_sf = pkg.quantize_mxfp4_block32(w2_f32)
     else:
         x_q, x_sf = pkg.quantize_mxfp8_block32(
             x_rank.to(torch.float32),
@@ -415,7 +436,7 @@ def _torch_oracle(
 def test_sm107_mega_kernels_are_registered():
     assert "sm107_mxfp8_mxfp8_bf16_cutedsl" in _MEGA_KERNEL_REGISTRY
     assert "sm107_nvfp4_nvfp4_bf16_cutedsl" in _MEGA_KERNEL_REGISTRY
-    for kind in ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4"):
+    for kind in ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4", "mxfp4"):
         backend = create_mega_kernel(_megakernel_config(kind))
         assert backend.kernel_name().startswith("sm107_")
 
@@ -462,7 +483,7 @@ def test_sm107_preprocess_mega_weights_from_bf16(quant_kind):
     "quant_kind, in_kernel_fc2_reduce, apply_routing_weights_before_fc2",
     [
         (kind, ikr, early)
-        for kind in ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4")
+        for kind in ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4", "mxfp4")
         for ikr, early in ((False, True), (False, False), (True, True))
     ],
 )
@@ -550,7 +571,7 @@ def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
 @pytest.mark.parametrize("variant", ["standard", "genphase"])
 def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind, variant):
     import torch.distributed as dist
@@ -648,17 +669,32 @@ def test_mxfp4_k3_routed_expert_geometry_multirank():
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize(
-    "kind,variant,combine",
+    "kind,variant,combine,early,ikr",
     [
-        (kind, variant, "bf16")
-        for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+        (kind, variant, "bf16", early, ikr)
+        for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp4_mxfp8")
         for variant in ("inference", "genphase")
+        for early, ikr in ((False, False), (True, False), (True, True))
     ]
-    + [("nvfp4", "inference", combine) for combine in ("nvfp4", "mxfp8")],
+    + [
+        (kind, "inference", combine, early, False)
+        for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp4_mxfp8")
+        for combine in ("nvfp4", "mxfp8")
+        for early in (False, True)
+    ],
 )
-def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine):
+def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine, early, ikr):
     import torch.distributed as dist
     from tests.moe_ep.sm107_test_utils import quantize, weight_pack
+
+    def check_output(output, reference):
+        assert torch.isfinite(output).all()
+        if ikr:
+            # Atomic accumulation need not reproduce the same addition order.
+            error = (output.float() - reference.float()).norm()
+            assert float(error / reference.float().norm().clamp_min(1e-6)) < 0.02
+        else:
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
 
     rank, world = _launcher_ranks()
     if world < 2:
@@ -670,7 +706,8 @@ def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine):
         kind,
         kernel_variant=variant,
         combine_dtype=combine,
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=early,
+        in_kernel_fc2_reduce=ikr,
         **(
             dict(cluster_shape_mn=(4, 1), fc2_use_bulk=True)
             if variant == "genphase"
@@ -737,17 +774,170 @@ def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine):
             ]
             for t in inputs:
                 t.topk_weights.masked_fill_(t.topk_ids == -1, value)
+            if combine != "bf16":
+                # Masked return slots are not written by FC2 or cleared by launch.
+                ws = layers[0]._workspace
+                assert ws.kernel.masks_invalid_combine_slots
+                ws._pre_reduced_activation.view(torch.uint8).fill_(255)
+                ws._pre_reduced_activation_sf.view(torch.uint8).fill_(255)
             for layer, t, reference in zip(layers, inputs, expected, strict=True):
-                torch.testing.assert_close(layer.forward(t), reference, rtol=0, atol=0)
+                check_output(layer.forward(t), reference)
+                torch.testing.assert_close(
+                    layer._workspace.topk_weights[: t.topk_ids.shape[0]],
+                    t.topk_weights.float(),
+                    rtol=0,
+                    atol=0,
+                    equal_nan=True,
+                )
             for _ in range(3):
                 graph.replay()
                 torch.cuda.synchronize()
                 for output, reference in zip(outputs, expected, strict=True):
-                    assert torch.isfinite(output).all()
-                    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+                    check_output(output, reference)
     finally:
         if graph is not None:
             graph.reset()
         for layer in layers:
+            layer.destroy()
+        finalize_moe_ep_runtime(runtime)
+
+
+def _assert_collective_reference(actual, expected, kind):
+    import torch.distributed as dist
+
+    from tests.moe_ep.sm107_test_utils import assert_reference
+
+    failure = None
+    try:
+        assert_reference(actual, expected, kind)
+    except AssertionError as error:
+        failure = str(error)
+    failed = torch.tensor(int(failure is not None), device="cuda", dtype=torch.int32)
+    dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+    assert not failed.item(), failure or "reference failed on another rank"
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("family", ["inference", "genphase"])
+def test_transformed_expert_updates_in_captured_graph(family, monkeypatch):
+    """Replicate experts into physical slots and update their captured weights."""
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+    from tests.moe_ep.sm107_test_utils import canonical_reference, quantize, weight_pack
+
+    rank, world = _launcher_ranks()
+    if world < 2:
+        pytest.skip("requires torchrun with at least two ranks")
+    # Keep the same replicated expert bank at every EP width.
+    for name, value in dict(
+        HIDDEN=512,
+        INTERMEDIATE=256,
+        NUM_EXPERTS=64,
+        TOP_K=4,
+        NUM_TOKENS=16,
+        MAX_TOKENS=32,
+    ).items():
+        monkeypatch.setitem(globals(), name, value)
+    bootstrap = BootstrapConfig(rank=rank, world_size=world)
+    ensure_moe_ep_cuda_device(bootstrap)
+    kind = "mxfp4_mxfp8"
+    cfg = _megakernel_config(
+        kind,
+        kernel_variant=family,
+        apply_routing_weights_before_fc2=False,
+        **(
+            dict(cluster_shape_mn=(4, 1), fc2_use_bulk=True)
+            if family == "genphase"
+            else {}
+        ),
+    )
+    kernel = create_mega_kernel(cfg)
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap, kernel.runtime_requirements(bootstrap)
+    )
+    layer = None
+    graph = None
+    try:
+        w13, w2, x, _, scores = _global_problem(world)
+        logical_experts = NUM_EXPERTS // 2
+        ids = (
+            torch.arange(world * NUM_TOKENS * TOP_K, device="cuda").reshape(
+                world, NUM_TOKENS, TOP_K
+            )
+            % logical_experts
+        )
+        count = NUM_EXPERTS // world
+        local = slice(rank * count, (rank + 1) * count)
+        fleet = FleetParams(
+            num_experts=NUM_EXPERTS,
+            max_tokens_per_rank=MAX_TOKENS,
+            token_hidden_size=HIDDEN,
+        )
+
+        def prepare(a, b):
+            pack, _, _ = weight_pack(a, b, kind)
+            local_pack = PrequantizedMoEWeights(
+                *(
+                    getattr(pack, name)[local]
+                    for name in ("w13", "w2", "w13_scale", "w2_scale")
+                )
+            )
+            return pack, kernel.preprocess_weights(local_pack, fleet)
+
+        original_pack, transformed = prepare(w13, w2)
+        replica_w13 = torch.cat((w13[:logical_experts], w13[:logical_experts]))
+        replica_w2 = torch.cat((w2[:logical_experts], w2[:logical_experts]))
+        replica_pack, replica_weights = prepare(replica_w13, replica_w2)
+        changed_w2 = replica_w2.clone()
+        changed_w2[logical_experts:] *= 0.5
+        changed_pack, changed_weights = prepare(replica_w13, changed_w2)
+        pointers = tuple(t.data_ptr() for pair in transformed for t in pair)
+        layer = MoEEpLayer(
+            bootstrap=BootstrapConfig(
+                rank=rank, world_size=world, auto_bootstrap=False
+            ),
+            fleet_params=fleet,
+            weights=None,
+            backend=MegaConfig(megakernel=cfg, transformed_weights=transformed),
+        )
+        transformed = layer.get_transformed_weights()
+        t = MoEEpTensors(x[rank].clone(), ids[rank].clone(), scores[rank].clone())
+        layer.warmup(t)
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+            output = layer.forward(t)
+
+        def replay(pack):
+            dist.barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            xq, sf = quantize(t.hidden_states, kind)
+            reference = canonical_reference(
+                xq, sf, t.topk_ids, t.topk_weights, pack, kind, early=False
+            )
+            _assert_collective_reference(output, reference, kind)
+
+        replay(original_pack)
+        baseline = output.clone()
+        t.topk_ids[::2].add_(logical_experts)
+        for pack, replacement in (
+            (replica_pack, replica_weights),
+            (changed_pack, changed_weights),
+        ):
+            for dst_pair, src_pair in zip(transformed, replacement, strict=True):
+                for dst, src in zip(dst_pair, src_pair, strict=True):
+                    dst.view(torch.uint8).copy_(src.view(torch.uint8))
+            assert tuple(v.data_ptr() for pair in transformed for v in pair) == pointers
+            replay(pack)
+            _assert_collective_reference(output[1::2], baseline[1::2], kind)
+            if pack is replica_pack:
+                _assert_collective_reference(output, baseline, kind)
+    finally:
+        if graph is not None:
+            graph.reset()
+        if layer is not None:
             layer.destroy()
         finalize_moe_ep_runtime(runtime)

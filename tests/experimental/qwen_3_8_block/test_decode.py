@@ -14,7 +14,7 @@ cached step under ``set_sync_debug_mode("error")``; the compiled-plan cache's re
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_8_block_cases import (
+from tests.experimental.test_helpers.qwen_3_8_block_cases import (
     Qsa38PagedCase,
     bits,
     unified_kv_cache,
@@ -241,6 +241,74 @@ def test_tp_shard_slabs_are_declined_by_name(name, monkeypatch):
     case = Qsa38PagedCase(g, (64,), 1, page_size=16, seed=31)
     with pytest.raises(NotImplementedError, match="small-M projection route"):
         _plan(case, g)
+
+
+def test_plan_time_decline_past_the_launch_grid_bound_is_typed_before_any_vendored_code(
+    monkeypatch,
+):
+    """ONE decode run holds at most ``EXTEND_ROWS_GRID_MAX`` = 65,535 rows at this pin (the DECODE step's query compress shares the extend
+    step's launch: the run's row count as a CUDA grid dimension): batch 4096 x ``q_len`` 16 = 65,536 rows is the typed ``NotImplementedError``
+    naming the bound, the rows and the remedy through the public decode entry -- at ``prepare`` and at the workspace query -- BEFORE any
+    vendored code (host only: nothing declared, nothing compiled, the block table sample never read); 4095 x 16 passes the light gate.  The
+    probe carries the row on the decode record with the same text as the extend / prefill records."""
+    from flashinfer.experimental.qwen_3_8_block import api as impl
+    from flashinfer.experimental.qwen_3_8_block import support
+    from flashinfer.qwen_3_8_block import (
+        prepare_qwen_3_8_block_bf16,
+        qwen_3_8_block_support,
+        qwen_3_8_block_workspace_size,
+    )
+
+    g = _geometry("24_2")
+    sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
+    grid = support.EXTEND_GRID_ROWS_KEY
+    assert sup.extend_rows_grid_max == support.EXTEND_ROWS_GRID_MAX == 65535
+    assert (
+        grid in sup.decode.declines
+        and sup.decode.declines[grid] == sup.extend.declines[grid]
+    )
+    assert "65535" in sup.decode.declines[grid]
+
+    def reached():
+        raise AssertionError(
+            "the vendored declaration was reached past the launch-grid bound"
+        )
+
+    monkeypatch.setattr(impl, "_frost_block", reached)
+    case = Qsa38PagedCase(g, (64,), 1, page_size=16, seed=37)
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        prepare_qwen_3_8_block_bf16(
+            "decode",
+            geometry=g,
+            device="cuda",
+            weights=case.weights38,
+            w_o=case.w_o,
+            kv_cache=case.kv_cache,
+            page_size=16,
+            batch_size=4096,
+            q_len_per_req=16,
+            block_table=case.block_table,
+            **case.plan_args(),
+        )
+    msg = str(info.value)
+    assert msg.startswith("qwen_3_8_block (decode):"), msg
+    assert (
+        "= 65536 rows" in msg
+        and "several decode steps" in msg
+        and "smaller batch" in msg
+    ), msg
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        qwen_3_8_block_workspace_size(
+            "decode",
+            geometry=g,
+            device="cuda",
+            page_size=16,
+            batch_size=4096,
+            q_len_per_req=16,
+            max_pages=8,
+        )
+    assert str(info.value).startswith("qwen_3_8_block (decode):"), str(info.value)
+    impl._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4095)
 
 
 @pytest.mark.parametrize("page", [32, 64, 128])
@@ -526,7 +594,7 @@ def test_the_two_bodies_of_the_sparse_core_agree_within_the_budget_at_batch_1():
     order vs one 256-d MMA chain), each body against the two-stage oracle; the readbacks and the workspace carve of each body
     (``qwen_3_8_block_workspace_size`` with the same knob equals the plan's; the lean split's wider slab exceeds the core's)."""
     from flashinfer.qwen_3_8_block import qwen_3_8_block_workspace_size
-    from tests.test_helpers.qwen_3_8_block_cases import OUT_COS
+    from tests.experimental.test_helpers.qwen_3_8_block_cases import OUT_COS
 
     g = _geometry("24_2")
     results = {}
@@ -603,7 +671,7 @@ def test_three_carried_steps_with_a_rejected_draft():
     keys; the re-step rewrites it from the accepted ones).  After every step the two-stage oracle holds; the cache rows of every complete
     block of the ACCEPTED stream equal a from-scratch compress of that stream's raw keys (the prefill rows, the rows a step completes and
     a re-stepped block are one chain)."""
-    from tests.test_helpers.qwen_3_5_block_reference import (
+    from tests.experimental.test_helpers.qwen_3_5_block_reference import (
         gated_attention_block_reference,
     )
 

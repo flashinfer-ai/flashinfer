@@ -29,7 +29,7 @@
 //   smem_bytes, fused_tail,
 //                                    fused_block_tail, coarse_sample, spec_sample, slab_tail,
 //                                    coarse_push, leader_push, local_select, int_tail,
-//                                    no_tail, compact_list, lean) ...
+//                                    no_tail, compact_list, lean, l2_prefetch) ...
 //   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, variant_flags, smem_bytes) ...
 // and then includes this header.  Every table entry is taken verbatim from manifest.json.
 #ifndef CAKE_SAMPLING_BODY_FILE
@@ -100,6 +100,8 @@ constexpr int64_t kFlagCompactList = 8192;  // host-side build selection (compac
                                             // stream build); never forwarded to the kernel
 constexpr int64_t kFlagLean = 16384;        // host-side build selection (lean-scan twin of the
                                             // (4, 16) resident's fused-tail build); never forwarded
+constexpr int64_t kFlagL2Prefetch = 65536;  // host-side build selection (L2-prefetch twin of a
+                                            // cluster-1 stream build); never forwarded
 constexpr int32_t kTopKScalar = 1;
 constexpr int32_t kTopKPerRow = 2;
 constexpr int32_t kTopPScalar = 1;
@@ -169,6 +171,9 @@ struct Stage1Variant {
                          // with one shared load and two warp reductions, and the candidate-list
                          // scan keeps no trailing barrier (the (4, 16) resident fused-tail build's
                          // twin taken by launch_flags bit 14)
+  int32_t l2_prefetch;   // 1: the build warms L2 with the rest of the CTA's row while the latency
+                         // chain before its filter pass runs (the cluster-1 stream build's twin
+                         // taken by launch_flags bit 16)
 };
 
 struct Stage23Variant {
@@ -181,7 +186,7 @@ struct Stage23Variant {
 
 #define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused,        \
                                    fused_block, wide, spec, slab, push, leader, local, itail, \
-                                   notail, compact, lean)                                     \
+                                   notail, compact, lean, l2pf)                               \
   {reinterpret_cast<const void*>(&symbol),                                                    \
    cluster,                                                                                   \
    ept,                                                                                       \
@@ -199,7 +204,8 @@ struct Stage23Variant {
    itail,                                                                                     \
    notail,                                                                                    \
    compact,                                                                                   \
-   lean},
+   lean,                                                                                      \
+   l2pf},
 #define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, variant_flags, smem) \
   {reinterpret_cast<const void*>(&symbol), threads, items, variant_flags, smem},
 
@@ -248,7 +254,11 @@ struct Stage23Variant {
 // load and two warp reductions, and the candidate-list scan keeps no trailing barrier) is a second
 // build of the (4, 16) register-resident fused-tail build, taken only by launch_flags bit 14 --
 // the shared scan helpers feed every other build, which keep their code; every output is
-// bit-identical.
+// bit-identical.  The L2-prefetch build (l2_prefetch = 1: L2 prefetches of the rest of the CTA's
+// row, issued after the sampled pass or after chunk 0's sampled histogram) is a second build of the
+// cluster-1 ept-16 speculative-sample slab-tail stream and of the cluster-1 ept-32
+// speculative-sample stream, both with the fused two-warp tail, taken only by launch_flags bit 16
+// -- a prefetch returns no value and moves no branch, so every output is bit-identical.
 inline const Stage1Variant kStage1Table[] = {
     CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
 inline const Stage23Variant kStage23Table[] = {
@@ -260,13 +270,14 @@ inline std::atomic<uint64_t> kStage23Prepared[sizeof(kStage23Table) / sizeof(Sta
 inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t stream,
                                        int32_t block_tail, int32_t wide, int32_t spec, int32_t slab,
                                        int32_t push, int32_t leader, int32_t local, int32_t itail,
-                                       int32_t notail, int32_t compact, int32_t lean) {
+                                       int32_t notail, int32_t compact, int32_t lean,
+                                       int32_t l2pf) {
   for (const Stage1Variant& v : kStage1Table) {
     if (v.cluster == cluster && v.ept == ept && v.stream == stream &&
         v.fused_block_tail == block_tail && v.coarse_sample == wide && v.spec_sample == spec &&
         v.slab_tail == slab && v.coarse_push == push && v.leader_push == leader &&
         v.local_select == local && v.int_tail == itail && v.no_tail == notail &&
-        v.compact_list == compact && v.lean == lean)
+        v.compact_list == compact && v.lean == lean && v.l2_prefetch == l2pf)
       return &v;
   }
   return nullptr;
@@ -431,6 +442,11 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 //   read the sixteen warp sums with one shared load and two warp reductions, and the
 //   candidate-list scan keeps no trailing barrier; every output is bit-identical.  The host sets
 //   it only on the cells it lists per device; the kernel itself never sees the bit.
+//   launch_flags bit 16 (L2-prefetch twin): on the cluster-1 ept-16 speculative-sample slab-tail
+//   stream and the cluster-1 ept-32 speculative-sample stream with the fused two-warp tail,
+//   selects their L2-prefetch build (manifest l2_prefetch): L2 prefetches of the rest of the CTA's
+//   row while the chain before the filter pass runs; every output is bit-identical.  The host sets
+//   it only on the cells it lists per device; the kernel itself never sees the bit.
 void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64_t topk_kind,
                TensorView out_vals, TensorView out_idx, TensorView out_count, int64_t cluster,
                int64_t ept, int64_t stream_variant, TensorView topp_arr, double topp_scalar,
@@ -521,10 +537,14 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
       << "the lean-scan build (launch_flags bit 14) exists for register-resident variants only";
   TVM_FFI_ICHECK(!(want_lean && (want_block_tail || want_notail)))
       << "launch_flags bit 14 (lean-scan twin) is exclusive with bits 3 and 12";
-  const Stage1Variant* v = FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
-                                      static_cast<int32_t>(stream_variant), want_block_tail,
-                                      want_coarse, want_spec, want_slab, want_push, want_leader,
-                                      want_local, want_itail, want_notail, want_compact, want_lean);
+  const int32_t want_l2pf = (launch_flags & kFlagL2Prefetch) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_l2pf && stream_variant == 0))
+      << "the L2-prefetch build (launch_flags bit 16) exists for streaming variants only";
+  const Stage1Variant* v =
+      FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
+                 static_cast<int32_t>(stream_variant), want_block_tail, want_coarse, want_spec,
+                 want_slab, want_push, want_leader, want_local, want_itail, want_notail,
+                 want_compact, want_lean, want_l2pf);
   TVM_FFI_ICHECK(v != nullptr)
       << "no frozen stage-1 variant for cluster=" << cluster << " ept=" << ept
       << " stream=" << stream_variant
@@ -538,7 +558,8 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
       << (want_itail ? " with the integer-tested tail (launch_flags bit 11)" : "")
       << (want_notail ? " without the fused tails (launch_flags bit 12)" : "")
       << (want_compact ? " with the compact candidate list (launch_flags bit 13)" : "")
-      << (want_lean ? " with the lean block scans (launch_flags bit 14)" : "");
+      << (want_lean ? " with the lean block scans (launch_flags bit 14)" : "")
+      << (want_l2pf ? " with the L2 prefetches (launch_flags bit 16)" : "");
   PrepareKernel(device_id, kStage1Prepared[v - kStage1Table], v->kernel, v->smem_bytes, v->cluster);
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept

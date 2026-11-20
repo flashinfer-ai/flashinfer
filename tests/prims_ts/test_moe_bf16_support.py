@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from flashinfer.prims_ts.moe.config_mapper import (
+    apply_fused_finalize,
+    apply_weight_l2_policy,
+    PrimsTsConfigSpec,
     SUPPORTED_MXFP4_BF16_TILE_N,
     SUPPORTED_MXFP4_MXFP8_TILE_N,
     _expanded_prims_ts_json_configs,
@@ -47,6 +51,7 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     make_config,
     validate_config,
 )
+from flashinfer.prims_ts.batched_gemm.cache_policy import _is_single_expert_tile
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -287,14 +292,43 @@ def test_config_mapper_mxfp4_mxfp8_supports_geglu():
     assert pair.fc2.cfg.kwargs["act_kind"] == 0
 
 
-@pytest.mark.parametrize("num_tokens", [1024, 8192])
-def test_kimi_k3_tile_selection_keeps_128_and_adds_192(num_tokens):
-    assert _selected_tile_ns(
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,expected_tiles",
+    [
+        (1024, None, (128, 192, 256)),
+        (8192, None, (128, 192, 256)),
+        # Expert parallel (56 of 896 local): ~37 rows per local expert at
+        # 2048 tokens centres the window on 64 and drops the half-empty tiles.
+        (2048, 896, (32, 64, 128)),
+    ],
+)
+def test_kimi_k3_tile_selection_keeps_128_and_adds_192(
+    num_tokens, num_experts, expected_tiles
+):
+    kwargs = dict(
         num_tokens=num_tokens,
         top_k=16,
         num_local_experts=56,
         supported_tiles=SUPPORTED_MXFP4_MXFP8_TILE_N,
-    ) == (128, 192, 256)
+    )
+    assert _selected_tile_ns(num_experts=num_experts, **kwargs) == expected_tiles
+    if num_experts is not None and num_experts > 56:
+        # The untuned EP default must be a persistent-scheduler pair (a static
+        # grid is sized for every routed row, 16x the local work here).
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+            [-1, -1],
+            sm_arch=100,
+            activation_type=int(ActivationType.Situ),
+            num_tokens=num_tokens,
+            top_k=16,
+            num_local_experts=56,
+            num_experts=num_experts,
+            has_gemm1_alpha=True,
+            has_gemm1_beta=True,
+        )
+        assert pair.tile_n == 64
+        assert pair.fc1.cfg.build().tile_scheduler == int(TileScheduler.PERSISTENT)
+        assert pair.fc2.cfg.build().tile_scheduler == int(TileScheduler.PERSISTENT)
 
 
 @pytest.mark.parametrize("sm_arch", (100, 107))
@@ -418,6 +452,84 @@ def test_kimi_k3_ep_capacity_uses_local_experts():
     )
 
     assert capacity == 183 * 128
+
+
+@pytest.mark.parametrize(("num_tokens", "tile_n"), [(512, 8), (4096, 64), (32768, 256)])
+def test_finalize_fuses_into_the_second_gemm_epilogue(num_tokens, tile_n):
+    # SM107's tile-256 FC2 leaves no shared memory for the fused epilogue and
+    # keeps the unfused one.
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [tile_n, 0], num_tokens=num_tokens, top_k=6, num_local_experts=48, sm_arch=100
+    )
+    fused = apply_fused_finalize(
+        pair, num_tokens=num_tokens, top_k=6, num_local_experts=48
+    )
+    assert fused.fc1 is pair.fc1
+    assert pair.fc2.cfg.build().fused_finalize_top_k == 0
+    assert fused.fc2.cfg.build().fused_finalize_top_k == 6
+
+
+def test_fused_finalize_needs_a_plain_bf16_epilogue():
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [8, 0], num_tokens=512, top_k=6, num_local_experts=48
+    )
+    # FC1 runs the gated activation and quantizes its output.
+    with pytest.raises(ValueError, match="fused_finalize_top_k"):
+        validate_config(make_config(**pair.fc1.cfg.kwargs, fused_finalize_top_k=6))
+
+
+@pytest.mark.parametrize(
+    (
+        "top_k",
+        "num_local_experts",
+        "num_experts",
+        "do_finalize",
+        "partitioned",
+        "fused",
+    ),
+    [
+        (6, 48, 384, True, False, True),  # EP8: 0.75 local experts per token
+        (16, 112, 896, True, False, False),  # EP8 at top-16: two per token
+        (6, 48, 384, False, False, False),  # the caller finalizes
+        (6, 48, 384, True, True, False),  # partitioned launches finalize themselves
+    ],
+)
+def test_finalize_is_fused_when_tokens_average_one_local_expert(
+    top_k, num_local_experts, num_experts, do_finalize, partitioned, fused
+):
+    from flashinfer.prims_ts.moe.runner import PrimsTsMxfp4Mxfp8MoERunner
+
+    runner = SimpleNamespace(
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        num_experts=num_experts,
+        _is_partitioned=partitioned,
+    )
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [8, 0], num_tokens=64, top_k=top_k, num_local_experts=num_local_experts
+    )
+    pair = PrimsTsMxfp4Mxfp8MoERunner._maybe_fuse_finalize(
+        runner, pair, 64, {"do_finalize": do_finalize}
+    )
+    assert bool(pair.fc2.cfg.build().fused_finalize_top_k) == fused
+
+
+@pytest.mark.parametrize(
+    ("rank", "world", "expected"),
+    [
+        (None, None, [0, 1, 2, 3, 4, 5, 6, 7]),
+        ("1", "4", [2, 3, 4, 5, 6, 7, 0, 1]),
+    ],
+)
+def test_precompile_order_is_rotated_per_local_rank(monkeypatch, rank, world, expected):
+    from flashinfer.prims_ts.moe.runner import _node_rank_rotated
+
+    for name, value in (("LOCAL_RANK", rank), ("LOCAL_WORLD_SIZE", world)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert _node_rank_rotated(list(range(8))) == expected
 
 
 def test_kimi_k3_low_latency_fast_drain_fc2_config_is_buildable():
@@ -1109,3 +1221,151 @@ def test_support_rejects_unshuffled_major_k(monkeypatch):
 
     assert not ok
     assert "shuffled weights" in reason
+
+
+def _deepseek_block32_call(**overrides):
+    hidden_size = overrides.pop("hidden_size", 256)
+    intermediate_size = overrides.pop("intermediate_size", 160)
+    num_local_experts = overrides.pop("num_local_experts", 4)
+    weight_layout = overrides.pop("weight_layout", WeightLayout.MajorK)
+    runner = _runner(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_local_experts=num_local_experts,
+        weight_layout=weight_layout,
+    )
+    inputs = _inputs(
+        hidden_states=torch.empty((4, hidden_size), dtype=torch.float8_e4m3fn),
+        hidden_states_scale=torch.empty((hidden_size // 32, 4), dtype=torch.float32),
+    )
+    kwargs = dict(
+        weight_layout=weight_layout,
+        gemm1_weights_scale=torch.empty(
+            (num_local_experts, 2 * intermediate_size // 32, hidden_size // 32),
+            dtype=torch.float32,
+        ),
+        gemm2_weights_scale=torch.empty(
+            (num_local_experts, hidden_size // 32, intermediate_size // 32),
+            dtype=torch.float32,
+        ),
+    )
+    kwargs.update(overrides)
+    return runner, inputs, kwargs
+
+
+def test_deepseek_scale_block_accepts_block32_major_k():
+    ok, reason, block = support._deepseek_fp8_scale_block(*_deepseek_block32_call())
+    assert ok, reason
+    assert block == 32
+
+
+def test_deepseek_scale_block_rejects_block_major_k_hidden_not_128():
+    # FC1's K is hidden_size; BlockMajorK stores it in 128-element blocks.
+    ok, reason, _ = support._deepseek_fp8_scale_block(
+        *_deepseek_block32_call(
+            hidden_size=160,
+            intermediate_size=256,
+            weight_layout=WeightLayout.BlockMajorK,
+        )
+    )
+    assert not ok
+    assert "BlockMajorK" in reason and "hidden_size=160" in reason
+
+
+def test_deepseek_scale_block_rejects_wrong_expert_dim():
+    runner, inputs, kwargs = _deepseek_block32_call()
+    kwargs["gemm1_weights_scale"] = kwargs["gemm1_weights_scale"][:2]
+    ok, reason, _ = support._deepseek_fp8_scale_block(runner, inputs, kwargs)
+    assert not ok
+    assert "gemm1_weights_scale" in reason and "num_local_experts=4" in reason
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "tile_n"),
+    [
+        # DeepSeek-V4.1-Flash experts at EP8: 384 experts, top-6, rows of 8 ranks.
+        (512, 8),
+        (16384, 256),
+    ],
+)
+def test_weight_policy_enables_runtime_selection_on_both_gemms(num_tokens, tile_n):
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [tile_n, 0], num_tokens=num_tokens, top_k=6, num_local_experts=48
+    )
+    pair = apply_weight_l2_policy(pair)
+    assert pair.fc1.cfg.build().weight_l2_evict_first == 1
+    assert pair.fc2.cfg.build().weight_l2_evict_first == 1
+
+
+def test_weight_policy_checks_each_experts_entire_token_tile_run():
+    tile_n = 128
+    expert_rows = [0, 128, 0, 129, 1, 0]
+    tile_experts = [
+        expert
+        for expert, rows in enumerate(expert_rows)
+        for _ in range((rows + tile_n - 1) // tile_n)
+    ]
+    for tile, expert in enumerate(tile_experts):
+        previous_expert = tile_experts[tile - 1] if tile > 0 else -1
+        next_expert = tile_experts[tile + 1] if tile + 1 < len(tile_experts) else -1
+        assert _is_single_expert_tile(expert, previous_expert, next_expert) == (
+            expert_rows[expert] <= tile_n
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"batch_mode": int(BatchMode.BATCH_M)}, {"cluster_dim_y": 2}],
+)
+def test_weight_policy_preserves_ineligible_gemm_configs(overrides):
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [16, 0], num_tokens=256, top_k=6, num_local_experts=48
+    )
+    original = replace(
+        pair.fc1, cfg=PrimsTsConfigSpec(kwargs={**pair.fc1.cfg.kwargs, **overrides})
+    )
+    pair = replace(pair, fc1=original)
+    selected = apply_weight_l2_policy(pair)
+    assert selected.fc1 is original
+    assert selected.fc2.cfg.build().weight_l2_evict_first == 1
+    assert "weight_l2_evict_first" not in pair.fc2.cfg.kwargs
+
+
+def test_weight_policy_rejects_invalid_options():
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [16, 0], num_tokens=256, top_k=6, num_local_experts=48
+    )
+    cfg = replace(
+        pair.fc2.cfg.build(),
+        weight_l2_evict_first=1,
+        cluster_dim_y=2,
+        umma_cta_count=2,
+        mma_m=256,
+    )
+    validate_config(replace(cfg, weight_l2_evict_first=0))
+    with pytest.raises(
+        ValueError, match="weight_l2_evict_first requires token-cluster width one"
+    ):
+        validate_config(cfg)
+
+
+def test_weight_policy_rejects_batch_m():
+    row = next(
+        row
+        for row in _expanded_prims_ts_json_configs(100)
+        if row.comment.endswith("_HighThroughput_BatchM") and "_FC2_" in row.comment
+    )
+    kwargs = _json_config_kwargs(
+        row,
+        sm_arch=100,
+        fc="fc2",
+        activation_type=int(ActivationType.Swiglu),
+        has_bias=False,
+        default_dtype_a=int(DType.BF16),
+        default_dtype_b=int(DType.BF16),
+        default_dtype_c=int(DType.BF16),
+    )
+    cfg = make_config(**kwargs)
+    validate_config(cfg)
+    with pytest.raises(ValueError, match="weight_l2_evict_first requires swap-AB"):
+        validate_config(replace(cfg, weight_l2_evict_first=1))

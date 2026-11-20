@@ -17,10 +17,18 @@ upstream. K/V use one shared latent head; output has 512 channels.
 These are architectural/model recipes; the API takes capability and format
 parameters. NVFP4 has embedded block16 E4M3 scales and no global storage scale.
 Only the primary pool may use per-tensor FP8 in a mixed recipe. Its
-`kv_cache_scale` is a positive Python number passed as a runtime FP32 kernel
-argument, as are `softmax_scale` and `output_scale`. Scale values do not create
-JIT variants. CUDA graphs capture these values; use graph parameter updates or
-recapture when changing them for replay.
+`kv_cache_scale`, `softmax_scale`, and `output_scale` independently accept a
+positive finite Python number or a contiguous CUDA FP32 tensor of shape `()` or `(1,)`.
+`kv_cache_scale` describes the per-tensor FP8 primary storage, while the other
+two multiply QK logits and the complete attention output. Other primary formats
+require the identity storage descale and do not accept a device `kv_cache_scale`.
+Dense MLA exposes the two attention multipliers with the same type contract.
+Plan defaults infer each type; omitted run operands inherit those defaults and
+overrides must keep their planned types. Types create JIT variants, while values
+and addresses do not. CUDA graphs retain float values and tensor addresses;
+updating device contents in place preserves dynamic scale changes on replay.
+See [global scale operands](../../README.md#global-scale-operands) for validation
+and storage lifetimes.
 D512 includes rotated channels in the ordinary 512-channel storage; D576 has a
 separate QK-only 64-channel RoPE tail. Record diagrams and scale-byte ordering
 are documented in [helpers/nvfp4_kv.py](helpers/nvfp4_kv.py).
@@ -43,15 +51,15 @@ formats, narrower heads, extra pools and sinks retain their qualified paths.
 Sparse public LSE is natural-log; dense optional final LSE is base 2. Split
 scratch stays base 2 until the final store. An empty sparse row writes zero output and negative-infinity LSE. Native
 cache pools accept flat `[rows,D]` storage as well as paged views; indices always
-include each pool's physical row stride. Scale arguments remain host-runtime
-values with the same graph-capture semantics on both schedules.
+include each pool's physical row stride. Both MLA schedules support independent
+float/device global operands with the same graph-capture semantics.
 An omitted `softmax_scale` uses `1/sqrt(D)` for query width D on every cache
 format. Supply the model's effective attention/Q/K scale explicitly when its
 normalization dimension differs from the absorbed query width.
 
 | Feature | Support |
 |---|---|
-| GPU families | SM100/SM103 Blackwell; NVFP4 paths qualified locally on GB300 |
+| GPU families | SM100/SM103 Blackwell and SM107 Rubin; NVFP4 paths qualified locally on GB300 and Rubin |
 | Query shape | Fixed `[B,Sq,H,D]` or packed `[total_q,H,D]` with query offsets |
 | Query heads | Native automatic policy admits supported positive counts; NVFP4 qualification covers H8/H16/H32/H64/H128 |
 | Dense cache pages | 16, 32, 64 or 128 tokens; dense or bottom-right causal masking |
@@ -114,3 +122,30 @@ bounds; runs bind live metadata and reuse scratch. See the shared
 [planning contract](../../README.md#reusable-plans),
 [runtime split-KV policy](../../README.md#runtime-split-kv-policy), and
 [final statistics contract](../../README.md#final-statistics-and-sink-semantics).
+
+## Context-parallel local-KV prefixes
+
+Dense MLA specializes `cp_world` and `cp_interleave_size` when planning, and
+takes `cp_rank` as a runtime scalar. `seq_lens_kv` always contains global
+logical lengths, including the current Q tokens. The page table, cache, planned
+`max_kv_len`, and split/workspace capacity remain rank-local.
+
+For interleave size I and CP size C, a global prefix n contains
+`n//(I*C)*I + clamp(n%(I*C)-cp_rank*I, 0, I)` tokens on this rank. Dense
+attention maps the full global length G. Bottom-right causal attention maps
+`G-actual_Q+i+1` for logical query token i; packed Q obtains actual_Q from
+`qo_indptr`, not the planned maximum. All heads of a token share its bound.
+The same conversion governs producer domains, split ownership, and row masks.
+No per-query bounds tensor or bounds-materialization launch is required.
+
+`plan(zero_empty_rows=True)` (the default) initializes empty local rows to zero
+O and optional LSE `-inf`, including requests whose ordinary main schedule
+skips all local work. `zero_empty_rows=False` omits this neutral writer.
+Empty-row results are then unspecified, not guaranteed preserved; initialize
+them or exclude them from merging. A rank with no local tokens does not need
+valid page IDs. Static local K/V capacity remains positive; the one-shot API
+uses a minimum capacity of one for an all-empty rank.
+
+CP=1 preserves ordinary non-CP behavior and has no neutral-writer launch.
+Sparse/NVFP4 entry points remain outside this option's scope. CP adds no
+workspace and does not alter the public return type or optional-LSE contract.

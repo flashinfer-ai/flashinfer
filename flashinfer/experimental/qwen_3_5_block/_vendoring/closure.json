@@ -1,9 +1,9 @@
 {
- "commit": "4c8e24355",
+ "commit": "6b21be0e0",
  "fe": "cudnn_frontend",
  "runs": {
   "host_declare_cpu": {
-   "n_cudnn_modules": 105,
+   "n_cudnn_modules": 106,
    "facts": {
     "lower_to_cpp_calls": 0,
     "create_handle_calls": 0,
@@ -27,11 +27,15 @@
     "extend_qsa_b2_t20_p0_dead_auto_bf16": {},
     "extend_qsa_b1_t128_p6146_e4m3": {},
     "extend_qsa_b1_t64_p301_hf": {},
-    "extend_qsa_two_windows_b4_t20": {}
+    "extend_qsa_two_windows_b4_t20": {},
+    "extend_qsa_b1_t512_p0_bf16": {},
+    "extend_qsa_b1_t2048_p2048_bf16": {},
+    "extend_qsa_b4_t512_mixed_bf16": {},
+    "extend_qsa_b1_t512_p301_e4m3": {}
    }
   },
   "node_exec_decode_flagset": {
-   "n_cudnn_modules": 99,
+   "n_cudnn_modules": 100,
    "facts": {
     "lower_to_cpp_calls": 0,
     "create_handle_calls": 0,
@@ -42,11 +46,11 @@
     "decode": {
      "check_support": {
       "ok": true,
-      "s": 0.008
+      "s": 0.007
      },
      "compile": {
       "ok": true,
-      "s": 13.139
+      "s": 13.101
      },
      "workspace": {
       "ok": true,
@@ -54,11 +58,11 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.005
+      "s": 0.044
      },
      "synchronize": {
       "ok": true,
-      "s": 0.233
+      "s": 0.238
      },
      "execute2": {
       "ok": true
@@ -67,7 +71,7 @@
    }
   },
   "node_exec_decode_qsa_unset": {
-   "n_cudnn_modules": 107,
+   "n_cudnn_modules": 108,
    "facts": {
     "lower_to_cpp_calls": 18,
     "create_handle_calls": 1,
@@ -99,15 +103,15 @@
     "decode_qsa_fused_tables_slots": {
      "check_support": {
       "ok": true,
-      "s": 0.062
+      "s": 0.063
      },
      "compile": {
       "ok": true,
-      "s": 12.82
+      "s": 12.856
      },
      "workspace": {
       "ok": true,
-      "s": 0.0
+      "s": 0.001
      },
      "execute": {
       "ok": true,
@@ -115,7 +119,7 @@
      },
      "synchronize": {
       "ok": true,
-      "s": 0.223
+      "s": 0.22
      },
      "execute2": {
       "ok": true
@@ -128,11 +132,11 @@
      },
      "compile": {
       "ok": true,
-      "s": 2.408
+      "s": 2.398
      },
      "workspace": {
       "ok": true,
-      "s": 0.0
+      "s": 0.001
      },
      "execute": {
       "ok": true,
@@ -149,11 +153,11 @@
     "decode_qsa_unfused_pertoken_slots": {
      "check_support": {
       "ok": true,
-      "s": 0.007
+      "s": 0.006
      },
      "compile": {
       "ok": true,
-      "s": 2.919
+      "s": 2.915
      },
      "workspace": {
       "ok": true,
@@ -161,7 +165,7 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.002
+      "s": 0.003
      },
      "synchronize": {
       "ok": true,
@@ -174,11 +178,11 @@
     "decode_qsa_unfused_pertoken": {
      "check_support": {
       "ok": true,
-      "s": 0.0
+      "s": 0.001
      },
      "compile": {
       "ok": true,
-      "s": 0.573
+      "s": 0.58
      },
      "workspace": {
       "ok": true,
@@ -199,11 +203,11 @@
     "decode_qsa_lean_b1_sq1_fused_tables_slots": {
      "check_support": {
       "ok": true,
-      "s": 0.001
+      "s": 0.0
      },
      "compile": {
       "ok": true,
-      "s": 6.662
+      "s": 6.597
      },
      "workspace": {
       "ok": true,
@@ -211,11 +215,11 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.003
+      "s": 0.004
      },
      "synchronize": {
       "ok": true,
-      "s": 0.0
+      "s": 0.001
      },
      "execute2": {
       "ok": true
@@ -228,15 +232,15 @@
      },
      "compile": {
       "ok": true,
-      "s": 6.04
+      "s": 6.008
      },
      "workspace": {
       "ok": true,
-      "s": 0.001
+      "s": 0.006
      },
      "execute": {
       "ok": true,
-      "s": 0.004
+      "s": 0.003
      },
      "synchronize": {
       "ok": true,
@@ -253,7 +257,7 @@
      },
      "compile": {
       "ok": true,
-      "s": 0.037
+      "s": 0.036
      },
      "workspace": {
       "ok": true,
@@ -278,7 +282,7 @@
      },
      "compile": {
       "ok": true,
-      "s": 1.704
+      "s": 1.678
      },
      "workspace": {
       "ok": true,
@@ -303,7 +307,7 @@
      },
      "compile": {
       "ok": true,
-      "s": 0.035
+      "s": 0.036
      },
      "workspace": {
       "ok": true,
@@ -311,7 +315,7 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.002
+      "s": 0.001
      },
      "synchronize": {
       "ok": true,
@@ -324,7 +328,7 @@
    }
   },
   "node_exec_decode_unset": {
-   "n_cudnn_modules": 98,
+   "n_cudnn_modules": 99,
    "facts": {
     "lower_to_cpp_calls": 2,
     "create_handle_calls": 1,
@@ -344,11 +348,11 @@
      },
      "compile": {
       "ok": true,
-      "s": 13.169
+      "s": 13.118
      },
      "workspace": {
       "ok": true,
-      "s": 0.002
+      "s": 0.001
      },
      "execute": {
       "ok": true,
@@ -356,7 +360,7 @@
      },
      "synchronize": {
       "ok": true,
-      "s": 0.228
+      "s": 0.553
      },
      "execute2": {
       "ok": true
@@ -365,9 +369,9 @@
    }
   },
   "node_exec_extend_qsa_unset": {
-   "n_cudnn_modules": 143,
+   "n_cudnn_modules": 144,
    "facts": {
-    "lower_to_cpp_calls": 10,
+    "lower_to_cpp_calls": 18,
     "create_handle_calls": 1,
     "lower_to_cpp_stages": [
      "extend_qsa_b1_t128_p6146_bf16.compile",
@@ -379,7 +383,15 @@
      "extend_qsa_b1_t64_p301_hf.compile",
      "extend_qsa_b1_t64_p301_hf.compile",
      "extend_qsa_two_windows_b4_t20.compile",
-     "extend_qsa_two_windows_b4_t20.compile"
+     "extend_qsa_two_windows_b4_t20.compile",
+     "extend_qsa_b1_t512_p0_bf16.compile",
+     "extend_qsa_b1_t512_p0_bf16.compile",
+     "extend_qsa_b1_t2048_p2048_bf16.compile",
+     "extend_qsa_b1_t2048_p2048_bf16.compile",
+     "extend_qsa_b4_t512_mixed_bf16.compile",
+     "extend_qsa_b4_t512_mixed_bf16.compile",
+     "extend_qsa_b1_t512_p301_e4m3.compile",
+     "extend_qsa_b1_t512_p301_e4m3.compile"
     ],
     "create_handle_stages": [
      "extend_qsa_b1_t128_p6146_bf16.compile"
@@ -389,11 +401,11 @@
     "extend_qsa_b1_t128_p6146_bf16": {
      "check_support": {
       "ok": true,
-      "s": 0.04
+      "s": 0.042
      },
      "compile": {
       "ok": true,
-      "s": 17.247
+      "s": 17.318
      },
      "workspace": {
       "ok": true,
@@ -401,11 +413,11 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.006
+      "s": 0.005
      },
      "synchronize": {
       "ok": true,
-      "s": 0.233
+      "s": 0.225
      },
      "execute2": {
       "ok": true
@@ -418,7 +430,7 @@
      },
      "compile": {
       "ok": true,
-      "s": 6.401
+      "s": 6.348
      },
      "workspace": {
       "ok": true,
@@ -426,11 +438,11 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.003
+      "s": 0.004
      },
      "synchronize": {
       "ok": true,
-      "s": 0.0
+      "s": 0.001
      },
      "execute2": {
       "ok": true
@@ -443,7 +455,7 @@
      },
      "compile": {
       "ok": true,
-      "s": 4.083
+      "s": 4.112
      },
      "workspace": {
       "ok": true,
@@ -468,7 +480,32 @@
      },
      "compile": {
       "ok": true,
-      "s": 3.871
+      "s": 3.834
+     },
+     "workspace": {
+      "ok": true,
+      "s": 0.0
+     },
+     "execute": {
+      "ok": true,
+      "s": 0.006
+     },
+     "synchronize": {
+      "ok": true,
+      "s": 0.0
+     },
+     "execute2": {
+      "ok": true
+     }
+    },
+    "extend_qsa_two_windows_b4_t20": {
+     "check_support": {
+      "ok": true,
+      "s": 0.0
+     },
+     "compile": {
+      "ok": true,
+      "s": 5.96
      },
      "workspace": {
       "ok": true,
@@ -486,14 +523,14 @@
       "ok": true
      }
     },
-    "extend_qsa_two_windows_b4_t20": {
+    "extend_qsa_b1_t512_p0_bf16": {
      "check_support": {
       "ok": true,
       "s": 0.0
      },
      "compile": {
       "ok": true,
-      "s": 5.996
+      "s": 3.95
      },
      "workspace": {
       "ok": true,
@@ -501,7 +538,82 @@
      },
      "execute": {
       "ok": true,
-      "s": 0.004
+      "s": 0.003
+     },
+     "synchronize": {
+      "ok": true,
+      "s": 0.0
+     },
+     "execute2": {
+      "ok": true
+     }
+    },
+    "extend_qsa_b1_t2048_p2048_bf16": {
+     "check_support": {
+      "ok": true,
+      "s": 0.0
+     },
+     "compile": {
+      "ok": true,
+      "s": 2.042
+     },
+     "workspace": {
+      "ok": true,
+      "s": 0.001
+     },
+     "execute": {
+      "ok": true,
+      "s": 0.003
+     },
+     "synchronize": {
+      "ok": true,
+      "s": 0.001
+     },
+     "execute2": {
+      "ok": true
+     }
+    },
+    "extend_qsa_b4_t512_mixed_bf16": {
+     "check_support": {
+      "ok": true,
+      "s": 0.0
+     },
+     "compile": {
+      "ok": true,
+      "s": 1.201
+     },
+     "workspace": {
+      "ok": true,
+      "s": 0.0
+     },
+     "execute": {
+      "ok": true,
+      "s": 0.003
+     },
+     "synchronize": {
+      "ok": true,
+      "s": 0.0
+     },
+     "execute2": {
+      "ok": true
+     }
+    },
+    "extend_qsa_b1_t512_p301_e4m3": {
+     "check_support": {
+      "ok": true,
+      "s": 0.0
+     },
+     "compile": {
+      "ok": true,
+      "s": 2.624
+     },
+     "workspace": {
+      "ok": true,
+      "s": 0.0
+     },
+     "execute": {
+      "ok": true,
+      "s": 0.003
      },
      "synchronize": {
       "ok": true,
@@ -514,7 +626,7 @@
    }
   },
   "node_exec_extend_unset": {
-   "n_cudnn_modules": 95,
+   "n_cudnn_modules": 96,
    "facts": {
     "lower_to_cpp_calls": 1,
     "create_handle_calls": 1,
@@ -533,7 +645,7 @@
      },
      "compile": {
       "ok": true,
-      "s": 10.707
+      "s": 10.676
      },
      "workspace": {
       "ok": true,
@@ -545,7 +657,7 @@
      },
      "synchronize": {
       "ok": true,
-      "s": 0.229
+      "s": 0.234
      },
      "execute2": {
       "ok": true
@@ -554,7 +666,7 @@
    }
   },
   "node_exec_prefill_unset": {
-   "n_cudnn_modules": 90,
+   "n_cudnn_modules": 91,
    "facts": {
     "lower_to_cpp_calls": 1,
     "create_handle_calls": 1,
@@ -569,11 +681,11 @@
     "prefill": {
      "check_support": {
       "ok": true,
-      "s": 0.027
+      "s": 0.028
      },
      "compile": {
       "ok": true,
-      "s": 12.774
+      "s": 12.767
      },
      "workspace": {
       "ok": true,
@@ -585,7 +697,7 @@
      },
      "synchronize": {
       "ok": true,
-      "s": 0.238
+      "s": 0.247
      },
      "execute2": {
       "ok": true
@@ -594,14 +706,14 @@
    }
   }
  },
- "n_files": 159,
- "total_bytes": 7452588,
- "total_lines": 137493,
+ "n_files": 160,
+ "total_bytes": 7482045,
+ "total_lines": 137983,
  "by_group": {
   "root": {
    "files": 56,
-   "bytes": 1338632,
-   "lines": 29677
+   "bytes": 1340030,
+   "lines": 29702
   },
   "engines": {
    "files": 5,
@@ -620,8 +732,8 @@
   },
   "gated_attention_block": {
    "files": 19,
-   "bytes": 2084672,
-   "lines": 32935
+   "bytes": 2092906,
+   "lines": 33045
   },
   "gemm": {
    "files": 1,
@@ -629,9 +741,9 @@
    "lines": 42
   },
   "gemm.frost": {
-   "files": 16,
-   "bytes": 422483,
-   "lines": 9762
+   "files": 17,
+   "bytes": 441752,
+   "lines": 10113
   },
   "gemm.frost.sm100": {
    "files": 4,
@@ -645,8 +757,8 @@
   },
   "sdpa.fwd": {
    "files": 13,
-   "bytes": 1709311,
-   "lines": 28460
+   "bytes": 1709867,
+   "lines": 28464
   },
   "sdpa.fwd.kernels": {
    "files": 15,
@@ -655,7 +767,7 @@
   }
  },
  "licenses": {
-  "Apache-2.0": 91,
+  "Apache-2.0": 92,
   "MIT": 66,
   "Apache-2.0 AND MIT": 2
  },
@@ -810,9 +922,9 @@
    "path": "python/cudnn/_gemm_validate.py",
    "module": "cudnn._gemm_validate",
    "group": "root",
-   "bytes": 9260,
-   "lines": 196,
-   "sha256": "71e3d2a3578f9420d2b5230cf95c761679605cfe7c8d79db8ee054481e426add",
+   "bytes": 10558,
+   "lines": 220,
+   "sha256": "244cee381e65dcfa2ed8c7867c91566d29b4d7b19c76ef199f3a198fb1d20767",
    "license": "Apache-2.0",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -854,9 +966,9 @@
    "path": "python/cudnn/_pygraph.py",
    "module": "cudnn._pygraph",
    "group": "root",
-   "bytes": 213380,
-   "lines": 4264,
-   "sha256": "6a60ab3d1f70e112d370ffc91367cfc0b129020e7585c620e671da02e004eada",
+   "bytes": 213480,
+   "lines": 4265,
+   "sha256": "847e85a6b14bbce448e7acd28afffd46cba590d64edf052cb8fcb6c3b61c0646",
    "license": "Apache-2.0",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2368,9 +2480,9 @@
    "path": "python/cudnn/gated_attention_block/api.py",
    "module": "cudnn.gated_attention_block.api",
    "group": "gated_attention_block",
-   "bytes": 966273,
-   "lines": 13844,
-   "sha256": "ff44f5216756f05c2e9f45fd7c7c66b6e79b7e9112dd3d41fa0a92a49222babc",
+   "bytes": 966935,
+   "lines": 13849,
+   "sha256": "7f5fe95a7623b6103201e1032b3376e44734c38d16fd2cfb1d1c81ee2c7ab5be",
    "license": "Apache-2.0",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2606,9 +2718,9 @@
    "path": "python/cudnn/gated_attention_block/kernels/proj_gemm.py",
    "module": "cudnn.gated_attention_block.kernels.proj_gemm",
    "group": "gated_attention_block",
-   "bytes": 170858,
-   "lines": 2681,
-   "sha256": "a985f7b813b5113baf99e39d9678b67e7e1c65a7611baebe20b01bceb9a7b30b",
+   "bytes": 178430,
+   "lines": 2786,
+   "sha256": "43c7b32e6fcc91bf8aecfd7a4b4d3bcc96a6a6be68c70fb59ba9c750114521f9",
    "license": "Apache-2.0",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -2638,7 +2750,9 @@
     "cudnn.gemm.frost.graph_analyzer (in build_proj_gemm)",
     "cudnn.gemm.frost.kernel_registry (in _why_no_frost_plan)",
     "cudnn.gemm.frost.kernel_registry (in build_proj_gemm)",
+    "cudnn.gemm.frost.tile_config (in _planner_may_replan)",
     "cudnn.gemm.frost.tile_config (in build_proj_gemm)",
+    "cudnn.gemm.frost.tile_config (in large_m_tile_config)",
     "cudnn.gemm.frost.tile_config (in small_m_tile_config)"
    ],
    "lazy_outside_closure": [],
@@ -3004,9 +3118,9 @@
    "path": "python/cudnn/gemm/frost/compiler.py",
    "module": "cudnn.gemm.frost.compiler",
    "group": "gemm.frost",
-   "bytes": 87720,
-   "lines": 1815,
-   "sha256": "24e0e1e73db83304e6be61eab2b027804a852a4d083311ff82850970de38ce15",
+   "bytes": 88546,
+   "lines": 1826,
+   "sha256": "75a32258bb8145a3f351d01b6d751e9927db55002aeda3d40f051421db872e39",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -3032,9 +3146,9 @@
    "path": "python/cudnn/gemm/frost/dtypes.py",
    "module": "cudnn.gemm.frost.dtypes",
    "group": "gemm.frost",
-   "bytes": 8143,
+   "bytes": 8119,
    "lines": 220,
-   "sha256": "5188062ed761ce719043d2a3f8def9592bf52bec327969a3ee374d4717f179f9",
+   "sha256": "cae41ddecfc672aeb5c2073e84ab123d13e53589dd6973eb702ab1f67ce5004b",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -3122,9 +3236,9 @@
    "path": "python/cudnn/gemm/frost/graph_analyzer.py",
    "module": "cudnn.gemm.frost.graph_analyzer",
    "group": "gemm.frost",
-   "bytes": 81202,
-   "lines": 1962,
-   "sha256": "6a2a223841a69c01ae1e93298f4766b3bee67d3d468298ed2630e72ec6d72ba2",
+   "bytes": 92571,
+   "lines": 2162,
+   "sha256": "667faf6c7b5a3a0c9ce08fea3cc70f07909a25f4ee809d878cf37e7e8c0918ec",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -3133,7 +3247,8 @@
    "top_level_cudnn_imports": [
     "cudnn",
     "cudnn.gemm.frost.dtypes",
-    "cudnn.gemm.frost.fusion_ir"
+    "cudnn.gemm.frost.fusion_ir",
+    "cudnn.gemm.frost.layouts"
    ],
    "lazy_cudnn_imports": [
     "cudnn.gemm.frost.compiler (in build_gemm_plan)",
@@ -3268,12 +3383,29 @@
    ]
   },
   {
+   "path": "python/cudnn/gemm/frost/layouts.py",
+   "module": "cudnn.gemm.frost.layouts",
+   "group": "gemm.frost",
+   "bytes": 2211,
+   "lines": 37,
+   "sha256": "7c6f8282e4e60a269a5e4fbf9231921bb833fd053b18fbe8dc42f0683a94587b",
+   "license": "Apache-2.0",
+   "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+   "traced": true,
+   "opened_by_path": false,
+   "why": "traced on the serving route",
+   "top_level_cudnn_imports": [],
+   "lazy_cudnn_imports": [],
+   "lazy_outside_closure": [],
+   "root_cudnn_imports": []
+  },
+  {
    "path": "python/cudnn/gemm/frost/recipe.py",
    "module": "cudnn.gemm.frost.recipe",
    "group": "gemm.frost",
-   "bytes": 21820,
-   "lines": 538,
-   "sha256": "223b751a3870c7d1893f15dd4d107820b7b6a44f017baf678944365e40a738fe",
+   "bytes": 25049,
+   "lines": 617,
+   "sha256": "9cb15167d3cda21cd6ca8db0f87dd15050dd1d5b84fc67d7d7bc52c48ff9b9aa",
    "license": "Apache-2.0",
    "copyright": "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -3282,7 +3414,8 @@
    "top_level_cudnn_imports": [
     "cudnn.frost.buffers",
     "cudnn.gemm.frost.dtypes",
-    "cudnn.gemm.frost.fusion_ir"
+    "cudnn.gemm.frost.fusion_ir",
+    "cudnn.gemm.frost.layouts"
    ],
    "lazy_cudnn_imports": [],
    "lazy_outside_closure": [],
@@ -3413,9 +3546,9 @@
    "path": "python/cudnn/gemm/frost/tile_config.py",
    "module": "cudnn.gemm.frost.tile_config",
    "group": "gemm.frost",
-   "bytes": 42932,
-   "lines": 1005,
-   "sha256": "c5ecdd4be0b354a75080bf8dcc63dd67c13a99b8078741b940ede341a993b199",
+   "bytes": 44590,
+   "lines": 1029,
+   "sha256": "ebc1bdfe65dbab78e02193685a2905e637192678f48ae2a85eb6f743c1532bdd",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -4295,9 +4428,9 @@
    "path": "python/cudnn/sdpa/fwd/sparse_gqa_sm107.py",
    "module": "cudnn.sdpa.fwd.sparse_gqa_sm107",
    "group": "sdpa.fwd",
-   "bytes": 106792,
-   "lines": 1483,
-   "sha256": "ec7b6e3e0013cc6344e0dfddea78af13426bb1e3cddd882ec5aa641f3ecbc679",
+   "bytes": 107348,
+   "lines": 1487,
+   "sha256": "e6b8e8727c55d2f7a1b562d42d38ef6394f19221f59d856262988c6ee7a3852a",
    "license": "MIT",
    "copyright": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
    "traced": true,
@@ -4714,8 +4847,12 @@
    "cudnn._pygraph @ extend.compile",
    "cudnn._pygraph @ extend_qsa_b1_t128_p6146_bf16.compile",
    "cudnn._pygraph @ extend_qsa_b1_t128_p6146_e4m3.compile",
+   "cudnn._pygraph @ extend_qsa_b1_t2048_p2048_bf16.compile",
+   "cudnn._pygraph @ extend_qsa_b1_t512_p0_bf16.compile",
+   "cudnn._pygraph @ extend_qsa_b1_t512_p301_e4m3.compile",
    "cudnn._pygraph @ extend_qsa_b1_t64_p301_hf.compile",
    "cudnn._pygraph @ extend_qsa_b2_t20_p0_dead_auto_bf16.compile",
+   "cudnn._pygraph @ extend_qsa_b4_t512_mixed_bf16.compile",
    "cudnn._pygraph @ extend_qsa_two_windows_b4_t20.compile",
    "cudnn._pygraph @ prefill.compile"
   ],

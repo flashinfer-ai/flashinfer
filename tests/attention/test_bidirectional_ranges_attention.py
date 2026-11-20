@@ -478,8 +478,11 @@ def test_bidirectional_ranges_packed_nvfp4_kv(v_sf_swizzled):
     """The variant reads a packed NVFP4 cache through its scale factors,
     including V scales stored in the trtllm-gen per-page swizzle."""
     _skip_unless_fa2_jit()
-    pytest.importorskip("tests.test_helpers.utils_fp4")
-    from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+    pytest.importorskip("tests.quantization.test_helpers.utils_fp4")
+    from tests.quantization.test_helpers.utils_fp4 import (
+        create_nvfp4_kv,
+        nvfp4_to_float,
+    )
 
     device = torch.device("cuda")
     q_dtype = torch.bfloat16

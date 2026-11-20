@@ -14,17 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+from threading import Barrier
+
 import pytest
 import torch
 
 import flashinfer
 from flashinfer.utils import device_support_pdl
-from tests.test_helpers.parametrize import (
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
-from tests.test_helpers.pdl import late_store
-from tests.test_helpers.sampling import (
+from tests.utils.test_helpers.pdl import late_store
+from tests.utils.test_helpers.sampling import (
     required_num_collision_rows,
     required_num_trials,
 )
@@ -32,6 +36,51 @@ from tests.test_helpers.sampling import (
 
 # H100 CI peak GPU memory: 39.5 GiB.
 pytestmark = pytest.mark.gpu_exclusive
+
+
+@pytest.mark.parametrize("use_default_generator", [False, True])
+def test_get_seed_and_offset_threaded_reservations(use_default_generator):
+    device = torch.device("cuda", torch.cuda.current_device())
+    increments = (1, 4, 5, 13)
+    calls_per_thread = 256
+    start = Barrier(len(increments))
+
+    # Preserve the process-default generator for the remaining sampling tests.
+    with torch.random.fork_rng(devices=[device.index]):
+        generator = (
+            torch.cuda.default_generators[device.index]
+            if use_default_generator
+            else torch.Generator(device=device)
+        )
+        generator.manual_seed(1234)
+        generator.set_offset(128)
+
+        def reserve(increment):
+            start.wait(timeout=10)
+            ranges = []
+            for _ in range(calls_per_thread):
+                seed, offset = flashinfer.sampling.get_seed_and_offset(
+                    increment,
+                    None if use_default_generator else generator,
+                    device,
+                )
+                assert seed == 1234
+                ranges.append((offset, (increment + 3) // 4 * 4))
+            return ranges
+
+        with ThreadPoolExecutor(max_workers=len(increments)) as executor:
+            ranges = [
+                item
+                for group in executor.map(reserve, increments, timeout=30)
+                for item in group
+            ]
+
+        # Every reservation owns one disjoint range, with no lost advancement.
+        next_offset = 128
+        for offset, length in sorted(ranges):
+            assert offset == next_offset
+            next_offset += length
+        assert generator.get_offset() == next_offset
 
 
 def normal_distribution(std):
@@ -302,10 +351,146 @@ def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
     assert torch.isnan(actual).all()
 
 
+# One shape per Blackwell Softmax route: (rows, vocab_size, temperature,
+# enable_pdl, route).
+_BLACKWELL_SOFTMAX_ROUTE_SHAPES = [
+    (1, 111, 0.5, False, 1),
+    (64, 256, 0.5, False, 1),
+    (256, 32004, None, False, 2),
+    (16, 16380, None, False, 2),
+    # An odd vocabulary misaligns rows: unaligned head and tail elements.
+    (200, 32003, 0.5, False, 2),
+    (1, 32004, None, False, 3),
+    # One tile per row: a single split per row.
+    (200, 250, None, False, 3),
+    (256, 32000, None, False, 5),
+    (1, 256000, None, False, 5),
+    (48, 256000, None, False, 6),
+    (100, 128000, 0.5, True, 6),
+    (512, 256000, None, False, 7),
+]
+
+
+def _blackwell_softmax_route_and_output(logits, temperature, enable_pdl):
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    return route, actual
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature,enable_pdl,expected_route",
+    _BLACKWELL_SOFTMAX_ROUTE_SHAPES,
+)
+@pytest.mark.parametrize("offset", [1.0e7, 3.0e9, -1.0e10, 1.0e30])
+@pytest.mark.parametrize("scale", [1.0, 1.0e6])
+def test_blackwell_softmax_large_magnitude_logits_match_torch(
+    rows, vocab_size, temperature, enable_pdl, expected_route, offset, scale
+):
+    # Row maxima from 2^30 on take the exact exponent shift m; every route
+    # must still match torch.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(11)
+    logits = torch.randn(rows, vocab_size, device="cuda") * scale + offset
+    route, actual = _blackwell_softmax_route_and_output(logits, temperature, enable_pdl)
+    expected = torch.softmax(
+        logits if temperature is None else logits / temperature, dim=-1
+    )
+
+    assert route == expected_route
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-3)
+    significant = expected > 1e-6
+    torch.testing.assert_close(
+        actual[significant], expected[significant], atol=0.0, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        actual.sum(-1), torch.ones(rows, device="cuda"), atol=1e-5, rtol=0.0
+    )
+
+
+_FLOAT32_1E38 = float(torch.tensor(1.0e38, dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature,enable_pdl,expected_route",
+    _BLACKWELL_SOFTMAX_ROUTE_SHAPES,
+)
+@pytest.mark.parametrize(
+    "low,high,fill",
+    [
+        # Maxima of magnitude below 2^30 and from 2^30 on.
+        (2.0**30 - 64, 2.0**30, 0.0),
+        (-(2.0**30) - 128, -(2.0**30) + 64, -1.0e10),
+        # Maxima near and past 2^127: one twice the other, adjacent floats,
+        # and both past 2^127 with a fill whose difference overflows.
+        (_FLOAT32_1E38, 2 * _FLOAT32_1E38, 0.0),
+        (-2 * _FLOAT32_1E38, -_FLOAT32_1E38, -3.0e38),
+        (2.0**127 - 2.0**103, 2.0**127, 0.0),
+        (3.0e38, torch.finfo(torch.float32).max, -3.0e38),
+    ],
+)
+def test_blackwell_softmax_extreme_maxima_match_torch(
+    rows, vocab_size, temperature, enable_pdl, expected_route, low, high, fill
+):
+    # Each row holds `low` before and after three copies of `high`. Where a
+    # thread's chunk spans 2048 columns, thread 0 sees `low` at column 0 and
+    # then `high` at column 2048 (one tile, group or stride later) while its
+    # warp neighbour keeps `low` from column 8, so thread, warp, cluster and
+    # output rescales go from `low` to `high`. The result is 1/3 at `high`
+    # and 0 elsewhere.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    values = torch.full((rows, vocab_size), fill, device="cuda")
+    low_cols = [0, 8, vocab_size // 3, vocab_size - 2]
+    high_cols = [min(2048, vocab_size - 3), vocab_size // 2, vocab_size - 1]
+    values[:, low_cols] = low
+    values[:, high_cols] = high
+    # Powers of two keep the scaled logits exact.
+    logits = values if temperature is None else values * temperature
+    route, actual = _blackwell_softmax_route_and_output(logits, temperature, enable_pdl)
+    expected = torch.zeros_like(values)
+    expected[:, high_cols] = 1.0 / 3.0
+
+    assert route == expected_route
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        actual, torch.softmax(values, dim=-1), atol=1e-6, rtol=1e-6
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,enable_pdl",
+    [(64, 256, False), (256, 32000, False), (100, 128000, True), (512, 256000, False)],
+)
+def test_blackwell_softmax_low_temperature_huge_logits_match_torch(
+    rows, vocab_size, enable_pdl
+):
+    # A temperature of 0.005 takes logits near 1e36 past 2^127.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(17)
+    logits = torch.rand(rows, vocab_size, device="cuda") * 1.0e36
+    logits[:, vocab_size // 2] = 1.5e36
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=0.005, enable_pdl=enable_pdl
+    )
+    expected = torch.softmax(logits / 0.005, dim=-1)
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_blackwell_route_observer_falls_back_off_blackwell():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("This test exercises the non-Blackwell observer gate")
 
     logits = torch.empty((1, 111), device="cuda")
@@ -314,6 +499,45 @@ def test_blackwell_route_observer_falls_back_off_blackwell():
     )
 
     assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature_kind",
+    [
+        (4, 151552, "scalar"),  # a speculative-decoding verify step's rows
+        (37, 262144, "per_row"),  # the widest cached row: 16 CTAs x 8 tiles
+        (512, 128000, "none"),
+        (8, 4096, "per_row"),
+    ],
+)
+def test_blackwell_softmax_on_sm107_takes_blackwell_routes(
+    rows, vocab_size, temperature_kind, enable_pdl
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("This test exercises the SM107 gate")
+
+    generator = torch.Generator(device="cuda").manual_seed(rows * vocab_size)
+    logits = torch.randn(rows, vocab_size, device="cuda", generator=generator)
+    if temperature_kind == "none":
+        temperature, scale = None, torch.ones(rows, 1, device="cuda")
+    elif temperature_kind == "scalar":
+        temperature, scale = 0.7, torch.full((rows, 1), 0.7, device="cuda")
+    else:
+        temperature = torch.rand(rows, device="cuda", generator=generator) + 0.25
+        scale = temperature[:, None]
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    expected = torch.softmax(logits / scale, dim=-1)
+
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize(
@@ -831,9 +1055,8 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (71, 28672, "none", 4096, 4096),
         (75, 24584, "none", 6176, 4096),
         # 8-CTA shared-tile and persistent kernels (on sm_103 the persistent
-        # kernel only with a cut of at least 1/10; on sm_100 not for a 6-tile
-        # chunk with a cut of at least 1/10, which keeps whole tiles).
-        (45, 81928, "none", 12288, 10272),
+        # kernel only with a cut of at least 1/10).
+        (45, 81928, "none", 10272, 10272),
         (320, 69632, "none", 8704, 8704),
         (82, 70000, "none", 8768, 8768),
         (52, 100000, "scalar_pdl", 12512, 12512),
@@ -865,8 +1088,7 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         # wave, the 4-tile row kernels of 4 and 8 CTAs with other chunk tile
         # counts, the 4-tile row kernels of 1 and 2 CTAs, the 8-tile 16-CTA row
         # kernel, rows past five waves (on sm_100 past seven for the 8-CTA
-        # kernels) or past one wave with a cut of at most 1/16, and on sm_100
-        # the 8-CTA kernels of a 6-tile chunk with a cut of at least 1/10.
+        # kernels) or past one wave with a cut of at most 1/16.
         (8, 256000, "none", 26624, 22528),
         (24, 151936, "none", 10240, 16384),
         (100, 30720, "none", 8192, 8192),
@@ -908,6 +1130,86 @@ def test_blackwell_cached_cluster_balanced_chunk_per_arch(
         logits, temperature=temperature, enable_pdl=enable_pdl
     )
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (32, 151936),  # on B200 a full wave of 16-CTA clusters and one more
+        (16, 151936),
+        (48, 151936),
+        (64, 151936),
+        (32, 128000),
+        (32, 152064),
+        (1024, 151936),  # past two waves of shared-tile clusters
+        (62, 70000),  # 8-CTA shared-tile kernel within two waves
+        (128, 68000),
+    ],
+)
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_blackwell_softmax_unit_temperature_relative_error(rows, vocab_size, seed):
+    # A scalar temperature of 1 and no temperature run the same kernel and give
+    # identical outputs, each within 1e-6 relative error of float64 softmax.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(seed)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    expected = torch.softmax(logits.double(), dim=-1)
+    unit = flashinfer.sampling.softmax(logits, temperature=1.0)
+    none = flashinfer.sampling.softmax(logits, temperature=None)
+
+    assert torch.equal(unit, none)
+    rel = (unit.double() - expected).abs() / expected
+    assert rel.max().item() <= 1e-6
+
+
+@pytest.mark.parametrize(
+    "rows,prefix_rows,vocab_size",
+    [
+        # 16-CTA shared-tile kernel: five waves of resident clusters on B200
+        # (the last with the balanced chunk for a per-row temperature), and a
+        # prefix within two waves that takes the low-latency kernel.
+        (155, 32, 151936),
+        (155, 62, 151936),
+        # 8-CTA shared-tile kernel.
+        (355, 62, 66000),
+    ],
+)
+@pytest.mark.parametrize("temperature_kind", ["none", "scalar", "per_row"])
+def test_blackwell_softmax_shared_tile_kernels_match_across_waves(
+    rows, prefix_rows, vocab_size, temperature_kind
+):
+    # Rows give the same bits whether the batch launches the shared-tile kernel
+    # for more than two waves or the low-latency kernel for at most two waves.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(11)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        prefix_temperature = temperature[:prefix_rows].contiguous()
+    else:
+        temperature = None if temperature_kind == "none" else 0.7
+        prefix_temperature = temperature
+    prefix = logits[:prefix_rows].contiguous()
+    shared_tiles = (
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES
+    )
+    for x, t in ((logits, temperature), (prefix, prefix_temperature)):
+        route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+            x, temperature=t
+        )
+        assert route == shared_tiles
+    full_kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature
+    )
+    prefix_kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        prefix, temperature=prefix_temperature
+    )
+    # Same cluster size and chunk, so the same per-row arithmetic.
+    assert full_kernel[0] == prefix_kernel[0]
+    assert full_kernel[5] == prefix_kernel[5]
+    full = flashinfer.sampling.softmax(logits, temperature=temperature)
+    part = flashinfer.sampling.softmax(prefix, temperature=prefix_temperature)
+    assert torch.equal(full[:prefix_rows], part)
 
 
 @pytest.mark.parametrize(
@@ -1022,13 +1324,12 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
     "rows,vocab_size,temperature_kind,sm100_chunk,sm103_chunk",
     [
         # 8-CTA shared-tile kernel with a cut of at least 1/10: 6-, 7- and
-        # 8-tile chunks (whole tiles on sm_100 for 6 tiles, per-row
-        # temperatures included).
-        (79, 81928, "none", 12288, 10272),
-        (45, 81928, "per_row", 12288, 10272),
-        (296, 81928, "scalar", 12288, 12288),
-        (370, 88320, "scalar_pdl", 12288, 12288),
-        (371, 88320, "none", 12288, 12288),
+        # 8-tile chunks, per-row temperatures included.
+        (79, 81928, "none", 10272, 10272),
+        (45, 81928, "per_row", 10272, 10272),
+        (296, 81928, "scalar", 10272, 12288),
+        (370, 88320, "scalar_pdl", 11040, 12288),
+        (371, 88320, "none", 11040, 12288),
         (53, 98312, "none", 12320, 12320),
         (73, 98312, "per_row", 12320, 12320),
         (370, 103168, "none", 12896, 12896),
@@ -1041,8 +1342,8 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
         (115, 76544, "per_row", 9568, 9568),
         (116, 76544, "none", 9568, 10240),
         (79, 88328, "scalar", 11072, 11072),
-        (296, 88328, "none", 11072, 11072),
-        (370, 91904, "per_row", 12288, 11488),
+        (296, 88328, "none", 11072, 12288),
+        (370, 91904, "per_row", 12288, 12288),
         (371, 91904, "scalar_pdl", 11488, 12288),
         (53, 103176, "none", 12928, 12928),
         (73, 103176, "scalar", 12928, 12928),
@@ -1052,10 +1353,10 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
         (51, 117768, "per_row", 7392, 14752),
         (74, 126720, "scalar", 16384, 15840),
         # 8-CTA persistent kernel: 6-, 7- and 8-tile chunks.
-        (92, 81928, "scalar_pdl", 12288, 10272),
-        (93, 81928, "per_row", 12288, 12288),
-        (93, 81928, "none", 12288, 12288),
-        (180, 88320, "scalar", 12288, 12288),
+        (92, 81928, "scalar_pdl", 10272, 10272),
+        (93, 81928, "per_row", 10272, 10272),
+        (93, 81928, "none", 10272, 10272),
+        (180, 88320, "scalar", 11040, 11040),
         (181, 88320, "per_row", 12288, 12288),
         (128, 98312, "none", 12320, 12320),
         (129, 98312, "scalar_pdl", 12320, 12320),
@@ -1069,12 +1370,11 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
 def test_blackwell_cached_cluster_eight_cta_balanced_chunk_rows_per_arch(
     rows, vocab_size, temperature_kind, sm100_chunk, sm103_chunk
 ):
-    # On sm_103 the 8-CTA kernels of a 5- to 8-tile chunk take the balanced
-    # chunk up to the rows set per kernel, cut and chunk tile count: every
-    # row up to five waves or trips, except for 6-tile chunks with a cut of
-    # at least 1/10 (shared-tile kernel up to 79 rows, persistent kernel up
-    # to 92 rows). On sm_100 the 8-CTA kernels keep whole tiles for 6-tile
-    # chunks with a cut of at least 1/10.
+    # The 8-CTA kernels of a 5- to 8-tile chunk take the balanced chunk up to
+    # five waves or trips, on sm_100 up to seven unless the temperature is per
+    # row (371 rows of 88320 pass five shared-tile waves on sm_103). On sm_103,
+    # 296 to 443 rows of a 5- or 6-tile chunk whose CTA share exceeds 5 tiles
+    # run the persistent kernel with whole tiles instead.
     _skip_unless_b200_or_gb300()
     torch.manual_seed(13)
     logits = torch.randn(rows, vocab_size, device="cuda")
@@ -1253,6 +1553,74 @@ def test_softmax(
     assert torch.allclose(probs, probs_ref, atol=1e-5)
 
 
+@pytest.mark.parametrize("api", ["online_softmax", "sampling", "logits_pipe"])
+def test_softmax_concurrent_streams(api):
+    torch.manual_seed(42)
+    shape = (128, 131072)
+    logits = [
+        torch.randn(shape, device="cuda"),
+        torch.randn(shape, device="cuda") * 2 + 3,
+    ]
+    references = [value.softmax(dim=-1) for value in logits]
+
+    if api == "online_softmax":
+        # Public APIs dispatch to a different kernel on Blackwell. Exercise
+        # OnlineSoftmax directly with the same workspace for both graphs.
+        workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+        run = partial(
+            flashinfer.sampling.get_sampling_module().softmax,
+            workspace,
+            maybe_temperature_arr=None,
+            temperature_val=1.0,
+            enable_pdl=False,
+        )
+    elif api == "sampling":
+        run = partial(flashinfer.sampling.softmax, enable_pdl=False)
+    else:
+        from flashinfer.logits_processor import LogitsPipe, Softmax, Temperature
+
+        pipe = LogitsPipe([Temperature(), Softmax(enable_pdl=False)], compile=True)
+        run = partial(pipe, temperature=1.0)
+
+    run(logits[0])  # Compile before capture.
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+    outputs = []
+    for graph, stream, value in zip(graphs, streams, logits, strict=True):
+        with torch.cuda.graph(graph, stream=stream):
+            outputs.append(run(value))
+
+    for _ in range(10):
+        for graph, stream in zip(graphs, streams, strict=True):
+            with torch.cuda.stream(stream):
+                graph.replay()
+        for stream in streams:
+            stream.synchronize()
+        for output, reference in zip(outputs, references, strict=True):
+            torch.testing.assert_close(output, reference, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("offset", [0, 4, -4, 32768])
+def test_softmax_split_output_overlap(offset):
+    from flashinfer.jit.sampling import gen_sampling_module
+
+    vocab_size = 32768
+    storage = torch.randn(vocab_size + abs(offset), device="cuda")
+    logits = storage.narrow(0, max(-offset, 0), vocab_size).view(1, vocab_size)
+    output = storage.narrow(0, max(offset, 0), vocab_size).view(1, vocab_size)
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = gen_sampling_module().build_and_load().softmax
+    if offset == vocab_size:
+        softmax(workspace, logits, output, None, 1.0, False)
+        torch.testing.assert_close(output, logits.softmax(dim=-1), atol=1e-5, rtol=1e-5)
+    else:
+        with pytest.raises(
+            RuntimeError, match="OnlineSoftmax failed with error code invalid argument"
+        ):
+            softmax(workspace, logits, output, None, 1.0, False)
+
+
 # Batches of at most 128 rows with a vocabulary of at least 24576 take the vocab-splitting
 # map-reduce kernels; the rest take the fused kernel.
 @pytest.mark.parametrize("batch_size,vocab_size", [(128, 4096), (4, 32768)])
@@ -1272,6 +1640,44 @@ def test_softmax_pdl_waits_for_temperature(batch_size, vocab_size):
     temperature[0] = temperature_value * 4
     late_store(temperature, temperature_value)
     probs = softmax(workspace, logits, temperature, 0.0, True)
+
+    torch.testing.assert_close(probs, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "batch_size,vocab_size",
+    [
+        (8, 111),  # warp-packed route
+        (8, 1001),  # rowwise route (vocab not a multiple of 8)
+        (256, 32004),  # cooperative bootstrap route
+        (1, 32000),  # row-caching cluster route, _pdl twin
+        (16, 151552),  # shared-tile cluster route, _pdl twin
+        (48, 256000),  # persistent 16-CTA clusters
+        (1024, 256000),  # shared-tile 16-CTA clusters, _pdl twin
+    ],
+)
+def test_softmax_blackwell_pdl_waits_for_temperature(batch_size, vocab_size):
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("Cake softmax routes launch with PDL on SM103 and SM107")
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    temperature_value = 0.5
+    temperature = torch.full((batch_size,), temperature_value, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    expected = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=False
+    )
+
+    # Row 0's temperature is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the softmax kernel.
+    temperature[0] = temperature_value * 4
+    late_store(temperature, temperature_value)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=True
+    )
 
     torch.testing.assert_close(probs, expected, rtol=0, atol=0)
 
@@ -1625,6 +2031,142 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         ]
 
 
+@pytest.mark.parametrize(
+    "batch_size,vocab_size",
+    [(1, 8192), (20, 32000), (3, 50257), (7, 151936), (2, 262144)],
+)
+@pytest.mark.parametrize("mode", ["top_p", "top_k", "joint"])
+def test_split_row_rejection_sampling(batch_size, vocab_size, mode):
+    # Small batches with vocabularies of 8192 or more take the split-row (thread block
+    # cluster) kernels on SM90; these shapes cover cluster sizes 2, 4 and 8, an odd vocabulary
+    # (scalar staging), per-row thresholds, a row whose leading chunks have no mass, and k = 1.
+    torch.manual_seed(42)
+    eps = 1e-4
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+    logits[0, : vocab_size // 2] = -float("inf")
+    probs = torch.softmax(logits, dim=-1)
+    top_k = torch.randint(1, 1000, (batch_size,), dtype=torch.int32, device="cuda:0")
+    top_k[-1] = 1
+    top_p = torch.rand(batch_size, device="cuda:0") * 0.9 + 0.05
+
+    sorted_prob, order = torch.sort(probs, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask_top_p = torch.zeros_like(probs, dtype=torch.int32)
+    mask_top_p.scatter_add_(1, order, (cdf > (1 - top_p.unsqueeze(-1)) - eps).int())
+    pivot = sorted_prob.flip(-1).gather(1, (top_k.long() - 1).unsqueeze(-1))
+    mask_top_k = (probs >= pivot).int()
+    mask = {
+        "top_p": mask_top_p,
+        "top_k": mask_top_k,
+        "joint": torch.minimum(mask_top_p, mask_top_k),
+    }[mode]
+
+    def sample(offset, indices=None, per_row=True):
+        k, p = (top_k, top_p) if per_row else (int(top_k[0]), float(top_p[0]))
+        if mode == "top_p":
+            return flashinfer.sampling.top_p_sampling_from_probs(
+                probs, p, indices, seed=1234, offset=offset, return_valid=True
+            )
+        if mode == "top_k":
+            return flashinfer.sampling.top_k_sampling_from_probs(
+                probs, k, indices, seed=1234, offset=offset, return_valid=True
+            )
+        return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs,
+            k,
+            p,
+            indices,
+            filter_apply_order="joint",
+            seed=1234,
+            offset=offset,
+            return_valid=True,
+        )
+
+    rows = torch.arange(batch_size, device="cuda:0")
+    for offset in range(0, 200, 4):
+        samples, valid = sample(offset)
+        assert torch.all(valid)
+        assert torch.all(mask[rows, samples] == 1)
+        # Same seed and offset give the same samples.
+        assert torch.equal(sample(offset)[0], samples)
+
+    # Outputs mapped to rows through indices, with scalar thresholds (the row-0 mask).
+    indices = torch.tensor([0, batch_size - 1, 0], dtype=torch.int32, device="cuda:0")
+    if mode == "top_p":
+        mask_row0 = mask_top_p[0]
+    elif mode == "top_k":
+        mask_row0 = mask_top_k[0]
+    else:
+        mask_row0 = torch.minimum(mask_top_p[0], mask_top_k[0])
+    for offset in range(0, 40, 4):
+        samples, valid = sample(offset, indices, per_row=False)
+        assert torch.all(valid)
+        assert mask_row0[samples[0]] == 1 and mask_row0[samples[2]] == 1
+        assert 0 <= samples[1] < vocab_size
+
+
+@pytest.mark.parametrize(
+    "batch_size,vocab_size", [(256, 8192), (32, 32000), (256, 151936)]
+)
+@pytest.mark.parametrize("mode", ["top_p", "top_k", "joint"])
+def test_split_row_rejection_sampling_freq(batch_size, vocab_size, mode):
+    # The split-row kernels (cluster sizes 2, 4 and 8 for these shapes on SM90) partition each
+    # row into per-CTA chunks and per-warp segments. Put the probability mass on a sparse set
+    # that includes both sides of every such boundary for cluster sizes 2, 4 and 8, and compare
+    # the sample frequencies with the renormalized distribution.
+    torch.manual_seed(42)
+    num_warps = 8
+    support = {0, vocab_size - 1}
+    for cluster_size in [2, 4, 8]:
+        chunk = (-(-vocab_size // cluster_size) + 3) // 4 * 4
+        seg = (-(-chunk // num_warps) + 3) // 4 * 4
+        for start in range(0, vocab_size, chunk):
+            for b in [start + w * seg for w in range(num_warps)]:
+                support.update(i for i in [b - 1, b] if 0 <= i < vocab_size)
+    support.update(torch.randint(0, vocab_size, (32,)).tolist())
+    support = torch.tensor(sorted(support), device="cuda:0")
+    probs_row = torch.zeros(vocab_size, device="cuda:0")
+    probs_row[support] = torch.rand(len(support), device="cuda:0") + 0.1
+    probs_row /= probs_row.sum()
+    probs = probs_row.repeat(batch_size, 1)
+
+    k, p = len(support) // 2, 0.7
+    sorted_prob, order = torch.sort(probs_row)
+    mask_top_p = torch.zeros(vocab_size, dtype=torch.bool, device="cuda:0")
+    mask_top_p[order] = torch.cumsum(sorted_prob, 0) > 1 - p
+    mask_top_k = probs_row >= sorted_prob[-k]
+    mask = {
+        "top_p": mask_top_p,
+        "top_k": mask_top_k,
+        "joint": mask_top_p & mask_top_k,
+    }[mode]
+    expected = torch.where(mask, probs_row, 0.0)
+    expected /= expected.sum()
+
+    generator = torch.Generator(device="cuda:0").manual_seed(0)
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device="cuda:0")
+    num_calls = 51200 // batch_size
+    for _ in range(num_calls):
+        if mode == "top_p":
+            samples = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, p, generator=generator
+            )
+        elif mode == "top_k":
+            samples = flashinfer.sampling.top_k_sampling_from_probs(
+                probs, k, generator=generator
+            )
+        else:
+            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, k, p, filter_apply_order="joint", generator=generator
+            )
+        counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    num_draws = num_calls * batch_size
+    freq = counter.float() / num_draws
+    assert torch.all(counter[~mask] == 0)
+    tol = 6 * torch.sqrt(expected * (1 - expected) / num_draws) + 1e-6
+    assert torch.all((freq - expected).abs() <= tol), (freq - expected).abs().max()
+
+
 @parametrize_product(
     {
         "batch_size": [1, 99, 989],
@@ -1712,20 +2254,84 @@ def test_top_k_top_p_sampling_per_row_k_with_top_k_max_freq(k, from_logits):
         flashinfer.sampling.top_k_renorm_probs(probs, k), p
     )[0]
 
-    # The fast path rejects `indices`, so repeat the row instead.
-    x = logits.expand(num_rows, -1).contiguous()
-    top_k = torch.full((num_rows,), k, dtype=torch.int32, device="cuda:0")
+    # Reuse the unique source row through the indexed fast path.
+    x = logits
+    top_k = torch.tensor([k], dtype=torch.int32, device="cuda:0")
+    indices = torch.zeros(num_rows, dtype=torch.int32, device="cuda:0")
     generator = torch.Generator("cuda:0").manual_seed(0)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device="cuda:0")
     for _ in range(num_iters):
         samples = _top_k_top_p_sample(
-            x, top_k, p, from_logits, top_k_max=256, generator=generator
+            x,
+            top_k,
+            p,
+            from_logits,
+            indices=indices,
+            top_k_max=256,
+            generator=generator,
         )
         counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
     freq = counter.float() / (num_rows * num_iters)
     assert torch.all(ref[freq > 0] > 0)
     similarity = torch.cosine_similarity(freq, ref, dim=0)
     assert similarity > 0.99, f"similarity: {similarity}"
+
+
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_first_indexed_fast_path_matches_expanded_call(from_logits):
+    vocab_size = 65536
+    logits = torch.full((2, vocab_size), -float("inf"), device="cuda:0")
+    # Both rows have a tie at the exact-k boundary.
+    logits[0, :3] = torch.tensor([0.0, 0.0, -1.0], device="cuda:0")
+    logits[1, :4] = torch.tensor([2.0, 1.0, 1.0, 0.0], device="cuda:0")
+    top_k = torch.tensor([1, 2], dtype=torch.int32, device="cuda:0")
+    top_p = torch.tensor([1.0, 0.75], device="cuda:0")
+    indices = torch.tensor([0, 1, 1, 0] * 16, dtype=torch.int64, device="cuda:0")
+
+    indexed = _top_k_top_p_sample(
+        logits,
+        top_k,
+        top_p,
+        from_logits,
+        indices=indices,
+        top_k_max=2,
+        seed=20261031,
+        offset=17,
+    )
+    expanded = _top_k_top_p_sample(
+        logits.index_select(0, indices),
+        top_k.index_select(0, indices),
+        top_p.index_select(0, indices),
+        from_logits,
+        top_k_max=2,
+        seed=20261031,
+        offset=17,
+    )
+
+    assert indexed.dtype == torch.int64
+    torch.testing.assert_close(indexed, expanded.to(torch.int64), rtol=0, atol=0)
+    # Exact top-k retains only one of row 0's tied maxima.
+    assert torch.unique(indexed[indices == 0]).numel() == 1
+
+
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_first_indexed_fast_path_validates_top_p_length(from_logits):
+    logits = torch.zeros((2, 65536), device="cuda:0")
+    top_k = torch.tensor([1, 2], dtype=torch.int32, device="cuda:0")
+    indices = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda:0")
+    output_sized_top_p = torch.full((indices.numel(),), 0.9, device="cuda:0")
+
+    with pytest.raises(
+        ValueError, match="Sampling parameter tensor batch size mismatch"
+    ):
+        _top_k_top_p_sample(
+            logits,
+            top_k,
+            output_sized_top_p,
+            from_logits,
+            indices=indices,
+            top_k_max=2,
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
@@ -1760,7 +2366,12 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9, 1.0])
-def test_top_p_renorm_probs(batch_size, vocab_size, p):
+@pytest.mark.parametrize("is_deterministic", [False, True])
+def test_top_p_renorm_probs(batch_size, vocab_size, p, is_deterministic):
+    if is_deterministic and vocab_size < 2048:
+        pytest.skip(
+            "rows narrower than the radix histogram use the ternary search path"
+        )
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
@@ -1774,12 +2385,50 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
         dim=-1, keepdim=True
     )
 
-    renorm_prob = flashinfer.sampling.top_p_renorm_probs(normalized_prob, p)
+    renorm_prob = flashinfer.sampling.top_p_renorm_probs(
+        normalized_prob, p, is_deterministic=is_deterministic
+    )
     torch.testing.assert_close(
         renorm_prob_ground_truth,
         renorm_prob,
         rtol=1e-3,
         atol=1e-3,
+    )
+    if is_deterministic:
+        again = flashinfer.sampling.top_p_renorm_probs(
+            normalized_prob, p, is_deterministic=True
+        )
+        assert torch.equal(renorm_prob, again)
+
+
+@pytest.mark.parametrize("vocab_size", [(1 << 20) - 1, 1 << 20])
+def test_top_p_renorm_probs_deterministic_wide_rows(vocab_size):
+    # Rows below 2^20 elements accumulate split 32-bit histogram words; wider
+    # rows keep 64-bit words. Both must keep the sorted reference's tokens.
+    torch.manual_seed(42)
+    p = 0.9
+    pre_norm_prob = torch.rand(1, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    prob64 = normalized_prob.double()
+    sorted_prob, indices = torch.sort(prob64, descending=False)
+    expected_kept = torch.zeros_like(prob64, dtype=torch.bool)
+    expected_kept.scatter_(1, indices, torch.cumsum(sorted_prob, dim=-1) >= (1 - p))
+
+    renorm_prob = flashinfer.sampling.top_p_renorm_probs(
+        normalized_prob, p, is_deterministic=True
+    )
+    again = flashinfer.sampling.top_p_renorm_probs(
+        normalized_prob, p, is_deterministic=True
+    )
+    assert torch.equal(renorm_prob, again)
+    kept = renorm_prob > 0
+    # Rounding at the cumulative-mass boundary may move a single token.
+    assert (kept != expected_kept).sum().item() <= 1
+    torch.testing.assert_close(
+        renorm_prob[kept].double(),
+        prob64[kept] / prob64[kept].sum(),
+        rtol=1e-3,
+        atol=0,
     )
 
 
@@ -2766,10 +3415,12 @@ def test_per_request_top_k_with_indices_dtype(api, indices_dtype, threshold_dtyp
         )
 
 
-@pytest.mark.parametrize("api", ["top_k", "min_p"])
+@pytest.mark.parametrize(
+    "api,vocab_size", [("top_k", 4), ("min_p", 4), ("top_k", 8192)]
+)
 @pytest.mark.parametrize("remap", ["keep_all", "argmax", "mixed"])
 @pytest.mark.parametrize("expanded", [False, True], ids=["equal_rows", "more_outputs"])
-def test_per_request_param_indexed_by_row(api, remap, expanded):
+def test_per_request_param_indexed_by_row(api, vocab_size, remap, expanded):
     """A per-request threshold must be read from the probs row ``indices`` selects.
 
     The three rows have different argmax classes and binary-exact probabilities, so
@@ -2782,17 +3433,20 @@ def test_per_request_param_indexed_by_row(api, remap, expanded):
     read stays in bounds: it is a negative control with a wrong answer rather than a
     crash. ``more_outputs`` is the shape the fix enables -- fewer probs rows than
     outputs -- where the output-indexed read would run off the threshold array.
+
+    At vocab 8192, top-k takes the SM90 split-row kernel.
     """
-    rows = torch.tensor(
+    num_classes = 4
+    stride = vocab_size // num_classes
+    rows = torch.zeros(3, vocab_size, dtype=torch.float32, device="cuda:0")
+    rows[:, ::stride] = torch.tensor(
         [
             [0.5, 0.25, 0.125, 0.125],
             [0.125, 0.5, 0.25, 0.125],
             [0.125, 0.125, 0.5, 0.25],
         ],
-        dtype=torch.float32,
-        device="cuda:0",
+        device=rows.device,
     )
-    num_classes = rows.size(1)
     lanes = 1024
     # row 1 keeps every class; rows 0 and 2 keep their argmax only.
     if api == "top_k":
@@ -2824,12 +3478,13 @@ def test_per_request_param_indexed_by_row(api, remap, expanded):
     assert samples.dtype == indices.dtype
     assert valid.shape == indices.shape and valid.dtype == torch.bool
     assert bool(valid.all())
-    assert bool(((samples >= 0) & (samples < num_classes)).all())
+    assert bool(((samples >= 0) & (samples < vocab_size)).all())
+    assert bool((samples % stride == 0).all())
     assert torch.equal(probs, probs_before)
     assert torch.equal(threshold, threshold_before)
     assert torch.equal(indices, indices_before)
 
-    samples = samples.reshape(lanes, len(mapping))
+    samples = samples.reshape(lanes, len(mapping)) // stride
     for lane, row_idx in enumerate(mapping):
         counts = torch.bincount(samples[:, lane].long(), minlength=num_classes)
         if row_idx == 1:
