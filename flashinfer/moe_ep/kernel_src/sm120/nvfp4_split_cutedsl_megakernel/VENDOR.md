@@ -2,10 +2,46 @@
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-nvfp4-split`, commit
-`f6f6b5ae0f7d16fc7856d1af1d633d421590f44d`. The FlashInfer
+`aa968e6085ec0caa420e06225a7e0c554e33d99d`. The FlashInfer
 delivery uses ABI `2814542011115` (standalone source ABI `281454201`).
 This revision includes continuous decode policies, M128 workers, utility
 defaults, DATA TMA eviction hints and the NCCL memory/transport runtime.
+It adds the measured anchor table (`tuned_table.json`, DSV4.1-Flash and
+GLM5.3-Flash, EP4 in one NUMA node and EP8 across two) and the residency
+knobs `k1_ctas_per_sm` / `k2_launch_factor`; kernel cache keys include them.
+The FlashInfer frontend scales its K1/K2 launch grids by these knobs.
+On an EP spanning NUMA nodes the frontend can run the `p2p_split` backend
+(`transport/xnuma.py`): same-NUMA peers use direct P2P and every cross-NUMA
+peer is served through a local shadow segment of the workspace arena that
+GIN keeps in sync. The choice is made per compile bucket when the workspace
+is allocated: without a `comm_backend` knob a bucket follows the anchor
+table (or its rule for untabulated shapes), `knobs={"comm_backend":
+"p2p_split"}` selects it for every eligible bucket and `"gin"` disables it.
+Only buckets up to `FLASHINFER_MEGAMOE_P2P_SPLIT_MAX_TOKENS` (default 384,
+the largest decode bucket) qualify, because the xnuma return buffers grow
+with tokens x top-k x hidden x cross-NUMA peers (DSV4.1-Flash: about
+0.38 GB per rank at 384 tokens, 4 GB at 4096); larger buckets run `gin`.
+A bucket also needs at most 64 local experts, the 8-warp K2 and per-slot
+combine (rank-local combine is disabled for it), otherwise it runs `gin`.
+
+FlashInfer adaptation of p2p_split: the shadows cover only the arena prefix
+holding the inputs, the output and the p2p_split buckets' combine/shared
+buffers (allocated first), not the whole arena. All p2p_split buckets and
+layers of a workspace share one device epoch and one control region placed
+for the largest such bucket: GIN commits are cumulative signal-adds keyed by
+the source word, so every commit word keeps a fixed address. Inputs are sent
+as separate per-tensor puts sized to the bucket. Under an outer CUDA graph
+the epoch bump and sender are captured before the child graph, and the
+return scatter after the K2 finalizer and before K3.
+The standalone `tools/sm120_nvfp4_tuning` scripts are not vendored.
+
+FlashInfer fix in the ordinary top-k reduction (K3,
+`kernel_combine_reduce.py`): K2 writes no `combine_output` row for a negative
+(unrouted) top-k slot, so K3 previously summed whatever that row held from an
+earlier call whenever a valid token had such a slot. The frontend now passes
+the staged `topk_ids` and K3 skips negative slots (fully unrouted padding rows
+and the rank-local combine path were already correct). This is a deviation
+from the standalone source, which has the same unmasked reduction.
 The FlashInfer-specific EP8 GIN adapter and graph integration are retained
 alongside the standalone source; this is not a byte-identical standalone drop.
 See [DECODE_DEFAULTS.md](DECODE_DEFAULTS.md) for activation ranges and validation limits. The private `moe_sm120_nvfp4_split/support/common/` and `support/src/`

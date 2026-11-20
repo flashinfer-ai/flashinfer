@@ -113,6 +113,9 @@ def load_tuning_config(path):
 def config_from_dict(values, shape, contract):
     from .heuristic import (MegaMoEKernelConfig, derive_features, legality_errors,
                             semantic_errors, correctness_qualification_errors)
+    if isinstance(values, dict):
+        # Records written before the residency knobs existed use their defaults.
+        values = {"k1_ctas_per_sm": 1, "k2_launch_factor": 1, **values}
     if not isinstance(values, dict) or set(values) != {f.name for f in fields(MegaMoEKernelConfig)}:
         raise ValueError('incomplete or unknown kernel config fields')
     # Enforce JSON types before arithmetic/legality validation. In particular,

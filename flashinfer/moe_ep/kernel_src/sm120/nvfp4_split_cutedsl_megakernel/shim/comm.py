@@ -52,12 +52,35 @@ def _host_runtime():
     return host, allocator
 
 
+_ALIGN = 2 << 20
+
+
+def _align(value: int) -> int:
+    return (value + _ALIGN - 1) // _ALIGN * _ALIGN
+
+
+class _ArenaBase:
+    def __init__(self, session):
+        self._session = session
+
+    @property
+    def base(self) -> int:
+        return int(self._session.arena.data_ptr())
+
+
 class PeerMemorySession:
     """One symmetric arena per workspace, shared by all layers and buckets.
 
     The kernel uses one peer-offset table for every symmetric tensor. Therefore
     all these tensors must be slices of the SAME registered allocation. Multiple
     independent allocations cannot share that table, even if their sizes match.
+
+    With ``shadow`` (p2p_split, EP spanning NUMA nodes) the arena is
+    ``[own buffers | reserved control region | one shadow per cross-NUMA
+    peer]``. A shadow mirrors that peer's first ``shadow_bytes`` bytes at the
+    same offsets, and the peer-offset table maps every cross-NUMA peer to its
+    local shadow, so peer loads/stores of p2p_direct kernels stay local and
+    ``transport.xnuma`` keeps the shadows in sync over GIN.
     """
 
     def __init__(
@@ -68,6 +91,9 @@ class PeerMemorySession:
         control_group=None,
         *,
         network_peer_mask: int = 0,
+        shadow=None,
+        shadow_bytes: int = 0,
+        reserved_bytes: int = 0,
     ):
         ensure_not_capturing("NCCL workspace initialization")
         import torch.distributed as dist
@@ -76,6 +102,11 @@ class PeerMemorySession:
             raise ValueError("Network peer mask is outside the EP world")
         if network_peer_mask & (1 << rank):
             raise ValueError("The local EP rank cannot be a network peer")
+        if shadow is not None:
+            if shadow.world != world or shadow.rank != rank:
+                raise ValueError("shadow layout does not match the EP world")
+            if shadow.cross_mask != network_peer_mask:
+                raise ValueError("shadow peers must be exactly the network peers")
         if network_peer_mask:
             # Optional deployment mapping is indexed by visible CUDA device,
             # never by EP rank (an EP subgroup need not start at device zero).
@@ -106,9 +137,31 @@ class PeerMemorySession:
         self.handle = C.c_void_p()
         self.closed = False
         self.registered_arenas = []
-        self.capacity = (capacity + (2 << 20) - 1) // (2 << 20) * (2 << 20)
+        self.capacity = _align(capacity)
+        self.shadow = shadow
+        self.p2p = _ArenaBase(self)
+        if shadow is not None:
+            if not 0 < shadow_bytes <= self.capacity:
+                raise ValueError("shadow_bytes must lie inside the workspace capacity")
+            self.shadow_limit = _align(shadow_bytes)
+            self.reserved_offset = self.capacity
+            self.segment0 = _align(self.capacity + int(reserved_bytes))
+            self.reserved_bytes = self.segment0 - self.capacity
+            total = self.segment0 + self.shadow_limit * shadow.num_cross
+        else:
+            self.shadow_limit = self.reserved_offset = self.capacity
+            self.segment0 = self.capacity
+            self.reserved_bytes = 0
+            total = self.capacity
+        self.total_bytes = total
         signatures = [None] * world
-        signature = (self.capacity, self.network)
+        signature = (
+            self.capacity,
+            self.network,
+            total,
+            self.shadow_limit,
+            self.reserved_bytes,
+        )
         dist.all_gather_object(signatures, signature, group=control_group)
         if any(value != signature for value in signatures):
             raise ValueError(
@@ -141,12 +194,13 @@ class PeerMemorySession:
         try:
             self.pool = torch.cuda.MemPool(self.allocator.allocator())
             with torch.cuda.use_mem_pool(self.pool):
-                self.arena = torch.empty(
-                    self.capacity, dtype=torch.uint8, device="cuda"
-                )
+                self.arena = torch.empty(total, dtype=torch.uint8, device="cuda")
             self._check(
-                self.host.eq_register(self.handle, self.arena.data_ptr(), self.capacity)
+                self.host.eq_register(self.handle, self.arena.data_ptr(), total)
             )
+            if self.reserved_bytes:
+                # Commit words are cumulative signal-adds; clear them once only.
+                self.reserved_view(0, self.reserved_bytes).zero_()
             offsets = []
             for peer in range(world):
                 address = C.c_ulonglong()
@@ -158,6 +212,10 @@ class PeerMemorySession:
                 offsets.append(
                     address.value - self.arena.data_ptr() if address.value else 0
                 )
+            if shadow is not None:
+                # Cross-NUMA peers resolve to this rank's local shadow of them.
+                for peer, segment in shadow.local_segments().items():
+                    offsets[peer] = self.segment_offset(segment)
             self.offsets = tuple(offsets)
         except BaseException:
             self.close()
@@ -166,6 +224,24 @@ class PeerMemorySession:
     def _check(self, rc):
         if rc:
             raise RuntimeError(self.host.eq_error().decode())
+
+    def segment_offset(self, segment: int) -> int:
+        """Byte offset of shadow segment ``segment`` (0 = own buffers)."""
+        if segment == 0:
+            return 0
+        if self.shadow is None or not 0 < segment <= self.shadow.num_cross:
+            raise ValueError(f"invalid shadow segment {segment}")
+        return self.segment0 + (segment - 1) * self.shadow_limit
+
+    def reserved_view(self, offset: int, nbytes: int) -> torch.Tensor:
+        """Bytes ``[offset, offset + nbytes)`` of the reserved control region."""
+        if offset < 0 or offset + nbytes > self.reserved_bytes:
+            raise ValueError(
+                f"reserved range [{offset}, {offset + nbytes}) exceeds "
+                f"{self.reserved_bytes} bytes"
+            )
+        start = self.reserved_offset + offset
+        return self.arena[start : start + nbytes]
 
     def register_network_arena(self, capacity: int) -> torch.Tensor:
         """Register an additional arena for one execution bucket's GIN buffers.

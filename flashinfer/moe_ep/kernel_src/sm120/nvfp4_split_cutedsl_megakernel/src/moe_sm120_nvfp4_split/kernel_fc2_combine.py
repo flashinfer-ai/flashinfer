@@ -2717,6 +2717,25 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     cute.arch.fence_acq_rel_sys()
                     cute.arch.barrier(barrier_id=self.epilog_sync_bar_id, number_of_threads=32 * len(self.compute_warp_id))
                     self.token_comm_hook_fc2_tile_complete(token_comm_args, combine_ready_flags, fc2_block_done_counter, work_tile_info, compute_warp=compute_warp, lane_idx=lane_idx)
+                if cutlass.const_expr(getattr(self, "xnuma_progress_addr", None) is not None):
+                    # p2p_split: publish per-expert progress (valid tokens of
+                    # this tile, per compute warp) after its rows are stored;
+                    # the xnuma forwarder returns an expert once its counter
+                    # reaches total * hidden_tiles * compute_warps.
+                    cute.arch.sync_warp()
+                    if lane_idx == cutlass.Int32(0):
+                        cute.arch.atomic_add(
+                            cute.make_ptr(
+                                cutlass.Int32,
+                                cutlass.Int64(self.xnuma_progress_addr)
+                                + cutlass.Int64(work_tile_info.expert_idx) * cutlass.Int64(4),
+                                cute.AddressSpace.gmem,
+                                assumed_align=4,
+                            ),
+                            cutlass.Int32(work_tile_info.valid_tokens_in_tile),
+                            sem="release",
+                            scope="gpu",
+                        )
                 if cutlass.const_expr(self.token_back_by_dispatch):
                     cute.arch.fence_acq_rel_sys()
                     cute.arch.barrier(barrier_id=self.epilog_sync_bar_id, number_of_threads=32 * len(self.compute_warp_id))

@@ -7,7 +7,8 @@ def select(shape, base, overrides, contract, counts=None):
     if counts is not None or (overrides and any(getattr(overrides,k,None) is not None for k in ("k1_compact_tokens","k2_compact_tokens"))):
         return base, dict(matched=False,reason="explicit caller specialization")
     shape_dict=json.loads(json.dumps(asdict(shape)))
-    config=json.loads(json.dumps(asdict(base)))
+    from .heuristic import policy_asdict
+    config=json.loads(json.dumps(policy_asdict(base)))
     for profile in PROFILES:
         if profile["shape"]==shape_dict and profile["contract"]==contract and profile["baseline_config"]==config:
             return replace(base,**profile["flags"]),dict(matched=True,evidence=profile["evidence"],flags=profile["flags"])

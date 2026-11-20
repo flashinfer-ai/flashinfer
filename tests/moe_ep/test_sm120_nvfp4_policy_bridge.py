@@ -54,3 +54,159 @@ def test_ep8_frontend_native_policy_bridge(
     )
     assert k.k1_tile == k.k2_tile == ((64, 32, 128) if explicit_old else (128, 32, 128))
     assert spec.jit.fc1_utility_postprocess == (model == "dsv")
+
+
+def _frontend(monkeypatch, *, world, topk, experts, hidden, intermediate, same, cross):
+    bootstrap_paths()
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+    from moe_sm120_nvfp4_split.runtime import green_context
+
+    monkeypatch.setattr(green_context, "query_sm_resource_info", lambda: (110, 8, 8))
+    monkeypatch.setattr(
+        green_context,
+        "query_green_context_sm_counts",
+        lambda k1_sm_count: (k1_sm_count, 110 - k1_sm_count),
+    )
+    monkeypatch.setattr(
+        runtime.MegaMoESm120Nvfp4Frontend,
+        "_green_resources_for",
+        lambda self, s: SimpleNamespace(
+            k1_sm_count=s.kernel.k1_sms, k2_sm_count=s.kernel.k2_sms
+        ),
+    )
+    frontend = object.__new__(runtime.MegaMoESm120Nvfp4Frontend)
+    frontend.config = runtime.MegaMoESm120Nvfp4Config(
+        0,
+        world,
+        512,
+        topk,
+        experts,
+        hidden,
+        intermediate,
+        gate_up_clamp=10.0,
+        numerical_contract="owner_bf16",
+    )
+    frontend.workspace = SimpleNamespace(
+        _topology=SimpleNamespace(
+            same_numa_peer_count=same, cross_numa_peer_count=cross
+        )
+    )
+    return frontend
+
+
+def test_ep4_anchor_table_residency_reaches_frontend(monkeypatch):
+    # DSV4.1-Flash EP4 T16 anchor: k1_ctas_per_sm=2, k2_stages=3.
+    frontend = _frontend(
+        monkeypatch,
+        world=4,
+        topk=6,
+        experts=384,
+        hidden=5120,
+        intermediate=2304,
+        same=3,
+        cross=0,
+    )
+    k = frontend._select_spec(16).kernel
+    assert k.comm_backend == "p2p_direct"
+    assert (k.k1_ctas_per_sm, k.k2_launch_factor, k.dispatch_warps) == (2, 1, 1)
+    assert k.k2_stages == 3
+
+
+def test_ep8_frontend_skips_p2p_split_anchors(monkeypatch):
+    # GLM5.3-Flash EP8: FlashInfer always runs gin (native gin_hybrid), so a
+    # p2p_split anchor (T32) leaves the built-in selection while a gin_hybrid
+    # anchor (T1024: k1_stages=3, k2_stages=3) applies.
+    from moe_sm120_nvfp4_split import tuned_table
+
+    kwargs = dict(
+        world=8,
+        topk=8,
+        experts=288,
+        hidden=4096,
+        intermediate=2048,
+        same=3,
+        cross=4,
+    )
+    tabulated = {
+        t: _frontend(monkeypatch, **kwargs)._select_spec(t) for t in (32, 1024)
+    }
+    monkeypatch.setattr(tuned_table, "_load", lambda: dict(schema=1, tables=[]))
+    from moe_sm120_nvfp4_split import heuristic
+
+    heuristic._select_with_profiles.cache_clear()
+    builtin = {t: _frontend(monkeypatch, **kwargs)._select_spec(t) for t in (32, 1024)}
+    heuristic._select_with_profiles.cache_clear()
+    assert tabulated[32] == builtin[32]
+    k = tabulated[1024].kernel
+    assert k.comm_backend == "gin"
+    assert (k.k1_stages, k.k2_stages) == (3, 3)
+    assert (k.k1_ctas_per_sm, k.k2_launch_factor) == (1, 1)
+
+
+def _ep8_topology():
+    peers = tuple(SimpleNamespace(numa_node=0 if r < 4 else 1) for r in range(8))
+    return SimpleNamespace(
+        same_numa_peer_count=3,
+        cross_numa_peer_count=4,
+        force_ibgda_peer_mask=0b11110000,
+        peers=peers,
+    )
+
+
+def test_ep8_p2p_split_bucket_plan(monkeypatch):
+    bootstrap_paths()
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+    from moe_sm120_nvfp4_split.runtime import green_context
+
+    monkeypatch.setattr(green_context, "query_sm_resource_info", lambda: (110, 8, 8))
+    monkeypatch.delenv(runtime.P2P_SPLIT_MAX_TOKENS_ENV, raising=False)
+    buckets = [*runtime.DECODE_GRAPH_COMPILE_BUCKETS, 512]
+
+    def config(knobs=None):
+        return runtime.MegaMoESm120Nvfp4Config(
+            0, 8, 512, 6, 384, 5120, 2304, gate_up_clamp=10.0, knobs=knobs
+        )
+
+    topology = _ep8_topology()
+    # DSV4.1-Flash EP8 anchors up to 512 select p2p_split; 512 exceeds the
+    # default decode-bucket limit.
+    assert runtime.plan_p2p_split_buckets(config(), topology, buckets) == set(
+        runtime.DECODE_GRAPH_COMPILE_BUCKETS
+    )
+    monkeypatch.setenv(runtime.P2P_SPLIT_MAX_TOKENS_ENV, "512")
+    assert 512 in runtime.plan_p2p_split_buckets(config(), topology, buckets)
+    assert not runtime.plan_p2p_split_buckets(
+        config({"comm_backend": "gin"}), topology, buckets
+    )
+    # Same-NUMA EP4 never shadows peers.
+    ep4 = SimpleNamespace(
+        same_numa_peer_count=3, cross_numa_peer_count=0, force_ibgda_peer_mask=0
+    )
+    assert not runtime.plan_p2p_split_buckets(config(), ep4, buckets)
+
+
+def test_ep8_p2p_split_bucket_uses_folded_selection(monkeypatch):
+    frontend = _frontend(
+        monkeypatch,
+        world=8,
+        topk=6,
+        experts=384,
+        hidden=5120,
+        intermediate=2304,
+        same=3,
+        cross=4,
+    )
+    frontend.workspace._topology = _ep8_topology()
+    frontend.workspace._bucket_backends = {32: "p2p_split"}
+    split = frontend._select_spec(32).kernel
+    # DSV4.1-Flash EP8 T32 anchor: p2p_split with K1/K2 N64.
+    assert split.comm_backend == "p2p_direct"
+    assert not split.rank_local_combine
+    assert (split.k1_tile[1], split.k2_tile[1], split.k2_warps) == (64, 64, 8)
+    assert (split.tx_sms, split.rx_sms) == (0, 0)
+    gin = frontend._select_spec(1024).kernel
+    assert gin.comm_backend == "gin"

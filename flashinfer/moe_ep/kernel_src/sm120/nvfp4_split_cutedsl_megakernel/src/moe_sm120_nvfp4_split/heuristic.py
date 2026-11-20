@@ -26,6 +26,16 @@ class MegaMoEHeuristicOverrides(_LegacyOverrides):
     k1_compact_tokens: Optional[bool] = None
     k2_compact_tokens: Optional[bool] = None
     k1_stages: Optional[int] = None
+    # Residency knobs (None keeps the selected value).
+    k1_ctas_per_sm: Optional[int] = None
+    k2_launch_factor: Optional[int] = None
+
+
+# Largest expected rows per expert at which two resident CTAs of one kernel
+# per SM (k1_ctas_per_sm=2, k2_launch_factor=2) are qualified; at 64 rows per
+# expert the W4A8 port produced intermittent wrong rows.
+RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT = 32.0
+_KNOB_FIELDS = ("k1_ctas_per_sm", "k2_launch_factor")
 
 
 @dataclass(frozen=True)
@@ -34,6 +44,31 @@ class MegaMoEKernelConfig(_LegacyConfig):
     k2_compact_tokens: bool = False
     # None only on compatibility fallback: preserve its previous kernel resolver.
     k1_stages: Optional[int] = None
+    # Two K1 CTAs per K1 SM (natural registers, occupancy 2, one dispatch
+    # warp); the K1 grid doubles on the same Green partition.
+    k1_ctas_per_sm: int = 1
+    # Multiplier on the 8-warp K2 launch grid (2 = two CTAs per K2 SM).
+    k2_launch_factor: int = 1
+
+    def __post_init__(self):
+        parent = getattr(_LegacyConfig, "__post_init__", None)
+        if parent is not None:
+            parent(self)
+        if self.k1_ctas_per_sm not in (1, 2):
+            raise ValueError("k1_ctas_per_sm must be 1 or 2")
+        if self.k2_launch_factor not in (1, 2):
+            raise ValueError("k2_launch_factor must be 1 or 2")
+        if self.k1_ctas_per_sm == 2 and self.dispatch_warps != 1:
+            raise ValueError("k1_ctas_per_sm=2 needs one dispatch warp")
+        if self.k2_launch_factor == 2 and (self.k2_warps == 12 or self.k2_tile[1] > 32):
+            # Two CTAs must be co-resident: the persistent K2 grid deadlocks
+            # if the second cannot launch (N64/N128 tiles, 12-warp K2).
+            raise ValueError("k2_launch_factor=2 needs the 8-warp K2 with tile N <= 32")
+        if (self.k1_ctas_per_sm == 2 or self.k2_launch_factor == 2) and (
+                self.expected_rows_per_expert > RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT):
+            raise ValueError(
+                "k1_ctas_per_sm=2 / k2_launch_factor=2 are qualified only up to "
+                f"{RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT} expected rows per expert")
 
     def with_overrides(self, overrides):
         # Applying an idempotent backend override must preserve this config.
@@ -428,6 +463,8 @@ def _apply_overrides(c, o):
     if o is None:
         return c
     updates = {k: v for k, v in vars(o).items() if v is not None}
+    if updates.get("k1_ctas_per_sm") == 2:
+        updates.setdefault("dispatch_warps", 1)
     sms = [k for k in ("k1_sms", "k2_sms", "tx_sms", "rx_sms") if k in updates]
     if sms and len(sms) != 4:
         raise ValueError("SM overrides must specify K1/K2/TX/RX together")
@@ -689,7 +726,8 @@ def select_compatibility_config(
             raise ValueError("RLC requires explicit owner_bf16 numerical permission")
     legacy_o = (
         _LegacyOverrides(
-            **{k: v for k, v in vars(overrides).items() if k not in ("k1_stages", "k1_compact_tokens", "k2_compact_tokens")}
+            **{k: v for k, v in vars(overrides).items()
+               if k not in ("k1_stages", "k1_compact_tokens", "k2_compact_tokens") + _KNOB_FIELDS}
         )
         if overrides
         else None
@@ -704,6 +742,7 @@ def select_compatibility_config(
         k1_compact_tokens=bool(overrides.k1_compact_tokens) if overrides else False,
         k2_compact_tokens=bool(overrides.k2_compact_tokens) if overrides else False
     )
+    c = _apply_knobs(c, overrides)
     errors = (
         legality_errors(shape, c)
         + semantic_errors(c, numerical_contract)
@@ -712,6 +751,29 @@ def select_compatibility_config(
     if errors:
         raise ValueError("; ".join(errors))
     return c
+
+
+def policy_asdict(c):
+    """``asdict`` for matching qualified profile records: residency knobs at
+    their default are omitted so records written before they existed still
+    match; a non-default knob is kept (the profile then no longer applies)."""
+    d = asdict(c)
+    for k in _KNOB_FIELDS:
+        if d.get(k) == 1:
+            d.pop(k)
+    return d
+
+
+def _apply_knobs(c, overrides):
+    """Residency knobs from overrides, applied after every selection layer."""
+    if overrides is None:
+        return c
+    knobs = {k: getattr(overrides, k) for k in _KNOB_FIELDS if getattr(overrides, k, None) is not None}
+    if not knobs or all(getattr(c, k) == v for k, v in knobs.items()):
+        return c
+    if knobs.get("k1_ctas_per_sm") == 2 and getattr(overrides, "dispatch_warps", None) is None:
+        knobs["dispatch_warps"] = 1
+    return replace(c, **knobs)
 
 
 def select_megamoe_config(
@@ -725,8 +787,55 @@ def select_megamoe_config(
 ):
     """Return a complete config. Callers must explicitly permit owner BF16 order."""
     _validate_counts(shape, host_expert_counts)
+    if tuning_config is None and host_expert_counts is None:
+        overrides = _with_tuned_table(shape, overrides, numerical_contract)
     return _select_with_profiles(shape, overrides, numerical_contract, host_expert_counts,
                                  tuning_config, hardware)[0]
+
+
+# Geometry resolved at the anchor and pinned for every token count mapped to it.
+_PINNED_FROM_ANCHOR = (
+    "k1_tile", "k2_tile", "k1_stages", "k2_stages", "k2_warps", "ready_queue_bundle",
+    "k1_sms", "k2_sms", "tx_sms", "rx_sms", "k2_tail_reclaim", "dispatch_warps",
+    "dispatch_rank_cache", "dispatch_compute_overlap", "dispatch_chunk_tokens",
+    "k1_ctas_per_sm", "k2_launch_factor",
+)
+
+
+def _with_tuned_table(shape, overrides, contract):
+    """Fill unset overrides from the ``tuned_table.json`` anchor entry.
+
+    Knobs are the runner flags the tuner measured on top of the built-in
+    selection. The configuration measured at the anchor is resolved and its
+    geometry pinned, so every token count mapped to the anchor runs it;
+    explicit overrides win. A caller-forced backend other than the entry's
+    leaves the table out.
+    """
+    from . import tuned_table
+
+    entry = tuned_table.lookup(shape)
+    if entry is None:
+        return overrides
+    table = tuned_table.overrides_for(entry["knobs"])
+    user = {k: v for k, v in vars(overrides).items() if v is not None} if overrides else {}
+    if "comm_backend" in user and user["comm_backend"] != table.get("comm_backend", user["comm_backend"]):
+        return overrides
+    if not (set(table) - {"comm_backend"}):
+        return overrides  # the default won at this anchor
+    anchor = replace(shape, tokens_per_rank=int(entry["tokens"]))
+    try:
+        measured = _select_with_profiles(
+            anchor, MegaMoEHeuristicOverrides(**table), contract, None, None, None)[0]
+    except ValueError:
+        return overrides  # not representable for this contract
+    merged = {name: getattr(measured, name) for name in _PINNED_FROM_ANCHOR}
+    merged.update(table)
+    if shape.expected_rows_per_expert > RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT:
+        merged.update(k1_ctas_per_sm=1, k2_launch_factor=1)
+        if measured.k1_ctas_per_sm == 2:
+            merged.pop("dispatch_warps", None)
+    merged.update(user)
+    return MegaMoEHeuristicOverrides(**merged)
 
 
 @lru_cache(maxsize=256)
@@ -744,10 +853,10 @@ def _select_with_profiles(shape, overrides, contract, counts, tuning_config, har
         tuned, detail = resolve_tuning(tuning_config, shape, overrides, contract, hardware)
         info['offline'] = detail
         if tuned is not None:
-            return tuned, deepcopy(dict(info, source='offline_tuning'))
+            return _apply_knobs(tuned, overrides), deepcopy(dict(info, source='offline_tuning'))
     from .compact_policy import select as select_compact
     selected, info["compact"] = select_compact(shape, selected, overrides, contract, counts)
-    return selected, deepcopy(info)
+    return _apply_knobs(selected, overrides), deepcopy(info)
 
 
 def explain_selection(

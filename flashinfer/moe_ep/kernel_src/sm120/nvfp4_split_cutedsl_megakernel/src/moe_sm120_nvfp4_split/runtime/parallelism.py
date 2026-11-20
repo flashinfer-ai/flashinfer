@@ -236,9 +236,10 @@ def init_parallel_context(
     )
 
 
-def init_nccl_memory(context: ParallelContext, arena_bytes: int) -> ParallelContext:
+def init_nccl_memory(context: ParallelContext, arena_bytes: int, shadow=None,
+                     reserved_bytes: int = 0) -> ParallelContext:
     from ..transport import gin_bridge
-    gin_bridge.initialize(context, arena_bytes)
+    gin_bridge.initialize(context, arena_bytes, shadow=shadow, reserved_bytes=reserved_bytes)
     return context
 
 __all__ = ['ParallelContext', 'init_nccl_memory', 'init_parallel_context']

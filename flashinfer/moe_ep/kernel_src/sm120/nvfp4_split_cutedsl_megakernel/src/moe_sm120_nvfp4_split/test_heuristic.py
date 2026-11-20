@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from . import tuned_table
 from .heuristic import (
     MegaMoEHeuristicInput, MegaMoEHeuristicOverrides, derive_features,
     enumerate_candidates, explain_selection, legality_errors, semantic_errors,
@@ -28,10 +29,13 @@ def shape(tokens=8192, **updates):
 
 
 @pytest.mark.parametrize('case', CASES, ids=lambda c: c['name'])
-def test_selected_configuration_matches_measured_fixture(case):
+def test_selected_configuration_matches_measured_fixture(case, monkeypatch):
+    # The fixtures record the built-in selector; the measured anchor table is tested separately.
+    monkeypatch.setattr(tuned_table, '_load', lambda: dict(schema=1, tables=[]))
     s = MegaMoEHeuristicInput(**case['shape'])
     c = select_megamoe_config(s, MegaMoEHeuristicOverrides(k1_compact_tokens=False, k2_compact_tokens=False), numerical_contract='owner_bf16')
-    assert json.loads(json.dumps(asdict(c))) == dict(case['config'], k1_compact_tokens=False, k2_compact_tokens=False)
+    from moe_sm120_nvfp4_split.heuristic import policy_asdict
+    assert json.loads(json.dumps(policy_asdict(c))) == dict(case['config'], k1_compact_tokens=False, k2_compact_tokens=False)
     assert not legality_errors(s, c)
     assert not semantic_errors(c, 'owner_bf16')
 

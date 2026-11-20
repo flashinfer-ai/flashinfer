@@ -11,6 +11,7 @@ def select_utility(shape, config, contract, *, eligible=True):
             or config.k1_compact_tokens):
         return False
     # JSON-normalize tuples once for comparison with immutable evidence records.
+    from .heuristic import policy_asdict
     import json
-    key = json.loads(json.dumps(dict(shape=asdict(shape), config=asdict(config), contract=contract)))
+    key = json.loads(json.dumps(dict(shape=asdict(shape), config=policy_asdict(config), contract=contract)))
     return any(key == profile["key"] for profile in PROFILES)

@@ -331,6 +331,11 @@ def select_compile_spec(
         host_expert_counts, eligible=is_calibrated_execution(build=build, jit=resolved_jit),
         clamp=problem.gate_up_clamp, tuning=tuning_config,
     )
+    if resolved_jit.fc1_utility_postprocess is None and numerical_contract is not None:
+        from .tuned_table import utility_for
+        tabulated = utility_for(heuristic_input)
+        if tabulated is not None:
+            resolved_jit = replace(resolved_jit, fc1_utility_postprocess=tabulated)
     if resolved_jit.fc1_utility_postprocess is None:
         from .utility_policy import select_utility
         enabled = select_utility(
@@ -366,11 +371,12 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     config = spec.kernel
     options = spec.build
     cluster_size = 1
-    k1_clusters = options.k1_active_clusters or config.k1_sms // cluster_size
+    # Physical K1 SMs times the residency (two CTAs per SM with dual K1).
+    k1_clusters = (options.k1_active_clusters or config.k1_sms // cluster_size) * config.k1_ctas_per_sm
     k2_clusters = options.k2_active_clusters or config.k2_sms // cluster_size
     dual_n16 = config.k2_warps == 12 and config.k2_tile[1] == 16
     k2_ctas_per_sm = 2 if dual_n16 else 1
-    k2_launch_clusters = k2_clusters * k2_ctas_per_sm
+    k2_launch_clusters = k2_clusters * k2_ctas_per_sm * config.k2_launch_factor
     k1_group_hint = options.group_hint or k1_clusters
     k2_group_hint = options.group_hint or k2_launch_clusters
 
@@ -445,6 +451,15 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         **common_kwargs,
     )
     k1.compact_token_rows = config.k1_compact_tokens
+    if config.k1_ctas_per_sm == 2:
+        # Dual residency: natural register allocation so two CTAs fit per SM;
+        # at most two pipeline stages unless k1_stages is explicit.
+        k1.occupancy = 2
+        k1.use_warpgroup_reg_realloc = False
+        # The requested depth becomes a cap: at two CTAs/SM larger K1 tiles
+        # may fit fewer stages than the single-residency selection assumed.
+        k1.num_ab_stages_soft_cap = config.k1_stages or 2
+        k1.num_ab_stages_override = None
     k2_load_balance = (
         "atomic_counter" if config.k2_tail_reclaim else "static"
     )

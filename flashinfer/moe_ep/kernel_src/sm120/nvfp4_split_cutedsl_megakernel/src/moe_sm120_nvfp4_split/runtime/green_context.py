@@ -367,6 +367,8 @@ class NativeGreenContextGraph:
     _post_graph_k3: Optional[Callable[[], None]]
     _post_graph_finalizer: Optional[Callable[[], None]] = None
     _closed: bool = False
+    # p2p_split cross-NUMA transport (transport.xnuma.XnumaTransport) or None.
+    _xnuma: Optional[Any] = None
 
     @staticmethod
     def _library_kernels(compiled_kernels: tuple[Any, ...]) -> dict[int, Any]:
@@ -461,6 +463,7 @@ class NativeGreenContextGraph:
             NativeGreenContextResources | NativeGreenContextPair
         ] = None,
         device: Optional[int] = None,
+        xnuma: Optional[Any] = None,
     ) -> "NativeGreenContextGraph":
         """Rebind K1/K2 to Green Contexts; join K3 on the root stream."""
         from cuda.bindings import driver as cuda
@@ -494,6 +497,12 @@ class NativeGreenContextGraph:
             k1_stream.wait_event(capture_ready)
             k2_stream.wait_event(capture_ready)
             launch_k1()
+            forwarder_done = None
+            if xnuma is not None:
+                # Forked once K1 retired: K1's SMs are free and K2 is fully
+                # resident, so the polling forwarder never blocks persistent
+                # residency. K1-stream completion includes it.
+                forwarder_done = xnuma.launch_forwarder_after(k1_stream)
             serialize_k2 = os.environ.get("MEGA_DIAG_SERIALIZE_K2", "0") == "1"
             if serialize_k2 and launch_k2_drain is not None:
                 raise RuntimeError(
@@ -509,6 +518,8 @@ class NativeGreenContextGraph:
                 # releases that Green partition and then joins the main K2
                 # worker grid through the shared atomic queue.
                 launch_k2_drain()
+            if forwarder_done is not None:
+                k1_stream.wait_event(forwarder_done)
             if not serialize_k2:
                 k1_done.record(k1_stream)
             k2_done.record(k2_stream)
@@ -737,12 +748,16 @@ class NativeGreenContextGraph:
             _compiled_kernels=compiled_kernels,
             _post_graph_k3=launch_k3,
             _post_graph_finalizer=launch_k2_finalizer,
+            _xnuma=xnuma,
         )
 
     def _launch_post_graph(self) -> None:
         # Callbacks use the current stream for both eager and outer capture.
         if self._post_graph_finalizer is not None:
             self._post_graph_finalizer()
+        if self._xnuma is not None:
+            # p2p_split: copy the returned cross-NUMA rows before K3 reads them.
+            self._xnuma.before_k3(torch.cuda.current_stream())
         if self._post_graph_k3 is not None:
             self._post_graph_k3()
 
@@ -752,6 +767,10 @@ class NativeGreenContextGraph:
 
         caller_cuda = cuda.CUstream(caller_stream.cuda_stream)
         if torch.cuda.is_current_stream_capturing():
+            if self._xnuma is not None:
+                # Epoch bump + sender precede the child graph in capture order;
+                # the capture info below then includes them as dependencies.
+                self._xnuma.before_compute(caller_stream)
             (
                 capture_status,
                 _capture_id,
@@ -799,6 +818,9 @@ class NativeGreenContextGraph:
 
         self._launch_ready.record(caller_stream)
         self.root_stream.wait_event(self._launch_ready)
+        if self._xnuma is not None:
+            # Epoch bump + sender in stream order before the compute graph.
+            self._xnuma.before_compute(self.root_stream)
         _check_cuda(
             cuda.cuGraphLaunch(
                 self._graph_exec,
@@ -832,4 +854,5 @@ class NativeGreenContextGraph:
         self._closed = True
         self._post_graph_k3 = None
         self._post_graph_finalizer = None
+        self._xnuma = None
         self._compiled_kernels = ()

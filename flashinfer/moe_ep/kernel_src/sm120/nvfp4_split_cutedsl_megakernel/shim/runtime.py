@@ -25,6 +25,82 @@ from .weights import SCALE_DTYPE, TransformedWeights, ceil_div, round_up
 
 DECODE_GRAPH_COMPILE_BUCKETS = (7, 16, 32, 64, 128, 168, 256, 320, 384)
 _WARNED_DECODE_CAPACITY_FALLBACKS: set[int] = set()
+# Largest compile bucket that may run the p2p_split EP8 backend. Its xnuma
+# return buffers need about 2*n_cross*2*T*topk*(2*hidden+16) bytes per rank
+# (DSV4.1-Flash: ~0.38 GB at T=384, ~4 GB at T=4096), so only the decode
+# buckets qualify by default.
+P2P_SPLIT_MAX_TOKENS_ENV = "FLASHINFER_MEGAMOE_P2P_SPLIT_MAX_TOKENS"
+
+
+def plan_p2p_split_buckets(config, topology, buckets) -> set[int]:
+    """Compile buckets that run p2p_split on an EP spanning NUMA nodes.
+
+    Same-NUMA peers keep direct P2P; every cross-NUMA peer is served through
+    a local shadow segment kept in sync over GIN (``transport.xnuma``). With
+    no explicit ``comm_backend`` knob a bucket follows the measured anchor
+    table (or its rule for untabulated shapes); ``"p2p_split"`` selects it for
+    every eligible bucket and ``"gin"`` disables it. Buckets above
+    ``FLASHINFER_MEGAMOE_P2P_SPLIT_MAX_TOKENS`` (default: the largest decode
+    bucket) always use gin.
+    """
+    if _no_dist() or not getattr(topology, "cross_numa_peer_count", 0):
+        return set()
+    requested = (config.knobs or {}).get("comm_backend")
+    if requested == "gin":
+        return set()
+    from moe_sm120_nvfp4_split.heuristic import MegaMoEHeuristicInput
+    from moe_sm120_nvfp4_split.runtime.green_context import query_sm_resource_info
+    from moe_sm120_nvfp4_split.transport.shadow import ShadowLayout
+    from moe_sm120_nvfp4_split.tuned_table import (
+        SPLIT_MAX_EXPERTS_PER_RANK,
+        preferred_ep8_backend,
+    )
+
+    if config.local_experts > SPLIT_MAX_EXPERTS_PER_RANK:
+        return set()
+    try:
+        ShadowLayout.from_topology(topology, config.rank)
+    except (AttributeError, ValueError):
+        return set()
+    limit = int(
+        os.environ.get(P2P_SPLIT_MAX_TOKENS_ENV, str(DECODE_GRAPH_COMPILE_BUCKETS[-1]))
+    )
+    num_sms, minimum, alignment = query_sm_resource_info()
+    chosen = set()
+    for bucket in buckets:
+        if bucket > limit:
+            continue
+        if requested == "p2p_split":
+            chosen.add(bucket)
+            continue
+        shape = MegaMoEHeuristicInput(
+            tokens_per_rank=bucket,
+            hidden=config.hidden,
+            intermediate=2 * config.intermediate,
+            num_topk=config.num_topk,
+            num_total_experts=config.num_total_experts,
+            data_parallel_size=config.data_parallel_size,
+            tensor_parallel_size=config.tensor_parallel_size,
+            expert_parallel_size=config.world_size,
+            ep_same_numa_peer_count=topology.same_numa_peer_count,
+            ep_cross_numa_peer_count=topology.cross_numa_peer_count,
+            num_sms=num_sms,
+            sm_min_partition=minimum,
+            sm_partition_alignment=alignment,
+        )
+        if preferred_ep8_backend(shape) == "p2p_split":
+            chosen.add(bucket)
+    return chosen
+
+
+def _p2p_split_plan_supported(spec, bundle) -> bool:
+    from moe_sm120_nvfp4_split.kernel_fc2_combine import Sm120Fc2CombineKernel
+
+    return (
+        spec.kernel.comm_backend == "p2p_direct"
+        and not spec.kernel.rank_local_combine
+        and type(bundle.k2) is Sm120Fc2CombineKernel
+    )
 
 
 def select_graph_compile_bucket(
@@ -143,6 +219,7 @@ class _ExecutionStorage:
     rank_combine_ready: torch.Tensor | None = None
     green_trace: torch.Tensor | None = None
     network: Any = None
+    xnuma: Any = None
 
 
 @dataclass
@@ -156,6 +233,7 @@ class _ExecutionBuffers:
     rank_combine_ready: torch.Tensor | None = None
     green_trace: torch.Tensor | None = None
     network: Any = None
+    xnuma: Any = None
 
 
 @dataclass
@@ -202,6 +280,15 @@ class MegaMoESm120Nvfp4Workspace:
     _capture_streams: Any = None
     _transport_streams: dict[str, Any] = field(default_factory=dict)
     _staged_tokens: int = 0
+    # p2p_split: bucket -> "p2p_split", the preallocated (combine_output,
+    # shared_workspace) inside the shadowed prefix, and the shared xnuma
+    # control-region layout and device epoch.
+    _bucket_backends: dict[int, str] = field(default_factory=dict)
+    _split_buffers: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
+    _xnuma_region: Any = None
+    _xnuma_epoch: Any = None
     _destroyed: bool = False
 
     def _has_prepared_frontend(self, transformed_weights, output: torch.Tensor) -> bool:
@@ -304,7 +391,11 @@ class MegaMoESm120Nvfp4Frontend:
         if dist.is_available() and dist.is_initialized():
             dist.barrier(group=self.control_group)
 
-    def _heuristic_overrides(self):
+    def _is_p2p_split(self, bucket: int) -> bool:
+        backends = getattr(self.workspace, "_bucket_backends", None) or {}
+        return backends.get(bucket) == "p2p_split"
+
+    def _heuristic_overrides(self, *, p2p_split: bool = False):
         from moe_sm120_nvfp4_split.heuristic import MegaMoEHeuristicOverrides
 
         fields = {field.name for field in dataclasses.fields(MegaMoEHeuristicOverrides)}
@@ -312,13 +403,19 @@ class MegaMoESm120Nvfp4Frontend:
         unknown = sorted(set(values) - fields)
         if unknown:
             raise ValueError(f"unknown SM120 NVFP4 tuning knobs: {unknown}")
-        backend = (
-            "gin" if self.workspace._topology.cross_numa_peer_count else "p2p_direct"
-        )
-        if values.get("comm_backend", backend) != backend:
+        cross = self.workspace._topology.cross_numa_peer_count
+        backend = "gin" if cross else "p2p_direct"
+        allowed = {backend, "p2p_split"} if cross else {backend}
+        if values.get("comm_backend", backend) not in allowed:
             raise ValueError(
                 "Communication override conflicts with discovered EP topology"
             )
+        if p2p_split:
+            # Kernels see one P2P group; cross-NUMA peers are shadowed.
+            if values.get("rank_local_combine"):
+                raise ValueError("p2p_split requires rank_local_combine off")
+            values["rank_local_combine"] = False
+            backend = "p2p_direct"
         values["comm_backend"] = backend
         return MegaMoEHeuristicOverrides(**values)
 
@@ -358,13 +455,19 @@ class MegaMoESm120Nvfp4Frontend:
         )
         # The native policy calls local P2P + cross-NUMA GIN gin_hybrid;
         # FlashInfer's topology-owned transport calls the same mode gin.
-        overrides = self._heuristic_overrides()
+        p2p_split = self._is_p2p_split(tokens_per_rank)
+        overrides = self._heuristic_overrides(p2p_split=p2p_split)
         if overrides.comm_backend == "gin":
             overrides = dataclasses.replace(overrides, comm_backend="gin_hybrid")
+        same_numa = self.workspace._topology.same_numa_peer_count
+        cross_numa = self.workspace._topology.cross_numa_peer_count
+        if p2p_split:
+            # Same folded view as the native runner: one P2P group.
+            same_numa, cross_numa = same_numa + cross_numa, 0
         spec = select_compile_spec(
             problem=problem,
-            ep_same_numa_peer_count=self.workspace._topology.same_numa_peer_count,
-            ep_cross_numa_peer_count=self.workspace._topology.cross_numa_peer_count,
+            ep_same_numa_peer_count=same_numa,
+            ep_cross_numa_peer_count=cross_numa,
             num_sms=num_sms,
             sm_min_partition=minimum,
             sm_partition_alignment=alignment,
@@ -518,12 +621,80 @@ class MegaMoESm120Nvfp4Frontend:
                 f"rank_cache={kernel.dispatch_rank_cache} "
                 f"rank_combine={kernel.rank_local_combine} "
                 f"dispatch_warps={kernel.dispatch_warps} "
+                f"k1_ctas_per_sm={kernel.k1_ctas_per_sm} "
+                f"k2_launch_factor={kernel.k2_launch_factor} "
+                f"backend={'p2p_split' if self._is_p2p_split(bucket) else kernel.comm_backend} "
                 f"green={kernel.k1_sms}/{kernel.k2_sms}",
                 flush=True,
             )
-        plan = (spec, build_split_kernels(spec))
+        bundle = build_split_kernels(spec)
+        if self._is_p2p_split(bucket):
+            # Peer-store barriers wait only for same-NUMA ranks; cross-NUMA
+            # sources are delivered by the xnuma transport.
+            same_numa_mask = ((1 << self.config.world_size) - 1) & ~int(
+                self.workspace._topology.force_ibgda_peer_mask
+            )
+            for kernel in (
+                bundle.k1,
+                bundle.k2,
+                getattr(bundle, "k2_drain", None),
+                getattr(bundle, "k2_finalizer", None),
+            ):
+                if (
+                    kernel is not None
+                    and getattr(kernel, "token_comm", None) is not None
+                ):
+                    kernel.token_comm.barrier_peer_mask = same_numa_mask
+        plan = (spec, bundle)
         self.workspace._execution_plans[bucket] = plan
         return plan
+
+    def _create_xnuma(self, bundle, combine_output):
+        from types import SimpleNamespace
+
+        from moe_sm120_nvfp4_split.transport.xnuma import XnumaTransport
+        from moe_sm120_nvfp4_split.transport.xnuma_layout import XnumaLayout
+
+        workspace, cfg, bucket = self.workspace, self.config, self.compile_bucket
+        region = workspace._xnuma_region
+        layout = XnumaLayout(
+            world=cfg.world_size,
+            n_cross=region.n_cross,
+            experts_per_rank=cfg.local_experts,
+            tokens_per_rank=bucket,
+            topk=cfg.num_topk,
+            hidden=cfg.hidden,
+        )
+        inputs = (
+            workspace.x[:bucket],
+            workspace.x_scale[:bucket],
+            workspace.topk_ids[:bucket],
+            workspace.topk_weights[:bucket],
+        )
+        view = SimpleNamespace(
+            rank=cfg.rank,
+            _kernel_k2=bundle.k2,
+            my_activation=inputs[0],
+            my_activation_sf=inputs[1],
+            my_topk_idx=inputs[2],
+            my_topk_weights=inputs[3],
+            combine_output=combine_output,
+        )
+        transport = XnumaTransport(
+            view,
+            workspace._comm_session,
+            layout,
+            region=region,
+            epoch=workspace._xnuma_epoch,
+            input_regions=inputs,
+            zero_reserved=False,
+        )
+        # Compile-time hooks; set before K1/K2 are compiled for this bucket.
+        bundle.k1.token_comm.xnuma = transport.k1_config()
+        for kernel in (bundle.k2, getattr(bundle, "k2_drain", None)):
+            if kernel is not None:
+                kernel.xnuma_progress_addr = transport.k2_progress_addr
+        return transport
 
     def _ensure_execution(self) -> _ExecutionBuffers:
         execution = self.workspace._executions.get(self.compile_bucket)
@@ -537,14 +708,29 @@ class MegaMoESm120Nvfp4Frontend:
             # NCCL workspace allocation is not ordered on every peer caller
             # stream. Drain in-flight peer-dependent graphs before entering it.
             torch.cuda.synchronize()
-            combine_output, root = sym_byte_view(
-                (self.compile_bucket, self.config.num_topk, self.config.hidden),
-                torch.bfloat16,
-                session=self.workspace._comm_session,
-            )
-            self.workspace._sym_roots.append(root)
+            p2p_split = self._is_p2p_split(self.compile_bucket)
+            if p2p_split:
+                # Preallocated inside the shadowed arena prefix.
+                combine_output, split_shared = self.workspace._split_buffers[
+                    self.compile_bucket
+                ]
+            else:
+                combine_output, root = sym_byte_view(
+                    (self.compile_bucket, self.config.num_topk, self.config.hidden),
+                    torch.bfloat16,
+                    session=self.workspace._comm_session,
+                )
+                self.workspace._sym_roots.append(root)
             network = None
-            if spec.kernel.comm_backend == "gin":
+            xnuma = None
+            if p2p_split:
+                local_workspace = torch.zeros(
+                    (bundle.local_workspace_bytes,), dtype=torch.uint8, device="cuda"
+                )
+                shared_workspace = split_shared
+                rank_combine_ready = None
+                xnuma = self._create_xnuma(bundle, combine_output)
+            elif spec.kernel.comm_backend == "gin":
                 from .network_runtime import create_network_runtime
 
                 network = create_network_runtime(
@@ -605,6 +791,7 @@ class MegaMoESm120Nvfp4Frontend:
                 rank_combine_ready=rank_combine_ready,
                 green_trace=green_trace,
                 network=network,
+                xnuma=xnuma,
             )
             self.workspace._storages[self.compile_bucket] = storage
         execution = _ExecutionBuffers(
@@ -617,6 +804,7 @@ class MegaMoESm120Nvfp4Frontend:
             rank_combine_ready=storage.rank_combine_ready,
             green_trace=storage.green_trace,
             network=storage.network,
+            xnuma=storage.xnuma,
         )
         self.workspace._executions[self.compile_bucket] = execution
         return execution
@@ -671,11 +859,17 @@ class MegaMoESm120Nvfp4Frontend:
         )
         runtime_k1 = dict(base_runtime, stream=k1_cuda)
         runtime_k2 = dict(base_runtime, stream=k2_cuda)
-        compile_k1 = dict(runtime_k1, max_active_clusters=spec.kernel.k1_sms)
+        # Residency knobs multiply the launch grids on unchanged physical
+        # Green partitions (k1_ctas_per_sm: two K1 CTAs per K1 SM;
+        # k2_launch_factor: two 8-warp K2 CTAs per K2 SM).
+        k1_launch_clusters = spec.kernel.k1_sms * spec.kernel.k1_ctas_per_sm
+        compile_k1 = dict(runtime_k1, max_active_clusters=k1_launch_clusters)
         k2_ctas_per_sm = (
             2 if (spec.kernel.k2_warps == 12 and spec.kernel.k2_tile[1] == 16) else 1
         )
-        k2_launch_clusters = spec.kernel.k2_sms * k2_ctas_per_sm
+        k2_launch_clusters = (
+            spec.kernel.k2_sms * k2_ctas_per_sm * spec.kernel.k2_launch_factor
+        )
         compile_k2 = dict(
             runtime_k2,
             max_active_clusters=k2_launch_clusters,
@@ -749,18 +943,24 @@ class MegaMoESm120Nvfp4Frontend:
                 stream=root_cuda,
             )
         else:
+            # Unrouted (negative) slots of a valid token have no K2 row in
+            # combine_output; K3 must skip them rather than read stale rows.
             k3_plan = compile_combine_reduce(
                 combine_bucket,
                 output_bucket,
                 None,
+                topk_idx=inputs.topk_ids,
                 stream=root_cuda,
             )
-            compiled_k3, combine_cute, output_cute, score_cute, k3_stream = k3_plan
+            compiled_k3, combine_cute, output_cute, score_cute, k3_stream, idx_cute = (
+                k3_plan
+            )
             runtime_k3 = dict(
                 combine_cute=combine_cute,
                 reduced_cute=output_cute,
                 topk_score_cute=score_cute,
                 stream=k3_stream,
+                topk_idx_cute=idx_cute,
             )
 
         k1_executor = compiled_k1.to(None)
@@ -780,6 +980,7 @@ class MegaMoESm120Nvfp4Frontend:
         if network is not None:
             transport_kernels += (network._transport.compiled_dispatch_route_builder,)
         graph = NativeGreenContextGraph.capture(
+            xnuma=execution.xnuma,
             green_resources=green_resources,
             root_stream=root_stream,
             k1_stream=k1_stream,
@@ -837,7 +1038,7 @@ class MegaMoESm120Nvfp4Frontend:
                 )
             ),
             k1_sm_count=spec.kernel.k1_sms,
-            k1_grid_clusters=spec.kernel.k1_sms,
+            k1_grid_clusters=k1_launch_clusters,
             k2_grid_clusters=k2_launch_clusters,
             k2_drain_grid_clusters=(
                 k2_drain_launch_clusters if k2_drain_launch_clusters > 0 else None
@@ -955,9 +1156,6 @@ def allocate_workspace(
             ep_rank=config.rank,
             ep_control_group=control_group,
         )
-    planned = SimpleNamespace(
-        config=config, _execution_plans={}, _topology=topology, _green_resources={}
-    )
     buckets = sorted(
         {
             config.max_tokens_per_rank,
@@ -968,6 +1166,14 @@ def allocate_workspace(
             ),
         }
     )
+    split_buckets = plan_p2p_split_buckets(config, topology, buckets)
+    planned = SimpleNamespace(
+        config=config,
+        _execution_plans={},
+        _topology=topology,
+        _green_resources={},
+        _bucket_backends={bucket: "p2p_split" for bucket in split_buckets},
+    )
     size = config.max_tokens_per_rank
     scale_columns = round_up(ceil_div(config.hidden, 16), 4)
     sizes = [
@@ -977,18 +1183,56 @@ def allocate_workspace(
         size * config.num_topk * 4,
         size * config.hidden * 2,
     ]
+    split_shared_bytes = {}
     for bucket in buckets:
         frontend = MegaMoESm120Nvfp4Frontend(
             planned, compile_bucket=bucket, control_group=control_group
         )
         spec, bundle = frontend._ensure_plan(bucket)
+        if bucket in split_buckets and not _p2p_split_plan_supported(spec, bundle):
+            # The xnuma forwarder needs the 8-warp K2 and per-slot combine.
+            split_buckets.discard(bucket)
+            del planned._bucket_backends[bucket]
+            del planned._execution_plans[bucket]
+            spec, bundle = frontend._ensure_plan(bucket)
+        if bucket in split_buckets:
+            split_shared_bytes[bucket] = bundle.shared_workspace_bytes
         sizes += [
             bundle.shared_workspace_bytes,
             bucket * config.num_topk * config.hidden * 2,
         ]
         if spec.kernel.rank_local_combine:
             sizes.append((bucket + 1) * config.world_size * 4)
-    capacity = sum((n + 4095) // 4096 * 4096 for n in sizes)
+
+    def page(n):
+        return (n + 4095) // 4096 * 4096
+
+    capacity = sum(page(n) for n in sizes)
+    shadow = region = None
+    shadow_bytes = reserved_bytes = 0
+    if split_buckets:
+        from moe_sm120_nvfp4_split.transport.shadow import ShadowLayout
+        from moe_sm120_nvfp4_split.transport.xnuma_layout import XnumaLayout
+
+        shadow = ShadowLayout.from_topology(topology, config.rank)
+        # One control-region placement for every p2p_split bucket: commit
+        # words are cumulative signal-adds keyed by address.
+        region = XnumaLayout(
+            world=config.world_size,
+            n_cross=shadow.num_cross,
+            experts_per_rank=config.local_experts,
+            tokens_per_rank=max(split_buckets),
+            topk=config.num_topk,
+            hidden=config.hidden,
+        )
+        reserved_bytes = region.reserved_bytes
+        # Shadows cover the inputs and output, then each p2p_split bucket's
+        # combine output and shared workspace, allocated first below.
+        shadow_bytes = sum(page(n) for n in sizes[:5]) + sum(
+            page(bucket * config.num_topk * config.hidden * 2)
+            + page(split_shared_bytes[bucket])
+            for bucket in sorted(split_buckets)
+        )
     session = (
         None
         if _no_dist()
@@ -998,6 +1242,9 @@ def allocate_workspace(
             capacity,
             control_group,
             network_peer_mask=topology.force_ibgda_peer_mask,
+            shadow=shadow,
+            shadow_bytes=shadow_bytes,
+            reserved_bytes=reserved_bytes,
         )
     )
     roots: list[torch.Tensor] = []
@@ -1025,6 +1272,19 @@ def allocate_workspace(
         (config.max_tokens_per_rank, config.hidden), torch.bfloat16, session=session
     )
     roots.append(root)
+    split_buffers = {}
+    for bucket in sorted(split_buckets):
+        combine_output, root = sym_byte_view(
+            (bucket, config.num_topk, config.hidden), torch.bfloat16, session=session
+        )
+        roots.append(root)
+        shared_workspace = sym_zeros(
+            (split_shared_bytes[bucket],), torch.uint8, session=session
+        )
+        roots.append(shared_workspace)
+        split_buffers[bucket] = (combine_output, shared_workspace)
+    if split_buckets and session.cursor > session.shadow_limit:
+        raise RuntimeError("p2p_split buffers exceed the shadowed arena prefix")
     epilogue_args = tuple(
         torch.ones((config.local_experts,), dtype=torch.float32, device="cuda")
         for _ in range(3)
@@ -1046,6 +1306,14 @@ def allocate_workspace(
         _topology=topology,
         _control_group=control_group,
         _compile_bucket=config.max_tokens_per_rank,
+        _bucket_backends=planned._bucket_backends,
+        _split_buffers=split_buffers,
+        _xnuma_region=region,
+        _xnuma_epoch=(
+            torch.zeros((1,), dtype=torch.int64, device="cuda")
+            if split_buckets
+            else None
+        ),
     )
     return workspace
 

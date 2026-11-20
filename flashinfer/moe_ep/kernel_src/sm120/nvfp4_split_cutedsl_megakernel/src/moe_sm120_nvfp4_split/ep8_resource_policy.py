@@ -109,7 +109,8 @@ def select_ep8_resources(shape, anchor, overrides, contract, host_expert_counts=
     model = {(6,256): 'dsv', (8,288): 'glm'}.get((shape.num_topk,shape.num_total_experts))
     if model is None:
         return anchor
-    values=asdict(anchor)
+    from .heuristic import policy_asdict
+    values=policy_asdict(anchor)
     # JSON anchor records encode tuples as lists. Normalize only tile containers;
     # backend names and all resource/transport fields stay exact.
     values['k1_tile']=list(values['k1_tile'])

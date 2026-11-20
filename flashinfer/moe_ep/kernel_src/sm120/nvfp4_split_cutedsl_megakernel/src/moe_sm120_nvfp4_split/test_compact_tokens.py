@@ -14,12 +14,12 @@ def fixture():
 def test_cache_separates_both_specializations():
  shape,cfg=fixture();problem=MegaMoEProblemSpec(tokens_per_rank=512,num_topk=8,num_total_experts=288,hidden=4096,intermediate=4096,expert_parallel_size=4,expert_parallel_rank=0)
  specs=[MegaMoECompileSpec(problem,replace(cfg,k1_compact_tokens=a,k2_compact_tokens=b)) for a,b in [(False,False),(True,False),(True,True),(False,True)]]
- assert KERNEL_CACHE_ABI==2814
+ assert KERNEL_CACHE_ABI==2814542011115  # FlashInfer delivery ABI (standalone 281454201)
  assert len({s.cache_key for s in specs})==4
  assert len({s.canonical_dict()['kernel']['k1_tile'] for s in specs})==1
 
 def test_policy_requires_exact_shape_contract_and_baseline(monkeypatch):
- shape,cfg=fixture();record=dict(shape=json.loads(json.dumps(asdict(shape))),contract='owner_bf16',baseline_config=json.loads(json.dumps(asdict(cfg))),flags=dict(k1_compact_tokens=True,k2_compact_tokens=True),evidence='unit')
+ shape,cfg=fixture();record=dict(shape=json.loads(json.dumps(asdict(shape))),contract='owner_bf16',baseline_config=json.loads(json.dumps(__import__('moe_sm120_nvfp4_split.heuristic',fromlist=['x']).policy_asdict(cfg))),flags=dict(k1_compact_tokens=True,k2_compact_tokens=True),evidence='unit')
  monkeypatch.setattr(policy,'PROFILES',[record]);selected,info=policy.select(shape,cfg,None,'owner_bf16')
  assert info['matched'] and selected.k1_compact_tokens and selected.k2_compact_tokens
  for s,c,contract,override,counts in [(replace(shape,tokens_per_rank=513),cfg,'owner_bf16',None,None),(shape,replace(cfg,k2_stages=2),'owner_bf16',None,None),(shape,cfg,'ordinary_topk',None,None),(shape,cfg,'owner_bf16',MegaMoEHeuristicOverrides(k1_compact_tokens=False),None),(shape,cfg,'owner_bf16',None,(0,))]:

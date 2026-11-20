@@ -23,7 +23,7 @@ def profile(a,c):
         expert_parallel_size=p.expert_parallel_size,ep_same_numa_peer_count=a['ep_same_numa_peer_count'],
         ep_cross_numa_peer_count=a['ep_cross_numa_peer_count'],num_sms=a['num_sms'],
         sm_min_partition=a['sm_min_partition'],sm_partition_alignment=a['sm_partition_alignment'])
-    return {'key':json.loads(json.dumps(dict(shape=asdict(shape),config=asdict(c),contract=a['numerical_contract'])))}
+    return {'key':json.loads(json.dumps(dict(shape=asdict(shape),config=__import__('moe_sm120_nvfp4_split.heuristic',fromlist=['x']).policy_asdict(c),contract=a['numerical_contract'])))}
 
 @pytest.fixture
 def qualified(monkeypatch):

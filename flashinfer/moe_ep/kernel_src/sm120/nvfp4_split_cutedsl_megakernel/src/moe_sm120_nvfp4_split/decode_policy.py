@@ -2428,7 +2428,8 @@ CACHE_RULES = ({'model': 'dsv',
 
 
 def _config_key(config):
-    values = asdict(config)
+    from .heuristic import policy_asdict
+    values = policy_asdict(config)
     values.pop('expected_rows_per_expert')
     values['k1_tile'] = tuple(values['k1_tile'])
     values['k2_tile'] = tuple(values['k2_tile'])

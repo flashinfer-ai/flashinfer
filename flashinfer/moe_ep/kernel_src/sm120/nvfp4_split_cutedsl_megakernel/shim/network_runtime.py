@@ -143,7 +143,7 @@ def create_network_runtime(workspace, bucket, spec, bundle, combine_output):
     runtime._kernel, runtime._kernel_k2 = bundle.k1, bundle.k2
     runtime._kernel_k2_finalizer = bundle.k2_finalizer
     runtime._transport = HybridTransportState.from_config(spec.kernel)
-    runtime._transport.k1_sm_count = spec.kernel.k1_sms
+    runtime._transport.k1_sm_count = spec.kernel.k1_sms * spec.kernel.k1_ctas_per_sm
     runtime.my_activation = workspace.x[:bucket].view(torch.uint8)
     runtime.my_activation_sf = workspace.x_scale[:bucket]
     runtime.my_topk_idx = workspace.topk_ids[:bucket]

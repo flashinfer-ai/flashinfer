@@ -9,12 +9,17 @@ SIDE='none'
 STATE=0;HANDLE=None;HOST=None;POOL=None;ARENA=None;CURSOR=0;CONTEXT=None
 OFFSETS=();BUFFERS=[];ALLOCATOR=None
 NET_ARENA=None;NET_CURSOR=0;NET_EXPECTED=[];NET_INDEX=0
+# p2p_split shadow segments: segment 0 = own buffers [0, LIMIT) + reserved
+# control region [LIMIT, SEGMENT0); segment k >= 1 mirrors the k-th
+# cross-NUMA peer's segment 0 buffers (SEGMENT bytes each).
+SHADOW=None;LIMIT=0;SEGMENT0=0;SEGMENT=0;RESERVED_BYTES=0
+_ALIGN=2*1024**2
 
 def check(rc):
  if rc: raise RuntimeError(HOST.eq_error().decode())
 
-def initialize(context, arena_bytes):
- global STATE,HANDLE,HOST,POOL,ARENA,CONTEXT,OFFSETS,SIDE,ALLOCATOR
+def initialize(context, arena_bytes, shadow=None, reserved_bytes=0):
+ global STATE,HANDLE,HOST,POOL,ARENA,CONTEXT,OFFSETS,SIDE,ALLOCATOR,SHADOW,LIMIT,SEGMENT0,SEGMENT,RESERVED_BYTES
  if CONTEXT is not None:raise RuntimeError('One NCCL memory session per process')
  CONTEXT=context;network=context.ep_transport_topology.cross_numa_peer_count>0
  SIDE='both' if network else 'none'
@@ -37,7 +42,14 @@ def initialize(context, arena_bytes):
  POOL=torch.cuda.MemPool(ALLOCATOR.allocator())
  capacity=int(os.environ.get('MEGAMOE_SYMMETRIC_BYTES',str(arena_bytes)))
  if capacity<arena_bytes:raise ValueError('MEGAMOE_SYMMETRIC_BYTES is smaller than required P2P storage')
- with torch.cuda.use_mem_pool(POOL):ARENA=torch.empty((capacity,),dtype=torch.uint8,device='cuda')
+ capacity=(capacity+_ALIGN-1)//_ALIGN*_ALIGN
+ LIMIT=capacity;SEGMENT0=capacity;SEGMENT=capacity;RESERVED_BYTES=0;total=capacity
+ if shadow is not None:
+  if not network:raise ValueError('shadow segments need the GIN network session')
+  if shadow.world!=world or shadow.rank!=rank:raise ValueError('shadow layout does not match the EP world')
+  SHADOW=shadow;SEGMENT0=(capacity+int(reserved_bytes)+_ALIGN-1)//_ALIGN*_ALIGN
+  RESERVED_BYTES=SEGMENT0-capacity;total=SEGMENT0+capacity*shadow.num_cross
+ with torch.cuda.use_mem_pool(POOL):ARENA=torch.empty((total,),dtype=torch.uint8,device='cuda')
  assert ARENA.data_ptr()%4096==0
  check(HOST.eq_register(HANDLE,ARENA.data_ptr(),ARENA.numel()))
  peers=[]
@@ -46,6 +58,9 @@ def initialize(context, arena_bytes):
   if not address.value and not (context.ep_transport_topology.force_ibgda_peer_mask & (1<<peer)):
    raise RuntimeError(f'Required local P2P peer {peer} is not LSA accessible')
   peers.append(address.value-ARENA.data_ptr() if address.value else 0)
+ if SHADOW is not None:
+  # Cross-NUMA peers resolve to this rank's local shadow segment of that peer.
+  for peer,segment in SHADOW.local_segments().items():peers[peer]=segment_offset(segment)
  OFFSETS=tuple(peers)
  (out/f'nccl_memory_rank{rank}.json').write_text(json.dumps(dict(info=list(info),capacity=capacity,base=ARENA.data_ptr(),peer_offsets=OFFSETS,network=network,library=str(library))))
 
@@ -54,10 +69,34 @@ def arena_zeros(shape,dtype):
  if ARENA is None:raise RuntimeError('NCCL memory session is not initialized')
  n=math.prod(shape)*torch.empty((),dtype=dtype).element_size();size=(n+4095)//4096*4096
  start=CURSOR
- if start+size>ARENA.numel():raise MemoryError(f'NCCL symmetric arena exhausted: requested end={start+size}, capacity={ARENA.numel()}')
+ if start+size>LIMIT:raise MemoryError(f'NCCL symmetric arena exhausted: requested end={start+size}, capacity={ARENA.numel()}')
  CURSOR+=size
  span=ARENA[start:start+size];span.zero_();view=span[:n].view(dtype).reshape(shape)
  BUFFERS.append((ARENA,span,view));return view
+
+def segment_offset(segment):
+ """Byte offset of a shadow segment inside the arena (same on every rank)."""
+ return 0 if segment==0 else SEGMENT0+(segment-1)*SEGMENT
+
+def reserved_view(offset,nbytes):
+ """Bytes [offset, offset+nbytes) of segment 0's reserved control region."""
+ if offset<0 or offset+nbytes>RESERVED_BYTES:raise ValueError(f'reserved range [{offset}, {offset+nbytes}) exceeds {RESERVED_BYTES} bytes')
+ return ARENA[LIMIT+offset:LIMIT+offset+nbytes]
+
+class ShadowSession:
+ """Session view used by transport.xnuma (p2p_split)."""
+ class _Arena:
+  @property
+  def base(self):return ARENA.data_ptr()
+ p2p=_Arena()
+ @property
+ def shadow(self):return SHADOW
+ @property
+ def reserved_offset(self):return LIMIT
+ @property
+ def reserved_bytes(self):return RESERVED_BYTES
+ segment_offset=staticmethod(segment_offset)
+ reserved_view=staticmethod(reserved_view)
 
 def p2p_capacity(tokens, hidden, topk, experts, world, rank_local):
  # Inputs, BF16 top-k output, shared dispatch metadata, rank-combine flags.

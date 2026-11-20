@@ -743,3 +743,54 @@ def test_sm120_nvfp4_explicit_workspace_handles_and_output_view():
         for graph in graphs:
             graph.reset()
         layer.destroy()
+
+
+@pytest.mark.arch_sm120
+def test_sm120_nvfp4_k3_skips_unrouted_slots() -> None:
+    """K2 writes no combine row for a negative top-k slot; K3 must not read it."""
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+        bootstrap_paths,
+    )
+
+    bootstrap_paths()
+    import cuda.bindings.driver as cuda
+    from moe_sm120_nvfp4_split.api import compile_combine_reduce
+
+    tokens, top_k, hidden = 37, 6, 5120
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    combine = torch.randn(
+        (tokens, top_k, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    ids = torch.randint(
+        0, 384, (tokens, top_k), dtype=torch.int64, device="cuda", generator=generator
+    )
+    invalid = torch.rand((tokens, top_k), device="cuda", generator=generator) < 0.3
+    invalid[3] = True  # a fully unrouted token
+    ids[invalid] = -1
+    # Stale rows of unrouted slots may hold anything, including NaN.
+    combine[invalid] = float("nan")
+    output = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled, combine_cute, output_cute, score_cute, k3_stream, idx_cute = (
+        compile_combine_reduce(combine, output, None, topk_idx=ids, stream=stream)
+    )
+    compiled(
+        combine_cute=combine_cute,
+        reduced_cute=output_cute,
+        topk_score_cute=score_cute,
+        stream=k3_stream,
+        topk_idx_cute=idx_cute,
+    )
+    torch.cuda.synchronize()
+    expected = (
+        combine.float()
+        .masked_fill(invalid[..., None], 0.0)
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+    assert torch.isfinite(output.float()).all()
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert not output[3].any()

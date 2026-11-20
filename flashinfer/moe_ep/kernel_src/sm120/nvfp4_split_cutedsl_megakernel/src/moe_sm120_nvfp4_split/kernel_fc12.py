@@ -552,6 +552,8 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
             requested_num_ab_stage = self.num_ab_stages_override
         elif self.jit_config.num_ab_stages_override is not None:
             requested_num_ab_stage = self.jit_config.num_ab_stages_override
+        elif getattr(self, "num_ab_stages_soft_cap", None) is not None:
+            requested_num_ab_stage = min(self.num_ab_stages_soft_cap, max_num_ab_stage)
         else:
             requested_num_ab_stage = default_num_ab_stage
         if requested_num_ab_stage < 1 or requested_num_ab_stage > max_num_ab_stage:
