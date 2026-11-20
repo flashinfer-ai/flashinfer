@@ -35,6 +35,10 @@ import torch
 import triton
 import triton.language as tl
 
+# Triton 3.8's SM107 lowering exceeds the per-CTA budget on the wide
+# native-BF16 QK tiles. Keep the tuned geometry on newer compilers.
+_SMALL_NATIVE_Q_TILE = triton.__version__.split(".")[:2] == ["3", "8"]
+
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
     _HTMA = 1
@@ -2002,11 +2006,11 @@ def _qsa(Q, G, KC, VC, KDS, VDS, PK, CU, PB, O, WS, WL, WM,
         tl.store(O + qoff, outv, mask=rv[:, None])
 
 
-@triton.jit(noinline=True)
+@triton.jit
 def _qsa_w6_redo(Q, G, KC, VC, O, t0, s0, s1, base, NSLOT,
                  BT: tl.constexpr, NHC: tl.constexpr, DC: tl.constexpr,
                  PWC: tl.constexpr, SC: tl.constexpr):
-    """Cold dense-prefix retry, kept out of the common TMA instruction body."""
+    """Cold dense-prefix retry; inline into the warp-specialized caller."""
     dd = tl.arange(0, DC)
     hh = tl.arange(0, 8)
     hv = hh < NHC
@@ -2345,16 +2349,19 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
                         (3 if short_bn == 32 else SR_STAGES)))
         return
     if T == 16382 and B == 2 and "w7" not in _NO_WSPEC:
-        w7_bt = 21
+        w7_bt, w7_rw, w7_mk, w7_bn, stages = (
+            (2, 16, 16, 64, 1) if _SMALL_NATIVE_Q_TILE else (21, 128, 32, 128, 2)
+        )
         w7_nprog = (T + w7_bt - 1) // w7_bt + 1
-        kd, vd = _desc(k_cache, v_cache, 128, nslot)
+        kd, vd = _desc(k_cache, v_cache, w7_bn, nslot)
         try:
             _qsa_w7_tma[(w7_nprog,)](
                 q, gate, k_cache, v_cache, kd, vd,
                 packed, cu_seqlens, page_base, out,
-                T, nslot, BT=w7_bt, RW=128, MK=32, BN=128, HOST_DESC=bool(_HTMA),
+                T, nslot, BT=w7_bt, RW=w7_rw, MK=w7_mk, BN=w7_bn,
+                HOST_DESC=bool(_HTMA),
                 NHC=NH, DC=D, PWC=PW, SC=SCL,
-                num_warps=8, num_stages=2)
+                num_warps=8, num_stages=stages)
             return
         except Exception as exc:
             if not _wspec_compile_failure(exc):
@@ -2390,25 +2397,29 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
         nstages = BIG_STAGES
     if BIG_WARPS:
         nwarps = BIG_WARPS
+    if _SMALL_NATIVE_Q_TILE and SPV_MODE == 1 and T >= 12000:
+        bt, rw, mk, bn, nstages = 2, 16, 16, 64, 1
     ntiles = (T + bt - 1) // bt
     nprog = ntiles if single else ntiles + B - 1
     if ((T == 4057 and B == 2) or (T == 8181 and B == 4)) and (
         "w6" not in _NO_WSPEC
     ):
-        w6_bt = 21
+        w6_bt, w6_rw, w6_mk, wbn, stages = (
+            (2, 16, 16, 64, 1) if _SMALL_NATIVE_Q_TILE
+            else (21, 128, 32, 128 if T == 4057 else bn, 2)
+        )
         w6_nprog = (T + w6_bt - 1) // w6_bt + B - 1
-        wbn = 128 if T == 4057 else bn
         kd, vd = _desc(k_cache, v_cache, wbn, nslot)
         try:
             _qsa_w6[(w6_nprog,)](
                 q, gate, k_cache, v_cache, kd, vd, packed, cu_seqlens,
                 page_base,
-                out, T, nslot, BT=w6_bt, RW=128, MK=32, BN=wbn, NR=B,
+                out, T, nslot, BT=w6_bt, RW=w6_rw, MK=w6_mk, BN=wbn, NR=B,
                 HTMA=bool(_HTMA),
                 CAPQ=False, FASTEX2=(T < 6000), GATEPTX=(T >= 6000),
                 PEEL=(T < 6000), DEN16=(T == 4057),
                 NHC=NH, DC=D, PWC=PW, SC=SCL,
-                num_warps=nwarps, num_stages=2)
+                num_warps=nwarps, num_stages=stages)
             return
         except Exception as exc:
             if not _wspec_compile_failure(exc):

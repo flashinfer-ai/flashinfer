@@ -182,25 +182,6 @@ def run_api(inputs, out=None, backend="auto"):
     )
 
 
-def run_api_checked(inputs, **kw):
-    """``run_api`` that SKIPS (with the reason) when this toolchain/device
-    cannot compile a route at all: the kernel already retries the
-    non-warp-specialized and narrow-tile schedules on its own, so an escaping
-    resource/lowering failure means even the fallback tier does not fit this
-    environment — a compatibility limit, not a correctness failure."""
-    from triton.runtime.errors import OutOfResources
-
-    from flashinfer.triton.kernels import qsa_sparse_attention as qsa_mod
-
-    checker = getattr(qsa_mod, "_wspec_compile_failure", None)
-    try:
-        return run_api(inputs, **kw)
-    except Exception as exc:
-        if isinstance(exc, OutOfResources) or (checker is not None and checker(exc)):
-            pytest.skip(f"route does not compile on this toolchain: {exc}")
-        raise
-
-
 def run_ref(inputs):
     return ref_qsa_sparse_attention(
         inputs["q"],
@@ -240,7 +221,7 @@ def assert_close_at_gate(
 )
 def test_correctness(lengths):
     inputs = make_inputs(lengths, seed=sum(lengths))
-    out = run_api_checked(inputs)
+    out = run_api(inputs)
     ref = run_ref(inputs)
     assert_close_at_gate(out, ref)
 
@@ -251,7 +232,7 @@ def test_exact_capacity_cache(lengths):
     logical origin when the last window overhangs the slot count (origin
     clamping read the wrong slots), and every route must stay in bounds."""
     inputs = make_inputs(lengths, seed=sum(lengths) + 1, spare_pages=0)
-    out = run_api_checked(inputs)
+    out = run_api(inputs)
     ref = run_ref(inputs)
     assert_close_at_gate(out, ref)
 
@@ -316,7 +297,7 @@ def test_uniform_logits_stay_in_fp8_probability_range(lengths):
     operands: the dedicated descriptor routes' range guard has to hand such
     tiles to the exact retry (the denominator check alone cannot see it)."""
     inputs = make_uniform_dense_prefix_inputs(lengths)
-    out = run_api_checked(inputs)
+    out = run_api(inputs)
     ref = run_ref(inputs)
     assert_close_at_gate(out, ref)
     assert float((out.float() - 0.5).abs().max()) <= MAX_ABS_ERR
@@ -370,7 +351,7 @@ def test_dense_causal_cancellation_mid_range(length):
     direct dynamically-scaled FP8 query exceeded the cap on SM107 silicon
     with ~all rows failing)."""
     inputs = make_dense_causal_cancellation_inputs(length)
-    out = run_api_checked(inputs)
+    out = run_api(inputs)
     ref = run_ref(inputs)
     assert_close_at_gate(out, ref)
     # Even-count rows have an analytic expectation: m ones-rows at scaled
@@ -519,7 +500,7 @@ def test_negative_gate_keeps_small_sigmoid_accuracy(lengths):
     output must stay inside the cap (requires an FP32-accurate sigmoid; the
     packed fp16/bf16 tanh form fails here by construction)."""
     inputs = make_negative_gate_inputs(lengths)
-    out = run_api_checked(inputs)
+    out = run_api(inputs)
     ref = run_ref(inputs)
     assert_close_at_gate(out, ref)
     expected = 256.0 * torch.sigmoid(torch.tensor(-10.0)).item()
