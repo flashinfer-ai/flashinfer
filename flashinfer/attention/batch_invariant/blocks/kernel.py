@@ -429,9 +429,10 @@ class AttentionKernel:
             sRaw = storage.sRaw.get_tensor(
                 cute.make_layout((st.raw_stages * st.raw_stage_bytes,))
             )
-            sPg = storage.s_pg.get_tensor(cute.make_layout((st.raw_pg_elems,)))
+            sSide = storage.s_side.get_tensor(cute.make_layout((st.raw_side_words,)))
             if warp_idx == R.load_warp:
-                cute.arch.setmaxregister_decrease(R.regs_other)
+                cute.arch.setmaxregister_decrease(R.regs_load)
+                tidx, _, _ = cute.arch.thread_idx()
                 for u in range(bidx, num_units, grid_size):
                     q_prod = load_q_unit(
                         st,
@@ -454,13 +455,16 @@ class AttentionKernel:
                         atom_v,
                         tV,
                         sRaw_view,
-                        sPg,
+                        tKsf,
+                        tVsf,
+                        sSide,
                         mKvIndptr,
                         mKvIndices,
                         mDesc[(u, F_REQ)],
                         mDesc[(u, F_KVHEAD)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
+                        tidx % 32,
                     )
                 cute.arch.griddepcontrol_launch_dependents()
             if warp_idx >= R.convert_warps[0]:
@@ -477,7 +481,7 @@ class AttentionKernel:
                         tVsf,
                         sKV_u32,
                         sRaw,
-                        sPg,
+                        sSide,
                         mKvIndptr,
                         mDesc[(u, F_REQ)],
                         mDesc[(u, F_KVHEAD)],

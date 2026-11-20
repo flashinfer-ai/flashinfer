@@ -57,8 +57,10 @@ from .. import spec
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
 _NEG_INF = float("-inf")
-MASK_SELECT_MAX_D = 128  # the key mask as per-key selects (``masked_score``) serves the one-stage TMEM plan; the two-stage body at D = 256
-# keeps the per-key compare (the select form spills past its launch budget)
+MASK_SELECT_MAX_D = 128  # the key mask as per-key selects (``masked_score``) serves the full-row step of the one-stage TMEM plan; the
+# two-stage body at D = 256 keeps the per-key compare (the select form spills past its launch budget), and so does the
+# replicated-row placement of every kernel but the token-head-scale ones (the low-bit-KV kernels' decode units run it: the
+# selects made its tile step slower there, the compares the token-head-scale kernels')
 
 
 @dsl_user_op
@@ -411,7 +413,7 @@ def unit_loop(
         if need_mask:
             # the row's visible range in tile-relative columns: key k0 + col is masked iff col < lim_lo or col >= lim_hi (the slice's
             # columns offset by col_base)
-            if cutlass.const_expr(st.D <= MASK_SELECT_MAX_D):
+            if cutlass.const_expr(st.D <= MASK_SELECT_MAX_D and (not rep or st.th)):
                 lim_lo = lo_row - k0
                 lim_hi = L_row - k0
                 if cutlass.const_expr(not exchange):
@@ -423,7 +425,7 @@ def unit_loop(
                     for i in cutlass.range_constexpr(kpt):
                         rS[i] = masked_score(rS[i], lim_lo_s, lim_hi_s, int(cols_s[i]))
             else:
-                # the two-stage body keeps the per-key compare: the select form raises its register pressure past the launch budget
+                # the per-key compare (MASK_SELECT_MAX_D)
                 if cutlass.const_expr(not exchange):
                     for i in cutlass.range_constexpr(T):
                         key = k0 + cols_f[i]

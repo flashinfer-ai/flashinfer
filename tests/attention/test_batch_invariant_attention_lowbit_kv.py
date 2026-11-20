@@ -294,8 +294,8 @@ def test_conversion_stage_roles_and_raw_staging():
     pytest.importorskip("cutlass")
     from flashinfer.attention.batch_invariant.blocks import operands
 
-    for D in spec.HEAD_DIMS:
-        r = operands.Roles(1, D, lowbit=True)
+    for D, fp4 in ((D, fp4) for D in spec.HEAD_DIMS for fp4 in (False, True)):
+        r = operands.Roles(1, D, lowbit=True, fp4=fp4)
         assert r.threads == 512 and r.convert_threads == 192
         assert (
             r.convert_warps[0] == r.empty_warps[0]
@@ -303,9 +303,10 @@ def test_conversion_stage_roles_and_raw_staging():
         )
         used = (
             (r.regs_softmax + r.regs_correction) * 128
-            + r.regs_other * 64
+            + (r.regs_other + r.regs_load) * 32
             + r.regs_convert * r.convert_threads
         )
+        assert r.regs_load == (64 if fp4 and D <= 128 else 32)
         assert r.regs_convert >= 48 and used < 65536
         bf = operands.Roles(1, D)
         assert bf.threads == 384 and bf.convert_threads == 0
@@ -1605,6 +1606,28 @@ def test_nvfp4_swizzled_v_scales_are_the_linear_cache(D, page, layout):
     dec, last = fp4_run_decode(fp, layout, sf=(k_sf, v_swz), v_sf_swizzled=True)
     assert torch.equal(bits(dec), ref[last])
     assert torch.equal(bits(fp4_run_decode(fp, layout)[0]), ref[last])
+
+
+@needs_device
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("D,page", [(64, 16), (128, 16), (128, 1), (256, 16)])
+def test_nvfp4_block_scales_at_any_address(D, page, layout):
+    """The block scales are bytes: scale tensors that start at an odd address (views one byte into a buffer) give the bits of
+    the same scales at an aligned address, for paged prefill and paged decode."""
+    fp = fp4_problem([256, 1, 33], [1501, 2503, 770], 32, 8, D, page, 5)
+    ref = bits(fp4_run_paged_prefill(fp, layout)).clone()
+
+    def shifted(t):
+        buf = torch.zeros(t.numel() + 16, dtype=t.dtype, device=t.device)
+        view = buf[1 : 1 + t.numel()].view(t.shape)
+        view.copy_(t)
+        assert view.data_ptr() % 4
+        return view
+
+    sf = tuple(shifted(t) for t in fp.sf(layout))
+    assert torch.equal(bits(fp4_run_paged_prefill(fp, layout, sf=sf)), ref)
+    dec, last = fp4_run_decode(fp, layout, sf=sf)
+    assert torch.equal(bits(dec), ref[last])
 
 
 @needs_device

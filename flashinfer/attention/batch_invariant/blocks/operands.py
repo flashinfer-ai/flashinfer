@@ -131,6 +131,7 @@ REGS_Q2_128 = (184, 80, 64)
 REGS_CONVERT = 96  # per conversion thread of the low-bit-KV kernels (blocks/convert.py), where the budget allows: the stage is the two
 # otherwise idle warps of the last warpgroup plus CONVERT_WARPGROUPS further warpgroups; at D = 256 the correction's 208 leave 64
 CONVERT_WARPGROUPS = 1
+REGS_LOAD_FP4 = 64
 # the raw staging of the low-bit-KV kernels: (keys per stage, stages), the first that fits the part's shared memory next to the
 # Q stages and the ring. A stage is the TMA's unit (the load warp issues its page boxes of raw cache bytes) and the conversion
 # stage's unit of work; whole-slot stages deal the conversion threads without partial rounds
@@ -151,7 +152,14 @@ class Roles:
     their TMEM lanes), then the correction warpgroup, then MMA, load and empty warps completing the last
     warpgroup. Register budget: 65536 >= REGS_SOFTMAX x 128 x n_wg + REGS_CORRECTION x 128 + 32 x 128."""
 
-    def __init__(self, n_wg: int, D: int = 128, q2: bool = False, lowbit: bool = False):
+    def __init__(
+        self,
+        n_wg: int,
+        D: int = 128,
+        q2: bool = False,
+        lowbit: bool = False,
+        fp4: bool = False,
+    ):
         assert n_wg in (1, 2), n_wg
         assert not (lowbit and (n_wg != 1 or q2)), (
             "the low-bit-KV kernels run one softmax warpgroup"
@@ -179,6 +187,9 @@ class Roles:
         two_slices = n_wg == 2 and not q2
         self.regs_softmax = REGS_SOFTMAX_W2 if two_slices else REGS_SOFTMAX
         self.regs_other = REGS_OTHER
+        # the load warp: a TMA issuer, which in the NVFP4 kernels at D <= 128 also holds a group of block scale rows in flight
+        # (convert.stage_sf)
+        self.regs_load = REGS_LOAD_FP4 if fp4 and D <= 128 else REGS_OTHER
         if two_slices:
             self.regs_correction = REGS_CORRECTION_W2
         elif q2 and D in REGS_Q2_DIMS:
@@ -200,7 +211,8 @@ class Roles:
         fixed = (
             self.regs_softmax * 128 * n_wg
             + self.regs_correction * 128
-            + self.regs_other * 32 * (4 - (2 if lowbit else 0))
+            + self.regs_other * 32 * (3 - (2 if lowbit else 0))
+            + self.regs_load * 32
         )
         self.regs_convert = 0
         if lowbit:
@@ -305,7 +317,7 @@ class StaticPlan:
             D,
         )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB
         self.D, self.g, self.page, self.kv_slots = D, g, page, kv_slots
-        self.roles = Roles(n_wg, D, q2, self.lowbit)
+        self.roles = Roles(n_wg, D, q2, self.lowbit, self.fp4)
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (
@@ -584,16 +596,24 @@ class StaticPlan:
         # raw_box_rows keys (one page slab, the whole cache row wide); a ring slot is raw_per_slot consecutive stages
         self.raw_w = (D // 2 if self.fp4 else D) if self.lowbit else 0
         self.raw_keys = self.raw_stages = self.raw_stage_bytes = 0
+        self.sf_staged = False
         # 16-element groups a conversion thread takes per round: two for NVFP4 at D = 128 (its per-group scale fetch and round
         # overhead amortise), one elsewhere (measured)
         self.convert_groups = 2 if self.fp4 and D == 128 else 1
         if self.lowbit:
             for raw_keys, raw_stages in RAW_STAGING:
                 self.raw_keys, self.raw_stages = raw_keys, raw_stages
-                # the stages' side entries: the page of every box (the NVFP4 kernels' block-scale addressing; a stub otherwise)
-                self.raw_pg_elems = (
-                    raw_stages * (raw_keys // min(page, raw_keys)) if self.fp4 else 2
-                )
+                # the NVFP4 kernels' side words of the stages: with whole-slot stages at D <= 128 the load warp stages the block scales
+                # of the stage's keys there (sf_staged: D / 16 bytes per key); otherwise it records the page of every box and the
+                # conversion threads read the scales from global memory (a stage per page-table and scale round trip would hold
+                # the load warp back); a stub for the fp8 kernels
+                self.sf_staged = self.fp4 and D <= 128 and raw_keys == self.slot_keys
+                if self.sf_staged:
+                    self.raw_side_words = raw_stages * raw_keys * (D // 16) // 4
+                elif self.fp4:
+                    self.raw_side_words = raw_stages * (raw_keys // min(page, raw_keys))
+                else:
+                    self.raw_side_words = 4
                 self.raw_stage_bytes = raw_stage_bytes(self.raw_w, raw_keys, page)
                 if shared_storage_struct(self).size_in_bytes() <= max(
                     SMEM_CAP, self.cap
@@ -682,7 +702,7 @@ def shared_storage_struct(st: StaticPlan):
     if st.lowbit:
         fields.update(
             raw_mbar=mr[i64, 2 * st.raw_stages],
-            s_pg=mr[i32, st.raw_pg_elems],
+            s_side=cute.struct.Align[mr[i32, st.raw_side_words], 16],
             sRaw=cute.struct.Align[
                 mr[cutlass.Uint8, st.raw_stages * st.raw_stage_bytes], 128
             ],

@@ -7,8 +7,8 @@ TMA producer writes for a bf16 cache holding those values (``convert_unit``). Th
 the ring exactly as in the bf16 kernel: the conversion is a placement of the class's exact ``widen`` leaves (``spec.kv_widen``),
 never an arithmetic step.
 
-The NVFP4 variant (``st.fp4``) stages 8 packed bytes (16 e2m1 nibbles of one key) per group, reads the block's e4m3 scale byte
-from global memory and forms ``value * scale`` in binary32 (``cvt.rn.f16x2.e2m1x2`` / ``cvt.rn.f16x2.e4m3x2``, ``cvt.f32.f16``,
+The NVFP4 variant (``st.fp4``) stages 8 packed bytes (16 e2m1 nibbles of one key) per group, takes the block's e4m3 scale byte
+(staged with the stage by the load warp, ``stage_sf``, or read from global memory by the conversion thread, ``load_sf``) and forms ``value * scale`` in binary32 (``cvt.rn.f16x2.e2m1x2`` / ``cvt.rn.f16x2.e4m3x2``, ``cvt.f32.f16``,
 ``mul.rn.f32``): a product of at most six significant bits within the bf16 range, exact at every step, then ``cvt.rn.bf16x2.f32``
 moves bits. The ring then holds the class's ``dq4`` leaves (``spec.kv_dq4``). The V block scales of a paged cache are read in
 the linear layout or in the 4-token swizzle (``sf_swizzle_coord``, ``st.v_sf_swizzled``): the two layouts store the same scale
@@ -277,14 +277,14 @@ def load_sf(
     blk: Int32,
     pg0: Int32,
     mSF: cute.Tensor,
-    sPg: cute.Tensor,
+    sSide: cute.Tensor,
     kv_ptr0: Int32,
     kv_head: Int32,
     r_sf: cute.Tensor,
     sf_swizzled: cutlass.Constexpr,
 ):
     """The e4m3 block scale byte of block ``blk`` of stage key ``key`` (clamped to the stage; absolute key ``ka0 + key``) into
-    ``r_sf[0]``. The key's page is the one the load warp staged its cache bytes from (``sPg[pg0 + box]``); a ragged pool clamps
+    ``r_sf[0]``. The key's page is the one the load warp staged its cache bytes from (the stage's side words ``sSide[pg0 + box]``); a ragged pool clamps
     the token to the pool."""
     if key > st.raw_keys - 1:
         key = Int32(st.raw_keys - 1)
@@ -296,11 +296,124 @@ def load_sf(
             tok = last
         sfoff = sf_offset(st, mSF, blk, tok, kv_head, Int32(0), False)
     else:
-        page_id = sPg[pg0 + key // st.raw_box_rows]
+        page_id = sSide[pg0 + key // st.raw_box_rows]
         sfoff = sf_offset(st, mSF, blk, ka % st.page, kv_head, page_id, sf_swizzled)
     r_sf[0] = cute.make_tensor(mSF.iterator + sfoff, cute.make_layout((1,)))[0].to(
         Uint32
     )
+
+
+SF_GROUP = 4  # consecutive keys of a stage one lane of the load warp fetches the block scales of (a group of the 4-token swizzle)
+
+
+@cute.jit
+def stage_sf_pages(
+    st,
+    key0: Int32,
+    lane: Int32,
+    mKvIndices: cute.Tensor,
+    kv_ptr0: Int32,
+    n_pages: Int32,
+    r_pg: cute.Tensor,
+):
+    """The pages of the keys ``4 lane + m`` of a stage (from absolute key ``key0``) into ``r_pg[m]``: ``stage_sf``'s page loads,
+    issued with the stage's box page loads."""
+    for m in cutlass.range_constexpr(SF_GROUP):
+        pslot = (key0 + SF_GROUP * lane + m) // st.page
+        if pslot > n_pages - 1:
+            pslot = n_pages - 1
+        r_pg[m] = mKvIndices[kv_ptr0 + pslot]
+
+
+@cute.jit
+def stage_sf(
+    st,
+    key0: Int32,
+    stage: Int32,
+    lane: Int32,
+    mSF: cute.Tensor,
+    sSide: cute.Tensor,
+    r_pg: cute.Tensor,
+    kv_ptr0: Int32,
+    kv_head: Int32,
+    sf_swizzled: cutlass.Constexpr,
+):
+    """The NVFP4 block scales of one staging stage (``raw_keys`` keys from absolute key ``key0``, ``D / 16`` e4m3 bytes each) from
+    global memory into the stage's side words ``sSide`` ( byte ``blk`` of stage key ``k`` at byte ``(stage raw_keys + k) D /
+    16 + blk``), by the load warp before it issues the stage's last TMA box. Lane ``l`` holds the keys ``4 l .. 4 l + 3``, whose
+    pages are ``r_pg`` (``stage_sf_pages``): it reads their four rows of ``mSF`` (``(D / 16, page, Hkv, num_pages)`` bytes; one
+    load per row where the row is aligned, byte loads otherwise; a ragged pool clamps the token to the pool) and stores them in
+    key order -- under ``sf_swizzled`` after undoing the 4-token swizzle (``sf_swizzle_coord``), which permutes the scale bytes
+    inside exactly these four rows. The staged bytes are the same in either layout."""
+    NB = st.D // GROUP
+    W = NB // 4
+    r_w = cute.make_rmem_tensor(cute.make_layout((SF_GROUP * W,)), Uint32)
+    r_b = cute.make_rmem_tensor(cute.make_layout((NB,)), Uint32)
+    if lane < st.raw_keys // SF_GROUP:
+        k0 = SF_GROUP * lane
+        aligned = Int32(1)
+        for m in cutlass.range_constexpr(SF_GROUP):
+            ka = key0 + k0 + m
+            if cutlass.const_expr(st.ragged):
+                tok = kv_ptr0 + ka
+                last = mSF.shape[1] - 1
+                if tok > last:
+                    tok = last
+                row = cute.crd2idx((Int32(0), tok, kv_head, Int32(0)), mSF.layout)
+            else:
+                row = cute.crd2idx(
+                    (Int32(0), ka % st.page, kv_head, r_pg[m]), mSF.layout
+                )
+            if ((mSF.iterator + row).toint() & (NB - 1)) != 0:
+                aligned = Int32(0)
+        for m in cutlass.range_constexpr(SF_GROUP):
+            ka = key0 + k0 + m
+            if cutlass.const_expr(st.ragged):
+                tok = kv_ptr0 + ka
+                last = mSF.shape[1] - 1
+                if tok > last:
+                    tok = last
+                row = cute.crd2idx((Int32(0), tok, kv_head, Int32(0)), mSF.layout)
+            else:
+                row = cute.crd2idx(
+                    (Int32(0), ka % st.page, kv_head, r_pg[m]), mSF.layout
+                )
+            if aligned == 1:
+                cute.autovec_copy(
+                    cute.make_tensor(
+                        (mSF.iterator + row).align(NB), cute.make_layout((NB,))
+                    ),
+                    cute.make_tensor(
+                        cute.recast_ptr(r_w.iterator + m * W, dtype=cutlass.Uint8),
+                        cute.make_layout((NB,)),
+                    ),
+                )
+            else:
+                for blk in cutlass.range_constexpr(NB):
+                    r_b[blk] = cute.make_tensor(
+                        mSF.iterator + row + blk, cute.make_layout((1,))
+                    )[0].to(Uint32)
+                for j in cutlass.range_constexpr(W):
+                    r_w[m * W + j] = (
+                        r_b[4 * j]
+                        | (r_b[4 * j + 1] << 8)
+                        | (r_b[4 * j + 2] << 16)
+                        | (r_b[4 * j + 3] << 24)
+                    )
+        dst = (stage * st.raw_keys + k0) * W
+        for m in cutlass.range_constexpr(SF_GROUP):
+            for j in cutlass.range_constexpr(W):
+                if cutlass.const_expr(sf_swizzled):
+                    w = Uint32(0)
+                    for q in cutlass.range_constexpr(4):
+                        sb, sm = sf_swizzle_coord(NB, 4 * j + q, m)
+                        w = w | (
+                            ((r_w[sm * W + sb // 4] >> (8 * (sb % 4))) & 0xFF)
+                            << (8 * q)
+                        )
+                    sSide[dst + m * W + j] = w
+                else:
+                    sSide[dst + m * W + j] = r_w[m * W + j]
 
 
 @cute.jit
@@ -311,47 +424,82 @@ def stage_slot(
     atom: cute.CopyAtom,
     tg: cute.Tensor,
     ts: cute.Tensor,
-    sPg: cute.Tensor,
+    mSF: cute.Tensor,
+    sSide: cute.Tensor,
     mKvIndices: cute.Tensor,
     kv_ptr0: Int32,
     n_pages: Int32,
     kv_head: Int32,
+    lane: Int32,
+    sf_swizzled: cutlass.Constexpr,
 ):
     """The raw cache bytes of one ring slot (``slot_keys`` keys of K or V from absolute key ``key0``): ``raw_per_slot`` staging
     stages, each acquired and filled by ``raw_boxes`` TMA boxes of ``raw_box_rows`` keys of one page (``producer.issue_slot``'s
-    page and ragged addressing). The NVFP4 kernels record every box's page in the stage's side entries ``sPg`` before the box
-    is issued (the conversion threads address the block scales with it)."""
+    page and ragged addressing). The NVFP4 kernels use the stage's side words ``sSide``: with ``st.sf_staged`` the load warp
+    stages the stage's block scales in them (``stage_sf``) before its last box, so that the stage's full barrier, which completes
+    with its TMA boxes, covers them too; otherwise it records every box's page, with which the conversion threads address the
+    block scales in global memory (``load_sf``)."""
     page = st.page
+    PB = 8  # boxes whose page loads are issued together (their latencies overlap) ahead of the boxes
+    r_pg = cute.make_rmem_tensor(cute.make_layout((PB,)), Int32)
+    r_spg = cute.make_rmem_tensor(cute.make_layout((SF_GROUP,)), Int32)
     for sub in cutlass.range_constexpr(st.raw_per_slot):
         h = raw_prod.acquire_and_advance()
-        for i in cutlass.range_constexpr(st.raw_boxes):
-            k0 = key0 + sub * st.raw_keys + i * st.raw_box_rows
-            if cutlass.const_expr(st.ragged):
-                for half in cutlass.range_constexpr(st.raw_halves):
-                    cute.copy(
-                        atom,
-                        tg[(None, (half, k0 // st.raw_box_rows, kv_head, 0))],
-                        ts[(None, i, half, h.index)],
-                        tma_bar_ptr=h.barrier,
+        if cutlass.const_expr(st.sf_staged and not st.ragged):
+            stage_sf_pages(
+                st,
+                key0 + sub * st.raw_keys,
+                lane,
+                mKvIndices,
+                kv_ptr0,
+                n_pages,
+                r_spg,
+            )
+        for c0 in cutlass.range_constexpr(0, st.raw_boxes, PB):
+            if cutlass.const_expr(not st.ragged):
+                for i in cutlass.range_constexpr(c0, min(c0 + PB, st.raw_boxes)):
+                    pslot = (key0 + sub * st.raw_keys + i * st.raw_box_rows) // page
+                    if pslot > n_pages - 1:
+                        pslot = n_pages - 1
+                    r_pg[i - c0] = mKvIndices[kv_ptr0 + pslot]
+            for i in cutlass.range_constexpr(c0, min(c0 + PB, st.raw_boxes)):
+                k0 = key0 + sub * st.raw_keys + i * st.raw_box_rows
+                if cutlass.const_expr(st.sf_staged and i == st.raw_boxes - 1):
+                    # before the stage's last box: the full barrier completes after the scales are in place
+                    stage_sf(
+                        st,
+                        key0 + sub * st.raw_keys,
+                        h.index,
+                        lane,
+                        mSF,
+                        sSide,
+                        r_spg,
+                        kv_ptr0,
+                        kv_head,
+                        sf_swizzled,
                     )
-            else:
-                pslot = k0 // page
-                if cutlass.const_expr(page <= st.raw_keys):
-                    box_in_page = Int32(0)
+                if cutlass.const_expr(st.ragged):
+                    for half in cutlass.range_constexpr(st.raw_halves):
+                        cute.copy(
+                            atom,
+                            tg[(None, (half, k0 // st.raw_box_rows, kv_head, 0))],
+                            ts[(None, i, half, h.index)],
+                            tma_bar_ptr=h.barrier,
+                        )
                 else:
-                    box_in_page = (k0 % page) // st.raw_box_rows
-                if pslot > n_pages - 1:
-                    pslot = n_pages - 1
-                page_id = mKvIndices[kv_ptr0 + pslot]
-                if cutlass.const_expr(st.fp4):
-                    sPg[h.index * st.raw_boxes + i] = page_id
-                for half in cutlass.range_constexpr(st.raw_halves):
-                    cute.copy(
-                        atom,
-                        tg[(None, (half, box_in_page, kv_head, page_id))],
-                        ts[(None, i, half, h.index)],
-                        tma_bar_ptr=h.barrier,
-                    )
+                    if cutlass.const_expr(st.fp4 and not st.sf_staged):
+                        sSide[h.index * st.raw_boxes + i] = r_pg[i - c0]
+                    if cutlass.const_expr(page <= st.raw_keys):
+                        box_in_page = Int32(0)
+                    else:
+                        box_in_page = (k0 % page) // st.raw_box_rows
+                    for half in cutlass.range_constexpr(st.raw_halves):
+                        cute.copy(
+                            atom,
+                            tg[(None, (half, box_in_page, kv_head, r_pg[i - c0]))],
+                            ts[(None, i, half, h.index)],
+                            tma_bar_ptr=h.barrier,
+                        )
     return raw_prod
 
 
@@ -363,11 +511,14 @@ def stage_tile(
     atom: cute.CopyAtom,
     tg: cute.Tensor,
     ts: cute.Tensor,
-    sPg: cute.Tensor,
+    mSF: cute.Tensor,
+    sSide: cute.Tensor,
     mKvIndices: cute.Tensor,
     kv_ptr0: Int32,
     n_pages: Int32,
     kv_head: Int32,
+    lane: Int32,
+    sf_swizzled: cutlass.Constexpr,
 ):
     """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order (``producer.issue_tile``)."""
     for sl in cutlass.range_constexpr(st.slots_per_tile):
@@ -378,11 +529,14 @@ def stage_tile(
             atom,
             tg,
             ts,
-            sPg,
+            mSF,
+            sSide,
             mKvIndices,
             kv_ptr0,
             n_pages,
             kv_head,
+            lane,
+            sf_swizzled,
         )
     return raw_prod
 
@@ -396,15 +550,20 @@ def stage_unit(
     atom_v: cute.CopyAtom,
     tV: cute.Tensor,
     sRaw_view: cute.Tensor,
-    sPg: cute.Tensor,
+    mKsf: cute.Tensor,
+    mVsf: cute.Tensor,
+    sSide: cute.Tensor,
     mKvIndptr: cute.Tensor,
     mKvIndices: cute.Tensor,
     req: Int32,
     kv_head: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    lane: Int32,
 ):
-    """The raw K and V tiles of one unit into the staging buffer, in the TMA producer's slot order (``producer.load_loop``)."""
+    """The raw K and V tiles of one unit into the staging buffer, in the TMA producer's slot order (``producer.load_loop``). The K
+    block scales of an NVFP4 cache are linear; the V block scales are linear or swizzled as the plan states
+    (``st.v_sf_swizzled``)."""
     LA = st.qk_ahead
     kv_ptr0 = mKvIndptr[req]
     n_pages = mKvIndptr[req + 1] - kv_ptr0
@@ -427,11 +586,14 @@ def stage_unit(
         atom_k,
         tKgK,
         tKsK,
-        sPg,
+        mKsf,
+        sSide,
         mKvIndices,
         kv_ptr0,
         n_pages,
         kv_head,
+        lane,
+        False,
     )
     if cutlass.const_expr(LA == 2):
         if N > 1:
@@ -442,11 +604,14 @@ def stage_unit(
                 atom_k,
                 tKgK,
                 tKsK,
-                sPg,
+                mKsf,
+                sSide,
                 mKvIndices,
                 kv_ptr0,
                 n_pages,
                 kv_head,
+                lane,
+                False,
             )
         for n in range(N):
             raw_prod = stage_tile(
@@ -456,11 +621,14 @@ def stage_unit(
                 atom_v,
                 tVgV,
                 tVsV,
-                sPg,
+                mVsf,
+                sSide,
                 mKvIndices,
                 kv_ptr0,
                 n_pages,
                 kv_head,
+                lane,
+                st.v_sf_swizzled,
             )
             if n + 2 < N:
                 raw_prod = stage_tile(
@@ -470,11 +638,14 @@ def stage_unit(
                     atom_k,
                     tKgK,
                     tKsK,
-                    sPg,
+                    mKsf,
+                    sSide,
                     mKvIndices,
                     kv_ptr0,
                     n_pages,
                     kv_head,
+                    lane,
+                    False,
                 )
     else:
         for n in range(N):
@@ -486,11 +657,14 @@ def stage_unit(
                     atom_k,
                     tKgK,
                     tKsK,
-                    sPg,
+                    mKsf,
+                    sSide,
                     mKvIndices,
                     kv_ptr0,
                     n_pages,
                     kv_head,
+                    lane,
+                    False,
                 )
             raw_prod = stage_tile(
                 st,
@@ -499,11 +673,14 @@ def stage_unit(
                 atom_v,
                 tVgV,
                 tVsV,
-                sPg,
+                mVsf,
+                sSide,
                 mKvIndices,
                 kv_ptr0,
                 n_pages,
                 kv_head,
+                lane,
+                st.v_sf_swizzled,
             )
     return raw_prod
 
@@ -559,12 +736,16 @@ def load_group(
     st,
     key: Int32,
     rbase: Int32,
+    sbase: Int32,
     sRaw: cute.Tensor,
+    sSide: cute.Tensor,
     r_g8: cute.Tensor,
+    r_sf: cute.Tensor,
     G: cutlass.Constexpr,
 ):
     """The staged bytes of ``G`` consecutive groups (stage key ``key``, clamped to the stage; ``rbase`` the byte offset of the
-    thread's ``d0`` of the stage's key 0) into ``r_g8``."""
+    thread's ``d0`` of the stage's key 0) into ``r_g8`` and, with ``st.sf_staged``, their staged block scale bytes (``sbase`` the
+    byte offset of the thread's first block of the stage's key 0 in the side words) into ``r_sf``."""
     EB = G * (GROUP // 2 if st.fp4 else GROUP)
     if key > st.raw_keys - 1:
         key = Int32(st.raw_keys - 1)
@@ -581,6 +762,12 @@ def load_group(
         ),
         r_g8,
     )
+    if cutlass.const_expr(st.sf_staged):
+        sf8 = cute.recast_ptr(sSide.iterator, dtype=cutlass.Uint8)
+        for g in cutlass.range_constexpr(G):
+            r_sf[g] = cute.make_tensor(
+                sf8 + sbase + key * (st.D // GROUP) + g, cute.make_layout((1,))
+            )[0].to(Uint32)
 
 
 @cute.jit
@@ -592,7 +779,7 @@ def convert_slot(
     mSF: cute.Tensor,
     sKV_u32: cute.Tensor,
     sRaw: cute.Tensor,
-    sPg: cute.Tensor,
+    sSide: cute.Tensor,
     kv_ptr0: Int32,
     kv_head: Int32,
     ctid: Int32,
@@ -606,13 +793,14 @@ def convert_slot(
     fetch_sf: cutlass.Constexpr,
 ):
     """One ring slot (``slot_keys`` keys of K or V from absolute key ``key0``) from its staged raw bytes (``sRaw``: fp8 bytes, or
-    packed NVFP4 nibbles with the block scales ``mSF`` ``(D / 16, page, Hkv, num_pages)`` read from global memory through the
-    stage's page entries ``sPg``): acquire it, convert stage after stage in 16-element groups and commit. Thread ``ctid`` of the
-    stage holds ``convert_groups`` consecutive groups (unit ``ctid % UPK`` of ``UPK`` per key) of the keys ``ctid // UPK + round *
-    KPI`` of a stage; the loop is compact and reads a round ahead of its conversion.
-    ``sf_swizzled``: the block scales of ``mSF`` are stored in the 4-token swizzle (``sf_offset``). ``fetch_sf`` (the first
-    slot of a K tile of the token-head-scale kernels): between the acquire and the conversion, fetch the tile's scales
-    (``mSF`` the key scales, ``mVsf`` the value scales) into entry ``sf_entry`` of the side ring."""
+    packed NVFP4 nibbles): acquire it, convert stage after stage in 16-element groups and commit. The NVFP4 block scales come
+    from the stage's side words ``sSide`` (``st.sf_staged``: staged by the load warp), or from ``mSF`` ``(D / 16, page, Hkv,
+    num_pages)`` in global memory through the pages recorded there, ``SF_AHEAD`` rounds ahead (``sf_swizzled``: stored in the
+    4-token swizzle, ``sf_offset``). Thread ``ctid`` of the stage holds ``convert_groups`` consecutive groups (unit ``ctid %
+    UPK`` of ``UPK`` per key) of the keys ``ctid // UPK + round * KPI`` of a stage; the loop is compact and issues a round's
+    staged loads under the previous round's stores. ``fetch_sf`` (the first slot of a K tile of the token-head-scale kernels):
+    between the acquire and the conversion, fetch the tile's scales (``mSF`` the key scales, ``mVsf`` the value scales) into
+    entry ``sf_entry`` of the side ring."""
     CT = st.roles.convert_threads
     G = st.convert_groups  # consecutive groups of one key a thread converts per round
     UPK = st.D // (GROUP * G)  # thread units per key
@@ -635,10 +823,10 @@ def convert_slot(
             kv_head,
             ctid,
         )
-    r_in = cute.make_rmem_tensor(cute.make_layout((2 * G * EW,)), Uint32)
+    r_in = cute.make_rmem_tensor(cute.make_layout((G * EW,)), Uint32)
     r_in8 = cute.make_tensor(
         cute.recast_ptr(r_in.iterator, dtype=cutlass.Uint8),
-        cute.make_layout((2 * G * EB,)),
+        cute.make_layout((G * EB,)),
     )
     r_sf = cute.make_rmem_tensor(cute.make_layout(((SF_AHEAD + 1) * G,)), Uint32)
     r_out = cute.make_rmem_tensor(cute.make_layout((GROUP // 2,)), Uint32)
@@ -654,14 +842,15 @@ def convert_slot(
             + (e0 // st.raw_bw) * st.raw_half_bytes
             + e0 % st.raw_bw
         )
+        sbase = rh.index * (st.raw_keys * (st.D // GROUP)) + d0 // GROUP
         skey = sub * st.raw_keys
         pg0 = rh.index * st.raw_boxes
         # the thread's rounds of the stage: its keys kt, kt + KPI, ... below raw_keys (none for a thread past a small stage)
         n_rounds = (st.raw_keys - kt + KPI - 1) // KPI
         if cutlass.const_expr(st.raw_keys % KPI == 0):
             n_rounds = Int32(st.raw_keys // KPI)
-        load_group(st, kt, rbase, sRaw, r_in8, G)
-        if cutlass.const_expr(st.fp4):
+        load_group(st, kt, rbase, sbase, sRaw, sSide, r_in8, r_sf, G)
+        if cutlass.const_expr(st.fp4 and not st.sf_staged):
             for a in cutlass.range_constexpr(SF_AHEAD):
                 for g in cutlass.range_constexpr(G):
                     load_sf(
@@ -671,7 +860,7 @@ def convert_slot(
                         d0 // GROUP + g,
                         pg0,
                         mSF,
-                        sPg,
+                        sSide,
                         kv_ptr0,
                         kv_head,
                         cute.make_tensor(
@@ -681,15 +870,7 @@ def convert_slot(
                     )
         for i in cutlass.range(n_rounds, unroll=1):
             key = kt + i * KPI
-            load_group(
-                st,
-                key + KPI,
-                rbase,
-                sRaw,
-                cute.make_tensor(r_in8.iterator + G * EB, cute.make_layout((G * EB,))),
-                G,
-            )
-            if cutlass.const_expr(st.fp4):
+            if cutlass.const_expr(st.fp4 and not st.sf_staged):
                 for g in cutlass.range_constexpr(G):
                     load_sf(
                         st,
@@ -698,7 +879,7 @@ def convert_slot(
                         d0 // GROUP + g,
                         pg0,
                         mSF,
-                        sPg,
+                        sSide,
                         kv_ptr0,
                         kv_head,
                         cute.make_tensor(
@@ -713,6 +894,9 @@ def convert_slot(
                     dequant_group(r_g, e4m3_byte_to_f32(r_sf[g]), r_out)
                 else:
                     widen_group(st, r_g, r_out)
+                if cutlass.const_expr(g == G - 1):
+                    # the next round's staged bytes, issued once this round's are consumed: they arrive under the stores
+                    load_group(st, key + KPI, rbase, sbase, sRaw, sSide, r_in8, r_sf, G)
                 # the two 16-byte granules of the group in the SW128 slot (bf16 element offsets, then 32-bit words)
                 dg = d0 + g * GROUP
                 base = (
@@ -721,8 +905,8 @@ def convert_slot(
                     + skk * HALF
                 )
                 gran = (dg % HALF) // 8
-                g0 = base + ((gran ^ (skk % 8)) * 8)
-                g1 = base + (((gran + 1) ^ (skk % 8)) * 8)
+                g0 = base + ((gran ^ (skk & 7)) * 8)
+                g1 = base + (((gran + 1) ^ (skk & 7)) * 8)
                 cute.autovec_copy(
                     cute.make_tensor(r_out.iterator, cute.make_layout((4,))),
                     cute.make_tensor(
@@ -737,9 +921,7 @@ def convert_slot(
                         cute.make_layout((4,)),
                     ),
                 )
-            for j in cutlass.range_constexpr(G * EW):
-                r_in[j] = r_in[G * EW + j]
-            if cutlass.const_expr(st.fp4):
+            if cutlass.const_expr(st.fp4 and not st.sf_staged):
                 for a in cutlass.range_constexpr(SF_AHEAD * G):
                     r_sf[a] = r_sf[a + G]
         rh.release()
@@ -757,7 +939,7 @@ def convert_tile(
     mSF: cute.Tensor,
     sKV_u32: cute.Tensor,
     sRaw: cute.Tensor,
-    sPg: cute.Tensor,
+    sSide: cute.Tensor,
     kv_ptr0: Int32,
     kv_head: Int32,
     ctid: Int32,
@@ -781,7 +963,7 @@ def convert_tile(
             mSF,
             sKV_u32,
             sRaw,
-            sPg,
+            sSide,
             kv_ptr0,
             kv_head,
             ctid,
@@ -806,7 +988,7 @@ def convert_unit(
     mVsf: cute.Tensor,
     sKV_u32: cute.Tensor,
     sRaw: cute.Tensor,
-    sPg: cute.Tensor,
+    sSide: cute.Tensor,
     mKvIndptr: cute.Tensor,
     req: Int32,
     kv_head: Int32,
@@ -836,7 +1018,7 @@ def convert_unit(
         mKsf,
         sKV_u32,
         sRaw,
-        sPg,
+        sSide,
         kv_ptr0,
         kv_head,
         ctid,
@@ -859,7 +1041,7 @@ def convert_unit(
                 mKsf,
                 sKV_u32,
                 sRaw,
-                sPg,
+                sSide,
                 kv_ptr0,
                 kv_head,
                 ctid,
@@ -881,7 +1063,7 @@ def convert_unit(
                 mVsf,
                 sKV_u32,
                 sRaw,
-                sPg,
+                sSide,
                 kv_ptr0,
                 kv_head,
                 ctid,
@@ -903,7 +1085,7 @@ def convert_unit(
                     mKsf,
                     sKV_u32,
                     sRaw,
-                    sPg,
+                    sSide,
                     kv_ptr0,
                     kv_head,
                     ctid,
@@ -927,7 +1109,7 @@ def convert_unit(
                     mKsf,
                     sKV_u32,
                     sRaw,
-                    sPg,
+                    sSide,
                     kv_ptr0,
                     kv_head,
                     ctid,
@@ -948,7 +1130,7 @@ def convert_unit(
                 mVsf,
                 sKV_u32,
                 sRaw,
-                sPg,
+                sSide,
                 kv_ptr0,
                 kv_head,
                 ctid,
