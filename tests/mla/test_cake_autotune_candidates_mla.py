@@ -9,9 +9,9 @@ while the tuner may select it and never while an autotune process group tunes;
 that the committed offer table is well formed and lists only measured units; that a tuning bucket
 offers Cake only when every batch the bucket serves is listed and launches the
 programs of the profiled batch; that Cake is profiled only against a first-stage
-winner and a Cake choice stays valid only while that winner does; that the
-second stage times cold-L2 chains of launches while the first keeps its single
-cold replay; that the memo state and the tuning buckets are what the tuner's
+winner and a Cake choice stays valid only while that winner does; that both
+stages time a single cold replay and the second keeps Cake at an exact tie with
+the first stage's winner; that the memo state and the tuning buckets are what the tuner's
 accessors and the unmemoized computation give; that an
 untuned call never selects Cake and every Cake miss runs the first stage's
 selection; that a repeated lookup-only call of a listed batch reuses the
@@ -345,7 +345,7 @@ def test_first_stage_is_unchanged_and_cake_joins_the_second(
     assert disabled[0][1] and "cake" not in disabled[0][1]
     assert enabled[0][:2] == disabled[0][:2] and enabled[0][2] is disabled[0][2]
     assert [call[:2] for call in enabled[1:]] == [
-        (core._MLA_CAKE_MARGIN_OP, ["incumbent", "cake"])
+        (core._MLA_CAKE_MARGIN_OP, ["cake", "incumbent"])
     ]
     first, second = enabled[0][2], enabled[1][2]
     assert (
@@ -813,7 +813,7 @@ def test_untuned_auto_builds_no_cake_runner(monkeypatch, fresh_tuner):
     held = _candidate_calls(monkeypatch, case)
     assert held[0][:2] == calls[0][:2]
     assert [call[:2] for call in held[1:]] == [
-        (core._MLA_CAKE_MARGIN_OP, ["incumbent", "cake"])
+        (core._MLA_CAKE_MARGIN_OP, ["cake", "incumbent"])
     ]
 
 
@@ -1581,82 +1581,100 @@ def test_cake_selected_where_it_beat_the_first_stage(stages):
         assert stages.select(batch_size) == (stages.runners[1], -1), batch_size
 
 
-def test_cake_not_selected_at_a_tie(stages):
-    """Cake must measure faster than the first-stage winner. No GPU needed."""
-    stages.times[core._CAKE_MLA_RUNNER] = stages.times["_FakeCuteDsl"]
-    stages.select(4, tune=True)
+def _tie_times(stages, outcome):
+    """Sets Cake's stubbed time against the first stage's winner (CuTe DSL)
+    and returns the expected second-stage winner entry and decision."""
+    first_stage = stages.times["_FakeCuteDsl"]
+    stages.times[core._CAKE_MLA_RUNNER] = {
+        "tie": first_stage,
+        "first_stage_faster": first_stage * 1.5,
+        "cake_faster": first_stage * 0.5,
+    }[outcome]
+    if outcome == "first_stage_faster":
+        return ("_MlaStageOneWinnerRunner", WINNER), (stages.runners[1], -1)
+    return (core._CAKE_MLA_RUNNER, WINNER), ("cake", WINNER)
+
+
+@pytest.mark.parametrize("outcome", ["tie", "first_stage_faster", "cake_faster"])
+def test_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
+    """An exact tie between Cake and the first stage's winner selects Cake: it
+    is stored as the second stage's winner of every offered bucket, selected by
+    the tuned call and by lookups, and memoized for lookup-only calls. A
+    strictly faster first-stage winner still wins, and a strictly faster Cake
+    wins. No GPU needed."""
+    winner, expected = _tie_times(stages, outcome)
+    assert _decision(stages.select(4, tune=True)) == expected
     assert stages.cake_profiled() == [1, 2, 4, 8]
-    assert set(stages.entries(core._MLA_CAKE_MARGIN_OP).values()) == {
-        ("_MlaStageOneWinnerRunner", WINNER)
+    assert stages.incumbent_profiled() == [1, 2, 4, 8]
+    assert stages.entries(core._MLA_CAKE_MARGIN_OP) == {
+        bucket: winner for bucket in (1, 2, 4, 8)
     }
-    assert stages.select(4) == (stages.runners[1], -1)
+    lookups = _count_margin_lookups(monkeypatch)
+    for batch_size in (1, 4, 9, 15):
+        inputs = _cpu_inputs(torch.bfloat16, batch_size)
+        assert _decision(stages.select(inputs=inputs)) == expected, batch_size
+        before = lookups[0]
+        for _ in range(2):
+            assert _decision(stages.select(inputs=inputs, memo=True)) == expected
+        # Looked up once, then reused from the memo.
+        assert lookups[0] - before == 1, batch_size
+    assert any(
+        entry[0]() is stages.tuner and entry[3] is not None
+        for entry in core._CAKE_MLA_STAGE_TWO_MEMO.values()
+    ) == (expected[0] == "cake")
+    for batch_size in (16, 31):
+        assert stages.select(batch_size) == (stages.runners[1], -1), batch_size
+
+
+@pytest.mark.parametrize("outcome", ["tie", "first_stage_faster", "cake_faster"])
+def test_round_up_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
+    """Under ``autotune(round_up=True)`` the second stage uses the first
+    stage's config; there too an exact tie selects Cake, and a strictly faster
+    first-stage winner wins. No GPU needed."""
+    winner, expected = _tie_times(stages, outcome)
+    with autotune(False, round_up=True):
+        assert _decision(stages.select(4, tune=True)) == expected
+        assert 4 in stages.cake_profiled()
+        entries = stages.entries(core._MLA_CAKE_MARGIN_OP)
+        assert entries and set(entries.values()) == {winner}
+        assert _decision(stages.select(4)) == expected
+
+
+def test_second_stage_lists_cake_first_outside_autotune_v2(fresh_tuner):
+    """Cake is the second stage's first candidate, so the tuner's strict
+    minimum keeps it at a tie; inside an ``autotune_v2`` context, where the
+    first candidate also races the default tactic (the first stage's
+    selection), the first-stage winner stays first. No GPU needed."""
+    cake = _cpu_runner(torch.bfloat16, 64)
+    incumbent = core._MlaStageOneWinnerRunner(
+        [_FakeTrtllmGen(), _FakeCuteDsl()], None, [], cake
+    )
+    order = core._mla_cake_stage_two_runners
+    assert order(fresh_tuner, incumbent, cake) == [cake, incumbent]
+    with autotune_v2(mode="replay", persistent_cache=False):
+        assert fresh_tuner._in_v2_context
+        assert order(fresh_tuner, incumbent, cake) == [incumbent, cake]
+    assert order(fresh_tuner, incumbent, cake) == [cake, incumbent]
 
 
 def _record_policies(monkeypatch):
-    """Records ``(profiled runner class, L2 policy)`` of every measurement of
-    the stubbed profiling of ``_Stages``."""
+    """Records ``(profiled runner class, L2 policy, cold chain launches)`` of
+    every measurement of the stubbed profiling of ``_Stages``."""
     recorded = []
     profile = AutoTuner._profile_single_kernel
 
     def record(tuner, runner, inputs, tactic, tuning_config, **kwargs):
-        recorded.append((type(runner).__name__, tuning_config.l2_cache_policy))
+        recorded.append(
+            (
+                type(runner).__name__,
+                tuning_config.l2_cache_policy,
+                tuning_config.cold_chain_launches,
+            )
+        )
         return profile(tuner, runner, inputs, tactic, tuning_config, **kwargs)
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record)
     return recorded
-
-
-_CHAIN_POLICY = f"cold-chain:{core._MLA_CAKE_MARGIN_CHAIN_LAUNCHES}"
-
-
-def test_second_stage_times_a_cold_chain(monkeypatch, stages):
-    """The second stage times cold-L2 chains of launches on query and output
-    lanes; the first stage keeps its config object and its single cold
-    replay. The second stage's winners carry the chained policy, so a
-    strict-replay lookup hits with it and misses with the single-replay
-    policy. No GPU needed."""
-    first = stages.config
-    assert first is core._mla_decode_tuning_config(
-        buckets=stages.BUCKETS, num_pages=8, profile_seq_len=1024
-    )
-    assert (first.cold_chain_launches, first.profile_arena_input_indices) == (1, ())
-    assert first.l2_cache_policy == "cold"
-    second = core._mla_cake_margin_tuning_config(first, stages.ranges)
-    assert second.uses_cold_chain and second.l2_cache_policy == _CHAIN_POLICY
-    assert core._MLA_CAKE_MARGIN_CHAIN_LAUNCHES > 1
-    assert second.profile_arena_input_indices == (0, 3)  # query, out
-    # Besides the buckets, only the chain differs from the first stage.
-    single = replace(second, cold_chain_launches=1, profile_arena_input_indices=())
-    assert replace(single, dynamic_tensor_specs=first.dynamic_tensor_specs) == first
-
-    recorded = _record_policies(monkeypatch)
-    runner, tactic = stages.select(4, tune=True)
-    assert _name(runner) == "cake" and tactic == WINNER
-    policies = {}
-    for name, policy in recorded:
-        policies.setdefault(name, set()).add(policy)
-    assert policies == {
-        "_FakeTrtllmGen": {"cold"},
-        "_FakeCuteDsl": {"cold"},
-        "_MlaStageOneWinnerRunner": {_CHAIN_POLICY},
-        core._CAKE_MLA_RUNNER: {_CHAIN_POLICY},
-    }
-    stored = {
-        (key.custom_op, policy[policy.index("l2_cache_policy") + 1])
-        for (_, key), policy in stages.tuner._profiling_cache_policies.items()
-    }
-    assert stored == {
-        (core._MLA_DECODE_OP, "cold"),
-        (core._MLA_CAKE_MARGIN_OP, _CHAIN_POLICY),
-    }
-
-    monkeypatch.setattr(stages.tuner._v2_local, "strict_replay", True)
-    runner, tactic = stages.select(4)
-    assert _name(runner) == "cake" and tactic == WINNER
-    monkeypatch.setattr(
-        core, "_mla_cake_margin_tuning_config", lambda config, ranges: single
-    )
-    assert stages.select(4) == (stages.runners[1], -1)
 
 
 def _margin_policies(tuner):
@@ -1668,49 +1686,38 @@ def _margin_policies(tuner):
     }
 
 
-def test_second_stage_retunes_single_replay_entries(monkeypatch, stages):
-    """Second-stage winners stored under the single cold replay (as before the
-    chain) are not reused when tuning again: the tuning lookup rejects their
-    policy, so the incumbent and Cake are timed anew with the chain and the
-    stored policy becomes the chained one. No GPU needed."""
-    single = replace(
-        core._mla_cake_margin_tuning_config(stages.config, stages.ranges),
-        cold_chain_launches=1,
-        profile_arena_input_indices=(),
-    )
-    assert single.l2_cache_policy == "cold"
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            core, "_mla_cake_margin_tuning_config", lambda config, ranges: single
-        )
-        stages.select(4, tune=True)
-    assert stages.cake_profiled() == [1, 2, 4, 8]
+@pytest.mark.parametrize("round_up", [False, True])
+def test_second_stage_times_a_single_cold_replay(monkeypatch, stages, round_up):
+    """Both stages time a single cold replay per sample: the second stage's
+    config differs from the first stage's only in its buckets, and both ops
+    store the ``cold`` policy (also under ``autotune(round_up=True)``, where
+    the second stage uses the first stage's config). No GPU needed."""
+    first = stages.config
+    second = core._mla_cake_margin_tuning_config(first, stages.ranges)
+    assert (second.cold_chain_launches, second.profile_arena_input_indices) == (1, ())
+    assert replace(second, dynamic_tensor_specs=first.dynamic_tensor_specs) == first
+    assert second.l2_cache_policy == first.l2_cache_policy == "cold"
+
+    recorded = _record_policies(monkeypatch)
+    context = autotune(False, round_up=True) if round_up else contextlib.nullcontext()
+    with context:
+        assert _decision(stages.select(4, tune=True)) == ("cake", WINNER)
+    assert {name for name, _, _ in recorded} == {
+        "_FakeTrtllmGen",
+        "_FakeCuteDsl",
+        "_MlaStageOneWinnerRunner",
+        core._CAKE_MLA_RUNNER,
+    }
+    assert {(policy, chain) for _, policy, chain in recorded} == {("cold", 1)}
+    stored = {
+        (key.custom_op, policy[policy.index("l2_cache_policy") + 1])
+        for (_, key), policy in stages.tuner._profiling_cache_policies.items()
+    }
+    assert stored == {
+        (core._MLA_DECODE_OP, "cold"),
+        (core._MLA_CAKE_MARGIN_OP, "cold"),
+    }
     assert _margin_policies(stages.tuner) == {"cold"}
-    assert stages.entries(core._MLA_CAKE_MARGIN_OP) == _CAKE_WINS
-
-    stages.profiled.clear()
-    recorded = _record_policies(monkeypatch)
-    runner, tactic = stages.select(4, tune=True)
-    assert _name(runner) == "cake" and tactic == WINNER
-    assert stages.cake_profiled() == [1, 2, 4, 8]
-    assert stages.incumbent_profiled() == [1, 2, 4, 8]
-    assert {
-        policy
-        for name, policy in recorded
-        if name in ("_MlaStageOneWinnerRunner", core._CAKE_MLA_RUNNER)
-    } == {_CHAIN_POLICY}
-    assert _margin_policies(stages.tuner) == {_CHAIN_POLICY}
-    assert stages.entries(core._MLA_CAKE_MARGIN_OP) == _CAKE_WINS
-
-
-def test_round_up_second_stage_keeps_the_single_cold_replay(monkeypatch, stages):
-    """Under ``autotune(round_up=True)`` the second stage uses the first
-    stage's config, with its single cold replay. No GPU needed."""
-    recorded = _record_policies(monkeypatch)
-    with autotune(False, round_up=True):
-        stages.select(4, tune=True)
-    assert any(name == core._CAKE_MLA_RUNNER for name, _ in recorded)
-    assert {policy for _, policy in recorded} == {"cold"}
 
 
 def test_untuned_call_never_selects_cake(stages):
@@ -1902,7 +1909,8 @@ def _decision(result):
 
 
 @pytest.mark.parametrize(
-    "scenario", ["cake_won", "first_stage_kept", "untuned", "other_first_stage"]
+    "scenario",
+    ["cake_won", "cake_tied", "first_stage_kept", "untuned", "other_first_stage"],
 )
 def test_memoized_second_stage_matches_the_lookup(monkeypatch, stages, scenario):
     """With the dispatcher's memo key the second stage looks up once per request
@@ -1910,13 +1918,16 @@ def test_memoized_second_stage_matches_the_lookup(monkeypatch, stages, scenario)
     a lookup: the (runner, tactic) the lookup returns, for every batch of the
     offered buckets, and the first stage's selection without a lookup outside
     them. No GPU needed."""
-    if scenario == "first_stage_kept":
+    if scenario == "cake_tied":
         stages.times[core._CAKE_MLA_RUNNER] = stages.times["_FakeCuteDsl"]
+    elif scenario == "first_stage_kept":
+        stages.times[core._CAKE_MLA_RUNNER] = 1.5 * stages.times["_FakeCuteDsl"]
     if scenario != "untuned":
         stages.select(4, tune=True)
     selected = (stages.runners[0], -1) if scenario == "other_first_stage" else None
     expected = {
         "cake_won": ("cake", WINNER),
+        "cake_tied": ("cake", WINNER),
         "first_stage_kept": (stages.runners[1], -1),
         "untuned": (stages.runners[0], -1),
         "other_first_stage": (stages.runners[0], -1),
@@ -2363,7 +2374,7 @@ def test_autotuned_auto_matches_reference(
         if op == core._MLA_DECODE_OP:
             assert names and "cake" not in names
         else:
-            assert names == ["incumbent", "cake"]
+            assert names == ["cake", "incumbent"]
     assert any(profiled), "the Cake candidate was never profiled"
     # The cached call makes the first selection, and the second (a lookup)
     # while the tuner holds a Cake winner.
@@ -2376,79 +2387,99 @@ def test_autotuned_auto_matches_reference(
 
 
 @pytest.mark.parametrize(
-    "dtype,batch_size,q_len,page_size",
+    "dtype,batch_size,q_len,page_size,max_seq_len",
     [
-        (torch.bfloat16, 4, 1, 32),
-        (torch.float8_e4m3fn, 2, 2, 64),
+        (torch.bfloat16, 1, 1, 64, 128),
+        (torch.bfloat16, 2, 1, 64, 256),
+        (torch.float8_e4m3fn, 2, 2, 64, 1024),
     ],
 )
-def test_second_stage_chain_times_both_candidates(
-    monkeypatch, clean_tuner, dtype, batch_size, q_len, page_size
+def test_second_stage_decision_follows_its_measurements(
+    monkeypatch, clean_tuner, dtype, batch_size, q_len, page_size, max_seq_len
 ):
-    """Real tuning of an offered unit: every second-stage measurement of the
-    incumbent and of Cake times the cold chain and returns a finite time
-    without an error; the chain's inputs have laned query and output, and
-    one block_tables and seq_lens; the second stage records no failed profile
-    and stores the chained policy. (A measurement error is otherwise only
-    logged and timed as infinite, and the call stays correct.)"""
+    """Real tuning of a small offered unit: the second stage times the
+    incumbent and Cake once per offered bucket with the single cold replay,
+    finite and without an error, and stores Cake exactly where Cake's time is
+    at most the incumbent's (an exact tie selects Cake). The tuned call and a
+    later lookup-only call run what the stored winner of their bucket says,
+    and the output matches the reference. (Whether the two measure equal is up
+    to the timer, so the test checks the decision against the recorded
+    measurements rather than forcing a tie.)"""
     _require_cake_arch()
     margin_runners = {"_MlaStageOneWinnerRunner", core._CAKE_MLA_RUNNER}
-    measured = []
+    # {(runner class, profiled batch): [time or exception]}
+    measured: dict = {}
+    # (L2 policy, cold chain launches) of every second-stage measurement.
+    policies = set()
     profile = AutoTuner._profile_single_kernel
 
     def record(tuner, runner, inputs, tactic, tuning_config, *args, **kwargs):
         name = type(runner).__name__
+        times = measured.setdefault((name, inputs[0].size(0)), [])
+        if name in margin_runners:
+            policies.add(
+                (tuning_config.l2_cache_policy, tuning_config.cold_chain_launches)
+            )
         try:
             result = profile(
                 tuner, runner, inputs, tactic, tuning_config, *args, **kwargs
             )
         except Exception as exc:
-            measured.append((name, tuning_config.l2_cache_policy, exc))
+            times.append(exc)
             raise
-        measured.append((name, tuning_config.l2_cache_policy, result))
+        times.append(result)
         return result
 
-    chains = []
-    prepare = AutoTuner._prepare_input_tensors_with_batches
-
-    def record_batches(tuner, inputs, tuning_config):
-        batches = prepare(tuner, inputs, tuning_config)
-        if tuning_config.uses_cold_chain:
-            chains.append((inputs, batches))
-        return batches
-
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record)
-    monkeypatch.setattr(
-        AutoTuner, "_prepare_input_tensors_with_batches", record_batches
-    )
     case = _make_case(
-        dtype=dtype, batch_size=batch_size, q_len=q_len, page_size=page_size
+        dtype=dtype,
+        batch_size=batch_size,
+        q_len=q_len,
+        page_size=page_size,
+        max_seq_len=max_seq_len,
     )
     _offer_case(monkeypatch, case)
     failed = clean_tuner.stats.failed_profiling_count
     failed_before = set(failed.get(core._MLA_CAKE_MARGIN_OP, ()))
+    results = _spy_stage_two(monkeypatch)
 
     with autotune(True, tuning_buckets=TUNING_BUCKETS):
         tuned = _decode(case)
+    tuned_decision = results[-1]
 
-    margin = [entry for entry in measured if entry[0] in margin_runners]
-    assert {name for name, _, _ in margin} == margin_runners
-    for name, policy, result in margin:
-        assert policy == _CHAIN_POLICY, (name, policy)
-        assert not isinstance(result, BaseException), (name, result)
-        assert math.isfinite(result) and result > 0, (name, result)
+    buckets = {batch for name, batch in measured if name == core._CAKE_MLA_RUNNER}
+    assert batch_size in buckets
+    assert buckets == {
+        batch for name, batch in measured if name == "_MlaStageOneWinnerRunner"
+    }
+    stored = {
+        key.nearest_profile[0][0]: key.runner_class_name
+        for key in clean_tuner._winner_cache()
+        if key.custom_op == core._MLA_CAKE_MARGIN_OP
+    }
+    for bucket in buckets:
+        [cake_time] = measured[(core._CAKE_MLA_RUNNER, bucket)]
+        [incumbent_time] = measured[("_MlaStageOneWinnerRunner", bucket)]
+        for result in (cake_time, incumbent_time):
+            assert not isinstance(result, BaseException), (bucket, result)
+            assert math.isfinite(result) and result > 0, (bucket, result)
+        expected = (
+            core._CAKE_MLA_RUNNER
+            if cake_time <= incumbent_time
+            else "_MlaStageOneWinnerRunner"
+        )
+        assert stored.get(bucket) == expected, (bucket, cake_time, incumbent_time)
+    assert policies == {("cold", 1)}
     assert set(failed.get(core._MLA_CAKE_MARGIN_OP, ())) == failed_before
-    assert _margin_policies(clean_tuner) == {_CHAIN_POLICY}
-    assert chains
-    for inputs, batches in chains:
-        assert len(batches) == core._MLA_CAKE_MARGIN_CHAIN_LAUNCHES
-        for index in core._MLA_CAKE_MARGIN_ARENA_INPUTS:
-            assert len({batch[index].data_ptr() for batch in batches}) > 1, index
-        for index in (1, 2):
-            assert {batch[index].data_ptr() for batch in batches} == {
-                inputs[index].data_ptr()
-            }, index
+    assert _margin_policies(clean_tuner) == {"cold"}
+
+    cake_selected = stored[batch_size] == core._CAKE_MLA_RUNNER
+    assert (_name(tuned_decision[0]) == "cake") == cake_selected
+    with autotune(False):
+        cached = _decode(dict(case, out=_nan_out(case)))
+    assert (_name(results[-1][0]) == "cake") == cake_selected
     _assert_matches_reference(tuned, case, "tuned")
+    _assert_matches_reference(cached, case, "cached")
 
 
 @pytest.mark.parametrize(
@@ -2624,8 +2655,13 @@ def _force_cake(monkeypatch, case):
     def search_cache(self, op, runners, *args, **kwargs):
         if op != core._MLA_CAKE_MARGIN_OP:
             return original_search_cache(self, op, runners, *args, **kwargs)
-        forced.append((runners[-1], list(kwargs["inputs"])))
-        return True, len(runners) - 1, beaten(), None
+        [index] = [
+            index
+            for index, runner in enumerate(runners)
+            if isinstance(runner, core._CakeTrtllmMlaBlackwellRunner)
+        ]
+        forced.append((runners[index], list(kwargs["inputs"])))
+        return True, index, beaten(), None
 
     monkeypatch.setattr(
         core.AutoTuner, "may_select_runner_class", lambda self, name: True
@@ -3259,7 +3295,7 @@ def test_cake_build_failure_drops_cake_from_tuning(monkeypatch, clean_tuner):
         core._MLA_DECODE_OP,
         core._MLA_CAKE_MARGIN_OP,
     ]
-    assert [_name(r) for r in calls[1][1]] == ["incumbent", "cake"]
+    assert [_name(r) for r in calls[1][1]] == ["cake", "incumbent"]
     (runner, _), first_stage = results[-1], calls[0][2]
     assert runner is first_stage[0]
     assert profiled and all(tactics == [] for tactics in profiled)
