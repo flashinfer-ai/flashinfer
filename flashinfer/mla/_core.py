@@ -4129,8 +4129,8 @@ class _MlaStageOneWinnerRunner(TunableRunner):
 
     def validate_tactic_for_profile(self, inputs, tactic, profile) -> bool:
         """A reused bucket stays valid while the first stage keeps its winner.
-        The default tactic ``-1`` (raced by ``autotune_v2`` contexts) beat Cake
-        as well, so it stays valid."""
+        The default tactic ``-1`` (raced by ``autotune_v2`` contexts) beat or
+        tied Cake as well, so it stays valid."""
         return tactic == -1 or tactic == self.profile_winner(profile)
 
     def get_cache_key_extras(self, inputs):
@@ -4313,14 +4313,19 @@ def _mla_cake_stage_two_runners(
     most 1.00 of the best other candidate. The tuner's single cold replay
     quantizes a microsecond decode kernel to steps of about 2 us, so a tie in
     an offered unit is the timer's resolution, not evidence that the first
-    stage's winner is faster. Under ``autotune(tie_tolerance=...)`` Cake is
-    likewise kept within the tolerance once its re-timing confirms it.
+    stage's winner is faster. ``autotune(tie_tolerance=...)`` widens a tie to
+    the tolerance: the tuner re-times the earlier candidate and keeps it while
+    its mean stays within the tolerance, so Cake is then kept against a
+    first-stage winner faster by at most the tolerance, and a first-stage
+    winner faster by more still wins.
 
-    Inside an ``autotune_v2`` context the first candidate also races the
-    default tactic ``-1``, the not-tuned path, which for the second stage is
-    the first stage's selection; there the first-stage winner stays first (an
-    exact tie keeps it). The order decides no cache key, and every consumer
-    identifies Cake by the runner object, never by its position."""
+    Inside an ``autotune_v2`` context the tuner also races the default tactic
+    ``-1`` of the first candidate, even where that candidate offers no tactic
+    for a bucket. Cake does not serve every bucket, so there the first-stage
+    winner stays first (as before this order existed, an exact tie keeps it);
+    its ``-1`` runs the first stage's default runner. The order decides no
+    cache key, and every consumer identifies Cake by the runner object, never
+    by its position."""
     if tuner._in_v2_context:
         return [incumbent, cake]
     return [cake, incumbent]
@@ -4379,8 +4384,8 @@ def _mla_cake_stage_two(
     lookup_only = not tuner.is_tuning_mode or torch.cuda.is_current_stream_capturing()
     if lookup_only and not _in_batch_ranges(inputs[0].size(0), batch_ranges):
         return selected
-    # A Cake choice runs only in place of the first-stage selection it beat
-    # (also where replay diagnostics made the first stage's lookup miss).
+    # A Cake choice runs only in place of the first-stage selection it beat or
+    # tied (also where replay diagnostics made the first stage's lookup miss).
     beaten = (type(selected[0]).__name__, selected[1])
     state = memo_entry_key = None
     if lookup_only and memoizable is not None:
@@ -5465,8 +5470,8 @@ def _mla_with_kv_cache_impl(
     tuning bucket, under the same ``autotune()`` settings including
     ``tie_tolerance``, and keeps Cake at an exact tie (outside ``autotune_v2``
     contexts); it profiles Cake only against a first-stage winner, and a
-    Cake result is valid only while the first stage keeps the winner Cake beat.
-    The second stage runs only for the units the device's offer table
+    Cake result is valid only while the first stage keeps the winner Cake
+    beat or tied. The second stage runs only for the units the device's offer table
     (``_CAKE_MLA_AUTO_OFFERS``: device, dtype, page size, ``q_len``,
     ``max_seq_len`` bucket and batch range) lists, where Cake measured faster
     than the other candidates; elsewhere, and on devices the table does not

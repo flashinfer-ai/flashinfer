@@ -1605,21 +1605,31 @@ def _tie_times(stages, outcome):
     first_stage = stages.times["_FakeCuteDsl"]
     stages.times[core._CAKE_MLA_RUNNER] = {
         "tie": first_stage,
+        # The smallest margin: no bias towards Cake beyond an exact tie.
+        "first_stage_barely_faster": math.nextafter(first_stage, math.inf),
         "first_stage_faster": first_stage * 1.5,
         "cake_faster": first_stage * 0.5,
     }[outcome]
-    if outcome == "first_stage_faster":
+    if outcome.startswith("first_stage"):
         return ("_MlaStageOneWinnerRunner", WINNER), (stages.runners[1], -1)
     return (core._CAKE_MLA_RUNNER, WINNER), ("cake", WINNER)
 
 
-@pytest.mark.parametrize("outcome", ["tie", "first_stage_faster", "cake_faster"])
+_TIE_OUTCOMES = [
+    "tie",
+    "first_stage_barely_faster",
+    "first_stage_faster",
+    "cake_faster",
+]
+
+
+@pytest.mark.parametrize("outcome", _TIE_OUTCOMES)
 def test_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
     """An exact tie between Cake and the first stage's winner selects Cake: it
     is stored as the second stage's winner of every offered bucket, selected by
     the tuned call and by lookups, and memoized for lookup-only calls. A
-    strictly faster first-stage winner still wins, and a strictly faster Cake
-    wins. No GPU needed."""
+    strictly faster first-stage winner still wins, even by the smallest
+    margin, and a strictly faster Cake wins. No GPU needed."""
     winner, expected = _tie_times(stages, outcome)
     assert _decision(stages.select(4, tune=True)) == expected
     assert stages.cake_profiled() == [1, 2, 4, 8]
@@ -1644,7 +1654,7 @@ def test_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
         assert stages.select(batch_size) == (stages.runners[1], -1), batch_size
 
 
-@pytest.mark.parametrize("outcome", ["tie", "first_stage_faster", "cake_faster"])
+@pytest.mark.parametrize("outcome", _TIE_OUTCOMES)
 def test_round_up_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
     """Under ``autotune(round_up=True)`` the second stage uses the first
     stage's config; there too an exact tie selects Cake, and a strictly faster
@@ -1656,6 +1666,30 @@ def test_round_up_second_stage_tie_selects_cake(monkeypatch, stages, outcome):
         entries = stages.entries(core._MLA_CAKE_MARGIN_OP)
         assert entries and set(entries.values()) == {winner}
         assert _decision(stages.select(4)) == expected
+
+
+@pytest.mark.parametrize(
+    "cake_ratio,cake_kept", [(1.0, True), (1.02, True), (1.1, False), (0.9, True)]
+)
+def test_second_stage_tie_tolerance_keeps_cake_within_it(stages, cake_ratio, cake_kept):
+    """``autotune(tie_tolerance=0.05)`` widens the second stage's tie to 5 %:
+    Cake is kept against a first-stage winner faster by at most 5 % (its
+    re-timing confirms it), and a first-stage winner faster by more wins.
+    No GPU needed."""
+    stages.times[core._CAKE_MLA_RUNNER] = stages.times["_FakeCuteDsl"] * cake_ratio
+    if cake_kept:
+        winner, expected = (core._CAKE_MLA_RUNNER, WINNER), ("cake", WINNER)
+    else:
+        winner = ("_MlaStageOneWinnerRunner", WINNER)
+        expected = (stages.runners[1], -1)
+    with autotune(False, tie_tolerance=0.05):
+        assert _decision(stages.select(4, tune=True)) == expected
+        assert stages.entries(core._MLA_CAKE_MARGIN_OP) == {
+            bucket: winner for bucket in (1, 2, 4, 8)
+        }
+        assert _decision(stages.select(4)) == expected
+    # The first stage keeps its own winner (CuTe DSL, 2x faster than TRTLLM-GEN).
+    assert set(stages.entries(core._MLA_DECODE_OP).values()) == {("_FakeCuteDsl", -1)}
 
 
 def test_second_stage_lists_cake_first_outside_autotune_v2(fresh_tuner):
@@ -2558,9 +2592,16 @@ def test_second_stage_decision_follows_its_measurements(
 
     cake_selected = stored[batch_size] == core._CAKE_MLA_RUNNER
     assert (_name(tuned_decision[0]) == "cake") == cake_selected
+    before = len(results)
     with autotune(False):
         cached = _decode(dict(case, out=_nan_out(case)))
-    assert (_name(results[-1][0]) == "cake") == cake_selected
+    # The lookup-only call reaches the second stage while the tuner holds a
+    # Cake winner; then it follows the stored winner of its bucket.
+    if clean_tuner.may_select_runner_class(core._CAKE_MLA_RUNNER):
+        assert len(results) == before + 1
+        assert (_name(results[-1][0]) == "cake") == cake_selected
+    else:
+        assert len(results) == before and not cake_selected
     _assert_matches_reference(tuned, case, "tuned")
     _assert_matches_reference(cached, case, "cached")
 
