@@ -209,7 +209,17 @@ use an older valid winner until retuning. A capture inside ``autotune(True)``
 does check the signature, and a changed one fails there like any other tuning
 miss, because profiling cannot start during capture. Runners returning ``None``
 (the default) retain their existing behavior; this does not detect undeclared
-tactic-pool changes or change ``rank_tactics(k > 1)`` shortlist reuse.
+tactic-pool changes.
+
+``rank_tactics(k > 1)`` also checks the signature before reusing its
+process-local shortlist. A change on any rank makes the tuning group rebuild
+the shortlist together. An unchanged signature reuses the ranking without
+input synthesis or profiling. The saved signature precedes enumeration and
+runner preparation, just as for ``choose_one()``. A cache miss during CUDA
+Graph capture fails before preparation; warm hits remain usable.
+Shortlists retain their existing store/policy ownership and are not persisted.
+Ranking still compares explicitly enumerated tactics; it does not replace
+v2's separate default-candidate comparison in ``choose_one()``.
 
 Caching in the Benchmark Harness
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

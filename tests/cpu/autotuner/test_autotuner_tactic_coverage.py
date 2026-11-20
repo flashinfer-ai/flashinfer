@@ -235,3 +235,121 @@ def test_signature_changed_by_preparation_retunes(setup, mode):
     with tuning(mode):
         assert tuner.choose_one("growing", [runner], config, inputs) == (runner, 2)
     assert (GrowingRunner, 2) in calls
+
+
+@pytest.mark.parametrize("mode", ["v1", "v2", "managed"])
+@pytest.mark.parametrize("updated", [(1, 3, 2), (1,)])
+def test_shortlist_refreshes_changed_pool_and_reuses_warm_ranking(
+    setup, monkeypatch, mode, updated
+):
+    tuner, calls = setup
+    runner = PoolRunner([1, 3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with tuning(mode):
+        assert tuner.rank_tactics("ranked", [runner], config, inputs, k=2) == [3, 1]
+        runner.tactics = list(updated)
+        calls.clear()
+        expected = [2, 3] if 2 in updated else [1]
+        assert tuner.rank_tactics("ranked", [runner], config, inputs, k=2) == expected
+        assert [tactic for _, tactic in calls] == list(updated)
+        calls.clear()
+        monkeypatch.setattr(
+            tuner, "_prepare_input_tensors", lambda *args: pytest.fail("warm synthesis")
+        )
+        monkeypatch.setattr(
+            runner, "get_valid_tactics", lambda *args: pytest.fail("warm enumeration")
+        )
+        assert tuner.rank_tactics("ranked", [runner], config, inputs, k=3) == (
+            [2, 3, 1] if 2 in updated else [1]
+        )
+        assert calls == []
+
+    monkeypatch.setattr(
+        runner, "get_tactic_cache_key", lambda *args: pytest.fail("serving signature")
+    )
+    assert tuner.rank_tactics("ranked", [runner], config, inputs, k=2) == expected[:1]
+
+
+@pytest.mark.parametrize("mode", ["v1", "managed"])
+def test_shortlist_retains_preparation_snapshot(setup, mode):
+    tuner, calls = setup
+
+    class GrowingRunner(PoolRunner):
+        def forward(self, inputs, tactic=-1, do_preparation=False):
+            if do_preparation and 2 not in self.tactics:
+                self.tactics.append(2)
+            return inputs[0]
+
+    runner = GrowingRunner([1, 3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with tuning(mode):
+        assert tuner.rank_tactics("growing", [runner], config, inputs, k=2) == [3, 1]
+        assert (GrowingRunner, 2) not in calls
+        calls.clear()
+        assert tuner.rank_tactics("growing", [runner], config, inputs, k=2) == [2, 3]
+        assert (GrowingRunner, 2) in calls
+
+
+@pytest.mark.parametrize("mode", ["v1", "managed"])
+def test_shortlist_capture_reuses_hits_and_rejects_changed_pool(
+    setup, monkeypatch, mode
+):
+    tuner, calls = setup
+    runner = PoolRunner([1, 3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with tuning(mode):
+        assert tuner.rank_tactics("capture", [runner], config, inputs, k=2) == [3, 1]
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        monkeypatch.setattr(
+            tuner,
+            "_prepare_input_tensors",
+            lambda *args: pytest.fail("capture synthesis"),
+        )
+        calls.clear()
+        assert tuner.rank_tactics("capture", [runner], config, inputs, k=2) == [3, 1]
+        runner.tactics.append(2)
+        with pytest.raises(RuntimeError, match="active outer CUDA Graph capture"):
+            tuner.rank_tactics("capture", [runner], config, inputs, k=2)
+        assert calls == []
+
+
+def test_shortlist_signature_isolated_between_context_scopes(setup, tmp_path):
+    tuner, calls = setup
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    legacy, first, second = PoolRunner([1]), PoolRunner([1, 3]), PoolRunner([3])
+    with autotune():
+        assert tuner.rank_tactics("scoped", [legacy], config, inputs, k=2) == [1]
+
+    def scoped(name):
+        return autotune_v2(cache_scope="context", cache_root=tmp_path / name)
+
+    with scoped("first"):
+        assert tuner.rank_tactics("scoped", [first], config, inputs, k=2) == [3, 1]
+    with scoped("second"):
+        assert tuner.rank_tactics("scoped", [second], config, inputs, k=2) == [3]
+    first.tactics.append(2)
+    with scoped("first"):
+        assert tuner.rank_tactics("scoped", [first], config, inputs, k=2) == [2, 3]
+    calls.clear()
+    with scoped("second"):
+        assert tuner.rank_tactics("scoped", [second], config, inputs, k=2) == [3]
+    with autotune():
+        assert tuner.rank_tactics("scoped", [legacy], config, inputs, k=2) == [1]
+    assert calls == []
+
+
+def test_shortlist_does_not_claim_v2_default_candidate_coverage(setup, monkeypatch):
+    tuner, calls = setup
+    runner = PoolRunner([1, 3])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with tuning("managed"):
+        assert tuner.rank_tactics("default", [runner], config, inputs, k=2) == [3, 1]
+        assert all(tactic != -1 for _, tactic in calls)
+
+        def profile(self, runner, inputs, tactic, config, **kwargs):
+            calls.append((type(runner), tactic))
+            return 0.5 if tactic == -1 else 3.0
+
+        monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+        assert tuner.choose_one("default", [runner], config, inputs) == (runner, -1)
+        assert (PoolRunner, -1) in calls

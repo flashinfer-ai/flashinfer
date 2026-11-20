@@ -2058,10 +2058,11 @@ class AutoTuner:
         # Ranked shortlists are process-local. Persisted configs retain the
         # selected winner; a later tuning session rebuilds the shortlist when
         # compound refinement needs more than one candidate. Each shortlist is
-        # stored with the replay/L2 policy it was measured under, because the
-        # cache key does not include that policy.
+        # stored with its measurement policy and pre-enumeration tactic-pool
+        # signature, neither of which changes the serving cache key.
         self._ranked_tactics_cache: dict[
-            ProfilingCacheKey, tuple[tuple[Any, ...], tuple[Any, ...]]
+            ProfilingCacheKey,
+            tuple[tuple[Any, ...], tuple[Any, ...], tuple[Any, ...] | None],
         ] = {}
         self._ranked_tactics_partitions: dict[tuple, dict] = {}
         # Keep measurement provenance separate from the runtime cache key.
@@ -4088,7 +4089,8 @@ class AutoTuner:
         under the same key as ``choose_one``, and the top ``k`` by measured
         time are returned for callers that need a shortlist (e.g. multi-stage
         compound-tactic refinement). With ``k > 1``, ``tie_tolerance`` does not
-        apply: the fastest measured tactic is cached.
+        apply: the fastest measured tactic is cached. Shortlist reuse requires
+        the same measurement policy and optional ``get_tactic_cache_key``.
         """
         if self.is_tuning_mode and _tune_process_group is not None:
             _check_tuning_group_phase(
@@ -4142,6 +4144,7 @@ class AutoTuner:
                 input_shapes = tuple(self._get_input_sizes(inputs))
                 profiles = self._generate_optimization_profiles(tuning_config, inputs)
                 runner = runners[0]
+                tactic_key = runner.get_tactic_cache_key(inputs)
                 runner_arg_names = {
                     param.name
                     for param in inspect.signature(runner.forward).parameters.values()
@@ -4188,7 +4191,7 @@ class AutoTuner:
             ranked_cache = self._ranked_cache()
             cached = ranked_cache.get(cache_key)
             if _all_ranks_hit_cache(
-                cached is not None and cached[0] == policy,
+                cached is not None and cached[0] == policy and cached[2] == tactic_key,
                 (type(runner).__name__, k, cached[1][:k]) if cached else None,
             ):
                 assert cached is not None
@@ -4203,6 +4206,10 @@ class AutoTuner:
             input_preparation_oom = False
             input_error = None
             try:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "AutoTuner profiling cannot begin during an active outer CUDA Graph capture"
+                    )
                 tensors = self._prepare_input_tensors(profile, inputs)
                 if tuning_config.inputs_pre_hook is not None:
                     tensors = list(tuning_config.inputs_pre_hook(tensors))
@@ -4340,7 +4347,9 @@ class AutoTuner:
                 ranked[0],
                 self._selection_record([t for t, _ in scored], 0),
             )
-            ranked_cache[cache_key] = (policy, tuple(ranked))
+            # Preparation may grow the pool after enumeration; retain the
+            # earlier signature so the next tune compares the new candidates.
+            ranked_cache[cache_key] = (policy, tuple(ranked), tactic_key)
 
             return ranked[:k]
 

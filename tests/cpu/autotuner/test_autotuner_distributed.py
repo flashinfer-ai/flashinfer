@@ -616,10 +616,10 @@ try:
         ranked_key = tuner._get_cache_key("test::ranked", runners[0],
             (inputs[0].shape,), config, runners[0].get_cache_key_extras(inputs))
         if rank == 0:
-            tuner._ranked_cache()[ranked_key] = (policy, (1, 0))
+            tuner._ranked_cache()[ranked_key] = (policy, (1, 0), None)
         elif case in ("ranked_different_order", "ranked_all_hit"):
             tuner._ranked_cache()[ranked_key] = (
-                policy, (0, 1) if case == "ranked_different_order" else (1, 0))
+                policy, (0, 1) if case == "ranked_different_order" else (1, 0), None)
         ranked = tuner.rank_tactics("test::ranked", [runners[0]], config, inputs, k=2)
         expected_ranked = ([-1] if case == "failed_profile" else
                            [1, 0] if case == "ranked_all_hit" else [0, 1])
@@ -716,7 +716,7 @@ try:
             winner = rank % 2
             tuner._winner_cache()[key] = (winner, None)
             tuner._profiling_cache_policies[(tuner._winner_cache_identity(), key)] = policy
-            tuner._ranked_cache()[key] = (policy, (winner, 1 - winner))
+            tuner._ranked_cache()[key] = (policy, (winner, 1 - winner), None)
         dist.barrier()
         set_autotune_process_group(dist.group.WORLD)
         if legacy:
@@ -845,6 +845,8 @@ finally:
         "partial_file",
         "partial_managed",
         "partial_tactic_coverage",
+        "ranked_tactic_coverage",
+        "ranked_signature_error",
         "concurrent_publish",
         "failed_profile",
         "final_incomplete_disagreement",
@@ -861,7 +863,9 @@ finally:
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
     """Group lookups converge despite partial, racing, or divergent caches."""
-    if case.startswith("final_"):
+    if case in ("ranked_tactic_coverage", "ranked_signature_error"):
+        worker_src = _SHORTLIST_SIGNATURE_WORKER_SRC
+    elif case.startswith("final_"):
         worker_src = _FINAL_SELECTION_WORKER_SRC
     elif case.startswith("rejected_"):
         worker_src = _REJECTED_CACHE_WORKER_SRC
@@ -898,3 +902,72 @@ def test_cache_hit_disagreement_reprofiles_together(tmp_path, case, world_size):
                 process.kill()
         for process in processes:
             process.communicate()
+
+
+_SHORTLIST_SIGNATURE_WORKER_SRC = r"""
+import datetime, os
+from pathlib import Path
+import torch
+import torch.distributed as dist
+from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig, set_autotune_process_group
+from flashinfer.autotune_cache import autotune_v2
+
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+case = os.environ["CACHE_CASE"]
+root = Path(os.environ["CASE_ROOT"])
+revision = 0
+tactics = [0, 1]
+calls = []
+
+class Runner(TunableRunner):
+    def get_tactic_cache_key(self, inputs):
+        if revision and case == "ranked_signature_error":
+            raise ValueError("catalog unavailable")
+        return (revision,)
+    def get_valid_tactics(self, inputs, profile):
+        return list(tactics)
+    def forward(self, inputs, tactic=-1):
+        return inputs[0]
+
+def profile(self, runner, inputs, tactic, config, **kwargs):
+    calls.append(tactic)
+    elapsed = torch.tensor([3.0 - tactic])
+    dist.all_reduce(elapsed)
+    return elapsed.item() / world_size
+
+AutoTuner._profile_single_kernel = profile
+torch.cuda.is_current_stream_capturing = lambda: False
+dist.init_process_group("gloo", init_method="file://" + str(root / "rendezvous"),
+                        rank=rank, world_size=world_size, timeout=datetime.timedelta(seconds=30))
+try:
+    set_autotune_process_group(dist.group.WORLD)
+    tuner = AutoTuner.get()
+    runner, inputs, config = Runner(), [torch.zeros(4, 8)], TuningConfig()
+    with autotune_v2(cache_root=root / str(rank)):
+        assert tuner.rank_tactics("ranked", [runner], config, inputs, k=2) == [1, 0]
+        calls.clear()
+        tactics.append(2)
+        if rank == 0:
+            revision = 1
+        if case == "ranked_signature_error":
+            try:
+                tuner.rank_tactics("ranked", [runner], config, inputs, k=2)
+            except RuntimeError as exc:
+                assert "ranking_profile" in str(exc), str(exc)
+                expected = "catalog unavailable" if rank == 0 else "another rank failed preparation"
+                assert expected in str(exc), str(exc)
+            else:
+                raise AssertionError("every rank must reject the failed signature read")
+            assert calls == []
+        else:
+            assert tuner.rank_tactics("ranked", [runner], config, inputs, k=2) == [2, 1]
+            assert calls == [0, 1, 2], calls
+            calls.clear()
+            assert tuner.rank_tactics("ranked", [runner], config, inputs, k=2) == [2, 1]
+            assert calls == [], calls
+    print(f"rank {rank}: cache agreement OK", flush=True)
+finally:
+    set_autotune_process_group(None)
+    dist.destroy_process_group()
+"""
