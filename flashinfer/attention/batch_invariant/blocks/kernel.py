@@ -94,9 +94,10 @@ def tmem_views(
 
 
 class AttentionKernel:
-    """``AttentionKernel(D, g, page, kv_slots, n_wg, q2, ragged, cap, kv_fmt)`` compiled once per static tuple; shapes, strides,
-    the page table, the work units and the scales are runtime arguments. ``cap`` is the shared-memory capacity the smem plan is
-    checked against (0: the current device's); ``kv_fmt`` the K / V cache format (``spec.KV_FMTS``)."""
+    """``AttentionKernel(D, g, page, kv_slots, n_wg, q2, ragged, cap, kv_fmt, v_sf_swizzled)`` compiled once per static tuple;
+    shapes, strides, the page table, the work units and the scales are runtime arguments. ``cap`` is the shared-memory capacity
+    the smem plan is checked against (0: the current device's); ``kv_fmt`` the K / V cache format (``spec.KV_FMTS``);
+    ``v_sf_swizzled`` the layout of an NVFP4 cache's V block scales (``StaticPlan``)."""
 
     def __init__(
         self,
@@ -110,6 +111,7 @@ class AttentionKernel:
         hw_rowmax: bool = False,
         cap: int = 0,
         kv_fmt: str = "bf16",
+        v_sf_swizzled: bool = False,
     ):
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
@@ -123,6 +125,7 @@ class AttentionKernel:
         self.hw_rowmax = hw_rowmax
         self.cap = cap
         self.kv_fmt = kv_fmt
+        self.v_sf_swizzled = v_sf_swizzled
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
@@ -166,6 +169,7 @@ class AttentionKernel:
             self.hw_rowmax,
             self.cap,
             self.kv_fmt,
+            self.v_sf_swizzled,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)

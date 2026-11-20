@@ -10,7 +10,9 @@ never an arithmetic step.
 The NVFP4 variant (``st.fp4``) stages 8 packed bytes (16 e2m1 nibbles of one key) per group, reads the block's e4m3 scale byte
 from global memory and forms ``value * scale`` in binary32 (``cvt.rn.f16x2.e2m1x2`` / ``cvt.rn.f16x2.e4m3x2``, ``cvt.f32.f16``,
 ``mul.rn.f32``): a product of at most six significant bits within the bf16 range, exact at every step, then ``cvt.rn.bf16x2.f32``
-moves bits. The ring then holds the class's ``dq4`` leaves (``spec.kv_dq4``).
+moves bits. The ring then holds the class's ``dq4`` leaves (``spec.kv_dq4``). The V block scales of a paged cache are read in
+the linear layout or in the 4-token swizzle (``sf_swizzle_coord``, ``st.v_sf_swizzled``): the two layouts store the same scale
+bytes at different addresses, so the leaves -- and with them the class and its fingerprint -- do not depend on the layout.
 
 Exactness: every e4m3 and e5m2 value is a binary16 value, every binary16 value is a binary32 value, and every fp8 value has at most
 four significant bits, so the hardware chain ``cvt.rn.f16x2.<fmt>x2`` -> ``cvt.f32.f16`` -> ``cvt.rn.bf16x2.f32`` moves bits and
@@ -218,15 +220,39 @@ def dequant_group(r_in: cute.Tensor, sf: Float32, r_out: cute.Tensor):
         r_out[4 * j + 3] = w3
 
 
+def sf_swizzle_coord(n_blk: int, blk, tok):
+    """Where the 4-token swizzle of a paged NVFP4 cache stores the block scale of ``(blk, tok)`` -- block ``blk`` (of ``n_blk`` =
+    ``D / 16`` per key) of the token at offset ``tok`` in its page: within each group of four consecutive tokens of a page and
+    head, the ``4 x n_blk`` scale bytes are stored at token ``(tok // 4) * 4 + blk // (n_blk / 4)``, block
+    ``(blk % (n_blk / 4)) * 4 + tok % 4`` (the layout trtllm-gen reads the V block scales in, which serving engines write for
+    it). A permutation of the scale bytes inside the four-token group, so the page size must be a multiple of four tokens; the
+    scales of a page tail (a last page filled to fewer than a multiple of four tokens) lie in the rows of its group like any
+    other. Plain Python on Python or DSL integers: the addressing has one statement for the kernel and the tests."""
+    assert n_blk % 4 == 0, n_blk
+    per = n_blk // 4
+    return (blk % per) * 4 + tok % 4, (tok // 4) * 4 + blk // per
+
+
 SF_AHEAD = 4  # rounds the NVFP4 block scale of a group is read from global memory ahead of its conversion
 
 
 @cute.jit
 def sf_offset(
-    st, mSF: cute.Tensor, blk: Int32, tok: Int32, kv_head: Int32, page_id: Int32
+    st,
+    mSF: cute.Tensor,
+    blk: Int32,
+    tok: Int32,
+    kv_head: Int32,
+    page_id: Int32,
+    sf_swizzled: cutlass.Constexpr,
 ):
     """The offset in the NVFP4 block scales ``mSF`` (``(D / 16, page, Hkv, num_pages)`` bytes) of block ``blk`` of token ``tok``
-    of page ``page_id`` (the linear layout: the cache's own geometry)."""
+    of page ``page_id``: the linear layout (the cache's own geometry), or under ``sf_swizzled`` the 4-token swizzle
+    (``sf_swizzle_coord``) -- another address of the same scale byte."""
+    if cutlass.const_expr(sf_swizzled):
+        return cute.crd2idx(
+            sf_swizzle_coord(st.D // GROUP, blk, tok) + (kv_head, page_id), mSF.layout
+        )
     return cute.crd2idx((blk, tok, kv_head, page_id), mSF.layout)
 
 
@@ -242,6 +268,7 @@ def load_sf(
     kv_ptr0: Int32,
     kv_head: Int32,
     r_sf: cute.Tensor,
+    sf_swizzled: cutlass.Constexpr,
 ):
     """The e4m3 block scale byte of block ``blk`` of stage key ``key`` (clamped to the stage; absolute key ``ka0 + key``) into
     ``r_sf[0]``. The key's page is the one the load warp staged its cache bytes from (``sPg[pg0 + box]``); a ragged pool clamps
@@ -254,10 +281,10 @@ def load_sf(
         last = mSF.shape[1] - 1
         if tok > last:
             tok = last
-        sfoff = sf_offset(st, mSF, blk, tok, kv_head, Int32(0))
+        sfoff = sf_offset(st, mSF, blk, tok, kv_head, Int32(0), False)
     else:
         page_id = sPg[pg0 + key // st.raw_box_rows]
-        sfoff = sf_offset(st, mSF, blk, ka % st.page, kv_head, page_id)
+        sfoff = sf_offset(st, mSF, blk, ka % st.page, kv_head, page_id, sf_swizzled)
     r_sf[0] = cute.make_tensor(mSF.iterator + sfoff, cute.make_layout((1,)))[0].to(
         Uint32
     )
@@ -503,11 +530,13 @@ def convert_slot(
     kv_ptr0: Int32,
     kv_head: Int32,
     ctid: Int32,
+    sf_swizzled: cutlass.Constexpr,
 ):
     """One ring slot (``slot_keys`` keys of K or V from absolute key ``key0``) from its staged raw bytes (``sRaw``: fp8 bytes, or
     packed NVFP4 nibbles with the block scales ``mSF`` ``(D / 16, page, Hkv, num_pages)`` read from global memory through the
     stage's page entries ``sPg``): acquire it, convert stage after stage in 16-element groups and commit. Thread ``ctid`` of the stage holds group ``ctid % (D / 16)`` of the
-    keys ``ctid // (D / 16) + round * KPI`` of a stage; the loop is compact and reads a round ahead of its conversion."""
+    keys ``ctid // (D / 16) + round * KPI`` of a stage; the loop is compact and reads a round ahead of its conversion.
+    ``sf_swizzled``: the block scales of ``mSF`` are stored in the 4-token swizzle (``sf_offset``)."""
     CT = st.roles.convert_threads
     GPK = st.D // GROUP  # groups per key
     KPI = CT // GPK  # keys the stage's threads cover per round
@@ -550,6 +579,7 @@ def convert_slot(
                     kv_ptr0,
                     kv_head,
                     cute.make_tensor(r_sf.iterator + a, cute.make_layout((1,))),
+                    sf_swizzled,
                 )
         for i in cutlass.range(NI, unroll=1):
             key = kt + i * KPI
@@ -572,6 +602,7 @@ def convert_slot(
                     kv_ptr0,
                     kv_head,
                     cute.make_tensor(r_sf.iterator + SF_AHEAD, cute.make_layout((1,))),
+                    sf_swizzled,
                 )
             if key < st.raw_keys:
                 if cutlass.const_expr(st.fp4):
@@ -626,6 +657,7 @@ def convert_tile(
     kv_ptr0: Int32,
     kv_head: Int32,
     ctid: Int32,
+    sf_swizzled: cutlass.Constexpr,
 ):
     """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order (``producer.issue_tile``)."""
     for sl in cutlass.range_constexpr(st.slots_per_tile):
@@ -641,6 +673,7 @@ def convert_tile(
             kv_ptr0,
             kv_head,
             ctid,
+            sf_swizzled,
         )
     return kv_prod, raw_cons
 
@@ -663,7 +696,8 @@ def convert_unit(
     ctid: Int32,
 ):
     """The staged K and V tiles of one unit into the ring, in the TMA producer's slot order (``producer.load_loop``): the order
-    ``stage_unit`` staged them in."""
+    ``stage_unit`` staged them in. The K block scales of an NVFP4 cache are linear; the V block scales are linear or swizzled as
+    the plan states (``st.v_sf_swizzled``)."""
     LA = st.qk_ahead
     kv_ptr0 = mKvIndptr[req]
     N = tile_hi - tile_lo
@@ -679,6 +713,7 @@ def convert_unit(
         kv_ptr0,
         kv_head,
         ctid,
+        False,
     )
     if cutlass.const_expr(LA == 2):
         if N > 1:
@@ -694,6 +729,7 @@ def convert_unit(
                 kv_ptr0,
                 kv_head,
                 ctid,
+                False,
             )
         for n in range(N):
             kv_prod, raw_cons = convert_tile(
@@ -708,6 +744,7 @@ def convert_unit(
                 kv_ptr0,
                 kv_head,
                 ctid,
+                st.v_sf_swizzled,
             )
             if n + 2 < N:
                 kv_prod, raw_cons = convert_tile(
@@ -722,6 +759,7 @@ def convert_unit(
                     kv_ptr0,
                     kv_head,
                     ctid,
+                    False,
                 )
     else:
         for n in range(N):
@@ -738,6 +776,7 @@ def convert_unit(
                     kv_ptr0,
                     kv_head,
                     ctid,
+                    False,
                 )
             kv_prod, raw_cons = convert_tile(
                 st,
@@ -751,6 +790,7 @@ def convert_unit(
                 kv_ptr0,
                 kv_head,
                 ctid,
+                st.v_sf_swizzled,
             )
     return kv_prod, raw_cons
 

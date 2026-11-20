@@ -226,6 +226,7 @@ class StaticPlan:
         hw_rowmax: bool = False,
         cap: int = 0,
         kv_fmt: str = "bf16",
+        v_sf_swizzled: bool = False,
     ):
         """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
         have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
@@ -243,6 +244,16 @@ class StaticPlan:
         self.lowbit = kv_fmt != "bf16"
         self.fp4 = kv_fmt == "nvfp4"
         assert not self.lowbit or (n_wg == 1 and not q2), (kv_fmt, n_wg, q2)
+        # v_sf_swizzled: the V block scales of a paged NVFP4 cache are stored in the 4-token swizzle (convert.sf_swizzle_coord)
+        # instead of the linear layout the K block scales always have: the conversion stage reads the same scale byte at another
+        # address (a placement of the same leaves); a permutation inside groups of four tokens of a page, so the page is a
+        # multiple of four tokens and the ragged pool (no pages) has no such layout
+        assert not v_sf_swizzled or (self.fp4 and not ragged and page % 4 == 0), (
+            kv_fmt,
+            ragged,
+            page,
+        )
+        self.v_sf_swizzled = v_sf_swizzled
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
         # the SM; the MMA warp issues both tiles' folds off one K / V stream; the correction warpgroup steps both tiles' statistics, A then B
