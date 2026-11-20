@@ -46,7 +46,11 @@ from flashinfer.autotuner import (
 from flashinfer.autotuner import autotuner as _autotuner_module
 from flashinfer.jit.core import logger
 
-from ..api_logging import flashinfer_api, flashinfer_experimental_api
+from ..api_logging import (
+    _CAKE_AUTO_CANDIDATES_ENV_VAR,
+    flashinfer_api,
+    flashinfer_experimental_api,
+)
 from ..trace.templates.attention import (
     trtllm_batch_decode_mla_trace_dispatch,
     trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch,
@@ -3206,12 +3210,39 @@ def _cute_dsl_max_supported_batch(
 
     Cute-dsl's workspace requirement grows with B via the kernel's per-CTA
     split-K state. Binary-search for the largest ``B <= candidate_max`` whose
-    ``get_workspace_size(...)`` fits in ``workspace_bytes``.
+    ``get_workspace_size(...)`` fits in ``workspace_bytes``. The search is
+    memoized per workspace policy and sizes (``_cute_dsl_max_batch_search``).
     """
     workspace_sizer, resolved_impl = _resolve_cute_dsl_workspace_sizer(
         cute_dsl_impl, sinks, enable_dcp
     )
+    return _cute_dsl_max_batch_search(
+        workspace_sizer,
+        resolved_impl,
+        workspace_bytes,
+        q_len,
+        num_heads,
+        kv_lora_rank,
+        max_active_blocks,
+        max_seq_len,
+        candidate_max,
+    )
 
+
+@functools.lru_cache(maxsize=256)
+def _cute_dsl_max_batch_search(
+    workspace_sizer,
+    resolved_impl: str,
+    workspace_bytes: int,
+    q_len: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    max_active_blocks: int,
+    max_seq_len: int,
+    candidate_max: int,
+) -> int:
+    """The binary search of ``_cute_dsl_max_supported_batch``. The workspace
+    policies are pure functions of these arguments."""
     lo, hi = 1, max(1, candidate_max)
     while lo < hi:
         mid = (lo + hi + 1) // 2
@@ -3254,13 +3285,14 @@ def _compute_mla_decode_buckets(
 
     Caps:
       - trtllm-gen kernel-hardcoded ceiling: 8192
-      - cute-dsl dynamic workspace cap (via binary search)
-    """
-    from ..fused_moe.utils import get_hybrid_num_tokens_buckets
+      - cute-dsl dynamic workspace cap (via binary search, at most 8192)
 
-    cap = 0
+    With trtllm-gen listed the cap is 8192 whatever the cute-dsl cap is, so
+    the cute-dsl workspace search is skipped.
+    """
     if "trtllm-gen" in runner_names:
-        cap = max(cap, _TRTLLM_GEN_MLA_MAX_BATCH)
+        return _mla_decode_hybrid_buckets(_TRTLLM_GEN_MLA_MAX_BATCH)
+    cap = 0
     if "cute-dsl" in runner_names:
         from ..cute_dsl.utils import get_num_sm
 
@@ -3278,7 +3310,15 @@ def _compute_mla_decode_buckets(
         )
         cap = max(cap, cute_dsl_cap)
 
-    return get_hybrid_num_tokens_buckets(max(1, cap))
+    return _mla_decode_hybrid_buckets(max(1, cap))
+
+
+@functools.lru_cache(maxsize=64)
+def _mla_decode_hybrid_buckets(cap: int) -> Tuple[int, ...]:
+    """``get_hybrid_num_tokens_buckets(cap)``, memoized (a tuple)."""
+    from ..fused_moe.utils import get_hybrid_num_tokens_buckets
+
+    return get_hybrid_num_tokens_buckets(cap)
 
 
 def _cake_trtllm_mla_blackwell_supports(
@@ -4086,6 +4126,17 @@ class _MlaStageOneWinnerRunner(TunableRunner):
         return hash(type(self))
 
 
+# Launches per cold-L2 sample of the second stage. One cold graph replay of a
+# microsecond decode kernel measures mostly launch latency, quantized to the
+# event timer's step, so the first-stage winner and Cake often measure the same
+# and the incumbent keeps the tie. A chain of launches, each on its own query
+# and output lane, is reported per launch.
+_MLA_CAKE_MARGIN_CHAIN_LAUNCHES = 8
+# The second stage's profile-arena inputs: query and out. block_tables,
+# seq_lens and the optional fifth tensor are read-only and keep one pointer.
+_MLA_CAKE_MARGIN_ARENA_INPUTS = (0, 3)
+
+
 @functools.lru_cache(maxsize=256)
 def _mla_cake_margin_tuning_config(
     config: TuningConfig, batch_ranges: Tuple[Tuple[int, int], ...]
@@ -4095,6 +4146,12 @@ def _mla_cake_margin_tuning_config(
     bounds its profile's batches (no candidate offers a tactic there, so it
     is not timed). Its batch mapping, and so every cache key, is the first
     stage's. ``None`` when no bucket is within the ranges.
+
+    Each cold-L2 sample times a chain of ``_MLA_CAKE_MARGIN_CHAIN_LAUNCHES``
+    launches on query and output lanes of the profile arena, reported per
+    launch (``TuningConfig.cold_chain_launches``); the first stage keeps its
+    single cold replay. The second stage's persisted measurement policy is
+    therefore ``cold-chain:N``.
 
     ``autotune(tuning_buckets=...)`` replaces the generated buckets with its
     own; the candidates then still offer tactics only in the offered buckets,
@@ -4113,6 +4170,8 @@ def _mla_cake_margin_tuning_config(
             replace(spec, gen_tuning_buckets=tuple(sorted(kept))),
             *others,
         ),
+        cold_chain_launches=_MLA_CAKE_MARGIN_CHAIN_LAUNCHES,
+        profile_arena_input_indices=_MLA_CAKE_MARGIN_ARENA_INPUTS,
     )
 
 
@@ -4149,9 +4208,14 @@ def _mla_cake_memo_state(tuner: AutoTuner) -> Optional[tuple]:
     switch ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES``."""
     if tuner.is_tuning_mode or tuner._managed_cache is not None:
         return None
-    skip_ops = tuner._effective_skip_ops
-    if skip_ops and (_MLA_DECODE_OP in skip_ops or _MLA_CAKE_MARGIN_OP in skip_ops):
-        return None
+    # The thread's skip_ops and override stacks, read as
+    # ``AutoTuner._effective_skip_ops`` and ``_get_override_stack`` read them,
+    # without creating them (an absent stack is an empty one).
+    skip_stack = getattr(tuner._skip_ops_local, "stack", None)
+    if skip_stack:
+        skip_ops = skip_stack[-1]
+        if _MLA_DECODE_OP in skip_ops or _MLA_CAKE_MARGIN_OP in skip_ops:
+            return None
     local = tuner._v2_local
     if (
         local.active
@@ -4160,21 +4224,34 @@ def _mla_cake_memo_state(tuner: AutoTuner) -> Optional[tuple]:
         or local.measure is not None
     ):
         return None
-    stack = tuner._get_override_stack()
+    stack = getattr(tuner._override_local, "stack", None)
+    environ = os.environ
     return (
         _autotuner_module._winner_sources_generation,
         tuple(stack[-1][:3]) if stack else None,
-        _mla_cake_memo_settings(),
+        # _mla_cake_memo_settings(), inlined.
+        (
+            environ.get(_AUTOTUNER_LOAD_FROM_FILE_ENV, "0"),
+            environ.get(_CAKE_AUTO_CANDIDATES_SWITCH_ENV, "0") != "1",
+        ),
     )
+
+
+# The environment variables of ``_mla_cake_memo_settings``. The second is the
+# switch ``cake_auto_candidates_enabled`` reads, compared as it compares it.
+_AUTOTUNER_LOAD_FROM_FILE_ENV = "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE"
+_CAKE_AUTO_CANDIDATES_SWITCH_ENV = _CAKE_AUTO_CANDIDATES_ENV_VAR
 
 
 def _mla_cake_memo_settings() -> Tuple[str, bool]:
     """The environment settings in ``_mla_cake_memo_state``, read on every
     call: ``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE`` and whether the Cake
-    candidates are switched on (the read ``cake_auto_candidate_open`` makes)."""
+    candidates are switched on (the read ``cake_auto_candidate_open`` makes,
+    as ``cake_auto_candidates_enabled``)."""
+    environ = os.environ
     return (
-        os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0"),
-        _autotuner_module.cake_auto_candidates_enabled(),
+        environ.get(_AUTOTUNER_LOAD_FROM_FILE_ENV, "0"),
+        environ.get(_CAKE_AUTO_CANDIDATES_SWITCH_ENV, "0") != "1",
     )
 
 
@@ -4296,7 +4373,8 @@ def _mla_cake_stage_two(
     if not isinstance(cake, _CakeTrtllmMlaBlackwellRunner):
         cake = cake()
     # autotune(round_up=True) rebuilds the batch mapping from the profiled
-    # buckets, so the second stage then generates the first stage's buckets.
+    # buckets, so the second stage then uses the first stage's config (its
+    # buckets and its single cold replay).
     config = (
         tuning_config
         if tuner._override_round_up
