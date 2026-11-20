@@ -629,9 +629,10 @@ class BatchInvariantAttention:
             kv_lens = torch.where(
                 kv_spans > 0, (kv_spans - 1) * page_size + last_host, 0
             ).tolist()
-            kv_lens_alt = torch.where(
-                kv_spans > 0, (kv_spans - 1) * page_size + last_host, last_host
-            ).tolist()
+            if seq_lens is not None:
+                kv_lens_alt = torch.where(
+                    kv_spans > 0, (kv_spans - 1) * page_size + last_host, last_host
+                ).tolist()
         q_lens = (qo_host[1:] - qo_host[:-1]).tolist()
         for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
             if ql < 0 or kl < 0:
