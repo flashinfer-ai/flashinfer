@@ -280,6 +280,9 @@ class StaticPlan:
             kv_slots * self.slots_per_tile
         )  # physical ring slots (kv_slots counts whole-tile equivalents)
         self.box_rows = min(page, self.slot_keys)  # keys per TMA box
+        # the producer reads a slot's page ids before it acquires the slot (producer.issue_slot) on a two-slot ring, where it waits for
+        # nearly every slot; with a deeper ring the slot is usually free and the plain order measured as fast or faster
+        self.lookup_ahead = self.n_slots <= 2 and not ragged
         self.boxes_per_slot = self.slot_keys // self.box_rows  # per 64-wide half
         self.boxes_per_tile = self.T // self.box_rows
         self.halves = D // HALF
