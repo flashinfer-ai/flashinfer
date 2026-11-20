@@ -866,6 +866,8 @@ def resolve_knobs(
             combine_dtype=combine_dtype,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
             experts_per_rank=num_experts // max(world_size, 1),
+            hidden=hidden,
+            num_total_experts=num_experts,
         ),
         "heuristic",
     )

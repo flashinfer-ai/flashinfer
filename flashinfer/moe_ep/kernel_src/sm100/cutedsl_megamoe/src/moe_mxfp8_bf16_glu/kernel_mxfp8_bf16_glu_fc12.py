@@ -175,7 +175,8 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
 
     ScaleGranularityK = 32
     GateUpInterleave = Fc1GateUpInterleave
-    _SmemMiscBudget = 2048
+    # Scheduler storage, TMEM bookkeeping, epilogue scratch and alignment.
+    _SmemMiscBudget = 768
     _TmemColsTotal = 512
 
     _DefaultBStages = {"smem": 3, "tmem": 4}
@@ -194,23 +195,46 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
         transform_buffer: str,
         accumulator_overlap: bool,
         transform_k_tile: int,
+        num_weight_stages: Optional[int],
+        extra_smem_bytes: int,
     ) -> int:
-        """Largest B depth whose tile buffers fit the SM100 SMEM limit."""
+        """Largest B depth that fits the SM100 SMEM limit.
+
+        Counts every staged buffer with its full/empty mbarrier pair,
+        ``_SmemMiscBudget`` and ``extra_smem_bytes`` (SMEM a subclass
+        allocates outside the base storage, e.g. MegaMoE dispatch buffers).
+        ``num_weight_stages=None`` uses the implementation's default depth.
+        """
         stages = cls._derive_pipeline_stages(
             mma_tiler_mnk,
             transform_buffer,
             accumulator_overlap,
             transform_k_tile,
         )
+        weight_stages = (
+            stages["a"] if num_weight_stages is None else num_weight_stages
+        )
         smem_capacity = 232448
-        # Worst non-tile storage measured across implementations and knobs (N128/tmem).
-        smem_overhead = 10880
+        mbar_pair_bytes = 2 * 8
         m, n, k = mma_tiler_mnk
         cta_m, cta_n = m // 2, n // 2
-        fixed = smem_overhead + stages["a"] * cta_m * k
+        # Raw FP8 weights and E8M0 scales, each with its own pipeline.
+        weight_stage_bytes = (
+            cta_m * k + cta_m * k // cls.ScaleGranularityK + 2 * mbar_pair_bytes
+        )
+        transformed_stage_bytes = mbar_pair_bytes
         if transform_buffer == "smem":
-            fixed += stages["transformed_a"] * cta_m * k * 2
-        return (smem_capacity - fixed) // (cta_n * k * 2)
+            transformed_stage_bytes += cta_m * k * 2
+        acc_stages = 1 if accumulator_overlap else stages["acc"]
+        fixed = (
+            cls._SmemMiscBudget
+            + extra_smem_bytes
+            + weight_stages * weight_stage_bytes
+            + stages["transformed_a"] * transformed_stage_bytes
+            + acc_stages * mbar_pair_bytes
+        )
+        b_stage_bytes = cta_n * k * 2 + mbar_pair_bytes
+        return (smem_capacity - fixed) // b_stage_bytes
 
     @classmethod
     def _derive_pipeline_stages(
@@ -385,11 +409,14 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                 transform_buffer,
                 accumulator_overlap,
                 transform_k_tile,
+                num_weight_stages,
+                0,
             )
             if num_activation_stages > max_stages:
                 raise ValueError(
                     f"num_activation_stages must be at most {max_stages} for "
-                    f"{mma_tiler_mnk} with transform_buffer={transform_buffer!r}."
+                    f"{mma_tiler_mnk} with transform_buffer={transform_buffer!r} "
+                    f"and num_weight_stages={num_weight_stages}."
                 )
 
         self.mma_tiler_mnk = mma_tiler_mnk
