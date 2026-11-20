@@ -89,6 +89,44 @@ def test_specialized_matches_reference(shape, backend):
 
 
 @requires_fast_path
+@pytest.mark.parametrize("groups", [1, 16384], ids=["16-lane", "8-lane"])
+@pytest.mark.parametrize("case", ["zero_scale", "mixed_nan"])
+def test_specialized_exceptional_products_match_cutile(groups, case):
+    _skip_unless_stock_cutile_usable()
+    x = torch.zeros((groups, 128), device="cuda", dtype=torch.bfloat16)
+    kwargs = {}
+    if case == "zero_scale":
+        kwargs["eps"] = 0.0
+    else:
+        # One NaN among finite values; scale = 448 / 448 exactly.
+        x.fill_(448.0)
+        x[0, 7] = float("nan")
+
+    stock_q, stock_s = per_token_group_quant_8bit(x, 128, backend="cutile", **kwargs)
+    stock_deq = stock_q.float() * stock_s  # one group per row
+    if case == "zero_scale":
+        assert (stock_s == 0).all() and (stock_deq == 0).all()
+        # Check the reported dequantization on the other stock backend;
+        # cuTile, not CUDA, is the compatibility oracle for auto.
+        cuda_q, cuda_s = per_token_group_quant_8bit(x, 128, backend="cuda", **kwargs)
+        assert (cuda_s == 0).all() and (cuda_q.float() * cuda_s == 0).all()
+    else:
+        assert (stock_s == 1).all()
+        assert stock_q.float()[0, 7].item() == -448.0
+
+    for backend in ("auto", "specialized"):
+        _reset_per_token_group_quant_stats()
+        q, s = per_token_group_quant_8bit(x, 128, backend=backend, **kwargs)
+        assert _ptgq_stats["backend_dispatches"] == {"specialized": 1, "stock": 0}
+        assert torch.equal(s.view(torch.int32), stock_s.view(torch.int32))
+        assert torch.equal(q.view(torch.uint8), stock_q.view(torch.uint8))
+        # Numeric equality alone cannot distinguish the signs of zero.
+        assert torch.equal(
+            (q.float() * s).view(torch.int32), stock_deq.view(torch.int32)
+        )
+
+
+@requires_fast_path
 @pytest.mark.parametrize("stock", ["cutile", "cuda"])
 def test_explicit_stock_backends_never_swapped(stock):
     """backend='cutile' / 'cuda' never reach the specialized kernel, even

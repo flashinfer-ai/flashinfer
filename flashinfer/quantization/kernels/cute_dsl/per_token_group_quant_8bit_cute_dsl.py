@@ -248,18 +248,23 @@ def _quant8(
             shl.b32 lo, $1, 16; and.b32 hi, $1, 0xffff0000;
             mov.b32 f0, lo; mov.b32 f1, hi;
             mul.f32 f0, f0, $5; mul.f32 f1, f1, $5;
+            // Numeric max selects -448 for NaN; satfinite handles the upper bound.
+            max.f32 f0, f0, 0fC3E00000; max.f32 f1, f1, 0fC3E00000;
             cvt.rn.satfinite.e4m3x2.f32 h0, f1, f0;
             shl.b32 lo, $2, 16; and.b32 hi, $2, 0xffff0000;
             mov.b32 f0, lo; mov.b32 f1, hi;
             mul.f32 f0, f0, $5; mul.f32 f1, f1, $5;
+            max.f32 f0, f0, 0fC3E00000; max.f32 f1, f1, 0fC3E00000;
             cvt.rn.satfinite.e4m3x2.f32 h1, f1, f0;
             shl.b32 lo, $3, 16; and.b32 hi, $3, 0xffff0000;
             mov.b32 f0, lo; mov.b32 f1, hi;
             mul.f32 f0, f0, $5; mul.f32 f1, f1, $5;
+            max.f32 f0, f0, 0fC3E00000; max.f32 f1, f1, 0fC3E00000;
             cvt.rn.satfinite.e4m3x2.f32 h2, f1, f0;
             shl.b32 lo, $4, 16; and.b32 hi, $4, 0xffff0000;
             mov.b32 f0, lo; mov.b32 f1, hi;
             mul.f32 f0, f0, $5; mul.f32 f1, f1, $5;
+            max.f32 f0, f0, 0fC3E00000; max.f32 f1, f1, 0fC3E00000;
             cvt.rn.satfinite.e4m3x2.f32 h3, f1, f0;
             mov.b32 r0, {h0, h1}; mov.b32 r1, {h2, h3};
             mov.b64 $0, {r0, r1};

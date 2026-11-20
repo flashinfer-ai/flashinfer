@@ -1399,9 +1399,10 @@ def per_token_group_quant_8bit(
         sm90 with the optional ``nvidia-cutlass-dsl`` runtime installed and
         the call in the default form (2D contiguous bf16 input,
         ``group_size=128``, ``float8_e4m3fn`` output, row-major scales), it
-        dispatches to a specialized agent-generated CuTe-DSL kernel with
-        matching semantics, gated by the packaged allowlist
-        ``ptgq_fp8_g128_sm90_dispatch.json``. Warm the op up once before
+        dispatches to a specialized CuTe-DSL kernel gated by the packaged
+        allowlist ``ptgq_fp8_g128_sm90_dispatch.json``. It matches stock
+        scale rounding, but finite FP8 payloads can differ near rounding
+        boundaries. Warm the op up once before
         CUDA graph capture: a not-yet-compiled variant cannot JIT under
         capture, so ``"auto"`` records the stock ``cutile`` kernel into the
         graph (fallback reason ``capturing_before_jit``) and
