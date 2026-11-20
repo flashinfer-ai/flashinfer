@@ -132,7 +132,12 @@ exclude = [
 # Route catalog of the experimental SM100/SM103 dense and paged MQA-logits export, read at runtime
 # next to its module.
 "flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
-"flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json", "gqa_fp8q_sm90_dispatch.json"]
+"flashinfer" = [
+  "_build_meta.py",
+  "mla_kv_pack_fp8_workloads.json",
+  "top_p_renorm_probs_specialized_workloads.json",
+  "gqa_fp8q_sm90_dispatch.json",
+]
 # The private loader imports this hyphenated source tree from package data.
 "flashinfer.moe_ep.kernel_src.sm100" = [
   "kimi-k3-megamoe/**/*.py",

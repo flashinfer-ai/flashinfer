@@ -1,6 +1,6 @@
 {
-  "name": "prims_ts_decode_mla_one_shot_kv_bounds_h128_d_qk576_ckv512_kpe64_ps32_sq4",
-  "description": "One-shot PrimTS MLA decode over FlashInfer dense page tables. Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets; the wrapper derives omitted static Q/KV bounds before launch. Explicit kv_bounds replaces dense/causal visibility. Zero prefixes produce zero output and, when requested, base-2 LSE -inf.",
+  "name": "prims_ts_decode_mla_one_shot_cp8_i128_h128_d_qk576_ckv512_kpe64_ps32_sq4",
+  "description": "One-shot PrimTS MLA decode over FlashInfer dense page tables. Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets; the caller supplies the packed Q bound; omitted local KV capacity is derived before launch. Global token t belongs to (t // cp_interleave_size) % cp_world. Page tables and max_kv_len describe rank-local capacity. Local lengths must not exceed that capacity. Causal row i uses global prefix seq_lens_kv[b] - actual_Q + i + 1; packed actual_Q is its qo_indptr delta. Empty local prefixes produce zero output and, when requested, base-2 LSE -inf.",
   "op_type": "mla_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.mla_decode.batch_mla_decode_with_paged_kv_cache",
@@ -8,7 +8,7 @@
     "backend:prims-ts",
     "status:experimental",
     "mla",
-    "mask:kv_prefix"
+    "context_parallel"
   ],
   "axes": {
     "workspace_size": {
@@ -56,17 +56,17 @@
       "value": 4,
       "description": "Fixed query length per request."
     },
-    "use_kv_bounds": {
+    "cp_world": {
       "type": "const",
-      "value": 1
+      "value": 8
+    },
+    "cp_interleave_size": {
+      "type": "const",
+      "value": 128
     },
     "zero_empty_rows": {
       "type": "const",
       "value": 1
-    },
-    "num_kv_bounds": {
-      "type": "var",
-      "description": "Number of logical Q tokens."
     }
   },
   "constraints": [
@@ -76,7 +76,7 @@
     "page_size in (4, 8, 16, 32, 64, 128)",
     "block_tables.shape[0] == batch_size",
     "seq_len_q >= 1",
-    "num_kv_bounds == batch_size * seq_len_q",
+    "0 <= cp_rank < cp_world",
     "min(seq_lens_kv) >= 0"
   ],
   "inputs": {
@@ -116,7 +116,8 @@
       "shape": [
         "batch_size"
       ],
-      "dtype": "int32"
+      "dtype": "int32",
+      "description": "Global logical request lengths, including the current Q tokens."
     },
     "qo_indptr": {
       "shape": [
@@ -167,17 +168,25 @@
       "dtype": "dtype",
       "optional": true
     },
+    "cp_rank": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "cp_world": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "cp_interleave_size": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
     "zero_empty_rows": {
       "shape": null,
       "dtype": "bool",
       "optional": true
-    },
-    "kv_bounds": {
-      "shape": [
-        "num_kv_bounds"
-      ],
-      "dtype": "int32",
-      "description": "Per-query KV prefix counts, shared by all heads. Nondecreasing within each request and in [0, seq_lens_kv[request]]. Overrides mask_type."
     }
   },
   "outputs": {
