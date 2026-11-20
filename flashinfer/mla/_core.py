@@ -2918,11 +2918,16 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_vquarter", 512, 1, 7),
     ),
     ("sm_100a", 148, "float8_e4m3fn", 64, 1, False): (
+        ("mla_fp8_page64_pdl", 128, 16, 63),
+        ("mla_fp8_page64_pdl", 256, 16, 63),
+        ("mla_fp8_page64_pdl", 1024, 32, 63),
         ("mla_fp8_page64_pdl", 2048, 16, 31),
         ("mla_fp8_page64_pdl", 4096, 16, 31),
         ("mla_fp8_page64_pdl", 8192, 16, 31),
     ),
     ("sm_100a", 148, "float8_e4m3fn", 64, 2, False): (
+        ("mla_fp8_page64_pdl", 128, 8, 31),
+        ("mla_fp8_page64_pdl", 256, 16, 31),
         ("mla_fp8_page64_pdl", 2048, 8, 15),
         ("mla_fp8_page64_pdl", 4096, 8, 15),
         ("mla_fp8_page64_pdl", 8192, 8, 15),
@@ -2958,9 +2963,13 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_vquarter", 1024, 4, 7),
     ),
     ("sm_103a", 152, "float8_e4m3fn", 64, 1, False): (
+        ("mla_fp8_page64_pdl", 128, 16, 63),
+        ("mla_fp8_page64_pdl", 256, 16, 63),
         ("mla_fp8_page64_pdl", 2048, 16, 31),
     ),
     ("sm_103a", 152, "float8_e4m3fn", 64, 2, False): (
+        ("mla_fp8_page64_pdl", 128, 8, 31),
+        ("mla_fp8_page64_pdl", 256, 8, 31),
         ("mla_fp8_page64_pdl", 1024, 2, 3),
         ("mla_fp8_page64_pdl", 2048, 8, 15),
         ("mla_fp8_page64_pdl", 4096, 8, 15),
