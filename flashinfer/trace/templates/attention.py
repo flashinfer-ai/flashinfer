@@ -1852,52 +1852,56 @@ prims_ts_decode_wrapper_trace_dispatch.templates = _prims_ts_scale_trace_templat
 )
 
 
-def _with_prims_ts_mla_kv_bounds(
+def _with_prims_ts_mla_cp(
     template: TraceTemplate,
     *,
-    enabled: bool,
-    packed_query: bool,
+    cp_world: int,
+    cp_interleave_size: int,
     zero_empty_rows: bool,
     one_shot: bool = False,
 ) -> TraceTemplate:
-    """Describe explicit per-query prefixes rather than bottom-right causality."""
-    if enabled:
-        template.name_prefix += "_kv_bounds"
-        template.axes["use_kv_bounds"] = Const(abbrev="", value=1)
+    """Record CP specialization separately from the runtime rank/global lengths."""
+    template.axes["cp_world"] = Const(abbrev="", value=cp_world)
+    template.axes["cp_interleave_size"] = Const(abbrev="", value=cp_interleave_size)
+    template.inputs["cp_rank"] = Scalar("int32", optional=True)
+    template.inputs[
+        "seq_lens_kv"
+    ].description = "Global logical request lengths, including the current Q tokens."
+    template.constraints.append("0 <= cp_rank < cp_world")
+    if one_shot:
+        template.inputs["cp_world"] = Scalar("int32", optional=True)
+        template.inputs["cp_interleave_size"] = Scalar("int32", optional=True)
+        template.inputs["zero_empty_rows"] = Scalar("bool", optional=True)
+    if cp_world != 1 or cp_interleave_size != 1:
+        template.name_prefix += f"_cp{cp_world}_i{cp_interleave_size}"
+    if cp_world > 1:
         template.axes["zero_empty_rows"] = Const(abbrev="", value=int(zero_empty_rows))
         if not zero_empty_rows:
             template.name_prefix += "_no_zero_empty_rows"
-        if one_shot:
-            template.inputs["zero_empty_rows"] = Scalar("bool", optional=True)
-        template.axes["num_kv_bounds"] = Var(description="Number of logical Q tokens.")
-        template.inputs["kv_bounds"] = Tensor(
-            ["num_kv_bounds"],
-            dtype="int32",
-            description=(
-                "Per-query KV prefix counts, shared by all heads. Nondecreasing "
-                "within each request and in [0, seq_lens_kv[request]]. Overrides mask_type."
-            ),
-        )
-        template.constraints.append(
-            "num_kv_bounds == total_q"
-            if packed_query
-            else "num_kv_bounds == batch_size * seq_len_q"
-        )
         template.constraints = [
             "min(seq_lens_kv) >= 0" if item == "min(seq_lens_kv) >= 1" else item
             for item in template.constraints
+            if item != "max(seq_lens_kv) <= max_kv_len"
         ]
         if "min(seq_lens_kv) >= 0" not in template.constraints:
             template.constraints.append("min(seq_lens_kv) >= 0")
-        if "causal" in template.axes:
-            template.axes["causal"] = Const(abbrev="", value=0)
-        template.tags = [tag for tag in template.tags if not tag.startswith("mask:")]
-        template.tags.append("mask:kv_prefix")
-        template.description += " Explicit kv_bounds replaces dense/causal visibility."
+        if not one_shot:
+            template.constraints.append(
+                "max(seq_lens_kv) // (cp_world * cp_interleave_size) * cp_interleave_size"
+                " + min(max(max(seq_lens_kv) % (cp_world * cp_interleave_size)"
+                " - cp_rank * cp_interleave_size, 0), cp_interleave_size) <= max_kv_len"
+            )
+        template.tags.append("context_parallel")
         template.description += (
-            " Zero prefixes produce zero output and, when requested, base-2 LSE -inf."
+            " Global token t belongs to (t // cp_interleave_size) % cp_world."
+            " Page tables and max_kv_len describe rank-local capacity. Local lengths"
+            " must not exceed that capacity. Causal row i uses global prefix"
+            " seq_lens_kv[b] - actual_Q + i + 1; packed actual_Q is its qo_indptr delta."
+        )
+        template.description += (
+            " Empty local prefixes produce zero output and, when requested, base-2 LSE -inf."
             if zero_empty_rows
-            else " Empty-row results are unspecified; initialize them or exclude them from merging."
+            else " Empty-row results are unspecified; sanitize them before consumption or exclude them from merging."
         )
     return template
 
@@ -1907,7 +1911,8 @@ def _make_prims_ts_decode_mla_one_shot_trace(
     *,
     rank4_cache: bool,
     packed_query: bool,
-    use_kv_bounds: bool = False,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
     zero_empty_rows: bool = True,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
@@ -1947,7 +1952,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(
         description=(
             "One-shot PrimTS MLA decode over FlashInfer dense page tables. "
             "Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets; "
-            "the wrapper derives omitted static Q/KV bounds before launch."
+            "the caller supplies the packed Q bound; omitted local KV capacity is derived before launch."
         ),
         axes=axes,
         inputs={
@@ -1990,10 +1995,10 @@ def _make_prims_ts_decode_mla_one_shot_trace(
         ],
         tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
     )
-    return _with_prims_ts_mla_kv_bounds(
+    return _with_prims_ts_mla_cp(
         template,
-        enabled=use_kv_bounds,
-        packed_query=packed_query,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
         zero_empty_rows=zero_empty_rows,
         one_shot=True,
     )
@@ -2003,7 +2008,8 @@ _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
     (rank4_cache, packed_query): _make_prims_ts_decode_mla_one_shot_trace(
         rank4_cache=rank4_cache,
         packed_query=packed_query,
-        use_kv_bounds=False,
+        cp_world=1,
+        cp_interleave_size=1,
         zero_empty_rows=True,
     )
     for rank4_cache in (False, True)
@@ -2016,10 +2022,11 @@ def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
     base = _make_prims_ts_decode_mla_one_shot_trace(
         rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
         packed_query=kwargs.get("qo_indptr") is not None,
-        use_kv_bounds=kwargs.get("kv_bounds") is not None,
+        cp_world=int(kwargs.get("cp_world", 1)),
+        cp_interleave_size=int(kwargs.get("cp_interleave_size", 1)),
         zero_empty_rows=(
             bool(kwargs.get("zero_empty_rows", True))
-            if kwargs.get("kv_bounds") is not None
+            if kwargs.get("cp_world", 1) > 1
             else True
         ),
     )
@@ -2041,7 +2048,8 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
-    use_kv_bounds: bool = False,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
     zero_empty_rows: bool = True,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
@@ -2191,10 +2199,10 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             *threshold_tags,
         ],
     )
-    return _with_prims_ts_mla_kv_bounds(
+    return _with_prims_ts_mla_cp(
         template,
-        enabled=use_kv_bounds,
-        packed_query=packed_query,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
         zero_empty_rows=zero_empty_rows,
     )
 
@@ -2229,7 +2237,8 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
-    use_kv_bounds: bool = False,
+    cp_world: int = 1,
+    cp_interleave_size: int = 1,
     zero_empty_rows: bool = True,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
@@ -2243,7 +2252,8 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
-        use_kv_bounds=use_kv_bounds,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
         zero_empty_rows=zero_empty_rows,
     )
 
@@ -2262,12 +2272,11 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
     if state is None:
         raise RuntimeError("plan() must be called before run()")
     packed_query = bool(state.packed_query)
-    use_kv_bounds = bool(getattr(state, "use_kv_bounds", False))
+    cp_world = int(getattr(state, "cp_world", 1))
     required_metadata = (
         "block_tables",
         "seq_lens_kv",
         *(("qo_indptr",) if packed_query else ()),
-        *(("kv_bounds",) if use_kv_bounds else ()),
     )
     _require_bound_trace_tensors(
         kwargs,
@@ -2287,9 +2296,10 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         softmax_rescale_threshold_log2=float(
             getattr(state, "softmax_rescale_threshold_log2", 0.0)
         ),
-        use_kv_bounds=use_kv_bounds,
+        cp_world=cp_world,
+        cp_interleave_size=int(getattr(state, "cp_interleave_size", 1)),
         zero_empty_rows=(
-            bool(getattr(state, "zero_empty_rows", True)) if use_kv_bounds else True
+            bool(getattr(state, "zero_empty_rows", True)) if cp_world > 1 else True
         ),
     )
     return _prims_ts_scale_trace(base, kwargs, bound=True)

@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4",
-  "description": "One-shot PrimTS MLA decode over FlashInfer dense page tables. Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets; the wrapper derives omitted static Q/KV bounds before launch.",
+  "description": "One-shot PrimTS MLA decode over FlashInfer dense page tables. Packed Q uses [total_q,H,576] with cumulative qo_indptr offsets; the caller supplies the packed Q bound; omitted local KV capacity is derived before launch.",
   "op_type": "mla_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.mla_decode.batch_mla_decode_with_paged_kv_cache",
@@ -54,6 +54,14 @@
       "type": "const",
       "value": 4,
       "description": "Fixed query length per request."
+    },
+    "cp_world": {
+      "type": "const",
+      "value": 1
+    },
+    "cp_interleave_size": {
+      "type": "const",
+      "value": 1
     }
   },
   "constraints": [
@@ -62,7 +70,8 @@
     "qk_rope_head_dim == 64",
     "page_size in (4, 8, 16, 32, 64, 128)",
     "block_tables.shape[0] == batch_size",
-    "seq_len_q >= 1"
+    "seq_len_q >= 1",
+    "0 <= cp_rank < cp_world"
   ],
   "inputs": {
     "query": {
@@ -101,7 +110,8 @@
       "shape": [
         "batch_size"
       ],
-      "dtype": "int32"
+      "dtype": "int32",
+      "description": "Global logical request lengths, including the current Q tokens."
     },
     "qo_indptr": {
       "shape": [
@@ -150,6 +160,26 @@
     "out_dtype": {
       "shape": null,
       "dtype": "dtype",
+      "optional": true
+    },
+    "cp_rank": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "cp_world": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "cp_interleave_size": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "zero_empty_rows": {
+      "shape": null,
+      "dtype": "bool",
       "optional": true
     }
   },

@@ -45,6 +45,7 @@ from flashinfer.api_logging import flashinfer_experimental_api
 
 from ...utils import device_support_pdl
 from ._block_sparse.common import _num_sparse_pattern_heads
+from ._q_token_kv_block_sparse_policy import membership_planes
 from ._scales import GlobalScale, normalize_scale, resolve_scale, scale_types
 
 if TYPE_CHECKING:
@@ -70,6 +71,49 @@ def _get_prims_ts_q_token_kv_block_sparse_metadata_module() -> Any:
     from ...jit import gen_prims_ts_q_token_kv_block_sparse_metadata_module
 
     return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
+
+
+@functools.cache
+def _wide_metadata_smem_bytes(
+    group_size: int, max_seq_len_kv: int, sparse_block_size: int
+) -> int:
+    module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
+    return int(
+        module.wide_metadata_smem_bytes(group_size, max_seq_len_kv, sparse_block_size)
+    )
+
+
+def _validate_wide_metadata_fits(
+    group_size: int,
+    max_seq_len_kv: int,
+    sparse_block_size: int,
+    device_index: int,
+) -> None:
+    """Reject G16/G32 when their metadata map cannot fit the device's SMEM.
+
+    G9-G32 metadata keeps a map over the model's whole block prefix
+    (``max_seq_len_kv / sparse_block_size`` blocks) in shared memory; there is
+    no bounded fallback, so the check runs before any launch.
+    """
+    if group_size <= 8:
+        return
+    needed = _wide_metadata_smem_bytes(group_size, max_seq_len_kv, sparse_block_size)
+    available = torch.cuda.get_device_properties(
+        device_index
+    ).shared_memory_per_block_optin
+    if needed < 0 or needed > available:
+        raise ValueError(
+            f"QToken-KvBlock-Sparse-Attention group_size={group_size} keeps a "
+            f"metadata map of max_seq_len_kv={max_seq_len_kv} / "
+            f"kv_block_size={sparse_block_size} blocks in shared memory, which "
+            + (
+                "exceeds the map's size limit"
+                if needed < 0
+                else f"needs {needed} bytes"
+            )
+            + f" (device limit {available}); use group_size <= 8, a larger "
+            "kv_block_size or a smaller max_seq_len_kv"
+        )
 
 
 @dataclass(frozen=True)
@@ -716,6 +760,34 @@ class QTokenKvBlockSparsePagedTSWrapper:
         products are exact in BF16), FP8 Q runs FP8 MMA on K/V rounded to E4M3.
         The output is BF16 either way.
 
+        The kernel transforms NVFP4 K/V once per KV tile of every route that
+        loads it. Grouped routes overlap, so long packed query batches
+        transform each selected token many times (about 90 times at 4K queries
+        over a 64K context). With BF16 Q, a framework can instead convert each
+        request's visible NVFP4 pages to a BF16 paged cache once per call and
+        run this wrapper with BF16 K/V (``kv_dtype=torch.bfloat16`` and that
+        cache's block table). Results are unchanged, since E2M1 x E4M3 products
+        are exact in BF16. This does not apply to FP8 Q, which rounds K/V to
+        E4M3 and requires FP8 K/V otherwise. It needs no Prims-TS support; the
+        trade-off is:
+
+        - It pays only with TileQ128 groups (``group_size * Hq / Hkv > 64``,
+          e.g. G32 for 4 Q heads per KV head, G16 for 8), whose transform is
+          on the critical path, and with many queries. On GB300 (D256, top-k
+          512 blocks of 4 tokens, 0-64K prefixes) it measured 1.02-1.37x faster
+          than the best NVFP4 launch for 1K-4K packed queries (more with more
+          queries and longer prefixes), 0.84-1.11x at 512, and 0.63-1.0x
+          (never faster) at 128-256.
+        - Its cost grows with visible tokens x KV heads, not with the queries
+          (about 26 us for 64K tokens x 2 KV heads, near HBM bandwidth), and
+          the BF16 copy takes about 3.6x the NVFP4 cache's memory. Overlap it
+          with independent work (e.g. the indexer's top-k) and skip it for long
+          contexts, where it can cost more than it saves (not measured past
+          64K).
+        - Converting only the blocks the indexer selected did not pay: marking
+          them costs more than it saves, and long query batches select half or
+          more of the visible blocks anyway.
+
         Packed Q is ``[total_q, Hq, D]`` with ``qo_indptr``. Fixed Q is
         ``[B, Nq, G, Hq, D]`` without ``qo_indptr``. ``indexer_block_ids`` is
         Int32 ``[total_q, block_topk]`` for shared patterns or
@@ -1095,8 +1167,12 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
-        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        # G9-G32: ceil(G / 8) byte planes per route row (queries 8p..8p+7 in plane p).
+        else membership_planes(group_size)
+        * (
+            (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+            // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        )
     )
     return (groups, page_capacity), (groups, membership_words), (groups,)
 
@@ -1202,6 +1278,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     if out_dtype is None:
         out_dtype = q_dtype
     _, device_index = _resolve_cuda_device(device)
+    _validate_wide_metadata_fits(
+        group_size, max_seq_len_kv, sparse_block_size, device_index
+    )
     spec = _resolve_decode_launch_spec(
         device_index,
         groups,
@@ -1236,8 +1315,12 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
-        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        # G9-G32: ceil(G / 8) byte planes per route row (queries 8p..8p+7 in plane p).
+        else membership_planes(group_size)
+        * (
+            (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+            // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        )
     )
     q_token_kv_block_sparse_page_indices_shape = (metadata_rows, page_capacity)
     q_token_kv_block_sparse_page_indices_bytes = metadata_rows * page_capacity * 4
@@ -1591,6 +1674,9 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     if groups == 0:
         return outputs
 
+    _validate_wide_metadata_fits(
+        group_size, max_seq_len_kv, sparse_block_size, block_indices.device.index
+    )
     enable_pdl = device_support_pdl(block_indices.device)
     metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
     release_attention_pdl = enable_pdl and release_attention_pdl
