@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from flashinfer.prims_ts.moe.config_mapper import (
+    apply_fused_finalize,
     apply_weight_l2_policy,
     PrimsTsConfigSpec,
     SUPPORTED_MXFP4_BF16_TILE_N,
@@ -451,6 +452,82 @@ def test_kimi_k3_ep_capacity_uses_local_experts():
     )
 
     assert capacity == 183 * 128
+
+
+@pytest.mark.parametrize(("num_tokens", "tile_n"), [(512, 8), (4096, 64), (32768, 256)])
+def test_finalize_fuses_into_the_second_gemm_epilogue(num_tokens, tile_n):
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [tile_n, 0], num_tokens=num_tokens, top_k=6, num_local_experts=48
+    )
+    fused = apply_fused_finalize(
+        pair, num_tokens=num_tokens, top_k=6, num_local_experts=48
+    )
+    assert fused.fc1 is pair.fc1
+    assert pair.fc2.cfg.build().fused_finalize_top_k == 0
+    assert fused.fc2.cfg.build().fused_finalize_top_k == 6
+
+
+def test_fused_finalize_needs_a_plain_bf16_epilogue():
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [8, 0], num_tokens=512, top_k=6, num_local_experts=48
+    )
+    # FC1 runs the gated activation and quantizes its output.
+    with pytest.raises(ValueError, match="fused_finalize_top_k"):
+        validate_config(make_config(**pair.fc1.cfg.kwargs, fused_finalize_top_k=6))
+
+
+@pytest.mark.parametrize(
+    (
+        "top_k",
+        "num_local_experts",
+        "num_experts",
+        "do_finalize",
+        "partitioned",
+        "fused",
+    ),
+    [
+        (6, 48, 384, True, False, True),  # EP8: 0.75 local experts per token
+        (16, 112, 896, True, False, False),  # EP8 at top-16: two per token
+        (6, 48, 384, False, False, False),  # the caller finalizes
+        (6, 48, 384, True, True, False),  # partitioned launches finalize themselves
+    ],
+)
+def test_finalize_is_fused_when_tokens_average_one_local_expert(
+    top_k, num_local_experts, num_experts, do_finalize, partitioned, fused
+):
+    from flashinfer.prims_ts.moe.runner import PrimsTsMxfp4Mxfp8MoERunner
+
+    runner = SimpleNamespace(
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        num_experts=num_experts,
+        _is_partitioned=partitioned,
+    )
+    pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+        [8, 0], num_tokens=64, top_k=top_k, num_local_experts=num_local_experts
+    )
+    pair = PrimsTsMxfp4Mxfp8MoERunner._maybe_fuse_finalize(
+        runner, pair, 64, {"do_finalize": do_finalize}
+    )
+    assert bool(pair.fc2.cfg.build().fused_finalize_top_k) == fused
+
+
+@pytest.mark.parametrize(
+    ("rank", "world", "expected"),
+    [
+        (None, None, [0, 1, 2, 3, 4, 5, 6, 7]),
+        ("1", "4", [2, 3, 4, 5, 6, 7, 0, 1]),
+    ],
+)
+def test_precompile_order_is_rotated_per_local_rank(monkeypatch, rank, world, expected):
+    from flashinfer.prims_ts.moe.runner import _node_rank_rotated
+
+    for name, value in (("LOCAL_RANK", rank), ("LOCAL_WORLD_SIZE", world)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert _node_rank_rotated(list(range(8))) == expected
 
 
 def test_kimi_k3_low_latency_fast_drain_fc2_config_is_buildable():
