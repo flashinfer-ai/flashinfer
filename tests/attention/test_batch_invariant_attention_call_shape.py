@@ -332,6 +332,7 @@ class _Delegates:
             device,
             ragged=False,
             has_sinks=None,
+            null_requests=False,
         ):
             self.calls.append(
                 (
@@ -341,6 +342,7 @@ class _Delegates:
                     None if last is None else last.tolist(),
                     (Hq, Hkv, D, page, window_left, ragged),
                     config,
+                    null_requests,  # a decode plan skips requests without keys
                 )
             )
             # what the delegate reads off the engine's planned record
@@ -350,6 +352,7 @@ class _Delegates:
                 **dict.fromkeys(
                     (
                         "kv_indptr",
+                        "null_rows",
                         "workspace",
                         "ws",
                         "scratch",
