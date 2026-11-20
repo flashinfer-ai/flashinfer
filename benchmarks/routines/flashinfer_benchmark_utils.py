@@ -863,7 +863,7 @@ routine_cc_to_supported_backends = {
         "12.1": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
     },
     # cutlass flashinfer/gemm/gemm_base.py, cudnn, cutile, tgv.
-    # cake (:923, experimental) is not benchmarked.
+    # cake (experimental) is not benchmarked.
     "bmm_bf16": {
         "7.5": [],
         "8.0": ["cudnn", "auto"],
@@ -955,7 +955,7 @@ routine_cc_to_supported_backends = {
         "12.1": ["cudnn", "cutile"],
     },
     # flashinfer/gemm/gemm_svdquant.py: cutlass, cute-dsl(-unfused),
-    # cutlass-sm120. cake (:641, experimental) is not benchmarked.
+    # cutlass-sm120. cake (experimental) is not benchmarked.
     "mm_nvfp4_svdquant": {
         "7.5": [],
         "8.0": [],
