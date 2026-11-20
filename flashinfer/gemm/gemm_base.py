@@ -4571,21 +4571,6 @@ def _check_cudnn_fp4_availability():
     """Check if cuDNN FP4 support is available and raise exception if not."""
     _check_cudnn_availability()
 
-    # Check cuDNN version for FP4 support (requires 1.13.* or later)
-    try:
-        version_str = cudnn.__version__
-        major, minor = map(int, version_str.split(".")[:2])
-
-        if (major, minor) < (1, 13):
-            raise RuntimeError(
-                f"cuDNN FP4 requires version 1.13+, found {version_str}. "
-                f"Upgrade: pip install --upgrade nvidia-cudnn-cu12 nvidia-cudnn-frontend"
-            )
-    except (ImportError, AttributeError, ValueError, IndexError) as e:
-        raise RuntimeError(
-            "Unable to determine cuDNN version. FP4 requires cuDNN 1.13+."
-        ) from e
-
     # Check cuDNN backend version for FP4 support (requires >= 91002)
     try:
         backend_version = cudnn.backend_version()

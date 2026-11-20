@@ -227,8 +227,7 @@ serving/TTFT qualification. Neither FI admission nor execution forces an engine.
 
 With stable FE 1.33+, matching FP16 Q/KV/output uses the same paged admission
 regions as BF16 described above. All architecture, layout, length, paired-work,
-metadata and native width guards still apply. Earlier FE versions retain the
-existing FP16 route; BF16 admission is unchanged. This dtype transfer depends on
+metadata and native width guards still apply. This dtype transfer depends on
 FE's FP16 graph-declaration placement rules and uses the common backend/FROST
 graph contract, without selecting a particular engine.
 

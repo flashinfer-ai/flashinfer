@@ -24,17 +24,11 @@ try:
     import cudnn
 
     CUDNN_AVAILABLE = True
-    CUDNN_FRONTEND_VERSION = tuple(
-        int(part) for part in cudnn.__version__.split(".")[:2]
-    )
 except Exception:
     cudnn = None
     CUDNN_AVAILABLE = False
-    CUDNN_FRONTEND_VERSION = (0, 0)
 
 HEAD_DIM = 128
-
-MIN_FRONTEND_VERSION = (1, 29)
 
 SUPPORTED_COMPUTE_CAPABILITIES = frozenset(
     {(10, 0), (10, 1), (10, 2), (10, 3), (10, 7)}
@@ -44,8 +38,8 @@ SUPPORTED_COMPUTE_CAPABILITIES = frozenset(
 def cudnn_linear_attention_unavailable_reason() -> Optional[str]:
     """Why this host cannot run the cuDNN linear-attention engines, or ``None``.
 
-    Only the things a test can know without launching: the package, its
-    version, and the device. Everything finer -- head dims, dtypes, head-count
+    Only the things a test can know without launching: whether the package loads
+    and which device is present. Everything finer -- head dims, dtypes, head-count
     relations -- is the engine's call, so a test that wants to know whether a
     specific call is served should make the call and read the exception.
     """
@@ -53,9 +47,6 @@ def cudnn_linear_attention_unavailable_reason() -> Optional[str]:
         return "CUDA is required"
     if not CUDNN_AVAILABLE:
         return "the cudnn python frontend is not installed"
-    if CUDNN_FRONTEND_VERSION < MIN_FRONTEND_VERSION:
-        want = ".".join(str(part) for part in MIN_FRONTEND_VERSION)
-        return f"cudnn-frontend >= {want} is required, found {cudnn.__version__}"
     capability = get_compute_capability(torch.device("cuda"))
     if capability not in SUPPORTED_COMPUTE_CAPABILITIES:
         return (
