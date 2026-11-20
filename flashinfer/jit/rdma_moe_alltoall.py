@@ -129,7 +129,7 @@ def _spec(name: str, sources: list[str], *, nccl: bool = False):
     ):
         raise RuntimeError("RDMA MoE AlltoAll JIT requires an SM120 compilation target")
     flags = sm120a_nvcc_flags
-    includes = [
+    includes: list[str | Path] = [
         jit_env.FLASHINFER_CSRC_DIR,
         jit_env.FLASHINFER_INCLUDE_DIR,
     ]
