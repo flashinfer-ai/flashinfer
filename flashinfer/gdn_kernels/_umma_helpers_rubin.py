@@ -59,10 +59,23 @@ def tmem_dealloc(tmem_addr: Int32, ncols: int, *, loc=None, ip=None) -> None:
     )
 
 
+def tmem_warp_addr(tmem_base, warp):
+    """``tmem_base`` (a lane-0 TMEM address, e.g. the allocation base) moved to warp
+    ``warp``'s lane quadrant (``warp`` a warp-uniform warp index): the base of that warp's
+    tcgen05.ld / .st addresses (``tmem_ld``, ``tmem_st_u32``; add the column offset).
+
+    A warp reaches only TMEM lanes 32 * (warp % 4) .. + 31, and PTX requires the
+    tcgen05.ld / .st address to be warp-uniform with lane field 32 * (warp % 4): thread i of
+    the warp then accesses lane 32 * (warp % 4) + i. Built from the warp index alone, the
+    address stays in uniform registers."""
+    return tmem_base | (((warp & 3) << 5) << 16)
+
+
 @dsl_user_op
-def tmem_ld(row, col, num: int, *, loc=None, ip=None):
-    """tcgen05.ld.32x32b.x{num}: ``num`` consecutive fp32 columns of this warp's 32 lanes."""
-    ptr = _tmem_ptr((Int32(row) << Int32(16)) | Int32(col), loc=loc, ip=ip)
+def tmem_ld(taddr, num: int, *, loc=None, ip=None):
+    """tcgen05.ld.32x32b.x{num}: ``num`` consecutive fp32 columns of this warp's 32 lanes,
+    from the warp-uniform address ``taddr`` (``tmem_warp_addr`` + column offset)."""
+    ptr = _tmem_ptr(taddr, loc=loc, ip=ip)
     if num == 1:
         reg = nvvm.tcgen05_ld(Int32.mlir_type, _SHAPE_32X32B, ptr, loc=loc, ip=ip)
         return [Float32(llvm.bitcast(Float32.mlir_type, reg, loc=loc, ip=ip))]
@@ -73,9 +86,10 @@ def tmem_ld(row, col, num: int, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def tmem_st_u32(row, col, words, *, loc=None, ip=None) -> None:
-    """tcgen05.st.32x32b.x{len(words)} of raw 32-bit words."""
-    ptr = _tmem_ptr((Int32(row) << Int32(16)) | Int32(col), loc=loc, ip=ip)
+def tmem_st_u32(taddr, words, *, loc=None, ip=None) -> None:
+    """tcgen05.st.32x32b.x{len(words)} of raw 32-bit words to the warp-uniform address
+    ``taddr`` (as in ``tmem_ld``)."""
+    ptr = _tmem_ptr(taddr, loc=loc, ip=ip)
     n = len(words)
     if n == 1:
         nvvm.tcgen05_st(

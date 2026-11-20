@@ -1047,7 +1047,7 @@ class GdnReplayMtpUmmaRubin:
                 cute.arch.setmaxregister_increase(self.regsplit[1])
             # ============================================================ consumers
             cw = warp - CW0
-            ct = cw * 32 + lane  # TMEM lane address / k index for staging
+            ct = cw * 32 + lane  # consumer index: k index for staging
             row = ((warp & 3) << 5) | lane  # V row held by this thread (= TMEM lane)
             grp = lane >> 2
             c4 = lane & 3
@@ -1364,9 +1364,8 @@ class GdnReplayMtpUmmaRubin:
                 P=P,
                 brow=brow,
                 hv0=hv0,
-                ct=ct,
                 row=row,
-                tbase=tbase,
+                twarp=U.tmem_warp_addr(tbase, warp),  # TMEM lane quadrant
                 st_addr=st_addr,
                 u_cache=u_cache,
                 v=v,
@@ -1921,7 +1920,7 @@ class GdnReplayMtpUmmaRubin:
             )
             # ============================================================ consumers
             cw = warp - CW0
-            ct = cw * 32 + lane  # TMEM lane address / k index for staging
+            ct = cw * 32 + lane  # consumer index: k index for staging
             row = ((warp & 3) << 5) | lane  # V row held by this thread (= TMEM lane)
             grp = lane >> 2
             c4 = lane & 3
@@ -2196,9 +2195,8 @@ class GdnReplayMtpUmmaRubin:
                 P=P,
                 brow=brow,
                 hv0=hv0,
-                ct=ct,
                 row=row,
-                tbase=tbase,
+                twarp=U.tmem_warp_addr(tbase, warp),  # TMEM lane quadrant
                 st_addr=st_addr,
                 u_cache=u_cache,
                 v=v,
@@ -3284,7 +3282,7 @@ class GdnReplayMtpUmmaRubin:
         )
         # ============================================================ consumers
         cw = warp - CW0
-        ct = cw * 32 + lane  # TMEM lane address / k index for staging
+        ct = cw * 32 + lane  # consumer index: k index for staging
         row = ((warp & 3) << 5) | lane  # V row held by this thread (= TMEM lane)
         grp = lane >> 2
         c4 = lane & 3
@@ -3520,9 +3518,8 @@ class GdnReplayMtpUmmaRubin:
             P=P,
             brow=brow,
             hv0=hv0,
-            ct=ct,
             row=row,
-            tbase=sm["tmem_addr"][0],
+            twarp=U.tmem_warp_addr(sm["tmem_addr"][0], warp),  # TMEM lane quadrant
             st_addr=sm["st_addr"],
             u_cache=u_cache,
             v=v,
@@ -3754,11 +3751,10 @@ class GdnReplayMtpUmmaRubin:
         so their latency overlaps the D build and the readout wait); with ``vsm`` (vsmem,
         verify rows) none: the epilogue reads them from the u-window buffer."""
         T = self.T
-        P, row, ct, tbase, s_coef = (
+        P, row, twarp, s_coef = (
             ctx["P"],
             ctx["row"],
-            ctx["ct"],
-            ctx["tbase"],
+            ctx["twarp"],
             ctx["s_coef"],
         )
         v = ctx["v"]
@@ -3850,7 +3846,7 @@ class GdnReplayMtpUmmaRubin:
                 else Float32(0.0)
             )
             words.append(U.pack_f16x2(lo, hi))
-        U.tmem_st_u32(ct, tbase + dcol, words)
+        U.tmem_st_u32(twarp + dcol, words)
         U.tmem_wait_st()
         U.fence_before_sync()
         cute.arch.mbarrier_arrive(self._mb(ctx, "d_ready", hh))
@@ -3877,13 +3873,13 @@ class GdnReplayMtpUmmaRubin:
             ctx["brow"],
             ctx["hv0"],
         )
-        ct, row, tbase = ctx["ct"], ctx["row"], ctx["tbase"]
+        row, twarp = ctx["row"], ctx["twarp"]
         u_cache, out, s_coef = ctx["u_cache"], ctx["out"], ctx["s_coef"]
         hv = hv0 + hh
         cb = hh * _COEF
         nld = 1 << (T - 1).bit_length()  # tcgen05.ld widths are powers of two
-        rk = U.tmem_ld(ct, tbase + rcol, nld)
-        yk = U.tmem_ld(ct, tbase + rcol + 16, nld)
+        rk = U.tmem_ld(twarp + rcol, nld)
+        yk = U.tmem_ld(twarp + rcol + 16, nld)
         if vv is None:
             # vsmem (verify rows): this row's v values from head hh's u-window buffer
             # (slots wv..wv + T - 1), read under the TMEM loads; then the buffer may take
@@ -3925,8 +3921,8 @@ class GdnReplayMtpUmmaRubin:
             # verify rows: all four column groups first, then release the head buffer
             # (the readout two heads ahead waits on it)
             hks = [egp * rk[t] + yk[t] for t in range(T)]
-            rq = U.tmem_ld(ct, tbase + rcol + T, nld)
-            yq = U.tmem_ld(ct, tbase + rcol + 16 + T, nld)
+            rq = U.tmem_ld(twarp + rcol + T, nld)
+            yq = U.tmem_ld(twarp + rcol + 16 + T, nld)
             U.tmem_wait_ld()
             U.fence_before_sync()
             cute.arch.mbarrier_arrive(self._mb(ctx, "epi_done", hh))
@@ -3946,8 +3942,8 @@ class GdnReplayMtpUmmaRubin:
         if not early_release:
             # flush rows (register-bound): the u solve runs before the q columns are read,
             # so the k-side (hk, v) and q-side (rq, yq) values are never live together
-            rq = U.tmem_ld(ct, tbase + rcol + T, nld)
-            yq = U.tmem_ld(ct, tbase + rcol + 16 + T, nld)
+            rq = U.tmem_ld(twarp + rcol + T, nld)
+            yq = U.tmem_ld(twarp + rcol + 16 + T, nld)
             U.tmem_wait_ld()
             U.fence_before_sync()
             cute.arch.mbarrier_arrive(self._mb(ctx, "epi_done", hh))
@@ -4114,9 +4110,9 @@ class GdnReplayMtpUmmaRubin:
     def _rmw_group(self, hh, g, gq, ctx, egp, srow, r0, r1, r2, r3):
         """RMW loop (``rmw_loop``): TMEM column group gq (dynamic) of half g (dynamic) of head hh;
         the same steps as one group of _rmw. Returns the carried r0..r3 (LCG: advanced)."""
-        ct, tbase = ctx["ct"], ctx["tbase"]
+        twarp = ctx["twarp"]
         ldn = self.ldn
-        fv = U.tmem_ld(ct, tbase + 64 + gq * ldn, ldn)
+        fv = U.tmem_ld(twarp + 64 + gq * ldn, ldn)
         rws = None
         if self.sr_rounds > 0:
             # one Philox draw per 8-element chunk, issued under the TMEM load; off_row is a
@@ -4145,7 +4141,7 @@ class GdnReplayMtpUmmaRubin:
         """Flush rows, unrolled RMW (builds without ``rmw_loop``): S_half = e^{G_P} S0_half + F
         (TMEM cols 64..127) in place on state stage g (= half g of head hh), then publish it to
         warp 0's TMA store (f_gdone). Same arithmetic and noise bits as the RMW loop."""
-        ct, row, tbase, s_coef = ctx["ct"], ctx["row"], ctx["tbase"], ctx["s_coef"]
+        row, twarp, s_coef = ctx["row"], ctx["twarp"], ctx["s_coef"]
         egp = s_coef[hh * _COEF + _CO_EGP]
         srow = ctx["st_addr"] + g * 16384 + row * 128
         if self.sr_rounds > 0:
@@ -4181,7 +4177,7 @@ class GdnReplayMtpUmmaRubin:
             for _ in range(3):
                 lx.append(lx[-1] * Uint32(U.LCG_A) + Uint32(U.LCG_C))
         for grp in range(64 // ldn):
-            fv = U.tmem_ld(ct, tbase + 64 + grp * ldn, ldn)
+            fv = U.tmem_ld(twarp + 64 + grp * ldn, ldn)
             if self.sr_rounds > 0:
                 # one Philox draw per 8-element chunk (word i -> pair i), all of the load's
                 # chunks in one call, issued under the TMEM load. off_row is a multiple of 64, so
