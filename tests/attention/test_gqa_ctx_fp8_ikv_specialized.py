@@ -339,6 +339,87 @@ def test_direct_ffi_alignment(offset):
 
 
 @requires_sm103
+@pytest.mark.parametrize("pad", [0, 7])
+def test_direct_table_width(pad):
+    inp = _make_inputs([2, 2], [2, 2], btw_pad=pad, shuffle_pages=True)
+    out = _out_like(inp).fill_(float("nan"))
+    _direct(inp, out)
+    torch.testing.assert_close(
+        out.float(), _reference(inp).float(), atol=0.005, rtol=0.05
+    )
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "case,message",
+    [
+        ("short_out", "out must"),
+        ("strided_out", "out must"),
+        ("fp16_out", "out must"),
+        ("strided_q", "q must"),
+        ("table_rank", "tensor rank"),
+        ("seq_rank", "tensor rank"),
+        ("table_rows", "shapes"),
+        ("table_stride", "contiguous int32"),
+        ("cu_q_short", "shapes"),
+        ("cu_kv_short", "shapes"),
+        ("cu_q_stride", "contiguous int32"),
+        ("seq_dtype", "contiguous int32"),
+        ("page_stride", "token-interleaved"),
+        ("cpu_offsets", "same CUDA device"),
+    ],
+)
+def test_direct_rejects_invalid_views(case, message):
+    inp = _make_inputs([2, 2], [2, 2], btw_pad=1)
+    backing = _out_like(inp).fill_(-7)
+    out = backing
+    if case == "short_out":
+        out = backing[:-1]  # aligned; full backing still allocated
+    elif case == "strided_out":
+        out = backing.transpose(0, 1).contiguous().transpose(0, 1)
+    elif case == "fp16_out":
+        out = backing.view(torch.float16)
+    elif case == "strided_q":
+        inp["q"] = inp["q"].transpose(0, 1).contiguous().transpose(0, 1)
+    elif case == "table_rank":
+        inp["bt"] = inp["bt"].flatten()
+    elif case == "seq_rank":
+        inp["seq_lens"] = inp["seq_lens"].unsqueeze(1)
+    elif case == "table_rows":
+        inp["bt"] = inp["bt"][:1]
+    elif case == "table_stride":
+        inp["bt"] = inp["bt"][:, :1]
+    elif case == "cu_q_short":
+        inp["cu_q"] = inp["cu_q"][:-1]
+    elif case == "cu_kv_short":
+        inp["cu_kv"] = inp["cu_kv"][:-1]
+    elif case == "cu_q_stride":
+        inp["cu_q"] = inp["cu_q"].repeat_interleave(2)[::2]
+    elif case == "seq_dtype":
+        inp["seq_lens"] = inp["seq_lens"].long()
+    elif case == "page_stride":
+        inp["kv_buf"] = inp["kv_buf"].repeat_interleave(2, dim=0)[::2]
+    else:
+        inp["cu_kv"] = inp["cu_kv"].cpu()
+    with pytest.raises(ValueError, match=message):
+        _direct(inp, out)
+    assert (backing == -7).all().item()
+
+
+@requires_sm103
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="requires a second CUDA device"
+)
+def test_direct_rejects_other_cuda_device():
+    inp = _make_inputs([2], [2])
+    inp["cu_kv"] = inp["cu_kv"].to(
+        f"cuda:{(inp['q'].device.index + 1) % torch.cuda.device_count()}"
+    )
+    with pytest.raises(ValueError, match="same CUDA device"):
+        _direct(inp, _out_like(inp))
+
+
+@requires_sm103
 @pytest.mark.parametrize("empty", ["batch", "rows", "bound"])
 def test_direct_no_work(empty):
     inp = _make_inputs([1], [1])
@@ -524,7 +605,7 @@ def test_u128_padded_capacity_short_requests(B, q_len):
     gold = _reference(inp).float()
     nvalid = B * q_len
     before = dict(spec_mod.DISPATCH_STATS)
-    out = _out_like(inp)
+    out = _out_like(inp).fill_(-7)
     _api(inp, out)
     assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
         spec_mod.LAST_FALLBACK_REASONS
@@ -538,18 +619,49 @@ def test_u128_padded_capacity_short_requests(B, q_len):
     out2 = _out_like(inp)
     _api(inp, out2)
     assert torch.equal(out[:nvalid], out2[:nvalid])
+    assert (out[nvalid:] == -7).all().item()
 
 
 @requires_sm103
-def test_u2_large_batch_beyond_chunk_boundary():
+def test_u128_replay_changed_query_packing():
+    # Capture the U128 general route at full occupancy, then change only the
+    # packed query offsets. Both the graph bindings and the launch bounds stay fixed.
+    B = 10
+    inp = _make_padded_q128_inputs(B, PAGE, seed=17)
+    out = _out_like(inp)
+    _api(inp, out, backend="specialized")
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=stream):
+        _api(inp, out, backend="specialized")
+    torch.cuda.current_stream().wait_stream(stream)
+    for lengths in ([PAGE] * B, [125, 127] * (B // 2)):
+        inp["cu_q"][1:].copy_(inp["cu_q"].new_tensor(lengths).cumsum(0))
+        out.fill_(-7)
+        graph.replay()
+        live = sum(lengths)
+        torch.testing.assert_close(
+            out[:live].float(), _reference(inp).float(), atol=0.005, rtol=0.05
+        )
+        assert (out[live:] == -7).all().item()
+
+
+@requires_sm103
+@pytest.mark.parametrize("B", [65535, 65536])
+def test_u2_large_batch_beyond_chunk_boundary(B):
     # Regression: uniform q2/kv2 batches larger than 65535 used to be launched
     # in request chunks with q/out pointers advanced by the chunk origin while
     # the kernel's speculation fallback consumed cu_q's ABSOLUTE offsets --
     # applying the origin twice: rows past the boundary were written outside
     # the passed output view and the final logical rows were left untouched.
-    B = 65536
     dev = torch.device("cuda")
-    q = torch.zeros(B * 2, HQ, D, device=dev).to(torch.float8_e4m3fn)
+    # Keep the historical double-rebase destination (and its Q read) inside
+    # test allocations, but outside the views passed to the binding.
+    rows = B * 2
+    q = torch.zeros(rows * 2, HQ, D, dtype=torch.uint8, device=dev).view(
+        torch.float8_e4m3fn
+    )[:rows]
     kv_buf = torch.empty(1, PAGE, 2, D, device=dev)
     kv_buf[:, :, 0, :] = 0.0  # K = 0 -> uniform softmax
     kv_buf[:, :, 1, :] = 1.0  # V = 1 -> every output element is exactly 1
@@ -565,14 +677,16 @@ def test_u2_large_batch_beyond_chunk_boundary():
         max_kv=2,
     )
     before = dict(spec_mod.DISPATCH_STATS)
-    out = torch.full((B * 2, HQ, D), -8.0, dtype=torch.bfloat16, device=dev)
+    backing = torch.full((rows * 2, HQ, D), -8.0, dtype=torch.bfloat16, device=dev)
+    out = backing[:rows]
     _api(inp, out)
     assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
         spec_mod.LAST_FALLBACK_REASONS
     )
     # every logical row (poisoned beforehand) must have been written, exactly
     # within the passed view
-    assert float((out.float() - 1.0).abs().max()) <= 0.02
+    assert (out == 1).all().item()
+    assert (backing[rows:] == -8).all().item()
 
 
 @requires_sm103
@@ -654,6 +768,56 @@ def test_cuda_graph_replay_matches_eager():
     gold2 = _reference(inp).float()
     diff2 = (out.float() - gold2).abs()
     assert float((diff2 <= 0.005 + 0.05 * gold2.abs()).float().mean()) == 1.0
+
+
+@requires_sm103
+def test_direct_reports_immediate_launch_error(tmp_path):
+    # No production fault-injection switch: compile a private copy in which
+    # just the default tiny launch has an invalid grid. No device code from
+    # that launch can execute. Build and tensor setup are outside raises().
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.core import gen_jit_spec, sm103a_nvcc_flags
+
+    name = "gqa_ctx_fp8_ikv_sm103.cu"
+    source = (jit_env.FLASHINFER_CSRC_DIR / name).read_text()
+    launch = "LAUNCH(attn_tiny, 2);"
+    assert source.count(launch) == 1
+    faulty = tmp_path / name
+    faulty.write_text(
+        source.replace(
+            launch, "attn_tiny<2><<<0, 64, 0, st>>>(qp, kvp, btp, cqp, slp, op, btw);"
+        )
+    )
+    run = (
+        gen_jit_spec(
+            "gqa_ctx_fp8_ikv_sm103_invalid_grid_test",
+            [faulty],
+            extra_cuda_cflags=sm103a_nvcc_flags
+            + ["-DQ2_CAUSAL_PRUNE=1", "-DTINY_KVCAP=1"],
+        )
+        .build_and_load()
+        .gqa_ctx_fp8_ikv_run
+    )
+    inp = _make_inputs([1], [1])
+    k = inp["kv_buf"][:, :, 0, :].unsqueeze(1)
+    out = _out_like(inp).fill_(-7)
+    torch.cuda.synchronize()
+    with pytest.raises(
+        RuntimeError,
+        match="gqa_ctx_fp8_ikv_run launch at request 0: invalid configuration",
+    ):
+        run(
+            inp["q"],
+            k,
+            inp["bt"],
+            inp["cu_q"],
+            inp["cu_kv"],
+            inp["seq_lens"],
+            1,
+            1,
+            out,
+        )
+    assert (out == -7).all().item()
 
 
 @requires_sm103

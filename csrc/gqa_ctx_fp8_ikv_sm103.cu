@@ -2365,11 +2365,53 @@ __global__ void __launch_bounds__((128 * NTOK), (NTOK == 4 ? 2 : (NTOK == 2 ? 4 
 void Run(ffi::TensorView q, ffi::TensorView kv_buf, ffi::TensorView block_table,
          ffi::TensorView cu_q, ffi::TensorView cu_kv, ffi::TensorView seq_lens, int64_t max_q_len,
          int64_t max_kv_len, ffi::TensorView out) {
-  const int total_B = static_cast<int>(seq_lens.shape()[0]);
-  const int btw = static_cast<int>(block_table.shape()[1]);
-  const int max_q = static_cast<int>(max_q_len);
+  if (q.ndim() != 3 || out.ndim() != 3 || kv_buf.ndim() != 4 || block_table.ndim() != 2 ||
+      seq_lens.ndim() != 1 || cu_q.ndim() != 1 || cu_kv.ndim() != 1) {
+    TVM_FFI_THROW(ValueError) << "invalid tensor rank for gqa_ctx_fp8_ikv_run";
+  }
+  const auto device = q.device();
+  for (const auto& t : {q, kv_buf, block_table, cu_q, cu_kv, seq_lens, out}) {
+    if (t.device().device_type != kDLCUDA || t.device().device_id != device.device_id) {
+      TVM_FFI_THROW(ValueError) << "all tensors must be on the same CUDA device";
+    }
+  }
+  const auto has_dtype = [](ffi::TensorView t, int code, int bits) {
+    const auto dt = t.dtype();
+    return dt.code == code && dt.bits == bits && dt.lanes == 1;
+  };
+  if (!has_dtype(q, kDLFloat8_e4m3fn, 8) || q.shape()[1] != HQ || q.shape()[2] != DH ||
+      !q.IsContiguous()) {
+    TVM_FFI_THROW(ValueError) << "q must be contiguous E4M3FN [tokens, 16, 128]";
+  }
+  if (!has_dtype(out, kDLBfloat, 16) || out.shape()[0] != q.shape()[0] || out.shape()[1] != HQ ||
+      out.shape()[2] != DH || !out.IsContiguous()) {
+    TVM_FFI_THROW(ValueError) << "out must be contiguous BF16 with the query shape";
+  }
+  if (!has_dtype(kv_buf, kDLFloat8_e4m3fn, 8) || kv_buf.shape()[1] != 1 ||
+      kv_buf.shape()[2] != PAGE || kv_buf.shape()[3] != DH || kv_buf.stride(3) != 1 ||
+      kv_buf.stride(2) != KVTOK || (kv_buf.shape()[0] > 1 && kv_buf.stride(0) != PAGE * KVTOK)) {
+    TVM_FFI_THROW(ValueError) << "kv_buf must be an E4M3FN K view of token-interleaved pages";
+  }
+  for (const auto& t : {block_table, cu_q, cu_kv, seq_lens}) {
+    if (!has_dtype(t, kDLInt, 32) || !t.IsContiguous()) {
+      TVM_FFI_THROW(ValueError) << "table, offsets and lengths must be contiguous int32";
+    }
+  }
+  const int64_t batch = seq_lens.shape()[0];
+  const int64_t width = block_table.shape()[1];
+  if (batch > INT32_MAX || width > INT32_MAX || block_table.shape()[0] != batch ||
+      cu_q.shape()[0] != batch + 1 || cu_kv.shape()[0] != batch + 1) {
+    TVM_FFI_THROW(ValueError) << "table and offsets must have shapes [batch, width] and [batch+1]";
+  }
   // Reserved rows need not imply any requests. Never launch an empty grid.
-  if (total_B == 0 || max_q <= 0 || q.shape()[0] == 0) return;
+  if (batch == 0 || max_q_len <= 0 || q.shape()[0] == 0) return;
+  if (width == 0 || kv_buf.shape()[0] == 0 || max_q_len > PAGE || max_kv_len > PAGE) {
+    TVM_FFI_THROW(ValueError)
+        << "nonempty work requires a page pool, a table column and single-page bounds";
+  }
+  const int total_B = static_cast<int>(batch);
+  const int btw = static_cast<int>(width);
+  const int max_q = static_cast<int>(max_q_len);
   if ((reinterpret_cast<uintptr_t>(q.data_ptr()) | reinterpret_cast<uintptr_t>(kv_buf.data_ptr()) |
        reinterpret_cast<uintptr_t>(out.data_ptr())) &
       15) {
@@ -2489,6 +2531,11 @@ void Run(ffi::TensorView q, ffi::TensorView kv_buf, ffi::TensorView block_table,
       } else {
         LAUNCH_GEN(1, 1, 4);
       }
+    }
+    const cudaError_t status = cudaGetLastError();
+    if (status != cudaSuccess) {
+      TVM_FFI_THROW(RuntimeError) << "gqa_ctx_fp8_ikv_run launch at request " << rbase << ": "
+                                  << cudaGetErrorString(status);
     }
     rbase += B;
   } while (rbase < total_B);
