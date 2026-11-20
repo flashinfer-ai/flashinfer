@@ -799,6 +799,28 @@ __device__ __forceinline__ int cta_of_unit(long long x, int mode, long long Wtot
   return lo;
 }
 
+// A scored tile owns ALL its valid rows. Round the direct-fill range down
+// to a tile boundary unless the entire request (including its tail) fits.
+__host__ __device__ constexpr int direct_fill_rows(int nq, int prefix) {
+  const int limit = TOPK * KBLOCK - prefix;
+  return limit >= nq ? nq : limit <= 0 ? 0 : limit / BM * BM;
+}
+
+// Check the actual fill bound against the independent scoring predicate:
+// a tile is scored iff its last valid query has more than 15 prior blocks.
+constexpr bool writers_partition_request(int nq, int prefix) {
+  const int end = direct_fill_rows(nq, prefix);
+  for (int start = 0; start < nq; start += BM) {
+    const int next = start + BM < nq ? start + BM : nq;
+    const bool scored = (prefix + next - 1) / KBLOCK >= TOPK;
+    if (scored ? end > start : end < next) return false;
+  }
+  return true;
+}
+static_assert(writers_partition_request(8192, 128));     // mixed tile at row 1792
+static_assert(writers_partition_request(8192, 130944));  // no direct fill
+static_assert(writers_partition_request(1856, 128));     // short score-free tail
+
 template <bool USE_W1_BOUNDARIES, bool GUARDED, bool EPILOGUE4, bool FUSED>
 __global__ __launch_bounds__(NTHR_P, 1) void persistent_score_kernel(
     const __grid_constant__ CUtensorMap qmap, const __grid_constant__ CUtensorMap kmap,
@@ -1413,15 +1435,12 @@ __global__ __launch_bounds__(NTHR_P, 1) void persistent_score_kernel(
       }
     }
   }
-  // Rows whose own block is <= 15 take every prior block and belong to no
-  // scored tile, so the fused kernel emits them itself.  Issued after the
+  // Emit rows of wholly score-free tiles only. Issued after the
   // scoring loop, where it cannot delay the first A/B transfers.
   if constexpr (FUSED && !USE_W1_BOUNDARIES) {
     for (int rr = 0; rr < B; ++rr) {
       const int q0r = cu[rr];
-      int c = (TOPK * KBLOCK) - prefix[rr];
-      const int nqr = cu[rr + 1] - q0r;
-      if (c > nqr) c = nqr;
+      const int c = direct_fill_rows(cu[rr + 1] - q0r, prefix[rr]);
       for (int ii = (int)blockIdx.x * NTHR_P + tid; ii < c; ii += NCTA * NTHR_P) {
         const int ow = (prefix[rr] + ii) >> 7;
         int4* const outf = reinterpret_cast<int4*>(selp + (size_t)(q0r + ii) * TOPK);
@@ -2080,7 +2099,37 @@ __global__ __launch_bounds__(256, 2) void direct_fallback_kernel(
   }
 }
 
+// Only launched after an accepted acquire and a rejected consumer launch.
+__global__ void release_rejected_workspace() { finish_workspace(); }
+
 // ---------------- host side ----------------
+// Only synchronous submission rejection establishes that no consumer ran.
+static bool submission_rejected(cudaError_t status) {
+  return status == cudaErrorInvalidConfiguration || status == cudaErrorLaunchOutOfResources ||
+         status == cudaErrorInvalidValue || status == cudaErrorInvalidDeviceFunction ||
+         status == cudaErrorNoKernelImageForDevice;
+}
+
+static void check_cuda(cudaError_t status, const char* op) {
+  if (status != cudaSuccess) {
+    // A failed runtime setup call can also set the thread's last error.
+    (void)cudaGetLastError();
+    TVM_FFI_ICHECK(false) << op << ": " << cudaGetErrorString(status);
+  }
+}
+
+static void check_consumer(const char* op, bool acquired, cudaStream_t stream) {
+  const cudaError_t status = cudaGetLastError();
+  if (submission_rejected(status) && acquired) {
+    // Ordered after the acquire and any accepted scorer on this same stream.
+    release_rejected_workspace<<<1, 1, 0, stream>>>();
+    const cudaError_t cleanup = cudaGetLastError();
+    TVM_FFI_ICHECK(cleanup == cudaSuccess)
+        << op << ": " << cudaGetErrorString(status)
+        << "; workspace release: " << cudaGetErrorString(cleanup);
+  }
+  check_cuda(status, op);
+}
 static CUresult make_map(CUtensorMap* tm, const void* ptr, uint64_t rows, uint32_t box_rows) {
   uint64_t gdim[2] = {(uint64_t)DHEAD, rows};
   uint64_t gstr[1] = {(uint64_t)DHEAD * 2ull};
@@ -2159,6 +2208,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
     g_primary_stream_set = true;
   }
   const bool guarded = stream != g_primary_stream;
+  check_cuda(cudaGetLastError(), "CUDA error before staged indexer submission");
 
   const int pgtot = TKPAD / KBLOCK;
   // Fixed selectors retain exact slow paths beyond the generated average.
@@ -2172,6 +2222,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
         (const __nv_bfloat16*)qi.data_ptr(), (const __nv_bfloat16*)ki.data_ptr(),
         (const int*)cu_seqlens.data_ptr(), (const int*)kv_base.data_ptr(),
         (const int*)prefix_lens.data_ptr(), (int*)sel.data_ptr(), B, TQ);
+    check_cuda(cudaGetLastError(), "direct_fallback_kernel");
     return;
   }
 
@@ -2183,6 +2234,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
     direct_fill_kernel<<<fill_blocks, 256, 0, stream>>>((const int*)cu_seqlens.data_ptr(),
                                                         (const int*)prefix_lens.data_ptr(),
                                                         (int*)sel.data_ptr(), B, TQ);
+    check_cuda(cudaGetLastError(), "direct_fill_kernel");
     return;
   }
 
@@ -2199,6 +2251,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
         (const __nv_bfloat16*)qi.data_ptr(), (const __nv_bfloat16*)ki.data_ptr(),
         (const int*)cu_seqlens.data_ptr(), (const int*)kv_base.data_ptr(),
         (const int*)prefix_lens.data_ptr(), (int*)sel.data_ptr(), B, TQ);
+    check_cuda(cudaGetLastError(), "direct_fallback_kernel");
     return;
   }
   int avg_pg = pgtot / (B > 0 ? B : 1);
@@ -2238,33 +2291,31 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
 
   const int smem = NAT * ASZ + STAGES * BSZ;
   const int attr_dev = qi.device().device_id;
-  if (attr_dev >= 0 && attr_dev < 64 && !g_score_attr_set[attr_dev]) {
-    cudaFuncSetAttribute(score_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(score_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<false, false, false, false>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<true, false, true, false>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<false, true, false, false>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<true, true, true, false>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<false, false, true, false>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<false, true, true, false>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<true, false, true, true>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<true, true, true, true>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<false, false, true, true>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(persistent_score_kernel<false, true, true, true>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    g_score_attr_set[attr_dev] = 1;
+  const bool cacheable = attr_dev >= 0 && attr_dev < 64;
+  if (!cacheable || !g_score_attr_set[attr_dev]) {
+    auto set_smem = [&](auto kernel) {
+      check_cuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem),
+                 "cudaFuncSetAttribute");
+    };
+    set_smem(score_kernel<false>);
+    set_smem(score_kernel<true>);
+    set_smem(persistent_score_kernel<false, false, false, false>);
+    set_smem(persistent_score_kernel<true, false, true, false>);
+    set_smem(persistent_score_kernel<false, true, false, false>);
+    set_smem(persistent_score_kernel<true, true, true, false>);
+    set_smem(persistent_score_kernel<false, false, true, false>);
+    set_smem(persistent_score_kernel<false, true, true, false>);
+    set_smem(persistent_score_kernel<true, false, true, true>);
+    set_smem(persistent_score_kernel<true, true, true, true>);
+    set_smem(persistent_score_kernel<false, false, true, true>);
+    set_smem(persistent_score_kernel<false, true, true, true>);
+    if (cacheable) g_score_attr_set[attr_dev] = 1;
   }
 
-  if (guarded) acquire_workspace<<<1, 1, 0, stream>>>();
+  if (guarded) {
+    acquire_workspace<<<1, 1, 0, stream>>>();
+    check_cuda(cudaGetLastError(), "acquire_workspace");
+  }
 
   // Short-context multi-request shapes were split as nsplit x ntiles grids,
   // which both overflows one wave and leaves the largest query tile's chunk
@@ -2318,7 +2369,6 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
             qmap, kmap, (const int*)cu_seqlens.data_ptr(), (const int*)kv_base.data_ptr(),
             (const int*)prefix_lens.data_ptr(), B, pgstride, (int*)sel.data_ptr());
     }
-    if (fuse_sel) return;
   } else {
     int reduce_tiles = 0;
     int schedule_mode = 0;
@@ -2347,12 +2397,16 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
           reduce_tiles, schedule_mode);
   }
 
+  check_consumer("staged scorer", guarded, stream);
+  if (fuse_sel) return;
+
   if (fixed22_w1) {
     constexpr int W1_SELECTOR_BLOCKS = 848;
     if (guarded)
       topk_w1_exact_kernel<true><<<W1_SELECTOR_BLOCKS, 256, 0, stream>>>((int*)sel.data_ptr());
     else
       topk_w1_exact_kernel<false><<<W1_SELECTOR_BLOCKS, 256, 0, stream>>>((int*)sel.data_ptr());
+    check_consumer("W1 selector", guarded, stream);
     return;
   }
 
@@ -2366,6 +2420,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
       topk_w5_exact_kernel<false><<<W5_SELECTOR_BLOCKS, 256, 0, stream>>>(
           (const int*)cu_seqlens.data_ptr(), (const int*)prefix_lens.data_ptr(),
           (int*)sel.data_ptr());
+    check_consumer("W5 selector", guarded, stream);
     return;
   }
 
@@ -2381,6 +2436,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
     launch_topk<false>((const int*)cu_seqlens.data_ptr(), (const int*)prefix_lens.data_ptr(),
                        (int*)sel.data_ptr(), B, TQ, pgstride, max_pg, tk_blocks, tk_threads,
                        stream);
+  check_consumer("staged selector", guarded, stream);
 }
 
 }  // namespace c64_regbuf_impl

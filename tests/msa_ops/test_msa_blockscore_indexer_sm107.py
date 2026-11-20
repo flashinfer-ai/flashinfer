@@ -8,6 +8,12 @@ bitwise equality, while small shapes and the constructed-tie test (where every
 score gap is exact) assert exact equality.
 """
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
 import pytest
 import torch
 
@@ -365,6 +371,42 @@ def test_fallback_inf_tie_keeps_lowest_ids():
     assert got[0].tolist() == expect, f"{got[0].tolist()} != {expect}"
 
 
+def _isolated(worker, *args, timeout=300):
+    # Primary-stream registration belongs to the loaded native module. A new
+    # interpreter (not a fork of an initialized CUDA process) starts it empty.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy, sys; runpy.run_path(sys.argv[1])[sys.argv[2]](*sys.argv[3:])",
+            str(Path(__file__).resolve()),
+            worker,
+            *args,
+        ],
+        check=True,
+        timeout=timeout,
+    )
+
+
+def _primary_w6():
+    for qlens, prefixes in [
+        ([8192, 8192], [0, 131072]),
+        ([8192, 8192], [128, 130944]),
+        ([1856, 14528], [128, 130880]),
+    ]:
+        args = _analytic_inputs(qlens, prefixes)
+        assert args[0].shape[0] == 16384 and args[1].shape[0] == 1152 * BLOCK
+        out = torch.full((16384, TOPK), -2, dtype=torch.int32, device="cuda")
+        msa_blockscore_topk_indexer(*args, output=out, backend="specialized")
+        torch.testing.assert_close(
+            out.cpu(), _analytic_expected(qlens, prefixes), rtol=0, atol=0
+        )
+
+
+def test_primary_w6_tile_boundaries():
+    _isolated("_primary_w6", timeout=900)
+
+
 def test_graph_replay_same_capture_stream():
     """Capture one call into a CUDA graph and replay it 20 times on the
     capture stream (the documented replay contract), checking the output
@@ -380,6 +422,7 @@ def test_graph_replay_same_capture_stream():
     out = torch.empty((sum(qlens), TOPK), dtype=torch.int32, device="cuda")
     ref = _analytic_expected(qlens, prefixes)
 
+    s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         msa_blockscore_topk_indexer(*args, output=out)  # build + warm up
     s.synchronize()
@@ -389,8 +432,8 @@ def test_graph_replay_same_capture_stream():
         msa_blockscore_topk_indexer(*args, output=out)
 
     for replay in range(20):
-        out.zero_()
         with torch.cuda.stream(s):
+            out.fill_(-2)
             g.replay()
         s.synchronize()
         torch.testing.assert_close(
@@ -398,39 +441,38 @@ def test_graph_replay_same_capture_stream():
         )
 
 
-def test_concurrent_eager_overflow_streams():
-    """Concurrent eager calls on two non-primary streams share the guarded
-    overflow workspace; the release/acquire handoff must keep every call's
-    scratch state private to its lock tenure. One stream drives the staged
-    scorer, the other the fused single-pass kernel, 30 interleaved calls
-    each with no intervening synchronization."""
-    # Ensure the primary slot is owned by the current stream, so both side
-    # streams below take the guarded overflow slot.
-    warm = _analytic_inputs([256], [4096])
-    msa_blockscore_topk_indexer(*warm)
+@pytest.mark.parametrize("route", ["generic", "persistent", "fused"])
+def test_concurrent_eager_overflow_streams(route):
+    _isolated("_contend", route, timeout=900)
 
-    qlens_a, prefixes_a = [4096], [65536]  # staged W5-tier scorer+selector
-    qlens_b, prefixes_b = [4096] * 4, [65536] * 4  # fused single-pass kernel
-    args_a = _analytic_inputs(qlens_a, prefixes_a)
-    args_b = _analytic_inputs(qlens_b, prefixes_b)
-    ref_a = _analytic_expected(qlens_a, prefixes_a)
-    ref_b = _analytic_expected(qlens_b, prefixes_b)
+
+def _contend(route):
+    qlens, prefixes = {
+        "generic": ([4096], [4096]),
+        "persistent": ([16384], [0]),
+        "fused": ([4096] * 4, [65536] * 4),
+    }[route]
+    args_a = _analytic_inputs(qlens, prefixes)
+    # Reverse the rank of every prior block without changing dispatch or
+    # request geometry. Cross-call score/list contamination is observable.
+    args_b = (-args_a[0], *args_a[1:])
+    ref_a = _analytic_expected(qlens, prefixes)
+    ref_b = _ties_expected(qlens, prefixes)  # lowest prior ids win
+    assert not torch.equal(ref_a, ref_b)
+    msa_blockscore_topk_indexer(*args_a, backend="specialized")
 
     n_iters = 30
     outs_a = [
-        torch.empty((sum(qlens_a), TOPK), dtype=torch.int32, device="cuda")
+        torch.empty((sum(qlens), TOPK), dtype=torch.int32, device="cuda")
         for _ in range(n_iters)
     ]
     outs_b = [
-        torch.empty((sum(qlens_b), TOPK), dtype=torch.int32, device="cuda")
+        torch.empty((sum(qlens), TOPK), dtype=torch.int32, device="cuda")
         for _ in range(n_iters)
     ]
     s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
-    # Build both module paths before the contended loop.
-    with torch.cuda.stream(s1):
-        msa_blockscore_topk_indexer(*args_a)
-    with torch.cuda.stream(s2):
-        msa_blockscore_topk_indexer(*args_b)
+    # Order primary registration, input preparation and buffer allocation
+    # before either stream starts; no synchronization inside the loop.
     torch.cuda.synchronize()
 
     for i in range(n_iters):
@@ -442,8 +484,118 @@ def test_concurrent_eager_overflow_streams():
 
     for i in range(n_iters):
         torch.testing.assert_close(
-            outs_a[i].cpu(), ref_a, rtol=0, atol=0, msg=f"staged call {i} mismatched"
+            outs_a[i].cpu(),
+            ref_a,
+            rtol=0,
+            atol=0,
+            msg=f"{route} stream 1 call {i} mismatched",
         )
         torch.testing.assert_close(
-            outs_b[i].cpu(), ref_b, rtol=0, atol=0, msg=f"fused call {i} mismatched"
+            outs_b[i].cpu(),
+            ref_b,
+            rtol=0,
+            atol=0,
+            msg=f"{route} stream 2 call {i} mismatched",
         )
+
+
+def _rejection_module(directory):
+    # Build a private copy with invalid attribute/grid values at selected
+    # submission sites. The runtime really rejects the submission; neither
+    # the status checks nor the cleanup launches are mocked. No fault switch
+    # or extra synchronization in the shipped module.
+    from flashinfer.jit.msa_blockscore_indexer import (
+        gen_jit_spec,
+        get_msa_blockscore_indexer_csrc_dir,
+        sm107a_nvcc_flags,
+    )
+
+    root = get_msa_blockscore_indexer_csrc_dir()
+    sources = []
+    for family in ("staged", "fused"):
+        path = root / f"msa_blockscore_indexer_sm107_{family}.cu"
+        text = path.read_text()
+        sites = {
+            "cudaFuncAttributeMaxDynamicSharedMemorySize, smem)": 'cudaFuncAttributeMaxDynamicSharedMemorySize, fault("setup") ? 0x7fffffff : smem)',
+            "acquire_workspace<<<1, 1, 0, stream>>>": 'acquire_workspace<<<fault("acquire") ? 0 : 1, 1, 0, stream>>>',
+        }
+        if family == "staged":
+            sites["score_kernel<true><<<grid, NTHR, smem, stream>>>"] = (
+                'score_kernel<true><<<fault("score") ? dim3(0) : grid, NTHR, smem, stream>>>'
+            )
+            sites["const int tk_blocks = (TQ + tk_warps - 1) / tk_warps;"] = (
+                'const int tk_blocks = fault("select") ? 0 : (TQ + tk_warps - 1) / tk_warps;'
+            )
+        else:
+            sites["score_kernel<true><<<ncta, NTHR, smem, stream>>>"] = (
+                'score_kernel<true><<<fault("score") ? 0 : ncta, NTHR, smem, stream>>>'
+            )
+        for site, replacement in sites.items():
+            assert site in text, (path, site)
+            text = text.replace(site, replacement)
+        target = directory / path.name
+        target.write_text(
+            "#include <cstdlib>\n#include <cstring>\n"
+            "static bool fault(const char* site) {\n"
+            '  const char* s = std::getenv("MSA_TEST_REJECT");\n'
+            "  return s && std::strcmp(s, site) == 0;\n}\n" + text
+        )
+        sources.append(target)
+    sources.append(root / "msa_blockscore_indexer_sm107_binding.cu")
+    return gen_jit_spec(
+        "msa_blockscore_indexer_sm107_test_rejection",
+        sources,
+        extra_cuda_cflags=sm107a_nvcc_flags,
+        extra_ldflags=["-lcuda"],
+    ).build_and_load()
+
+
+def _exercise_rejections():
+    from flashinfer.msa_ops import blockscore_indexer as api
+
+    with tempfile.TemporaryDirectory() as tmp:
+        module = _rejection_module(Path(tmp))
+        api._get_module = lambda: module  # isolated process, real FFI run
+        for family, qlens, prefixes in [
+            ("staged", [256], [4096]),
+            ("fused", [4096] * 4, [65536] * 4),
+        ]:
+            args = _analytic_inputs(qlens, prefixes)
+            ref = _analytic_expected(qlens, prefixes)
+            primary = torch.cuda.current_stream()
+            overflow = torch.cuda.Stream()
+            out = torch.empty_like(ref, device="cuda")
+            for site, stream, message in [
+                ("setup", primary, "cudaFuncSetAttribute"),
+                ("acquire", overflow, "acquire_workspace"),
+                ("score", overflow, f"{family} scorer"),
+                *(
+                    [("select", overflow, "staged selector")]
+                    if family == "staged"
+                    else []
+                ),
+            ]:
+                with torch.cuda.stream(stream):
+                    out.fill_(-2)
+                    before = msa_blockscore_indexer_stats()
+                    os.environ["MSA_TEST_REJECT"] = site
+                    try:
+                        with pytest.raises(Exception, match=message):
+                            msa_blockscore_topk_indexer(
+                                *args, output=out, backend="specialized"
+                            )
+                    finally:
+                        del os.environ["MSA_TEST_REJECT"]
+                    after = msa_blockscore_indexer_stats()
+                    for key in ("dispatches", "backend_dispatches"):
+                        assert after[key] == before[key]
+                    # No dependent selector ran using stale scores.
+                    assert (out == -2).all().item()
+                    msa_blockscore_topk_indexer(
+                        *args, output=out, backend="specialized"
+                    )
+                    torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
+
+def test_rejected_submissions_retry_and_release():
+    _isolated("_exercise_rejections", timeout=900)

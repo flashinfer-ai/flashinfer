@@ -836,7 +836,23 @@ __global__ __launch_bounds__(256, 2) void direct_fallback_kernel(
   }
 }
 
+// Only launched after an accepted acquire and a rejected scorer launch.
+__global__ void release_rejected_workspace() { finish_workspace(); }
+
 // ---------------- host side ----------------
+// Only synchronous submission rejection establishes that no consumer ran.
+static bool submission_rejected(cudaError_t status) {
+  return status == cudaErrorInvalidConfiguration || status == cudaErrorLaunchOutOfResources ||
+         status == cudaErrorInvalidValue || status == cudaErrorInvalidDeviceFunction ||
+         status == cudaErrorNoKernelImageForDevice;
+}
+
+static void check_cuda(cudaError_t status, const char* op) {
+  if (status != cudaSuccess) {
+    (void)cudaGetLastError();
+    TVM_FFI_ICHECK(false) << op << ": " << cudaGetErrorString(status);
+  }
+}
 static CUresult make_map(CUtensorMap* tm, const void* ptr, uint64_t rows, uint32_t box_rows) {
   uint64_t gdim[2] = {(uint64_t)DHEAD, rows};
   uint64_t gstr[1] = {(uint64_t)DHEAD * 2ull};
@@ -871,8 +887,14 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
   }
   const bool guarded = stream != g_primary_stream;
 
-  if (g_sm_count == 0)
-    cudaDeviceGetAttribute(&g_sm_count, cudaDevAttrMultiProcessorCount, qi.device().device_id);
+  check_cuda(cudaGetLastError(), "CUDA error before fused indexer submission");
+  if (g_sm_count == 0) {
+    int count;
+    check_cuda(
+        cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, qi.device().device_id),
+        "cudaDeviceGetAttribute");
+    g_sm_count = count;
+  }
   const int pgtot = TKPAD / KBLOCK;
   const int ntiles_bound = (TQ + BM - 1) / BM + B - 1;
 
@@ -881,6 +903,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
         (const __nv_bfloat16*)qi.data_ptr(), (const __nv_bfloat16*)ki.data_ptr(),
         (const int*)cu_seqlens.data_ptr(), (const int*)kv_base.data_ptr(),
         (const int*)prefix_lens.data_ptr(), (int*)sel.data_ptr(), B, TQ);
+    check_cuda(cudaGetLastError(), "direct_fallback_kernel");
     return;
   }
 
@@ -888,6 +911,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
     fill_kernel<<<(TQ + 7) / 8, 256, 0, stream>>>((const int*)cu_seqlens.data_ptr(),
                                                   (const int*)prefix_lens.data_ptr(),
                                                   (int*)sel.data_ptr(), B, TQ);
+    check_cuda(cudaGetLastError(), "fill_kernel");
     return;
   }
   {
@@ -899,10 +923,15 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
         << "); qi/ki must be 16-byte-aligned contiguous BF16";
     const int smem = NAT * ASZ + STAGES * BSZ;
     const int attr_dev = qi.device().device_id;
-    if (attr_dev >= 0 && attr_dev < 64 && !g_attr_set[attr_dev]) {
-      cudaFuncSetAttribute(score_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-      cudaFuncSetAttribute(score_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-      g_attr_set[attr_dev] = 1;
+    const bool cacheable = attr_dev >= 0 && attr_dev < 64;
+    if (!cacheable || !g_attr_set[attr_dev]) {
+      check_cuda(cudaFuncSetAttribute(score_kernel<false>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, smem),
+                 "cudaFuncSetAttribute");
+      check_cuda(cudaFuncSetAttribute(score_kernel<true>,
+                                      cudaFuncAttributeMaxDynamicSharedMemorySize, smem),
+                 "cudaFuncSetAttribute");
+      if (cacheable) g_attr_set[attr_dev] = 1;
     }
     int ncta = g_sm_count > 0 ? g_sm_count : 212;
     // Few query tiles would otherwise give each tile ncta/ntiles chunks to
@@ -912,6 +941,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
     if (ncta > MAXPAIRS - MAXTILES) ncta = MAXPAIRS - MAXTILES;
     if (guarded) {
       acquire_workspace<<<1, 1, 0, stream>>>();
+      check_cuda(cudaGetLastError(), "acquire_workspace");
       score_kernel<true><<<ncta, NTHR, smem, stream>>>(
           qmap, kmap, (const int*)cu_seqlens.data_ptr(), (const int*)kv_base.data_ptr(),
           (const int*)prefix_lens.data_ptr(), (int*)sel.data_ptr(), B, ncta);
@@ -920,6 +950,15 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
           qmap, kmap, (const int*)cu_seqlens.data_ptr(), (const int*)kv_base.data_ptr(),
           (const int*)prefix_lens.data_ptr(), (int*)sel.data_ptr(), B, ncta);
     }
+    const cudaError_t status = cudaGetLastError();
+    if (submission_rejected(status) && guarded) {
+      release_rejected_workspace<<<1, 1, 0, stream>>>();
+      const cudaError_t cleanup = cudaGetLastError();
+      TVM_FFI_ICHECK(cleanup == cudaSuccess)
+          << "fused scorer: " << cudaGetErrorString(status)
+          << "; workspace release: " << cudaGetErrorString(cleanup);
+    }
+    check_cuda(status, "fused scorer");
   }
 }
 
