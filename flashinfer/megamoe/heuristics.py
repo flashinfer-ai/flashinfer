@@ -246,6 +246,7 @@ def select_mxfp4_fused_plan(
         return bm * num_logical_experts // (num_ranks * num_topk)
 
     if weight_tile_bytes != 8704:
+        supported_tokens: tuple[int, ...]
         if weight_tile_bytes == 8448:
             supported_tokens = (1, 2, 4, 8) if num_ranks == 8 else (1, 4, 8)
         else:
