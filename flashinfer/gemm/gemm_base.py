@@ -552,6 +552,7 @@ def _cutlass_mm_bf16_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ):
     if bias is not None:
         raise ValueError(
@@ -584,6 +585,7 @@ def _cublaslt_mm_bf16_requirement(
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ):
     if bias is not None:
         if out_dtype != torch.bfloat16:
@@ -620,6 +622,7 @@ def _cudnn_mm_bf16_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ):
     _validate_bf16_output_dtype(out_dtype)
     return _cudnn_available_or_raise_for_backend(backend)
@@ -651,10 +654,11 @@ def _tgv_gemm_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ):
-    if out_dtype != torch.bfloat16:
+    if out_dtype not in (torch.bfloat16, torch.float32):
         raise ValueError(
-            "You cannot provide an output dtype to the TGV backend. Use the CUTLASS or cuDNN backend instead."
+            "The TGV backend supports bfloat16 and float32 output only. Use the CUTLASS or cuDNN backend instead."
         )
     _require_tma_bf16_k_alignment("TGV", a.shape[-1])
     # The TGV backend dispatches to the CuTeDSL (cute_ext) implementation
@@ -671,6 +675,11 @@ def _tgv_gemm_requirement(
                 "`pip install 'nvidia-cutlass-dsl[cu13]'` or flip "
                 "_TGV_DEBUG_USE_CPP in flashinfer/gemm/gemm_base.py."
             )
+    if tactic is not None:
+        from .kernels.tgv_gemm_cute_ext import get_tgv_cute_ext_valid_tactics
+
+        if tactic not in get_tgv_cute_ext_valid_tactics(a.device):
+            raise ValueError(f"TGV tactic {tactic} is not valid on {a.device}.")
     return True
 
 
@@ -686,6 +695,7 @@ def _cute_dsl_mm_bf16_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cute-dsl", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The CuTeDSL low-M backend requires bfloat16 output.")
@@ -756,6 +766,7 @@ def _cutile_mm_bf16_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ):
     if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
@@ -783,6 +794,7 @@ def _tinygemm_mm_bf16_requirement(
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "tinygemm", "auto"] = "cudnn",
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The TinyGEMM backend only supports bfloat16 output.")
@@ -820,7 +832,10 @@ def _check_mm_bf16_problem_size(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ):
+    if tactic is not None and backend != "tgv":
+        raise ValueError("tactic applies to the TGV backend only; pass backend='tgv'.")
     if a.dtype != torch.bfloat16:
         raise ValueError(
             f"First tensor has unsupported dtype {a.dtype}. Only bfloat16 is supported."
@@ -864,6 +879,7 @@ def _heuristic_func_mm_bf16(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ):
     # pdl does not narrow the candidates: cuDNN, cuBLASLt and CUTLASS have no
     # PDL launch and run without it here (CUTLASS and cuBLASLt reject
@@ -937,6 +953,7 @@ def mm_bf16(
     ] = "cudnn",
     *,
     batch_invariant: bool = False,
+    tactic: Optional[int] = None,
 ) -> torch.Tensor:
     r"""MM BF16
 
@@ -969,10 +986,12 @@ def mm_bf16(
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
-        for CUTLASS and cuDNN backends; TinyGEMM and CuTeDSL require bf16 output.
+        for CUTLASS and cuDNN backends, FP32 output also for TGV; TinyGEMM and
+        CuTeDSL require bf16 output.
 
     out_dtype: torch.dtype
-        Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
+        Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends;
+        TGV supports ``torch.bfloat16`` and ``torch.float32``.
         TinyGEMM and CuTeDSL require ``torch.bfloat16``. Defaults to
         ``torch.bfloat16``.
 
@@ -1019,6 +1038,12 @@ def mm_bf16(
         instead of falling back. See ``flashinfer/batch_invariant/README.md``.
         Defaults to ``False``.
 
+    tactic: Optional[int]
+        TGV only (requires ``backend="tgv"``): run this TGV tactic id and skip
+        the default and the autotuner, also inside ``autotune()``. Valid ids
+        are ``0 .. 28`` on SM100/SM103 and ``0 .. 46`` on SM107. For callers
+        that pick the tile per shape themselves. Defaults to ``None``.
+
     Returns
     -------
     torch.Tensor
@@ -1063,6 +1088,8 @@ def mm_bf16(
     pdl = bool(pdl)
 
     if batch_invariant:
+        if tactic is not None:
+            raise ValueError("tactic does not apply to batch_invariant=True.")
         from .batch_invariant.tuning import mm_bf16_batch_invariant_auto
 
         return mm_bf16_batch_invariant_auto(a, b, bias, pdl, out, out_dtype, backend)
@@ -1073,6 +1100,11 @@ def mm_bf16(
             device=a.device,
             dtype=out_dtype,
         )
+
+    if tactic is not None:
+        from .kernels.tgv_gemm_cute_ext import run_tgv_cute_ext
+
+        return run_tgv_cute_ext(a, b, bias, out, pdl, tactic)
 
     # cuTile backend: pure cuda.tile Python kernel, no shared C++ dispatcher.
     # Handled before the SM100 dispatch table because it does not consume
