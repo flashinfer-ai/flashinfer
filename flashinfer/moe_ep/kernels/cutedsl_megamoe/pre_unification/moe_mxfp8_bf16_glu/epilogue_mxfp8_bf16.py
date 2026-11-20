@@ -54,6 +54,8 @@ Fc1GateUpInterleave = 16
 EpilogueTokenTile = 64
 EpilogueWarpCount = 4
 WarpThreadCount = 32
+# runtime_mma_split's small-tile MMA N. The FC1 block remap assumes 64.
+RuntimeMmaSplitTileN = 64
 
 
 class _ImmutableAfterInit:
@@ -369,8 +371,15 @@ class _MixedSwapABFc1Epilogue(_ImmutableAfterInit):
             token_block = subtile_idx * cutlass.Int32(2) + cutlass.Int32(
                 token_half
             )
-            if cutlass.const_expr(self.fc1_n128_block_swap):
-                if valid_tokens > cutlass.Int32(2 * WarpThreadCount):
+            # Rows stay in accumulator column order; FC2's full-N MMA undoes
+            # the swap.
+            row_in_expert = (
+                work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
+                + token_block * cutlass.Int32(WarpThreadCount)
+                + self.lane_idx
+            )
+            if cutlass.const_expr(self.runtime_mma_split):
+                if valid_tokens > cutlass.Int32(RuntimeMmaSplitTileN):
                     token_block = ((token_block & cutlass.Int32(1)) << 1) | (
                         token_block >> 1
                     )
@@ -442,7 +451,7 @@ class _MixedSwapABFc1Epilogue(_ImmutableAfterInit):
                 g_vec = cute.local_tile(
                     fc1_output,
                     (1, Fc1GateUpInterleave, 1),
-                    (token_in_expert, feature_block, 0),
+                    (row_in_expert, feature_block, 0),
                 )
                 aligned_ptr = cute.make_ptr(
                     cutlass.BFloat16,
@@ -492,7 +501,7 @@ class MixedGluBf16Epilogue:
         accumulator_overlap: bool = False,
         batch_invariant: bool = False,
         batch_invariant_activation=None,
-        fc1_n128_block_swap: bool = False,
+        runtime_mma_split: bool = False,
     ) -> None:
         self.batch_invariant_chain = batch_invariant
         self.batch_invariant_activation = batch_invariant_activation
@@ -519,15 +528,12 @@ class MixedGluBf16Epilogue:
         atom_thr_size = 2 if use_2cta_instrs else 1
         self.cta_tile_m = mma_tiler_mnk[0] // atom_thr_size
         self.cta_tile_n = mma_tiler_mnk[1]
-        # FC1 tiles with more than 64 valid tokens hold token blocks
-        # (0, 2, 1, 3) in their four 32-column accumulator blocks.
-        self.fc1_n128_block_swap = fc1_n128_block_swap
-        if fc1_n128_block_swap and (
-            self.cta_tile_n != 128 or accumulator_overlap
-        ):
-            raise ValueError(
-                "fc1_n128_block_swap requires N=128 without accumulator overlap."
-            )
+        # With runtime_mma_split, tiles above RuntimeMmaSplitTileN valid tokens
+        # use the N128 MMA and hold token blocks (0, 2, 1, 3) in their
+        # 32-column accumulator blocks.
+        self.runtime_mma_split = runtime_mma_split
+        if runtime_mma_split and self.cta_tile_n != 128:
+            raise ValueError("runtime_mma_split requires N=128.")
         self.cta_tile_k = mma_tiler_mnk[2]
         if self.cta_tile_m != self._EpilogueFc2HiddenTileSize:
             raise ValueError(
@@ -787,4 +793,5 @@ __all__ = [
     "EpilogueTokenTile",
     "Fc1GateUpInterleave",
     "MixedGluBf16Epilogue",
+    "RuntimeMmaSplitTileN",
 ]

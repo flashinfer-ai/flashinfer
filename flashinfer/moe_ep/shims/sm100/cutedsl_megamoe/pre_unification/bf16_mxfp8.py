@@ -48,9 +48,8 @@ class MegaMoEBf16Mxfp8Config:
     clc_bundle_size: Optional[int] = None
     num_sched_stages: Optional[int] = 2
     num_activation_stages: Optional[int] = None
-    mma_inst_n: Optional[int] = None
+    runtime_mma_split: bool = False
     direct_bf16_cvt: bool = True
-    full_tile_mma: bool = False
     num_weight_stages: Optional[int] = None
     flag_batch: int = 4
     epi_flag_batch: Tuple[int, int] = (2, 4)
@@ -456,9 +455,8 @@ class MegaMoEBf16Mxfp8Frontend:
             clc_bundle_size=c.clc_bundle_size,
             num_sched_stages=c.num_sched_stages,
             num_activation_stages=c.num_activation_stages,
-            mma_inst_n=c.mma_inst_n,
+            runtime_mma_split=c.runtime_mma_split,
             direct_bf16_cvt=c.direct_bf16_cvt,
-            full_tile_mma=c.full_tile_mma,
             num_weight_stages=c.num_weight_stages,
             transform_buffer=c.transform_buffer,
             accumulator_overlap=c.accumulator_overlap,
