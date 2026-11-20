@@ -1382,6 +1382,8 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         """Forward the latest delayed-V page IDs after the domain loop."""
         del stage_info
         return cached_k_pages, cached_v_pages, cached_next_v_pages
+
+
 class SmemQResource(HighThroughputMlaResource):
     """SMEM Q buffer (latent + rope).  Producer: LoadTma (TMA).  Consumer: Mma.
 
@@ -4405,21 +4407,31 @@ class GmemOResource(HighThroughputMlaResource):
     @cute.jit
     def _balanced_public_row(self, storage_row, batch_idx):
         if cutlass.const_expr(self.cu_seqlens_q is None):
-            storage_row += Int64(batch_idx) * Int64(self.logical_num_heads_q) * Int64(
-                self.logical_seq_len_q
+            storage_row += (
+                Int64(batch_idx)
+                * Int64(self.logical_num_heads_q)
+                * Int64(self.logical_seq_len_q)
             )
         return Int64(storage_row)
 
     @cute.jit
     def _store_balanced_output_fragment(
-        self, values, row_in_tile, query_tile_idx, batch_idx,
-        partial_idx, storage_row, column,
+        self,
+        values,
+        row_in_tile,
+        query_tile_idx,
+        batch_idx,
+        partial_idx,
+        storage_row,
+        column,
     ):
         # Integer addresses avoid a pointer-valued phi for one-piece requests.
         address = Int64(0)
         if partial_idx >= Int32(0):
-            element = ((Int64(query_tile_idx) * Int64(self.cfg.mma_qk_tiler[0])
-                + Int64(row_in_tile)) * Int64(self.split_kv) + Int64(partial_idx))
+            element = (
+                Int64(query_tile_idx) * Int64(self.cfg.mma_qk_tiler[0])
+                + Int64(row_in_tile)
+            ) * Int64(self.split_kv) + Int64(partial_idx)
             address = self.partial_output.iterator.raw_ptr().toint(Int64) + (
                 element * Int64(self.cfg.latent_dim * 2)
             )
@@ -4433,13 +4445,23 @@ class GmemOResource(HighThroughputMlaResource):
 
     @cute.jit
     def _store_balanced_lse(
-        self, value, row_in_tile, query_tile_idx, batch_idx, partial_idx, storage_row,
+        self,
+        value,
+        row_in_tile,
+        query_tile_idx,
+        batch_idx,
+        partial_idx,
+        storage_row,
     ):
         address = Int64(0)
         if partial_idx >= Int32(0):
-            element = ((Int64(query_tile_idx) * Int64(self.cfg.mma_qk_tiler[0])
-                + Int64(row_in_tile)) * Int64(self.split_kv) + Int64(partial_idx))
-            address = self.partial_lse.iterator.raw_ptr().toint(Int64) + element * Int64(4)
+            element = (
+                Int64(query_tile_idx) * Int64(self.cfg.mma_qk_tiler[0])
+                + Int64(row_in_tile)
+            ) * Int64(self.split_kv) + Int64(partial_idx)
+            address = self.partial_lse.iterator.raw_ptr().toint(
+                Int64
+            ) + element * Int64(4)
         else:
             row = self._balanced_public_row(storage_row, batch_idx)
             address = self.lse.iterator.raw_ptr().toint(Int64) + row * Int64(4)
@@ -4587,8 +4609,13 @@ class GmemOResource(HighThroughputMlaResource):
             if row_in_tile < physical_tile_rows and query_is_valid:
                 if cutlass.const_expr(self.use_balanced_scheduler):
                     self._store_balanced_output_fragment(
-                        qk_acc_regs, row_in_tile, seq_q_idx, batch_idx,
-                        split_kv_idx, storage_flat_query_row, iter_n * tile_d + g_j,
+                        qk_acc_regs,
+                        row_in_tile,
+                        seq_q_idx,
+                        batch_idx,
+                        split_kv_idx,
+                        storage_flat_query_row,
+                        iter_n * tile_d + g_j,
                     )
                 elif cutlass.const_expr(self.partial_output is not None):
                     # Split-KV partial O uses BF16 workspace storage.  LSE and
@@ -4739,8 +4766,12 @@ class GmemOResource(HighThroughputMlaResource):
             if lse_row_in_tile < physical_tile_rows and lse_query_is_valid:
                 if cutlass.const_expr(self.use_balanced_scheduler):
                     self._store_balanced_lse(
-                        lse, lse_row_in_tile, seq_q_idx, batch_idx,
-                        split_kv_idx, storage_flat_lse_row,
+                        lse,
+                        lse_row_in_tile,
+                        seq_q_idx,
+                        batch_idx,
+                        split_kv_idx,
+                        storage_flat_lse_row,
                     )
                 elif cutlass.const_expr(self.partial_lse is not None):
                     S_q = (
@@ -4901,8 +4932,13 @@ class GmemOResource(HighThroughputMlaResource):
         if row_in_tile < physical_tile_rows and query_is_valid and direct_store != 0:
             if cutlass.const_expr(self.use_balanced_scheduler):
                 self._store_balanced_output_fragment(
-                    qk_acc_regs, row_in_tile, seq_q_idx, batch_idx,
-                    split_kv_idx, storage_flat_query_row, iter_n * tile_d + g_j,
+                    qk_acc_regs,
+                    row_in_tile,
+                    seq_q_idx,
+                    batch_idx,
+                    split_kv_idx,
+                    storage_flat_query_row,
+                    iter_n * tile_d + g_j,
                 )
             elif cutlass.const_expr(self.partial_output is not None):
                 S_q = (
@@ -5044,8 +5080,12 @@ class GmemOResource(HighThroughputMlaResource):
                 if lse_row_in_tile < physical_tile_rows and lse_query_is_valid:
                     if cutlass.const_expr(self.use_balanced_scheduler):
                         self._store_balanced_lse(
-                            lse, lse_row_in_tile, seq_q_idx, batch_idx,
-                            split_kv_idx, storage_flat_lse_row,
+                            lse,
+                            lse_row_in_tile,
+                            seq_q_idx,
+                            batch_idx,
+                            split_kv_idx,
+                            storage_flat_lse_row,
                         )
                     elif cutlass.const_expr(self.partial_lse is not None):
                         S_q = (

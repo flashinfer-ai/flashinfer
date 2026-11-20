@@ -1784,6 +1784,7 @@ def test_prims_ts_mla_wrapper_trace_allows_only_balanced_inactive_slots():
     assert "scheduler:balanced" not in ordinary["tags"]
     assert "scheduler:balanced" in balanced["tags"]
 
+
 # ---------------------------------------------------------------------------
 # End-to-end checks: fi_trace with auto-generated CPU tensors
 #

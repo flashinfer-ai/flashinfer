@@ -6,6 +6,37 @@ MLA execution requires a checked-in calibration for the exact GPU product,
 compute capability, and SM count. It deliberately fails instead of using a
 model measured on another device.
 
+## Supported modes and ordinary fallback
+
+Balanced execution retains its qualified dense D576 feature set: latent width
+512, RoPE width 64, page sizes 16/32/64/128, matching BF16 or E4M3 Q/KV, BF16
+output, and host scalar scales. Both 1CTA/2CTA and fixed/packed Q are supported.
+For fixed Q the runtime query extent must equal the planned extent; packed
+request lengths may vary within their planned bound.
+
+Main's context parallelism, public LSE, attention tuning (including skip
+correction), device scalar scales, D512-only geometry, smaller pages, and sparse
+or quantized-cache APIs are not extensions of the balanced path. Sparse and
+quantized caches continue to use their separate upstream APIs.
+`plan_auto()` uses ordinary kernels for unsupported modes without consulting
+the balanced admission gate or calibration registry. `plan_balanced()` rejects
+them before policy compilation or allocation. A supported but uncalibrated
+auto candidate still warns and falls back as described below. Ordinary planning
+and execution keep main's interfaces and behavior, including their CP/LSE and
+inactive-request contracts.
+
+`plan_balanced()` and `plan_auto()` retain their existing
+`max_seq_len_q`/`q_data_type`/`kv_data_type`/`o_data_type` arguments; ordinary
+`plan()` uses main's `max_q_len`/`q_dtype`/`kv_dtype`/`out_dtype` names.
+Runtime scale keywords for all routes follow main: `softmax_scale` and
+`output_scale`. The calibration tool uses the corresponding internal planner
+and runtime bindings.
+
+The rebase preserves main's ordinary page-window loader and reducer; balanced
+combine reduction is a separate entry point. The existing B200/B300 coefficients
+remain registered, but the rebased kernels require fresh GPU correctness,
+graph-replay, and performance validation before production use.
+
 Checked-in calibrations currently cover these exact CUDA device identities:
 
 | Product name | Compute capability | SM count |

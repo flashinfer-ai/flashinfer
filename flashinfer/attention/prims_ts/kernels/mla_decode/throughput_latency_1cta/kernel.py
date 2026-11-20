@@ -137,6 +137,8 @@ def ceil_div(a, b):
     """Return the ceiling of a divided by b."""
 
     return (a + b - 1) // b
+
+
 @cute.jit
 def _publish_neutral_standalone_partial(
     cfg,
@@ -2271,7 +2273,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 use_pdl=True,
                 pdl_entry_trigger_max_ctas=self.pdl_entry_trigger_max_ctas,
             )
-        if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
+        if (
+            self.split_kv_capacity is not None
+            and cfg.use_multi_ctas_kv == 1
+            and not self.use_balanced_scheduler
+        ):
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
         if not self.fixed_seqlen:
             group = cfg.fixed_sparse_kv_tiles

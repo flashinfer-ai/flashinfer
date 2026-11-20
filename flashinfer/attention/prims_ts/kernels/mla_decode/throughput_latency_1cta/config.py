@@ -1883,7 +1883,9 @@ def make_throughput_latency_mla_config(
             use_multi_ctas_kv=1,
             use_cluster_reduction=0,
         )
-    elif selected_profile.use_persistent_scheduler and selected_profile.use_multi_ctas_kv:
+    elif (
+        selected_profile.use_persistent_scheduler and selected_profile.use_multi_ctas_kv
+    ):
         # The ordinary persistent queue does not enumerate KV splits.
         raise ValueError(
             "1CTA persistent scheduling is not supported with split-KV; "

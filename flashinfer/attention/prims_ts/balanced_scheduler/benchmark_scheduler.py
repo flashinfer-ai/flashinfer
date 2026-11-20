@@ -159,8 +159,8 @@ def make_runtime(
             kv_cache,
             block_tables,
             seq_lens,
-            bmm1_scale=1.0 / math.sqrt(QK_HEAD_DIM),
-            bmm2_scale=1.0,
+            softmax_scale=1.0 / math.sqrt(QK_HEAD_DIM),
+            output_scale=1.0,
             out=output,
             validate=False,
         )
@@ -183,8 +183,8 @@ def make_runtime(
         kv_cache,
         block_tables,
         seq_lens,
-        bmm1_scale=1.0 / math.sqrt(QK_HEAD_DIM),
-        bmm2_scale=1.0,
+        softmax_scale=1.0 / math.sqrt(QK_HEAD_DIM),
+        output_scale=1.0,
         out=output,
         validate=not forced_target_piece_tiles,
     )

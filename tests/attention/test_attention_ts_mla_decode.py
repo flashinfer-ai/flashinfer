@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import FrozenInstanceError, dataclass, replace
+from dataclasses import dataclass, replace
 import inspect
 import functools
 import math
@@ -485,7 +485,7 @@ def _fill_logical_cache_tokens(
 
     if case.block_tables.shape[0] != 1:
         raise ValueError("marker helper requires exactly one request")
-    stored_value = value / case.bmm2_scale
+    stored_value = value / case.output_scale
     for token_idx in range(token_begin, token_end):
         page_slot, page_offset = divmod(token_idx, case.page_size)
         physical_page = int(case.block_tables[0, page_slot].item())
@@ -944,8 +944,14 @@ def _plan_case(
     plan = wrapper.plan
     if balanced:
         plan = wrapper.plan_balanced
-        options.pop("tuning")
-        for source, target in (("q_dtype", "q_data_type"), ("kv_dtype", "kv_data_type"), ("out_dtype", "o_data_type"), ("max_q_len", "max_seq_len_q")):
+        if softmax_rescale_threshold_log2 == 0.0:
+            options.pop("tuning")
+        for source, target in (
+            ("q_dtype", "q_data_type"),
+            ("kv_dtype", "kv_data_type"),
+            ("out_dtype", "o_data_type"),
+            ("max_q_len", "max_seq_len_q"),
+        ):
             options[target] = options.pop(source)
         options["seq_lens"] = tuple(int(value) for value in case.seq_lens_kv.cpu())
     plan(
@@ -1044,7 +1050,7 @@ def test_attention_ts_mla_balanced_kernel_dtype_product(
     case = _make_mla_case(
         batch_size=2,
         num_qo_heads=num_qo_heads,
-        max_seq_len=32768,
+        max_kv_len=32768,
         kv_seq_lens=(32768, 257),
         qkv_dtype=qkv_dtype,
         device="cuda",
@@ -1071,7 +1077,7 @@ def test_attention_ts_mla_balanced_b64_h32_uses_calibrated_1cta_family():
     case = _make_mla_case(
         batch_size=batch_size,
         num_qo_heads=32,
-        max_seq_len=32768,
+        max_kv_len=32768,
         kv_seq_lens=(32768,) + (257,) * (batch_size - 1),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1095,7 +1101,7 @@ def test_attention_ts_mla_balanced_b16_h64_uses_calibrated_1cta_family():
     case = _make_mla_case(
         batch_size=batch_size,
         num_qo_heads=64,
-        max_seq_len=32768,
+        max_kv_len=32768,
         kv_seq_lens=(32768,) + (257,) * (batch_size - 1),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1119,7 +1125,7 @@ def test_attention_ts_mla_balanced_b4_h64_fp8_uses_calibrated_1cta_family():
     case = _make_mla_case(
         batch_size=batch_size,
         num_qo_heads=64,
-        max_seq_len=32768,
+        max_kv_len=32768,
         kv_seq_lens=(32768,) + (257,) * (batch_size - 1),
         qkv_dtype=torch.float8_e4m3fn,
         device="cuda",
@@ -1162,7 +1168,7 @@ def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
         batch_size=1,
         num_qo_heads=num_qo_heads,
         seq_len_q=2,
-        max_seq_len=257,
+        max_kv_len=257,
         kv_seq_lens=(257,),
         qkv_dtype=qkv_dtype,
         device="cuda",
@@ -1184,7 +1190,7 @@ def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
     wrapper = _plan_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=2 if packed else None,
+        max_q_len=2 if packed else None,
         balanced=True,
     )
     policy = _policy_dict(wrapper)
@@ -1198,7 +1204,7 @@ def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
     # of device-specific split costs (which may select a single three-tile piece).
     calibrated_out = _run_case(wrapper, case, qo_indptr=qo_indptr)
     _assert_case_correct(calibrated_out, case, policy, qo_indptr=qo_indptr)
-    plan.schedule_device(case.seq_lens, forced_target_piece_tiles=1)
+    plan.schedule_device(case.seq_lens_kv, forced_target_piece_tiles=1)
     descriptors = plan.work_descriptors[: plan.last_descriptor_count].cpu()
     assert torch.any(descriptors[:, 2] - descriptors[:, 1] == 1)
 
@@ -1221,9 +1227,9 @@ def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
     assert captured is graph_out
 
     for runtime_seq_len in (129, 257):
-        case.seq_lens.fill_(runtime_seq_len)
-        wrapper.schedule(case.seq_lens)
-        plan.schedule_device(case.seq_lens, forced_target_piece_tiles=1)
+        case.seq_lens_kv.fill_(runtime_seq_len)
+        wrapper.schedule(case.seq_lens_kv)
+        plan.schedule_device(case.seq_lens_kv, forced_target_piece_tiles=1)
         graph_out.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
@@ -1272,7 +1278,7 @@ def test_attention_ts_mla_balanced_forced_m32_reducer_uses_logical_query_shape(
             batch_size=1,
             num_qo_heads=128,
             seq_len_q=1,
-            max_seq_len=129,
+            max_kv_len=129,
             kv_seq_lens=(129,),
             qkv_dtype=torch.bfloat16,
             device="cuda",
@@ -1304,7 +1310,7 @@ def test_attention_ts_mla_balanced_2cta_keeps_flat_query_tile_layout():
         batch_size=2,
         num_qo_heads=96,
         seq_len_q=2,
-        max_seq_len=32768,
+        max_kv_len=32768,
         kv_seq_lens=(32768, 257),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1331,7 +1337,7 @@ def test_attention_ts_mla_balanced_2cta_keeps_flat_packed_query_tile_layout():
         batch_size=len(q_lens),
         num_qo_heads=96,
         seq_len_q=max(q_lens),
-        max_seq_len=32768,
+        max_kv_len=32768,
         kv_seq_lens=(32768, 2049, 257),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1341,7 +1347,7 @@ def test_attention_ts_mla_balanced_2cta_keeps_flat_packed_query_tile_layout():
     wrapper = _plan_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max(q_lens),
+        max_q_len=max(q_lens),
         balanced=True,
     )
     policy = _policy_dict(wrapper)
@@ -1363,7 +1369,7 @@ def test_attention_ts_mla_balanced_causal_reducer_uses_equal_split_boundaries():
         batch_size=1,
         num_qo_heads=128,
         seq_len_q=2,
-        max_seq_len=32769,
+        max_kv_len=32769,
         kv_seq_lens=(32769,),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1378,7 +1384,7 @@ def test_attention_ts_mla_balanced_causal_reducer_uses_equal_split_boundaries():
     assert plan is not None
     # This regression targets the four-tile equal-split geometry, independent of
     # whichever target the device's calibrated cost model currently selects.
-    plan.schedule_device(case.seq_lens, forced_target_piece_tiles=4)
+    plan.schedule_device(case.seq_lens_kv, forced_target_piece_tiles=4)
     assert plan.last_target_piece_tiles == 4
     assert plan.last_combine_request_count == 1
     combine = plan.combine_descriptors[0].cpu().tolist()
@@ -1397,7 +1403,7 @@ def test_attention_ts_mla_balanced_causal_reducer_uses_equal_split_boundaries():
         captured = _run_case(wrapper, case, out=graph_out, validate=False)
     assert captured is graph_out
 
-    wrapper.schedule(case.seq_lens)
+    wrapper.schedule(case.seq_lens_kv)
     kernel_workspace = wrapper._plan_state.workspace_views.kernel_workspace
     assert kernel_workspace is not None
     kernel_workspace.fill_(-1)
@@ -1424,7 +1430,7 @@ def test_attention_ts_mla_balanced_1cta_m64_uses_persistent_work_queue(
         batch_size=1,
         num_qo_heads=16,
         seq_len_q=3,
-        max_seq_len=4097,
+        max_kv_len=4097,
         kv_seq_lens=(4097,),
         qkv_dtype=qkv_dtype,
         device="cuda",
@@ -1465,7 +1471,7 @@ def test_attention_ts_mla_balanced_1cta_reducer_uses_logical_output_stride(
         batch_size=2,
         num_qo_heads=num_qo_heads,
         seq_len_q=seq_len_q,
-        max_seq_len=max_seq_len,
+        max_kv_len=max_seq_len,
         kv_seq_lens=(max_seq_len, max_seq_len),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1515,7 +1521,7 @@ def test_attention_ts_mla_balanced_1cta_reducer_uses_logical_output_stride(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        wrapper.schedule(case.seq_lens, validate=False)
+        wrapper.schedule(case.seq_lens_kv, validate=False)
         captured = _run_case(wrapper, case, out=output, validate=False)
     assert captured is output
 
@@ -1526,7 +1532,7 @@ def test_attention_ts_mla_balanced_1cta_reducer_uses_logical_output_stride(
         (max(seq_len_q, 127), max(seq_len_q, 65)),
         (max_seq_len, max_seq_len),
     ):
-        case.seq_lens.copy_(
+        case.seq_lens_kv.copy_(
             torch.tensor(runtime_seq_lens, dtype=torch.int32, device="cuda")
         )
         storage.fill_(sentinel)
@@ -1592,7 +1598,7 @@ def test_attention_ts_mla_balanced_schedule_across_graph_replay(
     case = _make_mla_case(
         batch_size=2,
         num_qo_heads=num_qo_heads,
-        max_seq_len=32768,
+        max_kv_len=32768,
         kv_seq_lens=(32768, 257),
         qkv_dtype=qkv_dtype,
         device="cuda",
@@ -1626,10 +1632,10 @@ def test_attention_ts_mla_balanced_schedule_across_graph_replay(
     assert captured is graph_out
 
     for runtime_seq_lens in ((127, 65), (16385, 129), (32768, 257)):
-        case.seq_lens.copy_(
+        case.seq_lens_kv.copy_(
             torch.tensor(runtime_seq_lens, dtype=torch.int32, device="cuda")
         )
-        wrapper.schedule(case.seq_lens)
+        wrapper.schedule(case.seq_lens_kv)
         kernel_workspace = wrapper._plan_state.workspace_views.kernel_workspace
         if kernel_workspace is not None:
             # Make an early reducer read deterministic and visibly invalid.
@@ -1677,13 +1683,13 @@ def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
     case = _make_mla_case(
         batch_size=batch_size,
         num_qo_heads=num_qo_heads,
-        max_seq_len=4096,
+        max_kv_len=4096,
         kv_seq_lens=storage_seq_lens,
         qkv_dtype=qkv_dtype,
         device="cuda",
         seed=33600 + num_qo_heads + qkv_dtype.itemsize,
     )
-    case.seq_lens.zero_()
+    case.seq_lens_kv.zero_()
     wrapper = _plan_case(case, balanced=True)
     policy = _policy_dict(wrapper)
     assert policy["kernel"] == expected_kernel
@@ -1694,7 +1700,7 @@ def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
 
     graph_out = torch.empty(
         (*case.query.shape[:-1], _LATENT_DIM),
-        dtype=case.output_dtype,
+        dtype=case.out_dtype,
         device=case.query.device,
     )
     _run_case(wrapper, case, out=graph_out)
@@ -1709,10 +1715,10 @@ def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
         (4096,) + (0,) * (batch_size - 1),
         storage_seq_lens,
     ):
-        case.seq_lens.copy_(
+        case.seq_lens_kv.copy_(
             torch.tensor(runtime_seq_lens, dtype=torch.int32, device="cuda")
         )
-        wrapper.schedule(case.seq_lens)
+        wrapper.schedule(case.seq_lens_kv)
         graph_out.fill_(float("nan"))
         wrapper._plan_state.workspace_views.lse.fill_(float("nan"))
         kernel_workspace = wrapper._plan_state.workspace_views.kernel_workspace
@@ -1781,7 +1787,7 @@ def test_attention_ts_mla_optimized_device_schedule_is_numerically_correct():
     case = _make_mla_case(
         batch_size=8,
         num_qo_heads=16,
-        max_seq_len=32768,
+        max_kv_len=32768,
         kv_seq_lens=(32768, 16384, 8192, 4096, 2048, 1024, 512, 129),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1789,7 +1795,7 @@ def test_attention_ts_mla_optimized_device_schedule_is_numerically_correct():
     )
     wrapper = _plan_case(case, balanced=True)
 
-    wrapper.schedule(case.seq_lens, scheduler="optimized")
+    wrapper.schedule(case.seq_lens_kv, scheduler="optimized")
     output = _run_case(wrapper, case)
 
     _assert_case_correct(output, case, _policy_dict(wrapper))
@@ -1804,7 +1810,7 @@ def test_attention_ts_mla_balanced_validated_run_requires_current_schedule():
     case = _make_mla_case(
         batch_size=2,
         num_qo_heads=16,
-        max_seq_len=512,
+        max_kv_len=512,
         kv_seq_lens=(512, 129),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1813,13 +1819,13 @@ def test_attention_ts_mla_balanced_validated_run_requires_current_schedule():
     wrapper = _plan_case(case, balanced=True)
 
     updated_seq_lens = (385, 65)
-    case.seq_lens.copy_(
+    case.seq_lens_kv.copy_(
         torch.tensor(updated_seq_lens, dtype=torch.int32, device="cuda")
     )
     with pytest.raises(ValueError, match=r"live seq_lens.*schedule"):
         _run_case(wrapper, case)
 
-    wrapper.schedule(case.seq_lens)
+    wrapper.schedule(case.seq_lens_kv)
     output = _run_case(wrapper, case)
     _assert_case_correct(output, case, _policy_dict(wrapper))
 
@@ -1835,16 +1841,16 @@ def test_attention_ts_mla_balanced_validated_run_requires_schedule_snapshot(
     case = _make_mla_case(
         batch_size=2,
         num_qo_heads=16,
-        max_seq_len=512,
+        max_kv_len=512,
         kv_seq_lens=(512, 128),
         qkv_dtype=torch.bfloat16,
         device="cuda",
         seed=33704,
     )
-    case.seq_lens.copy_(torch.tensor((128, 0), dtype=torch.int32, device="cuda"))
+    case.seq_lens_kv.copy_(torch.tensor((128, 0), dtype=torch.int32, device="cuda"))
     wrapper = _plan_case(case, balanced=True)
-    wrapper.schedule(case.seq_lens, validate=False)
-    case.seq_lens.copy_(torch.tensor((512, 128), dtype=torch.int32, device="cuda"))
+    wrapper.schedule(case.seq_lens_kv, validate=False)
+    case.seq_lens_kv.copy_(torch.tensor((512, 128), dtype=torch.int32, device="cuda"))
 
     original_launch = mla_decode_module._launch_mla_decode
 
@@ -1856,7 +1862,7 @@ def test_attention_ts_mla_balanced_validated_run_requires_schedule_snapshot(
         _run_case(wrapper, case)
 
     monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", original_launch)
-    wrapper.schedule(case.seq_lens)
+    wrapper.schedule(case.seq_lens_kv)
     output = _run_case(wrapper, case)
     _assert_case_correct(output, case, _policy_dict(wrapper))
 
@@ -1870,7 +1876,7 @@ def test_attention_ts_mla_balanced_workspace_size_is_publicly_queryable():
     case = _make_mla_case(
         batch_size=2,
         num_qo_heads=16,
-        max_seq_len=32768,
+        max_kv_len=32768,
         kv_seq_lens=(32768, 257),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1882,11 +1888,11 @@ def test_attention_ts_mla_balanced_workspace_size_is_publicly_queryable():
         _LATENT_DIM,
         _ROPE_DIM,
         case.page_size,
-        case.max_seq_len,
-        max_seq_len_q=1,
+        case.max_kv_len,
+        max_q_len=1,
         q_dtype=case.query.dtype,
         kv_dtype=case.kv_cache.dtype,
-        out_dtype=case.output_dtype,
+        out_dtype=case.out_dtype,
         mask_type=case.mask_type,
         balanced=True,
         device=case.query.device,
@@ -1900,12 +1906,12 @@ def test_attention_ts_mla_balanced_workspace_size_is_publicly_queryable():
         _LATENT_DIM,
         _ROPE_DIM,
         case.page_size,
-        case.max_seq_len,
+        case.max_kv_len,
         max_seq_len_q=1,
         packed_query=False,
         q_data_type=case.query.dtype,
         kv_data_type=case.kv_cache.dtype,
-        o_data_type=case.output_dtype,
+        o_data_type=case.out_dtype,
         seq_lens=(32768, 257),
         mask_type=case.mask_type,
         workspace_buffer=workspace,
@@ -1950,7 +1956,7 @@ def test_attention_ts_mla_auto_gate_runs_balanced_and_standard_plans():
     case = _make_mla_case(
         batch_size=2,
         num_qo_heads=128,
-        max_seq_len=8192,
+        max_kv_len=8192,
         kv_seq_lens=(8192, 512),
         qkv_dtype=torch.bfloat16,
         device="cuda",
@@ -1964,13 +1970,13 @@ def test_attention_ts_mla_auto_gate_runs_balanced_and_standard_plans():
         "kv_lora_rank": _LATENT_DIM,
         "qk_rope_head_dim": _ROPE_DIM,
         "page_size": case.page_size,
-        "max_kv_len": case.max_seq_len,
+        "max_kv_len": case.max_kv_len,
         "max_seq_len_q": 1,
         "packed_query": False,
         "q_data_type": case.query.dtype,
         "kv_data_type": case.kv_cache.dtype,
-        "o_data_type": case.output_dtype,
-        "seq_lens": tuple(int(value) for value in case.seq_lens.cpu()),
+        "o_data_type": case.out_dtype,
+        "seq_lens": tuple(int(value) for value in case.seq_lens_kv.cpu()),
         "mask_type": case.mask_type,
     }
 
@@ -3276,13 +3282,13 @@ def test_attention_ts_mla_balanced_q64_fp8_mixed_deep_queue_is_stable(
         query=query,
         kv_cache=kv_cache,
         block_tables=block_tables,
-        seq_lens=seq_lens_cpu.to(device),
-        max_seq_len=long_kv_len,
+        seq_lens_kv=seq_lens_cpu.to(device),
+        max_kv_len=long_kv_len,
         page_size=_DEFAULT_PAGE_SIZE,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         mask_type="causal",
-        bmm1_scale=q_scale * kv_scale / math.sqrt(_QK_DIM),
-        bmm2_scale=kv_scale,
+        softmax_scale=q_scale * kv_scale / math.sqrt(_QK_DIM),
+        output_scale=kv_scale,
     )
 
     selected_family = "throughput_latency_1cta"
@@ -3300,7 +3306,7 @@ def test_attention_ts_mla_balanced_q64_fp8_mixed_deep_queue_is_stable(
         assert one_plan is not None
         # This kernel-state regression specifically needs the deep exact/LPT
         # queue. Production defaults to the shallower optimized fold.
-        one_plan.schedule_device(case.seq_lens, scheduler="exact")
+        one_plan.schedule_device(case.seq_lens_kv, scheduler="exact")
         partition_offsets = one_plan.partition_offsets.cpu()
         partition_depths = partition_offsets[1:] - partition_offsets[:-1]
         assert one_plan.last_descriptor_count == batch_size
@@ -3497,7 +3503,7 @@ def test_attention_ts_mla_public_balanced_plan_rejects_packed_coordinate_overflo
             _ROPE_DIM,
             _DEFAULT_PAGE_SIZE,
             257,
-            max_seq_len_q=1,
+            max_q_len=1,
             balanced=True,
             device="cuda",
         )

@@ -88,6 +88,30 @@ _MLA_LEGACY_KV_COORDINATE_RESERVE = 128 * 2 * 128
 _MLA_MAX_KV_LEN = _INT32_MAX - (_MLA_LEGACY_KV_COORDINATE_RESERVE - 1)
 
 
+def _balanced_mla_mode_is_supported(
+    *,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
+    page_size=32,
+    cp_world=1,
+    lse_mode="none",
+    tuning=None,
+    softmax_scale=1.0,
+    output_scale=1.0,
+):
+    """Keep balanced execution within its qualified dense MLA feature set."""
+    return (
+        kv_lora_rank == 512
+        and qk_rope_head_dim == 64
+        and page_size in (16, 32, 64, 128)
+        and cp_world == 1
+        and lse_mode == "none"
+        and tuning is None
+        and not isinstance(softmax_scale, torch.Tensor)
+        and not isinstance(output_scale, torch.Tensor)
+    )
+
+
 @dataclass(frozen=True)
 class _MLADecodeLaunchSpec:
     """Automatic MLA policy and scratch geometry for one plan."""
@@ -499,7 +523,7 @@ def _validate_mla_run_metadata(
     seq_lens_kv: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
     *,
-    state: _MLADecodePlanState,
+    state: Optional[_MLADecodePlanState] = None,
     device: torch.device,
     batch_size: int,
     required_page_columns: int,
@@ -568,9 +592,11 @@ def _validate_mla_run_metadata(
     seq_lens_host = tuple(int(value) for value in seq_lens_kv.tolist())
     if cp_world > 1 and any(length < 0 for length in seq_lens_host):
         raise ValueError("global runtime KV lengths must be nonnegative with CP")
-    if state.balanced_plan is not None and any(length < 0 for length in seq_lens_host):
+    if getattr(state, "balanced_plan", None) is not None and any(
+        length < 0 for length in seq_lens_host
+    ):
         raise ValueError("every runtime K/V length must be non-negative")
-    if state.balanced_plan is not None:
+    if getattr(state, "balanced_plan", None) is not None:
         if state.planned_seq_lens is None:
             raise RuntimeError(
                 "balanced MLA cannot validate the installed schedule because its "
@@ -1094,9 +1120,11 @@ def _resolve_mla_decode_launch_spec(
                 use_balanced_scheduler=balanced,
                 fixed_seqlen=balanced,
             )
-            kernel.runtime_split_kv = True
+            kernel.runtime_split_kv = not balanced
             final_cfg = kernel._make_config()
-            split_kv = int(final_cfg.num_ctas_per_seq_kv) if balanced else one_cta_split_kv
+            split_kv = (
+                int(final_cfg.num_ctas_per_seq_kv) if balanced else one_cta_split_kv
+            )
             if balanced:
                 _validate_balanced_1cta_packed_coordinate(
                     batch_size=batch_size,
@@ -1203,7 +1231,9 @@ def _resolve_mla_decode_launch_spec(
                 is_persistent=is_persistent,
                 is_var_seq=False,
                 is_var_split_kv=balanced,
-                static_split_kv=split_kv if balanced else (1 if capacity == 1 else None),
+                static_split_kv=split_kv
+                if balanced
+                else (1 if capacity == 1 else None),
                 split_kv_capacity=capacity,
                 static_seq_len_k=None,
                 qkv_dtype=qkv_dtype_name,
@@ -1520,7 +1550,6 @@ def _get_compiled_mla_decode(
         stride_order=(0,),
         assumed_align=4,
     )
-    block_split_kvs_fake = None
     balanced_work_descriptors_fake = None
     balanced_partition_offsets_fake = None
     balanced_combine_descriptors_fake = None
@@ -1712,8 +1741,15 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         _validate_mask(mask_type)
     if not isinstance(balanced, bool):
         raise TypeError("balanced must be a bool")
-    if balanced and cp_world != 1:
-        raise ValueError("balanced MLA does not support context parallelism")
+    if balanced and not _balanced_mla_mode_is_supported(
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        page_size=page_size,
+        cp_world=cp_world,
+    ):
+        raise ValueError(
+            "unsupported balanced MLA mode: requires D576, page size 16/32/64/128 and no context parallelism"
+        )
     if kv_dtype is None:
         kv_dtype = q_dtype
     if validate:
@@ -1917,12 +1953,14 @@ def _launch_mla_decode(
         cp_rank,
     ]
     if balanced_plan is not None:
-        launch_args.extend((
-            balanced_plan.work_descriptors,
-            balanced_plan.partition_offsets,
-            balanced_plan.combine_descriptors,
-            balanced_plan.num_combine_descriptors,
-        ))
+        launch_args.extend(
+            (
+                balanced_plan.work_descriptors,
+                balanced_plan.partition_offsets,
+                balanced_plan.combine_descriptors,
+                balanced_plan.num_combine_descriptors,
+            )
+        )
     compiled(*launch_args)
     return runtime.out
 
@@ -2108,8 +2146,20 @@ class BatchMLADecodePagedTSWrapper:
             raise ValueError("balanced_seq_lens requires balanced=True")
         if not balanced and balanced_bootstrap_cost is not None:
             raise ValueError("balanced_bootstrap_cost requires balanced=True")
-        if balanced and (cp_world != 1 or lse_mode != "none" or tuning is not None):
-            raise ValueError("balanced MLA does not support context parallelism, public LSE, or attention tuning")
+        if balanced and not _balanced_mla_mode_is_supported(
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            page_size=page_size,
+            cp_world=cp_world,
+            lse_mode=lse_mode,
+            tuning=tuning,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+        ):
+            raise ValueError(
+                "unsupported balanced MLA mode: requires dense D576, page size "
+                "16/32/64/128, cp_world=1, lse_mode='none', tuning=None and host scales"
+            )
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
         _validate_mla_cp(cp_world, cp_interleave_size)
@@ -2417,7 +2467,6 @@ class BatchMLADecodePagedTSWrapper:
             kernel. It is range-checked even when ``validate`` is False.
         """
 
-
         self._plan(
             device=device,
             batch_size=batch_size,
@@ -2635,14 +2684,12 @@ class BatchMLADecodePagedTSWrapper:
         :meth:`plan` and :meth:`plan_balanced` remain the force-standard and
         force-balanced APIs, respectively.
 
-        Inactive padding is route-dependent. Balanced plans accept a zero K/V
-        length and publish zero output for that slot; standard plans require a
-        positive dummy length and a valid page. Therefore every ``seq_lens``
-        entry must be positive whenever this gate can select standard. Turning
-        runtime validation off does not add inactive-slot semantics. An
-        integration that requires zero-length graph padding must either supply
-        positive dummy metadata for the standard route or explicitly force a
-        balanced plan.
+        Inactive padding is route-dependent. Balanced plans accept zero K/V
+        lengths and publish zero output. Ordinary plans retain main's behavior:
+        nonpositive requests are inactive and their output is untouched, not
+        deterministically zeroed. An integration requiring neutral padding
+        must initialize or exclude ordinary inactive outputs, provide positive
+        dummy metadata, or explicitly force a qualified balanced plan.
 
         When supplying caller-owned scratch, first call
         :func:`should_use_prims_ts_balanced_mla` with the same static inputs,
@@ -2671,7 +2718,16 @@ class BatchMLADecodePagedTSWrapper:
             inconsistent with the other declaration.
         """
 
-        supported_balanced_mode = (cp_world == 1 and lse_mode == "none" and tuning is None)
+        supported_balanced_mode = _balanced_mla_mode_is_supported(
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            page_size=page_size,
+            cp_world=cp_world,
+            lse_mode=lse_mode,
+            tuning=tuning,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
+        )
         use_balanced = supported_balanced_mode and should_use_prims_ts_balanced_mla(
             batch_size=batch_size,
             num_heads=num_heads,
@@ -2850,6 +2906,11 @@ class BatchMLADecodePagedTSWrapper:
         state = self._plan_state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
+        if getattr(state, "balanced_plan", None) is not None and not state.packed_query:
+            if query.ndim != 4 or int(query.shape[1]) != state.max_q_len:
+                raise ValueError(
+                    "balanced fixed-query runs must match the planned max_q_len"
+                )
         softmax_scale = resolve_scale(
             softmax_scale, state.softmax_scale, "softmax_scale", state.device
         )

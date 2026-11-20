@@ -407,32 +407,23 @@ def create_load_tma_task(
 
     def load_tma_body(page_offset_window, smem_q, smem_kv, cached_page_state):
         """Load Q once and load K/V tiles with the K-before-V cadence."""
-        (
-            cached_k_pages,
-            cached_v_pages,
-            cached_next_v_pages,
-            cached_window_page,
-            prefetched_window_page,
-        ) = cached_page_state
+        cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
+            cached_page_state
+        )
 
         # HEAD: Q is independent of page IDs.  Enqueue it before the TMA warp
         # refreshes its first coalesced 32-entry page-table window.
         smem_q.acquire()
         smem_q.tma_load()
         smem_q.commit()
-        (
-            cached_k_pages,
-            cached_v_pages,
-            cached_next_v_pages,
-            cached_window_page,
-            prefetched_window_page,
-        ) = page_offset_window.read_page_offset_window(
-            cached_k_pages=cached_k_pages,
-            cached_v_pages=cached_v_pages,
-            cached_next_v_pages=cached_next_v_pages,
-            cached_window_page=cached_window_page,
-            prefetched_window_page=prefetched_window_page,
-            init_v_cache=True,
+        cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
+            page_offset_window.read_page_offset_window(
+                cached_k_pages=cached_k_pages,
+                cached_v_pages=cached_v_pages,
+                cached_next_v_pages=cached_next_v_pages,
+                cached_window_page=cached_window_page,
+                init_v_cache=True,
+            )
         )
         staged_kv_tma_load(
             smem_kv,
@@ -445,18 +436,13 @@ def create_load_tma_task(
 
         with domain_loop(loop_start, loop_end, loop_step):
             # LOOP: cache K[n]/V[n] offsets, load K[n], then deferred V[n-1].
-            (
-                cached_k_pages,
-                cached_v_pages,
-                cached_next_v_pages,
-                cached_window_page,
-                prefetched_window_page,
-            ) = page_offset_window.read_page_offset_window(
-                cached_k_pages=cached_k_pages,
-                cached_v_pages=cached_v_pages,
-                cached_next_v_pages=cached_next_v_pages,
-                cached_window_page=cached_window_page,
-                prefetched_window_page=prefetched_window_page,
+            cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
+                page_offset_window.read_page_offset_window(
+                    cached_k_pages=cached_k_pages,
+                    cached_v_pages=cached_v_pages,
+                    cached_next_v_pages=cached_next_v_pages,
+                    cached_window_page=cached_window_page,
+                )
             )
             # K sub-tiles then deferred V sub-tiles, each with its own local
             # sub-tile index; ``is_v`` tells the loader which path to take.

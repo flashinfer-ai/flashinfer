@@ -61,7 +61,6 @@ from .config import (
 from ..helpers.constants import LOG2_E, TMEM_DEALLOC_MBAR_THREADS
 from ..helpers.context_parallel import local_kv_length
 from ..helpers.constants import (
-    MAX_MLA_SPLITS_KV,
     TMEM_LIFECYCLE_BARRIER_ID,
     balanced_partial_capacity,
     balanced_reducer_capacity,
@@ -1801,6 +1800,46 @@ class MlaDecodeTs(Nvfp4KVConfig):
 
         # Reduction kernel: combine per-split results when split_kv > 1
         if cutlass.const_expr(acc_o is not None):
+            if cutlass.const_expr(self.use_balanced_scheduler):
+                reduction_grid = (
+                    ceil_div(
+                        self.num_heads * self.seq_len_q,
+                        REDUCTION_ROWS_PER_CTA,
+                    ),
+                    1,
+                    batch_size,
+                )
+                if cutlass.const_expr(self.use_balanced_scheduler):
+                    reduction_grid = (
+                        ceil_div(physical_tile_rows, REDUCTION_ROWS_PER_CTA),
+                        num_query_tiles,
+                        Int32(self.balanced_reducer_capacity),
+                    )
+                self.reduction_kernel(
+                    o,
+                    lse,
+                    acc_o,
+                    acc_lse,
+                    kernel_split_kv,
+                    cache_seqs,
+                    cu_seqlens_q,
+                    block_split_kvs,
+                    balanced_combine_descriptors=balanced_combine_descriptors,
+                    balanced_num_combine_descriptors=balanced_num_combine_descriptors,
+                ).launch(
+                    grid=reduction_grid,
+                    block=[REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW, 1, 1],
+                    smem=(
+                        REDUCTION_ROWS_PER_CTA
+                        * self.reduction_split_capacity
+                        * self.lse_dtype.width
+                        // 8
+                    ),
+                    stream=stream,
+                    min_blocks_per_mp=2,
+                    use_pdl=use_reducer_pdl,
+                )
+                return
             if cutlass.const_expr(
                 self.use_parallel_reduction or self.fuse_sparse_reduction
             ):
@@ -1837,163 +1876,87 @@ class MlaDecodeTs(Nvfp4KVConfig):
                     else [topology.cluster_size, 1, 1],
                     stream=stream,
                     min_blocks_per_mp=1,
-                    use_pdl=use_reducer_pdl,
+                    use_pdl=use_one_wave_reducer_pdl,
                 )
             else:
-                if cutlass.const_expr(self.use_balanced_scheduler):
-                    reduction_grid = (
-                        ceil_div(
-                            self.num_heads * self.seq_len_q,
-                            REDUCTION_ROWS_PER_CTA,
-                        ),
-                        1,
-                        batch_size,
-                    )
-                    if cutlass.const_expr(self.use_balanced_scheduler):
-                        reduction_grid = (
-                            ceil_div(physical_tile_rows, REDUCTION_ROWS_PER_CTA),
-                            num_query_tiles,
-                            Int32(self.balanced_reducer_capacity),
+                logical_query_rows = self.num_heads * seq_len_q
+                if cutlass.const_expr(
+                    self.reduction_split_capacity > 4
+                    and self.static_split_kv is None
+                    and not self.is_var_split_kv
+                ):
+                    # Allocation capacity is independent of the active split
+                    # prefix. Keep the existing S2/S4 reducer schedules and their
+                    # small scale rings; all three entrypoints live
+                    # in one cached module and retain runtime workspace strides.
+                    if kernel_split_kv <= Int32(2):
+                        self.reduction_kernel(
+                            o,
+                            lse,
+                            acc_o,
+                            acc_lse,
+                            kernel_split_kv,
+                            cache_seqs,
+                            cu_seqlens_q,
+                            block_split_kvs,
+                            split_divisor=tile_sched_params.split_kv_fdd
+                            if self.static_split_kv is None and not self.is_var_split_kv
+                            else None,
+                            max_q_len=max_q_len,
+                            local_split_capacity=2,
+                            cp_rank=cp_rank,
+                        ).launch(
+                            grid=(
+                                ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
+                                1,
+                                batch_size,
+                            ),
+                            block=[
+                                REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
+                                1,
+                                1,
+                            ],
+                            smem=(
+                                REDUCTION_ROWS_PER_CTA * 2 * self.lse_dtype.width // 8
+                            ),
+                            stream=stream,
+                            min_blocks_per_mp=2,
+                            use_pdl=use_one_wave_reducer_pdl,
                         )
-                    self.reduction_kernel(
-                        o,
-                        lse,
-                        acc_o,
-                        acc_lse,
-                        kernel_split_kv,
-                        cache_seqs,
-                        cu_seqlens_q,
-                        block_split_kvs,
-                        balanced_combine_descriptors=balanced_combine_descriptors,
-                        balanced_num_combine_descriptors=balanced_num_combine_descriptors,
-                    ).launch(
-                        grid=reduction_grid,
-                        block=[REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW, 1, 1],
-                        smem=(
-                            REDUCTION_ROWS_PER_CTA
-                            * self.reduction_split_capacity
-                            * self.lse_dtype.width
-                            // 8
-                        ),
-                        stream=stream,
-                        min_blocks_per_mp=2,
-                        use_pdl=use_reducer_pdl,
-                    )
-                else:
-                    logical_query_rows = self.num_heads * seq_len_q
-                    if cutlass.const_expr(
-                        self.reduction_split_capacity > 4
-                        and self.static_split_kv is None
-                        and not self.is_var_split_kv
-                    ):
-                        # Allocation capacity is independent of the active split
-                        # prefix. Keep the existing S2/S4 reducer schedules and their
-                        # small scale rings; all three entrypoints live
-                        # in one cached module and retain runtime workspace strides.
-                        if kernel_split_kv <= Int32(2):
-                            self.reduction_kernel(
-                                o,
-                                lse,
-                                acc_o,
-                                acc_lse,
-                                kernel_split_kv,
-                                cache_seqs,
-                                cu_seqlens_q,
-                                block_split_kvs,
-                                split_divisor=tile_sched_params.split_kv_fdd
-                                if self.static_split_kv is None and not self.is_var_split_kv
-                                else None,
-                                max_q_len=max_q_len,
-                                local_split_capacity=2,
-                                cp_rank=cp_rank,
-                            ).launch(
-                                grid=(
-                                    ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
-                                    1,
-                                    batch_size,
-                                ),
-                                block=[
-                                    REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
-                                    1,
-                                    1,
-                                ],
-                                smem=(
-                                    REDUCTION_ROWS_PER_CTA * 2 * self.lse_dtype.width // 8
-                                ),
-                                stream=stream,
-                                min_blocks_per_mp=2,
-                                use_pdl=use_one_wave_reducer_pdl,
-                            )
-                        elif kernel_split_kv <= Int32(4):
-                            self.reduction_kernel(
-                                o,
-                                lse,
-                                acc_o,
-                                acc_lse,
-                                kernel_split_kv,
-                                cache_seqs,
-                                cu_seqlens_q,
-                                block_split_kvs,
-                                split_divisor=tile_sched_params.split_kv_fdd
-                                if self.static_split_kv is None and not self.is_var_split_kv
-                                else None,
-                                max_q_len=max_q_len,
-                                local_split_capacity=4,
-                                cp_rank=cp_rank,
-                            ).launch(
-                                grid=(
-                                    ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
-                                    1,
-                                    batch_size,
-                                ),
-                                block=[
-                                    REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
-                                    1,
-                                    1,
-                                ],
-                                smem=(
-                                    REDUCTION_ROWS_PER_CTA * 4 * self.lse_dtype.width // 8
-                                ),
-                                stream=stream,
-                                min_blocks_per_mp=2,
-                                use_pdl=use_one_wave_reducer_pdl,
-                            )
-                        else:
-                            self.reduction_kernel(
-                                o,
-                                lse,
-                                acc_o,
-                                acc_lse,
-                                kernel_split_kv,
-                                cache_seqs,
-                                cu_seqlens_q,
-                                block_split_kvs,
-                                split_divisor=tile_sched_params.split_kv_fdd
-                                if self.static_split_kv is None and not self.is_var_split_kv
-                                else None,
-                                max_q_len=max_q_len,
-                                cp_rank=cp_rank,
-                            ).launch(
-                                grid=(
-                                    ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
-                                    1,
-                                    batch_size,
-                                ),
-                                block=[
-                                    REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
-                                    1,
-                                    1,
-                                ],
-                                smem=(
-                                    REDUCTION_ROWS_PER_CTA
-                                    * self.reduction_split_capacity
-                                    * self.lse_dtype.width
-                                    // 8
-                                ),
-                                stream=stream,
-                                min_blocks_per_mp=2,
-                                use_pdl=use_one_wave_reducer_pdl,
-                            )
+                    elif kernel_split_kv <= Int32(4):
+                        self.reduction_kernel(
+                            o,
+                            lse,
+                            acc_o,
+                            acc_lse,
+                            kernel_split_kv,
+                            cache_seqs,
+                            cu_seqlens_q,
+                            block_split_kvs,
+                            split_divisor=tile_sched_params.split_kv_fdd
+                            if self.static_split_kv is None and not self.is_var_split_kv
+                            else None,
+                            max_q_len=max_q_len,
+                            local_split_capacity=4,
+                            cp_rank=cp_rank,
+                        ).launch(
+                            grid=(
+                                ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
+                                1,
+                                batch_size,
+                            ),
+                            block=[
+                                REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
+                                1,
+                                1,
+                            ],
+                            smem=(
+                                REDUCTION_ROWS_PER_CTA * 4 * self.lse_dtype.width // 8
+                            ),
+                            stream=stream,
+                            min_blocks_per_mp=2,
+                            use_pdl=use_one_wave_reducer_pdl,
+                        )
                     else:
                         self.reduction_kernel(
                             o,
@@ -2030,6 +1993,42 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             min_blocks_per_mp=2,
                             use_pdl=use_one_wave_reducer_pdl,
                         )
+                else:
+                    self.reduction_kernel(
+                        o,
+                        lse,
+                        acc_o,
+                        acc_lse,
+                        kernel_split_kv,
+                        cache_seqs,
+                        cu_seqlens_q,
+                        block_split_kvs,
+                        split_divisor=tile_sched_params.split_kv_fdd
+                        if self.static_split_kv is None and not self.is_var_split_kv
+                        else None,
+                        max_q_len=max_q_len,
+                        cp_rank=cp_rank,
+                    ).launch(
+                        grid=(
+                            ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
+                            1,
+                            batch_size,
+                        ),
+                        block=[
+                            REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
+                            1,
+                            1,
+                        ],
+                        smem=(
+                            REDUCTION_ROWS_PER_CTA
+                            * self.reduction_split_capacity
+                            * self.lse_dtype.width
+                            // 8
+                        ),
+                        stream=stream,
+                        min_blocks_per_mp=2,
+                        use_pdl=use_one_wave_reducer_pdl,
+                    )
 
     @cute.kernel
     def split_kv_kernel(
@@ -2107,7 +2106,11 @@ class MlaDecodeTs(Nvfp4KVConfig):
         num_query_tiles = (
             seq_len_q * self.num_heads + self.mma_qk_tiler_mn[0] - 1
         ) // self.mma_qk_tiler_mn[0]
-        use_clc_dynamic = (self.is_persistent and not cfg.is_fp8_qkv() and not self.use_balanced_scheduler)
+        use_clc_dynamic = (
+            self.is_persistent
+            and not cfg.is_fp8_qkv()
+            and not self.use_balanced_scheduler
+        )
         tiled_mma_qk = None
         if cutlass.const_expr(cfg.is_fp8_qkv()):
             tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(

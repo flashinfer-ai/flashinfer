@@ -2101,7 +2101,9 @@ class TmemCorrResource(MlaResource):
                 output_query_row = public_query_flat_row(
                     cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
                 )
-                base_elem_offset = Int64(output_query_row) * Int64(cfg.head_dim_v) + Int64(store_col_base)
+                base_elem_offset = Int64(output_query_row) * Int64(
+                    cfg.head_dim_v
+                ) + Int64(store_col_base)
                 base_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
             element_bytes = cfg.partial_o_dtype_bytes
         elif cutlass.const_expr(self.acc_o_tensor is not None):
