@@ -189,7 +189,7 @@ def transform_mxfp4_weights_for_mega_moe(
     for weights, interleave in ((l1_weights, True), (l2_weights, False)):
         packed, scales = _validate_weights(weights, 32)
         e, n, half_k = packed.shape
-        nonzero = (packed.reshape(e, n, -1, 16) & 0x77).any(dim=-1)
+        nonzero = (packed.reshape(e, n, -1, 16) & 0x77).ne(0).any(dim=-1)
         if (((scales < 122) | (scales > 133)) & nonzero).any():
             raise ValueError(
                 "nonzero MXFP4 groups require E8M0 scale bytes in [122, 133]"
@@ -213,4 +213,4 @@ def transform_mxfp4_weights_for_mega_moe(
             packed.contiguous(), normalized, output, interleave
         )
         result.append(output)
-    return tuple(result)
+    return result[0], result[1]
