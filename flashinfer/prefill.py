@@ -5615,6 +5615,52 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         _validate_paged_query_lengths(planned_backend, seq_lens_q, qo_indptr_host)
 
+        # Refuse incompatible token/head-scale plans before clearing an
+        # accepted FP8 composable plan's dtype, row map, or dispatch flags.
+        if use_token_head_sf:
+            if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError(
+                    "use_token_head_sf requires an fp8 (e4m3/e5m2) KV cache, got "
+                    f"{kv_data_type}"
+                )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"use_token_head_sf requires an fp16/bf16 query, got {q_data_type}"
+                )
+            if get_compute_capability(self.device)[0] < 8:
+                if q_data_type != torch.float16:
+                    raise ValueError(
+                        "bf16 query is not supported with use_token_head_sf on this "
+                        "device (SM75 only supports fp16)"
+                    )
+            # Standard KV layout: the cache last dim is head_dim (no inline slot).
+            # head_dim_qk/head_dim_vo must be multiples of 16 and may differ (asymmetric
+            # QK/VO plans).
+            if head_dim_qk % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_qk to be a multiple of 16, "
+                    f"got {head_dim_qk}"
+                )
+            if head_dim_vo % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_vo to be a multiple of 16, "
+                    f"got {head_dim_vo}"
+                )
+            if self._requested_backend not in ("auto", "fa2"):
+                raise ValueError(
+                    "use_token_head_sf is only supported with backend='fa2', "
+                    f"got backend={self._requested_backend!r}"
+                )
+        if (
+            self._jit_module is not None
+            and self._jit_use_token_head_sf != use_token_head_sf
+        ):
+            raise ValueError(
+                "use_token_head_sf must match the value used to build the custom JIT "
+                f"module: the module was built with use_token_head_sf="
+                f"{self._jit_use_token_head_sf}, plan() passed use_token_head_sf={use_token_head_sf}"
+            )
+
         candidate = None
         if capture_rows is not None:
             # The graph bypasses Python. Test the actual prepare decision,
@@ -5713,55 +5759,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._head_dim_qk = head_dim_qk
         self._head_dim_vo = head_dim_vo
 
-        if use_token_head_sf:
-            if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
-                raise ValueError(
-                    "use_token_head_sf requires an fp8 (e4m3/e5m2) KV cache, got "
-                    f"{kv_data_type}"
-                )
-            if q_data_type not in (torch.float16, torch.bfloat16):
-                raise ValueError(
-                    f"use_token_head_sf requires an fp16/bf16 query, got {q_data_type}"
-                )
-            if get_compute_capability(self.device)[0] < 8:
-                if q_data_type != torch.float16:
-                    raise ValueError(
-                        "bf16 query is not supported with use_token_head_sf on this "
-                        "device (SM75 only supports fp16)"
-                    )
-            # Standard KV layout: the cache last dim is head_dim (no inline slot).
-            # head_dim_qk/head_dim_vo must be multiples of 16 and may differ (asymmetric
-            # QK/VO plans).
-            if head_dim_qk % 16 != 0:
-                raise ValueError(
-                    "use_token_head_sf requires head_dim_qk to be a multiple of 16, "
-                    f"got {head_dim_qk}"
-                )
-            if head_dim_vo % 16 != 0:
-                raise ValueError(
-                    "use_token_head_sf requires head_dim_vo to be a multiple of 16, "
-                    f"got {head_dim_vo}"
-                )
-            # The token-head-scale path is only implemented for the fa2 backend. Key off
-            # the originally requested backend, not self._backend (which a prior "auto"
-            # plan may have resolved to a non-fa2 backend).
-            if self._requested_backend == "auto":
-                self._backend = "fa2"
-            elif self._requested_backend != "fa2":
-                raise ValueError(
-                    "use_token_head_sf is only supported with backend='fa2', "
-                    f"got backend={self._requested_backend!r}"
-                )
+        if use_token_head_sf and self._requested_backend == "auto":
+            self._backend = "fa2"
         self._use_token_head_sf = use_token_head_sf
-        if (
-            self._jit_module is not None
-            and self._jit_use_token_head_sf != use_token_head_sf
-        ):
-            raise ValueError(
-                "use_token_head_sf must match the value used to build the custom JIT "
-                f"module: the module was built with use_token_head_sf="
-                f"{self._jit_use_token_head_sf}, plan() passed use_token_head_sf={use_token_head_sf}"
-            )
 
         # Normalized: the planner and kernels read these as raw pointers (#5260).
         paged_kv_indptr = paged_kv_indptr.contiguous()
