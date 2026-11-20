@@ -89,6 +89,17 @@ def _row_keys(seed, offset, M: int, device) -> Tuple[torch.Tensor, torch.Tensor]
 
     def one(v, name):
         if isinstance(v, torch.Tensor):
+            if (
+                v.dtype == torch.int64
+                and v.device == device
+                and v.dim() == 1
+                and v.shape[0] == M
+                and v.is_contiguous()
+            ):
+                return (
+                    v,
+                    M == 1,
+                )  # already the kernel's form (one key per row): no copy, no view
             if v.dtype not in _KEY_DTYPES:
                 raise ValueError(f"{name} tensor must be int64/uint64")
             t = v.to(device=device)
@@ -260,6 +271,7 @@ def draw(
             M,
             Msrc,
             N,
+            int(bool(enable_pdl)),
         )
     elif (
         M > 0
