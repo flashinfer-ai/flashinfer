@@ -219,6 +219,17 @@ struct Data {
   // Only read when one of the pointers above is set.
   int32_t const* ctaIdxXyToBatchIdx = nullptr;
   int32_t tileTokensDim{0};
+
+  // Persistent DeepSeek FP8 activation (activationDeepSeekKernelPersistent128): the permuted
+  // row -> token map (-1 for the padding rows inside an expert's last tile; at least
+  // totalMaxPaddedTokens entries) and the upper bound on the padded row count (the permuted
+  // buffers hold at least this many rows; the live count is *totalNumPaddedTokens, on the
+  // device). The persistent kernel runs only when persistentActivationSupported() holds (map and
+  // bound set, 128-wide scale blocks, a row width that is a whole number of blocks, 16-byte
+  // aligned buffers, and the tile -> expert map when the per-expert controls are set); otherwise
+  // the pair-parallel activationDeepSeekKernel runs.
+  int32_t const* permutedIdxToTokenIdx = nullptr;
+  int32_t totalMaxPaddedTokens{0};
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -247,6 +258,9 @@ struct KernelParams {
   int32_t const* ctaIdxXyToBatchIdx = nullptr;
   int32_t tileTokensDim{0};
 
+  int32_t const* permutedIdxToTokenIdx = nullptr;
+  int32_t totalMaxPaddedTokens{0};
+
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
 
@@ -268,6 +282,9 @@ struct KernelParams {
     params.gatedActClampLimitPtr = data.gatedActClampLimitPtr;
     params.ctaIdxXyToBatchIdx = data.ctaIdxXyToBatchIdx;
     params.tileTokensDim = data.tileTokensDim;
+
+    params.permutedIdxToTokenIdx = data.permutedIdxToTokenIdx;
+    params.totalMaxPaddedTokens = data.totalMaxPaddedTokens;
 
     return params;
   }
@@ -409,6 +426,12 @@ struct Data {
   tg::Dtype mDtypeExpW{tg::Dtype::Bfloat16};
   bool mUsePdl{false};
   bool mUseDeepSeekFp8{false};
+  // The GEMM producing inPtr already stored every token with exactly one local expert in outPtr
+  // (scaled by its expert weight); only zero rows and multi-expert tokens remain.
+  bool mSingleExpertTokensDone{false};
+  // Write the zero rows of tokens without a local expert. When false, their rows of outPtr (and
+  // of outDqSfsPtr) are left as they are, for callers that never read them.
+  bool mZeroRowsWithoutLocalExpert{true};
 
   void* inPtr;
   void* inPtr2 = nullptr;
@@ -454,6 +477,7 @@ struct KernelParams {
   int32_t numExperts;
   int32_t topK;
   int32_t const* totalNumPaddedTokens;
+  bool zeroRowsWithoutLocalExpert;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -473,6 +497,7 @@ struct KernelParams {
     params.numExperts = data.numExperts;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+    params.zeroRowsWithoutLocalExpert = data.mZeroRowsWithoutLocalExpert;
 
     return params;
   }

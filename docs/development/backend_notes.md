@@ -12,7 +12,7 @@ or dtypes. General workflow rules are in [AGENTS.md](../../AGENTS.md).
 
 ## cuDNN linear attention
 
-Use `nvidia-cudnn-frontend>=1.32.0`; automatic selection also requires CuTe DSL
+Use `nvidia-cudnn-frontend>=1.33.0`; automatic selection also requires CuTe DSL
 4.7+. KDA/GDN normalization adds `1e-6`, without an epsilon argument. KDA's
 SM100/SM103 policies live in `flashinfer/kda.py`; GDN's SM100 policy lives in
 `flashinfer/gdn_prefill.py`. See [KDA shape regions](../api/kda.rst).
@@ -42,15 +42,55 @@ Validate dispatch changes during CUDA graph replay. Indexed forward is not
 bitwise repeatable because index compaction can change accumulation order.
 On cuDNN Frontend 1.32, cover the bitmap boundary at 512/513 tokens.
 
+## Autotuner cache changes
+
+The autotuner cache file (`load_configs` / `save_configs` /
+`autotune(cache=...)`) is shared by independent processes: `save_configs`
+re-reads the file and merges this process's entries over the on-disk ones
+instead of overwriting the file. Any change that drops, invalidates, or
+rewrites cached entries must respect that:
+
+- Decide what to remove from disk at save time against the entry currently on
+  disk, not from a load-time snapshot; another writer may have re-tuned the
+  same key to a valid tactic since this process loaded the file.
+- `AutoTuner._invalidated_file_keys` is reserved for superseded-runner
+  invalidation and is removed from the file unconditionally. Do not reuse it
+  for a new reason; keep separate state and re-check the on-disk value.
+- Before touching shared `AutoTuner` state, read every consumer of the field
+  and note what each one assumes.
+- Add a two-writer regression in `tests/autotuner/` using two independent
+  `AutoTuner` instances (reset `AutoTuner._instance` between them): writer A
+  drops or invalidates a key, writer B re-tunes it to a permitted tactic and
+  saves, writer A enters `autotune(False, cache=<another path>)` and then saves
+  to the original path; writer B's entry must survive. See
+  `TestBlocklistCacheFiles` in `tests/autotuner/test_tactics_blocklist.py`.
+  These tests run on CPU with a stubbed `_profile_single_kernel`.
+
 ## Attention plan and CUDA Graph lifetime
 
-FlashInfer requires cuDNN Frontend >=1.32.0. Attention code can rely on its
+FlashInfer requires cuDNN Frontend >=1.33.0. Attention code can rely on its
 cumulative-length graph arguments, shape-override constructor, short-cache
 placement, and CUDA-graph replay hint. Do not retain compatibility branches for
 older FE releases. Backend versions and native/runtime capabilities remain
 separate: token offsets require backend 9.24 (mixed masks/FP8 require 9.25), and
 the single-token GQA Stats bug is guarded until 9.27. Keep checks that ensure
 both backend and FROST remain usable through the common graph contract.
+
+### Hopper ragged declaration cache
+
+For unscaled, direct cumulative-length BF16/FP16 D256 ragged attention on Hopper,
+cuDNN 9.24+ uses a power-of-two batch declaration bound instead of the general
+4096-batch cache. Q/KV sequence cache classes remain unchanged. This reduces
+work in the cuDNN SDPA kernel while retaining plan reuse within a batch bucket;
+crossing that bound requires a different graph. The batch bound does not imply
+a packed-Q capacity. Existing FROST packed-capacity declarations are unchanged.
+
+This applies to unwindowed attention without sinks, explicit mask lengths or
+single-token queries, for MHA/GQA ratios 1, 2, 4, 8 and 16. It does not change
+ragged `auto` admission. Graph-mode wrappers already use explicit lengths and
+exact declarations, so they keep that path. Validate batch-boundary replans and
+retained captures in both modes with changed partitions, data, scales and
+workspaces.
 
 ### Buffer ownership and graph bounds
 
@@ -145,7 +185,7 @@ feature and runtime guards still apply. Short requests mixed with long ones
 do not qualify for this extension merely because their declaration is large.
 Independent Q overrides and device-only metadata keep the original policy.
 
-### SM100 D256 paged GQA admission
+### SM100/SM103 D256 paged GQA admission
 
 The BF16 HND/page-16 prefix extension requires cuDNN 9.24+, FE 1.33+,
 and native packed-split and physical-origin capability flags for the requested
@@ -166,6 +206,35 @@ Test the automatic route with strided Q, independent actual query masks,
 physical token origins, changed lengths/page tables and retained graph replay.
 The version and native flags are necessary dependencies; benchmark evidence
 from a development FE build does not establish released-wheel qualification.
+
+### Additional Blackwell full-prefill admission
+
+With stable FE 1.33+, the same public graph path admits BF16 HND full prefills
+on SM100 and SM103 with page sizes 16 or 64. D256 MHA supports batch 1–8,
+D256 GQA groups 2/4/8/16 support batch 1–16, and D128 GQA groups 4/8 support
+batch 1–32. Query heads remain in 8–64.
+Every actual Q length must equal its KV length, and the declared Q/KV maxima
+must equal the actual maximum in 512–16384. The paired-work floor is 16 Mi.
+
+This extension uses existing CPU offsets/lengths only. Independent Q masks,
+device-only metadata, and larger declaration bounds do not extend admission.
+The original routes remain available under their existing guards. D256 keeps
+its matching native packed-split/physical-origin checks. FE's full-prefill
+placement is a dependency; a source-build result is not released-wheel or
+serving/TTFT qualification. Neither FI admission nor execution forces an engine.
+
+### FP16 paged auto admission
+
+With stable FE 1.33+, matching FP16 Q/KV/output uses the same paged admission
+regions as BF16 described above. All architecture, layout, length, paired-work,
+metadata and native width guards still apply. Earlier FE versions retain the
+existing FP16 route; BF16 admission is unchanged. This dtype transfer depends on
+FE's FP16 graph-declaration placement rules and uses the common backend/FROST
+graph contract, without selecting a particular engine.
+
+The transfer changes admission only. Existing shape-override eligibility is
+unchanged. Test actual FP16 auto execution and retained captures; matching
+predicate decisions alone does not establish runtime or performance parity.
 
 ## Grouped FP8 GEMM
 
@@ -192,6 +261,15 @@ For SM90 NVFP4 fused/split and MXFP4 fused MegaMoE, use
 timing and [test_megamoe_fp4_sm90.py](../../tests/moe/test_megamoe_fp4_sm90.py)
 for correctness checks.
 
+For the `moe_ep` SM120 MXFP4 x MXFP8 MegaMoE backends (`--backend cutedsl` /
+`cake`, or `nosync`: the `--fallback` backend with
+`MoEEpLayer(..., nosync=NosyncOptions())`, on the same weights and routes), use
+[bench_megamoe_mxfp4_sm120.py](../../benchmarks/bench_megamoe_mxfp4_sm120.py); the
+nosync option's correctness checks are in
+[test_moe_ep_sm120_w4a8_nosync_mega.py](../../tests/moe_ep/test_moe_ep_sm120_w4a8_nosync_mega.py). Its
+design, transports and host-topology caveats are in
+[moe_ep_sm120_nosync.md](../design_docs/moe_ep_sm120_nosync.md).
+
 ## Prims-TS decode dtypes
 
 Keep storage (`q_dtype`, `k_dtype`, `v_dtype`) separate from MMA precision
@@ -214,11 +292,13 @@ maximum Q 65–16384 and maximum KV at most 32768. Actual positive Q/KV lengths
 must already be on CPU, satisfy Q≤KV per request, match the declared maxima,
 and use physical query offsets as the valid query lengths. Independent masks
 and device-only metadata do not extend admission. Admission also requires at
-least `2**24` actual causal query-key pairs across query heads:
-`Hq * sum(q_i * (2 * kv_i - q_i + 1) // 2)`. Small workloads retain their native
-FA2/FA3 provider. The calculation uses paired CPU lengths rather than declared
-maximum lengths and adds no device readback. Existing causal, mask, window,
-sinks, split-control and runtime guards remain in force. Q, K, V and output
+least `2**24` actual query-key pairs across query heads. For causal attention,
+work is `Hq * sum(q_i * (2 * kv_i - q_i + 1) // 2)`; for noncausal attention,
+work is `Hq * sum(q_i * kv_i)`. Small workloads retain their native FA2/FA3
+provider. Both calculations use paired CPU lengths rather than declared maximum
+lengths and add no device readback. Custom-mask, window, sinks, split-control
+and runtime guards remain in force. This noncausal extension is H100-specific;
+Blackwell auto admission keeps its causal guard. Q, K, V and output
 must have the same BF16 or FP16 dtype; mixed precision is not admitted.
 
 The cuDNN graph uses exact H100 declarations; Blackwell's cache buckets do not

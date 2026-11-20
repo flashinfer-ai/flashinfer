@@ -59,6 +59,7 @@ from .config import (
     make_mla_decode_config,
 )
 from ..helpers.constants import LOG2_E, TMEM_DEALLOC_MBAR_THREADS
+from ..helpers.context_parallel import local_kv_length
 from ..helpers.mask import MaskType, mask_visible_k_length, normalize_mask_type
 from ..helpers.query import (
     FlatQueryTileLayout,
@@ -175,13 +176,13 @@ def build_mla_decode_task_manager(
     acc_output=None,
     lse=None,
     acc_lse=None,
-    # Domain (k_tile_count)
     domain=4,
     # Persistent loop support
     work_queue=None,
     # For k_index_base computation (split_kv support)
     cache_seqs=None,
     cu_seqlens_q=None,
+    cp_rank: Int32 = 0,
     split_kv=None,
     logical_num_heads_q=128,
     logical_seq_len_q=1,
@@ -479,6 +480,7 @@ def build_mla_decode_task_manager(
 
     tmem_s = TmemSResource(
         page_offsets=page_offsets,
+        cp_rank=cp_rank,
         smem_q_latent=smem_q_latent_arr,
         smem_q_rope=smem_q_rope_arr,
         smem_p=smem_p_arr,
@@ -905,6 +907,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        cp_world: int = 1,
+        cp_interleave_size: int = 1,
+        zero_empty_rows: bool = True,
         softmax_rescale_threshold_log2: float = 0.0,
         fixed_seqlen: bool = False,
     ):
@@ -1005,6 +1010,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
+        self.cp_world = cp_world
+        self.cp_interleave_size = cp_interleave_size
+        self.zero_empty_rows = zero_empty_rows
         # Validate eagerly: the config (and its own check) is only built when
         # the kernel is traced, after plan() has bound a workspace.
         self.softmax_rescale_threshold_log2 = (
@@ -1077,6 +1085,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.num_heads,
             self.seq_len_q if self.fixed_seqlen else None,
             self.mask_type,
+            self.cp_world,
+            self.cp_interleave_size,
+            self.zero_empty_rows,
             self.softmax_rescale_threshold_log2,
             self.reduction_split_capacity,
             self.query_tile_layout if self.fixed_seqlen else None,
@@ -1176,6 +1187,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
             is_var_seq=self.is_var_seq,
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
+            cp_world=self.cp_world,
+            cp_interleave_size=self.cp_interleave_size,
             lse_base_on_e=self.lse_base_on_e,
             sparse_gather_warps=self.sparse_gather_warps,
             sparse_kv_stages=self.sparse_kv_stages,
@@ -1242,6 +1255,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         stream: object,
         output_quant_args=None,
         max_q_len: cutlass.Int32 = 0,
+        cp_rank: Int32 = 0,
     ):
         """Execute the MLA decode TS kernel."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -1679,6 +1693,12 @@ class MlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
             softmax_scale_operand = softmax_scale * LOG2_E
 
+        if cutlass.const_expr(self.cp_world > 1 and self.zero_empty_rows):
+            from ..helpers.context_parallel import initialize_empty_rows
+
+            initialize_empty_rows(
+                o, lse, cache_seqs, cu_seqlens_q, cp_rank, cfg, Int32(seq_len_q), stream
+            )
         self.split_kv_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -1706,6 +1726,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             tma_desc_sparse_rope,
             tma_desc_sparse_extra_rope,
             max_q_len,
+            cp_rank,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -1735,6 +1756,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                     if self.static_split_kv is None and not self.is_var_split_kv
                     else None,
                     max_q_len=max_q_len,
+                    cp_rank=cp_rank,
                 ).launch(
                     grid=(
                         (
@@ -1780,6 +1802,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             else None,
                             max_q_len=max_q_len,
                             local_split_capacity=2,
+                            cp_rank=cp_rank,
                         ).launch(
                             grid=(
                                 ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1813,6 +1836,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             else None,
                             max_q_len=max_q_len,
                             local_split_capacity=4,
+                            cp_rank=cp_rank,
                         ).launch(
                             grid=(
                                 ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1845,6 +1869,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                             if self.static_split_kv is None and not self.is_var_split_kv
                             else None,
                             max_q_len=max_q_len,
+                            cp_rank=cp_rank,
                         ).launch(
                             grid=(
                                 ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1880,6 +1905,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                         if self.static_split_kv is None and not self.is_var_split_kv
                         else None,
                         max_q_len=max_q_len,
+                        cp_rank=cp_rank,
                     ).launch(
                         grid=(
                             ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
@@ -1931,6 +1957,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         tma_desc_sparse_rope: cutlass.GridConstant[cuda.TensorMap] = None,
         tma_desc_sparse_extra_rope: cutlass.GridConstant[cuda.TensorMap] = None,
         max_q_len: cutlass.Int32 = 0,
+        cp_rank: Int32 = 0,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -2187,7 +2214,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
         del tile_cluster_idx
 
         fixed_nonempty_single_split = (
-            not self.is_var_seq
+            cfg.cp_world == 1
+            and not self.is_var_seq
             and not self.is_var_split_kv
             and self.static_split_kv == 1
             and cu_seqlens_q is None
@@ -2211,7 +2239,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
             # can be active even when their initial logical tile is padded.
             # The full k_tile_count is recomputed per-task inside
             # MlaTask._run_task_body_persistent to keep SSA live ranges short.
-            if cutlass.const_expr(self.static_seq_len_k is not None):
+            if cutlass.const_expr(
+                self.static_seq_len_k is not None and cfg.cp_world == 1
+            ):
                 K = Int32(self.static_seq_len_k)
             else:
                 K = cache_seqs[tile_batch_idx]
@@ -2243,6 +2273,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                     tile_batch_idx,
                 )
                 K = mask_visible_k_length(cfg.mask_type, K, logical_q_idx, q_len)
+            K = local_kv_length(cfg, K, cp_rank)
             K = K if query_tile_has_rows else Int32(0)
             # split_kv is the static launch/workspace capacity. Runtime K
             # contracts the optional per-batch cap to an active prefix.
@@ -2363,6 +2394,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 tile_scheduler_config=work_queue_tile_scheduler_config,
                 pipeline_config=work_queue_pipeline_config,
                 name="mla_work_queue",
+                cp_rank=cp_rank,
             )
 
             task_manager, _tmem_resources, named_res = build_mla_decode_task_manager(
@@ -2402,6 +2434,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 work_queue=mla_work_queue,
                 cache_seqs=cache_seqs,
                 cu_seqlens_q=cu_seqlens_q,
+                cp_rank=cp_rank,
                 split_kv=max_split_kv,
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=seq_len_q,
@@ -2564,6 +2597,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         split_divisor=None,
         max_q_len: cutlass.Int32 = 0,
         local_split_capacity: cutlass.Constexpr[int] = 0,
+        cp_rank: Int32 = 0,
     ):
         """Dispatch the throughput 2CTA split-KV reduction body."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -2575,6 +2609,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            cp_world=self.cp_world,
+            cp_interleave_size=self.cp_interleave_size,
             lse_base_on_e=self.lse_base_on_e,
         )
         if cutlass.const_expr(not self.is_persistent):
@@ -2596,6 +2632,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             REDUCTION_ROWS_PER_CTA,
             split_divisor=split_divisor,
             runtime_seq_len_q=seq_len_q,
+            cp_rank=cp_rank,
         )
 
     @cute.kernel
@@ -2612,6 +2649,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         output_quant_args=None,
         split_divisor=None,
         max_q_len: cutlass.Int32 = 0,
+        cp_rank: Int32 = 0,
     ):
         """Dispatch the high-split fixed-D512 cluster reducer."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -2624,6 +2662,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            cp_world=self.cp_world,
+            cp_interleave_size=self.cp_interleave_size,
             lse_base_on_e=self.lse_base_on_e,
         )
         if cutlass.const_expr(not self.is_persistent):
@@ -2654,4 +2694,5 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.output_quant,
             output_quant_args,
             split_divisor=split_divisor,
+            cp_rank=cp_rank,
         )

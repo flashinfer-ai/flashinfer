@@ -47,8 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -56,7 +54,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
-kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M)
+kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_outputs, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ route_slots, __nv_bfloat16* __restrict__ output, int top_k, int num_tokens, int route_stride, int M, int* __restrict__ route_experts, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -73,101 +71,162 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
     int token = blockIdx.y;
     int route_base = token * 10;
     float weights[10];
+    bool oks[10];
     if (feature < M && token < num_tokens) {
         weights[0] = (float)route_weights[route_base];
+        oks[0] = (unsigned int)route_experts[route_base] < (unsigned int)num_experts;
         weights[1] = (float)route_weights[route_base + 1];
+        oks[1] = (unsigned int)route_experts[route_base + 1] < (unsigned int)num_experts;
         weights[2] = (float)route_weights[route_base + 2];
+        oks[2] = (unsigned int)route_experts[route_base + 2] < (unsigned int)num_experts;
         weights[3] = (float)route_weights[route_base + 3];
+        oks[3] = (unsigned int)route_experts[route_base + 3] < (unsigned int)num_experts;
         weights[4] = (float)route_weights[route_base + 4];
+        oks[4] = (unsigned int)route_experts[route_base + 4] < (unsigned int)num_experts;
         weights[5] = (float)route_weights[route_base + 5];
+        oks[5] = (unsigned int)route_experts[route_base + 5] < (unsigned int)num_experts;
         weights[6] = (float)route_weights[route_base + 6];
+        oks[6] = (unsigned int)route_experts[route_base + 6] < (unsigned int)num_experts;
         weights[7] = (float)route_weights[route_base + 7];
+        oks[7] = (unsigned int)route_experts[route_base + 7] < (unsigned int)num_experts;
         weights[8] = (float)route_weights[route_base + 8];
+        oks[8] = (unsigned int)route_experts[route_base + 8] < (unsigned int)num_experts;
         weights[9] = (float)route_weights[route_base + 9];
+        oks[9] = (unsigned int)route_experts[route_base + 9] < (unsigned int)num_experts;
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (feature < M && token < num_tokens) {
         int rows[10];
-        rows[0] = route_slots[route_base];
-        rows[1] = route_slots[route_base + 1];
-        rows[2] = route_slots[route_base + 2];
-        rows[3] = route_slots[route_base + 3];
-        rows[4] = route_slots[route_base + 4];
-        rows[5] = route_slots[route_base + 5];
-        rows[6] = route_slots[route_base + 6];
-        rows[7] = route_slots[route_base + 7];
-        rows[8] = route_slots[route_base + 8];
-        rows[9] = route_slots[route_base + 9];
+        rows[0] = ((oks[0]) ? route_slots[route_base] : 0);
+        rows[1] = ((oks[1]) ? route_slots[route_base + 1] : 0);
+        rows[2] = ((oks[2]) ? route_slots[route_base + 2] : 0);
+        rows[3] = ((oks[3]) ? route_slots[route_base + 3] : 0);
+        rows[4] = ((oks[4]) ? route_slots[route_base + 4] : 0);
+        rows[5] = ((oks[5]) ? route_slots[route_base + 5] : 0);
+        rows[6] = ((oks[6]) ? route_slots[route_base + 6] : 0);
+        rows[7] = ((oks[7]) ? route_slots[route_base + 7] : 0);
+        rows[8] = ((oks[8]) ? route_slots[route_base + 8] : 0);
+        rows[9] = ((oks[9]) ? route_slots[route_base + 9] : 0);
         unsigned int words[20];
-        {
-            const uint2* _ivptr_0 = reinterpret_cast<const uint2*>(route_outputs + (rows[0] * route_stride + feature) + 0);
-            uint2 _ivld_0;
-            _ivld_0 = *_ivptr_0;
-            words[0 + 0] = _ivld_0.x;
-            words[0 + 1] = _ivld_0.y;
+        if (oks[0]) {
+            {
+                const uint2* _ivptr_0 = reinterpret_cast<const uint2*>(route_outputs + (rows[0] * route_stride + feature) + 0);
+                uint2 _ivld_0;
+                _ivld_0 = *_ivptr_0;
+                words[0 + 0] = _ivld_0.x;
+                words[0 + 1] = _ivld_0.y;
+            }
+        } else {
+            words[0] = 0;
+            words[1] = 0;
         }
-        {
-            const uint2* _ivptr_1 = reinterpret_cast<const uint2*>(route_outputs + (rows[1] * route_stride + feature) + 0);
-            uint2 _ivld_1;
-            _ivld_1 = *_ivptr_1;
-            words[2 + 0] = _ivld_1.x;
-            words[2 + 1] = _ivld_1.y;
+        if (oks[1]) {
+            {
+                const uint2* _ivptr_1 = reinterpret_cast<const uint2*>(route_outputs + (rows[1] * route_stride + feature) + 0);
+                uint2 _ivld_1;
+                _ivld_1 = *_ivptr_1;
+                words[2 + 0] = _ivld_1.x;
+                words[2 + 1] = _ivld_1.y;
+            }
+        } else {
+            words[2] = 0;
+            words[3] = 0;
         }
-        {
-            const uint2* _ivptr_2 = reinterpret_cast<const uint2*>(route_outputs + (rows[2] * route_stride + feature) + 0);
-            uint2 _ivld_2;
-            _ivld_2 = *_ivptr_2;
-            words[4 + 0] = _ivld_2.x;
-            words[4 + 1] = _ivld_2.y;
+        if (oks[2]) {
+            {
+                const uint2* _ivptr_2 = reinterpret_cast<const uint2*>(route_outputs + (rows[2] * route_stride + feature) + 0);
+                uint2 _ivld_2;
+                _ivld_2 = *_ivptr_2;
+                words[4 + 0] = _ivld_2.x;
+                words[4 + 1] = _ivld_2.y;
+            }
+        } else {
+            words[4] = 0;
+            words[5] = 0;
         }
-        {
-            const uint2* _ivptr_3 = reinterpret_cast<const uint2*>(route_outputs + (rows[3] * route_stride + feature) + 0);
-            uint2 _ivld_3;
-            _ivld_3 = *_ivptr_3;
-            words[6 + 0] = _ivld_3.x;
-            words[6 + 1] = _ivld_3.y;
+        if (oks[3]) {
+            {
+                const uint2* _ivptr_3 = reinterpret_cast<const uint2*>(route_outputs + (rows[3] * route_stride + feature) + 0);
+                uint2 _ivld_3;
+                _ivld_3 = *_ivptr_3;
+                words[6 + 0] = _ivld_3.x;
+                words[6 + 1] = _ivld_3.y;
+            }
+        } else {
+            words[6] = 0;
+            words[7] = 0;
         }
-        {
-            const uint2* _ivptr_4 = reinterpret_cast<const uint2*>(route_outputs + (rows[4] * route_stride + feature) + 0);
-            uint2 _ivld_4;
-            _ivld_4 = *_ivptr_4;
-            words[8 + 0] = _ivld_4.x;
-            words[8 + 1] = _ivld_4.y;
+        if (oks[4]) {
+            {
+                const uint2* _ivptr_4 = reinterpret_cast<const uint2*>(route_outputs + (rows[4] * route_stride + feature) + 0);
+                uint2 _ivld_4;
+                _ivld_4 = *_ivptr_4;
+                words[8 + 0] = _ivld_4.x;
+                words[8 + 1] = _ivld_4.y;
+            }
+        } else {
+            words[8] = 0;
+            words[9] = 0;
         }
-        {
-            const uint2* _ivptr_5 = reinterpret_cast<const uint2*>(route_outputs + (rows[5] * route_stride + feature) + 0);
-            uint2 _ivld_5;
-            _ivld_5 = *_ivptr_5;
-            words[10 + 0] = _ivld_5.x;
-            words[10 + 1] = _ivld_5.y;
+        if (oks[5]) {
+            {
+                const uint2* _ivptr_5 = reinterpret_cast<const uint2*>(route_outputs + (rows[5] * route_stride + feature) + 0);
+                uint2 _ivld_5;
+                _ivld_5 = *_ivptr_5;
+                words[10 + 0] = _ivld_5.x;
+                words[10 + 1] = _ivld_5.y;
+            }
+        } else {
+            words[10] = 0;
+            words[11] = 0;
         }
-        {
-            const uint2* _ivptr_6 = reinterpret_cast<const uint2*>(route_outputs + (rows[6] * route_stride + feature) + 0);
-            uint2 _ivld_6;
-            _ivld_6 = *_ivptr_6;
-            words[12 + 0] = _ivld_6.x;
-            words[12 + 1] = _ivld_6.y;
+        if (oks[6]) {
+            {
+                const uint2* _ivptr_6 = reinterpret_cast<const uint2*>(route_outputs + (rows[6] * route_stride + feature) + 0);
+                uint2 _ivld_6;
+                _ivld_6 = *_ivptr_6;
+                words[12 + 0] = _ivld_6.x;
+                words[12 + 1] = _ivld_6.y;
+            }
+        } else {
+            words[12] = 0;
+            words[13] = 0;
         }
-        {
-            const uint2* _ivptr_7 = reinterpret_cast<const uint2*>(route_outputs + (rows[7] * route_stride + feature) + 0);
-            uint2 _ivld_7;
-            _ivld_7 = *_ivptr_7;
-            words[14 + 0] = _ivld_7.x;
-            words[14 + 1] = _ivld_7.y;
+        if (oks[7]) {
+            {
+                const uint2* _ivptr_7 = reinterpret_cast<const uint2*>(route_outputs + (rows[7] * route_stride + feature) + 0);
+                uint2 _ivld_7;
+                _ivld_7 = *_ivptr_7;
+                words[14 + 0] = _ivld_7.x;
+                words[14 + 1] = _ivld_7.y;
+            }
+        } else {
+            words[14] = 0;
+            words[15] = 0;
         }
-        {
-            const uint2* _ivptr_8 = reinterpret_cast<const uint2*>(route_outputs + (rows[8] * route_stride + feature) + 0);
-            uint2 _ivld_8;
-            _ivld_8 = *_ivptr_8;
-            words[16 + 0] = _ivld_8.x;
-            words[16 + 1] = _ivld_8.y;
+        if (oks[8]) {
+            {
+                const uint2* _ivptr_8 = reinterpret_cast<const uint2*>(route_outputs + (rows[8] * route_stride + feature) + 0);
+                uint2 _ivld_8;
+                _ivld_8 = *_ivptr_8;
+                words[16 + 0] = _ivld_8.x;
+                words[16 + 1] = _ivld_8.y;
+            }
+        } else {
+            words[16] = 0;
+            words[17] = 0;
         }
-        {
-            const uint2* _ivptr_9 = reinterpret_cast<const uint2*>(route_outputs + (rows[9] * route_stride + feature) + 0);
-            uint2 _ivld_9;
-            _ivld_9 = *_ivptr_9;
-            words[18 + 0] = _ivld_9.x;
-            words[18 + 1] = _ivld_9.y;
+        if (oks[9]) {
+            {
+                const uint2* _ivptr_9 = reinterpret_cast<const uint2*>(route_outputs + (rows[9] * route_stride + feature) + 0);
+                uint2 _ivld_9;
+                _ivld_9 = *_ivptr_9;
+                words[18 + 0] = _ivld_9.x;
+                words[18 + 1] = _ivld_9.y;
+            }
+        } else {
+            words[18] = 0;
+            words[19] = 0;
         }
         float values[4];
         float partials[4];
@@ -185,10 +244,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[1 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[1 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[0], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[0], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[0], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[0], values[3]);
+        values[0] = ((oks[0]) ? __fmaf_rn(partials[0], weights[0], values[0]) : values[0]);
+        values[1] = ((oks[0]) ? __fmaf_rn(partials[1], weights[0], values[1]) : values[1]);
+        values[2] = ((oks[0]) ? __fmaf_rn(partials[2], weights[0], values[2]) : values[2]);
+        values[3] = ((oks[0]) ? __fmaf_rn(partials[3], weights[0], values[3]) : values[3]);
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
             (&partials[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[2 + _pair]) << 16);
@@ -199,10 +258,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[3 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[3 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[1], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[1], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[1], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[1], values[3]);
+        values[0] = ((oks[1]) ? __fmaf_rn(partials[0], weights[1], values[0]) : values[0]);
+        values[1] = ((oks[1]) ? __fmaf_rn(partials[1], weights[1], values[1]) : values[1]);
+        values[2] = ((oks[1]) ? __fmaf_rn(partials[2], weights[1], values[2]) : values[2]);
+        values[3] = ((oks[1]) ? __fmaf_rn(partials[3], weights[1], values[3]) : values[3]);
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
             (&partials[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[4 + _pair]) << 16);
@@ -213,10 +272,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[5 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[5 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[2], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[2], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[2], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[2], values[3]);
+        values[0] = ((oks[2]) ? __fmaf_rn(partials[0], weights[2], values[0]) : values[0]);
+        values[1] = ((oks[2]) ? __fmaf_rn(partials[1], weights[2], values[1]) : values[1]);
+        values[2] = ((oks[2]) ? __fmaf_rn(partials[2], weights[2], values[2]) : values[2]);
+        values[3] = ((oks[2]) ? __fmaf_rn(partials[3], weights[2], values[3]) : values[3]);
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
             (&partials[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[6 + _pair]) << 16);
@@ -227,10 +286,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[7 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[7 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[3], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[3], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[3], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[3], values[3]);
+        values[0] = ((oks[3]) ? __fmaf_rn(partials[0], weights[3], values[0]) : values[0]);
+        values[1] = ((oks[3]) ? __fmaf_rn(partials[1], weights[3], values[1]) : values[1]);
+        values[2] = ((oks[3]) ? __fmaf_rn(partials[2], weights[3], values[2]) : values[2]);
+        values[3] = ((oks[3]) ? __fmaf_rn(partials[3], weights[3], values[3]) : values[3]);
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
             (&partials[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[8 + _pair]) << 16);
@@ -241,10 +300,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[9 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[9 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[4], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[4], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[4], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[4], values[3]);
+        values[0] = ((oks[4]) ? __fmaf_rn(partials[0], weights[4], values[0]) : values[0]);
+        values[1] = ((oks[4]) ? __fmaf_rn(partials[1], weights[4], values[1]) : values[1]);
+        values[2] = ((oks[4]) ? __fmaf_rn(partials[2], weights[4], values[2]) : values[2]);
+        values[3] = ((oks[4]) ? __fmaf_rn(partials[3], weights[4], values[3]) : values[3]);
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
             (&partials[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[10 + _pair]) << 16);
@@ -255,10 +314,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[11 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[11 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[5], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[5], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[5], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[5], values[3]);
+        values[0] = ((oks[5]) ? __fmaf_rn(partials[0], weights[5], values[0]) : values[0]);
+        values[1] = ((oks[5]) ? __fmaf_rn(partials[1], weights[5], values[1]) : values[1]);
+        values[2] = ((oks[5]) ? __fmaf_rn(partials[2], weights[5], values[2]) : values[2]);
+        values[3] = ((oks[5]) ? __fmaf_rn(partials[3], weights[5], values[3]) : values[3]);
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
             (&partials[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[12 + _pair]) << 16);
@@ -269,10 +328,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[13 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[13 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[6], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[6], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[6], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[6], values[3]);
+        values[0] = ((oks[6]) ? __fmaf_rn(partials[0], weights[6], values[0]) : values[0]);
+        values[1] = ((oks[6]) ? __fmaf_rn(partials[1], weights[6], values[1]) : values[1]);
+        values[2] = ((oks[6]) ? __fmaf_rn(partials[2], weights[6], values[2]) : values[2]);
+        values[3] = ((oks[6]) ? __fmaf_rn(partials[3], weights[6], values[3]) : values[3]);
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
             (&partials[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[14 + _pair]) << 16);
@@ -283,10 +342,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[15 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[15 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[7], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[7], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[7], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[7], values[3]);
+        values[0] = ((oks[7]) ? __fmaf_rn(partials[0], weights[7], values[0]) : values[0]);
+        values[1] = ((oks[7]) ? __fmaf_rn(partials[1], weights[7], values[1]) : values[1]);
+        values[2] = ((oks[7]) ? __fmaf_rn(partials[2], weights[7], values[2]) : values[2]);
+        values[3] = ((oks[7]) ? __fmaf_rn(partials[3], weights[7], values[3]) : values[3]);
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
             (&partials[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[16 + _pair]) << 16);
@@ -297,10 +356,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[17 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[17 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[8], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[8], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[8], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[8], values[3]);
+        values[0] = ((oks[8]) ? __fmaf_rn(partials[0], weights[8], values[0]) : values[0]);
+        values[1] = ((oks[8]) ? __fmaf_rn(partials[1], weights[8], values[1]) : values[1]);
+        values[2] = ((oks[8]) ? __fmaf_rn(partials[2], weights[8], values[2]) : values[2]);
+        values[3] = ((oks[8]) ? __fmaf_rn(partials[3], weights[8], values[3]) : values[3]);
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
             (&partials[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[18 + _pair]) << 16);
@@ -311,10 +370,10 @@ kernel_cake_warp_decode_6729f7918be8ef4c8c1e(__nv_bfloat16* __restrict__ route_o
             (&partials[2 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(words[19 + _pair]) << 16);
             (&partials[2 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(words[19 + _pair]) & 0xffff0000u);
         }
-        values[0] = __fmaf_rn(partials[0], weights[9], values[0]);
-        values[1] = __fmaf_rn(partials[1], weights[9], values[1]);
-        values[2] = __fmaf_rn(partials[2], weights[9], values[2]);
-        values[3] = __fmaf_rn(partials[3], weights[9], values[3]);
+        values[0] = ((oks[9]) ? __fmaf_rn(partials[0], weights[9], values[0]) : values[0]);
+        values[1] = ((oks[9]) ? __fmaf_rn(partials[1], weights[9], values[1]) : values[1]);
+        values[2] = ((oks[9]) ? __fmaf_rn(partials[2], weights[9], values[2]) : values[2]);
+        values[3] = ((oks[9]) ? __fmaf_rn(partials[3], weights[9], values[3]) : values[3]);
         unsigned int _packed_0[2];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
