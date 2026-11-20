@@ -11,12 +11,12 @@ arriver runs the group's chunk-order fold (``fixup.fold_row``) and writes the ou
 Every floating-point op outside the two MMAs and ``ex2`` goes through ``CuteF32``; the reduction
 trees come from ``canon`` plans; the arithmetic functions are ``spec.py``'s.
 
-The low-bit-KV kernels (``kv_fmt`` ``"e4m3"`` / ``"e5m2"`` / ``"nvfp4"``) differ in one role: the load warp and the two empty
-warps form the conversion stage (``convert.py``) that fills the bf16 ring from the fp8 or NVFP4 cache instead of the TMA, through
-a thread-to-UMMA ring pipeline; the epilogue takes the value scale ``vs`` (``fixup.finish``). Every other role is the bf16
-kernel's code. The token-head-scale kernels (``"e4m3th"`` / ``"e5m2th"``) run the fp8-KV kernels' exact conversion stage,
-which also fetches every tile's per-(key, KV head) binary32 scales (``mKsf`` / ``mVsf``) into a smem side ring; the softmax
-multiplies each key's score and each key's probability by them (``softmax.py``); the epilogue is the bf16 kernel's.
+The low-bit-KV kernels (``kv_fmt`` ``"e4m3"`` / ``"e5m2"`` / ``"nvfp4"``) differ in one role: the load warp's TMA stages the raw
+cache bytes and the conversion warps (the two empty warps and a further warpgroup: ``convert.py``) fill the bf16 ring from them,
+through a thread-to-UMMA ring pipeline; the epilogue takes the value scale ``vs`` (``fixup.finish``). Every other role is the
+bf16 kernel's code. The token-head-scale kernels (``"e4m3th"`` / ``"e5m2th"``) run the fp8-KV kernels' staging and conversion; the
+conversion threads also fetch every tile's per-(key, KV head) binary32 scales (``mKsf`` / ``mVsf``) into a smem side ring, the
+softmax multiplies each key's score and each key's probability by them (``softmax.py``), and the epilogue is the bf16 kernel's.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ from ..plan import (
     F_TILE_HI,
     F_TILE_LO,
 )
-from .convert import convert_unit, load_q_unit
+from .convert import convert_unit, load_q_unit, stage_unit
 from .correction import correction_loop, correction_loop_q2, fold_group
 from .mma import mma_loop, mma_loop_q2
 from .operands import (
@@ -266,9 +266,8 @@ class AttentionKernel:
         if warp_idx == R.load_warp:
             cpasync.prefetch_descriptor(atom_q)
             cpasync.prefetch_descriptor(atom_q_rep)
-            if cutlass.const_expr(not st.lowbit):
-                cpasync.prefetch_descriptor(atom_k)
-                cpasync.prefetch_descriptor(atom_v)
+            cpasync.prefetch_descriptor(atom_k)
+            cpasync.prefetch_descriptor(atom_v)
         Hq = tK.shape[2] * st.g  # heads of Q = kv heads x group
 
         # ---- scaffolding
@@ -289,6 +288,15 @@ class AttentionKernel:
                 num_stages=st.n_slots,
                 producer_group=_thread_group(R.convert_threads),
                 consumer_group=_thread_group(1),
+                defer_sync=True,
+            ).make_participants()
+            # the raw staging: filled by the load warp's TMA, released by one thread of every conversion warp
+            raw_prod, raw_cons = pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage.raw_mbar.data_ptr(),
+                num_stages=st.raw_stages,
+                producer_group=_thread_group(1),
+                consumer_group=_thread_group(len(R.convert_warps)),
+                tx_count=st.raw_keys * st.raw_w,
                 defer_sync=True,
             ).make_participants()
         else:
@@ -413,13 +421,17 @@ class AttentionKernel:
 
         # ---- roles: every role walks the same units in the same order (u = bidx, bidx + grid, ...)
         if cutlass.const_expr(st.lowbit):
-            # the conversion stage: the load warp (Q by TMA, then its share of the K / V conversion) and the two other warps (their
-            # share of the conversion); every thread of the stage runs the same ring-slot sequence
+            # the load warp: Q, then the raw K / V bytes of the unit's tiles into the staging buffer, by TMA; the conversion warps: the
+            # staged bytes into the ring, every thread of the stage running the same slot sequence
+            sRaw_view = storage.sRaw.get_tensor(
+                cute.make_layout(st.raw_view_shape, stride=st.raw_view_stride)
+            )
+            sRaw = storage.sRaw.get_tensor(
+                cute.make_layout((st.raw_stages * st.raw_stage_bytes,))
+            )
+            sPg = storage.s_pg.get_tensor(cute.make_layout((st.raw_pg_elems,)))
             if warp_idx == R.load_warp:
                 cute.arch.setmaxregister_decrease(R.regs_other)
-                tidx, _, _ = cute.arch.thread_idx()
-                ctid = tidx - 32 * R.load_warp
-                seq = Int32(0)
                 for u in range(bidx, num_units, grid_size):
                     q_prod = load_q_unit(
                         st,
@@ -434,48 +446,45 @@ class AttentionKernel:
                         mDesc[(u, F_KVHEAD)],
                         mDesc[(u, F_ROWS)],
                     )
-                    kv_prod = convert_unit(
+                    raw_prod = stage_unit(
                         st,
-                        kv_prod,
+                        raw_prod,
+                        atom_k,
                         tK,
+                        atom_v,
                         tV,
-                        tKsf,
-                        tVsf,
-                        sKV_u32,
+                        sRaw_view,
+                        sPg,
                         mKvIndptr,
                         mKvIndices,
                         mDesc[(u, F_REQ)],
                         mDesc[(u, F_KVHEAD)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
-                        ctid,
-                        s_ks,
-                        s_vs,
-                        seq,
                     )
-                    seq = seq + mDesc[(u, F_TILE_HI)] - mDesc[(u, F_TILE_LO)]
                 cute.arch.griddepcontrol_launch_dependents()
-            if warp_idx >= R.empty_warps[0]:
-                cute.arch.setmaxregister_decrease(R.regs_other)
+            if warp_idx >= R.convert_warps[0]:
+                cute.arch.setmaxregister_decrease(R.regs_convert)
                 tidx, _, _ = cute.arch.thread_idx()
-                ctid = tidx - 32 * R.load_warp
+                ctid = tidx - 32 * R.convert_warps[0]
                 seq = Int32(0)
                 for u in range(bidx, num_units, grid_size):
-                    kv_prod = convert_unit(
+                    kv_prod, raw_cons = convert_unit(
                         st,
                         kv_prod,
-                        tK,
-                        tV,
+                        raw_cons,
                         tKsf,
                         tVsf,
                         sKV_u32,
+                        sRaw,
+                        sPg,
                         mKvIndptr,
-                        mKvIndices,
                         mDesc[(u, F_REQ)],
                         mDesc[(u, F_KVHEAD)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
                         ctid,
+                        mKvIndices,
                         s_ks,
                         s_vs,
                         seq,

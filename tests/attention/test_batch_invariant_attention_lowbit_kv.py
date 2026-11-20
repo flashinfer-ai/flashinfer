@@ -288,6 +288,39 @@ def test_cache_key_covers_the_conversion_stage():
     )
 
 
+def test_conversion_stage_roles_and_raw_staging():
+    """The low-bit kernels' conversion stage: one further warpgroup next to the two idle warps within the register pool, raw
+    stages whose TMA boxes land on 128-byte boundaries, and a default ring of the low-bit configuration space."""
+    pytest.importorskip("cutlass")
+    from flashinfer.attention.batch_invariant.blocks import operands
+
+    for D in spec.HEAD_DIMS:
+        r = operands.Roles(1, D, lowbit=True)
+        assert r.threads == 512 and r.convert_threads == 192
+        assert (
+            r.convert_warps[0] == r.empty_warps[0]
+            and r.load_warp not in r.convert_warps
+        )
+        used = (
+            (r.regs_softmax + r.regs_correction) * 128
+            + r.regs_other * 64
+            + r.regs_convert * r.convert_threads
+        )
+        assert r.regs_convert >= 48 and used < 65536
+        bf = operands.Roles(1, D)
+        assert bf.threads == 384 and bf.convert_threads == 0
+        cfg = engine.default_config(D, "e4m3")
+        assert cfg.kv_slots == engine.DEFAULT_RING_LOWBIT[D] and cfg.well_formed(
+            D, lowbit=True
+        )
+    # (cache row bytes, keys per stage, page) -> stage bytes: whole page boxes, a box narrower than 128 bytes padded to 128
+    assert operands.raw_stage_bytes(128, 128, 16) == 128 * 128
+    assert operands.raw_stage_bytes(256, 16, 16) == 16 * 256
+    assert operands.raw_stage_bytes(64, 128, 1) == 128 * 128
+    assert operands.raw_stage_bytes(32, 128, 2) == 64 * 128
+    assert operands.raw_stage_bytes(64, 128, 128) == 128 * 64
+
+
 # ------------------------------------------------------------------------------------------------------ on the device
 @needs_device
 @pytest.mark.parametrize("D", [64, 128, 256])
