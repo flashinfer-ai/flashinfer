@@ -1647,6 +1647,11 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     ),
                     tidx=tidx,
                 )
+                # The promotion above reads stage s through the generic proxy;
+                # fence it against the async-proxy (TMA) refill that the
+                # release allows, and join the warp before its arrive.
+                cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.sync_warp()
                 weight_sf_pipeline.consumer_release(ab_consumer_state)
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()
