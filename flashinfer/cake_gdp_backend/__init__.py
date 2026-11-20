@@ -403,6 +403,7 @@ def cake_gated_delta_product_mtp(
     b = _model_input(b, "b", shape=(B, T, n, HV), device=device, dtype=model_dtype)
     _state_pool(initial_state, heads=HV, device=device, arch=arch)
     state_dtype = initial_state.dtype
+    rounds = 0  # the launch class of an FP32 pool: its stores do not round
     if state_dtype == torch.float16:
         seed, rounds = _rounding(initial_state, rand_seed, philox_rounds)
     elif rand_seed is not None:
@@ -502,6 +503,10 @@ def cake_gated_delta_product_mtp(
         sm_count=_loader.sm_count(_device_index(device)),
         use_qk_l2norm=use_qk_l2norm,
         state_dtype=state_dtype,
+        # The launch class (host values, so a captured call keeps its program): an FP16 pool's round count and
+        # whether the call stores per-token snapshots pick a program's snapshot_noise sibling where it is faster.
+        philox_rounds=rounds,
+        use_ssm_state_indices=bool(use_scatter),
     )
     values: dict[str, object] = {
         "q": q,
