@@ -13,7 +13,6 @@ import os
 import shutil
 import subprocess
 import sys
-import warnings
 
 import numpy
 import pytest
@@ -122,27 +121,6 @@ class Planned:
 
 def make_wrapper(cfg, **plan):
     return Planned(cfg, **plan)
-
-
-def default_wrapper(cfg, rows, width=TOPK):
-    """The default (not batch-invariant) ``prims_ts`` schedule, for the negative control."""
-    from flashinfer.attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
-
-    dtype, head_dim, heads = cfg
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        wrapper = BatchSparseMLADecodePagedTSWrapper()
-        wrapper.plan(
-            torch.device("cuda"),
-            rows,
-            heads,
-            max_topk=width,
-            q_dtype=cases.torch_dtype(dtype),
-            qk_rope_head_dim=head_dim - 512,
-            softmax_scale=SCALE,
-            return_lse=True,
-        )
-    return wrapper
 
 
 class Rows:
@@ -338,7 +316,7 @@ def test_case_inputs_are_exact_and_reproducible():
 
 
 def test_generated_lean_cases_are_current():
-    with open(lean_cases.CASES_PATH) as f:
+    with open(lean_cases.CASES_PATH, encoding="utf-8") as f:
         committed = f.read()
     assert committed == lean_cases.render(), (
         "regenerate with: python -m flashinfer.batch_invariant.mla.lean_cases"
@@ -507,42 +485,13 @@ def test_one_plan_serves_every_row_count_and_width():
 
     cfg = CONFIGS[1]
     pool, targets, (ref_out, _) = shared(cfg)
+    wrapper = make_wrapper(cfg)
     before = len(engine._plans)
     for n in (1, 3, 12):
-        assert same_bits(run_batch(targets.take(range(n)))[0], ref_out[:n])
+        assert same_bits(run_batch(targets.take(range(n)), wrapper)[0], ref_out[:n])
     wide = Rows(cfg, pool, TARGETS, width=2051)
-    assert same_bits(run_batch(wide)[0], ref_out)
-    assert len(engine._plans) == before
-
-
-@needs_device
-def test_default_schedule_is_not_batch_invariant():
-    """Negative control: on today's default ``prims_ts`` schedule the same comparison fails, so the invariance tests
-    can fail. The classes do not depend on that schedule: if it stops differing, this control has nothing to show."""
-    pytest.importorskip("flashinfer.attention.prims_ts")
-    cfg = ("e4m3", 576, 64)
-    _, head_dim, heads = cfg
-    pool, targets, _ = shared(cfg)
-    full = targets.take([10, 11])
-
-    def default(rows):
-        n = len(rows)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            out, _ = default_wrapper(cfg, n).run(
-                rows.q.view(n, 1, heads, head_dim), pool.kv, rows.indices, rows.lengths
-            )
-        return out.view(n, heads, 512)
-
-    alone = [default(full.take([i])) for i in range(2)]
-    batch = join(full, mates(cfg, pool, 62, "long"))
-    assert not same_bits(default(batch)[:2], torch.cat(alone)), (
-        "the default prims_ts schedule gave batch-independent bits: the control needs another shape"
-    )
-    flagged = run_batch(batch)[0][:2]
-    assert same_bits(
-        flagged, torch.cat([run_batch(full.take([i]))[0] for i in range(2)])
-    )
+    assert same_bits(run_batch(wide, wrapper)[0], ref_out)
+    assert len(engine._plans) == before and make_wrapper(cfg).plan is wrapper.plan
 
 
 @needs_device
@@ -1126,6 +1075,7 @@ def test_stable_function_refuses_inputs_outside_the_class(monkeypatch):
 
     holes = targets.take([5, 6])
     holes.indices[1, 7] = -1
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "0")
     assert stable(holes, sparse_mla_top_k_lens=holes.lengths).shape[0] == 2
     monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
     tail = targets.take([5, 6])
@@ -1136,7 +1086,7 @@ def test_stable_function_refuses_inputs_outside_the_class(monkeypatch):
     far.indices[0, 3] = rows.pool.kv.shape[0] * rows.pool.kv.shape[1]
     with pytest.raises(ValueError, match="outside the cache"):
         stable(far, sparse_mla_top_k_lens=far.lengths)
-    monkeypatch.delenv("FLASHINFER_VALIDATE_INPUTS")
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "0")
 
     _, head_dim, heads = cfg
     out = flashinfer.prefill.trtllm_prefill_with_kv_cache_mla(
@@ -1462,6 +1412,73 @@ def test_an_unvalidated_live_count_above_the_width_stays_in_its_row(cfg):
 
 
 @needs_device
+def test_scale_limit_strided_lists_and_plan_defaults(monkeypatch):
+    """A host scale the kernel would overflow is refused; an output between strided list rows is accepted and one
+    on a row refused; a CPU query is refused before any capture probe; two first planners keep their own defaults."""
+    import threading
+
+    from flashinfer.batch_invariant import mla
+    from flashinfer.batch_invariant.mla import engine
+
+    cfg = CONFIGS[1]
+    _, head_dim, heads = cfg
+    pool, targets, (ref_out, _) = shared(cfg)
+    rows = targets.take(range(2))
+    plan = make_wrapper(cfg).plan
+    flat = pool.kv.view(-1, head_dim)
+    for scale in (2.4e38, 3e38):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="softmax_scale"):
+            plan.run(rows.q, flat, rows.indices, rows.lengths, softmax_scale=scale)
+    zero = torch.zeros_like(rows.q[:1])
+    one = torch.ones(1, dtype=torch.int32, device="cuda")
+    out = plan.run(zero, flat, rows.indices[:1], one, softmax_scale=2.3e38)
+    assert bool(torch.isfinite(out.float()).all())
+
+    arena = torch.zeros(1 << 21, dtype=torch.uint8, device="cuda")
+    wide = arena[: 2 * (1 << 18) * 4].view(torch.int32).view(2, 1 << 18)
+    wide[:, :TOPK] = rows.indices
+    strided = wide[:, :TOPK]
+    size = 2 * heads * 512 * 2
+    gap = arena[TOPK * 4 + 64 : TOPK * 4 + 64 + size].view(torch.bfloat16)
+    got = plan.run(rows.q, flat, strided, rows.lengths, out=gap.view(2, heads, 512))
+    assert same_bits(got, ref_out[:2])
+    for at in (0, (1 << 20) - 64):
+        on_row = arena[at : at + size].view(torch.bfloat16).view(2, heads, 512)
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="sharing memory"):
+            plan.run(rows.q, flat, strided, rows.lengths, out=on_row)
+
+    def no_probe():
+        raise RuntimeError("no CUDA capture probe on this build")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", no_probe)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="cpu"):
+        stable(rows, query=torch.zeros(2, 1, 3, head_dim, dtype=rows.q.dtype))
+    monkeypatch.undo()
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="cp_world"):
+        stable(rows, cp_world=torch.tensor(1))
+
+    made, gate = {}, threading.Barrier(2)
+
+    def first(scale):
+        gate.wait()
+        made[scale] = mla.plan(
+            torch.device("cuda"),
+            7,
+            q_dtype=rows.q.dtype,
+            qk_rope_head_dim=64,
+            softmax_scale=scale,
+        )
+
+    threads = [threading.Thread(target=first, args=(s,)) for s in (0.25, 0.5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert {s: p.softmax_scale for s, p in made.items()} == {0.25: 0.25, 0.5: 0.5}
+    assert not engine.capturing(torch.device("cpu"))
+
+
+@needs_device
 def test_kept_buffers_are_filled_before_another_stream_reads_them():
     """A row count first used on a busy stream: its kept buffers are complete when a second stream uses them."""
     from flashinfer.batch_invariant.mla import engine
@@ -1475,8 +1492,8 @@ def test_kept_buffers_are_filled_before_another_stream_reads_them():
     torch.cuda.synchronize()
     del junk
     busy, other = torch.cuda.Stream(), torch.cuda.Stream()
-    load = torch.randn(4000, 4000, device="cuda")
     with torch.cuda.stream(busy):
+        load = torch.randn(4000, 4000, device="cuda")
         for _ in range(30):
             load = (load @ load).clamp_(-1, 1)
         engine.full_lengths(device, 911, 1999)

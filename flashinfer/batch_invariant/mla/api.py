@@ -93,6 +93,10 @@ def sparse_mla_batch_invariant(
             and sparse_mla_top_k > 0
             and kv_lora_rank == spec.LATENT_DIM
             and type(qk_rope_head_dim) is int
+            and type(refused[2]) is bool
+            and type(refused[3]) is int
+            and type(refused[4]) is int
+            and type(refused[8]) is bool
             and refused == _NOT_REFUSED
             and bmm1_scale is not None
             and bmm2_scale is not None
@@ -151,7 +155,7 @@ def sparse_mla_batch_invariant(
         )
     )
     if plan is None:
-        if torch.cuda.is_current_stream_capturing():
+        if engine.capturing(device):
             raise RuntimeError(_BEFORE_CAPTURE)
         plan = engine.plan(
             device,

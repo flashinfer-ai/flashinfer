@@ -23,8 +23,8 @@ from . import spec
 Scale = Union[float, torch.Tensor]
 _JIT_MODULE = "batch_invariant_mla_sparse"
 _DTYPE_KEYS = {torch.bfloat16: "bf16", torch.float8_e4m3fn: "e4m3"}
-#: Host scales that round to a positive finite fp32.
-_MIN_SCALE, _MAX_SCALE = 1e-45, 3.4028234663852886e38
+#: Host scales that round to a positive fp32 and stay finite when the kernel multiplies them by log2(e).
+_MIN_SCALE, _MAX_SCALE = 1e-45, 2.35e38
 
 #: Plans per compiled shape. Never evicted: a captured CUDA graph reads its plan's buffers.
 _plans: Dict[tuple, "SparseMLAPlan"] = {}
@@ -60,8 +60,28 @@ def _capacity(rows: int) -> int:
     return max(64, 1 << (rows - 1).bit_length())
 
 
-def _not_capturing(what: str) -> None:
-    if torch.cuda.is_current_stream_capturing():
+def capturing(device) -> bool:
+    """Whether the current stream of ``device`` (not of the caller's current device) is capturing a CUDA graph."""
+    if device.type != "cuda":
+        return False
+    if device.index is None or device.index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
+def _rows_share(first, last, step, width, rows, lo, hi) -> bool:
+    """Whether bytes ``[lo, hi)`` meet a list row ``[first + r * step, + width)``; ``last`` ends the last row."""
+    if not (first < hi and lo < last):
+        return False
+    if step <= width:
+        return True
+    row = max(0, (lo - first - width) // step + 1)
+    return row < rows and first + row * step < hi
+
+
+def _not_capturing(what: str, device) -> None:
+    if capturing(device):
         raise RuntimeError(
             f"{what}: run one call of this shape before CUDA graph capture"
         )
@@ -71,7 +91,7 @@ def full_lengths(device, rows: int, top_k: int) -> torch.Tensor:
     """``[rows]`` int32 lengths equal to ``top_k``: a view of a kept buffer, so no row count allocates twice."""
     view = _full_views.get((device, rows, top_k))
     if view is None:
-        _not_capturing(spec.FAMILY)
+        _not_capturing(spec.FAMILY, device)
         with _lock:
             capacity, backing = _full.get((device, top_k), (0, None))
             if backing is None or rows > capacity:
@@ -98,7 +118,7 @@ class _RowBuffers:
     def get(self, rows: int) -> tuple:
         found = self.views.get(rows)
         if found is None:
-            _not_capturing(self.name)
+            _not_capturing(self.name, self.device)
             with _lock:
                 if rows > self.capacity:
                     capacity, dev = _capacity(rows), self.device
@@ -470,12 +490,13 @@ class SparseMLAPlan:
             l0 = lengths.data_ptr()
             l1 = l0 + rows * 4
             i0 = indices.data_ptr()
-            i1 = i0 + ((rows - 1) * indices.stride(0) + shape[1]) * 4
+            step, width = indices.stride(0) * 4, shape[1] * 4
+            i1 = i0 + (rows - 1) * step + width
             shared = (
                 (q0 < o1 and o0 < q1)
                 or (k0 < o1 and o0 < k1)
                 or (l0 < o1 and o0 < l1)
-                or (i0 < o1 and o0 < i1)
+                or _rows_share(i0, i1, step, width, rows, o0, o1)
             )
             if lse is not None:
                 s1 = s0 + rows * heads * 4
@@ -484,7 +505,7 @@ class SparseMLAPlan:
                     or (q0 < s1 and s0 < q1)
                     or (k0 < s1 and s0 < k1)
                     or (l0 < s1 and s0 < l1)
-                    or (i0 < s1 and s0 < i1)
+                    or _rows_share(i0, i1, step, width, rows, s0, s1)
                     or (o0 < s1 and s0 < o1)
                 )
             for scale in scales:
@@ -724,7 +745,9 @@ def check_scale(
         value = float("inf")
     if not _MIN_SCALE <= value <= _MAX_SCALE:
         raise unsupported(
-            class_name, f"{name}={value!r}", "a positive finite fp32 scale"
+            class_name,
+            f"{name}={value!r}",
+            f"a positive scale of at most {_MAX_SCALE:g} (the kernel multiplies it by log2(e) in fp32)",
         )
     return value
 
@@ -752,8 +775,8 @@ def plan(
     qk_rope_head_dim : int
         64 for 576-wide rows (512 latent + 64 RoPE), 0 for 512-wide rows.
     softmax_scale : Union[float, torch.Tensor]
-        Required: the scale is an input of the row term. A positive finite host float, or a one-element fp32 tensor
-        on ``device``. It is the default of the plan's launches; only its kind is part of the compiled shape.
+        Required: the scale is an input of the row term. A positive host float of at most 2.35e38, or a one-element
+        fp32 tensor on ``device`` (the same range is the caller's contract there: its contents are not read). It is the default of the plan's launches; only its kind is part of the compiled shape.
     output_scale : Union[float, torch.Tensor]
         Same rules; default ``1.0``.
 
@@ -813,11 +836,8 @@ def plan(
             output_scale, found.output_scale
         ):
             return found
-        twin = SparseMLAPlan.__new__(SparseMLAPlan)
-        twin.__dict__.update(found.__dict__)
-        twin.softmax_scale, twin.output_scale = softmax_scale, output_scale
-        return twin
-    _not_capturing(name)
+        return _twin(found, softmax_scale, output_scale)
+    _not_capturing(name, device)
     if cc == (10, 7):
         from ...cute_dsl.utils import require_cute_dsl_arch
 
@@ -837,7 +857,18 @@ def plan(
             )
             with _lock:
                 _plans[key] = made
-    return made
+    if _same_scale(softmax_scale, made.softmax_scale) and _same_scale(
+        output_scale, made.output_scale
+    ):
+        return made
+    return _twin(made, softmax_scale, output_scale)
+
+
+def _twin(found, softmax_scale, output_scale):
+    twin = SparseMLAPlan.__new__(SparseMLAPlan)
+    twin.__dict__.update(found.__dict__)
+    twin.softmax_scale, twin.output_scale = softmax_scale, output_scale
+    return twin
 
 
 def _same_scale(a, b) -> bool:

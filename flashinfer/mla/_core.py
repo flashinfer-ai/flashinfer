@@ -3864,7 +3864,9 @@ def _mla_with_kv_cache_impl(
         ``cum_seq_lens_q`` only marks a ``[total_q, heads, head_dim]`` query
         (every query token is its own row). Contiguous
         16-byte-aligned BF16 or E4M3 query and KV cache of width 576 or 512,
-        any list width, 1 to 128 heads. LSE output is natural-log and needs
+        any list width, 1 to 128 heads; a BF16 call takes at most 65,535
+        query tokens (split a larger call, the rows do not depend on the
+        split). LSE output is natural-log and needs
         ``return_lse_base="basee"``. Any other backend, architecture or input
         (sinks, DCP, packed uint8 caches, skip-softmax, ``use_fp16_softmax``,
         ``multi_ctas_kv_counter_buffer``) raises
