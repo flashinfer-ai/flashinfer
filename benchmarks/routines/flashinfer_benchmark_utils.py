@@ -635,9 +635,9 @@ routine_cc_to_supported_backends = {
     },
     # common check flashinfer/gemm/gemm_base.py gates every backend; cutile has no
     # per-backend checker (a comment in the file names a missing one).
-    # deepgemm = group_deepgemm_fp8_nt_groupwise (:11621),
-    # cute-dsl = group_gemm_fp8_nt_groupwise_contiguous (:11775).
-    # SM12x raises for num_groups > 1 (:10950); the probe drops it.
+    # deepgemm = group_deepgemm_fp8_nt_groupwise,
+    # cute-dsl = group_gemm_fp8_nt_groupwise_contiguous.
+    # SM12x raises for num_groups > 1; the probe drops it.
     "group_gemm_fp8_nt_groupwise": {
         "7.5": [],
         "8.0": [],
@@ -907,7 +907,7 @@ routine_cc_to_supported_backends = {
         "12.1": [],
     },
     # flashinfer/gemm/gemm_base.py also lists 110, but dispatch has no SM110 path
-    # (:11352 raises 'Unsupported device'), so 11.0 is left out.
+    # (raises 'Unsupported device'), so 11.0 is left out.
     "group_gemm_mxfp4_nt_groupwise": {
         "7.5": [],
         "8.0": [],
