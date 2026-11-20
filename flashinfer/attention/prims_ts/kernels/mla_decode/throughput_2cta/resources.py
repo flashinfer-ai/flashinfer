@@ -1384,6 +1384,12 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         return cached_k_pages, cached_v_pages, cached_next_v_pages
 
 
+# =====================================================================
+# SmemQResource — Q SMEM buffer with TmaUmmaAsync pipeline
+# =====================================================================
+
+
+@dataclass(kw_only=True)
 class SmemQResource(HighThroughputMlaResource):
     """SMEM Q buffer (latent + rope).  Producer: LoadTma (TMA).  Consumer: Mma.
 
@@ -4406,13 +4412,14 @@ class GmemOResource(HighThroughputMlaResource):
 
     @cute.jit
     def _balanced_public_row(self, storage_row, batch_idx):
+        public_row = Int64(storage_row)
         if cutlass.const_expr(self.cu_seqlens_q is None):
-            storage_row += (
+            public_row += (
                 Int64(batch_idx)
                 * Int64(self.logical_num_heads_q)
                 * Int64(self.logical_seq_len_q)
             )
-        return Int64(storage_row)
+        return public_row
 
     @cute.jit
     def _store_balanced_output_fragment(

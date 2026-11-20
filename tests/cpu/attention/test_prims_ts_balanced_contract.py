@@ -233,13 +233,15 @@ class TestBalancedMLAHostContract(unittest.TestCase):
                 )
                 self.assertIs(result, tensor)
                 args = calls[0]
-                self.assertEqual(len(args), 17 if plan is None else 21)
+                self.assertEqual(len(args), 21)
                 self.assertIs(args[11], runtime.sparse_inputs)
                 self.assertEqual(args[12:14], (0.125, 0.25))
                 self.assertIs(args[14], runtime.output_quant_args)
                 self.assertEqual(args[15:17], (1, 0))
                 if plan is not None:
                     self.assertEqual(args[17:], descriptors)
+                else:
+                    self.assertEqual(args[17:], (None, None, None, None))
 
     def test_task_cache_preserves_native_slots(self):
         make_cache = _function(

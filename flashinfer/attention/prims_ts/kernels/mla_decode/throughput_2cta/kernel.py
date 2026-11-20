@@ -1225,7 +1225,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
             cp_world=self.cp_world,
-            use_balanced_scheduler=self.use_balanced_scheduler,
             cp_interleave_size=self.cp_interleave_size,
             lse_base_on_e=self.lse_base_on_e,
             sparse_gather_warps=self.sparse_gather_warps,

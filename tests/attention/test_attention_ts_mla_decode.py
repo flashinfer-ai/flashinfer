@@ -1014,8 +1014,10 @@ def test_attention_ts_mla_balanced_decode_family_overrides_only_balanced_policy(
         "causal",
         1,
     )
-    balanced = mla_decode_module._resolve_mla_decode_launch_spec(*common, True)
-    ordinary = mla_decode_module._resolve_mla_decode_launch_spec(*common, False)
+    balanced = mla_decode_module._resolve_mla_decode_launch_spec(*common, balanced=True)
+    ordinary = mla_decode_module._resolve_mla_decode_launch_spec(
+        *common, balanced=False
+    )
 
     assert dict(balanced.policy)["kernel"] == balanced_kernel
     assert dict(ordinary.policy)["kernel"] == ordinary_kernel

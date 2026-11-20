@@ -1044,7 +1044,6 @@ def _resolve_mla_decode_launch_spec(
         use_throughput_latency = requested_policy == "throughput_latency_1cta"
 
         kernel: Any
-        policy: tuple[tuple[str, object], ...]
         if use_throughput_latency:
             max_active_clusters = max_active_one_cta_clusters
             launch_shape = one_cta_launch_shape
@@ -1961,6 +1960,11 @@ def _launch_mla_decode(
                 balanced_plan.num_combine_descriptors,
             )
         )
+    else:
+        # CuTe's persisted FFI retains optional None parameters in the callable
+        # signature even when they were omitted during compilation. Preserve
+        # the native operand prefix and bind the unused descriptor suffix.
+        launch_args.extend((None, None, None, None))
     compiled(*launch_args)
     return runtime.out
 
