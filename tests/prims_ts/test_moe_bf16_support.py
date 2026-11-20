@@ -456,8 +456,10 @@ def test_kimi_k3_ep_capacity_uses_local_experts():
 
 @pytest.mark.parametrize(("num_tokens", "tile_n"), [(512, 8), (4096, 64), (32768, 256)])
 def test_finalize_fuses_into_the_second_gemm_epilogue(num_tokens, tile_n):
+    # SM107's tile-256 FC2 leaves no shared memory for the fused epilogue and
+    # keeps the unfused one.
     pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
-        [tile_n, 0], num_tokens=num_tokens, top_k=6, num_local_experts=48
+        [tile_n, 0], num_tokens=num_tokens, top_k=6, num_local_experts=48, sm_arch=100
     )
     fused = apply_fused_finalize(
         pair, num_tokens=num_tokens, top_k=6, num_local_experts=48

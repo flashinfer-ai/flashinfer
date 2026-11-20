@@ -494,6 +494,35 @@ class TestPrimsTsUnifiedGpu:
         direct_out = runner.forward(packed, tactic=-1)
         _bf16_check(direct_out, reference, "prims_ts bf16 direct")
 
+    def test_layer_writes_the_packs_output_buffer(self):
+        """A pack's ``output`` buffer receives the finalized output in place."""
+        act, weights, config, _tensors = _make_bf16_packs_and_config(
+            16,
+            hidden_size=256,
+            intermediate_size=256,
+            num_experts=8,
+            top_k=2,
+            max_tokens=16,
+        )
+        act, weights, config = _with_prims_ts_backend(
+            act, weights, config, "trtllm_bf16_routed"
+        )
+        layer = MoELayer(config)
+        expected = layer(act, weights)
+        buffer = torch.full_like(expected, float("nan"))
+        out = layer(dataclasses.replace(act, output=buffer), weights)
+        assert out.data_ptr() == buffer.data_ptr()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        rows, hidden = buffer.shape
+        for invalid in (
+            buffer[:, :128],
+            buffer.new_empty((rows, 2 * hidden))[:, ::2],
+            buffer.cpu(),
+            buffer.new_empty(rows * hidden + 1)[1:].view(rows, hidden),
+        ):
+            with pytest.raises(ValueError, match="output must be a contiguous"):
+                layer(dataclasses.replace(act, output=invalid), weights)
+
     def test_tuning_pre_hook_binds_each_packs_static_extras(self):
         """Two packs on one runner: each pack's tuning pre-hook installs its own
         inner static extras, so tactic enumeration never reads the other's."""
@@ -728,6 +757,19 @@ class TestPrimsTsUnifiedGpu:
             prims_weights,
         )
         assert torch.equal(fp32_out, prims_out)
+
+        # Without zero rows, the rows of tokens without a local expert keep what
+        # the output buffer held, and every other row is the same.
+        buffer = torch.full_like(prims_out, float("nan"))
+        kept = prims_layer(
+            dataclasses.replace(
+                act, output=buffer, zero_rows_without_local_expert=False
+            ),
+            prims_weights,
+        )
+        assert kept.data_ptr() == buffer.data_ptr()
+        assert torch.isnan(kept[no_local]).all()
+        assert torch.equal(kept[~no_local], prims_out[~no_local])
 
     def test_mxfp4_mxfp8_fused_finalize_two_cta_fc2_past_hidden(self, monkeypatch):
         """A two-CTA FC2 tile that ends past the hidden size.

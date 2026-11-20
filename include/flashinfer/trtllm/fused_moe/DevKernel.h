@@ -429,6 +429,9 @@ struct Data {
   // The GEMM producing inPtr already stored every token with exactly one local expert in outPtr
   // (scaled by its expert weight); only zero rows and multi-expert tokens remain.
   bool mSingleExpertTokensDone{false};
+  // Write the zero rows of tokens without a local expert. When false, their rows of outPtr (and
+  // of outDqSfsPtr) are left as they are, for callers that never read them.
+  bool mZeroRowsWithoutLocalExpert{true};
 
   void* inPtr;
   void* inPtr2 = nullptr;
@@ -474,6 +477,7 @@ struct KernelParams {
   int32_t numExperts;
   int32_t topK;
   int32_t const* totalNumPaddedTokens;
+  bool zeroRowsWithoutLocalExpert;
 
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
@@ -493,6 +497,7 @@ struct KernelParams {
     params.numExperts = data.numExperts;
     params.topK = data.topK;
     params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+    params.zeroRowsWithoutLocalExpert = data.mZeroRowsWithoutLocalExpert;
 
     return params;
   }
