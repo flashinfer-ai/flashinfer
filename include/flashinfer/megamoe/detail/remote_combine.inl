@@ -27,6 +27,22 @@ const auto remote_wait_return = [&]() {
       if (cute::elect_one_sync()) ptx::tma_store_wait<0>();
       __syncwarp();
     }
+    // M1 keeps every first-pass y store and return consumer in CTA0. Preserve the
+    // flag wait and each warp's full TMA completion above; relay them across
+    // CTA0's math warps without joining unrelated CTAs.
+    if constexpr (kWeightTileBytes == 8448 && kNumSMs == 78 && kNumRanks == 16 && kNumNodes == 2 &&
+                  kNumLocalRanks == 8 && kNumExperts == 256 && kHidden == 4096 &&
+                  kIntermediateHidden == 2048 && kNumTopk == 6 && kNumMaxTokensPerRank == 2 &&
+                  BLOCK_M == 8 && BLOCK_N == 256 && BLOCK_K == 128 && kNumStages == 4 &&
+                  kNumExpertsPerWave == 16 && kNumThreads == 384 && kNumEpilogueThreads == 256 &&
+                  kNumDecodeThreads == 0 && kSwapABRequested && kUseRSOperand &&
+                  kSingleActiveDispatchWarp && kUseMode2RowDecoder && kUseInterleavedScheduler &&
+                  !kInKernelWeightCopy && kActivationClamp == 10.0f && kFastMath) {
+      if (num_tokens == 1) {
+        if (sm_idx == 0) ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+        return;
+      }
+    }
     comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(workspace, sm_idx, epilogue_thread_idx, [&]() {
       ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
     });

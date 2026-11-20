@@ -56,7 +56,13 @@ The shared compact8448 denominator is the common optimization target: rawFP8's e
 See `main-results.csv`, `fp8-control.csv`, `all-cohort-details.csv` and the companion CSVs for source core, declared commit, seed, graph calls, clocks, all cohorts and exclusions. Original records are preserved separately. Raw rank/arm records were independently reaggregated; every published row passes its source, accuracy, replay and stability gates.
 
 
-Model context: [DeepSeek-V4-Flash-0731 pinned config](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/raw/7872f01b1d1fe23eabc4c98b48bffcef5a386062/config.json): 43 hidden layers, 1 shared expert, E256/H4096/I2048/top-6. Timings use generated routed-core inputs. Benchmark source is `f5fd55a4e`, core `01293028…`; the subsequent H512/H768 column-batch correction keeps H4096 executable source equivalent.
+Model context: [DeepSeek-V4-Flash-0731 pinned config](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/raw/7872f01b1d1fe23eabc4c98b48bffcef5a386062/config.json): 43 hidden layers, 1 shared expert, E256/H4096/I2048/top-6. Timings use generated routed-core inputs. Benchmark source for the EP8/EP16 tables is `f5fd55a4e`, core `01293028…`; the subsequent H512/H768 column-batch correction keeps H4096 executable source equivalent. A later M1 compact return-handoff optimization has separate measurements below; its timings are not substituted into these paired tables.
 
 
 [Complete SOL derivation and all 46 measured EP-side comparisons](SOL.md).
+
+## M1 compact return handoff
+
+EP16 M1 on the same 2×8 H20 setup now uses a CTA0 math-warp barrier after complete return/TMA waits. Other supported configurations retain their existing synchronization. Against `e8ed127a`, independent ABBA and BAAB series measured +0.5594% and +0.5572% throughput, respectively: combined latency 88.4005 → 87.9097 µs. Both series and their cross-series rank medians passed the original 2% gate; 67 routing cases on all 16 ranks retained identical BF16 outputs and maximum relative L2 0.008995.
+
+These measurements use compact8448/cap2, requested 1740 MHz, 10000 calls per sample, three warmup graphs and five samples per arm, with a fresh process per arm. Complete BF16 outputs are checked between timing windows. They compare the two EP16 implementations with the same method and do not update the EP8 scaling ratios above. See [per-arm data](m1-return-handoff.csv); parent core `fce73dc0…`, candidate core `03129830…`. Actual release SASS confirms the M1 branch skips the return grid while preserving full TMA completion and the fallback; both binaries use REG160, STACK0 and LOCAL0.
