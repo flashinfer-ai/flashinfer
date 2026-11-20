@@ -92,26 +92,28 @@ def route(
 
 
 @pytest.mark.parametrize("dim", [256])
-def test_width_domains_and_actual_work_floor(monkeypatch, dim):
-    assert route(monkeypatch, dim, [128], [32768])
-    assert route(monkeypatch, dim, [512] * 4, [8192] * 4)
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_width_domains_and_actual_work_floor(monkeypatch, cc, dim):
+    assert route(monkeypatch, dim, [128], [32768], cc=cc)
+    assert route(monkeypatch, dim, [512] * 4, [8192] * 4, cc=cc)
     floor_kv = 8192
-    assert not route(monkeypatch, dim, [128], [floor_kv - 1], hq=16, hk=4)
-    assert route(monkeypatch, dim, [128], [floor_kv], hq=16, hk=4)
-    assert not route(monkeypatch, dim, [128], [32768], hq=16, hk=16)
-    assert not route(monkeypatch, dim, [128] * 5, [32768] * 5)
-    assert not route(monkeypatch, dim, [63], [32768])
-    assert not route(monkeypatch, dim, [1025], [32768])
-    assert not route(monkeypatch, dim, [128], [32769])
-    assert not route(monkeypatch, dim, [1024], [2048])
+    assert not route(monkeypatch, dim, [128], [floor_kv - 1], hq=16, hk=4, cc=cc)
+    assert route(monkeypatch, dim, [128], [floor_kv], hq=16, hk=4, cc=cc)
+    assert not route(monkeypatch, dim, [128], [32768], hq=16, hk=16, cc=cc)
+    assert not route(monkeypatch, dim, [128] * 5, [32768] * 5, cc=cc)
+    assert not route(monkeypatch, dim, [63], [32768], cc=cc)
+    assert not route(monkeypatch, dim, [1025], [32768], cc=cc)
+    assert not route(monkeypatch, dim, [128], [32769], cc=cc)
+    assert not route(monkeypatch, dim, [1024], [2048], cc=cc)
 
 
 @pytest.mark.parametrize("dim", [256])
-def test_width_mixed_batches_stay_in_declaration_class(monkeypatch, dim):
-    assert route(monkeypatch, dim, [64, 96, 128], [8192, 16384, 32768])
-    assert route(monkeypatch, dim, [256, 512, 768], [16384, 8192, 32768])
-    assert not route(monkeypatch, dim, [64, 64, 1024], [32768, 32768, 4096])
-    assert not route(monkeypatch, dim, [128], [32768], max_q=256)
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_width_mixed_batches_stay_in_declaration_class(monkeypatch, cc, dim):
+    assert route(monkeypatch, dim, [64, 96, 128], [8192, 16384, 32768], cc=cc)
+    assert route(monkeypatch, dim, [256, 512, 768], [16384, 8192, 32768], cc=cc)
+    assert not route(monkeypatch, dim, [64, 64, 1024], [32768, 32768, 4096], cc=cc)
+    assert not route(monkeypatch, dim, [128], [32768], max_q=256, cc=cc)
 
 
 class DeviceOnly:
@@ -126,15 +128,21 @@ class DeviceOnly:
 
 @pytest.mark.parametrize("dim", [256])
 @pytest.mark.parametrize("field", ["kv_lens", "seq_lens_q", "qo_indptr_host"])
-def test_width_auto_never_reads_device_metadata(monkeypatch, dim, field):
-    assert not route(monkeypatch, dim, [128], [32768], **{field: DeviceOnly()})
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_width_auto_never_reads_device_metadata(monkeypatch, cc, dim, field):
+    assert not route(monkeypatch, dim, [128], [32768], cc=cc, **{field: DeviceOnly()})
 
 
 @pytest.mark.parametrize("dim", [256])
-def test_explicit_query_masks_use_actual_not_physical_work(monkeypatch, dim):
-    assert route(monkeypatch, dim, [128], [32768], seq_lens_q=torch.tensor([96]))
-    assert not route(monkeypatch, dim, [128], [32768], seq_lens_q=torch.tensor([1]))
-    assert not route(monkeypatch, dim, [128], [32768], seq_lens_q=torch.tensor([129]))
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_explicit_query_masks_use_actual_not_physical_work(monkeypatch, cc, dim):
+    assert route(monkeypatch, dim, [128], [32768], seq_lens_q=torch.tensor([96]), cc=cc)
+    assert not route(
+        monkeypatch, dim, [128], [32768], seq_lens_q=torch.tensor([1]), cc=cc
+    )
+    assert not route(
+        monkeypatch, dim, [128], [32768], seq_lens_q=torch.tensor([129]), cc=cc
+    )
 
 
 @pytest.mark.parametrize(
@@ -144,20 +152,22 @@ def test_explicit_query_masks_use_actual_not_physical_work(monkeypatch, dim):
         dict(page_size=32),
         dict(q_dtype=torch.float16),
         dict(head_dim_vo=128),
-        dict(cc=(10, 3)),
+        dict(cc=(10, 1)),
         dict(cc=(10, 7)),
         dict(runtime=False),
         dict(kv_lens=None),
     ],
 )
 @pytest.mark.parametrize("dim", [256])
-def test_width_auto_keeps_other_guards(monkeypatch, dim, change):
-    assert not route(monkeypatch, dim, [128], [32768], **change)
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_width_auto_keeps_other_guards(monkeypatch, cc, dim, change):
+    assert not route(monkeypatch, dim, [128], [32768], **{"cc": cc, **change})
 
 
 @pytest.mark.parametrize(
     "qs,ks",
     [([128], [32768]), ([64, 96, 128], [8193, 16385, 32767]), ([512] * 4, [8192] * 4)],
 )
-def test_d64_remains_native_with_qualified_runtime(monkeypatch, qs, ks):
-    assert not route(monkeypatch, 64, qs, ks)
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+def test_d64_remains_native_with_qualified_runtime(monkeypatch, cc, qs, ks):
+    assert not route(monkeypatch, 64, qs, ks, cc=cc)

@@ -1033,6 +1033,18 @@ def _build_decode_gen_schedule(
     kv_seqlens = seqlens_kv if use_runtime_seqlens_kv else None
     smem_page_offsets = None
     smem_page_offsets_v = None
+    membership_plane_stride = None
+    if cutlass.const_expr(cfg.page_membership_planes > 1):
+        # Plane p of a G9-G32 route row starts p * (row words / planes) words
+        # in. A widened per-head stride spans Hkv rows; planes stay inside one
+        # head's row, so undo the widening once per CTA.
+        assert not isinstance(page_idx_kv, DirectSparseMetadataView)
+        membership_row_words = q_token_kv_block_sparse_page_membership_stride
+        if cutlass.const_expr(cfg.widens_sparse_metadata_rows_per_head):
+            membership_row_words = membership_row_words // num_heads_kv
+        membership_plane_stride = membership_row_words // Int32(
+            cfg.page_membership_planes
+        )
     if uses_page_offsets_task:
         smem_page_offsets = SmemPageOffsetsKvResource(
             pipeline_config=smem_page_offsets_cfg,
@@ -1046,6 +1058,7 @@ def _build_decode_gen_schedule(
             num_heads_kv=num_heads_kv,
             q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
             q_token_kv_block_sparse_page_membership_stride=q_token_kv_block_sparse_page_membership_stride,
+            q_token_kv_block_sparse_page_membership_plane_stride=membership_plane_stride,
             seqlens_kv=kv_seqlens,
             use_native_paged_kv=use_native_paged_kv,
             max_seq_len_kv=max_seq_len_kv,
@@ -1071,6 +1084,7 @@ def _build_decode_gen_schedule(
                 num_heads_kv=num_heads_kv,
                 q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
                 q_token_kv_block_sparse_page_membership_stride=q_token_kv_block_sparse_page_membership_stride,
+                q_token_kv_block_sparse_page_membership_plane_stride=membership_plane_stride,
                 seqlens_kv=kv_seqlens,
                 use_native_paged_kv=use_native_paged_kv,
                 max_seq_len_kv=max_seq_len_kv,
@@ -3539,11 +3553,7 @@ def decode_gen_kernel(
                 (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
             )
     q_group_cta_idx, h_k_idx, b_idx = split_kv_grid_coord(cfg, cute.arch.block_idx())
-    if cutlass.const_expr(
-        cfg.use_q_token_kv_block_sparse_route
-        and not cfg.shares_sparse_pattern
-        and not cfg.use_persistent_scheduler
-    ):
+    if cutlass.const_expr(cfg.widens_sparse_metadata_rows_per_head):
         if cutlass.const_expr(isinstance(g_page_idx_kv, DirectSparseMetadataView)):
             g_page_idx_kv = g_page_idx_kv.with_head(h_k_idx)
         else:

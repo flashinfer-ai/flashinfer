@@ -1099,6 +1099,22 @@ namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Whether the token's output row is written: always with zeroRowsWithoutLocalExpert, else only
+// when one of its topK experts is local. A kernel skipping a row still waits on the primary first,
+// so that a grid skipping every token completes after it.
+template <typename KernelParams>
+__device__ __forceinline__ bool writesTokenRow(KernelParams const& params, int64_t tokenIdx) {
+  if (params.zeroRowsWithoutLocalExpert) {
+    return true;
+  }
+  for (int k = 0; k < params.topK; k++) {
+    if (params.expandedIdxToPermutedIdx[tokenIdx * params.topK + k] != -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
 template <typename KernelParams>
 __global__ void finalizeKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -1112,6 +1128,9 @@ __global__ void finalizeKernel(KernelParams params) {
 #endif
 
   for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
+    if (!writesTokenRow(params, tokenIdx)) {
+      continue;
+    }
     // Loop over hidden dim
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {
@@ -1324,6 +1343,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   }
 #endif
 
+  bool hasLocalExpert = false;
   for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
        kChunkIdx += blockDim.x) {
     int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
@@ -1335,13 +1355,23 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
 
     scaleArrSmem[kChunkIdx] = scalePacked;
     permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
+    auto const permutedIdxArr = *reinterpret_cast<IdxArrayType const*>(&permutedIdxPacked);
+#pragma unroll
+    for (int ki = 0; ki < TopKUnrollFactor; ++ki) {
+      hasLocalExpert = hasLocalExpert || permutedIdxArr[ki] != -1;
+    }
   }
+  // writesTokenRow from the expanded indices read above, each thread holding some of the chunks.
+  bool const writeRow = params.zeroRowsWithoutLocalExpert || __syncthreads_or(hasLocalExpert);
 
   int64_t const offset = static_cast<int64_t>(tokenIdx) * params.hiddenDim;
   Type* outputPtr = params.outPtr + offset;
   auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
 
+  if (!writeRow) {
+    return;
+  }
   __syncthreads();
 
   auto const* inElemPtr2 = reinterpret_cast<InputElem const*>(params.inPtr2);
@@ -1403,10 +1433,15 @@ constexpr int FINALIZE_WARP_THREADS = 256;
 constexpr int FINALIZE_WARP_VECS = 4;
 // Row slices are added until the launch has at least this many warps.
 constexpr int FINALIZE_WARP_MIN_WARPS = 2048;
+// A prime, so coprime to every token count it does not divide.
+constexpr int64_t FINALIZE_TOKEN_SPREAD_STRIDE = 1000003;
 
-template <typename KernelParams>
-__global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
-    finalizeKernelWarpPerToken(KernelParams params) {
+// With SingleExpertTokensDone, the GEMM producing the input already wrote every token that has
+// exactly one local expert to the output (see finalizeKernelMultiExpertTokens): such tokens are
+// skipped, and tokens without a local expert only get their zero row.
+// Without zeroRowsWithoutLocalExpert, tokens without a local expert write nothing.
+template <typename KernelParams, bool SingleExpertTokensDone>
+__device__ __forceinline__ void finalizeWarpPerToken(KernelParams const& params) {
   using Type = typename KernelParams::Type;
   using TypeExpW = typename KernelParams::TypeExpW;
   constexpr int ElemPerVec = 128 / cutlass::sizeof_bits<Type>::value;
@@ -1416,9 +1451,16 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
   constexpr unsigned FullMask = 0xffffffffu;
 
   int const lane = threadIdx.x % 32;
-  int64_t const tokenIdx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + threadIdx.x / 32;
+  int64_t tokenIdx = static_cast<int64_t>(blockIdx.x) * WarpsPerBlock + threadIdx.x / 32;
   if (tokenIdx >= params.numTokens) {
     return;
+  }
+  if constexpr (SingleExpertTokensDone) {
+    // The tokens left are typically consecutive (rows without a local expert are packed at the
+    // end of each source rank's block); a stride coprime to numTokens spreads them over the CTAs.
+    if (params.numTokens % FINALIZE_TOKEN_SPREAD_STRIDE != 0) {
+      tokenIdx = tokenIdx * FINALIZE_TOKEN_SPREAD_STRIDE % params.numTokens;
+    }
   }
   int64_t const numVecs = params.hiddenDim / ElemPerVec;
   int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
@@ -1447,6 +1489,20 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
   }
   unsigned const localMask = __ballot_sync(FullMask, permutedIdx != -1);
   auto* outVecPtr = reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim);
+  if constexpr (SingleExpertTokensDone) {
+    int const numLocal = __popc(localMask);
+    if (numLocal == 0 && params.zeroRowsWithoutLocalExpert) {
+      VecElem zero;
+      zero.fill(Type(0.f));
+      for (int64_t vec = vecBegin + lane; vec < vecEnd; vec += 32) {
+        outVecPtr[vec] = zero;
+      }
+    }
+    if (numLocal <= 1) {
+      return;
+    }
+  }
+
   // Warp-uniform bound: every lane takes part in the shuffles below, and the lanes past the end of
   // the slice skip their loads and stores.
   for (int64_t stepBegin = vecBegin; stepBegin < vecEnd; stepBegin += vecsPerStep) {
@@ -1478,11 +1534,26 @@ __global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
     }
 #pragma unroll
     for (int u = 0; u < FINALIZE_WARP_VECS; ++u) {
-      if (vecBase + u * 32 < vecEnd) {
+      if (vecBase + u * 32 < vecEnd && (localMask != 0 || params.zeroRowsWithoutLocalExpert)) {
         outVecPtr[vecBase + u * 32] = arrayConvert<ComputeElem, VecElem>(acc[u]);
       }
     }
   }
+}
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
+    finalizeKernelWarpPerToken(KernelParams params) {
+  finalizeWarpPerToken<KernelParams, /*SingleExpertTokensDone=*/false>(params);
+}
+
+// Finalize after a GEMM whose epilogue stored each token with exactly one local expert straight
+// into the output, scaled by its expert weight: writes the zero rows of tokens without a local
+// expert (with zeroRowsWithoutLocalExpert) and reduces the tokens with several.
+template <typename KernelParams>
+__global__ void __launch_bounds__(FINALIZE_WARP_THREADS)
+    finalizeKernelMultiExpertTokens(KernelParams params) {
+  finalizeWarpPerToken<KernelParams, /*SingleExpertTokensDone=*/true>(params);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1546,6 +1617,19 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
       scale[j] = params.expertWeightsPtr != nullptr
                      ? static_cast<float>(params.expertWeightsPtr[expandedIdx])
                      : 1.f;
+    }
+  }
+
+  if (!params.zeroRowsWithoutLocalExpert) {
+    // writesTokenRow from the expanded indices read above: the block's first vector is always
+    // active and holds every topK slot of the token.
+    bool hasLocalExpert = false;
+#pragma unroll
+    for (int j = 0; j < SMALL_BATCH_FINALIZE_MAX_LOADS; ++j) {
+      hasLocalExpert = hasLocalExpert || permutedIdx[j] != -1;
+    }
+    if (!__syncthreads_or(hasLocalExpert)) {
+      return;
     }
   }
 
@@ -1618,6 +1702,9 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
 #endif
 
   for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
+    if (!writesTokenRow(params, tokenIdx)) {
+      continue;
+    }
     // Loop over hidden dim
     for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
          hiddenIdx += blockDim.x * gridDim.x) {
@@ -1667,7 +1754,35 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Grid of the warp-per-token kernels: one warp per token, and row slices over blockIdx.y. Each row
+// splits into slices of stepsPerSlice steps, enough of them to reach FINALIZE_WARP_MIN_WARPS warps.
+// Only slices that hold steps are launched, and the kernel derives the same stepsPerSlice from
+// their number.
+dim3 warpPerTokenGrid(Data const& data, int elemPerVec) {
+  int const warpsPerBlock = FINALIZE_WARP_THREADS / 32;
+  int const vecsPerStep = 32 * FINALIZE_WARP_VECS;
+  int const numSteps = (data.hiddenDim / elemPerVec + vecsPerStep - 1) / vecsPerStep;
+  int const maxSlices =
+      std::min(numSteps, (FINALIZE_WARP_MIN_WARPS + data.numTokens - 1) / data.numTokens);
+  int const stepsPerSlice = (numSteps + maxSlices - 1) / maxSlices;
+  int const numSlices = (numSteps + stepsPerSlice - 1) / stepsPerSlice;
+  return dim3((data.numTokens + warpsPerBlock - 1) / warpsPerBlock, numSlices);
+}
+
 void run(Data const& data, void* stream) {
+  if (data.mSingleExpertTokensDone) {
+    int const elemPerVec = data.mDtypeElt == tg::Dtype::E4m3 ? 16 : 8;
+    FLASHINFER_CHECK(!data.mUseDeepSeekFp8 && data.inPtr2 == nullptr &&
+                         data.hiddenDim % elemPerVec == 0 &&
+                         data.hiddenDimPadded % elemPerVec == 0 && data.topK <= 32,
+                     "Finalize of multi-expert tokens needs one input, 128-bit aligned rows "
+                     "and topK <= 32");
+    LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelMultiExpertTokens, 1,
+                warpPerTokenGrid(data, elemPerVec),
+                /*numThreads=*/FINALIZE_WARP_THREADS, 0, stream);
+    return;
+  }
   if (data.mUseDeepSeekFp8) {
     FLASHINFER_CHECK(data.inPtr2 == nullptr,
                      "DeepSeek FP8 finalize does not support a second input");
@@ -1713,19 +1828,8 @@ void run(Data const& data, void* stream) {
       dim3 numBlocks(numBlocksX, numBlocksY);
       LAUNCH_TOPK_EXPW(data, finalizeKernel, numBlocks, numThreads, 0, stream);
     } else if (vectorWidthAligned && data.topK <= 32 && data.inPtr2 == nullptr) {
-      int const warpsPerBlock = FINALIZE_WARP_THREADS / 32;
-      int const vecsPerStep = 32 * FINALIZE_WARP_VECS;
-      int const numSteps =
-          (data.hiddenDim / finalizeElemsPerVector + vecsPerStep - 1) / vecsPerStep;
-      // Each row splits into slices of stepsPerSlice steps, enough of them to reach
-      // FINALIZE_WARP_MIN_WARPS warps. Only slices that hold steps are launched, and the kernel
-      // derives the same stepsPerSlice from their number.
-      int const maxSlices =
-          std::min(numSteps, (FINALIZE_WARP_MIN_WARPS + data.numTokens - 1) / data.numTokens);
-      int const stepsPerSlice = (numSteps + maxSlices - 1) / maxSlices;
-      int const numSlices = (numSteps + stepsPerSlice - 1) / stepsPerSlice;
-      dim3 numBlocks((data.numTokens + warpsPerBlock - 1) / warpsPerBlock, numSlices);
-      LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelWarpPerToken, 1, numBlocks,
+      LAUNCH_EXPW(LAUNCH_FINALIZE_SINGLE_INPUT_PDL, data, finalizeKernelWarpPerToken, 1,
+                  warpPerTokenGrid(data, finalizeElemsPerVector),
                   /*numThreads=*/FINALIZE_WARP_THREADS, 0, stream);
     } else {
       FLASHINFER_CHECK(

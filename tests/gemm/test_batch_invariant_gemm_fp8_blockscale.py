@@ -521,16 +521,16 @@ def test_k_native_scale_staging_is_a_placement():
     seen = []
     real = compile_fp8bs.get_compiled_fp8bs
 
-    def recording(cfg, clusters, out_fmt="bf16", family="", native_k=False):
+    def recording(cfg, out_fmt="bf16", family="", native_k=False):
         seen.append(native_k)
-        return real(cfg, clusters, out_fmt, family, native_k)
+        return real(cfg, out_fmt, family, native_k)
 
     compile_fp8bs.get_compiled_fp8bs = recording
     try:
         for M, mode, want in ((16, "K", True), (128, "K", False), (16, "MN", False)):
             a, w, sa, sb = operands(M, 2048, 1024, seed=85)
             seen.clear()
-            bi_api._KERNELS.clear()  # the launch asks the compile again (its handle cache is per record and staging)
+            bi_api.clear_kernel_cache()  # the launch asks the compile again (its handle cache is per record and staging)
             api(a, w, sa, sb, mode)
             assert seen and all(v == want for v in seen), (M, mode, seen)
     finally:

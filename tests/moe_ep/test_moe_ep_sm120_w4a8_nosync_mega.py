@@ -248,7 +248,7 @@ def _worker(rank, args):
     # the nosync kernel reads the configured backend's packed FP4 weights, not a copy
     transformed = layer.base._transformed
     base_w13 = transformed.w1_fp4 if args.fallback == "cake" else transformed[0][0]
-    assert layer.nosync._get_transformed_weights().w13.data_ptr() == base_w13.data_ptr()
+    assert layer.nosync.get_transformed_weights().w13.data_ptr() == base_w13.data_ptr()
     for m_all in args.tokens:
         # uneven: ranks stage different row counts in the same call, one rank none
         m = (m_all, 0, max(m_all // 2, 1), 1)[rank % 4] if args.uneven else m_all
