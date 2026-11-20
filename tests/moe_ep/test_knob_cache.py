@@ -63,7 +63,8 @@ def test_live_tokens_distinguish_workloads(
     )
     with resources.as_file(source) as source_path:
         spec = importlib.util.spec_from_file_location(
-            "test_metadata_cache", source_path
+            f"flashinfer.moe_ep.kernel_src.{backend}.shim._test_metadata_cache",
+            source_path,
         )
         assert spec is not None and spec.loader is not None
         cache = importlib.util.module_from_spec(spec)

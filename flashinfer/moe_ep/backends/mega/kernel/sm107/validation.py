@@ -60,6 +60,10 @@ def make_workspace_config(
                 if getattr(k, "batch_invariant", False)
                 else {}
             ),
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
+            shared_expert=k.shared_expert,
+            combine_dedup=k.combine_dedup,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
             **block_scaled_batch_invariant_metadata(k),

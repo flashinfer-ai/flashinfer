@@ -42,9 +42,9 @@ def qk_tile(
     kv_cons,
     s_prod,
 ):
-    """``S = Q K^T`` of one tile: one ``D/16``-step fold per ring slot of K (one slot = the whole tile at D <= 128; two 64-key slots at
-    D = 256, each written to its own S columns by a 128 x 64 instruction -- the same per-element fold, ``ACCUMULATE`` off on its
-    first step); the slot is released as soon as its MMAs are issued (the release is the MMAs' completion)."""
+    """``S = Q K^T`` of one tile: one ``D/16``-step fold per ring slot of K (one slot = the whole tile; with half-tile slots each would be
+    written to its own S columns by a 128 x 64 instruction -- the same per-element fold, ``ACCUMULATE`` off on its first step); the
+    slot is released as soon as its MMAs are issued (the release is the MMAs' completion)."""
     sh = None
     for sl in cutlass.range_constexpr(st.slots_per_tile):
         kh = kv_cons.wait_and_advance()
@@ -364,10 +364,18 @@ def mma_loop_q2(
     kv_len: Int32,
 ):
     """The paired placement's MMA warp: one K / V stream over the union of the two tile ranges, each K and V tile consumed by both Q
-    tiles' folds. Issue order (a placement): ``QK_A(lo), QK_B(lo)``, then per tile t: ``QK_A(t+1), QK_B(t+1), PV_A(t), PV_B(t)`` -- QK one
-    tile ahead (P has its own TMEM columns, so S(t+1) only waits for the softmax's copy-out of S(t)); a fold is issued only for a tile in
-    its Q tile's range (a union tile outside both is loaded and released unused). Every fold is the one-tile body's: ``QK`` one
-    ``D / 16``-step block, ``PV`` reset at its Q tile's chunk starts (``chunk_blk`` against that tile's own ``tile_lo``)."""
+    tiles' folds. Issue order (a placement): ``QK_A(lo), QK_B(lo)``, then per tile t
+
+    * P in its own TMEM columns (D = 64): ``QK_A(t+1), QK_B(t+1), PV_A(t), PV_B(t)`` -- QK one tile ahead, S(t+1) only waits for the
+      softmax's copy-out of S(t); the ring holds ``K_{t+1}`` before ``V_t``;
+    * P over its own S stage (``st.p_over_s``, D = 128): ``PV_A(t), QK_A(t+1), PV_B(t), QK_B(t+1)`` -- the tensor core executes a CTA's
+      MMAs in order, so ``QK_k(t+1)`` overwrites ``P_k(t)`` only after ``PV_k(t)`` has read it (the two-stage body's argument); the ring
+      holds ``V_t`` before ``K_{t+1}``.
+
+    A fold is issued only for a tile in its Q tile's range (a union tile outside both is loaded and released unused). The Q stage is
+    released right after the unit's last QK, so the load warp fetches the next unit's Q tiles under the last PVs and the epilogue. Every
+    fold is the one-tile body's: ``QK`` one ``D / 16``-step block, ``PV`` reset at its Q tile's chunk starts (``chunk_blk`` against that
+    tile's own ``tile_lo``)."""
     TPC = st.tpc
     zeros8 = cute.make_rmem_tensor(cute.make_layout((8,)), IN_DTYPE)
     zeros8.fill(0.0)
@@ -393,50 +401,150 @@ def mma_loop_q2(
                 st, qk_mma, qk_low, tStS0, tSrQ, tSrK, qb, kh.index, s_prod_b
             )
         kh.release()
-        for t in range(lo, hi):
-            if t + 1 < hi:
-                kh2 = kv_cons.wait_and_advance()
-                if (t + 1 >= lo_a) & (t + 1 < hi_a):
-                    s_prod_a, qk_mma = qk_q2(
-                        st, qk_mma, qk_low, tStS0, tSrQ, tSrK, qa, kh2.index, s_prod_a
+        if hi == lo + 1:
+            qh.release()  # the unit's last QK is issued
+        if cutlass.const_expr(st.p_over_s):
+            for t in range(lo, hi):
+                vh = kv_cons.wait_and_advance()
+                zero_v_tail(st, sKV_flat, zeros8, t * st.T, vh.index, kv_len)
+                if (t >= lo_a) & (t < hi_a):
+                    p_cons_a, o_prod_a, pv_mma = pv_q2(
+                        st,
+                        pv_mma,
+                        pv_low,
+                        tOtOc_a,
+                        tOrP,
+                        tmem_ptr,
+                        tOrV,
+                        vh.index,
+                        chunk_blk(t, TPC, lo_a),
+                        p_cons_a,
+                        o_prod_a,
                     )
-                if (t + 1 >= lo_b) & (t + 1 < hi_b):
-                    s_prod_b, qk_mma = qk_q2(
-                        st, qk_mma, qk_low, tStS0, tSrQ, tSrK, qb, kh2.index, s_prod_b
+                if t + 1 < hi:
+                    kh2 = kv_cons.wait_and_advance()
+                    if (t + 1 >= lo_a) & (t + 1 < hi_a):
+                        s_prod_a, qk_mma = qk_q2(
+                            st,
+                            qk_mma,
+                            qk_low,
+                            tStS0,
+                            tSrQ,
+                            tSrK,
+                            qa,
+                            kh2.index,
+                            s_prod_a,
+                        )
+                    if (t >= lo_b) & (t < hi_b):
+                        p_cons_b, o_prod_b, pv_mma = pv_q2(
+                            st,
+                            pv_mma,
+                            pv_low,
+                            tOtOc_b,
+                            tOrP,
+                            tmem_ptr,
+                            tOrV,
+                            vh.index,
+                            chunk_blk(t, TPC, lo_b),
+                            p_cons_b,
+                            o_prod_b,
+                        )
+                    vh.release()
+                    if (t + 1 >= lo_b) & (t + 1 < hi_b):
+                        s_prod_b, qk_mma = qk_q2(
+                            st,
+                            qk_mma,
+                            qk_low,
+                            tStS0,
+                            tSrQ,
+                            tSrK,
+                            qb,
+                            kh2.index,
+                            s_prod_b,
+                        )
+                    kh2.release()
+                    if t + 2 == hi:
+                        qh.release()
+                else:
+                    if (t >= lo_b) & (t < hi_b):
+                        p_cons_b, o_prod_b, pv_mma = pv_q2(
+                            st,
+                            pv_mma,
+                            pv_low,
+                            tOtOc_b,
+                            tOrP,
+                            tmem_ptr,
+                            tOrV,
+                            vh.index,
+                            chunk_blk(t, TPC, lo_b),
+                            p_cons_b,
+                            o_prod_b,
+                        )
+                    vh.release()
+        else:
+            for t in range(lo, hi):
+                if t + 1 < hi:
+                    kh2 = kv_cons.wait_and_advance()
+                    if (t + 1 >= lo_a) & (t + 1 < hi_a):
+                        s_prod_a, qk_mma = qk_q2(
+                            st,
+                            qk_mma,
+                            qk_low,
+                            tStS0,
+                            tSrQ,
+                            tSrK,
+                            qa,
+                            kh2.index,
+                            s_prod_a,
+                        )
+                    if (t + 1 >= lo_b) & (t + 1 < hi_b):
+                        s_prod_b, qk_mma = qk_q2(
+                            st,
+                            qk_mma,
+                            qk_low,
+                            tStS0,
+                            tSrQ,
+                            tSrK,
+                            qb,
+                            kh2.index,
+                            s_prod_b,
+                        )
+                    kh2.release()
+                    if t + 2 == hi:
+                        qh.release()
+                vh = kv_cons.wait_and_advance()
+                zero_v_tail(st, sKV_flat, zeros8, t * st.T, vh.index, kv_len)
+                if (t >= lo_a) & (t < hi_a):
+                    p_cons_a, o_prod_a, pv_mma = pv_q2(
+                        st,
+                        pv_mma,
+                        pv_low,
+                        tOtOc_a,
+                        tOrP,
+                        tmem_ptr,
+                        tOrV,
+                        vh.index,
+                        chunk_blk(t, TPC, lo_a),
+                        p_cons_a,
+                        o_prod_a,
                     )
-                kh2.release()
-            vh = kv_cons.wait_and_advance()
-            zero_v_tail(st, sKV_flat, zeros8, t * st.T, vh.index, kv_len)
-            if (t >= lo_a) & (t < hi_a):
-                p_cons_a, o_prod_a, pv_mma = pv_q2(
-                    st,
-                    pv_mma,
-                    pv_low,
-                    tOtOc_a,
-                    tOrP,
-                    tmem_ptr,
-                    tOrV,
-                    vh.index,
-                    chunk_blk(t, TPC, lo_a),
-                    p_cons_a,
-                    o_prod_a,
-                )
-            if (t >= lo_b) & (t < hi_b):
-                p_cons_b, o_prod_b, pv_mma = pv_q2(
-                    st,
-                    pv_mma,
-                    pv_low,
-                    tOtOc_b,
-                    tOrP,
-                    tmem_ptr,
-                    tOrV,
-                    vh.index,
-                    chunk_blk(t, TPC, lo_b),
-                    p_cons_b,
-                    o_prod_b,
-                )
-            vh.release()
-    qh.release()
+                if (t >= lo_b) & (t < hi_b):
+                    p_cons_b, o_prod_b, pv_mma = pv_q2(
+                        st,
+                        pv_mma,
+                        pv_low,
+                        tOtOc_b,
+                        tOrP,
+                        tmem_ptr,
+                        tOrV,
+                        vh.index,
+                        chunk_blk(t, TPC, lo_b),
+                        p_cons_b,
+                        o_prod_b,
+                    )
+                vh.release()
+    else:
+        qh.release()
     return (
         q_cons,
         kv_cons,

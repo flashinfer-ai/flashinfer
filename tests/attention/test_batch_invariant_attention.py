@@ -477,6 +477,153 @@ def test_fingerprint_is_a_function_of_the_head_dim(op):
         bi.fingerprint(op, head_dim=128, page_size=16)
 
 
+def test_planner_unit_kind_rules():
+    """The ``auto`` unit-kind rules of the planner (placements: every kind computes the same bits): a multi-chunk tile of at most
+    ``INKERNEL_MAX_ROWS`` rows splits when the fused units would fill under 2 x SM, a wider (prefill) tile only when they would fill
+    under 1 / ``WIDE_SPLIT_SM_FRACTION`` of the SMs."""
+    from flashinfer.attention.batch_invariant import plan as P
+
+    # 4 requests x 4096 tokens of prefill at g = 4: 32 tokens per tile -> 128 wide tiles per request and kv head, 8 heads = 4096 tiles
+    qo = [0, 4096, 8192, 12288, 16384]
+    kv = [0, 256, 512, 768, 1024]
+    last = [16] * 4
+    wide = lambda sm: P.build_plan(qo, kv, last, 32, 8, 128, 16, sm_count=sm)  # noqa: E731
+    n_tiles = 4 * 128 * 8
+    assert wide(148).num_units == n_tiles
+    assert all(
+        d[P.F_MODE] == 0 for d in wide(n_tiles).desc
+    )  # the tiles fill the SMs once: fused
+    assert all(
+        d[P.F_MODE] == 0 for d in wide(4 * n_tiles).desc
+    )  # exactly 1 / 4 of the SMs: still fused
+    assert any(
+        d[P.F_MODE] == 1 for d in wide(4 * n_tiles + 1).desc
+    )  # under 1 / 4: split
+    # decode-sized tiles (one token per request, g = 4 -> 4 rows): split under 2 x SM
+    qo_d = list(range(0, 5))
+    narrow = lambda sm: P.build_plan(qo_d, kv, last, 32, 8, 128, 16, sm_count=sm)  # noqa: E731
+    assert any(d[P.F_MODE] == 1 for d in narrow(32).desc)  # 32 tiles < 64
+    assert all(d[P.F_MODE] == 0 for d in narrow(16).desc)  # 32 tiles >= 32
+
+
+def test_planner_snake_order():
+    """``snake_order``: a permutation of the longest-first list whose waves of ``grid`` units alternate direction, and the order
+    ``build_plan`` emits follows the launch grid (``grid``: the persistent CTAs, else the SM count)."""
+    from flashinfer.attention.batch_invariant import plan as P
+
+    units = [[i, 100 - i] for i in range(23)]  # descending "lengths"
+    out = P.snake_order(units, 5)
+    assert sorted(map(tuple, out)) == sorted(map(tuple, units))
+    for w, start in enumerate(range(0, 23, 5)):
+        wave = units[start : start + 5]
+        assert out[start : start + 5] == (wave[::-1] if w % 2 else wave), w
+    assert P.snake_order(units, 0) == units and P.snake_order([], 4) == []
+    qo = [0, 4096, 8192]
+    kv = [0, 256, 512]
+    last = [16, 16]
+    for sm, grid in ((148, 0), (148, 64), (1000, 0)):
+        plan = P.build_plan(qo, kv, last, 32, 8, 128, 16, sm_count=sm, grid=grid)
+        lengths = [d[P.F_TILE_HI] - d[P.F_TILE_LO] for d in plan.desc]
+        g = min(len(plan.desc), grid if grid else sm)
+        ref = P.snake_order(sorted(lengths, reverse=True), g)
+        assert lengths == ref, (sm, grid)
+
+
+def test_planner_swaps_unit_kinds():
+    """The Swaps-body unit-kind model (``plan.swaps_unit_kinds``; placements: every choice computes the same bits): every unit fused
+    on the grid of integral waves when the fused walk reaches the HBM rate, every multi-chunk unit split when there are too few units;
+    the per-CTA stream rate differs per head dim; non-Swaps batches keep the 2 x SM rule."""
+    from flashinfer.attention.batch_invariant import plan as P
+
+    SM = 212
+
+    def decode(B, L, D, sm=SM, swap=True, page=32, grid_search=True):
+        per = -(-L // page)
+        qo = list(range(B + 1))
+        kv = [b * per for b in range(B + 1)]
+        last = [L - (per - 1) * page] * B
+        return P.build_plan(
+            qo,
+            kv,
+            last,
+            32,
+            8,
+            D,
+            page,
+            sm_count=sm,
+            small_swap=swap,
+            swap_max_rows=8,
+            grid_search=grid_search,
+        )
+
+    def kinds(plan):
+        fused = sum(1 for d in plan.desc if d[P.F_MODE] == 0)
+        return fused, plan.num_units - fused, len(plan.groups), plan.grid
+
+    # D = 128, 16-chunk units: 128 units (B = 16) stream at the HBM rate fused on the default grid; 64 (B = 8) do not and split;
+    # 256 (B = 32) take two integral waves of 128 CTAs instead of 1.2 waves of 212; 512 (B = 64) five waves of 103
+    assert kinds(decode(16, 8192, 128)) == (128, 0, 0, 0)
+    assert kinds(decode(8, 8192, 128)) == (0, 1024, 64, 0)
+    assert kinds(decode(32, 8192, 128)) == (256, 0, 0, 128)
+    assert kinds(decode(64, 8192, 128)) == (512, 0, 0, 103)
+    assert kinds(decode(24, 8192, 128)) == (192, 0, 0, 96)
+    assert kinds(decode(1, 8192, 128)) == (0, 128, 8, 0)
+    # short fused units (two chunks) keep the default grid unless its last wave is nearly empty
+    assert kinds(decode(32, 1024, 128)) == (256, 0, 0, 128)
+    assert kinds(decode(64, 1024, 128)) == (512, 0, 0, 0)
+    assert kinds(decode(256, 1024, 128)) == (2048, 0, 0, 0)
+    # two-chunk units: fused from a few units up (the in-kernel fold and the first wave's burst), split at B = 1
+    assert kinds(decode(8, 1024, 128)) == (64, 0, 0, 0)
+    assert kinds(decode(1, 1024, 128)) == (0, 16, 8, 0)
+    # D = 64: a lone CTA streams at about half the D = 128 rate, so 128 units of 16 chunks split, and 512 units take three
+    # integral waves of 171 CTAs (above the D = 64 saturating count) rather than a split
+    assert kinds(decode(16, 8192, 64)) == (0, 2048, 128, 0)
+    assert kinds(decode(8, 1024, 64)) == (64, 0, 0, 0)
+    assert kinds(decode(64, 32768, 64)) == (512, 0, 0, 171)
+    # off the parts the grid model was fitted on (grid_search False: the engine's rule for every other part) the fused walk takes
+    # the full grid or the even-waves grid (no fitted constant) and a part-filled last wave never turns the batch into a split one:
+    # on 148 SMs 512 long units take four waves of 128 (74 with the fitted search), 320 units three waves of 107 (a thin third wave
+    # on the full grid), 192 units two waves of 96 at every head dim, 64 units their own 64 CTAs; one unit of 16 chunks still splits
+    assert kinds(decode(64, 8192, 128, sm=148, grid_search=False)) == (512, 0, 0, 128)
+    assert kinds(decode(64, 8192, 128, sm=148)) == (512, 0, 0, 74)
+    assert kinds(decode(40, 8192, 128, sm=148, grid_search=False)) == (320, 0, 0, 107)
+    assert kinds(decode(40, 2048, 128, sm=148, grid_search=False)) == (320, 0, 0, 107)
+    assert kinds(decode(24, 8192, 64, sm=148, grid_search=False)) == (192, 0, 0, 96)
+    assert kinds(decode(20, 8192, 128, sm=148, grid_search=False)) == (160, 0, 0, 80)
+    assert kinds(decode(8, 8192, 128, sm=148, grid_search=False)) == (64, 0, 0, 0)
+    assert kinds(decode(1, 8192, 128, sm=148, grid_search=False)) == (0, 128, 8, 0)
+    assert kinds(decode(256, 8192, 256, sm=148, grid_search=False)) == (2048, 0, 0, 147)
+    # the grid search terminates on parts of one or two SMs (the integral-wave grid is one CTA there) and never names a grid
+    # below one CTA or above the part
+    for sm in (1, 2, 3):
+        for D in (64, 128, 256):
+            for n in (1, 5, 64, 1000):
+                grids = P.swaps_fused_grids(n, sm, D)
+                assert grids and all(1 <= g <= sm for g in grids), (sm, D, n, grids)
+            assert decode(4, 32768, D, sm=sm).num_units > 0
+            assert decode(1, 8192, D, sm=sm).num_units > 0
+    assert kinds(decode(32, 8192, 64)) == (0, 4096, 256, 0)
+    # D = 256: a lone CTA streams faster, so 64 units fuse
+    assert kinds(decode(8, 8192, 256)) == (64, 0, 0, 0)
+    assert kinds(decode(32, 8192, 256)) == (256, 0, 0, 128)
+    # the decision follows the SM count (a launch parameter, never the bits): 128 units on a 1000-SM part split, 512 units on a
+    # 148-SM part take seven waves of 74
+    assert kinds(decode(16, 8192, 128, sm=1000))[0] == 0
+    assert kinds(decode(64, 8192, 128, sm=148)) == (512, 0, 0, 74)
+    # the fused grids: the default and every integral-wave grid above the floor, longest-first waves; the chosen one is the cheapest
+    assert P.swaps_fused_grids(512, SM, 128) == [212, 171, 128, 103]
+    assert P.swaps_fused_grids(128, SM, 128) == [128]
+    units = [(64, (16, 4, 4), 4)] * 512
+    costs = {
+        g: P.swaps_kind_cost(units, [False] * 512, g, SM, 128, 2)
+        for g in P.swaps_fused_grids(512, SM, 128)
+    }
+    assert min(costs, key=costs.get) == 103 and costs[103] < costs[212]
+    assert P.swaps_unit_kinds([], SM, 128, 2) == ([], 0)
+    # a non-Swaps batch (the row body's replicated placement) keeps the 2 x SM rule: 128 units split
+    assert kinds(decode(16, 8192, 128, swap=False)) == (0, 2048, 128, 0)
+
+
 def test_cache_key_covers_every_kernel_source():
     from flashinfer.batch_invariant.jit import relative_sources
 
@@ -505,6 +652,17 @@ def test_swaps_kernel_identity_carries_its_capacity():
     a = kernel_name(128, 8, 16, 8, False, cap=228 << 10)
     b = kernel_name(128, 8, 16, 8, False, cap=328 << 10)
     assert a != b and a.endswith("_c228") and b.endswith("_c328")
+
+
+def test_row_body_kernel_identity_carries_its_capacity():
+    """The row body's name carries the shared-memory capacity its smem plan is checked against (the paired placement at D = 128 fits
+    the 328 KB parts only), so a kernel compiled for one part is never loaded for another."""
+    from flashinfer.attention.batch_invariant.blocks.compile import kernel_name
+
+    a = kernel_name(128, 4, 16, 3, 2, True, False, cap=228 << 10)
+    b = kernel_name(128, 4, 16, 3, 2, True, False, cap=328 << 10)
+    assert a != b and a.endswith("_q2_c228") and b.endswith("_q2_c328")
+    assert kernel_name(128, 4, 16, 4) == "attn_d128_g4_p16_s4_w1"
 
 
 def test_unsupported_device_raises_before_any_kernel():
@@ -590,6 +748,72 @@ def test_determinism_and_graph_replay(D):
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(bits(out), ref)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_dependent_launch_chain_reads_the_predecessor(D):
+    """R1 under programmatic dependent launch: four decode steps whose query is the previous step's output, enqueued back to back
+    on one stream and captured as one CUDA graph, give the bits of the same steps run one at a time with a device synchronisation
+    between them. The attention kernel issues its loads only after the preceding grid has completed, so a dependent that is
+    scheduled early never reads a predecessor's unfinished output."""
+    from flashinfer.utils import device_support_pdl
+
+    pr = Problem([1, 1, 1, 1], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=21)
+    if not device_support_pdl(pr.device):
+        pytest.skip("this part has no programmatic dependent launch")
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    cache = pr.cache("NHD")
+    steps = 4
+    # one step at a time, no dependent launch, a synchronisation after each: the yardstick
+    q, ref = pr.q.clone(), []
+    for _ in range(steps):
+        q = w.run(q, cache, enable_pdl=False)
+        torch.cuda.synchronize()
+        ref.append(bits(q).clone())
+    # the same chain back to back as programmatic dependents
+    q, got = pr.q.clone(), []
+    for _ in range(steps):
+        q = w.run(q, cache, enable_pdl=True)
+        got.append(q)
+    torch.cuda.synchronize()
+    for t in range(steps):
+        assert torch.equal(bits(got[t]), ref[t]), t
+    # and captured as one CUDA graph over fixed buffers (the dependent-launch edges are captured with the kernels)
+    bufs = [torch.empty_like(pr.q) for _ in range(steps)]
+
+    def chain():
+        for t in range(steps):
+            w.run(pr.q if t == 0 else bufs[t - 1], cache, out=bufs[t], enable_pdl=True)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        chain()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            chain()
+    torch.cuda.synchronize()
+    for _ in range(3):
+        for b in bufs:
+            b.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        for t in range(steps):
+            assert torch.equal(bits(bufs[t]), ref[t]), t
 
 
 @needs_device
@@ -883,12 +1107,81 @@ def test_sm_count_and_grid_do_not_change_bits():
 
 
 @needs_device
+@pytest.mark.parametrize("decode", [True, False])
+def test_run_attention_runs_the_plan_s_kv_indptr(decode):
+    """The plan owns the page-table offsets: the descriptor table carries every request's first page-table entry and page count
+    next to its query offset and KV length, the kernels run with the plan's own kv_indptr, and run_attention accepts the array the
+    plan was built from or an equal copy (host or device) and rejects one that differs or has another length. The bits do not
+    depend on which equal tensor the caller passes."""
+    from flashinfer.attention.batch_invariant import engine
+
+    D = 128
+    pr = (
+        Problem([1] * 6, [900, 1500, 2100, 300, 4096, 777], 32, 8, D, 16, seed=23)
+        if decode
+        else Problem([200, 33, 1000], [2000, 500, 1000], 32, 8, D, 16, seed=24)
+    )
+    cfg = engine.default_config(D=D)
+    planned = engine.plan_attention(
+        pr.qo_indptr, pr.kv_indptr, pr.kv_last, 32, 8, D, 16, -1, cfg, None, pr.device
+    )
+    assert planned.kv_indptr is not None
+    assert torch.equal(planned.kv_indptr, pr.kv_indptr)
+    assert planned.kv_indptr.data_ptr() != pr.kv_indptr.data_ptr()  # a snapshot
+
+    def run(plan, kv_indptr):
+        return bits(
+            engine.run_attention(
+                plan,
+                pr.q,
+                pr.k_nhd,
+                pr.v_nhd,
+                kv_indptr,
+                pr.kv_indices,
+                1.0 / math.sqrt(D),
+                -1,
+                "NHD",
+                None,
+                cfg,
+            )
+        )
+
+    ref = run(planned, pr.kv_indptr)
+    wrapper = run_decode(pr)[0] if decode else run_paged_prefill(pr)
+    assert torch.equal(ref, bits(wrapper))
+    assert torch.equal(run(planned, planned.kv_indptr), ref)  # the snapshot itself
+    assert torch.equal(run(planned, pr.kv_indptr.clone()), ref)  # an equal copy
+    assert torch.equal(run(planned, pr.kv_indptr.cpu()), ref)  # the host array
+    from_host = engine.plan_attention(
+        pr.qo_indptr.cpu(),
+        pr.kv_indptr.cpu(),
+        pr.kv_last.cpu(),
+        32,
+        8,
+        D,
+        16,
+        -1,
+        cfg,
+        None,
+        pr.device,
+    )  # a plan built from host arrays (the wrappers' way) runs with the device array
+    assert torch.equal(run(from_host, pr.kv_indptr), ref)
+    with pytest.raises(ValueError, match="differs from the plan"):
+        run(
+            planned, pr.kv_indptr + 1
+        )  # the same page counts at moved offsets: another page table
+    with pytest.raises(ValueError, match="entries at run_attention"):
+        run(planned, pr.kv_indptr[:-1])
+
+
+@needs_device
 @pytest.mark.parametrize("D", [64, 128, 256])
 def test_config_agreement(D):
     """R3: every member of the configuration space (ring depth, unit kind, softmax warpgroups, fold placement, small-unit body)
     gives the same bits as the wrapper's pick; at D = 64 the paired placement too (two Q tiles per CTA), on a batch large enough
-    to be paired. The whole space at D = 128 / 256 (108 / 36 points); every 7th point of the 252 at D = 64 (each distinct kernel
-    is a compile)."""
+    to be paired, and at D = 128 on 328 KB parts (pairing forced with an SM count of one: the problem's units would not fill four
+    per SM; its rings, the split kind with both fold placements). The whole space at D = 128 / 256 (108 / 36 points); every 7th
+    point of the 252 at D = 64 (each distinct kernel is a compile)."""
     from dataclasses import replace
 
     from flashinfer.attention.batch_invariant import engine
@@ -901,10 +1194,21 @@ def test_config_agreement(D):
     ref = bits(run_paged_prefill(pr))
     space = engine.all_valid_configs(D)
     cfgs = list(space[::7] if D == 64 else space)
+    q2_sm = (
+        None  # the SM count the paired configurations plan with (None: the device's)
+    )
     if D == 64:
         two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
         rings = (2, 3) + ((4,) if arch_smem_cap(pr.device) >= (300 << 10) else ())
         cfgs += [replace(two, kv_slots=s) for s in rings]
+    elif D == 128 and arch_smem_cap(pr.device) >= (300 << 10):
+        two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
+        q2_sm = 1
+        cfgs += [
+            replace(two, kv_slots=s, split_policy=p, merge=m)
+            for s in (2, 3)
+            for p, m in (("auto", "auto"), ("split", "auto"), ("split", "inkernel"))
+        ]
     for cfg in cfgs:
         planned = engine.plan_attention(
             pr.qo_indptr,
@@ -918,6 +1222,7 @@ def test_config_agreement(D):
             cfg,
             None,
             pr.device,
+            sm_count=q2_sm if cfg.q2 else None,
         )
         if cfg.q2:
             assert planned.plan.num_launch is not None, (cfg, planned.plan.num_units)
@@ -944,6 +1249,213 @@ def test_sliding_window_prefill_equals_decode():
     dec, last = run_decode(pr, window_left=600)
     assert torch.equal(bits(pre[last]), bits(dec))
     assert torch.equal(bits(pre), bits(run_ragged_prefill(pr, window_left=600)))
+
+
+def _paired_d128(engine):
+    """The paired placement's configuration at D = 128 (the wrapper's pick on 328 KB parts)."""
+    from dataclasses import replace
+
+    return replace(
+        engine.default_config(D=128),
+        softmax_wgs=2,
+        q2=True,
+        kv_slots=engine.Q2_RING[128][True],
+    )
+
+
+@needs_device
+def test_paired_d128_sm_count_and_grid_do_not_change_bits():
+    """R3 for the paired placement at D = 128: the SM count decides whether the batch pairs at all (below four units per SM the
+    one-warpgroup body runs) and the unit kind, the grid how many CTAs walk the pairs; none of it reaches the bits."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.swaps.operands import arch_smem_cap
+
+    pr = Problem([256, 1000, 1], [3000, 2500, 8192], 32, 8, 128, 16, seed=7)
+    if arch_smem_cap(pr.device) < (300 << 10):
+        pytest.skip("the paired placement at D = 128 needs a 328 KB part")
+    ref = bits(run_paged_prefill(pr))
+    cfg = _paired_d128(engine)
+    paired = set()
+    for sm in (1, 8, 148, 1000):
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            sm_count=sm,
+        )
+        paired.add(planned.plan.num_launch is not None)
+        out = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+            -1,
+            "NHD",
+            None,
+            cfg,
+        )
+        assert torch.equal(bits(out), ref), sm
+    assert paired == {True, False}  # both the paired kernel and the fallback body ran
+    for grid in (1, 3, 64):
+        c = replace(cfg, grid=grid)
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            -1,
+            c,
+            None,
+            pr.device,
+            sm_count=1,
+        )
+        assert planned.plan.num_launch is not None
+        out = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+            -1,
+            "NHD",
+            None,
+            c,
+        )
+        assert torch.equal(bits(out), ref), grid
+
+
+@needs_device
+def test_paired_d128_ragged_window_and_pages():
+    """The paired placement at D = 128 over the ragged layout, a sliding window (the union of the two tiles' key ranges) and page
+    sizes 1 and 128 gives the one-warpgroup body's bits; tail tiles of at most 32 live rows take the full-row path there."""
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.swaps.operands import arch_smem_cap
+
+    if arch_smem_cap(torch.device("cuda")) < (300 << 10):
+        pytest.skip("the paired placement at D = 128 needs a 328 KB part")
+    cfg = _paired_d128(engine)
+
+    def paired(pr, ragged=False, window_left=-1):
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr_rag if ragged else pr.kv_indptr,
+            pr.kv_last,
+            pr.Hq,
+            pr.Hkv,
+            128,
+            pr.page,
+            window_left,
+            cfg,
+            None,
+            pr.device,
+            sm_count=1,
+            ragged=ragged,
+        )
+        assert planned.plan.num_launch is not None
+        if ragged:
+            k, v = pr.ragged("NHD")
+            return engine.run_attention(
+                planned,
+                pr.q,
+                k,
+                v,
+                pr.kv_indptr_rag,
+                torch.zeros(1, dtype=torch.int32, device=pr.device),
+                1.0 / math.sqrt(128),
+                window_left,
+                "NHD",
+                None,
+                cfg,
+                ragged=True,
+            )
+        return engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+            window_left,
+            "NHD",
+            None,
+            cfg,
+        )
+
+    pr = Problem([264, 33, 1, 129], [3000, 2500, 1000, 5000], 32, 8, 128, 16, seed=15)
+    ref = bits(run_paged_prefill(pr))
+    assert torch.equal(bits(paired(pr)), ref)
+    assert torch.equal(bits(paired(pr, ragged=True)), ref)
+    pr = Problem([256, 1, 2000], [1500, 2500, 5000], 32, 8, 128, 16, seed=9)
+    ref = bits(run_paged_prefill(pr, window_left=600))
+    assert torch.equal(bits(paired(pr, window_left=600)), ref)
+    for page in (1, 128):
+        pr = Problem([256, 1, 700], [3000, 2500, 1000], 32, 8, 128, page, seed=14)
+        assert torch.equal(bits(paired(pr)), bits(run_paged_prefill(pr)))
+
+
+@needs_device
+def test_wrapper_default_pairs_by_group_at_d64():
+    """The wrappers' default: the paired placement for prefill and ragged batches at D = 64 whose GQA group reaches
+    ``engine.Q2_DEFAULT_MIN_GROUP``; the one-warpgroup body for smaller groups, decode, and every batch at D = 128 (where the placement is
+    an explicit configuration). The table is the measured-faster body per (layout, group) on SM107."""
+    from flashinfer.attention.batch_invariant import engine
+
+    assert engine.Q2_DEFAULT_DIMS == (64,)
+    assert engine.Q2_DEFAULT_MIN_GROUP == {64: 4}
+    ws = workspace(torch.device("cuda"))
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    for D, Hq, expect in (
+        (64, 32, True),
+        (64, 16, False),
+        (64, 8, False),
+        (128, 32, False),
+    ):
+        pr = Problem([300, 1], [1000, 600], Hq, 8, D, 16, seed=22)
+        paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        paged.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            Hq,
+            8,
+            D,
+            16,
+            causal=True,
+            **kw,
+        )
+        ragged = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        ragged.plan(pr.qo_indptr, pr.kv_indptr_rag, Hq, 8, D, causal=True, **kw)
+        dec = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        dec.plan(pr.kv_indptr, pr.kv_indices, pr.kv_last, Hq, 8, D, 16, **kw)
+        assert paged._batch_invariant._config.q2 == expect, (D, Hq)
+        assert ragged._batch_invariant._config.q2 == expect, (D, Hq)
+        assert not dec._batch_invariant._config.q2, (D, Hq)
 
 
 @needs_device
@@ -1496,3 +2008,43 @@ def test_fixup_beyond_grid_y_limit():
         cfg,
     )
     assert torch.equal(bits(out), bits(ref))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128])
+def test_hardware_row_max_equals_the_register_tree(D, monkeypatch):
+    """The tile row maximum taken from the TMEM load (the parts that have the instruction) gives the bits of the register
+    tree, on finite rows and on rows whose scores hold NaN, +-inf and signed zeros: the maximum is exact and order-free, so
+    the placement reaches no value. Patching the gate selects the tree kernel for the comparison."""
+    from flashinfer.attention.batch_invariant import engine
+
+    dev = torch.device("cuda")
+    if not engine.hw_row_max_enabled(dev):
+        pytest.skip("this part has no hardware row maximum")
+    pr = Problem([300, 1000, 64], [700, 2500, 3000], 32, 8, D, 16, seed=3)
+    pr.q[5, 3, 7] = float("nan")
+    pr.q[310, 1, 0] = float("inf")
+    pr.q[311, 2, 1] = float("-inf")
+    pr.q[1300] = 0.0
+    hw = bits(run_paged_prefill(pr))
+    monkeypatch.setattr(engine, "hw_row_max_enabled", lambda device=None, D=128: False)
+    assert not engine.hw_row_max_enabled(dev)
+    tree = bits(run_paged_prefill(pr))
+    assert torch.equal(hw, tree)
+    assert torch.isnan(tree.view(torch.bfloat16).float()).any()
+
+
+@needs_device
+def test_hardware_row_max_is_a_head_dim_placement():
+    """The hardware row maximum is taken at D <= 128 only (the two-stage TMEM plan at D = 256 keeps the register tree), on the
+    parts that have the instruction; the D = 256 kernels are the tree kernels on every part, and a non-CUDA device never takes it."""
+    from flashinfer.attention.batch_invariant import engine
+
+    dev = torch.device("cuda")
+    assert not engine.hw_row_max_enabled(dev, 256)
+    assert (
+        engine.hw_row_max_enabled(dev, 128)
+        == engine.hw_row_max_enabled(dev, 64)
+        == engine.hw_row_max_enabled(dev)
+    )
+    assert engine.hw_row_max_enabled(torch.device("cpu"), 64) is False

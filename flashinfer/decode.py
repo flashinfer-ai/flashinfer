@@ -1737,7 +1737,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
     @property
     def resolved_backend(self) -> str:
-        r"""What the last :meth:`plan` resolved ``backend="auto"`` to: ``"cudnn"``
+        r"""The backend reported by this wrapper.
+
+        The last :meth:`plan` resolves ``backend="auto"`` to ``"cudnn"``
         when the auto rule picked cuDNN, the tensor-core pick (``"fa2"`` / ``"fa3"``)
         otherwise, ``"fa2"`` for the CUDA-core decode kernel. An explicit backend
         reports itself; a tensor-core ``auto`` wrapper reports ``"auto"`` before its
@@ -1825,6 +1827,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         device/stream selector for the underlying module query.  This method
         does not allocate buffers and does not mutate cached plan state.
 
+        This query is not available for ``cute-dsl``, ``trtllm-gen``, ``cudnn``,
+        or ``cutile`` backends and raises ``NotImplementedError`` for them.
+
         Parameters
         ----------
         indptr : torch.Tensor
@@ -1875,7 +1880,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size : Optional[int]
             The fixed split size for FA2 split-kv decode, in pages.
         disable_split_kv : bool
-            Whether to disable the split-kv for determinism in CUDA Graph. Defaults to ``False``.
+            Whether to disable split-KV on the ``fa2`` tensor-core path.
+            Defaults to ``False``. CUDA-core decode raises ``ValueError``
+            when this is ``True``.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
 
@@ -1945,9 +1952,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             disable_split_kv=disable_split_kv,
         ):
             backend = "cudnn"
-        if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
+        if backend in ("cute-dsl", "trtllm-gen", "cudnn", "cutile"):
             raise NotImplementedError(
                 f"workspace_size is not available for decode backend {backend!r}"
+            )
+
+        if disable_split_kv and not self.use_tensor_cores:
+            raise ValueError(
+                "disable_split_kv is not supported by CUDA-core decode; "
+                "use use_tensor_cores=True with backend='fa2'."
             )
 
         if fixed_split_size is not None and not self.use_tensor_cores:
@@ -2213,7 +2226,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
-            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+            Whether to disable split-KV on the ``fa2`` tensor-core or
+            ``cute-dsl`` backend. Defaults to ``False``. CUDA-core decode
+            raises ``ValueError`` when this is ``True``. The ``cutile``
+            backend currently ignores this flag.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``. This
             must be set at :meth:`plan` time to enable the XQA MTP decode fast
@@ -2457,7 +2473,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         # backend="auto" may resolve to cudnn; decided per plan() so that the
         # q_len_per_req / buffer checks below already know the path.
-        self._cudnn_auto = self._auto_prefers_cudnn(
+        cudnn_auto = self._auto_prefers_cudnn(
             q_data_type,
             kv_data_type,
             o_data_type,
@@ -2474,6 +2490,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+        if (
+            disable_split_kv
+            and not self.use_tensor_cores
+            and not (self._backend == "cudnn" or cudnn_auto)
+            and self._backend != "cutile"
+        ):
+            raise ValueError(
+                "disable_split_kv is not supported by CUDA-core decode; "
+                "use use_tensor_cores=True with backend='fa2'."
+            )
+        # A rejected split option must leave the previous plan's route intact.
+        self._cudnn_auto = cudnn_auto
         if self.is_cuda_graph_enabled:
             # The resolved backend is part of the frozen CUDA-graph shape: a
             # captured graph replays the kernels it was captured with, and
@@ -4507,7 +4535,7 @@ def trtllm_batch_decode_with_kv_cache(
 
     enable_pdl : Optional[bool] = None
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
-        When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
+        When set to ``None``, PDL is enabled automatically on supported device architectures.
 
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa``/``trtllm-gen`` or
@@ -4565,8 +4593,8 @@ def trtllm_batch_decode_with_kv_cache(
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
 
     lse : Optional[torch.Tensor] = None
-        Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, only supported
-        by the ``trtllm-gen`` backend. Must have shape ``[num_tokens, num_qo_heads]``
+        Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, supported
+        by the ``trtllm-gen`` and ``cake`` backends. Must have shape ``[num_tokens, num_qo_heads]``
         and dtype ``torch.float32``. If provided, the tensor is filled regardless of
         :attr:`return_lse`. If ``return_lse`` is True and this is None, a buffer will
         be allocated internally.
@@ -5691,6 +5719,11 @@ def fast_decode_plan(
     cuDNN uses the regular planner to refresh its KV lengths and block table;
     compatible prepared graphs are still reused. The copy-elision below is
     specific to the FA2/FA3 module, not cuDNN's metadata contract.
+
+    Outside CUDA graphs, ``indptr``, ``indices`` and ``last_page_len`` become the
+    wrapper's buffers without copying, so they must already be on the wrapper's
+    device; a ``ValueError`` is raised otherwise. Use
+    :meth:`BatchDecodeWithPagedKVCacheWrapper.plan` to plan with host metadata.
     """
     # Normalized: kernels read these as raw pointers (#5260); no-op when contiguous.
     indptr = indptr.contiguous()
@@ -5782,6 +5815,11 @@ def fast_decode_plan(
             disable_split_kv=disable_split_kv,
             q_len_per_req=q_len_per_req,
         )
+    if disable_split_kv and not self.use_tensor_cores:
+        raise ValueError(
+            "disable_split_kv is not supported by CUDA-core decode; "
+            "use use_tensor_cores=True with backend='fa2'."
+        )
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
     if q_len_per_req > 1 and not self.use_tensor_cores:
@@ -5823,6 +5861,22 @@ def fast_decode_plan(
                 f"this wrapper was planned with {frozen_q_len}, got "
                 f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
             )
+    if not self.is_cuda_graph_enabled:
+        # Outside CUDA graphs the metadata tensors become the wrapper's
+        # buffers as-is and run() hands their pointers to the kernel, so they
+        # must already be on the wrapper's device; plan() is the path that
+        # copies host metadata over. Checked before any plan state changes.
+        for name, tensor in (
+            ("indptr", indptr),
+            ("indices", indices),
+            ("last_page_len", last_page_len),
+        ):
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} must be on the wrapper's device {self.device}, got "
+                    f"{tensor.device}; plan host metadata with "
+                    "BatchDecodeWithPagedKVCacheWrapper.plan(wrapper, ...)"
+                )
     is_causal = q_len_per_req > 1
     self._q_len_per_req = q_len_per_req
     if logits_soft_cap is None:

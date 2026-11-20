@@ -711,6 +711,85 @@ def test_moe_raw_op_rejects_clamped_relu2_on_deepseek_blockscale():
         )
 
 
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "input",
+        "token_selected_experts",
+        "token_final_scales",
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_expert_biases",
+        "fc2_expert_biases",
+        "output",
+    ],
+)
+@pytest.mark.parametrize("layout", ["padded_rows", "strided_columns"])
+@pytest.mark.parametrize("entrypoint", ["public", "registered"])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_rejects_noncontiguous_operands(argument, layout, entrypoint):
+    torch.manual_seed(0)
+    tokens, hidden, inter, experts, top_k = 16, 128, 128, 4, 2
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) / 5
+    w1 = torch.randn(experts, 2 * inter, hidden, device="cuda", dtype=x.dtype) / 5
+    w2 = torch.randn(experts, hidden, inter, device="cuda", dtype=x.dtype) / 5
+    weights, ids = compute_routing(torch.randn(tokens, experts, device="cuda"), top_k)
+    ids = ids.to(torch.int32)
+    expected = compute_with_experts(experts, x, w1, w2, ids, weights)
+    args = dict(
+        input=x,
+        token_selected_experts=ids,
+        token_final_scales=weights,
+        fc1_expert_weights=w1,
+        fc2_expert_weights=w2,
+        fc1_expert_biases=None,
+        fc2_expert_biases=None,
+        output=torch.empty_like(x),
+        output_dtype=x.dtype,
+        quant_scales=[],
+        enable_pdl=False,
+        profile_ids=[-1, -1],
+    )
+    major, minor = get_compute_capability(x.device)
+    call = (
+        fused_moe.cutlass_fused_moe
+        if entrypoint == "public"
+        else get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe
+    )
+    if argument in ("fc1_expert_biases", "fc2_expert_biases"):
+        args["fc1_expert_biases"] = torch.zeros(
+            experts, 2 * inter, device=x.device, dtype=x.dtype
+        )
+        args["fc2_expert_biases"] = torch.zeros(
+            experts, hidden, device=x.device, dtype=x.dtype
+        )
+    call(**args)
+    torch.testing.assert_close(args["output"], expected, rtol=1e-2, atol=1e-2)
+
+    original = args[argument]
+    storage = torch.empty(
+        (*original.shape[:-1], original.shape[-1] * 2),
+        device=original.device,
+        dtype=original.dtype,
+    )
+    view = (
+        storage[..., : original.shape[-1]]
+        if layout == "padded_rows"
+        else storage[..., ::2]
+    )
+    view.copy_(original)
+    assert not view.is_contiguous()
+    args[argument] = view
+    with pytest.raises(
+        (ValueError, RuntimeError), match=f"{argument}.*must be contiguous"
+    ):
+        call(**args)
+
+    args[argument] = view.contiguous()
+    call(**args)
+    torch.testing.assert_close(args["output"], expected, rtol=1e-2, atol=1e-2)
+
+
 def compute_with_experts_gelu_tanh(
     num_experts,
     x,
@@ -3920,6 +3999,20 @@ def test_moe_bf16_mxfp4_hopper_correctness(
     _run_w4a16_moe_hopper(
         batch_size, hidden_size, num_experts, top_k, intermediate_size
     )
+
+
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="Mixed-input MoE epilogue policies require SM90",
+)
+@pytest.mark.parametrize("intermediate_size", [3072, 3200])
+def test_moe_bf16_mxfp4_hopper_epilogue_k_boundary(intermediate_size):
+    # FC1 stays above the H20 threshold while FC2 exercises the threshold and
+    # an aligned K above it. Both share the maximum-workspace allocation.
+    # Use the same numerical coverage criterion as the other large W4A16
+    # cases: BF16 cancellation near zero can exceed the strict per-element
+    # reference tolerance even in the unmodified generic implementation.
+    _run_w4a16_moe_hopper(16, 4096, 4, 2, intermediate_size, strict_correctness=False)
 
 
 @pytest.mark.skipif(

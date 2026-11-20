@@ -1,6 +1,6 @@
 """XQA decode tests extracted from ``test_trtllm_gen_attention_decode.py``.
 
-Split out so the CI parallel runner (``scripts/task_run_unit_tests.sh``)
+Split out so the CI parallel runner (``scripts/infra/task_run_unit_tests.sh``)
 schedules the ``backend="xqa"`` variant of ``test_trtllm_batch_decode`` on
 its own GPU, parallel with the ``backend="trtllm-gen"`` variant (which
 stays in ``test_trtllm_gen_attention_decode.py``) and the prefill shard.

@@ -1090,6 +1090,13 @@ def _bmm_fp8_reference(A, B, A_scale, B_scale, dtype):
     return torch.matmul(A_f, B_f).to(dtype)
 
 
+def _bmm_fp8_bias_reference(A, B, A_scale, B_scale, dtype, bias):
+    """Reference per-tensor FP8 BMM with a bias: dequantize, matmul, add the bias."""
+    A_f = A.to(torch.float32) * A_scale.to(torch.float32)
+    B_f = B.to(torch.float32) * B_scale.to(torch.float32)
+    return (torch.matmul(A_f, B_f) + bias.to(torch.float32)).to(dtype)
+
+
 def _bmm_mxfp8_reference(A, B, A_scale, B_scale, dtype):
     """Reference MXFP8 BMM (block size 32, 1D 128x4-swizzled E8M0 scales)."""
     block = 32
@@ -1215,6 +1222,34 @@ bmm_fp8_trace = TraceTemplate(
     init=_bmm_fp8_init,
 )
 bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
+
+# A separate definition, so the unbiased one and the solutions written for it
+# (called with one positional argument per input) stay as they are.
+bmm_fp8_bias_trace = TraceTemplate(
+    op_type="bmm_fp8",
+    name_prefix="bmm_fp8_bias",
+    description=bmm_fp8_trace.description
+    + " A bias of length N is added to every row.",
+    axes=dict(bmm_fp8_trace.axes),
+    inputs={
+        **bmm_fp8_trace.inputs,
+        "bias": Tensor(["N"], description="Output dtype; shared by every batch."),
+    },
+    outputs=dict(bmm_fp8_trace.outputs),
+    tags=list(bmm_fp8_trace.tags),
+    reference=_bmm_fp8_bias_reference,
+    check=_gemm_check,
+)
+
+
+def bmm_fp8_trace_dispatch(**kwargs):
+    """Return the TraceTemplate for a ``bmm_fp8`` call: the bias variant when a
+    bias is given. Pass as ``trace=bmm_fp8_trace_dispatch`` to ``@flashinfer_api``.
+    """
+    return bmm_fp8_bias_trace if kwargs.get("bias") is not None else bmm_fp8_trace
+
+
+bmm_fp8_trace_dispatch.templates = [bmm_fp8_trace, bmm_fp8_bias_trace]  # type: ignore[attr-defined]
 
 
 def _bmm_mxfp8_init(

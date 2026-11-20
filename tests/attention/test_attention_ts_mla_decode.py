@@ -370,6 +370,7 @@ def _fp8_request_reference(
     splits_kv: int,
     softmax_rescale_threshold_log2: float = 0.0,
     freeze: bool = True,
+    visible_kv_len: int | None = None,
 ) -> torch.Tensor:
     """Model E4M3 P across split-local KV instruction streams.
 
@@ -394,6 +395,14 @@ def _fp8_request_reference(
         + q_stored[:, _LATENT_DIM:] @ cache_stored[:, _LATENT_DIM:].T
     )
     num_qo_heads, seq_len = scores.shape
+    visible = seq_len if visible_kv_len is None else visible_kv_len
+    if not 0 <= visible <= seq_len:
+        raise ValueError("visible_kv_len must be within the raw KV sequence")
+    if visible == 0:
+        return torch.zeros(
+            (num_qo_heads, _LATENT_DIM), dtype=torch.float32, device=scores.device
+        )
+    # Mask inside raw-KV split streams; trimming K changes FP8 quantization.
     num_tiles = (seq_len + tile_size_kv - 1) // tile_size_kv
     tiles_per_group = splits_kv * num_insts_kv
     groups_per_split = (num_tiles + tiles_per_group - 1) // tiles_per_group
@@ -420,7 +429,9 @@ def _fp8_request_reference(
     for stream_idx, tile_indices in enumerate(stream_tiles):
         for tile_idx in tile_indices:
             begin = tile_idx * tile_size_kv
-            end = min(begin + tile_size_kv, seq_len)
+            if begin >= visible:
+                continue
+            end = min(begin + tile_size_kv, visible)
             tile_scores = scores[:, begin:end]
             local_max = tile_scores.max(dim=-1).values
             new_max = (
@@ -1205,6 +1216,75 @@ def _empty_mla_runtime() -> mla_decode_module._MLARuntime:
     )
 
 
+def test_attention_ts_mla_trusted_workspace_size(monkeypatch):
+    """Trusted sizing reuses the same policy without repeated host checks."""
+    from contextlib import nullcontext
+    from flashinfer.attention.prims_ts import _hardware
+
+    monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+    monkeypatch.setattr(
+        mla_decode_module, "get_max_active_clusters", lambda size: 148 // size
+    )
+    monkeypatch.setattr(_hardware, "get_max_active_clusters", lambda size: 148 // size)
+    monkeypatch.setattr(mla_decode_module, "get_device_sm_count", lambda *_: 148)
+    args = dict(
+        batch_size=2,
+        num_qo_heads=96,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        page_size=128,
+        max_q_len=8,
+        max_kv_len=8192,
+        q_dtype=_FP8,
+        cp_world=8,
+        cp_interleave_size=128,
+        device="cuda:0",
+    )
+    cache = mla_decode_module._resolve_mla_decode_launch_spec
+    cache.cache_clear()
+    try:
+        # A cold trusted call must still populate the ordinary policy cache.
+        expected = get_prims_ts_batch_mla_decode_workspace_size(**args, validate=False)
+        before = cache.cache_info()
+        assert get_prims_ts_batch_mla_decode_workspace_size(**args) == expected
+
+        def unexpected_check(*_args, **_kwargs):
+            pytest.fail("trusted workspace sizing must not repeat validation")
+
+        for name in (
+            "_validate_positive_int",
+            "_validate_mla_dims",
+            "_validate_page_size",
+            "_validate_mla_max_kv_len",
+            "_validate_mla_query_head_extent",
+            "_validate_mask",
+            "_validate_mla_dtype_pair",
+            "_validate_runtime_device",
+            "_make_mla_workspace_layout",
+        ):
+            monkeypatch.setattr(mla_decode_module, name, unexpected_check)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_check)
+        assert (
+            get_prims_ts_batch_mla_decode_workspace_size(**args, validate=False)
+            == expected
+        )
+        after = cache.cache_info()
+        assert after.misses == before.misses == 1
+        assert after.currsize == before.currsize == 1
+        assert after.hits == before.hits + 2
+        with pytest.raises(TypeError, match="cp_world"):
+            get_prims_ts_batch_mla_decode_workspace_size(
+                **(args | {"cp_world": True}), validate=False
+            )
+        with pytest.raises(ValueError, match="cp_world.*cp_interleave_size"):
+            get_prims_ts_batch_mla_decode_workspace_size(
+                **(args | {"cp_interleave_size": 2**30}), validate=False
+            )
+    finally:
+        cache.cache_clear()
+
+
 def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
     """Keep kernel policy automatic and the public signatures explicit."""
 
@@ -1272,6 +1352,9 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "softmax_scale",
         "output_scale",
         "lse_mode",
+        "cp_world",
+        "cp_interleave_size",
+        "zero_empty_rows",
         "workspace_buffer",
         "validate",
         "tuning",
@@ -1291,6 +1374,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "block_tables",
         "seq_lens_kv",
         "qo_indptr",
+        "cp_rank",
     ):
         assert request_metadata not in plan_parameters
 
@@ -1303,6 +1387,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "seq_lens_kv",
         "qo_indptr",
         "max_q_len",
+        "cp_rank",
         "softmax_scale",
         "output_scale",
         "out",
@@ -1315,6 +1400,21 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["qo_indptr"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
+    assert plan_parameters["cp_world"].default == 1
+    assert plan_parameters["cp_interleave_size"].default == 1
+    assert plan_parameters["zero_empty_rows"].default is True
+    assert run_parameters["cp_rank"].default == 0
+    assert run_parameters["cp_rank"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "cp_rank" not in mla_decode_module._MLADecodeCompileSpec.__dataclass_fields__
+    for surface in (
+        BatchMLADecodePagedTSWrapper.plan,
+        BatchMLADecodePagedTSWrapper.run,
+        batch_mla_decode_with_paged_kv_cache,
+        get_prims_ts_batch_mla_decode_workspace_size,
+    ):
+        assert {"kv_bounds", "use_kv_bounds", "seq_lens_kv_global"}.isdisjoint(
+            inspect.signature(surface).parameters
+        )
 
 
 def test_attention_ts_mla_decode_wrapper_trace_names_softmax_rescale_threshold_log2():
@@ -1386,6 +1486,8 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
         max_kv_len=64,
         kv_lora_rank=_LATENT_DIM,
         qk_rope_head_dim=_ROPE_DIM,
+        cp_world=1,
+        cp_interleave_size=1,
     )
     for required_name in ("block_tables", "seq_lens_kv", "qo_indptr"):
         incomplete_kwargs = dict(kwargs)
@@ -1494,8 +1596,10 @@ def test_attention_ts_mla_run_requires_plan():
         wrapper.run(None, None, None, None)
 
 
+@pytest.mark.parametrize("cp_world", (1, 8))
 def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
     monkeypatch,
+    cp_world,
 ):
     """Leave validation outside compiled and captured MLA run regions."""
 
@@ -1518,9 +1622,12 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         lse_mode="none",
         softmax_scale=1.0,
         output_scale=1.0,
+        cp_world=cp_world,
+        cp_interleave_size=128,
     )
     runtime = _empty_mla_runtime()
     sentinel = torch.empty(1)
+    cp_rank = cp_world - 1
 
     def fail_validation(*args, **kwargs):
         pytest.fail("validate=False must bypass explicit runtime validators")
@@ -1530,6 +1637,7 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         return runtime
 
     def launch(*args, **kwargs):
+        assert kwargs["cp_rank"] == cp_rank
         return sentinel
 
     monkeypatch.setattr(mla_decode_module, "_prepare_mla_runtime", prepare_runtime)
@@ -1537,11 +1645,77 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         mla_decode_module, "_validate_mla_run_metadata", fail_validation
     )
     monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", launch)
+    monkeypatch.setattr(torch.Tensor, "tolist", fail_validation)
+    monkeypatch.setattr(torch.Tensor, "item", fail_validation)
 
     tensor = torch.empty((1, 1, 8, _LATENT_DIM + _ROPE_DIM))
-    assert wrapper.run(tensor, tensor, tensor, tensor, validate=False) is sentinel
+    assert (
+        wrapper.run(
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            validate=False,
+            cp_rank=cp_rank,
+        )
+        is sentinel
+    )
     with pytest.raises(TypeError, match="validate must be a bool"):
         wrapper.run(tensor, tensor, tensor, tensor, validate=0)
+    for bad_rank in (-1, cp_world):
+        with pytest.raises(ValueError, match="cp_rank"):
+            wrapper.run(
+                tensor, tensor, tensor, tensor, cp_rank=bad_rank, validate=False
+            )
+    with pytest.raises(TypeError, match="cp_rank"):
+        wrapper.run(tensor, tensor, tensor, tensor, cp_rank=True, validate=False)
+
+
+def test_attention_ts_mla_cp_metadata_validates_actual_rank_capacity(monkeypatch):
+    """Global lengths may exceed local capacity; active pages depend on rank."""
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_validate_mla_metadata",
+        lambda *_: (torch.device("cpu"), 2, 1),
+    )
+    monkeypatch.setattr(mla_decode_module, "_validate_qo_indptr", lambda *_, **__: None)
+    runtime = replace(
+        _empty_mla_runtime(), query=torch.empty((11, 96, 576)), num_physical_pages=2
+    )
+    kwargs = dict(
+        device=torch.device("cpu"),
+        batch_size=2,
+        required_page_columns=1,
+        packed_query=True,
+        max_q_len=8,
+        max_kv_len=128,
+        page_size=128,
+        mask_type="causal",
+        cp_world=8,
+        cp_interleave_size=128,
+    )
+    tables = torch.tensor([[-1], [1]], dtype=torch.int32)
+    lengths = torch.tensor([131, 1031], dtype=torch.int32)
+    offsets = torch.tensor([0, 3, 11], dtype=torch.int32)
+    assert (
+        mla_decode_module._validate_mla_run_metadata(
+            runtime, tables, lengths, offsets, cp_rank=7, **kwargs
+        )
+        == 8
+    )
+    with pytest.raises(ValueError, match="local request longer than max_kv_len"):
+        mla_decode_module._validate_mla_run_metadata(
+            runtime, tables, lengths, offsets, cp_rank=0, **kwargs
+        )
+    # A padded all-empty request may retain Q rows and invalid unused page IDs.
+    lengths.zero_()
+    tables.fill_(-1)
+    assert (
+        mla_decode_module._validate_mla_run_metadata(
+            runtime, tables, lengths, offsets, cp_rank=7, **kwargs
+        )
+        == 8
+    )
 
 
 def test_attention_ts_mla_explicit_split_preserves_explicit_profile():

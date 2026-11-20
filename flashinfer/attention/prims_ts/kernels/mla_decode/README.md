@@ -122,3 +122,30 @@ bounds; runs bind live metadata and reuse scratch. See the shared
 [planning contract](../../README.md#reusable-plans),
 [runtime split-KV policy](../../README.md#runtime-split-kv-policy), and
 [final statistics contract](../../README.md#final-statistics-and-sink-semantics).
+
+## Context-parallel local-KV prefixes
+
+Dense MLA specializes `cp_world` and `cp_interleave_size` when planning, and
+takes `cp_rank` as a runtime scalar. `seq_lens_kv` always contains global
+logical lengths, including the current Q tokens. The page table, cache, planned
+`max_kv_len`, and split/workspace capacity remain rank-local.
+
+For interleave size I and CP size C, a global prefix n contains
+`n//(I*C)*I + clamp(n%(I*C)-cp_rank*I, 0, I)` tokens on this rank. Dense
+attention maps the full global length G. Bottom-right causal attention maps
+`G-actual_Q+i+1` for logical query token i; packed Q obtains actual_Q from
+`qo_indptr`, not the planned maximum. All heads of a token share its bound.
+The same conversion governs producer domains, split ownership, and row masks.
+No per-query bounds tensor or bounds-materialization launch is required.
+
+`plan(zero_empty_rows=True)` (the default) initializes empty local rows to zero
+O and optional LSE `-inf`, including requests whose ordinary main schedule
+skips all local work. `zero_empty_rows=False` omits this neutral writer.
+Empty-row results are then unspecified, not guaranteed preserved; initialize
+them or exclude them from merging. A rank with no local tokens does not need
+valid page IDs. Static local K/V capacity remains positive; the one-shot API
+uses a minimum capacity of one for an all-empty rank.
+
+CP=1 preserves ordinary non-CP behavior and has no neutral-writer launch.
+Sparse/NVFP4 entry points remain outside this option's scope. CP adds no
+workspace and does not alter the public return type or optional-LSE contract.

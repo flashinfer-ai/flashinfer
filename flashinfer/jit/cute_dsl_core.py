@@ -115,6 +115,14 @@ class JitSpecCuteDsl(JitSpec):
     reloaded as a TVM-FFI function; False for a kernel compiled without it,
     exported as a plain object file and reloaded as a CuTe-DSL compiled
     function that takes the same arguments as the in-process one.
+
+    ``export_compile_fn``, when given, compiles the same kernel without the
+    DSL's execution engine (``cute.compile(..., no_jit_engine=True)``). The
+    disk-cache path exports the compiled object and reloads it, so the
+    engine, its entry lookup and the TVM-FFI link of the in-process kernel
+    are work it never uses; the exported object is the same. ``compile_fn``
+    still runs when the export fails (an engine-less kernel cannot run) and
+    when the cache is disabled.
     """
 
     toolchain = "cute_dsl"
@@ -128,10 +136,12 @@ class JitSpecCuteDsl(JitSpec):
         *,
         enable_tvm_ffi: bool = True,
         target_arch: Optional[str] = None,
+        export_compile_fn: Optional[Callable[[], Any]] = None,
     ):
         self.module_name = module_name
         self.kernel_name = sanitize_symbol_name(kernel_name)
         self.compile_fn = compile_fn
+        self.export_compile_fn = export_compile_fn
         self.enable_tvm_ffi = enable_tvm_ffi
         arch = (
             _get_compile_arch()
@@ -208,8 +218,15 @@ class JitSpecCuteDsl(JitSpec):
             shutil.rmtree(self.module_dir, ignore_errors=True)
 
         logger.info(f"Compiling CuTe-DSL kernel {self.name}")
-        self._compiled_kernel = self.compile_fn()
-        self._export_best_effort()
+        if self.export_compile_fn is None:
+            self._compiled_kernel = self.compile_fn()
+            self._export_best_effort()
+            return
+        # The exported object is what load() hands back: compile without the
+        # execution engine, and again with one only if the export fails.
+        self._compiled_kernel = self.export_compile_fn()
+        exported = self._export_best_effort(recompile_on_failure=True)
+        self._compiled_kernel = None if exported else self.compile_fn()
 
     def compile_and_persist(self) -> None:
         """Compile outside the module lock; commit the artifact under it.
@@ -223,8 +240,11 @@ class JitSpecCuteDsl(JitSpec):
         from filelock import FileLock
 
         started = time.perf_counter()
-        self._compiled_kernel = self.compile_fn()
+        # Only the export is wanted here: no execution engine when the
+        # caller provides the engine-less compile.
+        self._compiled_kernel = (self.export_compile_fn or self.compile_fn)()
         _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
+        exported = False
         with FileLock(self.lock_path, thread_local=False):
             if (
                 self.module_dir.exists()
@@ -234,18 +254,30 @@ class JitSpecCuteDsl(JitSpec):
                     f"Invalidating stale CuTe-DSL module {self.module_dir_name}"
                 )
                 shutil.rmtree(self.module_dir, ignore_errors=True)
-            self._export_best_effort()
+            exported = self._export_best_effort()
+        if self.export_compile_fn is not None:
+            # the exported object is what load() hands back; an engine-less
+            # kernel cannot run, so without one compile again with the engine
+            self._compiled_kernel = None if exported else self.compile_fn()
 
-    def _export_best_effort(self) -> None:
+    def _export_best_effort(self, *, recompile_on_failure: bool = False) -> bool:
         self._export_failed = False
         try:
             self._export()
+            return True
         except Exception as e:  # noqa: BLE001 -- persistence is best-effort
             self._export_failed = True
+            suffix = (
+                "Compiling it again with an execution engine; the kernel "
+                "will be recompiled next run."
+                if recompile_on_failure
+                else "The kernel will be recompiled next run."
+            )
             logger.warning(
                 f"Failed to persist CuTe-DSL kernel {self.name} to "
-                f"{self.object_path}: {e}. The kernel will be recompiled next run."
+                f"{self.object_path}: {e}. {suffix}"
             )
+            return False
 
     def load(self) -> Any:
         """Load the exported artifact or return the in-process kernel.
@@ -329,6 +361,8 @@ def build_and_load_cute_dsl_kernel(
     *,
     enable_tvm_ffi: bool = True,
     target_arch: Optional[str] = None,
+    export_compile_fn: Optional[Callable[[], Any]] = None,
+    source_sha256: Optional[str] = None,
 ) -> Any:
     """Compile a CuTe-DSL kernel with a persistent on-disk cache.
 
@@ -356,6 +390,13 @@ def build_and_load_cute_dsl_kernel(
     target_arch : str, optional
         Explicit GPU architecture used by ``compile_fn``. When omitted, use
         the CuTe-DSL environment or current device to key the artifact.
+    export_compile_fn : Optional[Callable[[], Any]]
+        ``compile_fn`` without the DSL's execution engine, for the exported
+        object (see :class:`JitSpecCuteDsl`).
+    source_sha256 : Optional[str]
+        The hash of ``extra_key_files`` when the caller keeps it across the
+        kernels of a module (``_hash_source_files(extra_key_files)``);
+        computed here when None.
 
     Returns
     -------
@@ -369,14 +410,15 @@ def build_and_load_cute_dsl_kernel(
     # If any key source is unreadable (missing file, __file__ unavailable
     # under exotic packaging), bypass the disk cache rather than skipping the
     # file from the hash: a weakened key could serve stale artifacts.
-    try:
-        source_sha256 = _hash_source_files(tuple(extra_key_files))
-    except (OSError, TypeError, SyntaxError, ValueError) as e:
-        logger.warning(
-            f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
-            f"({e}); bypassing the disk cache for this kernel."
-        )
-        return compile_fn()
+    if source_sha256 is None:
+        try:
+            source_sha256 = _hash_source_files(tuple(extra_key_files))
+        except (OSError, TypeError, SyntaxError, ValueError) as e:
+            logger.warning(
+                f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
+                f"({e}); bypassing the disk cache for this kernel."
+            )
+            return compile_fn()
 
     spec = JitSpecCuteDsl(
         module_name,
@@ -385,5 +427,6 @@ def build_and_load_cute_dsl_kernel(
         source_sha256,
         enable_tvm_ffi=enable_tvm_ffi,
         target_arch=target_arch,
+        export_compile_fn=export_compile_fn,
     )
     return spec.build_and_load()
