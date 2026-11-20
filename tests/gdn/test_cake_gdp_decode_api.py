@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Tests of the flashinfer public surface of the Cake Gated DeltaProduct (GDP)
-decode kernels (SM90 / SM100 / SM103; FP16 state pool on SM100 / SM103): the ``flashinfer.cake_gdp``
-facade and its re-export from the ``flashinfer`` top-level package.  The
-facade's entry point is a pass-through to ``flashinfer.cake_gdp_backend``;
+decode kernels (SM90 / SM100 / SM103 / SM107; FP16 state pool on SM100 / SM103 /
+SM107): the ``flashinfer.cake_gdp`` facade and its re-export from the
+``flashinfer`` top-level package.  The facade's entry point is a pass-through
+to ``flashinfer.cake_gdp_backend``;
 this module checks that identity (same objects at the top level, the
 ``gated_delta_rule_mtp`` parameter list and the trailing stochastic-rounding
 parameters, same bits as the backend) and leaves
@@ -38,7 +39,7 @@ from flashinfer.cake_gdp_backend import cake_jit as loader
 from flashinfer.jit.env import has_flashinfer_jit_cache
 from flashinfer.utils import get_compute_capability
 
-SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
+SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3), (10, 7))
 K = 128
 V = 64
 SEED = 760
@@ -77,7 +78,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_gdp needs an SM90 / SM100 / SM103 device with exported routes",
+    reason="cake_gdp needs an SM90 / SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -190,8 +191,8 @@ def test_facade_matches_the_backend(n: int, T: int) -> None:
 
 @pytest.mark.parametrize("seeded", (False, True))
 def test_facade_matches_the_backend_fp16(seeded: bool) -> None:
-    """Over an FP16 pool (SM100 / SM103), to nearest or with stochastic rounding: the facade forwards the seed and
-    the round count, so output and pool bits equal the backend's."""
+    """Over an FP16 pool (SM100 / SM103 / SM107), to nearest or with stochastic rounding: the facade forwards the
+    seed and the round count, so output and pool bits equal the backend's."""
     if not loader.route_applies(
         device_capability=get_compute_capability(_device()),
         num_householder=3,
@@ -217,20 +218,27 @@ def test_facade_matches_the_backend_fp16(seeded: bool) -> None:
     assert not torch.equal(pool_facade, pool_before)
 
 
-@pytest.mark.parametrize("seeded", (False, True))
+# The Philox round count from which the runtime n = 3 snapshot_noise sibling serves a stochastic snapshot call.
+SNAPSHOT_NOISE_RUNTIME_ROUNDS = {"sm_100a": 10, "sm_103a": 10, "sm_107a": 16}
+
+
+@pytest.mark.parametrize(("seeded", "rounds"), ((False, 0), (True, 10), (True, 16)))
 def test_facade_fp16_launch_class_picks_the_snapshot_noise_sibling(
-    seeded: bool, monkeypatch
+    seeded: bool, rounds: int, monkeypatch
 ) -> None:
     """A facade call over an FP16 pool that stores per-token snapshots at T = 10 (the runtime program of three
-    Householder updates) launches that program's ``snapshot_noise`` sibling with 10 Philox rounds and the plain
-    program when it rounds to nearest even; output and pool bits equal the backend's."""
+    Householder updates) launches that program's ``snapshot_noise`` sibling when it rounds stochastically with at
+    least the architecture's round count (10 on SM100 / SM103, 16 on SM107), and the plain program below it or when
+    it rounds to nearest even; output and pool bits equal the backend's."""
+    capability = get_compute_capability(_device())
     if not loader.route_applies(
-        device_capability=get_compute_capability(_device()),
+        device_capability=capability,
         num_householder=3,
         num_tokens=10,
         state_dtype=torch.float16,
     ):
         pytest.skip("no FP16-pool program on this device")
+    edge = SNAPSHOT_NOISE_RUNTIME_ROUNDS[loader.arch_for_capability(capability)]
     launched: list[str] = []
     original = loader.run_module
 
@@ -249,7 +257,7 @@ def test_facade_fp16_launch_class_picks_the_snapshot_noise_sibling(
         inputs["rand_seed"] = torch.tensor(
             [-12345], dtype=torch.int64, device=_device()
         )
-        inputs["philox_rounds"] = 10
+        inputs["philox_rounds"] = rounds
     pool_before = inputs["initial_state"].clone()
     out, pool = cake_gated_delta_product_mtp(**inputs)
     pool_facade = pool.clone()
@@ -257,7 +265,7 @@ def test_facade_fp16_launch_class_picks_the_snapshot_noise_sibling(
     out_backend, _ = backend.cake_gated_delta_product_mtp(**inputs)
     assert len(launched) == 2 and launched[0] == launched[1], launched
     sibling = bool(loader.MODULES[launched[0]]["build"].get("snapshot_noise"))
-    assert sibling == seeded, launched
+    assert sibling == (seeded and rounds >= edge), launched
     assert _same_bits(out, out_backend)
     assert _same_bits(pool_facade, inputs["initial_state"])
     assert not torch.equal(pool_facade[8], pool_before[8])

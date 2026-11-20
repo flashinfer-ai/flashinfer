@@ -15,7 +15,8 @@ limitations under the License.
 
 Tests for the Cake Gated DeltaProduct (GDP) decode / MTP-verification kernels
 (``K = 128``, ``V = 64``, one to four Householder updates per
-token, FP32 state pool; SM90 / SM100 / SM103; FP16 state pool on SM100 / SM103).
+token, FP32 state pool; SM90 / SM100 / SM103 / SM107; FP16 state pool on SM100 /
+SM103 / SM107).
 
 Every output row and every pool slot the call may touch is compared with an
 FP64 token-serial reference of the same math (inputs at their BF16 values,
@@ -89,7 +90,7 @@ loader = cake_package("cake_gdp", "cake_jit")
 cake_gated_delta_product_mtp = pkg.cake_gated_delta_product_mtp
 is_cake_gdp_supported = pkg.is_cake_gdp_supported
 
-SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
+SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3), (10, 7))
 K = 128
 V = 64
 ATOL = 1e-2
@@ -119,6 +120,9 @@ MODEL_MAX_HEADS = 4096
 MODEL_CHUNK_HEADS = 512
 # Stored slots per gather of the all-slot rounding check (bounds its device memory).
 CHECK_SLOTS = 64
+# The SM counts the band rules are checked on: 132 / 148 / 152 / 160 (SM90 / SM100 / SM103 parts) and
+# 212 / 216 (SM107: VR200 / R200).
+SM_COUNTS = (132, 148, 152, 160, 212, 216)
 
 
 def _device() -> torch.device:
@@ -139,7 +143,7 @@ def _supported() -> bool:
 
 pytestmark = pytest.mark.skipif(
     not _supported(),
-    reason="cake_gdp needs an SM90 / SM100 / SM103 device with exported routes",
+    reason="cake_gdp needs an SM90 / SM100 / SM103 / SM107 device with exported routes",
 )
 
 
@@ -1546,28 +1550,29 @@ def _fp16_matrix() -> list:
     """Calls over an FP16 pool covering every FP16 body: the T = 1 bands (row partition, one-wave preload, l8r4,
     the many-wave program), static T = 4, 8 and 16 with writeback, distinct write slots, snapshots, holes (skipped
     snapshots, a skipped writeback: :func:`_holes`), the runtime programs of n = 1, 2, 3 and 4, the two
-    ``snapshot_noise`` siblings (stochastic calls with snapshots at T = 16 above 2 x SM and, from 10 rounds, on the
-    runtime program of n = 3), a padded pool, padding rows and ``disable_state_update``."""
+    ``snapshot_noise`` siblings (stochastic calls with snapshots at T = 16 above 2 x SM and, from 10 rounds (16 on
+    SM107), on the runtime program of n = 3), a padded pool, padding rows and ``disable_state_update``."""
     rows = [
         # (n, T, H, B, options)
         (3, 1, 10, 16, {}),  # 160 state heads: the row partition
         (3, 1, 24, 7, {"padding_row": True}),  # 168: the one-wave preload program
         (3, 1, 20, 64, {"distinct_write": True}),  # 1280: l8r4
-        (3, 1, 40, 257, {}),  # 10280: the many-wave program
+        (3, 1, 80, 257, {}),  # 20560 > 64 x SM on up to 320 SMs: the many-wave program
         (3, 4, 12, 16, {"scatter_tokens": True}),
         (3, 4, 12, 16, {"scatter_tokens": True, "holes": True}),
         (3, 8, 10, 7, {"distinct_write": True}),
         (3, 8, 10, 7, {"distinct_write": True, "holes": True}),
-        # 384 > 2 x SM on up to 160 SMs: l8r4; a stochastic call stores snapshots there, so it runs the l8r4
+        # 480 > 2 x SM on up to 216 SMs: l8r4; a stochastic call stores snapshots there, so it runs the l8r4
         # snapshot_noise sibling (one draw per launch into shared memory), a call that rounds to nearest even runs l8r4
-        (3, 16, 24, 16, {"scatter_tokens": True}),
-        (3, 16, 24, 16, {"scatter_tokens": True, "holes": True}),
+        (3, 16, 24, 20, {"scatter_tokens": True}),
+        (3, 16, 24, 20, {"scatter_tokens": True, "holes": True}),
         (3, 16, 10, 3, {"scatter_tokens": True}),  # l8r2: the shared snapshot noise
         (3, 5, 12, 7, {"padded_pool": True}),
         (3, 2, 6, 5, {"disable_state_update": True}),
         (1, 3, 6, 5, {}),
         (2, 9, 6, 3, {"scatter_tokens": True}),
-        # the runtime program of n = 3: its snapshot_noise sibling runs the snapshots of 10 rounds or more
+        # the runtime program of n = 3: its snapshot_noise sibling runs the snapshots of 10 rounds or more (16 or
+        # more on SM107)
         (3, 10, 6, 3, {"scatter_tokens": True}),
         (3, 13, 20, 16, {"scatter_tokens": True, "holes": True}),
         (4, 2, 6, 4, {"padding_row": True}),
@@ -1668,9 +1673,9 @@ def test_fp16_graph_replay_reads_the_seed_on_the_device(monkeypatch) -> None:
 
 def test_fp16_graph_replay_on_a_snapshot_noise_sibling(monkeypatch) -> None:
     """As :func:`test_fp16_graph_replay_reads_the_seed_on_the_device` for a stochastic call with snapshots at
-    T = 16 on 384 > 2 x SM state heads (on up to 160 SMs), which runs the ``l8r4`` ``snapshot_noise`` sibling:
+    T = 16 on 480 > 2 x SM state heads (on up to 216 SMs), which runs the ``l8r4`` ``snapshot_noise`` sibling:
     every launch, eager and captured, is that program, and each replay stores the eager call's bits for its seed."""
-    _graph_replay(16, 24, 16, True, monkeypatch)
+    _graph_replay(16, 24, 20, True, monkeypatch)
 
 
 def _graph_replay(T: int, H: int, B: int, snapshots: bool, monkeypatch) -> None:
@@ -1866,13 +1871,13 @@ def _restricted(rule, arches: list) -> object:
 
 
 def test_fp16_records_are_twins_of_the_fp32_records() -> None:
-    """Every FP16-pool record ships on SM100 / SM103 only, in the routes of its FP32 twin (same body and build
-    keywords but ``state_dtype`` and ``snapshot_noise``), with the twin's band on its architectures (its cells
-    without their launch-class keys), the twin's grid rule and the seed and round-count arguments.  Only FP16 cells
-    carry launch-class keys; a ``snapshot_noise`` sibling's cells each admit stochastic calls with snapshots only,
-    and the sibling has a plain FP16 record of the same twin key in the same routes.  On each of SM100 and SM103,
-    every FP32 decode record of a route has its plain FP16 twin in that route, delivered for that architecture, so an
-    FP16 pool has a route wherever an FP32 pool has one.  For every probe and every launch class (round count 0 or
+    """Every FP16-pool record ships on SM100 / SM103 / SM107 only, in the routes of its FP32 twin (same body and
+    build keywords but ``state_dtype`` and ``snapshot_noise``), with the twin's band on each of its architectures
+    (its cells there without their launch-class keys), the twin's grid rule and the seed and round-count
+    arguments.  Only FP16 cells carry launch-class keys; a ``snapshot_noise`` sibling's cells each admit stochastic
+    calls with snapshots only, and the sibling has a plain FP16 record of the same twin key in the same routes.  On
+    each of SM100, SM103 and SM107, every FP32 decode record of a route has its plain FP16 twin in that route,
+    delivered for that architecture, so an FP16 pool has a route wherever an FP32 pool has one.  For every probe and every launch class (round count 0 or
     5 to 16, with or without snapshots) the FP16 dispatch selects a program with the twin key of the FP32
     dispatch's program: the sibling exactly where one of the sibling's cells admits the call, else the plain twin."""
     fp32 = {
@@ -1892,7 +1897,7 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
             assert not any(set(CLASS_KEYS) & set(cell) for cell in cells), name
             continue
         assert record["build"]["state_dtype"] == "f16", name
-        assert set(record["arches"]) <= {"sm_100a", "sm_103a"}, name
+        assert set(record["arches"]) <= {"sm_100a", "sm_103a", "sm_107a"}, name
         other = fp32[_twin_key(record)]
         twin = loader.MODULES[other]
         if record["build"].get("snapshot_noise"):
@@ -1905,9 +1910,10 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
             assert other not in twins, (name, twins.get(other))
             twins[other] = name
         assert set(record["arches"]) <= set(twin["arches"]), name
-        assert _band_cells(record["select_rule"]) == _band_cells(
-            _restricted(twin["select_rule"], record["arches"])
-        ), name
+        for arch in record["arches"]:
+            assert _band_cells(
+                _restricted(record["select_rule"], [arch])
+            ) == _band_cells(_restricted(twin["select_rule"], [arch])), (name, arch)
         assert record["grid_rule"] == twin["grid_rule"], name
         assert record["logical"]["rand_seed"] == "rand_seed", name
         assert record["logical"]["philox_rounds"] == "philox_rounds", name
@@ -1925,7 +1931,7 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
             assert (
                 loader.MODULES[name]["arches"] == loader.MODULES[twins[other]]["arches"]
             ), name
-    for arch in ("sm_100a", "sm_103a"):
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
         for key, names in loader.ROUTES[arch].items():
             if key.startswith("decode_nh"):
                 for name in names:
@@ -1952,7 +1958,7 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
             ):
                 continue
             for T in range(1, loader.max_num_tokens(arch, n, l2) + 1):
-                for sms in (132, 148, 152, 160):
+                for sms in SM_COUNTS:
                     for state_heads in _STATE_HEAD_PROBES:
                         picked = loader.selected_module(
                             arch, n, T, state_heads, sm_count=sms, use_qk_l2norm=l2
@@ -2210,8 +2216,9 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
 
 
-# Band edges and wave bounds of the route tables: B x HV probes for selected_module.
-_STATE_HEAD_PROBES = (
+# Band edges and wave bounds of the route tables: B x HV probes for selected_module (those of the SM90 / SM100 /
+# SM103 parts, the domain of :data:`DEFAULT_PICKS_OF_RECORD`, then those of SM107).
+_RECORD_STATE_HEAD_PROBES = (
     1,
     8,
     160,
@@ -2263,6 +2270,36 @@ _STATE_HEAD_PROBES = (
     10241,
     20480,
 )
+_STATE_HEAD_PROBES = (
+    *_RECORD_STATE_HEAD_PROBES,
+    # the two-wave edge 2 x sm and +1, the one-wave edge 4 x sm and +1 and the tail-wave edge 5 x sm and +1 of
+    # T = 1 for 212 / 216 SMs
+    424,
+    425,
+    432,
+    433,
+    848,
+    849,
+    864,
+    865,
+    1060,
+    1061,
+    1080,
+    1081,
+    # the two-head edge 32 x sm and the many-wave edge 64 x sm, -1 / 0 / +1, for 212 / 216 SMs
+    6783,
+    6784,
+    6785,
+    6911,
+    6912,
+    6913,
+    13567,
+    13568,
+    13569,
+    13823,
+    13824,
+    13825,
+)
 
 
 def test_route_tables_are_consistent() -> None:
@@ -2311,7 +2348,7 @@ def test_route_tables_are_consistent() -> None:
                     arch, n, not key.endswith("_raw"), state_dtype=dtype
                 )
                 for T in range(1, bound + 1):
-                    for sms in (132, 148, 152, 160):
+                    for sms in SM_COUNTS:
                         for state_heads in _STATE_HEAD_PROBES:
                             # selected_module raises unless exactly one program admits the call
                             picks = {
@@ -2342,13 +2379,19 @@ DEFAULT_PICKS_OF_RECORD = (
     58880,
     "230aba7391a6d99ab133305bf824fda5d9012556aecb713bc382b6ad13acc784",
 )
+# The domain of that table: the architectures and SM counts of #9720 and :data:`_RECORD_STATE_HEAD_PROBES`
+# (sm_107a: :func:`test_sm107a_selects_the_sm100a_programs`).
+_RECORD_ARCHES = ("sm_100a", "sm_103a", "sm_90a")
+_RECORD_SM_COUNTS = (132, 148, 152, 160)
 
 
 def _default_pick_table() -> list[str]:
-    """One line ``arch route dtype T sm_count state_heads program`` per decode route, pool dtype, token count, SM
-    count and :data:`_STATE_HEAD_PROBES` probe: the program ``selected_module`` picks with its default keywords."""
+    """One line ``arch route dtype T sm_count state_heads program`` per decode route of :data:`_RECORD_ARCHES`, pool
+    dtype, token count, SM count of :data:`_RECORD_SM_COUNTS` and :data:`_RECORD_STATE_HEAD_PROBES` probe: the program
+    ``selected_module`` picks with its default keywords."""
     lines = []
-    for arch in sorted(loader.ROUTES):
+    assert set(_RECORD_ARCHES) <= set(loader.ROUTES)
+    for arch in sorted(_RECORD_ARCHES):
         for key in sorted(loader.ROUTES[arch]):
             if not key.startswith("decode_nh"):
                 continue
@@ -2357,8 +2400,8 @@ def _default_pick_table() -> list[str]:
                 dtype = _POOL_DTYPES[dtype_key]
                 bound = loader.max_num_tokens(arch, n, l2, state_dtype=dtype)
                 for T in range(1, bound + 1):
-                    for sms in (132, 148, 152, 160):
-                        for state_heads in _STATE_HEAD_PROBES:
+                    for sms in _RECORD_SM_COUNTS:
+                        for state_heads in _RECORD_STATE_HEAD_PROBES:
                             name = loader.selected_module(
                                 arch,
                                 n,
@@ -2380,6 +2423,60 @@ def test_default_launch_class_keeps_the_picks_of_record() -> None:
     lines = _default_pick_table()
     digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()
     assert (len(lines), digest) == DEFAULT_PICKS_OF_RECORD
+
+
+def test_sm107a_selects_the_sm100a_programs() -> None:
+    """sm_107a ships the decode programs, routes and bands of sm_100a: its decode routes are sm_100a's, and on every
+    route, pool dtype, token count, SM count, probe and launch class it selects the program sm_100a selects, except
+    where the sm_107a cell of a ``snapshot_noise`` sibling admits fewer round counts: there it selects the
+    sibling's plain FP16 program (same body and variant)."""
+
+    def decode_routes(arch: str) -> dict:
+        return {
+            key: names
+            for key, names in loader.ROUTES[arch].items()
+            if key.startswith("decode_")
+        }
+
+    routes = decode_routes("sm_107a")
+    assert routes == decode_routes("sm_100a")
+    for key in sorted(routes):
+        n, l2 = int(key[len("decode_nh")]), not key.endswith("_raw")
+        dtypes = {
+            loader.MODULES[name]["build"].get("state_dtype", "f32")
+            for name in routes[key]
+        }
+        for dtype in (_POOL_DTYPES[d] for d in sorted(dtypes)):
+            classes = (
+                LAUNCH_CLASSES if dtype == torch.float16 else ((0, False), (0, True))
+            )
+            bound = loader.max_num_tokens("sm_107a", n, l2, state_dtype=dtype)
+            assert bound == loader.max_num_tokens("sm_100a", n, l2, state_dtype=dtype)
+            for T, sms, state_heads, (rounds, snapshot) in itertools.product(
+                range(1, bound + 1), SM_COUNTS, _STATE_HEAD_PROBES, classes
+            ):
+                p100, p107 = (
+                    loader.selected_module(
+                        arch,
+                        n,
+                        T,
+                        state_heads,
+                        sm_count=sms,
+                        use_qk_l2norm=l2,
+                        state_dtype=dtype,
+                        philox_rounds=rounds,
+                        use_ssm_state_indices=snapshot,
+                    )
+                    for arch in ("sm_100a", "sm_107a")
+                )
+                if p100 == p107:
+                    continue
+                r100, r107 = loader.MODULES[p100], loader.MODULES[p107]
+                where = (key, dtype, T, sms, state_heads, rounds, snapshot, p100, p107)
+                assert r100["build"].get("snapshot_noise") is True, where
+                assert not r107["build"].get("snapshot_noise"), where
+                assert r107["build"].get("state_dtype") == "f16", where
+                assert _twin_key(r100) == _twin_key(r107), where
 
 
 @pytest.mark.parametrize("field", ("q", "k"))
@@ -2531,15 +2628,15 @@ def _static_pick(
     return (record["body"], record["build"]["variant"])
 
 
-@pytest.mark.parametrize("sm", (148, 152))
+@pytest.mark.parametrize("sm", (148, 152, 212, 216))
 def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
     """T = 1, three Householder steps, on `sm` SMs: the row-partition program up to 160
-    state heads; on SM100 / SM103 the one-wave program l8r4p takes (160, 4 x sm], l8r4
+    state heads; on SM100 / SM103 / SM107 the one-wave program l8r4p takes (160, 4 x sm], l8r4
     takes (4 x sm, 64 x sm] (the tail-wave rows (4 x sm, 5 x sm] included: the
     one-wave-of-5 band is off) and l8r4w5 takes every count above 64 x sm, while SM90
     ships neither of the two and keeps l8r4 above 160.  The choice depends on
     (arch, T, B x HV, sm_count) only."""
-    assert set(loader.ROUTES) == {"sm_90a", "sm_100a", "sm_103a"}
+    assert set(loader.ROUTES) == {"sm_90a", "sm_100a", "sm_103a", "sm_107a"}
     for arch in loader.ROUTES:
         one_wave = "l8r4" if arch == "sm_90a" else "l8r4p"
         many_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
@@ -2570,10 +2667,10 @@ def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
                 )
 
 
-@pytest.mark.parametrize("sm", (132, 148, 152, 160))
+@pytest.mark.parametrize("sm", SM_COUNTS)
 def test_t4_band_follows_the_architecture(sm: int) -> None:
     """T = 4, three Householder steps: SM90 runs the one-CTA-per-SM program l4r2 up to
-    `sm` state heads and l8r4 above it; SM100 / SM103 run l8r4 on every state-head count
+    `sm` state heads and l8r4 above it; SM100 / SM103 / SM107 run l8r4 on every state-head count
     and ship no l4r2 program (and SM90 no l8r4p / l8r4w5 program)."""
     for arch in loader.ROUTES:
         for state_heads in (1, 24, sm, sm + 1, 4 * sm, 20480):
@@ -2605,10 +2702,11 @@ L8R2_CTAS_PER_SM = {
     "sm_90a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 1},
     "sm_100a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 2},
     "sm_103a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 2},
+    "sm_107a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 2},
 }
 
 
-@pytest.mark.parametrize("sm", (132, 148, 152, 160))
+@pytest.mark.parametrize("sm", SM_COUNTS)
 def test_multi_token_bands_follow_the_architecture(sm: int) -> None:
     """Three Householder steps at T = 2, 3, 5, 6, 7, 8 and 16: l8r4 serves every
     state-head count at T = 2 and 3; from T = 5 on, l8r2 serves up to k x `sm` state
@@ -2634,7 +2732,7 @@ def test_static_programs_partition_every_token_count(T: int) -> None:
     Householder steps admits every state-head count on every SM count the kernel may
     meet, so the runtime program never serves these token counts."""
     for arch in loader.ROUTES:
-        for sm in (132, 148, 152, 160):
+        for sm in SM_COUNTS:
             for state_heads in (*range(1, 1300), 1536, 4096, 20480):
                 body, variant = _static_pick(arch, 3, T, state_heads, sm)
                 assert body == "lanerow", (arch, T, state_heads, sm, body, variant)
@@ -2645,7 +2743,7 @@ def test_t1_static_programs_partition_every_sm_count() -> None:
     the kernel may meet (`selected_module` raises when two admit), so the runtime program is
     never the T = 1 choice of three Householder steps."""
     for arch in loader.ROUTES:
-        for sm in (132, 148, 152, 160):
+        for sm in SM_COUNTS:
             for state_heads in (*range(1, 1300), 1536, 4096, 20480):
                 body, _variant = _static_pick(arch, 3, 1, state_heads, sm)
                 assert body != "runtime", (arch, state_heads, sm)
