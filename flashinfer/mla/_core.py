@@ -3211,7 +3211,9 @@ def _cute_dsl_max_supported_batch(
     Cute-dsl's workspace requirement grows with B via the kernel's per-CTA
     split-K state. Binary-search for the largest ``B <= candidate_max`` whose
     ``get_workspace_size(...)`` fits in ``workspace_bytes``. The search is
-    memoized per workspace policy and sizes (``_cute_dsl_max_batch_search``).
+    memoized per workspace policy and sizes (``_cute_dsl_max_batch_search``);
+    only the monolithic policy reads ``max_seq_len``, so the others' entries
+    are shared by every ``max_seq_len``.
     """
     workspace_sizer, resolved_impl = _resolve_cute_dsl_workspace_sizer(
         cute_dsl_impl, sinks, enable_dcp
@@ -3224,7 +3226,7 @@ def _cute_dsl_max_supported_batch(
         num_heads,
         kv_lora_rank,
         max_active_blocks,
-        max_seq_len,
+        max_seq_len if resolved_impl == "monolithic" else 0,
         candidate_max,
     )
 
@@ -4130,7 +4132,11 @@ class _MlaStageOneWinnerRunner(TunableRunner):
 # microsecond decode kernel measures mostly launch latency, quantized to the
 # event timer's step, so the first-stage winner and Cake often measure the same
 # and the incumbent keeps the tie. A chain of launches, each on its own query
-# and output lane, is reported per launch.
+# and output lane, is reported per launch. Only the first launch follows the
+# L2 flush: the KV cache and workspace (held by the runners) and block_tables
+# and seq_lens are not laned, so the later launches read them from L2 when
+# they fit there, and a chained sample of a small KV cache is closer to a
+# warm-KV time than to the cold single replay of the first stage.
 _MLA_CAKE_MARGIN_CHAIN_LAUNCHES = 8
 # The second stage's profile-arena inputs: query and out. block_tables,
 # seq_lens and the optional fifth tensor are read-only and keep one pointer.
