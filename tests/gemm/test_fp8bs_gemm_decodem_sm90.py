@@ -633,8 +633,8 @@ def test_native_green_occupancy(green8, native_rejection_module, record_property
     [
         ((12, 2624, 6144), False),  # exact CPA 16
         ((10, 2624, 6144), False),  # other CPA 16
-        ((24, 2624, 6144), False),  # KU 12
-        ((2, 2048, 7168), False),  # KU 14
+        ((24, 2624, 6144), True),  # KU 12: admitted by actual occupancy
+        ((2, 2048, 7168), True),  # KU 14: admitted by actual occupancy
         ((3, 2048, 2048), False),  # direct split-K 16
         ((13, 2048, 2048), True),  # direct split-K 4
         ((1, 8192, 1536), True),  # MWG
