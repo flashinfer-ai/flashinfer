@@ -8,8 +8,8 @@ output bits depend on its KV position, its head, the window and -- for the fp8-K
 ``attention.e5m2kv`` -- the two per-tensor scales alone, so the three wrappers compute the same bits for the same token.
 
 The fp8-KV classes take ``plan(kv_data_type=torch.float8_e4m3fn | torch.float8_e5m2)`` with bf16 queries and output, and at
-``run()`` the caches of that dtype with FlashInfer's ``k_scale`` / ``v_scale`` (Python numbers, or 1-element tensors read on the
-host: a synchronisation) in the chain the specification states (``spec.py``): ``c = fp32(sm_scale * k_scale * log2 e)`` and one
+``run()`` the caches of that dtype with FlashInfer's ``k_scale`` / ``v_scale`` (Python numbers, or 1-element tensors: a device
+tensor is read back once per tensor version, ``neutral.resolve_scale``) in the chain the specification states (``spec.py``): ``c = fp32(sm_scale * k_scale * log2 e)`` and one
 ``mul.rn`` by ``v_scale`` before the output rounding. The NVFP4-KV class ``attention.nvfp4kv`` takes ``plan(kv_data_type=torch.uint8)``
 (FlashInfer's packed NVFP4 cache, ``head_dim // 2`` bytes per row) and at ``run()`` the ``kv_cache_sf`` block scales in the wrappers'
 forms (a ``(k_sf, v_sf)`` tuple, or the single 5-D tensor of the paged wrappers; e4m3 bytes, ``head_dim // 16`` per row) with the
@@ -31,7 +31,9 @@ junk pages -- reach no output.
 Unit scales (``neutral.py``): the query and the output are unscaled bf16 in every class, so ``q_scale`` / ``o_scale`` are accepted
 at ``None`` or exactly ``1.0`` (what a serving engine passes on every call) and refused at any other value; ``k_scale`` /
 ``v_scale`` follow the same rule for a bf16 KV cache and for the token-head-scale classes (whose scales are the per-key
-tensors: a unit per-tensor scale multiplies nothing), and are operands of the per-tensor low-bit KV classes.
+tensors: a unit per-tensor scale multiplies nothing), and are operands of the per-tensor low-bit KV classes. Every scale is
+a Python number or a one-element floating-point tensor; a device tensor is read back once per tensor version, not per
+``run()``, and a ``run()`` captured into a CUDA graph must have seen it before the capture (``neutral.resolve_scale``).
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
@@ -953,5 +955,6 @@ class BatchInvariantAttention:
     @staticmethod
     def _scalar(x, name: str, cls: str) -> float:
         """A per-tensor scale as FlashInfer's wrappers take it: None (1.0), a Python number, or a 1-element floating-point tensor
-        (read on the host: a synchronisation, so a captured CUDA graph should pass numbers)."""
+        (a device tensor is read back once per tensor version and must be known before a CUDA-graph capture:
+        ``neutral.resolve_scale``)."""
         return neutral.scale_value(x, name, cls)

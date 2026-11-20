@@ -11,90 +11,129 @@ typed error.
 argument                                    accepted (no effect on the bits); everything else raises
 ==========================================  =====================================================================================
 ``q_scale`` / ``o_scale``                   ``None`` or exactly ``1.0`` for every class (the query and the output are bf16 and
-                                            unscaled), as a host number or a one-element CPU tensor (a device tensor would
-                                            cost a readback per ``run()``: refused)
-``k_scale`` / ``v_scale``                   ``None`` or exactly ``1.0`` (host values, as above) for a bf16 KV cache and for the
+                                            unscaled), as a number or a one-element floating-point tensor; a device tensor is
+                                            read back once per tensor version (``resolve_scale``), and before any CUDA-graph
+                                            capture
+``k_scale`` / ``v_scale``                   ``None`` or exactly ``1.0`` (in the same forms) for a bf16 KV cache and for the
                                             token-head-scale classes (their scales are the per-key tensors of
-                                            ``kv_cache_sf``); the per-tensor low-bit KV
-                                            classes take them as operands (any value their chain admits,
-                                            ``engine.check_sm_scale`` / ``engine.check_v_scale``)
+                                            ``kv_cache_sf``); the per-tensor low-bit KV classes take them as operands (any
+                                            value their chain admits, ``engine.check_sm_scale`` / ``engine.check_v_scale``),
+                                            read through the same path (``scale_value``)
 ==========================================  =====================================================================================
 
-A scale a class takes as an operand is a Python number or a one-element floating-point tensor (read on the host: a
-synchronisation for a device tensor, so a captured CUDA graph should pass numbers); a unit-only scale is a host value.
+Every scale, unit-only or an operand of the class, is a Python number or a one-element floating-point tensor and reaches the
+host through ``resolve_scale``: a device tensor costs one readback per tensor version, never one per ``run()``.
 """
 
 from __future__ import annotations
 
-from typing import Sequence
+import numbers
+import weakref
+from typing import Dict, Sequence, Tuple
 
 import torch
 
 from ...batch_invariant.support import unsupported
 
 SCALE_NAMES = ("q_scale", "k_scale", "v_scale", "o_scale")
-_UNIT_SCALES = "unscaled bf16 operands (q_scale / k_scale / v_scale / o_scale of None or exactly 1.0, as host numbers)"
+_UNIT_SCALES = "unscaled bf16 operands (q_scale / k_scale / v_scale / o_scale of None or exactly 1.0, as a number or a one-element floating-point tensor)"
 
 
-def scale_value(x, name: str, class_name: str) -> float:
-    """A per-tensor scale as FlashInfer's wrappers take it: ``None`` (1.0), a Python number, or a one-element floating-point
-    tensor (read on the host); anything else raises the class's typed error."""
-    if x is None:
-        return 1.0
-    if isinstance(x, (int, float)) and not isinstance(x, bool):
-        return float(x)
-    if isinstance(x, torch.Tensor):
-        if x.numel() != 1 or not x.dtype.is_floating_point:
+_SCALE_FORMS = (
+    "a Python number or a one-element floating-point tensor (a device tensor is read once per tensor version; inside a "
+    "CUDA-graph capture its value must already be known: pass a Python number or a CPU tensor, or call once before the capture)"
+)
+# device scale tensors already read: id(tensor) -> (weak reference to the tensor, its version when read, the value)
+_DEVICE_SCALES: Dict[int, Tuple[weakref.ref, int, float]] = {}
+
+
+def _read_device_scale(value: torch.Tensor) -> float:
+    """The one device readback of a scale tensor (a synchronisation point)."""
+    return float(value.item())
+
+
+def resolve_scale(class_name: str, name: str, value):
+    """The host number of one scale argument, for every wrapper and for eager and CUDA graph mode alike:
+
+    * a Python or numpy number (not a bool) is itself;
+    * a one-element floating-point CPU tensor is read on the host at every call;
+    * a one-element floating-point device tensor is read back at most once per tensor version: the value is remembered
+      for the tensor object (held through a weak reference, so a recycled ``id`` cannot alias it) and its ``_version``,
+      and later calls with the same unmodified tensor issue no readback and no synchronisation. An in-place write bumps
+      the version and the next call reads again. Storage changed without a version bump (``set_``, writes through a raw
+      pointer or another framework's view) is the caller's responsibility. A CUDA-graph capture cannot read the device:
+      a tensor whose value is not known when ``run()`` executes inside a capture raises, so it is resolved by a call
+      before the capture (the warm-up ``run()``).
+
+    Any other form (several elements, an integer or bool tensor, a bool, a non-number) raises the typed error."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
             raise unsupported(
                 class_name,
-                f"a {name} tensor of shape {tuple(x.shape)} and dtype {x.dtype}",
-                f"{name} as a Python number or a 1-element floating-point tensor",
+                f"{name} as a tensor of {value.numel()} elements",
+                _UNIT_SCALES,
             )
-        return float(x.item())
-    raise unsupported(
-        class_name,
-        f"{name} of type {type(x).__name__}",
-        f"{name} as a Python number or a 1-element tensor",
-    )
+        if not value.dtype.is_floating_point:
+            raise unsupported(
+                class_name, f"{name} as a tensor of dtype {value.dtype}", _UNIT_SCALES
+            )
+        if value.device.type == "cpu":
+            return value.item()
+        key = id(value)
+        known = _DEVICE_SCALES.get(key)
+        if known is not None and known[0]() is value and known[1] == value._version:
+            return known[2]
+        if value.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise unsupported(
+                class_name,
+                f"{name} as a tensor on {value.device} first seen inside a CUDA-graph capture (its value cannot be read "
+                "there)",
+                _SCALE_FORMS,
+            )
+        number = _read_device_scale(value)
+
+        def forget(ref, key=key):
+            entry = _DEVICE_SCALES.get(key)
+            if entry is not None and entry[0] is ref:
+                del _DEVICE_SCALES[key]
+
+        _DEVICE_SCALES[key] = (weakref.ref(value, forget), value._version, number)
+        return number
+    if isinstance(value, bool):
+        raise unsupported(class_name, f"{name}={value!r}", _UNIT_SCALES)
+    return value
 
 
 def check_unit_scales(
     class_name: str, scales: Sequence, free: Sequence[str] = ()
 ) -> None:
     """``scales`` in the order of :data:`SCALE_NAMES`: each must be ``None`` or exactly one (compared with ``1.0`` exactly,
-    no tolerance: engines pass the exact value), as a host number or a one-element CPU tensor -- a device tensor is refused
-    whatever its value, since reading it would synchronise every ``run()``. A unit scale multiplies nothing, so it is the
-    unscaled class; any other value is a term the class does not have. ``free`` names the scales a class takes as operands
-    (the per-tensor ``k_scale`` / ``v_scale`` of a low-bit KV class): those are not checked here. The query and the output
-    scale are unit-only for every class."""
-    limit = _UNIT_SCALES
-    if free:
-        fixed = [n for n in SCALE_NAMES if n not in free]
-        limit = (
-            f"an unscaled bf16 query and output ({' / '.join(fixed)} of None or exactly 1.0, as host numbers; "
-            f"{' / '.join(free)} are the class's per-tensor scales)"
-        )
+    no tolerance: engines pass the exact value; ``resolve_scale`` says which forms of the argument are read). A unit scale
+    multiplies nothing, so it is the unscaled class; any other value is a term the class does not have. ``free`` names
+    the scales a class takes as operands (the per-tensor ``k_scale`` / ``v_scale`` of a low-bit KV class): those are not
+    checked here. The query and the output scale are unit-only for every class."""
     for name, value in zip(SCALE_NAMES, scales, strict=False):
         if value is None or name in free:
             continue
-        shown = value
-        if isinstance(value, torch.Tensor):
-            if value.device.type != "cpu":
-                raise unsupported(
-                    class_name,
-                    f"{name} as a tensor on {value.device} (reading it would stall every run())",
-                    limit,
-                )
-            if value.numel() != 1:
-                raise unsupported(
-                    class_name,
-                    f"{name} as a tensor of {value.numel()} elements",
-                    limit,
-                )
-            shown = value.item()
+        shown = resolve_scale(class_name, name, value)
         try:
             unit = float(shown) == 1.0
         except (TypeError, ValueError):
             unit = False
         if not unit:
-            raise unsupported(class_name, f"{name}={shown!r}", limit)
+            raise unsupported(class_name, f"{name}={shown!r}", _UNIT_SCALES)
+
+
+def scale_value(x, name: str, class_name: str) -> float:
+    """A per-tensor scale a class takes as an operand (the ``k_scale`` / ``v_scale`` of a per-tensor low-bit KV class): ``None``
+    (1.0), or the host number of ``resolve_scale`` -- so a one-element device tensor is read back once per tensor version, not
+    at every ``run()``, and its value is on the host when the class folds it into its constants. Anything that is not a
+    number raises the class's typed error."""
+    if x is None:
+        return 1.0
+    shown = resolve_scale(class_name, name, x)
+    if not isinstance(shown, numbers.Real):
+        raise unsupported(
+            class_name, f"{name} of type {type(x).__name__}", _SCALE_FORMS
+        )
+    return float(shown)

@@ -728,7 +728,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         w.run(pr.q, pr.cache("NHD"), k_scale=lp.k_scale)
     with pytest.raises(bi.BatchInvariantUnsupportedError):  # the other fp8 format
         w.run(pr.q, (k.view(E5), v.view(E5)), k_scale=lp.k_scale)
-    for bad in (0.5, 2.0, torch.tensor([0.5]), torch.ones(2), "x"):
+    for bad in (0.5, 2.0, torch.tensor([0.5], device=pr.device), torch.ones(2), "x"):
         with pytest.raises(
             bi.BatchInvariantUnsupportedError, match="q_scale"
         ):  # a scaled query
@@ -768,21 +768,10 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert torch.equal(
         bits(w.run(pr.q, (k, v), k_scale=lp.k_scale, v_scale=lp.v_scale)), ref
     )  # the plan survived
-    # q_scale of 1.0 (a host number or a 1-element CPU tensor) is the unscaled query: the bits of no q_scale; a device tensor
-    # is refused whatever it holds (reading it would synchronise every run())
-    for unit in (1.0, 1, torch.ones(1), torch.tensor(1.0)):
+    # q_scale of 1.0 (a number or a 1-element tensor, on the host or the device) is the unscaled query: the bits of no q_scale
+    for unit in (1.0, 1, torch.ones(1), torch.tensor(1.0, device=pr.device)):
         got = w.run(pr.q, (k, v), q_scale=unit, k_scale=lp.k_scale, v_scale=lp.v_scale)
         assert torch.equal(bits(got), ref)
-    with pytest.raises(
-        bi.BatchInvariantUnsupportedError, match="q_scale as a tensor on cuda"
-    ):
-        w.run(
-            pr.q,
-            (k, v),
-            q_scale=torch.ones(1, device=pr.device),
-            k_scale=lp.k_scale,
-            v_scale=lp.v_scale,
-        )
     # the bf16 class has no scale in its chain: every scale is accepted at None / 1.0 (the same bits) and refused otherwise
     wb = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
     wb.plan(
@@ -793,16 +782,11 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         for bad in (2.0, 0.999, torch.tensor([2.0])):
             with pytest.raises(bi.BatchInvariantUnsupportedError, match=name):
                 wb.run(pr.q, pr.cache("NHD"), **{name: bad})
-    unit = torch.ones(1)
+    unit = torch.ones(1, device=pr.device)
     assert torch.equal(
         bits(wb.run(pr.q, pr.cache("NHD"), q_scale=1.0, k_scale=1.0, v_scale=unit)),
         bref,
     )
-    for name in ("q_scale", "k_scale", "v_scale"):
-        with pytest.raises(
-            bi.BatchInvariantUnsupportedError, match=f"{name} as a tensor on cuda"
-        ):
-            wb.run(pr.q, pr.cache("NHD"), **{name: torch.ones(1, device=pr.device)})
     with pytest.raises(
         bi.BatchInvariantUnsupportedError
     ):  # an fp8 cache over a bf16 plan
@@ -1917,7 +1901,7 @@ def test_serving_call_shape_fp8(layout):
     d.run(
         pr.q[last].contiguous(),
         cache,
-        q_scale=torch.ones(1),
+        q_scale=torch.ones(1, device=pr.device),
         k_scale=ks,
         v_scale=vs,
         out=dout,
@@ -1999,3 +1983,204 @@ def test_serving_page_layout_nvfp4(D):
         kv_cache_sf=(k_sf.view(e4), v_sf.view(e4)),
     )
     assert torch.equal(bits(out), ref)
+
+
+# ------------------------------------------------------------------------------------------------------ device-tensor scales
+def _scale_case(kind):
+    """A planned paged-prefill wrapper of one class and its scales: ``(run(**scales), owned)`` -- ``run`` launches with the given
+    scale arguments, ``owned`` maps the scales the class takes as operands to their values (the others are unit-only)."""
+    pr = Problem([64, 1], [700, 2500], 8, 2, 128, 16, seed=31)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    args = (pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 8, 2, 128, 16)
+    if kind == "bf16":
+        w.plan(*args, causal=True, q_data_type=torch.bfloat16)
+        return (lambda **s: w.run(pr.q, pr.cache("NHD"), **s)), {}
+    if kind == "e4m3":
+        lp = LowbitProblem(pr, E4, 1.3)
+        w.plan(*args, causal=True, **plan_kw(lp))
+        return (lambda **s: w.run(pr.q, lp.cache("NHD"), **s)), dict(
+            k_scale=lp.k_scale, v_scale=lp.v_scale
+        )
+    if kind == "nvfp4":
+        fp = Fp4Problem(pr, seed=31)
+        w.plan(*args, causal=True, q_data_type=torch.bfloat16, kv_data_type=torch.uint8)
+        return (
+            lambda **s: w.run(pr.q, fp.cache("NHD"), kv_cache_sf=fp.sf("NHD"), **s)
+        ), dict(k_scale=fp.k_scale, v_scale=fp.v_scale)
+    assert kind == "token_head", kind
+    from tests.attention.test_batch_invariant_attention_token_head_sf import THProblem
+
+    tp = THProblem(pr, E4)
+    w.plan(
+        *args,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=E4,
+        use_token_head_sf=True,
+    )
+    return (lambda **s: w.run(pr.q, tp.cache("NHD"), kv_cache_sf=tp.sf("NHD"), **s)), {}
+
+
+SCALE_KINDS = pytest.mark.parametrize("kind", ["bf16", "e4m3", "nvfp4", "token_head"])
+SCALE_ARGS = ("q_scale", "k_scale", "v_scale")
+
+
+@pytest.fixture
+def readbacks(monkeypatch):
+    """The number of device readbacks of scale tensors (``neutral._read_device_scale``) since the test started."""
+    from flashinfer.attention.batch_invariant import neutral
+
+    count = [0]
+    real = neutral._read_device_scale
+
+    def counted(value):
+        count[0] += 1
+        return real(value)
+
+    monkeypatch.setattr(neutral, "_read_device_scale", counted)
+    return count
+
+
+@needs_device
+@SCALE_KINDS
+def test_device_tensor_scale_is_read_once_per_tensor_version(kind, readbacks):
+    """A one-element device tensor as a scale -- unit-only or an operand of the class -- is read back once and remembered for
+    the tensor object and its version: repeated ``run()`` calls issue no further readback; an in-place write is read again
+    and takes effect (a new operand value changes the output as the number would; a unit-only scale that is no longer 1.0
+    raises); host tensors are never counted."""
+    run, owned = _scale_case(kind)
+    dev = torch.device("cuda")
+    values = {name: owned.get(name, 1.0) for name in SCALE_ARGS}
+    ref = bits(run(**values)).clone()
+    assert readbacks[0] == 0
+    host = {n: torch.tensor([v], dtype=torch.float32) for n, v in values.items()}
+    assert torch.equal(bits(run(**host)), ref) and readbacks[0] == 0
+    on_dev = {
+        n: torch.tensor([v], dtype=torch.float32, device=dev) for n, v in values.items()
+    }
+    for _ in range(3):
+        assert torch.equal(bits(run(**on_dev)), ref)
+        assert readbacks[0] == len(SCALE_ARGS)
+    # the same value in another tensor object is another readback, once
+    other = {n: t.clone() for n, t in on_dev.items()}
+    for _ in range(2):
+        assert torch.equal(bits(run(**other)), ref)
+        assert readbacks[0] == 2 * len(SCALE_ARGS)
+    seen = readbacks[0]
+    if owned:
+        # an operand written in place is read again, once, and is the new operand
+        on_dev["v_scale"].mul_(2.0)
+        want = bits(run(**dict(values, v_scale=values["v_scale"] * 2.0))).clone()
+        for _ in range(2):
+            assert torch.equal(bits(run(**on_dev)), want)
+            assert readbacks[0] == seen + 1
+        assert not torch.equal(want, ref)
+        seen += 1
+    # a unit-only scale written in place is read again: it raises while it is not 1.0 and is accepted again at 1.0
+    on_dev["q_scale"].fill_(2.0)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="q_scale"):
+        run(**on_dev)
+    assert readbacks[0] == seen + 1
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="q_scale"):
+        run(**on_dev)
+    assert readbacks[0] == seen + 1  # the refused value is remembered too
+    on_dev["q_scale"].fill_(1.0)
+    run(**on_dev)
+    assert readbacks[0] == seen + 2
+    # forms that are not a scale keep their typed refusals
+    for bad in (
+        torch.ones(2, device=dev),
+        torch.ones(1, dtype=torch.int32, device=dev),
+        True,
+    ):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="k_scale"):
+            run(k_scale=bad)
+    assert readbacks[0] == seen + 2
+
+
+@needs_device
+@SCALE_KINDS
+def test_device_tensor_scale_must_be_known_before_a_graph_capture(kind, readbacks):
+    """Inside a CUDA-graph capture the device cannot be read: a device-tensor scale first seen there raises the typed error
+    and is not read; one resolved by a ``run()`` before the capture is accepted in the capture with no readback, and the
+    replay reproduces the eager bits."""
+    run, owned = _scale_case(kind)
+    dev = torch.device("cuda")
+    values = {name: owned.get(name, 1.0) for name in SCALE_ARGS}
+    ref = bits(run(**values)).clone()
+    out = torch.empty_like(run(**values))
+    on_dev = {
+        n: torch.tensor([v], dtype=torch.float32, device=dev) for n, v in values.items()
+    }
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        g0 = torch.cuda.CUDAGraph()
+        with (
+            pytest.raises(
+                bi.BatchInvariantUnsupportedError,
+                match="first seen inside a CUDA-graph capture",
+            ),
+            torch.cuda.graph(g0, stream=s),
+        ):
+            out.zero_()
+            run(out=out, **on_dev)
+        assert readbacks[0] == 0
+        run(out=out, **on_dev)  # the warm-up: every device scale is read here, once
+        assert readbacks[0] == len(SCALE_ARGS)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            run(out=out, **on_dev)
+        assert readbacks[0] == len(SCALE_ARGS)
+    torch.cuda.synchronize()
+    for _ in range(2):
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+    # host values need no warm-up
+    with torch.cuda.stream(s):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            run(out=out, **values)
+    torch.cuda.synchronize()
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref) and readbacks[0] == len(SCALE_ARGS)
+
+
+@needs_device
+def test_collected_scale_tensor_leaves_no_cache_entry(readbacks):
+    """The remembered value belongs to the tensor object, not to its address: the entry of a collected tensor is dropped, and
+    an entry that outlived its tensor cannot answer for a new tensor at the same ``id``."""
+    import gc
+    import weakref
+
+    from flashinfer.attention.batch_invariant import neutral
+
+    dev = torch.device("cuda")
+    t = torch.ones(1, device=dev)
+    key = id(t)
+    assert neutral.resolve_scale("attention.bf16", "q_scale", t) == 1.0
+    assert key in neutral._DEVICE_SCALES and readbacks[0] == 1
+    del t
+    gc.collect()
+    assert key not in neutral._DEVICE_SCALES
+    # a stale entry under a live tensor's id (what address reuse would leave if the entry were kept): the weak reference does
+    # not point at the tensor asked about, so the tensor is read
+    dead = torch.ones(1, device=dev)
+    stale = weakref.ref(dead)
+    live = torch.full((1,), 2.0, device=dev)
+    neutral._DEVICE_SCALES[id(live)] = (stale, live._version, 1.0)
+    assert neutral.resolve_scale("attention.bf16", "q_scale", live) == 2.0
+    assert readbacks[0] == 2
+    del dead
+    gc.collect()
+    assert (
+        neutral._DEVICE_SCALES[id(live)][0]() is live
+    )  # the stale reference's death did not drop the live entry
+    assert neutral.resolve_scale("attention.bf16", "q_scale", live) == 2.0
+    assert readbacks[0] == 2

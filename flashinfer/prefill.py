@@ -3265,7 +3265,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales:
             ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is
             accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any
-            other value raises. CUDA graphs: capture
+            other value raises. A scale is a number or a one-element floating-point tensor; a device
+            tensor is read back once per tensor version (not per call) and must have been passed to a call before a CUDA-graph
+            capture of ``run()``. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -6063,7 +6065,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales:
             ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is
             accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any
-            other value raises. CUDA graphs: capture
+            other value raises. A scale is a number or a one-element floating-point tensor; a device
+            tensor is read back once per tensor version (not per call) and must have been passed to a call before a CUDA-graph
+            capture of ``run()``. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
