@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import math
 import os
+import weakref
 from dataclasses import dataclass, replace
 from typing import (
     Any,
@@ -26,6 +27,7 @@ from typing import (
     Literal,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
     cast,
@@ -3034,6 +3036,10 @@ _CAKE_MLA_TABLE_MEMO: Dict[Any, Any] = {}
 _CAKE_MLA_TABLE_MEMO_OWNER: List[Any] = [None]
 _CAKE_MLA_MEMO_LIMIT = 4096
 _MISSING = object()
+# ``(device facts function, device index)`` of the devices without Cake
+# programs (not SM100a/SM103a): ``_device_facts`` caches only its result, so
+# without this an auto call there would pay a capability query and a raise.
+_CAKE_MLA_NO_PROGRAM_DEVICES: Set[Tuple[Any, int]] = set()
 
 
 def _cake_mla_table_memo() -> Dict[Any, Any]:
@@ -3060,9 +3066,13 @@ def _cake_mla_auto_batch_ranges(
     SM100a/SM103a."""
     if has_sinks:
         return ()
+    device_facts = _cake_mla_module()._device_facts
+    if (device_facts, device_index) in _CAKE_MLA_NO_PROGRAM_DEVICES:
+        return ()
     try:
-        arch, num_sms = _cake_mla_module()._device_facts(device_index)
-    except RuntimeError:
+        arch, num_sms = device_facts(device_index)
+    except RuntimeError:  # not SM100a/SM103a: no Cake programs
+        _CAKE_MLA_NO_PROGRAM_DEVICES.add((device_facts, device_index))
         return ()
     memo = _cake_mla_table_memo()
     key = ("ranges", arch, num_sms, dtype, page_size, q_len, max_seq_len)
@@ -4023,10 +4033,11 @@ def _mla_cake_margin_tuning_config(
 # Second-stage decisions of lookup-only calls, keyed by
 # ``(memo_key, batch ranges, first-stage selection)``, where ``memo_key`` (built
 # by the dispatcher) holds every argument and tensor size, dtype and device the
-# two stages' lookups and the Cake checks read. A value is ``(tuner, tuner
-# state, offer table, families, launch plan, FP8 decode table)``; ``families``
-# is ``None`` for a decision to run the first stage's selection. See
-# ``_mla_cake_stage_two``. Bounded like ``_CAKE_MLA_TABLE_MEMO``.
+# two stages' lookups and the Cake checks read. A value is ``(weak reference
+# to the tuner, tuner state, offer table, families, launch plan, FP8 decode
+# table)``; ``families`` is ``None`` for a decision to run the first stage's
+# selection. The weak reference keeps an entry from holding a discarded tuner
+# alive. See ``_mla_cake_stage_two``. Bounded like ``_CAKE_MLA_TABLE_MEMO``.
 _CAKE_MLA_STAGE_TWO_MEMO: Dict[Any, Any] = {}
 
 
@@ -4122,7 +4133,7 @@ def _mla_cake_stage_two(
             entry, state = None, None
         if (
             entry is not None
-            and entry[0] is tuner
+            and entry[0]() is tuner
             and entry[1] == state
             and entry[2] is _CAKE_MLA_AUTO_OFFERS
         ):
@@ -4203,7 +4214,9 @@ def _mla_cake_stage_two(
     if cake_ok:
         try:
             plan = cake._launch_plan(inputs)
-        except Exception:
+        except (RuntimeError, ValueError, KeyError):
+            # No resolved launch for these sizes: ``forward`` takes the
+            # dispatcher. Any other error is a defect and propagates.
             plan = None
         cake._plan = plan
     # Memoize only a decision no readiness check (or failure) took part in.
@@ -4211,7 +4224,7 @@ def _mla_cake_stage_two(
         if len(_CAKE_MLA_STAGE_TWO_MEMO) > _CAKE_MLA_MEMO_LIMIT:
             _CAKE_MLA_STAGE_TWO_MEMO.clear()
         _CAKE_MLA_STAGE_TWO_MEMO[memo_entry_key] = (
-            tuner,
+            weakref.ref(tuner),
             state,
             _CAKE_MLA_AUTO_OFFERS,
             cake._validated_families if cake_ok else None,

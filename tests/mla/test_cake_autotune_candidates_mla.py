@@ -258,6 +258,23 @@ def _offer_case(monkeypatch, case, domain=None):
     monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {key: (unit,)})
 
 
+@pytest.fixture(autouse=True)
+def _clear_cake_mla_memos():
+    """Every test starts and ends without memoized Cake host facts or
+    second-stage decisions (they are process-global)."""
+
+    def clear():
+        core._CAKE_MLA_STAGE_TWO_MEMO.clear()
+        core._CAKE_MLA_TABLE_MEMO.clear()
+        core._CAKE_MLA_TABLE_MEMO_OWNER[0] = None
+        core._CAKE_MLA_NO_PROGRAM_DEVICES.clear()
+        core._cake_mla_auto_static_reason.cache_clear()
+
+    clear()
+    yield
+    clear()
+
+
 @pytest.fixture
 def clean_tuner(monkeypatch):
     monkeypatch.delenv(DISABLE_ENV, raising=False)
@@ -1512,7 +1529,7 @@ def test_second_stage_memo_skipped_under_replay_diagnostics(monkeypatch, stages)
         assert _decision(stages.select(4, memo=True)) == ("cake", WINNER)
     assert lookups[0] == 3
     assert not any(
-        entry[0] is stages.tuner for entry in core._CAKE_MLA_STAGE_TWO_MEMO.values()
+        entry[0]() is stages.tuner for entry in core._CAKE_MLA_STAGE_TWO_MEMO.values()
     )
     assert [record["op"] for record in report.records] == [core._MLA_DECODE_OP] * 3
 
@@ -1627,12 +1644,18 @@ def test_offered_batch_ranges_follow_the_offer_table(monkeypatch, cake_families)
     monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {})
     assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 1024)
 
+    queries = []
+
     def not_blackwell(index):
+        queries.append(index)
         raise RuntimeError("requires compute capability 10.0 or 10.3")
 
     monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", dict(_SYNTHETIC_OFFERS))
     monkeypatch.setattr(cake_module, "_device_facts", not_blackwell)
-    assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 1024)
+    for _ in range(3):
+        assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 1024)
+    # A device without Cake programs is queried once, not on every call.
+    assert queries == [0]
 
 
 def test_cake_families_memo_follows_the_offer_table(
