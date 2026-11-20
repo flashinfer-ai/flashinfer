@@ -45,11 +45,8 @@ def _make(M, N, K, seed=0, device="cuda"):
 
 
 def _reference(x, wq, ws):
-    """fp32 emulation of the contract with the STOCK scale_1x128 activation
-    quantization semantics: scale = 448/amax for nonzero amax, the identity
-    scale for an all-zero group, and NO epsilon clamp.  The kernel's scales
-    equal these bitwise for power-of-two amax (every exact probe below) and
-    stay within 1 ulp otherwise, well inside the tolerance checks."""
+    """FP32 reference: quantize with 448/amax (1 for an all-zero group),
+    then dequantize using the reciprocal multiplier before the dot product."""
     M, K = x.shape
     N = wq.shape[0]
     xf = x.float().view(M, K // G, G)
@@ -180,6 +177,25 @@ def test_small_amax_matches_stock_quantization(backend, exp):
 
 
 @requires_sm90
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+def test_normal_amax_below_replacement_floor(backend):
+    # Both FP32 scale factors are normal. With the floor the maximum maps
+    # near 420 and rounds to E4M3 416, rather than the unclamped 448.
+    x = torch.full((4, G), (15 / 16) * 2.0**-117, device="cuda", dtype=torch.bfloat16)
+    wq = torch.ones((64, G), device="cuda").to(torch.float8_e4m3fn)
+    ws = torch.full((1, 1), 2.0**117, device="cuda", dtype=torch.float32)
+    _reset_fp8bs_decodem_stats()
+    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+    assert _fp8bs_decodem_stats()["backend_dispatches"] == {
+        "specialized": 1,
+        "deepgemm": 0,
+    }
+    assert torch.equal(out, torch.full_like(out, 120))  # 128 * 15/16
+    stock = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="deepgemm")
+    torch.testing.assert_close(out, stock, atol=0, rtol=0.03)
+
+
+@requires_sm90
 def test_zero_amax_group_matches_stock_identity_scale():
     """An all-zero 1x128 activation group contributes exactly 0, as it does
     on the stock route (quantized zeros); nonzero groups in the same row are
@@ -193,6 +209,24 @@ def test_zero_amax_group_matches_stock_identity_scale():
     assert torch.equal(out, torch.full_like(out, 128.0))
     stock = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="deepgemm")
     assert torch.equal(out.view(torch.int16), stock.view(torch.int16))
+
+
+@requires_sm90
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (24, 4096, 128),  # single group, no next prefetch
+        (24, 3136, 1536),  # half-width last HMMA tile
+        (16, 3136, 24576),  # long enough to promote across a chunk boundary
+    ],
+)
+def test_hmma_prefetch_and_tail(shape):
+    x, wq, ws = _make(*shape, seed=31)
+    ref = _reference(x, wq, ws)
+    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+    assert _rel_fro(out, ref) <= 0.03
+    if shape[1] % 128:
+        assert _rel_fro(out[:, -64:], ref[:, -64:]) <= 0.03
 
 
 @requires_sm90
@@ -316,6 +350,20 @@ def test_cross_device_tensors_fall_back():
 
 
 @requires_sm90
+def test_n_zero_stays_on_stock_contract():
+    x, wq, ws = _make(4, 0, 128)
+    _reset_fp8bs_decodem_stats()
+    with pytest.raises(NotImplementedError, match="n_zero"):
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+    for backend in ("auto", "deepgemm"):
+        with pytest.raises(RuntimeError, match=r"(?i)weight.*null"):
+            fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+    st = _fp8bs_decodem_stats()
+    assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 2}
+    assert st["fallback_reasons"] == {"specialized: n_zero": 1, "auto: n_zero": 1}
+
+
+@requires_sm90
 def test_k_zero_stays_on_stock_contract():
     # the stock route rejects K == 0 (null input); the specialized backend
     # must not serve it either (several routes would leave `out` unwritten)
@@ -380,6 +428,162 @@ def test_jit_build_failure_falls_back_to_stock(monkeypatch):
     monkeypatch.setattr(mod, "_get_module", capture_boom)
     with pytest.raises(GraphCaptureJitError):
         fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+
+
+@requires_sm90
+@pytest.mark.parametrize(
+    "concurrent", [False, True], ids=["auto-first", "two-cold-callers"]
+)
+def test_cold_auto_build_failure(monkeypatch, caplog, concurrent):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from unittest.mock import Mock
+
+    import flashinfer.gemm.fp8bs_decodem_sm90 as mod
+
+    x, wq, ws = _make(4, 128, 256, seed=37)
+    ref = _reference(x, wq, ws)
+    torch.cuda.synchronize(x.device)
+    build = Mock(side_effect=RuntimeError("injected cold build failure"))
+    monkeypatch.setattr(mod, "_get_module", build)
+    monkeypatch.setitem(mod._stats, "jit_build", "not attempted")
+    _reset_fp8bs_decodem_stats()
+
+    def call(backend):
+        return fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+
+    if concurrent:
+        # Put both callers at lock entry, past the *old* failure check.
+        gate = Barrier(2, timeout=30)
+        lock = mod._jit_lock
+
+        class ColdLock:
+            def __enter__(self):
+                gate.wait()
+                lock.acquire()
+
+            def __exit__(self, *exc):
+                lock.release()
+
+        with monkeypatch.context() as ctx, ThreadPoolExecutor(2) as pool:
+            ctx.setattr(mod, "_jit_lock", ColdLock())
+            auto = pool.submit(call, "auto")
+            explicit = pool.submit(call, "specialized")
+            out = auto.result()
+            with pytest.raises(NotImplementedError, match="JIT build"):
+                explicit.result()
+    else:
+        out = call("auto")
+
+    assert _rel_fro(out, ref) <= 0.03
+    st = _fp8bs_decodem_stats()
+    assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 1}
+    reasons = {"auto: jit_build_failure": 1}
+    if concurrent:
+        reasons["specialized: jit_build_failure"] = 1
+    assert st["fallback_reasons"] == reasons
+    with pytest.raises(NotImplementedError, match="previously failed"):
+        call("specialized")
+    build.assert_called_once_with()
+    assert (
+        sum(
+            r.name == mod.logger.name
+            and r.levelname == "WARNING"
+            and "JIT build failed" in r.getMessage()
+            for r in caplog.records
+        )
+        == 1
+    )
+
+
+@pytest.fixture(scope="module")
+def native_rejection_module(tmp_path_factory):
+    from uuid import uuid4
+
+    from flashinfer.jit.gemm import fp8_blockscale as recipe
+
+    directory = tmp_path_factory.mktemp("decodem_native_rejection")
+    gen_spec = recipe.gen_jit_spec
+    operations = {
+        "fp8bs_gemm_decodem_sm90.cu": ("cudaLaunchKernelEx", 2),
+        "fp8bs_gemm_decodem_sm90_mwg.cu": ("cudaFuncSetAttribute", 1),
+    }
+
+    def private_spec(name, sources, **kwargs):
+        copies = []
+        for src in sources:
+            text = src.read_text()
+            if src.name in operations:
+                op, sites = operations[src.name]
+                # Redirect only the CUDA calls, not the code consuming their
+                # return values. Variadic forwarding preserves template commas.
+                assert text.count(op + "(") == sites
+                text = text.replace(op + "(", "FI_TEST_CUDA_CALL(")
+                anchor = '#include "fp8bs_gemm_decodem_sm90.h"'
+                assert text.count(anchor) == 1
+                wrapper = (
+                    "\n#include <cstdlib>\n"
+                    "#define FI_TEST_CUDA_CALL(...) "
+                    '(std::getenv("FLASHINFER_TEST_DECODEM_REJECT") != nullptr '
+                    f"? cudaErrorNotSupported : {op}(__VA_ARGS__))\n"
+                )
+                text = text.replace(anchor, anchor + wrapper)
+            copy = directory / src.name
+            copy.write_text(text)
+            copies.append(copy)
+        # Let the real recipe supply all flags, libraries and include paths.
+        return gen_spec(f"{name}_test_{uuid4().hex}", copies, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(recipe, "gen_jit_spec", private_spec)
+        spec = recipe.gen_fp8bs_gemm_decodem_sm90_module()
+    return spec.build_and_load()
+
+
+@requires_sm90
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+@pytest.mark.parametrize(
+    "shape,site",
+    [
+        ((4, 2048, 2048), "launch_ku"),
+        ((2, 7168, 2048), "launch_splitk_load_balanced"),
+        ((1, 8192, 1536), "mwg shared-memory opt-in"),
+    ],
+)
+def test_native_rejection_and_recovery(
+    monkeypatch, native_rejection_module, backend, shape, site
+):
+    import flashinfer.gemm.fp8bs_decodem_sm90 as mod
+
+    monkeypatch.setattr(mod, "_get_module", lambda: native_rejection_module)
+    monkeypatch.setitem(mod._stats, "jit_build", "built")
+    monkeypatch.delenv(SPECIALIZED_KERNEL_DISABLE_ENV, raising=False)
+    M, N, K = shape
+    x, wq, ws = _make(M, N, K, seed=17)
+    ref = _reference(x, wq, ws)
+    poison = torch.full((M, N), -1234, device=x.device, dtype=x.dtype)
+    out = poison.clone()
+
+    def call():
+        return fp8_blockscale_gemm_sm90(x, wq, None, ws, out=out, backend=backend)
+
+    _reset_fp8bs_decodem_stats()
+    monkeypatch.setenv("FLASHINFER_TEST_DECODEM_REJECT", "1")
+    # The failing branch returns a constant, without submitting work or
+    # setting CUDA's last-error slot. A post-launch check alone cannot pass.
+    with pytest.raises(RuntimeError, match=rf"{site}: operation not supported"):
+        call()
+    st = _fp8bs_decodem_stats()
+    assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 0}
+    assert st["fallback_reasons"] == {}
+    assert torch.equal(out, poison)
+
+    monkeypatch.delenv("FLASHINFER_TEST_DECODEM_REJECT")
+    call()
+    assert _rel_fro(out, ref) <= 0.03
+    st = _fp8bs_decodem_stats()
+    assert st["backend_dispatches"] == {"specialized": 1, "deepgemm": 0}
+    assert st["fallback_reasons"] == {}
 
 
 @requires_sm90

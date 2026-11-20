@@ -5,13 +5,10 @@
 An agent-generated kernel for the decode-M classes of
 :func:`flashinfer.gemm.fp8_blockscale_gemm_sm90` in its BF16-activation /
 FP8-weight / 128x128-block-scale form: the activation 1x128 per-token-group
-quantization happens inside the kernel with the stock route's scale_1x128
-semantics (no epsilon clamp: a nonzero amax scales by amax/448 — bitwise
-equal to the stock scales for power-of-two amax and within 1 ulp otherwise —
-and an all-zero group contributes exactly 0, as on the stock route; the
-kernel's internal floor, 2^-117, sits far below every BF16-normal
-magnitude), weights and their (ceil(N/128), K/128) float32 scale grid are
-consumed as passed.
+quantization happens inside the kernel. It uses the FP32 multiplier
+448/amax without an epsilon floor, or 1 for an all-zero group, and stores
+the reciprocal multiplier for dequantization. Weights and their
+(ceil(N/128), K/128) float32 scale grid are consumed as passed.
 
 Backend surface (#5667 semantics), driven from
 ``fp8_blockscale_gemm_sm90(..., backend=...)``:
@@ -55,11 +52,7 @@ _DISPATCH_FILE = "fp8bs_gemm_decodem_sm90_dispatch.json"
 # The measured decode-M envelope (captured serve rows span M in [1, 24];
 # interior points admitted by band interpolation, the study's banded form).
 _M_MAX = 24
-# The kernel implements the stock scale_1x128 quantization semantics
-# (no epsilon clamp: scale = amax/448 for nonzero amax; an all-zero group
-# contributes exactly 0 as on the stock route — the internal floor, 2^-117,
-# is far below every BF16-normal magnitude).  The launch parameter is
-# retained for ABI stability and ignored by the kernels' quantization.
+# Retained for launch ABI stability; fused quantization does not use epsilon.
 _QUANT_EPS = 0.0
 
 
@@ -239,51 +232,41 @@ def _fp8bs_decodem_try_dispatch(
                 "falls back — use backend='auto' or 'deepgemm'"
             )
         return None
-    if str(_stats["jit_build"]).startswith("failed"):
-        # a build failure is cached: `functools.cache` does not cache
-        # exceptions, and re-running Ninja on every eligible call (or during
-        # a later graph capture, where the retry would surface as a capture
-        # error instead of the warmed stock route) helps nobody
-        _fallback(f"{requested}: jit_build_failure")
-        if requested == "specialized":
-            raise NotImplementedError(
-                "fp8_blockscale_gemm_sm90 backend='specialized' JIT build "
-                f"previously failed ({_stats['jit_build']}); an explicitly "
-                "selected backend never falls back — use backend='auto' or "
-                "'deepgemm'"
-            )
-        return None
-    try:
-        # The capture guard inside `_get_module` reads the CURRENT device's
-        # current stream; the native RunImpl launches on the OPERAND
-        # device's stream. Scope the check (and the build) to the operand's
-        # device so a capture on `input.device` is seen even when the
-        # thread's current device differs. The lock serializes cold builds
-        # (see `_jit_lock`).
-        with _jit_lock, torch.cuda.device(input.device):
-            module = _get_module()
-    except GraphCaptureJitError:
-        raise  # the capture-without-warmup error above must surface
-    except Exception as e:
-        if _stats["jit_build"] == "not attempted":
-            logger.warning(
-                "fp8bs_gemm_decodem_sm90: specialized kernel JIT build failed%s",
-                "; serving via the stock route"
-                if requested == "auto"
-                else "; explicit backend='specialized' raises",
-                exc_info=True,
-            )
-        if _stats["jit_build"] != "built":
-            # never record a failure over a concurrently cached module
-            _stats["jit_build"] = f"failed ({str(e)[:120]})"
-        _fallback(f"{requested}: jit_build_failure")
-        if requested == "specialized":
-            raise NotImplementedError(
-                "fp8_blockscale_gemm_sm90 backend='specialized' JIT build "
-                f"failed ({str(e)[:200]}); an explicitly selected backend "
-                "never falls back — use backend='auto' or 'deepgemm'"
-            ) from e
-        return None
+    with _jit_lock:
+        state = _stats["jit_build"]
+        if state.startswith("failed"):
+            _fallback(f"{requested}: jit_build_failure")
+            if requested == "specialized":
+                raise NotImplementedError(
+                    "fp8_blockscale_gemm_sm90 backend='specialized' JIT build "
+                    f"previously failed ({state}); an explicitly selected backend "
+                    "never falls back — use backend='auto' or 'deepgemm'"
+                )
+            return None
+        try:
+            # Check graph capture on the device whose stream runs the kernel.
+            with torch.cuda.device(input.device):
+                module = _get_module()
+        except GraphCaptureJitError:
+            raise
+        except Exception as e:
+            if state == "not attempted":
+                _stats["jit_build"] = f"failed ({str(e)[:120]})"
+                logger.warning(
+                    "fp8bs_gemm_decodem_sm90: specialized kernel JIT build failed%s",
+                    "; serving via the stock route"
+                    if requested == "auto"
+                    else "; explicit backend='specialized' raises",
+                    exc_info=True,
+                )
+            _fallback(f"{requested}: jit_build_failure")
+            if requested == "specialized":
+                raise NotImplementedError(
+                    "fp8_blockscale_gemm_sm90 backend='specialized' JIT build "
+                    f"failed ({str(e)[:200]}); an explicitly selected backend "
+                    "never falls back — use backend='auto' or 'deepgemm'"
+                ) from e
+            return None
     module.run(input, weight, weight_scale, _QUANT_EPS, out)
     _stats["backend_dispatches"]["specialized"] += 1
     return out

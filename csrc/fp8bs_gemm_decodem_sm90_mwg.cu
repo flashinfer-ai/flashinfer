@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
 #include <cstring>
@@ -28,12 +29,10 @@ static void launch(dim3 grid, cudaStream_t stream, const __nv_bfloat16* x, const
   constexpr int SMEM = (COMPUTE > REDUCE ? COMPUTE : REDUCE) + 1024;
   // Set per launch: cudaFuncSetAttribute applies to the current device only,
   // so a once-per-process flag would skip the opt-in on every later device.
-  // On failure skip the launch; the error is sticky and surfaces through the
-  // entry point's post-dispatch cudaGetLastError check.
-  if (cudaFuncSetAttribute(mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant,
-                                      PipelineMMA, DenseM>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
-    return;
+  const cudaError_t err = cudaFuncSetAttribute(
+      mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant, PipelineMMA, DenseM>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+  TVM_FFI_ICHECK_EQ(err, cudaSuccess) << "mwg shared-memory opt-in: " << cudaGetErrorString(err);
   mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant, PipelineMMA, DenseM>
       <<<grid, 128 * NWG, SMEM, stream>>>(x, w, ws, eps, out, M, N, K);
 }

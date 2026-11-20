@@ -65,7 +65,9 @@ static void launch_ku(dim3 grid, bool lb, cudaStream_t stream, const __nv_bfloat
     attribute.val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = &attribute;
     config.numAttrs = 1;
-    cudaLaunchKernelEx(&config, kern, x, weight, weight_scale, eps, out, M, N, K);
+    const cudaError_t err =
+        cudaLaunchKernelEx(&config, kern, x, weight, weight_scale, eps, out, M, N, K);
+    TVM_FFI_ICHECK_EQ(err, cudaSuccess) << "launch_ku: " << cudaGetErrorString(err);
   } else {
     kern<<<grid, 128, PUSH_BYTES, stream>>>(x, weight, weight_scale, eps, out, M, N, K);
   }
@@ -138,11 +140,12 @@ static void launch_splitk_load_balanced(dim3 grid, cudaStream_t stream, const __
   attribute.val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
   config.attrs = &attribute;
   config.numAttrs = 1;
-  cudaLaunchKernelEx(
+  const cudaError_t err = cudaLaunchKernelEx(
       &config,
       fp8_blockscale_wgmma_splitk_kernel<MT, SPLIT, KeepX, PackMT8, PushDSM, false, false, false,
                                          CompactM2, ScaleOpt, false, AsyncM2, DenseN>,
       x, weight, weight_scale, eps, out, M, N, K);
+  TVM_FFI_ICHECK_EQ(err, cudaSuccess) << "launch_splitk_load_balanced: " << cudaGetErrorString(err);
 }
 
 static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale,

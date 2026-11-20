@@ -183,16 +183,8 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(const __nv_bfloat16* 
           am = o > am ? o : am;
         }
         float amax = __uint_as_float(am << 16);
-        // Stock scale_1x128 semantics: the clamp floor is 2^-117 and fires
-        // only for amax == 0 (exactly the stock zero contribution) or an
-        // amax below 2^-117 — far under any BF16-normal magnitude — where
-        // both routes' outputs round to the same BF16 value.  Every other
-        // amax scales by amax/448 unclamped (bitwise-stock for power-of-two
-        // amax, <=1 ulp otherwise).  448/cl stays finite (<= 448*2^117 <
-        // FLT_MAX), so no 0*inf NaN can form.
-        float cl = fmaxf(amax, 6.019e-36f);
-        if (qt == 0) dsc[m] = (m < Mloc) ? (cl * (1.0f / 448.0f)) : 0.0f;
-        float inv = __fdividef(448.0f, cl);
+        const float inv = amax == 0.0f ? 1.0f : __fdiv_rn(448.0f, amax);
+        if (qt == 0) dsc[m] = (m < Mloc) ? __frcp_rn(inv) : 0.0f;
         const int sw = m & 1;
         uint4 s0, s1;
         s0.x = q2(blo(v0.x) * inv, bhi(v0.x) * inv);
@@ -243,10 +235,13 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(const __nv_bfloat16* 
         }
       }
 
-      c0 = n0;
-      c1 = n1;
-      c2 = n2;
-      c3 = n3;
+      // A prefetched group may belong to the next chunk, but not the next rank.
+      if (cb + i + WK < kg_end) {
+        c0 = n0;
+        c1 = n1;
+        c2 = n2;
+        c3 = n3;
+      }
       if (pf < kg_end) {
         LOADW(n0, n1, n2, n3, pf);
         pf += WK;

@@ -4,7 +4,7 @@
   "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
   "ops": {
     "fp8_blockscale_gemm_sm90": {
-      "form": "BF16 activations (internal fused 1x128 per-token-group quantization, stock scale_1x128 semantics: no epsilon clamp, amax/448 scale for nonzero amax, an all-zero group contributes exactly 0; internal floor 2^-117, far below BF16-normal magnitudes), FP8 e4m3 weights (N, K), float32 128x128 block scale grid (ceil(N/128), K/128), BF16 output",
+      "form": "BF16 activations (internal fused 1x128 per-token-group quantization, no epsilon floor; FP32 quantization multiplier 448/amax for nonzero amax, identity for an all-zero group; reciprocal multiplier for dequantization), FP8 e4m3 weights (N, K), float32 128x128 block scale grid (ceil(N/128), K/128), BF16 output",
       "m_band": [1, 24],
       "band_note": "the measured decode-M envelope (captured serve rows M in {1,2,4,8,12,16,24}); interior points admitted by band interpolation; larger M stays on the stock route",
       "alignment": {"k_multiple_of": 128, "n_multiple_of": 64},

@@ -120,17 +120,8 @@ __device__ __forceinline__ void quantize_row_warp(uint2 raw, uint8_t* bq, float*
   m = m > o ? m : o;
   m = warp_max_u32(m);
   const float gmax = __uint_as_float(m << 16);
-  // Stock scale_1x128 semantics: the clamp floor is 2^-117 and fires only
-  // for amax == 0 (exactly the stock zero contribution) or an amax below
-  // 2^-117 — far under any BF16-normal magnitude — where both routes'
-  // outputs round to the same BF16 value.  Every other amax scales by
-  // amax/448 unclamped (bitwise-stock for power-of-two amax, <=1 ulp
-  // otherwise).  448/cl stays finite (<= 448*2^117 < FLT_MAX), so no 0*inf
-  // NaN can form.
-  const float cl = fmaxf(gmax, 6.019e-36f);
-  const float scale = cl * (1.0f / 448.0f);
-  const float inv_scale = __fdividef(448.0f, cl);
-  if (lane == 0) ascale[row] = scale;
+  const float inv_scale = gmax == 0.0f ? 1.0f : __fdiv_rn(448.0f, gmax);
+  if (lane == 0) ascale[row] = __frcp_rn(inv_scale);
   Bf16Pair p0, p1;
   p0.u32 = w0;
   p1.u32 = w1;
@@ -197,17 +188,8 @@ __device__ __forceinline__ void quantize_row_half(uint4 raw, uint8_t* bq, float*
     }
     gmax = __uint_as_float(m_bits);
   }
-  // Stock scale_1x128 semantics: the clamp floor is 2^-117 and fires only
-  // for amax == 0 (exactly the stock zero contribution) or an amax below
-  // 2^-117 — far under any BF16-normal magnitude — where both routes'
-  // outputs round to the same BF16 value.  Every other amax scales by
-  // amax/448 unclamped (bitwise-stock for power-of-two amax, <=1 ulp
-  // otherwise).  448/cl stays finite (<= 448*2^117 < FLT_MAX), so no 0*inf
-  // NaN can form.
-  const float clamped = fmaxf(gmax, 6.019e-36f);
-  const float scale = clamped * (1.0f / 448.0f);
-  if (sublane == 0) ascale[row] = scale;
-  const float inv_scale = __fdividef(448.0f, clamped);
+  const float inv_scale = gmax == 0.0f ? 1.0f : __fdiv_rn(448.0f, gmax);
+  if (sublane == 0) ascale[row] = __frcp_rn(inv_scale);
   const uint2 result =
       make_uint2(static_cast<uint32_t>(fp8x2(f[0] * inv_scale, f[1] * inv_scale)) |
                      (static_cast<uint32_t>(fp8x2(f[2] * inv_scale, f[3] * inv_scale)) << 16),
