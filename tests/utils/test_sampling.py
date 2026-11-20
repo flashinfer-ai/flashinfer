@@ -2648,11 +2648,15 @@ def test_sampling_strided_indices(dtype):
     """
     torch.manual_seed(42)
     probs = torch.softmax(torch.randn(8, 128, device="cuda:0"), dim=-1)
+    logits = torch.randn(8, 128, device="cuda:0")
     idx = _strided_per_row_indices(probs.size(0), dtype)
     packed = idx.contiguous()
     top_k = torch.full((probs.size(0),), 64, dtype=torch.int32, device="cuda:0")
 
     cases = {
+        "sampling_from_logits": lambda i: flashinfer.sampling.sampling_from_logits(
+            logits, i, seed=7, offset=0
+        ),
         "sampling_from_probs": lambda i: flashinfer.sampling.sampling_from_probs(
             probs, i, seed=7, offset=0
         ),

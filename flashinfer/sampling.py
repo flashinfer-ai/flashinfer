@@ -228,18 +228,19 @@ def _blackwell_softmax_launches_with_pdl(device_index: int) -> bool:
 def _pack_per_row_param(
     maybe_param_arr: Optional[torch.Tensor], dtype: torch.dtype
 ) -> Optional[torch.Tensor]:
-    """Cast a per-row sampling argument to the dtype the kernel reads and pack it.
+    """Pack the per-row sampling arguments the kernels read by linear index.
 
-    ``top_k_arr`` and the ``indices`` row mapping are indexed linearly by row
-    (``top_k_arr[row_idx]``, ``indices[bx]``) in the kernels, while
-    ``Tensor.to`` preserves strides. A view such as ``params[:, 0]`` would
-    therefore make row ``i`` read ``params[2 * i]``. Contiguous tensors are
-    returned unchanged, so the common path does not copy.
+    Kernels index ``top_k_arr[row_idx]`` and ``indices[bx]`` linearly, so a
+    strided view such as ``params[:, 0]`` would have row ``i`` read storage
+    slot ``i`` (row ``2 * i``'s value) instead of its own. ``Tensor.to`` keeps
+    strides, so pack in the kernel's dtype regardless. Contiguous tensors are
+    returned unchanged.
     """
     if maybe_param_arr is None:
         return None
-    param_arr = maybe_param_arr.to(dtype)
-    return param_arr if param_arr.is_contiguous() else param_arr.contiguous()
+    if maybe_param_arr.dtype != dtype:
+        maybe_param_arr = maybe_param_arr.to(dtype)
+    return maybe_param_arr.contiguous()
 
 
 @functools.cache
@@ -295,6 +296,8 @@ def get_sampling_module():
         logits = logits.float()
         batch_size = indices.size(0) if indices is not None else logits.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
+        if indices is not None:
+            indices = _pack_per_row_param(indices, indices.dtype)
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         if seed is None or offset is None:
             seed, offset = get_seed_and_offset(
@@ -344,6 +347,8 @@ def get_sampling_module():
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
+        if indices is not None:
+            indices = _pack_per_row_param(indices, indices.dtype)
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
@@ -408,6 +413,8 @@ def get_sampling_module():
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
+        if indices is not None:
+            indices = _pack_per_row_param(indices, indices.dtype)
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
@@ -471,6 +478,8 @@ def get_sampling_module():
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
+        if indices is not None:
+            indices = _pack_per_row_param(indices, indices.dtype)
         # The kernel reads top_k_arr with the element type it uses for indices and
         # output (IdType), so the threshold tensor has to carry that dtype. Casting
         # unconditionally to int32 makes an int64 indices path reinterpret two int32
@@ -543,6 +552,8 @@ def get_sampling_module():
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
+        if indices is not None:
+            indices = _pack_per_row_param(indices, indices.dtype)
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
@@ -610,6 +621,8 @@ def get_sampling_module():
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
+        if indices is not None:
+            indices = _pack_per_row_param(indices, indices.dtype)
         # See top_k_sampling_from_probs: top_k_arr is read as IdType by the kernel.
         maybe_top_k_arr = _pack_per_row_param(maybe_top_k_arr, out_dtype)
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
@@ -1639,8 +1652,6 @@ def sampling_from_probs(
         raise ValueError(
             "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
-    if indices is not None:
-        indices = _pack_per_row_param(indices, indices.dtype)
     return get_sampling_module().sampling_from_probs(
         probs,
         indices,
@@ -1812,8 +1823,6 @@ def top_p_sampling_from_probs(
         raise ValueError(
             "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
-    if indices is not None:
-        indices = _pack_per_row_param(indices, indices.dtype)
     return get_sampling_module().top_p_sampling_from_probs(
         probs,
         indices,
@@ -1983,8 +1992,6 @@ def top_k_sampling_from_probs(
         raise ValueError(
             "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
-    if indices is not None:
-        indices = _pack_per_row_param(indices, indices.dtype)
     return get_sampling_module().top_k_sampling_from_probs(
         probs,
         indices,
@@ -2150,8 +2157,6 @@ def min_p_sampling_from_probs(
         raise ValueError(
             "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
-    if indices is not None:
-        indices = _pack_per_row_param(indices, indices.dtype)
     return get_sampling_module().min_p_sampling_from_probs(
         probs,
         indices,
@@ -2544,8 +2549,6 @@ def top_k_top_p_sampling_from_logits(
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
-        if indices is not None:
-            indices = _pack_per_row_param(indices, indices.dtype)
         return get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
             indices,
@@ -2781,8 +2784,6 @@ def top_k_top_p_sampling_from_probs(
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
-        if indices is not None:
-            indices = _pack_per_row_param(indices, indices.dtype)
         return get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
             indices,
