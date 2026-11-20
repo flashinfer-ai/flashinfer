@@ -279,6 +279,171 @@ def test_auto_routes_to_specialized_for_multi_request_full_prefill():
     assert torch.equal(out, _reference_rows(inp))
 
 
+@requires_sm103
+@requires_validated_toolkit
+@pytest.mark.parametrize("other_current_device", [False, True])
+def test_native_wrapper_live_status_and_padding(other_current_device):
+    inp = _mk([122], [122], seed=56)
+    w = _wrapper(inp, max_bs=1)
+    state = w._capacity_plan._state
+    dev = inp["k"].device
+    if other_current_device and torch.cuda.device_count() < 2:
+        pytest.skip("second current device unavailable")
+    current = (dev.index + int(other_current_device)) % torch.cuda.device_count()
+    q = torch.cat((inp["q"], inp["q"][:1]))
+    weights = torch.ones((123, H), device=dev)
+    weights[-1].fill_(float("nan"))  # not a live row
+    weights[0].view(torch.int32).fill_(1)  # smallest positive subnormal
+    weights[1].fill_(float("inf"))
+    scale = inp["k_scale"]
+    out = torch.empty(123, TOPK, dtype=torch.int32, device=dev)
+    ref = _reference_rows(inp)
+    calls = []
+    for name in ("check", "unpack"):
+        fn = state[name]
+
+        def counted(*args, fn=fn, name=name):
+            calls.append(name)
+            return fn(*args)
+
+        state[name] = counted
+    with torch.cuda.device(current):
+
+        def run():
+            return w.run(q, weights, inp["k"], k_scale=scale, out=out)
+
+        assert run() is out
+        assert calls == ["check", "unpack"]
+        assert torch.equal(out[:-1], ref) and (out[-1] == -1).all()
+        weights[12].fill_(float("nan"))
+        scale[-1] = 0  # padded K row must still be checked
+        with pytest.raises(ValueError, match="unit k_scale"):
+            run()
+        assert state["status"].item() == 3
+        scale[-1] = 1
+        with pytest.raises(ValueError, match="per-row-constant"):
+            run()
+        weights[12].fill_(2)
+        assert run() is out and torch.equal(out[:-1], ref)
+        assert state["status"].item() == w.repair_error.item() == 0
+
+    # Exercise each compatibility gate separately, without repacking views.
+    for which in ("weights", "scale", "out"):
+
+        def view(x, name):
+            if which != name:
+                return x
+            padded = x.new_empty((*x.shape, 2))
+            padded[..., 0].copy_(x)
+            return padded[..., 0]
+
+        dst = view(out, "out")
+        dst.fill_(-2)
+        calls.clear()
+        got = w.run(
+            q, view(weights, "weights"), inp["k"], k_scale=view(scale, "scale"), out=dst
+        )
+        assert got is dst and torch.equal(dst[:-1], ref) and (dst[-1] == -1).all()
+        assert not calls
+
+
+@requires_sm103
+@requires_validated_toolkit
+@pytest.mark.parametrize("explicit_out", [False, True])
+@pytest.mark.parametrize("saved_word", ["out", "repair_error"])
+def test_native_wrapper_notifies_saved_tensor_mutation(explicit_out, saved_word):
+    class SaveIndex(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, index):
+            ctx.save_for_backward(index)
+            return x.clone()
+
+        @staticmethod
+        def backward(ctx, grad):
+            _ = ctx.saved_tensors
+            return grad, None
+
+    inp = _mk([122], [122], seed=57)
+    w = _wrapper(inp, max_bs=1)
+    out = (
+        torch.empty(122, TOPK, dtype=torch.int32, device=inp["q"].device)
+        if explicit_out
+        else None
+    )
+
+    def run():
+        return w.run(
+            inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=out
+        )
+
+    first = run()
+    saved = first if saved_word == "out" else w.repair_error
+    value = torch.ones((), device=inp["q"].device, requires_grad=True)
+    loss = SaveIndex.apply(value, saved)
+    run()
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        loss.backward()
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_wrapper_predicate_views_and_dtype_copy():
+    inp = _mk([122], [122], seed=58)
+    w = _wrapper(inp, max_bs=1)
+    gold = _reference_rows(inp)
+    weights = inp["weights"].clone().requires_grad_()
+    scale = inp["k_scale"].clone().requires_grad_()
+    got = w.run(inp["q"], weights, inp["k"], k_scale=scale)
+    assert torch.equal(got, gold)
+    assert weights.grad is None and scale.grad is None
+    weights = torch._neg_view(-inp["weights"])
+    scale = torch._neg_view(-inp["k_scale"])
+    out = torch.empty(123, TOPK, dtype=torch.float64, device=inp["q"].device)
+    got = w.run(inp["q"], weights, inp["k"], k_scale=scale, out=out)
+    assert got is out and torch.equal(got[:122], gold.to(torch.float64))
+    assert bool((got[122:] == -1).all())
+    with torch.inference_mode():
+        inference_out = torch.empty(
+            122, TOPK, dtype=torch.int32, device=inp["q"].device
+        )
+    with pytest.raises(RuntimeError, match="Inference tensor"):
+        w.run(
+            inp["q"],
+            inp["weights"],
+            inp["k"],
+            k_scale=inp["k_scale"],
+            out=inference_out,
+        )
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_native_wrapper_uses_input_current_stream():
+    inp = _mk([122], [122], seed=59)
+    w = _wrapper(inp, max_bs=1)
+    dev = inp["q"].device
+    out = torch.empty(122, TOPK, dtype=torch.int32, device=dev)
+    w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=out)
+    inp["weights"].zero_()
+    stream = torch.cuda.Stream(device=dev)
+    stream.wait_stream(torch.cuda.current_stream(dev))
+    other = (dev.index + 1) % torch.cuda.device_count()
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(2000000)
+        inp["weights"].fill_(2)
+        with torch.cuda.device(other):
+            assert (
+                w.run(
+                    inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=out
+                )
+                is out
+            )
+        consumed = out.clone()
+        done = stream.record_event()
+    torch.cuda.current_stream(dev).wait_event(done)
+    assert torch.equal(consumed, _reference_rows(inp))
+
+
 def test_packed_to_topk_conversion_matches_sort_reference():
     """The every-4th-column + lane-mask conversion equals the sort-based
     conversion it replaced, on synthetic packed rows built per the packed
@@ -507,7 +672,23 @@ def test_captured_replay_enforces_contract_on_live_values(backend_kw):
     graph.replay()
     torch.cuda.synchronize()
     assert bool((out == -1).all())
-    assert w.repair_error.item() & 16
+    assert w.repair_error.item() == 16
+    k_scale.fill_(1)
+    old_error = w.repair_error
+    if backend_kw["backend"] == "auto":
+        # Demote eagerly with a different weight tensor. Only the router's
+        # retirement list now owns the original plan and its status scratch.
+        bad = weights.clone()
+        bad[:, 0] = 100
+        w.run(inp["q"], bad, inp["k"], k_scale=k_scale)
+        assert w.resolved_backend == "cutedsl"
+    old_error.fill_(4)
+    weights[0].zero_()
+    graph.replay()
+    assert bool((out == -1).all()) and old_error.item() == 20
+    weights[0].fill_(1)
+    graph.replay()
+    assert torch.equal(out, gold) and old_error.item() == 20
 
 
 @requires_sm103

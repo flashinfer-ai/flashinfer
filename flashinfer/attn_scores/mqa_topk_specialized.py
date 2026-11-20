@@ -292,7 +292,8 @@ class SpecializedTopKPlan:
         # demote to a working backend.
         try:
             with torch.cuda.device(self._device):
-                get_fp8_paged_mqa_topk_indexer_module()
+                mod = get_fp8_paged_mqa_topk_indexer_module()
+                check, unpack = mod.wrapper_check, mod.wrapper_unpack
         except Exception as e:
             raise ValueError(
                 f"backend='specialized' kernel module unavailable ({type(e).__name__})"
@@ -369,6 +370,9 @@ class SpecializedTopKPlan:
             visible=visible.to(dev),
             cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=dev),
             page_table=table.to(dev),
+            check=check,
+            unpack=unpack,
+            status=torch.empty(1, dtype=torch.int32, device=dev),
             scratch=torch.empty(t, PACKED_WIDTH, dtype=torch.int32, device=dev),
             # row r of the packed output holds exactly min(visible[r], 512)
             # selected complete blocks; precompute the lane mask the
@@ -418,21 +422,57 @@ class SpecializedTopKPlan:
         # weights/k_scale and, on violation, fails closed below (-1 rows,
         # repair_error bit 16) instead of returning a selection computed
         # from stale values.
-        contract_ok = (
-            torch.all(k_scale == 1.0)
-            & torch.all(weights[:t] == weights[:t, :1])
-            & torch.all(weights[:t, 0] > 0)
+        # Keep torch's view, conversion and copy semantics off the fast path.
+        prior_out = out if out is not None else self._out
+        inference_write_allowed = torch.is_inference_mode_enabled() or not (
+            self.repair_error.is_inference()
+            or (prior_out is not None and prior_out.is_inference())
         )
-        if not self._is_capturing():
-            if not bool(contract_ok.item()):
-                if not bool(torch.all(k_scale == 1.0).item()):
-                    raise ContractViolation(
-                        "backend='specialized' requires unit k_scale at run as well"
-                    )
-                raise ContractViolation(
-                    "backend='specialized' requires a positive per-row-constant "
-                    "weights matrix (selection is then weight-invariant)"
+        native = (
+            inference_write_allowed
+            and weights.device == k_scale.device == self._device
+            and weights.is_contiguous()
+            and k_scale.is_contiguous()
+            and not weights.is_neg()
+            and not k_scale.is_neg()
+            and (
+                out is None
+                or (
+                    out.device == self._device
+                    and out.dtype == torch.int32
+                    and out.ndim == 2
+                    and out.shape[0] >= t
+                    and out.shape[1] == _TOPK
+                    and out.is_contiguous()
+                    and not out.is_neg()
                 )
+            )
+        )
+        if native:
+            with torch.cuda.device(self._device):
+                st["check"](
+                    weights.detach(), k_scale.detach().view(-1), t, st["status"]
+                )
+            bad = 0 if self._is_capturing() else st["status"].item()
+        else:
+            scale_ok = torch.all(k_scale == 1.0)
+            contract_ok = (
+                scale_ok
+                & torch.all(weights[:t] == weights[:t, :1])
+                & torch.all(weights[:t, 0] > 0)
+            )
+            bad = 0
+            if not self._is_capturing() and not contract_ok.item():
+                bad = 2 if scale_ok.item() else 1
+        if bad & 1:
+            raise ContractViolation(
+                "backend='specialized' requires unit k_scale at run as well"
+            )
+        if bad:
+            raise ContractViolation(
+                "backend='specialized' requires a positive per-row-constant "
+                "weights matrix (selection is then weight-invariant)"
+            )
         packed = fp8_paged_mqa_topk_indexer(
             q[:t],
             pool,
@@ -441,14 +481,6 @@ class SpecializedTopKPlan:
             st["pos"],
             st["visible"],
             out=st["scratch"],
-        )
-        sel = _packed_rows_to_topk(packed, st["sel_mask"])
-        # fail closed when a captured replay's live values violate the
-        # contract: poison the selection and raise the numerical-contract
-        # bit (eager runs raised above, so this only fires on replays)
-        sel = torch.where(contract_ok, sel, torch.full_like(sel, -1))
-        self.repair_error.bitwise_or_(
-            torch.logical_not(contract_ok).to(torch.int32) * 16
         )
         if out is None:
             # the wrapper contract returns the full supplied Q extent
@@ -463,6 +495,19 @@ class SpecializedTopKPlan:
         # out may carry more rows than the plan's t live rows (the wrapper
         # contract allows a [Q, top_k] destination with Q >= t): write the
         # live rows and pad the rest, instead of a shape-mismatched copy_.
+        if native:
+            with torch.cuda.device(self._device):
+                st["unpack"](
+                    packed, st["visible"], st["status"], self.repair_error, out
+                )
+            # Raw CUDA writes must still notify saved-index users of mutation.
+            torch.autograd.graph.increment_version((out, self.repair_error))
+            return out
+        sel = _packed_rows_to_topk(packed, st["sel_mask"])
+        sel = torch.where(contract_ok, sel, torch.full_like(sel, -1))
+        self.repair_error.bitwise_or_(
+            torch.logical_not(contract_ok).to(torch.int32) * 16
+        )
         out[:t].copy_(sel)
         out[t:].fill_(-1)
         return out

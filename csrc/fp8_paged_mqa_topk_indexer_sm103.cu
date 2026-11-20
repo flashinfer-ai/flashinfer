@@ -414,6 +414,63 @@ void RunDispatch(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView c
     legacy::Run(qi, ck_cache, cpage_table, cu_seqlens, pos, visible, packed);
   }
 }
+#include <flashinfer/attention/fp8_paged_mqa_topk_indexer_sm103/wrapper.cuh>
+
+namespace {
+// Python enters the plan device before calling either private export.
+void CheckWrapperTensor(ffi::TensorView x, int dev, int code, int rank) {
+  auto dt = x.dtype();
+  if (x.device().device_type != kDLCUDA || x.device().device_id != dev || x.ndim() != rank ||
+      !x.IsContiguous() || dt.code != code || dt.bits != 32 || dt.lanes != 1)
+    throw std::invalid_argument("bad specialized wrapper tensor");
+}
+
+cudaStream_t WrapperStream(int dev) {
+  int current;
+  CheckedLaunch{nullptr, nullptr}.Check(cudaGetDevice(&current));
+  if (current != dev) throw std::invalid_argument("specialized wrapper device mismatch");
+  return static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, dev));
+}
+
+void WrapperCheck(ffi::TensorView w, ffi::TensorView scale, int64_t t, ffi::TensorView status) {
+  int dev = w.device().device_id;
+  CheckWrapperTensor(w, dev, kDLFloat, 2);
+  CheckWrapperTensor(scale, dev, kDLFloat, 1);
+  CheckWrapperTensor(status, dev, kDLInt, 1);
+  if (t <= 0 || t > w.size(0) || w.size(1) != 4 || status.size(0) != 1)
+    throw std::invalid_argument("bad specialized wrapper check extents");
+  auto stream = WrapperStream(dev);
+  wrapper_detail::Check<<<1, 256, 0, stream>>>(static_cast<const float*>(w.data_ptr()), t,
+                                               static_cast<const float*>(scale.data_ptr()),
+                                               scale.size(0), static_cast<int*>(status.data_ptr()));
+  CheckedLaunch{nullptr, stream}.Check(cudaGetLastError());
+}
+
+void WrapperUnpack(ffi::TensorView packed, ffi::TensorView vis, ffi::TensorView status,
+                   ffi::TensorView error, ffi::TensorView out) {
+  int dev = packed.device().device_id;
+  CheckWrapperTensor(packed, dev, kDLInt, 2);
+  CheckWrapperTensor(vis, dev, kDLInt, 1);
+  CheckWrapperTensor(status, dev, kDLInt, 1);
+  CheckWrapperTensor(error, dev, kDLInt, 1);
+  CheckWrapperTensor(out, dev, kDLInt, 2);
+  int64_t t = packed.size(0), rows = out.size(0);
+  if (t <= 0 || t != vis.size(0) || packed.size(1) != PWIDTH || status.size(0) != 1 ||
+      error.size(0) != 1 || rows < t || out.size(1) != BTOPK)
+    throw std::invalid_argument("bad specialized wrapper unpack extents");
+  auto stream = WrapperStream(dev);
+  wrapper_detail::Unpack<PWIDTH, BTOPK>
+      <<<static_cast<unsigned>(rows < 65535 ? rows : 65535), 256, 0, stream>>>(
+          static_cast<const int*>(packed.data_ptr()), static_cast<const int*>(vis.data_ptr()),
+          static_cast<const int*>(status.data_ptr()), static_cast<int*>(error.data_ptr()),
+          static_cast<int*>(out.data_ptr()), t, rows);
+  CheckedLaunch{nullptr, stream}.Check(cudaGetLastError());
+}
+}  // namespace
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(wrapper_check, WrapperCheck);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(wrapper_unpack, WrapperUnpack);
+
 static int64_t CompiledNvccRelease() {
 #if defined(__NVCC__) && defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__)
   return (int64_t{__CUDACC_VER_MAJOR__} << 32) | __CUDACC_VER_MINOR__;
