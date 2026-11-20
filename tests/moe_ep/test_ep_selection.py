@@ -1117,7 +1117,7 @@ def test_fixed_mega_preparation_is_coordinated_before_launch(monkeypatch, peer_f
         _bootstrap=object(),
         _workspace=object(),
         _megakernel_config=SimpleNamespace(knobs={}),
-        _get_transformed_weights=lambda: (),
+        get_transformed_weights=lambda: (),
         _kernel=SimpleNamespace(ep_prepare_fixed=lambda *a: events.append("compile")),
         stage_inputs=lambda t: events.append("stage"),
         compute_staged=lambda **kwargs: events.append("launch"),
@@ -1141,7 +1141,7 @@ def test_skipping_outer_tuning_preserves_explicit_mega_knobs(monkeypatch):
         _mega_config=MegaConfig(kernel),
         _kernel=Mock(),
         _bootstrap=BootstrapConfig(1, 0),
-        _get_transformed_weights=lambda: (),
+        get_transformed_weights=lambda: (),
     )
     construct = Mock()
     monkeypatch.setattr(selection, "MoEEpMegaLayer", construct)

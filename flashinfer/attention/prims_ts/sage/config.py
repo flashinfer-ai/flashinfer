@@ -44,7 +44,7 @@ def _validate_int8_qk_device(q_dtype: torch.dtype, device_index: int) -> None:
     capability = torch.cuda.get_device_capability(device_index)
     if capability not in _INT8_QK_COMPUTE_CAPABILITIES:
         raise NotImplementedError(
-            "Int8 Q/K Sage attention requires an SM100a/B200 GPU, whose tcgen05 "
+            "Int8 Q/K attention requires an SM100a/B200 GPU, whose tcgen05 "
             "MMA supports INT8 operands; use the torch.float8_e4m3fn Q/K recipe "
             f"on device cuda:{device_index} with compute capability {capability}"
         )

@@ -17,6 +17,13 @@ tensor of per-head sink logits, selects the class's sink member (``spec.sink_mer
 of logit ``sinks[h]`` (natural-log units of the scaled score, ``sm_scale`` not applied) and zero value, merged once after the
 row's last chunk; the LSE includes it. A call without sinks is the class without the step, bit for bit; the member's receipts
 are ``fingerprint(<wrapper>, head_dim=..., sinks=True[, lse_base=...])``. The tensor is read in place at every launch.
+A run with sinks and a run without are two members with different bits, so ``plan(..., has_sinks=True | False)`` declares
+which one the plan's runs are: a ``run()`` that departs from the declaration raises (``None``, the default, leaves the
+choice to each run). The check is made in Python at ``run()``, so capturing ``run()`` into a CUDA graph is unaffected.
+The values are not checked. A ``+inf`` or NaN sink gives NaN on its head's rows and a ``-inf`` sink the bits of the run
+without sinks (``spec.sink_merge``); the step works on the base-2 value ``mul(sinks[h], LOG2E)``, so a finite sink above
+about ``2.36e38`` (the value overflows to ``+inf``) gives NaN as well, and one below about ``-2.36e38`` (``-inf``) the
+bits of the run without sinks.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture -- unless the wrapper is the decode wrapper built with
@@ -48,6 +55,12 @@ device readback, and later plans run before every replay). The ragged prefill wr
 A plan's execution state (the split-KV partials in the workspace, the arrival counters) is single-use per launch: two ``run()``
 calls of one plan must be stream-ordered, as with every FlashInfer wrapper's workspace; the counters reset themselves at every
 launch, so sequential reuse on one stream needs nothing more.
+
+Call shapes of serving engines: an engine passes one argument list on every ``plan()`` / ``run()``, with neutral values where
+a feature is off. The arguments the class does not consume are accepted at the values that ask for nothing (``neutral.py``
+states the rule of each: unit ``q_scale`` / ``k_scale`` / ``v_scale`` / ``o_scale``, ``seq_lens`` / ``seq_lens_q`` /
+``block_tables`` that restate the CSR metadata, ``fixed_split_size``, ``disable_split_kv``) and refused at every other value;
+none of them changes an output bit.
 """
 
 from __future__ import annotations
@@ -58,7 +71,7 @@ from typing import Optional, Tuple
 import torch
 
 from ...batch_invariant.support import check_device, unsupported
-from . import engine
+from . import engine, neutral
 from .spec import HEAD_DIMS, LSE_BASES, scale_log2
 
 CLASS = "attention.bf16"
@@ -137,6 +150,9 @@ class BatchInvariantAttention:
         self._fixed: Optional[engine.FixedLaunch] = None
         self._frozen_plan: Optional[tuple] = None
         self._frozen_run: Optional[tuple] = None
+        self._has_sinks: Optional[bool] = (
+            None  # the sinks declaration of a use_cuda_graph=True wrapper's plans
+        )
         self._qo_buffer: Optional[torch.Tensor] = None
         self._max_rows: Optional[int] = (
             None  # the packed query rows a plan may hold (prefill)
@@ -205,7 +221,9 @@ class BatchInvariantAttention:
             )
         self.workspace = float_workspace_buffer
 
-    #: The wrappers' ``plan()`` arguments the class does not take, with what the class takes instead: any of them set is refused.
+    #: The wrappers' ``plan()`` arguments the class does not take, with what the class takes instead: any of them set is refused
+    #: by ``refuse()``. ``seq_lens`` / ``seq_lens_q`` / ``block_tables`` go to ``plan()`` instead, which accepts them when they
+    #: restate what the CSR metadata already says (``neutral.py``).
     _PLAN_ARGS_OUTSIDE_THE_CLASS = {
         "window_right": "window_right 0 (the causal mask)",
         "seq_lens": "the KV lengths of the page table (indptr / last_page_len) or of kv_indptr",
@@ -310,16 +328,26 @@ class BatchInvariantAttention:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
         seq_lens: Optional[torch.Tensor] = None,
+        seq_lens_q: Optional[torch.Tensor] = None,
+        block_tables: Optional[torch.Tensor] = None,
         kv_indptr_host: Optional[torch.Tensor] = None,
         fast: bool = False,
+        has_sinks: Optional[bool] = None,
     ) -> None:
-        """The wrappers' ``plan`` arguments; every input outside the class raises before any work. ``disable_split_kv`` plans
-        fused units and ``fixed_split_size`` of ``None`` / ``-1`` is the wrappers' "no fixed size" (both placements); a positive
-        ``fixed_split_size`` is refused -- the chunk length is a class constant -- except under ``use_cuda_graph=True``, where
-        it is accepted and not used, as serving engines pass it on every replan. ``seq_lens`` (decode) must be the KV
-        lengths of the page table. ``fast`` (``flashinfer.decode.fast_decode_plan``): the replan of a ``use_cuda_graph=True``
-        wrapper without device readbacks -- ``kv_indptr_host`` is the host copy of ``kv_indptr`` when given, every last-page
-        length is 1 at page size 1 (as that function assumes), and the page indices are not range-checked."""
+        """The wrappers' ``plan`` arguments; every input outside the class raises before any work. ``has_sinks`` declares
+        whether every ``run()`` of this plan is given sinks (``True`` / ``False``: a run that departs from it raises);
+        ``None`` leaves the choice to each run.
+
+        Arguments the class does not consume, at the values serving engines pass on every call (``neutral.py``):
+        ``fixed_split_size`` of ``None`` / ``-1`` or any positive size is accepted and not used (the chunk length is a class
+        constant, which is what a fixed split asks for); ``disable_split_kv`` plans fused units (the same bits, no partials
+        in the workspace); ``seq_lens`` / ``seq_lens_q`` must equal the KV / query lengths of the CSR metadata and
+        ``block_tables`` must list the pages of the CSR triple -- host tensors are compared on the host, and the block-table
+        comparison shares the one readback of the page-index bounds.
+
+        ``fast`` (``flashinfer.decode.fast_decode_plan``): the replan of a ``use_cuda_graph=True`` wrapper without device
+        readbacks -- ``kv_indptr_host`` is the host copy of ``kv_indptr`` when given, every last-page length is 1 at page
+        size 1 (as that function assumes), and the page indices are not range-checked."""
         D = int(head_dim_qk)
         if D not in HEAD_DIMS:
             raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
@@ -389,16 +417,7 @@ class BatchInvariantAttention:
                 "use_fp16_qk_reduction",
                 "the fp32 score accumulation of the class",
             )
-        if (
-            fixed_split_size is not None
-            and int(fixed_split_size) > 0
-            and not self.graph
-        ):
-            raise unsupported(
-                CLASS,
-                f"fixed_split_size={fixed_split_size}",
-                "the class's own chunk length (a class constant); None or -1",
-            )
+        fused = neutral.check_split_request(CLASS, fixed_split_size, disable_split_kv)
         if use_token_head_sf:
             raise unsupported(CLASS, "use_token_head_sf", "unscaled bf16 K / V")
         if window_left is None:
@@ -532,7 +551,14 @@ class BatchInvariantAttention:
             )
         last_host = None
         max_page = -1
+        kv_lens_alt = None  # paged kinds: the lengths `flashinfer.page.get_seq_lens` states (they differ on pageless requests)
         if self.kind == "ragged":
+            if block_tables is not None:
+                raise unsupported(
+                    CLASS,
+                    "block_tables on the ragged wrapper",
+                    self._PLAN_ARGS_OUTSIDE_THE_CLASS["block_tables"],
+                )
             kv_lens = kv_spans.tolist()
         else:
             if kv_last_page_len is None or kv_indices is None:
@@ -566,6 +592,8 @@ class BatchInvariantAttention:
                     f"kv_indices of {kv_indices.numel()} entries for kv_indptr[-1] = {n_pages}",
                     "one page index per referenced page",
                 )
+            if block_tables is not None:
+                neutral.check_block_table_shape(CLASS, block_tables, kv_spans)
             # a prefill wrapper under use_cuda_graph checks the page indices at its first plan only: later plans run before
             # every replay and a range check is a device readback
             unchecked = fast or (
@@ -574,20 +602,39 @@ class BatchInvariantAttention:
             if n_pages and not unchecked:
                 used = kv_indices[:n_pages]
                 bounds = torch.aminmax(used)
-                # Only two scalars cross from CUDA; one readback waits for both bounds.
-                if used.is_cuda:
-                    lo, hi = torch.stack(bounds).to("cpu", non_blocking=False).tolist()
+                scalars = [bounds.min, bounds.max]
+                if block_tables is not None and not bool((kv_spans < 0).any()):
+                    scalars.append(
+                        neutral.block_table_mismatches(
+                            block_tables, kv_indices, kv_indptr_host, kv_spans
+                        )
+                    )
+                # Only these scalars cross from CUDA; one readback waits for all of them.
+                on = next((s.device for s in scalars if s.is_cuda), None)
+                if on is not None:
+                    values = (
+                        torch.stack([s.to(on, torch.int64) for s in scalars])
+                        .to("cpu", non_blocking=False)
+                        .tolist()
+                    )
                 else:
-                    lo, hi = int(bounds.min), int(bounds.max)
+                    values = [int(s) for s in scalars]
+                lo, hi = values[:2]
                 if lo < 0:
                     raise unsupported(
                         CLASS, "a negative page index", "page indices in 0..num_pages-1"
                     )
+                if len(values) > 2 and values[2]:
+                    raise neutral.block_table_mismatch_error(CLASS, values[2])
                 max_page = hi  # checked against the cache at run()
             # a request without pages has no keys, whatever its last-page entry (the planner's rule)
             kv_lens = torch.where(
                 kv_spans > 0, (kv_spans - 1) * page_size + last_host, 0
             ).tolist()
+            if seq_lens is not None:
+                kv_lens_alt = torch.where(
+                    kv_spans > 0, (kv_spans - 1) * page_size + last_host, last_host
+                ).tolist()
         q_lens = (qo_host[1:] - qo_host[:-1]).tolist()
         for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
             if ql < 0 or kl < 0:
@@ -603,16 +650,24 @@ class BatchInvariantAttention:
                     "kv_len >= q_len per request (the causal class)",
                 )
         if seq_lens is not None:
-            given = seq_lens.to("cpu", non_blocking=False).to(torch.int64).tolist()
-            if self.kind != "decode" or given != kv_lens:
+            neutral.check_lengths(
+                CLASS,
+                "seq_lens",
+                seq_lens,
+                kv_lens,
+                "kv_indptr" if self.kind == "ragged" else "the page table",
+                kv_lens_alt,
+            )
+        if seq_lens_q is not None:
+            if self.kind == "decode":
                 raise unsupported(
                     CLASS,
-                    "seq_lens",
-                    self._PLAN_ARGS_OUTSIDE_THE_CLASS["seq_lens"]
-                    + " (on the decode wrapper, seq_lens equal to them)",
+                    "seq_lens_q on the decode wrapper",
+                    "q_len_per_req query tokens per request",
                 )
+            neutral.check_lengths(CLASS, "seq_lens_q", seq_lens_q, q_lens, "qo_indptr")
         config = engine.default_config(D=D)
-        if disable_split_kv:
+        if fused:
             from dataclasses import replace
 
             config = replace(config, split_policy="fused")
@@ -652,6 +707,7 @@ class BatchInvariantAttention:
                 max_page,
                 fast,
                 qo_indptr,
+                has_sinks,
             )
             return
         try:
@@ -668,6 +724,7 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 ragged=self.kind == "ragged",
+                has_sinks=has_sinks,
             )
         except engine.WorkspaceTooSmall:
             # the planner's split units need more partials space than the caller's workspace holds: plan fused units instead (every unit
@@ -689,6 +746,7 @@ class BatchInvariantAttention:
                     self.workspace,
                     self.device,
                     ragged=self.kind == "ragged",
+                    has_sinks=has_sinks,
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(
@@ -696,12 +754,10 @@ class BatchInvariantAttention:
                     f"a float workspace buffer of {self.workspace.numel() * self.workspace.element_size()} bytes",
                     f"at least {e.needed} bytes for this batch's split-KV partials",
                 ) from None
-        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from a
-        # snapshot: a later in-place change by the caller cannot reach a plan built from the old values; the plan is published only once
-        # everything it runs with exists
-        kv_indptr_dev = kv_indptr.to(
-            device=self.device, dtype=torch.int32, non_blocking=non_blocking, copy=True
-        ).contiguous()
+        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from
+        # snapshots: kv_indptr's is the plan's own (engine.plan_attention: the descriptor table holds its offsets), kv_indices' is
+        # taken here; a later in-place change by the caller cannot reach a plan built from the old values, and the plan is published
+        # only once everything it runs with exists
         kv_indices_dev = (
             kv_indices.to(
                 device=self.device,
@@ -714,7 +770,7 @@ class BatchInvariantAttention:
         )
         self._planned = planned
         self._config = config
-        self._kv_indptr = kv_indptr_dev
+        self._kv_indptr = planned.kv_indptr
         self._kv_indices = kv_indices_dev
         self._max_page = max_page
         self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
@@ -745,6 +801,7 @@ class BatchInvariantAttention:
         max_page: int,
         fast: bool,
         qo_indptr: Optional[torch.Tensor] = None,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         """The plan of a ``use_cuda_graph=True`` wrapper: the first builds the fixed launch, every one is written into its
         tables and the wrapper's page-table buffers (``engine.FixedLaunch``), after the frozen options are checked. A prefill
@@ -774,6 +831,23 @@ class BatchInvariantAttention:
                 "the options of the wrapper's first plan (a captured graph holds them); only the KV lengths and the page "
                 "table may change",
             )
+        # the sinks declaration selects the captured kernels: the first one given is the wrapper's, and a plan without one
+        # (a fast replan has no such argument) keeps it
+        if has_sinks is not None:
+            if self._has_sinks is not None and bool(has_sinks) != self._has_sinks:
+                raise unsupported(
+                    CLASS,
+                    f"a plan() of a use_cuda_graph=True wrapper with has_sinks={has_sinks} after has_sinks={self._has_sinks}",
+                    "the sinks declaration of the wrapper's first plan (a captured graph holds the kernels it selects)",
+                )
+            if self._frozen_run is not None and self._frozen_run[2] != bool(has_sinks):
+                raise unsupported(
+                    CLASS,
+                    f"has_sinks={has_sinks} on a use_cuda_graph=True wrapper whose first run() was "
+                    + ("with" if self._frozen_run[2] else "without")
+                    + " sinks",
+                    "the presence of sinks of the wrapper's first run()",
+                )
         total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         if self._fixed is None:
             decode = self.kind == "decode"
@@ -790,6 +864,7 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 max_rows=None if decode else self._max_rows,
+                kv_indptr=indptr_buf,
             )
         else:
             from dataclasses import replace
@@ -808,6 +883,7 @@ class BatchInvariantAttention:
             config,
             fixed=self._fixed,
             non_blocking=non_blocking,
+            has_sinks=self._has_sinks if has_sinks is None else bool(has_sinks),
         )
         # the captured kernels read the page table from the wrapper's buffers: refreshed here unless the caller's tensors are
         # those buffers
@@ -824,6 +900,8 @@ class BatchInvariantAttention:
             ):
                 continue
             buf[: src.numel()].copy_(src, non_blocking=non_blocking)
+        if has_sinks is not None:
+            self._has_sinks = bool(has_sinks)
         self._planned = planned
         self._config = config
         self._kv_indptr = indptr_buf
@@ -923,9 +1001,18 @@ class BatchInvariantAttention:
         """Validate changing run-time inputs once, then launch with the fixed plan. ``return_lse``: ``(out, lse)`` with the LSE
         member in ``lse_base`` (``"log2"`` | ``"ln"``) and ``lse_layout`` (``"NH"`` | ``"HN"``), written to ``lse`` when given (as
         on the other backends, an ``lse`` buffer without ``return_lse`` is not used). ``sinks``: the fp32 ``(num_qo_heads,)``
-        per-head sink logits of the sink member."""
+        per-head sink logits of the sink member. ``scales`` are the wrappers' ``q_scale`` / ``k_scale`` / ``v_scale``
+        (/ ``o_scale``), in that order: ``None`` or exactly ``1.0`` (the unscaled class); ``kv_cache_sf`` of ``None``
+        likewise asks for nothing."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
+        mismatch = engine.sinks_declaration_mismatch(self._planned.has_sinks, sinks)
+        if mismatch is not None:
+            raise unsupported(
+                CLASS,
+                mismatch,
+                "the same sinks choice at every run() of the plan (a new plan() changes the declaration)",
+            )
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
                 CLASS,
@@ -941,10 +1028,7 @@ class BatchInvariantAttention:
                 raise unsupported(
                     CLASS, f"lse_layout {lse_layout!r}", 'lse_layout "NH" or "HN"'
                 )
-        if any(s is not None for s in scales):
-            raise unsupported(
-                CLASS, "q_scale / k_scale / v_scale / o_scale", "unscaled bf16 operands"
-            )
+        neutral.check_unit_scales(CLASS, scales)
         if kv_cache_sf is not None:
             raise unsupported(CLASS, "a scaled (fp8 / fp4) KV cache", "a bf16 KV cache")
         if skip_softmax_threshold_scale_factor is not None:
@@ -958,6 +1042,8 @@ class BatchInvariantAttention:
                 "the planned window",
             )
         Hq, Hkv, D = self._heads
+        # the caller's tensor: the kernels may run on a reshaped or packed copy of it
+        q_source = q
         if q.dim() == 4:
             q = q.reshape(-1, q.shape[-2], q.shape[-1])
         if q.dim() != 3 or q.shape[1] != Hq or q.shape[2] != D:
@@ -1035,6 +1121,7 @@ class BatchInvariantAttention:
                 "a q whose base address is not 16-byte aligned",
                 "a 16-byte-aligned q (the TMA descriptor's requirement)",
             )
+        storage = engine.plan_storage(self._planned)
         if out is None:
             out = torch.empty_like(q)
         elif (
@@ -1055,17 +1142,35 @@ class BatchInvariantAttention:
                 "an output that aliases the KV cache",
                 "an output byte span disjoint from the KV caches (CTAs store rows while others still read pages)",
             )
+        elif engine._overlaps_any(out, storage):
+            raise unsupported(
+                CLASS,
+                "an output that aliases the float workspace buffer",
+                "an output byte span disjoint from the workspace (the launch stores its split-KV partials there)",
+            )
         lse_nh = None
         if return_lse:
             nh_shape = (q.shape[0], Hq)
             if lse is not None:
                 shape = nh_shape if lse_layout == "NH" else nh_shape[::-1]
-                bad = engine.check_lse_buffer(lse, q, out, k, v, shape)
+                # the page table a run reads is the plan's own copy (plan() snapshots kv_indptr and kv_indices)
+                tables = (self._kv_indices, *engine.plan_tables(self._planned))
+                bad = engine.check_lse_buffer(
+                    lse,
+                    q,
+                    out,
+                    k,
+                    v,
+                    shape,
+                    q_source=q_source,
+                    storage=storage,
+                    tables=tables,
+                )
                 if bad is not None:
                     raise unsupported(
                         CLASS,
                         f"an lse buffer {bad}",
-                        f"a contiguous fp32 {shape} buffer on {self.device} that aliases neither q, out nor the KV cache",
+                        f"a contiguous fp32 {shape} buffer on {self.device} that aliases neither q, out, the KV cache nor the float workspace buffer",
                     )
             # the kernels write the (total_q, Hq) rows; the HN layout is a copy of them
             lse_nh = (
@@ -1089,12 +1194,14 @@ class BatchInvariantAttention:
                     "the LSE mode and the presence of sinks of the wrapper's first run() (they select the captured kernels)",
                 )
         if sinks is not None:
-            bad = engine.check_sinks(sinks, Hq, self.device, (out, lse_nh))
+            # the HN layout's copy writes the caller's buffer after the launch
+            written = (out, lse_nh, lse if return_lse else None, *storage)
+            bad = engine.check_sinks(sinks, Hq, self.device, written)
             if bad is not None:
                 raise unsupported(
                     CLASS,
                     f"sinks {bad}",
-                    f"a contiguous fp32 ({Hq},) tensor of per-head sink logits on {self.device} that aliases neither out nor lse",
+                    f"a contiguous fp32 ({Hq},) tensor of per-head sink logits on {self.device} that aliases neither out, lse nor the float workspace buffer",
                 )
         engine._run_attention_validated(
             self._planned,

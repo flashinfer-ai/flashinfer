@@ -75,6 +75,7 @@ from .utils import (
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
+    check_has_sinks_undeclared,
     get_alibi_slopes,
     _get_cache_alibi_slopes_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
@@ -1508,7 +1509,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
             requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales) raise
+            non-causal prefill, logits soft cap, custom masks, RoPE, non-unit scales) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
             the class's LSE member (fp32; the output bits are the same with and without it). ``run(..., sinks=)`` with an
             fp32 ``[num_qo_heads]`` tensor runs the class's sink member (one virtual key per head in the softmax
@@ -1524,6 +1525,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             without pages (a padded slot) is a null request: zeros in its output rows and ``-inf`` in its LSE; a request
             with fewer keys than ``q_len_per_req`` is refused as elsewhere. ``plan()`` runs a host-side planner whose cost
             grows with the number of requests (of the order of 10 us per request).
+
+            Serving call shapes: the arguments the class does not consume are accepted at the values that ask for
+            nothing and raise at every other value -- ``q_scale`` / ``k_scale`` / ``v_scale`` of ``None`` or exactly
+            ``1.0``, ``seq_lens`` / ``block_tables`` that restate the page table,
+            ``fixed_split_size`` (``None`` / ``-1`` or any positive size: not used, the chunk length is a class constant)
+            and ``disable_split_kv`` (``True`` plans fused units: the same bits, no split-KV partials). None of them
+            changes an output bit.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -2271,6 +2279,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``e5m2``) with standard layout (last dim ``head_dim``), ``q`` must be ``fp16``
             (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (``run(..., sinks=)``): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2346,6 +2364,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         use_token_head_sf: bool = False,
         indptr_host: Optional[torch.Tensor] = None,
         fast: bool = False,
+        has_sinks: Optional[bool] = None,
+        block_tables: Optional[torch.Tensor] = None,
     ) -> None:
         """``plan()`` of the batch-invariant class; ``fast`` is the replan of :func:`fast_decode_plan`."""
         assert self._batch_invariant is not None
@@ -2375,8 +2395,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_scale=rope_scale,
             rope_theta=rope_theta,
             seq_lens=seq_lens,
+            block_tables=block_tables,
             kv_indptr_host=indptr_host,
             fast=fast,
+            has_sinks=has_sinks,
         )
         self._batch_size = len(indptr) - 1
         self._num_qo_heads = num_qo_heads
@@ -2387,7 +2409,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._q_len_per_req = q_len_per_req
         self._sm_scale = sm_scale
         self._pos_encoding_mode = pos_encoding_mode
-        self._logits_soft_cap = logits_soft_cap
+        # the state the regular plans leave: callers compare it with their own settings
+        self._logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
 
@@ -2420,6 +2443,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
         use_token_head_sf: bool = False,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
@@ -2435,9 +2459,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if self._batch_invariant is not None:
             # the class's own checks run in the delegate; the arguments it does not take are refused there, before the plan
-            self._batch_invariant.refuse(
-                window_right=window_right, block_tables=block_tables
-            )
+            # (seq_lens / block_tables are accepted when they restate the page table)
+            self._batch_invariant.refuse(window_right=window_right)
             if is_causal is not None and is_causal != (q_len_per_req > 1):
                 from .batch_invariant.support import unsupported
 
@@ -2466,12 +2489,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 rope_theta=rope_theta,
                 non_blocking=non_blocking,
                 seq_lens=seq_lens,
+                block_tables=block_tables,
                 fixed_split_size=fixed_split_size,
                 disable_split_kv=disable_split_kv,
                 q_len_per_req=q_len_per_req,
                 use_token_head_sf=use_token_head_sf,
+                has_sinks=has_sinks,
             )
             return
+        check_has_sinks_undeclared(has_sinks)
 
         # Normalized: the planner and kernels read these as raw pointers (#5260).
         indptr = indptr.contiguous()
@@ -5809,6 +5835,11 @@ def fast_decode_plan(
     ``use_cuda_graph=True`` without device readbacks (``global_override_indptr_cpu``
     is the host copy of ``indptr``, every last-page length is 1 at page size 1,
     the page indices are not range-checked).
+
+    Outside CUDA graphs, ``indptr``, ``indices`` and ``last_page_len`` become the
+    wrapper's buffers without copying, so they must already be on the wrapper's
+    device; a ``ValueError`` is raised otherwise. Use
+    :meth:`BatchDecodeWithPagedKVCacheWrapper.plan` to plan with host metadata.
     """
     if getattr(self, "_batch_invariant", None) is not None:
         return self._plan_batch_invariant(
@@ -5973,6 +6004,22 @@ def fast_decode_plan(
                 f"this wrapper was planned with {frozen_q_len}, got "
                 f"{q_len_per_req}. Use a separate wrapper per q_len_per_req."
             )
+    if not self.is_cuda_graph_enabled:
+        # Outside CUDA graphs the metadata tensors become the wrapper's
+        # buffers as-is and run() hands their pointers to the kernel, so they
+        # must already be on the wrapper's device; plan() is the path that
+        # copies host metadata over. Checked before any plan state changes.
+        for name, tensor in (
+            ("indptr", indptr),
+            ("indices", indices),
+            ("last_page_len", last_page_len),
+        ):
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{name} must be on the wrapper's device {self.device}, got "
+                    f"{tensor.device}; plan host metadata with "
+                    "BatchDecodeWithPagedKVCacheWrapper.plan(wrapper, ...)"
+                )
     is_causal = q_len_per_req > 1
     self._q_len_per_req = q_len_per_req
     if logits_soft_cap is None:

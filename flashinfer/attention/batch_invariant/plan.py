@@ -27,7 +27,9 @@ from .spec import TILE_KEYS, chunk_len
 DESC_FIELDS = 16
 # descriptor fields (int32); F_QBASE = qo_indptr[req], the packed token index of the request's first token;
 # F_TILE_LO / F_TILE_HI are the unit's OWN tiles (the row block's visible range clipped to the unit's chunks): every role
-# of the kernel walks exactly that range and derives the chunk boundaries from the absolute tile index
+# of the kernel walks exactly that range and derives the chunk boundaries from the absolute tile index;
+# F_KVPTR0 / F_NPAGES = kv_indptr[req] and the request's page count (token offset and count under the ragged layout): the Swaps
+# load warp takes the request's page range from the descriptor (a plan runs with its own kv_indptr: engine.run_attention)
 (
     F_REQ,
     F_QTOK0,
@@ -43,7 +45,9 @@ DESC_FIELDS = 16
     F_TILE_HI,
     F_QBASE,
     F_GROUP,
-) = range(14)
+    F_KVPTR0,
+    F_NPAGES,
+) = range(16)
 # F_GROUP: the unit's split group (an index into Plan.groups) when the group's chunk fold runs IN-KERNEL (the unit that completes the
 # group folds it: blocks/correction.py), -1 otherwise (mode 0, or a group left to the fixup kernel)
 INKERNEL_MAX_ROWS = 32  # merge == "auto": groups of at most this many rows (every decode unit) and at most INKERNEL_MAX_CHUNKS chunks fold
@@ -605,8 +609,8 @@ def build_plan(
                     thi,
                     qo_indptr[b],
                     -1,
-                    0,
-                    0,
+                    kv_indptr[b],
+                    kv_indptr[b + 1] - kv_indptr[b],
                 ]
             )
             continue
@@ -641,8 +645,8 @@ def build_plan(
                     th,
                     qo_indptr[b],
                     grp,
-                    0,
-                    0,
+                    kv_indptr[b],
+                    kv_indptr[b + 1] - kv_indptr[b],
                 ]
             )
         plan.ws_rows += n * rows
@@ -719,10 +723,19 @@ class ArrayPlan:
             )
         )
 
-    def with_kv_lens(self, kv_lens: np.ndarray) -> "ArrayPlan":
-        """This plan for other KV lengths of the same shape: the same units, groups and order, the lengths rewritten."""
-        desc = self.desc_array.copy()
-        desc[:, F_KVLEN] = kv_lens[desc[:, F_REQ]]
+    def with_kv_lens(self, kv_lens: np.ndarray, kv_indptr: np.ndarray) -> "ArrayPlan":
+        """This plan for other KV lengths of the same shape: the same units, groups and order; the lengths and the requests'
+        page-table ranges rewritten."""
+
+        def rewrite(table: np.ndarray) -> np.ndarray:
+            table = table.copy()
+            req = table[:, F_REQ]
+            table[:, F_KVLEN] = kv_lens[req]
+            table[:, F_KVPTR0] = kv_indptr[req]
+            table[:, F_NPAGES] = kv_indptr[req + 1] - kv_indptr[req]
+            return table
+
+        desc = rewrite(self.desc_array)
         groups = self.groups_array.copy()
         groups[:, G_KVLEN] = kv_lens[groups[:, G_REQ]]
         plan = ArrayPlan(
@@ -737,8 +750,7 @@ class ArrayPlan:
         )
         plan.shape = self.shape
         if self.launch_array is not None:
-            plan.launch_array = self.launch_array.copy()
-            plan.launch_array[:, F_KVLEN] = kv_lens[plan.launch_array[:, F_REQ]]
+            plan.launch_array = rewrite(self.launch_array)
             plan.num_launch, plan.walk = self.num_launch, self.walk
         return plan
 
@@ -822,6 +834,7 @@ def build_array_plan(
     row_budget: int = -1,
     null_requests: bool = False,
     previous: Optional[ArrayPlan] = None,
+    kv_indptr: Optional[np.ndarray] = None,
 ) -> ArrayPlan:
     """``build_plan`` computed over arrays: request ``b`` has ``q_lens[b]`` query tokens over ``kv_lens[b]`` keys and its packed
     rows start at ``sum(q_lens[:b])``. The tables and the grid are those of ``build_plan`` with the same arguments, entry for
@@ -829,7 +842,8 @@ def build_array_plan(
     the units). A request without query tokens gets no unit; under ``null_requests`` neither does one without keys.
     ``previous``: the last plan of the caller; when this batch differs from that one in its KV lengths alone, with every
     Q tile on the same key tiles and chunks -- a decode loop between two tile boundaries --, the tables are that plan's with
-    the lengths rewritten (``ArrayPlan.with_kv_lens``), the same tables as planning afresh."""
+    the lengths rewritten (``ArrayPlan.with_kv_lens``), the same tables as planning afresh. ``kv_indptr``: the page-table
+    offsets the descriptors carry (``F_KVPTR0`` / ``F_NPAGES``); one key per page when omitted."""
     assert merge in ("auto", "fixup", "inkernel"), merge
     assert Hq % Hkv == 0, (Hq, Hkv)
     g = Hq // Hkv
@@ -839,6 +853,9 @@ def build_array_plan(
     tpc = C // T
     q_lens = np.asarray(q_lens, dtype=np.int64)
     kv_lens = np.asarray(kv_lens, dtype=np.int64)
+    if kv_indptr is None:
+        kv_indptr = np.concatenate([[0], np.cumsum(kv_lens)])
+    kv_indptr = np.asarray(kv_indptr, dtype=np.int64)
     q_base = np.cumsum(q_lens) - q_lens
     keep = q_lens > 0
     if null_requests:
@@ -870,7 +887,7 @@ def build_array_plan(
         -(-l_max // T),
     )
     if previous is not None and previous.same_shape(shape):
-        return previous.with_kv_lens(kv_lens)
+        return previous.with_kv_lens(kv_lens, kv_indptr)
     n_tiles = req.size * Hkv
 
     def tiles(a: np.ndarray) -> np.ndarray:
@@ -1008,6 +1025,8 @@ def build_array_plan(
     desc[:, F_TILE_HI] = tile_hi
     desc[:, F_QBASE] = qbase_t[tile]
     desc[:, F_GROUP] = np.where(split_u, grp_t[tile], -1)
+    desc[:, F_KVPTR0] = kv_indptr[b_t[tile]]
+    desc[:, F_NPAGES] = kv_indptr[b_t[tile] + 1] - kv_indptr[b_t[tile]]
     # longest first (stable), then the waves of the launch grid in alternating direction: build_plan's order
     if num_units:
         order = np.argsort(tile_lo - tile_hi, kind="stable")

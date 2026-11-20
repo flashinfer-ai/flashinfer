@@ -144,9 +144,15 @@ def test_lean_model_matches_python_engine_and_spec():
             lean[("fp4class", int(N), int(K))] = bool(int(b))
         elif kind == "attn":
             _, name, sx = line.split(" ", 2)
+            assert ("attn", name) not in lean, (
+                f"duplicate conformance record: {tag} {name}"
+            )
             lean[("attn", name)] = sx
         elif kind == "attnlse":
             _, name, sx = line.split(" ", 2)
+            assert (tag, name) not in lean, (
+                f"duplicate conformance record: {tag} {name}"
+            )
             lean[(tag, name)] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")

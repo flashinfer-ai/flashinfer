@@ -13,8 +13,10 @@ Q is ``(total_q, Hq, D)`` bf16, K/V caches ``(num_pages, page, Hkv, D)`` (NHD) o
 (HND) bf16, metadata int32 on the device; the output is ``(total_q, Hq, D)`` bf16 and, with ``return_lse``, the LSE member
 ``(total_q, Hq)`` fp32 (``spec.lse_term``; base 2, or base e with ``lse_base="ln"``). ``sinks``, an fp32 ``(Hq,)`` tensor of
 per-head sink logits, selects the sink member (``spec.sink_merge``: one more merge per row, after its last chunk). The planner runs on
-host copies of the indptr arrays (as FlashInfer's ``plan`` does); ``run`` launches the kernel and, for
-split units, the fixup.
+host copies of the indptr arrays (as FlashInfer's ``plan`` does) and a plan runs with the index offsets it was
+built from: the descriptor table carries every request's query offset, KV length and page-table range, so
+``run_attention`` launches the plan's own ``kv_indptr`` and rejects a differing one (``kv_indices`` is read at
+run time). ``run`` launches the kernel and, for split units, the fixup.
 """
 
 from __future__ import annotations
@@ -410,6 +412,7 @@ class FixedLaunch:
         sm_count: Optional[int] = None,
         unit_cap: Optional[int] = None,
         max_rows: Optional[int] = None,
+        kv_indptr: Optional[torch.Tensor] = None,
     ):
         from .blocks.operands import om_scratch_blocks
         from .fixup import MAX_GRID_Y, THREADS, wide_vec
@@ -500,6 +503,20 @@ class FixedLaunch:
             self.group_cap, dtype=torch.int32, device=device
         )
         self.lse_unused = torch.empty(1, dtype=torch.float32, device=device)
+        # the kv_indptr every plan of the launch runs with (the row body reads it; the Swaps body takes the page ranges from
+        # the descriptors): the caller's persistent buffer, which the caller refreshes, or the launch's own, refreshed by
+        # plan_attention
+        self.owns_kv_indptr = kv_indptr is None
+        self.kv_indptr = (
+            torch.zeros(self.batch + 1, dtype=torch.int32, device=device)
+            if kv_indptr is None
+            else kv_indptr
+        )
+        assert (
+            self.kv_indptr.dtype == torch.int32
+            and self.kv_indptr.numel() == self.batch + 1
+            and self.kv_indptr.is_contiguous()
+        )
         # two staging blocks in turn: a block is rewritten only after the copy that last read it has run
         self._stage = [
             torch.zeros(sum(self._sections), dtype=torch.int32, pin_memory=True)
@@ -595,6 +612,24 @@ class FixedLaunch:
             ev.record()
 
 
+_UNUSED_OPERAND: Dict[torch.device, torch.Tensor] = {}
+
+
+def unused_operand(device: torch.device) -> torch.Tensor:
+    """The one-element fp32 tensor a launch passes for the LSE operand it does not write (``lse_mode`` 0: every LSE store is
+    under ``lse_mode > 0``) and the sink operand it does not read (a kernel without the sink step has no sink load): one per
+    device, kept for the process. Inside a CUDA-graph capture an uncached tensor is returned instead (it would come from
+    the graph's private pool)."""
+    device = _resolve_device(device)
+    t = _UNUSED_OPERAND.get(device)
+    if t is None:
+        t = torch.empty(1, dtype=torch.float32, device=device)
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            return t
+        t = _UNUSED_OPERAND.setdefault(device, t)
+    return t
+
+
 class _Planned:
     def __init__(
         self,
@@ -612,6 +647,8 @@ class _Planned:
         self.counts = counts  # the counts table of a fixed launch (plan.COUNT_FIELDS)
         self.fixed = fixed  # the fixed launch this plan was written into (a wrapper under use_cuda_graph)
         self.scratch = scratch  # the per-CTA O_m scratch (D = 256)
+        # the caller's workspace tensor the partials live in (set by plan_attention)
+        self.workspace: Optional[torch.Tensor] = None
         self.ragged = False  # the packed-token KV layout (set by plan_attention)
         # what the descriptor table was built for; run_attention refuses anything else (the table holds one unit per KV head
         # and per Q tile, the configuration decides pairing and the unit body)
@@ -620,17 +657,20 @@ class _Planned:
         self.window_left: Optional[int] = None
         self.config: Optional[AttnConfig] = None
         self.page: Optional[int] = None
+        # the plan's kv_indptr (int32 on the device): the page-table offsets the descriptor table holds; the kernels run with it
+        self.kv_indptr: Optional[torch.Tensor] = None
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
         self.n_fixup_groups = plan.num_fixup_groups
         self.fold_counters = fold_counters  # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
-        # the kernels' LSE / sink operand of a launch without LSE / sinks (never written, never read)
+        # the kernels' LSE / sink operand of a launch without LSE / sinks; this reference keeps it alive for a captured graph
+        # (a fixed launch holds its own for the wrapper's lifetime)
         self.lse_unused = (
-            fixed.lse_unused
-            if fixed is not None
-            else torch.empty(1, dtype=torch.float32, device=desc.device)
+            fixed.lse_unused if fixed is not None else unused_operand(desc.device)
         )
+        # the plan's sinks declaration (set by plan_attention)
+        self.has_sinks: Optional[bool] = None
 
 
 def plan_attention(
@@ -649,12 +689,15 @@ def plan_attention(
     ragged: bool = False,
     fixed: Optional[FixedLaunch] = None,
     non_blocking: bool = True,
+    has_sinks: Optional[bool] = None,
 ) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
     holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer.
+    ``has_sinks``: declares whether every ``run_attention`` of this plan is given ``sinks`` (``True`` / ``False``: a run that
+    departs from it raises); ``None`` leaves the choice to each run.
     ``fixed``: the plan is held to that launch's capacities and written into its tables (``FixedLaunch``; a request without keys
-    gets no unit); ``workspace`` and ``sm_count`` are the launch's."""
+    gets no unit); ``workspace`` and ``sm_count`` are the launch's, and the plan runs with the launch's ``kv_indptr`` buffer."""
     if fixed is not None:
         batch = qo_indptr.numel() - 1
         q_lens = np.diff(qo_indptr.cpu().numpy().astype(np.int64, copy=False))
@@ -679,7 +722,8 @@ def plan_attention(
             )
             == fixed.config
         ), (config, fixed.config)
-        spans = np.diff(kv_indptr.cpu().numpy().astype(np.int64, copy=False))
+        kv_host = kv_indptr.cpu().numpy().astype(np.int64, copy=False)
+        spans = np.diff(kv_host)
         last = kv_last_page_len.cpu().numpy().astype(np.int64, copy=False)
         fixed_plan = build_array_plan(
             q_lens,
@@ -700,9 +744,12 @@ def plan_attention(
             row_budget=fixed.row_budget,
             null_requests=fixed.null_requests,
             previous=fixed.last_plan,
+            kv_indptr=kv_host,
         )
         fixed.last_plan = fixed_plan
         fixed.fill(fixed_plan, non_blocking)
+        if fixed.owns_kv_indptr:
+            fixed.kv_indptr.copy_(kv_indptr.to(torch.int32), non_blocking=non_blocking)
         planned = _Planned(
             fixed_plan,
             fixed.desc,
@@ -719,6 +766,9 @@ def plan_attention(
         planned.window_left = int(window_left)
         planned.config = config
         planned.page = int(page)
+        planned.has_sinks = None if has_sinks is None else bool(has_sinks)
+        planned.kv_indptr = fixed.kv_indptr
+        planned.workspace = workspace
         return planned
     if ragged:
         page = 1
@@ -803,11 +853,16 @@ def plan_attention(
         torch.zeros(max(1, len(plan.groups)), dtype=torch.int32, device=device),
     )
     planned.ragged = ragged
+    planned.workspace = workspace
     planned.heads = (int(Hq), int(Hkv))
     planned.total_q = int(qo_indptr[-1]) if qo_indptr.numel() else 0
     planned.window_left = int(window_left)
     planned.config = config
     planned.page = int(page)
+    planned.has_sinks = None if has_sinks is None else bool(has_sinks)
+    planned.kv_indptr = kv_indptr.to(
+        device=device, dtype=torch.int32, copy=True
+    ).contiguous()
     return planned
 
 
@@ -853,6 +908,37 @@ def workspace_bytes(
     return plan.ws_rows * ws_row(D) * 4
 
 
+def plan_storage(planned: _Planned) -> tuple:
+    """The tensors a launch of the plan writes besides the output and the LSE buffer: the split-KV partials, the per-CTA
+    scratch and the caller's workspace tensor the partials live in. The caller's tensor counts whole, whatever prefix
+    this plan uses, so whether a buffer inside it is refused does not depend on the batch."""
+    return tuple(
+        t for t in (planned.workspace, planned.ws, planned.scratch) if t is not None
+    )
+
+
+def plan_tables(planned: _Planned) -> tuple:
+    """The plan's own tensors a launch reads: the descriptor and group tables, the ``kv_indptr`` snapshot, the arrival
+    counters and, under a fixed launch, the counts table."""
+    return tuple(
+        t
+        for t in (
+            planned.desc,
+            planned.groups,
+            planned.fixup_groups,
+            planned.fold_counters,
+            planned.kv_indptr,
+            planned.counts,
+        )
+        if t is not None
+    )
+
+
+def _overlaps_any(t: torch.Tensor, others) -> bool:
+    """Whether the contiguous ``t`` shares bytes with one of ``others`` (addresses compare on one device only)."""
+    return any(o.device == t.device and _output_overlaps_kv(t, o, o) for o in others)
+
+
 def check_lse_buffer(
     lse: torch.Tensor,
     q: torch.Tensor,
@@ -860,10 +946,17 @@ def check_lse_buffer(
     k: torch.Tensor,
     v: torch.Tensor,
     shape: tuple,
+    q_source: Optional[torch.Tensor] = None,
+    storage=(),
+    tables=(),
 ) -> Optional[str]:
     """What is wrong with a caller's LSE buffer (``None`` when it can be written): a contiguous fp32 tensor of ``shape`` on
     the queries' device whose bytes are disjoint from the output, the queries and the K / V caches (CTAs store LSE rows
-    while others still read their operands)."""
+    while others still read their operands). ``q_source``: the caller's query tensor where ``q`` is a packed or reshaped
+    copy of it; the buffer must not share bytes with it either, since the store would change the caller's queries.
+    ``storage``: the plan's ``plan_storage``; an LSE row stored there would be read back as a split-KV partial.
+    ``tables``: the page-table tensors and the plan's ``plan_tables``; an LSE row stored there would be read as page
+    ids or descriptors."""
     if lse.dtype != torch.float32:
         return f"of dtype {lse.dtype}"
     if tuple(lse.shape) != tuple(shape):
@@ -876,13 +969,28 @@ def check_lse_buffer(
         return "that shares bytes with the KV cache"
     if _output_overlaps_kv(lse, q, q if out is None else out):
         return "that shares bytes with the queries or the output"
+    if q_source is not None and _output_overlaps_kv(lse, q_source, q_source):
+        return "that shares bytes with the queries or the output"
+    if _overlaps_any(lse, storage):
+        return "that shares bytes with the plan's workspace"
+    if _overlaps_any(lse, tables):
+        return "that shares bytes with the page table or the plan's tables"
     return None
+
+
+def sinks_declaration_mismatch(has_sinks: Optional[bool], sinks) -> Optional[str]:
+    """How a run departs from its plan's ``has_sinks`` declaration (``None``: it does not, or nothing was declared)."""
+    if has_sinks is None or has_sinks == (sinks is not None):
+        return None
+    if has_sinks:
+        return "a run without sinks over a plan declared with has_sinks=True"
+    return "a run with sinks over a plan declared with has_sinks=False"
 
 
 def check_sinks(sinks: torch.Tensor, Hq: int, device, written=()) -> Optional[str]:
     """What is wrong with a caller's ``sinks`` (``None`` when the kernels can read it): a contiguous fp32 ``(Hq,)`` tensor
     on the queries' device, read in place at every launch (so a captured graph replays with the tensor's current values),
-    whose bytes none of the ``written`` tensors (the output, the LSE buffer) share."""
+    whose bytes none of the ``written`` tensors (the output, the LSE buffer, the plan's ``plan_storage``) share."""
     if not isinstance(sinks, torch.Tensor):
         return f"of type {type(sinks).__name__}"
     if sinks.dtype != torch.float32:
@@ -893,8 +1001,10 @@ def check_sinks(sinks: torch.Tensor, Hq: int, device, written=()) -> Optional[st
         return f"on {sinks.device}"
     if not sinks.is_contiguous():
         return "that is not contiguous"
-    if any(w is not None and _output_overlaps_kv(w, sinks, sinks) for w in written):
-        return "that shares bytes with the output or the LSE buffer"
+    if _overlaps_any(sinks, [w for w in written if w is not None]):
+        return (
+            "that shares bytes with the output, the LSE buffer or the plan's workspace"
+        )
     return None
 
 
@@ -925,6 +1035,41 @@ def _output_overlaps_kv(out: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> 
     return False
 
 
+def plan_kv_indptr(planned: _Planned, kv_indptr: torch.Tensor) -> torch.Tensor:
+    """The ``kv_indptr`` a plan runs with. The descriptor table holds every request's page-table offset and page count
+    (``plan.F_KVPTR0`` / ``F_NPAGES``) next to its query offset and KV length, so the kernels take the plan's own snapshot
+    (``plan_attention`` records it); ``kv_indptr`` must be the array the plan was built from. The same storage is accepted as is;
+    another tensor is compared on the device and rejected when it differs, except under CUDA graph capture (no device read), where
+    the snapshot runs as planned. A moved page table needs a new plan; ``kv_indices`` is read at run time."""
+    snap = planned.kv_indptr
+    assert snap is not None, "plan_attention records the plan's kv_indptr"
+    if planned.fixed is not None:
+        # a fixed launch runs with its own kv_indptr buffer, refreshed at every plan: the tables in it are the last plan's
+        return snap
+    if kv_indptr is snap or (
+        kv_indptr.device == snap.device
+        and kv_indptr.dtype == snap.dtype
+        and kv_indptr.data_ptr() == snap.data_ptr()
+        and kv_indptr.numel() == snap.numel()
+        and kv_indptr.is_contiguous()
+    ):
+        return snap
+    if kv_indptr.numel() != snap.numel():
+        raise ValueError(
+            f"kv_indptr of {kv_indptr.numel()} entries at run_attention over a plan built from {snap.numel()}: the descriptor "
+            "table holds the planned requests' page-table ranges; plan again"
+        )
+    if snap.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return snap
+    if not torch.equal(kv_indptr.to(device=snap.device, dtype=snap.dtype), snap):
+        raise ValueError(
+            "kv_indptr at run_attention differs from the plan's: the descriptor table holds the requests' page-table offsets and "
+            "page counts, so a plan runs with the kv_indptr it was built from; plan again for a changed page table (kv_indices "
+            "may change between runs, kv_indptr may not)"
+        )
+    return snap
+
+
 def run_attention(
     planned: _Planned,
     q: torch.Tensor,
@@ -943,9 +1088,12 @@ def run_attention(
     lse_base: str = "log2",
     sinks: Optional[torch.Tensor] = None,
 ):
-    """``return_lse``: also return the LSE member ``(total_q, Hq)`` fp32 in ``lse_base`` (``"log2"`` | ``"ln"``), written to
-    ``lse`` when given; the output bits are the same with and without it. ``sinks``: the fp32 ``(Hq,)`` per-head sink logits
-    of the sink member (``None``: the class without sinks)."""
+    """Launch a plan from ``plan_attention``. ``kv_indptr`` must be the array the plan was built from (``plan_kv_indptr``: the plan
+    runs with its own snapshot; a differing array is rejected, except under CUDA graph capture, where no device compare is possible
+    and the snapshot runs uncompared); ``kv_indices`` is read at run time. ``return_lse``: also return the LSE member
+    ``(total_q, Hq)`` fp32 in ``lse_base`` (``"log2"`` | ``"ln"``), written to ``lse`` when given; the output bits are the same
+    with and without it. ``sinks``: the fp32 ``(Hq,)`` per-head sink logits of the sink member (``None``: the class without
+    sinks)."""
     total_q, Hq, D = q.shape
     if config is None:
         config = planned.config or default_config(D=D)
@@ -960,6 +1108,11 @@ def run_attention(
     if planned.window_left is not None and int(window_left) != planned.window_left:
         raise ValueError(
             f"window_left {window_left} at run_attention over a plan built for window_left {planned.window_left}"
+        )
+    mismatch = sinks_declaration_mismatch(planned.has_sinks, sinks)
+    if mismatch is not None:
+        raise ValueError(
+            f"{mismatch}: make the same sinks choice at every run of the plan, or plan again with another has_sinks"
         )
     if ragged:
         # Packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND.
@@ -1026,6 +1179,11 @@ def run_attention(
         raise ValueError(
             "out must not alias the K / V cache: CTAs store output rows while others still read pages"
         )
+    storage = plan_storage(planned)
+    if supplied_out and _overlaps_any(out, storage):
+        raise ValueError(
+            "out must not alias the plan's workspace: output rows and split-KV partials are stored by the same launch"
+        )
     c = check_sm_scale(sm_scale)
     lse_mode = 0
     if return_lse:
@@ -1035,23 +1193,34 @@ def run_attention(
         if lse is None:
             lse = torch.empty(total_q, Hq, dtype=torch.float32, device=q.device)
         else:
-            bad = check_lse_buffer(lse, q, out, k_cache, v_cache, (total_q, Hq))
+            bad = check_lse_buffer(
+                lse,
+                q,
+                out,
+                k_cache,
+                v_cache,
+                (total_q, Hq),
+                storage=storage,
+                tables=(kv_indptr, kv_indices, *plan_tables(planned)),
+            )
             if bad is not None:
                 raise ValueError(
                     f"lse must be a contiguous fp32 ({total_q}, {Hq}) tensor on {q.device} that aliases no operand; got one {bad}"
                 )
+    if not return_lse:
+        lse = None  # a buffer passed without return_lse is neither written nor returned
     if sinks is not None:
-        bad = check_sinks(sinks, Hq, q.device, (out, lse))
+        bad = check_sinks(sinks, Hq, q.device, (out, lse, *storage))
         if bad is not None:
             raise ValueError(
-                f"sinks must be a contiguous fp32 ({Hq},) tensor on {q.device} that aliases no output; got one {bad}"
+                f"sinks must be a contiguous fp32 ({Hq},) tensor on {q.device} that aliases no output and no workspace; got one {bad}"
             )
     _run_attention_validated(
         planned,
         q,
         k_cache,
         v_cache,
-        kv_indptr,
+        plan_kv_indptr(planned, kv_indptr),
         kv_indices,
         c,
         window_left,
@@ -1059,7 +1228,7 @@ def run_attention(
         out,
         config,
         ragged,
-        lse=lse if lse_mode else None,
+        lse=lse,
         lse_mode=lse_mode,
         sinks=sinks,
     )
@@ -1084,8 +1253,9 @@ def _run_attention_validated(
     lse_mode: int = 0,
     sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale. ``enable_pdl``: launch the
-    attention kernel as a programmatic dependent of the preceding kernel (None: the device's default, ``device_support_pdl``).
+    """Launch after the public engine or wrapper has checked inputs; ``kv_indptr`` is the plan's snapshot (``plan_kv_indptr``), ``c``
+    the binary32 log2 scale. ``enable_pdl``: launch the attention kernel as a programmatic dependent of the preceding kernel (None:
+    the device's default, ``device_support_pdl``).
     ``lse_mode`` 1 / 2 stores the base-2 / base-e LSE member of every row into ``lse`` (contiguous fp32, ``total_q * Hq``
     elements); every kernel takes it as a run-time argument, so the launch and the output bits are those of ``lse_mode`` 0.
     ``sinks`` (validated fp32 ``(Hq,)``) selects the kernels compiled for the sink member (their own names): the fold that
@@ -1175,7 +1345,6 @@ def _run_attention_validated(
             planned.groups,
             planned.fold_counters,
             planned.desc,
-            kv_indptr,
             kv_indices,
             float(c),
             float(-c),

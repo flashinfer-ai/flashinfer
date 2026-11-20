@@ -114,6 +114,7 @@ from .utils import (
     ceil_div,
     check_lse_base,
     check_lse_layout,
+    check_has_sinks_undeclared,
     check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
@@ -3248,7 +3249,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
             requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales) raise
+            non-causal prefill, logits soft cap, custom masks, RoPE, non-unit scales) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
             the class's LSE member (fp32; the output bits are the same with and without it). ``run(..., sinks=)`` with an
             fp32 ``[num_qo_heads]`` tensor runs the class's sink member (one virtual key per head in the softmax
@@ -3266,6 +3267,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             with the bits of an eager call on the same batch. The page indices are range-checked at the first plan
             only. ``plan()`` runs a host-side planner whose cost grows with the number of requests (of the order of
             10 us per request; an array planner under ``use_cuda_graph=True``).
+
+            Serving call shapes: the arguments the class does not consume are accepted at the values that ask for
+            nothing and raise at every other value -- ``q_scale`` / ``k_scale`` / ``v_scale`` of ``None`` or exactly
+            ``1.0``, ``seq_lens`` / ``seq_lens_q`` / ``block_tables`` that restate the CSR metadata,
+            ``fixed_split_size`` (``None`` / ``-1`` or any positive size: not used, the chunk length is a class constant)
+            and ``disable_split_kv`` (``True`` plans fused units: the same bits, no split-KV partials). None of them
+            changes an output bit.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -3923,6 +3931,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        *,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -4058,6 +4068,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (``run(..., sinks=)``): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -4089,15 +4109,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 token_pos_in_items_len=token_pos_in_items_len,
                 max_item_len_ptr=max_item_len_ptr,
-                seq_lens=seq_lens,
-                seq_lens_q=seq_lens_q,
-                block_tables=block_tables,
             )
             self._batch_invariant.plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=paged_kv_indptr,
                 kv_indices=paged_kv_indices,
                 kv_last_page_len=paged_kv_last_page_len,
+                seq_lens=seq_lens,
+                seq_lens_q=seq_lens_q,
+                block_tables=block_tables,
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim_qk=head_dim_qk,
@@ -4120,6 +4140,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                has_sinks=has_sinks,
             )
             self._qo_indptr_last = self._batch_invariant._total_q
             self._causal = causal
@@ -4127,13 +4148,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._window_left = window_left
             self._sm_scale = sm_scale
             self._pos_encoding_mode = pos_encoding_mode
-            self._logits_soft_cap = logits_soft_cap
+            # the state the regular plans leave: callers compare it with their own settings
+            self._logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
             self._cached_q_data_type = q_data_type
             self._cached_kv_data_type = kv_data_type
             self._cached_o_data_type = o_data_type
             return
+        check_has_sinks_undeclared(has_sinks)
 
         # Reject this during planning so an unsupported request cannot reach the
         # lower-level trtllm-gen launcher if wrapper setup changes later.
@@ -6040,7 +6063,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
             requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales) raise
+            non-causal prefill, logits soft cap, custom masks, RoPE, non-unit scales) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
             the class's LSE member (fp32; the output bits are the same with and without it). Attention sinks set on the
             wrapper (``_sinks``, an fp32 ``[num_qo_heads]`` tensor) run the class's sink member (one virtual key per head
@@ -6048,6 +6071,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
+
+            Serving call shapes: the arguments the class does not consume are accepted at the values that ask for
+            nothing and raise at every other value -- ``q_scale`` / ``k_scale`` / ``v_scale`` / ``o_scale`` of ``None`` or exactly
+            ``1.0``, ``seq_lens`` / ``seq_lens_q`` that restate ``kv_indptr`` / ``qo_indptr``,
+            ``fixed_split_size`` (``None`` / ``-1`` or any positive size: not used, the chunk length is a class constant)
+            and ``disable_split_kv`` (``True`` plans fused units: the same bits, no split-KV partials). None of them
+            changes an output bit.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -6288,6 +6318,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         uniform_q_len: Optional[int] = None,
         use_token_head_sf: bool = False,
+        *,
+        has_sinks: Optional[bool] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -6429,6 +6461,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             minus head_dim) is passed via ``kv_cache_sf`` at :meth:`run` time. When
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
+        has_sinks : Optional[bool]
+            Keyword-only, for ``batch_invariant=True``, where a run with attention sinks and
+            a run without are different members of the class (different bits and receipts).
+            Declares whether every :meth:`run` of this plan is given sinks
+            (the ``_sinks`` attribute): ``True`` makes a run without
+            sinks raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`,
+            ``False`` a run with sinks. Defaults to ``None``: each run decides by whether
+            sinks are given. The check is made in Python at :meth:`run`, so a captured CUDA
+            graph is unaffected, and a new :meth:`plan` replaces the declaration. Without
+            ``batch_invariant=True`` a value other than ``None`` raises ``ValueError``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -6484,8 +6526,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
                 token_pos_in_items_len=token_pos_in_items_len,
                 max_item_len_ptr=max_item_len_ptr,
-                seq_lens=seq_lens,
-                seq_lens_q=seq_lens_q,
                 v_indptr=v_indptr,
                 o_indptr=o_indptr,
             )
@@ -6494,6 +6534,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 kv_indptr=kv_indptr,
                 kv_indices=None,
                 kv_last_page_len=None,
+                seq_lens=seq_lens,
+                seq_lens_q=seq_lens_q,
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=num_kv_heads,
                 head_dim_qk=head_dim_qk,
@@ -6516,6 +6558,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 use_token_head_sf=use_token_head_sf,
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
+                has_sinks=has_sinks,
             )
             self._qo_indptr_last = self._batch_invariant._total_q
             self._causal = causal
@@ -6523,13 +6566,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._window_left = window_left
             self._sm_scale = sm_scale
             self._pos_encoding_mode = pos_encoding_mode
-            self._logits_soft_cap = logits_soft_cap
+            # the state the regular plans leave: callers compare it with their own settings
+            self._logits_soft_cap = 0.0 if logits_soft_cap is None else logits_soft_cap
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
             self._cached_q_data_type = q_data_type
             self._cached_kv_data_type = kv_data_type
             self._cached_o_data_type = o_data_type
             return
+        check_has_sinks_undeclared(has_sinks)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
