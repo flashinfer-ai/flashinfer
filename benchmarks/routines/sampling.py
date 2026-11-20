@@ -38,7 +38,7 @@ from .flashinfer_benchmark_utils import (
 )
 
 # Top-k backends forced through the library's documented FLASHINFER_TOPK_ALGO knob
-# (flashinfer/topk.py). "cuda" leaves the environment alone, i.e. the library's
+# (flashinfer/topk.py). "cuda" unsets the knob, i.e. the library's
 # auto-dispatch, which also depends on whether a CUDA graph is being captured.
 _TOPK_ALGO_BY_BACKEND = {
     "cuda": None,
@@ -50,6 +50,47 @@ _TIE_BREAK_BY_NAME = {
     "none": flashinfer.topk.TopKTieBreak.NONE,
     "small": flashinfer.topk.TopKTieBreak.SMALL,
     "large": flashinfer.topk.TopKTieBreak.LARGE,
+}
+_TOPK_ROUTINES = ("top_k", "top_k_page_table_transform", "top_k_ragged_transform")
+_PROBS_ROUTINES = (
+    "sampling_from_probs",
+    "top_k_sampling_from_probs",
+    "top_p_sampling_from_probs",
+    "top_k_top_p_sampling_from_probs",
+    "min_p_sampling_from_probs",
+    "top_k_renorm_probs",
+    "top_p_renorm_probs",
+)
+# Mode flag -> (default, routines that use it).
+_MODE_FLAG_ROUTINES = {
+    "param_mode": (
+        "scalar",
+        (
+            "softmax",
+            "top_k_sampling_from_probs",
+            "top_p_sampling_from_probs",
+            "top_k_top_p_sampling_from_probs",
+            "top_k_top_p_sampling_from_logits",
+            "min_p_sampling_from_probs",
+            "top_k_renorm_probs",
+            "top_p_renorm_probs",
+            "top_k_mask_logits",
+        ),
+    ),
+    "deterministic": (
+        None,
+        _PROBS_ROUTINES
+        + (
+            "sampling_from_logits",
+            "top_k_top_p_sampling_from_logits",
+            "chain_speculative_sampling",
+        )
+        + _TOPK_ROUTINES,
+    ),
+    "input_distribution": ("uniform", _PROBS_ROUTINES),
+    "sorted": (False, ("top_k",)),
+    "tie_break": ("none", _TOPK_ROUTINES),
+    "dsa_graph_safe": (False, _TOPK_ROUTINES),
 }
 
 
@@ -91,11 +132,12 @@ def _make_probs(args, batch_size, vocab_size, device, dtype=None):
 def _topk_algo(backend):
     """Force a top-k backend for the duration of one backend's refcheck + timing."""
     algo = _TOPK_ALGO_BY_BACKEND[backend]
-    if algo is None:
-        yield
-        return
     previous = os.environ.get("FLASHINFER_TOPK_ALGO")
-    os.environ["FLASHINFER_TOPK_ALGO"] = algo
+    if algo is None:
+        # "cuda" is the auto-dispatch: an exported value must not force a backend.
+        os.environ.pop("FLASHINFER_TOPK_ALGO", None)
+    else:
+        os.environ["FLASHINFER_TOPK_ALGO"] = algo
     try:
         yield
     finally:
@@ -406,6 +448,13 @@ def parse_sampling_args(line, parser):
             "(the batch-invariant class is the routine's only kernel)"
         )
 
+    # A mode flag on a routine that ignores it would still be written to the CSV.
+    for flag, (default, routines) in _MODE_FLAG_ROUTINES.items():
+        if getattr(args, flag) != default and args.routine not in routines:
+            parser.error(
+                f"--{flag} does not apply to {args.routine} (applies to: {', '.join(routines)})"
+            )
+
     # Default num_rows to batch_size if not specified
     if args.num_rows is None:
         args.num_rows = args.batch_size
@@ -481,6 +530,10 @@ def testSoftmax(args):
                 logits, temperature=temperature_arg, enable_pdl=args.enable_pdl
             )
         elif backend == "batch_invariant":
+            if args.param_mode == "tensor":
+                raise ValueError(
+                    "batch_invariant is benchmarked with a scalar temperature"
+                )
             return flashinfer.sampling.softmax(
                 logits,
                 temperature=temperature,
@@ -667,7 +720,8 @@ def _row_logp_routine(args, routine_name, with_token_ids):
 
     # Reference check: compare against PyTorch log_softmax in fp32 (gathered at the ids for log_probs)
     if run_refcheck and outputs:
-        reference_output = torch.log_softmax(logits.float() / temperature, dim=-1)
+        ref_temperature = 1.0 if temperature is None else temperature
+        reference_output = torch.log_softmax(logits.float() / ref_temperature, dim=-1)
         if with_token_ids:
             reference_output = reference_output.gather(1, token_ids[:, None]).squeeze(1)
         for backend, output in outputs.items():

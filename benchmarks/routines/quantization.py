@@ -85,6 +85,15 @@ def _assert_nvfp4_refcheck_tensor_equal(
         )
 
 
+# Routines that pass --nvfp4_4over6 to the library.
+_NVFP4_4OVER6_ROUTINES = (
+    "nvfp4_quantize",
+    "scaled_fp4_grouped_quantize",
+    "silu_and_mul_scaled_nvfp4_experts_quantize",
+    "silu_and_mul_nvfp4_quantize",
+)
+
+
 def _nvfp4_4over6_from_args(args):
     """Map --nvfp4_4over6 to (nvfp4_4over6= kwargs, resolved recipe).
 
@@ -166,6 +175,7 @@ _GROUPED_ROUTINES = (
 
 def run_quantization_test(args):
     """Run one quantization testlist line; see _dispatch_quantization_test for the routine table."""
+    uses_4over6 = args.nvfp4_4over6 in ("mae", "mse")
     res = _dispatch_quantization_test(args)
     # Mode flags added in 2026-10 stay blank on rows that do not use them, so
     # pre-existing lines keep their CSV columns (and dashboard keys).
@@ -177,7 +187,7 @@ def run_quantization_test(args):
             "nvfp4_4over6": {"env"},
             "use_4over6": {"False"},
             "disable_quant_fast_math": {"False"},
-            "nvfp4_4over6_e4m3_max": {"448"},
+            "nvfp4_4over6_e4m3_max": set() if uses_4over6 else {"448"},
         },
         owners={
             "masked_m": _GROUPED_ROUTINES,
@@ -436,6 +446,11 @@ def parse_quantization_args(line, parser):
     )
 
     args = parser.parse_args(line)
+    if args.nvfp4_4over6 != "env" and args.routine not in _NVFP4_4OVER6_ROUTINES:
+        parser.error(
+            f"--nvfp4_4over6 does not apply to {args.routine} "
+            f"(applies to: {', '.join(_NVFP4_4OVER6_ROUTINES)})"
+        )
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -533,6 +548,8 @@ def testMxfp8Quantize(args):
 
     def run_backend(backend, input_tensor):
         if backend == "batch_invariant":
+            if sf_layout_str == "8x4":
+                raise ValueError("batch_invariant is benchmarked with 128x4 / linear")
             return flashinfer.mxfp8_quantize(
                 input_tensor,
                 is_sf_swizzled_layout=is_sf_swizzled_layout,
@@ -1473,7 +1490,8 @@ def testGroupedQuantize(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
-    warn_if_pdl_unsupported(args, args.routine)
+    if args.routine != "silu_and_mul_mxfp8_experts_quantize":
+        warn_if_pdl_unsupported(args, args.routine)
     if args.verbose >= 1:
         print(f"[INFO] Running testGroupedQuantize ({args.routine})")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
@@ -1988,7 +2006,23 @@ def testNvfp4KvQuantize(args):
 
     x = torch.randn(m, k, dtype=input_dtype, device=device)
     global_sf = torch.tensor([args.global_scale], dtype=torch.float32, device=device)
-    fp4_data, block_scales = flashinfer.nvfp4_kv_quantize(x, global_sf)
+    if is_quant or filter_backends_by_compute_capability(
+        ["cuda"], "nvfp4_kv_quantize", device
+    ):
+        fp4_data, block_scales = flashinfer.nvfp4_kv_quantize(x, global_sf)
+    else:
+        # The quantize kernel needs SM100+, the dequantize kernel does not: time
+        # dequantize on random packed data, as nvfp4_kv_dequantize_paged does.
+        fp4_data = torch.randint(0, 256, (m, k // 2), dtype=torch.uint8, device=device)
+        block_scales = torch.randint(
+            1, 120, (m, k // 16), dtype=torch.uint8, device=device
+        )
+        if run_refcheck:
+            print(
+                "[INFO] nvfp4_kv_quantize is not supported on this device: "
+                "nvfp4_kv_dequantize runs on random packed data, round-trip refcheck skipped."
+            )
+            run_refcheck = False
 
     def run_backend(backend, x, fp4_data, block_scales, global_sf):
         if backend != "cuda":
@@ -2027,7 +2061,7 @@ def testNvfp4KvQuantize(args):
                 args,
                 args.routine,
                 f"{backend} round-trip mean relative error {rel_err:.4f} >= 0.5",
-                int(rel_err >= 0.5),
+                int(not bool(rel_err < 0.5)),  # NaN fails too
                 1,
             )
 

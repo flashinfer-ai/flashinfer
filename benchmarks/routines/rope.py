@@ -256,6 +256,15 @@ def parse_rope_args(line, parser):
         )
     if args.mla_kv and args.kv_layout != "NHD":
         parser.error("--mla_kv uses 3D (ckv, kpe) caches; --kv_layout does not apply")
+    # MLA needs a non-empty compressed (no-RoPE) part: k_nope / the ckv cache.
+    if args.mla_kv and args.routine == "rope_quantize_fp8" and args.no_rope_dim <= 0:
+        parser.error("--mla_kv requires --no_rope_dim > 0")
+    if (
+        args.mla_kv
+        and args.routine == "rope_quantize_fp8_append_paged_kv_cache"
+        and args.rotary_dim >= args.head_dim
+    ):
+        parser.error("--mla_kv requires --rotary_dim < --head_dim")
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -933,9 +942,15 @@ def testApplyRopeWithCosSinCache(args):
     # First half is cos, second half is sin
     max_seq_len = seq_len
     # API requires FP32 cache regardless of Q/K dtype (#5025).
-    cos_sin_cache = torch.randn(
-        max_seq_len, rotary_dim, dtype=torch.float32, device=device
+    # Real (cos, sin) pairs of random angles: each rotation keeps the vector
+    # norm, so --inplace can rewrite Q/K every timing iteration without the
+    # values growing to inf.
+    angles = (
+        torch.rand(max_seq_len, rotary_dim // 2, dtype=torch.float32, device=device)
+        * 2
+        * torch.pi
     )
+    cos_sin_cache = torch.cat([angles.cos(), angles.sin()], dim=-1)
 
     # positions: (total_tokens,)
     positions = torch.arange(seq_len, dtype=torch.long, device=device).repeat(

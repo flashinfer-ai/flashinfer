@@ -504,6 +504,11 @@ top-k page-table `--page_size`. The Cake backend is not benchmarked by these rou
 
 New mode flags are written as new CSV columns and stay empty on rows that do not use them
 (`blank_unused_mode_columns`), so pre-existing testlist lines keep the same CSV row.
+Two existing columns change on purpose:
+
+- `resolved_backend` is `cute-dsl` (was empty) on norm rows that ran the CuTe-DSL kernel.
+- `sf_layout` is `linear` (was `128x4`) on `mxfp8_quantize --no_sf_swizzled_layout` rows. The old
+  value was the unused `--sf_layout` default; the row always ran the linear layout.
 
 ### Mamba Flags
 | Flag                     | Description                                                                                                 |

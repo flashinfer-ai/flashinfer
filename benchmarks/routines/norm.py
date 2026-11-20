@@ -3230,6 +3230,9 @@ def testGatedResidualNorm(args):
         gate = torch.randn(shape, dtype=bf16, device=device)
         x = x0.clone()
 
+        # In place: each timing iteration re-normalizes its own output. Values
+        # stay finite (RMS norm, gate in (0, 1)) and the kernel has no
+        # data-dependent branch; the refcheck compares the first call only.
         def run_backend(backend, x):
             flashinfer.rmsnorm_sigmoid_gate(
                 x, gate, eps, enable_pdl=enable_pdl, backend="cute"
@@ -3369,7 +3372,7 @@ def testGatedResidualNorm(args):
             cur_res["norm_variant"] = variant
             cur_res["enable_pdl"] = enable_pdl
             cur_res["backend"] = backend
-            cur_res["resolved_backend"] = "cute"
+            cur_res["resolved_backend"] = "cute-dsl"
             cur_res["case_tag"] = args.case_tag
             res.append(cur_res)
     return res

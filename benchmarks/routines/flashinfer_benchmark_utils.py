@@ -460,6 +460,10 @@ def fp8_code_distance(actual, expected):
     A fixed rtol cannot express one fp8 ULP (12.5% relative for e4m3), so fp8
     outputs are compared in code space: sign-magnitude bytes mapped to an
     ordered integer line. int8 tensors are compared directly.
+
+    Bytes are read as e4m3 codes, where magnitude 0x7F is NaN, one step above
+    the largest finite value (0x7E). A NaN on one side only is a mismatch
+    (distance 255), so it cannot pass a "within one step" check.
     """
     if actual.dtype == torch.int8:
         return (actual.to(torch.int16) - expected.to(torch.int16)).abs()
@@ -467,9 +471,13 @@ def fp8_code_distance(actual, expected):
     def ordered(x):
         u = x.view(torch.uint8).to(torch.int16)
         mag = u & 0x7F
-        return torch.where(u >= 0x80, -mag, mag)
+        return torch.where(u >= 0x80, -mag, mag), mag == 0x7F
 
-    return (ordered(actual) - ordered(expected)).abs()
+    a, a_nan = ordered(actual)
+    e, e_nan = ordered(expected)
+    dist = (a - e).abs()
+    dist = torch.where(a_nan & e_nan, torch.zeros_like(dist), dist)
+    return torch.where(a_nan != e_nan, torch.full_like(dist, 255), dist)
 
 
 def blank_unused_mode_columns(args, res, defaults=None, owners=None):
@@ -1167,9 +1175,9 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutile"],
-        "10.3": ["cutile"],
-        "10.7": [],
+        "10.0": ["cutile", "cuda"],
+        "10.3": ["cutile", "cuda"],
+        "10.7": ["cuda"],
         "12.0": [],
         "12.1": [],
     },
