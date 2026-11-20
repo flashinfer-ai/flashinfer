@@ -178,7 +178,7 @@ def test_small_amax_matches_stock_quantization(backend, exp):
 
 @requires_sm90
 @pytest.mark.parametrize("backend", ["auto", "specialized"])
-def test_normal_amax_below_replacement_floor(backend):
+def test_normal_amax_below_replacement_floor(backend, record_property):
     # Both FP32 scale factors are normal. With the floor the maximum maps
     # near 420 and rounds to E4M3 416, rather than the unclamped 448.
     x = torch.full((4, G), (15 / 16) * 2.0**-117, device="cuda", dtype=torch.bfloat16)
@@ -191,8 +191,14 @@ def test_normal_amax_below_replacement_floor(backend):
         "deepgemm": 0,
     }
     assert torch.equal(out, torch.full_like(out, 120))  # 128 * 15/16
+    # The external H100/cu129 stock build returned zero on this extreme
+    # input; the H100/cu132 build returned 120. Keep the exact analytic
+    # oracle above, and record stock separately instead of treating it as
+    # ground truth. Other ordinary-range stock comparisons are unchanged.
     stock = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="deepgemm")
-    torch.testing.assert_close(out, stock, atol=0, rtol=0.03)
+    record_property("stock_min", stock.min().item())
+    record_property("stock_max", stock.max().item())
+    record_property("analytic_expected", 120)
 
 
 @requires_sm90
