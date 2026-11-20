@@ -298,6 +298,77 @@ def test_kernel_identity_carries_the_mask_mode():
         kernel_name(*args, mask_mode="ranged")
 
 
+def test_one_dataflow_over_the_visible_set():
+    """What a row sees is the only difference between the mask modes: a key-range row, the key-set row with the same visible
+    set (over the hull or a longer request) and, when the range adds no key, the causal row are ONE term object; the three
+    receipts are the published digests."""
+    import random
+
+    from flashinfer.attention.batch_invariant import spec
+    from flashinfer.attention.batch_invariant.spec import AttentionSpec, RowSpec
+
+    assert spec.MASK_MODES == ("causal", "key_ranges", "key_set")
+    S = AttentionSpec(64, T=16, C=32)
+    rng = random.Random(3)
+    rows = [spec.ranged_sample_row(16, 32)]
+    for _ in range(40):
+        p = rng.randrange(0, 150)
+        a = rng.randrange(0, 180)
+        rows.append(
+            RowSpec(
+                p=p,
+                window_left=rng.choice([-1, 0, 3, 40]),
+                row=rng.randrange(4),
+                brange=(a, a + rng.choice([0, 1, 7, 33, 90])),
+            )
+        )
+    for r in rows:
+        assert r.mask_mode == "key_ranges"
+        ks = r.as_key_set()
+        assert ks.mask_mode == "key_set" and ks.key_set() == r.key_set()
+        longer = r.as_key_set(r.L + 77)
+        causal = RowSpec(p=r.p, window_left=r.window_left, row=r.row)
+        for d in (0, 3):
+            t = S.output(r, d)
+            assert S.output(ks, d) is t and S.output(longer, d) is t
+            assert (S.output(causal, d) is t) == (r.key_set() == causal.key_set())
+        # the empty range is the causal row, and the causal row is the key-set row of its causal range
+        none = RowSpec(p=r.p, window_left=r.window_left, row=r.row, brange=(5, 5))
+        assert S.output(none, 1) is S.output(causal, 1)
+        assert S.output(causal.as_key_set(r.p + 9), 1) is S.output(causal, 1)
+    with pytest.raises(AssertionError):  # a row states its keys one way
+        RowSpec(p=3, kv_len=8, keys=frozenset({1}), brange=(0, 2))
+    for D in (64, 128, 256):
+        assert spec.spec_fingerprint(D) == spec.FINGERPRINTS[D]
+        assert spec.spec_fingerprint(D, mask_mode="key_ranges") == FINGERPRINTS[D]
+        assert (
+            spec.spec_fingerprint(D, mask_mode="key_set") == spec.MASK_FINGERPRINTS[D]
+        )
+        with pytest.raises(TypeError):  # keyword-only
+            spec.spec_fingerprint(D, -1, "key_ranges")
+    with pytest.raises(ValueError):
+        spec.spec_fingerprint(64, mask_mode="non_causal")
+
+
+def test_engine_takes_one_mask_mode_per_plan():
+    from flashinfer.attention.batch_invariant import engine
+
+    qo = torch.tensor([0, 4])
+    kv = torch.tensor([0, 1])
+    last = torch.tensor([16])
+    ks = engine.pack_key_sets([4], [16], torch.ones(64))
+    with pytest.raises(ValueError):
+        engine.plan_attention(
+            qo, kv, last, 8, 8, 128, 16, key_sets=ks, ranges=torch.zeros(4, 2)
+        )
+    with pytest.raises(ValueError):  # the key_ranges mode is sized with the ranges
+        engine.workspace_bytes(qo, kv, last, 8, 8, 128, 16, mask_mode="key_ranges")
+    with pytest.raises(ValueError):
+        engine.workspace_bytes(
+            qo, kv, last, 8, 8, 128, 16, ranges=torch.zeros(4, 2, dtype=torch.int32)
+        )
+
+
 # ------------------------------------------------------------------------------------------------------ on the device
 SPANS = [
     [(100, 139), (600, 1100)],  # inside a tile; across tiles and the first chunk end
@@ -345,6 +416,67 @@ def test_random_ranges_match_reference(D):
     for cw, rw in ((-1, -1), (300, 0), (0, 64), (700, 200)):
         out = run_ranges(pr, ranges, cw, rw)
         assert close(out, reference(pr, ranges, cw, rw)), (cw, rw)
+
+
+def visible_masks(pr, ranges, causal_window=-1, range_window=-1):
+    """The wrapper's mask of every request as ``(q_len, kv_len)`` bool tensors (host): ``(causal AND causal window) OR (in
+    range AND range window)`` -- each row's visible set, the custom mask that states the same rows to the prefill wrappers."""
+    out = []
+    tok = 0
+    host = ranges.to("cpu", torch.int64)
+    for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True):
+        pos = torch.arange(kl - ql, kl)[:, None]
+        key = torch.arange(kl)[None, :]
+        mask = key <= pos
+        if causal_window >= 0:
+            mask &= pos - key <= causal_window
+        r = host[tok : tok + ql]
+        in_range = (key >= r[:, :1]) & (key <= r[:, 1:])
+        if range_window > 0:
+            in_range &= pos - key < range_window
+        out.append(mask | in_range)
+        tok += ql
+    return out
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_key_range_rows_equal_the_key_set_rows_with_the_same_visible_set(D):
+    """The cross-check of the two modes whose keys are data: the ranges wrapper and the paged / ragged prefill wrappers with the
+    custom mask of the same visible sets give every token the same bits -- spans around the tokens, random rows ahead of and
+    behind them, with and without the two windows; with no range at all both are the causal class."""
+    pr = span_problem(D)
+    cases = [(span_rows(pr, SPANS), -1, -1), (span_rows(pr, SPANS), 300, 0)]
+    g = torch.Generator().manual_seed(11)
+    rows = []
+    for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True):
+        start = torch.randint(-50, kl + 50, (ql,), generator=g)
+        length = torch.randint(-20, 900, (ql,), generator=g)
+        keep = torch.rand(ql, generator=g) < 0.6
+        rows.append(
+            torch.where(
+                keep[:, None],
+                torch.stack((start, start + length), dim=1),
+                torch.full((ql, 2), -1),
+            )
+        )
+    rnd = torch.cat(rows).to(torch.int32).to(pr.device)
+    cases += [(rnd, -1, -1), (rnd, 500, 100)]
+    for ranges, cw, rw in cases:
+        ranged = bits(run_ranges(pr, ranges, cw, rw))
+        masks = visible_masks(pr, ranges, cw, rw)
+        assert torch.equal(bits(_base.run_masked(pr, masks)), ranged), (cw, rw)
+        assert torch.equal(bits(_base.run_masked(pr, masks, "ragged")), ranged), (
+            cw,
+            rw,
+        )
+    none = torch.full((sum(pr.q_lens), 2), -1, dtype=torch.int32, device=pr.device)
+    causal = bits(run_causal(pr))
+    assert torch.equal(bits(run_ranges(pr, none)), causal)
+    assert torch.equal(bits(_base.run_masked(pr, visible_masks(pr, none))), causal)
+    win = bits(run_causal(pr, 300))
+    assert torch.equal(bits(run_ranges(pr, none, 300, 0)), win)
+    assert torch.equal(bits(_base.run_masked(pr, visible_masks(pr, none, 300))), win)
 
 
 @needs_device
