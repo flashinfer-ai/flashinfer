@@ -87,14 +87,6 @@ When a FlashInfer operation executes, the autotuner resolves the best
    environment variable is set and tuning mode is off).
 5. **Fallback tactic (−1)** — a safe default that every runner must implement.
 
-Outside tuning mode, a lookup whose bucket lies above every bucket tuned for
-the operation (same runners, cache-key extras and non-dynamic dimensions)
-repeats levels 1–4 at the largest tuned bucket before using the fallback, and
-logs this once at INFO.  The largest tuned bucket is taken from levels 1–3;
-bundled package configs (level 4) are not scanned for it.  This covers runtime
-sizes above the tuned range.  Lookups below or between tuned buckets still use
-the fallback, and replay coverage reports still count such a lookup as a miss.
-
 User-loaded file configs (level 2) are also consulted during tuning. A
 multi-runner tune can re-profile a loaded winner whose recorded coverage omits
 a current candidate. See `Cache Hit Behavior During Tuning`_.
@@ -381,7 +373,11 @@ Context manager for autotuning with optional file-based caching.
    * - ``cache``
      - ``str | None``
      - Optional path to a JSON config file.
-       On entry, configs are loaded from this file if it exists.
+       On entry, configs are loaded from this file if it exists and added
+       to those already loaded in this process (for a key present in several
+       files, the file loaded last wins; entries for the same workload under
+       different runner classes are distinct keys, so between them the
+       caller's runner order decides, as with ``load_configs()``).
        On exit, configs are saved back to this file when ``tune_mode=True``.
 
 **Behavior matrix:**
@@ -553,6 +549,31 @@ skip state changes, or when caches are cleared or reloaded. Use it to invalidate
 prepared selections. Protocol records are separate from v1 JSON import/export.
 Existing ``autotune()`` controls can be nested as specified by v2; they do not
 import or export protocol records.
+
+Cake Backends as Autotuning Candidates
+--------------------------------------
+
+Some GEMM APIs append their Cake backend as the **last** runner of the
+``backend="auto"`` candidate list: ``bmm_bf16``, ``mm_nvfp4_svdquant`` (SM100/SM103)
+and the per-token-alpha path of ``mm_fp4``. The Cake runner is offered only for
+inputs it serves. Being last, it never changes the untuned default or a cache-miss
+fallback (``runners[0]``, tactic ``-1``); under ``flashinfer.autotune()`` it is
+measured with the other runners and is used only when it is the fastest.
+Tuning under an autotune process group
+(:func:`flashinfer.autotuner.set_autotune_process_group`) does not measure Cake:
+every rank of the group must list the same runners, and Cake is offered per
+rank-local operands. Outside
+tuning, the Cake runner is listed only while the autotuner can select it: it holds
+a Cake result tuned in this process or loaded from a cache file, or an
+``autotune_v2`` store is active (``AutoTuner.may_select_runner_class``). Untuned
+calls therefore keep the runner list and host cost of the other backends. Explicit
+``backend="cake"`` is unchanged. The per-token ``mm_fp4`` Cake backend is
+experimental and additionally needs ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``.
+To remove all automatic Cake candidates, set:
+
+.. code-block:: bash
+
+    export FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1
 
 cuTile Autotuning
 -----------------

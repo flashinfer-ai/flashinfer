@@ -15,6 +15,7 @@ SM107.
 """
 
 import dataclasses
+import re
 
 import pytest
 import torch
@@ -458,6 +459,67 @@ def test_flag_bypasses_the_operator_backend_selection():
 
 
 @needs_device
+def test_launch_placements_share_one_compiled_object(monkeypatch):
+    """The block-scaled wrapper's object rule: records differing only in the raster order, the swizzle size or the
+    persistent grid launch ONE compiled object (one ``jit.build_and_load`` name, without those tokens) with bit-identical
+    outputs; an in-cluster split record (``cluster_k > 1``: the chunk fold inside the cluster) is its own ``C1 ... _ck<k>``
+    object next to the split class's ``CL`` object."""
+    import flashinfer.batch_invariant.jit as J
+    from flashinfer.gemm.batch_invariant import api as bi_api
+    from flashinfer.gemm.batch_invariant.blocks import compile_blockscaled as bcb
+
+    names = []
+    orig = J.build_and_load
+
+    def recording(module, kernel, compile_fn):
+        names.append(kernel)
+        return orig(module, kernel, compile_fn)
+
+    monkeypatch.setattr(J, "build_and_load", recording)
+    bcb._compiled_blockscaled.cache_clear()
+    bi_api.clear_kernel_cache()
+    fam = part_of(torch.device("cuda"))[1]
+    fmt = mx_class_for("mxfp8", fam)
+    M, N, K = 300, 4096, 2048
+    assert chunks_for(N, K, fmt) == 1
+    a, sfa = adv_mx(M, K, 161)
+    b, sfb = weight(N, K, 162)
+    base = Knobs((128, 128), (1, 2), False, True, "m", 1)
+    ref = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=base))
+    for r in ("m", "n"):
+        for s in (1, 2, 4, 8):
+            for g in (0, 9):
+                cfg = dataclasses.replace(
+                    base, raster_along=r, swizzle_size=s, grid_clusters=g
+                )
+                got = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb, config=cfg))
+                assert torch.equal(got, ref), cfg.describe()
+    objects = [n for n in names if "_bk_C" in n]
+    assert len(objects) == 1 and "_bk_C1_" in objects[0], names
+    assert re.search(r"_r[mn]_sw\d|_g\d", objects[0]) is None, objects
+    # the in-cluster split record keeps its own object (its factor is static), beside the split class's dynamic-L object
+    del names[:]
+    N2, K2 = 512, 16384
+    C = chunks_for(N2, K2, fmt)
+    assert C == 2
+    a2, sfa2 = adv_mx(M, K2, 163)
+    b2, sfb2 = weight(N2, K2, 164)
+    split = Knobs((128, 64), (1, 1), False, True, "m", 1)
+    ref2 = bits(mm_mxfp8_batch_invariant(a2, b2, sfa2, sfb2, config=split, chunks=C))
+    ck = next(
+        k
+        for k in enumerate_space(M, N2, K2, chunks=C, b_major="k", in_fmt=fmt)
+        if k.cluster_k == C
+    )
+    got = bits(mm_mxfp8_batch_invariant(a2, b2, sfa2, sfb2, config=ck, chunks=C))
+    assert torch.equal(got, ref2), ck.describe()
+    objects = sorted(n for n in names if "_bk_C" in n)
+    assert len(objects) == 2, names
+    assert any("_bk_CL_" in n and "_ck" not in n for n in objects), objects
+    assert any("_bk_C1_" in n and f"_ck{C}" in n for n in objects), objects
+
+
+@needs_device
 def test_in_cluster_split_store_staging_is_stable_under_repeats():
     """The in-cluster split's owner stores every C-th subtile through a staging buffer indexed by its own store count; with
     several subtiles per owner and a stage count sharing a factor with C, a global-index scheme would reuse one buffer under
@@ -830,6 +892,39 @@ def test_public_api_skips_backend_selection(monkeypatch):
     )
     bi_mm(a, b, sfa, sfb)
     assert flashinfer.mm_mxfp8.suitable_auto_backends is sentinel
+
+
+@needs_device
+@pytest.mark.parametrize("M,N,K", [(16, 4096, 4096), (37, 128, 8192)])
+def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
+    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
+    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
+    (only the entry's own fresh output skips the aliasing check)."""
+    a, sfa = adv_mx(M, K, 181)
+    b, sfb = weight(N, K, 182)
+    ref = bits(mm_mxfp8_batch_invariant(a, b, sfa, sfb))
+    assert torch.equal(bits(bi_mm(a, b, sfa, sfb)), ref)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    assert bi_mm(a, b, sfa, sfb, out=out) is out and torch.equal(bits(out), ref)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        bi_mm(a, b, sfa, sfb, out=out)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            bi_mm(a, b, sfa, sfb, out=out)
+    torch.cuda.current_stream().wait_stream(s)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    buf = torch.empty(M * max(2 * N, K), dtype=torch.uint8, device="cuda")
+    alias_a = buf[: M * K].view(E4).view(M, K)
+    alias_out = buf[: 2 * M * N].view(torch.bfloat16).view(M, N)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        bi_mm(alias_a, b, sfa, sfb, out=alias_out)
 
 
 @needs_device

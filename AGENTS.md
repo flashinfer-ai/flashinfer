@@ -136,7 +136,7 @@ workspace for cold-cache comparisons.
 | Working on | Read |
 | --- | --- |
 | JIT, cache keys, bindings, tracing, or wheel builds | [JIT and build reference](docs/development/jit_and_build.md) |
-| Backend dispatch, graph lifetimes, or dtype contracts | [Backend implementation notes](docs/development/backend_notes.md) |
+| Backend dispatch, graph lifetimes, dtype contracts, or the autotuner cache file | [Backend implementation notes](docs/development/backend_notes.md) |
 | Test scheduling, resource telemetry, or architecture guards | [Testing reference](docs/development/testing.md) |
 | Build, cache, logging, or backend environment settings | [Environment variables](docs/development/environment_variables.md) |
 | Persistent CI caches and artifact publication | [CI cache contract](ci/COMPILE_CACHE.md) |
