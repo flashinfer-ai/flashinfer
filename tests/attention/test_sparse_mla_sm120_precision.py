@@ -178,8 +178,6 @@ def test_precision_no_prefill_fallback(precision):
 
 @pytest.mark.parametrize("mixed", [None, False, True])
 def test_fp8_prefill_cross_bucket_graphs(mixed, tmp_path):
-    from flashinfer.mla._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
-
     q, main, idx, kwargs, reference = inputs(16, 61, 53, mixed is True)
     if mixed is None:
         kwargs = {k: v for k, v in kwargs.items() if not k.startswith("extra")}
@@ -197,8 +195,8 @@ def test_fp8_prefill_cross_bucket_graphs(mixed, tmp_path):
     wrapper = SparseMLASm120Wrapper(
         kv_scale_format="ue8m0_g32", extra_kv_fp4=mixed is True, compute_precision="fp8"
     )
-    module = _get_sparse_mla_sm120_decode_module()
     states = []
+    scratch_tokens = set()
     for nt in [4, 65, 129]:
 
         def repeat(x):
@@ -214,25 +212,37 @@ def test_fp8_prefill_cross_bucket_graphs(mixed, tmp_path):
         output = torch.empty_like(nq)
         lse = wrapper.run(nq, main, ni, output, 512**-0.5, return_lse=True, **kw)
         expected = output.clone(), lse.clone()
-        if nt > 64:
-            direct, dlse = torch.empty_like(nq), torch.empty_like(lse)
-            module.sparse_mla_sm120_paged_attention(
-                nq,
-                main,
-                ni,
-                direct,
-                dlse,
-                512**-0.5,
-                5,
-                1,
-                kw.get("topk_length"),
-                kw.get("attn_sink"),
-                kw.get("extra_kv_cache"),
-                kw.get("extra_indices"),
-                kw.get("extra_topk_length"),
-                mixed is True,
-            )
-            assert torch.equal(direct, output) and torch.equal(dlse, lse)
+        prepared = next(
+            p
+            for p in wrapper._prepared_calls.values()
+            if p.plan.inspect()["tokens"] == nt
+        )
+        facts = prepared.plan.inspect()
+        if prepared.workspace[0][2]:
+            scratch_tokens.add(nt)
+        # Compare the wrapper with the same native plan and independent
+        # buffers. Auto may choose a different reduction than legacy prefill.
+        direct = torch.empty_like(nq)
+        mid, mlse, dlse = [
+            torch.empty(shape, dtype=dtype, device=nq.device)
+            for shape, dtype, _, _ in prepared.workspace
+        ]
+        prepared.execute(
+            nq,
+            main,
+            ni,
+            direct,
+            512**-0.5,
+            kw.get("topk_length"),
+            kw.get("attn_sink"),
+            kw.get("extra_kv_cache"),
+            kw.get("extra_indices"),
+            kw.get("extra_topk_length"),
+            mid=mid,
+            mlse=mlse,
+            lse=dlse,
+        )
+        assert torch.equal(direct, output) and torch.equal(dlse, lse)
         ref, rlse = (repeat(x) for x in reference)
         torch.testing.assert_close(output, ref, atol=0.05, rtol=0.05)
         torch.testing.assert_close(lse, rlse, atol=0.02, rtol=0.02)
@@ -251,9 +261,16 @@ def test_fp8_prefill_cross_bucket_graphs(mixed, tmp_path):
         graph.debug_dump(str(dot))
         topology = dot.read_text()
         _kernel_only_graph(topology)
-        if nt > 64:
+        if facts["implementation"] == "dsv4_fp8_splitkv_decode":
+            assert "dsv4_fp8_splitkv_decode" in topology
+        elif facts["implementation"] == "dsv4_fp8_decode":
+            assert "cute_prefill" in topology
+        elif facts["variant"] != 0:
             assert "sparse_mla_prefill_kernel" in topology
             assert "sparse_mla_decode" not in topology
+        elif mixed is not True:
+            assert "dsv4_fp8_splitkv_decode" in topology
+            assert "merge" in topology
         else:
             assert "sparse_mla_decode_dsv4_kernel" in topology
             assert "sparse_mla_decode_dsv4_merge_kernel" in topology
@@ -262,7 +279,7 @@ def test_fp8_prefill_cross_bucket_graphs(mixed, tmp_path):
         p.workspace[2][0][0]
         for p in wrapper._prepared_calls.values()
         if p.workspace[0][2]
-    } == {4}
+    } == scratch_tokens
     for graph, output, lse, expected, *_ in states * 3:
         graph.replay()
         torch.cuda.synchronize()

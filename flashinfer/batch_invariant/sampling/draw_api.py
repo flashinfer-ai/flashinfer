@@ -25,15 +25,15 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 
-from ..support import check_device, unsupported
+from ..support import check_no_overlap, out_buffer, scratch, unsupported
 from .api import (
     _DTYPE_STR,
-    MAX_VOCAB,
     _aligned_rows,
     _dummy,
     _pdl,
     _rows,
     _temperature,
+    check_input,
 )
 from .draw_schedule import SHARE_MAX, draw_config
 from .schedule import (
@@ -52,22 +52,16 @@ _KEY_DTYPES = (torch.int64, torch.uint64)
 
 
 def _check_input(x: torch.Tensor, name: str) -> int:
-    """The device, dtype, rank and vocabulary checks of an input; returns ``N``."""
-    check_device(x.device, CLASS, DRAW_ARCHS)
-    if x.dtype not in _DTYPE_STR:
-        raise unsupported(CLASS, f"{name} dtype {x.dtype}", f"bf16, f16 or fp32 {name}")
-    if x.dim() < 1:
-        raise unsupported(
-            CLASS, f"a {x.dim()}-D input", f"{name} of shape (..., vocabulary)"
-        )
-    N = int(x.shape[-1])
-    if not (0 < N < MAX_VOCAB):
-        raise unsupported(
-            CLASS,
-            f"a vocabulary of {N}",
-            f"0 < vocabulary < 2^31 (every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it only where the row's alignment admits a member within {SHARE_MAX} elements per thread)",
-        )
-    return N
+    """The device, dtype, rank and vocabulary checks of an input (the mode's shared check, naming this class); returns
+    ``N``."""
+    return check_input(
+        x,
+        name,
+        CLASS,
+        DRAW_ARCHS,
+        f"every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it only where the row's alignment admits a "
+        f"member within {SHARE_MAX} elements per thread",
+    )
 
 
 def _shared_key_error(M: int) -> ValueError:
@@ -147,10 +141,15 @@ def draw(
     enable_pdl: bool = False,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
+    return_valid: bool = True,
+    out: Optional[torch.Tensor] = None,
+    logprob_out: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
-    """One launch of the class: ``{"samples"`` (int32, ``-1`` for an invalid row), ``"valid"`` (bool), and with
-    ``return_logprob`` (logits only) ``"logp"`` (fp32: the drawn token's natural log-probability from the same ``m`` and
-    ``S``, NaN where invalid)``}``, each of shape ``indices.shape`` or ``x.shape[:-1]``. ``seed`` / ``offset`` are the
+    """One launch of the class: ``{"samples"`` (int32, ``-1`` for an invalid row), ``"valid"`` (bool, with
+    ``return_valid``), and with ``return_logprob`` (logits only) ``"logp"`` (fp32: the drawn token's natural
+    log-probability from the same ``m`` and ``S``, NaN where invalid)``}``, each of shape ``indices.shape`` or
+    ``x.shape[:-1]``. ``out`` (int32) and ``logprob_out`` (fp32; it implies ``return_logprob``) are caller-owned buffers
+    of that shape, written in place and returned as given. ``seed`` / ``offset`` are the
     rows' keys (int64 / uint64 tensors of one value per output row; a single value, as a Python int or a length-one
     tensor, for one row), ``draw`` the block of the stream the uniform is read from. An index outside the source rows
     makes its output row invalid (token ``-1``). Bitwise identical for every ``config`` in
@@ -159,6 +158,8 @@ def draw(
     from .draw_kernel import get_compiled_kernel
 
     name = "logits" if from_logits else "probs"
+    if logprob_out is not None:
+        return_logprob = True
     if return_logprob and not from_logits:
         raise ValueError("the drawn token's log-probability is defined for logits")
     N = _check_input(x, name)
@@ -202,23 +203,36 @@ def draw(
                 f"config {config.describe()} issues {loads} loads per thread per pass; the enumerated space bounds a "
                 f"re-read or staged member at {LOADS_PER_THREAD_MAX} (such a kernel compiles for minutes)"
             )
-        loads = config.elems_per_thread(N) // config.vec_elems
-        if config.stage != "regs" and loads > LOADS_PER_THREAD_MAX:
-            raise ValueError(
-                f"config {config.describe()} issues {loads} loads per thread per pass; the enumerated space bounds a "
-                f"re-read or staged member at {LOADS_PER_THREAD_MAX} (such a kernel compiles for minutes)"
-            )
     if indices is not None and config.rows_per_cta != 1:
         raise ValueError("an index gather needs a config with one row per CTA")
     if config.vec_elems > max_vec_elems(N, elem_bytes):
         raise ValueError("config vector width exceeds the row alignment")
     x2 = _aligned_rows(x2, config.vec_elems * elem_bytes)
-    tok = torch.empty(M, dtype=torch.int32, device=dev)
-    valid = torch.empty(M, dtype=torch.int32, device=dev)
-    lp = (
-        torch.empty(M, dtype=torch.float32, device=dev)
-        if return_logprob
-        else _dummy(dev, torch.float32)
+    ob = out_buffer(out, "out", lead, torch.int32, x, 4)
+    tok = (
+        ob.view(-1) if ob is not None else torch.empty(M, dtype=torch.int32, device=dev)
+    )
+    # the kernel's validity word is never read: validity is the token's sign (an invalid row draws -1), so the word
+    # goes to a per-device scratch and the call allocates nothing it does not return
+    valid = scratch(dev, torch.int32, M)
+    if return_logprob:
+        lb = out_buffer(logprob_out, "logprob_out", lead, torch.float32, x, 4)
+        lp = (
+            lb.view(-1)
+            if lb is not None
+            else torch.empty(M, dtype=torch.float32, device=dev)
+        )
+    else:
+        lb, lp = None, _dummy(dev, torch.float32)
+    check_no_overlap(
+        [("out", ob), ("logprob_out", lb)],
+        [
+            ("x", x),
+            ("seed", seeds),
+            ("offset", offs),
+            ("indices", indices),
+            ("temperature", temp_t),
+        ],
     )
     temp_arg = temp_t if temp_t is not None else _dummy(dev, torch.float32)
     if M > 0 and (indices is None or Msrc > 0):
@@ -251,13 +265,14 @@ def draw(
         M > 0
     ):  # a gather from an empty source: every index lies outside the source rows, nothing is read
         tok.fill_(-1)
-        valid.zero_()
         if return_logprob:
             lp.fill_(float("nan"))
-    out = {"samples": tok.view(lead), "valid": valid.to(torch.bool).view(lead)}
+    res = {"samples": ob if ob is not None else tok.view(lead)}
+    if return_valid:  # a comparison kernel: formed only when asked for
+        res["valid"] = (tok != -1).view(lead)
     if return_logprob:
-        out["logp"] = lp.view(lead)
-    return out
+        res["logp"] = lb if lb is not None else lp.view(lead)
+    return res
 
 
 def _entry(
@@ -271,9 +286,15 @@ def _entry(
     enable_pdl,
     config,
     sm_count,
+    temperature=None,
+    return_logprob: bool = False,
+    out: Optional[torch.Tensor] = None,
+    logprob_out: Optional[torch.Tensor] = None,
 ):
     """The public entries' common body: the operator's key resolution and validation, the draw, the output
-    dtype rule (the indices' dtype with ``indices``)."""
+    dtype rule (the indices' dtype with ``indices``); the outputs ``samples[, logp][, valid]``. ``out`` takes the
+    samples: an int32 buffer is the kernel's own output; with int64 ``indices`` an int64 buffer is filled by a cast
+    from the kernel's int32 tokens (the operator's dtype contract). ``logprob_out`` takes the log-probability."""
     name = "logits" if from_logits else "probs"
     N = _check_input(x, name)
     if indices is not None:
@@ -286,22 +307,62 @@ def _entry(
         M = int(x.numel() // N) if N else 0
     increment = M * N if from_logits else M  # the operator's own reservation per entry
     seeds, offs = _resolve_keys(seed, offset, generator, increment, M, x.device)
+    out64 = None
+    if (
+        out is not None
+        and indices is not None
+        and indices.dtype == torch.int64
+        and out.dtype == torch.int64
+    ):
+        # the operator's contract gives int64 samples with int64 indices: the kernel's int32 tokens are cast into the
+        # caller's int64 buffer (an int32 buffer is written directly)
+        out64, out = (
+            out_buffer(out, "out", tuple(indices.shape), torch.int64, x, 8),
+            None,
+        )
+        check_no_overlap(
+            [("out", out64), ("logprob_out", logprob_out)],
+            [
+                ("x", x),
+                ("seed", seeds),
+                ("offset", offs),
+                ("indices", indices),
+                (
+                    "temperature",
+                    temperature if isinstance(temperature, torch.Tensor) else None,
+                ),
+            ],
+        )
+    if logprob_out is not None:
+        return_logprob = True
     res = draw(
         x,
         seeds,
         offs,
         from_logits=from_logits,
+        temperature=temperature,
         indices=indices,
+        return_logprob=return_logprob,
         enable_pdl=_pdl(enable_pdl, x.device),
         config=config,
         sm_count=sm_count,
+        return_valid=return_valid,
+        out=out,
+        logprob_out=logprob_out,
     )
     samples = res["samples"]
-    if indices is not None and indices.dtype != samples.dtype:
+    if out64 is not None:
+        samples = out64.copy_(samples)
+    elif out is None and indices is not None and indices.dtype != samples.dtype:
         samples = samples.to(
             indices.dtype
         )  # the operator's contract: the output takes the indices' dtype
-    return (samples, res["valid"]) if return_valid else samples
+    outs = [samples]
+    if return_logprob:
+        outs.append(res["logp"])
+    if return_valid:
+        outs.append(res["valid"])
+    return outs[0] if len(outs) == 1 else tuple(outs)
 
 
 def sampling_from_probs_batch_invariant(
@@ -312,12 +373,14 @@ def sampling_from_probs_batch_invariant(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
     *,
+    out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
 ):
     """``flashinfer.sampling.sampling_from_probs(probs, indices, generator=, seed=, offset=, return_valid=,
-    batch_invariant=True)``: the class ``sample.icdf.v1`` over the given weights.
+    batch_invariant=True, out=)``: the class ``sample.icdf.v1`` over the given weights. ``out`` is a caller-owned
+    buffer for the samples (int32 of the output shape, or int64 with int64 ``indices``), written in place and returned.
 
     One token per output row of ``probs`` (unnormalised weights ``>= 0``; bf16 / f16 / fp32, any vocabulary) by the
     inverse CDF over the canonical sum tree of the row, with the fp32 uniform of the request stream keyed by the row's
@@ -342,6 +405,7 @@ def sampling_from_probs_batch_invariant(
         enable_pdl,
         config,
         sm_count,
+        out=out,
     )
 
 
@@ -352,14 +416,25 @@ def sampling_from_logits_batch_invariant(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     *,
+    temperature: Optional[Union[float, torch.Tensor]] = None,
+    return_logprob: bool = False,
+    out: Optional[torch.Tensor] = None,
+    logprob_out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
-) -> torch.Tensor:
-    """``flashinfer.sampling.sampling_from_logits(logits, indices, generator=, seed=, offset=, batch_invariant=True)``:
-    the class ``sample.icdf.v1`` over the ``lse.row`` weights ``e_j = ex2.approx.ftz((x_j - m) log2(e))`` of the row (no
-    temperature: the entry has none), without materialising the probabilities. The same draw as
+):
+    """``flashinfer.sampling.sampling_from_logits(logits, indices, generator=, seed=, offset=, batch_invariant=True,
+    temperature=, return_logprob=, out=, logprob_out=)``: the class ``sample.icdf.v1`` over the ``lse.row`` weights ``e_j =
+    ex2.approx.ftz((x_j - m) c)`` of the row, ``c = log2(e) / temperature`` (``None``, a positive scalar or one per row,
+    as :func:`softmax` takes it), without materialising the probabilities. The same draw as
     :func:`sampling_from_probs_batch_invariant`; a row of ``-inf`` logits (or with a NaN) is invalid and draws ``-1``.
+
+    ``return_logprob`` adds the drawn token's natural log-probability under the full distribution at the given
+    temperature (fp32, the samples' shape, NaN for an invalid row): ``lse.row``'s ``log_probs(logits, samples,
+    temperature)`` bit for bit -- the value a trainer re-scoring the token computes. Returns the samples alone, or the
+    pair ``(samples, logp)``. ``out`` (int32 of the output shape, or int64 with int64 ``indices``) and ``logprob_out``
+    (fp32; it implies ``return_logprob``) are caller-owned buffers, written in place and returned.
 
     Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class; it never
     falls back."""
@@ -374,4 +449,8 @@ def sampling_from_logits_batch_invariant(
         enable_pdl,
         config,
         sm_count,
+        temperature=temperature,
+        return_logprob=return_logprob,
+        out=out,
+        logprob_out=logprob_out,
     )
