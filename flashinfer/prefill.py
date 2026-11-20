@@ -2530,7 +2530,7 @@ def _eagle_verify_fp8kv_sm90_dispatch(
 # bf16. PV accumulates in fp32; normalized bf16 split partials merge in
 # fp32 before V descale. Wider P exponent range is not extra significand
 # precision: small contributions can still round away.
-# Auto prefers stock for whole batches with maximum KV length <= 64;
+# Auto prefers stock for whole batches with maximum KV length <= 128;
 # this tuning preference does not constrain explicit specialized plans.
 #
 # All allocation and compilation happen at plan time, outside CUDA-graph
@@ -2566,8 +2566,11 @@ _GQA_DEC_FP8Q_SM90_COMPUTE_CAPABILITY = (9, 0)
 # dispatcher fails closed (dequant + stock path) outside it.
 _GQA_DEC_FP8Q_SM90_MAX_BATCH = 128
 _GQA_DEC_FP8Q_SM90_MAX_KV_LEN = 262144
-# Provisional auto preference, not a kernel eligibility bound.
-_GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX = 64
+# H100 NVL, six paired rounds of graph replay: at KV 128, stock FA3 took
+# 6.15 us vs 7.07 us specialized; at 256, specialized took 6.94 us vs
+# 7.99 us stock. Eager host submission is separate: about 19 us specialized
+# vs 13 us stock. This is a replay preference, not an eager speedup claim.
+_GQA_DEC_FP8Q_SM90_AUTO_SHORT_KV_MAX = 128
 
 _gqa_dec_fp8q_sm90_counters: Dict[str, int] = {
     "plans_seen": 0,  # fp8-Q fa2 SM90 plans that reached the hook
