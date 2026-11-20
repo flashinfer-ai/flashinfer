@@ -409,7 +409,8 @@ def recurrent_kda(
             Checkpoint interval. Zero disables checkpoints; a positive value
             must be divisible by 32, except that the SM100-family exact-N16
             frozen route also accepts multiples of 16. SGLang normally uses
-            64 or a larger cache-page-aligned multiple.
+            64 or a larger cache-page-aligned multiple. With
+            ``batch_invariant=True`` only 16, and only without ``initial_state``.
         backend (Literal["auto", "cute-dsl", "cute-dsl-persistent", "tirx", "ptx", "cake", "small-bh", "cudnn"]):
             Implementation backend. ``"cute-dsl-persistent"`` explicitly selects
             the SM100/SM103 persistent prefill kernel with token-strided BF16
@@ -486,11 +487,25 @@ def recurrent_kda(
             guarantee is stated for finite inputs: a non-finite value inside
             a 16-token chunk shows from the chunk's first row in a prefill
             and from its own row in a decode step.
+            Without ``initial_state`` the call is stateless (the form of a
+            trainer's forward pass): every sequence is whole and runs from the
+            zero state, also a sequence of one token, its rows are bit for
+            bit the rows the pool calls return for it, no state is kept or
+            returned, and ``ssm_state_indices`` and
+            ``output_final_state=True`` are refused. The rows carry no
+            ``grad_fn``, also when an input requires grad: the class has no
+            backward. For a backward that reads the forward's states, the
+            stateless call takes ``checkpoint_every_n_tokens=16`` (with
+            optional ``state_checkpoints`` and ``checkpoint_cu_starts``) and
+            returns ``(output, None, state_checkpoints)``: the state before
+            every 16-token chunk of every sequence, bf16 or fp32, in fp32
+            bit for bit the pool's state after that many tokens.
             Requires ``backend="auto"``, bf16 activations, head dim 128,
             ``HV == H`` (a multiple of 8, or 1 to 10 or 12), ``A_log`` / ``dt_bias`` with
             ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
             ``beta_is_logit``, a finite negative ``lower_bound``; speculative
-            decode, checkpoints, ``initial_state_source``, ``seq_order``,
+            decode, checkpoints with a state pool or at another interval,
+            ``checkpoint_state_indices``, ``initial_state_source``, ``seq_order``,
             ``prefill_workspace`` and the frozen-verify arguments are not in
             the class. Unsupported inputs raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
@@ -544,6 +559,9 @@ def recurrent_kda(
             output=output,
             beta_is_logit=beta_is_logit,
             backend=backend,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             refused=dict(
                 num_spec_tokens=num_spec_tokens,
                 num_accepted_tokens=num_accepted_tokens,
@@ -551,9 +569,6 @@ def recurrent_kda(
                 initial_state_indices=initial_state_indices,
                 seq_order=seq_order,
                 prefill_workspace=prefill_workspace,
-                state_checkpoints=state_checkpoints,
-                checkpoint_cu_starts=checkpoint_cu_starts,
-                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
                 checkpoint_state_indices=checkpoint_state_indices,
                 disable_state_update=disable_state_update,
                 correction_cache=correction_cache,
