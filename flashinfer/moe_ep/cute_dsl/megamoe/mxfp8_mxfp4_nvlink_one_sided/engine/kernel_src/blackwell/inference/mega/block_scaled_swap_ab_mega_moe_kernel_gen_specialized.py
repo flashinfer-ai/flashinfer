@@ -272,9 +272,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     # next one under just-in-time claims, so the next tile goes to a cluster whose
     # stream is about to end. A load another warp issues while the SM streams
     # weights waits behind the weight loads, so claims map their tiles from
-    # register copies of the token counts and the slot order; what remains is the
-    # work-ID atomic, the cluster broadcast and, for an FC2 tile, its readiness
-    # peek: about 1.3 us from claim to publication at the median, up to about 5 us.
+    # register copies of the token counts and the processing order; what remains
+    # is the work-ID atomic, the cluster broadcast and, for an FC2 tile, its
+    # readiness peek: about 1.3 us from claim to publication at the median, up to
+    # about 5 us.
     # Sixteen K tiles are about 3 us of an FC1 tile's stream, so the stream waits
     # between tiles only behind the slowest claims. An FC2 tile has sixteen K
     # tiles, so its successor is claimed as it starts.
@@ -2651,7 +2652,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         fc2_output: cute.Tensor,
         actual_expert_shape: Tuple[cutlass.Int32, cutlass.Int32, cutlass.Int32],
         # Per-expert sizes in the order the scheduler walks them, which is the
-        # slot order rather than the expert order.
+        # processing order rather than the expert order.
         scheduler_expert_sizes: cute.Tensor,
         peer_rank_ptr_mapper: SymmetricBufferDevice,
         local_workspace: cute.Pointer,
@@ -3155,8 +3156,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     ) -> None:
         """The scheduler warp's plan of a token pool with a capacity, once the expert sizes are final.
 
-        The pool holds the launch's routes in processing order, the slot order
-        the scheduler walks (see GenphaseTokenComm, "Pull dispatch"). Word
+        The pool holds the launch's routes in processing order, the order the
+        scheduler walks (see GenphaseTokenComm, "Pull dispatch"). Word
         ``1 + e`` packs local expert e's first route in that order (high bits)
         with its routes per token tile (``balanced_tile_rows`` of the plan's
         tile N, low eight bits): its token tile t starts at that route plus t
@@ -3168,19 +3169,19 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         CTA 0 records the launch's routes and capacity in
         ``token_pool_record_region``.
         """
-        sizes_by_slot = self.token_comm.scheduler_expert_sizes_tensor(
+        expert_sizes_in_order = self.token_comm.scheduler_expert_sizes_tensor(
             self._device_workspace
         )
-        slot_to_expert = self.token_comm.slot_to_expert_tensor(self._device_workspace)
+        expert_order = self.token_comm.expert_order_tensor(self._device_workspace)
         carried = Int32(0)
         for batch in cutlass.range_constexpr(ceil_div(self.local_expert_count, 32)):
-            slot = Int32(batch * 32) + lane
+            position = Int32(batch * 32) + lane
             size = Int32(0)
-            if slot < Int32(self.local_expert_count):
-                size = sizes_by_slot[slot]
+            if position < Int32(self.local_expert_count):
+                size = expert_sizes_in_order[position]
             route_end = carried + _warp_inclusive_sum(size, lane)
-            if slot < Int32(self.local_expert_count):
-                plan[Int32(1) + slot_to_expert[slot]] = (
+            if position < Int32(self.local_expert_count):
+                plan[Int32(1) + expert_order[position]] = (
                     (route_end - size) << Int32(8)
                 ) | balanced_tile_rows(size, self.cta_tile_n)
             carried = Int32(cute.arch.shuffle_sync(route_end, Int32(31)))
@@ -3314,12 +3315,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         fc2_spin_threshold = (
             intermediate_gateup + config.mainloop.cta_tile_m - 1
         ) // config.mainloop.cta_tile_m
-        # The scheduler enumerates slots, so the tile it produces has to be
-        # rewritten into an expert index before any consumer sees it: the weights,
-        # their scale factors, the per-expert alphas and the per-expert
-        # scale-factor gate all address an expert. The row offsets it also carries
-        # are already resolved and stay as they are.
-        expert_remap = self.token_comm.slot_to_expert_tensor(self._device_workspace)
+        # The scheduler enumerates positions of the processing order, so the tile
+        # it produces has to be rewritten into an expert index before any consumer
+        # sees it: the weights, their scale factors, the per-expert alphas and the
+        # per-expert scale-factor gate all address an expert. The row offsets it
+        # also carries are already resolved and stay as they are.
+        expert_order = self.token_comm.expert_order_tensor(self._device_workspace)
         # No FC1 ready counter: readiness is published per rank, not per tile, and
         # the waits below cover it once per warp.
         kernel_extension = BlockScaledSwapAbFc12Extension(
@@ -3327,7 +3328,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             fc1_done_counter_pointer=fc1_done_counter.iterator,
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=None,
-            expert_remap=expert_remap,
+            expert_order=expert_order,
             shared_expert_marker=self.local_expert_count
             if self.shared_expert
             else None,
@@ -3431,11 +3432,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             if cutlass.const_expr(self.die_local_weights):
                 scheduler.load_sm_die()
             # Claims made while the SM streams weights map and translate their
-            # tiles from register copies of the slot tables, which are final now.
-            expert_remap_cache = None
+            # tiles from register copies of the sizes and the expert order, which
+            # are final now.
+            expert_order_cache = None
             if cutlass.const_expr(self.just_in_time_claims):
                 scheduler.load_token_count_cache()
-                expert_remap_cache = kernel_extension.load_expert_remap_cache(
+                expert_order_cache = kernel_extension.load_expert_order_cache(
                     self.local_expert_count
                 )
             if cutlass.const_expr(self.shared_expert):
@@ -3454,7 +3456,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             while work_tile.is_valid_tile:
                 iket.range_push("scheduler.publish_work")
                 scheduler.publish_work(
-                    kernel_extension.prepare_work_tile(work_tile, expert_remap_cache)
+                    kernel_extension.prepare_work_tile(work_tile, expert_order_cache)
                 )
                 iket.range_pop()
                 if cutlass.const_expr(self.just_in_time_claims):

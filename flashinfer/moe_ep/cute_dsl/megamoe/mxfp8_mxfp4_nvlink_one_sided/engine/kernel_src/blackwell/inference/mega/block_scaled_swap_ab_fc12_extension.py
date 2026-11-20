@@ -29,13 +29,13 @@ def _rewrite_tensor_shape(tensor: cute.Tensor, new_shape: Tuple) -> cute.Tensor:
 
 
 @cute.jit
-def _cached_expert(expert_remap_cache: Tuple[Int32, ...], slot: Int32) -> Int32:
-    """The expert of a warp-uniform ``slot`` from a register copy of the remap."""
-    entry = expert_remap_cache[0]
-    for batch in cutlass.range_constexpr(1, len(expert_remap_cache)):
-        if slot // Int32(32) == Int32(batch):
-            entry = expert_remap_cache[batch]
-    return Int32(cute.arch.shuffle_sync(entry, slot % Int32(32)))
+def _cached_expert(expert_order_cache: Tuple[Int32, ...], position: Int32) -> Int32:
+    """The expert at a warp-uniform ``position``, from a register copy of ``expert_order``."""
+    entry = expert_order_cache[0]
+    for batch in cutlass.range_constexpr(1, len(expert_order_cache)):
+        if position // Int32(32) == Int32(batch):
+            entry = expert_order_cache[batch]
+    return Int32(cute.arch.shuffle_sync(entry, position % Int32(32)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,11 +48,13 @@ class BlockScaledSwapAbFc12Extension:
     fc1_done_counter_pointer: Pointer
     fc2_spin_threshold: Int32
     fc1_ready_counter_pointer: Optional[Pointer] = None
-    # Which expert holds each slot the scheduler enumerates. Absent when the
-    # scheduler walks experts directly, in which case a slot is an expert.
-    expert_remap: Optional[cute.Tensor] = None
+    # The processing order: the expert at each position the scheduler enumerates.
+    # Absent when the scheduler walks experts directly, in which case a position
+    # is an expert.
+    expert_order: Optional[cute.Tensor] = None
     # The expert index a shared expert's tiles carry (the local expert count),
-    # which no slot holds and the remap leaves as it is; None without one.
+    # which no position holds and the translation leaves as it is; None without
+    # one.
     shared_expert_marker: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -66,8 +68,8 @@ class BlockScaledSwapAbFc12Extension:
         values.extend(extract_mlir_values(self.fc2_spin_threshold))
         if self.fc1_ready_counter_pointer is not None:
             values.extend(extract_mlir_values(self.fc1_ready_counter_pointer))
-        if self.expert_remap is not None:
-            values.extend(extract_mlir_values(self.expert_remap))
+        if self.expert_order is not None:
+            values.extend(extract_mlir_values(self.expert_order))
         return values
 
     def __new_from_mlir_values__(
@@ -91,8 +93,8 @@ class BlockScaledSwapAbFc12Extension:
             if self.fc1_ready_counter_pointer is not None
             else None
         )
-        expert_remap = (
-            rebuild(self.expert_remap) if self.expert_remap is not None else None
+        expert_order = (
+            rebuild(self.expert_order) if self.expert_order is not None else None
         )
         if value_index != len(values):
             raise ValueError(
@@ -103,23 +105,23 @@ class BlockScaledSwapAbFc12Extension:
             fc1_done_counter_pointer=fc1_done_counter_pointer,
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
-            expert_remap=expert_remap,
+            expert_order=expert_order,
             shared_expert_marker=self.shared_expert_marker,
         )
 
     @cute.jit
-    def load_expert_remap_cache(self, slot_count: int) -> Tuple[Int32, ...]:
-        """A register copy of ``expert_remap`` for one warp, read once the remap is final.
+    def load_expert_order_cache(self, position_count: int) -> Tuple[Int32, ...]:
+        """A register copy of ``expert_order`` for one warp, read once the order is final.
 
-        Entry ``b`` of lane ``l`` is the expert of slot ``32 * b + l``.
+        Entry ``b`` of lane ``l`` is the expert at position ``32 * b + l``.
         """
         lane_idx = Int32(cute.arch.lane_idx())
         entries = []
-        for batch in cutlass.range_constexpr((slot_count + 31) // 32):
-            slot = Int32(batch * 32) + lane_idx
+        for batch in cutlass.range_constexpr((position_count + 31) // 32):
+            position = Int32(batch * 32) + lane_idx
             expert_idx = Int32(0)
-            if slot < Int32(slot_count):
-                expert_idx = self.expert_remap[slot]
+            if position < Int32(position_count):
+                expert_idx = self.expert_order[position]
             entries.append(expert_idx)
         return tuple(entries)
 
@@ -127,17 +129,18 @@ class BlockScaledSwapAbFc12Extension:
     def prepare_work_tile(
         self,
         work_tile: SwapAbFc12WorkTileInfo,
-        expert_remap_cache: Optional[Tuple[Int32, ...]] = None,
+        expert_order_cache: Optional[Tuple[Int32, ...]] = None,
     ) -> SwapAbFc12WorkTileInfo:
         """Pack kernel readiness observations into the published tile flags.
 
-        Also the one place the scheduler's slot becomes an expert index, when the
-        two differ. Translating here rather than at each use is what keeps the
-        remap invisible downstream: every consumer of a published tile -- the
-        weight and scale-factor views, the per-expert alphas, the per-expert
-        scale-factor gate -- addresses an expert. The row offsets the tile carries
-        were resolved in slot order and are already final. ``expert_remap_cache``
-        (``load_expert_remap_cache``) translates from registers instead of global
+        Also the one place the scheduler's position in the processing order
+        becomes an expert index, when the two differ. Translating here rather
+        than at each use is what keeps the order invisible downstream: every
+        consumer of a published tile -- the weight and scale-factor views, the
+        per-expert alphas, the per-expert scale-factor gate -- addresses an
+        expert. The row offsets the tile carries were resolved in processing
+        order and are already final. ``expert_order_cache``
+        (``load_expert_order_cache``) translates from registers instead of global
         memory; the whole warp has to call.
         """
         phase_and_flags = work_tile.phase_and_flags
@@ -145,23 +148,23 @@ class BlockScaledSwapAbFc12Extension:
         if work_tile.is_valid_tile:
             # Inside the validity branch so a terminal tile keeps its sentinel.
             if cutlass.const_expr(
-                self.expert_remap is not None and self.shared_expert_marker is not None
+                self.expert_order is not None and self.shared_expert_marker is not None
             ):
-                # A shared tile keeps its marker; every other tile is a slot.
+                # A shared tile keeps its marker; every other tile carries a position.
                 if work_tile.expert_idx != Int32(self.shared_expert_marker):
-                    if cutlass.const_expr(expert_remap_cache is not None):
+                    if cutlass.const_expr(expert_order_cache is not None):
                         expert_idx = _cached_expert(
-                            expert_remap_cache, work_tile.expert_idx
+                            expert_order_cache, work_tile.expert_idx
                         )
                     else:
-                        expert_idx = self.expert_remap[work_tile.expert_idx]
-            elif cutlass.const_expr(self.expert_remap is not None):
-                if cutlass.const_expr(expert_remap_cache is not None):
+                        expert_idx = self.expert_order[work_tile.expert_idx]
+            elif cutlass.const_expr(self.expert_order is not None):
+                if cutlass.const_expr(expert_order_cache is not None):
                     expert_idx = _cached_expert(
-                        expert_remap_cache, work_tile.expert_idx
+                        expert_order_cache, work_tile.expert_idx
                     )
                 else:
-                    expert_idx = self.expert_remap[work_tile.expert_idx]
+                    expert_idx = self.expert_order[work_tile.expert_idx]
             counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
             is_fc1 = work_tile.phase == Int32(BlockPhase.Linear1)
             is_fc2 = work_tile.phase == Int32(BlockPhase.Linear2)
