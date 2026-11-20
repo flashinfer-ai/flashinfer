@@ -68,18 +68,19 @@ def test_omit_invalid_route_scores(weights, tokens, all_invalid, monkeypatch):
 
 @pytest.mark.parametrize("entry", ["warmup", "dispatch"])
 def test_module_lookup_is_inside_operand_device_scope(weights, monkeypatch, entry):
-    from contextlib import contextmanager
-
     w13, w2, scales = weights
     real_device = torch.cuda.device
     entered = []
 
-    @contextmanager
-    def observed_device(device):
-        with real_device(device):
+    class observed_device(real_device):
+        def __enter__(self):
+            result = super().__enter__()
             entered.append(torch.cuda.current_device())
+            return result
+
+        def __exit__(self, *args):
             try:
-                yield
+                return super().__exit__(*args)
             finally:
                 entered.pop()
 
