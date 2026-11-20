@@ -110,7 +110,7 @@ Fleet transports:
 
 | Backend | Config | Transport | Modes | Constraints |
 |---|---|---|---|---|
-| `nccl_ep` | `NcclEpConfig` | NCCL (nccl-extensions wheel) | LL `EXPERT_MAJOR` / `RANK_MAJOR`, HT `FLAT` | LL device kernel whitelists per-token row widths and caps top-k at 8 — see the runbook's "NCCL-EP low-latency device-kernel limits" |
+| `nccl_ep` | `NcclEpConfig` | NCCL (nccl-extensions wheel) | LL `EXPERT_MAJOR` / `RANK_MAJOR`, HT `FLAT` | Versioned LL hidden-size admission; see the [NCCL EP 0.3 guide](moe_ep_nccl_ep_03.md) |
 | `nixl_ep` | `NvepConfig` | NIXL over UCX device API (GPU-initiated RDMA) | LL `EXPERT_MAJOR` only | needs `BUILD_NIXL_EP=1` (UCX v1.21+ device headers) and `BootstrapConfig.tcp_store`; `max_tokens_per_rank ≤ 1024`; hidden ∈ {2048, 2560, 3072, 4096, 5120, 6144, 7168, 8192}; handles top-k > 8 |
 
 #### Kernel backends (post-dispatch inner compute)
@@ -1072,7 +1072,9 @@ When `auto_bootstrap=False`: dist must be up at layer construction if `process_g
 
 Split comm backends ship native libs under `backends/split/comm/*/_libs/`. Probe with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`. Missing libs raise `MoEEpNotBuiltError`.
 
-**Recommended build:** `docker/install/build_flashinfer_ep_pytorch.sh` builds the full NCCL-EP + Mega environment inside the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch`): it pins the NCCL-EP runtime wheels (`nvidia-nccl-cu13`, `nccl-extensions`, `nccl4py`, `cuda-core`, `cuda-bindings`), installs the mega deps (DeepGEMM, NVSHMEM, CUTLASS DSL), then runs `BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`. The EP backends are ON by default: NCCL-EP needs no build step (`nccl-extensions>=0.1.0` is a base dependency; `nccl.ep` moved there out of `nccl4py` in nccl4py 0.4.1), and the NIXL-EP meson build runs best-effort unless opted out with `BUILD_NIXL_EP=0` (set `BUILD_NIXL_EP=1` to make missing build deps a hard error; `BUILD_NVEP=0` turns both backends off).
+The [NCCL EP 0.3 guide](moe_ep_nccl_ep_03.md) covers release-specific controls, capture limits and provider coverage.
+
+**Recommended build:** `docker/install/build_flashinfer_ep_pytorch.sh` builds the full NCCL-EP + Mega environment inside the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch`): it pins the NCCL-EP runtime wheels (`nvidia-nccl-cu13`, `nccl-extensions`, `nccl4py`, `cuda-core`, `cuda-bindings`), installs the mega deps (DeepGEMM, NVSHMEM, CUTLASS DSL), then runs `BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`. The EP backends are ON by default: NCCL-EP needs no build step (`nccl-extensions>=0.2.0` is a base dependency; `nccl.ep` moved there out of `nccl4py` in nccl4py 0.4.1), and the NIXL-EP meson build runs best-effort unless opted out with `BUILD_NIXL_EP=0` (set `BUILD_NIXL_EP=1` to make missing build deps a hard error; `BUILD_NVEP=0` turns both backends off).
 
 ## Lifetimes
 
@@ -1212,13 +1214,13 @@ unless noted):
 
 | Kernel path | Last passed | Where |
 |---|---|---|
-| split trtllm bf16 (LL + HT share the compute kernel) | 2026-07-31 | `run_tests.sh all`, 4x GB200 (oracle + EP-vs-non-EP) |
+| split trtllm bf16 (LL + HT share the compute kernel) | 2026-07-31 | `run_tests.sh all`, 4x SM100 (oracle + EP-vs-non-EP) |
 | split trtllm nvfp4 | 2026-07-31 | same run |
 | mega deep_gemm (fp8_fp4) | 2026-07-31 | same run + variant job (multirank oracle) |
-| mega sm100_nvfp4_nvfp4_bf16_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x GB200 variant job |
-| mega sm100_mxfp8_mxfp8_bf16_cutedsl (default, ikr) | 2026-07-31 | 4x GB200 variant job |
+| mega sm100_nvfp4_nvfp4_bf16_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x SM100 variant job |
+| mega sm100_mxfp8_mxfp8_bf16_cutedsl (default, ikr) | 2026-07-31 | 4x SM100 variant job |
 | mega sm90_fp8_fp8_bf16_pull_cutedsl (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper; not runnable on SM100 |
-| mega sm90_bf16_bf16_bf16_pull_cutedsl | 2026-10-08 | Hopper 4x H200, this branch |
+| mega sm90_bf16_bf16_bf16_pull_cutedsl | 2026-10-08 | 4x SM90, this branch |
 
 ## Forward flow
 

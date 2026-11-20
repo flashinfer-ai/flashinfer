@@ -1,17 +1,10 @@
-"""ctypes shim for NCCL-EP's fault-tolerance mask API.
+"""Pointer adapter for NCCL-EP's fault-tolerance mask API.
 
-``nccl-extensions`` binds ``GroupConfig.enable_mask`` and ``timeout_ns`` (so
-masking can be switched on) but its ``Group`` class stops at ``create`` /
-``create_handle`` / ``destroy`` / ``.ptr`` — the five mask functions are not
-exposed to Python:
-
-    ncclEpMaskQuery / ncclEpMaskUpdate / ncclEpMaskClean
-    ncclEpGetAsyncError / ncclEpErrorClear
-
-``Group.ptr`` is the raw ``ncclEpGroup_t``, so we can call them directly until
-nccl-extensions catches up. Every method here tries a native ``Group`` method FIRST
-and only then falls back to ctypes, so the shim retires itself with no
-call-site churn the day those bindings land.
+Query and update use the C API directly. The Python methods introduced in
+nccl-extensions 0.2 require an EP Tensor and a NumPy array, respectively, while
+this adapter receives device and host pointers. The other methods prefer
+compatible Python bindings when available. Older providers use ctypes for all
+five operations.
 
 Which library: the symbols live in **libnccl_ep.so**, not libnccl.so.2.
 ``nccl.ep`` dlopens it with ``RTLD_GLOBAL`` and resolves through
@@ -23,8 +16,6 @@ LD_LIBRARY_PATH disagree, and calling into it with a group created by the
 other one is undefined behaviour. Path resolution is only a fallback for
 probing before any group exists.
 
-TODO(moe_ep): drop the ctypes fallback once nccl-extensions binds ncclEpMask* on
-``nccl.ep.Group``; the native-first dispatch below already prefers it.
 """
 
 from __future__ import annotations
@@ -201,14 +192,9 @@ class _MaskFfi:
 
     # ------------------------------------------------------- public wrappers
     #
-    # Each prefers a native nccl.ep Group method when one exists, so this
-    # module becomes dead weight (not a blocker) once those land.
+    # Pointer-taking calls retain the C ABI across Python API generations.
 
     def mask_query(self, group, dev_ptr: int, stream: int) -> None:
-        native = getattr(group, "mask_query", None)
-        if native is not None:
-            native(dev_ptr, stream=stream)
-            return
         self._call(
             "ncclEpMaskQuery",
             c_void_p(self._ptr(group)),
@@ -217,10 +203,6 @@ class _MaskFfi:
         )
 
     def mask_update(self, group, host_ptr: int, stream: int) -> None:
-        native = getattr(group, "mask_update", None)
-        if native is not None:
-            native(host_ptr, stream=stream)
-            return
         self._call(
             "ncclEpMaskUpdate",
             c_void_p(self._ptr(group)),

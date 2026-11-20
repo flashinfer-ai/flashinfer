@@ -201,6 +201,7 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 hidden_size=fleet_params.token_hidden_size,
                 recv_count=self._recv_count_for_exclusion(ctx),
                 num_experts=self._moe_config.routing.num_experts,
+                recv_scale=ctx.expert_tensors_scale,
             )
 
         return act_pack
