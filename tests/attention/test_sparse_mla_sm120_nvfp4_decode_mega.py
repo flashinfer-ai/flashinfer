@@ -11,6 +11,7 @@ from tests.attention.sparse_mla_prefill_utils import (
     fixture,
     native_prefill_calls,
     numerical_metrics,
+    poison_mega_destinations,
 )
 from tests.attention.test_sparse_mla_sm120_nvfp4_prefill_mega import (
     quantized_query_reference_lse,
@@ -86,6 +87,7 @@ def test_nvfp4_decode_mega_query_alignment(tokens, chunks_per_block, offset):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         mega()
+    poison_mega_destinations(f["out"], f["scales"], lse, expected[1])
     graph.replay()
     for actual, reference in zip(
         (f["out"].float(), f["scales"], lse), expected, strict=True
