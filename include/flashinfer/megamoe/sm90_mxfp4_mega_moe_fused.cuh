@@ -1,3 +1,4 @@
+// Portions derived from GC-MoE. See LICENSE.GC-MoE.txt.
 #pragma once
 
 #pragma clang diagnostic push
