@@ -343,29 +343,59 @@ class SwapsKernel:
                 # the preceding grid's stores (Q, the KV cache, the output and workspace it may have produced) are visible from here;
                 # every store of this kernel depends on loads issued after this point. The descriptors are plan constants
                 cute.arch.griddepcontrol_wait()
-            for u in range(first, num_units, walk):
-                q_prod, kv_prod = load_loop(
-                    st,
-                    atom_q,
-                    tQ,
-                    atom_k,
-                    tK,
-                    atom_v,
-                    tV,
-                    sQ_view,
-                    sKV_view,
-                    q_prod,
-                    kv_prod,
-                    mKvIndices,
-                    mDesc[(u, F_KVPTR0)],
-                    mDesc[(u, F_NPAGES)],
-                    mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
-                    mDesc[(u, F_KVHEAD)],
-                    mDesc[(u, F_TILE_LO)],
-                    mDesc[(u, F_TILE_HI)],
-                    storage.kv_mbar.data_ptr(),
-                    u == bidx,
-                )
+            if cutlass.const_expr(self.fixed):
+                # the same walk as below with the counts re-read at the loop's head: held across a unit they take registers from
+                # its TMA issue sequence, one box per page, which at 1- and 2-key pages is what bounds the launch. The table
+                # is not written while the launch runs
+                u = first
+                while u < mCounts[N_UNITS]:
+                    q_prod, kv_prod = load_loop(
+                        st,
+                        atom_q,
+                        tQ,
+                        atom_k,
+                        tK,
+                        atom_v,
+                        tV,
+                        sQ_view,
+                        sKV_view,
+                        q_prod,
+                        kv_prod,
+                        mKvIndices,
+                        mDesc[(u, F_KVPTR0)],
+                        mDesc[(u, F_NPAGES)],
+                        mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
+                        mDesc[(u, F_KVHEAD)],
+                        mDesc[(u, F_TILE_LO)],
+                        mDesc[(u, F_TILE_HI)],
+                        storage.kv_mbar.data_ptr(),
+                        u == bidx,
+                    )
+                    u = u + mCounts[N_WALK]
+            else:
+                for u in range(first, num_units, walk):
+                    q_prod, kv_prod = load_loop(
+                        st,
+                        atom_q,
+                        tQ,
+                        atom_k,
+                        tK,
+                        atom_v,
+                        tV,
+                        sQ_view,
+                        sKV_view,
+                        q_prod,
+                        kv_prod,
+                        mKvIndices,
+                        mDesc[(u, F_KVPTR0)],
+                        mDesc[(u, F_NPAGES)],
+                        mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
+                        mDesc[(u, F_KVHEAD)],
+                        mDesc[(u, F_TILE_LO)],
+                        mDesc[(u, F_TILE_HI)],
+                        storage.kv_mbar.data_ptr(),
+                        u == bidx,
+                    )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
             cute.arch.setmaxregister_decrease(R.regs_other)
