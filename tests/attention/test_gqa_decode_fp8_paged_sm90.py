@@ -1522,10 +1522,12 @@ def test_cancellation_precision_control_and_changed_descale_replay():
             _reference(b, q_descale=qd, v_descale=vd, compute_dtype=torch.float64),
             expected,
         )
+        # Replay before eager: eager must not refresh any wrapper-owned scale
+        # buffer and accidentally hide a stale retained-graph input.
+        _poison_and_replay(graph, out)
         before = _gqa_dec_fp8q_sm90_stats()["runs_dispatched"]
         eager = wrapper.run(q, kv, q_scale=qd, v_scale=vd)
         assert _gqa_dec_fp8q_sm90_stats()["runs_dispatched"] == before + 1
-        _poison_and_replay(graph, out)
         assert torch.isfinite(out).all()
         assert torch.equal(out.view(torch.int16), eager.view(torch.int16))
         if initial is None:
