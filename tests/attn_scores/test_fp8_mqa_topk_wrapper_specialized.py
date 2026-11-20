@@ -406,7 +406,7 @@ def test_wrapper_predicate_views_and_dtype_copy():
         inference_out = torch.empty(
             122, TOPK, dtype=torch.int32, device=inp["q"].device
         )
-    with pytest.raises(RuntimeError, match="Inference tensor"):
+    with pytest.raises(RuntimeError, match="[Ii]nference tensor"):
         w.run(
             inp["q"],
             inp["weights"],
