@@ -252,7 +252,7 @@ def test_prefill_chunking_and_decode_are_identical(width):
     mask = torch.ones(1, device="cuda", dtype=torch.bool)
     expected = causal_conv1d_fn(x, w, full, _offsets([43]), slots, mask)
     pieces, start = [], 0
-    for count in (1, 2, 17, 23):
+    for count in (1, 2, 4, 5, 8, 23):
         pieces.append(
             causal_conv1d_fn(
                 x[start : start + count], w, split, _offsets([count]), slots, mask
