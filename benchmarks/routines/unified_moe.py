@@ -568,8 +568,6 @@ def _frost_ll_prepare_weights(w1, w2, common, quant, fp8_static_scales):
     """
     activation = common["activation"]
     pair = quant.pair
-    if pair == (QuantFormat.BF16, QuantFormat.BF16):
-        return FrostLowLatencyConfig.prepare_bf16_weights(w1, w2, activation=activation)
     if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
         return FrostLowLatencyConfig.prepare_nvfp4_weights(
             w1, w2, activation=activation
@@ -633,7 +631,7 @@ def _frost_ll_prepare_weights(w1, w2, common, quant, fp8_static_scales):
         return FrostLowLatencyConfig.prepare_mxint4_weight_only_weights(
             q1, s1, q2, s2, activation=activation
         )
-    raise ValueError(f"frost_ll has no weight preparation for {quant!r}")
+    raise ValueError(f"frost_low_latency has no weight preparation for {quant!r}")
 
 
 def _canonical_activation_pack(quant: QuantConfig, hidden_states, fp8_static_scales):

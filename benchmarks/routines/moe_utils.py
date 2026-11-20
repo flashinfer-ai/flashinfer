@@ -319,19 +319,16 @@ def dequantize_fp8(
 
 
 def pack_topk_ids(
-    expert_ids: torch.Tensor,
-    expert_weights: torch.Tensor,
-    local_expert_offset: int = 0,
+    expert_ids: torch.Tensor, expert_weights: torch.Tensor
 ) -> torch.Tensor:
     """Pack top-k ids for the TRT-LLM ``*_routed_moe`` APIs.
 
     Same format as the library's ``_pack_prerouted_topk_ids``
-    (flashinfer/fused_moe/runners.py): ``((id - offset) << 16) | bf16 weight bits``.
-    Built once outside the timed region.
+    (flashinfer/fused_moe/runners.py): ``(global id << 16) | bf16 weight bits``.
+    The kernel maps global ids to the local shard through ``local_expert_offset``.
     """
     weight_bits = expert_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32)
-    ids = expert_ids.to(torch.int32) - local_expert_offset
-    return ((ids << 16) | (weight_bits & 0xFFFF)).contiguous()
+    return ((expert_ids.to(torch.int32) << 16) | (weight_bits & 0xFFFF)).contiguous()
 
 
 def calculate_moe_tflops(

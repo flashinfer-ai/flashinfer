@@ -88,15 +88,14 @@ output_column_dict = {
         "tp_rank",
         "ep_size",
         "ep_rank",
-        # bench1026-moe additions (mode-defining flags; appended so existing
-        # columns keep their positions)
+        # Mode-defining flags, appended so the columns before them keep their
+        # positions.
         "routing_input",
         "num_fused_shared_experts",
         "valid_hidden_size",
         "valid_intermediate_size",
         "swiglu_alpha",
         "swiglu_beta",
-        "swiglu_limit",
         "gemm_bias",
     ],
     "allreduce_comm": [
@@ -685,10 +684,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        # prims-ts: exact (10,0)/(10,3), flashinfer/prims_ts/moe/support.py:158
+        # prims-ts follows _PRIMS_TS_ARCHS in flashinfer/prims_ts/moe/support.py;
+        # on 10.7 it also needs a CuTe DSL that can target SM107.
         "10.0": ["trtllm", "prims-ts"],
         "10.3": ["trtllm", "prims-ts"],
-        "10.7": ["trtllm"],
+        "10.7": ["trtllm", "prims-ts"],
         "12.0": [],
         "12.1": [],
     },
@@ -698,10 +698,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        # prims-ts: exact (10,0)/(10,3), flashinfer/prims_ts/moe/support.py:158
+        # prims-ts follows _PRIMS_TS_ARCHS in flashinfer/prims_ts/moe/support.py;
+        # on 10.7 it also needs a CuTe DSL that can target SM107.
         "10.0": ["trtllm", "prims-ts"],
         "10.3": ["trtllm", "prims-ts"],
-        "10.7": ["trtllm"],
+        "10.7": ["trtllm", "prims-ts"],
         "12.0": [],
         "12.1": [],
     },
@@ -711,10 +712,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        # prims-ts: exact (10,0)/(10,3), flashinfer/prims_ts/moe/support.py:158
+        # prims-ts follows _PRIMS_TS_ARCHS in flashinfer/prims_ts/moe/support.py;
+        # on 10.7 it also needs a CuTe DSL that can target SM107.
         "10.0": ["trtllm", "prims-ts"],
         "10.3": ["trtllm", "prims-ts"],
-        "10.7": ["trtllm"],
+        "10.7": ["trtllm", "prims-ts"],
         "12.0": [],
         "12.1": [],
     },
@@ -722,10 +724,10 @@ routine_cc_to_supported_backends = {
         "7.5": [],
         "8.0": [],
         "8.6": [],
-        # 8.9/9.0/11.0: get_cutlass_fused_moe_module builds sm89/sm90/sm100(110)
-        # modules (flashinfer/fused_moe/core.py:638-648); guard-backed, not
-        # hardware-validated. nvfp4 is not built for 8.9/9.0
-        # (flashinfer/fused_moe/api.py:578 _CUTLASS_NVFP4_ARCHS).
+        # 8.9/9.0/11.0 follow get_cutlass_fused_moe_module (sm89/sm90/sm100
+        # modules) and have not been run on hardware. --cutlass_variant nvfp4 is
+        # not built for 8.9/9.0 (_CUTLASS_NVFP4_ARCHS in flashinfer/fused_moe/api.py)
+        # and fails inside the library there.
         "8.9": ["cutlass"],
         "9.0": ["cutlass"],
         "10.0": ["cutlass"],
@@ -780,31 +782,28 @@ routine_cc_to_supported_backends = {
         "10.3": ["unified"],
         "10.7": ["unified"],
     },
-    # BF16 / MxInt4 follow the TRT-LLM routed-MoE cubin manifest
-    # (flashinfer/fused_moe/api.py:541 _TRTLLM_ROUTED_ARCHS = (100, 103, 107)).
+    # BF16 / MxInt4 follow _TRTLLM_ROUTED_ARCHS in flashinfer/fused_moe/api.py.
     "trtllm_bf16_moe": {
         "10.0": ["trtllm", "prims-ts"],
         "10.3": ["trtllm", "prims-ts"],
-        "10.7": ["trtllm"],
+        "10.7": ["trtllm", "prims-ts"],
     },
     "trtllm_mxint4_block_scale_moe": {
         "10.0": ["trtllm"],
         "10.3": ["trtllm"],
         "10.7": ["trtllm"],
     },
-    # trtllm: trtllm_gen_routing.py:36 [100, 103, 120, 121] (no 10.7);
-    # dsv3: fused_routing_dsv3.py:66 default backend; hash: hash_topk.py:36;
-    # alphamoe (alphamoe_fused_router.py:292 [100, 103]) is not listed: its NVRTC
-    # build finds no CCCL <nv/target> in the CTK 13.4 perf image, so no [PERF] row
-    # was observed (2026-10-02 and 2026-10-26).
+    # Each backend follows its API's supported_compute_capability list
+    # (trtllm_gen_routing, fused_topk_deepseek's default backend, hash_topk).
+    # alphamoe (alphamoe_fused_router) runs only when named in --backends.
     "moe_routing": {
         "8.0": ["hash"],
         "8.6": ["hash"],
         "8.9": ["dsv3", "hash"],
         "9.0": ["dsv3", "hash"],
-        "10.0": ["trtllm", "dsv3", "hash"],
-        "10.3": ["trtllm", "dsv3", "hash"],
-        "10.7": ["dsv3", "hash"],
+        "10.0": ["trtllm", "dsv3", "alphamoe", "hash"],
+        "10.3": ["trtllm", "dsv3", "alphamoe", "hash"],
+        "10.7": ["trtllm", "dsv3", "hash"],
         "11.0": ["hash"],
         "12.0": ["trtllm", "dsv3", "hash"],
         "12.1": ["trtllm", "dsv3", "hash"],
