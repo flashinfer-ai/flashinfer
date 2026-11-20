@@ -38,6 +38,7 @@ from ..plan import (
     F_SLOT,
     F_TILE_HI,
     F_TILE_LO,
+    N_UNITS,
 )
 from .correction import correction_loop, correction_loop_q2, fold_group
 from .mma import mma_loop, mma_loop_q2
@@ -103,7 +104,13 @@ class AttentionKernel:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        sinks: bool = False,
+        fixed: bool = False,
     ):
+        self.sinks = (
+            sinks  # the sink step where a row is completed: a kernel of its own
+        )
+        self.fixed = fixed  # a fixed launch: the unit count and the walking CTAs are read from the counts table
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
             g,
@@ -124,6 +131,8 @@ class AttentionKernel:
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
+        mLse: cute.Tensor,
+        mSink: cute.Tensor,
         mWs: cute.Tensor,
         mScratch: cute.Tensor,
         mGroups: cute.Tensor,
@@ -135,11 +144,14 @@ class AttentionKernel:
         nc: Float32,
         window_left: Int32,
         num_units: Int32,
+        mCounts: cute.Tensor,
         grid: Int32,
+        lse_mode: Int32,
         stream: cuda.CUstream,
     ):
         """``grid`` CTAs walk the ``num_units`` work units persistently (unit ``u`` on CTA ``u % grid``): a launch
-        parameter, never a quantity that reaches the bits (I10). ``mScratch`` is the per-CTA ``O_m`` scratch (``grid x 128 x D``
+        parameter, never a quantity that reaches the bits (I10). A kernel compiled for a fixed launch takes the unit count from
+        ``mCounts`` instead (``plan.COUNT_FIELDS``), so the CTAs beyond a plan's units idle. ``mScratch`` is the per-CTA ``O_m`` scratch (``grid x 128 x D``
         fp32) when ``O_m`` is not in TMEM (D = 256), else any one-element tensor."""
         st = StaticPlan(
             self.D,
@@ -152,6 +164,7 @@ class AttentionKernel:
             self.hw_rowmax,
             self.cap,
         )
+        st.sinks = self.sinks
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)
         self.shared_storage = shared_storage_struct(st)
@@ -165,6 +178,8 @@ class AttentionKernel:
             tma.atom_v,
             tma.tensor_v,
             mO,
+            mLse,
+            mSink,
             mWs,
             mScratch,
             mGroups,
@@ -176,6 +191,8 @@ class AttentionKernel:
             nc,
             window_left,
             num_units,
+            mCounts,
+            lse_mode,
             st.qk_tiled_mma,
             st.qks_tiled_mma,
             st.pv_tiled_mma,
@@ -207,6 +224,8 @@ class AttentionKernel:
         atom_v: cute.CopyAtom,
         tV: cute.Tensor,
         mO: cute.Tensor,
+        mLse: cute.Tensor,
+        mSink: cute.Tensor,
         mWs: cute.Tensor,
         mScratch: cute.Tensor,
         mGroups: cute.Tensor,
@@ -218,6 +237,8 @@ class AttentionKernel:
         nc: Float32,
         window_left: Int32,
         num_units: Int32,
+        mCounts: cute.Tensor,
+        lse_mode: Int32,
         qk_tiled_mma: cute.TiledMma,
         qks_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
@@ -235,6 +256,13 @@ class AttentionKernel:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
         grid_size, _, _ = cute.arch.grid_dim()
+        first = bidx
+        walk = grid_size
+        if cutlass.const_expr(self.fixed):
+            # a fixed launch: the plan's unit count, from its counts table. A CTA beyond it walks no unit (no TMA load, no
+            # global store). The walk is the launch grid's (the row body's plans have no grid of their own), so nothing
+            # else stays live through the unit walk
+            num_units = mCounts[N_UNITS]
         if warp_idx == R.load_warp:
             cpasync.prefetch_descriptor(atom_q)
             cpasync.prefetch_descriptor(atom_q_rep)
@@ -368,7 +396,7 @@ class AttentionKernel:
         if warp_idx == R.load_warp:
             cute.arch.setmaxregister_decrease(R.regs_other)
             if cutlass.const_expr(st.q2):
-                for u in range(bidx, num_units, grid_size):
+                for u in range(first, num_units, walk):
                     ua = 2 * u
                     ub = ua + 1
                     q_prod, kv_prod = load_loop_q2(
@@ -400,7 +428,7 @@ class AttentionKernel:
                         mDesc[(ub, F_TILE_HI)],
                     )
             if cutlass.const_expr(not st.q2):
-                for u in range(bidx, num_units, grid_size):
+                for u in range(first, num_units, walk):
                     q_prod, kv_prod = load_loop(
                         st,
                         atom_q,
@@ -455,7 +483,7 @@ class AttentionKernel:
                 tOtOc_b = cute.make_tensor(
                     tOtOc.iterator + st.tmem_q2_stride, tOtOc.layout
                 )
-                for u in range(bidx, num_units, grid_size):
+                for u in range(first, num_units, walk):
                     ua = 2 * u
                     ub = ua + 1
                     (
@@ -499,7 +527,7 @@ class AttentionKernel:
                         mDesc[(ua, F_KVLEN)],
                     )
             if cutlass.const_expr(not st.q2):
-                for u in range(bidx, num_units, grid_size):
+                for u in range(first, num_units, walk):
                     (
                         q_cons,
                         kv_cons,
@@ -550,7 +578,7 @@ class AttentionKernel:
                 s_cons.advance(k)
                 p_prod.advance(k)
                 stats_prod.advance(2 * k)
-                for u in range(bidx, num_units, grid_size):
+                for u in range(first, num_units, walk):
                     uk = 2 * u + k
                     s_cons, p_prod, stats_prod = softmax_loop(
                         st,
@@ -576,7 +604,7 @@ class AttentionKernel:
                         mDesc[(uk, F_TILE_HI)],
                     )
             if cutlass.const_expr(not st.q2):
-                for u in range(bidx, num_units, grid_size):
+                for u in range(first, num_units, walk):
                     s_cons, p_prod, stats_prod = softmax_loop(
                         st,
                         k,
@@ -616,7 +644,7 @@ class AttentionKernel:
             if cutlass.const_expr(st.q2):
                 _, stats_cons_b = stats_pipe.make_participants()
                 stats_cons_b.advance(2)  # Q tile B's stats entries: 2, 3 of every four
-                for u in range(bidx, num_units, grid_size):
+                for u in range(first, num_units, walk):
                     ua = 2 * u
                     ub = ua + 1
                     o_cons, o_cons_b, stats_cons, stats_cons_b = correction_loop_q2(
@@ -656,6 +684,9 @@ class AttentionKernel:
                         mDesc[(ub, F_TILE_HI)],
                         mDesc[(ub, F_MODE)],
                         mDesc[(ub, F_SLOT)],
+                        mLse,
+                        mSink,
+                        lse_mode,
                     )
                     fold_group(
                         st,
@@ -669,6 +700,9 @@ class AttentionKernel:
                         nc,
                         window_left,
                         Hq,
+                        mLse,
+                        mSink,
+                        lse_mode,
                     )
                     if mDesc[(ub, F_TILE_HI)] > mDesc[(ub, F_TILE_LO)]:
                         fold_group(
@@ -683,9 +717,12 @@ class AttentionKernel:
                             nc,
                             window_left,
                             Hq,
+                            mLse,
+                            mSink,
+                            lse_mode,
                         )
             if cutlass.const_expr(not st.q2):
-                for u in range(bidx, num_units, grid_size):
+                for u in range(first, num_units, walk):
                     o_cons, stats_cons = correction_loop(
                         st,
                         pv_thr_mma,
@@ -713,6 +750,9 @@ class AttentionKernel:
                         mDesc[(u, F_TILE_HI)],
                         mDesc[(u, F_MODE)],
                         mDesc[(u, F_SLOT)],
+                        mLse,
+                        mSink,
+                        lse_mode,
                     )
                     fold_group(
                         st,
@@ -726,6 +766,9 @@ class AttentionKernel:
                         nc,
                         window_left,
                         Hq,
+                        mLse,
+                        mSink,
+                        lse_mode,
                     )
             cute.arch.griddepcontrol_launch_dependents()
             tmem.relinquish_alloc_permit()
