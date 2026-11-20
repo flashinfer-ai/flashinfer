@@ -275,8 +275,10 @@ void rmsnorm_serve_sm90(TensorView output, TensorView input, TensorView weight, 
   TVM_FFI_ICHECK_EQ(input.size(1), weight.size(0));
   TVM_FFI_ICHECK_EQ(output.size(0), input.size(0));
   TVM_FFI_ICHECK_EQ(output.size(1), input.size(1));
-  TVM_FFI_ICHECK_EQ(input.stride(0), input.size(1)) << "input must be contiguous";
-  TVM_FFI_ICHECK_EQ(output.stride(0), output.size(1)) << "output must be contiguous";
+  if (input.size(0) != 1) {
+    TVM_FFI_ICHECK_EQ(input.stride(0), input.size(1)) << "input must be contiguous";
+    TVM_FFI_ICHECK_EQ(output.stride(0), output.size(1)) << "output must be contiguous";
+  }
   TVM_FFI_ICHECK(input.dtype() == dl_bfloat16) << "rmsnorm_serve_sm90 is bf16-only";
 
   const int tokens = static_cast<int>(input.size(0));
@@ -322,4 +324,7 @@ void rmsnorm_serve_sm90(TensorView output, TensorView input, TensorView weight, 
         static_cast<const bf16*>(input.data_ptr()), static_cast<const bf16*>(weight.data_ptr()),
         static_cast<bf16*>(output.data_ptr()), hidden, inverse_h, eps);
   }
+  cudaError_t status = cudaGetLastError();
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "rmsnorm_serve_sm90 launch failed: " << cudaGetErrorString(status);
 }

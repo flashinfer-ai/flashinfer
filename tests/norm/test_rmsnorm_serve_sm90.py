@@ -14,10 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib
+import json
 import os
 import subprocess
 import sys
 import textwrap
+from importlib import resources
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -29,6 +33,8 @@ from flashinfer.norm.kernels.rmsnorm_serve_sm90 import (
     _reset_rmsnorm_serve_sm90_stats,
     _rmsnorm_serve_sm90_stats,
 )
+
+serve = importlib.import_module("flashinfer.norm.kernels.rmsnorm_serve_sm90")
 
 DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 VARIANT_ENV = "FLASHINFER_SM90_SERVE_RMSNORM"  # "0" = deprecated kill alias
@@ -43,11 +49,17 @@ def _clean(monkeypatch):
     _reset_rmsnorm_serve_sm90_stats()
 
 
-def _sm90_or_skip():
+def _sm90_or_skip(*, dsl=False):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("SM90 required")
+    if dsl:
+        if not serve._HAS_CUTE_DSL:
+            pytest.skip("CuTe DSL runtime required")
+        reason = flashinfer.norm._cutedsl_norm_unavailable(torch.device("cuda"))
+        if reason is not None:
+            pytest.skip(reason)
 
 
 def _ref(x, w, eps=1e-6):
@@ -67,8 +79,11 @@ def test_backends_tuple_is_plain_strings_with_specialized():
 
 
 def test_dispatch_table_loads_and_matches_guard_constants():
-    table = _dispatch_table()
-    assert table is not None
+    table = json.loads(
+        resources.files("flashinfer").joinpath(serve._DISPATCH_FILE).read_text()
+    )
+    assert _dispatch_table() == serve._parse_policy(table)
+    assert _dispatch_table() is not None
     assert table["kill_switch"] == DISABLE_ENV
     assert "specialized" in table["backends"]
     op = table["ops"]["rmsnorm_serve"]
@@ -87,8 +102,6 @@ def test_unknown_backend_raises():
 
 
 def test_sm90_probe_caches_only_indexed_devices(monkeypatch):
-    from flashinfer.norm.kernels import rmsnorm_serve_sm90 as serve
-
     probes = []
     caps = iter([(9, 0), (8, 0), (8, 0), (9, 0)])
 
@@ -141,7 +154,7 @@ def _matched(y, ref, rtol=0.02, atol=0.01):
     [(64, 2048), (2, 2048), (16, 512), (8, 520), (64, 6144), (65, 6144)],
 )
 def test_specialized_dispatches_and_matches_stock(tokens, hidden):
-    _sm90_or_skip()
+    _sm90_or_skip(dsl=True)
     x, w = _case(tokens=tokens, hidden=hidden)
     y_spec = flashinfer.norm.rmsnorm(x, w, backend="specialized")
     stats = _rmsnorm_serve_sm90_stats()
@@ -161,6 +174,8 @@ def test_specialized_dispatches_and_matches_stock(tokens, hidden):
 
 def test_incompatible_captured_target_declines_only_cute_variant():
     _sm90_or_skip()
+    if not serve._HAS_CUTE_DSL:
+        pytest.skip("CuTe DSL import required to capture a target")
     env = dict(os.environ, CUTE_DSL_ARCH="sm_100a", FLASHINFER_USE_CUDA_NORM="0")
     script = textwrap.dedent(
         """\
@@ -171,7 +186,6 @@ def test_incompatible_captured_target_declines_only_cute_variant():
         import pytest
         import torch
         import flashinfer.norm as norm
-        from flashinfer.norm.kernels import rmsnorm_serve_sm90 as serve
 
         torch.cuda.set_device(int(sys.argv[1]))
         assert norm._dsl_captured_arch() == 'sm_100a'
@@ -207,7 +221,7 @@ def test_incompatible_captured_target_declines_only_cute_variant():
 def test_explicit_incumbent_backends_are_never_swapped():
     """backend="cuda"/"cutedsl" on an allowlisted shape must never reach the
     specialized kernels, and each pins its own implementation."""
-    _sm90_or_skip()
+    _sm90_or_skip(dsl=True)
     x, w = _case(tokens=16, hidden=512)
     for incumbent in ("cuda", "cutedsl", "cuda"):
         flashinfer.norm.rmsnorm(x, w, backend=incumbent)
@@ -220,7 +234,7 @@ def test_explicit_incumbent_backends_are_never_swapped():
 
 
 def test_auto_routes_on_allowlist_only():
-    _sm90_or_skip()
+    _sm90_or_skip(dsl=True)
     x, w = _case(tokens=32, hidden=2048)
     y = flashinfer.norm.rmsnorm(x, w)  # auto default
     stats = _rmsnorm_serve_sm90_stats()
@@ -262,7 +276,7 @@ def test_auto_routes_on_allowlist_only():
     ],
 )
 def test_token_routing_boundary(tokens, hidden, backend, specialized):
-    _sm90_or_skip()
+    _sm90_or_skip(dsl=bool(specialized))
     x, w = _case(tokens=tokens, hidden=hidden)
     y = flashinfer.norm.rmsnorm(x, w, backend=backend)
     stats = _rmsnorm_serve_sm90_stats()
@@ -286,6 +300,11 @@ def test_explicit_specialized_off_envelope_raises():
 @pytest.mark.parametrize("env,value", [(DISABLE_ENV, "1"), (VARIANT_ENV, "0")])
 def test_kill_switch_and_deprecated_alias_force_incumbent(env, value, monkeypatch):
     _sm90_or_skip()
+    monkeypatch.setenv(VARIANT_ENV, "cuda")
+    if env == VARIANT_ENV and not serve._HAS_CUTE_DSL:
+        pytest.skip(
+            "deprecated alias selects default variant; auto bypasses consultation without DSL"
+        )
     x, w = _case()
     monkeypatch.setenv(env, value)
     y = flashinfer.norm.rmsnorm(x, w, backend="auto")
@@ -371,7 +390,7 @@ def test_cuda_variant_in_place_declined(tokens, hidden, monkeypatch):
 def test_cutedsl_in_place_is_supported():
     """The cutedsl variant is one CTA per row with register staging, so exact
     out-is-input aliasing stays on the specialized path and is correct."""
-    _sm90_or_skip()
+    _sm90_or_skip(dsl=True)
     x, w = _case(tokens=16, hidden=2048)
     ref = _ref(x, w)
     y = flashinfer.norm.rmsnorm(x, w, out=x, backend="specialized")
@@ -387,7 +406,7 @@ def test_stats_census_sums_to_calls(monkeypatch):
     guard refuses to a recorded refusal (it raises — an explicitly selected
     backend never falls back): calls == specialized + cuda + cutedsl +
     explicit refusals."""
-    _sm90_or_skip()
+    _sm90_or_skip(dsl=True)
     x, w = _case(tokens=16, hidden=2048)
     flashinfer.norm.rmsnorm(x, w, backend="specialized")  # specialized
     flashinfer.norm.rmsnorm(x, w, backend="cutedsl")  # explicit incumbent
@@ -441,3 +460,172 @@ def test_weight_overlapping_out_is_declined():
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert any("weight overlaps out" in r for r in stats["fallback_reasons"]), stats
+
+
+def test_manifest_policy_loaded_once(tmp_path, monkeypatch):
+    table = json.loads(
+        resources.files("flashinfer").joinpath(serve._DISPATCH_FILE).read_text()
+    )
+    env = table["ops"]["rmsnorm_serve"]["envelope"]
+    env.update(auto_max_tokens=2, hidden_exact_allowlist=[6144])
+    env["hidden_generic_band"].update(min=2048, max=2048)
+    path = tmp_path / serve._DISPATCH_FILE
+    path.write_text(json.dumps(table))
+    monkeypatch.setattr(resources, "files", lambda package: tmp_path)
+    monkeypatch.delattr(serve, "_DISPATCH_TABLE", raising=False)
+    p = _dispatch_table()
+    assert p.cap == 2 and p.cuda == {6144} and p.cutedsl == {2048, 6144}
+    path.write_text("{}")
+    assert _dispatch_table() is p
+    monkeypatch.delattr(serve, "_DISPATCH_TABLE")
+    assert _dispatch_table() is None
+    for op_patch in (
+        {"dtype": "float16"},
+        {"input_dim": 3},
+        {"compute_capability": [9, False]},
+    ):
+        op = table["ops"]["rmsnorm_serve"]
+        path.write_text(
+            json.dumps({**table, "ops": {"rmsnorm_serve": {**op, **op_patch}}})
+        )
+        monkeypatch.delattr(serve, "_DISPATCH_TABLE")
+        assert _dispatch_table() is None
+
+
+def test_manifest_narrows_auto_only(monkeypatch):
+    _sm90_or_skip()
+    monkeypatch.setenv(VARIANT_ENV, "cuda")
+    monkeypatch.setattr(
+        serve, "_DISPATCH_TABLE", serve._AutoPolicy(1, frozenset({2048}), frozenset())
+    )
+    x, w = _case(tokens=2)
+    out = torch.empty_like(x)
+    assert not serve.try_rmsnorm_serve_sm90(out, x, w, 1e-6)
+    assert _rmsnorm_serve_sm90_stats()["fallback_reasons"] == {
+        "auto: outside dispatch allowlist": 1
+    }
+    assert serve.try_rmsnorm_serve_sm90(out, x, w, 1e-6, "specialized")
+    torch.testing.assert_close(out, _ref(x, w), atol=0.01, rtol=0.02)
+
+
+@pytest.mark.parametrize("variant", ["cuda", "cutedsl"])
+def test_auto_build_cooldown(monkeypatch, variant):
+    _sm90_or_skip(dsl=variant == "cutedsl")
+    monkeypatch.setenv(VARIANT_ENV, variant)
+    monkeypatch.setattr(serve, "_RETRY_AT", {})
+    clock = [100.0]
+    monkeypatch.setattr(serve, "monotonic", lambda: clock[0])
+    launch = Mock()
+    product = Mock(rmsnorm_serve_sm90=launch) if variant == "cuda" else launch
+    build = Mock(side_effect=[RuntimeError("build sentinel"), product, product])
+    if variant == "cuda":
+        monkeypatch.setattr(serve, "_cuda_module", None)
+        monkeypatch.setattr(serve, "_get_cuda_module", build)
+    else:
+        monkeypatch.setattr(serve, "_COMPILED", {})
+        monkeypatch.setattr(serve, "_build", build)
+    x, w = _case(tokens=2)
+    args = (torch.empty_like(x), x, w, 1e-6)
+    monkeypatch.setattr(serve, "_capturing_on", lambda device: True)
+    assert not serve.try_rmsnorm_serve_sm90(*args)
+    assert not serve._RETRY_AT and not build.called
+    monkeypatch.setattr(serve, "_capturing_on", lambda device: False)
+    assert not serve.try_rmsnorm_serve_sm90(*args)
+    assert not serve.try_rmsnorm_serve_sm90(*args)
+    assert build.call_count == 1 and not launch.called
+    if variant == "cutedsl":
+        other, weight = _case(tokens=2, hidden=4096)
+        assert serve.try_rmsnorm_serve_sm90(
+            torch.empty_like(other), other, weight, 1e-6
+        )
+    clock[0] += serve._BUILD_BACKOFF + 1
+    assert serve.try_rmsnorm_serve_sm90(*args)
+    assert build.call_count == (3 if variant == "cutedsl" else 2)
+    assert not serve._RETRY_AT
+
+
+@pytest.mark.parametrize("route", ["specialized", "cuda", "auto"])
+def test_failed_submission_not_attributed(monkeypatch, route):
+    _sm90_or_skip()
+    monkeypatch.setenv(VARIANT_ENV, "cuda")
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", False)
+    monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda device: True)
+    if route == "auto":
+        monkeypatch.setenv(DISABLE_ENV, "1")
+    failure = RuntimeError("launch sentinel")
+    specialist = Mock(side_effect=failure)
+    incumbent = Mock(side_effect=failure)
+    monkeypatch.setattr(serve, "_cuda_module", Mock(rmsnorm_serve_sm90=specialist))
+    monkeypatch.setattr(
+        flashinfer.norm, "get_norm_module", lambda: Mock(rmsnorm=incumbent)
+    )
+    x, w = _case(tokens=2)
+    with pytest.raises(RuntimeError, match="launch sentinel"):
+        flashinfer.norm.rmsnorm(x, w, backend=route, enable_pdl=False)
+    assert specialist.call_count == int(route == "specialized")
+    assert incumbent.call_count == int(route != "specialized")
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["calls"] == 0
+    assert not any(stats["backend_dispatches"].values())
+    assert not any(stats["variant_dispatches"].values())
+    assert stats["fallback_reasons"] == (
+        {"auto: kill switch": 1} if route == "auto" else {}
+    )
+
+
+def test_cuda_variant_single_row_strides(monkeypatch):
+    _sm90_or_skip()
+    monkeypatch.setenv(VARIANT_ENV, "cuda")
+    x, w = _case(tokens=1)
+    x = x.as_strided(x.shape, (1, 1))
+    out = torch.empty_strided(x.shape, (1, 1), device=x.device, dtype=x.dtype)
+    assert x.is_contiguous() and out.is_contiguous()
+    flashinfer.norm.rmsnorm(x, w, out=out, backend="specialized")
+    assert _rmsnorm_serve_sm90_stats()["variant_dispatches"]["cuda"] == 1
+    torch.testing.assert_close(out, _ref(x, w), atol=0.01, rtol=0.02)
+
+
+def test_explicit_pdl_preserved(monkeypatch):
+    _sm90_or_skip()
+    monkeypatch.setenv(VARIANT_ENV, "cuda")
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", False)
+    monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda device: True)
+    monkeypatch.setattr(flashinfer.norm, "device_support_pdl", lambda device: True)
+    module = Mock()
+    monkeypatch.setattr(flashinfer.norm, "get_norm_module", lambda: module)
+    x, w = _case(tokens=4)
+    flashinfer.norm.rmsnorm(x, w, enable_pdl=True)
+    with pytest.raises(NotImplementedError, match="PDL"):
+        flashinfer.norm.rmsnorm(x, w, backend="specialized", enable_pdl=True)
+    module.rmsnorm.assert_called_once()
+    assert module.rmsnorm.call_args.args[-1] is True
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["calls"] == 1
+    assert stats["fallback_reasons"] == {"specialized: PDL not supported": 1}
+    assert not any(stats["backend_dispatches"].values())
+
+
+def test_cuda_specialist_import_does_not_require_cute_dsl():
+    code = """
+import importlib
+import importlib.abc
+import importlib.util
+import sys
+class NoCutlass(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "cutlass" or fullname.startswith("cutlass."):
+            raise ModuleNotFoundError("cutlass deliberately unavailable", name=fullname)
+sys.meta_path.insert(0, NoCutlass())
+original_find_spec = importlib.util.find_spec
+def absent_cutlass_spec(name, *args, **kwargs):
+    if name == "cutlass" or name.startswith("cutlass."):
+        return None
+    return original_find_spec(name, *args, **kwargs)
+importlib.util.find_spec = absent_cutlass_spec
+import flashinfer.norm as norm
+serve = importlib.import_module("flashinfer.norm.kernels.rmsnorm_serve_sm90")
+assert not serve._HAS_CUTE_DSL
+assert norm._try_rmsnorm_serve_sm90 is serve.try_rmsnorm_serve_sm90
+assert norm._USE_CUDA_NORM
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=60)

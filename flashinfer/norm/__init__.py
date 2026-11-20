@@ -1386,7 +1386,7 @@ def _rmsnorm_impl(
             )
         # Serves the call or raises with the refusal reason (the dim guard
         # included): explicit selection never falls back.
-        _try_rmsnorm_serve_sm90(out, input, weight, eps, backend)
+        _try_rmsnorm_serve_sm90(out, input, weight, eps, backend, enable_pdl=enable_pdl)
         return
     if backend == "auto":
         # The cached pre-gate keeps the specialized dispatch off the hot path
@@ -1394,6 +1394,7 @@ def _rmsnorm_impl(
         # dtype/shape/token counts): pre-gate misses are not counted.
         if (
             _try_rmsnorm_serve_sm90 is not None
+            and enable_pdl is not True
             and input.dim() == 2
             and not _USE_CUDA_NORM
             and _rmsnorm_serve_auto_eligible(input)
@@ -1416,13 +1417,6 @@ def _rmsnorm_impl(
         use_cuda = False
     else:
         use_cuda = _use_cuda_norm(input.device)
-    if _record_rmsnorm_incumbent is not None and (
-        consulted or backend in ("cuda", "cutedsl")
-    ):
-        _record_rmsnorm_incumbent(
-            "cuda" if use_cuda else "cutedsl",
-            count_call=backend in ("cuda", "cutedsl"),
-        )
     if use_cuda:
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
     else:
@@ -1434,6 +1428,10 @@ def _rmsnorm_impl(
             rmsnorm_cute(
                 input, weight, out, eps, weight_bias=0.0, enable_pdl=enable_pdl
             )
+    if _record_rmsnorm_incumbent is not None and (
+        consulted or backend in ("cuda", "cutedsl")
+    ):
+        _record_rmsnorm_incumbent("cuda" if use_cuda else "cutedsl")
 
 
 @register_fake_op("flashinfer::rmsnorm")

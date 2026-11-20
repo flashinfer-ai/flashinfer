@@ -68,6 +68,8 @@ tuning measures incumbent tactics only.
 """
 
 import os
+from time import monotonic
+from typing import NamedTuple
 
 import torch
 
@@ -115,6 +117,7 @@ def _fallback(reason):
     # prefixes the reason with the requested backend, so refuse loudly here.
     _stats["fallback_reasons"][reason] = _stats["fallback_reasons"].get(reason, 0) + 1
     if reason.startswith("specialized:"):
+        _stats["calls"] += 1
         raise NotImplementedError(
             f"rmsnorm backend='specialized' cannot serve this call "
             f"({reason.split(': ', 1)[1]}); an explicitly selected backend "
@@ -122,16 +125,9 @@ def _fallback(reason):
         )
 
 
-def record_incumbent_dispatch(impl: str, *, count_call: bool = False) -> None:
-    """Attribute a call served by an incumbent backend ("cuda"/"cutedsl").
-
-    ``count_call=True`` also counts the call itself (used for explicit
-    ``backend="cuda"``/``"cutedsl"`` pins, which never enter
-    :func:`try_rmsnorm_serve_sm90` and would otherwise be missing from the
-    census).
-    """
-    if count_call:
-        _stats["calls"] += 1
+def record_incumbent_dispatch(impl: str) -> None:
+    """Count a submitted incumbent pin or consulted auto fallback."""
+    _stats["calls"] += 1
     _stats["backend_dispatches"][impl] += 1
 
 
@@ -172,6 +168,53 @@ def _reset_rmsnorm_serve_sm90_stats() -> None:
     _stats["fallback_reasons"].clear()
 
 
+class _AutoPolicy(NamedTuple):
+    cap: int
+    cuda: frozenset
+    cutedsl: frozenset
+
+
+def _parse_policy(table):
+    def positive(n):
+        if type(n) is not int or n <= 0:
+            raise ValueError("expected positive integer")
+        return n
+
+    op = table["ops"]["rmsnorm_serve"]
+    cc = op["compute_capability"]
+    if (
+        table["kill_switch"] != _SPECIALIZED_KERNEL_DISABLE_ENV
+        or not isinstance(table["backends"], list)
+        or not {"auto", "specialized"}.issubset(table["backends"])
+        or op["dtype"] != "bfloat16"
+        or positive(op["input_dim"]) != 2
+        or cc != [9, 0]
+        or not all(type(n) is int for n in cc)
+    ):
+        raise ValueError("incompatible SM90 auto policy")
+    env = op["envelope"]
+    cap = min(
+        positive(env["auto_max_tokens"]), positive(env["max_tokens"]), _AUTO_MAX_TOKENS
+    )
+    widths = env["hidden_exact_allowlist"]
+    if not isinstance(widths, list):
+        raise ValueError("expected exact width list")
+    exact = frozenset(positive(h) for h in widths)
+    band = env["hidden_generic_band"]
+    lo, hi = positive(band["min"]), positive(band["max"])
+    step = positive(band["multiple_of"])
+    if lo > hi or band["variant"] != "cutedsl":
+        raise ValueError("invalid generic band")
+    cuda = exact.intersection(_SERVE_H_ALLOWLIST).difference(_AUTO_EXCLUDED_H)
+    cutedsl = frozenset(
+        h
+        for h in range(_GENERIC_H_MIN, _GENERIC_H_MAX + 1, 8)
+        if h not in _AUTO_EXCLUDED_H
+        and (h in exact or (lo <= h <= hi and h % step == 0))
+    )
+    return _AutoPolicy(cap, cuda, cutedsl)
+
+
 def _dispatch_table():
     """Load the dispatch surface (package data) once; ``None`` means
     ``backend="auto"`` never routes to "specialized"."""
@@ -187,7 +230,7 @@ def _dispatch_table():
         payload = _json.loads(
             resources.files("flashinfer").joinpath(_DISPATCH_FILE).read_text()
         )
-        _DISPATCH_TABLE = payload if isinstance(payload, dict) else None
+        _DISPATCH_TABLE = _parse_policy(payload)
     except Exception:
         _DISPATCH_TABLE = None
     return _DISPATCH_TABLE
@@ -399,6 +442,19 @@ if _HAS_CUTE_DSL:
 # ---------------------------------------------------------------------------
 
 _cuda_module = None
+_RETRY_AT: dict[str | tuple[int, torch.dtype], float] = {}
+_BUILD_BACKOFF = 5.0
+
+
+def _cooling_down(key, requested):
+    deadline = _RETRY_AT.get(key)
+    return requested == "auto" and deadline is not None and monotonic() < deadline
+
+
+def _build_failed(key, requested, variant):
+    _RETRY_AT[key] = monotonic() + _BUILD_BACKOFF
+    _fallback(f"{requested}: {variant} variant JIT build failed")
+    return False
 
 
 def _get_cuda_module():
@@ -509,6 +565,7 @@ def try_rmsnorm_serve_sm90(
     weight: torch.Tensor,
     eps: float,
     requested: str = "auto",
+    enable_pdl: bool | None = None,
 ) -> bool:
     """Run the SM90 serve-shape RMSNorm when the call is inside the measured
     envelope.  Returns ``True`` when the output has been produced; ``False``
@@ -523,14 +580,13 @@ def try_rmsnorm_serve_sm90(
     allowlist to be loaded. Incumbent-backend attribution is the caller's
     (record_incumbent_dispatch), since only the caller knows which
     implementation ran."""
-    _stats["calls"] += 1
     if requested in ("cuda", "cutedsl"):
         return False
     if _disabled():
         _fallback(f"{requested}: kill switch")
         return False
-    if requested == "auto" and _dispatch_table() is None:
-        _fallback("auto: dispatch allowlist unavailable")
+    if enable_pdl:
+        _fallback(f"{requested}: PDL not supported")
         return False
     backend = _variant()
     if input.dim() != 2:
@@ -547,13 +603,16 @@ def try_rmsnorm_serve_sm90(
     if not 0 < tokens <= _MAX_TOKENS:
         _fallback(f"{requested}: tokens {tokens} outside envelope")
         return False
-    if requested == "auto" and tokens > _AUTO_MAX_TOKENS:
-        _fallback(f"auto: tokens {tokens} beyond the measured-win cap")
-        return False
-    if requested == "auto" and hidden in _AUTO_EXCLUDED_H:
-        _fallback(f"auto: H {hidden} reserved for incumbent")
-        return False
-    if not _h_in_envelope(hidden, backend):
+    if requested == "auto":
+        policy = _dispatch_table()
+        if policy is None:
+            _fallback("auto: dispatch allowlist unavailable")
+            return False
+        widths = policy.cuda if backend == "cuda" else policy.cutedsl
+        if tokens > policy.cap or hidden not in widths:
+            _fallback("auto: outside dispatch allowlist")
+            return False
+    elif not _h_in_envelope(hidden, backend):
         _fallback(f"{requested}: H {hidden} off the allowlist")
         return False
     if input.device.type != "cuda":
@@ -600,16 +659,21 @@ def try_rmsnorm_serve_sm90(
             # read of the same row.  In-place calls take the incumbent path.
             _fallback(f"{requested}: cuda variant does not support in-place")
             return False
-        if _cuda_module is None and _capturing_on(input.device):
-            # Never JIT-build the module under CUDA-graph capture.
-            _fallback(f"{requested}: cuda variant uncompiled under capture")
-            return False
-        try:
-            module = _get_cuda_module()
-        except Exception:
-            _fallback(f"{requested}: cuda variant JIT build failed")
-            return False
+        module = _cuda_module
+        if module is None:
+            if _capturing_on(input.device):
+                _fallback(f"{requested}: cuda variant uncompiled under capture")
+                return False
+            if _cooling_down("cuda", requested):
+                _fallback("auto: cuda variant JIT build cooldown")
+                return False
+            try:
+                module = _get_cuda_module()
+            except Exception:
+                return _build_failed("cuda", requested, backend)
+            _RETRY_AT.pop("cuda", None)
         module.rmsnorm_serve_sm90(out, input, weight, float(eps))
+        _stats["calls"] += 1
         _stats["backend_dispatches"]["specialized"] += 1
         _stats["variant_dispatches"]["cuda"] += 1
         return True
@@ -633,6 +697,9 @@ def try_rmsnorm_serve_sm90(
             # Never JIT-compile a new (H, dtype) variant under capture.
             _fallback(f"{requested}: cutedsl variant uncompiled under capture")
             return False
+        if _cooling_down(key, requested):
+            _fallback("auto: cutedsl variant JIT build cooldown")
+            return False
         try:
             # Compile under the input tensor's device: the guard admits any
             # SM90 device, but on a mixed-architecture host the process's
@@ -641,12 +708,13 @@ def try_rmsnorm_serve_sm90(
             with torch.cuda.device(input.device):
                 fn = _build(hidden, input.dtype)
         except Exception:
-            _fallback(f"{requested}: cutedsl variant JIT build failed")
-            return False
+            return _build_failed(key, requested, backend)
+        _RETRY_AT.pop(key, None)
         _COMPILED[key] = fn
     # The compiled kernel takes the TVM-FFI env stream, i.e. the caller's
     # current torch stream re-queried on every call (CUDA-graph safe).
     fn(input, weight, out, float(eps))
+    _stats["calls"] += 1
     _stats["backend_dispatches"]["specialized"] += 1
     _stats["variant_dispatches"]["cutedsl"] += 1
     return True
