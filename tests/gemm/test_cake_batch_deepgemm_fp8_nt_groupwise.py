@@ -1075,13 +1075,13 @@ def _require_domain():
     if sm_count not in DOMAIN_SERVING_CELLS:
         pytest.skip(f"no locality-domain cell is listed for {sm_count} SMs")
     table = cake_locality.sm_table(device)
-    if table is None and device in cake_locality._MEMORY_CLOCKS:
-        pytest.skip(
-            f"memory clock {cake_locality._MEMORY_CLOCKS[device]} (current, max "
-            "MHz) is below the full clock: the device routes nothing"
-        )
     assert table is not None, "the SM table probe failed on a dual-die SM107a GPU"
     assert sum(table.counts) == sm_count
+    if not cake_locality.memory_at_full_clock(device):
+        pytest.skip(
+            f"memory clock {cake_locality._MEMORY_CLOCKS.get(device)} (current, "
+            "max MHz) is below the full clock: batch DeepGEMM FP8 routes no twin"
+        )
     return device, table
 
 
@@ -1928,8 +1928,8 @@ def test_domain_fallbacks_take_the_whole_route(monkeypatch):
         out = no_table.launch()
         torch.cuda.synchronize()
         _assert_valid_rows_close(out, reference, masked_m)
-    # The memory clock check, probed again: below the full clock the device has
-    # no SM table and takes the whole program; at the full clock the route is
+    # The memory clock check, read again: below the full clock the device keeps
+    # its SM table but takes the whole program; at the full clock the route is
     # the same as before.
     routed = domain_serving_routed(
         "sm_107a", device_sm_count(device), table.counts, *nk, groups
@@ -1940,10 +1940,9 @@ def test_domain_fallbacks_take_the_whole_route(monkeypatch):
             cake_locality._forget()
             try:
                 probed = cake_locality.sm_table(device)
-                assert (probed is not None) == routes
-                if routes:
-                    assert probed.counts == table.counts
-                    assert torch.equal(probed.entries, table.entries)
+                assert probed is not None and probed.counts == table.counts
+                assert torch.equal(probed.entries, table.entries)
+                assert cake_locality.memory_at_full_clock(device) == routes
                 localized = localize_weights(b)
                 assert (localized is not b) == (routes and routed)
                 public = prepare_batch_deepgemm_fp8_nt_groupwise(
@@ -2180,6 +2179,7 @@ def test_domain_homing_needs_the_whole_allocation(monkeypatch):
 
     monkeypatch.setattr(cake_locality, "homing", registry)
     monkeypatch.setattr(cake_locality, "sm_table", lambda device=None: table)
+    monkeypatch.setattr(cake_locality, "memory_at_full_clock", lambda device=None: True)
     monkeypatch.setattr(module, "domain_serving_routed", lambda *args: True)
     monkeypatch.setattr(module, "_PLANS", {})
     assert cake_locality.tensor_homing(b) is record
