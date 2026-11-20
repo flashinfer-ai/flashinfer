@@ -24,9 +24,43 @@ def weights():
     return w13, w2, [s13, s2]
 
 
+def _native_module_available():
+    if moe.gen_specialized_fused_moe_fp8_blockscale_sm120_module().is_compiled:
+        return True
+    from flashinfer.fused_moe.runners import _specialized_jit_nvcc_release
+
+    release = _specialized_jit_nvcc_release()
+    return release is not None and release >= (13, 2)
+
+
+@pytest.mark.parametrize(
+    "compiled,release,expected",
+    [(False, (13, 0), False), (False, (13, 2), True), (True, None, True)],
+    ids=["cold-cuda130", "cold-cuda132", "prebuilt-no-nvcc"],
+)
+def test_native_module_admission(monkeypatch, compiled, release, expected):
+    from types import SimpleNamespace
+
+    from flashinfer.fused_moe import runners
+
+    def selected_release():
+        assert not compiled, "a prebuilt module must not probe nvcc"
+        return release
+
+    monkeypatch.setattr(
+        moe,
+        "gen_specialized_fused_moe_fp8_blockscale_sm120_module",
+        lambda: SimpleNamespace(is_compiled=compiled),
+    )
+    monkeypatch.setattr(runners, "_specialized_jit_nvcc_release", selected_release)
+    assert _native_module_available() is expected
+
+
 @pytest.mark.parametrize("tokens", [1, 4, 16, 64])
 @pytest.mark.parametrize("all_invalid", [False, True])
 def test_omit_invalid_route_scores(weights, tokens, all_invalid, monkeypatch):
+    if not _native_module_available():
+        pytest.skip("requires a compiled SM120 module or JIT-selected nvcc >= 13.2")
     monkeypatch.delenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", raising=False)
     w13, w2, scales = weights
     device = w13.device
