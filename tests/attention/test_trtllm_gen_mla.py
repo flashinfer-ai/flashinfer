@@ -2005,6 +2005,128 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
             {"dtype": torch.float8_e4m3fn, "page_size": 64, "ragged_query": True},
             "mla_fp8_tail",
         ),
+        # The split-KV domain serves the devices _SPLITKV_RANGE lists (GB300: from
+        # max_seq_len 1025, the first max_seq_len of tuning bucket 2048, up to 18
+        # query rows), sinks, page 64, bmm2_scale != 1 and q_len > 1 included.
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 2048,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 1024,
+            },
+            "mla_bf16_vquarter",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 1025,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "batch_size": 9,
+                "q_len": 2,
+                "total_q": 18,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "batch_size": 19,
+                "q_len": 1,
+                "total_q": 19,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_vquarter",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "page_size": 64,
+                "enable_sink": True,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 16384,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "bmm2_scale": 0.5,
+                "q_len": 2,
+                "total_q": 2,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "skip_softmax": True,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_vquarter",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "ragged_query": True,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_vquarter",
+        ),
+        (
+            {"arch": "sm_103a", "num_sms": 152, "wants_lse": True, "max_seq_len": 4096},
+            "mla_bf16_tail",
+        ),
+        # The native split-8 program keeps its exact geometry.
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "q_len": 4,
+                "total_q": 4,
+                "max_seq_len": 2048,
+                "kv_lens": (1024,),
+            },
+            "mla_bf16_native_split8_pdl",
+        ),
+        # Devices not listed (B200, B300) and callers without arch never select it.
+        (
+            {"arch": "sm_100a", "num_sms": 148, "max_seq_len": 4096},
+            "mla_bf16_vquarter",
+        ),
+        (
+            {"arch": "sm_103a", "num_sms": 148, "max_seq_len": 4096},
+            "mla_bf16_vquarter",
+        ),
+        ({"num_sms": 152, "max_seq_len": 4096}, "mla_bf16_vquarter"),
     ],
 )
 def test_trtllm_mla_blackwell_domain_selection(
@@ -2037,6 +2159,7 @@ def test_trtllm_mla_blackwell_domain_selection(
         "table_width": 32,
         "kv_lens": None,
         "num_sms": 148,
+        "arch": None,
     }
     values.update(overrides)
     # The host reads the KV lengths only for the pre-filtered geometries; a row
@@ -2068,6 +2191,7 @@ def test_trtllm_mla_blackwell_domain_selection(
             "mla_bf16_vquarter",
             "mla_bf16_vhalf",
             "mla_bf16_clc",
+            "mla_bf16_splitkv",
             "mla_bf16_tail",
             "mla_fp8_tail",
             "mla_fp8_page64_pdl",
@@ -2151,6 +2275,45 @@ def test_trtllm_mla_blackwell_page64_split_plan_is_size_based() -> None:
     assert plan_num_split(1, 1024, 148) == 4
     assert plan_num_split(64, 8192, 152) == 2
     assert plan_num_split(1, 128, 148) == 2
+
+
+def test_trtllm_mla_blackwell_splitkv_plan_matches_rule() -> None:
+    """The split-KV count comes from host-known sizes: one wave of clusters at
+    most, at most 32 splits, equal tiles per split of a max_seq_len row."""
+    from flashinfer.mla.cake_trtllm_mla_blackwell import (
+        _SPLITKV_MAX_SPLIT,
+        plan_kv_split,
+    )
+
+    # GB300 (152 SMs, 76 resident clusters): (rows, max_seq_len) -> splits.
+    expected = {
+        (1, 2048): 16,
+        (1, 4096): 32,
+        (1, 16384): 32,
+        (2, 4096): 32,
+        (4, 16384): 19,
+        (8, 2048): 8,
+        (8, 16384): 9,
+        (9, 4096): 8,
+        (16, 4096): 4,
+        (18, 16384): 4,
+        (1, 1025): 9,
+    }
+    for (rows, max_seq_len), split in expected.items():
+        assert plan_kv_split(rows, max_seq_len, 152) == split, (rows, max_seq_len)
+    for num_sms in (148, 152):
+        resident = num_sms // 2
+        for rows in range(1, 39):
+            for max_seq_len in (1025, 2048, 4096, 8192, 16384, 131072):
+                split = plan_kv_split(rows, max_seq_len, num_sms)
+                tiles = -(-max_seq_len // 128)
+                per_split = -(-tiles // split)
+                assert 1 <= split <= _SPLITKV_MAX_SPLIT
+                assert rows * split <= resident, (num_sms, rows, max_seq_len)
+                # Every split of a max_seq_len row is busy and no count below
+                # gives the same tiles per split.
+                assert (split - 1) * per_split < tiles
+                assert split == 1 or -(-tiles // (split - 1)) > per_split
 
 
 _SMEM_FILL_SOURCE = r"""
@@ -2400,6 +2563,18 @@ def _blackwell_resident() -> int:
     return max(1, get_device_sm_count(torch.device("cuda")) // 2)
 
 
+def _skip_unless_splitkv_device(domain: str) -> None:
+    """Skip a split-KV case on a device ``_SPLITKV_RANGE`` does not list (there the
+    same request takes a value-split program)."""
+    from flashinfer.mla.cake_trtllm_mla_blackwell import _SPLITKV_RANGE, _device_facts
+
+    if (
+        domain == "mla_bf16_splitkv"
+        and _device_facts(torch.cuda.current_device()) not in _SPLITKV_RANGE
+    ):
+        pytest.skip("the split-KV domain serves only the devices _SPLITKV_RANGE lists")
+
+
 def _blackwell_decode(query, kv_cache, block_tables, seq_lens, max_seq_len, **kwargs):
     """``backend="cake"`` decode called on the Blackwell module directly."""
     from flashinfer.mla.cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
@@ -2571,6 +2746,7 @@ def test_trtllm_mla_blackwell_device_row_bindings() -> None:
     from flashinfer.mla.cake_trtllm_mla_blackwell import (
         _CLC_BINDING,
         _FP8_PAGE64_BINDING,
+        _SPLITKV_BINDING,
         _VALUE_SPLIT_BINDINGS,
         FAMILIES,
         ROUTES,
@@ -2617,6 +2793,15 @@ def test_trtllm_mla_blackwell_device_row_bindings() -> None:
         )
         order = FAMILIES[ROUTES[f"mla_bf16_clc_order__{arch}"]]
         assert order["arch"] == arch and order["domain"] == "mla_bf16_clc_order"
+        # The split-KV binding takes the caller's seq_lens and block_tables too and
+        # links its mainloop and reducer.
+        splitkv = FAMILIES[ROUTES[f"mla_bf16_splitkv__{arch}"]]
+        assert splitkv["binding"] == _SPLITKV_BINDING
+        assert splitkv["arch"] == arch and splitkv["domain"] == "mla_bf16_splitkv"
+        assert len(splitkv["dependencies"]) == 2
+    assert _SPLITKV_BINDING != _CLC_BINDING
+    assert _SPLITKV_BINDING not in _VALUE_SPLIT_BINDINGS
+    assert _SPLITKV_BINDING != _FP8_PAGE64_BINDING
 
 
 # name: (dtype, batch, q_len, page_size, sink, return_lse, max_len, domain)
@@ -2648,6 +2833,17 @@ _PADDED_ROW_CASES = {
     ),
     "bf16_tail": (torch.bfloat16, 4, 2, 32, False, True, 1024, "mla_bf16_tail"),
     "fp8_tail": (torch.float8_e4m3fn, 4, 2, 32, False, False, 1024, "mla_fp8_tail"),
+    "splitkv": (torch.bfloat16, 4, 2, 32, False, False, 4096, "mla_bf16_splitkv"),
+    "splitkv_page64_sink": (
+        torch.bfloat16,
+        3,
+        2,
+        64,
+        True,
+        False,
+        2048,
+        "mla_bf16_splitkv",
+    ),
 }
 
 
@@ -2663,6 +2859,7 @@ def test_trtllm_mla_blackwell_padded_rows_output_zero(case, blackwell_domains) -
     dtype, batch, q_len, page_size, sink, return_lse, max_len, domain = (
         _PADDED_ROW_CASES[case]
     )
+    _skip_unless_splitkv_device(domain)
     kv_lens = _padded_kv_lens(batch, q_len, max_len)
     query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
         kv_lens, q_len, page_size, dtype
@@ -2716,27 +2913,32 @@ def test_trtllm_mla_blackwell_padded_rows_output_zero(case, blackwell_domains) -
         assert bool((result[1] == float("-inf")).all())
 
 
-# name: (dtype, batch, q_len, page_size)
+# name: (dtype, batch, q_len, page_size, max_len)
 _GRAPH_CASES = {
-    "vquarter": (torch.bfloat16, 4, 4, 32),
-    "vhalf": (torch.bfloat16, 8, 4, 32),
-    "vhalf_page64": (torch.bfloat16, 8, 4, 64),
-    "clc_one_wave": (torch.bfloat16, 16, 4, 32),
-    "clc_ordered": (torch.bfloat16, 64, 4, 32),
-    "fp8_page64": (torch.float8_e4m3fn, 4, 2, 64),
+    "vquarter": (torch.bfloat16, 4, 4, 32, 1024),
+    "vhalf": (torch.bfloat16, 8, 4, 32, 1024),
+    "vhalf_page64": (torch.bfloat16, 8, 4, 64, 1024),
+    "clc_one_wave": (torch.bfloat16, 16, 4, 32, 1024),
+    "clc_ordered": (torch.bfloat16, 64, 4, 32, 1024),
+    "fp8_page64": (torch.float8_e4m3fn, 4, 2, 64, 1024),
+    "splitkv": (torch.bfloat16, 4, 2, 32, 4096),
+    "splitkv_page64": (torch.bfloat16, 3, 1, 64, 2048),
 }
 
 
 @pytest.mark.parametrize("case", sorted(_GRAPH_CASES))
-def test_trtllm_mla_blackwell_graph_replay_reads_current_rows(case) -> None:
+def test_trtllm_mla_blackwell_graph_replay_reads_current_rows(
+    case, blackwell_domains
+) -> None:
     """A graph captured once follows later in-place changes of seq_lens and block_tables.
 
     Rows are derived on the device from the caller's tensors at every replay, so the
     replay equals an eager call on fresh tensors holding the same values.
     """
     _skip_unless_blackwell()
-    dtype, batch, q_len, page_size = _GRAPH_CASES[case]
-    max_len = 1024
+    dtype, batch, q_len, page_size, max_len = _GRAPH_CASES[case]
+    if case.startswith("splitkv"):
+        _skip_unless_splitkv_device("mla_bf16_splitkv")
     width = max_len // page_size
     kv_lens = _padded_kv_lens(batch, q_len, max_len)
     query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
@@ -2777,6 +2979,8 @@ def test_trtllm_mla_blackwell_graph_replay_reads_current_rows(case) -> None:
             query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
         )
         _assert_rows(out, reference, rows, dtype)
+    if case.startswith("splitkv"):
+        assert set(blackwell_domains) == {"mla_bf16_splitkv"}
 
 
 # name: (batch, q_len, page_size, ragged q_lens with the same total, domain)
@@ -2851,6 +3055,33 @@ _TABLE_WIDTH_CASES = {
 }
 
 
+# name: (dtype, batch, q_len, page_size, domain); widths whose capacity exceeds
+# 1024 tokens, so the split-KV domain serves them where _SPLITKV_RANGE lists the
+# device.
+_SPLITKV_TABLE_WIDTH_CASES = {
+    "splitkv": (torch.bfloat16, 2, 2, 32, "mla_bf16_splitkv"),
+    "splitkv_page64": (torch.bfloat16, 2, 1, 64, "mla_bf16_splitkv"),
+}
+
+
+@pytest.mark.parametrize("table_end", ["poison", "allocation_end"])
+@pytest.mark.parametrize("width", [17, 19, 33, 34, 35, 37])
+@pytest.mark.parametrize("case", sorted(_SPLITKV_TABLE_WIDTH_CASES))
+def test_trtllm_mla_blackwell_splitkv_reads_no_page_id_past_the_table(
+    case, width, table_end, blackwell_domains
+) -> None:
+    """The split-KV program reads page ids only inside the caller's table (see
+    ``test_trtllm_mla_blackwell_reads_no_page_id_past_the_table``)."""
+    _skip_unless_blackwell()
+    dtype, batch, q_len, page_size, domain = _SPLITKV_TABLE_WIDTH_CASES[case]
+    if (page_size == 64) != (width < 32):
+        pytest.skip("page 32 takes widths 33-37, page 64 widths 17 and 19")
+    _skip_unless_splitkv_device(domain)
+    _check_page_ids_inside_the_table(
+        dtype, batch, q_len, page_size, domain, width, table_end, blackwell_domains
+    )
+
+
 @pytest.mark.parametrize("table_end", ["poison", "allocation_end"])
 @pytest.mark.parametrize("width", [1, 2, 3, 5])
 @pytest.mark.parametrize("case", sorted(_TABLE_WIDTH_CASES))
@@ -2874,6 +3105,14 @@ def test_trtllm_mla_blackwell_reads_no_page_id_past_the_table(
     """
     _skip_unless_blackwell()
     dtype, batch, q_len, page_size, domain = _TABLE_WIDTH_CASES[case]
+    _check_page_ids_inside_the_table(
+        dtype, batch, q_len, page_size, domain, width, table_end, blackwell_domains
+    )
+
+
+def _check_page_ids_inside_the_table(
+    dtype, batch, q_len, page_size, domain, width, table_end, blackwell_domains
+) -> None:
     if page_size == 64 and width % 2 == 0:
         pytest.skip("page 64 reads two entries per tile: odd widths only")
     capacity = width * page_size
@@ -3078,23 +3317,29 @@ void write_after_spin_launch(torch::Tensor dst, torch::Tensor src, int64_t spin_
 
 
 @pytest.mark.parametrize(
-    "dtype,batch,q_len,page_size",
+    "dtype,batch,q_len,page_size,max_len",
     [
-        (torch.bfloat16, 64, 4, 32),
-        (torch.bfloat16, 16, 4, 32),
-        (torch.float8_e4m3fn, 4, 2, 64),
+        (torch.bfloat16, 64, 4, 32, 1024),
+        (torch.bfloat16, 16, 4, 32, 1024),
+        (torch.float8_e4m3fn, 4, 2, 64, 1024),
+        (torch.bfloat16, 4, 2, 32, 2048),
+        (torch.bfloat16, 3, 1, 64, 4096),
     ],
-    ids=["clc_ordered", "clc_one_wave", "fp8_page64"],
+    ids=["clc_ordered", "clc_one_wave", "fp8_page64", "splitkv", "splitkv_page64"],
 )
 def test_trtllm_mla_blackwell_reads_rows_after_the_dependency_wait(
-    dtype, batch, q_len, page_size
+    dtype, batch, q_len, page_size, max_len
 ) -> None:
     """The PDL programs read seq_lens only after their programmatic dependency wait.
 
     A predecessor that triggers its dependents at entry writes seq_lens 200 us later;
-    a program reading it earlier sees all requests empty and outputs zeros.
+    a program reading it earlier sees all requests empty and outputs zeros.  The
+    split-KV cases also check the reducer: it must not start before the mainloop's
+    partials are complete.
     """
     _skip_unless_blackwell()
+    if max_len > 1024:
+        _skip_unless_splitkv_device("mla_bf16_splitkv")
     from torch.utils.cpp_extension import load_inline
 
     predecessor = load_inline(
@@ -3106,7 +3351,6 @@ def test_trtllm_mla_blackwell_reads_rows_after_the_dependency_wait(
         functions=["write_after_spin_launch"],
         verbose=False,
     )
-    max_len = 1024
     kv_lens = _padded_kv_lens(batch, q_len, max_len)
     query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
         kv_lens, q_len, page_size, dtype

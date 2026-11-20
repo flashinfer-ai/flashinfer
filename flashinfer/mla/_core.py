@@ -2847,8 +2847,10 @@ _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 # runs. It keeps every generic CLC launch within the device work-order window.
 # The FP8 page-64 route allocates its split-K partials on every call (about
 # rows * num_split * 129 KiB, num_split 2 from 37 rows on), also inside every
-# captured graph, so FP8 stops at 128 rows (about 33 MiB). The other routes the
-# candidate takes allocate nothing per call but an 8 KiB work order.
+# captured graph, so FP8 stops at 128 rows (about 33 MiB). The BF16 split-KV
+# route allocates its partials on every call too, at most one wave of clusters
+# (rows * num_split <= num_sms // 2) of 128.5 KiB each, about 10 MiB. The other
+# routes the candidate takes allocate nothing per call but an 8 KiB work order.
 _CAKE_MLA_MAX_ROWS = 512
 _CAKE_MLA_FP8_MAX_ROWS = 128
 
@@ -3288,8 +3290,9 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
     non-torch input updates and CUDA-graph replay with updated inputs stay
     correct, and it keeps no per-identity plan, per-shape scratch or per-stream
     work order that a captured graph could outlive or share. It never reads
-    ``seq_lens`` on the host, so only its value-split, generic CLC and FP8
-    page-64 programs serve it, never its exact-length or generic tail programs.
+    ``seq_lens`` on the host, so only its value-split, generic CLC, FP8 page-64
+    and split-KV programs serve it, never its exact-length or generic tail
+    programs.
     A padded row (no causal KV token) outputs exact zeros. Per call it launches
     the kernels of explicit ``backend="cake"`` for the same program: the
     attention program, preceded by the longest-first order program when a
@@ -3339,12 +3342,18 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
         self._incumbent: Optional["_MlaStageOneWinnerRunner"] = None
 
     def _domain(
-        self, inputs, num_sms: int, batch_size: Optional[int] = None
+        self,
+        inputs,
+        num_sms: int,
+        batch_size: Optional[int] = None,
+        *,
+        arch: Optional[str] = None,
     ) -> Optional[str]:
         """The domain the stateless route launches for these inputs (for
-        ``batch_size`` requests when given) on a device of ``num_sms`` SMs, or
-        ``None`` when it does not launch within the row cap or takes the
-        generic tail program."""
+        ``batch_size`` requests when given) on a device of ``arch`` with
+        ``num_sms`` SMs, or ``None`` when it does not launch within the row cap
+        or takes the generic tail program. Without ``arch`` the device-specific
+        split-KV domain is never selected (``_families`` passes the device's)."""
         from .cake_trtllm_mla_blackwell import (
             DOMAIN_BF16_TAIL,
             DOMAIN_FP8_TAIL,
@@ -3386,6 +3395,7 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
                 table_width=int(block_tables.shape[-1]),
                 kv_lens=None,
                 num_sms=num_sms,
+                arch=arch,
             )
         except ValueError:
             return None
@@ -3403,7 +3413,7 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
         try:
             arch, num_sms = _device_facts(query.device.index)
             for batch_size in batch_sizes:
-                domain = self._domain(inputs, num_sms, batch_size)
+                domain = self._domain(inputs, num_sms, batch_size, arch=arch)
                 if domain is None or not _cake_mla_auto_offered(
                     arch,
                     num_sms,

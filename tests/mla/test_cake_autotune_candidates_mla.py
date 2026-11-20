@@ -244,7 +244,10 @@ def _offer_case(monkeypatch, case, domain=None):
             bmm2_scale=case["bmm2_scale"],
         )
         inputs = [query, case["block_tables"], case["seq_lens"], _nan_out(case)]
-        domain = runner._domain(inputs, num_sms) or cake_module.DOMAIN_BF16_VQUARTER
+        domain = (
+            runner._domain(inputs, num_sms, arch=arch)
+            or cake_module.DOMAIN_BF16_VQUARTER
+        )
     first, last = _bucket_range(query.shape[0])
     key = (
         arch,
@@ -906,7 +909,9 @@ def test_cake_choice_valid_only_while_the_first_stage_keeps_its_winner(
 def _check_offer_table(table) -> None:
     """Every unit of an offer table: a supported configuration without sinks;
     a power-of-two max_seq_len bucket; whole tuning buckets within the row cap;
-    and every batch on the listed domain of the listed device."""
+    and every batch on the listed domain of the listed device, at both edges of
+    the max_seq_len bucket (a device-specific domain such as split-KV starts at a
+    bucket edge, so one bucket never spans two domains)."""
     buckets = get_hybrid_num_tokens_buckets(core._TRTLLM_GEN_MLA_MAX_BATCH)
     for key, units in table.items():
         arch, num_sms, dtype_name, page_size, q_len, has_sinks = key
@@ -926,10 +931,15 @@ def _check_offer_table(table) -> None:
             assert first in buckets and first <= last, unit
             assert last * q_len <= max_rows, unit
             assert last + 1 in buckets or last == max_rows // q_len, unit
-            runner = _cpu_runner(dtype, page_size, seq_bucket)
-            for batch_size in range(first, last + 1):
-                inputs = _cpu_inputs(dtype, batch_size, q_len)
-                assert runner._domain(inputs, num_sms) == domain, (unit, batch_size)
+            for max_seq_len in sorted({seq_bucket // 2 + 1, seq_bucket}):
+                runner = _cpu_runner(dtype, page_size, max_seq_len)
+                for batch_size in range(first, last + 1):
+                    inputs = _cpu_inputs(dtype, batch_size, q_len)
+                    assert runner._domain(inputs, num_sms, arch=arch) == domain, (
+                        unit,
+                        max_seq_len,
+                        batch_size,
+                    )
 
 
 def test_offer_table_well_formed():
@@ -1577,7 +1587,9 @@ def test_unavailable_cake_family_falls_back(monkeypatch, clean_tuner):
 
     cake, inputs = selected[0]
     assert _name(cake) == "cake" and cake.supports(inputs)
-    assert cake._domain(inputs, num_sms) == cake_module.DOMAIN_BF16_VQUARTER
+    assert (
+        cake._domain(inputs, num_sms, arch=arch) == cake_module.DOMAIN_BF16_VQUARTER
+    )
     assert not cake.validate_tactic(inputs, _forced_tactic(cake))
     assert not launches and results[-1] == selected.first_stage
     _assert_matches_reference(output, case, "unavailable family fallback")
@@ -1781,13 +1793,15 @@ def test_cake_miss_runs_the_tuned_first_stage_winner(monkeypatch, fresh_tuner, m
     _assert_matches_reference(output, case, miss)
 
 
-# (dtype, page size, query rows). With 74 or 76 resident clusters (148 or 152
-# SMs), the BF16 rows reach VQUARTER (4), VHALF (32), the CLC program in one
-# wave (64; the one-wave program where one is generated for the device, see
-# ``_one_wave_route``) and with the longest-first order program (128, and 300
-# with a partial last order CTA); FP8 page 64 has one domain. Sinks make every
-# BF16 row VQUARTER, with several work items per cluster above 18 rows. The tail
-# domains never join backend="auto".
+# (dtype, page size, query rows[, max_seq_len], default 1024). With 74 or 76
+# resident clusters (148 or 152 SMs), the BF16 rows reach VQUARTER (4), VHALF
+# (32), the CLC program in one wave (64; the one-wave program where one is
+# generated for the device, see ``_one_wave_route``) and with the longest-first
+# order program (128, and 300 with a partial last order CTA); FP8 page 64 has one
+# domain. Sinks make every BF16 row VQUARTER, with several work items per cluster
+# above 18 rows. The split-KV geometries (max_seq_len past 1024, few rows) reach
+# the split-KV program on the devices ``_SPLITKV_RANGE`` lists. The tail domains
+# never join backend="auto".
 _PARITY_GEOMETRIES = {
     "bf16_p32_vquarter": (torch.bfloat16, 32, 4),
     "bf16_p32_vhalf": (torch.bfloat16, 32, 32),
@@ -1798,6 +1812,8 @@ _PARITY_GEOMETRIES = {
     "bf16_p64_vhalf": (torch.bfloat16, 64, 32),
     "fp8_p64_small": (torch.float8_e4m3fn, 64, 4),
     "fp8_p64_large": (torch.float8_e4m3fn, 64, 128),
+    "bf16_p32_splitkv": (torch.bfloat16, 32, 4, 4096),
+    "bf16_p64_splitkv": (torch.bfloat16, 64, 4, 2048),
 }
 
 # Variants: padded requests have seq_lens 0 (every third request); with q_len 2
@@ -1831,8 +1847,9 @@ _AUTO_SKIPPED_VARIANTS = {
 
 def _skip_unserved_geometry(geometry, variant, arch, num_sms) -> None:
     """Skip the expected cells: variants backend="auto" never offers, FP8 with
-    sinks (the tail program), CLC with bmm2_scale != 1 and the one-wave CLC
-    geometry on a device without that program."""
+    sinks (the tail program), CLC with bmm2_scale != 1, the one-wave CLC
+    geometry on a device without that program and the split-KV geometries on a
+    device ``_SPLITKV_RANGE`` does not list."""
     dtype = _PARITY_GEOMETRIES[geometry][0]
     if "sinks" in variant and dtype != torch.bfloat16:
         pytest.skip("FP8 with sinks takes the tail program, which never joins")
@@ -1842,15 +1859,18 @@ def _skip_unserved_geometry(geometry, variant, arch, num_sms) -> None:
         pytest.skip("the CLC domain requires bmm2_scale == 1")
     if geometry == "bf16_p32_clc_one_wave" and not _one_wave_route(arch, num_sms):
         pytest.skip(f"no one-wave CLC program for {arch} with {num_sms} SMs")
+    if "splitkv" in geometry and (arch, num_sms) not in cake_module._SPLITKV_RANGE:
+        pytest.skip(f"no split-KV domain for {arch} with {num_sms} SMs")
 
 
 def _parity_case(geometry, q_len=1, seed=0):
-    dtype, page_size, rows = _PARITY_GEOMETRIES[geometry]
+    dtype, page_size, rows, *max_seq_len = _PARITY_GEOMETRIES[geometry]
     return _make_case(
         dtype=dtype,
         page_size=page_size,
         batch_size=rows // q_len,
         q_len=q_len,
+        max_seq_len=max_seq_len[0] if max_seq_len else 1024,
         seed=seed,
     )
 
@@ -1904,7 +1924,7 @@ def test_forced_cake_matches_trtllm_gen(monkeypatch, clean_tuner, geometry, vari
     _require_cake_arch()
     arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
     _skip_unserved_geometry(geometry, variant, arch, num_sms)
-    dtype, _, rows = _PARITY_GEOMETRIES[geometry]
+    dtype, _, rows = _PARITY_GEOMETRIES[geometry][:3]
     q_len = 2 if variant.endswith("q_len2") else 1
     case = _parity_case(geometry, q_len)
     if "sinks" in variant:
@@ -1924,9 +1944,11 @@ def test_forced_cake_matches_trtllm_gen(monkeypatch, clean_tuner, geometry, vari
     torch.cuda.synchronize()
     _assert_cake_launched(selected, launches)
     cake, inputs = selected[-1]
-    domain = cake._domain(inputs, num_sms)
+    domain = cake._domain(inputs, num_sms, arch=arch)
     families = cake_module.launch_families(domain, arch, num_sms, rows)
     label = f"{geometry}/{variant} (Cake {domain}, families {families})"
+    if "splitkv" in geometry:
+        assert domain == cake_module.DOMAIN_BF16_SPLITKV, label
     if geometry == "bf16_p32_clc_one_wave" and domain == cake_module.DOMAIN_BF16_CLC:
         one_wave = cake_module.route_key(
             cake_module.DOMAIN_BF16_CLC_ONE_WAVE, arch, num_sms
@@ -1962,6 +1984,8 @@ _STATELESS_GEOMETRIES = (
     "bf16_p32_clc_one_wave",
     "bf16_p32_clc",
     "fp8_p64_small",
+    "bf16_p32_splitkv",
+    "bf16_p64_splitkv",
 )
 
 
@@ -2129,6 +2153,7 @@ def test_forced_cake_graphs_replay_concurrently(monkeypatch, clean_tuner, geomet
         "bf16_p32_clc_one_wave",
         "bf16_p32_clc",
         "fp8_p64_small",
+        "bf16_p32_splitkv",
     ],
 )
 def test_stateless_cake_reads_no_host_state(monkeypatch, clean_tuner, geometry):
@@ -2146,7 +2171,7 @@ def test_stateless_cake_reads_no_host_state(monkeypatch, clean_tuner, geometry):
     _decode(case)  # warm-up: builds the programs and the FP8 decode table
     torch.cuda.synchronize()
     cake, inputs = selected[-1]
-    domain = cake._domain(inputs, num_sms)
+    domain = cake._domain(inputs, num_sms, arch=arch)
     rows = case["query"].shape[0] * case["query"].shape[1]
 
     def forbidden(name):
