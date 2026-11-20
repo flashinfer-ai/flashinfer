@@ -196,6 +196,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 "the in-kernel reduce can only atomic-add terms whose topk "
                 "score was already absorbed before fc2."
             )
+        if token_back_mode not in ("epi_warps", "standalone_warps", "reuse_dispatch_warps"):
+            raise ValueError(f"Unknown token_back_mode: {token_back_mode!r}.")
+        if deterministic and grouped_token_back:
+            raise ValueError("deterministic=True does not support grouped_token_back.")
         if deterministic and fc2_in_kernel_topk_reduce:
             raise ValueError(
                 "deterministic=True requires the separate TopkReduce: the "

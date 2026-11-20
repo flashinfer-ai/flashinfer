@@ -1,6 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Host driver for the MegaMoE NVFP4 swap-AB fused fc1+fc2 kernel."""
+"""Host driver for the MegaMoE NVFP4 swap-AB fused fc1+fc2 kernel.
+
+Run the installed module with ``python -m
+flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_nvfp4_swapab.runner_fc12``.
+"""
 
 
 import argparse

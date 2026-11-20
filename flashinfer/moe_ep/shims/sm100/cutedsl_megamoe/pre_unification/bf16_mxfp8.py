@@ -65,6 +65,14 @@ class MegaMoEBf16Mxfp8Config:
     situ_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
     situ_linear_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
 
+    @property
+    def persistent_finalize_enabled(self) -> bool:
+        return (
+            self.use_persistent_finalize_kernel
+            and not self.in_kernel_fc2_reduce
+            and not self.use_custom_finalize
+        )
+
     def __post_init__(self) -> None:
         from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
             validate_a16_batch_invariant,
@@ -315,7 +323,7 @@ class MegaMoEBf16Mxfp8Frontend:
             raise ValueError(
                 "output_activation has an invalid mixed MegaMoE shape or dtype."
             )
-        if c.use_persistent_finalize_kernel and not c.in_kernel_fc2_reduce:
+        if c.persistent_finalize_enabled:
             _validate_num_valid_tokens(inputs.num_valid_tokens)
 
     def _runtime_kwargs(
@@ -351,8 +359,7 @@ class MegaMoEBf16Mxfp8Frontend:
                     inputs.num_valid_tokens,
                     static_layout=True,
                 )
-                if self.config.use_persistent_finalize_kernel
-                and not self.config.in_kernel_fc2_reduce
+                if self.config.persistent_finalize_enabled
                 else None
             ),
         }
@@ -452,7 +459,7 @@ class MegaMoEBf16Mxfp8Frontend:
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
             skip_topk_reduce=c.use_custom_finalize,
-            topk_reduce_persistent=c.use_persistent_finalize_kernel,
+            topk_reduce_persistent=c.persistent_finalize_enabled,
             token_back_by_dispatch=c.token_back_mode == "reuse_dispatch_warps",
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
@@ -803,6 +810,99 @@ def bf16_mxfp8_mega_moe(
     return out if y is None else None
 
 
+def _create_dummy_weights(
+    num_local_experts: int,
+    hidden: int,
+    intermediate: int,
+    generator: torch.Generator,
+    *,
+    kind: MixedKind,
+) -> Tuple[TransformedWeights, TransformedWeights]:
+    """Random MXFP8 weights + swizzled SF for local smoke scripts."""
+    from .kernel_helpers import (
+        Mxfp8BlockSize,
+        _stack_byte_reinterpretable_tensors,
+        ceil_div,
+        to_blocked,
+    )
+
+    Mxfp8ScaleDtype = torch.float8_e8m0fnu
+
+    def _make_fp8_tensor(generator, shape, data_dtype):
+        count = 1
+        for size in shape:
+            count *= size
+        if data_dtype == torch.float8_e4m3fn:
+            codes = torch.randint(0, 254, (count,), device="cuda", generator=generator)
+            codes = torch.where(codes < 127, codes, codes + 1)
+        else:
+            codes = torch.randint(0, 248, (count,), device="cuda", generator=generator)
+            codes = torch.where(codes < 124, codes, codes + 4)
+        return codes.to(torch.uint8).view(data_dtype).reshape(shape)
+
+    def _make_e8m0_scale_tensor(generator, rows, cols, blocksize):
+        values = torch.rand(
+            rows, ceil_div(cols, blocksize), device="cuda", generator=generator
+        )
+        return torch.where(values < 0.8, 127, 128).to(torch.uint8).view(Mxfp8ScaleDtype)
+
+    data_dtype = _KIND_TO_DTYPE[kind]
+
+    fc1_out = 2 * intermediate
+    hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
+    intermediate_sf_cols = ceil_div(intermediate, Mxfp8BlockSize)
+
+    fc1_weight = (
+        _make_fp8_tensor(
+            generator,
+            (num_local_experts, hidden, fc1_out),
+            data_dtype,
+        )
+        .transpose(-1, -2)
+        .contiguous()
+        .transpose(-1, -2)
+    )
+    fc1_weight_sf_plain = _make_e8m0_scale_tensor(
+        generator,
+        num_local_experts * fc1_out,
+        hidden,
+        blocksize=Mxfp8BlockSize,
+    ).reshape(num_local_experts, fc1_out, hidden_sf_cols)
+    fc1_sf_swizzled = [
+        to_blocked(fc1_weight_sf_plain[e]) for e in range(num_local_experts)
+    ]
+    fc1_flat_sf_size = fc1_sf_swizzled[0].numel()
+    fc1_weight_sf = _stack_byte_reinterpretable_tensors(fc1_sf_swizzled, dim=0).view(
+        num_local_experts, fc1_flat_sf_size
+    )
+
+    fc2_weight = (
+        _make_fp8_tensor(
+            generator,
+            (num_local_experts, intermediate, hidden),
+            data_dtype,
+        )
+        .transpose(-1, -2)
+        .contiguous()
+        .transpose(-1, -2)
+    )
+    fc2_weight_sf_plain = _make_e8m0_scale_tensor(
+        generator,
+        num_local_experts * hidden,
+        intermediate,
+        blocksize=Mxfp8BlockSize,
+    ).reshape(num_local_experts, hidden, intermediate_sf_cols)
+    fc2_sf_swizzled = [
+        to_blocked(fc2_weight_sf_plain[e]) for e in range(num_local_experts)
+    ]
+    fc2_flat_sf_size = fc2_sf_swizzled[0].numel()
+    fc2_weight_sf = _stack_byte_reinterpretable_tensors(fc2_sf_swizzled, dim=0).view(
+        num_local_experts, fc2_flat_sf_size
+    )
+
+    return (fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf)
+
+
 def create_dummy_inputs(
     rank: int,
     world_size: int,
@@ -832,12 +932,6 @@ def create_dummy_inputs(
             f"num_tokens must be in [0, {num_max_tokens}], got {num_tokens}."
         )
 
-    # The mixed kernel's transformed weights are the pure-MXFP8 layout (same
-    # shapes, dtype and swizzled flat SF), so the weight side is shared.
-    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.mxfp8 import (
-        _create_dummy_weights,
-    )
-
     num_local_experts = num_total_experts // world_size
     gen = torch.Generator(device="cuda")
     gen.manual_seed(seed + rank)
@@ -865,7 +959,7 @@ def create_dummy_inputs(
         hidden,
         intermediate,
         gen,
-        kind="mxfp8_e4m3" if kind == "bf16_mxfp8_e4m3" else "mxfp8_e5m2",
+        kind=kind,
     )
 
     activation = torch.randn(

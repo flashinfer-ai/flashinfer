@@ -254,6 +254,35 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     assert fc1_sf.dtype == Mxfp8ScaleDtype
     assert fc2_sf.dtype == Mxfp8ScaleDtype
 
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.kernel_helpers import (
+        from_blocked,
+    )
+
+    block = 16
+    gate_sf, up_sf = w13_scale.chunk(2, dim=1)
+    expected_fc1_sf = torch.stack(
+        (
+            gate_sf.view(torch.uint8).reshape(num_experts, -1, block, hidden // 32),
+            up_sf.view(torch.uint8).reshape(num_experts, -1, block, hidden // 32),
+        ),
+        dim=2,
+    ).reshape(num_experts, 2 * intermediate, hidden // 32)
+    for expert in range(num_experts):
+        torch.testing.assert_close(
+            from_blocked(fc1_sf[expert], 2 * intermediate, hidden // 32).view(
+                torch.uint8
+            ),
+            expected_fc1_sf[expert],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            from_blocked(fc2_sf[expert], hidden, intermediate // 32).view(torch.uint8),
+            w2_scale[expert].view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+
     block = 16
     expected_gate0 = w13[:, :block, :].transpose(1, 2).contiguous()
     expected_up0 = (

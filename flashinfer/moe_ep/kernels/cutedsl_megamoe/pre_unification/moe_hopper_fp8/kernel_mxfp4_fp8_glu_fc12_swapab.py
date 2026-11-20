@@ -120,6 +120,11 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 f"Hopper {self._fp4_format_name}xFP8 supports only fp8_accum_mode='1xacc'."
             )
 
+        if fp8_scale_mode == "mxfp4_hybrid":
+            kwargs.setdefault("fc2_activation_scale_k", 64)
+            if kwargs["fc2_activation_scale_k"] != 64:
+                raise ValueError("mxfp4_hybrid requires fc2_activation_scale_k=64.")
+
         mma_tiler_mnk = kwargs.get("mma_tiler_mnk")
         if mma_tiler_mnk is None and args:
             mma_tiler_mnk = args[0]

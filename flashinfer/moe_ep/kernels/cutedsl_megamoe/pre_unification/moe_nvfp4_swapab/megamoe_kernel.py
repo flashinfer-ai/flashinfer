@@ -1711,6 +1711,11 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             # Opaque byte workspaces: a bare base pointer (no shape), like to_cute_ptr.
             local_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=16),
             shared_workspace=make_ptr(cutlass.Uint8, 0, AddressSpace.gmem, assumed_align=16),
+            gin_dev_comm=None,
+            gin_window=None,
+            gin_internode_send_count=None,
+            gin_internode_recv_splits=None,
+            gin_internode_combine_buffer=None,
             # Field values are placeholders (marshalled as runtime scalars); only
             # num_max_ranks is constexpr, so it must be exact.
             peer_rank_ptr_mapper_host=PeerMapperHost(

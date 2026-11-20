@@ -227,6 +227,8 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             and tmem_plan.accumulator_columns == 2 * tmem_plan.accumulator_stage_columns
             and tmem_plan.accumulator_columns == tmem_plan.allocation_columns
         )
+        if self.sf_in_accumulator and self.batch_invariant:
+            raise ValueError("batch_invariant does not support N256 SF-in-accumulator staging.")
         self.sf_in_accumulator_base = tmem_plan.accumulator_stage_columns - (tmem_plan.sfa_columns + tmem_plan.sfb_columns)
         self.sf_in_accumulator_narrow_limit = self.sf_in_accumulator_base // 16 * 16
         self.accumulator_shape = (self.cta_tile_m, self.cta_tile_n, tmem_plan.accumulator_stage_count)

@@ -80,7 +80,13 @@ def preprocess_mega_weights(
     activation_clamp: float | None = None,
     kernel_variant: Literal["inference", "genphase"] = "inference",
 ) -> TransformedMegaWeights:
-    """Prepare weights for the sources-backed standard or GenPhase kernel."""
+    """Prepare canonical weights for standard or GenPhase.
+
+    FC1 w13 is [E, 2I, H], with gate rows followed by up rows; FC2 w2 is
+    [E, H, I]. Prequantized MXFP8 inputs retain those shapes, with plain
+    E8M0 scales [E, 2I, H/32] and [E, H, I/32]. Pre-interleaved kernel-layout
+    FC1 inputs from the retired legacy implementation are not accepted.
+    """
     from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
         preprocess_block_scaled_weights,
         preprocess_prequantized_block_scaled_weights,

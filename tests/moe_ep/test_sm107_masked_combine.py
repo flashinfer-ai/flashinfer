@@ -170,7 +170,7 @@ def test_dedup_reduce_graph_with_16_byte_output(tokens, hidden, world, with_shar
     from cuda.bindings import driver as cuda
     from cutlass.cute.runtime import from_dlpack
 
-    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.kernel_src.rubin.inference.mega.topk_reduce_dedup import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.helpers.topk_reduce_dedup import (
         TopkReduceDedup,
     )
     from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.quant_def import (

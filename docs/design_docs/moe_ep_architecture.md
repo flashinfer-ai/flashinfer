@@ -610,9 +610,9 @@ expert placement fixed when comparing the same token across batches.
 W8A8 supports both `kind="mxfp8_e4m3"` and `kind="mxfp8_e5m2"`, with
 block-32 UE8M0 scales and BF16 output. Set `batch_invariant=True` on
 `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` or
-`Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`. Blackwell's default provider
-is legacy; select `kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"` for
-standard, or `kernel_variant="genphase"` for GenPhase. Rubin uses inference
+`Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`. Blackwell's unsuffixed selector
+uses standard inference; set `kernel_variant="genphase"` for GenPhase.
+The older MXFP8 implementation is no longer included. Rubin uses inference
 or GenPhase, with the existing explicit `(4, 1)` cluster and bulk FC2 settings
 for GenPhase.
 
@@ -622,30 +622,25 @@ separate receipts. It pins the following MMA geometry:
 
 | Architecture / provider | M / N / stage K | Native instruction K | Cluster |
 | --- | --- | --- | --- |
-| SM100/SM103 legacy | 256 / 256 / 128 | 32 | `(2, 1, 1)` |
 | SM100/SM103 standard / GenPhase | 256 / 128 / 128 (standard also 256) | 32 | `(2, 1)` / `(4, 1)` |
 | SM107 standard / GenPhase | 256 / 128 / 128 (standard also 256) | 64 | `(2, 1)` / `(4, 1)` |
 
-Legacy retains its early-routing-only interface. Next standard and GenPhase
-admit early and late routing. Legacy's FC1 activation association, operand
-orientation and block-32 quantization differ from next's paired-half recipe;
-they have separate receipts. Each receipt fixes MMA initialization, K order,
+Standard and GenPhase admit early and late routing. Their paired-half recipe
+differs from the retired MXFP8 implementation, so its receipts cannot be reused.
+Each receipt fixes MMA initialization, K order,
 full stage padding, activation/scale conversion and ascending top-k reduction.
 BF16 input staging always uses the specified fused normal-scale-floor recipe,
 including on Blackwell where ordinary W8A8 can use the full UE8M0 range.
 Prequantized inputs bypass this stager and retain the supplied bytes/scales.
 
-The admitted legacy plans vary static/atomic task assignment and epi/reuse
-carriers. Next standard admits grouped grid-stride, grouped atomic and
+Standard admits grouped grid-stride, grouped atomic and
 phase-interleaved atomic assignment with three carriers. GenPhase keeps its
 existing admitted scheduling interface. None of these changes the receipt.
 Standard inference additionally admits an equal-padding K256 stage and
-quantized combine. Blackwell legacy also supports `combine_dtype="mxfp8"`;
-its encoder consumes the FP32 FC2 accumulator directly and has a separate
-receipt from next's BF16-first encoder. BF16 deferred output is available on Blackwell legacy and
-standard. Other tile changes, mixed clusters, IKR, CAKE, global normalization/
+quantized combine, using a BF16-first encoder. BF16 deferred output is available
+on Blackwell standard. Other tile changes, mixed clusters, IKR, CAKE, global normalization/
 alpha tensors and non-default flag batching remain rejected. Blackwell
-legacy/standard retain their persistent live-count finalizer. Autotune, cache
+standard retains its persistent live-count finalizer. Autotune, cache
 hits and heuristic fallbacks pass the same admission checks.
 
 Query `fingerprint("megamoe_mxfp8", hidden=, intermediate=, top_k=,
@@ -672,7 +667,6 @@ fingerprints. The following options select additional ordered recipes:
 | SiTU | The same families, with required `situ_beta` and optional `situ_linear_beta` | Bounded and unbounded up branches are distinct |
 | Per-token FC1 scale | NVFP4 Blackwell legacy/standard | Presence is static; FP32 values are runtime per-token inputs |
 | `combine_dtype="nvfp4"` or `"mxfp8"` | Standard block-scaled inference; Blackwell legacy NVFP4 | Each wire has its own encoder, scale, decode and slot-fold terms |
-| `combine_dtype="mxfp8"` | Blackwell legacy MXFP8 | FP32 FC2 producer, legacy amax/scale recipe and E4M3 return data |
 | `FinalizeMode.NONE` | BF16, A16 and Blackwell legacy/standard block-scaled BF16 combine | Deferred numerical class; quantized-wire deferred output is rejected |
 | `FinalizeMode.CAKE` | Blackwell standard NVFP4, early routing, BF16 combine, H4096/top-k6, capacity 256/4096 | Same finalized arithmetic receipt as DEFAULT |
 

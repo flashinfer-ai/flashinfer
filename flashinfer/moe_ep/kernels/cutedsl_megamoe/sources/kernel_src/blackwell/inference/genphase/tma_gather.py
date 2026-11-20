@@ -1,6 +1,6 @@
 """Blackwell replacement for the Rubin TMA TILE_GATHER4 load used by the gen-phase FC1 gather.
 
-The port does not rely on the ``tile::gather4`` load mode on sm_100a (it is not documented for that target). One
+The default uses ordinary tile-mode loads to retain the existing descriptor and toolchain path. One
 gather4 writes four consecutive images of the descriptor's ``(1, tile_k)`` box, one per row coordinate, starting at
 the destination address. The same bytes land in the same places when each row is loaded by an ordinary tile-mode
 tensor load of that box at ``destination + i * box_bytes``: the box is one 128-byte swizzle atom, so every row image

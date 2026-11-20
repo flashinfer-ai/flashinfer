@@ -114,7 +114,7 @@ def test_token_back_chunks_fit_registered_stages(kind, hidden, mode, depth):
 def test_native_multistage_copies_graph(
     ep_runtime, monkeypatch, kind, hidden, depths, mode
 ):
-    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import src
+    from flashinfer.moe_ep.kernels import cutedsl_megamoe as src
     from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.api import ImplDesc
 
     construct = src.RubinInferenceMegaMoE

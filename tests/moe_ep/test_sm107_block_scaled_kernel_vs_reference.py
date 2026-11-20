@@ -1,6 +1,6 @@
 """Single-GPU torch-oracle correctness for the SM107 (Rubin) block-scaled kernel.
 
-Drives the vendored ``next_cutedsl_megamoe`` drop's fused inference mega
+Drives the vendored Rubin fused inference mega
 kernel (``BlockScaledSwapAbMegaMoeKernel``) through the shim allocator +
 compute entry on ONE Rubin GPU (``MEGA_NO_DIST=1``, world_size 1: every
 "peer" resolves to the local buffer, no NVSHMEM), for NVFP4 and MXFP8

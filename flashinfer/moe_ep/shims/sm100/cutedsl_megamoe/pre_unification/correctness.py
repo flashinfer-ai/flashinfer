@@ -1,24 +1,10 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Minimal smoke test for the CuTeDSL NVFP4 MegaMoE frontend.
+"""Legacy frontend validation helpers.
 
-Reuses ``mega_runner`` for deterministic input + reference generation, then
-launches via :class:`MegaMoENvfp4Frontend`.
-
-Single-rank (no NVSHMEM)::
-
-    MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 python -u \\
-        -m flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification \\
-        --num_tokens_per_rank 128 --num_topk 4 --num_total_experts 32 \\
-        --hidden 2048 --intermediate 1024
-
-Multi-rank::
-
-    PYTHONUNBUFFERED=1 torchrun --standalone --nproc_per_node=4 \\
-        -m flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification \\
-        --num_tokens_per_rank 256 --num_topk 4 --num_total_experts 32 \\
-        --hidden 2048 --intermediate 1024 --route_distribution balanced
+This module has no standalone correctness runner. Run the numerical and graph
+checks in tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py instead.
 """
 
 from __future__ import annotations

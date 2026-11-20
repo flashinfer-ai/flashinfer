@@ -451,9 +451,6 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
                 )
             )
 
-        if self.topk_reduce_persistent:
-            specs.append(_RegionSpec("topk_reduce_counters", cutlass.Int32, (1,), 16))
-
         # The counter reset prefix ends at l1_token_buffer.  The persistent
         # NVLink phase counter is intentionally placed after this boundary.
         specs += [

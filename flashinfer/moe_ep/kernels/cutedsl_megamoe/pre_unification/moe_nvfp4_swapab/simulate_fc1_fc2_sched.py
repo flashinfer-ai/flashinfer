@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Pure-Python preview of the fused fc1+fc2 static scheduler decode."""
+"""Pure-Python preview of the fused fc1+fc2 static scheduler decode.
+
+Run the installed module with ``python -m
+flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_nvfp4_swapab.simulate_fc1_fc2_sched``.
+"""
 
 import sys
 from enum import IntEnum

@@ -75,10 +75,11 @@ def test_production_modules_do_not_import_mega_runner() -> None:
     package = Path(__file__).parents[2] / "flashinfer" / "moe_ep"
     roots = (
         package / "backends" / "mega" / "kernel" / "sm120" / "mxfp4_mxfp8_bf16_cutedsl",
-        package / "shims" / "sm120" / "cutedsl_megamoe" / "split",
+        package / "shims" / "sm120" / "split_cutedsl",
     )
     offenders: list[str] = []
     for root in roots:
+        assert root.is_dir(), root
         for source in root.rglob("*.py"):
             tree = ast.parse(source.read_text())
             for node in ast.walk(tree):

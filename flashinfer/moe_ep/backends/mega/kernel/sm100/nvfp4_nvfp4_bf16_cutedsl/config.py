@@ -81,7 +81,8 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # dequantized fc1 output before the clamp / gated activation, so callers
     # that quantize ``x_t / s_t`` to NVFP4 recover the per-token range in-kernel.
     enable_fc1_activation_per_token_scale: bool = False
-    # None uses the capacity heuristic; a dictionary supplies explicit knobs.
+    # None looks up compatible offline tuning, then falls back to the capacity
+    # heuristic; a dictionary supplies explicit knobs.
     # "auto" searches inside autotune_v2() for the sources-backed implementation
     # and on the first forward for the legacy implementation.
     knobs: dict | str | None = None

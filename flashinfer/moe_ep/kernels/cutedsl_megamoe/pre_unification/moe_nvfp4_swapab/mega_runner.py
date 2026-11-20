@@ -1512,9 +1512,9 @@ class MegaMoETester:
         One registered root is required because NCCL peer deltas are window
         specific; using one root keeps the existing base-plus-delta mapper ABI.
         """
-        self.mc_base = 0
         if self.local_workspace is not None:
             return
+        self.mc_base = 0
         if self._kernel is None:
             raise RuntimeError(
                 "allocate_workspaces called before self._kernel was instantiated"
@@ -4767,7 +4767,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     Launcher::
 
-        torchrun --nproc_per_node=4 -m pre_unification.moe_nvfp4_swapab.mega_runner \\
+        torchrun --nproc_per_node=4 -m flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_nvfp4_swapab.mega_runner \\
             --num_total_experts 32 --route_distribution balanced
     """
     parser = _build_arg_parser()

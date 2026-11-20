@@ -689,7 +689,7 @@ def test_blackwell_standard_and_genphase_use_native_epilogues(kind, monkeypatch)
         pkg.Sm100BlockScaledMoeConfig(**fields, quant_kind=kind)
     )
     genphase = pkg.Sm100GenphaseSymmBuffer._build_kernel(
-        pkg.Sm100GenphaseMoeConfig(**fields)
+        pkg.Sm100GenphaseMoeConfig(**fields, quant_kind=kind)
     )
     assert type(standard.epilogue).__module__.endswith(
         ".blackwell.inference.mega.block_scaled_swap_ab_fc12_epilogue"

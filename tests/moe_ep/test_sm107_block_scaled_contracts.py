@@ -858,7 +858,7 @@ def test_execution_options_separate_cache_entries(tmp_path, monkeypatch):
 
 
 def _native_inference_kernel(monkeypatch, **overrides):
-    from flashinfer.moe_ep.kernels.cutedsl_megamoe import rubin as src
+    from flashinfer.moe_ep.kernels import cutedsl_megamoe as src
     from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.api import ImplDesc
 
     monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)

@@ -662,9 +662,9 @@ with `kind="mxfp4_mxfp8"` and `kernel_variant="genphase"`.
 Run `tests/moe_ep/test_sm100_mxfp4_mxfp8.py` under `torchrun` for multirank
 weight, staging and shared-workspace graph-replay checks.
 
-The `sm100_nvfp4_nvfp4_bf16_cutedsl_next` and
-`sm100_mxfp8_mxfp8_bf16_cutedsl_next` selectors support `knobs="auto"` through
-`autotune_v2()`. The legacy selectors retain their existing tuner. Standard
+The `sm100_nvfp4_nvfp4_bf16_cutedsl` and
+`sm100_mxfp8_mxfp8_bf16_cutedsl` selectors support `knobs="auto"` through
+`autotune_v2()`. The retained NVFP4 `_legacy` selector keeps its existing tuner. Standard
 `knobs=None` still uses built-in defaults; explicit dictionaries retain the
 legacy spelling and also accept the native dictionaries returned by
 `get_tuned_knobs()`. Pass those results to `create_workspace(..., knobs=knobs)`
@@ -695,9 +695,10 @@ because workspace capacity and actual staged tokens define these workloads.
 
 ## Blackwell GenPhase decoding (explicit opt-in)
 
-The existing SM100 MXFP8 config can select the independently owned GenPhase
-pipeline on SM100/SM103. Existing configurations keep `kernel_variant="inference"`,
-the legacy weight layout, workspace pool keys, knob cache and autotuner.
+The SM100 NVFP4 and MXFP8 configs select standard inference by default.
+Set `kernel_variant="genphase"` to use the GenPhase pipeline on SM100/SM103.
+Both variants use the `sources/` weight helpers, with separate workspace and
+tuning identities. The retained NVFP4 `_legacy` selector uses its own layout.
 
 ```python
 from flashinfer.moe_ep import (
@@ -733,9 +734,9 @@ BF16 reduction, with physical capacity at most 1024 tokens per rank.
 | MXFP4/MXFP8 | 128 | 128 | K128, N128/CGA4 or N64/CGA4 |
 
 NVFP4 uses `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` with
-`kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next"` and
+`kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl"` and
 `kernel_variant="genphase"`. E4M3/E5M2 and mixed MXFP4/MXFP8 use the MXFP8
-config with either its existing selector or `_cutedsl_next`. For example,
+config with `kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl"`. For example,
 set `kind="mxfp8_e5m2"` or `kind="mxfp4_mxfp8"` in the example above.
 Early and late routing weights are supported. In-kernel FC2 reduction,
 per-token FC1 scales, SiTU and custom finalization remain unsupported.
@@ -862,11 +863,9 @@ families and their independent source roots.
 
 Backends call the shim package API. The shim imports provider sources, prepares
 weights and workspaces, and preserves its provider's compiler and communication
-contract. Frozen legacy exports still use process-wide raw package names such
-as `common` and `src`; their bootstrap rejects another legacy export already
-loaded in the same process. The Blackwell and Rubin inference exports instead
-use their full FI package namespaces and can coexist. Keep these import rules
-when adding or refreshing an implementation.
+contract. The combined CuTe DSL export uses full FI package namespaces so
+Blackwell, Rubin and Hopper can coexist without process-wide `common` or `src`
+aliases. Other drops retain the import contracts in their vendoring records.
 
 ### 1. Kernel + frontend (the "backend config" it links to)
 

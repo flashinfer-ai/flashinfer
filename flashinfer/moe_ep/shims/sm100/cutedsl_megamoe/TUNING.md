@@ -11,6 +11,9 @@ records from the former `_next` route keep their identities through the rename;
 legacy MXFP8 records do not apply to the replacement. The offline NVFP4 tuner's
 existing `--implementation next` option selects the sources-backed route.
 Keep graph workspace capacity representative of the serving workload.
+Native SM100 knobs use `cluster_shape_mn=(M, N)`. Legacy
+`cluster_shape_mnk` dictionaries require retuning; renaming the key does not
+make the saved tactic compatible.
 
 See [VENDOR.md](../../../kernels/cutedsl_megamoe/VENDOR.md) for source pins and
 [SKILL.md](../../../kernels/cutedsl_megamoe/SKILL.md) for regeneration.
@@ -470,7 +473,7 @@ Support statement: **>= 4.5.2 at full performance** (4.5.2 via the mainloop
 workaround; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
 (4.5.0 fails at `cute.compile`, 4.5.1 unmeasured — the shim warns).
 
-## The knob system (`flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/legacy/tuner.py`, `flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/legacy/autotune.py`)
+## The knob system (`flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/pre_unification/tuner.py`, `flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/pre_unification/autotune.py`)
 
 - `tuner.py` mirrors the kernel team's `tester/solvers/inference_solver.py`
   knob taxonomy (re-audit on every drop).  Correctness knobs change a code
@@ -539,7 +542,7 @@ workaround; 4.5.3 / 4.6.0 / 4.6.1 verified natively fast); < 4.5.2 unsupported
 Knobs are **compile-time** kernel parameters, resolved **once per session**
 at workspace allocation and keyed on the buffer capacity `num_max_tokens` —
 never on the runtime token count.  `knobs=None` resolves through the
-persistent knob cache (`flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/legacy/knob_cache.py`, offline-tuned winners keyed on
+persistent knob cache (`flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/pre_unification/knob_cache.py`, offline-tuned winners keyed on
 device/dtype/world-size/geometry/wire/token-bucket; path via
 `FLASHINFER_MOE_EP_KNOB_CACHE`) before falling back to the built-in
 `default_knobs` heuristic — a pure dict lookup, no compiles or collectives.
@@ -549,7 +552,7 @@ tuning and no shape→kernel dispatch.  Explicitly, what does NOT happen when
 a shape comes in:
 
 - **No kernel lookup by shape.**  The frontend holds exactly ONE compiled
-  kernel (single-slot cache: `_mega` + `_mega_key` in `flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/legacy/nvfp4.py`),
+  kernel (single-slot cache: `_mega` + `_mega_key` in `flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/pre_unification/nvfp4.py`),
   compiled for `num_max_tokens`.  Every incoming token count launches that
   same kernel and slices the padded buffer `[:num_tokens]`.  The per-launch
   "cache" (`_launch_cache_key`: raw data_ptrs + token count + stream) only
@@ -683,7 +686,7 @@ more after the sweep (unless it happened to be timed last).
 sequenceDiagram
     autonumber
     participant B as Backend.compute()<br/>(first forward only)
-    participant A as autotune_knobs<br/>(flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/legacy/autotune.py)
+    participant A as autotune_knobs<br/>(flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/pre_unification/autotune.py)
     participant F as Frontend
     participant C as cute.compile
     participant D as torch.distributed

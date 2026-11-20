@@ -291,14 +291,18 @@ def test_cache_accepts_old_and_new_keywords(tmp_path, monkeypatch):
 def test_reference_accepts_legacy_keyword_without_duplicate_argument(name, monkeypatch):
     helpers = importlib.import_module(f"{_SHIM}.kernel_helpers")
     function = getattr(helpers, name)
+
+    def reference(apply_topk_in_fc1=False):
+        return {"apply_topk_in_fc1": apply_topk_in_fc1}
+
     monkeypatch.setattr(
         helpers.importlib,
         "import_module",
         lambda *_: SimpleNamespace(
             **{
-                name: lambda **kwargs: kwargs,
-                "compute_megamoe_reference": lambda **kwargs: kwargs,
-                "compute_megamoe_reference_mxfp8_bf16": lambda **kwargs: kwargs,
+                name: reference,
+                "compute_megamoe_reference": reference,
+                "compute_megamoe_reference_mxfp8_bf16": reference,
             }
         ),
     )

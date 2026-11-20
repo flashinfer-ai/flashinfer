@@ -8,7 +8,7 @@ wired for SM107.
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
     torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
-        --dtype nvfp4 --hidden 7168 --intermediate 2048 \
+        --dtype nvfp4 --implementation next --hidden 7168 --intermediate 2048 \
         --num-experts 256 --topk 8 --max-tokens 8 512 2048
 
 Hopper Humming MXFP4 fused (the scale ABI is selected automatically)::

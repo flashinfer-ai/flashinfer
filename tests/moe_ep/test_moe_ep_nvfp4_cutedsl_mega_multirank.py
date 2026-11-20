@@ -4,8 +4,9 @@ Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
-(``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification``.
+(``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``). Kernel sources live under
+``flashinfer.moe_ep.kernels.cutedsl_megamoe`` and adapters under
+``flashinfer.moe_ep.shims.sm100.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -33,9 +34,7 @@ import pytest
 
 from flashinfer.moe_ep import FinalizeMode
 
-# This test verifies the mega path only through the cutedsl_megamoe shim public
-# API (``flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification``); it never imports the
-# src/ kernel packages directly, so a new src/ drop can't silently break it.
+# The retained frontend supplies input and reference helpers for both NVFP4 routes.
 pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification")
 
 
@@ -2138,11 +2137,17 @@ def test_cutedsl_config_exposes_finalization_and_ikr(config_name, kernel_name):
 def test_cutedsl_deferred_output_rejects_incompatible_modes(config_name, incompatible):
     from flashinfer import moe_ep
 
+    selector = (
+        {"kernel_name": "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy"}
+        if config_name == "Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig"
+        else {}
+    )
     with pytest.raises(ValueError, match="finalize_mode=NONE requires"):
         getattr(moe_ep, config_name)(
             intermediate_size=128,
             top_k=2,
             finalize_mode=FinalizeMode.NONE,
+            **selector,
             **incompatible,
         )
 
@@ -2395,3 +2400,81 @@ def test_nvfp4_minimax_multirank(check):
         _run_mega_layer(rank, world_size, quantize_input=True, **kwargs)
     else:
         _run_mega_torch_oracle(rank, world_size, **kwargs)
+
+
+@pytest.mark.arch_blackwell
+def test_public_nvfp4_prepared_weights_forward_and_graph():
+    _require_cuda()
+    import torch
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        nvfp4_quantize_per_block_16,
+    )
+
+    rank, world = _launcher_ranks()
+    boot = moe_ep.BootstrapConfig(rank=rank, world_size=world)
+    moe_ep.ensure_moe_ep_cuda_device(boot)
+    config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128, top_k=3, knobs={}
+    )
+    runtime = moe_ep.bootstrap_moe_ep_runtime(
+        boot, create_mega_kernel(config).runtime_requirements(boot)
+    )
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(97 + rank)
+        legs = []
+        for shape in ((4, 256, 256), (4, 256, 128)):
+            values = torch.randn(shape, device="cuda", generator=generator) * 0.1
+            q, sf = nvfp4_quantize_per_block_16(values.reshape(-1, shape[-1]), 1.0)
+            legs.append(
+                (
+                    q.view(torch.uint8).reshape(*shape[:-1], shape[-1] // 2),
+                    sf.view(torch.uint8).reshape(*shape[:-1], shape[-1] // 16),
+                )
+            )
+        pack = moe_ep.MoEWeightPack(legs[0][0], legs[1][0], legs[0][1], legs[1][1])
+        fleet = moe_ep.FleetParams(4 * world, 17, 256)
+        x = torch.randn(
+            17, 256, device="cuda", dtype=torch.bfloat16, generator=generator
+        )
+        scores, ids = torch.randn(
+            17, 4 * world, device="cuda", generator=generator
+        ).topk(3, dim=-1)
+        inputs = moe_ep.MoEEpTensors(x, ids, scores.softmax(-1))
+        layer = moe_ep.MoEEpMegaLayer(
+            boot, fleet, pack, moe_ep.MegaConfig(megakernel=config)
+        )
+        try:
+            expected = layer.forward(inputs).clone()
+        finally:
+            layer.destroy()
+        transformed = moe_ep.preprocess_nvfp4_cutedsl_mega_weights(
+            pack, intermediate_size=128, hidden_size=256
+        )
+        layer = moe_ep.MoEEpMegaLayer(
+            boot,
+            fleet,
+            None,
+            moe_ep.MegaConfig(
+                megakernel=config,
+                transformed_weights=transformed,
+                preprocess_weights=False,
+            ),
+        )
+        try:
+            actual = layer.forward(inputs).clone()
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.graph(graph):
+                    output = layer.forward(inputs)
+                for _ in range(3):
+                    graph.replay()
+                    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+            finally:
+                graph.reset()
+        finally:
+            layer.destroy()
+    finally:
+        moe_ep.finalize_moe_ep_runtime(runtime)

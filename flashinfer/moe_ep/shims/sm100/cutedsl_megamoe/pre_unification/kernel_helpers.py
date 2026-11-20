@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 
 # --- eager: light, import-safe (no cutlass/nvshmem pulled at module load) ---
 from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.common.host_utils import (
@@ -158,16 +159,22 @@ def _reference_with_routing_weight_name(
     apply_routing_weights_before_fc2,
 ):
     function = getattr(importlib.import_module(module_name), function_name)
-    return function(
-        *args,
-        apply_topk_in_fc1=apply_routing_weights_before_fc2,
-        **kwargs,
-    )
+    bound = inspect.signature(function).bind_partial(*args, **kwargs)
+    if (
+        apply_routing_weights_before_fc2 is not None
+        or "apply_topk_in_fc1" not in bound.arguments
+    ):
+        bound.arguments["apply_topk_in_fc1"] = (
+            False
+            if apply_routing_weights_before_fc2 is None
+            else apply_routing_weights_before_fc2
+        )
+    return function(*bound.args, **bound.kwargs)
 
 
 @deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def compute_megamoe_reference_bf16_mxfp8(
-    *args, apply_routing_weights_before_fc2=False, **kwargs
+    *args, apply_routing_weights_before_fc2=None, **kwargs
 ):
     return _reference_with_routing_weight_name(
         "flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_mxfp8_bf16_glu.mega_reference_mxfp8_bf16",
@@ -180,7 +187,7 @@ def compute_megamoe_reference_bf16_mxfp8(
 
 @deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def compute_megamoe_reference_bf16(
-    *args, apply_routing_weights_before_fc2=False, **kwargs
+    *args, apply_routing_weights_before_fc2=None, **kwargs
 ):
     return _reference_with_routing_weight_name(
         "flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_bf16_glu.mega_reference_bf16",

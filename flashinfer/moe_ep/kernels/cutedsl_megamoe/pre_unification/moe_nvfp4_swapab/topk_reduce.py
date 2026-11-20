@@ -278,7 +278,9 @@ class TopkReduce:
             raise ValueError("num_remote_nodes must be non-negative")
         if persistent and self.num_remote_nodes:
             raise ValueError("Persistent reduction requires local combine.")
-        if vector_bytes is None and self.num_remote_nodes:
+        if self.num_remote_nodes:
+            if vector_bytes not in (None, 16):
+                raise ValueError("Internode BF16 reduction requires vector_bytes=16.")
             vector_bytes = 16
         self.batch_invariant = batch_invariant
         self.num_topk = int(num_topk)
@@ -307,11 +309,14 @@ class TopkReduce:
             and not self.num_remote_nodes
             and not batch_invariant
             and vector_bytes in (None, 16)
+            and (vector_bytes is not None or self.hidden % (128 // combine_format.act_dtype.width) == 0)
         )
         if self.use_scalar_math and combine_format.name != "bf16":
             if not (
                 self._use_sm90_static
                 and combine_format.act_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
+                and combine_format.scale_dtype is cutlass.Float8E8M0FNU
+                and combine_format.scale_block == 32
             ):
                 raise ValueError(
                     f"sm_arch={sm_arch!r} does not support {combine_format.name!r} "
@@ -1325,7 +1330,7 @@ class TopkReduce:
                     value = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
                     if cutlass.const_expr(is_fp8):
                         value.store(term.load().to(cutlass.Float32))
-                    elif cutlass.const_expr(os.environ.get("MEGA_F4CVT_USE_MANUAL", "0") == "1"):
+                    elif cutlass.const_expr(self.f4cvt_use_manual):
                         cvt_e2m1_to_fp32_optimal_ptx(term, value)
                     else:
                         cvt_e2m1_to_fp32_cvt_ptx(term, value)

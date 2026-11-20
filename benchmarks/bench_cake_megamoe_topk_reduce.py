@@ -67,7 +67,7 @@ _ATOL = 1e-2
 _RTOL = 1e-2
 _CUTEDSL_SOURCE = "flashinfer/moe_ep/kernels/cutedsl_megamoe/pre_unification/moe_nvfp4_swapab/topk_reduce.py"
 _CUTEDSL_SOURCE_SHA256 = (
-    "d796ab6145d89b4c45a1f5177406a3d2b08740ac46442336d69aa8f38a4cc900"
+    "08948e211855f4250e7f4a610467b9354a0e36e74c8b2caaac0f698b3f12a18f"
 )
 _RUBIN_CUTEDSL_SOURCE = (
     "flashinfer/moe_ep/kernels/cutedsl_megamoe/sources/helpers/topk_reduce.py"

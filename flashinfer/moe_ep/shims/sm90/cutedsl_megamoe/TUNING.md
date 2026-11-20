@@ -581,7 +581,7 @@ drop's `*_mega_us` columns are profiler-extracted kernel time only.
 ## Next levers
 
 1. **Fused staging kernel** — port the SM100 tree's single-launch
-   quant+repack (`flashinfer/moe_ep/shims/sm90/cutedsl_megamoe/quant_stage.py` / `FLASHINFER_MEGA_FUSED_STAGE`)
+   quant+repack (`flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/pre_unification/quant_stage.py` / `FLASHINFER_MEGA_FUSED_STAGE`)
    to the SM90 fp8 staging path; it is the bulk of the e2e overhead.
 2. **Heuristic re-calibration** — the token-bucket table was derived with
    a mega-only, no-post-warmup-alignment metric; under a metric that

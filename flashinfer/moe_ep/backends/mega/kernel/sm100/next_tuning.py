@@ -78,6 +78,12 @@ def tune_one(args, rank, world_size, max_tokens):
             if args.base_knobs
             else resolve_knobs(cfg, sm_count=sms, live_tokens=live)[0]
         )
+        if "cluster_shape_mnk" in base:
+            raise ValueError(
+                "cluster_shape_mnk belongs to the retired legacy tuning schema. "
+                "Retune with native cluster_shape_mn=(M, N); renaming an old "
+                "cache entry does not make it compatible."
+            )
         base = {k: tuple(v) if isinstance(v, list) else v for k, v in base.items()}
         constraints = (
             {k: v for k, v in base.items() if k != "schedule_policy"}

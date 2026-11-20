@@ -554,13 +554,13 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         expected_instruction_m = 256 if self.use_2cta_instrs else 128
         if instruction_m != expected_instruction_m:
             raise ValueError(
-                f"{'2CTA' if self.use_2cta_instrs else '1CTA'} Rubin MMA requires "
+                f"{'2CTA' if self.use_2cta_instrs else '1CTA'} Blackwell MMA requires "
                 f"instruction M={expected_instruction_m}, got {instruction_m}."
             )
         expected_instruction_k = self.quant_kind.instruction_k(self.mma_k_mode)
         if instruction_k != expected_instruction_k:
             raise ValueError(
-                f"{self.quant_kind} requires Rubin 2x instruction K={expected_instruction_k}, got {instruction_k}."
+                f"{self.quant_kind} requires Blackwell instruction K={expected_instruction_k}, got {instruction_k}."
             )
         if (instruction_m, instruction_n) != (mma_m, mma_n):
             raise NotImplementedError("Blackwell Genphase MegaMoE does not implement M/N instruction repetition.")

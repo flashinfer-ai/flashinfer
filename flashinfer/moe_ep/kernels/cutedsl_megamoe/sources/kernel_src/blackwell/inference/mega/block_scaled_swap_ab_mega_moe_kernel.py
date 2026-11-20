@@ -425,6 +425,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             if self.token_comm.relay_slot_count > 0
             else None
         )
+        if internode_reduce is not None and problem_desc.get("batch_invariant", False):
+            raise ValueError("batch_invariant does not support internode partial reduction.")
         self._topk_reduce = (
             None
             if self.reduce_topk_in_kernel or self.skip_topk_reduce

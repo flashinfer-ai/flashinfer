@@ -228,6 +228,8 @@ class SwapABFp8GluEpilogue:
     ) -> None:
         if fc2_activation_scale_k not in (64, 128):
             raise ValueError("fc2_activation_scale_k must be 64 or 128")
+        if fp8_scale_mode == "mxfp4_hybrid" and fc2_activation_scale_k != 64:
+            raise ValueError("mxfp4_hybrid requires fc2_activation_scale_k=64.")
         self.fc2_activation_scale_k = fc2_activation_scale_k
         self.fc1_output_dtype = fc1_output_dtype
         self.fc1_output_layout = fc1_output_layout

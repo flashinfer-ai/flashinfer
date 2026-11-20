@@ -1020,6 +1020,39 @@ def test_numerical_expert_parallel_per_token_blackwell_only(provider, request):
         moe_ep.finalize_moe_ep_runtime(runtime)
 
 
+def _mxfp8_wire_reference(x, ids, scores, w13, w2, config, kind):
+    """Torch expert math with independently dequantized operands and return scales."""
+    import torch
+    from .test_mxfp8_megamoe_batch_invariant import _quantize
+
+    def quantize(values, quant_kind):
+        q, sf = _quantize(values, quant_kind)
+        return q.float() * sf.float().repeat_interleave(32, dim=-1)
+
+    x = quantize(x, kind)
+    w13 = quantize(w13, kind)
+    w2 = quantize(w2, kind)
+    acc = torch.zeros_like(x, dtype=torch.float32)
+    for slot in range(ids.shape[1]):
+        for expert in range(w13.shape[0]):
+            rows = (ids[:, slot] == expert).nonzero(as_tuple=True)[0]
+            if not rows.numel():
+                continue
+            gate, up = (x[rows] @ w13[expert].T).chunk(2, dim=-1)
+            limit = config.gate_up_clamp
+            gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
+            act = (
+                (up + config.swiglu_beta)
+                * gate
+                * torch.sigmoid(config.swiglu_alpha * gate)
+            )
+            act *= scores[rows, slot, None]
+            term = quantize(act, kind) @ w2[expert].T
+            wire = quantize(term.bfloat16().float(), "mxfp8_e4m3")
+            acc[rows] += wire
+    return acc.bfloat16()
+
+
 @pytest.mark.gpu_2
 @pytest.mark.parametrize("kind", ("mxfp8_e4m3", "mxfp8_e5m2"))
 def test_numerical_expert_parallel_blackwell_only_mxfp8_wire(kind, request):
@@ -1028,6 +1061,7 @@ def test_numerical_expert_parallel_blackwell_only_mxfp8_wire(kind, request):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
     from ._megamoe_bi_helpers import (
+        all_gather_rows,
         assert_collectively,
         fail_stop_distributed,
         remote_routes,
@@ -1049,6 +1083,19 @@ def test_numerical_expert_parallel_blackwell_only_mxfp8_wire(kind, request):
     try:
         x, scores, ids, weights = _problem(rank, world, HIDDEN, INTERMEDIATE)
         ids = remote_routes(ids, rank, world, 4)
+        global_w13 = all_gather_rows(weights.w13)
+        global_w2 = all_gather_rows(weights.w2)
+
+        def reference(route_ids, route_scores):
+            return _mxfp8_wire_reference(
+                x[:17], route_ids, route_scores, global_w13, global_w2, config, kind
+            )
+
+        from .test_mxfp8_megamoe_batch_invariant import _quantize
+
+        _, activation_sf = _quantize(x[:17], kind)
+        assert (activation_sf.float() != 1).any()
+        expected = reference(ids[:17], scores[:17])
         _exercise(
             config,
             kind,
@@ -1067,25 +1114,51 @@ def test_numerical_expert_parallel_blackwell_only_mxfp8_wire(kind, request):
                 x[:17].clone(), ids[:17].clone(), scores[:17].clone()
             )
             baseline = layer.forward(args).clone()
-            for peer in range(world):
-                if peer == rank:
-                    continue
-                mask = ids[:17].div(4, rounding_mode="floor") == peer
-                assert_collectively(
-                    mask.any(), x.device, "missing MXFP8 remote traffic"
-                )
-                args.topk_ids.copy_(ids[:17].masked_fill(mask, -1))
-                args.topk_weights.copy_(scores[:17].masked_fill(mask, float("nan")))
-                masked = layer.forward(args).clone()
-                assert_collectively(
-                    torch.isfinite(masked).all()
-                    and (masked.view(torch.int16) != baseline.view(torch.int16)).any(),
-                    x.device,
-                    "removing MXFP8 peer had no observable contribution",
-                )
-                args.topk_ids.copy_(ids[:17])
-                args.topk_weights.copy_(scores[:17])
-                assert_bits(layer.forward(args), baseline, "quantized peer restore")
+            assert_reference(baseline, expected, 0.025, "MXFP8 peer-scale oracle")
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                graph_output = layer.forward(args)
+            try:
+                for peer in range(world):
+                    if peer == rank:
+                        continue
+                    mask = ids[:17].div(4, rounding_mode="floor") == peer
+                    assert_collectively(
+                        mask.any(), x.device, "missing MXFP8 remote traffic"
+                    )
+                    args.topk_ids.copy_(ids[:17].masked_fill(mask, -1))
+                    args.topk_weights.copy_(scores[:17].masked_fill(mask, float("nan")))
+                    masked = layer.forward(args).clone()
+                    masked_expected = reference(
+                        ids[:17].masked_fill(mask, -1), scores[:17].masked_fill(mask, 0)
+                    )
+                    assert_reference(
+                        masked, masked_expected, 0.025, "masked MXFP8 peer-scale oracle"
+                    )
+                    graph.replay()
+                    assert_reference(
+                        graph_output,
+                        masked_expected,
+                        0.025,
+                        "captured MXFP8 peer-scale oracle",
+                    )
+                    assert_collectively(
+                        torch.isfinite(masked).all()
+                        and (
+                            masked.view(torch.int16) != baseline.view(torch.int16)
+                        ).any(),
+                        x.device,
+                        "removing MXFP8 peer had no observable contribution",
+                    )
+                    args.topk_ids.copy_(ids[:17])
+                    args.topk_weights.copy_(scores[:17])
+                    assert_bits(layer.forward(args), baseline, "quantized peer restore")
+                    graph.replay()
+                    assert_bits(
+                        graph_output, baseline, "captured quantized peer restore"
+                    )
+            finally:
+                graph.reset()
     except BaseException as error:
         fail_stop_distributed(error, world)
         raise

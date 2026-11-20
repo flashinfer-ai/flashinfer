@@ -524,12 +524,20 @@ def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_persistent_finalize():
 @cuda_13_required
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
-def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
+@pytest.mark.parametrize("persistent_requested", [False, True])
+def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce(
+    persistent_requested,
+):
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
-    rank = _run_mega_layer(rank, world_size, in_kernel_fc2_reduce=True)
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        in_kernel_fc2_reduce=True,
+        use_persistent_finalize_kernel=persistent_requested,
+    )
     print(
         f"rank {rank}: sm100_bf16_mxfp8_bf16_cutedsl mega layer "
         "(in_kernel_fc2_reduce) matches reference within tolerance"

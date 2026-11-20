@@ -30,7 +30,9 @@ def _package_text(*parts: str) -> str:
     else:
         package = _PACKAGE_NAME
     resource = importlib_resources.files(package)
-    return resource.joinpath(*parts[1:]).read_text(encoding="utf-8")
+    for part in parts[1:]:
+        resource = resource.joinpath(part)
+    return resource.read_text(encoding="utf-8")
 
 
 def _private_source(name: str) -> str:
