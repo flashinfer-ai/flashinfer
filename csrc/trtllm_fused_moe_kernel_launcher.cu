@@ -3055,19 +3055,20 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
 
 namespace {
 
-void run_staged_moe_finalize(btg::Dtype dtype_elt, btg::Dtype dtype_exp_w, bool use_deep_seek_fp8,
-                             TensorView gemm2_output, TensorView output,
-                             Optional<TensorView> const& expert_weights,
-                             TensorView expanded_idx_to_permuted_idx,
-                             TensorView total_num_padded_tokens, int64_t num_tokens,
-                             int64_t num_experts, int64_t top_k, bool enable_pdl,
-                             bool use_routing_scales_on_input,
-                             Optional<TensorView> const& gemm2_output2) {
+void run_staged_moe_finalize(
+    btg::Dtype dtype_elt, btg::Dtype dtype_exp_w, bool use_deep_seek_fp8, TensorView gemm2_output,
+    TensorView output, Optional<TensorView> const& expert_weights,
+    TensorView expanded_idx_to_permuted_idx, TensorView total_num_padded_tokens, int64_t num_tokens,
+    int64_t num_experts, int64_t top_k, bool enable_pdl, bool use_routing_scales_on_input,
+    Optional<TensorView> const& gemm2_output2, bool zero_rows_without_local_expert,
+    bool single_expert_tokens_done = false) {
   moe::dev::finalize::Data finalizeData;
   finalizeData.mDtypeElt = dtype_elt;
   finalizeData.mDtypeExpW = dtype_exp_w;
   finalizeData.mUsePdl = enable_pdl;
   finalizeData.mUseDeepSeekFp8 = use_deep_seek_fp8;
+  finalizeData.mSingleExpertTokensDone = single_expert_tokens_done;
+  finalizeData.mZeroRowsWithoutLocalExpert = zero_rows_without_local_expert;
   finalizeData.inPtr = const_cast<void*>(gemm2_output.data_ptr());
   finalizeData.inPtr2 =
       gemm2_output2.has_value() ? const_cast<void*>(gemm2_output2.value().data_ptr()) : nullptr;
@@ -3421,13 +3422,14 @@ Array<Optional<Tensor>> trtllm_moe_run_routing(
   return launcher->collect_routing_outputs();
 }
 
-void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
-                             Optional<TensorView> const& expert_weights,
-                             TensorView expanded_idx_to_permuted_idx,
-                             TensorView total_num_padded_tokens, int64_t num_tokens,
-                             int64_t num_experts, int64_t top_k, int64_t hidden_size,
-                             bool enable_pdl, bool use_routing_scales_on_input,
-                             Optional<TensorView> const& gemm2_output2) {
+// Checks the tensors and extents of a BF16 staged finalize; false when there is no token to
+// finalize.
+static bool check_staged_moe_finalize_args(TensorView gemm2_output, TensorView output,
+                                           Optional<TensorView> const& expert_weights,
+                                           TensorView expanded_idx_to_permuted_idx,
+                                           TensorView total_num_padded_tokens, int64_t num_tokens,
+                                           int64_t num_experts, int64_t top_k, int64_t hidden_size,
+                                           Optional<TensorView> const& gemm2_output2) {
   TVM_FFI_ICHECK_GE(num_tokens, 0) << "Staged MoE finalize: num_tokens must be non-negative.";
   TVM_FFI_ICHECK_GT(num_experts, 0) << "Staged MoE finalize: num_experts must be positive.";
   TVM_FFI_ICHECK_GT(top_k, 0) << "Staged MoE finalize: top_k must be positive.";
@@ -3485,7 +3487,7 @@ void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
         << "Staged MoE finalize: both inputs must have the same padded hidden size.";
   }
   if (num_tokens == 0) {
-    return;
+    return false;
   }
 
   TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.dtype(), dl_int32)
@@ -3519,12 +3521,53 @@ void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
     TVM_FFI_ICHECK_EQ(weights.numel(), expanded_count)
         << "Staged MoE finalize: expert_weights must have num_tokens * top_k entries.";
   }
+  return true;
+}
 
+// Reduces each token's expert rows into its `output` row. Tokens without a local expert get a zero
+// row, or keep theirs as it is without zero_rows_without_local_expert.
+void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output,
+                             Optional<TensorView> const& expert_weights,
+                             TensorView expanded_idx_to_permuted_idx,
+                             TensorView total_num_padded_tokens, int64_t num_tokens,
+                             int64_t num_experts, int64_t top_k, int64_t hidden_size,
+                             bool enable_pdl, bool use_routing_scales_on_input,
+                             Optional<TensorView> const& gemm2_output2,
+                             bool zero_rows_without_local_expert) {
+  if (!check_staged_moe_finalize_args(gemm2_output, output, expert_weights,
+                                      expanded_idx_to_permuted_idx, total_num_padded_tokens,
+                                      num_tokens, num_experts, top_k, hidden_size, gemm2_output2)) {
+    return;
+  }
   run_staged_moe_finalize(btg::Dtype::Bfloat16, expert_weights_dtype(expert_weights),
                           /*use_deep_seek_fp8=*/false, gemm2_output, output, expert_weights,
                           expanded_idx_to_permuted_idx, total_num_padded_tokens, num_tokens,
                           num_experts, top_k, enable_pdl, use_routing_scales_on_input,
-                          gemm2_output2);
+                          gemm2_output2, zero_rows_without_local_expert);
+}
+
+// Finalize after an FC2 whose epilogue already stored each token with exactly one local expert
+// in `output`, scaled by its expert weight: zero rows for tokens without a local expert (with
+// zero_rows_without_local_expert) and the weighted sum of `gemm2_output` rows for tokens with
+// several.
+void trtllm_moe_run_finalize_multi_expert_tokens(
+    TensorView gemm2_output, TensorView output, TensorView expert_weights,
+    TensorView expanded_idx_to_permuted_idx, TensorView total_num_padded_tokens, int64_t num_tokens,
+    int64_t num_experts, int64_t top_k, int64_t hidden_size, bool enable_pdl,
+    bool zero_rows_without_local_expert) {
+  if (!check_staged_moe_finalize_args(gemm2_output, output, expert_weights,
+                                      expanded_idx_to_permuted_idx, total_num_padded_tokens,
+                                      num_tokens, num_experts, top_k, hidden_size,
+                                      /*gemm2_output2=*/Optional<TensorView>())) {
+    return;
+  }
+  run_staged_moe_finalize(btg::Dtype::Bfloat16, expert_weights_dtype(expert_weights),
+                          /*use_deep_seek_fp8=*/false, gemm2_output, output, expert_weights,
+                          expanded_idx_to_permuted_idx, total_num_padded_tokens, num_tokens,
+                          num_experts, top_k, enable_pdl,
+                          /*use_routing_scales_on_input=*/false,
+                          /*gemm2_output2=*/Optional<TensorView>(), zero_rows_without_local_expert,
+                          /*single_expert_tokens_done=*/true);
 }
 
 void trtllm_moe_run_deepseek_fp8_activation(
@@ -6942,6 +6985,60 @@ Array<Optional<Tensor>> trtllm_mxint4_block_scale_moe(
       .to_ffi();
 }
 
+// The tile_N the FP4 block-scale MoE runs without a tuned tactic: the first tile of
+// tileFallbackOrder() whose default config is valid and loads, as trtllm_fp4_block_scale_moe
+// retries. -1 when no tile can run. Call it on the launch's device (cubin loads are per context).
+int64_t trtllm_fp4_moe_default_tile_n(int64_t const dtype_act_, int64_t const dtype_weights_,
+                                      int64_t const num_tokens, int64_t const top_k,
+                                      int64_t const hidden_size, int64_t const hidden_size_output,
+                                      int64_t const intermediate_size,
+                                      int64_t const num_local_experts, int64_t const act_type,
+                                      bool const use_per_token_scaling) {
+  using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
+  auto const dtype_act = static_cast<btg::Dtype>(dtype_act_);
+  auto const dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
+  auto const bias_type = batchedGemm::gemm::BiasType::None;
+  auto const tile_ns =
+      FP4BlockScaleLauncher::getSupportedTileNums(dtype_act, dtype_weights, bias_type);
+  std::map<int32_t, bool> tiles;  // tileFallbackOrder() reads the keys only.
+  for (auto const tile_N : tile_ns) {
+    tiles[tile_N] = true;
+  }
+  // The runner filters its configs for the current GPU: key the cache by device and arch, as the
+  // launcher's runner cache does.
+  int device = -1, major = 0, minor = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+  static thread_local std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool, int, int, int>,
+                               RunnerType>
+      runners;
+  for (int64_t const tile_N : tileFallbackOrder(
+           selectDefaultTileN(tile_ns, num_tokens, top_k, num_local_experts), tiles)) {
+    std::tuple const key{dtype_act_, dtype_weights_, tile_N, act_type, use_per_token_scaling,
+                         major,      minor,          device};
+    auto it = runners.find(key);
+    if (it == runners.end()) {
+      // The runner prepare_moe_runner() builds for an FP4 launch (see getValidConfigs).
+      it = runners
+               .try_emplace(key, dtype_act, dtype_weights, /*useDeepSeekFp8=*/false,
+                            static_cast<int32_t>(tile_N), static_cast<ActivationType>(act_type),
+                            /*useShuffledMatrix=*/true, batchedGemm::gemm::MatrixLayout::MajorK,
+                            bias_type, use_per_token_scaling,
+                            use_per_token_scaling && dtype_act == btg::Dtype::E2m1)
+               .first;
+    }
+    try {
+      (void)it->second.getDefaultValidConfigIndex(
+          top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, hidden_size_output);
+      return tile_N;
+    } catch (tensorrt_llm::kernels::NoLoadableKernelError const&) {
+    } catch (tensorrt_llm::kernels::NoValidConfigError const&) {
+    }
+  }
+  return -1;
+}
+
 Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     int64_t const dtype_act_, int64_t const dtype_weights_,
     Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
@@ -7509,6 +7606,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_routing_fp8_block_scale,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_deepseek_fp8_activation,
                               trtllm_moe_run_deepseek_fp8_activation);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_finalize, trtllm_moe_run_finalize);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_moe_run_finalize_multi_expert_tokens,
+                              trtllm_moe_run_finalize_multi_expert_tokens);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_per_tensor_scale_moe, trtllm_fp8_per_tensor_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_per_tensor_scale_routed_moe,
                               trtllm_fp8_per_tensor_scale_routed_moe);
@@ -7517,6 +7616,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_moe_default_tile_n, trtllm_fp4_moe_default_tile_n);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_localized_moe_configs,
                               trtllm_get_valid_localized_moe_configs);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_factorizations,

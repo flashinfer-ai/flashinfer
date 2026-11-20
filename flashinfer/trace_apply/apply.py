@@ -368,6 +368,11 @@ def _make_wrapper(
             extractor_map = extractor_maps[template_idx]
             if extractor_map is None:
                 return original(*args, **kwargs)
+            # A template may give equivalent caller inputs the one form its
+            # traced definition records; the original call keeps the caller's.
+            canonical_inputs = getattr(template, "canonical_inputs", None)
+            if canonical_inputs is not None:
+                namespace = canonical_inputs(namespace)
             if stateful_adapter is not None:
                 self_obj = args[0] if args else None
                 namespace = plan_capture.augment_namespace(

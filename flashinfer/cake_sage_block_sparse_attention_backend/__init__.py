@@ -242,29 +242,62 @@ _ONE_LAUNCH_RECORD = "quantize_qkv_c8w16"
 #: Selected KV blocks per row from which each architecture runs another attention
 #: build than the default, the highest threshold first.  ``attention_sd`` keeps two S
 #: buffers per softmax group, so the next QK^T of a group does not wait for its P.V; it
-#: pays off from about 24 blocks a row on both architectures.  On SM100,
+#: pays off from about 23 blocks a row on both architectures.  On SM100,
 #: ``attention_qs`` (the next QK^T starts as soon as S is loaded) pays off from about
 #: ten.  Below every threshold, and when a record is absent, the default build runs.
 #: All these builds compute the same bits.
 _ATTENTION_ROUTES = {
-    "sm_100a": (("attention_sd", 24), ("attention_qs", 10)),
-    "sm_103a": (("attention_sd", 24),),
+    "sm_100a": (("attention_sd", 23), ("attention_qs", 10)),
+    "sm_103a": (("attention_sd", 23),),
 }
 #: The tail-split build of ``attention_sd`` and, per architecture, the selected blocks a
-#: row from which it runs (it pays off from about 24 on SM100 and 30 on SM103): clusters
-#: of two CTAs, where the tiles of the last, partial wave of the
-#: persistent grid run as two halves of their KV blocks, one per CTA of a cluster, and
-#: the first half folds the second half's output and softmax statistics into its own.
+#: row from which it runs (it pays off from about 24 on SM100 and 30 on SM103; on SM103
+#: ``attention_sd_tsplit_p3`` below takes the split rows from 24 to 64 blocks a row once
+#: the grid holds a tile per SM): clusters of two CTAs, where the tiles of the last,
+#: partial wave of the persistent grid run as two halves of their KV blocks, one per
+#: CTA of a cluster, and the first half folds the second half's output and softmax
+#: statistics into its own.
 #: A split tile sums its softmax in another order (within the kernel's tolerances, the
 #: same bits on every run); the split depends on how the grid fills.
 _TAIL_SPLIT_ROLE = "attention_sd_tsplit"
 _TAIL_SPLIT = {"sm_100a": 24, "sm_103a": 32}
+#: The tail split of ``attention_sdp3`` (below) and, per architecture, the band of
+#: selected blocks a row ``(lo, hi)`` (``hi`` ``None``: no bound) in which it replaces
+#: ``attention_sd_tsplit`` once the grid holds a tile per SM (``total_tiles >= SMs``).
+#: It splits the same tiles, with the occupancy of its own record.  SM100 split rows
+#: keep ``attention_sd_tsplit``.
+_TAIL_SPLIT_P3_ROLE = "attention_sd_tsplit_p3"
+_TAIL_SPLIT_P3 = {"sm_103a": (24, 64)}
 #: The ``p3`` build (a fifth warpgroup merges, scales and stores each tile while the
-#: next tile runs) and, per architecture, the band of selected blocks a row in which it
-#: replaces the default or ``attention_qs`` build when every CTA of the persistent grid
-#: runs at least two tiles (``total_tiles >= 2 x SMs``).  It writes the default bits.
+#: next tile runs) and, per architecture, the band of selected blocks a row
+#: ``(lo, hi, waves)`` in which it replaces the default or ``attention_qs`` build when
+#: every CTA of the persistent grid runs at least ``waves`` tiles
+#: (``total_tiles >= waves x SMs``).  It writes the default bits.
 _P3_ROLE = "attention_p3"
-_P3_BANDS = {"sm_100a": (6, 23), "sm_103a": (16, 23)}
+_P3_BANDS = {"sm_100a": (6, 10, 5), "sm_103a": (8, 22, 2)}
+#: The ``s_dbuf`` build with the ``p3`` epilogue warpgroup and, per architecture, the
+#: windows ``(lo, hi, min_waves, max_waves)`` in which it replaces the build of an
+#: unsplit call: ``lo <= block_sparse_num <= hi`` and ``min_waves x SMs <= total_tiles``
+#: (``< max_waves x SMs``; ``None``: no bound); the tiles per SM may be fractional.
+#: The windows come before ``_P3_BANDS``.  It writes the default bits.
+_SDP3_ROLE = "attention_sdp3"
+_SDP3_BANDS = {
+    "sm_100a": (
+        (6, 10, 0, 5),
+        (9, 9, 5, 42),
+        (10, 10, 5, 12),
+        (11, 22, 0, None),
+        (23, 127, 1, None),
+    ),
+    "sm_103a": (
+        (5, 6, 0, 0.5),
+        (5, 5, 1, 5),
+        (6, 6, 2.5, 5),
+        (7, 7, 3, 5),
+        (6, 22, 1, 2),
+        (23, 127, 1, None),
+    ),
+}
 
 
 def _attention_role(arch: str, block_sparse_num: int) -> str:
@@ -283,13 +316,26 @@ def _p3(arch: str, block_sparse_num: int, tiles: int, sms: int) -> bool:
     return (
         band is not None
         and band[0] <= block_sparse_num <= band[1]
-        and tiles >= 2 * sms
+        and tiles >= band[2] * sms
         and _P3_ROLE in _loader.MODULES
     )
 
 
+def _sdp3(arch: str, block_sparse_num: int, tiles: int, sms: int) -> bool:
+    """Does an unsplit call with ``block_sparse_num`` selected blocks a row and
+    ``tiles`` tiles run the ``attention_sdp3`` build on a device of ``sms`` SMs?"""
+    if _SDP3_ROLE not in _loader.MODULES:
+        return False
+    return any(
+        lo <= block_sparse_num <= hi
+        and tiles >= min_waves * sms
+        and (max_waves is None or tiles < max_waves * sms)
+        for lo, hi, min_waves, max_waves in _SDP3_BANDS.get(arch, ())
+    )
+
+
 def _tail_split(
-    arch: str, tiles: int, block_sparse_num: int, device_index: int
+    arch: str, tiles: int, block_sparse_num: int, device_index: int, p3: bool = False
 ) -> Optional[Tuple[int, int, int]]:
     """``(grid, split_from, items)`` of the tail-split build for a call, else ``None``.
 
@@ -297,10 +343,24 @@ def _tail_split(
     of the tile slots idle and fits twice in them: its tiles, from ``split_from`` on,
     become two items each, and ``items`` is the stream length.  ``None`` below the
     selected-block threshold, without the record, and inside a CUDA-graph capture
-    whose occupancy no eager call has queried yet.
+    whose occupancy no eager call has queried yet.  ``p3=True``: the plan of
+    ``attention_sd_tsplit_p3``, ``None`` outside its band of selected blocks or below
+    a tile per SM.
     """
-    name, min_sel = _TAIL_SPLIT_ROLE, _TAIL_SPLIT.get(arch)
-    if min_sel is None or block_sparse_num < min_sel or name not in _loader.MODULES:
+    if p3:
+        name, band = _TAIL_SPLIT_P3_ROLE, _TAIL_SPLIT_P3.get(arch)
+        if (
+            band is None
+            or block_sparse_num < band[0]
+            or (band[1] is not None and block_sparse_num > band[1])
+            or tiles < _loader.sm_count(device_index)
+        ):
+            return None
+    else:
+        name, min_sel = _TAIL_SPLIT_ROLE, _TAIL_SPLIT.get(arch)
+        if min_sel is None or block_sparse_num < min_sel:
+            return None
+    if name not in _loader.MODULES:
         return None
     resident = _tma_resident(name, device_index)
     if not resident:
@@ -321,7 +381,7 @@ def _tail_split(
 #: argument, ``split`` the tail-split parameters and ``tail`` the PDL flag and the
 #: grid.  Filled outside CUDA-graph capture (a capture may not know the occupancy yet),
 #: so a repeated call pays one dict lookup.  Code that changes ``_ATTENTION_ROUTES``,
-#: ``_TAIL_SPLIT`` or ``_P3_BANDS`` clears it.
+#: ``_TAIL_SPLIT``, ``_TAIL_SPLIT_P3``, ``_P3_BANDS`` or ``_SDP3_BANDS`` clears it.
 _ROUTES: dict = {}
 
 
@@ -338,13 +398,18 @@ def _route(
     items = total_tiles
     split: Tuple[int, ...] = ()
     if role == "attention_sd":
-        plan = _tail_split(arch, total_tiles, block_sparse_num, device_index)
-        if plan is not None:
-            role = _TAIL_SPLIT_ROLE
-            grid, split_from, items = plan
-            split = (split_from,)
-    elif _p3(arch, block_sparse_num, total_tiles, sms):
-        role = _P3_ROLE
+        for p3, name in ((True, _TAIL_SPLIT_P3_ROLE), (False, _TAIL_SPLIT_ROLE)):
+            plan = _tail_split(arch, total_tiles, block_sparse_num, device_index, p3)
+            if plan is not None:
+                role = name
+                grid, split_from, items = plan
+                split = (split_from,)
+                break
+    if not split:
+        if _sdp3(arch, block_sparse_num, total_tiles, sms):
+            role = _SDP3_ROLE
+        elif _p3(arch, block_sparse_num, total_tiles, sms):
+            role = _P3_ROLE
     record, flag = _record(role, pdl)
     hit = (record, items, split, flag + (grid, 1, 1))
     if not torch.cuda.is_current_stream_capturing():
