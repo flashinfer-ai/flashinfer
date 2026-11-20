@@ -130,6 +130,12 @@ def serving_config(
     hint, so at ``expected_m=1`` a group can still span several M blocks; with
     ``n_l2_group=1`` the two CTAs of such a group would compute different M
     blocks and the output would be wrong.
+
+    ``cta_reserve`` is a measured schedule choice: the grid is the SM count less
+    the reserve, in whole CTA pairs. On 212-SM devices the full grid (reserve 0)
+    is faster from ``expected_m`` 36 up (by 2-11% at ``expected_m`` 36 to 4096 on
+    every measured shape) and slower at ``expected_m`` 32 and below, which keep
+    the default reserve.
     """
     if k == 7168:
         if expected_m <= 1:
@@ -138,6 +144,8 @@ def serving_config(
             return 5, 2, "evict_normal", 16, 8
         if sm_count == 148:
             cta_reserve = 8 if arch == "sm_103a" else 20
+        elif sm_count == 212 and expected_m >= 36:
+            cta_reserve = 0
         else:
             cta_reserve = 24
         return 5, 2, "evict_normal", cta_reserve, 8
@@ -145,6 +153,8 @@ def serving_config(
         return 5, 3, "evict_normal", 0, 8
     if expected_m == 2:
         return 5, 2, "evict_normal", 20, 8
+    if sm_count == 212 and expected_m >= 36:
+        return 5, 2, "evict_normal", 0, 8
     return 5, 2, "evict_normal", 24, 8
 
 
@@ -1548,6 +1558,13 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     clock.  On a device whose memory ran at a lower clock (driver 620.43, 3186
     of 4752 MHz) the twin route took 0.99-1.06x the time of plain weights at
     ``expected_m <= 64``; keep plain weights on such a device.
+
+    On 212-SM devices, plain weights run their serving program on the full grid
+    from ``expected_m`` 36; the homed twin is unchanged.  For ``B=64`` weights of
+    ``(4096, 7168)``, plain weights then took 0.95x the time of homed weights at
+    ``expected_m`` 64 and 512 and 0.97x at 4096.  Homed weights stay faster at
+    smaller ``expected_m``: plain weights took 1.04x their time at 36 and
+    1.10-1.35x at 1-32.
 
     Call it outside CUDA graph capture (under capture it returns ``b``).  The
     memory is freed with the returned tensor; a CUDA graph that reads the tensor

@@ -43,7 +43,7 @@ import tvm_ffi
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 
-from ..api_logging import cake_auto_candidates_enabled, flashinfer_api
+from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
     batch_deepgemm_fp8_nt_groupwise_trace,
     bmm_bf16_trace,
@@ -66,7 +66,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
-    get_autotune_process_group,
+    cake_auto_candidate_open,
     is_in_profile_measurement,
 )
 from ..fused_moe.utils import (
@@ -625,6 +625,20 @@ def _cudnn_mm_bf16_requirement(
     return _cudnn_available_or_raise_for_backend(backend)
 
 
+def _require_tma_bf16_k_alignment(backend: str, k: int) -> None:
+    """Check for those gemm BF16 backends like TGV and TTinyGEMM
+    that use TMA.
+    TMA requires that stride is multiple of 16.
+    Since we use BF16 then each element uses 2 bytes.
+    Then K * 2 must be multiple of 16 => K must be multiple of 8.
+    This is why we check here against 8.
+    """
+    if k % 8 != 0:
+        raise ValueError(
+            f"The {backend} backend requires K divisible by 8 for 16-bit operands, got K={k}."
+        )
+
+
 @supported_compute_capability([100, 103, 107])
 def _tgv_gemm_requirement(
     a: torch.Tensor,
@@ -642,6 +656,7 @@ def _tgv_gemm_requirement(
         raise ValueError(
             "You cannot provide an output dtype to the TGV backend. Use the CUTLASS or cuDNN backend instead."
         )
+    _require_tma_bf16_k_alignment("TGV", a.shape[-1])
     # The TGV backend dispatches to the CuTeDSL (cute_ext) implementation
     # by default (see ``_TGV_DEBUG_USE_CPP`` in this module), which requires
     # nvidia-cutlass-dsl. Surface a clear error here when cute_ext is the
@@ -786,6 +801,7 @@ def _tinygemm_mm_bf16_requirement(
         raise ValueError(
             "The TinyGEMM backend requires the output feature dimension to be a multiple of 16."
         )
+    _require_tma_bf16_k_alignment("TinyGEMM", a.shape[-1])
     if out is not None and not out.is_contiguous():
         raise ValueError("The TinyGEMM backend requires a contiguous output tensor.")
     if bias is not None and not bias.is_contiguous():
@@ -1157,6 +1173,7 @@ def _tgv_bmm_bf16_requirement(
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The TGV backend for bmm_bf16 only supports bfloat16 output.")
+    _require_tma_bf16_k_alignment("TGV", A.shape[-1])
     # The C++ TGV kernel is 2D-only, so bmm_bf16 always dispatches to the
     # cute_ext implementation regardless of ``_TGV_DEBUG_USE_CPP``.
     from flashinfer.cute_dsl.availability import is_cute_dsl_available
@@ -1274,35 +1291,9 @@ _CAKE_BF16_BMM_RUNNER = "CakeBf16BmmRunner"
 _CAKE_FP4_GEMM_RUNNER = "CakeFp4GemmRunner"
 
 
-def _cake_auto_candidate_open(runner_class_name: str) -> bool:
-    """Whether ``backend="auto"`` lists the Cake runner of this class now.
-
-    The runner is always the last candidate, so the tuner selects it only
-    while tuning or from a cache entry of its class
-    (:meth:`AutoTuner.may_select_runner_class`). Otherwise listing it changes
-    no selection, so it is left out: the call keeps the runner list and host
-    cost of the other backends. ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1``
-    always leaves it out, and so does tuning under an autotune process group
-    (:func:`_cake_group_tuning`).
-    """
-    return (
-        cake_auto_candidates_enabled()
-        and not _cake_group_tuning()
-        and AutoTuner.get().may_select_runner_class(runner_class_name)
-    )
-
-
-def _cake_group_tuning() -> bool:
-    """Whether the tuner now tunes under an autotune process group
-    (:func:`~flashinfer.autotuner.set_autotune_process_group`).
-
-    Group tuning requires every rank to list the same runners for an op. The
-    automatic Cake candidates are offered per operands and per tuning bucket of
-    the rank-local M, so ranks could disagree; they are left out while a group
-    tunes, and every rank lists the other backends only. Outside tuning the
-    group checks nothing, and Cake is listed as without a group.
-    """
-    return get_autotune_process_group() is not None and AutoTuner.get().is_tuning_mode
+# The shared gate (FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES, autotune process
+# group, AutoTuner.may_select_runner_class); see cake_auto_candidate_open.
+_cake_auto_candidate_open = cake_auto_candidate_open
 
 
 @backend_requirement(
@@ -2931,6 +2922,8 @@ def _tinygemm_bf16_gemm_runner():
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
+            if inputs[0].shape[-1] % 8 != 0:
+                return []
             return [0]
 
         def forward(
@@ -2941,6 +2934,9 @@ def _tinygemm_bf16_gemm_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, bias, pdl, out, _ = inputs
+            # Same as TGVRunner.forward(): this must hold even if the
+            # requirement checks and get_valid_tactics() were bypassed.
+            _require_tma_bf16_k_alignment("TinyGEMM", a.shape[-1])
             weight = b.transpose(-2, -1)
             if bias is None:
                 module.tinygemm2_nobias_op(a, weight, out, bool(pdl))
@@ -2987,6 +2983,8 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
             inputs: List[torch.Tensor],
             profile: OptimizationProfile,
         ) -> List[int]:
+            if inputs[0].shape[-1] % 8 != 0:
+                return []
             # forward() routes 2D inputs to the C++ kernel under the debug
             # toggle, which has its own (smaller) tactic table.
             if _TGV_DEBUG_USE_CPP and inputs[0].dim() == 2:
@@ -3008,6 +3006,9 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
             **kwargs,
         ) -> torch.Tensor:
             a, b, bias, pdl, out, *_ = inputs
+            # skip_check=True and the default tactic -1 reach forward() without
+            # going through the requirement checks or get_valid_tactics().
+            _require_tma_bf16_k_alignment("TGV", a.shape[-1])
             # The C++ TGV kernel is 2D-only — always fall back to cute_ext
             # for batched inputs regardless of the toggle.
             if _TGV_DEBUG_USE_CPP and a.dim() == 2:
@@ -4018,6 +4019,8 @@ def tgv_gemm_sm100(
         tuning_config = TuningConfig()
         dtype_str = f"{a.dtype}_{b.dtype}_{a_descale.dtype}"
     else:
+        _require_tma_bf16_k_alignment("TGV", a.shape[1])
+
         runners = [
             get_tgv_gemm_sm10x_module(
                 a.dtype, is_sm100f_supported(a.device)

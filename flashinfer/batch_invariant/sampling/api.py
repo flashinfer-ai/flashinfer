@@ -107,24 +107,34 @@ def _temperature(
     return None, scale_value(T)
 
 
-def _check_logits(logits: torch.Tensor) -> int:
-    check_device(logits.device, CLASS, LSE_ROW_ARCHS)
-    if logits.dtype not in _DTYPE_STR:
+def check_input(
+    x: torch.Tensor,
+    name: str,
+    cls: str,
+    archs,
+    vocab_hint: str = (
+        f"every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it the row's alignment decides"
+    ),
+) -> int:
+    """The device, dtype, rank and vocabulary checks shared by the mode's sampling entries (the row class, the draw,
+    the support): ``BatchInvariantUnsupportedError`` naming ``cls`` on a miss; returns the vocabulary ``N``."""
+    check_device(x.device, cls, archs)
+    if x.dtype not in _DTYPE_STR:
+        raise unsupported(cls, f"{name} dtype {x.dtype}", f"bf16, f16 or fp32 {name}")
+    if x.dim() < 1:
         raise unsupported(
-            CLASS, f"logits dtype {logits.dtype}", "bf16, f16 or fp32 logits"
+            cls, f"a {x.dim()}-D input", f"{name} of shape (..., vocabulary)"
         )
-    if logits.dim() < 1:
-        raise unsupported(
-            CLASS, f"a {logits.dim()}-D input", "logits of shape (..., vocabulary)"
-        )
-    N = int(logits.shape[-1])
+    N = int(x.shape[-1])
     if not (0 < N < MAX_VOCAB):
         raise unsupported(
-            CLASS,
-            f"a vocabulary of {N}",
-            f"0 < vocabulary < 2^31 (every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it the row's alignment decides)",
+            cls, f"a vocabulary of {N}", f"0 < vocabulary < 2^31 ({vocab_hint})"
         )
     return N
+
+
+def _check_logits(logits: torch.Tensor) -> int:
+    return check_input(logits, "logits", CLASS, LSE_ROW_ARCHS)
 
 
 def _aligned_rows(x2: torch.Tensor, align: int) -> torch.Tensor:
@@ -405,10 +415,21 @@ def log_probs_batch_invariant(
     lse_out: Optional[torch.Tensor] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
+    top_k: Optional[Union[int, torch.Tensor]] = None,
+    top_p: Optional[Union[float, torch.Tensor]] = None,
+    min_p: Optional[Union[float, torch.Tensor]] = None,
+    filter_apply_order: str = "top_k_first",
 ):
     """``flashinfer.sampling.log_probs(logits, token_ids, temperature, return_lse=..., out=, lse_out=)``: the class
     ``lse.row``. ``out`` (fp32, the ids' shape) and ``lse_out`` (fp32, ``logits.shape[:-1]``) are caller-owned buffers,
     written in place and returned.
+
+    With ``top_k`` / ``top_p`` / ``min_p`` (and ``filter_apply_order``, as the truncated samplers take them) the value is
+    the token's log-probability under the sampler's kept-set distribution instead: ``support.row.v1``'s kept set and mass at
+    the row, then ``mul(add(z_t, neg(lg2(mass))), LN2)`` -- bit for bit the ``kept_logp`` the truncated samplers return for
+    the token they drew (the engines' processed log-probability); ``-inf`` for a token outside the kept set, NaN for an id
+    outside ``[0, N)`` or a row whose kept mass is not a positive finite number (``draw_support_api.kept_log_probs``). One
+    id per row; ``return_lse`` is the full row's statistic and is refused with a filter.
 
     The natural log-probability of ``token_ids[r]`` under ``softmax(logits[r] / temperature)``, fp32 of shape
     ``logits.shape[:-1]`` for one id per row or ``logits.shape[:-1] + (K,)`` for ``K`` ids per row:
@@ -417,6 +438,26 @@ def log_probs_batch_invariant(
 
     Raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for any input outside the class; it
     never falls back."""
+    if top_k is not None or top_p is not None or min_p is not None:
+        if return_lse or lse_out is not None:
+            raise ValueError(
+                "return_lse is the full row's statistic: call log_probs without the filters for it"
+            )
+        from .draw_support_api import kept_log_probs
+
+        return kept_log_probs(
+            logits,
+            token_ids,
+            temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            order=filter_apply_order,
+            enable_pdl=_pdl(enable_pdl, logits.device),
+            config=config,
+            sm_count=sm_count,
+            out=out,
+        )["kept_logp"]
     _check_logits(logits)
     res = lse_row(
         LOGP_LSE if return_lse else LOGP,

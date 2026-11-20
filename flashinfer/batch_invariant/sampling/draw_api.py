@@ -25,21 +25,15 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 
-from ..support import (
-    check_device,
-    check_no_overlap,
-    out_buffer,
-    scratch,
-    unsupported,
-)
+from ..support import check_no_overlap, out_buffer, scratch, unsupported
 from .api import (
     _DTYPE_STR,
-    MAX_VOCAB,
     _aligned_rows,
     _dummy,
     _pdl,
     _rows,
     _temperature,
+    check_input,
 )
 from .draw_schedule import SHARE_MAX, draw_config
 from .schedule import (
@@ -58,22 +52,16 @@ _KEY_DTYPES = (torch.int64, torch.uint64)
 
 
 def _check_input(x: torch.Tensor, name: str) -> int:
-    """The device, dtype, rank and vocabulary checks of an input; returns ``N``."""
-    check_device(x.device, CLASS, DRAW_ARCHS)
-    if x.dtype not in _DTYPE_STR:
-        raise unsupported(CLASS, f"{name} dtype {x.dtype}", f"bf16, f16 or fp32 {name}")
-    if x.dim() < 1:
-        raise unsupported(
-            CLASS, f"a {x.dim()}-D input", f"{name} of shape (..., vocabulary)"
-        )
-    N = int(x.shape[-1])
-    if not (0 < N < MAX_VOCAB):
-        raise unsupported(
-            CLASS,
-            f"a vocabulary of {N}",
-            f"0 < vocabulary < 2^31 (every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it only where the row's alignment admits a member within {SHARE_MAX} elements per thread)",
-        )
-    return N
+    """The device, dtype, rank and vocabulary checks of an input (the mode's shared check, naming this class); returns
+    ``N``."""
+    return check_input(
+        x,
+        name,
+        CLASS,
+        DRAW_ARCHS,
+        f"every vocabulary up to {VOCAB_COVERED} has a configuration; beyond it only where the row's alignment admits a "
+        f"member within {SHARE_MAX} elements per thread",
+    )
 
 
 def _shared_key_error(M: int) -> ValueError:
