@@ -3296,22 +3296,20 @@ def _cake_mla_auto_candidate_reason(
     (``_cake_mla_auto_static_reason``); the sink tensor and the contiguity of
     every tensor are checked on every call.
     """
-    if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
-        return "requires host float bmm1_scale / bmm2_scale"
-    # The sparse route reads every index (no -1 padding), the route has no
-    # skip-softmax and its LSE units do not follow return_lse_base.
-    if sparse_mla_top_k > 0 or sparse_mla_top_k_lens is not None:
-        return "does not join sparse MLA selection"
-    if skip_softmax_threshold_scale_factor is not None:
-        return "does not implement skip-softmax"
-    if lse_requested:
-        return "does not join selection when LSE is requested"
-    if use_fp16_softmax:
-        return "does not implement use_fp16_softmax"
-    if enable_dcp or multi_ctas_kv_counter_buffer is not None:
-        return "does not support DCP or multi_ctas_kv_counter_buffer"
-    if not uses_shared_paged_kv_idx:
-        return "requires uses_shared_paged_kv_idx=True"
+    reason = _cake_mla_auto_scalar_reason(
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        sparse_mla_top_k=sparse_mla_top_k,
+        sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        lse_requested=lse_requested,
+        use_fp16_softmax=use_fp16_softmax,
+        enable_dcp=enable_dcp,
+        multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+        uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+    )
+    if reason is not None:
+        return reason
     reason = _cake_mla_auto_static_reason(
         get_compute_capability(query.device),
         query.dtype,
@@ -3340,7 +3338,7 @@ def _cake_mla_auto_candidate_reason(
             and sink.is_contiguous()
             and tuple(sink.shape) == (query.size(-2),)
         ):
-            return "requires one contiguous FP32 sink value per head"
+            return _CAKE_MLA_SINK_REASON
     if not (
         query.is_contiguous()
         and kv_cache.is_contiguous()
@@ -3348,7 +3346,52 @@ def _cake_mla_auto_candidate_reason(
         and seq_lens.is_contiguous()
         and out.is_contiguous()
     ):
-        return "requires contiguous query, kv_cache, block_tables, seq_lens and out"
+        return _CAKE_MLA_CONTIGUITY_REASON
+    return None
+
+
+# The reasons of ``_cake_mla_auto_candidate_reason`` that depend on more than
+# scalars, dtypes and sizes (the sink tensor, strides). Every other reason is
+# a function of the dispatcher's memo key (``_CAKE_MLA_AUTO_MEMO``).
+_CAKE_MLA_SINK_REASON = "requires one contiguous FP32 sink value per head"
+_CAKE_MLA_CONTIGUITY_REASON = (
+    "requires contiguous query, kv_cache, block_tables, seq_lens and out"
+)
+
+
+def _cake_mla_auto_scalar_reason(
+    *,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    sparse_mla_top_k: int,
+    sparse_mla_top_k_lens: Optional[torch.Tensor],
+    skip_softmax_threshold_scale_factor: Optional[float],
+    lse_requested: bool,
+    use_fp16_softmax: Optional[bool],
+    enable_dcp: bool,
+    multi_ctas_kv_counter_buffer: Optional[torch.Tensor],
+    uses_shared_paged_kv_idx: bool,
+) -> Optional[str]:
+    """The checks of ``_cake_mla_auto_candidate_reason`` on arguments other
+    than the tensors' dtypes, sizes and strides; ``None`` when they pass. The
+    dispatcher runs them before it builds the memo key, so such calls pay
+    nothing for the memo."""
+    if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+        return "requires host float bmm1_scale / bmm2_scale"
+    # The sparse route reads every index (no -1 padding), the route has no
+    # skip-softmax and its LSE units do not follow return_lse_base.
+    if sparse_mla_top_k > 0 or sparse_mla_top_k_lens is not None:
+        return "does not join sparse MLA selection"
+    if skip_softmax_threshold_scale_factor is not None:
+        return "does not implement skip-softmax"
+    if lse_requested:
+        return "does not join selection when LSE is requested"
+    if use_fp16_softmax:
+        return "does not implement use_fp16_softmax"
+    if enable_dcp or multi_ctas_kv_counter_buffer is not None:
+        return "does not support DCP or multi_ctas_kv_counter_buffer"
+    if not uses_shared_paged_kv_idx:
+        return "requires uses_shared_paged_kv_idx=True"
     return None
 
 
@@ -4052,9 +4095,9 @@ def _mla_cake_margin_tuning_config(
 
 
 # Second-stage decisions of lookup-only calls, keyed by
-# ``(memo_key, batch ranges, first-stage selection)``, where ``memo_key`` (built
-# by the dispatcher) holds every argument and tensor size, dtype and device the
-# two stages' lookups and the Cake checks read. A value is ``(weak reference
+# ``(memo_key, batch ranges, first-stage selection)``, where ``memo_key`` (the
+# caller's) holds every argument and tensor size, dtype and device the two
+# stages' lookups and the Cake checks read. A value is ``(weak reference
 # to the tuner, tuner state, offer table, families, launch plan, FP8 decode
 # table, copy of the split-KV device ranges)``; ``families`` is ``None`` for a
 # decision to run the first stage's selection. The offer table and the Cake
@@ -4064,6 +4107,8 @@ def _mla_cake_margin_tuning_config(
 # in-place change of a range). The weak reference keeps an entry from holding a
 # discarded tuner alive. See ``_mla_cake_stage_two``. Bounded like
 # ``_CAKE_MLA_TABLE_MEMO``.
+# The dispatcher memoizes whole decisions in ``_CAKE_MLA_AUTO_MEMO`` instead;
+# this memo serves callers of ``_mla_cake_stage_two`` without one.
 _CAKE_MLA_STAGE_TWO_MEMO: Dict[Any, Any] = {}
 
 
@@ -4072,11 +4117,14 @@ def _mla_cake_memo_state(tuner: AutoTuner) -> Optional[tuple]:
     now: the generation of the tuner's winner sources (advanced by every change
     of the in-memory winners and loaded configs of every tuner), the active
     ``autotune()`` overrides and whether bundled configs are read. ``None``
-    when a lookup reads sources the generation does not cover, or is recorded:
-    while tuning, with a managed ``autotune_v2`` store, inside an
-    ``autotune_v2`` context, under replay diagnostics or with a measurement
-    policy."""
+    when a lookup reads sources the generation does not cover, is recorded or
+    is skipped: while tuning, with a managed ``autotune_v2`` store, inside an
+    ``autotune_v2`` context, under replay diagnostics, with a measurement
+    policy, or while the thread's ``skip_ops`` names either stage's op."""
     if tuner.is_tuning_mode or tuner._managed_cache is not None:
+        return None
+    skip_ops = tuner._effective_skip_ops
+    if skip_ops and (_MLA_DECODE_OP in skip_ops or _MLA_CAKE_MARGIN_OP in skip_ops):
         return None
     local = tuner._v2_local
     if (
@@ -4116,6 +4164,8 @@ def _mla_cake_stage_two(
     ],
     batch_ranges: Tuple[Tuple[int, int], ...],
     memo_key: Optional[tuple] = None,
+    memoizable: Optional[List[Optional[tuple]]] = None,
+    memo_state: Optional[tuple] = None,
 ) -> Tuple[TunableRunner, Any]:
     """The second selection stage: Cake when it beat the first stage's winner
     for this call's bucket and launches now, else ``selected``, the first
@@ -4138,6 +4188,17 @@ def _mla_cake_stage_two(
     no readiness check decided it (a Cake choice that does not launch for
     these sizes, does not name the first stage's winner, or no Cake choice).
     The memo is skipped whenever ``_mla_cake_memo_state`` is ``None``.
+
+    The dispatcher memoizes whole decisions instead (``_CAKE_MLA_AUTO_MEMO``):
+    it passes no ``memo_key``, ``memoizable`` (an empty list) and
+    ``memo_state``, its ``_mla_cake_memo_state`` read before the first
+    stage's lookup, not ``None``. This memo is then neither read nor written,
+    and ``memoizable``
+    receives the decision of a lookup-only call that this memo would store
+    (and of one no second-stage bucket covers): ``None`` for running
+    ``selected``, else ``(Cake tactic, families, launch plan, FP8 decode
+    table)``; the dispatcher keys the decision on the split-KV device ranges
+    as this memo does.
     """
     skip_ops = tuner._effective_skip_ops
     if skip_ops and (_MLA_DECODE_OP in skip_ops or _MLA_CAKE_MARGIN_OP in skip_ops):
@@ -4149,9 +4210,11 @@ def _mla_cake_stage_two(
     # (also where replay diagnostics made the first stage's lookup miss).
     beaten = (type(selected[0]).__name__, selected[1])
     state = memo_entry_key = None
-    if lookup_only and memo_key is not None:
+    if lookup_only and memoizable is not None:
+        state = memo_state
+    elif lookup_only and memo_key is not None:
         state = _mla_cake_memo_state(tuner)
-    if state is not None:
+    if state is not None and memoizable is None:
         memo_entry_key = (memo_key, batch_ranges, beaten)
         try:
             entry = _CAKE_MLA_STAGE_TWO_MEMO.get(memo_entry_key)
@@ -4182,6 +4245,9 @@ def _mla_cake_stage_two(
         else _mla_cake_margin_tuning_config(tuning_config, batch_ranges)
     )
     if config is None:
+        # A function of the first stage's config, the ranges and the overrides.
+        if state is not None and memoizable is not None:
+            memoizable.append(None)
         return selected
     incumbent = _MlaStageOneWinnerRunner(runners, tuning_config, inputs, cake)
     cake._incumbent = incumbent
@@ -4248,18 +4314,128 @@ def _mla_cake_stage_two(
         cake._plan = plan
     # Memoize only a decision no readiness check (or failure) took part in.
     if state is not None and looked_up and cake._unready == 0:
-        if len(_CAKE_MLA_STAGE_TWO_MEMO) > _CAKE_MLA_MEMO_LIMIT:
-            _CAKE_MLA_STAGE_TWO_MEMO.clear()
-        _CAKE_MLA_STAGE_TWO_MEMO[memo_entry_key] = (
-            weakref.ref(tuner),
-            state,
-            _CAKE_MLA_AUTO_OFFERS,
-            cake._validated_families if cake_ok else None,
-            plan,
-            _cake_mla_module()._FP8_LUTS.get(inputs[0].device) if cake_ok else None,
-            dict(_cake_mla_module()._SPLITKV_RANGE),
-        )
+        families = cake._validated_families if cake_ok else None
+        lut = _cake_mla_module()._FP8_LUTS.get(inputs[0].device) if cake_ok else None
+        if memoizable is not None:
+            memoizable.append((beaten, families, plan, lut) if cake_ok else None)
+        else:
+            if len(_CAKE_MLA_STAGE_TWO_MEMO) > _CAKE_MLA_MEMO_LIMIT:
+                _CAKE_MLA_STAGE_TWO_MEMO.clear()
+            _CAKE_MLA_STAGE_TWO_MEMO[memo_entry_key] = (
+                weakref.ref(tuner),
+                state,
+                _CAKE_MLA_AUTO_OFFERS,
+                families,
+                plan,
+                lut,
+                dict(_cake_mla_module()._SPLITKV_RANGE),
+            )
     return (cake, tactic) if cake_ok else selected
+
+
+# Whole ``backend="auto"`` decisions (both stages) of lookup-only calls of
+# listed batches, keyed by the dispatcher's ``memo_key``. A value is ``(weak
+# reference to the tuner, tuner state, offer table, decision, copy of the
+# split-KV device ranges)``, reused while the ranges equal the copy (as in
+# ``_CAKE_MLA_STAGE_TWO_MEMO``); ``decision``
+# is ``(index of the first stage's runner in the call's runner names,
+# first-stage tactic, cake)``, ``cake`` as ``_mla_cake_stage_two`` reports it
+# (``None``: run the first stage's selection; also stored for a call the
+# eligibility check rejects for a reason the key decides). Bounded like
+# ``_CAKE_MLA_TABLE_MEMO``. A decision is exact for the tuner state and offer
+# table read during the call; a concurrent change of the offer table or of
+# ``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE`` that is reverted within one call
+# (another thread) is not detected.
+#
+# What the two stages' lookups read besides ``_mla_cake_memo_state``: cache
+# keys of the runner class, a per-class hash and the cache-key extras, and a
+# tuning config, all functions of ``memo_key`` fields; and the stored-tactic
+# revalidation (``AutoTuner._tactic_still_valid``), which calls no validator
+# for TRTLLM-GEN, modular CuTe DSL or the incumbent, accepts only tactic -1 for
+# functional monolithic CuTe DSL, and for Cake reads the sizes, the contiguity
+# of query, block_tables, seq_lens and out, the first stage's lookup and the
+# readiness of the families. No candidate reads tensor data, seq_lens values,
+# data pointers, alignment, strides beyond contiguity or workspace contents
+# to select. A reused Cake decision therefore re-checks the contiguity the
+# eligibility check requires (else the call runs the first stage's selection,
+# as that check makes it) and the families' readiness (else it selects).
+_CAKE_MLA_AUTO_MEMO: Dict[Any, Any] = {}
+
+
+def _mla_cake_auto_memo_get(
+    tuner: AutoTuner,
+    memo_key: tuple,
+    state: tuple,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out: torch.Tensor,
+) -> Optional[tuple]:
+    """The memoized decision of this call, ``(first-stage runner index,
+    first-stage tactic, cake)``, or ``None`` when the call selects: no entry,
+    another tuner, offer table, split-KV device ranges or ``state`` (the call's
+    ``_mla_cake_memo_state``, not ``None``), or a Cake decision whose families
+    are not ready. A Cake decision for tensors that are not all contiguous
+    runs the first stage's selection (``cake`` ``None``). Raises ``TypeError``
+    for an unhashable key."""
+    entry = _CAKE_MLA_AUTO_MEMO.get(memo_key)
+    if (
+        entry is None
+        or entry[0]() is not tuner
+        or entry[2] is not _CAKE_MLA_AUTO_OFFERS
+        or entry[1] != state
+        or entry[4] != _cake_mla_module()._SPLITKV_RANGE
+    ):
+        return None
+    decision = entry[3]
+    cake = decision[2]
+    if cake is None:
+        return decision
+    if not (
+        query.is_contiguous()
+        and kv_cache.is_contiguous()
+        and block_tables.is_contiguous()
+        and seq_lens.is_contiguous()
+        and out.is_contiguous()
+    ):
+        return decision[0], decision[1], None
+    if not _cake_mla_families_ready(cake[1], query.device, cake[3]):
+        return None
+    return decision
+
+
+def _mla_cake_auto_memo_put(
+    tuner: AutoTuner,
+    memo_key: tuple,
+    state: tuple,
+    offers: Any,
+    runners: List[TunableRunner],
+    selected: Tuple[TunableRunner, Any],
+    cake: Optional[tuple],
+) -> None:
+    """Memoize the decision of a lookup-only call: ``selected`` is the first
+    stage's ``(runner, tactic)``, ``cake`` the second stage's decision as
+    ``_mla_cake_stage_two`` reports it, both made under ``state``, read before
+    the first stage's lookup, and the offer table ``offers``, read before the
+    batch ranges. Only while ``offers`` is the offer table and when
+    ``selected`` is one of ``runners``."""
+    if offers is not _CAKE_MLA_AUTO_OFFERS:
+        return
+    for index, runner in enumerate(runners):
+        if runner is selected[0]:
+            break
+    else:
+        return
+    if len(_CAKE_MLA_AUTO_MEMO) > _CAKE_MLA_MEMO_LIMIT:
+        _CAKE_MLA_AUTO_MEMO.clear()
+    _CAKE_MLA_AUTO_MEMO[memo_key] = (
+        weakref.ref(tuner),
+        state,
+        offers,
+        (index, selected[1], cake),
+        dict(_cake_mla_module()._SPLITKV_RANGE),
+    )
 
 
 def _validate_mla_dcp_args(
@@ -5098,9 +5274,11 @@ def _mla_with_kv_cache_impl(
     On SM100a/SM103a, Cake's generated Blackwell route (the one
     ``backend="cake"`` takes for its dimension tuples) can win ``backend="auto"``
     in a second selection stage. The first stage is the selection above,
-    unchanged: the same op (``"trtllm_batch_decode_mla"``), runners, buckets and
-    cache entries as without Cake, tuned and looked up first, so every bucket
-    holds its TRTLLM-GEN / CuTe DSL winner. The second stage, the op
+    unchanged: the same op (``"trtllm_batch_decode_mla"``), runners, buckets,
+    cache entries and replay records as without Cake, tuned and looked up first,
+    so every bucket holds its TRTLLM-GEN / CuTe DSL winner and every lookup
+    selects what it selects without Cake (a repeated lookup-only call of a
+    listed batch reuses that result, see below). The second stage, the op
     ``"trtllm_batch_decode_mla_cake_margin"``, compares that winner with Cake per
     tuning bucket, under the same ``autotune()`` settings including
     ``tie_tolerance``; it profiles Cake only against a first-stage winner, and a
@@ -5138,12 +5316,16 @@ def _mla_with_kv_cache_impl(
     row) on every call. Padded rows (``seq_lens`` 0, or a query row with no
     causal KV token) output zeros. Tuning measures GPU time under CUDA-graph
     replay; an eager caller also pays the host dispatch. Outside tuning, a
-    batch no listed unit covers skips the second stage, and the second
-    stage's decision is reused for repeated calls with the same arguments and
-    tensor sizes and the same first-stage selection until any tuner's winners
-    or loaded configs change (not while tuning, with an ``autotune_v2`` store
-    or context, or under replay diagnostics); a reused Cake decision launches
-    the programs it resolved for those sizes.
+    batch no listed unit covers skips the second stage, and for a listed batch
+    the decision of both stages is reused for repeated calls with the same
+    arguments and tensor sizes while the tuner, the offer table, every tuner's
+    winners and loaded configs, the ``autotune()`` overrides and ``skip_ops``
+    are unchanged (not while tuning, with an ``autotune_v2`` store or context,
+    under replay diagnostics or with a measurement policy): such a call
+    neither builds the tuning config nor looks up, and builds only the selected
+    runner; a reused Cake decision checks the contiguity of the tensors and
+    that its programs are loaded, and launches the programs it resolved for
+    those sizes.
     Uniform explicit CuTeDSL requests use the same tuner with one candidate.
     Explicit TRTLLM-GEN requests enter the tuner only during tuning; inference
     directly executes its sole tactic. Compact variable-Q requests select an eligible backend directly
@@ -5397,6 +5579,13 @@ def _mla_with_kv_cache_impl(
             # Batch ranges of the units for which the second selection stage
             # offers Cake (``_mla_cake_stage_two``); empty: no second stage.
             cake_batch_ranges: Tuple[Tuple[int, int], ...] = ()
+            # For a lookup-only call of a listed batch: the memo key, the
+            # tuner state and offer table read before both stages, and the
+            # decision ``_CAKE_MLA_AUTO_MEMO`` holds for them.
+            cake_memo_key: Optional[tuple] = None
+            cake_memo_state: Optional[tuple] = None
+            cake_offers: Any = None
+            cake_decision: Optional[tuple] = None
             if resolved_backend == "cute-dsl":
                 if cute_dsl_reason is not None:
                     raise ValueError(cute_dsl_reason)
@@ -5424,7 +5613,13 @@ def _mla_with_kv_cache_impl(
                 # could differ per rank). Outside tuning only a batch the units
                 # list joins it; tuning joins every batch, so one tuning call
                 # times every offered bucket, as the first stage does.
+                # A lookup-only call of a listed batch reuses the decision of
+                # both stages memoized for its arguments (``_CAKE_MLA_AUTO_MEMO``)
+                # instead of the eligibility check and both lookups.
                 if cake_auto_candidate_open(_CAKE_MLA_RUNNER):
+                    # Read once: a decision is memoized only while the table
+                    # it was made under is the offer table.
+                    cake_offers = _CAKE_MLA_AUTO_OFFERS
                     offered = _cake_mla_auto_batch_ranges(
                         query.get_device(),
                         query.dtype,
@@ -5433,36 +5628,116 @@ def _mla_with_kv_cache_impl(
                         sinks is not None,
                         max_seq_len,
                     )
+                    tuner = AutoTuner.get()
                     if (
                         offered
                         and (
-                            AutoTuner.get().is_tuning_mode
+                            tuner.is_tuning_mode
                             or _in_batch_ranges(query.size(0), offered)
                         )
-                        and _cake_mla_auto_candidate_reason(
-                            query=query,
-                            kv_cache=kv_cache,
-                            block_tables=block_tables,
-                            seq_lens=seq_lens,
-                            out=out,
-                            qk_nope_head_dim=qk_nope_head_dim,
-                            kv_lora_rank=kv_lora_rank,
-                            qk_rope_head_dim=qk_rope_head_dim,
-                            sparse_mla_top_k=sparse_mla_top_k,
+                        # Before the memo key: such calls pay nothing for it.
+                        and _cake_mla_auto_scalar_reason(
                             bmm1_scale=bmm1_scale,
                             bmm2_scale=bmm2_scale,
-                            sinks=sinks,
+                            sparse_mla_top_k=sparse_mla_top_k,
+                            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
                             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-                            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
                             lse_requested=return_lse or lse is not None,
                             use_fp16_softmax=use_fp16_softmax,
-                            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
-                            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
                             enable_dcp=enable_dcp,
+                            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+                            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
                         )
                         is None
                     ):
-                        cake_batch_ranges = offered
+                        if not tuner.is_tuning_mode:
+                            cake_memo_state = _mla_cake_memo_state(tuner)
+                        if cake_memo_state is not None:
+                            try:
+                                # Every argument the first stage's tuning
+                                # config, the two stages' lookups and the Cake
+                                # checks read, except the contiguity of the
+                                # tensors and the sinks (none: ``offered`` is
+                                # empty with sinks), and except the arguments
+                                # the scalar check above fixed; see the audit
+                                # at ``_CAKE_MLA_AUTO_MEMO``. The sign of
+                                # ``bmm2_scale`` keeps -0.0 and 0.0 apart (the
+                                # launch plan holds it).
+                                cake_memo_key = (
+                                    query.get_device(),
+                                    query.shape,
+                                    query.dtype,
+                                    kv_cache.shape,
+                                    kv_cache.dtype,
+                                    block_tables.shape,
+                                    block_tables.dtype,
+                                    seq_lens.shape,
+                                    seq_lens.dtype,
+                                    out.shape,
+                                    out.dtype,
+                                    workspace_buffer.shape,
+                                    workspace_buffer.dtype,
+                                    max_seq_len,
+                                    bmm1_scale,
+                                    bmm2_scale,
+                                    math.copysign(1.0, bmm2_scale),
+                                    qk_nope_head_dim,
+                                    kv_lora_rank,
+                                    qk_rope_head_dim,
+                                    sparse_mla_top_k,
+                                    use_fp16_softmax,
+                                    enable_pdl,
+                                    is_var_seq,
+                                    tuple(runner_names),
+                                    cute_dsl_impl,
+                                    return_lse_base,
+                                    cp_world,
+                                    cp_rank,
+                                )
+                                cake_decision = _mla_cake_auto_memo_get(
+                                    tuner,
+                                    cake_memo_key,
+                                    cake_memo_state,
+                                    query,
+                                    kv_cache,
+                                    block_tables,
+                                    seq_lens,
+                                    out,
+                                )
+                            except TypeError:  # an unhashable argument
+                                cake_memo_key = None
+                        if cake_decision is None:
+                            reason = _cake_mla_auto_candidate_reason(
+                                query=query,
+                                kv_cache=kv_cache,
+                                block_tables=block_tables,
+                                seq_lens=seq_lens,
+                                out=out,
+                                qk_nope_head_dim=qk_nope_head_dim,
+                                kv_lora_rank=kv_lora_rank,
+                                qk_rope_head_dim=qk_rope_head_dim,
+                                sparse_mla_top_k=sparse_mla_top_k,
+                                bmm1_scale=bmm1_scale,
+                                bmm2_scale=bmm2_scale,
+                                sinks=sinks,
+                                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                                lse_requested=return_lse or lse is not None,
+                                use_fp16_softmax=use_fp16_softmax,
+                                multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+                                sparse_mla_top_k_lens=sparse_mla_top_k_lens,
+                                enable_dcp=enable_dcp,
+                            )
+                            if reason is None:
+                                cake_batch_ranges = offered
+                            elif reason in (
+                                _CAKE_MLA_SINK_REASON,
+                                _CAKE_MLA_CONTIGUITY_REASON,
+                            ):
+                                # Not decided by the key: nothing is memoized.
+                                cake_memo_key = None
+                            # Else the key decides the rejection: the first
+                            # stage's selection is memoized.
 
             resolved_backend = "autotune"
 
@@ -5486,8 +5761,14 @@ def _mla_with_kv_cache_impl(
                 )
             )
 
+        # A memoized decision builds only the runner it selects.
+        built_names: Sequence[str] = runner_names
+        if cake_decision is not None:
+            built_names = (
+                (runner_names[cake_decision[0]],) if cake_decision[2] is None else ()
+            )
         runners: List[TunableRunner] = []
-        if "trtllm-gen" in runner_names:
+        if "trtllm-gen" in built_names:
             # The TRT adapter lowers tensor scales once before profiling/launch.
             runners.append(
                 _BatchMLAPagedAttentionTrtllmGenBackend.from_functional(
@@ -5512,7 +5793,7 @@ def _mla_with_kv_cache_impl(
                     use_fp16_softmax=use_fp16_softmax,
                 )
             )
-        if "cute-dsl" in runner_names:
+        if "cute-dsl" in built_names:
             # Normalize sinks: public contract accepts Optional[List[Tensor]] for
             # legacy reasons, but cute-dsl's modular variant expects a single
             # per-head tensor or None. The list-of-1 case has been guarded by
@@ -5565,7 +5846,26 @@ def _mla_with_kv_cache_impl(
             # alongside the other batch-shaped tensors during autotuning.
             inputs.append(causal_seqlens_kv_global)
         tuner = AutoTuner.get()
-        if backend == "trtllm-gen" and not tuner.is_tuning_mode:
+        if cake_decision is not None:
+            # Both stages' decision, memoized for this call's arguments.
+            _, tactic, cake_choice = cake_decision
+            if cake_choice is None:
+                runner = runners[0]
+            else:
+                cake = _CakeTrtllmMlaBlackwellRunner(
+                    kv_cache=kv_cache,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    max_seq_len=max_seq_len,
+                    bmm1_scale=cast(float, bmm1_scale),
+                    bmm2_scale=cast(float, bmm2_scale),
+                    sinks=sinks,
+                    enable_pdl=enable_pdl,
+                )
+                cake._plan = cake_choice[2]
+                runner, tactic = cake, cake_choice[0]
+        elif backend == "trtllm-gen" and not tuner.is_tuning_mode:
             # Explicit TRT has one implementation and only tactic -1. Keep
             # profiling inside autotune(), but inference needs no selection.
             runner, tactic = runners[0], -1
@@ -5595,46 +5895,16 @@ def _mla_with_kv_cache_impl(
                 inputs,
             )
             if cake_batch_ranges:
-                # Every argument the two stages' lookups and the Cake checks
-                # read (the eligibility check above holds the rest fixed:
-                # dense, no sinks, no LSE, host scales, int32 indices,
-                # contiguous tensors); only outside tuning.
-                memo_key = (
-                    None
-                    if tuner.is_tuning_mode
-                    else (
-                        query.get_device(),
-                        query.shape,
-                        query.dtype,
-                        kv_cache.shape,
-                        block_tables.shape,
-                        seq_lens.shape,
-                        out.shape,
-                        out.dtype,
-                        workspace_buffer.shape,
-                        workspace_buffer.dtype,
-                        max_seq_len,
-                        bmm1_scale,
-                        bmm2_scale,
-                        qk_nope_head_dim,
-                        kv_lora_rank,
-                        qk_rope_head_dim,
-                        enable_pdl,
-                        is_var_seq,
-                        tuple(runner_names),
-                        cute_dsl_impl,
-                        use_fp16_softmax,
-                        return_lse_base,
-                        cp_world,
-                        cp_rank,
-                    )
+                selected = (runner, tactic)
+                memoizable: Optional[List[Optional[tuple]]] = (
+                    None if cake_memo_key is None else []
                 )
                 runner, tactic = _mla_cake_stage_two(
                     tuner,
                     runners,
                     tuning_config,
                     inputs,
-                    (runner, tactic),
+                    selected,
                     lambda: _CakeTrtllmMlaBlackwellRunner(
                         kv_cache=kv_cache,
                         qk_nope_head_dim=qk_nope_head_dim,
@@ -5647,7 +5917,31 @@ def _mla_with_kv_cache_impl(
                         enable_pdl=enable_pdl,
                     ),
                     cake_batch_ranges,
-                    memo_key,
+                    None,
+                    memoizable,
+                    cake_memo_state,
+                )
+                if memoizable:
+                    _mla_cake_auto_memo_put(
+                        tuner,
+                        cast(tuple, cake_memo_key),
+                        cast(tuple, cake_memo_state),
+                        cake_offers,
+                        runners,
+                        selected,
+                        memoizable[0],
+                    )
+            elif cake_memo_key is not None:
+                # The eligibility check rejected Cake for a reason the key
+                # decides: the decision is the first stage's selection.
+                _mla_cake_auto_memo_put(
+                    tuner,
+                    cake_memo_key,
+                    cast(tuple, cake_memo_state),
+                    cake_offers,
+                    runners,
+                    (runner, tactic),
+                    None,
                 )
         if isinstance(runner, _BatchMLAPagedAttentionTrtllmGenBackend):
             runner(
