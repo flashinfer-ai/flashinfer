@@ -16,6 +16,7 @@ from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 BLOCK_T = 16
 BLOCK_C = 128
+_MAP_WARPS = 8
 _SOURCE_FILES = (str(Path(__file__).resolve()),)
 
 
@@ -184,24 +185,38 @@ def _warp_chunk_prefix(offsets, base, block_t: cutlass.Constexpr):
 def _build_chunk_map(
     offsets: cute.Tensor, mapping: cute.Tensor, block_t: cutlass.Constexpr
 ):
+    # One block per sequence; its eight warps scan 256 sequences per round.
     seq, _, _ = cute.arch.block_idx()
+    tid, _, _ = cute.arch.thread_idx()
     lane = cute.arch.lane_idx()
+    warp = tid // 32
     count = offsets.shape[0] - 1
+    partial = utils.SmemAllocator().allocate_tensor(
+        cutlass.Int32, cute.make_layout((2 * _MAP_WARPS,)), byte_alignment=4
+    )
     first = cutlass.Int32(0)
     total = cutlass.Int32(0)
-    for base in cutlass.range(0, count, 32):
-        value = _warp_chunk_prefix(offsets, base, block_t)
+    for base in cutlass.range(0, count, 32 * _MAP_WARPS):
+        group = base + warp * 32
+        value = _warp_chunk_prefix(offsets, group, block_t)
         group_total = cute.arch.shuffle_sync(value, 31)
-        preceding_lane = cute.max(0, cute.min(seq - base, 32) - 1)
+        preceding_lane = cute.max(0, cute.min(seq - group, 32) - 1)
         preceding = cute.arch.shuffle_sync(value, preceding_lane)
-        if seq > base:
-            first += preceding
-        total += group_total
-    if seq == 0 and lane == 0:
+        if lane == 0:
+            partial[warp] = group_total
+            partial[_MAP_WARPS + warp] = cutlass.Int32(0)
+            if seq > group:
+                partial[_MAP_WARPS + warp] = preceding
+        cute.arch.barrier()
+        for i in cutlass.range_constexpr(_MAP_WARPS):
+            total += partial[i]
+            first += partial[_MAP_WARPS + i]
+        cute.arch.barrier()
+    if seq == 0 and tid == 0:
         mapping[0] = total
     length = cutlass.Int64(offsets[seq + 1]) - offsets[seq]
     chunks = cutlass.Int32((length + block_t - 1) // block_t)
-    for chunk in cutlass.range(lane, chunks, 32):
+    for chunk in cutlass.range(tid, chunks, 32 * _MAP_WARPS):
         index = cutlass.Int64(first + chunk) * 2 + 1
         mapping[index] = seq
         mapping[index + 1] = chunk
@@ -215,7 +230,9 @@ def _chunk_map_launch(
     stream: cuda.CUstream,
 ):
     _build_chunk_map(offsets, mapping, block_t).launch(
-        grid=(offsets.shape[0] - 1, 1, 1), block=(32, 1, 1), stream=stream
+        grid=(offsets.shape[0] - 1, 1, 1),
+        block=(32 * _MAP_WARPS, 1, 1),
+        stream=stream,
     )
 
 
