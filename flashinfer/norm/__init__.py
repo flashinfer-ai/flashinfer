@@ -27,7 +27,7 @@ This package provides high-performance normalization kernels:
 import functools
 import os
 import warnings
-from typing import Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -99,19 +99,31 @@ except (ImportError, AttributeError):
     RMSNORM_BACKENDS = ("auto", "specialized", "cuda", "cutedsl")
 
 try:
-    from .kernels import (
-        gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
-    )
-    from .kernels import (
-        gated_residual_next_rmsnorm as _gated_residual_next_rmsnorm_cute,
-    )
-    from .kernels import (
-        rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
-    )
-    from .kernels import (
-        supports_rmsnorm_sigmoid_gate as _cute_supports_rmsnorm_sigmoid_gate,
-    )
-
+    if TYPE_CHECKING:
+        from .kernels.gated_residual_rmsnorm import (
+            gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
+        )
+        from .kernels.gated_residual_next_rmsnorm import (
+            gated_residual_next_rmsnorm as _gated_residual_next_rmsnorm_cute,
+        )
+        from .kernels.rmsnorm_sigmoid_gate import (
+            rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
+            supports_rmsnorm_sigmoid_gate as _cute_supports_rmsnorm_sigmoid_gate,
+        )
+    else:
+        # Resolve runtime imports through the package's lazy callable exports.
+        from .kernels import (
+            gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
+        )
+        from .kernels import (
+            gated_residual_next_rmsnorm as _gated_residual_next_rmsnorm_cute,
+        )
+        from .kernels import (
+            rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
+        )
+        from .kernels import (
+            supports_rmsnorm_sigmoid_gate as _cute_supports_rmsnorm_sigmoid_gate,
+        )
     _HAS_CUTE_DSL_FUSED_NORM = True
 except (ImportError, AttributeError):
     _HAS_CUTE_DSL_FUSED_NORM = False
@@ -1947,8 +1959,14 @@ def _layernorm_quant_fake(
 # CuTe-DSL fused RMSNorm + FP4 Quantization kernels
 # These require SM100+ (Blackwell) GPUs and nvidia-cutlass-dsl
 try:
-    from ..cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
-    from ..cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+    if TYPE_CHECKING:
+        from ..cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant as rmsnorm_fp4quant
+        from ..cute_dsl.add_rmsnorm_fp4quant import (
+            add_rmsnorm_fp4quant as add_rmsnorm_fp4quant,
+        )
+    else:
+        from ..cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
+        from ..cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
 except ImportError:
     # nvidia-cutlass-dsl not installed, these functions will not be available
     pass
