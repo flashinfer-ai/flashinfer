@@ -21,6 +21,7 @@ import functools
 from itertools import permutations
 
 import torch
+import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
@@ -56,10 +57,10 @@ def _rcp_approx_kernel(x: cute.Tensor, y: cute.Tensor, n: Int32):
 
 
 @cute.jit
-def _rcp_approx_host(x: cute.Tensor, y: cute.Tensor):
+def _rcp_approx_host(x: cute.Tensor, y: cute.Tensor, stream: cuda.CUstream):
     n = cute.size(x)
     _rcp_approx_kernel(x, y, Int32(n)).launch(
-        grid=((n + _BLOCK - 1) // _BLOCK, 1, 1), block=(_BLOCK, 1, 1),
+        grid=((n + _BLOCK - 1) // _BLOCK, 1, 1), block=(_BLOCK, 1, 1), stream=stream,
     )
 
 
@@ -85,10 +86,10 @@ def _swiglu_pair_kernel(g: cute.Tensor, u: cute.Tensor, o: cute.Tensor, n: Int32
 
 
 @cute.jit
-def _swiglu_pair_host(g: cute.Tensor, u: cute.Tensor, o: cute.Tensor):
+def _swiglu_pair_host(g: cute.Tensor, u: cute.Tensor, o: cute.Tensor, stream: cuda.CUstream):
     n = cute.size(g)
     _swiglu_pair_kernel(g, u, o, Int32(n)).launch(
-        grid=((n + _BLOCK - 1) // _BLOCK, 1, 1), block=(_BLOCK, 1, 1),
+        grid=((n + _BLOCK - 1) // _BLOCK, 1, 1), block=(_BLOCK, 1, 1), stream=stream,
     )
 
 
@@ -122,10 +123,10 @@ def _pack_fp4_kernel(x: cute.Tensor, out: cute.Tensor, n_pairs: Int64):
 
 
 @cute.jit
-def _pack_fp4_host(x: cute.Tensor, out: cute.Tensor):
+def _pack_fp4_host(x: cute.Tensor, out: cute.Tensor, stream: cuda.CUstream):
     n_pairs = cute.size(out)
     _pack_fp4_kernel(x, out, Int64(n_pairs)).launch(
-        grid=((n_pairs + _BLOCK - 1) // _BLOCK, 1, 1), block=(_BLOCK, 1, 1),
+        grid=((n_pairs + _BLOCK - 1) // _BLOCK, 1, 1), block=(_BLOCK, 1, 1), stream=stream,
     )
 
 
@@ -153,9 +154,9 @@ def _make_seq_sum_k(K: int):
             dst[Int64(t) * H + h] = acc
 
     @cute.jit
-    def host(src: cute.Tensor, dst: cute.Tensor, T: Int32, H: Int32):
+    def host(src: cute.Tensor, dst: cute.Tensor, T: Int32, H: Int32, stream: cuda.CUstream):
         kern(src, dst, T, H).launch(
-            grid=(T, (H + _BLOCK - 1) // _BLOCK, 1), block=(_BLOCK, 1, 1),
+            grid=(T, (H + _BLOCK - 1) // _BLOCK, 1), block=(_BLOCK, 1, 1), stream=stream,
         )
 
     return host
@@ -181,9 +182,9 @@ def _make_all_perms(K: int):
                 dst[(Int64(t) * H + h) * n_perms + p] = acc
 
     @cute.jit
-    def host(src: cute.Tensor, dst: cute.Tensor, T: Int32, H: Int32):
+    def host(src: cute.Tensor, dst: cute.Tensor, T: Int32, H: Int32, stream: cuda.CUstream):
         kern(src, dst, T, H).launch(
-            grid=(T, (H + _BLOCK - 1) // _BLOCK, 1), block=(_BLOCK, 1, 1),
+            grid=(T, (H + _BLOCK - 1) // _BLOCK, 1), block=(_BLOCK, 1, 1), stream=stream,
         )
 
     return host, n_perms
@@ -206,11 +207,11 @@ def rcp_approx_ftz_f32(x: torch.Tensor) -> torch.Tensor:
     y = torch.empty_like(x_c)
     if x_c.numel() == 0:
         return y.view_as(x)
+    stream = cuda.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
     key = "rcp"
     if key not in _compiled:
-        _compiled[key] = cute.compile(_rcp_approx_host, _flat_dyn(x_c), _flat_dyn(y))
-    _compiled[key](_flat_dyn(x_c), _flat_dyn(y))
-    torch.cuda.synchronize()
+        _compiled[key] = cute.compile(_rcp_approx_host, _flat_dyn(x_c), _flat_dyn(y), stream)
+    _compiled[key](_flat_dyn(x_c), _flat_dyn(y), stream)
     return y.view_as(x)
 
 
@@ -220,13 +221,13 @@ def swiglu_pair_hw_match(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     o = torch.empty_like(g_c)
     if g_c.numel() == 0:
         return o
+    stream = cuda.CUstream(torch.cuda.current_stream(gate.device).cuda_stream)
     key = "swiglu"
     if key not in _compiled:
         _compiled[key] = cute.compile(
-            _swiglu_pair_host, _flat_dyn(g_c), _flat_dyn(u_c), _flat_dyn(o)
+            _swiglu_pair_host, _flat_dyn(g_c), _flat_dyn(u_c), _flat_dyn(o), stream
         )
-    _compiled[key](_flat_dyn(g_c), _flat_dyn(u_c), _flat_dyn(o))
-    torch.cuda.synchronize()
+    _compiled[key](_flat_dyn(g_c), _flat_dyn(u_c), _flat_dyn(o), stream)
     return o
 
 
@@ -236,11 +237,11 @@ def pack_f32_to_fp4_u8(flat_f32: torch.Tensor) -> torch.Tensor:
     out = torch.empty(n_pairs, dtype=torch.uint8, device=flat_f32.device)
     if n_pairs == 0:
         return out
+    stream = cuda.CUstream(torch.cuda.current_stream(flat_f32.device).cuda_stream)
     key = "pack_fp4"
     if key not in _compiled:
-        _compiled[key] = cute.compile(_pack_fp4_host, _flat_dyn(flat_f32), _flat_dyn(out))
-    _compiled[key](_flat_dyn(flat_f32), _flat_dyn(out))
-    torch.cuda.synchronize()
+        _compiled[key] = cute.compile(_pack_fp4_host, _flat_dyn(flat_f32), _flat_dyn(out), stream)
+    _compiled[key](_flat_dyn(flat_f32), _flat_dyn(out), stream)
     return out
 
 
@@ -249,13 +250,13 @@ def bf16_seq_sum_k(src: torch.Tensor) -> torch.Tensor:
     T, K, H = src.shape
     src_c = src.contiguous()
     dst = torch.empty((T, H), dtype=torch.bfloat16, device=src.device)
+    stream = cuda.CUstream(torch.cuda.current_stream(src.device).cuda_stream)
     key = ("seq_sum", K)
     if key not in _compiled:
         _compiled[key] = cute.compile(
-            _make_seq_sum_k(K), _flat_dyn(src_c), _flat_dyn(dst), Int32(T), Int32(H)
+            _make_seq_sum_k(K), _flat_dyn(src_c), _flat_dyn(dst), Int32(T), Int32(H), stream
         )
-    _compiled[key](_flat_dyn(src_c), _flat_dyn(dst), Int32(T), Int32(H))
-    torch.cuda.synchronize()
+    _compiled[key](_flat_dyn(src_c), _flat_dyn(dst), Int32(T), Int32(H), stream)
     return dst
 
 
@@ -265,11 +266,11 @@ def bf16_all_perm_sums(src: torch.Tensor) -> torch.Tensor:
     host, n_perms = _make_all_perms(K)
     src_c = src.contiguous()
     dst = torch.empty((T, H, n_perms), dtype=torch.bfloat16, device=src.device)
+    stream = cuda.CUstream(torch.cuda.current_stream(src.device).cuda_stream)
     key = ("all_perms", K)
     if key not in _compiled:
         _compiled[key] = cute.compile(
-            host, _flat_dyn(src_c), _flat_dyn(dst), Int32(T), Int32(H)
+            host, _flat_dyn(src_c), _flat_dyn(dst), Int32(T), Int32(H), stream
         )
-    _compiled[key](_flat_dyn(src_c), _flat_dyn(dst), Int32(T), Int32(H))
-    torch.cuda.synchronize()
+    _compiled[key](_flat_dyn(src_c), _flat_dyn(dst), Int32(T), Int32(H), stream)
     return dst
