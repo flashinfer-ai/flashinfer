@@ -9,6 +9,7 @@ corrupt-entry tolerance.
 No GPU is required — profiling is monkeypatched and inputs are CPU tensors.
 """
 
+import contextlib
 import json
 from dataclasses import replace
 
@@ -740,11 +741,14 @@ def test_default_path_races_and_can_win(cache_root, monkeypatch):
     assert tactic == -1 and calls == []
 
 
-@pytest.mark.parametrize("reload", [False, True])
-def test_reordered_runners_race_the_current_default(cache_root, monkeypatch, reload):
+@pytest.mark.parametrize("storage", ["memory", "managed", "v1_file"])
+def test_reordered_runners_race_the_current_default(
+    cache_root, monkeypatch, tmp_path, storage
+):
     first, second = DummyRunner((0,)), DummyRunnerB((0,))
     inputs = [torch.zeros(8, 16)]
     profiled = []
+    v1_path = tmp_path / "reordered_v2.json"
 
     def profile(self, runner, inputs, tactic, tuning_config, **kwargs):
         profiled.append((runner, tactic))
@@ -752,21 +756,43 @@ def test_reordered_runners_race_the_current_default(cache_root, monkeypatch, rel
             return 0.5 if runner is second else 4.0
         return 2.0 if runner is second else 3.0
 
+    @contextlib.contextmanager
+    def tuning_context():
+        if storage == "v1_file":
+            with (
+                autotune(True, cache=str(v1_path)),
+                autotune_v2(persistent_cache=False),
+            ):
+                yield
+        else:
+            with autotune_v2():
+                yield
+
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
     tuner = AutoTuner.get()
-    with autotune_v2():
+    with tuning_context():
         assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 0)
     assert (second, -1) not in profiled
 
-    if reload:
+    if storage != "memory":
         tuner = _fresh_process()
     profiled.clear()
-    with autotune_v2():
+    with tuning_context():
         assert tuner.choose_one(_OP, [second, first], _CONFIG, inputs) == (second, -1)
         assert (second, -1) in profiled
         profiled.clear()
         assert tuner.choose_one(_OP, [second, first], _CONFIG, inputs) == (second, -1)
         assert not profiled
+
+    if storage == "v1_file":
+        tuner = _fresh_process()
+        profiled.clear()
+        with tuning_context():
+            assert tuner.choose_one(_OP, [second, first], _CONFIG, inputs) == (
+                second,
+                -1,
+            )
+            assert not profiled
 
 
 def test_v1_selection_does_not_race_default(monkeypatch):

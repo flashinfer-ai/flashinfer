@@ -1482,7 +1482,8 @@ class _ProfilingCandidates:
         ]
         runtime_keys = {(*key, False) for key in runner_keys}
         if race_default:
-            # Only the first runner's fallback races in a v2 comparison.
+            # Only the first runner's fallback races in a v2 comparison, so
+            # callers sharing a cache key must keep runner order stable.
             runtime_keys.add((*runner_keys[0], True))
         file_keys = {
             str((name, extras, "default") if is_default else (name, extras))
