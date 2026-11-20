@@ -945,7 +945,10 @@ def test_workspace_size_matches_the_armed_plan():
 def test_batch_invariant_workspace_size_and_plan_keep_original_dtype():
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
-    _sm90_or_skip()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("batch-invariant attention requires SM100/SM103/SM107")
     device = torch.device("cuda:0")
     b = _make_batch([4], [16], device)
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
