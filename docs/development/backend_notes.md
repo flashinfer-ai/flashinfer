@@ -161,7 +161,7 @@ feature and runtime guards still apply. Short requests mixed with long ones
 do not qualify for this extension merely because their declaration is large.
 Independent Q overrides and device-only metadata keep the original policy.
 
-### SM100 D256 paged GQA admission
+### SM100/SM103 D256 paged GQA admission
 
 The BF16 HND/page-16 prefix extension requires cuDNN 9.24+, FE 1.33+,
 and native packed-split and physical-origin capability flags for the requested
@@ -182,6 +182,35 @@ Test the automatic route with strided Q, independent actual query masks,
 physical token origins, changed lengths/page tables and retained graph replay.
 The version and native flags are necessary dependencies; benchmark evidence
 from a development FE build does not establish released-wheel qualification.
+
+### Additional Blackwell full-prefill admission
+
+With stable FE 1.33+, the same public graph path admits BF16 HND full prefills
+on SM100 and SM103 with page sizes 16 or 64. D256 MHA supports batch 1–8,
+D256 GQA groups 2/4/8/16 support batch 1–16, and D128 GQA groups 4/8 support
+batch 1–32. Query heads remain in 8–64.
+Every actual Q length must equal its KV length, and the declared Q/KV maxima
+must equal the actual maximum in 512–16384. The paired-work floor is 16 Mi.
+
+This extension uses existing CPU offsets/lengths only. Independent Q masks,
+device-only metadata, and larger declaration bounds do not extend admission.
+The original routes remain available under their existing guards. D256 keeps
+its matching native packed-split/physical-origin checks. FE's full-prefill
+placement is a dependency; a source-build result is not released-wheel or
+serving/TTFT qualification. Neither FI admission nor execution forces an engine.
+
+### FP16 paged auto admission
+
+With stable FE 1.33+, matching FP16 Q/KV/output uses the same paged admission
+regions as BF16 described above. All architecture, layout, length, paired-work,
+metadata and native width guards still apply. Earlier FE versions retain the
+existing FP16 route; BF16 admission is unchanged. This dtype transfer depends on
+FE's FP16 graph-declaration placement rules and uses the common backend/FROST
+graph contract, without selecting a particular engine.
+
+The transfer changes admission only. Existing shape-override eligibility is
+unchanged. Test actual FP16 auto execution and retained captures; matching
+predicate decisions alone does not establish runtime or performance parity.
 
 ## Grouped FP8 GEMM
 
