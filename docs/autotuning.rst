@@ -202,14 +202,20 @@ single runner. A changed or previously unrecorded signature triggers a new
 comparison; an unchanged signature permits warm reuse without enumeration or
 profiling. The signature is stored in the existing candidate-coverage metadata
 in both JSON and managed caches. Frozensets in the signature are persisted in
-a canonical order; other values need a process-stable ``str()``. The stored signature is the one read before tactic enumeration, so
-a pool that changes during preparation is compared again on the next tune.
+a canonical order; other values need a process-stable ``str()``. The stored
+signature is the one read before tactic enumeration, so a pool that changes
+during preparation is compared again on the next tune.
 Calls outside tuning, including CUDA Graph capture, remain lookup-only and can
 use an older valid winner until retuning. A capture inside ``autotune(True)``
 does check the signature, and a changed one fails there like any other tuning
 miss, because profiling cannot start during capture. Runners returning ``None``
 (the default) retain their existing behavior; this does not detect undeclared
-tactic-pool changes or change ``rank_tactics(k > 1)`` shortlist reuse.
+tactic-pool changes.
+
+``rank_tactics(k > 1)`` keeps its shortlists in memory for the process and
+stores each one with the signature read before enumeration. A shortlist is
+reused only when both the measurement policy and the signature match, so a
+compound runner that ranks each stage re-ranks a stage whose pool changed.
 
 Caching in the Benchmark Harness
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -932,6 +932,7 @@ class TunableRunner(ABC):
         ``None`` preserves the existing assumption that the runner identity
         determines its tactic pool. A changed signature requires retuning,
         including for a single runner, without invalidating serving lookups.
+        ``rank_tactics(k > 1)`` also re-ranks a shortlist when it changes.
         """
         return None
 
@@ -2058,8 +2059,9 @@ class AutoTuner:
         # Ranked shortlists are process-local. Persisted configs retain the
         # selected winner; a later tuning session rebuilds the shortlist when
         # compound refinement needs more than one candidate. Each shortlist is
-        # stored with the replay/L2 policy it was measured under, because the
-        # cache key does not include that policy.
+        # stored with the replay/L2 policy it was measured under and the
+        # runner's tactic-pool signature, because the cache key includes
+        # neither.
         self._ranked_tactics_cache: dict[
             ProfilingCacheKey, tuple[tuple[Any, ...], tuple[Any, ...]]
         ] = {}
@@ -4138,10 +4140,14 @@ class AutoTuner:
                 )
 
             plan_error = None
+            # Read before enumeration, as choose_one() does, so a pool that
+            # changes during preparation is ranked again on the next pass.
+            tactic_key = None
             try:
                 input_shapes = tuple(self._get_input_sizes(inputs))
                 profiles = self._generate_optimization_profiles(tuning_config, inputs)
                 runner = runners[0]
+                tactic_key = runner.get_tactic_cache_key(inputs)
                 runner_arg_names = {
                     param.name
                     for param in inspect.signature(runner.forward).parameters.values()
@@ -4184,11 +4190,13 @@ class AutoTuner:
                 tuning_config,
                 runner.get_cache_key_extras(inputs),
             )
-            policy = self._profiling_policy(tuning_config)
+            # A shortlist is reused only for the same measurement policy and
+            # the same declared tactic pool (see get_tactic_cache_key).
+            shortlist_identity = (self._profiling_policy(tuning_config), tactic_key)
             ranked_cache = self._ranked_cache()
             cached = ranked_cache.get(cache_key)
             if _all_ranks_hit_cache(
-                cached is not None and cached[0] == policy,
+                cached is not None and cached[0] == shortlist_identity,
                 (type(runner).__name__, k, cached[1][:k]) if cached else None,
             ):
                 assert cached is not None
@@ -4340,7 +4348,7 @@ class AutoTuner:
                 ranked[0],
                 self._selection_record([t for t, _ in scored], 0),
             )
-            ranked_cache[cache_key] = (policy, tuple(ranked))
+            ranked_cache[cache_key] = (shortlist_identity, tuple(ranked))
 
             return ranked[:k]
 

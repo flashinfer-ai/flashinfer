@@ -504,9 +504,12 @@ case = os.environ["CACHE_CASE"]
 world_size = int(os.environ["WORLD_SIZE"])
 root = Path(os.environ["CASE_ROOT"])
 tactic_revision = 0
+ranked_signature = None
 
 class RunnerA(TunableRunner):
     def get_tactic_cache_key(self, inputs):
+        if case == "ranked_partial_signature":
+            return ranked_signature
         return (tactic_revision,) if case == "partial_tactic_coverage" else None
     def get_cache_key_extras(self, inputs):
         return (0 if case in ("concurrent_publish", "all_hit_stale_memory") else rank,)
@@ -615,12 +618,18 @@ try:
         # A nested rank_tactics shortlist has its own process-local cache.
         ranked_key = tuner._get_cache_key("test::ranked", runners[0],
             (inputs[0].shape,), config, runners[0].get_cache_key_extras(inputs))
+        # Shortlists are stored with the policy and the pool signature.
+        ranked_identity = (policy, runners[0].get_tactic_cache_key(inputs))
         if rank == 0:
-            tuner._ranked_cache()[ranked_key] = (policy, (1, 0))
-        elif case in ("ranked_different_order", "ranked_all_hit"):
+            tuner._ranked_cache()[ranked_key] = (ranked_identity, (1, 0))
+        elif case in ("ranked_different_order", "ranked_all_hit", "ranked_partial_signature"):
             tuner._ranked_cache()[ranked_key] = (
-                policy, (0, 1) if case == "ranked_different_order" else (1, 0))
+                ranked_identity, (0, 1) if case == "ranked_different_order" else (1, 0))
+        if case == "ranked_partial_signature" and rank == 0:
+            # Only one rank's pool changed since its identical shortlist was stored.
+            ranked_signature = ("rev", 1)
         ranked = tuner.rank_tactics("test::ranked", [runners[0]], config, inputs, k=2)
+        ranked_signature = None
         expected_ranked = ([-1] if case == "failed_profile" else
                            [1, 0] if case == "ranked_all_hit" else [0, 1])
         assert ranked == expected_ranked
@@ -716,7 +725,8 @@ try:
             winner = rank % 2
             tuner._winner_cache()[key] = (winner, None)
             tuner._profiling_cache_policies[(tuner._winner_cache_identity(), key)] = policy
-            tuner._ranked_cache()[key] = (policy, (winner, 1 - winner))
+            tuner._ranked_cache()[key] = (
+                (policy, runner.get_tactic_cache_key(inputs)), (winner, 1 - winner))
         dist.barrier()
         set_autotune_process_group(dist.group.WORLD)
         if legacy:
@@ -840,6 +850,7 @@ finally:
         "all_hit_stale_memory",
         "ranked_different_order",
         "ranked_all_hit",
+        "ranked_partial_signature",
         "all_miss",
         "partial_memory",
         "partial_file",
