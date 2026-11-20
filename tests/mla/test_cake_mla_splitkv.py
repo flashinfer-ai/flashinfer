@@ -135,9 +135,7 @@ def _inputs(batch, q_len, page_size, max_seq_len, pattern, seed):
     )
 
 
-def _cake(
-    query, kv_cache, block_tables, seq_lens, max_seq_len, *, sink=None, **kwargs
-):
+def _cake(query, kv_cache, block_tables, seq_lens, max_seq_len, *, sink=None, **kwargs):
     """Explicit ``backend="cake"``: the Blackwell module's decode entry."""
     arguments = {
         "qk_nope_head_dim": 128,

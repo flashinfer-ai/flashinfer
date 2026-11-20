@@ -1587,9 +1587,7 @@ def test_unavailable_cake_family_falls_back(monkeypatch, clean_tuner):
 
     cake, inputs = selected[0]
     assert _name(cake) == "cake" and cake.supports(inputs)
-    assert (
-        cake._domain(inputs, num_sms, arch=arch) == cake_module.DOMAIN_BF16_VQUARTER
-    )
+    assert cake._domain(inputs, num_sms, arch=arch) == cake_module.DOMAIN_BF16_VQUARTER
     assert not cake.validate_tactic(inputs, _forced_tactic(cake))
     assert not launches and results[-1] == selected.first_stage
     _assert_matches_reference(output, case, "unavailable family fallback")

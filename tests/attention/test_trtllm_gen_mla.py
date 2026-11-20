@@ -3105,7 +3105,7 @@ def test_trtllm_mla_blackwell_splitkv_clamps_rows_to_the_table(
     dtype, _, q_len, page_size, domain = _SPLITKV_TABLE_WIDTH_CASES[case]
     _list_splitkv_device(domain, monkeypatch)
     width = 33 if page_size == 32 else 17
-    batch, capacity = 3, width * page_size
+    capacity = width * page_size
     kv_lens = [capacity + 300, capacity - 7, capacity + 300]
     query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
         kv_lens,
