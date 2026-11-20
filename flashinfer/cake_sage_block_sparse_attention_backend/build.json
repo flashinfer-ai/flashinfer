@@ -1205,7 +1205,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "2a7aef33d27d21899654c25ed01e8fe2998f2c3769d3ead5dc6c282bfe765855",
+      "closure_sha256": "2e563fe7454f7e8a774c832e6f1150444eb9cc646a81d6c589724c3da2e67e48",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.9",
@@ -1217,7 +1217,7 @@
       "path": "aot/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_sm_100a.so",
       "sha256": {
         "csrc/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_binding.cu": "2a0830c9a90fe77280c0d5f65e94f105a29a9b36c62201c30d7ed9eaeac5b55d",
-        "csrc/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_kernel.cu": "ee1c7f0836d72627a2a248f7e42f8f2c7fea8be7f2909819b42faf1086571cb6"
+        "csrc/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_kernel.cu": "de355060dcf8e20fc02c6f59b1de6f4e6a84a54360dc880967f3838820649815"
       },
       "sources": [
         "csrc/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_kernel.cu",
@@ -1226,7 +1226,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "df42789550ebd943f666a0a3d1e796b9724d6c7ad747b39e07c04beddea7c4ea",
+      "closure_sha256": "b9d52b9dd91d9240c6d5f7d238f8899ec9f12bc36e27917a9b35c206bd7ee1ac",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -1238,7 +1238,7 @@
       "path": "aot/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_sm_103a.so",
       "sha256": {
         "csrc/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_binding.cu": "2a0830c9a90fe77280c0d5f65e94f105a29a9b36c62201c30d7ed9eaeac5b55d",
-        "csrc/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_kernel.cu": "ee1c7f0836d72627a2a248f7e42f8f2c7fea8be7f2909819b42faf1086571cb6"
+        "csrc/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_kernel.cu": "de355060dcf8e20fc02c6f59b1de6f4e6a84a54360dc880967f3838820649815"
       },
       "sources": [
         "csrc/cake_sage_block_sparse_attention_e9c6917d77ff68ee48b9_kernel.cu",
