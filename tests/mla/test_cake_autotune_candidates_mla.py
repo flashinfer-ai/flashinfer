@@ -324,10 +324,11 @@ def test_first_stage_is_unchanged_and_cake_joins_the_second(
     )
 
 
-def test_committed_offer_table_runs_the_first_stage_only(monkeypatch, fresh_tuner):
-    """With the committed (empty) offer table a tuned call makes only the
-    first selection."""
+def test_unlisted_unit_runs_the_first_stage_only(monkeypatch, fresh_tuner):
+    """With no unit listed for the device a tuned call makes only the first
+    selection."""
     _require_cake_arch()
+    monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {})
     calls = _candidate_calls(monkeypatch, _make_case(), tune=True)
     assert _ops(calls) == [core._MLA_DECODE_OP] and "cake" not in _names(calls)
 
