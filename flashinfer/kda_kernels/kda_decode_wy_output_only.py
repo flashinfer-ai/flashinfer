@@ -2436,6 +2436,7 @@ def kda_wy_output_only(
             null_min=1,
             HV=HV,
             H=H,
+            batch=B,
         )
         if emit_corrections:
             return out_t, corr_t, kg_t
@@ -2711,6 +2712,7 @@ def kda_recoverssm_verify(
             null_min=null_min,
             HV=HV,
             H=H,
+            batch=batch,
         )
         return out
     if cache_key not in _CACHE:

@@ -41,6 +41,7 @@ def run_kda_oo_umma(
     null_min: int,
     HV: int,
     H: int,
+    batch: int = 0,
 ) -> None:
     """Compile (once per specialisation) and launch on ``args`` -- the
     ``KdaDecodeWyOutputOnlyKernel`` argument list."""
