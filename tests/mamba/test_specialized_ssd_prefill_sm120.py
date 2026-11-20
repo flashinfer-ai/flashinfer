@@ -78,13 +78,16 @@ pytestmark = [
     ),
 ]
 
+
 # Only the tests that actually launch the kernel JIT-build the sm_120a
 # module; the construction/refusal tests run without a toolkit.
-requires_toolkit = pytest.mark.skipif(
-    not _has_min_cuda_toolkit(),
-    reason="the specialized backend JIT-builds an sm_120a module "
-    "(CUDA >= 13.3 toolkit required)",
-)
+@pytest.fixture(scope="module")
+def _launch_toolkit():
+    if not _has_min_cuda_toolkit():
+        pytest.skip("the specialized backend requires a CUDA >= 13.3 toolkit")
+
+
+requires_toolkit = pytest.mark.usefixtures("_launch_toolkit")
 
 
 def _skip_unless_resident(nheads):
@@ -228,7 +231,36 @@ def test_large_step_decay_protection(nheads, t, step_pos):
     assert rel <= REL_TOL, f"rel {rel} at T={t} nheads={nheads} step at {step_pos}"
 
 
-def test_nvcc_override_without_default_toolkit(monkeypatch):
+def test_missing_default_nvcc(monkeypatch, tmp_path):
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.delenv("FLASHINFER_NVCC", raising=False)
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: tmp_path)
+    assert not _has_min_cuda_toolkit()
+
+
+@pytest.mark.parametrize("failure", ["missing", "exit", "banner"])
+def test_invalid_nvcc_override(monkeypatch, tmp_path, failure):
+    import subprocess
+
+    compiler = tmp_path / "nvcc"
+    monkeypatch.setenv("FLASHINFER_NVCC", str(compiler))
+    if failure != "missing":
+        compiler.write_text(
+            "#!/bin/sh\n" + ("exit 2\n" if failure == "exit" else "echo unknown\n")
+        )
+        compiler.chmod(0o755)
+    error = {
+        "missing": FileNotFoundError,
+        "exit": subprocess.CalledProcessError,
+        "banner": ValueError,
+    }
+    with pytest.raises(error[failure]):
+        _has_min_cuda_toolkit()
+
+
+@pytest.mark.parametrize("release,supported", [("13.2", False), ("13.3", True)])
+def test_nvcc_override_without_default_toolkit(monkeypatch, release, supported):
     import subprocess
 
     from flashinfer.jit import cpp_ext
@@ -241,10 +273,10 @@ def test_nvcc_override_without_default_toolkit(monkeypatch):
 
     def version(argv, *, text):
         assert argv == [compiler, "--version"] and text
-        return "Cuda compilation tools, release 13.3, V13.3.0"
+        return f"Cuda compilation tools, release {release}, V{release}.0"
 
     monkeypatch.setattr(subprocess, "check_output", version)
-    assert _has_min_cuda_toolkit()
+    assert _has_min_cuda_toolkit() is supported
 
 
 @requires_toolkit
@@ -294,6 +326,28 @@ def test_nh128_weighted_score_cancellation(row):
     assert _rel_max(out, ref) <= REL_TOL
 
 
+@requires_toolkit
+@pytest.mark.parametrize("nh", [64, 128])
+def test_large_steps_scaled_before_interval_and_suffix_sum(nh):
+    _skip_unless_resident(nh)
+    t = 129
+    p = _make_inputs(t, nh, seed=0)
+    for value in p.values():
+        value.zero_()
+    p["A"].fill_(-(2.0**-126))
+    p["x"][125].fill_(1)
+    p["B"][125, :, 0] = 1
+    p["dt"][126:128].fill_(2.0**127)
+    p["C"][127:, :, 0] = 1
+    # Both steps scale to -2; their unscaled FP32 sum would be infinite.
+    # The last two readouts probe the intra-chunk interval and carried state.
+    ref = _reference(p, t, nh)
+    out = _run(_make_ssd(nh, backend="specialized"), p, t, nh)
+    for row in (127, 128):
+        assert ref[row, 0, 0].item() > 0.01
+        assert _rel_max(out[row], ref[row]) <= REL_TOL
+
+
 def test_backends_declared_and_bogus_backend_raises():
     from flashinfer.mamba import SSD_BACKENDS
 
@@ -339,10 +393,17 @@ def test_unservable_call_form_raises():
 
 
 @pytest.mark.parametrize(
-    "reason",
-    ["out_form", "device_mismatch", "alignment", "out_overlap", "capture_unwarmed"],
+    "case",
+    [
+        "out_rank",
+        "out_cpu",
+        "device_mismatch",
+        "alignment",
+        "out_overlap",
+        "capture_unwarmed",
+    ],
 )
-def test_refusal_before_kernel_entry(monkeypatch, reason):
+def test_refusal_before_kernel_entry(monkeypatch, case):
     from flashinfer.mamba.specialized import ssd_prefill_sm120 as backend
 
     monkeypatch.setattr(backend, "_kernel_entry", lambda: pytest.fail("entered JIT"))
@@ -350,8 +411,11 @@ def test_refusal_before_kernel_entry(monkeypatch, reason):
     p = _make_inputs(t, nh, seed=1)
     ssd = _make_ssd(nh, backend="specialized")
     out = None
-    if reason == "out_form":
+    reason = "out_form" if case in ("out_rank", "out_cpu") else case
+    if case == "out_rank":
         out = torch.empty_like(p["x"])
+    elif case == "out_cpu":
+        out = torch.empty_like(p["x"].unsqueeze(0), device="cpu")
     elif reason == "device_mismatch":
         p["D"] = p["D"].cpu()
     elif reason == "alignment":
@@ -413,6 +477,23 @@ def test_native_operand_checks(nh):
     assert _rel_max(y, _reference(p, t, nh)) <= REL_TOL
     saved_y = y.clone()
     with profile() as refused:
+        # Keep full-size backing even for the short destination. A missing
+        # check must fail the test, not write beyond a test allocation.
+        for key, view, message in (
+            ("x", p["x"].unsqueeze(-1), "x must have rank 3"),
+            ("x", p["x"][:0], "invalid SSD sequence length"),
+            ("x", p["x"][:, :32], "SSD requires 64 or 128 heads"),
+            ("y", y[:-1], "y has wrong shape"),
+            ("dt", p["dt"].view(torch.float16), "dt has wrong dtype"),
+            (
+                "C",
+                p["C"].transpose(1, 2).contiguous().transpose(1, 2),
+                "C must be contiguous",
+            ),
+        ):
+            with pytest.raises(RuntimeError, match=message):
+                call(dict(p, **{key: view}), view if key == "y" else y)
+            assert torch.equal(y, saved_y)
         for key in ("x", "B", "C", "y"):
             value = y if key == "y" else p[key]
             backing = value.new_full((value.numel() + 1,), 3)
@@ -451,6 +532,80 @@ def test_kill_switch(monkeypatch):
     p = _make_inputs(128, 64, seed=2)
     with pytest.raises(NotImplementedError, match="kill_switch"):
         _run(ssd, p, 128, 64)
+
+
+def _retry_worker(a, b, nh):
+    from flashinfer.mamba.specialized import ssd_prefill_sm120 as backend
+
+    t = 3
+    torch.cuda.set_device(a)
+    run = backend._kernel_entry()
+    p = _make_inputs(t, nh, seed=4)
+    y = torch.full_like(p["x"], 7)
+    torch.cuda.synchronize(a)
+    # Only the submission uses the foreign stream. Attribute setup (and
+    # cooperative occupancy validation) uses the valid current device A.
+    owner = torch.cuda.Stream(device=b)
+    foreign = torch.cuda.ExternalStream(owner.cuda_stream, device=a)
+    with (
+        torch.cuda.stream(foreign),
+        pytest.raises(RuntimeError, match="invalid resource handle"),
+    ):
+        run(*p.values(), y)
+    assert (y == 7).all()
+
+    torch.cuda.set_device(b)
+    q = _make_inputs(t, nh, seed=5)
+    dst = torch.full_like(q["x"], float("nan"))
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as trace:
+        run(*q.values(), dst)
+        torch.cuda.synchronize(b)
+    assert (
+        sum(
+            e.device_type == torch.autograd.DeviceType.CUDA and "ssd_kernel" in e.name
+            for e in trace.events()
+        )
+        == 1
+    )
+    assert _rel_max(dst, _reference(q, t, nh)) <= REL_TOL
+    torch.cuda.set_device(a)
+    with pytest.raises(RuntimeError, match=f"bound to CUDA device {b}"):
+        run(*p.values(), y)
+    assert (y == 7).all()
+
+
+@requires_toolkit
+@pytest.mark.parametrize("nh", [64, 128])
+def test_failed_first_submission_retries_on_another_device(nh):
+    import multiprocessing
+
+    devices = [
+        i
+        for i in range(torch.cuda.device_count())
+        if torch.cuda.get_device_capability(i) == (12, 0)
+        and (
+            nh == 64
+            or torch.cuda.get_device_properties(i).multi_processor_count >= nh + 8
+        )
+    ]
+    if len(devices) < 2:
+        pytest.skip(f"requires two eligible SM120 devices for NH{nh}")
+    child = multiprocessing.get_context("spawn").Process(
+        target=_retry_worker, args=(*devices[:2], nh)
+    )
+    child.start()
+    try:
+        child.join(timeout=600)
+        assert child.exitcode == 0, f"retry worker exit code: {child.exitcode}"
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join()
 
 
 def _graph_worker(device, nh, t):

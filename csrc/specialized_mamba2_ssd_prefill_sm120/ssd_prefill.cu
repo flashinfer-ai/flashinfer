@@ -12,7 +12,9 @@
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <atomic>
+#include <climits>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 
 extern "C" __device__ float __nv_expf(float);
@@ -773,18 +775,19 @@ void RunPeer(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::Tens
   const bf16* Dp = (const bf16*)D.data_ptr();
   const bf16* dbp = (const bf16*)dt_bias.data_ptr();
   bf16* yp = (bf16*)y.data_ptr();
+  auto& initialized = g_init[NH >= 96 ? 0 : 1];
+  const bool needs_setup = !initialized.load();
 
   if (NH >= 96) {
     constexpr int SH = 65536 + 128 * 64 * 2 + 2 * 64 * 128 * 2 + 4 * 2 * 128 * 4;
-    if (!g_init[0]) {
+    if (needs_setup) {
       TVM_FFI_CHECK_CUDA_ERROR(
           cudaFuncSetAttribute(ssd_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
-      g_init[0] = 1;
     }
     ssd_kernel<64><<<NH, 256, SH, stream>>>(xp, dtp, Ap, Bp, Cp, Dp, dbp, yp, T, NH, nchunks);
   } else {
     constexpr int SH = 65536 + 2 * 128 * 32 * 2 + 2 * 32 * 128 * 2 + 3 * 2 * 128 * 4;
-    if (!g_init[1]) {
+    if (needs_setup) {
       TVM_FFI_CHECK_CUDA_ERROR(
           cudaFuncSetAttribute(ssd_kernel<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
       TVM_FFI_CHECK_CUDA_ERROR(cudaFuncSetAttribute(
@@ -795,7 +798,6 @@ void RunPeer(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::Tens
           ssd_kernel<32, true, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
       TVM_FFI_CHECK_CUDA_ERROR(cudaFuncSetAttribute(
           ssd_kernel<32, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
-      g_init[1] = 1;
     }
     if (T <= 128)
       ssd_kernel<32, false, true>
@@ -814,6 +816,8 @@ void RunPeer(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::Tens
       ssd_kernel<32><<<NH * 2, 256, SH, stream>>>(xp, dtp, Ap, Bp, Cp, Dp, dbp, yp, T, NH, nchunks);
   }
   TVM_FFI_CHECK_CUDA_ERROR(cudaGetLastError());
+  // While Run is still unbound, a failed submission can be retried on another device.
+  if (needs_setup) initialized.store(1);
 }
 
 #undef DEVI
@@ -2625,10 +2629,38 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
   same_device(D, "D");
   same_device(dt_bias, "dt_bias");
   same_device(y, "y");
+  TVM_FFI_ICHECK_EQ(x.ndim(), 3) << "x must have rank 3";
+  const int64_t T = x.shape()[0], NH = x.shape()[1];
+  // Both the chunk ceiling and the padded token indices use signed int arithmetic.
+  TVM_FFI_ICHECK(T > 0 && T <= INT_MAX - 127) << "invalid SSD sequence length";
+  TVM_FFI_ICHECK(NH == 64 || NH == 128) << "SSD requires 64 or 128 heads";
+  constexpr DLDataType bf{kDLBfloat, 16, 1}, fp{kDLFloat, 32, 1};
+  auto check_form = [](const ffi::TensorView& t, const char* name,
+                       std::initializer_list<int64_t> shape, DLDataType expected) {
+    TVM_FFI_ICHECK_EQ(t.ndim(), static_cast<int>(shape.size())) << name << " has wrong rank";
+    int i = 0;
+    for (int64_t extent : shape) {
+      TVM_FFI_ICHECK_EQ(t.shape()[i], extent) << name << " has wrong shape";
+      ++i;
+    }
+    auto dtype = t.dtype();
+    TVM_FFI_ICHECK(dtype.code == expected.code && dtype.bits == expected.bits &&
+                   dtype.lanes == expected.lanes)
+        << name << " has wrong dtype";
+    TVM_FFI_ICHECK(t.IsContiguous()) << name << " must be contiguous";
+  };
+  check_form(x, "x", {T, NH, 64}, bf);
+  check_form(dt, "dt", {T, NH}, bf);
+  check_form(A, "A", {NH}, fp);
+  check_form(Bmat, "B", {T, 8, 128}, bf);
+  check_form(Cmat, "C", {T, 8, 128}, bf);
+  check_form(D, "D", {NH}, bf);
+  check_form(dt_bias, "dt_bias", {NH}, bf);
+  check_form(y, "y", {T, NH, 64}, bf);
   auto address = [](const ffi::TensorView& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()); };
   TVM_FFI_ICHECK(((address(x) | address(Bmat) | address(Cmat) | address(y)) & 15) == 0)
       << "x, B, C and y must be 16-byte aligned";
-  const size_t tokens = x.shape()[0], heads = x.shape()[1];
+  const size_t tokens = T, heads = NH;
   const size_t dt_bytes = tokens * heads * sizeof(bf16);
   const size_t y_bytes = dt_bytes * 64, bc_bytes = tokens * 8 * 128 * sizeof(bf16);
   const uintptr_t dst = address(y);
