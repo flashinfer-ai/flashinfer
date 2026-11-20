@@ -11,6 +11,12 @@ Custom masks (``custom_mask`` / ``packed_custom_mask`` on the two prefill wrappe
 keys alone. The semantics are the regular wrappers': the mask replaces the causal mask (``causal`` is ignored), ``window_left``
 is ANDed in, a row without a visible key outputs zeros. The masks are snapshotted at ``plan()``.
 
+``BatchPrefillWithCausalBidirectionalRangesWrapper`` takes the delegate of kind ``"ranges"``: the ranged class, whose rows also see
+a key range of their request (``run_ranges``). The ranges arrive at ``run()``, so ``plan()`` checks and keeps the batch metadata
+and the unit table is built at the first ``run()`` that brings a given range tensor and window pair (one host readback of the
+ranges per call; the tables are kept, so the layers of one forward pass plan once).
+That readback makes its ``run()`` an eager call: capturing it in a CUDA graph raises.
+
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
 metadata a captured graph reads) is not offered: there is no device-side planner, so it raises.
@@ -23,15 +29,17 @@ launch, so sequential reuse on one stream needs nothing more.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS, MASK_CAUSAL, scale_log2
+from .spec import HEAD_DIMS, MASK_CAUSAL, MASK_KEY_RANGES, scale_log2
 
 CLASS = "attention.bf16"
+#: unit tables a ranged delegate keeps per plan() (one per distinct range tensor and window pair; the oldest is dropped first)
+RANGE_PLANS_KEPT = 8
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
 ATTENTION_ARCHS = ((10, 0), (10, 3), (10, 7))
 _MAX_PAGE = 128
@@ -45,7 +53,8 @@ def _dtype(x) -> torch.dtype:
 
 class BatchInvariantAttention:
     """One instance per wrapper: ``kind`` is ``"decode"`` (paged KV, one or more query tokens per request), ``"prefill"`` (paged
-    KV) or ``"ragged"`` (the K / V of every request packed along the token dimension)."""
+    KV), ``"ragged"`` (the K / V of every request packed along the token dimension) or ``"ranges"`` (paged KV prefill of the
+    ranged class: causal plus one bidirectional key range per query token)."""
 
     CLASS = CLASS
 
@@ -58,7 +67,7 @@ class BatchInvariantAttention:
         jit_args,
         use_cuda_graph: bool = False,
     ) -> None:
-        assert kind in ("decode", "prefill", "ragged"), kind
+        assert kind in ("decode", "prefill", "ragged", "ranges"), kind
         if use_cuda_graph:
             raise unsupported(
                 CLASS,
@@ -98,6 +107,9 @@ class BatchInvariantAttention:
         self._max_page = -1  # the largest page index the plan references (paged kinds)
         self._total_kv = 0  # the planned packed token count (ragged)
         self._masked = False  # the current plan runs the explicit-key-set class
+        # kind "ranges": the planned batch's host metadata and the unit tables built from it per (ranges, windows)
+        self._range_meta: Optional[dict] = None
+        self._range_plans: Dict[tuple, engine._Planned] = {}
 
     def reset_workspace(self, float_workspace_buffer: torch.Tensor) -> None:
         """The wrappers' ``reset_workspace_buffer``: the next ``plan()`` sizes its split-KV partials in this buffer (the current plan
@@ -115,6 +127,8 @@ class BatchInvariantAttention:
                 "a 16-byte-aligned workspace",
             )
         self.workspace = float_workspace_buffer
+        # the ranged unit tables are built lazily: the ones built in the old buffer are not reused
+        self._range_plans = {}
 
     #: The wrappers' ``plan()`` arguments the class does not take, with what the class takes instead: any of them set is refused.
     _PLAN_ARGS_OUTSIDE_THE_CLASS = {
@@ -162,7 +176,9 @@ class BatchInvariantAttention:
         """The wrappers' ``workspace_size``: the float workspace bytes the split-KV plan of this batch needs (0 when every unit is
         fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits). ``mask_mode``
         (keyword-only): what a row of the plan will see -- ``"key_set"`` for a plan with a custom mask (the explicit-key-set
-        class spans every request's whole key range)."""
+        class spans every request's whole key range). Kind ``"ranges"`` (always the ``key_ranges`` mode): the ranges arrive at
+        ``run()``, so the size is that of the batch whose every token's range is its request's whole key range -- an upper bound
+        for any ranges (the unit count does not depend on them and every split group's chunks are at most these)."""
         D = int(head_dim)
         if D not in HEAD_DIMS:
             raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
@@ -179,6 +195,17 @@ class BatchInvariantAttention:
             if (self.kind != "ragged" and kv_last_page_len is not None)
             else None
         )
+        ranges = None
+        if self.kind == "ranges":
+            assert last_host is not None
+            spans = kv_host[1:] - kv_host[:-1]
+            kv_lens = torch.where(
+                spans > 0, (spans - 1) * int(page_size) + last_host, 0
+            )
+            hi = torch.repeat_interleave(
+                kv_lens, (qo_host[1:] - qo_host[:-1]).clamp(min=0)
+            )
+            ranges = torch.stack((torch.zeros_like(hi), hi), dim=1)
         return engine.workspace_bytes(
             qo_host,
             kv_host,
@@ -191,7 +218,10 @@ class BatchInvariantAttention:
             engine.default_config(D=D),
             self.device,
             ragged=self.kind == "ragged",
-            mask_mode=MASK_CAUSAL if self.kind == "decode" else mask_mode,
+            mask_mode=MASK_KEY_RANGES
+            if self.kind == "ranges"
+            else (MASK_CAUSAL if self.kind == "decode" else mask_mode),
+            ranges=ranges,
         )
 
     # ------------------------------------------------------------------ plan
@@ -269,18 +299,27 @@ class BatchInvariantAttention:
                 CLASS, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
             )
         masked = custom_mask is not None or packed_custom_mask is not None
-        if masked and self.kind == "decode":
+        if masked and self.kind in ("decode", "ranges"):
             raise unsupported(
                 CLASS,
-                "a custom mask on the decode wrapper",
-                "the causal mask with an optional sliding window",
+                f"a custom mask on the {self.kind} wrapper",
+                "the causal mask with an optional sliding window"
+                if self.kind == "decode"
+                else "the causal keys and the bidirectional ranges of run()",
             )
-        # a custom mask replaces the causal mask, as in the regular kernels: ``causal`` is not read with one
-        if self.kind != "decode" and not causal and not masked:
+        # a custom mask replaces the causal mask, as in the regular kernels: ``causal`` is not read with one.
+        # kind "ranges": the wrapper owns its mask (the causal keys and the ranges) and plans with causal=False by contract
+        if self.kind in ("prefill", "ragged") and not causal and not masked:
             raise unsupported(
                 CLASS,
                 "non-causal attention",
                 "causal attention (bottom-right aligned), or a custom mask",
+            )
+        if self.kind == "ranges" and window_left not in (None, -1):
+            raise unsupported(
+                CLASS,
+                f"window_left {window_left} at plan()",
+                "the windows of run(causal_window_left=..., range_window_left=...)",
             )
         if logits_soft_cap is not None and logits_soft_cap > 0:
             raise unsupported(
@@ -484,6 +523,83 @@ class BatchInvariantAttention:
             slots = engine.Q2_RING[D][arch_smem_cap(self.device) >= (300 << 10)]
             if slots:
                 config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
+        range_meta = None
+        planned = None
+        if self.kind == "ranges":
+            # the unit table needs the ranges, which arrive at run(): keep what it is built from (host snapshots)
+            q_len_t = qo_host[1:] - qo_host[:-1]
+            kv_len_t = torch.tensor(kv_lens, dtype=torch.int64)
+            first = kv_len_t - q_len_t  # the position of a request's first query token
+            tok = torch.arange(int(qo_host[-1]) if qo_host.numel() else 0)
+            range_meta = {
+                "qo": qo_host,
+                "kv": kv_indptr_host,
+                "last": last_host,
+                "pos": tok
+                - torch.repeat_interleave(qo_host[:-1], q_len_t)
+                + torch.repeat_interleave(first, q_len_t),
+                "kv_len": torch.repeat_interleave(kv_len_t, q_len_t),
+            }
+        else:
+            planned, config = self._plan_units(
+                qo_host,
+                kv_indptr_host,
+                last_host,
+                num_qo_heads,
+                num_kv_heads,
+                D,
+                page_size,
+                window_left,
+                config,
+                key_sets=key_sets,
+            )
+        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from
+        # snapshots: kv_indptr's is the plan's own (engine.plan_attention: the descriptor table holds its offsets; kind "ranges"
+        # builds its plans at run()), kv_indices' is taken here; a later in-place change by the caller cannot reach a plan built
+        # from the old values, and the plan is published only once everything it runs with exists
+        kv_indices_dev = (
+            kv_indices.to(
+                device=self.device,
+                dtype=torch.int32,
+                non_blocking=non_blocking,
+                copy=True,
+            ).contiguous()
+            if kv_indices is not None
+            else torch.zeros(1, dtype=torch.int32, device=self.device)
+        )
+        self._planned = planned
+        self._range_meta = range_meta
+        self._range_plans = {}
+        self._config = config
+        self._kv_indptr = planned.kv_indptr if planned is not None else None
+        self._kv_indices = kv_indices_dev
+        self._max_page = max_page
+        self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
+        self._sm_scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
+        self._scale_log2 = scale_log2(self._sm_scale)
+        self._window_left = int(window_left)
+        self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
+        self._heads = (num_qo_heads, num_kv_heads, D)
+        self._page = page_size
+        self._masked = masked
+
+    def _plan_units(
+        self,
+        qo_host: torch.Tensor,
+        kv_indptr_host: torch.Tensor,
+        last_host: Optional[torch.Tensor],
+        num_qo_heads: int,
+        num_kv_heads: int,
+        D: int,
+        page_size: int,
+        window_left: int,
+        config: engine.AttnConfig,
+        *,
+        key_sets: Optional[engine.KeySets] = None,
+        ranges: Optional[torch.Tensor] = None,
+    ) -> Tuple[engine._Planned, engine.AttnConfig]:
+        """The engine's plan in the wrapper's workspace, and the configuration it was built with. ``key_sets`` (the ``key_set``
+        mode) or ``ranges`` (the ``key_ranges`` mode) select what a row sees; neither: the causal mode."""
         try:
             planned = engine.plan_attention(
                 qo_host,
@@ -499,6 +615,7 @@ class BatchInvariantAttention:
                 self.device,
                 ragged=self.kind == "ragged",
                 key_sets=key_sets,
+                ranges=ranges,
             )
         except engine.WorkspaceTooSmall:
             # the planner's split units need more partials space than the caller's workspace holds: plan fused units instead (every unit
@@ -521,6 +638,7 @@ class BatchInvariantAttention:
                     self.device,
                     ragged=self.kind == "ragged",
                     key_sets=key_sets,
+                    ranges=ranges,
                 )
             except engine.WorkspaceTooSmall as e:
                 raise unsupported(
@@ -528,33 +646,7 @@ class BatchInvariantAttention:
                     f"a float workspace buffer of {self.workspace.numel() * self.workspace.element_size()} bytes",
                     f"at least {e.needed} bytes for this batch's split-KV partials",
                 ) from None
-        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from
-        # snapshots: kv_indptr's is the plan's own (engine.plan_attention: the descriptor table holds its offsets), kv_indices' is
-        # taken here; a later in-place change by the caller cannot reach a plan built from the old values, and the plan is published
-        # only once everything it runs with exists
-        kv_indices_dev = (
-            kv_indices.to(
-                device=self.device,
-                dtype=torch.int32,
-                non_blocking=non_blocking,
-                copy=True,
-            ).contiguous()
-            if kv_indices is not None
-            else torch.zeros(1, dtype=torch.int32, device=self.device)
-        )
-        self._planned = planned
-        self._config = config
-        self._kv_indptr = planned.kv_indptr
-        self._kv_indices = kv_indices_dev
-        self._max_page = max_page
-        self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
-        self._sm_scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
-        self._scale_log2 = scale_log2(self._sm_scale)
-        self._window_left = int(window_left)
-        self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
-        self._heads = (num_qo_heads, num_kv_heads, D)
-        self._page = page_size
-        self._masked = masked
+        return planned, config
 
     def validate_forward_options(
         self,
@@ -646,6 +738,53 @@ class BatchInvariantAttention:
         """Validate changing run-time inputs once, then launch with the fixed plan."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
+        self._refuse_run_options(
+            return_lse=return_lse,
+            lse=lse,
+            scales=scales,
+            sinks=sinks,
+            kv_cache_sf=kv_cache_sf,
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            use_fp16_softmax=use_fp16_softmax,
+            uses_spcompress=uses_spcompress,
+        )
+        if window_left is not None and int(window_left) != self._window_left:
+            raise unsupported(
+                CLASS,
+                f"window_left {window_left} at run() after planning {self._window_left}",
+                "the planned window",
+            )
+        q, out = self._checked_run_tensors(q, k, v, out)
+        engine._run_attention_validated(
+            self._planned,
+            q,
+            k,
+            v,
+            self._kv_indptr,
+            self._kv_indices,
+            self._scale_log2,
+            self._window_left,
+            self.kv_layout,
+            out,
+            self._config,
+            ragged=self.kind == "ragged",
+            enable_pdl=enable_pdl,
+        )
+        return out
+
+    def _refuse_run_options(
+        self,
+        *,
+        return_lse: bool,
+        lse: Optional[torch.Tensor],
+        scales: Tuple = (),
+        sinks=None,
+        kv_cache_sf=None,
+        skip_softmax_threshold_scale_factor=None,
+        use_fp16_softmax: Optional[bool] = None,
+        uses_spcompress: Optional[bool] = None,
+    ) -> None:
+        """The ``run()`` options outside the class: any of them set raises the typed error."""
         if use_fp16_softmax or uses_spcompress:
             raise unsupported(
                 CLASS,
@@ -670,12 +809,15 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, "skip_softmax_threshold_scale_factor", "the full softmax"
             )
-        if window_left is not None and int(window_left) != self._window_left:
-            raise unsupported(
-                CLASS,
-                f"window_left {window_left} at run() after planning {self._window_left}",
-                "the planned window",
-            )
+
+    def _checked_run_tensors(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``run()``'s tensors checked against the plan: the packed contiguous ``q`` and the output to write."""
         Hq, Hkv, D = self._heads
         if q.dim() == 4:
             q = q.reshape(-1, q.shape[-2], q.shape[-1])
@@ -766,19 +908,101 @@ class BatchInvariantAttention:
                 "an output that aliases the KV cache",
                 "an output byte span disjoint from the KV caches (CTAs store rows while others still read pages)",
             )
+        return q, out
+
+    # ------------------------------------------------------------------ run (the ranged class)
+    def _class_ranges(self, host: torch.Tensor, range_window: int) -> torch.Tensor:
+        """The wrapper's range rows -- inclusive ``[start, end]`` per query token, ``(-1, -1)`` for none, the range part kept
+        while ``pos - key < range_window`` when ``range_window > 0`` -- as the class's ranges: the keys ``[a, b)`` of the request
+        (``0 <= a <= b <= kv_len``), ``(0, 0)`` for a token without one."""
+        assert self._range_meta is not None
+        pos, kv_len = self._range_meta["pos"], self._range_meta["kv_len"]
+        host = host.to(torch.int64)
+        a = host[:, 0].clamp(min=0)
+        b = torch.minimum(host[:, 1] + 1, kv_len)
+        if range_window > 0:
+            a = torch.maximum(a, pos - range_window + 1)
+        none = a >= b
+        return torch.stack((a.masked_fill(none, 0), b.masked_fill(none, 0)), dim=1)
+
+    def run_ranges(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bidirectional_ranges: torch.Tensor,
+        *,
+        causal_window_left: int,
+        range_window_left: int,
+        out: Optional[torch.Tensor],
+        return_lse: bool,
+        lse: Optional[torch.Tensor],
+        scales: Tuple = (),
+        kv_cache_sf=None,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """``BatchPrefillWithCausalBidirectionalRangesWrapper.run``: token ``i`` sees its causal keys (bounded by
+        ``causal_window_left`` as FlashInfer's ``window_left``; negative: unbounded) and the keys of its range row. The unit
+        table of a range tensor and window pair is built at its first call and kept until the next ``plan()``."""
+        if self.kind != "ranges" or self._range_meta is None:
+            raise RuntimeError("plan() must be called before run()")
+        if torch.cuda.is_current_stream_capturing():
+            raise unsupported(
+                CLASS,
+                "capturing run() of the ranges wrapper in a CUDA graph",
+                "an eager run() (it reads the range tensor back to the host to build the work units)",
+            )
+        self._refuse_run_options(
+            return_lse=return_lse, lse=lse, scales=scales, kv_cache_sf=kv_cache_sf
+        )
+        causal_window = -1 if int(causal_window_left) < 0 else int(causal_window_left)
+        range_window = max(int(range_window_left), 0)
+        q, out = self._checked_run_tensors(q, k, v, out)
+        if (
+            bidirectional_ranges.dim() != 2
+            or tuple(bidirectional_ranges.shape) != (self._total_q, 2)
+            or bidirectional_ranges.dtype != torch.int32
+        ):
+            raise unsupported(
+                CLASS,
+                f"bidirectional_ranges {tuple(bidirectional_ranges.shape)} {bidirectional_ranges.dtype}",
+                f"an int32 ({self._total_q}, 2) tensor: one [start, end] row per planned query token",
+            )
+        host = bidirectional_ranges.to("cpu", non_blocking=False)
+        key = (causal_window, range_window, host.numpy().tobytes())
+        planned = self._range_plans.get(key)
+        if planned is None:
+            Hq, Hkv, D = self._heads
+            meta = self._range_meta
+            assert self._config is not None
+            planned, _ = self._plan_units(
+                meta["qo"],
+                meta["kv"],
+                meta["last"],
+                Hq,
+                Hkv,
+                D,
+                self._page,
+                causal_window,
+                self._config,
+                ranges=self._class_ranges(host, range_window),
+            )
+            while len(self._range_plans) >= RANGE_PLANS_KEPT:
+                self._range_plans.pop(next(iter(self._range_plans)))
+            self._range_plans[key] = planned
         engine._run_attention_validated(
-            self._planned,
+            planned,
             q,
             k,
             v,
-            self._kv_indptr,
+            planned.kv_indptr,
             self._kv_indices,
             self._scale_log2,
-            self._window_left,
+            causal_window,
             self.kv_layout,
             out,
-            self._config,
-            ragged=self.kind == "ragged",
+            planned.config,
+            ragged=False,
             enable_pdl=enable_pdl,
         )
         return out

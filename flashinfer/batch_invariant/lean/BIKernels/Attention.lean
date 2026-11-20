@@ -139,7 +139,8 @@ def pvFold (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :=
     .mma acc (String.join (slice.map (fun q => " " ++ q.sexpr))) (vt0 + j) d) o0
 
 /-- `spec.tile_step` on a present tile `t` of a row whose visible keys are `vis`: the one tile step of every attention
-class (the causal rows give `visibleG p win`, the explicit-key-set rows their own key bits). -/
+class, written once over the visible set (the causal rows give `visibleG p win`, the explicit-key-set rows their own key bits,
+the ranged rows of `AttentionRanges.lean` the causal keys united with their range). -/
 def tileStepV (steps tbits row d : Nat) (vis : Nat → Bool) (st : State) (t : Nat) : State :=
   let T := 2 ^ tbits
   let scores : List (Option ATerm) :=

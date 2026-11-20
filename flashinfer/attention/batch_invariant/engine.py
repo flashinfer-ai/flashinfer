@@ -32,12 +32,20 @@ from .plan import (
     F_VIS,
     GRID_SEARCH_ARCHES,
     GROUP_FIELDS,
+    RANGE_ROW_TOKENS,
     build_plan,
     keys_are_data,
     snake_order,
     ws_row,
 )
-from .spec import HEAD_DIMS, MASK_CAUSAL, MASK_KEY_SET, TILE_KEYS, scale_log2
+from .spec import (
+    HEAD_DIMS,
+    MASK_CAUSAL,
+    MASK_KEY_RANGES,
+    MASK_KEY_SET,
+    TILE_KEYS,
+    scale_log2,
+)
 
 
 PAGE_SIZES = (
@@ -396,6 +404,46 @@ def append_row_visibility(
     ).reshape(-1, DESC_FIELDS)
 
 
+def _host_ranges(ranges: Optional[torch.Tensor], total_q: int):
+    """The ranged class's per-token ranges as a host int32 array of pairs ``(a, b)`` (the keys ``[a, b)``; ``a == b``: none), one
+    per packed query token; ``None`` for the other mask modes."""
+    if ranges is None:
+        return None
+    if ranges.dim() != 2 or ranges.shape[1] != 2 or ranges.shape[0] != total_q:
+        raise ValueError(
+            f"ranges of shape {tuple(ranges.shape)}: one (a, b) pair per packed query token is ({total_q}, 2)"
+        )
+    host = ranges.to("cpu").to(torch.int64)
+    if bool(
+        ((host[:, 0] < 0) | (host[:, 0] > host[:, 1]) | (host[:, 1] >= 2**31)).any()
+    ):
+        raise ValueError("ranges must satisfy 0 <= a <= b < 2^31 per token")
+    return host.to(torch.int32).contiguous().numpy()
+
+
+def pack_key_ranges(ranges, qo_indptr: List[int]) -> RowVisibility:
+    """The ``key_ranges`` mode's row-visibility blocks from the host ranges of ``_host_ranges`` (one ``(a, b)`` pair per packed
+    query token): per request its tokens' pairs in token order, ``RANGE_ROW_TOKENS`` pairs per table row, every request from a
+    table row (zero-padded). A token's pair sits at an offset given by its request's block and its token index alone."""
+    import numpy as np
+
+    qo = np.asarray(qo_indptr, dtype=np.int64)
+    q_lens = np.maximum(qo[1:] - qo[:-1], 0)
+    blk_rows = -(-q_lens // RANGE_ROW_TOKENS)
+    row_start = np.concatenate(([0], np.cumsum(blk_rows)))
+    rows = int(row_start[-1])
+    words = np.zeros((rows * RANGE_ROW_TOKENS, 2), dtype=np.int32)
+    total_q = int(q_lens.sum())
+    if total_q:
+        slot = np.repeat(
+            row_start[:-1] * RANGE_ROW_TOKENS - qo[:-1], q_lens
+        ) + np.arange(qo[0], qo[0] + total_q)
+        words[slot] = ranges[qo[0] : qo[0] + total_q]
+    return RowVisibility(
+        torch.from_numpy(words.reshape(-1)), row_start[:-1].tolist(), rows
+    )
+
+
 @dataclass
 class KeySets(RowVisibility):
     """The key sets of a batch in the kernels' layout (the ``key_set`` mode's row-visibility blocks): ``words`` holds, per request
@@ -569,8 +617,15 @@ def plan_attention(
     sm_count: Optional[int] = None,
     ragged: bool = False,
     key_sets: Optional[KeySets] = None,
+    ranges: Optional[torch.Tensor] = None,
 ) -> _Planned:
-    """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
+    """What a row sees (the plan's ``mask_mode``) follows from the visibility data given: ``ranges`` selects the ``key_ranges``
+    mode (the ranged class), ``key_sets`` the ``key_set`` mode (the explicit-key-set class), neither the causal mode; the plan is
+    built for that data (a snapshot: the kernels read the plan's copy, appended to the descriptor table as the requests'
+    row-visibility blocks) and its batches take the row body.
+    ``ranges``: an integer ``(total_q, 2)`` tensor with one key range ``(a, b)`` per packed query token (the keys ``[a, b)`` of
+    the token's request, ``0 <= a <= b <= kv_len``; ``a == b``: none, the causal row).
+    ``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
     holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer.
     ``key_sets``: the explicit-key-set class (``pack_key_sets``) -- every row's visible keys as data; a row block walks the
@@ -588,9 +643,19 @@ def plan_attention(
         if sm_count is not None
         else (device_sm_count(device) if device.type == "cuda" else 204)
     )
-    mask_mode = MASK_KEY_SET if key_sets is not None else MASK_CAUSAL
+    if key_sets is not None and ranges is not None:
+        raise ValueError(
+            "a plan takes key sets or key ranges, not both (one mask mode per plan)"
+        )
+    qo_list = qo_indptr.cpu().tolist()
+    host_ranges = _host_ranges(ranges, qo_list[-1] if qo_list else 0)
+    mask_mode = MASK_CAUSAL
     vis: Optional[RowVisibility] = None
-    if key_sets is not None:
+    if host_ranges is not None:
+        mask_mode = MASK_KEY_RANGES
+        vis = pack_key_ranges(host_ranges, qo_list)
+    elif key_sets is not None:
+        mask_mode = MASK_KEY_SET
         vis = key_sets
         key_sets.check(
             qo_indptr.cpu().tolist(), plan_kv_lens(kv_indptr, kv_last_page_len, page)
@@ -600,7 +665,7 @@ def plan_attention(
         config.small == "swap" and D in SWAPS_DIMS and not keys_are_data(mask_mode)
     )
     plan = build_plan(
-        qo_indptr.cpu().tolist(),
+        qo_list,
         kv_indptr.cpu().tolist(),
         kv_last_page_len.cpu().tolist(),
         Hq,
@@ -619,6 +684,7 @@ def plan_attention(
         key_tiles=(key_sets.tile_first, key_sets.tile_last)
         if key_sets is not None and key_sets.tile_first is not None
         else None,
+        ranges=host_ranges,
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
     desc = torch.tensor(
@@ -702,10 +768,12 @@ def workspace_bytes(
     ragged: bool = False,
     *,
     mask_mode: str = MASK_CAUSAL,
+    ranges: Optional[torch.Tensor] = None,
 ) -> int:
     """The float workspace bytes ``plan_attention`` needs for this batch's split-KV partials (0 when the plan has no split
     group); the planner runs on the host, nothing is allocated. ``mask_mode`` (keyword-only): what a row sees -- ``"key_set"``
-    plans the explicit-key-set class's geometry (every request's whole key range)."""
+    plans the explicit-key-set class's geometry (every request's whole key range), ``"key_ranges"`` the ranged class's for the
+    per-token ``ranges``, as ``plan_attention`` takes them."""
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
@@ -714,8 +782,14 @@ def workspace_bytes(
     config = config or default_config(D=D)
     device = torch.device(device or qo_indptr.device)
     sm = device_sm_count(device) if device.type == "cuda" else 204
+    qo_list = qo_indptr.cpu().tolist()
+    host_ranges = _host_ranges(ranges, qo_list[-1] if qo_list else 0)
+    if (host_ranges is not None) != (mask_mode == MASK_KEY_RANGES):
+        raise ValueError(
+            "the key_ranges mode is sized with the tokens' ranges, the other modes without"
+        )
     plan = build_plan(
-        qo_indptr.cpu().tolist(),
+        qo_list,
         kv_indptr.cpu().tolist(),
         kv_last_page_len.cpu().tolist(),
         Hq,
@@ -732,6 +806,7 @@ def workspace_bytes(
         swap_max_rows=SWAPS_MAX_ROWS,
         grid_search=planner_grid_search(device),
         mask_mode=mask_mode,
+        ranges=host_ranges,
     )
     return plan.ws_rows * ws_row(D) * 4
 

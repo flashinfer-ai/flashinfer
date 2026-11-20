@@ -3157,6 +3157,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
     wrapper class manages the lifecycle of these data structures.
     """
 
+    #: the kind of the ``batch_invariant=True`` delegate (``attention.batch_invariant.wrappers``); a subclass with its own
+    #: batch-invariant class names its kind here
+    _BATCH_INVARIANT_KIND = "prefill"
+
     @flashinfer_api
     def __init__(
         self,
@@ -3301,7 +3305,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._batch_invariant = BatchInvariantAttention(
                 float_workspace_buffer,
                 kv_layout,
-                "prefill",
+                self._BATCH_INVARIANT_KIND,
                 backend,
                 jit_args,
                 use_cuda_graph=use_cuda_graph,

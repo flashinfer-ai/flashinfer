@@ -40,7 +40,11 @@ def test_generated_cases_are_current():
         assert f"theorem {name} " in committed
     with open(os.path.join(lean_cases.LEAN_DIR, "Axioms.lean")) as f:
         axioms = f.read()
-    for name in lean_cases.DECIDED_THEOREMS + lean_cases.MODULE_DECIDED_THEOREMS:
+    for name in (
+        lean_cases.DECIDED_THEOREMS
+        + lean_cases.MODULE_DECIDED_THEOREMS
+        + lean_cases.RANGES_DECIDED_THEOREMS
+    ):
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
 
 
@@ -62,6 +66,19 @@ def test_generated_attention_mask_cases_are_current():
         assert f"theorem {name} " in committed
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
     assert len(committed) < 4 << 20
+
+
+def test_generated_ranges_cases_are_current():
+    """The ranged attention class's cases (their own module): byte for byte what the Python spec emits."""
+    with open(lean_cases.RANGES_CASES_PATH) as f:
+        committed = f.read()
+    assert committed == lean_cases.render_ranges(), (
+        "regenerate with: python -m flashinfer.batch_invariant.lean_cases"
+    )
+    assert "sorry" not in committed
+    assert committed.count("native_decide") == len(lean_cases.RANGES_DECIDED_THEOREMS)
+    for name in lean_cases.RANGES_DECIDED_THEOREMS:
+        assert f"theorem {name} " in committed
 
 
 def test_rendering_takes_the_nominal_parts():
@@ -136,6 +153,7 @@ def test_lean_model_matches_python_engine_and_spec():
         "fp4class": "fp4class",
         "attn": "attn",
         "attnmask": "attn",
+        "attnr": "attn",
     }
     # the block-scale fp8 class: the output at (0, 0) and at (3, 129) per (blocks, format), the promotion loop per block count
     kinds.update({"gemmfp8bs": "out", "gemmfp8bs2": "out", "gemmfp8bsloop": "loop"})
@@ -218,6 +236,9 @@ def test_lean_model_matches_python_engine_and_spec():
     for name, *_, sx in lean_cases.attn_mask_cases():
         assert lean[("attnmask", name)] == sx, name
         checked += 1
+    for name, *_, sx in lean_cases.attn_range_cases():
+        assert lean[("attnr", name)] == sx, name
+        checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80
 
@@ -231,5 +252,6 @@ def test_axioms_policy():
         len(lean_cases.DECIDED_THEOREMS)
         + len(lean_cases.MODULE_DECIDED_THEOREMS)
         + len(lean_cases.ATTN_MASK_DECIDED_THEOREMS)
+        + len(lean_cases.RANGES_DECIDED_THEOREMS)
     )
     assert f"{n_decided} named table theorems" in r.stdout, r.stdout

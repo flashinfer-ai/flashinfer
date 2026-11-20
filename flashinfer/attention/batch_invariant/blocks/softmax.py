@@ -8,6 +8,8 @@ of every row (the warps of the warpgroups share their TMEM lanes, so a row's key
 * (``st.mask_mode == "key_set"``, the explicit-key-set class) loads the row's key bits of the tile, ``T / 32`` int32 from the
   request's row-visibility block behind the descriptor table (``plan.F_VIS``), before waiting for ``S``, and masks by bit instead
   of by range;
+* (``st.mask_mode == "key_ranges"``, the ranged class) masks by two unsigned compares per key against the hull of the row's
+  causal part and its range part (read once per unit from the same block) less the gap between the two;
 * copies the **whole** row of ``S`` out of TMEM for the ``rowmax`` plan (the canonical 128-leaf pairwise
   tree, recomputed by every slice: a redundant tree costs less than an exchange) and its own slice of
   the row for the exponentials, masks both by absolute key (``select``; only on boundary tiles),
@@ -48,8 +50,8 @@ from ....batch_invariant.fp_interface.cute import CuteF32, fmax3
 
 
 from .. import spec
-from ..spec import MASK_KEY_SET
-from ..plan import DESC_FIELDS
+from ..spec import MASK_KEY_RANGES, MASK_KEY_SET
+from ..plan import DESC_FIELDS, RANGE_ROW_TOKENS
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
 _NEG_INF = float("-inf")
@@ -333,19 +335,33 @@ def unit_loop(
     neg_inf = Float32(_NEG_INF)
     m = Float32(_NEG_INF)
     N = tile_hi - tile_lo
-    # the explicit-key-set class: the row's visible keys are its key-set words -- one bit per key of [0, kv_len), 32 keys per int32,
-    # WORDS words per tile, the row's tiles consecutive, the request's rows in token order from table row ``vis_row`` (``DESC_FIELDS`` int32
-    # per table row); bits past kv_len are zero. A padding row reads the request's last row (a valid address; its values are never stored)
+    # ---- what the row sees: ONE dispatch on ``st.mask_mode`` (here, at the tile's bit load, at the decision whether the tile needs
+    # masking and at the mask itself); the causal mode is the last branch of each and its code is the body's own. Under the two
+    # modes whose keys are data the row's data is read from its request's row-visibility block, which starts at table row
+    # ``vis_row`` (``DESC_FIELDS`` int32 per table row; ``plan.F_VIS``); a padding row reads the request's last row (a valid
+    # address; its values are never stored).
+    # key_ranges: the row also sees the keys [a_row, b_row) of its token's pair (a == b: none)
+    # key_set: the row's visible keys are its key-set words -- one bit per key of [0, kv_len), 32 keys per int32, WORDS words per
+    #   tile, the row's tiles consecutive, the request's rows in token order; bits past kv_len are zero
     KEY_SET = st.mask_mode == MASK_KEY_SET
+    KEY_RANGES = st.mask_mode == MASK_KEY_RANGES
     WORDS = T // 32
     row_words = Int64(0)
     mw = None
     msw = None
     n_sw = max(1, kpt // 32)  # the words of the thread's key slice
-    if cutlass.const_expr(KEY_SET):
-        tok_m = token
+    a_row = Int32(0)
+    b_row = Int32(0)
+    tok_m = token
+    if cutlass.const_expr(st.keys_are_data):
         if tok_m > q_len - 1:
             tok_m = q_len - 1
+    if cutlass.const_expr(KEY_RANGES):
+        range_row = vis_row + tok_m // RANGE_ROW_TOKENS
+        range_col = 2 * (tok_m % RANGE_ROW_TOKENS)
+        a_row = mDesc[(range_row, range_col)]
+        b_row = mDesc[(range_row, range_col + 1)]
+    if cutlass.const_expr(KEY_SET):
         row_words = vis_row.to(Int64) * DESC_FIELDS + tok_m.to(Int64) * (
             ((kv_len + T - 1) // T) * WORDS
         )
@@ -417,6 +433,13 @@ def unit_loop(
             need_mask = cute.arch.vote_any_sync(
                 (w_all != Int32(-1)) & (row < rows_valid)
             )
+        elif cutlass.const_expr(KEY_RANGES):
+            # a tile is unmasked for a row when it lies inside the row's causal keys or inside its range
+            need_mask = cute.arch.vote_any_sync(
+                ((k0 < lo_row) | (k0 + T > L_row))
+                & ((k0 < a_row) | (k0 + T > b_row))
+                & (row < rows_valid)
+            )
         else:
             need_mask = cute.arch.vote_any_sync(
                 ((k0 < lo_row) | (k0 + T > L_row)) & (row < rows_valid)
@@ -436,8 +459,65 @@ def unit_loop(
                             msw[int(cols_s[i]) // 32] & _bit(int(cols_s[i]) % 32)
                         ) == Int32(0):
                             rS[i] = neg_inf
-            # the row's visible range in tile-relative columns: key k0 + col is masked iff col < lim_lo or col >= lim_hi (the slice's
-            # columns offset by col_base)
+            elif cutlass.const_expr(KEY_RANGES):
+                # the keys of this tile the row sees are the hull [u_lo, u_hi) of its causal part and its range part less the
+                # gap [g_lo, g_hi) between the two (empty unless both parts lie in the tile, apart)
+                k1 = k0 + T
+                u_lo = lo_row
+                if u_lo < k0:
+                    u_lo = k0
+                u_hi = L_row
+                if u_hi > k1:
+                    u_hi = k1
+                r_lo = a_row
+                if r_lo < k0:
+                    r_lo = k0
+                r_hi = b_row
+                if r_hi > k1:
+                    r_hi = k1
+                g_lo = Int32(0)
+                g_hi = Int32(0)
+                if r_lo < r_hi:
+                    if u_lo < u_hi:
+                        g_lo = u_hi
+                        if r_hi < g_lo:
+                            g_lo = r_hi
+                        g_hi = u_lo
+                        if r_lo > g_hi:
+                            g_hi = r_lo
+                        if r_lo < u_lo:
+                            u_lo = r_lo
+                        if r_hi > u_hi:
+                            u_hi = r_hi
+                    else:
+                        u_lo = r_lo
+                        u_hi = r_hi
+                # key in [lo, hi) as ONE unsigned compare, (key - lo) < (hi - lo): a key is masked when it is outside the hull
+                # or inside the gap -- two compares per key, as the causal body's mask
+                w_u = u_hi - u_lo
+                if w_u < 0:
+                    w_u = Int32(0)
+                w_g = g_hi - g_lo
+                if w_g < 0:
+                    w_g = Int32(0)
+                wu = cutlass.Uint32(w_u)
+                wg = cutlass.Uint32(w_g)
+                if cutlass.const_expr(not exchange):
+                    du = cutlass.Uint32(k0 - u_lo)
+                    dg = cutlass.Uint32(k0 - g_lo)
+                    for i in cutlass.range_constexpr(T):
+                        col = cutlass.Uint32(int(cols_f[i]))
+                        if ((du + col) >= wu) | ((dg + col) < wg):
+                            rF[i] = neg_inf
+                if cutlass.const_expr(not one_slice):
+                    du_s = cutlass.Uint32(k0 + col_base - u_lo)
+                    dg_s = cutlass.Uint32(k0 + col_base - g_lo)
+                    for i in cutlass.range_constexpr(kpt):
+                        col = cutlass.Uint32(int(cols_s[i]))
+                        if ((du_s + col) >= wu) | ((dg_s + col) < wg):
+                            rS[i] = neg_inf
+            # the causal mode. The row's visible range in tile-relative columns: key k0 + col is masked iff col < lim_lo or
+            # col >= lim_hi (the slice's columns offset by col_base)
             elif cutlass.const_expr(st.D <= MASK_SELECT_MAX_D):
                 lim_lo = lo_row - k0
                 lim_hi = L_row - k0

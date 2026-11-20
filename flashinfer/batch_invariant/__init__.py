@@ -100,6 +100,12 @@ def _attention_fingerprint(head_dim: int, custom_mask: bool = False) -> str:
     return spec_fingerprint(head_dim)
 
 
+def _attention_ranges_fingerprint(head_dim: int) -> str:
+    from ..attention.batch_invariant.spec import MASK_KEY_RANGES, spec_fingerprint
+
+    return spec_fingerprint(head_dim, mask_mode=MASK_KEY_RANGES)
+
+
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
     capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device.
@@ -626,6 +632,11 @@ CLASSES: Dict[str, ClassInfo] = {
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint, ("custom_mask",)
     ),
+    # the ranged class: the same dataflow over the causal keys united with one bidirectional key range per query token (its
+    # own receipt: what a row may see is part of the class; a row without a range has the causal class's term and bits)
+    "BatchPrefillWithCausalBidirectionalRangesWrapper": ClassInfo(
+        "attention.bf16", ("head_dim",), _attention_ranges_fingerprint
+    ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
     "fused_moe_fp8": ClassInfo(
@@ -732,6 +743,10 @@ def fingerprint(op: str, **dims) -> str:
     which a token's visible keys are its own mask row (ANDed with the window) instead of its causal range. The mask is data of
     that class, like the KV position of the causal one: one receipt covers every mask, and a mask row equal to a causal range
     gives the causal class's bits.
+    ``BatchPrefillWithCausalBidirectionalRangesWrapper`` takes ``head_dim`` too and names the ranged class
+    (``attn-bf16-d<D>-br-*``): the same tiles, chunks, softmax step and merge over the causal keys united with the token's
+    bidirectional key range. The ranges and the two windows are per-call inputs like the KV position; a token without a
+    range has the causal class's term, so its bits are those of the three wrappers above.
 
     >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, custom_mask=True)  # doctest: +SKIP
     'attn-bf16-d128-mask-...'

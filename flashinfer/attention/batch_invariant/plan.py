@@ -12,11 +12,17 @@ does not allow. Which of the two kinds a Q tile gets is the planner's choice (it
 count); every choice computes the same bits (R3).
 
 Positions are bottom-right causal: token ``i`` of request ``b`` (``0 <= i < q_len``) sits at
-``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``. Under the explicit-key-set class (``mask_mode="key_set"``) a row's
-keys are data inside ``[0, kv_len)``: a row block's range is the tiles between the first and the last tile in which one of its
-rows has a visible key (``key_tiles``, a summary of the sets; the request's whole key range without it), and the unit and
-group construction is otherwise the same. The tiles a block skips hold no visible key of its rows -- absent leaves either way,
-so the summary only saves null steps (R3).
+``p = kv_len - q_len + i`` and sees keys ``[max(0, p - window_left), p]``. What a row sees is the planner's ``mask_mode``; the unit
+and group construction is the same under every mode, only a row block's tile and chunk range differs:
+
+* ``"key_ranges"`` (the ranged class; ``ranges``): token ``i`` also sees its own key range ``[a_i, b_i)``; a row block's tiles and
+  chunks are the hull of its tokens' visible keys, which may reach past the block's last position.
+* ``"key_set"`` (the explicit-key-set class): a row's keys are data inside ``[0, kv_len)``; a row block's range is the tiles
+  between the first and the last tile in which one of its rows has a visible key (``key_tiles``, a summary of the sets; the
+  request's whole key range without it).
+
+The tiles of a block's range that hold no visible key of a row are that row's null steps and the tiles outside it hold none --
+absent leaves either way, so a tighter range only saves null steps (R3).
 """
 
 from __future__ import annotations
@@ -24,7 +30,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
-from .spec import MASK_CAUSAL, MASK_KEY_SET, TILE_KEYS, check_mask_mode, chunk_len
+from .spec import (
+    MASK_CAUSAL,
+    MASK_KEY_RANGES,
+    MASK_KEY_SET,
+    TILE_KEYS,
+    check_mask_mode,
+    chunk_len,
+)
 
 DESC_FIELDS = 16
 # descriptor fields (int32); F_QBASE = qo_indptr[req], the packed token index of the request's first token;
@@ -51,16 +64,22 @@ DESC_FIELDS = 16
     F_NPAGES,
 ) = range(16)
 F_VIS = F_KVPTR0
+RANGE_ROW_TOKENS = (
+    DESC_FIELDS // 2
+)  # the (a, b) pairs per table row of a key_ranges row-visibility block
 # F_GROUP: the unit's split group (an index into Plan.groups) when the group's chunk fold runs IN-KERNEL (the unit that completes the
 # group folds it: blocks/correction.py), -1 otherwise (mode 0, or a group left to the fixup kernel)
 # F_VIS (every mask mode whose visible keys are data: ``keys_are_data``): the table row (``DESC_FIELDS`` int32) at which the
 # row-visibility block of the unit's request starts. ``engine.plan_attention`` appends the requests' blocks to the table behind the
 # unit rows and fills the field, so the kernels' descriptor argument carries both. The slot is field 14, which the causal mode uses
 # as F_KVPTR0: the Swaps body, the only reader of F_KVPTR0 / F_NPAGES, runs the causal mode alone. The block's layout per mode:
+#   key_ranges  per query token of the request, in token order, the pair ``(a, b)``: the keys ``[a, b)`` of the request the row sees
+#               next to its causal keys (``a == b``: none), ``RANGE_ROW_TOKENS`` pairs per table row (``engine.pack_key_ranges``)
 #   key_set     per query token of the request, in token order, ``ceil(kv_len / 128) * 4`` int32: bit ``k % 32`` of word ``k // 32``
 #               is key ``k`` of the row, bits past ``kv_len`` zero (``engine.pack_key_sets``)
 MASK_SUFFIX = {
     MASK_CAUSAL: "",
+    MASK_KEY_RANGES: "_br",
     MASK_KEY_SET: "_mk",
 }  # the kernel objects' name suffix per mode (the causal names are unchanged)
 
@@ -390,6 +409,36 @@ def swaps_unit_kinds(
     return fused, best_grid
 
 
+def range_hulls(ranges, tok0: int, q_len: int, tpt: int, kv_len: int) -> tuple:
+    """Per row block of a request (``tpt`` tokens each, the request's tokens ``tok0 .. tok0 + q_len`` of the packed ``ranges``):
+    the smallest range start and the largest range end over the block's tokens that have a range, as two lists (``kv_len`` and
+    ``0`` for a block without one). ``ranges`` is a sequence of ``(a, b)`` pairs or an integer array of shape ``(total_q, 2)``
+    (reduced with numpy: the planner's cost per token is then a few nanoseconds)."""
+    n_blk = -(-q_len // tpt)
+    if hasattr(ranges, "shape"):
+        import numpy as np
+
+        seg = ranges[tok0 : tok0 + q_len]
+        has = seg[:, 0] < seg[:, 1]
+        assert bool(((seg[:, 0] >= 0) & (seg[:, 1] <= kv_len))[has].all()), (
+            f"a range outside the request's keys [0, {kv_len})"
+        )
+        a = np.full(n_blk * tpt, kv_len, dtype=np.int64)
+        e = np.zeros(n_blk * tpt, dtype=np.int64)
+        a[:q_len] = np.where(has, seg[:, 0], kv_len)
+        e[:q_len] = np.where(has, seg[:, 1], 0)
+        return a.reshape(n_blk, tpt).min(axis=1).tolist(), e.reshape(n_blk, tpt).max(
+            axis=1
+        ).tolist()
+    los, his = [kv_len] * n_blk, [0] * n_blk
+    for i, (a, e) in enumerate(ranges[tok0 : tok0 + q_len]):
+        if a < e:
+            assert a >= 0 and e <= kv_len, (a, e, kv_len)
+            los[i // tpt] = min(los[i // tpt], a)
+            his[i // tpt] = max(his[i // tpt], e)
+    return los, his
+
+
 def build_plan(
     qo_indptr: Sequence[int],
     kv_indptr: Sequence[int],
@@ -410,8 +459,14 @@ def build_plan(
     *,
     mask_mode: str = MASK_CAUSAL,
     key_tiles: Optional[tuple] = None,
+    ranges: Optional[Sequence[Sequence[int]]] = None,
 ) -> Plan:
-    """``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``
+    """``ranges`` (the ranged class, ``mask_mode="key_ranges"``): per packed query token its key range ``(a, b)`` -- the keys ``[a, b)`` of its request, within
+    ``[0, kv_len]``, ``a == b`` for none (a sequence of pairs, or an integer array of shape ``(total_q, 2)``). A row block's tile
+    and chunk ranges are the hull of its tokens' visible keys (the causal keys and the range of every token), so they may reach
+    past the block's last position; tiles and chunks inside the hull without a visible key for a row are that row's null steps
+    and absent chunks.
+    ``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``
     live rows) takes the kinds and the launch grid of ``swaps_unit_kinds`` (a makespan model over the SM count: every unit fused on
     the grid of integral waves, or every multi-chunk unit split). Otherwise a multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows
     (a decode unit) splits when the fused unit count would leave the machine underfilled (``< 2 x SM``), a wider tile (a prefill
@@ -434,6 +489,9 @@ def build_plan(
     key."""
     assert merge in ("auto", "fixup", "inkernel"), merge
     masked = check_mask_mode(mask_mode) == MASK_KEY_SET
+    assert (ranges is not None) == (mask_mode == MASK_KEY_RANGES), (
+        "the key_ranges mode plans with the tokens' ranges, the other modes without"
+    )
     assert not (small_swap and keys_are_data(mask_mode)), (
         "the Swaps body runs the causal mode alone"
     )
@@ -458,12 +516,17 @@ def build_plan(
             assert kv_len >= q_len, (
                 f"request {b}: kv_len {kv_len} < q_len {q_len} (bottom-right causal needs kv_len >= q_len)"
             )
+        if ranges is not None:
+            hull_lo, hull_hi = range_hulls(ranges, qo_indptr[b], q_len, tpt, kv_len)
         for tok0 in range(0, q_len, tpt):
             ntok = min(tpt, q_len - tok0)
             p_first = kv_len - q_len + tok0
             p_last = p_first + ntok - 1
             L_max = p_last + 1
             lo_min = max(0, p_first - window_left) if window_left >= 0 else 0
+            if ranges is not None:
+                lo_min = min(lo_min, hull_lo[tok0 // tpt])
+                L_max = max(L_max, hull_hi[tok0 // tpt])
             chunk_lo, chunk_hi = lo_min // C, -(-L_max // C)
             tile_lo, tile_hi = lo_min // T, -(-L_max // T)
             if masked:

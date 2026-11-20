@@ -3,6 +3,7 @@
 import BIKernels.Export
 import BIKernels.Cases
 import BIKernels.AttentionMaskCases
+import BIKernels.AttentionRangesCases
 /-! `lake exe conformance`: print the Lean model's terms for the generated cases. The Python test
 (`tests/batch_invariant/test_lean.py`, the Lean tier) compares these strings with the Python spec's / engine's
 S-expressions and the dispatcher's chunk rule. -/
@@ -116,3 +117,5 @@ def main : IO Unit := do
   -- the explicit-key-set attention class (custom masks)
   for (name, P) in attnMaskCases do
     IO.println s!"attnmask {name} {(Attn.maskOutput P).sexpr}"
+  for (name, P) in attnRangesCases do
+    IO.println s!"attnr {name} {(AttnR.output P).sexpr}"
