@@ -655,7 +655,9 @@ def sparse_mla_decode_sm90(
     -------
     torch.Tensor
         The supplied or newly allocated output. Split reductions keep FP32
-        LSE and FP16 partial values; the final write is BF16.
+        LSE and FP16 partial values on the ordinary path. A split requiring
+        wide arithmetic stores a complete BF16 row instead; the combine
+        copies that row without narrowing it to FP16.
 
     Notes
     -----

@@ -389,7 +389,10 @@ def test_finite_scaled_logits_select_larger_latent(backend):
 
 @pytest.mark.parametrize("nq", [12, 13])
 @pytest.mark.parametrize("backend", ["auto", "specialized"])
-@pytest.mark.parametrize("qmag,kmag", [(2.0**-25, 16384.0), (16384.0, 2.0**-25)])
+@pytest.mark.parametrize(
+    "qmag,kmag",
+    [pair for e in (25, 26, 27) for pair in ((2.0**-e, 16384.0), (16384.0, 2.0**-e))],
+)
 def test_small_qk_component(nq, backend, qmag, kmag):
     import math
 
@@ -411,7 +414,7 @@ def test_small_qk_component(nq, backend, qmag, kmag):
         dtype=torch.uint8,
     )
     y = sparse_mla_decode_sm90(q, kv, idx, sl, ws, sm_scale=1.0, backend=backend)
-    expected = torch.full_like(y, 448.0 * math.tanh(2.0**-11))
+    expected = torch.full_like(y, 448.0 * math.tanh(qmag * kmag))
     torch.testing.assert_close(y, expected, rtol=0, atol=0.001)
     assert _sparse_mla_sm90_stats()["backend_dispatches"] == {
         "specialized": 1,
@@ -467,6 +470,58 @@ def test_extreme_rope_scores(backend, second_pos, mixed_range):
             torch.testing.assert_close(
                 captured, torch.full_like(captured, target), rtol=0, atol=0
             )
+
+
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+@pytest.mark.parametrize("second_pos", [1, 48])
+def test_scaled_score_beyond_fp32(backend, second_pos):
+    _sm90_or_skip()
+    kv = torch.zeros((1, PAGE, BPT), device="cuda", dtype=torch.uint8)
+    rope = torch.zeros(KPE, device="cuda")
+    _write_token(kv, 1, 0.0, [1.0] * 4, rope)
+    rope[0] = 2.0**100
+    _write_token(kv, 0, 1.0, [1.0] * 4, rope)
+    slots = [(0, 0), (second_pos, 1)]
+    y = _single_row_call(kv, slots, 2.0**100, 1.0, backend)
+    # exp(-2^200) is negligible even at BF16 precision.
+    torch.testing.assert_close(y, torch.ones_like(y), rtol=0, atol=0)
+    assert _sparse_mla_sm90_stats()["backend_dispatches"] == {
+        "specialized": 1,
+        "reference": 0,
+    }
+
+
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+def test_tied_wide_maxima_keep_split_mass(backend):
+    _sm90_or_skip()
+    kv = torch.zeros((1, PAGE, BPT), device="cuda", dtype=torch.uint8)
+    rope = torch.zeros(KPE, device="cuda")
+    rope[0] = 2.0**100
+    _write_token(kv, 0, 3.0, [1.0] * 4, rope)
+    _write_token(kv, 1, 0.0, [1.0] * 4, rope)
+    # Identical logits, but two copies in the second split: (3+0+0)/3.
+    y = _single_row_call(kv, [(0, 0), (48, 1), (49, 1)], 2.0**100, 1.0, backend)
+    torch.testing.assert_close(y, torch.ones_like(y), rtol=0, atol=0)
+    assert _sparse_mla_sm90_stats()["backend_dispatches"] == {
+        "specialized": 1,
+        "reference": 0,
+    }
+
+
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+@pytest.mark.parametrize("nq", [1, 13])
+def test_latent_product_beyond_fp16(backend, nq):
+    _sm90_or_skip()
+    q, kv, idx, sl, ws = _make_case(B=1, QL=nq, kv_lens=(1,))
+    q.zero_()
+    _write_token(kv, 0, 1.0, [65536.0] * 4, torch.zeros(KPE, device=q.device))
+    y = sparse_mla_decode_sm90(q, kv, idx, sl, ws, sm_scale=1.0, backend=backend)
+    # The sole selected row has unit weight irrespective of the split plan.
+    torch.testing.assert_close(y, torch.full_like(y, 65536.0), rtol=0, atol=0)
+    assert _sparse_mla_sm90_stats()["backend_dispatches"] == {
+        "specialized": 1,
+        "reference": 0,
+    }
 
 
 @pytest.mark.parametrize("value,scale", [(2.0**-9, 2.0**17), (448.0, 1e-8)])

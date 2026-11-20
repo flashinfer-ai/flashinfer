@@ -140,8 +140,7 @@ __device__ __forceinline__ double wide_bf16(unsigned short b) {
   return double(__uint_as_float(uint32_t(b) << 16));
 }
 
-__device__ __noinline__ float repair_score(const __half* packed_q, const uint8_t* kv, int slot,
-                                           float qscale) {
+__device__ __noinline__ double wide_dot(const __half* packed_q, const uint8_t* kv, int slot) {
   const auto* qb = reinterpret_cast<const unsigned short*>(packed_q);
   const uint8_t* rw = kv + size_t(slot) * BPT;
   const auto* scales = reinterpret_cast<const float*>(rw + CKV);
@@ -156,14 +155,62 @@ __device__ __noinline__ float repair_score(const __half* packed_q, const uint8_t
   }
 #pragma unroll 1
   for (int d = 0; d < KPE; ++d) dot += wide_bf16(qb[CKV + d]) * wide_bf16(rope[d]);
-  return float(dot * double(qscale));
+  return dot;
+}
+
+// Cold path only. Recompute the whole row, not just the failing split: an
+// absolute LSE cannot encode the normalization mass next to a huge maximum.
+// Reuse conv (no longer needed) for TOPK doubles and one reduction scalar.
+__device__ __noinline__ void repair_row(const __half* qs, const uint8_t* kv, const int* idx,
+                                        double scale, double* scores, __nv_bfloat16* dst) {
+  const int tid = threadIdx.x;
+  for (int h = 0; h < 8; ++h) {
+    for (int i = tid; i < TOPK; i += NTHREAD) {
+      const int slot = idx[i];
+      scores[i] = slot < 0 ? -INFINITY : wide_dot(qs + h * QS, kv, slot);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      double m = -INFINITY;
+      for (int i = 0; i < TOPK; ++i) m = fmax(m, scores[i]);
+      scores[TOPK] = m;
+    }
+    __syncthreads();
+    const double m = scores[TOPK];
+    for (int i = tid; i < TOPK; i += NTHREAD) {
+      scores[i] = scores[i] == -INFINITY ? 0. : exp((scores[i] - m) * scale);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      double z = 0.;
+      for (int i = 0; i < TOPK; ++i) z += scores[i];
+      scores[TOPK] = z > 0. ? 1. / z : 0.;
+    }
+    __syncthreads();
+    // Each thread owns two adjacent latent features, in the same scale tile.
+    const int d = 2 * tid;
+    double x = 0., y = 0.;
+    for (int i = 0; i < TOPK; ++i) {
+      const double w = scores[i];
+      if (w == 0.) continue;
+      const uint8_t* rw = kv + size_t(idx[i]) * BPT;
+      const auto pair = fp8x2_to_f16x2(*reinterpret_cast<const unsigned short*>(rw + d));
+      const double ws = w * reinterpret_cast<const float*>(rw + CKV)[d / 128];
+      x += ws * __half2float(__ushort_as_half(pair & 0xffff));
+      y += ws * __half2float(__ushort_as_half(pair >> 16));
+    }
+    dst[h * CKV + d] = __double2bfloat16(x * scores[TOPK]);
+    dst[h * CKV + d + 1] = __double2bfloat16(y * scores[TOPK]);
+    __syncthreads();
+  }
 }
 
 template <int TILE, int STATIC_TPS>
 __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
     const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ kv,
     const int* __restrict__ indices, __half* __restrict__ po, float* __restrict__ plse,
-    __nv_bfloat16* __restrict__ outp, int nsplits, int tps, float qscale) {
+    __nv_bfloat16* __restrict__ outp, int nsplits, int tps, double sm_scale) {
+  const float qscale = float(sm_scale * 1.4426950408889634);
   static_assert(STATIC_TPS == 0 || STATIC_TPS == 1, "unsupported static TPS");
   extern __shared__ __align__(16) unsigned char smem[];
   __half* conv = (__half*)smem;            // TILE * CS
@@ -268,6 +315,7 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
   float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
 
   for (int t = 0; t < nt; ++t) {
+    bool needs_wide = !isfinite(qscale) || qscale == 0.f;
     // ---- direct gather + dequantize tile -> conv (fp16) ----
     // Hoist the warp's rows before converting to expose memory-level parallelism.
     {
@@ -275,6 +323,10 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
       for (int i = 0; i < TILE / 8; ++i) {
         __half* crow = conv + (warp * (TILE / 8) + i) * CS;
         const uint32_t vm = (slots[i] < 0) ? 0u : 0xffffffffu;
+        // E4M3 nonzero magnitudes span [2^-9, 448]. Outside this
+        // sufficient scale interval the FP16 latent tile may lose range.
+        const float mag = fabsf(sc0[i]);
+        needs_wide |= slots[i] >= 0 && mag != 0.f && (mag < 0x1p-15f || mag > 65504.f / 448.f);
         const uint4 n = nv[i];
         uint4 o;
         o.x = dequant_pair(n.x & 0xffffu, sc0[i]) & vm;
@@ -344,7 +396,9 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
         const __half* head = qs + h * QS;
         if ((j < 2 ? va : vb) &&
             (reinterpret_cast<const unsigned short*>(head)[DQ] || !isfinite(s[j]))) {
-          s[j] = repair_score(head, kv, sl[tbase + t0 + l4 + (j / 2) * 8], qscale);
+          const double dot = wide_dot(head, kv, sl[tbase + t0 + l4 + (j / 2) * 8]);
+          s[j] = float(dot * double(qscale));
+          needs_wide |= !isfinite(s[j]);
         }
       }
       float mx0 = fmaxf(va ? s[0] : -INFINITY, vb ? s[2] : -INFINITY);
@@ -359,7 +413,15 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
         red0[warp * 8 + 2 * m4 + 1] = mx1;
       }
     }
-    __syncthreads();
+    if (__syncthreads_or(needs_wide)) {
+      const size_t partial = size_t(row) * nsplits + split;
+      auto* dst = nsplits == 1 ? outp + size_t(row) * (8 * CKV)
+                               : reinterpret_cast<__nv_bfloat16*>(po) + partial * (8 * CKV);
+      repair_row(qs, kv, idxp, sm_scale, reinterpret_cast<double*>(conv), dst);
+      // +inf tags a complete BF16 answer, never a partial to average.
+      if (nsplits > 1 && tid < 8) plse[partial * 8 + tid] = INFINITY;
+      return;
+    }
     // Fold the QK-warp rows; unused logical lane groups are identities.
     const int wr = lane >> 3;
     float mv = (wr < TILE / 16) ? red0[wr * 8 + (lane & 7)] : -INFINITY;
@@ -510,6 +572,15 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
 }
 
 // ---------------------------------------------------------------------------
+// A flagged split contains the final row, already rounded to BF16. If more
+// than one split needed repair their full-row results are identical.
+__device__ __forceinline__ void copy_repaired(const __half* po, __nv_bfloat16* outp, int row,
+                                              int nsplits, int split, int h, int d) {
+  const size_t i = size_t(row) * (8 * CKV) + h * CKV + d;
+  const size_t j = (size_t(row) * nsplits + split) * (8 * CKV) + h * CKV + d;
+  *reinterpret_cast<__nv_bfloat162*>(outp + i) = *reinterpret_cast<const __nv_bfloat162*>(po + j);
+}
+
 // Split combine.  One CTA per (row, head, 128-dim chunk) -> 4x more CTAs than a
 // per-(row,head) combine, so the reduction saturates HBM instead of 1/3 of the
 // SMs.  nsplits is a template constant for the shapes the splitter produces, so
@@ -528,6 +599,14 @@ __global__ __launch_bounds__(64, 8) void mla_combine_t(const __half* __restrict_
   for (int s = 0; s < NS; ++s) {
     e[s] = lp[(size_t)s * 8];
     M = fmaxf(M, e[s]);
+  }
+  if (M == INFINITY) {
+    for (int s = 0; s < NS; ++s) {
+      if (e[s] == INFINITY) {
+        copy_repaired(po, outp, row, NS, s, h, d);
+        return;
+      }
+    }
   }
   float Z = 0.f;
 #pragma unroll
@@ -571,6 +650,12 @@ __global__ __launch_bounds__(64, 8) void mla_combine_warp_t(const __half* __rest
   float M = fmaxf(x0, x1);
 #pragma unroll
   for (int o = 16; o; o >>= 1) M = fmaxf(M, __shfl_xor_sync(FULL, M, o));
+  if (M == INFINITY) {
+    const unsigned lo = __ballot_sync(FULL, x0 == INFINITY);
+    const unsigned hi = __ballot_sync(FULL, x1 == INFINITY);
+    copy_repaired(po, outp, row, NS, lo ? __ffs(lo) - 1 : 32 + __ffs(hi) - 1, h, d);
+    return;
+  }
   float w0 = (lane < NS && M > -INFINITY) ? exp2f(x0 - M) : 0.f;
   float w1 = (lane + 32 < NS && M > -INFINITY) ? exp2f(x1 - M) : 0.f;
   float Z = w0 + w1;
@@ -597,7 +682,14 @@ __global__ __launch_bounds__(64, 8) void mla_combine_g(const __half* __restrict_
   const int d = blockIdx.x * 128 + (int)threadIdx.x * 2;
   const float* lp = plse + (size_t)row * nsplits * 8 + h;
   float M = -INFINITY;
-  for (int s = 0; s < nsplits; ++s) M = fmaxf(M, lp[(size_t)s * 8]);
+  for (int s = 0; s < nsplits; ++s) {
+    const float lse = lp[(size_t)s * 8];
+    if (lse == INFINITY) {
+      copy_repaired(po, outp, row, nsplits, s, h, d);
+      return;
+    }
+    M = fmaxf(M, lse);
+  }
   float Z = 0.f;
   for (int s = 0; s < nsplits; ++s) Z += (M > -INFINITY) ? exp2f(lp[(size_t)s * 8] - M) : 0.f;
   const float iz = (Z > 0.f) ? (1.f / Z) : 0.f;
@@ -679,10 +771,16 @@ void set_max_smem_attrs(int device) {
   const bool trackable = device >= 0 && device < 64;
   const uint64_t bit = trackable ? (uint64_t(1) << device) : 0;
   if (trackable && (done_mask.load(std::memory_order_acquire) & bit)) return;
-  cudaFuncSetAttribute(mla_main<48, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75488);
-  cudaFuncSetAttribute(mla_main<48, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 75488);
-  cudaFuncSetAttribute(mla_main<64, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 94624);
-  cudaFuncSetAttribute(mla_main<64, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 94624);
+  auto opt_in = [device](auto kernel, int bytes) {
+    const cudaError_t status =
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+        << "shared-memory opt-in on device " << device << ": " << cudaGetErrorString(status);
+  };
+  opt_in(mla_main<48, 0>, 75488);
+  opt_in(mla_main<48, 1>, 75488);
+  opt_in(mla_main<64, 0>, 94624);
+  opt_in(mla_main<64, 1>, 94624);
   if (trackable) done_mask.fetch_or(bit, std::memory_order_release);
 }
 
@@ -756,24 +854,23 @@ void run(TensorView q, TensorView kv_cache, TensorView indices, TensorView seq_l
   // stream is read from the environment at call time, never cached).
   cudaStream_t stream = get_stream(q.device());
 
-  const float qscale = (float)(sm_scale * 1.4426950408889634);
   const auto* qptr = static_cast<const __nv_bfloat16*>(q.data_ptr());
   const auto* kvptr = static_cast<const uint8_t*>(kv_cache.data_ptr());
   const auto* iptr = static_cast<const int*>(indices.data_ptr());
   auto* optr = static_cast<__nv_bfloat16*>(out.data_ptr());
   dim3 grid(nq, nsplits);
   if (plan.small_batch && tps == 1) {
-    mla_main<48, 1>
-        <<<grid, NTHREAD, smem, stream>>>(qptr, kvptr, iptr, po, plse, optr, nsplits, tps, qscale);
+    mla_main<48, 1><<<grid, NTHREAD, smem, stream>>>(qptr, kvptr, iptr, po, plse, optr, nsplits,
+                                                     tps, sm_scale);
   } else if (plan.small_batch) {
-    mla_main<48, 0>
-        <<<grid, NTHREAD, smem, stream>>>(qptr, kvptr, iptr, po, plse, optr, nsplits, tps, qscale);
+    mla_main<48, 0><<<grid, NTHREAD, smem, stream>>>(qptr, kvptr, iptr, po, plse, optr, nsplits,
+                                                     tps, sm_scale);
   } else if (tps == 1) {
-    mla_main<64, 1>
-        <<<grid, NTHREAD, smem, stream>>>(qptr, kvptr, iptr, po, plse, optr, nsplits, tps, qscale);
+    mla_main<64, 1><<<grid, NTHREAD, smem, stream>>>(qptr, kvptr, iptr, po, plse, optr, nsplits,
+                                                     tps, sm_scale);
   } else {
-    mla_main<64, 0>
-        <<<grid, NTHREAD, smem, stream>>>(qptr, kvptr, iptr, po, plse, optr, nsplits, tps, qscale);
+    mla_main<64, 0><<<grid, NTHREAD, smem, stream>>>(qptr, kvptr, iptr, po, plse, optr, nsplits,
+                                                     tps, sm_scale);
   }
   if (nsplits > 1) {
     dim3 cg(4, 8, nq);
