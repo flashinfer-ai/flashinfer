@@ -590,28 +590,77 @@ def test_refused_captured_replan_preserves_last_plan(backend, monkeypatch):
     # captured metadata and the last accepted eager plan must both survive.
     from types import SimpleNamespace
 
+    import flashinfer.prefill as prefill
+
+    accepted_module = w._cached_module
+    accepted_plan = w._plan_info
+    old_ref = _reference(b)
+    old_cu = b["qo_indptr"].clone()
+    old_indices = b["kv_indices"].clone()
+    workspaces = (
+        w._int_workspace_buffer,
+        w._pin_memory_int_workspace_buffer,
+    )
+    torch.cuda.current_stream(device).synchronize()
+    markers = [buf[:16].clone() for buf in workspaces]
+
     def refuse_common_plan(*args):
+        accepted_module.plan(*args)
+        # Dirty explicit workspace bytes even if both geometries happened
+        # to generate the same native schedule. Queue the DMA before raising.
+        args[1][:16].copy_(args[2][:16], non_blocking=True)
+        args[1][:16].bitwise_xor_(0x5A)
+        args[2][16:32].bitwise_not_()
         raise RuntimeError("injected common planner refusal")
 
+    pin_tail = workspaces[1][16:32].clone()
     with monkeypatch.context() as patch:
-        module = w._cached_module
-        patch.setattr(w, "_cached_module", SimpleNamespace(plan=refuse_common_plan))
-        # The planner cache lookup must return the same injected module.
-        import flashinfer.prefill as prefill
-
         patch.setattr(
             prefill,
             "get_batch_prefill_module",
-            lambda *args, **kwargs: w._cached_module,
+            lambda *args: SimpleNamespace(plan=refuse_common_plan),
         )
         with pytest.raises(RuntimeError, match="injected common planner refusal"):
             plan(24)
-        patch.setattr(w, "_cached_module", module)
+    assert w._cached_module is accepted_module and w._plan_info is accepted_plan
+    assert torch.equal(b["qo_indptr"], old_cu)
+    assert torch.equal(b["kv_indices"], old_indices)
+    assert all(
+        torch.equal(buf[:16], mark)
+        for buf, mark in zip(workspaces, markers, strict=True)
+    )
+    assert torch.equal(workspaces[1][16:32], pin_tail)
+
+    # Exercise a failure *after* native plan_info was produced and the first
+    # retained specialized metadata copy was enqueued.
+    build = prefill._build_block_tables_from_paged_kv_indices
+
+    def refuse_refresh(*args, **kwargs):
+        build(*args, **kwargs)
+        raise RuntimeError("injected late metadata refusal")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            prefill, "_build_block_tables_from_paged_kv_indices", refuse_refresh
+        )
+        with pytest.raises(RuntimeError, match="injected late metadata refusal"):
+            plan(24)
+    assert w._cached_module is accepted_module and w._plan_info is accepted_plan
     assert w._gqa_ctx_fp8q_sm90_state is state
     assert torch.equal(w.run(q, kv), eager)
     out.fill_(17)
     g.replay()
     assert torch.equal(out, eager)
+    if backend == "auto":
+        before = _gqa_ctx_fp8q_sm90_stats()["backend_dispatches"]
+        with monkeypatch.context() as patch:
+            patch.setenv(DISABLE_ENV, "1")
+            stock = w.run(q, kv)
+        assert _matched_ratio(stock, old_ref) >= MATCHED
+        assert _gqa_ctx_fp8q_sm90_stats()["backend_dispatches"] == {
+            "specialized": before["specialized"],
+            "composable": before["composable"] + 1,
+        }
 
     plan(24)
     ref = dict(
@@ -893,6 +942,41 @@ def test_workspace_size_matches_the_armed_plan():
         _ws("specialized", torch.bfloat16)
 
 
+def test_batch_invariant_workspace_size_and_plan_keep_original_dtype():
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    b = _make_batch([4], [16], device)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(16 << 20, device=device, dtype=torch.uint8),
+        backend="auto",
+        batch_invariant=True,
+    )
+    args = (
+        b["qo_indptr"],
+        b["kv_indptr"],
+        b["kv_indices"],
+        b["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+    )
+    opts = dict(causal=True, q_data_type=torch.bfloat16, o_data_type=torch.bfloat16)
+    size, int_size = w.workspace_size(*args, **opts)
+    assert size >= 0 and int_size == 0
+    w.plan(*args, **opts)
+    # This geometry would arm ordinary auto. Both public calls must refuse
+    # rather than quoting bytes for a plan the invariant backend cannot run.
+    opts.update(q_data_type=torch.float8_e4m3fn, kv_data_type=torch.float8_e4m3fn)
+    for call in (w.workspace_size, w.plan):
+        with pytest.raises(BatchInvariantUnsupportedError):
+            call(*args, **opts)
+    assert not w._gqa_ctx_fp8q_sm90_requested
+    assert w._cached_q_data_type == torch.bfloat16
+
+
 def test_auto_arming_declines_on_a_captured_fa3_graph():
     """An allowlisted fp8 auto plan must not rewrite the backend to fa2 when
     the wrapper's captured CUDA-graph backend is fa3 (the fa2 schedule would
@@ -995,18 +1079,25 @@ def test_rejected_replan_does_not_arm_the_wrapper():
     assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0
 
 
-def test_explicit_plan_rejects_non_fp8_query_at_run():
-    """run(q.bfloat16()) on an explicit 'specialized' plan must raise: the
-    cached composable plan is bf16 only because the dequant fallback feeds it,
-    and an explicitly selected backend never falls back."""
+@pytest.mark.parametrize("backend", ["specialized", "auto"])
+def test_armed_plan_rejects_non_fp8_query_at_run(backend):
+    """The fallback's internal bf16 ABI is not the caller's query contract."""
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([5, 90, 7], [584, 727, 75], device)
-    wrapper = _plan_wrapper(batch, device)
+    wrapper = _plan_wrapper(batch, device, backend=backend)
     q_bf16 = batch["q"].float().to(torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="never falls back"):
+    error, reason = (
+        (NotImplementedError, "never falls back")
+        if backend == "specialized"
+        else (ValueError, "q_data_type")
+    )
+    with pytest.raises(error, match=reason):
         wrapper.run(q_bf16, (batch["k_cache"], batch["v_cache"]))
-    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0
+    assert _gqa_ctx_fp8q_sm90_stats()["backend_dispatches"] == {
+        "specialized": 0,
+        "composable": 0,
+    }
     # valid e4m3 input still dispatches the specialized kernel
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
     assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1

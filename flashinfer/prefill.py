@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import copy
 import functools
 import json
 import logging
@@ -2660,6 +2661,109 @@ def _gqa_fp8q_sm90_dispatch_table() -> Optional[dict]:
         return None
 
 
+def _gqa_ctx_fp8q_sm90_contract_ok(wrapper, q_dtype, kv_dtype, o_dtype):
+    return (
+        wrapper._batch_invariant is None
+        and wrapper._jit_module is None
+        and q_dtype == kv_dtype == torch.float8_e4m3fn
+        and o_dtype == torch.bfloat16
+        and wrapper.device.type == "cuda"
+        and tuple(get_compute_capability(wrapper.device))
+        == _GQA_CTX_FP8Q_SM90_COMPUTE_CAPABILITY
+    )
+
+
+def _check_batch_invariant_paged_dtypes(q_dtype, kv_dtype, o_dtype):
+    from .batch_invariant import BatchInvariantUnsupportedError
+
+    q = canonicalize_torch_dtype(q_dtype)
+    kv = q if kv_dtype is None else canonicalize_torch_dtype(kv_dtype)
+    o = q if o_dtype is None else canonicalize_torch_dtype(o_dtype)
+    if not q == kv == o == torch.bfloat16:
+        raise BatchInvariantUnsupportedError(
+            f"batch-invariant paged prefill requires bf16 Q/KV/O, got {q}/{kv}/{o}"
+        )
+
+
+def _transactional_fp8_graph_replan(plan):
+    @functools.wraps(plan)
+    def wrapped(wrapper, *args, **kwargs):
+        if getattr(wrapper, "_gqa_ctx_fp8q_sm90_capture_rows", None) is None:
+            return plan(wrapper, *args, **kwargs)
+
+        # Only a preflighted native FA2 candidate can pass the retained-capture
+        # gate. Its Python fields are replacements; writes through shared tensor
+        # references are journaled below. Never publish a partial module/plan pair.
+        with torch.cuda.device(wrapper.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "paged FP8 planning must run outside CUDA graph capture"
+                )
+            staged = copy.copy(wrapper)
+            journal = staged._fp8_replan_journal = []
+            stream = torch.cuda.current_stream(wrapper.device)
+            try:
+                result = plan(staged, *args, **kwargs)
+                stream.synchronize()
+            except BaseException:
+                if journal:
+                    # Native planning can enqueue H2D from its pinned buffer
+                    # and then throw. Do not overwrite the DMA source early.
+                    stream.synchronize()
+                    for dst, saved in journal:
+                        dst.copy_(saved)
+                    stream.synchronize()
+                raise
+            del staged._fp8_replan_journal
+            wrapper.__dict__ = staged.__dict__
+            return result
+
+    return wrapped
+
+
+def _journal_fp8_graph_writes(wrapper, candidate, num_indices, num_lengths):
+    # Only destinations, never tensors borrowed merely as plan inputs. The
+    # constructor's graph buffers are explicitly reserved copy destinations.
+    # Save only the prefixes this replan can write. A prepared candidate has
+    # no custom mask. Older cuDNN captures may still need their owned mirrors.
+    state = candidate._gqa_ctx_fp8q_sm90_state
+    destinations = [
+        wrapper._qo_indptr_buf,
+        wrapper._paged_kv_indptr_buf,
+        wrapper._paged_kv_last_page_len_buf,
+        wrapper._paged_kv_indices_buf[:num_indices],
+        wrapper._kv_lens_buffer[:num_lengths],
+        state.block_table,
+        state.seq_lens,
+        state.qo_indptr,
+        state.unit_descale,
+    ]
+    if wrapper._cudnn_q_lens_buffer is not None:
+        destinations.append(wrapper._cudnn_q_lens_buffer[: state.batch_size])
+        if wrapper._cudnn_block_tables is not None:
+            destinations.append(wrapper._cudnn_block_tables)
+
+    # PrefillPlanImpl writes only integer scheduling workspace: the float
+    # span is sized into offsets, never written until run(). Preserve the
+    # two integer spans without copying the potentially large float workspace.
+    for buf in (
+        wrapper._int_workspace_buffer,
+        wrapper._pin_memory_int_workspace_buffer,
+    ):
+        destinations.append(buf.as_strided((buf.numel(),), (1,)).view(torch.uint8))
+
+    # Finish earlier ordered uses of the pinned workspace before reading it.
+    # Pageable host backups avoid doubling device or locked-host reservations.
+    # Complete all allocations before making even the first live write.
+    torch.cuda.current_stream(wrapper.device).synchronize()
+    backups = []
+    for dst in destinations:
+        saved = torch.empty(dst.shape, device="cpu", dtype=dst.dtype, pin_memory=False)
+        saved.copy_(dst)
+        backups.append((dst, saved))
+    wrapper._fp8_replan_journal.extend(backups)
+
+
 def _gqa_ctx_fp8q_sm90_auto_routes(
     num_qo_heads: int,
     num_kv_heads: int,
@@ -4762,6 +4866,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         >>> wrapper.plan(...)
         """
         if self._batch_invariant is not None:
+            _check_batch_invariant_paged_dtypes(q_data_type, kv_data_type, o_data_type)
             return self._batch_invariant.workspace_bytes(
                 qo_indptr,
                 paged_kv_indptr,
@@ -4837,14 +4942,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # fp8 dtype) to the stock module query.
         _fp8q_sizing_as_fa2 = False
         if self._requested_backend in ("specialized", "auto"):
-            _fp8q_contract_ok = (
-                q_data_type == torch.float8_e4m3fn
-                and kv_data_type == torch.float8_e4m3fn
-                and o_data_type == torch.bfloat16
-                and self._jit_module is None
-                and self.device.type == "cuda"
-                and tuple(get_compute_capability(self.device))
-                == _GQA_CTX_FP8Q_SM90_COMPUTE_CAPABILITY
+            _fp8q_contract_ok = _gqa_ctx_fp8q_sm90_contract_ok(
+                self, q_data_type, kv_data_type, o_data_type
             )
             if self._requested_backend == "specialized":
                 if not _fp8q_contract_ok:
@@ -4998,6 +5097,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         return int(float_workspace_size), int(int_workspace_size)
 
     @flashinfer_api
+    @_transactional_fp8_graph_replan
     def plan(
         self,
         qo_indptr: torch.Tensor,
@@ -5250,15 +5350,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _gqa_ctx_fp8q_sm90_armed_explicit = False
         _gqa_ctx_fp8q_sm90_armed_q_dtype = None
         _gqa_fp8q_contract_ok = (
-            q_data_type == torch.float8_e4m3fn
-            and kv_data_type == torch.float8_e4m3fn
-            and o_data_type == torch.bfloat16
-            and self._jit_module is None
-            and self._batch_invariant is None
-            and not use_token_head_sf
-            and self.device.type == "cuda"
-            and tuple(get_compute_capability(self.device))
-            == _GQA_CTX_FP8Q_SM90_COMPUTE_CAPABILITY
+            not use_token_head_sf
+            and _gqa_ctx_fp8q_sm90_contract_ok(
+                self, q_data_type, kv_data_type, o_data_type
+            )
         )
         if self._requested_backend == "specialized":
             if not _gqa_fp8q_contract_ok:
@@ -5312,6 +5407,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     _auto_reason,
                 )
         if self._batch_invariant is not None:
+            _check_batch_invariant_paged_dtypes(q_data_type, kv_data_type, o_data_type)
             self._batch_invariant.refuse(
                 prefix_len_ptr=prefix_len_ptr,
                 token_pos_in_items_ptr=token_pos_in_items_ptr,
@@ -5563,6 +5659,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"{_gqa_ctx_fp8q_sm90_last_fallback or 'plan not prepared'}; "
                     "use a new CUDA graph wrapper"
                 )
+            _journal_fp8_graph_writes(
+                self, candidate, len(paged_kv_indices), len(kv_lens_arr_host)
+            )
 
         # Commit the specialized arming decision (set or clear) only after the
         # plan passed backend validation: a rejected replan leaves the
@@ -6079,7 +6178,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # build, block table and workspace are settled here, outside
                 # the hot path (and outside any CUDA-graph capture)
                 if candidate is not None:
-                    candidate.refresh_metadata()
                     self._gqa_ctx_fp8q_sm90_state = candidate._gqa_ctx_fp8q_sm90_state
                     self._gqa_ctx_fp8q_sm90_bufs = candidate._gqa_ctx_fp8q_sm90_bufs
                     self._gqa_ctx_fp8q_sm90_row_seq = (
@@ -6313,6 +6411,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ):
             # A failed plan must not establish the backend for future captures.
             self._cuda_graph_backend = self._backend
+
+        if candidate is not None:
+            # Common planning, including any retained cuDNN mirrors, succeeded.
+            # This last in-place refresh is itself covered by the journal.
+            candidate.refresh_metadata()
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
@@ -6625,13 +6728,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 f"got {q.dtype}; an explicitly selected backend never falls "
                 "back — replan, or use backend='auto' for guarded routing"
             )
-        if getattr(self, "_gqa_ctx_fp8q_sm90_requested", False) and is_float8(q):
-            planned_q_dtype = getattr(self, "_gqa_ctx_fp8q_sm90_q_data_type", None)
-            if planned_q_dtype is not None and q.dtype != planned_q_dtype:
-                # mirror the stock wrappers' cached-dtype check, which the
-                # dequant fallback would otherwise bypass by casting to bf16
-                # first: an e5m2 query on an e4m3-planned wrapper must not be
-                # served silently (explicit or auto-armed alike)
+        if getattr(self, "_gqa_ctx_fp8q_sm90_requested", False):
+            planned_q_dtype = self._gqa_ctx_fp8q_sm90_q_data_type
+            if q.dtype != planned_q_dtype:
+                # Check the caller's plan, not the bf16 ABI used after dequant.
                 raise ValueError(
                     "gqa_context_fp8_paged_sm90: this plan was made for "
                     f"q_data_type={planned_q_dtype}, got a {q.dtype} query; "
