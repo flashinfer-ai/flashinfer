@@ -254,13 +254,20 @@ def _make_batch(kv_lens, device, seed=0):
     )
 
 
-def _reference(batch, q_descale=None, k_descale=None, v_descale=None):
+def _reference(
+    batch,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    *,
+    compute_dtype=torch.float32,
+):
     """fp32 dequant-then-attend verify-decode reference (row pos of request r
     sees kv_len_r - 6 + pos + 1 keys), with optional per-sequence descales."""
     device = batch["q"].device
-    q = batch["q"].float()
-    kf = batch["k_cache"].float().reshape(-1, HEAD_DIM)
-    vf = batch["v_cache"].float().reshape(-1, HEAD_DIM)
+    q = batch["q"].to(compute_dtype)
+    kf = batch["k_cache"].to(compute_dtype).reshape(-1, HEAD_DIM)
+    vf = batch["v_cache"].to(compute_dtype).reshape(-1, HEAD_DIM)
     cu = batch["qo_indptr"].tolist()
     kv_lens = batch["seq_lens"].tolist()
     bt = batch["block_table"]
@@ -1435,7 +1442,12 @@ def test_gap_analytic_and_mutated_descale_replay():
         qd.fill_(gap * math.sqrt(HEAD_DIM) / 256)
         expected = (n * (448 * 2**18) / (math.exp(gap) + n)).to(torch.bfloat16)
         expected = expected.expand_as(out)
-        assert torch.equal(_reference(b, q_descale=qd, v_descale=vd), expected)
+        # Float64 keeps this exact analytic cross-check independent of
+        # the process-wide TF32 policy used by float32 einsum.
+        assert torch.equal(
+            _reference(b, q_descale=qd, v_descale=vd, compute_dtype=torch.float64),
+            expected,
+        )
         if gap >= 24:
             # Isolate the old operand rounding: shifted sums did NOT round to fp16.
             p = 2048 * math.exp(-gap)
@@ -1509,14 +1521,19 @@ def test_all_short_auto_is_native_fa3(lens, monkeypatch):
             o_data_type=torch.bfloat16,
         )
 
-    sized = size()
+    # FA3 intentionally has no workspace-size query. Short auto must
+    # preserve that native API behavior, including its exception.
+    with pytest.raises(NotImplementedError, match="backend 'fa3'") as auto_error:
+        size()
     with monkeypatch.context() as m:
         m.setattr(
             fp,
             "_gqa_dec_fp8q_sm90_auto_routes",
             lambda *a, **kw: (False, "stock control"),
         )
-        assert sized == size()
+        with pytest.raises(NotImplementedError, match="backend 'fa3'") as stock_error:
+            size()
+    assert str(auto_error.value) == str(stock_error.value)
 
 
 @pytest.mark.parametrize("lens", [[2048], [16, 8192, 48, 128]])
