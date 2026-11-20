@@ -33,7 +33,7 @@ from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, OperandSource
 
 from ..plan import om_in_tmem as _om_in_tmem
 from ..plan import ws_row
-from ..spec import KV_FMTS, MMA_K, TILE_KEYS, tiles_per_chunk
+from ..spec import KV_FMTS, MMA_K, TH_KV_FMTS, TILE_KEYS, tiles_per_chunk
 
 ACC_DTYPE = cutlass.Float32
 IN_DTYPE = cutlass.BFloat16
@@ -126,6 +126,8 @@ REGS_SOFTMAX, REGS_OTHER = 192, 32
 # every prefill shape on SM107 (the paired placement keeps 192 / 96: its budget is full)
 REGS_1WG_DIMS = (64,)
 REGS_SOFTMAX_1WG, REGS_CORRECTION_1WG = 200, 96
+REGS_Q2_DIMS = (128,)
+REGS_Q2_128 = (184, 80, 64)
 REGS_CONVERT = 96  # per conversion thread of the low-bit-KV kernels (blocks/convert.py), where the budget allows: the stage is the two
 # otherwise idle warps of the last warpgroup plus CONVERT_WARPGROUPS further warpgroups; at D = 256 the correction's 208 leave 64
 CONVERT_WARPGROUPS = 1
@@ -170,7 +172,7 @@ class Roles:
         self.empty_warps = tuple(range(self.mma_warp + 2, self.mma_warp + 4))
         self.threads = 32 * (self.mma_warp + 4)
         # the low-bit-KV kernels: the two empty warps and CONVERT_WARPGROUPS further warpgroups form the conversion stage
-        self.convert_warps = ()
+        self.convert_warps: tuple[int, ...] = ()
         if lowbit:
             self.convert_warps = self.empty_warps + tuple(
                 range(self.mma_warp + 4, self.mma_warp + 4 + 4 * CONVERT_WARPGROUPS)
@@ -190,6 +192,11 @@ class Roles:
         self.regs_load = REGS_LOAD_FP4 if fp4 and D <= 128 else REGS_OTHER
         if two_slices:
             self.regs_correction = REGS_CORRECTION_W2
+        elif q2 and D in REGS_Q2_DIMS:
+            # the paired placement at D = 128: the MMA / load warpgroup at 64 so the MMA warp's two Q tiles' descriptors and pipeline
+            # state stay in registers (its spills miss L1 next to the 300 KB smem plan and sit on every tile's chain), the correction
+            # at 80 with 8-column pieces, the softmax at 184 with the streamed exponential form (StaticPlan.streamed)
+            self.regs_softmax, self.regs_correction, self.regs_other = REGS_Q2_128
         elif q2:
             self.regs_correction = 96
         elif D in REGS_1WG_DIMS:
@@ -250,11 +257,24 @@ class StaticPlan:
         # written for a bf16 cache holding those values -- the MMAs, the softmax and the correction are the bf16 body's, untouched.
         # One softmax warpgroup, no pairing (the conversion stage takes the second warpgroup's register budget).
         # "nvfp4": the cache is packed e2m1 nibbles ((D / 2, page, Hkv, num_pages) bytes) with one e4m3 block scale per 16 elements
-        # ((D / 16, page, Hkv, num_pages) bytes); the conversion stage forms the exact products in bf16
+        # ((D / 16, page, Hkv, num_pages) bytes); the conversion stage forms the exact products in bf16.
+        # "e4m3th" / "e5m2th": an fp8 cache converted exactly as "e4m3" / "e5m2", with one binary32 key scale and one value scale
+        # per (token, KV head) ((page, Hkv, num_pages) fp32 of any strides) that the softmax applies per key: the conversion stage
+        # fetches a tile's scales into a smem side ring of sf_stages entries (convert.py), the softmax multiplies the scores and
+        # the probabilities by them (softmax.py), and the epilogue is the bf16 class's
         assert kv_fmt in KV_FMTS, kv_fmt
         self.kv_fmt = kv_fmt
         self.lowbit = kv_fmt != "bf16"
         self.fp4 = kv_fmt == "nvfp4"
+        self.th = kv_fmt in TH_KV_FMTS
+        self.fp8_fmt = TH_KV_FMTS.get(kv_fmt, kv_fmt)  # the cache's element format
+        self.scaled_out = (
+            self.lowbit and not self.th
+        )  # the epilogue's one mul by the per-tensor value scale
+        # entries of the scale side ring: the conversion stage holds a K slot at most kv_slots tiles ahead of the tile whose P
+        # the softmax is forming (the V tiles in between stay in the ring until that P is stored), so kv_slots + 1 entries are
+        # never overwritten while read; one spare
+        self.sf_stages = kv_slots + 2 if self.th else 1
         assert not self.lowbit or (n_wg == 1 and not q2), (kv_fmt, n_wg, q2)
         # v_sf_swizzled: the V block scales of a paged NVFP4 cache are stored in the 4-token swizzle (convert.sf_swizzle_coord)
         # instead of the linear layout the K block scales always have: the conversion stage reads the same scale byte at another
@@ -323,6 +343,9 @@ class StaticPlan:
         # tile whenever one warpgroup worked alone; at D = 128 its P exchange and four-slice stats payload would also not leave room for
         # the third ring slot next to the two Q tiles and the smem O_m
         self.rep_ok = g <= REP_ROWS and not q2
+        # the softmax's exponential form: streamed (the P words take the scores' registers) for the one-warpgroup body and the paired
+        # placement at D = 128, where the register split needs the smaller live set; packed for the paired placement at D = 64
+        self.streamed = not q2 or D in (128,)
         self.tokens_rep = REP_ROWS // g if self.rep_ok else 1
         self.rep_rows = self.tokens_rep * g if self.rep_ok else 0
         self.n_slices = (
@@ -670,6 +693,8 @@ def shared_storage_struct(st: StaticPlan):
         s_r=mr[f32, st.stats_slots * st.r_slices * Q_ROWS],
         s_p=cute.struct.Align[mr[f32, st.s_p_elems], 16],
         s_mx=mr[f32, 2 * st.n_slices * Q_ROWS],
+        s_ks=mr[f32, st.sf_stages * st.T if st.th else 4],
+        s_vs=mr[f32, st.sf_stages * st.T if st.th else 4],
         sOm=cute.struct.Align[mr[f32, st.n_q * Q_ROWS * st.D if st.om_smem else 4], 16],
         sQ=cute.struct.Align[mr[IN_DTYPE, st.q_tiles * st.q_tile_elems], 1024],
         sKV=cute.struct.Align[mr[IN_DTYPE, st.n_slots * st.kv_slot_elems], 1024],

@@ -236,7 +236,7 @@ class SwapsPlan:
         assert not ragged or page == TILE_KEYS, (ragged, page)
         self.roles = Roles
         self.n_wg = 1  # one softmax warpgroup (fold_group's prefetch depth reads it)
-        self.lowbit = (
+        self.scaled_out = (
             False  # the bf16 class's body: fold_group's epilogue takes no value scale
         )
         self.T = TILE_KEYS

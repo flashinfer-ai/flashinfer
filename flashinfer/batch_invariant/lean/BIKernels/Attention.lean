@@ -4,8 +4,8 @@ import BIKernels.GEMM
 import BIKernels.Export
 
 /-!
-# Paged-KV attention: the classes `attention.bf16` / `attention.e4m3kv` / `attention.e5m2kv` (per head dim) and the
-batch-invariance guarantees
+# Paged-KV attention: the classes `attention.bf16` / `attention.e4m3kv` / `attention.e5m2kv` / `attention.nvfp4kv` /
+`attention.e4m3kv_th` / `attention.e5m2kv_th` (per head dim) and the batch-invariance guarantees
 
 Mirrors `flashinfer/attention/batch_invariant/spec.py`. The model is per logical row: the row's identity (its query token and
 head, hence its own K / V) is the leaf index of every score and value term, so rows of different KV heads or requests are
@@ -28,6 +28,14 @@ the value scale once before the rounding: `cvt_bf16(add(mul(mul(O, div(1, l)), v
 different chain: different terms (`output_depends_on_kv`, `output_depends_on_kv_fmt`), hence different classes. The NVFP4-KV
 class (`Params.kv = "nvfp4"`) has the leaves `(dq4 values block_scale)`: the e2m1 values of a slice times their e4m3 block scale
 (one per 16 elements along the head dim: one score K-step, or block `d / 16` of a V column), exact in bf16, and the same chain.
+
+The token-head-scale classes (`Params.kv = "e4m3th"` / `"e5m2th"`) take an fp8 cache with one binary32 scale per (token, KV
+head) for K and one for V. The K and V leaves are the fp8-KV classes' exact widenings; each scale enters once per key: the
+score of key `k` is `mul(s_k, sfk k)` (`scaledScore`) and the tile step -- maximum, `alpha`, probabilities, row sum -- runs
+on the scaled scores; the PV operand of a visible key is `cvt_bf16(mul(p_k, sfv k))` (`scaledProb`) while the row sum keeps
+the unscaled `p_k`; a masked key's operand is `+0` and its scales do not appear in the term (`masked_scales_absent`); the
+epilogue is the bf16 class's. Different terms from the per-tensor fp8 classes, from each other and from the bf16 class
+(`output_depends_on_kv_th`, `output_depends_on_kv_th_fmt`, `output_depends_on_kv_th_bf16`).
 
 Tile and chunk boundaries are absolute multiples of `T` and `C`, functions of `D` only: the term of
 a token depends on its position `p`, the window and the head, never on the batch, the page table
@@ -59,6 +67,8 @@ inductive ATerm where
   | ex2 (a : ATerm)
   | cvt (fmt : String) (a : ATerm)
   | mma (acc : ATerm) (pslice : String) (kv : String) (vt d : Nat)
+  | sfk (k : Nat)
+  | sfv (k : Nat)
   deriving DecidableEq, Repr, Inhabited
 
 /-- The K (B) slice leaf of score step `t` of key `k`: the fp8 key widened exactly (`(widen <fmt> (b t k))`), or the NVFP4
@@ -79,6 +89,13 @@ def vLeaf (kv : String) (vt d : Nat) : String :=
   else if kv == "nvfp4" then s!"(dq4 (op:v_slice {vt} {d}) (sfv {vt} {d / 16}))"
   else s!"(widen {kv} (op:v_slice {vt} {d}))"
 
+/-- The fp8 format of a token-head-scale class (`"e4m3th"` / `"e5m2th"`); `none` for every other class. -/
+def thBase (kv : String) : Option String :=
+  if kv == "e4m3th" then some "e4m3" else if kv == "e5m2th" then some "e5m2" else none
+
+/-- The format of a class's K / V leaves: the token-head-scale classes read their cache as the fp8-KV classes do. -/
+def leafFmt (kv : String) : String := (thBase kv).getD kv
+
 def ATerm.sexpr : ATerm → String
   | .const c => s!"(const {c})"
   | .sym s => s!"(sym {s})"
@@ -91,6 +108,15 @@ def ATerm.sexpr : ATerm → String
   | .ex2 a => s!"(ex2 {a.sexpr})"
   | .cvt f a => s!"(cvt {f} {a.sexpr})"
   | .mma acc ps kv vt d => s!"(mma16 {acc.sexpr} (op:pv_kslice (op:p_slice{ps}) {vLeaf kv vt d}))"
+  | .sfk k => s!"(sfk {k})"
+  | .sfv k => s!"(sfvt {k})"
+
+/-- `spec.scaled_score`: the token-head-scale classes' score of key `k`, one `mul` of the fold by the key's scale. -/
+def scaledScore (s : ATerm) (k : Nat) : ATerm := .mul s (.sfk k)
+
+/-- `spec.scaled_prob`: the token-head-scale classes' PV operand of key `k`, the probability times the key's value scale and
+then the operand's rounding to bf16. -/
+def scaledProb (p : ATerm) (k : Nat) : ATerm := .cvt "bf16" (.mul p (.sfv k))
 
 /-! ## Pairwise trees over the key digit (`canon._pairwise`: adjacent pairs, low index first,
 absent leaves dropped) -/
@@ -114,7 +140,7 @@ def ptree (f : ATerm → ATerm → ATerm) : Nat → List (Option ATerm) → Opti
 /-- The fixed data of one logical row's dataflow: head dim as `steps = D/16`, tile `T = 2^tbits`,
 chunk `C`, the row's position `p` (so `L = p + 1`), FlashInfer's `window_left` (negative = none),
 the row id of the Q leaves, the output column `d`, and the KV cache format `kv` (`""` the bf16 class,
-`"e4m3"` / `"e5m2"` the fp8-KV classes). -/
+`"e4m3"` / `"e5m2"` the fp8-KV classes, `"nvfp4"` the NVFP4-KV class, `"e4m3th"` / `"e5m2th"` the token-head-scale classes). -/
 structure Params where
   steps : Nat
   tbits : Nat
@@ -167,10 +193,18 @@ def pvFold (kv : String) (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :
     let slice := (pbf.drop (16 * j)).take 16
     .mma acc (String.join (slice.map (fun q => " " ++ q.sexpr))) kv (vt0 + j) d) o0
 
-/-- `spec.tile_step` on a present tile `t`. -/
+/-- `spec.tile_step` on a present tile `t`. The token-head-scale classes scale every visible key's score before the
+statistics and every visible key's probability before the operand's rounding; a masked key has no score and the operand
+`+0`, so its scales are absent. -/
 def tileStep (P : Params) (st : State) (t : Nat) : State :=
+  let th := (thBase P.kv).isSome
+  let fmt := leafFmt P.kv
   let scores : List (Option ATerm) :=
-    (List.range P.T).map (fun i => if P.visible (t * P.T + i) then some (.score P.kv P.row (t * P.T + i) P.steps) else none)
+    (List.range P.T).map (fun i =>
+      if P.visible (t * P.T + i) then
+        let s := ATerm.score fmt P.row (t * P.T + i) P.steps
+        some (if th then scaledScore s (t * P.T + i) else s)
+      else none)
   let mT := (ptree ATerm.fmax P.tbits scores).getD (.const "-inf")
   let mNew := ATerm.fmax st.m mT
   let alpha := alphaTerm st.m mNew
@@ -178,8 +212,11 @@ def tileStep (P : Params) (st : State) (t : Nat) : State :=
   let probs : List (Option ATerm) := scores.map (fun s => s.map (fun s => .ex2 (.fma s c nms)))
   let rT := (ptree ATerm.add P.tbits probs).getD (.const "0.0")
   let lNew := ATerm.fma st.l alpha rT
-  let pbf := probs.map (fun q => ATerm.cvt "bf16" (q.getD (.const "0.0")))
-  let oNew := pvFold P.kv (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
+  let pbf := (List.range P.T).map (fun i =>
+    match probs.getD i none with
+    | some q => if th then scaledProb q (t * P.T + i) else ATerm.cvt "bf16" q
+    | none => ATerm.cvt "bf16" (.const "0.0"))
+  let oNew := pvFold fmt (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
   ⟨mNew, lNew, oNew⟩
 
 /-- `spec.merge`: the running state `a` with the finished chunk `b`. -/
@@ -196,11 +233,11 @@ def chunkState (P : Params) (j : Nat) : State := (P.tilesOfChunk j).foldl (tileS
 /-- The fused (one-CTA) path: present chunks merged in index order from the init state. -/
 def fused (P : Params) : State := P.presentChunks.foldl (fun acc j => merge acc (chunkState P j)) initState
 
-/-- `spec.output_elem`: the bf16 class's chain, or the fp8-KV classes' with one `mul` by the value scale before the
-`add +0` and the rounding. -/
+/-- `spec.output_elem`: the bf16 class's chain (also the token-head-scale classes': their scales enter inside the tile
+step), or the per-tensor-scale classes' with one `mul` by the value scale before the `add +0` and the rounding. -/
 def epilogue (kv : String) (st : State) : ATerm :=
   let o := ATerm.mul st.o (.div (.const "1.0") st.l)
-  let o := if kv == "" then o else ATerm.mul o (.sym "v_scale")
+  let o := if kv == "" || (thBase kv).isSome then o else ATerm.mul o (.sym "v_scale")
   .cvt "bf16" (.add o (.const "0.0"))
 
 def output (P : Params) : ATerm := epilogue P.kv (fused P)
@@ -309,6 +346,28 @@ theorem output_depends_on_kv_fmt :
 theorem output_depends_on_kv_nvfp4 :
     output ⟨8, 2, 8, 9, -1, 0, 0, "nvfp4"⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, "e4m3"⟩ := by native_decide
 
+/-- **The token-head-scale classes are their own classes**: over the same fp8 bytes, the per-key scaled scores and scaled
+PV operands under the bf16 epilogue are a different term from the per-tensor class's (one constant, one scaled epilogue);
+the two fp8 formats differ; and the term differs from the bf16 class's. Stated on the printed terms of a concrete toy row,
+decided. -/
+theorem output_depends_on_kv_th :
+    (output ⟨8, 2, 8, 9, -1, 0, 0, "e4m3th"⟩).sexpr ≠ (output ⟨8, 2, 8, 9, -1, 0, 0, "e4m3"⟩).sexpr := by native_decide
+
+theorem output_depends_on_kv_th_fmt :
+    (output ⟨8, 2, 8, 9, -1, 0, 0, "e4m3th"⟩).sexpr ≠ (output ⟨8, 2, 8, 9, -1, 0, 0, "e5m2th"⟩).sexpr := by native_decide
+
+theorem output_depends_on_kv_th_bf16 :
+    (output ⟨8, 2, 8, 9, -1, 0, 0, "e4m3th"⟩).sexpr ≠ (output ⟨8, 2, 8, 9, -1, 0, 0, ""⟩).sexpr := by native_decide
+
+/-- **The scales of masked keys are not in the term**: a toy row at position 20 with a window of 3 sees keys 17..20 of the
+16-key tile 16..31; its printed term names the key scales and the value scales of exactly those four keys. The other
+twelve keys of the tile, which a kernel reads with the tile, appear without a scale: a masked key's scale cannot reach the
+row. Decided. -/
+theorem masked_scales_absent :
+    let sx := (output ⟨1, 4, 32, 20, 3, 0, 0, "e4m3th"⟩).sexpr
+    ((List.range 32).filter (fun k => (sx.splitOn s!"(sfk {k})").length > 1)) = [17, 18, 19, 20]
+      ∧ ((List.range 32).filter (fun k => (sx.splitOn s!"(sfvt {k})").length > 1)) = [17, 18, 19, 20] := by native_decide
+
 /-- The visible keys, the tiles and the chunks of a row depend on `(p, win, T, C)` only: the page
 table, the batch and the configuration do not appear. -/
 theorem boundaries_absolute (P Q : Params) (hp : P.p = Q.p) (hw : P.win = Q.win) (hT : P.tbits = Q.tbits) (hC : P.C = Q.C) :
@@ -348,7 +407,8 @@ so `kvSlots * D ≤ 512` (2..8 slots at D = 64, 2..4 at D = 128, exactly 2 at D 
 def ConfigOKD (D : Nat) (c : Config) : Bool :=
   (2 ≤ c.kvSlots && c.kvSlots * D ≤ 512) && c.policy ≤ 2 && (c.softmaxWgs == 1 || c.softmaxWgs == 2) && c.merge ≤ 2 && c.small ≤ 1
 
-/-- The knob constraints of the fp8-KV classes' kernels (`AttnConfig.well_formed(D, lowbit=True)`): the row body with one
+/-- The knob constraints of the low-bit-KV classes' kernels -- the fp8-KV, NVFP4-KV and token-head-scale classes
+(`AttnConfig.well_formed(D, lowbit=True)`): the row body with one
 softmax warpgroup (the conversion stage runs on the warps the second warpgroup would take) and the replicated-row placement
 for small units (the Swaps-AB body has no conversion stage); the ring and the planner knobs as for the bf16 class. -/
 def ConfigOKLowbit (D : Nat) (c : Config) : Bool :=

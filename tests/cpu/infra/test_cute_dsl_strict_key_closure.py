@@ -26,6 +26,8 @@ import pytest
 
 from flashinfer.jit import _cute_dsl_source as source_analysis
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _clear_closure_caches():
     source_analysis._import_closure.cache_clear()
@@ -340,6 +342,105 @@ def test_reading_all_through_star_import_keys_it(fake_package):
         "kernels/uses_all.py",
         "__init__.py",
         "from .api_a import api_a\nfrom .api_b import api_b\n__all__ = ['api_a']\n",
+    )
+
+
+def test_named_module_import_follows_only_used_function_dependencies(fake_package):
+    _write(fake_package / "__init__.py", "from .operations import api_a\n")
+    _write(fake_package / "used.py", "def helper():\n    return 1\n")
+    _write(fake_package / "unrelated.py", "def helper():\n    return 1\n")
+    _write(
+        fake_package / "operations.py",
+        "from .used import helper\n"
+        "def api_a():\n    return helper()\n"
+        "def unrelated():\n    from .unrelated import helper\n    return helper()\n",
+    )
+    assert _edit_changes_key(
+        fake_package,
+        "kernels/uses_root_api.py",
+        "used.py",
+        "def helper():\n    return 2\n",
+    )
+    assert not _edit_changes_key(
+        fake_package,
+        "kernels/uses_root_api.py",
+        "unrelated.py",
+        "def helper():\n    return 2\n",
+    )
+
+
+def test_named_module_import_keeps_unused_import_initialization(fake_package):
+    _write(fake_package / "__init__.py", "from .operations import api_a\n")
+    _write(fake_package / "setup_helper.py", "def configure():\n    return 1\n")
+    _write(
+        fake_package / "setup.py",
+        "from .setup_helper import configure\nVALUE = configure()\n",
+    )
+    _write(
+        fake_package / "operations.py",
+        "from .setup import VALUE\ndef api_a():\n    return 1\n",
+    )
+    assert _edit_changes_key(
+        fake_package,
+        "kernels/uses_root_api.py",
+        "setup_helper.py",
+        "def configure():\n    return 2\n",
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel_source",
+    [
+        "import flashinfer.operations as ops\n"
+        "def lookup(name):\n    return getattr(ops, name)\n",
+        "import flashinfer.operations as ops\n"
+        "def lookup(name):\n    return ops.__dict__[name]\n",
+        "from flashinfer.operations import __dict__ as namespace\n"
+        "def lookup(name):\n    return namespace[name]\n",
+        "import flashinfer.operations\n"
+        "def lookup(name):\n    return flashinfer.operations.__dict__[name]\n",
+        "import flashinfer.operations as ops\n"
+        "def lookup(name):\n    return ops.__getattribute__(name)\n",
+        "from flashinfer.operations import __getattribute__ as lookup\n",
+    ],
+    ids=[
+        "getattr",
+        "dict",
+        "from-dict",
+        "nested-dict",
+        "getattribute",
+        "from-getattribute",
+    ],
+)
+def test_escaping_plain_module_keeps_all_function_dependencies(
+    fake_package, kernel_source
+):
+    _write(fake_package / "unrelated.py", "def helper():\n    return 1\n")
+    _write(
+        fake_package / "operations.py",
+        "def unrelated():\n    from .unrelated import helper\n    return helper()\n",
+    )
+    _write(fake_package / "kernels/uses_module.py", kernel_source)
+    assert _edit_changes_key(
+        fake_package,
+        "kernels/uses_module.py",
+        "unrelated.py",
+        "def helper():\n    return 2\n",
+    )
+
+
+@pytest.mark.parametrize("metadata", ["version", "_build_meta"])
+def test_named_import_of_build_metadata_does_not_invalidate_key(fake_package, metadata):
+    _write(fake_package / f"{metadata}.py", "revision = 'before'\n")
+    _write(
+        fake_package / "kernels/uses_metadata.py",
+        f"from flashinfer.{metadata} import revision\n",
+    )
+    assert not _edit_changes_key(
+        fake_package,
+        "kernels/uses_metadata.py",
+        f"{metadata}.py",
+        "revision = 'after'\n",
     )
 
 

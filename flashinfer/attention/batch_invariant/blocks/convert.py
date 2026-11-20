@@ -21,6 +21,19 @@ land in two 16-byte granules of the SW128-swizzled slot (``mma.zero_v_tail`` add
 with element ``(key, d)`` at ``(d % 64) + 64 key + slot_keys * 64 * (d // 64)`` before the swizzle, as ``operands.ring_view_layout``
 places it.
 
+The token-head-scale kernels (``st.th``: classes ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``) stage and convert their fp8
+cache exactly as the fp8-KV kernels do; their per-(token, head) scales never touch the elements. With the first ring slot of
+every K tile the conversion threads also fetch the tile's ``T`` key scales and ``T`` value scales for the unit's KV head
+(``fetch_tile_scales``: through the page table at ``(key % page, kv_head, page_id)`` of each scale tensor's own layout for the
+paged kinds -- any strides, the scales may be a view into a wider slot tensor -- and at the request's token offset plus the key
+for the ragged kind, the page clamped as the staged bytes' page is and the ragged token clamped to the pool) into a small smem
+side ring the softmax warpgroup reads (``softmax.py``). Entry ``seq % sf_stages`` holds the scales of the CTA's ``seq``-th
+tile. The entry is written after the K tile's first ring slot is acquired and before it is committed: the MMA warp issues the
+tile's QK only after that commit, so the softmax finds the scales when it receives the tile's S; and an entry is not reused
+while the softmax still reads it, because the conversion threads cannot acquire a K ring slot ``kv_slots`` tiles further on
+before the softmax has stored P of the tile (the V tiles in between stay in the ring until their PV, which waits for that P).
+The staging buffer runs ahead of the ring without touching this: the side ring is written at the ring slot, not at the stage.
+
 A staging stage is ``raw_keys`` keys of raw cache rows (``operands.StaticPlan``); a ring slot is ``raw_per_slot``
 consecutive stages. The stage order is the TMA producer's slot order (``producer.load_loop``: ``K_lo``, then per tile
 ``K_{n+1}, V_n``, or with two S stages ``K_lo, K_{lo+1}`` then ``V_n, K_{n+2}``), so the MMA warp's consumer sequence is
@@ -200,7 +213,7 @@ def e5m2x4_to_bf16x4(packed: Uint32, *, loc=None, ip=None) -> Tuple[Uint32, Uint
 def widen_group(st, r_in: cute.Tensor, r_out: cute.Tensor):
     """``GROUP`` fp8 elements (four 32-bit words of ``r_in``) to ``GROUP`` bf16 (eight words of ``r_out``), in element order."""
     for j in cutlass.range_constexpr(GROUP // 4):
-        if cutlass.const_expr(st.kv_fmt == "e4m3"):
+        if cutlass.const_expr(st.fp8_fmt == "e4m3"):
             lo, hi = e4m3x4_to_bf16x4(r_in[j])
         else:
             lo, hi = e5m2x4_to_bf16x4(r_in[j])
@@ -673,6 +686,52 @@ def stage_unit(
 
 
 @cute.jit
+def fetch_tile_scales(
+    st,
+    key0: Int32,
+    entry: Int32,
+    mKsf: cute.Tensor,
+    mVsf: cute.Tensor,
+    s_ks: cute.Tensor,
+    s_vs: cute.Tensor,
+    mKvIndices: cute.Tensor,
+    kv_ptr0: Int32,
+    n_pages: Int32,
+    kv_head: Int32,
+    ctid: Int32,
+):
+    """The key and value scales of the ``T`` keys from absolute key ``key0`` for KV head ``kv_head`` into entry ``entry`` of the
+    side ring (``s_ks`` / ``s_vs``: ``(T, sf_stages)`` binary32), one key per conversion thread. ``mKsf`` / ``mVsf`` are the
+    ``(page, Hkv, num_pages)`` scale tensors with their own strides (ragged: ``(total_kv, Hkv, 1)``); a key past the request's
+    pages reads the clamped page ``stage_slot`` stages, a key past a ragged pool its last token."""
+    CT = st.roles.convert_threads
+    for i in cutlass.range_constexpr((st.T + CT - 1) // CT):
+        key = ctid + i * CT
+        if key < st.T:
+            ka = key0 + key
+            if cutlass.const_expr(st.ragged):
+                tok = kv_ptr0 + ka
+                last = mKsf.shape[0] - 1
+                if tok > last:
+                    tok = last
+                off_k = cute.crd2idx((tok, kv_head, Int32(0)), mKsf.layout)
+                off_v = cute.crd2idx((tok, kv_head, Int32(0)), mVsf.layout)
+            else:
+                pslot = ka // st.page
+                if pslot > n_pages - 1:
+                    pslot = n_pages - 1
+                page_id = mKvIndices[kv_ptr0 + pslot]
+                off_k = cute.crd2idx((ka % st.page, kv_head, page_id), mKsf.layout)
+                off_v = cute.crd2idx((ka % st.page, kv_head, page_id), mVsf.layout)
+            s_ks[(key, entry)] = cute.make_tensor(
+                mKsf.iterator + off_k, cute.make_layout((1,))
+            )[0]
+            s_vs[(key, entry)] = cute.make_tensor(
+                mVsf.iterator + off_v, cute.make_layout((1,))
+            )[0]
+
+
+@cute.jit
 def load_group(
     st,
     key: Int32,
@@ -725,6 +784,13 @@ def convert_slot(
     kv_head: Int32,
     ctid: Int32,
     sf_swizzled: cutlass.Constexpr,
+    mVsf: cute.Tensor,
+    s_ks: cute.Tensor,
+    s_vs: cute.Tensor,
+    sf_entry: Int32,
+    mKvIndices: cute.Tensor,
+    n_pages: Int32,
+    fetch_sf: cutlass.Constexpr,
 ):
     """One ring slot (``slot_keys`` keys of K or V from absolute key ``key0``) from its staged raw bytes (``sRaw``: fp8 bytes, or
     packed NVFP4 nibbles): acquire it, convert stage after stage in 16-element groups and commit. The NVFP4 block scales come
@@ -732,7 +798,9 @@ def convert_slot(
     num_pages)`` in global memory through the pages recorded there, ``SF_AHEAD`` rounds ahead (``sf_swizzled``: stored in the
     4-token swizzle, ``sf_offset``). Thread ``ctid`` of the stage holds ``convert_groups`` consecutive groups (unit ``ctid %
     UPK`` of ``UPK`` per key) of the keys ``ctid // UPK + round * KPI`` of a stage; the loop is compact and issues a round's
-    staged loads under the previous round's stores."""
+    staged loads under the previous round's stores. ``fetch_sf`` (the first slot of a K tile of the token-head-scale kernels):
+    between the acquire and the conversion, fetch the tile's scales (``mSF`` the key scales, ``mVsf`` the value scales) into
+    entry ``sf_entry`` of the side ring."""
     CT = st.roles.convert_threads
     G = st.convert_groups  # consecutive groups of one key a thread converts per round
     UPK = st.D // (GROUP * G)  # thread units per key
@@ -740,6 +808,21 @@ def convert_slot(
     EB = GROUP // 2 if st.fp4 else GROUP  # bytes of one group in the cache
     EW = EB // 4
     h = kv_prod.acquire_and_advance()
+    if cutlass.const_expr(fetch_sf):
+        fetch_tile_scales(
+            st,
+            key0,
+            sf_entry,
+            mSF,
+            mVsf,
+            s_ks,
+            s_vs,
+            mKvIndices,
+            kv_ptr0,
+            n_pages,
+            kv_head,
+            ctid,
+        )
     r_in = cute.make_rmem_tensor(cute.make_layout((G * EW,)), Uint32)
     r_in8 = cute.make_tensor(
         cute.recast_ptr(r_in.iterator, dtype=cutlass.Uint8),
@@ -861,8 +944,16 @@ def convert_tile(
     kv_head: Int32,
     ctid: Int32,
     sf_swizzled: cutlass.Constexpr,
+    mVsf: cute.Tensor,
+    s_ks: cute.Tensor,
+    s_vs: cute.Tensor,
+    sf_entry: Int32,
+    mKvIndices: cute.Tensor,
+    n_pages: Int32,
+    is_k: cutlass.Constexpr,
 ):
-    """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order (``producer.issue_tile``)."""
+    """One K or V tile = ``slots_per_tile`` consecutive ring slots in key order (``producer.issue_tile``). A K tile (``is_k``)
+    of the token-head-scale kernels brings its scales with its first slot."""
     for sl in cutlass.range_constexpr(st.slots_per_tile):
         kv_prod, raw_cons = convert_slot(
             st,
@@ -877,6 +968,13 @@ def convert_tile(
             kv_head,
             ctid,
             sf_swizzled,
+            mVsf,
+            s_ks,
+            s_vs,
+            sf_entry,
+            mKvIndices,
+            n_pages,
+            st.th and is_k and sl == 0,
         )
     return kv_prod, raw_cons
 
@@ -897,12 +995,20 @@ def convert_unit(
     tile_lo: Int32,
     tile_hi: Int32,
     ctid: Int32,
+    mKvIndices: cute.Tensor,
+    s_ks: cute.Tensor,
+    s_vs: cute.Tensor,
+    seq0: Int32,
 ):
     """The staged K and V tiles of one unit into the ring, in the TMA producer's slot order (``producer.load_loop``): the order
     ``stage_unit`` staged them in. The K block scales of an NVFP4 cache are linear; the V block scales are linear or swizzled as
-    the plan states (``st.v_sf_swizzled``)."""
+    the plan states (``st.v_sf_swizzled``). ``seq0`` is the CTA's running tile count at the unit's first tile: tile
+    ``tile_lo + n`` owns entry ``(seq0 + n) % sf_stages`` of the scale side ring (``s_ks`` / ``s_vs``; the token-head-scale
+    kernels, which read the page table ``mKvIndices`` for the scales' pages)."""
     LA = st.qk_ahead
+    SF = st.sf_stages
     kv_ptr0 = mKvIndptr[req]
+    n_pages = mKvIndptr[req + 1] - kv_ptr0
     N = tile_hi - tile_lo
     kv_prod, raw_cons = convert_tile(
         st,
@@ -917,6 +1023,13 @@ def convert_unit(
         kv_head,
         ctid,
         False,
+        mVsf,
+        s_ks,
+        s_vs,
+        seq0 % SF,
+        mKvIndices,
+        n_pages,
+        True,
     )
     if cutlass.const_expr(LA == 2):
         if N > 1:
@@ -933,6 +1046,13 @@ def convert_unit(
                 kv_head,
                 ctid,
                 False,
+                mVsf,
+                s_ks,
+                s_vs,
+                (seq0 + 1) % SF,
+                mKvIndices,
+                n_pages,
+                True,
             )
         for n in range(N):
             kv_prod, raw_cons = convert_tile(
@@ -948,6 +1068,13 @@ def convert_unit(
                 kv_head,
                 ctid,
                 st.v_sf_swizzled,
+                mVsf,
+                s_ks,
+                s_vs,
+                Int32(0),
+                mKvIndices,
+                n_pages,
+                False,
             )
             if n + 2 < N:
                 kv_prod, raw_cons = convert_tile(
@@ -963,6 +1090,13 @@ def convert_unit(
                     kv_head,
                     ctid,
                     False,
+                    mVsf,
+                    s_ks,
+                    s_vs,
+                    (seq0 + n + 2) % SF,
+                    mKvIndices,
+                    n_pages,
+                    True,
                 )
     else:
         for n in range(N):
@@ -980,6 +1114,13 @@ def convert_unit(
                     kv_head,
                     ctid,
                     False,
+                    mVsf,
+                    s_ks,
+                    s_vs,
+                    (seq0 + n + 1) % SF,
+                    mKvIndices,
+                    n_pages,
+                    True,
                 )
             kv_prod, raw_cons = convert_tile(
                 st,
@@ -994,6 +1135,13 @@ def convert_unit(
                 kv_head,
                 ctid,
                 st.v_sf_swizzled,
+                mVsf,
+                s_ks,
+                s_vs,
+                Int32(0),
+                mKvIndices,
+                n_pages,
+                False,
             )
     return kv_prod, raw_cons
 

@@ -12,9 +12,10 @@ argument                                    accepted (no effect on the bits); ev
 ==========================================  =====================================================================================
 ``q_scale`` / ``o_scale``                   ``None`` or exactly ``1.0`` for every class (the query and the output are bf16 and
                                             unscaled)
-``k_scale`` / ``v_scale``                   ``None`` or exactly ``1.0`` for a bf16 KV cache; the low-bit KV classes take them as
-                                            operands (any value their chain admits, ``engine.check_sm_scale`` /
-                                            ``engine.check_v_scale``)
+``k_scale`` / ``v_scale``                   ``None`` or exactly ``1.0`` for a bf16 KV cache and for the token-head-scale classes
+                                            (their scales are the per-key tensors of ``kv_cache_sf``); the per-tensor low-bit KV
+                                            classes take them as operands (any value their chain admits,
+                                            ``engine.check_sm_scale`` / ``engine.check_v_scale``)
 ==========================================  =====================================================================================
 
 A scale is a Python number or a one-element floating-point tensor (read on the host: a synchronisation for a device tensor,

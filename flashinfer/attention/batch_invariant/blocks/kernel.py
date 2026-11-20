@@ -14,7 +14,9 @@ trees come from ``canon`` plans; the arithmetic functions are ``spec.py``'s.
 The low-bit-KV kernels (``kv_fmt`` ``"e4m3"`` / ``"e5m2"`` / ``"nvfp4"``) differ in one role: the load warp's TMA stages the raw
 cache bytes and the conversion warps (the two empty warps and a further warpgroup: ``convert.py``) fill the bf16 ring from them,
 through a thread-to-UMMA ring pipeline; the epilogue takes the value scale ``vs`` (``fixup.finish``). Every other role is the
-bf16 kernel's code.
+bf16 kernel's code. The token-head-scale kernels (``"e4m3th"`` / ``"e5m2th"``) run the fp8-KV kernels' staging and conversion; the
+conversion threads also fetch every tile's per-(key, KV head) binary32 scales (``mKsf`` / ``mVsf``) into a smem side ring, the
+softmax multiplies each key's score and each key's probability by them (``softmax.py``), and the epilogue is the bf16 kernel's.
 """
 
 from __future__ import annotations
@@ -157,7 +159,8 @@ class AttentionKernel:
         fp32) when ``O_m`` is not in TMEM (D = 256), else any one-element tensor. ``vs`` is the low-bit-KV classes' value scale
         (the epilogue's one ``mul.rn``; unused by the bf16 kernel, which passes 1.0). ``mK`` / ``mV`` are the bf16 caches, or the
         fp8 caches viewed as bytes for the fp8-KV kernels, or the packed NVFP4 caches with their block scales ``mKsf`` / ``mVsf``
-        (``(D / 16, page, Hkv, num_pages)`` bytes; any one-element tensor for the other kernels)."""
+        (``(D / 16, page, Hkv, num_pages)`` bytes; any one-element tensor for the other kernels), or the fp8 caches with their
+        per-(token, head) binary32 scales (``(page, Hkv, num_pages)``, any strides) for the token-head-scale kernels."""
         st = StaticPlan(
             self.D,
             self.g,
@@ -396,6 +399,10 @@ class AttentionKernel:
         s_mx = storage.s_mx.get_tensor(
             cute.make_layout((2, st.n_slices, Q_ROWS))
         )  # the key slices' row-maximum partials, exchanged between the softmax warpgroups (two tile parities)
+        # the token-head-scale kernels' side ring: entry e holds the T key scales / value scales of one tile (convert.py)
+        sf_layout = cute.make_layout((st.T, st.sf_stages) if st.th else (4, 1))
+        s_ks = storage.s_ks.get_tensor(sf_layout)
+        s_vs = storage.s_vs.get_tensor(sf_layout)
         qk_thr_mma = qk_tiled_mma.get_slice(0)
         qks_thr_mma = qks_tiled_mma.get_slice(0)
         pv_thr_mma = pv_tiled_mma.get_slice(0)
@@ -464,6 +471,7 @@ class AttentionKernel:
                 cute.arch.setmaxregister_decrease(R.regs_convert)
                 tidx, _, _ = cute.arch.thread_idx()
                 ctid = tidx - 32 * R.convert_warps[0]
+                seq = Int32(0)
                 for u in range(bidx, num_units, grid_size):
                     kv_prod, raw_cons = convert_unit(
                         st,
@@ -480,7 +488,12 @@ class AttentionKernel:
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
                         ctid,
+                        mKvIndices,
+                        s_ks,
+                        s_vs,
+                        seq,
                     )
+                    seq = seq + mDesc[(u, F_TILE_HI)] - mDesc[(u, F_TILE_LO)]
                 cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not st.lowbit):
             if warp_idx == R.load_warp:
@@ -692,8 +705,12 @@ class AttentionKernel:
                         mDesc[(uk, F_QLEN)],
                         mDesc[(uk, F_TILE_LO)],
                         mDesc[(uk, F_TILE_HI)],
+                        s_ks,
+                        s_vs,
+                        Int32(0),
                     )
             if cutlass.const_expr(not st.q2):
+                seq = Int32(0)
                 for u in range(bidx, num_units, grid_size):
                     s_cons, p_prod, stats_prod = softmax_loop(
                         st,
@@ -717,7 +734,11 @@ class AttentionKernel:
                         mDesc[(u, F_QLEN)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
+                        s_ks,
+                        s_vs,
+                        seq,
                     )
+                    seq = seq + mDesc[(u, F_TILE_HI)] - mDesc[(u, F_TILE_LO)]
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx >= R.correction_warps[0] and warp_idx < R.mma_warp:
             if cutlass.const_expr(R.regs_correction > R.regs_launch):

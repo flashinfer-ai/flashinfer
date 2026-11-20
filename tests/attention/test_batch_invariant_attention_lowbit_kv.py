@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The fp8-KV classes of the batch-invariant attention (``attention.e4m3kv`` / ``attention.e5m2kv``): bitwise tests only (the
 mode's acceptance criterion), the device-free checks of the fingerprints and the configuration space, and the "unsupported
-raises, nothing falls back" rule for what the classes do not cover (per-(token, head) scales, scaled queries and outputs); then
+raises, nothing falls back" rule for what the classes do not cover (scaled queries and outputs, scale tensors on a
+per-tensor-scale plan; the per-(token, head)-scale classes have their own file,
+``test_batch_invariant_attention_token_head_sf.py``); then
 the NVFP4-KV class (``attention.nvfp4kv``) with its two V block-scale layouts, every code of the formats, and the argument lists
 serving engines call the wrappers with.
 
@@ -697,8 +699,14 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # plan(): what the classes do not cover
     with pytest.raises(
         bi.BatchInvariantUnsupportedError, match="use_token_head_sf"
-    ):  # per-(token, head) scales
-        w.plan(*plan_args, causal=True, use_token_head_sf=True, **plan_kw(lp))
+    ):  # per-(token, head) scales over a bf16 cache
+        w.plan(
+            *plan_args,
+            causal=True,
+            use_token_head_sf=True,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
     with pytest.raises(bi.BatchInvariantUnsupportedError):  # an fp16 cache
         w.plan(
             *plan_args,
@@ -728,7 +736,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             w.run(pr.q, (k, v), q_scale=bad, k_scale=lp.k_scale, v_scale=lp.v_scale)
     with pytest.raises(
         bi.BatchInvariantUnsupportedError, match="kv_cache_sf"
-    ):  # block / per-token scales
+    ):  # scale tensors on a per-tensor-scale plan
         w.run(
             pr.q,
             (k, v),
@@ -883,7 +891,8 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             128,
             16,
             use_token_head_sf=True,
-            **plan_kw(lp),
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
         )
     rag = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         ws, "NHD", batch_invariant=True
@@ -898,7 +907,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             causal=True,
             use_token_head_sf=True,
             q_data_type=torch.bfloat16,
-            kv_data_type=E4,
+            kv_data_type=torch.bfloat16,
         )
 
 
