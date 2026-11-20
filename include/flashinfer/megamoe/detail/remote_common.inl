@@ -12,8 +12,7 @@ const auto remote_index_of_node = [&](const uint32_t& node) {
 };
 const auto node_of_remote_index = [&](const uint32_t& j) { return j < my_node ? j : j + 1; };
 const auto& remote = buffers.remote;
-const uint32_t launch_epoch =
-    kNumRemoteNodes > 0 ? ptx::ld_volatile(remote.launch_epoch()) : 0u;
+const uint32_t launch_epoch = kNumRemoteNodes > 0 ? ptx::ld_volatile(remote.launch_epoch()) : 0u;
 
 // Byte offsets of the four input buffers inside the input block; the inbox
 // repeats them.
@@ -27,4 +26,3 @@ const int64_t weights_block_offset =
 constexpr uint32_t kSFBytes = kHidden / 32;
 constexpr uint32_t kIdxBytes = kNumTopk * sizeof(int64_t);
 constexpr uint32_t kWeightBytes = kNumTopk * sizeof(float);
-
