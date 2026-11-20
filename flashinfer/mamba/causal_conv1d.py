@@ -18,6 +18,15 @@ def _supported(x, *args, **kwargs):
     return x.is_cuda and get_compute_capability(x.device) in ((10, 0), (10, 3))
 
 
+def _decode_plan(prefill, accepted, num_sequences, width):
+    # Measured on B300: deeper histories want smaller blocks, and the ordinary
+    # update is launch-bound enough for a programmatic dependent launch to pay.
+    if prefill or accepted is not None:
+        return {}
+    block_c = {3: 256 if num_sequences <= 8 else 512, 4: 256}.get(width, 128)
+    return {"block_c": block_c, "pdl": True}
+
+
 def _prefill_block_t(rows, num_sequences):
     threshold = 64 if num_sequences > 32 else 128
     return 8 if rows < threshold * num_sequences else 16
@@ -210,6 +219,7 @@ def _run(
             ),
             width=width,
             silu=activation == "silu",
+            **_decode_plan(prefill, accepted, indices.numel(), width),
         )
         if prefill and not inline_prefix:
             get_chunk_map_kernel(arch, x.device.index, block_t)(offsets, workspace)

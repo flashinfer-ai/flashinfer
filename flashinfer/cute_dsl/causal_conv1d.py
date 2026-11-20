@@ -281,8 +281,11 @@ def _conv(
     single_sequence: cutlass.Constexpr,
     width: cutlass.Constexpr,
     silu: cutlass.Constexpr,
+    pdl: cutlass.Constexpr,
 ):
     depth = width - 1
+    if cutlass.const_expr(pdl):
+        cute.arch.griddepcontrol_wait()
     task, channel_tile, _ = cute.arch.block_idx()
     tid, _, _ = cute.arch.thread_idx()
     channel = cutlass.Int64(channel_tile) * block_c + tid
@@ -500,6 +503,8 @@ def _conv(
             else:
                 for token in cutlass.range(start, stop):
                     out[token, channel] = cutlass.BFloat16(0.0)
+    if cutlass.const_expr(pdl):
+        cute.arch.griddepcontrol_launch_dependents()
 
 
 @cute.jit
@@ -530,6 +535,7 @@ def _launch(
     single_sequence: cutlass.Constexpr,
     width: cutlass.Constexpr,
     silu: cutlass.Constexpr,
+    pdl: cutlass.Constexpr,
     stream: cuda.CUstream,
 ):
     tasks = slots.shape[0]
@@ -567,10 +573,12 @@ def _launch(
         single_sequence,
         width,
         silu,
+        pdl,
     ).launch(
         grid=(tasks, cute.ceil_div(x.shape[1], block_c), 1),
         block=(block_c, 1, 1),
         stream=stream,
+        use_pdl=pdl,
     )
 
 
@@ -622,6 +630,7 @@ def get_conv_kernel(
     single_sequence=False,
     width=4,
     silu=True,
+    pdl=False,
 ):
     defer_state = (
         speculative
@@ -673,7 +682,7 @@ def get_conv_kernel(
         f"_l{int(channel_contiguous)}_u{max_tokens}_pfx{int(inline_prefix)}"
         f"_a{weight_alignment}_t{block_t}_c{block_c}_f{int(full_tile)}"
         f"_d{static_channels}_svec{int(vector_state)}_dh{static_history}_wm{int(warp_metadata)}"
-        f"_str{'x'.join(map(str, static_strides))}_ss{int(single_sequence)}{'' if silu else '_id'}_{arch}"
+        f"_str{'x'.join(map(str, static_strides))}_ss{int(single_sequence)}{'' if silu else '_id'}{'_pdl' if pdl else ''}_{arch}"
     )
     return build_and_load_cute_dsl_kernel(
         "causal_conv1d",
@@ -706,6 +715,7 @@ def get_conv_kernel(
             single_sequence,
             width,
             silu,
+            pdl,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options=f"--enable-tvm-ffi --gpu-arch={arch}",
         ),
