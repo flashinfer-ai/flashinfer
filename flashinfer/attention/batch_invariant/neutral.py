@@ -36,32 +36,40 @@ SCALE_NAMES = ("q_scale", "k_scale", "v_scale", "o_scale")
 _UNIT_SCALES = "unscaled bf16 operands (q_scale / k_scale / v_scale / o_scale of None or exactly 1.0, as host numbers)"
 
 
+def host_scale(class_name: str, name: str, value):
+    """The host number of one scale argument, or the typed refusal for a form that cannot be read without a device
+    readback: a Python or numpy number, or a one-element CPU tensor. This is the one place that decides which forms are
+    readable (a device tensor is not: reading it would stall every ``run()``), for every wrapper and for eager and CUDA
+    graph mode alike."""
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            raise unsupported(
+                class_name,
+                f"{name} as a tensor on {value.device} (reading it would stall every run())",
+                _UNIT_SCALES,
+            )
+        if value.numel() != 1:
+            raise unsupported(
+                class_name,
+                f"{name} as a tensor of {value.numel()} elements",
+                _UNIT_SCALES,
+            )
+        return value.item()
+    return value
+
+
 def check_unit_scales(
     class_name: str, scales: Sequence, free: Sequence[str] = ()
 ) -> None:
     """``scales`` in the order of :data:`SCALE_NAMES`: each must be ``None`` or exactly one (compared with ``1.0`` exactly,
-    no tolerance: engines pass the exact value). A unit scale multiplies nothing, so it is the unscaled class; any other
-    value is a term the class does not have. ``free`` names the scales a class takes as operands (the per-tensor
-    ``k_scale`` / ``v_scale`` of a low-bit KV class): those are not checked here. The query and the output scale are
-    unit-only for every class."""
+    no tolerance: engines pass the exact value; ``host_scale`` says which forms of the argument are read). A unit scale
+    multiplies nothing, so it is the unscaled class; any other value is a term the class does not have. ``free`` names
+    the scales a class takes as operands (the per-tensor ``k_scale`` / ``v_scale`` of a low-bit KV class): those are not
+    checked here. The query and the output scale are unit-only for every class."""
     for name, value in zip(SCALE_NAMES, scales, strict=False):
         if value is None or name in free:
             continue
-        shown = value
-        if isinstance(value, torch.Tensor):
-            if value.device.type != "cpu":
-                raise unsupported(
-                    class_name,
-                    f"{name} as a tensor on {value.device} (reading it would stall every run())",
-                    _UNIT_SCALES,
-                )
-            if value.numel() != 1:
-                raise unsupported(
-                    class_name,
-                    f"{name} as a tensor of {value.numel()} elements",
-                    _UNIT_SCALES,
-                )
-            shown = value.item()
+        shown = host_scale(class_name, name, value)
         try:
             unit = float(shown) == 1.0
         except (TypeError, ValueError):
