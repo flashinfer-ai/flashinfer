@@ -12,6 +12,7 @@ from flashinfer import (
     silu_and_mul_mxfp8_experts_quantize,
 )
 from flashinfer.utils import get_compute_capability
+from flashinfer.quantization import mxfp8_dequantize
 from tests.utils_fp8 import (
     assert_mxfp8_quantize_exact as _assert_mxfp8_quantize_exact,
     mxfp8_quantize_reference,
@@ -84,6 +85,26 @@ def _skip_unless_grouped_backend(backend: str, dtype=torch.bfloat16) -> None:
         pytest.skip(
             f"a generated Cake grouped MXFP8 profile for {dtype} is not installed"
         )
+
+
+@pytest.mark.parametrize("layout", list(SfLayout))
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_mxfp8_dequantize_round_trip(layout, device):
+    if device == "cuda" and (
+        not torch.cuda.is_available() or not _is_mxfp8_supported(torch.device(device))
+    ):
+        pytest.skip("MXFP8 quantization requires SM100 or newer")
+    # Small integers scaled by powers of two are exactly representable here.
+    # Cross both swizzle tile boundaries and keep the flattened batch row order.
+    exponents = torch.arange(2 * 67 * 5).reshape(2, 67, 5, 1) % 16 - 8
+    x = (2.0**exponents * torch.arange(-16, 16)).reshape(2, 67, 160)
+    if device == "cuda":
+        q, sf = mxfp8_quantize(x.to(device, torch.bfloat16), sf_swizzle_layout=layout)
+    else:
+        q, sf = mxfp8_quantize_reference(x, sf_swizzle_layout=layout)
+        q = q.view(torch.uint8)
+    decoded = mxfp8_dequantize(q, sf, sf_swizzle_layout=layout)
+    torch.testing.assert_close(decoded, x, rtol=0, atol=0)
 
 
 def _unswizzle_mxfp8_scales_128x4(

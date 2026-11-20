@@ -1,4 +1,5 @@
 import functools
+import math
 from types import SimpleNamespace
 from typing import Dict, Literal, Optional, Tuple
 
@@ -8,6 +9,7 @@ import tvm_ffi
 from ..api_logging import flashinfer_api
 from ..cutile import is_cuda_tile_available
 from ..trace.templates.quantize import (
+    mxfp8_dequantize_trace,
     mxfp8_grouped_quantize_trace,
     mxfp8_quantize_trace,
     silu_and_mul_mxfp8_experts_quantize_trace,
@@ -1163,6 +1165,50 @@ def silu_and_mul_mxfp8_experts_quantize(
         get_mxfp8_quantization_sm100_module().silu_and_mul_mxfp8_experts_quantize_sm100(
             a, mask, enable_pdl
         )
+    )
+
+
+@flashinfer_api(trace=mxfp8_dequantize_trace)
+def mxfp8_dequantize(
+    input: torch.Tensor,
+    scale_tensor: torch.Tensor,
+    is_sf_swizzled_layout: bool = True,
+    sf_swizzle_layout: Optional[SfLayout] = None,
+) -> torch.Tensor:
+    """Decode the E4M3FN values and flat uint8 block scales from :func:`mxfp8_quantize`.
+
+    Pass the same scale layout used for quantization (128x4 by default).
+    Returns a CPU float32 tensor with the shape of the quantized input.
+    """
+    from ..batch_invariant.quantization.layout import sf_numel, unswizzle_sf
+    from ..batch_invariant.quantization.mx_api import layout_of
+
+    if input.ndim < 1 or input.shape[-1] % 32:
+        raise ValueError("input must have a last dimension divisible by 32")
+    if input.dtype not in (torch.float8_e4m3fn, torch.uint8):
+        raise TypeError("input must contain float8_e4m3fn values or their uint8 bytes")
+    if scale_tensor.dtype != torch.uint8:
+        raise TypeError("scale_tensor must have dtype uint8")
+    layout = layout_of(
+        is_sf_swizzled_layout
+        if sf_swizzle_layout is None
+        else SfLayout(sf_swizzle_layout)
+    )
+    rows, k = math.prod(input.shape[:-1]), input.shape[-1]
+    num_scales = sf_numel(rows, k, 32, layout) if k else 0
+    if scale_tensor.shape != (num_scales,):
+        raise ValueError(f"scale_tensor must have shape ({num_scales},) for {layout}")
+    if input.numel() == 0:
+        return torch.empty(input.shape, dtype=torch.float32, device="cpu")
+
+    scales = scale_tensor.cpu()
+    if layout == "linear":
+        scales = scales.reshape(rows, k // 32)
+    else:
+        scales = unswizzle_sf(scales, rows, k, 32, layout)
+    blocks = input.cpu().view(torch.float8_e4m3fn).reshape(rows, k // 32, 32).float()
+    return blocks.mul_(scales.view(torch.float8_e8m0fnu).float().unsqueeze(-1)).reshape(
+        input.shape
     )
 
 
