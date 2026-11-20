@@ -109,9 +109,9 @@ def _relative_imports(path: Path) -> set:
 
     ``from .m import a`` names the module ``m.py``; from a package ``p``, ``from .p import a`` names the submodule
     ``p/a.py`` (or ``p/a/__init__.py``) when it exists and the package's ``__init__.py`` only when ``a`` is a symbol
-    defined there. A package's ``__init__`` is thus followed only for the symbols it defines: its own imports (the
-    surfaces it re-exports) are not part of a kernel the package's submodules build. The ``__init__`` files on the
-    way to every key file still enter the key, unfollowed (:func:`module_sources`).
+    defined there. An ``__init__`` named by an import is followed in full (:func:`module_sources` walks it like any
+    key file); one that is only on the path to a key file enters the key unfollowed, so the surfaces it re-exports
+    are not part of a kernel the package's submodules build.
     """
     out: set = set()
     try:
