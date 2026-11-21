@@ -84,6 +84,9 @@ patch --batch --forward --no-backup-if-mismatch -p1 \
     -d "${FI_EXPORT_STAGE:?}/raw" -i "${FI_RELEASE_PATCH:?}"
 ```
 
+Apply FlashInfer's Blackwell GenPhase pusher-count guard after release
+preparation. It rejects configurations with no scale-factor pusher.
+
 Verify every Python file against the manifest and reject missing or extra
 files. The exporter, provider patches and release patch are maintained with
 the source export records and are not included in this package. Make kernel
