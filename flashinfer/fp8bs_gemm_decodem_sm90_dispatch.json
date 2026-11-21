@@ -1,0 +1,22 @@
+{
+  "comment": "Dispatch surface of the specialized SM90 decode-M dense fp8 block-scale GEMM, behind fp8_blockscale_gemm_sm90's 'specialized' backend. 'backends' lists the backend strings; the op entry carries the auto-routing keys (the compiled-in guards in flashinfer/gemm/fp8bs_decodem_sm90.py stay authoritative). backend='auto' routes to the specialized kernel only when this file is present and well-formed; FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 disables the specialized kernel regardless of this file: backend='auto' keeps the stock route, explicit backend='specialized' raises.",
+  "backends": ["auto", "specialized", "deepgemm"],
+  "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
+  "ops": {
+    "fp8_blockscale_gemm_sm90": {
+      "form": "BF16 activations (internal fused 1x128 per-token-group quantization, no epsilon floor; FP32 quantization multiplier 448/amax for nonzero amax, identity for an all-zero group; reciprocal multiplier for dequantization), FP8 e4m3 weights (N, K), float32 128x128 block scale grid (ceil(N/128), K/128), BF16 output",
+      "m_band": [1, 24],
+      "band_note": "Interpolate M within this inclusive band only for the paired (N,K) classes from the 12 captured H200 measurement rows. Other classes stay on stock under auto.",
+      "measured_nk_classes": [
+        [8192, 1536],
+        [2048, 7168],
+        [7168, 2048],
+        [2048, 2048],
+        [2624, 6144],
+        [6144, 2048]
+      ],
+      "alignment": {"k_multiple_of": 128, "n_multiple_of": 64},
+      "compute_capability": [9, 0]
+    }
+  }
+}

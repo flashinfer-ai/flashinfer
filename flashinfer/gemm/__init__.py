@@ -31,6 +31,10 @@ from .gemm_base import (
     group_gemm_fp8_nt_groupwise_contiguous as group_gemm_fp8_nt_groupwise_contiguous,
 )
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .fp8_blockscale_front import (
+    FP8_BLOCKSCALE_GEMM_BACKENDS as FP8_BLOCKSCALE_GEMM_BACKENDS,
+)
+from .fp8_blockscale_front import fp8_blockscale_gemm as fp8_blockscale_gemm
 from .gemm_bf16_fp8 import mm_bf16_fp8 as mm_bf16_fp8
 from .gemm_bf16_fp8 import (
     mm_bf16_fp8_workspace_bytes as mm_bf16_fp8_workspace_bytes,
@@ -216,6 +220,8 @@ __all__ = (
         "prepare_kimi_k3_fp8_projection",
         "prepare_kimi_k3_fp8_projection_weights",
         "fp8_blockscale_gemm_sm90",
+        "fp8_blockscale_gemm",
+        "FP8_BLOCKSCALE_GEMM_BACKENDS",
         "PreparedNvFp4LoraAdapter",
         "StaleAdapterError",
         "mm_fp8_lora",
