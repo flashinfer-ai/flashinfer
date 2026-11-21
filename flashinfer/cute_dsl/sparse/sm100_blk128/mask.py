@@ -48,10 +48,14 @@ def apply_block_size_mask(
     block_size: Int32,
     n_block_size: cutlass.Constexpr[int] = 128,
 ) -> None:
-    """Apply R2P bitmask masking positions >= block_size within a tile."""
-    if block_size < n_block_size:
-        mask_r2p_lambda(
-            acc_S,
-            lambda s: r2p_bitmask_below(block_size, s),
-            rank1=True,
-        )
+    """Apply R2P bitmask masking positions >= block_size within a tile.
+
+    Applied unconditionally: a full block's bitmask is all ones, so a runtime
+    `block_size < n_block_size` guard would only skip no-op work, and on SM100
+    it made the whole kernel about 1.5x slower.
+    """
+    mask_r2p_lambda(
+        acc_S,
+        lambda s: r2p_bitmask_below(block_size, s),
+        rank1=True,
+    )
