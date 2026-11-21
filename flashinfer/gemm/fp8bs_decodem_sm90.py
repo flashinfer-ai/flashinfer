@@ -319,9 +319,21 @@ def _fp8bs_decodem_try_dispatch(
                     "never falls back — use backend='auto' or 'deepgemm'"
                 ) from e
             return None
+    # Earlier prebuilt modules exported only run, which cannot decline a
+    # launch on a reduced-SM stream. Do not invoke that unchecked entry.
+    try_run = getattr(module, "try_run", None)
+    if try_run is None:
+        _fallback(f"{requested}: incompatible_prebuilt_module")
+        if requested == "specialized":
+            raise NotImplementedError(
+                "fp8_blockscale_gemm_sm90 backend='specialized' loaded an older "
+                "prebuilt module without stream-capacity support; rebuild or "
+                "remove that artifact, or use backend='auto' or 'deepgemm'"
+            )
+        return None
     # Outside the build handler: native errors are never build failures or
     # fallback signals. False specifically means no kernel was submitted.
-    if not module.try_run(input, weight, weight_scale, _QUANT_EPS, out):
+    if not try_run(input, weight, weight_scale, _QUANT_EPS, out):
         reason = "stream_cluster_capacity"
         _fallback(f"{requested}: {reason}")
         if requested == "specialized":

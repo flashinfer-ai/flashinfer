@@ -120,3 +120,47 @@ def test_native_stream_decision(monkeypatch, backend):
     assert mod._stats["backend_dispatches"] == {"specialized": 2, "deepgemm": 0}
     assert mod._stats["fallback_reasons"] == {f"{backend}: stream_cluster_capacity": 1}
     assert mod._stats["jit_build"] == "built"
+
+
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+def test_previous_prebuilt_module_falls_back_without_launch(monkeypatch, backend):
+    x = SimpleNamespace(shape=(4, 2048), device=0)
+    w = SimpleNamespace(shape=(2048, 2048))
+    ws, out = object(), object()
+    previous = Mock(spec_set=["run"])
+    current = Mock(spec_set=["try_run"])
+    current.try_run.side_effect = [True, AttributeError("native execution error")]
+    monkeypatch.setattr(
+        mod, "_get_module", Mock(side_effect=[previous, current, current])
+    )
+    monkeypatch.setattr(mod, "_eligibility", lambda *args: (True, "ok"))
+    monkeypatch.setattr(mod.torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(
+        mod,
+        "_stats",
+        {
+            "jit_build": "built",
+            "fallback_reasons": {},
+            "backend_dispatches": {"specialized": 0, "deepgemm": 0},
+        },
+    )
+
+    def call():
+        return mod._fp8bs_decodem_try_dispatch(x, w, None, ws, out, backend)
+
+    if backend == "auto":
+        assert call() is None
+    else:
+        with pytest.raises(NotImplementedError, match="older prebuilt module.*rebuild"):
+            call()
+    previous.run.assert_not_called()
+    assert mod._stats["jit_build"] == "built"
+    assert mod._stats["fallback_reasons"] == {
+        f"{backend}: incompatible_prebuilt_module": 1
+    }
+    # A replacement provider works, and errors from its actual invocation
+    # propagate rather than being mistaken for a missing export.
+    assert call() is out
+    with pytest.raises(AttributeError, match="native execution error"):
+        call()
+    assert mod._stats["backend_dispatches"] == {"specialized": 1, "deepgemm": 0}
