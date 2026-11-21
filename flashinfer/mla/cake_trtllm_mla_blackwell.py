@@ -408,9 +408,9 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "binding_flags": [
             "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_d5290af7ebbae835455a",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_01a8ed8aa21db44c",
-            "-DCAKE_VARIANT_NS_0=variant_cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371_sm_103a_32a1975e851a",
+            "-DCAKE_VARIANT_NS_0=variant_cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9_sm_103a_32a1975e851a",
             "-DCAKE_VARIANT_NS_1=variant_cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed_sm_103a_b314ebedc258",
-            "-DCAKE_VARIANT_NS_2=variant_cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3_sm_103a_b314ebedc258",
+            "-DCAKE_VARIANT_NS_2=variant_cake_trtllm_mla_blackwell_26168a31cc8a607d8a15_sm_103a_b314ebedc258",
             "-DCAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS=7",
         ],
         "dependencies": [

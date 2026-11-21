@@ -2894,9 +2894,9 @@ def test_trtllm_mla_blackwell_device_row_bindings() -> None:
         assert splitkv["binding"] == _SPLITKV_BINDING
         assert splitkv["arch"] == arch and splitkv["domain"] == "mla_bf16_splitkv"
         assert splitkv["dependencies"] == [
-            "cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371",
+            "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9",
             "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
-            "cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3",
+            "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15",
         ]
     assert _SPLITKV_BINDING != _CLC_BINDING
     assert _SPLITKV_BINDING not in _VALUE_SPLIT_BINDINGS

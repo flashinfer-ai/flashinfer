@@ -25,11 +25,13 @@
 // KV tiles into num_split equal ranges and writes one partial (LSE -inf and zeros for an empty range)
 // per (row, split); every page-id read is clamped to the table. The reducer merges the num_split
 // partials of each (row, head) in ascending split order, applies the sink and bmm2_scale, and writes
-// exact zeros for a row without KV tokens. The binding links two builds of the reducer that write the
-// same O bits: the prefetch_all build (every caller load in one batch after griddepcontrol.wait) for at
-// most CAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS query rows and more than CAKE_SPLITKV_PREFETCH_ALL_MIN_SPLITS - 1
-// splits, and the prefetch_any build (which prefetches up to eight splits) otherwise. Every program
-// launches with programmatic stream serialization.
+// exact zeros for a row without KV tokens. The mainloop stores each split's LSE before its last O wait
+// and writes the partial O of its last work item through shared memory in coalesced 1 KiB rows (the same
+// bytes). The binding links two builds of the reducer that write the same O bits: the prefetch_all build
+// (the sink and the split LSEs loaded in one batch after griddepcontrol.wait, every split's partial O
+// staged into shared memory by bulk copies) for at most CAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS query rows and
+// more than CAKE_SPLITKV_PREFETCH_ALL_MIN_SPLITS - 1 splits, and the prefetch_any build (which prefetches
+// up to eight splits) otherwise. Every program launches with programmatic stream serialization.
 // dispatch-policy-revision: unpinned
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -50,13 +52,13 @@
 #define CAKE_PROGRAM_SHIM cake_host_shim_cc810d7a556b9e7b
 #endif
 #ifndef CAKE_VARIANT_NS_0
-#define CAKE_VARIANT_NS_0 variant_cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371_sm_100a_15a61ea7a637
+#define CAKE_VARIANT_NS_0 variant_cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9_sm_100a_15a61ea7a637
 #endif
 #ifndef CAKE_VARIANT_NS_1
 #define CAKE_VARIANT_NS_1 variant_cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed_sm_100a_7c214d2f7fd0
 #endif
 #ifndef CAKE_VARIANT_NS_2
-#define CAKE_VARIANT_NS_2 variant_cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3_sm_100a_7c214d2f7fd0
+#define CAKE_VARIANT_NS_2 variant_cake_trtllm_mla_blackwell_26168a31cc8a607d8a15_sm_100a_7c214d2f7fd0
 #endif
 // The prefetch_all reducer (CAKE_VARIANT_NS_2) serves at most CAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS query rows split
 // at least CAKE_SPLITKV_PREFETCH_ALL_MIN_SPLITS ways; otherwise the binding launches the prefetch_any reducer
@@ -73,9 +75,9 @@
 #define CAKE_STR_(x) #x
 #define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k_nope, const __grid_constant__ CUtensorMap tmap_k_rope, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ seq_lens_kv, int* __restrict__ page_table, float* __restrict__ sinks, float softmax_scale_log2, float bmm2_scale, int num_split, int total_work_items, int max_pages_per_seq, int enable_sink, int q_len, int page_shift);
+extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k_nope, const __grid_constant__ CUtensorMap tmap_k_rope, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ seq_lens_kv, int* __restrict__ page_table, float* __restrict__ sinks, float softmax_scale_log2, float bmm2_scale, int num_split, int total_work_items, int max_pages_per_seq, int enable_sink, int q_len, int page_shift);
 extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ sinks, int num_q_heads, int num_split, float bmm2_scale, int enable_sink);
-extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ sinks, int num_q_heads, int num_split, float bmm2_scale, int enable_sink);
+extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_26168a31cc8a607d8a15(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ sinks, int num_q_heads, int num_split, float bmm2_scale, int enable_sink);
 
 namespace CAKE_PROGRAM_SHIM {
 
@@ -428,7 +430,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   void* kargs[] = {&p_tmap_q, &p_tmap_k_nope, &p_tmap_k_rope, &p_tmap_v, &p_O, &p_partial_lse, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_num_split, &v_total_work_items, &v_max_pages_per_seq, &v_enable_sink, &v_q_len, &v_page_shift};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371), 231424);
+      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9), 231424);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(384u, 1u, 1u);
@@ -452,9 +454,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9 failed: "
       << cudaGetErrorString(launch_status);
 }
 }  // namespace CAKE_VARIANT_NS_0
@@ -585,14 +587,14 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_lse, TensorView arg_O,
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 256u;
+  config.dynamicSmemBytes = 34048u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_26168a31cc8a607d8a15), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_26168a31cc8a607d8a15 failed: "
       << cudaGetErrorString(launch_status);
 }
 }  // namespace CAKE_VARIANT_NS_2
@@ -652,8 +654,8 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_half_
     int64_t gy = 128;
     int64_t gz = 1;
     // Both reducers write the same O bits; the prefetch_all one is faster for few rows with more
-    // splits than the prefetch_any one prefetches (eight), the prefetch_any one (fewer registers,
-    // more resident CTAs) otherwise.
+    // splits than the prefetch_any one prefetches (eight), the prefetch_any one (no shared-memory
+    // stage, more resident CTAs) otherwise.
     if (num_rows <= CAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS && num_split >= CAKE_SPLITKV_PREFETCH_ALL_MIN_SPLITS) {
       CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS_2::Run(arg_ws_partial_output, arg_ws_partial_lse, arg_output, arg_sinks, 128, num_split, bmm2_scale, enable_sink, gx, gy, gz, stream);
     } else {
