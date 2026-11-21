@@ -1088,8 +1088,8 @@ def test_native_task_cache_refreshes_for_each_work_tile(
     lengths, snapshots = [31, 57, 768], []
     query_offsets = object()
 
-    def visible_length(config, cache, query_tile, offsets, batch):
-        assert config is cfg and offsets is query_offsets
+    def visible_length(config, cache, query_tile, offsets, batch, *, cp_rank):
+        assert config is cfg and offsets is query_offsets and cp_rank == 0
         snapshots.append((cache, query_tile, batch))
         return cache[4]
 
