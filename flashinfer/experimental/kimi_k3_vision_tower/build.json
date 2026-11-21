@@ -217,7 +217,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_060b6894776fb9f893f7_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_060b6894776fb9f893f7_kernel.cu": "a01e7bcc97e518eaf422ebab330ac8807c7160d153ae681784437b2768435123"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_060b6894776fb9f893f7_kernel.cu": "af47079f7dfffb00f5aa047950417b6e44ed70183dc1d86aad7f7d13093e7fb0"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_060b6894776fb9f893f7_kernel.cu",
@@ -242,7 +242,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_060b6894776fb9f893f7_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_060b6894776fb9f893f7_kernel.cu": "a01e7bcc97e518eaf422ebab330ac8807c7160d153ae681784437b2768435123"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_060b6894776fb9f893f7_kernel.cu": "af47079f7dfffb00f5aa047950417b6e44ed70183dc1d86aad7f7d13093e7fb0"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_060b6894776fb9f893f7_kernel.cu",
@@ -489,7 +489,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_119aacafa6ef264b5fb6_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_119aacafa6ef264b5fb6_kernel.cu": "a2530c62e47421aab5f621f7fcafe8557f40bcea4bc0eab1e22f440016729e1e"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_119aacafa6ef264b5fb6_kernel.cu": "781a9a8e86ff1dfc18f517ded60e8b4f90798fbe1da2813e3bbe6b82551ac8c2"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_119aacafa6ef264b5fb6_kernel.cu",
@@ -514,7 +514,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_119aacafa6ef264b5fb6_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_119aacafa6ef264b5fb6_kernel.cu": "a2530c62e47421aab5f621f7fcafe8557f40bcea4bc0eab1e22f440016729e1e"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_119aacafa6ef264b5fb6_kernel.cu": "781a9a8e86ff1dfc18f517ded60e8b4f90798fbe1da2813e3bbe6b82551ac8c2"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_119aacafa6ef264b5fb6_kernel.cu",
@@ -929,7 +929,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_binding.cu": "128d66e49bc00cbf4abdc4ad3ee4619339e2b0fcdf2985d5455b1e311337932c",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_kernel.cu": "1d6fe46483e386b570372605c85c66faee9d55f843e585fc8e1ae1cc38b18628"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_kernel.cu": "ac852755e9ced126bb69467cfb427c49b6dd9fc9251e0d7945d44b1a9098e082"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_kernel.cu",
@@ -950,7 +950,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_binding.cu": "128d66e49bc00cbf4abdc4ad3ee4619339e2b0fcdf2985d5455b1e311337932c",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_kernel.cu": "1d6fe46483e386b570372605c85c66faee9d55f843e585fc8e1ae1cc38b18628"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_kernel.cu": "ac852755e9ced126bb69467cfb427c49b6dd9fc9251e0d7945d44b1a9098e082"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_kernel.cu",
@@ -999,7 +999,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_4009ef6ad254688445a6_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_4009ef6ad254688445a6_kernel.cu": "a3f24f16ee41da480356e40f9f444da9eab07f30f1d5c5f9c34a96d70b7a3d0e"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_4009ef6ad254688445a6_kernel.cu": "2b72029ab7053b1d30a81edcfcd2400a17db2cb649b674c6c45625a82fdda0e7"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_4009ef6ad254688445a6_kernel.cu",
@@ -1024,7 +1024,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_4009ef6ad254688445a6_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_4009ef6ad254688445a6_kernel.cu": "a3f24f16ee41da480356e40f9f444da9eab07f30f1d5c5f9c34a96d70b7a3d0e"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_4009ef6ad254688445a6_kernel.cu": "2b72029ab7053b1d30a81edcfcd2400a17db2cb649b674c6c45625a82fdda0e7"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_4009ef6ad254688445a6_kernel.cu",
@@ -1087,7 +1087,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_41c914ec338580579206_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_binding.cu": "58f1fc7098c38c165fbb404ad68149f6b8d1f2c7097d5cfcc4abaacc99789544",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_kernel.cu": "7c3031cdd458be7152d2bf13969c6407d8ac7dd21becf9778cc200cee46e8df2"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_kernel.cu": "b5d3544e2f014eb717375af4326dba328d5d6784a962abb9e405c8f3fe5a7c1d"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_kernel.cu",
@@ -1108,7 +1108,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_41c914ec338580579206_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_binding.cu": "58f1fc7098c38c165fbb404ad68149f6b8d1f2c7097d5cfcc4abaacc99789544",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_kernel.cu": "7c3031cdd458be7152d2bf13969c6407d8ac7dd21becf9778cc200cee46e8df2"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_kernel.cu": "b5d3544e2f014eb717375af4326dba328d5d6784a962abb9e405c8f3fe5a7c1d"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_kernel.cu",
@@ -1323,7 +1323,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_59c5772b6e592f5e9659_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_59c5772b6e592f5e9659_kernel.cu": "d864b288ff82ae1367352c515becfe70a03c7df2a6a7701b6e235af1bdadd22c"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_59c5772b6e592f5e9659_kernel.cu": "99277bf3ee07e91f8fab61086ad38517c04e56eba98ce41e2fa042dd86dbacb8"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_59c5772b6e592f5e9659_kernel.cu",
@@ -1348,7 +1348,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_59c5772b6e592f5e9659_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_59c5772b6e592f5e9659_kernel.cu": "d864b288ff82ae1367352c515becfe70a03c7df2a6a7701b6e235af1bdadd22c"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_59c5772b6e592f5e9659_kernel.cu": "99277bf3ee07e91f8fab61086ad38517c04e56eba98ce41e2fa042dd86dbacb8"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_59c5772b6e592f5e9659_kernel.cu",
@@ -2435,7 +2435,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_9639ace961aea6bdd487_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_binding.cu": "58f1fc7098c38c165fbb404ad68149f6b8d1f2c7097d5cfcc4abaacc99789544",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_9639ace961aea6bdd487_kernel.cu": "06ccec258919886b4d98f2355bf1db5d3ee5b906e13bb285c46a1b324c598394"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_9639ace961aea6bdd487_kernel.cu": "242483559d4f5a269984d8331054fd1f28429338f173f59c247d110ae323ab70"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_9639ace961aea6bdd487_kernel.cu",
@@ -2459,7 +2459,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_9639ace961aea6bdd487_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_binding.cu": "58f1fc7098c38c165fbb404ad68149f6b8d1f2c7097d5cfcc4abaacc99789544",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_9639ace961aea6bdd487_kernel.cu": "06ccec258919886b4d98f2355bf1db5d3ee5b906e13bb285c46a1b324c598394"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_9639ace961aea6bdd487_kernel.cu": "242483559d4f5a269984d8331054fd1f28429338f173f59c247d110ae323ab70"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_9639ace961aea6bdd487_kernel.cu",
@@ -2609,7 +2609,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_a1a25a69ef45e149b658_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_a1a25a69ef45e149b658_kernel.cu": "731df195cf3abbbd20ed502089157442e84bca64f0117abb8f366ab51e6aee7b"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_a1a25a69ef45e149b658_kernel.cu": "2f6af92740c573a9bcf230f86469bb37de2dd24cc34a003f6d111f45185101c1"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_a1a25a69ef45e149b658_kernel.cu",
@@ -2634,7 +2634,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_a1a25a69ef45e149b658_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_00350c16eb72ce2626a8_binding.cu": "a3aea039c7be2f332b0764ae2ec9bae66daaa113d632e60e643444b0c84837b0",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_a1a25a69ef45e149b658_kernel.cu": "731df195cf3abbbd20ed502089157442e84bca64f0117abb8f366ab51e6aee7b"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_a1a25a69ef45e149b658_kernel.cu": "2f6af92740c573a9bcf230f86469bb37de2dd24cc34a003f6d111f45185101c1"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_a1a25a69ef45e149b658_kernel.cu",
@@ -3082,7 +3082,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_c8d634c0e61dd18232f0_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_binding.cu": "128d66e49bc00cbf4abdc4ad3ee4619339e2b0fcdf2985d5455b1e311337932c",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_c8d634c0e61dd18232f0_kernel.cu": "a2b168cb151c3c32ce3158dd54c0b13abff8b9cff8f90063ac35b604e674851a"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_c8d634c0e61dd18232f0_kernel.cu": "b840d6ce26fa8622f4ae4d146eb4852af8201e35b2aa5ff2d9eb741a32ad091a"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_c8d634c0e61dd18232f0_kernel.cu",
@@ -3105,7 +3105,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_c8d634c0e61dd18232f0_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_3a549f6ec96c39788d46_binding.cu": "128d66e49bc00cbf4abdc4ad3ee4619339e2b0fcdf2985d5455b1e311337932c",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_c8d634c0e61dd18232f0_kernel.cu": "a2b168cb151c3c32ce3158dd54c0b13abff8b9cff8f90063ac35b604e674851a"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_c8d634c0e61dd18232f0_kernel.cu": "b840d6ce26fa8622f4ae4d146eb4852af8201e35b2aa5ff2d9eb741a32ad091a"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_c8d634c0e61dd18232f0_kernel.cu",
@@ -3459,7 +3459,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_dadabb88b3d7ac7703b3_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_41c914ec338580579206_binding.cu": "58f1fc7098c38c165fbb404ad68149f6b8d1f2c7097d5cfcc4abaacc99789544",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_dadabb88b3d7ac7703b3_kernel.cu": "f6436a6fc39dcb05ecb69c808e15d53fad3a112c11748b2711c3d4b91c4d0af4"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_dadabb88b3d7ac7703b3_kernel.cu": "601ce437c3ddf21329c13f97694d18e82d6ec78929f21d5d0b37f375e07006f0"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_dadabb88b3d7ac7703b3_kernel.cu",

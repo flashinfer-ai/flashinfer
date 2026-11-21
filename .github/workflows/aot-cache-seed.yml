@@ -48,8 +48,8 @@ on:
       - 'flashinfer-jit-cache/**'
       - 'ci/docker-tags.yml'
       - 'ci/cuda-versions.json'
-      - 'scripts/jit_cache_build_common.sh'
-      - 'scripts/task_test_jit_cache_package_build_import.sh'
+      - 'scripts/infra/jit_cache_build_common.sh'
+      - 'scripts/infra/task_test_jit_cache_package_build_import.sh'
       - '.github/workflows/aot-cache-seed.yml'
   workflow_dispatch:
 
@@ -154,7 +154,7 @@ jobs:
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
             -e AOT_PROVIDER_CONCURRENCY "${AOT_PROVIDER_CONCURRENCY}" \
             -e AOT_SKIP_SPEC_LINT 1 \
-            --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
+            --no-gpu ./scripts/infra/task_test_jit_cache_package_build_import.sh
 
       - name: Display sccache stats
         if: always()

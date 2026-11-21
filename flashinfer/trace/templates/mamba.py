@@ -170,15 +170,39 @@ selective_state_update_trace = TraceTemplate(
 )
 
 
+def _ssd_canonical_flags(kwargs):
+    """``kwargs`` with bool ``initial_state_flags`` replaced by their uint8
+    view (zero-copy, the bytes the kernels read), so bool and uint8 flags
+    trace to one definition and reach its solution in one dtype. Any other
+    value is left for the API to check."""
+
+    flags = kwargs.get("initial_state_flags")
+    if isinstance(flags, torch.Tensor) and flags.dtype == torch.bool:
+        kwargs = dict(kwargs)
+        kwargs["initial_state_flags"] = flags.view(torch.uint8)
+    return kwargs
+
+
 class _SSDCombinedTraceTemplate(TraceTemplate):
     """SSDCombined schema with the public state-dtype precedence rule."""
+
+    # ssd_combined_fwd returns ``(out, final_states | None)``; Trace Apply
+    # binds a returned tuple to these outputs by name, independent of the
+    # positional destination order of ``outputs``.
+    return_outputs = ("out", "final_states")
+
+    def canonical_inputs(self, namespace):
+        """The Apply namespace in the form the traced definition records."""
+        return _ssd_canonical_flags(namespace)
 
     def build_fi_trace_fn(self, fi_api: str):
         build_definition = super().build_fi_trace_fn(fi_api)
 
         def fi_trace(save_dir=None, name=None, **kwargs):
-            kwargs = dict(kwargs)
+            kwargs = dict(_ssd_canonical_flags(kwargs))
             state_dtype_source = kwargs.get("initial_states")
+            if state_dtype_source is None:
+                state_dtype_source = kwargs.get("final_states")
             if state_dtype_source is None:
                 state_dtype_source = kwargs.get("checkpoint_states")
             kwargs["_ssd_state_dtype_source"] = state_dtype_source
@@ -194,17 +218,57 @@ _SSD_COMBINED_COMMON_AXES: dict[str, Var | Const] = {
     "headdim": Const(abbrev="d", description="Per-head feature dimension."),
     "ngroups": Const(abbrev="g", description="Number of B/C state groups."),
     "dstate": Const(abbrev="s", description="Recurrent state dimension."),
-    "nchunks": Var(description="Physical chunks per batch row."),
     "chunk_size": Const(value=128, abbrev=""),
     "num_checkpoints": Var(description="Rows in caller-owned checkpoint storage."),
 }
+
+# State dtype name token of the slot schemas.
+_SSD_STATE_DTYPE_KEYS = {
+    torch.bfloat16: "bf16",
+    torch.float16: "f16",
+    torch.float32: "f32",
+}
+
+# seq_idx dtype name token of the slot schemas. A runner accepts only the
+# seq_idx dtype it was built for; a call without seq_idx (the cu_seqlens form)
+# runs the int64 runner.
+_SSD_SEQ_IDX_DTYPE_KEYS = {torch.int32: "i32", torch.int64: "i64"}
+_SSD_SEQ_IDX_DTYPES = {"i32": "int32", "i64": "int64"}
 
 
 def _make_ssd_combined_trace(
     mode: str,
     d_layout: str,
     return_final_states: bool,
+    initial_slots: bool = False,
+    final_slots: bool = False,
+    state_dtype_key: str | None = None,
+    seq_idx_dtype_key: str | None = None,
 ) -> TraceTemplate:
+    """One SSDCombined schema.  ``initial_slots`` / ``final_slots`` (packed
+    varlen only): ``initial_states`` / ``final_states`` is a pool with its
+    own row axis, addressed per sequence through ``initial_state_slots`` /
+    ``final_state_slots`` (possibly strided vectors); the other side keeps
+    one dense row per sequence.  A call with either slot vector also takes
+    ``checkpoint_state_slots`` into a checkpoint pool, optional per-sequence
+    ``initial_state_flags`` and a ``null_slot_id``, and accepts either
+    packed-varlen form (``cu_seqlens`` or the ``seq_idx`` triple).
+    ``state_dtype_key`` (``bf16`` / ``f16`` / ``f32``, slot schemas only)
+    names the state dtype, so pools of different dtypes route to different
+    definitions; ``seq_idx_dtype_key`` (``i32`` / ``i64``, slot schemas only)
+    names the seq_idx dtype in the same way."""
+
+    state_slots = initial_slots or final_slots
+    if state_slots and mode != "varlen":
+        raise ValueError("SSDCombined state slots require the varlen trace mode")
+    if (state_dtype_key is not None) != state_slots:
+        raise ValueError("SSDCombined slot schemas, and only they, name a state dtype")
+    if (seq_idx_dtype_key is not None) != state_slots:
+        raise ValueError(
+            "SSDCombined slot schemas, and only they, name a seq_idx dtype"
+        )
+    if final_slots and not return_final_states:
+        raise ValueError("SSDCombined final state slots require final states")
     axes: dict[str, Var | Const] = dict(_SSD_COMBINED_COMMON_AXES)
     inputs: dict[str, Tensor | Scalar] = {
         "x": Tensor(["batch_size", "seqlen", "nheads", "headdim"]),
@@ -245,21 +309,83 @@ def _make_ssd_combined_trace(
             }
         )
         state_batch_axis = "num_sequences"
+        initial_rows_axis = "num_sequences"
+        if state_slots:
+            axes["cu_seqlens_size"] = Var(
+                description="Length of the optional cu_seqlens vector."
+            )
+        if initial_slots:
+            axes["initial_state_rows"] = Var(
+                description="Rows of the initial-state pool."
+            )
+            initial_rows_axis = "initial_state_rows"
+        if final_slots:
+            axes["final_state_rows"] = Var(description="Rows of the final-state pool.")
         inputs.update(
             {
+                # A slot vector requires its pool.
                 "initial_states": Tensor(
-                    ["num_sequences", "nheads", "headdim", "dstate"],
-                    optional=True,
+                    [initial_rows_axis, "nheads", "headdim", "dstate"],
+                    optional=not initial_slots,
                 ),
-                "seq_idx": Tensor(["batch_size", "seqlen"]),
-                "chunk_indices": Tensor(["num_logical_chunks"], dtype="int32"),
-                "chunk_offsets": Tensor(["num_logical_chunks"], dtype="int32"),
+                "seq_idx": (
+                    Tensor(
+                        ["batch_size", "seqlen"],
+                        dtype=_SSD_SEQ_IDX_DTYPES[seq_idx_dtype_key],
+                        optional=True,
+                    )
+                    if state_slots
+                    else Tensor(["batch_size", "seqlen"])
+                ),
+                "chunk_indices": Tensor(
+                    ["num_logical_chunks"], dtype="int32", optional=state_slots
+                ),
+                "chunk_offsets": Tensor(
+                    ["num_logical_chunks"], dtype="int32", optional=state_slots
+                ),
                 "seq_chunk_cumsum": Tensor(
                     ["seq_chunk_cumsum_size"], dtype="int32", optional=True
                 ),
                 "update_seq_chunk_cumsum": Scalar("bool", optional=True),
             }
         )
+        if state_slots:
+            inputs["cu_seqlens"] = Tensor(
+                ["cu_seqlens_size"], dtype="int32", optional=True
+            )
+            inputs["null_slot_id"] = Scalar(
+                "int32",
+                optional=True,
+                description="Slot value that addresses no pool row.",
+            )
+        if initial_slots:
+            inputs.update(
+                {
+                    "initial_state_slots": Tensor(
+                        ["num_sequences"],
+                        dtype="int32",
+                        optional=True,
+                        description="Initial-state pool row of each sequence.",
+                    ),
+                    "initial_state_flags": Tensor(
+                        ["num_sequences"],
+                        dtype="uint8",
+                        optional=True,
+                        description=(
+                            "uint8 view of the caller's bool / uint8 "
+                            "per-sequence flags: 0 starts the sequence from "
+                            "zero state."
+                        ),
+                    ),
+                }
+            )
+        if final_slots:
+            inputs["final_state_slots"] = Tensor(
+                ["num_sequences"],
+                dtype="int32",
+                optional=True,
+                description="Final-state pool row of each sequence.",
+            )
     elif mode == "batched":
         state_batch_axis = "batch_size"
         inputs["initial_states"] = Tensor(
@@ -269,42 +395,69 @@ def _make_ssd_combined_trace(
     else:
         raise ValueError(f"unsupported SSDCombined trace mode: {mode}")
 
+    final_rows_axis = "final_state_rows" if final_slots else state_batch_axis
     inputs.update(
         {
             "checkpoint_token_indices": Tensor(
                 [state_batch_axis], dtype="int32", optional=True
             ),
             "checkpoint_state_slots": Tensor(
-                [state_batch_axis], dtype="int32", optional=True
+                [state_batch_axis],
+                dtype="int32",
+                optional=True,
+                description=(
+                    "Checkpoint-state pool row of each sequence (may be "
+                    "strided); skipped when < 0, >= the pool's rows or "
+                    "equal to null_slot_id."
+                    if state_slots
+                    else ""
+                ),
             ),
             "checkpoint_states": Tensor(
                 ["num_checkpoints", "nheads", "headdim", "dstate"],
                 optional=True,
+                description=(
+                    "Checkpoint state pool rows addressed through "
+                    "checkpoint_state_slots."
+                    if state_slots
+                    else ""
+                ),
+            ),
+            "final_states": Tensor(
+                [final_rows_axis, "nheads", "headdim", "dstate"],
+                optional=not final_slots,
+                description=(
+                    "Caller-owned final-state pool."
+                    if final_slots
+                    else "Optional caller-owned final-state storage."
+                ),
             ),
             "out": Tensor(
-                [
-                    "batch_size",
-                    "nheads",
-                    "headdim",
-                    "nchunks",
-                    "chunk_size",
-                ],
+                ["batch_size", "seqlen", "nheads", "headdim"],
                 dtype="bfloat16",
                 optional=True,
-                description="Optional caller-owned physical output storage.",
+                description=(
+                    "Optional caller-owned contiguous token-major output "
+                    "storage; returned as out."
+                ),
             ),
             "return_final_states": Scalar("bool", optional=True),
+            "state_dtype": Scalar("dtype", optional=True),
         }
     )
 
+    # Positional destination order (main's dense order, shared by the slot
+    # schemas): out, checkpoint_states, seq_chunk_cumsum, final_states. A
+    # value-returning solution's ``(out, final_states)`` binds by name through
+    # ``_SSDCombinedTraceTemplate.return_outputs``.
     outputs: dict[str, Tensor | Scalar] = {
         "out": Tensor(
             ["batch_size", "seqlen", "nheads", "headdim"],
             dtype_from="x",
             description=(
-                "Token-major return view. The optional out parameter has a "
-                "distinct physical layout, so this remains a value-returning "
-                "trace output rather than a destination binding."
+                "Token-major output [batch, seqlen, nheads, headdim]; the "
+                "optional out parameter, when given, has this same layout and "
+                "is returned."
             ),
         ),
         "checkpoint_states": Tensor(
@@ -324,51 +477,127 @@ def _make_ssd_combined_trace(
             optional=True,
             description="Caller-owned prefix-sum buffer when update is requested.",
         )
-    if return_final_states:
+    if final_slots:
         outputs["final_states"] = Tensor(
-            [state_batch_axis, "nheads", "headdim", "dstate"],
+            [final_rows_axis, "nheads", "headdim", "dstate"],
+            param="final_states",
             dtype="bfloat16",
             dtype_from="_ssd_state_dtype_source",
+            dtype_from_scalar="state_dtype",
+            description="Final states, stored into the caller's pool rows.",
+        )
+    elif return_final_states:
+        # Bound to the caller's dense final_states when given (an unbound
+        # output would be derived to the out parameter).
+        outputs["final_states"] = Tensor(
+            [state_batch_axis, "nheads", "headdim", "dstate"],
+            param="final_states",
+            dtype="bfloat16",
+            dtype_from="_ssd_state_dtype_source",
+            dtype_from_scalar="state_dtype",
         )
 
+    constraints = [
+        "nheads % ngroups == 0",
+        "chunk_size == 128",
+        "headdim == 64",
+        "dstate == 128",
+    ]
+    if not state_slots:
+        # A state-slot call runs on the Cake backend only, which takes any
+        # positive sequence length (a partial trailing chunk included).
+        constraints.insert(0, "seqlen % chunk_size == 0")
     final_suffix = "final" if return_final_states else "no_final"
+    # Both state sides pools, or only the initial / only the final side.
+    mode_name, slot_text = mode, "."
+    if initial_slots and final_slots:
+        mode_name += "_slots"
+        slot_text = ", states read and written through state-pool slots"
+    elif initial_slots:
+        mode_name += "_islots"
+        slot_text = ", initial states read through state-pool slots"
+    elif final_slots:
+        mode_name += "_fslots"
+        slot_text = ", final states written through state-pool slots"
+    if state_dtype_key is not None:
+        # The dense schema names stay without a state or seq_idx dtype.
+        mode_name += f"_{state_dtype_key}_sidx_{seq_idx_dtype_key}"
+        slot_text += (
+            f", {state_dtype_key} states, "
+            f"{_SSD_SEQ_IDX_DTYPES[seq_idx_dtype_key]} seq_idx."
+        )
     return _SSDCombinedTraceTemplate(
         op_type="mamba_ssd_combined",
-        name_prefix=f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}",
+        name_prefix=f"ssd_combined_{mode_name}_d_{d_layout}_{final_suffix}",
         description=(
             f"Mamba2 SSDCombined {mode} forward pass with {d_layout} D layout "
-            f"and return_final_states={return_final_states}."
+            f"and return_final_states={return_final_states}{slot_text}"
         ),
         axes=axes,
         inputs=inputs,
         outputs=outputs,
-        constraints=[
-            "seqlen % chunk_size == 0",
-            "nheads % ngroups == 0",
-            "chunk_size == 128",
-            "headdim == 64",
-            "dstate == 128",
-        ],
+        constraints=constraints,
         tags=["status:verified", "mamba", "backend:cake", f"mode:{mode}"],
     )
 
 
 _SSD_COMBINED_TRACE_BY_CONFIG = {
-    (mode, d_layout, return_final_states): _make_ssd_combined_trace(
+    (
         mode,
         d_layout,
         return_final_states,
+        initial_slots,
+        final_slots,
+        state_dtype_key,
+        seq_idx_dtype_key,
+    ): _make_ssd_combined_trace(
+        mode,
+        d_layout,
+        return_final_states,
+        initial_slots,
+        final_slots,
+        state_dtype_key,
+        seq_idx_dtype_key,
     )
-    for mode in ("batched", "varlen")
+    for mode, initial_slots, final_slots in (
+        ("batched", False, False),
+        ("varlen", False, False),
+        ("varlen", True, True),
+        ("varlen", True, False),
+        ("varlen", False, True),
+    )
     for d_layout in ("none", "vector", "matrix")
     for return_final_states in (False, True)
+    # The final-state pool is written only with return_final_states=True.
+    if return_final_states or not final_slots
+    # One slot schema per state dtype and seq_idx dtype; the dense schemas
+    # name neither.
+    for state_dtype_key in (
+        _SSD_STATE_DTYPE_KEYS.values() if initial_slots or final_slots else (None,)
+    )
+    for seq_idx_dtype_key in (
+        _SSD_SEQ_IDX_DTYPE_KEYS.values() if initial_slots or final_slots else (None,)
+    )
 }
 
 
 def ssd_combined_trace_dispatch(**kwargs):
-    """Select the exact SSDCombined schema for mode, D rank, and tuple output."""
+    """Select the exact SSDCombined schema for mode, D rank, tuple output,
+    which state side is a slot-indexed pool (a call with a slot vector is
+    packed varlen) and, for a slot call, the state and seq_idx dtypes."""
 
-    mode = "varlen" if kwargs.get("seq_idx") is not None else "batched"
+    initial_slots = kwargs.get("initial_state_slots") is not None
+    final_slots = kwargs.get("final_state_slots") is not None
+    slots = initial_slots or final_slots
+    # The API rejects a slot vector without its pool before any write, so
+    # such a call must reach it rather than match a slot definition.
+    for slots_name, pool_name in (
+        ("initial_state_slots", "initial_states"),
+        ("final_state_slots", "final_states"),
+    ):
+        if kwargs.get(slots_name) is not None and kwargs.get(pool_name) is None:
+            raise ValueError(f"SSDCombined trace: {slots_name} requires {pool_name}")
+    mode = "varlen" if slots or kwargs.get("seq_idx") is not None else "batched"
     D = kwargs.get("D")
     if D is None:
         d_layout = "none"
@@ -378,8 +607,59 @@ def ssd_combined_trace_dispatch(**kwargs):
         d_layout = "matrix"
     else:
         raise ValueError("SSDCombined trace requires D to be rank 1 or rank 2")
+    return_final_states = bool(kwargs.get("return_final_states", True))
+    if final_slots and not return_final_states:
+        raise ValueError(
+            "SSDCombined trace: final_state_slots requires return_final_states=True"
+        )
+    state_dtype_key = seq_idx_dtype_key = None
+    if slots:
+        # The state dtype rule of ssd_combined_fwd: state_dtype, else the
+        # first state tensor given, else bfloat16; every state tensor given
+        # must have that dtype.
+        state_tensors = {
+            name: kwargs.get(name)
+            for name in ("initial_states", "final_states", "checkpoint_states")
+        }
+        state_dtype = kwargs.get("state_dtype")
+        if state_dtype is None:
+            state_dtype = next(
+                (
+                    states.dtype
+                    for states in state_tensors.values()
+                    if states is not None
+                ),
+                torch.bfloat16,
+            )
+        state_dtype_key = _SSD_STATE_DTYPE_KEYS.get(state_dtype)
+        if state_dtype_key is None:
+            raise ValueError(
+                f"SSDCombined trace: unsupported state dtype {state_dtype}"
+            )
+        for name, states in state_tensors.items():
+            if states is not None and states.dtype != state_dtype:
+                raise ValueError(
+                    f"SSDCombined trace: {name} dtype {states.dtype} doesn't "
+                    f"match state_dtype {state_dtype}"
+                )
+        # The runner's seq_idx dtype: seq_idx's own, else int64.
+        seq_idx = kwargs.get("seq_idx")
+        seq_idx_dtype = torch.int64 if seq_idx is None else seq_idx.dtype
+        seq_idx_dtype_key = _SSD_SEQ_IDX_DTYPE_KEYS.get(seq_idx_dtype)
+        if seq_idx_dtype_key is None:
+            raise ValueError(
+                f"SSDCombined trace: unsupported seq_idx dtype {seq_idx_dtype}"
+            )
     return _SSD_COMBINED_TRACE_BY_CONFIG[
-        (mode, d_layout, bool(kwargs.get("return_final_states", True)))
+        (
+            mode,
+            d_layout,
+            return_final_states,
+            initial_slots,
+            final_slots,
+            state_dtype_key,
+            seq_idx_dtype_key,
+        )
     ]
 
 

@@ -28,6 +28,12 @@ def _require():
 
 def _configs(kind):
     from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.validation.common import (
+        is_bf16_mxfp8_cutedsl_supported,
+    )
+
+    if kind == "w8a16" and not is_bf16_mxfp8_cutedsl_supported():
+        pytest.skip("W8A16 MegaMoE requires CUDA 13+")
 
     if kind == "bf16":
         first = moe_ep.Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
@@ -130,7 +136,7 @@ def _run(kind, rank, world, monkeypatch, directory, *, force_inner=False):
     if force_inner:
         from flashinfer.autotuner import AutoTuner
         from flashinfer.moe_ep.core.selection import NAMESPACE
-        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             tuning_protocol,
         )
 

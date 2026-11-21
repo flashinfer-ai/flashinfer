@@ -201,7 +201,7 @@ class Sm90PushFp8MegaKernelBackend(MegaKernelBackend):
         self._transformed_weights = transformed_weights
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> _Sm90PushFp8Workspace:
-        from ......kernel_src.sm90.push_style_megamoe import (
+        from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
             Sm90PushCombine,
             Sm90PushConfig,
             Sm90PushMoERunner,
