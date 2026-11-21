@@ -1913,6 +1913,7 @@ def test_gvr2_posinf_reg_clus(batch, n_valid, mode):
 # forces each row's newest key (column n - 1) to +inf; these cases also put +inf
 # and -inf at the row head, in the scalar tail lane (n % 4 != 0), at K and more
 # than K random columns, and leave fewer than K finite scores. Hint-free and
+# hinted (the hinted register arms bracket on the hinted columns' scores),
 # unpaged; the ids name the launch each shape gets on a 148-SM B200.
 _INF_SHAPES = [
     # rows, logits width (launch envelope), live length, top_k, family
@@ -1927,6 +1928,9 @@ _INF_SHAPES = [
     # bracket = the first K values (register fold, identity gather)
     pytest.param(1, 4096, 4093, 512, "reg", id="reg_fold_vpt1"),
     pytest.param(1, 12288, 12001, 2048, "reg", id="reg_gather_vpt4"),
+    # K = 2048 rows of 4k - 3 columns: with fewer than K finite scores, upstream
+    # returned repeated indices here, hinted and hint-free
+    pytest.param(8, 8192, 8189, 2048, "reg", id="reg_k2048_4k_m3"),
     pytest.param(256, 4096, 4093, 512, "reg", id="reg_gather_nonbrl"),
     pytest.param(2, 32832, 32773, 2048, "reg_clus", id="reg_clus_cs8"),
     pytest.param(16, 32832, 32773, 2048, "reg_clus", id="reg_clus_cs4"),
@@ -2007,16 +2011,21 @@ def _inf_columns(pattern, n, top_k, gen):
 
 
 @requires_gvr2
+@pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
 @pytest.mark.parametrize("pattern", _INF_PATTERNS)
 @pytest.mark.parametrize("rows,width,n_valid,top_k,family", _INF_SHAPES)
-def test_gvr2_inf_scores_every_family(rows, width, n_valid, top_k, family, pattern):
+def test_gvr2_inf_scores_every_family(
+    rows, width, n_valid, top_k, family, pattern, hinted
+):
     """Rows holding +inf and -inf among finite scores are exact on every family:
     every output slot written, distinct in-row indices, and the selected values
     equal torch.topk's as a multiset (ties at the K-th value may pick other
     columns). The live length stays below the envelope and the columns past it
     are poisoned, so an out-of-row read fails the value check. A tuple of live
-    lengths gives ragged rows (rows of n <= top_k: identity + -1 tail). The
-    family is checked after the values, so a wrong value fails as such."""
+    lengths gives ragged rows (rows of n <= top_k: identity + -1 tail). Hinted
+    launches pass top_k distinct in-row columns per row (random, so they hold
+    +inf, -inf and finite scores as the pattern does). The family is checked
+    after the values, so a wrong value fails as such."""
     seed = rows * 7 + width + top_k + _INF_PATTERNS.index(pattern)
     gen = torch.Generator(device=_DEV).manual_seed(seed)
     ragged = isinstance(n_valid, tuple)
@@ -2028,9 +2037,18 @@ def test_gvr2_inf_scores_every_family(rows, width, n_valid, top_k, family, patte
         logits[r, pos] = float("inf")
         logits[r, neg] = float("-inf")
     seq_lens = torch.tensor(n_r, dtype=torch.int32, device=_DEV)
+    pre_idx = None
+    if hinted:  # its own generator: the scores match the hint-free case's
+        hgen = torch.Generator(device=_DEV).manual_seed(seed + 1)
+        pre_idx = torch.stack(
+            [
+                torch.randperm(max(n, top_k), generator=hgen, device=_DEV)[:top_k] % n
+                for n in n_r
+            ]
+        ).to(torch.int32)
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
-    _forget_launcher(rows, width, top_k, 1, 1, hint_free=True)
-    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    _forget_launcher(rows, width, top_k, 1, 1, hint_free=not hinted)
+    _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
     if ragged:
         torch.cuda.synchronize()
         assert int((out == -7).sum()) == 0, "unwritten output slots"
@@ -2038,7 +2056,7 @@ def test_gvr2_inf_scores_every_family(rows, width, n_valid, top_k, family, patte
     else:
         ref_vals = torch.topk(logits[:, :n_valid], top_k, dim=1).values
         _check_complete_exact(out, logits, n_valid, ref_vals, -7)
-    _assert_family(rows, width, top_k, 1, 1, _b200_family(family), hint_free=True)
+    _assert_family(rows, width, top_k, 1, 1, _b200_family(family), hint_free=not hinted)
 
 
 @requires_gvr2
