@@ -2885,7 +2885,9 @@ _CAKE_MLA_FP8_MAX_ROWS = 128
 # edge).
 #
 # Devices, dtypes, page sizes, q_len values, max_seq_len buckets and batches
-# that are not listed never offer Cake. Requests with sinks are not offered.
+# that are not listed never offer Cake. Requests with sinks are offered only
+# for the units listed under a key with has_sinks True, measured with sinks
+# (BF16 only: FP8 with sinks takes the generic tail program).
 _CAKE_MLA_AUTO_OFFERS: Dict[
     Tuple[str, int, str, int, int, bool], Tuple[Tuple[str, int, int, int], ...]
 ] = {
@@ -2992,8 +2994,6 @@ def _cake_mla_auto_offer_ranges(
 ) -> Tuple[Tuple[str, int, int], ...]:
     """The ``(domain, first batch, last batch)`` ranges ``_CAKE_MLA_AUTO_OFFERS``
     lists for this device, request configuration and max_seq_len bucket."""
-    if has_sinks:
-        return ()
     entries = _CAKE_MLA_AUTO_OFFERS.get(
         (arch, num_sms, _cake_mla_dtype_name(dtype), page_size, q_len, has_sinks),
         (),
@@ -3076,10 +3076,10 @@ def _cake_mla_table_memo() -> Dict[Any, Any]:
 
 
 # The results of ``_cake_mla_auto_batch_ranges`` per request configuration
-# ``(device index, dtype, page size, q_len, max_seq_len bucket)``: ``(offer
-# table, device facts function, {configuration: ranges})``, replaced as one tuple
-# when the table or the Cake module's ``_device_facts`` is another object
-# (tests patch both). A configuration seen before then pays one dict lookup
+# ``(device index, dtype, page size, q_len, has sinks, max_seq_len bucket)``:
+# ``(offer table, device facts function, {configuration: ranges})``, replaced
+# as one tuple when the table or the Cake module's ``_device_facts`` is another
+# object (tests patch both). A configuration seen before then pays one dict lookup
 # and two identity checks instead of the device facts and the table memo, also
 # when configurations alternate. Bounded like ``_CAKE_MLA_TABLE_MEMO``.
 _CAKE_MLA_RANGES_MEMO: List[Any] = [None]
@@ -3099,11 +3099,10 @@ def _cake_mla_auto_batch_ranges(
     SM100a/SM103a. A configuration's result is reused while the offer table
     and the Cake module's ``_device_facts`` are the same objects (the ranges
     read nothing else, and only the bucket of ``max_seq_len``, so every
-    ``max_seq_len`` of a bucket shares one entry)."""
-    if has_sinks:
-        return ()
+    ``max_seq_len`` of a bucket shares one entry). Requests with and without
+    sinks are separate configurations."""
     seq_bucket = _round_to_seq_len_bucket(max_seq_len)
-    configuration = (device_index, dtype, page_size, q_len, seq_bucket)
+    configuration = (device_index, dtype, page_size, q_len, has_sinks, seq_bucket)
     device_facts = _cake_mla_module()._device_facts
     table = _CAKE_MLA_AUTO_OFFERS
     memo = _CAKE_MLA_RANGES_MEMO[0]
@@ -3114,7 +3113,7 @@ def _cake_mla_auto_batch_ranges(
     else:
         memo = None
     ranges = _cake_mla_lookup_batch_ranges(
-        device_facts, device_index, dtype, page_size, q_len, seq_bucket
+        device_facts, device_index, dtype, page_size, q_len, seq_bucket, has_sinks
     )
     if _CAKE_MLA_AUTO_OFFERS is table:  # else replaced during the lookup
         if memo is None:
@@ -3133,9 +3132,10 @@ def _cake_mla_lookup_batch_ranges(
     page_size: int,
     q_len: int,
     seq_bucket: int,
+    has_sinks: bool = False,
 ) -> Tuple[Tuple[int, int], ...]:
-    """``_cake_mla_auto_batch_ranges`` without sinks for the ``max_seq_len``
-    bucket ``seq_bucket``, from the table memo."""
+    """``_cake_mla_auto_batch_ranges`` for the ``max_seq_len`` bucket
+    ``seq_bucket``, from the table memo."""
     if (device_facts, device_index) in _CAKE_MLA_NO_PROGRAM_DEVICES:
         return ()
     try:
@@ -3144,13 +3144,13 @@ def _cake_mla_lookup_batch_ranges(
         _CAKE_MLA_NO_PROGRAM_DEVICES.add((device_facts, device_index))
         return ()
     memo = _cake_mla_table_memo()
-    key = ("ranges", arch, num_sms, dtype, page_size, q_len, seq_bucket)
+    key = ("ranges", arch, num_sms, dtype, page_size, q_len, has_sinks, seq_bucket)
     ranges = memo.get(key)
     if ranges is None:
         ranges = tuple(
             (first, last)
             for _, first, last in _cake_mla_auto_offer_ranges(
-                arch, num_sms, dtype, page_size, q_len, False, seq_bucket
+                arch, num_sms, dtype, page_size, q_len, has_sinks, seq_bucket
             )
         )
         memo[key] = ranges
@@ -3428,18 +3428,8 @@ def _cake_mla_auto_candidate_reason(
     )
     if reason is not None:
         return reason
-    if sinks is not None:
-        sink = (
-            sinks[0] if isinstance(sinks, (list, tuple)) and len(sinks) == 1 else sinks
-        )
-        if not (
-            isinstance(sink, torch.Tensor)
-            and sink.device == query.device
-            and sink.dtype == torch.float32
-            and sink.is_contiguous()
-            and tuple(sink.shape) == (query.size(-2),)
-        ):
-            return _CAKE_MLA_SINK_REASON
+    if sinks is not None and not _cake_mla_sink_ok(sinks, query):
+        return _CAKE_MLA_SINK_REASON
     if not (
         query.is_contiguous()
         and kv_cache.is_contiguous()
@@ -3458,6 +3448,19 @@ _CAKE_MLA_SINK_REASON = "requires one contiguous FP32 sink value per head"
 _CAKE_MLA_CONTIGUITY_REASON = (
     "requires contiguous query, kv_cache, block_tables, seq_lens and out"
 )
+
+
+def _cake_mla_sink_ok(sinks: Any, query: torch.Tensor) -> bool:
+    """Whether ``sinks`` (not ``None``) is one contiguous FP32 tensor of one
+    value per head on the query's device, alone or in a list or tuple of one."""
+    sink = sinks[0] if isinstance(sinks, (list, tuple)) and len(sinks) == 1 else sinks
+    return (
+        isinstance(sink, torch.Tensor)
+        and sink.device == query.device
+        and sink.dtype == torch.float32
+        and sink.is_contiguous()
+        and tuple(sink.shape) == (query.size(-2),)
+    )
 
 
 def _cake_mla_auto_scalar_reason(
@@ -3832,11 +3835,10 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
         inputs: the launch ``trtllm_mla_blackwell_decode(..., stateless=True)``
         makes, resolved once (``DeviceRowLaunch``), or ``None`` when the route
         takes a program whose rows the host plans, or the device has no FP8
-        decode table yet. Only for a request without sinks."""
+        decode table yet. With sinks the launch applies a sink; the plan holds
+        no sink tensor (``forward`` passes the call's)."""
         cake = _cake_mla_module()
         query, block_tables = inputs[0], inputs[1]
-        if self.sinks is not None:
-            return None
         device = query.device
         lut = cake._FP8_LUTS.get(device)
         if lut is None:
@@ -3854,7 +3856,7 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
             arch=arch,
             num_sms=num_sms,
             num_heads=num_heads,
-            has_sink=False,
+            has_sink=self.sinks is not None,
             softmax_scale_log2=self._bmm1_scale * log2e,
             bmm2=self._bmm2_scale,
             total_q=total_q,
@@ -4007,8 +4009,10 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
             # The launch the second stage resolved for exactly these inputs
             # (their sizes and contiguity were checked for this call): the
             # kernels and arguments of the dispatcher's stateless mode, without
-            # re-deriving them.
+            # re-deriving them. The sink is the call's: in-place updates of its
+            # values reach a captured graph.
             launch, _, placeholder, device = plan
+            sink = _normalize_optional_mla_sink(self.sinks, "backend='auto'")
             _cake_mla_module().launch_device_rows(
                 launch,
                 query=query,
@@ -4016,7 +4020,7 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
                 out=out,
                 seq_lens=seq_lens,
                 block_tables=block_tables,
-                sink_arg=placeholder,
+                sink_arg=placeholder if sink is None else sink,
                 device=device,
                 stream=torch._C._cuda_getCurrentRawStream(device.index),
                 stateless=True,
@@ -4760,14 +4764,16 @@ def _mla_cake_auto_memo_get(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     out: torch.Tensor,
+    sinks: Any = None,
 ) -> Optional[tuple]:
     """The memoized decision of this call, ``(first-stage runner index,
     first-stage tactic, cake)``, or ``None`` when the call selects: no entry,
     another tuner, offer table, split-KV device ranges or ``state`` (the call's
     ``_mla_cake_memo_state``, not ``None``), or a Cake decision whose families
-    are not ready. A Cake decision for tensors that are not all contiguous
-    runs the first stage's selection (``cake`` ``None``). Raises ``TypeError``
-    for an unhashable key."""
+    are not ready. A Cake decision for tensors that are not all contiguous, or
+    for sinks that are not one contiguous FP32 value per head on the query's
+    device, runs the first stage's selection (``cake`` ``None``), as the
+    eligibility check makes it. Raises ``TypeError`` for an unhashable key."""
     entry = _CAKE_MLA_AUTO_MEMO.get(memo_key)
     if (
         entry is None
@@ -4787,6 +4793,7 @@ def _mla_cake_auto_memo_get(
         and block_tables.is_contiguous()
         and seq_lens.is_contiguous()
         and out.is_contiguous()
+        and (sinks is None or _cake_mla_sink_ok(sinks, query))
     ):
         return decision[0], decision[1], None
     if not _cake_mla_families_ready(cake[1], query.device, cake[3]):
@@ -5691,7 +5698,8 @@ def _mla_with_kv_cache_impl(
     (``_CAKE_MLA_AUTO_OFFERS``: device, dtype, page size, ``q_len``,
     ``max_seq_len`` bucket and batch range) lists, where Cake measured faster
     than the other candidates; elsewhere, and on devices the table does not
-    list, Cake is never offered. Requests with sinks are not offered. Outside
+    list, Cake is never offered. A request with sinks is offered only for the
+    units the table lists with sinks (BF16 only). Outside
     tuning the second stage runs only while the tuner holds a Cake result, and
     tuning under ``flashinfer.autotuner.set_autotune_process_group`` skips it.
     Cake is eligible only for dense requests its aligned programs serve with
@@ -6077,9 +6085,11 @@ def _mla_with_kv_cache_impl(
                             # Every argument the first stage's tuning config,
                             # the two stages' lookups and the Cake checks
                             # read, except the contiguity of the tensors and
-                            # the sinks (none: ``offered`` is empty with
-                            # sinks), and except the arguments the scalar
-                            # check above fixed; see the audit at
+                            # the sink tensor (whether there is one is
+                            # keyed: it selects the offer table's key, the
+                            # domain and the launch plan; the tensor is
+                            # checked on reuse), and except the arguments the
+                            # scalar check above fixed; see the audit at
                             # ``_CAKE_MLA_AUTO_MEMO``. Of ``max_seq_len`` only
                             # what the decision reads, so a caller varying it
                             # selects once per bucket, KV tile count and side
@@ -6116,6 +6126,7 @@ def _mla_with_kv_cache_impl(
                                 return_lse_base,
                                 cp_world,
                                 cp_rank,
+                                sinks is not None,
                             )
                             cake_decision = _mla_cake_auto_memo_get(
                                 tuner,
@@ -6126,6 +6137,7 @@ def _mla_with_kv_cache_impl(
                                 block_tables,
                                 seq_lens,
                                 out,
+                                sinks,
                             )
                         except TypeError:  # an unhashable argument
                             cake_memo_key = None
