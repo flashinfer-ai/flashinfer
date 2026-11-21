@@ -20,7 +20,6 @@ from flashinfer.fused_moe import (
     trtllm_fp8_block_scale_moe,
     trtllm_fp8_per_tensor_scale_moe,
     cutlass_fused_moe,
-    fused_topk_deepseek,
 )
 from flashinfer.tllm_enums import RoutingMethodType, is_gated_activation
 from flashinfer import fp4_quantize, mxfp8_quantize
@@ -185,9 +184,16 @@ def parse_moe_args(line, parser):
             "llama4",
             "renormalize_naive",
             "topk",
+            "sigmoid_renorm",
+            "minimax2",
+            "sigmoid",
+            "topk_sigmoid",
         ],
         help=(
-            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive | topk."
+            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive | "
+            "topk | sigmoid_renorm | minimax2 | sigmoid | topk_sigmoid. "
+            "deepseek_v3 with --n_group 1 (or unset) is ungrouped sigmoid + bias "
+            "routing. Only used by the trtllm_*_moe routines."
         ),
     )
     parser.add_argument(
@@ -352,13 +358,17 @@ def parse_moe_args(line, parser):
 
     # Normalize routing method (map string to internal int expected by kernels)
     routing_method_name_to_type = {
-        "renormalize": 1,
-        "deepseek_v3": 2,
-        "llama4": 3,
-        "renormalize_naive": 4,
-        "topk": 5,
+        "renormalize": RoutingMethodType.Renormalize,
+        "deepseek_v3": RoutingMethodType.DeepSeekV3,
+        "llama4": RoutingMethodType.Llama4,
+        "renormalize_naive": RoutingMethodType.RenormalizeNaive,
+        "topk": RoutingMethodType.TopK,
+        "sigmoid_renorm": RoutingMethodType.SigmoidRenorm,
+        "minimax2": RoutingMethodType.MiniMax2,
+        "sigmoid": RoutingMethodType.Sigmoid,
+        "topk_sigmoid": RoutingMethodType.TopKSigmoid,
     }
-    args.routing_method_type = routing_method_name_to_type[args.routing_method]
+    args.routing_method_type = int(routing_method_name_to_type[args.routing_method])
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -441,6 +451,26 @@ def create_trtllm_moe_test_data(
     return routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights
 
 
+def _check_trtllm_routing_bias(
+    routing_method_type: int, n_group: Optional[int], use_routing_bias: bool
+) -> None:
+    """Reject configs whose trtllm routing kernel reads ``routing_bias`` unconditionally.
+
+    MiniMax2 and ungrouped DeepSeekV3 (``n_group <= 1``) run the custom routing
+    kernel with sigmoid + bias preprocessing, which dereferences the bias pointer.
+    """
+    ungrouped_deepseek = routing_method_type == RoutingMethodType.DeepSeekV3 and (
+        n_group is None or n_group <= 1
+    )
+    if (
+        routing_method_type == RoutingMethodType.MiniMax2 or ungrouped_deepseek
+    ) and not use_routing_bias:
+        raise ValueError(
+            "--use_routing_bias is required for --routing_method minimax2 and for "
+            "--routing_method deepseek_v3 with --n_group <= 1."
+        )
+
+
 def _compute_routing_for_method(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -448,11 +478,20 @@ def _compute_routing_for_method(
     routing_method_type: int,
     n_group: Optional[int] = None,
     topk_group: Optional[int] = None,
-    routed_scaling_factor: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    Compute selected experts based on routing method type.
-    Returns only the selected expert indices tensor.
+    Compute the experts selected by the trtllm routing kernel for ``routing_method_type``.
+
+    Only the selected expert indices are returned (used for bandwidth accounting),
+    so methods whose score transform is monotonic select on the raw logits:
+
+    - DeepSeekV3: sigmoid(logits) + bias. With ``n_group > 1``, each group is scored
+      by the sum of its top-2 biased scores, the best ``topk_group`` groups are kept
+      and the top-k experts are taken from them. With ``n_group <= 1`` (or unset),
+      it is a plain top-k over the biased scores.
+    - MiniMax2: top-k over sigmoid(logits) + bias.
+    - Default, Renormalize, RenormalizeNaive, TopK, SigmoidRenorm, Sigmoid,
+      TopKSigmoid, Llama4: top-k over the logits (softmax and sigmoid preserve order).
 
     Args:
         routing_logits: [num_tokens, num_experts] routing scores
@@ -461,46 +500,43 @@ def _compute_routing_for_method(
         routing_method_type: Type of routing method (see RoutingMethodType enum)
         n_group: Number of expert groups (for DeepSeekV3)
         topk_group: Number of top groups (for DeepSeekV3)
-        routed_scaling_factor: Scaling factor (for DeepSeekV3)
 
     Returns:
         selected_experts: [num_tokens, top_k] tensor of selected expert indices
     """
-    num_tokens = routing_logits.shape[0]
-    device = routing_logits.device
+    logits = routing_logits.float()
+    if routing_method_type not in (
+        RoutingMethodType.DeepSeekV3,
+        RoutingMethodType.MiniMax2,
+    ):
+        return torch.topk(logits, top_k, dim=-1).indices
 
-    if routing_method_type == RoutingMethodType.DeepSeekV3:
-        # Use fused_topk_deepseek for accurate DeepSeekV3 routing
-        if n_group is None or topk_group is None or routed_scaling_factor is None:
-            raise ValueError(
-                "DeepSeekV3 routing requires n_group, topk_group, and routed_scaling_factor"
-            )
-        if routing_bias is None:
-            routing_bias = torch.zeros(
-                routing_logits.shape[1], device=device, dtype=routing_logits.dtype
-            )
+    scores = torch.sigmoid(logits)
+    if routing_bias is not None:
+        scores = scores + routing_bias.float()
 
-        # Allocate output tensors
-        topk_values = torch.empty(num_tokens, top_k, device=device, dtype=torch.float32)
-        topk_indices = torch.empty(num_tokens, top_k, device=device, dtype=torch.int32)
+    if routing_method_type == RoutingMethodType.MiniMax2 or (
+        n_group is None or n_group <= 1
+    ):
+        return torch.topk(scores, top_k, dim=-1).indices
 
-        fused_topk_deepseek(
-            scores=routing_logits.float(),
-            bias=routing_bias.float(),
-            n_group=n_group,
-            topk_group=topk_group,
-            topk=top_k,
-            routed_scaling_factor=routed_scaling_factor,
-            topk_values=topk_values,
-            topk_indices=topk_indices,
+    if topk_group is None:
+        raise ValueError("Grouped DeepSeekV3 routing requires --topk_group")
+    num_tokens, num_experts = scores.shape
+    if num_experts % n_group != 0:
+        raise ValueError(
+            f"num_experts ({num_experts}) must be divisible by n_group ({n_group})"
         )
-        return topk_indices
-    else:
-        # For other routing methods, use simple top-k as approximation
-        # This is accurate for Default, Renormalize, RenormalizeNaive, TopK
-        # and approximate for Llama4
-        _, selected_experts = compute_routing(routing_logits.float(), top_k)
-        return selected_experts
+    experts_per_group = num_experts // n_group
+    grouped = scores.view(num_tokens, n_group, experts_per_group)
+    group_scores = torch.topk(grouped, min(2, experts_per_group), dim=-1).values.sum(
+        dim=-1
+    )
+    top_groups = torch.topk(group_scores, topk_group, dim=-1).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+    group_mask.scatter_(1, top_groups, True)
+    masked = grouped.masked_fill(~group_mask.unsqueeze(-1), float("-inf"))
+    return torch.topk(masked.view(num_tokens, num_experts), top_k, dim=-1).indices
 
 
 def testTrtllmFp4BlockScaleMoe(args):
@@ -577,6 +613,8 @@ def testTrtllmFp4BlockScaleMoe(args):
             f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
         )
 
+    _check_trtllm_routing_bias(routing_method_type, n_group, args.use_routing_bias)
+
     # Create test data
     routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = (
         create_trtllm_moe_test_data(
@@ -603,7 +641,6 @@ def testTrtllmFp4BlockScaleMoe(args):
         routing_method_type=routing_method_type,
         n_group=n_group,
         topk_group=topk_group,
-        routed_scaling_factor=routed_scaling_factor,
     )
 
     # Determine FP4 quantization mode
@@ -2746,6 +2783,8 @@ def testTrtllmFp8BlockScaleMoe(args):
             f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
         )
 
+    _check_trtllm_routing_bias(routing_method_type, n_group, args.use_routing_bias)
+
     # Create test data
     routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = (
         create_trtllm_moe_test_data(
@@ -2772,7 +2811,6 @@ def testTrtllmFp8BlockScaleMoe(args):
         routing_method_type=routing_method_type,
         n_group=n_group,
         topk_group=topk_group,
-        routed_scaling_factor=routed_scaling_factor,
     )
 
     # For FP8 block scale, create quantized weights and block scales
@@ -3021,6 +3059,8 @@ def testTrtllmFp8PerTensorScaleMoe(args):
             f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
         )
 
+    _check_trtllm_routing_bias(routing_method_type, n_group, args.use_routing_bias)
+
     # Create test data
     routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = (
         create_trtllm_moe_test_data(
@@ -3047,7 +3087,6 @@ def testTrtllmFp8PerTensorScaleMoe(args):
         routing_method_type=routing_method_type,
         n_group=n_group,
         topk_group=topk_group,
-        routed_scaling_factor=routed_scaling_factor,
     )
 
     # For FP8 per-tensor scale, create quantized weights and per-tensor scales
