@@ -491,6 +491,18 @@ def test_recorded_fingerprints(D):
     assert (spec.TILE_KEYS, spec.chunk_len(D)) == (128, 512)
 
 
+def test_recorded_noncausal_fingerprint_d512():
+    """The non-causal class at D = 512 has its own recorded digest, shared by the three wrappers."""
+    from flashinfer.attention.batch_invariant import spec
+
+    assert spec.spec_fingerprint(512, causal=False) == spec.FINGERPRINT_D512_NC
+    assert spec.FINGERPRINT_D512_NC not in spec.FINGERPRINTS.values()
+    for op in WRAPPERS:
+        assert (
+            bi.fingerprint(op, head_dim=512, causal=False) == spec.FINGERPRINT_D512_NC
+        )
+
+
 def test_planner_output_parts_d512():
     """D = 512: a Q tile over a chunk range is one work unit per 256-column half of the output (``plan.o_parts``); the parts share
     every descriptor field but ``F_OPART`` -- the workspace slot of a split chunk too: each writes its own columns of the same
@@ -1285,7 +1297,7 @@ def test_config_agreement(D):
 
 
 @needs_device
-@pytest.mark.parametrize("kind", ["prefill", "decode"])
+@pytest.mark.parametrize("kind", ["prefill", "decode", "noncausal"])
 def test_d512_output_halves(kind):
     """D = 512 runs a Q tile as two work units, one per 256-column half of the output and of V, both forming the tile's scores from
     all 512 dims of Q and K. An output element reads its own column of V alone: replacing the upper half of V leaves the lower
@@ -1296,11 +1308,14 @@ def test_d512_output_halves(kind):
     if kind == "prefill":
         pr = Problem([300, 1000, 64], [700, 2500, 3000], 32, 8, D, 16, seed=41)
         run = run_paged_prefill
+    elif kind == "noncausal":
+        pr = Problem([300, 1000, 64], [700, 2500, 3000], 32, 8, D, 16, seed=44)
+        run = lambda p: run_paged_prefill(p, causal=False)  # noqa: E731
     else:
         pr = Problem([1] * 5, [1024, 4096, 33, 700, 5000], 32, 8, D, 16, seed=42)
         run = lambda p: run_decode(p)[0]  # noqa: E731
     base = bits(run(pr)).clone()
-    ref = reference(pr)
+    ref = reference_noncausal(pr) if kind == "noncausal" else reference(pr)
     if kind == "decode":
         ref = ref[run_decode(pr)[1]]
     err = (run(pr).float() - ref).abs().max().item()
@@ -2223,14 +2238,15 @@ def run_decode_noncausal(pr: Problem, q_len: int, layout="NHD", ws=None):
 def test_noncausal_fingerprint_is_a_function_of_head_dim_and_mode(op):
     """The mask mode is a class dimension: the non-causal fingerprint differs from the causal one at every head dim and each is
     shared by the three wrappers."""
-    for D in (64, 128, 256):
+    for D in (64, 128, 256, 512):
         nc = bi.fingerprint(op, head_dim=D, causal=False)
         c = bi.fingerprint(op, head_dim=D, causal=True)
         assert nc != c and nc.startswith(f"attn-bf16-d{D}-nc-")
         assert c == bi.fingerprint(WRAPPERS[0], head_dim=D, causal=True)
         assert nc == bi.fingerprint(WRAPPERS[0], head_dim=D, causal=False)
     assert (
-        len({bi.fingerprint(op, head_dim=D, causal=False) for D in (64, 128, 256)}) == 3
+        len({bi.fingerprint(op, head_dim=D, causal=False) for D in (64, 128, 256, 512)})
+        == 4
     )
     # the pinned causal fingerprints are unchanged by the new class
     from flashinfer.attention.batch_invariant.spec import FINGERPRINTS
@@ -2273,7 +2289,7 @@ def test_decode_fingerprint_defaults_to_the_causal_class():
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 @pytest.mark.parametrize("Hq,Hkv", [(32, 8), (8, 8)])
 def test_noncausal_matches_reference(D, Hq, Hkv):
     """The non-causal class against fp32 non-causal attention (every token sees every key of its request), paged and ragged; a
@@ -2288,7 +2304,7 @@ def test_noncausal_matches_reference(D, Hq, Hkv):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 @pytest.mark.parametrize("page", [1, 16, 128])
 def test_noncausal_paged_equals_ragged(D, page):
     """R4: the paged and the ragged KV layouts hand the kernel the same keys: the same bits under the non-causal class."""
@@ -2306,7 +2322,7 @@ def test_noncausal_paged_equals_ragged(D, page):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_noncausal_query_chunks_equal_full(D):
     """Chunked prefill under the non-causal class: a request's query rows run in chunks, each chunk planned over the request's
     FULL key set, give the bits of the one-shot run row for row (a row's visible set is ``[0, kv_len)`` whatever the cut), paged and
@@ -2344,7 +2360,7 @@ def test_noncausal_query_chunks_equal_full(D):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 def test_noncausal_prefill_equals_multi_token_decode(D, layout):
     """R4: the decode wrapper with ``q_len_per_req = 4`` and ``is_causal=False`` gives, for the last four tokens of every request,
@@ -2367,7 +2383,7 @@ def test_noncausal_prefill_equals_multi_token_decode(D, layout):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_noncausal_batch_permutation_and_subbatch_invariance(D):
     """R2 under the non-causal class: a request's rows are the same bits in a batch of one, in a permuted batch and in a sub-batch;
     paged prefill, ragged prefill and multi-token decode."""
@@ -2417,10 +2433,10 @@ def test_noncausal_batch_permutation_and_subbatch_invariance(D):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_noncausal_config_agreement(D):
     """R3 under the non-causal class: every member of the configuration space gives the bits of the wrapper's pick (the whole space
-    at D = 128 / 256, every 7th point at D = 64), and so does the paired placement: at D = 64, and at D = 128 on 328 KB parts
+    at D = 128 / 256 / 512, every 7th point at D = 64), and so does the paired placement: at D = 64, and at D = 128 on 328 KB parts
     (pairing forced with an SM count of one; its rings, the split kind with both fold placements). Under this class the Q tiles
     of a request share one chunk and tile range, so every pair's two tiles walk the same keys."""
     from dataclasses import replace
@@ -2632,7 +2648,7 @@ def test_workspace_sizing_raises_what_plan_refuses():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_workspace_size_is_a_function_of_the_mask_mode(D):
     """The two classes plan different units for the same batch: under the causal class the tokens of the first chunk see one chunk
     (fused units, no partials), under the non-causal class every token sees every chunk of its request, so the split plan of the
@@ -2659,7 +2675,7 @@ def _exact_workspace(need, device):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_prefill_workspace_size_plans_both_classes_without_fallback(D):
     """``workspace_size`` with the mask mode of the plan, then a buffer of exactly that many bytes: the plan of either class keeps its
     split units (no fused fallback) and gives the bits of a large workspace; one byte row less falls back to fused units, the same
@@ -2704,7 +2720,7 @@ def test_prefill_workspace_size_plans_both_classes_without_fallback(D):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_decode_workspace_size_plans_both_classes_without_fallback(D):
     """The decode wrapper's ``workspace_size`` takes ``q_len_per_req`` and ``is_causal`` as ``plan()`` does: a buffer of exactly the
     reported size plans the split units of the causal (``is_causal=None`` / ``True``) and of the non-causal (``is_causal=False``)
@@ -2902,7 +2918,7 @@ def test_noncausal_multi_token_decode_on_the_swaps_body(D):
 
 
 @needs_device
-@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("D", [64, 128, 256, 512])
 def test_noncausal_more_queries_than_keys_split_under_both_merges(D):
     """Non-causal requests of several chunks with more query tokens than keys (and one short query block over more chunks), with
     every multi-chunk unit split and the chunk fold placed in the fixup kernel, in-kernel, or by the planner's rule, and with
