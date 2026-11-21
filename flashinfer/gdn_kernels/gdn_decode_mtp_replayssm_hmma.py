@@ -46,7 +46,6 @@ import cuda.bindings.driver as cuda
 _ACC = cutlass.Float32
 _M = 128
 _K = 128
-_MAX_T = 8
 _THREADS = 256
 _GRAM_WARP = 4
 
@@ -75,6 +74,15 @@ def _operand_column(k_idx):
     p = k_idx % 64
     j = p % 16
     return k_group * 64 + (j // 2) * 8 + p // 16 + 4 * (j % 2)
+
+
+def _operand_rows(T: int) -> int:
+    """Rows of the zero-padded [K; Q] operand.
+
+    The state products use ceil(2T / 8) n8 tiles, and the Gram warp reads one
+    m16 tile of K rows, so the operand holds at least 16 rows.
+    """
+    return max(16, (2 * T + 7) // 8 * 8)
 
 
 @cute.kernel
@@ -125,109 +133,114 @@ def gdn_verify_kernel_mtp_replayssm_hmma(
     state_flat = safe_cache_idx * HV + i_hv
     state_matrix = state[(state_flat, None, None)]
 
+    # K0..K(T-1) followed by Q0..Q(T-1) in n8 MMA tiles.
+    n_tiles = (2 * T + 7) // 8
+    operand_rows = _operand_rows(T)
+
     smem = utils.SmemAllocator()
-    # K0..K(T-1) followed by Q0..Q(T-1), all normalized FP32 and K
-    # contiguous.  Keep the maximum shape so T=4 and T=8 share the same
-    # simple warp-MMA layouts.
+    # Normalized FP32 K/Q rows, K contiguous, zero-padded to operand_rows.
     s_operand = smem.allocate_tensor(
         _ACC,
-        cute.make_layout((2 * _MAX_T, _K), stride=(_K, 1)),
+        cute.make_layout((operand_rows, _K), stride=(_K, 1)),
         16,
     )
     s_values = smem.allocate_tensor(
         cutlass.BFloat16,
-        cute.make_layout((_MAX_T, _M), stride=(_M, 1)),
+        cute.make_layout((T, _M), stride=(_M, 1)),
         16,
     )
-    s_decay = smem.allocate_tensor(_ACC, cute.make_layout((_MAX_T,), stride=(1,)), 16)
-    s_beta = smem.allocate_tensor(_ACC, cute.make_layout((_MAX_T,), stride=(1,)), 16)
+    s_decay = smem.allocate_tensor(_ACC, cute.make_layout((T,), stride=(1,)), 16)
+    s_beta = smem.allocate_tensor(_ACC, cute.make_layout((T,), stride=(1,)), 16)
     s_gram = smem.allocate_tensor(
         _ACC,
-        cute.make_layout((2 * _MAX_T, 2 * _MAX_T), stride=(2 * _MAX_T, 1)),
+        cute.make_layout((16, n_tiles * 8), stride=(n_tiles * 8, 1)),
         16,
     )
     s_base = smem.allocate_tensor(
         _ACC,
         # The epilogue has one adjacent thread per V row.  Column-major
         # physical storage makes its fixed-column reads conflict-free.
-        cute.make_layout((_M, 2 * _MAX_T), stride=(1, _M)),
+        cute.make_layout((_M, n_tiles * 8), stride=(1, _M)),
         16,
     )
 
-    # Warp 4 always evaluates an m16 Gram tile.  For T<8, initialize the
-    # compile-time-known padding rows [2*T, 16) to benign zeros.  T=8 emits
-    # neither this loop nor any associated instructions.
-    if cutlass.const_expr(T < _MAX_T):
-        for zero_iter in cutlass.range_constexpr(_MAX_T - T):
+    # The MMAs read whole operand tiles; initialize the compile-time-known
+    # padding rows [2*T, operand_rows) to benign zeros.
+    if cutlass.const_expr(operand_rows > 2 * T):
+        for zero_iter in cutlass.range_constexpr((operand_rows - 2 * T) // 2):
             linear = tidx + zero_iter * _THREADS
             s_operand[(2 * T + linear // _K, linear % _K)] = 0.0
 
-    # Each warp owns one timestep.  This also keeps all ReplaySSM stores
-    # naturally coalesced and overlaps them with the input normalization.
-    i_t = warp
+    # Each warp owns one timestep per round.  This also keeps all ReplaySSM
+    # stores naturally coalesced and overlaps them with the input
+    # normalization.
     q_reg_bf16 = cute.make_rmem_tensor(cute.make_layout((4,)), cutlass.BFloat16)
     k_reg_bf16 = cute.make_rmem_tensor(cute.make_layout((4,)), cutlass.BFloat16)
     q_reg = cute.make_rmem_tensor(cute.make_layout((4,)), _ACC)
     k_reg = cute.make_rmem_tensor(cute.make_layout((4,)), _ACC)
-    if i_t < T:
-        q_tile = cute.local_tile(q, (1, 1, 1, 4), (i_n, i_t, i_h, lane))
-        k_tile = cute.local_tile(k, (1, 1, 1, 4), (i_n, i_t, i_h, lane))
-        cute.autovec_copy(q_tile[(0, 0, 0, None)], q_reg_bf16)
-        cute.autovec_copy(k_tile[(0, 0, 0, None)], k_reg_bf16)
-        sum_q = cutlass.Float32(0.0)
-        sum_k = cutlass.Float32(0.0)
-        for elem in cutlass.range_constexpr(4):
-            q_reg[elem] = cutlass.Float32(q_reg_bf16[elem])
-            k_reg[elem] = cutlass.Float32(k_reg_bf16[elem])
-            sum_q = sum_q + q_reg[elem] * q_reg[elem]
-            sum_k = sum_k + k_reg[elem] * k_reg[elem]
-        for offset in [16, 8, 4, 2, 1]:
-            sum_q = sum_q + cute.arch.shuffle_sync_bfly(
-                sum_q, offset=offset, mask=-1, mask_and_clamp=31
-            )
-            sum_k = sum_k + cute.arch.shuffle_sync_bfly(
-                sum_k, offset=offset, mask=-1, mask_and_clamp=31
-            )
-        q_norm = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
-        k_norm = cute.rsqrt(sum_k + 1e-6, fastmath=True)
-        for elem in cutlass.range_constexpr(4):
-            k_idx = lane * 4 + elem
-            # Store K/Q at the MMA column whose state element the A loads below
-            # place there (see _operand_column).
-            k_col = _operand_column(k_idx)
-            s_operand[(i_t, k_col)] = k_reg[elem] * k_norm
-            s_operand[(T + i_t, k_col)] = q_reg[elem] * q_norm
-            if valid and i_split == 0 and i_hv % heads_per_q == 0:
-                replayssm_rawk[(safe_cache_idx, i_h, i_t, k_idx)] = k_reg_bf16[elem]
-
-        for v_chunk in cutlass.range_constexpr(rows // 32):
-            v_idx = row0 + v_chunk * 32 + lane
-            value = v[(i_n, i_t, i_hv, v_idx)]
-            s_values[(i_t, v_idx)] = value
-            if valid:
-                replayssm_rawv[(safe_cache_idx, i_hv, i_t, v_idx)] = value
-
-        if lane == 0:
-            x = cutlass.Float32(a[(i_n, i_t, i_hv)]) + cutlass.Float32(dt_bias[i_hv])
-            softplus_x = x
-            if x <= 20.0:
-                softplus_x = cute.log(
-                    cutlass.Float32(1.0) + cute.exp(x, fastmath=True),
-                    fastmath=True,
+    for t_round in cutlass.range_constexpr((T + 7) // 8):
+        i_t = warp + t_round * 8
+        if i_t < T:
+            q_tile = cute.local_tile(q, (1, 1, 1, 4), (i_n, i_t, i_h, lane))
+            k_tile = cute.local_tile(k, (1, 1, 1, 4), (i_n, i_t, i_h, lane))
+            cute.autovec_copy(q_tile[(0, 0, 0, None)], q_reg_bf16)
+            cute.autovec_copy(k_tile[(0, 0, 0, None)], k_reg_bf16)
+            sum_q = cutlass.Float32(0.0)
+            sum_k = cutlass.Float32(0.0)
+            for elem in cutlass.range_constexpr(4):
+                q_reg[elem] = cutlass.Float32(q_reg_bf16[elem])
+                k_reg[elem] = cutlass.Float32(k_reg_bf16[elem])
+                sum_q = sum_q + q_reg[elem] * q_reg[elem]
+                sum_k = sum_k + k_reg[elem] * k_reg[elem]
+            for offset in [16, 8, 4, 2, 1]:
+                sum_q = sum_q + cute.arch.shuffle_sync_bfly(
+                    sum_q, offset=offset, mask=-1, mask_and_clamp=31
                 )
-            log_decay = (
-                -cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=True) * softplus_x
-            )
-            decay = cute.exp(log_decay, fastmath=True)
-            beta_value = cutlass.Float32(1.0) / (
-                cutlass.Float32(1.0)
-                + cute.exp(-cutlass.Float32(b[(i_n, i_t, i_hv)]), fastmath=True)
-            )
-            s_decay[i_t] = decay
-            s_beta[i_t] = beta_value
-            if valid and i_split == 0:
-                replayssm_g[(safe_cache_idx, i_hv, i_t)] = log_decay
-                replayssm_beta[(safe_cache_idx, i_hv, i_t)] = beta_value
+                sum_k = sum_k + cute.arch.shuffle_sync_bfly(
+                    sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                )
+            q_norm = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
+            k_norm = cute.rsqrt(sum_k + 1e-6, fastmath=True)
+            for elem in cutlass.range_constexpr(4):
+                k_idx = lane * 4 + elem
+                # Store K/Q at the MMA column whose state element the A loads below
+                # place there (see _operand_column).
+                k_col = _operand_column(k_idx)
+                s_operand[(i_t, k_col)] = k_reg[elem] * k_norm
+                s_operand[(T + i_t, k_col)] = q_reg[elem] * q_norm
+                if valid and i_split == 0 and i_hv % heads_per_q == 0:
+                    replayssm_rawk[(safe_cache_idx, i_h, i_t, k_idx)] = k_reg_bf16[elem]
+
+            for v_chunk in cutlass.range_constexpr(rows // 32):
+                v_idx = row0 + v_chunk * 32 + lane
+                value = v[(i_n, i_t, i_hv, v_idx)]
+                s_values[(i_t, v_idx)] = value
+                if valid:
+                    replayssm_rawv[(safe_cache_idx, i_hv, i_t, v_idx)] = value
+
+            if lane == 0:
+                x = cutlass.Float32(a[(i_n, i_t, i_hv)]) + cutlass.Float32(
+                    dt_bias[i_hv]
+                )
+                softplus_x = x
+                if x <= 20.0:
+                    softplus_x = cute.log(
+                        cutlass.Float32(1.0) + cute.exp(x, fastmath=True),
+                        fastmath=True,
+                    )
+                log_decay = (
+                    -cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=True) * softplus_x
+                )
+                decay = cute.exp(log_decay, fastmath=True)
+                beta_value = cutlass.Float32(1.0) / (
+                    cutlass.Float32(1.0)
+                    + cute.exp(-cutlass.Float32(b[(i_n, i_t, i_hv)]), fastmath=True)
+                )
+                s_decay[i_t] = decay
+                s_beta[i_t] = beta_value
+                if valid and i_split == 0:
+                    replayssm_g[(safe_cache_idx, i_hv, i_t)] = log_decay
+                    replayssm_beta[(safe_cache_idx, i_hv, i_t)] = beta_value
 
     cute.arch.barrier()
 
@@ -254,29 +267,20 @@ def gdn_verify_kernel_mtp_replayssm_hmma(
     # groups to shorten the register live range of the B fragments.
     if warp < state_warps:
         row_tile = row0 // 16 + warp
-        acc0 = hmma.make_fragment_C(hmma.partition_shape_C((16, 8)))
-        acc0.fill(0.0)
-        if cutlass.const_expr(T > 4):
-            acc1 = hmma.make_fragment_C(hmma.partition_shape_C((16, 8)))
-            acc1.fill(0.0)
+        accs = []
+        for _n_tile in cutlass.range_constexpr(n_tiles):
+            acc = hmma.make_fragment_C(hmma.partition_shape_C((16, 8)))
+            acc.fill(0.0)
+            accs.append(acc)
         for k_group in cutlass.range_constexpr(2):
-            operand_b0 = cute.local_tile(s_operand, (8, 64), (0, k_group))
-            b0_f32 = cute.make_rmem_tensor_like(
-                hmma.make_fragment_B(thr_mma.partition_B(operand_b0)), _ACC
-            )
-            cute.copy(copy_b, thr_b.partition_S(operand_b0), thr_b.retile(b0_f32))
-            b0_tf32 = _to_tf32(b0_f32)
-            if cutlass.const_expr(T > 4):
-                operand_b1 = cute.local_tile(s_operand, (8, 64), (1, k_group))
-                b1_f32 = cute.make_rmem_tensor_like(
-                    hmma.make_fragment_B(thr_mma.partition_B(operand_b1)), _ACC
+            b_tf32 = []
+            for n_tile in cutlass.range_constexpr(n_tiles):
+                operand_b = cute.local_tile(s_operand, (8, 64), (n_tile, k_group))
+                b_f32 = cute.make_rmem_tensor_like(
+                    hmma.make_fragment_B(thr_mma.partition_B(operand_b)), _ACC
                 )
-                cute.copy(
-                    copy_b,
-                    thr_b.partition_S(operand_b1),
-                    thr_b.retile(b1_f32),
-                )
-                b1_tf32 = _to_tf32(b1_f32)
+                cute.copy(copy_b, thr_b.partition_S(operand_b), thr_b.retile(b_f32))
+                b_tf32.append(_to_tf32(b_f32))
 
             # Each lane reads 16 contiguous state columns from rows g and g+8
             # with 128-bit loads instead of the MMA layout's scattered 32-bit
@@ -300,60 +304,31 @@ def gdn_verify_kernel_mtp_replayssm_hmma(
                     a_f32[row_half + 2 * (j % 2) + 4 * (j // 2)] = a_row[(0, j)]
             a_tf32 = _to_tf32(a_f32)
             for k_tile in cutlass.range_constexpr(8):
-                cute.gemm(
-                    hmma,
-                    acc0,
-                    a_tf32[None, None, k_tile],
-                    b0_tf32[None, None, k_tile],
-                    acc0,
-                )
-                if cutlass.const_expr(T > 4):
+                for n_tile in cutlass.range_constexpr(n_tiles):
                     cute.gemm(
                         hmma,
-                        acc1,
+                        accs[n_tile],
                         a_tf32[None, None, k_tile],
-                        b1_tf32[None, None, k_tile],
-                        acc1,
+                        b_tf32[n_tile][None, None, k_tile],
+                        accs[n_tile],
                     )
 
-        base0 = cute.local_tile(s_base, (16, 8), (row_tile, 0))
-        cute.copy(copy_c, thr_c.retile(acc0), thr_c.partition_D(base0))
-        if cutlass.const_expr(T > 4):
-            base1 = cute.local_tile(s_base, (16, 8), (row_tile, 1))
-            cute.copy(copy_c, thr_c.retile(acc1), thr_c.partition_D(base1))
+        for n_tile in cutlass.range_constexpr(n_tiles):
+            base = cute.local_tile(s_base, (16, 8), (row_tile, n_tile))
+            cute.copy(copy_c, thr_c.retile(accs[n_tile]), thr_c.partition_D(base))
 
-    # Warp 4 computes the 16x16 K/K, K/Q, Q/K and Q/Q Gram matrix in parallel
-    # with the state warps.  Only its upper-left K rows and Q columns are used
-    # by the recurrence, but the full two MMA column tiles are equally cheap.
+    # The Gram warp computes K rows against all K/Q columns in parallel with
+    # the state warps.  T <= 16 K rows fit one m16 tile; the recurrence reads
+    # only its K/K upper triangle and K/Q columns, but whole n8 tiles are
+    # equally cheap.
     if warp == _GRAM_WARP:
         gram_a = cute.local_tile(s_operand, (16, _K), (0, 0))
-        gram_acc0 = hmma.make_fragment_C(hmma.partition_shape_C((16, 8)))
-        gram_acc0.fill(0.0)
-        if cutlass.const_expr(T > 4):
-            gram_acc1 = hmma.make_fragment_C(hmma.partition_shape_C((16, 8)))
-            gram_acc1.fill(0.0)
+        gram_accs = []
+        for _n_tile in cutlass.range_constexpr(n_tiles):
+            gram_acc = hmma.make_fragment_C(hmma.partition_shape_C((16, 8)))
+            gram_acc.fill(0.0)
+            gram_accs.append(gram_acc)
         for k_group in cutlass.range_constexpr(2):
-            gram_b0 = cute.local_tile(s_operand, (8, 64), (0, k_group))
-            gram_b0_f32 = cute.make_rmem_tensor_like(
-                hmma.make_fragment_B(thr_mma.partition_B(gram_b0)), _ACC
-            )
-            cute.copy(
-                copy_b,
-                thr_b.partition_S(gram_b0),
-                thr_b.retile(gram_b0_f32),
-            )
-            gram_b0_tf32 = _to_tf32(gram_b0_f32)
-            if cutlass.const_expr(T > 4):
-                gram_b1 = cute.local_tile(s_operand, (8, 64), (1, k_group))
-                gram_b1_f32 = cute.make_rmem_tensor_like(
-                    hmma.make_fragment_B(thr_mma.partition_B(gram_b1)), _ACC
-                )
-                cute.copy(
-                    copy_b,
-                    thr_b.partition_S(gram_b1),
-                    thr_b.retile(gram_b1_f32),
-                )
-                gram_b1_tf32 = _to_tf32(gram_b1_f32)
             gram_a_group = cute.local_tile(gram_a, (16, 64), (0, k_group))
             gram_a_src = thr_a.partition_S(gram_a_group)
             gram_a_f32 = cute.make_rmem_tensor_like(
@@ -361,35 +336,39 @@ def gdn_verify_kernel_mtp_replayssm_hmma(
             )
             cute.copy(copy_a, gram_a_src, thr_a.retile(gram_a_f32))
             gram_a_tf32 = _to_tf32(gram_a_f32)
-            for k_tile in cutlass.range_constexpr(8):
-                cute.gemm(
-                    hmma,
-                    gram_acc0,
-                    gram_a_tf32[None, None, k_tile],
-                    gram_b0_tf32[None, None, k_tile],
-                    gram_acc0,
+            # One B fragment at a time bounds the Gram warp's registers.
+            for n_tile in cutlass.range_constexpr(n_tiles):
+                gram_b = cute.local_tile(s_operand, (8, 64), (n_tile, k_group))
+                gram_b_f32 = cute.make_rmem_tensor_like(
+                    hmma.make_fragment_B(thr_mma.partition_B(gram_b)), _ACC
                 )
-                if cutlass.const_expr(T > 4):
+                cute.copy(
+                    copy_b,
+                    thr_b.partition_S(gram_b),
+                    thr_b.retile(gram_b_f32),
+                )
+                gram_b_tf32 = _to_tf32(gram_b_f32)
+                for k_tile in cutlass.range_constexpr(8):
                     cute.gemm(
                         hmma,
-                        gram_acc1,
+                        gram_accs[n_tile],
                         gram_a_tf32[None, None, k_tile],
-                        gram_b1_tf32[None, None, k_tile],
-                        gram_acc1,
+                        gram_b_tf32[None, None, k_tile],
+                        gram_accs[n_tile],
                     )
-        gram0 = cute.local_tile(s_gram, (16, 8), (0, 0))
-        cute.copy(copy_c, thr_c.retile(gram_acc0), thr_c.partition_D(gram0))
-        if cutlass.const_expr(T > 4):
-            gram1 = cute.local_tile(s_gram, (16, 8), (0, 1))
-            cute.copy(copy_c, thr_c.retile(gram_acc1), thr_c.partition_D(gram1))
+        for n_tile in cutlass.range_constexpr(n_tiles):
+            gram_dst = cute.local_tile(s_gram, (16, 8), (0, n_tile))
+            cute.copy(
+                copy_c, thr_c.retile(gram_accs[n_tile]), thr_c.partition_D(gram_dst)
+            )
 
     cute.arch.barrier()
 
-    # One thread owns one V row.  O(T^2) scalar recurrence replaces eight
+    # One thread owns one V row.  O(T^2) scalar recurrence replaces T
     # full-state rank-one updates and consumes only CTA-local base products.
     if tidx < rows:
         row = row0 + tidx
-        coeff = cute.make_rmem_tensor(cute.make_layout((_MAX_T,)), _ACC)
+        coeff = cute.make_rmem_tensor(cute.make_layout((T,)), _ACC)
         coeff.fill(0.0)
         state_scale = cutlass.Float32(1.0)
         for t in cutlass.range_constexpr(T):
@@ -493,8 +472,8 @@ def run_gdn_verify_kernel_mtp_replayssm_hmma(
     target = gdn_device_target(state.device)
     if (target.major, target.minor) != (12, 0):
         raise ValueError("HMMA ReplaySSM verify requires SM120")
-    if not 4 <= T <= 8:
-        raise ValueError(f"HMMA ReplaySSM verify supports T=4..8, got {T}")
+    if not 4 <= T <= 16:
+        raise ValueError(f"HMMA ReplaySSM verify supports T=4..16, got {T}")
     if v_split not in (2, 4):
         raise ValueError(
             f"HMMA ReplaySSM verify supports v_split 2 or 4, got {v_split}"
