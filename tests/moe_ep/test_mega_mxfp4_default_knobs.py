@@ -346,9 +346,7 @@ def test_mxfp4_rejects_rank_divergence_before_pool_lookup(mismatch):
     """Reject differing configurations or occupancy before allocating or reusing storage."""
     import dataclasses
     import torch.distributed as dist
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.standard_cutedsl import (
-        _StandardBlockScaledBackend,
-    )
+    from flashinfer.moe_ep.core.kernel.base import MegaKernelBackend
 
     backend = StandardMxfp8Mxfp4Backend(
         Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
@@ -379,11 +377,11 @@ def test_mxfp4_rejects_rank_divergence_before_pool_lookup(mismatch):
     with (
         mock.patch.object(backend, "_active_clusters", return_value=76),
         mock.patch.object(dist, "all_gather_object", side_effect=gather),
-        mock.patch.object(_StandardBlockScaledBackend, "prepare_workspace") as prepare,
+        mock.patch.object(MegaKernelBackend, "_workspace_pool_request") as pool_request,
     ):
         with pytest.raises(MoEEpConfigError, match="differs across EP ranks"):
             backend.prepare_workspace(backend._ep_bootstrap, fleet)
-        prepare.assert_not_called()
+        pool_request.assert_not_called()
 
 
 @pytest.mark.parametrize("hint", [None, 8192])
@@ -401,9 +399,7 @@ def test_mxfp4_workspace_failure_is_collective(failing_rank, method, operation):
     from contextlib import nullcontext
 
     import torch.distributed as dist
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.standard_cutedsl import (
-        _StandardBlockScaledBackend,
-    )
+    from flashinfer.moe_ep.core.kernel.base import MegaKernelBackend
 
     backend = StandardMxfp8Mxfp4Backend(
         Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate_size=6400, top_k=2)
@@ -428,7 +424,7 @@ def test_mxfp4_workspace_failure_is_collective(failing_rank, method, operation):
         ),
         mock.patch.object(backend, "_active_clusters", return_value=76),
         mock.patch.object(dist, "all_gather_object", side_effect=gather) as collective,
-        mock.patch.object(_StandardBlockScaledBackend, "prepare_workspace") as prepare,
+        mock.patch.object(MegaKernelBackend, "_workspace_pool_request") as pool_request,
         mock.patch.object(backend, method, side_effect=RuntimeError(f"{method} failed"))
         if failing_rank == 0
         else nullcontext(),
@@ -436,7 +432,7 @@ def test_mxfp4_workspace_failure_is_collective(failing_rank, method, operation):
         with pytest.raises(MoEEpConfigError, match=f"rank {failing_rank}: {failure}"):
             getattr(backend, operation)(bootstrap, fleet)
         collective.assert_called_once()
-        prepare.assert_not_called()
+        pool_request.assert_not_called()
 
 
 @pytest.mark.parametrize("world_size,has_group", [(1, True), (2, False)])
