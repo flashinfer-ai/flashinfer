@@ -193,6 +193,30 @@ def _big_regime(b: int, R: int, n4: int) -> bool:
     return b * R <= 148 and not (R == 1 and b >= 75 and n4 <= 16384)
 
 
+def _small_row_sample(k: int, big: bool, R: int, aim: int, hint_free: bool) -> int:
+    """The streaming slab's ``sd_en`` (varlen launcher): 0, or a row length; rows
+    of max(2k, sd_en) < n <= SCAP then take the pair sample too (rows above SCAP
+    always do).
+
+    Upstream: 1 for K > 1024 off the big regime. FlashInfer-local, hint-free
+    launches: unsampled, a hinted row thresholds at the minimum of the previous
+    step's top-k and keeps about k survivors, but a hint-free row thresholds at
+    the minimum of its own first k values and keeps nearly all n of them. A
+    launch sized for a capacity far above its rows (a CUDA graph at the serving
+    width) runs every row up to SCAP that way: 128 rows of 16K columns at 1M
+    capacity, K=512, 17.7 us unsampled vs 6.2 us sampled (B200). The sample
+    stages about ``aim`` survivors instead, so it pays once n clears that count
+    (at n <= aim it runs 3-7% slower). The SPLIT slab (R > 1) gets 0: it ranks
+    every row of up to 16384 columns, above its SCAP, with the in-kernel register
+    path (``_main_reg_vpt``), so no row the gate admits reaches it. The 512- and
+    1024-thread one-CTA slabs do the same from an envelope of ``_MAIN_REG_ENV``
+    register rows (SCAP <= their register rows), so there the threshold acts on
+    narrower launches only."""
+    if not hint_free:
+        return int(k > 1024 and not big)
+    return aim if R == 1 else 0
+
+
 def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
     """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
 
@@ -914,6 +938,35 @@ def _regclus_stage_out(num_rows: int, k: int, paged: bool) -> bool:
     return bool(_REGCLUS_STAGE_OUT) and paged and (k <= 1024 or num_rows >= 16)
 
 
+# envelope, in register-path rows, from which the one-CTA-per-row main engines
+# compile the register path in (see _main_reg_vpt)
+_MAIN_REG_ENV = 8
+
+
+def _main_reg_vpt(blk: int, split: bool, n_env: int) -> int:
+    """Widest VPT of the in-kernel register path of a decode ``main`` engine
+    (FlashInfer-local; 0 = off). A CUDA-graph launch is planned for the
+    capacity, so it streams rows far shorter than that; with the path compiled
+    in, a row of at most BLK * VPT * 4 columns runs the register family's body
+    on its CTA instead (``GvrMainKernel`` ``reg_vpt``: the VPT 2 body for rows
+    up to BLK * 8, the VPT 4 body above), as SGLang's topk_v2 picks its register
+    path per row. VPT 4 is that family's widest rung: rows up to 16384 columns
+    at 1024 threads, 8192 at 512 (the 256-thread engine's smem cannot hold the
+    window). The SPLIT engines (1024 threads, up to 16 rows, 32 at K = 2048)
+    always compile it in. On the one-CTA-per-row engines the register body's
+    code moves ptxas's allocation of the streaming loops off the uniform
+    datapath, 0.5-1.5% on long rows and up to 4.5% on ragged batches, while a
+    batch whose rows all fit runs 1.15-3.4x faster (B200). In a launch sized to
+    its rows the longest row streams and sets the time of the one-wave grid,
+    so those engines compile the path in only when the envelope n_env holds at
+    least _MAIN_REG_ENV register rows: a launch planned for a capacity. A pure
+    function of the engine tuple and the envelope (fixed per ``warmup_varlen``
+    call), so the warmup band key needs no new axis."""
+    if split and blk == 1024:
+        return 4
+    return 4 if blk in (512, 1024) and n_env >= _MAIN_REG_ENV * blk * 16 else 0
+
+
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
@@ -1070,22 +1123,37 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
             hint_free=hint_free,
             pt_smem=pt_smem,
             pdl=_DECODE_PDL,
+            reg_vpt=_main_reg_vpt(tpl[0], tpl[5], n_kernel),
             **pg,
         )
     )
     big = _big_regime(num_rows, r_const, n_route >> 2)
-    aim_base = (
-        ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
-        if big
-        else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
-    )
+    # FlashInfer-local: the one-CTA slabs (R == 1) aim at 7k/4, except the
+    # 1024-thread one-wave slab at K = 512, which keeps upstream's 2k (upstream:
+    # 11k/8 at K >= 1024 and 3k/2 below off the big regime, 4k at K >= 1024 on
+    # it). The first threshold is the sample's rank-TGT rung, which keeps about
+    # `aim` values; the sample reads runs of 8 adjacent values, so on real rows,
+    # whose top scores come in runs, its estimate is coarse, and at 1.375-1.5k
+    # the rung kept fewer than k values on 28 of 441 captured DSv4 / V3.2 decode
+    # rows of 8K-262K columns (up to 21% of one layer's rows). Such a row streams
+    # a second time and the one-wave batch waits for it. At 7k/4 none misses and
+    # the staged count stays under 0.6 SCAP. The one-wave slab is the plan of a
+    # launch at a wide capacity at 75-148 rows (33-148 at K = 2048), whatever
+    # its rows; at 4k it staged 2.2x the candidates for no fewer misses (B200,
+    # at 7k/4: 32K-column rows 0.81-0.89x the 4k time with the caches cold,
+    # rows of 16K-524K columns 0.76-0.99x warm). The sample, sfac n / aim
+    # values, grows 2.3x, which costs rows streamed from DRAM at 96-144 rows up
+    # to 1.5% cold and 2.7% behind a warm producer (GLM-5.2 rows of 0.87M-1M
+    # columns). At K = 512 the slab keeps 2k: 7k/4 was slower there on
+    # 131K-column and deep-layer 32K-column rows.
+    aim_base = 2 * k if big and (r_const > 1 or k < 1024) else (7 * k) // 4
     sfac = (
         (32 if r_const == 2 else (48 if k > 1024 else 16))
         if r_const > 1
         else (64 if k >= 1024 else 32)
     )
     amin = 3 * k if r_const == 2 else (7 * k) // 2
-    sd_en = 1 if (k > 1024 and not big) else 0
+    sd_en = _small_row_sample(k, big, r_const, aim_base, hint_free)
     # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
     # num_rows > 15 would strand small batches in SPLIT-main without the
     # staged floor (a distribution-dependent tail regression); the kernel
