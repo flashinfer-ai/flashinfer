@@ -1709,15 +1709,6 @@ def _ws2_stock_oneshot(workspace, token_num):
     return None if backend == "mnnvl" else _ws2_vllm_oneshot(token_num)
 
 
-def _ws2_free_memory(device):
-    import gc
-
-    gc.collect()
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    return torch.cuda.mem_get_info(device)[0]
-
-
 def _run_ws2_divergent_allocation_worker(
     world_size, rank, dtype, hidden_dim, distributed_init_port, backend, gpu_offset=0
 ):
@@ -1726,20 +1717,24 @@ def _run_ws2_divergent_allocation_worker(
     release the region and stay in step: auto returns the stock workspace on both ranks and
     its calls run the stock backend; an explicit specialized backend raises on both ranks;
     a later workspace gets the state on both ranks."""
+    import gc
+    import weakref
+
     from flashinfer.comm import _allreduce_fusion_ws2_specialized as ws2
 
     device = _ws2_setup(world_size, rank, distributed_init_port, gpu_offset)
     real = ws2.SymmDeviceMemory
+    regions = []
 
-    class _FailsAfterExchange(real):
+    class _Tracked(real):
         def __init__(self, *args, **kwargs):
+            regions.append(weakref.ref(self))
             super().__init__(*args, **kwargs)
-            raise RuntimeError("injected local failure after the handle exchange")
+            if rank == 1:
+                raise RuntimeError("injected local failure after the handle exchange")
 
     rejected = _ws2_stats()["state_rejections"].get("allocation", 0)
-    free_before = _ws2_free_memory(device)
-    if rank == 1:
-        ws2.SymmDeviceMemory = _FailsAfterExchange
+    ws2.SymmDeviceMemory = _Tracked
     try:
         if backend == "specialized":
             with pytest.raises(ValueError, match="allocation"):
@@ -1752,11 +1747,10 @@ def _run_ws2_divergent_allocation_worker(
     stats = _ws2_stats()
     assert stats["state_rejections"].get("allocation", 0) == rejected + 1
     assert "rank 1" in stats["last_state_rejection"], stats["last_state_rejection"]
-    if workspace is None:
-        # The explicit backend destroyed its fallback: nothing of the attempt is left.
-        leaked = free_before - _ws2_free_memory(device)
-        assert abs(leaked) <= (64 << 20), f"rank {rank}: {leaked} bytes not released"
-    else:
+    # Every rank released its region (its own allocation and its import of the peer's).
+    gc.collect()
+    assert len(regions) == 1 and regions[0]() is None, f"rank {rank} kept its region"
+    if workspace is not None:
         assert not isinstance(workspace, comm.SpecializedAllReduceFusionWorkspace)
         assert workspace.backend == _ws2_stock_backend(world_size)
         token_num = _ws2_inside(0.5)
