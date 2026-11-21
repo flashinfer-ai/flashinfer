@@ -31,7 +31,7 @@ kernel:
   kernel for the device on the first eager call it admits; under CUDA-graph
   capture it admits a call only when the kernel is built and the same binding
   already admitted that token count eagerly (``eager_num_tokens``), that is,
-  when ``MoELayer`` already timed the candidates for that call outside capture.
+  when ``MoELayer`` already selected its winner for that call outside capture.
   ``MoELayer.reset_winner()`` clears those records with the winners, and a
   winner-cache miss under capture leaves this backend out of the selection.
   Nothing is built or timed inside a capture;

@@ -243,12 +243,19 @@ candidates. A kernel admits only the calls where it was measured faster than the
 other backends, so outside :func:`flashinfer.autotune` ``MoELayer`` runs a call
 a kernel admits on it without timing the other candidates; under
 ``autotune(True)`` it times the backend against them like any candidate. A
-kernel is built for a device by the first eager call it admits; the first call
-of a token count under CUDA Graph capture runs on another candidate.
+kernel is built for a device by the first eager call it admits. Under CUDA Graph
+capture it runs a call only when the layer already selected it eagerly for that
+token count; any other captured call, including the first call of a token count
+under capture, is captured on another candidate, untimed. That fallback needs
+another configured backend that accepts the call and whose weight view is
+prepared (in the default list, the backend whose view the kernel reads); with
+``SpecializedMoEConfig`` alone the call raises ``NotImplementedError``. Make an
+eager call of every token count before capturing it.
 ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` keeps every call on the other
-candidates. ``flashinfer.fused_moe.backends.specialized.registered_kernels()``
-lists the kernels and ``flashinfer.fused_moe.backends.specialized.stats()``
-returns their diagnostics.
+candidates.
+``flashinfer.fused_moe.backends.specialized.registered_kernels()`` lists the
+kernels and ``flashinfer.fused_moe.backends.specialized.stats()`` returns their
+diagnostics.
 
 .. autosummary::
     :toctree: ../generated

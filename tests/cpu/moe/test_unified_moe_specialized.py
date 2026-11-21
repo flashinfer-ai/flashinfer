@@ -2,8 +2,9 @@
 
 Kernel-independent: kernel discovery, every registered kernel's declarations, the
 runner's declarations and kernel binding, the backend's registration, the runner's
-kill switch, and how ``MoELayer`` keeps the backend's capture-time admissions tied
-to its cached winners. Every kernel's guards, numerics, kill switch, CUDA-graph
+kill switch, how ``MoELayer`` keeps the backend's capture-time admissions tied
+to its cached winners, and how it selects without timing: a backend that prefers
+itself outside autotune, any call inside a CUDA-graph capture. Every kernel's guards, numerics, kill switch, CUDA-graph
 behavior and own checks are tested in ``tests/moe/test_unified_moe_specialized.py``
 from its spec in ``tests/moe/specialized_kernels/``.
 """
@@ -44,6 +45,7 @@ from flashinfer.fused_moe.backends.specialized.kernel import (
 )
 from flashinfer.fused_moe.backends.specialized.runner import SpecializedMoERunner
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.runners import MoERunner
 
 _ARCHS = (75, 80, 89, 90, 100, 103, 107, 110, 120, 121)
 # Every kernel's stats() reports at least these fields.
@@ -333,7 +335,9 @@ class _StubKernel(SpecializedMoEKernel):
 
 
 def _stub_binding(monkeypatch):
-    """A specialized runner bound to one stub kernel, and a call it admits."""
+    """A specialized runner bound to one stub kernel, and a call it admits (the
+    kill switch cleared, whatever the caller's environment)."""
+    monkeypatch.delenv(KILL_SWITCH_ENV, raising=False)
     monkeypatch.setattr(fi_utils, "get_compute_capability", lambda device: (10, 3))
     config = MoEConfig(
         routing=RoutingConfig(num_experts=24, top_k=3),
@@ -392,32 +396,45 @@ def _plain_runner(name):
     )
 
 
+def _bench_outside_capture(monkeypatch, capturing, cost=None):
+    """Patch ``bench_gpu_time`` to record the timed backends; timing inside a
+    CUDA-graph capture fails, as the real one does (it synchronizes)."""
+    timed = []
+
+    def bench(fn, **kwargs):
+        assert not capturing[0], "a candidate was timed inside a CUDA-graph capture"
+        runner = fn.__defaults__[0]
+        timed.append(runner.backend_key)
+        return [cost(runner) if cost else float(len(timed))]
+
+    monkeypatch.setattr("flashinfer.testing.utils.bench_gpu_time", bench)
+    monkeypatch.setattr(layer_module, "_stream_capturing", lambda: capturing[0])
+    return timed
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("others", [1, 2])
 def test_capture_miss_leaves_the_specialized_backend_out(monkeypatch, others):
     """A winner-cache miss inside a CUDA-graph capture (e.g. an admission whose
-    winner selection failed or was evicted) never times the specialized backend:
-    it steps aside and the other candidates are selected as without it."""
+    winner selection failed or was evicted) times nothing: the specialized
+    backend steps aside and the first other candidate is taken untimed, marked
+    so that the next call outside a capture selects again."""
     runner, _, act, weights = _stub_binding(monkeypatch)
     plain = [_plain_runner(f"plain{i}") for i in range(others)]
-    timed = []
-
-    def bench(fn, **kwargs):
-        timed.append(fn.__defaults__[0].backend_key)
-        return [float(len(timed))]  # the first timed candidate wins
+    timed = _bench_outside_capture(monkeypatch, [True])
 
     def choose_one(custom_op, runners, tuning_config, inputs, **kwargs):
         assert runners[0] is not runner, "the specialized backend was tuned"
         return runners[0], 3
 
-    monkeypatch.setattr("flashinfer.testing.utils.bench_gpu_time", bench)
     layer = SimpleNamespace(tuner=SimpleNamespace(choose_one=choose_one))
     candidates = [runner, *plain]
 
-    monkeypatch.setattr(layer_module, "_stream_capturing", lambda: True)
-    assert MoELayer._select_winner(layer, act, weights, candidates) == (plain[0], 3)
-    # with one other candidate nothing is timed; with more, only they are
-    assert timed == ([] if others == 1 else [p.backend_key for p in plain])
+    winner = MoELayer._select_winner(layer, act, weights, candidates)
+    assert winner == (plain[0], 3) and timed == []
+    # one other candidate is the selection of the reduced pool; of several,
+    # the first was taken without timing
+    assert isinstance(winner, layer_module._CaptureWinner) == (others > 1)
     assert SpecializedMoERunner.capture_requires_eager_selection is True
 
 
@@ -439,40 +456,44 @@ def _layer_runner(name, cost, *, eager_only=False):
     return runner
 
 
-@pytest.mark.cpu_only
-def test_capture_selection_never_takes_the_full_pool_entry(monkeypatch):
-    """A first call of a bucket inside a CUDA-graph capture selects without the
-    specialized backend and caches that under its reduced pool's key, so a later
-    eager call of the same bucket still times every eligible backend and can
-    select the specialized one (which is faster here)."""
-    plain = _layer_runner("plain", cost=2.0)
-    special = _layer_runner("specialized", cost=1.0, eager_only=True)
+def _cpu_layer(*runners):
+    """A ``MoELayer`` over stub runners (no device), outside autotune."""
     layer = MoELayer.__new__(MoELayer)
     layer.config = MoEConfig(
         routing=RoutingConfig(num_experts=24, top_k=3),
         quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=384),
     )
-    layer.runners = [plain, special]
+    layer.runners = list(runners)
+    layer._tuning_runner_ids = list(range(len(runners)))
     layer._winners = OrderedDict()
     layer._last_winner_backend = None
     layer.tuner = SimpleNamespace(
+        is_tuning_mode=False,
         choose_one=lambda custom_op, runners, tuning_config, inputs, **kw: (
             runners[0],
             -1,
-        )
+        ),
     )
-    timed = []
+    return layer
 
-    def bench(fn, **kwargs):
-        runner = fn.__defaults__[0]
-        timed.append(runner.backend_key)
-        return [runner.cost]
 
-    monkeypatch.setattr("flashinfer.testing.utils.bench_gpu_time", bench)
-    act = SimpleNamespace(routing_input_mode=RoutingInputMode.FromLogits, num_tokens=6)
+def _cost(runner):
+    return runner.cost
+
+
+@pytest.mark.cpu_only
+def test_capture_selection_never_takes_the_full_pool_entry(monkeypatch):
+    """A first call of a bucket inside a CUDA-graph capture selects without the
+    specialized backend and caches that under its reduced pool's key, so a later
+    eager call of the same bucket still selects among every eligible backend and
+    can take the specialized one (which is faster here)."""
+    plain = _layer_runner("plain", cost=2.0)
+    special = _layer_runner("specialized", cost=1.0, eager_only=True)
+    layer = _cpu_layer(plain, special)
     capturing = [True]
-    monkeypatch.setattr(layer_module, "_stream_capturing", lambda: capturing[0])
+    timed = _bench_outside_capture(monkeypatch, capturing, _cost)
+    act = SimpleNamespace(routing_input_mode=RoutingInputMode.FromLogits, num_tokens=6)
 
     assert layer(act, None) == "plain"
     assert timed == []  # one candidate left in capture: nothing is timed
@@ -487,3 +508,86 @@ def test_capture_selection_never_takes_the_full_pool_entry(monkeypatch):
     capturing[0] = True
     assert layer(act, None) == "specialized"
     assert layer.winner_backend == "specialized" and len(timed) == 2
+
+
+@pytest.mark.cpu_only
+def test_capture_pick_is_selected_again_outside_capture(monkeypatch):
+    """A first call of a bucket inside a capture with several ordinary
+    candidates times nothing: it takes the first in configured order. The next
+    call outside a capture selects the bucket again, timing every candidate,
+    and a later capture replays that selection."""
+    slow = _layer_runner("slow", cost=2.0)
+    fast = _layer_runner("fast", cost=1.0)
+    layer = _cpu_layer(slow, fast)
+    capturing = [True]
+    timed = _bench_outside_capture(monkeypatch, capturing, _cost)
+    act = SimpleNamespace(routing_input_mode=RoutingInputMode.FromLogits, num_tokens=6)
+
+    assert layer(act, None) == "slow" and timed == []
+    assert layer(act, None) == "slow" and timed == []  # cached for captures
+
+    capturing[0] = False
+    assert layer(act, None) == "fast"
+    assert timed == ["slow", "fast"]
+    assert [key[2] for key in layer._winners] == [(0, 1)]
+    assert type(layer._winners[(8, act.routing_input_mode, (0, 1))]) is tuple
+
+    capturing[0] = True
+    assert layer(act, None) == "fast" and len(timed) == 2
+
+
+def _preferred_runner(name, cost):
+    runner = _layer_runner(name, cost=cost, eager_only=True)
+    runner.prefer_when_accepted = True
+    return runner
+
+
+@pytest.mark.cpu_only
+def test_preferred_backend_wins_untimed_outside_autotune(monkeypatch):
+    """A backend that prefers itself (``prefer_when_accepted``, as the
+    specialized one does) wins every call it accepts without cross-backend
+    timing, even where it would time slower. Under ``autotune(True)`` every
+    eligible backend is timed, a bucket whose winner was taken untimed is
+    selected again, and the measured winner stays afterwards."""
+    assert SpecializedMoERunner.prefer_when_accepted is True
+    assert MoERunner.prefer_when_accepted is False  # stock default
+    plain = _layer_runner("plain", cost=1.0)
+    special = _preferred_runner("specialized", cost=2.0)
+    layer = _cpu_layer(special, plain)
+    timed = _bench_outside_capture(monkeypatch, [False], _cost)
+    act = SimpleNamespace(routing_input_mode=RoutingInputMode.FromLogits, num_tokens=6)
+
+    assert layer(act, None) == "specialized" and timed == []
+    assert layer(act, None) == "specialized" and timed == []
+
+    layer.tuner.is_tuning_mode = True  # flashinfer.autotune(True)
+    assert layer(act, None) == "plain"
+    assert timed == ["specialized", "plain"]
+    assert layer(act, None) == "plain" and len(timed) == 2  # measured: kept
+
+    layer.tuner.is_tuning_mode = False
+    assert layer(act, None) == "plain" and len(timed) == 2
+
+    # a call the preferred backend does not accept selects as without it
+    other = _cpu_layer(_preferred_runner("specialized", cost=2.0), plain)
+    other.runners[0].accepts = lambda act, weights: False
+    assert other(act, None) == "plain" and len(timed) == 2  # one candidate
+
+
+@pytest.mark.cpu_only
+def test_preferred_backend_is_not_taken_inside_a_capture(monkeypatch):
+    """Inside a CUDA-graph capture the preference does not apply: a cached
+    winner is replayed, and a first call of a bucket is selected untimed among
+    the candidates that do not require an eager selection."""
+    plain = _layer_runner("plain", cost=1.0)
+    special = _preferred_runner("specialized", cost=2.0)
+    layer = _cpu_layer(special, plain)
+    capturing = [True]
+    timed = _bench_outside_capture(monkeypatch, capturing, _cost)
+    act = SimpleNamespace(routing_input_mode=RoutingInputMode.FromLogits, num_tokens=6)
+
+    assert layer(act, None) == "plain" and timed == []
+    capturing[0] = False
+    assert layer(act, None) == "specialized" and timed == []
+    capturing[0] = True
+    assert layer(act, None) == "specialized" and timed == []

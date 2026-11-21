@@ -744,6 +744,7 @@ Key mechanisms (and where they live):
 - **Breaking change — `CutlassConfig` removed.** The deprecated, unregistered `CutlassConfig` placeholder is gone. It was never a runnable `MoELayer` backend (`supported()` always returned false; it was not in `_BACKEND_RUNNERS`). Import, annotate, serialize, or feature-detect a quant-specific type instead (`CutlassBf16Config`, `CutlassNvfp4Config`, `CutlassFp8PerTensorConfig`, `CutlassFp8BlockConfig`, `CutlassMxfp8Config`, `CutlassMxfp8Mxfp4Config`, `CutlassW4A16Config`, `CutlassW4A8Config`, `CutlassHummingConfig`). Historical **Anchor:** / CR1 quotes earlier in this document still mention `CutlassConfig` as review history, not current API.
 - **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. This comparison captures `pack_inputs` plus `forward`, including per-call GPU conversions and routing-ID packing. One-time preparation runs before capture; Python overhead is excluded from graph replay timing. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
+- **Untimed selections.** A backend whose runner sets `prefer_when_accepted` (meant for a backend whose acceptance envelope is exactly where it measured faster than the other backends, such as one of kernels specialized for a single served configuration; no stock backend sets it) wins every bucket it accepts without cross-backend timing, outside `flashinfer.autotune(True)`. Under `autotune(True)` all eligible backends are timed, and a bucket whose winner was taken untimed is selected again. Nothing is timed inside a CUDA-graph capture, since timing synchronizes the device: a cached winner is replayed, and a first call of a bucket takes the first eligible candidate in configured order (leaving out runners that set `capture_requires_eager_selection`) and caches it as untimed, so the next call of the bucket outside a capture selects again.
 - **Fail-fast scope:** each runner declares MMA ``(weight, activation)`` pairs
   plus ``supported_output_formats``; ``QuantConfig`` only checks that each axis
   is a ``QuantFormat``. Unsupported combinations are filtered before build, the
@@ -1032,9 +1033,13 @@ backend.
 - **Build and CUDA graphs.** A kernel is built for a device by the first eager
   call it admits, never at import or construction. Under CUDA-graph capture a
   call is admitted only when the kernel is built and the layer already admitted
-  that token count eagerly, so its winner was timed outside capture; otherwise,
+  that token count eagerly, so its winner was selected outside capture; otherwise,
   including the first call of a token count under capture, the call is captured
-  on another candidate. `MoELayer.reset_winner()` forgets those admissions with
+  on another candidate, untimed. That needs another configured backend that
+  accepts the call with its weight view prepared (in the default list, the backend
+  whose view the kernel reads); with the specialized backend alone such a call
+  raises `NotImplementedError`, so make an eager call of every token count before
+  capturing it. `MoELayer.reset_winner()` forgets those admissions with
   the winners, and a winner-cache miss under capture leaves the backend out of
   the selection and caches it for the remaining candidates only, so a later eager
   call of that bucket still selects among all of them. Nothing is built or timed
