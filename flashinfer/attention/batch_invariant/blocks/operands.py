@@ -246,11 +246,16 @@ class StaticPlan:
         cap: int = 0,
         kv_fmt: str = "bf16",
         v_sf_swizzled: bool = False,
+        *,
+        causal: bool = True,
     ):
         """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
         have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
         self.hw_rowmax = hw_rowmax
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
+        # the mask mode (a class dimension): causal rows see [0, p], or [max(0, p - window_left), p] with a window (window_left >= 0),
+        # non-causal rows see every key of the request, [0, kv_len). A compile-time constant: the softmax masks and the fold's present chunks read it, the causal code is unchanged
+        self.causal = causal
         # kv_fmt: the K / V cache format. "bf16": the TMA producer fills the ring. "e4m3" / "e5m2": the cache is one byte per element
         # (viewed as uint8); the load warp's TMA brings the raw fp8 tiles into a staging buffer and the conversion stage
         # (blocks/convert.py: Roles.convert_warps) widens them to bf16 exactly and writes the SAME ring bytes the TMA would have

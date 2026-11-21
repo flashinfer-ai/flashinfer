@@ -1,6 +1,11 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>``.
+"""Canonical dataflow of paged-KV attention: the classes ``attn.bf16.d<D>`` (causal) and ``attn.bf16.d<D>.nc`` (non-causal).
+
+The mask mode is a class dimension, not a per-call input: a causal row at position ``p`` sees the keys ``[lo, p + 1)`` (bottom-right
+aligned, ``lo`` from the optional sliding window), a non-causal row sees every key of its request, ``[0, kv_len)`` (no window). The
+tiles, the chunks, the online softmax and the merge are the same dataflow in both modes; only the visible set a token gets from the
+request metadata differs, so a token's term (and the fingerprint) differs between the two classes.
 
 The class is stated for finite bf16 operands: a non-finite Q / K / V value, or scaled scores outside the binary32 range, give
 the NaN that fp32 softmax arithmetic gives (bit for bit, like every other value) and are not guarded against.
@@ -193,19 +198,39 @@ def scale_log2(sm_scale: float, k_scale: float = 1.0) -> float:
 
 @dataclass(frozen=True)
 class RowSpec:
-    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys ``[lo, L)`` with
-    ``L = p + 1`` (causal) and ``lo = max(0, p - window_left)``; ``row`` names the row (query token and head) in the leaf terms."""
+    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys ``[lo, L)``. Causal
+    (the default): ``L = p + 1`` and ``lo = max(0, p - window_left)``. Non-causal (``causal=False``): ``L = kv_len`` (every key of
+    the request) and ``lo = 0``; the position only names the row and a window is not a parameter of that class. ``row`` names the row
+    (query token and head) in the leaf terms."""
 
     p: int
     window_left: int = -1
     row: int = 0  # the row's identity in the leaf terms (query token / head index)
+    causal: bool = True
+    kv_len: Optional[int] = (
+        None  # the request's key count (non-causal: the visible range is [0, kv_len))
+    )
+
+    def __post_init__(self) -> None:
+        if not self.causal:
+            assert self.kv_len is not None and self.kv_len >= 1, (
+                "a non-causal row needs the request's kv_len (at least one key)"
+            )
+            assert self.window_left < 0, (
+                "window_left is not a parameter of the non-causal class"
+            )
 
     @property
     def L(self) -> int:
+        if not self.causal:
+            assert self.kv_len is not None
+            return self.kv_len
         return self.p + 1
 
     @property
     def lo(self) -> int:
+        if not self.causal:
+            return 0
         return 0 if self.window_left < 0 else max(0, self.p - self.window_left)
 
     def visible(self, k: int) -> bool:
@@ -590,22 +615,36 @@ FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
 
 
-def spec_fingerprint(D: int = 128, window_left: int = -1, kv_fmt: str = "bf16") -> str:
-    """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose prefix
-    spans one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
-    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``. The window is a per-call
-    input of the class (like the KV position), not a class dimension: the public receipt (``flashinfer.batch_invariant.fingerprint``)
-    is the digest of the no-window sample row; ``window_left`` here only selects another sample row. ``kv_fmt`` names the KV
-    cache format: the fp8-KV classes (``attn-e4m3kv-d<D>-...`` / ``attn-e5m2kv-d<D>-...``) hash their widened leaves and
-    scaled epilogue, the token-head-scale classes (``attn-e4m3kv_th-d<D>-...`` / ``attn-e5m2kv_th-d<D>-...``) their scaled
-    scores and scaled PV operands; the bf16 class's digest is the one recorded before they existed."""
+def spec_fingerprint(
+    D: int = 128, window_left: int = -1, causal: bool = True, kv_fmt: str = "bf16"
+) -> str:
+    """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose visible keys
+    span one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
+    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C`` and the mask mode. The window is a
+    per-call input of the causal class (like the KV position), not a class dimension: the public receipt
+    (``flashinfer.batch_invariant.fingerprint``) is the digest of the no-window sample row; ``window_left`` here only selects
+    another sample row. The mask mode IS a class dimension: the non-causal class (``causal=False``, name ``attn-bf16-d<D>-nc-*``)
+    gives a token the visible set ``[0, kv_len)`` of its request where the causal class gives ``[0, p + 1)``, so the same token
+    has a different term under the two classes; the sample row's term is the same dataflow over the same visible keys in both
+    modes, and the mode enters the digest explicitly. ``kv_fmt`` names the KV cache format, the other class dimension: the fp8-KV
+    classes (``attn-e4m3kv-d<D>-...`` / ``attn-e5m2kv-d<D>-...``) hash their widened leaves and scaled epilogue, the
+    token-head-scale classes (``attn-e4m3kv_th-d<D>-...`` / ``attn-e5m2kv_th-d<D>-...``) their scaled scores and scaled PV
+    operands, each with its own non-causal digest (``attn-<kv>-d<D>-nc-...``); the bf16 class's digests are the ones recorded
+    before the low-bit classes existed."""
     assert kv_fmt in KV_FMTS, kv_fmt
-    key = (D, window_left, kv_fmt)
+    if not causal and window_left >= 0:
+        raise ValueError("window_left is not a parameter of the non-causal class")
+    key = (D, window_left, kv_fmt, bool(causal))
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
         spec = AttentionSpec(D, kv_fmt=kv_fmt)
-        row = RowSpec(p=spec.C + spec.T // 2, window_left=window_left)
+        L = spec.C + spec.T // 2 + 1
+        row = (
+            RowSpec(p=L - 1, window_left=window_left)
+            if causal
+            else RowSpec(p=0, causal=False, kv_len=L)
+        )
         parts = [
             f"D={D}",
             f"T={spec.T}",
@@ -618,8 +657,11 @@ def spec_fingerprint(D: int = 128, window_left: int = -1, kv_fmt: str = "bf16") 
             fingerprint(spec.output(row, 0)),
             fingerprint(spec.output(row, 1)),
         ]
+        if not causal:
+            parts.insert(3, "mask=noncausal")
         _FINGERPRINTS[key] = (
             f"attn-{kv_tag(kv_fmt)}-d{D}-"
+            + ("" if causal else "nc-")
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _FINGERPRINTS[key]

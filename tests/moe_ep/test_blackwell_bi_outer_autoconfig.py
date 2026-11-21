@@ -136,7 +136,7 @@ def _run(kind, rank, world, monkeypatch, directory, *, force_inner=False):
     if force_inner:
         from flashinfer.autotuner import AutoTuner
         from flashinfer.moe_ep.core.selection import NAMESPACE
-        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             tuning_protocol,
         )
 

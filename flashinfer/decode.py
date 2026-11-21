@@ -1327,6 +1327,14 @@ def single_decode_with_kv_cache(
         return out
 
 
+def _batch_invariant_decode_causal(
+    q_len_per_req: int, is_causal: Optional[bool]
+) -> bool:
+    """The mask mode of the batch-invariant decode class: a single token per request is the causal class whatever
+    ``is_causal`` says; multi-token decode is causal unless ``is_causal=False``."""
+    return True if q_len_per_req <= 1 or is_causal is None else bool(is_causal)
+
+
 class BatchDecodeWithPagedKVCacheWrapper:
     r"""Wrapper class for decode attention with a paged KV cache (first proposed in
     `vLLM <https://arxiv.org/abs/2309.06180>`_) for a batch of requests.
@@ -1507,27 +1515,29 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. The KV cache is bf16 (the class ``attention.bf16``), fp8 (``kv_data_type``
-            ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``,
-            with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
-            key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
-            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()``
-            plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf; the K block scales are
-            linear and the V block scales are linear unless ``plan(v_sf_swizzled=True)`` states TRT-LLM's 4-token interleaved
-            layout -- the layout is not detectable, so a cache written for ``trtllm-gen`` must be planned with it). An fp8 cache planned with ``use_token_head_sf=True`` runs the classes
-            ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``: ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32`` scale per
-            (token, KV head) (the cache's shape minus the head dim; any strides); the fp8 values are widened exactly and each
-            scale enters once per key: key ``j``'s score is multiplied by ``k_sf_j`` before the softmax and its softmax weight
+            requires ``backend="auto"``. The mask mode is a class dimension: multi-token decode (``q_len_per_req > 1``) runs the
+            causal class (bottom-right aligned, optional ``window_left``) or, with ``is_causal=False``, the non-causal class (every
+            token sees its request's whole key range; no window); a single token per request is the causal class either way. Both
+            mask modes are available for every KV cache format below (the non-causal class of a format has its own fingerprint). The
+            KV cache is bf16 (the class ``attention.bf16``), fp8 (``kv_data_type`` ``torch.float8_e4m3fn`` / ``torch.float8_e5m2``
+            at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``, with the per-tensor ``k_scale`` / ``v_scale`` of
+            ``run()`` as the only scales; the fp8 values are widened exactly, the key scale enters the softmax constant and the
+            value scale multiplies once before the output rounding) or packed NVFP4 (``kv_data_type=torch.uint8``: the class
+            ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()`` plus the same per-tensor scales; each value
+            times its block scale is an exact bf16 leaf; the K block scales are linear and the V block scales are linear unless
+            ``plan(v_sf_swizzled=True)`` states TRT-LLM's 4-token interleaved layout -- the layout is not detectable, so a cache
+            written for ``trtllm-gen`` must be planned with it). An fp8 cache planned with ``use_token_head_sf=True`` runs the
+            classes ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``: ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32``
+            scale per (token, KV head) (the cache's shape minus the head dim; any strides); the fp8 values are widened exactly and
+            each scale enters once per key: key ``j``'s score is multiplied by ``k_sf_j`` before the softmax and its softmax weight
             by ``v_sf_j`` before the bf16 rounding that forms the P operand of the PV product (the normaliser sums the unscaled
-            weights). Inputs
-            outside the classes (q / o dtypes other than bf16, non-unit scales of an
-            unscaled operand, head dims other than 64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE
-            output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales:
-            ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is
-            accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any
-            other value raises. A scale is a number or a one-element floating-point tensor; a device
-            tensor is read back once per tensor version (not per call) and must have been passed to a call before a CUDA-graph
-            capture of ``run()``. CUDA graphs: capture
+            weights). Inputs outside the classes (q / o dtypes other than bf16, non-unit scales of an unscaled operand, head dims
+            other than 64 / 128 / 256, a window with ``is_causal=False``, logits soft cap, custom masks, RoPE, LSE output) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales: ``q_scale`` (and
+            the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is accepted, as are
+            ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any other value
+            raises. A scale is a number or a one-element floating-point tensor; a device tensor is read back once per tensor version
+            (not per call) and must have been passed to a call before a CUDA-graph capture of ``run()``. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -1835,6 +1845,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
+        is_causal: Optional[bool] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -1847,6 +1858,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         This query is not available for ``cute-dsl``, ``trtllm-gen``, ``cudnn``,
         or ``cutile`` backends and raises ``NotImplementedError`` for them.
+
+        Under ``batch_invariant=True`` the size is that of the split-KV plan of
+        the mask mode :meth:`plan` will run, so pass the same ``q_len_per_req``,
+        ``is_causal`` and ``window_left`` as to :meth:`plan`: the two classes
+        plan different units for the same batch, and an input :meth:`plan`
+        refuses raises the same
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` here.
 
         Parameters
         ----------
@@ -1903,6 +1921,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             when this is ``True``.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
+        is_causal : Optional[bool]
+            Whether the mask is causal within each request block, as in :meth:`plan`.
+            Defaults to ``None``, which derives it from ``q_len_per_req > 1``. Values
+            that differ from that default are not supported by this wrapper, except
+            under ``batch_invariant=True``, where ``is_causal=False`` with
+            ``q_len_per_req > 1`` sizes the non-causal batch-invariant class and a
+            single token per request is the causal class either way.
 
         Returns
         -------
@@ -1929,7 +1954,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 page_size,
                 window_left,
                 q_len_per_req,
+                causal=_batch_invariant_decode_causal(q_len_per_req, is_causal),
             ), 0
+        if is_causal is not None and is_causal != (q_len_per_req > 1):
+            raise NotImplementedError(
+                f"backend={self._backend!r} derives the decode mask from "
+                "q_len_per_req; an explicit is_causal override is not supported"
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2264,7 +2295,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         is_causal : Optional[bool]
             Whether the mask is causal within each request block. Defaults to ``None``,
             which derives it from ``q_len_per_req > 1``. Values that differ from
-            that default are not supported by this wrapper.
+            that default are not supported by this wrapper, except under
+            ``batch_invariant=True``, where ``is_causal=False`` with ``q_len_per_req > 1``
+            runs the non-causal batch-invariant class (every token sees its request's
+            whole key range) and a single token per request is the causal class either way.
         use_token_head_sf : bool
             Whether the FP8 KV cache uses the per-(token, head) scale layout: a separate
             ``float32`` scale tensor (passed via ``kv_cache_sf`` in :meth:`run`) dequantizes
@@ -2380,14 +2414,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._batch_invariant.refuse(
                 window_right=window_right, seq_lens=seq_lens, block_tables=block_tables
             )
-            if is_causal is not None and is_causal != (q_len_per_req > 1):
-                from .batch_invariant.support import unsupported
-
-                raise unsupported(
-                    self._batch_invariant.CLASS,
-                    f"is_causal={is_causal} with q_len_per_req={q_len_per_req}",
-                    "the bottom-right causal mask (is_causal follows q_len_per_req > 1)",
-                )
+            causal = _batch_invariant_decode_causal(q_len_per_req, is_causal)
             self._batch_invariant.plan(
                 qo_indptr=None,
                 kv_indptr=indptr,
@@ -2398,7 +2425,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim_qk=head_dim,
                 head_dim_vo=None,
                 page_size=page_size,
-                causal=True,
+                causal=causal,
                 window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
                 pos_encoding_mode=pos_encoding_mode,

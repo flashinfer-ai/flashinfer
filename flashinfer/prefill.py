@@ -49,6 +49,7 @@ from .cudnn.prefill import (
     _cudnn_supports_paged_token_offsets,
     _cudnn_supports_paged_auto,
     _cudnn_supports_paged_gqa_auto,
+    _cudnn_supports_paged_full_prefill_auto,
     CudnnPrefillGraph,
     _PrefillMetadata,
     _CudnnPrefillPlan,
@@ -2645,7 +2646,8 @@ def _blackwell_paged_gqa_auto_cudnn(
     """Measured D256 prefix domain using already available CPU lengths."""
     if not (
         layout == "HND"
-        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and q_dtype == kv_dtype == o_dtype
+        and q_dtype in (torch.bfloat16, torch.float16)
         and head_dim_qk == head_dim_vo
         and head_dim_qk == 256
         and 1 <= batch <= 4
@@ -2687,8 +2689,74 @@ def _blackwell_paged_gqa_auto_cudnn(
     work_floor = 16 * 1024 * 1024
     return (
         hq * sum(q * kv for q, kv in zip(queries, lengths, strict=True)) >= work_floor
-        and get_compute_capability(device) == (10, 0)
+        and get_compute_capability(device) in ((10, 0), (10, 3))
         and _cudnn_supports_paged_gqa_auto(head_dim_qk)
+    )
+
+
+def _blackwell_paged_full_prefill_auto_cudnn(
+    device,
+    layout,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+    head_dim_qk,
+    head_dim_vo,
+    batch,
+    hq,
+    hk,
+    max_q,
+    max_kv,
+    page_size,
+    total_q,
+    qo_indptr_host,
+    kv_lens,
+    seq_lens_q=None,
+):
+    """Additional full-prefill domains proven from existing CPU metadata."""
+    if not (
+        layout == "HND"
+        and q_dtype == kv_dtype == o_dtype
+        and q_dtype in (torch.bfloat16, torch.float16)
+        and head_dim_qk == head_dim_vo
+        and 8 <= hq <= 64
+        and hk > 0
+        and hq % hk == 0
+        and (
+            (
+                head_dim_qk == 256
+                and (
+                    (hq == hk and 1 <= batch <= 8)
+                    or (hq // hk in (2, 4, 8, 16) and 1 <= batch <= 16)
+                )
+            )
+            or (head_dim_qk == 128 and hq // hk in (4, 8) and 1 <= batch <= 32)
+        )
+        and page_size in (16, 64)
+        and 512 <= max_q == max_kv <= 16384
+        and seq_lens_q is None
+        and qo_indptr_host.device.type == "cpu"
+        and kv_lens is not None
+        and kv_lens.device.type == "cpu"
+    ):
+        return False
+    bounds = qo_indptr_host.tolist()
+    queries = [end - start for start, end in zip(bounds, bounds[1:], strict=False)]
+    lengths = kv_lens.flatten().tolist()
+    if not (
+        len(queries) == len(lengths) == batch
+        and bounds[0] == 0
+        and bounds[-1] == total_q
+        and max(queries) == max_q
+        and all(q == kv and q > 0 for q, kv in zip(queries, lengths, strict=True))
+    ):
+        return False
+    # Keep the completed-eager work floor, including for small full prefills.
+    return (
+        hq * sum(q * kv for q, kv in zip(queries, lengths, strict=True))
+        >= 16 * 1024 * 1024
+        and get_compute_capability(device) in ((10, 0), (10, 3))
+        and _cudnn_supports_paged_full_prefill_auto(head_dim_qk)
     )
 
 
@@ -2712,6 +2780,26 @@ def _blackwell_paged_auto_cudnn(
     seq_lens_q=None,
 ):
     """Measured paged domains; use actual paired work when already on CPU."""
+    if max_q == max_kv and _blackwell_paged_full_prefill_auto_cudnn(
+        device,
+        layout,
+        q_dtype,
+        kv_dtype,
+        o_dtype,
+        head_dim_qk,
+        head_dim_vo,
+        batch,
+        hq,
+        hk,
+        max_q,
+        max_kv,
+        page_size,
+        total_q,
+        qo_indptr_host,
+        kv_lens,
+        seq_lens_q,
+    ):
+        return True
     if head_dim_qk == 256:
         return _blackwell_paged_gqa_auto_cudnn(
             device,
@@ -2745,7 +2833,8 @@ def _blackwell_paged_auto_cudnn(
         return False
     if not (
         layout == "HND"
-        and q_dtype == kv_dtype == o_dtype == torch.bfloat16
+        and q_dtype == kv_dtype == o_dtype
+        and q_dtype in (torch.bfloat16, torch.float16)
         and head_dim_qk == head_dim_vo == 128
         and batch > 0
         and 8 <= hq <= 64
@@ -3247,27 +3336,31 @@ class BatchPrefillWithPagedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. The KV cache is bf16 (the class ``attention.bf16``), fp8 (``kv_data_type``
-            ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``,
-            with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
-            key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
-            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()``
-            plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf; the K block scales are
-            linear and the V block scales are linear unless ``plan(v_sf_swizzled=True)`` states TRT-LLM's 4-token interleaved
-            layout -- the layout is not detectable, so a cache written for ``trtllm-gen`` must be planned with it). An fp8 cache planned with ``use_token_head_sf=True`` runs the classes
-            ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``: ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32`` scale per
-            (token, KV head) (the cache's shape minus the head dim; any strides); the fp8 values are widened exactly and each
-            scale enters once per key: key ``j``'s score is multiplied by ``k_sf_j`` before the softmax and its softmax weight
-            by ``v_sf_j`` before the bf16 rounding that forms the P operand of the PV product (the normaliser sums the unscaled
-            weights). Inputs
-            outside the classes (q / o dtypes other than bf16, non-unit scales of an
-            unscaled operand, head dims other than 64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE
-            output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales:
-            ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is
-            accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any
-            other value raises. A scale is a number or a one-element floating-point tensor; a device
-            tensor is read back once per tensor version (not per call) and must have been passed to a call before a CUDA-graph
-            capture of ``run()``. CUDA graphs: capture
+            requires ``backend="auto"``. The mask mode is a class dimension: ``causal=True`` runs the causal class (bottom-right
+            aligned, optional ``window_left``), ``causal=False`` the non-causal class (every token sees its request's whole key
+            range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal class, and
+            ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint`` takes the same
+            ``causal`` for these wrappers and has no default). Both mask modes are available for every KV cache format below (the
+            non-causal class of a format has its own fingerprint). The KV cache is bf16 (the class ``attention.bf16``), fp8
+            (``kv_data_type`` ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` /
+            ``attention.e5m2kv``, with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are
+            widened exactly, the key scale enters the softmax constant and the value scale multiplies once before the output
+            rounding) or packed NVFP4 (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block
+            scales of ``run()`` plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf; the K block
+            scales are linear and the V block scales are linear unless ``plan(v_sf_swizzled=True)`` states TRT-LLM's 4-token
+            interleaved layout -- the layout is not detectable, so a cache written for ``trtllm-gen`` must be planned with it). An
+            fp8 cache planned with ``use_token_head_sf=True`` runs the classes ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``:
+            ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32`` scale per (token, KV head) (the cache's shape minus the head
+            dim; any strides); the fp8 values are widened exactly and each scale enters once per key: key ``j``'s score is
+            multiplied by ``k_sf_j`` before the softmax and its softmax weight by ``v_sf_j`` before the bf16 rounding that forms the
+            P operand of the PV product (the normaliser sums the unscaled weights). Inputs outside the classes (q / o dtypes other
+            than bf16, non-unit scales of an unscaled operand, head dims other than 64 / 128 / 256, a window with ``causal=False``,
+            logits soft cap, custom masks, RoPE, LSE output) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales: ``q_scale`` (and
+            the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is accepted, as are
+            ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any other value
+            raises. A scale is a number or a one-element floating-point tensor; a device tensor is read back once per tensor version
+            (not per call) and must have been passed to a call before a CUDA-graph capture of ``run()``. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -3599,6 +3692,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
 
+        Under ``batch_invariant=True`` the size is that of the split-KV plan of
+        the mask mode :meth:`plan` will run, so pass the same ``causal`` and
+        ``window_left`` as to :meth:`plan`: ``causal`` defaults to ``False``
+        here as it does there (the non-causal class, which takes no window), a
+        causal plan is sized with ``causal=True``, and an input :meth:`plan`
+        refuses raises the same
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` here.
+
         Parameters
         ----------
         qo_indptr : torch.Tensor
@@ -3703,6 +3804,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_qk,
                 page_size,
                 window_left,
+                causal=causal,
             ), 0
         if self._backend == "cute-dsl-prims":
             qo_indptr_host = qo_indptr.to("cpu")
@@ -6047,27 +6149,31 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. The KV cache is bf16 (the class ``attention.bf16``), fp8 (``kv_data_type``
-            ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` / ``attention.e5m2kv``,
-            with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are widened exactly, the
-            key scale enters the softmax constant and the value scale multiplies once before the output rounding) or packed NVFP4
-            (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block scales of ``run()``
-            plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf; the K and V block scales
-            of the ragged pool are linear -- TRT-LLM's 4-token interleaved V layout is a layout of the pages of a paged
-            cache, stated on the paged wrappers with ``plan(v_sf_swizzled=True)``). An fp8 cache planned with ``use_token_head_sf=True`` runs the classes
-            ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``: ``run(kv_cache_sf=(k_sf, v_sf))`` brings one ``float32`` scale per
-            (token, KV head) (the cache's shape minus the head dim; any strides); the fp8 values are widened exactly and each
-            scale enters once per key: key ``j``'s score is multiplied by ``k_sf_j`` before the softmax and its softmax weight
-            by ``v_sf_j`` before the bf16 rounding that forms the P operand of the PV product (the normaliser sums the unscaled
-            weights). Inputs
-            outside the classes (q / o dtypes other than bf16, non-unit scales of an
-            unscaled operand, head dims other than 64 / 128 / 256, non-causal prefill, logits soft cap, custom masks, RoPE, LSE
-            output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit scales:
-            ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class and is
-            accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf`` plan; any
-            other value raises. A scale is a number or a one-element floating-point tensor; a device
-            tensor is read back once per tensor version (not per call) and must have been passed to a call before a CUDA-graph
-            capture of ``run()``. CUDA graphs: capture
+            requires ``backend="auto"``. The mask mode is a class dimension: ``causal=True`` runs the causal class (bottom-right
+            aligned, optional ``window_left``), ``causal=False`` the non-causal class (every token sees its request's whole key
+            range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal class, and
+            ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint`` takes the same
+            ``causal`` for these wrappers and has no default). Both mask modes are available for every KV cache format below (the
+            non-causal class of a format has its own fingerprint). The KV cache is bf16 (the class ``attention.bf16``), fp8
+            (``kv_data_type`` ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` at ``plan()``: the classes ``attention.e4m3kv`` /
+            ``attention.e5m2kv``, with the per-tensor ``k_scale`` / ``v_scale`` of ``run()`` as the only scales; the fp8 values are
+            widened exactly, the key scale enters the softmax constant and the value scale multiplies once before the output
+            rounding) or packed NVFP4 (``kv_data_type=torch.uint8``: the class ``attention.nvfp4kv``, the ``kv_cache_sf`` e4m3 block
+            scales of ``run()`` plus the same per-tensor scales; each value times its block scale is an exact bf16 leaf; the K and V
+            block scales of the ragged pool are linear -- TRT-LLM's 4-token interleaved V layout is a layout of the pages of a paged
+            cache, stated on the paged wrappers with ``plan(v_sf_swizzled=True)``). An fp8 cache planned with
+            ``use_token_head_sf=True`` runs the classes ``attention.e4m3kv_th`` / ``attention.e5m2kv_th``: ``run(kv_cache_sf=(k_sf,
+            v_sf))`` brings one ``float32`` scale per (token, KV head) (the cache's shape minus the head dim; any strides); the fp8
+            values are widened exactly and each scale enters once per key: key ``j``'s score is multiplied by ``k_sf_j`` before the
+            softmax and its softmax weight by ``v_sf_j`` before the bf16 rounding that forms the P operand of the PV product (the
+            normaliser sums the unscaled weights). Inputs outside the classes (q / o dtypes other than bf16, non-unit scales of an
+            unscaled operand, head dims other than 64 / 128 / 256, a window with ``causal=False``, logits soft cap, custom masks,
+            RoPE, LSE output) raise :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. Unit
+            scales: ``q_scale`` (and the output scale) of ``None`` or exactly ``1.0`` is the unscaled bf16 operand of every class
+            and is accepted, as are ``k_scale`` / ``v_scale`` of ``None`` or ``1.0`` with a bf16 KV cache or a ``use_token_head_sf``
+            plan; any other value raises. A scale is a number or a one-element floating-point tensor; a device tensor is read back
+            once per tensor version (not per call) and must have been passed to a call before a CUDA-graph capture of ``run()``.
+            CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).

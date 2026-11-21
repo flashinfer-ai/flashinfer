@@ -114,6 +114,8 @@ class AttentionKernel:
         cap: int = 0,
         kv_fmt: str = "bf16",
         v_sf_swizzled: bool = False,
+        *,
+        causal: bool = True,
     ):
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
@@ -128,6 +130,7 @@ class AttentionKernel:
         self.cap = cap
         self.kv_fmt = kv_fmt
         self.v_sf_swizzled = v_sf_swizzled
+        self.causal = causal  # the mask mode (a class dimension; compile-time)
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
@@ -173,6 +176,7 @@ class AttentionKernel:
             self.cap,
             self.kv_fmt,
             self.v_sf_swizzled,
+            causal=self.causal,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)

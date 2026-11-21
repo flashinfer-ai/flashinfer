@@ -24,13 +24,15 @@ from .support import (
 
 class ClassInfo(NamedTuple):
     """A consistency class behind a FlashInfer API: its name, the fixed dimensions its fingerprint takes, the
-    function computing the fingerprint from them, and the optional dimensions (flags of the specification with a
-    default, such as a bias) the function also accepts."""
+    function computing the fingerprint from them, the optional dimensions (flags of the specification with a
+    default, such as a bias) the function also accepts, and a note the missing-dimension error carries (what the
+    fixed dimensions select, where a caller could expect a default)."""
 
     name: str
     dims: tuple
     fingerprint: Callable[..., str]
     optional: tuple = ()
+    note: str = ""
 
 
 def _mm_bf16_fingerprint(N: int, K: int, bias: bool = False) -> str:
@@ -119,9 +121,12 @@ def _attention_kv_fmt(kv_dtype: Union[torch.dtype, str, None]) -> str:
 
 def _attention_fingerprint(
     head_dim: int,
+    causal: Optional[bool] = None,
     kv_dtype: Union[torch.dtype, str, None] = None,
     use_token_head_sf: bool = False,
 ) -> str:
+    """The attention class at ``head_dim`` under a mask mode and a KV cache format; ``causal=None`` is the causal class (the
+    decode wrapper's ``is_causal=None``), never a truth value."""
     from ..attention.batch_invariant.spec import TH_KV_FMTS, spec_fingerprint
 
     kv_fmt = _attention_kv_fmt(kv_dtype)
@@ -134,7 +139,17 @@ def _attention_fingerprint(
                 f"torch.float8_e5m2 (the per-(token, head)-scale classes are fp8 classes), not {kv_dtype!r}"
             )
         kv_fmt += "th"
-    return spec_fingerprint(head_dim, kv_fmt=kv_fmt)
+    return spec_fingerprint(
+        head_dim, causal=True if causal is None else bool(causal), kv_fmt=kv_fmt
+    )
+
+
+#: The prefill wrappers' ``plan()`` defaults to ``causal=False``, which runs the non-causal class: their receipt has no
+#: default mode.
+_PREFILL_CAUSAL_NOTE = (
+    "`causal` selects one of the two attention classes -- causal=True the causal class, causal=False the non-causal "
+    "class -- and the wrapper's plan() defaults to causal=False"
+)
 
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
@@ -650,8 +665,11 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_mxfp4w8a_fingerprint,
         ("arch",),
     ),
-    # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class; the KV cache dtype is an optional
+    # the three attention wrappers compute one class per head dim and mask mode: under the causal class a token's output depends
+    # on its KV position, its head and the window alone, under the non-causal class (`causal=False`) on its request's key count
+    # and its head alone; prefill and decode (and the paged and ragged KV layouts) are one class per mode. The mode is a fixed
+    # dimension of the prefill wrappers' receipt (their plan() defaults to the non-causal class) and optional for the decode
+    # wrapper, whose default (a single token per request, or `is_causal=None`) is the causal class. The KV cache dtype is an optional
     # dimension: bf16 (the default) names the bf16 class, torch.float8_e4m3fn / torch.float8_e5m2 the fp8-KV classes
     # (attention.e4m3kv / attention.e5m2kv: exactly widened fp8 leaves, the key scale inside the log2 constant, one mul by the
     # value scale before the conversion) and torch.uint8 the NVFP4-KV class (attention.nvfp4kv: e2m1 values times their e4m3
@@ -659,23 +677,26 @@ CLASSES: Dict[str, ClassInfo] = {
     # per-(token, head)-scale classes (attention.e4m3kv_th / attention.e5m2kv_th: exactly widened fp8 leaves, each key's score
     # multiplied by its key scale before the softmax step and each key's probability by its value scale before the bf16
     # rounding of the PV operand, under the bf16 class's constant and epilogue)
+    # -- each format under either mask mode
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
         "attention.bf16",
         ("head_dim",),
         _attention_fingerprint,
-        ("kv_dtype", "use_token_head_sf"),
+        ("causal", "kv_dtype", "use_token_head_sf"),
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
         "attention.bf16",
-        ("head_dim",),
+        ("head_dim", "causal"),
         _attention_fingerprint,
         ("kv_dtype", "use_token_head_sf"),
+        note=_PREFILL_CAUSAL_NOTE,
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16",
-        ("head_dim",),
+        ("head_dim", "causal"),
         _attention_fingerprint,
         ("kv_dtype", "use_token_head_sf"),
+        note=_PREFILL_CAUSAL_NOTE,
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
@@ -773,27 +794,43 @@ def fingerprint(op: str, **dims) -> str:
     step kernel that computes its rows from the open chunk's cached rows; the head count, the batch, the slot and the position are
     not dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
 
-    The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
-    functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
-    do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
-    ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
-    sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too. The optional ``kv_dtype`` names the KV cache format:
-    ``torch.bfloat16`` (the default) is the bf16 class, ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` the fp8-KV classes
-    (``attn-e4m3kv-d...`` / ``attn-e5m2kv-d...``: the fp8 keys and values widened to bf16 exactly at every leaf, the per-tensor
-    ``k_scale`` inside the one binary32 constant ``c = fp32(sm_scale * k_scale * log2 e)``, and one ``mul.rn`` by ``v_scale``
-    before the single rounding) and ``torch.uint8`` the NVFP4-KV class (``attn-nvfp4kv-d...``: the e2m1 values times their e4m3
-    block scales as exact bf16 leaves, the same chain); the scales' values, like the cache, are inputs. The optional
-    ``use_token_head_sf=True`` with an fp8 ``kv_dtype`` names the per-(token, head)-scale classes (``attn-e4m3kv_th-d...`` /
-    ``attn-e5m2kv_th-d...``, the wrappers' ``plan(use_token_head_sf=True)``): the K and V leaves are the fp8 values widened
-    exactly, the score of key ``j`` is ``mul.rn(s_j, k_sf[j, kv_head])`` before the tile step, and the PV operand of key ``j`` is
-    ``cvt.rn.bf16(mul.rn(p_j, v_sf[j, kv_head]))`` while the row sum adds the unscaled ``p_j``; ``c`` and the epilogue are the
-    bf16 class's. The scale tensors' values, like the cache, are inputs.
+    The attention wrappers take ``head_dim`` and the mask mode ``causal``: the tile and chunk grid, the online-softmax step
+    and the chunk merge are functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout
+    and the configuration do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``,
+    ``BatchDecodeWithPagedKVCacheWrapper`` and ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint of a mode
+    (their outputs for one token are the same bits). ``causal=True`` names the causal class, ``causal=False`` the non-causal
+    class (prefill with ``causal=False``, decode with ``q_len_per_req > 1`` and ``is_causal=False``): every token sees its
+    request's whole key range, so the same token has a different term and a different fingerprint
+    (``attn-bf16-d<D>-nc-*``). For the two prefill wrappers ``causal`` is a fixed dimension, to be given as the value passed
+    to ``plan()``: their ``plan()`` defaults to ``causal=False``, the non-causal class, so a receipt without the mode would
+    name a class the default plan does not run, and an omitted or ``None`` ``causal`` raises. For the decode wrapper it is
+    optional: omitted or ``None`` is the causal class, as ``is_causal=None`` is in its ``plan()``, and a single-token decode
+    step is the causal class whatever ``is_causal`` says. The sliding window (``window_left``) is a per-call input of the
+    causal class, like the KV position: the receipt is the digest of the class's no-window sample row and covers windowed
+    calls too.
+    The optional ``kv_dtype`` names the KV cache format: ``torch.bfloat16`` (the default) is the bf16 class,
+    ``torch.float8_e4m3fn`` / ``torch.float8_e5m2`` the fp8-KV classes (``attn-e4m3kv-d...`` / ``attn-e5m2kv-d...``: the fp8
+    keys and values widened to bf16 exactly at every leaf, the per-tensor ``k_scale`` inside the one binary32 constant ``c =
+    fp32(sm_scale * k_scale * log2 e)``, and one ``mul.rn`` by ``v_scale`` before the single rounding) and ``torch.uint8``
+    the NVFP4-KV class (``attn-nvfp4kv-d...``: the e2m1 values times their e4m3 block scales as exact bf16 leaves, the same
+    chain); the scales' values, like the cache, are inputs. The optional ``use_token_head_sf=True`` with an fp8 ``kv_dtype``
+    names the per-(token, head)-scale classes (``attn-e4m3kv_th-d...`` / ``attn-e5m2kv_th-d...``, the wrappers'
+    ``plan(use_token_head_sf=True)``): the K and V leaves are the fp8 values widened exactly, the score of key ``j`` is
+    ``mul.rn(s_j, k_sf[j, kv_head])`` before the tile step, and the PV operand of key ``j`` is ``cvt.rn.bf16(mul.rn(p_j,
+    v_sf[j, kv_head]))`` while the row sum adds the unscaled ``p_j``; ``c`` and the epilogue are the bf16 class's. The scale
+    tensors' values, like the cache, are inputs. Every KV cache format has both mask modes: ``causal=False`` with a
+    ``kv_dtype`` names that format's non-causal class (``attn-e4m3kv-d<D>-nc-*`` and so on).
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
     'gemm-bf16-kfold-bias-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, causal=True)  # doctest: +SKIP
+    'attn-bf16-d128-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, causal=False)  # doctest: +SKIP
+    'attn-bf16-d128-nc-...'
+    >>> fingerprint("BatchDecodeWithPagedKVCacheWrapper", head_dim=128)  # doctest: +SKIP
+    'attn-bf16-d128-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
     >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
@@ -828,9 +865,13 @@ def fingerprint(op: str, **dims) -> str:
         raise TypeError(
             f"fingerprint({op!r}) takes the fixed dimensions {list(info.dims)} and the optional {list(info.optional)}, not {unknown}"
         )
-    missing = [d for d in info.dims if d not in dims]
+    # a fixed dimension has no default: one passed as None is as missing as one left out
+    missing = [d for d in info.dims if dims.get(d) is None]
     if missing:
-        raise TypeError(f"fingerprint({op!r}) needs the fixed dimensions {missing}")
+        raise TypeError(
+            f"fingerprint({op!r}) needs the fixed dimensions {missing}"
+            + (f": {info.note}" if info.note else "")
+        )
     return info.fingerprint(**dims)
 
 

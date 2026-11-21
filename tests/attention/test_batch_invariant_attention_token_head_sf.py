@@ -530,34 +530,46 @@ def test_fingerprints(op):
     per-tensor fp8 and NVFP4 digests are the recorded ones."""
     for (fmt, D), want in RECORDED.items():
         assert spec.spec_fingerprint(D, kv_fmt=fmt) == want
-        assert bi.fingerprint(op, head_dim=D, kv_dtype=fmt) == want
+        assert bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=fmt) == want
         assert (
-            bi.fingerprint(op, head_dim=D, kv_dtype=fmt, use_token_head_sf=False)
+            bi.fingerprint(
+                op, head_dim=D, causal=True, kv_dtype=fmt, use_token_head_sf=False
+            )
             == want
         )
     for D in (64, 128, 256):
-        assert bi.fingerprint(op, head_dim=D) == RECORDED[("bf16", D)]
-        assert bi.fingerprint(op, head_dim=D, kv_dtype=E4) == RECORDED[("e4m3", D)]
-        assert bi.fingerprint(op, head_dim=D, kv_dtype=E5) == RECORDED[("e5m2", D)]
+        assert bi.fingerprint(op, head_dim=D, causal=True) == RECORDED[("bf16", D)]
         assert (
-            bi.fingerprint(op, head_dim=D, kv_dtype=torch.uint8)
+            bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=E4)
+            == RECORDED[("e4m3", D)]
+        )
+        assert (
+            bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=E5)
+            == RECORDED[("e5m2", D)]
+        )
+        assert (
+            bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=torch.uint8)
             == RECORDED[("nvfp4", D)]
         )
         for dtype in (E4, E5):
             fmt = FMT_OF[dtype]
-            th = bi.fingerprint(op, head_dim=D, kv_dtype=dtype, use_token_head_sf=True)
+            th = bi.fingerprint(
+                op, head_dim=D, causal=True, kv_dtype=dtype, use_token_head_sf=True
+            )
             assert th == TOKEN_HEAD[(fmt, D)] == spec.spec_fingerprint(D, kv_fmt=fmt)
-            assert th == bi.fingerprint(op, head_dim=D, kv_dtype=fmt)
+            assert th == bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=fmt)
             assert th == bi.fingerprint(
-                op, head_dim=D, kv_dtype=fmt[:4], use_token_head_sf=True
+                op, head_dim=D, causal=True, kv_dtype=fmt[:4], use_token_head_sf=True
             )
             assert th.startswith(f"attn-{fmt[:4]}kv_th-d{D}-")
     assert len(set(RECORDED.values()) | set(TOKEN_HEAD.values())) == 18
     for bad in (None, BF16, torch.uint8, "nvfp4", torch.float16):
         with pytest.raises(ValueError):
-            bi.fingerprint(op, head_dim=128, kv_dtype=bad, use_token_head_sf=True)
+            bi.fingerprint(
+                op, head_dim=128, causal=True, kv_dtype=bad, use_token_head_sf=True
+            )
     with pytest.raises(TypeError):
-        bi.fingerprint(op, head_dim=128, kv_dtype=E4, token_head=True)
+        bi.fingerprint(op, head_dim=128, causal=True, kv_dtype=E4, token_head=True)
     assert bi.class_name(op) == "attention.bf16"
     assert spec.class_name("e4m3th") == "attention.e4m3kv_th"
     assert spec.class_name("e5m2th") == "attention.e5m2kv_th"

@@ -198,30 +198,36 @@ def reference(lp: LowbitProblem, window_left=-1):
 def test_fingerprints_per_head_dim_and_kv_format(op):
     """One fingerprint per (head dim, KV format); the bf16 class's digests are the recorded ones and do not see the new dimension."""
     for D in (64, 128, 256):
-        bf16 = bi.fingerprint(op, head_dim=D)
+        bf16 = bi.fingerprint(op, head_dim=D, causal=True)
         assert (
             bf16
             == spec.FINGERPRINTS[D]
-            == bi.fingerprint(op, head_dim=D, kv_dtype=torch.bfloat16)
+            == bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=torch.bfloat16)
         )
-        e4 = bi.fingerprint(op, head_dim=D, kv_dtype=E4)
-        e5 = bi.fingerprint(op, head_dim=D, kv_dtype=E5)
+        e4 = bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=E4)
+        e5 = bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=E5)
         assert e4.startswith(f"attn-e4m3kv-d{D}-") and e5.startswith(
             f"attn-e5m2kv-d{D}-"
         )
         assert len({bf16, e4, e5}) == 3
         assert (
             e4
-            == bi.fingerprint(op, head_dim=D, kv_dtype="e4m3")
+            == bi.fingerprint(op, head_dim=D, causal=True, kv_dtype="e4m3")
             == bi.fingerprint(WRAPPERS[0], head_dim=D, kv_dtype=E4)
         )
     assert (
-        len({bi.fingerprint(op, head_dim=D, kv_dtype=E4) for D in (64, 128, 256)}) == 3
+        len(
+            {
+                bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=E4)
+                for D in (64, 128, 256)
+            }
+        )
+        == 3
     )
     with pytest.raises(ValueError):
-        bi.fingerprint(op, head_dim=128, kv_dtype=torch.float16)
+        bi.fingerprint(op, head_dim=128, causal=True, kv_dtype=torch.float16)
     with pytest.raises(ValueError):
-        bi.fingerprint(op, head_dim=128, kv_dtype=torch.int8)
+        bi.fingerprint(op, head_dim=128, causal=True, kv_dtype=torch.int8)
     assert bi.class_name(op) == "attention.bf16"
     assert (
         spec.class_name("e4m3") == "attention.e4m3kv"
@@ -1089,13 +1095,13 @@ def fp4_run_decode(fp, layout="NHD", window_left=-1, sf=None, **plan_kw):
 @pytest.mark.parametrize("op", WRAPPERS)
 def test_nvfp4_fingerprint(op):
     for D in (64, 128, 256):
-        f4 = bi.fingerprint(op, head_dim=D, kv_dtype=torch.uint8)
+        f4 = bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=torch.uint8)
         assert f4.startswith(f"attn-nvfp4kv-d{D}-") and f4 == bi.fingerprint(
-            op, head_dim=D, kv_dtype="nvfp4"
+            op, head_dim=D, causal=True, kv_dtype="nvfp4"
         )
         assert f4 != bi.fingerprint(
-            op, head_dim=D, kv_dtype=E4
-        ) and f4 != bi.fingerprint(op, head_dim=D)
+            op, head_dim=D, causal=True, kv_dtype=E4
+        ) and f4 != bi.fingerprint(op, head_dim=D, causal=True)
     assert spec.class_name("nvfp4") == "attention.nvfp4kv"
     from flashinfer.batch_invariant.fp_interface.term import sexpr
 
@@ -1496,7 +1502,10 @@ LOWBIT_FINGERPRINTS = {
 @pytest.mark.parametrize("op", WRAPPERS)
 def test_lowbit_fingerprints_are_the_recorded_ones(op):
     for (fmt, D), want in LOWBIT_FINGERPRINTS.items():
-        assert bi.fingerprint(op, head_dim=D, kv_dtype=fmt) == want, (fmt, D)
+        assert bi.fingerprint(op, head_dim=D, causal=True, kv_dtype=fmt) == want, (
+            fmt,
+            D,
+        )
 
 
 # ------------------------------------------------------------------------------------------------------ the V block-scale layout

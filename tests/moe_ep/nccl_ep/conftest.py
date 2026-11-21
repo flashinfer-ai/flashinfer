@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared fake ``nccl.ep`` fixtures for host-only NcclEpFleet/Handle tests.
 
 ``fake_nccl_ep`` injects a recording stand-in for the whole ``nccl`` package
@@ -8,6 +11,7 @@ be exercised without a GPU, RDMA fabric, or the nccl-extensions wheel.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import enum
 import sys
@@ -186,9 +190,54 @@ def fake_nccl_ep():
 
 
 @pytest.fixture
+def modern_ep(fake_nccl_ep):
+    fake_nccl_ep.get_lib_version = lambda: "0.3.0"
+    fake_nccl_ep.DispatchQuantizationRecipe = types.SimpleNamespace(FWD=1)
+    fake_nccl_ep.CombineQuantizationRecipe = types.SimpleNamespace(NVFP4=1)
+    return fake_nccl_ep
+
+
+@pytest.fixture
+def make_native_handle(modern_ep, bypass_build_checks):
+    import torch
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetAlgoKnobNcclEpConfig,
+        FleetParams,
+        HandleAlgoKnobTopKWeights,
+        HandleParams,
+    )
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    def make(*, algorithm="LOW_LATENCY", layout="RANK_MAJOR", **options):
+        fleet = NcclEpFleet(
+            BootstrapConfig(world_size=4, rank=0),
+            FleetParams(
+                num_experts=8,
+                max_tokens_per_rank=4,
+                token_hidden_size=2048,
+                algorithm=EpAlgorithm[algorithm],
+                layout=EpLayout[layout],
+            ),
+            [FleetAlgoKnobNcclEpConfig(**options)],
+        )
+        handle = fleet.create_handle(
+            HandleParams(topk_ids=torch.zeros(3, 2, dtype=torch.int64)),
+            [HandleAlgoKnobTopKWeights(torch.ones(3, 2))],
+        )
+        return fleet, handle
+
+    return make
+
+
+@pytest.fixture
 def bypass_build_checks():
     """Bypass build/arch checks and distributed comm resolution."""
     from flashinfer.moe_ep.backends.split.comm.nccl_ep import fleet as nccl_fleet
+    import torch
 
     with (
         mock.patch.object(nccl_fleet, "_require_built", return_value=None),
@@ -196,6 +245,18 @@ def bypass_build_checks():
         mock.patch.object(
             nccl_fleet, "validate_bootstrap_world_size", return_value=None
         ),
-        mock.patch.object(nccl_fleet, "_resolve_comm", return_value=object()),
+        mock.patch.object(
+            nccl_fleet,
+            "_resolve_comm",
+            return_value=types.SimpleNamespace(destroy=mock.Mock()),
+        ),
+        (
+            contextlib.nullcontext()
+            if torch.cuda.is_available()
+            else mock.patch(
+                "torch.cuda.is_current_stream_capturing", return_value=False
+            )
+        ),
+        mock.patch.object(nccl_fleet.NcclEpFleet, "_current_stream", return_value=0),
     ):
         yield

@@ -19,7 +19,7 @@ def test_sm90_push_backend_import_defers_kernel_package():
         import sys
         import typing
 
-        kernel_name = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
+        kernel_name = "flashinfer.moe_ep.shims.sm90.push_style_megamoe"
         backend_package = importlib.import_module(
             "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda"
         )
@@ -338,9 +338,7 @@ def test_sm90_push_destroy_uses_workspace_pool_refcount(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_sm90_push_destroy_quiesces_locally_before_releasing_views(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.protocol import (
-        Sm90PushPipe,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe.protocol import Sm90PushPipe
 
     calls = []
 
@@ -362,9 +360,7 @@ def test_sm90_push_destroy_quiesces_locally_before_releasing_views(monkeypatch):
 
 @pytest.mark.cpu_only
 def test_sm90_push_destroy_preserves_peer_views_after_local_sync_failure(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.protocol import (
-        Sm90PushPipe,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe.protocol import Sm90PushPipe
 
     pipe = object.__new__(Sm90PushPipe)
     pipe._destroyed = False

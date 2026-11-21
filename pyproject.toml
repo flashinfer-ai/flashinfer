@@ -72,7 +72,6 @@ exclude = [
   "flashinfer.experimental.b12x._compat*",
   "flashinfer.prims_ts.moe.tools*",
   "flashinfer.batch_invariant.lean*",
-  "flashinfer.moe_ep.kernel_src.sm100.kimi-k3-megamoe*",
 ]
 
 [tool.setuptools.package-dir]
@@ -132,19 +131,19 @@ exclude = [
 # Route catalog of the experimental SM100/SM103 dense and paged MQA-logits export, read at runtime
 # next to its module.
 "flashinfer.experimental.deepgemm_dense_mqa" = ["*.json"]
-"flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
-# The private loader imports this hyphenated source tree from package data.
-"flashinfer.moe_ep.kernel_src.sm100" = [
-  "kimi-k3-megamoe/**/*.py",
-  "kimi-k3-megamoe/*.py",
-  "kimi-k3-megamoe/*.md",
-  "kimi-k3-megamoe/*.json",
-  "kimi-k3-megamoe/LICENSE",
-  "kimi-k3-megamoe/NOTICE",
+"flashinfer" = [
+  "_build_meta.py",
+  "mla_kv_pack_fp8_workloads.json",
+  "top_p_renorm_probs_specialized_workloads.json",
 ]
-"flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
-"flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md", "export_manifest.json"]
-"flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe" = ["*.md"]
+# Provider export records and retained patch files accompany their sources.
+"flashinfer.moe_ep.kernels.cutedsl_megamoe" = ["*.md", "*.json", "patches/*.patch"]
+"flashinfer.moe_ep.shims.sm90.cutedsl_megamoe" = ["*.md"]
+"flashinfer.moe_ep.shims.sm100.cutedsl_megamoe" = ["*.md"]
+"flashinfer.moe_ep.shims.sm107.cutedsl_megamoe" = ["*.md"]
+"flashinfer.moe_ep.kernels.flashinfer.sm120_split" = ["*.md"]
+"flashinfer.moe_ep.kernels.flashinfer.sm120_swapab" = ["*.md"]
+"flashinfer.moe_ep.kernels.kimi_k3" = ["*.md", "*.json", "LICENSE", "NOTICE"]
 "flashinfer.prims_ts.moe" = [
   "prims_ts_moe_configs.json",
   "prims_ts_moe_configs_sm107.json",
@@ -195,29 +194,14 @@ exclude = [
 "flashinfer.experimental.mhc_pre_big_fuse_with_norm" = ["csrc/**"]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
 # runtime; registered so non-editable installs ship them (PR #4069).
-"flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [
-  "*.md",
-  "src/a2a/*.cu",
-  "src/a2a/*.cuh",
-  "src/fp8_gemm/*.cu",
-  "src/fp8_gemm/*.cuh",
+"flashinfer.moe_ep.kernels.flashinfer.push_style_megamoe" = [
+  "*.md", "a2a/*.cu", "a2a/*.cuh", "fp8_gemm/*.cu", "fp8_gemm/*.cuh",
 ]
-# Generated SM90 BF16 Cake MegaMoE sources and manifest, compiled on demand.
-"flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe" = [
-  "src/*.cu",
-  "src/*.json",
-]
-# Generated SM120 MXFP4 x MXFP8 Cake MegaMoE closure (sealed by its manifest) and
-# the hand-written binding / cubin carrier, compiled on demand.
-"flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe" = [
-  "*.md",
-  "src/*.cu",
-  "src/*.cuh",
-  "src/*.json",
-]
+"flashinfer.moe_ep.kernels.cake.bf16_megamoe_sm90" = ["*.cu", "*.json"]
+"flashinfer.moe_ep.kernels.cake.mxfp4_megamoe_sm120" = ["*.md", "*.cu", "*.cuh", "*.json"]
 # Generated SM100 BF16 rank-major mega-MoE CUDA bundle. The runtime validates
 # the manifest checksum before compiling the source on demand.
-"flashinfer.moe_ep.kernel_src.blackwell_bf16_rank_major" = [
+"flashinfer.moe_ep.kernels.flashinfer.bf16_rank_major" = [
   "*.md",
   "src/*.cu",
   "src/*.json",
@@ -259,14 +243,12 @@ exclude = [
   "flashinfer/cute_dsl/attention/fmha/rubin/",
   "flashinfer/cute_dsl/attention/fmha/rubin_gqa/",
   "flashinfer/prims_ts/",
-  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/",
-  "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src/",
-  # Mypy cannot name the private loader's hyphenated package-data directory.
-  "flashinfer/moe_ep/kernel_src/sm100/kimi-k3-megamoe/",
-  "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/",
-  "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/",
-  "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/",
-  "flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel/src/",
+  "flashinfer/moe_ep/kernels/cutedsl_megamoe/pre_unification/",
+  "flashinfer/moe_ep/kernels/cutedsl_megamoe/sources/",
+  # Generated Kimi sources.
+  "flashinfer/moe_ep/kernels/kimi_k3/",
+  "flashinfer/moe_ep/kernels/flashinfer/sm120_swapab/",
+  "flashinfer/moe_ep/kernels/flashinfer/sm120_split/",
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
@@ -291,9 +273,8 @@ exclude = [
 ]
 
 # CuTe DSL FMHA kernels from TRTLLM VisualGen; kept as-is for clean re-sync.
-# cutedsl_megamoe/src kernels are maintained upstream and re-dropped
-# periodically; excluded so lint churn doesn't block syncs. The shim/ layer
-# next to it is ours and stays linted.
+# Provider kernels are refreshed from source exports and keep their bytes.
+# Maintained adapters under moe_ep/shims/ stay linted.
 # The GVR top-k kernels are CuTe-DSL device code ported verbatim from
 # TensorRT-LLM. Exclude them from ruff (both lint and format) so the port stays
 # byte-faithful to upstream and future syncs stay clean -- reflowing or
@@ -310,19 +291,17 @@ extend-exclude = [
   "flashinfer/cute_dsl/attention/fmha/helpers",
   "flashinfer/cute_dsl/attention/fmha/rubin",
   "flashinfer/cute_dsl/attention/fmha/rubin_gqa",
-  "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src",
-  "flashinfer/moe_ep/kernel_src/sm100/next_cutedsl_megamoe/src",
-  "flashinfer/moe_ep/kernel_src/sm100/kimi-k3-megamoe/src",
-  "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src",
+  "flashinfer/moe_ep/kernels/cutedsl_megamoe/pre_unification",
+  "flashinfer/moe_ep/kernels/cutedsl_megamoe/sources",
+  "flashinfer/moe_ep/kernels/kimi_k3",
   "flashinfer/experimental/cake_mxfp8_megamoe_ep16/csrc/cake_mxfp8_megamoe_ep16/cute",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
   "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
   "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
   "flashinfer/topk_varlen/kernels/block_scan.py",
-  "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src",
-  "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src",
-  "flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel/src",
+  "flashinfer/moe_ep/kernels/flashinfer/sm120_swapab",
+  "flashinfer/moe_ep/kernels/flashinfer/sm120_split",
   "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
   "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",

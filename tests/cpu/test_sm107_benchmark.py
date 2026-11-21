@@ -165,7 +165,7 @@ def main_benchmark(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep.core.runtime", MagicMock())
     monkeypatch.setitem(
         sys.modules,
-        "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe",
+        "flashinfer.moe_ep.shims.sm107.cutedsl_megamoe",
         MagicMock(),
     )
     monkeypatch.setenv("RANK", "0")

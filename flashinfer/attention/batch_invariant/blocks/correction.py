@@ -903,6 +903,7 @@ def fold_group(
                         st.ws_row,
                         vs,
                         st.scaled_out,
+                        causal=st.causal,
                     )
             if thread_idx == 0:
                 mCounters[grp] = Int32(

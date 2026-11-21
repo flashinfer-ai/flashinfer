@@ -18,7 +18,7 @@ from .test_nvfp4_megamoe_batch_invariant import (
 pytestmark = pytest.mark.gpu
 _ieee_matmul = _ieee_precision_fixture
 KINDS = ("mxfp8_e4m3", "mxfp8_e5m2")
-PROVIDERS = ("legacy", "standard", "genphase")
+PROVIDERS = ("standard", "genphase")
 HIDDEN = INTERMEDIATE = 384
 
 
@@ -47,6 +47,7 @@ def _config(
     import torch
     from flashinfer import moe_ep
 
+    assert provider in PROVIDERS
     common = dict(
         intermediate_size=intermediate,
         top_k=top_k,
@@ -56,8 +57,6 @@ def _config(
         apply_routing_weights_before_fc2=early,
     )
     cc = torch.cuda.get_device_capability()
-    if provider == "legacy" and (cc == (10, 7) or not early):
-        pytest.skip("legacy MXFP8 is Blackwell early-routing only")
     if cc == (10, 7):
         assert not persistent
         return moe_ep.Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
@@ -70,11 +69,6 @@ def _config(
     return moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         **common,
         kind=kind,
-        kernel_name=(
-            "sm100_mxfp8_mxfp8_bf16_cutedsl_next"
-            if provider == "standard"
-            else "sm100_mxfp8_mxfp8_bf16_cutedsl"
-        ),
         kernel_variant="genphase" if provider == "genphase" else "inference",
         finalize_mode=(
             moe_ep.FinalizeMode.PERSISTENT
@@ -88,12 +82,6 @@ def _config(
 
 
 def _plans(provider, cc):
-    if provider == "legacy":
-        return [
-            dict(load_balance_mode=mode, token_back_mode=carrier)
-            for mode in ("static", "atomic_counter")
-            for carrier in ("epi_warps", "reuse_dispatch_warps")
-        ]
     if provider == "genphase":
         return (
             [{"work_id_mode": mode} for mode in ("grid_stride", "atomic_counter")]
@@ -288,11 +276,8 @@ def test_mxfp8_batch_invariant_batches_plans_and_graphs(
 
 
 @pytest.mark.parametrize("kind", KINDS)
-@pytest.mark.parametrize("provider", ("legacy", "standard"))
 @pytest.mark.parametrize("early", (False, True))
-def test_mxfp8_batch_invariant_persistent_live_count(
-    kind, provider, early, monkeypatch
-):
+def test_mxfp8_batch_invariant_persistent_live_count(kind, early, monkeypatch):
     import torch
     from flashinfer.moe_ep import MoEEpTensors
 
@@ -301,12 +286,12 @@ def test_mxfp8_batch_invariant_persistent_live_count(
     if _device(kind) == (10, 7):
         pytest.skip("SM107 does not expose persistent finalization")
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    config = _config(kind, provider, early)
+    config = _config(kind, "standard", early)
     x, scores, ids, weights = _problem(0, 1, HIDDEN, INTERMEDIATE)
     with _layer(config, weights, 0, 1, 129, HIDDEN) as layer:
         anchor = layer.forward(MoEEpTensors(x[:129], ids[:129], scores[:129])).clone()
         receipt = layer.batch_invariant_fingerprint
-    config = _config(kind, provider, early, persistent=True)
+    config = _config(kind, "standard", early, persistent=True)
     with _layer(config, weights, 0, 1, 129, HIDDEN) as layer:
         inputs = MoEEpTensors(x[:129].clone(), ids[:129].clone(), scores[:129].clone())
         config.num_valid_tokens_tensor.fill_(129)
@@ -330,9 +315,7 @@ def test_mxfp8_batch_invariant_persistent_live_count(
 
 def _quantize(tensor, kind, *, weight=False):
     import torch
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        quantize_mxfp8_block32,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import quantize_mxfp8_block32
 
     dtype = torch.float8_e4m3fn if kind == "mxfp8_e4m3" else torch.float8_e5m2
     return quantize_mxfp8_block32(tensor.float(), dtype)
@@ -373,9 +356,7 @@ def test_mxfp8_batch_invariant_prequantized_batches(kind, provider, early, monke
 def _torch_reference(q, sf, ids, scores, packed, kind, early, provider):
     """Canonical prepacked operands; no production weight transform or FC kernels."""
     import torch
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        scale_to_f32,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import scale_to_f32
 
     def dequant(data, scale, *, weight=False):
         values = data.float()
@@ -393,11 +374,7 @@ def _torch_reference(q, sf, ids, scores, packed, kind, early, provider):
             w2 = dequant(packed.w2[expert], packed.w2_scale[expert], weight=True)
             gate, up = (x[rows] @ w13.T).chunk(2, dim=-1)
             gate, up = gate.clamp(max=2.5), up.clamp(-2.5, 2.5)
-            act = (
-                (torch.sigmoid(gate) * gate) * up
-                if provider == "legacy"
-                else (up * gate) * torch.sigmoid(gate)
-            )
+            act = (up * gate) * torch.sigmoid(gate)
             if early:
                 act *= scores[rows, slot, None]
             aq, asf = _quantize(act, kind)
@@ -480,10 +457,6 @@ def test_mxfp8_batch_invariant_independent_reference(
     knobs = mxfp8_batch_invariant_default_knobs(
         provider, arch=f"sm_{cc[0]}{cc[1]}", quant_kind=kind
     )
-    if provider == "legacy":
-        knobs = {
-            name: value for name, value in knobs.items() if name != "mma_tiler_mnk"
-        }
     if provider == "genphase" and cc != (10, 7):
         knobs = {
             name: knobs[name]
