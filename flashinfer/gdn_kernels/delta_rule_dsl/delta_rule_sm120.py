@@ -7,7 +7,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import warp, warpgroup, cpasync
 from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
-from ...utils import get_device_sm_count, _get_cache_buf
+from ...utils import _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import (
@@ -19,6 +19,7 @@ from .custom_compile_cache import (
 from .collective_inverse_hmma import CollectiveInverse
 from .helpers import (
     SM80,
+    get_device_nsmid,
     round_down,
     smid,
     state_dtype_to_cutlass,
@@ -3090,7 +3091,7 @@ def delta_rule_prefill_dsl(
     )
     total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
 
-    workspace_size = get_device_sm_count(device) * 128
+    workspace_size = get_device_nsmid(device) * 128
     tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, device)
     # The K and V tail descriptors of the load warp: two 128-byte slots per
     # SM (see create_load_tail_tensormaps).
