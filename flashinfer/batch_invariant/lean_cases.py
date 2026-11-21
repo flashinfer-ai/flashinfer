@@ -135,6 +135,9 @@ ATTN_CASES = [
     # a row of two tiles in one chunk (the tile fold)
     ("a14", 512, 16, 32, 33, 5, 1, 2, True, 0),
     ("a15", 512, 16, 32, 18, 3, 0, 300, True, 0),
+    # the non-causal class at D = 512: a token in the first tile seeing the 33 keys of its request (two chunks: the merge; a
+    # partial last tile), an element of the second 256-column half of the output
+    ("a16", 512, 16, 32, 7, -1, 0, 300, False, 33),
 ]
 ATTN_HEAD_DIMS = (64, 128, 256, 512)
 
