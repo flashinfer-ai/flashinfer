@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The fp16 batch-invariant attention class (``attention.fp16``: binary16 q / K / V / output behind ``batch_invariant=True`` on the
 three wrappers): the bf16 suite's bitwise invariances on binary16 operands, the device-free checks of the class dimension (the
-fingerprints, the term, the kernel names), the refusal of mixed formats, and the behaviour at the edges of the binary16 range
-(the output rounding's overflow to infinity, the gradual underflow of the probabilities)."""
+fingerprints, the term, the kernel names), the refusal of mixed formats, the behaviour at the edges of the binary16 range
+(the output rounding's overflow to infinity, the gradual underflow of the probabilities), and the class's non-causal mode (the
+operand format is orthogonal to the mask mode: reference, prefill == multi-token decode, the invariances, the refusals)."""
 
 import math
 from dataclasses import replace
@@ -33,6 +34,12 @@ FP16_FINGERPRINTS = {
     64: "attn-fp16-d64-94871aafae9b4e51",
     128: "attn-fp16-d128-f00b125b7722e683",
     256: "attn-fp16-d256-79c1eec69fd60b8a",
+}
+#: The fp16 class's non-causal mode (every token sees its request's whole key range).
+FP16_NC_FINGERPRINTS = {
+    64: "attn-fp16-d64-nc-9995210840aa613d",
+    128: "attn-fp16-d128-nc-396cddd8058eea83",
+    256: "attn-fp16-d256-nc-969f24568d0e7549",
 }
 BF16_FINGERPRINTS = {
     64: "attn-bf16-d64-9a05233ec9351b0d",
@@ -163,7 +170,9 @@ def plan_dtypes(pr: Problem, plan_kw):
     return kw
 
 
-def run_paged_prefill(pr: Problem, layout="NHD", window_left=-1, **plan_kw):
+def run_paged_prefill(
+    pr: Problem, layout="NHD", window_left=-1, causal=True, **plan_kw
+):
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace(pr.device), layout, batch_invariant=True
     )
@@ -176,14 +185,16 @@ def run_paged_prefill(pr: Problem, layout="NHD", window_left=-1, **plan_kw):
         pr.Hkv,
         pr.D,
         pr.page,
-        causal=True,
+        causal=causal,
         window_left=window_left,
         **plan_dtypes(pr, plan_kw),
     )
     return w.run(pr.q, pr.cache(layout))
 
 
-def run_ragged_prefill(pr: Problem, layout="NHD", window_left=-1, **plan_kw):
+def run_ragged_prefill(
+    pr: Problem, layout="NHD", window_left=-1, causal=True, **plan_kw
+):
     w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace(pr.device), layout, batch_invariant=True
     )
@@ -193,7 +204,7 @@ def run_ragged_prefill(pr: Problem, layout="NHD", window_left=-1, **plan_kw):
         pr.Hq,
         pr.Hkv,
         pr.D,
-        causal=True,
+        causal=causal,
         window_left=window_left,
         **plan_dtypes(pr, plan_kw),
     )
@@ -201,8 +212,11 @@ def run_ragged_prefill(pr: Problem, layout="NHD", window_left=-1, **plan_kw):
     return w.run(pr.q, k, v)
 
 
-def run_decode(pr: Problem, layout="NHD", window_left=-1, q_len=1, **plan_kw):
-    """Decode of the last ``q_len`` tokens of every request of ``pr`` (q rows picked from the prefill problem)."""
+def run_decode(
+    pr: Problem, layout="NHD", window_left=-1, q_len=1, causal=True, **plan_kw
+):
+    """Decode of the last ``q_len`` tokens of every request of ``pr`` (q rows picked from the prefill problem); ``causal=False``
+    plans the non-causal class (``is_causal=False``, which a multi-token step alone selects)."""
     assert all(ql >= q_len for ql in pr.q_lens)
     last = torch.cat(
         [
@@ -220,6 +234,8 @@ def run_decode(pr: Problem, layout="NHD", window_left=-1, q_len=1, **plan_kw):
     )
     if q_len != 1:
         plan_kw = dict(plan_kw, q_len_per_req=q_len)
+    if not causal:
+        plan_kw = dict(plan_kw, is_causal=False)
     w.plan(
         pr.kv_indptr,
         pr.kv_indices,
@@ -234,9 +250,11 @@ def run_decode(pr: Problem, layout="NHD", window_left=-1, q_len=1, **plan_kw):
     return w.run(q, pr.cache(layout)), last
 
 
-def reference(pr: Problem, window_left=-1, sm_scale=None, with_scale=False):
-    """Causal (bottom-right aligned) attention per request in binary64 over the operands' exact values: the yardstick for accuracy
-    (never for bits). ``with_scale`` also returns ``sum_k p_k |v_k|`` (the magnitude the relative rounding errors of an output
+def reference(
+    pr: Problem, window_left=-1, sm_scale=None, with_scale=False, causal=True
+):
+    """Causal (bottom-right aligned) attention per request, or with ``causal=False`` attention over the request's whole key
+    range, in binary64 over the operands' exact values: the yardstick for accuracy (never for bits). ``with_scale`` also returns ``sum_k p_k |v_k|`` (the magnitude the relative rounding errors of an output
     element scale with) and ``sum_k |v_k|`` over the visible keys (what the absolute rounding error of the subnormal weights
     scales with)."""
     outs, mags, sums = [], [], []
@@ -250,7 +268,7 @@ def reference(pr: Problem, window_left=-1, sm_scale=None, with_scale=False):
         s = torch.einsum("qhd,khd->hqk", q, k) * scale
         pos = torch.arange(kl - ql, kl, device=pr.device)[:, None]
         key = torch.arange(kl, device=pr.device)[None, :]
-        mask = key <= pos
+        mask = key <= pos if causal else (key >= 0).expand(ql, kl).clone()
         if window_left >= 0:
             mask &= key >= pos - window_left
         s = s.masked_fill(~mask[None], float("-inf"))
@@ -329,6 +347,19 @@ def test_fp16_kernel_identity_carries_the_format():
     )
     assert swaps(128, 8, 16, 8, False, cap=228 << 10).endswith("_c228")
     assert swaps(128, 8, 16, 8, False, cap=228 << 10, fmt="f16").endswith("_c228_f16")
+    # the mask mode and the operand format are independent parts of the name
+    assert row(128, 4, 16, 4, causal=False) == "attn_d128_g4_p16_s4_w1_nc"
+    assert (
+        row(128, 4, 16, 4, causal=False, fmt="f16") == "attn_d128_g4_p16_s4_w1_nc_f16"
+    )
+    assert swaps(128, 8, 16, 8, False, cap=228 << 10, causal=False, fmt="f16").endswith(
+        "_c228_nc_f16"
+    )
+    # both class dimensions are keyword-only at the kernel-facing signatures: a positional value cannot select a kernel
+    with pytest.raises(TypeError):
+        row(128, 4, 16, 4, 1, False, False, False, 0, "f16")
+    with pytest.raises(TypeError):
+        swaps(128, 8, 16, 8, False, 0, False, "f16")
 
 
 def test_binary16_rounding_model():
@@ -1010,3 +1041,212 @@ def test_mixed_formats_raise_and_nothing_falls_back(kind):
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="attention.fp16"):
         w.plan(*args, q_data_type=f16, pos_encoding_mode="ROPE_LLAMA", **kw)
     assert torch.equal(bits(w.run(pr.q, *cache)), ref)
+
+
+# ------------------------------------------------------------------------------------------------------ the non-causal mode
+@pytest.mark.parametrize("op", WRAPPERS)
+def test_fingerprint_mask_mode_and_operand_format_are_independent(op):
+    """The receipt takes the mask mode and the operand dtype together: four classes per head dim, the two fp16 digests pinned
+    here, the two bf16 digests unchanged by the dtype dimension. ``causal`` is required for the prefill wrappers and optional
+    for the decode wrapper, with or without ``dtype``."""
+    prefill = not op.startswith("BatchDecode")
+    for D in (64, 128, 256):
+        nc = bi.fingerprint(op, head_dim=D, causal=False, dtype=torch.float16)
+        assert nc == FP16_NC_FINGERPRINTS[D]
+        assert (
+            bi.fingerprint(op, head_dim=D, causal=True, dtype=torch.float16)
+            == FP16_FINGERPRINTS[D]
+        )
+        nc_bf16 = bi.fingerprint(op, head_dim=D, causal=False)
+        assert nc_bf16.startswith(f"attn-bf16-d{D}-nc-") and nc_bf16 != nc
+        assert bi.fingerprint(op, head_dim=D, causal=False, dtype="bf16") == nc_bf16
+        assert bi.fingerprint(op, head_dim=D, causal=True) == BF16_FINGERPRINTS[D]
+    if prefill:
+        with pytest.raises(TypeError, match="causal"):
+            bi.fingerprint(op, head_dim=128, dtype=torch.float16)
+    else:
+        assert (
+            bi.fingerprint(op, head_dim=128, dtype=torch.float16)
+            == FP16_FINGERPRINTS[128]
+        )
+
+
+def test_noncausal_fp16_term_and_spec_fingerprint():
+    """The non-causal fp16 term is the non-causal bf16 term with the binary16 step and roundings (the format does not reach the
+    visible key set), and differs from the causal fp16 term of the same token; ``fmt`` is keyword-only in the spec."""
+    from flashinfer.attention.batch_invariant import spec
+    from flashinfer.batch_invariant.fp_interface.term import sexpr
+
+    row = spec.RowSpec(p=5, causal=False, kv_len=41)
+    f16 = sexpr(spec.AttentionSpec(64, T=16, C=32, fmt="f16").output(row, 0))
+    bf16 = sexpr(spec.AttentionSpec(64, T=16, C=32).output(row, 0))
+    assert f16.replace("(mma16f16 ", "(mma16 ").replace("(cvt f16 ", "(cvt bf16 ") == (
+        bf16
+    )
+    causal = sexpr(
+        spec.AttentionSpec(64, T=16, C=32, fmt="f16").output(spec.RowSpec(p=5), 0)
+    )
+    assert causal != f16
+    for D in (64, 128, 256):
+        assert (
+            spec.spec_fingerprint(D, causal=False, fmt="f16") == FP16_NC_FINGERPRINTS[D]
+        )
+        assert (
+            spec.spec_fingerprint(D, -1, False, fmt="f16") == (FP16_NC_FINGERPRINTS[D])
+        )
+    with pytest.raises(TypeError):
+        spec.spec_fingerprint(128, -1, True, "f16")
+    with pytest.raises(TypeError):
+        spec.class_name("f16")
+    with pytest.raises(ValueError):
+        spec.spec_fingerprint(128, 8, False, fmt="f16")
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("Hq,Hkv", [(32, 8), (8, 8)])
+def test_noncausal_matches_reference(D, Hq, Hkv):
+    pr = Problem([300, 1000, 64], [700, 2500, 3000], Hq, Hkv, D, 16, seed=31)
+    out = run_paged_prefill(pr, causal=False)
+    assert out.dtype == F16
+    ref = reference(pr, causal=False)
+    err = (out.double() - ref).abs().max().item()
+    assert err < 2e-3 + 2e-3 * ref.abs().max().item(), err
+    # the two mask modes are two classes: the same operands give other bits wherever a token has later keys
+    assert not torch.equal(bits(out), bits(run_paged_prefill(pr)))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_noncausal_prefill_equals_multi_token_decode(D, layout):
+    """R4 under the non-causal class: the paged prefill, the ragged prefill and the decode wrapper with ``q_len_per_req = 4``
+    and ``is_causal=False`` give the last four tokens of every request the same bits."""
+    pr = Problem([256, 33, 1024, 7], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=32)
+    pre = bits(run_paged_prefill(pr, layout, causal=False))
+    assert torch.equal(bits(run_ragged_prefill(pr, layout, causal=False)), pre)
+    dec, last4 = run_decode(pr, layout, q_len=4, causal=False)
+    assert dec.dtype == F16
+    assert torch.equal(bits(dec), pre[last4])
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("page", [1, 128])
+def test_noncausal_paged_equals_ragged(D, page):
+    pr = Problem(
+        [300, 1000, 64, 2048], [700, 2500, 3000, 2048], 32, 8, D, page, seed=33
+    )
+    assert torch.equal(
+        bits(run_paged_prefill(pr, causal=False)),
+        bits(run_ragged_prefill(pr, causal=False)),
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_batch_permutation_subbatch_and_query_subset_invariance(D):
+    """R2 under the non-causal class: a request's bits do not depend on its neighbours, its position in the batch or the batch
+    size, nor on which of its tokens are queried (a token's term is a function of its request's key count, not of the query
+    length)."""
+    q_lens, kv_lens = [300, 1000, 64, 2048, 1], [700, 2500, 3000, 2048, 5000]
+    pr = Problem(q_lens, kv_lens, 32, 8, D, 16, seed=35)
+    full = bits(run_paged_prefill(pr, causal=False))
+    assert torch.equal(bits(run_ragged_prefill(pr, causal=False)), full)
+    for i in (0, 2, 4):  # one request alone
+        single = derived(
+            pr,
+            [q_lens[i]],
+            [kv_lens[i]],
+            pr.q[pr.rows(i)],
+            pr.k_rag[pr.keys(i)],
+            pr.v_rag[pr.keys(i)],
+            seed=70 + i,
+        )
+        assert torch.equal(
+            bits(run_ragged_prefill(single, causal=False)), full[pr.rows(i)]
+        ), i
+        assert torch.equal(
+            bits(run_paged_prefill(single, causal=False)), full[pr.rows(i)]
+        ), i
+    perm = [3, 0, 4, 1, 2]
+    pp = derived(
+        pr,
+        [q_lens[i] for i in perm],
+        [kv_lens[i] for i in perm],
+        torch.cat([pr.q[pr.rows(i)] for i in perm]),
+        torch.cat([pr.k_rag[pr.keys(i)] for i in perm]),
+        torch.cat([pr.v_rag[pr.keys(i)] for i in perm]),
+        seed=80,
+    )
+    permuted = bits(run_paged_prefill(pp, causal=False))
+    off = 0
+    for i in perm:
+        n = q_lens[i]
+        assert torch.equal(permuted[off : off + n], full[pr.rows(i)]), i
+        off += n
+    # a query chunk planned over the request's full key set: the first 100 tokens of request 1 alone
+    rows = pr.rows(1)
+    head = derived(
+        pr,
+        [100],
+        [kv_lens[1]],
+        pr.q[rows][:100],
+        pr.k_rag[pr.keys(1)],
+        pr.v_rag[pr.keys(1)],
+        seed=81,
+    )
+    assert torch.equal(bits(run_paged_prefill(head, causal=False)), full[rows][:100])
+
+
+@needs_device
+def test_noncausal_single_token_decode_is_the_causal_class():
+    """A single-token decode step is the causal class whatever ``is_causal`` says, in the fp16 class as in the bf16 one."""
+    pr = Problem([64, 1], [700, 300], 32, 8, 128, 16, seed=36)
+    causal, last = run_decode(pr)
+    step, _ = run_decode(pr, causal=False)
+    assert torch.equal(bits(step), bits(causal))
+    assert torch.equal(bits(run_paged_prefill(pr))[last], bits(causal))
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_noncausal_mixed_formats_and_window_raise(kind):
+    """The refusals of the fp16 class under the non-causal mode: every mix of fp16 and bf16 raises at ``plan()``, a window is not
+    a parameter of the non-causal class, tensors of the other format raise at ``run()``; the errors name the fp16 class and
+    the plan survives them."""
+    pr = Problem([2, 2], [700, 300], 32, 8, 128, 16, seed=37)
+    w = getattr(flashinfer, WRAPPERS[kind])(
+        workspace(pr.device, mb=8), "NHD", batch_invariant=True
+    )
+    if kind == 0:
+        args = (pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16)
+        kw, cache = dict(q_len_per_req=2, is_causal=False), (pr.cache(),)
+    elif kind == 1:
+        args = (pr.qo_indptr, pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, 128, 16)
+        kw, cache = dict(causal=False), (pr.cache(),)
+    else:
+        args, kw = (pr.qo_indptr, pr.kv_indptr_rag, 32, 8, 128), dict(causal=False)
+        cache = pr.ragged()
+    bf, f16 = torch.bfloat16, torch.float16
+    for q_dt, kv_dt, o_dt in (
+        (f16, bf, None),
+        (bf, f16, None),
+        (f16, None, bf),
+        (bf, None, f16),
+        (f16, torch.float8_e4m3fn, None),
+        (torch.float32, None, None),
+    ):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            w.plan(*args, q_data_type=q_dt, kv_data_type=kv_dt, o_data_type=o_dt, **kw)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="attention.fp16"):
+        w.plan(*args, q_data_type=f16, kv_data_type=f16, window_left=8, **kw)
+    w.plan(*args, q_data_type=f16, kv_data_type=f16, o_data_type=f16, **kw)
+    ref = bits(w.run(pr.q, *cache))
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="attention.fp16"):
+        w.run(pr.q.to(bf), *cache)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="fp16"):
+        w.run(pr.q, *cache, out=torch.empty(pr.q.shape, dtype=bf, device=pr.device))
+    assert torch.equal(bits(w.run(pr.q, *cache)), ref)
+    # the planned bits are the non-causal class's: the paged prefill of the same requests
+    assert torch.equal(ref, bits(run_paged_prefill(pr, causal=False)))
