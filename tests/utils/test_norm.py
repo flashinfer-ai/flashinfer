@@ -1442,6 +1442,232 @@ def test_fused_add_rmsnorm_quant_int64_stride():
 
 
 # =============================================================================
+# Regression tests: CUDA RMSNorm row offsets past UINT32_MAX
+# =============================================================================
+# The CUDA JIT RMSNorm kernels are what runs when the CuTe DSL cannot target the
+# device.  Three rows laid out 2**31 elements apart put the third row 2**32
+# elements into the buffer, where a row offset computed in 32 bits wraps back to
+# the first row.  The int64-stride tests above stop at two rows, below that
+# boundary.
+
+_UINT32_ROWS = 3
+_UINT32_ROW_STRIDE = 2**31
+assert (_UINT32_ROWS - 1) * _UINT32_ROW_STRIDE > 2**32 - 1
+
+
+def _rows_past_uint32(*row_shape, dtype=torch.bfloat16):
+    """Random rows of ``row_shape`` stored ``_UINT32_ROW_STRIDE`` elements apart."""
+    numel = (_UINT32_ROWS - 1) * _UINT32_ROW_STRIDE + math.prod(row_shape)
+    need = numel * torch.finfo(dtype).bits // 8
+    free, _ = torch.cuda.mem_get_info()
+    if free < need + (1 << 30):
+        pytest.skip(
+            f"Requires ~{need / 1024**3:.1f}GB free VRAM, "
+            f"only {free / 1024**3:.1f}GB available"
+        )
+    inner_strides = [math.prod(row_shape[i + 1 :]) for i in range(len(row_shape))]
+    storage = torch.empty(numel, dtype=dtype, device="cuda")
+    rows = storage.as_strided(
+        (_UINT32_ROWS, *row_shape), (_UINT32_ROW_STRIDE, *inner_strides)
+    )
+    rows.copy_(torch.randn(_UINT32_ROWS, *row_shape, dtype=dtype, device="cuda"))
+    return rows
+
+
+@pytest.mark.parametrize("gemma", [False, True])
+def test_rmsnorm_cuda_row_offset_beyond_uint32(gemma, monkeypatch):
+    """The third input row starts 2**32 elements in."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    torch.manual_seed(0)
+    H = 128
+    x = _rows_past_uint32(H)
+    w = torch.randn(H, dtype=x.dtype, device="cuda")
+
+    if gemma:
+        y = flashinfer.norm.gemma_rmsnorm(x, w)
+        y_ref = gemma_rms_norm(x.contiguous(), w)
+    else:
+        y = flashinfer.norm.rmsnorm(x, w)
+        y_ref = llama_rms_norm(x.contiguous(), w)
+
+    torch.testing.assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_rmsnorm_cuda_output_row_offset_beyond_uint32(monkeypatch):
+    """The third output row starts 2**32 elements in."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    torch.manual_seed(0)
+    H = 128
+    x = torch.randn(_UINT32_ROWS, H, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(H, dtype=x.dtype, device="cuda")
+    out = _rows_past_uint32(H)
+
+    flashinfer.norm.rmsnorm(x, w, out=out)
+
+    torch.testing.assert_close(
+        out.contiguous(), llama_rms_norm(x, w), rtol=1e-3, atol=1e-3
+    )
+
+
+def test_qknorm_cuda_batch_offset_beyond_uint32(monkeypatch):
+    """3D rmsnorm whose third batch entry starts 2**32 elements in."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    torch.manual_seed(0)
+    num_heads, head_dim = 4, 128
+    x = _rows_past_uint32(num_heads, head_dim)
+    w = torch.randn(head_dim, dtype=x.dtype, device="cuda")
+
+    y = flashinfer.norm.rmsnorm(x, w)
+
+    torch.testing.assert_close(
+        y, llama_rms_norm(x.contiguous(), w), rtol=1e-3, atol=1e-3
+    )
+
+
+def test_qknorm_cuda_head_offset_beyond_uint32(monkeypatch):
+    """3D rmsnorm whose third head starts 2**32 elements in."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    torch.manual_seed(0)
+    head_dim = 128
+    rows = _rows_past_uint32(head_dim)
+    # One batch entry whose heads are those rows, so only the head stride is large.
+    x = rows.as_strided((1, _UINT32_ROWS, head_dim), (1, _UINT32_ROW_STRIDE, 1))
+    w = torch.randn(head_dim, dtype=x.dtype, device="cuda")
+
+    y = flashinfer.norm.rmsnorm(x, w)
+
+    torch.testing.assert_close(
+        y, llama_rms_norm(x.contiguous(), w), rtol=1e-3, atol=1e-3
+    )
+
+
+def test_rmsnorm_quant_cuda_row_offset_beyond_uint32(monkeypatch):
+    """rmsnorm_quant whose third input row starts 2**32 elements in."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    torch.manual_seed(0)
+    H, quant_scale = 128, 1.0
+    x = _rows_past_uint32(H)
+    w = torch.randn(H, dtype=x.dtype, device="cuda")
+
+    y = torch.empty(_UINT32_ROWS, H, dtype=torch.float8_e4m3fn, device="cuda")
+    flashinfer.norm.rmsnorm_quant(y, x, w, torch.tensor(quant_scale, device="cuda"))
+
+    y_ref = llama_rms_norm_quant(x.contiguous(), w, quant_scale, torch.float8_e4m3fn)
+    torch.testing.assert_close(y.float(), y_ref.float(), rtol=1, atol=1)
+
+
+@pytest.mark.parametrize("gemma", [False, True])
+@pytest.mark.parametrize("far", ["input", "residual"])
+def test_fused_add_rmsnorm_cuda_row_offset_beyond_uint32(far, gemma, monkeypatch):
+    """fused_add_rmsnorm whose third input or residual row starts 2**32 elements in."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    torch.manual_seed(0)
+    H, eps = 128, 1e-6
+    # float16, as in the fused-add tests above: the Gemma reference adds in the input
+    # dtype, which costs a bfloat16 input a rounding step the kernel does not take.
+    far_rows = _rows_past_uint32(H, dtype=torch.float16)
+    near_rows = torch.randn(_UINT32_ROWS, H, dtype=far_rows.dtype, device="cuda")
+    x, r = (far_rows, near_rows) if far == "input" else (near_rows, far_rows)
+    w = torch.randn(H, dtype=x.dtype, device="cuda")
+
+    if gemma:
+        x_ref, r_ref = gemma_fused_add_rms_norm(
+            x.contiguous().clone(), r.contiguous().clone(), w, eps
+        )
+        flashinfer.norm.gemma_fused_add_rmsnorm(x, r, w, eps)
+    else:
+        x_ref, r_ref = fused_add_rms_norm(
+            x.contiguous().clone(), r.contiguous().clone(), w, eps
+        )
+        flashinfer.fused_add_rmsnorm(x, r, w, eps)
+
+    torch.testing.assert_close(x.contiguous(), x_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(r.contiguous(), r_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_fused_add_rmsnorm_quant_cuda_row_offset_beyond_uint32(monkeypatch):
+    """fused_add_rmsnorm_quant whose third input row starts 2**32 elements in."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    torch.manual_seed(0)
+    H, eps, quant_scale = 128, 1e-6, 1.0
+    x = _rows_past_uint32(H)
+    r = torch.randn(_UINT32_ROWS, H, dtype=x.dtype, device="cuda")
+    w = torch.randn(H, dtype=x.dtype, device="cuda")
+    x_ref, r_ref = fused_add_rms_norm_quant(
+        x.contiguous().clone(), r.clone(), w, quant_scale, torch.float8_e4m3fn, eps
+    )
+
+    y = torch.empty(_UINT32_ROWS, H, dtype=torch.float8_e4m3fn, device="cuda")
+    flashinfer.norm.fused_add_rmsnorm_quant(
+        y, x, r, w, torch.tensor(quant_scale, device="cuda"), eps
+    )
+
+    torch.testing.assert_close(y.float(), x_ref.float(), rtol=1, atol=1)
+    torch.testing.assert_close(r, r_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_fused_add_rmsnorm_fp8_block_quant_row_offset_beyond_uint32():
+    """The fp8 block-quant producer whose third input row starts 2**32 elements in."""
+    torch.manual_seed(0)
+    H, eps = 256, 1e-6
+    x = _rows_past_uint32(H)
+    x.mul_(0.1)
+    r = torch.randn(_UINT32_ROWS, H, dtype=x.dtype, device="cuda") * 0.1
+    w = torch.randn(H, dtype=x.dtype, device="cuda")
+    _, _, r_ref, normed_ref = fused_add_rms_norm_fp8_block_quant(
+        x.contiguous().clone(), r.clone(), w, eps
+    )
+
+    out = torch.empty(_UINT32_ROWS, H, dtype=torch.float8_e4m3fn, device="cuda")
+    block_scale = torch.empty(
+        H // 128, (_UINT32_ROWS + 3) & ~3, dtype=torch.float32, device="cuda"
+    )
+    normed_out = torch.empty(_UINT32_ROWS, H, dtype=x.dtype, device="cuda")
+    flashinfer.norm.fused_add_rmsnorm_fp8_block_quant(
+        out, block_scale, normed_out, x, r, w, eps
+    )
+
+    torch.testing.assert_close(r, r_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(normed_out, normed_ref, rtol=1e-2, atol=1e-2)
+
+
+# Shape (350000, 12288) fp16: the last rows start past 2**32 elements, as they do
+# for a long prefill through a wide layer.
+_UINT32_OVERFLOW_M = 350000
+_UINT32_OVERFLOW_H = 12288
+assert (_UINT32_OVERFLOW_M - 1) * _UINT32_OVERFLOW_H > 2**32
+
+
+def test_rmsnorm_cuda_contiguous_beyond_uint32(monkeypatch):
+    """CUDA rmsnorm on a contiguous tensor with M*H > UINT32_MAX."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    M, H = _UINT32_OVERFLOW_M, _UINT32_OVERFLOW_H
+    need = 4 * M * H  # fp16 input + output
+    free, _ = torch.cuda.mem_get_info()
+    if free < need * 1.15:
+        pytest.skip(
+            f"Requires ~{need / 1024**3:.1f}GB free VRAM, "
+            f"only {free / 1024**3:.1f}GB available"
+        )
+    torch.manual_seed(0)
+    x = torch.randn(M, H, dtype=torch.float16, device="cuda")
+    w = torch.randn(H, dtype=x.dtype, device="cuda")
+
+    y = flashinfer.norm.rmsnorm(x, w)
+
+    # Rows around the 2**32 boundary plus the ends; a full fp32 reference would
+    # not fit beside the tensors.
+    boundary_row = 2**32 // H
+    for row in (0, 1, boundary_row - 1, boundary_row, boundary_row + 1, M - 1):
+        torch.testing.assert_close(
+            y[row : row + 1],
+            llama_rms_norm(x[row : row + 1], w),
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+
+# =============================================================================
 # Tests: contiguous tensor with M*H > INT32_MAX
 # =============================================================================
 # Exercise the contiguous (compact) path of the cute-DSL norm kernels with a
