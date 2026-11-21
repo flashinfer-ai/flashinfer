@@ -115,14 +115,14 @@ def _run_pair(lg, lens, top_k, pt, page_size, next_n=1, cr=1):
     return loc, pg
 
 
-def _launcher_key(rows, ncols, top_k, page_shift):
+def _launcher_key(rows, ncols, top_k, page_shift, next_n=1):
     """Cache key of a hint-free decode launch at the full-width envelope."""
     return (
         rows,
         ncols,
         top_k,
         ncols,
-        1,
+        next_n,
         1,
         True,
         page_shift,
@@ -172,14 +172,18 @@ def test_paged_page_sizes(page_size):
 
 @requires_gvr2
 @pytest.mark.parametrize(
-    "rows,ncols,top_k",
+    "rows,ncols,top_k,next_n",
     [
-        (9, 131136, 512),
-        (9, 131136, 2048),
-        (16, 131136, 512),
-        (32, 131136, 2048),
-        (128, 131136, 512),
-        (160, 65600, 2048),
+        (9, 131136, 512, 1),
+        (9, 131136, 2048, 1),
+        (16, 131136, 512, 1),
+        (32, 131136, 2048, 1),
+        (128, 131136, 512, 1),
+        (160, 65600, 2048, 1),
+        (18, 131136, 2048, 2),
+        (27, 131136, 2048, 3),
+        (128, 131136, 512, 2),
+        (160, 65600, 2048, 2),
     ],
     ids=[
         "split9-k512",
@@ -188,39 +192,50 @@ def test_paged_page_sizes(page_size):
         "split32-k2048",
         "cta1024-k512",
         "cta512-k2048",
+        "split18-k2048-n2",
+        "split27-k2048-n3",
+        "cta1024-k512-n2",
+        "cta512-k2048-n2",
     ],
 )
 @pytest.mark.parametrize("page_size", [1, 64, 128], ids=lambda p: f"ps{p}")
-def test_paged_main_register_rows(rows, ncols, top_k, page_size):
+def test_paged_main_register_rows(rows, ncols, top_k, next_n, page_size):
     """Main-engine launches (capacity-wide logits) whose rows mostly fit the
     in-kernel register path: that path stages its own page-table slice, sized
     from the register capacity (none at page size 1), and must map through the
-    request's row like the streaming path."""
+    request's row like the streaming path. With next_n > 1 every row of a
+    request maps through that request's page-table row (row // next_n): the
+    table has one row per request."""
     plan = _host.route_streaming(rows, ncols, ncols, top_k, force_main=True)
     cap = (
         plan["tpl"][0] * _host._main_reg_vpt(plan["tpl"][0], plan["tpl"][5], ncols) * 4
     )
     assert cap > 0
+    batch = rows // next_n
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
     gen = torch.Generator(device=_DEV).manual_seed(rows + page_size)
-    lens = torch.randint(top_k + 1, cap + 1, (rows,), generator=gen, device=_DEV)
-    # band edges, the VPT 2 / VPT 4 boundary, a short row, a streaming row, and
-    # short register rows (k + 1, 2048, 2049)
-    lens[0], lens[1], lens[2], lens[3] = cap, cap + 1, top_k, ncols
-    lens[4], lens[5] = cap // 2, cap // 2 + 1
-    lens[6], lens[7], lens[8] = top_k + 1, 2048, 2049
-    lens = lens.to(torch.int32)
-    pt = _page_table(rows, ncols, page_size, seed=41)
+    last = torch.randint(top_k + 1, cap + 1, (batch,), generator=gen, device=_DEV)
+    # the last row of each request: band edges, the VPT 2 / VPT 4 boundary, a
+    # short row, a streaming row, and short register rows (k + 1, 2048, 2049);
+    # row j of a request has next_n - 1 - j columns fewer
+    last[0], last[1], last[2], last[3] = cap, cap + 1, top_k, ncols
+    last[4], last[5] = cap // 2, cap // 2 + 1
+    last[6], last[7], last[8] = top_k + 1, 2048, 2049
+    lens = last.to(torch.int32)  # seq_lens of request q: its last row's columns
+    n_r = [
+        max(int(lens[r // next_n]) - (next_n - 1 - r % next_n), 0) for r in range(rows)
+    ]
+    pt = _page_table(batch, ncols, page_size, seed=41)
     # drop the paged launcher first, so the family read below is the launch's
-    key = _launcher_key(rows, ncols, top_k, page_size.bit_length() - 1)
+    key = _launcher_key(rows, ncols, top_k, page_size.bit_length() - 1, next_n)
     _host._VARLEN_CACHE.pop(key, None)
-    loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
+    loc, pg = _run_pair(lg, lens, top_k, pt, page_size, next_n=next_n)
     lc = _host._VARLEN_CACHE.get(key)
     assert lc is not None, f"launcher not cached for {key}"
     # the family on 148-SM parts (B200), where these shapes plan the main engines
     assert _host._sm_count() != 148 or lc[0] == "main", f"{key}: {lc[0]}"
     for r in range(rows):  # the local output itself is the exact top-k
-        n = int(lens[r])
+        n = n_r[r]
         if n > top_k:
             idx = loc[r].to(torch.int64)
             assert (
@@ -230,7 +245,7 @@ def test_paged_main_register_rows(rows, ncols, top_k, page_size):
             )
             ref = torch.topk(lg[r, :n], top_k).values.sort().values
             assert torch.equal(lg[r, idx].sort().values, ref), f"row {r} inexact"
-    assert _same_rows(pg, _expected(loc, pt, 1, page_size))
+    assert _same_rows(pg, _expected(loc, pt, next_n, page_size))
 
 
 @requires_gvr2

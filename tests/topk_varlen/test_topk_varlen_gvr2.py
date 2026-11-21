@@ -958,7 +958,15 @@ def _injective_page_table(batch, width, page_size, which=0):
         shift = page_size.bit_length() - 1
         o = out.to(torch.int64)
         req = (torch.arange(out.shape[0], device=_DEV) // next_n).unsqueeze(1)
-        page = ((o >> shift) - req * pages) * pow(mult, -1, pages) % pages
+        # a slot mapped through another request's row differs from the right one
+        # by a multiple of `pages`, which the modulo below would remove: every
+        # slot must lie in its own request's pages first
+        rel = (o >> shift) - req * pages
+        stray = (out >= 0) & ((rel < 0) | (rel >= pages))
+        assert not bool(stray.any()), (
+            f"{int(stray.sum())} slots outside their request's pages"
+        )
+        page = rel * pow(mult, -1, pages) % pages
         col = (page << shift) | (o & (page_size - 1))
         return torch.where(out >= 0, col, o).to(torch.int32)
 
