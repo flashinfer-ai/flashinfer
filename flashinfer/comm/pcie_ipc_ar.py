@@ -645,9 +645,13 @@ class PcieIpcAllReduceWorkspace:
         tuning_config = pcie_ipc_tuning_config(self._batches_for(hidden))
         can_profile = tuner.is_tuning_mode and self._runner.can_profile(inp.device)
         if can_profile:
-            _, tactic = tuner.choose_one(
-                PCIE_IPC_CUSTOM_OP, [self._runner], tuning_config, [inp]
-            )
+            try:
+                _, tactic = tuner.choose_one(
+                    PCIE_IPC_CUSTOM_OP, [self._runner], tuning_config, [inp]
+                )
+            finally:
+                # Profiling is the only writer; a later miss allocates again.
+                self._runner.release_buffers()
         else:
             # An enclosing autotune context may belong to another operator and
             # may have replaced the global file cache. Without a matching
@@ -991,12 +995,15 @@ class PcieIpcAllReduceWorkspace:
                             dtype=torch.int32,
                             device=self.device,
                         ).to(dtype)
-                        tuner.choose_one(
-                            PCIE_IPC_CUSTOM_OP,
-                            [self._runner],
-                            pcie_ipc_tuning_config(tuple(requested)),
-                            [inp],
-                        )
+                        try:
+                            tuner.choose_one(
+                                PCIE_IPC_CUSTOM_OP,
+                                [self._runner],
+                                pcie_ipc_tuning_config(tuple(requested)),
+                                [inp],
+                            )
+                        finally:
+                            self._runner.release_buffers()
                         covered.append((hidden, batch))
         finally:
             tuner.warmup, tuner.repeat = previous_counts
