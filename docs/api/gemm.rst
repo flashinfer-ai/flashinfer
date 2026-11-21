@@ -7,6 +7,41 @@ flashinfer.gemm
 
 This module provides a set of GEMM operations.
 
+Unified GEMM API (MVP)
+----------------------
+
+One configuration object (``GemmConfig``), one ``torch.nn.Linear`` subclass and two
+functional entries replace the per-function backend strings and weight layouts for dense
+NVFP4 and per-tensor FP8 GEMMs; backends are capability records whose ``backend_key`` is
+the legacy ``backend=`` string, and ``supported_backends`` answers "what runs here, and why
+not?" without loading a kernel. The design, the as-built MVP scope and the roadmap are in
+`docs/design_docs/flashinfer_gemm_api.md <../../design_docs/flashinfer_gemm_api.md>`_.
+
+.. autosummary::
+    :toctree: ../generated
+
+    Linear
+    linear
+    gemm
+    GemmLayer
+    supported_backends
+    GemmConfig
+    EpilogueConfig
+    ExecutionConfig
+    GemmProblem
+    BackendReport
+    BackendUnsupported
+    GemmWeightPack
+    GemmActivationPack
+    prepare_weight_pack
+    prepare_activations
+    CutlassGemmConfig
+    CuteDslGemmConfig
+    TrtllmGemmConfig
+    CudnnGemmConfig
+    CublasGemmConfig
+    DEFAULT_GEMM_BACKENDS
+
 BF16 GEMM
 ---------
 

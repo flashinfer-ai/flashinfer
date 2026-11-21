@@ -8,10 +8,13 @@ wall/call is the host cost.  ``--kernel`` adds GPU time per call (torch
 profiler, all device activity) and flags rows where host > GPU, i.e. where an
 eager caller starves the GPU.
 
-    python benchmarks/bench_host_overhead.py [--api bf16 fp4 mxfp8 fp8 quant]
+    python benchmarks/bench_host_overhead.py [--api bf16 fp4 mxfp8 fp8 quant unified]
         [--shape M N K] [--kernel] [--json out.json] [--compare base.json]
 
 Use --compare to print a before/after table when changing the dispatch path.
+``--api unified`` pairs each ``GemmLayer.__call__`` (unified GEMM API, after
+``prepare``) with the legacy ``mm_fp4`` / ``bmm_fp8`` call it delegates to, on
+the same operands, so the layer's dispatch cost reads off as the difference.
 """
 
 import argparse
@@ -63,6 +66,98 @@ def kernel_us(fn, iters=10):
     return total_ns / iters / 1e3, n / iters
 
 
+def unified_rows(a, w, out, *, nvfp4, fp8):
+    """(name, fn) pairs: GemmLayer after prepare next to its legacy call, per backend.
+
+    Candidates are the ones the design doc lists for ``auto`` (cutlass, cublas,
+    cudnn); one that cannot be built here (no cuDNN frontend, unsupported arch)
+    is skipped with its reason, as ``add`` does for a failing legacy row.
+    """
+    from flashinfer.gemm import (
+        CublasGemmConfig,
+        CudnnGemmConfig,
+        CutlassGemmConfig,
+        GemmConfig,
+        GemmLayer,
+        prepare_activations,
+        prepare_weight_pack,
+    )
+    from flashinfer.gemm.api import BackendOptions, QuantConfig, QuantFormat
+
+    pairs = []
+    if nvfp4:
+        quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+        pairs.append(("nvfp4", quant, (CutlassGemmConfig, CudnnGemmConfig)))
+    if fp8:
+        quant = QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        )
+        pairs.append(
+            ("fp8", quant, (CutlassGemmConfig, CublasGemmConfig, CudnnGemmConfig))
+        )
+
+    rows = []
+    for pair_name, quant, candidates in pairs:
+        act = prepare_activations(a, quant=quant)
+        for candidate in candidates:
+            key = candidate.backend_key
+            cfg = GemmConfig(quant=quant, backend=BackendOptions((candidate(),)))
+            try:
+                pack = prepare_weight_pack(w, cfg)
+                layer = GemmLayer(cfg, device=a.device)
+                layer.prepare(pack)
+            except Exception as exc:
+                msg = str(exc).strip().splitlines()
+                print(
+                    f"  skip GemmLayer[{pair_name}]({key}): {msg[0][:90] if msg else exc}"
+                )
+                continue
+            rows.append(
+                (
+                    f"{_LEGACY_NAME[pair_name]}({key})",
+                    legacy_call(pair_name, key, act, pack.get_view(key), out),
+                )
+            )
+            rows.append(
+                (
+                    f"GemmLayer[{pair_name}]({key})",
+                    lambda layer=layer, act=act: layer(act, out=out),
+                )
+            )
+    return rows
+
+
+_LEGACY_NAME = {"nvfp4": "mm_fp4", "fp8": "bmm_fp8"}
+
+
+def legacy_call(pair_name, backend, act, view, out):
+    """The legacy function on the pack's own tensors (what the unified runner launches)."""
+    if pair_name == "fp8":
+        a3, o3 = act.a.unsqueeze(0), out.unsqueeze(0)
+        return lambda: flashinfer.bmm_fp8(
+            a3,
+            view["b3"],
+            act.a_scale,
+            view["b_scale"],
+            torch.bfloat16,
+            o3,
+            backend=backend,
+        )
+    alpha = (1.0 / (act.a_global_scale * view["b_global_scale"])).reshape(1).float()
+    return lambda: flashinfer.mm_fp4(
+        act.a,
+        view["b_t"],
+        act.a_scale,
+        view["b_descale_t"],
+        alpha,
+        torch.bfloat16,
+        out=out,
+        block_size=16,
+        use_8x4_sf_layout=False,
+        backend=backend,
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -76,7 +171,7 @@ def main():
         "--api",
         nargs="+",
         default=["bf16", "fp4"],
-        choices=["bf16", "fp4", "mxfp8", "fp8", "quant"],
+        choices=["bf16", "fp4", "mxfp8", "fp8", "quant", "unified"],
     )
     ap.add_argument(
         "--only", nargs="+", default=[], help="keep rows whose name contains one"
@@ -258,6 +353,14 @@ def main():
             lambda: flashinfer.nvfp4_quantize(a, ga, sfLayout=layout, do_shuffle=False),
         )
         add("fp4_quantize(a)", lambda: flashinfer.fp4_quantize(a, ga))
+
+    if "unified" in args.api:
+        # Each GemmLayer row follows the legacy row it delegates to: same
+        # quantized operands, same kernel, so the gap is the layer's dispatch.
+        for name, fn in unified_rows(
+            a, w, out, nvfp4=blackwell, fp8=(props.major, props.minor) >= (8, 9)
+        ):
+            add(name, fn)
 
     base = None
     if args.compare:
