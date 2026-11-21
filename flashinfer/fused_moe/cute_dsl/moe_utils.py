@@ -229,8 +229,8 @@ def validate_pre_fc2_routing(
         or swap_ab
     ):
         raise ValueError(
-            "routing_weights_before_fc2 requires W4A4, ClampedRelu2, "
-            "BF16 output, and swap_ab=False"
+            "routing_weights_before_fc2 requires NVFP4 W4A4 (quant_mode='w4a4'), "
+            "ClampedRelu2, BF16 output, and swap_ab=False"
         )
 
 

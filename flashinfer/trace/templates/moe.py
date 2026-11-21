@@ -4136,7 +4136,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
     name_prefix="cute_dsl_fused_moe",
     description=(
         "CuteDSL fused MoE on SM100, SM103, or SM107 (MX formats exclude SM107). "
-        "Runs W4A4, W4A8, W4A16, or MXFP8 with precomputed top-k routing."
+        "Runs W4A4, W4A8, W4A16, MXFP8, or MXFP4 with precomputed top-k routing."
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
@@ -4149,7 +4149,9 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
         "input_width": Var(
-            description="hidden_size // 2 for W4A4; hidden_size for W4A8/W4A16/MXFP8."
+            description=(
+                "hidden_size // 2 for W4A4/MXFP4; hidden_size for W4A8/W4A16/MXFP8."
+            )
         ),
         "num_packed_hidden": Var(
             description="hidden_size // 2 for FP4 weights; hidden_size for MXFP8."
@@ -4187,13 +4189,13 @@ cute_dsl_fused_moe_trace = TraceTemplate(
     inputs={
         "x": Tensor(
             ["num_tokens", "input_width"],
-            description="Packed W4A4, E4M3 W4A8/MXFP8, or BF16 W4A16 input.",
+            description="Packed W4A4/MXFP4, E4M3 W4A8/MXFP8, or BF16 W4A16 input.",
         ),
         "x_sf": Tensor(
             ["num_tokens", "num_fp4_hidden_blocks"],
             optional=True,
             description=(
-                "Linear activation scales for W4A4/W4A8/MXFP8; omitted for W4A16. "
+                "Linear activation scales for W4A4/W4A8/MXFP8/MXFP4; omitted for W4A16. "
                 "W4A4 also accepts a trailing singleton dimension."
             ),
         ),
@@ -4236,7 +4238,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             optional=True,
             description=(
                 "Global scale for W4A4 FC2 input quantization; omitted for "
-                "W4A8/W4A16/MXFP8."
+                "W4A8/W4A16/MXFP8/MXFP4."
             ),
         ),
         "w2_weight": Tensor(
@@ -4276,7 +4278,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "quant_mode": Scalar(
             "string",
             optional=True,
-            description="Compute mode: 'w4a4', 'w4a8', 'w4a16', or 'mxfp8'.",
+            description="Compute mode: 'w4a4', 'w4a8', 'w4a16', 'mxfp8', or 'mxfp4'.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
