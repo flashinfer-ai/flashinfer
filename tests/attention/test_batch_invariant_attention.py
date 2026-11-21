@@ -3681,6 +3681,13 @@ def test_noncausal_fingerprint_is_a_function_of_head_dim_and_mode(op):
     assert (
         len({bi.fingerprint(op, head_dim=D, causal=False) for D in (64, 128, 256)}) == 3
     )
+    assert {
+        D: bi.fingerprint(op, head_dim=D, causal=False) for D in (64, 128, 256)
+    } == {
+        64: "attn-bf16-d64-nc-5c64fc377eb66759",
+        128: "attn-bf16-d128-nc-421e018610a7f93c",
+        256: "attn-bf16-d256-nc-603c24eeb8691c0a",
+    }
     # the pinned causal fingerprints are unchanged by the new class
     from flashinfer.attention.batch_invariant.spec import FINGERPRINTS
 
@@ -4565,6 +4572,132 @@ def test_noncausal_member_kernels_have_their_own_names():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("kind", ["prefill", "ragged", "decode"])
+@pytest.mark.parametrize("causal", [True, False])
+def test_mask_mode_reaches_the_plan_and_every_kernel_lookup(monkeypatch, kind, causal):
+    """Device-free: a plan through the wrappers' delegate records its mask mode, and a run with the LSE, with sinks and
+    with both asks for the kernels of that mode and member -- ``_nc`` under ``causal=False``, ``_nc_sink`` with sinks, in
+    the row body or the Swaps body and in the fixup -- whatever else the call carries. The kernels are stubbed."""
+    from flashinfer import utils
+    from flashinfer.attention.batch_invariant import engine, fixup
+    from flashinfer.attention.batch_invariant.blocks import compile as row
+    from flashinfer.attention.batch_invariant.blocks import operands as row_operands
+    from flashinfer.attention.batch_invariant.swaps import compile as swaps
+    from flashinfer.attention.batch_invariant.swaps import operands as swaps_operands
+    from flashinfer.attention.batch_invariant.wrappers import BatchInvariantAttention
+
+    names = []
+
+    def stub(module):
+        def get(*args, **kw):
+            names.append(module.kernel_name(*args, **kw))
+            return lambda *operands: None
+
+        return get
+
+    monkeypatch.setattr(row, "get_compiled_attention", stub(row))
+    monkeypatch.setattr(swaps, "get_compiled_swaps", stub(swaps))
+    monkeypatch.setattr(fixup, "get_fixup", stub(fixup))
+    monkeypatch.setattr(engine, "device_sm_count", lambda device: 204)
+    monkeypatch.setattr(engine, "hw_row_max_enabled", lambda device=None, D=128: False)
+    monkeypatch.setattr(row_operands, "arch_smem_cap", lambda device=None: 228 << 10)
+    monkeypatch.setattr(swaps_operands, "arch_smem_cap", lambda device=None: 228 << 10)
+    monkeypatch.setattr(utils, "device_support_pdl", lambda device: False)
+
+    D, Hq, Hkv, page, q_len = 256, 4, 2, 16, 3
+    kv_lens = [5000, 40, 2100]
+    q_lens = [q_len] * 3 if kind == "decode" else [700, 3, 2100]
+    d = object.__new__(BatchInvariantAttention)
+    d.kind, d.kv_layout, d.device = kind, "NHD", torch.device("cpu")
+    d.workspace = torch.empty(64 << 20, dtype=torch.uint8)
+    d._planned = None
+    n_pages = [-(-L // page) for L in kv_lens]
+    paged = kind != "ragged"
+    kv_indptr = _i32(
+        [0] + list(torch.cumsum(torch.tensor(n_pages if paged else kv_lens), 0))
+    )
+    d.plan(
+        qo_indptr=None
+        if kind == "decode"
+        else _i32([0] + list(torch.cumsum(torch.tensor(q_lens), 0))),
+        kv_indptr=kv_indptr,
+        kv_indices=torch.arange(sum(n_pages), dtype=torch.int32) if paged else None,
+        kv_last_page_len=_i32(
+            [L - (n - 1) * page for L, n in zip(kv_lens, n_pages, strict=True)]
+        )
+        if paged
+        else None,
+        num_qo_heads=Hq,
+        num_kv_heads=Hkv,
+        head_dim_qk=D,
+        head_dim_vo=D,
+        page_size=page,
+        causal=causal,
+        window_left=-1,
+        logits_soft_cap=None,
+        pos_encoding_mode="NONE",
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        o_data_type=torch.bfloat16,
+        sm_scale=None,
+        q_len_per_req=q_len,
+    )
+    assert d._causal is causal and d._planned.causal is causal
+    plan = d._planned.plan
+    if (
+        kind == "decode"
+    ):  # split units: the fold that completes their rows is a kernel lookup too
+        assert plan.groups and engine.swaps_n_pad(plan) > 0
+    else:
+        assert engine.swaps_n_pad(plan) == 0  # the row body
+    q = torch.zeros(sum(q_lens), Hq, D, dtype=torch.bfloat16)
+    if paged:
+        k = torch.zeros(sum(n_pages), page, Hkv, D, dtype=torch.bfloat16)
+    else:
+        k = torch.zeros(sum(kv_lens), Hkv, D, dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    sinks = torch.zeros(Hq)
+    mode = "" if causal else "_nc"
+    for given, return_lse in ((None, True), (sinks, False), (sinks, True)):
+        names.clear()
+        d.run(
+            q,
+            k,
+            v,
+            out=None,
+            return_lse=return_lse,
+            lse=None,
+            window_left=None,
+            sinks=given,
+        )
+        want = mode + ("" if given is None else "_sink")
+        assert names and all(n.endswith(want) for n in names), (names, want)
+        assert all(("_nc" in n) is (not causal) for n in names), names
+        assert all(("_sink" in n) is (given is not None) for n in names), names
+        assert any(n.startswith("attn_fixup_") for n in names) is bool(
+            plan.fixup_groups
+        )
+    # the engine's own entry points carry the mode the same way
+    planned = engine.plan_attention(
+        _i32([0, 3, 6]),
+        _i32([0, 300, 900]),
+        None,
+        Hq,
+        Hkv,
+        D,
+        1,
+        -1,
+        None,
+        None,
+        "cpu",
+        ragged=True,
+        causal=causal,
+    )
+    assert planned.causal is causal
+    assert engine.plan_storage(planned) and engine.plan_tables(planned)
+
+
+@pytest.mark.cpu_only
 def test_noncausal_member_terms_are_the_members_of_the_final_state():
     """Under the non-causal class the LSE and the sink step read the final ``(m, l)`` of the fold over ``[0, kv_len)``: the
     terms do not depend on the row's position, and they are those of the causal row at the last position."""
@@ -4748,7 +4881,8 @@ def test_noncausal_members_batch_permutation_and_subbatch_invariance(D, with_sin
 def test_noncausal_members_config_agreement(D):
     """R3 for the members of the non-causal class: every kernel site that holds a row's final ``(m, l)`` -- the fused unit's
     epilogue, the fixup kernel, the in-kernel fold, the Swaps body and (D = 64) the paired placement -- stores the same LSE
-    bits and takes the same sink step, over the configuration space on a prefill-shaped and a small-unit batch."""
+    bits and takes the same sink step, over the configuration space on a prefill-shaped and a small-unit batch. Every
+    configuration runs the LSE alone, sinks alone and sinks with the LSE."""
     from dataclasses import replace
 
     from flashinfer.attention.batch_invariant import engine
@@ -4784,6 +4918,7 @@ def test_noncausal_members_config_agreement(D):
             for s in (None, sinks)
         }
         assert not torch.equal(ref[("log2", True)][1], ref[("log2", False)][1])
+        sink_out = bits(run_paged_prefill(pr, causal=False, run_kw=dict(sinks=sinks)))
         for n, cfg in enumerate(cfgs):
             planned = engine.plan_attention(
                 pr.qo_indptr,
@@ -4810,11 +4945,8 @@ def test_noncausal_members_config_agreement(D):
                 sites.add(f"{body}-inkernel")
             if cfg.q2 and plan.num_launch is not None:
                 sites.add("paired")
-            for base, s in (
-                (("log2", sinks), ("ln", None))
-                if n % 2 == 0
-                else (("ln", sinks), ("log2", None))
-            ):
+            base = ("log2", "ln")[n % 2]
+            for s, with_lse in ((None, True), (sinks, False), (sinks, True)):
                 got = engine.run_attention(
                     planned,
                     pr.q,
@@ -4827,20 +4959,83 @@ def test_noncausal_members_config_agreement(D):
                     "NHD",
                     None,
                     cfg,
-                    return_lse=True,
+                    return_lse=with_lse,
                     lse_base=base,
                     sinks=s,
                 )
-                out, lse = _both(got)
                 want = ref[(base, s is not None)]
-                assert torch.equal(out, want[0]), (cfg, base, s is not None)
-                assert torch.equal(lse, want[1]), (cfg, base, s is not None)
+                what = (cfg, base, s is not None, with_lse)
+                if with_lse:
+                    out, lse = _both(got)
+                    assert torch.equal(lse, want[1]), what
+                else:
+                    out = bits(got)
+                    assert torch.equal(out, sink_out), what
+                assert torch.equal(out, want[0]), what
     want_sites = {
         f"{b}-{k}" for b in ("row", "swaps") for k in ("fused", "fixup", "inkernel")
     }
     if D == 64:
         want_sites.add("paired")
     assert sites >= want_sites, want_sites - sites
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_members_large_batch_equals_single_requests(D):
+    """A large non-causal batch -- many requests of several chunks, split units completed by the fixup kernel and by the
+    in-kernel fold -- gives every request the output and LSE bits of its single-request run, with sinks; the plan carries
+    the non-causal mode and every row sees its request's whole key range (the last row's bits are the causal last row's)."""
+    import random
+
+    rng = random.Random(72 + D)
+    n = 40
+    kv_lens = [rng.choice([40, 513, 1100, 2100, 3300, 5000]) for _ in range(n)]
+    q_lens = [rng.choice([1, 3, 130, 600]) for _ in range(n)]
+    pr = Problem(q_lens, kv_lens, 8, 2, D, 16, seed=72)
+    sinks = sink_logits(pr, seed=D)
+    kw = dict(LSE, sinks=sinks)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device, mb=512), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        D,
+        16,
+        causal=False,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        has_sinks=True,
+    )
+    planned = w._batch_invariant._planned
+    plan = planned.plan
+    assert planned.causal is False
+    assert plan.groups and plan.fixup_groups and any(plan.group_inkernel)
+    full = _both(w.run(pr.q, pr.cache("NHD"), **kw))
+    got_r = _both(_nc_ragged(pr, kw))
+    assert torch.equal(got_r[0], full[0]) and torch.equal(got_r[1], full[1])
+    for i in range(0, n, 3):
+        one = Problem([q_lens[i]], [kv_lens[i]], 8, 2, D, 16, seed=73)
+        qa, qb = int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])
+        ka, kb = int(pr.kv_indptr_rag[i]), int(pr.kv_indptr_rag[i + 1])
+        one.q[:] = pr.q[qa:qb]
+        one.k_rag[:] = pr.k_rag[ka:kb]
+        one.v_rag[:] = pr.v_rag[ka:kb]
+        one = _repack(one)
+        got = _both(run_paged_prefill(one, causal=False, run_kw=kw))
+        assert torch.equal(got[0], full[0][qa:qb]), i
+        assert torch.equal(got[1], full[1][qa:qb]), i
+        if q_lens[i] <= kv_lens[i]:
+            last = _both(run_paged_prefill(one, causal=True, run_kw=kw))
+            assert torch.equal(last[0][-1], got[0][-1]), i
+            assert torch.equal(last[1][-1], got[1][-1]), i
+            if q_lens[i] > 1:
+                assert not torch.equal(last[1][0], got[1][0]), i
 
 
 @needs_device
