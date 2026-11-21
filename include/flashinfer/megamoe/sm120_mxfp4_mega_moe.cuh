@@ -154,10 +154,10 @@ struct Args {
   const int64_t* topk_ids;  // [T][TOPK] global expert ids, -1 = masked route
   const float* topk_w;      // [T][TOPK]
   __nv_bfloat16* out;       // [T][H]
-  const uint8_t* l1;        // [EL][2I][H/2] packed E2M1 W13, row-major, gate/up rows interleaved
+  const uint8_t* l1;        // [EL][2I][H/2] packed E2M1 W13, interleaved or gate/up-contiguous
   const uint8_t* l2;        // [EL][H][I/2] packed E2M1 W2, row-major
-  const uint8_t* l1s;       // [EL][2I/16][H/128][16] UE8M0 x4 words of W13
-  const uint8_t* l2s;       // [EL][H/16][I/128][16] UE8M0 x4 words of W2
+  const uint8_t* l1s;       // UE8M0 W13 scales in kernel, canonical or DeepGEMM MN-major layout
+  const uint8_t* l2s;       // UE8M0 W2 scales in kernel, canonical or DeepGEMM MN-major layout
   size_t l1_stride, l2_stride, l1s_stride, l2s_stride;  // bytes per expert
   uint8_t* inter;                                       // [EL][W*TCAP][I] e4m3 (local)
   uint32_t* inter_s;                                    // [EL][W*TCAP][I/128]
@@ -167,7 +167,16 @@ struct Args {
   Gin gin;
   int T, H, I, EL, W, TOPK, TCAP, rank;
   float swiglu_limit;
+  bool w13_gate_up_interleaved = true;
+  bool scales_are_canonical = false;
+  bool scales_are_deepgemm = false;
 };
+
+__device__ __forceinline__ int w13_row(int row, int intermediate) {
+  if (intermediate == 0) return row;
+  const int block = row / 16, j = row % 16;
+  return block * 8 + j % 8 + (j >= 8 ? intermediate : 0);
+}
 
 __device__ __forceinline__ const uint8_t* w13_of(const Args& a, int el) {
   return a.l1 + size_t(el) * a.l1_stride;
@@ -300,19 +309,40 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
                                           const uint32_t* WS, int nblocks, int nb0, int K,
                                           const uint8_t* const (&xrow)[NH],
                                           const uint32_t* const (&xsrow)[NH], int lane,
-                                          int kc_begin = 0, int kc_end = -1) {
+                                          int w13_intermediate = 0, int kc_begin = 0,
+                                          int kc_end = -1, bool canonical_scales = false,
+                                          int canonical_intermediate = 0,
+                                          bool deepgemm_scales = false) {
   const int g = lane / 4, c = lane % 4;
   const int kch = K / 64, kq = K / 128;
   const uint4* wp[kNbPerWarp][2];  // rows g, g + 8 of block nb0 + j, at this lane's 16 bytes
   const uint32_t* sp[kNbPerWarp];
+  const uint8_t* canonical_sp[kNbPerWarp];
+  const uint8_t* deepgemm_sp[kNbPerWarp];
 #pragma unroll
   for (int j = 0; j < kNbPerWarp; ++j) {
 #pragma unroll
-    for (int r = 0; r < 2; ++r)
-      wp[j][r] =
-          reinterpret_cast<const uint4*>(W + size_t((nb0 + j) * 16 + g + 8 * r) * (K / 2)) + c;
+    for (int r = 0; r < 2; ++r) {
+      const int row = w13_row((nb0 + j) * 16 + g + 8 * r, w13_intermediate);
+      wp[j][r] = reinterpret_cast<const uint4*>(W + size_t(row) * (K / 2)) + c;
+    }
+    const int scale_row = w13_row((nb0 + j) * 16 + g + (lane & 1) * 8,
+                                  canonical_intermediate);
+    canonical_sp[j] = reinterpret_cast<const uint8_t*>(WS) + scale_row * (K / 32);
+    deepgemm_sp[j] = reinterpret_cast<const uint8_t*>(WS) +
+                     w13_row((nb0 + j) * 16 + g + (lane & 1) * 8,
+                             w13_intermediate != 0 ? w13_intermediate
+                                                   : canonical_intermediate) *
+                         4;
     sp[j] = WS + size_t(nb0 + j) * kq * 16 + g + (lane & 1) * 8;
   }
+  auto scales_at = [&](int j, int k128) {
+    if (deepgemm_scales)
+      return __ldg(reinterpret_cast<const uint32_t*>(deepgemm_sp[j] +
+                                                     size_t(k128) * nblocks * 64));
+    if (!canonical_scales) return __ldg(sp[j] + k128 * 16);
+    return __ldg(reinterpret_cast<const uint32_t*>(canonical_sp[j] + k128 * 4));
+  };
   const uint2* xp[NH];
 #pragma unroll
   for (int h = 0; h < NH; ++h) xp[h] = reinterpret_cast<const uint2*>(xrow[h]) + c;
@@ -323,7 +353,8 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
   if (kc_end < 0) kc_end = kch;
   // lanes 0..15 prefetch row lane of the block kPfAhead bytes ahead, one 128-byte line (an
   // iteration's K256) per iteration
-  const char* pf = reinterpret_cast<const char*>(W) + size_t(nb0 * 16 + (lane & 15)) * (K / 2);
+  const char* pf = reinterpret_cast<const char*>(W) +
+                   size_t(w13_row(nb0 * 16 + (lane & 15), w13_intermediate)) * (K / 2);
   // 8-token items (one MMA per weight fragment) leave the loop waiting on DRAM: the next step's
   // weights and scales are loaded into a second buffer while this step's MMAs run. The buffer takes
   // the kernel to ~168 registers, one CTA per SM (the grid follows the occupancy). P2P build only:
@@ -344,7 +375,7 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
 #pragma unroll
       for (int s = 0; s < (kUnroll + 1) / 2; ++s)
 #pragma unroll
-        for (int j = 0; j < kNbPerWarp; ++j) sf[j][s] = __ldg(sp[j] + (k0 / 2 + s) * 16);
+        for (int j = 0; j < kNbPerWarp; ++j) sf[j][s] = scales_at(j, k0 / 2 + s);
     };
     if (kc_begin < kc_end) load(kc_begin, wq, sfa);
     for (int k0 = kc_begin; k0 < kc_end; k0 += kUnroll) {
@@ -419,7 +450,7 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
 #pragma unroll
     for (int q = 0; q < (kUnroll + 1) / 2; ++q)
 #pragma unroll
-      for (int j = 0; j < kNbPerWarp; ++j) sfa[j][q] = __ldg(sp[j] + (k0 / 2 + q) * 16);
+      for (int j = 0; j < kNbPerWarp; ++j) sfa[j][q] = scales_at(j, k0 / 2 + q);
 #pragma unroll
     for (int u = 0; u < kUnroll; ++u) {
       const int kc = k0 + u;
@@ -911,7 +942,9 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
 #endif
           xs[h] = reinterpret_cast<const uint32_t*>(xr[h] + H);
         }
-        item_gemm<NH>(acc, w13_of(a, el), ws13_of(a, el), 2 * I / 16, nb0, H, xr, xs, lane);
+        item_gemm<NH>(acc, w13_of(a, el), ws13_of(a, el), 2 * I / 16, nb0, H, xr, xs,
+                      lane, a.w13_gate_up_interleaved ? 0 : I, 0, -1,
+                      a.scales_are_canonical, I, a.scales_are_deepgemm);
         // SwiGLU: acc rows g (gate) / g+8 (up) of block nb -> inter col nb*8+g; tokens 2c, 2c+1
         constexpr int kItemInter = kRowsPerItem / 2;  // inter cols per item (multiple of 32)
         constexpr int kGroups = kItemInter / 32;
@@ -957,7 +990,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           xr[h] = a.inter + r * I;
           xs[h] = a.inter_s + r * (I / 128);
         }
-        item_gemm<NH>(acc, w2_of(a, el), ws2_of(a, el), H / 16, nb0, I, xr, xs, lane);
+        item_gemm<NH>(acc, w2_of(a, el), ws2_of(a, el), H / 16, nb0, I, xr, xs, lane,
+                      0, 0, -1, a.scales_are_canonical, 0, a.scales_are_deepgemm);
 #pragma unroll
         for (int jb = 0; jb < kNbPerWarp; ++jb) {
           const int col = (warp * kNbPerWarp + jb) * 16 + g;  // 0..kRowsPerItem-1 within the item
