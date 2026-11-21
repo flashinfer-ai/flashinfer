@@ -75,6 +75,8 @@ def _check_act_and_mul_input(input: torch.Tensor) -> None:
     # multiple of 16 bytes.
     if input.shape[-1] % 2 != 0:
         raise ValueError("The last dimension must be even (2 * hidden_size).")
+    if not input.is_contiguous():
+        raise ValueError("Input tensor must be contiguous.")
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
@@ -85,6 +87,8 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.shape[-1] == 2 * output.shape[-1], (
         f"{input.shape[-1]} != {2 * output.shape[-1]}"
     )
+    if not output.is_contiguous():
+        raise ValueError("Output tensor must be contiguous.")
 
 
 @flashinfer_api(trace=silu_and_mul_trace)
@@ -99,9 +103,11 @@ def silu_and_mul(
     ----------
     input: torch.Tensor
         Input tensor, shape (..., 2 * hidden_size).
+        Must be contiguous.
 
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor in place.
+        Must be contiguous if specified.
 
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
@@ -143,9 +149,11 @@ def gelu_tanh_and_mul(
     ----------
     input: torch.Tensor
         Input tensor, shape (..., 2 * hidden_size).
+        Must be contiguous.
 
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor in place.
+        Must be contiguous if specified.
 
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
@@ -183,9 +191,11 @@ def gelu_and_mul(
     ----------
     input: torch.Tensor
         Input tensor, shape (..., 2 * hidden_size).
+        Must be contiguous.
 
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor in place.
+        Must be contiguous if specified.
 
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
