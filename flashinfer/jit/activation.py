@@ -36,9 +36,15 @@ using namespace flashinfer;
 {{ act_func_def }}
 
 void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
-  int d = input.size(input.ndim() -1) / 2;
-  int64_t num_tokens = input.numel() / input.size(input.ndim() -1);
-  dim3 grid(num_tokens);
+  CHECK_CUDA(input);
+  CHECK_DEVICE(out, input);
+  if (input.numel() == 0) {
+    return;
+  }
+  CHECK_CONTIGUOUS(out);
+  CHECK_CONTIGUOUS(input);
+  int d = input.size(input.ndim() - 1) / 2;
+  int64_t num_tokens = input.numel() / input.size(input.ndim() - 1);
 
   cudaSetDevice(out.device().device_id);
   int num_sms_attr = 0;

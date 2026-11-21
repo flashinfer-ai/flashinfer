@@ -128,5 +128,44 @@ def test_act_and_mul_cuda_graph():
     torch.testing.assert_close(y2, y2_ref, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("act", ["silu", "gelu", "gelu_tanh"])
+def test_act_and_mul_non_contiguous_rejected(act):
+    fn = getattr(flashinfer.activation, f"{act}_and_mul")
+    buf = torch.full((4, 544), float("nan"), device="cuda", dtype=torch.float16)
+    buf[:, :512] = torch.randn((4, 512), device="cuda", dtype=torch.float16)
+    x_nc = buf[:, :512]
+    assert not x_nc.is_contiguous()
+
+    with pytest.raises(ValueError, match="contiguous"):
+        fn(x_nc)
+
+    x_c = torch.randn((4, 512), device="cuda", dtype=torch.float16)
+    out_buf = torch.zeros((4, 288), device="cuda", dtype=torch.float16)
+    out_nc = out_buf[:, :256]
+    assert not out_nc.is_contiguous()
+
+    with pytest.raises(ValueError, match="contiguous"):
+        fn(x_c, out=out_nc)
+
+    # Also verify the underlying C++ kernel wrapper rejects non-contiguous tensors directly.
+    op = getattr(flashinfer.activation.get_act_and_mul_module(act), f"{act}_and_mul")
+    out_c = torch.empty((4, 256), device="cuda", dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="contiguous"):
+        op(out_c, x_nc, False)
+    with pytest.raises(RuntimeError, match="contiguous"):
+        op(out_nc, x_c, False)
+
+
+@pytest.mark.parametrize("act", ["silu", "gelu", "gelu_tanh"])
+@pytest.mark.parametrize("shape", [(0, 512), (2, 0, 512), (4, 0)])
+def test_act_and_mul_empty(act, shape):
+    fn = getattr(flashinfer.activation, f"{act}_and_mul")
+    x = torch.empty(shape, device="cuda", dtype=torch.float16)
+    y = fn(x)
+    assert y.shape == shape[:-1] + (shape[-1] // 2,)
+    assert y.device == x.device
+    assert y.dtype == x.dtype
+
+
 if __name__ == "__main__":
     test_fused_silu_mul(128, 1, 1, True)
