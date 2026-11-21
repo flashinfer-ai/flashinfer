@@ -1,0 +1,16 @@
+{
+  "comment": "Dispatch surface of the specialized SM90 CuTe-DSL per-token-group fp8 quantizer, behind per_token_group_quant_8bit's 'specialized' backend. 'backends' lists the backend strings; the op entry carries the auto-routing keys (the compiled-in guards in flashinfer/quantization/fp8_quantization.py stay authoritative). backend='auto' routes to the specialized kernel only when this file is present and well-formed; FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 disables the specialized kernel regardless of this file: backend='auto' keeps the stock routes, explicit backend='specialized' raises.",
+  "backends": ["auto", "specialized", "cutile", "cuda"],
+  "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
+  "deprecated_kill_switch_alias": "FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL",
+  "ops": {
+    "per_token_group_quant_8bit": {
+      "input": "2D contiguous bfloat16 CUDA tensor, last dim a multiple of 128, nonzero numel",
+      "group_size": 128,
+      "dst_dtype": "float8_e4m3fn",
+      "scales": "row-major float32 (column_major_scales / scale_tma_aligned / scale_ue8m0 all false)",
+      "compute_capability": [9, 0],
+      "runtime": "nvidia-cutlass-dsl (optional; absent means stock routes)"
+    }
+  }
+}
