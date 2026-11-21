@@ -24,6 +24,7 @@ import torch
 
 import flashinfer
 from flashinfer import _top_p_renorm_specialized
+from flashinfer.jit.core import current_compilation_context
 from flashinfer.utils import device_support_pdl
 from tests.infra.test_helpers.parametrize import (
     parametrize_product,
@@ -4817,3 +4818,200 @@ def test_per_request_param_indexed_by_row(api, vocab_size, remap, expanded):
         else:
             # rows 0 and 2 keep their argmax alone, and row i's argmax is class i.
             assert counts[row_idx].item() == lanes, (remap, lane, counts)
+
+
+def _storage_offset_view(tensor, shift):
+    """A contiguous copy of ``tensor`` that starts ``shift`` elements into its storage."""
+    storage = torch.empty(
+        shift + tensor.numel(), device=tensor.device, dtype=tensor.dtype
+    )
+    storage[shift:] = tensor.flatten()
+    view = storage[shift:].view(tensor.shape)
+    assert view.is_contiguous()
+    return view
+
+
+# name -> (call on the (batch, vocab) input, whether the input is logits)
+_UNALIGNED_INPUT_CALLS = {
+    "softmax": (lambda x: flashinfer.sampling.softmax(x), True),
+    "sampling_from_logits": (
+        lambda x: flashinfer.sampling.sampling_from_logits(x, seed=7, offset=0),
+        True,
+    ),
+    "sampling_from_probs": (
+        lambda x: flashinfer.sampling.sampling_from_probs(x, seed=7, offset=0),
+        False,
+    ),
+    "top_p_sampling_from_probs": (
+        lambda x: flashinfer.sampling.top_p_sampling_from_probs(
+            x, 0.9, seed=7, offset=0
+        ),
+        False,
+    ),
+    "top_k_sampling_from_probs": (
+        lambda x: flashinfer.sampling.top_k_sampling_from_probs(
+            x, 10, seed=7, offset=0
+        ),
+        False,
+    ),
+    "min_p_sampling_from_probs": (
+        lambda x: flashinfer.sampling.min_p_sampling_from_probs(
+            x, 0.05, seed=7, offset=0
+        ),
+        False,
+    ),
+    "top_k_top_p_sampling_from_probs": (
+        lambda x: flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            x, 10, 0.9, seed=7, offset=0
+        ),
+        False,
+    ),
+    "top_k_top_p_sampling_from_logits": (
+        lambda x: flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x, 10, 0.9, seed=7, offset=0
+        ),
+        True,
+    ),
+    "top_k_top_p_sampling_from_probs_joint": (
+        lambda x: flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            x, 10, 0.9, filter_apply_order="joint", seed=7, offset=0
+        ),
+        False,
+    ),
+    "top_p_renorm_probs": (
+        lambda x: flashinfer.sampling.top_p_renorm_probs(x, 0.9),
+        False,
+    ),
+    "top_k_renorm_probs": (
+        lambda x: flashinfer.sampling.top_k_renorm_probs(x, 10),
+        False,
+    ),
+    "top_k_mask_logits": (lambda x: flashinfer.sampling.top_k_mask_logits(x, 10), True),
+}
+
+
+def _unaligned_input(is_logits, vocab_size, dtype=torch.float32):
+    torch.manual_seed(42)
+    logits = torch.randn(4, vocab_size, device="cuda:0")
+    return (logits if is_logits else torch.softmax(logits, dim=-1)).to(dtype)
+
+
+@pytest.mark.parametrize("api", sorted(_UNALIGNED_INPUT_CALLS))
+def test_sampling_rejects_unaligned_input(api):
+    """A contiguous view at an unaligned storage offset is refused, not launched.
+
+    The kernels read 16 bytes at once when the vocabulary is a multiple of 4; launching
+    on such a view faults with a misaligned address and poisons the CUDA context.
+    """
+    call, is_logits = _UNALIGNED_INPUT_CALLS[api]
+    aligned = _unaligned_input(is_logits, 128)
+    for shift in (1, 2, 3):
+        with pytest.raises(ValueError, match="must be 16-byte aligned"):
+            call(_storage_offset_view(aligned, shift))
+    # the refusal comes before any launch: the context still works
+    call(aligned)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("api", sorted(_UNALIGNED_INPUT_CALLS))
+@pytest.mark.parametrize("shift,vocab_size", [(1, 127), (2, 126), (4, 128)])
+def test_sampling_accepts_offset_view_aligned_for_its_loads(api, shift, vocab_size):
+    """An offset view is read in place when its base suits the vector width of its rows."""
+    call, is_logits = _UNALIGNED_INPUT_CALLS[api]
+    aligned = _unaligned_input(is_logits, vocab_size)
+    expected = call(aligned)
+    actual = call(_storage_offset_view(aligned, shift))
+    if isinstance(expected, tuple):
+        expected, actual = expected[0], actual[0]
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("api", ["top_k_renorm_probs", "top_k_mask_logits"])
+def test_top_k_rejects_unaligned_half_precision_input(api, dtype):
+    """These two read half precision as stored, eight elements (16 bytes) at once."""
+    call, is_logits = _UNALIGNED_INPUT_CALLS[api]
+    aligned = _unaligned_input(is_logits, 128, dtype)
+    for shift in (1, 4):
+        with pytest.raises(ValueError, match="must be 16-byte aligned"):
+            call(_storage_offset_view(aligned, shift))
+    assert torch.equal(call(_storage_offset_view(aligned, 8)), call(aligned))
+
+
+def test_top_p_renorm_probs_reads_unaligned_large_vocab_in_place():
+    """The radix kernel used from 2048 tokens up has no alignment requirement."""
+    aligned = _unaligned_input(False, 32000)
+    assert torch.equal(
+        flashinfer.sampling.top_p_renorm_probs(_storage_offset_view(aligned, 1), 0.9),
+        flashinfer.sampling.top_p_renorm_probs(aligned, 0.9),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("vocab_size", [128, 65536])
+@pytest.mark.parametrize(
+    "api", ["top_k_top_p_sampling_from_logits", "top_k_top_p_sampling_from_probs"]
+)
+def test_top_k_top_p_sampling_rejects_unaligned_input_as_stored(api, vocab_size, dtype):
+    """The "top_k_first" order hands the input to a top-k kernel as stored.
+
+    128 tokens take the top-k mask / renorm kernels and 65536 the radix top-k fast path,
+    which has no check of its own: both must refuse the view rather than launch on it.
+    """
+    call, is_logits = _UNALIGNED_INPUT_CALLS[api]
+    aligned = _unaligned_input(is_logits, vocab_size, dtype)
+    with pytest.raises(ValueError, match="must be 16-byte aligned"):
+        call(_storage_offset_view(aligned, 1))
+    # an offset of 16 bytes is still read in place
+    in_place = _storage_offset_view(aligned, 16 // aligned.element_size())
+    assert torch.equal(call(in_place), call(aligned))
+
+
+@pytest.mark.parametrize(
+    "api",
+    [
+        "top_p_sampling_from_probs",
+        "top_k_sampling_from_probs",
+        "top_k_top_p_sampling_from_probs_joint",
+    ],
+)
+def test_split_row_sampling_reads_scalar_loaded_offset_view_in_place(api):
+    # 8194 tokens make the SM90 split-row launch stage rows with scalar loads, which need
+    # no alignment; the single-CTA kernels of other architectures read 8 bytes at once.
+    # The launch needs both an SM90 device and a kernel compiled for it: a build that
+    # targets an older architecture falls back to the single-CTA kernels.
+    targets = current_compilation_context.TARGET_CUDA_ARCHS
+    if torch.cuda.get_device_capability()[0] != 9 or all(m != 9 for m, _ in targets):
+        pytest.skip("split-row rejection sampling requires SM90 and an SM90 build")
+
+    call, is_logits = _UNALIGNED_INPUT_CALLS[api]
+    aligned = _unaligned_input(is_logits, 8194)
+    assert torch.equal(call(_storage_offset_view(aligned, 1)), call(aligned))
+
+
+def test_chain_speculative_sampling_rejects_unaligned_probs():
+    torch.manual_seed(42)
+    vocab_size = 128
+    draft_probs = torch.softmax(torch.randn(2, 2, vocab_size, device="cuda:0"), dim=-1)
+    target_probs = torch.softmax(torch.randn(2, 3, vocab_size, device="cuda:0"), dim=-1)
+    draft_token_ids = torch.randint(
+        0, vocab_size, (2, 2), device="cuda:0", dtype=torch.int32
+    )
+    sample = partial(flashinfer.sampling.chain_speculative_sampling, seed=7, offset=0)
+    with pytest.raises(ValueError, match="draft_probs must be 16-byte aligned"):
+        sample(_storage_offset_view(draft_probs, 1), draft_token_ids, target_probs)
+    with pytest.raises(ValueError, match="target_probs must be 16-byte aligned"):
+        sample(draft_probs, draft_token_ids, _storage_offset_view(target_probs, 1))
+    sample(draft_probs, draft_token_ids, target_probs)
+    torch.cuda.synchronize()
+
+
+def test_blackwell_softmax_rejects_unaligned_logits():
+    # A base that is not 32-byte aligned takes the OnlineSoftmax fallback, which reads
+    # 16 bytes at once: a base that is not 16-byte aligned must be refused before it.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    logits = _storage_offset_view(_unaligned_input(True, 128), 1)
+    with pytest.raises(ValueError, match="logits must be 16-byte aligned"):
+        flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)

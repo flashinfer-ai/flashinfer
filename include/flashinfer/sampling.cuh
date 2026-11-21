@@ -1740,6 +1740,28 @@ cudaError_t SplitRowRejectionSamplingFromProb(uint32_t cluster_size, T* probs, I
   return cudaSuccess;
 }
 
+/*!
+ * \brief Whether SplitRowRejectionSamplingFromProb launches for this input and reads probs with
+ *   scalar loads, so that its base needs no vector-load alignment. False whenever the single-CTA
+ *   kernels may run, including as the fallback of a kernel that was not compiled for SM90+.
+ */
+template <SplitRowSamplingMode MODE, typename T, typename IdType>
+inline bool SplitRowSamplingReadsScalars(uint32_t batch_size, uint32_t d) {
+  if (GetSplitRowSamplingClusterSize<MODE>(batch_size, d) <= 1) return false;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  // With VEC_SIZE == 4 the kernel stages float rows with 16-byte cp.async copies.
+  if (vec_size == 4 && std::is_same_v<T, float>) return false;
+  bool compiled_for_sm90 = false;
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    cudaFuncAttributes attr;
+    auto kernel = SplitRowRejectionSamplingFromProbKernel<SPLIT_ROW_SAMPLING_THREADS, SCAN_ALGO,
+                                                          VEC_SIZE, MODE, T, IdType>;
+    compiled_for_sm90 =
+        cudaFuncGetAttributes(&attr, kernel) == cudaSuccess && attr.ptxVersion >= 90;
+  });
+  return compiled_for_sm90;
+}
+
 template <typename DType>
 cudaError_t OnlineSoftmax(DType* logits, DType* output, uint32_t batch_size, uint32_t d,
                           DType* temperature_arr, DType temperature_val, void* workspace_buffer,

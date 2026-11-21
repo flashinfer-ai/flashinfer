@@ -22,6 +22,7 @@
 #include <limits>
 #include <vector>
 
+#include "sampling_utils.h"
 #include "tvm/ffi/container/array.h"
 #include "tvm_ffi_utils.h"
 
@@ -1288,6 +1289,9 @@ ParameterKind validate_logits_and_temperature(TensorView logits,
   CHECK_INPUT(logits);
   CHECK_DIM(2, logits);
   CHECK_INPUT_TYPE(logits, dl_float32);
+  // A base that is not 32-byte aligned takes the OnlineSoftmax fallback, whose vector loads
+  // still need the alignment checked here.
+  check_vector_load_alignment(logits, "logits");
   TVM_FFI_ICHECK_GT(logits.size(0), 0) << "logits must contain at least one row";
   TVM_FFI_ICHECK_GT(logits.size(1), 0) << "logits must contain at least one vocabulary entry";
   TVM_FFI_ICHECK_LE(static_cast<uint64_t>(logits.size(0)),
