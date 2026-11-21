@@ -60,11 +60,10 @@ pip install -U "nvidia-cutlass-dsl[cu13]"   # or pin, e.g. ==4.6.1
 ```
 
 The pt2605 container ships nvidia-cutlass-dsl **4.5.0**; the cutedsl mega
-kernels need ≥ 4.6.x. **4.6.1** is the perf-validated reference (the TUNING.md
-and benchmark tables were measured on it). **4.7.0** passed the drop harness,
-fused-quant unit tests, and the DeepGEMM, NVFP4 and MXFP8 MegaMoE multi-rank
-and oracle suites on 2026-08-10. Pin 4.6.1 for comparisons with the reference
-tables, since the 4.7.0 runs measured correctness only.
+kernels need ≥ 4.6.x. **4.6.1** is the performance reference. The July 22
+microbenchmarks used **4.5.2** with the mainloop workaround.
+**4.7.0** passed the drop harness, fused-quant unit tests, and the DeepGEMM,
+NVFP4 and MXFP8 MegaMoE multi-rank and oracle suites on 2026-08-10.
 
 History: 4.7.0 used to crash every four-rank
 `deep_gemm.fp8_fp4_mega_moe` launch with `CUDA_ERROR_MISALIGNED_ADDRESS`
@@ -410,7 +409,7 @@ reference first). See the module docstring for the columns.
 
 ## Benchmarking
 
-All numbers below were measured on **4× GB200 (SM100)** with the FlashInfer
+The July 22 microbenchmarks used **4× GB200 (SM100)** with the FlashInfer
 mainloop workaround and **nvidia-cutlass-dsl 4.5.2**, the version pinned by
 vLLM 0.25.1. With the workaround, 4.5.2 matches the 4.6.1 reference
 and is the runtime floor for this setup. Version 4.5.0 fails at
@@ -427,10 +426,10 @@ The July NVFP4 results use the implementation now selected with
 | column          | variant          | backend          | combine |
 |-----------------|------------------|------------------|-----|
 | `dg`            | `fi_dg`          | `sm100_fp8_fp4_bf16_deepgemm` | — |
-| `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | — |
-| `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | In-kernel FC2 reduction |
-| `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | E2M1 with one BF16 scale per 16 values |
-| `+combine_mxfp8`| `fi_combine_fp8` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | E4M3 with one E8M0 scale per 32 values |
+| `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy` | — |
+| `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy` | In-kernel FC2 reduction |
+| `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy` | E2M1 with one BF16 scale per 16 values |
+| `+combine_mxfp8`| `fi_combine_fp8` | `sm100_nvfp4_nvfp4_bf16_cutedsl_legacy` | E4M3 with one E8M0 scale per 32 values |
 
 - `e2e_pipelined` measures steady-state forward calls enqueued back to back,
   with activations prepared before timing.
@@ -614,7 +613,9 @@ attributes, input scalars and per-token scales retain their configured values.
 The measured boundary is the native collective kernel; a separate terminal
 reducer, staging and weight preparation are outside it.
 
-Select this implementation explicitly in the offline CLI:
+If your offline tuner defaults to the legacy NVFP4 kernel, pass
+`--implementation next` with the following options to select Standard.
+With a tuner that defaults to Standard, run:
 
 ```bash
 torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
@@ -622,9 +623,6 @@ torchrun --standalone --nproc_per_node=2 -m flashinfer.moe_ep.tune \
   --hidden 4096 --intermediate 1024 --num-experts 256 --topk 8 \
   --max-tokens 128 --live-tokens 65
 ```
-
-On v0.7.x releases whose tuner defaults to legacy, add `--implementation next`
-to select Standard.
 
 Both new Blackwell paths use exact capacity/live-token matching. Managed cache
 hits also write the configured MegaMoE file. `persistent_cache=False` disables
