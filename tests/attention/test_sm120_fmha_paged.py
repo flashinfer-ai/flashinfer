@@ -5,7 +5,7 @@
 Tests ``sm120_fmha_fp8_paged_prefill`` against a float32 PyTorch reference.
 Covers uniform and variable-length packed Q, MHA and GQA, causal and non-causal.
 
-Run on an SM120 GPU:
+Run on an SM120 or SM121 GPU:
     pytest tests/attention/test_sm120_fmha_paged.py -v
 """
 
@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from flashinfer.cute_dsl.availability import is_cute_dsl_experimental_available
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_sm12x_supported
 
 if not is_cute_dsl_experimental_available():
     pytest.skip("SM120 CuTe DSL dependencies are unavailable", allow_module_level=True)
@@ -23,8 +23,11 @@ if not is_cute_dsl_experimental_available():
 _device = torch.device("cuda") if torch.cuda.is_available() else None
 
 pytestmark = pytest.mark.skipif(
-    _device is None or get_compute_capability(_device) != (12, 0),
-    reason="SM120 FMHA requires SM120 GPU (compute capability 12.0)",
+    _device is None
+    or get_compute_capability(_device) not in ((12, 0), (12, 1))
+    or not is_sm12x_supported(_device),
+    reason="SM120 FMHA requires an SM120 or SM121 GPU (compute capability 12.0 or "
+    "12.1) and a CUDA version that supports it",
 )
 
 from flashinfer.attention.cute_dsl.sm120_fmha import sm120_fmha_fp8_paged_prefill
