@@ -1667,10 +1667,8 @@ __device__ __forceinline__ float atom_add_f32(float* p, float v) {
   asm volatile("atom.global.add.f32 %0, [%1], %2;" : "=f"(r) : "l"(p), "f"(v) : "memory");
   return r;
 }
-__device__ __forceinline__ unsigned ld_relaxed_gpu(const unsigned* p) {
-  unsigned v;
-  asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-  return v;
+__device__ __forceinline__ void fence_acq_rel_gpu() {
+  asm volatile("fence.acq_rel.gpu;" ::: "memory");
 }
 __device__ __forceinline__ void red_add_u32(unsigned* p, unsigned v) {
   asm volatile("red.relaxed.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
@@ -1748,9 +1746,13 @@ __device__ __forceinline__ void gemm1(SStatic& S, const Layout& L, Ring& rs, flo
   float acc[NB][4];
   int boff[NB];
   int cur_s = -1, cur_rg = 0, pst = 0, nt = 0;
-  // Partials are flushed with returning atomics; the returned values are consumed at the next
-  // flush, which proves the earlier atomics were performed at L2 before the expert is
-  // reported done (no memory fence on the consumer path).
+  // Expert readiness is published in two release/acquire handoffs. Each warp reports the experts
+  // whose partials it has completed in S.done_cnt with a CTA-scope release: after the warp barrier
+  // that follows the consumed returns of its returning atomics, or after the bulk async-group
+  // wait (its completion makes the reductions visible to the issuing thread). The signaller
+  // acquires that and releases each expert's grid counter at gpu scope; the table builder
+  // acquires the counter before it reads the partials. Only the CTA-scope release is on the
+  // consumer path.
   int signalled = 0;  // experts [0, signalled) reported to the signaller
   float pend[NB][4];
 #pragma unroll
@@ -1777,7 +1779,7 @@ __device__ __forceinline__ void gemm1(SStatic& S, const Layout& L, Ring& rs, flo
           asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
         else
           asm volatile("cp.async.bulk.wait_group 1;" ::: "memory");
-        atomicExch(&S.done_cnt[warp], s_end);
+        st_release_cta_s(&S.done_cnt[warp], s_end);
       }
       __syncwarp();
     }
@@ -1789,7 +1791,10 @@ __device__ __forceinline__ void gemm1(SStatic& S, const Layout& L, Ring& rs, flo
 #pragma unroll
       for (int q = 0; q < 4; ++q) sum += pend[n][q];
     const int bad = __any_sync(0xffffffffu, sum != sum) ? 1 : 0;
-    if (lane == 0) atomicExch(&S.done_cnt[warp], s_end | (bad << 16));
+    // every lane's atomics for experts < s_end precede lane 0's release (warp barrier), so the
+    // report covers the partials of the whole warp
+    __syncwarp();
+    if (lane == 0) st_release_cta_s(&S.done_cnt[warp], s_end | (bad << 16));
     signalled = max(signalled, s_end);
   };
   auto flush = [&]() {
@@ -2593,11 +2598,14 @@ __global__ void __launch_bounds__(NTHREADS, 1)
       while (s < n_active) {
         int s1 = n_active;
 #pragma unroll
-        for (int w = 0; w < NCW; ++w) s1 = min(s1, atomicAdd(&S.done_cnt[w], 0) & 0xffff);
+        for (int w = 0; w < NCW; ++w) s1 = min(s1, ld_acquire_cta_s(&S.done_cnt[w]) & 0xffff);
         if (s1 <= s) {
           __nanosleep(32);
           continue;
         }
+        // The acquires saw every consumer warp's release of experts [s, s1); one gpu-scope fence
+        // makes each counter increment below a release of those partials (cumulative).
+        fence_acq_rel_gpu();
         for (int k = s; k < s1; ++k) red_add_u32(&g_cnt[par][k], 1u);
         s = s1;
       }
@@ -2649,7 +2657,8 @@ __global__ void __launch_bounds__(NTHREADS, 1)
 #pragma unroll 1
     while (s0 < n_active) {
       const int s = s0 + lane;
-      const bool rdy = s < n_active && ld_relaxed_gpu(&g_cnt[par][s]) >= target;
+      // acquire: the count of G includes every CTA's release of expert s's partials
+      const bool rdy = s < n_active && ld_acquire_gpu(&g_cnt[par][s]) >= target;
       const unsigned b = __ballot_sync(0xffffffffu, rdy);
       int nr = (b == 0xffffffffu) ? 32 : (__ffs(~b) - 1);
       nr = min(nr, n_active - s0);
@@ -2657,6 +2666,8 @@ __global__ void __launch_bounds__(NTHREADS, 1)
         __nanosleep(64);
         continue;
       }
+      // the warp barrier orders lane k's acquire before every lane's reads of expert s0 + k
+      __syncwarp();
       const int p0 = S.slot_pstart[s0], p1 = S.slot_pstart[s0 + nr];
       if constexpr (TT == 6 || TT == 10) {
         // Pull complete fp32 rows into spare smem with bulk copies, then apply SwiGLU.
@@ -2741,8 +2752,8 @@ __global__ void __launch_bounds__(NTHREADS, 1)
   if constexpr (TT == 6 || TT == 10) {
     // T = 10: more than 8 tokens on one expert needs the two n-block (16 column) variants
     const bool wide = TT == 10 && S.max_tok > 8;
-    // One real accumulator partial uses a returning atomic after the warp's reductions; its
-    // consumed return orders the actual accumulator traffic before expert publication.
+    // The narrow path flushes its partials with bulk async reductions and reports an expert once
+    // their bulk async-group completed; the wide path uses returning atomics (see gemm1).
     if (!wide)
       gemm1<1, true, TT == 6 || TT == 10, TT == 6>(S, L, rs, gacc);
     else
