@@ -162,7 +162,7 @@ class GatherGemvBf16Fp4Sm12x:
         rows_per_hw: int = 2,
         unroll: int = 2,
         num_warps: int = 4,
-        max_resident_iters: int = 8,
+        max_resident_iters: int = 6,
         enable_pdl: bool = True,
     ):
         if hidden % 32 != 0:

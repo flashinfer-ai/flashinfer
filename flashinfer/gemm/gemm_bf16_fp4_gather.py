@@ -17,9 +17,11 @@ _KERNEL_CACHE: dict = {}
 _ROWS_PER_HALF_WARP = 2
 _UNROLL = 2
 _NUM_WARPS = 4
-# Activation chunks kept in registers per lane (512 elements each); larger K is
-# walked in stripes of this size so the kernel does not spill.
-_MAX_RESIDENT_ITERS = 8
+# Activation chunks kept in registers per lane (512 elements each). Larger K is
+# walked in balanced stripes of at most this size; a fully resident row spills
+# above K=4096. On GB10, 6 is within 0.5% of or faster than 8 for K in
+# {2048, 2560, 4096, 5120, 7168}.
+_MAX_RESIDENT_ITERS = 6
 
 _OUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _ID_DTYPES = (torch.int32, torch.int64)
