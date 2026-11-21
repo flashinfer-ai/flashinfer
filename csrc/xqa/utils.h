@@ -112,6 +112,21 @@ struct alignas(mha::max<uint32_t>(alignof(T),
   static constexpr uint32_t size = size_;
   Elem data[size];
 
+#ifdef _MSC_VER
+  // MSVC rejects by-value over-aligned parameters (C2719).
+  HOST_DEVICE_FUNC inline void fill(T const& val) {
+#pragma unroll
+    for (uint32_t i = 0; i < size; i++) {
+      data[i] = val;
+    }
+  }
+
+  static HOST_DEVICE_FUNC inline Vec<T, size> filled(T const& val) {
+    Vec<T, size> ret;
+    ret.fill(val);
+    return ret;
+  }
+#else
   HOST_DEVICE_FUNC inline void fill(T val) {
 #pragma unroll
     for (uint32_t i = 0; i < size; i++) {
@@ -124,6 +139,7 @@ struct alignas(mha::max<uint32_t>(alignof(T),
     ret.fill(val);
     return ret;
   }
+#endif
 
   HOST_DEVICE_FUNC inline Elem const& operator[](uint32_t i) const {
     assert(i < size);

@@ -23,11 +23,9 @@ from flashinfer.autotune_cache import (
 )
 from flashinfer.autotuner import (
     AutoTuner,
-    DynamicTensorSpec,
     TuningConfig,
     autotune,
 )
-from flashinfer.utils import next_positive_power_of_2
 
 from .utils import DummyRunner, reset_autotuner
 
@@ -58,17 +56,13 @@ def cache_root(tmp_path, monkeypatch):
 
 def _install_fake_profile(monkeypatch, times, record_configs=None):
     """Replace GPU profiling with a lookup table; returns the call log.
-    Pass a list as *record_configs* to also capture each TuningConfig.
-    *times* is a ``{tactic: time}`` table, or a ``(inputs, tactic) -> time``
-    callable when the winner must depend on the profiled shape."""
+    Pass a list as *record_configs* to also capture each TuningConfig."""
     calls = []
 
     def fake_profile(self, runner, inputs, tactic, tuning_config, **kwargs):
         calls.append(tactic)
         if record_configs is not None:
             record_configs.append(tuning_config)
-        if callable(times):
-            return float(times(inputs, tactic))
         return float(times[tactic])
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
@@ -351,51 +345,6 @@ def test_hydrate_only_context_enables_reuse(cache_root, monkeypatch):
         pass  # attach only; no calls inside
     _, tactic = AutoTuner.get().choose_one(
         _OP, [DummyRunner()], _CONFIG, [torch.zeros(8, 16)]
-    )
-    assert tactic == 1
-    assert calls == []
-
-
-def test_serving_above_top_tuned_bucket_uses_largest_entry(cache_root, monkeypatch):
-    """A serving lookup whose bucket lies above every bucket in the store is
-    served from the largest hydrated entry instead of the fallback."""
-    config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
-                gen_tuning_buckets=(4, 8),
-                map_to_tuning_buckets=next_positive_power_of_2,
-            ),
-        ),
-    )
-
-    # Bucket 4 is won by tactic 0 and bucket 8 by tactic 1, so the served
-    # tactic shows which entry the lookup used.
-    def times_by_bucket(inputs, tactic):
-        return {
-            4: {0: 1.0, 1: 3.0, 2: 2.0},
-            8: {0: 3.0, 1: 1.0, 2: 2.0},
-        }[inputs[0].shape[0]][tactic]
-
-    _install_fake_profile(monkeypatch, times=times_by_bucket)
-    with autotune_v2():
-        AutoTuner.get().choose_one(_OP, [DummyRunner()], config, [torch.zeros(8, 16)])
-    assert len(_entry_files(cache_root)) == 2
-
-    _fresh_process()
-    calls = _install_fake_profile(monkeypatch, times=times_by_bucket)
-    with autotune_v2(mode="replay"):
-        pass  # hydrate the entries for buckets 4 and 8
-    # A malformed key must not break the scan for the top tuned bucket.
-    store = AutoTuner.get()._active_managed_store
-    for bad_key in (("too", "short"), (_OP, "DummyRunner", None, ())):
-        AutoTuner.get()._managed_decoded[(str(store.root), store.env_hash, bad_key)] = (
-            object()
-        )
-    # 12 maps to bucket 16, above both tuned buckets.
-    _, tactic = AutoTuner.get().choose_one(
-        _OP, [DummyRunner()], config, [torch.zeros(12, 16)]
     )
     assert tactic == 1
     assert calls == []
@@ -839,6 +788,83 @@ class DummyRunnerB(DummyRunner):
     pass
 
 
+class DummyRunnerWithExtras(DummyRunner):
+    def __init__(self, extras, valid_tactics=(0, 1, 2)):
+        super().__init__(valid_tactics)
+        self._extras = extras
+
+    def get_cache_key_extras(self, inputs):
+        return self._extras
+
+
+@pytest.mark.parametrize("storage", ["legacy", "managed"])
+def test_persisted_winner_requires_candidate_coverage_for_tuning(
+    cache_root, monkeypatch, storage
+):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._collect_metadata",
+        lambda: {"gpu": "test GPU"},
+    )
+    path = cache_root / "legacy.json"
+    first = DummyRunnerWithExtras(("layout_a",), (0,))
+    second = DummyRunnerWithExtras(("layout_b",), (1,))
+    third = DummyRunnerWithExtras(("layout_c",), (2,))
+    inputs = [torch.zeros(8, 16)]
+    calls = _install_fake_profile(monkeypatch, {-1: 3.0, 0: 2.0, 1: 1.0, 2: 0.5})
+
+    def context(tune_mode):
+        if storage == "legacy":
+            return autotune(tune_mode=tune_mode, cache=str(path))
+        return autotune_v2(mode="tune" if tune_mode else "replay")
+
+    with context(True):
+        assert AutoTuner.get().choose_one(_OP, [first], _CONFIG, inputs) == (first, 0)
+    if storage == "legacy":
+        # Legacy two-field JSON entries predate policy and coverage metadata.
+        data = json.loads(path.read_text())
+        (key,) = (key for key in data if key.startswith(f"('{_OP}', "))
+        data[key] = data[key][:2]
+        path.write_text(json.dumps(data))
+
+    tuner = _fresh_process()
+    calls.clear()
+    with context(False):
+        assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (first, 0)
+    with context(True):
+        assert tuner.choose_one(_OP, [first], _CONFIG, inputs) == (first, 0)
+        assert calls == []
+        winner = tuner.choose_one(_OP, [first, second], _CONFIG, inputs)
+        assert [tactic for tactic in calls if tactic != -1] == [0, 1]
+        assert winner == (second, 1)
+
+    tuner = _fresh_process()
+    calls.clear()
+    with context(False):
+        assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 1)
+    with context(True):
+        assert tuner.choose_one(_OP, [second, first], _CONFIG, inputs) == (second, 1)
+    assert calls == []
+
+    with context(True):
+        assert tuner.choose_one(_OP, [first], _CONFIG, inputs) == (first, 0)
+        calls.clear()
+        assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 1)
+        assert [tactic for tactic in calls if tactic != -1] == [0, 1]
+
+    tuner = _fresh_process()
+    calls.clear()
+    with context(False):
+        assert tuner.choose_one(_OP, [first, second], _CONFIG, inputs) == (second, 1)
+    assert calls == []
+    with context(True):
+        assert tuner.choose_one(_OP, [first, second, third], _CONFIG, inputs) == (
+            third,
+            2,
+        )
+        assert [tactic for tactic in calls if tactic != -1] == [0, 1, 2]
+
+
 def test_runner_reorder_replays_correct_runner(cache_root, monkeypatch):
     """Persisted entries key on the runner class, so reordering the runner
     list across processes replays the winner on the RIGHT runner."""
@@ -859,15 +885,6 @@ def test_runner_reorder_replays_correct_runner(cache_root, monkeypatch):
         )
     assert isinstance(runner, DummyRunnerB) and tactic == 1
     assert calls == []
-
-
-class DummyRunnerWithExtras(DummyRunner):
-    def __init__(self, extras, valid_tactics=(0, 1, 2)):
-        super().__init__(valid_tactics)
-        self._extras = extras
-
-    def get_cache_key_extras(self, inputs):
-        return self._extras
 
 
 def test_extras_distinguish_entries(cache_root, monkeypatch):

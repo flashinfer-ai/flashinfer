@@ -159,6 +159,7 @@ def test_disabled_cache_compiles_directly(monkeypatch):
 
 def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypatch):
     utils = pytest.importorskip("cutlass.utils")
+    driver = pytest.importorskip("cuda.bindings.driver")
     device = [0]
     calls = []
     fail = [False]
@@ -176,23 +177,35 @@ def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypa
     )
     monkeypatch.setattr(torch, "empty", lambda *a, **kw: None)
     monkeypatch.setattr(
-        utils, "HardwareInfo", lambda *_: SimpleNamespace(get_max_active_clusters=query)
+        utils,
+        "HardwareInfo",
+        lambda *_: SimpleNamespace(kernel=None, get_max_active_clusters=query),
+    )
+    monkeypatch.setattr(
+        driver,
+        "cuOccupancyMaxPotentialClusterSize",
+        lambda *_: (driver.CUresult.CUDA_SUCCESS, (16, 8)[device[0]]),
     )
     _hardware._query_max_active_clusters.cache_clear()
+    _hardware._cluster_limits.cache_clear()
     try:
         assert _hardware.get_max_active_clusters(1) == 148
         assert _hardware.get_max_active_clusters(1) == 148
         assert _hardware.get_max_active_clusters(2) == 74
+        assert _hardware.get_max_active_clusters(16) == 9
+        assert _hardware.get_max_active_clusters(17) == 0
         device[0] = 1
         assert _hardware.get_max_active_clusters(1) == 147
+        assert _hardware.get_max_active_clusters(16) == 0
         fail[0] = True
         with pytest.raises(RuntimeError, match="probe failed"):
             _hardware.get_max_active_clusters(2)
         fail[0] = False
         assert _hardware.get_max_active_clusters(2) == 73
-        assert calls == [(0, 1), (0, 2), (1, 1), (1, 2), (1, 2)]
+        assert calls == [(0, 1), (0, 2), (0, 16), (1, 1), (1, 2), (1, 2)]
     finally:
         _hardware._query_max_active_clusters.cache_clear()
+        _hardware._cluster_limits.cache_clear()
 
 
 @pytest.mark.skipif(

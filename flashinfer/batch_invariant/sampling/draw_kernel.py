@@ -25,7 +25,7 @@ import functools
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64
+from cutlass import Boolean, Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -248,6 +248,15 @@ class _DrawPeers(_CutePeers):
         return first, last
 
 
+# PDL is a runtime launch argument of every kernel (2026-11-18): the `griddepcontrol` instructions are always emitted and have
+# no effect unless the launch carries the attribute. The temperature form, the index gather and the log-probability output
+# STAY compile-time variants of this kernel: the register-resident 512-thread kernel (152064 x 4096) holds 128 of its 128
+# registers with the host scale as a constant-bank operand; a per-row scale costs one live register and the log-probability
+# chain two across the crossing phase, and the variants carrying them spill (144 / 80 bytes of stack, 1.27-1.34x at that cell,
+# measured on Rubin) -- folded in as runtime flags, the plain path inherited the spill. The K5 kernels have the headroom and
+# fold everything; the lse kernels, like this one, fold PDL only (the per-row scale cost them 2-12 %).
+
+
 class DrawRowKernel:
     """``sample.icdf.v1`` for one ``Kp`` bucket (``N`` runtime), one input kind (logits / probabilities), one
     temperature form, with or without an index gather and the drawn token's log-probability."""
@@ -348,7 +357,7 @@ class DrawRowKernel:
         M: Int64,
         Msrc: Int64,
         N: Int32,
-        enable_pdl: cutlass.Constexpr[bool],
+        enable_pdl: Int32,
         stream,
     ):
         k = self.kernel(
@@ -365,7 +374,6 @@ class DrawRowKernel:
             M,
             Msrc,
             N,
-            enable_pdl,
             self._tv_layout(self.vec),
             (self.rows, BLOCK),
         )
@@ -403,14 +411,12 @@ class DrawRowKernel:
         M: Int64,
         Msrc: Int64,
         N: Int32,
-        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         fp = CuteF32
         bidx, _, _ = cute.arch.block_idx()
-        if enable_pdl:
-            cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # no effect unless the launch carried the PDL attribute (a runtime launch argument)
         W, C, rows = self.W, self.C, self.rows
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -429,6 +435,7 @@ class DrawRowKernel:
         row_ok = row < M
         row_c = _select(row_ok, row, M - 1)
         # the source row (an index gather reads row indices[row]; one row per CTA then)
+        src_ok = Boolean(True)
         if cutlass.const_expr(self.has_indices):
             src = mIdx[row_c]
             src_ok = (src >= 0) & (src < Msrc)
@@ -548,11 +555,9 @@ class DrawRowKernel:
         # ===== the row's answer ==========================================================================================
         a = _select(first == Int32(INT_MAX), last, first)
         s_ok = (Float32(0.0) < S) & (Float32(float("inf")) > S)
-        valid = s_ok & (a >= Int32(0))
-        if cutlass.const_expr(self.has_indices):
-            valid = (
-                valid & src_ok
-            )  # an index outside the source rows: an invalid output row, not row 0's draw
+        valid = (
+            s_ok & (a >= Int32(0)) & src_ok
+        )  # an index outside the source rows: an invalid output row, not row 0's draw
         slot = a >> 3
         lane_a = slot >> (self.Kp.bit_length() - 1)
         block_a = slot & Int32(self.Kp - 1)
@@ -575,8 +580,7 @@ class DrawRowKernel:
                         if row_ok:
                             mLogp[row] = lp
         peers.finish()
-        if enable_pdl:
-            cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_launch_dependents()
 
 
 def _block_totals(plan, state, kpw):
@@ -665,11 +669,30 @@ def kernel_name(
     return_logprob: bool,
     enable_pdl: bool,
 ) -> str:
-    """The cache object's name: one per (dtype, Kp bucket, config, input kind, temperature form, gather,
-    log-probability output, pdl)."""
+    """The cache object's name: one per (dtype, Kp bucket, config, input kind, temperature form, gather, log-probability
+    output); PDL is a runtime launch argument (``enable_pdl`` is accepted and ignored)."""
     return jit.sanitize_symbol_name(
         f"draw_{'logits' if from_logits else 'probs'}_{dtype_str}_Kp{Kp}_{cfg.describe()}_{'trow' if temp_rows else 'tconst'}"
-        f"{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}_pdl{int(enable_pdl)}"
+        f"{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}"
+    )
+
+
+def _key(
+    dtype_str, N, cfg, from_logits, temp_rows, has_indices, return_logprob, enable_pdl
+):
+    """The compile key of the kernel serving ``N``: the Kp bucket, the config, the input kind, the temperature form, the
+    gather, the log-probability output (PDL is a runtime launch argument: ``enable_pdl`` is accepted and ignored)."""
+    from .schedule import padded_blocks
+
+    return (
+        dtype_str,
+        padded_blocks(N),
+        cfg,
+        from_logits,
+        bool(temp_rows),
+        bool(has_indices),
+        bool(return_logprob),
+        False,
     )
 
 
@@ -684,26 +707,57 @@ def get_compiled_kernel(
     enable_pdl: bool,
 ):
     """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, temperature form,
-    index gather, log-probability output, pdl); ``N``, ``M`` and the row stride are runtime arguments."""
-    from .schedule import padded_blocks
-
+    index gather, log-probability output); ``N``, ``M``, the row stride and PDL are runtime arguments (``enable_pdl`` is
+    accepted and ignored)."""
     return _compile_bucket(
-        dtype_str,
-        padded_blocks(N),
-        cfg,
-        from_logits,
-        temp_rows,
-        has_indices,
-        return_logprob,
-        enable_pdl,
+        *_key(
+            dtype_str,
+            N,
+            cfg,
+            from_logits,
+            temp_rows,
+            has_indices,
+            return_logprob,
+            enable_pdl,
+        )
     )
 
 
-@functools.cache
-def _compile_bucket(
+def precompile(
+    dtype_str: str,
+    N: int,
+    cfg: LSEConfig,
+    from_logits: bool,
+    temp_rows: bool,
+    has_indices: bool,
+    return_logprob: bool,
+    enable_pdl: bool,
+) -> None:
+    """Compile the kernel serving ``N`` into the on-disk cache without loading it, outside the op family's module lock
+    (:func:`jit.precompile`): what a precompile pool's worker calls. ``get_compiled_kernel`` holds the lock for the whole build
+    (concurrent processes missing the same kernel compile it once), so workers compiling different kernels of one family
+    through it would run serially."""
+    jit.precompile(
+        DRAW_MODULE,
+        *_spec(
+            *_key(
+                dtype_str,
+                N,
+                cfg,
+                from_logits,
+                temp_rows,
+                has_indices,
+                return_logprob,
+                enable_pdl,
+            )
+        ),
+    )
+
+
+def _spec(
     dtype_str, Kp, cfg, from_logits, temp_rows, has_indices, return_logprob, enable_pdl
 ):
-    """Compile, or load from the cache, the kernel of one Kp bucket and specialisation."""
+    """The cache object's name and the compile function of one Kp bucket and specialisation."""
     from ..fp_interface.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)
@@ -756,9 +810,16 @@ def _compile_bucket(
             Int64(1),
             Int64(1),
             Int32(1),
-            enable_pdl,
+            Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
         )
 
-    return jit.build_and_load(DRAW_MODULE, name, compile_fn)
+    return name, compile_fn
+
+
+@functools.cache
+def _compile_bucket(*key):
+    """Compile, or load from the cache, the kernel of one compile key (the serving path: the module lock is held for the
+    whole build)."""
+    return jit.build_and_load(DRAW_MODULE, *_spec(*key))

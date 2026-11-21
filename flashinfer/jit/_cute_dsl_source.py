@@ -356,8 +356,9 @@ class _Source:
 class _ImportClosure:
     """Flashinfer sources that key files can run, resolved name by name.
 
-    Plain modules are keyed by content, and everything they import is
-    followed. Package initializers mostly re-export, so they are followed
+    Plain modules are keyed by content. A named import follows the binding
+    it uses and import-time code, rather than unrelated function bodies.
+    Package initializers mostly re-export, so they are also followed
     one name at a time: a lookup of ``name`` in a package resolves to the
     binding that defines it (a re-export leads to its source, a function to
     its body), plus the submodule of that name. Code an initializer runs at
@@ -406,6 +407,33 @@ class _ImportClosure:
         source = self._source(path)
         self._add_imports(source, source.tree)
 
+    def _add_module_code(self, source: _Source) -> None:
+        """Key a plain module's content and follow the code run at import."""
+        path = source.path
+        if not self._once("module_code", path):
+            return
+        self.files.add(path)
+        self._add_parents(path)
+        # Imports run even if the requested function never reads their bound
+        # names. Follow imported modules' initialization without assuming their
+        # unused functions are called. Bindings omit function-local imports.
+        for bindings in source.bindings.values():
+            for statement, alias in bindings:
+                if alias is None:
+                    continue
+                if isinstance(statement, ast.ImportFrom):
+                    target = source.import_target(statement)
+                    if target is not None and not self._source(target).is_initializer:
+                        self.add_module(target, frozenset())
+                        # A missing from-import can invoke module __getattr__.
+                        if alias.name not in self._source(target).definite_bindings:
+                            self.add_symbol(target, alias.name, frozenset())
+                        continue
+                self._add_alias(source, statement, alias, frozenset())
+        for statement in source.star_imports:
+            self.add_module(source.import_target(statement), None)
+        self._add_code(source, source.executed)
+
     def add_initializer(self, path: Path) -> None:
         """A package initializer that runs because something below it is imported."""
         if not self._once("initializer", path):
@@ -420,10 +448,13 @@ class _ImportClosure:
         if path is None or path in self._unkeyed:
             return
         source = self._source(path)
-        if not source.is_initializer:
+        if source.is_initializer:
+            self.add_initializer(path)
+        elif uses is None:
             self.add_file(path)
             return
-        self.add_initializer(path)
+        else:
+            self._add_module_code(source)
         if uses is None:
             # Any attribute may be read: every binding, and every submodule,
             # which becomes an attribute once anything imports it.
@@ -446,15 +477,25 @@ class _ImportClosure:
             )
 
     def add_symbol(self, path: Path, name: str, uses, *, attribute_lookup=True) -> None:
-        """``name`` looked up in the package initializer ``path``."""
-        if not self._once("symbol", path, name, uses, attribute_lookup):
+        """``name`` looked up in a module or package initializer ``path``."""
+        if path in self._unkeyed or not self._once(
+            "symbol", path, name, uses, attribute_lookup
+        ):
             return
-        self.add_initializer(path)
-        self.initializers[path].add(name)
+        if name in {"__dict__", "__getattribute__"}:
+            # These expose arbitrary module attributes, including functions
+            # whose local imports a named lookup would otherwise omit.
+            self.add_module(path, None)
+            return
         source = self._source(path)
-        # ``from pkg import name`` returns pkg's attribute when it binds one,
-        # else the submodule; key both rather than model import order.
-        self.add_module(_resolve_package_module(source.package + [name]), uses)
+        if source.is_initializer:
+            self.add_initializer(path)
+            self.initializers[path].add(name)
+            # ``from pkg import name`` returns pkg's attribute when it binds
+            # one, else the submodule; key both rather than model import order.
+            self.add_module(_resolve_package_module(source.package + [name]), uses)
+        else:
+            self._add_module_code(source)
         bindings = source.bindings.get(name, [])
         for statement, alias in bindings:
             if alias is not None:
@@ -489,19 +530,17 @@ class _ImportClosure:
         target = source.import_target(statement)
         if target is None:
             return
-        if self._source(target).is_initializer:
-            # A self re-export resolves its own binding, rather than looking
-            # up an unrelated lazy export in the same initializer.
-            self.add_symbol(
-                target,
-                alias.name,
-                uses,
-                attribute_lookup=(
-                    target != source.path or _bound_name(statement, alias) != alias.name
-                ),
-            )
-        else:
-            self.add_file(target)
+        # A self re-export resolves its own binding, rather than looking
+        # up an unrelated lazy export in the same initializer. Plain modules
+        # also resolve the requested binding, while remaining keyed by content.
+        self.add_symbol(
+            target,
+            alias.name,
+            uses,
+            attribute_lookup=(
+                target != source.path or _bound_name(statement, alias) != alias.name
+            ),
+        )
 
     def _add_imports(self, source: _Source, scope: ast.AST) -> None:
         """Follow the imports in ``scope`` as far as ``scope`` uses their names."""

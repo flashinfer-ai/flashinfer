@@ -2804,7 +2804,15 @@ def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, reques
         "seq_idx_dtype": torch.int32,
         "backend": "cake",
     }
-    forwarded = {**optional, "cu_seqlens": None}
+    forwarded = {
+        **optional,
+        "cu_seqlens": None,
+        "final_states": None,
+        "initial_state_slots": None,
+        "final_state_slots": None,
+        "initial_state_flags": None,
+        "null_slot_id": -1,
+    }
     assert runners[0].run_calls == [(positional, forwarded), (positional, forwarded)]
     assert runners[-1].run_calls[0][1]["dt_softplus"] is False
 
@@ -2890,6 +2898,11 @@ def test_source_public_api_signatures_are_stable():
         "return_final_states",
         "num_seqs",
         "cu_seqlens",
+        "final_states",
+        "initial_state_slots",
+        "final_state_slots",
+        "initial_state_flags",
+        "null_slot_id",
     )
     run_defaults = (
         empty,
@@ -2915,6 +2928,11 @@ def test_source_public_api_signatures_are_stable():
         True,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
+        -1,
     )
     expected_run = tuple(
         zip(
@@ -2929,7 +2947,12 @@ def test_source_public_api_signatures_are_stable():
         _signature_contract(cake_module.CakeSSDCombined.run, drop_self=True)
         == expected_run
     )
-    assert _signature_contract(module.ssd_combined_fwd) == expected_run
+    # The functional entry inserts the runner-config state dtype before the
+    # caller-owned final states and the state-slot arguments.
+    expected_fwd = (
+        expected_run[:-5] + (("state_dtype", positional, None),) + expected_run[-5:]
+    )
+    assert _signature_contract(module.ssd_combined_fwd) == expected_fwd
 
     # The prepared (CUDA-graph-capturable) submission entry: keyword-only,
     # the shape-determining subset of ``run``'s arguments, identical on the
@@ -2954,6 +2977,14 @@ def test_source_public_api_signatures_are_stable():
         "num_seqs",
         "cu_seqlens",
         "out",
+        "final_states",
+        "initial_state_slots",
+        "final_state_slots",
+        "initial_state_flags",
+        "null_slot_id",
+        "checkpoint_token_indices",
+        "checkpoint_state_slots",
+        "checkpoint_states",
     )
     prepare_defaults = (
         empty,
@@ -2972,6 +3003,14 @@ def test_source_public_api_signatures_are_stable():
         None,
         None,
         True,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        -1,
         None,
         None,
         None,
@@ -3202,6 +3241,10 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
         "checkpoint_token_indices": object(),
         "checkpoint_state_slots": object(),
         "checkpoint_states": object(),
+        "final_states": object(),
+        "initial_state_slots": object(),
+        "final_state_slots": object(),
+        "initial_state_flags": object(),
     }
     out = torch.empty((1, 128, 2, 64), dtype=torch.bfloat16)
     kwargs = {
@@ -3213,6 +3256,7 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
         "return_final_states": False,
         "num_seqs": 1,
         "cu_seqlens": torch.tensor([0, 128], dtype=torch.int32),
+        "null_slot_id": 0,
     }
 
     actual = runner.run(*tensors, **kwargs)
@@ -5366,13 +5410,23 @@ def test_source_program_table_names_shipped_sources():
     # per ``_SM107_MODULES`` identity (a program without an entry builds its
     # fold source on sm_107a, whose descriptor mask is an ``__CUDA_ARCH__``
     # branch) and the two sm_107a renders of the segment preprocess (with and
-    # without the early dependent-launch trigger), no other architecture copies
+    # without the early dependent-launch trigger); plus the 38 state-slot
+    # programs' sources (one sm_100a / sm_103a and one sm_107a source per
+    # ``_SLOT_MODULES`` key, and one sm_107a source per claim and wrap twin,
+    # test_cake_ssd_combined_state_slots.py), no other architecture copies
     # and no orphans.
     rubin_sources = set(module._SM107_MODULES.values()) | {
         module._SM107_SEGMENT_PREPROCESS_MODULE,
         module._SM107_SEGMENT_PREPROCESS_TRIGGER_MODULE,
     }
-    assert len(device_sources) == 53 + len(rubin_sources)
+    slot_sources = {
+        source_dir / module._DEVICE_DIR / f"{identity}.cu"
+        for table in (module._SLOT_MODULES, module._SM107_SLOT_MODULES)
+        for identity in table.values()
+    }
+    assert all(source.is_file() for source in slot_sources), slot_sources
+    device_sources |= slot_sources
+    assert len(device_sources) == 53 + len(rubin_sources) + 38
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
     ) == sorted(path.name for path in device_sources)
@@ -5388,7 +5442,15 @@ def test_active_source_package_declares_cuda_half_types_explicitly():
         kernel.source
         for program in module._PROGRAMS.values()
         for kernel in program.kernels
-    } | {f"{identity}.cu" for identity in module._SM107_MODULES.values()}
+    } | {
+        f"{identity}.cu"
+        for table in (
+            module._SM107_MODULES,
+            module._SLOT_MODULES,
+            module._SM107_SLOT_MODULES,
+        )
+        for identity in table.values()
+    }
     sources.add(module._SM107_SEGMENT_PREPROCESS.source)
     sources.add(module._SM107_SEGMENT_PREPROCESS_TRIGGER.source)
     assert sources
@@ -5440,7 +5502,7 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
     monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
     monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setattr(module.subprocess, "run", run)
-    monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
+    monkeypatch.setattr(module, "load_inline_with_cubin", load_inline)
     module._load_generated_program.cache_clear()
 
     actual = module._load_generated_program("exact_bf16_varlen", "sm_103a")
@@ -6327,7 +6389,7 @@ def test_source_sm107_program_builds_its_table_module(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
     monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setattr(module.subprocess, "run", run)
-    monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
+    monkeypatch.setattr(module, "load_inline_with_cubin", load_inline)
 
     module._load_generated_program(name, "sm_107a")
     module._load_generated_program.cache_clear()
@@ -6493,7 +6555,7 @@ def test_source_chunk_parallel_program_builds_from_its_own_template(
     monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
     monkeypatch.setattr(module.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
     monkeypatch.setattr(module.subprocess, "run", run)
-    monkeypatch.setattr(module, "cpp", SimpleNamespace(load_inline=load_inline))
+    monkeypatch.setattr(module, "load_inline_with_cubin", load_inline)
     module._load_generated_program.cache_clear()
 
     module._load_generated_program(name, "sm_100a")
@@ -9229,17 +9291,17 @@ def test_source_retained_start_programs_are_the_round5_files():
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     source_dir = module._source_dir()
     retained = {
-        "device/mamba_ssd_q_tmem_alias_bf16_batched_3876f7208d.cu": "46c3bc0cc2d71728d70ea140c77da9f094a71612e85f1d11d9cf9ad37cfed4c3",
-        "device/mamba_ssd_q_tmem_alias_bf16_batched_noring_77156893a6.cu": "3cfae323c2eb5290b05f4590d37029c4af7d7a12200ab3cb5a7fb8058cb15637",
-        "device/mamba_ssd_q_tmem_alias_bf16_varlen_636342f6cc.cu": "93992e1526a925b69ccdf4645fdd6873c9314e70859f3f12f398cdbf9bec96cd",
-        "device/mamba_ssd_q_tmem_alias_bf16_varlen_noring_0f475595b9.cu": "0112ebe565d1895ce8a1568765c84fc868a02f8bba340b4ab0bcf06856e3e105",
-        "device/mamba_ssd_q_tmem_alias_f16_batched_f074fc128b.cu": "99924fb4ba28c8fcc4d1de304ec4533bb2f105628b2084b99575db23edc7cee2",
-        "device/mamba_ssd_q_tmem_alias_f16_batched_noring_d19039c163.cu": "beaf9f268cd701c35009581594fc320e3d853872ba6292a6ccedc571369db685",
-        "device/mamba_ssd_q_tmem_alias_f16_varlen_9759edcc11.cu": "5bba167a188354bb4393727798114c5f03dfa63d9c3cdc9edbfeb629e6b3a98a",
-        "device/mamba_ssd_q_tmem_alias_f16_varlen_noring_d11774ac8e.cu": "af0557e21b54901059c9f656bc88c4242c6a0a426014a1b0b0a94440fa5d4cbd",
-        "device/mamba_ssd_q_tmem_alias_f32_batched_2dc39c9955.cu": "11549cdbdcc3329ed7bd42a46f83daf436db88aed498cd8028d37513162f40a3",
-        "device/mamba_ssd_q_tmem_alias_f32_batched_noring_bbd73b5202.cu": "69c7298f74a264a8e3db1c0c2a26ed27a4de6703e01178051232fb833a54affd",
-        "device/mamba_ssd_q_tmem_alias_f32_varlen_6037fe869d.cu": "4f1059751fb8173b0a1e0c9dad79c4899ed563baf9329a8feac9e177c047072b",
+        "device/mamba_ssd_q_tmem_alias_bf16_batched_57c5d59a5d.cu": "57c5d59a5d8250d0a0fbb1c502134b19b9c00cac1b92c7140c961155e1fb836a",
+        "device/mamba_ssd_q_tmem_alias_bf16_batched_noring_efdf7380e0.cu": "efdf7380e0e7d38d23501203377dc689f322e9ac2e579765155422a2d107a6c3",
+        "device/mamba_ssd_q_tmem_alias_bf16_varlen_bff217fa79.cu": "bff217fa7919d49a6c621d412993d23d2763527f05cfa9518391f6d89a58956c",
+        "device/mamba_ssd_q_tmem_alias_bf16_varlen_noring_2b039f415c.cu": "2b039f415c0b44deec949b7190809aad24f5f75f1114c2414c2a95ef2b31653f",
+        "device/mamba_ssd_q_tmem_alias_f16_batched_0304e7bf49.cu": "0304e7bf49913c2007b5bdb016904ccba568f25c336b38c04c94b1a589646def",
+        "device/mamba_ssd_q_tmem_alias_f16_batched_noring_a10529397b.cu": "a10529397bf02b4599e0e6f689da069275c519b0f5c0823b63ee86d940d59804",
+        "device/mamba_ssd_q_tmem_alias_f16_varlen_0c6f30beba.cu": "0c6f30bebaeb3fefc2daedb50d1fdb5300873d35c28794120d123665bb663eec",
+        "device/mamba_ssd_q_tmem_alias_f16_varlen_noring_493e7eec20.cu": "493e7eec20646dd16ced49820dce043b3dc70c37f80cd1d834d2d9fd562f081b",
+        "device/mamba_ssd_q_tmem_alias_f32_batched_5f1dbb9c66.cu": "5f1dbb9c66f05a228fb035e77363bd265d4c6a88fd733234475573ad8ef11f61",
+        "device/mamba_ssd_q_tmem_alias_f32_batched_noring_52b64b0dd5.cu": "52b64b0dd5fbb9d5435a4f06f2e248018661c66deb4975e69f35c06eae6854bd",
+        "device/mamba_ssd_q_tmem_alias_f32_varlen_6d2318ba0d.cu": "6d2318ba0d6a9a64ef3249a34e21b1318773ced96b0aa8d0786c1effb5d3e4b0",
         "host/mamba_ssd_combined_sequence.cpp": "a992780866f3b70c21f009dfdc74753acecc8573925d219dad5e822821771344",
     }
     assert len(retained) == 12
@@ -9383,7 +9445,8 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
 
     def key(caller_cumsum, publish_table=False):
         # (device, batch, seqlen, nchunks, num_segments, num_sequences, state
-        # dtype, from_cu_seqlens, caller_cumsum, publish_table, family override)
+        # dtype, from_cu_seqlens, caller_cumsum, publish_table, state_slots,
+        # family override)
         return module._WorkspaceKey(
             None,
             1,
@@ -9395,6 +9458,7 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
             False,
             caller_cumsum,
             publish_table,
+            False,
             "auto",
         )
 
@@ -10070,7 +10134,7 @@ def test_source_every_selected_program_is_shipped_without_gpu(monkeypatch):
     counts, every call form, every override of the chunk-parallel family --
     resolves a shipped program whose family, state dtype, mode and variant are
     the call's, and the programs so resolved are exactly the table but its
-    sm_107a-only programs: the one selection path (``_materialize_workspace``)
+    sm_107a-only programs: the one selection path (``_program_route``)
     names no missing program and leaves no table entry dead."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
@@ -10141,3 +10205,187 @@ def test_source_every_selected_program_is_shipped_without_gpu(monkeypatch):
     # (10, 7) alone (test_source_sm107_many_one_chunk_items_take_the_claim_program,
     # test_source_sm107_short_item_calls_take_the_ibulk_program).
     assert seen == set(module._PROGRAMS) - module._SM107_ONLY_PROGRAMS
+
+
+@pytest.mark.parametrize(
+    "state_dtype", (torch.bfloat16, torch.float16, torch.float32), ids=str
+)
+@pytest.mark.parametrize("varlen", (False, True), ids=("batched", "varlen"))
+def test_cake_ssd_combined_caller_final_states_are_written_in_place(
+    state_dtype, varlen
+):
+    """A caller ``final_states`` is written in place and returned: bitwise
+    the final states of the same call without it, and a warm call with
+    caller ``out`` and ``final_states`` allocates nothing."""
+
+    _skip_unless_cake_arch()
+    constructor, tensors, arguments = _case(state_dtype=state_dtype, varlen=varlen)
+    runner = SSDCombined(**constructor, backend="cake")
+    out, final = runner.run(*tensors, **arguments)
+    out_buffer = torch.full_like(out, float("nan"))
+    final_buffer = torch.full_like(final, float("nan"))
+    out_run, final_run = runner.run(
+        *tensors, **arguments, out=out_buffer, final_states=final_buffer
+    )
+    assert out_run is out_buffer and final_run is final_buffer
+    assert runner._cake_runner._allocations_in_last_run == 0
+    assert torch.equal(out_run, out) and torch.equal(final_run, final)
+
+
+@pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float32), ids=str)
+def test_cake_ssd_combined_without_final_states_allocates_no_state_storage(
+    state_dtype,
+):
+    """``return_final_states=False`` binds no ``num_seqs``-sized state
+    storage: 1024 one-token sequences (the capture batch of short prefills)
+    allocate far less than one state per sequence, while the same call
+    returning final states allocates them."""
+
+    _skip_unless_cake_arch()
+    lengths = (1,) * 1024
+    constructor, tensors, arguments = _case(
+        state_dtype=state_dtype, varlen=True, lengths=lengths, initial_states=False
+    )
+    arguments = _cu_seqlens_arguments(arguments, lengths)
+    state_bytes = (
+        len(lengths)
+        * constructor["nheads"]
+        * 64
+        * 128
+        * torch.empty((), dtype=state_dtype).element_size()
+    )
+    runner = SSDCombined(**constructor, backend="cake")
+    out = torch.empty_like(tensors[0])
+    runner.run(*tensors, **{**arguments, "out": out, "return_final_states": False})
+
+    def peak_growth(**overrides):
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        result = runner.run(*tensors, **{**arguments, "out": out, **overrides})
+        torch.cuda.synchronize()
+        return result, torch.cuda.max_memory_allocated() - before
+
+    (_, final), growth = peak_growth(return_final_states=False)
+    assert final is None
+    assert runner._cake_runner._allocations_in_last_run == 0
+    assert growth < state_bytes // 8, (growth, state_bytes)
+    (_, final), growth = peak_growth(return_final_states=True)
+    assert final is not None and growth >= state_bytes, (growth, state_bytes)
+    _, growth = peak_growth(final_states=torch.empty_like(final))
+    assert runner._cake_runner._allocations_in_last_run == 0
+
+
+@pytest.mark.parametrize("state_dtype", (torch.float16, torch.float32), ids=str)
+def test_ssd_combined_fwd_state_dtype_without_state_tensors(state_dtype):
+    """``state_dtype`` selects the state programs without any state tensor:
+    the functional entry returns final states of that dtype, bitwise those
+    of a runner constructed with it."""
+
+    _skip_unless_cake_arch()
+    functional = importlib.import_module("flashinfer.mamba.ssd_combined")
+    lengths = (96, 160)
+    constructor, tensors, arguments = _case(
+        state_dtype=state_dtype, varlen=True, lengths=lengths, initial_states=False
+    )
+    arguments = _cu_seqlens_arguments(arguments, lengths)
+    out, final = functional.ssd_combined_fwd(
+        *tensors, **arguments, state_dtype=state_dtype
+    )
+    assert final.dtype == state_dtype
+    runner = SSDCombined(**constructor, backend="cake")
+    out_runner, final_runner = runner.run(*tensors, **arguments)
+    assert torch.equal(out, out_runner) and torch.equal(final, final_runner)
+
+
+def test_cake_ssd_combined_caller_final_states_validation():
+    """A caller ``final_states`` must be returned (``return_final_states``),
+    match the state shape, dtype and contiguity, and not overlap the
+    initial or checkpoint states.  A strided dense ``initial_states`` is
+    packed before the launch: a ``final_states`` in the gaps between its
+    rows (but on none of its elements) is accepted and gives the same
+    result; one on a row of it is refused."""
+
+    _skip_unless_cake_arch()
+    constructor, tensors, arguments = _case(varlen=False)
+    runner = SSDCombined(**constructor, backend="cake")
+    out, final = runner.run(*tensors, **arguments)
+    out = out.clone()
+    final = final.clone()
+    with pytest.raises(ValueError, match="return_final_states"):
+        runner.run(
+            *tensors,
+            **{**arguments, "return_final_states": False},
+            final_states=torch.empty_like(final),
+        )
+    for bad in (
+        torch.empty_like(final)[:1],
+        torch.empty_like(final, dtype=torch.float32),
+        torch.empty_like(final).transpose(2, 3).contiguous().transpose(2, 3),
+    ):
+        with pytest.raises(ValueError, match="final_states must be a contiguous"):
+            runner.run(*tensors, **arguments, final_states=bad)
+    with pytest.raises(ValueError, match="must not overlap initial_states"):
+        runner.run(*tensors, **arguments, final_states=arguments["initial_states"])
+    # Rows 0 and 4 of a five-row storage hold the initial states, rows 2..3
+    # take the final states: disjoint elements inside the initial extent.
+    storage = torch.zeros((5, *final.shape[1:]), dtype=final.dtype, device=final.device)
+    strided = storage[::4]
+    strided.copy_(arguments["initial_states"])
+    run_out, run_final = runner.run(
+        *tensors,
+        **{**arguments, "initial_states": strided},
+        final_states=storage[2:4],
+    )
+    assert run_final.data_ptr() == storage[2:4].data_ptr()
+    assert torch.equal(run_out, out) and torch.equal(run_final, final)
+    with pytest.raises(ValueError, match="must not overlap initial_states"):
+        runner.run(
+            *tensors,
+            **{**arguments, "initial_states": strided},
+            final_states=storage[:2],
+        )
+    # Contiguous dense views that share a row still race and are refused.
+    storage[:2].copy_(arguments["initial_states"])
+    with pytest.raises(ValueError, match="must not overlap initial_states"):
+        runner.run(
+            *tensors,
+            **{**arguments, "initial_states": storage[:2]},
+            final_states=storage[1:3],
+        )
+
+
+def test_cake_ssd_combined_rejects_state_rows_beyond_32_bit_offsets():
+    """The kernels address states with 32-bit offsets: a call whose
+    ``num_seqs * nheads`` state rows exceed ``2**31 / (64 * 128)`` is
+    refused before any workspace is built."""
+
+    _skip_unless_cake_arch()
+    nheads = 128
+    lengths = (1,) * (2**31 // (64 * 128) // nheads + 1)
+    constructor, tensors, arguments = _case(
+        nheads=nheads, varlen=True, lengths=lengths, initial_states=False
+    )
+    arguments = _cu_seqlens_arguments(arguments, lengths)
+    runner = SSDCombined(**constructor, backend="cake")
+    with pytest.raises(ValueError, match="state rows the kernels address"):
+        runner.run(*tensors, **{**arguments, "return_final_states": False})
+
+
+def test_ssd_combined_fwd_state_dtype_validation_without_gpu():
+    """``state_dtype`` accepts the three state dtypes and every given state
+    tensor must have it; the CuTe backend refuses a caller ``final_states``."""
+
+    functional = importlib.import_module("flashinfer.mamba.ssd_combined")
+    x, dt, A, B, C = _cpu_public_run_inputs()
+    states = torch.empty((1, 2, 64, 128), dtype=torch.float16)
+    with pytest.raises(ValueError, match="state_dtype must be"):
+        functional.ssd_combined_fwd(x, dt, A, B, C, state_dtype=torch.int8)
+    for name in ("initial_states", "final_states", "checkpoint_states"):
+        with pytest.raises(ValueError, match=f"{name} dtype"):
+            functional.ssd_combined_fwd(
+                x, dt, A, B, C, state_dtype=torch.float32, **{name: states}
+            )
+    runner = _public_runner_without_constructor("cute", None)
+    with pytest.raises(ValueError, match="final_states require"):
+        runner.run(x, dt, A, B, C, final_states=states)
