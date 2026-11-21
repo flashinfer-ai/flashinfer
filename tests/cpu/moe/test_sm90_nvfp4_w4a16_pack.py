@@ -152,3 +152,26 @@ def test_wgmma_specialization_operands():
     # 12 accumulators, then 4 A registers and the descriptor
     assert "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11}, {%12,%13,%14,%15}, %16," in src
     assert '"+f"(d[127])' in src and "%132, 1, 1, 1, 0;" in src
+
+
+@pytest.mark.parametrize(
+    "shape,fraction,expected",
+    [
+        ((4096, 4096, 32, 8), 1.0, 256),  # 64 routes per expert
+        ((4096, 4096, 8, 8), 1.0, 64),
+        ((2048, 768, 32, 8), 1.0, 683),  # small matrices: work bound
+        ((3072, 1024, 8, 2), 1.0, 1366),
+        ((1024, 512, 4, 1), 1.0, 2049),  # capped at the default
+        ((4096, 4096, 32, 8), 32 / 256, 2048),  # EP: 32 of 256 experts local
+    ],
+)
+def test_auto_prefill_min_tokens(shape, fraction, expected):
+    H, I, E, k = shape
+    got = w4a16.sm90_nvfp4_w4a16_moe_prefill_min_tokens(H, I, E, k, fraction)
+    assert got == expected
+
+
+def test_auto_prefill_min_tokens_rejects_bad_fraction():
+    for fraction in (0.0, 1.5):
+        with pytest.raises(ValueError):
+            w4a16.sm90_nvfp4_w4a16_moe_prefill_min_tokens(4096, 4096, 32, 8, fraction)

@@ -30,8 +30,9 @@ Two kernels:
 
 * small / medium batches (up to 1024 tokens per launch): one persistent launch
   runs gate/up, SwiGLU, down and the top-k reduction;
-* large batches (``prefill_min_tokens`` and up): a persistent expert-grouped
-  kernel on CTA pairs with TMA multicast, plus a finalize kernel.
+* large batches: a persistent expert-grouped kernel on CTA pairs with TMA
+  multicast, plus a finalize kernel. By default it takes over from the token
+  count given by :func:`sm90_nvfp4_w4a16_moe_prefill_min_tokens`.
 
 Weights are repacked once by :func:`prepare_sm90_nvfp4_w4a16_weights` into the
 layout the in-register decoder reads. The repack is lossless; it requires the
@@ -46,6 +47,7 @@ Apache-2.0), which builds on vjeux/okc-2026 and alygg77/okc-muse-spark-kernels
 from __future__ import annotations
 
 import functools
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -67,8 +69,16 @@ MAX_LOCAL_EXPERTS = 32
 TOPK_SLOTS = 8
 #: Token count one small-batch launch covers.
 DECODE_MAX_TOKENS = 1024
+#: Upper bound of the automatic switch to the large-batch kernel.
 DEFAULT_PREFILL_MIN_TOKENS = 2049
 DEFAULT_PREFILL_CHUNK_TOKENS = 8192
+
+# Automatic kernel choice (measured on H200 over 16 shapes, uniform and skewed
+# routing): the large-batch kernel is faster once each expert receives about 64
+# routes and the call has enough work to fill every SM, about 2**33
+# routes x hidden x intermediate multiply-adds per projection.
+_AUTO_ROUTES_PER_EXPERT = 64
+_AUTO_MIN_WORK = 1 << 33
 
 # The 6-bit scale encoding holds E4M3 block scales 0 or in [2.0, 448].
 _SCALE_MIN, _SCALE_MAX = 2.0, 448.0
@@ -577,6 +587,34 @@ def _decode_buffer_bytes(
 # ---------------------------------------------------------------------------
 
 
+def sm90_nvfp4_w4a16_moe_prefill_min_tokens(
+    hidden_size: int,
+    intermediate_size: int,
+    num_local_experts: int,
+    top_k: int,
+    local_route_fraction: float = 1.0,
+) -> int:
+    """Token count from which :func:`sm90_nvfp4_w4a16_moe` uses the large-batch
+    kernel when ``prefill_min_tokens`` is not given.
+
+    The large-batch kernel wins once every expert receives about 64 routes and
+    the call carries enough work to fill the GPU; below that the small-batch
+    kernel is faster. The result is at most ``DEFAULT_PREFILL_MIN_TOKENS``.
+
+    ``local_route_fraction`` is the expected share of routes that hit the local
+    experts. The default 1.0 assumes every route is local; under expert
+    parallelism, where routes to other ranks' experts are passed as skipped ids,
+    pass ``num_local_experts / num_global_experts`` (for balanced routing) and
+    give the result as ``prefill_min_tokens``.
+    """
+    if not 0.0 < local_route_fraction <= 1.0:
+        raise ValueError("local_route_fraction must be in (0, 1]")
+    routes_per_token = top_k * local_route_fraction
+    by_experts = _AUTO_ROUTES_PER_EXPERT * num_local_experts / routes_per_token
+    by_work = _AUTO_MIN_WORK / (routes_per_token * hidden_size * intermediate_size)
+    return min(DEFAULT_PREFILL_MIN_TOKENS, math.ceil(max(by_experts, by_work)))
+
+
 def _routing_inputs(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -605,7 +643,7 @@ def _check_sm90_nvfp4_w4a16_moe(
     out: Optional[torch.Tensor] = None,
     workspace: Optional[Sm90Nvfp4W4A16MoEWorkspace] = None,
     enable_pdl: bool = True,
-    prefill_min_tokens: int = DEFAULT_PREFILL_MIN_TOKENS,
+    prefill_min_tokens: Optional[int] = None,
     prefill_chunk_tokens: int = DEFAULT_PREFILL_CHUNK_TOKENS,
 ) -> bool:
     if not hidden_states.is_cuda:
@@ -702,7 +740,7 @@ def sm90_nvfp4_w4a16_moe(
     out: Optional[torch.Tensor] = None,
     workspace: Optional[Sm90Nvfp4W4A16MoEWorkspace] = None,
     enable_pdl: bool = True,
-    prefill_min_tokens: int = DEFAULT_PREFILL_MIN_TOKENS,
+    prefill_min_tokens: Optional[int] = None,
     prefill_chunk_tokens: int = DEFAULT_PREFILL_CHUNK_TOKENS,
 ) -> torch.Tensor:
     r"""Fused MoE with NVFP4 expert weights and BF16 activations on SM90.
@@ -741,9 +779,16 @@ def sm90_nvfp4_w4a16_moe(
         Calls that can run concurrently need separate workspaces.
     enable_pdl : bool
         Programmatic dependent launch for the short launches.
-    prefill_min_tokens : int
-        Token count from which the large-batch kernel is used (it needs a
-        reserved prefill workspace, allocated on first use).
+    prefill_min_tokens : Optional[int]
+        Token count from which the large-batch kernel is used. ``None`` (default)
+        picks it from the problem shape with
+        :func:`sm90_nvfp4_w4a16_moe_prefill_min_tokens`, assuming every route
+        is local (pass it explicitly under expert parallelism). The large-batch
+        kernel needs the prefill buffers of the workspace, allocated on first
+        use; during CUDA graph capture the automatic choice falls back to the
+        small-batch kernel when they are not reserved yet (call
+        :meth:`Sm90Nvfp4W4A16MoEWorkspace.reserve_prefill` before capture to
+        capture the large-batch kernel).
     prefill_chunk_tokens : int
         Tokens per large-batch launch (sizes the prefill workspace).
 
@@ -785,7 +830,18 @@ def sm90_nvfp4_w4a16_moe(
     gs_gate, gs_up = w13_global_scale[0], w13_global_scale[1]
     eps = float(post_norm_eps)
 
-    if prefill_min_tokens <= M:
+    min_tokens = prefill_min_tokens
+    if min_tokens is None:
+        min_tokens = sm90_nvfp4_w4a16_moe_prefill_min_tokens(H, I, E, topk_ids.shape[1])
+    use_prefill = min_tokens <= M
+    if (
+        use_prefill
+        and prefill_min_tokens is None
+        and workspace.prefill_chunk_tokens < prefill_chunk_tokens
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        use_prefill = False  # its buffers cannot be allocated during capture
+    if use_prefill:
         workspace.reserve_prefill(prefill_chunk_tokens)
         recv = torch.empty((TOPK_SLOTS, M, H), dtype=torch.bfloat16, device=device)
         rev = torch.empty(

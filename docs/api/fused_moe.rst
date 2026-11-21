@@ -878,9 +878,10 @@ with FP32 accumulation, so activations are never quantized. One call runs
 gate/up, SwiGLU, down and the top-k sum (optionally with a per-route RMSNorm of
 each expert output) for up to 32 local experts and top-k up to 8, with
 precomputed routing (ids outside ``[0, E)`` are skipped, as under expert
-parallelism). Up to 1024 tokens run in one persistent launch; from
-``prefill_min_tokens`` a persistent expert-grouped kernel on CTA pairs takes
-over. Hidden size: multiple of 512 in ``[1024, 8192]``; intermediate size:
+parallelism). Up to 1024 tokens run in one persistent launch; larger batches
+use a persistent expert-grouped kernel on CTA pairs, from a token count chosen
+per shape (:func:`sm90_nvfp4_w4a16_moe_prefill_min_tokens`) unless
+``prefill_min_tokens`` is given. Hidden size: multiple of 512 in ``[1024, 8192]``; intermediate size:
 multiple of 256 in ``[512, 8192]``.
 
 Weights are repacked once with :func:`prepare_sm90_nvfp4_w4a16_weights`
@@ -897,6 +898,7 @@ Create the workspace (:func:`get_sm90_nvfp4_w4a16_moe_workspace` or
     Sm90Nvfp4W4A16MoEWorkspace
     get_sm90_nvfp4_w4a16_moe_workspace
     sm90_nvfp4_w4a16_moe
+    sm90_nvfp4_w4a16_moe_prefill_min_tokens
 
 cuDNN Grouped-GEMM MoE
 ----------------------

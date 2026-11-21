@@ -36,6 +36,7 @@ from flashinfer.fused_moe import (
     Sm90Nvfp4W4A16MoEWorkspace,
     prepare_sm90_nvfp4_w4a16_weights,
     sm90_nvfp4_w4a16_moe,
+    sm90_nvfp4_w4a16_moe_prefill_min_tokens,
 )
 from flashinfer.utils import is_sm90a_supported
 
@@ -190,12 +191,13 @@ def run(packed, x, ids, w, **kw):
 @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "h{}_i{}_e{}_k{}".format(*s))
 @pytest.mark.parametrize("num_tokens", DECODE_TOKENS)
 def test_decode_matches_reference(shape, num_tokens):
+    """The small-batch kernel (forced; the automatic choice may pick the other one)."""
     ckpt, packed = checkpoint(shape)
     H, _, E, top_k = shape
     torch.manual_seed(num_tokens)
     x = torch.randn(num_tokens, H, device="cuda").bfloat16()
     ids, w = routing(num_tokens, E, top_k, "cuda", seed=num_tokens)
-    y = run(packed, x, ids, w)
+    y = run(packed, x, ids, w, prefill_min_tokens=1 << 30)
     assert y.shape == (num_tokens, H) and y.dtype == torch.bfloat16
     assert_in_band(y, reference_moe(ckpt, x, ids, w))
 
@@ -251,6 +253,44 @@ def test_prefill_kernel_matches_reference(shape, num_tokens, chunk):
     )
     assert ws.prefill_chunk_tokens == chunk
     assert_in_band(y, reference_moe(ckpt, x, ids, w))
+
+
+@pytest.mark.parametrize("num_tokens", [255, 256, 300])
+def test_auto_kernel_choice(num_tokens):
+    """Without ``prefill_min_tokens`` the call runs the kernel the shape rule picks
+    (256 tokens for the tuned shape): bitwise equal to forcing that kernel."""
+    ckpt, packed = checkpoint(SHAPES[0])
+    H, I, E, top_k = SHAPES[0]
+    assert sm90_nvfp4_w4a16_moe_prefill_min_tokens(H, I, E, top_k) == 256
+    x = torch.randn(num_tokens, H, device="cuda").bfloat16()
+    ids, w = routing(num_tokens, E, top_k, "cuda", seed=17)
+    y = run(packed, x, ids, w)
+    forced = 1 if num_tokens >= 256 else 1 << 30
+    assert torch.equal(y, run(packed, x, ids, w, prefill_min_tokens=forced))
+    assert_in_band(y, reference_moe(ckpt, x, ids, w))
+
+
+def test_cuda_graph_auto_choice_without_prefill_buffers():
+    """Captured with a workspace whose prefill buffers are not reserved, a batch
+    above the automatic threshold runs the small-batch kernel."""
+    ckpt, packed = checkpoint(SHAPES[0])
+    H, I, E, top_k = SHAPES[0]
+    num_tokens = 300
+    ws = Sm90Nvfp4W4A16MoEWorkspace(torch.device("cuda"), H, I)
+    x = torch.randn(num_tokens, H, device="cuda").bfloat16()
+    ids, w = routing(num_tokens, E, top_k, "cuda", seed=19)
+    out = torch.empty(num_tokens, H, device="cuda", dtype=torch.bfloat16)
+    run(packed, x, ids, w, out=out, workspace=ws, prefill_min_tokens=1 << 30)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(packed, x, ids, w, out=out, workspace=ws)
+    assert ws.prefill_chunk_tokens == 0
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = run(packed, x, ids, w, workspace=ws, prefill_min_tokens=1 << 30)
+    assert torch.equal(out, ref)
 
 
 def test_long_decode_is_chunked():

@@ -283,6 +283,7 @@ from .sm90_nvfp4_w4a16 import (  # noqa: F401
     get_sm90_nvfp4_w4a16_moe_workspace as get_sm90_nvfp4_w4a16_moe_workspace,
     prepare_sm90_nvfp4_w4a16_weights as prepare_sm90_nvfp4_w4a16_weights,
     sm90_nvfp4_w4a16_moe as sm90_nvfp4_w4a16_moe,
+    sm90_nvfp4_w4a16_moe_prefill_min_tokens as sm90_nvfp4_w4a16_moe_prefill_min_tokens,
 )
 from .monomoe import (  # noqa: F401
     mono_moe as mono_moe,
@@ -559,6 +560,7 @@ __all__ = [
     "get_sm90_nvfp4_w4a16_moe_workspace",
     "prepare_sm90_nvfp4_w4a16_weights",
     "sm90_nvfp4_w4a16_moe",
+    "sm90_nvfp4_w4a16_moe_prefill_min_tokens",
 ]
 
 # Add CuteDSL exports if available

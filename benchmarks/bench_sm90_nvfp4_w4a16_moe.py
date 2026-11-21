@@ -48,6 +48,7 @@ from flashinfer.fused_moe import (
     get_sm90_nvfp4_w4a16_moe_workspace,
     prepare_sm90_nvfp4_w4a16_weights,
     sm90_nvfp4_w4a16_moe,
+    sm90_nvfp4_w4a16_moe_prefill_min_tokens,
 )
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import is_sm90a_supported
@@ -155,7 +156,12 @@ def main():
     p.add_argument(
         "--post-norm", action="store_true", help="per-route RMSNorm before the sum"
     )
-    p.add_argument("--prefill-min-tokens", type=int, default=2049)
+    p.add_argument(
+        "--prefill-min-tokens",
+        type=int,
+        default=None,
+        help="large-batch kernel from this token count (default: automatic per shape)",
+    )
     p.add_argument("--cupti", action="store_true", help="CUPTI kernel timing")
     p.add_argument(
         "--warm-l2", action="store_true", help="do not flush L2 between iterations"
@@ -186,6 +192,10 @@ def main():
         f"{'tokens':>7} {'path':>8} {'us':>10} {'GB/s':>8} {'TFLOP/s':>8}"
         + (f" {'cutile_us':>10} {'speedup':>8}" if base else "")
     )
+    pmin = a.prefill_min_tokens
+    if pmin is None:
+        pmin = sm90_nvfp4_w4a16_moe_prefill_min_tokens(H, I, E, k)
+    print(f"# large-batch kernel from {pmin} tokens")
     for M in a.tokens:
         x = torch.randn(M, H, device="cuda").bfloat16()
         ids, w = make_routing(M, E, k, a.routing, seed=M)
@@ -204,7 +214,7 @@ def main():
         nbytes = touched_weight_bytes(ids, E, H, I)
         routes = int(((ids >= 0) & (ids < E)).sum())
         flops = 2.0 * routes * (2 * I * H + H * I)
-        path = "prefill" if a.prefill_min_tokens <= M else "decode"
+        path = "prefill" if pmin <= M else "decode"
         line = f"{M:>7} {path:>8} {us:>10.2f} {nbytes / us / 1e3:>8.0f} {flops / us / 1e6:>8.1f}"
         if base is not None:
             base(x, ids, w)
