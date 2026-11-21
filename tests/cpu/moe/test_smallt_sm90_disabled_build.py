@@ -123,3 +123,131 @@ def test_cold_capture_query_uses_input_device(monkeypatch):
     assert smallt._moe_smallt_sm90_dispatch(**args) is None
     assert queried == [1] and current == [0]
     build.assert_not_called()
+
+
+def test_deferred_failure_keeps_stock_candidate_eligible(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from flashinfer.fused_moe import CutlassFp8BlockRunner, MoELayer
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+    import flashinfer.jit.moe_fp8_grouped_smallt_sm90 as recipe
+
+    # Exercise real module failure caching and MoELayer eligibility on CPU.
+    # Only device/pack validation and the compiler are substituted.
+    monkeypatch.delenv("FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90", raising=False)
+    monkeypatch.setattr(smallt, "_module", None)
+    monkeypatch.setattr(smallt, "_module_error", None)
+    monkeypatch.setattr(smallt, "_counters", dict(smallt._counters))
+    generate = Mock(side_effect=RuntimeError("injected compiler failure"))
+    monkeypatch.setattr(recipe, "gen_moe_fp8_grouped_smallt_sm90_module", generate)
+    monkeypatch.setattr(
+        CutlassFp8BlockRunner,
+        "accepts",
+        lambda self, act, weights: not smallt._disabled(),
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(smallt, "_eligibility", lambda *args, **kwargs: None)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    runner = object.__new__(SpecializedFp8BlockSmallTRunner)
+    runner._build()
+    runner.pack_inputs = Mock(return_value=[None] * 8)
+    runner._quant_scales = Mock(return_value=[])
+    mode = runner.supported_routing_modes[0]
+    act = SimpleNamespace(
+        num_tokens=4,
+        routing_input_mode=mode,
+        hidden_states_q=SimpleNamespace(device=torch.device("cuda:1")),
+    )
+    weights = SimpleNamespace(native_views={})
+    stock = SimpleNamespace(
+        backend_key="stock",
+        supported_routing_modes=(mode,),
+        accepts=lambda act, weights: True,
+    )
+    layer = object.__new__(MoELayer)
+    layer.config = SimpleNamespace(execution=SimpleNamespace(tune_max_num_tokens=64))
+    layer.runners = [runner, stock]
+    assert layer._eligible_runners(act, weights) == (1,)
+    generate.assert_not_called()
+    monkeypatch.delenv(DISABLE_ENV)
+    for _ in range(2):
+        assert layer._eligible_runners(act, weights) == (1,)
+    generate.assert_called_once_with()
+    runner.pack_inputs.assert_called_once_with(act, weights)
+    assert "injected compiler failure" in smallt._module_error
+
+
+def test_deferred_capture_declines_then_eager_selection_warms(monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from flashinfer.fused_moe import CutlassFp8BlockRunner
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+    import flashinfer.jit.moe_fp8_grouped_smallt_sm90 as recipe
+
+    monkeypatch.delenv("FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90", raising=False)
+    monkeypatch.setattr(smallt, "_module", None)
+    monkeypatch.setattr(smallt, "_module_error", None)
+    monkeypatch.setattr(
+        CutlassFp8BlockRunner,
+        "accepts",
+        lambda self, act, weights: not smallt._disabled(),
+    )
+    generate = Mock()
+    monkeypatch.setattr(recipe, "gen_moe_fp8_grouped_smallt_sm90_module", generate)
+    eligibility = Mock(return_value=None)
+    monkeypatch.setattr(smallt, "_eligibility", eligibility)
+    current = [0]
+    queries = []
+    capturing = [True]
+
+    @contextmanager
+    def guard(device):
+        previous = current[0]
+        current[0] = device.index
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    def query():
+        queries.append(current[0])
+        return capturing[0]
+
+    monkeypatch.setattr(torch.cuda, "device", guard)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", query)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    runner = object.__new__(SpecializedFp8BlockSmallTRunner)
+    runner._build()
+    runner.pack_inputs = Mock(return_value=[None] * 8)
+    runner._quant_scales = Mock(return_value=[])
+    act = SimpleNamespace(
+        hidden_states_q=SimpleNamespace(device=torch.device("cuda:1"))
+    )
+    weights = SimpleNamespace(native_views={})
+    monkeypatch.delenv(DISABLE_ENV)
+    assert not runner.accepts(act, weights)
+    assert queries == [1] and current == [0] and smallt._module_error is None
+    generate.assert_not_called()
+    runner.pack_inputs.assert_not_called()
+    capturing[0] = False
+    eligibility.return_value = "unsupported alignment"
+    assert not runner.accepts(act, weights)
+    generate.assert_not_called()
+    eligibility.return_value = None
+    assert runner.accepts(act, weights)
+    generate.assert_called_once_with()
+    # The warmed path neither probes CUDA nor repacks; the kill switch still applies.
+    count = len(queries)
+    pack_count = runner.pack_inputs.call_count
+    assert runner.accepts(act, weights)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    assert not runner.accepts(act, weights)
+    monkeypatch.delenv(DISABLE_ENV)
+    assert runner.accepts(act, weights)
+    assert len(queries) == count and runner.pack_inputs.call_count == pack_count
+    assert current == [0]

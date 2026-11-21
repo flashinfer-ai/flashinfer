@@ -1204,3 +1204,127 @@ def test_cold_capture_on_input_device_with_other_device_current(monkeypatch):
             torch.cuda.synchronize(1)
     finally:
         torch.cuda.set_device(previous)
+
+
+def test_deferred_jit_failure_excluded_before_selection(monkeypatch):
+    _sm90_or_skip()
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+    import flashinfer.jit.moe_fp8_grouped_smallt_sm90 as recipe
+
+    calls = []
+
+    def failed_build():
+        calls.append(None)
+        raise RuntimeError("injected compiler failure")
+
+    monkeypatch.setattr(recipe, "gen_moe_fp8_grouped_smallt_sm90_module", failed_build)
+    monkeypatch.setattr(smallt, "_module", None)
+    monkeypatch.setattr(smallt, "_module_error", None)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    layer, act, weights, b = _unified_layer(
+        4, (SpecializedFp8BlockSmallTConfig(), CutlassFp8BlockConfig())
+    )
+    assert [r.backend_key for r in layer.runners] == [
+        "specialized_fp8_block_smallt",
+        "cutlass_fp8_block",
+    ]
+    assert layer._eligible_runners(act, weights) == (1,)
+    assert not calls
+    monkeypatch.delenv(DISABLE_ENV)
+    ref = _reference(b)
+    for _ in range(2):
+        out = layer(act, weights)
+        assert layer.winner_backend == "cutlass_fp8_block"
+        assert layer._eligible_runners(act, weights) == (1,)
+        ts, l2 = _gate(out, ref)
+        assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL
+    assert len(calls) == 1
+    assert "injected compiler failure" in smallt._module_error
+    assert _moe_smallt_sm90_stats()["calls_seen"] == 0
+
+
+def test_deferred_jit_checks_structure_first(monkeypatch):
+    _sm90_or_skip()
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    monkeypatch.setattr(smallt, "_module", None)
+    monkeypatch.setattr(smallt, "_module_error", None)
+    monkeypatch.setattr(smallt, "_get_module", lambda: pytest.fail("unexpected JIT"))
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    layer, act, weights, b = _unified_layer(4)
+    gap, gap_act, gap_weights, _ = _unified_layer(64)
+    monkeypatch.delenv(DISABLE_ENV)
+    assert not gap.runners[0].accepts(gap_act, gap_weights)
+    view = dict(weights.get_view("cutlass_fp8_block"), gemm1_beta=b["tw"][0])
+    overrides = MoEWeightPack()
+    overrides.prepare_for("cutlass_fp8_block", view)
+    assert not layer.runners[0].accepts(act, overrides)
+    buf = b["x"].new_empty(4 * H + 1)
+    misaligned = MoEActivationPack(buf[1:].view(4, H), None, b["ids"], b["tw"])
+    assert not layer.runners[0].accepts(misaligned, weights)
+    assert smallt._module_error is None
+
+
+def test_deferred_selection_capture_device_and_warm_switch(monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("requires two CUDA devices")
+    target = next(
+        (
+            i
+            for i in range(torch.cuda.device_count())
+            if torch.cuda.get_device_capability(i) == (9, 0)
+        ),
+        None,
+    )
+    if target is None:
+        pytest.skip("requires an SM90 input device")
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    monkeypatch.setattr(smallt, "_module", None)
+    monkeypatch.setattr(smallt, "_module_error", None)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    with torch.cuda.device(target):
+        layer, act, weights, _ = _unified_layer(4)
+    monkeypatch.delenv(DISABLE_ENV)
+    probes = []
+
+    def capturing():
+        probes.append(torch.cuda.current_device())
+        return probes[-1] == target
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", capturing)
+    monkeypatch.setattr(smallt, "_get_module", lambda: pytest.fail("unexpected JIT"))
+    other = 1 if target == 0 else 0
+    with torch.cuda.device(other):
+        assert not layer.runners[0].accepts(act, weights)
+        assert probes == [target] and torch.cuda.current_device() == other
+        assert smallt._module_error is None
+        monkeypatch.setattr(smallt, "_module", object())
+        assert layer._eligible_runners(act, weights) == (0,)
+        monkeypatch.setenv(DISABLE_ENV, "1")
+        assert not layer.runners[0].accepts(act, weights)
+        monkeypatch.delenv(DISABLE_ENV)
+        assert layer._eligible_runners(act, weights) == (0,)
+        assert probes == [target]
+
+
+def test_warm_invocation_failure_propagates(monkeypatch):
+    _sm90_or_skip()
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    class BrokenLaunch:
+        @staticmethod
+        def plan_workspace_bytes(*args):
+            return 16
+
+        @staticmethod
+        def run(*args):
+            raise RuntimeError("injected invocation failure")
+
+    monkeypatch.setattr(smallt, "_module", BrokenLaunch())
+    monkeypatch.setattr(smallt, "_module_error", None)
+    layer, act, weights, _ = _unified_layer(4)
+    assert layer._eligible_runners(act, weights) == (0,)
+    with pytest.raises(RuntimeError, match="injected invocation failure"):
+        layer(act, weights)
+    assert smallt._module_error is None

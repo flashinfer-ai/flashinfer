@@ -2903,9 +2903,10 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
         # and selects among the remaining candidates.
         from .smallt_sm90 import _disabled, _get_module
 
-        # Keep the runner registered. Dispatch can load the module on its
-        # first eligible eager call if the switch is subsequently cleared.
-        if _disabled():
+        # Keep the runner registered; check deferred availability before
+        # selection if the switch is subsequently cleared.
+        self._jit_deferred = _disabled()
+        if self._jit_deferred:
             return
 
         if _get_module() is None:
@@ -2989,6 +2990,44 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
                 name in view for name in self._ACTIVATION_OVERRIDE_KEYS
             ):
                 return False
+        if not self._jit_deferred:
+            return True
+
+        from . import smallt_sm90 as smallt
+
+        if smallt._module is None:
+            if smallt._module_error is not None:
+                return False
+            device = act.hidden_states_q.device
+            if device.type != "cuda":
+                return False
+            with torch.cuda.device(device):
+                if (
+                    hasattr(torch.cuda, "is_current_stream_capturing")
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    return False
+                # A deferred build used to follow dispatch's structural guard.
+                # Keep that ordering even for packs that pass the runner checks.
+                inputs = self.pack_inputs(act, weights)
+                if (
+                    smallt._eligibility(
+                        inputs[1],
+                        inputs[2],
+                        inputs[3],
+                        inputs[4],
+                        inputs[5],
+                        torch.bfloat16,
+                        self._quant_scales(inputs),
+                        inputs[0],
+                        flags={},
+                    )
+                    is not None
+                ):
+                    return False
+                if smallt._get_module() is None:
+                    return False
+        self._jit_deferred = False
         return True
 
     def pack_inputs(
