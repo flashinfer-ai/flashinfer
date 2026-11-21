@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from b12x._lib.quant.block_codec import block_codec
+from b12x._lib.quant.x4t_encode import encode_x4t_scales
 
 if TYPE_CHECKING:
     from b12x._lib.quant.nvfp4_csf import Nvfp4CsfBatch
@@ -201,6 +202,7 @@ class CsfScalePlanes:
     Each tuple contains one CPU tensor per expert: uint8 fixed bytes and uint32
     exceptions. The weight plan supplies matrix geometry and the scale codec.
     ``prepare_weights`` uploads and rearranges these planes for its kernels.
+    ``encode_mxfp4_csf_scales`` builds MXFP4 planes from raw E8M0 scales.
     """
 
     fixed: tuple[torch.Tensor, ...]
@@ -220,6 +222,20 @@ class CsfScalePlanes:
                     raise TypeError(f"CSF planes must be {dtype} tensors")
                 if plane.device.type != "cpu":
                     raise ValueError("Unprepared CSF planes must reside on CPU")
+
+
+def encode_mxfp4_csf_scales(scales: torch.Tensor) -> CsfScalePlanes:
+    """Encode E8M0 block scales ``[experts, rows, cols]`` as CSF scale planes.
+
+    ``scales`` is any one-byte dtype with ``rows % 16 == 0`` and
+    ``1 <= cols <= 255``; the encoding is lossless. Per row, the base is the
+    lowest ``b`` maximizing ``count(b) + count(b + 1)``, ``base + 1`` is a
+    selector bit, and every other byte is an exception. The planes are CPU
+    tensors, ready for ``Mxfp4CsfWeights``. Not usable during CUDA graph capture.
+    """
+
+    fixed, exceptions = encode_x4t_scales(scales)
+    return CsfScalePlanes(fixed=fixed, exceptions=exceptions)
 
 
 @dataclass(frozen=True)
@@ -296,6 +312,7 @@ class PreparedExperts:
 
 __all__ = [
     "CsfScalePlanes",
+    "encode_mxfp4_csf_scales",
     "Nvfp4CsfWeights",
     "Mxfp4CsfWeights",
     "PackedWeights",
