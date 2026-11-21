@@ -7,6 +7,7 @@ you may not use this file except in compliance with the License.
 
 import functools
 import math
+from itertools import compress
 from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union, cast
 
 import torch
@@ -274,6 +275,14 @@ def _fa_plan_work_count(q_lens, kv_lens, num_heads, num_sm, causal):
             "FA MLA device has insufficient SMs for its cluster size."
         )
     tile = 64 * cluster
+    if 0 in q_lens and len(q_lens) == len(kv_lens):
+        # Requests without queries own no tiles. CUDA-graph callers pad their
+        # batch buffers with such rows (e.g. 8192 rows per plan() for a few
+        # live requests), so drop them before the per-request loops. The C-level
+        # membership test keeps batches without padding on the original path,
+        # and mismatched lengths still reach the strict zip below.
+        kv_lens = list(compress(kv_lens, q_lens))
+        q_lens = list(filter(None, q_lens))
     tile_counts = [(q * num_heads + tile - 1) // tile for q in q_lens]
     if sum(tile_counts) > _FA_MAX_WORK_ITEMS:
         raise _BackendPlanUnsupportedError(
@@ -370,7 +379,13 @@ def _validate_fa_plan_workload(
         raise _BackendPlanUnsupportedError(
             "FA MLA requires query offsets for every KV request."
         )
-    q_lens = [offsets[i + 1] - offsets[i] for i in range(len(kv_lens))]
+    batch_size = len(kv_lens)
+    q_lens = [
+        end - start
+        for start, end in zip(
+            offsets[:batch_size], offsets[1 : batch_size + 1], strict=True
+        )
+    ]
     count = _fa_plan_work_count(
         q_lens, kv_lens, num_heads, get_device_sm_count(device), causal
     )
@@ -578,19 +593,21 @@ class _BatchMLAGeneratedFaMechanics:
         q_data_type: torch.dtype,
         kv_data_type: torch.dtype,
         use_profiler: bool,
+        _workload_validated: bool = False,
     ) -> None:
         # ---------------------------------------------------------------------------
         # Build the generated backend plan
         # ---------------------------------------------------------------------------
-        _validate_fa_plan_workload(
-            qo_indptr,
-            kv_len_arr,
-            num_heads,
-            causal,
-            self.device,
-            self._backend,
-            kv_data_type,
-        )
+        if not _workload_validated:
+            _validate_fa_plan_workload(
+                qo_indptr,
+                kv_len_arr,
+                num_heads,
+                causal,
+                self.device,
+                self._backend,
+                kv_data_type,
+            )
         cached_module = module_loader()
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
@@ -857,6 +874,7 @@ class _BatchMLAPagedAttentionFaBackendBase(
         output_dtype: torch.dtype,
         scale_mode: str,
         use_profiler: bool,
+        _workload_validated: bool = False,
     ) -> None:
         raise NotImplementedError
 
@@ -983,6 +1001,9 @@ class _BatchMLAPagedAttentionFaBackendBase(
                 output_dtype=args.output_dtype,
                 scale_mode=args.scale_mode,
                 use_profiler=args.use_profiler,
+                # This call uses the CSR and scalars checked by the preflight
+                # above. Keep this per invocation so direct plans still validate.
+                _workload_validated=True,
             )
             return backend
         except BaseException:
