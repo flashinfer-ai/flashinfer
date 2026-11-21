@@ -244,8 +244,34 @@ def test_disabled_prebuilt_d_returns_generic_module(host, device):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("device", [H100_SXM, H20], ids=["h100", "h20"])
+@pytest.mark.parametrize(
+    ("use_prebuilt_d_descriptor", "expected"),
+    [
+        (False, (GENERIC_MODULE, set())),
+        (True, (H20_MODULE, {H20_FLAG})),
+    ],
+)
+def test_explicit_prebuilt_d_override_skips_device_probe(
+    host, device, use_prebuilt_d_descriptor, expected
+):
+    host.device = device
+    host.aot_modules = {H100_MODULE, H20_MODULE}
+    assert _select(use_prebuilt_d_descriptor=use_prebuilt_d_descriptor) == expected
+    assert host.probes == 0
+
+
+@pytest.mark.cpu_only
+def test_conflicting_prebuilt_d_flags_raise(host):
+    with pytest.raises(ValueError, match="conflicts with enable_prebuilt_d=False"):
+        _select(enable_prebuilt_d=False, use_prebuilt_d_descriptor=True)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("device", [H100_SXM, H20], ids=["h100-host", "h20-host"])
-def test_aot_registers_generic_sm90_module_on_any_build_host(monkeypatch, host, device):
+def test_aot_registers_generic_and_h20_sm90_modules_on_any_build_host(
+    monkeypatch, host, device
+):
     from flashinfer import aot
 
     host.device = device
@@ -280,5 +306,9 @@ def test_aot_registers_generic_sm90_module_on_any_build_host(monkeypatch, host, 
     )
 
     fused_moe_specs = [spec for spec in specs if spec.name.startswith("fused_moe_90")]
-    assert [spec.name for spec in fused_moe_specs] == [GENERIC_MODULE]
+    assert [spec.name for spec in fused_moe_specs] == [GENERIC_MODULE, H20_MODULE]
     assert not {H20_FLAG, H100_FLAG}.intersection(fused_moe_specs[0].nvcc_flags)
+    assert {H20_FLAG, H100_FLAG}.intersection(fused_moe_specs[1].nvcc_flags) == {
+        H20_FLAG
+    }
+    assert host.probes == 0

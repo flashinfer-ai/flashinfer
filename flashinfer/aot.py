@@ -980,9 +980,15 @@ def gen_all_modules(
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
-            # The generic module only: the device-specific prebuilt-D variants are
-            # selected at JIT time and must not follow the build host's GPU.
-            jit_specs.append(gen_cutlass_fused_moe_sm90_module(enable_prebuilt_d=False))
+            # Ship both generic and H20 prebuilt-D variants, independent of the builder's GPU.
+            # H20 runtime dispatch selects fused_moe_90_h20_prebuilt_d whenever JIT is enabled,
+            # while H100 prebuilt-D stays JIT-only unless its AOT artifact is present.
+            for use_prebuilt_d_descriptor in (False, True):
+                jit_specs.append(
+                    gen_cutlass_fused_moe_sm90_module(
+                        use_prebuilt_d_descriptor=use_prebuilt_d_descriptor
+                    )
+                )
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
             # (SM90a) only (uses wgmma.mma_async + TMA).  Hard-specialized to
             # the fixed E=256/N=512/K=2048 shape (BS8).

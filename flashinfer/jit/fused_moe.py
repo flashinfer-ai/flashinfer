@@ -209,15 +209,28 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
 
 
 def gen_cutlass_fused_moe_sm90_module(
-    use_fast_build: bool = False, *, enable_prebuilt_d: bool = True
+    use_fast_build: bool = False,
+    *,
+    enable_prebuilt_d: bool = True,
+    use_prebuilt_d_descriptor: Optional[bool] = None,
 ) -> JitSpec:
     """Generate the SM90 cutlass fused MoE JitSpec.
 
-    With ``enable_prebuilt_d`` (the default), an H20 (which takes precedence)
-    or a measured H100 SXM selects its prebuilt-D module variant; every other
-    device gets the generic module. ``False`` always returns the generic module,
-    so AOT builds do not depend on the build host's GPU.
+    When ``use_prebuilt_d_descriptor`` is set, it selects the H20 prebuilt-D
+    variant (``True``) or the generic module (``False``) without probing the
+    build host's GPU (for AOT builds). Otherwise, with ``enable_prebuilt_d``
+    (the default), an H20 (which takes precedence) or a measured H100 SXM
+    selects its prebuilt-D module variant; every other device or
+    ``enable_prebuilt_d=False`` gets the generic module.
+
+    Raises:
+        ValueError: If ``use_prebuilt_d_descriptor=True`` conflicts with
+            ``enable_prebuilt_d=False``.
     """
+    if use_prebuilt_d_descriptor and not enable_prebuilt_d:
+        raise ValueError(
+            "use_prebuilt_d_descriptor=True conflicts with enable_prebuilt_d=False"
+        )
     nvcc_flags = sm90a_nvcc_flags + [
         "-DCOMPILE_HOPPER_TMA_GEMMS",
         "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
@@ -230,7 +243,11 @@ def gen_cutlass_fused_moe_sm90_module(
         "-DCUTLASS_MIXED_GEMM_FP4_FP8_PREPROCESSED_SIGNS=1",
     ]
     module_name = None
-    if enable_prebuilt_d:
+    if use_prebuilt_d_descriptor is not None:
+        if use_prebuilt_d_descriptor:
+            nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
+            module_name = "fused_moe_90_h20_prebuilt_d"
+    elif enable_prebuilt_d:
         if _should_enable_sm90_moe_prebuilt_d_descriptor():
             nvcc_flags.append("-DFLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR=1")
             module_name = "fused_moe_90_h20_prebuilt_d"
