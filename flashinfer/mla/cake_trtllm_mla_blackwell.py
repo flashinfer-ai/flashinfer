@@ -887,14 +887,17 @@ def select_domain(
     the devices ``_SPLITKV_RANGE`` lists, so a call without ``arch`` never selects
     it.
     """
-    aligned = (
+    # Of the aligned programs only FP8 page 64 writes the LSE (base 2, from both
+    # its one-split producer and its reducer); every other one leaves LSE
+    # requests to the generic tail.
+    aligned_lse = (
         num_heads == _ALIGNED_HEADS
         and qk_dim == _ALIGNED_QK_DIM
         and value_dim == _ALIGNED_VALUE_DIM
         and topk == 0
         and uses_shared_paged_kv_idx
-        and not wants_lse
     )
+    aligned = aligned_lse and not wants_lse
     dims_match = (qk_nope_head_dim, value_dim, qk_dim - value_dim) == _ALIGNED_DIMS
     if dtype == torch.bfloat16 and aligned:
         if kv_lens is not None and dims_match and not ragged_query and not skip_softmax:
@@ -967,7 +970,7 @@ def select_domain(
         return DOMAIN_FP8_P32
     if (
         dtype == torch.float8_e4m3fn
-        and aligned
+        and aligned_lse
         and page_size == 64
         and not ragged_query
         and not enable_sink
@@ -1027,8 +1030,6 @@ def generic_tail_reason(
         return "FP8 with a compact variable-length query"
     if skip_softmax:
         return "FP8 with skip-softmax"
-    if wants_lse:
-        return "FP8 with LSE output"
     return "this FP8 configuration"
 
 
@@ -1534,6 +1535,7 @@ def launch_device_rows(
     stateless: bool,
     row_batches: Optional[torch.Tensor] = None,
     row_seq_lens: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch ``launch`` on ``stream``.
 
@@ -1546,7 +1548,9 @@ def launch_device_rows(
     current stream per call; otherwise they are cached per stream and shape.
     The split-KV scratch is allocated per call under stream capture too, so a
     captured graph owns its scratch (a cached one could leave the LRU cache
-    while the graph still launches with it).
+    while the graph still launches with it). ``lse`` is the caller's
+    contiguous FP32 LSE of the query rows (FP8 page 64 only), which the program
+    writes in base 2; ``None`` writes it to scratch.
     """
     run = get_cake_trtllm_mla_blackwell_family(launch.family).run
     kind = launch.kind
@@ -1606,7 +1610,7 @@ def launch_device_rows(
             query.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
             kv_cache.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
             out.reshape(-1, _ALIGNED_VALUE_DIM),
-            state["lse"],
+            state["lse"] if lse is None else lse.reshape(-1, _ALIGNED_HEADS),
             seq_lens,
             block_tables.reshape(-1),
             state["partial_output"],
@@ -1970,6 +1974,7 @@ def trtllm_mla_blackwell_decode(
             stateless=stateless,
             row_batches=row_batches,
             row_seq_lens=row_seq_lens,
+            lse=lse,
         )
     elif domain == DOMAIN_BF16_NATIVE_SPLIT8:
         plan = row_plan("table")

@@ -2005,6 +2005,43 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
             {"dtype": torch.float8_e4m3fn, "page_size": 64, "ragged_query": True},
             "mla_fp8_tail",
         ),
+        # FP8 page 64 writes the LSE itself, at any max_seq_len; the other
+        # aligned programs leave LSE requests to the generic tails.
+        (
+            {"dtype": torch.float8_e4m3fn, "page_size": 64, "wants_lse": True},
+            "mla_fp8_page64_pdl",
+        ),
+        (
+            {
+                "dtype": torch.float8_e4m3fn,
+                "page_size": 64,
+                "wants_lse": True,
+                "q_len": 2,
+                "total_q": 2,
+                "max_seq_len": 16384,
+            },
+            "mla_fp8_page64_pdl",
+        ),
+        (
+            {
+                "dtype": torch.float8_e4m3fn,
+                "page_size": 64,
+                "wants_lse": True,
+                "enable_sink": True,
+            },
+            "mla_fp8_tail",
+        ),
+        (
+            {
+                "dtype": torch.float8_e4m3fn,
+                "wants_lse": True,
+                "q_len": 2,
+                "total_q": 2,
+                "kv_lens": (1024,),
+            },
+            "mla_fp8_tail",
+        ),
+        ({"page_size": 64, "wants_lse": True}, "mla_bf16_tail"),
         # The split-KV domain serves the devices _SPLITKV_RANGE lists (GB300: from
         # max_seq_len 2049, the first max_seq_len of tuning bucket 4096, up to 18
         # query rows), sinks, page 64, bmm2_scale != 1 and q_len > 1 included.
@@ -2921,6 +2958,27 @@ _PADDED_ROW_CASES = {
         256,
         "mla_fp8_page64_pdl",
     ),
+    # LSE output: the reducer (split-K) and the one-split producer write it.
+    "fp8_page64_lse": (
+        torch.float8_e4m3fn,
+        8,
+        1,
+        64,
+        False,
+        True,
+        1024,
+        "mla_fp8_page64_pdl",
+    ),
+    "fp8_page64_lse_one_split": (
+        torch.float8_e4m3fn,
+        128,
+        1,
+        64,
+        False,
+        True,
+        1024,
+        "mla_fp8_page64_pdl",
+    ),
     "bf16_tail": (torch.bfloat16, 4, 2, 32, False, True, 1024, "mla_bf16_tail"),
     "fp8_tail": (torch.float8_e4m3fn, 4, 2, 32, False, False, 1024, "mla_fp8_tail"),
     "splitkv": (torch.bfloat16, 4, 2, 32, False, False, 4096, "mla_bf16_splitkv"),
@@ -3650,8 +3708,13 @@ _TAIL_REQUEST = {
             "FP8 with skip-softmax",
         ),
         (
-            {"dtype": torch.float8_e4m3fn, "page_size": 64, "wants_lse": True},
-            "FP8 with LSE output",
+            {
+                "dtype": torch.float8_e4m3fn,
+                "page_size": 64,
+                "wants_lse": True,
+                "enable_sink": True,
+            },
+            "FP8 with sinks",
         ),
     ],
 )
@@ -3824,6 +3887,77 @@ def test_trtllm_mla_blackwell_lse_follows_return_lse_base(dtype) -> None:
     )
     torch.testing.assert_close(
         supplied[live].double(), reference[live] * math.log(2.0), rtol=1e-3, atol=5e-3
+    )
+
+
+@pytest.mark.parametrize(
+    ("batch", "q_len", "max_len", "padded"),
+    [
+        (1, 1, 1024, False),  # split-K: the reducer writes the LSE
+        (1, 1, 8192, False),  # beyond the generic tail's 4096 keys
+        (8, 1, 1024, False),
+        (8, 1, 4096, True),
+        (32, 1, 1024, True),
+        (128, 1, 1024, False),  # one split: the producer writes the LSE
+        (128, 1, 4096, True),
+        (20, 2, 1024, True),
+    ],
+)
+def test_trtllm_mla_blackwell_fp8_page64_lse(
+    batch, q_len, max_len, padded, blackwell_domains
+) -> None:
+    """An FP8 page-64 request with LSE output runs the FP8 page-64 program (one
+    split and split-K): the output equals, bit for bit, the same request without
+    LSE; the base-2 LSE, written into the caller's buffer of either accepted
+    shape, matches the FP64 reference on live rows and is ``-inf`` on padded
+    rows."""
+    _skip_unless_blackwell()
+    from flashinfer.mla.cake_trtllm_mla_blackwell import (
+        _device_facts,
+        plan_num_split,
+    )
+
+    page_size = 64
+    if padded:
+        kv_lens = _padded_kv_lens(batch, q_len, max_len)
+    else:
+        generator = random.Random(batch * 7 + max_len)
+        kv_lens = [generator.randint(max_len // 2, max_len) for _ in range(batch)]
+        kv_lens[-1] = max_len
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, q_len, page_size, torch.float8_e4m3fn
+    )
+    rows = _query_rows(kv_lens, [q_len] * batch)
+    total_q = batch * q_len
+    _, num_sms = _device_facts(torch.cuda.current_device())
+    splits = plan_num_split(total_q, max_len, num_sms)
+
+    plain = _blackwell_decode(query, kv_cache, block_tables, seq_lens, max_len)
+    out, lse = _blackwell_decode(
+        query, kv_cache, block_tables, seq_lens, max_len, return_lse=True
+    )
+    nested = torch.full(
+        (batch, q_len, 128), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    out_nested = _blackwell_decode(
+        query, kv_cache, block_tables, seq_lens, max_len, lse=nested
+    )
+    torch.cuda.synchronize()
+    assert blackwell_domains == ["mla_fp8_page64_pdl"] * 3, (blackwell_domains, splits)
+    assert torch.equal(out, plain) and torch.equal(out_nested, plain)
+    assert tuple(lse.shape) == (total_q, 128)
+    assert torch.equal(nested.reshape(total_q, 128), lse)
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    _assert_rows(out, reference, rows, torch.float8_e4m3fn)
+    lse_reference = _blackwell_lse_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    live = torch.tensor([length > 0 for _, length in rows], device="cuda")
+    assert bool(torch.isneginf(lse[~live]).all()), splits
+    torch.testing.assert_close(
+        lse[live].double(), lse_reference[live], rtol=1e-3, atol=5e-3
     )
 
 

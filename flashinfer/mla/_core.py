@@ -5509,11 +5509,12 @@ def _mla_with_kv_cache_impl(
         ``"cake"`` explicitly selects the source-level Blackwell semantic
         dispatcher. It covers its qualified BF16/FP8 dense, sparse, compact-Q,
         sink, LSE, and caller-owned-output envelope. Requests its tuned
-        Blackwell programs do not serve (LSE output, FP8 with page size 32
-        outside one exact geometry, FP8 with sinks, head counts other than
+        Blackwell programs do not serve (BF16 LSE output, FP8 with page size
+        32 outside one exact geometry, FP8 with sinks, head counts other than
         128, sparse top-k) run a scalar
         generic tail program that takes milliseconds per call; the first such
-        call per reason logs a warning. An untuned ``"auto"`` call
+        call per reason logs a warning. FP8 page-64 LSE output runs the tuned
+        FP8 page-64 program, at any ``max_seq_len``. An untuned ``"auto"`` call
         never selects it; under ``flashinfer.autotune(True)`` its dense
         Blackwell route can win a uniform-Q ``"auto"`` request (see Autotune
         below). ``"auto"``
