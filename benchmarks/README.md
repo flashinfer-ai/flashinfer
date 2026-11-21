@@ -442,6 +442,18 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--backends`             | Backend to test: `cuda` (default), `cute-dsl`, `batch_invariant` (`mxfp8_quantize`, `mxfp4_quantize`, `nvfp4_quantize`; see [Batch-invariant mode](#batch-invariant-mode)) |
 
 ### Sampling Flags
+
+Sampling routines preserve their API defaults. Token samplers default to deterministic
+mode, while top-k selection, transforms and renormalization default to non-deterministic
+mode. Pass `--deterministic` or `--no-deterministic` to override the mode. Softmax
+and top-k masking leave the deterministic CSV field empty. For the five probability-based samplers,
+`--with_softmax` includes a float32 PyTorch softmax in the timed call. Without
+this flag, probability preparation is outside the timing. Both options are
+recorded in CSV output. The unified entry point uses CUPTI by default:
+
+```bash
+python benchmarks/flashinfer_benchmark.py --routine top_k_sampling_from_probs --batch_size 16 --vocab_size 128256 --top_k 50 --with_softmax --no-deterministic
+```
 | Flag                     | Description                                                                                                 |
 |--------------------------|-------------------------------------------------------------------------------------------------------------|
 | `--batch_size`           | Batch size (number of sequences)                                                                           |
