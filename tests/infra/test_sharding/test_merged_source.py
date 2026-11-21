@@ -87,7 +87,12 @@ class MergedSourceTests(unittest.TestCase):
             with patch.object(MergedSource, "git", local_transport):
                 source = MergedSource("owner/repo", self.base, self.head, shallow)
             self.addCleanup(source.close)
-            self.assertEqual([self.base, self.head], fetches)
+            # The base is fetched first. Where the path remote can be a promisor
+            # remote (Windows), that fetch lets Git fetch the head lazily, so the
+            # explicit head fetch may not run; the tree check below proves the
+            # head arrived from the remote either way.
+            self.assertEqual([self.base, self.head][: len(fetches)], fetches)
+            self.assertEqual(self.base, fetches[0])
             self.assertFalse((source.root / ".git/objects/info/alternates").exists())
             paths = {item["path"] for item in source.tree(source.tree_sha)["tree"]}
             self.assertTrue({"new_base.py", "pr.py"}.issubset(paths))
