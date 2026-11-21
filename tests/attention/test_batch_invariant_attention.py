@@ -533,6 +533,99 @@ def test_planner_snake_order():
         assert lengths == ref, (sm, grid)
 
 
+def test_planner_array_path_matches_loop(monkeypatch):
+    """A batch whose units are all fused is planned as one array (``plan.fused_units_array``) and paired as one
+    (``engine.pair_units_array``): the descriptor table, the unit order and the paired table are the per-unit loop's (a host
+    placement: the same plan). The list form is produced on demand and retires the array (``Plan.table``)."""
+    import numpy as np
+
+    from flashinfer.attention.batch_invariant import engine as E
+    from flashinfer.attention.batch_invariant import plan as P
+
+    def batch(
+        reqs, page
+    ):  # (q_len, cached prefix) per request -> qo_indptr, kv_indptr, kv_last_page_len
+        qo, kv, last = [0], [0], []
+        for q_len, prefix in reqs:
+            n = -(-(q_len + prefix) // page)
+            qo.append(qo[-1] + q_len)
+            kv.append(kv[-1] + n)
+            last.append(q_len + prefix - (n - 1) * page if n else 0)
+        return qo, kv, last
+
+    mixed = [(4096, 0), (100, 7), (0, 40), (3000, 2000), (1, 5), (1024, 512)]
+    cases = [  # reqs, Hq, Hkv, D, page, window_left, policy, sm, grid, array path
+        ([(1024, 0)] * 32, 64, 8, 64, 16, -1, "auto", 148, 0, True),
+        (mixed, 32, 8, 128, 16, 100, "auto", 8, 37, True),
+        (mixed, 24, 4, 64, 1, -1, "fused", 212, 0, True),
+        (mixed, 16, 8, 256, 64, 2000, "fused", 148, 0, True),
+        (
+            mixed,
+            16,
+            8,
+            256,
+            64,
+            -1,
+            "auto",
+            8,
+            0,
+            False,
+        ),  # D = 256 "auto": the decode-unit rules stay with the loop
+        (mixed, 32, 8, 128, 16, -1, "split", 148, 0, False),
+        (
+            [(1, 4095)] * 400,
+            8,
+            8,
+            128,
+            16,
+            -1,
+            "auto",
+            148,
+            0,
+            False,
+        ),  # a Swaps-body batch
+        (
+            [(64, 0)],
+            32,
+            8,
+            128,
+            16,
+            -1,
+            "auto",
+            148,
+            0,
+            False,
+        ),  # under ARRAY_PLAN_MIN_UNITS
+    ]
+    for reqs, Hq, Hkv, D, page, wl, policy, sm, grid, arrayed in cases:
+        qo, kv, last = batch(reqs, page)
+        kw = dict(small_swap=True, swap_max_rows=E.SWAPS_MAX_ROWS, grid=grid)
+        plan = P.build_plan(qo, kv, last, Hq, Hkv, D, page, wl, policy, sm, **kw)
+        table = plan.table()
+        assert (table is not None) == arrayed, (reqs[:2], D, policy)
+        with monkeypatch.context() as m:
+            m.setattr(P, "ARRAY_PLAN_MIN_UNITS", 1 << 62)
+            ref = P.build_plan(qo, kv, last, Hq, Hkv, D, page, wl, policy, sm, **kw)
+        assert ref.table() is None
+        if arrayed:
+            assert table.dtype == np.int32 and plan.num_units == len(ref.desc)
+            for pair_grid in (0, 5, sm):
+                assert E.pair_units_array(table, pair_grid).tolist() == E.pair_units(
+                    ref.desc, pair_grid
+                )
+        assert plan.desc == ref.desc and plan.table() is None
+        assert (plan.groups, plan.group_inkernel, plan.ws_rows, plan.grid) == (
+            ref.groups,
+            ref.group_inkernel,
+            ref.ws_rows,
+            ref.grid,
+        )
+        assert all(type(x) is int for d in plan.desc[:2] for x in d)
+        # the pairing of any table (split units included) through the array form
+        rows = np.array(ref.desc, dtype=np.int32).reshape(-1, P.DESC_FIELDS)
+        assert E.pair_units_array(rows, sm).tolist() == E.pair_units(ref.desc, sm)
+
+
 def test_planner_swaps_unit_kinds():
     """The Swaps-body unit-kind model (``plan.swaps_unit_kinds``; placements: every choice computes the same bits): every unit fused
     on the grid of integral waves when the fused walk reaches the HBM rate, every multi-chunk unit split when there are too few units;

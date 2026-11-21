@@ -221,15 +221,16 @@ def unit_loop(
     cS = cute.make_identity_tensor((Q_ROWS, T))
     tScS = qk_thr_mma.partition_C(cS)
     HWM = st.hw_rowmax
+    LC = st.s_load_cols  # columns per load of the whole row
     if cutlass.const_expr(HWM):
-        # the load returns each 32-column piece's maximum in an extra register (tcgen05.ld.red::max): the unmasked tile's row maximum
+        # the load returns each piece's maximum in an extra register (tcgen05.ld.red::max): the unmasked tile's row maximum
         # is the max.f32 join of the pieces -- the same exact maximum as the register tree
         ld_full = cute.make_copy_atom(
-            tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
+            tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(LC)), ACC_DTYPE
         )
     else:
         ld_full = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(LC)), ACC_DTYPE
         )
     tiled_full = tcgen05.make_tmem_copy(ld_full, tStS)
     thr_full = tiled_full.get_slice(thread_idx)
@@ -240,7 +241,7 @@ def unit_loop(
     rRed = None
     if cutlass.const_expr(HWM):
         rRed = cute.make_rmem_tensor(((1, 1), *tFcS.shape[1:]), ACC_DTYPE)
-        assert cute.size(rRed) == T // 32, cute.size(rRed)
+        assert cute.size(rRed) == T // LC, cute.size(rRed)
     one_slice = kpt == T  # one warpgroup: the slice is the row, loaded once
     # two warpgroups on whole rows: each loads ONLY its key slice, forms the slice's maximum and exchanges it with the other
     # warpgroup through shared memory (fmax is exact and order-free, so the maximum of the two partials is the row maximum: a
@@ -411,7 +412,7 @@ def unit_loop(
                 sf.append(rF[i])
             if cutlass.const_expr(HWM):
                 sr = []
-                for i in cutlass.range_constexpr(T // 32):
+                for i in cutlass.range_constexpr(T // LC):
                     sr.append(rRed[i])
                 m_t = max3_tree(
                     sr
@@ -443,31 +444,25 @@ def unit_loop(
         ss = []
         for kk in cutlass.range_constexpr(kpt):
             ss.append(rS[reg_s[kk]])  # the slice's scores in key order
-        # p_k = EX2(fma(s_k, c, mul(m_new, nc))); masked -> +0. Whole or sliced rows under one softmax warp per scheduler: the
-        # exponentials, their bf16 words and the rowsum tree as one stream in key order (streamed_tile_probs: the P words take the
-        # scores' registers). The paired placement (two warpgroups on whole rows) and the replicated rows: the exponentials two keys
-        # per fma.rn.f32x2, the subtree with packed adds, the conversion after -- measured faster there, where two softmax warps
-        # share a scheduler and the fewer instructions of the packed adds matter more than the register copies
+        # p_k = EX2(fma(s_k, c, mul(m_new, nc))); masked -> +0. Whole or sliced rows (the paired placement's two warpgroups on whole
+        # rows included): the exponentials, their bf16 words and the rowsum tree as one stream in key order (streamed_tile_probs: the
+        # P words take the scores' registers, so the stream carries no register copies). The replicated rows: the exponentials two
+        # keys per fma.rn.f32x2, the subtree with packed adds, the conversion after
         if cutlass.const_expr(rep):
             rPq = cute.make_rmem_tensor(cute.make_layout((kpt // 2,)), ACC_DTYPE)
             rPq_e = cute.make_tensor(
                 cute.recast_ptr(rPq.iterator, dtype=IN_DTYPE), cute.make_layout((kpt,))
             )
-        if cutlass.const_expr(not rep and st.streamed):
-            r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE)
-        else:
             ps = [None] * kpt
             for i in cutlass.range_constexpr(0, kpt, 2):
                 x0, x1 = CuteF32.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
                 ps[i] = CuteF32.ex2(x0)
                 ps[i + 1] = CuteF32.ex2(x1)
             r_s = packed_pairwise_add(ps, CuteF32)
-            if cutlass.const_expr(rep):
-                for i in cutlass.range_constexpr(kpt):
-                    rPq_e[i] = ps[i].to(IN_DTYPE)
-            else:
-                for i in cutlass.range_constexpr(kpt):
-                    rP_e[i] = ps[i].to(IN_DTYPE)
+            for i in cutlass.range_constexpr(kpt):
+                rPq_e[i] = ps[i].to(IN_DTYPE)
+        else:
+            r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE)
         # ---- (m', r_slice) to the correction warpgroup, which owns the l chain and the merges
         sth = stats_prod.acquire_and_advance()
         s_m[(sth.index, row)] = m_new
