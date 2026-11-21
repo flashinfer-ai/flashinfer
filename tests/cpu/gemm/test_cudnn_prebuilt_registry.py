@@ -3,6 +3,7 @@
 import types
 
 import pytest
+import torch
 
 import flashinfer.gemm.gemm_base as gb
 
@@ -173,3 +174,84 @@ def test_plan_the_workers_could_not_export_is_built_here_even_when_profiling(
     assert calls == [{"tactic": (9, ())}]
     gb._discard_cudnn_prebuilt("k")
     assert not gb._cudnn_single_plan_graphs
+
+
+def test_worker_plan_bypassed_when_disallowed(monkeypatch):
+    built = _built("ok", 2)
+    _store("k", built)
+    tactic = built[0][0]
+    monkeypatch.setattr(gb, "_cudnn_override_key", lambda builder, kwargs: "k")
+    calls = []
+
+    def builder(**kwargs):
+        calls.append(kwargs)
+        return "in-process"
+
+    assert gb._is_cudnn_single_plan_graph(gb._get_cudnn_override_graph(builder, tactic))
+    assert calls == []
+    assert (
+        gb._get_cudnn_override_graph(builder, tactic, use_worker_plan=False)
+        == "in-process"
+    )
+    assert calls == [{"tactic": tactic}]
+
+
+M, N, K = 64, 32, 16
+
+
+def _bf16(*shape):
+    return torch.zeros(*shape, dtype=torch.bfloat16)
+
+
+def _a():
+    return _bf16(M, K)
+
+
+def _b():
+    return _bf16(N, K).T
+
+
+def _out():
+    return _bf16(M, N)
+
+
+@pytest.mark.parametrize(
+    "a, b, bias, out, a_k_major, b_k_major, ok",
+    [
+        (_a(), _b(), None, _out(), True, True, True),
+        (_bf16(37, K), _b(), None, _bf16(37, N), True, True, False),
+        (_a(), _b(), None, _bf16(M, N + 8)[:, :N], True, True, False),
+        (_a(), _b(), _bf16(N), _out(), True, True, False),
+        (_bf16(1, M, K), _b(), None, _out(), True, True, False),
+        (_bf16(K, M).T, _b(), None, _out(), False, True, True),
+        (_bf16(K, M).T, _b(), None, _out(), True, True, False),
+        (_a(), _bf16(K, N), None, _out(), True, False, True),
+        (_a(), _bf16(K, N), None, _out(), True, True, False),
+    ],
+    ids=[
+        "built-geometry",
+        "m-below-bucket",
+        "padded-output",
+        "bias",
+        "batched",
+        "a-mn-major",
+        "a-layout-mismatch",
+        "b-n-major",
+        "b-layout-mismatch",
+    ],
+)
+def test_worker_plan_geometry(a, b, bias, out, a_k_major, b_k_major, ok):
+    assert (
+        gb._bf16_worker_plan_geometry_ok(
+            a,
+            b,
+            bias,
+            out,
+            m=M,
+            n=N,
+            k=K,
+            is_a_k_major=a_k_major,
+            is_b_k_major=b_k_major,
+        )
+        is ok
+    )

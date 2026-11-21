@@ -4332,17 +4332,18 @@ def _pool_plan_tactics(pool, key, spec, device_index, heur_modes, handle):
         return None
 
 
-def _get_cudnn_override_graph(builder, tactic, **kwargs):
+def _get_cudnn_override_graph(builder, tactic, *, use_worker_plan=True, **kwargs):
     """Reuse an existing search graph, or build only a persisted winner.
 
     The builder's LRU owns the graph lifetime. Weak references let profiling
     and immediate CUDA Graph capture reuse its all-plans graph without retaining
     graphs after eviction. A fresh process with a saved tactic builds just that
-    engine and knob combination.
+    engine and knob combination. ``use_worker_plan=False`` skips plans built by
+    the plan-build workers for this call.
     """
     key = _cudnn_override_key(builder, kwargs)
     if _is_cudnn_engine_knob_tactic(tactic):
-        prebuilt = _cudnn_override_prebuilt.get(key)
+        prebuilt = _cudnn_override_prebuilt.get(key) if use_worker_plan else None
         if prebuilt is not None and tactic in prebuilt:
             _cudnn_override_prebuilt.move_to_end(key)
             graph = prebuilt[tactic]
@@ -5912,6 +5913,29 @@ def _bf16_override_graph_spec(
     )
 
 
+def _bf16_worker_plan_geometry_ok(
+    a, b, bias, out, *, m, n, k, is_a_k_major, is_b_k_major
+) -> bool:
+    """Whether a worker-built plan may run this call.
+
+    A plan built by the plan-build workers and restored with ``deserialize()``
+    can write past an output smaller than the one it was built for: on GB300
+    (cuDNN 9.24) an M=37 call on an M=64 plan returned the right rows but
+    overwrote 27 rows beyond them (#9809). Run such plans only for dense,
+    bias-free 2-D calls whose shapes and strides equal the built geometry;
+    everything else uses the in-process plan.
+    """
+    return (
+        bias is None
+        and tuple(a.shape) == (m, k)
+        and tuple(b.shape) == (k, n)
+        and tuple(out.shape) == (m, n)
+        and a.stride() == ((k, 1) if is_a_k_major else (1, m))
+        and b.stride() == ((1, k) if is_b_k_major else (n, 1))
+        and out.stride() == (n, 1)
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def build_cudnn_gemm_bf16_graph_override_shape(
     batch,
@@ -6127,10 +6151,25 @@ def _cudnn_gemm_bf16_runner(
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def _get_override_graph(self, a, b, bias, out, tactic=-1):
+            kwargs = self._override_graph_kwargs(a, b, bias, out)
+            use_worker_plan = True
+            if _cudnn_override_prebuilt and _is_cudnn_engine_knob_tactic(tactic):
+                use_worker_plan = _bf16_worker_plan_geometry_ok(
+                    a,
+                    b,
+                    bias,
+                    out,
+                    m=kwargs["cache_m"],
+                    n=kwargs["n"],
+                    k=kwargs["k"],
+                    is_a_k_major=self._is_a_k_major,
+                    is_b_k_major=self._is_b_k_major,
+                )
             return _get_cudnn_override_graph(
                 build_cudnn_gemm_bf16_graph_override_shape,
                 tactic,
-                **self._override_graph_kwargs(a, b, bias, out),
+                use_worker_plan=use_worker_plan,
+                **kwargs,
             )
 
         def _override_graph_kwargs(self, a, b, bias, out) -> dict:
