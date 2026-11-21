@@ -857,12 +857,14 @@ class KdaReplayMtpUmma:
 
         # TMEM first: the next CTA on this SM is not launched before this one relinquishes
         # its TMEM allocation permit (GDN: allocating late spaced CTAs ~2.5 us apart).
-        # Named barrier 2 (warp 1 arrive + 128 consumers) publishes the address.
+        # Named barrier 2 (warp 1 + warp 0 arrive, 128 consumers sync) publishes the
+        # address together with warp 0's mbarrier inits. Named barriers: ids 1..3 only
+        # (SM107 has 16 per SM and a CTA holds highest id + 1: 4 -> 4 CTAs per SM).
         if warp == 1:
             U.tmem_alloc(tmem_addr, _TMEM_COLS)
             cute.arch.relinquish_tmem_alloc_permit()
             U.fence_before_sync()
-            cute.arch.barrier_arrive(barrier_id=2, number_of_threads=160)
+            cute.arch.barrier_arrive(barrier_id=2, number_of_threads=192)
 
         # Cursors first (every thread), then the mbarrier inits while they are in flight.
         sidx = Int32(state_idx_t[brow])
@@ -885,7 +887,7 @@ class KdaReplayMtpUmma:
                 cute.arch.mbarrier_init_fence()
             cute.arch.fence_acq_rel_cta()
             cute.arch.barrier_arrive(barrier_id=3, number_of_threads=64)
-            cute.arch.barrier_arrive(barrier_id=4, number_of_threads=160)
+            cute.arch.barrier_arrive(barrier_id=2, number_of_threads=192)
 
         # Batch-row-only inputs, issued by EVERY thread ahead of the padded-row exit so
         # their latency overlaps the cursors' (warps 0 / 1 load in-range dummies).
@@ -1193,7 +1195,8 @@ class KdaReplayMtpUmma:
                 s_coef[_CO_BETA + ct] = Float32(1.0) / (
                     Float32(1.0) + _exp(Float32(0.0) - Float32(braw))
                 )
-            cute.arch.barrier(barrier_id=4, number_of_threads=160)  # warp 0's inits
+            # warp 0's inits + warp 1's TMEM address
+            cute.arch.barrier(barrier_id=2, number_of_threads=192)
             cute.arch.fence_view_async_shared()
             cute.arch.mbarrier_arrive(x_ready)
             _bar_sync_ua(1, 128)  # s_gp, X_c, Ktil visible to every consumer
@@ -1313,8 +1316,7 @@ class KdaReplayMtpUmma:
                 lo = _sel(2 * i < P, uv[2 * i], Uint32(0), Uint32)
                 hi = _sel(2 * i + 1 < P, uv[2 * i + 1], Uint32(0), Uint32)
                 words.append(lo | (hi << Uint32(16)))
-            cute.arch.barrier(barrier_id=2, number_of_threads=160)  # TMEM address
-            U.fence_after_sync()
+            U.fence_after_sync()  # TMEM address: named barrier 2 in P2
             tbase = tmem_addr[0] | (tq << 16)  # lane field: this warp's quadrant
             U.tmem_st_u32(0, tbase + _COL_D, words)
             if cutlass.const_expr(WR == 32):
@@ -1503,9 +1505,9 @@ def _use_persistent(B: int, T: int, H: int, w_ring: int, dev: torch.device) -> b
         return bool(_FORCE_PERSISTENT)
     if w_ring != 16:
         return False
-    slots = (
-        _MIN_BLOCKS_PER_SM * torch.cuda.get_device_properties(dev).multi_processor_count
-    )
+    from .kda_replay_mtp_umma_persistent import ctas_per_sm
+
+    slots = ctas_per_sm(dev) * torch.cuda.get_device_properties(dev).multi_processor_count
     items = B * H
     return items >= (4 if T <= 6 else 16) * slots
 

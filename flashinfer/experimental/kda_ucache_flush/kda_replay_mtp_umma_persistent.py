@@ -1297,12 +1297,14 @@ class KdaReplayMtpUmma:
                 )
         # TMEM first: the next CTA on this SM is not launched before this one relinquishes
         # its TMEM allocation permit (GDN: allocating late spaced CTAs ~2.5 us apart).
-        # Named barrier 2 (warp 1 arrive + 128 consumers) publishes the address.
+        # Named barrier 2 (warp 1 + warp 0 arrive, 128 consumers sync) publishes the
+        # address together with warp 0's mbarrier inits. Named barriers: ids 1..3 only
+        # (SM107 has 16 per SM and a CTA holds highest id + 1: 4 -> 4 CTAs per SM).
         if warp == 1:
             U.tmem_alloc(tmem_addr, _TMEM_COLS)
             cute.arch.relinquish_tmem_alloc_permit()
             U.fence_before_sync()
-            cute.arch.barrier_arrive(barrier_id=2, number_of_threads=160)
+            cute.arch.barrier_arrive(barrier_id=2, number_of_threads=192)
 
         # Cursors of the first item (every thread), then the mbarrier inits while they
         # are in flight. Every role walks the same item list with the same cursors.
@@ -1336,7 +1338,7 @@ class KdaReplayMtpUmma:
                 cute.arch.mbarrier_init_fence()
             cute.arch.fence_acq_rel_cta()
             cute.arch.barrier_arrive(barrier_id=3, number_of_threads=64)
-            cute.arch.barrier_arrive(barrier_id=4, number_of_threads=160)
+            cute.arch.barrier_arrive(barrier_id=2, number_of_threads=192)
 
         x_addr = s_x.iterator.toint()
         kt_addr = s_kt.iterator.toint()
@@ -1652,8 +1654,9 @@ class KdaReplayMtpUmma:
             it = Int32(0)
             fit = Int32(0)
             mb_addr = s_mbox.toint()
-            # warp 0's mbarrier inits (the mailbox is read before the first item)
-            cute.arch.barrier(barrier_id=4, number_of_threads=160)
+            # warp 0's mbarrier inits (the mailbox is read before the first item) and
+            # warp 1's TMEM address
+            cute.arch.barrier(barrier_id=2, number_of_threads=192)
             item = _mbox_take(mb_addr, mb_full, mb_empty, Int32(0), cta, warp)
             kk = Int32(0)
             while item < NIT:
@@ -2026,10 +2029,7 @@ class KdaReplayMtpUmma:
                         hi = _sel(2 * i + 1 < P, uv[2 * i + 1], Uint32(0), Uint32)
                         words.append(lo | (hi << Uint32(16)))
                     if it == 0:
-                        cute.arch.barrier(
-                            barrier_id=2, number_of_threads=160
-                        )  # TMEM addr
-                        U.fence_after_sync()
+                        U.fence_after_sync()  # TMEM addr: named barrier 2 above
                     tbase = tmem_addr[0] | (
                         tq << 16
                     )  # lane field: this warp's quadrant
@@ -2266,13 +2266,38 @@ def _u_src(w_ring: int) -> str:
     return "smem" if w_ring == 16 else "ldg"
 
 
+# Named-barrier slots a CTA of either UMMA kernel holds (highest barrier id + 1: ids 1..3).
+_BARRIER_SLOTS = 4
+_CTAS_PER_SM: dict = {}
+
+
+def ctas_per_sm(dev: torch.device, threads: int = 256) -> int:
+    """Resident CTAs per SM of the UMMA kernels (persistent grid size / SM): the
+    _MIN_BLOCKS_PER_SM register / SMEM / TMEM target, capped by the SM's named barriers
+    (64 on SM100 / SM103, 16 on SM107 Rubin; _BARRIER_SLOTS per CTA) and its thread limit
+    (2048 on SM100, 1024 on SM107)."""
+    key = (str(dev), threads)
+    n = _CTAS_PER_SM.get(key)
+    if n is None:
+        p = torch.cuda.get_device_properties(dev)
+        bars = 16 if (p.major, p.minor) == (10, 7) else 64
+        n = max(
+            1,
+            min(
+                _MIN_BLOCKS_PER_SM,
+                bars // _BARRIER_SLOTS,
+                p.max_threads_per_multi_processor // threads,
+            ),
+        )
+        _CTAS_PER_SM[key] = n
+    return n
+
+
 def _grid(B: int, H: int, dev: torch.device):
     """(persistent, CTAs): one CTA per (request, head) item, or a persistent grid of
-    _MIN_BLOCKS_PER_SM CTAs per SM when there are more items than that."""
+    ctas_per_sm() CTAs per SM when there are more items than that."""
     n = B * H
-    slots = (
-        _MIN_BLOCKS_PER_SM * torch.cuda.get_device_properties(dev).multi_processor_count
-    )
+    slots = ctas_per_sm(dev) * torch.cuda.get_device_properties(dev).multi_processor_count
     pz = _FORCE_PERSISTENT if _FORCE_PERSISTENT is not None else True
     return bool(pz), (min(n, slots) if pz else n)
 
