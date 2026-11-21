@@ -460,6 +460,11 @@ def frost_template_kernel(
                         if my_group != 0:
                             my_begin = cutlass.Int32(first_token_arr[my_group])
                         my_end = cutlass.Int32(first_token_arr[my_group + 1])
+                        # The offsets are device data the host never checks: clamp the group into the M routed
+                        # rows, so a bad table drops rows instead of storing past the output or reading past
+                        # token_index / token_ks, and its tile count cannot go negative.
+                        my_end = cutlass.min(cutlass.max(my_end, cutlass.Int32(0)), cutlass.Int32(M))
+                        my_begin = cutlass.min(cutlass.max(my_begin, cutlass.Int32(0)), my_end)
                         my_tiles = cute.ceil_div(my_end - my_begin, cgrp_tile_mnk[0]) * tiles_along_n
                     prefix_tiles = my_tiles
                     for delta in (1, 2, 4, 8, 16):

@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .activations import ACTIVATIONS, is_gated
+from .activations import KNOWN_ACTIVATIONS, SWIGLU_PARAM_SCALARS, is_gated
 from .manifest import MANIFEST_FILENAME, read_manifest, write_manifest
 from .catalog import generic_contract, kernel_id
 
@@ -184,7 +184,7 @@ def _build_graph(
         output.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
         return graph
     activation = op.removeprefix("grouped_gemm1_")
-    if activation not in ACTIVATIONS:
+    if activation not in KNOWN_ACTIVATIONS:
         raise ValueError(f"unsupported export op {op!r}")
     up = graph.tensor(
         name="up_weight",
@@ -256,6 +256,12 @@ def _build_graph(
     if activation == "relu2":
         activated = graph.mul(a=activated, b=activated, name="square")
     elif activation == "swiglu_step":
+        # min(silu(gate), 7) * clamp(up, -7, 7). cuDNN's RELU_FWD is
+        # x < lower ? lower + slope * (x - lower) : x, then min(., upper), with
+        # lower defaulting to 0: the gate keeps its negative values through an
+        # identity slope, and a slope-free ReLU clamps up at -7. (A slope with
+        # lower_clip=-7 would leak below -7; Frost before cuDNN Frontend
+        # e0185b3b clamped there anyway. Both packaged revisions are later.)
         activated = graph.relu(
             input=activated, negative_slope=1.0, upper_clip=7.0, name="gate_clamp"
         )
@@ -266,6 +272,37 @@ def _build_graph(
             lower_clip=-7.0,
             upper_clip=7.0,
             name="up_clamp",
+        )
+    elif activation == "swiglu_param":
+        # SwiGLU with launch-time alpha/beta/limit (FlashInfer's SwiGLU contract):
+        # g = min(gate, limit), u = clamp(up, -limit, limit),
+        # g * sigmoid(alpha * g) * (u + beta). The lower bound arrives as -limit.
+        alpha, beta, limit, lower = (
+            graph.tensor(
+                name=name,
+                dim=[1, 1, 1],
+                stride=[1, 1, 1],
+                data_type=cudnn.data_type.FLOAT,
+            )
+            for name in SWIGLU_PARAM_SCALARS
+        )
+        gate_clamped = graph.min(input0=gate_out, input1=limit, name="gate_clamp")
+        activated = graph.mul(
+            a=gate_clamped,
+            b=graph.sigmoid(
+                input=graph.mul(a=gate_clamped, b=alpha, name="gate_slope"),
+                name="gate_sigmoid",
+            ),
+            name="gate_swish",
+        )
+        up_out = graph.add(
+            a=graph.max(
+                input0=graph.min(input0=up_out, input1=limit, name="up_upper"),
+                input1=lower,
+                name="up_lower",
+            ),
+            b=beta,
+            name="up_bias",
         )
     elif activation == "situ":
         gate_scale = graph.tensor(
@@ -696,9 +733,11 @@ def _export_compiled(args, compiled, config, arch):
             if 0 in tma_slots
             else ["output", "output_scale"] + aux_names
         )
-    expected_aux = (
-        {"scale", "gate_scale", "linear_scale"} if activation == "situ" else {"scale"}
-    )
+    expected_aux = {"scale"}
+    if activation == "situ":
+        expected_aux |= {"gate_scale", "linear_scale"}
+    elif activation == "swiglu_param":
+        expected_aux |= set(SWIGLU_PARAM_SCALARS)
     if dtype != "bf16":
         expected_aux |= {"gate_alpha"}
         if is_gated(activation):
@@ -841,7 +880,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--op",
-        choices=(*(f"grouped_gemm1_{name}" for name in ACTIVATIONS), "grouped_gemm2"),
+        choices=(
+            *(f"grouped_gemm1_{name}" for name in KNOWN_ACTIVATIONS),
+            "grouped_gemm2",
+        ),
         default="grouped_gemm1_swiglu",
     )
     parser.add_argument("--output-dir", type=Path, required=True)

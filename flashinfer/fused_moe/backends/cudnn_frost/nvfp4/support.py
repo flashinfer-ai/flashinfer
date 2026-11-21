@@ -23,4 +23,7 @@ def is_eligible(config, act, arch):
         activation_name(config.activation)
     except NotImplementedError:
         return False
-    return moe_geometry(config, act, hidden_size=2 * x.shape[1])
+    # SM120 kernels take whole 32-element N/K blocks; NVFP4's 4-column scale
+    # words then need H and I in 64s (e.g. gpt-oss, 2880).
+    multiple = 64 if arch == 120 else 128
+    return moe_geometry(config, act, hidden_size=2 * x.shape[1], multiple=multiple)

@@ -17,7 +17,12 @@ from .....fused_moe.api import QuantFormat, RoutingInputMode
 from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from .....utils import get_compute_capability
 from .. import runtime as common
-from ..activations import ACTIVATIONS, activation_name
+from ..activations import (
+    ACTIVATIONS,
+    DEFAULT_LAUNCH_SCALARS,
+    activation_name,
+    launch_scalars,
+)
 from ..support import SUPPORTED_ARCHS, weight_view
 from .support import is_eligible
 from ..compiler import require_moe_assembler
@@ -54,6 +59,10 @@ _WEIGHT_KEYS = (
 )
 _TAG = "cudnn_frost-nvfp4-moe-v3"
 _UNSUPPORTED = "cuDNN Frost NVFP4 MoE kernels require SM107a or SM120a"
+
+
+def _atom_rows(rows):
+    return (rows + 127) // 128 * 128
 
 
 def _tensor_version(tensor):
@@ -259,6 +268,7 @@ class _Plans:
         swizzled=False,
         fma_tactic=None,
         validate_fma_sources=None,
+        scalars=DEFAULT_LAUNCH_SCALARS,
     ):
         self.plans, self.launches = {}, {}
         first = tuple(common.bind_kernel(k, device) for k in first)
@@ -268,7 +278,7 @@ class _Plans:
         module = _module(common._arch_for(device))
         for a, b in product(first, second):
             key = (_TAG, a.tactic, b.tactic)
-            executor_key = (hidden, intermediate, experts, topk, swizzled, key)
+            executor_key = (hidden, intermediate, experts, topk, swizzled, scalars, key)
             plan = executor_cache.get(executor_key)
             if plan is None:
                 factory = (
@@ -291,13 +301,22 @@ class _Plans:
                     b.swap_ab,
                     swizzled,
                     False,
+                    *scalars,
                 )
                 executor_cache[executor_key] = plan
             # Packed states retain Modules whose run Functions borrow them.
             self.plans[key], self.launches[key] = plan, plan["run"]
             required = max(required, plan["workspace_size"](tokens))
         if fma_tactic is not None:
-            executor_key = (hidden, intermediate, experts, topk, swizzled, fma_tactic)
+            executor_key = (
+                hidden,
+                intermediate,
+                experts,
+                topk,
+                swizzled,
+                scalars,
+                fma_tactic,
+            )
             plan = executor_cache.get(executor_key)
             if plan is None:
                 if validate_fma_sources is not None:
@@ -335,6 +354,7 @@ class _Plans:
                     False,
                     swizzled,
                     True,
+                    *scalars,
                 )
                 if validate_fma_sources is not None:
                     validate_fma_sources()
@@ -467,6 +487,16 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
                 }
             )
         )
+        if not any(
+            kernel.fc1 and kernel.arch == arch and kernel.activation == name
+            for root in _artifact_roots()
+            for kernel in runtime.discover(root)
+        ):
+            # E.g. swiglu_param, whose scalar-parameterized sources are packaged
+            # for SM120 only.
+            raise NotImplementedError(
+                f"cuDNN Frost NVFP4 MoE has no {name} kernels for {arch}"
+            )
         require_graph_resource_retention()
         # Only the SM107 sources patch tensor maps and need the assembler floor.
         if arch == "sm_107a":
@@ -502,6 +532,7 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
                 swizzled,
                 metadata.fma_tactic,
                 metadata.validate_fma_sources,
+                launch_scalars(activation),
             ),
         )
         self._plans = self._engine.plans
@@ -547,8 +578,10 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
             and 0 < i <= 1 << 20
         ):
             raise ValueError("cuDNN Frost NVFP4 requires bounded int32 geometry")
-        if h % 128 or i % 128:
-            raise ValueError("cuDNN Frost NVFP4 requires H/I divisible by 128")
+        # SM120 takes H/I in 64s (4-column scale words); SM107 in 128s.
+        multiple = 64 if get_compute_capability(self.device) == (12, 0) else 128
+        if h % multiple or i % multiple:
+            raise ValueError(f"cuDNN Frost NVFP4 requires H/I divisible by {multiple}")
         _validate_prerouted_inputs(
             act,
             t,
@@ -564,10 +597,11 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
             )
         w1, w2, a1, sf1, alpha1, a2, sf2, alpha2 = (view[name] for name in _WEIGHT_KEYS)
         mult = 2 if self.config.activation.is_gated else 1
+        # 128x4 block scales pad each matrix's rows to whole 128-row atoms.
         expected = (
             (w1, torch.uint8, (e, mult * i, h // 2)),
             (w2, torch.uint8, (e, h, i // 2)),
-            (sf2, torch.uint8, (e, h, i // 16)),
+            (sf2, torch.uint8, (e, _atom_rows(h), i // 16)),
             (alpha1, torch.float32, (e,)),
             (alpha2, torch.float32, (e,)),
         )
@@ -579,12 +613,19 @@ class CudnnFrostNvfp4MoeRunner(FrostRunnerMixin, MoERunner):
             or sf1.dtype != torch.uint8
             or tuple(sf1.shape)
             not in (
-                (e, mult * i, h // 16),
-                (mult, e, i, h // 16),
+                (e, _atom_rows(mult * i), h // 16),
+                (mult, e, _atom_rows(i), h // 16),
             )
         ):
             raise ValueError(
                 "cuDNN Frost NVFP4 canonical weight/scale geometry mismatch"
+            )
+        if sf1.ndim == 3 and mult == 2 and i % 128:
+            # The gate rows start mid-atom: Frost reads up and gate separately.
+            raise ValueError(
+                "cuDNN Frost NVFP4 needs per-branch FC1 block scales when I is "
+                "not a multiple of 128; prepare weights with "
+                "CudnnFrostNvfp4Config.prepare_weights"
             )
         if any(
             value.dtype != torch.float32 or tuple(value.shape) not in ((), (1,))
