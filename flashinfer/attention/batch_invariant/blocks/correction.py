@@ -38,7 +38,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass.cute.nvgpu import tcgen05
 
 from ....batch_invariant.fp_interface.cute import CuteF32
-from ..fixup import VEC, fold_row
+from ..fixup import VEC, finish2, fold_row
 from ..plan import (
     G_CHUNK_LO,
     G_KVHEAD,
@@ -161,12 +161,12 @@ def first_merge_elems(rO, a2):
         rO[e + 1] = y1
 
 
-def normalize_elems(rM, inv, rOut):
-    """The epilogue's ``cvt_bf16(add(mul(O, inv), +0))`` per element, two per ``mul.rn.f32x2`` / ``add.rn.f32x2``. Plain Python."""
-    zero = Float32(0.0)
+def normalize_elems(rM, inv, rOut, vs, scaled: bool):
+    """The epilogue's ``cvt_bf16(add(mul(O, inv), +0))`` per element, two per ``mul.rn.f32x2`` / ``add.rn.f32x2``; with ``scaled``
+    (the low-bit-KV classes) one ``mul.rn`` by the value scale ``vs`` before the add (``fixup.finish2``, the chain's one home).
+    Plain Python."""
     for e in range(0, cute.size(rM), 2):
-        y0, y1 = CuteF32.mul2((rM[e], rM[e + 1]), (inv, inv))
-        z0, z1 = CuteF32.add2((y0, y1), (zero, zero))
+        z0, z1 = finish2((rM[e], rM[e + 1]), inv, vs, scaled)
         rOut[e] = z0.to(IN_DTYPE)
         rOut[e + 1] = z1.to(IN_DTYPE)
 
@@ -324,9 +324,12 @@ def merge_global_to_output(
     n_pieces: cutlass.Constexpr,
     CT: cutlass.Constexpr,
     D: cutlass.Constexpr,
+    vs: Float32,
+    scaled: cutlass.Constexpr,
 ):
     """``merge_global_pipelined``'s merge of the unit's last chunk with the running state in the global scratch, normalised into the
-    output rows piece by piece instead of written back: the fused unit's epilogue when ``O_m`` is not in TMEM."""
+    output rows piece by piece instead of written back: the fused unit's epilogue when ``O_m`` is not in TMEM. ``vs`` / ``scaled``:
+    the low-bit-KV classes' value scale in the normalisation (``normalize_elems``)."""
     depth = len(rMs)
     if first_merge:
         rMa = rMs[0]
@@ -335,7 +338,7 @@ def merge_global_to_output(
                 tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
             )
             merge_elems(rO, rMa, a1, a2, True)
-            normalize_elems(rMa, inv, rOut)
+            normalize_elems(rMa, inv, rOut, vs, scaled)
             if row_valid:
                 store_out_piece(rOut, mO, out_row, i, CT, D)
     else:
@@ -351,7 +354,7 @@ def merge_global_to_output(
                 tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
             )
             merge_elems(rO, cur, a1, a2, False)
-            normalize_elems(cur, inv, rOut)
+            normalize_elems(cur, inv, rOut, vs, scaled)
             if row_valid:
                 store_out_piece(rOut, mO, out_row, i, CT, D)
 
@@ -500,6 +503,8 @@ def epilogue(
     CT: cutlass.Constexpr,
     om_tmem: cutlass.Constexpr,
     WS: cutlass.Constexpr,
+    vs: Float32,
+    scaled: cutlass.Constexpr,
 ):
     """The unit's end. Mode 0 with ``O_m`` in TMEM: the accumulator is folded into ``O_m`` (the last chunk's merge when the unit has
     several chunks, a copy otherwise), the accumulator stage is RELEASED -- the next unit's first PV may start -- and the output rows
@@ -507,7 +512,8 @@ def epilogue(
     home of the unit's final fp32 state differs (a placement), and the tensor core no longer waits for the normalisation and the
     output stores, which cost more than every tile of a short unit. Mode 0 with ``O_m`` elsewhere: merged straight into the output
     rows while the stage is held. Mode 1: the raw fp32 ``O_c`` rows and ``(m, l)`` to the workspace slot (``fixup.py`` folds them),
-    the stage released after the reads."""
+    the stage released after the reads. ``vs`` / ``scaled``: the low-bit-KV classes' value scale in every mode-0 normalisation
+    (``fixup.finish2``: one ``mul.rn`` before the add)."""
     oh = o_cons.wait_and_advance()  # the unit's last PV complete
     if mode == 0:
         if cutlass.const_expr(om_tmem):
@@ -552,7 +558,7 @@ def epilogue(
                         cute.make_tensor(tLDm.iterator + i * CT, tLDm.layout),
                         rM,
                     )
-                    normalize_elems(rM, inv, rOut)
+                    normalize_elems(rM, inv, rOut, vs, scaled)
                     if row_valid:
                         store_out_piece(rOut, mO, out_row, i, CT, D)
         else:
@@ -577,6 +583,8 @@ def epilogue(
                         n_pieces,
                         CT,
                         D,
+                        vs,
+                        scaled,
                     )
                 else:
                     for i in cutlass.range_constexpr(n_pieces):
@@ -585,7 +593,7 @@ def epilogue(
                             cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout),
                             rO,
                         )
-                        normalize_elems(rO, inv, rOut)
+                        normalize_elems(rO, inv, rOut, vs, scaled)
                         if row_valid:
                             store_out_piece(rOut, mO, out_row, i, CT, D)
             cute.arch.fence_view_async_tmem_load()
@@ -632,6 +640,7 @@ def correction_loop(
     cta: Int32,
     c: Float32,
     nc: Float32,
+    vs: Float32,
     rows_valid: Int32,
     q_base: Int32,
     q_tok0: Int32,
@@ -813,6 +822,8 @@ def correction_loop(
         CT,
         om_tmem,
         WS,
+        vs,
+        st.scaled_out,
     )
     return o_cons, stats_cons
 
@@ -828,6 +839,7 @@ def fold_group(
     grp: Int32,
     c: Float32,
     nc: Float32,
+    vs: Float32,
     window_left: Int32,
     Hq: Int32,
 ):
@@ -889,6 +901,8 @@ def fold_group(
                         chunk_len(st.D),
                         8 if st.n_wg == 1 else 4,
                         st.ws_row,
+                        vs,
+                        st.scaled_out,
                         causal=st.causal,
                     )
             if thread_idx == 0:
@@ -1015,6 +1029,7 @@ def correction_loop_q2(
     mWs: cute.Tensor,
     c: Float32,
     nc: Float32,
+    vs: Float32,
     Hq: Int32,
     q_base: Int32,
     kv_head: Int32,
@@ -1223,6 +1238,8 @@ def correction_loop_q2(
             CT,
             st.om_tmem,
             WS,
+            vs,
+            st.scaled_out,
         )
     if has_b:
         inv_b = CuteF32.div(Float32(1.0), lr_b)
@@ -1259,5 +1276,7 @@ def correction_loop_q2(
             CT,
             st.om_tmem,
             WS,
+            vs,
+            st.scaled_out,
         )
     return o_cons_a, o_cons_b, stats_cons_a, stats_cons_b

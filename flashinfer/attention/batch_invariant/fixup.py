@@ -54,6 +54,27 @@ _NEG_INF = float("-inf")
 
 
 @cute.jit
+def finish(x: Float32, inv: Float32, vs: Float32, scaled: cutlass.Constexpr) -> Float32:
+    """The epilogue chain before the conversion, in one place for every epilogue site (the fused unit's, the in-kernel fold's
+    and the fixup kernel's): ``add(mul(x, inv), +0)`` for the bf16 class; ``add(mul(mul(x, inv), vs), +0)`` for the fp8-KV
+    classes (``scaled``: one ``mul.rn`` by the value scale ``vs``), then the caller's single ``cvt.rn``."""
+    y = CuteF32.mul(x, inv)
+    if cutlass.const_expr(scaled):
+        y = CuteF32.mul(y, vs)
+    return CuteF32.add(y, Float32(0.0))
+
+
+def finish2(x, inv, vs, scaled: bool):
+    """``finish`` on two elements per packed instruction (``mul.rn.f32x2`` / ``add.rn.f32x2``: the same per-element ops, a packing
+    placement) for the row body's epilogue pieces; ``x`` is a pair, the result a pair. Plain Python: trace-time structure."""
+    zero = Float32(0.0)
+    y = CuteF32.mul2(x, (inv, inv))
+    if scaled:
+        y = CuteF32.mul2(y, (vs, vs))
+    return CuteF32.add2(y, (zero, zero))
+
+
+@cute.jit
 def fold_row_state(
     mWs: cute.Tensor,
     slot: Int32,
@@ -191,13 +212,16 @@ def fold_row(
     C: cutlass.Constexpr,
     PF: cutlass.Constexpr,
     WS: cutlass.Constexpr,
+    vs: Float32,
+    scaled: cutlass.Constexpr,
     *,
     causal: cutlass.Constexpr = True,
 ):
     """Row ``r`` of a split group, output columns ``[d0, d0 + VEC)``: the chunk-order fold of the row's present chunks from the
-    init state (``fold_row_state``, the single implementation), then the epilogue to the output row. ``WS`` is the workspace row
-    pitch of the head dim (``plan.ws_row(D)``: 68 / 132 / 260 at D = 64 / 128 / 256). ``causal``: the mask mode; a non-causal row's
-    present chunks are those of the whole key range ``[0, kv_len)`` (the fold of a row at the last position with no window)."""
+    init state (``fold_row_state``, the single implementation), then the epilogue to the output row (``finish``: with the value
+    scale ``vs`` for the fp8-KV classes). ``WS`` is the workspace row pitch of the head dim (``plan.ws_row(D)``: 68 / 132 / 260 at
+    D = 64 / 128 / 256). ``causal``: the mask mode; a non-causal row's present chunks are those of the whole key range
+    ``[0, kv_len)`` (the fold of a row at the last position with no window)."""
     token = q_tok0 + r // g
     pos = kv_len - q_len + token
     if cutlass.const_expr(not causal):
@@ -225,9 +249,9 @@ def fold_row(
     inv = CuteF32.div(Float32(1.0), l)
     out_row = (q_base + token) * Hq + kv_head * g + r % g
     for e in cutlass.range_constexpr(VEC):
-        mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
-            CuteF32.mul(o[e], inv), Float32(0.0)
-        ).to(mO.element_type)
+        mO[(out_row.to(Int64), d0 + e)] = finish(o[e], inv, vs, scaled).to(
+            mO.element_type
+        )
 
 
 WIDE_PF = 32  # the fixup kernel's batch of chunks loaded before their merges (the wide thread mapping below)
@@ -431,8 +455,19 @@ def fold_row_coop(
 
 
 class SplitKVFixup:
-    def __init__(self, D: int, g: int, pdl: bool = PDL, *, causal: bool = True):
-        self.D, self.g, self.pdl = D, g, pdl
+    """``scaled``: the fp8-KV classes' epilogue (one ``mul.rn`` by the value scale ``vs`` before the conversion); the bf16 class's
+    kernel ignores ``vs``."""
+
+    def __init__(
+        self,
+        D: int,
+        g: int,
+        scaled: bool = False,
+        pdl: bool = PDL,
+        *,
+        causal: bool = True,
+    ):
+        self.D, self.g, self.scaled, self.pdl = D, g, scaled, pdl
         self.causal = causal  # the mask mode (a class dimension; compile-time)
         self.C = chunk_len(D)
         self.WS = ws_row(D)
@@ -445,6 +480,7 @@ class SplitKVFixup:
         mGroups: cute.Tensor,
         c: Float32,
         nc: Float32,
+        vs: Float32,
         window_left: Int32,
         Hq: Int32,
         num_groups: Int32,
@@ -455,7 +491,7 @@ class SplitKVFixup:
         # grid: (row blocks of a group, min(groups, MAX_GRID_Y)); a block handles 128 / (D / V) rows (2 / 2 / 1 at D = 64 / 128 / 256),
         # V = wide_vec(D) output columns per thread, and strides over the groups beyond grid.y
         rows_per_block = THREADS // (self.D // wide_vec(self.D))
-        self.kernel(mWs, mO, mGroups, c, nc, window_left, Hq, num_groups).launch(
+        self.kernel(mWs, mO, mGroups, c, nc, vs, window_left, Hq, num_groups).launch(
             grid=[cute.ceil_div(max_rows, rows_per_block), grid_y, 1],
             block=[THREADS, 1, 1],
             stream=stream,
@@ -470,6 +506,7 @@ class SplitKVFixup:
         mGroups: cute.Tensor,
         c: Float32,
         nc: Float32,
+        vs: Float32,
         window_left: Int32,
         Hq: Int32,
         num_groups: Int32,
@@ -552,8 +589,8 @@ class SplitKVFixup:
             if live:
                 inv = CuteF32.div(Float32(1.0), l)
                 for e in cutlass.range_constexpr(V):
-                    mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
-                        CuteF32.mul(o[e], inv), Float32(0.0)
+                    mO[(out_row.to(Int64), d0 + e)] = finish(
+                        o[e], inv, vs, self.scaled
                     ).to(mO.element_type)
             cute.arch.sync_threads()  # the block's smem rows are reused by the next group
 
@@ -564,9 +601,11 @@ MAX_GRID_Y = (
 
 
 @functools.cache
-def get_fixup(D: int, g: int, *, causal: bool = True):
+def get_fixup(D: int, g: int, scaled: bool = False, *, causal: bool = True):
     name = jit.sanitize_symbol_name(
-        f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}" + ("" if causal else "_nc")
+        f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}"
+        + ("_vs" if scaled else "")
+        + ("" if causal else "_nc")
     )
 
     def compile_fn():
@@ -585,12 +624,13 @@ def get_fixup(D: int, g: int, *, causal: bool = True):
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            SplitKVFixup(D, g, causal=causal),
+            SplitKVFixup(D, g, scaled, causal=causal),
             ws_fake,
             o_fake,
             groups_fake,
             Float32(1.0),
             Float32(-1.0),
+            Float32(1.0),
             Int32(-1),
             Int32(1),
             Int32(1),

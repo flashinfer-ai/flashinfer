@@ -29,6 +29,15 @@ warps 1..3 from overwriting the exchange buffer with the next tile's slices) bef
 the correction reads rows 0..31. Padding rows compute values that are never stored (no predicated regions).
 With the two-stage S / P plan (``operands.tmem_plan_for``) tile ``n`` reads ``S`` from and writes ``P`` into stage
 ``n % 2`` (a dynamic TMEM column offset; ``P`` over the first ``T/2`` columns of its own ``S`` stage).
+
+The token-head-scale kernels (``st.th``) apply the per-(token, head) scales here, once per key (``spec.scaled_score`` /
+``spec.scaled_prob``): every score copied out of TMEM is multiplied by its key's scale (``mul.rn``) BEFORE the mask and the
+maximum, so the step below runs on the scaled scores unchanged (the maximum is the register tree's: the TMEM load's own
+maximum is of the unscaled scores); every probability is multiplied by its key's value scale (``mul.rn``) right before
+the bf16 conversion that forms the P operand, while the row sum adds the unscaled probabilities. A masked key's operand is
+then set to ``+0`` by a select, never by the multiply: whatever bytes its scales hold (a NaN, an infinity), they reach no
+stored value. The scales of the tile's keys come from the smem side ring the conversion stage fills with the tile's K slot
+(``convert.fetch_tile_scales``), entry ``seq % sf_stages`` for the CTA's ``seq``-th tile.
 """
 
 from __future__ import annotations
@@ -48,8 +57,10 @@ from .. import spec
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
 _NEG_INF = float("-inf")
-MASK_SELECT_MAX_D = 128  # the key mask as per-key selects (``masked_score``) serves the one-stage TMEM plan; the two-stage body at D = 256
-# keeps the per-key compare (the select form spills past its launch budget)
+MASK_SELECT_MAX_D = 128  # the key mask as per-key selects (``masked_score``) serves the full-row step of the one-stage TMEM plan; the
+# two-stage body at D = 256 keeps the per-key compare (the select form spills past its launch budget), and so does the
+# replicated-row placement of every kernel but the token-head-scale ones (the low-bit-KV kernels' decode units run it: the
+# selects made its tile step slower there, the compares the token-head-scale kernels')
 
 
 @dsl_user_op
@@ -89,7 +100,7 @@ class _RegLoader:
         return self.vals[key[0]]
 
 
-def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype):
+def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype, vs=None):
     """The slice's exponentials, their bf16 conversion and the rowsum tree's subtree over the slice, emitted in KEY order as a stream:
     for every pair of keys ``p = EX2(fma(s, c, nms))`` (the two fmas as one ``fma.rn.f32x2``), the pair's bf16 words, and the
     pair's ``add`` -- the first level of the engine's adjacent pairwise tree (``canon._pairwise``: low index first, level by level) --
@@ -97,15 +108,22 @@ def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype):
     tree, the same operand order). Written this way the live values at any point are the unprocessed scores, the finished P words
     and at most ``log2(keys)`` partial sums, so the P words can take the registers of the scores they came from; emitting every
     exponential before the first conversion kept all of them live next to the P block and cost the register allocator a copy of
-    most of them per tile. ``ss[i]`` is the score of key ``i`` of the slice (register ``i``). Plain Python: trace-time structure."""
+    most of them per tile. ``ss[i]`` is the score of key ``i`` of the slice (register ``i``). ``vs`` (the token-head-scale kernels):
+    ``vs[i]`` is key ``i``'s value scale and the pair's words are those of ``mul(p, vs)`` (one ``mul.rn.f32x2``), while the
+    sums take the unscaled ``p``. Plain Python: trace-time structure."""
     assert len(ss) % 2 == 0 and len(ss) & (len(ss) - 1) == 0, len(ss)
     stack = []  # (level, partial sum) of the completed subtrees, highest level first
     for i in range(0, len(ss), 2):
         x0, x1 = fp.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
         p0 = fp.ex2(x0)
         p1 = fp.ex2(x1)
-        rP_e[i] = p0.to(in_dtype)
-        rP_e[i + 1] = p1.to(in_dtype)
+        if vs is None:
+            rP_e[i] = p0.to(in_dtype)
+            rP_e[i + 1] = p1.to(in_dtype)
+        else:
+            y0, y1 = fp.mul2((p0, p1), (vs[i], vs[i + 1]))
+            rP_e[i] = y0.to(in_dtype)
+            rP_e[i + 1] = y1.to(in_dtype)
         v = fp.add(p0, p1)
         level = 1
         while stack and stack[-1][0] == level:
@@ -192,11 +210,15 @@ def unit_loop(
     q_len: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    s_ks: cute.Tensor,
+    s_vs: cute.Tensor,
+    seq0: Int32,
 ):
     """One unit for softmax warpgroup ``k``, in the full-row placement (its slice = keys ``[k kpt, (k+1) kpt)``) or the
     replicated-row placement (warp ``wq`` of the warpgroup takes slice ``4k + wq`` of ``4 n_wg``; the warpgroup's four
     slices are gathered in its warp 0 through smem before the P store). ``k`` is dynamic: the warpgroups run one copy
-    of this code (the slice index only moves TMEM column offsets and smem indices)."""
+    of this code (the slice index only moves TMEM column offsets and smem indices). ``s_ks`` / ``s_vs`` / ``seq0``: the
+    token-head-scale kernels' scale side ring and the CTA's tile count at the unit's first tile."""
     T, g, TPC = st.T, st.g, st.tpc
     tidx, _, _ = cute.arch.thread_idx()
     thread_idx = tidx % 128  # thread within the warpgroup (= TMEM lane)
@@ -221,6 +243,7 @@ def unit_loop(
     cS = cute.make_identity_tensor((Q_ROWS, T))
     tScS = qk_thr_mma.partition_C(cS)
     HWM = st.hw_rowmax
+    assert not (st.th and (HWM or st.n_wg != 1)), (st.kv_fmt, HWM, st.n_wg)
     if cutlass.const_expr(HWM):
         # the load returns each 32-column piece's maximum in an extra register (tcgen05.ld.red::max): the unmasked tile's row maximum
         # is the max.f32 join of the pieces -- the same exact maximum as the register tree
@@ -362,6 +385,30 @@ def unit_loop(
                 barrier_id=BAR_SOFTMAX_ALL, number_of_threads=st.softmax_threads
             )
         k0 = t * T
+        if cutlass.const_expr(st.th):
+            # s'_k = mul(s_k, ks_k) for every key of the row (and of the slice), before the mask and the maximum
+            sfe = (seq0 + n) % st.sf_stages
+            for i in cutlass.range_constexpr(0, T, 2):
+                x0, x1 = CuteF32.mul2(
+                    (rF[i], rF[i + 1]),
+                    (
+                        s_ks[(int(cols_f[i]), sfe)],
+                        s_ks[(int(cols_f[i + 1]), sfe)],
+                    ),
+                )
+                rF[i] = x0
+                rF[i + 1] = x1
+            if cutlass.const_expr(not one_slice):
+                for i in cutlass.range_constexpr(0, kpt, 2):
+                    x0, x1 = CuteF32.mul2(
+                        (rS[i], rS[i + 1]),
+                        (
+                            s_ks[(col_base + int(cols_s[i]), sfe)],
+                            s_ks[(col_base + int(cols_s[i + 1]), sfe)],
+                        ),
+                    )
+                    rS[i] = x0
+                    rS[i + 1] = x1
         # mask only the tiles that need it: a boundary of a live row's visible range inside the tile. Interior tiles
         # are fully visible and padding rows (row >= rows_valid) are never masked: their values are never stored (a
         # warp-uniform decision, no arithmetic involved)
@@ -371,7 +418,7 @@ def unit_loop(
         if need_mask:
             # the row's visible range in tile-relative columns: key k0 + col is masked iff col < lim_lo or col >= lim_hi (the slice's
             # columns offset by col_base)
-            if cutlass.const_expr(st.D <= MASK_SELECT_MAX_D):
+            if cutlass.const_expr(st.D <= MASK_SELECT_MAX_D and (not rep or st.th)):
                 lim_lo = lo_row - k0
                 lim_hi = L_row - k0
                 if cutlass.const_expr(not exchange):
@@ -383,7 +430,7 @@ def unit_loop(
                     for i in cutlass.range_constexpr(kpt):
                         rS[i] = masked_score(rS[i], lim_lo_s, lim_hi_s, int(cols_s[i]))
             else:
-                # the two-stage body keeps the per-key compare: the select form raises its register pressure past the launch budget
+                # the per-key compare (MASK_SELECT_MAX_D)
                 if cutlass.const_expr(not exchange):
                     for i in cutlass.range_constexpr(T):
                         key = k0 + cols_f[i]
@@ -453,8 +500,14 @@ def unit_loop(
             rPq_e = cute.make_tensor(
                 cute.recast_ptr(rPq.iterator, dtype=IN_DTYPE), cute.make_layout((kpt,))
             )
+        vss = None
+        if cutlass.const_expr(st.th):
+            # the slice's value scales in key order: P'_k = cvt_bf16(mul(p_k, vs_k)), the row sum takes p_k
+            vss = []
+            for kk in cutlass.range_constexpr(kpt):
+                vss.append(s_vs[(col_base + kk, sfe)])
         if cutlass.const_expr(not rep and st.streamed):
-            r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE)
+            r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE, vss)
         else:
             ps = [None] * kpt
             for i in cutlass.range_constexpr(0, kpt, 2):
@@ -462,12 +515,26 @@ def unit_loop(
                 ps[i] = CuteF32.ex2(x0)
                 ps[i + 1] = CuteF32.ex2(x1)
             r_s = packed_pairwise_add(ps, CuteF32)
+            if cutlass.const_expr(st.th):
+                for i in cutlass.range_constexpr(0, kpt, 2):
+                    y0, y1 = CuteF32.mul2((ps[i], ps[i + 1]), (vss[i], vss[i + 1]))
+                    ps[i] = y0
+                    ps[i + 1] = y1
             if cutlass.const_expr(rep):
                 for i in cutlass.range_constexpr(kpt):
                     rPq_e[i] = ps[i].to(IN_DTYPE)
             else:
                 for i in cutlass.range_constexpr(kpt):
                     rP_e[i] = ps[i].to(IN_DTYPE)
+        if cutlass.const_expr(st.th):
+            if need_mask:  # a masked key's operand is +0 whatever its scale holds
+                for kk in cutlass.range_constexpr(kpt):
+                    key = k0 + col_base + kk
+                    if (key < lo_row) | (key >= L_row):
+                        if cutlass.const_expr(rep):
+                            rPq_e[kk] = Float32(0.0).to(IN_DTYPE)
+                        else:
+                            rP_e[kk] = Float32(0.0).to(IN_DTYPE)
         # ---- (m', r_slice) to the correction warpgroup, which owns the l chain and the merges
         sth = stats_prod.acquire_and_advance()
         s_m[(sth.index, row)] = m_new
@@ -533,6 +600,9 @@ def softmax_loop(
     q_len: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    s_ks: cute.Tensor,
+    s_vs: cute.Tensor,
+    seq0: Int32,
 ):
     """One unit for softmax warpgroup ``k``: the replicated-row placement when the unit has at most ``rep_rows = (32 // g) g``
     live rows (``g <= 32``), the full-row placement otherwise. Returns the advanced pipelines."""
@@ -561,6 +631,9 @@ def softmax_loop(
                 q_len,
                 tile_lo,
                 tile_hi,
+                s_ks,
+                s_vs,
+                seq0,
             )
         else:
             s_cons, p_prod, stats_prod = unit_loop(
@@ -586,6 +659,9 @@ def softmax_loop(
                 q_len,
                 tile_lo,
                 tile_hi,
+                s_ks,
+                s_vs,
+                seq0,
             )
     else:
         s_cons, p_prod, stats_prod = unit_loop(
@@ -611,5 +687,8 @@ def softmax_loop(
             q_len,
             tile_lo,
             tile_hi,
+            s_ks,
+            s_vs,
+            seq0,
         )
     return s_cons, p_prod, stats_prod

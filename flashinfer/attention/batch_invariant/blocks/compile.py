@@ -1,9 +1,15 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the attention kernel: one TVM-FFI object per static tuple ``(D, g, page,
-kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal)`` with dynamic shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``.
+kv_slots, n_wg, q2, ragged, hw_rowmax, cap, kv_fmt, v_sf_swizzled, causal)`` with dynamic shapes, strides, page table, work units and
+scales; cache module ``batch_invariant_attention``.
 ``cap`` is the shared-memory capacity the smem plan is sized for (the execution device's): part of the kernel's identity, in-process
-and on disk, so a kernel compiled for one part is never loaded for another.
+and on disk, so a kernel compiled for one part is never loaded for another. ``kv_fmt`` ``"bf16"`` is the bf16 class's kernel;
+``"e4m3"`` / ``"e5m2"`` the fp8-KV kernels, whose K / V operands are the fp8 caches viewed as bytes (``(D, page, Hkv, num_pages)``
+uint8, 16-byte-aligned strides) and which take the value scale ``vs``; ``"nvfp4"`` the NVFP4-KV kernel (packed ``(D / 2, ...)``
+bytes with the ``(D / 16, ...)`` block scales; ``v_sf_swizzled`` selects the address the V block scales are read at, the linear
+layout or the 4-token swizzle of a paged cache); ``"e4m3th"`` / ``"e5m2th"`` the token-head-scale kernels, which take the fp8
+byte caches and two binary32 scale tensors ``(page, Hkv, num_pages)`` of any strides.
 
 Operand views the kernel expects (all built by ``engine.py`` from the FlashInfer-shaped tensors):
 Q as ``(D, Hq, total_q)`` (strides ``(1, D, Hq*D)`` for a packed ``(total_q, Hq, D)`` tensor), K and V as
@@ -21,6 +27,7 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..plan import GROUP_FIELDS
+from ..spec import TH_KV_FMTS
 from .kernel import AttentionKernel
 
 MODULE = "batch_invariant_attention"
@@ -36,6 +43,8 @@ def kernel_name(
     ragged: bool = False,
     hw_rowmax: bool = False,
     cap: int = 0,
+    kv_fmt: str = "bf16",
+    v_sf_swizzled: bool = False,
     *,
     causal: bool = True,
 ) -> str:
@@ -45,6 +54,8 @@ def kernel_name(
         + ("_rg" if ragged else "")
         + ("_hwm" if hw_rowmax else "")
         + (f"_c{cap >> 10}" if cap else "")
+        + ("" if kv_fmt == "bf16" else f"_kv{kv_fmt}")
+        + ("_vsfswz" if v_sf_swizzled else "")
         + ("" if causal else "_nc")
     )
 
@@ -60,22 +71,47 @@ def get_compiled_attention(
     ragged: bool = False,
     hw_rowmax: bool = False,
     cap: int = 0,
+    kv_fmt: str = "bf16",
+    v_sf_swizzled: bool = False,
     *,
     causal: bool = True,
 ):
     """``hw_rowmax``: the softmax's row maximum from the TMEM load (``engine.hw_row_max_enabled``); part of the kernel's name.
     ``cap``: the shared-memory capacity the smem plan is checked against (the execution device's; the current device's when 0).
+    ``v_sf_swizzled``: the NVFP4 kernel reads the V block scales in the 4-token swizzle (``convert.sf_swizzle_coord``); part of
+    the kernel's name.
     ``causal``: the mask mode, a compile-time constant of the body (the non-causal kernel is a separate object, ``_nc``; the causal
     body's code is unchanged)."""
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
     name = kernel_name(
-        D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal=causal
+        D,
+        g,
+        page,
+        kv_slots,
+        n_wg,
+        q2,
+        ragged,
+        hw_rowmax,
+        cap,
+        kv_fmt,
+        v_sf_swizzled,
+        causal=causal,
     )
 
     def compile_fn():
         bf16, f32, i32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
+        lowbit = kv_fmt != "bf16"
+        fp4 = kv_fmt == "nvfp4"
+        th = kv_fmt in TH_KV_FMTS
+        kv_dtype = cutlass.Uint8 if lowbit else bf16
+        kv_div = (
+            16 if lowbit else 8
+        )  # outer strides: 16-byte multiples in either element size
+        kv_d = (
+            D // 2 if fp4 else D
+        )  # the cache row: D bf16 or fp8 elements, or D / 2 packed bytes
         s_hq, s_tq, s_npages, s_nunits, s_hkv = (cute.sym_int(32) for _ in range(5))
         s_ws = (
             cute.sym_int64()
@@ -91,27 +127,63 @@ def get_compiled_attention(
             cute.sym_int(32) if ragged else page
         )  # the ragged pool: one page of total_kv (dynamic) tokens
         k_fake = cute.runtime.make_fake_tensor(
-            bf16,
-            (D, kv_tok, s_hkv, s_npages),
+            kv_dtype,
+            (kv_d, kv_tok, s_hkv, s_npages),
             (
                 1,
-                cute.sym_int64(divisibility=8),
-                cute.sym_int64(divisibility=8),
-                cute.sym_int64(divisibility=8),
+                cute.sym_int64(divisibility=kv_div),
+                cute.sym_int64(divisibility=kv_div),
+                cute.sym_int64(divisibility=kv_div),
             ),
             assumed_align=16,
         )
         v_fake = cute.runtime.make_fake_tensor(
-            bf16,
-            (D, kv_tok, s_hkv, s_npages),
+            kv_dtype,
+            (kv_d, kv_tok, s_hkv, s_npages),
             (
                 1,
-                cute.sym_int64(divisibility=8),
-                cute.sym_int64(divisibility=8),
-                cute.sym_int64(divisibility=8),
+                cute.sym_int64(divisibility=kv_div),
+                cute.sym_int64(divisibility=kv_div),
+                cute.sym_int64(divisibility=kv_div),
             ),
             assumed_align=16,
         )
+        if fp4:
+            # the NVFP4 block scales: one byte per 16 elements, the cache's geometry, byte loads (no stride constraint)
+            ksf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8,
+                (D // 16, kv_tok, s_hkv, s_npages),
+                (1, cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=1,
+            )
+            vsf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8,
+                (D // 16, kv_tok, s_hkv, s_npages),
+                (1, cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=1,
+            )
+        elif th:
+            # the per-(token, head) scales: one binary32 per key and KV head in the cache's geometry minus the head dim, with
+            # the scale tensor's own strides (a view into a wider slot tensor is addressed as it is)
+            ksf_fake = cute.runtime.make_fake_tensor(
+                f32,
+                (kv_tok, s_hkv, s_npages),
+                (cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=4,
+            )
+            vsf_fake = cute.runtime.make_fake_tensor(
+                f32,
+                (kv_tok, s_hkv, s_npages),
+                (cute.sym_int64(), cute.sym_int64(), cute.sym_int64()),
+                assumed_align=4,
+            )
+        else:
+            ksf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8, (cute.sym_int(32),), (1,), assumed_align=1
+            )
+            vsf_fake = cute.runtime.make_fake_tensor(
+                cutlass.Uint8, (cute.sym_int(32),), (1,), assumed_align=1
+            )
         o_fake = cute.runtime.make_fake_tensor(
             bf16,
             (cute.sym_int(32), D),
@@ -139,13 +211,26 @@ def get_compiled_attention(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         k = AttentionKernel(
-            D, g, page, kv_slots, n_wg, q2, ragged, hw_rowmax, cap, causal=causal
+            D,
+            g,
+            page,
+            kv_slots,
+            n_wg,
+            q2,
+            ragged,
+            hw_rowmax,
+            cap,
+            kv_fmt,
+            v_sf_swizzled,
+            causal=causal,
         )
         return cute.compile(
             k,
             q_fake,
             k_fake,
             v_fake,
+            ksf_fake,
+            vsf_fake,
             o_fake,
             ws_fake,
             scratch_fake,
@@ -156,6 +241,7 @@ def get_compiled_attention(
             indices_fake,
             cutlass.Float32(1.0),
             cutlass.Float32(-1.0),
+            cutlass.Float32(1.0),
             cutlass.Int32(-1),
             cutlass.Int32(1),
             cutlass.Int32(1),

@@ -33,7 +33,7 @@ from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, OperandSource
 
 from ..plan import om_in_tmem as _om_in_tmem
 from ..plan import ws_row
-from ..spec import MMA_K, TILE_KEYS, tiles_per_chunk
+from ..spec import KV_FMTS, MMA_K, TH_KV_FMTS, TILE_KEYS, tiles_per_chunk
 
 ACC_DTYPE = cutlass.Float32
 IN_DTYPE = cutlass.BFloat16
@@ -128,6 +128,22 @@ REGS_1WG_DIMS = (64,)
 REGS_SOFTMAX_1WG, REGS_CORRECTION_1WG = 200, 96
 REGS_Q2_DIMS = (128,)
 REGS_Q2_128 = (184, 80, 64)
+REGS_CONVERT = 96  # per conversion thread of the low-bit-KV kernels (blocks/convert.py), where the budget allows: the stage is the two
+# otherwise idle warps of the last warpgroup plus CONVERT_WARPGROUPS further warpgroups; at D = 256 the correction's 208 leave 64
+CONVERT_WARPGROUPS = 1
+REGS_LOAD_FP4 = 64
+# the raw staging of the low-bit-KV kernels: (keys per stage, stages), the first that fits the part's shared memory next to the
+# Q stages and the ring. A stage is the TMA's unit (the load warp issues its page boxes of raw cache bytes) and the conversion
+# stage's unit of work; whole-slot stages deal the conversion threads without partial rounds
+RAW_STAGING = ((128, 4), (128, 3), (128, 2), (64, 2), (32, 3), (16, 3), (16, 2))
+RAW_BOX_BYTES = 128  # the widest raw TMA box, in bytes of a cache row
+
+
+def raw_stage_bytes(raw_w: int, raw_keys: int, page: int) -> int:
+    """Bytes of one raw staging stage: ``raw_keys`` keys of ``raw_w`` cache bytes in page boxes, every box on a 128-byte boundary."""
+    rows = min(page, raw_keys)
+    bw = min(raw_w, RAW_BOX_BYTES)
+    return (raw_w // bw) * (raw_keys // rows) * max(128, bw * rows)
 
 
 class Roles:
@@ -136,8 +152,18 @@ class Roles:
     their TMEM lanes), then the correction warpgroup, then MMA, load and empty warps completing the last
     warpgroup. Register budget: 65536 >= REGS_SOFTMAX x 128 x n_wg + REGS_CORRECTION x 128 + 32 x 128."""
 
-    def __init__(self, n_wg: int, D: int = 128, q2: bool = False):
+    def __init__(
+        self,
+        n_wg: int,
+        D: int = 128,
+        q2: bool = False,
+        lowbit: bool = False,
+        fp4: bool = False,
+    ):
         assert n_wg in (1, 2), n_wg
+        assert not (lowbit and (n_wg != 1 or q2)), (
+            "the low-bit-KV kernels run one softmax warpgroup"
+        )
         self.n_wg = n_wg
         self.softmax_warps = tuple(range(4 * n_wg))
         self.correction_warps = tuple(range(4 * n_wg, 4 * n_wg + 4))
@@ -145,6 +171,14 @@ class Roles:
         self.load_warp = self.mma_warp + 1
         self.empty_warps = tuple(range(self.mma_warp + 2, self.mma_warp + 4))
         self.threads = 32 * (self.mma_warp + 4)
+        # the low-bit-KV kernels: the two empty warps and CONVERT_WARPGROUPS further warpgroups form the conversion stage
+        self.convert_warps: tuple[int, ...] = ()
+        if lowbit:
+            self.convert_warps = self.empty_warps + tuple(
+                range(self.mma_warp + 4, self.mma_warp + 4 + 4 * CONVERT_WARPGROUPS)
+            )
+            self.threads += 128 * CONVERT_WARPGROUPS
+        self.convert_threads = 32 * len(self.convert_warps)
         # register budgets: one softmax warpgroup -- 192 per softmax thread (a whole row of scores), the correction 128 at D <= 128 and 208
         # when the chunk merge runs through the global scratch (O_m pieces in flight); two softmax warpgroups on key slices -- 160 each
         # (half a row of scores) and 160 for the correction; the paired placement (q2: each warpgroup a whole row) -- 192 and 96 (the
@@ -153,6 +187,9 @@ class Roles:
         two_slices = n_wg == 2 and not q2
         self.regs_softmax = REGS_SOFTMAX_W2 if two_slices else REGS_SOFTMAX
         self.regs_other = REGS_OTHER
+        # the load warp: a TMA issuer, which in the NVFP4 kernels at D <= 128 also holds a group of block scale rows in flight
+        # (convert.stage_sf)
+        self.regs_load = REGS_LOAD_FP4 if fp4 and D <= 128 else REGS_OTHER
         if two_slices:
             self.regs_correction = REGS_CORRECTION_W2
         elif q2 and D in REGS_Q2_DIMS:
@@ -171,12 +208,26 @@ class Roles:
             self.regs_correction = 208 if not om_in_tmem(D) else 128
         self.n_tmem_users = 32 * (4 * n_wg + 4 + 1)
         self.regs_launch = (65536 // self.threads) // 8 * 8
-        assert (
+        fixed = (
             self.regs_softmax * 128 * n_wg
             + self.regs_correction * 128
-            + self.regs_other * 32 * 4
-            <= 65536
-        ), (n_wg, self.regs_softmax, self.regs_correction, self.regs_other)
+            + self.regs_other * 32 * (3 - (2 if lowbit else 0))
+            + self.regs_load * 32
+        )
+        self.regs_convert = 0
+        if lowbit:
+            # 8 registers per conversion thread stay in the pool: with the pool exactly exhausted the roles' register increases never
+            # completed (D = 256)
+            self.regs_convert = min(
+                REGS_CONVERT, (65536 - fixed) // self.convert_threads // 8 * 8 - 8
+            )
+        assert fixed + self.regs_convert * self.convert_threads <= 65536, (
+            n_wg,
+            self.regs_softmax,
+            self.regs_correction,
+            self.regs_other,
+            self.regs_convert,
+        )
 
 
 class StaticPlan:
@@ -193,6 +244,8 @@ class StaticPlan:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        kv_fmt: str = "bf16",
+        v_sf_swizzled: bool = False,
         *,
         causal: bool = True,
     ):
@@ -203,6 +256,41 @@ class StaticPlan:
         # the mask mode (a class dimension): causal rows see [0, p], or [max(0, p - window_left), p] with a window (window_left >= 0),
         # non-causal rows see every key of the request, [0, kv_len). A compile-time constant: the softmax masks and the fold's present chunks read it, the causal code is unchanged
         self.causal = causal
+        # kv_fmt: the K / V cache format. "bf16": the TMA producer fills the ring. "e4m3" / "e5m2": the cache is one byte per element
+        # (viewed as uint8); the load warp's TMA brings the raw fp8 tiles into a staging buffer and the conversion stage
+        # (blocks/convert.py: Roles.convert_warps) widens them to bf16 exactly and writes the SAME ring bytes the TMA would have
+        # written for a bf16 cache holding those values -- the MMAs, the softmax and the correction are the bf16 body's, untouched.
+        # One softmax warpgroup, no pairing (the conversion stage takes the second warpgroup's register budget).
+        # "nvfp4": the cache is packed e2m1 nibbles ((D / 2, page, Hkv, num_pages) bytes) with one e4m3 block scale per 16 elements
+        # ((D / 16, page, Hkv, num_pages) bytes); the conversion stage forms the exact products in bf16.
+        # "e4m3th" / "e5m2th": an fp8 cache converted exactly as "e4m3" / "e5m2", with one binary32 key scale and one value scale
+        # per (token, KV head) ((page, Hkv, num_pages) fp32 of any strides) that the softmax applies per key: the conversion stage
+        # fetches a tile's scales into a smem side ring of sf_stages entries (convert.py), the softmax multiplies the scores and
+        # the probabilities by them (softmax.py), and the epilogue is the bf16 class's
+        assert kv_fmt in KV_FMTS, kv_fmt
+        self.kv_fmt = kv_fmt
+        self.lowbit = kv_fmt != "bf16"
+        self.fp4 = kv_fmt == "nvfp4"
+        self.th = kv_fmt in TH_KV_FMTS
+        self.fp8_fmt = TH_KV_FMTS.get(kv_fmt, kv_fmt)  # the cache's element format
+        self.scaled_out = (
+            self.lowbit and not self.th
+        )  # the epilogue's one mul by the per-tensor value scale
+        # entries of the scale side ring: the conversion stage holds a K slot at most kv_slots tiles ahead of the tile whose P
+        # the softmax is forming (the V tiles in between stay in the ring until that P is stored), so kv_slots + 1 entries are
+        # never overwritten while read; one spare
+        self.sf_stages = kv_slots + 2 if self.th else 1
+        assert not self.lowbit or (n_wg == 1 and not q2), (kv_fmt, n_wg, q2)
+        # v_sf_swizzled: the V block scales of a paged NVFP4 cache are stored in the 4-token swizzle (convert.sf_swizzle_coord)
+        # instead of the linear layout the K block scales always have: the conversion stage reads the same scale byte at another
+        # address (a placement of the same leaves); a permutation inside groups of four tokens of a page, so the page is a
+        # multiple of four tokens and the ragged pool (no pages) has no such layout
+        assert not v_sf_swizzled or (self.fp4 and not ragged and page % 4 == 0), (
+            kv_fmt,
+            ragged,
+            page,
+        )
+        self.v_sf_swizzled = v_sf_swizzled
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
         # the SM; the MMA warp issues both tiles' folds off one K / V stream; the correction warpgroup steps both tiles' statistics, A then B
@@ -234,7 +322,7 @@ class StaticPlan:
             D,
         )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB
         self.D, self.g, self.page, self.kv_slots = D, g, page, kv_slots
-        self.roles = Roles(n_wg, D, q2)
+        self.roles = Roles(n_wg, D, q2, self.lowbit, self.fp4)
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (
@@ -509,6 +597,65 @@ class StaticPlan:
         self.kv_slot_bytes = (
             self.kv_slot_elems * 2
         )  # the ring pipeline's transaction count (one slot)
+        # the raw staging of the low-bit caches: raw_stages stages of raw_keys keys x raw_w cache bytes, row-major, filled by TMA boxes of
+        # raw_box_rows keys (one page slab, the whole cache row wide); a ring slot is raw_per_slot consecutive stages
+        self.raw_w = (D // 2 if self.fp4 else D) if self.lowbit else 0
+        self.raw_keys = self.raw_stages = self.raw_stage_bytes = 0
+        self.sf_staged = False
+        # 16-element groups a conversion thread takes per round: two for NVFP4 at D = 128 (its per-group scale fetch and round
+        # overhead amortise), one elsewhere (measured)
+        self.convert_groups = 2 if self.fp4 and D == 128 else 1
+        if self.lowbit:
+            for raw_keys, raw_stages in RAW_STAGING:
+                self.raw_keys, self.raw_stages = raw_keys, raw_stages
+                # the NVFP4 kernels' side words of the stages: with whole-slot stages at D <= 128 the load warp stages the block scales
+                # of the stage's keys there (sf_staged: D / 16 bytes per key); otherwise it records the page of every box and the
+                # conversion threads read the scales from global memory (a stage per page-table and scale round trip would hold
+                # the load warp back); a stub for the fp8 kernels
+                self.sf_staged = self.fp4 and D <= 128 and raw_keys == self.slot_keys
+                if self.sf_staged:
+                    self.raw_side_words = raw_stages * raw_keys * (D // 16) // 4
+                elif self.fp4:
+                    self.raw_side_words = raw_stages * (raw_keys // min(page, raw_keys))
+                else:
+                    self.raw_side_words = 4
+                self.raw_stage_bytes = raw_stage_bytes(self.raw_w, raw_keys, page)
+                if shared_storage_struct(self).size_in_bytes() <= max(
+                    SMEM_CAP, self.cap
+                ):
+                    break
+            self.raw_box_rows = min(page, self.raw_keys)
+            self.raw_boxes = self.raw_keys // self.raw_box_rows
+            self.raw_per_slot = self.slot_keys // self.raw_keys
+            # a box is at most RAW_BOX_BYTES of a cache row wide and lands on a 128-byte boundary (the TMA's destination alignment):
+            # byte e of stage key k sits at (e % raw_bw) + raw_bw (k % rows) + raw_box_stride (k // rows) + raw_half_bytes (e // raw_bw)
+            self.raw_bw = min(self.raw_w, RAW_BOX_BYTES)
+            self.raw_halves = self.raw_w // self.raw_bw
+            self.raw_box_stride = max(128, self.raw_bw * self.raw_box_rows)
+            self.raw_half_bytes = self.raw_boxes * self.raw_box_stride
+            self.raw_stage_bytes = self.raw_halves * self.raw_half_bytes
+            self.raw_slab_layout = cute.make_layout(
+                (self.raw_bw, self.raw_box_rows, 1, 1), stride=(1, self.raw_bw, 0, 0)
+            )
+            # the load warp's view of the staging buffer: (byte, key in box, 1, 1, box, half, stage) -> byte offset
+            self.raw_view_shape = (
+                self.raw_bw,
+                self.raw_box_rows,
+                1,
+                1,
+                self.raw_boxes,
+                self.raw_halves,
+                self.raw_stages,
+            )
+            self.raw_view_stride = (
+                1,
+                self.raw_bw,
+                0,
+                0,
+                self.raw_box_stride,
+                self.raw_half_bytes,
+                self.raw_stage_bytes,
+            )
         # the exact smem footprint against the target's capacity (the ring depth is a placement: a shallower ring on a smaller part
         # gives the same bits); the paired placement at D = 128 (two Q tiles, the 128 KB smem O_m, the ring) needs a 328 KB part
         self.smem_bytes = shared_storage_struct(self).size_in_bytes()
@@ -551,10 +698,20 @@ def shared_storage_struct(st: StaticPlan):
         s_r=mr[f32, st.stats_slots * st.r_slices * Q_ROWS],
         s_p=cute.struct.Align[mr[f32, st.s_p_elems], 16],
         s_mx=mr[f32, 2 * st.n_slices * Q_ROWS],
+        s_ks=mr[f32, st.sf_stages * st.T if st.th else 4],
+        s_vs=mr[f32, st.sf_stages * st.T if st.th else 4],
         sOm=cute.struct.Align[mr[f32, st.n_q * Q_ROWS * st.D if st.om_smem else 4], 16],
         sQ=cute.struct.Align[mr[IN_DTYPE, st.q_tiles * st.q_tile_elems], 1024],
         sKV=cute.struct.Align[mr[IN_DTYPE, st.n_slots * st.kv_slot_elems], 1024],
     )
+    if st.lowbit:
+        fields.update(
+            raw_mbar=mr[i64, 2 * st.raw_stages],
+            s_side=cute.struct.Align[mr[i32, st.raw_side_words], 16],
+            sRaw=cute.struct.Align[
+                mr[cutlass.Uint8, st.raw_stages * st.raw_stage_bytes], 128
+            ],
+        )
     return cute.struct(type("SharedStorage", (), {"__annotations__": fields}))
 
 
@@ -573,6 +730,16 @@ class TmaSetup:
         self.atom_q_rep, self.tensor_q_rep = cpasync.make_tiled_tma_atom(
             op, mQ, st.q_slab_rep_layout, st.q_box_rep
         )
+        if st.lowbit:
+            # the raw cache bytes into the staging buffer: boxes (raw_w bytes, raw_box_rows keys) of the uint8 views
+            box = (st.raw_bw, st.raw_box_rows, 1, 1)
+            self.atom_k, self.tensor_k = cpasync.make_tiled_tma_atom(
+                op, mK, st.raw_slab_layout, box
+            )
+            self.atom_v, self.tensor_v = cpasync.make_tiled_tma_atom(
+                op, mV, st.raw_slab_layout, box
+            )
+            return
         self.atom_k, self.tensor_k = cpasync.make_tiled_tma_atom(
             op, mK, st.kv_slab_layout, (HALF, st.box_rows, 1, 1)
         )
