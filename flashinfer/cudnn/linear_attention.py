@@ -377,7 +377,9 @@ if CUDNN_AVAILABLE:
             if overwrite_initial_state:
                 attrs["overwrite_initial_state"] = True
 
-            O, fs, _checkpoints = getattr(graph, family)(**ports, **attrs)
+            # Outputs come in a fixed order that FE releases extend at the end
+            # (1.33 appends composed_initial_state); only O and final_state are used.
+            O, fs = getattr(graph, family)(**ports, **attrs)[:2]
 
             O.set_uid(UIDs.O_UID.value).set_output(True).set_dim(
                 list(o.shape)
