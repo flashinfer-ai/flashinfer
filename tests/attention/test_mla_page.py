@@ -121,6 +121,94 @@ def test_append_mla_paged_kv_cache(kv_len, page_size):
         acc_padding_kv_len += num_pages_per_req[i] * page_size
 
 
+@pytest.mark.parametrize(
+    "ckv_dtype, kpe_dtype, ckv_cache_dtype, kpe_cache_dtype, message",
+    [
+        # bf16 latents into an FP8 cache, written without quantizing first.
+        (
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            "ckv_cache dtype must match append_ckv dtype",
+        ),
+        (
+            torch.float16,
+            torch.bfloat16,
+            torch.float16,
+            torch.float16,
+            "append_ckv and append_kpe must have the same dtype",
+        ),
+        (
+            torch.float16,
+            torch.float16,
+            torch.bfloat16,
+            torch.float16,
+            "ckv_cache dtype must match append_ckv dtype",
+        ),
+        (
+            torch.float16,
+            torch.float16,
+            torch.float16,
+            torch.bfloat16,
+            "kpe_cache dtype must match append_kpe dtype",
+        ),
+        (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+            torch.float8_e5m2,
+            "ckv_cache dtype must match append_ckv dtype",
+        ),
+    ],
+    ids=[
+        "bf16_into_e4m3_cache",
+        "ckv_kpe_mismatch",
+        "ckv_cache_mismatch",
+        "kpe_cache_mismatch",
+        "e4m3_into_e5m2_cache",
+    ],
+)
+def test_append_mla_paged_kv_cache_rejects_dtype_mismatch(
+    ckv_dtype, kpe_dtype, ckv_cache_dtype, kpe_cache_dtype, message
+):
+    if torch.float8_e4m3fn in (ckv_dtype, ckv_cache_dtype):
+        _skip_if_fp8_e4m3_unsupported()
+
+    nnz_kv = 4
+    page_size = 16
+    ckv_append = torch.ones(nnz_kv, CKV_DIM, dtype=ckv_dtype, device="cuda:0")
+    kpe_append = torch.ones(nnz_kv, KPE_DIM, dtype=kpe_dtype, device="cuda:0")
+    ckv_cache = torch.zeros(
+        1, page_size, CKV_DIM, dtype=ckv_cache_dtype, device="cuda:0"
+    )
+    kpe_cache = torch.zeros(
+        1, page_size, KPE_DIM, dtype=kpe_cache_dtype, device="cuda:0"
+    )
+    # One request of nnz_kv new tokens in page 0.
+    batch_indices = torch.zeros(nnz_kv, dtype=torch.int32, device="cuda:0")
+    positions = torch.arange(nnz_kv, dtype=torch.int32, device="cuda:0")
+    kv_page_indices = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+    kv_page_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda:0")
+    kv_last_page_len = torch.tensor([nnz_kv], dtype=torch.int32, device="cuda:0")
+
+    with pytest.raises(RuntimeError, match=message):
+        flashinfer.append_paged_mla_kv_cache(
+            ckv_append,
+            kpe_append,
+            batch_indices,
+            positions,
+            ckv_cache,
+            kpe_cache,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_len,
+        )
+
+    assert not ckv_cache.view(torch.uint8).any()
+    assert not kpe_cache.view(torch.uint8).any()
+
+
 def _reference_e2m1_encode(scaled: torch.Tensor) -> torch.Tensor:
     """Round-to-nearest-even E2M1 codes, matching nvfp4_append_quantize_e2m1."""
     sign = torch.where(torch.signbit(scaled), 8, 0).to(torch.uint8)
