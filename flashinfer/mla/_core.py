@@ -2852,15 +2852,16 @@ from ._batch_mla._wrapper import (
 _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 
 # Query rows (batch * q_len) up to which the Cake candidate is profiled and
-# runs. It keeps every generic CLC launch within the device work-order window.
-# The FP8 page-64 route allocates its split-K partials on every call (about
-# rows * num_split * 129 KiB; one split from 38 rows on, 39 on 152 SMs), also
-# inside every captured graph, so FP8 stops at 128 rows (about 16 MiB). The
-# BF16 split-KV route allocates its partials on every call too, at most one
-# wave of clusters (rows * num_split <= num_sms // 2) of 128.5 KiB each, about
-# 10 MiB. The other routes the candidate takes allocate nothing per call but an
-# 8 KiB work order.
-_CAKE_MLA_MAX_ROWS = 512
+# runs: the device work-order window (``_MAX_ORDERED_ROWS``, 1024 rows), so
+# every generic CLC launch of more rows than one wave of clusters takes the
+# longest-first order. The FP8 page-64 route allocates its split-K partials on
+# every call (about rows * num_split * 129 KiB; one split from 38 rows on, 39
+# on 152 SMs), also inside every captured graph, so FP8 stops at 128 rows
+# (about 16 MiB). The BF16 split-KV route allocates its partials on every call
+# too, at most one wave of clusters (rows * num_split <= num_sms // 2) of
+# 128.5 KiB each, about 10 MiB. The other routes the candidate takes allocate
+# nothing per call but an 8 KiB work order.
+_CAKE_MLA_MAX_ROWS = 1024
 _CAKE_MLA_FP8_MAX_ROWS = 128
 
 
@@ -5709,7 +5710,7 @@ def _mla_with_kv_cache_impl(
     tensors; never with sparse MLA, ``sparse_mla_top_k_lens``, skip-softmax,
     ``use_fp16_softmax``, DCP, a ``multi_ctas_kv_counter_buffer`` or LSE output.
     Its generic tail program and the Kimi-K3 FP8 Cake route never join. Cake
-    serves at most 512 query rows (``batch * q_len``; FP8 128) and is offered for
+    serves at most 1024 query rows (``batch * q_len``; FP8 128) and is offered for
     a tuning bucket only when every batch the bucket serves is listed and
     launches the programs of the profiled batch, so never for the largest
     bucket. An untuned call never selects Cake. Every Cake miss runs the first

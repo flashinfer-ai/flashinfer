@@ -1089,14 +1089,23 @@ def test_cake_bucket_rule_covers_every_batch_of_the_bucket(
     assert _family(cake_module.DOMAIN_BF16_CLC, 64) != _family(
         cake_module.DOMAIN_BF16_CLC, 128
     )
-    # The row cap bounds the bucket's last batch.
+    # The row cap (the device work-order window) bounds the bucket's last
+    # batch: buckets 512 and 768 of one-token rows and bucket 256 of two-token
+    # rows launch the ordered CLC program for every batch; bucket 1024 (last
+    # batch 1279) and bucket 512 of two-token rows cross the cap.
     cap = core._CAKE_MLA_MAX_ROWS
-    assert _serves(page32, _cpu_inputs(bf16, 256), _bucket(256, cap))
-    assert not _serves(page32, _cpu_inputs(bf16, 256), _bucket(256, 1024))
+    assert cap == 1024 and cap <= cake_module._MAX_ORDERED_ROWS
+    assert _serves(page32, _cpu_inputs(bf16, 256), _bucket(256, 512))
+    assert _serves(page32, _cpu_inputs(bf16, 512), _bucket(512, 768))
+    assert _serves(page32, _cpu_inputs(bf16, 768), _bucket(768, cap))
+    assert not _serves(page32, _cpu_inputs(bf16, cap), _bucket(cap, 1280))
     assert _serves(page32, _cpu_inputs(bf16, 128, 2), _bucket(128, 256))
-    assert not _serves(page32, _cpu_inputs(bf16, 256, 2), _bucket(256, 512))
+    assert _serves(page32, _cpu_inputs(bf16, 256, 2), _bucket(256, 512))
+    assert not _serves(page32, _cpu_inputs(bf16, 512, 2), _bucket(512, 768))
     assert page32.supports(_cpu_inputs(bf16, cap))
+    assert page32.supports(_cpu_inputs(bf16, cap // 2, 2))
     assert not page32.supports(_cpu_inputs(bf16, cap + 1))
+    assert not page32.supports(_cpu_inputs(bf16, cap // 2 + 1, 2))
 
     # FP8 page 64 always launches its one program, up to its own row cap; the
     # tail program (FP8 page 32, other head counts) never joins.
@@ -2721,7 +2730,26 @@ def test_cake_families_memo_follows_the_offer_table(
     needed."""
     for dtype, page_size in ((torch.bfloat16, 32), (torch.bfloat16, 64)):
         runner = _cpu_runner(dtype, page_size)
-        for batch_size in (1, 4, 18, 19, 37, 38, 64, 74, 75, 128, 300, 512, 513):
+        for batch_size in (
+            1,
+            4,
+            18,
+            19,
+            37,
+            38,
+            64,
+            74,
+            75,
+            128,
+            300,
+            512,
+            513,
+            767,
+            768,
+            1023,
+            1024,
+            1025,
+        ):
             inputs = _cpu_inputs(dtype, batch_size)
             expected = runner._launched_families(
                 dtype, 1, NUM_HEADS, QK_DIM, 32, batch_size, "sm_100a", 148
@@ -3534,9 +3562,10 @@ def test_cake_miss_runs_the_tuned_first_stage_winner(monkeypatch, fresh_tuner, m
 # resident clusters (148 or 152 SMs), the BF16 rows reach VQUARTER (4), VHALF
 # (32), the CLC program in one wave (64; the one-wave program where one is
 # generated for the device, see ``_one_wave_route``) and with the longest-first
-# order program (128, and 300 with a partial last order CTA); FP8 page 64 has one
-# domain. Sinks make every BF16 row VQUARTER, with several work items per cluster
-# above 18 rows. The split-KV geometries (max_seq_len bucket 4096, few rows) reach
+# order program (128; 300 and 1000 with a partial last order CTA; 1024, the
+# device work-order window and the row cap); FP8 page 64 has one domain. Sinks
+# make every BF16 row VQUARTER, with several work items per cluster above 18
+# rows. The split-KV geometries (max_seq_len bucket 4096, few rows) reach
 # the split-KV program on the devices whose ``_SPLITKV_RANGE`` covers them (B200
 # and GB300 from 2049). The tail domains never join backend="auto".
 _PARITY_GEOMETRIES = {
@@ -3545,6 +3574,8 @@ _PARITY_GEOMETRIES = {
     "bf16_p32_clc_one_wave": (torch.bfloat16, 32, 64),
     "bf16_p32_clc": (torch.bfloat16, 32, 128),
     "bf16_p32_clc_window300": (torch.bfloat16, 32, 300),
+    "bf16_p32_clc_window1000": (torch.bfloat16, 32, 1000),
+    "bf16_p32_clc_window1024": (torch.bfloat16, 32, 1024),
     "bf16_p64_vquarter": (torch.bfloat16, 64, 4),
     "bf16_p64_vhalf": (torch.bfloat16, 64, 32),
     "fp8_p64_small": (torch.float8_e4m3fn, 64, 4),
@@ -3716,6 +3747,8 @@ _STATELESS_GEOMETRIES = (
     "bf16_p64_vhalf",
     "bf16_p32_clc_one_wave",
     "bf16_p32_clc",
+    "bf16_p32_clc_window1000",
+    "bf16_p32_clc_window1024",
     "fp8_p64_small",
     "bf16_p32_splitkv",
     "bf16_p64_splitkv",
@@ -3832,7 +3865,15 @@ def test_forced_cake_cuda_graph_replay_with_updated_inputs(
     _assert_live_and_padded(case["out"], case, "replay after query update")
 
 
-@pytest.mark.parametrize("geometry", ["bf16_p32_clc", "bf16_p32_clc_window300"])
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        "bf16_p32_clc",
+        "bf16_p32_clc_window300",
+        "bf16_p32_clc_window1000",
+        "bf16_p32_clc_window1024",
+    ],
+)
 def test_forced_cake_graphs_replay_concurrently(monkeypatch, clean_tuner, geometry):
     """Two graphs captured on the default capture stream through the auto Cake
     candidate, replayed on two streams at once, each equal their eager result:
@@ -4103,6 +4144,8 @@ _LAUNCH_GEOMETRIES = (
     (torch.bfloat16, 32, 64, 1024),
     (torch.bfloat16, 32, 128, 1024),
     (torch.bfloat16, 32, 300, 1024),
+    (torch.bfloat16, 32, 1000, 1024),
+    (torch.bfloat16, 32, 1024, 1024),
     (torch.bfloat16, 64, 4, 1024),
     (torch.bfloat16, 64, 32, 1024),
     (torch.float8_e4m3fn, 64, 4, 1024),
