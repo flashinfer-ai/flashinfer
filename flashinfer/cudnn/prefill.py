@@ -267,6 +267,22 @@ def _get_dummy_scale_tensor(device: torch.device):
     return t
 
 
+_fp8_softmax_scales: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _get_fp8_softmax_scales(device: torch.device):
+    scales = _fp8_softmax_scales.get(device)
+    if scales is None:
+        # Scale the softmax intermediate into FP8's range before the P @ V MMA.
+        # Keep O's scale separate so this reciprocal pair does not rescale output.
+        scales = tuple(
+            torch.tensor([[[[value]]]], device=device, dtype=torch.float32)
+            for value in (256.0, 1.0 / 256.0)
+        )
+        _fp8_softmax_scales[device] = scales
+    return scales
+
+
 def _create_cudnn_handle(stream=None, *, device=None):
     return get_cudnn_attention_handle(cudnn, stream, device=device)
 
@@ -1550,8 +1566,9 @@ def _prefill_plan_bindings(metadata, dtype, device):
             ):
                 raise ValueError("cuDNN FP8 scales must be scalar float32 tensors")
             var_map[uid.value] = scale
-        var_map[UIDs.S_SCALE_UID.value] = dummy_scale_tensor
-        var_map[UIDs.S_DESCALE_UID.value] = dummy_scale_tensor
+        s_scale, s_descale = _get_fp8_softmax_scales(device)
+        var_map[UIDs.S_SCALE_UID.value] = s_scale
+        var_map[UIDs.S_DESCALE_UID.value] = s_descale
         var_map[UIDs.O_SCALE_UID.value] = dummy_scale_tensor
 
     for tensor in var_map.values():

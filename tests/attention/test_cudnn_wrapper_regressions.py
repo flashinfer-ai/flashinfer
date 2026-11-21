@@ -2230,3 +2230,70 @@ def test_paged_auto_query_capacity_switch_preserves_capture(
         assert torch.isnan(out[64:]).all()
     finally:
         g.reset()
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("head_dim", [64, 80, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_fp8_prefill_softmax_intermediate_precision(head_dim, causal):
+    """Long-context FP8 attention should retain quantized-input reference precision."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("native cuDNN FP8-input/BF16-output prefill requires SM10x")
+    if not prefill._cudnn_supports_direct_seqlens(torch.float8_e4m3fn):
+        pytest.skip("requires cuDNN FP8 cumulative sequence lengths")
+    torch.manual_seed(2701)
+    tokens, heads = 4960, 4
+    inputs = [
+        torch.randn(tokens, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    ]
+    descales = [x.float().abs().amax().reshape(1) / 448.0 for x in inputs]
+    quantized = [
+        (x.float() / scale).to(torch.float8_e4m3fn)
+        for x, scale in zip(inputs, descales, strict=True)
+    ]
+    dequantized = [
+        (x.float() * scale).to(torch.bfloat16).transpose(0, 1).unsqueeze(0)
+        for x, scale in zip(quantized, descales, strict=True)
+    ]
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    with sdpa_kernel(SDPBackend.MATH):
+        ref = (
+            torch.nn.functional.scaled_dot_product_attention(
+                *dequantized, is_causal=causal
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 << 20, device="cuda", dtype=torch.uint8), backend="cudnn"
+    )
+    indptr = torch.tensor([0, tokens], dtype=torch.int32)
+    wrapper.plan(
+        indptr,
+        indptr,
+        heads,
+        heads,
+        head_dim,
+        causal=causal,
+        q_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+
+    def run():
+        return wrapper.run(
+            *quantized, q_scale=descales[0], k_scale=descales[1], v_scale=descales[2]
+        )
+
+    def check(out):
+        error = torch.linalg.vector_norm(out.float() - ref.float())
+        assert error < 0.04 * torch.linalg.vector_norm(ref.float())
+
+    check(run())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    out.fill_(float("nan"))
+    graph.replay()
+    check(out)
