@@ -48,6 +48,7 @@ from flashinfer.attention.prims_ts.decode import (
     _DECODE_MAX_KV_TILE_SIZE,
     _DecodePlanState,
     _get_compiled_decode,
+    _make_decode_compile_spec,
     _make_decode_workspace_layout,
     _resolve_decode_launch_spec,
     _validate_prims_ts_q_token_kv_block_sparse_group_layout,
@@ -7204,6 +7205,75 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
     finally:
         _resolve_decode_launch_spec.cache_clear()
         _get_compiled_decode.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("packed_query", "runtime_q_lengths", "seq_len_q", "batch_size", "expect_fixed"),
+    (
+        # Complete grouped Q tiles drop the inactive-row score mask.
+        (False, False, 4, 16, True),
+        # Packed Q keeps one kernel across lengths.
+        (True, True, 4, 16, False),
+        # A partial final token band still needs the mask: no gain, keep reuse.
+        (False, False, 3, 16, False),
+        # One-request tiles are already full without the exact length.
+        (False, False, 4, 1, False),
+        # Callers that do not opt in (prepared sparse plans) are unchanged.
+        (False, True, 4, 16, False),
+    ),
+    ids=("fixed-q4", "packed-q4", "fixed-q3", "fixed-q4-b1", "default-runtime-q"),
+)
+def test_attention_ts_decode_fixed_q_compiles_exact_q_length(
+    packed_query: bool,
+    runtime_q_lengths: bool,
+    seq_len_q: int,
+    batch_size: int,
+    expect_fixed: bool,
+):
+    """Fixed-Q plans key the kernel on the Q length only when it drops a mask."""
+
+    def compile_items(seq_len_q: int) -> dict[str, object]:
+        spec = _resolve_decode_launch_spec(
+            torch.cuda.current_device(),
+            batch_size,
+            32,
+            4,
+            128,
+            32,
+            1024 if batch_size == 1 else 4096,
+            seq_len_q,
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "bfloat16",
+            "HND",
+            "causal",
+            packed_query,
+            -1,
+        )
+        compile_spec = _make_decode_compile_spec(
+            spec,
+            device_index=torch.cuda.current_device(),
+            num_qo_heads=32,
+            num_kv_heads=4,
+            head_dim=128,
+            page_size=32,
+            q_dtype_key="float8_e4m3fn",
+            k_dtype_key="float8_e4m3fn",
+            v_dtype_key="float8_e4m3fn",
+            out_dtype_key="bfloat16",
+            packed_query=packed_query,
+            runtime_q_lengths=runtime_q_lengths,
+        )
+        assert compile_spec.packed_query == packed_query
+        return dict(compile_spec.config_items)
+
+    items = compile_items(seq_len_q)
+    assert items["fixed_seqlen_q"] is expect_fixed
+    assert ("max_seq_len_q" in items) is expect_fixed
+    if expect_fixed:
+        assert items["max_seq_len_q"] == seq_len_q
+        assert not FmhaDecodeConfig(**items).q_score_rows_need_mask
 
 
 @pytest.mark.parametrize(
