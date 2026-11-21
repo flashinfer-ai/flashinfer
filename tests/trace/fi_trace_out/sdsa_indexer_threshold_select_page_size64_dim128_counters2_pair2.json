@@ -1,6 +1,6 @@
 {
   "name": "sdsa_indexer_threshold_select_page_size64_dim128_counters2_pair2",
-  "description": "Keys of each query row's request scoring above the row's threshold, with one query head over paged BF16 or NVFP4 keys, written as (key, score) candidate and tie slots. SM100/SM103.",
+  "description": "Keys of each query row's request scoring above the row's threshold, with one query head over paged BF16, FP8 or NVFP4 keys (FP8 scores times an optional score scale), written as (key, score) candidate and tie slots. SM100/SM103.",
   "op_type": "sdsa_indexer_threshold_select",
   "tags": [
     "fi_api:flashinfer.sdsa.indexer.indexer_threshold_select",
@@ -36,7 +36,7 @@
     "dim": {
       "type": "const",
       "value": 128,
-      "description": "Elements per key: 128 BF16, or 64 NVFP4 bytes."
+      "description": "Elements per key: 128 BF16 or FP8, or 64 NVFP4 bytes."
     },
     "scales": {
       "type": "var",
@@ -59,6 +59,11 @@
     "range": {
       "type": "var",
       "description": "A row's first and past-last Top-K slot."
+    },
+    "one": {
+      "type": "const",
+      "value": 1,
+      "description": "FP8 score_scale's element."
     }
   },
   "constraints": [
@@ -158,6 +163,13 @@
         "rows"
       ],
       "dtype": "int32",
+      "optional": true
+    },
+    "score_scale": {
+      "shape": [
+        "one"
+      ],
+      "dtype": "unknown",
       "optional": true
     }
   },
