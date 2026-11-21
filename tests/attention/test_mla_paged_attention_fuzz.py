@@ -50,12 +50,6 @@ LEDGER = FuzzLedger(
             reason="#6860: CUTLASS MLA propagates NaNs from last-page tails and dense-table padding",
             quarantine=True,
         ),
-        Finding(
-            match=lambda phase: phase == "poisoned_padding",
-            backend="cute-dsl-monolithic",
-            reason="#6861: CuTe DSL monolithic MLA propagates padding NaNs into valid output",
-            quarantine=True,
-        ),
     ],
 )
 UNIT_ROUNDOFF = {torch.bfloat16: 2**-8, torch.float16: 2**-11}
@@ -836,3 +830,123 @@ def test_mla_problem_seed_and_padding():
     assert all(first.nan_page not in ids for ids in first.pages)
     for ids, length in zip(first.pages, cfg.kv_lengths, strict=True):
         assert torch.isnan(first.cache[ids[-1], length % cfg.page_size :]).all()
+
+
+@pytest.mark.parametrize(
+    "dtype,page_size,decode_only",
+    [
+        (torch.bfloat16, 2, True),
+        (torch.float16, 4, True),
+        (torch.bfloat16, 8, True),
+        (torch.float16, 16, True),
+        (torch.bfloat16, 32, True),
+        (torch.bfloat16, 64, True),
+        (torch.float16, 128, True),
+        (torch.bfloat16, 8, False),
+        (torch.bfloat16, 16, False),
+        (torch.float16, 32, False),
+        (torch.float16, 128, False),
+    ],
+)
+def test_mla_cute_padding_graph(dtype, page_size, decode_only, workspace):
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("CuTe DSL MLA requires Blackwell")
+    cfg = Config(
+        90,
+        (1,) * 7 if decode_only else (1, 8),
+        (17, 24, 25, 63, 127, 128, 159) if decode_only else (page_size - 1, 151),
+        heads=128 if decode_only else 32,
+        page_size=page_size,
+        dtype=dtype,
+        causal=True,
+        metadata_form="dense",
+        metadata_device="cuda",
+        query_layout="packed",
+        kv_layout="packed",
+        lse_mode="base2",
+    )
+    p = make_problem(cfg)
+    changed = make_problem(
+        replace(
+            cfg,
+            seed=91,
+            kv_lengths=cfg.kv_lengths[2:] + cfg.kv_lengths[:2]
+            if decode_only
+            else (page_size - 2, 149),
+        )
+    )
+    for problem in (p, changed):
+        table = problem.metadata.block_tables
+        problem.metadata = replace(
+            problem.metadata,
+            block_tables=torch.nn.functional.pad(
+                table, (0, -table.shape[1] % (128 // page_size)), value=problem.nan_page
+            ),
+        )
+    # Both sentinel values are legal in unused dense slots.
+    for row, pages in enumerate(changed.pages):
+        padding_id = -1 if row % 2 == 0 else 2**31 - 1
+        changed.metadata.block_tables[row, len(pages) :].fill_(padding_id)
+    wrapper = BatchMLAPagedAttentionWrapper(
+        workspace, backend="cute-dsl-monolithic", use_cuda_graph=True
+    )
+    wrapper.plan(**_plan_kwargs(p))
+    out = torch.empty_like(p.q[..., :CKV])
+    lse = torch.empty(p.q.shape[:2], dtype=torch.float32, device="cuda")
+    wrapper.run(**_run_kwargs(p, out, lse))
+    _check_numeric(out, lse, p, reference_mla(p))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(**_run_kwargs(p, out, lse))
+    p.q.copy_(changed.q)
+    p.cache.copy_(changed.cache)
+    p.metadata.block_tables.copy_(changed.metadata.block_tables)
+    p.metadata.seq_lens.copy_(changed.metadata.seq_lens)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_numeric(out, lse, changed, reference_mla(changed))
+
+
+@pytest.mark.parametrize("page_size", (4, 8, 16, 64))
+def test_mla_cute_padding_large_page_offset(workspace, page_size):
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("CuTe DSL MLA requires Blackwell")
+    cfg = Config(
+        0,
+        (1,),
+        (17,),  # Sparse partial tile takes the cp.async path with software addresses.
+        heads=128,
+        page_size=page_size,
+        dtype=torch.bfloat16,
+        query_layout="packed",
+        kv_layout="packed",
+        lse_mode="base2",
+    )
+    p = make_problem(cfg)
+    page = (1 << 31) // (cfg.page_size * (CKV + KPE)) + 1
+    cache = torch.empty(
+        (page + len(p.pages[0]), cfg.page_size, CKV + KPE),
+        device="cuda",
+        dtype=cfg.dtype,
+    )
+    cache[0].fill_(float("nan"))
+    table = torch.zeros((1, 128 // page_size), dtype=torch.int32)
+    for slot, physical in enumerate(p.pages[0]):
+        cache[page + slot].copy_(p.cache[physical])
+        table[0, slot] = page + slot
+    metadata = MLAPlanMetadata.dense(
+        torch.tensor([0, 1], dtype=torch.int32),
+        table,
+        torch.tensor(cfg.kv_lengths, dtype=torch.int32),
+        1,
+    )
+    # The reference keeps the small logical cache; execution uses the same
+    # page contents at a physical offset above 2**31 elements.
+    physical = replace(p, kv_cache=cache, metadata=metadata)
+    wrapper = _wrapper(physical, "cute-dsl-monolithic", workspace)
+    out = torch.empty_like(p.q[..., :CKV])
+    lse = torch.empty(p.q.shape[:2], dtype=torch.float32, device="cuda")
+    wrapper.run(**_run_kwargs(physical, out, lse))
+    _check_numeric(out, lse, p, reference_mla(p))
