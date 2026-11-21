@@ -3161,6 +3161,135 @@ class TestUnifiedMoEDispatch:
             )
 
 
+@sm100_required
+@pytest.mark.parametrize(
+    "mode", [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed]
+)
+def test_layer_selection_times_serving_like_inputs(monkeypatch, mode):
+    """A warm-up-like first call (identical tokens, so every token on the same
+    experts, as in a framework's warm-up batch on static, often zero-filled
+    CUDA-graph buffers) times the candidates on the same serving-like pack as
+    a first call on served routing, and still computes on its own tensors."""
+    monkeypatch.delenv("FLASHINFER_MOE_SELECT_ON_CALL_INPUTS", raising=False)
+    num_tokens, num_experts, top_k = 6, 256, 8
+    # Two candidates engage the cross-backend timing on real kernels.
+    act, weights, config, _ = _make_bf16_packs_and_config(
+        num_tokens,
+        hidden_size=1024,
+        intermediate_size=256,
+        num_experts=num_experts,
+        top_k=top_k,
+        max_tokens=16,
+        backend_configs=(TrtllmBf16Config(), TrtllmBf16Config()),
+    )
+    device = act.hidden_states_q.device
+    if mode is RoutingInputMode.FromLogits:
+        # GLM-5.2-style routing: DeepSeekV3 scores plus a correction bias.
+        config = dataclasses.replace(
+            config,
+            routing=RoutingConfig(
+                num_experts=num_experts,
+                top_k=top_k,
+                method=RoutingMethodType.DeepSeekV3,
+                n_group=1,
+                topk_group=1,
+                routed_scaling_factor=2.5,
+            ),
+        )
+        bias = (torch.rand(num_experts, device=device) - 0.5) * 0.1
+
+        def logits_pack(logits):
+            return MoEActivationPack(
+                hidden_states_q=act.hidden_states_q,
+                hidden_states_scale=None,
+                routing_input_mode=mode,
+                routing_logits=logits,
+                routing_bias=bias,
+            )
+
+        warmup_pack = logits_pack(torch.zeros(num_tokens, num_experts, device=device))
+        served_pack = logits_pack(torch.randn(num_tokens, num_experts, device=device))
+    else:
+        shared = torch.arange(top_k, dtype=torch.int32, device=device)
+        warmup_pack = dataclasses.replace(
+            act, topk_ids=shared.expand(num_tokens, top_k).contiguous()
+        )
+        served_pack = act
+
+    timed = []
+    for caller in (warmup_pack, served_pack):
+        layer = MoELayer(config)
+        assert len(layer.runners) == 2
+        select = layer._select_winner
+        monkeypatch.setattr(
+            layer,
+            "_select_winner",
+            lambda pack, packed_weights, runners, _select=select: timed.append(pack)
+            or _select(pack, packed_weights, runners),
+        )
+        out = layer(caller, weights)
+        runner, tactic = next(iter(layer._winners.values()))
+        inputs = runner.pack_inputs(caller, weights)
+        expected = runner.forward(
+            inputs, tactic=tactic, **runner.launch_kwargs_for(inputs)
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+
+    from_warmup, from_served = timed
+    assert from_warmup is not warmup_pack and from_served is not served_pack
+    for name in ("hidden_states_q", "routing_logits", "topk_ids", "topk_weights"):
+        a, b = getattr(from_warmup, name), getattr(from_served, name)
+        assert (a is None) == (b is None), name
+        if a is not None:
+            assert torch.equal(a, b), name
+    if mode is RoutingInputMode.FromLogits:
+        assert from_warmup.routing_bias is bias
+        scores = torch.sigmoid(from_warmup.routing_logits.float()) + bias
+        experts = torch.topk(scores, top_k, dim=-1).indices
+    else:
+        experts = from_warmup.topk_ids
+    # The warm-up batch routes to top_k=8 experts; the timed pack spreads.
+    assert experts.unique().numel() >= 32
+
+
+@sm100_required
+def test_layer_selects_before_capture_and_replays_the_winner(monkeypatch):
+    """The eager call selects; capturing the same bucket neither selects nor
+    synthesizes inputs, the replay matches eager, and ``warmup()`` refuses to
+    run inside a capture."""
+    from flashinfer.fused_moe import layer as moe_layer_module
+
+    act, weights, config, _ = _make_bf16_packs_and_config(
+        6,
+        hidden_size=1024,
+        intermediate_size=256,
+        num_experts=32,
+        top_k=4,
+        max_tokens=16,
+        backend_configs=(TrtllmBf16Config(), TrtllmBf16Config()),
+    )
+    layer = MoELayer(config)
+    eager = layer(act, weights).clone()
+
+    def fail(*args, **kwargs):
+        raise AssertionError("MoELayer selected inside a CUDA-graph capture")
+
+    monkeypatch.setattr(layer, "_select_winner", fail)
+    monkeypatch.setattr(moe_layer_module, "representative_pack", fail)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = layer(act, weights)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, eager, rtol=1e-2, atol=1e-2)
+
+    with (
+        pytest.raises(RuntimeError, match="before capturing"),
+        torch.cuda.graph(torch.cuda.CUDAGraph()),
+    ):
+        layer.warmup(act, weights)
+
+
 # ---------------------------------------------------------------------------
 # 4. BF16 conformance (trtllm_bf16_routed)
 # ---------------------------------------------------------------------------
