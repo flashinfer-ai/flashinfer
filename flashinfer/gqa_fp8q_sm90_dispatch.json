@@ -1,0 +1,26 @@
+{
+  "comment": "Geometry and limits describe the explicit SM90 FP8-Q kernel contract, not a qualified performance region. No automatic kernel admission is qualified after the precision repair. These geometry keys also delimit the existing plan-time kill-switch composable fallback for auto.",
+  "backends": ["auto", "specialized", "fa2"],
+  "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
+  "ops": {
+    "context": {
+      "auto_admission": false,
+      "kv_layout": "NHD",
+      "causal": true,
+      "num_qo_heads": 8,
+      "num_kv_heads": 1,
+      "head_dim": 128,
+      "page_size": 16,
+      "q_dtype": "float8_e4m3fn",
+      "kv_dtype": "float8_e4m3fn",
+      "o_dtype": "bfloat16",
+      "compute_capability": [9, 0],
+      "envelope": {
+        "max_batch_size": 128,
+        "max_total_q": 32768,
+        "max_kv_len": 262144,
+        "max_referenced_pages": 131072
+      }
+    }
+  }
+}
