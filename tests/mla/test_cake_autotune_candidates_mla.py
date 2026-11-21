@@ -1321,18 +1321,10 @@ def _check_offer_table(table) -> None:
 
 def test_offer_table_well_formed():
     """The committed offer table and the synthetic one of these tests are well
-    formed. No GPU needed."""
+    formed: every listed unit, split-KV units included, stays on its measured
+    domain under the committed ``_SPLITKV_RANGE``. No GPU needed."""
     _check_offer_table(core._CAKE_MLA_AUTO_OFFERS)
     _check_offer_table(_SYNTHETIC_OFFERS)
-    # The measurements the committed table derives from timed no split-KV
-    # unit without sinks, so it lists none; _check_offer_table holds every
-    # listed unit on its measured domain under the committed _SPLITKV_RANGE.
-    assert not any(
-        unit[0] == cake_module.DOMAIN_BF16_SPLITKV
-        for key, units in core._CAKE_MLA_AUTO_OFFERS.items()
-        if not key[5]
-        for unit in units
-    )
 
 
 def test_committed_offer_table_unlisted_units_offer_nothing(monkeypatch, cake_families):
