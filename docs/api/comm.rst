@@ -210,10 +210,28 @@ covers the workspace, and the stock pick otherwise; ``"trtllm"`` and
 ``"mnnvl"`` never run a specialized kernel.  Today it holds one kernel:
 ``kARResidualRMSNorm`` with ``fp32_acc=True`` on two ranks of one node, hidden
 size 6144, bfloat16, compute capability 10.3, for the allowlisted
-``weight_bias`` values and token counts.  ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
-(read at call time and at workspace creation; set it identically on every rank)
-sends every call to the fallback.  The checkpoint lifecycle above covers both
-the workspace's own buffers and its fallback's.
+``weight_bias`` values and token counts.  The checkpoint lifecycle above covers
+both the workspace's own buffers and its fallback's.
+
+Creation is collective.  A workspace configuration outside the kernels'
+envelope (world size, hidden size, dtype, ``max_token_num``) runs no
+collective: ``backend="auto"`` returns the stock pick and an explicit
+``backend="specialized"`` raises ``ValueError`` before building anything.
+Inside it, the ranks vote (compute capability, one node, free memory, the JIT
+build, the kill switch) and, after allocating, vote again on their local setup;
+one rank's veto or failure is the outcome on every rank.  When the vote rejects
+the kernel, ``backend="auto"`` returns the stock workspace it built, while an
+explicit ``backend="specialized"`` destroys it and raises ``ValueError`` on
+every rank.
+
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` is read in two places; set it
+identically on every rank.  At creation, ``backend="auto"`` then returns the
+stock workspace, and an explicit ``backend="specialized"`` returns a
+fallback-only :class:`SpecializedAllReduceFusionWorkspace` (no kernel state, no
+extra memory) instead of raising.  At call time it sends every eager call, and
+every call captured into a CUDA graph from then on, to the fallback.  A graph
+captured before the variable was set still replays the launches it captured:
+recapture such graphs after setting it.
 
 .. autoclass:: SpecializedAllReduceFusionWorkspace
     :members:
