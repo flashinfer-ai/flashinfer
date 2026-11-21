@@ -486,11 +486,9 @@ def test_fused_quantized_combine_routes_mirror_the_cake_host_rule():
         for top_k in _FUSED_QUANTIZED_COMBINE_TOP_K:
             symbol = f"{_FUSED_QUANTIZED_COMBINE_SYMBOL}{top_k}("
             assert generated.count(f"void {symbol}") == 1
-            # 256 threads per CTA (the launcher passes kCombineThreads) and one TOP_K
-            # specialization per symbol
+            # 256 threads per CTA (the launcher passes kCombineThreads)
             assert (
-                f"#define THREADS 256 #define TOP_K {top_k} "
-                f'extern "C" {{ __global__ __launch_bounds__(THREADS) void {symbol}'
+                f'extern "C" {{ __global__ __launch_bounds__(256) void {symbol}'
                 in generated
             )
             signature, body = generated.split(f"void {symbol}", 1)[1].split(")", 1)

@@ -113,7 +113,7 @@ extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_top
     unsigned long long, int, int, int, int, int, int, int, bool, bool);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(
-    uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, int, int, int, int, int, float, int, int,
+    uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, int, int, int, int, int, int, float, int, int,
     bool);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_sanitize_expert_ids(int*, int*, int,
@@ -130,7 +130,8 @@ constexpr int kDispatchSharedBytes = 256;
 constexpr int kCombineThreads = 256;
 constexpr int kBf16TopK6Threads = 32;
 constexpr int kPublicationThreads = 64;
-constexpr int kQuantThreads = 32;
+// quantize_combine: one thread per 16 consecutive elements of a scale block, 128 to a CTA.
+constexpr int kQuantThreads = 128;
 constexpr int kSanitizeThreads = 256;
 constexpr int kDTypeBFloat16 = 0;
 constexpr int kDTypeFloat16 = 1;
@@ -629,17 +630,20 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   }
 
   QuantizedCombineLayout const layout = quantizedCombineLayout(params);
-  int const quant_grid = params.local_num_tokens * layout.blocks_per_row;
+  // An NVFP4 block is one 16-element chunk, an MXFP8/MXFP4 block two.
+  int const chunks_per_block = params.quant_mode == MoeA2ACombineQuantMode::NVFP4 ? 1 : 2;
+  int const quant_grid =
+      ceilDiv(params.local_num_tokens * layout.blocks_per_row * chunks_per_block, kQuantThreads);
   auto* output_bytes = static_cast<uint8_t*>(params.output_data);
   auto* scale_bytes = static_cast<uint8_t*>(params.output_scales);
-  launchWithPdlWhenEnabled("mnnvl_moe_alltoall_quantize_combine", params.enable_pdl,
-                           kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine, quant_grid,
-                           kQuantThreads, 0, params.stream,
-                           static_cast<uint8_t*>(params.accumulation_data), output_bytes,
-                           output_bytes, scale_bytes, scale_bytes, params.elements_per_token,
-                           dtypeBytes(params.dtype), dtypeCode(params.dtype), layout.quant_mode,
-                           static_cast<int>(params.swizzle_mode), params.output_scalar_scale,
-                           layout.blocks_per_row, layout.padded_scale_cols, params.enable_pdl);
+  launchWithPdlWhenEnabled(
+      "mnnvl_moe_alltoall_quantize_combine", params.enable_pdl,
+      kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine, quant_grid, kQuantThreads, 0,
+      params.stream, static_cast<uint8_t*>(params.accumulation_data), output_bytes, output_bytes,
+      scale_bytes, scale_bytes, params.local_num_tokens, params.elements_per_token,
+      dtypeBytes(params.dtype), dtypeCode(params.dtype), layout.quant_mode,
+      static_cast<int>(params.swizzle_mode), params.output_scalar_scale, layout.blocks_per_row,
+      layout.padded_scale_cols, params.enable_pdl);
 }
 
 bool moe_a2a_combine_fuses_quantization(MoeA2ACombineParams const& params) {
