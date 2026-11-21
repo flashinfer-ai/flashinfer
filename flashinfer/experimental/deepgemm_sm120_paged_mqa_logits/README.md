@@ -7,10 +7,10 @@ prepares the DeepSeek-V3.2 / V4.1-Flash decode-side "lightning indexer"
 logits[b * next_n + t, k] = sum_h relu(Q[b, t, h, :] . KV[k, :]) * scale[k] * w[b * next_n + t, h]
 ```
 
-over a block-table KV cache on **SM120a** (RTX PRO 6000 Blackwell / RTX 5090,
-GB202). Each prepared call returns a plan; `plan.run()` submits on the current
-PyTorch stream and returns the logical `[B * next_n, max_context_len]` view of
-the FP32 output.
+over a block-table KV cache on **SM120a** (RTX PRO 5000 / PRO 6000 Blackwell
+and RTX 5090). Each prepared call returns a plan; `plan.run()` submits on the
+current PyTorch stream and returns the logical `[B * next_n, max_context_len]`
+view of the FP32 output.
 
 A call is a real **two-kernel sequence**: a single-warp scheduler writes
 `schedule_meta[num_sms + 1, 2]` (per-CTA `(q_atom_idx, kv_split_idx)` walk
@@ -97,11 +97,12 @@ route binding (see "Layout").
 
 ## Device routes
 
-The catalog also carries routes tuned for two devices, chosen by the
-device's physical SM count (170: RTX 5090, 188: RTX PRO 6000). The SM count
-is the only key: another part with the same SM count (the RTX PRO 6000 Max-Q,
-or a board with a lower power limit) takes the same table without having been
-measured on it. A prepared call takes a device route only when all of these hold:
+The catalog also carries routes tuned for three devices, chosen by the
+device's physical SM count (110: RTX PRO 5000, 170: RTX 5090,
+188: RTX PRO 6000). The SM count is the only key: another part with the
+same SM count (the RTX PRO 6000 Max-Q, or a board with a lower power limit)
+takes the same table without having been measured on it. A prepared call
+takes a device route only when all of these hold:
 the device's SM count keys a table of `policy.device_rule`, the CTA budget
 equals that SM count (no `sm_count` override; for the one-shot entry,
 `schedule_meta` has `num_sms + 1` rows), and `max_context_hint` lies in one
@@ -113,6 +114,11 @@ when both list the same one; any other batch, and a `null` entry, runs the
 default route. Every other call runs the default route above.
 `resolve_route(...)` gives the route a call runs; `plan.route_name`,
 `plan.atom_variant` and `plan.num_next_n_atoms` follow it.
+
+The 110-SM table is intentionally sparse, selecting existing programs only
+at measured batch points with additional lengths tested within their context
+window. Unlisted conditions keep the default route; this is not a full-grid
+retuning of the device.
 
 The device routes are built without fast math. Their logits are bitwise
 equal to DeepGEMM's on all inputs, including tiny-magnitude ones whose
@@ -241,7 +247,7 @@ exported head counts select different schedules — `next_n` 5 and 6 at
 `B > 8` — in which case the `ValueError` names it; for `next_n` 1–4 and for
 every `B <= 8` without a long-context hint the DeepGEMM-shaped call without
 `num_heads` is exact (the hint changes this for `next_n` 5 and 6; see below).
-On RTX 5090 and RTX PRO 6000 at the full CTA budget, with a `max_context_hint`
+On devices with a route table at the full CTA budget, with a `max_context_hint`
 inside a route context window, a device route can also make the two head counts
 select different schedules for other `next_n` values and batches; `num_heads`
 is then required there too, and the `ValueError` names it.
