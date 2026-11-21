@@ -48,4 +48,14 @@ theorem attnr_r6_causal : AttnR.output attnRP_r6 = Attn.output attnRP_r6.causal 
 theorem attnr_r6_keyset_row : Attn.maskOutput (Attn.MParams.ofV attnRP_r6.toV) = AttnR.output attnRP_r6 := AttnR.key_set_row_of_range_row _ (by decide)
 theorem attnr_r6_keyset : Attn.maskOutput ⟨4, 4, 32, [false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, true, true, true, true, true, true, true, false, false, false, false, false, false, false, false, false], 2, 1⟩ = AttnR.output attnRP_r6 := by native_decide
 def attnRangesCases : List (String × AttnR.Params) := [("r0", attnRP_r0), ("r1", attnRP_r1), ("r2", attnRP_r2), ("r3", attnRP_r3), ("r4", attnRP_r4), ("r5", attnRP_r5), ("r6", attnRP_r6)]
+
+/-! A range equal to the request's whole key range gives the non-causal class's term: every non-causal toy case against the ranged row at the same position whose range is `[0, kv_len)`, with and without a window (the Python spec builds the same term object; the general theorem instantiated). -/
+theorem attnr_a10_noncausal : AttnR.output ⟨4, 4, 32, 5, -1, 0, 41, 0, 0⟩ = Attn.output (AttnR.Params.nonCausal ⟨4, 4, 32, 5, -1, 0, 41, 0, 0⟩) := AttnR.whole_range_is_noncausal _ rfl (by decide)
+theorem attnr_a10_noncausal_windowed : AttnR.output ⟨4, 4, 32, 5, 3, 0, 41, 0, 0⟩ = Attn.output (AttnR.Params.nonCausal ⟨4, 4, 32, 5, 3, 0, 41, 0, 0⟩) := AttnR.whole_range_is_noncausal _ rfl (by decide)
+theorem attnr_a11_noncausal : AttnR.output ⟨8, 4, 32, 20, -1, 0, 45, 1, 2⟩ = Attn.output (AttnR.Params.nonCausal ⟨8, 4, 32, 20, -1, 0, 45, 1, 2⟩) := AttnR.whole_range_is_noncausal _ rfl (by decide)
+theorem attnr_a11_noncausal_windowed : AttnR.output ⟨8, 4, 32, 20, 3, 0, 45, 1, 2⟩ = Attn.output (AttnR.Params.nonCausal ⟨8, 4, 32, 20, 3, 0, 45, 1, 2⟩) := AttnR.whole_range_is_noncausal _ rfl (by decide)
+theorem attnr_a12_noncausal : AttnR.output ⟨16, 4, 32, 0, -1, 0, 33, 0, 1⟩ = Attn.output (AttnR.Params.nonCausal ⟨16, 4, 32, 0, -1, 0, 33, 0, 1⟩) := AttnR.whole_range_is_noncausal _ rfl (by decide)
+theorem attnr_a12_noncausal_windowed : AttnR.output ⟨16, 4, 32, 0, 3, 0, 33, 0, 1⟩ = Attn.output (AttnR.Params.nonCausal ⟨16, 4, 32, 0, 3, 0, 33, 0, 1⟩) := AttnR.whole_range_is_noncausal _ rfl (by decide)
+theorem attnr_a13_noncausal : AttnR.output ⟨4, 4, 32, 40, -1, 0, 48, 3, 0⟩ = Attn.output (AttnR.Params.nonCausal ⟨4, 4, 32, 40, -1, 0, 48, 3, 0⟩) := AttnR.whole_range_is_noncausal _ rfl (by decide)
+theorem attnr_a13_noncausal_windowed : AttnR.output ⟨4, 4, 32, 40, 3, 0, 48, 3, 0⟩ = Attn.output (AttnR.Params.nonCausal ⟨4, 4, 32, 40, 3, 0, 48, 3, 0⟩) := AttnR.whole_range_is_noncausal _ rfl (by decide)
 end BIK

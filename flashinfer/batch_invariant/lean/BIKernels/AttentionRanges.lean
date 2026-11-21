@@ -17,6 +17,8 @@ What the module states:
 
 * a row without a range (`rb ≤ ra`), and a row whose range lies inside its causal keys, have the causal class's term
   (`no_range_is_causal`, `range_inside_causal_is_causal`): tokens outside every range are unaffected by the class;
+* a row whose range is its request's whole key range `[0, kvLen)` has the non-causal class's term
+  (`whole_range_is_noncausal`);
 * the split kernel computes the fused term for every chunk-to-CTA assignment, and every configuration computes the term;
 * the launch model: a row's term is a function of its own position, window, range and identity (R1, R2);
 * the explicit-key-set row whose bits are the ranged row's visible set has the ranged row's term
@@ -123,6 +125,32 @@ theorem range_inside_causal_is_causal (P : Params) (hlo : Attn.loOf P.p P.win �
     · simp [hk]
   · unfold endG
     split <;> omega
+
+/-! ## A row whose range is its request's whole key range is a row of the non-causal class -/
+
+/-- The non-causal class's row of a request with `P.rb` keys, at the same identity. -/
+def Params.nonCausal (P : Params) : Attn.Params := ⟨P.steps, P.tbits, P.C, P.p, P.win, P.row, P.d, false, P.rb⟩
+
+/-- **The whole key range, the non-causal class**: a row whose range is `[0, kvLen)` of a request that holds its position
+(`p < kvLen`) sees every key of the request whatever its window, and has the term of the non-causal class's row -- the same
+visible set, so the same term and the same bits. -/
+theorem whole_range_is_noncausal (P : Params) (h0 : P.ra = 0) (hp : P.p + 1 ≤ P.rb) :
+    output P = Attn.output P.nonCausal := by
+  have hv : visibleG P.p P.win P.ra P.rb = fun k => decide (k < P.rb) := by
+    funext k
+    simp only [visibleG, Attn.visibleG, Attn.visibleR, h0]
+    by_cases hk : k < P.rb
+    · simp [hk]
+    · have hc : ¬ (Attn.loOf P.p P.win ≤ k ∧ k < P.p + 1) := by omega
+      simp [hk, hc]
+  have hL : endG P.p P.ra P.rb = P.rb := by
+    unfold endG
+    split <;> omega
+  have h : P.toV = P.nonCausal.toV := by
+    rw [Attn.noncausal_toV P.nonCausal rfl]
+    simp [Params.toV, Params.nonCausal, hv, hL]
+  show vTerm P.toV = vTerm P.nonCausal.toV
+  rw [h]
 
 /-! ## The launch model -/
 

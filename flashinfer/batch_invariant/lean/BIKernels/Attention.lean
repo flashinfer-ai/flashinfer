@@ -662,6 +662,25 @@ theorem key_set_row_of_causal_row (P : Params) (hne : P.presentChunks ≠ []) :
   have : ¬ (P.lo ≤ k ∧ k < P.L) := by omega
   simp [Params.toV, Core.toV, Params.core, visibleR, this]
 
+/-- The all-ones mask row over a request of `kvLen` keys. -/
+def allKeys (kvLen : Nat) : List Bool := List.replicate kvLen true
+
+theorem map_range_all_visible (n : Nat) : (List.range n).map (visibleR 0 n) = allKeys n := by
+  apply List.ext_getElem
+  · simp [allKeys]
+  · intro i h₁ h₂
+    have hi : i < n := by simpa using h₁
+    simp [allKeys, visibleR, hi]
+
+/-- **An all-ones key set is the non-causal row**: the mask row that shows a token every key of its request gives the
+non-causal class's term, whatever the token's position (the same visible set, so the same term and the same bits). -/
+theorem all_keys_row_is_noncausal_row (P : Params) (h : P.causal = false) (hne : P.presentChunks ≠ []) :
+    maskOutput ⟨P.steps, P.tbits, P.C, allKeys P.kvLen, P.row, P.d⟩ = output P := by
+  have e : (⟨P.steps, P.tbits, P.C, allKeys P.kvLen, P.row, P.d⟩ : MParams) = MParams.ofV P.toV := by
+    simp [MParams.ofV, Params.toV, Core.toV, Params.core, Params.L, Params.lo, LMode, loMode, h, map_range_all_visible]
+  rw [e]
+  exact key_set_row_of_causal_row P hne
+
 /-- **The key set reaches the term**: two key sets differing in one key are different terms (a toy row, decided), so the
 class is a function of the mask and one receipt covers it only because the mask is an input, as the position is. -/
 theorem mask_output_depends_on_keys :

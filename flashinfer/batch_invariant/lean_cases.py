@@ -655,7 +655,7 @@ RANGES_DECIDED_THEOREMS = tuple(
 #: range over a longer request; every key of the request for a non-causal row).
 ATTN_MASK_DECIDED_THEOREMS = tuple(
     f"attnm_{n}_spec" for n, *_ in ATTN_MASK_CASES
-) + tuple(f"attnm_{c[0]}_causal" for c in ATTN_CASES if c[8])
+) + tuple(f"attnm_{c[0]}_{'causal' if c[8] else 'noncausal'}" for c in ATTN_CASES)
 DECIDED_THEOREMS = (
     tuple(n for F in FORMATS for n in F.decided)
     + ("gemm_fp8bs_space_ok", "gemm_fp8bs_dispatch_in_space")
@@ -857,6 +857,19 @@ def _render_attention_mask(L: List[str]) -> None:
                 f"Attn.output ⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}, true, 0⟩ := by native_decide"
             )
             continue
+        row = RowSpec(p=p, row=rid, causal=False, kv_len=kv_len)
+        all_keys = RowSpec(p=0, row=rid, kv_len=kv_len, keys=frozenset(range(kv_len)))
+        assert S.output(all_keys, d) is S.output(row, d), name
+        assert S.output(row.as_key_set(), d) is S.output(row, d), name
+        lean_row = f"⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}, false, {kv_len}⟩"
+        L.append(
+            f"theorem attnm_{name}_noncausal_row : Attn.maskOutput ⟨{D // mk}, {tb}, {C}, Attn.allKeys {kv_len}, {rid}, {d}⟩ = "
+            f"Attn.output {lean_row} := Attn.all_keys_row_is_noncausal_row {lean_row} rfl (by decide)"
+        )
+        L.append(
+            f"theorem attnm_{name}_noncausal : Attn.maskOutput ⟨{D // mk}, {tb}, {C}, {_lean_bools([True] * kv_len)}, {rid}, {d}⟩ = "
+            f"Attn.output {lean_row} := by native_decide"
+        )
     L.append("")
 
 
@@ -1466,6 +1479,25 @@ def _render_attention_ranges(L: List[str]) -> None:
         + "]"
     )
     L.append("")
+    L.append(
+        "/-! A range equal to the request's whole key range gives the non-causal class's term: every non-causal toy case "
+        "against the ranged row at the same position whose range is `[0, kv_len)`, with and without a window (the Python spec "
+        "builds the same term object; the general theorem instantiated). -/"
+    )
+    for name, D, T, C, p, _, rid, d, causal, kv_len in ATTN_CASES:
+        if causal:
+            continue
+        tb = T.bit_length() - 1
+        S = AttentionSpec(D, T=T, C=C)
+        nc_row = RowSpec(p=p, row=rid, causal=False, kv_len=kv_len)
+        for tag, win in (("", -1), ("_windowed", 3)):
+            ranged = RowSpec(p=p, window_left=win, row=rid, brange=(0, kv_len))
+            assert S.output(ranged, d) is S.output(nc_row, d), name
+            lean_row = f"⟨{D // mk}, {tb}, {C}, {p}, {win}, 0, {kv_len}, {rid}, {d}⟩"
+            L.append(
+                f"theorem attnr_{name}_noncausal{tag} : AttnR.output {lean_row} = "
+                f"Attn.output (AttnR.Params.nonCausal {lean_row}) := AttnR.whole_range_is_noncausal _ rfl (by decide)"
+            )
     L.append("")
 
 
