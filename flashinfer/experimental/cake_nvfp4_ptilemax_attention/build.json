@@ -68,7 +68,7 @@
       "path": "aot/cake_nvfp4_ptilemax_attention_aeef857fb82e9e29a633_sm_103a.so",
       "sha256": {
         "csrc/cake_nvfp4_ptilemax_attention_aeef857fb82e9e29a633_binding.cu": "4edfc0fafee25c3b71b02ab12b973056e8b73c07936f832a3586fa612e071211",
-        "csrc/cake_nvfp4_ptilemax_attention_aeef857fb82e9e29a633_kernel.cu": "203f5966d9cfc50a8eedf014c0d21090c1449171c081bdd797f67d2e6673066e"
+        "csrc/cake_nvfp4_ptilemax_attention_aeef857fb82e9e29a633_kernel.cu": "5a3677bdfc8d9f1aac335ebf8c498a105ef96eadd5ab1a68c9f9b6497b13e33b"
       },
       "sources": [
         "csrc/cake_nvfp4_ptilemax_attention_aeef857fb82e9e29a633_kernel.cu",
