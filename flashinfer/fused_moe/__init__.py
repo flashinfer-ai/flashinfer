@@ -90,6 +90,7 @@ from .api import (  # noqa: F401
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
+    W4A16MxFp4LatentConfig,
 )
 from .layer import MoELayer  # noqa: F401
 from .da_runtime import (  # noqa: F401
@@ -136,6 +137,7 @@ from .runners import (  # noqa: F401
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
     TrtllmMxInt4RoutedRunner,
+    W4A16MxFp4LatentRunner,
 )
 
 # Legacy flat-argument Prims-TS APIs are imported on first use. Keeping them
@@ -155,9 +157,24 @@ _PRIMS_TS_LAZY_EXPORTS = {
     "prims_ts_fp4_block_scale_routed_moe": ".backends.prims_ts.fp4_op",
 }
 
+# Specialized flat ops are likewise imported on first use. Their modules run
+# the api-logging decorator and load a trace template at import time, so a
+# plain ``import flashinfer`` must not execute them: the MoELayer backend
+# registration (W4A16MxFp4LatentConfig in api.py, its runner mapping in
+# layer.py) stays eager because it is pure Python with no kernel-side
+# imports, while the flat entry point resolves lazily through
+# ``__getattr__`` below.
+_SPECIALIZED_FLAT_OP_LAZY_EXPORTS = {
+    "w4a16_mxfp4_latent_routed_moe": ".w4a16_mxfp4_moe",
+}
+
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS.keys())
+    return sorted(
+        set(globals())
+        | _PRIMS_TS_LAZY_EXPORTS.keys()
+        | _SPECIALIZED_FLAT_OP_LAZY_EXPORTS.keys()
+    )
 
 
 # Other legacy flat-argument APIs (unchanged, not deprecated)
@@ -312,7 +329,9 @@ except ImportError:
 
 
 def __getattr__(name: str):
-    module_name = _PRIMS_TS_LAZY_EXPORTS.get(name)
+    module_name = _PRIMS_TS_LAZY_EXPORTS.get(
+        name
+    ) or _SPECIALIZED_FLAT_OP_LAZY_EXPORTS.get(name)
     if module_name is not None:
         value = getattr(importlib.import_module(module_name, __name__), name)
         globals()[name] = value
@@ -394,6 +413,8 @@ __all__ = [
     "CutlassNvfp4Runner",
     "CutlassW4A16Config",
     "CutlassW4A16Runner",
+    "W4A16MxFp4LatentConfig",
+    "W4A16MxFp4LatentRunner",
     "CutlassW4A8Config",
     "CutlassW4A8Runner",
     "CuTileBf16Config",

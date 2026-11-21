@@ -82,6 +82,7 @@ from .api import (
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
+    W4A16MxFp4LatentConfig,
 )
 from .runners import (
     B12xNvfp4Runner,
@@ -122,6 +123,7 @@ from .runners import (
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
     TrtllmMxInt4RoutedRunner,
+    W4A16MxFp4LatentRunner,
 )
 from .backends.cudnn_frost.bf16.moe import CudnnFrostBf16MoeRunner
 from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
@@ -179,6 +181,7 @@ _RunnerT = Union[
     TrtllmMxInt4RoutedRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    W4A16MxFp4LatentRunner,
 ]
 
 # Map backend-config class -> runner class
@@ -228,6 +231,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
     BatchInvariantFp8PerTensorConfig: BatchInvariantFp8PerTensorRunner,
+    W4A16MxFp4LatentConfig: W4A16MxFp4LatentRunner,
 }
 
 

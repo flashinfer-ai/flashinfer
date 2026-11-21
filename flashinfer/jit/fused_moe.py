@@ -699,3 +699,24 @@ def gen_alphamoe_nvfp4_sm100_module() -> JitSpec:
         extra_cuda_cflags=_alphamoe_nvfp4_sm100_nvcc_flags(),
         extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
     )
+
+
+def gen_w4a16_mxfp4_latent_moe_sm90_module() -> JitSpec:
+    """SM90 W4A16 latent-MoE routed-expert block (mxfp4-g32 weights, bf16
+    activations), fixed geometry E_local=56 / top_k=16 / L=3584 / I=3072.
+
+    Built lazily, and only when the guard in
+    flashinfer/fused_moe/w4a16_mxfp4_moe.py admits a call; no existing
+    module is affected.  ``--ftz=false`` is part of the kernel's numeric
+    contract (the ue8m0 scale decode keeps the zero-exponent case normal),
+    so it is pinned after the default fast-math flag.
+    """
+    return gen_jit_spec(
+        "fused_moe_w4a16_mxfp4_latent_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "fused_moe_w4a16_mxfp4_latent_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "flashinfer_fused_moe_w4a16_mxfp4_latent_sm90_binding.cu",
+        ],
+        extra_cuda_cflags=sm90a_nvcc_flags + ["-O3", "--ftz=false", "-lineinfo"],
+    )

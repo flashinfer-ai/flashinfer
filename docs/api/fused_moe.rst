@@ -882,3 +882,14 @@ cuDNN Grouped-GEMM MoE
     CudnnGroupedGemmMxfp8Runner
     CudnnGroupedGemmNvfp4Config
     CudnnGroupedGemmNvfp4Runner
+
+
+SM90 W4A16 latent-MoE routed-expert block
+-----------------------------------------
+
+Served through the ``"specialized"`` backend (``backend="auto"`` routes to
+it on its dispatch allowlist; the composable ``"reference"`` torch path
+serves everything else, including under
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``).
+
+.. autofunction:: w4a16_mxfp4_latent_routed_moe

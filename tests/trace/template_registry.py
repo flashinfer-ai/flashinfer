@@ -75,6 +75,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.fused_moe.monomoe",
     "flashinfer.fused_moe.prepare",
     "flashinfer.fused_moe.trtllm_gen_routing",
+    "flashinfer.fused_moe.w4a16_mxfp4_moe",
     "flashinfer.gdn2_prefill",
     "flashinfer.gdp_prefill",
     "flashinfer.gdn_decode",

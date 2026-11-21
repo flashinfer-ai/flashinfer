@@ -1,0 +1,137 @@
+{
+  "name": "w4a16_mxfp4_latent_routed_moe_e56_l3584_n6144_k16",
+  "description": "One EP rank's W4A16 latent-MoE routed-expert block under given routing: grouped GEMMs over the local experts with mxfp4 group-32 weights, the gated situ activation, and the weighted combine (rank-partial output).",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.w4a16_mxfp4_moe.w4a16_mxfp4_latent_routed_moe",
+    "quantization:mxfp4_g32",
+    "weights:w4a16",
+    "routing:given"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var",
+      "description": "Number of latent token rows."
+    },
+    "num_local_experts": {
+      "type": "const",
+      "value": 56,
+      "description": "Local (rank-resident) expert count."
+    },
+    "latent_size": {
+      "type": "const",
+      "value": 3584,
+      "description": "Latent hidden width."
+    },
+    "latent_packed": {
+      "type": "const",
+      "value": 1792,
+      "description": "latent_size / 2 packed uint8 columns."
+    },
+    "latent_groups": {
+      "type": "const",
+      "value": 112,
+      "description": "latent_size / 32 scale groups."
+    },
+    "gated_size": {
+      "type": "const",
+      "value": 6144,
+      "description": "Stacked gate|up fc1 rows (2 * expert intermediate)."
+    },
+    "inter_packed": {
+      "type": "const",
+      "value": 1536,
+      "description": "intermediate / 2 packed uint8 columns."
+    },
+    "inter_groups": {
+      "type": "const",
+      "value": 96,
+      "description": "intermediate / 32 scale groups."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 16,
+      "description": "Routed slots per token."
+    }
+  },
+  "constraints": [
+    "latent_size == latent_packed * 2",
+    "latent_size == latent_groups * 32",
+    "gated_size == inter_packed * 4",
+    "gated_size == inter_groups * 64"
+  ],
+  "inputs": {
+    "x": {
+      "shape": [
+        "num_tokens",
+        "latent_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Latent activations."
+    },
+    "w13_packed": {
+      "shape": [
+        "num_local_experts",
+        "gated_size",
+        "latent_packed"
+      ],
+      "dtype": "uint8",
+      "description": "fc1 mxfp4 codes, gate rows then up rows."
+    },
+    "w13_scale": {
+      "shape": [
+        "num_local_experts",
+        "gated_size",
+        "latent_groups"
+      ],
+      "dtype": "uint8",
+      "description": "fc1 ue8m0 group-32 scales."
+    },
+    "w2_packed": {
+      "shape": [
+        "num_local_experts",
+        "latent_size",
+        "inter_packed"
+      ],
+      "dtype": "uint8",
+      "description": "fc2 (down) mxfp4 codes."
+    },
+    "w2_scale": {
+      "shape": [
+        "num_local_experts",
+        "latent_size",
+        "inter_groups"
+      ],
+      "dtype": "uint8",
+      "description": "fc2 ue8m0 group-32 scales."
+    },
+    "topk_ids": {
+      "shape": [
+        "num_tokens",
+        "top_k"
+      ],
+      "dtype": "int32",
+      "description": "GLOBAL expert ids; only ids < num_local_experts hit."
+    },
+    "topk_weights": {
+      "shape": [
+        "num_tokens",
+        "top_k"
+      ],
+      "dtype": "float32",
+      "description": "Combine weights, consumed as-is."
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "num_tokens",
+        "latent_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Rank-partial weighted combine back to latent space."
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n# ----- reference dependencies -----\n@torch.no_grad()\ndef _unpack_fp4_e2m1(packed: torch.Tensor) -> torch.Tensor:\n    \"\"\"Unpack a uint8 tensor of packed e2m1fn FP4 values into float32.\n\n    Each byte stores two 4-bit values (low nibble = first element along the\n    last axis). The returned tensor has twice the last-dim size of *packed*.\n    \"\"\"\n    # Keep the LUT local so serialized trace references remain standalone.\n    lut = torch.tensor(\n        [\n            0.0,\n            0.5,\n            1.0,\n            1.5,\n            2.0,\n            3.0,\n            4.0,\n            6.0,\n            -0.0,\n            -0.5,\n            -1.0,\n            -1.5,\n            -2.0,\n            -3.0,\n            -4.0,\n            -6.0,\n        ],\n        dtype=torch.float32,\n        device=packed.device,\n    )\n    p = packed.view(torch.uint8).to(torch.int64)\n    lo = lut[p & 0x0F]\n    hi = lut[(p >> 4) & 0x0F]\n    stacked = torch.stack([lo, hi], dim=-1)  # pairs along a new last axis\n    return stacked.reshape(*packed.shape[:-1], packed.shape[-1] * 2)\n\n@torch.no_grad()\ndef _ue8m0_to_float32(scales: torch.Tensor) -> torch.Tensor:\n    \"\"\"Decode UE8M0 (uint8, unsigned exponent-only) scales to float32.\"\"\"\n    e = scales.view(torch.uint8).to(torch.int64)\n    return torch.pow(torch.tensor(2.0, device=scales.device), (e - 127).float())\n\n# ----- reference -----\n@torch.no_grad()\ndef _w4a16_mxfp4_latent_routed_moe_reference(\n    x,\n    w13_packed,\n    w13_scale,\n    w2_packed,\n    w2_scale,\n    topk_ids,\n    topk_weights,\n    **_unused,\n):\n    \"\"\"Reference for the W4A16 mxfp4-g32 latent routed-expert block.\n\n    Exact mxfp4 dequant, gate/up GEMMs, the gated \"situ\" activation\n    (``4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)``) with one bf16 rounding of\n    the activated intermediate, and the weighted combine, all with fp32\n    accumulation.  Only slots with ``topk_ids < E_local`` contribute\n    (rank-partial output).\n    \"\"\"\n    num_local_experts, gated_rows, _ = w13_packed.shape\n    inter = gated_rows // 2\n    xf = x.to(torch.float32)\n    ids = topk_ids.to(torch.int64)\n    tw = topk_weights.to(torch.float32)\n    acc = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)\n    for e in range(num_local_experts):\n        rows, slots = torch.where(ids == e)\n        if rows.numel() == 0:\n            continue\n        w13 = _unpack_fp4_e2m1(w13_packed[e]) * _ue8m0_to_float32(\n            w13_scale[e]\n        ).repeat_interleave(32, dim=-1)\n        w2 = _unpack_fp4_e2m1(w2_packed[e]) * _ue8m0_to_float32(\n            w2_scale[e]\n        ).repeat_interleave(32, dim=-1)\n        xe = xf[rows]\n        g = xe @ w13[:inter].t()\n        u = xe @ w13[inter:].t()\n        h = (4.0 * torch.tanh(g / 4.0) * torch.sigmoid(g)) * (\n            25.0 * torch.tanh(u / 25.0)\n        )\n        h = h.to(torch.bfloat16).to(torch.float32)\n        acc.index_add_(0, rows, (h @ w2.t()) * tw[rows, slots, None])\n    return acc.to(torch.bfloat16)\n",
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
