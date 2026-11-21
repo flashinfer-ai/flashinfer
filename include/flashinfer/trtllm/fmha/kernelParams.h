@@ -760,14 +760,22 @@ struct KernelParams {
     tileShapeKv[1] = numKeysPerTile / reshapeFactorKv;
 
     // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout
-    // (numTokensKvInPagedKv, headDimQk).
+    // (numTokensKvInPagedKv, headDimQk), whose row stride is the token stride of the cache.
     // Token-sparse MQA (not MLA) flattens V the same way with its own base pointer. Its pages
     // hold one token, so the page strides are the row strides: K and V may be views of one row.
     if (options.isSparseMla()) {
+      int64_t const pageStrideOfTokens =
+          static_cast<int64_t>(options.mNumTokensPerPage) * options.kStrideKeysValues;
+      FLASHINFER_CHECK(
+          !options.isMla() || options.kStrideBatch == pageStrideOfTokens,
+          "Sparse MLA with a token stride of %d must have a page stride of %lld, got %d",
+          options.kStrideKeysValues, static_cast<long long>(pageStrideOfTokens),
+          options.kStrideBatch);
       shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
                                      static_cast<uint64_t>(INT_MAX)};
-      strideK = std::vector<uint64_t>{
-          1, static_cast<uint64_t>(options.isMla() ? options.mHeadDimQk : options.kStrideBatch)};
+      strideK =
+          std::vector<uint64_t>{1, static_cast<uint64_t>(options.isMla() ? options.kStrideKeysValues
+                                                                         : options.kStrideBatch)};
       tileShapeKv[1] = 1;
     }
     if (options.isSparseMqa()) {

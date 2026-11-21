@@ -1553,6 +1553,71 @@ def test_trtllm_batch_decode_mla_sparse_compact_query(
     )
 
 
+def _run_sparse_mla_on_token_stride(token_stride, page_stride, dtype, topk=128):
+    torch.manual_seed(42)
+    batch_size, num_heads, head_dim = 2, 16, 576
+    page_size, num_pages = 64, 32
+    num_tokens = num_pages * page_size
+    storage = torch.randn(num_pages * page_stride + token_stride, device="cuda").to(
+        dtype
+    )
+    kv_cache = torch.as_strided(
+        storage,
+        (num_pages, 1, page_size, head_dim),
+        (page_stride, page_stride, token_stride, 1),
+        token_stride - head_dim,
+    )
+    query = torch.randn(batch_size, 1, num_heads, head_dim, device="cuda").to(dtype)
+    indices = torch.randint(
+        0, num_tokens, (batch_size, 1, topk), dtype=torch.int32, device="cuda"
+    )
+    workspace = torch.zeros(workspace_size, dtype=torch.uint8, device="cuda")
+
+    def run(cache):
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=cache,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=indices,
+            seq_lens=torch.full(
+                (batch_size,), num_tokens, dtype=torch.int32, device="cuda"
+            ),
+            max_seq_len=num_tokens,
+            sparse_mla_top_k=topk,
+            bmm1_scale=1.0 / math.sqrt(192),
+            backend="trtllm-gen",
+        )
+
+    return run(kv_cache), run(kv_cache.contiguous())
+
+
+@pytest.mark.parametrize("token_stride", [576, 576 * 3, 576 * 3 + 32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("topk", [128, 2048])
+def test_trtllm_batch_decode_sparse_mla_token_stride(token_stride, dtype, topk):
+    """Sparse MLA over tokens spaced token_stride apart matches a packed copy."""
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
+    strided, packed = _run_sparse_mla_on_token_stride(
+        token_stride, 64 * token_stride, dtype, topk
+    )
+    torch.testing.assert_close(strided, packed, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("token_stride", [576, 608])
+def test_trtllm_batch_decode_sparse_mla_rejects_padded_pages(token_stride):
+    """Sparse MLA refuses pages with padding between them."""
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
+    with pytest.raises(RuntimeError, match="must have a page stride"):
+        _run_sparse_mla_on_token_stride(
+            token_stride, 64 * token_stride + 576, torch.bfloat16
+        )
+
+
 def test_trtllm_batch_decode_mla_sparse_cum_seq_lens_q():
     trtllm_batch_decode_mla_sparse(
         batch_size=2,
