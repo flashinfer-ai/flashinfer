@@ -3313,8 +3313,8 @@ def testUnifiedNvfp4Moe(args):
     from tests.moe.test_cute_dsl_fused_moe import (
         check_accuracy,
         compute_reference_moe_fp4,
-        create_moe_tensors,
     )
+    from tests.moe.utils import create_moe_activation_tensors
 
     # Wide-EP (MVP): model a single rank as a complete MoE over its
     # local_num_experts experts — route the activation WITHIN the local experts
@@ -3325,12 +3325,10 @@ def testUnifiedNvfp4Moe(args):
     # experts <= local). For EP=1 (local == global) this is unchanged.
     routing_num_experts = local_num_experts
     routing_top_k = min(top_k, local_num_experts)
-    cute_dsl_data = create_moe_tensors(
+    cute_dsl_data = create_moe_activation_tensors(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
         num_experts=routing_num_experts,
-        num_local_experts=local_num_experts,
         top_k=routing_top_k,
         device=device,
     )
@@ -3399,8 +3397,8 @@ def testUnifiedNvfp4Moe(args):
     if args.refcheck:
         ref_output = compute_reference_moe_fp4(
             hidden_states=cute_dsl_data["x_bf16"].float().to(device),
-            gemm1_weights=w1_bf16.float().to(device),
-            gemm2_weights=w2_bf16.float().to(device),
+            gemm1_weights=w1_bf16,
+            gemm2_weights=w2_bf16,
             token_selected_experts=local_topk_ids,
             token_final_scales=act_pack.topk_weights,
             num_tokens=num_tokens,
@@ -3408,7 +3406,7 @@ def testUnifiedNvfp4Moe(args):
             top_k=routing_top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            fc2_input_scale=cute_dsl_data["fc2_input_scale"],
+            fc2_input_scale=torch.ones(1, dtype=torch.float32, device=device),
         )
 
     # ---- Per-backend best-tactic timing (one result row per candidate) ----
