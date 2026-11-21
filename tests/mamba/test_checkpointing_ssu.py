@@ -986,7 +986,111 @@ def test_autotune_quantized_scratch_forwards_monolith(monkeypatch, tmp_path):
     assert forwarded_tactics == [selected_tactic]
 
 
-def test_two_kernel_d_split2():
+@pytest.fixture
+def main_control_call(monkeypatch):
+    """Exercise the public Python path while recording the native boundary."""
+    import importlib
+    from types import SimpleNamespace
+
+    module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
+    native_calls, tuning_calls = [], []
+    native = SimpleNamespace(checkpointing_ssu=lambda *args: native_calls.append(args))
+    monkeypatch.setattr(module, "_get_module", lambda *args: native)
+    monkeypatch.setattr(module, "_sm_count", lambda device: 48)
+
+    def choose_one(name, runners, config, inputs):
+        tuning_calls.append(name)
+        return runners[0], -1
+
+    monkeypatch.setattr(module.AutoTuner.get(), "choose_one", choose_one)
+    state = torch.empty(2, 4, 64, 128, dtype=torch.float16)
+    x = torch.empty(1, 2, 4, 64, dtype=torch.bfloat16)
+    kwargs = dict(
+        state=state,
+        x_cache=torch.empty(2, 4, 10, 64, dtype=x.dtype),
+        B_cache=torch.empty(2, 1, 10, 128, dtype=x.dtype),
+        dt_cache=torch.empty(2, 4, 10),
+        ring_start=torch.zeros(2, dtype=torch.int32),
+        prev_num_accepted_tokens=torch.zeros(2, dtype=torch.int32),
+        x=x,
+        dt=x,
+        A=torch.empty(4, 64, 128),
+        B=torch.empty(1, 2, 1, 128, dtype=x.dtype),
+        C=torch.empty(1, 2, 1, 128, dtype=x.dtype),
+        out=torch.empty_like(x),
+    )
+    kwargs.update(_two_kernel_scratch(1, 4, 2, 8, x.dtype, "cpu"))
+    kwargs["algorithm"] = "auto"
+    return module.checkpointing_ssu, kwargs, native_calls, tuning_calls
+
+
+def test_main_controls_default_keeps_autotuning(main_control_call):
+    call, kwargs, native_calls, tuning_calls = main_control_call
+    call(**kwargs)
+    default_call = native_calls.pop()
+    call(**kwargs, main_pipeline_stages=0, main_ctas_per_sm=0)
+    assert tuning_calls == ["checkpointing_ssu", "checkpointing_ssu"]
+    assert all(
+        a is b or a == b for a, b in zip(default_call, native_calls[0], strict=False)
+    )
+    assert native_calls[0][-2:] == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "stages,ctas_per_sm", [(2, 4), (2, 5), (2, 2147483647), (1, 0), (0, 4)]
+)
+def test_main_controls_reach_native_without_tuning(
+    main_control_call, stages, ctas_per_sm
+):
+    call, kwargs, native_calls, tuning_calls = main_control_call
+    call(
+        **kwargs,
+        d_split=2,
+        precompute_heads_per_cta=1,
+        main_pipeline_stages=stages,
+        main_ctas_per_sm=ctas_per_sm,
+    )
+    assert tuning_calls == []
+    assert native_calls[0][-3:] == (1, stages, ctas_per_sm)
+    assert native_calls[0][-8] == 2
+    assert all(value is not None for value in native_calls[0][-6:-3])
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"main_pipeline_stages": -1},
+        {"main_pipeline_stages": 3},
+        {"main_pipeline_stages": 1.0},
+        {"main_ctas_per_sm": -1},
+        {"main_ctas_per_sm": 2147483648},
+        {"main_ctas_per_sm": 1.0},
+        {"main_pipeline_stages": 2, "algorithm": "monolith"},
+    ],
+)
+def test_main_controls_reject_invalid_values(main_control_call, controls):
+    call, kwargs, native_calls, tuning_calls = main_control_call
+    kwargs.update(controls)
+    with pytest.raises(ValueError):
+        call(**kwargs)
+    assert native_calls == tuning_calls == []
+
+
+@pytest.mark.parametrize("unsupported", ["missing_scratch", "state_float64"])
+def test_main_controls_require_supported_split(main_control_call, unsupported):
+    call, kwargs, native_calls, tuning_calls = main_control_call
+    if unsupported == "missing_scratch":
+        for name in ("cb_scaled", "cumAdt_vec", "cb_old"):
+            kwargs.pop(name)
+    else:
+        kwargs["state"] = kwargs["state"].double()
+    with pytest.raises(ValueError, match="two-kernel"):
+        call(**kwargs, main_pipeline_stages=2, main_ctas_per_sm=4)
+    assert native_calls == tuning_calls == []
+
+
+@pytest.mark.parametrize("main_stages,main_ctas", [(0, 0), (1, 1), (2, 4), (2, 5)])
+def test_two_kernel_d_split2(main_stages, main_ctas):
     """Two-kernel split with d_split=2 must match d_split=1 bit-for-bit.
 
     d_split=2 halves D_PER_CTA (64→32), doubling the CTA count for better
@@ -1031,7 +1135,7 @@ def test_two_kernel_d_split2():
             dt1_proc[slot],
         )
 
-    def _run(k, *, d_split):
+    def _run(k, *, d_split, stages=0, ctas=0):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
         dt2 = repeat(
@@ -1061,6 +1165,8 @@ def test_two_kernel_d_split2():
             dt_bias=dt_bias,
             dt_softplus=True,
             d_split=d_split,
+            main_pipeline_stages=stages,
+            main_ctas_per_sm=ctas,
             **_two_kernel_scratch(batch, nheads, T, max_window, dtype, device),
         )
         return out, st, xc, bc, dtc
@@ -1068,7 +1174,7 @@ def test_two_kernel_d_split2():
     names = ("out", "state", "x_cache", "B_cache", "dt_cache")
     for k in (0, 2, T):
         ref = _run(k, d_split=1)
-        test = _run(k, d_split=2)
+        test = _run(k, d_split=2, stages=main_stages, ctas=main_ctas)
         for name, r, t in zip(names, ref, test, strict=True):
             torch.testing.assert_close(
                 t, r, rtol=2e-2, atol=5e-1, msg=f"{name} mismatch at k={k}"
@@ -2293,7 +2399,7 @@ def test_checkpointing_ssu_philox_with_checkpoint(
     )
 
 
-def _flush_fp8_slot_without_update(state, scales, philox_rounds):
+def _flush_quantized_slot_without_update(state, scales, philox_rounds, sr_rng):
     """Flush slot 1 through a recurrence that adds nothing and decays nothing."""
     device = state.device
     _, nheads, dim, dstate = state.shape
@@ -2327,16 +2433,17 @@ def _flush_fp8_slot_without_update(state, scales, philox_rounds):
         if philox_rounds
         else None,
         philox_rounds=philox_rounds,
+        sr_rng=sr_rng,
         enable_pdl=False,
     )
     return out
 
 
-@pytest.mark.parametrize("philox_rounds", [0, 5])
-def test_checkpointing_ssu_fp8_flush_keeps_valid_scales(philox_rounds):
+@pytest.mark.parametrize(
+    "philox_rounds,sr_rng", [(0, "philox"), (5, "philox"), (5, "shared_seed")]
+)
+def test_checkpointing_ssu_fp8_flush_keeps_valid_scales(philox_rounds, sr_rng):
     """A no-op recurrence must preserve tiny FP8 states across a flush."""
-    if philox_rounds and not is_cvt_rs_supported():
-        pytest.skip(f"FP8 SR requires HW cvt.rs on {cvt_rs_supported_arches_text()}")
     device = "cuda"
     nheads, dim, dstate = 16, 64, 128
     floor = 2.0**-117
@@ -2348,7 +2455,7 @@ def test_checkpointing_ssu_fp8_flush_keeps_valid_scales(philox_rounds):
     scales[1] = amplitudes[row_case]
     before = state[1].float() * scales[1, ..., None]
 
-    out = _flush_fp8_slot_without_update(state, scales, philox_rounds)
+    out = _flush_quantized_slot_without_update(state, scales, philox_rounds, sr_rng)
 
     expected_scales = torch.tensor([1.0, floor, floor, 1.0], device=device)[row_case]
     expected_state = torch.tensor([0.0, 0.5, 448.0, 448.0], device=device)[row_case]
@@ -2365,11 +2472,13 @@ def test_checkpointing_ssu_fp8_flush_keeps_valid_scales(philox_rounds):
     assert torch.count_nonzero(out) == 0
 
 
-@pytest.mark.parametrize("philox_rounds", [0, 5])
-def test_checkpointing_ssu_fp8_flush_tiny_row_with_zeros_stays_finite(philox_rounds):
+@pytest.mark.parametrize(
+    "philox_rounds,sr_rng", [(0, "philox"), (5, "philox"), (5, "shared_seed")]
+)
+def test_checkpointing_ssu_fp8_flush_tiny_row_with_zeros_stays_finite(
+    philox_rounds, sr_rng
+):
     """A tiny row with exact zeros must not encode 0 * inf as an FP8 NaN."""
-    if philox_rounds and not is_cvt_rs_supported():
-        pytest.skip(f"FP8 SR requires HW cvt.rs on {cvt_rs_supported_arches_text()}")
     device = "cuda"
     nheads, dim, dstate = 16, 64, 128
     # An unbounded encode scale, 448 / 2^-122, overflows FP32.
@@ -2379,7 +2488,7 @@ def test_checkpointing_ssu_fp8_flush_tiny_row_with_zeros_stays_finite(philox_rou
     scales[1] = 2.0**-122
     before = state[1].float() * scales[1, ..., None]
 
-    _flush_fp8_slot_without_update(state, scales, philox_rounds)
+    _flush_quantized_slot_without_update(state, scales, philox_rounds, sr_rng)
 
     assert not torch.isnan(state[1].float()).any()
     torch.testing.assert_close(
@@ -6045,3 +6154,445 @@ def test_checkpointing_ssu_continuous_dA_cumsum_multistep():
             atol=5e-1,
             msg=f"output mismatch at step {step + 1} (prev_k={prev_k})",
         )
+
+
+_PADDING_HISTORY_CASES = [
+    (state_dtype, rounds, algorithm)
+    for state_dtype, rounds in (
+        (torch.bfloat16, 0),
+        (torch.float32, 0),
+        (torch.float16, 0),
+        (torch.float16, 5),
+    )
+    for algorithm in ("monolith", "two-kernel")
+] + [
+    (state_dtype, rounds, "monolith")
+    for state_dtype in (torch.int8, torch.float8_e4m3fn)
+    for rounds in (0, 5)
+]
+
+
+@pytest.mark.parametrize("state_dtype,rounds,algorithm", _PADDING_HISTORY_CASES)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_checkpointing_ssu_ignores_inactive_ring_rows(
+    state_dtype, rounds, algorithm, enable_pdl
+):
+    """Future append rows must not enter replay as NaN * zero.
+
+    Compare clean and NaN-poisoned padding with the same kernel, including
+    software SR, without a model checkpoint or hardware-only reference.
+    """
+    from flashinfer.utils import device_support_pdl
+
+    if enable_pdl and not device_support_pdl(torch.device("cuda")):
+        pytest.skip("PDL requires a supported CUDA device")
+    if state_dtype == torch.float8_e4m3fn and _get_sm_version() < 89:
+        pytest.skip("FP8 state requires SM89+")
+    device, dtype = "cuda", torch.bfloat16
+    batch, slots, nheads, ngroups, dim, dstate, T, window = 1, 3, 16, 1, 64, 128, 8, 16
+    torch.manual_seed(42)
+    source = torch.randn(slots, nheads, dim, dstate, device=device) * 0.03
+    quantized = state_dtype in (torch.int8, torch.float8_e4m3fn)
+    if quantized:
+        state0, scales0 = _quantize_state(
+            source, state_dtype, 127.0 if state_dtype == torch.int8 else 448.0
+        )
+    else:
+        state0, scales0 = source.to(state_dtype), None
+    starts = torch.full((slots,), 23, device=device, dtype=torch.int32)
+    previous = torch.tensor([0, 9, 0], device=device, dtype=torch.int32)
+    indices = torch.tensor([1], device=device, dtype=torch.int32)
+    x0, B0, dt0, _ = _make_ring_caches(
+        slots, nheads, ngroups, dim, dstate, window, T, dtype, device, starts
+    )
+    x0.mul_(0.01)
+    B0.mul_(0.01)
+    x = torch.randn(batch, T, nheads, dim, device=device, dtype=dtype) * 0.01
+    dt = repeat(
+        torch.randn(batch, T, nheads, device=device, dtype=dtype),
+        "b t h -> b t h p",
+        p=dim,
+    )
+    A = repeat(-torch.rand(nheads, device=device) - 0.5, "h -> h p n", p=dim, n=dstate)
+    B = torch.randn(batch, T, ngroups, dstate, device=device, dtype=dtype) * 0.01
+    C = torch.randn_like(B) * 0.01
+    seed = (
+        torch.tensor([0x12345678], device=device, dtype=torch.int64) if rounds else None
+    )
+    readonly = [x, dt, A, B, C, starts, previous, indices]
+    if seed is not None:
+        readonly.append(seed)
+    unchanged = [value.clone() for value in readonly]
+
+    def run(poison):
+        state, xc, Bc, dtc = (value.clone() for value in (state0, x0, B0, dt0))
+        scales = scales0.clone() if scales0 is not None else None
+        if poison:
+            # h9/start23 appends logical9..16: all poisoned9..15 are overwritten.
+            rows = (23 + torch.arange(9, 16, device=device)) % (window + T)
+            xc[1, :, rows, :] = float("nan")
+            Bc[1, :, rows, :] = float("nan")
+            dtc[1, :, rows] = float("nan")
+        out = torch.empty_like(x)
+        scratch = (
+            _two_kernel_scratch(batch, nheads, T, window, dtype, device)
+            if algorithm == "two-kernel"
+            else {}
+        )
+        with autotune(False, skip_ops={"checkpointing_ssu"}):
+            checkpointing_ssu(
+                state,
+                xc,
+                Bc,
+                dtc,
+                starts,
+                previous,
+                x,
+                dt,
+                A,
+                B,
+                C,
+                out,
+                dt_softplus=True,
+                state_batch_indices=indices,
+                state_scale=scales,
+                rand_seed=seed,
+                philox_rounds=rounds,
+                d_split=1,
+                enable_pdl=enable_pdl,
+                **(scratch if scratch else {"algorithm": algorithm}),
+            )
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all()
+        decoded = state.float() * scales[..., None] if quantized else state.float()
+        assert torch.isfinite(decoded).all()
+        if quantized:
+            assert torch.isfinite(scales).all() and (scales > 0).all()
+        return [out, state, xc, Bc, dtc] + ([scales] if quantized else [])
+
+    clean, poisoned = run(False), run(True)
+    for expected, actual in zip(clean, poisoned, strict=True):
+        assert torch.equal(
+            expected.contiguous().view(torch.uint8),
+            actual.contiguous().view(torch.uint8),
+        )
+    for expected, actual in zip(unchanged, readonly, strict=True):
+        assert torch.equal(expected, actual)
+
+
+def test_checkpointing_ssu_fp8_software_sr_bitwise():
+    """Compare the changed software helper with the independent old scalar body."""
+    if _get_sm_version() < 89:
+        pytest.skip("FP8 state requires SM89+")
+    if is_cvt_rs_supported():
+        pytest.skip(
+            "This target uses the packed hardware SR path; software path tested separately"
+        )
+    from .checkpointing_ssu_sr_probe import verify_software_sr
+
+    coverage = verify_software_sr()
+    assert coverage["pairs"] == 32571392
+
+
+@pytest.mark.parametrize(
+    "state_dtype,algorithm",
+    [
+        (torch.float16, "monolith"),
+        (torch.float16, "two-kernel"),
+        (torch.float8_e4m3fn, "monolith"),
+        (torch.int8, "monolith"),
+    ],
+)
+@pytest.mark.parametrize("history", [8, 9, 16])
+def test_checkpointing_ssu_shared_seed_policy(state_dtype, algorithm, history):
+    """The RNG policy changes persistent rounding, never the current RN readout."""
+    if state_dtype == torch.float8_e4m3fn and _get_sm_version() < 89:
+        pytest.skip("FP8 state requires SM89+")
+    if algorithm == "two-kernel":
+        from flashinfer.utils import device_support_pdl
+
+        if not device_support_pdl(torch.device("cuda")):
+            pytest.skip("The public split requires internal PDL support")
+    device, dtype = "cuda", torch.bfloat16
+    slots, nheads, ngroups, dim, dstate, T, window = 3, 128, 8, 64, 128, 8, 16
+    torch.manual_seed(123)
+    source = torch.randn(slots, nheads, dim, dstate, device=device) * 0.03
+    quantized = state_dtype in (torch.int8, torch.float8_e4m3fn)
+    if quantized:
+        state0, scales0 = _quantize_state(
+            source, state_dtype, 127.0 if state_dtype == torch.int8 else 448.0
+        )
+    else:
+        state0, scales0 = source.to(state_dtype), None
+    starts = torch.full((slots,), 23, device=device, dtype=torch.int32)
+    previous = torch.tensor([0, history, 0], device=device, dtype=torch.int32)
+    indices = torch.tensor([1], device=device, dtype=torch.int32)
+    x0, B0, dt0, _ = _make_ring_caches(
+        slots, nheads, ngroups, dim, dstate, window, T, dtype, device, starts
+    )
+    x0.mul_(0.01)
+    B0.mul_(0.01)
+    x = torch.randn(1, T, nheads, dim, device=device, dtype=dtype) * 0.01
+    dt = repeat(
+        torch.randn(1, T, nheads, device=device, dtype=dtype),
+        "b t h -> b t h p",
+        p=dim,
+    )
+    A = repeat(-torch.rand(nheads, device=device) - 0.5, "h -> h p n", p=dim, n=dstate)
+    B = torch.randn(1, T, ngroups, dstate, device=device, dtype=dtype) * 0.01
+    C = torch.randn_like(B) * 0.01
+    seed = torch.tensor([0x12345678], device=device, dtype=torch.int64)
+    readonly = [x, dt, A, B, C, starts, previous, indices, seed]
+    untouched = [value.clone() for value in readonly]
+
+    def run(mode, *, poison=False, seed_value=None, rounds=5, omit_seed=False):
+        state, xc, Bc, dtc = (value.clone() for value in (state0, x0, B0, dt0))
+        scales = scales0.clone() if scales0 is not None else None
+        if poison:
+            rows = (23 + torch.arange(9, 16, device=device)) % (window + T)
+            xc[1, :, rows, :] = float("nan")
+            Bc[1, :, rows, :] = float("nan")
+            dtc[1, :, rows] = float("nan")
+        out = torch.empty_like(x)
+        scratch = (
+            _two_kernel_scratch(1, nheads, T, window, dtype, device)
+            if algorithm == "two-kernel"
+            else {"algorithm": "monolith"}
+        )
+        noise = seed if seed_value is None else torch.full_like(seed, seed_value)
+        with autotune(False, skip_ops={"checkpointing_ssu"}):
+            checkpointing_ssu(
+                state,
+                xc,
+                Bc,
+                dtc,
+                starts,
+                previous,
+                x,
+                dt,
+                A,
+                B,
+                C,
+                out,
+                dt_softplus=True,
+                state_batch_indices=indices,
+                state_scale=scales,
+                rand_seed=(
+                    noise
+                    if (mode == "shared_seed" or rounds or seed_value is not None)
+                    and not omit_seed
+                    else None
+                ),
+                **({"philox_rounds": rounds} if rounds is not None else {}),
+                d_split=1,
+                enable_pdl=False,
+                **({"sr_rng": mode} if mode else {}),
+                **scratch,
+            )
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all()
+        assert torch.isfinite(state.float()).all()
+        if quantized:
+            assert torch.isfinite(scales).all() and (scales > 0).all()
+        return [out, state, xc, Bc, dtc] + ([scales] if quantized else [])
+
+    def exact(expected, actual):
+        return torch.equal(
+            expected.contiguous().view(torch.uint8),
+            actual.contiguous().view(torch.uint8),
+        )
+
+    philox, shared = run("philox"), run("shared_seed")
+    assert exact(philox[0], shared[0])
+    for left, right in zip(philox[2:], shared[2:], strict=True):
+        assert exact(left, right)  # Ring append and row scales do not use SR bits.
+    for slot in (0, 2):
+        assert exact(philox[1][slot], shared[1][slot])
+    if history + T <= window:
+        assert exact(philox[1], shared[1])
+    else:
+        assert not exact(philox[1][1], shared[1][1])
+        lo, hi = (
+            run("shared_seed", seed_value=0),
+            run("shared_seed", seed_value=0xFFFFFFFF),
+        )
+        assert exact(lo[0], hi[0]) and not exact(lo[1][1], hi[1][1])
+    repeated = run("shared_seed")
+    assert all(exact(a, b) for a, b in zip(shared, repeated, strict=True))
+    for rounds in (None, 0, 10):
+        normalized = run("shared_seed", rounds=rounds)
+        assert all(exact(a, b) for a, b in zip(shared, normalized, strict=True))
+    if history == 9:
+        poisoned = run("shared_seed", poison=True)
+        assert all(exact(a, b) for a, b in zip(shared, poisoned, strict=True))
+    implicit, explicit = run(None, rounds=0), run("philox", rounds=0)
+    assert all(exact(a, b) for a, b in zip(implicit, explicit, strict=True))
+    no_seed_default = run(None, rounds=None)
+    assert all(exact(a, b) for a, b in zip(implicit, no_seed_default, strict=True))
+    for expected, actual in zip(untouched, readonly, strict=True):
+        assert torch.equal(expected, actual)
+    if history == 8 and algorithm == "monolith":
+        with pytest.raises(ValueError, match="sr_rng must"):
+            run("unknown")
+        with pytest.raises(ValueError, match="nonnegative philox_rounds"):
+            run("shared_seed", rounds=-1)
+        with pytest.raises(ValueError, match="requires rand_seed"):
+            run("shared_seed", rounds=0, omit_seed=True)
+        with pytest.raises(AssertionError, match="philox_rounds must be > 0"):
+            run("philox", rounds=0, seed_value=0)
+        with pytest.raises(AssertionError, match="philox_rounds must be > 0"):
+            run("philox", rounds=-1)
+        if state_dtype == torch.float16:
+            original_state = state0
+            for unsupported in (torch.bfloat16, torch.float32):
+                state0 = original_state.to(unsupported)
+                with pytest.raises(
+                    ValueError, match="supports FP16, FP8 E4M3 and INT8"
+                ):
+                    run("shared_seed")
+            state0 = original_state
+
+
+def test_checkpointing_ssu_shared_seed_jit_contract(monkeypatch, tmp_path):
+    """The RNG policy is part of the JIT key; only shared_seed gets its flag."""
+    from flashinfer.jit.mamba import checkpointing_ssu as jit
+
+    requests = []
+    monkeypatch.setattr(jit.jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
+    monkeypatch.setattr(jit, "_arch_flags", lambda: [])
+
+    def spec(uri, sources, **kwargs):
+        requests.append((uri, sources, kwargs))
+        return requests[-1]
+
+    monkeypatch.setattr(jit, "gen_jit_spec", spec)
+    flag = "-DFLASHINFER_MAMBA_SR_SHARED_SEED=1"
+    for state_dtype in (torch.float16, torch.float8_e4m3fn, torch.int8):
+        args = (
+            state_dtype,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            torch.int32,
+            None if state_dtype == torch.float16 else torch.float32,
+            64,
+            128,
+            8,
+            16,
+            16,
+            1,
+            5,
+            False,
+        )
+        default = jit.get_checkpointing_ssu_uri(*args)
+        assert default == jit.get_checkpointing_ssu_uri(*args, sr_rng="philox")
+        assert (
+            jit.get_checkpointing_ssu_uri(*args, sr_rng="shared_seed")
+            == default + "_sr_shared_seed"
+        )
+        phi = jit.gen_checkpointing_ssu_module(*args, sr_rng="philox")
+        cheap = jit.gen_checkpointing_ssu_module(*args, sr_rng="shared_seed")
+        assert flag not in phi[2]["extra_cuda_cflags"]
+        assert flag in cheap[2]["extra_cuda_cflags"]
+        assert len(cheap[1]) == 3 and all(path.is_file() for path in cheap[1])
+        base = args[:-2]
+        shared_default = jit.gen_checkpointing_ssu_module(*base, sr_rng="shared_seed")
+        shared_ten = jit.gen_checkpointing_ssu_module(
+            *base, philox_rounds=10, sr_rng="shared_seed"
+        )
+        shared_zero = jit.gen_checkpointing_ssu_module(
+            *base, philox_rounds=0, sr_rng="shared_seed"
+        )
+        assert shared_default[0] == shared_zero[0] == shared_ten[0]
+        assert shared_default[0] != cheap[0]
+        assert (
+            shared_default[0]
+            == jit.get_checkpointing_ssu_uri(*base, sr_rng="shared_seed")
+            == jit.get_checkpointing_ssu_uri(
+                *base, philox_rounds=10, sr_rng="shared_seed"
+            )
+        )
+        assert shared_zero[0] == jit.get_checkpointing_ssu_uri(
+            *base, philox_rounds=0, sr_rng="shared_seed"
+        )
+        assert (
+            "PHILOX_ROUNDS = 10;"
+            in (
+                tmp_path / shared_default[0] / "checkpointing_ssu_config.inc"
+            ).read_text()
+        )
+        phi_default = jit.gen_checkpointing_ssu_module(*base)
+        assert phi_default[0] == jit.get_checkpointing_ssu_uri(*base)
+        assert "_pr_" not in phi_default[0]
+        for factory in (
+            jit.get_checkpointing_ssu_uri,
+            jit.gen_checkpointing_ssu_module,
+        ):
+            with pytest.raises(ValueError, match="nonnegative"):
+                factory(*base, philox_rounds=-1, sr_rng="shared_seed")
+            for unsupported in (torch.bfloat16, torch.float32):
+                with pytest.raises(ValueError, match="FP16, FP8 E4M3 or INT8"):
+                    factory(unsupported, *base[1:], sr_rng="shared_seed")
+
+
+@pytest.mark.parametrize(
+    "philox_rounds,sr_rng", [(0, "philox"), (5, "philox"), (5, "shared_seed")]
+)
+def test_checkpointing_ssu_int8_flush_keeps_tiny_scales(philox_rounds, sr_rng):
+    """INT8 overflow/FTZ and reciprocal-boundary cases use the real flush path."""
+    import struct
+
+    device = "cuda"
+    nheads, dim, dstate = 16, 64, 128
+    minimum = 2.0**-126
+    threshold = 127.0 * minimum
+    bits = struct.unpack("I", struct.pack("f", threshold))[0]
+    adjacent = [struct.unpack("f", struct.pack("I", bits + d))[0] for d in (-1, 0, 1)]
+    amplitudes = torch.tensor(
+        [1.0, minimum, 2.0**-122, 2.0**-120, *adjacent, 1.0, 127.0],
+        device=device,
+        dtype=torch.float32,
+    )
+    row_case = torch.arange(nheads * dim, device=device).reshape(nheads, dim) % 9
+    pattern = torch.tensor([0, 1, -1, 0], device=device, dtype=torch.int8).repeat(
+        dstate // 4
+    )
+    state = torch.full((2, nheads, dim, dstate), 7, device=device, dtype=torch.int8)
+    state[1] = pattern
+    state[1][row_case == 0] = 0
+    scales = torch.ones(2, nheads, dim, device=device)
+    scales[1] = amplitudes[row_case]
+    before = state[1].float() * scales[1, ..., None]
+    inactive_state, inactive_scales = state[0].clone(), scales[0].clone()
+
+    # Reuse the shared no-update flush helper for both quantized state types.
+    out = _flush_quantized_slot_without_update(state, scales, philox_rounds, sr_rng)
+
+    decoded = state[1].float() * scales[1, ..., None]
+    assert torch.isfinite(scales).all() and (scales > 0).all()
+    assert torch.all(scales[1] >= minimum)  # Actual reciprocal/FTZ boundary.
+    assert torch.isfinite(decoded).all() and torch.isfinite(out).all()
+    assert torch.equal(state[0], inactive_state)
+    assert torch.equal(scales[0], inactive_scales)
+    assert torch.count_nonzero(state[1][row_case == 0]) == 0
+    assert torch.all(scales[1][row_case == 0] == 1.0)
+    assert torch.count_nonzero(state[1][..., ::4]) == 0
+    assert torch.count_nonzero(state[1][..., 3::4]) == 0
+    for case, code in ((1, 1), (2, 16), (3, 64)):
+        rows = row_case == case
+        assert torch.all(scales[1][rows] == minimum)
+        torch.testing.assert_close(
+            state[1][rows], (pattern * code).expand_as(state[1][rows]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(decoded[rows], before[rows], rtol=0, atol=0)
+    boundary = (row_case >= 4) & (row_case <= 6)
+    # Compare in quantization-step units so tiny absolute differences are not
+    # themselves FTZ. RN permits half a step; SR permits either neighbor.
+    scaled_reference = before[boundary] / scales[1][boundary, None]
+    margin = 8 * torch.finfo(torch.float32).eps * 127.0
+    bound = (1.0 if philox_rounds else 0.5) + margin
+    assert torch.all((state[1][boundary].float() - scaled_reference).abs() <= bound)
+    ordinary = row_case >= 7
+    torch.testing.assert_close(decoded[ordinary], before[ordinary], rtol=1e-6, atol=0)
+    assert torch.count_nonzero(out) == 0

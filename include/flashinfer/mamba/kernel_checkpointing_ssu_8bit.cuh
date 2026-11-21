@@ -20,6 +20,7 @@
 // storage, replay, encode, output, and __global__ kernel.
 
 #include "kernel_checkpointing_ssu_common.cuh"
+#include "stochastic_rounding.cuh"
 
 namespace flashinfer::mamba::checkpointing {
 
@@ -516,6 +517,12 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
       denominator = (a < MINIMUM_AMAX) ? MINIMUM_AMAX : a;
     }
     encode_scale_per_row[i] = (a == 0.f) ? 1.f : (QUANT_MAX / denominator);
+    if constexpr (std::is_same_v<state_t, int8_t>) {
+      // INT8's smallest nonzero code is 1. Bound the actual reciprocal input
+      // so the decoded unit remains normal FP32 under FTZ, including when
+      // approximate division overflows or rounds past the boundary.
+      encode_scale_per_row[i] = fminf(encode_scale_per_row[i], 0x1p126f);
+    }
   }
 
   // ── STG decode_scale (one writer per (cache, head, d_row)).
@@ -563,7 +570,7 @@ template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE
 __device__ __forceinline__ void encode_state_replay_8bit(
     SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t cache_slot, int head, float const (&encode_scale_per_row)[2],
-    float const (&total_scale)[2], int64_t rand_seed, int64_t state_ptr_offset) {
+    float const (&total_scale)[2], int64_t rand_seed, int64_t state_ptr_offset, bool shared_seed) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "encode_state_replay_8bit requires 2-byte input_t");
   static_assert(sizeof(state_t) == 1,
@@ -685,7 +692,7 @@ __device__ __forceinline__ void encode_state_replay_8bit(
       float const e1 = encode_scale_per_row[1];
 
       if constexpr (PHILOX_ROUNDS > 0) {
-        // One Philox4x call yields 4 independent u32s — enough for 4 n-passes
+        // One SR random-source call yields 4 u32s — enough for 4 n-passes
         // when each pass packs all 4 of its 8-bit outputs into one u32 via the
         // dtype-specific x4 cvt_rs (int8: `cvt_rs_sat_s8x4_f32`, 16-bit
         // randomness/elt via bitrev16 trick; fp8 e4m3: `cvt_rs_e4m3x4_f32`,
@@ -694,8 +701,15 @@ __device__ __forceinline__ void encode_state_replay_8bit(
         if (rand_pos == 0) {
           int64_t const philox_off =
               state_ptr_offset + (int64_t)row_lo * DSTATE + (frag_col_base + n_base);
-          conversion::philox_randint4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
-                                                      rand_idx[1], rand_idx[2], rand_idx[3]);
+          // INT8 selects the SR policy at runtime; FP8 selects it at compile time.
+          if constexpr (std::is_same_v<state_t, int8_t>) {
+            conversion::sr_random4x_runtime<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0],
+                                                           rand_idx[1], rand_idx[2], rand_idx[3],
+                                                           shared_seed);
+          } else {
+            conversion::sr_random4x<PHILOX_ROUNDS>(rand_seed, philox_off, rand_idx[0], rand_idx[1],
+                                                   rand_idx[2], rand_idx[3]);
+          }
         }
         // Packed layout: byte 0 = q0_lo, byte 1 = q1_lo (→ row_lo store at off_lo)
         //                byte 2 = q0_hi, byte 3 = q1_hi (→ row_hi store at off_lo + 1024)
@@ -1270,7 +1284,8 @@ __device__ __forceinline__ void ssu_checkpoint_8bit(SmemT& smem,
                                                     CheckpointingSsuParams const& params, int warp,
                                                     int lane, int prev_k, int d_tile,
                                                     int64_t out_seq_base, int head,
-                                                    int64_t cache_slot, float D_val, int seq_len) {
+                                                    int64_t cache_slot, float D_val, int seq_len,
+                                                    bool shared_seed) {
   using namespace cute;
   int const tid = warp * warpSize + lane;
 
@@ -1295,12 +1310,12 @@ __device__ __forceinline__ void ssu_checkpoint_8bit(SmemT& smem,
       smem, params, warp, lane, prev_k, d_tile, cache_slot, head, /*must_checkpoint=*/true,
       frag_y_DxT, encode_scale_per_row, total_scale);
 
-  // ── Philox seed for stochastic rounding (deferred to reduce register pressure) ──
+  // Stochastic-rounding seed, loaded here to reduce register pressure.
   [[maybe_unused]] int64_t const rand_seed = (PHILOX_ROUNDS > 0) ? *params.rand_seed : 0;
   // `state_ptr_offset` is int64 — matches Triton's `base_rand =
   // cache_batch_idx * stride_state_batch + ...` (cache_batch_idx is .to(int64)).
-  // Full 64 bits flow through `philox_randint4x`, which splits low/high
-  // across Philox c0/c1.  No collision risk at large serving cache sizes.
+  // Under the Philox policy, all 64 bits flow through `philox_randint4x`,
+  // which splits low/high across c0/c1. Shared-seed rounding ignores the offset.
   int64_t const state_ptr_offset =
       cache_slot * params.state_stride_seq + (int64_t)head * DIM * DSTATE;
 
@@ -1310,7 +1325,7 @@ __device__ __forceinline__ void ssu_checkpoint_8bit(SmemT& smem,
   // frag_y_DxT stays live through PASS 2 (extra register pressure accepted). ──
   encode_state_replay_8bit<input_t, state_t, DIM, D_PER_CTA, DSTATE, PHILOX_ROUNDS>(
       smem, params, warp, lane, prev_k, d_tile, cache_slot, head, encode_scale_per_row, total_scale,
-      rand_seed, state_ptr_offset);
+      rand_seed, state_ptr_offset, shared_seed);
 
   // ── Single sync: cross-warp visibility for smem.CB_scaled (warps 0,1) /
   // smem.x (warp 2) / smem.z (warp 3) / smem.state (all warps' M-shards). ──
@@ -1342,10 +1357,12 @@ __device__ __forceinline__ void ssu_checkpoint_8bit(SmemT& smem,
 // `store_old_B`, `compute_CB_scaled_2warp`) are reused verbatim — they only
 // touch shared smem fields that both storage structs expose by name.
 //
+// INT8 keeps both SR policies in one runtime-selected body. FP8 selects the
+// existing compile-time policy and does not consume the uniform bool argument.
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int NPREDICTED, int MAX_WINDOW, int DIM,
           int DSTATE, int HEADS_PER_GROUP, int PHILOX_ROUNDS, int NUM_WARPS, bool VARLEN = false>
-__global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
+__global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params, bool shared_seed) {
   using namespace cute;
   static_assert(sizeof(state_t) == 1,
                 "checkpointing_ssu_kernel_8bit requires 1-byte state_t (int8 or fp8 e4m3)");
@@ -1436,14 +1453,14 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   if constexpr (ENABLE_PDL) {
     load_pre_pdl_wait_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                            NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
-                                      ring_start, A_val, dt_bias_val, dt_seq_base, z_seq_base,
-                                      seq_len);
+                                      ring_start, prev_k, A_val, dt_bias_val, dt_seq_base,
+                                      z_seq_base, seq_len);
     cudaGridDependencySynchronize();
     load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
         smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
   } else {
     load_data<input_t, dt_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE, NUM_WARPS>(
-        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, ring_start, A_val,
+        smem, params, lane, warp, d_tile, head, group_idx, cache_slot, ring_start, prev_k, A_val,
         dt_bias_val, outer, seq_len);
   }
 
@@ -1474,7 +1491,7 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   if (must_checkpoint) {
     ssu_checkpoint_8bit<input_t, state_t, NPREDICTED, DIM, D_PER_CTA, DSTATE, NUM_WARPS,
                         PHILOX_ROUNDS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base, head,
-                                       cache_slot, D_val, seq_len);
+                                       cache_slot, D_val, seq_len, shared_seed);
   } else {
     ssu_nocheckpoint_8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, D_PER_CTA, DSTATE,
                           NUM_WARPS>(smem, params, warp, lane, prev_k, d_tile, out_seq_base, head,

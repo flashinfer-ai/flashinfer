@@ -357,7 +357,12 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
         config.stream = stream;
         config.attrs = attrs;
         config.numAttrs = 1;
-        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&config, func, params));
+#if defined(FLASHINFER_MAMBA_SR_SHARED_SEED) && FLASHINFER_MAMBA_SR_SHARED_SEED
+        constexpr bool shared_seed = true;
+#else
+        constexpr bool shared_seed = false;
+#endif
+        FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&config, func, params, shared_seed));
       } else {
         FLASHINFER_CHECK(false,
                          "checkpointing_ssu_kernel_8bit: unsupported D_SPLIT != 1 for 8-bit "
