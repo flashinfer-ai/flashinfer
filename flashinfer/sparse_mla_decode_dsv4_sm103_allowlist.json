@@ -1,0 +1,98 @@
+{
+  "op": "trtllm_batch_decode_sparse_mla_dsv4",
+  "kernel": "sparse_mla_decode_dsv4_sm103",
+  "backends": [
+    "specialized"
+  ],
+  "arch": {
+    "compute_capability": [
+      [
+        10,
+        3
+      ]
+    ]
+  },
+  "contract": {
+    "num_heads": 16,
+    "head_dim": 512,
+    "table_width": 640,
+    "swa_columns": 128,
+    "compressed_columns": 512,
+    "q_dtype": "bfloat16",
+    "kv_dtype": "bfloat16",
+    "swa_page_tokens": 256,
+    "compressed_page_tokens": 64,
+    "index_dtype": "int32",
+    "indices_are_storage_offsets": true,
+    "bmm1_scale": 0.044194173824159216,
+    "bmm2_scale": 1.0,
+    "sinks_dtype": "float32"
+  },
+  "auto_route_keys": [
+    {
+      "batch_size": 1,
+      "max_q_len": 6,
+      "num_tokens": 6
+    },
+    {
+      "batch_size": 2,
+      "max_q_len": 6,
+      "num_tokens": 12
+    },
+    {
+      "batch_size": 3,
+      "max_q_len": 6,
+      "num_tokens": 18
+    },
+    {
+      "batch_size": 4,
+      "max_q_len": 6,
+      "num_tokens": 24
+    },
+    {
+      "batch_size": 5,
+      "max_q_len": 6,
+      "num_tokens": 30
+    },
+    {
+      "batch_size": 6,
+      "max_q_len": 6,
+      "num_tokens": 36
+    },
+    {
+      "batch_size": 7,
+      "max_q_len": 6,
+      "num_tokens": 42
+    },
+    {
+      "batch_size": 8,
+      "max_q_len": 6,
+      "num_tokens": 48
+    },
+    {
+      "batch_size": 9,
+      "max_q_len": 6,
+      "num_tokens": 54
+    },
+    {
+      "batch_size": 10,
+      "max_q_len": 6,
+      "num_tokens": 60
+    },
+    {
+      "batch_size": 11,
+      "max_q_len": 6,
+      "num_tokens": 66
+    },
+    {
+      "batch_size": 12,
+      "max_q_len": 6,
+      "num_tokens": 72
+    },
+    {
+      "batch_size": 13,
+      "max_q_len": 6,
+      "num_tokens": 78
+    }
+  ]
+}
