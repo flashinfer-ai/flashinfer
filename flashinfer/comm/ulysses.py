@@ -283,9 +283,14 @@ class UlyssesQKVWorkspace:
 
     ``qkv_shape``, ``world_size``, ``dtype``, ``device``, ``used_sequence``,
     ``quantization`` and ``layout`` describe the prepared operation.
-    ``transport`` is always ``"nccl"``, independently of the ordinary
-    scatter/gather backend. Storage follows PyTorch tensor lifetimes and
-    owns neither an extra process group nor a separate close protocol.
+    ``transport`` names the payload transport: ``"nccl"`` on the NCCL and
+    NVLink backends, ``"pcie"`` on the multi-rank PCIe backend (its route is
+    the owner's :attr:`~UlyssesCommunicator.transport`). On NCCL/NVLink,
+    storage follows PyTorch tensor lifetimes and owns neither an extra
+    process group nor a separate close protocol. On PCIe, the receive storage
+    (and, on the hybrid and all-RDMA routes, the send storage) is the owner's
+    single registered QKV slot, shared by every workspace it prepares and
+    registered until the owner's :meth:`~UlyssesCommunicator.close`.
     """
 
     qkv_shape: Tuple[int, int, int, int]
@@ -307,6 +312,8 @@ class UlyssesQKVWorkspace:
     _send_buffer: torch.Tensor
     _recv_buffer: torch.Tensor
     _stats_gather: torch.Tensor
+    _exchange_vote: Optional[torch.Tensor]
+    _vote_stream: Optional[torch.cuda.Stream]
 
     def __init__(self):
         raise TypeError("use UlyssesCommunicator.prepare_qkv() to create a workspace")
@@ -355,7 +362,7 @@ class UlyssesQKVWorkspace:
             used_sequence=used_sequence,
             quantization="sage2",
             layout=layout,
-            transport="nccl",
+            transport="pcie" if owner.backend == "pcie" else "nccl",
             _owner=owner,
             _layout_impl=layout_impl,
             _q_scale_offset=int(spec["q_scale_offset"]),
@@ -370,17 +377,30 @@ class UlyssesQKVWorkspace:
                 else lowp.get_ulysses_lowp_module()
             )
             values["_enable_pdl"] = bool(lowp.device_support_pdl(owner.device))
-            values["_send_buffer"] = torch.empty(
-                wire_shape, dtype=torch.uint8, device=owner.device
-            )
-            recv = owner.allocate_output(
-                values["_send_buffer"].view(1, 1, *wire_shape),
-                "exchange_chunks",
-                dtype=torch.uint8,
-            )
-            values["_recv_buffer"] = recv.view(wire_shape)
+            if owner.backend == "pcie":
+                send, recv = owner._qkv_pcie_wire(wire_shape)
+                values["_send_buffer"] = send
+                values["_recv_buffer"] = recv
+            else:
+                values["_send_buffer"] = torch.empty(
+                    wire_shape, dtype=torch.uint8, device=owner.device
+                )
+                recv = owner.allocate_output(
+                    values["_send_buffer"].view(1, 1, *wire_shape),
+                    "exchange_chunks",
+                    dtype=torch.uint8,
+                )
+                values["_recv_buffer"] = recv.view(wire_shape)
             values["_stats_gather"] = torch.empty(
                 world * stats_numel, dtype=torch.float32, device=owner.device
+            )
+            # Preallocated so a failing rank can still vote without allocating.
+            rdma = owner.backend == "pcie" and owner.transport in _PCIE_RDMA_TRANSPORTS
+            values["_exchange_vote"] = (
+                torch.zeros(1, dtype=torch.int32, device=owner.device) if rdma else None
+            )
+            values["_vote_stream"] = (
+                torch.cuda.Stream(device=owner.device) if rdma else None
             )
         for name, value in values.items():
             object.__setattr__(workspace, name, value)
@@ -407,8 +427,9 @@ class UlyssesCommunicator:
     :meth:`exchange_chunks` exchanges already-packed destination-major
     chunks. The NCCL and NVLink backends use NCCL for this operation.
     :meth:`prepare_qkv` and :meth:`scatter_qkv` additionally provide Sage2
-    INT8/FP8 QKV preparation, using this chunk exchange and a statistics
-    AllGather on the same NCCL group.
+    INT8/FP8 QKV preparation, using this chunk exchange (NCCL, or the
+    registered PCIe route on the multi-rank PCIe backend) and a statistics
+    AllGather on the group's NCCL backend.
 
     Backend selection for ordinary scatter/gather happens in the constructor,
     strictly before any IPC
@@ -639,6 +660,9 @@ class UlyssesCommunicator:
         self._pcie_outputs: Dict[int, int] = {}
         # the caller stream the first PCIe collective bound this communicator to
         self._pcie_stream: Optional[torch.cuda.Stream] = None
+        # flat uint8 view of the one exchange_chunks registration every
+        # prepared QKV workspace shares; None until the first prepare_qkv
+        self._qkv_pcie_slot: Optional[torch.Tensor] = None
         # Sticky: a Python failure before the native enqueue can leave peers
         # spinning in an unbounded barrier, so close() must not synchronize.
         self._pcie_python_teardown_safe = True
@@ -1269,11 +1293,11 @@ class UlyssesCommunicator:
         for a layer-scale scatter it is the largest device-to-device move on the
         path -- and the caller's own source allocation with it.
 
-        The result must reach :meth:`scatter_heads` or :meth:`gather_heads`
-        unmodified: the fast path is exact pointer identity, and a slice or a
-        re-view that moves the base pointer is rejected rather than silently
-        staged, because on the scatter path the NIC reads the landing buffer
-        whatever the caller passes.
+        The result must reach :meth:`scatter_heads`, :meth:`gather_heads` or
+        :meth:`exchange_chunks` unmodified: the fast path is exact pointer
+        identity, and a slice or a re-view that moves the base pointer is
+        rejected rather than silently staged, because on the scatter path the
+        NIC reads the landing buffer whatever the caller passes.
 
         Parameters
         ----------
@@ -1329,6 +1353,35 @@ class UlyssesCommunicator:
                 f"slot was registered for"
             )
         return landing.narrow(0, 0, numel).view(shape)
+
+    def _register_qkv_pcie_slot(self, probe: torch.Tensor) -> None:
+        """Register the chunk slot every prepared QKV workspace shares.
+
+        Collective, and fail-stop like every PCIe registration. The native
+        registration holds ``max_bytes`` (plus an equal landing buffer on the
+        RDMA routes) until :meth:`close` and rebinds its geometry per call, so
+        one slot serves every prepared shape: re-registering per preparation
+        would retain that much memory again for each shape or live length.
+        ``probe`` is a ``[1, 1, world_size, 1]`` uint8 tensor that only names
+        the initial geometry.
+        """
+        registered = self.allocate_output(probe, "exchange_chunks", dtype=torch.uint8)
+        # allocate_output narrows the flat registration to the probe's
+        # geometry; keep the whole of it, at the registered base pointer.
+        self._qkv_pcie_slot = registered.as_strided((self.max_bytes,), (1,))
+
+    def _qkv_pcie_wire(
+        self, wire_shape: Tuple[int, int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rank-local send/receive views of the registered QKV slot."""
+        recv = self._qkv_pcie_slot[: wire_shape[0] * wire_shape[1]].view(wire_shape)
+        if self.transport in _PCIE_RDMA_TRANSPORTS:
+            # Pack straight into the landing buffer the NIC reads: exact
+            # pointer identity skips the per-call payload staging copy.
+            send = self.input_buffer(recv.view(1, 1, *wire_shape), (1, 1, *wire_shape))
+            return send.view(wire_shape), recv
+        # The all-P2P route reads the operand in place.
+        return torch.empty(wire_shape, dtype=torch.uint8, device=self.device), recv
 
     def _output_geometry(self, x: torch.Tensor, op: str) -> Tuple[Tuple[int, ...], int]:
         """Output shape and native mode for one layout transform.
@@ -1445,43 +1498,55 @@ class UlyssesCommunicator:
                 raise ValueError(
                     f"multi-rank PCIe {op} requires out= from allocate_output()"
                 )
-            with torch.cuda.device(self.device):
-                capturing = torch.cuda.is_current_stream_capturing()
-            if capturing and self.transport in _PCIE_RDMA_TRANSPORTS:
-                raise RuntimeError(
-                    f"the {self.transport} PCIe route cannot be captured into "
-                    "a CUDA graph: each exchange posts mlx5 work requests and "
-                    "polls its completion queue from the host. "
-                    "FLASHINFER_ULYSSES_PCIE_ROUTE=p2p on every rank gives a "
-                    "capturable all-P2P route."
-                )
+            capturing = self._pcie_capturing()
             self._validate_out(out, shape, op, dtype)
             self._validate_no_overlap(x, out, op)
             if not capturing:
-                # Like PcieIpcAllReduceWorkspace, the communicator is bound to
-                # the stream of its first collective; peers order their copies
-                # against this rank's caller stream, so silently accepting a
-                # second stream could let a consumer race the next exchange.
                 # Bound only once the call is known to be valid, so a rejected
                 # call does not pin the stream.
-                current = torch.cuda.current_stream(self.device)
-                if self._pcie_stream is None:
-                    self._pcie_stream = current
-                elif current != self._pcie_stream:
-                    raise RuntimeError(
-                        "PCIe Ulysses collectives are bound to the stream of "
-                        "their first call; use one stream per communicator"
-                    )
+                self._pcie_check_stream(bind=True)
             return self._pcie_exchange(x, out, mode)
         except Exception as e:  # noqa: BLE001
-            # Still OPEN means the failure happened before native code ran;
-            # _pcie_exchange has already moved a native failure to BROKEN.
-            if self._state == _OPEN and self.transport == "p2p":
-                self._poison_pcie_p2p(
-                    f"rank {self.rank} PCIe {op} before/during enqueue: "
-                    f"{type(e).__name__}: {e}"
-                )
+            self._poison_pcie_p2p_before_enqueue(op, e)
             raise
+
+    def _pcie_capturing(self) -> bool:
+        """Whether the caller stream is capturing; the RDMA routes refuse it."""
+        with torch.cuda.device(self.device):
+            capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and self.transport in _PCIE_RDMA_TRANSPORTS:
+            raise RuntimeError(
+                f"the {self.transport} PCIe route cannot be captured into "
+                "a CUDA graph: each exchange posts mlx5 work requests and "
+                "polls its completion queue from the host. "
+                "FLASHINFER_ULYSSES_PCIE_ROUTE=p2p on every rank gives a "
+                "capturable all-P2P route."
+            )
+        return capturing
+
+    def _pcie_check_stream(self, *, bind: bool) -> None:
+        # Like PcieIpcAllReduceWorkspace, the communicator is bound to the
+        # stream of its first collective; peers order their copies against
+        # this rank's caller stream, so silently accepting a second stream
+        # could let a consumer race the next exchange.
+        current = torch.cuda.current_stream(self.device)
+        if self._pcie_stream is None:
+            if bind:
+                self._pcie_stream = current
+        elif current != self._pcie_stream:
+            raise RuntimeError(
+                "PCIe Ulysses collectives are bound to the stream of "
+                "their first call; use one stream per communicator"
+            )
+
+    def _poison_pcie_p2p_before_enqueue(self, op: str, error: Exception) -> None:
+        # Still OPEN means the failure happened before native code ran;
+        # _pcie_exchange has already moved a native failure to BROKEN.
+        if self._state == _OPEN and self.transport == "p2p":
+            self._poison_pcie_p2p(
+                f"rank {self.rank} PCIe {op} before/during enqueue: "
+                f"{type(error).__name__}: {error}"
+            )
 
     def _poison_pcie_p2p(self, reason: str) -> None:
         """Fail-stop an all-P2P communicator whose peer barrier is uncertain."""
@@ -1932,6 +1997,7 @@ class UlyssesCommunicator:
             # close every rank must re-enter _pcie_close() when the group
             # retries, or its peers hang in the stage gathers.
             self._pcie_armed = False
+            self._qkv_pcie_slot = None
             self._state = _CLOSED
             return
 
@@ -2084,10 +2150,21 @@ class UlyssesCommunicator:
         Missing participants and CUDA/process-group failures are not recoverable
         through this protocol.
 
-        This method does not change ``backend``. Quantized QKV always uses
-        the group's CUDA NCCL backend, even when ordinary scatter/gather
-        uses NVLink. The experimental PCIe backend is not supported by this
-        prepared API. Supports homogeneous SM90 or SM120 groups of 2/4/8 ranks.
+        This method does not change ``backend``. Statistics always use the
+        group's CUDA NCCL backend, so the group must support it on every
+        backend. The packed payload uses NCCL on the NCCL and NVLink backends,
+        and the communicator's own route on the multi-rank experimental PCIe
+        backend. Supports homogeneous SM90 or SM120 groups of 2/4/8 ranks.
+
+        On PCIe, the first preparation additionally registers one
+        ``exchange_chunks`` slot, collectively and after the payload has been
+        checked against ``max_bytes``. Every later workspace of this
+        communicator reuses it, whatever its shape, until :meth:`close`. The
+        registration holds ``max_bytes`` bytes (twice that on the hybrid and
+        all-RDMA routes, which add a landing buffer), so size ``max_bytes`` to
+        the largest packed payload rather than a loose bound, and prepare
+        during warmup. Like every PCIe registration, a registration failure is
+        fail-stop: the communicator enters BROKEN.
 
         Parameters
         ----------
@@ -2119,10 +2196,6 @@ class UlyssesCommunicator:
         outcome: Tuple[Any, ...]
         try:
             self._require_open("prepare_qkv")
-            if self.backend == "pcie":
-                raise ValueError(
-                    "Sage2 QKV requires the nccl or nvlink communicator backend"
-                )
             if type(qkv_shape) not in (tuple, list, torch.Size):
                 raise TypeError(
                     "qkv_shape must be a tuple/list/torch.Size of four ints"
@@ -2187,6 +2260,7 @@ class UlyssesCommunicator:
                 f"inconsistent prepare_qkv configuration across ranks: {outcomes}"
             )
 
+        probe = None
         try:
             from . import _ulysses_lowp as lowp
 
@@ -2214,6 +2288,14 @@ class UlyssesCommunicator:
                 self._validate_capacity(
                     payload_bytes, "prepare_qkv packed payload", dtype=torch.uint8
                 )
+                if self.backend == "pcie" and self._qkv_pcie_slot is None:
+                    # Allocated here so a rank-local failure is a group
+                    # outcome, never a rank missing from the registration.
+                    probe = torch.empty(
+                        (1, 1, self.world_size, 1),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
             layout = (
                 "sage2_sm90"
                 if cap["device_capability"] == (9, 0)
@@ -2241,6 +2323,10 @@ class UlyssesCommunicator:
             raise ValueError(
                 f"inconsistent QKV hardware/layout across ranks: {outcomes}"
             )
+        if probe is not None:
+            # Every rank reaches this point together, and with the same slot
+            # state because registrations are themselves joint.
+            self._register_qkv_pcie_slot(probe)
 
         workspace = None
         try:
@@ -2271,12 +2357,25 @@ class UlyssesCommunicator:
     ) -> UlyssesQKV:
         r"""Quantize and exchange QKV for the prepared SageAttention2 layout.
 
-        Runs one FP32 statistics AllGather and one jointly packed uint8
-        AllToAll on ``group``, using NCCL independently of ``backend``.
+        Runs one FP32 statistics AllGather on the group's NCCL backend and one
+        jointly packed uint8 chunk exchange: NCCL on the NCCL and NVLink
+        backends, the communicator's own route on the multi-rank PCIe backend.
         Execution uses the current CUDA stream; all ranks must issue the
         same sequence of calls with valid inputs. There is no per-call
         metadata collective, implicit preparation, or precision fallback.
         Local statistics still allocate temporary tensors.
+
+        On PCIe the call follows the backend's collective contract. It runs on
+        the stream the communicator's first PCIe collective bound; the hybrid
+        and all-RDMA routes refuse CUDA graph capture and block the host in
+        the exchange. Both rules are checked before any work is enqueued, and
+        a rejection there is an ordinary error on the RDMA routes. Because
+        those routes wait for every peer in an unbounded barrier, they also
+        vote over NCCL just before the exchange: a failure on any rank after
+        admission raises on every rank before any of them enters it, and the
+        communicator stays OPEN. On the all-P2P route, a rejection or failure
+        before this rank enqueues its exchange leaves the communicator BROKEN,
+        as for the backend's other collectives.
 
         Parameters
         ----------
@@ -2306,6 +2405,37 @@ class UlyssesCommunicator:
         """
         from . import _ulysses_lowp as lowp
 
+        try:
+            result = self._admit_scatter_qkv(q, k, v, workspace, out, lowp)
+            stats = self._quantize_and_exchange_qkv(q, k, v, workspace, lowp)
+        except Exception as e:  # noqa: BLE001
+            if self.backend == "pcie" and self.world_size > 1:
+                # Until this rank has enqueued its exchange, a peer may already
+                # wait in the all-P2P barrier, which has no abort protocol.
+                self._poison_pcie_p2p_before_enqueue("scatter_qkv", e)
+            raise
+        _batch, local_sequence, heads, _head_dim = workspace.qkv_shape
+        local_heads = heads // self.world_size
+        with torch.cuda.device(self.device):
+            with torch.cuda.nvtx.range("lowp_unpack"):
+                lowp._unpack_for_sage_impl(
+                    workspace._recv_buffer,
+                    result[:5],
+                    local_sequence,
+                    self.world_size,
+                    workspace.used_sequence,
+                    workspace._enable_pdl,
+                    workspace._module,
+                )
+            with torch.cuda.nvtx.range("lowp_v_scale"):
+                head_start = self.rank * local_heads
+                result.v_scale.copy_(
+                    stats.v_scale_global[:, head_start : head_start + local_heads]
+                )
+        return result
+
+    def _admit_scatter_qkv(self, q, k, v, workspace, out, lowp) -> UlyssesQKV:
+        """Every scatter_qkv check, decided before any work is enqueued."""
         self._require_open("scatter_qkv")
         if (
             not isinstance(workspace, UlyssesQKVWorkspace)
@@ -2350,71 +2480,120 @@ class UlyssesCommunicator:
                 )
             checked_ranges.append((start, end))
         result = self._prepare_qkv_out(workspace, out, checked_ranges, lowp)
+        if self.backend == "pcie" and not self._pcie_capturing():
+            # The statistics AllGather runs first, and once a rank has
+            # enqueued collective work it has no rank-local way back. The
+            # exchange itself binds the stream.
+            self._pcie_check_stream(bind=False)
+        return result
+
+    def _quantize_and_exchange_qkv(self, q, k, v, workspace, lowp):
+        """Statistics, quantization and the payload exchange; returns stats."""
         layout = workspace._layout_impl
-        _batch, local_sequence, heads, _head_dim = workspace.qkv_shape
-        local_heads = heads // self.world_size
+        vote = workspace._exchange_vote
+        stage = "stats"
+        failure: Optional[Exception] = None
+        stats = None
         with torch.cuda.device(self.device):
-            with torch.cuda.nvtx.range("lowp_local_stats"):
-                send, ctx = lowp._local_stats_impl(
-                    q,
-                    k,
-                    v,
-                    self.rank,
-                    self.world_size,
-                    workspace.used_sequence,
-                    layout.Q_GROUP,
-                    layout.K_GROUP,
-                    workspace._enable_pdl,
-                    workspace._module,
-                )
-            with torch.cuda.nvtx.range("lowp_stats_allgather"):
-                dist.all_gather_into_tensor(
-                    workspace._stats_gather, send, group=self.group
-                )
-            with torch.cuda.nvtx.range("lowp_finalize_stats"):
-                stats = lowp._finalize_stats_impl(
-                    workspace._stats_gather,
-                    ctx,
-                    k,
-                    workspace._enable_pdl,
-                    workspace._module,
-                )
-            with torch.cuda.nvtx.range("lowp_quant_pack"):
-                lowp._quant_and_pack_impl(
-                    q,
-                    k,
-                    v,
-                    stats,
-                    workspace._send_buffer,
-                    workspace._q_scale_offset,
-                    workspace._enable_pdl,
-                    workspace._module,
-                )
+            try:
+                with torch.cuda.nvtx.range("lowp_local_stats"):
+                    send, ctx = lowp._local_stats_impl(
+                        q,
+                        k,
+                        v,
+                        self.rank,
+                        self.world_size,
+                        workspace.used_sequence,
+                        layout.Q_GROUP,
+                        layout.K_GROUP,
+                        workspace._enable_pdl,
+                        workspace._module,
+                    )
+                stage = "gather"
+                with torch.cuda.nvtx.range("lowp_stats_allgather"):
+                    dist.all_gather_into_tensor(
+                        workspace._stats_gather, send, group=self.group
+                    )
+                stage = "pack"
+                with torch.cuda.nvtx.range("lowp_finalize_stats"):
+                    stats = lowp._finalize_stats_impl(
+                        workspace._stats_gather,
+                        ctx,
+                        k,
+                        workspace._enable_pdl,
+                        workspace._module,
+                    )
+                with torch.cuda.nvtx.range("lowp_quant_pack"):
+                    lowp._quant_and_pack_impl(
+                        q,
+                        k,
+                        v,
+                        stats,
+                        workspace._send_buffer,
+                        workspace._q_scale_offset,
+                        workspace._enable_pdl,
+                        workspace._module,
+                    )
+            except Exception as e:  # noqa: BLE001 — a rank-local failure joins the vote
+                # A failure inside the AllGather itself is a process-group
+                # failure, which this protocol cannot recover.
+                if vote is None or stage == "gather":
+                    raise
+                failure = e
+                if stage == "stats":
+                    # Peers are already in the statistics AllGather: join it in
+                    # place so this rank's vote pairs with theirs.
+                    chunk = workspace._stats_numel
+                    dist.all_gather_into_tensor(
+                        workspace._stats_gather,
+                        workspace._stats_gather.narrow(0, self.rank * chunk, chunk),
+                        group=self.group,
+                    )
+            if vote is not None:
+                self._vote_before_rdma_exchange(workspace, failure)
             with torch.cuda.nvtx.range("lowp_input_a2a"):
                 self._exchange_qkv_payload(
                     workspace._send_buffer, workspace._recv_buffer
                 )
-            with torch.cuda.nvtx.range("lowp_unpack"):
-                lowp._unpack_for_sage_impl(
-                    workspace._recv_buffer,
-                    result[:5],
-                    local_sequence,
-                    self.world_size,
-                    workspace.used_sequence,
-                    workspace._enable_pdl,
-                    workspace._module,
-                )
-            with torch.cuda.nvtx.range("lowp_v_scale"):
-                head_start = self.rank * local_heads
-                result.v_scale.copy_(
-                    stats.v_scale_global[:, head_start : head_start + local_heads]
-                )
-        return result
+        return stats
+
+    def _vote_before_rdma_exchange(
+        self, workspace: UlyssesQKVWorkspace, failure: Optional[Exception]
+    ) -> None:
+        """Agree on success before any rank enters the RDMA opening barrier.
+
+        That barrier waits for every peer without a deadline, while a failure
+        between admission and the exchange (an allocation in the statistics
+        or quantizer, say) is rank-local. Every rank therefore raises here,
+        before entering it, so no peer is left waiting and the communicator
+        stays OPEN.
+
+        Every failure the vote reports is raised on the host while the
+        statistics and quantizer kernels are enqueued, so the vote need not
+        wait for them: on its own stream it overlaps finalization and packing
+        instead of following them, and the exchange still orders after them
+        on the caller's stream.
+        """
+        vote = workspace._exchange_vote
+        with torch.cuda.stream(workspace._vote_stream):
+            vote.fill_(0 if failure is None else 1)
+            dist.all_reduce(vote, op=dist.ReduceOp.MAX, group=self.group)
+            failed = vote.item()
+        if not failed:
+            return
+        if failure is not None:
+            raise failure
+        raise RuntimeError(
+            "scatter_qkv failed on a peer rank before the PCIe exchange; "
+            "no rank entered it"
+        )
 
     def _exchange_qkv_payload(self, send: torch.Tensor, recv: torch.Tensor) -> None:
         # The two-dimensional kernel payload is already destination-major.
         # These views preserve storage; exchange_chunks supplies the shared
-        # transport contract and validates the current byte budget.
+        # transport contract and validates the current byte budget. On PCIe,
+        # recv is the registered slot and, on the RDMA routes, send is its
+        # landing buffer, so the native exchange stages nothing.
         self.exchange_chunks(
             send.view(1, 1, *send.shape),
             out=recv.view(1, 1, *recv.shape),

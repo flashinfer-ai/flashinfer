@@ -23,6 +23,11 @@ Both retain existing local_stats/finalize_stats temporary allocations and
 copy the per-rank V scale into independent final storage. This compares
 the same output-ownership contract. Preparation/JIT is outside timing.
 
+The standalone chain always exchanges the payload with NCCL. --backend pcie
+moves the communicator's payload over the experimental PCIe transport instead
+(FLASHINFER_ULYSSES_PCIE_ROUTE selects the route on every rank), so the
+reported overhead then includes the transport difference.
+
 CUDA event spans include launch starvation and collective waits; they are
 NOT sums of kernel execution times. CPU enqueue time can include blocking
 inside NCCL/PyTorch. Synchronized wall time measures complete batch latency.
@@ -149,7 +154,7 @@ def benchmark_case(args, rank, world, length):
         dist.group.WORLD,
         max_bytes=max(q.nbytes, int(spec["payload_bytes"])),
         dtype=q.dtype,
-        backend="nccl",
+        backend=args.backend,
         device=device,
     ) as comm:
         workspace = comm.prepare_qkv(shape, used_sequence=used)
@@ -199,6 +204,9 @@ def benchmark_case(args, rank, world, length):
             "used_sequence": used,
             "world_size": world,
             "layout": workspace.layout,
+            "backend": comm.backend,
+            "payload_transport": workspace.transport,
+            "pcie_route": comm.transport,
             "dtype": str(q.dtype),
             "byte_comparison": "all six outputs and send/recv payloads equal on every rank",
             "workspace_bytes_per_rank": storage_bytes,
@@ -235,6 +243,12 @@ def main():
     parser.add_argument("--heads", type=int, default=56)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
+    parser.add_argument(
+        "--backend",
+        choices=("nccl", "nvlink", "pcie"),
+        default="nccl",
+        help="Communicator backend; the standalone chain always uses NCCL.",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--rounds", type=int, default=5)

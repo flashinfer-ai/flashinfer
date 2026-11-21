@@ -25,7 +25,10 @@ with UlyssesCommunicator(group, max_bytes=3 * q.nbytes, dtype=q.dtype,
 layout/JIT admission, and allocation. Recoverable preparation failures publish
 no workspace and leave the existing communicator usable. Missing rank calls,
 invalid hot-path inputs and unrecoverable CUDA/process-group failures cannot
-be recovered this way. Ordinary `create_workspace` remains local.
+be recovered this way. Ordinary `create_workspace` remains local. On the
+experimental PCIe backend the first call also registers the communicator's
+chunk slot between admission and allocation; like every PCIe registration,
+that step is fail-stop rather than recoverable.
 
 The dedicated `UlyssesQKVWorkspace` fixes owner, shape, P, dtype, layout and U.
 It reuses the statistics receive buffer and mixed-dtype payload storage;
@@ -35,8 +38,12 @@ the complete packed Q/K/V operand, including scales and chunk alignment.
 `3 * q.nbytes` (the original floating Q/K/V total) is a conservative budget for
 both supported layouts; a single floating Q tensor's size is insufficient.
 Preparation checks the exact byte requirement before allocating wire buffers.
-NCCL allocates the actual wire size, not the full budget. Statistics and final
-outputs are separate storage, so this limit is not a total memory budget.
+NCCL allocates the actual wire size, not the full budget. PCIe registers the
+full budget once per communicator (twice it on the hybrid and all-RDMA routes),
+so there `max_bytes` should be the largest payload, about `1.5 * q.nbytes` for
+FP16/BF16 inputs plus scales and alignment, rather than the loose bound.
+Statistics and final outputs are separate storage, so this limit is not a
+total memory budget.
 Ordinary `UlyssesWorkspace` and `create_workspace(max_elems=...)` continue to
 express their staging capacities in elements.
 
@@ -52,14 +59,18 @@ or SM120 groups. It preserves the primitive stride and input-padding contract.
 Statistics AllGather uses NCCL on the existing group. Packed uint8 AllToAll
 uses the communicator's `exchange_chunks` interface: `[P, chunk_bytes]` becomes
 `[1, 1, P, chunk_bytes]` through a zero-copy view, with destination-major send
-and source-major receive ordering. The current `nccl` and `nvlink` backends
-both use NCCL for chunks; `workspace.transport` exposes that choice. Ordinary
-scatter/gather retains its NCCL or fused NVLink route. For these chunk calls,
-`allocate_output` provides ordinary PyTorch receive storage. The prepared Lowp
-API collectively rejects the experimental `pcie` backend; ordinary PCIe calls
-retain their own output-registration and dtype contracts. On NCCL/NVLink, only
-chunk exchange supports overriding the communicator dtype, including
-`torch.uint8`; dtype selection never performs quantization or conversion.
+and source-major receive ordering. The `nccl` and `nvlink` backends both use
+NCCL for chunks, and the experimental multi-rank `pcie` backend uses its
+selected route; `workspace.transport` (`"nccl"` or `"pcie"`) exposes that
+choice. Ordinary scatter/gather retains its NCCL, fused NVLink or PCIe route.
+On NCCL/NVLink, `allocate_output` provides ordinary PyTorch receive storage for
+these chunk calls. On PCIe, every workspace of a communicator views one
+registered chunk output, and on the RDMA routes the quantizer packs straight
+into its landing buffer; the
+[PCIe design note](ulysses_pcie.md#prepared-sage2-qkv) covers its sizing,
+lifetime, stream and failure contract. On NCCL/NVLink, only chunk exchange
+supports overriding the communicator dtype, including `torch.uint8`; dtype
+selection never performs quantization or conversion.
 All operations are serialized on the current stream. There is no ordinary
 floating `scatter_qkv` mode, automatic workspace cache or Sage package dependency.
 
