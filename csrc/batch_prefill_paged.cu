@@ -26,9 +26,8 @@ namespace flashinfer {
 template <bool SAME_KV_STRIDES, uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           bool USE_TOKEN_HEAD_SF, typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, bool enable_pdl,
-                                                   cudaStream_t stream);
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
+                                                   bool enable_pdl, cudaStream_t stream);
 
 }  // namespace flashinfer
 
