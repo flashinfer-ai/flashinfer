@@ -21,12 +21,13 @@ state-update primitives used in SSM blocks.
 Inference causal convolution
 ---------------------------
 
-``causal_conv1d_fn`` and ``causal_conv1d_update`` provide width-four,
-per-channel convolution with fused SiLU on SM100/SM103. Packed inputs and
+``causal_conv1d_fn`` and ``causal_conv1d_update`` provide per-channel
+convolution of width ``W`` = 3, 4 or 7 on SM100/SM103. SiLU is fused by
+default; ``activation=None`` returns the convolution itself. Packed inputs and
 outputs are BF16 ``[tokens, channels]``. Weights are FP32 or BF16
-``[channels, 4]``; tap 3 multiplies the current token. The optional bias
-initializes an FP32 accumulator, followed by four FMAs in tap order and FP32 SiLU, then one
-BF16 output conversion.
+``[channels, W]``; tap ``W-1`` multiplies the current token. The optional bias
+initializes an FP32 accumulator, followed by ``W`` FMAs in tap order and, when
+enabled, FP32 SiLU, then one BF16 output conversion.
 
 The caller owns a BF16 ``[slots, channels, history_capacity]`` state pool.
 History stores raw convolution inputs. Slots may have padding between them;
@@ -36,8 +37,8 @@ distinct, in-range slots. Padding produces zero output without changing
 state, and empty sequences leave state untouched.
 
 Prefill reads ``cu_seqlens`` and ``has_initial_state`` on the device, consumes
-three old history values (or zero history) and writes the final three values
-to the same slot. For more than 32 sequences and nonempty input, its optional
+``W-1`` old history values (or zero history) and writes the final ``W-1``
+values to the same slot. For more than 32 sequences and nonempty input, its optional
 ``workspace`` needs ``1 + 2 * min(rows, ceil(rows / B) + num_sequences)`` int32
 elements. B is 8 if ``rows < 64 * num_sequences`` and 16 otherwise. A GPU
 kernel builds the chunk-to-sequence map shared by all channel tiles.
@@ -50,11 +51,11 @@ uses no workspace and commits all its input tokens in one launch.
 
 For speculative verification, ``num_accepted_tokens`` selects the history
 window from the **preceding** call; it includes the accepted bonus token.
-For a positive count ``a``, the input history is ``state[..., a-1:a+2]``.
+For a positive count ``a``, the input history is ``state[..., a-1:a+W-2]``.
 Nonpositive counts denote an inactive row and produce zero output without updating
-state. The current T-token call writes ``[old_h1, old_h2, x0, ..., x(T-1)]``
-to positions ``0:T+2``. Provision at least ``T_max + 2`` history positions
-and require ``1 <= a <= history_capacity - 2`` for active rows. Select only
+state. The current T-token call writes ``[old_h1, ..., old_h(W-2), x0, ..., x(T-1)]``
+to positions ``0:T+W-2``. Provision at least ``T_max + W - 2`` history
+positions and require ``1 <= a <= history_capacity - (W - 2)`` for active rows. Select only
 windows produced by the preceding call. After prefill the
 first speculative call uses ``a=1``. This interface covers linear accepted
 prefixes, not tree speculation.
@@ -69,7 +70,10 @@ device-to-host validation synchronization. Output, state and workspace must
 not alias their input operands.
 
 The unified benchmark compares complete calls, including state updates,
-against the repository's framework Triton reference. ``--input_row_stride``
+against the repository's framework Triton reference. ``--width`` and
+``--activation`` select the convolution; the Triton reference covers widths up
+to 4, so wider cases run ``--backends flashinfer`` without ``--refcheck``.
+``--input_row_stride``
 sets the input row stride in elements and defaults to ``--dim``. Reference checks use
 separate initial state snapshots, and state resets and JIT compilation are
 outside timing. Reported bandwidth is a logical-byte estimate, not measured
