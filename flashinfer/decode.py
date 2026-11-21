@@ -1519,7 +1519,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             causal class (bottom-right aligned, optional ``window_left``) or, with ``is_causal=False``, the non-causal class (every
             token sees its request's whole key range; no window); a single token per request is the causal class either way.
             Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window with
-            ``is_causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            ``is_causal=False``, custom masks, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests

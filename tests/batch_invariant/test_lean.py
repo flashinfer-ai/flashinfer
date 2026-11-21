@@ -53,6 +53,13 @@ def test_generated_cases_are_current():
         axioms = f.read()
     for name in lean_cases.DECIDED_THEOREMS + lean_cases.MODULE_DECIDED_THEOREMS:
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
+    # the capped attention classes are a family module of their own; every capped score leaf is the opaque tanh of one mul by
+    # the runtime factor, and no other family has one
+    capped = "".join(text for rel, text in modules.items() if "AttentionSoftCap" in rel)
+    assert capped.count("(tanh (mul ") == capped.count("(sym ca)") > 0
+    assert committed.count("(tanh ") == capped.count("(tanh (mul ")
+    for name, *_ in lean_cases.ATTN_SOFT_CAP_CASES:
+        assert f"theorem attnsc_{name}_spec " in capped
 
 
 def test_writing_removes_only_stale_generated_modules(tmp_path):
@@ -160,7 +167,12 @@ def test_lean_model_matches_python_engine_and_spec():
     assert r.returncode == 0, (r.stdout + r.stderr)[-4000:]
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
-    kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
+    kinds = {
+        "gemmbias": "spec",
+        "fp4class": "fp4class",
+        "attn": "attn",
+        "attnsc": "attn",
+    }
     # the block-scale fp8 class: the output at (0, 0) and at (3, 129) per (blocks, format), the promotion loop per block count
     kinds.update({"gemmfp8bs": "out", "gemmfp8bs2": "out", "gemmfp8bsloop": "loop"})
     for F in lean_cases.FORMATS:
@@ -191,7 +203,7 @@ def test_lean_model_matches_python_engine_and_spec():
             lean[("fp4class", int(N), int(K))] = bool(int(b))
         elif kind == "attn":
             _, name, sx = line.split(" ", 2)
-            lean[("attn", name)] = sx
+            lean[(tag, name)] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -237,6 +249,9 @@ def test_lean_model_matches_python_engine_and_spec():
         checked += 1
     for name, *_, sx in lean_cases.attn_cases():
         assert lean[("attn", name)] == sx, name
+        checked += 1
+    for name, *_, sx in lean_cases.attn_soft_cap_cases():
+        assert lean[("attnsc", name)] == sx, name
         checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80

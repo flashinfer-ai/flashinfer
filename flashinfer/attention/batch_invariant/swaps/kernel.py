@@ -77,8 +77,12 @@ class SwapsKernel:
         pdl: bool = False,
         *,
         causal: bool = True,
+        soft_cap: bool = False,
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
+        self.soft_cap = (
+            soft_cap  # the capped class: every score leaf through spec.capped_score
+        )
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
         self.pdl = pdl  # launched as a programmatic dependent: the load warp waits for the preceding grid before its first TMA
         self.causal = causal  # the mask mode (a class dimension; compile-time)
@@ -97,6 +101,7 @@ class SwapsKernel:
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
+        ca: Float32,
         window_left: Int32,
         num_units: Int32,
         grid: Int32,
@@ -111,6 +116,7 @@ class SwapsKernel:
             self.cap,
             causal=self.causal,
         )
+        st.soft_cap = self.soft_cap
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
 
@@ -138,6 +144,7 @@ class SwapsKernel:
             mKvIndices,
             c,
             nc,
+            ca,
             window_left,
             num_units,
             st.qk_tiled_mma,
@@ -174,6 +181,7 @@ class SwapsKernel:
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
+        ca: Float32,
         window_left: Int32,
         num_units: Int32,
         qk_tiled_mma: cute.TiledMma,
@@ -425,6 +433,7 @@ class SwapsKernel:
                     sP_e,
                     c,
                     nc,
+                    ca,
                     window_left,
                     mDesc[(u, F_ROWS)],
                     mDesc[(u, F_QTOK0)],

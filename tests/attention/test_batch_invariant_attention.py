@@ -315,8 +315,9 @@ def test_forward_equivalent_scale(kind):
         {"pos_encoding_mode": "ROPE_LLAMA"},
         {"window_left": 123},
         {"rope_scale": 2.0},
+        {"logits_soft_cap": 30.0},
     ],
-    ids=["scale", "rope", "window", "rope-scale"],
+    ids=["scale", "rope", "window", "rope-scale", "soft-cap"],
 )
 def test_forward_rejection_preserves_plan(kind, bad):
     pr = Problem([1], [17], 8, 2, 128, 16, seed=33)
@@ -1495,7 +1496,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             128,
             16,
             causal=True,
-            logits_soft_cap=30.0,
+            logits_soft_cap=-30.0,
             **kw,
         )
     with pytest.raises(bi.BatchInvariantUnsupportedError):
@@ -2078,7 +2079,7 @@ def reference_noncausal(pr: Problem):
     return torch.cat(outs)
 
 
-def run_decode_noncausal(pr: Problem, q_len: int, layout="NHD", ws=None):
+def run_decode_noncausal(pr: Problem, q_len: int, layout="NHD", ws=None, **plan_kw):
     """The decode wrapper with ``q_len_per_req = q_len`` and ``is_causal=False`` on the LAST ``q_len`` tokens of every request."""
     assert all(ql >= q_len for ql in pr.q_lens)
     rows = torch.cat(
@@ -2106,6 +2107,7 @@ def run_decode_noncausal(pr: Problem, q_len: int, layout="NHD", ws=None):
         kv_data_type=torch.bfloat16,
         q_len_per_req=q_len,
         is_causal=False,
+        **plan_kw,
     )
     return w.run(pr.q[rows].contiguous(), pr.cache(layout)), rows
 
@@ -2870,3 +2872,755 @@ def test_noncausal_more_queries_than_keys_split_under_both_merges(D):
             cfg,
         )
         assert torch.equal(bits(got), bits(out)), (policy, merge)
+
+
+# ------------------------------------------------------------------------------------------------------ logits soft cap
+SOFT_CAPS = (30.0, 50.0)
+
+
+def _hot(pr: Problem, gain: float) -> Problem:
+    """``pr`` with its queries scaled by ``gain`` (a power of two: exact in bf16), so that the scaled scores reach the cap."""
+    pr.q = (pr.q.float() * gain).to(torch.bfloat16)
+    return pr
+
+
+def capped_reference(pr: Problem, cap, window_left=-1, sm_scale=None, causal=True):
+    """Double-precision attention (causal, or with ``causal=False`` every key of the request) with every scaled score ``s``
+    replaced by ``cap * tanh(s / cap)`` (``cap`` None or 0: no cap); the mask is applied after the cap. The yardstick for
+    accuracy (never for bits)."""
+    outs = []
+    tok_q = tok_kv = 0
+    g = pr.Hq // pr.Hkv
+    scale = 1.0 / math.sqrt(pr.D) if sm_scale is None else sm_scale
+    for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True):
+        q = pr.q[tok_q : tok_q + ql].double()
+        k = pr.k_rag[tok_kv : tok_kv + kl].double().repeat_interleave(g, dim=1)
+        v = pr.v_rag[tok_kv : tok_kv + kl].double().repeat_interleave(g, dim=1)
+        s = torch.einsum("qhd,khd->hqk", q, k) * scale
+        if cap:
+            s = cap * torch.tanh(s / cap)
+        pos = torch.arange(kl - ql, kl, device=pr.device)[:, None]
+        key = torch.arange(kl, device=pr.device)[None, :]
+        mask = key <= pos if causal else torch.ones_like(key <= pos)
+        if window_left >= 0:
+            mask &= key >= pos - window_left
+        p = torch.softmax(s.masked_fill(~mask[None], float("-inf")), dim=-1)
+        outs.append(torch.einsum("hqk,khd->qhd", p, v))
+        tok_q += ql
+        tok_kv += kl
+    return torch.cat(outs)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("op", WRAPPERS)
+def test_soft_cap_fingerprint_is_a_class_dimension(op):
+    """No cap (omitted, ``None``, ``0``) is the existing class with its pinned digest; a positive cap is the capped class, one
+    fingerprint for every cap value (the value is a runtime input, like ``sm_scale``); a cap that names no class raises."""
+    from flashinfer.attention.batch_invariant import spec
+
+    for D in (64, 128, 256):
+        plain = bi.fingerprint(op, head_dim=D, causal=True)
+        assert plain == spec.FINGERPRINTS[D]
+        for off in (None, 0, 0.0):
+            assert (
+                bi.fingerprint(op, head_dim=D, causal=True, logits_soft_cap=off)
+                == plain
+            )
+        capped = bi.fingerprint(op, head_dim=D, causal=True, logits_soft_cap=50.0)
+        assert capped == spec.FINGERPRINTS_SOFT_CAP[D] != plain
+        assert capped.startswith(f"attn-bf16-d{D}-sc-")
+        for cap in (30.0, 1.0, 1e-3, 4096):
+            assert (
+                bi.fingerprint(op, head_dim=D, causal=True, logits_soft_cap=cap)
+                == capped
+            )
+        # the window stays a per-call input of the capped class too: another sample row, the same public receipt
+        assert spec.spec_fingerprint(D, 100, soft_cap=True) != capped
+    for bad in (-30.0, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            bi.fingerprint(op, head_dim=128, causal=True, logits_soft_cap=bad)
+
+
+@pytest.mark.cpu_only
+def test_soft_cap_scales_and_term():
+    """The capped class's two runtime scalars are formed in double precision and rounded once; its leaf is one ``mul.rn`` and
+    the opaque ``tanh``, wrapped around every score and nothing else; a scale that leaves binary32 or rounds to zero is refused."""
+    from flashinfer.attention.batch_invariant import engine, spec
+    from flashinfer.batch_invariant.fp_interface.term import TermAlgebra, sexpr, to_f32
+
+    log2e = 1.0 / math.log(2.0)
+    for D, cap in ((64, 30.0), (128, 50.0), (256, 7.5)):
+        scale = 1.0 / math.sqrt(D)
+        c, ca = engine.check_scales(scale, cap)
+        assert c == to_f32(cap * log2e) and ca == to_f32(scale / cap)
+        assert engine.check_scales(scale, None) == (spec.scale_log2(scale), None)
+        assert engine.check_scales(scale, 0.0) == (spec.scale_log2(scale), None)
+    alg = TermAlgebra()
+    leaf = sexpr(spec.capped_score(alg, alg.sym("s"), alg.sym("ca")))
+    assert leaf == "(tanh (mul (sym ca) (sym s)))"
+    plain = sexpr(spec.AttentionSpec(64, T=16, C=32).output(spec.RowSpec(p=20), 0))
+    capped = sexpr(
+        spec.AttentionSpec(64, T=16, C=32, soft_cap=True).output(spec.RowSpec(p=20), 0)
+    )
+    assert "(sym ca)" in capped and "(sym ca)" not in plain
+    # the capped term is the uncapped one with every score leaf wrapped: no other node moves
+    assert capped.count("(sym ca)") == capped.count("(tanh (mul ")
+    assert capped.count("(tanh ") == capped.count("(sym ca)")
+    for bad_scale, bad_cap in (
+        (0.125, -1.0),
+        (0.125, float("nan")),
+        (0.125, float("inf")),
+        (1e3, 1e-42),  # sm_scale / cap overflows binary32
+        (0.125, 1e39),  # cap log2(e) overflows binary32
+        (1e-30, 1e30),  # sm_scale / cap rounds to zero
+        (0.0, 30.0),
+    ):
+        with pytest.raises(ValueError):
+            engine.check_scales(bad_scale, bad_cap)
+
+
+@needs_device
+def test_soft_cap_tanh_primitive():
+    """The hardware hypotheses of the capped class's opaque ``tanh`` (``tanh.approx.f32``), on the special values, a dense grid
+    and random bit patterns: deterministic, within ``[-1, 1]``, exactly ``+-1`` in saturation and at the infinities, ``+-0`` at
+    ``+-0``, bitwise odd, never NaN on a number, and close to ``tanh`` (the class's accuracy, not its bits)."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32
+
+    from flashinfer.batch_invariant.fp_interface.cute import CuteF32
+
+    class Table:
+        @cute.jit
+        def __call__(self, mX: cute.Tensor, mY: cute.Tensor, n: Int32, stream):
+            self.kernel(mX, mY, n).launch(
+                grid=[cute.ceil_div(n, 256), 1, 1], block=[256, 1, 1], stream=stream
+            )
+
+        @cute.kernel
+        def kernel(self, mX: cute.Tensor, mY: cute.Tensor, n: Int32):
+            tidx, _, _ = cute.arch.thread_idx()
+            bidx, _, _ = cute.arch.block_idx()
+            i = bidx * 256 + tidx
+            if i < n:
+                mY[i] = CuteF32.tanh(mX[i])
+
+    def fake():
+        return cute.runtime.make_fake_tensor(
+            cutlass.Float32, (cute.sym_int(32),), (1,), assumed_align=16
+        )
+
+    table = cute.compile(
+        Table(),
+        fake(),
+        fake(),
+        Int32(1),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+    def tanh(x):
+        x = x.to(torch.float32).contiguous().cuda()
+        y = torch.empty_like(x)
+        table(x, y, x.numel())
+        torch.cuda.synchronize()
+        return y
+
+    inf = float("inf")
+    special = torch.tensor([0.0, -0.0, inf, -inf, 8.0, -8.0, 50.0, -1e30, 3e38])
+    want = torch.tensor([0.0, -0.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0])
+    assert torch.equal(bits(tanh(special)), bits(want.cuda()))
+    g = torch.Generator(device="cpu").manual_seed(7)
+    pats = torch.randint(-(2**31), 2**31 - 1, (1 << 22,), generator=g).to(torch.int32)
+    x = torch.cat([pats.view(torch.float32), torch.linspace(-12.0, 12.0, 1 << 20)])
+    x = x[~torch.isnan(x)]
+    y = tanh(x)
+    assert torch.equal(bits(y), bits(tanh(x)))  # deterministic
+    assert not bool(torch.isnan(y).any()) and bool((y.abs() <= 1.0).all())
+    assert torch.equal(bits(tanh(-x)), bits(-y))  # bitwise odd
+    big = x.abs().cuda() >= 9.0
+    assert torch.equal(y[big], torch.sign(x.cuda()[big]))
+    assert (y.double() - torch.tanh(x.double().cuda())).abs().max().item() < 2e-5
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("cap", SOFT_CAPS)
+def test_soft_cap_matches_reference(D, cap):
+    """The capped class against ``cap * tanh(score * sm_scale / cap)`` in double precision, on scores that reach the cap (so the
+    capped and the uncapped references differ by far more than the tolerance), through the three wrappers."""
+    pr = _hot(Problem([300, 1000, 64], [700, 2500, 3000], 32, 8, D, 16, seed=41), 16.0)
+    ref = capped_reference(pr, cap)
+    tol = 2e-2 + 1e-2 * ref.abs().max().item()
+    assert (capped_reference(pr, None) - ref).abs().max().item() > 10 * tol
+    out = run_paged_prefill(pr, logits_soft_cap=cap)
+    assert (out.double() - ref).abs().max().item() < tol
+    assert torch.equal(bits(run_ragged_prefill(pr, logits_soft_cap=cap)), bits(out))
+    dec, last = run_decode(pr, logits_soft_cap=cap)
+    assert torch.equal(bits(dec), bits(out[last]))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_soft_cap_saturation_and_custom_scale(D):
+    """Scores far into saturation (hundreds of caps): the capped scores sit at exactly ``+-cap``, nothing overflows or turns NaN,
+    and the output is the reference's; with an explicit ``sm_scale`` too."""
+    pr = _hot(Problem([200, 1, 500], [1300, 2000, 500], 16, 4, D, 16, seed=42), 1024.0)
+    for cap, sm_scale in ((30.0, None), (50.0, 1.0), (2.0, 0.25)):
+        ref = capped_reference(pr, cap, sm_scale=sm_scale)
+        kw = {} if sm_scale is None else {"sm_scale": sm_scale}
+        out = run_paged_prefill(pr, logits_soft_cap=cap, **kw)
+        assert bool(torch.isfinite(out.float()).all())
+        err = (out.double() - ref).abs().max().item()
+        assert err < 2e-2 + 1e-2 * ref.abs().max().item(), (cap, sm_scale, err)
+        dec, last = run_decode(pr, logits_soft_cap=cap, **kw)
+        assert torch.equal(bits(dec), bits(out[last]))
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_soft_cap_off_is_the_uncapped_class(kind):
+    """``logits_soft_cap`` of ``None`` / ``0`` runs today's class: the same bits as a plan without the argument."""
+    pr = _hot(Problem([1, 1, 1], [900, 17, 2600], 8, 2, 128, 16, seed=43), 16.0)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    plain = bits(w.run(*args)).clone()
+    for off in (None, 0, 0.0):
+        w, args, _, _ = _wrapper_case(kind, pr, logits_soft_cap=off)
+        assert torch.equal(bits(w.run(*args)), plain), off
+    w, args, _, _ = _wrapper_case(kind, pr, logits_soft_cap=30.0)
+    assert not torch.equal(bits(w.run(*args)), plain)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_soft_cap_prefill_equals_decode(D, layout):
+    """R4 under the capped class: prefill row == decode step, paged == ragged, with and without a window."""
+    pr = _hot(
+        Problem([256, 1, 1024, 33], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=44),
+        16.0,
+    )
+    for cap, win in ((30.0, -1), (50.0, 600), (50.0, 0)):
+        pre = run_paged_prefill(pr, layout, window_left=win, logits_soft_cap=cap)
+        dec, last = run_decode(pr, layout, window_left=win, logits_soft_cap=cap)
+        assert torch.equal(bits(pre[last]), bits(dec)), (cap, win)
+        rag = run_ragged_prefill(pr, layout, window_left=win, logits_soft_cap=cap)
+        assert torch.equal(bits(pre), bits(rag)), (cap, win)
+
+
+@needs_device
+def test_soft_cap_window_matches_reference():
+    """Window + cap: the keys outside the window stay absent (the mask is applied after the cap: a masked key never enters as
+    ``-cap``), against the reference."""
+    pr = _hot(Problem([700, 3], [1500, 600], 16, 4, 128, 16, seed=45), 16.0)
+    for win in (0, 5, 200, 1100):
+        ref = capped_reference(pr, 30.0, window_left=win)
+        out = run_paged_prefill(pr, window_left=win, logits_soft_cap=30.0)
+        err = (out.double() - ref).abs().max().item()
+        assert err < 2e-2 + 1e-2 * ref.abs().max().item(), (win, err)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_soft_cap_batch_permutation_and_subbatch_invariance(D):
+    """R2 under the capped class: a request's bits do not depend on its neighbours, its place in the batch or the batch size
+    (prefill and decode)."""
+    q_lens, kv_lens = [300, 1000, 64, 2048, 1], [700, 2500, 3000, 2048, 5000]
+    cap = 50.0
+    pr = _hot(Problem(q_lens, kv_lens, 32, 8, D, 16, seed=46), 16.0)
+    full = bits(run_ragged_prefill(pr, logits_soft_cap=cap))
+    assert torch.equal(bits(run_paged_prefill(pr, logits_soft_cap=cap)), full)
+    rows = [
+        slice(int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1]))
+        for i in range(len(q_lens))
+    ]
+    keys = [
+        slice(int(pr.kv_indptr_rag[i]), int(pr.kv_indptr_rag[i + 1]))
+        for i in range(len(q_lens))
+    ]
+
+    def sub(sel):
+        p = Problem([q_lens[i] for i in sel], [kv_lens[i] for i in sel], 32, 8, D, 16)
+        p.q = torch.cat([pr.q[rows[i]] for i in sel]).contiguous()
+        p.k_rag = torch.cat([pr.k_rag[keys[i]] for i in sel]).contiguous()
+        p.v_rag = torch.cat([pr.v_rag[keys[i]] for i in sel]).contiguous()
+        return p
+
+    for sel in ([0], [2], [4], [3, 0, 4, 1, 2], [1, 3]):
+        got = bits(run_ragged_prefill(sub(sel), logits_soft_cap=cap))
+        off = 0
+        for i in sel:
+            assert torch.equal(got[off : off + q_lens[i]], full[rows[i]]), (sel, i)
+            off += q_lens[i]
+    # decode: a batch of five against each request alone in a fresh page table
+    dec, last = run_decode(pr, logits_soft_cap=cap)
+    assert torch.equal(bits(dec), full[last])
+    for i in (1, 4):
+        one = _repack(sub([i]))
+        out1, last1 = run_decode(one, logits_soft_cap=cap)
+        assert torch.equal(bits(out1), bits(dec[i : i + 1])), i
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_soft_cap_config_agreement(D):
+    """R3 under the capped class: ring depths, unit kinds (fused, split with the fixup kernel, split folded in-kernel), softmax
+    warpgroups, the small-unit bodies and (D = 64) the paired placement give the wrapper's bits; the cap's value is a runtime
+    input (two caps run the same compiled kernels)."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.blocks.compile import (
+        get_compiled_attention,
+    )
+
+    cap = 30.0
+    if D == 64:
+        pr = Problem([2048, 2048, 1], [4096, 3000, 1000], 32, 8, D, 16, seed=47)
+    else:
+        pr = Problem([256, 1, 1000, 1], [3000, 2500, 1000, 5000], 32, 8, D, 16, seed=47)
+    pr = _hot(pr, 16.0)
+    ref = bits(run_paged_prefill(pr, logits_soft_cap=cap))
+    dec_ref, last = run_decode(pr, logits_soft_cap=cap)
+    assert torch.equal(bits(dec_ref), ref[last])
+    space = engine.all_valid_configs(D)
+    cfgs = list(space[:: {64: 21, 128: 9, 256: 3}[D]])
+    if D == 64:
+        two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
+        cfgs += [replace(two, kv_slots=s) for s in (2, 3)]
+
+    def run(problem, q, cfg, value):
+        planned = engine.plan_attention(
+            problem.qo_indptr,
+            problem.kv_indptr,
+            problem.kv_last,
+            32,
+            8,
+            D,
+            16,
+            -1,
+            cfg,
+            None,
+            problem.device,
+        )
+        return engine.run_attention(
+            planned,
+            q,
+            problem.k_nhd,
+            problem.v_nhd,
+            problem.kv_indptr,
+            problem.kv_indices,
+            1.0 / math.sqrt(D),
+            -1,
+            "NHD",
+            None,
+            cfg,
+            logits_soft_cap=value,
+        )
+
+    # the decode batch of the same requests' last tokens: small units (the Swaps body or the replicated rows) and split groups
+    dp = Problem([1] * len(pr.q_lens), pr.kv_lens, 32, 8, D, 16, seed=47)
+    dp.k_nhd, dp.v_nhd = pr.k_nhd, pr.v_nhd
+    dp.kv_indptr, dp.kv_indices, dp.kv_last = pr.kv_indptr, pr.kv_indices, pr.kv_last
+    dq = pr.q[last].contiguous()
+    for cfg in cfgs:
+        assert torch.equal(bits(run(pr, pr.q, cfg, cap)), ref), cfg
+        if not cfg.q2:
+            assert torch.equal(bits(run(dp, dq, cfg, cap)), bits(dec_ref)), cfg
+    compiled = get_compiled_attention.cache_info().currsize
+    other = run(pr, pr.q, engine.default_config(D=D), 50.0)
+    assert get_compiled_attention.cache_info().currsize == compiled
+    assert not torch.equal(bits(other), ref)
+    assert torch.equal(bits(other), bits(run_paged_prefill(pr, logits_soft_cap=50.0)))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128])
+def test_soft_cap_multi_token_decode_and_chunked_prefill(D):
+    """Decode with several query tokens per request and a prefill fed in two pieces give the one-shot prefill's bits under
+    the capped class."""
+    cap = 50.0
+    kv = [1500, 700, 2600]
+    pr = _hot(Problem([4, 4, 4], kv, 32, 8, D, 16, seed=48), 16.0)
+    pre = run_paged_prefill(pr, logits_soft_cap=cap)
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        32,
+        8,
+        D,
+        16,
+        q_len_per_req=4,
+        logits_soft_cap=cap,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    assert torch.equal(bits(w.run(pr.q, pr.cache("NHD"))), bits(pre))
+    # the same requests with longer queries: the last four rows are the same tokens at the same positions
+    long = Problem([600, 300, 1000], kv, 32, 8, D, 16, seed=48)
+    long.k_rag, long.v_rag = pr.k_rag, pr.v_rag
+    long.q = _hot(Problem([600, 300, 1000], kv, 32, 8, D, 16, seed=49), 16.0).q
+    tails = torch.cat(
+        [
+            torch.arange(int(long.qo_indptr[i + 1]) - 4, int(long.qo_indptr[i + 1]))
+            for i in range(3)
+        ]
+    ).to(pr.device)
+    short = Problem([4, 4, 4], kv, 32, 8, D, 16, seed=48)
+    short.k_rag, short.v_rag = pr.k_rag, pr.v_rag
+    short.q = long.q[tails].contiguous()
+    assert torch.equal(
+        bits(run_ragged_prefill(long, logits_soft_cap=cap))[tails],
+        bits(run_ragged_prefill(short, logits_soft_cap=cap)),
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_soft_cap_forward_and_refusals(kind):
+    """``forward()`` takes the planned cap (the same bits as ``run()``) and refuses another one, in both directions, leaving the
+    plan intact; a cap that names no class is refused at ``plan()`` and nothing falls back."""
+    pr = _hot(Problem([1, 1], [900, 17], 8, 2, 128, 16, seed=50), 16.0)
+    options = {} if kind == 0 else {"causal": True}
+    w, args, plan_args, plan_kw = _wrapper_case(kind, pr, logits_soft_cap=30.0)
+    expected = bits(w.run(*args)).clone()
+    assert torch.equal(
+        bits(w.forward(*args, logits_soft_cap=30.0, **options)), expected
+    )
+    for other in (None, 0.0, 50.0, -30.0, float("nan")):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            w.forward(*args, logits_soft_cap=other, **options)
+        assert torch.equal(bits(w.run(*args)), expected)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.forward(*args, logits_soft_cap=30.0, sm_scale=0.5, **options)
+    for bad in (-30.0, -1e-3, float("nan"), float("inf"), 1e-44, 1e39):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            w.plan(*plan_args, **(plan_kw | {"logits_soft_cap": bad}))
+        assert torch.equal(bits(w.run(*args)), expected)  # the earlier plan stands
+    # an uncapped plan refuses a cap at forward()
+    w, args, _, _ = _wrapper_case(kind, pr)
+    plain = bits(w.run(*args)).clone()
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.forward(*args, logits_soft_cap=30.0, **options)
+    assert torch.equal(bits(w.forward(*args, logits_soft_cap=0.0, **options)), plain)
+
+
+# ------------------------------------------------------------------------------------------- logits soft cap x the non-causal class
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("op", WRAPPERS)
+def test_soft_cap_noncausal_fingerprint_is_its_own_class(op):
+    """The cap and the mask mode are independent class dimensions: four fingerprints per head dim, the capped non-causal one
+    pinned and named mask first, then score (``attn-bf16-d<D>-nc-sc-*``), shared by the three wrappers and by every cap value;
+    no cap is the non-causal class's own digest."""
+    from flashinfer.attention.batch_invariant import spec
+
+    for D in (64, 128, 256):
+        nc = bi.fingerprint(op, head_dim=D, causal=False)
+        for off in (None, 0, 0.0):
+            assert (
+                bi.fingerprint(op, head_dim=D, causal=False, logits_soft_cap=off) == nc
+            )
+        nc_sc = bi.fingerprint(op, head_dim=D, causal=False, logits_soft_cap=50.0)
+        assert nc_sc == spec.FINGERPRINTS_NONCAUSAL_SOFT_CAP[D]
+        assert nc_sc.startswith(f"attn-bf16-d{D}-nc-sc-")
+        assert nc_sc == spec.spec_fingerprint(D, causal=False, soft_cap=True)
+        for cap in (30.0, 1.0, 1e-3, 4096):
+            assert (
+                bi.fingerprint(op, head_dim=D, causal=False, logits_soft_cap=cap)
+                == nc_sc
+            )
+        assert nc_sc == bi.fingerprint(
+            WRAPPERS[0], head_dim=D, causal=False, logits_soft_cap=30.0
+        )
+        four = {
+            spec.FINGERPRINTS[D],
+            nc,
+            spec.FINGERPRINTS_SOFT_CAP[D],
+            nc_sc,
+        }
+        assert len(four) == 4
+    # the decode wrapper's mode stays optional under a cap: omitted is the capped causal class
+    assert (
+        bi.fingerprint(WRAPPERS[0], head_dim=128, logits_soft_cap=50.0)
+        == spec.FINGERPRINTS_SOFT_CAP[128]
+    )
+    # a window is not a parameter of the non-causal class, capped or not
+    with pytest.raises(ValueError):
+        spec.spec_fingerprint(128, 100, causal=False, soft_cap=True)
+    with pytest.raises(TypeError):  # the score class is keyword-only
+        spec.spec_fingerprint(128, -1, False, True)
+
+
+def test_soft_cap_kernel_identity_composes_with_the_mask_mode():
+    """The capped kernels of the two mask modes are separate objects (``_sc``, ``_nc_sc``: mask first, then score), next to
+    the uncapped ones, for the row body and the Swaps body; both class dimensions are keyword-only at the kernel-facing
+    signatures, so a positional flag cannot select another class's kernel."""
+    from flashinfer.attention.batch_invariant.blocks import compile as row
+    from flashinfer.attention.batch_invariant.swaps import compile as swaps
+
+    def names(fn, *args):
+        return [
+            fn(*args, causal=causal, soft_cap=soft_cap)
+            for causal in (True, False)
+            for soft_cap in (False, True)
+        ]
+
+    for got in (
+        names(row.kernel_name, 128, 4, 16, 4),
+        names(swaps.kernel_name, 128, 8, 16, 8),
+    ):
+        plain, sc, nc, nc_sc = got
+        assert len(set(got)) == 4
+        assert sc == plain + "_sc" and nc == plain + "_nc" and nc_sc == plain + "_nc_sc"
+    assert row.kernel_name(128, 4, 16, 4) == "attn_d128_g4_p16_s4_w1"
+    with pytest.raises(TypeError):
+        row.kernel_name(128, 4, 16, 4, 1, False, False, False, 0, False)
+    with pytest.raises(TypeError):
+        swaps.kernel_name(128, 8, 16, 8, False, 0, False, False)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("cap", SOFT_CAPS)
+def test_soft_cap_noncausal_matches_reference(D, cap):
+    """The capped non-causal class against ``cap * tanh(score * sm_scale / cap)`` over every key of the request in double
+    precision, on scores that reach the cap, paged and ragged; a request with more query tokens than keys is a member. The
+    result is neither the uncapped non-causal class's nor the capped causal class's."""
+    pr = _hot(
+        Problem([300, 1000, 64, 40], [700, 2500, 3000, 17], 32, 8, D, 16, seed=51), 16.0
+    )
+    ref = capped_reference(pr, cap, causal=False)
+    tol = 2e-2 + 1e-2 * ref.abs().max().item()
+    assert (
+        capped_reference(pr, None, causal=False) - ref
+    ).abs().max().item() > 10 * tol
+    n = pr.q_lens[
+        0
+    ]  # the causal class is compared on a request it is defined for (no more query tokens than keys)
+    assert (capped_reference(pr, cap)[:n] - ref[:n]).abs().max().item() > 10 * tol
+    out = run_paged_prefill(pr, causal=False, logits_soft_cap=cap)
+    assert (out.double() - ref).abs().max().item() < tol
+    rag = run_ragged_prefill(pr, causal=False, logits_soft_cap=cap)
+    assert torch.equal(bits(rag), bits(out))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_soft_cap_noncausal_saturation_and_custom_scale(D):
+    """Scores hundreds of caps into saturation under the capped non-causal class, with the default and an explicit
+    ``sm_scale``: finite, the reference's values, and a key count that is not a multiple of the tile (the keys past the
+    request's end are masked after the cap: none enters as ``-cap``)."""
+    pr = _hot(Problem([200, 1, 500], [1300, 2001, 437], 16, 4, D, 16, seed=52), 1024.0)
+    for cap, sm_scale in ((30.0, None), (50.0, 1.0), (2.0, 0.25)):
+        ref = capped_reference(pr, cap, sm_scale=sm_scale, causal=False)
+        kw = {} if sm_scale is None else {"sm_scale": sm_scale}
+        out = run_paged_prefill(pr, causal=False, logits_soft_cap=cap, **kw)
+        assert bool(torch.isfinite(out.float()).all())
+        err = (out.double() - ref).abs().max().item()
+        assert err < 2e-2 + 1e-2 * ref.abs().max().item(), (cap, sm_scale, err)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_soft_cap_noncausal_prefill_equals_multi_token_decode(D, layout):
+    """R4 under the capped non-causal class: multi-token decode (``is_causal=False``) gives the bits of the non-causal
+    prefill rows, paged == ragged, and the position does not enter the term (the same query elsewhere in its request gives
+    the same bits)."""
+    cap, q_len = 50.0, 4
+    pr = _hot(
+        Problem([256, 33, 1024, 7], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=53),
+        16.0,
+    )
+    pre = bits(run_paged_prefill(pr, layout, causal=False, logits_soft_cap=cap))
+    dec, rows = run_decode_noncausal(pr, q_len, layout, logits_soft_cap=cap)
+    assert torch.equal(bits(dec), pre[rows])
+    rag = run_ragged_prefill(pr, layout, causal=False, logits_soft_cap=cap)
+    assert torch.equal(bits(rag), pre)
+    pr2 = Problem(pr.q_lens, pr.kv_lens, 32, 8, D, 16, seed=53)
+    for i in range(len(pr.q_lens)):
+        a, b = int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])
+        pr2.q[a:b] = pr.q[a:b].flip(0)
+    pre2 = bits(run_paged_prefill(pr2, layout, causal=False, logits_soft_cap=cap))
+    for i in range(len(pr.q_lens)):
+        a, b = int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])
+        assert torch.equal(pre2[a:b], pre[a:b].flip(0)), i
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_soft_cap_off_is_the_uncapped_noncausal_class(D):
+    """``logits_soft_cap`` of ``None`` / ``0`` under ``causal=False`` runs the non-causal class of main: the same bits as a
+    plan without the argument (paged, ragged, multi-token decode); a positive cap gives other bits, and not the capped causal
+    class's."""
+    pr = _hot(Problem([64, 5, 300], [900, 17, 2600], 8, 2, D, 16, seed=54), 16.0)
+    plain = bits(run_paged_prefill(pr, causal=False)).clone()
+    assert torch.equal(bits(run_ragged_prefill(pr, causal=False)), plain)
+    dec, rows = run_decode_noncausal(pr, 4)
+    assert torch.equal(bits(dec), plain[rows])
+    for off in (None, 0, 0.0):
+        out = run_paged_prefill(pr, causal=False, logits_soft_cap=off)
+        assert torch.equal(bits(out), plain), off
+        out = run_ragged_prefill(pr, causal=False, logits_soft_cap=off)
+        assert torch.equal(bits(out), plain), off
+        dec, _ = run_decode_noncausal(pr, 4, logits_soft_cap=off)
+        assert torch.equal(bits(dec), plain[rows]), off
+    capped = bits(run_paged_prefill(pr, causal=False, logits_soft_cap=30.0))
+    assert not torch.equal(capped, plain)
+    assert not torch.equal(capped, bits(run_paged_prefill(pr, logits_soft_cap=30.0)))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_soft_cap_noncausal_batch_permutation_and_subbatch_invariance(D):
+    """R2 under the capped non-causal class: a request's rows are the same bits alone, in a permuted batch and in a
+    sub-batch; paged prefill, ragged prefill and multi-token decode."""
+    cap = 50.0
+    q_lens, kv_lens = [300, 8, 1000, 64, 4], [700, 2500, 2500, 3000, 4]
+    pr = _hot(Problem(q_lens, kv_lens, 32, 8, D, 16, seed=55), 16.0)
+    full = bits(run_paged_prefill(pr, causal=False, logits_soft_cap=cap))
+    assert torch.equal(
+        bits(run_ragged_prefill(pr, causal=False, logits_soft_cap=cap)), full
+    )
+
+    def sub(sel):
+        p = Problem([q_lens[i] for i in sel], [kv_lens[i] for i in sel], 32, 8, D, 16)
+        for j, i in enumerate(sel):
+            qa, qb = int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])
+            sa, sb = int(p.qo_indptr[j]), int(p.qo_indptr[j + 1])
+            p.q[sa:sb] = pr.q[qa:qb]
+            ka, kb = int(pr.kv_indptr_rag[i]), int(pr.kv_indptr_rag[i + 1])
+            ta, tb = int(p.kv_indptr_rag[j]), int(p.kv_indptr_rag[j + 1])
+            p.k_rag[ta:tb] = pr.k_rag[ka:kb]
+            p.v_rag[ta:tb] = pr.v_rag[ka:kb]
+        return _repack(p)
+
+    for sel in ([2], [4, 0], [3, 1, 2], [1, 0, 4, 3, 2]):
+        p = sub(sel)
+        got_p = bits(run_paged_prefill(p, causal=False, logits_soft_cap=cap))
+        got_r = bits(run_ragged_prefill(p, causal=False, logits_soft_cap=cap))
+        for j, i in enumerate(sel):
+            qa, qb = int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1])
+            sa, sb = int(p.qo_indptr[j]), int(p.qo_indptr[j + 1])
+            assert torch.equal(got_p[sa:sb], full[qa:qb]), (D, sel, i, "paged")
+            assert torch.equal(got_r[sa:sb], full[qa:qb]), (D, sel, i, "ragged")
+    # multi-token decode: the whole batch against a sub-batch, and both against the prefill rows
+    dec, rows = run_decode_noncausal(pr, 4, logits_soft_cap=cap)
+    assert torch.equal(bits(dec), full[rows])
+    p = sub([1, 4])
+    dsub, _ = run_decode_noncausal(p, 4, logits_soft_cap=cap)
+    assert torch.equal(bits(dsub), torch.cat([bits(dec)[4:8], bits(dec)[16:20]]))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_soft_cap_noncausal_config_agreement(D):
+    """R3 under the capped non-causal class: ring depths, unit kinds (fused, split with the fixup kernel, split folded
+    in-kernel), softmax warpgroups, the small-unit bodies (a multi-token decode batch on the Swaps body and on the replicated
+    rows) and (D = 64) the paired placement give the wrapper's bits; the cap's value is a runtime input (two caps run the
+    same compiled kernels)."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.blocks.compile import (
+        get_compiled_attention,
+    )
+
+    cap = 30.0
+    if D == 64:
+        pr = Problem([2048, 2048, 4], [4096, 3000, 1000], 32, 8, D, 16, seed=56)
+    else:
+        pr = Problem([256, 4, 1000, 4], [3000, 2500, 1000, 5000], 32, 8, D, 16, seed=56)
+    pr = _hot(pr, 16.0)
+    ref = bits(run_paged_prefill(pr, causal=False, logits_soft_cap=cap))
+    dec_ref, rows = run_decode_noncausal(pr, 4, logits_soft_cap=cap)
+    assert torch.equal(bits(dec_ref), ref[rows])
+    space = engine.all_valid_configs(D)
+    cfgs = list(space[:: {64: 21, 128: 9, 256: 3}[D]])
+    if D == 64:
+        two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
+        cfgs += [replace(two, kv_slots=s) for s in (2, 3)]
+
+    def run(qo, q, cfg, value):
+        planned = engine.plan_attention(
+            qo,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            D,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            causal=False,
+        )
+        return engine.run_attention(
+            planned,
+            q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(D),
+            -1,
+            "NHD",
+            None,
+            cfg,
+            logits_soft_cap=value,
+        )
+
+    # the multi-token decode batch of the same requests' last four tokens: small units and split groups
+    dqo = torch.arange(len(pr.q_lens) + 1, dtype=torch.int32, device=pr.device) * 4
+    dq = pr.q[rows].contiguous()
+    for cfg in cfgs:
+        assert torch.equal(bits(run(pr.qo_indptr, pr.q, cfg, cap)), ref), cfg
+        if not cfg.q2:
+            assert torch.equal(bits(run(dqo, dq, cfg, cap)), bits(dec_ref)), cfg
+    compiled = get_compiled_attention.cache_info().currsize
+    other = run(pr.qo_indptr, pr.q, engine.default_config(D=D), 50.0)
+    assert get_compiled_attention.cache_info().currsize == compiled
+    assert not torch.equal(bits(other), ref)
+    assert torch.equal(
+        bits(other), bits(run_paged_prefill(pr, causal=False, logits_soft_cap=50.0))
+    )
+
+
+@needs_device
+@pytest.mark.parametrize("kind", [1, 2], ids=["paged", "ragged"])
+def test_soft_cap_noncausal_forward_and_refusals(kind):
+    """A capped non-causal plan: ``forward()`` takes the planned cap and mask mode (the bits of ``run()``) and refuses another
+    cap or the other mode, leaving the plan intact; a window stays outside the non-causal class under a cap, and a cap that
+    names no class is refused at ``plan()``."""
+    pr = _hot(Problem([64, 3], [900, 17], 8, 2, 128, 16, seed=57), 16.0)
+    w, args, plan_args, plan_kw = _wrapper_case(
+        kind, pr, causal=False, logits_soft_cap=30.0
+    )
+    expected = bits(w.run(*args)).clone()
+    ref = capped_reference(pr, 30.0, causal=False)
+    err = (w.run(*args).double() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    assert torch.equal(
+        bits(w.forward(*args, causal=False, logits_soft_cap=30.0)), expected
+    )
+    for other in (None, 0.0, 50.0, -30.0, float("nan")):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            w.forward(*args, causal=False, logits_soft_cap=other)
+        assert torch.equal(bits(w.run(*args)), expected)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.forward(*args, causal=True, logits_soft_cap=30.0)
+    assert torch.equal(bits(w.run(*args)), expected)
+    for bad in (
+        {"window_left": 32},
+        {"logits_soft_cap": -30.0},
+        {"logits_soft_cap": float("inf")},
+        {"logits_soft_cap": 1e39},
+    ):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            w.plan(*plan_args, **(plan_kw | bad))
+        assert torch.equal(bits(w.run(*args)), expected)  # the earlier plan stands
