@@ -347,7 +347,8 @@ def test_non_swap_gated_tma_ring_uses_physical_box_bytes(tile_n, epi_tile_n):
         * cfg.num_epilogue_warpgroups
     )
     assert not replace(cfg, use_deepseek_fp8=1).uses_non_swap_c_tma_ring
-    assert not replace(cfg, dtype_c=int(DType.E2M1)).uses_non_swap_c_tma_ring
+    # Gated NVFP4 now has its own persistent scratch ring as well.
+    assert replace(cfg, dtype_c=int(DType.E2M1)).uses_non_swap_c_tma_ring
     assert not replace(cfg, dtype_c=int(DType.E4M3)).uses_non_swap_c_tma_ring
 
 

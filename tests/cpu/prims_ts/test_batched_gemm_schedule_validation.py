@@ -950,7 +950,7 @@ def test_sm107_task_manager_smem_matches_kernel_capacity_check(monkeypatch):
         num_stages_smem_sfb=5,
         num_stages_tmem_acc=2,
         num_stages_tmem_sfa=4,
-        num_stages_tmem_sfb=10,
+        num_stages_tmem_sfb=7,
         num_stages_c_smem=2,
         num_stages_workid=3,
         use_tma_oob_opt=1,
@@ -964,7 +964,7 @@ def test_sm107_task_manager_smem_matches_kernel_capacity_check(monkeypatch):
 
     with pytest.raises(
         ValueError,
-        match=r"SMEM usage \(334856 B",
+        match=r"SMEM usage \(334888 B",
     ):
         build_batched_gemm_task_manager(
             num_experts=96,
@@ -984,7 +984,7 @@ def test_sm107_task_manager_smem_matches_kernel_capacity_check(monkeypatch):
     assert (
         manager._smem_allocator.total_smem_bytes
         + manager._smem_allocator.barrier_smem_bytes
-        == 334808
+        == 334840
     )
 
 
@@ -1146,6 +1146,23 @@ def test_validation_accepts_safe_fused_operand_sf_pipeline():
 
 
 @pytest.mark.cpu_only
+def test_fused_operand_sf_relay_accepts_short_operand_rings():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        _ldgsts_sfb_producer_commit_prefetch_depth,
+        validate_config,
+    )
+
+    cfg = _fused_operand_sf_config(
+        num_stages_a=1, num_stages_b=1, num_stages_smem_sfb=4
+    )
+    validate_config(cfg)
+    # Completion barriers replace delayed cp.async group commits, so SFB's
+    # deeper ring does not require spare operand stages for forward progress.
+    assert cfg.uses_ldgsts_sf_relay
+    assert _ldgsts_sfb_producer_commit_prefetch_depth(cfg) == 0
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("operand", ("sfa", "sfb"))
 def test_validation_rejects_fused_sf_copy_with_non_r128c4_layout(operand):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -1195,14 +1212,6 @@ def test_validation_rejects_fused_sf_copy_with_non_r128c4_layout(operand):
         (
             {"num_load_sfb_warps": 2},
             "Fused B/SF loader requires equal warp counts",
-        ),
-        (
-            {
-                "num_stages_a": 1,
-                "num_stages_b": 1,
-                "num_stages_smem_sfb": 4,
-            },
-            "delayed SFB commit depth",
         ),
     ),
 )

@@ -160,6 +160,7 @@ def prims_ts_fp4_block_scale_moe(
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
     num_fused_shared_experts: Optional[int] = None,
+    use_fused_finalize: bool = True,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE using the Prims-TS backend on SM100/SM103/SM107.
 
@@ -245,6 +246,12 @@ def prims_ts_fp4_block_scale_moe(
         Precomputed routing weights when not routing from logits.
     num_fused_shared_experts : Optional[int]
         Number of fused shared experts (default ``None`` / ``0``).
+
+    use_fused_finalize : bool
+        Fuse router weighting and BF16 atomic reduction into supported native
+        Rubin FC2 epilogues (default ``True``). Reduction order is unspecified.
+        Fusion is disabled for other tactics, ``do_finalize=False``,
+        or when PyTorch deterministic algorithms are enabled.
 
     Returns
     -------
@@ -373,6 +380,7 @@ def prims_ts_fp4_block_scale_moe(
         use_shuffled_weight=True,
         weight_layout=weight_layout,
         do_finalize=do_finalize,
+        use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
         norm_topk_prob=norm_topk_prob,
@@ -747,6 +755,8 @@ def _fake_prims_ts_fp4_block_scale_moe(
     routing_input_mode: int = RoutingInputMode.FromLogits,
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
+    num_fused_shared_experts: Optional[int] = None,
+    use_fused_finalize: bool = True,
 ) -> List[torch.Tensor]:
     del (
         routing_logits,
@@ -783,6 +793,8 @@ def _fake_prims_ts_fp4_block_scale_moe(
         routing_input_mode,
         topk_ids,
         topk_weights,
+        num_fused_shared_experts,
+        use_fused_finalize,
     )
     hidden_size = (
         hidden_states.shape[-1] * 2
@@ -833,8 +845,9 @@ def prims_ts_fp4_block_scale_routed_moe(
     per_token_scale: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    use_fused_finalize: bool = True,
 ) -> List[torch.Tensor]:
-    r"""FP4 block-scaled MoE with precomputed routing (Prims-TS / SM100).
+    r"""FP4 block-scaled MoE with precomputed routing (Prims-TS / SM100/SM103/SM107).
 
     Same arguments and return value as
     :func:`~flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe`.
@@ -907,6 +920,10 @@ def prims_ts_fp4_block_scale_routed_moe(
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
 
+    use_fused_finalize : bool
+        Fuse supported native Rubin FC2 finalization (default ``True``), with
+        the same BF16 atomic reduction and fallback rules as the flat API.
+
     Returns
     -------
     List[torch.Tensor]
@@ -949,6 +966,7 @@ def prims_ts_fp4_block_scale_routed_moe(
         routing_method_type=routing_method_type,
         weight_layout=weight_layout,
         do_finalize=do_finalize,
+        use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
         per_token_scale=per_token_scale,

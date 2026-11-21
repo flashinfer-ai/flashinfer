@@ -131,7 +131,12 @@ class GmemAResource(MemoryResource):
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
         token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
-        self.tile_expert_idx = self.tile_idx_view.load(idx=token_cga, vector_size=1)[0]
+        if cutlass.const_expr(self.cfg.dense_single_expert):
+            self.tile_expert_idx = Int32(0)
+        else:
+            self.tile_expert_idx = self.tile_idx_view.load(
+                idx=token_cga, vector_size=1
+            )[0]
         self.tile_mn_limit = self._local_tile_limit(
             self.mn_limit_view.load(idx=token_cga, vector_size=1)[0],
             token_tile,
@@ -244,7 +249,12 @@ class GmemBResource(MemoryResource):
             token_tile = tile_coord_m
             token_rows = self.cfg.tile_m
         token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
-        self.tile_expert_idx = self.tile_idx_view.load(idx=token_cga, vector_size=1)[0]
+        if cutlass.const_expr(self.cfg.dense_single_expert):
+            self.tile_expert_idx = Int32(0)
+        else:
+            self.tile_expert_idx = self.tile_idx_view.load(
+                idx=token_cga, vector_size=1
+            )[0]
         self.tile_mn_limit = self._local_tile_limit(
             self.mn_limit_view.load(idx=token_cga, vector_size=1)[0],
             token_tile,

@@ -21,7 +21,9 @@ Modes:
 """
 
 import argparse
+import json
 from bisect import bisect_right
+import ctypes
 from dataclasses import dataclass, replace
 from functools import lru_cache
 import gc
@@ -81,9 +83,12 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
+from flashinfer.tllm_enums import WeightLayout
+
 from .batched_gemm_kernel import (
     build_batched_gemm_task_manager,
     gemm,
+    prepare_gemm_descriptors,
 )
 from .batched_gemm_config import (
     BatchMode,
@@ -98,6 +103,7 @@ from .batched_gemm_config import (
     resolve_early_exit_max_token_ctas,
     shuffled_matrix_row_indices,
     validate_launch_grid,
+    validate_config,
 )
 from .batched_gemm_quant import (
     kaiming_uniform_tensor as _kaiming_uniform_tensor,
@@ -583,7 +589,7 @@ def _validate_swap_ab_out_hidden(cfg, out_hidden: int) -> None:
         )
 
 
-def _runtime_config(cfg, in_hidden: int):
+def _runtime_config(cfg, in_hidden: int, *, out_hidden: int | None = None):
     """Normalize runtime options for a concrete K."""
     if cfg.use_deepseek_fp8:
         block = cfg.deepseek_fp8_block_size
@@ -599,7 +605,12 @@ def _runtime_config(cfg, in_hidden: int):
                 "use_deepseek_fp8=1 requires problem_k to be a multiple of "
                 f"deepseek_fp8_block_size={block}, got problem_k={in_hidden}"
             )
-    return resolve_problem_config(cfg, in_hidden)
+    cfg = resolve_problem_config(cfg, in_hidden)
+    if (cfg.dense_m_repeats == 2 or cfg.routed_native_sfa) and out_hidden is not None:
+        # Validate the expert SF stride before allocating or launching. M is
+        # padded later and does not constrain this output-width check.
+        validate_config(cfg, problem_mnk=(0, out_hidden, in_hidden))
+    return cfg
 
 
 def _expand_bf16_activations(
@@ -1630,23 +1641,32 @@ def _dequantize_dsfp8_output(
     return fp8_view * sf_c.float()[sf_idx]
 
 
-def reorder_rows_for_gated_act(tensor: torch.Tensor) -> torch.Tensor:
+def reorder_rows_for_gated_act(
+    tensor: torch.Tensor, group_size: int = 1
+) -> torch.Tensor:
     """Interleave first half and second half rows for gated activation.
 
       Original:  [r0, r1, ..., r(M/2-1), r(M/2), ..., r(M-1)]
       Reordered: [r0, r(M/2), r1, r(M/2+1), ..., r(M/2-1), r(M-1)]
 
     Applied to weights so adjacent output rows in the MMA accumulator
-    contain (gate, up) pairs for gated activations.
+    contain (linear/up, nonlinear/gate) pairs for gated activations.
 
     Args:
-        tensor: (..., M, K) — last two dims are rows × cols. M must be even.
+        tensor: (..., M, K) — last two dims are rows × cols.
+        group_size: Consecutive up/gate rows per group; M must be divisible
+            by twice this value. The 64-row form feeds two contiguous TMEM
+            loads without rearranging up/gate register pairs for packed math.
     """
     M = tensor.shape[-2]
-    assert M % 2 == 0, f"M must be even for gated act reorder, got {M}"
+    if group_size not in (1, 64) or M % (2 * group_size):
+        raise ValueError(f"Invalid gated row grouping: M={M}, group_size={group_size}")
     half = M // 2
     rows = torch.arange(M, dtype=torch.long, device=tensor.device)
-    source_rows = torch.stack((rows[:half], rows[half:]), dim=1).flatten()
+    source_rows = torch.stack(
+        (rows[:half].reshape(-1, group_size), rows[half:].reshape(-1, group_size)),
+        dim=1,
+    ).flatten()
     return tensor.index_select(-2, source_rows)
 
 
@@ -1727,13 +1747,14 @@ def _kernel_weight_row_source_indices(
     epilogue_tile_m: int,
     shuffle_weight_rows: bool,
     device: torch.device,
+    group_size: int = 1,
 ) -> torch.Tensor:
     """Return the original weight row stored at each kernel weight row."""
     row_ids = torch.arange(num_rows, dtype=torch.long, device=device).view(
         1, num_rows, 1
     )
     if is_gated:
-        row_ids = reorder_rows_for_gated_act(row_ids)
+        row_ids = reorder_rows_for_gated_act(row_ids, group_size)
     if shuffle_weight_rows:
         row_ids = shuffle_matrix(row_ids, epilogue_tile_m)
     return row_ids.view(num_rows)
@@ -1798,6 +1819,7 @@ def _kernel_weight_sf(
         epilogue_tile_m=cfg.epi_tile_m,
         shuffle_weight_rows=shuffle_weight_rows,
         device=sf_weights.device,
+        group_size=cfg.gated_weight_group_size,
     )
     return _permute_mma_sf_rows(
         sf_weights,
@@ -1835,6 +1857,7 @@ def _parse_overrides(args):
             {
                 "static": TileScheduler.STATIC,
                 "persistent": TileScheduler.PERSISTENT,
+                "static-persistent": TileScheduler.STATIC_PERSISTENT,
             }[args.tile_scheduler]
         ),
         "cta_raster_order": int(
@@ -1843,6 +1866,13 @@ def _parse_overrides(args):
                 "rasterizeAlongN": CtaRasterOrder.ALONG_N,
             }[args.cta_swizzle_type]
         ),
+        "cta_raster_group_m": args.cta_raster_group_m,
+        "weight_layout": int(
+            {"major_k": WeightLayout.MajorK, "block_major_k": WeightLayout.BlockMajorK}[
+                args.weight_layout
+            ]
+        ),
+        "gated_weight_group_size": args.gated_weight_group_size,
         "transpose_mma_output": args.transpose_mma_output,
         "use_shuffled_matrix": args.use_shuffled_matrix,
         "act_kind": int(
@@ -1882,6 +1912,30 @@ def _parse_overrides(args):
                 "r128c4": SfLayout.R128c4,
             }[args.sf_layout_c]
         ),
+        "dense_fuse_tma_pipeline": args.dense_fuse_tma_pipeline,
+        "dense_partition_tma_loads": args.dense_partition_tma_loads,
+        "dense_single_expert": args.dense_single_expert,
+        "dense_specialize_tma_cga": args.dense_specialize_tma_cga,
+        "dense_split_tma_pipeline": args.dense_split_tma_pipeline,
+        "dense_fuse_tma_loads": args.dense_fuse_tma_loads,
+        "dense_rolled_epilogue": args.dense_rolled_epilogue,
+        "dense_epilogue_warps": args.dense_epilogue_warps,
+        "dense_preload_epilogue": args.dense_preload_epilogue,
+        "dense_preload_store_prefix_fragments": args.dense_preload_store_prefix_fragments,
+        "epilogue_tmem_load_width": args.epilogue_tmem_load_width,
+        "epilogue_tmem_load_ahead": args.epilogue_tmem_load_ahead,
+        "epilogue_smem_staging": args.epilogue_smem_staging,
+        "epilogue_tmem_release": args.epilogue_tmem_release,
+        "epilogue_steps": args.epilogue_steps,
+        "dense_streaming_c": args.dense_streaming_c,
+        "dense_a_l2_promotion": args.dense_a_l2_promotion,
+        "dense_retain_a": args.dense_retain_a,
+        "dense_dkg_store_order": args.dense_dkg_store_order,
+        "dense_local_barrier": args.dense_local_barrier,
+        "dense_m_repeats": args.dense_m_repeats,
+        "dense_b_reuse": args.dense_b_reuse,
+        "dense_async_sf": args.dense_async_sf,
+        "dense_rolled_mma": args.dense_rolled_mma,
         "umma_cta_count": args.umma_cta_count,
         "cluster_dim_x": args.cluster_dim_x,
         "cluster_dim_y": args.cluster_dim_y,
@@ -1920,12 +1974,19 @@ def _parse_overrides(args):
         "load_sfa_regs": args.load_sfa_regs,
         "load_sfb_regs": args.load_sfb_regs,
         "copy_sf_regs": args.copy_sf_regs,
+        "sync_regs": args.sync_regs,
         "workid_regs": args.workid_regs,
+        "num_stages_workid": args.num_stages_workid,
         "padding_regs": args.padding_regs,
         "use_unroll_loop_2x_for_mma": args.use_unroll_loop_2x_for_mma,
         "use_max_tmem_overlap": args.use_max_tmem_overlap,
         "fuse_sf_copy_to_mma": args.fuse_sf_copy_to_mma,
         "fuse_operand_sf_loads": args.fuse_operand_sf_loads,
+        "fused_a_single_commit": args.fused_a_single_commit,
+        "routed_native_sfa": args.routed_native_sfa,
+        "routed_low_smem": args.routed_low_smem,
+        "routed_sfa_first": args.routed_sfa_first,
+        "static_persistent_clusters": args.static_persistent_clusters,
         "use_early_exit": args.use_early_exit,
         "use_clc_fast_drain": args.use_clc_fast_drain,
         "use_work_throttle": args.use_work_throttle,
@@ -1995,20 +2056,27 @@ _C_UNWRITTEN_POISON_F = float("nan")
 _C_UNWRITTEN_POISON_E4M3_U8 = 0x7F
 
 
-def _same_launch_output(first: torch.Tensor, current: torch.Tensor) -> bool:
-    """Whether two launches produced the same C buffer.
+def _active_route_output(output, active_route_mask, *, is_swap_ab):
+    """Select observable token rows/columns from a logical output tensor."""
+    token_dim = 1 if is_swap_ab else 0
+    # Declared capacity can exceed the routed padded extent.
+    if output.shape[token_dim] > active_route_mask.numel():
+        output = output.narrow(token_dim, 0, active_route_mask.numel())
+    if output.shape[token_dim] != active_route_mask.numel():
+        raise AssertionError(
+            "output token extent does not match routed metadata: "
+            f"{output.shape[token_dim]} != {active_route_mask.numel()}"
+        )
+    return output[:, active_route_mask] if is_swap_ab else output[active_route_mask, :]
 
-    Elements the epilogue never stores keep their poison, so plain equality
-    would read the unwritten NaNs as a difference and report a deterministic
-    kernel as nondeterministic. Treat two NaNs in the same position as equal
-    and let the NaN coverage check downstream report them instead.
-    """
-    if torch.equal(first, current):
-        return True
-    if not first.dtype.is_floating_point:
+
+def _same_launch_output(first: torch.Tensor, current: torch.Tensor) -> bool:
+    """Compare observable output bits, including signed zeros and NaN payloads."""
+    if first.dtype != current.dtype or first.shape != current.shape:
         return False
-    matches = (first == current) | (torch.isnan(first) & torch.isnan(current))
-    return bool(matches.all().item())
+    return torch.equal(
+        first.contiguous().view(torch.uint8), current.contiguous().view(torch.uint8)
+    )
 
 
 def _partition_view(storage, width, cols, pitch):
@@ -2100,7 +2168,10 @@ def reference_check(
     When problem_n / problem_k are None, they default to tile_n / tile_k
     (single-tile test). Set them to realistic values (e.g. 4096) for
     multi-tile benchmarks. ``repeat_launches`` reuses the compiled kernel and
-    requires bitwise-stable output and output scale buffers across launches.
+    requires bitwise-stable output for active tokens and output scale buffers
+    across launches.
+    ``output_guard_elements`` appends a sentinel region to C; block-scaled
+    output also guards SF-C with that many bytes.
 
     ``token_capacity`` declares a token extent wider than the routed padded
     count, the way the MoE runner must: its ``routed_token_capacity`` has to be
@@ -2130,8 +2201,14 @@ def reference_check(
     )
     all_zero_input_data = _uses_all_zero_input_data(data_distribution)
     cfg = make_config(**cfg_overrides)
+    if cfg.fuse_moe_finalize:
+        raise ValueError(
+            "standalone GEMM does not provide fused-finalize routing data and a zeroed token output; use the MoE runner"
+        )
+    if cfg.dense_single_expert and (num_experts != 1 or top_k != 1):
+        raise ValueError("dense_single_expert requires num_experts=top_k=1")
     if require_mixed_cga_runtime:
-        if cfg.fallback_cluster_shape is None:
+        if cfg.fallback_cluster_shape in (None, cfg.preferred_cluster_shape):
             raise ValueError(
                 "require_mixed_cga_runtime requires distinct preferred and "
                 "fallback cluster shapes"
@@ -2153,7 +2230,7 @@ def reference_check(
     default_out_hidden = cfg.tile_m if cfg.is_swap_ab else cfg.tile_n
     out_hidden = problem_n if problem_n is not None else default_out_hidden
     in_hidden = problem_k if problem_k is not None else cfg.tile_k
-    cfg = _runtime_config(cfg, in_hidden)
+    cfg = _runtime_config(cfg, in_hidden, out_hidden=out_hidden)
     scale_c_is_auto = scale_c_value is None
     scale_c_value = _resolve_scale_c(
         scale_c_value,
@@ -2518,13 +2595,15 @@ def reference_check(
     #             M=out_hidden, N=tokens, C is M-major
     # non-swapAB: A=activations(tokens×in_hidden), B=weights(out_hidden×in_hidden)
     #             M=tokens, N=out_hidden, C is row-major
-    # For gated activations: interleave gate/up weight rows so adjacent accumulator
-    # columns contain (gate, up) pairs. The kernel output has out_hidden
+    # For gated activations: interleave weight rows so adjacent accumulator
+    # columns contain (linear, gate) pairs. The GEMM output has out_hidden
     # columns; the epilogue applies the activation to produce out_hidden/2 columns.
     is_gated = _is_gated_act_kind(cfg.act_kind)
     preprocessed_weights = weights_torch
     if is_gated:
-        preprocessed_weights = reorder_rows_for_gated_act(weights_torch)
+        preprocessed_weights = reorder_rows_for_gated_act(
+            weights_torch, cfg.gated_weight_group_size
+        )
 
     if declared_padded_tokens > total_padded_tokens and not cfg.has_routed_act:
         # Expanded activations are indexed by padded token row, so widening the
@@ -2618,11 +2697,16 @@ def reference_check(
     c_storage_elems = logical_output_n * c_pitch
     c_touched = None
     sf_c_touched = None
+    sf_c_guard = None
     if cfg.has_output_block_scaling:
-        if output_guard_elements > 0:
-            raise ValueError("output_guard_elements is not supported with FP4 C output")
+        c_numel = _quantized_c_numel(cfg, c_pitch, logical_output_n)
+        c_guard_bytes = (
+            output_guard_elements
+            if cfg.uses_mxfp8_output_quant
+            else (output_guard_elements + 1) // 2
+        )
         c_storage = torch.full(
-            (_quantized_c_numel(cfg, c_pitch, logical_output_n),),
+            (c_numel + c_guard_bytes,),
             _C_STRIDE_SENTINEL_U8 if c_row_stride else 0,
             dtype=torch.uint8,
             device=device,
@@ -2637,12 +2721,21 @@ def reference_check(
                     cfg.output_sf_block_size_c,
                     is_swap_ab=cfg.is_swap_ab,
                     pitch=c_pitch,
-                ),
+                )
+                + output_guard_elements,
             ),
             _C_STRIDE_SENTINEL_U8 if c_row_stride else 0,
             dtype=torch.uint8,
             device=device,
         )
+        output_guard_value = _C_STRIDE_SENTINEL_U8
+        c_guard = c_storage[c_numel:]
+        c_guard.fill_(output_guard_value)
+        c_storage = c_storage[:c_numel]
+        if output_guard_elements:
+            sf_c_guard = sf_c_torch[-output_guard_elements:]
+            sf_c_guard.fill_(output_guard_value)
+            sf_c_torch = sf_c_torch[:-output_guard_elements]
         if c_row_stride:
             m_idx = torch.arange(logical_output_m, device=device).view(-1, 1)
             n_idx = torch.arange(logical_output_n, device=device).view(1, -1)
@@ -2672,8 +2765,6 @@ def reference_check(
             sf_c_touched = torch.zeros_like(sf_c_torch, dtype=torch.bool)
             sf_c_touched[sf_idx.reshape(-1)] = True
             sf_c_torch[sf_c_touched] = 0
-        output_guard_value = None
-        c_guard = None
     elif cfg.uses_fp8_output:
         if output_guard_elements > 0:
             raise ValueError("output_guard_elements is not supported with FP8 C output")
@@ -3022,29 +3113,82 @@ def reference_check(
     print("Compiling kernel...")
     compiled_fn = _compile_for_launch(ref_io, stream)
     print("Launching kernel...")
+    active_route_mask = torch.tensor(
+        [expert_idx >= 0 for expert_idx in token_layout.expanded_to_expert],
+        dtype=torch.bool,
+        device=device,
+    )
+
+    def _active_routes(output):
+        return _active_route_output(
+            output, active_route_mask, is_swap_ab=cfg.is_swap_ab
+        )
+
     first_output = None
     first_scale = None
     outputs_deterministic = True
     scales_deterministic = True
+    active_scale_offsets = None
+    if repeat_launches > 1 and cfg.has_output_block_scaling and not cfg.is_swap_ab:
+        # SF-C for unobserved padded rows is unspecified, just like C. Select
+        # every scale used by a real row; allocation guards stay independent.
+        sf_cols = (
+            _round_up(logical_output_n, cfg.output_sf_block_size_c)
+            // cfg.output_sf_block_size_c
+        )
+        active_scale_offsets = _sf_offsets(
+            row_idx=torch.nonzero(active_route_mask, as_tuple=False).flatten(),
+            sf_cols=sf_cols,
+            layout=cfg.sf_layout_c,
+            num_padded_sf_cols=_round_up(sf_cols, 4),
+            device=device,
+        )
     for _ in range(repeat_launches):
+        if require_mixed_cga_runtime:
+            # Count one physical grid, not the sum of repeated launches,
+            # when checking whether the logical work exceeds a grid wave.
+            num_non_exiting_ctas[1:].zero_()
         compiled_fn(*_launch_arg_tuple(ref_io, stream))
         torch.cuda.synchronize()
         if repeat_launches > 1:
+            scale_tensor = (
+                sf_c_torch[active_scale_offsets]
+                if active_scale_offsets is not None
+                else sf_c_torch
+            )
             output_tensor = (
                 c_storage
                 if (cfg.has_output_block_scaling or cfg.uses_fp8_output)
                 else c_torch
             )
+            if (
+                cfg.has_output_block_scaling
+                and not cfg.is_swap_ab
+                and logical_output_n % 2 == 0
+            ):
+                # FP4 has no NaN encoding. Inactive routed rows can therefore
+                # produce arbitrary packed bytes even when SF-C is zero.
+                # For whole-byte rows, compare raw bytes for every real token,
+                # with the same padding exclusion as plain output below.
+                output_tensor = _active_routes(c_storage.reshape(logical_output_m, -1))
+            elif not (cfg.has_output_block_scaling or cfg.uses_fp8_output):
+                # Routed loads may leave inactive SMEM rows unspecified, and
+                # an epilogue can store those rows as part of a full tile.
+                # Compare the same observable rows as the numerical reference;
+                # allocation/stride guards remain checked separately below.
+                output_tensor = _active_routes(output_tensor)
             if first_output is None:
                 first_output = output_tensor.detach().clone()
                 if cfg.has_output_block_scaling or cfg.has_deepseek_fp8_c_scale:
-                    first_scale = sf_c_torch.detach().clone()
+                    first_scale = scale_tensor.detach().clone()
             else:
                 outputs_deterministic &= _same_launch_output(
                     first_output, output_tensor
                 )
                 if first_scale is not None:
-                    scales_deterministic &= _same_launch_output(first_scale, sf_c_torch)
+                    scales_deterministic &= _same_launch_output(
+                        first_scale, scale_tensor
+                    )
 
     runtime_cga_shapes_ok = True
     if require_mixed_cga_runtime:
@@ -3222,34 +3366,17 @@ def reference_check(
 
     if output_guard_elements > 0:
         guard_changed = (c_guard != output_guard_value).any().item()
+        if sf_c_guard is not None:
+            guard_changed |= (sf_c_guard != output_guard_value).any().item()
         print(f"Output guard changed: {guard_changed}")
         if guard_changed:
-            return _return_diagnostics(False, reason="output guard was modified")
+            return _return_diagnostics(
+                False, reason="output or scale guard was modified"
+            )
 
     # Routed MoE kernels are only required to write rows/columns that map to
     # real tokens. Expert padding remains outside the observable output, so do
     # not treat unspecified padding values as correctness failures.
-    active_route_mask = torch.tensor(
-        [expert_idx >= 0 for expert_idx in token_layout.expanded_to_expert],
-        dtype=torch.bool,
-        device=device,
-    )
-
-    def _active_routes(output):
-        token_dim = 1 if cfg.is_swap_ab else 0
-        # A declared capacity wider than the routed count leaves a tail the
-        # kernel never writes, so drop it before selecting the routed rows.
-        if output.shape[token_dim] > active_route_mask.numel():
-            output = output.narrow(token_dim, 0, active_route_mask.numel())
-        if output.shape[token_dim] != active_route_mask.numel():
-            raise AssertionError(
-                "output token extent does not match routed metadata: "
-                f"{output.shape[token_dim]} != {active_route_mask.numel()}"
-            )
-        if cfg.is_swap_ab:
-            return output[:, active_route_mask]
-        return output[active_route_mask, :]
-
     # --- PyTorch reference ---
     c_active = _active_routes(c_logical)
     nan_count = int(torch.isnan(c_active).sum().item())
@@ -3525,7 +3652,8 @@ def reference_check(
     is_silu = cfg.act_kind == int(ActKind.SILU)
 
     if is_gated:
-        # Gated activation: weights are logically [gate-half, up-half].
+        # Logical weights are [linear/up-half, nonlinear/gate-half]. The legacy
+        # local names below are reversed: `gate` is linear, `up` enters SiLU.
         def _quick_gelu(x, scale_gate):
             return x * torch.sigmoid(1.702 * x * scale_gate)
 
@@ -3794,6 +3922,12 @@ def _build_launch_io(
     )
     all_zero_input_data = _uses_all_zero_input_data(data_distribution)
     cfg = make_config(**cfg_overrides)
+    if cfg.fuse_moe_finalize:
+        raise ValueError(
+            "standalone GEMM does not provide fused-finalize routing data and a zeroed token output; use the MoE runner"
+        )
+    if cfg.dense_single_expert and (num_experts != 1 or top_k != 1):
+        raise ValueError("dense_single_expert requires num_experts=top_k=1")
 
     torch.manual_seed(seed)
     device = input_device
@@ -3805,7 +3939,7 @@ def _build_launch_io(
     default_out_hidden = cfg.tile_m if cfg.is_swap_ab else cfg.tile_n
     out_hidden = problem_n if problem_n is not None else default_out_hidden
     in_hidden = problem_k if problem_k is not None else cfg.tile_k
-    cfg = _runtime_config(cfg, in_hidden)
+    cfg = _runtime_config(cfg, in_hidden, out_hidden=out_hidden)
     scale_c_value = _resolve_scale_c(
         scale_c_value,
         cfg=cfg,
@@ -3859,6 +3993,7 @@ def _build_launch_io(
             bool(cfg.is_fp8_mma),
             bool(cfg.is_swap_ab),
             int(cfg.act_kind),
+            int(cfg.gated_weight_group_size),
             int(cfg.epi_tile_m),
             bool(cfg.uses_shuffled_matrix),
             int(getattr(cfg, "weight_layout", 0)),
@@ -4068,7 +4203,9 @@ def _build_launch_io(
         assert weights_torch is not None
         preprocessed_weights = weights_torch
         if is_gated:
-            preprocessed_weights = reorder_rows_for_gated_act(weights_torch)
+            preprocessed_weights = reorder_rows_for_gated_act(
+                weights_torch, cfg.gated_weight_group_size
+            )
         kernel_weights = preprocessed_weights
         shuffle_weight_rows = cfg.is_swap_ab or cfg.uses_shuffled_matrix
         if shuffle_weight_rows:
@@ -4507,6 +4644,25 @@ def _fused_finalize_args(io: dict) -> tuple:
     return (io["c0_dp"], io["route_map_dp"], io["scale_c_dp"])
 
 
+def _native_finalize_args(io: dict) -> tuple:
+    """Native finalization requires the MoE caller's routing buffers."""
+    names = ("finalize_scale_dp", "finalize_route_dp")
+    if getattr(io["cfg"], "fuse_moe_finalize", False):
+        missing = [name for name in names if io.get(name) is None]
+        if missing:
+            raise ValueError(f"a fused-finalize launch needs {', '.join(missing)}")
+        return tuple(io[name] for name in names)
+    return (
+        io.get("finalize_scale_dp", io["scale_c_dp"]),
+        io.get("finalize_route_dp", io["route_map_dp"]),
+    )
+
+
+def _validate_launch_expert_count(io: dict) -> None:
+    if getattr(io["cfg"], "dense_single_expert", False) and io["shape"][3] != 1:
+        raise ValueError("dense_single_expert requires num_experts_dim=1")
+
+
 def _compile_arg_tuple(io: dict, stream) -> tuple:
     """Positional args for ``cute.compile(gemm, ...)``.
 
@@ -4514,6 +4670,7 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
     ``launch_early_exit_max_token_ctas`` is a runtime launch argument because
     it only controls the over-launched grid size for dynamic-batch reuse.
     """
+    _validate_launch_expert_count(io)
     return (
         io["a_dp"],
         io["b_dp"],
@@ -4536,12 +4693,15 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
         *_fused_finalize_args(io),
+        *_native_finalize_args(io),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
         int(io.get("sf_c_m_offset", 0)),
         io["cfg"],
         stream,
+        io.get("tma_desc_storage_dp"),
+        False,
     )
 
 
@@ -4564,6 +4724,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
     ``JitArguments`` workspaces in :func:`benchmark`: same as
     :func:`_compile_arg_tuple` minus the constexpr ``cfg`` operand.
     """
+    _validate_launch_expert_count(io)
     problem_m, problem_n = (int(value) for value in io["shape"][:2])
     validate_launch_grid(
         io["cfg"],
@@ -4593,11 +4754,46 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
         *_fused_finalize_args(io),
+        *_native_finalize_args(io),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
         int(io.get("sf_c_m_offset", 0)),
         stream,
+        io.get("tma_desc_storage_dp"),
+    )
+
+
+def _prepare_tma_descriptors(io: dict, stream) -> None:
+    """Own descriptors per IO workspace, rebuilding when its binding changes."""
+    from cutlass.cutlass_dsl import BaseDSL
+    from cutlass.cute.runtime import make_ptr
+
+    if _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA"):
+        return
+    key = tuple(
+        io[name]._pointer for name in ("a_dp", "b_dp", "c0_dp", "sfa_dp", "sfb_dp")
+    ) + (io["shape"], _c_row_stride(io), repr(io["cfg"]))
+    if io.get("_tma_descriptor_key") == key:
+        return
+    # CUtensorMap is 128 bytes and requires 64-byte alignment. Keep its owner
+    # in the same IO object as the device allocations it describes.
+    storage = ctypes.create_string_buffer(7 * 128 + 63)
+    address = (ctypes.addressof(storage) + 63) & ~63
+    descriptor_ptr = make_ptr(
+        cutlass.Uint8, address, cutlass.AddressSpace.generic, assumed_align=64
+    )
+    preparation_io = dict(io, tma_desc_storage_dp=descriptor_ptr)
+    with task_scheduling_scope(), BaseDSL.enable_pyir():
+        args = _launch_arg_tuple(preparation_io, stream)
+        prepare = cute.compile(
+            prepare_gemm_descriptors, args, io["cfg"], options=_cute_compile_options()
+        )
+    prepare(args)
+    io.update(
+        tma_desc_storage_dp=descriptor_ptr,
+        _tma_descriptor_storage=storage,
+        _tma_descriptor_key=key,
     )
 
 
@@ -4609,6 +4805,7 @@ def _compile_for_launch(io: dict, stream) -> object:
     """
     from cutlass.cutlass_dsl import BaseDSL
 
+    _prepare_tma_descriptors(io, stream)
     compile_entry = cute.compile
     if _generate_line_info_enabled():
         compile_entry = cute.compile[cute.GenerateLineInfo(True)]
@@ -4656,6 +4853,7 @@ def run(executable: _BatchedGemmExecutable, tensors: dict, stream) -> None:
             f"prepared tensors shape {tensors['shape']} does not match the "
             f"compiled shape {executable.shape}"
         )
+    _prepare_tma_descriptors(tensors, stream)
     executable.compiled_fn(*_launch_arg_tuple(tensors, stream))
 
 
@@ -4703,6 +4901,7 @@ def benchmark_compiled(
     cuda_profiler_range: bool = False,
     use_cuda_graphs: bool = True,
     host_input_gen: bool = False,
+    use_cupti: bool | None = None,
 ) -> float:
     """Time an already-compiled batched GEMM against one launch IO.
 
@@ -4778,10 +4977,10 @@ def benchmark_compiled(
             )
             sf_c_buf = sf_c_torch
             sf_c_ptr = sf_c_dp
-        args = testing.JitArguments(
-            *_launch_arg_tuple({**io, "c0_dp": c_ptr, "sf_c_dp": sf_c_ptr}, stream)
-        )
-        args.add_to_scope([c_buf, sf_c_buf])
+        workspace_io = dict(io, c0_dp=c_ptr, sf_c_dp=sf_c_ptr)
+        _prepare_tma_descriptors(workspace_io, stream)
+        args = testing.JitArguments(*_launch_arg_tuple(workspace_io, stream))
+        args.add_to_scope([c_buf, sf_c_buf, workspace_io])
         return args
 
     if cfg.is_bf16_mma or cfg.has_cast_a:
@@ -4833,6 +5032,7 @@ def benchmark_compiled(
                 warmup_iterations=warmup_iters,
                 iterations=bench_iters,
                 use_cuda_graphs=use_cuda_graphs,
+                **({} if use_cupti is None else {"use_cupti": use_cupti}),
             )
         )
     finally:
@@ -4934,7 +5134,7 @@ def benchmark(
     del compiled_fn
     gc.collect()
 
-    print(f"  Average kernel time: {exec_time:.1f} µs ({exec_time / 1000:.4f} ms)")
+    print(f"  Average kernel time: {exec_time:.4f} µs ({exec_time / 1000:.4f} ms)")
     routed_tokens = sum(io["token_layout"].tokens_per_expert)
     flops = 2.0 * routed_tokens * out_hidden * in_hidden
     # Only experts selected by this concrete routing layout read weights.
@@ -5082,7 +5282,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tile-scheduler",
-        choices=["static", "persistent"],
+        choices=["static", "persistent", "static-persistent"],
         default="static",
     )
     parser.add_argument(
@@ -5091,8 +5291,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="rasterizeAlongM",
         help=(
             "Persistent CLC CTA rasterization order; the option name and values "
-            "match TRTLLM-gen, but do not enable an additional CTA swizzle."
+            "match TRTLLM-gen. Use --cta-raster-group-m to interleave M clusters."
         ),
+    )
+    parser.add_argument(
+        "--cta-raster-group-m",
+        type=int,
+        choices=(1, 2, 4, 8),
+        default=1,
+        help="Interleave this many M clusters in persistent N order (dense pipeline).",
+    )
+    parser.add_argument(
+        "--weight-layout",
+        choices=("major_k", "block_major_k"),
+        default="major_k",
+        help="Weight storage layout; the runner packs weights before GEMM timing.",
+    )
+    parser.add_argument(
+        "--gated-weight-group-size",
+        type=int,
+        choices=(1, 64),
+        default=1,
+        help="Consecutive up/gate weight rows per group for the gated epilogue.",
     )
     parser.add_argument(
         "--transpose-mma-output",
@@ -5188,7 +5408,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-sfa-regs", type=int, default=0)
     parser.add_argument("--load-sfb-regs", type=int, default=0)
     parser.add_argument("--copy-sf-regs", type=int, default=48)
+    parser.add_argument("--sync-regs", type=int, default=48)
     parser.add_argument("--workid-regs", type=int, default=48)
+    parser.add_argument("--num-stages-workid", type=int, default=3)
     parser.add_argument("--padding-regs", type=int, default=48)
 
     parser.add_argument(
@@ -5197,8 +5419,109 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
     )
     parser.add_argument("--use-max-tmem-overlap", type=int, default=0)
+    parser.add_argument(
+        "--dense-partition-tma-loads", type=int, choices=(0, 1), default=0
+    )
+    parser.add_argument("--dense-single-expert", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--dense-specialize-tma-cga", type=int, choices=(0, 1), default=0
+    )
+    parser.add_argument(
+        "--dense-split-tma-pipeline", type=int, choices=(0, 1), default=0
+    )
+    parser.add_argument("--dense-fuse-tma-loads", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--dense-rolled-epilogue",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="Roll the non-overlap TMA epilogue, including dense/native-routed NVFP4/SwiGLU",
+    )
+    parser.add_argument(
+        "--dense-preload-epilogue", type=_binary_cli_flag, choices=(0, 1), default=0
+    )
+    parser.add_argument(
+        "--dense-preload-store-prefix-fragments",
+        type=int,
+        choices=(0, 2),
+        default=0,
+        help=(
+            "Store 0 (disabled) or 2 fragments before TMEM release; "
+            "2 requires --dense-preload-epilogue 1 and --dense-epilogue-warps 8"
+        ),
+    )
+    parser.add_argument(
+        "--dense-epilogue-warps",
+        type=int,
+        choices=(4, 8),
+        default=4,
+        help="Warps for the rolled dense/native-routed epilogue, including NVFP4/SwiGLU",
+    )
+    parser.add_argument(
+        "--epilogue-steps",
+        type=json.loads,
+        default=(),
+        help="JSON array of explicit epilogue load/stage/emit/release steps",
+    )
+    parser.add_argument(
+        "--epilogue-tmem-load-width",
+        type=int,
+        choices=(0, 32, 64),
+        default=0,
+        help="Preload width: 0 preserves the existing mapping; explicit 32/64 must match it",
+    )
+    parser.add_argument(
+        "--epilogue-tmem-load-ahead",
+        type=int,
+        choices=(-1, 0, 1),
+        default=-1,
+        help="Pending preload reads: -1 auto, 0 serial, 1 one read ahead; supported schedules only",
+    )
+    parser.add_argument(
+        "--epilogue-smem-staging",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help="0 auto, 1 fragment ring with register tail, 2 full-tile SMEM staging",
+    )
+    parser.add_argument(
+        "--epilogue-tmem-release",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help="0/1 release after preload, 2 release after output-store task",
+    )
+    parser.add_argument(
+        "--dense-streaming-c", type=_binary_cli_flag, choices=(0, 1), default=0
+    )
+    parser.add_argument(
+        "--dense-a-l2-promotion", type=int, choices=(0, 128, 256), default=0
+    )
+    parser.add_argument(
+        "--dense-retain-a", type=_binary_cli_flag, choices=(0, 1), default=0
+    )
+    parser.add_argument("--dense-dkg-store-order", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--dense-local-barrier", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--dense-m-repeats", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--dense-b-reuse", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--dense-async-sf", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--dense-rolled-mma", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--dense-fuse-tma-pipeline", type=int, choices=(0, 1), default=0
+    )
     parser.add_argument("--fuse-sf-copy-to-mma", type=int, choices=(0, 1), default=0)
     parser.add_argument("--fuse-operand-sf-loads", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--fused-a-single-commit", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--routed-native-sfa", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--routed-low-smem", type=int, choices=(0, 1), default=0)
+    parser.add_argument(
+        "--routed-sfa-first",
+        type=_binary_cli_flag,
+        choices=(0, 1),
+        default=0,
+        help="Place native routed SFA first in SMEM; requires --routed-low-smem 0",
+    )
+    parser.add_argument("--static-persistent-clusters", type=int, default=0)
     parser.add_argument("--use-early-exit", type=int, default=0)
     parser.add_argument("--use-clc-fast-drain", type=int, default=0)
     parser.add_argument("--use-work-throttle", type=int, default=1)

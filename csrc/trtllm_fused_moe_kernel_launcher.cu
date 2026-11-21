@@ -2492,6 +2492,10 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
     if (dtype_act == btg::Dtype::Bfloat16) {
       return {8, 16, 32, 64, 128};
     }
+    if (dtype_act == btg::Dtype::E2m1 && dtype_weights == btg::Dtype::E2m1) {
+      // Native Rubin Batch-M tiles span 512 or 1024 routed tokens per CGA.
+      return {8, 16, 32, 64, 128, 256, 512, 1024};
+    }
     return {8, 16, 32, 64, 128, 256};
   }
 
@@ -2556,7 +2560,19 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
         << "the second dimension of weights must be a multiple of 128.";
   }
 
-  void prepare_external_gemm_buffers() override {
+  void prepare_external_gemm_buffers() override { prepare_external_gemm_buffers(true); }
+
+  void prepare_fused_finalize_routing() {
+    // The router already knows the top-k slot while assigning each routed row.
+    // Retain it so FC2 can read the caller's coefficients without a permutation pass.
+    if (!permuted_idx_to_expanded_idx.has_value()) {
+      permuted_idx_to_expanded_idx =
+          alloc_tensor({workspace.total_max_padded_tokens}, dl_int32, hidden_states.device());
+    }
+    workspace.permuted_idx_to_expanded_idx = static_cast<int*>(permuted_idx_to_expanded_idx_ptr());
+  }
+
+  void prepare_external_gemm_buffers(bool allocate_gemm2_output) {
     auto const max_num_padded_tokens_gemm1 =
         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
             workspace.total_max_padded_tokens, args->intermediate_size,
@@ -2575,8 +2591,11 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
           max_num_padded_tokens_gemm1, args->intermediate_size / output_sf_vec_size);
       gemm1_output_scale = alloc_tensor({gemm1_sf_size}, dl_uint8, hidden_states.device());
     }
-    gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
-                                hidden_states.device());
+    // Fused FC2 writes the caller's token output directly. Keep an empty
+    // tensor in the staged return tuple without retaining expanded BF16 storage.
+    gemm2_output =
+        alloc_tensor({allocate_gemm2_output ? max_num_padded_tokens_gemm2 : 0, args->hidden_size},
+                     dl_bfloat16, hidden_states.device());
 
     workspace.hidden_states_scale_linear = nullptr;
     workspace.gemm1_output = gemm1_output.data_ptr();
@@ -2603,6 +2622,10 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
       result.push_back(gemm1_output_scale.value());
     }
     result.push_back(gemm2_output);
+    // Only NVFP4 consumers include the fused-finalize routing slot.
+    if (dtype_weights == btg::Dtype::E2m1) {
+      result.push_back(permuted_idx_to_expanded_idx);
+    }
     return result;
   }
 
@@ -3664,7 +3687,8 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     int64_t routing_method_type, bool enable_pdl, Array<int64_t> moe_tactic, int64_t weight_layout,
-    int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    int64_t activation_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    bool allocate_gemm2_output) {
   TVM_FFI_ICHECK_EQ(hidden_states.dtype(), dl_uint8)
       << "Staged FP4 MoE routing: hidden_states must be packed fp4 uint8.";
   TVM_FFI_ICHECK_EQ(hidden_states_scale.dtype(), dl_float8_e4m3fn)
@@ -3683,7 +3707,7 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
   }
 
   auto const num_tokens = hidden_states.size(0);
-  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256};
+  std::vector<int32_t> supported_tile_nums{8, 16, 32, 64, 128, 256, 512, 1024};
   auto const [tile_N, config] = resolveMoeTileAndConfig(moe_tactic, supported_tile_nums, num_tokens,
                                                         top_k, local_num_experts);
   (void)config;
@@ -3698,9 +3722,12 @@ Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
 
   launcher->check_routing();
   launcher->prepare_routing();
+  if (!allocate_gemm2_output) {
+    launcher->prepare_fused_finalize_routing();
+  }
   launcher->run_routing_kernel(enable_pdl);
   launcher->check_moe();
-  launcher->prepare_external_gemm_buffers();
+  launcher->prepare_external_gemm_buffers(allocate_gemm2_output);
 
   return launcher->collect_routing_outputs();
 }

@@ -15,6 +15,8 @@
 """Coverage for register-capped TMEM loads and byte-derived C TMA swizzles."""
 
 import pytest
+
+from tests.prims_ts.python_body import python_body
 import torch
 
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -772,3 +774,97 @@ def test_swap_tma_config_validates_at_both_register_caps():
         )
         compute_warp_layout(cfg)
         validate_config(cfg)
+
+
+@pytest.mark.parametrize("swap_ab", (False, True))
+@pytest.mark.parametrize("gated", (False, True))
+@pytest.mark.parametrize("epi_tile_n", (16, 32, 64, 128, 256))
+@pytest.mark.parametrize(
+    "dtype_c",
+    (DType.BF16, DType.FP16, DType.E4M3, DType.MXE4M3, DType.E2M1, DType.MXE2M1),
+)
+def test_c_scratch_addresses_match_tma_bit_permutation(
+    monkeypatch, swap_ab, gated, epi_tile_n, dtype_c
+):
+    """Every output packing uses the descriptor's byte permutation, without aliasing."""
+    from types import MethodType, SimpleNamespace
+
+    from flashinfer.prims_ts.batched_gemm import gmem_ab_resources as ab
+    from flashinfer.prims_ts.batched_gemm import gmem_c_resources as c
+
+    cfg = make_config(
+        batch_mode=int(BatchMode.BATCH_N if swap_ab else BatchMode.BATCH_M),
+        transpose_mma_output=int(swap_ab),
+        act_kind=int(ActKind.SWIGLU if gated else ActKind.NONE),
+        dtype_c=int(dtype_c),
+        tile_n=256,
+        epi_tile_m=128,
+        epi_tile_n=epi_tile_n,
+        use_tma_store=1,
+    )
+    monkeypatch.setattr(c, "Int32", int)
+    monkeypatch.setattr(ab, "Int32", int)
+    resource = SimpleNamespace(cfg=cfg)
+    names = (
+        "_c_tma_smem_swizzle_mask",
+        "_c_tma_smem_byte_offset",
+        "_swap_tma_smem_linear_index",
+        "_non_swap_tma_smem_element_offset",
+        "_non_swap_fp4_tma_smem_word_offset",
+        "_bf16_tma_smem_element_offset",
+        "_bf16_gated_tma_smem_element_offset",
+        "_fp4_tma_smem_byte_offset",
+        "_mxfp8_tma_smem_byte_offset",
+        "_fp8_nongated_tma_smem_byte_offset",
+    )
+    for name in names:
+        setattr(
+            resource,
+            name,
+            MethodType(python_body(getattr(c.GmemCResource, name)), resource),
+        )
+    bits = cfg.dtype_c_bits
+    if swap_ab:
+        rows, cols = cfg.swap_tma_store_tile_rows, epi_tile_n
+        method = (
+            (
+                "_bf16_gated_tma_smem_element_offset"
+                if gated
+                else "_bf16_tma_smem_element_offset"
+            )
+            if bits == 16
+            else (
+                "_fp4_tma_smem_byte_offset"
+                if bits == 4
+                else "_mxfp8_tma_smem_byte_offset"
+                if dtype_c == DType.MXE4M3
+                else "_fp8_nongated_tma_smem_byte_offset"
+            )
+        )
+        row_step, col_step, unit_bytes = (2, 1, 1) if bits == 4 else (1, 1, bits // 8)
+    else:
+        rows, cols = cfg.epi_tile_m, cfg.tma_store_cols
+        method = (
+            "_non_swap_fp4_tma_smem_word_offset"
+            if bits == 4
+            else "_non_swap_tma_smem_element_offset"
+        )
+        row_step, col_step, unit_bytes = (1, 8, 4) if bits == 4 else (1, 1, bits // 8)
+    offsets = set()
+    for row in range(0, rows, row_step):
+        for col in range(0, cols, col_step):
+            if swap_ab:
+                box, within_box = divmod(row, cfg.swap_tma_store_rows)
+                linear = (box * cols + col) * cfg.swap_tma_store_rows + within_box
+            else:
+                linear = row * cols + col
+            byte = linear * bits // 8
+            # TMA XORs byte-address bits 7..9 into bits 4..6 (fewer for s32/s64).
+            expected_byte = byte ^ (
+                (byte >> 3) & (max(16, cfg.c_tma_swizzle_bytes) - 16)
+            )
+            offset = getattr(resource, method)(row, col)
+            assert offset * unit_bytes == expected_byte
+            assert 0 <= offset * unit_bytes < rows * cols * bits // 8
+            assert offset not in offsets
+            offsets.add(offset)

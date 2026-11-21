@@ -15,6 +15,8 @@
 """GMEM output resource for C (epilogue store)."""
 
 from dataclasses import dataclass
+
+from .epilogue_schedule import EpilogueOp
 from typing import Any, Optional
 
 import cutlass
@@ -58,6 +60,24 @@ _EPILOGUE_BARRIER_ID = 9
 _SKIP_ROW = -1
 _FP4_VALUES_PER_PACKED_WORD = 8
 _PACKED_WORD_BYTES = 4
+
+
+@dsl_user_op
+def _streaming_c_cache_policy(*, loc=None, ip=None):
+    """Build an L2 evict-first policy for output with little expected reuse."""
+    return cutlass.Int64(
+        llvm.inline_asm(
+            cutlass.Int64.mlir_type,
+            [],
+            "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+            "=l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 def _convert_f32x2_to_e2m1x2(a, b):
@@ -187,7 +207,7 @@ def _clamp_upper_f32_trt(val, upper, *, loc=None, ip=None):
 class GmemCResource(MemoryResource):
     """GMEM output resource for BF16/FP16, plain-FP8, or quantized stores.
 
-    TMA output paths obey one shared-memory ownership protocol:
+    Cooperative TMA output paths obey one shared-memory ownership protocol:
 
     * Before staging, the issuing lane waits until the selected scratch stage
       is reusable; a barrier then holds every warp that can write that stage.
@@ -199,7 +219,10 @@ class GmemCResource(MemoryResource):
       epilogue-task tail.
 
     Bulk wait-group state is per issuing thread.  Consequently a wait without
-    its following writer barrier is insufficient to protect SMEM reuse.
+    its following writer barrier is insufficient for cooperative scratch.
+    The four-warp full-tile finalizer instead gives each thread exclusive rows:
+    that thread publishes its own stores and waits for its own source reads
+    before reusing them, without a per-tile CTA barrier.
     """
 
     cfg: Constexpr[BatchedGemmConfig]
@@ -207,6 +230,11 @@ class GmemCResource(MemoryResource):
     sf_c_tensor: Any = None  # cute.Tensor for output scaling factors
     tma_c_desc: Any = None
     bias_tensor: Any = None
+    finalize_scale_tensor: Any = None
+    gFinalizeScale: Any = None
+    finalize_route_tensor: Any = None
+    gFinalizeRoute: Any = None
+    num_tokens: Any = None
     scale_c_tensor: Any = None
     scale_gate_tensor: Any = None
     gemm1_alpha_tensor: Any = None
@@ -261,6 +289,8 @@ class GmemCResource(MemoryResource):
     sPerTokenSfA: Any = None
     sPerTokenSfB: Any = None
     tile_scale_c: Any = None
+    tile_finalize_scale_0: Any = None
+    tile_finalize_scale_1: Any = None
     tile_scale_gate: Any = None
     tile_gemm1_alpha: Any = None
     tile_gemm1_beta: Any = None
@@ -346,6 +376,10 @@ class GmemCResource(MemoryResource):
                 )
         if self.bias_tensor is not None:
             self.gBias = cutlass.make_array_view(self.bias_tensor)
+        if self.finalize_scale_tensor is not None:
+            self.gFinalizeScale = cutlass.make_array_view(self.finalize_scale_tensor)
+        if self.finalize_route_tensor is not None:
+            self.gFinalizeRoute = cutlass.make_array_view(self.finalize_route_tensor)
         if self.scale_c_tensor is not None:
             self.gScaleC = cutlass.make_array_view(self.scale_c_tensor)
         if self.scale_gate_tensor is not None:
@@ -475,6 +509,8 @@ class GmemCResource(MemoryResource):
                 addrspace=3,
             )
         self.tile_scale_c = Float32(1.0)
+        self.tile_finalize_scale_0 = Float32(0)
+        self.tile_finalize_scale_1 = Float32(0)
         self.tile_scale_gate = Float32(1.0)
         self.tile_gemm1_alpha = Float32(1.0)
         self.tile_gemm1_beta = Float32(
@@ -966,6 +1002,28 @@ class GmemCResource(MemoryResource):
         return self._to_output_value(vec_f32)
 
     @cute.jit
+    def _unshuffle_non_swap_vec(self, vec_f32, num_cols: cutlass.Constexpr[int]):
+        # Each 32x32b fragment owns complete shuffle blocks. Resolve the
+        # inverse storage mapping in registers before contiguous output stores.
+        if cutlass.const_expr(self.cfg.use_shuffled_matrix):
+            return cutlass.Vector.from_elements(
+                tuple(
+                    vec_f32[self._non_swap_shuffled_col_idx(vi)]
+                    for vi in range(num_cols)
+                ),
+                dtype=cutlass.Float32,
+            )
+        return vec_f32
+
+    @cute.jit
+    def _convert_non_swap_plain_output(
+        self, vec_f32, scale_c, num_cols: cutlass.Constexpr[int]
+    ):
+        return self._scale_and_convert_output_vec(
+            self._unshuffle_non_swap_vec(vec_f32, num_cols), scale_c
+        )
+
+    @cute.jit
     def _clamp_swiglu_oai_linear(self, val):
         if cutlass.const_expr(self.cfg.has_gemm1_clamp_limit):
             limit = self.tile_gemm1_clamp_limit
@@ -1015,6 +1073,16 @@ class GmemCResource(MemoryResource):
             self._load_fused_finalize_rows(tile_coord_n, token_limit)
         self.tile_scale_c = self._load_scale_c_global(expert_idx)
         self.tile_scale_gate = self._load_scale_gate_global(expert_idx)
+        if cutlass.const_expr(self.cfg.fuse_moe_finalize):
+            # Resolve both row coefficients before loading accumulator fragments.
+            # Performing the indirect loads amid the preload keeps address and
+            # predicate state live alongside its payload and causes spills.
+            warp = cute.arch.warp_idx() - Int32(self.cfg.warp_layout.epilogue_warp_idx)
+            row = (warp % Int32(4)) * Int32(32) + cute.arch.lane_idx()
+            self.tile_finalize_scale_0 = self._load_finalize_scale(tile_coord_m, row)
+            self.tile_finalize_scale_1 = self._load_finalize_scale(
+                tile_coord_m, row + Int32(128)
+            )
         if cutlass.const_expr(self.cfg.has_gemm1_activation_params):
             self.tile_gemm1_alpha = self._load_gemm1_alpha_global(expert_idx)
             self.tile_gemm1_beta = self._load_gemm1_beta_global(expert_idx)
@@ -1193,6 +1261,424 @@ class GmemCResource(MemoryResource):
                     alignment=8,
                 )
 
+    @cute.jit
+    def advance_dense_c_tma_ring(self):
+        # Dense direct stores bypass store_epilogue(), which advances this
+        # persistent ring for the generic schedule. Advance once per fragment
+        # so the next store cannot overwrite a still-in-flight TMA source.
+        if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+            self._c_tma_call_idx = self._c_tma_call_idx + Int32(1)
+
+    @cute.jit
+    def _load_finalize_scale(self, tile_m, local_row):
+        routed_scale = Float32(0)
+        if local_row < self.tile_token_limit:
+            expanded_idx = self.gFinalizeRoute.load(
+                idx=tile_m * Int32(self.cfg.tile_m) + local_row, vector_size=1
+            )[0]
+            routed_scale = Float32(
+                self.gFinalizeScale.load(idx=expanded_idx, vector_size=1)[0]
+            )
+        return self.tile_scale_c * routed_scale
+
+    @cute.jit
+    def _cooperative_fragment_scale(self, stage_info, fragment):
+        scale = self.tile_scale_c
+        if cutlass.const_expr(self.cfg.fuse_moe_finalize):
+            if fragment < Int32(4):
+                scale = self.tile_finalize_scale_0
+            else:
+                scale = self.tile_finalize_scale_1
+        return scale
+
+    @cute.jit
+    def _stage_finalize_fragment(self, vec, row, fragment):
+        """Stage one N64 fragment of a row owned by the four-warp finalizer."""
+        slot = nonnegative_div(fragment, 4)
+        self.sC.store(
+            vec,
+            idx=slot * Int32(self.cfg.num_bytes_c_per_stage // 2)
+            + row * Int32(self.cfg.finalize_smem_row_stride)
+            + nonnegative_mod(fragment, 4) * Int32(64),
+        )
+
+    @cute.jit
+    def _store_preloaded_finalize(self, stage_info):
+        tile_m, tile_n, _ = stage_info.work_tile.tile_idx
+        warp = cute.arch.warp_idx() - Int32(self.cfg.warp_layout.epilogue_warp_idx)
+        row = warp * Int32(32) + cute.arch.lane_idx()
+        for half in cutlass.range_constexpr(2):
+            local_row = row + Int32(half * 128)
+            if local_row < self.tile_token_limit:
+                permuted_row = tile_m * Int32(self.cfg.tile_m) + local_row
+                token = self.route_map_view.load(idx=permuted_row, vector_size=1)[0]
+                if (token >= Int32(0)) & (token < self.num_tokens):
+                    prims.cp_reduce_async_bulk_global_shared_cta(
+                        self.gC.subview(
+                            cutlass.Int64(token) * self.problem_n
+                            + tile_n * Int32(self.cfg.tile_n)
+                        ),
+                        self.sC.subview(
+                            Int32(half * self.cfg.num_bytes_c_per_stage // 2)
+                            + row * Int32(self.cfg.finalize_smem_row_stride)
+                        ),
+                        self.cfg.tile_n * 2,
+                        type=prims.CpReduceType.BF16,
+                        noftz=True,
+                    )
+        # Row ownership stays with the same thread across work tiles. Its
+        # bulk queue must finish both source reads before it overwrites either
+        # row; no other thread writes or reduces this scratch. A CTA barrier
+        # here would unnecessarily hold all epilogue warps behind the slowest
+        # reduction. Padding follows the same commit/wait protocol.
+        prims.cp_async_bulk_commit_group()
+        prims.cp_async_bulk_wait_group(0, read=True)
+
+    @cute.jit
+    def _reduce_cooperative_fragment(self, vec, tile_m, tile_n, call_idx):
+        # Collect four N64 fragments into full N256 rows before reducing.
+        # Prefix stores stage their halves before TMEM release; the reduction
+        # waits for the other halves. This saves four times the bulk operations.
+        warp = cute.arch.warp_idx() - Int32(self.cfg.warp_layout.epilogue_warp_idx)
+        group = warp // Int32(4)
+        row = (warp % Int32(4)) * Int32(32) + cute.arch.lane_idx()
+        slot = nonnegative_mod(nonnegative_div(call_idx, 4), self.cfg.num_stages_c_smem)
+        smem = self.sC.subview(
+            slot * Int32(self.cfg.num_bytes_c_per_stage * 8 // self.cfg.dtype_c_bits)
+        )
+        smem.store(
+            vec,
+            idx=row * Int32(self.cfg.finalize_smem_row_stride)
+            + nonnegative_mod(call_idx, 4) * Int32(64)
+            + group * Int32(32),
+        )
+        if nonnegative_mod(call_idx, 4) == Int32(3):
+            cute.arch.fence_view_async_shared()
+            prims.barrier_cta_sync(
+                barrier_id=9,
+                thread_count=self.cfg.preload_epilogue_plan.barrier_threads,
+            )
+            if group == Int32(0):
+                local_row = row + nonnegative_div(call_idx, 4) * Int32(128)
+                if local_row < self.tile_token_limit:
+                    permuted_row = tile_m * Int32(self.cfg.tile_m) + local_row
+                    token = self.route_map_view.load(idx=permuted_row, vector_size=1)[0]
+                    if (token >= Int32(0)) & (token < self.num_tokens):
+                        col = tile_n * Int32(self.cfg.tile_n)
+                        prims.cp_reduce_async_bulk_global_shared_cta(
+                            self.gC.subview(
+                                cutlass.Int64(token) * self.problem_n + col
+                            ),
+                            smem.subview(
+                                row * Int32(self.cfg.finalize_smem_row_stride)
+                            ),
+                            self.cfg.tile_n * 2,
+                            type=prims.CpReduceType.BF16,
+                            noftz=True,
+                        )
+                # Queues belong to individual issuing threads, including empty
+                # groups for padding. All writers rendezvous before slot reuse.
+                prims.cp_async_bulk_commit_group()
+                prims.cp_async_bulk_wait_group(
+                    self.cfg.num_stages_c_smem - 1, read=True
+                )
+            prims.barrier_cta_sync(
+                barrier_id=9,
+                thread_count=self.cfg.preload_epilogue_plan.barrier_threads,
+            )
+
+    @cute.jit
+    def _store_cooperative_fragment(self, vec, tile_m, tile_n, call_idx):
+        """Stage one fragment through the selected output ownership protocol.
+
+        Ordinary TMA stores join N32 halves in an N64 slot; warp zero owns
+        the queue. Fused finalization gathers N256 rows and gives each row's
+        issuing thread a queue. Both paths pair waits with writer barriers.
+        """
+        if cutlass.const_expr(self.cfg.fuse_moe_finalize):
+            self._reduce_cooperative_fragment(vec, tile_m, tile_n, call_idx)
+        else:
+            warp = cute.arch.warp_idx() - Int32(self.cfg.warp_layout.epilogue_warp_idx)
+            group = warp // Int32(4)
+            row = (warp % Int32(4)) * Int32(32) + cute.arch.lane_idx()
+            slot = nonnegative_mod(call_idx, self.cfg.num_stages_c_smem)
+            smem = self.sC.subview(
+                slot
+                * Int32(self.cfg.num_bytes_c_per_stage * 8 // self.cfg.dtype_c_bits)
+            )
+            self._stage_non_swap_tma_vec(vec, row, group * Int32(32), smem, 32)
+            cute.arch.fence_view_async_shared()
+            prims.barrier_cta_sync(
+                barrier_id=9,
+                thread_count=self.cfg.preload_epilogue_plan.barrier_threads,
+            )
+            if (warp == Int32(0)) & prims.elect_sync():
+                prims.cp_async_bulk_tensor_global_shared_cta(
+                    self.tma_c_desc,
+                    smem,
+                    (
+                        tile_n * Int32(self.cfg.tile_n)
+                        + nonnegative_mod(call_idx, 4) * Int32(64),
+                        tile_m * Int32(self.cfg.tile_m)
+                        + nonnegative_div(call_idx, 4) * Int32(128),
+                    ),
+                    l2_cache_hint=(
+                        _streaming_c_cache_policy()
+                        if cutlass.const_expr(self.cfg.dense_streaming_c)
+                        else None
+                    ),
+                )
+                prims.cp_async_bulk_commit_group()
+                prims.cp_async_bulk_wait_group(
+                    self.cfg.num_stages_c_smem - 1, read=True
+                )
+            prims.barrier_cta_sync(
+                barrier_id=9,
+                thread_count=self.cfg.preload_epilogue_plan.barrier_threads,
+            )
+
+    @cute.jit
+    def _store_cooperative_epilogue(self, stage_info, packed):
+        tile_m, tile_n, _ = stage_info.work_tile.tile_idx
+        prefix = self.cfg.preload_epilogue_plan.store_fragment_begin
+        for i in cutlass.range_constexpr(prefix, 8):
+            words = cutlass.Vector.from_elements(
+                tuple(packed[(i - prefix) * 16 + j] for j in range(16)),
+                dtype=cutlass.Int32,
+            )
+            if cutlass.const_expr(self.cfg.dtype_c == int(DType.BF16)):
+                vec = words.bitcast(cutlass.BFloat16)
+            else:
+                vec = words.bitcast(cutlass.Float16)
+            self._store_cooperative_fragment(vec, tile_m, tile_n, Int32(i))
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def store_packed_epilogue(self, stage_info: StageInfo, *, packed: cutlass.Int32):
+        """Store the payload retained by the resolved preload schedule.
+
+        Full-tile finalization reduces its already-staged rows. Fragment-ring
+        schedules stage and store the register tail after the prefix. Each
+        lowering obeys its ownership protocol; release timing is selected by
+        the task schedule rather than by these store helpers.
+        """
+        if cutlass.const_expr(bool(self.cfg.epilogue_steps)):
+            self._store_step_epilogue(stage_info, packed)
+            return
+        if cutlass.const_expr(self.cfg.uses_full_tile_finalize):
+            self._store_preloaded_finalize(stage_info)
+            return
+        if cutlass.const_expr(self.cfg.dense_epilogue_warps == 8):
+            self._store_cooperative_epilogue(stage_info, packed)
+            return
+        tile_m, tile_n, _ = stage_info.work_tile.tile_idx
+        warp = cute.arch.warp_idx()
+        row = (warp - Int32(self.cfg.warp_layout.epilogue_warp_idx)) * Int32(
+            32
+        ) + cute.arch.lane_idx()
+        for i in cutlass.range_constexpr(7):
+            words = cutlass.Vector.from_elements(
+                tuple(packed[i * 32 + j] for j in range(32)), dtype=cutlass.Int32
+            )
+            if cutlass.const_expr(self.cfg.dtype_c == int(DType.BF16)):
+                vec = words.bitcast(cutlass.BFloat16)
+            else:
+                vec = words.bitcast(cutlass.Float16)
+            self._store_non_swap_tma_32x32b(
+                vec,
+                row,
+                tile_n * Int32(256) + Int32(((i + 1) % 4) * 64),
+                tile_m * Int32(2) + Int32((i + 1) // 4),
+                Int32((i + 1) % 4),
+                True,
+                tile_n * Int32(self.cfg.tile_n) < self.problem_n,
+                warp,
+            )
+            self.advance_dense_c_tma_ring()
+        prims.barrier_cta_sync(
+            barrier_id=9, thread_count=self.cfg.preload_epilogue_plan.barrier_threads
+        )
+
+    @cute.jit
+    def _store_step_epilogue(self, stage_info, packed):
+        plan = self.cfg.preload_epilogue_plan
+        for i in cutlass.range_constexpr(len(plan.after_release)):
+            action = plan.after_release[i]
+            if cutlass.const_expr(action.op == EpilogueOp.STAGE):
+                start = (
+                    action.fragment - plan.retained_fragments[0]
+                ) * plan.words_per_fragment
+                vec = cutlass.Vector.from_elements(
+                    tuple(packed[start + j] for j in range(plan.words_per_fragment)),
+                    dtype=cutlass.Int32,
+                )
+                self._step_output_action(stage_info, action, vec)
+            else:
+                self._step_output_action(stage_info, action)
+
+    @cute.jit
+    def _fc1_step_output_action(
+        self, stage_info, action: cutlass.Constexpr, packed=None, fragment_base=0
+    ):
+        """Execute FP4 data transfers; SF bytes were written during processing.
+
+        Every four-warp group owns an independent ring and fixed TMA issuer.
+        Both rings follow the same host-compiled queue history, including empty
+        commits for padded output tiles. No additional waits live in this body.
+        """
+        plan = self.cfg.preload_epilogue_plan
+        warp = cute.arch.warp_idx() - Int32(self.cfg.warp_layout.epilogue_warp_idx)
+        group = warp // Int32(4)
+        row = (warp % Int32(4)) * Int32(32) + cute.arch.lane_idx()
+        fragment = Int32(action.fragment) + fragment_base
+        slot = (fragment // Int32(plan.output_unit)) % Int32(plan.scratch_stages)
+        offset = (group * Int32(plan.scratch_stages) + slot) * Int32(
+            self.cfg.num_bytes_c_tma_store_per_group
+        )
+        if cutlass.const_expr(action.op == EpilogueOp.STAGE):
+            word_offset = self._non_swap_fp4_tma_smem_word_offset(
+                row, (fragment % Int32(2)) * Int32(32)
+            )
+            self.sCInt32.store(
+                tuple(packed[i] for i in range(4)),
+                idx=offset // Int32(4) + word_offset,
+                vector_size=4,
+                alignment=16,
+            )
+        elif cutlass.const_expr(action.op == EpilogueOp.EMIT):
+            tile_m, tile_n, _ = stage_info.work_tile.tile_idx
+            index = plan.fc1_fragment_index(fragment, group)
+            output_col = tile_n * Int32(self.cfg.tile_n // 2) + (
+                index % Int32(4)
+            ) * Int32(32)
+            output_row = tile_m * Int32(self.cfg.tile_m) + (index // Int32(4)) * Int32(
+                128
+            )
+            if (
+                (warp % Int32(4) == Int32(0))
+                & (cute.arch.lane_idx() == Int32(0))
+                & (output_col < self.problem_n // Int32(2))
+            ):
+                prims.cp_async_bulk_tensor_global_shared_cta(
+                    self.tma_c_desc,
+                    self.sC.subview(offset),
+                    (output_col, output_row),
+                    l2_cache_hint=(
+                        _streaming_c_cache_policy()
+                        if cutlass.const_expr(self.cfg.dense_streaming_c)
+                        else None
+                    ),
+                )
+        elif cutlass.const_expr(action.op == EpilogueOp.COMMIT):
+            if (warp % Int32(4) == Int32(0)) & (cute.arch.lane_idx() == Int32(0)):
+                prims.cp_async_bulk_commit_group()
+
+    @cute.jit
+    def _step_output_action(
+        self, stage_info, action: cutlass.Constexpr, packed=None, fragment_base=0
+    ):
+        """Lower already-validated actions; synchronization is owned by the plan.
+
+        Every output issuer commits even when all its rows are padding. The
+        compiler's group ordinals consequently apply to every issuing thread.
+        Plain TMA issue and commit use the same fixed lane across actions.
+        """
+        plan = self.cfg.preload_epilogue_plan
+        if cutlass.const_expr(
+            plan.gated
+            and action.op in (EpilogueOp.STAGE, EpilogueOp.EMIT, EpilogueOp.COMMIT)
+        ):
+            self._fc1_step_output_action(stage_info, action, packed, fragment_base)
+            return
+        warp = cute.arch.warp_idx() - Int32(self.cfg.warp_layout.epilogue_warp_idx)
+        row = (warp % Int32(4)) * Int32(32) + cute.arch.lane_idx()
+        tile_m, tile_n, _ = stage_info.work_tile.tile_idx
+        if cutlass.const_expr(action.op == EpilogueOp.STAGE):
+            if cutlass.const_expr(self.cfg.dtype_c == int(DType.BF16)):
+                vec = packed.bitcast(cutlass.BFloat16)
+            else:
+                vec = packed.bitcast(cutlass.Float16)
+            smem = self.sC.subview(
+                Int32(action.slot * self.cfg.num_bytes_c_per_stage // 2)
+            )
+            col = Int32(0)
+            if cutlass.const_expr(plan.warps == 8):
+                col = (warp // Int32(4)) * Int32(32)
+            if cutlass.const_expr(plan.finalize):
+                smem.store(
+                    vec,
+                    idx=row * Int32(self.cfg.finalize_smem_row_stride)
+                    + Int32(action.fragment % 4 * 64)
+                    + col,
+                )
+            else:
+                self._stage_non_swap_tma_vec(
+                    vec, row, col, smem, plan.words_per_fragment * 2
+                )
+        elif cutlass.const_expr(action.op == EpilogueOp.SHARED_FENCE):
+            cute.arch.fence_view_async_shared()
+        elif cutlass.const_expr(action.op == EpilogueOp.BARRIER):
+            if cutlass.const_expr(plan.gated):
+                prims.barrier_cta_sync(
+                    barrier_id=self._tma_store_barrier_id(warp // Int32(4)),
+                    thread_count=plan.barrier_threads,
+                )
+            else:
+                prims.barrier_cta_sync(barrier_id=9, thread_count=plan.barrier_threads)
+        elif cutlass.const_expr(action.op == EpilogueOp.SOURCE_WAIT):
+            # Queues are per issuer. Non-issuers have empty queues; the plan's
+            # following writer barrier publishes completion to all writers.
+            prims.cp_async_bulk_wait_group(action.pending, read=True)
+        elif cutlass.const_expr(action.op == EpilogueOp.EMIT):
+            smem = self.sC.subview(
+                Int32(action.slot * self.cfg.num_bytes_c_per_stage // 2)
+            )
+            if cutlass.const_expr(plan.finalize):
+                if warp < Int32(4):
+                    local_row = row + Int32(action.fragment // 4 * 128)
+                    if local_row < self.tile_token_limit:
+                        permuted_row = tile_m * Int32(self.cfg.tile_m) + local_row
+                        token = self.route_map_view.load(
+                            idx=permuted_row, vector_size=1
+                        )[0]
+                        if (token >= Int32(0)) & (token < self.num_tokens):
+                            prims.cp_reduce_async_bulk_global_shared_cta(
+                                self.gC.subview(
+                                    cutlass.Int64(token) * self.problem_n
+                                    + tile_n * Int32(self.cfg.tile_n)
+                                ),
+                                smem.subview(
+                                    row * Int32(self.cfg.finalize_smem_row_stride)
+                                ),
+                                self.cfg.tile_n * 2,
+                                type=prims.CpReduceType.BF16,
+                                noftz=True,
+                            )
+            else:
+                if (warp == Int32(0)) & (cute.arch.lane_idx() == Int32(0)):
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_c_desc,
+                        smem,
+                        (
+                            tile_n * Int32(self.cfg.tile_n)
+                            + Int32(action.fragment % 4 * 64),
+                            tile_m * Int32(self.cfg.tile_m)
+                            + Int32(action.fragment // 4 * 128),
+                        ),
+                        l2_cache_hint=(
+                            _streaming_c_cache_policy()
+                            if cutlass.const_expr(self.cfg.dense_streaming_c)
+                            else None
+                        ),
+                    )
+        elif cutlass.const_expr(action.op == EpilogueOp.COMMIT):
+            if cutlass.const_expr(plan.finalize):
+                if warp < Int32(4):
+                    prims.cp_async_bulk_commit_group()
+            else:
+                if (warp == Int32(0)) & (cute.arch.lane_idx() == Int32(0)):
+                    prims.cp_async_bulk_commit_group()
+
     @producer_work
     @cute.jit
     def store_epilogue(
@@ -1309,9 +1795,22 @@ class GmemCResource(MemoryResource):
         tile_coord_n,
         call_idx,
         warp_idx,
+        pack_fragments: cutlass.Constexpr[int] = 0,
     ):
-        """Non-swapAB: 32x32b T2R, row-major output."""
+        """Non-swapAB: 32x32b T2R, row-major output.
+
+        Explicit FC1 steps use pack_fragments=1/2 to process complete group1
+        N64 fragments with this same activation/quantization implementation.
+        Zero retains the legacy path. Scale factors go directly to GMEM;
+        four/eight packed FP4 words are returned for the
+        planner's independently scheduled SMEM transfer and TMA emission.
+        """
         epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+        if cutlass.const_expr(self.cfg.dense_m_repeats == 2):
+            calls_per_fragment = self.cfg.tile_n // epi_t2r_repx
+            m_fragment = call_idx // Int32(calls_per_fragment)
+            tile_coord_m = tile_coord_m * Int32(2) + m_fragment
+            call_idx = call_idx % Int32(calls_per_fragment)
         warp_in_epi = warp_idx - Int32(self.cfg.warp_layout.epilogue_warp_idx)
         warp_in_epi = cute.arch.make_warp_uniform(warp_in_epi)
         lane_id = cute.arch.lane_idx()
@@ -1320,17 +1819,13 @@ class GmemCResource(MemoryResource):
         warp_in_epi4 = cute.arch.make_warp_uniform(warp_in_epi4)
         warpgroup_idx = warp_in_epi // Int32(WARPS_PER_WARPGROUP)
         warpgroup_idx = cute.arch.make_warp_uniform(warpgroup_idx)
-        row = (
-            tile_coord_m * Int32(self.cfg.tile_m)
-            + warp_in_epi4 * Int32(WARP_SIZE)
-            + lane_id
-        )
+        row = tile_coord_m * Int32(128) + warp_in_epi4 * Int32(WARP_SIZE) + lane_id
         row_in_tile = warp_in_epi4 * Int32(WARP_SIZE) + lane_id
         n = self.problem_n
         expert_idx = self._expert_idx_for_tile(tile_coord_m, tile_coord_n)
         scale_c = self.tile_scale_c
         scale_gate = self.tile_scale_gate
-        token_limit = Int32(self.cfg.tile_m)
+        token_limit = Int32(128)
         if cutlass.const_expr(self.cfg.use_tma_oob_opt):
             token_limit = self._token_limit_for_tile(tile_coord_m, tile_coord_n)
         token_in_bounds = row_in_tile < token_limit
@@ -1348,13 +1843,17 @@ class GmemCResource(MemoryResource):
         )
         is_eltwise_act = cutlass.const_expr(self.cfg.has_eltwise_act)
         if cutlass.const_expr(is_gated_act):
-            # Gated epilogue: adjacent columns are (gate, up) pairs.
+            # Gated epilogue: adjacent columns are (linear/up, nonlinear/gate).
             # Output has half the columns.
             output_n = n // Int32(2)
             col_base = tile_coord_n * Int32(self.cfg.tile_n // 2) + call_idx * Int32(
                 epi_t2r_repx // 2
             )
-            results_per_call = self.cfg.non_swap_gated_output_cols_per_call
+            results_per_call = (
+                32 * pack_fragments
+                if pack_fragments
+                else self.cfg.non_swap_gated_output_cols_per_call
+            )
             result_vals = []
             for pair_idx in cutlass.range_constexpr(results_per_call // 2):
                 pi0 = pair_idx * 2
@@ -1402,7 +1901,7 @@ class GmemCResource(MemoryResource):
             if cutlass.const_expr(self.cfg.has_output_block_scaling):
                 sf_block = self.cfg.output_sf_block_size_c
                 all_scaled_vals = []
-                num_sf_blocks = self.cfg.non_swap_output_sf_blocks_per_call
+                num_sf_blocks = results_per_call // sf_block
                 num_sf_pairs = num_sf_blocks // 2
                 for sf_pair_idx in cutlass.range_constexpr(num_sf_pairs):
                     result_base0 = sf_pair_idx * 2 * sf_block
@@ -1452,14 +1951,27 @@ class GmemCResource(MemoryResource):
                     output_scale1 = output_scale1 * cute.arch.fmin(
                         sf_rounded1 * Float32(1.0e30), Float32(1.0)
                     )
-                    for value_idx in cutlass.range_constexpr(sf_block):
-                        all_scaled_vals.append(
-                            result_vals[result_base0 + value_idx] * output_scale0
+                    # Adjacent values stay in register pairs through FP4 packing.
+                    # Preserve the scalar path's subnormal behavior (no FTZ).
+                    scaled0, scaled1 = [], []
+                    for value_idx in cutlass.range_constexpr(0, sf_block, 2):
+                        v0, v1 = cute.arch.mul_packed_f32x2(
+                            (
+                                result_vals[result_base0 + value_idx],
+                                result_vals[result_base0 + value_idx + 1],
+                            ),
+                            (output_scale0, output_scale0),
                         )
-                    for value_idx in cutlass.range_constexpr(sf_block):
-                        all_scaled_vals.append(
-                            result_vals[result_base1 + value_idx] * output_scale1
+                        w0, w1 = cute.arch.mul_packed_f32x2(
+                            (
+                                result_vals[result_base1 + value_idx],
+                                result_vals[result_base1 + value_idx + 1],
+                            ),
+                            (output_scale1, output_scale1),
                         )
+                        scaled0 += [v0, v1]
+                        scaled1 += [w0, w1]
+                    all_scaled_vals += scaled0 + scaled1
 
                     self._store_non_swap_output_sf_pair(
                         sf_packed,
@@ -1526,6 +2038,12 @@ class GmemCResource(MemoryResource):
                         ).bitcast(cutlass.Int32)
                     )
                 packed_i32 = tuple(packed_i32_list)
+                if cutlass.const_expr(pack_fragments):
+                    if not token_in_bounds:
+                        packed_i32 = tuple(
+                            cutlass.Int32(0) for _ in range(num_packed_words)
+                        )
+                    return cutlass.Vector.from_elements(packed_i32, dtype=cutlass.Int32)
                 if cutlass.const_expr(self.cfg.use_tma_store):
                     staged_vals_i32 = packed_i32
                     if not token_in_bounds:
@@ -1533,7 +2051,18 @@ class GmemCResource(MemoryResource):
                             cutlass.Int32(0) for _ in range(num_packed_words)
                         )
                     store_barrier_id = self._tma_store_barrier_id(warpgroup_idx)
-                    self._wait_for_tma_scratch_reuse(store_barrier_id)
+                    if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+                        # Only the issuing lane owns the TMA queue. Its wait
+                        # must precede the all-writer rendezvous before reuse.
+                        prims.cp_async_bulk_wait_group(
+                            self.cfg.num_stages_c_smem - 1, read=True
+                        )
+                        prims.barrier_cta_sync(
+                            barrier_id=store_barrier_id,
+                            thread_count=self.cfg.epilogue_threads_per_warpgroup,
+                        )
+                    else:
+                        self._wait_for_tma_scratch_reuse(store_barrier_id)
                     self._stage_non_swap_fp4_tma(
                         staged_vals_i32,
                         row_in_tile,
@@ -1602,18 +2131,7 @@ class GmemCResource(MemoryResource):
             col_base = tile_coord_n * Int32(self.cfg.tile_n) + call_idx * Int32(
                 epi_t2r_repx
             )
-            vec_f32 = t2r_rmem
-            if cutlass.const_expr(self.cfg.use_shuffled_matrix):
-                # A 32x32b load owns complete shuffle blocks (validated in
-                # validate_config), so unshuffling is a register permutation;
-                # output addresses and vectorized stores stay contiguous.
-                vec_f32 = cutlass.Vector.from_elements(
-                    tuple(
-                        t2r_rmem[self._non_swap_shuffled_col_idx(vi)]
-                        for vi in range(epi_t2r_repx)
-                    ),
-                    dtype=cutlass.Float32,
-                )
+            vec_f32 = self._unshuffle_non_swap_vec(t2r_rmem, epi_t2r_repx)
             if cutlass.const_expr(self.cfg.has_per_token_sf_a):
                 sf_a_vec = cutlass.vector.full_like(
                     vec_f32,
@@ -1855,9 +2373,10 @@ class GmemCResource(MemoryResource):
     def _non_swap_fp4_tma_smem_word_offset(self, m_local_row, n_local_col):
         """Map one packed FP4 word into the TMA-swizzled scratch tile."""
         row_bytes = Int32(self.cfg.tma_store_cols // 2)
-        byte_offset = m_local_row * row_bytes + n_local_col // Int32(2)
-        swizzle_mask = self._c_tma_smem_swizzle_mask(byte_offset // Int32(128))
-        return (byte_offset ^ swizzle_mask) // Int32(_PACKED_WORD_BYTES)
+        byte_offset = m_local_row * row_bytes + nonnegative_div(n_local_col, 2)
+        return nonnegative_div(
+            self._c_tma_smem_byte_offset(byte_offset), _PACKED_WORD_BYTES
+        )
 
     @cute.jit
     def _stage_non_swap_fp4_tma(
@@ -1874,6 +2393,11 @@ class GmemCResource(MemoryResource):
             * Int32(self.cfg.num_bytes_c_tma_store_per_group)
             // Int32(_PACKED_WORD_BYTES)
         )
+        if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+            stage = nonnegative_mod(self._c_tma_call_idx, self.cfg.num_stages_c_smem)
+            group_word_offset = (
+                warpgroup_idx * Int32(self.cfg.num_stages_c_smem) + stage
+            ) * Int32(self.cfg.num_bytes_c_tma_store_per_group // _PACKED_WORD_BYTES)
         full_atoms = num_packed_words // words_per_atom
         for atom_idx in cutlass.range_constexpr(full_atoms):
             word_base = atom_idx * words_per_atom
@@ -1922,7 +2446,12 @@ class GmemCResource(MemoryResource):
         self, t2r_rmem, t2r_rmem_1, logical_col: int, fragment_regs: int
     ):
         """Load one logical column from one or two batch-M T2R fragments."""
-        physical_col = self._non_swap_shuffled_col_idx(logical_col)
+        physical_col = logical_col
+        if cutlass.const_expr(self.cfg.gated_weight_group_size == 64):
+            physical_col = logical_col // 2 + (logical_col % 2) * 64
+        # Host packing first groups U/G rows, then shuffles each 16/32-row
+        # block. Compose in that order before selecting the TMEM fragment.
+        physical_col = self._non_swap_shuffled_col_idx(physical_col)
         if cutlass.const_expr(physical_col >= fragment_regs):
             return t2r_rmem_1[physical_col - fragment_regs]
         return t2r_rmem[physical_col]
@@ -1949,6 +2478,12 @@ class GmemCResource(MemoryResource):
         smem_base = self.sC.subview(
             warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
         )
+        if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
+            stage = nonnegative_mod(self._c_tma_call_idx, self.cfg.num_stages_c_smem)
+            smem_base = self.sC.subview(
+                (warpgroup_idx * Int32(self.cfg.num_stages_c_smem) + stage)
+                * Int32(self.cfg.num_bytes_c_tma_store_per_group)
+            )
         should_store = (
             (warp_idx == group_leader)
             & prims.elect_sync()
@@ -1959,18 +2494,26 @@ class GmemCResource(MemoryResource):
             prims.cp_async_bulk_tensor_global_shared_cta(
                 self.tma_c_desc,
                 smem_base,
-                (output_col_base, tile_coord_m * Int32(self.cfg.tile_m)),
+                # The caller has already converted tile512's M coordinate
+                # into a 128-row fragment coordinate, as used by SF-C stores.
+                (output_col_base, tile_coord_m * Int32(128)),
             )
+        if (warp_idx == group_leader) & prims.elect_sync():
+            # Empty commits keep padded tiles aligned with the persistent ring.
             prims.cp_async_bulk_commit_group()
             if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
                 # The next writer can be an A/B producer running on different
                 # threads.  Drain on the issuing lane before handing ownership
                 # of the aliased allocation back to that task.
                 prims.cp_async_bulk_wait_group(0, read=True)
-        prims.barrier_cta_sync(
-            barrier_id=store_barrier_id,
-            thread_count=self.cfg.epilogue_threads_per_warpgroup,
-        )
+        # Ring users rendezvous before their next scratch write, after the
+        # issuer has committed and retired any same-slot read. The task tail
+        # drains the final stores before any epilogue thread exits.
+        if cutlass.const_expr(not self.cfg.uses_non_swap_c_tma_ring):
+            prims.barrier_cta_sync(
+                barrier_id=store_barrier_id,
+                thread_count=self.cfg.epilogue_threads_per_warpgroup,
+            )
 
     @cute.jit
     def _store_non_swap_gated_16bit_tma(
@@ -2072,15 +2615,44 @@ class GmemCResource(MemoryResource):
         """Stage one non-swap epilogue subtile to SMEM and TMA-store it."""
         epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
         tma_store_cols = self.cfg.tma_store_cols
+        if cutlass.const_expr(self.cfg.dense_epilogue_warps == 8):
+            # Each group owns its scratch ring and the async stores reading it.
+            # The full epilogue rendezvous before releasing C remains in the
+            # dense loop, so MMA cannot overwrite either group's TMEM reads.
+            group = (warp_idx - Int32(self.cfg.warp_layout.epilogue_warp_idx)) // Int32(
+                4
+            )
+            barrier_id = self._tma_store_barrier_id(group)
+            local_call = nonnegative_div(call_idx, 2)
+            stage = nonnegative_mod(local_call, self.cfg.num_stages_c_smem)
+            stage_elems = self.cfg.num_bytes_c_per_stage * 8 // self.cfg.dtype_c_bits
+            smem_base = self.sC.subview((stage * Int32(2) + group) * Int32(stage_elems))
+            prims.cp_async_bulk_wait_group(self.cfg.num_stages_c_smem - 1, read=True)
+            prims.barrier_cta_sync(barrier_id=barrier_id, thread_count=128)
+            self._stage_non_swap_tma_vec(
+                vec_out, row_in_tile, Int32(0), smem_base, epi_t2r_repx
+            )
+            cute.arch.fence_view_async_shared()
+            prims.barrier_cta_sync(barrier_id=barrier_id, thread_count=128)
+            if (
+                warp_idx
+                == Int32(self.cfg.warp_layout.epilogue_warp_idx) + group * Int32(4)
+            ) & prims.elect_sync():
+                prims.cp_async_bulk_tensor_global_shared_cta(
+                    self.tma_c_desc, smem_base, (col_base, tile_coord_m * Int32(128))
+                )
+                prims.cp_async_bulk_commit_group()
+            prims.barrier_cta_sync(barrier_id=barrier_id, thread_count=128)
+            return
         calls_per_tma = max(1, tma_store_cols // epi_t2r_repx)
-        call_in_tma = call_idx % calls_per_tma
+        call_in_tma = nonnegative_mod(call_idx, calls_per_tma)
         smem_stage_offset = Int32(0)
         if cutlass.const_expr(self.cfg.num_stages_c_smem > 1):
             if cutlass.const_expr(self.cfg.uses_non_swap_c_tma_ring):
-                tma_group_idx = self._c_tma_call_idx // Int32(calls_per_tma)
+                tma_group_idx = nonnegative_div(self._c_tma_call_idx, calls_per_tma)
             else:
-                tma_group_idx = call_idx // Int32(calls_per_tma)
-            tma_smem_stage = tma_group_idx % Int32(self.cfg.num_stages_c_smem)
+                tma_group_idx = nonnegative_div(call_idx, calls_per_tma)
+            tma_smem_stage = nonnegative_mod(tma_group_idx, self.cfg.num_stages_c_smem)
             smem_stage_stride = Int32(
                 self.cfg.num_bytes_c_per_stage * 8 // self.cfg.dtype_c_bits
             )
@@ -2097,11 +2669,12 @@ class GmemCResource(MemoryResource):
         # avoids making synchronization depend on a staged call index.  A
         # wait-group is local to the issuer, so the all-writer barrier must
         # follow it before any warp can overwrite the selected stage.
-        prims.cp_async_bulk_wait_group(self.cfg.num_stages_c_smem - 1, read=True)
-        prims.barrier_cta_sync(
-            barrier_id=_EPILOGUE_BARRIER_ID,
-            thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
-        )
+        if cutlass.const_expr(not self.cfg.dense_dkg_store_order):
+            prims.cp_async_bulk_wait_group(self.cfg.num_stages_c_smem - 1, read=True)
+            prims.barrier_cta_sync(
+                barrier_id=_EPILOGUE_BARRIER_ID,
+                thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
+            )
         if cutlass.const_expr(self.cfg.c_tma_swizzle_bytes >= 32):
             # Match the TMA descriptor's 32/64/128-byte swizzle for every C
             # format. Split the fragment into 16-byte atoms because TMA
@@ -2141,12 +2714,33 @@ class GmemCResource(MemoryResource):
                     prims.cp_async_bulk_tensor_global_shared_cta(
                         self.tma_c_desc,
                         smem_box_base,
-                        (tma_col_base, tile_coord_m * Int32(self.cfg.tile_m)),
+                        (
+                            tma_col_base,
+                            tile_coord_m
+                            * Int32(
+                                128
+                                if self.cfg.dense_m_repeats == 2
+                                else self.cfg.tile_m
+                            ),
+                        ),
+                        l2_cache_hint=(
+                            _streaming_c_cache_policy()
+                            if cutlass.const_expr(self.cfg.dense_streaming_c)
+                            else None
+                        ),
                     )
                 prims.cp_async_bulk_commit_group()
+                if cutlass.const_expr(self.cfg.dense_dkg_store_order):
+                    # DKG commit/acquire: retire enough stores before the next
+                    # stage's writers pass the following all-epilogue barrier.
+                    prims.cp_async_bulk_wait_group(
+                        self.cfg.num_stages_c_smem - 1, read=True
+                    )
                 if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
                     prims.cp_async_bulk_wait_group(0, read=True)
-            if cutlass.const_expr(self.cfg.aliases_c_scratch_with_ab):
+            if cutlass.const_expr(
+                self.cfg.aliases_c_scratch_with_ab or self.cfg.dense_dkg_store_order
+            ):
                 prims.barrier_cta_sync(
                     barrier_id=_EPILOGUE_BARRIER_ID,
                     thread_count=self.cfg.warp_layout.num_epilogue_warps * WARP_SIZE,
@@ -2156,12 +2750,32 @@ class GmemCResource(MemoryResource):
     def _c_tma_smem_swizzle_mask(self, swizzle_row_128b):
         """XOR mask for the 128-byte SMEM band containing a C element."""
         if cutlass.const_expr(self.cfg.c_tma_swizzle_bytes % 128 == 0):
-            return (swizzle_row_128b % Int32(8)) * Int32(16)
+            return nonnegative_mod(swizzle_row_128b, 8) * Int32(16)
         if cutlass.const_expr(self.cfg.c_tma_swizzle_bytes % 64 == 0):
-            return (swizzle_row_128b % Int32(4)) * Int32(16)
+            return nonnegative_mod(swizzle_row_128b, 4) * Int32(16)
         if cutlass.const_expr(self.cfg.c_tma_swizzle_bytes % 32 == 0):
-            return (swizzle_row_128b % Int32(2)) * Int32(16)
+            return nonnegative_mod(swizzle_row_128b, 2) * Int32(16)
         return Int32(0)
+
+    @cute.jit
+    def _c_tma_smem_byte_offset(self, byte_offset):
+        """Swizzle a nonnegative tile-local byte offset for every C format.
+
+        TMA derives the XOR row from 128-byte SMEM bands, including when a
+        logical row is narrower than 128 bytes. Local coordinates and stage/
+        group offsets are nonnegative; shifts/masks need no signed correction.
+        """
+        band = nonnegative_div(byte_offset, 128)
+        return byte_offset ^ self._c_tma_smem_swizzle_mask(band)
+
+    @cute.jit
+    def _swap_tma_smem_linear_index(self, m_local_row, n_local_col):
+        """Element index in the unswizzled, column-major C scratch boxes."""
+        box_rows = self.cfg.swap_tma_store_rows
+        row_block = nonnegative_div(m_local_row, box_rows)
+        row_in_block = nonnegative_mod(m_local_row, box_rows)
+        box_stride = Int32(self.cfg.epi_tile_n * box_rows)
+        return row_block * box_stride + n_local_col * Int32(box_rows) + row_in_block
 
     @cute.jit
     def _non_swap_tma_smem_element_offset(self, m_local_row, n_local_col):
@@ -2169,11 +2783,9 @@ class GmemCResource(MemoryResource):
         tma_store_cols = Int32(self.cfg.tma_store_cols)
         element_bytes = Int32(self.cfg.dtype_c_bits // 8)
         smem_offset_bytes = (m_local_row * tma_store_cols + n_local_col) * element_bytes
-        # TMA derives the XOR row from 128-byte SMEM bands.  A logical row is
-        # narrower than that for s32b/s64b, so using m_local_row directly
-        # advances the swizzle pattern too quickly.
-        swizzle_mask = self._c_tma_smem_swizzle_mask(smem_offset_bytes // Int32(128))
-        return (smem_offset_bytes ^ swizzle_mask) // element_bytes
+        return nonnegative_div(
+            self._c_tma_smem_byte_offset(smem_offset_bytes), self.cfg.dtype_c_bits // 8
+        )
 
     @cute.jit
     def _stage_non_swap_tma_vec(
@@ -2215,14 +2827,9 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _bf16_tma_smem_element_offset(self, m_local_row, n_local_col):
-        box_rows = Int32(self.cfg.swap_tma_store_rows)
-        row_block = m_local_row // box_rows
-        row_in_block = m_local_row % box_rows
-        box_stride = Int32(self.cfg.epi_tile_n) * box_rows
-        linear = row_block * box_stride + n_local_col * box_rows + row_in_block
+        linear = self._swap_tma_smem_linear_index(m_local_row, n_local_col)
         smem_offset_bytes = linear * Int32(2)
-        swizzle_mask = self._c_tma_smem_swizzle_mask(smem_offset_bytes // Int32(128))
-        return (smem_offset_bytes ^ swizzle_mask) // Int32(2)
+        return nonnegative_div(self._c_tma_smem_byte_offset(smem_offset_bytes), 2)
 
     @cute.jit
     def _bf16_gated_tma_smem_element_offset(self, m_local_row, n_local_col):
@@ -2696,7 +3303,7 @@ class GmemCResource(MemoryResource):
     ):
         warp_absmax0 = self._reduce_fp4_absmax_m16(val0)
         warp_absmax1 = self._reduce_fp4_absmax_m16(val1)
-        lane_col = (lane_id % Int32(4)) * Int32(2)
+        lane_col = nonnegative_mod(lane_id, 4) * Int32(2)
         scratch_idx = (
             row_group * Int32(self.cfg.epi_tile_n) + scale_pair * Int32(8) + lane_col
         )
@@ -2808,7 +3415,7 @@ class GmemCResource(MemoryResource):
         At block 32 it is this warp and its partner ``warp_in_epi4 ^ 1``.
         """
         if cutlass.const_expr(self.cfg.uses_deepseek_fp8_atomic_absmax):
-            lane_col = (lane_id % Int32(4)) * Int32(2)
+            lane_col = nonnegative_mod(lane_id, 4) * Int32(2)
             scratch_idx = (
                 row_group * Int32(self.cfg.epi_tile_n)
                 + scale_pair * Int32(8)
@@ -2971,24 +3578,13 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _fp4_tma_smem_byte_offset(self, m_local_row, n_local_col):
-        box_rows = Int32(self.cfg.swap_tma_store_rows)
-        row_block = m_local_row // box_rows
-        row_in_block = m_local_row % box_rows
-        box_stride = Int32(self.cfg.epi_tile_n) * box_rows
-        linear = row_block * box_stride + n_local_col * box_rows + row_in_block
-        byte_offset = linear // Int32(2)
-        swizzle_mask = self._c_tma_smem_swizzle_mask(byte_offset // Int32(128))
-        return byte_offset ^ swizzle_mask
+        linear = self._swap_tma_smem_linear_index(m_local_row, n_local_col)
+        return self._c_tma_smem_byte_offset(nonnegative_div(linear, 2))
 
     @cute.jit
     def _mxfp8_tma_smem_byte_offset(self, m_local_row, n_local_col):
-        box_rows = Int32(self.cfg.swap_tma_store_rows)
-        row_block = m_local_row // box_rows
-        row_in_block = m_local_row % box_rows
-        box_stride = Int32(self.cfg.epi_tile_n) * box_rows
-        linear = row_block * box_stride + n_local_col * box_rows + row_in_block
-        swizzle_mask = self._c_tma_smem_swizzle_mask(linear // Int32(128))
-        return linear ^ swizzle_mask
+        linear = self._swap_tma_smem_linear_index(m_local_row, n_local_col)
+        return self._c_tma_smem_byte_offset(linear)
 
     @cute.jit
     def _pack_swap_ab_fp8_gated_tma_pair(self, val0_f32, val1_f32):
@@ -2998,13 +3594,8 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _fp8_nongated_tma_smem_byte_offset(self, m_local_row, n_local_col):
-        box_rows = Int32(self.cfg.swap_tma_store_rows)
-        row_block = m_local_row // box_rows
-        row_in_block = m_local_row % box_rows
-        box_stride = Int32(self.cfg.epi_tile_n) * box_rows
-        linear = row_block * box_stride + n_local_col * box_rows + row_in_block
-        swizzle_mask = self._c_tma_smem_swizzle_mask(linear // Int32(128))
-        return linear ^ swizzle_mask
+        linear = self._swap_tma_smem_linear_index(m_local_row, n_local_col)
+        return self._c_tma_smem_byte_offset(linear)
 
     @cute.jit
     def _stage_swap_ab_fp8_tma_vec4(
@@ -3021,7 +3612,7 @@ class GmemCResource(MemoryResource):
         packed23 = self._pack_swap_ab_fp8_gated_tma_pair(val2_f32, val3_f32)
         self.sCInt16.store(
             (packed01, packed23),
-            idx=smem_offset // Int32(2),
+            idx=nonnegative_div(smem_offset, 2),
             vector_size=2,
             alignment=4,
         )
@@ -3042,7 +3633,7 @@ class GmemCResource(MemoryResource):
             + tma_smem_stage * smem_stage_stride
             + warpgroup_idx * Int32(self.cfg.num_bytes_c_tma_store_per_group)
         )
-        return smem_offset // Int32(2)
+        return nonnegative_div(smem_offset, 2)
 
     @cute.jit
     def _fp8_store_dependency_xor16(
@@ -4791,7 +5382,9 @@ class GmemCResource(MemoryResource):
                         and self.cfg.tile_n
                         > self.cfg.epi_tile_n * self.cfg.num_epilogue_warpgroups
                     ):
-                        tma_smem_stage = call_idx % Int32(self.cfg.num_stages_c_smem)
+                        tma_smem_stage = nonnegative_mod(
+                            call_idx, self.cfg.num_stages_c_smem
+                        )
                     pair_count = (self.cfg.epi_tile_n // 8) * 2
                     token_sfs = []
                     if cutlass.const_expr(self.cfg.has_per_token_sf_b):

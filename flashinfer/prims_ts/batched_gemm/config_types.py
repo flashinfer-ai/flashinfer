@@ -32,6 +32,7 @@ class RouteImpl(IntEnum):
 class TileScheduler(IntEnum):
     STATIC = 0
     PERSISTENT = 1
+    STATIC_PERSISTENT = 2
 
 
 class CtaRasterOrder(IntEnum):
