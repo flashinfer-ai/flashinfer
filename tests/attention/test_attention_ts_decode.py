@@ -4474,9 +4474,96 @@ def test_attention_ts_decode_nvfp4_d512_q8_groups_transformed_slots() -> None:
         config(transformed_kv_hd_stages_per_slot=1).transformed_kv_hd_stages_per_slot
         == 1
     )
+    # An explicit ring depth keeps counting head-dim stages, as before slots
+    # were grouped, and stays within the TMEM budget.
+    for depth in (4, 8):
+        pinned = config(transformed_kv_stages=depth)
+        assert pinned.transformed_kv_stages == depth
+        assert pinned.transformed_kv_hd_stages_per_slot == 1
+        assert pinned.tmem_total_cols <= 512
+    # The packed/whole-tile defaults belong to the TMEM converter; an explicit
+    # SMEM converter keeps one four-warp group and per-stage staging.
+    smem = config(store_transformed_kv_in_tmem=False)
+    assert not smem.store_transformed_kv_in_tmem
+    assert (smem.transform_kv_warp_idx, smem.transform_kv_num_warps) == (4, 4)
+    assert smem.transformed_kv_hd_stages_per_slot == 1
+    assert not (
+        smem.use_packed_nvfp4_raw_payload
+        or smem.use_whole_tile_nvfp4_raw_stage
+        or smem.use_permuted_packed_k_order
+        or smem.use_fused_slot_mma_issue
+    )
     # Grouping must divide the head-dim stages.
     with pytest.raises(ValueError, match="transformed_kv_hd_stages_per_slot"):
         config(transformed_kv_hd_stages_per_slot=3)
+
+
+def test_attention_ts_decode_nvfp4_d512_keeps_ring_depths_fit() -> None:
+    """D512 grouped Keeps NVFP4 converted-ring depths and raw depth fit SMEM."""
+
+    def config(**overrides):
+        return make_decode_config(
+            headdim=512,
+            args={
+                "use_keeps_mma_ab": True,
+                "groups_tokens_heads_q": True,
+                "tile_size_q": 64,
+                "use_persistent_scheduler": False,
+                **overrides,
+            },
+            seq_len_q=8,
+            seq_len_kv=32768,
+            batch_size=8,
+            num_heads_q=32,
+            num_heads_kv=4,
+            q_dtype=Float8E4M3FN,
+            k_dtype=Float4E2M1FN,
+            v_dtype=Float4E2M1FN,
+            o_dtype=BFloat16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=64,
+            mask_type="causal",
+            split_kv_mode="disabled",
+            auto_tuner=False,
+        )
+
+    cfg = config()
+    assert cfg.keeps_o_uses_lane_panels and cfg.uses_stage_sliced_nvfp4_sf
+    assert (cfg.transformed_kv_stages, cfg.transformed_v_stages) == (4, 3)
+    # An explicit V depth of zero shares the K depth; three slots each fit.
+    shared = config(transformed_v_stages=0)
+    assert (shared.transformed_kv_stages, shared.transformed_v_stages) == (3, 0)
+    # The inferred raw depth reserves both converted rings and keeps complete
+    # head-dim rounds, so an explicit launch at that depth still fits.
+    raw_stages = cfg.infer_kv_stages(cap_kv_staging=False)
+    assert raw_stages % (2 * cfg.num_head_dim_stages_kv) == 0
+    for checked in (cfg, shared, config(kv_stages=raw_stages)):
+        _, smem_allocator, _ = _build_decode_resources(checked)
+        _assert_decode_smem_within_capacity(checked, smem_allocator)
+
+
+def test_attention_ts_decode_whole_tile_nvfp4_stage_requires_full_slices() -> None:
+    """Whole-tile NVFP4 staging copies full D128 slices, so D192 is rejected."""
+    with pytest.raises(ValueError, match="use_whole_tile_nvfp4_raw_stage"):
+        make_decode_config(
+            headdim=192,
+            args={
+                "head_dim_per_stage_kv": 128,
+                "use_packed_nvfp4_raw_payload": True,
+                "use_whole_tile_nvfp4_raw_stage": True,
+            },
+            seq_len_q=1,
+            seq_len_kv=4096,
+            batch_size=4,
+            num_heads_q=8,
+            num_heads_kv=1,
+            qkv_dtype=Float8E4M3FN,
+            kv_dtype=Float4E2M1FN,
+            o_dtype=Float16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=8,
+            auto_tuner=False,
+        )
 
 
 @pytest.mark.parametrize(
@@ -10480,11 +10567,10 @@ def test_attention_ts_decode_nvfp4_resource_overrides(
                 assert cfg.transformed_kv_stages == requested
 
 
-@_REQUIRES_PRIMTS_GPU
 def _resolve_d512_decode_policy(
     monkeypatch, *, batch_size, num_heads_q, seq_len_q, kv_dtype_key, max_kv_len
 ):
-    """Resolve the automatic D512 launch spec on a mocked 148-SM device."""
+    """Resolve the automatic D512 launch spec on a mocked 148-SM SM100 device."""
     from contextlib import nullcontext
 
     from flashinfer.attention.prims_ts import decode as decode_module
@@ -10501,6 +10587,7 @@ def _resolve_d512_decode_policy(
 
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (10, 0))
     decode_module._resolve_decode_launch_spec.cache_clear()
     try:
         return decode_module._resolve_decode_launch_spec(
@@ -10560,6 +10647,17 @@ def test_attention_ts_decode_d512_keeps_policy_scope(monkeypatch):
         max_kv_len=32768,
     )
     assert not wide.use_keeps_mma_ab
+    # Ratios above 32 take the wide-head fallback, which also stays off D512
+    # grouped Keeps.
+    wider = _resolve_d512_decode_policy(
+        monkeypatch,
+        batch_size=4,
+        num_heads_q=160,
+        seq_len_q=8,
+        kv_dtype_key="float4_e2m1fn",
+        max_kv_len=32768,
+    )
+    assert not (wider.use_keeps_mma_ab and wider.groups_tokens_heads_q)
     single = _resolve_d512_decode_policy(
         monkeypatch,
         batch_size=32,
@@ -10656,6 +10754,7 @@ def test_attention_ts_decode_d512_fp8_kv_grouped_keeps(
         )
 
 
+@_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
     "head_dim,tile_size_q,seq_len_q,seq_len_kv,heads_q_per_kv,output_dtype,split_kv_mode,page_size,use_keeps_mma_ab",
     (

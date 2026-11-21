@@ -4259,9 +4259,8 @@ def fmha_decode_launch(
                 swizzle=swizzle,
             )
 
-        tma_desc_k_sf = sf_tma_desc(
-            k_sf_iter, k_sf_tma_strides, cuda.TensorMapSwizzle.none
-        )
+        # Stage-sliced scales copy one D128 stage's columns per transaction;
+        # other profiles copy complete scale rows.
         if cutlass.const_expr(cfg.uses_stage_sliced_nvfp4_sf):
             # K: one token per box row, 16 B (the half row holding a D128
             # stage's 8 scales); the loader selects the half by column.
@@ -4288,15 +4287,6 @@ def fmha_decode_launch(
                 stride_order=(0, 1, 2, 3),
                 swizzle=cuda.TensorMapSwizzle.none,
             )
-        # D512 V scales use the 128 B swizzle (FmhaDecodeConfig.swizzles_v_scale_factors).
-        tma_desc_v_sf = sf_tma_desc(
-            v_sf_iter,
-            v_sf_tma_strides,
-            cuda.TensorMapSwizzle.s128b
-            if cutlass.const_expr(cfg.swizzles_v_scale_factors)
-            else cuda.TensorMapSwizzle.none,
-        )
-        if cutlass.const_expr(cfg.uses_stage_sliced_nvfp4_sf):
             # V: folded 4-token rows (128 B); a stage's scales are the 32 B
             # at column 32 * stage of each row.
             v_token_stride, v_head_stride, v_page_stride = v_sf_tma_strides
@@ -4316,6 +4306,18 @@ def fmha_decode_launch(
                 box_dims=(32, cfg.num_tokens_per_page // sf_r, 1, 1),
                 stride_order=(0, 1, 2, 3),
                 swizzle=cuda.TensorMapSwizzle.none,
+            )
+        else:
+            tma_desc_k_sf = sf_tma_desc(
+                k_sf_iter, k_sf_tma_strides, cuda.TensorMapSwizzle.none
+            )
+            # D512 V scales use the 128 B swizzle (FmhaDecodeConfig.swizzles_v_scale_factors).
+            tma_desc_v_sf = sf_tma_desc(
+                v_sf_iter,
+                v_sf_tma_strides,
+                cuda.TensorMapSwizzle.s128b
+                if cutlass.const_expr(cfg.swizzles_v_scale_factors)
+                else cuda.TensorMapSwizzle.none,
             )
 
     grid_x = q_groups

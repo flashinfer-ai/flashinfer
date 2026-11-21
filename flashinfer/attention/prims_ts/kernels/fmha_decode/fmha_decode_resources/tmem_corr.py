@@ -511,8 +511,8 @@ class TmemCorrResource(DecodeGenResourceBase):
         # Every correction thread waits on the transaction mbarrier itself, the
         # same shape as a pipeline consumer wait. A lane-0-only spin here makes
         # ptxas compile the MMA warp of the same kernel as possibly divergent
-        # (FlashInfer #9602). The correction-group
-        # barrier below still orders all reducer lanes after the wait.
+        # (FlashInfer #9602). The correction-group barrier below still orders
+        # all reducer lanes after the wait.
         # The peers' st.async complete-tx releases at cluster scope, so the
         # wait must observe it at cluster scope; the default CTA scope does
         # not synchronize with a thread of another CTA. The wait itself is
@@ -1548,13 +1548,21 @@ class TmemCorrResource(DecodeGenResourceBase):
                     target_type=Int32,
                 )
             old_complete = _warp_broadcast_i32(old_complete, 0)
+            # Global wrapping INC counts split-CTA completion. Map arrivals in
+            # reverse order so the last publisher becomes owner 0 instead of
+            # handing reduction back to a fixed logical CTA. Non-owners can
+            # leave immediately. If multiple row-slice owners are needed, only
+            # the earlier owner arrivals wait for the last arrival to publish
+            # every split and wrap the counter to zero.
             reducer_cta_idx = splits_kv - Int32(1) - old_complete
             if reducer_cta_idx < Int32(
                 cfg.cluster_reduction_num_owner_ctas
             ) and old_complete < splits_kv - Int32(1):
                 pending = Int32(1)
                 while pending != Int32(0):
-                    pending = cute.arch.make_warp_uniform(
+                    # Lanes may sample the counter on either side of the last
+                    # arrival's wrap, so branch on lane 0's sample only.
+                    pending = _warp_broadcast_i32(
                         prims.mov_b32(
                             prims.load_ext(
                                 counter_ptr,
@@ -1562,7 +1570,8 @@ class TmemCorrResource(DecodeGenResourceBase):
                                 scope=prims.MemScope.GPU,
                             ),
                             target_type=Int32,
-                        )
+                        ),
+                        0,
                     )
             if ticket_lane == Int32(0):
                 self._gmem_reducer_rank.store(reducer_cta_idx, 0, alignment=4)

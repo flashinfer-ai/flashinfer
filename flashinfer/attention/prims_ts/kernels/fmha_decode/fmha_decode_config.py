@@ -3068,9 +3068,13 @@ class FmhaDecodeConfig:
             ) * BITS_PER_BYTE
             if not self.store_transformed_kv_in_tmem:
                 if self.transformed_kv_stages > 0:
-                    fixed_bytes += (
-                        self.transformed_kv_stages * self.smem_transformed_kv_tile_bytes
-                    )
+                    converted_slots = self.transformed_kv_stages
+                    if self.uses_dual_smem_transform:
+                        # Separate K and V rings; V reuses the K depth when unset.
+                        converted_slots += (
+                            self.transformed_v_stages or self.transformed_kv_stages
+                        )
+                    fixed_bytes += converted_slots * self.smem_transformed_kv_tile_bytes
                 else:
                     kv_tile_bits += self.smem_transformed_kv_tile_bytes * BITS_PER_BYTE
 
@@ -3082,6 +3086,11 @@ class FmhaDecodeConfig:
                 MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB, kv_budget_bytes
             )
         inferred_stages = max(1, kv_budget_bytes * BITS_PER_BYTE // kv_tile_bits)
+        if self.uses_dual_smem_transform:
+            # The kernel gives each raw K and V ring complete head-dim rounds,
+            # and at least one round each.
+            rounds = 2 * self.num_head_dim_stages_kv
+            inferred_stages = max(rounds, inferred_stages // rounds * rounds)
         return inferred_stages
 
     def validate_dtypes(self) -> None:
@@ -4735,6 +4744,20 @@ def _finalize_static_decode_config(
     uses_full_wg_transform = (
         cfg.use_transform_kv and cfg.num_insts_kv == 1 and not cfg.use_keeps_mma_ab
     )
+    # Resolve the converter backend first: the D512 Q8 defaults below apply
+    # only to the TMEM converter.
+    _set_if_implicit(
+        cfg,
+        "store_transformed_kv_in_tmem",
+        (
+            cfg.use_nvfp4_kv
+            and cfg.uses_tmem_transformed_kv_q_dtype
+            and not cfg.use_keeps_mma_ab
+            and cfg.head_dim_kv_stage == 128
+            and cfg.tile_size_kv == 128
+        ),
+        explicit_fields,
+    )
     if uses_full_wg_transform:
         # Dense D512 Swaps Q8 NVFP4 converts K and V through one shared TMEM
         # ring. With per-D128-stage handoffs two converter warp groups
@@ -4750,6 +4773,10 @@ def _finalize_static_decode_config(
             and cfg.use_fp8_q
             and cfg.use_paged_kv
             and not cfg.use_q_token_kv_block_sparse_route
+            # An explicit SMEM converter or interleaved NVFP4 layout keeps the
+            # established one-group, per-stage defaults.
+            and cfg.store_transformed_kv_in_tmem
+            and not cfg.use_nvfp4_interleaved_kv
         )
         _set_if_implicit(
             cfg,
@@ -4767,11 +4794,16 @@ def _finalize_static_decode_config(
         # The per-D128-stage converter/MMA handoff (acquire, 256-thread
         # commit, wait, tcgen05.commit release) dominated this profile; one
         # ring slot per K or V tile (4 head-dim stages, 3 slots) measured
-        # 17-22% faster than per-stage slots on B200/B300.
+        # 17-22% faster than per-stage slots on B200/B300. An explicit
+        # positive ``transformed_kv_stages`` keeps counting head-dim stages
+        # unless the slot width is also given.
+        explicit_ring_depth = (
+            "transformed_kv_stages" in explicit_fields and cfg.transformed_kv_stages > 0
+        )
         _set_if_implicit(
             cfg,
             "transformed_kv_hd_stages_per_slot",
-            4 if split_stage_transform else 1,
+            4 if split_stage_transform and not explicit_ring_depth else 1,
             explicit_fields,
         )
         # Stage each K or V tile once (packed payload, all head-dim slices,
@@ -4801,18 +4833,6 @@ def _finalize_static_decode_config(
     # and Correction uses those stage slots as the corresponding accumulators.
     _set_if_implicit(cfg, "o_stages", cfg.num_insts_kv, explicit_fields)
 
-    _set_if_implicit(
-        cfg,
-        "store_transformed_kv_in_tmem",
-        (
-            cfg.use_nvfp4_kv
-            and cfg.uses_tmem_transformed_kv_q_dtype
-            and not cfg.use_keeps_mma_ab
-            and cfg.head_dim_kv_stage == 128
-            and cfg.tile_size_kv == 128
-        ),
-        explicit_fields,
-    )
     if cfg.store_transformed_kv_in_tmem:
         # Allocate the remaining TMEM columns to transformed K/V eagerly.
         if (
@@ -4878,7 +4898,18 @@ def _finalize_static_decode_config(
             _set_if_implicit(cfg, "use_permuted_packed_v_order", True, explicit_fields)
             _set_if_implicit(cfg, "use_stage_sliced_nvfp4_sf", True, explicit_fields)
             if cfg.uses_stage_sliced_nvfp4_sf:
-                _set_if_implicit(cfg, "transformed_kv_stages", 4, explicit_fields)
+                # An explicit transformed_v_stages=0 shares the K depth: three
+                # slots per ring fit, four do not.
+                shared_depth = (
+                    "transformed_v_stages" in explicit_fields
+                    and cfg.transformed_v_stages == 0
+                )
+                _set_if_implicit(
+                    cfg,
+                    "transformed_kv_stages",
+                    3 if shared_depth else 4,
+                    explicit_fields,
+                )
                 _set_if_implicit(cfg, "transformed_v_stages", 3, explicit_fields)
             if (
                 cfg.use_paged_kv
@@ -5734,7 +5765,12 @@ def _try_apply_default_wide_keeps_config(
                 probe,
                 explicit_fields | {"tile_size_q"},
             )
-            if probe.groups_tokens_heads_q and not probe.supports_auto_grouped_keeps:
+            if probe.groups_tokens_heads_q and (
+                not probe.supports_auto_grouped_keeps
+                # D512 grouped Keeps is qualified only at eight Q heads per KV
+                # head; wider ratios keep the ungrouped Q16 Swaps fallback.
+                or probe.headdim == 512
+            ):
                 continue
             _validate_profile_support(
                 cfg=probe,
@@ -6856,12 +6892,15 @@ def _validate_profile_support(
         and not cfg.use_nvfp4_interleaved_kv
         and cfg.use_paged_kv
         and cfg.head_dim_kv_stage == 128
+        # Each slice box copies a full D128 slice; a partial last slice would
+        # write past the stage.
+        and cfg.headdim % cfg.head_dim_kv_stage == 0
         and cfg.tile_size_q < 32  # converters need constant head-dim stages
     ):
         raise ValueError(
             "use_whole_tile_nvfp4_raw_stage requires the paged TMEM K/V "
-            "transform with separate NVFP4 scale tensors and a non-flattened "
-            "converter"
+            "transform with separate NVFP4 scale tensors, a head dim that is a "
+            "multiple of 128, and a non-flattened converter"
         )
     slot_stages = cfg.transformed_kv_hd_stages_per_slot
     if slot_stages != 1 and not (
