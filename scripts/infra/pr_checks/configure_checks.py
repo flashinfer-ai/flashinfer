@@ -34,7 +34,7 @@ AGENT_GUIDANCE_DOCS: tuple[Path, ...] = (
         )
     ),
 )
-SKILLS_DIR: Path = FLASHINFER_ROOT / ".claude" / "skills"
+SKILLS_DIR: Path = FLASHINFER_ROOT / "skills"
 
 OUTPUT_DIR: Path = Path(
     os.environ.get(

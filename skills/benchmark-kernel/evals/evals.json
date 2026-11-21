@@ -1,0 +1,70 @@
+[
+  {
+    "id": "benchmark-kernel-001",
+    "question": "Give me the command to benchmark FlashInfer batch decode attention with paged KV cache, comparing the fa2, fa2_tc and cudnn backends, with a correctness check. Which timing method will it use?",
+    "expected_skill": "benchmark-kernel",
+    "expected_script": null,
+    "ground_truth": "The agent gave a python benchmarks/flashinfer_benchmark.py command with --routine BatchDecodeWithPagedKVCacheWrapper, --backends fa2 fa2_tc cudnn, problem-size flags such as --page_size, --batch_size, --s_kv, --num_qo_heads, --num_kv_heads, --head_dim_qk and --head_dim_vo, plus --refcheck (and optionally -vv). It explained that CUPTI is used automatically when cupti-python is installed and that it falls back to CUDA events otherwise, or when --use_cuda_events is passed.",
+    "expected_behavior": [
+      "The agent consulted the benchmark-kernel skill",
+      "The command used benchmarks/flashinfer_benchmark.py with --routine BatchDecodeWithPagedKVCacheWrapper",
+      "The command listed fa2, fa2_tc and cudnn under --backends and included --refcheck",
+      "The agent explained CUPTI is preferred and CUDA events are the automatic fallback",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  },
+  {
+    "id": "benchmark-kernel-002",
+    "question": "My FlashInfer benchmark numbers vary a lot between runs and the std is large. What should I change?",
+    "expected_skill": "benchmark-kernel",
+    "expected_script": null,
+    "ground_truth": "The agent suggested increasing warmup with --dry_run_iters, increasing measured iterations with --num_iters, using a cold L2 cache or rotating buffers in bench_gpu_time, and, as an advanced option, locking GPU clocks with nvidia-smi -lgc. It may also recommend installing cupti-python for more accurate timing of short kernels.",
+    "expected_behavior": [
+      "The agent consulted the benchmark-kernel skill",
+      "The agent recommended more warmup iterations (--dry_run_iters) and more measured iterations (--num_iters)",
+      "The agent mentioned a cold L2 cache or buffer rotation",
+      "The agent mentioned locking GPU clocks as an advanced option",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  },
+  {
+    "id": "benchmark-kernel-003",
+    "question": "I want to time my own function that calls a FlashInfer kernel from a Python script. Which FlashInfer helper should I use, what does it return, and what do I need installed for the most accurate timing?",
+    "expected_skill": "benchmark-kernel",
+    "expected_script": null,
+    "ground_truth": "The agent recommended flashinfer.testing.bench_gpu_time, called with the function and args plus enable_cupti=True, num_iters and dry_run_iters (and optionally cold_l2_cache=True). It returns the median and standard deviation of the kernel time in milliseconds. For the most accurate timing the user should install cupti-python (version 13 or newer, which needs CUDA 13); without it the helper warns and falls back to CUDA events.",
+    "expected_behavior": [
+      "The agent consulted the benchmark-kernel skill",
+      "The agent recommended bench_gpu_time from flashinfer.testing",
+      "The agent said it returns median and standard deviation times",
+      "The agent said cupti-python (CUDA 13+) gives the most accurate timing and that CUDA events are the fallback",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  },
+  {
+    "id": "benchmark-kernel-004",
+    "question": "I have a dozen FlashInfer benchmark configurations to run and I want all the results in one CSV that I can share with reproducer commands. How do I do that?",
+    "expected_skill": "benchmark-kernel",
+    "expected_script": null,
+    "ground_truth": "The agent said to put one set of flashinfer_benchmark.py arguments per line in a test-list file and run python benchmarks/flashinfer_benchmark.py --testlist <file> --output_path results.csv --generate_repro_command (optionally with --refcheck), which writes every case and its reproducer command to the CSV; --case_tag can label rows.",
+    "expected_behavior": [
+      "The agent consulted the benchmark-kernel skill",
+      "The agent described a test-list file with one argument set per line passed via --testlist",
+      "The agent used --output_path to write a CSV",
+      "The agent used --generate_repro_command to record reproducer commands",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  },
+  {
+    "id": "benchmark-kernel-005",
+    "question": "My PyTorch training loop is slow and I suspect the DataLoader. How do I use torch.profiler to find the bottleneck?",
+    "expected_skill": null,
+    "expected_script": null,
+    "ground_truth": "The agent explained how to profile a PyTorch training loop with torch.profiler (schedule, record_function, TensorBoard trace or key_averages) and DataLoader-specific checks such as num_workers and pin_memory. It did not route the user to FlashInfer kernel benchmarking, flashinfer_benchmark.py or bench_gpu_time.",
+    "expected_behavior": [
+      "The agent's answer focused on torch.profiler and DataLoader performance",
+      "The agent did not recommend benchmarks/flashinfer_benchmark.py or flashinfer.testing.bench_gpu_time",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  }
+]

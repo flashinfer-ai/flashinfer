@@ -77,7 +77,7 @@ CHECKS: tuple[CheckMeta, ...] = (
     CheckMeta(
         SKILL_REFS,
         "Skill References",
-        "Paths referenced by .claude skills must exist.",
+        "Paths referenced by skills must exist.",
     ),
     CheckMeta(
         DOCS_INDEX_REFS,

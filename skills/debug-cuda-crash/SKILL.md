@@ -1,6 +1,16 @@
 ---
 name: debug-cuda-crash
-description: Tutorial for debugging CUDA crashes using API logging
+description: Debugs CUDA crashes and numerical errors in FlashInfer with @flashinfer_api logging (FLASHINFER_LOGLEVEL, FLASHINFER_LOGDEST), which records API inputs before a kernel runs, combined with compute-sanitizer, cuda-gdb and in-kernel printf. Use when a FlashInfer call fails with an illegal memory access, NaN or Inf output, out-of-memory, or a dtype or shape mismatch, including multi-GPU runs.
+license: Apache-2.0
+metadata:
+  author: "FlashInfer Team"
+  tags:
+    - flashinfer
+    - cuda
+    - debugging
+    - logging
+    - compute-sanitizer
+    - gpu
 ---
 
 # Tutorial: Debugging CUDA Crashes with API Logging
@@ -333,7 +343,7 @@ my_kernel(input, output)
 torch.cuda.synchronize()  # ← Flushes printf output
 ```
 
-### ⚠️ Warp-Specialized Kernels: Choosing the Right Print Thread
+### ⚠ Warp-Specialized Kernels: Choosing the Right Print Thread
 
 **Problem**: `threadIdx.x == 0` doesn't work for all warps (warp starting at thread 32 won't have thread 0).
 

@@ -1,0 +1,69 @@
+[
+  {
+    "id": "debug-cuda-crash-001",
+    "question": "A FlashInfer call in my script dies with 'CUDA error: an illegal memory access was encountered' and the process exits, so I can't inspect anything. How do I find out which inputs caused it?",
+    "expected_skill": "debug-cuda-crash",
+    "expected_script": null,
+    "ground_truth": "The agent said to enable FlashInfer API logging with FLASHINFER_LOGLEVEL=3 and send it to a file with FLASHINFER_LOGDEST (e.g. debug.log), because the @flashinfer_api decorator logs inputs before the kernel runs. After re-running, the last logged API call with no logged outputs is the one that crashed; check its tensor shapes, dtypes, devices (CUDA, not CPU), strides and is_contiguous. Optionally combine with compute-sanitizer --tool memcheck.",
+    "expected_behavior": [
+      "The agent consulted the debug-cuda-crash skill",
+      "The agent set FLASHINFER_LOGLEVEL=3 and FLASHINFER_LOGDEST to a file",
+      "The agent explained that inputs are logged before execution, so the last call without outputs is the crashing call",
+      "The agent listed checks such as shapes, dtypes, device placement and contiguity",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  },
+  {
+    "id": "debug-cuda-crash-002",
+    "question": "A FlashInfer kernel in my model starts returning NaN after a few steps. How can FlashInfer's logging help me find where the NaNs come from?",
+    "expected_skill": "debug-cuda-crash",
+    "expected_script": null,
+    "ground_truth": "The agent recommended FLASHINFER_LOGLEVEL=5, which adds tensor statistics (min, max, mean, nan_count, inf_count) to the logged inputs and outputs, written to a file via FLASHINFER_LOGDEST, and said to look for the first call whose inputs or outputs have non-zero nan_count/inf_count or suspicious magnitudes. It noted that level-5 statistics are skipped during CUDA graph capture.",
+    "expected_behavior": [
+      "The agent consulted the debug-cuda-crash skill",
+      "The agent recommended FLASHINFER_LOGLEVEL=5 for tensor statistics",
+      "The agent mentioned nan_count and inf_count (or min/max/mean statistics)",
+      "The agent mentioned that statistics are skipped under CUDA graph capture",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  },
+  {
+    "id": "debug-cuda-crash-003",
+    "question": "I'm running a FlashInfer model with torchrun on 8 GPUs and want the FlashInfer API logs separated per process. How do I configure that?",
+    "expected_skill": "debug-cuda-crash",
+    "expected_script": null,
+    "ground_truth": "The agent said to set FLASHINFER_LOGLEVEL (e.g. 3) and put %i in FLASHINFER_LOGDEST, for example FLASHINFER_LOGDEST=rank_%i.log, where %i is replaced by the process ID, so torchrun produces one log file per process.",
+    "expected_behavior": [
+      "The agent consulted the debug-cuda-crash skill",
+      "The agent used a %i pattern in FLASHINFER_LOGDEST",
+      "The agent explained %i is replaced by the process ID, giving one log per process",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  },
+  {
+    "id": "debug-cuda-crash-004",
+    "question": "I added printf to a warp-specialized CUDA kernel in FlashInfer, guarded by threadIdx.x == 0, but only one warp ever prints and sometimes nothing shows up at all. What's wrong?",
+    "expected_skill": "debug-cuda-crash",
+    "expected_script": null,
+    "ground_truth": "The agent explained that threadIdx.x == 0 selects only the first thread of the block, so only warp 0 prints; in a warp-specialized kernel the print guard should pick one representative thread per specialization group (e.g. threadIdx.x % 32 == 0 per warp or threadIdx.x % 128 == 0 per 4-warp group). It also said printf output is flushed only after synchronization, e.g. torch.cuda.synchronize() after the kernel.",
+    "expected_behavior": [
+      "The agent consulted the debug-cuda-crash skill",
+      "The agent explained that threadIdx.x == 0 only covers the first warp",
+      "The agent suggested choosing one representative thread per warp or group (e.g. threadIdx.x % 32 == 0)",
+      "The agent mentioned synchronizing (e.g. torch.cuda.synchronize()) to flush printf output",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  },
+  {
+    "id": "debug-cuda-crash-005",
+    "question": "My torch.distributed job hangs inside all_reduce on the second node. Which NCCL environment variables should I set to debug the hang?",
+    "expected_skill": null,
+    "expected_script": null,
+    "ground_truth": "The agent addressed NCCL and torch.distributed debugging (e.g. NCCL_DEBUG=INFO, NCCL_DEBUG_SUBSYS, TORCH_NCCL_ASYNC_ERROR_HANDLING or TORCH_DISTRIBUTED_DEBUG, network interface settings such as NCCL_SOCKET_IFNAME). It did not treat this as a FlashInfer crash and did not suggest FLASHINFER_LOGLEVEL or @flashinfer_api logging.",
+    "expected_behavior": [
+      "The agent's answer focused on NCCL / torch.distributed debugging settings",
+      "The agent did not recommend FLASHINFER_LOGLEVEL or FlashInfer API logging",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  }
+]
