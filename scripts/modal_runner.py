@@ -125,6 +125,29 @@ def _run_flashinfer_command(command: str) -> str:
             ],
             check=True,
         )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                "3rdparty/cccl",
+                "fetch",
+                "--depth=1",
+                "origin",
+                "67064a8b2357b3541bc96c209413e1a6189a3297",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                "3rdparty/cccl",
+                "checkout",
+                "--detach",
+                "67064a8b2357b3541bc96c209413e1a6189a3297",
+            ],
+            check=True,
+        )
 
     # Run the user command
     print(f"=== Running command: {command} ===")
