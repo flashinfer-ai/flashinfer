@@ -57,7 +57,7 @@ SM103_ONLY_MODULES = {
 }
 
 
-def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
+def _registered_generators(monkeypatch, sm_capabilities, overrides=None, add_moe=True):
     """Run gen_all_modules with every module generator stubbed to its own name."""
     from flashinfer import aot
     from flashinfer.jit import comm as jit_comm
@@ -75,6 +75,7 @@ def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
                 monkeypatch.setattr(
                     module, attr, lambda *args, _result=result, **kwargs: _result
                 )
+    monkeypatch.setattr(aot, "tinygemm2_sm100_has_targets", lambda: True)
     for attr, stub in (overrides or {}).items():
         monkeypatch.setattr(aot, attr, stub)
     monkeypatch.setattr(aot, "_gen_blackwell_bf16_bmm_aot_specs", lambda caps: [])
@@ -91,7 +92,7 @@ def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
         True,
         False,
         False,
-        True,
+        add_moe,
         False,
         True,
         True,
@@ -172,6 +173,33 @@ def test_registered_tgv_gemm_runs_on_every_targeted_arch(
     assert calls[0] is expected_use_sm_100f
 
 
+BF16_GEMM_MODULES = {
+    "gen_mm_bf16_cublaslt_module",
+    "gen_gemm_sm100_module_cutlass_bf16",
+    "gen_tgv_gemm_sm10x_module",
+    "gen_tinygemm2_module",
+    "gen_tinygemm2_sm100_module",
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "sm_capabilities",
+    [
+        {"sm100": True, "sm100a_exact": True, "sm100f": True},
+        {"sm103": True, "sm103a_exact": True},
+        {"sm107": True, "sm107a_exact": True},
+    ],
+    ids=["sm100a", "sm103a", "sm107a"],
+)
+def test_bf16_gemm_modules_are_prebuilt_for_every_blackwell_target(
+    monkeypatch, sm_capabilities
+):
+    registered = _registered_generators(monkeypatch, sm_capabilities)
+
+    assert registered >= BF16_GEMM_MODULES
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("arch_list", "expected"),
@@ -200,3 +228,123 @@ def test_trtllm_gen_gemm_runners_target_the_built_sm10x_arch(
     flags = getattr(gemm_core, generator)().extra_cuda_cflags
 
     assert [flag for flag in flags if flag.startswith("-gencode=")] == [expected]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "arch", ["sm90", "sm100", "sm103", "sm107", "sm110", "sm120", "sm121"]
+)
+def test_tinygemm2_is_prebuilt_for_every_arch_that_loads_it(monkeypatch, arch):
+    # mm_bf16(backend="tinygemm") loads tinygemm2 on SM90+; when the jit-cache
+    # lacks it, the first call runs nvcc.
+    registered = _registered_generators(monkeypatch, {arch: True})
+
+    assert "gen_tinygemm2_module" in registered
+
+
+@pytest.mark.cpu_only
+def test_tinygemm2_is_prebuilt_without_moe(monkeypatch):
+    registered = _registered_generators(monkeypatch, {"sm100": True}, add_moe=False)
+
+    assert {"gen_tinygemm2_module", "gen_tinygemm2_sm100_module"} <= registered
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm100", "sm103", "sm107"])
+def test_bf16_cutlass_and_cublaslt_are_prebuilt_without_moe(monkeypatch, arch):
+    registered = _registered_generators(monkeypatch, {arch: True}, add_moe=False)
+
+    assert {
+        "gen_mm_bf16_cublaslt_module",
+        "gen_gemm_sm100_module_cutlass_bf16",
+    } <= registered
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("arch", "expected"),
+    [
+        ("sm90", False),
+        ("sm100", True),
+        ("sm103", True),
+        ("sm107", True),
+        ("sm110", False),
+        ("sm120", False),
+        ("sm121", False),
+    ],
+)
+def test_tinygemm2_sm100_variant_is_prebuilt_only_for_sm10x(
+    monkeypatch, arch, expected
+):
+    registered = _registered_generators(monkeypatch, {arch: True})
+
+    assert ("gen_tinygemm2_sm100_module" in registered) == expected
+
+
+@pytest.mark.cpu_only
+def test_tinygemm2_sm100_is_skipped_when_no_target_survives_the_cuda_gate(
+    monkeypatch,
+):
+    from flashinfer.jit import tinygemm2
+
+    monkeypatch.setattr(
+        tinygemm2, "is_cuda_version_at_least", lambda v: Version("13.0") >= Version(v)
+    )
+    monkeypatch.setattr(
+        tinygemm2.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, "7a")}
+    )
+
+    registered = _registered_generators(
+        monkeypatch,
+        {"sm107": True},
+        overrides={
+            "tinygemm2_sm100_has_targets": tinygemm2.tinygemm2_sm100_has_targets
+        },
+    )
+
+    assert "gen_tinygemm2_sm100_module" not in registered
+    assert {
+        "gen_mm_bf16_cublaslt_module",
+        "gen_gemm_sm100_module_cutlass_bf16",
+    } <= registered
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("cuda", "targets", "expected"),
+    [
+        ("13.4", {(10, "0a")}, ["compute_100a"]),
+        ("13.4", {(10, "3a")}, ["compute_103a"]),
+        ("13.4", {(10, "7a")}, ["compute_107a"]),
+        (
+            "13.4",
+            {(10, "0a"), (10, "3a"), (10, "7a")},
+            ["compute_100a", "compute_103a", "compute_107a"],
+        ),
+        (
+            "13.0",
+            {(10, "0a"), (10, "3a"), (10, "7a")},
+            ["compute_100a", "compute_103a"],
+        ),
+        ("12.8", {(10, "0a"), (10, "3a"), (10, "7a")}, ["compute_100a"]),
+        ("13.4", {(9, "0a"), (10, "0a")}, ["compute_100a"]),
+    ],
+)
+def test_tinygemm2_sm100_targets_follow_the_build_targets(
+    monkeypatch, cuda, targets, expected
+):
+    from flashinfer.jit import tinygemm2
+
+    monkeypatch.setattr(
+        tinygemm2, "is_cuda_version_at_least", lambda v: Version(cuda) >= Version(v)
+    )
+    monkeypatch.setattr(
+        tinygemm2.current_compilation_context, "TARGET_CUDA_ARCHS", targets
+    )
+    flags = tinygemm2.gen_tinygemm2_sm100_module().extra_cuda_cflags
+
+    assert [
+        flag.split("arch=")[1].split(",")[0]
+        for flag in flags
+        if flag.startswith("-gencode=")
+    ] == expected
