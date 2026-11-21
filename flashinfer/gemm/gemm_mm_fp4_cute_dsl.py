@@ -230,6 +230,102 @@ def _mxfp8_blockscaled_kernel_disk_name(cache_key, batch_size, max_active_cluste
     )
 
 
+def _mm_mxfp8_sm107_cache_key(
+    mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m, out_dtype
+):
+    """In-memory and on-disk specialization key for SM107 mm_mxfp8."""
+    return (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m, out_dtype)
+
+
+def _mxfp8_sm107_kernel_disk_name(cache_key, batch_size, max_active_clusters):
+    """On-disk kernel name encoding every SM107 mm_mxfp8 codegen parameter.
+
+    The SM107 kernel's MMA inst/tiler K are module constants, so they are
+    covered by the source fingerprint rather than the name.
+    """
+    mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m, out_dtype = cache_key
+    dtype = str(out_dtype).removeprefix("torch.")
+    return (
+        f"t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+        f"_c{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+        f"_swap{int(swap_ab)}_im{mma_inst_shape_m}_{dtype}"
+        f"_b{batch_size}_mac{max_active_clusters}"
+    )
+
+
+def _blockscaled_mxfp8_sm107_cache_key_files() -> tuple:
+    """Source files whose content invalidates the on-disk SM107 mm_mxfp8 kernels."""
+    from . import gemm_base
+    from .kernels import dense_blockscaled_gemm_sm107
+
+    return (
+        __file__,
+        dense_blockscaled_gemm_sm107.__file__,
+        gemm_base.__file__,
+    )
+
+
+def _mm_mxfp8_sm120_cache_key(
+    sf_vec_size,
+    mma_tiler_mn,
+    cluster_shape_mn,
+    swap_ab,
+    use_prefetch,
+    kernel_type,
+    use_tma_store,
+    enable_pdl,
+    out_dtype,
+):
+    """In-memory and on-disk specialization key for SM120 (b12x) mm_mxfp8."""
+    return (
+        sf_vec_size,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        swap_ab,
+        use_prefetch,
+        kernel_type,
+        use_tma_store,
+        enable_pdl,
+        out_dtype,
+    )
+
+
+def _mxfp8_sm120_kernel_disk_name(cache_key, batch_size, max_active_clusters):
+    """On-disk kernel name encoding every SM120 mm_mxfp8 codegen parameter."""
+    (
+        sf_vec_size,
+        mma_tiler_mn,
+        cluster_shape_mn,
+        swap_ab,
+        use_prefetch,
+        kernel_type,
+        use_tma_store,
+        enable_pdl,
+        out_dtype,
+    ) = cache_key
+    tma = "x" if use_tma_store is None else int(use_tma_store)
+    dtype = str(out_dtype).removeprefix("torch.")
+    return (
+        f"sf{sf_vec_size}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+        f"_c{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
+        f"_swap{int(swap_ab)}_pf{int(use_prefetch)}_{kernel_type}"
+        f"_tma{tma}_pdl{int(enable_pdl)}_{dtype}"
+        f"_b{batch_size}_mac{max_active_clusters}"
+    )
+
+
+def _blockscaled_mxfp8_sm120_cache_key_files() -> tuple:
+    """Source files whose content invalidates the on-disk SM120 mm_mxfp8 kernels."""
+    from . import gemm_mm_mxfp8_cute_dsl
+    from .kernels import dense_blockscaled_gemm_sm120_b12x
+
+    return (
+        __file__,
+        dense_blockscaled_gemm_sm120_b12x.__file__,
+        gemm_mm_mxfp8_cute_dsl.__file__,
+    )
+
+
 def _make_blockscaled_gemm_compile_fn(
     gemm,
     ab_cutlass_dtype,

@@ -76,7 +76,10 @@ from ..fused_moe.utils import (
 from .gemm_mm_fp4_cute_dsl import (
     _blockscaled_mxfp8_gemm_cache_key_files,
     _compile_block_scaled_gemm,
+    _blockscaled_mxfp8_sm107_cache_key_files,
+    _mm_mxfp8_sm107_cache_key,
     _mxfp8_blockscaled_kernel_disk_name,
+    _mxfp8_sm107_kernel_disk_name,
     _mm_fp4_cache_key,
     mm_fp4_l2_policy,
     _mm_mxfp8_cache_key,
@@ -7964,7 +7967,9 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
 
             compiled_gemm, _ = _compile_block_scaled_gemm(
                 _CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE,
-                (mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m, out_dtype),
+                _mm_mxfp8_sm107_cache_key(
+                    mma_tiler_mn, cluster_shape_mn, swap_ab, mma_inst_shape_m, out_dtype
+                ),
                 lambda: Sm107Kernel(
                     sf_vec_size,
                     (mma_inst_shape_m, mma_tiler_mn[1], _SM107_MXFP8_MMA_INST_SHAPE_K),
@@ -7981,6 +7986,10 @@ def _cute_dsl_gemm_mxfp8_sm107_runner(out_dtype: torch.dtype):
                 sf_n=sf_n,
                 sf_k=sf_k,
                 batch_size=1,
+                cache_module_name="mm_mxfp8_sm107",
+                device_index=get_device_index(a.device),
+                disk_kernel_name_fn=_mxfp8_sm107_kernel_disk_name,
+                cache_key_files_fn=_blockscaled_mxfp8_sm107_cache_key_files,
             )
 
             launch_out = (
