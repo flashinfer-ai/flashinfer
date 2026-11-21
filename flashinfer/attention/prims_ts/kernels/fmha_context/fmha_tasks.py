@@ -1982,9 +1982,9 @@ def _cache_loop_mask_state(
     Runs once per work tile, before the K/V loop. Each warp's unmasked range
     ``[begin, end)`` splits the LOOP into left-masked, unmasked, and
     right-masked tiles, so ``_loop_row_max`` selects the masked path with one
-    tile-index test. Window masks store the range in SMEM here; masks with a
-    single right bound derive it from the cached ``q_offset`` / ``seqlen_k``
-    (``TmemSPResource.uses_loop_unmasked_tile_range``).
+    test. Window masks store the range in SMEM here; masks with a single right
+    bound test it in key space from the cached ``q_offset`` / ``seqlen_k``,
+    which their masked tiles reuse (``TmemSPResource.uses_loop_unmasked_tile_range``).
     """
     if tmem_sp.uses_varlen_q_offset_cache:
         q_offset = sp.cache_q_offset()

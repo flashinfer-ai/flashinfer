@@ -82,6 +82,7 @@ from ..tensor_map import transform_ragged_coords
 
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from ..mask import (
+    kv_tile_needs_right_mask,
     pack_kv_tile_range,
     packed_kv_tile_in_range,
     unmasked_kv_tile_range,
@@ -3440,13 +3441,13 @@ class TmemSPResource(MemoryResource):
     def uses_loop_unmasked_tile_range(self) -> bool:
         """Return whether LOOP masks select tiles by an SMEM-cached unmasked range.
 
-        Window masks build their range once per work tile in HEAD. The
-        query-paired causal and packed dense K masks keep their per-tile
-        right-edge test on ``q_min`` / ``seqlen_k``, which the mask needs in
-        the loop anyway: a cached range (loop-carried register or SMEM load)
-        measured slower on the register-bound D256 LDTM.STAT softmax. A fixed
-        dense K tail masks only the last LOOP tile, which a constant tile-count
-        test already selects.
+        Two-sided (window) masks build their ``[begin, end)`` tile range once
+        per work tile in HEAD. Masks with a single right bound test it in key
+        space with ``kv_tile_needs_right_mask``, because their masked tiles
+        need that bound anyway: the query-paired causal mask builds it from
+        the cached ``q_offset`` (``_causal_k_end``) and the packed dense K mask
+        uses the cached ``seqlen_k``. A fixed dense K tail masks only the last
+        LOOP tile, which a constant tile-count test already selects.
         """
         return self.loop_mask_kind in ("variable_window", "left_window", "varlen_right")
 
@@ -4292,6 +4293,68 @@ class TmemSPResource(MemoryResource):
         )
 
     @cute.jit
+    def _causal_k_end(self, stage_info: StageInfo, q_offset: Int32) -> Int32:
+        """Return the keys ``[0, end)`` visible to the Q tile's first row.
+
+        The query-paired causal right bound grows by one key per row, so row
+        ``r`` of the tile sees ``end + r`` keys and a tile whose keys all lie
+        below ``end`` needs no mask. Built from the per-work-tile ``q_offset``
+        and tile coordinates on the uniform datapath: caching ``end`` across
+        the LOOP instead measured 3-8% slower on the register-bound D256
+        LDTM.STAT softmax, whose S tile the allocator then copies every tile.
+        """
+        cfg = self.cfg
+        seq_coord, _, _ = _resolve_work_tile_coords(cfg, stage_info.work_tile.tile_idx)
+        return (
+            Int32(q_offset)
+            + seq_coord * cfg.cta_tiler[0]
+            + self.q_half * cfg.q_tile_m
+            + Int32(1)
+        )
+
+    @cute.jit
+    def _causal_k_end_needs_mask(
+        self, kv_tile_idx: Int32, causal_k_end: Int32
+    ) -> cutlass.Boolean:
+        """Return whether K/V tile ``kv_tile_idx`` crosses the tile's causal end."""
+        return kv_tile_needs_right_mask(
+            kv_tile_idx * self.cfg.kv_tile_n,
+            Int32(self.cfg.qk_mma_tiler[1]),
+            causal_k_end,
+        )
+
+    @cute.jit
+    def _causal_row_k_end(self, causal_k_end: Int32) -> Int32:
+        """Return the keys this thread's Q row sees: ``causal_k_end + row``."""
+        return (
+            causal_k_end
+            + (cute.arch.warp_idx() % _NUM_SOFTMAX_WARPS) * cute.arch.WARP_SIZE
+            + cute.arch.lane_idx()
+        )
+
+    @cute.jit
+    def _mask_causal_k_end_chunks(
+        self, s_data: SoftmaxChunks, kv_tile_idx: Int32, causal_k_end: Int32
+    ) -> SoftmaxChunks:
+        """Mask every key at or past this row's causal end."""
+        tmem_x = self.cfg.tmem_x_load_s
+        kv_base = kv_tile_idx * self.cfg.kv_tile_n
+        row_k_end = self._causal_row_k_end(causal_k_end)
+        for chunk_idx in cutlass.range_constexpr(len(s_data)):
+            num_valid = cute.math.min(
+                cute.math.max(row_k_end - (kv_base + chunk_idx * tmem_x), Int32(0)),
+                Int32(tmem_x),
+            )
+            mask = cutlass.vector.create_mask([tmem_x], [num_valid])
+            masked_values = cutlass.vector.full_like(
+                s_data[chunk_idx], Float32(_SOFTMAX_MASK_VALUE)
+            )
+            s_data[chunk_idx] = cutlass.vector.where(
+                mask, s_data[chunk_idx], masked_values
+            )
+        return s_data
+
+    @cute.jit
     def _mask_range_word(self, stage_info: StageInfo) -> tuple[cutlass.Array, Int32]:
         """Return the SMEM range words and this warp's slot in them."""
         words = cutlass.Array(
@@ -4552,7 +4615,7 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
         *,
         causal_loop_mask: cutlass.Constexpr[bool] = False,
-        q_offset: Int32 = 0,
+        causal_k_end: Int32 = 0,
         tile_scale: SoftmaxScalar | None = None,
         dense_k_mask: cutlass.Constexpr[bool] = False,
         seqlen_k: Int32 = 0,
@@ -4595,31 +4658,22 @@ class TmemSPResource(MemoryResource):
         row_max = cute.math.max(row_max, tile_max)
         if cutlass.const_expr(causal_loop_mask or dense_k_mask):
             if cutlass.const_expr(causal_loop_mask):
-                seq_coord, _, _ = _resolve_work_tile_coords(
-                    self.cfg, stage_info.work_tile.tile_idx
-                )
-                q_min = (
-                    q_offset
-                    + seq_coord * self.cfg.cta_tiler[0]
-                    + self.q_half * self.cfg.q_tile_m
-                )
                 kv_base = stage_info.loop_offset * self.cfg.kv_tile_n
-                needs_mask = q_min < kv_base + self.cfg.qk_mma_tiler[1] - Int32(1)
+                needs_mask = self._causal_k_end_needs_mask(
+                    stage_info.loop_offset, causal_k_end
+                )
             else:
                 if cutlass.const_expr(section == FmhaStage.Loop):
                     kv_tile_idx = stage_info.loop_offset
                 else:
                     kv_tile_idx = stage_info.loop_end
                 kv_base = kv_tile_idx * self.cfg.kv_tile_n
-                needs_mask = seqlen_k < kv_base + Int32(self.cfg.kv_tile_n)
+                needs_mask = kv_tile_needs_right_mask(
+                    kv_base, Int32(self.cfg.kv_tile_n), seqlen_k
+                )
             if needs_mask:
                 if cutlass.const_expr(causal_loop_mask):
-                    right_bound = (
-                        q_min
-                        + (cute.arch.warp_idx() % 4) * cute.arch.WARP_SIZE
-                        + cute.arch.lane_idx()
-                        + Int32(1)
-                    )
+                    right_bound = self._causal_row_k_end(causal_k_end)
                 else:
                     right_bound = seqlen_k
                 # Invalid lanes can contain another request's scores or TMA
@@ -5710,8 +5764,7 @@ class TmemSPResource(MemoryResource):
             # Some schedules materialize their final score tile in TAIL.
             kv_tile_idx = stage_info.loop_end
         kv_base = kv_tile_idx * self.cfg.kv_tile_n
-        kv_end = kv_base + Int32(self.cfg.kv_tile_n)
-        if seqlen_k < kv_end:
+        if kv_tile_needs_right_mask(kv_base, Int32(self.cfg.kv_tile_n), seqlen_k):
             masked_values = cutlass.vector.full(
                 [tmem_x],
                 self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
@@ -5914,15 +5967,17 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
         q_offset: Int32,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """Loop stage: apply causal masking for mixed Q right-offset batches."""
+        """Loop stage: query-paired causal mask on tiles crossing the causal end."""
+        causal_k_end = self._causal_k_end(stage_info, q_offset)
         if cutlass.const_expr(self.cfg.uses_ldtm_stat):
             return self._load_s_chunks_and_reduce_row_max(
-                stage_info, row_max, causal_loop_mask=True, q_offset=q_offset
+                stage_info, row_max, causal_loop_mask=True, causal_k_end=causal_k_end
             )
         s_data = self._load_s_chunks(stage_info)
-        s_data = self._apply_causal_mask_for_kv_tile(
-            stage_info, s_data, kv_tile_idx=stage_info.loop_offset, q_offset=q_offset
-        )
+        if self._causal_k_end_needs_mask(stage_info.loop_offset, causal_k_end):
+            s_data = self._mask_causal_k_end_chunks(
+                s_data, stage_info.loop_offset, causal_k_end
+            )
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
