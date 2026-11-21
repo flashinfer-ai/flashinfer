@@ -107,6 +107,14 @@ from .vc_attention.vc_resources import (
 )
 from .vc_attention.vc_scales import VCKScaleTable, vc_flat_k_base, vc_flat_q_slot
 from ..tcgen05_compat import tcgen05_ld_32x32b_max
+from ..quant_output import (
+    QuantOutputFormat,
+    block_amax,
+    block_scale,
+    quant_output_format,
+    sf_offset,
+    store_sf,
+)
 from ...sage.int32_scores import (
     INT32_SCORE_BIAS,
     fill_sage_score_seed_tile,
@@ -509,6 +517,16 @@ class FmhaConfig:
     # operands. The scale atoms ride the Q and K loads and the MMA warp copies
     # them into tensor memory before each QK step.
     use_mxfp8_qk: bool = False
+    # Quantized (block-scaled) output: the dtype of O's block scales, or None.
+    # With ``o_dtype`` it selects the format (``kernels/quant_output.py``);
+    # the correction warps then write one scale per ``sf_vec_size`` output
+    # channels next to the staged O tile.
+    out_sf_dtype: type | None = None
+
+    @property
+    def quant_output(self) -> QuantOutputFormat | None:
+        """The quantized output format, or None for a plain output."""
+        return quant_output_format(self.o_dtype, self.out_sf_dtype)
 
     # Variable sequence length mode stores Q/K/V/O as flattened
     # [sum_seqlen, head, dim] tensors and uses cum_seqlen_* for per-batch
@@ -7420,6 +7438,11 @@ class SmemOResource(MemoryResource):
     # their sequences; the epilogue reads the work tile's ``sfV`` / ``v_mean``.
     sage_scales: cute.Pointer | None = field(init=False, default=None)
     num_kv_heads: int | Int32 = field(init=False, default=0)
+    # Quantized output: the flat swizzled block-scale buffer, its padded scale
+    # columns divided by four, and the Q head count that bounds the rows.
+    o_sf: cute.Tensor | None = field(init=False, default=None)
+    o_sf_col_blocks: int | Int32 = field(init=False, default=0)
+    num_qo_heads: int | Int32 = field(init=False, default=0)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     head_coord: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     batch_coord: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -7433,6 +7456,9 @@ class SmemOResource(MemoryResource):
         tmem_vec_resource: TmemStatsResource | None = None,
         sage_scales: cute.Pointer | None = None,
         num_kv_heads: int | Int32 = 0,
+        o_sf: cute.Tensor | None = None,
+        o_sf_col_blocks: int | Int32 = 0,
+        num_qo_heads: int | Int32 = 0,
         **kwargs: Any,
     ) -> None:
         """Bind one output subtile stage and reserve its SMEM staging buffer."""
@@ -7442,6 +7468,9 @@ class SmemOResource(MemoryResource):
         self.tmem_vec_resource = tmem_vec_resource
         self.sage_scales = sage_scales
         self.num_kv_heads = num_kv_heads
+        self.o_sf = o_sf
+        self.o_sf_col_blocks = o_sf_col_blocks
+        self.num_qo_heads = num_qo_heads
         stage_elements = cfg.sO_stage_elements
         size_bytes = stage_elements * cfg.o_dtype.width // 8
         self._alloc = SmemAllocation(
@@ -7624,6 +7653,43 @@ class SmemOResource(MemoryResource):
         d_block_size = o_head_dim // tma_copy_o_iters
         row_offset = tid_in_wg * d_block_size
 
+        # A quantized output groups the 16-column loads of one scale block.
+        # Each correction thread owns one O row, so the block maximum needs no
+        # shuffle. The row's token and head follow the LSE mapping.
+        quant = self.cfg.quant_output
+        loads_per_group = 1
+        if cutlass.const_expr(quant is not None):
+            assert quant.sf_vec_size % tmem_x == 0
+            loads_per_group = quant.sf_vec_size // tmem_x
+        assert num_iters % loads_per_group == 0
+        sf_valid = cutlass.Boolean(False)
+        sf_token = Int32(0)
+        sf_col_base = Int32(0)
+        if cutlass.const_expr(quant is not None):
+            stats = self.tmem_vec_resource
+            assert stats is not None and self.o_sf is not None
+            seq_tile, head_tile, batch = _resolve_work_tile_coords(
+                self.cfg, stage_info.work_tile.tile_idx
+            )
+            head = (
+                head_tile * self.cfg.work_tile_q_heads
+                + self.stage_idx * self.cfg.peer_q_head_stride
+            )
+            query = (
+                seq_tile * self.cfg.work_tile_q_seq_tiles
+                + self.stage_idx * self.cfg.peer_q_seq_tile_stride
+            ) * self.cfg.q_tile_m + tid_in_wg
+            length = Int32(stats.query_seq_len)
+            sf_token = batch * length + query
+            if cutlass.const_expr(stats.cum_seqlen_q is not None):
+                start = Int32(stats.cum_seqlen_q[batch])
+                length = Int32(stats.cum_seqlen_q[batch + Int32(1)]) - start
+                sf_token = start + query
+            sf_valid = (query < length) & (head < Int32(self.num_qo_heads))
+            sf_col_base = head * Int32(
+                self.cfg.epi_tile[1] // quant.sf_vec_size
+            ) + Int32(head_dim_stage_idx * o_head_dim // quant.sf_vec_size)
+
         if cutlass.const_expr(self.cfg.use_sage_attention):
             # The sequence's first sfV word plus this stage's first channel;
             # the per-iteration channels are constant offsets from it.
@@ -7642,58 +7708,88 @@ class SmemOResource(MemoryResource):
                 sequence_words=sage_sequence,
             ) + Int64(head_dim_stage_idx * o_head_dim) * Int64(4)
 
-        for i in cutlass.range_constexpr(num_iters):
-            tmem_offset_tile = tmem_offset_o + i * tmem_x
+        for group_idx in cutlass.range_constexpr(num_iters // loads_per_group):
+            o_parts = []
+            for part_idx in cutlass.range_constexpr(loads_per_group):
+                i = group_idx * loads_per_group + part_idx
+                tmem_offset_tile = tmem_offset_o + i * tmem_x
 
-            tmem_ptr = cutlass.inttoptr(
-                tmem_offset_tile,
-                mem_space=6,
-                dtype=self.cfg.pv_acc_dtype,
-            )
-
-            o_rmem = prims.tcgen05_ld(tmem_shape, tmem_ptr, num=tmem_x)
-            cute.arch.fence_view_async_tmem_load()
-
-            scale_vec = cutlass.vector.full_like(o_rmem, scale)
-            if cutlass.const_expr(self.cfg.use_sage_attention):
-                v_scales, v_means = load_sage_v_channels(
-                    self.cfg.sage_scale_layout,
-                    sage_v_address,
-                    offset=i * tmem_x,
-                    count=tmem_x,
+                tmem_ptr = cutlass.inttoptr(
+                    tmem_offset_tile,
+                    mem_space=6,
+                    dtype=self.cfg.pv_acc_dtype,
                 )
-                o_rmem = o_rmem * (scale_vec * v_scales)
-                if cutlass.const_expr(v_means is not None):
-                    o_rmem = o_rmem + v_means * cutlass.vector.full_like(
-                        o_rmem, output_scale
+
+                o_rmem = prims.tcgen05_ld(tmem_shape, tmem_ptr, num=tmem_x)
+                cute.arch.fence_view_async_tmem_load()
+
+                scale_vec = cutlass.vector.full_like(o_rmem, scale)
+                if cutlass.const_expr(self.cfg.use_sage_attention):
+                    v_scales, v_means = load_sage_v_channels(
+                        self.cfg.sage_scale_layout,
+                        sage_v_address,
+                        offset=i * tmem_x,
+                        count=tmem_x,
                     )
-            elif cutlass.const_expr(self.cfg.vc_attention):
-                o_rmem = o_rmem * scale_vec
-                # The tile means were stored divided by the per-channel V scale,
-                # so the whole accumulator is rescaled by it here.
-                col0 = head_dim_stage_idx * o_head_dim + i * tmem_x
-                chan_scale = cutlass.inttoptr(
-                    vc_scale_row + Int64(col0) * Int64(4), mem_space=1, dtype=Float32
-                ).load(count=tmem_x, alignment=64)
-                o_rmem = o_rmem * chan_scale
-            else:
-                o_rmem = o_rmem * scale_vec
+                    o_rmem = o_rmem * (scale_vec * v_scales)
+                    if cutlass.const_expr(v_means is not None):
+                        o_rmem = o_rmem + v_means * cutlass.vector.full_like(
+                            o_rmem, output_scale
+                        )
+                elif cutlass.const_expr(self.cfg.vc_attention):
+                    o_rmem = o_rmem * scale_vec
+                    # The tile means were stored divided by the per-channel V
+                    # scale, so the whole accumulator is rescaled by it here.
+                    col0 = head_dim_stage_idx * o_head_dim + i * tmem_x
+                    chan_scale = cutlass.inttoptr(
+                        vc_scale_row + Int64(col0) * Int64(4),
+                        mem_space=1,
+                        dtype=Float32,
+                    ).load(count=tmem_x, alignment=64)
+                    o_rmem = o_rmem * chan_scale
+                else:
+                    o_rmem = o_rmem * scale_vec
+                o_parts.append(o_rmem)
 
-            o_rmem_dtype = o_rmem.to(self.cfg.o_dtype)
+            if cutlass.const_expr(quant is not None):
+                # Quantize the finished values: one scale per block.
+                amax = block_amax(o_parts[0], 0, tmem_x)
+                for part in o_parts[1:]:
+                    amax = cute.math.max(amax, block_amax(part, 0, tmem_x))
+                scale_bits, inverse = block_scale(amax, quant)
+                if sf_valid:
+                    store_sf(
+                        self.o_sf,
+                        sf_offset(
+                            sf_token,
+                            sf_col_base + Int32(group_idx),
+                            Int32(self.o_sf_col_blocks),
+                        ),
+                        scale_bits,
+                    )
+                o_parts = [
+                    part * cutlass.vector.full_like(part, inverse) for part in o_parts
+                ]
 
-            col_offset = (i * tmem_x) % d_block_size
-            block_idx = (i * tmem_x) // d_block_size
-            block_offset = block_idx * self.cfg.tma_copy_o_granu_elems
-            smem_offset = block_offset + row_offset + col_offset
-            smem_ptr = (sO_base.subview(smem_offset)).data_ptr()
+            for part_idx in cutlass.range_constexpr(loads_per_group):
+                i = group_idx * loads_per_group + part_idx
+                o_rmem_dtype = o_parts[part_idx].to(self.cfg.o_dtype)
 
-            if cutlass.const_expr(self.cfg.o_dtype.width == 8):
-                o_rmem_i8 = o_rmem_dtype.bitcast(cutlass.Int8)
-                smem_ptr.store_swizzled(o_rmem_i8, alignment=64, swizzle=smem_o_swizzle)
-            else:
-                smem_ptr.store_swizzled(
-                    o_rmem_dtype, alignment=64, swizzle=smem_o_swizzle
-                )
+                col_offset = (i * tmem_x) % d_block_size
+                block_idx = (i * tmem_x) // d_block_size
+                block_offset = block_idx * self.cfg.tma_copy_o_granu_elems
+                smem_offset = block_offset + row_offset + col_offset
+                smem_ptr = (sO_base.subview(smem_offset)).data_ptr()
+
+                if cutlass.const_expr(self.cfg.o_dtype.width == 8):
+                    o_rmem_i8 = o_rmem_dtype.bitcast(cutlass.Int8)
+                    smem_ptr.store_swizzled(
+                        o_rmem_i8, alignment=64, swizzle=smem_o_swizzle
+                    )
+                else:
+                    smem_ptr.store_swizzled(
+                        o_rmem_dtype, alignment=64, swizzle=smem_o_swizzle
+                    )
 
         prims.fence_proxy(
             kind=prims.Proxy.ASYNC_SHARED,

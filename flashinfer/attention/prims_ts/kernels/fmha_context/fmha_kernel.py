@@ -152,6 +152,7 @@ import cutlass.utils as utils
 from cuda.bindings import driver as cuda_drv
 from cutlass import Float32, Int32
 from ..tensor_map import create_tensor_map_ragged_from_tensor
+from ..quant_output import quant_output_format
 
 from cutlass.experimental.task_scheduling.memory import (
     SmemAllocation,
@@ -759,6 +760,9 @@ def build_context_task_manager(
     output_scale: Float32 | cute.Tensor | None = None,
     lse_output: cute.Tensor | None = None,
     attention_sinks: cute.Tensor | None = None,
+    o_sf: cute.Tensor | None = None,
+    o_sf_col_blocks: int | Int32 = 0,
+    num_qo_heads: int | Int32 = 0,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
@@ -1370,6 +1374,9 @@ def build_context_task_manager(
         tmem_vec_resource=tmem_vec0,
         sage_scales=sage_scales,
         num_kv_heads=num_kv_heads,
+        o_sf=o_sf,
+        o_sf_col_blocks=o_sf_col_blocks,
+        num_qo_heads=num_qo_heads,
         name="smem_o_0",
     )
     gmem_o_0 = GmemOResource(
@@ -1470,6 +1477,9 @@ def build_context_task_manager(
             tmem_vec_resource=tmem_vec1,
             sage_scales=sage_scales,
             num_kv_heads=num_kv_heads,
+            o_sf=o_sf,
+            o_sf_col_blocks=o_sf_col_blocks,
+            num_qo_heads=num_qo_heads,
             name="smem_o_1",
         )
         gmem_o_1 = GmemOResource(
@@ -2932,6 +2942,9 @@ def build_fmha_task_manager(
     output_scale: Float32 | cute.Tensor | None = None,
     lse_output: cute.Tensor | None = None,
     attention_sinks: cute.Tensor | None = None,
+    o_sf: cute.Tensor | None = None,
+    o_sf_col_blocks: int | Int32 = 0,
+    num_qo_heads: int | Int32 = 0,
     q_offset: int | Int32 = 0,
     g_block_tables: cute.Pointer | None = None,
     block_table_row_stride: int | Int32 = 0,
@@ -3041,6 +3054,9 @@ def build_fmha_task_manager(
         num_kv_heads=num_kv_heads,
         lse_output=lse_output,
         attention_sinks=attention_sinks,
+        o_sf=o_sf,
+        o_sf_col_blocks=o_sf_col_blocks,
+        num_qo_heads=num_qo_heads,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
@@ -3085,6 +3101,10 @@ class FmhaTs:
         Input tensor dtype for V (default: Float16).
     out_dtype : type, optional
         Output tensor dtype for O (default: Float16).
+    out_sf_dtype : type, optional
+        Block-scale dtype of a quantized output (``kernels/quant_output.py``;
+        Float8E8M0FNU with Float8E4M3FN O is MXFP8), written to the ``o_sf``
+        launch operand. None (default) stores a plain O.
     mma_tiler_mn : Tuple[int, int], optional
         MMA tile shape (M, N) (default: (128, 128)).
     d : int, optional
@@ -3170,6 +3190,7 @@ class FmhaTs:
         vc_attention: str | None = None,
         use_blackwell_tma_oob_workaround: bool = False,
         sage_scale_layout: _SageScaleLayout | None = None,
+        out_sf_dtype: type | None = None,
     ) -> None:
         """Initialize mode-specific tiling, dtype, and schedule configuration."""
         head_paired = resolve_head_paired_mode(
@@ -3223,6 +3244,8 @@ class FmhaTs:
         v_dtype = in_pv_dtype or cutlass.Float16
 
         o_dtype = out_dtype or cutlass.Float16
+        # Reject unsupported (data, scale) pairs before choosing tiles.
+        quant_output_format(o_dtype, out_sf_dtype)
 
         # Validate the logical Q/K and V head dimensions before choosing tiles.
         d_v = d if d_v is None else d_v
@@ -3237,6 +3260,7 @@ class FmhaTs:
         padded_d = 1 << (max(d, 64) - 1).bit_length()
         cfg = FmhaConfig()
         cfg.logical_head_dim_qk = d
+        cfg.out_sf_dtype = out_sf_dtype
         if two_cta_umma and (
             is_persistent
             or is_causal
@@ -3480,8 +3504,13 @@ class FmhaTs:
         sage_scales: cute.Tensor | None = None,
         lse_output: cute.Tensor | None = None,
         attention_sinks: cute.Tensor | None = None,
+        o_sf: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
+
+        ``o_sf`` is the flat uint8 block-scale buffer of a quantized-output
+        kernel, laid out as ``kernels/quant_output.py`` describes over the
+        ``[tokens, Hq * Dv]`` view of ``o_cute``; other kernels reject it.
 
         VC-Attention adds the tile means, the bf16 UMMA operands packed by the
         host with sixteen tiles per group, and the repair tile count, a
@@ -3745,6 +3774,8 @@ class FmhaTs:
             raise ValueError(
                 "q_scales and k_scales are required only by an MXFP8 Q/K kernel"
             )
+        if cutlass.const_expr((cfg.quant_output is not None) != (o_sf is not None)):
+            raise ValueError("o_sf is required only by a quantized-output kernel")
 
         # Compute tile scheduler and grid
         if cutlass.const_expr(cum_seqlen_q is None):
@@ -3769,6 +3800,12 @@ class FmhaTs:
         num_seq_tiles = cute.ceil_div(s_q, cfg.cta_tiler[0])
         num_kv_tiles = cute.ceil_div(s_k, cfg.kv_tile_n)
         num_head_tiles = h_q // cfg.work_tile_q_heads
+        # Output scale columns of one token row, in 4-column swizzle blocks.
+        o_sf_col_blocks = 0
+        if cutlass.const_expr(cfg.quant_output is not None):
+            o_sf_col_blocks = cute.ceil_div(
+                h_q * (cfg.epi_tile[1] // cfg.quant_output.sf_vec_size), 4
+            )
         q_offset = Int32(0) if cutlass.const_expr(cfg.head_paired) else 0
         if cutlass.const_expr(self.is_causal):
             q_offset = s_k - s_q
@@ -3875,6 +3912,9 @@ class FmhaTs:
                 self.is_clc_dynamic,
                 lse_output,
                 attention_sinks,
+                o_sf,
+                Int32(o_sf_col_blocks),
+                Int32(h_q),
                 dense_tail_capacity=capacity,
             ).launch(
                 grid=grid,
@@ -3935,6 +3975,9 @@ class FmhaTs:
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
         lse_output: cute.Tensor | None = None,
         attention_sinks: cute.Tensor | None = None,
+        o_sf: cute.Tensor | None = None,
+        o_sf_col_blocks: Int32 = 0,
+        num_qo_heads: Int32 = 0,
         dense_tail_capacity: cutlass.Constexpr[int] = 0,
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
@@ -4022,6 +4065,9 @@ class FmhaTs:
             num_kv_heads=num_kv_heads,
             lse_output=lse_output,
             attention_sinks=attention_sinks,
+            o_sf=o_sf,
+            o_sf_col_blocks=o_sf_col_blocks,
+            num_qo_heads=num_qo_heads,
             q_offset=q_offset,
             tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,
             vc_q_scale=vc_q_scale if cfg.vc_qk8 else None,

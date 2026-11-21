@@ -62,7 +62,7 @@ Validation can read metadata values on the host. Trusted/captured execution uses
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv` |
 | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_dtype`; defaults to `k_dtype`) |
-| Output dtype | `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
+| Output dtype | `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn`; with `out_scale_dtype`, quantized outputs such as MXFP8 (`torch.float8_e4m3fn` O with `torch.float8_e8m0fnu` or `torch.uint8` swizzled UE8M0 scales; see [Quantized output](../../README.md#quantized-output)) except with MXFP8 Q/K, Sage or VC |
 | Contiguous storage | Fixed BSHD or packed THD with uniform or ragged request lengths |
 | Paged storage | Packed Q plus separate HND or NHD K/V page pools, addressed without repacking |
 | Page size | 4, 8, 16, 32, 64, or 128 tokens |
