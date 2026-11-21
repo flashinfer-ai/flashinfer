@@ -70,6 +70,7 @@ def gemm_kernel_persistent(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    READ_C: tl.constexpr,  # beta != 0; constexpr so the epilogue has no runtime branch
 ):
     """Multiply strided matrices with persistent CTAs and an FP32 alpha/beta epilogue."""
     start_pid = tl.program_id(axis=0)
@@ -125,7 +126,11 @@ def gemm_kernel_persistent(
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         # Keep the epilogue in FP32 to avoid overflow/underflow before scaling.
-        c = tl.fma(accumulator, alpha, beta * tl.load(c_ptrs, mask=c_mask))
+        # C is write-only when beta == 0, so it must not be read there.
+        if READ_C:
+            c = tl.fma(accumulator, alpha, beta * tl.load(c_ptrs, mask=c_mask))
+        else:
+            c = accumulator * alpha
         tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -145,6 +150,7 @@ def gemm_kernel_descriptor_persistent(
     GROUP_SIZE_M: tl.constexpr,  #
     EPILOGUE_SUBTILE: tl.constexpr,  #
     NUM_SMS: tl.constexpr,
+    READ_C: tl.constexpr,  # beta != 0; constexpr so the epilogue has no runtime branch
 ):  #
     dtype = c_ptr.dtype.element_ty
     start_pid = tl.program_id(axis=0)
@@ -205,18 +211,29 @@ def gemm_kernel_descriptor_persistent(
             acc = tl.reshape(accumulator, (BLOCK_SIZE_M, 2, BLOCK_SIZE_N // 2))
             acc = tl.permute(acc, (0, 2, 1))
             acc0, acc1 = tl.split(acc)
-            acc0 = tl.fma(acc0, alpha, beta * c_desc.load([offs_cm, offs_cn]))
-            acc1 = tl.fma(
-                acc1, alpha, beta * c_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2])
-            )
+            # C is write-only when beta == 0, so it must not be read there.
+            if READ_C:
+                acc0 = tl.fma(acc0, alpha, beta * c_desc.load([offs_cm, offs_cn]))
+                acc1 = tl.fma(
+                    acc1,
+                    alpha,
+                    beta * c_desc.load([offs_cm, offs_cn + BLOCK_SIZE_N // 2]),
+                )
+            else:
+                acc0 = acc0 * alpha
+                acc1 = acc1 * alpha
             c0 = acc0.to(dtype)
             c_desc.store([offs_cm, offs_cn], c0)
             c1 = acc1.to(dtype)
             c_desc.store([offs_cm, offs_cn + BLOCK_SIZE_N // 2], c1)
         else:
-            accumulator = tl.fma(
-                accumulator, alpha, beta * c_desc.load([offs_cm, offs_cn])
-            )
+            # C is write-only when beta == 0, so it must not be read there.
+            if READ_C:
+                accumulator = tl.fma(
+                    accumulator, alpha, beta * c_desc.load([offs_cm, offs_cn])
+                )
+            else:
+                accumulator = accumulator * alpha
             c = accumulator.to(dtype)
             c_desc.store([offs_cm, offs_cn], c)
 
@@ -246,6 +263,7 @@ def gemm_kernel(
     BLOCK_SIZE_N: tl.constexpr,  #
     BLOCK_SIZE_K: tl.constexpr,  #
     GROUP_SIZE_M: tl.constexpr,  #
+    READ_C: tl.constexpr,  # beta != 0; constexpr so the epilogue has no runtime branch
 ):
     """Multiply strided matrices with one program per tile and an FP32 epilogue."""
     pid = tl.program_id(axis=0)
@@ -286,5 +304,9 @@ def gemm_kernel(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     # Keep the epilogue in FP32 to avoid overflow/underflow before scaling.
-    c = tl.fma(accumulator, alpha, beta * tl.load(c_ptrs, mask=c_mask))
+    # C is write-only when beta == 0, so it must not be read there.
+    if READ_C:
+        c = tl.fma(accumulator, alpha, beta * tl.load(c_ptrs, mask=c_mask))
+    else:
+        c = accumulator * alpha
     tl.store(c_ptrs, c, mask=c_mask)
