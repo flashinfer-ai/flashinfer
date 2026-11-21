@@ -138,6 +138,9 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   CHECK_INPUT_TYPE(paged_kv_indices, dl_int32);
   CHECK_INPUT_TYPE(paged_kv_last_page_len, dl_int32);
 
+  // Both the decode kernel and the split-KV merge use dense output addressing.
+  check_contiguous(o, "out");
+
   DecodePlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
@@ -161,6 +164,7 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
 
   if (maybe_lse.has_value()) {
     const auto& lse = maybe_lse.value();
+    check_contiguous(lse, "lse");
     TVM_FFI_ICHECK_EQ(lse.size(0), batch_size);
     TVM_FFI_ICHECK_EQ(lse.size(1), num_qo_heads);
   }
