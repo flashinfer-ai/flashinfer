@@ -2863,7 +2863,7 @@ def test_source_public_api_signatures_are_stable():
         False,
         False,
         torch.int64,
-        "cute",
+        "auto",
     )
     assert _signature_contract(module.SSDCombined) == tuple(
         zip(
@@ -3068,6 +3068,9 @@ def test_source_public_constructor_forwards_complete_cake_contract(monkeypatch):
             calls.append((args, kwargs))
 
     monkeypatch.setattr(utils, "get_compute_capability", lambda *_: (10, 3))
+    # The constructor resolves the current CUDA ordinal before the mocked
+    # capability lookup; stub it so this test stays GPU-free.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(cake_module, "CakeSSDCombined", CakeRunner)
     runner = module.SSDCombined(
         128,
@@ -3104,7 +3107,10 @@ def test_source_public_constructor_forwards_complete_cake_contract(monkeypatch):
     assert runner._backend == "cake"
     assert runner._cake_runner.__class__ is CakeRunner
 
-    with pytest.raises(ValueError, match="backend must be 'cute' or 'cake'"):
+    with pytest.raises(
+        ValueError,
+        match=r"backend must be one of \('auto', 'specialized', 'cute', 'cake'\)",
+    ):
         module.SSDCombined(128, 8, 64, 128, 8, backend="unknown")
 
 
@@ -3112,6 +3118,7 @@ def test_source_public_constructor_hardware_error_parity_without_gpu(monkeypatch
     module = importlib.import_module("flashinfer.mamba.ssd_combined")
     utils = importlib.import_module("flashinfer.utils")
     monkeypatch.setattr(utils, "get_compute_capability", lambda *_: (12, 0))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     errors = {}
 
     for backend in ("cute", "cake"):
@@ -3163,6 +3170,7 @@ def test_source_public_backend_constructor_validation_without_gpu(
     module = importlib.import_module("flashinfer.mamba.ssd_combined")
     utils = importlib.import_module("flashinfer.utils")
     monkeypatch.setattr(utils, "get_compute_capability", lambda *_: (10, 3))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     constructor = {
         "chunk_size": 128,
         "nheads": 2,

@@ -1,0 +1,25 @@
+{
+  "op": "mamba2_ssd_combined_prefill",
+  "backend": "specialized",
+  "min_compute_capability": [12, 0],
+  "max_compute_capability": [12, 0],
+  "geometry": {
+    "chunk_size": 128,
+    "headdim": 64,
+    "dstate": 128,
+    "ngroups": 8,
+    "nheads_allowlist": [64, 128]
+  },
+  "call_form": {
+    "num_seqs": 1,
+    "initial_states": null,
+    "z": null,
+    "dt_softplus": true,
+    "dt_limit": [0.0, "inf"],
+    "d_has_hdim": false,
+    "return_final_states": false,
+    "io_dtype": "bfloat16"
+  },
+  "measured_seqlen_range": [120, 16384],
+  "notes": "Dispatch surface for the agent-generated SM120 SSD chunk-scan prefill kernel. Geometry and call-form relations are the kernel's own guard relations; seqlen is a runtime value (varlen by construction, any T >= 1), not an exact-shape list."
+}
