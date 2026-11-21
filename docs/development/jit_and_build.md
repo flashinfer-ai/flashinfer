@@ -72,6 +72,15 @@ invalidate the module, which rebuilds lazily. See
 ### Source-key coverage
 
 By default, SHA256 covers the caller's `extra_key_files`, often just `__file__`.
+Files inside `flashinfer` use package-relative identities, including strict-mode
+package initializers, so moving an otherwise identical installation does not
+change the source key. External key files retain their caller-supplied path
+identity. Content changes still invalidate the covered sources. This key-format
+change causes a one-time cache miss for existing in-package source keys; it does
+not migrate artifacts. Matching source keys alone do not guarantee cache reuse:
+the dependency, Python ABI, architecture, and compilation-option keys must also
+match.
+
 `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1` extends coverage to the in-package
 source dependencies. Analysis/hashing lives in `flashinfer/jit/_cute_dsl_source.py`;
 `cute_dsl_core.py` manages compilation and artifacts. Strict analysis follows:
