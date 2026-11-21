@@ -17,30 +17,47 @@ import flashinfer.comm as comm
 from flashinfer.comm.mnnvl import TorchDistBackend
 
 
-def _check_ws2_specialized_call(workspace, group, tp_rank: int) -> None:
+_WS2_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+
+
+def _ws2_group_is_target(group) -> bool:
+    """Whether every rank of ``group`` has compute capability 10.3: the sub-group-wide
+    condition the creation vote decides on (one rank's GPU alone does not decide it)."""
+    from flashinfer.utils import get_compute_capability
+
+    flags = [None] * dist.get_world_size(group)
+    local = get_compute_capability(torch.device("cuda")) == (10, 3)
+    dist.all_gather_object(flags, local, group=group)
+    return all(flags)
+
+
+def _check_ws2_specialized_call(workspace, group, expect_specialized: bool) -> None:
     """One kARResidualRMSNorm call in the range of the specialized two-rank kernel on an
-    ``auto`` workspace of a TP sub-group: on compute capability 10.3 auto picks the
-    specialized backend (the state was agreed over the sub-group) and the kernel
-    dispatches; elsewhere auto builds the stock backend; the result is correct either
-    way."""
+    ``auto`` workspace of a TP sub-group. The route is the sub-group's collective decision:
+    the specialized backend (its state agreed over the sub-group) with one launch per rank
+    when ``expect_specialized``, else the stock workspace with no specialized launch; every
+    rank of the sub-group takes the same route, and the result is correct either way."""
     from flashinfer.comm._allreduce_fusion_ws2_specialized import (
         _allreduce_fusion_ws2_specialized_stats as stats,
     )
-    from flashinfer.utils import get_compute_capability
 
-    target = get_compute_capability(torch.device("cuda")) == (10, 3)
     is_specialized = isinstance(workspace, comm.SpecializedAllReduceFusionWorkspace)
-    assert is_specialized == target, stats()["last_state_rejection"]
-    assert getattr(workspace, "_ar_ws2", None) is not None or not target
+    assert is_specialized == expect_specialized, stats()["last_state_rejection"]
+    if expect_specialized:
+        assert workspace.has_specialized_kernels, stats()["last_state_rejection"]
+        assert workspace.fallback_backend in ("mnnvl", "trtllm")
     lo, hi = stats()["allowlist_num_tokens"][0]
     num_tokens, hidden_dim = min((lo + hi) // 2, 5461), 6144
-    own = torch.Generator(device="cuda").manual_seed(11 + tp_rank)
+    # x differs on every global rank (the two sub-groups get different values); residual and
+    # gamma are shared, as in tensor parallelism.
+    own = torch.Generator(device="cuda").manual_seed(11 + dist.get_rank())
     shared = torch.Generator(device="cuda").manual_seed(5)
     x = torch.randn(num_tokens, hidden_dim, generator=own, device="cuda").bfloat16()
     residual = torch.randn(
         num_tokens, hidden_dim, generator=shared, device="cuda"
     ).bfloat16()
     gamma = (0.1 * torch.randn(hidden_dim, generator=shared, device="cuda")).bfloat16()
+    # The reference reduces over this rank's sub-group only.
     x_all = [torch.empty_like(x) for _ in range(dist.get_world_size(group))]
     dist.all_gather(x_all, x, group=group)
     residual_out = torch.empty_like(x)
@@ -60,7 +77,13 @@ def _check_ws2_specialized_call(workspace, group, tp_rank: int) -> None:
         weight_bias=1.0,
     )
     torch.cuda.synchronize()
-    assert stats()["dispatch_count"] - before == int(target)
+    launches = stats()["dispatch_count"] - before
+    assert launches == int(expect_specialized)
+    routes = [None] * dist.get_world_size(group)
+    dist.all_gather_object(routes, (is_specialized, launches), group=group)
+    assert len(set(routes)) == 1, (
+        f"the sub-group's ranks took different routes: {routes}"
+    )
     s = torch.stack([t.float() for t in x_all]).sum(0).bfloat16()
     h = (s.float() + residual.float()).bfloat16()
     hf = h.float()
@@ -71,6 +94,32 @@ def _check_ws2_specialized_call(workspace, group, tp_rank: int) -> None:
     )
     torch.testing.assert_close(residual_out.float(), hf, atol=1e-2, rtol=1.6e-2)
     torch.testing.assert_close(norm_out.float(), norm, atol=1e-2, rtol=1.6e-2)
+
+
+def _check_ws2_specialized_veto(
+    group, comm_backend, tp_size: int, tp_rank: int
+) -> None:
+    """A veto by one rank of the sub-group (its kill switch set at creation): ``auto`` builds
+    the stock workspace on every rank of the sub-group, and no call launches the kernel."""
+    import os
+
+    if tp_rank == 1:
+        os.environ[_WS2_DISABLE_ENV] = "1"
+    try:
+        workspace = comm.create_allreduce_fusion_workspace(
+            backend="auto",
+            world_size=tp_size,
+            rank=tp_rank,
+            max_token_num=5461,
+            hidden_dim=6144,
+            dtype=torch.bfloat16,
+            comm_backend=comm_backend,
+            group=group,
+        )
+    finally:
+        os.environ.pop(_WS2_DISABLE_ENV, None)
+    _check_ws2_specialized_call(workspace, group, expect_specialized=False)
+    workspace.destroy()
 
 
 def _worker_subgroup(tp_size: int, hidden_dim: int, use_unified_api: bool):
@@ -104,9 +153,13 @@ def _worker_subgroup(tp_size: int, hidden_dim: int, use_unified_api: bool):
             hidden_dim=hidden_dim,
             dtype=torch.bfloat16,
             comm_backend=comm_backend,
+            group=my_tp_group,
         )
         if hidden_dim == 6144:
-            _check_ws2_specialized_call(workspace, my_tp_group, tp_rank)
+            _check_ws2_specialized_call(
+                workspace, my_tp_group, _ws2_group_is_target(my_tp_group)
+            )
+            _check_ws2_specialized_veto(my_tp_group, comm_backend, tp_size, tp_rank)
     else:
         comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
             tp_rank=tp_rank,

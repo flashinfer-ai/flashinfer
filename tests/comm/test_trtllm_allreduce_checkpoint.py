@@ -352,19 +352,33 @@ def _run_ws2_worker(rank: int, world_size: int, port: int, backend: str) -> None
         workspace.checkpoint_restore(fresh_backend)
         dist.barrier()
 
-        input_.fill_(rank + 2)
-        small_in.fill_(rank + 2)
-        residual_out.fill_(float("nan"))
-        norm_out.fill_(float("nan"))
-        small_out.fill_(float("nan"))
-        # Two replays: both receive slots after the restore.
-        graph.replay()
-        graph.replay()
-        torch.cuda.synchronize()
-        # (2 + 3) + 1 = 6; 6 * rsqrt(36) = 1
-        torch.testing.assert_close(residual_out, torch.full_like(residual_out, 6))
-        torch.testing.assert_close(norm_out, torch.ones_like(norm_out))
-        torch.testing.assert_close(small_out, torch.full_like(small_out, 5))
+        # Two replays, each checked on its own (fresh inputs, NaN-filled outputs): the two
+        # receive slots of the kernel's region after the restore, and the fallback's buffers.
+        for replay in range(2):
+            input_.fill_(rank + 2 + replay)
+            small_in.fill_(rank + 2 + replay)
+            residual_out.fill_(float("nan"))
+            norm_out.fill_(float("nan"))
+            small_out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            # (2 + 3 + 2 * replay) + 1 = 6 + 2 * replay; norm = 1 (gamma 0, weight_bias 1)
+            what = f"rank {rank} replay {replay}"
+            torch.testing.assert_close(
+                residual_out,
+                torch.full_like(residual_out, 6 + 2 * replay),
+                msg=lambda m: f"{what} residual_out: {m}",
+            )
+            torch.testing.assert_close(
+                norm_out,
+                torch.ones_like(norm_out),
+                msg=lambda m: f"{what} norm_out: {m}",
+            )
+            torch.testing.assert_close(
+                small_out,
+                torch.full_like(small_out, 5 + 2 * replay),
+                msg=lambda m: f"{what} small_out: {m}",
+            )
     finally:
         if workspace is not None:
             workspace.destroy()
@@ -372,11 +386,14 @@ def _run_ws2_worker(rank: int, world_size: int, port: int, backend: str) -> None
 
 
 def _is_compute_capability_10_3() -> bool:
-    if not torch.cuda.is_available():
+    """Both GPUs the two workers bind (cuda:0 and cuda:1) have compute capability 10.3."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         return False
     from flashinfer.utils import get_compute_capability
 
-    return get_compute_capability(torch.device("cuda:0")) == (10, 3)
+    return all(
+        get_compute_capability(torch.device(f"cuda:{i}")) == (10, 3) for i in (0, 1)
+    )
 
 
 @pytest.mark.skipif(
