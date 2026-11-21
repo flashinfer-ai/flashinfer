@@ -276,9 +276,17 @@ def get_sampling_module():
         offset: Optional[Union[int, torch.Tensor]] = None,
     ) -> torch.Tensor:
         device = logits.device
-        # TODO: support more data types in logits to avoid conversion
-        # to float32
-        logits = logits.float()
+        # The kernel reads float16 and bfloat16 logits as stored and widens them to
+        # float32 on load, which draws the same samples as a float32 copy. Other dtypes,
+        # and half-precision views that are not contiguous, are still copied to float32.
+        # So are views that do not start on an 8-byte boundary: the kernel loads up to
+        # four half-precision elements at once and that load must be aligned.
+        if (
+            logits.dtype not in (torch.float16, torch.bfloat16)
+            or not logits.is_contiguous()
+            or logits.data_ptr() % 8 != 0
+        ):
+            logits = logits.float()
         batch_size = indices.size(0) if indices is not None else logits.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
