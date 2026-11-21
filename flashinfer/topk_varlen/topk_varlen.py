@@ -1748,15 +1748,19 @@ def top_k_varlen(
         compress_ratio``), and a larger value counts as that default. The
         bound is consumed before the launch and fixed for a captured graph,
         so it must hold at every call and every replay. Pass it when the rows
-        are known to be shorter than the buffer: the batch's longest entry
-        (``seq_lens.max()``), or in decode the length bucket a CUDA graph is
-        captured for while ``logits`` is allocated at the serving capacity;
-        the tighter the bound, the more the backend can specialize. Only
-        ``gvr_2`` uses it; the other backends rank every row in full. In
-        decode, ``gvr_2`` ranks a request whose ``seq_lens`` entry exceeds
-        the bound over the first ``max_window_len // compress_ratio`` columns
-        only, as it ranks a row wider than the buffer over ``num_cols``. A
-        positive ``int``.
+        are known to be shorter than the buffer; the tighter the bound, the
+        more the backend can specialize. In windowed mode the batch's longest
+        entry (``seq_lens.max()``) serves. In decode, pass a constant per CUDA
+        graph, the length bucket the graph is captured for while ``logits`` is
+        allocated at the serving capacity: ``gvr_2`` plans (and, the first
+        time, compiles) a launch for each distinct bound, and an explicit
+        bound is not rounded up the way the envelope it derives without one
+        is, so a bound that follows the batch would plan a new launch as the
+        batch grows. Only ``gvr_2`` uses it; the other backends rank every row
+        in full. A request whose ``seq_lens`` entry exceeds the bound breaks
+        this contract: ``gvr_2`` still returns distinct indices of its rows'
+        own columns (or ``-1``) and never reads past the bound or the buffer,
+        but which indices is unspecified. A positive ``int``.
     absolute_indices : bool, optional
         Windowed (prefill) mode only: write each hit as its column of
         ``logits`` (``window-local index + row_starts[r]``) instead of the

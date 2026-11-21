@@ -1196,10 +1196,12 @@ def test_gvr2_decode_bound_edges(
     rows, width, bound, top_k, cr, next_n, family, page_size
 ):
     """Rows at, just below and beyond a decode bound in every family the
-    bound selects: requests within it rank in full, longer ones over their
-    first ``bound // cr`` columns (the documented truncation), never past the
-    buffer, unpaged and paged. Only gvr_2 uses the bound: radix_cutlass ranks
-    every request in full."""
+    bound selects: requests within it rank in full; longer ones break the
+    contract, which leaves their result unspecified, and this pins what gvr_2
+    returns for them today (bound >= compress ratio here): the top-k of their
+    first ``bound // cr`` columns, never read past the buffer, unpaged and
+    paged. Only gvr_2 uses the bound: radix_cutlass ranks every request in
+    full."""
     nb = bound // cr
     kv = [bound, bound - 1, bound + 1, 2 * bound, width * cr, bound - cr, 0, 1]
     kv += [(top_k + 1) * cr + next_n - 1, top_k * cr, (2 * top_k + 1) * cr + next_n]
