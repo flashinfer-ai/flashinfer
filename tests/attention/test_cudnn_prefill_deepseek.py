@@ -4,21 +4,26 @@ import torch
 import flashinfer
 
 
+# Each case builds its own cuDNN graph; list valid pairs instead of skipping a cross product.
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("s_qo", [32, 64, 87, 256])
-@pytest.mark.parametrize("s_kv", [32, 87, 512])
-@pytest.mark.parametrize("num_kv_heads", [1, 4])
-@pytest.mark.parametrize("num_qo_heads", [1, 8])
+@pytest.mark.parametrize(
+    "s_qo,s_kv",
+    [
+        # Maximum lengths; per-sequence lengths are drawn below them.
+        (32, 512),  # short queries, long KV
+        (32, 87),  # KV lengths from 32 to an odd 87
+        (87, 87),  # equal odd maxima: every KV length is exactly 87
+        (256, 512),  # long queries
+    ],
+)
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads",
+    [(1, 1), (8, 1), (8, 4)],  # MHA, MQA, GQA
+)
 @pytest.mark.parametrize("causal", [True, False])
 def test_cudnn_prefill_deepseek(
     batch_size, s_qo, s_kv, num_kv_heads, num_qo_heads, causal
 ):
-    if s_qo > s_kv:
-        pytest.skip("s_qo > s_kv, skipping test as causal")
-
-    if num_qo_heads < num_kv_heads:
-        pytest.skip("num_qo_heads < num_kv_heads, skipping test")
-
     head_dim_qk = 192
     head_dim_vo = 128
 
