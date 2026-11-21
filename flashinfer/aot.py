@@ -167,6 +167,7 @@ from .jit.mamba.cake_selective_state_update import (
     gen_cake_selective_state_update_modules,
 )
 from .jit.mhc import gen_mhc_module
+from .jit.mhc_pre_glm import gen_mhc_pre_glm_module
 from .jit.cake_minimax_h3_mxfp8_pre_attention import (
     aot_specs as gen_cake_minimax_h3_mxfp8_pre_attention_aot_modules,
 )
@@ -761,6 +762,12 @@ def gen_all_modules(
     # programs (other targets JIT it on first use).
     if has_sm100a_exact or has_sm103a_exact:
         jit_specs.append(gen_mla_kv_pack_fp8_module())
+    # Fused full-op GLM mHC PRE kernel (backend="specialized" of mhc_pre),
+    # SM103-exact: without this registration a jit-cache install cannot serve
+    # explicit "specialized" calls and "auto" loses the fast path when nvcc
+    # is unavailable.
+    if has_sm103a_exact:
+        jit_specs.append(gen_mhc_pre_glm_module())
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
     # QSA sparse paged attention: one build (SM80 instructions) over the 8.x and 9.x targets.
