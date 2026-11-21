@@ -196,6 +196,26 @@ def blk_reduce_bf16(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
+def blk_reduce_bf16_l2_hint(dst_gemm, src_smem, size, l2_policy, loc=None, ip=None):
+    """blk_reduce_bf16 with an L2 cache-eviction policy from createpolicy."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+            l2_policy.ir_value(),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.L2::cache_hint"
+        ".add.noftz.bf16 [$0], [$1], $2, $3;",
+        "l,l,r,l",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def blk_reduce_fp32(dst_gemm, src_smem, size, loc=None, ip=None):
     llvm.inline_asm(
         None,
