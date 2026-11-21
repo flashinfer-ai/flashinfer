@@ -7,7 +7,12 @@
 #include <flashinfer/fastdiv.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/mask.cuh>
+#ifdef _WIN32
+// Kept for the MSVC build only. On Linux the POD kernels are instantiated by the
+// pod_kernel_mask_*.cu units and pod.cu keeps its forward declaration, so this
+// include would instantiate all of them a second time inside pod.cu.
 #include <flashinfer/attention/pod.cuh>
+#endif
 #include <flashinfer/attention/variant_helper.cuh>
 #include <flashinfer/attention/default_prefill_params.cuh>
 
