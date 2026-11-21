@@ -42,7 +42,7 @@ from .weights import (
 
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
-    from ......kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledSymmBuffer,
     )
 
@@ -124,7 +124,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             )
 
             validate_nvfp4_batch_invariant(self._kernel_config, arch="sm_107")
-        from ......kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import require_sm107_dsl
 
         self._ensure_ep_bootstrap(bootstrap)
         self._resolved_config(fleet_params)
@@ -189,9 +189,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         )
 
     supports_live_token_tuning = True
-    _knob_cache_module = (
-        "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache"
-    )
+    _knob_cache_module = "flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.knob_cache"
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict:
         k = self._kernel_config
@@ -243,7 +241,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         return super().live_token_buckets(fleet_params)
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.sm107.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             Sm107BlockScaledSymmBuffer,
         )
 
@@ -254,7 +252,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
 
     def _knob_overrides(self, fleet_params: FleetParams) -> dict:
         """Resolve fixed overrides or the automatic workspace's initial heuristic."""
-        from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
         if k.batch_invariant:
@@ -292,7 +290,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
                 )
             return dict(k.knobs)
         if k.knobs == "auto":
-            from ......kernel_src.sm107.next_cutedsl_megamoe import default_knobs
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import default_knobs
 
             # Cache selection must be collective before it affects allocation.
             selected = default_knobs(
@@ -454,7 +452,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.sm107.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             sm107_block_scaled_mega_moe,
         )
 

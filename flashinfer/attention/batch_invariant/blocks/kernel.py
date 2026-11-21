@@ -103,6 +103,8 @@ class AttentionKernel:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        *,
+        causal: bool = True,
         soft_cap: bool = False,
     ):
         self.soft_cap = soft_cap
@@ -117,6 +119,7 @@ class AttentionKernel:
         )
         self.hw_rowmax = hw_rowmax
         self.cap = cap
+        self.causal = causal  # the mask mode (a class dimension; compile-time)
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
@@ -154,7 +157,8 @@ class AttentionKernel:
             self.ragged,
             self.hw_rowmax,
             self.cap,
-            self.soft_cap,
+            causal=self.causal,
+            soft_cap=self.soft_cap,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)

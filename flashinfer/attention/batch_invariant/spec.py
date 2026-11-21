@@ -1,12 +1,20 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>`` and its soft-capped variant.
+"""Canonical dataflow of paged-KV attention: the classes ``attn.bf16.d<D>`` (causal) and ``attn.bf16.d<D>.nc`` (non-causal), and
+the soft-capped variant of each.
 
-The logits soft cap is a class dimension: under the capped class every score leaf ``s`` is ``tanh(mul(s, ca))``
+The mask mode is a class dimension, not a per-call input: a causal row at position ``p`` sees the keys ``[lo, p + 1)`` (bottom-right
+aligned, ``lo`` from the optional sliding window), a non-causal row sees every key of its request, ``[0, kv_len)`` (no window). The
+tiles, the chunks, the online softmax and the merge are the same dataflow in both modes; only the visible set a token gets from the
+request metadata differs, so a token's term (and the fingerprint) differs between the two classes.
+
+The logits soft cap is a second, independent class dimension: under a capped class every score leaf ``s`` is ``tanh(mul(s, ca))``
 (``capped_score``; the capped logit ``cap * tanh(s * sm_scale / cap)`` in natural units) and the rest of the dataflow -- the row
 maximum, the rescale, the exponentials, the merge -- is unchanged, read with ``c = fp32(cap * log2(e))``. The cap's value enters
-through the runtime scalars ``ca`` and ``c`` only (symbolic leaves, as ``sm_scale`` is), so one capped class per head dim covers
-every cap. Without a cap the terms and the fingerprints are the uncapped class's.
+through the runtime scalars ``ca`` and ``c`` only (symbolic leaves, as ``sm_scale`` is), so one capped class per head dim and mask
+mode covers every cap. The cap acts on the score leaves and the mask mode on which leaves a row has, so the two compose: the
+capped non-causal class is the non-causal visible set over capped leaves. Without a cap the terms and the fingerprints are the
+uncapped classes'.
 
 The class is stated for finite bf16 operands: a non-finite Q / K / V value, or scaled scores outside the binary32 range, give
 the NaN that fp32 softmax arithmetic gives (bit for bit, like every other value) and are not guarded against.
@@ -144,19 +152,39 @@ def soft_cap_scales(sm_scale: float, logits_soft_cap: float) -> tuple:
 
 @dataclass(frozen=True)
 class RowSpec:
-    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys ``[lo, L)`` with
-    ``L = p + 1`` (causal) and ``lo = max(0, p - window_left)``; ``row`` names the row (query token and head) in the leaf terms."""
+    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys ``[lo, L)``. Causal
+    (the default): ``L = p + 1`` and ``lo = max(0, p - window_left)``. Non-causal (``causal=False``): ``L = kv_len`` (every key of
+    the request) and ``lo = 0``; the position only names the row and a window is not a parameter of that class. ``row`` names the row
+    (query token and head) in the leaf terms."""
 
     p: int
     window_left: int = -1
     row: int = 0  # the row's identity in the leaf terms (query token / head index)
+    causal: bool = True
+    kv_len: Optional[int] = (
+        None  # the request's key count (non-causal: the visible range is [0, kv_len))
+    )
+
+    def __post_init__(self) -> None:
+        if not self.causal:
+            assert self.kv_len is not None and self.kv_len >= 1, (
+                "a non-causal row needs the request's kv_len (at least one key)"
+            )
+            assert self.window_left < 0, (
+                "window_left is not a parameter of the non-causal class"
+            )
 
     @property
     def L(self) -> int:
+        if not self.causal:
+            assert self.kv_len is not None
+            return self.kv_len
         return self.p + 1
 
     @property
     def lo(self) -> int:
+        if not self.causal:
+            return 0
         return 0 if self.window_left < 0 else max(0, self.p - self.window_left)
 
     def visible(self, k: int) -> bool:
@@ -487,21 +515,33 @@ FINGERPRINTS_SOFT_CAP = {
 
 
 def spec_fingerprint(
-    D: int = 128, window_left: int = -1, soft_cap: bool = False
+    D: int = 128, window_left: int = -1, causal: bool = True, *, soft_cap: bool = False
 ) -> str:
-    """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose prefix
-    spans one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
-    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``. The window is a per-call
-    input of the class (like the KV position), not a class dimension: the public receipt (``flashinfer.batch_invariant.fingerprint``)
-    is the digest of the no-window sample row; ``window_left`` here only selects another sample row. The soft cap IS a class
-    dimension: under ``soft_cap`` every score leaf of the sample row is ``capped_score`` (name ``attn-bf16-d<D>-sc-*``); the cap's
-    value, like ``sm_scale``, is a runtime input of that class and does not enter the digest."""
-    key = (D, window_left, bool(soft_cap))
+    """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose visible keys
+    span one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
+    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C`` and the mask mode. The window is a
+    per-call input of the causal class (like the KV position), not a class dimension: the public receipt
+    (``flashinfer.batch_invariant.fingerprint``) is the digest of the no-window sample row; ``window_left`` here only selects
+    another sample row. The mask mode IS a class dimension: the non-causal class (``causal=False``, name ``attn-bf16-d<D>-nc-*``)
+    gives a token the visible set ``[0, kv_len)`` of its request where the causal class gives ``[0, p + 1)``, so the same token
+    has a different term under the two classes; the sample row's term is the same dataflow over the same visible keys in both
+    modes, and the mode enters the digest explicitly. The soft cap IS a class dimension too: under ``soft_cap`` every score leaf
+    of the sample row is ``capped_score`` (name ``attn-bf16-d<D>-sc-*``, and ``attn-bf16-d<D>-nc-sc-*`` for the capped non-causal
+    class: mask mode first, then the score); the cap's value, like ``sm_scale``, is a runtime input of that class and does not
+    enter the digest."""
+    if not causal and window_left >= 0:
+        raise ValueError("window_left is not a parameter of the non-causal class")
+    key = (D, window_left, bool(causal), bool(soft_cap))
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
         spec = AttentionSpec(D, soft_cap=soft_cap)
-        row = RowSpec(p=spec.C + spec.T // 2, window_left=window_left)
+        L = spec.C + spec.T // 2 + 1
+        row = (
+            RowSpec(p=L - 1, window_left=window_left)
+            if causal
+            else RowSpec(p=0, causal=False, kv_len=L)
+        )
         parts = [
             f"D={D}",
             f"T={spec.T}",
@@ -512,8 +552,11 @@ def spec_fingerprint(
         ]
         if soft_cap:
             parts.insert(3, "score=softcap")
+        if not causal:
+            parts.insert(3, "mask=noncausal")
         _FINGERPRINTS[key] = (
             f"attn-bf16-d{D}-"
+            + ("" if causal else "nc-")
             + ("sc-" if soft_cap else "")
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )

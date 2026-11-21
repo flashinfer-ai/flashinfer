@@ -570,12 +570,10 @@ def test_cudnn_paged_rejects_noncontiguous_buffers_before_dispatch(monkeypatch, 
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_paged_explicit_lengths_cudnn924_retained_capture(dtype, backend, return_lse):
     """Physical token origins and explicit masks work on 9.24 without mixed forms."""
-    from packaging.version import Version
 
     cudnn = cudnn_prefill.cudnn
     if (
         cudnn.backend_version() < 92400
-        or Version(cudnn.__version__) < Version("1.32.0")
         or torch.cuda.get_device_capability() != (10, 0)
         or not cudnn_prefill.cudnn_frontend_frost_runtime_available()
     ):

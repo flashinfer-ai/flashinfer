@@ -7,14 +7,18 @@ and the routed call then runs only the expert body; it must match the ordinary r
 import pytest
 import torch
 
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import (
     QuantConfig,
     QuantFormat,
     TrtllmFp4Config,
     populate_trtllm_moe_routing_metadata_,
+    trtllm_fp4_block_scale_moe_routing_tile_n,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_moe_allocate_routing_metadata_multi_tile,
 )
+from flashinfer.fused_moe.backends.trtllm.sm100_runner import MoERunner
+from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
 from flashinfer.tllm_enums import RoutingInputMode, RoutingMethodType
 from flashinfer.utils import get_compute_capability
 
@@ -285,3 +289,188 @@ def test_routing_metadata_rejects_unsupported_options(experts, case):
             routing_metadata=metadata.slots[0],
             **overrides,
         )
+
+
+def _tile_n(view, hidden_states, scale, routing, do_finalize, **overrides):
+    """The tile for ``_call`` with the same arguments."""
+    return trtllm_fp4_block_scale_moe_routing_tile_n(
+        routing,
+        hidden_states,
+        scale,
+        view["gemm1_weights"],
+        view["gemm1_weights_scale"],
+        NUM_EXPERTS,
+        TOP_K,
+        INTERMEDIATE,
+        LOCAL,
+        do_finalize=do_finalize,
+        **overrides,
+    )
+
+
+def _record_tactics(monkeypatch):
+    """Tactics the FP4 op chooses, and the tactics its metadata body runs."""
+    chosen, bodies = [], []
+    choose_one, forward = AutoTuner.choose_one, MoERunner.forward
+
+    def record_choose_one(self, custom_op, *args, **kwargs):
+        runner, tactic = choose_one(self, custom_op, *args, **kwargs)
+        if custom_op == "flashinfer::trtllm_fp4_block_scale_moe":
+            chosen.append(tactic)
+        return runner, tactic
+
+    def record_forward(self, inputs, tactic=-1, *args, **kwargs):
+        if "da_routing_metadata" in kwargs:
+            bodies.append([int(t) for t in tactic])
+        return forward(self, inputs, tactic, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "choose_one", record_choose_one)
+    monkeypatch.setattr(MoERunner, "forward", record_forward)
+    return chosen, bodies
+
+
+def _run_with_tile_metadata(
+    view, hidden_states, scale, routing, do_finalize, tile_n, **kw
+):
+    metadata = _allocate(routing, tile_n)
+    _populate_on(torch.cuda.Stream(), metadata, routing)
+    return _call(
+        view,
+        hidden_states,
+        scale,
+        routing,
+        do_finalize,
+        routing_metadata=metadata.slots[0],
+        **kw,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 64, 960])
+@pytest.mark.parametrize("do_finalize", [False, True])
+def test_routing_tile_n_untuned(experts, monkeypatch, num_tokens, do_finalize):
+    """Untuned: the default tile, and its metadata matches the ordinary call bitwise."""
+    AutoTuner.get().clear_cache()
+    quant, view = experts
+    hidden_states, scale = _activations(quant, num_tokens, seed=num_tokens)
+    routing = _routing(num_tokens, seed=num_tokens, packed=True)
+    chosen, bodies = _record_tactics(monkeypatch)
+    want = _result(
+        num_tokens, _call(view, hidden_states, scale, routing, do_finalize), do_finalize
+    )
+    assert chosen == [-1]
+
+    tile_n = _tile_n(view, hidden_states, scale, routing, do_finalize)
+    assert tile_n in TILES
+    out = _run_with_tile_metadata(
+        view, hidden_states, scale, routing, do_finalize, tile_n
+    )
+    assert bodies[-1] == [tile_n, -1]
+    assert torch.equal(_result(num_tokens, out, do_finalize), want)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 64, 960])
+@pytest.mark.parametrize("do_finalize", [False, True])
+def test_routing_tile_n_tuned(experts, monkeypatch, num_tokens, do_finalize):
+    """Tuned: the tuned tile, the call runs the tuned config, bitwise equal to the ordinary call."""
+    AutoTuner.get().clear_cache()
+    quant, view = experts
+    hidden_states, scale = _activations(quant, num_tokens, seed=num_tokens)
+    routing = _routing(num_tokens, seed=num_tokens, packed=True)
+    tune = dict(tune_max_num_tokens=num_tokens)
+    default_tile_n = _tile_n(view, hidden_states, scale, routing, do_finalize, **tune)
+    with autotune(True):
+        # Lookup only: inside a tuning context the query returns the default tile.
+        assert (
+            _tile_n(view, hidden_states, scale, routing, do_finalize, **tune)
+            == default_tile_n
+        )
+        _call(view, hidden_states, scale, routing, do_finalize, **tune)
+    chosen, bodies = _record_tactics(monkeypatch)
+    want = _result(
+        num_tokens,
+        _call(view, hidden_states, scale, routing, do_finalize, **tune),
+        do_finalize,
+    )
+    (tuned,) = chosen
+    assert tuned != -1
+    tuned = [int(t) for t in tuned]
+
+    # Routing runs before activation quantization, so shape-only activations must do.
+    tile_n = _tile_n(
+        view,
+        hidden_states.to("meta"),
+        scale.to("meta"),
+        routing,
+        do_finalize,
+        **tune,
+    )
+    assert tile_n == tuned[0]
+    out = _run_with_tile_metadata(
+        view, hidden_states, scale, routing, do_finalize, tile_n, **tune
+    )
+    assert bodies[-1] == tuned
+    assert torch.equal(_result(num_tokens, out, do_finalize), want)
+
+
+def test_routing_tile_n_tuned_narrow_output(experts, monkeypatch):
+    """A narrow caller ``output`` keys the cache by its width; passing it finds the tuned tile."""
+    AutoTuner.get().clear_cache()
+    quant, view = experts
+    num_tokens = 64
+    hidden_states, scale = _activations(quant, num_tokens, seed=num_tokens)
+    routing = _routing(num_tokens, seed=num_tokens, packed=True)
+
+    def narrow():
+        return torch.empty(num_tokens, HIDDEN // 2, dtype=torch.bfloat16, device="cuda")
+
+    tune = dict(tune_max_num_tokens=num_tokens)
+    with autotune(True):
+        _call(view, hidden_states, scale, routing, True, output=narrow(), **tune)
+    chosen, bodies = _record_tactics(monkeypatch)
+    want = _call(view, hidden_states, scale, routing, True, output=narrow(), **tune)[0]
+    (tuned,) = chosen
+    assert tuned != -1
+    tuned = [int(t) for t in tuned]
+
+    tile_n = _tile_n(
+        view, hidden_states, scale, routing, True, output=narrow().to("meta"), **tune
+    )
+    assert tile_n == tuned[0]
+    out = _run_with_tile_metadata(
+        view, hidden_states, scale, routing, True, tile_n, output=narrow(), **tune
+    )
+    assert bodies[-1] == tuned
+    assert torch.equal(out[0], want)
+
+
+@pytest.mark.parametrize("runnable", [True, False], ids=["fallback_tile", "no_tile"])
+def test_routing_tile_n_follows_tile_fallback(experts, monkeypatch, runnable):
+    """The default tile cannot run: the query gives the launch's fallback tile, or None.
+
+    The native query walks the launch's tile order until a tile's default config is valid and
+    loads; a rejection cannot be forced on hardware where every cubin loads, so its answer is
+    stubbed with the next tile up (the launch's first fallback) or -1 (no tile can run).
+    """
+    AutoTuner.get().clear_cache()
+    quant, view = experts
+    num_tokens = 64
+    hidden_states, scale = _activations(quant, num_tokens, seed=num_tokens)
+    routing = _routing(num_tokens, seed=num_tokens, packed=True)
+    default_tile_n = _tile_n(view, hidden_states, scale, routing, True)
+    fallback = next(t for t in TILES if t > default_tile_n) if runnable else None
+    monkeypatch.setattr(
+        get_trtllm_moe_sm100_module().moe_op,
+        "trtllm_fp4_moe_default_tile_n",
+        lambda *args: -1 if fallback is None else fallback,
+    )
+    tile_n = _tile_n(view, hidden_states, scale, routing, True)
+    assert tile_n == fallback
+    if not runnable:
+        return
+    _, bodies = _record_tactics(monkeypatch)
+    want = _result(num_tokens, _call(view, hidden_states, scale, routing, True), True)
+    out = _run_with_tile_metadata(view, hidden_states, scale, routing, True, tile_n)
+    assert bodies[-1] == [tile_n, -1]
+    torch.testing.assert_close(
+        _result(num_tokens, out, True), want, rtol=1e-2, atol=1e-2
+    )

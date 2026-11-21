@@ -220,7 +220,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 f"{_NAME} launches on the current torch CUDA stream; BootstrapConfig.stream must be 0"
             )
-        from ......kernel_src.sm90.cake_bf16_megamoe import COMBINE_WIRES
+        from flashinfer.moe_ep.shims.sm90.cake_bf16 import COMBINE_WIRES
 
         if kcfg.combine_wire is not None and kcfg.combine_wire not in COMBINE_WIRES:
             raise MoEEpConfigError(
@@ -304,7 +304,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
 
     def _wcx_max_tokens(self) -> int:
         """Requested WCX decode-round bound (config, else the environment; 0 = off)."""
-        from ......kernel_src.sm90.cake_bf16_megamoe.shim.cake_runner import (
+        from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_runner import (
             validate_wcx_max_tokens,
             wcx_max_tokens_default,
         )
@@ -323,9 +323,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
         """True when the runner will resolve WCX on (wcx_max_tokens > 0, an
         effective fc2_early_max_tokens > 0, an early-start geometry and a GEMM
         with the WCX pair), so the layer needs the WCX copies."""
-        from ......kernel_src.sm90.cake_bf16_megamoe.shim.cake_runner import (
-            wcx_resolves_on,
-        )
+        from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_runner import wcx_resolves_on
 
         return wcx_resolves_on(
             wcx_max_tokens=self._wcx_max_tokens(),
@@ -394,8 +392,8 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
     def _allocate_workspace_with_init_timeout(
         self, fleet_params: FleetParams, comm: Any, transformed_weights: Any
     ) -> _Sm90CakeBf16Workspace:
-        from ......kernel_src.sm90.cake_bf16_megamoe import Sm90CakeBf16MoERunner
-        from ......kernel_src.sm90.push_style_megamoe import (
+        from flashinfer.moe_ep.shims.sm90.cake_bf16 import Sm90CakeBf16MoERunner
+        from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
             Sm90PushCombine,
             Sm90PushConfig,
             Sm90PushPayload,
