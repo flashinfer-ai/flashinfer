@@ -43,7 +43,9 @@ from .spec import (
     MASK_CAUSAL,
     MASK_KEY_RANGES,
     MASK_KEY_SET,
+    MASK_NON_CAUSAL,
     TILE_KEYS,
+    mask_mode_of_causal,
     scale_log2,
 )
 
@@ -593,13 +595,19 @@ class _Planned:
         self.page: Optional[int] = None
         # the plan's kv_indptr (int32 on the device): the page-table offsets the descriptor table holds; the kernels run with it
         self.kv_indptr: Optional[torch.Tensor] = None
-        # what a row sees (spec.MASK_MODES); under a mode whose keys are data the table continues with the requests' row-visibility blocks
+        # what a row sees (spec.MASK_MODES): the mode the table was built for, a class dimension (the kernels are compiled per
+        # mode); under a mode whose keys are data the table continues with the requests' row-visibility blocks
         self.mask_mode = MASK_CAUSAL
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
         self.n_fixup_groups = len(getattr(plan, "fixup_groups", plan.groups))
         self.fold_counters = fold_counters  # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
+
+    @property
+    def causal(self) -> bool:
+        """The callers' spelling of the mode: ``False`` exactly for a plan of the non-causal class."""
+        return self.mask_mode != MASK_NON_CAUSAL
 
 
 def plan_attention(
@@ -617,11 +625,13 @@ def plan_attention(
     sm_count: Optional[int] = None,
     ragged: bool = False,
     *,
+    causal: bool = True,
     key_sets: Optional[KeySets] = None,
     ranges: Optional[torch.Tensor] = None,
 ) -> _Planned:
     """What a row sees (the plan's ``mask_mode``) follows from the visibility data given: ``ranges`` selects the ``key_ranges``
-    mode (the ranged class), ``key_sets`` the ``key_set`` mode (the explicit-key-set class), neither the causal mode; the plan is
+    mode (the ranged class), ``key_sets`` the ``key_set`` mode (the explicit-key-set class), neither the causal mode or, with
+    ``causal=False``, the non-causal mode; the plan is
     built for that data (a snapshot: the kernels read the plan's copy, appended to the descriptor table as the requests'
     row-visibility blocks) and its batches take the row body.
     ``ranges``: an integer ``(total_q, 2)`` tensor with one key range ``(a, b)`` per packed query token (the keys ``[a, b)`` of
@@ -629,6 +639,9 @@ def plan_attention(
     ``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
     holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer.
+    ``causal`` (read without visibility data alone): ``False`` selects the ``non_causal`` mode, a class dimension (every token
+    sees its request's whole key range; no window). A plan with ``ranges`` or ``key_sets`` states its rows' keys itself and does
+    not read it.
     ``key_sets``: the explicit-key-set class (``pack_key_sets``) -- every row's visible keys as data; a row block walks the
     tiles between its rows' first and last visible key (``KeySets.tile_first`` / ``tile_last``) and ``window_left`` is not read
     (``pack_key_sets`` folds the window into the sets)."""
@@ -650,7 +663,7 @@ def plan_attention(
         )
     qo_list = qo_indptr.cpu().tolist()
     host_ranges = _host_ranges(ranges, qo_list[-1] if qo_list else 0)
-    mask_mode = MASK_CAUSAL
+    mask_mode = mask_mode_of_causal(bool(causal))
     vis: Optional[RowVisibility] = None
     if host_ranges is not None:
         mask_mode = MASK_KEY_RANGES
@@ -661,7 +674,11 @@ def plan_attention(
         key_sets.check(
             qo_indptr.cpu().tolist(), plan_kv_lens(kv_indptr, kv_last_page_len, page)
         )
-    # a batch whose keys are data takes the row body (the Swaps-AB kernel implements the causal mode alone)
+    if mask_mode == MASK_NON_CAUSAL and window_left >= 0:
+        raise ValueError(
+            "window_left is not a parameter of the non-causal class (the whole key range is visible)"
+        )
+    # a batch whose keys are data takes the row body (the Swaps-AB kernel implements the causal and the non-causal mode alone)
     small_swap = (
         config.small == "swap" and D in SWAPS_DIMS and not keys_are_data(mask_mode)
     )
@@ -903,6 +920,10 @@ def run_attention(
         raise ValueError(
             f"window_left {window_left} at run_attention over a plan built for window_left {planned.window_left}"
         )
+    if not planned.causal and int(window_left) >= 0:
+        raise ValueError(
+            "window_left is not a parameter of the non-causal class (the whole key range is visible)"
+        )
     if ragged:
         # Packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND.
         Hkv = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[0]
@@ -1033,7 +1054,7 @@ def _run_attention_validated(
         "plan_attention must be called with the same (FMHA) config"
     )
     # a mode whose keys are data: the row body alone implements it (small units take its replicated rows)
-    mask_mode = planned.mask_mode
+    mask_mode = planned.mask_mode  # a compile-time constant of every kernel
     n_pad = (
         swaps_n_pad(plan)
         if (config.small == "swap" and D in SWAPS_DIMS and not keys_are_data(mask_mode))
@@ -1049,7 +1070,7 @@ def _run_attention_validated(
         pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl
+            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl, mask_mode=mask_mode
         )
         kernel(
             q_view,
@@ -1167,8 +1188,11 @@ def attention_paged(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     workspace: Optional[torch.Tensor] = None,
+    *,
+    causal: bool = True,
 ) -> torch.Tensor:
-    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned)."""
+    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned, or with ``causal=False`` the
+    non-causal class: every token sees its request's whole key range)."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -1185,6 +1209,7 @@ def attention_paged(
         config,
         workspace,
         q.device,
+        causal=causal,
     )
     return run_attention(
         planned,

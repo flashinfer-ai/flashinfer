@@ -93,10 +93,11 @@ def mma_loop(
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
     tCtAcc_base: cute.Tensor,
-    chunks: cutlass.Constexpr = 1,
+    chunks=1,
+    cc: cutlass.Constexpr = False,
 ):
-    """``chunks``: 1 (one fold per tile), or the class's chunk count for the in-CTA chunk fold (``k_tile_cnt`` is then the
-    k-tiles of ONE chunk and the fold is issued per chunk, chunks ascending, each committed to the epilogue)."""
+    """``cc``: the in-CTA chunk fold (static); ``chunks`` is then the class's chunk count, a runtime value (``k_tile_cnt``
+    is the k-tiles of ONE chunk and the fold is issued per chunk, chunks ascending, each committed to the epilogue)."""
     assert cute.size(tCrA, mode=[2]) == lowering.inner, (
         "one smem stage must hold exactly the lowering's inner steps"
     )
@@ -105,7 +106,7 @@ def mma_loop(
     )
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
-        if cutlass.const_expr(chunks == 1):
+        if cutlass.const_expr(not cc):
             ab_consumer, acc_state = mma_fold(
                 lowering,
                 k_tile_cnt,

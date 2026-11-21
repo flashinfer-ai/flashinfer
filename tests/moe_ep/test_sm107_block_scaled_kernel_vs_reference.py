@@ -1,6 +1,6 @@
 """Single-GPU torch-oracle correctness for the SM107 (Rubin) block-scaled kernel.
 
-Drives the vendored ``next_cutedsl_megamoe`` drop's fused inference mega
+Drives the vendored Rubin fused inference mega
 kernel (``BlockScaledSwapAbMegaMoeKernel``) through the shim allocator +
 compute entry on ONE Rubin GPU (``MEGA_NO_DIST=1``, world_size 1: every
 "peer" resolves to the local buffer, no NVSHMEM), for NVFP4 and MXFP8
@@ -30,7 +30,7 @@ QUANT_KINDS = ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4", "mxfp4_mxfp8")
 
 def _sm107_tree():
     """Import failures on a supported host must fail qualification."""
-    import flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe as pkg
+    import flashinfer.moe_ep.shims.sm107.cutedsl_megamoe as pkg
 
     return pkg
 
@@ -197,7 +197,7 @@ def test_layer_situ_prequantized_weights_and_scaling(
                 assert_reference(layer.forward(t), reference, kind)
         assert layers[0]._workspace is layers[1]._workspace
         if (scaled or kind == "mxfp4_mxfp8") and situ and early and prequantized:
-            from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
                 autotune_sm107_block_scaled_mega_moe,
             )
 
@@ -328,7 +328,7 @@ def test_shim_config_validation():
     with pytest.raises(ValueError, match="epi_flag_batches"):
         cfg_cls(**{**kwargs, "epi_flag_batches": (8, 2)})
 
-    # Mixed-CGA (fallback cluster) rules, added with upstream a5b4d33.
+    # Mixed-CGA (fallback cluster) rules.
     mixed = cfg_cls(
         **{
             **kwargs,
@@ -560,7 +560,7 @@ def test_sm107_knob_cache_and_candidates(monkeypatch, tmp_path):
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize("quant_kind", QUANT_KINDS)
 def test_sm107_block_scaled_kernel_perf_winner_config(monkeypatch, quant_kind):
-    """Oracle check for the upstream perf-report winner knobs (a5b4d33):
+    """Oracle check for the mixed-CGA scheduler settings:
     mixed CGA (preferred 4x1, fallback 2x1), phase-interleave scheduling,
     atomic work IDs, FC2 bulk TMA with 2 stages, epi-warp token back."""
     # Set BEFORE the drop import (see the reference test above).

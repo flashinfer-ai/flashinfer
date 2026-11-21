@@ -1075,6 +1075,116 @@ mm_bf16_fp4_trace_dispatch.templates = [  # type: ignore[attr-defined]
 ]
 
 
+# ── Gathered-row BF16 x NVFP4 GEMV with scatter (SM12x) ──────────────────────
+
+
+def _gemv_bf16_fp4_gather_reference(
+    a,
+    b,
+    b_descale,
+    alpha,
+    row_ids,
+    out,
+    out_col_offset=0,
+    enable_pdl=True,
+    **_unused,
+):
+    """Dequantize the picked row-major NVFP4 rows, fp32 GEMV, scatter into out."""
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float32,
+        device=b.device,
+    )
+    sf = b_descale.view(torch.float8_e4m3fn).float()
+    for m in range(a.shape[0]):
+        keep = row_ids[m] >= 0
+        rows = row_ids[m][keep].long()
+        codes = b[rows].long()
+        w = torch.stack((lut[codes & 15], lut[codes >> 4]), dim=-1)
+        w = w.reshape(rows.numel(), -1) * sf[rows].repeat_interleave(16, dim=1)
+        if alpha is not None:
+            w = w * alpha.float()
+        out[m, out_col_offset + rows] = (w @ a[m].float()).to(out.dtype)
+    return out
+
+
+def _gemv_bf16_fp4_gather_init(
+    *,
+    M: int,
+    J: int = 4096,
+    K: int = 2560,
+    R: int = 32768,
+    N: int = 0,  # derived: R + out_col_offset
+    K_packed: int = 0,  # derived
+    K_sf: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Rows from fp4_quantize with linear scales; out zero-filled so untouched
+    columns compare equal."""
+    del N, K_packed, K_sf
+    from flashinfer import fp4_quantize  # noqa: PLC0415
+
+    if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+        raise NotImplementedError("gemv_bf16_fp4_gather init requires CUDA")
+    if torch.cuda.get_device_capability(torch.device(device))[0] != 12:
+        raise NotImplementedError("gemv_bf16_fp4_gather requires SM120/121")
+    torch.manual_seed(seed)
+    offset = 128
+    w = torch.randn(R, K, dtype=torch.bfloat16, device=device) * 0.02
+    g_w = 2688.0 / w.float().abs().max()
+    b, sf = fp4_quantize(w, g_w.reshape(1), is_sf_swizzled_layout=False)
+    row_ids = torch.randn(M, R, device=device).topk(J, sorted=False).indices
+    return dict(
+        a=torch.randn(M, K, dtype=torch.bfloat16, device=device),
+        b=b,
+        b_descale=sf.view(torch.float8_e4m3fn).reshape(R, K // 16),
+        alpha=g_w.reciprocal().reshape(1).float(),
+        row_ids=row_ids,
+        out=torch.zeros(M, R + offset, dtype=torch.bfloat16, device=device),
+        out_col_offset=offset,
+    )
+
+
+gemv_bf16_fp4_gather_trace = TraceTemplate(
+    op_type="gemm_bf16_fp4",
+    name_prefix="gemv_bf16_fp4_gather",
+    description=(
+        "Per-token GEMV over gathered row-major NVFP4 rows (linear E4M3 block "
+        "scales), each result written to out[m, out_col_offset + row_ids[m, j]]. "
+        "Negative ids are skipped; other columns of out are left untouched. "
+        "SM120/121. Mutates ``out`` in place."
+    ),
+    axes={
+        "M": Var(description="Tokens."),
+        "J": Var(description="Picked rows per token."),
+        "R": Const(abbrev="r"),
+        "K": Const(abbrev="k"),
+        "K_packed": Const(),
+        "K_sf": Const(),
+        "N": Const(abbrev="n"),
+    },
+    inputs={
+        "a": Tensor(["M", "K"]),
+        "b": Tensor(["R", "K_packed"]),
+        "b_descale": Tensor(["R", "K_sf"]),
+        "alpha": Tensor(["1"], optional=True),
+        "row_ids": Tensor(["M", "J"]),
+        "out": Tensor(["M", "N"], description="In-place output buffer."),
+        "out_col_offset": Scalar("int32", optional=True),
+        "enable_pdl": Scalar("int32", optional=True),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="out"),
+    },
+    constraints=["K == K_packed * 2", "K == K_sf * 16", "K % 32 == 0"],
+    tags=["status:verified", "quantization:fp4"],
+    reference=_gemv_bf16_fp4_gather_reference,
+    check=_fp4_gemm_check,
+    init=_gemv_bf16_fp4_gather_init,
+)
+
+
 # ── Batched matmuls (BMM) ────────────────────────────────────────────────────
 
 

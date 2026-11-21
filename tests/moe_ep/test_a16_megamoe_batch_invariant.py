@@ -524,12 +524,12 @@ def test_a16_batch_invariant_public_autotune_disk_reload(
 
     if kind == "w4a16":
         module = importlib.import_module(
-            "flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4.autotune"
+            "flashinfer.moe_ep.kernels.flashinfer.bf16_nvfp4.autotune"
         )
         name = "bf16_nvfp4_candidates"
     else:
         module = importlib.import_module(
-            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune"
+            "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.autotune"
         )
         name = "bf16_mxfp8_candidates"
     candidates = getattr(module, name)(batch_invariant=True)[:2]

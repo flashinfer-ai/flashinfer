@@ -24,7 +24,7 @@ from .weights import (
 
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
-    from ......kernel_src.sm120.split_cutedsl_megakernel import TransformedWeights
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import TransformedWeights
 
 
 def _effective_clamp(
@@ -94,7 +94,7 @@ class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.sm120.split_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm120.split_cutedsl import (
             MegaMoESm120W4A8Config,
             allocate_workspace,
         )
@@ -142,7 +142,7 @@ class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         compile_tokens_per_rank: int | None,
     ) -> None:
-        from ......kernel_src.sm120.split_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm120.split_cutedsl import (
             set_compile_tokens_per_rank,
         )
 
@@ -155,7 +155,7 @@ class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
-        from ......kernel_src.sm120.split_cutedsl_megakernel import stage_inputs
+        from flashinfer.moe_ep.shims.sm120.split_cutedsl import stage_inputs
 
         compile_bucket = workspace._compile_bucket
         stage_inputs(
@@ -181,7 +181,9 @@ class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.sm120.split_cutedsl_megakernel import run_split_mega_moe
+        from flashinfer.moe_ep.shims.sm120.split_cutedsl import (
+            run_split_mega_moe,
+        )
 
         direct_output = (
             output

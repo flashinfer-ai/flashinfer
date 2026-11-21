@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 
 from ..plan import ws_row
-from ..spec import MASK_CAUSAL, MMA_K, TILE_KEYS, tiles_per_chunk
+from ..spec import MASK_CAUSAL, MASK_NON_CAUSAL, MMA_K, TILE_KEYS, tiles_per_chunk
 from ..blocks.operands import (
     ACC_DTYPE,
     HALF,
@@ -219,13 +219,39 @@ class Roles:
     )
 
 
+SWAPS_MASK_MODES = (
+    MASK_CAUSAL,
+    MASK_NON_CAUSAL,
+)  # the mask modes of this body: a row's keys are a range given by the unit's descriptor
+
+
+def check_swaps_mask_mode(mask_mode: str) -> str:
+    if mask_mode not in SWAPS_MASK_MODES:
+        raise ValueError(
+            f"mask_mode {mask_mode!r}: the Swaps body implements {SWAPS_MASK_MODES}"
+        )
+    return mask_mode
+
+
 class SwapsPlan:
     """Tiled MMAs, tilers, smem / TMEM layouts, stage counts and the producer views of the swapped body."""
 
     def __init__(
-        self, D: int, g: int, page: int, n_pad: int, ragged: bool = False, cap: int = 0
+        self,
+        D: int,
+        g: int,
+        page: int,
+        n_pad: int,
+        ragged: bool = False,
+        cap: int = 0,
+        *,
+        mask_mode: str = MASK_CAUSAL,
     ):
         assert D in (64, 128, 256) and n_pad in N_PADS and 1 <= g <= 32, (D, n_pad, g)
+        # what a row sees (blocks/operands.StaticPlan.mask_mode): the two modes whose keys follow from the request metadata; a
+        # batch of a mode whose keys are data takes the row body
+        self.mask_mode = check_swaps_mask_mode(mask_mode)
+        self.keys_are_data = False
         assert page >= 1 and (
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page
@@ -235,9 +261,6 @@ class SwapsPlan:
         )
         assert not ragged or page == TILE_KEYS, (ragged, page)
         self.roles = Roles
-        # the causal mode alone: a batch of another mask mode takes the row body (blocks/operands.StaticPlan.mask_mode)
-        self.mask_mode = MASK_CAUSAL
-        self.keys_are_data = False
         self.n_wg = 1  # one softmax warpgroup (fold_group's prefetch depth reads it)
         self.T = TILE_KEYS
         self.tpc = tiles_per_chunk(D)

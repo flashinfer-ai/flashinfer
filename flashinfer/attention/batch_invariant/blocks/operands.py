@@ -197,7 +197,9 @@ class StaticPlan:
         mask_mode: str = MASK_CAUSAL,
     ):
         """``mask_mode`` (keyword-only; ``spec.MASK_MODES``): what a row sees, a compile-time constant of the body
-        (``compile.kernel_name``); the causal mode's code is unchanged. ``"key_set"``, the explicit-key-set class: the softmax reads
+        (``compile.kernel_name``); the causal mode's code is unchanged. Causal rows see ``[0, p]``, or ``[max(0, p -
+        window_left), p]`` with a window; ``"non_causal"`` rows see every key of the request, ``[0, kv_len)`` (the causal masking
+        code at the request's last position, no window). ``"key_set"``, the explicit-key-set class: the softmax reads
         every row's visible keys of a tile as bits (the key-set words of the request's row-visibility block, ``plan.F_VIS``). Under
         every mode whose keys are data (``keys_are_data``) the correction stores ``+0`` for a row without a visible key and the
         in-kernel chunk fold takes the present chunks from the partials.

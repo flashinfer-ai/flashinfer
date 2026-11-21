@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the attention kernel: one TVM-FFI object per static tuple ``(D, g, page,
-kv_slots, n_wg, q2, ragged, cap, mask_mode)`` with dynamic shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``.
+kv_slots, n_wg, q2, ragged, hw_rowmax, cap, mask_mode)`` with dynamic shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``.
 ``cap`` is the shared-memory capacity the smem plan is sized for (the execution device's): part of the kernel's identity, in-process
 and on disk, so a kernel compiled for one part is never loaded for another.
 
@@ -68,8 +68,8 @@ def get_compiled_attention(
 ):
     """``hw_rowmax``: the softmax's row maximum from the TMEM load (``engine.hw_row_max_enabled``); part of the kernel's name.
     ``cap``: the shared-memory capacity the smem plan is checked against (the execution device's; the current device's when 0).
-    ``mask_mode`` (keyword-only): what a row sees (``spec.MASK_MODES``) -- one object per mode (``plan.MASK_SUFFIX``); the causal
-    mode's objects keep their names."""
+    ``mask_mode`` (keyword-only): what a row sees (``spec.MASK_MODES``), a compile-time constant of the body -- one object per
+    mode (``plan.MASK_SUFFIX``); the causal mode's objects keep their names and their code."""
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()

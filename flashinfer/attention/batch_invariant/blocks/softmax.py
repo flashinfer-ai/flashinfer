@@ -50,7 +50,7 @@ from ....batch_invariant.fp_interface.cute import CuteF32, fmax3
 
 
 from .. import spec
-from ..spec import MASK_KEY_RANGES, MASK_KEY_SET
+from ..spec import MASK_KEY_RANGES, MASK_KEY_SET, MASK_NON_CAUSAL
 from ..plan import DESC_FIELDS, RANGE_ROW_TOKENS
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
@@ -324,19 +324,27 @@ def unit_loop(
     assert len(reg_f) == T and len(reg_s) == kpt, (
         "every key must be owned exactly once by the thread"
     )
+    # the row's position-derived keys [lo_row, L_row): the bottom-right position's prefix (and the window); under the non-causal
+    # mode every key of the request -- as if every row sat at the last position with no window (the causal mode's masking code
+    # below, a static choice)
+    NON_CAUSAL = st.mask_mode == MASK_NON_CAUSAL
     token = q_tok0 + row // g
     pos = kv_len - q_len + token
+    if cutlass.const_expr(NON_CAUSAL):
+        pos = kv_len - 1
     L_row = pos + 1
     lo_row = Int32(0)
-    if window_left >= 0:
-        lo_row = pos - window_left
-        if lo_row < 0:
-            lo_row = Int32(0)
+    if cutlass.const_expr(not NON_CAUSAL):
+        if window_left >= 0:
+            lo_row = pos - window_left
+            if lo_row < 0:
+                lo_row = Int32(0)
     neg_inf = Float32(_NEG_INF)
     m = Float32(_NEG_INF)
     N = tile_hi - tile_lo
     # ---- what the row sees: ONE dispatch on ``st.mask_mode`` (here, at the tile's bit load, at the decision whether the tile needs
-    # masking and at the mask itself); the causal mode is the last branch of each and its code is the body's own. Under the two
+    # masking and at the mask itself); the causal mode is the last branch of each and its code is the body's own, which the
+    # non-causal mode shares with the position and the window chosen above. Under the two
     # modes whose keys are data the row's data is read from its request's row-visibility block, which starts at table row
     # ``vis_row`` (``DESC_FIELDS`` int32 per table row; ``plan.F_VIS``); a padding row reads the request's last row (a valid
     # address; its values are never stored).

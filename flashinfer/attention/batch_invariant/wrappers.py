@@ -3,18 +3,25 @@
 """The delegate behind ``batch_invariant=True`` on ``BatchDecodeWithPagedKVCacheWrapper``, ``BatchPrefillWithPagedKVCacheWrapper`` and
 ``BatchPrefillWithRaggedKVCacheWrapper``: the wrappers' ``plan`` / ``run`` hand their arguments here, the class's typed checks raise
 :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for everything the class does not cover (nothing falls back), and the
-engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim: a token's output bits depend on
-its KV position, its head and the window alone, so the three wrappers compute the same bits for the same token.
+engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim and mask mode: under the causal
+class a token's output bits depend on its KV position, its head and the window alone; under the non-causal class (``causal=False`` on
+the prefill wrappers, ``is_causal=False`` with ``q_len_per_req > 1`` on the decode wrapper) on its request's key count and its head
+alone. The three wrappers compute the same bits for the same token of the same class.
+Chunked prefill: under the causal class a request cut into chunks (each later chunk over the keys cached so far) reproduces the
+one-shot bits; under the non-causal class only query chunks planned over the request's full key set do -- a chunk run while the
+KV is still growing is that chunk's view of the keys present at the time, and a different ``kv_len`` is a different term.
 
 Custom masks (``custom_mask`` / ``packed_custom_mask`` on the two prefill wrappers' ``plan()``) run the explicit-key-set class
 (``attention.bf16.mask``): a token's output bits depend on its own mask row (ANDed with the window), its head and its request's
-keys alone. The semantics are the regular wrappers': the mask replaces the causal mask (``causal`` is ignored), ``window_left``
-is ANDed in, a row without a visible key outputs zeros. The masks are snapshotted at ``plan()``.
+keys alone. The semantics are the regular wrappers': the mask replaces the position-derived keys (``causal`` is not read with
+one: ``causal=False`` without a mask is the non-causal class, with a mask the explicit-key-set class), ``window_left`` is ANDed
+in, a row without a visible key outputs zeros. The masks are snapshotted at ``plan()``.
 
 ``BatchPrefillWithCausalBidirectionalRangesWrapper`` takes the delegate of kind ``"ranges"``: the ranged class, whose rows also see
 a key range of their request (``run_ranges``). The ranges arrive at ``run()``, so ``plan()`` checks and keeps the batch metadata
 and the unit table is built at the first ``run()`` that brings a given range tensor and window pair (one host readback of the
-ranges per call; the tables are kept, so the layers of one forward pass plan once).
+ranges per call; the tables are kept, so the layers of one forward pass plan once). That wrapper plans with ``causal=False`` by
+contract (it owns its mask): the kind, not the flag, selects the ranged class, never the non-causal one.
 That readback makes its ``run()`` an eager call: capturing it in a CUDA graph raises.
 
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
@@ -35,7 +42,15 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS, MASK_CAUSAL, MASK_KEY_RANGES, scale_log2
+from .spec import (
+    HEAD_DIMS,
+    MASK_CAUSAL,
+    MASK_KEY_RANGES,
+    MASK_KEY_SET,
+    MASK_NON_CAUSAL,
+    mask_mode_of_causal,
+    scale_log2,
+)
 
 CLASS = "attention.bf16"
 #: unit tables a ranged delegate keeps per plan() (one per distinct range tensor and window pair; the oldest is dropped first)
@@ -101,6 +116,7 @@ class BatchInvariantAttention:
         self._sm_scale: Optional[float] = None
         self._scale_log2 = 0.0
         self._window_left = -1
+        self._causal = True  # the planned class is not the non-causal one (the ``causal`` of a plan without a mask)
         self._total_q = 0
         self._heads: Tuple[int, int, int] = (0, 0, 0)
         self._page = 1
@@ -171,39 +187,41 @@ class BatchInvariantAttention:
         window_left: int = -1,
         q_len_per_req: int = 1,
         *,
-        mask_mode: str = MASK_CAUSAL,
+        causal: bool = True,
+        masked: bool = False,
     ) -> int:
         """The wrappers' ``workspace_size``: the float workspace bytes the split-KV plan of this batch needs (0 when every unit is
-        fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits). ``mask_mode``
-        (keyword-only): what a row of the plan will see -- ``"key_set"`` for a plan with a custom mask (the explicit-key-set
-        class spans every request's whole key range). Kind ``"ranges"`` (always the ``key_ranges`` mode): the ranges arrive at
-        ``run()``, so the size is that of the batch whose every token's range is its request's whole key range -- an upper bound
-        for any ranges (the unit count does not depend on them and every split group's chunks are at most these)."""
-        D = int(head_dim)
-        if D not in HEAD_DIMS:
-            raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
-        kv_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
-        if self.kind == "decode":
-            qo_host = torch.arange(0, kv_host.numel(), dtype=torch.int64) * int(
-                q_len_per_req
+        fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits). ``causal`` and
+        ``masked`` (keyword-only) say what a row of the plan will see, as ``plan()`` decides it (``_check_mask_mode``):
+        ``masked`` for a plan with a custom mask (the explicit-key-set class spans every request's whole key range; ``causal``
+        is not read), else ``causal`` selects the causal or the non-causal class. Kind ``"ranges"`` (always the ``key_ranges``
+        mode): the ranges arrive at ``run()``, so the size is that of the batch whose every token's range is its request's whole
+        key range -- an upper bound for any ranges (the unit count does not depend on them and every split group's chunks are at
+        most these)."""
+        D = self._check_head_dim(head_dim)
+        self._check_heads(num_qo_heads, num_kv_heads)
+        page_size = self._check_page_size(page_size)
+        mask_mode, window_left = self._check_mask_mode(causal, window_left, masked)
+        qo_host, kv_host = self._host_offsets(qo_indptr, kv_indptr, q_len_per_req)
+        last_host = None
+        if self.kind != "ragged":
+            if kv_last_page_len is None:
+                raise unsupported(
+                    CLASS,
+                    "a paged plan without kv_last_page_len",
+                    "the paged KV CSR triple",
+                )
+            last_host = self._host_last_page_len(
+                kv_last_page_len, kv_host.numel() - 1, page_size
             )
-        else:
-            assert qo_indptr is not None
-            qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
-        last_host = (
-            kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
-            if (self.kind != "ragged" and kv_last_page_len is not None)
-            else None
+        q_lens, kv_lens = self._check_requests(
+            qo_host, kv_host, last_host, page_size, mask_mode
         )
         ranges = None
-        if self.kind == "ranges":
-            assert last_host is not None
-            spans = kv_host[1:] - kv_host[:-1]
-            kv_lens = torch.where(
-                spans > 0, (spans - 1) * int(page_size) + last_host, 0
-            )
+        if mask_mode == MASK_KEY_RANGES:
             hi = torch.repeat_interleave(
-                kv_lens, (qo_host[1:] - qo_host[:-1]).clamp(min=0)
+                torch.tensor(kv_lens, dtype=torch.int64),
+                torch.tensor(q_lens, dtype=torch.int64),
             )
             ranges = torch.stack((torch.zeros_like(hi), hi), dim=1)
         return engine.workspace_bytes(
@@ -213,16 +231,199 @@ class BatchInvariantAttention:
             num_qo_heads,
             num_kv_heads,
             D,
-            1 if self.kind == "ragged" else page_size,
-            -1 if window_left is None else int(window_left),
+            page_size,
+            window_left,
             engine.default_config(D=D),
             self.device,
             ragged=self.kind == "ragged",
-            mask_mode=MASK_KEY_RANGES
-            if self.kind == "ranges"
-            else (MASK_CAUSAL if self.kind == "decode" else mask_mode),
+            mask_mode=mask_mode,
             ranges=ranges,
         )
+
+    # ------------------------------------------------------------------ the checks plan() and workspace_bytes() share
+    @staticmethod
+    def _check_head_dim(head_dim: int) -> int:
+        D = int(head_dim)
+        if D not in HEAD_DIMS:
+            raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
+        return D
+
+    @staticmethod
+    def _check_heads(num_qo_heads: int, num_kv_heads: int) -> None:
+        if (
+            num_kv_heads <= 0
+            or num_qo_heads < num_kv_heads
+            or num_qo_heads % num_kv_heads
+        ):
+            raise unsupported(
+                CLASS,
+                f"{num_qo_heads} query heads over {num_kv_heads} KV heads",
+                "num_qo_heads a positive multiple of num_kv_heads",
+            )
+        g = num_qo_heads // num_kv_heads
+        if g > 128:
+            raise unsupported(
+                CLASS, f"a GQA group of {g}", "at most 128 query heads per KV head"
+            )
+
+    def _check_page_size(self, page_size: int) -> int:
+        """The planner's page size: 1 for the ragged layout, else the caller's (a power of two up to ``_MAX_PAGE``)."""
+        if self.kind == "ragged":
+            page_size = 1
+        if page_size < 1 or page_size > _MAX_PAGE or page_size & (page_size - 1):
+            raise unsupported(
+                CLASS, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
+            )
+        return page_size
+
+    def _check_mask_mode(
+        self, causal: bool, window_left: Optional[int], masked: bool = False
+    ) -> Tuple[str, int]:
+        """The plan's mask mode (``spec.MASK_MODES``) and the window as the planner takes them -- THE mapping of the wrappers'
+        arguments onto the mode: the ranges wrapper always runs the ``key_ranges`` mode (it passes ``causal=False`` by contract
+        and that flag is not read), a custom mask selects the ``key_set`` mode whatever ``causal`` says (the mask replaces the
+        position-derived keys), and without either ``causal`` selects the causal or the non-causal mode. A window belongs to
+        every mode but the non-causal one."""
+        if window_left is None:
+            window_left = -1
+        window_left = int(window_left)
+        if window_left < -1:
+            raise unsupported(
+                CLASS,
+                f"window_left {window_left}",
+                "window_left >= 0, or -1 for no window",
+            )
+        if self.kind == "ranges":
+            return MASK_KEY_RANGES, window_left
+        if masked:
+            return MASK_KEY_SET, window_left
+        if not causal and window_left >= 0:
+            # a symmetric window over a non-causal row would be a further class; the non-causal class sees every key
+            raise unsupported(
+                CLASS,
+                f"window_left {window_left} with causal=False",
+                "the whole key range under the non-causal class (a window belongs to the causal class)",
+            )
+        return mask_mode_of_causal(bool(causal)), window_left
+
+    def _host_offsets(
+        self,
+        qo_indptr: Optional[torch.Tensor],
+        kv_indptr: torch.Tensor,
+        q_len_per_req: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The query and KV offsets on the host as int64 (decode: ``q_len_per_req`` query tokens per request), checked for
+        the planner: one KV range per request, non-negative offsets below 2^31, query rows from row 0."""
+        if self.kind == "decode":
+            if q_len_per_req < 1:
+                raise unsupported(
+                    CLASS,
+                    f"q_len_per_req {q_len_per_req}",
+                    "at least one query token per request",
+                )
+            batch = int(kv_indptr.numel()) - 1
+            qo_indptr = torch.arange(
+                0, batch + 1, dtype=torch.int32, device="cpu"
+            ) * int(q_len_per_req)
+        else:
+            if qo_indptr is None:
+                raise unsupported(
+                    CLASS, "a plan without qo_indptr", "the packed query offsets"
+                )
+        kv_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
+        qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
+        if bool((kv_host < 0).any()):
+            raise unsupported(
+                CLASS,
+                f"a negative kv_indptr entry ({int(kv_host.min())})",
+                "non-negative KV offsets",
+            )
+        if qo_host.numel() != kv_host.numel():
+            raise unsupported(
+                CLASS,
+                f"{qo_host.numel() - 1} query requests over {kv_host.numel() - 1} KV requests",
+                "one KV range per request",
+            )
+        if qo_host.numel() and int(qo_host[0]) != 0:
+            raise unsupported(
+                CLASS,
+                f"qo_indptr starting at {int(qo_host[0])}",
+                "qo_indptr[0] == 0 (the packed query rows start at row 0)",
+            )
+        if kv_host.numel() and int(kv_host[-1]) >= 2**31:
+            raise unsupported(
+                CLASS,
+                f"kv_indptr[-1] = {int(kv_host[-1])}",
+                "page-table offsets below 2^31 (the kernels read them as int32)",
+            )
+        return qo_host, kv_host
+
+    @staticmethod
+    def _host_last_page_len(
+        kv_last_page_len: torch.Tensor, n_requests: int, page_size: int
+    ) -> torch.Tensor:
+        last_host = kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
+        if last_host.numel() != n_requests:
+            raise unsupported(
+                CLASS,
+                f"kv_last_page_len of {last_host.numel()} entries for {n_requests} requests",
+                "one last-page length per request",
+            )
+        if bool(((last_host < 0) | (last_host > page_size)).any()):
+            raise unsupported(
+                CLASS,
+                "a kv_last_page_len outside 0..page_size",
+                f"last-page lengths in 0..{page_size}",
+            )
+        return last_host
+
+    @staticmethod
+    def _check_requests(
+        qo_host: torch.Tensor,
+        kv_host: torch.Tensor,
+        last_host: Optional[torch.Tensor],
+        page_size: int,
+        mask_mode: str,
+    ) -> Tuple[list, list]:
+        """Every request's query and key counts against the planned class (``last_host`` is ``None`` for the ragged layout,
+        whose ``kv_host`` holds token offsets): the causal and the ranged class need ``kv_len >= q_len`` (bottom-right
+        positions), the non-causal and the explicit-key-set class a key for every request with query tokens. Returns the
+        requests' ``(q_lens, kv_lens)``."""
+        positional = mask_mode in (MASK_CAUSAL, MASK_KEY_RANGES)
+        kv_spans = kv_host[1:] - kv_host[:-1]  # tokens (ragged) or pages
+        if last_host is None:
+            kv_lens = kv_spans.tolist()
+        else:
+            # a request without pages has no keys, whatever its last-page entry (the planner's rule)
+            kv_lens = torch.where(
+                kv_spans > 0, (kv_spans - 1) * page_size + last_host, 0
+            ).tolist()
+        q_lens = (qo_host[1:] - qo_host[:-1]).tolist()
+        for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
+            if ql < 0 or kl < 0:
+                raise unsupported(
+                    CLASS,
+                    f"request {i} with a decreasing qo_indptr / kv_indptr",
+                    "non-decreasing offsets",
+                )
+            if positional and ql > kl:
+                raise unsupported(
+                    CLASS,
+                    f"request {i} with {ql} query tokens over {kl} keys",
+                    "kv_len >= q_len per request (the causal class)",
+                )
+            if not positional and ql > 0 and kl == 0:
+                raise unsupported(
+                    CLASS,
+                    f"request {i} with {ql} query tokens over no key",
+                    "at least one key per request with query tokens "
+                    + (
+                        "(a custom mask selects among the request's keys)"
+                        if mask_mode == MASK_KEY_SET
+                        else "(a non-causal row sees its request's keys)"
+                    ),
+                )
+        return q_lens, kv_lens
 
     # ------------------------------------------------------------------ plan
     def plan(
@@ -257,30 +458,15 @@ class BatchInvariantAttention:
         rope_theta: Optional[float] = None,
     ) -> None:
         """The wrappers' ``plan`` arguments; every input outside the class raises before any work."""
-        D = int(head_dim_qk)
-        if D not in HEAD_DIMS:
-            raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
+        D = self._check_head_dim(head_dim_qk)
         if head_dim_vo is not None and int(head_dim_vo) != D:
             raise unsupported(
                 CLASS,
                 f"head_dim_vo {head_dim_vo} with head_dim_qk {D}",
                 "equal query and value head dims",
             )
-        if (
-            num_kv_heads <= 0
-            or num_qo_heads < num_kv_heads
-            or num_qo_heads % num_kv_heads
-        ):
-            raise unsupported(
-                CLASS,
-                f"{num_qo_heads} query heads over {num_kv_heads} KV heads",
-                "num_qo_heads a positive multiple of num_kv_heads",
-            )
+        self._check_heads(num_qo_heads, num_kv_heads)
         g = num_qo_heads // num_kv_heads
-        if g > 128:
-            raise unsupported(
-                CLASS, f"a GQA group of {g}", "at most 128 query heads per KV head"
-            )
         for name, dt in (
             ("q_data_type", q_data_type),
             ("kv_data_type", kv_data_type),
@@ -292,28 +478,15 @@ class BatchInvariantAttention:
                     f"{name} {_dtype(dt)}",
                     "bf16 queries, keys, values and output",
                 )
-        if self.kind == "ragged":
-            page_size = 1
-        if page_size < 1 or page_size > _MAX_PAGE or page_size & (page_size - 1):
-            raise unsupported(
-                CLASS, f"page_size {page_size}", f"a power of two up to {_MAX_PAGE}"
-            )
+        page_size = self._check_page_size(page_size)
         masked = custom_mask is not None or packed_custom_mask is not None
         if masked and self.kind in ("decode", "ranges"):
             raise unsupported(
                 CLASS,
                 f"a custom mask on the {self.kind} wrapper",
-                "the causal mask with an optional sliding window"
+                "the causal mask with an optional sliding window, or the non-causal class"
                 if self.kind == "decode"
                 else "the causal keys and the bidirectional ranges of run()",
-            )
-        # a custom mask replaces the causal mask, as in the regular kernels: ``causal`` is not read with one.
-        # kind "ranges": the wrapper owns its mask (the causal keys and the ranges) and plans with causal=False by contract
-        if self.kind in ("prefill", "ragged") and not causal and not masked:
-            raise unsupported(
-                CLASS,
-                "non-causal attention",
-                "causal attention (bottom-right aligned), or a custom mask",
             )
         if self.kind == "ranges" and window_left not in (None, -1):
             raise unsupported(
@@ -347,14 +520,7 @@ class BatchInvariantAttention:
             )
         if use_token_head_sf:
             raise unsupported(CLASS, "use_token_head_sf", "unscaled bf16 K / V")
-        if window_left is None:
-            window_left = -1
-        if window_left < -1:
-            raise unsupported(
-                CLASS,
-                f"window_left {window_left}",
-                "window_left >= 0, or -1 for no window",
-            )
+        mask_mode, window_left = self._check_mask_mode(causal, window_left, masked)
         if sm_scale is not None:
             ok = math.isfinite(float(sm_scale)) and float(sm_scale) > 0.0
             if ok:
@@ -368,73 +534,21 @@ class BatchInvariantAttention:
                     f"sm_scale {sm_scale}",
                     "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
                 )
-        if self.kind == "decode":
-            if q_len_per_req < 1:
-                raise unsupported(
-                    CLASS,
-                    f"q_len_per_req {q_len_per_req}",
-                    "at least one query token per request",
-                )
-            batch = int(kv_indptr.numel()) - 1
-            qo_indptr = torch.arange(
-                0, batch + 1, dtype=torch.int32, device="cpu"
-            ) * int(q_len_per_req)
-        else:
-            if qo_indptr is None:
-                raise unsupported(
-                    CLASS, "a plan without qo_indptr", "the packed query offsets"
-                )
-        kv_indptr_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
-        qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
-        if bool((kv_indptr_host < 0).any()):
-            raise unsupported(
-                CLASS,
-                f"a negative kv_indptr entry ({int(kv_indptr_host.min())})",
-                "non-negative KV offsets",
-            )
-        if qo_host.numel() != kv_indptr_host.numel():
-            raise unsupported(
-                CLASS,
-                f"{qo_host.numel() - 1} query requests over {kv_indptr_host.numel() - 1} KV requests",
-                "one KV range per request",
-            )
-        kv_spans = kv_indptr_host[1:] - kv_indptr_host[:-1]  # tokens (ragged) or pages
-        if qo_host.numel() and int(qo_host[0]) != 0:
-            raise unsupported(
-                CLASS,
-                f"qo_indptr starting at {int(qo_host[0])}",
-                "qo_indptr[0] == 0 (the packed query rows start at row 0)",
-            )
-        if kv_indptr_host.numel() and int(kv_indptr_host[-1]) >= 2**31:
-            raise unsupported(
-                CLASS,
-                f"kv_indptr[-1] = {int(kv_indptr_host[-1])}",
-                "page-table offsets below 2^31 (the kernels read them as int32)",
-            )
+        qo_host, kv_indptr_host = self._host_offsets(
+            qo_indptr, kv_indptr, q_len_per_req
+        )
         last_host = None
         max_page = -1
-        if self.kind == "ragged":
-            kv_lens = kv_spans.tolist()
-        else:
+        if self.kind != "ragged":
             if kv_last_page_len is None or kv_indices is None:
                 raise unsupported(
                     CLASS,
                     "a paged plan without kv_indices / kv_last_page_len",
                     "the paged KV CSR triple",
                 )
-            last_host = kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
-            if last_host.numel() != kv_spans.numel():
-                raise unsupported(
-                    CLASS,
-                    f"kv_last_page_len of {last_host.numel()} entries for {kv_spans.numel()} requests",
-                    "one last-page length per request",
-                )
-            if bool(((last_host < 0) | (last_host > page_size)).any()):
-                raise unsupported(
-                    CLASS,
-                    "a kv_last_page_len outside 0..page_size",
-                    f"last-page lengths in 0..{page_size}",
-                )
+            last_host = self._host_last_page_len(
+                kv_last_page_len, kv_indptr_host.numel() - 1, page_size
+            )
             n_pages = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
             if kv_indices.numel() < n_pages:
                 raise unsupported(
@@ -455,31 +569,9 @@ class BatchInvariantAttention:
                         CLASS, "a negative page index", "page indices in 0..num_pages-1"
                     )
                 max_page = hi  # checked against the cache at run()
-            # a request without pages has no keys, whatever its last-page entry (the planner's rule)
-            kv_lens = torch.where(
-                kv_spans > 0, (kv_spans - 1) * page_size + last_host, 0
-            ).tolist()
-        q_lens = (qo_host[1:] - qo_host[:-1]).tolist()
-        for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
-            if ql < 0 or kl < 0:
-                raise unsupported(
-                    CLASS,
-                    f"request {i} with a decreasing qo_indptr / kv_indptr",
-                    "non-decreasing offsets",
-                )
-            if masked:
-                if ql > 0 and kl == 0:
-                    raise unsupported(
-                        CLASS,
-                        f"request {i} with {ql} query tokens over no key",
-                        "at least one key per request with query tokens (a custom mask selects among the request's keys)",
-                    )
-            elif ql > kl:
-                raise unsupported(
-                    CLASS,
-                    f"request {i} with {ql} query tokens over {kl} keys",
-                    "kv_len >= q_len per request (the causal class)",
-                )
+        q_lens, kv_lens = self._check_requests(
+            qo_host, kv_indptr_host, last_host, page_size, mask_mode
+        )
         key_sets = None
         if masked:
             # the rows' key sets in the kernels' layout, from a snapshot of the caller's mask (a later in-place change cannot reach
@@ -551,6 +643,7 @@ class BatchInvariantAttention:
                 page_size,
                 window_left,
                 config,
+                causal=mask_mode != MASK_NON_CAUSAL,
                 key_sets=key_sets,
             )
         # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here) from
@@ -578,6 +671,7 @@ class BatchInvariantAttention:
         self._sm_scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
         self._scale_log2 = scale_log2(self._sm_scale)
         self._window_left = int(window_left)
+        self._causal = mask_mode != MASK_NON_CAUSAL
         self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
         self._heads = (num_qo_heads, num_kv_heads, D)
         self._page = page_size
@@ -595,11 +689,13 @@ class BatchInvariantAttention:
         window_left: int,
         config: engine.AttnConfig,
         *,
+        causal: bool = True,
         key_sets: Optional[engine.KeySets] = None,
         ranges: Optional[torch.Tensor] = None,
     ) -> Tuple[engine._Planned, engine.AttnConfig]:
         """The engine's plan in the wrapper's workspace, and the configuration it was built with. ``key_sets`` (the ``key_set``
-        mode) or ``ranges`` (the ``key_ranges`` mode) select what a row sees; neither: the causal mode."""
+        mode) or ``ranges`` (the ``key_ranges`` mode) select what a row sees; neither: the causal mode, or with
+        ``causal=False`` the non-causal mode (``engine.plan_attention``)."""
         try:
             planned = engine.plan_attention(
                 qo_host,
@@ -614,6 +710,7 @@ class BatchInvariantAttention:
                 self.workspace,
                 self.device,
                 ragged=self.kind == "ragged",
+                causal=causal,
                 key_sets=key_sets,
                 ranges=ranges,
             )
@@ -637,6 +734,7 @@ class BatchInvariantAttention:
                     self.workspace,
                     self.device,
                     ragged=self.kind == "ragged",
+                    causal=causal,
                     key_sets=key_sets,
                     ranges=ranges,
                 )
@@ -692,16 +790,12 @@ class BatchInvariantAttention:
                 'pos_encoding_mode "NONE" (apply RoPE to q / k beforehand)',
             )
         self.refuse(rope_scale=rope_scale, rope_theta=rope_theta)
-        if (
-            causal is not None
-            and not causal
-            and self.kind != "decode"
-            and not self._masked
-        ):
+        # a custom mask replaces the position-derived keys: ``causal`` is not read with one, at plan() or here
+        if causal is not None and not self._masked and bool(causal) != self._causal:
             raise unsupported(
                 CLASS,
-                "non-causal attention",
-                "causal attention (bottom-right aligned), or a custom mask",
+                f"causal={bool(causal)} at forward() after planning causal={self._causal}",
+                "the planned mask mode (the causal and the non-causal class are two classes)",
             )
         if use_fp16_qk_reduction:
             raise unsupported(

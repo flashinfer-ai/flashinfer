@@ -11,7 +11,7 @@ Every declaration of the `BIKernels.*` modules is checked:
   except the named theorems in `decidedTheorems` below, which are decided by `native_decide` and therefore depend on
   `Lean.ofReduceBool` as well: the axiom that `Lean.reduceBool c = true` implies `c = true`, i.e. it trusts the
   compiled evaluator (Lean's code generator and interpreter) for the evaluation of these closed Boolean terms. Every
-  other generated conformance case (`BIKernels.Cases`) uses kernel `decide` and needs no such trust.
+  other generated conformance case (`BIKernels.Cases.*`) uses kernel `decide` and needs no such trust.
 
 The claim the policy enforces is therefore "Lean's standard axioms, plus `Lean.ofReduceBool` for the named
 exhaustive table checks", never "standard axioms only". -/
@@ -22,8 +22,8 @@ def decidedAxiom : Name := ``Lean.ofReduceBool
 /-- The named `native_decide` theorems: the exhaustive checks over the generators' configuration spaces and the GEMM
 dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates in reasonable time), the attention spec cases
 (terms of tens of kilobytes), the attention class-separation theorems, the explicit-key-set attention cases
-(`BIKernels.AttentionMaskCases`: the spec terms and the causal-range equalities) and the ranged attention class's spec cases,
-toy-row theorems and key-set equalities (`BIKernels.AttentionRangesCases`). -/
+(`BIKernels.Cases.AttentionMask`: the spec terms and the equalities with the causal and the non-causal rows of the same visible
+set) and the ranged attention class's spec cases, toy-row theorems and key-set equalities (`BIKernels.Cases.AttentionRanges`). -/
 def decidedTheorems : List Name :=
   [``BIK.gemm_space_ok, ``BIK.gemm_space_c4_ok, ``BIK.gemm_space_c4_cta_twins, ``BIK.gemm_dispatch_in_space,
    ``BIK.gemm_fp8_space_ok, ``BIK.gemm_fp8_space_c4_ok, ``BIK.gemm_fp8_space_c4_cta_twins, ``BIK.gemm_fp8_dispatch_in_space,
@@ -44,7 +44,7 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mxw48_space_decode_ok, ``BIK.gemm_mxw48_space_c2_ok,
    ``BIK.gemm_mxw48k64_space_ok, ``BIK.gemm_mxw48k64_space_c4_ok, ``BIK.gemm_mxw48k64_space_c4_cta_twins, ``BIK.gemm_mxw48k64_dispatch_in_space,
    ``BIK.gemm_mxw48k64_space_decode_ok, ``BIK.gemm_mxw48k64_space_c2_ok,
-   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64,
+   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_a10_spec, ``BIK.attn_a11_spec, ``BIK.attn_a12_spec, ``BIK.attn_a13_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64, ``BIK.Attn.output_depends_on_mode,
    ``BIK.Attn.mask_output_depends_on_keys, ``BIK.attnm_m0_spec, ``BIK.attnm_m1_spec, ``BIK.attnm_m2_spec, ``BIK.attnm_m3_spec, ``BIK.attnm_m4_spec, ``BIK.attnm_m5_spec, ``BIK.attnm_m6_spec, ``BIK.attnm_m7_spec, ``BIK.attnm_a0_causal, ``BIK.attnm_a1_causal, ``BIK.attnm_a2_causal, ``BIK.attnm_a3_causal, ``BIK.attnm_a4_causal, ``BIK.attnm_a5_causal, ``BIK.attnm_a6_causal, ``BIK.attnm_a7_causal, ``BIK.attnm_a8_causal, ``BIK.attnm_a9_causal,
    ``BIK.attnr_r0_spec, ``BIK.attnr_r1_spec, ``BIK.attnr_r2_spec, ``BIK.attnr_r3_spec, ``BIK.attnr_r4_spec, ``BIK.attnr_r5_spec, ``BIK.attnr_r6_spec, ``BIK.attnr_r0_keyset, ``BIK.attnr_r1_keyset, ``BIK.attnr_r2_keyset, ``BIK.attnr_r3_keyset, ``BIK.attnr_r4_keyset, ``BIK.attnr_r5_keyset, ``BIK.attnr_r6_keyset, ``BIK.AttnR.output_depends_on_range, ``BIK.AttnR.range_around_position_is_causal_at_end]
 def moduleOf (env : Environment) (n : Name) : Option Name :=

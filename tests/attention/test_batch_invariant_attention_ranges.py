@@ -133,11 +133,17 @@ def test_receipt_of_the_ranged_class(D):
 
     fp = bi.fingerprint(RANGES_WRAPPER, head_dim=D)
     assert fp == FINGERPRINTS[D]
-    causal = bi.fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=D)
+    causal = bi.fingerprint(
+        "BatchPrefillWithPagedKVCacheWrapper", head_dim=D, causal=True
+    )
     assert causal == spec.FINGERPRINTS[D] and fp != causal
     assert bi.class_name(RANGES_WRAPPER) == "attention.bf16"
     with pytest.raises(TypeError):
         bi.fingerprint(RANGES_WRAPPER, head_dim=D, batch=8)
+    with pytest.raises(
+        TypeError
+    ):  # the wrapper has one mask mode: its receipt takes no `causal`
+        bi.fingerprint(RANGES_WRAPPER, head_dim=D, causal=False)
 
 
 def test_a_row_without_a_range_has_the_causal_term():
@@ -287,9 +293,10 @@ def test_kernel_identity_carries_the_mask_mode():
     args = (128, 4, 16, 4, 1, False, False, True, 228 << 10)
     causal = kernel_name(*args)
     assert kernel_name(*args, mask_mode="causal") == causal
+    assert kernel_name(*args, mask_mode="non_causal") == causal + "_nc"
     assert kernel_name(*args, mask_mode="key_ranges") == causal + "_br"
     assert kernel_name(*args, mask_mode="key_set") == causal + "_mk"
-    assert set(MASK_MODES) == {"causal", "key_ranges", "key_set"}
+    assert set(MASK_MODES) == {"causal", "non_causal", "key_ranges", "key_set"}
     with pytest.raises(
         TypeError
     ):  # the mode is keyword-only: it cannot land in another flag's position
@@ -307,7 +314,7 @@ def test_one_dataflow_over_the_visible_set():
     from flashinfer.attention.batch_invariant import spec
     from flashinfer.attention.batch_invariant.spec import AttentionSpec, RowSpec
 
-    assert spec.MASK_MODES == ("causal", "key_ranges", "key_set")
+    assert spec.MASK_MODES == ("causal", "non_causal", "key_ranges", "key_set")
     S = AttentionSpec(64, T=16, C=32)
     rng = random.Random(3)
     rows = [spec.ranged_sample_row(16, 32)]
@@ -347,7 +354,7 @@ def test_one_dataflow_over_the_visible_set():
         with pytest.raises(TypeError):  # keyword-only
             spec.spec_fingerprint(D, -1, "key_ranges")
     with pytest.raises(ValueError):
-        spec.spec_fingerprint(64, mask_mode="non_causal")
+        spec.spec_fingerprint(64, mask_mode="ranged")
 
 
 def test_engine_takes_one_mask_mode_per_plan():

@@ -40,7 +40,7 @@ structure Params where
   d : Nat
 
 /-- The causal class's row at the same position, window and identity. -/
-def Params.causal (P : Params) : Attn.Params := ⟨P.steps, P.tbits, P.C, P.p, P.win, P.row, P.d⟩
+def Params.causal (P : Params) : Attn.Params := ⟨P.steps, P.tbits, P.C, P.p, P.win, P.row, P.d, true, P.p + 1⟩
 
 /-! The geometry of a ranged row as functions of `(tbits, C, p, win, ra, rb)` alone. -/
 
@@ -85,10 +85,10 @@ theorem splitKernel_assignment_irrelevant (P : Params) (σ τ : Nat → Nat) : s
 /-! ## Rows whose range adds no key are rows of the causal class -/
 
 theorem tilesOfChunkV_causal (tbits C p : Nat) (win : Int) (j : Nat) :
-    tilesOfChunkV tbits C (Attn.visibleG p win) j = Attn.tilesOfChunkG tbits C p win j := rfl
+    tilesOfChunkV tbits C (Attn.visibleG p win) j = Attn.tilesOfChunkR tbits C (Attn.loOf p win) (p + 1) j := rfl
 
 theorem presentChunksV_causal (tbits C p : Nat) (win : Int) :
-    presentChunksV tbits C (p + 1) (Attn.visibleG p win) = Attn.presentChunksG tbits C p win := rfl
+    presentChunksV tbits C (p + 1) (Attn.visibleG p win) = Attn.presentChunksR tbits C (Attn.loOf p win) (p + 1) := rfl
 
 /-- A ranged row whose visible keys and last key are the causal row's is the causal row as a visible-set row, and has its
 term. -/
@@ -96,7 +96,8 @@ theorem output_eq_causal (P : Params) (hv : P.visible = Attn.visibleG P.p P.win)
     output P = Attn.output P.causal := by
   have hvis : visibleG P.p P.win P.ra P.rb = Attn.visibleG P.p P.win := hv
   have h : P.toV = P.causal.toV := by
-    simp [Params.toV, Attn.Params.toV, Params.causal, hvis, hL]
+    rw [Attn.causal_toV P.causal rfl]
+    simp [Params.toV, Params.causal, hvis, hL]
   show vTerm P.toV = vTerm P.causal.toV
   rw [h]
 
@@ -115,7 +116,7 @@ theorem range_inside_causal_is_causal (P : Params) (hlo : Attn.loOf P.p P.win �
     output P = Attn.output P.causal := by
   apply output_eq_causal
   · funext k
-    simp only [Params.visible, visibleG, Attn.visibleG]
+    simp only [Params.visible, visibleG, Attn.visibleG, Attn.visibleR]
     by_cases hk : P.ra ≤ k ∧ k < P.rb
     · have hc : Attn.loOf P.p P.win ≤ k ∧ k < P.p + 1 := by omega
       simp [hk, hc]
@@ -162,7 +163,8 @@ theorem subbatch_invariance (steps tbits C : Nat) (win : Int) (d : Nat) {M k : N
 /-- A row without a range in a ranged launch is the causal launch's row, whatever ranges the other rows carry. -/
 theorem launch_row_without_range (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M)
     (h : (rows r).rb ≤ (rows r).ra) :
-    launch M rows steps tbits C win d r = Attn.rowOutput steps tbits C win d ⟨(rows r).p, (rows r).h, (rows r).row⟩ :=
+    launch M rows steps tbits C win d r
+      = Attn.rowOutput true steps tbits C win d ⟨(rows r).p, (rows r).p + 1, (rows r).h, (rows r).row⟩ :=
   no_range_is_causal ⟨steps, tbits, C, (rows r).p, win, (rows r).ra, (rows r).rb, (rows r).row, d⟩ h
 
 /-! ## The ranged row is a row of the explicit-key-set class -/
@@ -176,7 +178,7 @@ theorem not_visible_past_end (p : Nat) (win : Int) (ra rb k : Nat) (hk : endG p 
   have hr : ¬ (ra ≤ k ∧ k < rb) := by
     unfold endG at hk
     split at hk <;> omega
-  simp [visibleG, Attn.visibleG, hc, hr]
+  simp [visibleG, Attn.visibleG, Attn.visibleR, hc, hr]
 
 /-- **A key-range row equals the explicit-key-set row with the same visible set**: the mask row whose bits are
 `causal ∪ [ra, rb)` over `[0, endG)` has the ranged row's term (`Attn.key_set_row_of_visible_set`), so the two classes give
@@ -189,12 +191,12 @@ theorem key_set_row_of_range_row (P : Params) (hne : P.presentChunks ≠ []) :
 
 /-- **The ranged class is not the causal class**: a range ahead of the position is a different term (a toy row, decided). -/
 theorem output_depends_on_range :
-    output ⟨1, 2, 8, 9, -1, 12, 14, 0, 0⟩ ≠ Attn.output ⟨1, 2, 8, 9, -1, 0, 0⟩ := by native_decide
+    output ⟨1, 2, 8, 9, -1, 12, 14, 0, 0⟩ ≠ Attn.output ⟨1, 2, 8, 9, -1, 0, 0, true, 10⟩ := by native_decide
 
 /-- A row inside its range with no window sees the prefix up to the range's last key: the term of the causal row at that
 key, for the same query row (a toy row, decided). -/
 theorem range_around_position_is_causal_at_end :
-    output ⟨1, 2, 8, 5, -1, 3, 12, 0, 0⟩ = Attn.output ⟨1, 2, 8, 11, -1, 0, 0⟩ := by native_decide
+    output ⟨1, 2, 8, 5, -1, 3, 12, 0, 0⟩ = Attn.output ⟨1, 2, 8, 11, -1, 0, 0, true, 12⟩ := by native_decide
 
 /-! ## The configuration space -/
 

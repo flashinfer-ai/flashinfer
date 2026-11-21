@@ -24,13 +24,18 @@ from .support import (
 
 class ClassInfo(NamedTuple):
     """A consistency class behind a FlashInfer API: its name, the fixed dimensions its fingerprint takes, the
-    function computing the fingerprint from them, and the optional dimensions (flags of the specification with a
-    default, such as a bias) the function also accepts."""
+    function computing the fingerprint from them, the optional dimensions (flags of the specification with a
+    default, such as a bias) the function also accepts, a note the missing-dimension error carries (what the
+    fixed dimensions select, where a caller could expect a default), and the waivers: pairs ``(flag, dim)`` of an optional
+    flag that, when set, names a class in which the fixed dimension ``dim`` is not a dimension (it is then not required,
+    and the function does not read it)."""
 
     name: str
     dims: tuple
     fingerprint: Callable[..., str]
     optional: tuple = ()
+    note: str = ""
+    waived: tuple = ()
 
 
 def _mm_bf16_fingerprint(N: int, K: int, bias: bool = False) -> str:
@@ -90,14 +95,27 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int, custom_mask: bool = False) -> str:
-    """The attention class at ``head_dim``; ``custom_mask=True`` names the explicit-key-set class a ``plan()`` with a custom mask
-    runs (the mask is data of that class: its values never enter the identifier)."""
+def _attention_fingerprint(
+    head_dim: int, causal: Optional[bool] = None, custom_mask: bool = False
+) -> str:
+    """The attention class at ``head_dim`` under a mask mode; ``causal=None`` is the causal class (the decode wrapper's
+    ``is_causal=None``), never a truth value. ``custom_mask=True`` names the explicit-key-set class a ``plan()`` with a custom
+    mask runs (the mask is data of that class: its values never enter the identifier); the mask replaces the position-derived
+    keys, so ``causal`` is not read with it, as ``plan()`` does not read it."""
     from ..attention.batch_invariant.spec import mask_fingerprint, spec_fingerprint
 
     if custom_mask:
         return mask_fingerprint(head_dim)
-    return spec_fingerprint(head_dim)
+    return spec_fingerprint(head_dim, causal=True if causal is None else bool(causal))
+
+
+#: The prefill wrappers' ``plan()`` defaults to ``causal=False``, which runs the non-causal class: their receipt has no
+#: default mode.
+_PREFILL_CAUSAL_NOTE = (
+    "`causal` selects one of the two attention classes -- causal=True the causal class, causal=False the non-causal "
+    "class -- and the wrapper's plan() defaults to causal=False (a plan with a custom mask runs a third class, named by "
+    "custom_mask=True, which does not read `causal`)"
+)
 
 
 def _attention_ranges_fingerprint(head_dim: int) -> str:
@@ -619,21 +637,36 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_mxfp4w8a_fingerprint,
         ("arch",),
     ),
-    # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    # the three attention wrappers compute one class per head dim and mask mode: under the causal class a token's output depends
+    # on its KV position, its head and the window alone, under the non-causal class (`causal=False`) on its request's key count
+    # and its head alone; prefill and decode (and the paged and ragged KV layouts) are one class per mode. The mode is a fixed
+    # dimension of the prefill wrappers' receipt (their plan() defaults to the non-causal class) and optional for the decode
+    # wrapper, whose default (a single token per request, or `is_causal=None`) is the causal class
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal",)
     ),
     # a prefill plan with a custom mask runs the explicit-key-set class (`custom_mask=True`): a token's output depends on its own
-    # mask row (ANDed with the window), its head and its request's keys alone; the decode wrapper takes no mask
+    # mask row (ANDed with the window), its head and its request's keys alone; `causal` is not a dimension of that class (the
+    # plan does not read it with a mask), so the receipt does not require it then. The decode wrapper takes no mask
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint, ("custom_mask",)
+        "attention.bf16",
+        ("head_dim", "causal"),
+        _attention_fingerprint,
+        ("custom_mask",),
+        note=_PREFILL_CAUSAL_NOTE,
+        waived=(("custom_mask", "causal"),),
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint, ("custom_mask",)
+        "attention.bf16",
+        ("head_dim", "causal"),
+        _attention_fingerprint,
+        ("custom_mask",),
+        note=_PREFILL_CAUSAL_NOTE,
+        waived=(("custom_mask", "causal"),),
     ),
     # the ranged class: the same dataflow over the causal keys united with one bidirectional key range per query token (its
-    # own receipt: what a row may see is part of the class; a row without a range has the causal class's term and bits)
+    # own receipt: what a row may see is part of the class; a row without a range has the causal class's term and bits). The
+    # wrapper has one mask mode, so its receipt takes no `causal`
     "BatchPrefillWithCausalBidirectionalRangesWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_ranges_fingerprint
     ),
@@ -733,20 +766,30 @@ def fingerprint(op: str, **dims) -> str:
     step kernel that computes its rows from the open chunk's cached rows; the head count, the batch, the slot and the position are
     not dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
 
-    The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
-    functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
-    do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
-    ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
-    sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too. The two prefill wrappers also take ``custom_mask=True``: a
-    ``plan()`` with ``custom_mask`` / ``packed_custom_mask`` runs the explicit-key-set class (``attn-bf16-d<D>-mask-*``), in
-    which a token's visible keys are its own mask row (ANDed with the window) instead of its causal range. The mask is data of
-    that class, like the KV position of the causal one: one receipt covers every mask, and a mask row equal to a causal range
-    gives the causal class's bits.
-    ``BatchPrefillWithCausalBidirectionalRangesWrapper`` takes ``head_dim`` too and names the ranged class
-    (``attn-bf16-d<D>-br-*``): the same tiles, chunks, softmax step and merge over the causal keys united with the token's
+    The attention wrappers take ``head_dim`` and the mask mode ``causal``: the tile and chunk grid, the online-softmax step
+    and the chunk merge are functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout
+    and the configuration do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``,
+    ``BatchDecodeWithPagedKVCacheWrapper`` and ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint of a mode
+    (their outputs for one token are the same bits). ``causal=True`` names the causal class, ``causal=False`` the non-causal
+    class (prefill with ``causal=False``, decode with ``q_len_per_req > 1`` and ``is_causal=False``): every token sees its
+    request's whole key range, so the same token has a different term and a different fingerprint
+    (``attn-bf16-d<D>-nc-*``). For the two prefill wrappers ``causal`` is a fixed dimension, to be given as the value passed
+    to ``plan()``: their ``plan()`` defaults to ``causal=False``, the non-causal class, so a receipt without the mode would
+    name a class the default plan does not run, and an omitted or ``None`` ``causal`` raises. For the decode wrapper it is
+    optional: omitted or ``None`` is the causal class, as ``is_causal=None`` is in its ``plan()``, and a single-token decode
+    step is the causal class whatever ``is_causal`` says. The sliding window (``window_left``) is a per-call input of the
+    causal class, like the KV position: the receipt is the digest of the class's no-window sample row and covers windowed
+    calls too. The two prefill wrappers also take ``custom_mask=True``: a ``plan()`` with ``custom_mask`` /
+    ``packed_custom_mask`` runs the explicit-key-set class (``attn-bf16-d<D>-mask-*``), in which a token's visible keys are
+    its own mask row (ANDed with the window) instead of a range of its position or request. The mask replaces the
+    position-derived keys, so ``causal`` is neither required nor read with ``custom_mask=True`` (as ``plan()`` does not read it
+    with a mask). The mask is data of that class, like the KV position of the causal one: one receipt covers every mask; a mask
+    row equal to a causal range gives the causal class's bits and an all-ones mask the non-causal class's.
+    ``BatchPrefillWithCausalBidirectionalRangesWrapper`` takes ``head_dim`` alone (it has one mask mode) and names the ranged
+    class (``attn-bf16-d<D>-br-*``): the same tiles, chunks, softmax step and merge over the causal keys united with the token's
     bidirectional key range. The ranges and the two windows are per-call inputs like the KV position; a token without a
-    range has the causal class's term, so its bits are those of the three wrappers above.
+    range has the causal class's term, so its bits are those of the three wrappers above, and a token whose range is its
+    request's whole key range has the non-causal class's.
 
     >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, custom_mask=True)  # doctest: +SKIP
     'attn-bf16-d128-mask-...'
@@ -754,6 +797,12 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
     'gemm-bf16-kfold-bias-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, causal=True)  # doctest: +SKIP
+    'attn-bf16-d128-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, causal=False)  # doctest: +SKIP
+    'attn-bf16-d128-nc-...'
+    >>> fingerprint("BatchDecodeWithPagedKVCacheWrapper", head_dim=128)  # doctest: +SKIP
+    'attn-bf16-d128-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
     >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
@@ -784,9 +833,14 @@ def fingerprint(op: str, **dims) -> str:
         raise TypeError(
             f"fingerprint({op!r}) takes the fixed dimensions {list(info.dims)} and the optional {list(info.optional)}, not {unknown}"
         )
-    missing = [d for d in info.dims if d not in dims]
+    # a fixed dimension has no default: one passed as None is as missing as one left out
+    waived = {d for flag, d in info.waived if dims.get(flag)}
+    missing = [d for d in info.dims if dims.get(d) is None and d not in waived]
     if missing:
-        raise TypeError(f"fingerprint({op!r}) needs the fixed dimensions {missing}")
+        raise TypeError(
+            f"fingerprint({op!r}) needs the fixed dimensions {missing}"
+            + (f": {info.note}" if info.note else "")
+        )
     return info.fingerprint(**dims)
 
 

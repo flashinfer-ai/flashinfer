@@ -44,7 +44,7 @@ from .plan import (
     keys_are_data,
     ws_row,
 )
-from .spec import MASK_CAUSAL, check_mask_mode, chunk_len
+from .spec import MASK_CAUSAL, MASK_NON_CAUSAL, check_mask_mode, chunk_len
 
 VEC = 4
 THREADS = 128
@@ -209,15 +209,22 @@ def fold_row(
     C: cutlass.Constexpr,
     PF: cutlass.Constexpr,
     WS: cutlass.Constexpr,
-    by_partial: cutlass.Constexpr = False,
+    *,
+    mask_mode: cutlass.Constexpr = MASK_CAUSAL,
 ):
     """Row ``r`` of a split group, output columns ``[d0, d0 + VEC)``: the chunk-order fold of the row's present chunks from the
     init state (``fold_row_state``, the single implementation), then the epilogue to the output row. ``WS`` is the workspace row
-    pitch of the head dim (``plan.ws_row(D)``: 68 / 132 / 260 at D = 64 / 128 / 256). ``by_partial`` (always passed by
-    keyword): the present-chunk rule of the mask modes whose keys are data (``fold_row_state``); a row without a present chunk
-    stores ``+0`` (``spec.output_elem_or_zero``)."""
+    pitch of the head dim (``plan.ws_row(D)``: 68 / 132 / 260 at D = 64 / 128 / 256). ``mask_mode`` (keyword-only) selects the
+    present-chunk rule: a causal row's follow from its position and the window, a non-causal row's are those of the whole key
+    range ``[0, kv_len)`` (the fold of a row at the last position with no window), and under the modes whose keys are data
+    (``plan.keys_are_data``) the partials decide (``fold_row_state``'s ``by_partial``); a row without a present chunk stores ``+0``
+    (``spec.output_elem_or_zero``)."""
     token = q_tok0 + r // g
     pos = kv_len - q_len + token
+    if cutlass.const_expr(mask_mode == MASK_NON_CAUSAL):
+        pos = kv_len - 1
+        window_left = Int32(-1)
+    by_partial = keys_are_data(mask_mode)
     o = cute.make_rmem_tensor(cute.make_layout((VEC,)), Float32)
     m, l = fold_row_state(
         mWs,
@@ -475,8 +482,10 @@ class SplitKVFixup:
         self, D: int, g: int, pdl: bool = PDL, *, mask_mode: str = MASK_CAUSAL
     ):
         self.D, self.g, self.pdl = D, g, pdl
-        # the present-chunk rule of the mask modes whose keys are data (compile-time)
+        # the present-chunk rule (compile-time): by the partials under the mask modes whose keys are data, of the whole key range
+        # under the non-causal mode, of the row's position and window under the causal mode
         self.by_partial = keys_are_data(mask_mode)
+        self.non_causal = mask_mode == MASK_NON_CAUSAL
         self.C = chunk_len(D)
         self.WS = ws_row(D)
 
@@ -538,6 +547,9 @@ class SplitKVFixup:
         sA1 = sbuf[0, ri, None]
         sA2 = sbuf[1, ri, None]
         sL = sbuf[2, ri, None]
+        wl = window_left
+        if cutlass.const_expr(self.non_causal):
+            wl = Int32(-1)  # no window in the non-causal class
         for grp in cutlass.range(grp0, num_groups, grid_y):
             rows = mGroups[(grp, G_ROWS)]
             # every thread of the block reaches the fold's barriers: a row past the group's rows folds a clamped (valid) row and stores nothing
@@ -558,6 +570,9 @@ class SplitKVFixup:
             )
             token = q_tok0 + rr // g
             pos = kv_len - q_len + token
+            if cutlass.const_expr(self.non_causal):
+                # the non-causal class: every row's present chunks are the whole key range's (the last position, no window)
+                pos = kv_len - 1
             if cutlass.const_expr(self.pdl):
                 # the group table is a plan constant (host-written before the attention grid), so it is read while the blocks wait
                 # for the grid; every partial row of the attention grid is complete and visible before the first workspace read
@@ -575,7 +590,7 @@ class SplitKVFixup:
                 pos,
                 c,
                 nc,
-                window_left,
+                wl,
                 rr,
                 d0,
                 o,
