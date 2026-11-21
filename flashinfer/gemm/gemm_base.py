@@ -85,6 +85,8 @@ from .gemm_mm_fp4_cute_dsl import (
     precompile_mm_fp4_tactics,
 )
 from .gemm_mm_mxfp8_precompile import precompile_mm_mxfp8_tactics
+from . import _cudnn_plan_pool
+from ._cudnn_plan_build import Bf16OverrideGraphSpec, build_bf16_override_graph
 from .gemm_mm_mxfp8_cute_dsl import (
     _b12x_gemm_mxfp8_requirement,
     _b12x_gemm_mxfp8_runner,
@@ -4698,16 +4700,113 @@ _cudnn_override_all_plans: weakref.WeakValueDictionary[tuple, Any] = (
 )
 
 
-def _get_cudnn_override_graph(builder, tactic, **kwargs):
+# Single-plan graphs deserialized from plan-build workers
+# (FLASHINFER_CUDNN_PLAN_BUILD_WORKERS): override key -> {tactic: graph} in
+# candidate order; the value is None for a candidate the workers could not
+# build and _CUDNN_BUILD_IN_PROCESS for one they built but could not export. Whole keys are stored and evicted, bounded like the
+# builders' LRUs. ``_cudnn_single_plan_graphs`` maps id -> graph (a strong
+# reference, so an id cannot be reused while registered) and lets the plan
+# lookup recognise these graphs, which hold exactly their tactic's plan but
+# expose no engine/knob query by index. Mutated only under the GIL.
+_CUDNN_PREBUILT_MAX_KEYS = 2048
+_cudnn_override_prebuilt: "OrderedDict[tuple, dict]" = OrderedDict()
+# Registry value for a tactic whose plan built in a worker but could not be
+# exported: usable, so it is built in-process when requested.
+_CUDNN_BUILD_IN_PROCESS = object()
+_cudnn_single_plan_graphs: dict[int, Any] = {}
+
+
+def _cudnn_override_key(builder, kwargs) -> tuple:
+    return (builder, tuple(sorted(kwargs.items())))
+
+
+def _is_cudnn_single_plan_graph(graph) -> bool:
+    return _cudnn_single_plan_graphs.get(id(graph)) is graph
+
+
+def _cudnn_prebuilt_tactics(key):
+    # Every candidate, including those mapped to None (no worker-built plan).
+    graphs = _cudnn_override_prebuilt.get(key)
+    return None if graphs is None else list(graphs)
+
+
+def _discard_cudnn_prebuilt(key) -> None:
+    for graph in (_cudnn_override_prebuilt.pop(key, None) or {}).values():
+        if graph is not None and graph is not _CUDNN_BUILD_IN_PROCESS:
+            _cudnn_single_plan_graphs.pop(id(graph), None)
+
+
+def _store_cudnn_prebuilt(key, candidates, built, handle, build_here=()) -> list:
+    """Store worker-built plans for ``key``.
+
+    A candidate the workers could not build maps to None; one in
+    ``build_here`` (built but not exportable) maps to _CUDNN_BUILD_IN_PROCESS.
+    """
+    built_graphs = {}
+    for tactic, blob in built:
+        graph = cudnn.pygraph(handle=handle)
+        graph.deserialize(blob)
+        built_graphs[tactic] = graph
+    build_here = set(build_here)
+    graphs = {
+        tactic: (
+            _CUDNN_BUILD_IN_PROCESS
+            if tactic in build_here
+            else built_graphs.get(tactic)
+        )
+        for tactic in candidates
+    }
+    _discard_cudnn_prebuilt(key)
+    _cudnn_override_prebuilt[key] = graphs
+    _cudnn_single_plan_graphs.update((id(g), g) for g in built_graphs.values())
+    while len(_cudnn_override_prebuilt) > _CUDNN_PREBUILT_MAX_KEYS:
+        _discard_cudnn_prebuilt(next(iter(_cudnn_override_prebuilt)))
+    return list(graphs)
+
+
+def _pool_plan_tactics(pool, key, spec, device_index, heur_modes, handle):
+    """Tactics for ``key`` built by ``pool``, or ``None`` to build in-process.
+
+    Any failure, including one loading the workers' plans here, disables the
+    pool: tuning must never fail because of it.
+    """
+    try:
+        result = pool.build(spec, device_index, heur_modes)
+        if result is None:
+            return None
+        candidates, built, build_here = result
+        return _store_cudnn_prebuilt(key, candidates, built, handle, build_here)
+    except Exception as exc:  # noqa: BLE001 - fall back to the in-process build
+        _discard_cudnn_prebuilt(key)
+        pool.disable(f"{type(exc).__name__}: {exc}")
+        return None
+
+
+def _get_cudnn_override_graph(builder, tactic, *, use_worker_plan=True, **kwargs):
     """Reuse an existing search graph, or build only a persisted winner.
 
     The builder's LRU owns the graph lifetime. Weak references let profiling
     and immediate CUDA Graph capture reuse its all-plans graph without retaining
     graphs after eviction. A fresh process with a saved tactic builds just that
-    engine and knob combination.
+    engine and knob combination. ``use_worker_plan=False`` skips plans built by
+    the plan-build workers for this call.
     """
-    key = (builder, tuple(sorted(kwargs.items())))
+    key = _cudnn_override_key(builder, kwargs)
     if _is_cudnn_engine_knob_tactic(tactic):
+        prebuilt = _cudnn_override_prebuilt.get(key) if use_worker_plan else None
+        if prebuilt is not None and tactic in prebuilt:
+            _cudnn_override_prebuilt.move_to_end(key)
+            graph = prebuilt[tactic]
+            if graph is not None and graph is not _CUDNN_BUILD_IN_PROCESS:
+                return graph
+            # The workers could not build this candidate. In-process it would
+            # fail at profiling too, so report it as unsupported there rather
+            # than paying for another build attempt.
+            if graph is None and is_in_profile_measurement():
+                raise RuntimeError(
+                    "cuDNN plan for this engine/knob tactic could not be built "
+                    "by the plan-build workers; reporting as unsupported."
+                )
         graph = _cudnn_override_all_plans.get(key)
         if graph is not None:
             return graph
@@ -4725,6 +4824,9 @@ def _cudnn_knob_items_to_dict(knob_items) -> dict:
 
 
 def _get_cudnn_plan_index_for_tactic(graph, tactic) -> int:
+    if _is_cudnn_single_plan_graph(graph):
+        # Built for exactly this tactic; execute() runs its only plan.
+        return -1
     if _is_cudnn_engine_knob_tactic(tactic):
         target_engine_id, target_knob_items = tactic
         target_tactic = (
@@ -4912,6 +5014,8 @@ def clear_cudnn_graph_cache() -> None:
     )
 
     _cudnn_override_all_plans.clear()
+    _cudnn_override_prebuilt.clear()
+    _cudnn_single_plan_graphs.clear()
     cached_builders = (
         build_cudnn_bf16_fp4_graph,
         build_cudnn_bf16_fp4_graph_override_shape,
@@ -6240,6 +6344,48 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=
 # ---------------------------------------------------------------------------
 
 
+def _bf16_override_graph_spec(
+    batch, n, k, o_type, bias_is_not_none, cache_m, is_a_k_major, is_b_k_major
+) -> Bf16OverrideGraphSpec:
+    return Bf16OverrideGraphSpec(
+        batch=batch,
+        n=n,
+        k=k,
+        o_type=int(o_type),
+        bias=bool(bias_is_not_none),
+        cache_m=cache_m,
+        is_a_k_major=is_a_k_major,
+        is_b_k_major=is_b_k_major,
+        uid_a=UIDs.A_UID.value,
+        uid_b=UIDs.B_UID.value,
+        uid_bias=UIDs.BIAS_UID.value,
+        uid_o=UIDs.O_UID.value,
+    )
+
+
+def _bf16_worker_plan_geometry_ok(
+    a, b, bias, out, *, m, n, k, is_a_k_major, is_b_k_major
+) -> bool:
+    """Whether a worker-built plan may run this call.
+
+    A plan built by the plan-build workers and restored with ``deserialize()``
+    can write past an output smaller than the one it was built for: on GB300
+    (cuDNN 9.24) an M=37 call on an M=64 plan returned the right rows but
+    overwrote 27 rows beyond them (#9809). Run such plans only for dense,
+    bias-free 2-D calls whose shapes and strides equal the built geometry;
+    everything else uses the in-process plan.
+    """
+    return (
+        bias is None
+        and tuple(a.shape) == (m, k)
+        and tuple(b.shape) == (k, n)
+        and tuple(out.shape) == (m, n)
+        and a.stride() == ((k, 1) if is_a_k_major else (1, m))
+        and b.stride() == ((1, k) if is_b_k_major else (n, 1))
+        and out.stride() == (n, 1)
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def build_cudnn_gemm_bf16_graph_override_shape(
     batch,
@@ -6268,63 +6414,13 @@ def build_cudnn_gemm_bf16_graph_override_shape(
     """
     _check_cudnn_override_shape_availability()
 
-    a_shape = (batch, cache_m, k)
-    a_stride = (cache_m * k, k, 1) if is_a_k_major else (cache_m * k, 1, cache_m)
-    b_shape = (batch, k, n)
-    b_stride = (k * n, 1, k) if is_b_k_major else (k * n, n, 1)
-    bias_shape = (1, 1, n)
-    bias_stride = (n, n, 1)
-
     stream = torch.cuda.current_stream(device)
-    graph = cudnn.pygraph(
-        io_data_type=cudnn.data_type.BFLOAT16,
-        intermediate_data_type=cudnn.data_type.FLOAT,
-        compute_data_type=cudnn.data_type.FLOAT,
-        handle=_get_cudnn_handle(device, stream),
-        is_override_shape_enabled=True,
+    graph = build_bf16_override_graph(
+        _bf16_override_graph_spec(
+            batch, n, k, o_type, bias_is_not_none, cache_m, is_a_k_major, is_b_k_major
+        ),
+        _get_cudnn_handle(device, stream),
     )
-
-    a_cudnn_tensor = graph.tensor(
-        name="a",
-        dim=list(a_shape),
-        stride=list(a_stride),
-        data_type=cudnn.data_type.BFLOAT16,
-    )
-    b_cudnn_tensor = graph.tensor(
-        name="b",
-        dim=list(b_shape),
-        stride=list(b_stride),
-        data_type=cudnn.data_type.BFLOAT16,
-    )
-    c_cudnn_tensor = graph.matmul(
-        name="matmul",
-        A=a_cudnn_tensor,
-        B=b_cudnn_tensor,
-        compute_data_type=cudnn.data_type.FLOAT,
-    )
-    c_cudnn_tensor.set_data_type(cudnn.data_type.FLOAT)
-
-    if bias_is_not_none:
-        bias_cudnn_tensor = graph.tensor(
-            name="bias",
-            dim=bias_shape,
-            stride=bias_stride,
-            data_type=cudnn.data_type.BFLOAT16,
-        )
-        c_final_cudnn_tensor = graph.add(
-            name="bias_add",
-            a=c_cudnn_tensor,
-            b=bias_cudnn_tensor,
-        )
-        bias_cudnn_tensor.set_uid(UIDs.BIAS_UID.value)
-    else:
-        c_final_cudnn_tensor = c_cudnn_tensor
-
-    c_final_cudnn_tensor.set_name("c_final").set_output(True).set_data_type(o_type)
-
-    a_cudnn_tensor.set_uid(UIDs.A_UID.value)
-    b_cudnn_tensor.set_uid(UIDs.B_UID.value)
-    c_final_cudnn_tensor.set_uid(UIDs.O_UID.value)
 
     _finalize_cudnn_graph_for_tactic(
         graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
@@ -6505,6 +6601,28 @@ def _cudnn_gemm_bf16_runner(
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def _get_override_graph(self, a, b, bias, out, tactic=-1):
+            kwargs = self._override_graph_kwargs(a, b, bias, out)
+            use_worker_plan = True
+            if _cudnn_override_prebuilt and _is_cudnn_engine_knob_tactic(tactic):
+                use_worker_plan = _bf16_worker_plan_geometry_ok(
+                    a,
+                    b,
+                    bias,
+                    out,
+                    m=kwargs["cache_m"],
+                    n=kwargs["n"],
+                    k=kwargs["k"],
+                    is_a_k_major=self._is_a_k_major,
+                    is_b_k_major=self._is_b_k_major,
+                )
+            return _get_cudnn_override_graph(
+                build_cudnn_gemm_bf16_graph_override_shape,
+                tactic,
+                use_worker_plan=use_worker_plan,
+                **kwargs,
+            )
+
+        def _override_graph_kwargs(self, a, b, bias, out) -> dict:
             a_shape, _ = _get_bf16_3d_shape_stride(a)
             b_shape, _ = _get_bf16_3d_shape_stride(b)
 
@@ -6526,9 +6644,7 @@ def _cudnn_gemm_bf16_runner(
             # call, breaking tactic-index alignment.
             cache_m = _effective_cache_m(self._tuning_config, actual_m)
 
-            graph = _get_cudnn_override_graph(
-                build_cudnn_gemm_bf16_graph_override_shape,
-                tactic,
+            return dict(
                 batch=batch,
                 n=n,
                 k=k,
@@ -6539,7 +6655,52 @@ def _cudnn_gemm_bf16_runner(
                 is_a_k_major=self._is_a_k_major,
                 is_b_k_major=self._is_b_k_major,
             )
-            return graph
+
+        def _pool_built_tactics(self, a, b, bias, out):
+            """Tactics whose plans worker processes built, or ``None`` to build here."""
+            pool = _cudnn_plan_pool.get_cudnn_plan_build_pool()
+            if pool is None or torch.cuda.is_current_stream_capturing():
+                return None
+            kwargs = self._override_graph_kwargs(a, b, bias, out)
+            # Worker plans run only at their built geometry. When this call's
+            # layout could never pass that check (bias, batched, or a layout
+            # the profiler does not reproduce), the workers' plans would go
+            # unused and each candidate would be built here one by one.
+            if not _bf16_worker_plan_geometry_ok(
+                a,
+                b,
+                bias,
+                out,
+                m=a.shape[-2],
+                n=kwargs["n"],
+                k=kwargs["k"],
+                is_a_k_major=self._is_a_k_major,
+                is_b_k_major=self._is_b_k_major,
+            ):
+                return None
+            key = _cudnn_override_key(
+                build_cudnn_gemm_bf16_graph_override_shape, kwargs
+            )
+            cached = _cudnn_prebuilt_tactics(key)
+            if cached is not None:
+                return cached
+            return _pool_plan_tactics(
+                pool,
+                key,
+                _bf16_override_graph_spec(
+                    kwargs["batch"],
+                    kwargs["n"],
+                    kwargs["k"],
+                    kwargs["o_type"],
+                    kwargs["bias_is_not_none"],
+                    kwargs["cache_m"],
+                    kwargs["is_a_k_major"],
+                    kwargs["is_b_k_major"],
+                ),
+                a.device.index,
+                [int(cudnn.heur_mode.A), int(cudnn.heur_mode.FALLBACK)],
+                _get_cudnn_handle(a.device, torch.cuda.current_stream(a.device)),
+            )
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             # inputs layout: a, b, bias, pdl, out, workspace_buffer
@@ -6560,6 +6721,9 @@ def _cudnn_gemm_bf16_runner(
             a, b, bias, _, out, _ = inputs
 
             if self._use_override_shape:
+                tactics = self._pool_built_tactics(a, b, bias, out)
+                if tactics is not None:
+                    return tactics
                 graph = self._get_override_graph(a, b, bias, out, tactic=0)
             else:
                 a_shape, a_stride = _get_bf16_3d_shape_stride(a)
