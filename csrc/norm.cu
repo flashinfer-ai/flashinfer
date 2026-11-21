@@ -26,6 +26,9 @@ void rmsnorm(TensorView output, TensorView input, TensorView weight, double eps,
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_DEVICE(input, weight);
+  // Operands cast to the compute type dispatched on input must share input.dtype().
+  CHECK_SAME_DTYPE(weight, input);
+  CHECK_SAME_DTYPE(output, input);
   CHECK_DIM(1, weight);  // weight: (hidden_size)
 
   auto input_ndim = input.ndim();
@@ -86,6 +89,9 @@ void rmsnorm_quant(TensorView output, TensorView input, TensorView weight, Tenso
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_DEVICE(input, weight);
   CHECK_DEVICE(input, scale);
+  // weight is cast to the compute type; scale is read as fp32. output selects the fp8 kernel.
+  CHECK_SAME_DTYPE(weight, input);
+  CHECK_INPUT_TYPE(scale, dl_float32);
   CHECK_DIM(1, weight);  // weight: (hidden_size)
   TVM_FFI_ICHECK_EQ(scale.numel(), 1);
 
@@ -125,6 +131,8 @@ void fused_add_rmsnorm(TensorView input, TensorView residual, TensorView weight,
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_DEVICE(input, residual);
   CHECK_DEVICE(input, weight);
+  CHECK_SAME_DTYPE(residual, input);
+  CHECK_SAME_DTYPE(weight, input);
   CHECK_DIM(2, input);     // input: (batch_size, hidden_size)
   CHECK_DIM(2, residual);  // residual: (batch_size, hidden_size)
   CHECK_DIM(1, weight);    // weight: (hidden_size)
@@ -158,6 +166,11 @@ void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView res
   CHECK_DEVICE(input, weight);
   CHECK_DEVICE(input, output);
   CHECK_DEVICE(input, scale);
+  // residual/weight are cast to the compute type; scale is read as fp32. output selects the fp8
+  // kernel.
+  CHECK_SAME_DTYPE(residual, input);
+  CHECK_SAME_DTYPE(weight, input);
+  CHECK_INPUT_TYPE(scale, dl_float32);
   CHECK_DIM(2, input);     // input: (batch_size, hidden_size)
   CHECK_DIM(2, residual);  // residual: (batch_size, hidden_size)
   CHECK_DIM(1, weight);    // weight: (hidden_size)
@@ -259,6 +272,8 @@ void gemma_rmsnorm(TensorView output, TensorView input, TensorView weight, doubl
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_DEVICE(input, weight);
+  CHECK_SAME_DTYPE(weight, input);
+  CHECK_SAME_DTYPE(output, input);
   CHECK_DIM(2, input);   // input: (batch_size, hidden_size)
   CHECK_DIM(1, weight);  // weight: (hidden_size)
   TVM_FFI_ICHECK_EQ(input.size(1), weight.size(0));
@@ -287,6 +302,8 @@ void gemma_fused_add_rmsnorm(TensorView input, TensorView residual, TensorView w
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_DEVICE(input, residual);
   CHECK_DEVICE(input, weight);
+  CHECK_SAME_DTYPE(residual, input);
+  CHECK_SAME_DTYPE(weight, input);
   CHECK_DIM(2, input);     // input: (batch_size, hidden_size)
   CHECK_DIM(2, residual);  // residual: (batch_size, hidden_size)
   CHECK_DIM(1, weight);    // weight: (hidden_size)
@@ -315,6 +332,8 @@ void layernorm(Tensor output, Tensor input, Tensor gamma, Tensor beta, double ep
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(beta);
   CHECK_DEVICE(input, gamma);
   CHECK_DEVICE(input, beta);
+  // gamma/beta are fp32 by contract (checked below); output is written at input's compute type.
+  CHECK_SAME_DTYPE(output, input);
   CHECK_DIM(2, input);  // input: (batch_size, hidden_size)
   CHECK_DIM(1, gamma);  // gamma: (hidden_size)
   CHECK_DIM(1, beta);   // beta: (hidden_size)
