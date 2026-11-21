@@ -512,6 +512,42 @@ def test_planner_gives_the_non_causal_mode_the_request_key_range():
             )
 
 
+def test_workspace_size_follows_the_mapped_mode():
+    """The sizing call maps its arguments onto the mode as ``plan()`` does: a masked plan is sized as the explicit-key-set
+    class whatever ``causal`` says (every request's whole key range, like the non-causal class), an unmasked one as the causal
+    or the non-causal class, and the ranges wrapper's as the ranged class whatever ``causal`` says (the upper bound over its
+    ranges: every token's whole request)."""
+    from flashinfer.attention.batch_invariant.spec import chunk_len
+
+    L = 2 * chunk_len(128)
+    i32 = _base._i32
+    request = (i32([0, L]), i32([0, L // 16]), i32([16]), 2, 2, 128, 16)
+    paged = _base._host_delegate("prefill")
+    causal = paged.workspace_bytes(*request, causal=True)
+    non_causal = paged.workspace_bytes(*request, causal=False)
+    assert 0 < causal < non_causal
+    for flag in (True, False):
+        assert paged.workspace_bytes(*request, causal=flag, masked=True) == non_causal
+    # a masked plan may hold more query tokens than keys and takes a window; an unmasked non-causal one takes no window
+    assert paged.workspace_bytes(*request, 5, causal=False, masked=True) >= 0
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        paged.workspace_bytes(*request, 5, causal=False)
+    more = (i32([0, 40]), i32([0, 1]), i32([9]), 2, 2, 128, 16)
+    assert paged.workspace_bytes(*more, causal=True, masked=True) == 0
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        paged.workspace_bytes(*more, causal=True)
+    ranged = _base._host_delegate("ranges")
+    assert (
+        ranged.workspace_bytes(*request, causal=False)
+        == ranged.workspace_bytes(*request, causal=True)
+        == non_causal
+    )
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # the ranged rows are bottom-right aligned
+        ranged.workspace_bytes(*more, causal=False)
+
+
 def test_engine_takes_one_mask_mode_per_plan():
     from flashinfer.attention.batch_invariant import engine
 
@@ -1174,15 +1210,13 @@ def test_wrappers_map_causal_onto_the_mask_mode():
     sized = {
         name: w.workspace_size(*paged, **plan_kw)[0]
         for name, plan_kw in (
-            ("causal", dict(causal=True)),
             ("non_causal", dict(causal=False)),
             ("mask", dict(causal=False, custom_mask=flat)),
             ("mask_causal", dict(causal=True, custom_mask=flat)),
         )
     }
-    # an all-ones key-set plan and the non-causal plan span the same chunks; the causal plan of the same batch spans fewer
-    assert sized["mask"] == sized["mask_causal"] == sized["non_causal"] > 0
-    assert sized["causal"] != sized["non_causal"]
+    # a key-set plan spans every request's whole key range, as the non-causal plan does, whatever ``causal`` says
+    assert sized["mask"] == sized["mask_causal"] == sized["non_causal"]
     # the ranges wrapper: tokens without a range keep the causal class's bits (not the non-causal class's)
     wr = make_wrapper(pr)
     none = torch.full((sum(pr.q_lens), 2), -1, dtype=torch.int32, device=pr.device)
