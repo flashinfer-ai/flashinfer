@@ -170,7 +170,7 @@ def skip_unless_ep_launch() -> tuple[int, int]:
     if torch.cuda.device_count() < local_world_size:
         pytest.skip(f"needs {local_world_size} visible GPUs, one per local rank")
     if not cake_sm120_megamoe_available():
-        pytest.skip("needs NCCL 2.30.7 with the Device API (set NCCL_HOME)")
+        pytest.skip("needs NCCL 2.30.7 or newer with the Device API and its headers")
     return rank, world_size
 
 

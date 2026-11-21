@@ -3,8 +3,8 @@
 The kernel package behind the moe_ep backend `sm120_mxfp4_mxfp8_bf16_cake`
 (`flashinfer/moe_ep/backends/mega/kernel/sm120/mxfp4_mxfp8_bf16_cake/`).  This directory holds the
 **generated, checksum-attested** device sources of the Cake persistent MegaMoE kernel for
-consumer Blackwell (`sm_120a`, CC 12.0) plus two hand-written files (the host binding and the
-cubin carrier); `flashinfer/moe_ep/shims/sm120/cake_mxfp4/cake_jit.py` is the JIT loader.  Humans do not edit the generated device
+consumer Blackwell (`sm_120a`, CC 12.0) plus three hand-written files (the host binding, the
+cubin carrier and the NCCL checks); `flashinfer/moe_ep/shims/sm120/cake_mxfp4/cake_jit.py` is the JIT loader.  Humans do not edit the generated device
 files (formatting them breaks the manifest digests — see the `clang-format` exclusion note
 below).
 
@@ -40,6 +40,7 @@ GEMM schedule as the copier-free ones (two-fragment B lookahead; K-step unroll a
 | `cake_sm120_megamoe_geometry.json` | generated | host geometry: every switch, constant, buffer extent, guard and the kernel ABI as integer expressions of the parameters |
 | `cake_sm120_megamoe_manifest.json` | generated | SHA-256 seal of all of the above (schema below) |
 | `cake_sm120_megamoe_cubins.cu` | hand-written | carrier of the two embedded cubins of one device module (`cubin_image(task_m)`); not part of the generated closure |
+| `cake_sm120_megamoe_nccl_check.cuh` | hand-written | NCCL Device API checks force-included (`nvcc -include`) ahead of every device instance, and of the nosync MegaMoE's GIN builds: NCCL 2.30.7 or newer, exactly one GIN backend in device code; not part of the generated closure |
 
 ### Parameters
 
@@ -104,28 +105,35 @@ first, as a `MoEEpConfigError` in `validate_init`).
 Both kinds of modules are ordinary FlashInfer `JitSpec`s (`flashinfer/moe_ep/shims/sm120/cake_mxfp4/cake_jit.py`), cached in the JIT
 directory and packaged ahead of time by `flashinfer/aot.py`:
 
-* `cake_sm120_megamoe_binding_<digest>`: the host binding, one per source revision.
+* `cake_sm120_megamoe_binding_<digest>`: the host binding, one per source revision and NCCL (version
+  and a digest of its Device API headers, not their location, so a package built elsewhere is found
+  wherever the same NCCL is installed), so a shared JIT cache rebuilds it when the process loads
+  another NCCL.
 * `cake_sm120_megamoe_{copier,nocopier}_{proxy,gdaki,gpi}_<digest>`: the device instances of one
   parameter set, transport flavor and NCCL GIN backend.  Its `embedded_cubin_factory` compiles the
   flavor's M128 and M64 wrappers (`nvcc -cubin --generate-code=arch=compute_120a,code=sm_120a
   -std=c++17 -O3`, about 10 s each, in parallel) and the build embeds both cubins into the carrier;
-  the digest covers the sealed sources, the wrappers, the `-D` parameters, the flags and the NCCL
-  version.  A workspace builds or loads only the module of the flavor its transport table needs and
+  the digest covers the sealed sources, the wrappers, the `-D` parameters, the flags, the NCCL
+  checks and the NCCL (version and header digest).  A workspace builds or loads only the module of the flavor its transport table needs and
   of its communicator's GIN backend (`ncclGinType_t` of the transport session; proxy when the
   communicator has no GIN, where no GIN call executes).
 
-**GIN backend builds.** The NCCL Device API inlines every enabled GIN backend (proxy, GDAKI, GPI)
-into each GIN call behind a runtime switch on the context's backend.  The device modules compile
-only the session's backend (`NCCL_GIN_{PROXY,GDAKI,GPI}_ENABLE`; `GIN_BACKENDS` in
-`flashinfer/moe_ep/shims/sm120/cake_mxfp4/cake_jit.py`), which lowers the persistent kernel's register use by 10-20 registers and
-removes the 8-byte stack frame of the GPI fence.  `validate_init` runs before the transport
+**GIN backend builds.** The NCCL Device API inlines every enabled GIN backend (proxy, GDAKI, GPI,
+and from NCCL 2.32 EFA GDA) into each GIN call behind a runtime switch on the context's backend.
+The device modules compile only the session's backend (`NCCL_GIN_{PROXY,GDAKI,GPI,EFA_GDA}_ENABLE`;
+`GIN_BACKENDS` in `flashinfer/moe_ep/shims/sm120/cake_mxfp4/cake_jit.py`), which lowers the persistent kernel's register use by 10-20
+registers and removes the 8-byte stack frame of the GPI fence; left enabled, NCCL 2.32's EFA GDA
+backend alone gives the kernel a 128-byte stack frame, which the spill check refuses.
+`cake_sm120_megamoe_nccl_check.cuh` asserts at compile time that exactly one backend remains, so a
+backend a newer NCCL adds fails the build with a message naming `GIN_BACKENDS` instead.  `validate_init` runs before the transport
 session exists, so it compile-checks the candidate instances of all three backends (in parallel,
 cached); the workspace loads the one it needs.
 
 `flashinfer/aot.py` registers the binding and the DeepSeek-V4-Flash routed-expert defaults
 (`AOT_DEVICE_PARAMETERS`: E256 / H4096 / I2048 / top-k 6, in-kernel FP8 shared expert,
 `swiglu_limit=10`, 4096 tokens per rank, all-GIN table, EP 4 and EP 8, each GIN backend) when the target list has
-SM120 and NCCL 2.30.7 (headers + library) is found at build time.  Any other parameter set compiles
+SM120 and an NCCL of 2.30.7 or newer with matching headers is found at build time (a runtime with
+another NCCL compiles its own modules).  Any other parameter set compiles
 on first use; with `FLASHINFER_DISABLE_JIT=1` an unpackaged one raises `MissingJITCacheError`.  The
 `MOE_MAX_ROWS` capacity is a compile-time parameter, so a packaged module is used only by a
 deployment with the same `max_tokens_per_rank` (rounded up to 128).
@@ -202,12 +210,17 @@ division and remainder); nothing is `eval`-ed.
 
 ## Runtime requirements
 
-* NCCL **2.30.7** with the Device API on the EP communicator
+* NCCL **2.30.7 or newer** with the Device API on the EP communicator
   (`ncclCommQueryProperties(...).deviceApiSupport`); GIN is optional (an all-LSA table needs
-  none).  The binding fails closed on any other NCCL version: the device code inlines the
-  Device API of the headers it is compiled against, and only 2.30.7 is validated.  Headers and
-  library are found as `flashinfer/jit/comm.py` finds NCCL: `NCCL_HOME`, then the
-  `nvidia-nccl-cu13==2.30.7` wheel.
+  none).  Validated on 2.30.7 and 2.32.3.  The device code inlines the Device API of the headers it
+  is compiled against and reads the `ncclDevComm` the library fills in, so it is compiled against
+  the headers of exactly the `libnccl.so.2` the process uses (`nccl_installation`): the library
+  is the one that defines `ncclGetVersion` (`dladdr`; torch's, or an `LD_PRELOAD` one), and its
+  headers are looked up next to it (`<lib>/../include`, the `nvidia-nccl-cu13` wheel layout), then
+  under `NCCL_HOME` and every portion of the `nvidia-nccl-cu13` wheel's namespace package, skipping
+  headers of another version.  The
+  binding also refuses a library other than the headers it was built against.  Without matching
+  headers the backend reports which `nvidia-nccl-cu13` version to install.
 * CUDA 13 toolkit (`cuTensorMapEncodeTiled` via the driver entry point; `cuLaunchCooperativeKernel`;
   `-lcuda`).  The device build uses the compiler and headers of one release, found through
   `CUDA_HOME`.  All multi-GPU tests run with **13.0.88**.  The register grid above compiles

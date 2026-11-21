@@ -862,16 +862,18 @@ def test_gin_backend_builds(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     assert [gin_backend_name(t) for t in (2, 3, 4)] == ["proxy", "gdaki", "gpi"]
     with pytest.raises(RuntimeError, match="no device build for NCCL GIN type 5"):
         gin_backend_name(5)
-    # Each backend build compiles the other two out and is its own JIT module.
+    # Each backend build compiles every other backend out (the other two, and EFA GDA, which NCCL 2.32 adds) and is
+    # its own JIT module.
     for name, (_, defines) in GIN_BACKENDS.items():
-        assert len(defines) == 2 and all(name.upper() not in d for d in defines)
+        assert len(defines) == 3 and all(name.upper() not in d for d in defines)
+        assert "-DNCCL_GIN_EFA_GDA_ENABLE=0" in defines
     names = {
         gen_cake_sm120_megamoe_kernel_module(AOT_DEVICE_PARAMETERS[0], False, b).name
         for b in GIN_BACKENDS
     }
     assert len(names) == len(GIN_BACKENDS)
     # AOT packages every backend's build of the default parameter sets.  The binding spec
-    # records the NCCL 2.30.7 include and library paths; without the wheel (CI's CUDA 12.9
+    # records the NCCL include and library paths; without the wheel (CI's CUDA 12.9
     # image carries NCCL 2.29.7) stand-ins serve, as the spec is generated here, not built.
     try:
         cake_jit.nccl_installation()
@@ -1188,3 +1190,84 @@ def test_tuner_candidate_tables_are_feasible_and_distinct() -> None:
     assert [name for name, _ in candidate_tables(4, full, False)] == [
         "lsa_where_reachable"
     ]
+
+
+def _fake_nccl_include(root, version: int, device_body: str = "// device api\n"):
+    include = root / "include"
+    (include / "nccl_device").mkdir(parents=True)
+    (include / "nccl.h").write_text(f"#define NCCL_VERSION_CODE {version}\n")
+    (include / "nccl_device.h").write_text('#include "nccl_device/core.h"\n')
+    (include / "nccl_device" / "core.h").write_text(device_body)
+    return include
+
+
+def test_nccl_identity_is_independent_of_the_install_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    # AOT modules are looked up by name: the same NCCL headers installed elsewhere must give the same module names,
+    # and another NCCL (version or header content) must not.
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import cake_jit
+
+    library = tmp_path / "lib" / "libnccl.so.2"
+    includes = {
+        "a": _fake_nccl_include(tmp_path / "a", 23203),
+        "b": _fake_nccl_include(tmp_path / "b", 23203),
+        "other_version": _fake_nccl_include(tmp_path / "c", 23007),
+        "other_headers": _fake_nccl_include(tmp_path / "d", 23203, "// changed\n"),
+    }
+
+    def names(include) -> tuple[str | None, str, str]:
+        monkeypatch.setattr(cake_jit, "nccl_installation", lambda: (include, library))
+        cake_jit.gen_cake_sm120_megamoe_module.cache_clear()
+        cake_jit.gen_cake_sm120_megamoe_kernel_module.cache_clear()
+        return (
+            cake_jit.nccl_identity(),
+            cake_jit.gen_cake_sm120_megamoe_module().name,
+            cake_jit.gen_cake_sm120_megamoe_kernel_module(
+                cake_jit.AOT_DEVICE_PARAMETERS[0], False, "gdaki"
+            ).name,
+        )
+
+    try:
+        same = names(includes["a"])
+        assert names(includes["b"]) == same
+        for other in ("other_version", "other_headers"):
+            assert all(
+                x != y for x, y in zip(names(includes[other]), same, strict=True)
+            )
+    finally:
+        cake_jit.gen_cake_sm120_megamoe_module.cache_clear()
+        cake_jit.gen_cake_sm120_megamoe_kernel_module.cache_clear()
+
+
+def test_nccl_installation_searches_every_header_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    # The loaded library has no headers next to it and NCCL_HOME holds another version: the matching headers of the
+    # nvidia-nccl wheel are still found, in any portion of its namespace package (the first can lack headers).
+    import sys
+    import types
+
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import cake_jit
+
+    library = tmp_path / "preloaded" / "lib" / "libnccl.so.2"
+    monkeypatch.setattr(cake_jit, "loaded_nccl_library", lambda: (library, 23203))
+    _fake_nccl_include(tmp_path / "nccl_home", 23007)
+    monkeypatch.setenv("NCCL_HOME", str(tmp_path / "nccl_home"))
+    (tmp_path / "user_site" / "nvidia" / "nccl").mkdir(parents=True)
+    wheel = tmp_path / "site" / "nvidia" / "nccl"
+    expected = _fake_nccl_include(wheel, 23203)
+    package = types.ModuleType("nvidia.nccl")
+    package.__path__ = [str(tmp_path / "user_site" / "nvidia" / "nccl"), str(wheel)]
+    monkeypatch.setitem(sys.modules, "nvidia.nccl", package)
+    monkeypatch.setitem(sys.modules, "nvidia", types.ModuleType("nvidia"))
+    sys.modules["nvidia"].nccl = package
+
+    assert cake_jit.nccl_installation() == (expected.resolve(), library)
+
+    # Without matching headers anywhere, the error names what was found and the version to install.
+    (expected / "nccl.h").write_text("#define NCCL_VERSION_CODE 23100\n")
+    with pytest.raises(
+        RuntimeError, match=r"2\.30\.7.*2\.31\.0.*nvidia-nccl-cu13==2\.32\.3"
+    ):
+        cake_jit.nccl_installation()
