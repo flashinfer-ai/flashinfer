@@ -517,9 +517,12 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
     for (uint32_t j = 0; j < 2; ++j) {
       m[j] = max(smem_storage->m_wg[0][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4],
                  smem_storage->m_wg[1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4]);
-      // Per-row clamp for fully masked rows (see update_mdo_states in prefill.cuh).
-      const float m_scaled = max(m[j] * sm_scale, -cuda::std::numeric_limits<float>::max());
-      float o_scale = math::ptx_exp2(m_prev[j] * sm_scale - m_scaled);
+      // Per-row clamp for fully masked rows (see update_mdo_states in prefill.cuh):
+      // the shifted maximum keeps every exponent at -inf, so p is 0, not NaN.
+      const float m_shift = max(m[j], -cuda::std::numeric_limits<float>::max());
+      // Subtract before scaling so an unchanged maximum preserves the old state
+      // exactly; an empty previous state has no mass and must not form -inf - -inf.
+      float o_scale = m_prev[j] == -math::inf ? 0.f : math::ptx_exp2((m_prev[j] - m[j]) * sm_scale);
       d[j] *= o_scale;
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 2; ++mma_d) {
@@ -530,10 +533,16 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
       }
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV / 2; ++mma_kv) {
-        s_frag[mma_kv][j * 2 + 0] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 0] * sm_scale - m_scaled);
-        s_frag[mma_kv][j * 2 + 1] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 1] * sm_scale - m_scaled);
-        s_frag[mma_kv][j * 2 + 4] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 4] * sm_scale - m_scaled);
-        s_frag[mma_kv][j * 2 + 5] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 5] * sm_scale - m_scaled);
+        // The selected element must exponentiate to exactly 1; exp2(rounding error
+        // of m * sm_scale) overflows the fp16 P once the logits are large.
+        s_frag[mma_kv][j * 2 + 0] =
+            math::ptx_exp2((s_frag[mma_kv][j * 2 + 0] - m_shift) * sm_scale);
+        s_frag[mma_kv][j * 2 + 1] =
+            math::ptx_exp2((s_frag[mma_kv][j * 2 + 1] - m_shift) * sm_scale);
+        s_frag[mma_kv][j * 2 + 4] =
+            math::ptx_exp2((s_frag[mma_kv][j * 2 + 4] - m_shift) * sm_scale);
+        s_frag[mma_kv][j * 2 + 5] =
+            math::ptx_exp2((s_frag[mma_kv][j * 2 + 5] - m_shift) * sm_scale);
       }
     }
   } else {
@@ -552,9 +561,12 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
 
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
-      // Per-row clamp for fully masked rows (see update_mdo_states in prefill.cuh).
-      const float m_scaled = max(m[j] * sm_scale, -cuda::std::numeric_limits<float>::max());
-      float o_scale = math::ptx_exp2(m_prev[j] * sm_scale - m_scaled);
+      // Per-row clamp for fully masked rows (see update_mdo_states in prefill.cuh):
+      // the shifted maximum keeps every exponent at -inf, so p is 0, not NaN.
+      const float m_shift = max(m[j], -cuda::std::numeric_limits<float>::max());
+      // Subtract before scaling so an unchanged maximum preserves the old state
+      // exactly; an empty previous state has no mass and must not form -inf - -inf.
+      float o_scale = m_prev[j] == -math::inf ? 0.f : math::ptx_exp2((m_prev[j] - m[j]) * sm_scale);
       d[j] *= o_scale;
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 2; ++mma_d) {
@@ -565,10 +577,16 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
       }
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-        s_frag[mma_kv][j * 2 + 0] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 0] * sm_scale - m_scaled);
-        s_frag[mma_kv][j * 2 + 1] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 1] * sm_scale - m_scaled);
-        s_frag[mma_kv][j * 2 + 4] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 4] * sm_scale - m_scaled);
-        s_frag[mma_kv][j * 2 + 5] = math::ptx_exp2(s_frag[mma_kv][j * 2 + 5] * sm_scale - m_scaled);
+        // The selected element must exponentiate to exactly 1; exp2(rounding error
+        // of m * sm_scale) overflows the fp16 P once the logits are large.
+        s_frag[mma_kv][j * 2 + 0] =
+            math::ptx_exp2((s_frag[mma_kv][j * 2 + 0] - m_shift) * sm_scale);
+        s_frag[mma_kv][j * 2 + 1] =
+            math::ptx_exp2((s_frag[mma_kv][j * 2 + 1] - m_shift) * sm_scale);
+        s_frag[mma_kv][j * 2 + 4] =
+            math::ptx_exp2((s_frag[mma_kv][j * 2 + 4] - m_shift) * sm_scale);
+        s_frag[mma_kv][j * 2 + 5] =
+            math::ptx_exp2((s_frag[mma_kv][j * 2 + 5] - m_shift) * sm_scale);
       }
     }
   }
