@@ -4983,9 +4983,10 @@ def test_noncausal_members_config_agreement(D):
 @needs_device
 @pytest.mark.parametrize("D", [64, 128, 256])
 def test_noncausal_members_large_batch_equals_single_requests(D):
-    """A large non-causal batch -- many requests of several chunks, split units completed by the fixup kernel and by the
-    in-kernel fold -- gives every request the output and LSE bits of its single-request run, with sinks; the plan carries
-    the non-causal mode and every row sees its request's whole key range (the last row's bits are the causal last row's)."""
+    """A large non-causal batch of many requests of several chunks gives every request the output and LSE bits of its
+    single-request run, with sinks, under the wrapper's plan and with every request split and its rows completed by the
+    fixup kernel and by the in-kernel fold; the plans carry the non-causal mode and every row sees its request's whole key
+    range (the last row's bits are the causal last row's)."""
     import random
 
     rng = random.Random(72 + D)
@@ -5012,11 +5013,53 @@ def test_noncausal_members_large_batch_equals_single_requests(D):
         kv_data_type=torch.bfloat16,
         has_sinks=True,
     )
-    planned = w._batch_invariant._planned
-    plan = planned.plan
-    assert planned.causal is False
-    assert plan.groups and plan.fixup_groups and any(plan.group_inkernel)
+    assert w._batch_invariant._planned.causal is False
     full = _both(w.run(pr.q, pr.cache("NHD"), **kw))
+    # the same batch with every multi-chunk request split, its rows completed by the fixup kernel and by the in-kernel fold
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+
+    for merge in ("fixup", "inkernel"):
+        cfg = replace(engine.default_config(D=D), split_policy="split", merge=merge)
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            pr.Hq,
+            pr.Hkv,
+            D,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            causal=False,
+            has_sinks=True,
+        )
+        plan = planned.plan
+        assert planned.causal is False and len(plan.groups) >= n
+        if merge == "fixup":
+            assert len(plan.fixup_groups) == len(plan.groups)
+        else:
+            assert any(plan.group_inkernel)
+        got = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(D),
+            -1,
+            "NHD",
+            None,
+            cfg,
+            return_lse=True,
+            sinks=sinks,
+        )
+        got = _both(got)
+        assert torch.equal(got[0], full[0]) and torch.equal(got[1], full[1]), merge
     got_r = _both(_nc_ragged(pr, kw))
     assert torch.equal(got_r[0], full[0]) and torch.equal(got_r[1], full[1])
     for i in range(0, n, 3):
