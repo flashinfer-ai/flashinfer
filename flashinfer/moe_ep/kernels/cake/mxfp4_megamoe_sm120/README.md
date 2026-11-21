@@ -105,14 +105,16 @@ first, as a `MoEEpConfigError` in `validate_init`).
 Both kinds of modules are ordinary FlashInfer `JitSpec`s (`flashinfer/moe_ep/shims/sm120/cake_mxfp4/cake_jit.py`), cached in the JIT
 directory and packaged ahead of time by `flashinfer/aot.py`:
 
-* `cake_sm120_megamoe_binding_<digest>`: the host binding, one per source revision and NCCL (headers'
-  path and version), so a shared JIT cache rebuilds it when the process loads another NCCL.
+* `cake_sm120_megamoe_binding_<digest>`: the host binding, one per source revision and NCCL (version
+  and a digest of its Device API headers, not their location, so a package built elsewhere is found
+  wherever the same NCCL is installed), so a shared JIT cache rebuilds it when the process loads
+  another NCCL.
 * `cake_sm120_megamoe_{copier,nocopier}_{proxy,gdaki,gpi}_<digest>`: the device instances of one
   parameter set, transport flavor and NCCL GIN backend.  Its `embedded_cubin_factory` compiles the
   flavor's M128 and M64 wrappers (`nvcc -cubin --generate-code=arch=compute_120a,code=sm_120a
   -std=c++17 -O3`, about 10 s each, in parallel) and the build embeds both cubins into the carrier;
   the digest covers the sealed sources, the wrappers, the `-D` parameters, the flags, the NCCL
-  checks and the NCCL (headers' path and version).  A workspace builds or loads only the module of the flavor its transport table needs and
+  checks and the NCCL (version and header digest).  A workspace builds or loads only the module of the flavor its transport table needs and
   of its communicator's GIN backend (`ncclGinType_t` of the transport session; proxy when the
   communicator has no GIN, where no GIN call executes).
 
@@ -215,7 +217,8 @@ division and remainder); nothing is `eval`-ed.
   the headers of exactly the `libnccl.so.2` the process uses (`nccl_installation`): the library
   is the one that defines `ncclGetVersion` (`dladdr`; torch's, or an `LD_PRELOAD` one), and its
   headers are looked up next to it (`<lib>/../include`, the `nvidia-nccl-cu13` wheel layout), then
-  under `NCCL_HOME` and the `nvidia-nccl-cu13` wheel, skipping headers of another version.  The
+  under `NCCL_HOME` and every portion of the `nvidia-nccl-cu13` wheel's namespace package, skipping
+  headers of another version.  The
   binding also refuses a library other than the headers it was built against.  Without matching
   headers the backend reports which `nvidia-nccl-cu13` version to install.
 * CUDA 13 toolkit (`cuTensorMapEncodeTiled` via the driver entry point; `cuLaunchCooperativeKernel`;

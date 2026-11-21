@@ -161,16 +161,22 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _nccl_home() -> Path | None:
+def _header_candidates(library: Path) -> list[Path]:
+    """Include directories that may hold the headers of ``library``, in search order: next to it
+    (``<lib>/../include``, the wheel layout), ``NCCL_HOME``, then every portion of the ``nvidia.nccl`` namespace
+    package (the first portion can be one without headers, such as a user site's)."""
+
+    candidates = [library.parent.parent / "include"]
     nccl_home = os.environ.get("NCCL_HOME")
     if nccl_home:
-        return Path(nccl_home).expanduser()
+        candidates.append(Path(nccl_home).expanduser() / "include")
     try:
         import nvidia.nccl  # type: ignore[import-not-found]
 
-        return Path(nvidia.nccl.__path__[0])
-    except (ImportError, AttributeError, IndexError):
-        return None
+        candidates.extend(Path(portion) / "include" for portion in nvidia.nccl.__path__)
+    except (ImportError, AttributeError):
+        pass
+    return list(dict.fromkeys(path.resolve() for path in candidates))
 
 
 def _defining_library(function: Any) -> Path | None:
@@ -241,8 +247,8 @@ def nccl_installation() -> tuple[Path, Path]:
     The device code inlines NCCL's Device API and reads the ``ncclDevComm`` the library fills in, so the headers
     must be the library's own version, whatever that version is (at least :data:`MIN_NCCL_VERSION_INTEGER`).
     Headers are looked up next to the library (``<lib>/../include``, the ``nvidia-nccl-cu13`` wheel layout), then
-    under ``NCCL_HOME`` and the ``nvidia-nccl-cu13`` wheel; a directory whose headers report another version is
-    skipped.
+    under ``NCCL_HOME`` and every portion of the ``nvidia-nccl-cu13`` wheel's namespace package; a directory whose
+    headers report another version is skipped.
     """
 
     library, version = loaded_nccl_library()
@@ -251,12 +257,8 @@ def nccl_installation() -> tuple[Path, Path]:
             f"Cake SM120 MegaMoE needs NCCL {_version_string(MIN_NCCL_VERSION_INTEGER)} or newer (Device API: LSA "
             f"+ GIN), this process loads {_version_string(version)} from {library}"
         )
-    candidates = [library.parent.parent / "include"]
-    root = _nccl_home()
-    if root is not None:
-        candidates.append(root / "include")
     seen = []
-    for include in dict.fromkeys(path.resolve() for path in candidates):
+    for include in _header_candidates(library):
         found = _header_version(include)
         if found == version:
             return include.resolve(), library
@@ -277,15 +279,33 @@ def nccl_check_header() -> Path:
     return _SOURCE_DIR / _NCCL_CHECK
 
 
+_DEVICE_API_HEADERS = ("nccl.h", "nccl_device.h", "nccl_device_wrapper.h")
+
+
+@functools.cache
+def _headers_digest(include: Path) -> str:
+    """Digest of the NCCL headers a device build compiles (relative paths and contents, in sorted order)."""
+
+    files = [include / name for name in _DEVICE_API_HEADERS]
+    files += sorted((include / "nccl_device").rglob("*"))
+    digest = hashlib.sha256()
+    for path in files:
+        if path.is_file():
+            digest.update(path.relative_to(include).as_posix().encode() + b"\0")
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
 def nccl_identity() -> str | None:
-    """The NCCL a device build compiles against, for module identities: the headers' path and version (``None`` where
-    no usable NCCL is installed; such a spec is generated, never built)."""
+    """The NCCL a device build compiles against, for module identities: its version and a digest of its Device API
+    headers, not their location, so AOT-packaged modules (looked up by name) are found wherever the same NCCL is
+    installed (``None`` where no usable NCCL is installed; such a spec is generated, never built)."""
 
     try:
         include, _ = nccl_installation()
     except RuntimeError:
         return None
-    return f"{include}:{_header_version(include)}"
+    return f"{_header_version(include)}:{_headers_digest(include)}"
 
 
 def cake_sm120_megamoe_available() -> bool:
