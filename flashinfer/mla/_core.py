@@ -2854,11 +2854,12 @@ _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 # Query rows (batch * q_len) up to which the Cake candidate is profiled and
 # runs. It keeps every generic CLC launch within the device work-order window.
 # The FP8 page-64 route allocates its split-K partials on every call (about
-# rows * num_split * 129 KiB, num_split 2 from 37 rows on), also inside every
-# captured graph, so FP8 stops at 128 rows (about 33 MiB). The BF16 split-KV
-# route allocates its partials on every call too, at most one wave of clusters
-# (rows * num_split <= num_sms // 2) of 128.5 KiB each, about 10 MiB. The other
-# routes the candidate takes allocate nothing per call but an 8 KiB work order.
+# rows * num_split * 129 KiB; one split from 38 rows on, 39 on 152 SMs), also
+# inside every captured graph, so FP8 stops at 128 rows (about 16 MiB). The
+# BF16 split-KV route allocates its partials on every call too, at most one
+# wave of clusters (rows * num_split <= num_sms // 2) of 128.5 KiB each, about
+# 10 MiB. The other routes the candidate takes allocate nothing per call but an
+# 8 KiB work order.
 _CAKE_MLA_MAX_ROWS = 512
 _CAKE_MLA_FP8_MAX_ROWS = 128
 
@@ -2893,6 +2894,7 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_clc", 512, 128, 255),
         ("mla_bf16_clc", 1024, 128, 255),
         ("mla_bf16_clc", 2048, 128, 255),
+        ("mla_bf16_clc", 4096, 128, 255),
         ("mla_bf16_vquarter", 128, 1, 15),
         ("mla_bf16_vquarter", 256, 1, 15),
         ("mla_bf16_vquarter", 512, 1, 15),
@@ -2916,11 +2918,16 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_vquarter", 512, 1, 7),
     ),
     ("sm_100a", 148, "float8_e4m3fn", 64, 1, False): (
+        ("mla_fp8_page64_pdl", 128, 16, 63),
+        ("mla_fp8_page64_pdl", 256, 16, 63),
+        ("mla_fp8_page64_pdl", 1024, 32, 63),
         ("mla_fp8_page64_pdl", 2048, 16, 31),
         ("mla_fp8_page64_pdl", 4096, 16, 31),
         ("mla_fp8_page64_pdl", 8192, 16, 31),
     ),
     ("sm_100a", 148, "float8_e4m3fn", 64, 2, False): (
+        ("mla_fp8_page64_pdl", 128, 8, 31),
+        ("mla_fp8_page64_pdl", 256, 16, 31),
         ("mla_fp8_page64_pdl", 2048, 8, 15),
         ("mla_fp8_page64_pdl", 4096, 8, 15),
         ("mla_fp8_page64_pdl", 8192, 8, 15),
@@ -2956,9 +2963,13 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_vquarter", 1024, 4, 7),
     ),
     ("sm_103a", 152, "float8_e4m3fn", 64, 1, False): (
+        ("mla_fp8_page64_pdl", 128, 16, 63),
+        ("mla_fp8_page64_pdl", 256, 16, 63),
         ("mla_fp8_page64_pdl", 2048, 16, 31),
     ),
     ("sm_103a", 152, "float8_e4m3fn", 64, 2, False): (
+        ("mla_fp8_page64_pdl", 128, 8, 31),
+        ("mla_fp8_page64_pdl", 256, 8, 31),
         ("mla_fp8_page64_pdl", 1024, 2, 3),
         ("mla_fp8_page64_pdl", 2048, 8, 15),
         ("mla_fp8_page64_pdl", 4096, 8, 15),
