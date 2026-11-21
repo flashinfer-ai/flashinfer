@@ -1510,7 +1510,9 @@ def _use_persistent(B: int, T: int, H: int, w_ring: int, dev: torch.device) -> b
         return False
     from .kda_replay_mtp_umma_persistent import ctas_per_sm
 
-    slots = ctas_per_sm(dev) * torch.cuda.get_device_properties(dev).multi_processor_count
+    slots = (
+        ctas_per_sm(dev) * torch.cuda.get_device_properties(dev).multi_processor_count
+    )
     items = B * H
     if torch.cuda.get_device_capability(dev) == (10, 7):
         return T <= 4 and items >= 12 * slots

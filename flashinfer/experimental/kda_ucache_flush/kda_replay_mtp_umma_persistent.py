@@ -2300,7 +2300,9 @@ def _grid(B: int, H: int, dev: torch.device):
     """(persistent, CTAs): one CTA per (request, head) item, or a persistent grid of
     ctas_per_sm() CTAs per SM when there are more items than that."""
     n = B * H
-    slots = ctas_per_sm(dev) * torch.cuda.get_device_properties(dev).multi_processor_count
+    slots = (
+        ctas_per_sm(dev) * torch.cuda.get_device_properties(dev).multi_processor_count
+    )
     pz = _FORCE_PERSISTENT if _FORCE_PERSISTENT is not None else True
     return bool(pz), (min(n, slots) if pz else n)
 
