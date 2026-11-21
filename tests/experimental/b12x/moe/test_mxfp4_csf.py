@@ -1,10 +1,11 @@
 """MXFP4-CSF preserves native W4A8 expert math and serialized scale scratch."""
 
+from dataclasses import replace
+
 import pytest
 import torch
-
 from b12x.moe import fused_moe as moe
-from b12x.preparation import PreparationSession, PreparedCall
+from b12x.preparation import PreparationSession, PreparedCall, require_prepared
 from ..conftest import require_b12x
 from ..quantization.test_mxfp4_csf import fixture
 
@@ -12,7 +13,10 @@ from ..quantization.test_mxfp4_csf import fixture
 @pytest.mark.parametrize("tokens", [1, 17, 33, 128])
 @pytest.mark.parametrize("h,n", [(512, 192), (5120, 576), (512, 256)])
 @pytest.mark.parametrize("raw", [False, True])
-def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, raw):
+def test_native_expert_output_and_shared_scratch_poisoned_replay(
+    tokens, h, n, raw, monkeypatch
+):
+    monkeypatch.setenv("B12X_W4A8_CSF_INLINE", "0")
     device = require_b12x()
     e, topk = 8, 2
     first, s13 = fixture(2 * n, h // 32, finite_scales=True)
@@ -165,8 +169,8 @@ def test_native_expert_output_and_shared_scratch_poisoned_replay(tokens, h, n, r
 def _csf_planes(rows, columns, *, experts, seed):
     """CSF planes with sparse exceptions in most native tiles and dense rows
     whose tiles exceed the inline records (raw tiles)."""
-    import numpy as np
 
+    import numpy as np
     from b12x._lib.quant.x4t_scales import make_x4t_scale_batch
 
     device = require_b12x()
@@ -220,6 +224,11 @@ def _prepare_arms(h, n, layout, monkeypatch, *, experts=8, seed=0):
             num_experts=experts, hidden_size=h, intermediate_size=n
         ),
     )
+    # Compare all three scale representations using the same N64 GEMM layout.
+    weight_plan = replace(
+        weight_plan,
+        _impl=replace(weight_plan._impl, w4a8_n64_repacked=True),
+    )
     native = moe.prepare_weights(
         plan=weight_plan,
         weights=moe.PackedWeights(
@@ -264,36 +273,42 @@ def _assert_bitwise(expected, actual):
     "h,n,tokens",
     [
         (h, n, tokens)
-        for h, n in ((5120, 576), (1024, 320), (512, 256))
+        for h, n in ((5120, 576), (1024, 320), (512, 256), (4096, 1024))
         for tokens in (1, 8, 17, 64, 512)
-        # Deterministic N128 decode at 8 tokens plans direct routing, which
-        # that reduction contract does not support (independent of CSF).
-        if not (n % 128 == 0 and tokens == 8)
     ],
 )
 def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
-    h, n, tokens, layout, ids_dtype, monkeypatch, after_plan=None
+    h,
+    n,
+    tokens,
+    layout,
+    ids_dtype,
+    monkeypatch,
+    after_plan=None,
+    experts=8,
+    topk=2,
+    execution_override=None,
+    reads_inline=True,
 ):
     """Inline reads equal native scales and per-call expansion bit for bit.
 
     The shared expansion scratch is poisoned with NaN E8M0 bytes before every
-    replay; inline launches never read or write it. N % 128 == 0 keeps the
-    per-call expansion (no inline storage).
+    replay; inline launches never read or write it.
     """
     device = require_b12x()
-    e, topk = 8, 2
-    (native, expanded, inline), scratch = _prepare_arms(h, n, layout, monkeypatch)
-    compact = n % 128 == 64
+    e = experts
+    (native, expanded, inline), scratch = _prepare_arms(
+        h, n, layout, monkeypatch, experts=e
+    )
     assert expanded._impl.mxfp4_csf is not None
     assert expanded._impl.mxfp4_csf_inline is None
     assert not expanded.plan._impl.w4a8_csf_inline
-    assert inline.plan._impl.w4a8_csf_inline == compact
-    assert (inline._impl.mxfp4_csf_inline is not None) == compact
-    assert (inline._impl.mxfp4_csf is None) == compact
-    if compact:
-        # Canonical scale storage stays the caller's scratch; launches read
-        # the inline planes instead.
-        assert inline._impl.w1_blockscale.data_ptr() == scratch[1][0].data_ptr()
+    assert inline.plan._impl.w4a8_csf_inline
+    assert inline._impl.mxfp4_csf_inline is not None
+    assert inline._impl.mxfp4_csf is None
+    # Canonical scale storage stays the caller's scratch; launches read
+    # the inline planes instead.
+    assert inline._impl.w1_blockscale.data_ptr() == scratch[1][0].data_ptr()
     arms = (native, expanded, inline)
     plans = [
         moe.plan_execution(
@@ -301,6 +316,7 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
             capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
             invocation={"fast_math": False},
             routing=moe.RoutingSpec(deterministic_output=True),
+            override=execution_override,
         )
         for owner in arms
     ]
@@ -357,6 +373,7 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
             )
             owners.append((buffers, binding))
             outputs.append(output)
+        assert owners[2][1].w4a8_csf_inline == reads_inline
         session.freeze()
         for _, binding in owners:
             graph = torch.cuda.CUDAGraph()
@@ -379,11 +396,20 @@ def test_inline_scales_match_native_and_expansion_under_poisoned_replay(
             )
             _assert_bitwise(outputs[0], outputs[1])
             _assert_bitwise(outputs[0], outputs[2])
-            if compact:
+            if reads_inline:
                 assert all(
                     bool((buffer.view(torch.uint8) == 0xFF).all())
                     for buffer in scratch[1]
                 )
+            else:
+                reference = native._impl.representation.value
+                for buffer, expected in zip(
+                    scratch[1], (reference.w13_sfb, reference.w2_sfb), strict=True
+                ):
+                    assert torch.equal(
+                        buffer.view(torch.uint8).view(-1),
+                        expected.view(torch.uint8).view(-1),
+                    )
         for graph in graphs:
             graph.reset()
 
@@ -591,3 +617,273 @@ def test_inline_capacity_control_is_retained_after_declaration(monkeypatch):
         monkeypatch,
         after_plan=lambda: monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 0),
     )
+
+
+@pytest.mark.parametrize(
+    "h,n,experts,topk,tokens,limit,reads_inline",
+    [
+        (1024, 256, 64, 2, 1537, None, True),
+        (1024, 256, 64, 2, 1792, None, True),
+        (1024, 256, 64, 2, 2048, None, True),
+        (2048, 512, 128, 4, 2048, None, True),
+        (1024, 256, 128, 2, 2049, None, False),
+        (1024, 256, 32, 2, 2048, None, False),
+        (1024, 256, 64, 2, 2048, 1536, False),
+        (1024, 256, 64, 2, 2048, 0, False),
+        (1024, 256, 128, 2, 2049, 4096, True),
+    ],
+)
+def test_m64_prefill_admission_preserves_outputs_and_explicit_limits(
+    h, n, experts, topk, tokens, limit, reads_inline, monkeypatch
+):
+    """The bounded SM121 policy survives replay with changed routes and controls."""
+    from b12x.moe.fused_moe import _impl
+
+    device = require_b12x()
+    if torch.cuda.get_device_capability(device) != (12, 1):
+        pytest.skip("The extended automatic prefill band targets SM121")
+    if limit is None:
+        monkeypatch.delenv("B12X_W4A8_CSF_INLINE_MAX_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("B12X_W4A8_CSF_INLINE_MAX_TOKENS", str(limit))
+    monkeypatch.setattr(
+        _impl, "W4A8_CSF_INLINE_MAX_TOKENS", 1536 if limit is None else limit
+    )
+
+    def change_controls():
+        monkeypatch.setenv("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "0")
+        monkeypatch.setattr(_impl, "W4A8_CSF_INLINE_MAX_TOKENS", 0)
+
+    test_inline_scales_match_native_and_expansion_under_poisoned_replay(
+        h,
+        n,
+        tokens,
+        "w31",
+        torch.int32,
+        monkeypatch,
+        after_plan=change_controls,
+        experts=experts,
+        topk=topk,
+        execution_override=moe.MoeDecodeConfig(
+            backend="dynamic",
+            max_active_clusters=None,
+            route_planner="internal",
+            dynamic_tile_m=64,
+            dynamic_route_mode="grouped",
+        ),
+        reads_inline=reads_inline,
+    )
+
+
+def _pool_micro_plan(*, repacked):
+    """Minimal micro plan fields that pool workspace resolution reads."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        implementation="micro",
+        quant_mode="w4a8_mx",
+        state_E=8,
+        weight_E=8,
+        k=1024,
+        n=256,
+        num_topk=2,
+        routed_rows=8,
+        max_rows=8,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        activation="silu",
+        deterministic_output=False,
+        dynamic_physical_tiles=None,
+        dynamic_task_capacity=None,
+        max_tokens_per_launch=4,
+        execution=SimpleNamespace(tile_m=16, tile_n=128),
+        decode_config=SimpleNamespace(
+            dynamic_route_mode=None, nvfp4_materialize_intermediate=False
+        ),
+        spec=SimpleNamespace(source_format="fp4_e8m0_k32"),
+        w4a8_n64_repacked=repacked,
+    )
+
+
+def _resolve_pool_workspace(_impl, pool, plan):
+    one = torch.ones(8)
+    return _impl._resolve_workspace(
+        pool, plan=plan, a1_gscale=one, a2_gscale=one, input_scales_static=True
+    )
+
+
+def test_pool_workspace_plans_with_the_n64_representation(monkeypatch):
+    """Pool allocation sizes compact micro scratch from the plan's packing."""
+    from b12x.moe.fused_moe import _impl
+
+    seen = {}
+
+    class _Planned(Exception):
+        pass
+
+    def plan_core_workspace(*args, **kwargs):
+        seen.update(kwargs)
+        raise _Planned
+
+    monkeypatch.setattr(_impl, "_plan_core_workspace", plan_core_workspace)
+    monkeypatch.setattr(_impl.torch.cuda, "is_current_stream_capturing", lambda: False)
+    with pytest.raises(_Planned):
+        _resolve_pool_workspace(
+            _impl, _impl.TPMoEWorkspacePool(), _pool_micro_plan(repacked=True)
+        )
+    assert seen["source_format"] == "fp4_e8m0_k32"
+    assert seen["w4a8_n64_repacked"] is True
+
+
+@pytest.mark.parametrize("enough_scratch", [False, True])
+def test_pool_grows_reused_micro_scratch_for_compact_plans(enough_scratch, monkeypatch):
+    """A compact N64 plan does not reuse a smaller micro workspace from the pool."""
+    from b12x.moe._shared.kernels.w4a8_compact_micro import micro_scratch_nbytes
+    from b12x.moe.fused_moe import _impl
+
+    compact = _pool_micro_plan(repacked=True)
+    required = micro_scratch_nbytes(
+        compact.max_rows // compact.num_topk, compact.k, compact.n, compact.num_topk
+    )
+    calls = []
+
+    def alloc_workspace(*args, **kwargs):
+        calls.append(kwargs)
+        workspace = object.__new__(_impl.TPMicroWorkspace)
+        workspace.state_E = args[2]
+        workspace.max_rows = kwargs["max_rows"]
+        workspace.routed_rows_capacity = kwargs["routed_rows"]
+        nbytes = required if enough_scratch or kwargs["w4a8_n64_repacked"] else 256
+        workspace.micro_intermediate = torch.empty(nbytes, dtype=torch.uint8)
+        return workspace
+
+    monkeypatch.setattr(_impl, "_alloc_workspace", alloc_workspace)
+    monkeypatch.setattr(_impl.torch.cuda, "is_current_stream_capturing", lambda: False)
+    pool = _impl.TPMoEWorkspacePool()
+    first = _resolve_pool_workspace(_impl, pool, _pool_micro_plan(repacked=False))
+    second = _resolve_pool_workspace(_impl, pool, compact)
+    if enough_scratch:
+        assert second is first and len(calls) == 1
+    else:
+        assert second is not first and len(calls) == 2
+        assert calls[1]["w4a8_n64_repacked"] is True
+        assert second.micro_intermediate.nbytes >= required
+
+
+def test_direct_binding_rejects_compact_plans_without_prepared_launchers(
+    monkeypatch,
+):
+    """Only fused_moe.plan_execution() builds the launchers that compact micro plans need."""
+    from b12x.moe.fused_moe import _impl
+
+    device = require_b12x()
+    arms, _ = _prepare_arms(1024, 256, "w31", monkeypatch)
+    tokens, topk = 4, 2
+    x = torch.randn(tokens, 1024, dtype=torch.bfloat16, device=device)
+    ids = torch.randint(0, 8, (tokens, topk), dtype=torch.int32, device=device)
+    weights = torch.full((tokens, topk), 0.5, device=device)
+    with pytest.raises(ValueError, match="plan_execution"):
+        _impl.build_tp_moe_fp4_binding(
+            scratch=_impl.allocate_tp_moe_workspace_pool(),
+            a=x,
+            experts=arms[0]._impl,
+            topk_weights=weights,
+            topk_ids=ids,
+            output=torch.empty_like(x),
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+            decode_config=moe.MoeDecodeConfig(
+                backend="micro", route_planner="internal", max_active_clusters=None
+            ),
+        )
+
+
+def test_scratch_plan_binding_rejects_compact_plans_without_prepared_launchers(
+    monkeypatch,
+):
+    """A prepared compact plan's scratch plan cannot bind without its launchers."""
+    device = require_b12x()
+    arms, _ = _prepare_arms(1024, 256, "w31", monkeypatch)
+    tokens, topk = 4, 2
+    plan = moe.plan_execution(
+        experts=arms[2],
+        capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
+        invocation={"fast_math": False},
+        routing=moe.RoutingSpec(deterministic_output=True),
+    )
+    x = torch.randn(tokens, 1024, dtype=torch.bfloat16, device=device)
+    ids = torch.randint(0, 8, (tokens, topk), dtype=torch.int32, device=device)
+    weights = torch.full((tokens, topk), 0.5, device=device)
+
+    def prepare(state):
+        buffers = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in state.scratch.scratch_specs()
+        )
+        output = torch.empty_like(x)
+        binding = state.bind(
+            a=x,
+            topk_ids=ids,
+            topk_weights=weights,
+            output=output,
+            scratch=buffers,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), output=output, owners=(buffers, binding)
+        )
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (plan.request(name="csf-compact-scratch", prepare_call=prepare),)
+        )
+        state = require_prepared(plan, "moe.decode")
+        assert state.compact_launches is not None
+        buffers = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in state.scratch.scratch_specs()
+        )
+        with pytest.raises(ValueError, match="plan_execution"):
+            state.scratch.bind(
+                scratch=buffers,
+                a=x,
+                experts=arms[2]._impl,
+                topk_weights=weights,
+                topk_ids=ids,
+                output=torch.empty_like(x),
+                input_scales_static=True,
+                fast_math=False,
+            )
+
+
+@pytest.mark.parametrize(
+    "n,capability,requested,expected",
+    [
+        (256, (12, 1), False, True),
+        (256, (12, 0), False, False),
+        (256, (12, 0), True, True),
+        (192, (12, 0), False, True),
+    ],
+)
+def test_full_n128_n64_packing_defaults_to_sm121(
+    n, capability, requested, expected, monkeypatch
+):
+    """N64 tails always pack; full N128 tiles pack by default only on SM121."""
+    from b12x.moe.fused_moe import planning
+
+    monkeypatch.delenv("B12X_W4A8_CSF_INLINE", raising=False)
+    monkeypatch.setattr(
+        planning.torch.cuda, "get_device_capability", lambda device=None: capability
+    )
+    plan = moe.plan_weights(
+        source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
+        activation=moe.ActivationSpec(
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=moe.MoEGeometry(num_experts=8, hidden_size=1024, intermediate_size=n),
+    )
+    if requested:
+        plan = replace(plan, _impl=replace(plan._impl, w4a8_n64_repacked=True))
+    assert planning._w4a8_csf_inline(plan, torch.device("cuda", 0)) is expected
