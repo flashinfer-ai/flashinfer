@@ -179,6 +179,7 @@ from .jit.cake_minimax_h3_qkv_quantize_pack import (
 from .jit.mla import (
     gen_mla_module,
     gen_mla_swa_sm90_module,
+    gen_sparse_mla_sm90_module,
     gen_sparse_mla_sm120_module,
 )
 from .jit.cake_sparse_mla_sm120_dsv4_nvfp4 import (
@@ -1341,6 +1342,8 @@ def gen_all_modules(
 
     if has_sm90:
         jit_specs.append(gen_mla_swa_sm90_module())
+        # DSA sparse-MLA decode over the fp8_ds_mla Page64 cache (SM90).
+        jit_specs.append(gen_sparse_mla_sm90_module())
 
     # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
     if has_sm120 or has_sm121:
