@@ -6,8 +6,12 @@ init state ``(-inf, +0, +0)`` and apply the epilogue (``cvt_bf16(add(mul(O, div(
 (one thread per (row, 4 output columns), a second graph node) or in-kernel by the correction warpgroup of
 the unit that completes a group (the "last arriver": ``blocks/correction.py``, a placement chosen by the
 planner per group, ``plan.py``). The present chunks of a row are recomputed from its position (a function
-of fixed dims and the row only), so absent chunks (sliding window) are never merged. All math through
-``CuteF32``; one kernel per D.
+of fixed dims and the row only), so absent chunks (sliding window) are never merged. Under a mask mode whose keys are
+data (``plan.keys_are_data``; ``by_partial`` below) a row's present chunks are not an interval of its position: the candidates
+are the group's chunks and a chunk is present for a row when its partial is not the init state (``m != -inf``: the row had a
+visible key in it), again a function of the row alone and the rule the fused units' in-kernel merge follows for every mode
+(``blocks/correction.merge_coeffs``); a row without a present chunk stores ``+0``. ONE rule and one code path for every such mode.
+All math through ``CuteF32``; one kernel per D and mask mode.
 
 Placement: the partials of ``PF`` consecutive chunks are loaded before their merges (the loads of
 chunk ``j + 1`` do not depend on the merge of chunk ``j``, so ``PF`` L2 round trips overlap instead of
@@ -36,9 +40,11 @@ from .plan import (
     G_ROWS,
     G_SLOT,
     GROUP_FIELDS,
+    MASK_SUFFIX,
+    keys_are_data,
     ws_row,
 )
-from .spec import chunk_len
+from .spec import MASK_CAUSAL, MASK_NON_CAUSAL, check_mask_mode, chunk_len
 
 VEC = 4
 THREADS = 128
@@ -75,6 +81,7 @@ def fold_row_state(
     lane_rows: cutlass.Constexpr = 0,
     cells: cutlass.Constexpr = None,
     grid: cutlass.Constexpr = None,
+    by_partial: cutlass.Constexpr = False,
 ):
     """The ``chunk`` fold digit for row ``r`` (query position ``pos``) of a split group over output columns ``[d0, d0 + VEC)``: the
     row's present chunks folded in chunk order with ``spec.merge`` from the init state ``(-inf, +0, +0)`` into ``o`` (``VEC`` fp32,
@@ -91,6 +98,11 @@ def fold_row_state(
     arithmetic below, bit for bit): a device function ``cells(grid, lo, L) -> (j_lo, j_hi)`` giving the first and one-past-last
     chunk (cell) of the row's visible range on the class's absolute chunk grid ``grid``;
     the regions stay one per chunk index, so the fold below is unchanged.
+
+    ``by_partial`` (the mask modes whose keys are data; always passed by keyword): the candidates are the group's chunks
+    ``[chunk_lo, chunk_lo + n_chunks)`` (``pos`` and ``window_left`` are not read) and a chunk whose partial is the init state
+    (``m == -inf``: no visible key of the row in it) is absent and never merged, in the same chunk order -- the causal mode's
+    present chunks all hold a key.
     """
     L = pos + 1
     lo = Int32(0)
@@ -106,6 +118,9 @@ def fold_row_state(
     if j_lo < chunk_lo:
         j_lo = chunk_lo
     if j_hi > chunk_lo + n_chunks:
+        j_hi = chunk_lo + n_chunks
+    if cutlass.const_expr(by_partial):
+        j_lo = chunk_lo
         j_hi = chunk_lo + n_chunks
     m = Float32(_NEG_INF)
     l = Float32(0.0)
@@ -153,7 +168,10 @@ def fold_row_state(
                     cute.make_tensor(po.iterator + i * VEC, cute.make_layout((VEC,))),
                 )  # po is (PF, VEC) with VEC contiguous
         for i in cutlass.range_constexpr(PF):
-            if r0 + i < r_hi:
+            present = r0 + i < r_hi
+            if cutlass.const_expr(by_partial):
+                present = present & (pm[i] != Float32(_NEG_INF))
+            if present:
                 m2 = pm[i]
                 l2 = pl[i]
                 mm = CuteF32.fmaxc(m, m2)
@@ -192,17 +210,21 @@ def fold_row(
     PF: cutlass.Constexpr,
     WS: cutlass.Constexpr,
     *,
-    causal: cutlass.Constexpr = True,
+    mask_mode: cutlass.Constexpr = MASK_CAUSAL,
 ):
     """Row ``r`` of a split group, output columns ``[d0, d0 + VEC)``: the chunk-order fold of the row's present chunks from the
     init state (``fold_row_state``, the single implementation), then the epilogue to the output row. ``WS`` is the workspace row
-    pitch of the head dim (``plan.ws_row(D)``: 68 / 132 / 260 at D = 64 / 128 / 256). ``causal``: the mask mode; a non-causal row's
-    present chunks are those of the whole key range ``[0, kv_len)`` (the fold of a row at the last position with no window)."""
+    pitch of the head dim (``plan.ws_row(D)``: 68 / 132 / 260 at D = 64 / 128 / 256). ``mask_mode`` (keyword-only) selects the
+    present-chunk rule: a causal row's follow from its position and the window, a non-causal row's are those of the whole key
+    range ``[0, kv_len)`` (the fold of a row at the last position with no window), and under the modes whose keys are data
+    (``plan.keys_are_data``) the partials decide (``fold_row_state``'s ``by_partial``); a row without a present chunk stores ``+0``
+    (``spec.output_elem_or_zero``)."""
     token = q_tok0 + r // g
     pos = kv_len - q_len + token
-    if cutlass.const_expr(not causal):
+    if cutlass.const_expr(mask_mode == MASK_NON_CAUSAL):
         pos = kv_len - 1
         window_left = Int32(-1)
+    by_partial = keys_are_data(mask_mode)
     o = cute.make_rmem_tensor(cute.make_layout((VEC,)), Float32)
     m, l = fold_row_state(
         mWs,
@@ -221,8 +243,12 @@ def fold_row(
         C,
         PF,
         WS,
+        by_partial=by_partial,
     )
     inv = CuteF32.div(Float32(1.0), l)
+    if cutlass.const_expr(by_partial):
+        if l == Float32(0.0):  # no present chunk: the row stores +0
+            inv = Float32(0.0)
     out_row = (q_base + token) * Hq + kv_head * g + r % g
     for e in cutlass.range_constexpr(VEC):
         mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
@@ -352,6 +378,7 @@ def fold_row_coop(
     C: cutlass.Constexpr,
     WS: cutlass.Constexpr,
     V: cutlass.Constexpr,
+    by_partial: cutlass.Constexpr = False,
 ):
     """The fixup kernel's cooperative fold of row ``r`` (every thread of the row's thread group calls it; ``is_scan_warp`` marks the
     row's first warp). Per batch of up to ``COOP_NCB`` present chunks: every thread loads its ``V`` columns of every chunk's partial
@@ -359,7 +386,11 @@ def fold_row_coop(
     running maxima (``_warp_inclusive_max``) and every chunk's ``a1 = ex2(add(mul(m, c), mul(mm, nc)))`` /
     ``a2 = ex2(add(mul(m2, c), mul(mm, nc)))`` in parallel into shared memory; then every thread runs the chunk-order ``l`` and ``O``
     chains ``fma(x2, a2, mul(x, a1))``. The operations and their order per output are exactly ``fold_row_state``'s; only who computes
-    the scalars, and when, differs. Returns ``l`` (the running ``m`` is not an output)."""
+    the scalars, and when, differs. Returns ``l`` (the running ``m`` is not an output). ``by_partial`` (the mask modes whose keys are data; always
+    passed by keyword): ``fold_row_state``'s rule -- the candidates are the group's chunks and a chunk whose partial is the init
+    state (``m == -inf``) is absent; its step takes the coefficients ``(1, 0)``, which leave ``l`` and ``O`` as they are (up to
+    the sign of an exact zero, erased by the epilogue): the fused units' ``merge_coeffs``, and the placement of "never merged"
+    that keeps the chains uniform across the row's threads."""
     L = pos + 1
     lo = Int32(0)
     if window_left >= 0:
@@ -371,6 +402,9 @@ def fold_row_coop(
     if j_lo < chunk_lo:
         j_lo = chunk_lo
     if j_hi > chunk_lo + n_chunks:
+        j_hi = chunk_lo + n_chunks
+    if cutlass.const_expr(by_partial):
+        j_lo = chunk_lo
         j_hi = chunk_lo + n_chunks
     r_lo = j_lo - chunk_lo
     r_hi = j_hi - chunk_lo
@@ -415,8 +449,21 @@ def fold_row_coop(
                     exc = m_run
                 m_run = cute.arch.shuffle_sync(inc, 31)
                 na = CuteF32.mul(inc, nc)
-                sA1[sb * 32 + lane] = CuteF32.ex2(CuteF32.add(CuteF32.mul(exc, c), na))
-                sA2[sb * 32 + lane] = CuteF32.ex2(CuteF32.add(CuteF32.mul(ma, c), na))
+                if cutlass.const_expr(by_partial):
+                    a1v = CuteF32.ex2(CuteF32.add(CuteF32.mul(exc, c), na))
+                    a2v = CuteF32.ex2(CuteF32.add(CuteF32.mul(ma, c), na))
+                    if ma == Float32(_NEG_INF):
+                        a1v = Float32(1.0)
+                        a2v = Float32(0.0)
+                    sA1[sb * 32 + lane] = a1v
+                    sA2[sb * 32 + lane] = a2v
+                else:
+                    sA1[sb * 32 + lane] = CuteF32.ex2(
+                        CuteF32.add(CuteF32.mul(exc, c), na)
+                    )
+                    sA2[sb * 32 + lane] = CuteF32.ex2(
+                        CuteF32.add(CuteF32.mul(ma, c), na)
+                    )
                 sL[sb * 32 + lane] = la
         cute.arch.sync_threads()
         for i in cutlass.range_constexpr(COOP_NCB):
@@ -431,9 +478,14 @@ def fold_row_coop(
 
 
 class SplitKVFixup:
-    def __init__(self, D: int, g: int, pdl: bool = PDL, *, causal: bool = True):
+    def __init__(
+        self, D: int, g: int, pdl: bool = PDL, *, mask_mode: str = MASK_CAUSAL
+    ):
         self.D, self.g, self.pdl = D, g, pdl
-        self.causal = causal  # the mask mode (a class dimension; compile-time)
+        # the present-chunk rule (compile-time): by the partials under the mask modes whose keys are data, of the whole key range
+        # under the non-causal mode, of the row's position and window under the causal mode
+        self.by_partial = keys_are_data(mask_mode)
+        self.non_causal = mask_mode == MASK_NON_CAUSAL
         self.C = chunk_len(D)
         self.WS = ws_row(D)
 
@@ -496,7 +548,7 @@ class SplitKVFixup:
         sA2 = sbuf[1, ri, None]
         sL = sbuf[2, ri, None]
         wl = window_left
-        if cutlass.const_expr(not self.causal):
+        if cutlass.const_expr(self.non_causal):
             wl = Int32(-1)  # no window in the non-causal class
         for grp in cutlass.range(grp0, num_groups, grid_y):
             rows = mGroups[(grp, G_ROWS)]
@@ -518,7 +570,7 @@ class SplitKVFixup:
             )
             token = q_tok0 + rr // g
             pos = kv_len - q_len + token
-            if cutlass.const_expr(not self.causal):
+            if cutlass.const_expr(self.non_causal):
                 # the non-causal class: every row's present chunks are the whole key range's (the last position, no window)
                 pos = kv_len - 1
             if cutlass.const_expr(self.pdl):
@@ -548,9 +600,13 @@ class SplitKVFixup:
                 C,
                 self.WS,
                 V,
+                by_partial=self.by_partial,
             )
             if live:
                 inv = CuteF32.div(Float32(1.0), l)
+                if cutlass.const_expr(self.by_partial):
+                    if l == Float32(0.0):  # no present chunk: the row stores +0
+                        inv = Float32(0.0)
                 for e in cutlass.range_constexpr(V):
                     mO[(out_row.to(Int64), d0 + e)] = CuteF32.add(
                         CuteF32.mul(o[e], inv), Float32(0.0)
@@ -564,9 +620,11 @@ MAX_GRID_Y = (
 
 
 @functools.cache
-def get_fixup(D: int, g: int, *, causal: bool = True):
+def get_fixup(D: int, g: int, *, mask_mode: str = MASK_CAUSAL):
+    """The fixup kernel of head dim ``D`` and group size ``g``; ``mask_mode`` (keyword-only) selects the present-chunk rule: one
+    object per mode (``plan.MASK_SUFFIX``), the causal mode's object and name unchanged."""
     name = jit.sanitize_symbol_name(
-        f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}" + ("" if causal else "_nc")
+        f"attn_fixup_d{D}_g{g}_pdl{int(PDL)}" + MASK_SUFFIX[check_mask_mode(mask_mode)]
     )
 
     def compile_fn():
@@ -585,7 +643,7 @@ def get_fixup(D: int, g: int, *, causal: bool = True):
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            SplitKVFixup(D, g, causal=causal),
+            SplitKVFixup(D, g, mask_mode=mask_mode),
             ws_fake,
             o_fake,
             groups_fake,

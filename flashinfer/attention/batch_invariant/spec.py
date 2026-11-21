@@ -1,11 +1,21 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical dataflow of paged-KV attention: the classes ``attn.bf16.d<D>`` (causal) and ``attn.bf16.d<D>.nc`` (non-causal).
+"""Canonical dataflow of paged-KV attention: the classes ``attn.bf16.d<D>`` (causal), ``attn.bf16.d<D>.nc`` (non-causal),
+``attn.bf16.d<D>.br`` (causal with a bidirectional key range per row) and ``attn.bf16.d<D>.mask`` (an explicit key set per row).
 
-The mask mode is a class dimension, not a per-call input: a causal row at position ``p`` sees the keys ``[lo, p + 1)`` (bottom-right
-aligned, ``lo`` from the optional sliding window), a non-causal row sees every key of its request, ``[0, kv_len)`` (no window). The
-tiles, the chunks, the online softmax and the merge are the same dataflow in both modes; only the visible set a token gets from the
-request metadata differs, so a token's term (and the fingerprint) differs between the two classes.
+One dataflow, four ways of saying which keys a row sees (``MASK_MODES``). The mask mode is a class dimension, not a per-call
+input. A row has a set of visible keys of its request; the tiles, the chunks, the online softmax and the merge are stated over
+that set alone (``RowSpec.visible``): a key outside it is an absent leaf, a tile or a chunk without a visible key is dropped, and a
+row without one outputs ``+0`` (``output_elem_or_zero``). The term of a row is a function of its own visible set, so two rows with
+the same set have the same term whatever mode stated it (the receipts differ: a receipt names what a row MAY see):
+
+* causal: the keys ``[lo, p + 1)`` of the row's position ``p`` (bottom-right aligned, ``lo`` from the optional sliding window);
+* non-causal: every key of the row's request, ``[0, kv_len)`` (no window) -- the causal row at the request's last position;
+* key ranges: the causal keys united with one key range ``[a, b)`` of the request -- a row with an empty range is the causal row,
+  a row whose range is ``[0, kv_len)`` is the non-causal row;
+* key set: the set is data (a custom attention mask) -- a row whose set is a causal range is the causal row, one whose set is
+  every key of the request is the non-causal row, and one whose set is ``causal ∪ [a, b)`` is the key-range row
+  (``RowSpec.as_key_set``).
 
 The class is stated for finite bf16 operands: a non-finite Q / K / V value, or scaled scores outside the binary32 range, give
 the NaN that fp32 softmax arithmetic gives (bit for bit, like every other value) and are not guarded against.
@@ -34,7 +44,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from ...batch_invariant import canon
 from ...batch_invariant.fp_interface.term import to_f32
@@ -55,6 +65,27 @@ HEAD_DIMS = (
     256,
 )  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)))
 NEG_INF = float("-inf")
+
+# what a row sees (``mask_mode``): the declared values of the one mode switch every signature of the kernels, the planner and the
+# fold takes by keyword. A mode names where a row's visible keys come from; the tiles, the chunks, the tile step and the merge are
+# the same dataflow under every mode
+MASK_CAUSAL = "causal"  # the keys [max(0, p - window_left), p] of the row's position
+MASK_NON_CAUSAL = "non_causal"  # every key [0, kv_len) of the row's request (no window)
+MASK_KEY_RANGES = "key_ranges"  # the causal keys united with one key range [a, b) per row (data: bidirectional ranges)
+MASK_KEY_SET = "key_set"  # an explicit key set per row (data: a custom mask)
+MASK_MODES = (MASK_CAUSAL, MASK_NON_CAUSAL, MASK_KEY_RANGES, MASK_KEY_SET)
+
+
+def check_mask_mode(mask_mode: str) -> str:
+    if mask_mode not in MASK_MODES:
+        raise ValueError(f"mask_mode {mask_mode!r}: one of {MASK_MODES}")
+    return mask_mode
+
+
+def mask_mode_of_causal(causal: bool) -> str:
+    """The mode a ``causal`` flag names: the two modes whose visible keys follow from the request metadata alone. The callers'
+    ``causal`` / ``is_causal`` argument is mapped here once; below the wrappers every signature takes ``mask_mode``."""
+    return MASK_CAUSAL if causal else MASK_NON_CAUSAL
 
 
 CHUNK_LEN = 512  # C: keys per chunk (4 tiles) -- a class constant (another C would be a different class)
@@ -107,54 +138,128 @@ def scale_log2(sm_scale: float) -> float:
 
 @dataclass(frozen=True)
 class RowSpec:
-    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys ``[lo, L)``. Causal
-    (the default): ``L = p + 1`` and ``lo = max(0, p - window_left)``. Non-causal (``causal=False``): ``L = kv_len`` (every key of
-    the request) and ``lo = 0``; the position only names the row and a window is not a parameter of that class. ``row`` names the row
-    (query token and head) in the leaf terms."""
+    """One logical row and its visible keys, stated in one of the four modes (``mask_mode``): the causal keys
+    ``[lo_causal, p + 1)`` of the query position ``p`` (0-based, absolute in the KV sequence; ``lo_causal = max(0, p -
+    window_left)``); every key ``[0, kv_len)`` of the request (``causal=False``: the position only names the row and a window is not
+    a parameter of that class); the causal keys united with the bidirectional range ``brange = (a, b)`` (the keys ``[a, b)``;
+    ``a >= b``: no range, the causal row); or the explicit set ``keys`` over the request's ``kv_len`` keys. ``[lo, L)`` is the hull
+    of the keys the row may see; ``row`` names the row (query token and head) in the leaf terms."""
 
     p: int
     window_left: int = -1
     row: int = 0  # the row's identity in the leaf terms (query token / head index)
     causal: bool = True
     kv_len: Optional[int] = (
-        None  # the request's key count (non-causal: the visible range is [0, kv_len))
+        None  # the request's key count (non-causal: the visible range is [0, kv_len); with ``keys``: the set's universe)
+    )
+    keys: Optional[FrozenSet[int]] = (
+        None  # the key-set mode: the row's visible keys; ``p`` and ``window_left`` are then unused
+    )
+    brange: Optional[Tuple[int, int]] = (
+        None  # the key-ranges mode: the bidirectional range [a, b) next to the causal keys
     )
 
     def __post_init__(self) -> None:
+        assert self.keys is None or self.brange is None, (
+            "a row states its keys as a set or as causal keys with a range, not both"
+        )
         if not self.causal:
+            assert self.keys is None and self.brange is None, (
+                "a non-causal row sees every key of its request: it takes no key set and no range"
+            )
             assert self.kv_len is not None and self.kv_len >= 1, (
                 "a non-causal row needs the request's kv_len (at least one key)"
             )
             assert self.window_left < 0, (
                 "window_left is not a parameter of the non-causal class"
             )
+        if self.keys is not None:
+            assert self.kv_len is not None and self.kv_len >= 1, (
+                "a row with an explicit key set needs the request's kv_len (at least one key)"
+            )
+            assert all(0 <= k < self.kv_len for k in self.keys), (
+                "the key set is a subset of [0, kv_len)"
+            )
+
+    @property
+    def mask_mode(self) -> str:
+        """The mode that states this row's keys (``MASK_MODES``)."""
+        if self.keys is not None:
+            return MASK_KEY_SET
+        if self.brange is not None:
+            return MASK_KEY_RANGES
+        return MASK_CAUSAL if self.causal else MASK_NON_CAUSAL
+
+    @property
+    def range_keys(self) -> Optional[Tuple[int, int]]:
+        """The row's range ``(a, b)`` when it holds a key, else ``None``."""
+        if self.brange is None:
+            return None
+        a, b = self.brange
+        assert a >= 0, self.brange
+        return (a, b) if a < b else None
+
+    @property
+    def lo_causal(self) -> int:
+        return 0 if self.window_left < 0 else max(0, self.p - self.window_left)
 
     @property
     def L(self) -> int:
-        if not self.causal:
+        """One past the last key the row may see (the hull's end; the request's ``kv_len`` for a non-causal row and a key set)."""
+        if not self.causal or self.keys is not None:
             assert self.kv_len is not None
             return self.kv_len
-        return self.p + 1
+        r = self.range_keys
+        return self.p + 1 if r is None else max(self.p + 1, r[1])
 
     @property
     def lo(self) -> int:
-        if not self.causal:
+        """The first key the row may see (the hull's start)."""
+        if not self.causal or self.keys is not None:
             return 0
-        return 0 if self.window_left < 0 else max(0, self.p - self.window_left)
+        r = self.range_keys
+        return self.lo_causal if r is None else min(self.lo_causal, r[0])
 
     def visible(self, k: int) -> bool:
-        return self.lo <= k < self.L
+        """THE visibility predicate: every mode's rows enter the dataflow through it alone."""
+        if self.keys is not None:
+            return k in self.keys
+        if not self.causal:
+            return 0 <= k < self.L
+        r = self.range_keys
+        return self.lo_causal <= k <= self.p or (r is not None and r[0] <= k < r[1])
+
+    def key_set(self) -> FrozenSet[int]:
+        """The row's visible keys as a set."""
+        return frozenset(k for k in range(self.lo, self.L) if self.visible(k))
+
+    def as_key_set(self, kv_len: Optional[int] = None) -> "RowSpec":
+        """The key-set row with this row's visible set (over ``kv_len`` keys; the hull's end by default): the same term, since the
+        dataflow reads ``visible`` alone."""
+        return RowSpec(
+            p=self.p,
+            window_left=self.window_left,
+            row=self.row,
+            kv_len=self.L if kv_len is None else kv_len,
+            keys=self.key_set(),
+        )
 
 
 def visible_keys(row: RowSpec, t: int, T: int = TILE_KEYS) -> List[int]:
     """The visible absolute keys of tile ``t`` for ``row`` (empty = the tile is absent)."""
     a, b = max(row.lo, t * T), min(row.L, (t + 1) * T)
-    return list(range(a, b)) if a < b else []
+    return [k for k in range(a, b) if row.visible(k)]
 
 
 def present_chunks(row: RowSpec, D: int) -> List[int]:
     C = chunk_len(D, row.L)
-    return list(range(row.lo // C, -(-row.L // C))) if row.lo < row.L else []
+    return [
+        j
+        for j in range(row.lo // C, -(-row.L // C))
+        if any(
+            row.visible(k) for k in range(max(row.lo, j * C), min(row.L, (j + 1) * C))
+        )
+    ]
 
 
 # ----------------------------------------------------------------------------- the engine reductions
@@ -318,6 +423,17 @@ def output_elem(fp, st: State, out_fmt: str = "bf16"):
     return fp.cvt_out(fp.add(fp.mul(st.o, inv), fp.const(0.0)), out_fmt)
 
 
+def output_elem_or_zero(fp, st: Optional[State], out_fmt: str = "bf16"):
+    """The output element of the explicit-key-set class: ``output_elem`` of the row's state, or ``cvt(+0)`` for a row without a
+    visible key (``st`` is ``None``: no chunk is present, so there is no state to normalise). The rule is declared, not derived:
+    the init state's ``mul(+0, div(1, +0))`` would be a NaN. The kernels take it from the row's own ``l`` (``l == +0`` exactly
+    when no key of the row is visible: every present tile adds the probability of its maximum, ``ex2`` of a rounding
+    residual), replacing the reciprocal by ``+0``."""
+    if st is None:
+        return fp.cvt_out(fp.const(0.0), out_fmt)
+    return output_elem(fp, st, out_fmt)
+
+
 # ----------------------------------------------------------------------------- the reduction object
 
 
@@ -400,7 +516,8 @@ class AttentionSpec:
         return self.reduction(row, d).canonical(self.alg)
 
     def output(self, row: RowSpec, d: int) -> Term:
-        return output_elem(self.alg, self.state(row, d), self.out_fmt)
+        # one epilogue for every mode: a row without a visible key (possible under the key-set mode alone) is +0
+        return output_elem_or_zero(self.alg, self.state(row, d), self.out_fmt)
 
 
 _FINGERPRINTS: Dict[tuple, str] = {}
@@ -412,44 +529,120 @@ FINGERPRINT_D128 = "attn-bf16-d128-027b0379515b82e2"
 FINGERPRINT_D64 = "attn-bf16-d64-9a05233ec9351b0d"
 FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
+# the explicit-key-set class per head dim (``mask_fingerprint``); pinned by the same test
+MASK_FINGERPRINTS = {
+    64: "attn-bf16-d64-mask-a6c0fb6237f4f1da",
+    128: "attn-bf16-d128-mask-79713bfb8fb3c998",
+    256: "attn-bf16-d256-mask-f94e81a34c536168",
+}
 
 
-def spec_fingerprint(D: int = 128, window_left: int = -1, causal: bool = True) -> str:
+# the receipts' infix per mask mode (the causal receipts have none)
+FINGERPRINT_INFIX = {
+    MASK_CAUSAL: "",
+    MASK_NON_CAUSAL: "nc-",
+    MASK_KEY_RANGES: "br-",
+    MASK_KEY_SET: "mask-",
+}
+
+
+def sample_key_set(T: int = TILE_KEYS, C: int = CHUNK_LEN) -> FrozenSet[int]:
+    """The declared key set the explicit-key-set class's fingerprint is sampled on, over ``kv_len = C + T // 2 + 1`` keys: key ``k``
+    is visible unless ``k % 3 == 1`` or ``k`` lies in tile 1 -- masked leaves inside every other tile, a tile without a visible key
+    inside a chunk, the chunk merge with the init state and a partial last tile are all in the sample row's term."""
+    return frozenset(
+        k for k in range(C + T // 2 + 1) if k % 3 != 1 and not T <= k < 2 * T
+    )
+
+
+def ranged_sample_row(T: int, C: int) -> RowSpec:
+    """The ranged class's sample row: a windowed causal part in the third chunk and a range that starts inside the first tile and ends
+    inside the second chunk, so the row has a masked head and tail of a tile on both parts, a chunk of which only the first tile is
+    present, tiles and chunk-interior keys absent between the two parts, and three merged chunks."""
+    return RowSpec(p=2 * C + T // 2, window_left=T // 4, brange=(T // 2, C + T // 4))
+
+
+def spec_fingerprint(
+    D: int = 128,
+    window_left: int = -1,
+    causal: Optional[bool] = None,
+    *,
+    mask_mode: Optional[str] = None,
+) -> str:
     """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose visible keys
     span one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
     masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C`` and the mask mode. The window is a
     per-call input of the causal class (like the KV position), not a class dimension: the public receipt
     (``flashinfer.batch_invariant.fingerprint``) is the digest of the no-window sample row; ``window_left`` here only selects
-    another sample row. The mask mode IS a class dimension: the non-causal class (``causal=False``, name ``attn-bf16-d<D>-nc-*``)
-    gives a token the visible set ``[0, kv_len)`` of its request where the causal class gives ``[0, p + 1)``, so the same token
-    has a different term under the two classes; the sample row's term is the same dataflow over the same visible keys in both
-    modes, and the mode enters the digest explicitly."""
-    if not causal and window_left >= 0:
-        raise ValueError("window_left is not a parameter of the non-causal class")
-    key = (D, window_left, bool(causal))
+    another sample row.
+
+    The mask mode IS a class dimension with one receipt per value, stated once: as ``causal`` (``True`` / omitted: the causal
+    class; ``False``: the non-causal class) or as ``mask_mode`` (keyword-only, any of ``MASK_MODES``):
+
+    * ``"non_causal"`` (``attn-bf16-d<D>-nc-*``): a token sees ``[0, kv_len)`` of its request where the causal class gives it
+      ``[0, p + 1)``, so the same token has a different term under the two classes; the sample row's term is the same dataflow
+      over the same visible keys in both modes, and the mode enters the digest explicitly.
+    * ``"key_ranges"`` (``attn-bf16-d<D>-br-*``): rows take a bidirectional key range next to the causal keys. The receipt digests
+      ``ranged_sample_row`` and records the mode; a row without a range has the causal class's term under it, so the two receipts
+      name the same bits for such rows and differ as identifiers of what a row may see.
+    * ``"key_set"`` (``attn-bf16-d<D>-mask-*``): rows take an explicit key set. The receipt digests the row with the declared
+      set ``sample_key_set`` and a row without a visible key. The set is DATA of the class, like the KV position of the causal
+      class: one receipt covers every mask and the mask's values never enter it. The class contains the other three as functions:
+      a row whose set is a causal range, every key of its request, or a causal range united with a key range, has that row's
+      term."""
+    if causal is not None and not isinstance(causal, bool):
+        raise TypeError(
+            f"causal {causal!r}: True or False (a mode name goes to the keyword `mask_mode`)"
+        )
+    if mask_mode is None:
+        mask_mode = mask_mode_of_causal(causal is None or causal)
+    elif causal is not None:
+        raise ValueError("state the mask mode once: `causal` or `mask_mode`")
+    check_mask_mode(mask_mode)
+    if mask_mode == MASK_NON_CAUSAL:
+        if window_left >= 0:
+            raise ValueError("window_left is not a parameter of the non-causal class")
+    elif mask_mode != MASK_CAUSAL and window_left != -1:
+        raise ValueError(f"the {mask_mode} class's receipt has one sample")
+    key = (D, window_left, mask_mode)
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
         spec = AttentionSpec(D)
-        L = spec.C + spec.T // 2 + 1
-        row = (
-            RowSpec(p=L - 1, window_left=window_left)
-            if causal
-            else RowSpec(p=0, causal=False, kv_len=L)
-        )
-        parts = [
-            f"D={D}",
-            f"T={spec.T}",
-            f"C={spec.C}",
-            f"win={window_left}",
-            fingerprint(spec.output(row, 0)),
-            fingerprint(spec.output(row, 1)),
-        ]
-        if not causal:
-            parts.insert(3, "mask=noncausal")
+        parts = [f"D={D}", f"T={spec.T}", f"C={spec.C}"]
+        if mask_mode == MASK_KEY_SET:
+            kv_len = spec.C + spec.T // 2 + 1
+            row = RowSpec(p=0, kv_len=kv_len, keys=sample_key_set(spec.T, spec.C))
+            empty = RowSpec(p=0, kv_len=kv_len, keys=frozenset())
+            parts += [
+                "mask=explicit",
+                fingerprint(spec.output(row, 0)),
+                fingerprint(spec.output(row, 1)),
+                fingerprint(spec.output(empty, 0)),
+            ]
+        else:
+            L = spec.C + spec.T // 2 + 1
+            if mask_mode == MASK_KEY_RANGES:
+                row = ranged_sample_row(spec.T, spec.C)
+                parts.append("mask=causal+ranges")
+            elif mask_mode == MASK_NON_CAUSAL:
+                row = RowSpec(p=0, causal=False, kv_len=L)
+                parts.append("mask=noncausal")
+            else:
+                row = RowSpec(p=L - 1, window_left=window_left)
+            parts += [
+                f"win={window_left}",
+                fingerprint(spec.output(row, 0)),
+                fingerprint(spec.output(row, 1)),
+            ]
         _FINGERPRINTS[key] = (
             f"attn-bf16-d{D}-"
-            + ("" if causal else "nc-")
+            + FINGERPRINT_INFIX[mask_mode]
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _FINGERPRINTS[key]
+
+
+def mask_fingerprint(D: int = 128) -> str:
+    """The explicit-key-set class's identifier at head dim ``D``: ``spec_fingerprint(D, mask_mode="key_set")``."""
+    return spec_fingerprint(D, mask_mode=MASK_KEY_SET)

@@ -112,3 +112,8 @@ def main : IO Unit := do
     IO.println s!"gemmmxw48k64out {steps} {fmt} {(outputKfoldMXW48K64 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
   for (name, P) in attnCases do
     IO.println s!"attn {name} {(Attn.output P).sexpr}"
+  -- the explicit-key-set attention class (custom masks)
+  for (name, P) in attnMaskCases do
+    IO.println s!"attnmask {name} {(Attn.maskOutput P).sexpr}"
+  for (name, P) in attnRangesCases do
+    IO.println s!"attnr {name} {(AttnR.output P).sexpr}"

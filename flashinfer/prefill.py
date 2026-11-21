@@ -3246,6 +3246,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
     wrapper class manages the lifecycle of these data structures.
     """
 
+    #: the kind of the ``batch_invariant=True`` delegate (``attention.batch_invariant.wrappers``); a subclass with its own
+    #: batch-invariant class names its kind here
+    _BATCH_INVARIANT_KIND = "prefill"
+
     @flashinfer_api
     def __init__(
         self,
@@ -3340,8 +3344,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             aligned, optional ``window_left``), ``causal=False`` the non-causal class (every token sees its request's whole key
             range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal
             class, and ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint``
-            takes the same ``causal`` for these wrappers and has no default). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
-            with ``causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            takes the same ``causal`` for these wrappers and has no default). ``custom_mask`` / ``packed_custom_mask`` on
+            :meth:`plan` run the explicit-key-set class (a token's bits depend on its own mask row alone) with the regular
+            semantics: the mask replaces the position-derived keys (``causal`` is not read with one, here or by
+            ``fingerprint(..., custom_mask=True)``), ``window_left`` is ANDed in, a row without a visible key outputs zeros;
+            ``packed_custom_mask`` is the ``segment_packbits(..., bitorder="little")`` layout (every request's bits from a byte
+            boundary). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
+            with ``causal=False`` and no mask, logits soft cap, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
@@ -3390,7 +3399,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._batch_invariant = BatchInvariantAttention(
                 float_workspace_buffer,
                 kv_layout,
-                "prefill",
+                self._BATCH_INVARIANT_KIND,
                 backend,
                 jit_args,
                 use_cuda_graph=use_cuda_graph,
@@ -3787,6 +3796,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 page_size,
                 window_left,
                 causal=causal,
+                masked=custom_mask is not None or packed_custom_mask is not None,
             ), 0
         if self._backend == "cute-dsl-prims":
             qo_indptr_host = qo_indptr.to("cpu")
@@ -6112,8 +6122,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             aligned, optional ``window_left``), ``causal=False`` the non-causal class (every token sees its request's whole key
             range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal
             class, and ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint``
-            takes the same ``causal`` for these wrappers and has no default). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
-            with ``causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            takes the same ``causal`` for these wrappers and has no default). ``custom_mask`` / ``packed_custom_mask`` on
+            :meth:`plan` run the explicit-key-set class (a token's bits depend on its own mask row alone) with the regular
+            semantics: the mask replaces the position-derived keys (``causal`` is not read with one, here or by
+            ``fingerprint(..., custom_mask=True)``), ``window_left`` is ANDed in, a row without a visible key outputs zeros;
+            ``packed_custom_mask`` is the ``segment_packbits(..., bitorder="little")`` layout (every request's bits from a byte
+            boundary). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
+            with ``causal=False`` and no mask, logits soft cap, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests

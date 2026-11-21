@@ -119,6 +119,9 @@ theorem loMode_false (p : Nat) (win : Int) : loMode false p win = 0 := rfl
 
 def visibleR (lo L k : Nat) : Bool := decide (lo ≤ k ∧ k < L)
 
+/-- The causal keys of position `p` under the window `win`: `[loOf p win, p + 1)`. -/
+def visibleG (p : Nat) (win : Int) : Nat → Bool := visibleR (loOf p win) (p + 1)
+
 def tilePresentR (tbits lo L t : Nat) : Bool :=
   (List.range (2 ^ tbits)).any (fun i => visibleR lo L (t * 2 ^ tbits + i))
 
@@ -174,20 +177,27 @@ def pvFold (o0 : ATerm) (pbf : List ATerm) (vt0 d : Nat) : ATerm :=
     let slice := (pbf.drop (16 * j)).take 16
     .mma acc (String.join (slice.map (fun q => " " ++ q.sexpr))) (vt0 + j) d) o0
 
-/-- `spec.tile_step` on a present tile `t`. -/
-def tileStep (P : Core) (st : State) (t : Nat) : State :=
+/-- `spec.tile_step` on a present tile `t` of a row whose visible keys are `vis`: the one tile step of every attention
+class, written once over the visible set (the causal and the non-causal rows give `visibleR lo L`, the explicit-key-set rows
+their own key bits, the ranged rows of `AttentionRanges.lean` the causal keys united with their range). -/
+def tileStepV (steps tbits row d : Nat) (vis : Nat → Bool) (st : State) (t : Nat) : State :=
+  let T := 2 ^ tbits
   let scores : List (Option ATerm) :=
-    (List.range P.T).map (fun i => if P.visible (t * P.T + i) then some (.score P.row (t * P.T + i) P.steps) else none)
-  let mT := (ptree ATerm.fmax P.tbits scores).getD (.const "-inf")
+    (List.range T).map (fun i => if vis (t * T + i) then some (.score row (t * T + i) steps) else none)
+  let mT := (ptree ATerm.fmax tbits scores).getD (.const "-inf")
   let mNew := ATerm.fmax st.m mT
   let alpha := alphaTerm st.m mNew
   let nms := ATerm.mul mNew nc
   let probs : List (Option ATerm) := scores.map (fun s => s.map (fun s => .ex2 (.fma s c nms)))
-  let rT := (ptree ATerm.add P.tbits probs).getD (.const "0.0")
+  let rT := (ptree ATerm.add tbits probs).getD (.const "0.0")
   let lNew := ATerm.fma st.l alpha rT
   let pbf := probs.map (fun q => ATerm.cvt "bf16" (q.getD (.const "0.0")))
-  let oNew := pvFold (.mul st.o alpha) pbf (t * (P.T / 16)) P.d
+  let oNew := pvFold (.mul st.o alpha) pbf (t * (T / 16)) d
   ⟨mNew, lNew, oNew⟩
+
+/-- `spec.tile_step` on a present tile `t` of a row whose visible keys are a range `[lo, L)` (the causal and the non-causal
+class). -/
+def tileStep (P : Core) (st : State) (t : Nat) : State := tileStepV P.steps P.tbits P.row P.d P.visible st t
 
 /-- `spec.merge`: the running state `a` with the finished chunk `b`. -/
 def merge (a b : State) : State :=
@@ -388,5 +398,293 @@ theorem config_invariance (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : Params) (
 theorem space_invariant (space : List Config) :
     ∀ b₁ ∈ space, ∀ b₂ ∈ space, ∀ (f₁ f₂ : Bool) (P : Params) (σ τ : Nat → Nat), kernel b₁ f₁ P σ = kernel b₂ f₂ P τ :=
   fun b₁ _ b₂ _ f₁ f₂ P σ τ => config_invariance b₁ b₂ f₁ f₂ P σ τ
+
+/-! ## Rows stated by their visible set: the one formulation behind every mask mode
+
+What a row sees is the only thing in which the attention classes differ (`spec.MASK_MODES`): the causal keys of its position,
+every key of its request (non-causal), the causal keys united with a key range, or an explicit key set. The dataflow reads the row's visible set alone -- the tile step `tileStepV`,
+the per-chunk fold, the merge and the epilogue below take `vis` and one bound `L` past the last key the row may see -- so it is
+stated ONCE here, and every class is an instance of it: `Params.toV` (causal: `vis k = lo ≤ k ∧ k < p + 1`; non-causal:
+`vis k = k < kvLen`, `noncausal_toV`), `MParams.toV` (explicit key set),
+`AttnR.Params.toV` (`AttentionRanges.lean`: causal keys united with a range). A key outside the set is an absent leaf; a tile
+or a chunk without a visible key is dropped; a row without one outputs `cvt_bf16(+0)` (`spec.output_elem_or_zero`: a declared
+rule; the kernels take it from the row's own `l`). The theorems that hold for every way of stating the set -- split kernel ==
+fused, configuration invariance, the launch model's batch / permutation / sub-batch invariance and row locality -- are proved
+here once; the instances only say which set a row has. Two rows with the same visible set have the same term whatever mode
+stated it (`vOutput` is a function of the `VParams`), which is how a causal-range key set is the causal row, an all-ones key
+set and a whole-request key range are the non-causal row, and a `causal ∪ [a, b)` key set is the ranged row. -/
+
+/-- One logical row by its visible set: head dim as `steps = D/16`, tile `T = 2^tbits`, chunk `C`, the predicate `vis` over
+the absolute key index and `L`, one past the last key the row may see (the chunks `[0, ⌈L / C⌉)` are the candidates), the row
+id of the Q leaves, the output column `d`. -/
+structure VParams where
+  steps : Nat
+  tbits : Nat
+  C : Nat
+  L : Nat
+  vis : Nat → Bool
+  row : Nat
+  d : Nat
+
+def tilePresentV (tbits : Nat) (vis : Nat → Bool) (t : Nat) : Bool :=
+  (List.range (2 ^ tbits)).any (fun i => vis (t * 2 ^ tbits + i))
+
+def tilesOfChunkV (tbits C : Nat) (vis : Nat → Bool) (j : Nat) : List Nat :=
+  ((List.range (C / 2 ^ tbits)).map (fun i => j * (C / 2 ^ tbits) + i)).filter (tilePresentV tbits vis)
+
+def presentChunksV (tbits C L : Nat) (vis : Nat → Bool) : List Nat :=
+  (List.range ((L + C - 1) / C)).filter (fun j => !(tilesOfChunkV tbits C vis j).isEmpty)
+
+def VParams.tilesOfChunk (P : VParams) (j : Nat) : List Nat := tilesOfChunkV P.tbits P.C P.vis j
+def VParams.presentChunks (P : VParams) : List Nat := presentChunksV P.tbits P.C P.L P.vis
+
+/-- The per-chunk fold: the present tiles of chunk `j`, ascending, from the init state. -/
+def vChunkState (P : VParams) (j : Nat) : State :=
+  (P.tilesOfChunk j).foldl (tileStepV P.steps P.tbits P.row P.d P.vis) initState
+
+/-- The fused path: present chunks merged in index order from the init state. -/
+def vFused (P : VParams) : State := P.presentChunks.foldl (fun acc j => merge acc (vChunkState P j)) initState
+
+/-- The term of a row with a visible key. -/
+def vTerm (P : VParams) : ATerm := epilogue (vFused P)
+
+/-- The output of a row without a visible key. -/
+def zeroOut : ATerm := .cvt "bf16" (.const "0.0")
+
+/-- `AttentionSpec.output` of a row stated by its visible set. -/
+def vOutput (P : VParams) : ATerm := if P.presentChunks.isEmpty then zeroOut else vTerm P
+
+/-- The split kernel: every chunk's state in its workspace slot whatever CTA `σ` computed it on, the present slots folded in
+index order. ONE rule for which slots are present, for every mask mode whose keys are data: a slot is present when its state
+is not the init state (the row had a visible key in the chunk) -- the list `presentChunks`, and the rule the fused path's
+merge follows. -/
+def vSplitKernel (P : VParams) (_σ : Nat → Nat) : ATerm :=
+  if P.presentChunks.isEmpty then zeroOut else epilogue (fixup (fun j => vChunkState P j) P.presentChunks)
+
+theorem vSplitKernel_eq_fused (P : VParams) (σ : Nat → Nat) : vSplitKernel P σ = vOutput P := rfl
+
+/-- A row without a present chunk outputs `+0`. -/
+theorem v_empty_row (P : VParams) (h : P.presentChunks = []) : vOutput P = zeroOut := by
+  simp [vOutput, h]
+
+/-- A row with a present chunk has the plain term: the `+0` rule is inert for it. -/
+theorem vOutput_eq_term (P : VParams) (h : P.presentChunks ≠ []) : vOutput P = vTerm P := by
+  simp [vOutput, h]
+
+/-- A row's output under a configuration, as `kernel` for the causal class. -/
+def vKernel (b : Config) (fusedAuto : Bool) (P : VParams) (σ : Nat → Nat) : ATerm :=
+  if b.policy == 2 || (b.policy == 0 && fusedAuto) then vOutput P else vSplitKernel P σ
+
+/-- **Configuration invariance (R3)**, for every way of stating the visible set. -/
+theorem v_config_invariance (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : VParams) (σ τ : Nat → Nat) :
+    vKernel b₁ f₁ P σ = vKernel b₂ f₂ P τ := by
+  unfold vKernel
+  split <;> split <;> rfl
+
+/-- A row whose visible keys are a range `[lo, L)` as a visible-set row. -/
+def Core.toV (G : Core) : VParams := ⟨G.steps, G.tbits, G.C, G.L, visibleR G.lo G.L, G.row, G.d⟩
+
+/-- The causal or non-causal row as a visible-set row. -/
+def Params.toV (P : Params) : VParams := P.core.toV
+
+/-- **The causal and the non-causal class are the visible-set formulation at their key ranges**: the same term, by
+definition. -/
+theorem range_row_is_visible_set_row (P : Params) : output P = vTerm P.toV := rfl
+
+/-- The causal row's visible set: the causal keys of its position, up to `p + 1`. -/
+theorem causal_toV (P : Params) (h : P.causal = true) :
+    P.toV = ⟨P.steps, P.tbits, P.C, P.p + 1, visibleG P.p P.win, P.row, P.d⟩ := by
+  simp [Params.toV, Core.toV, Params.core, Params.L, Params.lo, LMode, loMode, h, visibleG]
+
+/-- **The non-causal row is the visible-set row with `vis k = k < kvLen`**: every key of its request, whatever its position. -/
+theorem noncausal_toV (P : Params) (h : P.causal = false) :
+    P.toV = ⟨P.steps, P.tbits, P.C, P.kvLen, fun k => decide (k < P.kvLen), P.row, P.d⟩ := by
+  have hv : visibleR 0 P.kvLen = fun k => decide (k < P.kvLen) := by
+    funext k
+    simp [visibleR]
+  simp [Params.toV, Core.toV, Params.core, Params.L, Params.lo, LMode, loMode, h, hv]
+
+theorem noncausal_row_is_visible_set_row (P : Params) (h : P.causal = false) :
+    output P = vTerm ⟨P.steps, P.tbits, P.C, P.kvLen, fun k => decide (k < P.kvLen), P.row, P.d⟩ := by
+  rw [← noncausal_toV P h]
+  rfl
+
+/-! ### The launch model, once for every per-row term
+
+A launch applies a per-row term `out` to every row; a row's data (`α`: its position, its key set, its range, its head, its
+identity) is all that enters. The causal and the non-causal class's `launch` above is this at `rowOutput`; the two classes whose keys are data
+instantiate it below and in `AttentionRanges.lean`. -/
+
+def launchOf {α : Type} (out : α → ATerm) (M : Nat) (rows : Fin M → α) (r : Fin M) : ATerm := out (rows r)
+
+/-- **Batch invariance (R2)**: equal rows give equal outputs whatever the batch size, the row's place or its neighbours. -/
+theorem launchOf_batch_invariance {α : Type} (out : α → ATerm) {M₁ M₂ : Nat}
+    (rows₁ : Fin M₁ → α) (rows₂ : Fin M₂ → α) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
+    launchOf out M₁ rows₁ r₁ = launchOf out M₂ rows₂ r₂ := by
+  simp only [launchOf, h]
+
+/-- **Row locality**: two launches that agree on row `r` agree on its output, whatever the data of every other row. -/
+theorem launchOf_row_locality {α : Type} (out : α → ATerm) {M : Nat} (rows rows' : Fin M → α) (r : Fin M)
+    (h : rows r = rows' r) : launchOf out M rows r = launchOf out M rows' r :=
+  launchOf_batch_invariance out rows rows' r r h
+
+theorem launchOf_permutation_invariance {α : Type} (out : α → ATerm) {M : Nat} (rows : Fin M → α) (σ : Fin M → Fin M)
+    (r : Fin M) : launchOf out M (rows ∘ σ) r = launchOf out M rows (σ r) := rfl
+
+theorem launchOf_subbatch_invariance {α : Type} (out : α → ATerm) {M k : Nat} (rows : Fin M → α) (sel : Fin k → Fin M)
+    (i : Fin k) : launchOf out k (rows ∘ sel) i = launchOf out M rows (sel i) := rfl
+
+/-- The causal and the non-causal launch are the launch model at their per-row term. -/
+theorem launch_is_launchOf (causal : Bool) (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat)
+    (r : Fin M) : launch causal M rows steps tbits C win d r = launchOf (rowOutput causal steps tbits C win d) M rows r := rfl
+
+/-! ## The explicit-key-set class (custom masks): `attention.bf16.mask`
+
+A row's visible keys are DATA: a list of key bits over its request's keys `[0, keys.length)` (FlashInfer's `custom_mask` row,
+ANDed with the window by the wrapper). The class is the visible-set formulation at that list (`MParams.toV`): the term is a
+function of the row's own key set; no other row's set, and nothing of the batch, appears in `maskOutput`. -/
+
+/-- The fixed data of one row of the explicit-key-set class: head dim as `steps = D/16`, tile `T = 2^tbits`, chunk `C`, the
+row's key bits over `[0, keys.length)`, the row id of the Q leaves, the output column `d`. -/
+structure MParams where
+  steps : Nat
+  tbits : Nat
+  C : Nat
+  keys : List Bool
+  row : Nat
+  d : Nat
+
+def MParams.T (P : MParams) : Nat := 2 ^ P.tbits
+def MParams.visible (P : MParams) (k : Nat) : Bool := P.keys.getD k false
+/-- The key-set row as a visible-set row. -/
+def MParams.toV (P : MParams) : VParams := ⟨P.steps, P.tbits, P.C, P.keys.length, P.visible, P.row, P.d⟩
+def MParams.presentChunks (P : MParams) : List Nat := P.toV.presentChunks
+
+/-- `AttentionSpec.output` of a row with an explicit key set. -/
+def maskOutput (P : MParams) : ATerm := vOutput P.toV
+
+/-- The split kernel of the class (`vSplitKernel`). -/
+def mSplitKernel (P : MParams) (σ : Nat → Nat) : ATerm := vSplitKernel P.toV σ
+
+theorem mSplitKernel_eq_fused (P : MParams) (σ : Nat → Nat) : mSplitKernel P σ = maskOutput P := rfl
+
+/-- A row without a present chunk outputs `+0`. -/
+theorem mask_empty_row (P : MParams) (h : P.presentChunks = []) : maskOutput P = zeroOut := v_empty_row P.toV h
+
+/-- A row of a launch of the class: its own key bits, its head, its row id. -/
+structure MRow where
+  keys : List Bool
+  h : Nat
+  row : Nat
+  deriving DecidableEq, Repr
+
+def mRowOutput (steps tbits C d : Nat) (r : MRow) : ATerm := maskOutput ⟨steps, tbits, C, r.keys, r.row, d⟩
+
+/-- The launch applies the per-row term to every row: each row brings its own key set, there is no batch parameter inside. -/
+def mLaunch (M : Nat) (rows : Fin M → MRow) (steps tbits C d : Nat) (r : Fin M) : ATerm :=
+  launchOf (mRowOutput steps tbits C d) M rows r
+
+/-- **Batch invariance (R2)** with per-row key sets (`launchOf_batch_invariance`). -/
+theorem mask_batch_invariance (steps tbits C d : Nat) {M₁ M₂ : Nat}
+    (rows₁ : Fin M₁ → MRow) (rows₂ : Fin M₂ → MRow) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
+    mLaunch M₁ rows₁ steps tbits C d r₁ = mLaunch M₂ rows₂ steps tbits C d r₂ :=
+  launchOf_batch_invariance _ rows₁ rows₂ r₁ r₂ h
+
+/-- **A row's output depends on its own key set alone** (`launchOf_row_locality`). -/
+theorem mask_row_locality (steps tbits C d : Nat) {M : Nat} (rows rows' : Fin M → MRow) (r : Fin M) (h : rows r = rows' r) :
+    mLaunch M rows steps tbits C d r = mLaunch M rows' steps tbits C d r :=
+  launchOf_row_locality _ rows rows' r h
+
+theorem mask_permutation_invariance (steps tbits C d : Nat) {M : Nat} (rows : Fin M → MRow) (σ : Fin M → Fin M) (r : Fin M) :
+    mLaunch M (rows ∘ σ) steps tbits C d r = mLaunch M rows steps tbits C d (σ r) := rfl
+
+theorem mask_subbatch_invariance (steps tbits C d : Nat) {M k : Nat} (rows : Fin M → MRow) (sel : Fin k → Fin M) (i : Fin k) :
+    mLaunch k (rows ∘ sel) steps tbits C d i = mLaunch M rows steps tbits C d (sel i) := rfl
+
+/-- The key bits of a causal range over a request of `kvLen` keys: the mask row that reproduces the causal row at position
+`p` with window `win`. The generated cases decide `maskOutput` of it equal to the causal `output` on the toy rows. -/
+def causalKeys (kvLen p : Nat) (win : Int) : List Bool := (List.range kvLen).map (visibleG p win)
+
+/-- The wrapper's AND of the window into a mask row: token `i` of `qLen` keeps key `k` when `kvLen - qLen + i - win ≤ k`
+(the regular kernels' rule, also for more query tokens than keys); a negative `win` is no window. -/
+def windowKeys (keys : List Bool) (qLen i : Nat) (win : Int) : List Bool :=
+  if win < 0 then keys
+  else (List.range keys.length).map
+    (fun k => keys.getD k false && decide ((keys.length : Int) - (qLen : Int) + (i : Int) - win ≤ (k : Int)))
+
+/-- A row's output under a configuration (`vKernel`). -/
+def mKernel (b : Config) (fusedAuto : Bool) (P : MParams) (σ : Nat → Nat) : ATerm := vKernel b fusedAuto P.toV σ
+
+/-- **Configuration invariance (R3)** of the explicit-key-set class (`v_config_invariance`). -/
+theorem mask_config_invariance (b₁ b₂ : Config) (f₁ f₂ : Bool) (P : MParams) (σ τ : Nat → Nat) :
+    mKernel b₁ f₁ P σ = mKernel b₂ f₂ P τ := v_config_invariance b₁ b₂ f₁ f₂ P.toV σ τ
+
+/-! ### A key set equal to a row's visible set is that row
+
+The explicit-key-set class contains the other classes as functions: the key-set row whose bits are a row's visible set over
+`[0, L)` IS that row as a visible-set row, so it has its term. Stated once for any visible set that is empty from `L` on; the
+causal row and the non-causal row (here) and the ranged row (`AttnR.key_set_row_of_range_row`) are its uses. The generated cases decide the same
+equalities over longer requests (key bits past the row's last visible key). -/
+
+/-- The key-set row with the visible set of `V` over `[0, V.L)`. -/
+def MParams.ofV (V : VParams) : MParams := ⟨V.steps, V.tbits, V.C, (List.range V.L).map V.vis, V.row, V.d⟩
+
+theorem getD_map_range (f : Nat → Bool) (L k : Nat) (hout : ∀ k, L ≤ k → f k = false) :
+    ((List.range L).map f).getD k false = f k := by
+  by_cases hk : k < L
+  · simp [List.getD_eq_getElem?_getD, hk]
+  · have h := hout k (by omega)
+    have hn : (List.range L)[k]? = none := List.getElem?_eq_none (by simp; omega)
+    simp [List.getD_eq_getElem?_getD, hn, h]
+
+theorem ofV_toV (V : VParams) (hout : ∀ k, V.L ≤ k → V.vis k = false) : (MParams.ofV V).toV = V := by
+  have hv : (MParams.ofV V).visible = V.vis := by
+    funext k
+    exact getD_map_range V.vis V.L k hout
+  cases V
+  simp_all [MParams.ofV, MParams.toV]
+
+/-- **A key set equal to a row's visible set gives that row's term.** -/
+theorem key_set_row_of_visible_set (V : VParams) (hout : ∀ k, V.L ≤ k → V.vis k = false) (hne : V.presentChunks ≠ []) :
+    maskOutput (MParams.ofV V) = vTerm V := by
+  unfold maskOutput
+  rw [ofV_toV V hout]
+  exact vOutput_eq_term V hne
+
+/-- **A key set equal to a row's key range is that row**, under both position-derived modes: the mask row
+`causalKeys (p + 1) p win` gives the causal class's term (and hence its bits and the decode step's), the mask row of every
+key of the request the non-causal class's. -/
+theorem key_set_row_of_causal_row (P : Params) (hne : P.presentChunks ≠ []) :
+    maskOutput (MParams.ofV P.toV) = output P := by
+  apply key_set_row_of_visible_set P.toV _ hne
+  intro k hk
+  have hk' : P.L ≤ k := hk
+  have : ¬ (P.lo ≤ k ∧ k < P.L) := by omega
+  simp [Params.toV, Core.toV, Params.core, visibleR, this]
+
+/-- The all-ones mask row over a request of `kvLen` keys. -/
+def allKeys (kvLen : Nat) : List Bool := List.replicate kvLen true
+
+theorem map_range_all_visible (n : Nat) : (List.range n).map (visibleR 0 n) = allKeys n := by
+  apply List.ext_getElem
+  · simp [allKeys]
+  · intro i h₁ h₂
+    have hi : i < n := by simpa using h₁
+    simp [allKeys, visibleR, hi]
+
+/-- **An all-ones key set is the non-causal row**: the mask row that shows a token every key of its request gives the
+non-causal class's term, whatever the token's position (the same visible set, so the same term and the same bits). -/
+theorem all_keys_row_is_noncausal_row (P : Params) (h : P.causal = false) (hne : P.presentChunks ≠ []) :
+    maskOutput ⟨P.steps, P.tbits, P.C, allKeys P.kvLen, P.row, P.d⟩ = output P := by
+  have e : (⟨P.steps, P.tbits, P.C, allKeys P.kvLen, P.row, P.d⟩ : MParams) = MParams.ofV P.toV := by
+    simp [MParams.ofV, Params.toV, Core.toV, Params.core, Params.L, Params.lo, LMode, loMode, h, map_range_all_visible]
+  rw [e]
+  exact key_set_row_of_causal_row P hne
+
+/-- **The key set reaches the term**: two key sets differing in one key are different terms (a toy row, decided), so the
+class is a function of the mask and one receipt covers it only because the mask is an input, as the position is. -/
+theorem mask_output_depends_on_keys :
+    maskOutput ⟨4, 4, 32, [true, false, true, true], 0, 0⟩ ≠ maskOutput ⟨4, 4, 32, [true, true, true, true], 0, 0⟩ := by
+  native_decide
 
 end BIK.Attn

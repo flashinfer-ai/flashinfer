@@ -160,7 +160,13 @@ def test_lean_model_matches_python_engine_and_spec():
     assert r.returncode == 0, (r.stdout + r.stderr)[-4000:]
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
-    kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
+    kinds = {
+        "gemmbias": "spec",
+        "fp4class": "fp4class",
+        "attn": "attn",
+        "attnmask": "attn",
+        "attnr": "attn",
+    }
     # the block-scale fp8 class: the output at (0, 0) and at (3, 129) per (blocks, format), the promotion loop per block count
     kinds.update({"gemmfp8bs": "out", "gemmfp8bs2": "out", "gemmfp8bsloop": "loop"})
     for F in lean_cases.FORMATS:
@@ -191,7 +197,7 @@ def test_lean_model_matches_python_engine_and_spec():
             lean[("fp4class", int(N), int(K))] = bool(int(b))
         elif kind == "attn":
             _, name, sx = line.split(" ", 2)
-            lean[("attn", name)] = sx
+            lean[(tag, name)] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -237,6 +243,13 @@ def test_lean_model_matches_python_engine_and_spec():
         checked += 1
     for name, *_, sx in lean_cases.attn_cases():
         assert lean[("attn", name)] == sx, name
+        checked += 1
+    # the explicit-key-set attention class (custom masks)
+    for name, *_, sx in lean_cases.attn_mask_cases():
+        assert lean[("attnmask", name)] == sx, name
+        checked += 1
+    for name, *_, sx in lean_cases.attn_range_cases():
+        assert lean[("attnr", name)] == sx, name
         checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80
