@@ -1522,7 +1522,14 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         if cutlass.const_expr(self.needs_beta):
             # Reads of the beta stage complete before its refill (see the k
             # release below).
-            cute.arch.fence_view_async_shared()
+            if cutlass.const_expr(
+                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+            ):
+                cute.arch.inline_ptx(
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                )
+            else:
+                cute.arch.fence_view_async_shared()
             beta_pipeline.consumer_release(beta_consumer_state)
             beta_consumer_state.advance()
 
@@ -1557,7 +1564,14 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             cute.gemm(o1_tiled_mma, tOrO, tOrKV, tOrQ, tOrO)
             self.o1_epi(tOrO, tOcO, sAlpha, alpha_stage, scale)
         # Reads of the q stage complete before its refill (see the k release).
-        cute.arch.fence_view_async_shared()
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_view_async_shared()
         q_pipeline.consumer_release(q_consumer_state)
         q_consumer_state.advance()
 
@@ -1594,7 +1608,14 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         )
         self._math_order_notify(wg_idx)
         # Reads of the v stage complete before its refill (see the k release).
-        cute.arch.fence_view_async_shared()
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_view_async_shared()
         v_pipeline.consumer_release(v_consumer_state)
         v_consumer_state.advance()
 
@@ -1639,7 +1660,14 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         # land before a queued read, and the KV update then uses the K of
         # block + 2. The fence completes this thread's shared-memory reads
         # before the release. It also covers the alpha reads released below.
-        cute.arch.fence_view_async_shared()
+        if cutlass.const_expr(
+            (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+        ):
+            cute.arch.inline_ptx(
+                "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+            )
+        else:
+            cute.arch.fence_view_async_shared()
         k_pipeline.consumer_release(k_consumer_state)
         k_consumer_state.advance()
         if cutlass.const_expr(self.needs_alpha):
