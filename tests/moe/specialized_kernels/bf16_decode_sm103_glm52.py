@@ -433,28 +433,43 @@ def _check_concurrent_streams(spec, ctx):
     accumulators, counters, launch parity); launches serialize on it in the
     kernels, so each call produces its own result: eager calls on two streams,
     then a CUDA graph replayed on one stream next to eager calls on another.
-    Every output is pre-filled with NaN and checked."""
+    Every output is pre-filled with NaN and checked, and the dispatch counters
+    show that every eager call and every captured launch ran the kernels (a
+    launch that failed would run trtllm-gen, with the same numerics). Stream 1
+    routes every token to the same eight experts; with ``eager_tokens`` its
+    calls have another token count than stream 0 and the graph, e.g. six-token
+    graphs (kernel B's bulk-reduction path) next to ten-token calls on kernel
+    B's wide returning-atomic path."""
     num_tokens = ctx.num_tokens
+    eager_tokens = getattr(ctx, "eager_tokens", num_tokens)
     _, weight_pack = _weights()
     runner = _runner(MoELayer(_config()))
     inputs = [
-        _inputs(num_tokens, kind, seed=300 + k)
-        for k, kind in enumerate(["serving", "skew"])
+        _inputs(num_tokens, "serving", seed=300),
+        _inputs(eager_tokens, "skew", seed=301),
     ]
     packs = [_pack(*x) for x in inputs]
     references = [_reference(*x)[0] for x in inputs]
     rounds = 16
 
-    def nan_outputs():
+    def nan_outputs(tokens):
         return [
-            torch.full(
-                (num_tokens, _H), float("nan"), dtype=torch.bfloat16, device="cuda"
-            )
+            torch.full((tokens, _H), float("nan"), dtype=torch.bfloat16, device="cuda")
             for _ in range(rounds)
         ]
 
+    def counters():
+        stats = bf16_decode.stats()
+        assert not stats["run_errors"], stats["run_errors"]
+        return (
+            stats["dispatch_count"],
+            stats["capture_dispatch_count"],
+            stats["dispatched_num_tokens"],
+        )
+
+    start = counters()
     streams = [torch.cuda.Stream() for _ in packs]
-    outs = [nan_outputs() for _ in packs]
+    outs = [nan_outputs(t) for t in (num_tokens, eager_tokens)]
     for stream in streams:
         stream.wait_stream(torch.cuda.current_stream())
     for r in range(rounds):
@@ -464,6 +479,8 @@ def _check_concurrent_streams(spec, ctx):
     for stream in streams:
         torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
+    eager = counters()
+    assert eager[0] - start[0] == 2 * rounds and eager[1] == start[1]
     for k, reference in enumerate(references):
         for out in outs[k]:
             _assert_close(out, reference)
@@ -475,8 +492,10 @@ def _check_concurrent_streams(spec, ctx):
     with torch.cuda.graph(graph, stream=capture_stream):
         graph_outs = [_run_kernel(runner, packs[0], weight_pack) for _ in range(4)]
     torch.cuda.synchronize()
-    snapshots = [nan_outputs() for _ in graph_outs]
-    outs = nan_outputs()
+    built = counters()
+    assert built[0] - eager[0] == 4 and built[1] - eager[1] == 4
+    snapshots = [nan_outputs(num_tokens) for _ in graph_outs]
+    outs = nan_outputs(eager_tokens)
     for stream in streams:
         stream.wait_stream(torch.cuda.current_stream())
     for r in range(rounds):
@@ -491,6 +510,13 @@ def _check_concurrent_streams(spec, ctx):
     for stream in streams:
         torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
+    # replays run no Python: only the eager calls are new dispatches
+    done = counters()
+    assert done[0] - built[0] == rounds and done[1] == built[1]
+    expected = dict(start[2])
+    for tokens, calls in ((num_tokens, rounds + 4), (eager_tokens, 2 * rounds)):
+        expected[tokens] = expected.get(tokens, 0) + calls
+    assert done[2] == dict(sorted(expected.items()))
     for snapshot in snapshots:
         for out in snapshot:
             _assert_close(out, references[0])
@@ -693,7 +719,8 @@ SPEC = _Bf16DecodeSpec(
         Check(
             "concurrent_streams",
             _check_concurrent_streams,
-            _params(num_tokens=(1, 2, 6, 10)),
+            _params(num_tokens=(1, 2, 6, 10))
+            + (("num_tokens6-eager_tokens10", {"num_tokens": 6, "eager_tokens": 10}),),
         ),
         Check("cuda_graph_pool_replay", _check_cuda_graph_pool_replay),
     ),

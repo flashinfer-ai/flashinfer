@@ -41,7 +41,7 @@ Build: the module is loaded (JIT-compiled, or taken from the AOT cache) and
 launched once per allowlisted token count on a dummy problem by the first eager
 call admitted, outside any capture. Under CUDA-graph capture a call is admitted
 only when the kernels are loaded and this binding already admitted the same
-token count eagerly, i.e. when ``MoELayer`` already timed its candidates for
+token count eagerly, i.e. when ``MoELayer`` already selected its winner for
 that call outside capture; nothing is built inside a capture.
 
 The kernels keep cross-CTA state in device globals of the loaded module (one
