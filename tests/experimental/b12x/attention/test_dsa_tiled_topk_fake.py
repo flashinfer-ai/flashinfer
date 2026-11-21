@@ -14,11 +14,12 @@ def test_indexer_dlpack_helpers_skip_fake_storage(monkeypatch) -> None:
 
     monkeypatch.setattr(contiguous_kernel, "from_dlpack", fail)
     monkeypatch.setattr(tiled_topk, "from_dlpack", fail)
+    initialized_before = torch.cuda.is_initialized()
     with FakeTensorMode(), compile_only_launches():
         values = torch.empty((2, 4), device="cuda")
         contiguous_kernel._to_kernel_tensor(values, contiguous_kernel.cutlass.Float32)
         tiled_topk._to_kernel_tensor(values, tiled_topk.cutlass.Float32)
-        assert not torch.cuda.is_initialized()
+        assert torch.cuda.is_initialized() == initialized_before
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
