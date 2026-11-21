@@ -305,11 +305,11 @@ class Package:
 
 # The ulysses, the NVFP4 SVDQuant GEMM, the Sage
 # block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention (and its per-tile-max
-# variant cake_nvfp4_ptilemax_attention), the SM90 VSA,
+# variant cake_nvfp4_ptilemax_attention), the fp4_mla cache MLA decode (cake_fp4_mla_decode), the SM90 VSA,
 # the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm), the experimental batched FP8 projection (deepgemm_batched_gemm) and the experimental Mega Gate (deepgemm_mega_gate) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
 # ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and ``library``
 # (ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
-# nvfp4_attention, cake_nvfp4_ptilemax_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES).
+# nvfp4_attention, cake_nvfp4_ptilemax_attention, cake_fp4_mla_decode, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES).
 PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_ulysses_backend",
@@ -380,6 +380,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.cake_nvfp4_ptilemax_attention",
         "flashinfer/experimental/cake_nvfp4_ptilemax_attention",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_fp4_mla_decode",
+        "flashinfer/experimental/cake_fp4_mla_decode",
         "cake_jit.py",
         refs_generic,
     ),
