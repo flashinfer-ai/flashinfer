@@ -82,6 +82,7 @@ exclude = [
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.fused_moe.specialized" = ["*.json"]
 "flashinfer.cute_dsl.attention.fmha.rubin_gqa" = ["LICENSE"]
 "flashinfer.experimental.hc_sum_sm100" = ["csrc/**", "README.md", "SOURCES.md"]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]

@@ -2746,6 +2746,99 @@ class SM12xFp8Config:
 
 
 @dataclass(frozen=True)
+class SpecializedFp8BlockConfig:
+    """Specialized (agent-generated) SM120 DeepSeek FP8 block-scale backend
+    (its own module,
+    ``flashinfer/fused_moe/specialized/fp8_blockscale_moe_sm120.py`` — not a
+    CUTLASS kernel, and not reachable through ``cutlass_fused_moe``):
+    fp8 e4m3 weights with fp32 ``[128, 128]`` block scales, BF16 activations
+    in/out, default SwiGLU, pre-routed (``PackedPrecomputed``) inputs only.
+    The kernels' shipped dispatch surface stays authoritative: the backend
+    serves only its generated contract (``num_experts=256, top_k=8,
+    hidden_size=2048, intermediate_size=512``), the validated SM120 device
+    profile, and the shipped ``num_tokens`` allowlist; the
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` kill switch removes it from
+    the candidate set at layer construction and refuses it at call time.
+
+    A DEFAULT backend candidate: ``supported()`` gates the arch (SM120) and
+    the runner gates the contract and per-call token allowlist, so under
+    ``backend=auto`` the ``MoELayer`` cross-backend shootout times the
+    specialized kernels directly on matching layers with no opt-in. It is a
+    default candidate, not the only SM120 FP8 block-scale implementation:
+    the opt-in CuTe-DSL route (:class:`SM12xFp8Config`) also serves DeepSeek
+    FP8 on SM120.
+
+    This backend does not guarantee bitwise repeatability. Some variants
+    combine expert contributions with floating-point atomic adds; their
+    arrival order can change the rounded result even for identical inputs,
+    including on graph replay. If bitwise repeatability is required,
+    exclude this candidate before capture and use only an implementation
+    verified for that requirement on the deployment, or refuse the call.
+    Disabling the backend does not change graphs already captured with it.
+
+    The allowlist's largest variant (16,384 tokens) exceeds
+    ``ExecutionConfig``'s default ``tune_max_num_tokens=8192``, and
+    ``MoELayer`` rejects an over-limit call before backend eligibility is
+    checked; layers that must serve that variant need
+    ``ExecutionConfig(tune_max_num_tokens=16384)``.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        # The shipped dispatch surface pins CC 12.0 exactly (its cooperative
+        # grids are sized for the validated device profile); SM121 is not
+        # guard-allowed.
+        return arch == 120
+
+    @staticmethod
+    def prepare_weights(w13_weight, w13_weight_sf, w2_weight, w2_weight_sf):
+        """Build the native weight view in the kernels' own layout.
+
+        ``w13_weight`` is the fp8 ``[E, 2I, H]`` fc1 stack in the canonical
+        ``MoEWeightPack`` ``[up, gate]`` row order; the kernels read the
+        first fc1 half as gate, so this helper swaps the halves of the
+        payload and of its block scales together (``MoEWeightPack`` rule:
+        backends that want ``[gate, up]`` swap inside their prepare helper).
+        ``w13_weight_sf`` is fp32 ``[E, 2I/128, H/128]``; ``w2_weight`` is
+        fp8 ``[E, H, I]`` with ``w2_weight_sf`` fp32 ``[E, H/128, I/128]``.
+        Register the result with
+        ``MoEWeightPack.prepare_for("specialized_fp8_block", ...)``.
+        """
+        if w13_weight.ndim != 3 or w13_weight.shape[1] % 2:
+            raise ValueError(
+                "w13_weight must be [E, 2I, H] with rows in canonical "
+                f"[up, gate] order; got shape {tuple(w13_weight.shape)}."
+            )
+        if w13_weight_sf.ndim != 3 or w13_weight_sf.shape[1] % 2:
+            raise ValueError(
+                "w13_weight_sf must be [E, 2I/128, H/128] block scales for "
+                "canonical [up, gate] rows; got shape "
+                f"{tuple(w13_weight_sf.shape)}."
+            )
+        half = w13_weight.shape[1] // 2
+        sf_half = w13_weight_sf.shape[1] // 2
+        w13_native = torch.cat(
+            (w13_weight[:, half:], w13_weight[:, :half]), dim=1
+        ).contiguous()
+        w13_sf_native = torch.cat(
+            (w13_weight_sf[:, sf_half:], w13_weight_sf[:, :sf_half]), dim=1
+        ).contiguous()
+        return {
+            "w13_weight": w13_native,
+            "w13_weight_sf": w13_sf_native,
+            # The launch guard refuses noncontiguous operands
+            # (fc2_weights_form), so normalize storage here: a checkpoint
+            # can produce the documented [E, H, I] fc2 shape by transposing
+            # [E, I, H]. Already-contiguous tensors pass through unchanged.
+            "w2_weight": w2_weight.contiguous(),
+            "w2_weight_sf": w2_weight_sf.contiguous(),
+        }
+
+    def __repr__(self) -> str:
+        return "SpecializedFp8BlockConfig()"
+
+
+@dataclass(frozen=True)
 class SM12xMxfp8Mxfp4Config:
     """SM120/SM121 CuTe-DSL MXFP8 x MXFP4 backend."""
 
@@ -3626,6 +3719,7 @@ BackendConfigType = Union[
     CutlassHummingConfig,
     CuteDslConfig,
     SM12xFp8Config,
+    SpecializedFp8BlockConfig,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
@@ -3673,6 +3767,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassHummingConfig,
     CuteDslConfig,
     SM12xFp8Config,
+    SpecializedFp8BlockConfig,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
@@ -3732,6 +3827,11 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
+        # Specialized agent-generated kernels: first-class auto/autotune
+        # candidates on the layers they were optimized for (supported() and
+        # the runner gate arch + contract; out-of-domain calls are declined
+        # and served by the other candidates).
+        SpecializedFp8BlockConfig(),
         CuteDslConfig(),
         CuTileMxfp4Bf16Config(),
         CuTileFp8PerTensorBf16Config(),
