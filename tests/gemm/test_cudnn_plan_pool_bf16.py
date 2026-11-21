@@ -74,15 +74,6 @@ def test_pool_tactics_match_in_process(pool_off, pool_on, monkeypatch, m):
     assert got == expected
 
 
-# In-process (all-plans graph, execute_plan_at_index) results known to be wrong
-# on a GPU major version, keyed by tactic. On GB300 (CUDA 12.9) this tactic at
-# M=37 returned B.T @ B in its first rows while the pool's single-plan graph
-# returned A @ B (PR #9488 CI). The in-process path is unchanged upstream
-# code, so the mismatch is tracked in issue #9809 and only warned about here.
-# Remove the entry once that is fixed.
-_KNOWN_BAD_IN_PROCESS = {10: {(9, ((12, 246),))}}
-
-
 def _reference(inputs):
     a, b = inputs[0], inputs[1]
     return (a.double() @ b.double()).float()
@@ -94,27 +85,19 @@ def _matches_reference(out, ref):
 
 @pytest.mark.parametrize("m", [37, 128])
 def test_pool_plans_bitwise_equal(pool_off, pool_on, m):
-    # The in-process output is not the oracle: both paths are checked against
-    # an independent matmul, then compared bitwise where in-process is right.
+    # Both paths are checked against an independent matmul as well as each
+    # other, so neither output is trusted as the oracle.
     torch.manual_seed(0)
     inputs = _inputs(m)
     ref = _reference(inputs)
-    known_bad = _KNOWN_BAD_IN_PROCESS.get(torch.cuda.get_device_capability()[0], ())
     runner = _runner()
     tactics = runner.get_valid_tactics(inputs, None)
     expected = {}
-    bad_in_process = set()
     for tactic in tactics:
         inputs[4].zero_()
         runner.forward(inputs, tactic=tactic)
         expected[tactic] = inputs[4].clone()
-        if not _matches_reference(expected[tactic], ref):
-            assert tactic in known_bad, f"in-process {tactic} does not match A @ B"
-            bad_in_process.add(tactic)
-            warnings.warn(
-                f"known-bad in-process cuDNN tactic {tactic} does not match A @ B",
-                stacklevel=1,
-            )
+        assert _matches_reference(expected[tactic], ref), f"in-process {tactic}"
 
     pool = pool_on()
     runner = _runner()
@@ -123,9 +106,68 @@ def test_pool_plans_bitwise_equal(pool_off, pool_on, m):
     for tactic in tactics:
         inputs[4].zero_()
         runner.forward(inputs, tactic=tactic)
-        assert _matches_reference(inputs[4], ref), f"pooled {tactic} != A @ B"
-        if tactic not in bad_in_process:
-            assert torch.equal(inputs[4], expected[tactic]), tactic
+        assert _matches_reference(inputs[4], ref), f"pooled {tactic}"
+        assert torch.equal(inputs[4], expected[tactic]), tactic
+
+
+_GUARD = -1024.0  # exactly representable in BF16
+
+
+@pytest.mark.parametrize("m", [37, 64])
+def test_pool_plans_do_not_write_outside_output(pool_off, pool_on, m):
+    # Restored worker plans wrote past a smaller output on GB300 (#9809); the
+    # output here sits between guard rows that no plan may touch.
+    torch.manual_seed(0)
+    inputs = _inputs(m)
+    big = torch.full((3 * 64, N), _GUARD, dtype=torch.bfloat16, device="cuda")
+    inputs[4] = big[64 : 64 + m]
+    ref = _reference(inputs)
+
+    def check(path):
+        runner = _runner()
+        for tactic in runner.get_valid_tactics(inputs, None):
+            inputs[4].zero_()
+            runner.forward(inputs, tactic=tactic)
+            assert _matches_reference(inputs[4], ref), (path, tactic)
+            assert bool((big[:64] == _GUARD).all()), (path, tactic, "before output")
+            assert bool((big[64 + m :] == _GUARD).all()), (path, tactic, "after")
+
+    check("in-process")
+    pool = pool_on()
+    check("pooled")
+    assert pool.last_responses, "the pool was not used"
+
+
+def test_worker_plans_used_only_at_built_geometry(pool_on):
+    pool = pool_on()
+    runner = _runner()
+    a, b, bias, _, out, _ = warm = _inputs(64)
+    tactics = runner.get_valid_tactics(warm, None)
+    assert pool.last_responses, "the pool was not used"
+    tactic = next(
+        t
+        for t in tactics
+        if gb._is_cudnn_single_plan_graph(
+            runner._get_override_graph(a, b, bias, out, tactic=t)
+        )
+    )
+
+    def graph_for(m, out=None):
+        a, b, bias, _, default_out, workspace = _inputs(m)
+        out = default_out if out is None else out
+        assert runner._override_graph_kwargs(a, b, bias, out)["cache_m"] == 64
+        return runner._get_override_graph(a, b, bias, out, tactic=tactic), (
+            [a, b, bias, False, out, workspace]
+        )
+
+    graph, _ = graph_for(64)
+    assert gb._is_cudnn_single_plan_graph(graph)
+
+    padded = torch.empty(64, N + 8, dtype=torch.bfloat16, device="cuda")[:, :N]
+    for graph, inputs in (graph_for(37), graph_for(64, padded)):
+        assert not gb._is_cudnn_single_plan_graph(graph)
+        runner.forward(inputs, tactic=tactic)
+        assert _matches_reference(inputs[4], _reference(inputs)), tactic
 
 
 def test_pool_plans_profile_without_mismatch(pool_on):
