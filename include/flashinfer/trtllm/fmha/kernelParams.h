@@ -766,11 +766,10 @@ struct KernelParams {
     if (options.isSparseMla()) {
       int64_t const pageStrideOfTokens =
           static_cast<int64_t>(options.mNumTokensPerPage) * options.kStrideKeysValues;
-      FLASHINFER_CHECK(
-          !options.isMla() || options.kStrideBatch == pageStrideOfTokens,
-          "Sparse MLA with a token stride of %d must have a page stride of %lld, got %d",
-          options.kStrideKeysValues, static_cast<long long>(pageStrideOfTokens),
-          options.kStrideBatch);
+      FLASHINFER_CHECK(!options.isMla() || options.kStrideBatch == pageStrideOfTokens,
+                       "Sparse MLA with a token stride of", options.kStrideKeysValues,
+                       "must have a page stride of", pageStrideOfTokens, "but got",
+                       options.kStrideBatch);
       shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
                                      static_cast<uint64_t>(INT_MAX)};
       strideK =
