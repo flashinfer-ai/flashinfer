@@ -8770,6 +8770,9 @@ def trtllm_ragged_attention_deepseek(
         contains non-``None`` tensors.
     backend : str
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
+        (The agent-generated specialized kernel is exposed through the
+        generic :func:`ragged_attention_deepseek` front, not through this
+        vendor-named entry.)
     q_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row query lengths. When provided
         together with ``kv_seq_lens_cpu``, the Python wrapper can detect empty
@@ -9318,6 +9321,152 @@ def trtllm_ragged_attention_deepseek(
         return out, lse
     else:
         return out
+
+
+# Backends of the generalized ragged DeepSeek-attention front. Every name
+# is a real implementation ("trtllm" = the trtllm-gen cubin path behind
+# trtllm_ragged_attention_deepseek, "cute-dsl" = its CuTe-DSL path,
+# "specialized" = the agent-generated SM103 CUDA kernel, linked directly);
+# "auto" only SELECTS among the named backends and carries no behavior of
+# its own.
+RAGGED_DEEPSEEK_BACKENDS = ("auto", "specialized", "trtllm", "cute-dsl")
+
+# Defaults of trtllm_ragged_attention_deepseek's optional parameters, for the
+# front's keyword fast path (kept in sync with the entry's signature; the
+# positional slow path binds the real signature).
+_RAGGED_DEEPSEEK_DEFAULTS = dict(
+    attention_sinks=None,
+    skip_softmax_threshold_scale_factor=None,
+    out=None,
+    lse=None,
+    sage_attn_sfs=(None, None, None, None),
+    num_elts_per_sage_attn_blk=(0, 0, 0, 0),
+    q_seq_lens_cpu=None,
+    kv_seq_lens_cpu=None,
+    use_fp16_softmax=None,
+    uses_spcompress=None,
+)
+
+
+@functools.cache
+def _ragged_deepseek_param_info():
+    """Stock-signature metadata for the generic front: (all parameter
+    names, required parameter names, positional index of ``backend``)."""
+    import inspect
+
+    params = inspect.signature(trtllm_ragged_attention_deepseek).parameters
+    names = frozenset(params)
+    required = frozenset(
+        n for n, p in params.items() if p.default is inspect.Parameter.empty
+    )
+    return names, required, list(params).index("backend")
+
+
+def ragged_attention_deepseek(*args, backend: str = "auto", **kwargs):
+    """Generalized ragged (varlen, non-paged) DeepSeek MLA prefill attention.
+
+    Vendor-neutral front for the ragged DeepSeek-attention contract.
+    Parameters are those of :func:`trtllm_ragged_attention_deepseek`
+    (unchanged, including ``return_lse=True`` returning the base-2
+    log-sum-exp with the bmm1 scale folded in), except ``backend``, which
+    names a real implementation from ``RAGGED_DEEPSEEK_BACKENDS``:
+
+    - ``"specialized"``: the agent-generated SM103 CUDA kernel, called
+      directly at this front (not through the trtllm-named entry). Raises
+      a ``ValueError`` listing ``fallback_reasons`` for calls outside its
+      strict allowlist — an explicitly selected backend is never silently
+      swapped.
+    - ``"trtllm"`` / ``"cute-dsl"``: the corresponding paths of the
+      trtllm-named entry.
+    - ``"auto"`` (default): selection only, no behavior of its own —
+      routes to ``"specialized"`` when its allowlist serves the call,
+      otherwise to ``"trtllm"``.
+    """
+    if backend not in RAGGED_DEEPSEEK_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {RAGGED_DEEPSEEK_BACKENDS}, got {backend!r}"
+        )
+    param_names, required, backend_pos = _ragged_deepseek_param_info()
+    if len(args) > backend_pos:
+        # The stock signature's positional backend slot would be silently
+        # overridden by this front's own (keyword-only) ``backend`` and then
+        # passed twice on the fallback call.
+        raise TypeError(
+            "ragged_attention_deepseek() takes backend by keyword only; "
+            "do not pass it (or later parameters) positionally"
+        )
+    if backend in ("auto", "specialized"):
+        from .mla_ragged_prefill_dsr1_cuda import (
+            maybe_dispatch_specialized as _mds,
+        )
+
+        if args:
+            # positional usage: full signature bind (slow path)
+            import inspect as _inspect
+
+            bound = _inspect.signature(trtllm_ragged_attention_deepseek).bind(
+                *args, **kwargs
+            )
+            bound.apply_defaults()
+            a = dict(bound.arguments)
+        else:
+            # keyword usage (the serving call form): defaults + kwargs,
+            # no inspect machinery on the hot path.  Reject calls the stock
+            # entry would reject, so dispatch never changes error behavior.
+            unknown = kwargs.keys() - param_names
+            if unknown:
+                raise TypeError(
+                    "ragged_attention_deepseek() got unexpected keyword "
+                    f"argument(s): {sorted(unknown)}"
+                )
+            missing = required - kwargs.keys()
+            if missing:
+                raise TypeError(
+                    "ragged_attention_deepseek() missing required "
+                    f"argument(s): {sorted(missing)}"
+                )
+            a = dict(_RAGGED_DEEPSEEK_DEFAULTS)
+            a.update(kwargs)
+        served = _mds(
+            backend=backend,
+            query=a["query"],
+            key=a["key"],
+            value=a["value"],
+            workspace_buffer=a["workspace_buffer"],
+            seq_lens=a["seq_lens"],
+            max_q_len=a["max_q_len"],
+            max_kv_len=a["max_kv_len"],
+            cum_seq_lens_q=a["cum_seq_lens_q"],
+            cum_seq_lens_kv=a["cum_seq_lens_kv"],
+            batch_size=a["batch_size"],
+            out=a["out"],
+            extras=dict(
+                is_causal=a["is_causal"],
+                return_lse=a["return_lse"],
+                enable_pdl=a["enable_pdl"],
+                lse=a["lse"],
+                window_left=a["window_left"],
+                attention_sinks=a["attention_sinks"],
+                skip_softmax_threshold_scale_factor=a[
+                    "skip_softmax_threshold_scale_factor"
+                ],
+                sage_attn_sfs=a["sage_attn_sfs"],
+                num_elts_per_sage_attn_blk=a["num_elts_per_sage_attn_blk"],
+                use_fp16_softmax=a["use_fp16_softmax"],
+                uses_spcompress=a["uses_spcompress"],
+                q_seq_lens_cpu=a["q_seq_lens_cpu"],
+                kv_seq_lens_cpu=a["kv_seq_lens_cpu"],
+                bmm1_scale=a["bmm1_scale"],
+                bmm2_scale=a["bmm2_scale"],
+                o_sf_scale=a["o_sf_scale"],
+            ),
+        )
+        if served is not None:
+            return served
+        # backend == "auto": the specialized allowlist cannot serve; route
+        # to the named "trtllm" backend (explicit "specialized" raised).
+    kwargs["backend"] = "cute-dsl" if backend == "cute-dsl" else "trtllm-gen"
+    return trtllm_ragged_attention_deepseek(*args, **kwargs)
 
 
 def _validate_trtllm_variable_window_bounds(
