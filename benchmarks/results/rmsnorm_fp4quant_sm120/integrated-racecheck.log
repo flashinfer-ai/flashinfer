@@ -1,0 +1,11 @@
+========= COMPUTE-SANITIZER
+....................                                                     [100%]
+=============================== warnings summary ===============================
+../flashinfer-src/tests/conftest.py:29
+../flashinfer-src/tests/conftest.py:29
+  /root/autodl-tmp/pr5210/flashinfer-src/tests/conftest.py:29: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+    from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+20 passed, 1007 deselected, 2 warnings in 17.69s
+========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)
