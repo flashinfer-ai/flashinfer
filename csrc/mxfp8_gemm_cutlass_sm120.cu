@@ -54,6 +54,27 @@ inline const std::vector<CutlassGemmConfig>& GetMxfp8GemmConfigsSm120() {
 
 namespace {
 
+// Tactic for untuned calls: the swap-AB 128x32 tile, which puts N on the 128-wide MMA
+// side instead of leaving most of that side empty at decode-sized M. Against the
+// non-swapped 128x32 tile (the previous default) on RTX PRO 6000 at M <= 24, it was
+// 1.0-3.5x faster with weights not resident in L2 and 1.5-7.9x faster with warm L2
+// under CUDA graph replay. With cold L2 it can be up to 1.37x slower on some narrow-N
+// shapes at M from 48 to 256. At M >= 1024 neither 128x32 tile is the fastest;
+// callers that need the best tile there should autotune.
+int64_t defaultMxfp8TacticSm120() {
+  static const int64_t kDefault = []() {
+    const auto& configs = detail::GetMxfp8GemmConfigsSm120();
+    for (size_t i = 0; i < configs.size(); ++i) {
+      if (configs[i].tile_config_sm120 == CutlassTileConfigSM120::CtaShape128x32x128B &&
+          configs[i].swap_ab) {
+        return static_cast<int64_t>(i);
+      }
+    }
+    return int64_t{0};
+  }();
+  return kDefault;
+}
+
 CutlassGemmConfig getMxfp8GemmConfigSm120(int64_t tactic) {
   const auto& globalConfigs = detail::GetMxfp8GemmConfigsSm120();
   TVM_FFI_ICHECK(tactic >= 0 && tactic < static_cast<int64_t>(globalConfigs.size()))
@@ -178,7 +199,7 @@ void mxfp8_gemm_sm120_impl(TensorView mat1, TensorView mat2, TensorView mat1Scal
   }
 
   if (tactic == -1) {
-    tactic = 0;
+    tactic = defaultMxfp8TacticSm120();
   }
   auto config = getMxfp8GemmConfigSm120(tactic);
 
