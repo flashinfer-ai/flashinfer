@@ -6590,7 +6590,9 @@ def _prepare_w8a8_from_mxfp8_source(
         )
     activation = normalize_moe_activation(activation)
     if activation not in {"silu", "situ"}:
-        raise ValueError(f"W8A8 MXFP8 preparation requires silu or situ, got {activation!r}")
+        raise ValueError(
+            f"W8A8 MXFP8 preparation requires silu or situ, got {activation!r}"
+        )
     w13_layout = _normalize_w13_layout_for_activation(activation, w13_layout)
     if w13_layout == "w31":
         _ensure_w13_kernel_order_inplace(
