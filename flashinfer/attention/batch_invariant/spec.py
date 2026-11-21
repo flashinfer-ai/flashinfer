@@ -426,6 +426,8 @@ FINGERPRINTS = {
     256: FINGERPRINT_D256,
     512: FINGERPRINT_D512,
 }
+# the non-causal D = 512 class (the mask mode is the second class dimension): the same term over the visible set [0, kv_len)
+FINGERPRINT_D512_NC = "attn-bf16-d512-nc-85f3942336e9f678"
 
 
 def spec_fingerprint(D: int = 128, window_left: int = -1, causal: bool = True) -> str:
