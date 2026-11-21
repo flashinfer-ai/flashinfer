@@ -1001,6 +1001,7 @@ def test_paged_fp8_planewords_atom_byte_contract_graph(
         False,
         False,
         int(plan.page_size),
+        use_fp8_pv_repack=False,
     )
     assert kernel.debug_dump_paged_kv_planewords
     # Exercise the byte-exact PLANEWORDS dump through the supported CuTe-atom
