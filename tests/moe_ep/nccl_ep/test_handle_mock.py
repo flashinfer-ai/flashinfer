@@ -16,7 +16,9 @@ from __future__ import annotations
 import pytest
 
 
-def _make_fleet(fake_nccl_ep, *, algorithm=None, world=4, max_tokens=128, hidden=2048):
+def _make_fleet(
+    fake_nccl_ep, *, algorithm=None, world=4, max_tokens=128, hidden=2048, knobs=()
+):
     from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm, FleetParams
     from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
 
@@ -27,7 +29,7 @@ def _make_fleet(fake_nccl_ep, *, algorithm=None, world=4, max_tokens=128, hidden
         dtype_bytes=2,
         algorithm=algorithm if algorithm is not None else EpAlgorithm.LOW_LATENCY,
     )
-    return NcclEpFleet(BootstrapConfig(world_size=world, rank=0), params)
+    return NcclEpFleet(BootstrapConfig(world_size=world, rank=0), params, knobs)
 
 
 def _make_handle(fleet, *, num_tokens=16, top_k=2, with_weights=True, extra_knobs=()):
@@ -51,6 +53,140 @@ def _dispatch(handle, x):
     from flashinfer.moe_ep.config import DispatchInputParams
 
     return handle.dispatch(DispatchInputParams(x=[x]))
+
+
+def test_eager_ht_receive_capacity_and_empty_rows(fake_nccl_ep, bypass_build_checks):
+    import torch
+
+    from flashinfer.moe_ep import EpAlgorithm, FleetAlgoKnobNcclEpConfig
+
+    fake_nccl_ep.get_lib_version = lambda: "0.3.0"
+    fleet = _make_fleet(
+        fake_nccl_ep,
+        algorithm=EpAlgorithm.HIGH_THROUGHPUT,
+        knobs=[FleetAlgoKnobNcclEpConfig(eager_recv=True)],
+    )
+    assert fleet.group.config.max_recv_tokens_per_rank == 0
+    handle = _make_handle(fleet)
+    x = torch.zeros(16, 2048, dtype=torch.bfloat16)
+    for count in (7, 0, 19):
+        handle._recv_total_target.fill_(count)
+        dispatched = _dispatch(handle, x)
+        assert dispatched.num_tokens == count
+        assert dispatched.expert_tensors.shape == (1, max(1, count), 2048)
+        assert dispatched.recv_topk_idx.shape == (max(1, count), 2)
+        if count == 0:
+            assert dispatched.recv_topk_idx.eq(-1).all()
+            assert dispatched.recv_topk_weights.eq(0).all()
+            assert dispatched.expert_tensors.eq(0).all()
+    assert handle._wrap(x) is not handle._wrap(x)
+
+
+def test_eager_ht_capture_fails_before_provider_calls(
+    fake_nccl_ep, bypass_build_checks, monkeypatch
+):
+    import torch
+
+    from flashinfer.moe_ep import EpAlgorithm, FleetAlgoKnobNcclEpConfig, HandleParams
+
+    fake_nccl_ep.get_lib_version = lambda: "0.3.0"
+    fleet = _make_fleet(
+        fake_nccl_ep,
+        algorithm=EpAlgorithm.HIGH_THROUGHPUT,
+        knobs=[FleetAlgoKnobNcclEpConfig(eager_recv=True)],
+    )
+    handle = _make_handle(fleet)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    params = HandleParams(topk_ids=torch.zeros(16, 2, dtype=torch.int64))
+    native_handles = list(fake_nccl_ep._log["handles"])
+    for operation in (
+        lambda: fleet.create_handle(params),
+        lambda: handle.update(params),
+        lambda: _dispatch(handle, torch.zeros(16, 2048, dtype=torch.bfloat16)),
+    ):
+        with pytest.raises(ValueError, match="capture"):
+            operation()
+    assert handle._handle.calls == []
+    assert fake_nccl_ep._log["handles"] == native_handles
+
+
+@pytest.mark.parametrize("forward", [False, True])
+def test_empty_ht_rows_use_the_operation_stream(
+    fake_nccl_ep, bypass_build_checks, monkeypatch, forward
+):
+    from types import SimpleNamespace
+
+    import torch
+
+    from flashinfer.moe_ep import (
+        DispatchInputParams,
+        EpAlgorithm,
+        FleetAlgoKnobNcclEpConfig,
+        HandleAlgoKnobUserStream,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA streams")
+    fake_nccl_ep.get_lib_version = lambda: "0.3.0"
+    fake_nccl_ep.DispatchQuantizationRecipe = SimpleNamespace(FWD=1)
+    operation, caller = torch.cuda.Stream(), torch.cuda.Stream()
+    fleet = _make_fleet(
+        fake_nccl_ep,
+        algorithm=EpAlgorithm.HIGH_THROUGHPUT,
+        knobs=[
+            FleetAlgoKnobNcclEpConfig(
+                eager_recv=True, dispatch_quantization="forward" if forward else "none"
+            )
+        ],
+    )
+    handle = _make_handle(
+        fleet, extra_knobs=[HandleAlgoKnobUserStream(operation.cuda_stream)]
+    )
+    handle._recv_total_target.zero_()
+    values = torch.ones(16, 2048, device="cuda", dtype=torch.bfloat16)
+    payload = (
+        [values.to(torch.float8_e4m3fn), torch.empty(16, 16, device="cuda")]
+        if forward
+        else [values]
+    )
+    streams, allocations = [], []
+    original_empty = torch.empty
+    original_zero, original_fill = torch.Tensor.zero_, torch.Tensor.fill_
+
+    def empty(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        if tensor.is_cuda:
+            allocations.append(torch.cuda.current_stream().cuda_stream)
+        return tensor
+
+    def zero(tensor, *args, **kwargs):
+        if tensor.is_cuda:
+            streams.append(torch.cuda.current_stream().cuda_stream)
+        return original_zero(tensor, *args, **kwargs)
+
+    def fill(tensor, *args, **kwargs):
+        if tensor.is_cuda:
+            streams.append(torch.cuda.current_stream().cuda_stream)
+        return original_fill(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "zero_", zero)
+    monkeypatch.setattr(torch.Tensor, "fill_", fill)
+    monkeypatch.setattr(torch, "empty", empty)
+    try:
+        with torch.cuda.stream(caller):
+            handle.dispatch(DispatchInputParams(x=payload))
+            assert torch.cuda.current_stream() == caller
+        torch.cuda.synchronize()
+        assert streams == [operation.cuda_stream] * (4 if forward else 3)
+        assert allocations == [operation.cuda_stream] * (4 if forward else 3)
+        assert handle._dispatch_output_t.eq(0).all()
+        assert handle._dispatch_out_w.eq(0).all()
+        assert handle._dispatch_out_idx.eq(-1).all()
+        if forward:
+            assert handle._dispatch_scale_t.eq(0).all()
+    finally:
+        handle.destroy()
+        fleet.destroy()
 
 
 # -------------------------------------------------------------------- _wrap

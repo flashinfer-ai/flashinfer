@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -50,10 +50,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
-#define LAUNCH_MIN_BLOCKS 1
-#else
+#if __CUDA_ARCH__ == 1030
 #define LAUNCH_MIN_BLOCKS 2
+#else
+#define LAUNCH_MIN_BLOCKS 1
 #endif
 
 #include <math_constants.h>
@@ -614,10 +614,10 @@ kernel_cake_gdp_f0b0248a8e7d3ad6047d(__nv_bfloat16* __restrict__ q, __nv_bfloat1
         S2[15] = make_float2(S[30], S[31]);
 #endif
         if (use_ssm_state_indices != 0) {
-#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
-            #pragma unroll 1
-#else
+#if __CUDA_ARCH__ == 1030
             #pragma unroll 2
+#else
+            #pragma unroll 1
 #endif
             for (int t = 0; t < 6; t++) {
                 float alpha = sAlpha[t];
@@ -1880,10 +1880,10 @@ kernel_cake_gdp_f0b0248a8e7d3ad6047d(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             }
         }
         if (use_ssm_state_indices == 0) {
-#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
-            #pragma unroll 1
-#else
+#if __CUDA_ARCH__ == 1030
             #pragma unroll 2
+#else
+            #pragma unroll 1
 #endif
             for (int t_1 = 0; t_1 < 6; t_1++) {
                 float alpha_1 = sAlpha[t_1];

@@ -124,7 +124,7 @@ def _session(problem, rank, world_size, capacity, knobs, weight_before_fc2):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         bf16_mega_moe,
         get_symm_buffer_for_bf16_mega_moe,
     )

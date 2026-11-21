@@ -75,6 +75,7 @@ from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
     prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
 )
+from .gemm_bf16_fp4_gather import gemv_bf16_fp4_gather as gemv_bf16_fp4_gather
 from .gemm_mxfp8_mxfp4 import mm_mxfp8_mxfp4 as mm_mxfp8_mxfp4
 
 from .gemm_svdquant import (
@@ -222,6 +223,7 @@ __all__ = (
         "prepare_nvfp4_lora_adapter",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "gemv_bf16_fp4_gather",
         "mm_mxfp8_mxfp4",
         "fp8_linear",
         "fp8_linear_swiglu",

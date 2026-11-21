@@ -64,11 +64,11 @@ systems with 36 NVLink ports per GPU, before launching MegaMoE.
 | `mm_mxfp8` | `backend="auto", batch_invariant=True` | `gemm.mxfp8.kfold` (one fp32 fold over the 32-wide block-scaled steps of the SM100 / SM103 instruction, the UE8M0 block scales applied inside each step, then one `cvt.rn`) or `gemm.mxfp8.kchunk[C]`, and on SM107 `gemm.mxfp8.kfold64` / `gemm.mxfp8.kchunk64[C]` (the SM107 instruction folds 64 elements per step: a different class, so the architecture is a dimension of the specification); `C` is a function of the weight shape alone (chunks of whole 128-element granules); `fingerprint("mm_mxfp8", N=, K=, out_dtype=, arch=)` (`arch` defaults to the current device) | e4m3 `a (M, K)` row-major and e4m3 `b (K, N)` the transpose of a row-major `(N, K)` weight (the block-scaled instruction takes K-major operands only), `K` a multiple of 32 and `N` of 8 within the operator's own limits (`N, K >= 128`), any `M`; the scale factors as the 1-D uint8 buffers of `mxfp8_quantize(..., is_sf_swizzled_layout=True)` (the 128x4 swizzled layout; where K is not a multiple of the class's step the last step's scales are read from the buffers' padding, which must be finite, as the quantizers write it); bf16 or fp16 output. SM100 / SM103 / SM107 |
 | `mm_fp4` | `backend="auto", batch_invariant=True` | NVFP4 (`use_nvfp4=True`): `gemm.nvfp4.kfold` (one fp32 fold over the 64-wide block-scaled steps of the SM100 / SM103 instruction, the e4m3 block scales of 16-element blocks applied inside each step, then one `mul.rn` by the caller's `alpha` and one `cvt.rn`) or `gemm.nvfp4.kchunk[C]`, and on SM107 `gemm.nvfp4.kfold128` for the weight shapes the chunk rule leaves unsplit (the SM107 instruction folds 128 elements per step; a split weight shape runs `gemm.nvfp4.kchunk[C]` with the 64-wide step on SM107 too); MXFP4 (`use_nvfp4=False`): `gemm.mxfp4.kfold` / `gemm.mxfp4.kchunk[C]` (the UE8M0 block scales of 32-element blocks), and on SM107 `gemm.mxfp4.kfold128` / `gemm.mxfp4.kchunk128[C]`; `C` is a function of the weight shape and the format alone (chunks of whole granules: 128 elements for the 64-wide step, 256 for the 128-wide); `fingerprint("mm_fp4", N=, K=, out_dtype=, use_nvfp4=, arch=)` (`arch` defaults to the current device) | packed-fp4 `a (M, K / 2)` row-major and `b (K / 2, N)` the transpose of a row-major `(N, K / 2)` weight (uint8 or `float4_e2m1fn_x2`; the block-scaled instruction takes K-major operands only), `K` a multiple of 32 and `N` of 8, any `M`; the scale factors as the 1-D swizzled buffers of `nvfp4_quantize(..., sfLayout=SfLayout.layout_128x4, do_shuffle=False)` / `mxfp4_quantize(...)` (the 128x4 layout; e4m3 or uint8 bytes); `alpha` a 1-element fp32 tensor or None (1.0; a per-token alpha is not a class of the mode); where K is not a multiple of the class's step (64; 128 on SM107) the last step's scales are read from the buffers' padding, which must be finite, as the quantizers write it; bf16 or fp16 output. SM100 / SM103 / SM107 |
 | `mm_mxfp8_mxfp4` | `batch_invariant=True`; `batch_invariant=False` (the default) runs the same class today, since FlashInfer has no other dense kernel for e2m1 weights against e4m3 activations (its `tgv_gemm_sm100` low-latency path takes the pair for a few rows only) -- a future non-invariant kernel may take the `False` path, `True` keeps the guarantee | the mixed MX classes: `gemm.mxfp4w8a.kfold` (one fp32 fold over the 32-wide steps of the SM100 / SM103 `kind::mxf8f6f4` instruction with mixed operand formats -- e4m3 A against e2m1 B, one UE8M0 scale per 32 elements on each, applied inside the step -- then one `mul.rn` by the caller's `alpha` and one `cvt.rn`) or `gemm.mxfp4w8a.kchunk[C]`, and on SM107 `gemm.mxfp4w8a.kfold64` / `gemm.mxfp4w8a.kchunk64[C]` (the SM107 instruction folds 64 elements per step: a different class, so the architecture is a dimension); the mixed step is its own fold -- the MXFP8 class on the e2m1 values re-coded to e4m3 gives different bits (pinned as an observation in the suite), so neither `mm_mxfp8` nor any FlashInfer backend is an oracle of it; `C` is a function of the weight shape and the format alone: the MX rule (chunks of whole 128-element granules) with the mixed classes' lower bound of 8 chunks for `N <= 512`, `K >= 16384` (K a multiple of 1024; constants declared empirical, the same on every part), so weights in that region carry `kchunk[8]` fingerprints; `fingerprint("mm_mxfp8_mxfp4", N=, K=, out_dtype=, arch=)` (`arch` defaults to the current device) | e4m3 `a (M, K)` row-major (`mxfp8_quantize`'s output) and the packed-e2m1 weight `b (K / 2, N)` as the transpose of a row-major `(N, K / 2)` tensor (`mxfp4_quantize`'s output; uint8 or `float4_e2m1fn_x2`; the block-scaled instruction takes K-major operands only), `K` a multiple of 32 and `N` of 8, any `M`; **on SM100 / SM103 `K` a multiple of 128** (the instruction reads the e2m1 operand through the TMA's unpacking format over whole 64-byte runs of the row; smaller K is rejected, not padded); the scale factors as the quantizers' 1-D swizzled uint8 buffers (the 128x4 layout; on SM107, where K is not a multiple of 64, the last step's scales are read from the buffers' padding, which must be finite); `alpha` a 1-element fp32 tensor or None (1.0); bf16 or fp16 output; `enable_pdl=None` follows the device (programmatic dependent launch, a placement: the same bits). SM100 / SM103 / SM107 |
-| `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper` | `backend="auto", batch_invariant=True` (constructor) | `attention.bf16` per head dim: 128-key tiles and 512-key chunks on the absolute KV axis, the online softmax step and the chunk merge of `attention/batch_invariant/spec.py`; `fingerprint(<wrapper name>, head_dim=...)`. The three wrappers (prefill and decode, paged and ragged KV) compute one class: a token's bits depend on its KV position, head and window alone | bf16 q / K / V / out; head dim 64 / 128 / 256; GQA (`num_qo_heads` a multiple of `num_kv_heads`, up to 128 per group); causal (bottom-right aligned) with an optional `window_left`; page sizes 1..128 (powers of two); NHD / HND. CUDA graphs: capture `run()` after `plan()`; a replay reproduces the planned batch and a new `plan()` needs a new capture (`use_cuda_graph=True` raises). `plan()` runs a host-side planner (of the order of 10 us per request). Not: soft cap, custom masks, fused RoPE, non-causal prefill, fp8 / fp4 KV, q / k / v scales, LSE output, sinks |
+| `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper` | `backend="auto", batch_invariant=True` (constructor) | `attention.bf16` per head dim and mask mode: 128-key tiles and 512-key chunks on the absolute KV axis, the online softmax step and the chunk merge of `attention/batch_invariant/spec.py`; `fingerprint(<wrapper name>, head_dim=..., causal=True)` for the causal class (a token at KV position `p` sees the keys `[0, p]`, or `[max(0, p - window_left), p]` with a window, `window_left >= 0`) and `fingerprint(<wrapper name>, head_dim=..., causal=False)` for the non-causal class (a token sees every key of its request, `[0, kv_len)`; the same dataflow over a different visible set, so a different term and fingerprint). `causal` is a required dimension of the two prefill wrappers' receipt, to be given as the value passed to `plan()`: their `plan()` defaults to `causal=False`, so a plan that omits `causal` runs the non-causal class and `causal=True` selects the causal one; for the decode wrapper it is optional and an omitted or `None` `causal` is the causal class, as `is_causal=None` is in its `plan()`. The three wrappers (prefill and decode, paged and ragged KV) compute one class per mode: a token's bits depend on its KV position (causal) or its request's key count (non-causal), its head and the window alone | bf16 q / K / V / out; head dim 64 / 128 / 256; GQA (`num_qo_heads` a multiple of `num_kv_heads`, up to 128 per group); causal (bottom-right aligned) with an optional `window_left`, or non-causal (prefill `causal=False`; decode `q_len_per_req > 1` with `is_causal=False`; no window, any `q_len` against at least one key; a single-token decode step is the causal class either way; chunked prefill reproduces the one-shot bits only when each query chunk is planned over the request's full key set, since a token's term is a function of `kv_len`); page sizes 1..128 (powers of two); NHD / HND. CUDA graphs: capture `run()` after `plan()`; a replay reproduces the planned batch and a new `plan()` needs a new capture (`use_cuda_graph=True` raises). `plan()` runs a host-side planner (of the order of 10 us per request). Not: soft cap, custom masks, fused RoPE, a window with `causal=False`, fp8 / fp4 KV, q / k / v scales, LSE output, sinks |
 | `MoELayer` with `BatchInvariantBf16Config` (`flashinfer.fused_moe`) | `MoEConfig(..., backend=BackendOptions((BatchInvariantBf16Config(),)))`: named explicitly, never a default candidate (alone in the candidates the layer skips its shootout) | one class per typed activation of the layer (gated, on the (gate, up) pair: `SwiGLU` with any `alpha` / `beta` / `limit`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`; ungated, on one accumulator: `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU`; the activation's scalars are binary32 constants of the chain, so a parameter set is a class): the class's own routing (the declared `exp`, the strict selection order `(score desc, index asc)` on exact binary32 scores, the method's weight formula; a NaN logit is skipped by the row maximum, contributes `+0` to the softmax sum and is never selected), the deterministic permutation of the expanded rows (expert order, then token-slot order), the two grouped GEMMs as placements of the unsplit member of the dense class, `gemm.bf16.kfold` at `K=H` / `K=I` (per expert one fp32 fold over all of K whatever the weight shape: the dense operator's chunk rule, which runs `gemm.bf16.kchunk[C]` for a narrow weight, does not apply, so `mm_bf16(batch_invariant=True)` on one expert's weight reproduces these bits only where that rule leaves K unsplit; the gate / up pair of a SwiGLU term in one thread's fragment; the chain's declared arithmetic on the fp32 accumulators: `cvt_bf16(mul(silu(g), u))` for the default `SwiGLU`, every sigmoid / tanh through the declared `exp`, GELU / GeGLU through a declared `erf`, PowLU through a declared `log` and the correctly rounded `sqrt`, the clamps as `fmin` / `fmax`), and the slot-order fp32 combine `cvt_bf16(fold_r add(acc, mul(y_r, w_r)))`; `fingerprint("fused_moe", H=, I=, top_k=, num_experts=, method=, act=, n_group=, topk_group=)` (`method` a `RoutingMethodType` the class implements, the groups for `DeepSeekV3`'s group-limited selection, `act` an `ActivationConfig` of the layer or `"swiglu"` / `"relu2"`) | bf16 `hidden_states (T, H)`, `H` and `I` multiples of 8, `1 <= top_k <= min(E, 16)`, `E <= 1024`; routing from logits (`RoutingInputMode.FromLogits`: fp32 or bf16 `(T, E)` logits, methods `Default`, `Renormalize`, `RenormalizeNaive`, `Sigmoid`, `SigmoidRenorm`, `TopK` (the logits as weights), `Llama4` (`top_k = 1`) and `TopKSigmoid` (the sigmoid of the chosen logits as weights), `DeepSeekV3` with or without expert groups (`n_group` dividing `E` into groups of at least two experts, `1 <= topk_group <= n_group <= 16`, `top_k <= topk_group * E / n_group`: the group score is the sum of a group's two largest biased scores), a bias exactly for the methods that select on `sigmoid(l) + bias`) or pre-routed ids and weights (`PackedPrecomputed` / `UnpackedPrecomputed`, bf16 or fp32 weights; any `RoutingConfig`, since the selection is the caller's: a routing term the from-logits mode has no class for is refused at a from-logits call, not at construction); weights from `BatchInvariantBf16Config.prepare_weights(w1 [E, 2I, H] (rows up, gate) or [E, I, H] for the ungated activations, w2 [E, H, I], activation=...)` with `E` the local experts of a shard; bf16 output, or with `do_finalize=False` the layer's triple `[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]` (the rows in the class's permutation, the weights as the combine folds them -- fp32 from logits, where the other backends return bf16: the fold widens a bf16 weight exactly, so a receiver that needs bf16 rounds them itself -- and the flat map with `-1` at a dropped slot: the class's slot-order fold over it is the finalized output bit for bit, as the public op `fused_moe.batch_invariant.api.combine_unfinalized(*triple)` computes it; `use_fused_finalize` is ignored); expert-parallel shards (`ExpertConfig.local_expert_offset` / `local_num_experts`: the rank's output is the dense fold restricted to its experts, the other slots dropped; the receiver's slot-order fold over the ranks' unfinalized rows is the dense output, the fixed-order sum of finalized partials the split path's within-placement form); no fused shared experts. SM100 / SM103 / SM107 |
 | `MoELayer` with `BatchInvariantFp8PerTensorConfig` under `QuantConfig(FP8PerTensor, FP8PerTensor)` (`flashinfer.fused_moe`) | `MoEConfig(..., quant=QuantConfig(weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor), backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)))`: named explicitly, never a default candidate | the fp8 per-tensor (W8A8) classes `moe.e4m3.<act>`, one per typed activation and parameter set as the bf16 backend: the bf16 classes' routing (every method and group form of the bf16 row), permutation and slot-order combine; the two grouped GEMMs as placements of the dense fp8 class `gemm.e4m3.kfold[K=H]` / `[K=I]` (the 32-wide fp8 step); the static per-tensor scales in FlashInfer's multiplier convention (`q = x * s`), the class's dequantization scales their correctly rounded reciprocals formed once at preparation, the per-tile alpha `mul(s_a, s_w[e])` formed on the device; GEMM1's fused quantization `cvt.rn.satfinite.e4m3(mul(act(alpha-scaled accumulators), intermediate_scale_global))` (the activation chain of the bf16 class on the dequantized fp32 accumulators, no bf16 rounding, the activation's scalars in dequantized units) and GEMM2's `cvt_bf16(mul(acc, mul(s_inter, s_w2[e])))`; `fingerprint("fused_moe_fp8", H=, I=, top_k=, num_experts=, method=, act=, n_group=, topk_group=)` (the dimensions of `fused_moe`; the scales' values are inputs, not dimensions) | e4m3 `hidden_states (T, H)` from `BatchInvariantFp8PerTensorConfig.prepare_activations(x_bf16, hidden_states_scale_global=)` (no activation scale tensor), `H` and `I` multiples of 16, `1 <= top_k <= min(E, 16)`, `E <= 1024`; the routing modes, methods and groups of the bf16 backend through the same route kernels (its NaN-logit rule included; a term outside the from-logits classes is refused at the from-logits call, so a pre-routed layer builds under any `RoutingConfig`); weights from `BatchInvariantFp8PerTensorConfig.prepare_weights(w1 [E, 2I, H] (rows up, gate) or [E, I, H], w2 [E, H, I], hidden_states_scale_global=, intermediate_scale_global=, activation=...)` (the experts quantized here with one `448 / amax` multiplier per expert and GEMM); bf16 output; `do_finalize=True` only (the unfinalized triple is refused) and dense expert placement only (`local_expert_offset` / `local_num_experts` shards are refused: the class's EP form is not part of this backend); no fused shared experts. SM100 / SM103 / SM107 |
 | `chunk_gated_delta_rule` | `backend="auto", batch_invariant=True` | `gdn.bf16.c64`: the native SM100 / SM103 / SM107 chunked GDN prefill kernel without context parallelism (64-token chunks, fp32 state, log-domain gates, the Q / K l2-norm); decode computes row `p` of that kernel from rows cached since the last chunk boundary (a step kernel that issues the same tensor-core folds as `mma.sync`), so decode row `p` is prefill row `p` and prefill, chunked prefill, decode and multi-token steps are one class; `fingerprint("chunk_gated_delta_rule")` (no dimension) | bf16 packed q / k `[T, HQ, 128]` and v `[T, HV, 128]` with `HV` a multiple of `HQ`, fp32 log gates `g` and fp32 `beta` `[T, HV]` (`gate_domain="log"`), `use_qk_l2norm_in_kernel=True`; the state an fp32 pool `[slots, HV, 128, 128]` addressed by int32 `state_indices` and updated in place (a slot holds the state at the last 64-token boundary; the rows since it live next to the pool); a call with one token per sequence is a decode step, a call with more tokens is a prefill from the slot's state as a chunk boundary, and `prefix_lens` continues an open chunk (multi-token steps, pieces cut anywhere); `cu_seqlens` / `cu_seqlens_cpu`, `output`, `output_final_state` (the pool). CUDA graphs: a decode step over fixed buffers is capturable once no slot of the pool is waiting for its rebuild, i.e. after one eager decode step (or call of fewer than 64 tokens per sequence) on every slot prefilled since (while a slot the pool addresses waits, capturing a step raises). Not: `use_cp`, checkpoints, `output_state_indices`, the fused gate (`A_log` / `dt_bias` / `beta_is_logit`), linear-domain gates, a bf16 or fp16 state, fp16 activations, other head sizes. SM100 / SM103 / SM107 |
-| `recurrent_kda` | `backend="auto", batch_invariant=True` | `kda.bf16.c16`: the native SM100 / SM103 / SM107 chunked KDA prefill kernel on its pinned persistent route (16-token chunks, fp32 state, in-kernel Q / K l2-norm, gate `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` and beta sigmoid); decode computes row `p` of that prefill in one launch of a step kernel (`include/flashinfer/kda/batch_invariant_decode.cuh`: the boundary state plus cached rows of the open chunk, every tensor-core product an `mma.sync` from registers), so decode row `p` is prefill row `p` and prefill, chunked prefill and decode are one class; `fingerprint("recurrent_kda")` (no dimension; it digests both kernels, the step's launcher and build flags and the installed `nvidia-cutlass-dsl` version, so it differs between environments with different DSL builds) | bf16 q / k / v / g / beta of head dim 128, `HV == H` a multiple of 8, or 1 to 10 or 12 heads (what the pinned prefill route carries; `flashinfer.batch_invariant.kda.spec.heads_supported`); the state an fp32 pool `[slots, HV, 128, 128]` addressed by `ssm_state_indices` and updated in place (a slot holds the state at the last 16-token boundary; what the open chunk needs lives next to the pool, so a chunked prefill cuts at multiples of 16 tokens except for its last piece, and a call with one token per sequence is a decode step); `A_log` / `dt_bias` with `use_gate_in_kernel`, `use_qk_l2norm_in_kernel`, `beta_is_logit`, a finite negative `lower_bound`; `cu_seqlens` packed or `[B, T]` fixed layouts, `output`, `output_final_state` (the pool). CUDA graphs: a decode step over fixed buffers is capturable after one eager step of the same batch size. Finite inputs: with a non-finite value inside a 16-token chunk the prefill shows it from the chunk's first row and a decode step from its own row, so the two differ inside that chunk (the sequence's neighbours stay exact). Not: speculative decode (`num_spec_tokens`), checkpoints, `initial_state_source`, `seq_order`, `prefill_workspace`, the frozen-verify arguments, a bf16 state. SM100 / SM103 / SM107 |
+| `recurrent_kda` | `backend="auto", batch_invariant=True` | `kda.bf16.c16`: the native SM100 / SM103 / SM107 chunked KDA prefill kernel on its pinned persistent route (16-token chunks, fp32 state, in-kernel Q / K l2-norm, gate `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` and beta sigmoid); decode computes row `p` of that prefill in one launch of a step kernel (`include/flashinfer/kda/batch_invariant_decode.cuh`: the boundary state plus cached rows of the open chunk, every tensor-core product an `mma.sync` from registers), so decode row `p` is prefill row `p` and prefill, chunked prefill and decode are one class; `fingerprint("recurrent_kda")` (no dimension; it digests both kernels, the step's launcher and build flags and the installed `nvidia-cutlass-dsl` version, so it differs between environments with different DSL builds) | bf16 q / k / v / g / beta of head dim 128, `HV == H` a multiple of 8, or 1 to 10 or 12 heads (what the pinned prefill route carries; `flashinfer.batch_invariant.kda.spec.heads_supported`); the state an fp32 pool `[slots, HV, 128, 128]` addressed by `ssm_state_indices` and updated in place (a slot holds the state at the last 16-token boundary; what the open chunk needs lives next to the pool, so a chunked prefill cuts at multiples of 16 tokens except for its last piece, and a call with one token per sequence is a decode step); `A_log` / `dt_bias` with `use_gate_in_kernel`, `use_qk_l2norm_in_kernel`, `beta_is_logit`, a finite negative `lower_bound`; `cu_seqlens` packed or `[B, T]` fixed layouts, `output`, `output_final_state` (the pool); without `initial_state` the stateless call (whole sequences from the zero state, the same rows, nothing kept, no `grad_fn`: a trainer's forward pass). CUDA graphs: a decode step over fixed buffers is capturable after one eager step of the same batch size. Finite inputs: with a non-finite value inside a 16-token chunk the prefill shows it from the chunk's first row and a decode step from its own row, so the two differ inside that chunk (the sequence's neighbours stay exact). Not: speculative decode (`num_spec_tokens`), checkpoints with a state pool or at another interval than 16 (the stateless call takes `checkpoint_every_n_tokens=16`), `checkpoint_state_indices`, `initial_state_source`, `seq_order`, `prefill_workspace`, the frozen-verify arguments, a bf16 state. SM100 / SM103 / SM107 |
 
 ## The dispatcher and the launch grid
 
@@ -114,11 +114,13 @@ lowering trace and the GPU configuration-agreement tests establish. What Lean ca
 configuration space selects compute the same per-element function; the GPU configuration-agreement tests check it bit
 for bit. A second hardware hypothesis of the block-scaled classes: the block-scaled step gives the same bits with its two operands exchanged, which the swapped decode records (`swap_ab`: the weights as the kernel's A, the tokens as its B) rely on; the dispatcher takes those records up to 64 rows and the dense records above, so the rows of a 64-row and a 65-row call are compared bit for bit in `test_batch_invariance_along_rows` of the mxfp8, fp4 and mxfp8_mxfp4 suites (M = 63, 64, 65 among the row counts), and every swapped record against the dense one in `test_swapped_decode_records_compute_the_class`, on each part. The bf16 MoE classes' swapped records rest on the same hypothesis for the bf16 step (`mma16` with its two operands exchanged: the weights as the kernel's A, the tokens as its B, the accumulator transposed), which `test_swapped_records_equal_the_grouped_records` of `tests/moe/test_unified_moe_batch_invariant.py` discharges bit for bit on each part: every swapped record, in its box and its gather form, against a grouped record over groups of one to several token tiles. The fp8 per-tensor MoE classes' swapped records rest on it for the 32-wide fp8 step, discharged the same way by `test_swapped_records_equal_the_grouped_records` of `tests/moe/test_unified_moe_batch_invariant_fp8.py`. A third, of the block-scale fp8 class's promotion: the packed `fma.rn.f32x2` folds two elements per instruction and each of its lanes is the same correctly rounded fma as the scalar `fma.rn.f32`; the exact-model tests of `tests/gemm/test_batch_invariant_gemm_fp8_blockscale.py` discharge it bit for bit, the kernel's output against the exact CPU promotion (correctly rounded scalar fmas over the device block partials), on each part.
 
-`Cases.lean` is generated from the Python specification and engine (`python -m flashinfer.batch_invariant.lean_cases`):
+`Cases.lean` and the family modules it imports (`lean/BIKernels/Cases/GEMM.lean`, `Attention1.lean`, ...: one module per
+kernel family, a family larger than the generator's per-file budget as numbered parts chained by import) are generated
+from the Python specification and engine (`python -m flashinfer.batch_invariant.lean_cases`):
 the Lean model reproduces the Python S-expressions node for node, re-derives the dispatchers' shape rules and checks
 every record of a configuration space and every dispatcher pick against the class's constraints. The device-free test
-`tests/batch_invariant/test_lean.py` byte-compares the committed file; its `lake` steps run when the toolchain is
-installed.
+`tests/batch_invariant/test_lean.py` byte-compares the committed modules and fails on a stale or missing generated one; its `lake`
+steps run when the toolchain is installed.
 
 The MoE classes have their own tier. `lean/BIKernels/MoE.lean` (and `MoEFp8.lean` for the fp8 per-tensor classes: the per-tile alpha from the multipliers' reciprocals, the fused e4m3 quantization of every chain as the standalone quantization term of the activation value, GEMM2's scaled chain) states the declared `exp`, sigmoid, tanh, erf and log
 chains, the GEMM1 chains of every activation the classes take as a parameter (the gated `GAct`: SwiGLU, GeGLU-tanh,
@@ -410,6 +412,9 @@ the whole remainder, so give the pool a storage of its own.
 
 What the caller owes the class:
 
+* A call that carries a sequence's state passes the pool. Without `initial_state` (and without the other state
+  arguments) the call does not raise: it is the stateless call below and returns rows from the zero state, so a decode
+  step that drops its pool returns every token as a first token.
 * A new sequence loaded into a slot starts with a prefill call (more tokens than sequences) or carries `prefix_lens`.
   A one-token call without `prefix_lens` continues what the slot holds: on a reused slot it continues the previous
   sequence, with finite rows that are not the new sequence's (nothing detects a slot whose state the caller replaced).
@@ -433,6 +438,94 @@ What the caller owes the class:
 `output_final_state` returns the pool. The decode entries (`gated_delta_rule_decode_pretranspose`,
 `gated_delta_rule_mtp`) do not take the flag: they compute the gates from the raw parameters and keep another state
 layout; a decode step of the class is a one-token call of `chunk_gated_delta_rule`.
+
+### Stateless call: a trainer's forward pass
+
+Without `initial_state` the same entry is a stateless call, the form a training forward takes: packed whole sequences,
+every one from the zero state, rows only.
+
+```python
+out = torch.empty_like(v)          # once, reused every step
+flashinfer.chunk_gated_delta_rule(
+    q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out,
+    use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
+)
+```
+
+* The rows of a sequence are bit for bit the rows the pool calls return for it (prefill, chunked prefill and decode),
+  whatever the other sequences of the call, their order and their number. It is one launch of the class's prefill
+  kernel with every sequence reading the zero state and storing none.
+* No pool, no state next to a pool, no state returned: `state_indices`, `prefix_lens`, `output_state` and
+  `output_final_state=True` raise the typed error without `initial_state`. A sequence that has to continue later is a
+  pool call.
+* With `output=` and a contiguous int32 `cu_seqlens` on the inputs' device the call keeps nothing after it returns and
+  adds no allocation of its own, and reads the offsets back to check them. With `cu_seqlens_cpu` it runs from those
+  host offsets instead (no read of a device tensor), so device and host offsets cannot disagree in it; only their lengths are compared.
+  The host offsets are copied to the device once and the last 16 copies are kept (across streams, devices and the
+  two forms of the call; a few int32 per sequence, and per stored state with `train_states`), so a call that repeats
+  the offsets of an earlier one on the same stream copies nothing. Offsets that are not 1-D integers raise the typed error. The
+  prefill underneath allocates, as in every prefill of the class, the normalized `q` and `k` (`2 * T * HQ * 256`
+  bytes), the linear gates (`4 * T * HV` bytes) and a small kernel workspace, all freed at return. Per device and
+  v-head count the class keeps one state tensor the kernel is pointed at and never reads or writes (3.1 MB at 48 v
+  heads) and, for the call without `train_states`, an int32 index tensor, allocated at the first stateless call and
+  regrown to twice the sequence count when a call brings more sequences than it holds (the replaced ones are kept,
+  a few bytes per sequence).
+* `output` may share no memory with an input, the offsets, `train_states` or one of the class's state pools (a pool
+  owns its storage from its first slot to the storage's end), and an `output` allocated under `inference_mode` is
+  refused in a call outside it (typed errors, before anything is written). The call bumps its autograd version (an
+  inference tensor has none).
+* It cannot be captured in a CUDA graph (it raises).
+* **The rows carry no `grad_fn`.** The class has no backward: inputs that require grad are read as plain values and
+  `out.requires_grad` is `False`. A trainer that needs gradients runs its own backward, for example its existing
+  differentiable op on the same inputs wrapped in an `autograd.Function` whose forward returns these rows. The
+  shortcut `ref + (out - ref).detach()` rounds in bf16 and does not return these bits. What that gradient is, and
+  whether it is batch-invariant, is the trainer's.
+
+**Intermediates for a backward pass: `train_states`.** The same call stores the state every 64-token chunk of every
+sequence starts from in a caller-owned buffer:
+
+```python
+from flashinfer.batch_invariant.gdn import training_state_rows, training_state_slots
+
+states = torch.empty(training_state_slots(seq_lens), HV, 128, 128, device=v.device)   # fp32, once per layer
+flashinfer.chunk_gated_delta_rule(
+    q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out, train_states=states,
+    use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
+)
+rows = training_state_rows(seq_lens)   # rows[i][j]: the state chunk j of sequence i starts from (zero for j = 0)
+```
+
+* A backward over the class's recurrence works from the inputs, the output gradient and, per 64-token chunk, the
+  state the chunk starts from. That state is the one term it cannot recompute from the chunk's own inputs; without
+  it a backward first re-runs the state scan over the sequence (FLA's backward and cuDNN's default path do). Every
+  other term of a chunk (the normalized `q` / `k`, the cumulative gates, the triangular solve, the corrected values)
+  is a function of the chunk's own 64 input rows and that state, so a backward evaluates the chunks independently of
+  each other and only the state adjoint runs from chunk to chunk. Those per-chunk terms are internal to the kernel
+  and are not exported, and no backward surveyed takes them from a forward.
+* **The layout is the one cuDNN's GDN backward takes** (`cudnn::gated_delta_net_bwd`, argument `state_checkpoints`
+  with `checkpoint_every_n_tokens=64`): `(n - 1) // 64 + 1` rows per sequence of `n` tokens, sequences in call order,
+  a sequence's first row the zero state its first chunk starts from (the call writes the zeros) and row `j` the state
+  after its first `64 * j` tokens; a state is `[HV, 128 (value), 128 (key)]`, one per v head (`state @ k` is the
+  predicted value). The state after a sequence's last token is not stored. With the same `q`, `k`, `v`, `g`, `beta`,
+  `cu_seqlens` and `scale`, `use_qk_l2norm_in_kernel=True` and `gate_domain="log"`, cuDNN frontend 1.32.3 takes the
+  buffer as it is; a frontend that requires the series in the input dtype takes `states.to(torch.bfloat16)`. The
+  gradients it returns from this series agree with the ones from its own recomputed series, and with an fp64 autograd
+  of the token recurrence, to bf16 rounding (`tests/gdn/test_batch_invariant_gdn_stateless.py`, skipped without the
+  frontend). cuDNN's own series is a bf16 rounding of its forward's states and is not these bits; the gradient is
+  the backward's, and this class makes no bitwise statement about it. FLA's `h` is the transpose,
+  `[..., key, value]`.
+* Each stored state is bit for bit the state an inference prefill of the same prefix leaves in its pool, whatever the
+  other sequences of the call. The output rows are the rows of the call without `train_states`.
+* 64 KiB per v head and chunk, which approaches 1 KiB per token and v head for long sequences (48 KiB per token at
+  48 v heads, four times the output) and is one state per sequence for sequences of at most 64 tokens. Rows past
+  `training_state_slots` are left as they are. The layout's index tensors are kept with the offsets' copies.
+* The buffer's autograd version is bumped by the call, so a trainer's `autograd.Function` that saved it can tell
+  that a later call has overwritten it. `train_states` with `initial_state`, or a buffer that is not 16-byte aligned
+  or shares memory with one of the class's state pools, the output, an input or the offsets, raises the typed error.
+  A pool owns its storage from its first slot to the storage's end, so a buffer carved from the same allocation
+  after a pool is refused too: give `train_states` an allocation of its own.
+
+Tests: `tests/gdn/test_batch_invariant_gdn_stateless.py`.
 
 `lean/BIKernels/Gdn.lean` models the two kernels as an opaque chunk step and an opaque row step and defines the
 prefill as the fold of the chunk step over 64-row chunks. Four device facts carry the model, all checked bit for bit
@@ -503,3 +596,59 @@ generated cases (`lean/BIKernels/KdaCases.lean`, rendered by `kda/lean_cases.py`
 device-free test `tests/batch_invariant/test_kda_lean.py` compares with the Python specification. Tests:
 `tests/kda/test_batch_invariant_recurrent_kda.py` (every comparison bitwise; `FLASHINFER_KDA_BI_HASH_DIR` records the
 output hashes in one process and asserts them in another).
+
+### Stateless call: a trainer's forward pass
+
+Without `initial_state` the same entry is a stateless call, the form a training forward takes: whole sequences, every
+one from the zero state, rows only.
+
+```python
+out = torch.empty_like(v, memory_format=torch.contiguous_format)  # once, reused every step
+flashinfer.recurrent_kda(
+    q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0, cu_seqlens=cu, output=out,
+    use_gate_in_kernel=True, use_qk_l2norm_in_kernel=True, beta_is_logit=True, batch_invariant=True,
+)
+```
+
+* The rows of a sequence are bit for bit the rows the pool calls return for it (prefill, chunked prefill and decode),
+  whatever the other sequences of the call, their order and their number. Every row comes from one launch of the
+  class's prefill kernel over the whole sequences, built without a state input and without a state output; the step
+  kernel is not involved, the sequence's last rows off a multiple of 16 included. A packed call is preceded, as a pool
+  prefill is, by the kernel's small launch that orders the sequences on the device; it is sized for serving batches
+  and its time grows with the square of the sequence count.
+* Layouts and inputs are the pool calls': packed `[1, T, HV, 128]` with `cu_seqlens`, or `[B, T, HV, 128]`; bf16 `q` /
+  `k` / `v` / `g`, bf16 `beta` logits, fp32 `A_log` and `dt_bias`, the same head counts. No call shape is a decode step:
+  a sequence of one token is a first token.
+* No pool, no state next to a pool, no state returned: `ssm_state_indices` and `output_final_state=True` raise the typed
+  error without `initial_state`. A sequence that has to continue later is a pool call. A pool call that drops its pool
+  no longer raises: it returns rows from the zero state, so a decode step without its pool returns every token as a
+  first token.
+* With `output=` (16-byte aligned, as allocator tensors are), int64 `cu_seqlens` and contiguous inputs a call
+  allocates nothing on the device once its sequence count (packed) or its `[B, T]` (fixed layout) has been seen on the
+  stream: the kernel on this route has no workspace and writes the caller's buffer. What stays behind is the prefill
+  kernel's own metadata, one int32 per sequence for each sequence count seen (fixed layout: its offsets and order per
+  `[B, T]`), never a state. The call reads `cu_seqlens` back once to check it. Inputs or gate parameters that are not
+  contiguous, inputs that are not 16-byte aligned and an int32 `cu_seqlens` each cost one copy, a misaligned `output`
+  a buffer and a copy.
+* One `output` buffer per layer: the next call overwrites it, so a graph that saved its contents must not outlive
+  that call (the call bumps the buffer's autograd version, so such a backward raises instead of reading the new rows).
+* It cannot be captured in a CUDA graph (it raises).
+* One call takes at most 65535 sequences (more raises).
+* **What a backward needs from the forward.** `checkpoint_every_n_tokens=16` also returns `state_checkpoints`, the
+  state before every 16-token chunk of every sequence, and the call then returns `(rows, None, state_checkpoints)`. Row
+  zero of a sequence is its (zero) initial state, the next rows the states before tokens 16, 32, ...; a sequence of `n`
+  tokens has `ceil(n / 16)` rows and the sequences follow each other in call order. In fp32 a row is bit for bit the
+  pool's slot after a prefill of that many tokens; in bf16 (the default, and what the cuDNN frontend's KDA backward
+  reads on its `state_checkpoints` port) it is that state rounded. The rows of the call do not change. Pass a
+  `state_checkpoints` buffer (bf16 or fp32 `[rows, HV, 128, 128]`, at least that many rows; further rows are left
+  alone) and `checkpoint_cu_starts` (int64 `[N + 1]`, the running count of rows) to keep the call allocation-free
+  (the call reads `checkpoint_cu_starts` back on the host to check it);
+  without them the call allocates both. One row is 32 KB per head in bf16, so 2 KB per head and token. Only 16, and only
+  without a pool.
+* **The rows carry no `grad_fn`.** The class has no backward: inputs that require grad are read as plain values and
+  `out.requires_grad` is `False`. A trainer that needs gradients runs its own backward, for example its existing
+  differentiable op on the same inputs wrapped in an `autograd.Function` whose forward returns these rows. The
+  shortcut `ref + (out - ref).detach()` rounds in bf16 and does not return these bits. What that gradient is, and
+  whether it is batch-invariant, is the trainer's.
+
+Tests: `tests/kda/test_batch_invariant_kda_stateless.py`.
