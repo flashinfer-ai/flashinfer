@@ -244,7 +244,7 @@ __device__ void vectorizedProcess(size_t threadRank, size_t numThreads, T const*
 
 // ======================== Filter + Histogram ========================
 
-template <bool IsDeterministic, typename T, typename HisT_>
+template <bool IsDeterministic, bool ShortRow, typename T, typename HisT_>
 __device__ __forceinline__ void filterAndHistogram(T const* inBuf, T* outBuf, int previousLen,
                                                    Counter<T>* counter, HisT_* histogram,
                                                    IdxT* countHistogram, HisT_* histogramSmem,
@@ -257,7 +257,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, T* outBuf, in
   int const startBit = calcStartBit<T>(pass);
   uint32_t const mask = calcMask<T>(pass);
   // A block only scans its own row, so previousLen bounds every bin's count.
-  bool const splitMantissa = previousLen < MAX_SPLIT_MANTISSA_LEN;
+  bool const splitMantissa = ShortRow || previousLen < MAX_SPLIT_MANTISSA_LEN;
   if (pass == 0) {
     auto f = [startBit, mask, histogramSmem, countHistogramSmem, splitMantissa](T value, IdxT) {
       int bucket = calcBucket<T>(value, startBit, mask);
@@ -304,7 +304,7 @@ __device__ __forceinline__ void filterAndHistogram(T const* inBuf, T* outBuf, in
 
 // ======================== Main radix kernel ========================
 
-template <bool IsDeterministic, typename T>
+template <bool IsDeterministic, typename T, bool ShortRow = false>
 __global__ void AirTopPRenormRadixKernel(Counter<T>* counters, HisT<IsDeterministic, T>* histograms,
                                          IdxT* countHistograms, int const pass, T* buf1, T* buf2) {
   using HisT_ = HisT<IsDeterministic, T>;
@@ -338,7 +338,7 @@ __global__ void AirTopPRenormRadixKernel(Counter<T>* counters, HisT<IsDeterminis
   auto countHistogram = countHistograms + batchId * NUM_BUCKETS;
   __shared__ HisT_ histogramSmem[NUM_BUCKETS];
   __shared__ IdxT countHistogramSmem[NUM_BUCKETS];
-  filterAndHistogram<IsDeterministic, T, HisT_>(inBuf, outBuf, previousLen, counter, histogram,
+  filterAndHistogram<IsDeterministic, ShortRow>(inBuf, outBuf, previousLen, counter, histogram,
                                                 countHistogram, histogramSmem, countHistogramSmem,
                                                 pass);
   __syncthreads();
@@ -522,7 +522,13 @@ cudaError_t AirTopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_a
   int dev, smCnt;
   cudaGetDevice(&dev);
   cudaDeviceGetAttribute(&smCnt, cudaDevAttrMultiProcessorCount, dev);
+  // Keep the row partition independent of the short-row specialization's register count.
   uint32_t blockNum = CalcAirTopPBlockNum<IsDeterministic, DType>(batch_size, d, smCnt);
+  auto radixKernel = AirTopPRenormRadixKernel<IsDeterministic, DType>;
+  if constexpr (IsDeterministic) {
+    // Every radix pass scans at most the original row length.
+    if (d < MAX_SPLIT_MANTISSA_LEN) radixKernel = AirTopPRenormRadixKernel<true, DType, true>;
+  }
   IdxT const bufLen = calcBufLen<DType>(d);
 
   auto align256 = [](size_t x) { return ((x + 255) / 256) * 256; };
@@ -544,8 +550,8 @@ cudaError_t AirTopPRenormProb(DType* probs, DType* renormed_prob, float* top_p_a
   dim3 grid(blockNum, batch_size);
   constexpr int numPasses = NUM_PASSES<DType>;
   for (int pass = 0; pass < numPasses; ++pass) {
-    AirTopPRenormRadixKernel<IsDeterministic, DType>
-        <<<grid, BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, pass, buf1, buf2);
+    radixKernel<<<grid, BLOCK_SIZE, 0, stream>>>(counters, histograms, countHistograms, pass, buf1,
+                                                 buf2);
   }
 
   AirTopPRenormApplyKernel<DType>
