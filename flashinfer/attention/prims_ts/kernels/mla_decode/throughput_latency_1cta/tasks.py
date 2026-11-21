@@ -2048,6 +2048,11 @@ def create_single_kv_pipe_mma_task(
                         producer_label=pv_loop,
                         **pv_kwargs,
                     )
+            if cfg.q_tma_stage:
+                # The loaders' TMA-staged Q lives in TMEM and only QK reads it: the
+                # commit-based release arrives once the tile's last QK completes,
+                # so the next tile's Q staging overlaps the tail PV.
+                smem_q.release()
             pv_mma(
                 smem_kv,
                 p_resource,
@@ -2059,7 +2064,7 @@ def create_single_kv_pipe_mma_task(
                 producer_label=pv_tail,
                 **pv_kwargs,
             )
-            if not cfg.q_tmem_mma_copy:
+            if not (cfg.q_tmem_mma_copy or cfg.q_tma_stage):
                 smem_q.release()
 
     schedule_result = (
