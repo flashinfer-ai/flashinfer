@@ -340,14 +340,21 @@ def _loaded_nvrtc_libraries() -> set[Path]:
             wintypes.DWORD,
         ]
         psapi.EnumProcessModulesEx.restype = wintypes.BOOL
-        handles = (wintypes.HMODULE * 2048)()
         needed = wintypes.DWORD()
         process = kernel32.GetCurrentProcess()
-        if not psapi.EnumProcessModulesEx(
-            process, handles, ctypes.sizeof(handles), ctypes.byref(needed), 0x03
-        ):
-            raise RuntimeError("cannot resolve the loaded NVRTC library")
-        count = min(needed.value // ctypes.sizeof(wintypes.HMODULE), len(handles))
+        capacity = 2048
+        while True:
+            handles = (wintypes.HMODULE * capacity)()
+            if not psapi.EnumProcessModulesEx(
+                process, handles, ctypes.sizeof(handles), ctypes.byref(needed), 0x03
+            ):
+                raise RuntimeError("cannot resolve the loaded NVRTC library")
+            count = needed.value // ctypes.sizeof(wintypes.HMODULE)
+            if count <= capacity:
+                break
+            # The call succeeds with a truncated list when the array is too
+            # small; repeat it with room for every module it reported.
+            capacity = count
         buffer = ctypes.create_unicode_buffer(32768)
         for handle in handles[:count]:
             if kernel32.GetModuleFileNameW(handle, buffer, len(buffer)):
