@@ -57,10 +57,10 @@ def _check(out, ref, out_dtype):
     )
 
 
-@pytest.mark.parametrize("k", [2048, 2560, 1056, 2080])
+@pytest.mark.parametrize("k", [2048, 2560, 1056, 2080, 5120, 5152])
 @pytest.mark.parametrize("m", [1, 4, 5, 32])
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_gather_scatter_matches_reference(k, m, ids_dtype, out_dtype):
     num_rows, slots, offset = 3000, 517, 101
     b, sf = _random_rows(num_rows, k, seed=k + m)
@@ -122,6 +122,79 @@ def test_cuda_graph_replay():
     _check(out, _reference(a, b, sf, None, ids, num_rows, 0), torch.bfloat16)
 
 
+def test_alpha_none_captured_before_first_eager_call():
+    k, num_rows = 2048, 1000
+    b, sf = _random_rows(num_rows, k, seed=11)
+    a = torch.randn(2, k, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(0, num_rows, (2, 128), device="cuda")
+    out = torch.full((2, num_rows), float("-inf"), device="cuda")
+    alpha = torch.tensor([0.5], device="cuda")
+    gemv_bf16_fp4_gather(a, b, sf, alpha, ids, out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):  # captured, never replayed
+        gemv_bf16_fp4_gather(a, b, sf, None, ids, out)
+    out.fill_(float("-inf"))
+    gemv_bf16_fp4_gather(a, b, sf, None, ids, out)
+    _check(out, _reference(a, b, sf, None, ids, num_rows, 0), torch.float32)
+
+
+def test_strided_activation_rows():
+    k, num_rows = 2048, 500
+    b, sf = _random_rows(num_rows, k, seed=5)
+    a = torch.randn(3, k + 8, device="cuda", dtype=torch.bfloat16)[:, :k]
+    ids = torch.randint(0, num_rows, (3, 64), device="cuda")
+    out = torch.full((3, num_rows), float("-inf"), device="cuda")
+    gemv_bf16_fp4_gather(a, b, sf, None, ids, out)
+    _check(out, _reference(a, b, sf, None, ids, num_rows, 0), torch.float32)
+    with pytest.raises(ValueError):
+        gemv_bf16_fp4_gather(
+            torch.randn(3, k + 1, device="cuda", dtype=torch.bfloat16)[:, :k],
+            b,
+            sf,
+            None,
+            ids,
+            out,
+        )
+
+
+def test_out_of_range_ids_are_skipped():
+    k, num_rows = 2048, 300
+    b, sf = _random_rows(num_rows, k, seed=13)
+    a = torch.randn(2, k, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(0, num_rows, (2, 64), device="cuda")
+    ids[:, 5] = num_rows
+    ids[:, 9] = 1 << 40
+    out = torch.full((2, num_rows + 64), float("-inf"), device="cuda")
+    gemv_bf16_fp4_gather(a, b, sf, None, ids, out)
+    valid = torch.where(ids < num_rows, ids, -1)
+    _check(out, _reference(a, b, sf, None, valid, num_rows + 64, 0), torch.float32)
+    assert torch.isinf(out[:, num_rows:]).all()
+
+
+def test_scale_rows_2b_aligned():
+    k, num_rows = 2080, 400  # 130-byte scale rows: row 1 starts at 2 mod 4
+    b, sf = _random_rows(num_rows + 1, k, seed=17)
+    b, sf = b[1:], sf[1:]
+    assert sf.data_ptr() % 4 == 2
+    a = torch.randn(2, k, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(0, num_rows, (2, 64), device="cuda")
+    out = torch.full((2, num_rows), float("-inf"), device="cuda")
+    gemv_bf16_fp4_gather(a, b, sf, None, ids, out)
+    _check(out, _reference(a, b, sf, None, ids, num_rows, 0), torch.float32)
+
+
+def test_empty_weight_table_leaves_out_untouched():
+    k = 64
+    b = torch.empty(0, k // 2, dtype=torch.uint8, device="cuda")
+    sf = torch.empty(0, k // 16, dtype=torch.float8_e4m3fn, device="cuda")
+    a = torch.randn(1, k, device="cuda", dtype=torch.bfloat16)
+    ids = torch.full((1, 4), -1, dtype=torch.int32, device="cuda")
+    out = torch.full((1, 8), float("-inf"), device="cuda")
+    gemv_bf16_fp4_gather(a, b, sf, None, ids, out)
+    torch.cuda.synchronize()
+    assert torch.isinf(out).all()
+
+
 def test_rejects_bad_shapes():
     b, sf = _random_rows(10, 64, seed=0)
     a = torch.randn(1, 64, device="cuda", dtype=torch.bfloat16)
@@ -131,4 +204,17 @@ def test_rejects_bad_shapes():
     with pytest.raises(ValueError):
         gemv_bf16_fp4_gather(
             a.float(), b, sf, None, ids, torch.empty(1, 10, device="cuda")
+        )
+    with pytest.raises(ValueError):
+        gemv_bf16_fp4_gather(
+            a, b, sf, torch.ones(1), ids, torch.empty(1, 10, device="cuda")
+        )
+    with pytest.raises(ValueError):
+        gemv_bf16_fp4_gather(
+            a,
+            b,
+            sf,
+            torch.tensor(0.5, device="cuda"),
+            ids,
+            torch.empty(1, 10, device="cuda"),
         )

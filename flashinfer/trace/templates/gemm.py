@@ -1097,11 +1097,12 @@ def _gemv_bf16_fp4_gather_reference(
     )
     sf = b_descale.view(torch.float8_e4m3fn).float()
     for m in range(a.shape[0]):
-        keep = row_ids[m] >= 0
+        keep = (row_ids[m] >= 0) & (row_ids[m] < b.shape[0])
         rows = row_ids[m][keep].long()
         codes = b[rows].long()
         w = torch.stack((lut[codes & 15], lut[codes >> 4]), dim=-1)
-        w = w.reshape(rows.numel(), -1) * sf[rows].repeat_interleave(16, dim=1)
+        w = w.reshape(rows.numel(), a.shape[1])
+        w = w * sf[rows].repeat_interleave(16, dim=1)
         if alpha is not None:
             w = w * alpha.float()
         out[m, out_col_offset + rows] = (w @ a[m].float()).to(out.dtype)
@@ -1114,7 +1115,7 @@ def _gemv_bf16_fp4_gather_init(
     J: int = 4096,
     K: int = 2560,
     R: int = 32768,
-    N: int = 0,  # derived: R + out_col_offset
+    N: int = 0,  # R + out_col_offset; 0 means R + 128
     K_packed: int = 0,  # derived
     K_sf: int = 0,  # derived
     device: str = "cuda",
@@ -1122,7 +1123,7 @@ def _gemv_bf16_fp4_gather_init(
 ):
     """Rows from fp4_quantize with linear scales; out zero-filled so untouched
     columns compare equal."""
-    del N, K_packed, K_sf
+    del K_packed, K_sf
     from flashinfer import fp4_quantize  # noqa: PLC0415
 
     if not torch.cuda.is_available() or torch.device(device).type != "cuda":
@@ -1130,7 +1131,10 @@ def _gemv_bf16_fp4_gather_init(
     if torch.cuda.get_device_capability(torch.device(device))[0] != 12:
         raise NotImplementedError("gemv_bf16_fp4_gather requires SM120/121")
     torch.manual_seed(seed)
-    offset = 128
+    N = N or R + 128
+    if N < R:
+        raise ValueError(f"N ({N}) must be at least R ({R})")
+    offset = N - R
     w = torch.randn(R, K, dtype=torch.bfloat16, device=device) * 0.02
     g_w = 2688.0 / w.float().abs().max()
     b, sf = fp4_quantize(w, g_w.reshape(1), is_sf_swizzled_layout=False)
@@ -1141,9 +1145,12 @@ def _gemv_bf16_fp4_gather_init(
         b_descale=sf.view(torch.float8_e4m3fn).reshape(R, K // 16),
         alpha=g_w.reciprocal().reshape(1).float(),
         row_ids=row_ids,
-        out=torch.zeros(M, R + offset, dtype=torch.bfloat16, device=device),
+        out=torch.zeros(M, N, dtype=torch.bfloat16, device=device),
         out_col_offset=offset,
     )
+
+
+cast(Any, _gemv_bf16_fp4_gather_init)._trace_init_const_axes = ("K", "R", "N")
 
 
 gemv_bf16_fp4_gather_trace = TraceTemplate(
@@ -1152,7 +1159,7 @@ gemv_bf16_fp4_gather_trace = TraceTemplate(
     description=(
         "Per-token GEMV over gathered row-major NVFP4 rows (linear E4M3 block "
         "scales), each result written to out[m, out_col_offset + row_ids[m, j]]. "
-        "Negative ids are skipped; other columns of out are left untouched. "
+        "Ids outside [0, R) are skipped; other columns of out are left untouched. "
         "SM120/121. Mutates ``out`` in place."
     ),
     axes={

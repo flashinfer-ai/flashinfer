@@ -127,6 +127,7 @@ prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_native_sf1d_N256_K1024_K_packed512_block_size16_SF_dim_016384.json
+gemv_bf16_fp4_gather_r215552_k2048_K_packed1024_K_sf128_n248320.json
 mono_moe_topk8_h2048_i512.json
 moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
@@ -997,6 +998,25 @@ if torch.cuda.is_available() and torch.cuda.get_device_capability(device) in (
     b_native = torch.zeros(256, 512, dtype=torch.uint8, device=device)
     sf_native = torch.ones(256 * 64, dtype=torch.float8_e4m3fn, device=device)
     flashinfer.mm_bf16_fp4(a_native, b_native, sf_native, backend="cute-dsl-native")
+
+# ── Gathered-row GEMV: gemv_bf16_fp4_gather (sparse draft LM head) ───────────
+# SM120/121: a Qwen3.6-35B-A3B-sized drafter head (K=2048, vocab 248320) whose
+# first 32768 logits come from a dense GEMM; 16384 of the remaining rows are
+# picked per token and scattered into the full-vocabulary logits.
+if torch.cuda.is_available() and torch.cuda.get_device_capability(device) in (
+    (12, 0),
+    (12, 1),
+):
+    M, J, K, R, OFF = 4, 16384, 2048, 215552, 32768
+    flashinfer.gemv_bf16_fp4_gather(
+        torch.zeros(M, K, dtype=torch.bfloat16, device=device),
+        torch.zeros(R, K // 2, dtype=torch.uint8, device=device),
+        torch.ones(R, K // 16, dtype=torch.float8_e4m3fn, device=device),
+        torch.ones(1, dtype=torch.float32, device=device),
+        torch.arange(J, dtype=torch.int32, device=device).repeat(M, 1),
+        torch.zeros(M, OFF + R, dtype=torch.bfloat16, device=device),
+        out_col_offset=OFF,
+    )
 
 # ── GQA paged decode (Llama-3.1-8B, h=32/kv=8/d=128) ────────────────────────
 num_qo, num_kv, head_dim, batch_size = 32, 8, 128, 32
