@@ -60,6 +60,12 @@ from .config import (
 )
 from ..helpers.constants import LOG2_E, TMEM_DEALLOC_MBAR_THREADS
 from ..helpers.context_parallel import local_kv_length
+from ..helpers.constants import (
+    TMEM_LIFECYCLE_BARRIER_ID,
+    balanced_partial_capacity,
+    balanced_reducer_capacity,
+    balanced_work_descriptor_capacity,
+)
 from ..helpers.mask import MaskType, mask_visible_k_length, normalize_mask_type
 from ..helpers.query import (
     FlatQueryTileLayout,
@@ -105,7 +111,11 @@ from .parallel_reduction import (
     PARALLEL_REDUCTION_THREADS,
     run_parallel_reduction_kernel,
 )
-from .reduction import run_reduction_kernel
+from .reduction import (
+    run_reduction_kernel,
+    run_balanced_reduction_kernel,
+    zero_balanced_inactive_outputs,
+)
 from ..helpers.tile_scheduler import (
     MLAStaticTileSchedulerParams,
     MLAStaticTileScheduler,
@@ -186,6 +196,7 @@ def build_mla_decode_task_manager(
     split_kv=None,
     logical_num_heads_q=128,
     logical_seq_len_q=1,
+    use_balanced_scheduler=False,
     tiled_mma_qk=None,
     verbose=False,
     exhaustive_deadlock_race_check: bool | None = None,
@@ -543,6 +554,7 @@ def build_mla_decode_task_manager(
         scale_softmax_log2=None,  # set at runtime
         smem_exchange=None,  # set at runtime
         split_kv=None,  # set at runtime
+        use_balanced_scheduler=use_balanced_scheduler,
         cu_seqlens_q=cu_seqlens_q,
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
@@ -906,6 +918,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         num_heads=128,
         seq_len_q=1,
         batch_size=1,
+        use_balanced_scheduler=False,
         mask_type: MaskType | str = MaskType.CAUSAL,
         cp_world: int = 1,
         cp_interleave_size: int = 1,
@@ -1009,6 +1022,25 @@ class MlaDecodeTs(Nvfp4KVConfig):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
+        self.use_balanced_scheduler = use_balanced_scheduler
+        self.balanced_num_partitions = max_active_clusters
+        self.balanced_descriptor_capacity = (
+            balanced_work_descriptor_capacity(batch_size, max_active_clusters)
+            if use_balanced_scheduler
+            else 0
+        )
+        self.balanced_partial_capacity = (
+            balanced_partial_capacity(batch_size, max_active_clusters)
+            if use_balanced_scheduler
+            else 0
+        )
+        self.balanced_reducer_capacity = (
+            balanced_reducer_capacity(batch_size, max_active_clusters)
+            if use_balanced_scheduler
+            else 0
+        )
+        if use_balanced_scheduler and not is_persistent:
+            raise ValueError("balanced MLA scheduling requires a persistent launch")
         self.mask_type = normalize_mask_type(mask_type)
         self.cp_world = cp_world
         self.cp_interleave_size = cp_interleave_size
@@ -1093,6 +1125,11 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.query_tile_layout if self.fixed_seqlen else None,
             self.num_q_tiles if self.fixed_seqlen else None,
             self.tail_q_rows if self.fixed_seqlen else None,
+            self.use_balanced_scheduler,
+            self.balanced_num_partitions,
+            self.balanced_descriptor_capacity,
+            self.balanced_partial_capacity,
+            self.balanced_reducer_capacity,
             self._parallel_reduction_shape_is_eligible,
             self.use_parallel_reduction,
             self._reduction_topology(),
@@ -1256,6 +1293,10 @@ class MlaDecodeTs(Nvfp4KVConfig):
         output_quant_args=None,
         max_q_len: cutlass.Int32 = 0,
         cp_rank: Int32 = 0,
+        balanced_work_descriptors: cute.Tensor | None = None,
+        balanced_partition_offsets: cute.Tensor | None = None,
+        balanced_combine_descriptors: cute.Tensor | None = None,
+        balanced_num_combine_descriptors: cute.Tensor | None = None,
     ):
         """Execute the MLA decode TS kernel."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -1641,9 +1682,19 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cfg.cluster_shape_mnk,
             kernel_split_kv,
         )
-        use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
+        use_clc_dynamic = (
+            self.is_persistent
+            and not cfg.is_fp8_qkv()
+            and not self.use_balanced_scheduler
+        )
         clc_tile_sched_params = None
-        if cutlass.const_expr(use_clc_dynamic):
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            grid = (
+                cfg.cluster_shape_mnk[0] * self.max_active_clusters,
+                1,
+                1,
+            )
+        elif cutlass.const_expr(use_clc_dynamic):
             # Keep the physical query-tile dimension in grid X and flatten
             # only split/batch into grid Z.  Besides avoiding a hot-path
             # S/B decode for every stolen tile, this preserves the natural
@@ -1674,18 +1725,26 @@ class MlaDecodeTs(Nvfp4KVConfig):
             )
 
         # Initialize workspace for split_kv > 1
+        workspace_split_capacity = kernel_split_kv
+        workspace_batch_size = batch_size
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            workspace_split_capacity = Int32(self.balanced_partial_capacity)
+            workspace_batch_size = Int32(1)
         acc_o, acc_lse = self.initialize_workspace(
             Int32(physical_tile_rows),
             cfg.latent_dim,  # D
             Int32(num_query_tiles),
-            batch_size,
-            kernel_split_kv,
+            workspace_batch_size,
+            workspace_split_capacity,
             workspace,
         )
         # Nonpersistent producers signal near retirement. The native reducer
         # can overlap setup, then waits for the complete prerequisite grid
         # before reading partials. Persistent schedules retain stream ordering.
         use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
+        use_reducer_pdl = acc_o is not None and (
+            not self.is_persistent or self.use_balanced_scheduler
+        )
 
         # Host FP32 scales enter the device kernel in log2 units. Device
         # buffers retain natural units until they are loaded by the kernel.
@@ -1727,17 +1786,59 @@ class MlaDecodeTs(Nvfp4KVConfig):
             tma_desc_sparse_extra_rope,
             max_q_len,
             cp_rank,
+            balanced_work_descriptors=balanced_work_descriptors,
+            balanced_partition_offsets=balanced_partition_offsets,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
             cluster=cfg.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=use_one_wave_reducer_pdl,
+            use_pdl=use_reducer_pdl,
         )
 
         # Reduction kernel: combine per-split results when split_kv > 1
         if cutlass.const_expr(acc_o is not None):
+            if cutlass.const_expr(self.use_balanced_scheduler):
+                reduction_grid = (
+                    ceil_div(
+                        self.num_heads * self.seq_len_q,
+                        REDUCTION_ROWS_PER_CTA,
+                    ),
+                    1,
+                    batch_size,
+                )
+                if cutlass.const_expr(self.use_balanced_scheduler):
+                    reduction_grid = (
+                        ceil_div(physical_tile_rows, REDUCTION_ROWS_PER_CTA),
+                        num_query_tiles,
+                        Int32(self.balanced_reducer_capacity),
+                    )
+                self.reduction_kernel(
+                    o,
+                    lse,
+                    acc_o,
+                    acc_lse,
+                    kernel_split_kv,
+                    cache_seqs,
+                    cu_seqlens_q,
+                    block_split_kvs,
+                    balanced_combine_descriptors=balanced_combine_descriptors,
+                    balanced_num_combine_descriptors=balanced_num_combine_descriptors,
+                ).launch(
+                    grid=reduction_grid,
+                    block=[REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW, 1, 1],
+                    smem=(
+                        REDUCTION_ROWS_PER_CTA
+                        * self.reduction_split_capacity
+                        * self.lse_dtype.width
+                        // 8
+                    ),
+                    stream=stream,
+                    min_blocks_per_mp=2,
+                    use_pdl=use_reducer_pdl,
+                )
+                return
             if cutlass.const_expr(
                 self.use_parallel_reduction or self.fuse_sparse_reduction
             ):
@@ -1958,6 +2059,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
         tma_desc_sparse_extra_rope: cutlass.GridConstant[cuda.TensorMap] = None,
         max_q_len: cutlass.Int32 = 0,
         cp_rank: Int32 = 0,
+        balanced_work_descriptors: cute.Tensor | None = None,
+        balanced_partition_offsets: cute.Tensor | None = None,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -2002,7 +2105,11 @@ class MlaDecodeTs(Nvfp4KVConfig):
         num_query_tiles = (
             seq_len_q * self.num_heads + self.mma_qk_tiler_mn[0] - 1
         ) // self.mma_qk_tiler_mn[0]
-        use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
+        use_clc_dynamic = (
+            self.is_persistent
+            and not cfg.is_fp8_qkv()
+            and not self.use_balanced_scheduler
+        )
         tiled_mma_qk = None
         if cutlass.const_expr(cfg.is_fp8_qkv()):
             tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
@@ -2120,7 +2227,10 @@ class MlaDecodeTs(Nvfp4KVConfig):
             Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
         )
         clc_response_ptr = None
-        if cutlass.const_expr(use_clc_dynamic):
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            cluster_idx = cute.arch.block_idx()[0] % Int32(cfg.cluster_shape_mnk[0])
+            blk_coord = (cluster_idx, Int32(0), Int32(0), Int32(0))
+        elif cutlass.const_expr(use_clc_dynamic):
             # Keep both response stages in the ordinary dynamic-SMEM arena.
             # ``alloc_smem`` creates a separately rounded static section, which
             # needlessly exceeds this kernel's near-capacity SMEM budget.
@@ -2152,7 +2262,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
         # Remove once the compiler scopes nctaid reads per task.
         # Tile decomposition — compute blk_coord from ctaid.x WITHOUT creating
         # a full tile scheduler.
-        if cutlass.const_expr(use_clc_dynamic):
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            pass
+        elif cutlass.const_expr(use_clc_dynamic):
             query_cluster_idx, _, split_batch_idx = cute.arch.block_idx()
             seq_q_idx = query_cluster_idx // Int32(cfg.cluster_shape_mnk[0])
             cluster_idx = query_cluster_idx % Int32(cfg.cluster_shape_mnk[0])
@@ -2282,7 +2394,11 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 if cutlass.const_expr(self.static_split_kv is not None)
                 else split_kv
             )
-            if cutlass.const_expr(
+            if cutlass.const_expr(self.use_balanced_scheduler):
+                # The persistent work queue replaces this physical launch
+                # coordinate with a packed descriptor before task execution.
+                split_kv_cap = max_split_kv
+            elif cutlass.const_expr(
                 self.static_split_kv is not None and not self.is_var_split_kv
             ):
                 split_kv_cap = max_split_kv
@@ -2304,9 +2420,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
             )
             exit_early = k_tile_count <= Int32(0)
             if cutlass.const_expr(self.is_persistent):
-                # A physical persistent CTA may own an empty initial split but
-                # later grid-stride to a nonempty batch/Q tile. Let MlaTask
-                # skip empty logical tiles instead of terminating the CTA.
+                # A physical grid-stride/CLC CTA may own an empty initial
+                # split but later advance to a nonempty batch/Q tile.
                 exit_early = False
 
         if exit_early:
@@ -2381,6 +2496,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 cache_seqs=cache_seqs,
                 split_kv=max_split_kv,
                 block_split_kvs=block_split_kvs,
+                balanced_work_descriptors=balanced_work_descriptors,
+                balanced_partition_offsets=balanced_partition_offsets,
+                use_balanced_scheduler=self.use_balanced_scheduler,
                 is_var_split_kv=self.is_var_split_kv,
                 cfg=cfg,
                 static_split_kv=self.static_split_kv,
@@ -2438,6 +2556,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 split_kv=max_split_kv,
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=seq_len_q,
+                use_balanced_scheduler=self.use_balanced_scheduler,
                 tiled_mma_qk=tiled_mma_qk,
             )
 
@@ -2516,9 +2635,21 @@ class MlaDecodeTs(Nvfp4KVConfig):
             named_res["gmem_o"].smem_exchange = epilogue_exchange_arr.data_ptr().toint(
                 Int32
             )
-            named_res["gmem_o"].split_kv = max_split_kv
+            named_res["gmem_o"].split_kv = (
+                Int32(self.balanced_partial_capacity)
+                if cutlass.const_expr(self.use_balanced_scheduler)
+                else max_split_kv
+            )
 
             task_manager.run()
+
+        if cutlass.const_expr(acc_o is not None and self.use_balanced_scheduler):
+            # All producer work, including workspace stores, must finish before
+            # any CTA releases the dependent reducer.
+            prims.barrier_cta_sync(
+                barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
+                thread_count=cfg.threads_per_cta,
+            )
 
         # TMEM deallocation (MMA warp)
         if warp_idx == cfg.mma_warp_id:
@@ -2541,6 +2672,10 @@ class MlaDecodeTs(Nvfp4KVConfig):
             if cutlass.const_expr(acc_o is not None and not self.is_persistent):
                 if prims.elect_sync():
                     prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+        if cutlass.const_expr(acc_o is not None and self.use_balanced_scheduler):
+            thread_idx, _, _ = cute.arch.thread_idx()
+            if thread_idx == Int32(0):
+                prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
     @cute.jit
     def initialize_workspace(
@@ -2598,6 +2733,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
         max_q_len: cutlass.Int32 = 0,
         local_split_capacity: cutlass.Constexpr[int] = 0,
         cp_rank: Int32 = 0,
+        balanced_combine_descriptors: cute.Tensor | None = None,
+        balanced_num_combine_descriptors: cute.Tensor | None = None,
     ):
         """Dispatch the throughput 2CTA split-KV reduction body."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -2613,27 +2750,68 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cp_interleave_size=self.cp_interleave_size,
             lse_base_on_e=self.lse_base_on_e,
         )
-        if cutlass.const_expr(not self.is_persistent):
+        if cutlass.const_expr(not self.is_persistent or self.use_balanced_scheduler):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-        run_reduction_kernel(
-            self,
-            output,
-            lse,
-            acc_output,
-            acc_lse,
-            split_kv,
-            cache_seqs,
-            cu_seqlens_q,
-            block_split_kvs,
-            cfg,
-            local_split_capacity
-            if local_split_capacity > 0
-            else self.reduction_split_capacity,
-            REDUCTION_ROWS_PER_CTA,
-            split_divisor=split_divisor,
-            runtime_seq_len_q=seq_len_q,
-            cp_rank=cp_rank,
-        )
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            _, _, combine_slot = cute.arch.block_idx()
+            # Zero-KV requests have no producer or combine descriptor, so the
+            # normal main/reduction paths cannot publish their result. Keep the
+            # compact fixed grid and stride it over every logical request slot.
+            zero_balanced_inactive_outputs(
+                self,
+                output,
+                lse,
+                cache_seqs,
+                cu_seqlens_q,
+                cfg,
+                self.balanced_reducer_capacity,
+                REDUCTION_ROWS_PER_CTA,
+            )
+            if combine_slot < Int32(balanced_num_combine_descriptors[Int32(0)]):
+                batch_idx = Int32(balanced_combine_descriptors[combine_slot, Int32(0)])
+                split_count = Int32(
+                    balanced_combine_descriptors[combine_slot, Int32(1)]
+                )
+                split_begin = Int32(
+                    balanced_combine_descriptors[combine_slot, Int32(2)]
+                )
+                run_balanced_reduction_kernel(
+                    self,
+                    output,
+                    lse,
+                    acc_output,
+                    acc_lse,
+                    split_kv,
+                    cache_seqs,
+                    cu_seqlens_q,
+                    block_split_kvs,
+                    split_count,
+                    split_begin,
+                    cfg,
+                    self.reduction_split_capacity,
+                    REDUCTION_ROWS_PER_CTA,
+                    batch_idx,
+                )
+        else:
+            run_reduction_kernel(
+                self,
+                output,
+                lse,
+                acc_output,
+                acc_lse,
+                split_kv,
+                cache_seqs,
+                cu_seqlens_q,
+                block_split_kvs,
+                cfg,
+                local_split_capacity
+                if local_split_capacity > 0
+                else self.reduction_split_capacity,
+                REDUCTION_ROWS_PER_CTA,
+                split_divisor=split_divisor,
+                runtime_seq_len_q=seq_len_q,
+                cp_rank=cp_rank,
+            )
 
     @cute.kernel
     def parallel_reduction_kernel(
@@ -2666,7 +2844,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cp_interleave_size=self.cp_interleave_size,
             lse_base_on_e=self.lse_base_on_e,
         )
-        if cutlass.const_expr(not self.is_persistent):
+        if cutlass.const_expr(not self.is_persistent or self.use_balanced_scheduler):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         attention_sinks = None
         if cutlass.const_expr(self.fuse_sparse_reduction):

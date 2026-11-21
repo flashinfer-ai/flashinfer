@@ -2042,6 +2042,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     *,
     rank4_cache: bool,
     packed_query: bool,
+    balanced: bool = False,
     mask_type: str,
     max_q_len: int,
     max_kv_len: int,
@@ -2079,6 +2080,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             f"{threshold_text}, so O rescales are skipped while a K tile raises "
             "a row maximum by at most that many binades."
         )
+    schedule_suffix = "_balanced" if balanced else ""
     axes: dict[str, Var | Const] = {
         "batch_size": Var(description="Exact number of planned MLA requests."),
         "max_q_len": Const(
@@ -2133,7 +2135,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     template = TraceTemplate(
         op_type="mla_paged",
         name_prefix=(
-            f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}_{mask_type}"
+            f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}{schedule_suffix}_{mask_type}"
             f"{threshold_suffix}"
         ),
         description=(
@@ -2154,7 +2156,12 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             "seq_lens_kv": Tensor(
                 ["batch_size"],
                 dtype="int32",
-                description="Required per-request KV lengths supplied to run().",
+                description=(
+                    "Required non-negative per-request KV lengths supplied to run(); "
+                    "zero marks an inactive balanced slot."
+                    if balanced
+                    else "Required positive per-request KV lengths supplied to run()."
+                ),
             ),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"],
@@ -2177,7 +2184,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             "page_size in (4, 8, 16, 32, 64, 128)",
             "block_tables.shape[0] == batch_size",
             "max_pages_per_seq * page_size >= max_kv_len",
-            "min(seq_lens_kv) >= 1",
+            f"min(seq_lens_kv) >= {0 if balanced else 1}",
             "max(seq_lens_kv) <= max_kv_len",
             *(["kv_pad_dim == 1"] if rank4_cache else []),
             *(
@@ -2197,6 +2204,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             "mla",
             f"mask:{mask_type}",
             *threshold_tags,
+            *(["scheduler:balanced"] if balanced else []),
         ],
     )
     return _with_prims_ts_mla_cp(
@@ -2210,9 +2218,10 @@ def _make_prims_ts_decode_mla_wrapper_trace(
 # Finite examples support trace discovery and schema-consistency tests. Bound
 # dispatch below synthesizes the exact template from the wrapper's plan state.
 _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES = {
-    (rank4_cache, packed_query): _make_prims_ts_decode_mla_wrapper_trace(
+    (rank4_cache, packed_query, balanced): _make_prims_ts_decode_mla_wrapper_trace(
         rank4_cache=rank4_cache,
         packed_query=packed_query,
+        balanced=balanced,
         mask_type="causal",
         max_q_len=1,
         max_kv_len=1,
@@ -2221,6 +2230,7 @@ _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES = {
     )
     for rank4_cache in (False, True)
     for packed_query in (False, True)
+    for balanced in (False, True)
 }
 
 
@@ -2231,6 +2241,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     *,
     rank4_cache: bool,
     packed_query: bool,
+    balanced: bool = False,
     mask_type: str,
     max_q_len: int,
     max_kv_len: int,
@@ -2246,6 +2257,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     return _make_prims_ts_decode_mla_wrapper_trace(
         rank4_cache=rank4_cache,
         packed_query=packed_query,
+        balanced=balanced,
         mask_type=mask_type,
         max_q_len=max_q_len,
         max_kv_len=max_kv_len,
@@ -2287,6 +2299,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
     base = _get_prims_ts_decode_mla_wrapper_trace(
         rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
         packed_query=packed_query,
+        balanced=getattr(state, "balanced_plan", None) is not None,
         mask_type=str(state.mask_type),
         max_q_len=int(state.max_q_len),
         max_kv_len=int(state.max_kv_len),
