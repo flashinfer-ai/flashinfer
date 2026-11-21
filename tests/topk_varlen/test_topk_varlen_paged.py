@@ -435,7 +435,8 @@ def test_paged_cluster_rows_far_below_envelope(rows):
     (cluster rows), against the transformed local output, which is itself
     checked against torch.topk."""
     ncols, top_k, page_size = 131072, 512, 64
-    assert _host._varlen_launcher(rows, ncols, top_k, ncols, 1, 1, True, 6)[0] == "clus"
+    fam = _host._varlen_launcher(rows, ncols, top_k, ncols, 1, 1, True, 6)[0]
+    assert _host._sm_count() != 148 or fam == "clus", fam  # the B200 plan
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
     gen = torch.Generator(device=_DEV).manual_seed(rows)
     lens = torch.randint(top_k - 8, 9000, (rows,), generator=gen, device=_DEV)

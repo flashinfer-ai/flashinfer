@@ -683,7 +683,9 @@ def test_gvr2_clus_rows_far_below_envelope(rows, msl_c, top_k, next_n, cr, hinte
         next_n=next_n,
         compress_ratio=cr,
     )
-    _assert_family(rows, msl_c, top_k, next_n, cr, "clus", hint_free=not hinted)
+    _assert_family(
+        rows, msl_c, top_k, next_n, cr, _b200_family("clus"), hint_free=not hinted
+    )
     _check_varlen_rows(logits, out, n_r, top_k)
 
 
@@ -719,7 +721,7 @@ def test_gvr2_clus_adversarial_short_rows(pattern, rows):
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=True)
     _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
-    _assert_family(rows, msl_c, top_k, 1, 1, "clus", hint_free=True)
+    _assert_family(rows, msl_c, top_k, 1, 1, _b200_family("clus"), hint_free=True)
     _check_varlen_rows(logits, out, n_r, top_k)
 
 
@@ -748,7 +750,7 @@ def test_gvr2_clus_graph_replay_lengths_change(rows):
     with torch.cuda.stream(s):  # eager warm-up on the capturing stream
         _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
     torch.cuda.synchronize()
-    _assert_family(rows, msl, top_k, 1, 1, "clus", hint_free=True)
+    _assert_family(rows, msl, top_k, 1, 1, _b200_family("clus"), hint_free=True)
     g = torch.cuda.CUDAGraph()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
@@ -830,7 +832,9 @@ def test_gvr2_clus_register_rows(rows, msl_c, top_k, next_n, cr, hinted):
         next_n=next_n,
         compress_ratio=cr,
     )
-    _assert_family(rows, msl_c, top_k, next_n, cr, "clus", hint_free=not hinted)
+    _assert_family(
+        rows, msl_c, top_k, next_n, cr, _b200_family("clus"), hint_free=not hinted
+    )
     _check_varlen_rows(logits, indices, n_r, top_k)
 
 
@@ -889,7 +893,9 @@ def test_gvr2_clus_register_adversarial(rows, pattern):
         _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=pre_idx is None)
         _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
         torch.cuda.synchronize()
-        _assert_family(rows, msl_c, top_k, 1, 1, "clus", hint_free=pre_idx is None)
+        _assert_family(
+            rows, msl_c, top_k, 1, 1, _b200_family("clus"), hint_free=pre_idx is None
+        )
         _check_varlen_rows(logits, out, lens, top_k)
 
 
@@ -2110,7 +2116,7 @@ def test_gvr2_register_escape_tail_element(
         _forget_launcher(rows, width, top_k, 1, 1)
         _run_gvr2(logits, seq_lens, top_k, hint, out_indices=out)
         torch.cuda.synchronize()
-        _assert_family(rows, width, top_k, 1, 1, family)
+        _assert_family(rows, width, top_k, 1, 1, _b200_family(family))
         _check_varlen_rows(logits, out, n_r, top_k)
 
 
@@ -2241,7 +2247,7 @@ def test_gvr2_short_rows_every_family(rows, width, top_k, next_n, cr, family, pa
             top_k,
             next_n,
             cr,
-            family,
+            _b200_family(family),
             hint_free=hint_free,
             page_shift=6 if paged else None,
         )
@@ -2279,7 +2285,7 @@ def test_gvr2_short_rows_page_sizes(rows, width, top_k, next_n, cr, family, page
         top_k,
         next_n,
         cr,
-        family,
+        _b200_family(family),
         hint_free=True,
         page_shift=page_size.bit_length() - 1,
     )
@@ -2352,7 +2358,7 @@ def test_gvr2_short_rows_graph_replay(rows, width, top_k, next_n, cr, family, pa
         top_k,
         next_n,
         cr,
-        family,
+        _b200_family(family),
         hint_free=True,
         page_shift=6 if paged else None,
     )
@@ -2483,7 +2489,15 @@ def test_gvr2_main_cluster_path_rows(rows, msl_c, top_k, next_n, cr):
                 next_n=next_n,
                 compress_ratio=cr,
             )
-            _assert_family(rows, msl_c, top_k, next_n, cr, "main", hint_free=hint_free)
+            _assert_family(
+                rows,
+                msl_c,
+                top_k,
+                next_n,
+                cr,
+                _b200_family("main"),
+                hint_free=hint_free,
+            )
             _check_varlen_rows(logits, indices, n_r, top_k)
 
 
@@ -2572,7 +2586,9 @@ def test_gvr2_main_cluster_path_adversarial(rows, msl_c, top_k, page_size, patte
         _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=pre_idx is None)
         _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
         torch.cuda.synchronize()
-        _assert_family(rows, msl_c, top_k, 1, 1, "main", hint_free=pre_idx is None)
+        _assert_family(
+            rows, msl_c, top_k, 1, 1, _b200_family("main"), hint_free=pre_idx is None
+        )
         _check_varlen_rows(logits, out, lens, top_k)
 
 
@@ -2764,7 +2780,15 @@ def test_gvr2_main_slab_rows(rows, msl_c, top_k, next_n, cr):
                 next_n=next_n,
                 compress_ratio=cr,
             )
-            _assert_family(rows, msl_c, top_k, next_n, cr, "main", hint_free=hint_free)
+            _assert_family(
+                rows,
+                msl_c,
+                top_k,
+                next_n,
+                cr,
+                _b200_family("main"),
+                hint_free=hint_free,
+            )
             _check_varlen_rows(logits, indices, n_r, top_k)
 
 
@@ -2848,7 +2872,9 @@ def test_gvr2_main_slab_adversarial(rows, msl_c, top_k, pattern):
         _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=pre_idx is None)
         _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
         torch.cuda.synchronize()
-        _assert_family(rows, msl_c, top_k, 1, 1, "main", hint_free=pre_idx is None)
+        _assert_family(
+            rows, msl_c, top_k, 1, 1, _b200_family("main"), hint_free=pre_idx is None
+        )
         _check_varlen_rows(logits, out, lens, top_k)
 
 
