@@ -229,7 +229,7 @@ jobs:
                 '> [!CAUTION]',
                 '> **THIS PR APPEARS TO BREAK THE PUBLIC API. AUTHORS AND REVIEWERS: DO NOT MISS THIS.**',
                 '>',
-                '> This is an advisory warning and does not gate merging. Confirm compatibility and provide a deprecation or migration path, or track the fix in a follow-up PR.',
+                '> The **Public API compatibility** check fails until the break is fixed. If the break is intended and has a deprecation or migration path, a maintainer can apply the `api-break-approved` label to let it pass.',
                 '',
                 `${publicApiFindings.length} public API finding(s):`,
                 '',
@@ -259,7 +259,7 @@ jobs:
                 '# 🚨 ADVISORY CHECKER REPORT IS INCOMPLETE 🚨',
                 '',
                 '> [!WARNING]',
-                `> ${escape(problems.join('; '))}. The checker remains non-blocking, but this run must not be treated as a clean result.`,
+                `> ${escape(problems.join('; '))}. This advisory report must not be treated as a clean result; the **Public API compatibility** check gives the blocking verdict.`,
               );
             }
             sections.push('', `[View the full check run](${runUrl})`);

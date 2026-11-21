@@ -1,0 +1,86 @@
+name: PR Public API Compatibility
+
+# Blocking counterpart of the advisory public-API step in pr-api-doc-checks.yml.
+# The same checker runs with --strict, so a PR that removes or incompatibly
+# changes a stable public API fails this check until the break is fixed or a
+# maintainer accepts it with the api-break-approved label. Documentation
+# findings stay advisory and are reported only by PR Documentation Checks.
+#
+# The job has no `if:` and runs on every listed event, label events included.
+# A skipped job reports a passing conclusion to a required check, so a job that
+# skipped itself on an unrelated label event would replace a failure with a pass.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-api-compat-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  OVERRIDE_LABEL: api-break-approved
+
+jobs:
+  public-api:
+    name: Public API compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check public API compatibility
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Read via env, not inlined: label names are caller-supplied text.
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -o pipefail
+          status=0
+          python scripts/check_pr_api_diff.py \
+              --base "$BASE_SHA" \
+              --head "$HEAD_SHA" \
+              --strict \
+              --report-json api-compat.json | tee api-compat-check.txt || status=$?
+          cat api-compat-check.txt >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+
+          # --strict exits 1 on findings, but an uncaught exception also exits 1.
+          # The report is written only after a complete run, so a missing or
+          # empty report means the checker failed, which must not pass either.
+          findings=$(jq '.findings | length' api-compat.json 2>/dev/null || echo 0)
+          if [ "${findings:-0}" -gt 0 ]; then
+            what="$findings potential breaking public API change(s)"
+          else
+            what="the public API checker did not complete (exit $status)"
+          fi
+
+          if jq -e --arg label "$OVERRIDE_LABEL" 'index($label) != null' <<< "$PR_LABELS" > /dev/null; then
+            echo "::notice title=Public API break accepted::$what accepted by the $OVERRIDE_LABEL label"
+            {
+              echo ""
+              echo "> [!NOTE]"
+              echo "> Passing because a maintainer applied \`$OVERRIDE_LABEL\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::error title=Public API compatibility::$what. Fix the break, or a maintainer can apply the $OVERRIDE_LABEL label after confirming a deprecation or migration path."
+          {
+            echo ""
+            echo "> [!CAUTION]"
+            echo "> Blocking: $what. Restore compatibility, or a maintainer can apply"
+            echo "> \`$OVERRIDE_LABEL\` once the break is intended and has a deprecation or migration path."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
