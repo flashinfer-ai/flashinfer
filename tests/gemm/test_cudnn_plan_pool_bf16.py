@@ -78,7 +78,8 @@ def test_pool_tactics_match_in_process(pool_off, pool_on, monkeypatch, m):
 # on a GPU major version, keyed by tactic. On GB300 (CUDA 12.9) this tactic at
 # M=37 returned B.T @ B in its first rows while the pool's single-plan graph
 # returned A @ B (PR #9488 CI). The in-process path is unchanged upstream
-# code, so the mismatch is tracked separately and only warned about here.
+# code, so the mismatch is tracked in issue #9809 and only warned about here.
+# Remove the entry once that is fixed.
 _KNOWN_BAD_IN_PROCESS = {10: {(9, ((12, 246),))}}
 
 
