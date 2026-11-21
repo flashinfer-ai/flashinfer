@@ -1088,8 +1088,11 @@ def test_native_task_cache_refreshes_for_each_work_tile(
     lengths, snapshots = [31, 57, 768], []
     query_offsets = object()
 
-    def visible_length(config, cache, query_tile, offsets, batch):
+    def visible_length(config, cache, query_tile, offsets, batch, cp_rank=0):
         assert config is cfg and offsets is query_offsets
+        # This task is built without a context-parallel rank, so the default has
+        # to reach the helper; non-zero ranks are covered by the CP tests.
+        assert cp_rank == 0
         snapshots.append((cache, query_tile, batch))
         return cache[4]
 
