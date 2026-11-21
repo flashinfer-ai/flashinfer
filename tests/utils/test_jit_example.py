@@ -135,7 +135,14 @@ struct FlashSigmoid : AttentionVariantBase {
 """
 
 
-def test_flash_sigmoid():
+# The second shape makes single prefill split the KV range; FlashSigmoid has no softmax,
+# so the partial outputs are combined by AttentionSum over 128 query heads. Its outputs sum
+# 4096 sigmoid-weighted values (|o| ~ 30), so the fp16 partials differ by a few ulp there.
+@pytest.mark.parametrize(
+    "qo_len,num_qo_heads,num_kv_heads,kv_len,atol",
+    [(128, 8, 8, 1027, 2e-2), (32, 128, 8, 4096, 1e-1)],
+)
+def test_flash_sigmoid(qo_len, num_qo_heads, num_kv_heads, kv_len, atol):
     torch.manual_seed(42)
     variant_decl = flash_sigmoid_sm80_decl
     jit_module = gen_customize_single_prefill_module(
@@ -156,18 +163,21 @@ def test_flash_sigmoid():
 
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
-    q = torch.randn(128, 8, 128, dtype=torch.float16, device="cuda")
-    k = torch.randn(1027, 8, 128, dtype=torch.float16, device="cuda")
-    v = torch.randn(1027, 8, 128, dtype=torch.float16, device="cuda")
+    q = torch.randn(qo_len, num_qo_heads, 128, dtype=torch.float16, device="cuda")
+    k = torch.randn(kv_len, num_kv_heads, 128, dtype=torch.float16, device="cuda")
+    v = torch.randn(kv_len, num_kv_heads, 128, dtype=torch.float16, device="cuda")
     logits_scale = 1.0 / math.sqrt(128)
     sigmoid_bias = 0.25
     o = f(q, k, v, logits_scale, sigmoid_bias, mask_mode=MaskMode.NON_CAUSAL.value)
 
+    group_size = num_qo_heads // num_kv_heads
+    k_ref = k.float().repeat_interleave(group_size, dim=1)
+    v_ref = v.float().repeat_interleave(group_size, dim=1)
     p = torch.sigmoid(
-        torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * logits_scale + sigmoid_bias
+        torch.einsum("mhd,nhd->hmn", q.float(), k_ref) * logits_scale + sigmoid_bias
     )
-    o_ref = torch.einsum("hmn,nhd->mhd", p, v.float()).half()
-    torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
+    o_ref = torch.einsum("hmn,nhd->mhd", p, v_ref).half()
+    torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=atol)
 
 
 def test_dump_logits():
@@ -1090,7 +1100,8 @@ struct FlashAlibiDecode : AttentionVariantBase {
 
 if __name__ == "__main__":
     test_single_decode_mask()
-    test_flash_sigmoid()
+    test_flash_sigmoid(128, 8, 8, 1027, 2e-2)
+    test_flash_sigmoid(32, 128, 8, 4096, 1e-1)
     test_dump_logits()
     test_batch_decode_flash_sigmoid(False)
     test_batch_decode_flash_sigmoid(True)
