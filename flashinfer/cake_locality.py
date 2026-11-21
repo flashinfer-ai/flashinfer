@@ -34,6 +34,23 @@ FlashInfer JIT build of :data:`PROBE_SOURCE`, and caches only the outcomes that 
 later probe would repeat. Every condition it cannot meet gives ``None``, and a
 caller then takes its whole-GPU route.
 
+Twins gain from die-local memory reads. Some boards keep their memory at a
+lower clock under load (driver 620.43: 3186 of 4752 MHz). There, for B=64 batch
+DeepGEMM FP8 weights of (4096, 7168), the twin route took 1.01-1.08x the time
+of the whole-GPU route at expected_m <= 64 and 0.92-0.95x at 512 and 4096 while
+the whole-GPU route kept its CTA reserve; with the whole-GPU route on the full
+grid from expected_m 36 (212-SM devices), the twin took 1.01-1.14x its time at
+every measured expected_m from 1 to 4096. At 4752 MHz the twin was faster at
+every measured expected_m than the reserved grid, and, with the full grid from
+expected_m 36, at expected_m <= 36. Neither the CUDA driver API version
+(cuDriverGetVersion) nor the CUDA memory-clock attribute tells the two apart,
+while NVML's current memory clock does: :func:`memory_at_full_clock` reads it
+once per device, and the batch DeepGEMM FP8 path homes and routes no twin
+below :data:`MEMORY_CLOCK_FRACTION` of the maximum, or when NVML cannot read
+it. The GDN decode twin (H=16, HV=32, B 48-512) stays faster than its
+whole-GPU route at 3186 MHz (0.88-0.97x its time in CUDA graphs), so
+:func:`sm_table` does not depend on the memory clock.
+
 :func:`split_empty` reserves one virtual address range and backs ``[0, cut)``
 with memory of die 0 and ``[cut, size)`` with memory of die 1. The allocation is
 in a registry keyed by its base pointer from allocation until its last tensor is
@@ -57,6 +74,7 @@ import dataclasses
 import fractions
 import functools
 import itertools
+import logging
 import threading
 from collections.abc import Sequence
 from typing import Any
@@ -73,6 +91,7 @@ __all__ = [
     "EVEN_GAP",
     "LOCALITY_ARCH",
     "LOCALITY_CUDA",
+    "MEMORY_CLOCK_FRACTION",
     "PROBE_ATTEMPTS",
     "PROBE_SOURCE",
     "SM_TABLE_LENGTH",
@@ -84,6 +103,7 @@ __all__ = [
     "granularity",
     "homing",
     "launch_counters",
+    "memory_at_full_clock",
     "pack_rows",
     "pointer_domain",
     "reserve_launch_counters",
@@ -112,6 +132,9 @@ LOCALITY_CUDA = (13, 5)
 PROBE_ATTEMPTS = 4
 # Two dies whose SM counts differ by at most this many SMs are "even".
 EVEN_GAP = 4
+# memory_at_full_clock: NVML reads the memory clock at no less than this fraction
+# of the maximum memory clock (see the module docstring).
+MEMORY_CLOCK_FRACTION = 0.95
 
 # One 1-thread CTA per SM (each asks for an SM's whole opt-in shared memory, so no
 # two share an SM) stores its SM's id, locality domain, supplemental flag and the
@@ -252,6 +275,13 @@ _LOCK = threading.Lock()
 _TABLES: dict[int, SmTable | None] = {}
 _PROBE_MODULE: list[Any] = []  # the loaded module, or None for an old toolkit
 _PROBE_LOCKS: dict[int, threading.Lock] = {}  # one per device: one probe at a time
+# The (current, max) memory clock in MHz NVML read for a device by
+# memory_at_full_clock, or None when it could not read them.
+_MEMORY_CLOCKS: dict[int, tuple[int, int] | None] = {}
+# Devices whose unreadable memory clock was logged: one warning per device and
+# process (_forget does not clear it).
+_CLOCK_WARNED: set[int] = set()
+_LOGGER = logging.getLogger(__name__)
 
 
 def _device_index(device: Any) -> int:
@@ -391,6 +421,81 @@ def _remember(index: int, table: SmTable | None, cacheable: bool) -> SmTable | N
         return _TABLES.setdefault(index, table)
 
 
+def memory_at_full_clock(device: Any = None) -> bool:
+    """Whether NVML reads the memory clock of ``device`` (default: the current
+    CUDA device) at no less than :data:`MEMORY_CLOCK_FRACTION` of its maximum;
+    ``False`` below it or when NVML cannot read it. The clock is read once per
+    process and device, through NVML by the device's UUID, and the outcome is
+    cached: a cached outcome costs a dictionary lookup. The batch DeepGEMM FP8
+    path routes no twin where this is ``False`` (see the module docstring);
+    :func:`sm_table` does not depend on it."""
+    try:
+        index = _device_index(device)
+    except Exception:  # noqa: BLE001 - no CUDA device to read
+        return False
+    if index not in _MEMORY_CLOCKS:
+        read = _memory_clocks(index)
+        with _LOCK:
+            _MEMORY_CLOCKS.setdefault(index, read)
+    clocks = _MEMORY_CLOCKS.get(index)
+    if clocks is None:
+        return False
+    current, peak = clocks
+    return peak > 0 and current >= MEMORY_CLOCK_FRACTION * peak
+
+
+def _nvml_uuid(device_index: int) -> str:
+    """The NVML UUID (``GPU-...``) of CUDA device ``device_index``."""
+    import torch
+
+    uuid = str(torch.cuda.get_device_properties(device_index).uuid)
+    return uuid if uuid.startswith(("GPU-", "MIG-")) else f"GPU-{uuid}"
+
+
+def _memory_clocks(device_index: int) -> tuple[int, int] | None:
+    """The current and maximum memory clock in MHz of CUDA device
+    ``device_index`` read through NVML (the device is found by its UUID, so a
+    ``CUDA_VISIBLE_DEVICES`` order does not matter), or ``None`` when NVML cannot
+    read them. A ``None`` is logged once per device and process, since the
+    batch DeepGEMM FP8 path then routes no twin on the device."""
+    try:
+        import pynvml
+
+        uuid = _nvml_uuid(device_index)
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+            current = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+            peak = pynvml.nvmlDeviceGetMaxClockInfo(handle, pynvml.NVML_CLOCK_MEM)
+        finally:
+            pynvml.nvmlShutdown()
+        return int(current), int(peak)
+    except Exception as exc:  # noqa: BLE001 - an unreadable clock routes nothing
+        _warn_unreadable_clock(device_index, exc)
+        return None
+
+
+def _warn_unreadable_clock(device_index: int, exc: Exception) -> None:
+    """Log, once per device and process, why the memory clock of CUDA device
+    ``device_index`` could not be read."""
+    with _LOCK:
+        if device_index in _CLOCK_WARNED:
+            return
+        _CLOCK_WARNED.add(device_index)
+    reason = (
+        "pynvml is not installed"
+        if isinstance(exc, ImportError)
+        else f"NVML could not read it ({type(exc).__name__}: {exc})"
+    )
+    _LOGGER.warning(
+        "the memory clock of CUDA device %d is unknown (%s), so batch DeepGEMM "
+        "FP8 calls on it route no locality-domain twin and take the whole-GPU "
+        "route",
+        device_index,
+        reason,
+    )
+
+
 def _probe(device_index: int) -> tuple[SmTable | None, bool]:
     """Run the probe on device ``device_index``: ``(table, cacheable)`` (see
     :func:`sm_table`)."""
@@ -456,6 +561,7 @@ def _forget() -> None:
     with _LOCK:
         _TABLES.clear()
         _PROBE_MODULE.clear()
+        _MEMORY_CLOCKS.clear()
 
 
 # --------------------------------------------------------------------------- memory

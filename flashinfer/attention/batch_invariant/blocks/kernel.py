@@ -103,6 +103,8 @@ class AttentionKernel:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        *,
+        causal: bool = True,
         fmt: str = "bf16",
     ):
         self.fmt = fmt  # the class's operand format (bf16, or f16 for the fp16 class)
@@ -117,6 +119,7 @@ class AttentionKernel:
         )
         self.hw_rowmax = hw_rowmax
         self.cap = cap
+        self.causal = causal  # the mask mode (a class dimension; compile-time)
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit
@@ -153,7 +156,8 @@ class AttentionKernel:
             self.ragged,
             self.hw_rowmax,
             self.cap,
-            self.fmt,
+            causal=self.causal,
+            fmt=self.fmt,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)

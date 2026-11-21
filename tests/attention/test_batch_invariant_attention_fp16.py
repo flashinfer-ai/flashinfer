@@ -270,20 +270,26 @@ def reference(pr: Problem, window_left=-1, sm_scale=None, with_scale=False):
 def test_fingerprint_operand_format_dimension(op):
     """The operand dtype is an optional dimension of the receipt: omitted (or bf16) it is the bf16 class's recorded digest, fp16
     names the fp16 class; the three wrappers share both."""
+    # the mask mode is a fixed dimension of the prefill wrappers' receipt and optional for the decode wrapper
+    kw = {} if op.startswith("BatchDecode") else {"causal": True}
     for D in (64, 128, 256):
-        assert bi.fingerprint(op, head_dim=D) == BF16_FINGERPRINTS[D]
+        assert bi.fingerprint(op, head_dim=D, **kw) == BF16_FINGERPRINTS[D]
         assert (
-            bi.fingerprint(op, head_dim=D, dtype=torch.bfloat16)
+            bi.fingerprint(op, head_dim=D, dtype=torch.bfloat16, **kw)
             == (BF16_FINGERPRINTS[D])
         )
-        assert bi.fingerprint(op, head_dim=D, dtype="bf16") == BF16_FINGERPRINTS[D]
+        assert (
+            bi.fingerprint(op, head_dim=D, dtype="bf16", **kw) == BF16_FINGERPRINTS[D]
+        )
         for dt in (torch.float16, "fp16", "f16"):
-            assert bi.fingerprint(op, head_dim=D, dtype=dt) == FP16_FINGERPRINTS[D]
+            assert (
+                bi.fingerprint(op, head_dim=D, dtype=dt, **kw) == FP16_FINGERPRINTS[D]
+            )
     for dt in (torch.float32, torch.float8_e4m3fn, "half"):
         with pytest.raises(ValueError):
-            bi.fingerprint(op, head_dim=128, dtype=dt)
+            bi.fingerprint(op, head_dim=128, dtype=dt, **kw)
     with pytest.raises(TypeError):
-        bi.fingerprint(op, head_dim=128, dtype=torch.float16, page_size=16)
+        bi.fingerprint(op, head_dim=128, dtype=torch.float16, page_size=16, **kw)
 
 
 def test_fp16_term_names_its_format_everywhere():

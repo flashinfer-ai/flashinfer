@@ -15,29 +15,41 @@ import functools
 
 from ..generator import Knobs
 from .blockscaled_mx_mixed import plan_for
-from .compile_blockscaled import compile_blockscaled
+from .compile import object_record
+from .compile_blockscaled import compile_blockscaled, object_chunks
 
 MODULE = "batch_invariant_gemm_blockscaled_mixed"
 
 
-@functools.cache
 def get_compiled_blockscaled_mixed(
     cfg: Knobs,
     chunks: int,
-    clusters: int,
     in_fmt: str,
     out_fmt: str = "bf16",
     family: str = "",
     enable_pdl: bool = False,
 ):
-    """``kernel(a3, b3, sfa, sfb, c3, alpha)`` of the mixed class ``in_fmt`` (the direct stores; the workspace split's
-    partials are unscaled and the dense module's fixup applies ``alpha``), with the conventions of
+    """``kernel(a3, b3, sfa, sfb, c3, alpha, grid, swizzle, raster_m)`` of the mixed class ``in_fmt`` (the direct stores;
+    the workspace split's partials are unscaled and the dense module's fixup applies ``alpha``), with the conventions of
     :func:`compile_blockscaled.get_compiled_blockscaled`; ``enable_pdl`` compiles the programmatic-dependent-launch
     variant (its own cache key, the same bits)."""
+    return _compiled_blockscaled_mixed(
+        object_record(cfg),
+        object_chunks(cfg, chunks),
+        in_fmt,
+        out_fmt,
+        family,
+        enable_pdl,
+    )
+
+
+@functools.cache
+def _compiled_blockscaled_mixed(
+    cfg: Knobs, chunks: int, in_fmt: str, out_fmt: str, family: str, enable_pdl: bool
+):
     return compile_blockscaled(
         cfg,
         chunks,
-        clusters,
         in_fmt,
         out_fmt,
         MODULE,

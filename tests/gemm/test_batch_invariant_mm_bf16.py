@@ -257,6 +257,19 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                         assert cfg in space, cfg.describe()
 
 
+def test_kernel_handle_cache_clears_with_the_rankings():
+    """The launch-handle cache has one supported clear, and forgetting the rankings (a device's registered numbers) forgets
+    the handles too: a handle is sized with the grid the rankings were computed for."""
+    from flashinfer.gemm.batch_invariant import api as bi_api, heuristic
+
+    bi_api._KERNELS[("probe",)] = object()
+    bi_api.clear_kernel_cache()
+    assert ("probe",) not in bi_api._KERNELS
+    bi_api._KERNELS[("probe",)] = object()
+    heuristic.rank.cache_clear()
+    assert ("probe",) not in bi_api._KERNELS
+
+
 @pytest.mark.parametrize("family,sm_count", PARTS)
 def test_memoised_dispatcher_pick_equals_a_fresh_ranking(family, sm_count):
     """The dispatcher's pick, its candidate list and the enumerated space are memoised per argument tuple: a memoised
@@ -367,34 +380,46 @@ def test_tactic_encoding_round_trips():
         )
 
 
-def test_non_kernel_source_exclusions_are_current():
-    """Every source excluded from a module's cache key (the dispatcher's host-side files) exists and is in the module's import
-    closure: a stale entry raises instead of silently letting the file back into the key."""
-    import flashinfer.batch_invariant.jit as J
+def test_scheduler_decode_mirror_visits_every_tile_once():
+    """The host mirror of the kernel's tile decode (``scheduler.tile_order``): a permutation of the cluster tiles for
+    every swizzle, raster order, batch extent and odd tile count; ``s = 1`` is the plain raster order; the full swizzle
+    bands keep the static scheduler's order (bands ascending, the slow index ascending inside a band, the band's fast
+    tiles innermost) and the remainder band holds exactly the tiles the static scheduler padded with phantoms."""
+    from flashinfer.gemm.batch_invariant.blocks.scheduler import tile_order
 
-    clear = getattr(
-        J.module_sources, "cache_clear", lambda: None
-    )  # the closure is memoised per module
-    for module, entries in list(J.MODULE_NON_KERNEL_SOURCES.items()):
-        saved = J.MODULE_NON_KERNEL_SOURCES[module]
-        try:
-            J.MODULE_NON_KERNEL_SOURCES[module] = ()
-            clear()
-            full = set(J.relative_sources(module))
-            for r in entries:
-                assert (J._FI_DIR / r).exists(), (module, r)
-                assert r in full, (module, r)
-            J.MODULE_NON_KERNEL_SOURCES[module] = saved + (
-                "gemm/batch_invariant/does_not_exist.py",
-            )
-            clear()
-            with pytest.raises(
-                FileNotFoundError, match="not in the module's import closure"
-            ):
-                J.relative_sources(module)
-        finally:
-            J.MODULE_NON_KERNEL_SOURCES[module] = saved
-            clear()
+    for mt in (1, 2, 3, 7, 16):
+        for nt in (1, 3, 5, 8, 13):
+            for L in (1, 2):
+                for raster_m in (True, False):
+                    plain = [
+                        (m, n, l)
+                        for l in range(L)
+                        for f in range(nt if raster_m else mt)
+                        for sl in range(mt if raster_m else nt)
+                        for (m, n) in [((sl, f) if raster_m else (f, sl))]
+                    ]
+                    assert tile_order(mt, nt, L, 1, raster_m) == plain
+                    for s in (2, 4, 8):
+                        order = tile_order(mt, nt, L, s, raster_m)
+                        assert sorted(order) == sorted(plain), (mt, nt, L, s, raster_m)
+                        S, F = (mt, nt) if raster_m else (nt, mt)
+                        static = [
+                            ((sl, f, l) if raster_m else (f, sl, l))
+                            for l in range(L)
+                            for band in range(-(-F // s))
+                            for sl in range(S)
+                            for f in range(band * s, min((band + 1) * s, F))
+                        ]
+                        full = (F // s) * s * S
+                        for l in range(L):
+                            per_l = S * F
+                            assert (
+                                order[l * per_l : l * per_l + full]
+                                == static[l * per_l : l * per_l + full]
+                            )
+                            assert sorted(
+                                order[l * per_l + full : (l + 1) * per_l]
+                            ) == sorted(static[l * per_l + full : (l + 1) * per_l])
 
 
 def test_cache_key_covers_every_kernel_source():
@@ -413,6 +438,7 @@ def test_cache_key_covers_every_kernel_source():
         "gemm/batch_invariant/blocks/mainloop.py",
         "gemm/batch_invariant/blocks/operands.py",
         "gemm/batch_invariant/blocks/producer.py",
+        "gemm/batch_invariant/blocks/scheduler.py",
         "gemm/batch_invariant/fixup.py",
         "gemm/batch_invariant/spec.py",
         "gemm/batch_invariant/generator.py",
@@ -835,9 +861,11 @@ def test_failed_occupancy_query_is_retried_a_bounded_number_of_times(monkeypatch
 def test_persistent_grid_is_the_device_co_resident_cluster_count():
     """The compiled persistent grid is the launch device's co-resident cluster count for the configuration's cluster
     shape (the GPC-aware occupancy query), not SMs // cluster size: the launched grid, read from a profiler trace of a
-    many-tile GEMM, is that many clusters; the kernel's cache key carries the count; the bits are those of any other grid.
-    Where the profiler records no kernels (a CUPTI that does not support the device under the installed toolkit), the
-    grid readback is skipped and the other checks still run."""
+    many-tile GEMM, is that many clusters; the count is a launch argument, not part of the object's name; the bits are
+    those of any other grid. Where the profiler records no kernels (a CUPTI that does not support the device under the
+    installed toolkit), the grid readback is skipped and the other checks still run."""
+    import dataclasses
+
     import cutlass.utils as cutlass_utils
     from torch.profiler import ProfilerActivity, profile
 
@@ -864,7 +892,10 @@ def test_persistent_grid_is_the_device_co_resident_cluster_count():
             clusters,
             query,
         )
-        assert kernel_name(cfg, "n", 1, clusters).endswith(f"_g{clusters}")
+        # the grid is a launch argument: the object's name is the same for every count
+        assert kernel_name(cfg, "n", 1) == kernel_name(
+            dataclasses.replace(cfg, grid_clusters=7), "n", 1
+        )
         out = mm_bf16_batch_invariant(
             a, b, config=cfg
         )  # compiled before the profiled launch
@@ -894,6 +925,229 @@ def test_persistent_grid_is_the_device_co_resident_cluster_count():
             "torch.profiler records no CUDA kernel on this device with the installed toolkit (CUPTI unavailable): the "
             "launched grid was not read back; the occupancy query, the cache key and the bits were checked"
         )
+
+
+def _recorded_builds(monkeypatch) -> list:
+    """Every kernel name ``jit.build_and_load`` is asked for (the compile or load of one object), with the in-process
+    caches that would short-circuit it cleared."""
+    import flashinfer.batch_invariant.jit as J
+    from flashinfer.gemm.batch_invariant import api as bi_api, fixup
+    from flashinfer.gemm.batch_invariant.blocks import compile as bc
+
+    names = []
+    orig = J.build_and_load
+
+    def recording(module, kernel, compile_fn):
+        names.append(kernel)
+        return orig(module, kernel, compile_fn)
+
+    monkeypatch.setattr(J, "build_and_load", recording)
+    bc._compiled_gemm.cache_clear()
+    fixup.get_fixup.cache_clear()
+    bi_api.clear_kernel_cache()
+    return names
+
+
+@needs_device
+def test_launch_placements_share_one_compiled_object(monkeypatch):
+    """Records that differ only in the raster order, the swizzle size, the persistent grid or (the split class) the chunk
+    count launch ONE compiled object -- one ``jit.build_and_load`` name, one launch-handle entry, the same callable --
+    with bit-identical outputs; the in-CTA fold is its own object (a static flag), the fixup its own per chunk count."""
+    import dataclasses
+
+    from flashinfer.gemm.batch_invariant import api as bi_api
+    from flashinfer.gemm.batch_invariant.blocks.compile import object_record
+
+    names = _recorded_builds(monkeypatch)
+    a, b = rnd_bf16(300, 2048, 171), rnd_bf16(2048, 4096, 172)
+    base = Knobs((128, 128), (2, 1), True, True, "m", 1)
+    ref = bits(mm_bf16_batch_invariant(a, b, config=base))
+    variants = [
+        dataclasses.replace(base, raster_along=r, swizzle_size=s, grid_clusters=g)
+        for r in ("m", "n")
+        for s in (1, 2, 4, 8)
+        for g in (0, 9)
+    ]
+    for cfg in variants:
+        assert torch.equal(bits(mm_bf16_batch_invariant(a, b, config=cfg)), ref), (
+            cfg.describe()
+        )
+    gemm_names = [n for n in names if n.startswith("bf16_")]
+    assert (
+        len(gemm_names) == 1
+        and "_sw" not in gemm_names[0]
+        and "_g" not in gemm_names[0]
+    ), names
+    # one launch handle per record (its own trailing arguments), all holding the same compiled kernel
+    handles = {
+        k: v
+        for k, v in bi_api._KERNELS.items()
+        if object_record(k[1]) == object_record(base)
+    }
+    assert len(handles) == len(variants), handles.keys()
+    assert len({id(v[0]) for v in handles.values()}) == 1, handles.keys()
+    clusters = bi_api.persistent_clusters(a.device, base)
+    assert {v[1] for v in handles.values()} == {
+        (g or clusters, s, 1 if r == "m" else 0)
+        for r in ("m", "n")
+        for s in (1, 2, 4, 8)
+        for g in (0, 9)
+    }
+    # the split class: C = 2 and C = 8 (two weight shapes) share the partial kernel; the fixup is per chunk count
+    del names[:]
+    cfg = Knobs((64, 32), (1, 4), False, True, "m", 1)
+    for N, K, C in [(512, 16384, 2), (256, 32768, 8)]:
+        a, b = rnd_bf16(64, K, 173 + C), rnd_bf16(K, N, 174 + C)
+        assert chunks_for(N, K) == C
+        outs = [
+            bits(mm_bf16_batch_invariant(a, b, config=k, chunks=C))
+            for k in (
+                cfg,
+                dataclasses.replace(cfg, raster_along="n", swizzle_size=4),
+                dataclasses.replace(cfg, cta_chunks=True),
+            )
+        ]
+        assert torch.equal(outs[0], outs[1]) and torch.equal(outs[0], outs[2]), (N, K)
+    gemm_names = sorted(n for n in names if n.startswith("bf16_"))
+    assert len(gemm_names) == 2 and all("_CL_" in n for n in gemm_names), names
+    assert sum("_cc" in n for n in gemm_names) == 1, names
+    fixups = sorted(n for n in names if n.startswith("splitk_fixup"))
+    assert fixups == ["splitk_fixup_C2_bf16", "splitk_fixup_C8_bf16"], names
+    # one partial kernel for both chunk counts and the raster / swizzle variant (the in-CTA fold is its own object)
+    kernels = {
+        id(v[0])
+        for k, v in bi_api._KERNELS.items()
+        if object_record(k[1]) == object_record(cfg) and not k[1].cta_chunks
+    }
+    assert len(kernels) == 1, kernels
+
+
+@needs_device
+def test_bucket_tactic_sweep_compiles_one_object_per_placement_class(monkeypatch):
+    """The autotuner's candidate list for one shape compiles one object per (tile, cluster, 2-CTA, in-CTA fold) class:
+    its raster twins and swizzle variants are launch arguments of the same object."""
+    names = _recorded_builds(monkeypatch)
+    M, N, K = 512, 4096, 4096
+    C = chunks_for(N, K)
+    sm, fam = PARTS[0][1], PARTS[0][0]
+    dev = torch.device("cuda", torch.cuda.current_device())
+    from flashinfer.gemm.batch_invariant.api import part_of
+    from flashinfer.gemm.batch_invariant.blocks.compile import object_record
+
+    sm, fam = part_of(dev)
+    tactics = rank_topk(M, N, K, C, "n", sm, 10, fam)
+    a, b = rnd_bf16(M, K, 175), rnd_bf16(K, N, 176)
+    ref = bits(mm_bf16_batch_invariant(a, b, config=tactics[0], chunks=C))
+    for cfg in tactics[1:]:
+        assert torch.equal(
+            bits(mm_bf16_batch_invariant(a, b, config=cfg, chunks=C)), ref
+        ), cfg.describe()
+    gemm_names = [n for n in names if n.startswith("bf16_")]
+    classes = {object_record(t) for t in tactics}
+    assert len(gemm_names) == len(set(gemm_names)) == len(classes), (
+        gemm_names,
+        classes,
+    )
+    assert len(classes) < len(tactics), "the candidate list holds raster twins"
+
+
+@needs_device
+@pytest.mark.parametrize("static_l1", [True, False])
+def test_kernel_side_decode_matches_the_host_mirror(static_l1):
+    """The compiled scheduler's decode of every linear index (FastDivmod divisors, the ``s = 1`` branch, the remainder
+    band, the batch slice) is the host mirror ``tile_order``, and indices beyond the tile count are invalid: a probe
+    kernel with the tile counts, the swizzle and the raster flag as runtime arguments, one object for every case."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.gemm.batch_invariant.blocks.scheduler import (
+        SchedParams,
+        TileScheduler,
+        tile_order,
+    )
+
+    EXTRA = 5  # blocks beyond the tile count: invalid work
+
+    class Probe:
+        def __init__(self, static_l1: bool):
+            self.static_l1 = static_l1
+
+        @cute.jit
+        def __call__(
+            self,
+            out: cute.Tensor,
+            mt: cutlass.Int32,
+            nt: cutlass.Int32,
+            l: cutlass.Int32,
+            swizzle: cutlass.Int32,
+            raster_m: cutlass.Int32,
+            stream: cuda.CUstream,
+        ):
+            if cutlass.const_expr(self.static_l1):
+                params = SchedParams((mt, nt, 1), (1, 1), swizzle, raster_m)
+            else:
+                params = SchedParams((mt, nt, l), (1, 1), swizzle, raster_m)
+            self.kernel(out, params).launch(
+                grid=(1, 1, params.total + EXTRA), block=[32, 1, 1], stream=stream
+            )
+
+        @cute.kernel
+        def kernel(self, out: cute.Tensor, params: SchedParams):
+            tidx, _, _ = cute.arch.thread_idx()
+            _, _, z = cute.arch.block_idx()
+            if tidx == 0:
+                sched = TileScheduler.create(
+                    params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+                work = sched.get_current_work()
+                out[z, 0] = work.tile_idx[0]
+                out[z, 1] = work.tile_idx[1]
+                out[z, 2] = work.tile_idx[2]
+                if work.is_valid_tile:
+                    out[z, 3] = cutlass.Int32(1)
+
+    out = torch.zeros(4096, 4, dtype=torch.int32, device="cuda")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    probe = cute.compile(
+        Probe(static_l1),
+        from_dlpack(out, assumed_align=16).mark_layout_dynamic(),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        cutlass.Int32(1),
+        stream,
+    )
+    cases = [
+        (mt, nt, L, s, rm)
+        for mt in (1, 3, 7, 16)
+        for nt in (1, 5, 8, 13)
+        for L in ((1,) if static_l1 else (2, 3))
+        for s in (1, 2, 4, 8)
+        for rm in (1, 0)
+    ]
+    for mt, nt, L, s, rm in cases:
+        total = mt * nt * L
+        out.zero_()
+        probe(
+            from_dlpack(out, assumed_align=16).mark_layout_dynamic(),
+            cutlass.Int32(mt),
+            cutlass.Int32(nt),
+            cutlass.Int32(L),
+            cutlass.Int32(s),
+            cutlass.Int32(rm),
+            stream,
+        )
+        torch.cuda.synchronize()
+        got = out[: total + EXTRA].tolist()
+        assert all(row[3] == 1 for row in got[:total]) and all(
+            row[3] == 0 for row in got[total:]
+        ), (mt, nt, L, s, rm)
+        assert [tuple(row[:3]) for row in got[:total]] == tile_order(
+            mt, nt, L, s, bool(rm)
+        ), (mt, nt, L, s, rm)
 
 
 @needs_device

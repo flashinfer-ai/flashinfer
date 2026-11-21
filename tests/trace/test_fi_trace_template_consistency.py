@@ -1644,8 +1644,8 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     assert "mask:dense" in mla_definitions[1]["tags"]
 
 
-def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
-    """Bounded traces describe local prefixes, including empty rank-local KV."""
+def test_prims_ts_mla_cp_trace_contract() -> None:
+    """CP traces retain causal semantics and distinguish static/runtime metadata."""
     from flashinfer.attention.prims_ts.mla_decode import (
         BatchMLADecodePagedTSWrapper,
         batch_mla_decode_with_paged_kv_cache,
@@ -1668,10 +1668,6 @@ def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
         default_template is registered
         for registered in prims_ts_decode_mla_one_shot_trace_dispatch.templates
     )
-    bounds = torch.tensor(
-        [0] * 8 + [0, 1, 63, 64, 65, 65, 65, 65],
-        dtype=torch.int32,
-    )
     wrapper = BatchMLADecodePagedTSWrapper()
     wrapper._plan_state = SimpleNamespace(
         packed_query=False,
@@ -1680,54 +1676,56 @@ def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
         max_kv_len=128,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
-        use_kv_bounds=False,
+        cp_world=1,
+        cp_interleave_size=1,
     )
     ordinary = fi_trace(wrapper.run, **kwargs)
-    wrapper._plan_state.use_kv_bounds = True
-    for missing_bounds in ({}, {"kv_bounds": None}):
-        with pytest.raises(ValueError, match="kv_bounds"):
-            fi_trace(wrapper.run, **kwargs, **missing_bounds)
-    bounded = fi_trace(wrapper.run, **kwargs, kv_bounds=bounds)
+    wrapper._plan_state.cp_world = 8
+    wrapper._plan_state.cp_interleave_size = 128
+    bounded = fi_trace(wrapper.run, **kwargs, cp_rank=7)
     assert ordinary["name"] != bounded["name"]
-    assert bounded["axes"]["causal"]["value"] == 0
+    assert bounded["axes"]["causal"]["value"] == 1
     assert ordinary["axes"]["causal"]["value"] == 1
     assert "min(seq_lens_kv) >= 0" in bounded["constraints"]
     assert "min(seq_lens_kv) >= 1" not in bounded["constraints"]
     assert "min(seq_lens_kv) >= 1" in ordinary["constraints"]
-    assert "mask:kv_prefix" in bounded["tags"]
-    assert "mask:causal" not in bounded["tags"]
+    assert "context_parallel" in bounded["tags"]
+    assert "mask:causal" in bounded["tags"]
     assert "kv_bounds" not in ordinary["inputs"]
 
     one_shot_kwargs = dict(kwargs)
     ordinary_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(**one_shot_kwargs)
     bounded_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
-        **one_shot_kwargs, kv_bounds=bounds
+        **one_shot_kwargs, cp_world=8, cp_interleave_size=128, cp_rank=7
     )
     assert ordinary_one_shot["name"] != bounded_one_shot["name"]
     assert "kv_bounds" not in ordinary_one_shot["inputs"]
     for definition in (bounded, bounded_one_shot):
-        assert "_kv_bounds" in definition["name"]
-        assert definition["axes"]["use_kv_bounds"]["value"] == 1
+        assert "_cp8_i128" in definition["name"]
+        assert definition["axes"]["cp_world"]["value"] == 8
+        assert definition["axes"]["cp_interleave_size"]["value"] == 128
         assert definition["axes"]["zero_empty_rows"]["value"] == 1
-        assert definition["inputs"]["kv_bounds"]["shape"] == ["num_kv_bounds"]
-        assert definition["inputs"]["kv_bounds"]["dtype"] == "int32"
-        assert not definition["inputs"]["kv_bounds"].get("optional", False)
-        assert "num_kv_bounds == batch_size * seq_len_q" in definition["constraints"]
+        assert "cp_rank" not in definition["axes"]
+        assert definition["inputs"]["cp_rank"]["dtype"] == "int32"
+        assert "max(seq_lens_kv) <= max_kv_len" not in definition["constraints"]
+        assert "Global logical" in definition["inputs"]["seq_lens_kv"]["description"]
         assert "unknown" not in str(definition["inputs"])
     for template in (
-        prims_ts_decode_mla_wrapper_trace_dispatch(
-            self=wrapper, **kwargs, kv_bounds=bounds
-        ),
+        prims_ts_decode_mla_wrapper_trace_dispatch(self=wrapper, **kwargs, cp_rank=7),
         prims_ts_decode_mla_one_shot_trace_dispatch(
-            **one_shot_kwargs, kv_bounds=bounds
+            **one_shot_kwargs, cp_world=8, cp_interleave_size=128, cp_rank=7
         ),
     ):
         assert_template_constraints_valid(template, label=template.name_prefix)
 
     wrapper._plan_state.zero_empty_rows = False
-    opt_out = fi_trace(wrapper.run, **kwargs, kv_bounds=bounds)
+    opt_out = fi_trace(wrapper.run, **kwargs, cp_rank=7)
     opt_out_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
-        **one_shot_kwargs, kv_bounds=bounds, zero_empty_rows=False
+        **one_shot_kwargs,
+        cp_world=8,
+        cp_interleave_size=128,
+        cp_rank=7,
+        zero_empty_rows=False,
     )
     for definition in (opt_out, opt_out_one_shot):
         assert "_no_zero_empty_rows" in definition["name"]
@@ -1736,7 +1734,7 @@ def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
     assert opt_out["name"] != bounded["name"]
     assert opt_out_one_shot["name"] != bounded_one_shot["name"]
     assert "zero_empty_rows" in opt_out_one_shot["inputs"]
-    # Ignored flags must not break canonical template identity without bounds.
+    # Ignored flags must not break canonical template identity without CP.
     assert (
         prims_ts_decode_mla_one_shot_trace_dispatch(
             **kwargs,

@@ -27,6 +27,8 @@ def kernel_name(
     ragged: bool = False,
     cap: int = 0,
     pdl: bool = False,
+    *,
+    causal: bool = True,
     fmt: str = "bf16",
 ) -> str:
     return jit.sanitize_symbol_name(
@@ -34,6 +36,7 @@ def kernel_name(
         + ("_rg" if ragged else "")
         + (f"_c{cap >> 10}" if cap else "")
         + ("_pdl" if pdl else "")
+        + ("" if causal else "_nc")
         + ("" if fmt == "bf16" else f"_{fmt}")
     )
 
@@ -47,16 +50,19 @@ def get_compiled_swaps(
     ragged: bool = False,
     cap: int = 0,
     pdl: bool = False,
+    *,
+    causal: bool = True,
     fmt: str = "bf16",
 ):
     """``fmt``: the class's operand format (bf16, or f16 for the fp16 class). ``cap``: the shared-memory capacity the ring is sized for (the execution device's; the current device's when 0): part of
     the kernel's identity in this process's cache and on disk; ``pdl``: launched as a programmatic dependent (its load warp waits
-    for the preceding grid before the first TMA)."""
+    for the preceding grid before the first TMA). ``causal``: the mask mode, a compile-time constant (``_nc`` names the non-causal
+    object; the causal body is unchanged)."""
     from ..blocks.operands import in_dtype_of
     from .operands import arch_smem_cap
 
     cap = cap or arch_smem_cap()
-    name = kernel_name(D, g, page, n_pad, ragged, cap, pdl, fmt)
+    name = kernel_name(D, g, page, n_pad, ragged, cap, pdl, causal=causal, fmt=fmt)
 
     def compile_fn():
         op16, f32, i32 = in_dtype_of(fmt), cutlass.Float32, cutlass.Int32
@@ -64,7 +70,7 @@ def get_compiled_swaps(
         s_ws = (
             cute.sym_int64()
         )  # fp32 elements of the workspace: beyond 2^31 on large batches
-        s_nb1, s_nidx = cute.sym_int(32), cute.sym_int(32)
+        s_nidx = cute.sym_int(32)
         q_fake = cute.runtime.make_fake_tensor(
             op16,
             (D, s_hq, s_tq),
@@ -110,14 +116,11 @@ def get_compiled_swaps(
         desc_fake = cute.runtime.make_fake_tensor(
             i32, (s_nunits, 16), (16, 1), assumed_align=16
         )
-        indptr_fake = cute.runtime.make_fake_tensor(
-            i32, (s_nb1,), (1,), assumed_align=4
-        )
         indices_fake = cute.runtime.make_fake_tensor(
             i32, (s_nidx,), (1,), assumed_align=4
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        k = SwapsKernel(D, g, page, n_pad, ragged, cap, pdl, fmt)
+        k = SwapsKernel(D, g, page, n_pad, ragged, cap, pdl, causal=causal, fmt=fmt)
         return cute.compile(
             k,
             q_fake,
@@ -128,7 +131,6 @@ def get_compiled_swaps(
             groups_fake,
             counters_fake,
             desc_fake,
-            indptr_fake,
             indices_fake,
             cutlass.Float32(1.0),
             cutlass.Float32(-1.0),
