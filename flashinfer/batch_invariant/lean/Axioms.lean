@@ -20,7 +20,7 @@ open Lean
 def standardAxioms : List Name := [``propext, ``Classical.choice, ``Quot.sound]
 def decidedAxiom : Name := ``Lean.ofReduceBool
 /-- The named `native_decide` theorems: the exhaustive checks over the generators' configuration spaces and the GEMM
-dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates in reasonable time), the attention spec cases
+dispatcher's picks (hundreds of records, beyond what kernel `decide` evaluates in reasonable time), the attention spec, LSE and sink cases
 (terms of tens of kilobytes) and the attention class-separation theorems. -/
 def decidedTheorems : List Name :=
   [``BIK.gemm_space_ok, ``BIK.gemm_space_c4_ok, ``BIK.gemm_space_c4_cta_twins, ``BIK.gemm_dispatch_in_space,
@@ -42,7 +42,7 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mxw48_space_decode_ok, ``BIK.gemm_mxw48_space_c2_ok,
    ``BIK.gemm_mxw48k64_space_ok, ``BIK.gemm_mxw48k64_space_c4_ok, ``BIK.gemm_mxw48k64_space_c4_cta_twins, ``BIK.gemm_mxw48k64_dispatch_in_space,
    ``BIK.gemm_mxw48k64_space_decode_ok, ``BIK.gemm_mxw48k64_space_c2_ok,
-   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_a10_spec, ``BIK.attn_a11_spec, ``BIK.attn_a12_spec, ``BIK.attn_a13_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64, ``BIK.Attn.output_depends_on_mode]
+   ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_a10_spec, ``BIK.attn_a11_spec, ``BIK.attn_a12_spec, ``BIK.attn_a13_spec, ``BIK.attn_a2_lse2, ``BIK.attn_a2_lseE, ``BIK.attn_a3_lse2, ``BIK.attn_a3_lseE, ``BIK.attn_a5_lse2, ``BIK.attn_a5_lseE, ``BIK.attn_a7_lse2, ``BIK.attn_a7_lseE, ``BIK.attn_a8_lse2, ``BIK.attn_a8_lseE, ``BIK.attn_a10_lse2, ``BIK.attn_a10_lseE, ``BIK.attn_a11_lse2, ``BIK.attn_a11_lseE, ``BIK.attn_a12_lse2, ``BIK.attn_a12_lseE, ``BIK.attn_a2_sink, ``BIK.attn_a2_sink_lse2, ``BIK.attn_a2_sink_lseE, ``BIK.attn_a3_sink, ``BIK.attn_a3_sink_lse2, ``BIK.attn_a3_sink_lseE, ``BIK.attn_a5_sink, ``BIK.attn_a5_sink_lse2, ``BIK.attn_a5_sink_lseE, ``BIK.attn_a7_sink, ``BIK.attn_a7_sink_lse2, ``BIK.attn_a7_sink_lseE, ``BIK.attn_a8_sink, ``BIK.attn_a8_sink_lse2, ``BIK.attn_a8_sink_lseE, ``BIK.attn_a10_sink, ``BIK.attn_a10_sink_lse2, ``BIK.attn_a10_sink_lseE, ``BIK.attn_a11_sink, ``BIK.attn_a11_sink_lse2, ``BIK.attn_a11_sink_lseE, ``BIK.attn_a12_sink, ``BIK.attn_a12_sink_lse2, ``BIK.attn_a12_sink_lseE, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64, ``BIK.Attn.output_depends_on_mode, ``BIK.Attn.output_depends_on_sink, ``BIK.Attn.output_depends_on_sink_noncausal, ``BIK.Attn.lse_depends_on_mode, ``BIK.Attn.sink_depends_on_mode]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with
   | some idx => env.header.moduleNames[idx.toNat]?
