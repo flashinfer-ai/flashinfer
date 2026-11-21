@@ -120,7 +120,7 @@ def _allocate_reference_workspace(
     *,
     apply_routing_weights_before_fc2: bool = True,
 ):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         get_symm_buffer_for_mega_moe,
     )
 
@@ -148,7 +148,9 @@ def _reference_forward(t, workspace, transformed_weights, problem: dict):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
         staging,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import nvfp4_mega_moe
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        nvfp4_mega_moe,
+    )
 
     # Allocate the owned output before staging.  Nothing that can allocate or
     # synchronize is inserted between the staged collective round and compute.
@@ -194,8 +196,15 @@ def _public_pointer_snapshot(workspace) -> tuple[int, ...]:
 def _custom_finalize_pointer_snapshot(
     workspace,
 ) -> tuple[int, int, tuple[int, ...]]:
-    partials, root, descriptor = workspace._frontend.custom_finalize_workspace()
-    return partials.data_ptr(), root.data_ptr(), tuple(descriptor["shape"])
+    if hasattr(workspace, "_frontend"):
+        partials, root, descriptor = workspace._frontend.custom_finalize_workspace()
+        return partials.data_ptr(), root.data_ptr(), tuple(descriptor["shape"])
+    partials = workspace.custom_finalize_workspace()
+    return (
+        partials.data_ptr(),
+        partials.untyped_storage().data_ptr(),
+        tuple(partials.shape),
+    )
 
 
 def _assert_close(actual, expected) -> None:
@@ -479,7 +488,14 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
         layer.destroy()
 
 
-def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
+@pytest.mark.parametrize(
+    "kernel_name",
+    [
+        "sm100_nvfp4_nvfp4_bf16_cutedsl",
+        "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
+    ],
+)
+def test_native_reducer_reusable_workspaces_four_rank_end_to_end(kernel_name):
     """Exercise the complete native-workspace contract in one EP session."""
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -495,6 +511,7 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
+        FinalizeMode,
         MegaConfig,
         MoEEpLayer,
         MoEEpMegaLayer,
@@ -514,7 +531,11 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         pytest.skip("native terminal reducer requires exact SM100a or SM103a")
 
     problem = _problem(rank, world_size)
-    megakernel = _megakernel_config(problem, epilogue_via_config=True)
+    megakernel = _megakernel_config(
+        problem,
+        epilogue_via_config=True,
+        kernel_name=kernel_name,
+    )
     runtime_kernel = create_mega_kernel(megakernel)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, runtime_kernel.runtime_requirements(bootstrap)
@@ -557,10 +578,10 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         assert small_raw is not large_raw
         assert small.max_tokens_per_rank == 256
         assert large.max_tokens_per_rank == 4096
-        assert layer._kernel._uses_native_topk_reduce(small._fleet_params)
-        assert layer._kernel._uses_native_topk_reduce(large._fleet_params)
-        assert small_raw._frontend.config.use_custom_finalize
-        assert large_raw._frontend.config.use_custom_finalize
+        assert layer._kernel._finalize_mode(small._fleet_params) is FinalizeMode.CAKE
+        assert layer._kernel._finalize_mode(large._fleet_params) is FinalizeMode.CAKE
+        assert getattr(small_raw, "_frontend", small_raw).config.use_custom_finalize
+        assert getattr(large_raw, "_frontend", large_raw).config.use_custom_finalize
         assert pooled_workspace_refcount(small_raw) == 1
         assert pooled_workspace_refcount(large_raw) == 1
         assert layer._preprocessing_count == 1
@@ -639,9 +660,10 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         torch.cuda.synchronize()
         dist.barrier()
         _assert_close(after_zero, references[(8, 256)])
-        assert side_stream.cuda_stream in {
-            key[3] for key in layer._kernel._thunk_states
-        }
+        if hasattr(layer._kernel, "_thunk_states"):
+            assert side_stream.cuda_stream in {
+                key[3] for key in layer._kernel._thunk_states
+            }
 
         # Capture one graph per explicit capacity profile.  Prewarm the exact
         # capture streams so no stream-bound launch thunk is created inside

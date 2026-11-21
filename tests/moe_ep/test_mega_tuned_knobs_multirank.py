@@ -34,7 +34,7 @@ def test_tuned_knobs_create_fixed_layer(monkeypatch, tmp_path):
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         ensure_moe_ep_cuda_device,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import autotune
 
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
@@ -48,6 +48,7 @@ def test_tuned_knobs_create_fixed_layer(monkeypatch, tmp_path):
         token_hidden_size=problem["hidden"],
     )
     config = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
         intermediate_size=problem["intermediate"],
         top_k=problem["topk"],
         gate_up_clamp=problem["gate_up_clamp"],
@@ -82,7 +83,7 @@ def test_tuned_knobs_create_fixed_layer(monkeypatch, tmp_path):
             MegaConfig(
                 megakernel=dataclasses.replace(config, knobs=knobs),
                 preprocess_weights=False,
-                transformed_weights=auto._get_transformed_weights(),
+                transformed_weights=auto.get_transformed_weights(),
             ),
         )
         fixed.warmup(tensors)

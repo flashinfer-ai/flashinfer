@@ -71,7 +71,8 @@ def bsa_attn_sm100_blk64_fwd(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Forward pass for BSA block-sparse attention using the blk64 CuTe-DSL kernel.
 
-    Supports SM100 and SM103. MHA only (num_kv_heads must equal num_heads);
+    Supports SM100 and SM103. The CuTe-DSL backend is MHA only
+    (num_kv_heads must equal num_heads);
     head_dim must be 128.
 
     Args:

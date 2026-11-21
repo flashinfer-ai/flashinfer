@@ -1,4 +1,4 @@
-"""CPU tests for scripts/build_windows_arm64_wheels.py.
+"""CPU tests for scripts/infra/build_windows_arm64_wheels.py.
 
 Every subprocess call goes through a fake runner, so these run on Linux, macOS
 and Windows without a GPU, CUDA toolkit or MSVC. Builds are simulated by
@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-SCRIPTS_DIR = REPO_ROOT / "scripts"
+SCRIPTS_DIR = REPO_ROOT / "scripts" / "infra"
 
 requires_posix_bash = pytest.mark.skipif(
     sys.platform == "win32", reason="sources Linux CI bash scripts"

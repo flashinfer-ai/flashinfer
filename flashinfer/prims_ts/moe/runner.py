@@ -51,6 +51,8 @@ from flashinfer.utils import get_compute_capability, round_up
 
 from .compile_cache import get_compiled_gemm, stable_config_hash
 from .config_mapper import (
+    apply_fused_finalize,
+    apply_weight_l2_policy,
     map_trtllm_bf16_moe_tactic,
     map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_fp8_per_tensor_moe_tactic,
@@ -296,6 +298,16 @@ def _select_expert_weights(
     if routed_expert_weights is None:
         raise RuntimeError("routing did not return expert weights")
     return routed_expert_weights
+
+
+def _gemm_config_hash(io: dict) -> str:
+    """Compile-cache key of a GEMM launch: its config and, for an FC2 with a
+    fused finalize, the element type of the expert weights, which the config
+    leaves to the call and the compiled GEMM is specialized on."""
+    expert_weights = io.get("expert_weights_dp")
+    if expert_weights is None:
+        return stable_config_hash(io["cfg"])
+    return stable_config_hash(io["cfg"], expert_weights_dtype=expert_weights.dtype)
 
 
 def _torch_views_of_ffi_tensors(tensors: Any) -> list[Any]:
@@ -591,7 +603,7 @@ class _PrimsTsMoERunnerMixin:
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         return (
-            ("prims_ts_moe_config_version", 8),
+            ("prims_ts_moe_config_version", 11),
             ("top_k", int(self.top_k)),
             ("num_local_experts", int(self.num_local_experts)),
             ("num_experts", int(self.num_experts)),
@@ -1145,6 +1157,9 @@ class _PrimsTsMoERunnerMixin:
                 do_finalize=kwargs["do_finalize"],
                 enable_pdl=kwargs["enable_pdl"],
                 use_routing_scales_on_input=use_routing_scales_on_input,
+                zero_rows_without_local_expert=kwargs.get(
+                    "zero_rows_without_local_expert", True
+                ),
             )
 
     @staticmethod
@@ -1165,6 +1180,7 @@ class _PrimsTsMoERunnerMixin:
         do_finalize: bool,
         enable_pdl: bool,
         use_routing_scales_on_input: bool = False,
+        zero_rows_without_local_expert: bool = True,
     ):
         if do_finalize:
             # The join above fully orders both partition outputs eagerly.
@@ -1184,6 +1200,7 @@ class _PrimsTsMoERunnerMixin:
                 enable_pdl,
                 use_routing_scales_on_input,
                 second_gemm2_output,
+                zero_rows_without_local_expert,
             )
             return []
         if second_gemm2_output is not None:
@@ -1306,6 +1323,7 @@ class _PrimsTsMoERunnerMixin:
                     f"{self.__class__.__name__} tactic {tactic}: {exc}"
                 )
 
+        tactics = _node_rank_rotated(tactics)
         # Compilation is mostly host-side; fan out tactics when there are several.
         max_workers = min(4, max(1, len(tactics)))
         if max_workers == 1 or len(tactics) <= 1:
@@ -1317,6 +1335,22 @@ class _PrimsTsMoERunnerMixin:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 list(pool.map(_precompile_one, tactics))
         return True
+
+
+def _node_rank_rotated(items: List[Any]) -> List[Any]:
+    """``items`` rotated by this process's share of the node's local ranks.
+
+    Compiled GEMMs persist on disk and every process loads what another one
+    has already compiled. Ranks that tune the same tactics then start their
+    precompile at different places and compile disjoint GEMMs side by side
+    instead of the same ones in step.
+    """
+    rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    if world <= 1 or not 0 <= rank < world:
+        return list(items)
+    start = len(items) * rank // world
+    return list(items[start:]) + list(items[:start])
 
 
 class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
@@ -1356,7 +1390,9 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
-        return map_trtllm_bf16_moe_tactic(tactic, **common, **bias_and_oa)
+        return apply_weight_l2_policy(
+            map_trtllm_bf16_moe_tactic(tactic, **common, **bias_and_oa)
+        )
 
     def _make_tuning_config(
         self,
@@ -1579,6 +1615,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 kwargs["enable_pdl"],
                 False,
                 None,
+                kwargs.get("zero_rows_without_local_expert", True),
             )
             return []
         return [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
@@ -1626,16 +1663,18 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, extras = self._tactic_common(moe_inputs, kwargs)
         uses_per_token_scaling = moe_inputs.per_token_scale is not None
-        return map_trtllm_nvfp4_moe_tactic(
-            tactic,
-            **common,
-            **bias_and_oa,
-            use_per_token_sf_b=uses_per_token_scaling,
-            per_token_sf_dtype=(
-                _per_token_sf_dtype_value(moe_inputs.per_token_scale)
-                if uses_per_token_scaling
-                else int(extras.get("per_token_sf_dtype", 1))
-            ),
+        return apply_weight_l2_policy(
+            map_trtllm_nvfp4_moe_tactic(
+                tactic,
+                **common,
+                **bias_and_oa,
+                use_per_token_sf_b=uses_per_token_scaling,
+                per_token_sf_dtype=(
+                    _per_token_sf_dtype_value(moe_inputs.per_token_scale)
+                    if uses_per_token_scaling
+                    else int(extras.get("per_token_sf_dtype", 1))
+                ),
+            )
         )
 
     def _make_tuning_config(
@@ -1921,6 +1960,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 kwargs["enable_pdl"],
                 False,
                 None,
+                kwargs.get("zero_rows_without_local_expert", True),
             )
             return []
         return [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
@@ -1970,7 +2010,34 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
-        return map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
+        pair = apply_weight_l2_policy(
+            map_trtllm_mxfp4_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
+        )
+        return self._maybe_fuse_finalize(
+            pair, moe_inputs.hidden_states.shape[0], kwargs or {}
+        )
+
+    def _maybe_fuse_finalize(self, pair, num_tokens: int, kwargs: dict):
+        """Move the finalize of single-expert tokens into the FC2 epilogue.
+
+        Only when tokens average at most one local expert
+        (``top_k * num_local_experts <= num_experts``, as under expert
+        parallelism): with more, most tokens still need the finalize's
+        reduction, and storing every row from the epilogue only adds work.
+        Partitioned launches keep their own finalize.
+        """
+        if (
+            self._is_partitioned
+            or not kwargs.get("do_finalize", True)
+            or self.top_k * self.num_local_experts > self.num_experts
+        ):
+            return pair
+        return apply_fused_finalize(
+            pair,
+            num_tokens=num_tokens,
+            top_k=self.top_k,
+            num_local_experts=self.num_local_experts,
+        )
 
     def _make_tuning_config(
         self,
@@ -2093,10 +2160,32 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
+        def map_tactic(tactic):
+            requested_tactic = [-1, -1] if tactic == -1 else tactic
+            return self._map_tactic(requested_tactic, moe_inputs, kwargs)
+
+        # The tactics are FC1 x FC2 config pairs: compile each distinct GEMM
+        # once, through the first tactic that uses it.
+        jobs = []
+        seen = set()
         for tactic in tactics:
             try:
-                requested_tactic = [-1, -1] if tactic == -1 else tactic
-                pair = self._map_tactic(requested_tactic, moe_inputs, kwargs)
+                pair = map_tactic(tactic)
+            except Exception as exc:
+                logger.debug(
+                    "[Prims-TS MoE] Skipping MXFP4xMXFP8 precompile for tactic "
+                    f"{tactic}: {exc}"
+                )
+                continue
+            for fc, gemm in (("fc1", pair.fc1), ("fc2", pair.fc2)):
+                key = (fc, tuple(sorted(gemm.cfg.kwargs.items())))
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append((tactic, fc))
+
+        for tactic, fc in _node_rank_rotated(jobs):
+            try:
+                pair = map_tactic(tactic)
                 resolved_tactic = _concrete_tactic(pair)
                 ok, reason = is_prims_ts_mxfp4_mxfp8_supported(
                     self,
@@ -2191,25 +2280,22 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     hidden_size=self.hidden_size,
                 )
 
-                fc1_io = build_mxfp4_mxfp8_launch_io(
-                    fc="fc1", cfg=fc1_cfg, **common_io_kwargs
+                gemm_cfg = fc1_cfg if fc == "fc1" else fc2_cfg
+                if fc == "fc2" and fc2_cfg.fused_finalize_top_k:
+                    common_io_kwargs.update(
+                        finalize_output=moe_inputs.output,
+                        expanded_idx_to_permuted_idx=_expanded_idx_to_permuted_idx,
+                        expert_weights=_select_expert_weights(
+                            moe_inputs, _expert_weights, kwargs
+                        ),
+                    )
+                gemm_io = build_mxfp4_mxfp8_launch_io(
+                    fc=fc, cfg=gemm_cfg, **common_io_kwargs
                 )
-                fc1_hash = stable_config_hash(fc1_io["cfg"])
                 get_compiled_gemm(
-                    fc1_hash,
-                    "mxfp4_mxfp8_fc1",
-                    fc1_io,
-                    stream,
-                )
-
-                fc2_io = build_mxfp4_mxfp8_launch_io(
-                    fc="fc2", cfg=fc2_cfg, **common_io_kwargs
-                )
-                fc2_hash = stable_config_hash(fc2_io["cfg"])
-                get_compiled_gemm(
-                    fc2_hash,
-                    "mxfp4_mxfp8_fc2",
-                    fc2_io,
+                    _gemm_config_hash(gemm_io),
+                    f"mxfp4_mxfp8_{fc}",
+                    gemm_io,
                     stream,
                 )
                 torch_stream.synchronize()
@@ -2364,11 +2450,33 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc1_fn = get_compiled_gemm(fc1_hash, "mxfp4_mxfp8_fc1", fc1_io, stream)
         fc1_fn(*self._launch_args(fc1_io, stream))
 
+        fused_finalize = bool(fc2_cfg.fused_finalize_top_k)
+        if fused_finalize:
+            common_io_kwargs.update(
+                finalize_output=output,
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                expert_weights=expert_weights,
+            )
         fc2_io = build_mxfp4_mxfp8_launch_io(fc="fc2", cfg=fc2_cfg, **common_io_kwargs)
-        fc2_hash = stable_config_hash(fc2_io["cfg"])
+        fc2_hash = _gemm_config_hash(fc2_io)
         fc2_fn = get_compiled_gemm(fc2_hash, "mxfp4_mxfp8_fc2", fc2_io, stream)
         fc2_fn(*self._launch_args(fc2_io, stream))
 
+        if fused_finalize:
+            self.moe_op.trtllm_moe_run_finalize_multi_expert_tokens(
+                gemm2_output,
+                output,
+                expert_weights,
+                expanded_idx_to_permuted_idx,
+                total_num_padded_tokens,
+                num_tokens,
+                kwargs["num_experts"],
+                self.top_k,
+                self.hidden_size,
+                kwargs["enable_pdl"],
+                kwargs.get("zero_rows_without_local_expert", True),
+            )
+            return []
         if kwargs["do_finalize"]:
             self.moe_op.trtllm_moe_run_finalize(
                 gemm2_output,
@@ -2383,6 +2491,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 kwargs["enable_pdl"],
                 False,
                 None,
+                kwargs.get("zero_rows_without_local_expert", True),
             )
             return []
         return [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
@@ -2429,7 +2538,9 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
-        return map_trtllm_mxfp4_bf16_moe_tactic(tactic, **common, **bias_and_oa)
+        return apply_weight_l2_policy(
+            map_trtllm_mxfp4_bf16_moe_tactic(tactic, **common, **bias_and_oa)
+        )
 
     def _make_tuning_config(
         self,
@@ -2655,6 +2766,7 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 kwargs["enable_pdl"],
                 False,
                 None,
+                kwargs.get("zero_rows_without_local_expert", True),
             )
             return []
         return [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
@@ -2731,14 +2843,16 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             use_routing_scales_on_input=use_routing_scales,
             routing_logits=moe_inputs.routing_logits,
         )
-        return map_trtllm_fp8_per_tensor_moe_tactic(
-            tactic,
-            **common,
-            **bias_and_oa,
-            fc1_use_per_token_sf_a=use_fc1_scale,
-            fc2_use_per_token_sf_a=use_fc2_scale,
-            use_per_token_sf_b=use_routing_scales,
-            per_token_sf_dtype=per_token_sf_dtype,
+        return apply_weight_l2_policy(
+            map_trtllm_fp8_per_tensor_moe_tactic(
+                tactic,
+                **common,
+                **bias_and_oa,
+                fc1_use_per_token_sf_a=use_fc1_scale,
+                fc2_use_per_token_sf_a=use_fc2_scale,
+                use_per_token_sf_b=use_routing_scales,
+                per_token_sf_dtype=per_token_sf_dtype,
+            )
         )
 
     def _make_tuning_config(
@@ -3021,6 +3135,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 kwargs["enable_pdl"],
                 kwargs.get("use_routing_scales_on_input", False),
                 None,
+                kwargs.get("zero_rows_without_local_expert", True),
             )
             return []
         return [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]
@@ -3076,20 +3191,24 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
     def _map_tactic(self, tactic, moe_inputs, kwargs=None):
         common, bias_and_oa, _ = self._tactic_common(moe_inputs, kwargs)
         if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
-            return map_trtllm_deepseek_fp8_moe_tactic(
-                tactic,
-                sm_arch=common["sm_arch"],
-                num_tokens=common["num_tokens"],
-                top_k=common["top_k"],
-                num_local_experts=common["num_local_experts"],
-                num_experts=common["num_experts"],
-                weight_layout=common["weight_layout"],
-                enable_pdl=common["enable_pdl"],
-                deepseek_fp8_block_size=deepseek_fp8_scale_block_size(
-                    self.hidden_size, moe_inputs.hidden_states_scale
-                ),
+            return apply_weight_l2_policy(
+                map_trtllm_deepseek_fp8_moe_tactic(
+                    tactic,
+                    sm_arch=common["sm_arch"],
+                    num_tokens=common["num_tokens"],
+                    top_k=common["top_k"],
+                    num_local_experts=common["num_local_experts"],
+                    num_experts=common["num_experts"],
+                    weight_layout=common["weight_layout"],
+                    enable_pdl=common["enable_pdl"],
+                    deepseek_fp8_block_size=deepseek_fp8_scale_block_size(
+                        self.hidden_size, moe_inputs.hidden_states_scale
+                    ),
+                )
             )
-        return map_trtllm_mxfp8_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
+        return apply_weight_l2_policy(
+            map_trtllm_mxfp8_mxfp8_moe_tactic(tactic, **common, **bias_and_oa)
+        )
 
     def _make_tuning_config(
         self,
@@ -3363,6 +3482,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 kwargs["enable_pdl"],
                 False,
                 None,
+                kwargs.get("zero_rows_without_local_expert", True),
             )
             return []
         return [gemm2_output, expert_weights, expanded_idx_to_permuted_idx]

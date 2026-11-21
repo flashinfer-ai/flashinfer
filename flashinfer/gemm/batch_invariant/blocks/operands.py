@@ -17,10 +17,6 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 
-# FlashInfer's copy of the DSL's persistent tile scheduler (the DSL's own module is deprecated and warns per use)
-from flashinfer.cute_dsl.attention.fmha.helpers import (
-    static_persistent_tile_scheduler as tile_scheduler,
-)
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..generator import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
@@ -98,7 +94,7 @@ class StaticPlan:
         c_layout,
         c_in_smem: bool = True,
         extra_smem_bytes: int = 2048,
-        chunks: int = 1,
+        cta_chunks: bool = False,
         in_fmt: str = "bf16",
         k_blocks: Optional[int] = None,
         acc_stages: Optional[int] = None,
@@ -107,17 +103,15 @@ class StaticPlan:
         """``k_blocks`` overrides the instruction K-steps per smem stage (default ``MMA_K_BLOCKS``: one 128-byte swizzle atom
         of K per row; the grouped MoE kernels take two atoms for bf16) -- the lowering's inner radix, a placement of the same
         fold (Lean's ``kblockLoopG_eq_kfoldG`` holds for every radix). ``c_in_smem=False`` reserves no C stages, so the whole leftover budget goes to the A/B ring, minus
-        ``extra_smem_bytes`` for a caller's own shared storage (unused by this body). ``chunks`` is the
-        class's chunk count: with ``knobs.cta_chunks`` the CTA folds all of them (``cta_chunks`` below) and the
+        ``extra_smem_bytes`` for a caller's own shared storage (unused by this body). ``cta_chunks``: the in-CTA chunk
+        fold of the split class (the chunk count is a runtime value of the kernel, the operands' batch extent) -- the
         TMEM holds the running sum next to the accumulator stages. ``in_fmt`` names the operand format whose knob
         constraints apply. ``acc_stages`` overrides the accumulator ring's depth (the block-scale body: one stage per K
         block in flight); ``reserve_smem_bytes`` is smem the caller allocates itself (its scale ring), off the A/B/C budget."""
         assert knobs.well_formed(in_fmt) and knobs.use_tma_store, (knobs, in_fmt)
         self.knobs = knobs
-        self.chunks = chunks
-        self.cta_chunks = (
-            chunks if (knobs.cta_chunks and chunks > 1) else 1
-        )  # chunks folded inside the CTA (1: none)
+        assert not cta_chunks or knobs.cta_chunks, knobs
+        self.cta_chunks = cta_chunks  # the in-CTA chunk fold (its count is dynamic)
         self.c_in_smem = c_in_smem
         self.extra_smem_bytes = extra_smem_bytes
         self.acc_stages = acc_stages
@@ -179,9 +173,9 @@ class StaticPlan:
         acc_shape = self.tiled_mma.partition_shape_C(self.mma_tiler[:2])
         # the in-CTA chunk fold keeps the running sum in TMEM as one more accumulator-shaped buffer (stage index
         # `num_acc_stage` of the fragment); the accumulator stages shrink to one when three buffers do not fit
-        self.sum_stage = self.num_acc_stage if self.cta_chunks > 1 else None
-        self.num_tmem_stages = self.num_acc_stage + (1 if self.cta_chunks > 1 else 0)
-        if self.cta_chunks > 1:
+        self.sum_stage = self.num_acc_stage if self.cta_chunks else None
+        self.num_tmem_stages = self.num_acc_stage + (1 if self.cta_chunks else 0)
+        if self.cta_chunks:
             # (stages + sum) x tile N columns, a power of two >= 32 (the library's rule; its layout recast does not take the 64-row
             # tile's 16x4 lane split at three stages, so the count is formed here); one accumulator stage holds tile N columns
             self.num_tmem_alloc_cols = max(
@@ -210,7 +204,7 @@ class StaticPlan:
         )
         c_bytes_per_stage = cute.size_in_bytes(self.c_dtype, c_one)
         num_acc = self.acc_stages or NUM_ACC_STAGE
-        if self.cta_chunks > 1:
+        if self.cta_chunks:
             # accumulator stages + the running sum: 3 x tile N columns when they fit the 512-column allocation, else one stage; the
             # 64-row CTA tiles (the 16 x 4 lane split of their accumulator) take one stage too: the DSL's TMEM fragment of three
             # such stages does not compile (a layout-recast limit of DSL 4.8.1, not a budget), two do
@@ -273,25 +267,6 @@ class TmaSetup:
             self.atom_c, self.tensor_c = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(), c, epi_smem, st.epi_tile
             )
-
-
-def build_grid(st: StaticPlan, c: cute.Tensor, max_active_clusters):
-    """Tile count from C and the CTA tile; persistent grid = min(tiles, max_active_clusters x
-    cluster). The grid is a launch parameter only (I10): no fold bound depends on it."""
-    gc = cute.zipped_divide(
-        c, tiler=cute.slice_(st.cta_tile_shape_mnk, (None, None, 0))
-    )
-    num_ctas_mnl = gc[(0, (None, None, None))].shape
-    params = tile_scheduler.PersistentTileSchedulerParams(
-        num_ctas_mnl,
-        (*st.cluster_shape_mn, 1),
-        st.knobs.swizzle_size,
-        st.knobs.raster_along == "m",
-    )
-    grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
-        params, max_active_clusters
-    )
-    return params, grid
 
 
 def can_implement(

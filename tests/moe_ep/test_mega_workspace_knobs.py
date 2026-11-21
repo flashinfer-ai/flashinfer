@@ -9,10 +9,10 @@ from unittest import mock
 import pytest
 import torch
 
-from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
     Sm100GenphaseMoeConfig,
 )
-from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
     default_sm100_genphase_knobs,
     is_valid_sm100_genphase_knobs,
     sm100_genphase_candidates,
@@ -48,7 +48,7 @@ def test_blackwell_genphase_backend_selects_own_workspace(
     tile, cluster, monkeypatch, dist_not_initialized
 ):
     """GenPhase allocation and pool identity stay separate from legacy inference."""
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -69,7 +69,7 @@ def test_blackwell_genphase_backend_selects_own_workspace(
     assert config.resolved_mma_tiler_mnk == (tile or (256, 64, 128))
     assert config.cluster_shape_mn == (cluster or (4, 1))
     assert config.fc2_use_bulk and not config.reduce_topk_in_kernel
-    assert kernel._workspace_pool_key(fleet)[-1] == config
+    assert config in kernel._workspace_pool_key(fleet)
     explicit, _, _ = _mxfp8_backend(
         kernel_variant="genphase",
         mma_tiler_mnk=config.resolved_mma_tiler_mnk,
@@ -77,7 +77,6 @@ def test_blackwell_genphase_backend_selects_own_workspace(
     )
     assert kernel._workspace_pool_key(fleet) == explicit._workspace_pool_key(fleet)
     legacy, _, _ = _mxfp8_backend()
-    monkeypatch.setattr(legacy, "_workspace_knobs", lambda fp: None)
     assert kernel._workspace_pool_key(fleet) != legacy._workspace_pool_key(fleet)
     other, _, _ = _mxfp8_backend(
         kernel_variant="genphase",
@@ -114,6 +113,12 @@ def test_blackwell_genphase_schedule_heuristic(tile, cluster, hint, monkeypatch)
         lambda _: mock.Mock(major=10, minor=3, multi_processor_count=148),
     )
 
+    def gather(reports, proposal, *, group):
+        assert group is mock.sentinel.ep_group
+        reports[:] = [proposal, proposal]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+
     def make(**overrides):
         """Bind a GenPhase backend with selected geometry and optional overrides."""
         params = dict(
@@ -128,7 +133,12 @@ def test_blackwell_genphase_schedule_heuristic(tile, cluster, hint, monkeypatch)
             Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(**params)
         )
         backend.bind_ep_bootstrap(
-            BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False)
+            BootstrapConfig(
+                world_size=2,
+                rank=0,
+                auto_bootstrap=False,
+                process_group=mock.sentinel.ep_group,
+            )
         )
         return backend
 
@@ -202,7 +212,7 @@ def test_blackwell_genphase_backend_weights_and_layout_validation(
     scale_dtype, dist_not_initialized
 ):
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
@@ -222,11 +232,13 @@ def test_blackwell_genphase_backend_weights_and_layout_validation(
             assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
     config = kernel._genphase_config(fleet)
     pkg.validate_genphase_weights(transformed, config, torch.device("cpu"))
-    legacy = preprocess_mega_weights(
+    standard = preprocess_mega_weights(
         MoEWeightPack(w13, w2), intermediate_size=192, hidden_size=384
     )
+    pkg.validate_genphase_weights(standard, config, torch.device("cpu"))
+    wrong_stride = ((transformed[0][0].contiguous(), transformed[0][1]), transformed[1])
     with pytest.raises(ValueError, match="K-major"):
-        pkg.validate_genphase_weights(legacy, config, torch.device("cpu"))
+        pkg.validate_genphase_weights(wrong_stride, config, torch.device("cpu"))
     with pytest.raises(ValueError, match="tuple"):
         pkg.validate_genphase_weights(None, config, torch.device("cpu"))
     bad = ((transformed[0][0], transformed[0][1].view(torch.uint8)), transformed[1])
@@ -275,6 +287,7 @@ def make_layer(monkeypatch):
                 megakernel=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                     intermediate_size=128,
                     top_k=2,
+                    kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
                     knobs=knobs,
                     finalize_mode=FinalizeMode.DEFAULT,
                 ),
@@ -420,11 +433,13 @@ def test_override_does_not_replace_allocated_default(make_layer, live_tokens):
 )
 def test_single_cta_reset_admission(world, count, ncu, expected, monkeypatch):
     """EP1, large prefixes and NCU retain the distributed reset protocol."""
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as pkg
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.comm.megamoe_config import (
+        MegaMoEDiagnostics,
+    )
 
     cutlass = pytest.importorskip("cutlass")
 
-    monkeypatch.setenv("MEGA_USE_NCU", ncu)
     comm = pkg.TokenInPullTokenBackPush(
         world_size=world,
         num_topk=4,
@@ -439,6 +454,7 @@ def test_single_cta_reset_admission(world, count, ncu, expected, monkeypatch):
         cluster_shape_mn=(2, 1),
         dispatch_warp_start=8,
         num_other_warps=8,
+        diagnostics=MegaMoEDiagnostics(use_ncu=ncu == "1"),
     )
     assert comm.use_single_cta_tail_reset(count) is expected
 
@@ -446,7 +462,7 @@ def test_single_cta_reset_admission(world, count, ncu, expected, monkeypatch):
 @pytest.mark.parametrize("world", [1, 2, 4])
 @pytest.mark.parametrize("tile_n,cluster_m", [(128, 4), (64, 4), (64, 2)])
 def test_blackwell_genphase_workspace_plan(world, tile_n, cluster_m, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     cutlass = pytest.importorskip("cutlass")
     # DSL 4.6/4.7 expose the SMEM query through cutlass.utils only.
@@ -463,12 +479,12 @@ def test_blackwell_genphase_workspace_plan(world, tile_n, cluster_m, monkeypatch
         cluster_shape_mn=(cluster_m, 1),
     )
     monkeypatch.setattr(
-        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.block_scaled._max_active_clusters",
+        "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.block_scaled._max_active_clusters",
         lambda size: 32,
     )
     kernel = pkg.Sm100GenphaseSymmBuffer._build_kernel(cfg)
     assert type(kernel).__module__.startswith(
-        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.kernel_src.blackwell."
+        "flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.kernel_src.blackwell."
     )
     assert kernel.architecture == "sm_100"
     assert kernel._mainloop.architecture == "sm_100"
@@ -482,12 +498,12 @@ def test_blackwell_genphase_workspace_plan(world, tile_n, cluster_m, monkeypatch
     assert mainloop.gather_b_rows_per_cta == tile_n // 2
     assert mainloop.gather_b_runs_per_unit == 1
     assert mainloop.num_gather_b_warps == (2 if tile_n == 64 and cluster_m == 4 else 4)
-    assert not mainloop.dynamic_gather
+    assert not mainloop.dynamic_token_tx
     assert kernel.masks_invalid_combine_slots
 
 
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
-def test_blackwell_standard_backend_is_opt_in(kind, monkeypatch):
+def test_blackwell_standard_backend_is_default(kind, monkeypatch):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
@@ -500,9 +516,7 @@ def test_blackwell_standard_backend_is_opt_in(kind, monkeypatch):
     )
     kwargs = {} if kind == "nvfp4" else {"kind": kind}
     original = config_type(intermediate_size=192, top_k=3, **kwargs)
-    selected = dataclasses.replace(
-        original, kernel_name=f"sm100_{name}_bf16_cutedsl_next"
-    )
+    selected = dataclasses.replace(original, kernel_name=f"sm100_{name}_bf16_cutedsl")
     backend = create_mega_kernel(selected)
     backend.bind_ep_bootstrap(
         moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
@@ -513,16 +527,16 @@ def test_blackwell_standard_backend_is_opt_in(kind, monkeypatch):
     cfg = backend._workspace_config(fleet)
     assert cfg.quant_kind == kind and cfg.kernel_variant == "inference"
     assert cfg.instruction_k == (64 if kind == "nvfp4" else 32)
-    assert type(create_mega_kernel(original)) is not type(backend)
+    assert type(create_mega_kernel(original)) is type(backend)
     assert hash(backend._workspace_pool_key(fleet))
 
 
 @pytest.mark.parametrize("supplied_output", [False, True])
 def test_standard_compute_returns_output(supplied_output, monkeypatch):
     from types import SimpleNamespace
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
-    backend, _, _ = _mxfp8_backend(kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next")
+    backend, _, _ = _mxfp8_backend(kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl")
     output = torch.empty(2, 128) if supplied_output else None
     view = torch.full((2, 128), 3.0)
 
@@ -545,7 +559,7 @@ def test_blackwell_standard_routing_bounds(kind, topk, monkeypatch):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.backends.mega.kernel.sm100 import standard_cutedsl
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(standard_cutedsl, "validate_mega_arch", lambda: None)
@@ -559,7 +573,7 @@ def test_blackwell_standard_routing_bounds(kind, topk, monkeypatch):
         config_type(
             intermediate_size=192,
             top_k=topk,
-            kernel_name=f"sm100_{name}_bf16_cutedsl_next",
+            kernel_name=f"sm100_{name}_bf16_cutedsl",
             **({} if kind == "nvfp4" else {"kind": kind}),
         )
     )
@@ -590,11 +604,11 @@ def test_blackwell_standard_routing_bounds(kind, topk, monkeypatch):
 @pytest.mark.parametrize("world,topk", [(1, 256), (1, 257), (257, 1)])
 def test_blackwell_standard_router_metadata_bounds(world, topk):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.api import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.api import (
         ImplDesc,
         ProblemDesc,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.communication.nvlink_domain.token_comm import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.communication.nvlink_domain.token_comm import (
         _MetadataPushRouter,
     )
 
@@ -619,11 +633,11 @@ def test_blackwell_standard_router_metadata_bounds(world, topk):
 @pytest.mark.parametrize("compute_clusters", [16, 32])
 def test_blackwell_grid_stride_cluster_count(mode, compute_clusters):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.api import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.api import (
         ImplDesc,
         ProblemDesc,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.kernel_src.schedulers.fc12_scheduler import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.kernel_src.schedulers.fc12_scheduler import (
         BlackwellFusedFc12Scheduler,
     )
 
@@ -654,12 +668,12 @@ def test_blackwell_grid_stride_cluster_count(mode, compute_clusters):
 
 
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3"])
-def test_blackwell_standard_and_genphase_share_epilogue(kind, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+def test_blackwell_standard_and_genphase_use_native_epilogues(kind, monkeypatch):
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     pytest.importorskip("cutlass")
     monkeypatch.setattr(
-        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.block_scaled._max_active_clusters",
+        "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.block_scaled._max_active_clusters",
         lambda size: 32,
     )
     fields = dict(
@@ -675,9 +689,14 @@ def test_blackwell_standard_and_genphase_share_epilogue(kind, monkeypatch):
         pkg.Sm100BlockScaledMoeConfig(**fields, quant_kind=kind)
     )
     genphase = pkg.Sm100GenphaseSymmBuffer._build_kernel(
-        pkg.Sm100GenphaseMoeConfig(**fields)
+        pkg.Sm100GenphaseMoeConfig(**fields, quant_kind=kind)
     )
-    assert type(standard.epilogue) is type(genphase.epilogue)
+    assert type(standard.epilogue).__module__.endswith(
+        ".blackwell.inference.mega.block_scaled_swap_ab_fc12_epilogue"
+    )
+    assert type(genphase.epilogue).__module__.endswith(
+        ".blackwell.inference.genphase.block_scaled_swap_ab_fc12_epilogue"
+    )
     assert genphase.epilogue.fc2_tma_stages == 2
     assert standard.masks_invalid_combine_slots
 
@@ -708,7 +727,7 @@ def test_blackwell_standard_finalize_modes(kind, mode, live_count, supported):
     config = config_type(
         intermediate_size=192,
         top_k=3,
-        kernel_name=f"sm100_{kind}_{kind}_bf16_cutedsl_next",
+        kernel_name=f"sm100_{kind}_{kind}_bf16_cutedsl",
         finalize_mode=FinalizeMode[mode],
         num_valid_tokens_tensor=torch.tensor([7], dtype=torch.int32)
         if live_count
@@ -738,7 +757,7 @@ def test_blackwell_standard_nvfp4_finalize_compat(kwargs):
         config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=192,
             top_k=3,
-            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
             **kwargs,
         )
     backend = create_mega_kernel(config)
@@ -767,7 +786,7 @@ def test_blackwell_standard_forwards_routing_weights(early, monkeypatch):
     config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=192,
         top_k=3,
-        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
         apply_routing_weights_before_fc2=early,
     )
     backend = create_mega_kernel(config)
@@ -793,16 +812,16 @@ def test_blackwell_genphase_import_is_lazy():
             "sentinel = types.ModuleType('sources')\n"
             "sentinel.__file__ = '/unrelated/sources/__init__.py'\n"
             "sys.modules['sources'] = sentinel\n"
-            "from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg\n"
+            "from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg\n"
             "assert sys.modules['sources'] is sentinel\n"
-            "assert 'flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe' not in sys.modules\n"
-            "assert pkg.Sm100GenphaseMoeConfig.__module__.endswith('.sm100.next_cutedsl_megamoe.shim.genphase')\n"
+            "assert 'flashinfer.moe_ep.shims.sm107.cutedsl_megamoe' not in sys.modules\n"
+            "assert pkg.Sm100GenphaseMoeConfig.__module__.endswith('.sm100.cutedsl_megamoe.sources.genphase')\n"
             "assert sys.modules['sources'] is sentinel\n"
-            "assert 'flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe' not in sys.modules\n"
-            "from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as genphase\n"
+            "assert 'flashinfer.moe_ep.shims.sm107.cutedsl_megamoe' not in sys.modules\n"
+            "from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as genphase\n"
             "assert pkg.Sm100GenphaseSymmBuffer is genphase.Sm100GenphaseSymmBuffer\n"
             "del sys.modules['sources']\n"
-            "from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as rubin\n"
+            "from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as rubin\n"
             "assert not issubclass(pkg.Sm100GenphaseSymmBuffer, rubin.Sm107BlockScaledSymmBuffer)\n"
             "assert not any(name.startswith('Sm100') for name in dir(rubin))\n",
         ],
@@ -830,7 +849,7 @@ def test_blackwell_genphase_import_is_lazy():
     ],
 )
 def test_blackwell_genphase_admission(override):
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     values = dict(
         num_total_experts=8,
@@ -974,7 +993,7 @@ def test_blackwell_genphase_autotune_rejects_incomplete_candidates_before_trials
 ):
     """Reject malformed shared candidates on every rank before trial collectives."""
     from flashinfer.moe_ep.core import tuning as core_tuning
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
         autotune,
         correctness,
         knob_cache,
@@ -1027,7 +1046,7 @@ def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_
     """Cache reuse requires exact profiles and preserves unrelated or invalid data."""
     import json
     from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
         knob_cache as cache,
     )
 
@@ -1139,8 +1158,8 @@ def test_blackwell_genphase_tuning_public_auto_retunes_once_and_capture_guard(
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
     from flashinfer.moe_ep.core.tuning_state import AutoTuningState
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import autotune
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     backend = create_mega_kernel(
@@ -1169,7 +1188,7 @@ def test_blackwell_genphase_tuning_public_auto_retunes_once_and_capture_guard(
     tune = mock.Mock(return_value=winner)
     launch = mock.Mock(return_value=mock.sentinel.output)
     monkeypatch.setattr(autotune, "autotune_sm100_block_scaled_mega_moe", tune)
-    monkeypatch.setattr(pkg, "sm100_genphase_mega_moe", launch)
+    monkeypatch.setattr(pkg, "sm100_block_scaled_mega_moe", launch)
     with autotune_v2(persistent_cache=False):
         for _ in range(2):
             assert (
@@ -1233,7 +1252,7 @@ def test_blackwell_genphase_tuning_backend_selection_memo_separates_devices(
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
@@ -1256,6 +1275,10 @@ def test_blackwell_genphase_tuning_backend_selection_memo_separates_devices(
     fleet = FleetParams(
         num_experts=256, max_tokens_per_rank=1024, token_hidden_size=4096
     )
+    buckets = mock.Mock(return_value=[16, 64])
+    monkeypatch.setattr(pkg, "genphase_live_token_buckets", buckets)
+    assert backend.live_token_buckets(fleet) == [16, 64]
+    buckets.assert_called_once_with(backend._genphase_base_config(fleet))
     first = backend._genphase_config(fleet)
     assert backend._genphase_config(fleet) is first
     resolve.assert_called_once()
@@ -1271,7 +1294,7 @@ def test_blackwell_genphase_tuning_device_identity_separates_compiler_stacks_and
     from types import SimpleNamespace
     import torch
     from flashinfer.jit import cute_dsl_core
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import knob_cache
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
@@ -1305,7 +1328,7 @@ def test_blackwell_genphase_tuning_cache_hit_before_dsl_arch_configuration(
     import json
     import torch
     from flashinfer.jit import cute_dsl_core
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
         knob_cache as cache,
     )
 
@@ -1353,10 +1376,10 @@ def test_blackwell_genphase_tuning_cache_hit_before_dsl_arch_configuration(
 def test_standard_activation_forwarding(kind, activation, monkeypatch):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     monkeypatch.setattr(
-        "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.block_scaled._max_active_clusters",
+        "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.block_scaled._max_active_clusters",
         lambda size: 32,
     )
     cls = (
@@ -1368,7 +1391,7 @@ def test_standard_activation_forwarding(kind, activation, monkeypatch):
         cls(
             intermediate_size=192,
             top_k=3,
-            kernel_name=f"sm100_{kind}_{kind}_bf16_cutedsl_next",
+            kernel_name=f"sm100_{kind}_{kind}_bf16_cutedsl",
             **activation,
         )
     )
@@ -1399,7 +1422,7 @@ def test_standard_persistent_pool_tracks_storage(monkeypatch):
     config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=192,
         top_k=3,
-        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
         finalize_mode=FinalizeMode.PERSISTENT,
         num_valid_tokens_tensor=count,
     )
@@ -1429,7 +1452,7 @@ def test_standard_auto_cake_matches_legacy(monkeypatch):
     config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=6,
-        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
     )
     backend = create_mega_kernel(config)
     backend.bind_ep_bootstrap(
@@ -1452,7 +1475,7 @@ def test_standard_cake_requires_reducer_warmup(monkeypatch):
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=192,
             top_k=3,
-            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
         )
     )
     workspace = SimpleNamespace(
@@ -1470,7 +1493,7 @@ def test_standard_cake_requires_reducer_warmup(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2"])
 def test_standard_hidden_alignment_preserves_genphase_constraints(kind):
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
         Sm100BlockScaledMoeConfig,
         Sm100GenphaseMoeConfig,
     )

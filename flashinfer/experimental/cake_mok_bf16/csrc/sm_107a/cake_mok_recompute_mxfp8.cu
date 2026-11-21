@@ -11,7 +11,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -4818,22 +4818,37 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
             int _parity_decode_ready = (int)((unsigned int)iteration % 2);
             mbarrier_wait(decode_ready_addr, _parity_decode_ready);
             unsigned int decode_quad[4];
+#if defined(_MSC_VER)
+            uint64_t _smem_raw_137[2];
+            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_137[0]), "=l"(_smem_raw_137[1]) : "r"(decode_words_0_addr) : "memory");
+#else
             __int128_t _smem_raw_137;
             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_137) : "r"(decode_words_0_addr) : "memory");
+#endif
             decode_quad[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_137)[0];
             decode_quad[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_137)[1];
             decode_quad[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_137)[2];
             decode_quad[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_137)[3];
             unsigned int decode_quad_0[4];
+#if defined(_MSC_VER)
+            uint64_t _smem_raw_138[2];
+            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_138[0]), "=l"(_smem_raw_138[1]) : "r"(decode_words_1_addr) : "memory");
+#else
             __int128_t _smem_raw_138;
             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_138) : "r"(decode_words_1_addr) : "memory");
+#endif
             decode_quad_0[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_138)[0];
             decode_quad_0[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_138)[1];
             decode_quad_0[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_138)[2];
             decode_quad_0[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_138)[3];
             unsigned int decode_quad_1[4];
+#if defined(_MSC_VER)
+            uint64_t _smem_raw_139[2];
+            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_139[0]), "=l"(_smem_raw_139[1]) : "r"(decode_words_2_addr) : "memory");
+#else
             __int128_t _smem_raw_139;
             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_139) : "r"(decode_words_2_addr) : "memory");
+#endif
             decode_quad_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_139)[0];
             decode_quad_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_139)[1];
             decode_quad_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_139)[2];

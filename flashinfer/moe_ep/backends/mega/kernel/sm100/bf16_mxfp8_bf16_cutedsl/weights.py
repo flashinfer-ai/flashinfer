@@ -73,9 +73,7 @@ def preprocess_mega_weights(
     """bf16 (or pre-quantized) weights → MXFP8 + swizzled-SF mega layout."""
     import torch
 
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
-    # shim exposes the cutlass-pulling stacking helper lazily via the boundary.
-    from ......kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         Mxfp8BlockSize,
         _stack_byte_reinterpretable_tensors,
         ceil_div,
@@ -241,8 +239,10 @@ def validate_transformed_mega_weights(
     fc1_out = 2 * intermediate_size
     data_dtype = _mxfp8_data_dtype(kind)
 
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.sm100.cutedsl_megamoe import Mxfp8BlockSize, ceil_div
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        Mxfp8BlockSize,
+        ceil_div,
+    )
 
     hidden_sf_cols = ceil_div(hidden_size, Mxfp8BlockSize)
     intermediate_sf_cols = ceil_div(intermediate_size, Mxfp8BlockSize)

@@ -28,6 +28,11 @@ pytestmark = pytest.mark.cpu_only
 def route(monkeypatch, qs, ks, *, hq=16, hk=4, cc=(10, 0), available=True, **changes):
     monkeypatch.setattr(prefill, "get_compute_capability", lambda device: cc)
     monkeypatch.setattr(prefill, "_cudnn_supports_paged_auto", lambda: available)
+    # Test this D128 extension independently of the installed FE version and
+    # the separately qualified full-prefill extension.
+    monkeypatch.setattr(
+        prefill, "_cudnn_supports_paged_full_prefill_auto", lambda dim: False
+    )
     kwargs = dict(
         device=torch.device("cuda"),
         layout="HND",
