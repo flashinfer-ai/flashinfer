@@ -1324,7 +1324,8 @@ class _PrimsTsMoERunnerMixin:
                 )
 
         tactics = _node_rank_rotated(tactics)
-        # Compilation is mostly host-side; fan out tactics when there are several.
+        # Threads can overlap tactic preparation and cache loads. CuTe compiler
+        # entry is serialized within a process; different ranks compile independently.
         max_workers = min(4, max(1, len(tactics)))
         if max_workers == 1 or len(tactics) <= 1:
             for tactic in tactics:
