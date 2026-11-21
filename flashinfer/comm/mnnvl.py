@@ -369,8 +369,10 @@ class MnnvlMemory:  # type: ignore[no-redef]
             ),
         )
 
+        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id, handle_type)
         madesc = cuda.CUmemAccessDesc()
-        madesc.location = MnnvlMemory.get_allocation_prop(dev_id, handle_type).location
+        # .location views allocation_prop; retain it until the descriptor copies it.
+        madesc.location = allocation_prop.location
         madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
         for i, mem_handle in enumerate(mem_handles):
             rank_ptr = start_address + rank_stride * i + address_offset
