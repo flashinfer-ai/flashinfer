@@ -648,6 +648,46 @@ def test_graph_workspace_ordered_and_independent(T):
         torch.testing.assert_close(y, oracle, rtol=0, atol=0)
 
 
+def test_green_stream_decode_capacity_and_replay():
+    _sm90_or_skip()
+    green_contexts = pytest.importorskip("torch.cuda.green_contexts")
+    ctx = green_contexts.GreenContext(num_sms=8)
+    reduced = ctx.Stream()
+    full = torch.cuda.default_stream()
+    # One weight pack, one reduced workspace. Warm to the maximum before
+    # pinning that workspace in the decode graph.
+    args, expected = _combine_case(65)
+    args[-2][:, 3:] += EL
+    out = torch.empty_like(expected)
+    torch.cuda.synchronize()
+    for t in (8, 64, 65):
+        inputs = (args[0][:t], *args[1:5], args[5][:t], args[6][:t])
+        for backend in ("auto", "specialized"):
+            for stream in (full, reduced, full):
+                with torch.cuda.stream(stream):
+                    out[:t].fill_(float("nan"))
+                    w4a16_mxfp4_latent_routed_moe(*inputs, out=out[:t], backend=backend)
+                    torch.testing.assert_close(out[:t], expected[:t], atol=0, rtol=0)
+                stream.synchronize()
+    assert _w4a16_mxfp4_latent_moe_stats()["backend_dispatches"] == {
+        "specialized": 18,
+        "reference": 0,
+    }
+
+    inputs = (args[0][:8], *args[1:5], args[5][:8], args[6][:8])
+    dst = out[:8]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=reduced):
+        w4a16_mxfp4_latent_routed_moe(*inputs, out=dst, backend="specialized")
+    with torch.cuda.stream(reduced):
+        for sign in (-1, 1):
+            inputs[-1].neg_()
+            dst.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(dst, sign * expected[:8], atol=0, rtol=0)
+    reduced.synchronize()
+
+
 def _workspace_limits_in_fresh_process():
     # The slot registry is process-lifetime; neither inherit nor exhaust the
     # test worker's cache. Hopper has 32 pooled streams per priority.

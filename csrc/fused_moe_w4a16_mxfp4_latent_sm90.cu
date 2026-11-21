@@ -3,6 +3,9 @@
 // include/flashinfer/fused_moe/fused_moe_w4a16_mxfp4_latent_sm90/kernels.cuh;
 // this TU keeps the host-side launch glue and dispatch.
 
+#include <cuda.h>
+
+#include <algorithm>
 #include <atomic>
 #include <flashinfer/fused_moe/fused_moe_w4a16_mxfp4_latent_sm90/kernels.cuh>
 #include <mutex>
@@ -25,8 +28,91 @@ static bool g_attr[64] = {};
 namespace {
 
 inline void check_cuda(cudaError_t status, const char* what) {
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "w4a16_mxfp4_latent_routed_moe: " << what << " failed: " << cudaGetErrorString(status);
+  if (status != cudaSuccess) {
+    // Report the saved return value, but do not leave this synchronous API
+    // failure for the next call's post-launch cudaGetLastError check.
+    static_cast<void>(cudaGetLastError());
+    TVM_FFI_ICHECK(false) << "w4a16_mxfp4_latent_routed_moe: " << what
+                          << " failed: " << cudaGetErrorString(status);
+  }
+}
+
+constexpr size_t kDecodeSmem = LH * 2 + RCAP * 8;
+
+#if CUDA_VERSION >= 12040
+// Resolve through the runtime already linked into the module. decltype is
+// unevaluated: it does not import the named function from the driver DSO.
+template <typename Fn>
+Fn green_entry(const char* name) {
+  void* ptr = nullptr;
+  cudaDriverEntryPointQueryResult query{};
+#if CUDART_VERSION >= 12050
+  check_cuda(cudaGetDriverEntryPointByVersion(name, &ptr, 12040, cudaEnableDefault, &query), name);
+#else
+  check_cuda(cudaGetDriverEntryPoint(name, &ptr, cudaEnableDefault, &query), name);
+#endif
+  TVM_FFI_ICHECK(query == cudaDriverEntryPointSuccess && ptr != nullptr)
+      << "w4a16_mxfp4_latent_routed_moe: driver entry unavailable: " << name;
+  return reinterpret_cast<Fn>(ptr);
+}
+#endif
+
+int decode_grid(int device, cudaStream_t stream) {
+  static std::atomic<int> blocks_per_sm[64] = {};
+  const bool cacheable = device >= 0 && device < 64;
+  int nb = cacheable ? blocks_per_sm[device].load(std::memory_order_relaxed) : 0;
+  if (!nb) {
+    check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, moe_dec_k, 512, kDecodeSmem),
+               "cudaOccupancyMaxActiveBlocksPerMultiprocessor(moe_dec_k)");
+    TVM_FFI_ICHECK(nb > 0) << "moe_dec_k cannot reside on this device";
+    if (cacheable) blocks_per_sm[device].store(nb, std::memory_order_relaxed);
+  }
+
+  int driver = 0;
+  check_cuda(cudaDriverGetVersion(&driver), "cudaDriverGetVersion");
+  if (driver >= 12040) {
+#if CUDA_VERSION >= 12040
+    static const auto get_green =
+        green_entry<decltype(&cuStreamGetGreenCtx)>("cuStreamGetGreenCtx");
+    CUgreenCtx green = nullptr;
+    CUresult status = get_green(stream, &green);
+    TVM_FFI_ICHECK(status == CUDA_SUCCESS) << "cuStreamGetGreenCtx failed: " << int(status);
+    if (green != nullptr) {
+      static const auto get_resource =
+          green_entry<decltype(&cuGreenCtxGetDevResource)>("cuGreenCtxGetDevResource");
+      CUdevResource resource{};
+      status = get_resource(green, &resource, CU_DEV_RESOURCE_TYPE_SM);
+      TVM_FFI_ICHECK(status == CUDA_SUCCESS) << "cuGreenCtxGetDevResource failed: " << int(status);
+      TVM_FFI_ICHECK(resource.type == CU_DEV_RESOURCE_TYPE_SM && resource.sm.smCount > 0)
+          << "empty stream SM resource";
+      return std::min<long long>(DGRID, 1LL * nb * resource.sm.smCount);
+    }
+#else
+    // Old headers cannot describe CUdevResource. Do not infer that the
+    // *driver* lacks green streams from the toolkit used to build this TU.
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim.x = attr.val.clusterDim.y = attr.val.clusterDim.z = 1;
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(DGRID);
+    config.blockDim = dim3(512);
+    config.dynamicSmemBytes = kDecodeSmem;
+    config.stream = stream;
+    config.attrs = &attr;
+    config.numAttrs = 1;
+    int clusters = 0;
+    check_cuda(cudaOccupancyMaxActiveClusters(&clusters, moe_dec_k, &config),
+               "cudaOccupancyMaxActiveClusters(moe_dec_k)");
+    TVM_FFI_ICHECK(clusters > 0) << "no resident decode blocks on stream";
+    return std::min(DGRID, clusters);
+#endif
+  }
+  // Non-green stream (including default streams), or pre-green driver.
+  int sms = 0;
+  check_cuda(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device),
+             "cudaDeviceGetAttribute(multiProcessorCount)");
+  TVM_FFI_ICHECK(sms > 0) << "empty device SM resource";
+  return std::min<long long>(DGRID, 1LL * nb * sms);
 }
 
 // Makes x's device current for the whole enqueue sequence (allocations,
@@ -75,6 +161,7 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
   check_cuda(cudaStreamIsCapturing(st, &capture_status), "cudaStreamIsCapturing");
   TVM_FFI_ICHECK(capture_status != cudaStreamCaptureStatusInvalidated) << "invalidated capture";
   const bool capturing = capture_status == cudaStreamCaptureStatusActive;
+  const int coop = MT == 1 ? decode_grid(device, st) : 0;
   WorkspaceSlot* slot = nullptr;
   {
     std::lock_guard<std::mutex> registry(g_ws_registry_mu);
@@ -163,23 +250,6 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
   }
 
   if (MT == 1) {
-    // The cooperative grid size is occupancy- and SM-count-derived, so it is
-    // cached PER DEVICE ORDINAL: a second device with fewer SMs must not
-    // inherit a grid the first device sized.
-    static std::atomic<int> g_coop[64] = {};
-    const bool cacheable = device >= 0 && device < 64;
-    int coop = cacheable ? g_coop[device].load(std::memory_order_relaxed) : 0;
-    if (coop == 0) {
-      int nb = 0, nsm = 0;
-      check_cuda(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, moe_dec_k, 512,
-                                                               (size_t)(LH * 2 + RCAP * 8)),
-                 "cudaOccupancyMaxActiveBlocksPerMultiprocessor(moe_dec_k)");
-      check_cuda(cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, device),
-                 "cudaDeviceGetAttribute(multiProcessorCount)");
-      int g = nb * nsm;
-      coop = (g < 1) ? 1 : (g > DGRID ? DGRID : g);
-      if (cacheable) g_coop[device].store(coop, std::memory_order_relaxed);
-    }
     const __nv_bfloat16* xp = static_cast<const __nv_bfloat16*>(x.data_ptr());
     const uint8_t* a1 = static_cast<const uint8_t*>(w13p.data_ptr());
     const uint8_t* a2 = static_cast<const uint8_t*>(w13s.data_ptr());
@@ -190,7 +260,7 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView
     void* args[] = {(void*)&xp, (void*)&a1, (void*)&a2,   (void*)&a3, (void*)&a4,
                     (void*)&a5, (void*)&a6, (void*)&hbuf, (void*)&T,  (void*)&acc};
     check_cuda(cudaLaunchCooperativeKernel((const void*)moe_dec_k, dim3(coop), dim3(512), args,
-                                           (size_t)(LH * 2 + RCAP * 8), st),
+                                           kDecodeSmem, st),
                "cudaLaunchCooperativeKernel(moe_dec_k)");
   } else {
     size_t sm1 = (size_t)(MMM + 2 * MNT) * MSTR * 2;
