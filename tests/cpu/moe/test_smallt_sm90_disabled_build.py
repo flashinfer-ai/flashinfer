@@ -258,3 +258,56 @@ def test_deferred_capture_declines_then_eager_selection_warms(monkeypatch):
     assert runner.accepts(act, weights)
     assert len(queries) == count and runner.pack_inputs.call_count == pack_count
     assert current == [0]
+
+
+def test_alignment_excludes_same_pack_before_and_after_warmup(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from flashinfer.fused_moe import MoELayer
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    monkeypatch.delenv(DISABLE_ENV, raising=False)
+    monkeypatch.delenv("FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90", raising=False)
+    monkeypatch.setattr(smallt, "_module", object())
+    runner = object.__new__(SpecializedFp8BlockSmallTRunner)
+    runner._jit_deferred = True
+    runner._band_geometry_ok = lambda t, h: True
+    runner.pack_inputs = Mock(side_effect=AssertionError("eligibility must not repack"))
+    hidden = torch.empty((4, 128), dtype=torch.bfloat16)
+    offset = torch.empty(hidden.numel() + 1, dtype=hidden.dtype)[1:].view_as(hidden)
+    assert hidden.data_ptr() % 16 == 0 and offset.data_ptr() % 16 == 2
+    mode = runner.supported_routing_modes[0]
+    act = SimpleNamespace(num_tokens=4, routing_input_mode=mode, hidden_states_q=hidden)
+    bad = SimpleNamespace(num_tokens=4, routing_input_mode=mode, hidden_states_q=offset)
+    view = {
+        "fc1_expert_weights": torch.empty(32, dtype=torch.float8_e4m3fn),
+        "fc2_expert_weights": torch.empty(32, dtype=torch.float8_e4m3fn),
+    }
+    weights = SimpleNamespace(native_views={"cutlass_fp8_block": view})
+    stock = SimpleNamespace(
+        backend_key="stock",
+        supported_routing_modes=(mode,),
+        accepts=lambda act, weights: True,
+    )
+    layer = object.__new__(MoELayer)
+    layer.config = SimpleNamespace(execution=SimpleNamespace(tune_max_num_tokens=64))
+    layer.runners = [runner, stock]
+    assert layer._eligible_runners(bad, weights) == (1,)
+    assert runner._jit_deferred
+    assert layer._eligible_runners(act, weights) == (0, 1)
+    assert not runner._jit_deferred
+    assert layer._eligible_runners(bad, weights) == (1,)
+    for name in view:
+        aligned = view[name]
+        view[name] = torch.empty(33, dtype=aligned.dtype)[1:]
+        assert layer._eligible_runners(act, weights) == (1,)
+        view[name] = aligned
+    assert layer._eligible_runners(act, weights) == (0, 1)
+    aligned_offset = torch.empty(hidden.numel() + 8, dtype=hidden.dtype)[8:].view_as(
+        hidden
+    )
+    assert aligned_offset.storage_offset() == 8 and aligned_offset.data_ptr() % 16 == 0
+    act.hidden_states_q = aligned_offset
+    assert layer._eligible_runners(act, weights) == (0, 1)
+    runner.pack_inputs.assert_not_called()

@@ -1328,3 +1328,59 @@ def test_warm_invocation_failure_propagates(monkeypatch):
     with pytest.raises(RuntimeError, match="injected invocation failure"):
         layer(act, weights)
     assert smallt._module_error is None
+
+
+def test_deferred_alignment_remains_ineligible_after_warmup(monkeypatch):
+    _sm90_or_skip()
+    from unittest.mock import Mock
+
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    monkeypatch.setattr(smallt, "_module", None)
+    monkeypatch.setattr(smallt, "_module_error", None)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    layer, act, weights, b = _unified_layer(
+        4, (SpecializedFp8BlockSmallTConfig(), CutlassFp8BlockConfig())
+    )
+    runner = layer.runners[0]
+
+    def offset(t, elements):
+        buf = t.new_empty(t.numel() + elements)
+        out = buf[elements:].view_as(t)
+        assert out.is_contiguous()
+        assert out.data_ptr() % 16 == (elements * t.element_size()) % 16
+        return out
+
+    misaligned = MoEActivationPack(offset(b["x"], 1), None, b["ids"], b["tw"])
+    cases = [(misaligned, weights)]
+    for name in ("fc1_expert_weights", "fc2_expert_weights"):
+        view = dict(weights.get_view("cutlass_fp8_block"))
+        view[name] = offset(view[name], 1)
+        bad_weights = MoEWeightPack()
+        bad_weights.prepare_for("cutlass_fp8_block", view)
+        cases.append((act, bad_weights))
+    monkeypatch.delenv(DISABLE_ENV)
+    with monkeypatch.context() as ctx:
+        ctx.setattr(
+            runner, "pack_inputs", Mock(side_effect=AssertionError("unexpected pack"))
+        )
+        for bad_act, bad_weights in cases:
+            assert layer._eligible_runners(bad_act, bad_weights) == (1,)
+    assert smallt._module is None and runner._jit_deferred
+    assert layer._eligible_runners(act, weights) == (0, 1)
+    assert smallt._module is not None and not runner._jit_deferred
+    before = _moe_smallt_sm90_stats()["runs_dispatched"]
+    out = runner.forward(runner.pack_inputs(act, weights))
+    torch.cuda.synchronize(act.hidden_states_q.device)
+    assert _moe_smallt_sm90_stats()["runs_dispatched"] == before + 1
+    ts, l2 = _gate(out, _reference(b))
+    assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL
+    aligned_offset = MoEActivationPack(offset(b["x"], 8), None, b["ids"], b["tw"])
+    with monkeypatch.context() as ctx:
+        ctx.setattr(
+            runner, "pack_inputs", Mock(side_effect=AssertionError("unexpected pack"))
+        )
+        for bad_act, bad_weights in cases:
+            assert layer._eligible_runners(bad_act, bad_weights) == (1,)
+        assert layer._eligible_runners(act, weights) == (0, 1)
+        assert layer._eligible_runners(aligned_offset, weights) == (0, 1)

@@ -2967,12 +2967,12 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
         return False
 
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
-        from .smallt_sm90 import _disabled
+        from .smallt_sm90 import _VEC_ALIGN, _disabled
 
         if _disabled():
             return False
         hidden = act.hidden_states_q
-        if hidden.ndim != 2:
+        if hidden.ndim != 2 or hidden.data_ptr() % _VEC_ALIGN:
             return False
         return self._band_geometry_ok(act.num_tokens, hidden.shape[1])
 
@@ -2990,6 +2990,19 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
                 name in view for name in self._ACTIVATION_OVERRIDE_KEYS
             ):
                 return False
+        # Validate vector-load addresses on every pack, including warm calls.
+        # These pointer checks do not repack inputs or allocate an output.
+        from .smallt_sm90 import _VEC_ALIGN
+
+        for key in (self.backend_key, *self.weight_view_aliases):
+            view = weights.native_views.get(key)
+            if view is not None:
+                if any(
+                    view[name].data_ptr() % _VEC_ALIGN
+                    for name in ("fc1_expert_weights", "fc2_expert_weights")
+                ):
+                    return False
+                break
         if not self._jit_deferred:
             return True
 
