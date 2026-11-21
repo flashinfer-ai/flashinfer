@@ -58,6 +58,9 @@ class B12XSparseMLAScratchCaps:
     scale_format: int | None = None
     cache_record_bytes: int | None = None
     fp8_rope: bool | None = None
+    kvarn_k_bits: int | None = None
+    kvarn_v_bits: int | None = None
+    kvarn_group: int | None = None
     latent_scale_per_token: bool = False
     cache_traits: UnifiedMLATraits | None = field(
         default=None,
@@ -119,6 +122,9 @@ class B12XSparseMLAScratchCaps:
             scale_format,
             fp8_rope=self.fp8_rope,
             latent_scale_per_token=bool(self.latent_scale_per_token),
+            k_bits=int(self.kvarn_k_bits or 0),
+            v_bits=int(self.kvarn_v_bits or 0),
+            group=int(self.kvarn_group or 0),
         )
         record_bytes = int(traits.kv_gmem_stride)
         if (

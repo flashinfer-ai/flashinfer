@@ -536,6 +536,44 @@ def _run_module_asserts() -> None:
         f"SM120 carveout {SM120_SMEM_CARVEOUT_BYTES}B"
     )
     get_prefill_mg_shared_storage_cls(v41_fp8, mg_n_hg=1)
+    # KVarN (KVARN_DUAL): n_hg==1 only -- the 536B-class record double
+    # buffer plus the BF16 Q group fits the carveout for one 16-head
+    # group per CTA; pin the budget at import time.
+    kvarn44 = make_unified_traits(
+        ModelType.KVARN_MLA,
+        ComputeMode.BF16,
+        ScaleFormat.KVARN_DUAL,
+        k_bits=4,
+        v_bits=4,
+        group=256,
+    )
+    kl = make_smem_layout_mg(kvarn44, mg_n_hg=1)
+    assert kl.kv_smem_stride == 536
+    assert kl.q_nope_bf16_stride == 520
+    assert kl.total_bytes < SM120_SMEM_CARVEOUT_BYTES, (
+        f"KVarN MG prefill smem {kl.total_bytes}B exceeds SM120 carveout "
+        f"{SM120_SMEM_CARVEOUT_BYTES}B"
+    )
+    get_prefill_mg_shared_storage_cls(kvarn44, mg_n_hg=1)
+    # Pool bindings carry the 66B inline tail (row stride 602 for k4v4);
+    # the record copy lands at smem+0, so only the stride grows -- pin the
+    # pool-geometry layout too (the AOT probe binds the real pool view).
+    kvarn44_row = make_unified_traits(
+        ModelType.KVARN_MLA,
+        ComputeMode.BF16,
+        ScaleFormat.KVARN_DUAL,
+        k_bits=4,
+        v_bits=4,
+        group=256,
+        kvarn_row_stride=602,
+    )
+    kl_row = make_smem_layout_mg(kvarn44_row, mg_n_hg=1)
+    assert kl_row.kv_smem_stride == 536  # smem stays the packed record row
+    assert kl_row.total_bytes < SM120_SMEM_CARVEOUT_BYTES, (
+        f"KVarN pool-geometry MG prefill smem {kl_row.total_bytes}B exceeds "
+        f"SM120 carveout {SM120_SMEM_CARVEOUT_BYTES}B"
+    )
+    get_prefill_mg_shared_storage_cls(kvarn44_row, mg_n_hg=1)
 
     # mg_n_hg==1 (heads==16): one head group. Every group buffer is exactly half
     # the mg_n_hg==2 size; the per-group *_group_bytes (and so the group-0 byte

@@ -225,7 +225,13 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # retains its BF16 Q staging.
     q_fp8_off = off
     q_element_bytes = (
-        1 if traits.fp8_internal or traits.scale_format != ScaleFormat.NVFP4_E4M3 else 2
+        1
+        if traits.fp8_internal
+        else (
+            2
+            if traits.scale_format in (ScaleFormat.NVFP4_E4M3, ScaleFormat.KVARN_DUAL)
+            else 1
+        )
     )
     q_fp8_bytes = hpb * q_nope_stride * q_element_bytes
     off = q_fp8_off + q_fp8_bytes
@@ -297,7 +303,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # PV then stages both passes behind one barrier per V group.
     w_fp8_bufs = (
         2 * _W_FP8_BUF_COUNT
-        if traits.model_type == ModelType.GLM_NEXT
+        if traits.model_type in (ModelType.GLM_NEXT, ModelType.KVARN_TAIL_FP8)
         else _W_FP8_BUF_COUNT
     )
     off = w_fp8_off + w_fp8_buf_bytes * w_fp8_bufs
@@ -514,11 +520,22 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
 # import time (pure Python) and guard against a layout change blowing the SM120
 # carveout or desyncing KV_SMEM_STRIDE / Q_NOPE_STRIDE from the traits.
 # ---------------------------------------------------------------------------
-def _assert_model(model_type: int, compute_mode: int, scale_format: int) -> int:
+def _assert_model(
+    model_type: int,
+    compute_mode: int,
+    scale_format: int,
+    k_bits: int = 4,
+    v_bits: int = 4,
+) -> int:
     # Imported lazily to keep this module's top-level import order simple.
     from .traits import make_unified_traits
 
-    traits = make_unified_traits(model_type, compute_mode, scale_format)
+    # k_bits/v_bits only matter for the kvarn-family recipes (they set the
+    # gmem slot width); the SMEM layout is slot-width independent, so the
+    # k4v4 default is valid for every size assertion.
+    traits = make_unified_traits(
+        model_type, compute_mode, scale_format, k_bits=k_bits, v_bits=v_bits
+    )
     layout = make_smem_layout(traits)
     # This constructor validates every typed field offset and the exact total
     # that CUTLASS DSL 4.6 infers for the launch's dynamic shared memory.
@@ -562,6 +579,13 @@ def _run_module_asserts() -> None:
     _assert_model(ModelType.GLM_NSA, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
     glm_next = _assert_model(
         ModelType.GLM_NEXT, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32
+    )
+    _assert_model(
+        ModelType.KVARN_TAIL_FP8,
+        ComputeMode.FP8,
+        ScaleFormat.ARBITRARY_FP32,
+        k_bits=4,
+        v_bits=4,
     )
     # Sanity on the expected magnitudes (~92KB DSV4, ~96KB GLM after the
     # double-buffered KV + footer + w_fp8 refinements).
