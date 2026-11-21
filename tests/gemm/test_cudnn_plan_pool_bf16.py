@@ -74,16 +74,46 @@ def test_pool_tactics_match_in_process(pool_off, pool_on, monkeypatch, m):
     assert got == expected
 
 
+# In-process (all-plans graph, execute_plan_at_index) results known to be wrong
+# on a GPU major version, keyed by tactic. On GB300 (CUDA 12.9) this tactic at
+# M=37 returned B.T @ B in its first rows while the pool's single-plan graph
+# returned A @ B (PR #9488 CI). The in-process path is unchanged upstream
+# code, so the mismatch is tracked separately and only warned about here.
+_KNOWN_BAD_IN_PROCESS = {10: {(9, ((12, 246),))}}
+
+
+def _reference(inputs):
+    a, b = inputs[0], inputs[1]
+    return (a.double() @ b.double()).float()
+
+
+def _matches_reference(out, ref):
+    return torch.allclose(out.float(), ref, rtol=2e-2, atol=5e-2)
+
+
 @pytest.mark.parametrize("m", [37, 128])
 def test_pool_plans_bitwise_equal(pool_off, pool_on, m):
+    # The in-process output is not the oracle: both paths are checked against
+    # an independent matmul, then compared bitwise where in-process is right.
     torch.manual_seed(0)
     inputs = _inputs(m)
+    ref = _reference(inputs)
+    known_bad = _KNOWN_BAD_IN_PROCESS.get(torch.cuda.get_device_capability()[0], ())
     runner = _runner()
     tactics = runner.get_valid_tactics(inputs, None)
     expected = {}
+    bad_in_process = set()
     for tactic in tactics:
+        inputs[4].zero_()
         runner.forward(inputs, tactic=tactic)
         expected[tactic] = inputs[4].clone()
+        if not _matches_reference(expected[tactic], ref):
+            assert tactic in known_bad, f"in-process {tactic} does not match A @ B"
+            bad_in_process.add(tactic)
+            warnings.warn(
+                f"known-bad in-process cuDNN tactic {tactic} does not match A @ B",
+                stacklevel=1,
+            )
 
     pool = pool_on()
     runner = _runner()
@@ -92,7 +122,9 @@ def test_pool_plans_bitwise_equal(pool_off, pool_on, m):
     for tactic in tactics:
         inputs[4].zero_()
         runner.forward(inputs, tactic=tactic)
-        assert torch.equal(inputs[4], expected[tactic]), tactic
+        assert _matches_reference(inputs[4], ref), f"pooled {tactic} != A @ B"
+        if tactic not in bad_in_process:
+            assert torch.equal(inputs[4], expected[tactic]), tactic
 
 
 def test_pool_plans_profile_without_mismatch(pool_on):
