@@ -1046,7 +1046,10 @@ backend.
   inside a capture.
 - **Kill switch.** `FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`, read at call time,
   keeps every call on the other candidates (the runner rejects the call before
-  asking any kernel).
+  asking any kernel). A selection stored outside `MoELayer.__call__`
+  (`_prepare_tactic` / `_run_tactic`) is re-checked against `accepts()`
+  (`stored_selection_requires_accepts`), so it falls back to an ordinary
+  selection too.
 
 ### Today's MVP Cut
 

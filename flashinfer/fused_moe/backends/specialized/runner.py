@@ -81,7 +81,9 @@ class SpecializedMoERunner(MoERunner):
     eagerly, whose winners ``MoELayer`` selected outside capture.
     ``MoELayer.reset_winner()`` forgets those admissions with the winners
     (:meth:`forget_selections`), and a winner-cache miss under capture leaves
-    this backend out (``capture_requires_eager_selection``).
+    this backend out (``capture_requires_eager_selection``). A selection stored
+    for this backend (``MoELayer._run_tactic``) runs only while it accepts the
+    call (``stored_selection_requires_accepts``).
     """
 
     backend_key: ClassVar[str] = "specialized"
@@ -93,6 +95,11 @@ class SpecializedMoERunner(MoERunner):
     # the backend serves a captured call only for a winner selected eagerly, so
     # its admission there without a cached winner never adds a candidate.
     capture_requires_eager_selection: ClassVar[bool] = True
+    # A selection stored outside MoELayer.__call__ (MoELayer._prepare_tactic and
+    # _run_tactic, e.g. a tuned expert-parallel tactic) runs here only while
+    # accepts() admits the call, so the kill switch and the capture-time
+    # admission apply to it as to every MoELayer call.
+    stored_selection_requires_accepts: ClassVar[bool] = True
     # The capabilities are the registered kernels', documented per kernel; the
     # generated activation matrix of the design doc leaves this backend out.
     capabilities_from_kernel_registry: ClassVar[bool] = True
@@ -213,7 +220,9 @@ class SpecializedMoERunner(MoERunner):
 
     def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
         # The kill switch rejects every call here, before any kernel is asked;
-        # each kernel also checks it for direct callers.
+        # each kernel's accepts() also checks it, for callers that ask a kernel
+        # directly. MoELayer asks this for every call, including a stored
+        # selection (stored_selection_requires_accepts).
         if kill_switch_engaged():
             return False
         for kernel in self.kernels:

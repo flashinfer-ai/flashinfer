@@ -591,3 +591,35 @@ def test_preferred_backend_is_not_taken_inside_a_capture(monkeypatch):
     assert layer(act, None) == "specialized" and timed == []
     capturing[0] = True
     assert layer(act, None) == "specialized" and timed == []
+
+
+@pytest.mark.cpu_only
+def test_stored_selection_respects_the_kill_switch(monkeypatch):
+    """A selection stored outside ``__call__`` (``_prepare_tactic`` /
+    ``_run_tactic``, e.g. a tuned expert-parallel tactic) that names the
+    specialized backend runs only while the backend accepts the call: with
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` nothing is packed or run on it
+    and the call is selected among the other backends, as ``__call__`` does."""
+    runner, kernel, act, weights = _stub_binding(monkeypatch)
+    plain = _layer_runner("plain", cost=1.0)
+    forwarded = []
+    runner.forward = lambda inputs, **kwargs: forwarded.append(inputs) or "specialized"
+    runner.pack_inputs = lambda act, weights: ["packed"]
+    layer = _cpu_layer(runner, plain)
+    _bench_outside_capture(monkeypatch, [False], lambda r: 1.0)
+    act.num_tokens = 6
+    assert runner.stored_selection_requires_accepts is True
+
+    assert layer._run_tactic(act, weights, (0, -1)) == "specialized"
+    assert forwarded == [["packed"]] and kernel.asked == 1
+
+    monkeypatch.setenv(KILL_SWITCH_ENV, "1")
+    runner.pack_inputs = lambda act, weights: pytest.fail("packed while disabled")
+    layer._prepare_tactic(act, weights, (0, -1))  # prepares nothing
+    assert layer._run_tactic(act, weights, (0, -1)) == "plain"
+    assert layer.winner_backend == "plain"
+    assert len(forwarded) == 1 and kernel.asked == 1  # the kernel was not asked
+
+    # other runners' stored selections are not re-checked
+    plain.accepts = lambda act, weights: pytest.fail("a stock runner was asked")
+    assert layer._run_tactic(act, weights, (1, -1)) == "plain"

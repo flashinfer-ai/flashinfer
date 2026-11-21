@@ -252,7 +252,7 @@ prepared (in the default list, the backend whose view the kernel reads); with
 ``SpecializedMoEConfig`` alone the call raises ``NotImplementedError``. Make an
 eager call of every token count before capturing it.
 ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` keeps every call on the other
-candidates.
+candidates, including a selection stored before it was set.
 ``flashinfer.fused_moe.backends.specialized.registered_kernels()`` lists the
 kernels and ``flashinfer.fused_moe.backends.specialized.stats()`` returns their
 diagnostics.

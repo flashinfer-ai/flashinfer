@@ -614,11 +614,26 @@ class MoELayer:
             )
         return candidates
 
+    def _stored_selection_runner(self, act_pack, weight_pack, backend_index):
+        """The runner of a stored selection, or ``None`` when that runner
+        re-checks a stored selection (``stored_selection_requires_accepts``)
+        and no longer accepts the call, e.g. the specialized backend while
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``."""
+        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        if getattr(runner, "stored_selection_requires_accepts", False) and not (
+            act_pack.routing_input_mode in runner.supported_routing_modes
+            and runner.accepts(act_pack, weight_pack)
+        ):
+            return None
+        return runner
+
     def _prepare_tactic(self, act_pack, weight_pack, selection):
         from ..autotuner.autotuner import OptimizationProfile, StaticDim
 
         backend_index, tactic = selection
-        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        runner = self._stored_selection_runner(act_pack, weight_pack, backend_index)
+        if runner is None:
+            return  # _run_tactic selects among the runners that accept the call
         inputs = runner.pack_inputs(act_pack, weight_pack)
         profile = OptimizationProfile(
             [
@@ -634,9 +649,16 @@ class MoELayer:
             runner.forward(inputs, tactic=tactic, do_preparation=True, **kwargs)
 
     def _run_tactic(self, act_pack, weight_pack, selection):
-        """Pack and execute an already selected runner/tactic."""
+        """Pack and execute an already selected runner/tactic.
+
+        A runner that no longer accepts the call (see
+        ``_stored_selection_runner``) does not run it; the call is selected as
+        in ``__call__`` instead.
+        """
         backend_index, tactic = selection
-        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        runner = self._stored_selection_runner(act_pack, weight_pack, backend_index)
+        if runner is None:
+            return self(act_pack, weight_pack)
         inputs = runner.pack_inputs(act_pack, weight_pack)
         return runner.forward(inputs, tactic=tactic, **runner.launch_kwargs_for(inputs))
 
