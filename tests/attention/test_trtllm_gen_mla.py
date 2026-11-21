@@ -2963,7 +2963,12 @@ def test_trtllm_mla_blackwell_padded_rows_output_zero(
 
         num_sms = get_device_sm_count(torch.device("cuda"))
         one_split = plan_num_split(len(rows), max_len, num_sms) == 1
-        assert one_split == case.endswith("one_split")
+        if case.endswith("one_split"):
+            assert one_split
+        elif num_sms >= 148:
+            # The other sizes split on full B200 / GB300 parts; a part with
+            # fewer SMs (a MIG slice) may plan one split for them.
+            assert not one_split
     reference = _blackwell_rows_reference(
         query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size, sinks
     )
