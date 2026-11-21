@@ -173,6 +173,17 @@ def _decode_num_chunks(
     return max(1, min(pow2, topk))
 
 
+# Backends of msa_sparse_decode_attention, named for what each one IS:
+# "cake" = the Cake-generated CUDA programs (all Blackwell classes and the
+# Cake-served SM90 classes), "cutedsl" = the CuTe-DSL kernels (SM120/SM121
+# and the CuTe-served SM90 classes), "specialized" = the agent-generated
+# SM103 CUDA kernel. "auto" (the default) only SELECTS among the named
+# backends — specialized on its allowlist, otherwise the stock
+# per-architecture/per-class selection among cake and cutedsl — and
+# carries no behavior of its own. Explicit backends are never swapped.
+MSA_SPARSE_DECODE_BACKENDS = ("auto", "specialized", "cake", "cutedsl")
+
+
 @flashinfer_api(trace=msa_sparse_decode_attention_trace)
 def msa_sparse_decode_attention(
     q: torch.Tensor,
@@ -196,6 +207,7 @@ def msa_sparse_decode_attention(
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
     out: Optional[torch.Tensor] = None,
+    backend: str = "auto",
 ):
     """Sparse decode attention for SM100/SM103/SM107 and SM120/SM121 GPUs.
 
@@ -302,11 +314,32 @@ def msa_sparse_decode_attention(
         being copied into, because a silent copy here is precisely the cost
         this parameter exists to remove.
 
-        Supported by the packed-NVFP4 paged-KV route on compute capability
-        10.0/10.3/10.7 and by the compute capability 9.0 route. Every other
-        route raises ``NotImplementedError`` when it is passed -- before any
-        device query, so a host tensor gets the same answer -- deliberately, so
-        that a caller cannot be handed the copy back without being told.
+        Supported by the SM103 specialized route (16-byte aligned, with no
+        overlap between the destination and any input), the packed-NVFP4
+        paged-KV route on compute capability 10.0/10.3/10.7, and the compute
+        capability 9.0 route. Off the specialized allowlist, ``"auto"`` uses
+        the stock route's ``out`` contract.
+
+    backend : str
+        One of ``("auto", "specialized", "cake", "cutedsl")``, each named
+        for what it is. ``"cake"`` is the Cake-generated CUDA programs:
+        every Blackwell class, and (under ``"auto"``) the Cake-served SM90
+        classes. ``"cutedsl"`` is the CuTe-DSL kernels: SM120/SM121, and
+        (under ``"auto"``) the CuTe-served SM90 classes. ``"specialized"``
+        is an agent-generated SM103 kernel serving a strict allowlist --
+        bf16 Q, paged fp8 E4M3 KV, 16:1 head group, head_dim 128, page
+        128, topk 16, ``seqlen_q`` 1, causal, default scale -- and also
+        honours ``out=``. ``"auto"`` (the default) only selects among the
+        named backends: specialized on its allowlist, otherwise the stock
+        per-architecture (and, on SM90, per-class) selection between cake
+        and cutedsl. An explicitly selected backend is never silently
+        swapped: ``"specialized"`` raises when it cannot serve the call,
+        and explicit ``"cake"``/``"cutedsl"`` raise on devices where that
+        implementation does not serve this entry (SM90's per-class mix is
+        reachable through ``"auto"`` only). Kill switch:
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``. (The former
+        ``"native"`` name is REMOVED: it labeled an arch dispatch, not an
+        implementation.)
 
     Returns
     -------
@@ -316,7 +349,65 @@ def msa_sparse_decode_attention(
         ``return_softmax_lse``. When ``out`` is given it IS the returned
         tensor.
     """
-    if is_blackwell_msa_device(q.device):
+    if backend not in MSA_SPARSE_DECODE_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {MSA_SPARSE_DECODE_BACKENDS}, got {backend!r}"
+        )
+    # "specialized" backend: an agent-generated kernel for the bf16-Q /
+    # fp8-E4M3 paged-KV single-token decode contract
+    # (flashinfer/msa_sparse_decode_fp8kv_cuda.py). backend="auto" selects
+    # it only on its strict allowlist; explicitly selected backends are
+    # never swapped; kill switch: FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1.
+    if backend in ("auto", "specialized"):
+        from ..msa_sparse_decode_fp8kv_cuda import (
+            maybe_dispatch_specialized as _mds,
+        )
+
+        _specialized_out = _mds(
+            backend=backend,
+            q=q,
+            k=k,
+            v=v,
+            q2k_indices=q2k_indices,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            softmax_scale=softmax_scale,
+            out=out,
+            extras=dict(
+                seqlen_q=seqlen_q,
+                causal=causal,
+                return_softmax_lse=return_softmax_lse,
+                cu_seqlens_k=cu_seqlens_k,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                k_global_scale=k_global_scale,
+                v_global_scale=v_global_scale,
+                q_offset=q_offset,
+                partial_dtype=partial_dtype,
+                force_fused=force_fused,
+                workspace=workspace,
+            ),
+        )
+        if _specialized_out is not None:
+            return _specialized_out
+    if backend == "cake" and not is_blackwell_msa_device(q.device):
+        raise ValueError(
+            "backend='cake' serves this entry's Blackwell classes; the "
+            "Cake-served SM90 classes are selected through backend='auto' "
+            "only (the SM90 dispatch is per-class). An explicitly selected "
+            "backend is never silently swapped."
+        )
+    if backend == "cutedsl":
+        from ..utils import is_sm12x_supported as _is_sm12x
+
+        if not _is_sm12x(q.device):
+            raise ValueError(
+                "backend='cutedsl' serves this entry on SM120/SM121; the "
+                "CuTe-served SM90 classes are selected through "
+                "backend='auto' only. An explicitly selected backend is "
+                "never silently swapped."
+            )
+    if backend != "cutedsl" and is_blackwell_msa_device(q.device):
         return blackwell_msa_sparse_decode_attention(
             q,
             k,
@@ -353,7 +444,8 @@ def msa_sparse_decode_attention(
     if out is not None and not sm90:
         raise NotImplementedError(
             "out= is implemented by the compute capability 10.0/10.3/10.7 "
-            "packed-NVFP4 paged-KV decode route and on SM90; the SM120/SM121 "
+            "packed-NVFP4 paged-KV decode route, the SM103 specialized route, "
+            "and on SM90; the SM120/SM121 "
             "backend allocates its own output"
         )
     if not (sm90 or is_sm12x_supported(q.device)):
