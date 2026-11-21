@@ -13,6 +13,23 @@ are ``128 x D`` bf16 (16 / 32 / 64 KB at D = 64 / 128 / 256), so the ring takes 
 the merged chunk state ``O_m`` in a per-CTA global scratch (``om_in_tmem(D)``: 128 + 64 + 2 D <= 512), as the TS body's
 two-tile build places it. The same blocks compute every D: the numerics never see the placement.
 
+D = 512 exceeds three per-CTA budgets at once, and the body splits the head dim instead of the class:
+
+* TMEM: a 512-column ``O`` accumulator is every column of a 512-column part, so a CTA accumulates one ``O_PART_DIMS`` = 256-column
+  half of ``O`` (``plan.o_parts``: the planner emits one work unit per half) in the D = 256 plan ``O_c (256) | S_0 | S_1``; both units
+  compute the tile's scores and softmax (the same instructions on the same operands) and each folds ``P V`` over its own half of
+  ``V`` -- the ``128 x 256 x 16`` instruction of D = 256, which is also the widest ``tcgen05.mma`` N;
+* shared memory: a Q stage is ``128 x 512`` bf16 = 128 KB (the A operand of QK^T is 128 rows whatever the unit holds), which leaves
+  under 100 KB of a 228 KB part and under 200 KB of a 328 KB part for the ring and the payloads, against 128 KB for one K tile. A
+  ring slot therefore holds a whole tile's keys over ``Ds`` of the head dims (``slot_geometry``): QK^T takes a tile's K as
+  ``512 / Ds`` consecutive slots (the dims ascending: the 32 K-steps of the score fold in order on one S accumulator, the
+  accumulate bit off on the first only), PV takes the unit's half of V as ``256 / Ds`` slots, slot ``i`` folded into columns
+  ``[i Ds, (i + 1) Ds)`` of the accumulator by a ``128 x Ds x 16`` instruction per key step. Two slots of ``Ds = 256`` (64 KB)
+  on a 328 KB part; two of ``Ds = 128`` (32 KB) on a 228 KB part, where every instruction is the ``128 x 128 x 16`` one (48 per
+  tile; half-tile slots of 256 dims would issue 72, and the MMA warp's issue rate binds);
+* the Q stage is addressed by the MMA as ``512 / Ds`` stages of ``Ds`` dims (the same bytes the producer fills as eight 64-wide
+  boxes).
+
 Built at trace time (inside the ``@cute.jit`` entry point) because the CuTe layout algebra needs
 the MLIR context; the results are plain attributes the kernel reads as constants.
 
@@ -31,8 +48,8 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode, OperandSource
 
+from ..plan import O_PART_DIMS, o_parts, ws_row
 from ..plan import om_in_tmem as _om_in_tmem
-from ..plan import ws_row
 from ..spec import MMA_K, TILE_KEYS, tiles_per_chunk
 
 ACC_DTYPE = cutlass.Float32
@@ -40,7 +57,12 @@ IN_DTYPE = cutlass.BFloat16
 HALF = 64  # d elements per TMA box / per SW128 half of a tile (128 bytes of bf16)
 Q_ROWS = 128  # query rows per CTA tile (the MMA M)
 TMEM_COLS = 512
-HEAD_DIMS_BODY = (64, 128, 256)  # head dims this body implements (``spec.HEAD_DIMS``)
+HEAD_DIMS_BODY = (
+    64,
+    128,
+    256,
+    512,
+)  # head dims this body implements (``spec.HEAD_DIMS``)
 RING_BYTES = (
     128 << 10
 )  # K/V bytes in flight per CTA at every D: 512 / D ring slots of 128 x D bf16
@@ -54,9 +76,29 @@ def slot_bytes(D: int) -> int:
 
 def max_kv_slots(D: int) -> int:
     """The deepest ring at ``D``: ``RING_BYTES`` of K/V in flight (8 / 4 / 2 slots at D = 64 / 128 / 256); ``RLK_RING_BYTES`` raises the
-    budget where the part's shared memory allows it (sm_107: 328 KB per CTA)."""
-
+    budget where the part's shared memory allows it (sm_107: 328 KB per CTA). At D = 512 the ring is two slots of the part's slot
+    geometry (``slot_geometry``): what fits next to the 128 KB Q stage."""
+    if D > O_PART_DIMS:
+        return 2
     return RING_BYTES // slot_bytes(D)
+
+
+def part_dims(D: int) -> int:
+    """Head dims per ring slot, per MMA-addressed Q stage and per ``O`` accumulator: ``D`` up to ``O_PART_DIMS``, 256 at D = 512."""
+    return min(D, O_PART_DIMS)
+
+
+def slot_geometry(D: int, cap: int) -> tuple:
+    """``(keys, dims)`` of a ring slot: a whole tile of the whole head dim up to D = 256. At D = 512 a whole tile's 256-dim half
+    (64 KB) when two of them fit next to the Q stage and the payloads under the part's capacity ``cap``, else a whole tile's
+    128-dim quarter (32 KB): every QK^T instruction keeps N = 128 and PV becomes two ``128 x 128 x 16`` instructions per key step
+    into the two column halves of the accumulator. A placement: the slots carry the same operands of the same per-element folds."""
+    if D <= O_PART_DIMS:
+        return TILE_KEYS, D
+    half = TILE_KEYS * part_dims(D) * 2
+    if slot_bytes(D) + 2 * half + (24 << 10) <= max(SMEM_CAP, cap):
+        return TILE_KEYS, part_dims(D)
+    return TILE_KEYS, part_dims(D) // 2
 
 
 def valid_kv_slots(D: int) -> tuple:
@@ -200,6 +242,12 @@ class StaticPlan:
         have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
         self.hw_rowmax = hw_rowmax
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
+        # the head dim's parts (module docstring): Dk columns per O accumulator, o_parts work units per Q tile (the unit's part is a
+        # runtime descriptor field); set with the ring slot's geometry below: Ds dims per ring slot and per MMA-addressed Q stage,
+        # qk_parts slots of K per key range of QK^T, pv_parts slots of V (and PV instructions) per key step of a unit
+        self.Dk = part_dims(D)
+        self.o_parts = o_parts(D)
+        assert self.o_parts == 1 or not q2, D
         # the mask mode (a class dimension): causal rows see [0, p], or [max(0, p - window_left), p] with a window (window_left >= 0),
         # non-causal rows see every key of the request, [0, kv_len). A compile-time constant: the softmax masks and the fold's present chunks read it, the causal code is unchanged
         self.causal = causal
@@ -282,16 +330,20 @@ class StaticPlan:
         self.stats_slots = STATS_SLOTS_PP if q2 else STATS_SLOTS
         # ring slots: a whole KV tile (T keys) at every D (SLOT_KEYS_256: the half-tile slots of D = 256 were a placement that cost more
         # MMA issue than they saved in load latency); the code keeps the general slots_per_tile form
-        self.slot_keys = SLOT_KEYS_256 if D == 256 else self.T
+        self.slot_keys, self.Ds = slot_geometry(D, self.cap)
+        self.qk_parts = D // self.Ds
+        self.pv_parts = self.Dk // self.Ds
         self.slots_per_tile = self.T // self.slot_keys
         self.n_slots = (
-            kv_slots * self.slots_per_tile
-        )  # physical ring slots (kv_slots counts whole-tile equivalents)
+            kv_slots * self.slots_per_tile if D <= O_PART_DIMS else kv_slots
+        )  # physical ring slots (kv_slots counts whole-tile equivalents; the slots themselves at D = 512)
         self.box_rows = min(page, self.slot_keys)  # keys per TMA box
         self.boxes_per_slot = self.slot_keys // self.box_rows  # per 64-wide half
         self.boxes_per_tile = self.T // self.box_rows
-        self.halves = D // HALF
+        self.halves = self.Ds // HALF  # 64-wide boxes per ring slot
+        self.q_halves = D // HALF  # 64-wide boxes per Q tile
         self.d_steps = D // MMA_K
+        self.d_steps_part = self.Ds // MMA_K  # QK^T K-steps per ring slot of K
         self.k_steps = self.T // MMA_K
         self.k_steps_per_slot = self.slot_keys // MMA_K
         self.tpc = tiles_per_chunk(D)  # tiles per chunk
@@ -328,26 +380,41 @@ class StaticPlan:
             OperandMajorMode.MN,
             ACC_DTYPE,
             cta_group,
-            (Q_ROWS, D),
+            (Q_ROWS, self.Dk),
             OperandSource.TMEM,
         )
-        self.qk_tiler = (Q_ROWS, self.T, D)
-        self.qks_tiler = (Q_ROWS, self.slot_keys, D)
-        self.pv_tiler = (Q_ROWS, D, self.T)
-        self.pvs_tiler = (Q_ROWS, D, self.slot_keys)
+        # the PV instruction actually issued: N = Ds (the same as above unless a ring slot holds part of the accumulator's dims)
+        self.pvs_tiled_mma = (
+            self.pv_tiled_mma
+            if self.pv_parts == 1
+            else utils.sm100.make_trivial_tiled_mma(
+                IN_DTYPE,
+                IN_DTYPE,
+                OperandMajorMode.K,
+                OperandMajorMode.MN,
+                ACC_DTYPE,
+                cta_group,
+                (Q_ROWS, self.Ds),
+                OperandSource.TMEM,
+            )
+        )
+        self.qk_tiler = (Q_ROWS, self.T, self.Ds)
+        self.qks_tiler = (Q_ROWS, self.slot_keys, self.Ds)
+        self.pv_tiler = (Q_ROWS, self.Dk, self.T)
+        self.pvs_tiler = (Q_ROWS, self.Ds, self.slot_keys)
         self.q_stages = q_stages_for(D, q2)
         self.q_tiles = (
             self.q_stages * self.n_q
         )  # Q tiles in smem: stage s holds tiles n_q s .. n_q s + n_q - 1
         self.ws_row = ws_row(D)  # fp32 per partial row of the split workspace
         self.q_smem_layout = utils.sm100.make_smem_layout_a(
-            self.qks_tiled_mma, self.qks_tiler, IN_DTYPE, self.q_tiles
-        )
+            self.qks_tiled_mma, self.qks_tiler, IN_DTYPE, self.q_tiles * self.qk_parts
+        )  # MMA stage ``tile * qk_parts + part``: dims [part Ds, (part + 1) Ds) of Q tile ``tile``
         self.k_smem_layout = utils.sm100.make_smem_layout_b(
             self.qks_tiled_mma, self.qks_tiler, IN_DTYPE, self.n_slots
         )  # (slot_keys x D) per slot
         self.v_smem_layout = utils.sm100.make_smem_layout_b(
-            self.pv_tiled_mma, self.pvs_tiler, IN_DTYPE, self.n_slots
+            self.pvs_tiled_mma, self.pvs_tiler, IN_DTYPE, self.n_slots
         )  # (D x slot_keys) per slot
         self.p_tmem_layout = utils.sm100.make_smem_layout_a(
             self.pv_tiled_mma, self.pv_tiler, IN_DTYPE, 1
@@ -355,7 +422,7 @@ class StaticPlan:
         k_one = cute.select(self.k_smem_layout, mode=[0, 1, 2])
         v_one = cute.select(self.v_smem_layout, mode=[0, 1, 2])
         self.kv_slot_elems = cute.cosize(k_one)
-        assert cute.cosize(v_one) == self.kv_slot_elems == self.slot_keys * D, (
+        assert cute.cosize(v_one) == self.kv_slot_elems == self.slot_keys * self.Ds, (
             cute.cosize(v_one),
             self.kv_slot_elems,
         )
@@ -397,7 +464,7 @@ class StaticPlan:
             self.swizzle,
             0,
             cute.make_layout(
-                (HALF, g, self.tokens_per_tile, self.halves, self.q_tiles),
+                (HALF, g, self.tokens_per_tile, self.q_halves, self.q_tiles),
                 stride=(1, HALF, HALF * g, Q_ROWS * HALF, self.q_tile_elems),
             ),
         )
@@ -420,7 +487,7 @@ class StaticPlan:
                     g,
                     self.tokens_rep,
                     Q_ROWS // REP_ROWS,
-                    self.halves,
+                    self.q_halves,
                     self.q_tiles,
                 ),
                 stride=(
@@ -470,7 +537,7 @@ class StaticPlan:
             self.s_stages = 2
             self.qk_ahead = 2  # the MMA warp issues QK two tiles ahead of PV (K two tiles ahead in the ring)
             self.tmem_oc = 0
-            self.tmem_s = D
+            self.tmem_s = self.Dk
             self.tmem_s_stride = self.T  # columns between the S stages (P_k = S_k + 0)
             self.tmem_p = self.tmem_s
             self.tmem_om = None
@@ -493,11 +560,14 @@ class StaticPlan:
             self.tmem_p == self.tmem_s
         )  # P shares its S stage's columns: the P store must follow EVERY S load of the tile
         assert (
-            cute.cosize(cute.select(self.q_smem_layout, mode=[0, 1, 2]))
+            cute.cosize(cute.select(self.q_smem_layout, mode=[0, 1, 2])) * self.qk_parts
             == self.q_tile_elems
         )
-        self.q_bytes = cute.size_in_bytes(
-            IN_DTYPE, cute.select(self.q_smem_layout, mode=[0, 1, 2])
+        self.q_bytes = (
+            cute.size_in_bytes(
+                IN_DTYPE, cute.select(self.q_smem_layout, mode=[0, 1, 2])
+            )
+            * self.qk_parts
         )  # the whole stage (128 rows)
         self.q_bytes_full = (
             self.rows_per_tile * D * 2

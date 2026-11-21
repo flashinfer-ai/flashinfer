@@ -24,6 +24,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ....batch_invariant import canon
 from ..plan import (
+    O_PART_DIMS,
+    F_OPART,
     F_CHUNK_HI,
     F_CHUNK_LO,
     F_GROUP,
@@ -73,7 +75,7 @@ def tmem_views(
     tStS = cute.make_tensor(
         tmem_ptr + st.tmem_s, qk_thr_mma.make_fragment_C(s_shape).layout
     )
-    o_shape = pv_thr_mma.partition_shape_C((Q_ROWS, st.D))
+    o_shape = pv_thr_mma.partition_shape_C((Q_ROWS, st.Dk))
     o_layout = pv_thr_mma.make_fragment_C(o_shape).layout
     tOtOc = cute.make_tensor(tmem_ptr + st.tmem_oc, o_layout)
     tOtOm = None
@@ -183,6 +185,7 @@ class AttentionKernel:
             st.qk_tiled_mma,
             st.qks_tiled_mma,
             st.pv_tiled_mma,
+            st.pvs_tiled_mma,
             st.q_smem_layout,
             st.q_view_layout,
             st.q_view_rep_layout,
@@ -225,6 +228,7 @@ class AttentionKernel:
         qk_tiled_mma: cute.TiledMma,
         qks_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
+        pvs_tiled_mma: cute.TiledMma,
         q_smem_layout: cute.ComposedLayout,
         q_view_layout: cute.ComposedLayout,
         q_view_rep_layout: cute.ComposedLayout,
@@ -355,11 +359,12 @@ class AttentionKernel:
         qk_thr_mma = qk_tiled_mma.get_slice(0)
         qks_thr_mma = qks_tiled_mma.get_slice(0)
         pv_thr_mma = pv_tiled_mma.get_slice(0)
+        pvs_thr_mma = pvs_tiled_mma.get_slice(0)
         tSrQ = qks_thr_mma.make_fragment_A(sQ)  # (MMA, MMA_M, MMA_K, Q_STAGE)
         tSrK = qks_thr_mma.make_fragment_B(
             sK
         )  # (MMA, MMA_N, MMA_K, SLOT): one ring slot of K
-        tOrV = pv_thr_mma.make_fragment_B(
+        tOrV = pvs_thr_mma.make_fragment_B(
             sV
         )  # (MMA, MMA_N, MMA_K, SLOT): one ring slot of V (K = slot_keys)
         pipeline_init_wait()
@@ -405,6 +410,9 @@ class AttentionKernel:
                     )
             if cutlass.const_expr(not st.q2):
                 for u in range(bidx, num_units, grid_size):
+                    o_part = None  # the unit's output part (D = 512: its half of V)
+                    if cutlass.const_expr(st.o_parts > 1):
+                        o_part = mDesc[(u, F_OPART)]
                     q_prod, kv_prod = load_loop(
                         st,
                         atom_q,
@@ -428,6 +436,7 @@ class AttentionKernel:
                         mDesc[(u, F_ROWS)],
                         mDesc[(u, F_TILE_LO)],
                         mDesc[(u, F_TILE_HI)],
+                        o_part,
                     )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
@@ -444,6 +453,13 @@ class AttentionKernel:
             tStS_slots = tuple(
                 cute.make_tensor(tmem_ptr + st.tmem_s + sl * st.slot_keys, ss_layout)
                 for sl in range(st.slots_per_tile)
+            )
+            # the O accumulator per PV instruction: the whole O_c, or its Ds-column parts when a ring slot of V holds Ds < Dk dims
+            op_shape = pvs_thr_mma.partition_shape_C((Q_ROWS, st.Ds))
+            op_layout = pvs_thr_mma.make_fragment_C(op_shape).layout
+            tOtOc_parts = tuple(
+                cute.make_tensor(tmem_ptr + st.tmem_oc + vp * st.Ds, op_layout)
+                for vp in range(st.pv_parts)
             )
             qk_low = canon.BlockedFold(
                 "dstep", st.d_steps
@@ -511,15 +527,15 @@ class AttentionKernel:
                         p_cons,
                         o_prod,
                         qks_tiled_mma,
-                        pv_tiled_mma,
+                        pvs_tiled_mma,
                     ) = mma_loop(
                         st,
                         qks_tiled_mma,
-                        pv_tiled_mma,
+                        pvs_tiled_mma,
                         qk_low,
                         pv_low,
                         tStS_slots,
-                        tOtOc,
+                        tOtOc_parts,
                         tOrP,
                         tmem_ptr,
                         tSrQ,
@@ -690,6 +706,9 @@ class AttentionKernel:
                         )
             if cutlass.const_expr(not st.q2):
                 for u in range(bidx, num_units, grid_size):
+                    o_off = 0  # the first head-dim column of the unit's output part
+                    if cutlass.const_expr(st.o_parts > 1):
+                        o_off = mDesc[(u, F_OPART)] * O_PART_DIMS
                     o_cons, stats_cons = correction_loop(
                         st,
                         pv_thr_mma,
@@ -717,6 +736,7 @@ class AttentionKernel:
                         mDesc[(u, F_TILE_HI)],
                         mDesc[(u, F_MODE)],
                         mDesc[(u, F_SLOT)],
+                        o_off,
                     )
                     fold_group(
                         st,
