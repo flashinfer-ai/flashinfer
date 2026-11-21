@@ -438,7 +438,7 @@ template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD, bool UE8M0_SF,
           bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt_warp_fp16_to_fp4(
     PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, float SFScaleVal, uint8_t* SFout,
-    float rowAmax = 0.0f) {
+    float rowAmax = 0.0f, uint32_t activeMask = 0xffffffffu) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
@@ -462,12 +462,16 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   }
 
   constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
+  // The enclosing row loop may leave trailing lanes of a warp inactive, and the
+  // inactive tail can change between grid-stride iterations. The caller derives
+  // activeMask from the loop predicate; all lanes of an SF group must enter the
+  // loop together so every reduction partner is named in the mask.
   // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
   if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    localMax = cuda_max(__shfl_xor_sync(activeMask, localMax, 1), localMax);
   }
   if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+    localMax = cuda_max(__shfl_xor_sync(activeMask, localMax, 2), localMax);
   }
   // Get the final absolute maximum values.
   float vecMax = float(cuda_max(localMax.x, localMax.y));
@@ -518,6 +522,14 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   }
 
   if constexpr (!UE8M0_SF && IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
+    // A zero SF group returns below and stops executing warp reductions. Both
+    // lanes of an SF group share vecMax, so they return together. Ballot while
+    // every loop-active lane is still here to get the mask of groups that stay;
+    // the error reduction below must name exactly those lanes.
+    uint32_t errorMask = activeMask;
+    if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
+      errorMask = __ballot_sync(activeMask, vecMax != 0.0f);
+    }
     if (vecMax == 0.0f) {
       if (SFout) {
         *SFout = 0;
@@ -647,12 +659,12 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     }
 
     if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-      error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 1));
-      error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 1));
+      error4 = __fadd_rn(error4, __shfl_xor_sync(errorMask, error4, 1));
+      error6 = __fadd_rn(error6, __shfl_xor_sync(errorMask, error6, 1));
     }
     if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-      error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 2));
-      error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));
+      error4 = __fadd_rn(error4, __shfl_xor_sync(errorMask, error4, 2));
+      error6 = __fadd_rn(error6, __shfl_xor_sync(errorMask, error6, 2));
     }
 
     if (error4 < error6) {
@@ -871,7 +883,7 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
 // Quantizes the provided PackedVec into the uint64_t (8 e4m3) or uint4 (16 e4m3) output.
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
 __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
-    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout) {
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout, uint32_t activeMask = 0xffffffffu) {
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t>;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
@@ -886,12 +898,16 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
   }
 
   constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / CVT_ELTS_PER_THREAD;
+  // The enclosing row loop may leave trailing lanes of a warp inactive, and the
+  // inactive tail can change between grid-stride iterations. The caller derives
+  // activeMask from the loop predicate; all lanes of an SF group must enter the
+  // loop together so every reduction partner is named in the mask.
   // Get the absolute maximum among all 16 values (two threads for 16, four threads for 32).
   if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 1), localMax);
+    localMax = cuda_max(__shfl_xor_sync(activeMask, localMax, 1), localMax);
   }
   if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
-    localMax = cuda_max(__shfl_xor_sync(uint32_t(-1), localMax, 2), localMax);
+    localMax = cuda_max(__shfl_xor_sync(activeMask, localMax, 2), localMax);
   }
   // Get the final absolute maximum values.
   float vecMax = float(cuda_max(localMax.x, localMax.y));
