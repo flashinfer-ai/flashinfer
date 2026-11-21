@@ -33,7 +33,10 @@ def _to_tensor_scalar_tuple(
     x: Union[torch.Tensor, float, int],
 ) -> Tuple[Optional[torch.Tensor], Union[float, int]]:
     if isinstance(x, torch.Tensor):
-        return (x, 0 if x.dtype == torch.int32 else 0.0)
+        # The scalar is unused when a tensor is given, but it still crosses the
+        # FFI boundary. An int converts to both the integer (top_k) and the
+        # floating-point (top_p, min_p) kernel parameters; a float only to the latter.
+        return (x, 0)
     else:
         return (None, x)
 
