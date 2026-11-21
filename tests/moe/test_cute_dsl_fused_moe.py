@@ -83,7 +83,7 @@ def _skip_sm107_unimplemented_moe_features(request):
     ``fused_moe/cute_dsl/rubin/`` holds a narrower specialisation of the
     Blackwell kernels rather than a port of them: the gather kernel implements
     SwiGLU (including its SiTU variant and a clamp limit) and Relu2 but not
-    GeGLU-tanh or custom SwiGLU alpha/beta constants, and its wrapper has no
+    GeGLU-tanh, and its wrapper has no
     ``a_per_token_scale_ptr``. The wrappers raise ``NotImplementedError`` for
     these cases, which is correct behaviour -- but on Rubin it reports as a
     test failure on every CI sweep, for features the kernels were never built
@@ -3114,11 +3114,6 @@ class TestCuteDslFusedMoeFunctional:
         """Test functional API with autotune context."""
         if swap_ab and is_sm107():
             pytest.skip("swap_ab requires Blackwell SM100 or SM103")
-        if is_sm107() and quant_mode == "w4a4":
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta)"
-            )
         from flashinfer import autotune
         from flashinfer import cute_dsl_fused_moe
         from flashinfer.autotuner import AutoTuner
@@ -3176,13 +3171,18 @@ class TestCuteDslFusedMoeFunctional:
             assert_w4a16_bits(result, reference)
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
-    def test_swiglu_oai_accuracy(self, quant_mode: str):
+    @pytest.mark.parametrize(
+        "swiglu_alpha,swiglu_beta,swiglu_limit",
+        [(1.702, 1.0, 7.0), (1.702, 0.0, 0.1), (1.0, 1.0, 0.1)],
+    )
+    def test_swiglu_oai_accuracy(
+        self,
+        quant_mode: str,
+        swiglu_alpha: float,
+        swiglu_beta: float,
+        swiglu_limit: float,
+    ):
         """Accuracy test for the OAI SwiGLU epilogue variant."""
-        if is_sm107() and quant_mode == "w4a4":
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta)"
-            )
         from flashinfer import cute_dsl_fused_moe
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
@@ -3212,9 +3212,9 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             top_k=top_k,
             activation_type=ActivationType.Swiglu,
-            swiglu_alpha=1.702,
-            swiglu_beta=1.0,
-            swiglu_limit=7.0,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
             quant_mode=quant_mode,
             **api_inputs,
@@ -3231,9 +3231,9 @@ class TestCuteDslFusedMoeFunctional:
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             activation_type=ActivationType.Swiglu,
-            swiglu_alpha=1.702,
-            swiglu_beta=1.0,
-            swiglu_limit=7.0,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             **reference_inputs,
         )
 
@@ -3409,11 +3409,6 @@ class TestCuteDslMoEWrapper:
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_wrapper_swiglu_oai_accuracy(self, quant_mode: str):
         """Accuracy test for wrapper API with OAI SwiGLU."""
-        if is_sm107() and quant_mode == "w4a4":
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta)"
-            )
         from flashinfer import CuteDslMoEWrapper
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
@@ -3492,11 +3487,6 @@ class TestCuteDslMoEWrapper:
         swap_ab: bool,
     ):
         """Test wrapper API with CUDA graph capture and replay."""
-        if is_sm107() and quant_mode == "w4a4":
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta)"
-            )
         from flashinfer import CuteDslMoEWrapper
 
         hidden_size, intermediate_size = 256, 512
@@ -3790,11 +3780,6 @@ class TestCuteDslMoEWrapper:
     def test_cuda_graph_wrapper_lifetime_after_autotune(self):
         """Dropped CUDA graph wrappers should not wait for cyclic GC,
         even after autotune profiling has populated the autotuner cache."""
-        if is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
-                "SwiGLU constants (swiglu_alpha/beta)"
-            )
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
         from flashinfer.autotuner import AutoTuner
@@ -6022,6 +6007,142 @@ def test_cute_dsl_pinned_recipe_matches_env(
         assert not torch.equal(env_on[leg], env_off[leg])
         assert torch.equal(pinned_under_env_off[leg], env_on[leg])
         assert torch.equal(none_under_env_on[leg], env_off[leg])
+
+
+def _make_swiglu_parameter_sensitivity_case(scale=1.0):
+    # Exact representable NVFP4 operands isolate parameter plumbing from weight
+    # quantization noise. x=6, gate weight=6, up weight=12; expert scale gives
+    # gate 0.5 or 1.0, where sigmoid alpha changes the result substantially.
+    from flashinfer.fp4_quantization import fp4_quantize
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+    from flashinfer.fused_moe.prepare import _cute_dsl_gated_weight_group_size
+    from tests.moe.utils import interleave_linear_and_gate, _fp4_quantize_per_expert
+
+    experts, hidden, intermediate, tokens = 256, 256, 512, 128
+    x = torch.zeros((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+    x[:, 0] = 6.0
+    w1 = torch.zeros(
+        (experts, 2 * intermediate, hidden), device="cuda", dtype=torch.bfloat16
+    )
+    w1[:, :intermediate, 0] = 12.0
+    w1[:, intermediate:, 0] = 6.0
+    w2 = torch.zeros(
+        (experts, hidden, intermediate), device="cuda", dtype=torch.bfloat16
+    )
+    w2[:, 0, 0] = 6.0
+    one = torch.ones(1, device="cuda")
+    xq, xsf = fp4_quantize(
+        x, global_scale=one, sf_vec_size=16, is_sf_swizzled_layout=False
+    )
+    interleaved = interleave_linear_and_gate(
+        w1,
+        group_size=_cute_dsl_gated_weight_group_size(w1.device, swap_ab=False),
+        dim=1,
+    )
+    w1q, sf1 = _fp4_quantize_per_expert(interleaved, one, 16)
+    sf1 = convert_sf_to_mma_layout(
+        sf1, m=2 * intermediate, k=hidden, num_groups=experts, sf_vec_size=16
+    )
+    w2q, sf2 = fp4_quantize(
+        w2.view(experts * hidden, intermediate),
+        global_scale=one,
+        sf_vec_size=16,
+        is_sf_swizzled_layout=True,
+    )
+    sf2 = convert_sf_to_mma_layout(
+        sf2, m=hidden, k=intermediate, num_groups=experts, sf_vec_size=16
+    )
+    tensors = dict(
+        x=xq,
+        x_sf=xsf.unsqueeze(-1),
+        x_bf16=x,
+        x_ref=x.float(),
+        x_per_token_scale=None,
+        token_selected_experts=torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        .expand(tokens, 2)
+        .contiguous(),
+        token_final_scales=torch.full((tokens, 2), 0.5, device="cuda"),
+        w1_weight=w1q,
+        w1_weight_sf=sf1,
+        w1_weight_bf16=w1,
+        w1_alpha=torch.full((experts,), float(scale) / 72.0, device="cuda"),
+        w2_weight=w2q.view(experts, hidden, intermediate // 2),
+        w2_weight_sf=sf2,
+        w2_weight_bf16=w2,
+        w2_alpha=torch.ones(experts, device="cuda"),
+        fc2_input_scale=one,
+    )
+    api, ref = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
+    common = dict(
+        token_selected_experts=tensors["token_selected_experts"],
+        token_final_scales=tensors["token_final_scales"],
+        num_experts=experts,
+        top_k=2,
+        activation_type=ActivationType.Swiglu,
+    )
+    inputs = dict(
+        common,
+        **api,
+        **{
+            k: tensors[k]
+            for k in [
+                "w1_weight",
+                "w1_weight_sf",
+                "w1_alpha",
+                "w2_weight",
+                "w2_weight_sf",
+                "w2_alpha",
+            ]
+        },
+        quant_mode="w4a4",
+        use_fused_finalize=True,
+    )
+    reference = dict(
+        common,
+        **ref,
+        num_tokens=tokens,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+    )
+    return tensors, inputs, reference
+
+
+@cute_dsl_available
+@sm10x_required
+@_requires_dsl_arch
+@pytest.mark.parametrize("scale", [1.0, 2.0])
+@pytest.mark.parametrize(
+    "alpha,beta,limit,omit",
+    [
+        (1.702, 0.0, 7.0, "alpha"),
+        (1.0, 1.0, 0.1, "beta"),
+        (1.702, 1.0, 7.0, "alpha"),
+        (1.702, 1.0, 7.0, "beta"),
+    ],
+)
+def test_swiglu_parameter_sensitivity(scale, alpha, beta, limit, omit):
+    from flashinfer import cute_dsl_fused_moe
+
+    tensors, inputs, ref_kwargs = _make_swiglu_parameter_sensitivity_case(scale)
+    correct = dict(swiglu_alpha=alpha, swiglu_beta=beta, swiglu_limit=limit)
+    wrong = dict(correct)
+    wrong["swiglu_" + omit] = 1.0 if omit == "alpha" else 0.0
+    expected = _compute_moe_quant_mode_reference(
+        tensors, "w4a4", **ref_kwargs, **correct
+    )
+    good = cute_dsl_fused_moe(**inputs, **correct).float()
+    bad = cute_dsl_fused_moe(**inputs, **wrong).float()
+    torch.cuda.synchronize()
+    assert expected.float().norm().item() > 0, (
+        "Negative-control reference must have nonzero signal"
+    )
+    denom = expected.float().norm()
+    good_error = ((good - expected.float()).norm() / denom).item()
+    bad_error = ((bad - expected.float()).norm() / denom).item()
+    assert good_error < 0.5 * bad_error, (
+        f"Correct NVFP4 error {good_error} must be less than half the "
+        f"error {bad_error} when {omit} is omitted"
+    )
 
 
 def _place_in_domain(domains, domain: int, tensor: torch.Tensor) -> torch.Tensor:
