@@ -19,5 +19,6 @@ if [ -z "${JIT_TEST_SCOPE:-}" ]; then
   bash tests/moe_ep/run_tests.sh unit
 fi
 pytest -s tests/attention/test_batch_decode_kernels.py
+pytest -s tests/attention/test_paged_attention_fuzz.py
 pytest -s tests/utils/test_jit_example.py
 pytest -s tests/gemm/test_group_gemm.py
