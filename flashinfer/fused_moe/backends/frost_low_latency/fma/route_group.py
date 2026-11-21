@@ -6,7 +6,7 @@ import cutlass
 from cutlass import cute
 from .bf16.fma_fc1 import _quad, _single_route_body
 from .activations import apply_activation
-from .fp4_weight import scaled_quad, weight_scale
+from .fp4_weight import accumulate_mxfp4, mxfp4_decode_scale, scaled_quad, weight_scale
 
 
 @cute.jit
@@ -24,9 +24,30 @@ def load_weight(
 ):
     word = wp[(expert * rows + row) * (width // 4) + col]
     if cutlass.const_expr(fp8_weights):
-        return _quad(word, cutlass.Float8E4M3FN)
+        return _quad(word, cutlass.Float8E4M3FN), cutlass.Float32(1.0)
     scale = weight_scale(sf[expert, row, col // (scale_block // 4)], scale_block)
-    return scaled_quad(word, scale, native, scale_block)
+    decode_scale = scale
+    if cutlass.const_expr(scale_block == 32):
+        decode_scale = mxfp4_decode_scale(scale)
+    return scaled_quad(word, decode_scale, native, scale_block), scale
+
+
+@cute.jit
+def _accumulate_mxfp4_group(
+    acc, xv, values, scale, members, column, group_size: cutlass.Constexpr
+):
+    if scale >= cutlass.Float32(2.0**126):
+        for p in cutlass.range_constexpr(group_size):
+            if members[p] >= 0:
+                for c in cutlass.range_constexpr(4):
+                    acc[p, c, column] = accumulate_mxfp4(
+                        acc[p, c, column], xv[p, c], values[c], scale
+                    )
+    else:
+        for p in cutlass.range_constexpr(group_size):
+            if members[p] >= 0:
+                for c in cutlass.range_constexpr(4):
+                    acc[p, c, column] = acc[p, c, column] + xv[p, c] * values[c]
 
 
 @cute.kernel
@@ -145,7 +166,7 @@ def _kernel(
                             for c in cutlass.range_constexpr(4):
                                 xv[p, c] = values[c]
                     for o in cutlass.range_constexpr(columns):
-                        uv = load_weight(
+                        uv, up_scale = load_weight(
                             wp,
                             sf,
                             expert,
@@ -158,7 +179,7 @@ def _kernel(
                             fp8_weights,
                         )
                         if cutlass.const_expr(gated):
-                            gv = load_weight(
+                            gv, gate_scale = load_weight(
                                 wp,
                                 sf,
                                 expert,
@@ -170,16 +191,41 @@ def _kernel(
                                 scale_block,
                                 fp8_weights,
                             )
-                        for p in cutlass.range_constexpr(group_size):
-                            if members[p] >= 0:
-                                for c in cutlass.range_constexpr(4):
-                                    up[p, c, o] = up[p, c, o] + xv[p, c] * uv[c].to(
-                                        cutlass.Float32
+                        if cutlass.const_expr(scale_block == 32 and not fp8_weights):
+                            deferred = up_scale >= cutlass.Float32(2.0**126)
+                            if cutlass.const_expr(gated):
+                                deferred = deferred | (
+                                    gate_scale >= cutlass.Float32(2.0**126)
+                                )
+                            if deferred:
+                                _accumulate_mxfp4_group(
+                                    up, xv, uv, up_scale, members, o, group_size
+                                )
+                                if cutlass.const_expr(gated):
+                                    _accumulate_mxfp4_group(
+                                        gate, xv, gv, gate_scale, members, o, group_size
                                     )
-                                    if cutlass.const_expr(gated):
-                                        gate[p, c, o] = gate[p, c, o] + xv[p, c] * gv[
-                                            c
-                                        ].to(cutlass.Float32)
+                            else:
+                                # Reuse the original normal-scale member/vector order.
+                                for p in cutlass.range_constexpr(group_size):
+                                    if members[p] >= 0:
+                                        for c in cutlass.range_constexpr(4):
+                                            up[p, c, o] = up[p, c, o] + xv[p, c] * uv[c]
+                                            if cutlass.const_expr(gated):
+                                                gate[p, c, o] = (
+                                                    gate[p, c, o] + xv[p, c] * gv[c]
+                                                )
+                        else:
+                            for p in cutlass.range_constexpr(group_size):
+                                if members[p] >= 0:
+                                    for c in cutlass.range_constexpr(4):
+                                        up[p, c, o] = up[p, c, o] + xv[p, c] * uv[c].to(
+                                            cutlass.Float32
+                                        )
+                                        if cutlass.const_expr(gated):
+                                            gate[p, c, o] = gate[p, c, o] + xv[
+                                                p, c
+                                            ] * gv[c].to(cutlass.Float32)
                 for p in cutlass.range_constexpr(group_size):
                     for o in cutlass.range_constexpr(columns):
                         u = cute.arch.warp_reduction_sum(
