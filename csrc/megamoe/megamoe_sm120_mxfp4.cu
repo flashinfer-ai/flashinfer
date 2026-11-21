@@ -73,10 +73,14 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
                                tvm::ffi::TensorView l1_scales, tvm::ffi::TensorView l2_scales,
                                tvm::ffi::Array<int64_t> offsets, tvm::ffi::Array<int64_t> dims,
                                int64_t num_tokens, double activation_clamp,
-                               tvm::ffi::Array<int64_t> gin, int64_t tokens_per_item) {
+                               tvm::ffi::Array<int64_t> gin, int64_t tokens_per_item,
+                               int64_t w13_gate_up_interleaved,
+                               int64_t scales_are_canonical,
+                               int64_t scales_are_deepgemm) {
   // dims: [num_experts, num_topk, hidden, intermediate_hidden, num_max_tokens_per_rank]
-  // l1/l2_weights: row-major packed E2M1 [EL][2I][H/2] / [EL][H][I/2] (the cake / cutedsl layout);
-  // l1/l2_scales: [EL][bytes] UE8M0 words per 16-row block and K128
+  // l1/l2_weights: packed E2M1 [EL][2I][H/2] / [EL][H][I/2], interleaved or canonical;
+  // l1/l2_scales: UE8M0 words per 16-row block and K128, canonical per-row bytes,
+  // or DeepGEMM MN-major packed UE8M0 words.
   // gin: [] (every pair P2P) or [device ncclDevComm*, ncclWindow_t, GIN rank mask, GIN contexts]
   TVM_FFI_ICHECK_EQ(offsets.size(), kNumSm120Offsets);
   TVM_FFI_ICHECK_EQ(dims.size(), 5);
@@ -154,6 +158,9 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
   a.H = hidden, a.I = inter, a.EL = experts / world, a.W = world, a.TOPK = topk, a.TCAP = capacity;
   a.rank = static_cast<int>(rank_idx);
   a.swiglu_limit = static_cast<float>(activation_clamp);
+  a.w13_gate_up_interleaved = w13_gate_up_interleaved != 0;
+  a.scales_are_canonical = scales_are_canonical != 0;
+  a.scales_are_deepgemm = scales_are_deepgemm != 0;
 
   ffi::CUDADeviceGuard device_guard(y.device().device_id);
   const int dev = y.device().device_id;
