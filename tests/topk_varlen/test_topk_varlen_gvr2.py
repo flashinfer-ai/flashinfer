@@ -633,7 +633,7 @@ def test_gvr2_family_parity_and_oracle(rows, msl_c, top_k, next_n, cr, family):
     indices, _ = _run_gvr2(
         logits, seq_lens, top_k, pre_idx, next_n=next_n, compress_ratio=cr
     )
-    _assert_family(rows, msl_c, top_k, next_n, cr, family)
+    _assert_family(rows, msl_c, top_k, next_n, cr, _b200_family(family))
     _check_varlen_rows(logits, indices, n_r, top_k)
 
 
@@ -789,7 +789,9 @@ def test_gvr2_rows_far_shorter_than_envelope(
         next_n=next_n,
         compress_ratio=cr,
     )
-    _assert_family(rows, cap_c, top_k, next_n, cr, family, hint_free=not hinted)
+    _assert_family(
+        rows, cap_c, top_k, next_n, cr, _b200_family(family), hint_free=not hinted
+    )
     _check_varlen_rows(logits, indices, n_r, top_k)
 
 
@@ -844,7 +846,16 @@ def test_gvr2_graph_replay_lengths_change_after_capture(
     with torch.cuda.stream(s):  # eager warm-up on the capturing stream
         _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw)
     torch.cuda.synchronize()
-    _assert_family(rows, cap_c, top_k, 1, 1, family, hint_free=not hinted, n_env=bound)
+    _assert_family(
+        rows,
+        cap_c,
+        top_k,
+        1,
+        1,
+        _b200_family(family),
+        hint_free=not hinted,
+        n_env=bound,
+    )
     _check_varlen_rows(logits, out, cols, top_k)
     g = torch.cuda.CUDAGraph()
     with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
@@ -985,7 +996,7 @@ def _run_hard(logits, kv, top_k, n_r, want, next_n=1, cr=1, page_size=None, **kw
         **kw,
     )
     torch.cuda.synchronize()
-    _assert_family(rows, width, top_k, next_n, cr, want, **key_kw)
+    _assert_family(rows, width, top_k, next_n, cr, _b200_family(want), **key_kw)
     _check_varlen_rows(
         logits, out if unpage is None else unpage(out, next_n), n_r, top_k
     )
@@ -1149,8 +1160,9 @@ def test_gvr2_onecta_wave_slab_rows(rows, width, top_k, page_size, pattern):
     n_r = [min(cols[r % len(cols)], width) for r in range(rows)]
     logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width + top_k)
     lc = _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
-    assert lc[2][5] == 1, lc  # one CTA per row
-    assert lc[3][0] == (7 * top_k) // 4, lc[3]  # aim_base
+    if _host._sm_count() == 148:  # the B200 plan: the one-wave slab
+        assert lc[2][5] == 1, lc  # one CTA per row
+        assert lc[3][0] == (7 * top_k) // 4, lc[3]  # aim_base
 
 
 _BOUND_EDGE_CASES = [
@@ -1388,7 +1400,9 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
             next_n=next_n,
             compress_ratio=cr,
         )
-        _assert_family(rows, msl_c, top_k, next_n, cr, "main", hint_free=hint_free)
+        _assert_family(
+            rows, msl_c, top_k, next_n, cr, _b200_family("main"), hint_free=hint_free
+        )
         _check_varlen_rows(logits, indices, n_r, top_k)
 
 
@@ -1434,7 +1448,9 @@ def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern, band):
         _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=pre_idx is None)
         _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
         torch.cuda.synchronize()
-        _assert_family(rows, msl_c, top_k, 1, 1, "main", hint_free=pre_idx is None)
+        _assert_family(
+            rows, msl_c, top_k, 1, 1, _b200_family("main"), hint_free=pre_idx is None
+        )
         _check_varlen_rows(logits, out, [n] * rows, top_k)
 
 
