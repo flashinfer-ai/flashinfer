@@ -649,6 +649,8 @@ def get_conv_kernel(
     silu=True,
     pdl=False,
 ):
+    # Prefill reads a chunk's history from the previous chunk of the same sequence.
+    assert width - 1 <= block_t
     defer_state = (
         speculative
         and not vector_state

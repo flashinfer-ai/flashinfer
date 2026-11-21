@@ -19,12 +19,11 @@ def _supported(x, *args, **kwargs):
 
 
 def _decode_plan(prefill, accepted, num_sequences, width):
-    # Measured on B300: deeper histories want smaller blocks, and the ordinary
-    # update is launch-bound enough for a programmatic dependent launch to pay.
-    if prefill or accepted is not None:
+    # Measured on B300: only the width-3 ordinary update gains from wider blocks
+    # and a programmatic dependent launch; widths 4 and 7 keep the defaults.
+    if prefill or accepted is not None or width != 3:
         return {}
-    block_c = {3: 256 if num_sequences <= 8 else 512, 4: 256}.get(width, 128)
-    return {"block_c": block_c, "pdl": True}
+    return {"block_c": 256 if num_sequences <= 8 else 512, "pdl": True}
 
 
 def _prefill_block_t(rows, num_sequences):

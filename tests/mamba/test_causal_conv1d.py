@@ -278,10 +278,12 @@ def test_prefill_chunking_and_decode_are_identical(width):
         ("prefill", 64, 256, "sd", 0, False),
         ("prefill", 97, 24, "ds", 0, False),
         ("prefill", 256, 24, "sd", 0, False),
+        ("prefill", 257, 24, "sd", 0, False),
         ("spec", 3, 256, "sd", 8, True),
         ("spec", 3, 129, "ds", 1, False),
         ("spec", 3, 128, "sd", 1, False),
         ("decode", 3, 129, "sd", 0, True),
+        ("decode", 9, 129, "sd", 0, True),
     ],
 )
 def test_graph_replay_updates_live_state(
