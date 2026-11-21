@@ -44,7 +44,7 @@ __global__ __launch_bounds__(256) void act_and_mul_kernel(T* __restrict__ out,
   const int64_t offset = token_idx * 2 * d;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
 #pragma unroll 1
@@ -60,7 +60,7 @@ __global__ __launch_bounds__(256) void act_and_mul_kernel(T* __restrict__ out,
   }
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -82,7 +82,7 @@ __global__ __launch_bounds__(256) void act_and_mul_split_kernel(T* __restrict__ 
   T* out_ptr = out + int64_t(row) * d;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  cudaGridDependencySynchronize();
 #endif
 
 #pragma unroll 1
@@ -122,7 +122,7 @@ __global__ __launch_bounds__(256) void act_and_mul_split_kernel(T* __restrict__ 
   }
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 

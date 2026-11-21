@@ -272,7 +272,7 @@ quantize_with_block_size(
   int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  cudaGridDependencySynchronize();
 
   // Get the caller-provided global scaling factor, which will be applied to the SF.
   float SFScaleVal = 1.0f;
@@ -465,7 +465,7 @@ quantize_with_block_size(
       }
     }
   }
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -535,7 +535,7 @@ quantize_with_block_size_tma(
   // Work items are (batch, 16-row tile) pairs.
   int const numRowTiles = (numPaddedRowsForSf + TMA_ROW_TILE - 1) / TMA_ROW_TILE;
 
-  asm volatile("griddepcontrol.wait;" ::: "memory");
+  cudaGridDependencySynchronize();
 
   // Get the global scaling factor
   float SFScaleVal = 1.0f;
@@ -693,7 +693,7 @@ quantize_with_block_size_tma(
       }
     }
   }
-  asm volatile("griddepcontrol.launch_dependents;");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
