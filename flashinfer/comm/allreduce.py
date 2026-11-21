@@ -335,9 +335,21 @@ class SpecializedAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         dtype: torch.dtype,
         use_oneshot: Optional[Any] = None,
     ) -> bool:
+        """The fallback workspace's check, with ``use_oneshot`` as
+        :func:`allreduce_fusion` passes it to that backend: an MNNVL fallback
+        takes a one-shot / two-shot strategy, so a boolean is translated as the
+        call would translate it; ``None`` keeps the backend's default."""
         if use_oneshot is None:
             return self.fallback.is_buffer_size_sufficient(
                 tp_size, num_tokens, hidden_dim, dtype
+            )
+        if isinstance(use_oneshot, bool) and isinstance(
+            self.fallback, MNNVLAllReduceFusionWorkspace
+        ):
+            use_oneshot = (
+                MNNVLAllreduceFusionStrategy.ONESHOT
+                if use_oneshot
+                else MNNVLAllreduceFusionStrategy.TWOSHOT
             )
         return self.fallback.is_buffer_size_sufficient(
             tp_size, num_tokens, hidden_dim, dtype, use_oneshot
@@ -1127,11 +1139,13 @@ def allreduce_fusion(
         the workspace's fallback backend (``workspace.fallback_backend``) with the
         same arguments. Today: ``kARResidualRMSNorm`` with ``fp32_acc=True`` on two
         ranks of one node, hidden size 6144, bfloat16, compute capability 10.3, for
-        the allowlisted ``weight_bias`` values and token counts.
+        the allowlisted ``weight_bias`` values and token counts; an omitted
+        ``residual_out`` or ``norm_out`` is allocated, as the MNNVL backend does.
         ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time and at
         workspace creation; set it identically on every rank) sends every call to
-        the fallback backend. Per-call options that depend on the backend, such as
-        ``use_oneshot``, follow ``workspace.fallback_backend``.
+        the fallback backend; a CUDA graph captured before it was set keeps its
+        specialized launches, so recapture it. Per-call options that depend on the
+        backend, such as ``use_oneshot``, follow ``workspace.fallback_backend``.
 
     Parameters
     ----------

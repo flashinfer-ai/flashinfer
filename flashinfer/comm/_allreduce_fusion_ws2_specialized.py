@@ -31,9 +31,14 @@ rank passes identically, so no collective runs for any other configuration. For 
 :func:`create_state` adds one peer-mapped region (``SymmDeviceMemory``, unicast, no signal pads), a
 rank-local device call counter and a launch grid. Before allocating anything the ranks vote with
 one ``allgather``: every rank must be on compute capability 10.3, on one node, have the JIT module
-built, a non-empty allowlist, enough free memory and ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE``
-unset. One rank's veto leaves the state absent on every rank, and the reason is returned on every
-rank alike. Creation never raises.
+built, a non-empty allowlist, enough free memory, pass the allocation pre-flight (the per-device
+driver queries the handle exchange makes between its collectives) and have
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` unset. One rank's veto leaves the state absent on every
+rank, and the reason is returned on every rank alike. After the handle exchange (whose own
+collectives gather every rank's allocation error) every rank votes once more, on its local setup
+(mapping, pointer table) and the idle-state initialisation, before any rank returns: a local
+failure on one rank releases the region on every rank and is the same rejection everywhere.
+Creation never raises.
 
 Dispatch (call time). :func:`allreduce_fusion` first asks :func:`outside_token_ranges`, a few
 cheap checks of the token count against the state's ranges, so that calls the kernel never serves
@@ -47,26 +52,36 @@ cheap checks of the token count against the state's ranges, so that calls the ke
   capacity (first, so that calls outside the token ranges, e.g. decode, return after a few
   checks);
 - ``fp32_acc=True`` and an allowlisted ``weight_bias``;
-- ``residual_in``, ``residual_out``, ``norm_out`` and ``rms_gamma`` given, all bf16;
+- ``residual_in`` and ``rms_gamma`` given; every tensor given bf16;
 - ``input`` of shape ``[num_tokens, 6144]``, residual/norm tensors of the same shape, ``rms_gamma``
   of shape ``[6144]``, all contiguous;
 - all tensors on the workspace's device.
 
 ``use_oneshot``, ``trigger_completion_at_end``, ``output``, ``layout_code`` and the quantization
 arguments do not change the result of this pattern and are ignored. ``residual_out`` and/or
-``norm_out`` may be the same tensor as ``input`` or ``residual_in``.
+``norm_out`` may be the same tensor as ``input`` or ``residual_in``. An omitted ``residual_out`` or
+``norm_out`` is allocated (as the MNNVL backend does), so whether a rank passes them never changes
+its path.
 
 Rank symmetry. The call is collective: if one rank dispatched and its peer did not, the dispatched
 rank would wait forever for the peer's data. Every check above depends only on values that are
 identical on both ranks of a tensor-parallel group (shapes, dtypes, layouts, arguments, the state
 the ranks agreed on, the environment), so the environment variable must be set identically on
-every rank. Nothing per-rank (pointer values, tensor contents) decides the path; a launch error
-raises instead of falling back.
+every rank. Nothing per-rank decides the path: not whether optional outputs are given, not
+tensor contents and not pointer values. A contiguous view that is not 16-byte aligned (the
+kernel's bulk copies need 16 bytes) runs the same kernel through aligned copies on its rank
+(:func:`_launch_staged`) instead of falling back, since its peer's views may be aligned. A launch
+error raises instead of falling back.
 
 The kernel waits for its predecessor before reading anything when launched with programmatic
 dependent launch (``launch_with_pdl=True``) and never triggers its dependents early. It launches on
-the current stream with no host synchronisation or allocation, so it is CUDA-graph capturable; the
-module is built at workspace creation, never at call time.
+the current stream with no host synchronisation, so it is CUDA-graph capturable (it allocates only
+an omitted output or the aligned copies of a misaligned view, from the caching allocator); the
+module is built at workspace creation, never at call time. Its grid holds every co-resident CTA
+slot of the device and waits on its peer, so the launcher runs eager launches on one device one
+grid at a time, also across streams, in the order the host issued them (see
+``csrc/allreduce_fusion_ws2_specialized.cu``); launches captured in a CUDA graph follow the
+stream the graph is replayed on.
 
 Markers, once per process each, written to ``sys.stderr`` (serving frameworks may route or drop
 library loggers) and to the ``flashinfer.jit`` logger: :data:`STATE_MARKER` when a state is created,
@@ -172,6 +187,7 @@ _module_lock = threading.Lock()
 _stats: Dict[str, Any] = {
     "calls": 0,
     "dispatch_count": 0,
+    "staged_launches": 0,
     "fallbacks": 0,
     "fallback_reasons": {},
     "guard_error": None,
@@ -276,6 +292,45 @@ def _node_id() -> str:
     return f"{boot_id}@{socket.gethostname()}"
 
 
+def _allocation_preflight(device_idx: int) -> Optional[str]:
+    """Why this rank cannot pass the allocation's per-device driver queries, or ``None``.
+
+    ``SymmDeviceMemory`` gathers every rank's error of creating, exporting and importing the
+    allocation, but it queries the allocation granularity of the chosen handle type locally
+    between two of its collectives, where a local failure would leave the peer waiting in the
+    next one. Running the same queries (the properties ``SymmDeviceMemory`` builds, for each
+    handle type it may choose) before the vote turns such a failure into a veto on every rank."""
+    from .mnnvl import (
+        _FABRIC_HANDLE,
+        _POSIX_FD_HANDLE,
+        _local_fabric_status,
+        checkCudaErrors,
+        cuda,
+    )
+
+    handle_types = [_POSIX_FD_HANDLE]
+    if _local_fabric_status(device_idx)[0] is None:
+        handle_types.insert(0, _FABRIC_HANDLE)
+    for handle_type in handle_types:
+        prop = cuda.CUmemAllocationProp()
+        prop.requestedHandleTypes = handle_type
+        prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.location = cuda.CUmemLocation()
+        prop.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location.id = device_idx
+        prop.allocFlags.gpuDirectRDMACapable = 1
+        try:
+            checkCudaErrors(
+                cuda.cuMemGetAllocationGranularity(
+                    prop,
+                    cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed query is a veto
+            return f"granularity query ({handle_type}): {type(exc).__name__}: {exc}"
+    return None
+
+
 def _record_rejection(reason: str, detail: str, target_device: bool) -> None:
     _stats["state_rejections"][reason] = _stats["state_rejections"].get(reason, 0) + 1
     _stats["last_state_rejection"] = f"{reason}: {detail}"[:600]
@@ -324,6 +379,9 @@ def _local_probe(
                 f"free={free_bytes} < region {region_bytes} + {_FREE_MEMORY_MARGIN}"
             )
             return "memory", detail, 0, 0, 0, target
+        preflight = _allocation_preflight(device.index)
+        if preflight is not None:
+            return "allocation_preflight", preflight[:300], 0, 0, 0, target
     except Exception as exc:  # noqa: BLE001 - a probe failure is a veto, never an exception
         return "probe_error", f"{type(exc).__name__}: {exc}"[:300], 0, 0, 0, target
     return None, "", capacity, grid, region_bytes, target
@@ -424,8 +482,16 @@ def _create_state(
     assert module is not None
     region_bytes = int(module.allreduce_fusion_ws2_region_bytes(capacity))
 
-    # 2. Allocation. The handle exchange gathers every rank's allocation error, so a failure
-    #    raises on every rank alike.
+    # 2. Allocation and the idle state on this rank, then one more vote before any rank returns;
+    #    it doubles as the barrier: both ranks' regions hold the sentinel before either rank can
+    #    push into its peer's. The handle exchange gathers every rank's error of creating,
+    #    exporting and importing the allocation (so those fail on every rank alike); its local
+    #    steps after the exchange (mapping, the pointer table) and the initialisation can fail on
+    #    one rank only, so every rank reaches this vote whatever happened locally, and a failure
+    #    anywhere releases the region on every rank.
+    handle: Optional[Any] = None
+    state: Optional[_State] = None
+    error: Optional[Tuple[str, str]] = None
     try:
         handle = SymmDeviceMemory(
             buf_size=region_bytes,
@@ -436,41 +502,22 @@ def _create_state(
             enable_multicast=False,
             allocate_signal_pads=False,
         )
-    except Exception as exc:  # noqa: BLE001
-        rejection = ("allocation", f"{type(exc).__name__}: {exc}"[:300])
-        _record_rejection(*rejection, target)
-        return None, rejection
-
-    # 3. Idle state on this rank, then a second vote that doubles as the barrier: both ranks'
-    #    regions hold the sentinel before either rank can push into its peer's.
-    state: Optional[_State] = None
-    error: Optional[str] = None
-    try:
-        ptrs = handle.get_buffer_ptrs_host()
-        own_ptr, peer_ptr = int(ptrs[tp_rank]), int(ptrs[1 - tp_rank])
-        words = int(module.allreduce_fusion_ws2_epoch_words(grid))
-        epoch = torch.zeros(words, dtype=torch.int32, device=device)
-        module.allreduce_fusion_ws2_init(epoch, own_ptr, capacity)
-        torch.cuda.synchronize(device)
-        state = _State(
-            handle=handle,
-            own_ptr=own_ptr,
-            peer_ptr=peer_ptr,
-            epoch=epoch,
-            capacity=capacity,
-            grid=grid,
-            device_idx=device_idx,
-            rank=tp_rank,
-            region_bytes=region_bytes,
-        )
-    except Exception as exc:  # noqa: BLE001
-        error = f"{type(exc).__name__}: {exc}"[:300]
+    except Exception as exc:  # noqa: BLE001 - voted on below
+        error = ("allocation", f"{type(exc).__name__}: {exc}"[:300])
+    if error is None:
+        try:
+            state = _init_state(handle, tp_rank, device, capacity, grid, region_bytes)
+        except Exception as exc:  # noqa: BLE001 - voted on below
+            error = ("init", f"{type(exc).__name__}: {exc}"[:300])
     errors = backend.allgather(error)
     failed = [(r, e) for r, e in enumerate(errors) if e is not None]
     if failed:
+        # Release this rank's mapping of both regions (its own allocation and its import of the
+        # peer's); the backing is freed once every rank has released it.
         state = None
-        del handle
-        rejection = ("init", f"rank {failed[0][0]}: {failed[0][1]}")
+        handle = None
+        rank, (stage, what) = failed[0]
+        rejection = (stage, f"rank {rank}: {what}")
         _record_rejection(*rejection, target)
         return None, rejection
     assert state is not None
@@ -481,6 +528,37 @@ def _create_state(
         f"grid={grid}, region_bytes={region_bytes})",
     )
     return state, None
+
+
+def _init_state(
+    handle: Any,
+    tp_rank: int,
+    device: torch.device,
+    capacity: int,
+    grid: int,
+    region_bytes: int,
+) -> _State:
+    """This rank's state over the mapped region: its own region and call counter put into the
+    idle state (synchronised; the vote after it makes both ranks' regions idle before either
+    rank can launch)."""
+    assert _module is not None
+    ptrs = handle.get_buffer_ptrs_host()
+    own_ptr, peer_ptr = int(ptrs[tp_rank]), int(ptrs[1 - tp_rank])
+    words = int(_module.allreduce_fusion_ws2_epoch_words(grid))
+    epoch = torch.zeros(words, dtype=torch.int32, device=device)
+    _module.allreduce_fusion_ws2_init(epoch, own_ptr, capacity)
+    torch.cuda.synchronize(device)
+    return _State(
+        handle=handle,
+        own_ptr=own_ptr,
+        peer_ptr=peer_ptr,
+        epoch=epoch,
+        capacity=capacity,
+        grid=grid,
+        device_idx=device.index,
+        rank=tp_rank,
+        region_bytes=region_bytes,
+    )
 
 
 def checkpoint_prepare_state(workspace: Any) -> bool:
@@ -538,7 +616,9 @@ def _reject_reason(
     fp32_acc: Any,
 ) -> Optional[str]:
     """``None`` when the specialized kernel serves the call, else the fallback reason. Every
-    input is identical on both ranks of a tensor-parallel group."""
+    input that decides it is identical on both ranks of a tensor-parallel group: whether
+    ``residual_out`` / ``norm_out`` are given does not decide it (an omitted one is allocated),
+    and neither do pointer values (a misaligned view is staged, see :func:`_launch_staged`)."""
     if os.environ.get(_DISABLE_ENV) == "1":
         return "kill_switch"
     if state is None:
@@ -556,22 +636,20 @@ def _reject_reason(
         return "fp32_acc"
     if weight_bias is None or float(weight_bias) not in allowlist.weight_bias:
         return "weight_bias"
-    if (
-        residual_in is None
-        or residual_out is None
-        or norm_out is None
-        or rms_gamma is None
-    ):
+    # The pattern's required inputs; every backend rejects a call without them.
+    if residual_in is None or rms_gamma is None:
         return "missing_tensor"
     tensors = (input, residual_in, residual_out, norm_out, rms_gamma)
+    if residual_out is None or norm_out is None:
+        tensors = tuple(t for t in tensors if t is not None)
     if any(t.dtype != _DTYPE for t in tensors):
         return "dtype"
     # ---- shape / layout ----
     if (
         shape[1] != _HIDDEN
         or residual_in.shape != shape
-        or residual_out.shape != shape
-        or norm_out.shape != shape
+        or (residual_out is not None and residual_out.shape != shape)
+        or (norm_out is not None and norm_out.shape != shape)
         or rms_gamma.dim() != 1
         or rms_gamma.shape[0] != _HIDDEN
     ):
@@ -652,10 +730,11 @@ def try_dispatch(
     fp32_acc: Any,
     launch_with_pdl: bool,
 ) -> Optional[torch.Tensor]:
-    """``norm_out`` after the specialized kernel ran, or ``None`` when the workspace's fallback
-    backend must serve the call. Raises when the region is detached (between
-    ``checkpoint_prepare`` and ``checkpoint_restore``) or the launch itself fails: the call is
-    collective, so a rank never falls back after its guard passed."""
+    """``norm_out`` after the specialized kernel ran (allocated when omitted, as is an omitted
+    ``residual_out``), or ``None`` when the workspace's fallback backend must serve the call.
+    Raises when the region is detached (between ``checkpoint_prepare`` and
+    ``checkpoint_restore``) or the launch itself fails: the call is collective, so a rank never
+    falls back after its guard passed."""
     # Under torch.compile (dynamo) tracing use the fallback: this check folds to a constant,
     # so none of the host-side dispatch below is traced.
     if torch.compiler.is_compiling():
@@ -683,7 +762,13 @@ def try_dispatch(
     assert state is not None and _module is not None
     if not state.handle.mapped:
         raise RuntimeError("specialized all-reduce fusion handles are not attached")
-    _module.allreduce_fusion_ws2_ar_rmsnorm(
+    # Omitted outputs are allocated here, so that passing them or not never splits the ranks.
+    if residual_out is None:
+        residual_out = torch.empty_like(input)
+    if norm_out is None:
+        norm_out = torch.empty_like(input)
+    # The launcher returns 1, without launching, when a tensor is not 16-byte aligned.
+    if _module.allreduce_fusion_ws2_ar_rmsnorm(
         input,
         residual_in,
         rms_gamma,
@@ -697,7 +782,18 @@ def try_dispatch(
         float(rms_eps),
         float(weight_bias),
         bool(launch_with_pdl),
-    )
+    ):
+        _launch_staged(
+            state,
+            input,
+            residual_in,
+            rms_gamma,
+            residual_out,
+            norm_out,
+            rms_eps,
+            weight_bias,
+            launch_with_pdl,
+        )
     _stats["dispatch_count"] += 1
     if "dispatch" not in _markers_emitted:
         _emit_once(
@@ -706,6 +802,58 @@ def try_dispatch(
             f"grid={state.grid}, capacity={state.capacity})",
         )
     return norm_out
+
+
+def _launch_staged(
+    state: _State,
+    input: torch.Tensor,
+    residual_in: torch.Tensor,
+    rms_gamma: torch.Tensor,
+    residual_out: torch.Tensor,
+    norm_out: torch.Tensor,
+    rms_eps: float,
+    weight_bias: Any,
+    launch_with_pdl: bool,
+) -> None:
+    """The launch of a call with a contiguous view that is not 16-byte aligned (the kernel's
+    bulk copies and vector stores need 16 bytes): aligned copies of such inputs, aligned scratch
+    for such outputs, copied back after the kernel on the same stream. Only this rank stages; its
+    peer, whose views may be aligned, launches the same kernel, so the ranks never split.
+    Aliasing (an output that is ``input`` or ``residual_in``) holds: the kernel reads the copy and
+    the copy-back writes the caller's tensor afterwards."""
+    assert _module is not None
+    staged = []
+
+    def aligned_input(t: torch.Tensor) -> torch.Tensor:
+        return t.clone() if t.data_ptr() % 16 else t
+
+    def aligned_output(t: torch.Tensor) -> torch.Tensor:
+        if t.data_ptr() % 16 == 0:
+            return t
+        scratch = torch.empty_like(t)
+        staged.append((t, scratch))
+        return scratch
+
+    status = _module.allreduce_fusion_ws2_ar_rmsnorm(
+        aligned_input(input),
+        aligned_input(residual_in),
+        aligned_input(rms_gamma),
+        aligned_output(residual_out),
+        aligned_output(norm_out),
+        state.own_ptr,
+        state.peer_ptr,
+        state.epoch,
+        state.capacity,
+        state.grid,
+        float(rms_eps),
+        float(weight_bias),
+        bool(launch_with_pdl),
+    )
+    if status:  # fresh allocations of the caching allocator are aligned
+        raise RuntimeError("specialized all-reduce fusion: staged tensors not aligned")
+    for target, scratch in staged:
+        target.copy_(scratch)
+    _stats["staged_launches"] += 1
 
 
 def _allreduce_fusion_ws2_specialized_stats() -> Dict[str, Any]:

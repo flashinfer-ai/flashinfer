@@ -18,7 +18,7 @@
 
 // Fused all-reduce over two ranks + residual add + RMSNorm, hidden size 6144, bf16, for
 // compute capability 10.3. Serves `allreduce_fusion(pattern=kARResidualRMSNorm, fp32_acc=True)`
-// on a two-rank single-node TRT-LLM workspace; see
+// on a two-rank single-node specialized workspace (backend="specialized"); see
 // flashinfer/comm/_allreduce_fusion_ws2_specialized.py.
 //
 // Host interface (the Python side relies on exactly these; a replacement kernel keeps the names,
@@ -80,7 +80,15 @@
 //
 // Liveness: iteration i of a CTA pushes its row i+kL before it waits for the peer's copy of its
 // row i; rows of a CTA are increasing, so the smallest row awaited anywhere has always been pushed
-// (all CTAs are co-resident).
+// once all CTAs of both ranks' grids are resident. A kernel on another stream that does not wait
+// on other GPUs only delays that: it retires and the rest of the grid becomes resident. Two
+// grids that wait on peers (two launches of this kernel, or another collective) in flight on
+// different streams of one device can deadlock across the ranks when the ranks run them in
+// different orders, since each holds the SM slots the other needs. The launcher
+// (csrc/allreduce_fusion_ws2_specialized.cu) therefore runs eager launches of this kernel on a
+// device one grid at a time in host issue order, across streams; a CUDA graph's launches follow
+// its replay stream, and another collective on another stream must be ordered by the caller (as
+// for every collective kernel).
 //
 // Waits have no deadline (as in the TRT-LLM kernels): a peer that never arrives stalls the call.
 // For debugging only, -DFLASHINFER_ALLREDUCE_FUSION_WS2_SPIN_TIMEOUT_NS=<ns> makes a wait that
