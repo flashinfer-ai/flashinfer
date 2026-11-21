@@ -26,6 +26,7 @@ codegen argument. Pattern follows tests/jit/test_cute_dsl_cache.py:
 3. Symbol safety: names stay within [A-Za-z0-9_] (filename + TVM-FFI symbol).
 """
 
+import importlib
 import inspect
 import re
 
@@ -64,8 +65,17 @@ from flashinfer.gdn_kernels.blackwell.gdn_prefill import (  # noqa: E402
     _get_compiled_cache,
     _prefill_kernel_name,
 )
+from flashinfer.utils import get_compute_capability  # noqa: E402
 
 _SYMBOL_SAFE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class _ForbidCompile:
+    def __getitem__(self, options):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        raise AssertionError("cute.compile ran despite valid disk artifacts")
 
 
 # ---------------------------------------------------------------------------
@@ -635,3 +645,91 @@ def test_nontranspose_disk_cache_round_trip(monkeypatch, tmp_path):
     )
     torch.testing.assert_close(out1, out2, atol=0, rtol=0)
     torch.testing.assert_close(state1, state2, atol=0, rtol=0)
+
+
+def _make_wy_call(variant):
+    module = importlib.import_module(
+        f"flashinfer.gdn_kernels.gdn_decode_bf16_wy_{variant}"
+    )
+    suffix = "" if variant == "output_only" else f"_{variant}"
+    entry = getattr(module, f"gated_delta_rule_mtp{suffix}")
+
+    dtype = getattr(module, "IO_TORCH", torch.bfloat16)
+    state_dtype = getattr(module, "ST_TORCH", torch.bfloat16)
+    ring_dtype = getattr(module, "RING_TORCH", torch.bfloat16)
+    batch, tokens, heads, dim = 2, 4, 2, 128
+    generator = torch.Generator(device="cuda").manual_seed(17)
+
+    def rand(*shape, dtype=dtype):
+        return torch.randn(shape, generator=generator, dtype=dtype, device="cuda") * 0.1
+
+    q, k, v = (rand(batch, tokens, heads, dim) for _ in range(3))
+    a, b = (rand(batch, tokens, heads) for _ in range(2))
+    A_log, dt_bias = rand(heads), rand(heads)
+    initial_state = rand(batch, heads, dim, dim, dtype=state_dtype)
+    indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+    buffers = {}
+    options = {}
+    if variant != "output_only":
+        slots = getattr(module, "RING_SLOTS", module.W_RING)
+        ring_shape = (batch, heads, slots, dim)
+        buffers.update(
+            k_cache=torch.zeros(ring_shape, dtype=ring_dtype, device="cuda"),
+            u_cache=torch.zeros(ring_shape, dtype=ring_dtype, device="cuda"),
+            g_cache=torch.zeros(ring_shape[:-1], dtype=torch.float32, device="cuda"),
+            hist_len=torch.zeros(batch, dtype=torch.int32, device="cuda"),
+        )
+    if variant == "ucache_flush":
+        buffers["hist_len"][0] = module.W_RING - tokens + 1
+        buffers["cache_base"] = torch.zeros(batch, dtype=torch.int32, device="cuda")
+        options["backend"] = "hmma"
+
+    def run():
+        state = initial_state.clone()
+        ring = {name: tensor.clone() for name, tensor in buffers.items()}
+        out = entry(
+            A_log,
+            a,
+            dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            initial_state_indices=indices,
+            disable_state_update=True,
+            **ring,
+            **options,
+        )
+        return out, state, ring
+
+    return module, run
+
+
+@pytest.mark.parametrize("variant", ["output_only", "ucache", "ucache_flush"])
+def test_wy_disk_cache_round_trip(monkeypatch, tmp_path, variant):
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, _ = get_compute_capability(device)
+    if major < 9:
+        pytest.skip("requires an SM90+ WY kernel")
+
+    import cutlass.cute as cute
+
+    from flashinfer.jit import env as jit_env
+
+    module, run = _make_wy_call(variant)
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+    monkeypatch.setattr(module, "_CACHE", {})
+
+    expected = run()
+    if variant == "ucache_flush":
+        assert expected[2]["cache_base"][0].item() > 0
+
+    module._CACHE.clear()
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE")
+    torch.testing.assert_close(run(), expected, atol=0, rtol=0)
+    assert len(list(tmp_path.rglob("*.o"))) == 1
+    module._CACHE.clear()
+    monkeypatch.setattr(cute, "compile", _ForbidCompile())
+    torch.testing.assert_close(run(), expected, atol=0, rtol=0)

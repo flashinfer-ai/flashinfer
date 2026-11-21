@@ -47,6 +47,7 @@ from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
+from .cute_dsl_cache import build_and_load_gdn_kernel
 from .device_target import gdn_compile_options, gdn_device_target
 from .dtype_compat import as_bf16
 
@@ -2279,8 +2280,7 @@ def gated_delta_rule_mtp(
     # compile and read H0 with the wrong strides -> ~3e-01 garbage outputs. Found
     # by the intense correctness sweep; invisible to the tests/benches, which use
     # one HV per process.
-    cache_key: tuple = (
-        target.compile_key,
+    specialization: tuple = (
         mbp,
         t_disc,
         n_valid,
@@ -2291,7 +2291,8 @@ def gated_delta_rule_mtp(
         V_dim,
     )
     if _qkv_rs > 0:
-        cache_key = cache_key + (B, h0.shape[0])
+        specialization += (B, h0.shape[0])
+    cache_key = (target.compile_key, specialization)
     mk = from_dlpack
 
     def mk_dyn(t):
@@ -2348,7 +2349,16 @@ def gated_delta_rule_mtp(
             qkv_row_stride=_qkv_rs,
             ab_native=_ab_native_flag,
         )
-        _CACHE[cache_key] = cute.compile[gdn_compile_options(device)](kernel, *args)
+        _CACHE[cache_key] = build_and_load_gdn_kernel(
+            "gdn_decode_bf16_wy_output_only",
+            "output_only",
+            specialization,
+            args,
+            lambda: cute.compile[gdn_compile_options(device)](kernel, *args),
+            target_arch=target.arch,
+            extra_key_files=(__file__,),
+            enable_tvm_ffi=False,
+        )
     _CACHE[cache_key](*args)
 
     if output is None:
