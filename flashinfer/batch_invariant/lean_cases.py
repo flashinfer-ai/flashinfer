@@ -133,10 +133,11 @@ ATTN_CASES = [
     ),  # whole tiles: the last position equals the causal a0 row's prefix
 ]
 ATTN_HEAD_DIMS = (64, 128, 256)
-# the toy cases whose LSE member (bases 2 and e) is checked too: one chunk, a window across chunks, every head dim
-ATTN_LSE_CASES = ("a2", "a3", "a5", "a7", "a8")
+# the toy cases whose LSE member (bases 2 and e) is checked too: one chunk, a window across chunks, every head dim, and the
+# non-causal class at every head dim (a10, a11, a12)
+ATTN_LSE_CASES = ("a2", "a3", "a5", "a7", "a8", "a10", "a11", "a12")
 # the toy cases whose sink member (the output and the LSE in both bases, with the sink step) is checked too
-ATTN_SINK_CASES = ("a2", "a3", "a5", "a7", "a8")
+ATTN_SINK_CASES = ("a2", "a3", "a5", "a7", "a8", "a10", "a11", "a12")
 
 GEMM_CASES = [
     (64, 1),
