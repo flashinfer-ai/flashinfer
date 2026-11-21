@@ -8453,7 +8453,7 @@ def dense_gemm(
                 swap_ab = default_plan.swap_ab if mma_tiler_mn[1] < 64 else False
     assert load_path is not None
     assert swap_ab is not None
-    if ab_dtype == "float4_e2m1fn" and _tile_k_override is None:
+    if ab_dtype == "float4_e2m1fn" and sf_vec_size == 16 and _tile_k_override is None:
         tile_k = _select_fp4_tile_k(
             m,
             n,
@@ -9332,7 +9332,7 @@ def _lower_dense_gemm(
                 swap_ab = default_plan.swap_ab if mma_tiler_mn[1] < 64 else False
     assert load_path is not None
     assert swap_ab is not None
-    if ab_dtype == "float4_e2m1fn" and _tile_k_override is None:
+    if ab_dtype == "float4_e2m1fn" and sf_vec_size == 16 and _tile_k_override is None:
         tile_k = _select_fp4_tile_k(
             m,
             n,
