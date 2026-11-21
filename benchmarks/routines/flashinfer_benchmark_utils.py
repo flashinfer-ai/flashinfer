@@ -262,6 +262,7 @@ benchmark_apis = {
         "mm_bf16_fp4",
         "mm_mxfp8",
         "mm_bf16",
+        "mm_tf32",
         "bmm_bf16",
         "tinygemm_bf16",
     ],
@@ -664,7 +665,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
+    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, mm_tf32, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],

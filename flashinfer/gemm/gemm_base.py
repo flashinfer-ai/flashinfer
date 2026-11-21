@@ -53,6 +53,7 @@ from ..trace.templates.gemm import (
     gemm_fp8_nt_groupwise_trace,
     group_gemm_fp8_nt_groupwise_contiguous_trace,
     mm_bf16_trace,
+    mm_tf32_trace,
     mm_fp4_trace,
     mm_fp8_trace,
     mm_mxfp8_trace,
@@ -1148,6 +1149,310 @@ def mm_bf16(
         backends = [backend]
 
     bf16_gemm_sm100(a, b, bias, pdl, out, workspace_buffer, backends)
+    return out
+
+
+@supported_compute_capability([100, 103, 107])
+def _cute_dsl_mm_tf32_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
+):
+    if not is_sm100a_supported(a.device):
+        raise ValueError("The CuTeDSL TF32 backend requires SM10x with CUDA 12.8+.")
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        # A ValueError lets "auto" fall back to cuBLAS.
+        error = LibraryError if backend == "cute-dsl" else ValueError
+        raise error("The CuTeDSL TF32 backend requires nvidia-cutlass-dsl.")
+    from .kernels.dense_tf32_gemm_sm100_splitk import default_tactic
+
+    # An explicit tactic is validated in the common check.
+    if tactic is None:
+        with torch.cuda.device(a.device):
+            default_tactic(a.shape[0], b.shape[1], a.shape[1])
+    return True
+
+
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
+def _cublas_mm_tf32_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
+):
+    if pdl and backend == "cublas":
+        raise ValueError("The cuBLAS TF32 backend has no PDL launch; pass pdl=False.")
+    if tactic is not None:
+        raise ValueError("tactic applies to the cute-dsl backend only.")
+    if not torch.backends.cuda.matmul.allow_tf32:
+        raise ValueError(
+            "The cuBLAS TF32 backend runs torch.matmul, which uses TF32 only when "
+            "torch.backends.cuda.matmul.allow_tf32 is set."
+        )
+    return True
+
+
+def _check_mm_tf32_problem_size(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
+):
+    from .kernels.utils import validate_tf32_gemm_inputs
+
+    validate_tf32_gemm_inputs(a, b, out)
+    if tactic is not None:
+        # Here rather than in the CuTeDSL check, so a bad tactic raises under
+        # "auto" too instead of leaving no backend.
+        from flashinfer.cute_dsl.availability import is_cute_dsl_available
+
+        if is_cute_dsl_available():
+            from .kernels.dense_tf32_gemm_sm100_splitk import (
+                Tf32SplitKTactic,
+                validate_tactic,
+            )
+
+            with torch.cuda.device(a.device):
+                validate_tactic(
+                    Tf32SplitKTactic(*tactic), a.shape[0], b.shape[1], a.shape[1]
+                )
+    return True
+
+
+def _heuristic_func_mm_tf32(
+    suitable_backends: List[str],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
+):
+    # The cluster split-K kernel wins while its 64 x 64 output tiles fit in half
+    # the SMs (its splits fill the rest); beyond that cuBLAS's large tiles win.
+    tiles = -(-a.shape[0] // 64) * -(-b.shape[1] // 64)
+    sm_count = torch.cuda.get_device_properties(a.device).multi_processor_count
+    order = ["cute-dsl", "cublas"]
+    if 2 * tiles > sm_count:
+        order.reverse()
+    return [x for x in order if x in suitable_backends]
+
+
+_TF32_GEMM_TUNING_CONFIG = TuningConfig(
+    use_cuda_graph=True,
+    use_cold_l2_graph_replay=True,
+    use_cold_l2_cache=True,
+    cold_chain_launches=8,
+    profile_arena_input_indices=(1,),  # b
+    dynamic_tensor_specs=(
+        DynamicTensorSpec(
+            (0,),  # a_tensor_index
+            (-2,),
+            get_hybrid_num_tokens_buckets,
+            map_to_hybrid_bucket_uncapped,
+        ),
+    ),
+    constraint_specs=(
+        ConstraintSpec(
+            3,  # out_tensor_index
+            -2,
+            lambda shapes: shapes[0][-2],
+        ),
+    ),
+)
+
+
+@functools.cache
+def _cute_dsl_tf32_splitk_gemm_runner(compute_capability: int):
+    from .kernels.dense_tf32_gemm_sm100_splitk import (
+        Tf32SplitKTactic,
+        autotune_tactics,
+        default_tactic,
+        run_tf32_splitk_dense,
+        validate_tactic,
+    )
+
+    class CuteDSLTf32SplitKRunner(TunableRunner):
+        def get_valid_tactics(
+            self, inputs: List[torch.Tensor], profile: OptimizationProfile
+        ) -> list[tuple[int, int, int, int, int]]:
+            a, b, *_ = inputs
+            # Pruning reads the SM count and cluster capacity of the device.
+            with torch.cuda.device(a.device):
+                try:
+                    tactics = autotune_tactics(a.shape[0], b.shape[1], a.shape[1])
+                except ValueError:
+                    return []
+            return [astuple(t) for t in tactics]
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            return (bool(inputs[2]), compute_capability)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=-1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, pdl, out = inputs
+            m, k = a.shape
+            n = b.shape[1]
+            with torch.cuda.device(a.device):
+                if tactic != -1:
+                    try:
+                        tactic = Tf32SplitKTactic(*tactic)
+                        validate_tactic(tactic, m, n, k)
+                    except (TypeError, ValueError):
+                        # A cached entry can come from another shape.
+                        tactic = -1
+                if tactic == -1:
+                    tactic = default_tactic(m, n, k)
+                return run_tf32_splitk_dense(a, b, out, bool(pdl), tactic)
+
+    return CuteDSLTf32SplitKRunner()
+
+
+@functools.cache
+def _cublas_tf32_gemm_runner():
+    class CublasTf32Runner(TunableRunner):
+        def get_valid_tactics(
+            self, inputs: List[torch.Tensor], profile: OptimizationProfile
+        ) -> List[int]:
+            return [0]
+
+        def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+            return (bool(inputs[2]),)
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            a, b, _, out = inputs
+            return torch.matmul(a, b, out=out)
+
+    return CublasTf32Runner()
+
+
+@backend_requirement(
+    {
+        "cute-dsl": _cute_dsl_mm_tf32_requirement,
+        "cublas": _cublas_mm_tf32_requirement,
+    },
+    common_check=_check_mm_tf32_problem_size,
+    heuristic_func=_heuristic_func_mm_tf32,
+)
+@flashinfer_api(trace=mm_tf32_trace)
+def mm_tf32(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    pdl: bool = False,
+    out: Optional[torch.Tensor] = None,
+    backend: Literal["cute-dsl", "cublas", "auto"] = "auto",
+    *,
+    tactic: Optional[Tuple[int, int, int, int, int]] = None,
+) -> torch.Tensor:
+    r"""MM TF32: ``out = a @ b`` with FP32 inputs, TF32 MMAs and FP32 output.
+
+    Both operands are rounded to TF32 and the products are accumulated in
+    FP32, as in ``torch.matmul`` with ``torch.backends.cuda.matmul.allow_tf32``
+    set.
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input tensor, shape (m, k), fp32 in row-major layout.
+
+    b: torch.Tensor
+        Weight tensor, shape (k, n), fp32 in column-major layout (the transpose
+        of a row-major ``(n, k)`` weight).
+
+    pdl: bool
+        Whether to use Programmatic Dependent Launch. The CuTeDSL kernel may
+        read ``b`` before waiting for the preceding kernel, so pass
+        ``pdl=False`` if a kernel that may still be running writes it. Naming
+        cuBLAS with ``pdl=True`` raises ``ValueError``; under ``"auto"`` cuBLAS
+        competes without PDL. Defaults to ``False``.
+
+    out: Optional[torch.Tensor]
+        Out tensor, shape (m, n), fp32 in row-major layout. Allocated if None.
+
+    backend: Literal["cute-dsl", "cublas", "auto"]
+        The backend to use for the operation. Defaults to ``"auto"``.
+        ``"cute-dsl"``: a low-M SM100/SM103/SM107 kernel that splits K over a
+        thread-block cluster and reduces the partial sums in distributed
+        shared memory in the same launch, in a fixed order (deterministic);
+        requires N % 2 == 0 and K % 64 == 0. Under autotuning the tile, cluster
+        size and K tile are tuned per M bucket.
+        ``"cublas"``: ``torch.matmul``; requires
+        ``torch.backends.cuda.matmul.allow_tf32`` (it does not change it).
+        ``"auto"``: CuTeDSL first while its output tiles fit in half the
+        SMs (low M), cuBLAS first above; with autotuning, the faster of the
+        two per M bucket.
+
+    tactic: Optional[Tuple[int, int, int, int, int]]
+        CuTeDSL only: run this ``(mma_m, mma_n, split_k, ab_stages, cta_k)``
+        (``Tf32SplitKTactic`` field order) and skip the default and the
+        autotuner, also inside ``autotune()``. For callers that tune the kernel where it runs, e.g.
+        beside a concurrent kernel on another stream, where a smaller grid
+        that co-resides with it can finish first. Defaults to ``None``.
+
+    Returns
+    -------
+    torch.Tensor
+        Out tensor, shape (m, n), fp32 in row-major layout.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> a = torch.randn([16, 4096], device="cuda")
+    >>> b = torch.randn([256, 4096], device="cuda").transpose(-2, -1)
+    >>> out = flashinfer.mm_tf32(a, b)
+    >>> out.shape
+    torch.Size([16, 256])
+    >>> out.dtype
+    torch.float32
+    """
+    pdl = bool(pdl)
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], b.shape[1]), device=a.device, dtype=torch.float32
+        )
+    if tactic is not None:
+        from .kernels.dense_tf32_gemm_sm100_splitk import (
+            Tf32SplitKTactic,
+            run_tf32_splitk_dense,
+        )
+
+        return run_tf32_splitk_dense(a, b, out, pdl, Tf32SplitKTactic(*tactic))
+    backends = mm_tf32.suitable_auto_backends if backend == "auto" else [backend]
+    major, minor = torch.cuda.get_device_capability(a.device)
+    runners = [
+        _cute_dsl_tf32_splitk_gemm_runner(major * 10 + minor)
+        if name == "cute-dsl"
+        else _cublas_tf32_gemm_runner()
+        for name in backends
+    ]
+    assert runners, "No suitable runners found"
+    inputs = [a, b, pdl, out]
+    # Both runners key their cache entries on pdl, so one op serves both.
+    runner, tactic = AutoTuner.get().choose_one(
+        "tf32_gemm", runners, _TF32_GEMM_TUNING_CONFIG, inputs
+    )
+    runner(inputs=inputs, tactic=tactic)
     return out
 
 
