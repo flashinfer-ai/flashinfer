@@ -78,10 +78,10 @@ class SpecializedMoERunner(MoERunner):
     preparation. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` rejects every call.
 
     Under CUDA-graph capture a kernel admits only token counts it admitted
-    eagerly, whose winners ``MoELayer`` timed outside capture.
+    eagerly, whose winners ``MoELayer`` selected outside capture.
     ``MoELayer.reset_winner()`` forgets those admissions with the winners
-    (:meth:`forget_selections`), and a winner-cache miss under capture never
-    times this backend (``capture_requires_eager_selection``).
+    (:meth:`forget_selections`), and a winner-cache miss under capture leaves
+    this backend out (``capture_requires_eager_selection``).
     """
 
     backend_key: ClassVar[str] = "specialized"
@@ -90,8 +90,8 @@ class SpecializedMoERunner(MoERunner):
     # admitted call here without timing the other candidates.
     prefer_when_accepted: ClassVar[bool] = True
     # MoELayer leaves this backend out of a selection inside a CUDA-graph capture:
-    # the backend serves a captured call only for a winner timed eagerly, so its
-    # admission there without a cached winner never adds a timed candidate.
+    # the backend serves a captured call only for a winner selected eagerly, so
+    # its admission there without a cached winner never adds a candidate.
     capture_requires_eager_selection: ClassVar[bool] = True
     # The capabilities are the registered kernels', documented per kernel; the
     # generated activation matrix of the design doc leaves this backend out.

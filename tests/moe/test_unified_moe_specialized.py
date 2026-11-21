@@ -124,15 +124,6 @@ def _counting_bench_gpu_time(monkeypatch):
     return timed
 
 
-def _layer_takes_preferred_backends_untimed():
-    """Whether this build's MoELayer takes a backend that prefers itself
-    (``prefer_when_accepted``) without timing it, outside autotune; without that,
-    the default layer times the specialized backend like any candidate."""
-    from flashinfer.fused_moe.runners import MoERunner
-
-    return "prefer_when_accepted" in vars(MoERunner)
-
-
 def _eligible_keys(layer, act, weights):
     return [
         layer.runners[index].backend_key
@@ -342,7 +333,7 @@ def test_kill_switch_through_layer(spec, monkeypatch):
     assert torch.cuda.current_device() in st["precompiled"]
     dispatched = st["dispatch_count"]
     assert dispatched >= 1
-    layer(pack, weights)  # a new eligible set: untimed or timed, it runs the kernel
+    layer(pack, weights)  # a new eligible set: the kernel, taken untimed
     assert _KEY in _eligible_keys(layer, pack, weights)
     assert k.stats()["dispatch_count"] > dispatched
 
@@ -377,9 +368,9 @@ def test_lazy_build_and_range(spec):
 @pytest.mark.parametrize("name,case", _cases("numerics_cases"))
 def test_matches_reference(spec, case):
     """The kernel, the reference backend and the default layer against the
-    kernel's fp32 reference. The default layer may run either backend here (it
-    takes the kernel untimed where MoELayer honours ``prefer_when_accepted``,
-    else it times both); speed is ``test_performance_layer_selects_specialized``."""
+    kernel's fp32 reference. The default layer takes the kernel untimed
+    (``prefer_when_accepted``); the numerics hold whichever backend it runs, and
+    speed is ``test_performance_layer_selects_specialized``."""
     _needs_kernel(spec)
     k = spec.kernel_module
     params = dict(spec.numerics_cases)[case]
@@ -541,8 +532,7 @@ def test_cuda_graph_without_a_cached_winner(spec, monkeypatch, case):
 @pytest.mark.parametrize("name", NAMES)
 def test_auto_first_inside_the_envelope(spec, monkeypatch):
     """``auto`` dispatches the kernel for every token count of its envelope
-    without timing it against the other backends (where MoELayer honours
-    ``prefer_when_accepted``; otherwise it is timed like any candidate);
+    without timing it against the other backends (``prefer_when_accepted``);
     outside the envelope the backend is not a candidate."""
     _needs_kernel(spec)
     k = spec.kernel_module
@@ -550,7 +540,6 @@ def test_auto_first_inside_the_envelope(spec, monkeypatch):
     config = spec.config()
     layer = MoELayer(config)
     timed = _counting_bench_gpu_time(monkeypatch)
-    untimed = _layer_takes_preferred_backends_untimed()
     for num_tokens in _envelope(spec, config.execution.tune_max_num_tokens):
         pack = spec.pack(*spec.inputs(num_tokens))
         keys = _eligible_keys(layer, pack, weights)
@@ -559,12 +548,9 @@ def test_auto_first_inside_the_envelope(spec, monkeypatch):
         out = layer(pack, weights)
         torch.cuda.synchronize()
         assert bool(torch.isfinite(out.float()).all()), num_tokens
-        if untimed:
-            assert layer.winner_backend == _KEY, num_tokens
-            assert len(timed) == before, num_tokens  # no cross-backend timing
-            assert k.stats()["dispatch_count"] == dispatched + 1, num_tokens
-        else:
-            assert layer.winner_backend in keys, num_tokens
+        assert layer.winner_backend == _KEY, num_tokens
+        assert len(timed) == before, num_tokens  # no cross-backend timing
+        assert k.stats()["dispatch_count"] == dispatched + 1, num_tokens
     pack = spec.pack(*spec.inputs(spec.lazy_rejected_tokens))
     dispatched = k.stats()["dispatch_count"]
     assert _KEY not in _eligible_keys(layer, pack, weights)
@@ -595,15 +581,15 @@ def test_autotune_times_every_backend(spec, monkeypatch):
         layer(pack, weights)
         assert layer.winner_backend == winner and len(timed) == len(eligible)
 
-        if _layer_takes_preferred_backends_untimed():
-            retuned = MoELayer(config)
+        # taken untimed outside autotune, then timed against every backend
+        retuned = MoELayer(config)
+        retuned(pack, weights)
+        assert retuned.winner_backend == _KEY
+        assert len(timed) == len(eligible)
+        with autotune(True):
             retuned(pack, weights)
-            assert retuned.winner_backend == _KEY
-            assert len(timed) == len(eligible)
-            with autotune(True):
-                retuned(pack, weights)
-            assert len(timed) == 2 * len(eligible)
-            assert retuned.winner_backend in eligible
+        assert len(timed) == 2 * len(eligible)
+        assert retuned.winner_backend in eligible
     finally:
         # leave no tuned tactic behind for the tests that time untuned paths
         AutoTuner.get().clear_cache()
