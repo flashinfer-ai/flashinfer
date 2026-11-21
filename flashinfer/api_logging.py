@@ -2512,6 +2512,7 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
                         "NVFP4KVMaterializer",
                         "MNNVLCuteDSLAllGatherDualNormWorkspace",
                         "MNNVLCuteDSLAllGatherNormQuantWorkspace",
+                        "MNNVLCuteDSLAllReduceDualNormWorkspace",
                         "MNNVLCuteDSLMoEFinalizeAllReduceWorkspace",
                     ]:
                         func_name = f"{class_name}.{func_name}"

@@ -10,6 +10,7 @@ workspace across a sequence of token counts, so stale mailbox rows from a
 larger previous call and the Lamport stage rotation are both exercised.
 """
 
+import dataclasses
 import os
 import socket
 from datetime import timedelta
@@ -30,6 +31,11 @@ from flashinfer.comm.mnnvl_cutedsl_ag import (
     all_gather_rmsnorm_fp4_quantize,
     supports_all_gather_gated_residual_next_rmsnorm,
     supports_all_gather_rmsnorm_fp4_quantize,
+)
+from flashinfer.comm.mnnvl_cutedsl_ar_dual_norm import (
+    MNNVLCuteDSLAllReduceDualNormWorkspace,
+    all_reduce_gated_residual_next_rmsnorm,
+    supports_all_reduce_gated_residual_next_rmsnorm,
 )
 from flashinfer.comm.mnnvl_cutedsl_moe_finalize import (
     MNNVLCuteDSLMoEFinalizeAllReduceWorkspace,
@@ -792,6 +798,521 @@ def test_all_gather_rmsnorm_fp4_quantize_trace() -> None:
         assert "unknown" not in dtypes, defn["inputs"]
     assert consumer["inputs"]["shard"].get("optional") is True
     assert consumer["inputs"]["shard"]["dtype"] == "bfloat16"
+
+
+# ---------------------------------------------------------------------------
+# All-reduce + gated residual + next RMSNorm
+# ---------------------------------------------------------------------------
+
+AR_MAX_TOKENS = 128
+# Every default cluster size (16 down to one CTA per token), shrinking and
+# growing so calls reuse slots another M wrote.
+AR_TOKEN_SEQUENCE = (128, 1, 7, 64, 3, 33, 16, 1, 65)
+# (gate, post weight, post weight is an input scale, next weight, router)
+AR_BOUNDARIES = (
+    ("channel", True, True, True, True),
+    ("scalar", False, False, True, False),
+    ("none", True, False, False, False),
+)
+
+
+def _ar_boundary(step: int, hidden: int):
+    """``(gate, kwargs)`` of boundary variant ``step`` (cycled)."""
+    gate, post, input_scale, has_next, router = AR_BOUNDARIES[step % len(AR_BOUNDARIES)]
+    gen = _shared_generator(7000 + step)
+    n = 1 if gate == "scalar" else hidden
+
+    def gate_vector():
+        return torch.rand(n, generator=gen, device="cuda") if gate != "none" else None
+
+    def weight(present):
+        if present:
+            return (
+                1 + 0.1 * torch.randn(hidden, generator=gen, device="cuda")
+            ).bfloat16()
+
+    beta, alpha = gate_vector(), gate_vector()
+    return gate, dict(
+        alpha=alpha,
+        beta=beta,
+        post_weight=weight(post),
+        post_weight_is_input_scale=input_scale,
+        next_weight=weight(has_next),
+        want_router=router,
+    )
+
+
+def _ar_compile(workspace, m, gate, kwargs, pushed=False, use_oneshot=None) -> None:
+    workspace.compile(
+        num_tokens=m,
+        post_eps=POST_EPS,
+        next_eps=NEXT_EPS,
+        gate=gate,
+        has_post_weight=kwargs["post_weight"] is not None,
+        post_weight_is_input_scale=kwargs["post_weight_is_input_scale"],
+        has_next_weight=kwargs["next_weight"] is not None,
+        want_router=kwargs["want_router"],
+        pushed=pushed,
+        use_oneshot=use_oneshot,
+    )
+
+
+def _ar_call(partial, residual, workspace, kwargs, use_oneshot=None):
+    return all_reduce_gated_residual_next_rmsnorm(
+        partial,
+        residual,
+        workspace,
+        post_eps=POST_EPS,
+        next_eps=NEXT_EPS,
+        use_oneshot=use_oneshot,
+        **kwargs,
+    )
+
+
+def _inv_rms(x, eps):
+    return torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+
+
+def _ar_dual_norm_reference(partials, residual, kwargs):
+    """FP32 sum, then the boundary with every BF16 rounding of the op."""
+    b = torch.stack(partials).float().sum(0).bfloat16().float()
+    w_post, w_next = kwargs["post_weight"], kwargs["next_weight"]
+    input_scale = w_post is not None and kwargs["post_weight_is_input_scale"]
+    if input_scale:
+        b = (b * w_post.float()).bfloat16().float()
+    n = b * _inv_rms(b, POST_EPS)
+    if w_post is not None and not input_scale:
+        n = n * w_post.float()
+    n = n.bfloat16().float()
+    alpha = kwargs["alpha"] if kwargs["alpha"] is not None else 1.0
+    beta = kwargs["beta"] if kwargs["beta"] is not None else 1.0
+    residual_out = alpha * residual + beta * n
+    y = residual_out * _inv_rms(residual_out, NEXT_EPS)
+    if w_next is not None:
+        y = y * w_next.float()
+    return residual_out, y.bfloat16()
+
+
+def _assert_ar_bitwise(got, want, context: str) -> None:
+    for g, w in zip(got, want, strict=True):
+        assert (g is None) == (w is None), context
+        if g is not None:
+            assert torch.equal(g.view(torch.int16), w.view(torch.int16)), context
+
+
+def _ar_plane_workspace(world_size: int, atom_bytes: int, device, group):
+    """A two-phase plane whose slots hold AR_MAX_TOKENS full rows, and its workspace."""
+    hidden = DUAL_NORM_HIDDEN
+    half_bytes = world_size * AR_MAX_TOKENS * hidden * 2
+    plane = SymmetricBuffer.allocate(
+        (2 * half_bytes,),
+        torch.uint8,
+        device,
+        group,
+        require_multicast=True,
+        materialize_peer_addresses=True,
+    )
+    plane.tensor.zero_()
+    epoch = torch.zeros(1, dtype=torch.int64, device=device)
+    mc, peers = plane.multicast_address, plane.peer_addresses
+    push_plane = PushPlane(plane.tensor, mc, epoch, half_bytes, atom_bytes, peers)
+    torch.cuda.synchronize()
+    dist.barrier()
+    workspace = MNNVLCuteDSLAllReduceDualNormWorkspace(
+        world_size,
+        dist.get_rank(),
+        AR_MAX_TOKENS,
+        hidden,
+        group=group,
+        push_plane=push_plane,
+    )
+    return plane, epoch, push_plane, workspace
+
+
+def _ar_replay(run_sequence, graph: bool, plane, epoch, calls: int):
+    """Outputs of ``run_sequence`` eagerly, or of its graph replayed twice; the
+    plane ends re-armed with the epoch advanced once per call."""
+    replays = 2 if graph else 1
+    if not graph:
+        outputs = run_sequence()
+    else:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        cuda_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cuda_graph, stream=stream):
+            outputs = run_sequence()
+        for _ in range(replays):
+            cuda_graph.replay()
+    torch.cuda.synchronize()
+    rank = dist.get_rank()
+    assert epoch.item() == replays * calls << 32, f"rank {rank}: {epoch.item()}"
+    assert not plane.tensor.any(), f"rank {rank}: plane not re-armed"
+    return outputs
+
+
+def _ar_dual_norm_worker(
+    local_rank: int,
+    master_port: int | None,
+    world_size: int,
+    graph: bool,
+    atom_bytes: int,
+) -> None:
+    """Mailbox and push-plane two-shot modes: bitwise equal to each other, on
+    every rank, and close to the FP32 reference."""
+    _init_group(local_rank, master_port, world_size)
+    rank, group = dist.get_rank(), dist.group.WORLD
+    hidden = DUAL_NORM_HIDDEN
+    plane, epoch, _, workspace = _ar_plane_workspace(
+        world_size, atom_bytes, torch.device("cuda", local_rank), group
+    )
+    mailbox = MNNVLCuteDSLAllReduceDualNormWorkspace(
+        world_size, rank, AR_MAX_TOKENS, hidden, group=group
+    )
+    try:
+        calls = []
+        for step, m in enumerate(AR_TOKEN_SEQUENCE):
+            gen = torch.Generator(device="cuda").manual_seed(100 * step + rank)
+            partial = _signed_zero_rows(m, hidden, step)
+            partial += torch.randn(m, hidden, generator=gen, device="cuda").bfloat16()
+            residual = torch.randn(
+                m, hidden, generator=_shared_generator(9000 + step), device="cuda"
+            )
+            gate, kwargs = _ar_boundary(step, hidden)
+            vectors = ("alpha", "beta", "post_weight", "next_weight")
+            for ws in (mailbox, workspace):
+                local_ok = supports_all_reduce_gated_residual_next_rmsnorm(
+                    ws,
+                    partial,
+                    residual,
+                    use_oneshot=False,
+                    **{k: kwargs[k] for k in vectors},
+                )
+                assert ws.check_support(local_ok), f"unsupported at M={m}"
+                _ar_compile(ws, m, gate, kwargs, use_oneshot=False)
+            calls.append((partial, residual, kwargs))
+
+        def run(ws):
+            return [_ar_call(p, r, ws, kwargs, False) for p, r, kwargs in calls]
+
+        outputs = _ar_replay(lambda: run(workspace), graph, plane, epoch, len(calls))
+        reference = run(mailbox)
+        torch.cuda.synchronize()
+        for step, ((partial, residual, kwargs), got, want) in enumerate(
+            zip(calls, outputs, reference, strict=True)
+        ):
+            context = f"rank {rank}, step {step}, M={partial.shape[0]}, graph={graph}, atom={atom_bytes}"
+            _assert_ar_bitwise(got, want, context)
+            partials = [torch.empty_like(partial) for _ in range(world_size)]
+            dist.all_gather(partials, partial)
+            ref_residual, ref_norm = _ar_dual_norm_reference(partials, residual, kwargs)
+            assert _rel_l2(got[0], ref_residual) < 1e-3, context
+            assert _rel_l2(got[1], ref_norm) < 5e-3, context
+            if kwargs["want_router"]:
+                assert torch.equal(got[2].bfloat16(), got[1]), context
+            # Every rank holds the same rows.
+            rows = torch.cat([got[0], got[1].float()], dim=1)
+            gathered = [torch.empty_like(rows) for _ in range(world_size)]
+            dist.all_gather(gathered, rows)
+            assert all(torch.equal(g, rows) for g in gathered), context
+    finally:
+        workspace.destroy()
+        mailbox.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("atom_bytes", [2, 4])
+def test_all_reduce_gated_residual_next_rmsnorm(
+    world_size: int, graph: bool, atom_bytes: int
+) -> None:
+    _launch(_ar_dual_norm_worker, world_size, graph, atom_bytes)
+
+
+def _ar_gemm_push_worker(
+    local_rank: int,
+    master_port: int | None,
+    world_size: int,
+    graph: bool,
+    multicast: bool,
+) -> None:
+    """A peer-store GEMM broadcasts its tile, ``partial=None`` consumes it; bitwise
+    equal to the published one-shot and two-shot calls on the same GEMM output,
+    alternating on one plane."""
+    _init_group(local_rank, master_port, world_size)
+    rank = dist.get_rank()
+    hidden, k = DUAL_NORM_HIDDEN, 1024
+    plane, epoch, push_plane, workspace = _ar_plane_workspace(
+        world_size, 4, torch.device("cuda", local_rank), dist.group.WORLD
+    )
+    try:
+        gen = torch.Generator(device="cuda").manual_seed(5000 + rank)
+        w = (torch.randn(hidden, k, generator=gen, device="cuda") / k**0.5).bfloat16()
+        w[::97] = 0.0  # +0 columns of every partial
+        peers = plane.peer_addresses.tolist()
+        cases = []
+        for step, m in enumerate((1, 8, 16, 32)):
+            gemm = _peer_store_gemm(m, hidden, k)
+            if gemm is None:
+                continue
+            x = torch.randn(m, k, generator=gen, device="cuda").bfloat16()
+            if rank == 0:
+                x[0] = 0.0  # an all-zero partial row
+            partial = torch.empty(m, hidden, dtype=torch.bfloat16, device="cuda")
+            gemm[0](x, w.T, partial)
+            residual = torch.randn(
+                m, hidden, generator=_shared_generator(9100 + step), device="cuda"
+            )
+            gate, kwargs = _ar_boundary(step, hidden)
+            for pushed, use_oneshot in ((True, None), (False, True), (False, False)):
+                _ar_compile(workspace, m, gate, kwargs, pushed, use_oneshot)
+            cases.append((m, x, partial, residual, kwargs, gemm[1:]))
+        assert cases, "no split-K GEMM fits"
+        torch.cuda.synchronize()
+
+        def run_sequence():
+            outputs = []
+            for _m, x, partial, residual, kwargs, (peer_store, tactic) in cases:
+                peer_store(
+                    x,
+                    w.T,
+                    torch.empty_like(partial),
+                    tactic,
+                    peer_ptrs=None if multicast else peers,
+                    multicast_ptr=plane.multicast_address if multicast else None,
+                    epoch_ptr=epoch.data_ptr() + 4,
+                    slot_bytes=push_plane.half_bytes // world_size,
+                    rank=rank,
+                    world_size=world_size,
+                    layout="broadcast",
+                )
+                pushed = _ar_call(None, residual, workspace, kwargs)
+                published = [
+                    _ar_call(partial, residual, workspace, kwargs, one_shot)
+                    for one_shot in (True, False)
+                ]
+                outputs.append((pushed, *published))
+            return outputs
+
+        outputs = _ar_replay(run_sequence, graph, plane, epoch, 3 * len(cases))
+        for (m, *_), (pushed, one_shot, two_shot) in zip(cases, outputs, strict=True):
+            context = f"rank {rank}, M={m}, graph={graph}, multicast={multicast}"
+            # Same FP32 rank-order sum of the same marked rows, one BF16 rounding.
+            _assert_ar_bitwise(pushed, one_shot, context + ", one-shot")
+            # Two-shot may differ only in the sign of a zero sum: the residual
+            # has no -0, so the outputs match too.
+            _assert_ar_bitwise(pushed, two_shot, context + ", two-shot")
+    finally:
+        workspace.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("multicast", [False, True])
+def test_all_reduce_gated_residual_next_rmsnorm_gemm_push(
+    world_size: int, graph: bool, multicast: bool
+) -> None:
+    _launch(_ar_gemm_push_worker, world_size, graph, multicast)
+
+
+# use_oneshot of the plane calls, cycled over AR_TOKEN_SEQUENCE.
+AR_EXCHANGES = (True, False, None)
+
+
+def _ar_mailbox_rearmed(workspace) -> bool:
+    impl = workspace.impl
+    return all(
+        bool((b.tensor.view(torch.int16) == -32768).all())
+        for b in (impl._scatter, impl._gather)
+    )
+
+
+def _ar_one_shot_worker(
+    local_rank: int,
+    master_port: int | None,
+    world_size: int,
+    graph: bool,
+    atom_bytes: int,
+) -> None:
+    """Published one-shot on the plane and the mailbox, interleaved with two-shot
+    and default calls on one workspace: bitwise equal to the mailbox two-shot
+    result of the same call (the zero-sum sign is the only difference in ``b``;
+    the residual has no -0), on every rank; unfit one-shot calls are rejected."""
+    _init_group(local_rank, master_port, world_size)
+    rank, group = dist.get_rank(), dist.group.WORLD
+    hidden = DUAL_NORM_HIDDEN
+    plane, epoch, _, workspace = _ar_plane_workspace(
+        world_size, atom_bytes, torch.device("cuda", local_rank), group
+    )
+    mailbox = MNNVLCuteDSLAllReduceDualNormWorkspace(
+        world_size, rank, AR_MAX_TOKENS, hidden, group=group
+    )
+    rows = mailbox.impl.one_shot_rows
+    vectors = ("alpha", "beta", "post_weight", "next_weight")
+    try:
+        assert rows == min(AR_MAX_TOKENS, 128 // world_size)
+        calls = []
+        for step, m in enumerate(AR_TOKEN_SEQUENCE):
+            gen = torch.Generator(device="cuda").manual_seed(100 * step + rank)
+            partial = _signed_zero_rows(m, hidden, step)
+            partial += torch.randn(m, hidden, generator=gen, device="cuda").bfloat16()
+            residual = torch.randn(
+                m, hidden, generator=_shared_generator(9000 + step), device="cuda"
+            )
+            gate, kwargs = _ar_boundary(step, hidden)
+            # Plane: every M fits a slot. Mailbox: two interleaved passes that
+            # together run each fitting call one-shot once.
+            exchanges = (
+                (workspace, AR_EXCHANGES[step % len(AR_EXCHANGES)]),
+                (mailbox, step % 2 == 0 and m <= rows),
+                (mailbox, step % 2 == 1 and m <= rows),
+                (mailbox, False),
+            )
+            for ws, one_shot in exchanges:
+                local_ok = supports_all_reduce_gated_residual_next_rmsnorm(
+                    ws,
+                    partial,
+                    residual,
+                    use_oneshot=one_shot,
+                    **{k: kwargs[k] for k in vectors},
+                )
+                assert ws.check_support(local_ok), f"unsupported at M={m}"
+                _ar_compile(ws, m, gate, kwargs, use_oneshot=one_shot)
+            calls.append((partial, residual, kwargs, [x for _, x in exchanges]))
+
+        # Rejections: pushed two-shot; mailbox one-shot above its rows.
+        partial, residual, kwargs, _ = calls[0]
+        args = {k: kwargs[k] for k in vectors}
+        assert not supports_all_reduce_gated_residual_next_rmsnorm(
+            workspace, None, residual, use_oneshot=False, **args
+        )
+        with pytest.raises(ValueError, match="pushed calls are one-shot"):
+            _ar_compile(workspace, partial.shape[0], "channel", kwargs, True, False)
+        big = AR_MAX_TOKENS
+        assert (big > rows) == (not mailbox.fits_rows(big, False, True))
+        assert mailbox.fits_rows(rows, False, True)
+
+        def run(ws, column):
+            return [
+                _ar_call(p, r, ws, kwargs, exchanges[column])
+                for p, r, kwargs, exchanges in calls
+            ]
+
+        plane_out = _ar_replay(
+            lambda: run(workspace, 0), graph, plane, epoch, len(calls)
+        )
+        mailbox_out = []
+        for column in (1, 2):
+            if graph:
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                cuda_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cuda_graph, stream=stream):
+                    out = run(mailbox, column)
+                for _ in range(2):
+                    cuda_graph.replay()
+            else:
+                out = run(mailbox, column)
+            mailbox_out.append(out)
+        reference = run(mailbox, 3)
+        torch.cuda.synchronize()
+        assert _ar_mailbox_rearmed(mailbox), f"rank {rank}: mailbox not re-armed"
+        for step, (call, want, *got) in enumerate(
+            zip(calls, reference, plane_out, *mailbox_out, strict=True)
+        ):
+            m, exchanges = call[0].shape[0], call[3]
+            context = (
+                f"rank {rank}, step {step}, M={m}, graph={graph}, atom={atom_bytes}"
+            )
+            for g, x in zip(got, exchanges, strict=False):
+                _assert_ar_bitwise(g, want, f"{context}, use_oneshot={x}")
+            rows_out = torch.cat([want[0], want[1].float()], dim=1)
+            gathered = [torch.empty_like(rows_out) for _ in range(world_size)]
+            dist.all_gather(gathered, rows_out)
+            assert all(torch.equal(g, rows_out) for g in gathered), context
+    finally:
+        workspace.destroy()
+        mailbox.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("atom_bytes", [2, 4])
+def test_all_reduce_gated_residual_next_rmsnorm_one_shot(
+    world_size: int, graph: bool, atom_bytes: int
+) -> None:
+    _launch(_ar_one_shot_worker, world_size, graph, atom_bytes)
+
+
+def _ar_plane_checks_worker(
+    local_rank: int, master_port: int | None, world_size: int
+) -> None:
+    """A plane only rank 0 gets wrong makes every rank reject it."""
+    _init_group(local_rank, master_port, world_size)
+    rank, group = dist.get_rank(), dist.group.WORLD
+    _, _, push_plane, workspace = _ar_plane_workspace(
+        world_size, 4, torch.device("cuda", local_rank), group
+    )
+    peers = push_plane.peer_addresses
+    try:
+        rejected = (
+            dict(half_bytes=push_plane.half_bytes - 16),  # unaligned rank slots
+            dict(peer_addresses=torch.stack([peers, peers], 1)[:, 0]),  # strided
+            dict(peer_addresses=peers.cpu()),
+        )
+        for change in rejected:
+            plane = (
+                dataclasses.replace(push_plane, **change) if rank == 0 else push_plane
+            )
+            with pytest.raises(ValueError, match="unsupported push plane"):
+                MNNVLCuteDSLAllReduceDualNormWorkspace(
+                    world_size,
+                    rank,
+                    AR_MAX_TOKENS,
+                    DUAL_NORM_HIDDEN,
+                    group=group,
+                    push_plane=plane,
+                )
+    finally:
+        workspace.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_all_reduce_gated_residual_next_rmsnorm_plane_checks(world_size: int) -> None:
+    _launch(_ar_plane_checks_worker, world_size)
+
+
+def test_all_reduce_gated_residual_next_rmsnorm_trace() -> None:
+    """Published and consumer-only calls trace to one definition."""
+    workspace = SimpleNamespace(
+        impl=SimpleNamespace(push_plane=object()),
+        max_token_num=16,
+        hidden_dim=4096,
+        tp_size=4,
+        device=torch.device("cpu"),
+    )
+    common = dict(
+        residual=torch.ones(5, 4096),
+        workspace=workspace,
+        post_eps=POST_EPS,
+        next_eps=NEXT_EPS,
+        alpha=torch.ones(1),
+        beta=torch.ones(1),
+        next_weight=torch.ones(4096, dtype=torch.bfloat16),
+    )
+    trace = all_reduce_gated_residual_next_rmsnorm.fi_trace
+    published = trace(partial=torch.ones(5, 4096, dtype=torch.bfloat16), **common)
+    consumer = trace(partial=None, **common)
+    assert consumer["name"] == published["name"]
+    assert published["axes"]["hidden"]["value"] == 4096
+    assert consumer["inputs"]["partial"].get("optional") is True
 
 
 # ---------------------------------------------------------------------------

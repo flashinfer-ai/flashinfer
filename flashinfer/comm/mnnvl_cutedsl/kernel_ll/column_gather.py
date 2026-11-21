@@ -75,6 +75,8 @@ class PushPlane:
     adds to it once after its re-arms, so the phase flips with the last one.
     Start it at zero on every rank and never reset it while the plane is in use.
     Every plane user runs on one stream, in the same order on every rank.
+    Ops that store into one peer's plane (a two-shot all-reduce) also need
+    ``peer_addresses``.
     """
 
     buffer: torch.Tensor  # this rank's mapping of the plane, >= 2 * half_bytes
@@ -82,6 +84,7 @@ class PushPlane:
     epoch: torch.Tensor  # [1] int64 (8 bytes), rank-local
     half_bytes: int
     atom_bytes: int = 2  # sentinel granularity: 2 = BF16, 4 = 32-bit word
+    peer_addresses: torch.Tensor | None = None  # [tp] int64 plane base on each rank
 
     def ll_state(self) -> LLProtocolState:
         """The plane as the LL kernels' mailbox and stage state (not owned)."""
