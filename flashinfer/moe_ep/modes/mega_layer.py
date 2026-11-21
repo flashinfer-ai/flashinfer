@@ -171,9 +171,8 @@ class MoEEpMegaLayer(nn.Module):
         self._staged_transformed: Any = None
 
         if backend.transformed_weights is not None:
-            self._transformed = backend.transformed_weights
-            self._kernel.validate_transformed_weights(
-                self._transformed,
+            self._transformed = self._kernel.prepare_transformed_weights(
+                backend.transformed_weights,
                 self._bootstrap,
                 self._fleet_params,
             )
