@@ -354,6 +354,13 @@ theorem output_depends_on_fmt :
 theorem output_depends_on_fmt_noncausal :
     output ⟨8, 2, 8, 9, -1, 0, 0, false, 12, "bf16"⟩ ≠ output ⟨8, 2, 8, 9, -1, 0, 0, false, 12, "f16"⟩ := by native_decide
 
+/-- **The operand format is orthogonal to the mask mode**: the visible keys, the tiles and the chunks of a row do not depend
+on the format (it names the steps and the roundings of the dataflow, never the key set), so each format has a causal and a
+non-causal class over the same geometry. -/
+theorem geometry_ignores_fmt (P : Params) (f : String) (j : Nat) :
+    ({ P with fmt := f }).presentChunks = P.presentChunks ∧ ({ P with fmt := f }).tilesOfChunk j = P.tilesOfChunk j :=
+  ⟨rfl, rfl⟩
+
 /-- **The mask mode is a class dimension**: the token at position 9 of a request with 12 keys sees the keys `0..9` under the
 causal class and `0..11` under the non-causal one -- a different term (stated on a concrete toy row, decided), hence a
 different fingerprint per head dim. -/

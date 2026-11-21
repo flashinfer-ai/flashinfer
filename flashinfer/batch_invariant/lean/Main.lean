@@ -2,7 +2,6 @@
 -- SPDX-License-Identifier: Apache-2.0
 import BIKernels.Export
 import BIKernels.Cases
-import BIKernels.AttentionFp16Cases
 /-! `lake exe conformance`: print the Lean model's terms for the generated cases. The Python test
 (`tests/batch_invariant/test_lean.py`, the Lean tier) compares these strings with the Python spec's / engine's
 S-expressions and the dispatcher's chunk rule. -/
