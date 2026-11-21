@@ -56,6 +56,11 @@ from .fp4_quantization import (
 # Re-export the NVFP4 4over6 recipe types and helpers.  These spell the
 # ``nvfp4_4over6=`` parameter of the quantization APIs, replacing the
 # process-wide FLASHINFER_NVFP4_4OVER6* environment variables.
+from .nvfp4_4over6_sm120 import (
+    nvfp4_4over6_dynamic_quantize_sm120,
+    nvfp4_4over6_quantize_sm120,
+)
+
 from .nvfp4_quantization_utils import (
     NVFP44Over6Config,
     NVFP44Over6ErrMode,
@@ -122,6 +127,9 @@ __all__ = [
     "scaled_fp4_grouped_quantize",
     "silu_and_mul_nvfp4_quantize",
     "get_fp4_quantization_module",
+    # NVFP4 4over6 quantizers for SM12x
+    "nvfp4_4over6_quantize_sm120",
+    "nvfp4_4over6_dynamic_quantize_sm120",
     # NVFP4 4over6 recipe
     "NVFP44Over6Config",
     "NVFP44Over6ErrMode",
