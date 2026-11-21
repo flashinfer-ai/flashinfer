@@ -42,7 +42,7 @@ Build: the programs (13, none depends on the token count) are compiled and
 launched once on a dummy problem by the first eager call admitted, outside any
 capture. Under CUDA-graph capture a call is admitted only when the programs
 exist and this binding already admitted the same token count eagerly, i.e. when
-``MoELayer`` already timed its candidates for that call outside capture;
+``MoELayer`` already selected its winner for that call outside capture;
 otherwise the call stays on the other candidates and nothing compiles inside a
 capture.
 
