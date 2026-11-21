@@ -389,7 +389,15 @@ def assert_mega_outputs(actual, expected):
     torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
 
 
-def decode_fixture(requests=1, *, heads=64, history_tokens=32768, seed=42, inline=True):
+def decode_fixture(
+    requests=1,
+    *,
+    heads=64,
+    history_tokens=32768,
+    seed=42,
+    cache_format="v41_fp8",
+    inline=True,
+):
     """Seven verification rows/request, shifted SWA and independent causal top-512.
 
     Requests own disjoint cache pools. The compressed history uses ratio two.
@@ -400,7 +408,7 @@ def decode_fixture(requests=1, *, heads=64, history_tokens=32768, seed=42, inlin
     f = fixture(
         requests * 7,
         heads,
-        "v41_fp8",
+        cache_format,
         pool_tokens=requests * primary_stride,
         extra_pool_tokens=requests * extra_stride,
         seed=seed,
