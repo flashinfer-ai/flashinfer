@@ -58,7 +58,13 @@ from typing import Any, Literal, NamedTuple, Optional, Union
 import torch
 
 from ..jit import env as jit_env
-from ..jit.core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from ..jit.core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+)
 from ..utils import log2e
 
 MODULES: dict[str, dict[str, Any]] = {
@@ -168,6 +174,11 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed": {
         "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -298,6 +309,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "dependencies": [
             "cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371",
             "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
+            "cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3",
         ],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_splitkv",
@@ -398,10 +410,13 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_01a8ed8aa21db44c",
             "-DCAKE_VARIANT_NS_0=variant_cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371_sm_103a_32a1975e851a",
             "-DCAKE_VARIANT_NS_1=variant_cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed_sm_103a_b314ebedc258",
+            "-DCAKE_VARIANT_NS_2=variant_cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3_sm_103a_b314ebedc258",
+            "-DCAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS=7",
         ],
         "dependencies": [
             "cake_trtllm_mla_blackwell_3e8ec0cdecccb3b5f371",
             "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
+            "cake_trtllm_mla_blackwell_1e364888a6277ea9a2c3",
         ],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_splitkv",
@@ -881,14 +896,17 @@ def select_domain(
     the devices ``_SPLITKV_RANGE`` lists, so a call without ``arch`` never selects
     it.
     """
-    aligned = (
+    # Of the aligned programs only FP8 page 64 writes the LSE (base 2, from both
+    # its one-split producer and its reducer); every other one leaves LSE
+    # requests to the generic tail.
+    aligned_lse = (
         num_heads == _ALIGNED_HEADS
         and qk_dim == _ALIGNED_QK_DIM
         and value_dim == _ALIGNED_VALUE_DIM
         and topk == 0
         and uses_shared_paged_kv_idx
-        and not wants_lse
     )
+    aligned = aligned_lse and not wants_lse
     dims_match = (qk_nope_head_dim, value_dim, qk_dim - value_dim) == _ALIGNED_DIMS
     if dtype == torch.bfloat16 and aligned:
         if kv_lens is not None and dims_match and not ragged_query and not skip_softmax:
@@ -961,7 +979,7 @@ def select_domain(
         return DOMAIN_FP8_P32
     if (
         dtype == torch.float8_e4m3fn
-        and aligned
+        and aligned_lse
         and page_size == 64
         and not ragged_query
         and not enable_sink
@@ -974,6 +992,69 @@ def select_domain(
             f"{_MAX_GENERIC_TOKENS}"
         )
     return DOMAIN_BF16_TAIL if dtype == torch.bfloat16 else DOMAIN_FP8_TAIL
+
+
+# The reasons a request took a generic tail program in this process
+# (``_warn_generic_tail``): each is logged once.
+_TAIL_WARNED: set[str] = set()
+
+
+def generic_tail_reason(
+    *,
+    dtype: torch.dtype,
+    num_heads: int,
+    qk_dim: int,
+    value_dim: int,
+    qk_nope_head_dim: int,
+    page_size: int,
+    topk: int,
+    uses_shared_paged_kv_idx: bool,
+    ragged_query: bool,
+    enable_sink: bool,
+    skip_softmax: bool,
+    wants_lse: bool,
+) -> str:
+    """Why ``select_domain`` sends a request to a generic tail program: the
+    first request feature, in the dispatcher's order, that no aligned program
+    serves."""
+    if topk > 0:
+        return "sparse top-k"
+    if (
+        num_heads != _ALIGNED_HEADS
+        or qk_dim != _ALIGNED_QK_DIM
+        or value_dim != _ALIGNED_VALUE_DIM
+        or (qk_nope_head_dim, value_dim, qk_dim - value_dim) != _ALIGNED_DIMS
+    ):
+        dims = (qk_nope_head_dim, value_dim, qk_dim - value_dim)
+        return f"{num_heads} heads of dimensions {dims}"
+    if not uses_shared_paged_kv_idx:
+        return "separate K and V page indices"
+    if dtype == torch.bfloat16:
+        return "BF16 with LSE output" if wants_lse else "this BF16 configuration"
+    if page_size != 64:
+        return "FP8 with page size 32" + (" and LSE output" if wants_lse else "")
+    if enable_sink:
+        return "FP8 with sinks"
+    if ragged_query:
+        return "FP8 with a compact variable-length query"
+    if skip_softmax:
+        return "FP8 with skip-softmax"
+    return "this FP8 configuration"
+
+
+def _warn_generic_tail(reason: str) -> None:
+    """Log once per reason and process that an explicit ``backend="cake"`` call
+    runs a generic tail program."""
+    if reason in _TAIL_WARNED:
+        return
+    _TAIL_WARNED.add(reason)
+    logger.warning(
+        "[MLA] backend='cake' runs the generic tail program for %s: a scalar "
+        "reference program that takes milliseconds per call where the tuned "
+        "programs take microseconds. backend='auto' selects a tuned backend "
+        "for such requests. Logged once per reason.",
+        reason,
+    )
 
 
 def plan_num_split(work_items: int, max_seq_len: int, num_sms: int) -> int:
@@ -1463,6 +1544,7 @@ def launch_device_rows(
     stateless: bool,
     row_batches: Optional[torch.Tensor] = None,
     row_seq_lens: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch ``launch`` on ``stream``.
 
@@ -1475,7 +1557,9 @@ def launch_device_rows(
     current stream per call; otherwise they are cached per stream and shape.
     The split-KV scratch is allocated per call under stream capture too, so a
     captured graph owns its scratch (a cached one could leave the LRU cache
-    while the graph still launches with it).
+    while the graph still launches with it). ``lse`` is the caller's
+    contiguous FP32 LSE of the query rows (FP8 page 64 only), which the program
+    writes in base 2; ``None`` writes it to scratch.
     """
     run = get_cake_trtllm_mla_blackwell_family(launch.family).run
     kind = launch.kind
@@ -1535,7 +1619,7 @@ def launch_device_rows(
             query.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
             kv_cache.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
             out.reshape(-1, _ALIGNED_VALUE_DIM),
-            state["lse"],
+            state["lse"] if lse is None else lse.reshape(-1, _ALIGNED_HEADS),
             seq_lens,
             block_tables.reshape(-1),
             state["partial_output"],
@@ -1823,6 +1907,23 @@ def trtllm_mla_blackwell_decode(
         num_sms=num_sms,
         arch=arch,
     )
+    if domain in (DOMAIN_BF16_TAIL, DOMAIN_FP8_TAIL):
+        _warn_generic_tail(
+            generic_tail_reason(
+                dtype=query.dtype,
+                num_heads=num_heads,
+                qk_dim=qk_dim,
+                value_dim=value_dim,
+                qk_nope_head_dim=int(qk_nope_head_dim),
+                page_size=page_size,
+                topk=topk,
+                uses_shared_paged_kv_idx=bool(uses_shared_paged_kv_idx),
+                ragged_query=ragged_query,
+                enable_sink=sink is not None,
+                skip_softmax=skip_softmax,
+                wants_lse=lse is not None,
+            )
+        )
     family = launch_family(domain, arch, num_sms, total_q)
     stream = int(torch.cuda.current_stream(device).cuda_stream)
     run = get_cake_trtllm_mla_blackwell_family(family).run
@@ -1882,6 +1983,7 @@ def trtllm_mla_blackwell_decode(
             stateless=stateless,
             row_batches=row_batches,
             row_seq_lens=row_seq_lens,
+            lse=lse,
         )
     elif domain == DOMAIN_BF16_NATIVE_SPLIT8:
         plan = row_plan("table")

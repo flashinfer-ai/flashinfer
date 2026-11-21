@@ -5,7 +5,10 @@ the devices ``_SPLITKV_RANGE`` lists. Its mainloop derives each query row's requ
 causal KV length and pages from the caller's ``seq_lens`` and ``block_tables`` on
 the device and cuts the row's KV tiles into ``plan_kv_split`` equal ranges; its
 reducer merges the BF16 partials in a fixed order and applies the sink and
-``bmm2_scale``. These tests check, on every Blackwell device (the fixture lists the
+``bmm2_scale``. The binding launches one of two reducer builds that write the same
+bits: the prefetch_all build up to ``CAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS`` query rows
+split at least ``CAKE_SPLITKV_PREFETCH_ALL_MIN_SPLITS`` ways, the prefetch_any build
+otherwise; the row counts and lengths below lie on both sides of that bound. These tests check, on every Blackwell device (the fixture lists the
 current device from max_seq_len 1025, so the split-KV program is also checked below
 the max_seq_len 2049 where the listed ranges of B200 and GB300 start):
 

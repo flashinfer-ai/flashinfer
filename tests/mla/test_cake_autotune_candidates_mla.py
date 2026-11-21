@@ -249,16 +249,19 @@ def _bucket_range(batch_size):
 
 def _offer_case(monkeypatch, case, domain=None):
     """Replace the offer table with a synthetic one listing the unit of this
-    case on this device: its domain (or ``domain``) over its tuning bucket."""
+    case on this device: its domain (or ``domain``) over its tuning bucket,
+    under the key with sinks when the case has sinks."""
     arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
     query = case["query"]
     page_size = case["kv_cache"].shape[-2]
+    sinks = case.get("sinks")
     if domain is None:
         runner = _cpu_runner(
             query.dtype,
             page_size,
             case["max_seq_len"],
             bmm2_scale=case["bmm2_scale"],
+            sinks=sinks,
         )
         inputs = [query, case["block_tables"], case["seq_lens"], _nan_out(case)]
         domain = (
@@ -272,7 +275,7 @@ def _offer_case(monkeypatch, case, domain=None):
         core._cake_mla_dtype_name(query.dtype),
         page_size,
         query.shape[1],
-        False,
+        sinks is not None,
     )
     unit = (domain, _round_to_seq_len_bucket(case["max_seq_len"]), first, last)
     monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {key: (unit,)})
@@ -1063,8 +1066,8 @@ def test_cake_bucket_rule_covers_every_batch_of_the_bucket(
     # The largest bucket also serves every larger batch.
     assert not _serves(page64, _cpu_inputs(bf16, 4, 2), _bucket(4))
     assert _serves(page64, _cpu_inputs(bf16, 4, 2), None)
-    # Requests with sinks are never offered, although the table lists the unit
-    # without sinks.
+    # Requests with sinks are offered only for units listed with sinks, which
+    # this table does not list, although it lists the unit without sinks.
     sink = [torch.zeros(NUM_HEADS, dtype=torch.float32)]
     page64_sink = _cpu_runner(bf16, 64, sinks=sink)
     assert not _serves(page64_sink, _cpu_inputs(bf16, 16), _bucket(16, 32))
@@ -1086,14 +1089,23 @@ def test_cake_bucket_rule_covers_every_batch_of_the_bucket(
     assert _family(cake_module.DOMAIN_BF16_CLC, 64) != _family(
         cake_module.DOMAIN_BF16_CLC, 128
     )
-    # The row cap bounds the bucket's last batch.
+    # The row cap (the device work-order window) bounds the bucket's last
+    # batch: buckets 512 and 768 of one-token rows and bucket 256 of two-token
+    # rows launch the ordered CLC program for every batch; bucket 1024 (last
+    # batch 1279) and bucket 512 of two-token rows cross the cap.
     cap = core._CAKE_MLA_MAX_ROWS
-    assert _serves(page32, _cpu_inputs(bf16, 256), _bucket(256, cap))
-    assert not _serves(page32, _cpu_inputs(bf16, 256), _bucket(256, 1024))
+    assert cap == 1024 and cap <= cake_module._MAX_ORDERED_ROWS
+    assert _serves(page32, _cpu_inputs(bf16, 256), _bucket(256, 512))
+    assert _serves(page32, _cpu_inputs(bf16, 512), _bucket(512, 768))
+    assert _serves(page32, _cpu_inputs(bf16, 768), _bucket(768, cap))
+    assert not _serves(page32, _cpu_inputs(bf16, cap), _bucket(cap, 1280))
     assert _serves(page32, _cpu_inputs(bf16, 128, 2), _bucket(128, 256))
-    assert not _serves(page32, _cpu_inputs(bf16, 256, 2), _bucket(256, 512))
+    assert _serves(page32, _cpu_inputs(bf16, 256, 2), _bucket(256, 512))
+    assert not _serves(page32, _cpu_inputs(bf16, 512, 2), _bucket(512, 768))
     assert page32.supports(_cpu_inputs(bf16, cap))
+    assert page32.supports(_cpu_inputs(bf16, cap // 2, 2))
     assert not page32.supports(_cpu_inputs(bf16, cap + 1))
+    assert not page32.supports(_cpu_inputs(bf16, cap // 2 + 1, 2))
 
     # FP8 page 64 always launches its one program, up to its own row cap; the
     # tail program (FP8 page 32, other head counts) never joins.
@@ -1269,17 +1281,20 @@ def test_cake_choice_valid_only_while_the_first_stage_keeps_its_winner(
 
 
 def _check_offer_table(table) -> None:
-    """Every unit of an offer table: a supported configuration without sinks;
-    a power-of-two max_seq_len bucket; whole tuning buckets within the row cap;
-    and every batch on the listed domain of the listed device, at both edges of
-    the max_seq_len bucket (a device-specific domain such as split-KV starts at a
-    bucket edge, so one bucket never spans two domains)."""
+    """Every unit of an offer table: a supported configuration (sinks with BF16
+    only); a power-of-two max_seq_len bucket; whole tuning buckets within the
+    row cap; and every batch on the listed domain of the listed device, with
+    sinks for a key with sinks, at both edges of the max_seq_len bucket (a
+    device-specific domain such as split-KV starts at a bucket edge, so one
+    bucket never spans two domains)."""
     buckets = get_hybrid_num_tokens_buckets(core._TRTLLM_GEN_MLA_MAX_BATCH)
     for key, units in table.items():
         arch, num_sms, dtype_name, page_size, q_len, has_sinks = key
         assert arch in ("sm_100a", "sm_103a") and num_sms > 0, key
         assert dtype_name in ("bfloat16", "float8_e4m3fn"), key
-        assert page_size in (32, 64) and q_len >= 1 and not has_sinks, key
+        assert page_size in (32, 64) and q_len >= 1, key
+        assert not has_sinks or dtype_name == "bfloat16", key
+        sinks = [torch.zeros(NUM_HEADS, dtype=torch.float32)] if has_sinks else None
         assert units, key
         dtype = getattr(torch, dtype_name)
         max_rows = (
@@ -1294,7 +1309,7 @@ def _check_offer_table(table) -> None:
             assert last * q_len <= max_rows, unit
             assert last + 1 in buckets or last == max_rows // q_len, unit
             for max_seq_len in sorted({seq_bucket // 2 + 1, seq_bucket}):
-                runner = _cpu_runner(dtype, page_size, max_seq_len)
+                runner = _cpu_runner(dtype, page_size, max_seq_len, sinks=sinks)
                 for batch_size in range(first, last + 1):
                     inputs = _cpu_inputs(dtype, batch_size, q_len)
                     assert runner._domain(inputs, num_sms, arch=arch) == domain, (
@@ -1310,27 +1325,31 @@ def test_offer_table_well_formed():
     _check_offer_table(core._CAKE_MLA_AUTO_OFFERS)
     _check_offer_table(_SYNTHETIC_OFFERS)
     # The measurements the committed table derives from timed no split-KV
-    # unit, so it lists none; _check_offer_table holds every listed unit on
-    # its measured domain under the committed _SPLITKV_RANGE.
+    # unit without sinks, so it lists none; _check_offer_table holds every
+    # listed unit on its measured domain under the committed _SPLITKV_RANGE.
     assert not any(
         unit[0] == cake_module.DOMAIN_BF16_SPLITKV
-        for units in core._CAKE_MLA_AUTO_OFFERS.values()
+        for key, units in core._CAKE_MLA_AUTO_OFFERS.items()
+        if not key[5]
         for unit in units
     )
 
 
 def test_committed_offer_table_unlisted_units_offer_nothing(monkeypatch, cake_families):
     """Units the measured table does not list offer nothing: devices without
-    measurements, requests with sinks and FP8 with 32-token pages. No Cake
-    program or FP8 decode table is built for them. No GPU needed."""
+    measurements, requests with sinks where no unit with sinks is listed, FP8
+    with sinks and FP8 with 32-token pages. No Cake program or FP8 decode table
+    is built for them. No GPU needed."""
     built, _ = cake_families
     table = core._CAKE_MLA_AUTO_OFFERS
     assert set(table) <= {
-        (arch, num_sms, dtype, page_size, q_len, False)
+        (arch, num_sms, dtype, page_size, q_len, has_sinks)
         for arch, num_sms in (("sm_100a", 148), ("sm_103a", 152))
         for dtype in ("bfloat16", "float8_e4m3fn")
         for page_size in (32, 64)
         for q_len in (1, 2)
+        for has_sinks in (False, True)
+        if not (has_sinks and dtype == "float8_e4m3fn")
     }
     assert not any(key[2] == "float8_e4m3fn" and key[3] == 32 for key in table)
     for arch, num_sms in (("sm_100a", 132), ("sm_103a", 148), ("sm_100a", 152)):
@@ -1361,10 +1380,25 @@ def test_committed_offer_table_unlisted_units_offer_nothing(monkeypatch, cake_fa
         for dtype in (torch.bfloat16, torch.float8_e4m3fn):
             for page_size in (32, 64):
                 for q_len in (1, 2):
+                    sink_key = (
+                        arch,
+                        num_sms,
+                        core._cake_mla_dtype_name(dtype),
+                        page_size,
+                        q_len,
+                        True,
+                    )
                     for max_seq_len in (512, 1024, 4096, 16384):
-                        assert not core._cake_mla_auto_offer_ranges(
-                            arch, num_sms, dtype, page_size, q_len, True, max_seq_len
-                        )
+                        if sink_key not in table:
+                            assert not core._cake_mla_auto_offer_ranges(
+                                arch,
+                                num_sms,
+                                dtype,
+                                page_size,
+                                q_len,
+                                True,
+                                max_seq_len,
+                            )
                         if dtype == torch.float8_e4m3fn and page_size == 32:
                             assert not core._cake_mla_auto_offer_ranges(
                                 arch,
@@ -1381,8 +1415,8 @@ def test_committed_offer_table_unlisted_units_offer_nothing(monkeypatch, cake_fa
 
 def test_offer_table_lookup(monkeypatch, cake_families, synthetic_offers):
     """A unit is offered only on its exact device, dtype, page size, q_len,
-    max_seq_len bucket, domain and batch range, and never with sinks. No GPU
-    needed."""
+    max_seq_len bucket, domain and batch range, and to requests with sinks only
+    when it is listed with sinks (then only to them). No GPU needed."""
     vquarter = cake_module.DOMAIN_BF16_VQUARTER
     bf16 = torch.bfloat16
 
@@ -1430,13 +1464,19 @@ def test_offer_table_lookup(monkeypatch, cake_families, synthetic_offers):
         "sm_100a", 148, bf16, 64, 1, False, 1024
     ) == ((vquarter, 1, 15),)
 
-    # Sinks are never offered, even for a listed unit with sinks.
+    # A unit listed with sinks is offered to requests with sinks only.
     with_sinks = {
         ("sm_100a", 148, "bfloat16", 64, 1, True): ((vquarter, 1024, 1, 15),),
     }
     monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", with_sinks)
-    assert not offered(has_sinks=True)
-    assert not core._cake_mla_auto_offer_ranges("sm_100a", 148, bf16, 64, 1, True, 1024)
+    assert offered(has_sinks=True) and offered(has_sinks=True, batch_size=15)
+    assert not offered() and not offered(has_sinks=True, batch_size=16)
+    assert core._cake_mla_auto_offer_ranges(
+        "sm_100a", 148, bf16, 64, 1, True, 1024
+    ) == ((vquarter, 1, 15),)
+    assert not core._cake_mla_auto_offer_ranges(
+        "sm_100a", 148, bf16, 64, 1, False, 1024
+    )
 
 
 # --- The two selection stages on the real tuner, with first-stage stand-ins ---
@@ -2484,11 +2524,60 @@ def test_auto_memo_follows_the_tuner_state(
     assert get(("cake",)) is None
 
 
+def test_auto_memo_rechecks_the_sink_tensor(
+    monkeypatch, fresh_tuner, cake_families, synthetic_offers
+):
+    """A memoized Cake decision runs again only for a sink the eligibility
+    check accepts (one contiguous FP32 value per head on the query's device,
+    alone or in a list or tuple of one); any other sink runs the first stage's
+    selection, as the eligibility check makes it. A first-stage decision is
+    returned as stored. No GPU needed."""
+    tuner = fresh_tuner
+    query, block_tables, seq_lens, out = _cpu_inputs(torch.bfloat16, 4)
+    kv_cache = torch.empty(8, 64, QK_DIM, dtype=torch.bfloat16)
+    runners = [_FakeTrtllmGen(), _FakeCuteDsl()]
+    selected = (runners[1], -1)
+    state = core._mla_cake_memo_state(tuner)
+    assert state is not None
+    family = _family(cake_module.DOMAIN_BF16_VQUARTER, 4)
+    lut = torch.empty(1)
+    cake = (WINNER, frozenset({family}), None, lut)
+    offers = core._CAKE_MLA_AUTO_OFFERS
+    core._mla_cake_auto_memo_put(
+        tuner, ("first",), state, offers, runners, selected, None
+    )
+    core._mla_cake_auto_memo_put(
+        tuner, ("cake",), state, offers, runners, selected, cake
+    )
+    core._CAKE_MLA_LOADED_FAMILIES.add(family)
+    cake_module._FP8_LUTS[query.device] = lut
+
+    def get(key, sinks):
+        return core._mla_cake_auto_memo_get(
+            tuner, key, state, query, kv_cache, block_tables, seq_lens, out, sinks
+        )
+
+    sink = torch.zeros(NUM_HEADS, dtype=torch.float32)
+    first_stage = (1, -1, None)
+    for accepted in (None, sink, [sink], (sink,)):
+        assert get(("cake",), accepted) == (1, -1, cake)
+        assert get(("first",), accepted) == first_stage
+    for rejected in (
+        sink.to(torch.bfloat16),
+        [sink.to(torch.float64)],
+        torch.zeros(2 * NUM_HEADS, dtype=torch.float32)[::2],
+        torch.zeros(NUM_HEADS - 1, dtype=torch.float32),
+        [sink, sink],
+    ):
+        assert get(("cake",), rejected) == first_stage
+        assert get(("first",), rejected) == first_stage
+
+
 def test_offered_batch_ranges_follow_the_offer_table(monkeypatch, cake_families):
     """The memoized offered batch ranges equal the offer table's ranges for
-    every committed unit, follow a replaced table, and are empty with sinks,
-    for unlisted units and on devices other than SM100a/SM103a. No GPU
-    needed."""
+    every committed unit, with and without sinks, follow a replaced table, and
+    are empty for unlisted units and on devices other than SM100a/SM103a. No
+    GPU needed."""
     devices = {(arch, num_sms) for arch, num_sms, *_ in core._CAKE_MLA_AUTO_OFFERS}
     for arch, num_sms in sorted(devices):
         monkeypatch.setattr(
@@ -2518,9 +2607,18 @@ def test_offered_batch_ranges_follow_the_offer_table(monkeypatch, cake_families)
                             )
                             == expected
                         ), (key, max_seq_len)
-                    assert not core._cake_mla_auto_batch_ranges(
-                        0, dtype, page_size, q_len, True, max_seq_len
+                    with_sinks = tuple(
+                        (first, last)
+                        for _, first, last in core._cake_mla_auto_offer_ranges(
+                            arch, num_sms, dtype, page_size, q_len, True, max_seq_len
+                        )
                     )
+                    assert (
+                        core._cake_mla_auto_batch_ranges(
+                            0, dtype, page_size, q_len, True, max_seq_len
+                        )
+                        == with_sinks
+                    ), (key, max_seq_len)
 
     bf16 = torch.bfloat16
     monkeypatch.setattr(cake_module, "_device_facts", lambda index: ("sm_100a", 148))
@@ -2530,6 +2628,16 @@ def test_offered_batch_ranges_follow_the_offer_table(monkeypatch, cake_families)
     assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 2048)
     assert not core._cake_mla_auto_batch_ranges(0, bf16, 32, 1, False, 1024)
     assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 2, False, 1024)
+    assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, True, 1024)
+    # A unit listed with sinks serves requests with sinks only.
+    sink_key = ("sm_100a", 148, "bfloat16", 64, 1, True)
+    monkeypatch.setattr(
+        core,
+        "_CAKE_MLA_AUTO_OFFERS",
+        {sink_key: ((cake_module.DOMAIN_BF16_VQUARTER, 1024, 2, 3),)},
+    )
+    assert core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, True, 1024) == ((2, 3),)
+    assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 1024)
     monkeypatch.setattr(core, "_CAKE_MLA_AUTO_OFFERS", {})
     assert not core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, False, 1024)
 
@@ -2592,6 +2700,25 @@ def test_offered_batch_ranges_are_memoized_per_configuration(
     monkeypatch.setattr(cake_module, "_device_facts", lambda index: ("sm_100a", 148))
     assert ranges() == ((2, 3),)
     assert len(lookups) == 5
+    # Requests with and without sinks of one shape are separate configurations:
+    # each is looked up once, also when they alternate, and never answers for
+    # the other.
+    sink_key = ("sm_100a", 148, "bfloat16", 64, 1, True)
+    sink_unit = (cake_module.DOMAIN_BF16_VQUARTER, 1024, 4, 7)
+    monkeypatch.setattr(
+        core, "_CAKE_MLA_AUTO_OFFERS", {key: (unit,), sink_key: (sink_unit,)}
+    )
+
+    def sink_ranges(has_sinks):
+        return core._cake_mla_auto_batch_ranges(0, bf16, 64, 1, has_sinks, 1024)
+
+    assert [sink_ranges(flag) for flag in (True, False, True, False)] == [
+        ((4, 7),),
+        ((2, 3),),
+        ((4, 7),),
+        ((2, 3),),
+    ]
+    assert len(lookups) == 7
 
 
 def test_cake_families_memo_follows_the_offer_table(
@@ -2603,7 +2730,26 @@ def test_cake_families_memo_follows_the_offer_table(
     needed."""
     for dtype, page_size in ((torch.bfloat16, 32), (torch.bfloat16, 64)):
         runner = _cpu_runner(dtype, page_size)
-        for batch_size in (1, 4, 18, 19, 37, 38, 64, 74, 75, 128, 300, 512, 513):
+        for batch_size in (
+            1,
+            4,
+            18,
+            19,
+            37,
+            38,
+            64,
+            74,
+            75,
+            128,
+            300,
+            512,
+            513,
+            767,
+            768,
+            1023,
+            1024,
+            1025,
+        ):
             inputs = _cpu_inputs(dtype, batch_size)
             expected = runner._launched_families(
                 dtype, 1, NUM_HEADS, QK_DIM, 32, batch_size, "sm_100a", 148
@@ -3416,9 +3562,10 @@ def test_cake_miss_runs_the_tuned_first_stage_winner(monkeypatch, fresh_tuner, m
 # resident clusters (148 or 152 SMs), the BF16 rows reach VQUARTER (4), VHALF
 # (32), the CLC program in one wave (64; the one-wave program where one is
 # generated for the device, see ``_one_wave_route``) and with the longest-first
-# order program (128, and 300 with a partial last order CTA); FP8 page 64 has one
-# domain. Sinks make every BF16 row VQUARTER, with several work items per cluster
-# above 18 rows. The split-KV geometries (max_seq_len bucket 4096, few rows) reach
+# order program (128; 300 and 1000 with a partial last order CTA; 1024, the
+# device work-order window and the row cap); FP8 page 64 has one domain. Sinks
+# make every BF16 row VQUARTER, with several work items per cluster above 18
+# rows. The split-KV geometries (max_seq_len bucket 4096, few rows) reach
 # the split-KV program on the devices whose ``_SPLITKV_RANGE`` covers them (B200
 # and GB300 from 2049). The tail domains never join backend="auto".
 _PARITY_GEOMETRIES = {
@@ -3427,6 +3574,8 @@ _PARITY_GEOMETRIES = {
     "bf16_p32_clc_one_wave": (torch.bfloat16, 32, 64),
     "bf16_p32_clc": (torch.bfloat16, 32, 128),
     "bf16_p32_clc_window300": (torch.bfloat16, 32, 300),
+    "bf16_p32_clc_window1000": (torch.bfloat16, 32, 1000),
+    "bf16_p32_clc_window1024": (torch.bfloat16, 32, 1024),
     "bf16_p64_vquarter": (torch.bfloat16, 64, 4),
     "bf16_p64_vhalf": (torch.bfloat16, 64, 32),
     "fp8_p64_small": (torch.float8_e4m3fn, 64, 4),
@@ -3455,25 +3604,16 @@ def _one_wave_route(arch: str, num_sms: int) -> bool:
     return key in cake_module.ROUTES
 
 
-# Variants whose forced Cake selection backend="auto" never reaches, so their
-# cells are expected skips: requests with sinks are not offered (explicit
-# backend="cake" sink parity is checked in tests/attention/test_trtllm_gen_mla.py).
-_AUTO_SKIPPED_VARIANTS = {
-    "sinks": "backend='auto' does not offer Cake for requests with sinks",
-    "sinks_padded": "backend='auto' does not offer Cake for requests with sinks",
-}
-
-
 def _skip_unserved_geometry(geometry, variant, arch, num_sms) -> None:
-    """Skip the expected cells: variants backend="auto" never offers, FP8 with
-    sinks (the tail program), CLC with bmm2_scale != 1, the one-wave CLC
-    geometry on a device without that program and the split-KV geometries
-    outside the device's ``_SPLITKV_RANGE``."""
+    """Skip the expected cells: FP8 with sinks (the tail program), CLC with
+    bmm2_scale != 1, the one-wave CLC geometry on a device without that program
+    and the split-KV geometries outside the device's ``_SPLITKV_RANGE``. With
+    sinks every geometry of up to the row cap reaches a Cake program (the
+    quarter-value split or split-KV one), offered when a unit lists it with
+    sinks (``_offer_case``)."""
     dtype = _PARITY_GEOMETRIES[geometry][0]
     if "sinks" in variant and dtype != torch.bfloat16:
         pytest.skip("FP8 with sinks takes the tail program, which never joins")
-    if variant in _AUTO_SKIPPED_VARIANTS:
-        pytest.skip(_AUTO_SKIPPED_VARIANTS[variant])
     if variant == "bmm2_scale" and "clc" in geometry:
         pytest.skip("the CLC domain requires bmm2_scale == 1")
     if geometry == "bf16_p32_clc_one_wave" and not _one_wave_route(arch, num_sms):
@@ -3607,6 +3747,8 @@ _STATELESS_GEOMETRIES = (
     "bf16_p64_vhalf",
     "bf16_p32_clc_one_wave",
     "bf16_p32_clc",
+    "bf16_p32_clc_window1000",
+    "bf16_p32_clc_window1024",
     "fp8_p64_small",
     "bf16_p32_splitkv",
     "bf16_p64_splitkv",
@@ -3723,7 +3865,15 @@ def test_forced_cake_cuda_graph_replay_with_updated_inputs(
     _assert_live_and_padded(case["out"], case, "replay after query update")
 
 
-@pytest.mark.parametrize("geometry", ["bf16_p32_clc", "bf16_p32_clc_window300"])
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        "bf16_p32_clc",
+        "bf16_p32_clc_window300",
+        "bf16_p32_clc_window1000",
+        "bf16_p32_clc_window1024",
+    ],
+)
 def test_forced_cake_graphs_replay_concurrently(monkeypatch, clean_tuner, geometry):
     """Two graphs captured on the default capture stream through the auto Cake
     candidate, replayed on two streams at once, each equal their eager result:
@@ -3994,6 +4144,8 @@ _LAUNCH_GEOMETRIES = (
     (torch.bfloat16, 32, 64, 1024),
     (torch.bfloat16, 32, 128, 1024),
     (torch.bfloat16, 32, 300, 1024),
+    (torch.bfloat16, 32, 1000, 1024),
+    (torch.bfloat16, 32, 1024, 1024),
     (torch.bfloat16, 64, 4, 1024),
     (torch.bfloat16, 64, 32, 1024),
     (torch.float8_e4m3fn, 64, 4, 1024),
@@ -4005,26 +4157,30 @@ _LAUNCH_GEOMETRIES = (
 )
 
 
+@pytest.mark.parametrize("with_sink", [False, True])
 @pytest.mark.parametrize("bmm2_scale", [1.0, 0.5])
 @pytest.mark.parametrize("q_len", [1, 2])
 @pytest.mark.parametrize("facts", [("sm_100a", 148), ("sm_103a", 152)])
 def test_resolved_cake_launch_matches_the_dispatcher(
-    monkeypatch, facts, q_len, bmm2_scale
+    monkeypatch, facts, q_len, bmm2_scale, with_sink
 ):
     """The launch the second stage resolves once (``_launch_plan``) makes the
     same family calls with the same arguments as the stateless dispatcher on
     every program the candidate reaches (split-KV included), both simulated
-    devices, q_len 1 and 2 and bmm2_scale != 1: the same caller tensors
-    (address, shape, strides, dtype), the same scalars and stream, per-call
-    scratch of the same sizes. The resolved launch takes the device's domain,
-    so a split-KV geometry resolves the split-KV program. Nothing is built or
-    launched; any CUDA device."""
+    devices, q_len 1 and 2, bmm2_scale != 1 and with sinks: the same caller
+    tensors (address, shape, strides, dtype; the call's sink, not the
+    placeholder), the same scalars and stream, per-call scratch of the same
+    sizes. The resolved launch takes the device's domain, so a split-KV
+    geometry resolves the split-KV program. Nothing is built or launched; any
+    CUDA device."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     monkeypatch.setattr(cake_module, "_device_facts", lambda index: facts)
     runs = _record_runs(monkeypatch)
     device = torch.device("cuda", torch.cuda.current_device())
     lut = cake_module._fp8_lut(device)
+    sink = torch.zeros(NUM_HEADS, dtype=torch.float32, device=device)
+    sinks = [sink] if with_sink else None
     checked = splitkv = 0
     for dtype, page_size, rows, max_seq_len in _LAUNCH_GEOMETRIES:
         batch_size = rows // q_len
@@ -4047,14 +4203,28 @@ def test_resolved_cake_launch_matches_the_dispatcher(
             kv_cache=kv_cache,
             bmm1_scale=1.0 / (192**0.5),
             bmm2_scale=bmm2_scale,
+            sinks=sinks,
         )
-        label = (facts, dtype, page_size, rows, q_len, max_seq_len, bmm2_scale)
+        label = (
+            facts,
+            dtype,
+            page_size,
+            rows,
+            q_len,
+            max_seq_len,
+            bmm2_scale,
+            with_sink,
+        )
         domain = runner._domain(inputs, facts[1], arch=facts[0])
         is_splitkv = domain == cake_module.DOMAIN_BF16_SPLITKV
-        assert is_splitkv == (max_seq_len > 1024), label
+        assert is_splitkv == (max_seq_len > 1024 and domain is not None), label
         if domain is None:
-            # BF16 page 64 beyond a half-value split, CLC with bmm2_scale != 1.
-            assert page_size == 64 or bmm2_scale != 1.0, label
+            # FP8 with sinks (the tail); without sinks BF16 page 64 beyond a
+            # half-value split, CLC with bmm2_scale != 1.
+            if with_sink:
+                assert dtype == torch.float8_e4m3fn, label
+            else:
+                assert page_size == 64 or bmm2_scale != 1.0, label
             assert runner._launch_plan(inputs) is None, label
             continue
         plan = runner._launch_plan(inputs)
@@ -4066,6 +4236,7 @@ def test_resolved_cake_launch_matches_the_dispatcher(
             seq_lens.data_ptr(): "seq_lens",
             out.data_ptr(): "out",
             lut.data_ptr(): "fp8_table",
+            sink.data_ptr(): "sink",
         }
         runs.clear()
         runner._plan = plan
@@ -4143,6 +4314,118 @@ def test_memoized_cake_call_matches_explicit_cake_bitwise(
     assert torch.equal(first, explicit)
     assert torch.equal(first, stateless)
     _assert_live_and_padded(first, case, f"{geometry} memoized")
+
+
+def _stateless_cake(case):
+    """The stateless dispatcher on ``case`` (its sinks included)."""
+    return cake_module.trtllm_mla_blackwell_decode(
+        case["query"],
+        case["kv_cache"],
+        case["block_tables"],
+        case["seq_lens"],
+        case["max_seq_len"],
+        qk_nope_head_dim=128,
+        kv_lora_rank=LATENT,
+        qk_rope_head_dim=QK_DIM - LATENT,
+        sparse_mla_top_k=0,
+        out=_nan_out(case),
+        bmm1_scale=case["bmm1_scale"],
+        bmm2_scale=case["bmm2_scale"],
+        sinks=case.get("sinks"),
+        skip_softmax_threshold_scale_factor=None,
+        enable_pdl=None,
+        uses_shared_paged_kv_idx=True,
+        lse=None,
+        return_lse=False,
+        cum_seq_lens_q=None,
+        max_q_len=None,
+        multi_ctas_kv_counter_buffer=None,
+        sparse_mla_top_k_lens=None,
+        enable_dcp=False,
+        stateless=True,
+    )
+
+
+@pytest.mark.timeout(600, method="thread")
+@pytest.mark.parametrize("q_len", [1, 2])
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        "bf16_p32_vquarter",
+        "bf16_p32_vhalf",
+        "bf16_p64_vhalf",
+        "bf16_p32_splitkv",
+        "bf16_p64_splitkv",
+    ],
+)
+def test_memoized_sink_and_plain_calls_never_share_a_decision(
+    monkeypatch, clean_tuner, geometry, q_len
+):
+    """Calls of one shape with and without sinks, alternating, each look up
+    once and then reuse their own memoized decision and resolved launch (the
+    launch with sinks applies the call's sink, the other none); every output
+    equals, bit for bit, the stateless dispatcher with the same sinks, also
+    after the sink values change in place, eagerly and in a replayed graph."""
+    _require_cake_arch()
+    arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
+    _skip_unserved_geometry(geometry, "sinks", arch, num_sms)
+    case = _parity_case(geometry, q_len)
+    _pad(case["seq_lens"], q_len)
+    generator = torch.Generator().manual_seed(1)
+    sink = (torch.randn(NUM_HEADS, generator=generator) * 2.0).to("cuda")
+    sink_case = dict(case, sinks=[sink])
+    selected = _force_cake(monkeypatch, case)
+    # List the unit with sinks too (its own domain: sinks take the quarter-value
+    # split where the plain request takes the half-value split).
+    plain_table = core._CAKE_MLA_AUTO_OFFERS
+    _offer_case(monkeypatch, sink_case)
+    monkeypatch.setattr(
+        core, "_CAKE_MLA_AUTO_OFFERS", {**plain_table, **core._CAKE_MLA_AUTO_OFFERS}
+    )
+    assert len(core._CAKE_MLA_AUTO_OFFERS) == 2
+    launches = _spy_cake_forward(monkeypatch)
+    results = _spy_stage_two(monkeypatch)
+    outputs = [
+        _decode(dict(sink_case if call % 2 == 0 else case, out=_nan_out(case)))
+        for call in range(4)
+    ]
+    torch.cuda.synchronize()
+    # One lookup per kind of request; the repeated calls reuse their own
+    # decision (``_CAKE_MLA_AUTO_MEMO`` holds one entry per kind).
+    assert len(selected) == 2
+    assert [_name(runner) for runner, _ in results] == ["cake", "cake"]
+    assert len(core._CAKE_MLA_AUTO_MEMO) == 2
+    assert [runner.sinks is not None for runner in launches] == [True, False] * 2
+    plans = [runner._plan for runner in launches]
+    assert all(plan is not None for plan in plans)
+    assert plans[0][0] != plans[1][0]
+    assert plans[2][0] == plans[0][0] and plans[3][0] == plans[1][0]
+    assert torch.equal(outputs[2], outputs[0]) and torch.equal(outputs[3], outputs[1])
+    assert torch.equal(outputs[0], _stateless_cake(sink_case))
+    assert torch.equal(outputs[1], _stateless_cake(case))
+    assert not torch.equal(outputs[0], outputs[1])
+    _assert_live_and_padded(outputs[0], sink_case, f"{geometry} with sinks")
+    _assert_live_and_padded(outputs[1], case, f"{geometry} without sinks")
+
+    # The memoized launch reads the call's sink values.
+    sink.neg_()
+    updated = _decode(dict(sink_case, out=_nan_out(case)))
+    torch.cuda.synchronize()
+    assert torch.equal(updated, _stateless_cake(sink_case))
+    assert not torch.equal(updated, outputs[0])
+    _assert_live_and_padded(updated, sink_case, f"{geometry} updated sinks")
+    sink_case["out"] = _nan_out(case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _decode(sink_case)
+    torch.cuda.synchronize()
+    sink.add_(1.0)
+    sink_case["out"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(sink_case["out"], _stateless_cake(sink_case))
+    _assert_live_and_padded(sink_case["out"], sink_case, f"{geometry} graph sinks")
+    assert all(_name(runner) == "cake" for runner in launches)
 
 
 def _count_tuning_configs(monkeypatch):
