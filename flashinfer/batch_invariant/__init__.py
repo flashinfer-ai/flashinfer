@@ -92,12 +92,39 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int, causal: Optional[bool] = None) -> str:
-    """The attention class at ``head_dim`` under a mask mode; ``None`` is the causal class (the decode wrapper's
-    ``is_causal=None``), never a truth value."""
+def _attention_fmt(dtype: Union[torch.dtype, str, None]) -> str:
+    """The attention class of an operand dtype (the one format of q, K, V and the output): bf16 (the default class) or
+    ``torch.float16`` / ``"fp16"`` (the fp16 class)."""
+    names = {
+        None: "bf16",
+        torch.bfloat16: "bf16",
+        "bf16": "bf16",
+        torch.float16: "f16",
+        "f16": "f16",
+        "fp16": "f16",
+    }
+    if dtype not in names:
+        raise ValueError(
+            "fingerprint(<attention wrapper>) takes dtype torch.bfloat16 (the default) or torch.float16 "
+            f"(or 'bf16' / 'fp16'), not {dtype!r}"
+        )
+    return names[dtype]
+
+
+def _attention_fingerprint(
+    head_dim: int,
+    causal: Optional[bool] = None,
+    dtype: Union[torch.dtype, str, None] = None,
+) -> str:
+    """The attention class at ``head_dim`` under a mask mode and an operand format; ``causal=None`` is the causal class (the
+    decode wrapper's ``is_causal=None``), never a truth value; ``dtype=None`` is the bf16 class."""
     from ..attention.batch_invariant.spec import spec_fingerprint
 
-    return spec_fingerprint(head_dim, causal=True if causal is None else bool(causal))
+    return spec_fingerprint(
+        head_dim,
+        causal=True if causal is None else bool(causal),
+        fmt=_attention_fmt(dtype),
+    )
 
 
 #: The prefill wrappers' ``plan()`` defaults to ``causal=False``, which runs the non-causal class: their receipt has no
@@ -621,24 +648,29 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_mxfp4w8a_fingerprint,
         ("arch",),
     ),
-    # the three attention wrappers compute one class per head dim and mask mode: under the causal class a token's output depends
-    # on its KV position, its head and the window alone, under the non-causal class (`causal=False`) on its request's key count
-    # and its head alone; prefill and decode (and the paged and ragged KV layouts) are one class per mode. The mode is a fixed
-    # dimension of the prefill wrappers' receipt (their plan() defaults to the non-causal class) and optional for the decode
-    # wrapper, whose default (a single token per request, or `is_causal=None`) is the causal class
+    # the three attention wrappers compute one class per head dim, mask mode and operand format: under the causal class a token's
+    # output depends on its KV position, its head and the window alone, under the non-causal class (`causal=False`) on its
+    # request's key count and its head alone; prefill and decode (and the paged and ragged KV layouts) are one class per mode. The
+    # mode is a fixed dimension of the prefill wrappers' receipt (their plan() defaults to the non-causal class) and optional for
+    # the decode wrapper, whose default (a single token per request, or `is_causal=None`) is the causal class. The operand dtype
+    # (the one format of q, K, V and the output) is an optional dimension of all three, orthogonal to the mode: bf16 (the
+    # default) names the class attention.bf16, torch.float16 the class attention.fp16 (binary16 leaves and MMA steps, the
+    # probabilities and the output rounded to binary16)
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal",)
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal", "dtype")
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
         "attention.bf16",
         ("head_dim", "causal"),
         _attention_fingerprint,
+        ("dtype",),
         note=_PREFILL_CAUSAL_NOTE,
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16",
         ("head_dim", "causal"),
         _attention_fingerprint,
+        ("dtype",),
         note=_PREFILL_CAUSAL_NOTE,
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
@@ -750,7 +782,11 @@ def fingerprint(op: str, **dims) -> str:
     optional: omitted or ``None`` is the causal class, as ``is_causal=None`` is in its ``plan()``, and a single-token decode
     step is the causal class whatever ``is_causal`` says. The sliding window (``window_left``) is a per-call input of the
     causal class, like the KV position: the receipt is the digest of the class's no-window sample row and covers windowed
-    calls too.
+    calls too. The optional ``dtype`` names the operand format, the one dtype of q, K, V and the output, a dimension
+    orthogonal to the mode: ``torch.bfloat16`` (the default) is the bf16 class, ``torch.float16`` the fp16 class
+    (``attn-fp16-d<D>-*`` and ``attn-fp16-d<D>-nc-*``: binary16 leaves, the binary16 variant of the 16-wide MMA step, the
+    probabilities of the PV product and the output rounded to binary16 with round-to-nearest-even, an output magnitude of
+    65520 or more giving ``inf``).
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
@@ -764,6 +800,10 @@ def fingerprint(op: str, **dims) -> str:
     'attn-bf16-d128-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
+    >>> fingerprint("BatchDecodeWithPagedKVCacheWrapper", head_dim=128, dtype=torch.float16)  # doctest: +SKIP
+    'attn-fp16-d128-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, causal=False, dtype=torch.float16)  # doctest: +SKIP
+    'attn-fp16-d128-nc-...'
     >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kblock128-...'
     >>> fingerprint("mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_107")  # doctest: +SKIP
@@ -807,7 +847,7 @@ def class_name(op: str) -> str:
     ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.e4m3.kblock128"`` behind ``gemm_fp8_nt_groupwise``;
     ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
     ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``; ``"gemm.mxfp4w8a"`` for the mixed MX classes behind
-    ``mm_mxfp8_mxfp4``)."""
+    ``mm_mxfp8_mxfp4``; ``"attention.bf16"`` for the attention wrappers, whose fp16 plans run ``attention.fp16``)."""
     info = CLASSES.get(op)
     if info is None:
         raise ValueError(

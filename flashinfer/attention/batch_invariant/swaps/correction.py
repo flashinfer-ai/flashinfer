@@ -20,7 +20,7 @@ from cutlass.cute.nvgpu import tcgen05
 
 from ....batch_invariant.fp_interface.cute import CuteF32
 from ..blocks.correction import merge_coeffs, row_sum
-from ..blocks.operands import ACC_DTYPE, IN_DTYPE
+from ..blocks.operands import ACC_DTYPE
 from .operands import BAR_COEF
 
 _NEG_INF = float("-inf")
@@ -233,7 +233,7 @@ def correction_loop(
                     out_row = (q_base + q_tok0 + n // g) * Hq + kv_head * g + n % g
                     mO[(out_row.to(Int64), d)] = CuteF32.add(
                         CuteF32.mul(rM[e], s_inv[n]), Float32(0.0)
-                    ).to(IN_DTYPE)
+                    ).to(mO.element_type)
         else:
             for e in cutlass.range_constexpr(n_el):
                 n = tLDc[e][1]

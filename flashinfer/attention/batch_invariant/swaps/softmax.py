@@ -30,7 +30,7 @@ from cutlass.cute.nvgpu import tcgen05
 from ....batch_invariant import canon
 from ....batch_invariant.fp_interface.cute import CuteF32
 from .. import spec
-from ..blocks.operands import ACC_DTYPE, IN_DTYPE
+from ..blocks.operands import ACC_DTYPE
 from .operands import BAR_SOFTMAX
 
 _NEG_INF = float("-inf")
@@ -302,7 +302,7 @@ def unit_loop(
                 + 64 * n
                 + 64 * NP * (kk // 64)
             )
-            sP_e[off] = ps[n].to(IN_DTYPE)
+            sP_e[off] = ps[n].to(st.in_dtype)
         cute.arch.fence_view_async_shared()
         ph.commit()
     # an odd unit: warpgroup 1's phantom tile -- every pipeline step of a tile without the work (its S^T stage waited for and released, two

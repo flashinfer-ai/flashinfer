@@ -105,7 +105,9 @@ class AttentionKernel:
         cap: int = 0,
         *,
         causal: bool = True,
+        fmt: str = "bf16",
     ):
+        self.fmt = fmt  # the class's operand format (bf16, or f16 for the fp16 class)
         self.D, self.g, self.page, self.kv_slots, self.n_wg, self.q2, self.ragged = (
             D,
             g,
@@ -155,6 +157,7 @@ class AttentionKernel:
             self.hw_rowmax,
             self.cap,
             causal=self.causal,
+            fmt=self.fmt,
         )
         self.st = st
         tma = TmaSetup(st, mQ, mK, mV)

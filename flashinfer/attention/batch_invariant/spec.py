@@ -27,6 +27,22 @@ symbolic spec and the Lean coupling, ``CuteF32`` inside the kernel). Per logical
 Tile and chunk boundaries are absolute, ``T`` and ``C`` are functions of ``D`` only, so decode at
 position ``p`` and prefill of the token at position ``p`` build the same term (R4), and nothing in
 the term depends on the batch, the page table or the configuration (R2, R3).
+
+The fp16 class ``attn.fp16.d<D>`` (``OPERAND_FMTS``, ``fmt = "f16"``) is the same dataflow over IEEE binary16 operands: Q, K and V
+are binary16 leaves, every score and PV K-step is the binary16 variant of the instruction (``MMA_OP_OF``: the same ``kind::f16``
+family, 16 elements per step, with the binary16 operand format -- a different opaque primitive from the bf16 step), the probabilities
+the softmax hands the PV product are rounded to binary16 (``cvt_f16``: round to nearest even with gradual underflow, so a weight
+of ``2^-25`` or less is ``+0`` and a weight below ``2^-14`` keeps fewer than 11 significant bits; the largest weight is 1 up to
+the rounding of its exponent argument, far inside the range), and the epilogue
+rounds to binary16 (``cvt_f16(add(mul(O, div(1, l)), +0))``: round to nearest even, a magnitude of ``65520`` or more gives ``inf``).
+Scores, the softmax statistics, the accumulator and the chunk merge are binary32 exactly as in the bf16 class, so the operand
+range (up to ``65504``) never overflows a score; the output rounding can: the row sum ``l`` adds the unrounded probabilities while
+``O`` accumulates the rounded ones, so a row whose values sit within about ``2^-11`` of the binary16 maximum can round to ``inf``
+although every exact convex combination of them is finite. Accuracy against exact arithmetic: the roundings of the weights
+of at least ``2^-14`` (relative to their chunk's maximum) and of the output are relative, ``2^-11`` of ``sum_k p_k |v_k|``; a
+smaller weight is rounded on the ``2^-24`` grid, an absolute error of at most ``2^-25 |v_k|`` per key, which shows only where
+values thousands of times larger than the row's dominant ones sit behind such weights. Different leaves' format, a different step, different roundings:
+different classes and fingerprints; the bf16 class is unchanged.
 """
 
 from __future__ import annotations
@@ -49,6 +65,13 @@ TILE_KEYS = 128  # T: keys per KV tile (the N extent of one QK^T MMA tile)
 MMA_K = 16  # bf16 K extent of one tcgen05.mma step (shared with the GEMM)
 FLT_MAX = 3.4028234663852886e38  # the largest binary32 number
 MMA_OP = _GEMM_MMA_OP  # "mma_bf16_k16": the same opaque instruction family as the GEMM
+#: The operand formats of the class family: Q, K, V, the probabilities the softmax writes back for the PV product and the output
+#: all have the class's one 16-bit format. ``"bf16"`` is the class ``attention.bf16``, ``"f16"`` (IEEE binary16) ``attention.fp16``.
+OPERAND_FMTS = ("bf16", "f16")
+#: The opaque K-step per operand format: both are ``tcgen05.mma kind::f16`` with 16 elements per step; the instruction's operand
+#: format field selects bf16 or binary16 products, so the two are different primitives (different terms at every D).
+MMA_OP_OF = {"bf16": MMA_OP, "f16": "mma_f16_k16"}
+CLASS_TAG = {"bf16": "bf16", "f16": "fp16"}  # the tag in class names and fingerprints
 HEAD_DIMS = (
     64,
     128,
@@ -80,6 +103,14 @@ def chunk_len(D: int, L: Optional[int] = None) -> int:
     C a candidate there; the common constant was kept)."""
     assert D in HEAD_DIMS, D
     return CHUNK_LEN_OF[D]
+
+
+def class_name(*, fmt: str = "bf16") -> str:
+    """The class family of an operand format: ``attention.bf16`` or ``attention.fp16``. ``fmt`` is keyword-only here and in
+    every function of this module that takes it: it names the OPERAND format (q, the probabilities, the output and the MMA
+    step), a dimension of its own next to the mask mode and to any format of the stored K / V."""
+    assert fmt in OPERAND_FMTS, fmt
+    return f"attention.{CLASS_TAG[fmt]}"
 
 
 def tiles_per_chunk(D: int) -> int:
@@ -225,10 +256,29 @@ def init_state(fp) -> State:
     return State(fp.const(NEG_INF), fp.const(0.0), fp.const(0.0))
 
 
-def score_term(fp, row: RowSpec, k: int, D: int):
+def score_term(fp, row: RowSpec, k: int, D: int, *, fmt: str = "bf16"):
     """``s_k``: the GEMM's K-fold over ``D`` (``D/16`` opaque ``MMA16`` steps from +0) for A row
-    ``row.row`` and B column ``k``: the same reduction object as ``gemm.bf16.kfold[K=D]``."""
-    return gemm_kfold(D, row.row, k).canonical(fp)
+    ``row.row`` and B column ``k``: the same reduction object as ``gemm.bf16.kfold[K=D]``. The fp16 class folds the same
+    slices (binary16 leaves) with its own step (``MMA_OP_OF["f16"]``)."""
+    if fmt == "bf16":
+        return gemm_kfold(D, row.row, k).canonical(fp)
+    assert fmt in OPERAND_FMTS, fmt
+
+    def leaf(fp_, idx):
+        t = idx["kstep"]
+        return fp_.op("ab_kslice", fp_.op("a_rows", row.row, t), fp_.op("b_cols", t, k))
+
+    kstep = Digit(
+        "kstep",
+        d_steps(D),
+        "fold",
+        init=lambda fp_: fp_.const(0.0),
+        step=lambda fp_, acc, tile: fp_.op(MMA_OP_OF[fmt], acc, tile),
+        identity_note="the binary16 K-step over the slices of gemm.bf16.kfold (no padded step: D is a multiple of 16)",
+    )
+    return Reduction(f"attn.{CLASS_TAG[fmt]}.score[K={D}]", (kstep,), leaf).canonical(
+        fp
+    )
 
 
 def alpha_term(fp, m_old, m_new, c, nc):
@@ -273,31 +323,43 @@ def tile_stats(
     return m_new, alpha, [fp.const(0.0) if q is None else q for q in probs], l_new
 
 
-def pv_fold(fp, o_scaled, probs_bf16: Sequence[Any], v_slice: Callable[[int], Any]):
+def pv_fold(
+    fp,
+    o_scaled,
+    probs_bf16: Sequence[Any],
+    v_slice: Callable[[int], Any],
+    *,
+    fmt: str = "bf16",
+):
     """``O' = MMA16-fold over the tile's key-steps from ``o_scaled = mul(O, alpha)``: step ``j`` takes
-    the bf16 P slice of keys ``16j .. 16j+15`` (masked keys carry ``+0``) and ``v_slice(j)``."""
+    the bf16 P slice of keys ``16j .. 16j+15`` (masked keys carry ``+0``) and ``v_slice(j)``. In the fp16 class the P slice
+    holds the binary16 roundings and the step is the binary16 one."""
     acc = o_scaled
     for j in range(len(probs_bf16) // MMA_K):
         p_slice = fp.op("p_slice", *probs_bf16[j * MMA_K : (j + 1) * MMA_K])
-        acc = fp.op(MMA_OP, acc, fp.op("pv_kslice", p_slice, v_slice(j)))
+        acc = fp.op(MMA_OP_OF[fmt], acc, fp.op("pv_kslice", p_slice, v_slice(j)))
     return acc
 
 
-def tile_step(fp, st: State, tile: Dict[str, Any], c, nc, D: int, d: int) -> State:
+def tile_step(
+    fp, st: State, tile: Dict[str, Any], c, nc, D: int, d: int, *, fmt: str = "bf16"
+) -> State:
     """One tile of the per-chunk fold (the ``tile`` digit's step). ``tile`` = ``{"t": abs tile index,
-    "keys": visible absolute keys, "row": RowSpec}``."""
+    "keys": visible absolute keys, "row": RowSpec}``. ``fmt`` is the class's operand format: the probabilities are rounded to it
+    (one ``cvt.rn`` each: a declared rounding of the term) before the PV step of that format."""
     row, t, keys, T = tile["row"], tile["t"], tile["keys"], tile["T"]
     scores = [
-        score_term(fp, row, t * T + k, D) if (t * T + k) in keys else None
+        score_term(fp, row, t * T + k, D, fmt=fmt) if (t * T + k) in keys else None
         for k in range(T)
     ]
     m_new, alpha, probs, l_new = tile_stats(fp, st.m, st.l, scores, c, nc)
-    probs_bf16 = [fp.cvt_out(q, "bf16") for q in probs]
+    probs_bf16 = [fp.cvt_out(q, fmt) for q in probs]
     o_new = pv_fold(
         fp,
         fp.mul(st.o, alpha),
         probs_bf16,
         lambda j: fp.op("v_slice", t * (T // MMA_K) + j, d),
+        fmt=fmt,
     )
     return State(m_new, l_new, o_new)
 
@@ -322,7 +384,15 @@ def output_elem(fp, st: State, out_fmt: str = "bf16"):
 
 
 def attention_reduction(
-    row: RowSpec, D: int, d: int, c, nc, T: int = TILE_KEYS, C: Optional[int] = None
+    row: RowSpec,
+    D: int,
+    d: int,
+    c,
+    nc,
+    T: int = TILE_KEYS,
+    C: Optional[int] = None,
+    *,
+    fmt: str = "bf16",
 ) -> Reduction:
     """The per-row dataflow as an engine ``Reduction`` with two ``fold`` digits: ``tile`` (radix
     ``C/T``, the online softmax inside a chunk) and ``chunk`` (radix = chunks of the prefix, the
@@ -343,7 +413,7 @@ def attention_reduction(
         C // T,
         "fold",
         init=init_state,
-        step=lambda fp, st, tl: tile_step(fp, st, tl, c, nc, D, d),
+        step=lambda fp, st, tl: tile_step(fp, st, tl, c, nc, D, d, fmt=fmt),
         identity_note="absent tiles are dropped; a kernel's null step (P row = 0, alpha = 1) is exact on (m, l) "
         "and exact on O up to the sign of an exact zero, which the epilogue's add(+0) erases",
     )
@@ -355,7 +425,7 @@ def attention_reduction(
         step=lambda fp, a, b: merge(fp, a, b, c, nc),
         identity_note="absent chunks are dropped (never merged)",
     )
-    return Reduction(f"attn.bf16.d{D}[T={T},C={C}]", (tile, chunk), leaf)
+    return Reduction(f"attn.{CLASS_TAG[fmt]}.d{D}[T={T},C={C}]", (tile, chunk), leaf)
 
 
 def fold_placement(red: Reduction) -> canon.Placement:
@@ -386,15 +456,22 @@ class AttentionSpec:
         alg: Optional[TermAlgebra] = None,
         T: int = TILE_KEYS,
         C: Optional[int] = None,
-        out_fmt: str = "bf16",
+        out_fmt: Optional[str] = None,
+        *,
+        fmt: str = "bf16",
     ):
-        self.D, self.T, self.out_fmt = D, T, out_fmt
+        assert fmt in OPERAND_FMTS, fmt
+        # the operand format of the class; the output is rounded to the same format unless a caller of the model asks otherwise
+        self.fmt = fmt
+        self.D, self.T, self.out_fmt = D, T, fmt if out_fmt is None else out_fmt
         self.C = chunk_len(D) if C is None else C
         self.alg = alg or TermAlgebra()
         self.c, self.nc = self.alg.sym("c"), self.alg.sym("nc")
 
     def reduction(self, row: RowSpec, d: int) -> Reduction:
-        return attention_reduction(row, self.D, d, self.c, self.nc, self.T, self.C)
+        return attention_reduction(
+            row, self.D, d, self.c, self.nc, self.T, self.C, fmt=self.fmt
+        )
 
     def state(self, row: RowSpec, d: int) -> State:
         return self.reduction(row, d).canonical(self.alg)
@@ -414,7 +491,9 @@ FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
 
 
-def spec_fingerprint(D: int = 128, window_left: int = -1, causal: bool = True) -> str:
+def spec_fingerprint(
+    D: int = 128, window_left: int = -1, causal: bool = True, *, fmt: str = "bf16"
+) -> str:
     """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose visible keys
     span one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
     masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C`` and the mask mode. The window is a
@@ -423,14 +502,17 @@ def spec_fingerprint(D: int = 128, window_left: int = -1, causal: bool = True) -
     another sample row. The mask mode IS a class dimension: the non-causal class (``causal=False``, name ``attn-bf16-d<D>-nc-*``)
     gives a token the visible set ``[0, kv_len)`` of its request where the causal class gives ``[0, p + 1)``, so the same token
     has a different term under the two classes; the sample row's term is the same dataflow over the same visible keys in both
-    modes, and the mode enters the digest explicitly."""
+    modes, and the mode enters the digest explicitly. ``fmt`` (keyword-only) names the operand format (``OPERAND_FMTS``), a class
+    dimension orthogonal to the mask mode: the fp16 classes (``attn-fp16-d<D>-...`` and ``attn-fp16-d<D>-nc-...``) hash their
+    binary16 steps and roundings; the bf16 classes' digests are the ones recorded before the dimension existed."""
+    assert fmt in OPERAND_FMTS, fmt
     if not causal and window_left >= 0:
         raise ValueError("window_left is not a parameter of the non-causal class")
-    key = (D, window_left, bool(causal))
+    key = (D, window_left, bool(causal), fmt)
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
-        spec = AttentionSpec(D)
+        spec = AttentionSpec(D, fmt=fmt)
         L = spec.C + spec.T // 2 + 1
         row = (
             RowSpec(p=L - 1, window_left=window_left)
@@ -442,13 +524,17 @@ def spec_fingerprint(D: int = 128, window_left: int = -1, causal: bool = True) -
             f"T={spec.T}",
             f"C={spec.C}",
             f"win={window_left}",
+        ]
+        if fmt != "bf16":
+            parts.append(f"fmt={fmt}")
+        parts += [
             fingerprint(spec.output(row, 0)),
             fingerprint(spec.output(row, 1)),
         ]
         if not causal:
             parts.insert(3, "mask=noncausal")
         _FINGERPRINTS[key] = (
-            f"attn-bf16-d{D}-"
+            f"attn-{CLASS_TAG[fmt]}-d{D}-"
             + ("" if causal else "nc-")
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )

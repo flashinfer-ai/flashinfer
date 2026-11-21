@@ -235,9 +235,10 @@ def test_lean_model_matches_python_engine_and_spec():
     for KB, sx in lean_cases.fp8bs_loop_cases():
         assert lean[("gemmfp8bsloop", KB)] == sx, ("e4m3_bs loop", KB)
         checked += 1
-    for name, *_, sx in lean_cases.attn_cases():
-        assert lean[("attn", name)] == sx, name
-        checked += 1
+    for fmt in ("bf16", "f16"):
+        for name, *_, sx in lean_cases.attn_cases(fmt):
+            assert lean[("attn", name)] == sx, (fmt, name)
+            checked += 1
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80
 

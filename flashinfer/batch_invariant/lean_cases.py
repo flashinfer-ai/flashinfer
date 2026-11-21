@@ -133,6 +133,41 @@ ATTN_CASES = [
     ),  # whole tiles: the last position equals the causal a0 row's prefix
 ]
 ATTN_HEAD_DIMS = (64, 128, 256)
+# the fp16 classes' toy cases (same fields): binary16 steps in every score and PV slice, the probabilities and the output rounded
+# to binary16, under both mask modes; emitted as their own family module (``Cases/AttentionFp16.lean``)
+ATTN_FP16_CASES = [
+    ("f0", 64, 16, 32, 24, -1, 0, 0, True, 0),
+    ("f1", 128, 16, 32, 33, 5, 1, 2, True, 0),  # a window across a chunk boundary
+    ("f2", 256, 16, 32, 33, 5, 1, 2, True, 0),  # sixteen steps per score
+    (
+        "f3",
+        64,
+        16,
+        32,
+        100,
+        0,
+        0,
+        0,
+        True,
+        0,
+    ),  # leading chunks absent, one visible key
+    (
+        "f4",
+        64,
+        32,
+        64,
+        40,
+        12,
+        0,
+        0,
+        True,
+        0,
+    ),  # two PV slices per tile (T = 2 x MMA_K)
+    # the non-causal mode: a token in the first tile seeing past its position, a partial last tile, at every head dim
+    ("f5", 64, 16, 32, 5, -1, 0, 0, False, 41),
+    ("f6", 128, 16, 32, 20, -1, 1, 2, False, 45),
+    ("f7", 256, 16, 32, 0, -1, 0, 1, False, 33),
+]
 
 GEMM_CASES = [
     (64, 1),
@@ -585,7 +620,7 @@ BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 DECIDED_THEOREMS = (
     tuple(n for F in FORMATS for n in F.decided)
     + ("gemm_fp8bs_space_ok", "gemm_fp8bs_dispatch_in_space")
-    + tuple(f"attn_{n}_spec" for n, *_ in ATTN_CASES)
+    + tuple(f"attn_{n}_spec" for n, *_ in ATTN_CASES + ATTN_FP16_CASES)
     + tuple(
         f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
     )
@@ -596,6 +631,8 @@ MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_C",
     "Attn.output_depends_on_D",
     "Attn.output_depends_on_D_64",
+    "Attn.output_depends_on_fmt",
+    "Attn.output_depends_on_fmt_noncausal",
     "Attn.output_depends_on_mode",
 )
 
@@ -677,19 +714,24 @@ def bias_cases() -> List[Tuple[int, int, str]]:
     ]
 
 
-def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, bool, int, str]]:
-    """The attention toy cases with the Python spec's S-expression of the output element."""
+def attn_cases(
+    fmt: str = "bf16",
+) -> List[Tuple[str, int, int, int, int, int, int, int, bool, int, str]]:
+    """The attention toy cases with the Python spec's S-expression of the output element: the bf16 classes', or the fp16
+    classes' (``fmt = "f16"``)."""
     from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
     from .fp_interface.term import sexpr
 
     out = []
-    for name, D, T, C, p, win, rid, d, causal, kv_len in ATTN_CASES:
+    for name, D, T, C, p, win, rid, d, causal, kv_len in (
+        ATTN_CASES if fmt == "bf16" else ATTN_FP16_CASES
+    ):
         row = (
             RowSpec(p=p, window_left=win, row=rid)
             if causal
             else RowSpec(p=p, row=rid, causal=False, kv_len=kv_len)
         )
-        sx = sexpr(AttentionSpec(D, T=T, C=C).output(row, d))
+        sx = sexpr(AttentionSpec(D, T=T, C=C, fmt=fmt).output(row, d))
         out.append((name, D, T, C, p, win, rid, d, causal, kv_len, sx))
     return out
 
@@ -1176,20 +1218,14 @@ def _render_fp8_blockscale(L: List[str]) -> None:
     L.append("")
 
 
-def _render_attention(L: List[str]) -> None:
-    """The attention class: the toy-case spec terms and the per-head-dim configuration spaces."""
-    mk = MMA_K_OF["bf16"]
-    L.append(
-        "/-! The attention classes on toy sizes (T = 16: one PV step per tile; C = 32; D = 64 / 128 / 256 = 4 / 8 / 16 MMA steps per "
-        "score; causal rows see [lo, p + 1), non-causal rows see [0, kv_len)): the Python spec's output element "
-        "(`attention/batch_invariant/spec.py`) reproduced by `Attention.lean` node for node, and the split kernel's equality to it "
-        "instantiated on every case. -/"
-    )
-    for name, D, T, C, p, win, rid, d, causal, kv_len, sx in attn_cases():
+def _render_attention_cases(L: List[str], fmt: str) -> None:
+    """The spec theorem and the split-kernel instance of every toy case of the classes of operand format ``fmt``."""
+    mk = MMA_K_OF["bf16"]  # 16 elements per step in both operand formats
+    for name, D, T, C, p, win, rid, d, causal, kv_len, sx in attn_cases(fmt):
         tb = T.bit_length() - 1
         L.append(
             f"def attnP_{name} : Attn.Params := ⟨{D // mk}, {tb}, {C}, {p}, {win}, {rid}, {d}, "
-            f"{'true' if causal else 'false'}, {kv_len}⟩"
+            f'{"true" if causal else "false"}, {kv_len}, "{fmt}"⟩'
         )
         L.append(
             f"theorem attn_{name}_spec : (Attn.output attnP_{name}).sexpr = {lean_str(sx)} := by native_decide"
@@ -1198,6 +1234,35 @@ def _render_attention(L: List[str]) -> None:
             f"theorem attn_{name}_split : ∀ σ : Nat → Nat, Attn.splitKernel attnP_{name} σ = Attn.output attnP_{name} := "
             f"fun σ => Attn.splitKernel_eq_fused _ σ"
         )
+
+
+def _render_attention_fp16(L: List[str]) -> None:
+    """The fp16 attention classes on toy sizes. Their configuration space is the bf16 classes' (the same kernels with another
+    element type; the ``Attention`` family instantiates ``space_invariant`` for every row, whatever its format)."""
+    L.append(
+        "/-! The fp16 attention classes (`attention.fp16`, causal and non-causal) on toy sizes: the Python spec's output element "
+        'with binary16 operands (`AttentionSpec(fmt="f16")`: the `mma16f16` step in every score and PV slice, `cvt f16` on the '
+        "probabilities and on the output) reproduced by `Attention.lean` node for node, and the split kernel's equality to it "
+        "on every case. -/"
+    )
+    _render_attention_cases(L, "f16")
+    L.append(
+        "def attnFp16Cases : List (String × Attn.Params) := ["
+        + ", ".join(f'("{n}", attnP_{n})' for n, *_ in ATTN_FP16_CASES)
+        + "]"
+    )
+    L.append("")
+
+
+def _render_attention(L: List[str]) -> None:
+    """The attention class: the toy-case spec terms and the per-head-dim configuration spaces."""
+    L.append(
+        "/-! The attention classes on toy sizes (T = 16: one PV step per tile; C = 32; D = 64 / 128 / 256 = 4 / 8 / 16 MMA steps per "
+        "score; causal rows see [lo, p + 1), non-causal rows see [0, kv_len)): the Python spec's output element "
+        "(`attention/batch_invariant/spec.py`) reproduced by `Attention.lean` node for node, and the split kernel's equality to it "
+        "instantiated on every case. -/"
+    )
+    _render_attention_cases(L, "bf16")
     L.append(
         "def attnCases : List (String × Attn.Params) := ["
         + ", ".join(f'("{n}", attnP_{n})' for n, *_ in ATTN_CASES)
@@ -1241,6 +1306,7 @@ def _render_gemm(L: List[str]) -> None:
 FAMILIES: Tuple[Tuple[str, Tuple[str, ...], Callable[[List[str]], None]], ...] = (
     ("GEMM", (), _render_gemm),
     ("Attention", (), _render_attention),
+    ("AttentionFp16", (), _render_attention_fp16),
 )
 
 
@@ -1347,6 +1413,7 @@ def summary() -> str:
         f"space={len(fp8bs_space())} dispatch={len(fp8bs_dispatch_cases())}"
         + f"; native_decide theorems={len(DECIDED_THEOREMS)}"
         + f"; attention cases={len(ATTN_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
+        + f" fp16 cases={len(ATTN_FP16_CASES)}"
     )
 
 

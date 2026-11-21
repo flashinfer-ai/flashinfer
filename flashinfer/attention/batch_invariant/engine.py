@@ -1,7 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """FlashInfer-shaped entry points for the RL-ready paged attention (classes ``attn.bf16.d64`` / ``d128`` / ``d256``:
-one class per head dim, ``spec.HEAD_DIMS``).
+one class per head dim, ``spec.HEAD_DIMS``; and the fp16 classes ``attn.fp16.d<D>`` when q, K, V and the output are binary16:
+the same plan and kernels with the binary16 element type, ``OPERAND_DTYPES``).
 
 * ``attention_paged(q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, kv_last_page_len, ...)``: the
   single-call form (prefill or decode: a request with ``q_len == 1`` is a decode step; positions are
@@ -47,6 +48,9 @@ PAGE_SIZES = (
     64,
     128,
 )  # every power of two up to 128 (page size is a placement / layout input, never a class parameter)
+#: The operand format (``spec.OPERAND_FMTS``) of a tensor dtype: q, K, V and the output of one call share it, and it selects the
+#: class (``attention.bf16`` / ``attention.fp16``) and with it the kernels' element type and MMA instruction variant.
+OPERAND_DTYPES = {torch.bfloat16: "bf16", torch.float16: "f16"}
 MAX_GROUP = 128  # GQA group g = Hq / Hkv: 1 .. 128 (a Q tile holds (128 // g) g rows)
 
 
@@ -678,10 +682,10 @@ def run_attention(
             f"{planned.heads[1]} (one unit per KV head: the table does not cover other head counts)"
         )
     assert (
-        q.dtype == torch.bfloat16
-        and k_cache.dtype == torch.bfloat16
-        and v_cache.dtype == torch.bfloat16
-    )
+        q.dtype in OPERAND_DTYPES
+        and k_cache.dtype == q.dtype
+        and v_cache.dtype == q.dtype
+    ), (q.dtype, k_cache.dtype, v_cache.dtype)
     assert q.is_contiguous(), "Q must be a packed (total_q, Hq, D) tensor"
     if k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1:
         raise ValueError(
@@ -700,7 +704,7 @@ def run_attention(
     supplied_out = out is not None
     if out is None:
         out = torch.empty_like(q)
-    assert out.shape == q.shape and out.dtype == torch.bfloat16 and out.is_contiguous()
+    assert out.shape == q.shape and out.dtype == q.dtype and out.is_contiguous()
     if out.data_ptr() % 16:
         raise ValueError(
             "out must be 16-byte aligned (the TMA descriptors' requirement)"
@@ -749,6 +753,8 @@ def _run_attention_validated(
     from .spec import TILE_KEYS
 
     total_q, Hq, D = q.shape
+    # the class's operand format: part of every kernel's identity
+    fmt = OPERAND_DTYPES[q.dtype]
     if ragged:
         page = TILE_KEYS
         Hkv = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[0]
@@ -791,7 +797,15 @@ def _run_attention_validated(
         pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl, causal=causal
+            D,
+            g,
+            page,
+            n_pad,
+            ragged,
+            arch_smem_cap(q.device),
+            pdl,
+            causal=causal,
+            fmt=fmt,
         )
         kernel(
             q_view,
@@ -822,7 +836,17 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, causal=causal
+                D,
+                g,
+                page,
+                DEFAULT_RING[D],
+                1,
+                False,
+                ragged,
+                hwm,
+                cap,
+                causal=causal,
+                fmt=fmt,
             )
         else:
             kernel = get_compiled_attention(
@@ -836,6 +860,7 @@ def _run_attention_validated(
                 hwm,
                 cap,
                 causal=causal,
+                fmt=fmt,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
@@ -871,7 +896,7 @@ def _run_attention_validated(
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g, causal=causal)(
+        get_fixup(D, g, causal=causal, fmt=fmt)(
             planned.ws,
             o_view,
             planned.fixup_groups,

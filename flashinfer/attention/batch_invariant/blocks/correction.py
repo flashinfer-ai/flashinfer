@@ -51,7 +51,7 @@ from ..plan import (
     G_SLOT,
 )
 from ..spec import chunk_len
-from .operands import ACC_DTYPE, BAR_FOLD, IN_DTYPE, OM_VEC, Q_ROWS, om_scratch_blocks
+from .operands import ACC_DTYPE, BAR_FOLD, OM_VEC, Q_ROWS, om_scratch_blocks
 
 
 CT = 16  # TMEM columns per load / store with two softmax warpgroups (96 registers); 32 with one, 8 under the paired placement (StaticPlan.ct)
@@ -167,8 +167,8 @@ def normalize_elems(rM, inv, rOut):
     for e in range(0, cute.size(rM), 2):
         y0, y1 = CuteF32.mul2((rM[e], rM[e + 1]), (inv, inv))
         z0, z1 = CuteF32.add2((y0, y1), (zero, zero))
-        rOut[e] = z0.to(IN_DTYPE)
-        rOut[e + 1] = z1.to(IN_DTYPE)
+        rOut[e] = z0.to(rOut.element_type)
+        rOut[e + 1] = z1.to(rOut.element_type)
 
 
 def store_out_piece(rOut, mO, out_row, i, CT, D):
@@ -691,7 +691,7 @@ def correction_loop(
     rMs = bufs[1:] if not om_tmem else (rM,)
     rescale_bufs = bufs
     n_el = cute.size(rO)
-    rOut = cute.make_rmem_tensor(cute.make_layout((n_el,)), IN_DTYPE)
+    rOut = cute.make_rmem_tensor(cute.make_layout((n_el,)), st.in_dtype)
     n_pieces = D // CT
     row = tLDcO[
         0
@@ -1075,7 +1075,7 @@ def correction_loop_q2(
         cute.make_rmem_tensor(tLDcO.shape, ACC_DTYPE),
     )
     n_el = cute.size(rO)
-    rOut = cute.make_rmem_tensor(cute.make_layout((n_el,)), IN_DTYPE)
+    rOut = cute.make_rmem_tensor(cute.make_layout((n_el,)), st.in_dtype)
     n_pieces = D // CT
     row = tLDcO[0][0]
     om_layout = cute.make_layout((OM_VEC, D // OM_VEC), stride=(1, OM_VEC * Q_ROWS))

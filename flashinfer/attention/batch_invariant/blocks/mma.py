@@ -27,7 +27,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.cute.nvgpu import tcgen05
 
-from .operands import HALF, IN_DTYPE
+from .operands import HALF
 
 
 @cute.jit
@@ -138,7 +138,7 @@ def pv_tile(
                 tOrP_k = cute.make_tensor(
                     cute.recast_ptr(
                         tmem_ptr + st.tmem_p + ph.index * st.tmem_p_stride,
-                        dtype=IN_DTYPE,
+                        dtype=st.in_dtype,
                     ),
                     tOrP.layout,
                 )
@@ -200,7 +200,7 @@ def mma_loop(
 ):
     """``tStS`` is the tuple of the S accumulator's per-slot views of stage 0 (one view = the whole S at D <= 128)."""
     TPC = st.tpc
-    zeros8 = cute.make_rmem_tensor(cute.make_layout((8,)), IN_DTYPE)
+    zeros8 = cute.make_rmem_tensor(cute.make_layout((8,)), st.in_dtype)
     zeros8.fill(0.0)
     qh = q_cons.wait_and_advance()
     qs = qh.index
@@ -318,7 +318,7 @@ def pv_q2(
     p_cons.advance(1)
     tOrP_k = cute.make_tensor(
         cute.recast_ptr(
-            tmem_ptr + st.tmem_p + ph.index * st.tmem_p_stride, dtype=IN_DTYPE
+            tmem_ptr + st.tmem_p + ph.index * st.tmem_p_stride, dtype=st.in_dtype
         ),
         tOrP.layout,
     )
@@ -377,7 +377,7 @@ def mma_loop_q2(
     fold is the one-tile body's: ``QK`` one ``D / 16``-step block, ``PV`` reset at its Q tile's chunk starts (``chunk_blk`` against that
     tile's own ``tile_lo``)."""
     TPC = st.tpc
-    zeros8 = cute.make_rmem_tensor(cute.make_layout((8,)), IN_DTYPE)
+    zeros8 = cute.make_rmem_tensor(cute.make_layout((8,)), st.in_dtype)
     zeros8.fill(0.0)
     qh = q_cons.wait_and_advance()
     qa = 2 * qh.index

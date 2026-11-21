@@ -1523,7 +1523,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             16,
             causal=True,
             q_data_type=torch.float16,
-            kv_data_type=torch.float16,
+            kv_data_type=torch.bfloat16,
         )
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         w.plan(
