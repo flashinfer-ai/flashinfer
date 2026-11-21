@@ -847,6 +847,7 @@ class KdaDecodeUCacheFlushKernel:
         pdl_trigger=False,
         w_ring=16,
         tma_late=True,
+        smem_carveout=None,
     ):
         assert t_input in (4, 8), "KDA ucache kernel supports T in {4, 8} only"
         assert w_ring in (16, 32), "w_ring must be 16 or 32"
@@ -873,6 +874,9 @@ class KdaDecodeUCacheFlushKernel:
         #     lower residency but wins at small batch where SMs are
         #     under-filled and latency cover beats residency.
         self._tma_late = bool(tma_late)
+        # Explicit preferred SMEM carveout (percent) for the launch; None keeps the
+        # DSL default (derived from min_blocks_per_mp when that is > 1).
+        self._smem_carveout = smem_carveout
 
     @cute.experimental.jit
     def __call__(
@@ -948,6 +952,7 @@ class KdaDecodeUCacheFlushKernel:
             cluster=(1, 1, 1),
             stream=stream,
             min_blocks_per_mp=self._min_blocks_per_mp,
+            preferred_smem_carveout=self._smem_carveout,
         )
 
     @cute.experimental.kernel
@@ -3076,6 +3081,16 @@ def kda_delta_rule_mtp_ucache_flush(
             _mbp_cap = 5 if tma_late else 4
         else:
             _mbp_cap = (7 if T_in <= 4 else 6) if tma_late else 5
+        _carveout = None
+        if torch.cuda.get_device_capability(dev) == (10, 7):
+            # SM107: min_blocks_per_mp > 1 without a carveout makes the DSL derive a
+            # preferred SMEM carveout from min_blocks_per_mp x SMEM/CTA; when that
+            # exceeds the 233 KB/SM (w16 T<=4 tma-late: 7 x 34 KB) the launch faults
+            # (Xid 13, cudaErrorLaunchFailure; #4957 / #5253). Cap at the SMEM fit
+            # (6 CTAs/SM, 33 KB + 1 KB reserve each) and pin the carveout to 100 %.
+            if w_ring == 16 and tma_late and T_in <= 4:
+                _mbp_cap = 6
+            _carveout = 100
         mbp = max(1, min(_needed + 1, _mbp_cap))
         t_disc = 4 if T_in <= 4 else 8
         cache_key: tuple = (
@@ -3089,6 +3104,7 @@ def kda_delta_rule_mtp_ucache_flush(
             V_dim,
             w_ring,
             tma_late,
+            _carveout,
         )
         mk = from_dlpack
 
@@ -3131,6 +3147,7 @@ def kda_delta_rule_mtp_ucache_flush(
                     pdl_trigger=pdl_trigger,
                     w_ring=w_ring,
                     tma_late=tma_late,
+                    smem_carveout=_carveout,
                 ),
                 *args,
             )
