@@ -862,16 +862,18 @@ def test_gin_backend_builds(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     assert [gin_backend_name(t) for t in (2, 3, 4)] == ["proxy", "gdaki", "gpi"]
     with pytest.raises(RuntimeError, match="no device build for NCCL GIN type 5"):
         gin_backend_name(5)
-    # Each backend build compiles the other two out and is its own JIT module.
+    # Each backend build compiles every other backend out (the other two, and EFA GDA, which NCCL 2.32 adds) and is
+    # its own JIT module.
     for name, (_, defines) in GIN_BACKENDS.items():
-        assert len(defines) == 2 and all(name.upper() not in d for d in defines)
+        assert len(defines) == 3 and all(name.upper() not in d for d in defines)
+        assert "-DNCCL_GIN_EFA_GDA_ENABLE=0" in defines
     names = {
         gen_cake_sm120_megamoe_kernel_module(AOT_DEVICE_PARAMETERS[0], False, b).name
         for b in GIN_BACKENDS
     }
     assert len(names) == len(GIN_BACKENDS)
     # AOT packages every backend's build of the default parameter sets.  The binding spec
-    # records the NCCL 2.30.7 include and library paths; without the wheel (CI's CUDA 12.9
+    # records the NCCL include and library paths; without the wheel (CI's CUDA 12.9
     # image carries NCCL 2.29.7) stand-ins serve, as the spec is generated here, not built.
     try:
         cake_jit.nccl_installation()

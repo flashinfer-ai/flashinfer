@@ -32,8 +32,8 @@ Two kinds of JIT modules are built from it, both ordinary :class:`JitSpec` objec
   kernel is a cooperative persistent kernel launched with ``cuLaunchCooperativeKernel``
   rather than a ``<<<>>>`` host stub.
 
-Both link NCCL 2.30.7 (Device API: LSA + GIN), found like ``flashinfer/jit/comm.py``
-finds NCCL: ``NCCL_HOME``, then the ``nvidia-nccl`` wheel.
+Both compile against the headers of the NCCL this process loads (2.30.7 or newer; Device API: LSA + GIN), see
+:func:`nccl_installation`.
 """
 
 from __future__ import annotations
@@ -60,6 +60,8 @@ _MANIFEST_FORMAT = "cake-sm120-megamoe-manifest/3"
 _GEOMETRY_FORMAT = "cake-sm120-megamoe-geometry/1"
 # Hand-written carrier of the two embedded cubins of one device module (not generated).
 _CUBIN_CARRIER = "cake_sm120_megamoe_cubins.cu"
+# Hand-written NCCL checks force-included ahead of every device instance (not part of the generated closure).
+_NCCL_CHECK = "cake_sm120_megamoe_nccl_check.cuh"
 # Index = the MOE_INSTANCE value compiled by the wrapper of that name.
 INSTANCE_NAMES = ("m128_copier", "m64_copier", "m128_nocopier", "m64_nocopier")
 # Compile-time parameters of the device source, in -D order (MOE_INSTANCE comes from the wrapper).
@@ -86,16 +88,44 @@ _NVCC_FLAGS = (
     # included earlier.
     "-D_CCCL_ATOMIC_UNSAFE_AUTOMATIC_STORAGE",
 )
-EXPECTED_NCCL_VERSION_INTEGER = 23007  # NCCL 2.30.7: GIN device API
+# The first NCCL whose Device API has everything the kernel uses (LSA, GIN with strong signals, GIN barrier
+# sessions). There is no upper bound: the device code is compiled against the headers of the NCCL this process
+# loads (``nccl_installation``), the kernel asserts that exactly one GIN backend is compiled in, every loaded
+# instance is checked for spills, and the binding refuses a library other than the headers it was built against.
+MIN_NCCL_VERSION_INTEGER = 23007
+EXPECTED_NCCL_VERSION_INTEGER = (
+    MIN_NCCL_VERSION_INTEGER  # deprecated alias of MIN_NCCL_VERSION_INTEGER
+)
 # NCCL GIN backends a device module can be built for, keyed by name, with the session's
 # ``gin_type`` (``ncclGinType_t``) and the NCCL Device API macros that compile out the other
 # two.  Every GIN call otherwise inlines all three backends behind a runtime switch, which
 # costs the persistent kernel 10-20 registers; a workspace only ever uses its communicator's
 # backend.
 GIN_BACKENDS: dict[str, tuple[int, tuple[str, ...]]] = {
-    "proxy": (2, ("-DNCCL_GIN_GDAKI_ENABLE=0", "-DNCCL_GIN_GPI_ENABLE=0")),
-    "gdaki": (3, ("-DNCCL_GIN_PROXY_ENABLE=0", "-DNCCL_GIN_GPI_ENABLE=0")),
-    "gpi": (4, ("-DNCCL_GIN_PROXY_ENABLE=0", "-DNCCL_GIN_GDAKI_ENABLE=0")),
+    "proxy": (
+        2,
+        (
+            "-DNCCL_GIN_GDAKI_ENABLE=0",
+            "-DNCCL_GIN_GPI_ENABLE=0",
+            "-DNCCL_GIN_EFA_GDA_ENABLE=0",
+        ),
+    ),
+    "gdaki": (
+        3,
+        (
+            "-DNCCL_GIN_PROXY_ENABLE=0",
+            "-DNCCL_GIN_GPI_ENABLE=0",
+            "-DNCCL_GIN_EFA_GDA_ENABLE=0",
+        ),
+    ),
+    "gpi": (
+        4,
+        (
+            "-DNCCL_GIN_PROXY_ENABLE=0",
+            "-DNCCL_GIN_GDAKI_ENABLE=0",
+            "-DNCCL_GIN_EFA_GDA_ENABLE=0",
+        ),
+    ),
 }
 
 # Device modules packaged by ``flashinfer/aot.py``: DeepSeek-V4-Flash routed experts
@@ -143,39 +173,123 @@ def _nccl_home() -> Path | None:
         return None
 
 
-def nccl_installation() -> tuple[Path, Path]:
-    """Locate NCCL 2.30.7 headers (``nccl.h`` + ``nccl_device.h``) and ``libnccl.so.2``.
+def _defining_library(function: Any) -> Path | None:
+    """The shared object that provides ``function`` (a ctypes function pointer), as the dynamic loader resolved it.
 
-    Search order (as ``flashinfer/jit/comm.py``): ``NCCL_HOME``, then the
-    ``nvidia-nccl-cu13`` wheel (``nvidia/nccl``).
+    Several ``libnccl.so.2`` can be mapped at once (torch maps its wheel's copy by path, ``LD_PRELOAD`` another);
+    only the one that defines the symbols in use matters.
     """
 
+    import ctypes
+
+    class _DlInfo(ctypes.Structure):
+        _fields_ = [
+            ("dli_fname", ctypes.c_char_p),
+            ("dli_fbase", ctypes.c_void_p),
+            ("dli_sname", ctypes.c_char_p),
+            ("dli_saddr", ctypes.c_void_p),
+        ]
+
+    dladdr = ctypes.CDLL(None).dladdr
+    dladdr.argtypes = [ctypes.c_void_p, ctypes.POINTER(_DlInfo)]
+    info = _DlInfo()
+    if (
+        not dladdr(ctypes.cast(function, ctypes.c_void_p), ctypes.byref(info))
+        or not info.dli_fname
+    ):
+        return None
+    return Path(os.fsdecode(info.dli_fname))
+
+
+def _version_string(version: int) -> str:
+    return f"{version // 10000}.{version // 100 % 100}.{version % 100}"
+
+
+def _header_version(include: Path) -> int | None:
+    header = include / "nccl.h"
+    if not (header.is_file() and (include / "nccl_device.h").is_file()):
+        return None
+    match = re.search(r"#define\s+NCCL_VERSION_CODE\s+(\d+)", header.read_text())
+    return int(match.group(1)) if match else None
+
+
+@functools.cache
+def loaded_nccl_library() -> tuple[Path, int]:
+    """The ``libnccl.so.2`` whose symbols this process uses (torch's, or an ``LD_PRELOAD`` one) and its version."""
+
+    import ctypes
+
+    try:
+        get_version = ctypes.CDLL("libnccl.so.2").ncclGetVersion
+    except OSError as error:
+        raise RuntimeError(f"libnccl.so.2 cannot be loaded: {error}") from error
+    version = ctypes.c_int()
+    if get_version(ctypes.byref(version)) != 0:
+        raise RuntimeError("ncclGetVersion failed")
+    library = _defining_library(get_version)
+    if library is None:
+        raise RuntimeError(
+            "dladdr could not name the library that defines ncclGetVersion"
+        )
+    return library.resolve(), int(version.value)
+
+
+def nccl_installation() -> tuple[Path, Path]:
+    """NCCL headers (``nccl.h`` + ``nccl_device.h``) of exactly the ``libnccl.so.2`` this process loads, and that
+    library.
+
+    The device code inlines NCCL's Device API and reads the ``ncclDevComm`` the library fills in, so the headers
+    must be the library's own version, whatever that version is (at least :data:`MIN_NCCL_VERSION_INTEGER`).
+    Headers are looked up next to the library (``<lib>/../include``, the ``nvidia-nccl-cu13`` wheel layout), then
+    under ``NCCL_HOME`` and the ``nvidia-nccl-cu13`` wheel; a directory whose headers report another version is
+    skipped.
+    """
+
+    library, version = loaded_nccl_library()
+    if version < MIN_NCCL_VERSION_INTEGER:
+        raise RuntimeError(
+            f"Cake SM120 MegaMoE needs NCCL {_version_string(MIN_NCCL_VERSION_INTEGER)} or newer (Device API: LSA "
+            f"+ GIN), this process loads {_version_string(version)} from {library}"
+        )
+    candidates = [library.parent.parent / "include"]
     root = _nccl_home()
     if root is not None:
-        include = root / "include"
-        header = include / "nccl.h"
-        if header.is_file() and (include / "nccl_device.h").is_file():
-            match = re.search(
-                r"#define\s+NCCL_VERSION_CODE\s+(\d+)", header.read_text()
-            )
-            version = int(match.group(1)) if match else None
-            if version != EXPECTED_NCCL_VERSION_INTEGER:
-                raise RuntimeError(
-                    f"Cake SM120 MegaMoE requires NCCL {EXPECTED_NCCL_VERSION_INTEGER} "
-                    f"headers, {header} reports {version}"
-                )
-            for lib_dir in (root / "lib", root / "lib64"):
-                library = lib_dir / "libnccl.so.2"
-                if library.is_file():
-                    return include.resolve(), library.resolve()
+        candidates.append(root / "include")
+    seen = []
+    for include in dict.fromkeys(path.resolve() for path in candidates):
+        found = _header_version(include)
+        if found == version:
+            return include.resolve(), library
+        if found is not None:
+            seen.append(f"{include} ({_version_string(found)})")
     raise RuntimeError(
-        "NCCL 2.30.7 development files (nccl.h, nccl_device.h, libnccl.so.2) were not found; "
-        "set NCCL_HOME or install nvidia-nccl-cu13==2.30.7"
+        f"Cake SM120 MegaMoE compiles NCCL's Device API into its kernel and needs the headers of the NCCL this "
+        f"process loads ({_version_string(version)}, {library}); "
+        + (f"found only {', '.join(seen)}; " if seen else "found none; ")
+        + f"install nvidia-nccl-cu13=={_version_string(version)} or point NCCL_HOME at that version's headers"
     )
 
 
+def nccl_check_header() -> Path:
+    """Hand-written NCCL Device API checks (version floor; exactly one GIN backend in device code) for any SM120
+    MegaMoE build that compiles a :data:`GIN_BACKENDS` build: pass it to nvcc with ``-include``."""
+
+    return _SOURCE_DIR / _NCCL_CHECK
+
+
+def nccl_identity() -> str | None:
+    """The NCCL a device build compiles against, for module identities: the headers' path and version (``None`` where
+    no usable NCCL is installed; such a spec is generated, never built)."""
+
+    try:
+        include, _ = nccl_installation()
+    except RuntimeError:
+        return None
+    return f"{include}:{_header_version(include)}"
+
+
 def cake_sm120_megamoe_available() -> bool:
-    """True when the sealed sources and NCCL 2.30.7 (headers + library) are present."""
+    """True when the sealed sources are present and the loaded NCCL is new enough and has matching headers."""
 
     try:
         read_manifest()
@@ -246,7 +360,11 @@ def gen_cake_sm120_megamoe_module() -> JitSpec:
 
     manifest = read_manifest()
     nccl_include, nccl_library = nccl_installation()
-    identity = manifest["binding"]["sha256"][:20]
+    # The binding links one NCCL and checks it at run time: a build per NCCL, so a shared JIT cache rebuilds it when
+    # the process loads another NCCL instead of failing that check.
+    identity = hashlib.sha256(
+        f"{manifest['binding']['sha256']}:{nccl_identity()}".encode()
+    ).hexdigest()[:20]
     spec = gen_jit_spec(
         name=f"cake_sm120_megamoe_binding_{identity}",
         sources=[_SOURCE_DIR / manifest["binding"]["path"]],
@@ -335,6 +453,8 @@ def _compile_cubins(
                 nvcc,
                 *_NVCC_FLAGS,
                 *defines,
+                "-include",
+                str(_SOURCE_DIR / _NCCL_CHECK),
                 f"-I{_SOURCE_DIR}",
                 f"-I{nccl_include}",
                 str(_SOURCE_DIR / wrapper["path"]),
@@ -390,7 +510,8 @@ def gen_cake_sm120_megamoe_kernel_module(
                 ),
                 "defines": defines,
                 "flags": _NVCC_FLAGS,
-                "nccl": EXPECTED_NCCL_VERSION_INTEGER,
+                "nccl_check": _sha256(_SOURCE_DIR / _NCCL_CHECK),
+                "nccl": nccl_identity(),
             },
             sort_keys=True,
         ).encode()
@@ -500,9 +621,11 @@ def check_exact_sm120(device: Any = None) -> None:
 def _build_and_load() -> Any:
     module = gen_cake_sm120_megamoe_module().build_and_load()
     observed = int(module.nccl_runtime_version())
-    if observed != EXPECTED_NCCL_VERSION_INTEGER:
+    _, expected = loaded_nccl_library()
+    if observed != expected:  # the binding links the library nccl_installation found
         raise RuntimeError(
-            f"Cake SM120 MegaMoE requires NCCL {EXPECTED_NCCL_VERSION_INTEGER}, the loaded library reports {observed}"
+            f"Cake SM120 MegaMoE binding reports NCCL {_version_string(observed)}, this process loads "
+            f"{_version_string(expected)}"
         )
     logger.info("Loaded Cake SM120 MegaMoE binding module")
     return module
@@ -519,6 +642,7 @@ __all__ = [
     "AOT_DEVICE_PARAMETERS",
     "DEVICE_PARAMETERS",
     "EXPECTED_NCCL_VERSION_INTEGER",
+    "MIN_NCCL_VERSION_INTEGER",
     "GIN_BACKENDS",
     "INSTANCE_NAMES",
     "cake_sm120_megamoe_available",
@@ -532,6 +656,9 @@ __all__ = [
     "gen_cake_sm120_megamoe_module",
     "gin_backend_name",
     "load_cake_sm120_megamoe_module",
+    "loaded_nccl_library",
+    "nccl_check_header",
+    "nccl_identity",
     "nccl_installation",
     "nvcc_version",
     "read_geometry",
