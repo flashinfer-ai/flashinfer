@@ -18,32 +18,41 @@ CuTe DSL Norm Kernels
 Internal kernel implementations using NVIDIA CuTe-DSL.
 """
 
-from .rmsnorm import (
-    RMSNormKernel,
-    QKRMSNormKernel,
-    RMSNormQuantKernel,
-    rmsnorm_cute,
-    qk_rmsnorm_cute,
-    rmsnorm_quant_cute,
-)
-from .fused_add_rmsnorm import (
-    FusedAddRMSNormKernel,
-    FusedAddRMSNormQuantKernel,
-    fused_add_rmsnorm_cute,
-    fused_add_rmsnorm_quant_cute,
-)
-from .layernorm import (
-    LayerNormKernel,
-    LayerNormQuantKernel,
-    layernorm_cute,
-    layernorm_quant_cute,
-)
-from .gated_residual_rmsnorm import gated_residual_rmsnorm
-from .gated_residual_next_rmsnorm import gated_residual_next_rmsnorm
-from .rmsnorm_sigmoid_gate import (
-    rmsnorm_sigmoid_gate,
-    supports_rmsnorm_sigmoid_gate,
-)
+from importlib import import_module
+
+
+# Keep the CUDA specialist importable when optional CuTe DSL dependencies are
+# absent. Import each DSL implementation only when its exported name is used.
+_KERNEL_MODULES = {
+    "RMSNormKernel": "rmsnorm",
+    "QKRMSNormKernel": "rmsnorm",
+    "RMSNormQuantKernel": "rmsnorm",
+    "rmsnorm_cute": "rmsnorm",
+    "qk_rmsnorm_cute": "rmsnorm",
+    "rmsnorm_quant_cute": "rmsnorm",
+    "FusedAddRMSNormKernel": "fused_add_rmsnorm",
+    "FusedAddRMSNormQuantKernel": "fused_add_rmsnorm",
+    "fused_add_rmsnorm_cute": "fused_add_rmsnorm",
+    "fused_add_rmsnorm_quant_cute": "fused_add_rmsnorm",
+    "LayerNormKernel": "layernorm",
+    "LayerNormQuantKernel": "layernorm",
+    "layernorm_cute": "layernorm",
+    "layernorm_quant_cute": "layernorm",
+    "gated_residual_rmsnorm": "gated_residual_rmsnorm",
+    "gated_residual_next_rmsnorm": "gated_residual_next_rmsnorm",
+    "rmsnorm_sigmoid_gate": "rmsnorm_sigmoid_gate",
+    "supports_rmsnorm_sigmoid_gate": "rmsnorm_sigmoid_gate",
+}
+
+
+def __getattr__(name):
+    module = _KERNEL_MODULES.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(f".{module}", __name__), name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     # RMSNorm

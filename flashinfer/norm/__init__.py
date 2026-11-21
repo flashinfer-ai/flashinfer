@@ -27,7 +27,7 @@ This package provides high-performance normalization kernels:
 import functools
 import os
 import warnings
-from typing import Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -83,20 +83,47 @@ if not _USE_CUDA_NORM:
         # nvidia-cutlass-dsl not installed or incompatible version
         _USE_CUDA_NORM = True
 
+# SM90 serve-shape RMSNorm fast path, behind the "specialized" backend of
+# rmsnorm() (guard + kernels); None disables it.
 try:
-    from .kernels.gated_residual_rmsnorm import (
-        gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
+    from .kernels.rmsnorm_serve_sm90 import (
+        RMSNORM_BACKENDS,
+        record_incumbent_dispatch as _record_rmsnorm_incumbent,
+        rmsnorm_serve_auto_eligible as _rmsnorm_serve_auto_eligible,
+        try_rmsnorm_serve_sm90 as _try_rmsnorm_serve_sm90,
     )
-    from .kernels.gated_residual_next_rmsnorm import (
-        gated_residual_next_rmsnorm as _gated_residual_next_rmsnorm_cute,
-    )
-    from .kernels.rmsnorm_sigmoid_gate import (
-        rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
-    )
-    from .kernels.rmsnorm_sigmoid_gate import (
-        supports_rmsnorm_sigmoid_gate as _cute_supports_rmsnorm_sigmoid_gate,
-    )
+except (ImportError, AttributeError):
+    _try_rmsnorm_serve_sm90 = None
+    _rmsnorm_serve_auto_eligible = None
+    _record_rmsnorm_incumbent = None
+    RMSNORM_BACKENDS = ("auto", "specialized", "cuda", "cutedsl")
 
+try:
+    if TYPE_CHECKING:
+        from .kernels.gated_residual_rmsnorm import (
+            gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
+        )
+        from .kernels.gated_residual_next_rmsnorm import (
+            gated_residual_next_rmsnorm as _gated_residual_next_rmsnorm_cute,
+        )
+        from .kernels.rmsnorm_sigmoid_gate import (
+            rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
+            supports_rmsnorm_sigmoid_gate as _cute_supports_rmsnorm_sigmoid_gate,
+        )
+    else:
+        # Resolve runtime imports through the package's lazy callable exports.
+        from .kernels import (
+            gated_residual_rmsnorm as _gated_residual_rmsnorm_cute,
+        )
+        from .kernels import (
+            gated_residual_next_rmsnorm as _gated_residual_next_rmsnorm_cute,
+        )
+        from .kernels import (
+            rmsnorm_sigmoid_gate as _rmsnorm_sigmoid_gate_cute,
+        )
+        from .kernels import (
+            supports_rmsnorm_sigmoid_gate as _cute_supports_rmsnorm_sigmoid_gate,
+        )
     _HAS_CUTE_DSL_FUSED_NORM = True
 except (ImportError, AttributeError):
     _HAS_CUTE_DSL_FUSED_NORM = False
@@ -265,6 +292,38 @@ def _use_cuda_norm(device: torch.device) -> bool:
             return True
 
     return False
+
+
+def _cutedsl_norm_unavailable(device: torch.device) -> Optional[str]:
+    """Why explicit ``backend="cutedsl"`` cannot serve ``device`` (None = it can).
+
+    Mirrors the conditions under which :func:`_use_cuda_norm` would route
+    away from the CuTe DSL kernels, including the import-time opt-out
+    (``FLASHINFER_USE_CUDA_NORM=1`` skips importing them entirely).
+    """
+    if _USE_CUDA_NORM:
+        return (
+            "the CuTe DSL norm kernels are unavailable in this process "
+            "(FLASHINFER_USE_CUDA_NORM=1, or nvidia-cutlass-dsl missing/incompatible)"
+        )
+    return _cutedsl_norm_arch_unavailable(torch.cuda.get_device_capability(device))
+
+
+def _cutedsl_norm_arch_unavailable(device_cap: tuple[int, int]) -> Optional[str]:
+    """Architecture refusal shared by the incumbent and specialized CuTe kernels."""
+    if not _cute_dsl_supports_arch(*device_cap):
+        return (
+            f"the installed CuTe DSL does not support sm_{device_cap[0]}{device_cap[1]}"
+        )
+    if _dsl_captured_arch is not None:
+        captured_arch = _dsl_captured_arch()
+        if captured_arch is not None and not _is_arch_compatible(
+            captured_arch, device_cap
+        ):
+            return (
+                "the CuTe DSL compile target is not binary-compatible with this device"
+            )
+    return None
 
 
 @functools.cache
@@ -1241,6 +1300,8 @@ def rmsnorm(
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
+    *,
+    backend: str = "auto",
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -1259,15 +1320,48 @@ def rmsnorm(
     enable_pdl: bool
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html>`_
+        Passing either True or False explicitly keeps backend="auto"
+        on the incumbent path, so toggling PDL preserves its numerical behavior.
+        The specialized backend currently supports only non-PDL launches.
+    backend: str
+        One of ``("auto", "specialized", "cuda", "cutedsl")``.
+        ``"specialized"`` selects the specialized SM90 serve-shape kernels
+        explicitly (a call they cannot serve raises ``NotImplementedError``
+        with the refusal reason, also recorded in the dispatch stats — an
+        explicitly selected backend never falls back). The
+        incumbent implementations are named by nature: ``"cuda"`` pins the
+        legacy CUDA JIT norm kernel, ``"cutedsl"`` pins the CuTe DSL
+        kernels (raising ``NotImplementedError`` when the installed DSL
+        cannot serve the device). ``"auto"`` (default) is purely a router
+        over the named backends: it routes to ``"specialized"`` only on its
+        dispatch allowlist
+        (``flashinfer/rmsnorm_serve_sm90_dispatch.json``) and inside the
+        token cap (T <= 512), excluding H=512 where auto keeps the incumbent, and otherwise
+        between ``"cuda"`` and ``"cutedsl"`` by device/runtime support — an
+        explicitly selected backend is never silently swapped, and unknown
+        names raise. A pre-gate with a cached per-device capability check
+        skips the full specialized guard for ineligible devices and shapes.
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) disables
+        the specialized kernels (``"auto"`` keeps the incumbent path,
+        explicit ``"specialized"`` raises); ``FLASHINFER_SM90_SERVE_RMSNORM=0`` is a
+        deprecated kill alias kept for one release (its ``=cuda`` value
+        still selects the CUDA kernel variant behind ``"specialized"``,
+        a namespace distinct from the ``backend="cuda"`` incumbent).
 
     Returns
     -------
     output: torch.Tensor
         Normalized tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
     """
+    if backend not in RMSNORM_BACKENDS:
+        raise ValueError(
+            f"rmsnorm supports backend in {RMSNORM_BACKENDS}, got "
+            f"{backend!r}; an explicitly selected backend is never silently "
+            "swapped"
+        )
     if out is None:
         out = torch.empty_like(input)
-    _rmsnorm_impl(out, input, weight, eps, enable_pdl)
+    _rmsnorm_impl(out, input, weight, eps, enable_pdl, backend)
     return out
 
 
@@ -1278,10 +1372,67 @@ def _rmsnorm_impl(
     weight: torch.Tensor,
     eps: float,
     enable_pdl: Optional[bool],
+    backend: str = "auto",
 ) -> None:
+    # SM90 serve-shape "specialized" backend: 2D bf16 at the measured
+    # decode-serve envelope (see kernels/rmsnorm_serve_sm90.py for the guard
+    # and the #5667 semantics).  Under backend="auto" a False return falls
+    # through to the incumbent dispatch unchanged; under explicit
+    # backend="specialized" a call the kernels cannot serve RAISES with the
+    # refusal reason (an explicitly selected backend never falls back). The
+    # incumbent implementations are the nature-named backends "cuda" (legacy
+    # CUDA JIT norm kernel) and "cutedsl" (CuTe DSL kernels), and "auto" is
+    # purely a router over the named backends.
+    # FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 is the kill switch
+    # (FLASHINFER_SM90_SERVE_RMSNORM=0 a deprecated alias).
+    # FLASHINFER_USE_CUDA_NORM=1 keeps its pre-existing meaning: under the
+    # default backend="auto" it pins the legacy CUDA JIT norm kernels, so the
+    # specialized path is not consulted.  An explicitly selected backend is
+    # never silently swapped: "cuda"/"cutedsl" pin their implementation and
+    # never consult the specialized kernels.
+    consulted = False
+    if backend == "specialized":
+        if _try_rmsnorm_serve_sm90 is None:
+            raise NotImplementedError(
+                "rmsnorm backend='specialized' is unavailable (the serve "
+                "kernel module failed to import); an explicitly selected "
+                "backend never falls back — use backend='auto', 'cuda' or "
+                "'cutedsl'"
+            )
+        # Serves the call or raises with the refusal reason (the dim guard
+        # included): explicit selection never falls back.
+        _try_rmsnorm_serve_sm90(out, input, weight, eps, backend, enable_pdl=enable_pdl)
+        return
+    if backend == "auto":
+        # The cached pre-gate keeps the specialized dispatch off the hot path
+        # for calls it can never serve (non-SM90 devices, off-envelope
+        # dtype/shape/token counts): pre-gate misses are not counted.
+        if (
+            _try_rmsnorm_serve_sm90 is not None
+            and enable_pdl is None
+            and input.dim() == 2
+            and not _USE_CUDA_NORM
+            and _rmsnorm_serve_auto_eligible(input)
+        ):
+            consulted = True
+            if _try_rmsnorm_serve_sm90(out, input, weight, eps, backend):
+                return
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
-    if _use_cuda_norm(input.device):
+    if backend == "cuda":
+        use_cuda = True
+    elif backend == "cutedsl":
+        reason = _cutedsl_norm_unavailable(input.device)
+        if reason is not None:
+            raise NotImplementedError(
+                f"rmsnorm backend='cutedsl' cannot serve this call ({reason}); "
+                "an explicitly selected backend is never silently swapped — "
+                "use backend='cuda' or 'auto'"
+            )
+        use_cuda = False
+    else:
+        use_cuda = _use_cuda_norm(input.device)
+    if use_cuda:
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
     else:
         if input.dim() == 3:
@@ -1292,6 +1443,10 @@ def _rmsnorm_impl(
             rmsnorm_cute(
                 input, weight, out, eps, weight_bias=0.0, enable_pdl=enable_pdl
             )
+    if _record_rmsnorm_incumbent is not None and (
+        consulted or backend in ("cuda", "cutedsl")
+    ):
+        _record_rmsnorm_incumbent("cuda" if use_cuda else "cutedsl")
 
 
 @register_fake_op("flashinfer::rmsnorm")
@@ -1301,6 +1456,7 @@ def _rmsnorm_impl_fake(
     weight: torch.Tensor,
     eps: float,
     enable_pdl: Optional[bool],
+    backend: str = "auto",
 ) -> None:
     pass
 
@@ -1803,8 +1959,14 @@ def _layernorm_quant_fake(
 # CuTe-DSL fused RMSNorm + FP4 Quantization kernels
 # These require SM100+ (Blackwell) GPUs and nvidia-cutlass-dsl
 try:
-    from ..cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
-    from ..cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
+    if TYPE_CHECKING:
+        from ..cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant as rmsnorm_fp4quant
+        from ..cute_dsl.add_rmsnorm_fp4quant import (
+            add_rmsnorm_fp4quant as add_rmsnorm_fp4quant,
+        )
+    else:
+        from ..cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
+        from ..cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
 except ImportError:
     # nvidia-cutlass-dsl not installed, these functions will not be available
     pass
