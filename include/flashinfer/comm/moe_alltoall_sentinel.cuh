@@ -19,11 +19,11 @@
 // NVLinkOneSidedAlltoAll): one dispatch and one combine kernel, no completion flags and no
 // fences between data and its readiness.
 //
-// Sentinel arrival. Every landing row a peer writes into is armed with a sentinel word that no
-// payload word takes (senders rewrite the few words that could, see canonicalize_*). A receiver
-// polls the data itself: a 16-byte vector has arrived when none of its four 32-bit words is the
-// sentinel (32-bit stores are single-copy atomic, so a torn vector still shows one). The
-// receiver copies the vector out and re-arms it; it is the vector's only reader.
+// Sentinel arrival. Every landing row a peer writes into holds a sentinel word that no payload
+// word takes (senders rewrite the few words that could, see canonicalize_*) until data replaces
+// it. A receiver polls the data itself: a 16-byte vector has arrived when none of its four 32-bit
+// words is the sentinel (32-bit stores are single-copy atomic, so a torn vector still shows one).
+// The receiver, the vector's only reader, copies it out and resets it to the sentinel.
 //
 // Landing rows of a rank's workspace, row (src, token) = token * ep_size + src (the same rows in
 // every round, a token slot's rows adjacent):
@@ -36,14 +36,14 @@
 // A source stores its ids row (src, token) on EVERY alive peer, all invalid_expert_id where the
 // peer is no target: the ids row tells that slot `token` arrived and whether it holds a token.
 //
-// Re-arming. A dispatch ends only after every alive peer's ids rows of the round arrived, so no
+// Resets. A dispatch ends only after every alive peer's ids rows of the round arrived, so no
 // rank starts round n + 2 before every peer finished round n. Payload, scale and weights rows go
 // to targets only, and the sender's combine waits for every target's partial: a row is rewritten
-// only after its reader re-armed it, so one set suffices. Ids rows also reach non-targets, which
+// only after its reader reset it, so one set suffices. Ids rows also reach non-targets, which
 // may still be in round n when the sender writes round n + 1, so they alternate two sets by an
 // epoch in device memory (CUDA graphs replay it) that the last combine block advances; the
-// combine re-arms them. A combine row is written in round n only by a rank that received the
-// reader's round-n ids rows, sent after the reader's previous combine re-armed the row.
+// combine resets them. A combine row is written in round n only by a rank that received the
+// reader's round-n ids rows, sent after the reader's previous combine reset the row.
 //
 // Dispatch, grid max_tokens_per_rank x blocks_per_token (a block: one token slot, one chunk of
 // kNumThreads 16-byte vectors of the wire row, payload vectors first, then scale vectors):
@@ -56,16 +56,16 @@
 //                its threads taking the (peer, vector) stores in turn.
 //   D4 poll ids  every source's ids row of slot `token` -> recv_source_mask; warp 0 lists the
 //                sources that sent a token.
-//   D5 receive   poll, copy out and re-arm this thread's vector of every source that sent one,
+//   D5 receive   poll, copy out and reset this thread's vector of every source that sent one,
 //                8 sources of the slot's source list per round.
 //   D6 weights   in the same rounds, the chunk-0 block does the same for the weights rows.
 // Rank loops walk the set bits of a rank mask in ascending rank order (pop_lowest_rank).
 // Combine, same grid:
 //   C1 sources   warp 0 lists the token's target ranks in top-k slot order.
 //   C2 push      the expert output of row (src, token) goes to src's combine row (ep_rank, token).
-//   C3 reduce    poll this rank's partials 8 sources at a time, re-arm them and add them in the
+//   C3 reduce    poll this rank's partials 8 sources at a time, reset them and add them in the
 //                order of the fence combine (vectorized_combine_impl), then round to bf16.
-//   C4 tail      the chunk-0 block re-arms the slot's ids rows; the last block advances the epoch.
+//   C4 tail      the chunk-0 block resets the slot's ids rows; the last block advances the epoch.
 // The only fence is the device-scope one before the combine's finished-block count.
 
 #pragma once
@@ -577,7 +577,7 @@ __device__ __forceinline__ void list_sources(uint64_t source_mask, int* s_source
   if (lane == 0) *s_num_sources = __popc(low) + __popc(high);
 }
 
-// D5 / D6: poll, copy out (wire -> raw) and re-arm this thread's wire vector of every source in
+// D5 / D6: poll, copy out (wire -> raw) and reset this thread's wire vector of every source in
 // s_sources[0, num_sources), 8 sources per round with every load in flight: n sources take
 // ceil(n / 8) rounds whatever their ranks. A round's sources are re-read from shared memory before
 // every spin's loads and before its copy-out (holding them across the round would exceed the
@@ -787,7 +787,7 @@ __device__ __forceinline__ float sum_group(float const (&values)[8], int num_sou
 }
 
 // C3, sources 8 * group .. 8 * group + 7 of the slot-ordered list: poll their partials of this
-// rank's token (every load in flight), re-arm them, and sum each of the vector's 8 elements.
+// rank's token (every load in flight), reset them, and sum each of the vector's 8 elements.
 __device__ __forceinline__ void receive_group(CombineParams const& p, int token, int vec, int group,
                                               int num_sources, int const* s_sources,
                                               long long wait_start, bool& timed_out,
@@ -861,10 +861,10 @@ __device__ __forceinline__ uint4 join_groups(float const (&group_sums)[NUM_GROUP
   return out;
 }
 
-// C4: re-arm this slot's ids rows of the round's landing set (their readers, the dispatch
+// C4: reset this slot's ids rows of the round's landing set (their readers, the dispatch
 // blocks, have all ended), then the last block closes the round and advances the epoch (every
 // block read it first).
-__device__ __forceinline__ void rearm_ids_and_advance_epoch(CombineParams const& p, int token,
+__device__ __forceinline__ void reset_ids_and_advance_epoch(CombineParams const& p, int token,
                                                             int chunk, int ids_row_vectors,
                                                             int landing_set) {
   if (chunk == 0) {
@@ -927,7 +927,7 @@ __global__ void __launch_bounds__(kNumThreads) moeA2ASentinelCombineKernel(Combi
   }
   if (timed_out)
     report_and_trap(p.round_state, p.ep_rank, "timed out waiting for a peer (combine)");
-  rearm_ids_and_advance_epoch(p, token, chunk, topk_row_vectors(top_k), s_landing_set);  // C4
+  reset_ids_and_advance_epoch(p, token, chunk, topk_row_vectors(top_k), s_landing_set);  // C4
 #else
   __trap();  // not built for this architecture (see MOE_A2A_SENTINEL_COMPILE)
 #endif
