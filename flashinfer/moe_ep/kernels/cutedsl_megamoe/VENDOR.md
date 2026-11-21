@@ -84,8 +84,12 @@ patch --batch --forward --no-backup-if-mismatch -p1 \
     -d "${FI_EXPORT_STAGE:?}/raw" -i "${FI_RELEASE_PATCH:?}"
 ```
 
-Apply FlashInfer's Blackwell GenPhase pusher-count guard after release
-preparation. It rejects configurations with no scale-factor pusher.
+After release preparation, apply the FlashInfer Blackwell GenPhase patch from
+the source export records with the same command, setting `FI_RELEASE_PATCH` to
+the GenPhase patch path. In
+`sources/kernel_src/blackwell/inference/genphase/token_comm_gen_specialized.py`,
+the patch adds `sf_pusher_cta_count` to the positive-value checks in
+`GenphaseTokenComm` and removes an obsolete profiling-note reference.
 
 Verify every Python file against the manifest and reject missing or extra
 files. The exporter, provider patches and release patch are maintained with
