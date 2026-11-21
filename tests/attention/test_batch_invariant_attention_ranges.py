@@ -357,6 +357,161 @@ def test_one_dataflow_over_the_visible_set():
         spec.spec_fingerprint(64, mask_mode="ranged")
 
 
+NON_CAUSAL_FINGERPRINTS = {
+    64: "attn-bf16-d64-nc-5c64fc377eb66759",
+    128: "attn-bf16-d128-nc-421e018610a7f93c",
+    256: "attn-bf16-d256-nc-603c24eeb8691c0a",
+}
+
+
+def test_non_causal_is_one_value_of_the_mode_switch():
+    """The non-causal class is the fourth declared value of the one switch, under the names it was published with: the
+    ``_nc`` objects and the ``nc-`` receipts. ``causal`` stays the callers' spelling of the two position-derived modes and
+    names the same class as ``mask_mode``; its keys are not data (no row-visibility block, present chunks from the request's
+    length), so it keeps the Swaps body, which the two data modes do not have."""
+    from flashinfer.attention.batch_invariant import plan as P
+    from flashinfer.attention.batch_invariant import spec
+    from flashinfer.attention.batch_invariant.swaps.compile import (
+        kernel_name as swaps_name,
+    )
+    from flashinfer.attention.batch_invariant.swaps.operands import SWAPS_MASK_MODES
+
+    assert spec.mask_mode_of_causal(True) == "causal"
+    assert spec.mask_mode_of_causal(False) == "non_causal"
+    assert P.MASK_SUFFIX["non_causal"] == "_nc" and P.MASK_SUFFIX["causal"] == ""
+    assert not P.keys_are_data("causal") and not P.keys_are_data("non_causal")
+    assert P.keys_are_data("key_ranges") and P.keys_are_data("key_set")
+    assert SWAPS_MASK_MODES == ("causal", "non_causal")
+    args = (128, 4, 16, 8, False, 228 << 10, True)
+    assert swaps_name(*args, mask_mode="non_causal") == swaps_name(*args) + "_nc"
+    assert swaps_name(*args, mask_mode="causal") == swaps_name(*args)
+    for mode in ("key_ranges", "key_set", "ranged"):
+        with pytest.raises(ValueError):
+            swaps_name(*args, mask_mode=mode)
+    with pytest.raises(TypeError):  # keyword-only, as on the row body
+        swaps_name(*args, "non_causal")
+    for D in (64, 128, 256):
+        nc = spec.spec_fingerprint(D, mask_mode="non_causal")
+        assert nc == NON_CAUSAL_FINGERPRINTS[D]
+        assert nc == spec.spec_fingerprint(D, causal=False)
+        assert nc == spec.spec_fingerprint(D, -1, False)
+        assert spec.spec_fingerprint(D, causal=True) == spec.FINGERPRINTS[D]
+        for op in (
+            "BatchPrefillWithPagedKVCacheWrapper",
+            "BatchPrefillWithRaggedKVCacheWrapper",
+        ):
+            assert bi.fingerprint(op, head_dim=D, causal=False) == nc
+        with pytest.raises(ValueError):  # the mode is stated once
+            spec.spec_fingerprint(D, causal=False, mask_mode="non_causal")
+        with pytest.raises(ValueError):  # no window in the non-causal class
+            spec.spec_fingerprint(D, 4, mask_mode="non_causal")
+    receipts = {spec.spec_fingerprint(128, mask_mode=mode) for mode in spec.MASK_MODES}
+    assert len(receipts) == 4
+
+
+def test_non_causal_row_is_the_row_of_the_same_visible_set_in_every_mode():
+    """A non-causal row sees ``[0, kv_len)``. The causal row at the request's last position, the key-set row of an all-ones
+    mask and the key-range row whose range is ``[0, kv_len)`` (whatever its window) have the same visible set, hence are ONE
+    term object; a row that sees one key less is another term."""
+    import random
+
+    from flashinfer.attention.batch_invariant.spec import AttentionSpec, RowSpec
+
+    rng = random.Random(11)
+    for D, T, C in ((64, 16, 32), (128, 16, 32), (256, 16, 32), (64, 32, 64)):
+        S = AttentionSpec(D, T=T, C=C)
+        for _ in range(12):
+            kv_len = rng.choice([1, 15, 16, 17, 31, 32, 33, 64, 77, 130])
+            p = rng.randrange(kv_len)
+            rid = rng.randrange(4)
+            nc = RowSpec(p=p, row=rid, causal=False, kv_len=kv_len)
+            assert nc.mask_mode == "non_causal"
+            assert nc.key_set() == frozenset(range(kv_len))
+            last = RowSpec(p=kv_len - 1, row=rid)
+            ones = RowSpec(p=0, row=rid, kv_len=kv_len, keys=frozenset(range(kv_len)))
+            whole = [
+                RowSpec(p=p, window_left=w, row=rid, brange=(0, kv_len))
+                for w in (-1, 0, 5)
+            ]
+            assert ones.mask_mode == "key_set" and whole[0].mask_mode == "key_ranges"
+            for d in (0, 2):
+                t = S.output(nc, d)
+                assert S.output(last, d) is t and S.output(ones, d) is t
+                assert S.output(nc.as_key_set(), d) is t
+                assert all(S.output(r, d) is t for r in whole)
+                if kv_len > 1:
+                    fewer = RowSpec(
+                        p=0, row=rid, kv_len=kv_len, keys=frozenset(range(kv_len - 1))
+                    )
+                    assert S.output(fewer, d) is not t
+    with pytest.raises(
+        AssertionError
+    ):  # a non-causal row takes no key set, no range and no window
+        RowSpec(p=3, causal=False, kv_len=8, keys=frozenset({1}))
+    with pytest.raises(AssertionError):
+        RowSpec(p=3, causal=False, kv_len=8, brange=(0, 2))
+    with pytest.raises(AssertionError):
+        RowSpec(p=3, window_left=2, causal=False, kv_len=8)
+
+
+def test_planner_gives_the_non_causal_mode_the_request_key_range():
+    """``build_plan`` under the four modes: the non-causal row blocks span the request's whole key range, as the key-set blocks
+    without a summary and the key-range blocks whose every token's range is the whole request do -- the same tiles and chunks
+    -- and only the two position-derived modes may take the Swaps body."""
+    from flashinfer.attention.batch_invariant import plan as P
+
+    qo, kv, last = [0, 700, 703], [0, 90, 96], [16, 5]
+    kw = dict(split_policy="fused")
+    geo = lambda plan: [  # noqa: E731
+        (
+            d[P.F_REQ],
+            d[P.F_QTOK0],
+            d[P.F_TILE_LO],
+            d[P.F_TILE_HI],
+            d[P.F_CHUNK_LO],
+            d[P.F_CHUNK_HI],
+        )
+        for d in plan.desc
+    ]
+    nc = P.build_plan(qo, kv, last, 32, 8, 128, 16, mask_mode="non_causal", **kw)
+    ks = P.build_plan(qo, kv, last, 32, 8, 128, 16, mask_mode="key_set", **kw)
+    kv_lens = P.kv_lengths(kv, last, 16)
+    ranges = [(0, kv_lens[0])] * 700 + [(0, kv_lens[1])] * 3
+    kr = P.build_plan(
+        qo, kv, last, 32, 8, 128, 16, mask_mode="key_ranges", ranges=ranges, **kw
+    )
+    causal = P.build_plan(qo, kv, last, 32, 8, 128, 16, **kw)
+    assert geo(nc) == geo(ks) == geo(kr) != geo(causal)
+    with pytest.raises(TypeError):  # keyword-only
+        P.build_plan(
+            qo,
+            kv,
+            last,
+            32,
+            8,
+            128,
+            16,
+            -1,
+            "auto",
+            204,
+            128,
+            "auto",
+            False,
+            32,
+            0,
+            True,
+            "non_causal",
+        )
+    with pytest.raises(AssertionError):  # no window in the non-causal class
+        P.build_plan(qo, kv, last, 32, 8, 128, 16, 4, mask_mode="non_causal")
+    P.build_plan(qo, kv, last, 32, 8, 128, 16, mask_mode="non_causal", small_swap=True)
+    for mode, extra in (("key_set", {}), ("key_ranges", dict(ranges=ranges))):
+        with pytest.raises(AssertionError):
+            P.build_plan(
+                qo, kv, last, 32, 8, 128, 16, mask_mode=mode, small_swap=True, **extra
+            )
+
+
 def test_engine_takes_one_mask_mode_per_plan():
     from flashinfer.attention.batch_invariant import engine
 
@@ -912,3 +1067,134 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     # a refused call leaves the plan usable
     assert torch.equal(bits(w.run(pr.q, kv, ranges)), bits(good))
     assert torch.equal(bits(w.forward(pr.q, kv, ranges)), bits(good))
+
+
+# ------------------------------------------------------------------------------------------------------ the four modes
+def _all_ones(pr):
+    return [
+        torch.ones(ql, kl, dtype=torch.bool)
+        for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True)
+    ]
+
+
+def _whole_request_ranges(pr):
+    """The wrapper's range rows that give every token its request's whole key range, ``[0, kv_len - 1]`` inclusive."""
+    rows = [
+        [0, kl - 1]
+        for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True)
+        for _ in range(ql)
+    ]
+    return torch.tensor(rows, dtype=torch.int32, device=pr.device).reshape(-1, 2)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_all_ones_mask_and_whole_request_range_are_the_non_causal_class(D):
+    """Three modes, one visible set: every token of the non-causal class (``causal=False`` without a mask), of the
+    explicit-key-set class under an all-ones mask and of the ranged class under a range over its whole request sees
+    ``[0, kv_len)``, so the three give it the same bits -- paged and ragged, packed and unpacked masks, with and without a
+    causal window on the ranged rows (the range covers what the window drops), and ``causal`` is not read with a mask."""
+    pr = Problem([300, 129, 5], [1300, 600, 77], 16, 4, D, 16, seed=41)
+    nc = bits(_base.run_paged_prefill(pr, causal=False))
+    assert torch.equal(nc, bits(_base.run_ragged_prefill(pr, causal=False)))
+    assert not torch.equal(nc, bits(run_causal(pr)))
+    ones = _all_ones(pr)
+    for kind in ("paged", "ragged"):
+        for packed in (False, True):
+            got = bits(_base.run_masked(pr, ones, kind, packed=packed))
+            assert torch.equal(got, nc), (kind, packed)
+    assert torch.equal(bits(_base.run_masked(pr, ones, causal=True)), nc)
+    whole = _whole_request_ranges(pr)
+    for causal_window in (-1, 0, 200):
+        got = bits(run_ranges(pr, whole, causal_window, -1))
+        assert torch.equal(got, nc), causal_window
+    assert torch.equal(bits(run_ranges(pr, whole, layout="HND")), nc)
+    # one key less for one token is another visible set: that token's bits move and no other token's
+    fewer = [m.clone() for m in ones]
+    fewer[1][7, 599] = False
+    got = bits(_base.run_masked(pr, fewer))
+    row = pr.q_lens[0] + 7
+    changed = (got != nc).reshape(got.shape[0], -1).any(dim=1)
+    assert changed[row] and int(changed.sum()) == 1
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 256])
+def test_all_ones_mask_is_the_non_causal_class_with_more_queries_than_keys(D):
+    """Both classes take more query tokens than keys (neither is bottom-right aligned): the same bits again, on split units
+    (several chunks) and on a request of a few keys."""
+    pr = Problem([1400, 40], [1100, 9], 8, 2, D, 16, seed=43)
+    nc = bits(_base.run_paged_prefill(pr, causal=False))
+    ones = _all_ones(pr)
+    assert torch.equal(bits(_base.run_masked(pr, ones)), nc)
+    assert torch.equal(bits(_base.run_masked(pr, ones, "ragged", packed=True)), nc)
+
+
+@needs_device
+def test_wrappers_map_causal_onto_the_mask_mode():
+    """The one mapping of the wrappers' arguments onto the mode: a prefill plan without a mask runs the causal or the
+    non-causal class as ``causal`` says, with a mask the explicit-key-set class whatever ``causal`` says, and the ranges
+    wrapper -- which plans with ``causal=False`` by contract -- the ranged class, never the non-causal one. ``workspace_size``
+    follows the same rule."""
+    pr = Problem([64, 33], [1200, 600], 8, 2, 128, 16, seed=44)
+    ones = _all_ones(pr)
+    flat = _base._flat(ones, pr.device)
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    paged = (
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+    )
+    ragged = (pr.qo_indptr, pr.kv_indptr_rag, pr.Hq, pr.Hkv, pr.D)
+    for W, args in (
+        (flashinfer.BatchPrefillWithPagedKVCacheWrapper, paged),
+        (flashinfer.BatchPrefillWithRaggedKVCacheWrapper, ragged),
+    ):
+        w = W(workspace(pr.device), "NHD", batch_invariant=True)
+        delegate = w._batch_invariant
+        for plan_kw, mode in (
+            (dict(causal=True), "causal"),
+            (dict(causal=False), "non_causal"),
+            (dict(), "non_causal"),  # the wrappers' default
+            (dict(causal=True, custom_mask=flat), "key_set"),
+            (dict(causal=False, custom_mask=flat), "key_set"),
+            (dict(custom_mask=flat, window_left=5), "key_set"),
+        ):
+            w.plan(*args, **plan_kw, **kw)
+            assert delegate._planned.mask_mode == mode, plan_kw
+            assert delegate._planned.causal == (mode != "non_causal")
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    sized = {
+        name: w.workspace_size(*paged, **plan_kw)[0]
+        for name, plan_kw in (
+            ("causal", dict(causal=True)),
+            ("non_causal", dict(causal=False)),
+            ("mask", dict(causal=False, custom_mask=flat)),
+            ("mask_causal", dict(causal=True, custom_mask=flat)),
+        )
+    }
+    # an all-ones key-set plan and the non-causal plan span the same chunks; the causal plan of the same batch spans fewer
+    assert sized["mask"] == sized["mask_causal"] == sized["non_causal"] > 0
+    assert sized["causal"] != sized["non_causal"]
+    # the ranges wrapper: tokens without a range keep the causal class's bits (not the non-causal class's)
+    wr = make_wrapper(pr)
+    none = torch.full((sum(pr.q_lens), 2), -1, dtype=torch.int32, device=pr.device)
+    out = bits(
+        wr.run(pr.q, pr.cache("NHD"), none, causal_window_left=-1, range_window_left=-1)
+    )
+    assert torch.equal(out, bits(run_causal(pr)))
+    assert not torch.equal(out, bits(_base.run_paged_prefill(pr, causal=False)))
+    plans = wr._batch_invariant._range_plans
+    assert plans and all(p.mask_mode == "key_ranges" for p in plans.values())
+    assert wr._batch_invariant.workspace_bytes(
+        *paged[:2], pr.kv_last, pr.Hq, pr.Hkv, pr.D, pr.page, causal=False
+    ) == wr._batch_invariant.workspace_bytes(
+        *paged[:2], pr.kv_last, pr.Hq, pr.Hkv, pr.D, pr.page, causal=True
+    )
