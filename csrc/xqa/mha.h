@@ -206,20 +206,23 @@ void launchHopperF8MHA(
 #endif
     uint32_t* semaphores, void* scratch, bool enable_pdl, cudaStream_t stream);
 
-void launchHopperF8MHAFlashInfer(
-    uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize, float qScale,
-    float const* qScalePtr, OutputHead* output,
+void launchHopperF8MHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads,
+                                 uint32_t slidingWinSize, float qScale, float const* qScalePtr,
+                                 OutputHead* output,
 #if LOW_PREC_OUTPUT
-    float rcpOutScale,
+                                 float rcpOutScale,
 #endif
-    InputHead const* q, float const* attentionSinks, GMemCacheHead* kCacheVLLM,
-    GMemCacheHead* vCacheVLLM, KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
-    uint32_t const* seqLen, uint32_t batchSize, float kvCacheScale, float const* kvScalePtr,
+                                 InputHead const* q, float const* attentionSinks,
+                                 GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+                                 KVCachePageIndex const* kvCachePageList, uint32_t maxSeqLen,
+                                 uint32_t maxKvLen, uint32_t const* seqLen, uint32_t batchSize,
+                                 float kvCacheScale, float const* kvScalePtr,
 #if SPEC_DEC
-    uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
+                                 uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
-    uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream);
+                                 uint32_t* semaphores, void* scratch, uint64_t scratchBytes,
+                                 bool enable_pdl, uint64_t kv_stride_page, uint64_t kv_stride_token,
+                                 uint64_t kv_stride_head, cudaStream_t stream);
 
 void launchMLA(
     cudaDeviceProp const& prop,
