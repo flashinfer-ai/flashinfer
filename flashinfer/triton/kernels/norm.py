@@ -23,6 +23,7 @@ def rms_norm_kernel(
     HAS_OUT_SCALE: tl.constexpr,
     HAS_OUTPUT: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    ROUND_BEFORE_WEIGHT: tl.constexpr = False,
 ) -> None:
     i = tl.program_id(axis=0).to(tl.int64)
 
@@ -69,9 +70,10 @@ def rms_norm_kernel(
 
         w = tl.load(w_ptr + offsets, mask=mask).to(tl.float32)
 
-        # Multiply x with RMS on float32, but cast to the narrower type before
-        # multiplying with the weights to replicate the HF behaviour precisely.
-        result = w * (x * rms)
+        normalized = x * rms
+        if ROUND_BEFORE_WEIGHT:
+            normalized = normalized.to(x_ptr.dtype.element_ty).to(tl.float32)
+        result = w * normalized
         if HAS_OUT_SCALE:
             result = scale_and_clamp(result, o_scale, output_dtype)
         tl.store(o_row + offsets, result, mask=mask)
