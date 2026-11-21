@@ -92,7 +92,7 @@ def _moe_profile_shapes(
         "expert_weights": _bucket(inputs["expert_weights"]),
         "hidden_states": _bucket(inputs["hidden_states"]),
         "hidden_states_scale": _bucket(inputs["hidden_states_scale"], dim=scale_dim),
-        "gemm1_lora_delta": (0,),
+        "gemm1_lora_delta": _bucket(inputs.get("gemm1_lora_delta")),
         "per_token_scale": (0,),
     }
     return tuple(by_name[name] for name in MoEInputs._FIELDS)
@@ -578,6 +578,11 @@ def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
 @pytest.mark.parametrize("intermediate_size", [3072])
 @pytest.mark.parametrize("num_experts", [128, 384])
 @pytest.mark.parametrize("top_k", [4, 6])
+@pytest.mark.parametrize(
+    "activation_type,has_gemm1_lora_delta",
+    [(ActivationType.Swiglu, False), (ActivationType.Situ, True)],
+    ids=["Swiglu", "Situ_LoRA"],
+)
 def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     num_tokens: int,
     hidden_size: int,
@@ -585,6 +590,8 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     top_k: int,
     num_experts: int,
     quant_mode: Fp4QuantMode,
+    activation_type: ActivationType,
+    has_gemm1_lora_delta: bool,
     local_num_experts: int | None = None,
     tile_ns: set[int] | None = None,
 ):
@@ -598,6 +605,9 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     """
     if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
         pytest.skip("Only work on SM100 / SM103.")
+
+    if has_gemm1_lora_delta and quant_mode != "MxFP4xMxFP8":
+        pytest.skip("SiTU LoRA coverage targets MXFP4 x MXFP8")
 
     AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
 
@@ -629,6 +639,18 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         "output2_scale_scalar",
     ):
         inputs[key] = inputs[key][:local_num_experts]
+    inputs["gemm1_lora_delta"] = (
+        torch.randn(
+            num_tokens,
+            top_k,
+            2 * intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1
+        if has_gemm1_lora_delta
+        else None
+    )
     # Pin the autotuner bucket so cache-write and runtime cache-lookup match.
     tune_max_num_tokens = max(last_positive_power_of_2(num_tokens), 16)
     bucket_m = min(last_positive_power_of_2(num_tokens), tune_max_num_tokens)
@@ -644,13 +666,14 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         fp8_quantization_type=Fp8QuantizationType.NoneFp8,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        activation_type=ActivationType.Swiglu.value,
+        activation_type=activation_type.value,
         weight_layout=WeightLayout.MajorK,
         use_shuffled_weight=True,
         num_experts=num_experts,
     )
 
     def _run_kernel_with_tactic(tactic: list[int] | None) -> torch.Tensor:
+        AutoTuner.get()._logged_file_hits.discard(_TEST_LOG_KEY_FP4)
         _force_tactic_in_autotuner_cache(
             profile_shapes, tactic, custom_op=_TEST_OP_FP4, runner=forced_runner
         )
@@ -662,6 +685,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
             gemm1_weights=inputs["w13"],
             gemm1_weights_scale=inputs["w13_scale"],
             gemm1_bias=None,
+            gemm1_lora_delta=inputs["gemm1_lora_delta"],
             gemm1_alpha=None,
             gemm1_beta=None,
             gemm1_clamp_limit=None,
@@ -682,10 +706,14 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
             routing_method_type=routing_method_type.value,
             do_finalize=True,
             enable_pdl=enable_pdl,
-            activation_type=ActivationType.Swiglu.value,
+            activation_type=activation_type.value,
             tune_max_num_tokens=tune_max_num_tokens,
         )[0]
         torch.cuda.synchronize()
+        if tactic is not None:
+            assert _TEST_LOG_KEY_FP4 in AutoTuner.get()._logged_file_hits, (
+                f"forced tactic {tactic} was not dispatched through the autotuner cache"
+            )
         return out
 
     # Heuristic-default tactic acts as reference.
@@ -705,6 +733,8 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         local_num_experts,
         num_tokens,
         global_num_experts=num_experts,
+        activation_type=activation_type,
+        has_gemm1_lora_delta=has_gemm1_lora_delta,
     )
     if tile_ns is not None:
         valid_tactics = [t for t in valid_tactics if t[0] in tile_ns]
@@ -769,8 +799,38 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness_expert_parallel():
         top_k=8,
         num_experts=num_experts,
         quant_mode="NvFP4xNvFP4",
+        activation_type=ActivationType.Swiglu,
+        has_gemm1_lora_delta=False,
         local_num_experts=local_num_experts,
         tile_ns=added,
+    )
+
+
+def test_trtllm_fp4_situ_lora_large_token_bucket():
+    # Larger per-expert token counts make the 64/128/256 MN-bias tiles reachable.
+    test_trtllm_fp4_routed_moe_all_tactics_correctness(
+        num_tokens=4096,
+        hidden_size=4096,
+        intermediate_size=3072,
+        top_k=6,
+        num_experts=128,
+        quant_mode="MxFP4xMxFP8",
+        activation_type=ActivationType.Situ,
+        has_gemm1_lora_delta=True,
+    )
+
+
+def test_trtllm_fp4_swiglu_lora_large_token_bucket():
+    # The MN-bias tile restriction also applies to existing SwiGLU LoRA.
+    test_trtllm_fp4_routed_moe_all_tactics_correctness(
+        num_tokens=4096,
+        hidden_size=4096,
+        intermediate_size=3072,
+        top_k=6,
+        num_experts=128,
+        quant_mode="MxFP4xMxFP8",
+        activation_type=ActivationType.Swiglu,
+        has_gemm1_lora_delta=True,
     )
 
 
