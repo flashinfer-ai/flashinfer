@@ -38,6 +38,24 @@ namespace flashinfer::mamba::checkpointing {
 
 using namespace conversion;
 
+// ── PDL (programmatic dependent launch) primitives ──
+// griddepcontrol is SM90+ PTX, but a JIT module is compiled once per -gencode
+// target, so a module that carries the two-kernel split is also built for
+// compute_80/89.  Strip the intrinsics there instead of failing ptxas: the
+// split itself never runs on those devices (the Python layer gates tactic
+// selection on device_support_pdl).  Guard mirrors include/flashinfer/norm.cuh.
+__device__ __forceinline__ void ssu_grid_dependency_wait() {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+}
+
+__device__ __forceinline__ void ssu_grid_dependency_launch() {
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 // ldmatrix.b8 (SM100_U8x16_LDSM_T) was tried as a replacement for per-lane
 // LDS.16 int8 state loads.  It's 5-18% slower (bench v16.7b vs v16.8) because:
 //   (1) inherent 2-way bank conflicts (16 threads × 16B vs 128B banks),

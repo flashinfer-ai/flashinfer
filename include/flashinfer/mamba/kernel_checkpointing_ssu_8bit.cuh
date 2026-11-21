@@ -1438,7 +1438,7 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
                            NUM_WARPS>(smem, params, lane, warp, d_tile, head, group_idx, cache_slot,
                                       ring_start, A_val, dt_bias_val, dt_seq_base, z_seq_base,
                                       seq_len);
-    cudaGridDependencySynchronize();
+    ssu_grid_dependency_wait();
     load_post_pdl_wait_data<input_t, NPREDICTED, DIM, D_PER_CTA, DSTATE>(
         smem, params, lane, warp, d_tile, head, group_idx, outer, seq_len);
   } else {
@@ -1485,7 +1485,7 @@ __global__ void checkpointing_ssu_kernel_8bit(CheckpointingSsuParams params) {
   // target tensors only the next SSU step reads, not the immediate
   // downstream kernel — safe to signal first. ──
   if constexpr (ENABLE_PDL) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    ssu_grid_dependency_launch();
   }
 
   // ── Phase 3: cache writes (old_x, dt_proc, cumAdt) ──

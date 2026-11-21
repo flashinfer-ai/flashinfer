@@ -35,7 +35,7 @@ from ..fused_moe.utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from ..jit.mamba.checkpointing_ssu import gen_checkpointing_ssu_module
-from ..utils import register_custom_op, register_fake_op
+from ..utils import device_support_pdl, register_custom_op, register_fake_op
 
 
 _ALGORITHM_AUTO = 0
@@ -71,6 +71,7 @@ def _get_module(
     philox_rounds: int = 0,
     enable_pdl: bool = False,
 ):
+    """Return the cached JIT module for this checkpointing SSU specialization."""
     return gen_checkpointing_ssu_module(
         state_dtype,
         input_dtype,
@@ -358,17 +359,22 @@ class CheckpointingSSURunner(TunableRunner):
 
     @staticmethod
     def _two_kernel_supported(inputs: list[Any]) -> bool:
+        """Return whether inputs can use the PDL-backed two-kernel split."""
         state = inputs[0]  # state
         x = inputs[1]  # x
         cb_scaled = inputs[19]  # cb_scaled
         cumAdt_vec = inputs[20]  # cumAdt_vec
         cb_old = inputs[21]  # cb_old
+        # The two-kernel split hard-wires its internal precompute -> main PDL
+        # chain (the launch attribute is always 1).  The PDL PTX therefore
+        # requires SM90+, even when the caller leaves enable_pdl=False.
         return (
             cb_scaled is not None
             and cumAdt_vec is not None
             and cb_old is not None
             and state.element_size() in (2, 4)
             and x.element_size() == 2
+            and device_support_pdl(x.device)
         )
 
     def get_valid_tactics(
@@ -477,6 +483,7 @@ class CheckpointingSSURunner(TunableRunner):
         do_preparation: bool = False,
         **kwargs: Any,
     ) -> None:
+        """Prepare the JIT module or launch the selected checkpointing SSU tactic."""
         del kwargs
         if do_preparation:
             _get_module(*self._module_base_args)
@@ -507,7 +514,7 @@ class CheckpointingSSURunner(TunableRunner):
         if two_kernel and not self._two_kernel_supported(inputs):
             raise ValueError(
                 "two-kernel checkpointing SSU requires its scratch trio, "
-                "2-byte input, and 2- or 4-byte state"
+                "2-byte input, 2- or 4-byte state, and a PDL-capable (SM90+) device"
             )
         module = _get_module(*self._module_base_args)
         module.checkpointing_ssu(
