@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from b12x.attention import sparse_mla
+from b12x.attention.sparse_mla._scratch import plan_sparse_mla_scratch
 from b12x.attention._shared.mla.prefill import _topk_container
 from b12x.attention._shared.mla.traits import ModelType
 
@@ -56,7 +57,8 @@ def test_glm_binding_requires_the_planned_topk_width(
     short_width: int,
 ) -> None:
     rows = 2
-    plan = sparse_mla.plan(
+    # Exercise the storage-binding contract without compiling GPU programs.
+    plan = plan_sparse_mla_scratch(
         sparse_mla.Caps(
             device="cpu",
             num_q_heads=8,
@@ -81,27 +83,25 @@ def test_glm_binding_requires_the_planned_topk_width(
     with pytest.raises(
         ValueError, match=f"must match the planned top-k width {planned_width}"
     ):
-        sparse_mla.bind(
-            plan,
+        plan.bind(
             scratch=scratch,
             q=q,
             kv_cache=kv_cache,
             selected_indices=torch.empty((rows, short_width), dtype=torch.int32),
-            cache_lengths=cache_seqlens,
-            selected_lengths=active_counts,
+            cache_seqlens_int32=cache_seqlens,
+            nsa_cache_seqlens_int32=active_counts,
         )
 
     selected_indices = torch.empty((rows, planned_width), dtype=torch.int32)
-    binding = sparse_mla.bind(
-        plan,
+    binding = plan.bind(
         scratch=scratch,
         q=q,
         kv_cache=kv_cache,
         selected_indices=selected_indices,
-        cache_lengths=cache_seqlens,
-        selected_lengths=active_counts,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=active_counts,
     )
-    assert binding.runtime.selected_indices is selected_indices
+    assert binding.selected_indices is selected_indices
 
 
 def test_glm_prefill_dispatch_keeps_the_bound_index_storage(monkeypatch) -> None:
