@@ -2,7 +2,36 @@ import argparse
 import torch
 
 from flashinfer.testing.utils import set_seed
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import (
+    BackendSupportedError,
+    GPUArchitectureError,
+    LibraryError,
+    get_compute_capability,
+)
+
+# What the library raises when a backend rejects a configuration: Python guards
+# (ValueError / NotImplementedError / AssertionError), C++ and cubin lookups
+# (RuntimeError), a missing optional toolchain (ImportError, or OSError for the
+# tileiras compiler) and the library's own types. TypeError, AttributeError,
+# KeyError and the like mean harness/library skew and are left to propagate.
+BACKEND_REJECTION_ERRORS = (
+    ValueError,
+    NotImplementedError,
+    AssertionError,
+    RuntimeError,
+    ImportError,
+    OSError,
+    BackendSupportedError,
+    GPUArchitectureError,
+    LibraryError,
+)
+try:
+    # A CuTe DSL kernel that fails to compile for a configuration.
+    from cutlass.base_dsl.common import DSLBaseError
+
+    BACKEND_REJECTION_ERRORS += (DSLBaseError,)
+except ImportError:
+    pass
 
 # Output columns for the test results.
 output_column_dict = {
@@ -34,12 +63,28 @@ output_column_dict = {
         "timing_metric",
         "row_activity_mode",
         "calls_per_sample",
+        "window_left",
+        "logits_soft_cap",
+        "sinks",
+        "use_fp16_softmax",
+        "uses_spcompress",
+        "use_token_head_sf",
+        "skip_softmax_threshold_scale_factor",
+        "kv_cache_kind",
+        "slot_mapping",
+        "num_states",
+        # serving-shaped inputs (routines/value_inputs.py); blank unless set
+        "seq_lens_kv",
+        "seq_lens_q",
+        "decode_max_seq_len",
     ],
     "dsv4_sparse_mla": [
         "swa_topk",
         "compressed_topk",
         "compressed_kv_len",
         "compressed_page_size",
+        "dsv4_layer",
+        "sparse_mla_top_k",
     ],
     "gemm": [
         "n",
@@ -50,6 +95,10 @@ output_column_dict = {
         "use_128x4_sf_layout",
         "use_nvfp4",
         "bias",
+        "scale_granularity_m",
+        "expected_m",
+        "rank",
+        "epilogue",
     ],
     "moe": [
         "num_tokens",
@@ -88,12 +137,28 @@ output_column_dict = {
         "tp_rank",
         "ep_size",
         "ep_rank",
+        # Mode-defining flags, appended so the columns before them keep their
+        # positions.
+        "routing_input",
+        "num_fused_shared_experts",
+        "valid_hidden_size",
+        "valid_intermediate_size",
+        "swiglu_alpha",
+        "swiglu_beta",
+        "gemm_bias",
+        # serving-shaped inputs (routines/value_inputs.py); blank unless set
+        "routing_dist",
     ],
     "allreduce_comm": [
         "num_tokens",
         "ar_backend",
         "pattern",
         "layout_code",
+        # linattn (2026-10): workload knobs of the fused patterns.
+        "block_quant_group_size",
+        "weight_bias",
+        "fp32_acc",
+        "shared_expert",
     ],
     "mixed_comm": [
         "local_bs",
@@ -113,6 +178,11 @@ output_column_dict = {
         "ppf",
         "pph",
         "ppw",
+        # normquant 2026-10: activation / mHC / gated-residual norm modes
+        "act_type",
+        "mhc_mode",
+        "num_splits",
+        "norm_variant",
     ],
     "quantization": [
         "alignment",
@@ -120,6 +190,19 @@ output_column_dict = {
         "sf_layout",
         "do_shuffle",
         "sf_vec_size",
+        # normquant 2026-10: quantization mode knobs
+        "per_token_activation",
+        "nvfp4_4over6",
+        "use_4over6",
+        "nvfp4_4over6_err_mode",
+        "nvfp4_4over6_err_use_fast_math",
+        "nvfp4_4over6_e4m3_max",
+        "disable_quant_fast_math",
+        "masked_m",
+        "column_major_scales",
+        "scale_tma_aligned",
+        "scale_ue8m0",
+        "bitorder",
     ],
     "sampling": [
         "vocab_size",
@@ -133,11 +216,24 @@ output_column_dict = {
         "top_k_max",
         "max_len",
         "num_rows",
+        # normquant 2026-10: sampling / top-k modes
+        "param_mode",
+        "deterministic",
+        "input_distribution",
+        "sorted",
+        "tie_break",
+        "dsa_graph_safe",
     ],
     # top_k_varlen selects top-K KV positions per request; its row width is a
     # max sequence length, not a vocab size (see routines/topk_varlen.py).
     "topk_varlen": [
         "max_seq_len",
+        "compress_ratio",
+        "seq_len_distribution",
+        "load_balance",
+        "return_values",
+        "topk_mode",
+        "chunk_len",
     ],
     "rope": [
         "seq_len",
@@ -148,6 +244,9 @@ output_column_dict = {
         "rope_scale",
         "interleave",
         "kv_layout",
+        # normquant 2026-10
+        "inplace",
+        "mla_kv",
     ],
     "mamba": [
         "nheads",
@@ -170,6 +269,29 @@ output_column_dict = {
         "conv_workspace_bytes",
         "conv_host_submit_us",
         "conv_cuda_ops",
+        # linattn (2026-10): mode-defining knobs of the SSU spec-decode /
+        # quantized-state paths and of ssd_combined / checkpointing_ssu /
+        # replayssm_materialize. Existing SSU lines write the defaults
+        # (varlen=False, algorithm=auto, ...).
+        "varlen",
+        "algorithm",
+        "intermediate_states",
+        "disable_state_update",
+        "dst_checkpoint_step",
+        "philox_rounds",
+        "ssm_seqlen",
+        "chunk_size",
+        "max_window",
+        "prev_tokens",
+        "num_layers",
+        "replay_prefix_len",
+        "active_requests",
+        "initial_states",
+        "no_d",
+        "d_has_hdim",
+        "d_split",
+        # Which library kernel produced the row (cuda_sm100, cuda:two-kernel, ...).
+        "mamba_kernel",
     ],
     "gdn": [
         "num_q_heads",
@@ -181,6 +303,12 @@ output_column_dict = {
         "update_state",
         "use_qk_l2norm",
         "use_cp",
+        # linattn (2026-10): kernel family that ran (= backend name for explicit
+        # backends; for 'flashinfer' the kernel the library picked on prefill and
+        # 'auto' on decode / MTP) and the
+        # non-default workload knobs (initial state, ragged, indices, ...).
+        "gdn_kernel",
+        "gdn_flags",
     ],
     "kda": [
         # Which variant the policy chose, and whether this device's thresholds
@@ -192,12 +320,27 @@ output_column_dict = {
         "sm_count",
         "packed",
         "has_initial_state",
+        # linattn (2026-10)
+        "ragged",
+        "gate_mode",
+        "lower_bound",
+        "beta_is_logit",
+        "num_spec_tokens",
+        "state_pool",
+        "verify_caches",
     ],
     "msa": [
         "topk",
         "max_k_tiles",
         "total_q",
         "total_kv",
+        # paged_mqa_logits (DSA indexer); next_n is shared with top_k_varlen
+        "mqa_dtype",
+        "next_n",
+        # Block-sparse wrappers: block shape and fraction of blocks attended
+        "block_r",
+        "block_c",
+        "block_density",
     ],
     "general": [
         "batch_size",
@@ -251,6 +394,12 @@ benchmark_apis = {
         "BatchPrefillWithRaggedKVCacheWrapper",
         "BatchMLAPagedAttentionWrapper",
         "trtllm_batch_decode_sparse_mla_dsv4",
+        "concat_mla_k",
+        "concat_mla_kv_quant_fp8",
+        "append_paged_kv_cache",
+        "single_decode_with_kv_cache",
+        "single_prefill_with_kv_cache",
+        "merge_states",
     ],
     "gemm": [
         "gemm_fp8_nt_groupwise",
@@ -264,6 +413,12 @@ benchmark_apis = {
         "mm_bf16",
         "bmm_bf16",
         "tinygemm_bf16",
+        "router_gemm",
+        "group_gemm_mxfp4_nt_groupwise",
+        "masked_grouped_gemm",
+        "grouped_mm",
+        "mm_nvfp4_svdquant",
+        "fused_linear",
     ],
     "moe": [
         "trtllm_fp4_block_scale_moe",
@@ -276,6 +431,9 @@ benchmark_apis = {
         "alphamoe_nvfp4_aligned_moe",
         "unified_nvfp4_moe",
         "bgmv_moe",
+        "trtllm_bf16_moe",
+        "trtllm_mxint4_block_scale_moe",
+        "moe_routing",
     ],
     # Uses each unified backend config's supported(arch) check followed by a
     # real runner construction/probe, like mm_fp4's runtime backend filtering.
@@ -301,12 +459,32 @@ benchmark_apis = {
         "fused_rmsnorm_silu",
         "fused_dit_layernorm",
         "fused_qk_rmsnorm_rope",
+        # normquant 2026-10
+        "fused_add_rmsnorm_fp8_block_quant",
+        "layernorm",
+        "act_and_mul",
+        "mhc",
+        "gated_residual_rmsnorm",
+        "gated_residual_next_rmsnorm",
+        "rmsnorm_sigmoid_gate",
     ],
     "quantization": [
         "mxfp8_quantize",
         "mxfp4_quantize",
         "nvfp4_quantize",
         "nvfp4_batched_quantize",
+        # normquant 2026-10
+        "scaled_fp4_grouped_quantize",
+        "mxfp8_grouped_quantize",
+        "per_token_group_quant_8bit",
+        "silu_and_mul_nvfp4_quantize",
+        "silu_and_mul_scaled_nvfp4_experts_quantize",
+        "silu_and_mul_mxfp8_experts_quantize",
+        "nvfp4_kv_quantize",
+        "nvfp4_kv_dequantize",
+        "nvfp4_kv_dequantize_paged",
+        "packbits",
+        "segment_packbits",
     ],
     "sampling": [
         "softmax",
@@ -346,20 +524,37 @@ benchmark_apis = {
         "selective_state_update",
         "causal_conv1d_fn",
         "causal_conv1d_update",
+        "ssd_combined",
+        "checkpointing_ssu",
+        "replayssm_materialize",
     ],
     "gdn": [
         "gated_delta_rule_decode",
         "gated_delta_rule_mtp",
         "chunk_gated_delta_rule",
+        "chunk_gated_delta_rule2",
+        "chunk_gated_delta_product",
+        "gated_delta_rule_mtp_ucache",
+        "gated_delta_rule_mtp_ucache_flush",
+        "gdn_fused_decode_step",
+        "gated_delta_rule_replayssm_commit",
     ],
     "kda": [
         "recurrent_kda_prefill",
+        "recurrent_kda_decode",
+        "recurrent_kda_output_only",
+        "fused_kda_decode",
+        "packed_fused_kda_decode",
     ],
     "sparse_attention": [
         "MSAProxyScore",
         "MSASparseAttention",
         "MSASparseDecode",
         "MSAPipeline",
+        "MSATopKSelect",
+        "paged_mqa_logits",
+        "BlockSparseAttentionWrapper",
+        "VariableBlockSparseAttentionWrapper",
     ],
 }
 
@@ -406,6 +601,59 @@ def is_close_stats(input, other, rtol=1e-5, atol=1e-8):
     )
 
 
+def fp8_code_distance(actual, expected):
+    """Per-element distance in representable steps between two 8-bit tensors.
+
+    A fixed rtol cannot express one fp8 ULP (12.5% relative for e4m3), so fp8
+    outputs are compared in code space: sign-magnitude bytes mapped to an
+    ordered integer line. int8 tensors are compared directly.
+
+    Bytes are read as e4m3 codes, where magnitude 0x7F is NaN, one step above
+    the largest finite value (0x7E). A NaN on one side only is a mismatch
+    (distance 255), so it cannot pass a "within one step" check.
+    """
+    if actual.dtype == torch.int8:
+        return (actual.to(torch.int16) - expected.to(torch.int16)).abs()
+
+    def ordered(x):
+        u = x.view(torch.uint8).to(torch.int16)
+        mag = u & 0x7F
+        return torch.where(u >= 0x80, -mag, mag), mag == 0x7F
+
+    a, a_nan = ordered(actual)
+    e, e_nan = ordered(expected)
+    dist = (a - e).abs()
+    dist = torch.where(a_nan & e_nan, torch.zeros_like(dist), dist)
+    return torch.where(a_nan != e_nan, torch.full_like(dist, 255), dist)
+
+
+def blank_unused_mode_columns(args, res, defaults=None, owners=None):
+    """Keep pre-existing CSV rows (and the dashboard problem keys built from them) unchanged
+    when a routine family gains new mode flags.
+
+    flashinfer_benchmark.py backfills every empty output column from ``args``, so a new flag
+    would otherwise write its default into rows that never used it. ``defaults`` maps a
+    column to the string values that mean "mode not used" (written as ""); ``owners`` maps a
+    column to the routines that use it (blank for every other routine). Rows that set a
+    non-default value keep it; ``args`` is blanked afterwards so the backfill writes "".
+    Call this after the routine has run (it overwrites ``args`` attributes).
+    """
+    defaults = defaults or {}
+    owners = owners or {}
+    for col in set(defaults) | set(owners):
+        for r in res:
+            v = r.get(col, "")
+            if v == "":
+                v = getattr(args, col, "")
+            unused = col in owners and args.routine not in owners[col]
+            if unused or str(v) in defaults.get(col, ()):
+                v = ""
+            r[col] = v
+        if hasattr(args, col):
+            setattr(args, col, "")
+    return res
+
+
 def to_float8(x, dtype=torch.float8_e4m3fn):
     """Quantize ``x`` to FP8 with a per-tensor scale and return the inverse scale.
 
@@ -442,13 +690,23 @@ def dtype_str_to_torch_dtype(dtype_str):
 routine_cc_to_supported_backends = {
     # ATTENTION
     "BatchDecodeWithPagedKVCacheWrapper": {
-        # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache
+        # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache(backend="auto"),
+        #       which resolves to trtllm-gen on SM10x and to xqa elsewhere
+        # NOTE: xqa calls trtllm_batch_decode_with_kv_cache(backend="xqa")
         # NOTE: cudnn-native calls cudnn_batch_decode_with_kv_cache
         "7.5": ["fa2", "auto"],
         "8.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
         "8.6": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
         "8.9": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
+        "9.0": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-native",
+            "xqa",
+        ],
         "10.0": [
             "fa2",
             "fa2_tc",
@@ -458,6 +716,8 @@ routine_cc_to_supported_backends = {
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
+            "cute-dsl",
+            "xqa",
         ],
         "10.3": [
             "fa2",
@@ -468,6 +728,8 @@ routine_cc_to_supported_backends = {
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
+            "cute-dsl",
+            "xqa",
         ],
         "10.7": [
             "fa2",
@@ -477,15 +739,103 @@ routine_cc_to_supported_backends = {
             "cudnn-native",
             "trtllm-gen",
             "trtllm-native",
+            "cute-dsl",
+            "xqa",
             "prims-ts",
         ],
-        "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
-        "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
+        "12.0": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-native",
+            "xqa",
+        ],
+        "12.1": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-native",
+            "xqa",
+        ],
     },
     "BatchPrefillWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_context_with_kv_cache
         # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
         # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
+        # NOTE: batch-attention runs flashinfer.BatchAttention on the same batch
+        "7.5": [],
+        "8.0": ["fa2", "auto", "cudnn", "cudnn-native", "batch-attention"],
+        "8.6": ["fa2", "auto", "cudnn", "cudnn-native", "batch-attention"],
+        "8.9": ["fa2", "auto", "cudnn", "cudnn-native", "batch-attention"],
+        "9.0": [
+            "fa2",
+            "fa3",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "batch-attention",
+        ],
+        "10.0": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+            "cute-dsl",
+            "batch-attention",
+        ],
+        "10.3": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+            "cute-dsl",
+            "batch-attention",
+        ],
+        "10.7": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+            "prims-ts",
+            "cute-dsl",
+            "batch-attention",
+        ],
+        "12.0": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "cute-dsl-prims",
+            "batch-attention",
+        ],
+        "12.1": [
+            "fa2",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-fmha-v2",
+            "batch-attention",
+        ],
+    },
+    "BatchPrefillWithRaggedKVCacheWrapper": {
+        # NOTE: trtllm-native calls trtllm_ragged_attention_deepseek
+        # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
+        # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
+        # NOTE: auto resolves inside the wrapper (Blackwell upgrades to cudnn/cutlass)
         "7.5": [],
         "8.0": ["fa2", "auto", "cudnn", "cudnn-native"],
         "8.6": ["fa2", "auto", "cudnn", "cudnn-native"],
@@ -496,27 +846,33 @@ routine_cc_to_supported_backends = {
             "auto",
             "cudnn",
             "cudnn-native",
-            "trtllm-gen",
+            "cutlass",
+            "cute-dsl",
             "trtllm-native",
             "prims-ts",
+            "cutile",
         ],
         "10.3": [
             "fa2",
             "auto",
             "cudnn",
             "cudnn-native",
-            "trtllm-gen",
+            "cutlass",
+            "cute-dsl",
             "trtllm-native",
             "prims-ts",
+            "cutile",
         ],
         "10.7": [
             "fa2",
             "auto",
             "cudnn",
             "cudnn-native",
-            "trtllm-gen",
+            "cutlass",
+            "cute-dsl",
             "trtllm-native",
             "prims-ts",
+            "cutile",
         ],
         "12.0": [
             "fa2",
@@ -526,131 +882,491 @@ routine_cc_to_supported_backends = {
             "trtllm-fmha-v2",
             "cute-dsl-prims",
         ],
-        "12.1": ["fa2", "auto", "cudnn", "cudnn-native"],
-    },
-    "BatchPrefillWithRaggedKVCacheWrapper": {
-        # NOTE: trtllm-native calls trtllm_ragged_attention_deepseek
-        # NOTE: trtllm-fmha-v2 calls trtllm_fmha_v2_prefill
-        # NOTE: cudnn-native calls cudnn_batch_prefill_with_kv_cache
-        "7.5": [],
-        "8.0": ["fa2", "cudnn", "cudnn-native"],
-        "8.6": ["fa2", "cudnn", "cudnn-native"],
-        "8.9": ["fa2", "cudnn", "cudnn-native"],
-        "9.0": ["fa2", "fa3", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
-        "10.0": [
-            "fa2",
-            "cudnn",
-            "cudnn-native",
-            "cutlass",
-            "cute-dsl",
-            "trtllm-native",
-            "prims-ts",
-        ],
-        "10.3": [
-            "fa2",
-            "cudnn",
-            "cudnn-native",
-            "cutlass",
-            "cute-dsl",
-            "trtllm-native",
-            "prims-ts",
-        ],
-        "10.7": [
-            "fa2",
-            "cudnn",
-            "cudnn-native",
-            "cutlass",
-            "cute-dsl",
-            "trtllm-native",
-            "prims-ts",
-        ],
-        "12.0": [
-            "fa2",
-            "cudnn",
-            "cudnn-native",
-            "trtllm-fmha-v2",
-            "cute-dsl-prims",
-        ],
-        "12.1": ["fa2", "cudnn", "cudnn-native"],
+        "12.1": ["fa2", "auto", "cudnn", "cudnn-native", "trtllm-fmha-v2"],
     },
     "BatchMLAPagedAttentionWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache_mla(backend="trtllm-gen")
         # NOTE: cute-dsl calls trtllm_batch_decode_with_kv_cache_mla(backend="cute-dsl")
         # NOTE: auto calls trtllm_batch_decode_with_kv_cache_mla(backend="auto")
         #       and is the only backend that benefits from --autotune
+        # NOTE: cutile / trtllm-gen / cute-dsl-rubin-mtp run
+        #       BatchMLAPagedAttentionWrapper(backend=...). trtllm-gen admits
+        #       10.0/10.3/10.7 (_batch_mla/_backends/trtllm_gen_backend.py), cutile
+        #       10.0/10.3/10.7/12.x (cutile_backend.py), cute-dsl-rubin-mtp 10.7 only
+        #       (cute_dsl_rubin_mtp_backend.py: fp8 in/out, 128 heads, page 64/128).
         "7.5": [],
         "8.0": ["fa2"],
         "8.6": ["fa2"],
         "8.9": ["fa2"],
         "9.0": ["fa2", "fa3"],
-        "10.0": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.3": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "auto", "prims-ts"],
-        "10.7": ["fa2", "cutlass", "trtllm-native", "cute-dsl", "prims-ts"],
-        "12.0": ["fa2"],
-        "12.1": ["fa2"],
+        "10.0": [
+            "fa2",
+            "cutlass",
+            "trtllm-native",
+            "cute-dsl",
+            "auto",
+            "prims-ts",
+            "cutile",
+            "trtllm-gen",
+        ],
+        "10.3": [
+            "fa2",
+            "cutlass",
+            "trtllm-native",
+            "cute-dsl",
+            "auto",
+            "prims-ts",
+            "cutile",
+            "trtllm-gen",
+        ],
+        "10.7": [
+            "fa2",
+            "cutlass",
+            "trtllm-native",
+            "cute-dsl",
+            "auto",
+            "prims-ts",
+            "cutile",
+            "trtllm-gen",
+            "cute-dsl-rubin-mtp",
+        ],
+        "12.0": ["fa2", "cutile"],
+        "12.1": ["fa2", "cutile"],
     },
     "trtllm_batch_decode_sparse_mla_dsv4": {
+        # NOTE: cute-dsl is the CuTe DSL HCA kernel (--dsv4_layer hca only).
+        # _resolve_dsv4_sparse_mla_backend (mla/_core.py): trtllm-gen admits
+        # 10.0/10.3/10.7; it admits cute-dsl there too, listed here on 10.0/10.3
+        # (the archs it has been timed on).
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["trtllm-gen"],
-        "10.3": ["trtllm-gen"],
-        "10.7": [],
+        "10.0": ["trtllm-gen", "cute-dsl"],
+        "10.3": ["trtllm-gen", "cute-dsl"],
+        "10.7": ["trtllm-gen"],
         "12.0": [],
         "12.1": [],
     },
+    "concat_mla_k": {
+        # NOTE: cuda = concat_mla_k(backend="default"), a generic JIT copy kernel.
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "concat_mla_kv_quant_fp8": {
+        # NOTE: specialized = the CUDA fused pack kernel; auto = the library's
+        #       per-head-count pick (mla_kv_pack.py _backend_order). Device guard:
+        #       mla_kv_pack.py _device_supported (cc >= allowlist min_cc = 10.0).
+        #       auto is left off where it can resolve to the Cake kernel (observed on
+        #       10.0 / 10.3 for head counts other than 12); Cake is out of scope here.
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["specialized"],
+        "10.3": ["specialized"],
+        "10.7": ["specialized", "auto"],
+        "12.0": ["specialized"],
+        "12.1": ["specialized"],
+    },
+    "append_paged_kv_cache": {
+        # NOTE: cuda = flashinfer.page.append_paged_kv_cache and its MLA / NVFP4
+        #       variants (generic JIT, no arch guard; jit/page.py)
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "single_decode_with_kv_cache": {
+        # NOTE: fa2_tc = use_tensor_cores=True (prefill kernel); fa2 JIT is built
+        #       for every supported arch (utils.determine_attention_backend)
+        "7.5": ["fa2"],
+        "8.0": ["fa2", "fa2_tc"],
+        "8.6": ["fa2", "fa2_tc"],
+        "8.9": ["fa2", "fa2_tc"],
+        "9.0": ["fa2", "fa2_tc"],
+        "10.0": ["fa2", "fa2_tc"],
+        "10.3": ["fa2", "fa2_tc"],
+        "10.7": ["fa2", "fa2_tc"],
+        "12.0": ["fa2", "fa2_tc"],
+        "12.1": ["fa2", "fa2_tc"],
+    },
+    "single_prefill_with_kv_cache": {
+        # NOTE: fa3 needs is_sm90a_supported (utils.py)
+        "7.5": [],
+        "8.0": ["fa2", "auto"],
+        "8.6": ["fa2", "auto"],
+        "8.9": ["fa2", "auto"],
+        "9.0": ["fa2", "fa3", "auto"],
+        "10.0": ["fa2", "auto"],
+        "10.3": ["fa2", "auto"],
+        "10.7": ["fa2", "auto"],
+        "12.0": ["fa2", "auto"],
+        "12.1": ["fa2", "auto"],
+    },
+    "merge_states": {
+        # NOTE: cuda = flashinfer.cascade.merge_state / merge_states (generic JIT,
+        #       no arch guard). The triton variants are Hopper-only (triton/cascade.py).
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "MSAProxyScore": {
+        # msa_ops/proxy_score.py:370,776 -- SM120/SM121 only
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "MSASparseAttention": {
+        "10.0": ["cudsl"],
+        "10.3": ["cudsl"],
+        "10.7": ["cudsl"],
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "MSASparseDecode": {
+        # trtllm-gen: decode.py enable_block_sparse_attention (trtllm-gen cubins)
+        "10.0": ["cudsl", "trtllm-gen"],
+        "10.3": ["cudsl", "trtllm-gen"],
+        "10.7": ["cudsl", "trtllm-gen"],
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "MSAPipeline": {
+        # proxy stage is SM120/SM121 only
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "MSATopKSelect": {
+        # msa_ops/sparse_topk_select.py:181,195; 10.7 raises (_blackwell_sm100.py:140)
+        "10.0": ["cudsl"],
+        "10.3": ["cudsl"],
+        "12.0": ["cudsl"],
+        "12.1": ["cudsl"],
+    },
+    "paged_mqa_logits": {
+        # attn_scores/attn_scores.py:759 _PAGED_MQA_CCS = [100, 103, 107]
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    "BlockSparseAttentionWrapper": {
+        # fa3: SM90 (utils.py determine_attention_backend); vsa_sm100_*:
+        # 10.0/10.3/10.7 (sparse.py vsa_sm100_* plan checks); vsa_sm120_blk64:
+        # cc major 12 (sparse.py:1071). Non-CI rows are guard-backed only.
+        # vsa_sm100_blk128 is guard-admitted on 10.0/10.3 but needs `quack-kernels`.
+        "8.0": ["fa2"],
+        "8.6": ["fa2"],
+        "8.9": ["fa2"],
+        "9.0": ["fa2", "fa3"],
+        "10.0": ["fa2", "cutile", "vsa_sm100_blk64"],
+        "10.3": ["fa2", "cutile", "vsa_sm100_blk64"],
+        "10.7": ["fa2", "cutile", "vsa_sm100_blk64"],
+        "12.0": ["fa2", "vsa_sm120_blk64"],
+        "12.1": ["fa2", "vsa_sm120_blk64"],
+    },
+    "VariableBlockSparseAttentionWrapper": {
+        "8.0": ["fa2"],
+        "8.6": ["fa2"],
+        "8.9": ["fa2"],
+        "9.0": ["fa2", "fa3"],
+        "10.0": ["fa2"],
+        "10.3": ["fa2"],
+        "10.7": ["fa2"],
+        "12.0": ["fa2"],
+        "12.1": ["fa2"],
+    },
     # GEMM
+    # Every gemm routine filters by this table first (rows mirror the library's
+    # per-backend @supported_compute_capability guards, cited per routine), then
+    # probes each remaining backend with a trial call to drop shape/dtype limits.
+    # 10.0 / 10.3 / 10.7 rows are pipecleaned on B200 / B300 / GR100 (a backend
+    # the guard allows stays listed even if it fails to build; the trial call
+    # drops it at run time); 9.0, 11.0 and 12.x rows are guard-backed only.
+    # cutlass flashinfer/gemm/gemm_base.py, trtllm, cutile (K-major only),
+    # cute-dsl (SM107 only). auto picks cute-dsl/cutlass.
     "gemm_fp8_nt_groupwise": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass", "auto", "batch_invariant"],
-        "10.3": ["cutlass", "auto", "batch_invariant"],
-        "10.7": ["cutlass", "cute-dsl", "auto", "batch_invariant"],
-        "12.0": [],
-        "12.1": [],
+        "10.0": ["cutlass", "trtllm", "cutile", "auto", "batch_invariant"],
+        "10.3": ["cutlass", "trtllm", "cutile", "auto", "batch_invariant"],
+        "10.7": ["cutlass", "trtllm", "cutile", "cute-dsl", "auto", "batch_invariant"],
+        "11.0": ["cutile"],
+        "12.0": ["cutlass", "cutile", "auto"],
+        "12.1": ["cutlass", "cutile", "auto"],
     },
+    # common check flashinfer/gemm/gemm_base.py gates every backend; cutile has no
+    # per-backend checker (a comment in the file names a missing one).
+    # deepgemm = group_deepgemm_fp8_nt_groupwise,
+    # cute-dsl = group_gemm_fp8_nt_groupwise_contiguous.
+    # SM12x raises for num_groups > 1; the probe drops it.
     "group_gemm_fp8_nt_groupwise": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass"],
-        "10.3": ["cutlass"],
-        "10.7": ["cutlass"],
-        "12.0": [],
-        "12.1": [],
+        "10.0": ["cutlass", "cutile", "deepgemm", "cute-dsl"],
+        "10.3": ["cutlass", "cutile", "deepgemm", "cute-dsl"],
+        "10.7": ["cutlass", "cutile", "deepgemm", "cute-dsl"],
+        "11.0": [],
+        "12.0": ["cutlass", "cutile"],
+        "12.1": ["cutlass", "cutile"],
     },
+    # cudnn flashinfer/gemm/gemm_base.py, cublas, cutlass, cute-dsl (SM107 only).
+    "bmm_fp8": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": ["cudnn", "cublas", "auto"],
+        "9.0": ["cudnn", "cublas", "auto"],
+        "10.0": ["cudnn", "cublas", "cutlass", "auto", "batch_invariant"],
+        "10.3": ["cudnn", "cublas", "cutlass", "auto", "batch_invariant"],
+        "10.7": ["cudnn", "cublas", "cutlass", "cute-dsl", "auto", "batch_invariant"],
+        "11.0": ["cudnn", "cublas", "cutlass", "auto"],
+        "12.0": ["cudnn", "cublas", "cutlass", "auto"],
+        "12.1": ["cudnn", "cublas", "cutlass", "auto"],
+    },
+    # trtllm_low_latency flashinfer/gemm/gemm_base.py, cublas, cudnn, cutlass,
+    # cutedsl_low_latency; prims-ts = flashinfer.gemm.fp8_linear
+    # (flashinfer/prims_ts/gemm/api.py, support.py).
+    "mm_fp8": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": ["cublas", "cudnn", "auto"],
+        "9.0": ["cublas", "cudnn", "auto"],
+        "10.0": [
+            "trtllm_low_latency",
+            "cutedsl_low_latency",
+            "cublas",
+            "cudnn",
+            "cutlass",
+            "prims-ts",
+            "auto",
+        ],
+        "10.3": [
+            "trtllm_low_latency",
+            "cutedsl_low_latency",
+            "cublas",
+            "cudnn",
+            "cutlass",
+            "prims-ts",
+            "auto",
+        ],
+        "10.7": [
+            "trtllm_low_latency",
+            "cutedsl_low_latency",
+            "cublas",
+            "cudnn",
+            "cutlass",
+            "prims-ts",
+            "auto",
+        ],
+        "11.0": ["cublas", "cudnn", "cutlass", "auto"],
+        "12.0": ["cublas", "cudnn", "cutlass", "auto"],
+        "12.1": ["cublas", "cudnn", "cutlass", "auto"],
+    },
+    # cudnn flashinfer/gemm/gemm_base.py, cutlass (SM120/121 only).
     "bmm_mxfp8": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cudnn"],
-        "10.3": ["cudnn"],
-        "10.7": ["cudnn", "cute-dsl"],
-        "12.0": ["cudnn"],
-        "12.1": ["cudnn"],
+        "10.0": ["cudnn", "auto"],
+        "10.3": ["cudnn", "auto"],
+        "10.7": ["cudnn", "cute-dsl", "auto"],
+        "11.0": ["cudnn", "auto"],
+        "12.0": ["cudnn", "cutlass", "auto"],
+        "12.1": ["cudnn", "cutlass", "auto"],
     },
+    # cudnn flashinfer/gemm/gemm_base.py, trtllm, cutlass, cute-dsl,
+    # cutedsl_low_latency, b12x; prims-ts = flashinfer.gemm.fp4_linear
+    # (prims_ts/gemm/api.py). cake (experimental) is not benchmarked.
+    "mm_fp4": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": [
+            "cudnn",
+            "trtllm",
+            "cutlass",
+            "cute-dsl",
+            "cutedsl_low_latency",
+            "prims-ts",
+            "auto",
+            "batch_invariant",
+        ],
+        "10.3": [
+            "cudnn",
+            "trtllm",
+            "cutlass",
+            "cute-dsl",
+            "cutedsl_low_latency",
+            "prims-ts",
+            "auto",
+            "batch_invariant",
+        ],
+        "10.7": [
+            "cudnn",
+            "trtllm",
+            "cutlass",
+            "cute-dsl",
+            "cutedsl_low_latency",
+            "prims-ts",
+            "auto",
+            "batch_invariant",
+        ],
+        "11.0": ["cudnn", "cutlass", "auto"],
+        "12.0": ["cudnn", "cutlass", "cute-dsl", "b12x", "auto"],
+        "12.1": ["cudnn", "cutlass", "cute-dsl", "b12x", "auto"],
+    },
+    # flashinfer/gemm/gemm_bf16_fp4.py: cudnn, cute-dsl,
+    # blackwell-native/-tiled; cute-dsl-native
+    # gemm/kernels/native_bf16_fp4/support.py.
+    "mm_bf16_fp4": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cudnn", "cute-dsl", "blackwell-native", "blackwell-tiled"],
+        "10.3": ["cudnn", "cute-dsl", "blackwell-native", "blackwell-tiled"],
+        "10.7": ["cudnn", "cute-dsl"],
+        "11.0": ["cudnn", "cute-dsl"],
+        "12.0": ["cudnn", "cute-dsl", "cute-dsl-native"],
+        "12.1": ["cudnn", "cute-dsl", "cute-dsl-native"],
+    },
+    # cutlass flashinfer/gemm/gemm_base.py, trtllm, cute-dsl, cutedsl_low_latency,
+    # cudnn; b12x flashinfer/gemm/gemm_mm_mxfp8_cute_dsl.py.
     "mm_mxfp8": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["cutlass", "cute-dsl", "trtllm", "cudnn", "batch_invariant"],
-        "10.3": ["cutlass", "cute-dsl", "trtllm", "cudnn", "batch_invariant"],
-        "10.7": ["cutlass", "cute-dsl", "trtllm", "batch_invariant"],
-        "11.0": ["cutlass", "cudnn"],
-        "12.0": ["cutlass", "cudnn"],
-        "12.1": ["cutlass", "cudnn"],
+        "10.0": [
+            "cutlass",
+            "cute-dsl",
+            "cutedsl_low_latency",
+            "trtllm",
+            "cudnn",
+            "auto",
+            "batch_invariant",
+        ],
+        "10.3": [
+            "cutlass",
+            "cute-dsl",
+            "cutedsl_low_latency",
+            "trtllm",
+            "cudnn",
+            "auto",
+            "batch_invariant",
+        ],
+        "10.7": [
+            "cutlass",
+            "cute-dsl",
+            "cutedsl_low_latency",
+            "trtllm",
+            "cudnn",
+            "auto",
+            "batch_invariant",
+        ],
+        "11.0": ["cutlass", "cudnn", "auto"],
+        "12.0": ["cutlass", "cudnn", "b12x", "auto"],
+        "12.1": ["cutlass", "cudnn", "b12x", "auto"],
     },
+    # Guards: the per-backend `_<backend>_mm_bf16_requirement` functions in
+    # flashinfer/gemm/gemm_base.py (tinygemm is also on SM107).
+    "mm_bf16": {
+        "7.5": [],
+        "8.0": ["cudnn", "cublaslt", "auto"],
+        "8.6": ["cudnn", "cublaslt", "auto"],
+        "8.7": ["cudnn", "cublaslt", "auto"],
+        "8.9": ["cudnn", "cublaslt", "auto"],
+        "9.0": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
+        "10.0": [
+            "cudnn",
+            "cutlass",
+            "tgv",
+            "cublaslt",
+            "tinygemm",
+            "cutile",
+            "cute-dsl",
+            "auto",
+            "batch_invariant",
+        ],
+        "10.3": [
+            "cudnn",
+            "cutlass",
+            "tgv",
+            "cublaslt",
+            "tinygemm",
+            "cutile",
+            "cute-dsl",
+            "auto",
+            "batch_invariant",
+        ],
+        "10.7": [
+            "cudnn",
+            "cutlass",
+            "tgv",
+            "cublaslt",
+            "tinygemm",
+            "cutile",
+            "cute-dsl",
+            "auto",
+            "batch_invariant",
+        ],
+        "11.0": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
+        "12.0": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
+        "12.1": ["cudnn", "cublaslt", "tinygemm", "cutile", "auto"],
+    },
+    # cutlass flashinfer/gemm/gemm_base.py, cudnn, cutile, tgv.
+    # cake (experimental) is not benchmarked.
+    "bmm_bf16": {
+        "7.5": [],
+        "8.0": ["cudnn", "auto"],
+        "8.6": ["cudnn", "auto"],
+        "8.7": ["cudnn", "auto"],
+        "8.9": ["cudnn", "auto"],
+        "9.0": ["cudnn", "cutile", "auto"],
+        "10.0": ["cudnn", "cutlass", "cutile", "tgv", "auto"],
+        "10.3": ["cudnn", "cutlass", "cutile", "tgv", "auto"],
+        "10.7": ["cudnn", "cutlass", "cutile", "tgv", "auto"],
+        "11.0": ["cudnn", "cutile", "auto"],
+        "12.0": ["cudnn", "cutile", "auto"],
+        "12.1": ["cudnn", "cutile", "auto"],
+    },
+    # flashinfer/gemm/routergemm.py.
     "tinygemm_bf16": {
         "7.5": [],
         "8.0": [],
@@ -664,7 +1380,98 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
+    # mm_M1_16_K*_N* shape checks, flashinfer/gemm/routergemm.py.
+    # The API has no backend argument; dsv3 labels the family.
+    "router_gemm": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["dsv3"],
+        "10.0": ["dsv3"],
+        "10.3": ["dsv3"],
+        "10.7": ["dsv3"],
+        "11.0": [],
+        "12.0": [],
+        "12.1": [],
+    },
+    # flashinfer/gemm/gemm_base.py also lists 110, but dispatch has no SM110 path
+    # (raises 'Unsupported device'), so 11.0 is left out.
+    "group_gemm_mxfp4_nt_groupwise": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cutlass"],
+        "10.3": ["cutlass"],
+        "10.7": ["cutlass"],
+        "11.0": [],
+        "12.0": ["cutlass"],
+        "12.1": ["cutlass"],
+    },
+    # deepgemm = batch_deepgemm_fp8_nt_groupwise flashinfer/gemm/gemm_base.py; cute-dsl =
+    # grouped_gemm_nt_masked (gemm/kernels/grouped_gemm_masked_wrapper.py:
+    # SM100/103 and SM107 kernels, SM110 rejected); cutile = masked_bmm
+    # flashinfer/gemm/gemm_base.py (bf16) / masked_scaled_bmm (block-scaled, no SM90).
+    "masked_grouped_gemm": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": ["cutile"],
+        "10.0": ["deepgemm", "cute-dsl", "cutile"],
+        "10.3": ["deepgemm", "cute-dsl", "cutile"],
+        "10.7": ["deepgemm", "cute-dsl"],
+        "11.0": ["cutile"],
+        "12.0": ["cutile"],
+        "12.1": ["cutile"],
+    },
+    # cudnn = grouped_mm_{bf16,fp8,mxfp8,fp4} flashinfer/grouped_mm/core.py,174,308,452
+    # (fp8 from 8.9, mxfp8/fp4 from 10.0; the dtype probe drops the rest);
+    # cutile = ragged_bmm flashinfer/gemm/gemm_base.py / ragged_scaled_bmm.
+    "grouped_mm": {
+        "7.5": [],
+        "8.0": ["cudnn"],
+        "8.6": ["cudnn"],
+        "8.9": ["cudnn"],
+        "9.0": ["cudnn", "cutile"],
+        "10.0": ["cudnn", "cutile"],
+        "10.3": ["cudnn", "cutile"],
+        "10.7": ["cudnn"],
+        "11.0": ["cudnn", "cutile"],
+        "12.0": ["cudnn", "cutile"],
+        "12.1": ["cudnn", "cutile"],
+    },
+    # flashinfer/gemm/gemm_svdquant.py: cutlass, cute-dsl(-unfused),
+    # cutlass-sm120. cake (experimental) is not benchmarked.
+    "mm_nvfp4_svdquant": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cutlass", "auto"],
+        "10.3": ["cutlass", "auto"],
+        "10.7": ["cutlass", "auto"],
+        "11.0": [],
+        "12.0": ["cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"],
+        "12.1": ["cute-dsl", "cute-dsl-unfused", "auto"],
+    },
+    # flashinfer/prims_ts/gemm/api.py (fp8/fp4 linear, swiglu, qkv_qknorm_rope).
+    "fused_linear": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["prims-ts"],
+        "10.3": ["prims-ts"],
+        "10.7": ["prims-ts"],
+        "11.0": [],
+        "12.0": [],
+        "12.1": [],
+    },
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -672,9 +1479,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["trtllm"],
-        "10.3": ["trtllm"],
-        "10.7": ["trtllm"],
+        # prims-ts follows _PRIMS_TS_ARCHS in flashinfer/prims_ts/moe/support.py;
+        # on 10.7 it also needs a CuTe DSL that can target SM107.
+        "10.0": ["trtllm", "prims-ts"],
+        "10.3": ["trtllm", "prims-ts"],
+        "10.7": ["trtllm", "prims-ts"],
         "12.0": [],
         "12.1": [],
     },
@@ -684,9 +1493,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["trtllm"],
-        "10.3": ["trtllm"],
-        "10.7": ["trtllm"],
+        # prims-ts follows _PRIMS_TS_ARCHS in flashinfer/prims_ts/moe/support.py;
+        # on 10.7 it also needs a CuTe DSL that can target SM107.
+        "10.0": ["trtllm", "prims-ts"],
+        "10.3": ["trtllm", "prims-ts"],
+        "10.7": ["trtllm", "prims-ts"],
         "12.0": [],
         "12.1": [],
     },
@@ -696,9 +1507,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["trtllm"],
-        "10.3": ["trtllm"],
-        "10.7": ["trtllm"],
+        # prims-ts follows _PRIMS_TS_ARCHS in flashinfer/prims_ts/moe/support.py;
+        # on 10.7 it also needs a CuTe DSL that can target SM107.
+        "10.0": ["trtllm", "prims-ts"],
+        "10.3": ["trtllm", "prims-ts"],
+        "10.7": ["trtllm", "prims-ts"],
         "12.0": [],
         "12.1": [],
     },
@@ -706,11 +1519,16 @@ routine_cc_to_supported_backends = {
         "7.5": [],
         "8.0": [],
         "8.6": [],
-        "8.9": [],
-        "9.0": [],
+        # 8.9/9.0/11.0 follow get_cutlass_fused_moe_module (sm89/sm90/sm100
+        # modules) and have not been run on hardware. --cutlass_variant nvfp4 is
+        # not built for 8.9/9.0 (_CUTLASS_NVFP4_ARCHS in flashinfer/fused_moe/api.py)
+        # and fails inside the library there.
+        "8.9": ["cutlass"],
+        "9.0": ["cutlass"],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
         "10.7": ["cutlass"],
+        "11.0": ["cutlass"],
         "12.0": ["cutlass"],
         "12.1": ["cutlass"],
     },
@@ -758,6 +1576,32 @@ routine_cc_to_supported_backends = {
         "10.0": ["unified"],
         "10.3": ["unified"],
         "10.7": ["unified"],
+    },
+    # BF16 / MxInt4 follow _TRTLLM_ROUTED_ARCHS in flashinfer/fused_moe/api.py.
+    "trtllm_bf16_moe": {
+        "10.0": ["trtllm", "prims-ts"],
+        "10.3": ["trtllm", "prims-ts"],
+        "10.7": ["trtllm", "prims-ts"],
+    },
+    "trtllm_mxint4_block_scale_moe": {
+        "10.0": ["trtllm"],
+        "10.3": ["trtllm"],
+        "10.7": ["trtllm"],
+    },
+    # Each backend follows its API's supported_compute_capability list
+    # (trtllm_gen_routing, fused_topk_deepseek's default backend, hash_topk).
+    # alphamoe (alphamoe_fused_router) runs only when named in --backends.
+    "moe_routing": {
+        "8.0": ["hash"],
+        "8.6": ["hash"],
+        "8.9": ["dsv3", "hash"],
+        "9.0": ["dsv3", "hash"],
+        "10.0": ["trtllm", "dsv3", "alphamoe", "hash"],
+        "10.3": ["trtllm", "dsv3", "alphamoe", "hash"],
+        "10.7": ["trtllm", "dsv3", "hash"],
+        "11.0": ["hash"],
+        "12.0": ["trtllm", "dsv3", "hash"],
+        "12.1": ["trtllm", "dsv3", "hash"],
     },
     # NORM
     "rmsnorm": {
@@ -871,6 +1715,123 @@ routine_cc_to_supported_backends = {
     },
     # fused_qk_rmsnorm_rope: CC check done programmatically via
     # fused_qk_rmsnorm_rope.is_compute_capability_supported() in the benchmark.
+    # normquant 2026-10. fused_rmsnorm_silu / fused_dit_layernorm: SM80+ (norm/__init__.py
+    # fused_rmsnorm_silu, _dit_ln_check_common_inputs); fp8 output SM89+, nvfp4/mxfp8 output
+    # SM100+, enforced by the library at call time.
+    "fused_rmsnorm_silu": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "fused_dit_layernorm": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # fused_add_rmsnorm_fp8_block_quant / act_and_mul: generic CUDA JIT, no SM guard.
+    "fused_add_rmsnorm_fp8_block_quant": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "act_and_mul": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # layernorm: same CuTe-DSL / CUDA-fallback dispatch as rmsnorm.
+    "layernorm": {
+        "7.5": ["cute-dsl"],
+        "8.0": ["cute-dsl"],
+        "8.6": ["cute-dsl"],
+        "8.9": ["cute-dsl"],
+        "9.0": ["cute-dsl"],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    # mhc: generic CUDA JIT (jit/mhc.py), no SM guard; bf16-only API.
+    "mhc": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # gated residual norms (Muse-Spark-style hidden 8192 / head dim 64): CuTe-DSL kernel
+    # gated on _GATED_RESIDUAL_COMPUTE_CAPABILITIES = (10,0),(10,3),(10,7) (norm/__init__.py:196);
+    # the library's cake route is out of scope, the routine forces backend='cute'.
+    "gated_residual_rmsnorm": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": [],
+        "12.1": [],
+    },
+    "gated_residual_next_rmsnorm": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": [],
+        "12.1": [],
+    },
+    "rmsnorm_sigmoid_gate": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": [],
+        "12.1": [],
+    },
     # QUANTIZATION
     "mxfp8_quantize": {
         "7.5": [],
@@ -892,7 +1853,7 @@ routine_cc_to_supported_backends = {
         "9.0": [],
         "10.0": ["cuda", "cute-dsl", "batch_invariant"],
         "10.3": ["cuda", "cute-dsl", "batch_invariant"],
-        "10.7": ["cuda", "batch_invariant"],
+        "10.7": ["cuda", "cute-dsl", "batch_invariant"],
         "12.0": ["cuda", "cute-dsl"],
         "12.1": ["cuda", "cute-dsl"],
     },
@@ -914,6 +1875,147 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # normquant 2026-10. CUDA fp4/mxfp8 quantize kernels compile their body only for
+    # __CUDA_ARCH__ >= 1000, so no rows below 10.0.
+    "scaled_fp4_grouped_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # mxfp8_grouped_quantize: major >= 10 (fp8_quantization.py mxfp8_grouped_quantize);
+    # cutile needs a tileiras that targets the device: the CTK 13.4 perf image's tileiras
+    # rejects sm_107 ("Cannot find option named 'sm_107'"), so no 10.7 cutile rows (here,
+    # per_token_group_quant_8bit and rope_quantize_fp8). cake out of scope.
+    "mxfp8_grouped_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda", "cutile"],
+        "10.3": ["cuda", "cutile"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda", "cutile"],
+        "12.1": ["cuda", "cutile"],
+    },
+    # per_token_group_quant_8bit: cutile only, no static SM guard; rows only where observed.
+    "per_token_group_quant_8bit": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cutile", "cuda"],
+        "10.3": ["cutile", "cuda"],
+        "10.7": ["cuda"],
+        "12.0": [],
+        "12.1": [],
+    },
+    # silu_and_mul_nvfp4_quantize: major >= 10 + CuTe-DSL (fp4_quantization.py:1017).
+    "silu_and_mul_nvfp4_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+        "12.0": ["cute-dsl"],
+        "12.1": ["cute-dsl"],
+    },
+    "silu_and_mul_scaled_nvfp4_experts_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    # silu_and_mul_mxfp8_experts_quantize: major >= 10 (fp8_quantization.py).
+    "silu_and_mul_mxfp8_experts_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "nvfp4_kv_quantize": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "nvfp4_kv_dequantize": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "nvfp4_kv_dequantize_paged": {
+        "7.5": [],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "packbits": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
+        "10.0": ["cuda"],
+        "10.3": ["cuda"],
+        "10.7": ["cuda"],
+        "12.0": ["cuda"],
+        "12.1": ["cuda"],
+    },
+    "segment_packbits": {
+        "7.5": ["cuda"],
+        "8.0": ["cuda"],
+        "8.6": ["cuda"],
+        "8.9": ["cuda"],
+        "9.0": ["cuda"],
         "10.0": ["cuda"],
         "10.3": ["cuda"],
         "10.7": ["cuda"],
@@ -1089,41 +2191,44 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
+    # normquant 2026-10. top_k family: "cuda" = library auto-dispatch; "radix" / "clusters" /
+    # "cub" are forced through FLASHINFER_TOPK_ALGO. clusters: topk.py can_use_clusters_topk
+    # (cc major 10); cub: can_use_cub_topk (limits enforced per call by the routine).
     "top_k": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "radix", "cub"],
+        "8.0": ["cuda", "radix", "cub"],
+        "8.6": ["cuda", "radix", "cub"],
+        "8.9": ["cuda", "radix", "cub"],
+        "9.0": ["cuda", "radix", "cub"],
+        "10.0": ["cuda", "radix", "clusters", "cub"],
+        "10.3": ["cuda", "radix", "clusters", "cub"],
+        "10.7": ["cuda", "radix", "clusters", "cub"],
+        "12.0": ["cuda", "radix", "cub"],
+        "12.1": ["cuda", "radix", "cub"],
     },
     "top_k_page_table_transform": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "radix", "cub"],
+        "8.0": ["cuda", "radix", "cub"],
+        "8.6": ["cuda", "radix", "cub"],
+        "8.9": ["cuda", "radix", "cub"],
+        "9.0": ["cuda", "radix", "cub"],
+        "10.0": ["cuda", "radix", "clusters", "cub"],
+        "10.3": ["cuda", "radix", "clusters", "cub"],
+        "10.7": ["cuda", "radix", "clusters", "cub"],
+        "12.0": ["cuda", "radix", "cub"],
+        "12.1": ["cuda", "radix", "cub"],
     },
     "top_k_ragged_transform": {
-        "7.5": ["cuda"],
-        "8.0": ["cuda"],
-        "8.6": ["cuda"],
-        "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
-        "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "7.5": ["cuda", "radix", "cub"],
+        "8.0": ["cuda", "radix", "cub"],
+        "8.6": ["cuda", "radix", "cub"],
+        "8.9": ["cuda", "radix", "cub"],
+        "9.0": ["cuda", "radix", "cub"],
+        "10.0": ["cuda", "radix", "clusters", "cub"],
+        "10.3": ["cuda", "radix", "clusters", "cub"],
+        "10.7": ["cuda", "radix", "clusters", "cub"],
+        "12.0": ["cuda", "radix", "cub"],
+        "12.1": ["cuda", "radix", "cub"],
     },
     # Note: top_k_varlen uses its @backend_requirement support checks
     # (top_k_varlen.is_backend_supported) to filter backends, so it is not listed here.
@@ -1200,17 +2305,19 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
+    # normquant 2026-10. cutile: rope.py rope_quantize_fp8 requires SM90+ (FP8 lowering),
+    # interleaved rotary and a 2-D (MLA) key; no other static guard.
     "rope_quantize_fp8": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": ["cuda"],
-        "9.0": ["cuda"],
-        "10.0": ["cuda"],
-        "10.3": ["cuda"],
+        "9.0": ["cuda", "cutile"],
+        "10.0": ["cuda", "cutile"],
+        "10.3": ["cuda", "cutile"],
         "10.7": ["cuda"],
-        "12.0": ["cuda"],
-        "12.1": ["cuda"],
+        "12.0": ["cuda", "cutile"],
+        "12.1": ["cuda", "cutile"],
     },
     "rope_quantize_fp8_append_paged_kv_cache": {
         "7.5": [],
@@ -1224,7 +2331,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["cuda"],
         "12.1": ["cuda"],
     },
-    # MAMBA
+    # MAMBA (causal conv1d, #8273)
     "causal_conv1d_fn": {
         "10.0": ["flashinfer", "triton"],
         "10.3": ["flashinfer", "triton"],
@@ -1233,8 +2340,11 @@ routine_cc_to_supported_backends = {
         "10.0": ["flashinfer", "triton"],
         "10.3": ["flashinfer", "triton"],
     },
+    # MAMBA (linattn 2026-10). Cake backends are out of scope and not listed.
+    # flashinfer: the base CUDA module is built for major 8 only
+    # (jit/mamba/selective_state_update.py), so 7.5 runs triton only.
     "selective_state_update": {
-        "7.5": ["flashinfer", "triton"],
+        "7.5": ["triton"],
         "8.0": ["flashinfer", "triton"],
         "8.6": ["flashinfer", "triton"],
         "8.9": ["flashinfer", "triton"],
@@ -1246,7 +2356,51 @@ routine_cc_to_supported_backends = {
         "12.0": ["flashinfer", "triton"],
         "12.1": ["flashinfer", "triton"],
     },
-    # GDN (Gated Delta Net)
+    # cute-dsl: SSDCombined(backend="cute") accepts cc major 10/11
+    # (mamba/ssd_combined.py SSDCombined guard). 11.0 is guard-backed only.
+    "ssd_combined": {
+        "10.0": ["cute-dsl", "triton"],
+        "10.3": ["cute-dsl", "triton"],
+        "10.7": ["cute-dsl", "triton"],
+        "11.0": ["cute-dsl", "triton"],
+    },
+    # CUDA JIT built for majors 8-12 (jit/mamba/checkpointing_ssu.py,
+    # jit/mamba/replayssm_materialize.py). Rows other than 10.0/10.7 are
+    # guard-backed, not hardware-validated.
+    "checkpointing_ssu": {
+        cc: ["flashinfer", "flashinfer-monolith", "flashinfer-two-kernel", "triton"]
+        for cc in (
+            "8.0",
+            "8.6",
+            "8.9",
+            "9.0",
+            "10.0",
+            "10.3",
+            "10.7",
+            "11.0",
+            "12.0",
+            "12.1",
+        )
+    },
+    "replayssm_materialize": {
+        cc: ["flashinfer"]
+        for cc in (
+            "8.0",
+            "8.6",
+            "8.9",
+            "9.0",
+            "10.0",
+            "10.3",
+            "10.7",
+            "11.0",
+            "12.0",
+            "12.1",
+        )
+    },
+    # GDN (Gated Delta Net). Backend names are defined in routines/gdn.py
+    # (ROUTINE_BACKENDS). The CuTe-DSL decode kernels have no cc guard; 11.0/12.x
+    # stay triton-only until observed. rubin / rubin_ugpu: backend="rubin"
+    # raises off cc 10.7 (gdn_decode.py gated_delta_rule_decode_pretranspose).
     "gated_delta_rule_decode": {
         "7.5": [],
         "8.0": [],
@@ -1266,39 +2420,84 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": ["flashinfer", "triton"],
-        "10.0": ["flashinfer", "triton"],
-        "10.3": ["flashinfer", "triton"],
-        "10.7": ["flashinfer", "triton"],
+        "10.0": ["flashinfer", "cute-dsl", "cute-dsl-wy", "triton"],
+        "10.3": ["flashinfer", "cute-dsl", "cute-dsl-wy", "triton"],
+        "10.7": ["flashinfer", "cute-dsl", "cute-dsl-wy", "triton"],
         "11.0": ["triton"],
         "12.0": ["triton"],
         "12.1": ["triton"],
     },
+    # CuTe-DSL (+CP) prefill: cc majors 8/9/10/12 (gdn_prefill.py
+    # chunk_gated_delta_rule arch dispatch; SM8x since #5109); major 10 needs
+    # CUDA >= 13. 8.x/9.0/12.x cute-dsl rows are guard-backed. cudnn needs
+    # nvidia-cudnn-frontend >= 1.31.
     "chunk_gated_delta_rule": {
         "7.5": [],
-        "8.0": [],
-        "8.6": [],
-        "8.9": [],
-        "9.0": ["flashinfer", "fla"],
-        "10.0": ["flashinfer", "fla"],
-        "10.3": ["flashinfer", "fla"],
-        "10.7": ["flashinfer"],
+        "8.0": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
+        "8.6": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
+        "8.9": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
+        "9.0": ["flashinfer", "cute-dsl", "cute-dsl-cp", "fla"],
+        "10.0": ["flashinfer", "cute-dsl", "cute-dsl-cp", "cudnn", "fla"],
+        "10.3": ["flashinfer", "cute-dsl", "cute-dsl-cp", "cudnn", "fla"],
+        "10.7": ["flashinfer", "cute-dsl", "cute-dsl-cp", "cudnn"],
         "11.0": ["flashinfer"],
-        "12.0": [],
-        "12.1": [],
+        "12.0": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
+        "12.1": ["flashinfer", "cute-dsl", "cute-dsl-cp"],
     },
-    # KDA prefill on SM120a only. The SM100-family Cake prefill backend is a
-    # different kernel with a different contract and is not benchmarked here;
-    # listing it under 10.0/10.3 would put two unrelated implementations in one
-    # column.
+    # cuDNN-only APIs (gdn2_prefill.py, gdp_prefill.py; cake for GDP is out of scope).
+    "chunk_gated_delta_rule2": {
+        "10.0": ["cudnn"],
+        "10.3": ["cudnn"],
+        "10.7": ["cudnn"],
+    },
+    "chunk_gated_delta_product": {
+        "10.0": ["cudnn"],
+        "10.3": ["cudnn"],
+        "10.7": ["cudnn"],
+    },
+    "gated_delta_rule_mtp_ucache": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    "gated_delta_rule_mtp_ucache_flush": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    # Specialized kernels are registered for SM120 only (experimental
+    # gdn_fused_decode_specialized.py); on 10.x 'flashinfer' would time the
+    # composable torch path, so no 10.x row. 12.0 is guard-backed.
+    "gdn_fused_decode_step": {
+        "12.0": ["flashinfer", "specialized"],
+    },
+    # ReplaySSM fold: gdn_kernels/gdn_replayssm_spec_fold.py requires cc major 10
+    # (accepts 10.7 although its message says SM100/SM103).
+    "gated_delta_rule_replayssm_commit": {
+        "10.0": ["flashinfer", "simt", "tcgen05"],
+        "10.3": ["flashinfer", "simt", "tcgen05"],
+        "10.7": ["flashinfer", "simt", "tcgen05"],
+    },
+    # KDA. small-BH and persistent prefill gate on exactly (10,0)/(10,3); the
+    # CuTe BT16 prefill also takes (10,7) (kda_prefill_cute.py); "ptx" is
+    # (10,3)-only (kda_prefill_ptx.py). "cudnn" needs
+    # nvidia-cudnn-frontend >= 1.31. 12.0 is the SM120 CuTe backend.
     "recurrent_kda_prefill": {
         "7.5": [],
         "8.0": [],
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["flashinfer"],
-        "10.3": [],
-        "10.7": [],
+        "10.0": ["flashinfer", "cute-dsl", "cute-dsl-persistent", "small-bh", "cudnn"],
+        "10.3": [
+            "flashinfer",
+            "cute-dsl",
+            "cute-dsl-persistent",
+            "ptx",
+            "small-bh",
+            "cudnn",
+        ],
+        "10.7": ["flashinfer", "cute-dsl", "cudnn"],
         "11.0": [],
         "12.0": [
             "flashinfer",
@@ -1308,6 +2507,28 @@ routine_cc_to_supported_backends = {
             "flash-kda",
         ],
         "12.1": [],
+    },
+    # CuTe-DSL decode has no cc gate (T=1 fast path: (10,0)/(10,3)/(10,7)).
+    "recurrent_kda_decode": {
+        "10.0": ["flashinfer", "cute-dsl"],
+        "10.3": ["flashinfer", "cute-dsl"],
+        "10.7": ["flashinfer", "cute-dsl"],
+    },
+    "recurrent_kda_output_only": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    "fused_kda_decode": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
+    },
+    # T>1 is the SM10x CuTe multitoken kernel (cc major 10).
+    "packed_fused_kda_decode": {
+        "10.0": ["cute-dsl"],
+        "10.3": ["cute-dsl"],
+        "10.7": ["cute-dsl"],
     },
 }
 
