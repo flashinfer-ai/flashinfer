@@ -59,6 +59,21 @@ def _config(kind, **kwargs):
     )
 
 
+@pytest.mark.parametrize("pusher_count", [0, -1])
+def test_genphase_rejects_nonpositive_scale_pusher_count(pusher_count, monkeypatch):
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.kernel_src.blackwell.inference.genphase.token_comm_gen_specialized import (
+        GenphaseTokenComm,
+    )
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import block_scaled
+
+    monkeypatch.setattr(
+        block_scaled, "_max_active_clusters", lambda cluster: 148 // cluster
+    )
+    monkeypatch.setattr(GenphaseTokenComm, "sf_pusher_cta_count", pusher_count)
+    with pytest.raises(ValueError, match="sf_pusher_cta_count must be positive"):
+        pkg.Sm100GenphaseSymmBuffer._build_kernel(_config("nvfp4"))
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_genphase_dtype_geometries_and_workspace_plan(kind, monkeypatch):
     """Every tuning geometry must build a native 512-column Blackwell plan."""
