@@ -159,6 +159,7 @@ _FORCE_PERSISTENT: Optional[bool] = None
 # CUTE_DSL_COMPILER_OPT=iket). Off by default; then no probe code is emitted.
 _IKET = os.environ.get("KDA_UMMA_IKET", "0") == "1"
 _FORCE_SPLIT: Optional[bool] = None
+_FORCE_CTAS_PER_SM: Optional[int] = None  # persistent grid CTAs per SM
 _HANG_DEBUG_ADDR = 0  # debug: pinned int32 buffer [CTAs, 8] for watchdog waits
 _PF_WHERE = "producer"  # debug: L2 prefetch issuer (producer / consumer)
 _HANG_PROGRESS_ADDR = 0  # debug: pinned int32 [CTAs, 8] progress words
@@ -2276,6 +2277,8 @@ def ctas_per_sm(dev: torch.device, threads: int = 256) -> int:
     _MIN_BLOCKS_PER_SM register / SMEM / TMEM target, capped by the SM's named barriers
     (64 on SM100 / SM103, 16 on SM107 Rubin; _BARRIER_SLOTS per CTA) and its thread limit
     (2048 on SM100, 1024 on SM107)."""
+    if _FORCE_CTAS_PER_SM is not None:
+        return int(_FORCE_CTAS_PER_SM)
     key = (str(dev), threads)
     n = _CTAS_PER_SM.get(key)
     if n is None:

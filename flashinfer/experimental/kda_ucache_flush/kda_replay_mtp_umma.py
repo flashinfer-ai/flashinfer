@@ -1497,8 +1497,11 @@ def _use_persistent(B: int, T: int, H: int, w_ring: int, dev: torch.device) -> b
     with at least 4 (T <= 6) or 16 (T >= 7) (request, head) items per resident CTA slot
     (4 per SM). At 1.3-2.6 items per slot (B = 64 / 128) it lost 5-16 %; T = 8 at
     B = 256 / 512 loses up to 6 %; w_ring = 32 (u ring read per row, 32-slot K~) measured
-    30 % slower. H > 256 does not fit its SMEM A_log table. _FORCE_PERSISTENT (test hook)
-    overrides everything but the H limit."""
+    30 % slower. H > 256 does not fit its SMEM A_log table. Rubin (SM107, 212 SMs,
+    H = 12, ncu): it wins only at T <= 4 with >= 12 items per slot (B >= 848;
+    T = 4, B = 1024 / 2048: up to 1.03x bf16, 1.14x fp16 + philox) and loses up to
+    13 % at T = 6 / 8 and smaller batches, so there it is T <= 4 and >= 12 items per
+    slot only. _FORCE_PERSISTENT (test hook) overrides everything but the H limit."""
     if H > 256:
         return False
     if _FORCE_PERSISTENT is not None:
@@ -1509,6 +1512,8 @@ def _use_persistent(B: int, T: int, H: int, w_ring: int, dev: torch.device) -> b
 
     slots = ctas_per_sm(dev) * torch.cuda.get_device_properties(dev).multi_processor_count
     items = B * H
+    if torch.cuda.get_device_capability(dev) == (10, 7):
+        return T <= 4 and items >= 12 * slots
     return items >= (4 if T <= 6 else 16) * slots
 
 
