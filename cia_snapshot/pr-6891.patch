@@ -1,0 +1,111 @@
+diff --git a/flashinfer/fused_moe/backends/cudnn_frost/bf16/fma.py b/flashinfer/fused_moe/backends/cudnn_frost/bf16/fma.py
+index 3c58910434d..4a63a85f79b 100644
+--- a/flashinfer/fused_moe/backends/cudnn_frost/bf16/fma.py
++++ b/flashinfer/fused_moe/backends/cudnn_frost/bf16/fma.py
+@@ -141,6 +141,8 @@ def _source(
+         try:
+             with os.fdopen(fd, "w") as stream:
+                 stream.write(source)
++            # mkstemp creates 0600; a shared JIT cache must be readable by other users.
++            os.chmod(temporary, 0o644)
+             os.replace(temporary, path)
+         finally:
+             Path(temporary).unlink(missing_ok=True)
+diff --git a/flashinfer/fused_moe/backends/cudnn_frost/mxfp8/fma.py b/flashinfer/fused_moe/backends/cudnn_frost/mxfp8/fma.py
+index c5a896a82c0..681286cfa10 100644
+--- a/flashinfer/fused_moe/backends/cudnn_frost/mxfp8/fma.py
++++ b/flashinfer/fused_moe/backends/cudnn_frost/mxfp8/fma.py
+@@ -162,6 +162,8 @@ def _source(
+         try:
+             with os.fdopen(fd, "w") as stream:
+                 stream.write(source)
++            # mkstemp creates 0600; a shared JIT cache must be readable by other users.
++            os.chmod(temporary, 0o644)
+             os.replace(temporary, path)
+         finally:
+             Path(temporary).unlink(missing_ok=True)
+diff --git a/flashinfer/fused_moe/backends/cudnn_frost/nvfp4/fma.py b/flashinfer/fused_moe/backends/cudnn_frost/nvfp4/fma.py
+index 0c51f2ab6b0..646a379ff1f 100644
+--- a/flashinfer/fused_moe/backends/cudnn_frost/nvfp4/fma.py
++++ b/flashinfer/fused_moe/backends/cudnn_frost/nvfp4/fma.py
+@@ -160,6 +160,8 @@ def _source(
+         try:
+             with os.fdopen(fd, "w") as stream:
+                 stream.write(source)
++            # mkstemp creates 0600; a shared JIT cache must be readable by other users.
++            os.chmod(temporary, 0o644)
+             os.replace(temporary, path)
+         finally:
+             Path(temporary).unlink(missing_ok=True)
+diff --git a/flashinfer/fused_moe/backends/cudnn_frost/source_template.py b/flashinfer/fused_moe/backends/cudnn_frost/source_template.py
+index 54df023f270..ebb21a0e428 100644
+--- a/flashinfer/fused_moe/backends/cudnn_frost/source_template.py
++++ b/flashinfer/fused_moe/backends/cudnn_frost/source_template.py
+@@ -270,6 +270,8 @@ def materialize_source(template_path: Path, parameters: dict) -> tuple[Path, str
+         try:
+             with os.fdopen(fd, "w") as file:
+                 file.write(source)
++            # mkstemp creates 0600; a shared JIT cache must be readable by other users.
++            os.chmod(temporary, 0o644)
+             os.replace(temporary, path)
+         finally:
+             Path(temporary).unlink(missing_ok=True)
+diff --git a/flashinfer/jit/cake_gdn.py b/flashinfer/jit/cake_gdn.py
+index 34d084a5c6a..9d8c6d0f9a0 100644
+--- a/flashinfer/jit/cake_gdn.py
++++ b/flashinfer/jit/cake_gdn.py
+@@ -206,6 +206,9 @@ def _compile_cubin(
+                     raise RuntimeError(
+                         f"failed to compile {source.name} for {arch}:\n{result.stdout}"
+                     )
++                # NamedTemporaryFile creates 0600 and nvcc keeps that mode; a
++                # shared JIT cache must be readable by other users.
++                os.chmod(temporary, 0o644)
+                 os.replace(temporary, cubin)
+             finally:
+                 temporary.unlink(missing_ok=True)
+diff --git a/tests/gdn/test_cake_gdn_decode.py b/tests/gdn/test_cake_gdn_decode.py
+index d0fc32b55e8..47c07766076 100644
+--- a/tests/gdn/test_cake_gdn_decode.py
++++ b/tests/gdn/test_cake_gdn_decode.py
+@@ -2221,6 +2221,9 @@ def fake_run(command, **kwargs):
+     )
+ 
+     assert cubin == b"cubin"
++    # The JIT cache can be shared between CI users.
++    cubin_path = cake_gdn._cubin_path(source, arch="sm_100a", digest="digest")
++    assert cubin_path.stat().st_mode & 0o777 == 0o644
+     assert calls[0][0] == [
+         str(nvcc),
+         "--cubin",
+diff --git a/tests/moe/test_cudnn_frost_manifest.py b/tests/moe/test_cudnn_frost_manifest.py
+index 9deb0ee638a..ab23beaab97 100644
+--- a/tests/moe/test_cudnn_frost_manifest.py
++++ b/tests/moe/test_cudnn_frost_manifest.py
+@@ -17,6 +17,7 @@
+     write_manifest,
+ )
+ from flashinfer.fused_moe.backends.cudnn_frost.runtime import artifact_root
++from flashinfer.fused_moe.backends.cudnn_frost import source_template
+ from flashinfer.fused_moe.backends.cudnn_frost.source_template import render_source
+ 
+ 
+@@ -32,6 +33,18 @@ def payload():
+     return {**original, "kernels": [first, second]}
+ 
+ 
++def test_materialized_source_is_readable_by_other_users(tmp_path, monkeypatch):
++    # The generated-source cache can be shared between CI users.
++    import flashinfer.jit.env as jit_env
++
++    monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
++    monkeypatch.setattr(source_template, "render_source", lambda text, _: text)
++    template = tmp_path / "template.py"
++    template.write_text("KERNEL = 1\n")
++    path, _ = source_template.materialize_source(template, {})
++    assert path.stat().st_mode & 0o777 == 0o644
++
++
+ def test_catalog_shares_implementations_without_merging_shape_contracts(payload):
+     before = deepcopy(payload)
+     catalog = normalize_manifest(payload)

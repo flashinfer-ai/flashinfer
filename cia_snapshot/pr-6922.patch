@@ -1,0 +1,1026 @@
+diff --git a/benchmarks/bench_swiglu_stepfun.py b/benchmarks/bench_swiglu_stepfun.py
+index 60f237e32d..a69e694522 100644
+--- a/benchmarks/bench_swiglu_stepfun.py
++++ b/benchmarks/bench_swiglu_stepfun.py
+@@ -9,7 +9,8 @@
+ tokens. Each precision uses identical native weights and prepared activations
+ for OA (alpha=1.702, beta=1, limit=7) and Step limits 7 and 16. Preparation,
+ quantization and independent tactic tuning precede timing. Timed GPU work
+-includes precomputed routing, fused FC1 activation, FC2 and finalization.
++includes precomputed routing, FC1 and its activation (fused, or the separate
++activation kernel for dsfp8), FC2 and finalization.
+ 
+ Alternating measurement order reduces drift. CUPTI reports the elapsed span
+ from the first GPU activity to the last activity in one CUDA graph replay,
+@@ -89,6 +90,9 @@
+ MODES = {
+     "bf16": (TrtllmBf16Config, TrtllmBf16RoutedRunner, QuantFormat.BF16),
+     "mxfp8": (TrtllmFp8BlockConfig, TrtllmFp8BlockRunner, QuantFormat.MXFP8),
++    # DeepSeek FP8 (128x128 block scales) has no fused FC1 activation; both arms
++    # run the separate activation kernel.
++    "dsfp8": (TrtllmFp8BlockConfig, TrtllmFp8BlockRunner, QuantFormat.DeepSeekFp8),
+     "nvfp4": (TrtllmFp4Config, TrtllmFp4RoutedRunner, QuantFormat.NVFP4),
+     "fp8": (
+         TrtllmFp8PerTensorConfig,
+@@ -96,10 +100,12 @@
+         QuantFormat.FP8PerTensor,
+     ),
+ }
+-# The per-tensor FP8 mode is opt-in; the default precision set is unchanged.
++# The per-tensor and DeepSeek FP8 modes are opt-in; the default precision set is
++# unchanged.
+ DEFAULT_PRECISIONS = ("bf16", "mxfp8", "nvfp4")
+ # Alternative backends measured next to the native trtllm-gen kernels on the
+-# same weights, activations and autotune policy. Cake serves every precision.
++# same weights, activations and autotune policy. Cake serves every precision
++# except dsfp8.
+ BACKENDS = {
+     "trtllm": None,
+     "cake": (CakeStepFunConfig, CakeStepFunRunner),
+@@ -137,7 +143,7 @@ def parse_args():
+         nargs="+",
+         choices=tuple(BACKENDS),
+         default=["trtllm"],
+-        help="FC1 backends measured on the same inputs (the cake arm serves every precision).",
++        help="FC1 backends measured on the same inputs (the cake arm serves every precision except dsfp8).",
+     )
+     parser.add_argument(
+         "--full-path",
+@@ -520,7 +526,7 @@ def main():
+         "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+         "nvidia_smi": command_output("nvidia-smi"),
+         "nvcc": command_output("nvcc", "--version"),
+-        "timing_scope": "native unified runner forward: routing, fused FC1 activation, FC2, finalize; preparation and input quantization excluded",
++        "timing_scope": "native unified runner forward: routing, FC1 + activation (fused, or a separate kernel for dsfp8), FC2, finalize; preparation and input quantization excluded",
+         "routing": "uniform round-robin expert ids; normalized FP32 weights; UnpackedPrecomputed; RoutingMethodType.Renormalize on both arms",
+         "cold_l2_cache": args.cache_policy == "cold",
+         "autotune": "independent per activation, precision, backend, token count",
+@@ -670,7 +676,8 @@ def main():
+                 # Alternative backends share the view, activations and tuning policy;
+                 # each is paired with the native kernel on the same activation.
+                 for arm in arms:
+-                    if arm == "trtllm":
++                    # Cake StepFun has no DeepSeek FP8 (128x128 block) path.
++                    if arm == "trtllm" or (arm == "cake" and precision == "dsfp8"):
+                         continue
+                     arm_backend, arm_runner_cls = BACKENDS[arm]
+                     candidates.update(
+diff --git a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
+index 7410c2979f..43f8a383e6 100644
+--- a/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
++++ b/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
+@@ -94,6 +94,34 @@ inline __device__ float gatedSilu(KernelParams const& params, int32_t permutedId
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
++// SwiGLU-Step (StepFun), matching the CUTLASS SwigluStep activation and the fused SwiGluStep
++// epilogue of the trtllm-gen cubins:
++//   out = min(silu(xGlu), limit) * clamp(xLinear, -limit, limit)
++// The clamp applies to the SiLU output, unlike the OAI clamp in gatedSilu, which applies to its
++// input. limit is per local expert; without a clamp tensor it is 7, as in those epilogues.
++template <typename KernelParams>
++inline __device__ float gatedSiluStep(KernelParams const& params, int32_t permutedIdx,
++                                      float xLinear, float xGlu) {
++  float limit = 7.0f;
++  if (params.gatedActClampLimitPtr != nullptr) {
++    limit =
++        params.gatedActClampLimitPtr[params.ctaIdxXyToBatchIdx[permutedIdx / params.tileTokensDim]];
++  }
++  return fminf(silu(xGlu), limit) * fmaxf(fminf(xLinear, limit), -limit);
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
++template <typename KernelParams>
++inline __device__ float gatedActivation(KernelParams const& params, int32_t permutedIdx,
++                                        float xLinear, float xGlu) {
++  return params.gatedActType == GatedActType::SwiGluStep
++             ? gatedSiluStep(params, permutedIdx, xLinear, xGlu)
++             : gatedSilu(params, permutedIdx, xLinear, xGlu);
++}
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
+ template <typename KernelParams>
+ __global__ void activationKernel(KernelParams params) {
+   using Type = typename KernelParams::Type;
+@@ -122,7 +150,7 @@ __global__ void activationKernel(KernelParams params) {
+         float x1 = (float)params.inPtr[baseIdx];
+         float x2 = (float)params.inPtr[baseIdx + params.innerDim / 2];
+ 
+-        Type out = (Type)gatedSilu(params, permutedIdx, x1, x2);
++        Type out = (Type)gatedActivation(params, permutedIdx, x1, x2);
+ 
+         int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
+         params.outPtr[outIdx] = out;
+@@ -322,7 +350,8 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
+           // Padding lanes keep permutedIdx == -1 and contribute a zeroed x1/x2, so skip the
+           // per-expert lookup for them instead of indexing ctaIdxXyToBatchIdx out of range.
+           int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+-          float out = permutedIdx == -1 ? silu(x2) * x1 : gatedSilu(params, permutedIdx, x1, x2);
++          float out =
++              permutedIdx == -1 ? silu(x2) * x1 : gatedActivation(params, permutedIdx, x1, x2);
+           outArr[tokenInCtaIdx] = out;
+           absOutArr[tokenInCtaIdx] = fabsf(out);
+         }
+diff --git a/csrc/trtllm_fused_moe_kernel_launcher.cu b/csrc/trtllm_fused_moe_kernel_launcher.cu
+index c4056e9136..09367b96d2 100644
+--- a/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -1023,15 +1023,19 @@ inline void validateStepGemm1ActivationParams(Optional<TensorView> const& gemm1_
+ // MxFp8 applies these in the fused FC1 epilogue of the trtllm-gen cubins; DeepSeekFp8 has no
+ // fused activation and applies them in the separate activation kernel
+ // (moe::dev::activation::run). Both consume the values as-is: FP8 block scaling carries no
+-// scalar dequant factor, so no host-side rescaling of the limit is needed.
++// scalar dequant factor, so no host-side rescaling of the limit is needed. The same holds for
++// the SwigluStep limit.
+ inline void validateFp8BlockScaleGemm1ActivationParams(
+     Optional<TensorView> const& gemm1_alpha, Optional<TensorView> const& gemm1_beta,
+     Optional<TensorView> const& gemm1_clamp_limit, Fp8QuantizationType quantization_type,
+     ActivationType activation_type) {
+   validateStepGemm1ActivationParams(gemm1_alpha, gemm1_beta, activation_type);
+   TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep ||
+-                 quantization_type == Fp8QuantizationType::MxFp8)
+-      << "SwigluStep requires the fused MxFp8 GEMM1 epilogue.";
++                 quantization_type == Fp8QuantizationType::MxFp8 ||
++                 quantization_type == Fp8QuantizationType::DeepSeekFp8)
++      << "SwigluStep requires Fp8QuantizationType::MxFp8 or Fp8QuantizationType::DeepSeekFp8 "
++         "in FP8 block scale MoE, got "
++      << fp8QuantizationTypeToString(quantization_type) << ".";
+   if (!hasOptionalGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit)) {
+     return;
+   }
+@@ -1042,11 +1046,10 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
+          "MoE, got "
+       << fp8QuantizationTypeToString(quantization_type) << ".";
+   TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
+-                 (activation_type == ActivationType::SwigluStep &&
+-                  quantization_type == Fp8QuantizationType::MxFp8))
++                 activation_type == ActivationType::SwigluStep)
+       << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
+          "ActivationType::Swiglu, or gemm1_clamp_limit alone for "
+-         "ActivationType::SwigluStep with MxFp8.";
++         "ActivationType::SwigluStep.";
+ }
+ 
+ std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& ascending_supported_tile_sizes,
+@@ -1874,6 +1877,7 @@ void FusedMoeLauncher::init_common(
+       << "the value of weight_layout is not recognized";
+   this->weight_layout = static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout);
+   this->activation_type = activation_type;
++  this->args->activation_type = activation_type;
+   this->intermediate_size_factor = isGatedActivation(activation_type) ? 2 : 1;
+   this->norm_topk_prob = norm_topk_prob;
+   this->gemm1_bias_type = bias_type_enum;
+@@ -3236,6 +3240,10 @@ void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView
+       << "DeepSeek FP8 activation: total_num_padded_tokens must be int32.";
+ 
+   auto const activation = validateAndCastActivationType(activation_type);
++  // No per-expert parameters reach this entry point, so it applies plain SwiGLU only.
++  TVM_FFI_ICHECK(activation == ActivationType::Swiglu)
++      << "DeepSeek FP8 activation: only ActivationType::Swiglu is supported, got "
++      << static_cast<int>(activation) << ".";
+   moe::dev::activation::Data activationData;
+   activationData.mDtypeElt = btg::Dtype::E4m3;
+   activationData.mUsePdl = enable_pdl;
+@@ -4517,9 +4525,13 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
+     workspace.gemm2_output_scale = nullptr;
+     args->hidden_states_scale = static_cast<float*>(hidden_states_scale.data_ptr());
+     args->gemm1_weights_scale = static_cast<float*>(gemm1_weights_scale.data_ptr());
+-    args->gemm1_alpha = nullptr;
+-    args->gemm1_beta = nullptr;
+-    args->gemm1_clamp_limit = nullptr;
++    args->gemm1_alpha =
++        gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
++    args->gemm1_beta =
++        gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
++    args->gemm1_clamp_limit = gemm1_clamp_limit.has_value()
++                                  ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
++                                  : nullptr;
+     args->gemm2_weights_scale = static_cast<float*>(gemm2_weights_scale.data_ptr());
+     // Launch the complete body after every dtype-specific scale pointer is bound.
+     cudaStream_t stream = get_stream(hidden_states.device());
+@@ -4657,9 +4669,10 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
+       if (quantization_type == Fp8QuantizationType::DeepSeekFp8 && dtype_act == btg::Dtype::E4m3 &&
+           dtype_weights == btg::Dtype::E4m3 &&
+           gemm1_bias_type == batchedGemm::gemm::BiasType::None) {
+-        TVM_FFI_ICHECK(static_cast<int>(activation_type) ==
+-                       static_cast<int>(ActivationType::Swiglu))
+-            << "DeepSeekFp8 only supports ActivationType::Swiglu, got "
++        TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
++                       activation_type == ActivationType::SwigluStep)
++            << "DeepSeekFp8 only supports ActivationType::Swiglu and ActivationType::SwigluStep, "
++               "got "
+             << static_cast<int>(activation_type) << ".";
+         moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+             dtype_weights, true /* useDeepSeekFp8 */, tile_N, use_shuffled_weight,
+@@ -5849,13 +5862,14 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
+   auto activation_type = validateAndCastActivationType(act_type);
+   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                                              quantization_type, activation_type);
+-  // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
+-  // Fail for any other activation to avoid silently running incorrect activation behavior.
++  // DeepSeekFp8 runs FC1 without a fused activation; the separate activation kernel implements
++  // Swiglu and SwigluStep only. Fail for any other activation to avoid silently running
++  // incorrect activation behavior.
+   if (quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
+-      activation_type != ActivationType::Swiglu) {
++      activation_type != ActivationType::Swiglu && activation_type != ActivationType::SwigluStep) {
+     TVM_FFI_LOG_AND_THROW(NotImplementedError)
+-        << "DeepSeekFp8 only supports ActivationType::Swiglu in this runner path. "
+-        << "Received activation_type=" << static_cast<int>(activation_type);
++        << "DeepSeekFp8 only supports ActivationType::Swiglu and ActivationType::SwigluStep in "
++        << "this runner path. Received activation_type=" << static_cast<int>(activation_type);
+   }
+ 
+   // Basic type validation
+@@ -6380,10 +6394,11 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
+ 
+   } else if (fp8_quantization_type == Fp8QuantizationType::DeepSeekFp8 &&
+              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
+-    if (activation_type != ActivationType::Swiglu) {
++    if (activation_type != ActivationType::Swiglu &&
++        activation_type != ActivationType::SwigluStep) {
+       TVM_FFI_LOG_AND_THROW(NotImplementedError)
+-          << "DeepSeekFp8 only supports ActivationType::Swiglu, " << "got act_type=" << act_type
+-          << ".";
++          << "DeepSeekFp8 only supports ActivationType::Swiglu and ActivationType::SwigluStep, "
++          << "got act_type=" << act_type << ".";
+     }
+     // FP8 block scale (DeepSeek)
+     return Fp8BlockScaleLauncher::getValidConfigs(
+diff --git a/csrc/trtllm_fused_moe_runner.cu b/csrc/trtllm_fused_moe_runner.cu
+index 320cd10b0d..77020fd727 100644
+--- a/csrc/trtllm_fused_moe_runner.cu
++++ b/csrc/trtllm_fused_moe_runner.cu
+@@ -513,13 +513,17 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
+ 
+   activationData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
+ 
+-  // SwiGLU OAI controls. The fused-epilogue paths get these through the FC1 GEMM instead; this
+-  // kernel only runs for DeepSeek FP8, where FC1 has no fused activation to carry them.
++  // SwiGLU OAI and SwiGLU-Step controls. The fused-epilogue paths get these through the FC1 GEMM
++  // instead; this kernel only runs for DeepSeek FP8, where FC1 has no fused activation to carry
++  // them.
+   activationData.gatedActAlphaPtr = args.gemm1_alpha;
+   activationData.gatedActBetaPtr = args.gemm1_beta;
+   activationData.gatedActClampLimitPtr = args.gemm1_clamp_limit;
+   activationData.ctaIdxXyToBatchIdx = workspace.cta_idx_xy_to_batch_idx;
+   activationData.tileTokensDim = workspace.ProjUpTileN;
++  activationData.mGatedActType = args.activation_type == ActivationType::SwigluStep
++                                     ? moe::dev::activation::GatedActType::SwiGluStep
++                                     : moe::dev::activation::GatedActType::SwiGlu;
+ 
+   // Setup finalize data
+   if (args.do_finalize) {
+diff --git a/docs/design_docs/flashinfer_moe_api.md b/docs/design_docs/flashinfer_moe_api.md
+index e318a5aa02..539e109f9f 100644
+--- a/docs/design_docs/flashinfer_moe_api.md
++++ b/docs/design_docs/flashinfer_moe_api.md
+@@ -803,11 +803,11 @@ including `SwiGLUStep(limit=16)`, is materialized during weight preparation.
+ An explicit tensor in the prepared view overrides that typed limit.
+ 
+ The tensor contains raw FC1 accumulator limits: for NVFP4 and per-tensor FP8,
+-divide physical limits by the FC1 gate dequantization scale. BF16 and MXFP8
+-use physical limits directly. The FP8 preparation helper performs this
++divide physical limits by the FC1 gate dequantization scale. BF16, MXFP8 and
++DeepSeek FP8 use physical limits directly. The FP8 preparation helper performs this
+ conversion, and the NVFP4 helper prepares unit global scales. With fused
+-shared experts in NVFP4 or MXFP8, append the shared expert limits after the
+-routed expert limits:
++shared experts in NVFP4, MXFP8 or DeepSeek FP8, append the shared expert limits
++after the routed expert limits:
+ 
+ ```python
+ limits = torch.full((num_local_experts + 1,), 7.0, device=device)
+@@ -821,7 +821,8 @@ view["gemm1_clamp_limit"] = (
+ ```
+ 
+ The fused StepFun epilogue supports BF16, FP8 per tensor, MXFP8 block scale,
+-and NVFP4. DeepSeek FP8 uses a separate activation kernel and rejects StepFun.
++and NVFP4. DeepSeek FP8 has no fused activation: its separate activation kernel
++applies StepFun after FC1 dequantization, with the same per-expert limits.
+ NVFP4 also supports explicit per-token scaling through BF16-output FC1
+ StepFun cubins followed by per-token requantization for FC2.
+ The TRT-LLM backend requires batched-GEMM export `7.0.5.0.4.0` or later
+@@ -937,7 +938,7 @@ python scripts/generate_moe_activation_matrix.py --write
+ | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
+ | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+ | `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `SiTU`, `ReLU2` |
+-| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
++| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SwiGLUStep` |
+ | `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `ReLU2` |
+ | `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
+ | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
+diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
+index 14b9af063e..55c898f9ca 100644
+--- a/flashinfer/fused_moe/core.py
++++ b/flashinfer/fused_moe/core.py
+@@ -4820,8 +4820,15 @@ def _validate_fp8_block_scale_gemm1_activation_params(
+     gemm1_clamp_limit: Optional[torch.Tensor],
+ ) -> None:
+     if int(activation_type) == int(ActivationType.SwigluStep):
+-        if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.MxFp8:
+-            raise ValueError("SwigluStep requires the fused MxFp8 GEMM1 epilogue.")
++        if Fp8QuantizationType(fp8_quantization_type) not in (
++            Fp8QuantizationType.MxFp8,
++            Fp8QuantizationType.DeepSeekFp8,
++        ):
++            raise ValueError(
++                "SwigluStep requires Fp8QuantizationType.MxFp8 or "
++                "Fp8QuantizationType.DeepSeekFp8 in FP8 block scale MoE, got "
++                f"{Fp8QuantizationType(fp8_quantization_type)}."
++            )
+         if gemm1_alpha is not None or gemm1_beta is not None:
+             raise ValueError(
+                 "ActivationType.SwigluStep accepts gemm1_clamp_limit only."
+@@ -6046,7 +6053,7 @@ def trtllm_fp8_block_scale_moe(
+         otherwise a ``ValueError`` is raised.
+     activation_type : int
+         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
+-        ``6`` Relu2; ``7`` SwigluStep (MxFp8 only); ``9`` Identity.
++        ``6`` Relu2; ``7`` SwigluStep (MxFp8 and DeepSeekFp8); ``9`` Identity.
+     norm_topk_prob : bool
+         Whether to normalize the top-k probabilities (default ``True``).
+     routing_replay_out : Optional[torch.Tensor]
+@@ -6078,10 +6085,12 @@ def trtllm_fp8_block_scale_moe(
+         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
+         With ``Swiglu``, supported for MxFp8 and DeepSeekFp8 and clamps
+         ``X1`` to ``[-limit, limit]`` and ``X2`` from above before SiLU.
+-        With ``SwigluStep``, supported only for fused MxFp8 and clamps
+-        ``X1`` and ``silu(X2)`` at the physical limit.  ``None`` uses
+-        physical ``7`` for SwigluStep.  MXFP8 has no global FC1 dequant
+-        scale, so raw accumulator and physical units coincide.
++        With ``SwigluStep``, supported for MxFp8 (in the fused FC1
++        epilogue) and DeepSeekFp8 (in the separate activation kernel) and
++        clamps ``X1`` and ``silu(X2)`` at the physical limit.  ``None`` uses
++        physical ``7`` for SwigluStep.  Neither block-scale recipe has a
++        global FC1 dequant scale, so raw accumulator and physical units
++        coincide.
+     output : Optional[torch.Tensor]
+         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
+         Allocated internally when ``None`` (default).
+@@ -6360,10 +6369,11 @@ def trtllm_fp8_block_scale_routed_moe(
+         With ``ActivationType.Swiglu``, supported for MxFp8 and
+         DeepSeekFp8; it clamps ``X1`` to ``[-limit, limit]`` and ``X2``
+         from above before SiLU. ``None`` disables that clamp. With
+-        ``ActivationType.SwigluStep``, supported only for fused MxFp8;
+-        it caps ``X1`` and ``silu(X2)`` at the physical limit, with a
+-        default of ``7`` when ``None``. MxFp8 has no global FC1 dequant
+-        scale, so raw accumulator and physical limits coincide.
++        ``ActivationType.SwigluStep``, supported for MxFp8 and
++        DeepSeekFp8; it caps ``X1`` and ``silu(X2)`` at the physical limit,
++        with a default of ``7`` when ``None``. Neither block-scale recipe
++        has a global FC1 dequant scale, so raw accumulator and physical
++        limits coincide.
+ 
+     valid_hidden_size : Optional[int]
+         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
+diff --git a/flashinfer/fused_moe/runners.py b/flashinfer/fused_moe/runners.py
+index f938734081..657ee1a984 100644
+--- a/flashinfer/fused_moe/runners.py
++++ b/flashinfer/fused_moe/runners.py
+@@ -5992,7 +5992,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
+     supported_activation_classes_by_quant: ClassVar[
+         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+     ] = {
+-        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
++        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU, SwiGLUStep),
+         (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, SwiGLUStep, GeGLU, ReLU2),
+     }
+ 
+diff --git a/flashinfer/trace/templates/moe.py b/flashinfer/trace/templates/moe.py
+index b45da9c817..ec89181e53 100644
+--- a/flashinfer/trace/templates/moe.py
++++ b/flashinfer/trace/templates/moe.py
+@@ -220,10 +220,13 @@ def _fp8_moe_run_experts(
+ 
+     is_step = int(activation_type) == 7
+     if is_step:
+-        if int(fp8_quantization_type) != 2:
+-            raise ValueError("SwiGLUStep requires fused MXFP8 block scaling")
++        # DeepSeekFp8 (1) applies SwiGLUStep in its separate activation kernel, MXFP8 (2) in the
++        # fused FC1 epilogue.
++        if int(fp8_quantization_type) not in (1, 2):
++            raise ValueError("SwiGLUStep requires DeepSeekFp8 or MXFP8 block scaling")
+         if gemm1_alpha is not None or gemm1_beta is not None:
+             raise ValueError("SwiGLUStep accepts gemm1_clamp_limit only")
++    if is_step and int(fp8_quantization_type) == 2:
+         # MXFP8 uses one UE8M0 scale per row and 32 values along K.
+         a_exp = hidden_states_scale.view(torch.uint8).reshape(T, H // 32)
+         a_scale = torch.exp2(a_exp.to(torch.float32) - 127.0)
+@@ -1359,14 +1362,25 @@ def trtllm_fp8_block_scale_moe(..., routing_method_type: int = 0, ...):
+     """
+     routing_method_type = int(kwargs.get("routing_method_type", 0))
+     if int(kwargs.get("activation_type", 3)) == 7:
+-        if int(kwargs.get("fp8_quantization_type", 1)) != 2:
+-            raise ValueError("SwiGLUStep requires fused MXFP8 block scaling")
++        fp8_quantization_type = int(kwargs.get("fp8_quantization_type", 1))
++        if fp8_quantization_type not in (1, 2):
++            raise ValueError("SwiGLUStep requires DeepSeekFp8 or MXFP8 block scaling")
++        mxfp8 = fp8_quantization_type == 2
+         if (
+             routing_method_type == 2
+             and int(kwargs.get("num_fused_shared_experts") or 0) > 0
+         ):
+-            return trtllm_mxfp8_step_shared_experts_trace
+-        return _STEP_MXFP8_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
++            return (
++                trtllm_mxfp8_step_shared_experts_trace
++                if mxfp8
++                else trtllm_dsfp8_step_shared_experts_trace
++            )
++        step_traces = (
++            _STEP_MXFP8_TRACE_BY_ROUTING_TYPE
++            if mxfp8
++            else _STEP_DSFP8_TRACE_BY_ROUTING_TYPE
++        )
++        return step_traces.get(routing_method_type)
+     if (
+         routing_method_type == 2
+         and int(kwargs.get("num_fused_shared_experts") or 0) > 0
+@@ -3858,7 +3872,7 @@ def _mono_moe_init(
+ 
+ # StepFun siblings preserve the existing activation's definition filenames.
+ def _make_step_moe_trace(
+-    base: TraceTemplate, *, mxfp8: bool = False, bf16: bool = False
++    base: TraceTemplate, *, mxfp8: bool = False, bf16: bool = False, dsfp8: bool = False
+ ) -> TraceTemplate:
+     axes = dict(base.axes)
+     axes["activation_type"] = Const(abbrev="act", value=7)
+@@ -3911,12 +3925,23 @@ def _make_step_moe_trace(
+             optional=True,
+             description="Per-expert physical StepFun limit; None uses 7.",
+         )
++    if dsfp8:
++        # DeepSeekFp8 keeps the base 128x128 block scales and applies the limit in its separate
++        # activation kernel, in physical units. The suffix keeps the names apart from the MXFP8
++        # siblings built from the same bases.
++        rows = "num_weight_rows" if "num_weight_rows" in axes else "num_local_experts"
++        inputs["gemm1_clamp_limit"] = Tensor(
++            [rows],
++            dtype="float32",
++            optional=True,
++            description="Per-expert physical StepFun limit; None uses 7.",
++        )
+     return TraceTemplate(
+         op_type=base.op_type,
+         axes=axes,
+         inputs=inputs,
+         outputs=dict(base.outputs),
+-        name_prefix=f"{base.name_prefix}_swiglu_step",
++        name_prefix=f"{base.name_prefix}_swiglu_step" + ("_dsfp8" if dsfp8 else ""),
+         reference=base.reference,
+         check=base.check,
+         constraints=list(base.constraints),
+@@ -3960,10 +3985,24 @@ def dispatch(**kwargs):
+ trtllm_fp8_block_scale_routed_moe_step_trace = _make_step_moe_trace(
+     trtllm_fp8_block_scale_routed_moe_trace, mxfp8=True
+ )
+-trtllm_fp8_block_scale_routed_moe_trace_dispatch = _make_step_moe_trace_dispatch(
++trtllm_fp8_block_scale_routed_moe_dsfp8_step_trace = _make_step_moe_trace(
++    trtllm_fp8_block_scale_routed_moe_trace, dsfp8=True
++)
++
++
++def trtllm_fp8_block_scale_routed_moe_trace_dispatch(**kwargs):
++    if int(kwargs.get("activation_type", 3)) != 7:
++        return trtllm_fp8_block_scale_routed_moe_trace
++    if int(kwargs.get("fp8_quantization_type", 1)) == 2:
++        return trtllm_fp8_block_scale_routed_moe_step_trace
++    return trtllm_fp8_block_scale_routed_moe_dsfp8_step_trace
++
++
++trtllm_fp8_block_scale_routed_moe_trace_dispatch.templates = [  # type: ignore[attr-defined]
+     trtllm_fp8_block_scale_routed_moe_trace,
+     trtllm_fp8_block_scale_routed_moe_step_trace,
+-)
++    trtllm_fp8_block_scale_routed_moe_dsfp8_step_trace,
++]
+ _STEP_MXFP8_TRACE_BY_ROUTING_TYPE = {
+     routing: _make_step_moe_trace(base, mxfp8=True)
+     for routing, base in _MOE_TRACE_BY_ROUTING_TYPE.items()
+@@ -3971,9 +4010,18 @@ def dispatch(**kwargs):
+ trtllm_mxfp8_step_shared_experts_trace = _make_step_moe_trace(
+     trtllm_fp8_block_scale_moe_ds_shared_experts_trace, mxfp8=True
+ )
++_STEP_DSFP8_TRACE_BY_ROUTING_TYPE = {
++    routing: _make_step_moe_trace(base, dsfp8=True)
++    for routing, base in _MOE_TRACE_BY_ROUTING_TYPE.items()
++}
++trtllm_dsfp8_step_shared_experts_trace = _make_step_moe_trace(
++    trtllm_fp8_block_scale_moe_ds_shared_experts_trace, dsfp8=True
++)
+ trtllm_fp8_block_scale_moe_trace_dispatch.templates += [  # type: ignore[attr-defined]
+     *_STEP_MXFP8_TRACE_BY_ROUTING_TYPE.values(),
+     trtllm_mxfp8_step_shared_experts_trace,
++    *_STEP_DSFP8_TRACE_BY_ROUTING_TYPE.values(),
++    trtllm_dsfp8_step_shared_experts_trace,
+ ]
+ 
+ for _fp8_reference in (
+diff --git a/include/flashinfer/trtllm/fused_moe/DevKernel.h b/include/flashinfer/trtllm/fused_moe/DevKernel.h
+index 15c4557d4b..a5348d4c3b 100644
+--- a/include/flashinfer/trtllm/fused_moe/DevKernel.h
++++ b/include/flashinfer/trtllm/fused_moe/DevKernel.h
+@@ -162,10 +162,21 @@ namespace tg = batchedGemm::trtllm::gen;
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
++// The gated activation the kernel applies to the FC1 output.
++enum class GatedActType : int32_t {
++  // xGlu * sigmoid(alpha * xGlu) * (xLinear + beta), with the optional clamp before SiLU.
++  SwiGlu = 0,
++  // min(silu(xGlu), limit) * clamp(xLinear, -limit, limit): StepFun, clamp after SiLU.
++  SwiGluStep = 1,
++};
++
++////////////////////////////////////////////////////////////////////////////////////////////////////
++
+ struct Data {
+   tg::Dtype mDtypeElt{tg::Dtype::Fp16};
+   bool mUsePdl{false};
+   bool mUseDeepSeekFp8{false};
++  GatedActType mGatedActType{GatedActType::SwiGlu};
+ 
+   void* inPtr;
+   void* outPtr;
+@@ -179,10 +190,11 @@ struct Data {
+ 
+   int32_t const* totalNumPaddedTokens;
+ 
+-  // Optional per-local-expert SwiGLU OAI controls, [localNumExperts] each. Null means the
+-  // neutral value (alpha=1, beta=0, no clamp), which reduces the epilogue to plain SwiGLU.
+-  // The trtllm-gen cubins apply these in the fused FC1 epilogue; the unfused activation
+-  // kernel below (DeepSeek FP8) has to apply them itself.
++  // Optional per-local-expert gated-activation controls, [localNumExperts] each. For SwiGlu,
++  // null means the neutral value (alpha=1, beta=0, no clamp), which reduces the epilogue to
++  // plain SwiGLU; SwiGluStep reads only the clamp, and a null clamp means limit 7. The
++  // trtllm-gen cubins apply these in the fused FC1 epilogue; the unfused activation kernel
++  // below (DeepSeek FP8) has to apply them itself.
+   float const* gatedActAlphaPtr = nullptr;
+   float const* gatedActBetaPtr = nullptr;
+   float const* gatedActClampLimitPtr = nullptr;
+@@ -216,6 +228,7 @@ struct KernelParams {
+   float const* gatedActClampLimitPtr = nullptr;
+   int32_t const* ctaIdxXyToBatchIdx = nullptr;
+   int32_t tileTokensDim{0};
++  GatedActType gatedActType{GatedActType::SwiGlu};
+ 
+   static KernelParams setKernelParams(Data const& data) {
+     KernelParams params;
+@@ -237,6 +250,7 @@ struct KernelParams {
+     params.gatedActClampLimitPtr = data.gatedActClampLimitPtr;
+     params.ctaIdxXyToBatchIdx = data.ctaIdxXyToBatchIdx;
+     params.tileTokensDim = data.tileTokensDim;
++    params.gatedActType = data.mGatedActType;
+ 
+     return params;
+   }
+diff --git a/tests/moe/test_da_trtllm_fused_moe.py b/tests/moe/test_da_trtllm_fused_moe.py
+index 0a1e84cfe6..a53952aff3 100644
+--- a/tests/moe/test_da_trtllm_fused_moe.py
++++ b/tests/moe/test_da_trtllm_fused_moe.py
+@@ -8,7 +8,9 @@
+ import pytest
+ import torch
+ 
++import benchmarks.bench_trtllm_moe_da as bench_trtllm_moe_da
+ from benchmarks.bench_trtllm_moe_da import (
++    PreparedPrecision,
+     _canonical_inputs,
+     _capture,
+     _matching_diagnostic,
+@@ -18,14 +20,17 @@
+ )
+ from flashinfer.autotuner import autotune
+ from flashinfer.fused_moe import (
++    ActivationType,
+     QuantConfig,
+     QuantFormat,
+     TrtllmBf16Config,
+     TrtllmFp4Config,
++    TrtllmFp8BlockConfig,
+     TrtllmFp8PerTensorConfig,
+     trtllm_bf16_moe,
+     trtllm_bf16_routed_moe,
+     trtllm_fp4_block_scale_routed_moe,
++    trtllm_fp8_block_scale_routed_moe,
+     trtllm_fp8_per_tensor_scale_moe,
+     trtllm_moe_acquire_da_graph_leases,
+     trtllm_moe_allocate_routing_metadata,
+@@ -33,7 +38,12 @@
+     trtllm_moe_release_da_resources,
+ )
+ from flashinfer.fused_moe.da_tuner import DADistribution, RoutingRealizationFactory
+-from flashinfer.tllm_enums import RoutingInputMode, RoutingMethodType
++from flashinfer.tllm_enums import (
++    Fp8QuantizationType,
++    RoutingInputMode,
++    RoutingMethodType,
++    WeightLayout,
++)
+ 
+ from tests.moe.da_acceptance_utils import (
+     PRODUCTION_PRECISIONS,
+@@ -511,6 +521,114 @@ def test_public_routed_precision_matches_ordinary_graph(precision: str) -> None:
+     assert {str(row["distribution"]) for row in rows} == {"uniform", "ddist:4"}
+ 
+ 
++def test_deepseek_fp8_da_graph_keeps_swiglu_step_limit(monkeypatch) -> None:
++    """DeepSeekFp8 DA bodies apply the per-expert activation parameters.
++
++    The DeepSeekFp8 DA body used to pass null alpha, beta and limit pointers, so the
++    bodies of a DA SWITCH graph ran unclamped SwiGLU whatever the call requested.
++    These inputs make SwigluStep's limit move the output well past the NoDA/DA
++    tolerance, so a DA body that drops the limit fails the matched-graph comparison.
++    """
++    require_sm100()
++    shape = compact_shape()
++    quant = QuantConfig(
++        weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
++    )
++    hidden, w1, w2, ids, routing_weights = _canonical_inputs(shape)
++    # The canonical inputs give FC1 outputs near 0.006; scale them to about 1.
++    hidden = (hidden.float() * 50).to(torch.bfloat16)
++    w1 = (w1.float() * 3).to(torch.bfloat16)
++    w2 = (w2.float() * 5).to(torch.bfloat16)
++    hidden_q, hidden_scale = TrtllmFp8BlockConfig.prepare_activations(
++        hidden, quant=quant
++    )
++    view = TrtllmFp8BlockConfig.prepare_weights(
++        w1,
++        w2,
++        quant=quant,
++        num_local_experts=shape.local_num_experts,
++        hidden_size=shape.hidden_size,
++        intermediate_size=shape.intermediate_size,
++        device=hidden.device,
++    )
++    output = torch.empty(
++        shape.num_tokens, shape.hidden_size, device=hidden.device, dtype=torch.bfloat16
++    )
++    packed = torch.empty_like(ids)
++
++    def prepare(limit: float) -> PreparedPrecision:
++        clamp_limit = torch.full(
++            (shape.local_num_experts,), limit, device=hidden.device, dtype=torch.float32
++        )
++
++        def invoke() -> torch.Tensor:
++            result = trtllm_fp8_block_scale_routed_moe(
++                topk_ids=packed,
++                routing_bias=None,
++                hidden_states=hidden_q,
++                hidden_states_scale=hidden_scale,
++                gemm1_weights=view["gemm1_weights"],
++                gemm1_weights_scale=view["gemm1_weights_scale"],
++                gemm2_weights=view["gemm2_weights"],
++                gemm2_weights_scale=view["gemm2_weights_scale"],
++                num_experts=shape.num_experts,
++                top_k=shape.top_k,
++                n_group=None,
++                topk_group=None,
++                intermediate_size=shape.intermediate_size,
++                local_expert_offset=shape.local_expert_offset,
++                local_num_experts=shape.local_num_experts,
++                routed_scaling_factor=1.0,
++                routing_method_type=RoutingMethodType.Renormalize.value,
++                weight_layout=WeightLayout.MajorK.value,
++                output=output,
++                tune_max_num_tokens=shape.tune_max_num_tokens,
++                fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
++                activation_type=ActivationType.SwigluStep.value,
++                gemm1_clamp_limit=clamp_limit,
++            )
++            return result[0] if isinstance(result, list) else result
++
++        return PreparedPrecision(
++            "fp8_block", shape, ids, routing_weights, packed, output, invoke
++        )
++
++    clamped, unclamped = prepare(0.5), prepare(1.0e9)
++    first_ids, first_weights = _realization(
++        RoutingRealizationFactory(), shape, "uniform"
++    )
++    clamped.stage(first_ids, first_weights)
++    with _temporary_environment(FLASHINFER_DIST_AWARE_AUTOTUNE="0"):
++        reference = clamped.invoke().clone()
++        without_limit = unclamped.invoke().clone()
++    # The limit must matter far beyond the 3e-2 NoDA/DA tolerance.
++    assert (reference.float() - without_limit.float()).abs().max() > 0.1
++
++    monkeypatch.setattr(
++        bench_trtllm_moe_da, "_prepare_precision", lambda name, shape: clamped
++    )
++    # Only SWITCH bodies reach run_deepseek_da_body; a single-body DA graph replays the
++    # ordinary launcher, which already forwarded the limit. With the baseline guard on,
++    # this shape practically never admits a SWITCH.
++    with _temporary_environment(FLASHINFER_DA_BASELINE_GUARD="0"):
++        rows = run_matched_public_graphs(
++            "fp8_block",
++            shape=shape,
++            distributions=(
++                "uniform",
++                "ddist:1.1",
++                "ddist:1.5",
++                "ddist:2",
++                "ddist:3",
++                "ddist:4",
++            ),
++        )
++    if {row["capture_policy"] for row in rows} != {"da_switch"}:
++        pytest.skip(
++            "no DA SWITCH graph was captured, so run_deepseek_da_body did not run"
++        )
++
++
+ def test_live_distribution_selects_distinct_reachable_bodies() -> None:
+     """One captured graph must select distinct complete bodies after routing mutation."""
+     require_sm100()
+diff --git a/tests/moe/test_trtllm_gen_fused_moe.py b/tests/moe/test_trtllm_gen_fused_moe.py
+index 0a61127f07..4ba7c0541f 100644
+--- a/tests/moe/test_trtllm_gen_fused_moe.py
++++ b/tests/moe/test_trtllm_gen_fused_moe.py
+@@ -2652,17 +2652,23 @@ def run_case(gemm1_alpha=None, gemm1_beta=None, gemm1_clamp_limit=None):
+             WeightLayout.MajorK,
+             id="mxfp8-block",
+         ),
++        pytest.param(
++            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
++            WeightLayout.MajorK,
++            id="dsfp8-block",
++        ),
+     ],
+ )
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+ def test_swiglu_step_mixed_expert_limits(
+     moe_impl, weight_layout, cache_permute_indices
+ ):
+-    """The fused GEMM caps SiLU and up independently for per-expert 7/16 limits.
++    """SwiGLUStep caps SiLU and up independently for per-expert 7/16 limits.
+ 
+     The larger inputs make both limits effective. NVFP4 and per-tensor FP8
+     have non-unit FC1 dequant scales, so this also checks their raw-limit
+-    conversion; the reference consumes physical limits.
++    conversion; the reference consumes physical limits. DeepSeekFp8 applies
++    the limits in its separate activation kernel instead of the FC1 epilogue.
+     """
+     num_experts = 32
+     intermediate_size = 512
+@@ -2719,6 +2725,10 @@ def test_swiglu_step_mixed_expert_limits(
+             FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+             id="mxfp8-block",
+         ),
++        pytest.param(
++            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
++            id="dsfp8-block",
++        ),
+     ],
+ )
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@@ -3037,6 +3047,28 @@ def test_fp8_block_scale_moe_swiglu_oa_activation_param_validation():
+             gemm1_clamp_limit=per_expert,
+         )
+ 
++    # SwigluStep is scoped to the two block-scale recipes and takes a limit only.
++    with pytest.raises(
++        ValueError, match=r"SwigluStep requires Fp8QuantizationType\.MxFp8"
++    ):
++        trtllm_fp8_block_scale_moe(
++            **kwargs,
++            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
++            activation_type=ActivationType.SwigluStep.value,
++            gemm1_clamp_limit=per_expert,
++        )
++    for quantization_type in (
++        Fp8QuantizationType.DeepSeekFp8,
++        Fp8QuantizationType.MxFp8,
++    ):
++        with pytest.raises(ValueError, match=r"gemm1_clamp_limit only"):
++            trtllm_fp8_block_scale_moe(
++                **kwargs,
++                fp8_quantization_type=quantization_type,
++                activation_type=ActivationType.SwigluStep.value,
++                gemm1_alpha=per_expert,
++            )
++
+     routed_kwargs = {
+         key: value for key, value in kwargs.items() if key != "routing_logits"
+     }
+diff --git a/tests/moe/test_unified_moe.py b/tests/moe/test_unified_moe.py
+index 15e1d52999..155bfae9d5 100644
+--- a/tests/moe/test_unified_moe.py
++++ b/tests/moe/test_unified_moe.py
+@@ -1451,7 +1451,7 @@ def test_declarative_activation_capabilities(self):
+             ReLU2,
+         )
+         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
+-            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
++            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU, SwiGLUStep),
+             (QuantFormat.MXFP8, QuantFormat.MXFP8): (
+                 SwiGLU,
+                 SwiGLUStep,
+diff --git a/tests/moe/test_unified_moe_fp8.py b/tests/moe/test_unified_moe_fp8.py
+index 56ff8bcc76..2ca5ab208e 100644
+--- a/tests/moe/test_unified_moe_fp8.py
++++ b/tests/moe/test_unified_moe_fp8.py
+@@ -169,6 +169,14 @@ def _block_fp8_reference(
+             up, gate = fc1[:, :INTERMEDIATE], fc1[:, INTERMEDIATE:]
+             if isinstance(activation, GeGLU):
+                 act = F.gelu(gate) * up
++            elif isinstance(activation, SwiGLUStep):
++                # StepFun caps the SiLU output; an explicit clamp tensor overrides the typed limit.
++                limit = (
++                    activation.limit
++                    if gemm1_clamp_limit is None
++                    else gemm1_clamp_limit[local_expert].float()
++                )
++                act = F.silu(gate).clamp(max=limit) * up.clamp(min=-limit, max=limit)
+             else:
+                 if gemm1_clamp_limit is not None:
+                     limit = gemm1_clamp_limit[local_expert].float()
+@@ -198,6 +206,13 @@ def _assert_fp8_close(actual, expected):
+     check_accuracy(expected.float(), actual.float(), atol=0.05, rtol=0.3, percent=0.99)
+ 
+ 
++def _assert_fp8_close_to_scale(actual, expected):
++    # Scaled FC1 weights put outputs far above the absolute atol above, and the
++    # reference skips the kernel's E4M3 rounding of the FC1 output.
++    atol = 0.02 * expected.float().abs().max().item()
++    check_accuracy(expected.float(), actual.float(), atol=atol, rtol=0.3, percent=0.99)
++
++
+ def _assert_closer_to(actual, expected, wrong, *, margin=1.25):
+     """Assert the output is closer to the requested formula than a wrong one.
+ 
+@@ -217,12 +232,19 @@ def _assert_closer_to(actual, expected, wrong, *, margin=1.25):
+ 
+ 
+ def _make_block_fp8_case(
+-    variant, *, activation=None, expert_offset=0, local_experts=NUM_EXPERTS
++    variant,
++    *,
++    activation=None,
++    expert_offset=0,
++    local_experts=NUM_EXPERTS,
++    tokens=TOKENS,
++    w1_scale=1.0,
++    up_scale=1.0,
+ ):
+     device = torch.device("cuda")
+     generator = torch.Generator(device=device).manual_seed(20260717)
+     x = torch.randn(
+-        TOKENS, HIDDEN, device=device, dtype=torch.bfloat16, generator=generator
++        tokens, HIDDEN, device=device, dtype=torch.bfloat16, generator=generator
+     )
+     activation = activation or SwiGLU()
+     gemm1_rows = INTERMEDIATE * (2 if activation.is_gated else 1)
+@@ -237,6 +259,10 @@ def _make_block_fp8_case(
+         )
+         * 0.02
+     )
++    w1 *= w1_scale
++    if up_scale != 1.0:
++        # Gated FC1 rows are [up; gate]; scaling up separates the two halves' ranges.
++        w1[:, :INTERMEDIATE] *= up_scale
+     w2 = (
+         torch.randn(
+             local_experts,
+@@ -251,14 +277,14 @@ def _make_block_fp8_case(
+     ids = torch.randint(
+         expert_offset,
+         expert_offset + local_experts,
+-        (TOKENS, TOP_K),
++        (tokens, TOP_K),
+         device=device,
+         dtype=torch.int32,
+         generator=generator,
+     )
+     route_weights = torch.softmax(
+         torch.randn(
+-            TOKENS, TOP_K, device=device, dtype=torch.float32, generator=generator
++            tokens, TOP_K, device=device, dtype=torch.float32, generator=generator
+         ),
+         dim=-1,
+     )
+@@ -289,7 +315,7 @@ def _make_block_fp8_case(
+         ),
+         activation=activation,
+         backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(),)),
+-        execution=ExecutionConfig(tune_max_num_tokens=TOKENS),
++        execution=ExecutionConfig(tune_max_num_tokens=tokens),
+     )
+     pack = MoEActivationPack(
+         hidden_states_q=x_q,
+@@ -460,6 +486,110 @@ def per_expert(value):
+     torch.testing.assert_close(noop.float(), baseline.float(), atol=1e-2, rtol=1e-2)
+ 
+ 
++_DEEPSEEK_FP8 = QuantConfig(
++    weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
++)
++
++
++@pytest.mark.parametrize("limits", ["default", "per_expert", "0.25"])
++@pytest.mark.parametrize("tokens", [64, 512, 2048])
++@pytest.mark.parametrize("expert_offset", [0, 8], ids=["offset0", "offset8"])
++def test_dsfp8_swiglu_step_matches_reference(limits, tokens, expert_offset):
++    """DeepSeekFp8 applies SwiGLUStep in its separate activation kernel.
++
++    FC1 weights are scaled so that gates and ups exceed every limit. The limit is
++    the kernel default 7 (no tensor), a per-local-expert tensor cycling 7/11/16,
++    or 0.25. The token counts reach the activation kernel's 1, 2 and 4
++    tokens-per-CTA variants. Neighbouring experts get different limits, and with
++    the expert offset of 8 a global expert index would read past the tensor.
++    Besides matching the dequantized reference, the output must be measurably
++    closer to it than to what a wrong kernel computes: no clamp, limits shifted
++    by one expert, or the clamp before SiLU.
++    """
++    activation = SwiGLUStep(limit=0.25) if limits == "0.25" else SwiGLUStep()
++    pack, weights, config, (x, w1, w2) = _make_block_fp8_case(
++        _DEEPSEEK_FP8,
++        activation=activation,
++        expert_offset=expert_offset,
++        tokens=tokens,
++        w1_scale=40.0,
++    )
++    device = x.device
++    clamp = None
++    if limits == "per_expert":
++        clamp = torch.tensor(
++            [(7.0, 11.0, 16.0)[expert % 3] for expert in range(NUM_EXPERTS)],
++            device=device,
++            dtype=torch.float32,
++        )
++        weights.get_view("trtllm_fp8_block")["gemm1_clamp_limit"] = clamp
++
++    def _reference(act, **activation_params):
++        return _block_fp8_reference(
++            x,
++            w1,
++            w2,
++            pack.topk_ids,
++            pack.topk_weights,
++            _DEEPSEEK_FP8,
++            expert_offset=expert_offset,
++            activation=act,
++            **activation_params,
++        )
++
++    reference = _reference(activation, gemm1_clamp_limit=clamp)
++    layer = MoELayer(config)
++    runner = layer.runners[0]
++    direct = runner.forward(runner.pack_inputs(pack, weights), tactic=-1)
++    _assert_fp8_close_to_scale(direct, reference)
++    _assert_fp8_close_to_scale(layer(pack, weights), reference)
++    if limits == "default":
++        wrong = _reference(SwiGLU())
++    elif limits == "per_expert":
++        wrong = _reference(activation, gemm1_clamp_limit=clamp.roll(1))
++    else:
++        pre_silu_clamp = torch.full(
++            (NUM_EXPERTS,), 0.25, device=device, dtype=torch.float32
++        )
++        wrong = _reference(SwiGLU(), gemm1_clamp_limit=pre_silu_clamp)
++    _assert_closer_to(direct, reference, wrong)
++
++
++def test_dsfp8_swiglu_step_equals_swiglu_while_gates_stay_below_limit():
++    """SwiGLUStep and SwiGLU's OA clamp differ only for gates above the limit.
++
++    For gate <= limit, min(silu(gate), limit) == silu(min(gate, limit)), and both
++    clamp up to [-limit, limit]. The DeepSeekFp8 activation kernel evaluates both
++    with the same float operations, so the outputs must match bit for bit, with
++    the up clamp engaged (the up rows are scaled 16x). Below the gates, the two
++    clamp orders must differ.
++    """
++
++    def run(activation):
++        pack, weights, config, dequant = _make_block_fp8_case(
++            _DEEPSEEK_FP8, activation=activation, up_scale=16.0
++        )
++        return MoELayer(config)(pack, weights), dequant
++
++    plain, (x, w1, _) = run(SwiGLU())
++    fc1 = torch.einsum("th,eoh->eto", x, w1)
++    gate_max = fc1[..., INTERMEDIATE:].max().item()
++    up_abs_max = fc1[..., :INTERMEDIATE].abs().max().item()
++    # 2x covers the E4M3 rounding of the kernel's FC1 output.
++    limit = 2.0 * gate_max
++    assert limit < 0.5 * up_abs_max, (gate_max, up_abs_max)
++
++    step = run(SwiGLUStep(limit=limit))[0]
++    oa = run(SwiGLU(alpha=1.0, beta=0.0, limit=limit))[0]
++    assert torch.equal(step, oa)
++    assert not torch.allclose(step.float(), plain.float(), atol=1e-3, rtol=1e-3)
++
++    low = 0.25 * gate_max
++    step_low = run(SwiGLUStep(limit=low))[0]
++    oa_low = run(SwiGLU(alpha=1.0, beta=0.0, limit=low))[0]
++    assert not torch.allclose(step_low.float(), oa_low.float(), atol=1e-3, rtol=1e-3)
++
++
+ @pytest.mark.parametrize("key", ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"])
+ def test_block_fp8_swiglu_oa_params_rejected_when_malformed(key):
+     """Malformed OA params fail at the runner boundary, naming the offending key."""

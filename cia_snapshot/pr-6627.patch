@@ -1,0 +1,917 @@
+diff --git a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_kernel.cu b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_kernel.cu
+index 39631d7a49c..0e63de5aa45 100644
+--- a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_kernel.cu
++++ b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_kernel.cu
+@@ -483,6 +483,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t1024(int* __restrict__ topk_idx_i32, f
+             #pragma unroll 1
+             for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
+                 int e_h = topk_idx_i32[idx * 2];
++                if (e_h < 0) {
++                    token_to_permuted[idx] = -1;
++                    continue;
++                }
+                 int _atomic_old_0 = atomicAdd(&expert_counts[e_h], 1);
+                 int slot_h = _atomic_old_0;
+                 expert_scatter_offsets[e_h * 1024 + slot_h] = idx;
+@@ -614,11 +618,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t1024(int* __restrict__ topk_idx_i32, f
+             int expert_end = 0;
+             #pragma unroll 1
+             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
+-                while (expert_end <= pair_idx) {
++                while (expert_end <= pair_idx && pull_expert + 1 < num_experts) {
+                     pull_expert += 1;
+                     expert_start = expert_end;
+                     expert_end += expert_counts[pull_expert];
+                 }
++                if (expert_end <= pair_idx) {
++                    break;
++                }
+                 int e_s = pull_expert;
+                 int dst_row = expert_row_offsets[e_s] + pair_idx - expert_start;
+                 int source_pair = expert_scatter_offsets[e_s * 1024 + pair_idx - expert_start];
+@@ -2123,17 +2130,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t1024(int* __restrict__ topk_idx_i32, f
+             for (unsigned int token_chunk = epi_warp_2 * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += NUM_CTAS * 8) {
+                 unsigned int token = token_chunk / 4;
+                 unsigned int chunk = token_chunk % 4;
+-                unsigned int stored_row = 0;
++                int stored_row = -1;
+                 if (lane < 6) {
+-                    stored_row = (unsigned int)token_to_permuted[token * 6 + (unsigned int)lane];
++                    stored_row = token_to_permuted[token * 6 + (unsigned int)lane];
+                 }
++                unsigned int routed_slots = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
+                 #pragma unroll 1
+                 for (unsigned int i_4 = 0; i_4 < 6; i_4++) {
+                     unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_4);
+                     unsigned int row_3 = _shfl_56;
+                     if (elect_sync()) {
+-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
+-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        if ((routed_slots >> i_4) & 1) {
++                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        } else {
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 0);
++                        }
+                     }
+                     __syncwarp();
+                 }
+@@ -2180,6 +2192,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t1024(int* __restrict__ topk_idx_i32, f
+                 #pragma unroll 1
+                 for (unsigned int i_5 = 0; i_5 < 6; i_5++) {
+                     mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_5) * 8, phase_1);
++                    if (((routed_slots >> i_5) & 1) == 0) {
++                        continue;
++                    }
+                     #pragma unroll
+                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
+                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+diff --git a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_kernel.cu b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_kernel.cu
+index 66c8052861a..33fa64649fb 100644
+--- a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_kernel.cu
++++ b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_kernel.cu
+@@ -1204,6 +1204,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a(int* __restrict__ topk_idx_
+             #pragma unroll 1
+             for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
+                 int e_h = topk_idx_i32[idx * 2];
++                if (e_h < 0) {
++                    token_to_permuted[idx] = -1;
++                    continue;
++                }
+                 int _atomic_old_0 = atomicAdd(&expert_counts[e_h], 1);
+                 int slot_h = _atomic_old_0;
+                 expert_scatter_offsets[e_h * 128 + slot_h] = idx;
+@@ -1335,11 +1339,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a(int* __restrict__ topk_idx_
+             int expert_end = 0;
+             #pragma unroll 1
+             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
+-                while (expert_end <= pair_idx) {
++                while (expert_end <= pair_idx && pull_expert + 1 < num_experts) {
+                     pull_expert += 1;
+                     expert_start = expert_end;
+                     expert_end += expert_counts[pull_expert];
+                 }
++                if (expert_end <= pair_idx) {
++                    break;
++                }
+                 int e_s = pull_expert;
+                 int dst_row = expert_row_offsets[e_s] + pair_idx - expert_start;
+                 int source_pair = expert_scatter_offsets[e_s * 128 + pair_idx - expert_start];
+@@ -2845,17 +2852,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a(int* __restrict__ topk_idx_
+             for (unsigned int token_chunk = epi_warp_2 * 148 + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += 1184) {
+                 unsigned int token = token_chunk / 4;
+                 unsigned int chunk = token_chunk % 4;
+-                unsigned int stored_row = 0;
++                int stored_row = -1;
+                 if (lane < 6) {
+-                    stored_row = (unsigned int)token_to_permuted[token * 6 + lane];
++                    stored_row = token_to_permuted[token * 6 + lane];
+                 }
++                unsigned int routed_slots = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
+                 #pragma unroll 1
+                 for (unsigned int i_4 = 0; i_4 < 6; i_4++) {
+                     unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_4);
+                     unsigned int row_3 = _shfl_56;
+                     if (elect_sync()) {
+-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
+-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        if ((routed_slots >> i_4) & 1) {
++                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        } else {
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 0);
++                        }
+                     }
+                     __syncwarp();
+                 }
+@@ -2902,6 +2914,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a(int* __restrict__ topk_idx_
+                 #pragma unroll 1
+                 for (unsigned int i_5 = 0; i_5 < 6; i_5++) {
+                     mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_5) * 8, phase_1);
++                    if (((routed_slots >> i_5) & 1) == 0) {
++                        continue;
++                    }
+                     #pragma unroll
+                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
+                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+diff --git a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a_kernel.cu b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a_kernel.cu
+index ed29d81426c..6788747a09e 100644
+--- a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a_kernel.cu
++++ b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a_kernel.cu
+@@ -1204,6 +1204,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a(int* __restrict__ topk_idx_
+             #pragma unroll 1
+             for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
+                 int e_h = topk_idx_i32[idx * 2];
++                if (e_h < 0) {
++                    token_to_permuted[idx] = -1;
++                    continue;
++                }
+                 int _atomic_old_0 = atomicAdd(&expert_counts[e_h], 1);
+                 int slot_h = _atomic_old_0;
+                 expert_scatter_offsets[e_h * 128 + slot_h] = idx;
+@@ -1335,11 +1339,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a(int* __restrict__ topk_idx_
+             int expert_end = 0;
+             #pragma unroll 1
+             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
+-                while (expert_end <= pair_idx) {
++                while (expert_end <= pair_idx && pull_expert + 1 < num_experts) {
+                     pull_expert += 1;
+                     expert_start = expert_end;
+                     expert_end += expert_counts[pull_expert];
+                 }
++                if (expert_end <= pair_idx) {
++                    break;
++                }
+                 int e_s = pull_expert;
+                 int dst_row = expert_row_offsets[e_s] + pair_idx - expert_start;
+                 int source_pair = expert_scatter_offsets[e_s * 128 + pair_idx - expert_start];
+@@ -2883,17 +2890,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a(int* __restrict__ topk_idx_
+             for (unsigned int token_chunk = epi_warp_2 * 152 + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += 1216) {
+                 unsigned int token = token_chunk / 4;
+                 unsigned int chunk = token_chunk % 4;
+-                unsigned int stored_row = 0;
++                int stored_row = -1;
+                 if (lane < 6) {
+-                    stored_row = (unsigned int)token_to_permuted[token * 6 + lane];
++                    stored_row = token_to_permuted[token * 6 + lane];
+                 }
++                unsigned int routed_slots = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
+                 #pragma unroll 1
+                 for (unsigned int i_4 = 0; i_4 < 6; i_4++) {
+                     unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_4);
+                     unsigned int row_3 = _shfl_56;
+                     if (elect_sync()) {
+-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
+-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        if ((routed_slots >> i_4) & 1) {
++                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        } else {
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 0);
++                        }
+                     }
+                     __syncwarp();
+                 }
+@@ -2940,6 +2952,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a(int* __restrict__ topk_idx_
+                 #pragma unroll 1
+                 for (unsigned int i_5 = 0; i_5 < 6; i_5++) {
+                     mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_5) * 8, phase_1);
++                    if (((routed_slots >> i_5) & 1) == 0) {
++                        continue;
++                    }
+                     #pragma unroll
+                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
+                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+diff --git a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_kernel.cu b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_kernel.cu
+index a44fa7d4605..a114dac75ab 100644
+--- a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_kernel.cu
++++ b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_kernel.cu
+@@ -1204,6 +1204,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a(int* __restrict__ topk_idx_i
+             #pragma unroll 1
+             for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
+                 int e_h = topk_idx_i32[idx * 2];
++                if (e_h < 0) {
++                    token_to_permuted[idx] = -1;
++                    continue;
++                }
+                 int _atomic_old_0 = atomicAdd(&expert_counts[e_h], 1);
+                 int slot_h = _atomic_old_0;
+                 expert_scatter_offsets[e_h * 16 + slot_h] = idx;
+@@ -1335,11 +1339,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a(int* __restrict__ topk_idx_i
+             int expert_end = 0;
+             #pragma unroll 1
+             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
+-                while (expert_end <= pair_idx) {
++                while (expert_end <= pair_idx && pull_expert + 1 < num_experts) {
+                     pull_expert += 1;
+                     expert_start = expert_end;
+                     expert_end += expert_counts[pull_expert];
+                 }
++                if (expert_end <= pair_idx) {
++                    break;
++                }
+                 int e_s = pull_expert;
+                 int dst_row = expert_row_offsets[e_s] + pair_idx - expert_start;
+                 int source_pair = expert_scatter_offsets[e_s * 16 + pair_idx - expert_start];
+@@ -2851,17 +2858,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a(int* __restrict__ topk_idx_i
+             for (unsigned int token_chunk = epi_warp_2 * 148 + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += 1184) {
+                 unsigned int token = token_chunk / 4;
+                 unsigned int chunk = token_chunk % 4;
+-                unsigned int stored_row = 0;
++                int stored_row = -1;
+                 if (lane < 6) {
+-                    stored_row = (unsigned int)token_to_permuted[token * 6 + lane];
++                    stored_row = token_to_permuted[token * 6 + lane];
+                 }
++                unsigned int routed_slots = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
+                 #pragma unroll 1
+                 for (unsigned int i_4 = 0; i_4 < 6; i_4++) {
+                     unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_4);
+                     unsigned int row_3 = _shfl_56;
+                     if (elect_sync()) {
+-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
+-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        if ((routed_slots >> i_4) & 1) {
++                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        } else {
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 0);
++                        }
+                     }
+                     __syncwarp();
+                 }
+@@ -2908,6 +2920,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a(int* __restrict__ topk_idx_i
+                 #pragma unroll 1
+                 for (unsigned int i_5 = 0; i_5 < 6; i_5++) {
+                     mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_5) * 8, phase_1);
++                    if (((routed_slots >> i_5) & 1) == 0) {
++                        continue;
++                    }
+                     #pragma unroll
+                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
+                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+diff --git a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a_kernel.cu b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a_kernel.cu
+index f96427ce57e..e8f70c791af 100644
+--- a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a_kernel.cu
++++ b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a_kernel.cu
+@@ -1204,6 +1204,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a(int* __restrict__ topk_idx_i
+             #pragma unroll 1
+             for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
+                 int e_h = topk_idx_i32[idx * 2];
++                if (e_h < 0) {
++                    token_to_permuted[idx] = -1;
++                    continue;
++                }
+                 int _atomic_old_0 = atomicAdd(&expert_counts[e_h], 1);
+                 int slot_h = _atomic_old_0;
+                 expert_scatter_offsets[e_h * 16 + slot_h] = idx;
+@@ -1335,11 +1339,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a(int* __restrict__ topk_idx_i
+             int expert_end = 0;
+             #pragma unroll 1
+             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
+-                while (expert_end <= pair_idx) {
++                while (expert_end <= pair_idx && pull_expert + 1 < num_experts) {
+                     pull_expert += 1;
+                     expert_start = expert_end;
+                     expert_end += expert_counts[pull_expert];
+                 }
++                if (expert_end <= pair_idx) {
++                    break;
++                }
+                 int e_s = pull_expert;
+                 int dst_row = expert_row_offsets[e_s] + pair_idx - expert_start;
+                 int source_pair = expert_scatter_offsets[e_s * 16 + pair_idx - expert_start];
+@@ -2886,17 +2893,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a(int* __restrict__ topk_idx_i
+             for (unsigned int token_chunk = epi_warp_2 * 152 + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += 1216) {
+                 unsigned int token = token_chunk / 4;
+                 unsigned int chunk = token_chunk % 4;
+-                unsigned int stored_row = 0;
++                int stored_row = -1;
+                 if (lane < 6) {
+-                    stored_row = (unsigned int)token_to_permuted[token * 6 + lane];
++                    stored_row = token_to_permuted[token * 6 + lane];
+                 }
++                unsigned int routed_slots = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
+                 #pragma unroll 1
+                 for (unsigned int i_4 = 0; i_4 < 6; i_4++) {
+                     unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_4);
+                     unsigned int row_3 = _shfl_56;
+                     if (elect_sync()) {
+-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
+-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        if ((routed_slots >> i_4) & 1) {
++                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        } else {
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 0);
++                        }
+                     }
+                     __syncwarp();
+                 }
+@@ -2943,6 +2955,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a(int* __restrict__ topk_idx_i
+                 #pragma unroll 1
+                 for (unsigned int i_5 = 0; i_5 < 6; i_5++) {
+                     mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_5) * 8, phase_1);
++                    if (((routed_slots >> i_5) & 1) == 0) {
++                        continue;
++                    }
+                     #pragma unroll
+                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
+                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+diff --git a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1_kernel.cu b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1_kernel.cu
+index 119ba6faa49..1f680fda6f3 100644
+--- a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1_kernel.cu
++++ b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1_kernel.cu
+@@ -1192,6 +1192,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t1(int* __restrict__ topk_idx_i32, floa
+             #pragma unroll 1
+             for (int idx = disp_tid; idx < total_pairs; idx += 128) {
+                 int e_h = topk_idx_i32[idx * 2];
++                if (e_h < 0) {
++                    continue;
++                }
+                 atomicAdd(&smem_hist[e_h], 1);
+             }
+             asm volatile("barrier.sync 10, 128;" ::: "memory");
+@@ -1311,6 +1314,12 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t1(int* __restrict__ topk_idx_i32, floa
+             #pragma unroll 1
+             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
+                 int e_s = topk_idx_i32[pair_idx * 2];
++                if (e_s < 0) {
++                    if (lane == 0) {
++                        token_to_permuted[pair_idx] = -1;
++                    }
++                    continue;
++                }
+                 int t_s = pair_idx / top_k;
+                 int k_s = pair_idx - t_s * top_k;
+                 if (lane == 0) {
+@@ -2923,17 +2932,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t1(int* __restrict__ topk_idx_i32, floa
+             for (unsigned int token_chunk = epi_warp_2 * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += NUM_CTAS * 8) {
+                 unsigned int token = token_chunk / 4;
+                 unsigned int chunk = token_chunk % 4;
+-                unsigned int stored_row = 0;
++                int stored_row = -1;
+                 if (lane < 6) {
+-                    stored_row = (unsigned int)token_to_permuted[token * 6 + lane];
++                    stored_row = token_to_permuted[token * 6 + lane];
+                 }
++                unsigned int routed_slots = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
+                 #pragma unroll 1
+                 for (unsigned int i_6 = 0; i_6 < 6; i_6++) {
+                     unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_6);
+                     unsigned int row_3 = _shfl_56;
+                     if (elect_sync()) {
+-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_6) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_6) * 8);
+-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_6) * 8, 2560);
++                        if ((routed_slots >> i_6) & 1) {
++                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_6) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_6) * 8);
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_6) * 8, 2560);
++                        } else {
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_6) * 8, 0);
++                        }
+                     }
+                     __syncwarp();
+                 }
+@@ -2980,6 +2994,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t1(int* __restrict__ topk_idx_i32, floa
+                 #pragma unroll 1
+                 for (unsigned int i_7 = 0; i_7 < 6; i_7++) {
+                     mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_7) * 8, phase_1);
++                    if (((routed_slots >> i_7) & 1) == 0) {
++                        continue;
++                    }
+                     #pragma unroll
+                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
+                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+diff --git a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_kernel.cu b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_kernel.cu
+index b77253826d5..e398cf397d2 100644
+--- a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_kernel.cu
++++ b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_kernel.cu
+@@ -477,6 +477,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t4096(int* __restrict__ topk_idx_i32, f
+             #pragma unroll 1
+             for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
+                 int e_h = topk_idx_i32[idx * 2];
++                if (e_h < 0) {
++                    token_to_permuted[idx] = -1;
++                    continue;
++                }
+                 int _atomic_old_0 = atomicAdd(&expert_counts[e_h], 1);
+                 int slot_h = _atomic_old_0;
+                 expert_scatter_offsets[e_h * 4096 + slot_h] = idx;
+@@ -608,11 +612,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t4096(int* __restrict__ topk_idx_i32, f
+             int expert_end = 0;
+             #pragma unroll 1
+             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
+-                while (expert_end <= pair_idx) {
++                while (expert_end <= pair_idx && pull_expert + 1 < num_experts) {
+                     pull_expert += 1;
+                     expert_start = expert_end;
+                     expert_end += expert_counts[pull_expert];
+                 }
++                if (expert_end <= pair_idx) {
++                    break;
++                }
+                 int e_s = pull_expert;
+                 int dst_row = expert_row_offsets[e_s] + pair_idx - expert_start;
+                 int source_pair = expert_scatter_offsets[e_s * 4096 + pair_idx - expert_start];
+@@ -2118,17 +2125,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t4096(int* __restrict__ topk_idx_i32, f
+             for (unsigned int token_chunk = epi_warp_2 * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += NUM_CTAS * 8) {
+                 unsigned int token = token_chunk / 4;
+                 unsigned int chunk = token_chunk % 4;
+-                unsigned int stored_row = 0;
++                int stored_row = -1;
+                 if (lane < 6) {
+-                    stored_row = (unsigned int)token_to_permuted[token * 6 + (unsigned int)lane];
++                    stored_row = token_to_permuted[token * 6 + (unsigned int)lane];
+                 }
++                unsigned int routed_slots = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
+                 #pragma unroll 1
+                 for (unsigned int i_4 = 0; i_4 < 6; i_4++) {
+                     unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_4);
+                     unsigned int row_3 = _shfl_56;
+                     if (elect_sync()) {
+-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
+-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        if ((routed_slots >> i_4) & 1) {
++                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        } else {
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 0);
++                        }
+                     }
+                     __syncwarp();
+                 }
+@@ -2175,6 +2187,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t4096(int* __restrict__ topk_idx_i32, f
+                 #pragma unroll 1
+                 for (unsigned int i_5 = 0; i_5 < 6; i_5++) {
+                     mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_5) * 8, phase_1);
++                    if (((routed_slots >> i_5) & 1) == 0) {
++                        continue;
++                    }
+                     #pragma unroll
+                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
+                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+diff --git a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t512_kernel.cu b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t512_kernel.cu
+index 4574cef3d77..5d943cd8889 100644
+--- a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t512_kernel.cu
++++ b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t512_kernel.cu
+@@ -1206,6 +1206,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t512(int* __restrict__ topk_idx_i32, fl
+             #pragma unroll 1
+             for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
+                 int e_h = topk_idx_i32[idx * 2];
++                if (e_h < 0) {
++                    token_to_permuted[idx] = -1;
++                    continue;
++                }
+                 int _atomic_old_0 = atomicAdd(&expert_counts[e_h], 1);
+                 int slot_h = _atomic_old_0;
+                 expert_scatter_offsets[e_h * 512 + slot_h] = idx;
+@@ -1337,11 +1341,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t512(int* __restrict__ topk_idx_i32, fl
+             int expert_end = 0;
+             #pragma unroll 1
+             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
+-                while (expert_end <= pair_idx) {
++                while (expert_end <= pair_idx && pull_expert + 1 < num_experts) {
+                     pull_expert += 1;
+                     expert_start = expert_end;
+                     expert_end += expert_counts[pull_expert];
+                 }
++                if (expert_end <= pair_idx) {
++                    break;
++                }
+                 int e_s = pull_expert;
+                 int dst_row = expert_row_offsets[e_s] + pair_idx - expert_start;
+                 int source_pair = expert_scatter_offsets[e_s * 512 + pair_idx - expert_start];
+@@ -2880,17 +2887,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t512(int* __restrict__ topk_idx_i32, fl
+             for (unsigned int token_chunk = epi_warp_2 * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += NUM_CTAS * 8) {
+                 unsigned int token = token_chunk / 4;
+                 unsigned int chunk = token_chunk % 4;
+-                unsigned int stored_row = 0;
++                int stored_row = -1;
+                 if (lane < 6) {
+-                    stored_row = (unsigned int)token_to_permuted[token * 6 + lane];
++                    stored_row = token_to_permuted[token * 6 + lane];
+                 }
++                unsigned int routed_slots = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
+                 #pragma unroll 1
+                 for (unsigned int i_4 = 0; i_4 < 6; i_4++) {
+                     unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_4);
+                     unsigned int row_3 = _shfl_56;
+                     if (elect_sync()) {
+-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
+-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        if ((routed_slots >> i_4) & 1) {
++                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        } else {
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 0);
++                        }
+                     }
+                     __syncwarp();
+                 }
+@@ -2937,6 +2949,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t512(int* __restrict__ topk_idx_i32, fl
+                 #pragma unroll 1
+                 for (unsigned int i_5 = 0; i_5 < 6; i_5++) {
+                     mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_5) * 8, phase_1);
++                    if (((routed_slots >> i_5) & 1) == 0) {
++                        continue;
++                    }
+                     #pragma unroll
+                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
+                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+diff --git a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_kernel.cu b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_kernel.cu
+index 18449cd1635..a64b7897225 100644
+--- a/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_kernel.cu
++++ b/csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_kernel.cu
+@@ -1197,6 +1197,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp8_t16(int* __restrict__ topk_idx_i32, flo
+             #pragma unroll 1
+             for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
+                 int e_h = topk_idx_i32[idx * 2];
++                if (e_h < 0) {
++                    token_to_permuted[idx] = -1;
++                    continue;
++                }
+                 int _atomic_old_0 = atomicAdd(&expert_counts[e_h], 1);
+                 int slot_h = _atomic_old_0;
+                 expert_scatter_offsets[e_h * 16 + slot_h] = idx;
+@@ -1328,11 +1332,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp8_t16(int* __restrict__ topk_idx_i32, flo
+             int expert_end = 0;
+             #pragma unroll 1
+             for (int pair_idx = global_warp_idx; pair_idx < total_pairs; pair_idx += warps_per_grid) {
+-                while (expert_end <= pair_idx) {
++                while (expert_end <= pair_idx && pull_expert + 1 < num_experts) {
+                     pull_expert += 1;
+                     expert_start = expert_end;
+                     expert_end += expert_counts[pull_expert];
+                 }
++                if (expert_end <= pair_idx) {
++                    break;
++                }
+                 int e_s = pull_expert;
+                 int dst_row = expert_row_offsets[e_s] + pair_idx - expert_start;
+                 int source_pair = expert_scatter_offsets[e_s * 16 + pair_idx - expert_start];
+@@ -2846,17 +2853,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp8_t16(int* __restrict__ topk_idx_i32, flo
+             for (unsigned int token_chunk = epi_warp_2 * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += NUM_CTAS * 8) {
+                 unsigned int token = token_chunk / 4;
+                 unsigned int chunk = token_chunk % 4;
+-                unsigned int stored_row = 0;
++                int stored_row = -1;
+                 if (lane < 6) {
+-                    stored_row = (unsigned int)token_to_permuted[token * 6 + lane];
++                    stored_row = token_to_permuted[token * 6 + lane];
+                 }
++                unsigned int routed_slots = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
+                 #pragma unroll 1
+                 for (unsigned int i_4 = 0; i_4 < 6; i_4++) {
+                     unsigned int _shfl_56 = __shfl_sync(0xFFFFFFFF, stored_row, i_4);
+                     unsigned int row_3 = _shfl_56;
+                     if (elect_sync()) {
+-                        cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
+-                        mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        if ((routed_slots >> i_4) & 1) {
++                            cp_async_bulk_gmem2smem(combine_smem_addr + (epi_warp_2 * 6 + i_4) * 2560, expert_output + ((unsigned long long)row_3 * 5120 + (unsigned long long)(chunk * 1280)), 2560, combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8);
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 2560);
++                        } else {
++                            mbarrier_arrive_expect_tx(combine_barriers_addr + (epi_warp_2 * 6 + i_4) * 8, 0);
++                        }
+                     }
+                     __syncwarp();
+                 }
+@@ -2903,6 +2915,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp8_t16(int* __restrict__ topk_idx_i32, flo
+                 #pragma unroll 1
+                 for (unsigned int i_5 = 0; i_5 < 6; i_5++) {
+                     mbarrier_wait(combine_barriers_addr + (epi_warp_2 * 6 + i_5) * 8, phase_1);
++                    if (((routed_slots >> i_5) & 1) == 0) {
++                        continue;
++                    }
+                     #pragma unroll
+                     for (unsigned int j_3 = 0; j_3 < 5; j_3++) {
+                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+diff --git a/docs/experimental/generated_mega_moe.md b/docs/experimental/generated_mega_moe.md
+index 6e93b34b1a9..c9b1ead17e4 100644
+--- a/docs/experimental/generated_mega_moe.md
++++ b/docs/experimental/generated_mega_moe.md
+@@ -22,8 +22,10 @@ clamped SwiGLU and combine in one submission. Routed weights may use packed
+ FP4 E2M1 or FP8 E4M3. It accepts logical gate/up weight halves and float
+ power-of-two scales. Its FP4 model routes cover 1, 16, 128, 512, 1024
+ and 4096 tokens (FP8 routed weights at 16 tokens); the 1024- and 4096-token
+-routes use the 32- and 128-row source tile heights. Preparation packs scales and interleaves the
+-weights. Every exported pipeline route is `self_cleaning`: it launches exactly
++routes use the 32- and 128-row source tile heights. A `topk_idx` of -1 routes
++its slot to no expert, as a routing gate marks a masked token: the slot takes
++no row and adds nothing to the output, whatever its weight. Preparation packs
++scales and interleaves the weights. Every exported pipeline route is `self_cleaning`: it launches exactly
+ one kernel per `run()`, the kernel zeroes its per-launch workspace words before
+ it exits and its grid gates are phase-toggling words, so the plan zeroes the
+ counter workspace once when it is bound, never inside `run()` (a captured
+@@ -61,7 +63,8 @@ The public tests use independent PyTorch math on the exact packed inputs,
+ check valid dispatch metadata and reusable counters, poison outputs between
+ launches, and exercise direct and graph replay. They cover both routed
+ precisions on the 16-token model route, the FP4 single-token route's workspace
+-lifecycle, the FP4 1024- and 4096-token routes, and the catalog's grouped L2
+-route, and they check that a captured `run()` is one kernel node. The 384-expert inputs need about 48 GiB of free device memory;
++lifecycle, the FP4 1024- and 4096-token routes, -1 routes on every pipeline
++route, and the catalog's grouped L2 route, and they check that a captured
++`run()` is one kernel node. The 384-expert inputs need about 48 GiB of free device memory;
+ the tests skip below that. They do not enumerate every model shape or claim
+ model-wide performance.
+diff --git a/examples/experimental/mega_moe_inputs.py b/examples/experimental/mega_moe_inputs.py
+index edf85b63eb1..61d4b062813 100644
+--- a/examples/experimental/mega_moe_inputs.py
++++ b/examples/experimental/mega_moe_inputs.py
+@@ -126,12 +126,15 @@ def model_reference(inputs, x_scales):
+     """BF16 L1, clamped SwiGLU, FP32 activation quantization, BF16 L2 of the
+     routed experts (only the selected ones are dequantized; all 384 at once
+     would need tens of GiB), summed in FP32 and rounded to BF16 once, like the
+-    kernel."""
++    kernel. A negative expert id routes its slot to no expert (a masked token):
++    the slot adds nothing, whatever its weight."""
+     precision = inputs["routed_weight_dtype"]
+     x = unpack(inputs["x_fp8_packed"], x_scales, "fp8")
+     width = inputs["intermediate"]
+     output = torch.zeros_like(x)
+     for index in inputs["topk_idx"].unique().tolist():
++        if index < 0:
++            continue
+         first = unpack(
+             inputs[f"w1_{precision}"][index], inputs["w1_sf"][index], precision
+         )
+diff --git a/flashinfer/experimental/mega_moe_v3/catalog.json b/flashinfer/experimental/mega_moe_v3/catalog.json
+index c8d2581a4d5..66e556b12e2 100644
+--- a/flashinfer/experimental/mega_moe_v3/catalog.json
++++ b/flashinfer/experimental/mega_moe_v3/catalog.json
+@@ -14,7 +14,7 @@
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1_kernel.cu",
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1_binding.cu"
+    ],
+-   "closure_sha256": "23c342c0a9d0be6d072d4696abf62bcba8d9d3a306ea45fecfccf042bed03c29",
++   "closure_sha256": "ffda005feaeea8b7dc5b712377392455692c8874a1d9d94d955bfd5f408ffc6f",
+    "compile_flags": [
+     "--use_fast_math"
+    ],
+@@ -266,7 +266,7 @@
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_kernel.cu",
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm100a_binding.cu"
+    ],
+-   "closure_sha256": "f53a56a62f788670c9c2804869af7cb3fa243738c3baed5d69026501ac9cef35",
++   "closure_sha256": "2b2ded4cc16798cf1bc2baafd94cdc58c5a773bcd526efab9479e3961ba4013b",
+    "compile_flags": [
+     "--use_fast_math"
+    ],
+@@ -515,7 +515,7 @@
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a_kernel.cu",
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t16_sm103a_binding.cu"
+    ],
+-   "closure_sha256": "2777b057b5f86b58e3c3fd3a16fadffd67cf424695180b2742f543793958a31b",
++   "closure_sha256": "0fb3f135e52d013ddaa09b7df9116d902fe64c1098bdbeb6931e9c7bea1db165",
+    "compile_flags": [
+     "--use_fast_math"
+    ],
+@@ -764,7 +764,7 @@
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_kernel.cu",
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm100a_binding.cu"
+    ],
+-   "closure_sha256": "11078f4541769ef5db18218f5db179de2c869a9709f0348d1dc6687f3d570759",
++   "closure_sha256": "30c1e3e892df2569658b4162d37894fbb2c476ec8c2c41c78378daca8f6fc8e7",
+    "compile_flags": [
+     "--use_fast_math"
+    ],
+@@ -1013,7 +1013,7 @@
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a_kernel.cu",
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t128_sm103a_binding.cu"
+    ],
+-   "closure_sha256": "77e1c7a364e1ada5934f6b31c109c06e05b51838a54d8c71d5923975cabf5592",
++   "closure_sha256": "7c236bf3c8a992e7c81627da72b000d1b793650ee76f0405f2fe67b8bd912006",
+    "compile_flags": [
+     "--use_fast_math",
+     "--ptxas-options=--register-usage-level=10"
+@@ -1264,7 +1264,7 @@
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t512_kernel.cu",
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t512_binding.cu"
+    ],
+-   "closure_sha256": "f9bdfe1b5430f89eb8d7f15416001851d259f955e8a56878338572556c5f3e4d",
++   "closure_sha256": "4e733bdb76a757b4ee2da799a6b67ec85bdc63ce3cf9c10dec3280decede4b0d",
+    "compile_flags": {
+     "sm_100a": [
+      "--use_fast_math"
+@@ -1523,7 +1523,7 @@
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_kernel.cu",
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp8_t16_binding.cu"
+    ],
+-   "closure_sha256": "7327da1e4451919f2a3ddf80e9e81035083bb5ed3da426e8ebc84412a6af2d1e",
++   "closure_sha256": "6308c131ae94d55e5c582ddc402064be0f6f606feef3b90c6fddb339815d6e62",
+    "compile_flags": [
+     "--use_fast_math"
+    ],
+@@ -2167,7 +2167,7 @@
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_kernel.cu",
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t1024_binding.cu"
+    ],
+-   "closure_sha256": "8ae67025dbae730ac98bb640276bddb47367331fdec29affcf3da1e1ecaa1dec",
++   "closure_sha256": "2cc695afec524e0ae278064088101b88060c7bad6d2a6aa4a351de63cd62122d",
+    "compile_flags": [
+     "--use_fast_math"
+    ],
+@@ -2420,7 +2420,7 @@
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_kernel.cu",
+     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_t4096_binding.cu"
+    ],
+-   "closure_sha256": "58e52ab59f7c1405cb91d8367be7e51f9ae14304fd9b25e605ed1afc3e4a72ef",
++   "closure_sha256": "01804da860e13dbb15e277b44996d434c52a4854a1576e6cac935dd9516b1a35",
+    "compile_flags": [
+     "--use_fast_math"
+    ],
+diff --git a/flashinfer/experimental/mega_moe_v3/preparation.py b/flashinfer/experimental/mega_moe_v3/preparation.py
+index 378b40e27b2..d895cb9d8dd 100644
+--- a/flashinfer/experimental/mega_moe_v3/preparation.py
++++ b/flashinfer/experimental/mega_moe_v3/preparation.py
+@@ -41,7 +41,8 @@ def _mega_dispatch_reference(
+     row offsets, tile list, and total M. Row assignment within an expert is
+     runtime-nondeterministic (atomic claim order), so pool/metadata are checked
+     via token_to_permuted, not by fixed row — this returns only the
+-    order-independent quantities."""
++    order-independent quantities. A negative id routes its slot to no expert
++    (a masked token) and takes no row."""
+     import torch
+ 
+     T, TK = topk_idx.shape
+@@ -49,7 +50,9 @@ def _mega_dispatch_reference(
+     ids = topk_idx.cpu()
+     for t in range(T):
+         for k in range(TK):
+-            counts[int(ids[t, k].item())] += 1
++            expert = int(ids[t, k].item())
++            if expert >= 0:
++                counts[expert] += 1
+     pad = ((counts + align_m - 1) // align_m) * align_m
+     offsets = torch.zeros(num_experts, dtype=torch.int64)
+     running = 0
+@@ -156,7 +159,9 @@ def prepare_pipeline_bindings(inputs, num_sms):
+     grid_n1, K1_tiles = (N1 // BLOCK_N, K1 // BLOCK_K)
+     grid_n2, K2_tiles = (N2 // BLOCK_N, K2 // BLOCK_K)
+     ref = _mega_dispatch_reference(inputs["topk_idx"], E)
+-    M_total = ref["M_total"]
++    # A batch whose every slot is -1 routes no row; its pools keep one aligned
++    # block so that their tensor maps stay valid.
++    M_total = max(ref["M_total"], ALIGN_M)
+     total_m_tiles = ref["total_m_tiles"]
+     topk_idx_i32 = inputs["topk_idx"].contiguous().view(torch.int32)
+     topk_weights_flat = inputs["topk_weights"].contiguous().view(-1)
+@@ -185,6 +190,10 @@ def prepare_pipeline_bindings(inputs, num_sms):
+     persistent_grid = max(CTA_GROUP, min(num_sms - num_sms % CTA_GROUP, num_tiles))
+     if persistent_grid % CTA_GROUP != 0:
+         persistent_grid += CTA_GROUP - persistent_grid % CTA_GROUP
++    if source_schedule:
++        # The source schedule runs one CTA per SM (NUM_CTAS) however few tiles
++        # the routes fill, e.g. when -1 slots leave fewer routed tokens.
++        persistent_grid = num_sms
+     grid = (persistent_grid, 1, 1)
+     residual_readiness = (
+         source_schedule
+diff --git a/tests/experimental/test_generated_mega_moe.py b/tests/experimental/test_generated_mega_moe.py
+index 929f9af946a..d6eb70f9705 100644
+--- a/tests/experimental/test_generated_mega_moe.py
++++ b/tests/experimental/test_generated_mega_moe.py
+@@ -220,6 +220,95 @@ def test_v3_long_token_routes(num_tokens):
+         check_v3_workspace(plan)
+ 
+ 
++@pytest.mark.parametrize(
++    ("precision", "num_tokens"),
++    [
++        ("fp4", 1),
++        ("fp4", 16),
++        ("fp8", 16),
++        ("fp4", 128),
++        ("fp4", 512),
++        ("fp4", 1024),
++        ("fp4", 4096),
++    ],
++)
++def test_pipeline_negative_topk_idx_routes_to_no_expert(precision, num_tokens):
++    """A topk_idx of -1 routes its slot to no expert, on every pipeline route.
++
++    Every fourth token is masked the way a routing gate writes it (all slots -1,
++    weight 0); another quarter of the tokens drop one slot whose weight stays
++    nonzero, which must not count. Such a slot contributes exactly what the same
++    route at weight 0 contributes, nothing: the output equals, bit for bit, a
++    plan whose slots keep their experts at weight 0, and it is close to the
++    PyTorch reference that skips -1. Masked rows are zero. This holds on the
++    first launch, a replay and a captured graph; each launch marks a -1 slot's
++    token_to_permuted entry -1 (the entries start at a real row), and the
++    workspace stays clean."""
++    require_model_memory()
++    inputs, xs = fixtures.model_inputs(
++        precision,
++        num_tokens=num_tokens,
++        l2_scale_shift=5 if num_tokens >= 1024 else 0,
++    )
++    token = torch.arange(num_tokens, device="cuda")
++    masked = token % 4 == 1
++    dropped = token % 4 == 0
++    inputs["topk_weights"][masked] = 0.0
++    weight_zero = dict(inputs, topk_weights=inputs["topk_weights"].clone())
++    weight_zero["topk_weights"][dropped, 3] = 0.0
++    zero_plan = _v3_runtime.prepare_pipeline(weight_zero)
++    zero_plan.run()
++    torch.cuda.synchronize()
++    unrouted = zero_plan.outputs.clone()
++    del zero_plan
++    inputs["topk_idx"] = inputs["topk_idx"].clone()
++    inputs["topk_idx"][masked] = -1
++    inputs["topk_idx"][dropped, 3] = -1
++    plan = _v3_runtime.prepare_pipeline(inputs)
++    expected = model_reference(inputs, xs).float()
++    permuted = plan.stages[0].bindings["token_to_permuted"]
++    unrouted_slots = (inputs["topk_idx"] < 0).reshape(-1)
++    for launch in range(3):
++        plan.outputs.fill_(float("nan"))
++        # Row 0 is a real row: a -1 slot must not be read from a stale entry.
++        permuted.fill_(0)
++        if launch < 2:
++            plan.run()
++        else:
++            graph = torch.cuda.CUDAGraph()
++            with torch.cuda.graph(graph):
++                plan.run()
++            plan.outputs.fill_(float("nan"))
++            graph.replay()
++        torch.cuda.synchronize()
++        torch.testing.assert_close(plan.outputs, unrouted, atol=0, rtol=0)
++        assert plan.outputs[masked].count_nonzero().item() == 0
++        assert (permuted[unrouted_slots] == -1).all().item()
++        actual = plan.outputs.float()
++        difference = 1 - 2 * (actual * expected).sum() / (
++            actual.square().sum() + expected.square().sum()
++        )
++        assert difference.item() < 1e-3
++        check_v3_workspace(plan, scratch_cleared=num_tokens == 1)
++
++
++@pytest.mark.parametrize("num_tokens", [1, 16])
++def test_pipeline_fully_masked_batch_is_zero(num_tokens):
++    """A batch whose every slot is -1 routes no token: it binds to the route's
++    grid, every launch writes zeros and the workspace stays clean."""
++    require_model_memory()
++    inputs, _ = fixtures.model_inputs("fp4", num_tokens=num_tokens)
++    inputs["topk_idx"][:] = -1
++    inputs["topk_weights"][:] = 0.0
++    plan = _v3_runtime.prepare_pipeline(inputs)
++    for _ in range(2):
++        plan.outputs.fill_(float("nan"))
++        plan.run()
++        torch.cuda.synchronize()
++        assert plan.outputs.count_nonzero().item() == 0
++        check_v3_workspace(plan, scratch_cleared=num_tokens == 1)
++
++
+ def test_grouped_l2_update_scales_and_graph_replay():
+     plan, a, b, sa, sb, words_a, words_b = fixtures.make_grouped_l2()
+     for changed in (None, "activation", "weight"):
+diff --git a/tests/experimental/test_mega_moe_v3_catalog.py b/tests/experimental/test_mega_moe_v3_catalog.py
+index e34984deafc..9e6f4540297 100644
+--- a/tests/experimental/test_mega_moe_v3_catalog.py
++++ b/tests/experimental/test_mega_moe_v3_catalog.py
+@@ -1,5 +1,6 @@
+ """Catalog consistency of the generated MegaMoE v3 family (no GPU required)."""
+ 
++import hashlib
+ import json
+ from pathlib import Path
+ 
+@@ -75,6 +76,16 @@ def test_programs_sources_symbols_and_compile_line_definitions():
+         )
+ 
+ 
++def test_closure_sha256_names_the_shipped_sources():
++    """Each program's closure_sha256 is the SHA-256 of its kernel then binding source bytes."""
++    data = json.loads(_catalog().path.read_text())
++    for name, record in data["programs"].items():
++        digest = hashlib.sha256(
++            b"".join((ROOT / src).read_bytes() for src in record["sources"])
++        ).hexdigest()
++        assert record["closure_sha256"] == digest, name
++
++
+ def test_load_program_supplies_the_route_sm_count_as_num_ctas():
+     pytest.importorskip("torch")
+     catalog = _catalog()

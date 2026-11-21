@@ -1,0 +1,395 @@
+diff --git a/flashinfer/grouped_mm/core.py b/flashinfer/grouped_mm/core.py
+index d924935a1b2..c6415954d81 100644
+--- a/flashinfer/grouped_mm/core.py
++++ b/flashinfer/grouped_mm/core.py
+@@ -399,6 +399,11 @@ def grouped_mm_mxfp8(
+         Block scale tensor for A. Can be:
+         - 2D swizzled 128x4: shape (cum_m, k // 32)
+         dtype: uint8.
++        The tensor is the 128x4 swizzle of all ``cum_m`` token rows as one
++        matrix (rows padded to a multiple of 128), e.g. the output of
++        ``nvfp4_quantize``/``mxfp8_quantize`` on ``a``. Expert segments in
++        ``m_indptr`` need not start on multiples of 128: the scales are
++        re-laid out internally into the per-expert padded order cuDNN reads.
+     b_descale : torch.Tensor
+         Block scale tensor for B. Can be:
+         - 3D swizzled 128x4: shape (batch_size, n, k // 32)
+@@ -564,6 +569,11 @@ def grouped_mm_fp4(
+         Block scale tensor for A. Can be:
+         - 2D swizzled 128x4: shape (cum_m, k // block_size)
+         dtype: float8_e4m3fn or uint8.
++        The tensor is the 128x4 swizzle of all ``cum_m`` token rows as one
++        matrix (rows padded to a multiple of 128), e.g. the output of
++        ``nvfp4_quantize``/``mxfp8_quantize`` on ``a``. Expert segments in
++        ``m_indptr`` need not start on multiples of 128: the scales are
++        re-laid out internally into the per-expert padded order cuDNN reads.
+     b_descale : torch.Tensor
+         Block scale tensor for B. Can be:
+         - 3D swizzled 128x4: shape (batch_size, n, k // block_size)
+diff --git a/flashinfer/grouped_mm/cudnn/core.py b/flashinfer/grouped_mm/cudnn/core.py
+index 273f17c2eef..276d2e9e2ec 100644
+--- a/flashinfer/grouped_mm/cudnn/core.py
++++ b/flashinfer/grouped_mm/cudnn/core.py
+@@ -349,6 +349,78 @@ def _run_cudnn_moe_grouped_gemm(
+     return out
+ 
+ 
++def _segmented_token_scale_capacity_rows(total_rows: int, num_groups: int) -> int:
++    """Rows of the per-group-padded token scale blob cuDNN's MoE block-scale kernels read.
++
++    Mirrors cuDNN frontend's ``segmented_row_scale_capacity_rows``: with ``total_rows``
++    tokens split over at most ``num_groups`` non-empty groups, independently padding
++    every group to whole 128-row blocks needs at most ``A + (total_rows - A) // 128``
++    blocks, ``A = min(total_rows, num_groups)``. The bound is static, so the blob can
++    be sized without reading ``m_indptr`` on the host.
++    """
++    active = min(total_rows, num_groups)
++    return 128 * (active + (total_rows - active) // 128)
++
++
++def _segment_token_descale_per_group(
++    a_descale: torch.Tensor, m_indptr: torch.Tensor, cum_m: int, k_blocks: int
++) -> torch.Tensor:
++    """Re-lay A's block scales from one 128x4 swizzle over all ``cum_m`` tokens into
++    the layout cuDNN's MoE block-scale kernels read.
++
++    ``grouped_mm_fp4`` / ``grouped_mm_mxfp8`` take ``a_descale`` as one F8_128x4-reordered
++    tensor over every token, which is what the quantizers produce. cuDNN's MoE grouped
++    block-scale kernels (SM100 and SM12x) instead read token scales that are
++    F8_128x4-reordered and padded to whole 128-row blocks *per group*, groups
++    concatenated in order: group ``g`` starts at block ``sum(ceil(rows_g' / 128))`` over
++    the groups before it, and its rows are addressed group-locally. The two layouts
++    coincide only when every group starts on a multiple of 128 rows; for any other
++    ``m_indptr`` the kernel reads the wrong scales (or past the buffer) and returns
++    wrong values without an error.
++
++    One Triton kernel does it: each program writes one destination 128-row block,
++    finding its group from ``m_indptr`` on the device, so this needs no host
++    synchronization and is safe under CUDA graph capture. Padding rows are zero. Returns a dense ``(capacity_rows, round_up(k_blocks, 4))``
++    tensor of ``a_descale``'s dtype.
++    """
++    import triton
++
++    from ...triton.kernels.grouped_scale import segment_scale_128x4_per_group_kernel
++
++    cols = ((k_blocks + 3) // 4) * 4
++    col_words = cols // 4
++    rows = a_descale.numel() // cols
++    num_groups = m_indptr.numel() - 1
++    cap = _segmented_token_scale_capacity_rows(cum_m, num_groups)
++    src = a_descale.contiguous().view(torch.uint8).view(torch.int32)
++    dst = torch.empty(cap * col_words, dtype=torch.int32, device=a_descale.device)
++    block_c = min(32, triton.next_power_of_2(col_words))
++    grid = (cap // 128, triton.cdiv(col_words, block_c))
++    segment_scale_128x4_per_group_kernel[grid](
++        src,
++        dst,
++        m_indptr.to(torch.int32),
++        num_groups,
++        rows,
++        num_col_words=col_words,
++        BLOCK_G=max(16, triton.next_power_of_2(num_groups)),
++        BLOCK_C=block_c,
++    )
++    return dst.view(torch.uint8).view(cap, cols).view(a_descale.dtype)
++
++
++def _bind_as_declared(blob: torch.Tensor, declared: torch.Tensor) -> torch.Tensor:
++    """A view of ``blob`` with ``declared``'s shape and dense strides.
++
++    The graph declares the logical token scales, and cuDNN reads the scale buffer
++    through its base pointer, so the larger segmented blob is bound through a view
++    whose shape matches the declaration. Binding a tensor of a different shape makes
++    cuDNN take its per-call shape-override path, which costs tens of milliseconds of
++    host time per execute. The view keeps the blob alive.
++    """
++    return blob.reshape(-1)[: declared.numel()].view(declared.shape)
++
++
+ @functools.lru_cache(maxsize=1024)
+ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
+     handle,
+@@ -564,6 +636,17 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
+ 
+     token_3d = a.unsqueeze(0)
+     token_descale_3d = a_descale.unsqueeze(0)
++    # The graph declares the logical token scales; the kernel reads the per-group
++    # padded blob (see _segment_token_descale_per_group), so that is what runs.
++    token_descale_runtime = _bind_as_declared(
++        _segment_token_descale_per_group(
++            a_descale,
++            m_indptr,
++            cum_m,
++            a.shape[1] // 32,  # MXFP8: one UE8M0 scale per 32
++        ),
++        a_descale,
++    ).unsqueeze(0)
+     weight_3d = b.transpose(1, 2)
+     weight_descale_3d = b_descale.transpose(1, 2)
+     fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
+@@ -605,7 +688,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
+ 
+     variant_pack = {
+         _CUDNN_UIDs.TOKEN.value: token_3d,
+-        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_3d,
++        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_runtime,
+         _CUDNN_UIDs.WEIGHT.value: weight_3d,
+         _CUDNN_UIDs.WEIGHT_SCALE_FACTOR.value: weight_descale_3d,
+         _CUDNN_UIDs.FIRST_TOKEN_OFFSET.value: fto,
+@@ -665,6 +748,17 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
+ 
+     token_3d = a.unsqueeze(0)
+     token_descale_3d = a_descale.unsqueeze(0)
++    # The graph declares the logical token scales; the kernel reads the per-group
++    # padded blob (see _segment_token_descale_per_group), so that is what runs.
++    token_descale_runtime = _bind_as_declared(
++        _segment_token_descale_per_group(
++            a_descale,
++            m_indptr,
++            cum_m,
++            a.shape[1] * 2 // block_size,  # packed FP4: two per byte
++        ),
++        a_descale,
++    ).unsqueeze(0)
+     weight_3d = b.transpose(1, 2)
+     weight_descale_3d = b_descale.transpose(1, 2)
+     fto = m_indptr[:-1].reshape(-1, 1, 1).contiguous()
+@@ -713,7 +807,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
+ 
+     variant_pack = {
+         _CUDNN_UIDs.TOKEN.value: token_3d,
+-        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_3d,
++        _CUDNN_UIDs.TOKEN_SCALE_FACTOR.value: token_descale_runtime,
+         _CUDNN_UIDs.WEIGHT.value: weight_3d,
+         _CUDNN_UIDs.WEIGHT_SCALE_FACTOR.value: weight_descale_3d,
+         _CUDNN_UIDs.FIRST_TOKEN_OFFSET.value: fto,
+diff --git a/flashinfer/triton/kernels/grouped_scale.py b/flashinfer/triton/kernels/grouped_scale.py
+new file mode 100644
+index 00000000000..7d06ba60dc5
+--- /dev/null
++++ b/flashinfer/triton/kernels/grouped_scale.py
+@@ -0,0 +1,69 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def segment_scale_128x4_per_group_kernel(
++    src_ptr,  # int32 words of the source F8_128x4 blob over all tokens
++    dst_ptr,  # int32 words of the destination blob, groups padded to 128 rows
++    indptr_ptr,  # int32 [num_groups + 1] row offsets of the groups in the source
++    num_groups,
++    src_rows,  # rows of the source blob (a multiple of 128)
++    num_col_words: tl.constexpr,  # scale columns / 4
++    BLOCK_G: tl.constexpr,  # power of two >= num_groups
++    BLOCK_C: tl.constexpr,  # column words per program
++):
++    """One program writes one destination 128-row block for ``BLOCK_C`` column words.
++
++    In the F8_128x4 layout the four scales of row ``r`` in column group ``c`` are one
++    32-bit word at ``((r // 128) * C4 + c) * 128 + (r % 32) * 4 + (r // 32) % 4``. The
++    destination holds every group padded to whole 128-row blocks, groups in order;
++    rows past a group's end, and blocks past the last group, are zero.
++    """
++    dst_block = tl.program_id(0)
++    col_tile = tl.program_id(1)
++
++    g = tl.arange(0, BLOCK_G)
++    g_mask = g < num_groups
++    lo = tl.load(indptr_ptr + g, mask=g_mask, other=0)
++    hi = tl.load(indptr_ptr + g + 1, mask=g_mask, other=0)
++    blocks = (hi - lo + 127) // 128
++    block_end = tl.cumsum(blocks, axis=0)
++    # the group whose padded region holds this block (num_groups if past the last one)
++    group = tl.sum((g_mask & (block_end <= dst_block)).to(tl.int32), axis=0)
++    in_range = group < num_groups
++    sel = g == group
++    g_lo = tl.sum(tl.where(sel, lo, 0), axis=0)
++    g_rows = tl.sum(tl.where(sel, hi - lo, 0), axis=0)
++    g_block_start = tl.sum(tl.where(sel, block_end - blocks, 0), axis=0)
++
++    r = tl.arange(0, 128)
++    c = col_tile * BLOCK_C + tl.arange(0, BLOCK_C)
++    local = (dst_block - g_block_start) * 128 + r
++    row_ok = in_range & (local < g_rows)
++    s = tl.minimum(g_lo + local, src_rows - 1)
++    src_word = ((s // 128)[:, None] * num_col_words + c[None, :]) * 128 + (
++        (s % 32) * 4 + (s // 32) % 4
++    )[:, None]
++    dst_word = (dst_block * num_col_words + c[None, :]) * 128 + (
++        (r % 32) * 4 + (r // 32) % 4
++    )[:, None]
++    c_ok = c[None, :] < num_col_words
++    words = tl.load(src_ptr + src_word, mask=row_ok[:, None] & c_ok, other=0)
++    tl.store(dst_ptr + dst_word, words, mask=c_ok)
+diff --git a/tests/grouped_mm/test_grouped_mm_fp4.py b/tests/grouped_mm/test_grouped_mm_fp4.py
+index 30213b58d4b..a59ea60fa24 100644
+--- a/tests/grouped_mm/test_grouped_mm_fp4.py
++++ b/tests/grouped_mm/test_grouped_mm_fp4.py
+@@ -21,6 +21,19 @@ class TestGroupedMmFp4:
+     """Tests for grouped_mm_fp4 (NVFP4 grouped GEMM)."""
+ 
+     MIN_COS_SIM = 0.9
++    # Expert segments that do not start on a multiple of 128 rows, the shape real
++    # routing produces. cuDNN reads token scales padded to 128 rows per group, so
++    # these exercise the re-layout in _segment_token_descale_per_group; before it,
++    # every segment that started mid-tile was silently wrong (or NaN).
++    UNALIGNED_SEGMENTS = [
++        [64, 64],
++        [120, 136],
++        [16, 48, 64],
++        [128, 64, 64],
++        [192, 64],
++        [13, 83, 0, 67, 77],
++    ]
++    MIN_SEGMENT_COS_SIM = 0.97
+ 
+     @staticmethod
+     def _quantize_a(a_bf16):
+@@ -182,6 +195,55 @@ def test_empty_experts(self):
+         )
+         assert cos_sim > self.MIN_COS_SIM
+ 
++    @requires_cudnn_moe_block_scale
++    @pytest.mark.parametrize("seg_lens", UNALIGNED_SEGMENTS)
++    def test_unaligned_segments(self, seg_lens):
++        """Segments starting off a 128-row boundary are as accurate as aligned ones."""
++        torch.manual_seed(3)
++        num_experts = len(seg_lens)
++        cum_m = sum(seg_lens)
++        k, n = 512, 256
++
++        a_bf16 = torch.randn(cum_m, k, dtype=torch.bfloat16, device="cuda")
++        b_bf16 = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
++        m_indptr = torch.tensor(
++            [0, *torch.tensor(seg_lens).cumsum(0).tolist()],
++            dtype=torch.int32,
++            device="cuda",
++        )
++
++        a_fp4, a_sf, a_gsf = self._quantize_a(a_bf16)
++        b_fp4, b_sf, b_gsf = self._quantize_b(b_bf16)
++        alpha = torch.tensor(
++            [1.0 / (a_gsf * b_gsf)], dtype=torch.float32, device="cuda"
++        )
++
++        out = grouped_mm_fp4(
++            a_fp4,
++            b_fp4,
++            a_sf,
++            b_sf,
++            m_indptr,
++            alpha=alpha,
++            out_dtype=torch.bfloat16,
++            block_size=16,
++        )
++        ref = ref_grouped_mm(a_bf16, b_bf16, m_indptr, out_dtype=torch.bfloat16)
++
++        assert torch.isfinite(out).all()
++        for e in range(num_experts):
++            start, end = m_indptr[e].item(), m_indptr[e + 1].item()
++            if start == end:
++                continue
++            cos_sim = F.cosine_similarity(
++                ref[start:end].reshape(-1).float(),
++                out[start:end].reshape(-1).float(),
++                dim=0,
++            )
++            assert cos_sim > self.MIN_SEGMENT_COS_SIM, (
++                f"segment {e} rows [{start}, {end}): cosine similarity {cos_sim:.4f}"
++            )
++
+     @requires_cudnn_moe_block_scale
+     def test_single_expert(self):
+         """Degenerate case: only one expert (equivalent to dense mm)."""
+diff --git a/tests/grouped_mm/test_grouped_mm_mxfp8.py b/tests/grouped_mm/test_grouped_mm_mxfp8.py
+index c62dbd75731..e7824f02da3 100644
+--- a/tests/grouped_mm/test_grouped_mm_mxfp8.py
++++ b/tests/grouped_mm/test_grouped_mm_mxfp8.py
+@@ -20,6 +20,19 @@ class TestGroupedMmMxfp8:
+     """Tests for grouped_mm_mxfp8 (block-scaled MXFP8 grouped GEMM)."""
+ 
+     MIN_COS_SIM = 0.9
++    # Expert segments that do not start on a multiple of 128 rows, the shape real
++    # routing produces. cuDNN reads token scales padded to 128 rows per group, so
++    # these exercise the re-layout in _segment_token_descale_per_group; before it,
++    # every segment that started mid-tile was silently wrong (or NaN).
++    UNALIGNED_SEGMENTS = [
++        [64, 64],
++        [120, 136],
++        [16, 48, 64],
++        [128, 64, 64],
++        [192, 64],
++        [13, 83, 0, 67, 77],
++    ]
++    MIN_SEGMENT_COS_SIM = 0.97
+ 
+     @staticmethod
+     def _quantize_a(a_bf16):
+@@ -149,6 +162,50 @@ def test_empty_experts(self):
+         )
+         assert cos_sim > self.MIN_COS_SIM
+ 
++    @requires_cudnn_moe_block_scale
++    @pytest.mark.parametrize("seg_lens", UNALIGNED_SEGMENTS)
++    def test_unaligned_segments(self, seg_lens):
++        """Segments starting off a 128-row boundary are as accurate as aligned ones."""
++        torch.manual_seed(3)
++        num_experts = len(seg_lens)
++        cum_m = sum(seg_lens)
++        k, n = 512, 256
++
++        a_bf16 = torch.randn(cum_m, k, dtype=torch.bfloat16, device="cuda")
++        b_bf16 = torch.randn(num_experts, n, k, dtype=torch.bfloat16, device="cuda")
++        m_indptr = torch.tensor(
++            [0, *torch.tensor(seg_lens).cumsum(0).tolist()],
++            dtype=torch.int32,
++            device="cuda",
++        )
++
++        a_mxfp8, a_scale = self._quantize_a(a_bf16)
++        b_mxfp8, b_scale = self._quantize_b(b_bf16)
++
++        out = grouped_mm_mxfp8(
++            a_mxfp8,
++            b_mxfp8,
++            a_scale,
++            b_scale,
++            m_indptr,
++            out_dtype=torch.bfloat16,
++        )
++        ref = ref_grouped_mm(a_bf16, b_bf16, m_indptr, out_dtype=torch.bfloat16)
++
++        assert torch.isfinite(out).all()
++        for e in range(num_experts):
++            start, end = m_indptr[e].item(), m_indptr[e + 1].item()
++            if start == end:
++                continue
++            cos_sim = F.cosine_similarity(
++                ref[start:end].reshape(-1).float(),
++                out[start:end].reshape(-1).float(),
++                dim=0,
++            )
++            assert cos_sim > self.MIN_SEGMENT_COS_SIM, (
++                f"segment {e} rows [{start}, {end}): cosine similarity {cos_sim:.4f}"
++            )
++
+     @requires_cudnn_moe_block_scale
+     def test_single_expert(self):
+         """Degenerate case: only one expert (equivalent to dense mm)."""

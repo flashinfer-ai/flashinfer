@@ -1,0 +1,420 @@
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/build.json b/flashinfer/cake_causal_conv1d_train_backend/build.json
+index 390f81ed67..26900f862f 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/build.json
++++ b/flashinfer/cake_causal_conv1d_train_backend/build.json
+@@ -55,55 +55,55 @@
+     }
+   },
+   "generator": {
+-    "cake_revision": "9058dacb7354934698d58b6ee13a4dc17d10345b",
++    "cake_revision": "9a27fa8d4f0a83adedcfd8ab363ec3dc6be28bf7",
+     "cuda": "13.4.92",
+-    "rendered_at": "2026-10-19T06:24:37Z"
++    "rendered_at": "2026-10-20T07:05:21Z"
+   },
+   "libraries": [
+     {
+       "arch": "sm_100a",
+-      "closure_sha256": "cf560fff4ba9d42e2fec9f38a967f557ff100ce481aab851306d7630134016b2",
++      "closure_sha256": "cb3d107730c6945fc2049661911ad3b2e36a49d46ea9bc443284a540263a1ba2",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+       "min_cuda": "12.8",
+-      "name": "cake_causal_conv1d_train_a578fae272376f2d9537_sm_100a",
++      "name": "cake_causal_conv1d_train_21cc8e5b2b49282a47ef_sm_100a",
+       "nvcc_flags": [
+         "--prec-div=true",
+         "--prec-sqrt=true",
+         "--ftz=false"
+       ],
+       "nvcc_flags_if": [],
+-      "path": "aot/cake_causal_conv1d_train_a578fae272376f2d9537_sm_100a.so",
++      "path": "aot/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_sm_100a.so",
+       "sha256": {
+-        "csrc/cake_causal_conv1d_train_a578fae272376f2d9537_binding.cu": "928dd84839294edd27842263e72aece3546f982f846f46dedf968a8cb0e566f3",
+-        "csrc/cake_causal_conv1d_train_a578fae272376f2d9537_kernel.cu": "835dc5363488e5dea46a55f5c218e8fa58df74bc7d7deb11e72c412a373ba476"
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu": "ec6574b45078c89c21f9750199b14cda45511c838eb3050a132c06b5c4361235",
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu": "46cdd9c958519387ea73c86c9d7bcd1e4e08095f2734d147502c54343fb105d0"
+       },
+       "sources": [
+-        "csrc/cake_causal_conv1d_train_a578fae272376f2d9537_kernel.cu",
+-        "csrc/cake_causal_conv1d_train_a578fae272376f2d9537_binding.cu"
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu",
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu"
+       ]
+     },
+     {
+       "arch": "sm_103a",
+-      "closure_sha256": "cc76fc48a54ab2a28264eaf7ce840cb5f78c92ae922a775040d51e0ecea44c73",
++      "closure_sha256": "a31a46881557ad7a97c4be4cf8861aff328190f16dc4ab8ae3f238a01a437ebb",
+       "entry": "run",
+       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+       "min_cuda": "12.9",
+-      "name": "cake_causal_conv1d_train_a578fae272376f2d9537_sm_103a",
++      "name": "cake_causal_conv1d_train_21cc8e5b2b49282a47ef_sm_103a",
+       "nvcc_flags": [
+         "--prec-div=true",
+         "--prec-sqrt=true",
+         "--ftz=false"
+       ],
+       "nvcc_flags_if": [],
+-      "path": "aot/cake_causal_conv1d_train_a578fae272376f2d9537_sm_103a.so",
++      "path": "aot/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_sm_103a.so",
+       "sha256": {
+-        "csrc/cake_causal_conv1d_train_a578fae272376f2d9537_binding.cu": "928dd84839294edd27842263e72aece3546f982f846f46dedf968a8cb0e566f3",
+-        "csrc/cake_causal_conv1d_train_a578fae272376f2d9537_kernel.cu": "835dc5363488e5dea46a55f5c218e8fa58df74bc7d7deb11e72c412a373ba476"
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu": "ec6574b45078c89c21f9750199b14cda45511c838eb3050a132c06b5c4361235",
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu": "46cdd9c958519387ea73c86c9d7bcd1e4e08095f2734d147502c54343fb105d0"
+       },
+       "sources": [
+-        "csrc/cake_causal_conv1d_train_a578fae272376f2d9537_kernel.cu",
+-        "csrc/cake_causal_conv1d_train_a578fae272376f2d9537_binding.cu"
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu",
++        "csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu"
+       ]
+     },
+     {
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py b/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py
+index 63661f9032..de72511534 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py
++++ b/flashinfer/cake_causal_conv1d_train_backend/cake_jit.py
+@@ -126,7 +126,7 @@
+         "role": "fwd",
+         "workspace_rule": None,
+     },
+-    "cake_causal_conv1d_train_a578fae272376f2d9537": {
++    "cake_causal_conv1d_train_21cc8e5b2b49282a47ef": {
+         "arches": [
+             "sm_100a",
+             "sm_103a",
+@@ -146,6 +146,8 @@
+             ["parameter", "ct_vec"],
+             ["parameter", "n_sub"],
+             ["parameter", "n_ch_tiles"],
++            ["buffer", "x_map"],
++            ["buffer", "dy_map"],
+             ["grid", "grid_x"],
+             ["grid", "grid_y"],
+             ["grid", "grid_z"],
+@@ -165,8 +167,8 @@
+             },
+             "kind": "co_resident",
+         },
+-        "kernel": "cake_causal_conv1d_train_a578fae272376f2d9537",
+-        "kernel_symbol": "kernel_cake_causal_conv1d_train_a578fae272376f2d9537",
++        "kernel": "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
++        "kernel_symbol": "kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
+         "launch": {
+             "block": (128, 1, 1),
+             "cluster": (1, 1, 1),
+@@ -174,7 +176,7 @@
+             "dynamic_smem_bytes": 50176,
+             "use_pdl": False,
+         },
+-        "library": "cake_causal_conv1d_train_a578fae272376f2d9537",
++        "library": "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
+         "logical": {
+             "C": "C",
+             "S": "S",
+@@ -183,6 +185,7 @@
+             "dw": "dw",
+             "dx": "dx",
+             "dy": "dy",
++            "dy_map": "dy",
+             "n_ch_tiles": "n_ch_tiles",
+             "n_sub": "n_sub",
+             "num_docs": "num_docs",
+@@ -190,6 +193,7 @@
+             "search_steps": "search_steps",
+             "w": "w",
+             "x": "x",
++            "x_map": "x",
+         },
+         "role": "bwd",
+         # The FP32 ``partial`` workspace: ``[ceil(grid / n_ch_tiles), C, taps]``
+@@ -280,7 +284,7 @@
+ ROUTES: dict[str, dict[str, list[str]]] = {
+     "sm_100a": {
+         "bwd": [
+-            "cake_causal_conv1d_train_a578fae272376f2d9537",
++            "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
+         ],
+         "fwd": [
+             "cake_causal_conv1d_train_f193c5247980992f4f81",
+@@ -288,7 +292,7 @@
+     },
+     "sm_103a": {
+         "bwd": [
+-            "cake_causal_conv1d_train_a578fae272376f2d9537",
++            "cake_causal_conv1d_train_21cc8e5b2b49282a47ef",
+         ],
+         "fwd": [
+             "cake_causal_conv1d_train_f193c5247980992f4f81",
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a578fae272376f2d9537_binding.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu
+similarity index 54%
+rename from flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a578fae272376f2d9537_binding.cu
+rename to flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu
+index 9ea85fc771..e240734e9f 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a578fae272376f2d9537_binding.cu
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_binding.cu
+@@ -14,30 +14,117 @@
+  * limitations under the License.
+  */
+ 
+-// Generated by Cake: the tvm-ffi host binding of kernel_cake_causal_conv1d_train_a578fae272376f2d9537, for the device source that defines it. Do not edit.
++// Generated by Cake: the tvm-ffi host binding of kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef, for the device source that defines it. Do not edit.
+ #include <cuda_runtime.h>
++#include <cuda.h>
+ #include <cuda_bf16.h>
+ 
+ #include "cake_ffi_checks.h"
+ 
+ #include <cstdint>
+ 
+-extern "C" __global__ void kernel_cake_causal_conv1d_train_a578fae272376f2d9537(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles);
++extern "C" __global__ void kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map);
+ 
+-namespace cake_binding_kernel_cake_causal_conv1d_train_a578fae272376f2d9537 {
++namespace cake_binding_kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef {
+ 
+ using tvm::ffi::TensorView;
+ 
+-constexpr const char* KERNEL_NAME = "kernel_cake_causal_conv1d_train_a578fae272376f2d9537";
++constexpr const char* KERNEL_NAME = "kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef";
+ 
+ void CheckCuda(cudaError_t status, const char* what) {
+   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
+       << KERNEL_NAME << ": " << what << " failed: " << cudaGetErrorString(status);
+ }
+ 
++void CheckCu(CUresult result, const char* what) {
++  if (result != CUDA_SUCCESS) {
++    const char* name = nullptr;
++    const char* message = nullptr;
++    cuGetErrorName(result, &name);
++    cuGetErrorString(result, &message);
++    TVM_FFI_THROW(RuntimeError) << KERNEL_NAME << ": " << what << " failed with "
++                                << (name ? name : "an unknown CUresult") << " (" << static_cast<int>(result)
++                                << "): " << (message ? message : "");
++  }
++}
++
+ void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
+ 
+-void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, TensorView a_dx, TensorView a_dw, TensorView a_partial, int64_t a_S, int64_t a_C, int64_t a_num_docs, int64_t a_search_steps, int64_t a_ct_vec, int64_t a_n_sub, int64_t a_n_ch_tiles, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
++void CheckUnitInnerStride(const TensorView& t, const char* name) {
++  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
++      << KERNEL_NAME << ": '" << name << "' needs a unit innermost stride, got " << t.stride(-1);
++}
++
++// The product of the extents above the trailing `trailing` dims.
++int64_t NumelAbove(const TensorView& t, int trailing) {
++  int64_t product = 1;
++  for (int axis = 0; axis < t.ndim() - trailing; ++axis) product *= t.size(axis);
++  return product;
++}
++
++cuuint64_t Extent(int64_t value, const char* descriptor) {
++  TVM_FFI_CHECK(value > 0, ValueError)
++      << KERNEL_NAME << ": an extent of descriptor '" << descriptor << "' resolves to " << value;
++  return static_cast<cuuint64_t>(value);
++}
++
++cuuint64_t Stride(int64_t value, const char* descriptor) {
++  TVM_FFI_CHECK(value >= 0, ValueError)
++      << KERNEL_NAME << ": a stride of descriptor '" << descriptor << "' resolves to " << value;
++  return static_cast<cuuint64_t>(value);
++}
++
++CUtensorMap EncodeTma_x_map(const TensorView& t) {
++  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
++      << KERNEL_NAME << ": descriptor 'x_map' takes a source of at least 2 dims, got " << t.ndim();
++  CheckUnitInnerStride(t, "x_map");
++  int64_t d1 = t.size(-1);
++  int64_t outer1 = NumelAbove(t, 1);
++  check_dense_leading_dims(t, 1, "x_map");
++  int64_t s2 = t.stride(-2) * 2;
++  cuuint64_t global_dim[2] = {Extent(d1, "x_map"), Extent(outer1, "x_map")};
++  cuuint64_t global_strides[1] = {Stride(s2, "x_map")};
++  cuuint32_t box_dim[2] = {256u, 4u};
++  cuuint32_t elem_strides[2] = {1u, 1u};
++  TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
++      << KERNEL_NAME << ": the strides of descriptor 'x_map' must be multiples of 16 bytes";
++  void* address = DataPtr(t);
++  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
++      << KERNEL_NAME << ": the address of descriptor 'x_map' must be 16-byte aligned";
++  CUtensorMap map{};
++  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, address, global_dim, global_strides,
++                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
++                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
++          "cuTensorMapEncodeTiled of x_map");
++  return map;
++}
++
++CUtensorMap EncodeTma_dy_map(const TensorView& t) {
++  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
++      << KERNEL_NAME << ": descriptor 'dy_map' takes a source of at least 2 dims, got " << t.ndim();
++  CheckUnitInnerStride(t, "dy_map");
++  int64_t d1 = t.size(-1);
++  int64_t outer1 = NumelAbove(t, 1);
++  check_dense_leading_dims(t, 1, "dy_map");
++  int64_t s2 = t.stride(-2) * 2;
++  cuuint64_t global_dim[2] = {Extent(d1, "dy_map"), Extent(outer1, "dy_map")};
++  cuuint64_t global_strides[1] = {Stride(s2, "dy_map")};
++  cuuint32_t box_dim[2] = {256u, 4u};
++  cuuint32_t elem_strides[2] = {1u, 1u};
++  TVM_FFI_CHECK(global_strides[0] % 16 == 0, ValueError)
++      << KERNEL_NAME << ": the strides of descriptor 'dy_map' must be multiples of 16 bytes";
++  void* address = DataPtr(t);
++  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
++      << KERNEL_NAME << ": the address of descriptor 'dy_map' must be 16-byte aligned";
++  CUtensorMap map{};
++  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, address, global_dim, global_strides,
++                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
++                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
++          "cuTensorMapEncodeTiled of dy_map");
++  return map;
++}
++
++void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, TensorView a_dx, TensorView a_dw, TensorView a_partial, int64_t a_S, int64_t a_C, int64_t a_num_docs, int64_t a_search_steps, int64_t a_ct_vec, int64_t a_n_sub, int64_t a_n_ch_tiles, TensorView a_x_map, TensorView a_dy_map, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+   DLDevice dev = a_x.device();
+   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
+   check_cuda_tensor(a_x, "x");
+@@ -75,6 +162,10 @@ void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, Tenso
+   TVM_FFI_CHECK(a_n_ch_tiles >= -2147483648LL && a_n_ch_tiles <= 2147483647LL, ValueError)
+       << KERNEL_NAME << ": 'n_ch_tiles' = " << a_n_ch_tiles
+       << " is outside the i32 range [-2147483648, 2147483647]";
++  check_cuda_tensor(a_x_map, "x_map");
++  check_dtype(a_x_map, DLDataType{kDLBfloat, 16, 1}, "x_map");
++  check_cuda_tensor(a_dy_map, "dy_map");
++  check_dtype(a_dy_map, DLDataType{kDLBfloat, 16, 1}, "dy_map");
+   check_contiguous(a_x, "x");
+   check_contiguous(a_w, "w");
+   check_same_device(a_w, a_x, "w", "x");
+@@ -88,17 +179,20 @@ void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, Tenso
+   check_same_device(a_dw, a_x, "dw", "x");
+   check_contiguous(a_partial, "partial");
+   check_same_device(a_partial, a_x, "partial", "x");
++  check_same_device(a_x_map, a_x, "x_map", "x");
++  check_same_device(a_dy_map, a_x, "dy_map", "x");
+   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
+       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
+   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
+       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") exceeds CUDA's limits";
+   cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
+   {
+-    // Once per thread per device: the kernel's function attributes hold per device.
++    // Once per thread per device: the kernel's function attributes hold per device; the tensor-map encoders need this thread's context of the device bound.
+     static thread_local uint64_t prepared_devices = 0;
+     const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
+     if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
+-      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_causal_conv1d_train_a578fae272376f2d9537), cudaFuncAttributeMaxDynamicSharedMemorySize, 50176), "cudaFuncSetAttribute");
++      CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
++      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef), cudaFuncAttributeMaxDynamicSharedMemorySize, 50176), "cudaFuncSetAttribute");
+       prepared_devices |= device_bit;
+     }
+   }
+@@ -116,7 +210,9 @@ void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, Tenso
+   int32_t v_ct_vec = static_cast<int32_t>(a_ct_vec);
+   int32_t v_n_sub = static_cast<int32_t>(a_n_sub);
+   int32_t v_n_ch_tiles = static_cast<int32_t>(a_n_ch_tiles);
+-  void* kernel_args[] = {&v_x, &v_w, &v_cu, &v_dy, &v_dx, &v_dw, &v_partial, &v_S, &v_C, &v_num_docs, &v_search_steps, &v_ct_vec, &v_n_sub, &v_n_ch_tiles};
++  CUtensorMap v_x_map = EncodeTma_x_map(a_x_map);
++  CUtensorMap v_dy_map = EncodeTma_dy_map(a_dy_map);
++  void* kernel_args[] = {&v_x, &v_w, &v_cu, &v_dy, &v_dx, &v_dw, &v_partial, &v_S, &v_C, &v_num_docs, &v_search_steps, &v_ct_vec, &v_n_sub, &v_n_ch_tiles, &v_x_map, &v_dy_map};
+   cudaLaunchConfig_t config{};
+   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
+   config.blockDim = dim3(128, 1, 1);
+@@ -127,11 +223,11 @@ void Run(TensorView a_x, TensorView a_w, TensorView a_cu, TensorView a_dy, Tenso
+   attrs[0].val.cooperative = 1;
+   config.attrs = attrs;
+   config.numAttrs = 1;
+-  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_causal_conv1d_train_a578fae272376f2d9537), kernel_args),
++  CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef), kernel_args),
+             "cudaLaunchKernelExC");
+ }
+ 
+-}  // namespace cake_binding_kernel_cake_causal_conv1d_train_a578fae272376f2d9537
++}  // namespace cake_binding_kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef
+ 
+-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_causal_conv1d_train_a578fae272376f2d9537::Run);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_binding_kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef::Run);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(build_cuda_version, cake_ffi_build_cuda_version);
+diff --git a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a578fae272376f2d9537_kernel.cu b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu
+similarity index 97%
+rename from flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a578fae272376f2d9537_kernel.cu
+rename to flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu
+index 939464c384..85b0678c5b 100644
+--- a/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_a578fae272376f2d9537_kernel.cu
++++ b/flashinfer/cake_causal_conv1d_train_backend/csrc/cake_causal_conv1d_train_21cc8e5b2b49282a47ef_kernel.cu
+@@ -130,6 +130,19 @@ __device__ __forceinline__ float approx_rcp(float x) {
+ 
+ 
+ 
++
++
++__device__ __forceinline__ void tma_2d_gmem2smem(
++    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
++    asm volatile(
++        "cp.async.bulk.tensor.2d.shared::cta.global"
++        ".mbarrier::complete_tx::bytes"
++        " [%0], [%1, {%2, %3}], [%4];"
++        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
++           "r"(mbar_addr) : "memory");
++}
++
++
+ __device__ __forceinline__ void cp_async_bulk_gmem2smem(
+     unsigned smem_addr, const void* gmem_ptr, unsigned bytes, int mbar_addr) {
+     asm volatile(
+@@ -158,7 +171,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
+ extern "C" {
+ 
+ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
+-kernel_cake_causal_conv1d_train_a578fae272376f2d9537(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles)
++kernel_cake_causal_conv1d_train_21cc8e5b2b49282a47ef(__nv_bfloat16* __restrict__ x, float* __restrict__ w, int* __restrict__ cu, __nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ dx, float* __restrict__ dw, float* __restrict__ partial, int S, int C, int num_docs, int search_steps, int ct_vec, int n_sub, int n_ch_tiles, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap dy_map)
+ {
+     const int tid = threadIdx.x;
+     const int warp = make_warp_uniform(tid / 32);
+@@ -748,13 +761,19 @@ kernel_cake_causal_conv1d_train_a578fae272376f2d9537(__nv_bfloat16* __restrict__
+             if (li == 0 && rows_k_3 > 0) {
+                 int _min_17 = ((rstride) < ((int)(C64 - c64_1) * 2) ? (rstride) : ((int)(C64 - c64_1) * 2));
+                 int cb = _min_17;
+-                mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, rows_k_3 * (2 * cb));
+                 int sx_2 = (int)stage_buf_addr + bslot_2 * 4096 + seg_off;
+                 long long src0_2 = (long long)(t0 + k0_1 * 4) * C64 + c64_1;
+                 if (whole_row != 0) {
++                    mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, rows_k_3 * (2 * cb));
+                     cp_async_bulk_gmem2smem(sx_2, reinterpret_cast<const uint8_t*>(x + src0_2), rows_k_3 * cb, stage_full_addr + (bslot_2) * 8);
+                     cp_async_bulk_gmem2smem(sx_2 + 2048, reinterpret_cast<const uint8_t*>(dy + src0_2), rows_k_3 * cb, stage_full_addr + (bslot_2) * 8);
++                } else if (rstride == 512) {
++                    mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, 4096);
++                    int cc = (int)c64_1;
++                    tma_2d_gmem2smem(sx_2, (&x_map), cc, t0 + k0_1 * 4, stage_full_addr + (bslot_2) * 8);
++                    tma_2d_gmem2smem(sx_2 + 2048, (&dy_map), cc, t0 + k0_1 * 4, stage_full_addr + (bslot_2) * 8);
+                 } else {
++                    mbarrier_arrive_expect_tx(stage_full_addr + (bslot_2) * 8, rows_k_3 * (2 * cb));
+                     #pragma unroll 1
+                     for (int i_2 = 0; i_2 < rows_k_3; i_2++) {
+                         long long src = src0_2 + (long long)i_2 * C64;
+@@ -1170,13 +1189,19 @@ kernel_cake_causal_conv1d_train_a578fae272376f2d9537(__nv_bfloat16* __restrict__
+                 if (li == 0 && rows_k_5 > 0) {
+                     int _min_21 = ((rstride) < ((int)(C64 - c64_1) * 2) ? (rstride) : ((int)(C64 - c64_1) * 2));
+                     int cb_1 = _min_21;
+-                    mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, rows_k_5 * (2 * cb_1));
+                     int sx_3 = (int)stage_buf_addr + bslot_0_1 * 4096 + seg_off;
+                     long long src0_3 = (long long)(t0 + kn_1 * 4) * C64 + c64_1;
+                     if (whole_row != 0) {
++                        mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, rows_k_5 * (2 * cb_1));
+                         cp_async_bulk_gmem2smem(sx_3, reinterpret_cast<const uint8_t*>(x + src0_3), rows_k_5 * cb_1, stage_full_addr + (bslot_0_1) * 8);
+                         cp_async_bulk_gmem2smem(sx_3 + 2048, reinterpret_cast<const uint8_t*>(dy + src0_3), rows_k_5 * cb_1, stage_full_addr + (bslot_0_1) * 8);
++                    } else if (rstride == 512) {
++                        mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, 4096);
++                        int cc_1 = (int)c64_1;
++                        tma_2d_gmem2smem(sx_3, (&x_map), cc_1, t0 + kn_1 * 4, stage_full_addr + (bslot_0_1) * 8);
++                        tma_2d_gmem2smem(sx_3 + 2048, (&dy_map), cc_1, t0 + kn_1 * 4, stage_full_addr + (bslot_0_1) * 8);
+                     } else {
++                        mbarrier_arrive_expect_tx(stage_full_addr + (bslot_0_1) * 8, rows_k_5 * (2 * cb_1));
+                         #pragma unroll 1
+                         for (int i_4 = 0; i_4 < rows_k_5; i_4++) {
+                             long long src_1 = src0_3 + (long long)i_4 * C64;

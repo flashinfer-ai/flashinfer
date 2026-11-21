@@ -1,0 +1,3935 @@
+diff --git a/benchmarks/bench_mla_swa_sm90.py b/benchmarks/bench_mla_swa_sm90.py
+new file mode 100644
+index 00000000000..86668f11521
+--- /dev/null
++++ b/benchmarks/bench_mla_swa_sm90.py
+@@ -0,0 +1,186 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Standalone SM90 MLA+SWA complete-op CUDA Graph benchmark.
++
++Example: python benchmarks/bench_mla_swa_sm90.py --refcheck
++
++The PyTorch baseline implements the same causal window and BF16 score rounding,
++but uses PyTorch gather/mask operations, NOT SGLang's Triton fallback kernels.
++Its latency must not be labeled as the original SGLang fallback latency.
++No SGLang installation, model weights, or previously built binary is required.
++"""
++
++import argparse
++import json
++import math
++import statistics
++from pathlib import Path
++
++import torch
++
++import flashinfer
++from flashinfer.mla import (
++    batch_decode_with_kv_cache_mla_swa,
++    get_mla_swa_workspace_size_bytes,
++)
++
++
++def torch_reference(q, kv, table, lengths, scale, dtype=torch.bfloat16, with_abs=False):
++    b, sq, heads, dim = q.shape
++    width = math.ceil((513 + sq - 1) / 64) * 64
++    start = (lengths - 512 - sq).clamp_min(0)
++    positions = start[:, None] + torch.arange(width, device=q.device)
++    pages = table.gather(1, (positions // 64).clamp_max(table.shape[1] - 1).long())
++    keys = kv.reshape(-1, dim)[pages.long() * 64 + positions % 64].to(dtype)
++    scores = torch.bmm(q.to(dtype).reshape(b, sq * heads, dim), keys.transpose(1, 2))
++    if dtype == torch.bfloat16:
++        scores = scores.float()
++    scores = scores.view(b, sq, heads, width) * scale
++    q_pos = lengths[:, None] - sq + torch.arange(sq, device=q.device)
++    valid = (positions[:, None, :] <= q_pos[:, :, None]) & (
++        positions[:, None, :] >= (q_pos - 512).clamp_min(0)[:, :, None]
++    )
++    probabilities = scores.masked_fill(~valid[:, :, None, :], -torch.inf).softmax(-1)
++    probabilities = probabilities.to(dtype).reshape(b, sq * heads, width)
++    values = keys[..., :1024]
++    output = torch.bmm(probabilities, values).view(b, sq, heads, 1024)
++    if with_abs:
++        return output, torch.bmm(probabilities, values.abs()).view_as(output)
++    return output
++
++
++def check_accuracy(actual, inputs, scale):
++    gold, weighted_abs = torch_reference(
++        *inputs, scale, dtype=torch.float64, with_abs=True
++    )
++    actual = actual.double()
++    diff = actual - gold
++    floor = 1e-5 * math.sqrt(1024)
++    relative_l2 = (diff.norm(dim=-1) / gold.norm(dim=-1).clamp_min(floor)).max().item()
++    budget_ratio = (diff.abs() / (4 * 2**-8 * weighted_abs + 1e-5)).max().item()
++    assert torch.isfinite(actual).all(), "Nonfinite output"
++    assert relative_l2 <= 2 * 2**-8, relative_l2
++    assert budget_ratio <= 1, budget_ratio
++    return dict(max_row_relative_l2=relative_l2, max_error_budget_ratio=budget_ratio)
++
++
++def capture(fn):
++    for _ in range(3):
++        fn()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        output = fn()
++    graph.replay()
++    torch.cuda.synchronize()
++    return graph, output
++
++
++def benchmark(args, b, sq):
++    device = torch.device("cuda")
++    pages = math.ceil(args.kv_len / 64)
++    q = torch.randn(b, sq, 64, 1088, dtype=torch.bfloat16, device=device)
++    kv = torch.randn(b * pages, 64, 1088, dtype=torch.bfloat16, device=device)
++    table = torch.arange(b * pages, dtype=torch.int32, device=device).view(b, pages)
++    lengths = torch.full((b,), args.kv_len, dtype=torch.int32, device=device)
++    workspace = torch.empty(
++        get_mla_swa_workspace_size_bytes(b, sq), dtype=torch.uint8, device=device
++    )
++    out = torch.empty(b, sq, 64, 1024, dtype=torch.bfloat16, device=device)
++
++    def native():
++        return batch_decode_with_kv_cache_mla_swa(
++            q,
++            kv,
++            workspace,
++            table,
++            lengths,
++            window_left=512,
++            sm_scale=args.scale,
++            out=out,
++        )
++
++    if args.autotune:
++        with flashinfer.autotune(True, cache=args.autotune_cache):
++            native()
++    functions = {
++        "flashinfer": native,
++        "pytorch_reference": lambda: torch_reference(q, kv, table, lengths, args.scale),
++    }
++    graphs = {name: capture(fn) for name, fn in functions.items()}
++    accuracy = (
++        check_accuracy(graphs["flashinfer"][1], (q, kv, table, lengths), args.scale)
++        if args.refcheck
++        else None
++    )
++    rounds = {name: [] for name in functions}
++    names = list(functions)
++    for index in range(args.rounds):
++        for name in names if index % 2 == 0 else reversed(names):
++            start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
++            start.record()
++            for _ in range(args.replays):
++                graphs[name][0].replay()
++            end.record()
++            end.synchronize()
++            rounds[name].append(start.elapsed_time(end) * 1000 / args.replays)
++    native_us, reference_us = (statistics.median(rounds[name]) for name in names)
++    return dict(
++        local_bs=b,
++        s_q=sq,
++        kv_len=args.kv_len,
++        window_left=512,
++        sm_scale=args.scale,
++        autotune=args.autotune,
++        flashinfer_us=native_us,
++        pytorch_reference_us=reference_us,
++        pytorch_reference_over_flashinfer=reference_us / native_us,
++        accuracy=accuracy,
++        rounds_us=rounds,
++    )
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 2, 4, 8, 16])
++    parser.add_argument("--q-lens", nargs="+", type=int, default=[1, 4])
++    parser.add_argument("--kv-len", type=int, default=4127)
++    parser.add_argument("--scale", type=float, default=0.0625)
++    parser.add_argument("--rounds", type=int, default=6)
++    parser.add_argument("--replays", type=int, default=200)
++    parser.add_argument("--refcheck", action="store_true")
++    parser.add_argument("--autotune", action="store_true")
++    parser.add_argument("--autotune-cache", default=None)
++    parser.add_argument("--output", type=Path, default=None)
++    args = parser.parse_args()
++    if any(b not in (1, 2, 4, 8, 16) for b in args.batch_sizes):
++        parser.error("batch sizes must be selected from 1, 2, 4, 8, 16")
++    if any(sq not in (1, 4) for sq in args.q_lens) or args.kv_len < max(args.q_lens):
++        parser.error("q-lens must be 1 or 4; kv-len must be >= every q-len")
++    if args.rounds < 1 or args.replays < 1 or not 0 < args.scale < float("inf"):
++        parser.error("rounds/replays and finite scale must be positive")
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
++        parser.error("an SM90 CUDA device is required")
++    torch.manual_seed(123)
++    metadata = dict(
++        gpu=torch.cuda.get_device_name(),
++        sm_count=torch.cuda.get_device_properties(0).multi_processor_count,
++        torch_version=torch.__version__,
++        cuda_version=torch.version.cuda,
++        flashinfer_version=flashinfer.__version__,
++        timing="interleaved CUDA Graph, complete op, warm cache; microseconds",
++        baseline="PyTorch reference; NOT the SGLang Triton fallback",
++    )
++    print(json.dumps(metadata), flush=True)
++    rows = []
++    for sq in args.q_lens:
++        for b in args.batch_sizes:
++            row = benchmark(args, b, sq)
++            rows.append(row)
++            print(json.dumps(row), flush=True)
++    if args.output:
++        args.output.parent.mkdir(parents=True, exist_ok=True)
++        args.output.write_text(json.dumps(dict(metadata=metadata, rows=rows), indent=2))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/csrc/mla_swa_sm90.cu b/csrc/mla_swa_sm90.cu
+new file mode 100644
+index 00000000000..f2bd737ec31
+--- /dev/null
++++ b/csrc/mla_swa_sm90.cu
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: Apache-2.0
++#include <cmath>
++#include <flashinfer/attention/mla_swa_sm90/launch.cuh>
++
++#include "tvm_ffi_utils.h"
++
++namespace {
++void check_tensor(TensorView t, TensorView q, DLDataType dtype) {
++  CHECK_CUDA(t);
++  CHECK_DEVICE(t, q);
++  CHECK_INPUT_TYPE(t, dtype);
++}
++
++bool device_supported(int64_t device) {
++  ffi::CUDADeviceGuard guard(device);
++  int major, minor, cluster, smem;
++  TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device),
++                    cudaSuccess);
++  TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device),
++                    cudaSuccess);
++  TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&cluster, cudaDevAttrClusterLaunch, device),
++                    cudaSuccess);
++  TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device),
++                    cudaSuccess);
++  return major == 9 && minor == 0 && cluster && smem >= 223584;
++}
++
++void run(TensorView q, TensorView kv, TensorView workspace, TensorView table, TensorView lengths,
++         TensorView out, double scale, int64_t window_left, int64_t tactic) {
++  check_tensor(q, q, dl_bfloat16);
++  check_tensor(kv, q, dl_bfloat16);
++  check_tensor(workspace, q, dl_uint8);
++  check_tensor(table, q, dl_int32);
++  check_tensor(lengths, q, dl_int32);
++  check_tensor(out, q, dl_bfloat16);
++  CHECK_DIM(4, q);
++  CHECK_DIM(3, kv);
++  CHECK_DIM(2, table);
++  CHECK_DIM(1, lengths);
++  CHECK_DIM(1, workspace);
++  CHECK_DIM(4, out);
++  const auto b = q.size(0), sq = q.size(1), h = q.size(2);
++  TVM_FFI_ICHECK(b == 1 || b == 2 || b == 4 || b == 8 || b == 16);
++  TVM_FFI_ICHECK(sq == 1 || sq == 4);
++  TVM_FFI_ICHECK_EQ(h, 64);
++  TVM_FFI_ICHECK_EQ(q.size(3), 1088);
++  TVM_FFI_ICHECK_EQ(kv.size(1), 64);
++  TVM_FFI_ICHECK_EQ(kv.size(2), 1088);
++  TVM_FFI_ICHECK_GT(kv.size(0), 0);
++  TVM_FFI_ICHECK_EQ(q.stride(3), 1);
++  TVM_FFI_ICHECK_EQ(q.stride(2), 1088);
++  TVM_FFI_ICHECK_EQ(q.stride(1), h * 1088);
++  TVM_FFI_ICHECK_GE(q.stride(0), sq * h * 1088);
++  TVM_FFI_ICHECK_EQ(kv.stride(2), 1);
++  TVM_FFI_ICHECK_EQ(kv.stride(1), 1088);
++  TVM_FFI_ICHECK_EQ(kv.stride(0), 64 * 1088);
++  TVM_FFI_ICHECK_EQ(table.size(0), b);
++  TVM_FFI_ICHECK_GT(table.size(1), 0);
++  TVM_FFI_ICHECK_EQ(table.stride(1), 1);
++  TVM_FFI_ICHECK_GE(table.stride(0), table.size(1));
++  TVM_FFI_ICHECK_EQ(lengths.size(0), b);
++  TVM_FFI_ICHECK_EQ(lengths.stride(0), 1);
++  TVM_FFI_ICHECK_EQ(workspace.stride(0), 1);
++  TVM_FFI_ICHECK_GE(workspace.numel(), flashinfer::mla_swa_sm90::workspace_bytes(b * sq * h));
++  TVM_FFI_ICHECK_EQ(out.size(0), b);
++  TVM_FFI_ICHECK_EQ(out.size(1), sq);
++  TVM_FFI_ICHECK_EQ(out.size(2), h);
++  TVM_FFI_ICHECK_EQ(out.size(3), 1024);
++  TVM_FFI_ICHECK_EQ(out.stride(3), 1);
++  TVM_FFI_ICHECK_EQ(out.stride(2), 1024);
++  TVM_FFI_ICHECK_EQ(out.stride(1), h * 1024);
++  TVM_FFI_ICHECK_EQ(out.stride(0), sq * h * 1024);
++  TVM_FFI_ICHECK_EQ(window_left, 512);
++  TVM_FFI_ICHECK(std::isfinite(scale) && scale > 0);
++  TVM_FFI_ICHECK(tactic >= 0 && tactic < 6);
++  for (auto t : {q, kv, workspace, out}) {
++    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16, 0);
++  }
++  TVM_FFI_ICHECK(device_supported(q.device().device_id))
++      << "Requires SM90 with cluster launch and 223584 bytes opt-in shared memory";
++  ffi::CUDADeviceGuard guard(q.device().device_id);
++  using namespace flashinfer::mla_swa_sm90;
++  Arguments a{static_cast<const cutlass::bfloat16_t*>(q.data_ptr()),
++              static_cast<const cutlass::bfloat16_t*>(kv.data_ptr()),
++              static_cast<const int*>(table.data_ptr()),
++              static_cast<const int*>(lengths.data_ptr()),
++              static_cast<cutlass::bfloat16_t*>(out.data_ptr()),
++              workspace.data_ptr(),
++              static_cast<int>(b),
++              static_cast<int>(sq),
++              static_cast<int>(h),
++              static_cast<int>(kv.size(0)),
++              static_cast<int>(table.size(1)),
++              513,
++              static_cast<float>(scale),
++              q.stride(0),
++              table.stride(0),
++              get_stream(q.device())};
++  cudaError_t status;
++  switch (tactic) {
++    case 0:
++      status = launch<mla_swa::M8S9>(a);
++      break;
++    case 1:
++      status = launch<mla_swa::M8S5>(a);
++      break;
++    case 2:
++      status = launch<mla_swa::M8S3>(a);
++      break;
++    case 3:
++      status = launch<mla_swa::M16S2>(a);
++      break;
++    case 4:
++      status = launch<mla_swa::M32S2>(a);
++      break;
++    case 5:
++      status = launch<mla_swa::M32S1>(a);
++      break;
++    default:
++      status = cudaErrorInvalidValue;
++  }
++  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << cudaGetErrorString(status);
++}
++}  // namespace
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, run);
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(device_supported, device_supported);
+diff --git a/docs/api/attention.rst b/docs/api/attention.rst
+index 3621e61f0e9..c59439fe192 100644
+--- a/docs/api/attention.rst
++++ b/docs/api/attention.rst
+@@ -217,6 +217,12 @@ and `DeepSeek-R1 <https://arxiv.org/abs/2501.12948>`_).
+ 
+ .. currentmodule:: flashinfer.mla
+ 
++Sliding-window MLA (SM90)
++-------------------------
++
++.. autofunction:: batch_decode_with_kv_cache_mla_swa
++.. autofunction:: get_mla_swa_workspace_size_bytes
++
+ PageAttention for MLA
+ ---------------------
+ 
+diff --git a/flashinfer/aot.py b/flashinfer/aot.py
+index 24e3d902987..3d52a1375b3 100644
+--- a/flashinfer/aot.py
++++ b/flashinfer/aot.py
+@@ -180,6 +180,7 @@
+ )
+ from .jit.mla import (
+     gen_mla_module,
++    gen_mla_swa_sm90_module,
+     gen_sparse_mla_sm120_module,
+ )
+ from .jit.cake_sparse_mla_sm120_dsv4_nvfp4 import (
+@@ -1255,6 +1256,9 @@ def gen_all_modules(
+             )
+         )
+ 
++    if has_sm90:
++        jit_specs.append(gen_mla_swa_sm90_module())
++
+     # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
+     if has_sm120 or has_sm121:
+         jit_specs.append(gen_sparse_mla_sm120_module())
+diff --git a/flashinfer/jit/mla.py b/flashinfer/jit/mla.py
+index be17b443141..4f621aabec6 100644
+--- a/flashinfer/jit/mla.py
++++ b/flashinfer/jit/mla.py
+@@ -32,6 +32,18 @@ def gen_mla_module() -> JitSpec:
+     )
+ 
+ 
++def gen_mla_swa_sm90_module() -> JitSpec:
++    """BF16 Page64 DOTS-style sliding-window MLA, six frozen SM90 tactics."""
++    return gen_jit_spec(
++        "mla_swa_sm90",
++        [jit_env.FLASHINFER_CSRC_DIR / "mla_swa_sm90.cu"],
++        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
++            supported_major_versions=[9]
++        )
++        + ["-O3", "--use_fast_math", "--expt-relaxed-constexpr"],
++    )
++
++
+ def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
+     """Compatibility alias: the NVFP4 route lives in the unified SM120 module."""
+     return gen_sparse_mla_sm120_module()
+diff --git a/flashinfer/mla/__init__.py b/flashinfer/mla/__init__.py
+index 4fc6be512cc..d1a523b361b 100644
+--- a/flashinfer/mla/__init__.py
++++ b/flashinfer/mla/__init__.py
+@@ -14,6 +14,10 @@
+ 
+ from ._core import *  # noqa: F401,F403
+ 
++_SWA_LAZY_EXPORTS = frozenset(
++    {"batch_decode_with_kv_cache_mla_swa", "get_mla_swa_workspace_size_bytes"}
++)
++
+ _PRIMS_TS_LAZY_EXPORTS = frozenset(
+     {
+         "get_prims_ts_batch_mla_decode_workspace_size",
+@@ -109,6 +113,12 @@
+ def __getattr__(name: str):
+     """Resolve lazily-exported MLA APIs without loading their runtime at import."""
+ 
++    if name in _SWA_LAZY_EXPORTS:
++        from . import _swa
++
++        value = getattr(_swa, name)
++        globals()[name] = value
++        return value
+     if name in _PRIMS_TS_LAZY_EXPORTS:
+         from ..attention.prims_ts import mla_decode as prims_ts_mla_decode
+ 
+@@ -170,6 +180,7 @@ def __dir__():
+     """Include lazily-exported names alongside the module globals."""
+     return sorted(
+         set(globals())
++        | _SWA_LAZY_EXPORTS
+         | _PRIMS_TS_LAZY_EXPORTS
+         | _SPARSE_MLA_SM120_LAZY_EXPORTS
+         | _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS
+diff --git a/flashinfer/mla/_swa.py b/flashinfer/mla/_swa.py
+new file mode 100644
+index 00000000000..3a24d935e8d
+--- /dev/null
++++ b/flashinfer/mla/_swa.py
+@@ -0,0 +1,321 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Page64 BF16 sliding-window MLA. SM120's packed FP8 sparse API is separate."""
++
++import functools
++import math
++from typing import Optional
++
++import torch
++
++from ..api_logging import flashinfer_api
++from ..autotuner import AutoTuner, TunableRunner, TuningConfig
++from ..jit.mla import gen_mla_swa_sm90_module
++from ..trace.templates.attention import mla_swa_decode_trace
++from ..utils import register_custom_op, register_fake_op
++
++_DEFAULT_TACTICS = {
++    (1, 1): 0,
++    (2, 1): 1,
++    (4, 1): 2,
++    (8, 1): 3,
++    (16, 1): 3,
++    (1, 4): 2,
++    (2, 4): 3,
++    (4, 4): 3,
++    (8, 4): 4,
++    (16, 4): 5,
++}
++
++
++@flashinfer_api
++def get_mla_swa_workspace_size_bytes(
++    batch_size: int, q_len_per_req: int, num_q_heads: int = 64
++) -> int:
++    """Return byte workspace capacity for every SM90 MLA+SWA tuning candidate.
++
++    Parameters
++    ----------
++    batch_size : int
++        Local batch size, one of 1, 2, 4, 8, 16.
++    q_len_per_req : int
++        Query length per request, 1 or 4.
++    num_q_heads : int
++        Local query head count; currently 64.
++
++    Returns
++    -------
++    int
++        Capacity for FP32 partial output and LSE with up to nine splits,
++        including 256-byte padding. The final output is not part of workspace.
++        Even DSM/direct calls require this capacity so autotune can change tactics.
++    """
++    if (batch_size, q_len_per_req) not in _DEFAULT_TACTICS or num_q_heads != 64:
++        raise ValueError("Qualified shapes: B1/2/4/8/16, q_len1/4, Hq64")
++    rows = batch_size * q_len_per_req * num_q_heads
++    return (rows * 9 * 1024 * 4 + 255) // 256 * 256 + (rows * 9 * 4 + 255) // 256 * 256
++
++
++@functools.cache
++def _get_module():
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError("Warm up MLA+SWA eagerly before CUDA Graph capture")
++    return gen_mla_swa_sm90_module().build_and_load()
++
++
++@functools.cache
++def _device_supported(device: torch.device) -> bool:
++    return torch.cuda.get_device_capability(device) == (9, 0) and bool(
++        _get_module().device_supported(device.index)
++    )
++
++
++def _validate(
++    query,
++    kv_cache,
++    workspace,
++    block_tables,
++    seq_lens,
++    out,
++    window_left,
++    sm_scale,
++    backend,
++):
++    if backend not in ("auto", "sm90"):
++        raise ValueError("MLA+SWA currently supports backend='auto' or 'sm90'")
++    tensors = (query, kv_cache, workspace, block_tables, seq_lens, out)
++    if any(not t.is_cuda or t.device != query.device for t in tensors):
++        raise ValueError("All tensors must be on the same CUDA device")
++    if query.ndim != 4 or query.shape[-2:] != (64, 1088):
++        raise ValueError("query must be [B, q_len_per_req, 64, 1088]")
++    b, sq, h, _ = query.shape
++    required = get_mla_swa_workspace_size_bytes(b, sq, h)
++    if (
++        query.dtype != torch.bfloat16
++        or kv_cache.dtype != torch.bfloat16
++        or out.dtype != torch.bfloat16
++    ):
++        raise ValueError("Q, KV and output must be BF16")
++    if query.stride()[-3:] != (h * 1088, 1088, 1) or query.stride(0) < sq * h * 1088:
++        raise ValueError("Q rows must be contiguous and batches must not overlap")
++    if (
++        kv_cache.ndim != 3
++        or kv_cache.shape[1:] != (64, 1088)
++        or not kv_cache.is_contiguous()
++        or kv_cache.shape[0] < 1
++    ):
++        raise ValueError("kv_cache must be contiguous [num_pages, 64, 1088]")
++    if (
++        block_tables.ndim != 2
++        or block_tables.shape[0] != b
++        or block_tables.shape[1] < 1
++        or block_tables.stride(1) != 1
++        or block_tables.stride(0) < block_tables.shape[1]
++    ):
++        raise ValueError("block_tables must be non-overlapping [B, max_pages] rows")
++    if (
++        seq_lens.shape != (b,)
++        or not seq_lens.is_contiguous()
++        or block_tables.dtype != torch.int32
++        or seq_lens.dtype != torch.int32
++    ):
++        raise ValueError("block_tables/seq_lens must be CUDA int32; seq_lens is [B]")
++    if (
++        workspace.dtype != torch.uint8
++        or workspace.ndim != 1
++        or not workspace.is_contiguous()
++        or workspace.numel() < required
++    ):
++        raise ValueError(
++            f"workspace must be a contiguous uint8 vector with at least {required} bytes"
++        )
++    if out.shape != (b, sq, h, 1024) or not out.is_contiguous():
++        raise ValueError("out must be contiguous [B, q_len_per_req, 64, 1024]")
++    if window_left != 512 or not math.isfinite(sm_scale) or sm_scale <= 0:
++        raise ValueError(
++            "Only window_left=512 and positive finite sm_scale are qualified"
++        )
++    if any(t.data_ptr() % 16 for t in (query, kv_cache, workspace, out)):
++        raise ValueError("Q/KV/workspace/out require 16-byte alignment")
++
++    # Writable buffers cannot alias inputs or each other, including strided views.
++    def extent(t):
++        n = 1 + sum(
++            (s - 1) * stride for s, stride in zip(t.shape, t.stride(), strict=False)
++        )
++        return t.data_ptr(), t.data_ptr() + n * t.element_size()
++
++    for target in (workspace, out):
++        lo, hi = extent(target)
++        for source in tensors:
++            if source is target:
++                continue
++            other_lo, other_hi = extent(source)
++            if max(lo, other_lo) < min(hi, other_hi):
++                raise ValueError(
++                    "Writable MLA+SWA buffers must not overlap any other tensor"
++                )
++    if not _device_supported(query.device):
++        raise ValueError(
++            "Requires SM90 cluster launch and sufficient opt-in shared memory"
++        )
++
++
++@register_custom_op("flashinfer::mla_swa_sm90", mutates_args=("workspace", "out"))
++def _run(
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    workspace: torch.Tensor,
++    block_tables: torch.Tensor,
++    seq_lens: torch.Tensor,
++    out: torch.Tensor,
++    sm_scale: float,
++    window_left: int,
++    tactic: int,
++) -> None:
++    _get_module().run(
++        query,
++        kv_cache,
++        workspace,
++        block_tables,
++        seq_lens,
++        out,
++        sm_scale,
++        window_left,
++        tactic,
++    )
++
++
++@register_fake_op("flashinfer::mla_swa_sm90")
++def _run_fake(
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    workspace: torch.Tensor,
++    block_tables: torch.Tensor,
++    seq_lens: torch.Tensor,
++    out: torch.Tensor,
++    sm_scale: float,
++    window_left: int,
++    tactic: int,
++) -> None:
++    pass
++
++
++def _profiling_inputs(inputs):
++    # Never profile random int32 page IDs or mutate caller metadata. No host
++    # metadata inspection is required; all dimensions stay exact (no bucketing).
++    q, kv, workspace, table, lengths, out = inputs
++    b, sq = q.shape[:2]
++    table = (
++        torch.arange(b * table.shape[1], device=q.device, dtype=torch.int32).reshape(
++            table.shape
++        )
++        % kv.shape[0]
++    )
++    context = min(table.shape[1] * 64, 4127)
++    lengths = torch.full((b,), context, device=q.device, dtype=torch.int32)
++    return [q, kv, workspace, table, lengths, out]
++
++
++class _Runner(TunableRunner):
++    def __init__(self, scale, window_left):
++        self.scale = scale
++        self.window_left = window_left
++
++    def get_cache_key_extras(self, inputs):
++        return ("sm90-bf16-page64-fp32-v1", self.scale, self.window_left)
++
++    def get_valid_tactics(self, inputs, profile):
++        return list(range(6))
++
++    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
++        if do_preparation:
++            _get_module()
++            return inputs[-1]
++        if tactic == -1:
++            tactic = _DEFAULT_TACTICS[tuple(inputs[0].shape[:2])]
++        _run(*inputs, self.scale, self.window_left, tactic)
++        return inputs[-1]
++
++
++@functools.cache
++def _runner(scale, window_left):
++    return _Runner(scale, window_left)
++
++
++_TUNING_CONFIG = TuningConfig(use_cuda_graph=True, inputs_pre_hook=_profiling_inputs)
++
++
++@flashinfer_api(trace=mla_swa_decode_trace)
++def batch_decode_with_kv_cache_mla_swa(
++    query: torch.Tensor,
++    kv_cache: torch.Tensor,
++    workspace_buffer: torch.Tensor,
++    block_tables: torch.Tensor,
++    seq_lens: torch.Tensor,
++    *,
++    window_left: int,
++    sm_scale: float,
++    out: Optional[torch.Tensor] = None,
++    backend: str = "auto",
++) -> torch.Tensor:
++    """Causal sliding-window MLA decode over a shared latent Page64 KV cache.
++
++    Parameters
++    ----------
++    query : torch.Tensor
++        BF16 ``[B, q_len_per_req, 64, 1088]``; B1/2/4/8/16 and q_len1/4.
++    kv_cache : torch.Tensor
++        BF16 contiguous ``[num_pages, 64, 1088]``. The first 1024 features
++        are both latent K and V; the last 64 features are positional K.
++        Attended K/V values must be finite. Masked page slots need not be
++        initialized; they do not contribute even if they contain NaN or Inf.
++    workspace_buffer : torch.Tensor
++        Caller-owned CUDA uint8 buffer sized by :func:`get_mla_swa_workspace_size_bytes`.
++        Do not share writable workspace across concurrent calls/streams.
++    block_tables : torch.Tensor
++        CUDA int32 ``[B, max_pages]``, mapping logical pages to physical pages.
++    seq_lens : torch.Tensor
++        CUDA int32 ``[B]``, total KV lengths **including** the query tokens.
++        Query i has position ``seq_lens[b] - q_len_per_req + i``. Valid
++        page IDs must be in range and each nonempty length must fit its table;
++        invalid metadata values are not checked synchronously. Zero-length
++        dummy rows produce zero output.
++    window_left : int
++        Number of past tokens; currently 512 (513 including the current token).
++    sm_scale : float
++        Positive finite attention scale, supplied by the model.
++    out : torch.Tensor, optional
++        Contiguous BF16 ``[B, q_len_per_req, 64, 1024]``. If omitted, allocated.
++        Pass a persistent output and warm up eagerly before Graph capture.
++    backend : str
++        ``"auto"`` or ``"sm90"``. Both use the SM90 implementation; there is
++        no hidden fallback to a different operator/precision on other devices.
++
++    Returns
++    -------
++    torch.Tensor
++        The supplied or newly allocated output. All split reductions retain
++        FP32 until the final BF16 write. Use ``flashinfer.autotune(True)``
++        before capture to search the six tactics; otherwise a frozen LUT is used.
++    """
++    if out is None:
++        out = torch.empty(
++            (*query.shape[:-1], 1024), device=query.device, dtype=query.dtype
++        )
++    scale = float(sm_scale)
++    _validate(
++        query,
++        kv_cache,
++        workspace_buffer,
++        block_tables,
++        seq_lens,
++        out,
++        window_left,
++        scale,
++        backend,
++    )
++    inputs = [query, kv_cache, workspace_buffer, block_tables, seq_lens, out]
++    runner, tactic = AutoTuner.get().choose_one(
++        "mla_swa_sm90", [_runner(scale, window_left)], _TUNING_CONFIG, inputs
++    )
++    return runner(inputs, tactic=tactic)
+diff --git a/flashinfer/trace/templates/attention.py b/flashinfer/trace/templates/attention.py
+index 2864570e879..a579e539732 100644
+--- a/flashinfer/trace/templates/attention.py
++++ b/flashinfer/trace/templates/attention.py
+@@ -49,6 +49,40 @@
+ from ._init_helpers import make_paged_kv_indices
+ 
+ 
++mla_swa_decode_trace = TraceTemplate(
++    op_type="mla_swa",
++    name_prefix="mla_swa_decode",
++    description="BF16 Page64 causal latent MLA sliding-window decode on SM90.",
++    axes={
++        "batch_size": Var(),
++        "q_len_per_req": Const(abbrev="sq"),
++        "num_heads": Const(abbrev="h"),
++        "head_dim_qk": Const(abbrev="d"),
++        "head_dim_v": Const(abbrev="dv", value=1024),
++        "num_pages": Var(),
++        "page_size": Const(abbrev="ps"),
++        "table_width": Var(),
++        "workspace_bytes": Var(),
++    },
++    inputs={
++        "query": Tensor(["batch_size", "q_len_per_req", "num_heads", "head_dim_qk"]),
++        "kv_cache": Tensor(["num_pages", "page_size", "head_dim_qk"]),
++        "workspace_buffer": Tensor(["workspace_bytes"]),
++        "block_tables": Tensor(["batch_size", "table_width"]),
++        "seq_lens": Tensor(["batch_size"]),
++        "window_left": Scalar("int32"),
++        "sm_scale": Scalar("float32"),
++        "backend": Scalar("string", optional=True),
++    },
++    outputs={
++        "output": Tensor(
++            ["batch_size", "q_len_per_req", "num_heads", "head_dim_v"],
++            dtype_from="query",
++        )
++    },
++)
++
++
+ def _attention_check(
+     reference_outputs,
+     actual_outputs,
+diff --git a/include/flashinfer/attention/mla_swa_sm90/FLASHMLA_LICENSE.txt b/include/flashinfer/attention/mla_swa_sm90/FLASHMLA_LICENSE.txt
+new file mode 100644
+index 00000000000..5c48bdc9f6e
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/FLASHMLA_LICENSE.txt
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2025 DeepSeek
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
+diff --git a/include/flashinfer/attention/mla_swa_sm90/NOTICE b/include/flashinfer/attention/mla_swa_sm90/NOTICE
+new file mode 100644
+index 00000000000..e9ade39dbac
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/NOTICE
+@@ -0,0 +1,6 @@
++This implementation develops the FlashMLA-style MLA attention framework for
++Hopper sliding-window decode. FlashMLA is Copyright (c) 2025 DeepSeek and
++licensed under MIT; its notice is retained in FLASHMLA_LICENSE.txt.
++
++CUTLASS/CuTe utilities are supplied by the existing FlashInfer CUTLASS
++submodule and retain their upstream license and copyright notices.
+diff --git a/include/flashinfer/attention/mla_swa_sm90/README.md b/include/flashinfer/attention/mla_swa_sm90/README.md
+new file mode 100644
+index 00000000000..f964157b204
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/README.md
+@@ -0,0 +1,49 @@
++# SM90 BF16 sliding-window MLA
++
++The public entry is `flashinfer.mla.batch_decode_with_kv_cache_mla_swa`.
++This is a dense Page64 latent cache, not SM120's sparse-index packed FP8 API.
++
++## Qualified contract
++
++- SM90 with cluster launch and at least 223584 bytes opt-in dynamic shared memory.
++- BF16 Q `[B, sq, 64, 1088]`, KV `[pages, 64, 1088]`, output `[B, sq, 64, 1024]`.
++- Local B in `{1,2,4,8,16}`, sq in `{1,4}`, window_left=512 (513 tokens inclusive).
++- CUDA int32 page table and total KV lengths; causal Q positions are `L-sq+i`.
++- Q/KV and the WGMMA probability tile are BF16. Scores, PV accumulators
++  and all split-reduction payloads/calculations are FP32; final output is BF16.
++- Caller-owned byte workspace is conservative across all tuning candidates.
++- Warm eagerly before capture; autotune is optional and uses the standard
++  FlashInfer context/cache. Serving does not read metadata values on the host.
++- No gradients, LSE output, cache quantization, DCP, cross attention, or prefill
++  support is implied. Invalid metadata values are caller errors.
++
++## Frozen tactic catalogue
++
++| ID | M | S | Mainloop | Reduction |
++|---|---:|---:|---|---|
++|0|8|9|Register softmax, owner PV|Global FP32 + combine|
++|1|8|5|Register softmax, owner PV|Global FP32 + combine|
++|2|8|3|Register softmax, owner PV|DSM FP32, row-packed|
++|3|16|2|Helper softmax, 4 lookahead slices|DSM FP32, natural fragment|
++|4|32|2|All-WG softmax|DSM FP32, natural fragment|
++|5|32|1|All-WG softmax|Direct|
++
++The device implementation retains the validated kernel's arithmetic and
++pipeline, with formatting normalized to FlashInfer's style. Torch-dependent
++host code is replaced by `launch.cuh` and the TVM-FFI binding.
++New tactics must be explicitly qualified; this is not an arbitrary
++M x S parameter product. The normal JitSpec is shared by JIT and AOT builds.
++
++## Reproduce
++
++```bash
++pytest tests/attention/test_mla_swa_sm90.py tests/trace/test_mla_swa.py
++python benchmarks/bench_mla_swa_sm90.py --refcheck --output results/mla_swa.json
++```
++
++The benchmark uses only FlashInfer and PyTorch, times the complete operation
++including any split combine with interleaved CUDA Graph replays, and checks an
++independent FP64 reference. Its PyTorch gather/mask baseline is not SGLang's
++Triton fallback; do not compare that baseline's speedup to historical SGLang
++fallback speedups. Use `--autotune --autotune-cache results/mla_swa_tuning.json`
++to benchmark startup-tuned dispatch instead of the default tactic catalogue.
+diff --git a/include/flashinfer/attention/mla_swa_sm90/config.cuh b/include/flashinfer/attention/mla_swa_sm90/config.cuh
+new file mode 100644
+index 00000000000..c860397012b
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/config.cuh
+@@ -0,0 +1,150 @@
++#pragma once
++#include <type_traits>
++
++namespace mla_swa {
++enum class Reduce { Direct, GlobalFP32, DSM };
++enum class Mailbox { None, RowPacked, NaturalFragment };
++enum class PartialForm { Normalized, Raw };
++enum class Protocol { RegisterSoftmax, HelperLookahead, AllWGSoftmax };
++enum class Producer { QKWarpStreams, LookaheadOwner, BaseOwner };
++enum class Arena { None, DeadKV, DeadQ };
++enum class ReduceSync { None, Cluster, PerWGReadyAck };
++
++template <int M_, int S_>
++struct ShapePolicy {
++  static constexpr int M = M_, S = S_, Page = 64, Dq = 1088, Dv = 1024, Slice = 64,
++                       VSliceCount = 16;
++};
++template <int PV_, int QKPV_, bool Interleave_>
++struct RolePolicy {
++  static constexpr int PvWG = PV_, QkPV = QKPV_, Threads = (PV_ + 1) * 128;
++  static constexpr bool Interleave = Interleave_;
++};
++template <int A, int B, bool Zero = false>
++struct QKPair {
++  static constexpr int first = A, second = B;
++  static constexpr bool zero = Zero;
++};
++template <int A, bool Zero = false>
++struct QKSingle {
++  static constexpr int first = A, second = -1;
++  static constexpr bool zero = Zero;
++};
++template <class... Ops>
++struct QKSequence {
++  static constexpr unsigned coverage =
++      ((unsigned(1) << Ops::first | (Ops::second < 0 ? 0 : unsigned(1) << Ops::second)) | ...);
++  static constexpr int tiles = ((Ops::second < 0 ? 1 : 2) + ...);
++  static_assert(coverage == (1u << 17) - 1 && tiles == 17, "QK must cover 17 slices exactly once");
++};
++using M8QK = QKSequence<QKPair<16, 0, true>, QKPair<1, 6>, QKPair<11, 2>, QKPair<7, 12>,
++                        QKPair<3, 8>, QKPair<13, 4>, QKPair<9, 14>, QKPair<5, 10>, QKSingle<15>>;
++using M32QK = QKSequence<QKSingle<16, true>, QKPair<0, 5>, QKPair<10, 1>, QKPair<6, 11>,
++                         QKPair<2, 7>, QKPair<12, 3>, QKPair<8, 13>, QKPair<4, 9>, QKPair<14, 15>>;
++template <int K>
++struct LookaheadQK {
++  static constexpr int lookahead = K;
++};
++template <int M, int K>
++struct SchedulePolicy {
++  static constexpr int LookAhead = K;
++  static constexpr Protocol Mainloop = M == 8    ? Protocol::RegisterSoftmax
++                                       : M == 16 ? Protocol::HelperLookahead
++                                                 : Protocol::AllWGSoftmax;
++  static constexpr Producer TmaProducer = M == 8    ? Producer::QKWarpStreams
++                                          : M == 16 ? Producer::LookaheadOwner
++                                                    : Producer::BaseOwner;
++  static constexpr bool StoreP0First = M == 16;
++  using QKProgram =
++      std::conditional_t<M == 8, M8QK, std::conditional_t<M == 32, M32QK, LookaheadQK<K>>>;
++};
++template <Reduce B, Mailbox L, PartialForm F, int M>
++struct ReducePolicy {
++  static constexpr Reduce Backend = B;
++  static constexpr Mailbox Payload = L;
++  static constexpr PartialForm PartialFormat = F;
++  static constexpr Arena MailboxArena = B != Reduce::DSM ? Arena::None
++                                        : M == 8         ? Arena::DeadKV
++                                                         : Arena::DeadQ;
++  static constexpr ReduceSync Synchronization = B != Reduce::DSM ? ReduceSync::None
++                                                : M == 32        ? ReduceSync::PerWGReadyAck
++                                                                 : ReduceSync::Cluster;
++  static constexpr int VectorWords = B != Reduce::DSM ? 0 : M == 8 ? 2 : 4;
++};
++template <class Shape, class Roles, class Schedule, class Merge>
++struct AttentionTactic : Shape, Roles, Schedule, Merge {
++  using ShapeTraits = Shape;
++  using RoleTraits = Roles;
++  using ScheduleTraits = Schedule;
++  using ReduceTraits = Merge;
++  static constexpr bool DenseRowMailbox = Shape::M == 8 && Merge::Payload == Mailbox::RowPacked &&
++                                          (Shape::VSliceCount - Roles::QkPV) % Roles::PvWG == 0;
++  static constexpr int StorageKind = Shape::M == 8                   ? 0
++                                     : Shape::M == 16                ? 1
++                                     : Merge::Backend == Reduce::DSM ? 3
++                                                                     : 2;
++  static_assert((Merge::Backend == Reduce::Direct) == (Shape::S == 1));
++  static_assert(
++      (Shape::M == 8 && Roles::PvWG == 3 && Roles::QkPV == 1 && !Roles::Interleave &&
++       Schedule::LookAhead == 0 &&
++       ((Shape::S == 3 && Merge::Backend == Reduce::DSM && Merge::Payload == Mailbox::RowPacked &&
++         Merge::PartialFormat == PartialForm::Raw) ||
++        ((Shape::S == 5 || Shape::S == 9) && Merge::Backend == Reduce::GlobalFP32 &&
++         Merge::Payload == Mailbox::None && Merge::PartialFormat == PartialForm::Normalized))) ||
++          (Shape::M == 16 && Shape::S == 2 && Roles::PvWG == 4 && Roles::QkPV == 0 &&
++           Roles::Interleave && Schedule::LookAhead == 4 && Merge::Backend == Reduce::DSM &&
++           Merge::Payload == Mailbox::NaturalFragment &&
++           Merge::PartialFormat == PartialForm::Raw) ||
++          (Shape::M == 32 && Roles::PvWG == 3 && Roles::QkPV == 0 && !Roles::Interleave &&
++           Schedule::LookAhead == 0 &&
++           ((Shape::S == 1 && Merge::Backend == Reduce::Direct &&
++             Merge::Payload == Mailbox::None) ||
++            (Shape::S == 2 && Merge::Backend == Reduce::DSM &&
++             Merge::Payload == Mailbox::NaturalFragment &&
++             Merge::PartialFormat == PartialForm::Raw))),
++      "Only the six frozen tactics are supported; not an arbitrary parameter product");
++};
++template <int M, int S, int PV, int QKPV, bool Interleave, int K, Reduce B, Mailbox L,
++          PartialForm F = PartialForm::Normalized>
++using KernelConfig = AttentionTactic<ShapePolicy<M, S>, RolePolicy<PV, QKPV, Interleave>,
++                                     SchedulePolicy<M, K>, ReducePolicy<B, L, F, M>>;
++
++template <class C>
++struct PVOwnership {
++  static constexpr int Remaining = C::VSliceCount - C::QkPV;
++  static constexpr int MaxSlices = (Remaining + C::PvWG - 1) / C::PvWG;
++  __host__ __device__ static constexpr int begin(int group) {
++    return C::QkPV + (C::Interleave ? group : Remaining * group / C::PvWG);
++  }
++  __host__ __device__ static constexpr int end(int group) {
++    return C::Interleave ? C::VSliceCount : C::QkPV + Remaining * (group + 1) / C::PvWG;
++  }
++  static constexpr int Stride = C::Interleave ? C::PvWG : 1;
++  __host__ __device__ static constexpr int slice(int group, int local) {
++    return begin(group) + local * Stride;
++  }
++};
++template <class C>
++struct RowOwnership {
++  __host__ __device__ static constexpr int begin(int rank) { return C::M * rank / C::S; }
++  __host__ __device__ static constexpr int end(int rank) { return C::M * (rank + 1) / C::S; }
++};
++template <class C>
++struct EventTraits {
++  static constexpr int Threads = C::Threads, WGThreads = 128, PVThreads = C::PvWG * 128;
++  static constexpr int ScoreReady = C::M == 8 ? -1 : 8;
++  static constexpr int PReady = C::M == 32 ? 9 : -1;
++  static constexpr int PFree = C::M == 32 ? 10 : -1;
++  static constexpr int HelperDone = C::M == 16 ? 9 : -1;
++  // Named barrier numbers above are documentation contracts; the exact
++  // instructions remain in the validated protocol primitives.
++};
++using M8S9 = KernelConfig<8, 9, 3, 1, false, 0, Reduce::GlobalFP32, Mailbox::None>;
++using M8S5 = KernelConfig<8, 5, 3, 1, false, 0, Reduce::GlobalFP32, Mailbox::None>;
++using M8S3 = KernelConfig<8, 3, 3, 1, false, 0, Reduce::DSM, Mailbox::RowPacked, PartialForm::Raw>;
++using M16S2 =
++    KernelConfig<16, 2, 4, 0, true, 4, Reduce::DSM, Mailbox::NaturalFragment, PartialForm::Raw>;
++using M32S2 =
++    KernelConfig<32, 2, 3, 0, false, 0, Reduce::DSM, Mailbox::NaturalFragment, PartialForm::Raw>;
++using M32S1 = KernelConfig<32, 1, 3, 0, false, 0, Reduce::Direct, Mailbox::None>;
++}  // namespace mla_swa
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/accumulator.cuh b/include/flashinfer/attention/mla_swa_sm90/device/accumulator.cuh
+new file mode 100644
+index 00000000000..824ec2da666
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/accumulator.cuh
+@@ -0,0 +1,33 @@
++#pragma once
++template <class T, class Fragment, class Plan>
++__forceinline__ __device__ void rescale_output_fragment(Fragment& output, Plan& plan, int lane) {
++#pragma unroll
++  for (int group = 0; group < T::BLOCK_M / 8; ++group) {
++    const int n0 = group * 8 + (lane % 4) * 2, n1 = n0 + 1, base = group * 4;
++    output(base + 0) *= plan.row_scale[n0];
++    output(base + 1) *= plan.row_scale[n1];
++    output(base + 2) *= plan.row_scale[n0];
++    output(base + 3) *= plan.row_scale[n1];
++  }
++}
++template <class T, class Fragment, class VTile, class P>
++__forceinline__ __device__ void issue_pv_gemm(Fragment& output, VTile const& v_tile, P const& sP,
++                                              int idx) {
++  typename T::TiledMMAPV mma;
++  auto thread_mma = mma.get_slice(idx);
++  Tensor a = thread_mma.partition_fragment_A(v_tile);
++  Tensor b = thread_mma.partition_fragment_B(sP);
++  issue_wgmma<false>(mma, a, b, output);
++}
++__forceinline__ __device__ float raw_exp_weight(float maximum, float sum, float common_max) {
++  return sum > 0.0f ? exp2f(maximum - common_max) : 0.0f;
++}
++__forceinline__ __device__ float2 raw_pair_weights(float local_max, float local_sum, float peer_max,
++                                                   float peer_sum) {
++  const float maximum = fmaxf(local_max, peer_max);
++  const float a = raw_exp_weight(local_max, local_sum, maximum);
++  const float b = raw_exp_weight(peer_max, peer_sum, maximum);
++  const float denominator = a * local_sum + b * peer_sum;
++  const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
++  return make_float2(a * inv, b * inv);
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/attention.cuh b/include/flashinfer/attention/mla_swa_sm90/device/attention.cuh
+new file mode 100644
+index 00000000000..a28936f92b2
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/attention.cuh
+@@ -0,0 +1,168 @@
++#pragma once
++template <class T, class KV, class Plan, class TMA>
++__forceinline__ __device__ void bootstrap_regular_kv(KV& sKV, Plan& plan, int physical_page,
++                                                     TMA const& tma_params) {
++  if (threadIdx.x == 128 && physical_page >= 0) {
++    Tensor gkv = tma_params.tma_k.get_tma_tensor(tma_params.shape_k)(_, _, physical_page);
++    launch_kv_tma<16, T::NUM_K_TILES>(gkv, sKV, tma_params.tma_k, plan.kv_barriers, 0);
++    launch_kv_tma<0, 16>(gkv, sKV, tma_params.tma_k, plan.kv_barriers, 0);
++#pragma unroll
++    for (int tile = 0; tile < T::NUM_K_TILES; ++tile)
++      plan.kv_barriers[tile].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K *
++                                                  sizeof(typename T::InputT));
++  }
++}
++
++template <class T, class Q, class Plan, class TMA>
++__forceinline__ __device__ void bootstrap_q(Q& sQ, Plan& plan, int batch_idx, int m_block_idx,
++                                            TMA const& tma_params) {
++  if (threadIdx.x == 0) {
++    Tensor gq = tma_params.tma_q.get_tma_tensor(tma_params.shape_q)(_, _, batch_idx);
++    auto thr_tma = tma_params.tma_q.get_slice(_0{});
++    Tensor q_tile =
++        flat_divide(gq, Shape<Int<T::BLOCK_M>, Int<T::HEAD_DIM_K>>{})(_, _, m_block_idx, _0{});
++    cute::copy(
++        tma_params.tma_q.with(reinterpret_cast<typename TMABarrier::ValueType&>(plan.q_barrier),
++                              uint16_t{0}, cute::TMA::CacheHintSm90::EVICT_FIRST),
++        thr_tma.partition_S(q_tile), thr_tma.partition_D(sQ));
++    plan.q_barrier.arrive_and_expect_tx(T::BLOCK_M * T::HEAD_DIM_K * sizeof(typename T::InputT));
++  }
++}
++
++template <class T, class TMA>
++__forceinline__ __device__ void attention_body(
++    const typename T::InputT* q, const typename T::InputT* kv, const int* block_table,
++    const int* cache_seqlens, typename T::InputT* out, float* lse, int num_splits,
++    int64_t out_stride_split, int batch_size, int s_q, int num_heads, int max_pages,
++    int window_size, float softmax_scale, int64_t q_stride_b, int64_t q_stride_s,
++    int64_t q_stride_h, int64_t kv_stride_token, int64_t block_table_stride_b, int64_t out_stride_b,
++    int64_t out_stride_s, int64_t out_stride_h, TMA const& tma_params) {
++  using C = typename T::Config;
++  using InputT = typename T::InputT;
++  extern __shared__ char shared_raw[];
++  auto& plan = *reinterpret_cast<typename T::SharedMemoryPlan*>(shared_raw);
++  Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), typename T::SmemLayoutQ{});
++  Tensor sKV = make_tensor(make_smem_ptr(plan.kv.data()), typename T::SmemLayoutKV{});
++  Tensor sP = make_tensor(make_smem_ptr(plan.p.data()), typename T::SmemLayoutP{});
++  Tensor sV = make_tensor(make_smem_ptr(plan.kv.data()), typename T::SmemLayoutV{});
++  const int warpgroup = threadIdx.x / 128;
++  const int idx_in_warpgroup = threadIdx.x % 128;
++  const int warp_in_group = idx_in_warpgroup / 32;
++  const int lane = idx_in_warpgroup % 32;
++  const int batch_idx = C::Backend == mla_swa::Reduce::DSM ? blockIdx.x / C::S : blockIdx.x;
++  const int split_idx = C::Backend == mla_swa::Reduce::DSM ? blockIdx.x % C::S : blockIdx.z;
++  const int grid_m_block_idx = blockIdx.y;
++  const int total_rows = s_q * num_heads;
++  const int total_m_blocks = (total_rows + T::BLOCK_M - 1) / T::BLOCK_M;
++  if (threadIdx.x == 0) {
++    cute::prefetch_tma_descriptor(tma_params.tma_q.get_tma_descriptor());
++    cute::prefetch_tma_descriptor(tma_params.tma_k.get_tma_descriptor());
++  }
++  role_barrier();
++#pragma unroll
++  for (int row_group_idx = 0; row_group_idx < 1; ++row_group_idx) {
++    const int m_block_idx = grid_m_block_idx + row_group_idx;
++    if (m_block_idx >= total_m_blocks) break;
++    if (threadIdx.x == 0) {
++      plan.q_barrier.init(1);
++      if constexpr (C::LookAhead > 0) {
++        plan.pv_done_barrier.init(T::NUM_PV_WARPGROUPS);
++        plan.softmax_score_ready.init(1);
++        plan.softmax_done.init(T::NUM_PV_WARPGROUPS);
++      }
++      if constexpr (C::M == 32 && C::Backend == mla_swa::Reduce::DSM) {
++        for (int event = 0; event < 4; ++event) {
++          plan.p1_ready[event].init(1);
++          plan.p1_ack[event].init(event == 0 ? 1 : 4);
++        }
++        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
++      }
++#pragma unroll
++      for (int tile = 0; tile < T::NUM_K_TILES; ++tile) plan.kv_barriers[tile].init(1);
++      if constexpr (C::LookAhead > 0) {
++#pragma unroll
++        for (int slot = 0; slot < T::LOOKAHEAD_K + T::AUX_GUARD_SLICES; ++slot)
++          plan.aux_kv_barriers[slot].init(1);
++      }
++#pragma unroll
++      for (int tile = 0; tile < T::NUM_V_TILES; ++tile) plan.kv_free_barriers[tile].init(1);
++      cutlass::arch::fence_view_async_shared();
++    }
++    role_barrier();
++    if constexpr (C::M == 32 && C::Backend == mla_swa::Reduce::DSM) cute::cluster_arrive();
++    // Preserve original prologue order: M16 issues Q before reading scheduler
++    // metadata; the other protocols compute their first page before issuing Q.
++    if constexpr (C::LookAhead > 0) bootstrap_q<T>(sQ, plan, batch_idx, m_block_idx, tma_params);
++    const int cache_len = cache_seqlens[batch_idx];
++    const int union_left = max(cache_len - window_size - s_q + 1, 0);
++    const int full_start_page = union_left / T::BLOCK_N;
++    // Graph padding may have length zero and an entirely sentinel page table.
++    // Do not run masked PV against uninitialized KV: 0 * NaN is still NaN.
++    const int full_end_page = (max(cache_len, 0) + T::BLOCK_N - 1) / T::BLOCK_N;
++    const int total_pages = full_end_page - full_start_page;
++    const int start_page =
++        full_start_page +
++        static_cast<int>((static_cast<int64_t>(total_pages) * split_idx) / num_splits);
++    const int end_page =
++        full_start_page +
++        static_cast<int>((static_cast<int64_t>(total_pages) * (split_idx + 1)) / num_splits);
++    InputT* role_out = out;
++    if constexpr (C::Backend == mla_swa::Reduce::GlobalFP32)
++      role_out += split_idx * out_stride_split;
++    if constexpr (C::LookAhead == 0) {
++      const int first_physical_page =
++          start_page < end_page && start_page < max_pages
++              ? block_table[batch_idx * block_table_stride_b + start_page]
++              : -1;
++      bootstrap_q<T>(sQ, plan, batch_idx, m_block_idx, tma_params);
++      bootstrap_regular_kv<T>(sKV, plan, first_physical_page, tma_params);
++    }
++    if constexpr (C::LookAhead > 0) {
++      plan.q_barrier.wait(0);
++      if (threadIdx.x < T::BLOCK_M) {
++        plan.row_max[threadIdx.x] = -CUDART_INF_F;
++        plan.row_sum[threadIdx.x] = 0.0f;
++        plan.row_scale[threadIdx.x] = 0.0f;
++      }
++    } else {
++      if (threadIdx.x >= 128 && threadIdx.x < 128 + T::BLOCK_M) {
++        const int row = threadIdx.x - 128;
++        plan.row_max[row] = -CUDART_INF_F;
++        plan.row_sum[row] = 0.0f;
++        plan.row_scale[row] = 0.0f;
++      }
++      plan.q_barrier.wait(0);
++    }
++    role_barrier();
++    if (warpgroup == 0) {
++      run_qk_role<C::QkPV, T>(sQ, sKV, sP, sV, plan, block_table, role_out, batch_idx, m_block_idx,
++                              total_rows, s_q, num_heads, max_pages, cache_len, start_page,
++                              end_page, window_size, softmax_scale, block_table_stride_b,
++                              out_stride_b, out_stride_s, out_stride_h, idx_in_warpgroup,
++                              warp_in_group, lane, tma_params);
++      if constexpr (C::M == 16) {
++        if (split_idx == 0)
++          dsm_direct_accum_qk_s2<0, T>(plan, idx_in_warpgroup);
++        else
++          dsm_direct_accum_qk_s2<1, T>(plan, idx_in_warpgroup);
++      }
++    } else {
++      run_pv_role<T>(sKV, sP, sV, plan, block_table, role_out, batch_idx, m_block_idx, total_rows,
++                     s_q, num_heads, max_pages, cache_len, start_page, end_page, window_size,
++                     softmax_scale, warpgroup, idx_in_warpgroup, warp_in_group, lane,
++                     block_table_stride_b, out_stride_b, out_stride_s, out_stride_h, tma_params);
++    }
++    if constexpr (C::Backend == mla_swa::Reduce::GlobalFP32) {
++      if (warpgroup == 0 && idx_in_warpgroup < T::BLOCK_M) {
++        const int global_row = m_block_idx * T::BLOCK_M + idx_in_warpgroup;
++        if (global_row < total_rows) {
++          const float sum = plan.row_sum[idx_in_warpgroup];
++          const float row_lse =
++              sum > 0.0f ? plan.row_max[idx_in_warpgroup] + log2f(sum) : -CUDART_INF_F;
++          lse[(batch_idx * total_rows + global_row) * num_splits + split_idx] = row_lse;
++        }
++      }
++    }
++    if constexpr (C::M == 16 || C::Backend == mla_swa::Reduce::GlobalFP32) role_barrier();
++  }
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/combine.cuh b/include/flashinfer/attention/mla_swa_sm90/device/combine.cuh
+new file mode 100644
+index 00000000000..b0b1b8909e7
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/combine.cuh
+@@ -0,0 +1,50 @@
++template <class InputT, int HeadDimV = 1024, int MaxSplits = 2, class PartialT = float>
++__global__ void dense_swa_roles_split_combine_kernel(const PartialT* partial, const float* lse,
++                                                     InputT* out, int total_rows, int num_splits) {
++  const int row = blockIdx.x;
++  if (row >= total_rows) {
++    return;
++  }
++  __shared__ float weights[MaxSplits];
++  __shared__ float weight_sum;
++  if (threadIdx.x == 0) {
++    float row_max = -CUDART_INF_F;
++#pragma unroll
++    for (int split = 0; split < MaxSplits; ++split) {
++      if (split < num_splits) {
++        row_max = fmaxf(row_max, lse[row * num_splits + split]);
++      }
++    }
++    float sum = 0.0f;
++#pragma unroll
++    for (int split = 0; split < MaxSplits; ++split) {
++      if (split < num_splits) {
++        const float value = lse[row * num_splits + split];
++        const float weight = isfinite(value) ? exp2f(value - row_max) : 0.0f;
++        weights[split] = weight;
++        sum += weight;
++      }
++    }
++    weight_sum = sum;
++  }
++  __syncthreads();
++  const float inv_sum = weight_sum > 0.0f ? 1.0f / weight_sum : 0.0f;
++  float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++#pragma unroll
++  for (int split = 0; split < MaxSplits; ++split) {
++    if (split < num_splits) {
++      const float weight = weights[split];
++      const PartialT* split_row = partial + (row * num_splits + split) * HeadDimV;
++#pragma unroll
++      for (int item = 0; item < 4; ++item) {
++        const int dim = threadIdx.x + item * 256;
++        values[item] += weight * float(split_row[dim]);
++      }
++    }
++  }
++#pragma unroll
++  for (int item = 0; item < 4; ++item) {
++    const int dim = threadIdx.x + item * 256;
++    out[row * HeadDimV + dim] = InputT(values[item] * inv_sum);
++  }
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/contracts.cuh b/include/flashinfer/attention/mla_swa_sm90/device/contracts.cuh
+new file mode 100644
+index 00000000000..54151e4946d
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/contracts.cuh
+@@ -0,0 +1,28 @@
++
++template <class C>
++struct PVRoleOps;
++template <class T>
++struct SplitOutputTraits : T {
++  using InputT = std::conditional_t<T::Config::Backend == mla_swa::Reduce::GlobalFP32, float,
++                                    typename T::InputT>;
++};
++template <typename T>
++struct DsmDirectAccumLayout {
++  static constexpr int kPvGroups = T::Config::PvWG;
++  static constexpr int kSlicesPerPvGroup = mla_swa::PVOwnership<typename T::Config>::MaxSlices;
++  static constexpr int kPayloadWordsPerThreadPerSlice = 4;
++  static constexpr int kThreadsPerWarpgroup = 128;
++  static constexpr int kMailboxWords =
++      kPvGroups * kSlicesPerPvGroup * kPayloadWordsPerThreadPerSlice * kThreadsPerWarpgroup;
++  static constexpr int kRowsPerOwner = T::BLOCK_M / 2;
++  static constexpr int kStateFloats =
++      kRowsPerOwner * ((T::Config::PartialFormat == mla_swa::PartialForm::Raw) ? 2 : 1);
++};
++struct PVTask {
++  const int* block_table;
++  int batch_idx, m_block_idx, total_rows, s_q, num_heads, max_pages, cache_len;
++  int start_page, end_page, window_size;
++  float softmax_scale;
++  int warpgroup, idx_in_warpgroup, warp_in_group, lane;
++  int64_t block_table_stride_b, out_stride_b, out_stride_s, out_stride_h;
++};
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/entries.cuh b/include/flashinfer/attention/mla_swa_sm90/device/entries.cuh
+new file mode 100644
+index 00000000000..2d70f855d46
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/entries.cuh
+@@ -0,0 +1,44 @@
++template <typename T, typename TmaParamsT>
++__global__ void __launch_bounds__(T::NUM_THREADS, 1)
++    dense_swa_wgmma_roles_kernel(const typename T::InputT* q, const typename T::InputT* kv,
++                                 const int* block_table, const int* cache_seqlens,
++                                 typename T::InputT* out, float* lse, int num_splits,
++                                 int64_t out_stride_split, int batch_size, int s_q, int num_heads,
++                                 int max_pages, int window_size, float softmax_scale,
++                                 int64_t q_stride_b, int64_t q_stride_s, int64_t q_stride_h,
++                                 int64_t kv_stride_token, int64_t block_table_stride_b,
++                                 int64_t out_stride_b, int64_t out_stride_s, int64_t out_stride_h,
++                                 __grid_constant__ const TmaParamsT tma_params) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
++  attention_body<T>(q, kv, block_table, cache_seqlens, out, lse, num_splits, out_stride_split,
++                    batch_size, s_q, num_heads, max_pages, window_size, softmax_scale, q_stride_b,
++                    q_stride_s, q_stride_h, kv_stride_token, block_table_stride_b, out_stride_b,
++                    out_stride_s, out_stride_h, tma_params);
++#endif
++}
++
++template <typename T, typename TmaParamsT>
++__global__ void __launch_bounds__(T::NUM_THREADS, 1)
++    dense_swa_direct_kernel(const typename T::InputT* q, const typename T::InputT* kv,
++                            const int* block_table, const int* cache_seqlens,
++                            typename T::InputT* out, int batch_size, int s_q, int num_heads,
++                            int max_pages, int window_size, float softmax_scale, int64_t q_stride_b,
++                            int64_t q_stride_s, int64_t q_stride_h, int64_t kv_stride_token,
++                            int64_t block_table_stride_b, int64_t out_stride_b,
++                            int64_t out_stride_s, int64_t out_stride_h,
++                            __grid_constant__ const TmaParamsT tma_params) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
++  attention_body<T>(q, kv, block_table, cache_seqlens, out, nullptr, 1, int64_t{0}, batch_size, s_q,
++                    num_heads, max_pages, window_size, softmax_scale, q_stride_b, q_stride_s,
++                    q_stride_h, kv_stride_token, block_table_stride_b, out_stride_b, out_stride_s,
++                    out_stride_h, tma_params);
++#endif
++}
++
++template <class T, class TMA>
++auto tactic_kernel_pointer() {
++  if constexpr (T::Config::Backend == mla_swa::Reduce::Direct)
++    return &dense_swa_direct_kernel<T, TMA>;
++  else
++    return &dense_swa_wgmma_roles_kernel<T, TMA>;
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/gemm.cuh b/include/flashinfer/attention/mla_swa_sm90/device/gemm.cuh
+new file mode 100644
+index 00000000000..5afeb53d009
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/gemm.cuh
+@@ -0,0 +1,139 @@
++#pragma once
++
++template <int Tile, typename T, typename TiledMMA, typename TensorA, typename TensorB,
++          typename TensorScore>
++__forceinline__ __device__ void issue_qk_tile_ops(TiledMMA& qk_mma, TensorA const& qk_a,
++                                                  TensorB const& qk_b, TensorScore& score) {
++  static_assert(Tile < T::NUM_K_TILES);
++  static_assert(T::TILE_K == 64);
++  CUTLASS_PRAGMA_UNROLL
++  for (int k16 = 0; k16 < T::TILE_K / 16; ++k16) {
++    cute::gemm(qk_mma, qk_a(_, _, Tile * (T::TILE_K / 16) + k16),
++               qk_b(_, _, Tile * (T::TILE_K / 16) + k16), score);
++    qk_mma.accumulate_ = GMMA::ScaleOut::One;
++  }
++}
++
++template <int Tile0, int Tile1, bool ZeroInit, typename T, typename TiledMMA, typename TensorA,
++          typename TensorB, typename TensorScore, typename Plan>
++__forceinline__ __device__ void issue_qk_ready_pair(TiledMMA& qk_mma, TensorA const& qk_a,
++                                                    TensorB const& qk_b, TensorScore& score,
++                                                    Plan& plan, bool kv_phase) {
++  plan.kv_barriers[Tile0].wait(kv_phase);
++  plan.kv_barriers[Tile1].wait(kv_phase);
++  warpgroup_arrive();
++  qk_mma.accumulate_ = ZeroInit ? GMMA::ScaleOut::Zero : GMMA::ScaleOut::One;
++  issue_qk_tile_ops<Tile0, T>(qk_mma, qk_a, qk_b, score);
++  issue_qk_tile_ops<Tile1, T>(qk_mma, qk_a, qk_b, score);
++  warpgroup_commit_batch();
++  warpgroup_wait<1>();
++}
++
++template <int Tile, bool ZeroInit, typename T, typename TiledMMA, typename TensorA,
++          typename TensorB, typename TensorScore, typename Plan>
++__forceinline__ __device__ void issue_qk_ready_single(TiledMMA& qk_mma, TensorA const& qk_a,
++                                                      TensorB const& qk_b, TensorScore& score,
++                                                      Plan& plan, bool kv_phase) {
++  plan.kv_barriers[Tile].wait(kv_phase);
++  warpgroup_arrive();
++  qk_mma.accumulate_ = ZeroInit ? GMMA::ScaleOut::Zero : GMMA::ScaleOut::One;
++  issue_qk_tile_ops<Tile, T>(qk_mma, qk_a, qk_b, score);
++  warpgroup_commit_batch();
++  warpgroup_wait<1>();
++}
++
++template <typename T, bool WaitForCompletion = true, typename TensorOutput, typename TensorSP,
++          typename Plan>
++__forceinline__ __device__ void issue_aux_pv_dynamic(TensorOutput& output_fragment,
++                                                     TensorSP const& sP, Plan& plan, int slot,
++                                                     int idx_in_warpgroup) {
++  Tensor sAuxV =
++      make_tensor(make_smem_ptr(plan.aux_kv[slot].data()), typename T::SmemLayoutVSlice{});
++  typename T::TiledMMAPV mma;
++  auto thread_mma = mma.get_slice(idx_in_warpgroup);
++  Tensor a = thread_mma.partition_fragment_A(sAuxV);
++  Tensor b = thread_mma.partition_fragment_B(sP);
++  issue_wgmma<false, WaitForCompletion>(mma, a, b, output_fragment);
++}
++
++template <int Tile, int Slot, bool ZeroInit, typename T, typename TiledMMA, typename TensorA,
++          typename TensorB, typename TensorScore, typename Plan>
++__forceinline__ __device__ void issue_qk_ready_lookahead_single(
++    TiledMMA& qk_mma, TensorA const& qk_a, TensorB const& qk_b, TensorScore& score, Plan& plan,
++    int idx_in_warpgroup, bool use_aux, bool stage_phase) {
++  static_assert(T::LOOKAHEAD_K > 0);
++  static_assert(Tile == T::NUM_V_TILES - T::LOOKAHEAD_K + Slot);
++  if (!use_aux) {
++    issue_qk_ready_single<Tile, ZeroInit, T>(qk_mma, qk_a, qk_b, score, plan, stage_phase);
++    return;
++  }
++  plan.aux_kv_barriers[Slot + T::AUX_GUARD_SLICES].wait(stage_phase);
++  Tensor sAux = make_tensor(make_smem_ptr(plan.aux_kv[Slot + T::AUX_GUARD_SLICES].data()),
++                            typename T::SmemLayoutKVSlice{});
++  auto qk_thread = qk_mma.get_slice(idx_in_warpgroup);
++  Tensor aux_a = qk_thread.partition_fragment_A(sAux);
++  warpgroup_arrive();
++  qk_mma.accumulate_ = ZeroInit ? GMMA::ScaleOut::Zero : GMMA::ScaleOut::One;
++  CUTLASS_PRAGMA_UNROLL
++  for (int k16 = 0; k16 < T::TILE_K / 16; ++k16) {
++    cute::gemm(qk_mma, aux_a(_, _, k16), qk_b(_, _, Tile * (T::TILE_K / 16) + k16), score);
++    qk_mma.accumulate_ = GMMA::ScaleOut::One;
++  }
++  warpgroup_commit_batch();
++  warpgroup_wait<1>();
++}
++
++template <int Slot, typename T, bool ZeroInitFirst = true, typename TiledMMA, typename TensorA,
++          typename TensorB, typename TensorScore, typename Plan>
++__forceinline__ __device__ void issue_qk_lookahead_descending(TiledMMA& qk_mma, TensorA const& qk_a,
++                                                              TensorB const& qk_b,
++                                                              TensorScore& score, Plan& plan,
++                                                              int idx_in_warpgroup, bool use_aux,
++                                                              bool stage_phase) {
++  static_assert(Slot >= 0 && Slot < T::LOOKAHEAD_K);
++  constexpr int Tile = T::NUM_V_TILES - T::LOOKAHEAD_K + Slot;
++  issue_qk_ready_lookahead_single<Tile, Slot, ZeroInitFirst && Slot == T::LOOKAHEAD_K - 1, T>(
++      qk_mma, qk_a, qk_b, score, plan, idx_in_warpgroup, use_aux, stage_phase);
++  if constexpr (Slot > 0) {
++    issue_qk_lookahead_descending<Slot - 1, T, ZeroInitFirst>(
++        qk_mma, qk_a, qk_b, score, plan, idx_in_warpgroup, use_aux, stage_phase);
++  }
++}
++
++template <int Tile, typename T, typename TiledMMA, typename TensorA, typename TensorB,
++          typename TensorScore, typename Plan>
++__forceinline__ __device__ void issue_qk_nonlookahead_ascending(TiledMMA& qk_mma,
++                                                                TensorA const& qk_a,
++                                                                TensorB const& qk_b,
++                                                                TensorScore& score, Plan& plan,
++                                                                bool kv_phase) {
++  static_assert(Tile < T::NUM_V_TILES - T::LOOKAHEAD_K);
++  issue_qk_ready_single<Tile, false, T>(qk_mma, qk_a, qk_b, score, plan, kv_phase);
++  if constexpr (Tile + 1 < T::NUM_V_TILES - T::LOOKAHEAD_K) {
++    issue_qk_nonlookahead_ascending<Tile + 1, T>(qk_mma, qk_a, qk_b, score, plan, kv_phase);
++  }
++}
++
++template <typename T, typename TiledMMA, typename TensorA, typename TensorB, typename TensorScore,
++          typename Plan>
++__forceinline__ __device__ void issue_qk_ready_order_lookahead(
++    TiledMMA& qk_mma, TensorA const& qk_a, TensorB const& qk_b, TensorScore& score, Plan& plan,
++    int idx_in_warpgroup, bool use_aux, bool selected_stage_phase, bool kv_phase) {
++  static_assert(T::LOOKAHEAD_K > 0);
++  Tensor aux_score =
++      partition_fragment_C(typename T::TiledMMAQK{}, Shape<Int<T::BLOCK_N>, Int<T::BLOCK_M>>{});
++  warpgroup_fence_operand(aux_score);
++  issue_qk_lookahead_descending<T::LOOKAHEAD_K - 1, T>(
++      qk_mma, qk_a, qk_b, aux_score, plan, idx_in_warpgroup, use_aux, selected_stage_phase);
++  warpgroup_wait<0>();
++  warpgroup_fence_operand(aux_score);
++  warpgroup_fence_operand(score);
++  issue_qk_ready_single<T::NUM_V_TILES, true, T>(qk_mma, qk_a, qk_b, score, plan, kv_phase);
++  issue_qk_nonlookahead_ascending<0, T>(qk_mma, qk_a, qk_b, score, plan, kv_phase);
++  warpgroup_wait<0>();
++  warpgroup_fence_operand(score);
++#pragma unroll
++  for (int value = 0; value < size(aux_score); ++value) {
++    score(value) += aux_score(value);
++  }
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/mailbox.cuh b/include/flashinfer/attention/mla_swa_sm90/device/mailbox.cuh
+new file mode 100644
+index 00000000000..ccc9c147c6b
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/mailbox.cuh
+@@ -0,0 +1,489 @@
++#pragma once
++
++template <bool ProduceWeights, int MaxSlices, typename T, typename TensorOutput, typename Plan>
++__forceinline__ __device__ void dsm_row_direct_m8_s3_slices(
++    TensorOutput const& outputs, int output_slice_offset, int slice_begin, int slice_end,
++    Plan& plan, typename T::InputT* out, int batch, int m_block, int total_rows, int heads,
++    int64_t stride_b, int64_t stride_s, int64_t stride_h, int idx, int warp, int lane) {
++  using InputT = typename T::InputT;
++  static_assert(T::BLOCK_M == 8 && T::TILE_K == 64);
++  static_assert(3 == 3);
++  static_assert(1 == 1);
++  constexpr int kElements = 8 * 1024;
++  const int rank = cute::block_id_in_cluster().x;
++  const int row_begin = 8 * rank / 3;
++  const int row_end = 8 * (rank + 1) / 3;
++  const int peer0 = (rank + 1) % 3;
++  const int peer1 = (rank + 2) % 3;
++  const int n0 = (lane % 4) * 2;
++  const int n1 = n0 + 1;
++  const float inv0 = 1.0f;
++  const float inv1 = 1.0f;
++  float* mailbox = reinterpret_cast<float*>(plan.kv.data());
++  float* lse_local = mailbox + kElements;
++#pragma unroll
++  for (int local = 0; local < MaxSlices; ++local) {
++    const int slice = slice_begin + local;
++    if (!T::Config::DenseRowMailbox && slice >= slice_end) continue;
++    Tensor flat = outputs(_, output_slice_offset + local, _0{});
++    Tensor acc = make_tensor(flat.data(), typename T::OutputSliceFragmentLayout{});
++    if (n0 < row_begin || n0 >= row_end) {
++      const int offset = row_direct_offset(slice, 0, idx, warp, lane);
++      *reinterpret_cast<float2*>(mailbox + offset) = make_float2(acc(0) * inv0, acc(2) * inv0);
++    }
++    if (n1 < row_begin || n1 >= row_end) {
++      const int offset = row_direct_offset(slice, 1, idx, warp, lane);
++      *reinterpret_cast<float2*>(mailbox + offset) = make_float2(acc(1) * inv1, acc(3) * inv1);
++    }
++  }
++  if constexpr (ProduceWeights) {
++    if (idx < 8) {
++      const float sum = plan.row_sum[idx];
++      lse_local[idx] = plan.row_max[idx];
++      lse_local[8 + idx] = sum;
++    }
++  }
++  cute::cluster_sync();
++  if constexpr (ProduceWeights) {
++    if (idx < 8) {
++      const uint32_t lse_base = cute::cast_smem_ptr_to_uint(lse_local);
++      float maximum = -CUDART_INF_F;
++      float score_max[3], row_sum[3], weight[3];
++#pragma unroll
++      for (int source = 0; source < 3; ++source) {
++        const uint32_t address = cute::set_block_rank(lse_base, source);
++        score_max[source] = source == rank ? lse_local[idx] : load_dsm_float(address, idx);
++        row_sum[source] = source == rank ? lse_local[8 + idx] : load_dsm_float(address, 8 + idx);
++        maximum = fmaxf(maximum, score_max[source]);
++      }
++      float denominator = 0.0f;
++#pragma unroll
++      for (int source = 0; source < 3; ++source) {
++        weight[source] = raw_exp_weight(score_max[source], row_sum[source], maximum);
++        denominator += weight[source] * row_sum[source];
++      }
++      const float inv = denominator > 0.0f ? 1.0f / denominator : 0.0f;
++#pragma unroll
++      for (int source = 0; source < 3; ++source)
++        plan.reduction[source * 8 + idx] = weight[source] * inv;
++    }
++  }
++  role_barrier();
++  const uint32_t base = cute::cast_smem_ptr_to_uint(mailbox);
++  const uint32_t remote0 = cute::set_block_rank(base, peer0);
++  const uint32_t remote1 = cute::set_block_rank(base, peer1);
++  const int dim0 = fragment_m0(warp, lane);
++#pragma unroll
++  for (int row_bit = 0; row_bit < 2; ++row_bit) {
++    const int row = n0 + row_bit;
++    const bool owned = row >= row_begin && row < row_end;
++    const float inv = row_bit == 0 ? inv0 : inv1;
++    const float w_local = plan.reduction[rank * 8 + row];
++    const float w_peer0 = plan.reduction[peer0 * 8 + row];
++    const float w_peer1 = plan.reduction[peer1 * 8 + row];
++    const int global_row = m_block * 8 + row;
++    InputT* output_row =
++        out + batch * stride_b + (global_row / heads) * stride_s + (global_row % heads) * stride_h;
++    float ahead00 = 0.0f, ahead01 = 0.0f, ahead10 = 0.0f, ahead11 = 0.0f;
++    if (owned && (T::Config::DenseRowMailbox || slice_begin < slice_end)) {
++      const int offset = row_direct_offset(slice_begin, row_bit, idx, warp, lane);
++      load_dsm_float2(remote0, offset, ahead00, ahead01);
++      load_dsm_float2(remote1, offset, ahead10, ahead11);
++    }
++#pragma unroll
++    for (int local = 0; local < MaxSlices; ++local) {
++      const int slice = slice_begin + local;
++      if (!T::Config::DenseRowMailbox && slice >= slice_end) continue;
++      Tensor flat = outputs(_, output_slice_offset + local, _0{});
++      Tensor acc = make_tensor(flat.data(), typename T::OutputSliceFragmentLayout{});
++      float value0 = 0.0f, value1 = 0.0f;
++      if (owned) {
++        const int offset = row_direct_offset(slice, row_bit, idx, warp, lane);
++        float p00, p01, p10, p11;
++        p00 = ahead00;
++        p01 = ahead01;
++        p10 = ahead10;
++        p11 = ahead11;
++        if (local + 1 < MaxSlices && (T::Config::DenseRowMailbox || slice + 1 < slice_end)) {
++          load_dsm_float2(remote0, offset + 512, ahead00, ahead01);
++          load_dsm_float2(remote1, offset + 512, ahead10, ahead11);
++        }
++        value0 = fmaf(w_peer1, p10, fmaf(w_peer0, p00, w_local * (acc(row_bit) * inv)));
++        value1 = fmaf(w_peer1, p11, fmaf(w_peer0, p01, w_local * (acc(row_bit + 2) * inv)));
++      }
++      const float adjacent0 = __shfl_down_sync(0xffffffff, value0, 4);
++      const float adjacent1 = __shfl_down_sync(0xffffffff, value1, 4);
++      if (owned && global_row < total_rows && (lane & 4) == 0) {
++        const int dim = slice * 64 + dim0;
++        cutlass::Array<InputT, 2> pair;
++        pair[0] = InputT(value0);
++        pair[1] = InputT(adjacent0);
++        *reinterpret_cast<cutlass::Array<InputT, 2>*>(output_row + dim) = pair;
++        pair[0] = InputT(value1);
++        pair[1] = InputT(adjacent1);
++        *reinterpret_cast<cutlass::Array<InputT, 2>*>(output_row + dim + 8) = pair;
++      }
++    }
++  }
++  cute::cluster_sync();
++}
++
++template <bool ProduceWeights, int MaxSlices, typename T, typename TensorOutput, typename Plan>
++__forceinline__ __device__ void dsm_direct_accum_m8_s3_slices(
++    TensorOutput const& output_fragment_all, int output_slice_offset, int slice_begin,
++    int slice_end, Plan& plan, typename T::InputT* out, int batch_idx, int m_block_idx,
++    int total_rows, int num_heads, int64_t out_stride_b, int64_t out_stride_s, int64_t out_stride_h,
++    int idx_in_warpgroup, int warp_in_group, int lane) {
++  dsm_row_direct_m8_s3_slices<ProduceWeights, MaxSlices, T>(
++      output_fragment_all, output_slice_offset, slice_begin, slice_end, plan, out, batch_idx,
++      m_block_idx, total_rows, num_heads, out_stride_b, out_stride_s, out_stride_h,
++      idx_in_warpgroup, warp_in_group, lane);
++}
++
++template <typename T, typename Plan>
++__forceinline__ __device__ void dsm_direct_accum_m32_qk_s2(Plan& plan, int idx,
++                                                           typename T::InputT* out, int batch,
++                                                           int m_block, int total_rows, int heads,
++                                                           int64_t stride_b, int64_t stride_s,
++                                                           int64_t stride_h) {
++  static_assert(T::BLOCK_M == 32 && T::NUM_PV_WARPGROUPS == 3);
++  static_assert(2 == 2 && 1);
++  constexpr int words = 16 * 2 * 128 * 4;
++  cute::cluster_wait();
++  static_assert((words + 32) * sizeof(float) <=
++                T::BLOCK_M * T::HEAD_DIM_K * sizeof(typename T::InputT));
++  float* state = p1_mailbox(plan) + words;
++  const int rank = cute::block_rank_in_cluster();
++  const int owner = rank * 16;
++  const int publish = (1 - rank) * 16;
++  if (idx < 16) {
++    const float sum = plan.row_sum[publish + idx];
++    state[idx] = plan.row_max[publish + idx];
++    state[16 + idx] = sum;
++  }
++  p1_wg_sync(0);
++  if (idx == 0) p1_release(plan.p1_ready[0], rank ^ 1);
++  p1_acquire(plan.p1_ready[0]);
++  if (idx < 16) {
++    const int row = owner + idx;
++    const uint32_t remote = cute::set_block_rank(cute::cast_smem_ptr_to_uint(state), rank ^ 1);
++    const float local_sum = plan.row_sum[row];
++    const float local_max = plan.row_max[row];
++    const float peer_max = load_dsm_float(remote, idx);
++    const float peer_sum = load_dsm_float(remote, 16 + idx);
++    const float2 weights = raw_pair_weights(local_max, local_sum, peer_max, peer_sum);
++    plan.row_max[row] = weights.x;
++    plan.row_sum[row] = weights.y;
++  }
++  p1_wg_sync(0);
++  if (idx == 0) p1_release(plan.p1_ack[0], rank ^ 1);
++  role_barrier();
++  p1_acquire(plan.p1_ack[0]);
++  role_barrier();
++}
++
++template <int OwnerGroup, int PublishGroup, int MaxSlices, typename T, typename TensorOutput,
++          typename Plan>
++__forceinline__ __device__ void dsm_direct_accum_pv_s2(
++    TensorOutput const& output_fragment_all, int slice_begin, int slice_end, int slice_stride,
++    int pv_group, Plan& plan, typename T::InputT* out, int batch_idx, int m_block_idx,
++    int total_rows, int num_heads, int64_t out_stride_b, int64_t out_stride_s, int64_t out_stride_h,
++    int idx_in_warpgroup, int warp_in_group, int lane) {
++  using InputT = typename T::InputT;
++  using Layout = DsmDirectAccumLayout<T>;
++  static_assert(OwnerGroup == 0 || OwnerGroup == 1);
++  static_assert(PublishGroup == 1 - OwnerGroup);
++  static_assert(T::BLOCK_M == 16);
++  static_assert(T::NUM_PV_WARPGROUPS == Layout::kPvGroups);
++  static_assert(MaxSlices == Layout::kSlicesPerPvGroup);
++  static_assert(1);
++  static_assert(0 == 0);
++  constexpr bool Raw = (T::Config::PartialFormat == mla_swa::PartialForm::Raw);
++  uint32_t* mailbox = reinterpret_cast<uint32_t*>(plan.q.data());
++  float* mailbox_fp32 = reinterpret_cast<float*>(mailbox);
++  constexpr int kPayloadBytes = Layout::kMailboxWords * sizeof(uint32_t);
++  constexpr int kStateBytes = Layout::kStateFloats * sizeof(float);
++  constexpr int kQBytes = T::BLOCK_M * T::HEAD_DIM_K * sizeof(InputT);
++  static_assert(kPayloadBytes + kStateBytes <= kQBytes);
++  cutlass::Array<float, MaxSlices * 4> owner_values;
++  const int m0 = fragment_m0(warp_in_group, lane);
++  const int m1 = m0 + 8;
++  const int owner_n0 = OwnerGroup * 8 + (lane % 4) * 2;
++  const int owner_n1 = owner_n0 + 1;
++  const int publish_n0 = PublishGroup * 8 + (lane % 4) * 2;
++  const int publish_n1 = publish_n0 + 1;
++  const float owner_inv_sum0 =
++      Raw ? 1.0f : (plan.row_sum[owner_n0] > 0.0f ? 1.0f / plan.row_sum[owner_n0] : 0.0f);
++  const float owner_inv_sum1 =
++      Raw ? 1.0f : (plan.row_sum[owner_n1] > 0.0f ? 1.0f / plan.row_sum[owner_n1] : 0.0f);
++  const float publish_inv_sum0 =
++      Raw ? 1.0f : (plan.row_sum[publish_n0] > 0.0f ? 1.0f / plan.row_sum[publish_n0] : 0.0f);
++  const float publish_inv_sum1 =
++      Raw ? 1.0f : (plan.row_sum[publish_n1] > 0.0f ? 1.0f / plan.row_sum[publish_n1] : 0.0f);
++#pragma unroll
++  for (int local_slice = 0; local_slice < MaxSlices; ++local_slice) {
++    const int global_slice = slice_begin + local_slice * slice_stride;
++    if (global_slice >= slice_end) {
++      continue;
++    }
++    Tensor output_fragment_flat = output_fragment_all(_, local_slice, _0{});
++    Tensor output_fragment =
++        make_tensor(output_fragment_flat.data(), typename T::OutputSliceFragmentLayout{});
++    constexpr int kOwnerBase = OwnerGroup * 4;
++    constexpr int kPublishBase = PublishGroup * 4;
++    const float owner00 = output_fragment(kOwnerBase + 0) * owner_inv_sum0;
++    const float owner01 = output_fragment(kOwnerBase + 1) * owner_inv_sum1;
++    const float owner10 = output_fragment(kOwnerBase + 2) * owner_inv_sum0;
++    const float owner11 = output_fragment(kOwnerBase + 3) * owner_inv_sum1;
++    owner_values[local_slice * 4 + 0] = owner00;
++    owner_values[local_slice * 4 + 1] = owner01;
++    owner_values[local_slice * 4 + 2] = owner10;
++    owner_values[local_slice * 4 + 3] = owner11;
++    const float publish00 = output_fragment(kPublishBase + 0) * publish_inv_sum0;
++    const float publish01 = output_fragment(kPublishBase + 1) * publish_inv_sum1;
++    const float publish10 = output_fragment(kPublishBase + 2) * publish_inv_sum0;
++    const float publish11 = output_fragment(kPublishBase + 3) * publish_inv_sum1;
++    const int offset = (global_slice * 128 + idx_in_warpgroup) * 4;
++    fragment_store4(mailbox_fp32 + offset, publish00, publish01, publish10, publish11);
++  }
++  role_barrier();
++  asm volatile("fence.acq_rel.cluster;" ::: "memory");
++  cute::cluster_sync();
++  asm volatile("fence.acq_rel.cluster;" ::: "memory");
++  role_barrier();
++  const int cluster_rank = cute::block_rank_in_cluster();
++  const int peer_rank = cluster_rank ^ 1;
++  const uint32_t mailbox_base = cute::cast_smem_ptr_to_uint(mailbox);
++  const uint32_t mailbox_peer = cute::set_block_rank(mailbox_base, peer_rank);
++  const float weight0_row0 = plan.row_max[owner_n0];
++  const float weight1_row0 = plan.row_sum[owner_n0];
++  const float weight0_row1 = plan.row_max[owner_n1];
++  const float weight1_row1 = plan.row_sum[owner_n1];
++  float ahead00, ahead01, ahead10, ahead11;
++  const int first_offset = (slice_begin * 128 + idx_in_warpgroup) * 4;
++  fragment_load4(mailbox_peer + first_offset * sizeof(float), ahead00, ahead01, ahead10, ahead11);
++#pragma unroll
++  for (int local_slice = 0; local_slice < MaxSlices; ++local_slice) {
++    const int global_slice = slice_begin + local_slice * slice_stride;
++    if (global_slice >= slice_end) continue;
++    const float peer00 = ahead00, peer01 = ahead01;
++    const float peer10 = ahead10, peer11 = ahead11;
++    if (local_slice + 1 < MaxSlices && global_slice + slice_stride < slice_end) {
++      const int next_offset = ((global_slice + slice_stride) * 128 + idx_in_warpgroup) * 4;
++      fragment_load4(mailbox_peer + next_offset * sizeof(float), ahead00, ahead01, ahead10,
++                     ahead11);
++    }
++    const float local00 = owner_values[local_slice * 4 + 0];
++    const float local01 = owner_values[local_slice * 4 + 1];
++    const float local10 = owner_values[local_slice * 4 + 2];
++    const float local11 = owner_values[local_slice * 4 + 3];
++    float output00;
++    float output01;
++    float output10;
++    float output11;
++    if constexpr (OwnerGroup == 0) {
++      output00 = weight0_row0 * local00 + weight1_row0 * peer00;
++      output01 = weight0_row1 * local01 + weight1_row1 * peer01;
++      output10 = weight0_row0 * local10 + weight1_row0 * peer10;
++      output11 = weight0_row1 * local11 + weight1_row1 * peer11;
++    } else {
++      output00 = weight0_row0 * peer00 + weight1_row0 * local00;
++      output01 = weight0_row1 * peer01 + weight1_row1 * local01;
++      output10 = weight0_row0 * peer10 + weight1_row0 * local10;
++      output11 = weight0_row1 * peer11 + weight1_row1 * local11;
++    }
++    const int global_row0 = m_block_idx * T::BLOCK_M + owner_n0;
++    const int global_row1 = global_row0 + 1;
++    const int dim0 = global_slice * T::TILE_K + m0;
++    const int dim1 = global_slice * T::TILE_K + m1;
++    if (global_row0 < total_rows) {
++      const int query_idx = global_row0 >> 6;
++      const int head_idx = global_row0 & 63;
++      InputT* output_row =
++          out + batch_idx * out_stride_b + query_idx * out_stride_s + head_idx * out_stride_h;
++      output_row[dim0] = InputT(output00);
++      output_row[dim1] = InputT(output10);
++    }
++    if (global_row1 < total_rows) {
++      const int query_idx = global_row1 >> 6;
++      const int head_idx = global_row1 & 63;
++      InputT* output_row =
++          out + batch_idx * out_stride_b + query_idx * out_stride_s + head_idx * out_stride_h;
++      output_row[dim0] = InputT(output01);
++      output_row[dim1] = InputT(output11);
++    }
++  }
++  cute::cluster_sync();
++}
++
++template <int MaxSlices, typename T, typename TensorOutput, typename Plan>
++__forceinline__ __device__ void dsm_direct_accum_m32_pv_s2(TensorOutput& outputs, int begin,
++                                                           int end, Plan& plan,
++                                                           typename T::InputT* out, int batch,
++                                                           int m_block, int total_rows, int heads,
++                                                           int64_t stride_b, int64_t stride_s,
++                                                           int64_t stride_h, int warp, int lane) {
++  using InputT = typename T::InputT;
++  cute::cluster_wait();
++  const int rank = cute::block_rank_in_cluster();
++  const int owner_group = rank * 2;
++  const int publish_group = (1 - rank) * 2;
++  const int idx = warp * 32 + lane;
++  const int pv_wg = threadIdx.x / 128;
++  float* mailbox = p1_mailbox(plan);
++#pragma unroll
++  for (int group = 0; group < 4; ++group) {
++    const int n0 = group * 8 + (lane % 4) * 2;
++    const int n1 = n0 + 1;
++#pragma unroll
++    for (int local = 0; local < MaxSlices; ++local) {
++      const int slice = begin + local;
++      if (slice >= end) continue;
++      Tensor flat = outputs(_, local, _0{});
++      Tensor acc = make_tensor(flat.data(), typename T::OutputSliceFragmentLayout{});
++      const int base = group * 4;
++      if (group >= publish_group && group < publish_group + 2) {
++        const int offset = ((slice * 2 + group - publish_group) * 128 + idx) * 4;
++        fragment_store4(mailbox + offset, acc(base), acc(base + 1), acc(base + 2), acc(base + 3));
++      }
++    }
++  }
++  p1_wg_sync(pv_wg);
++  if (idx == 0) p1_release(plan.p1_ready[pv_wg], rank ^ 1);
++  role_barrier();
++  p1_acquire(plan.p1_ready[pv_wg]);
++  const uint32_t remote = cute::set_block_rank(cute::cast_smem_ptr_to_uint(mailbox), rank ^ 1);
++  const int dim0 = begin * T::TILE_K + fragment_m0(warp, lane);
++#pragma unroll
++  for (int group = 0; group < 4; ++group) {
++    if (group < owner_group || group >= owner_group + 2) continue;
++    const int n0 = group * 8 + (lane % 4) * 2;
++    const int n1 = n0 + 1;
++    const float a0 = plan.row_max[n0], b0 = plan.row_sum[n0];
++    const float a1 = plan.row_max[n1], b1 = plan.row_sum[n1];
++    const int global0 = m_block * 32 + n0;
++    const int global1 = global0 + 1;
++    InputT* row0 =
++        out + batch * stride_b + (global0 / heads) * stride_s + (global0 % heads) * stride_h;
++    InputT* row1 =
++        out + batch * stride_b + (global1 / heads) * stride_s + (global1 % heads) * stride_h;
++    float ahead0, ahead1, ahead2, ahead3;
++    const int first_offset = ((begin * 2 + group - owner_group) * 128 + idx) * 4;
++    fragment_load4(remote + first_offset * sizeof(float), ahead0, ahead1, ahead2, ahead3);
++#pragma unroll
++    for (int local = 0; local < MaxSlices; ++local) {
++      const int slice = begin + local;
++      if (slice >= end) continue;
++      Tensor flat = outputs(_, local, _0{});
++      Tensor acc = make_tensor(flat.data(), typename T::OutputSliceFragmentLayout{});
++      const int base = group * 4;
++      const int offset = ((slice * 2 + group - owner_group) * 128 + idx) * 4;
++      float p0, p1, p2, p3;
++      p0 = ahead0;
++      p1 = ahead1;
++      p2 = ahead2;
++      p3 = ahead3;
++      if (local + 1 < MaxSlices && slice + 1 < end && !(0 && slice + 1 == 15)) {
++        fragment_load4(remote + (offset + 2 * 128 * 4) * sizeof(float), ahead0, ahead1, ahead2,
++                       ahead3);
++      }
++      const float v0 = a0 * acc(base) + b0 * p0;
++      const float v1 = a1 * acc(base + 1) + b1 * p1;
++      const float v2 = a0 * acc(base + 2) + b0 * p2;
++      const float v3 = a1 * acc(base + 3) + b1 * p3;
++      const float next0 = __shfl_down_sync(0xffffffff, v0, 4);
++      const float next1 = __shfl_down_sync(0xffffffff, v1, 4);
++      const float next2 = __shfl_down_sync(0xffffffff, v2, 4);
++      const float next3 = __shfl_down_sync(0xffffffff, v3, 4);
++      if (group == owner_group + 1 && slice == end - 1 - (0 && pv_wg == 3)) {
++        __syncwarp();
++        if (lane == 0) p1_release(plan.p1_ack[pv_wg], rank ^ 1);
++      }
++      if ((lane & 4) == 0) {
++        const int dim = dim0 + local * T::TILE_K;
++        cutlass::Array<InputT, 2> pair;
++        if (global0 < total_rows) {
++          pair[0] = InputT(v0);
++          pair[1] = InputT(next0);
++          *reinterpret_cast<cutlass::Array<InputT, 2>*>(row0 + dim) = pair;
++          pair[0] = InputT(v2);
++          pair[1] = InputT(next2);
++          *reinterpret_cast<cutlass::Array<InputT, 2>*>(row0 + dim + 8) = pair;
++        }
++        if (global1 < total_rows) {
++          pair[0] = InputT(v1);
++          pair[1] = InputT(next1);
++          *reinterpret_cast<cutlass::Array<InputT, 2>*>(row1 + dim) = pair;
++          pair[0] = InputT(v3);
++          pair[1] = InputT(next3);
++          *reinterpret_cast<cutlass::Array<InputT, 2>*>(row1 + dim + 8) = pair;
++        }
++      }
++    }
++  }
++  p1_acquire(plan.p1_ack[pv_wg]);
++  role_barrier();
++}
++
++template <int OwnerGroup, typename T, typename Plan>
++__forceinline__ __device__ void dsm_direct_accum_qk_s2(Plan& plan, int idx_in_warpgroup) {
++  using Layout = DsmDirectAccumLayout<T>;
++  static_assert(OwnerGroup == 0 || OwnerGroup == 1);
++  static_assert(T::BLOCK_M == 16);
++  uint32_t* mailbox = reinterpret_cast<uint32_t*>(plan.q.data());
++  float* state_mailbox = reinterpret_cast<float*>(mailbox + Layout::kMailboxWords);
++  constexpr int kPayloadBytes = Layout::kMailboxWords * sizeof(uint32_t);
++  constexpr int kStateBytes = Layout::kStateFloats * sizeof(float);
++  constexpr int kQBytes = T::BLOCK_M * T::HEAD_DIM_K * sizeof(typename T::InputT);
++  static_assert(kPayloadBytes + kStateBytes <= kQBytes);
++  constexpr int kPublishGroup = 1 - OwnerGroup;
++  if (idx_in_warpgroup < Layout::kRowsPerOwner) {
++    const int publish_row = kPublishGroup * Layout::kRowsPerOwner + idx_in_warpgroup;
++    const float sum = plan.row_sum[publish_row];
++    if constexpr ((T::Config::PartialFormat == mla_swa::PartialForm::Raw)) {
++      state_mailbox[idx_in_warpgroup] = plan.row_max[publish_row];
++      state_mailbox[Layout::kRowsPerOwner + idx_in_warpgroup] = sum;
++    } else {
++      state_mailbox[idx_in_warpgroup] =
++          sum > 0.0f ? plan.row_max[publish_row] + log2f(sum) : -CUDART_INF_F;
++    }
++  }
++  role_barrier();
++  asm volatile("fence.acq_rel.cluster;" ::: "memory");
++  cute::cluster_sync();
++  asm volatile("fence.acq_rel.cluster;" ::: "memory");
++  if (idx_in_warpgroup < Layout::kRowsPerOwner) {
++    const int owner_row = OwnerGroup * Layout::kRowsPerOwner + idx_in_warpgroup;
++    const float local_sum = plan.row_sum[owner_row];
++    if constexpr ((T::Config::PartialFormat == mla_swa::PartialForm::Raw)) {
++      const int peer_rank = cute::block_rank_in_cluster() ^ 1;
++      const uint32_t peer =
++          cute::set_block_rank(cute::cast_smem_ptr_to_uint(state_mailbox), peer_rank);
++      const float peer_max = load_dsm_float(peer, idx_in_warpgroup);
++      const float peer_sum = load_dsm_float(peer, Layout::kRowsPerOwner + idx_in_warpgroup);
++      const float local_max = plan.row_max[owner_row];
++      const float2 weights = raw_pair_weights(local_max, local_sum, peer_max, peer_sum);
++      plan.row_max[owner_row] = OwnerGroup == 0 ? weights.x : weights.y;
++      plan.row_sum[owner_row] = OwnerGroup == 0 ? weights.y : weights.x;
++    } else {
++      const float local_lse =
++          local_sum > 0.0f ? plan.row_max[owner_row] + log2f(local_sum) : -CUDART_INF_F;
++      const int cluster_rank = cute::block_rank_in_cluster();
++      const int peer_rank = cluster_rank ^ 1;
++      const uint32_t state_base = cute::cast_smem_ptr_to_uint(state_mailbox);
++      const uint32_t state_peer = cute::set_block_rank(state_base, peer_rank);
++      const float peer_lse = load_dsm_float(state_peer, idx_in_warpgroup);
++      const float lse0 = OwnerGroup == 0 ? local_lse : peer_lse;
++      const float lse1 = OwnerGroup == 0 ? peer_lse : local_lse;
++      const float row_max = fmaxf(lse0, lse1);
++      const float unnormalized0 = isfinite(lse0) ? exp2f(lse0 - row_max) : 0.0f;
++      const float unnormalized1 = isfinite(lse1) ? exp2f(lse1 - row_max) : 0.0f;
++      const float weight_sum = unnormalized0 + unnormalized1;
++      const float inv_weight_sum = weight_sum > 0.0f ? 1.0f / weight_sum : 0.0f;
++      plan.row_max[owner_row] = unnormalized0 * inv_weight_sum;
++      plan.row_sum[owner_row] = unnormalized1 * inv_weight_sum;
++    }
++  }
++  role_barrier();
++  cute::cluster_sync();
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/memory.cuh b/include/flashinfer/attention/mla_swa_sm90/device/memory.cuh
+new file mode 100644
+index 00000000000..0c7345713df
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/memory.cuh
+@@ -0,0 +1,138 @@
++#pragma once
++
++__forceinline__ __device__ void fragment_store4(float* ptr, float a, float b, float c, float d) {
++  const uint32_t address = cute::cast_smem_ptr_to_uint(ptr);
++  asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" ::"r"(address), "f"(a), "f"(b), "f"(c),
++               "f"(d)
++               : "memory");
++}
++
++__forceinline__ __device__ void fragment_load4(uint32_t address, float& a, float& b, float& c,
++                                               float& d) {
++  asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];"
++               : "=f"(a), "=f"(b), "=f"(c), "=f"(d)
++               : "r"(address)
++               : "memory");
++}
++
++__forceinline__ __device__ int fragment_m0(int warp_in_group, int lane) {
++  return warp_in_group * 16 + lane / 4;
++}
++
++template <int MaxSlices, typename T, typename TensorOutput, typename Plan>
++__forceinline__ __device__ void write_output_slices(
++    TensorOutput const& output_fragment_all, int output_slice_offset, int slice_begin,
++    int slice_end, Plan& plan, typename T::InputT* out, int batch_idx, int m_block_idx,
++    int total_rows, int num_heads, int64_t out_stride_b, int64_t out_stride_s, int64_t out_stride_h,
++    int warp_in_group, int lane) {
++  static_assert(MaxSlices > 0);
++  const int m0 = fragment_m0(warp_in_group, lane);
++  const int m1 = m0 + 8;
++#pragma unroll
++  for (int group = 0; group < T::BLOCK_M / 8; ++group) {
++    const int n0 = group * 8 + (lane % 4) * 2;
++    const int n1 = n0 + 1;
++    const int base = group * 4;
++    const int global_row0 = m_block_idx * T::BLOCK_M + n0;
++    const int global_row1 = global_row0 + 1;
++    typename T::InputT* row0 = nullptr;
++    typename T::InputT* row1 = nullptr;
++    if (global_row0 < total_rows) {
++      const int query_idx = global_row0 >> 6;
++      const int head_idx = global_row0 & 63;
++      row0 = out + batch_idx * out_stride_b + query_idx * out_stride_s + head_idx * out_stride_h;
++    }
++    if (global_row1 < total_rows) {
++      const int query_idx = global_row1 >> 6;
++      const int head_idx = global_row1 & 63;
++      row1 = out + batch_idx * out_stride_b + query_idx * out_stride_s + head_idx * out_stride_h;
++    }
++    const float inv_sum0 = plan.row_sum[n0] > 0.0f ? 1.0f / plan.row_sum[n0] : 0.0f;
++    const float inv_sum1 = plan.row_sum[n1] > 0.0f ? 1.0f / plan.row_sum[n1] : 0.0f;
++#pragma unroll
++    for (int slice = 0; slice < MaxSlices; ++slice) {
++      if (slice_begin + slice >= slice_end) {
++        continue;
++      }
++      Tensor output_fragment_flat = output_fragment_all(_, output_slice_offset + slice, _0{});
++      Tensor output_fragment =
++          make_tensor(output_fragment_flat.data(), typename T::OutputSliceFragmentLayout{});
++      const int global_slice = slice_begin + slice;
++      const int dim0 = global_slice * T::TILE_K + m0;
++      const int dim1 = global_slice * T::TILE_K + m1;
++      const float value00 = output_fragment(base + 0) * inv_sum0;
++      const float value01 = output_fragment(base + 1) * inv_sum1;
++      const float value10 = output_fragment(base + 2) * inv_sum0;
++      const float value11 = output_fragment(base + 3) * inv_sum1;
++      const float peer00 = __shfl_down_sync(0xffffffff, value00, 4);
++      const float peer01 = __shfl_down_sync(0xffffffff, value01, 4);
++      const float peer10 = __shfl_down_sync(0xffffffff, value10, 4);
++      const float peer11 = __shfl_down_sync(0xffffffff, value11, 4);
++      if ((lane & 4) == 0) {
++        cutlass::Array<typename T::InputT, 2> pair;
++        if (row0 != nullptr) {
++          pair[0] = static_cast<typename T::InputT>(value00);
++          pair[1] = static_cast<typename T::InputT>(peer00);
++          *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row0 + dim0) = pair;
++          pair[0] = static_cast<typename T::InputT>(value10);
++          pair[1] = static_cast<typename T::InputT>(peer10);
++          *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row0 + dim1) = pair;
++        }
++        if (row1 != nullptr) {
++          pair[0] = static_cast<typename T::InputT>(value01);
++          pair[1] = static_cast<typename T::InputT>(peer01);
++          *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row1 + dim0) = pair;
++          pair[0] = static_cast<typename T::InputT>(value11);
++          pair[1] = static_cast<typename T::InputT>(peer11);
++          *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row1 + dim1) = pair;
++        }
++      }
++    }
++  }
++}
++
++__forceinline__ __device__ void load_dsm_float2(uint32_t remote_base, int element_idx,
++                                                float& value0, float& value1) {
++  const uint32_t address = remote_base + element_idx * sizeof(float);
++  asm volatile("ld.shared::cluster.v2.f32 {%0, %1}, [%2];"
++               : "=f"(value0), "=f"(value1)
++               : "r"(address)
++               : "memory");
++}
++
++__forceinline__ __device__ float load_dsm_float(uint32_t remote_base, int element_idx) {
++  float value;
++  const uint32_t address = remote_base + element_idx * sizeof(float);
++  asm volatile("ld.shared::cluster.f32 %0, [%1];" : "=f"(value) : "r"(address));
++  return value;
++}
++
++__forceinline__ __device__ int row_direct_offset(int slice, int row_bit, int idx, int warp,
++                                                 int lane) {
++  const int row = (lane % 4) * 2 + row_bit;
++  const int row_lane = warp * 8 + lane / 4;
++  return slice * 512 + row * 64 + row_lane * 2;
++}
++
++template <typename T, typename TensorScore, typename TensorSScore>
++__forceinline__ __device__ void store_score_fragment(TensorScore const& score,
++                                                     TensorSScore const& sScore, int warp_in_group,
++                                                     int lane) {
++  const int m0 = fragment_m0(warp_in_group, lane);
++  const int m1 = m0 + 8;
++#pragma unroll
++  for (int group = 0; group < T::BLOCK_M / 8; ++group) {
++    const int n0 = group * 8 + (lane % 4) * 2;
++    const int n1 = n0 + 1;
++    const int base = group * 4;
++    sScore(n0, m0) = score(base + 0);
++    sScore(n1, m0) = score(base + 1);
++    sScore(n0, m1) = score(base + 2);
++    sScore(n1, m1) = score(base + 3);
++  }
++}
++
++template <typename Plan>
++__forceinline__ __device__ float* p1_mailbox(Plan& plan) {
++  return reinterpret_cast<float*>(plan.q.data());
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/native_softmax.cuh b/include/flashinfer/attention/mla_swa_sm90/device/native_softmax.cuh
+new file mode 100644
+index 00000000000..75feadd8cd7
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/native_softmax.cuh
+@@ -0,0 +1,114 @@
++
++template <class T, class Score, class P, class Plan>
++__forceinline__ __device__ void register_fragment_softmax(
++    Score& score, P const& sP, Plan& plan, int physical_page, int page_idx, int m_block_idx,
++    int total_rows, int s_q, int num_heads, int cache_len, int window_size, float softmax_scale,
++    int idx_in_warpgroup, int warp_in_group, int lane) {
++  const int m0 = fragment_m0(warp_in_group, lane);
++  const int m1 = m0 + 8;
++  static_assert(T::BLOCK_M == 8);
++  int lane_q_pos = 0;
++  int lane_left = 0;
++  int lane_row_valid = 0;
++  if (lane < T::BLOCK_M) {
++    const int lane_global_row = m_block_idx * T::BLOCK_M + lane;
++    lane_row_valid = physical_page >= 0 && lane_global_row < total_rows;
++    if (lane_row_valid) {
++      const int query_idx = lane_global_row / num_heads;
++      lane_q_pos = cache_len - s_q + query_idx;
++      lane_left = max(lane_q_pos - window_size + 1, 0);
++    }
++  }
++#pragma unroll
++  for (int group = 0; group < T::BLOCK_M / 8; ++group) {
++    const int n0 = group * 8 + (lane % 4) * 2;
++    const int n1 = n0 + 1;
++    const int base = group * 4;
++    const int token0 = page_idx * T::BLOCK_N + m0;
++    const int token1 = page_idx * T::BLOCK_N + m1;
++    const int global_row0 = m_block_idx * T::BLOCK_M + n0;
++    const int global_row1 = global_row0 + 1;
++    const int row0_valid = __shfl_sync(0xffffffff, lane_row_valid, n0);
++    const int row1_valid = __shfl_sync(0xffffffff, lane_row_valid, n1);
++    const int q_pos0 = __shfl_sync(0xffffffff, lane_q_pos, n0);
++    const int q_pos1 = __shfl_sync(0xffffffff, lane_q_pos, n1);
++    const int left0 = __shfl_sync(0xffffffff, lane_left, n0);
++    const int left1 = __shfl_sync(0xffffffff, lane_left, n1);
++    const bool valid00 = row0_valid && token0 >= left0 && token0 <= q_pos0;
++    const bool valid01 = row1_valid && token0 >= left1 && token0 <= q_pos1;
++    const bool valid10 = row0_valid && token1 >= left0 && token1 <= q_pos0;
++    const bool valid11 = row1_valid && token1 >= left1 && token1 <= q_pos1;
++    const float scale = softmax_scale * 1.4426950408889634f;
++    score(base + 0) = valid00 ? score(base + 0) * scale : -CUDART_INF_F;
++    score(base + 1) = valid01 ? score(base + 1) * scale : -CUDART_INF_F;
++    score(base + 2) = valid10 ? score(base + 2) * scale : -CUDART_INF_F;
++    score(base + 3) = valid11 ? score(base + 3) * scale : -CUDART_INF_F;
++    float max0 = fmaxf(score(base + 0), score(base + 2));
++    float max1 = fmaxf(score(base + 1), score(base + 3));
++    max0 = fmaxf(max0, __shfl_xor_sync(0xffffffff, max0, 4));
++    max1 = fmaxf(max1, __shfl_xor_sync(0xffffffff, max1, 4));
++    max0 = fmaxf(max0, __shfl_xor_sync(0xffffffff, max0, 8));
++    max1 = fmaxf(max1, __shfl_xor_sync(0xffffffff, max1, 8));
++    max0 = fmaxf(max0, __shfl_xor_sync(0xffffffff, max0, 16));
++    max1 = fmaxf(max1, __shfl_xor_sync(0xffffffff, max1, 16));
++    if (lane < 4) {
++      plan.reduction[warp_in_group * T::BLOCK_M + n0] = max0;
++      plan.reduction[warp_in_group * T::BLOCK_M + n1] = max1;
++    }
++  }
++  role_barrier();
++  if (idx_in_warpgroup < T::BLOCK_M) {
++    const int row = idx_in_warpgroup;
++    float tile_max = -CUDART_INF_F;
++#pragma unroll
++    for (int warp = 0; warp < 4; ++warp) {
++      tile_max = fmaxf(tile_max, plan.reduction[warp * T::BLOCK_M + row]);
++    }
++    const float old_max = plan.row_max[row];
++    const float new_max = fmaxf(old_max, tile_max);
++    plan.row_scale[row] = isfinite(old_max) ? exp2f(old_max - new_max) : 0.0f;
++    plan.row_max[row] = new_max;
++  }
++  role_barrier();
++#pragma unroll
++  for (int group = 0; group < T::BLOCK_M / 8; ++group) {
++    const int n0 = group * 8 + (lane % 4) * 2;
++    const int n1 = n0 + 1;
++    const int base = group * 4;
++    const float score00 = score(base + 0);
++    const float score01 = score(base + 1);
++    const float score10 = score(base + 2);
++    const float score11 = score(base + 3);
++    const float p00 = isfinite(score00) ? exp2f(score00 - plan.row_max[n0]) : 0.0f;
++    const float p01 = isfinite(score01) ? exp2f(score01 - plan.row_max[n1]) : 0.0f;
++    const float p10 = isfinite(score10) ? exp2f(score10 - plan.row_max[n0]) : 0.0f;
++    const float p11 = isfinite(score11) ? exp2f(score11 - plan.row_max[n1]) : 0.0f;
++    sP(n0, m0) = static_cast<typename T::InputT>(p00);
++    sP(n1, m0) = static_cast<typename T::InputT>(p01);
++    sP(n0, m1) = static_cast<typename T::InputT>(p10);
++    sP(n1, m1) = static_cast<typename T::InputT>(p11);
++    float sum0 = p00 + p10;
++    float sum1 = p01 + p11;
++    sum0 += __shfl_xor_sync(0xffffffff, sum0, 4);
++    sum1 += __shfl_xor_sync(0xffffffff, sum1, 4);
++    sum0 += __shfl_xor_sync(0xffffffff, sum0, 8);
++    sum1 += __shfl_xor_sync(0xffffffff, sum1, 8);
++    sum0 += __shfl_xor_sync(0xffffffff, sum0, 16);
++    sum1 += __shfl_xor_sync(0xffffffff, sum1, 16);
++    if (lane < 4) {
++      plan.reduction[warp_in_group * T::BLOCK_M + n0] = sum0;
++      plan.reduction[warp_in_group * T::BLOCK_M + n1] = sum1;
++    }
++  }
++  role_barrier();
++  if (idx_in_warpgroup < T::BLOCK_M) {
++    const int row = idx_in_warpgroup;
++    float tile_sum = 0.0f;
++#pragma unroll
++    for (int warp = 0; warp < 4; ++warp) {
++      tile_sum += plan.reduction[warp * T::BLOCK_M + row];
++    }
++    plan.row_sum[row] = plan.row_sum[row] * plan.row_scale[row] + tile_sum;
++  }
++  role_barrier();
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/owner_pv.cuh b/include/flashinfer/attention/mla_swa_sm90/device/owner_pv.cuh
+new file mode 100644
+index 00000000000..144e37513fe
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/owner_pv.cuh
+@@ -0,0 +1,74 @@
++#pragma once
++
++template <int LocalSlice, int GlobalSlice, typename T, typename TmaParamsT, typename TensorOutput,
++          typename TensorSV, typename TensorSP, typename TensorSKV, typename Plan>
++__forceinline__ __device__ void pv_owner_tma_slice_static(TensorOutput& output_fragment_all,
++                                                          TensorSV const& sV, TensorSP const& sP,
++                                                          TensorSKV& sKV, Plan& plan,
++                                                          int idx_in_warpgroup, int lane,
++                                                          int next_physical_page, bool has_next,
++                                                          TmaParamsT const& tma_params) {
++  static_assert(LocalSlice >= 0 && LocalSlice < 6);
++  static_assert(GlobalSlice >= 0 && GlobalSlice < 16);
++  Tensor output_fragment_flat = output_fragment_all(_, Int<LocalSlice>{}, _0{});
++  Tensor output_fragment =
++      make_tensor(output_fragment_flat.data(), typename T::OutputSliceFragmentLayout{});
++  rescale_output_fragment<T>(output_fragment, plan, lane);
++  Tensor v_tiles = flat_divide(sV, Shape<Int<T::TILE_K>, Int<T::BLOCK_N>>{});
++  Tensor v_tile = v_tiles(_, _, Int<GlobalSlice>{}, _0{});
++  issue_pv_gemm<T>(output_fragment, v_tile, sP, idx_in_warpgroup);
++  if (has_next && idx_in_warpgroup == 0) {
++    plan.kv_free_barriers[GlobalSlice].arrive();
++    issue_kv_tma_async<GlobalSlice, false, T>(sKV, plan, next_physical_page, lane, false,
++                                              tma_params);
++  }
++}
++
++template <typename T, typename TmaParamsT, typename TensorOutput, typename TensorSV,
++          typename TensorSP, typename TensorSKV, typename Plan>
++__forceinline__ __device__ void pv_step_owner_tma_static(TensorOutput& output_fragment_all,
++                                                         int slice_begin, TensorSV const& sV,
++                                                         TensorSP const& sP, TensorSKV& sKV,
++                                                         Plan& plan, int idx_in_warpgroup, int lane,
++                                                         int next_physical_page, bool has_next,
++                                                         TmaParamsT const& tma_params) {
++  static_assert(T::BLOCK_M == 32);
++  static_assert(T::NUM_V_TILES == 16);
++  static_assert(T::NUM_PV_WARPGROUPS == 3);
++  if (slice_begin == 0) {
++    pv_owner_tma_slice_static<0, 0, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<1, 1, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<2, 2, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<3, 3, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<4, 4, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++  } else if (slice_begin == 5) {
++    pv_owner_tma_slice_static<0, 5, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<1, 6, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<2, 7, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<3, 8, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<4, 9, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                       lane, next_physical_page, has_next, tma_params);
++  } else {
++    pv_owner_tma_slice_static<0, 10, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                        lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<1, 11, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                        lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<2, 12, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                        lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<3, 13, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                        lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<4, 14, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                        lane, next_physical_page, has_next, tma_params);
++    pv_owner_tma_slice_static<5, 15, T>(output_fragment_all, sV, sP, sKV, plan, idx_in_warpgroup,
++                                        lane, next_physical_page, has_next, tma_params);
++  }
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/pv.cuh b/include/flashinfer/attention/mla_swa_sm90/device/pv.cuh
+new file mode 100644
+index 00000000000..747060c048f
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/pv.cuh
+@@ -0,0 +1,150 @@
++#pragma once
++// A single slice executor. Buffer selection and TMA producer differ, not
++// accumulator rescaling, fragment layout or the PV GEMM itself.
++template <int MaxSlices, class T, class Output, class V, class P, class KV, class Plan, class TMA>
++__forceinline__ __device__ void pv_step(Output& output_fragment_all, int output_slice_offset,
++                                        int slice_begin, int slice_end, int slice_stride,
++                                        V const& sV, P const& sP, Plan& plan, int idx_in_warpgroup,
++                                        int warp_in_group, int lane, bool signal_free, KV& sKV,
++                                        int next_physical_page, int page_plus2_physical,
++                                        int local_page, int pstate_slot, int tma_lane,
++                                        TMA const& tma_params) {
++  static_assert(MaxSlices > 0);
++#pragma unroll
++  for (int slice = 0; slice < MaxSlices; ++slice) {
++    if (slice_begin + slice * slice_stride >= slice_end) continue;
++    Tensor output_fragment_flat = output_fragment_all(_, output_slice_offset + slice, _0{});
++    Tensor output_fragment =
++        make_tensor(output_fragment_flat.data(), typename T::OutputSliceFragmentLayout{});
++    rescale_output_fragment<T>(output_fragment, plan, lane);
++    const int global_slice = slice_begin + slice * slice_stride;
++    Tensor v_tiles = flat_divide(sV, Shape<Int<T::TILE_K>, Int<T::BLOCK_N>>{});
++    Tensor v_tile = v_tiles(_, _, global_slice, _0{});
++    bool used_aux = false;
++    if constexpr (T::Config::LookAhead > 0) {
++      if ((local_page & 1) != 0 && global_slice >= T::NUM_V_TILES - T::LOOKAHEAD_K) {
++        issue_aux_pv_dynamic<T>(output_fragment, sP, plan,
++                                global_slice - (T::NUM_V_TILES - T::LOOKAHEAD_K), idx_in_warpgroup);
++        used_aux = true;
++      }
++    }
++    if (!used_aux) {
++      issue_pv_gemm<T>(output_fragment, v_tile, sP, idx_in_warpgroup);
++    }
++    if constexpr (T::Config::LookAhead > 0) {
++      if (signal_free)
++        issue_owner_tma_for_slice<T>(global_slice, sKV, plan, next_physical_page,
++                                     page_plus2_physical, local_page, tma_lane, tma_params);
++    } else {
++      if (signal_free && idx_in_warpgroup == 0) plan.kv_free_barriers[global_slice].arrive();
++    }
++  }
++}
++
++template <class C>
++struct PVRoleOps {
++  template <int kMaxSlices, class T, class Output, class KV, class P, class V, class Plan,
++            class Task, class TMA>
++  __forceinline__ __device__ static void step(Output& output, int begin, int end, int stride,
++                                              KV& sKV, P const& sP, V const& sV, Plan& plan,
++                                              Task const& task, int pv_group, int page_idx,
++                                              bool& p_ready_phase, TMA const& tma) {
++    if constexpr (C::M == 8) {
++      role_barrier();
++      role_barrier();
++      role_barrier();
++      role_barrier();
++      role_barrier();
++      pv_step<kMaxSlices, T>(output, 0, begin, end, stride, sV, sP, plan, task.idx_in_warpgroup,
++                             task.warp_in_group, task.lane, page_idx + 1 < task.end_page, sKV, -1,
++                             -1, page_idx - task.start_page, 0, task.idx_in_warpgroup, tma);
++      if (page_idx + 1 < task.end_page || C::Backend == mla_swa::Reduce::DSM) role_barrier();
++    } else {
++      const int physical_page =
++          page_idx < task.max_pages
++              ? task.block_table[task.batch_idx * task.block_table_stride_b + page_idx]
++              : -1;
++      if constexpr (C::M == 32) {
++        m32_p0_score_ready_consumer();
++        run_m32_p0_softmax_helper<T>(sP, plan, task.warpgroup, task.warp_in_group, task.lane,
++                                     physical_page, page_idx, task.m_block_idx, task.total_rows,
++                                     task.s_q, task.num_heads, task.cache_len, task.window_size,
++                                     task.softmax_scale);
++        m32_p0_p_ready();
++      }
++      const bool has_next = page_idx + 1 < task.end_page;
++      const int next_page = page_idx + 1;
++      const int next_physical_page =
++          has_next && next_page < task.max_pages
++              ? task.block_table[task.batch_idx * task.block_table_stride_b + next_page]
++              : -1;
++      if constexpr (C::M == 16) {
++        const int local_page = page_idx - task.start_page;
++        const int pstate_slot = local_page & 1;
++        Tensor page_sP = sP;
++        const int page_plus2_physical =
++            page_idx + 2 < task.end_page && page_idx + 2 < task.max_pages
++                ? task.block_table[task.batch_idx * task.block_table_stride_b + page_idx + 2]
++                : -1;
++        v0_wait_score_ready();
++        run_softmax_helper<T>(page_sP, plan, pv_group, task.warp_in_group, task.lane, physical_page,
++                              page_idx, task.m_block_idx, task.total_rows, task.s_q, task.num_heads,
++                              task.cache_len, task.window_size, task.softmax_scale, pstate_slot);
++        v0_pv_warpgroups_barrier();
++        v0_helper_done();
++        pv_step<kMaxSlices, T>(output, 0, begin, end, stride, sV, page_sP, plan,
++                               task.idx_in_warpgroup, task.warp_in_group, task.lane, has_next, sKV,
++                               next_physical_page, page_plus2_physical, local_page, pstate_slot,
++                               task.idx_in_warpgroup, tma);
++        v0_pv_warpgroups_barrier();
++      } else {
++        pv_step_owner_tma_static<T>(output, begin, sV, sP, sKV, plan, task.idx_in_warpgroup,
++                                    task.lane, next_physical_page, has_next, tma);
++        m32_p0_p_free();
++      }
++    }
++  }
++
++  template <int MaxSlices, class T, class Output, class Plan, class Task>
++  __forceinline__ __device__ static void finish(Output& output, int begin, int end, int stride,
++                                                Plan& plan, typename T::InputT* out,
++                                                Task const& task, int pv_group) {
++    if constexpr (C::Backend == mla_swa::Reduce::GlobalFP32) {
++      write_output_slices<MaxSlices, SplitOutputTraits<T>>(
++          output, 0, begin, end, plan, reinterpret_cast<float*>(out), task.batch_idx,
++          task.m_block_idx, task.total_rows, task.num_heads, task.out_stride_b, task.out_stride_s,
++          task.out_stride_h, task.warp_in_group, task.lane);
++    } else if constexpr (C::Backend == mla_swa::Reduce::Direct) {
++      write_output_slices<MaxSlices, T>(output, 0, begin, end, plan, out, task.batch_idx,
++                                        task.m_block_idx, task.total_rows, task.num_heads,
++                                        task.out_stride_b, task.out_stride_s, task.out_stride_h,
++                                        task.warp_in_group, task.lane);
++    } else if constexpr (C::M == 8) {
++      dsm_direct_accum_m8_s3_slices<false, MaxSlices, T>(
++          output, 0, begin, end, plan, out, task.batch_idx, task.m_block_idx, task.total_rows,
++          task.num_heads, task.out_stride_b, task.out_stride_s, task.out_stride_h,
++          task.idx_in_warpgroup, task.warp_in_group, task.lane);
++    } else if constexpr (C::M == 32) {
++      if (task.start_page >= task.end_page) role_barrier();
++      dsm_direct_accum_m32_pv_s2<MaxSlices, T>(output, begin, end, plan, out, task.batch_idx,
++                                               task.m_block_idx, task.total_rows, task.num_heads,
++                                               task.out_stride_b, task.out_stride_s,
++                                               task.out_stride_h, task.warp_in_group, task.lane);
++    } else {
++      // Keep the owner rank a template constant: dynamic ownership
++      // previously enlarged accumulator live ranges and spilled.
++      const int rank = cute::block_id_in_cluster().x;
++      if (rank == 0) {
++        dsm_direct_accum_pv_s2<0, 1, MaxSlices, T>(
++            output, begin, end, stride, pv_group, plan, out, task.batch_idx, task.m_block_idx,
++            task.total_rows, task.num_heads, task.out_stride_b, task.out_stride_s,
++            task.out_stride_h, task.idx_in_warpgroup, task.warp_in_group, task.lane);
++      } else {
++        dsm_direct_accum_pv_s2<1, 0, MaxSlices, T>(
++            output, begin, end, stride, pv_group, plan, out, task.batch_idx, task.m_block_idx,
++            task.total_rows, task.num_heads, task.out_stride_b, task.out_stride_s,
++            task.out_stride_h, task.idx_in_warpgroup, task.warp_in_group, task.lane);
++      }
++    }
++  }
++};
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/pv_role.cuh b/include/flashinfer/attention/mla_swa_sm90/device/pv_role.cuh
+new file mode 100644
+index 00000000000..d4197794ec4
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/pv_role.cuh
+@@ -0,0 +1,50 @@
++#pragma once
++
++template <typename T, typename TmaParamsT, typename TensorSKV, typename TensorSP, typename TensorSV,
++          typename Plan>
++__forceinline__ __device__ void run_pv_role(
++    TensorSKV& sKV, TensorSP const& sP, TensorSV const& sV, Plan& plan, const int* block_table,
++    typename T::InputT* out, int batch_idx, int m_block_idx, int total_rows, int s_q, int num_heads,
++    int max_pages, int cache_len, int start_page, int end_page, int window_size,
++    float softmax_scale, int warpgroup, int idx_in_warpgroup, int warp_in_group, int lane,
++    int64_t block_table_stride_b, int64_t out_stride_b, int64_t out_stride_s, int64_t out_stride_h,
++    TmaParamsT const& tma_params) {
++  using C = typename T::Config;
++  using Ownership = mla_swa::PVOwnership<C>;
++  constexpr int MaxSlices = Ownership::MaxSlices;
++  const int pv_group = warpgroup - 1;
++  const int slice_begin = Ownership::begin(pv_group);
++  const int slice_end = Ownership::end(pv_group);
++  constexpr int kSliceStride = Ownership::Stride;
++  Tensor output_fragment_all = partition_fragment_C(
++      typename T::TiledMMAPV{}, Shape<Int<MaxSlices * T::TILE_K>, Int<T::BLOCK_M>>{});
++  cute::fill(output_fragment_all, 0.0f);
++  const PVTask task{block_table,
++                    batch_idx,
++                    m_block_idx,
++                    total_rows,
++                    s_q,
++                    num_heads,
++                    max_pages,
++                    cache_len,
++                    start_page,
++                    end_page,
++                    window_size,
++                    softmax_scale,
++                    warpgroup,
++                    idx_in_warpgroup,
++                    warp_in_group,
++                    lane,
++                    block_table_stride_b,
++                    out_stride_b,
++                    out_stride_s,
++                    out_stride_h};
++  bool p_ready_phase = 1;
++  for (int page_idx : mla_swa::PageRange<C>{start_page, end_page}) {
++    PVRoleOps<C>::template step<MaxSlices, T>(output_fragment_all, slice_begin, slice_end,
++                                              kSliceStride, sKV, sP, sV, plan, task, pv_group,
++                                              page_idx, p_ready_phase, tma_params);
++  }
++  PVRoleOps<C>::template finish<MaxSlices, T>(output_fragment_all, slice_begin, slice_end,
++                                              kSliceStride, plan, out, task, pv_group);
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/qk.cuh b/include/flashinfer/attention/mla_swa_sm90/device/qk.cuh
+new file mode 100644
+index 00000000000..c78507d1834
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/qk.cuh
+@@ -0,0 +1,197 @@
++#pragma once
++template <class T, class MMA, class A, class B, class Score, class Plan>
++__forceinline__ __device__ void execute_qk_program(MMA& mma, A const& a, B const& b, Score& score,
++                                                   Plan& plan, int idx, bool use_aux,
++                                                   bool aux_phase, bool kv_phase) {
++  if constexpr (T::Config::LookAhead > 0) {
++    issue_qk_ready_order_lookahead<T>(mma, a, b, score, plan, idx, use_aux, aux_phase, kv_phase);
++  } else {
++    QKExecutor<typename T::Config::QKProgram>::template execute<T>(mma, a, b, score, plan,
++                                                                   kv_phase);
++  }
++}
++
++template <class T, class KV, class Plan>
++__forceinline__ __device__ void clear_masked_kv_rows(KV& sKV, Plan& plan, int page_idx,
++                                                     int local_page, int m_block_idx, int s_q,
++                                                     int cache_len, int window_size, int idx) {
++  // Qualified Hq64 and M8/16/32 keep each CTA within one query token.
++  // QK has finished reading this page; existing P-publication barriers order
++  // these stores before PV. Never modify global KV or a future-page buffer.
++  static_assert(64 % T::BLOCK_M == 0);
++  const int q_pos = cache_len - s_q + m_block_idx * T::BLOCK_M / 64;
++  const int left = max(q_pos - window_size + 1, 0);
++  const int valid_begin = min(max(left - page_idx * T::BLOCK_N, 0), T::BLOCK_N);
++  const int valid_end = min(max(q_pos + 1 - page_idx * T::BLOCK_N, valid_begin), T::BLOCK_N);
++  const int masked_rows = valid_begin + T::BLOCK_N - valid_end;
++  if (masked_rows == 0) return;
++  // Eight BF16 elements fit one aligned 16-byte store within a swizzle atom.
++  constexpr int vector_width = 8;
++  const uint4 zero = make_uint4(0, 0, 0, 0);
++  if constexpr (T::BLOCK_M == 8) {
++    // Fixed feature ownership avoids per-token index arithmetic in M8.
++    // M16/M32 keep their measured faster mapping.
++    static_assert(T::HEAD_DIM_V == 128 * vector_width && T::LOOKAHEAD_K == 0);
++    const int feature = idx * vector_width;
++    for (int token = 0; token < valid_begin; ++token)
++      *reinterpret_cast<uint4*>(&sKV(token, feature)) = zero;
++    for (int token = valid_end; token < T::BLOCK_N; ++token)
++      *reinterpret_cast<uint4*>(&sKV(token, feature)) = zero;
++  } else {
++    for (int i = idx * vector_width; i < masked_rows * T::HEAD_DIM_V; i += 128 * vector_width) {
++      const int row = i / T::HEAD_DIM_V;
++      const int token = row < valid_begin ? row : valid_end + row - valid_begin;
++      const int feature = i % T::HEAD_DIM_V;
++      if constexpr (T::LOOKAHEAD_K > 0) {
++        if ((local_page & 1) != 0 && feature >= (T::NUM_V_TILES - T::LOOKAHEAD_K) * T::TILE_K) {
++          const int slot = feature / T::TILE_K - (T::NUM_V_TILES - T::LOOKAHEAD_K);
++          Tensor aux =
++              make_tensor(make_smem_ptr(plan.aux_kv[slot].data()), typename T::SmemLayoutKVSlice{});
++          *reinterpret_cast<uint4*>(&aux(token, feature % T::TILE_K)) = zero;
++          continue;
++        }
++      }
++      *reinterpret_cast<uint4*>(&sKV(token, feature)) = zero;
++    }
++  }
++  // WGMMA reads through the async proxy, unlike the generic shared stores.
++  cutlass::arch::fence_view_async_shared();
++}
++
++// One common role loop. Accumulators are scoped to their actual role; the
++// three protocols only select publication/wait/producer operations.
++template <int QKSlices, class T, class TMA, class SQ, class KV, class P, class V, class Plan>
++__forceinline__ __device__ void run_qk_role(
++    SQ const& sQ, KV& sKV, P const& sP, V const& sV, Plan& plan, const int* block_table,
++    typename T::InputT* out, int batch_idx, int m_block_idx, int total_rows, int s_q, int num_heads,
++    int max_pages, int cache_len, int start_page, int end_page, int window_size,
++    float softmax_scale, int64_t block_table_stride_b, int64_t out_stride_b, int64_t out_stride_s,
++    int64_t out_stride_h, int idx_in_warpgroup, int warp_in_group, int lane,
++    TMA const& tma_params) {
++  using C = typename T::Config;
++  bool kv_phase = 0;
++  {
++    auto qk_output = [&]() {
++      if constexpr (QKSlices > 0) {
++        return partition_fragment_C(typename T::TiledMMAPV{},
++                                    Shape<Int<QKSlices * T::TILE_K>, Int<T::BLOCK_M>>{});
++      } else
++        return cute::tuple<>{};
++    }();
++    if constexpr (QKSlices > 0) cute::fill(qk_output, 0.0f);
++    Tensor score =
++        partition_fragment_C(typename T::TiledMMAQK{}, Shape<Int<T::BLOCK_N>, Int<T::BLOCK_M>>{});
++    typename T::TiledMMAQK qk_mma;
++    auto qk_thread = qk_mma.get_slice(idx_in_warpgroup);
++    Tensor qk_a = qk_thread.partition_fragment_A(sKV);
++    Tensor qk_b = qk_thread.partition_fragment_B(sQ);
++    bool free_phase = 0;
++    const int first_physical_page = start_page < end_page && start_page < max_pages
++                                        ? block_table[batch_idx * block_table_stride_b + start_page]
++                                        : -1;
++    if (first_physical_page >= 0) {
++      if constexpr (C::LookAhead > 0) {
++        const int second_page = start_page + 1;
++        const int second_physical_page =
++            second_page < end_page && second_page < max_pages
++                ? block_table[batch_idx * block_table_stride_b + second_page]
++                : -1;
++        issue_lookahead_prologue<T>(sKV, plan, first_physical_page, second_physical_page,
++                                    idx_in_warpgroup, tma_params);
++      }
++      execute_qk_program<T>(qk_mma, qk_a, qk_b, score, plan, idx_in_warpgroup, false, false,
++                            kv_phase);
++      kv_phase ^= 1;
++    } else
++      cute::fill(score, 0.0f);
++    for (int page_idx : mla_swa::PageRange<C>{start_page, end_page}) {
++      const int physical_page =
++          page_idx < max_pages ? block_table[batch_idx * block_table_stride_b + page_idx] : -1;
++      const bool has_next = page_idx + 1 < end_page;
++      const int next_page = page_idx + 1;
++      const int next_physical_page = has_next && next_page < max_pages
++                                         ? block_table[batch_idx * block_table_stride_b + next_page]
++                                         : -1;
++      if constexpr (C::M == 8) role_barrier();
++      if (has_next && warp_in_group == 0) {
++        issue_kv_tma_async<16, false, T>(sKV, plan, next_physical_page, lane, free_phase,
++                                         tma_params);
++      }
++      clear_masked_kv_rows<T>(sKV, plan, page_idx, page_idx - start_page, m_block_idx, s_q,
++                              cache_len, window_size, idx_in_warpgroup);
++      if constexpr (C::M == 8) {
++        register_fragment_softmax<T>(score, sP, plan, physical_page, page_idx, m_block_idx,
++                                     total_rows, s_q, num_heads, cache_len, window_size,
++                                     softmax_scale, idx_in_warpgroup, warp_in_group, lane);
++        pv_step<QKSlices, T>(qk_output, 0, 0, QKSlices, 1, sV, sP, plan, idx_in_warpgroup,
++                             warp_in_group, lane, has_next, sKV, -1, -1, page_idx - start_page, 0,
++                             idx_in_warpgroup, tma_params);
++      } else {
++        if constexpr (C::M == 16) {
++          if (page_idx > start_page) v0_wait_helper_done();
++        }
++        Tensor sScore =
++            make_tensor(make_smem_ptr(plan.softmax_score.data()), typename T::SmemLayoutScore{});
++        store_score_fragment<T>(score, sScore, warp_in_group, lane);
++        if constexpr (C::M == 16) {
++          qk_warpgroup_barrier();
++          v0_score_ready();
++        } else {
++          m32_p0_qk_warpgroup_barrier();
++          m32_p0_score_ready_producer();
++          run_m32_p0_softmax_helper<T>(sP, plan, 0, warp_in_group, lane, physical_page, page_idx,
++                                       m_block_idx, total_rows, s_q, num_heads, cache_len,
++                                       window_size, softmax_scale);
++          m32_p0_p_ready();
++        }
++      }
++      if constexpr (C::M == 8) {
++        if (has_next) {
++          if (warp_in_group == 0)
++            issue_kv_tma_stream<0, 1, T>(sKV, plan, next_physical_page, lane, free_phase,
++                                         tma_params);
++          else if (warp_in_group == 1)
++            issue_kv_tma_stream<1, 6, T>(sKV, plan, next_physical_page, lane, free_phase,
++                                         tma_params);
++          else if (warp_in_group == 2)
++            issue_kv_tma_stream<6, 11, T>(sKV, plan, next_physical_page, lane, free_phase,
++                                          tma_params);
++          else
++            issue_kv_tma_stream<11, 16, T>(sKV, plan, next_physical_page, lane, free_phase,
++                                           tma_params);
++        }
++        if (has_next || C::Backend == mla_swa::Reduce::DSM) role_barrier();
++      }
++      if (has_next) {
++        if (next_physical_page >= 0) {
++          const int next_local_page = page_idx - start_page + 1;
++          execute_qk_program<T>(qk_mma, qk_a, qk_b, score, plan, idx_in_warpgroup,
++                                (next_local_page & 1) != 0, ((next_local_page >> 1) & 1) != 0,
++                                kv_phase);
++        } else
++          cute::fill(score, 0.0f);
++        kv_phase ^= 1;
++        free_phase ^= 1;
++      }
++      if constexpr (C::M == 32) m32_p0_p_free();
++    }
++    if constexpr (C::M == 8) {
++      if constexpr (C::Backend == mla_swa::Reduce::GlobalFP32) {
++        write_output_slices<QKSlices, SplitOutputTraits<T>>(
++            qk_output, 0, 0, QKSlices, plan, reinterpret_cast<float*>(out), batch_idx, m_block_idx,
++            total_rows, num_heads, out_stride_b, out_stride_s, out_stride_h, warp_in_group, lane);
++      } else {
++        dsm_direct_accum_m8_s3_slices<true, QKSlices, T>(
++            qk_output, 0, 0, QKSlices, plan, out, batch_idx, m_block_idx, total_rows, num_heads,
++            out_stride_b, out_stride_s, out_stride_h, idx_in_warpgroup, warp_in_group, lane);
++      }
++    } else if constexpr (C::M == 16) {
++      if (start_page < end_page) v0_wait_helper_done();
++    }
++  }
++  if constexpr (C::M == 32 && C::Backend == mla_swa::Reduce::DSM) {
++    if (start_page >= end_page) role_barrier();
++    dsm_direct_accum_m32_qk_s2<T>(plan, idx_in_warpgroup, out, batch_idx, m_block_idx, total_rows,
++                                  num_heads, out_stride_b, out_stride_s, out_stride_h);
++  }
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/qk_sequence.cuh b/include/flashinfer/attention/mla_swa_sm90/device/qk_sequence.cuh
+new file mode 100644
+index 00000000000..e6d35aa49fe
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/qk_sequence.cuh
+@@ -0,0 +1,22 @@
++#pragma once
++template <class Program>
++struct QKExecutor;
++template <class... Ops>
++struct QKExecutor<mla_swa::QKSequence<Ops...>> {
++  template <class Op, class T, class MMA, class A, class B, class Score, class Plan>
++  __forceinline__ __device__ static void issue(MMA& mma, A const& a, B const& b, Score& score,
++                                               Plan& plan, bool phase) {
++    if constexpr (Op::second < 0)
++      issue_qk_ready_single<Op::first, Op::zero, T>(mma, a, b, score, plan, phase);
++    else
++      issue_qk_ready_pair<Op::first, Op::second, Op::zero, T>(mma, a, b, score, plan, phase);
++  }
++  template <class T, class MMA, class A, class B, class Score, class Plan>
++  __forceinline__ __device__ static void execute(MMA& mma, A const& a, B const& b, Score& score,
++                                                 Plan& plan, bool phase) {
++    warpgroup_fence_operand(score);
++    (issue<Ops, T>(mma, a, b, score, plan, phase), ...);
++    warpgroup_wait<0>();
++    warpgroup_fence_operand(score);
++  }
++};
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/softmax.cuh b/include/flashinfer/attention/mla_swa_sm90/device/softmax.cuh
+new file mode 100644
+index 00000000000..36ed304b1dc
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/softmax.cuh
+@@ -0,0 +1,79 @@
++#pragma once
++
++template <typename T, typename TensorSP, typename Plan>
++__forceinline__ __device__ void softmax_one_row(TensorSP const& sP, Plan& plan, int row, int lane,
++                                                int physical_page, int page_idx, int m_block_idx,
++                                                int total_rows, int s_q, int num_heads,
++                                                int cache_len, int window_size,
++                                                float softmax_scale) {
++  Tensor sScore =
++      make_tensor(make_smem_ptr(plan.softmax_score.data()), typename T::SmemLayoutScore{});
++  const int global_row = m_block_idx * T::BLOCK_M + row;
++  const bool row_valid = physical_page >= 0 && global_row < total_rows;
++  int q_pos = 0, left = 0;
++  if (lane == 0 && row_valid) {
++    q_pos = cache_len - s_q + global_row / num_heads;
++    left = max(q_pos - window_size + 1, 0);
++  }
++  q_pos = __shfl_sync(0xffffffff, q_pos, 0);
++  left = __shfl_sync(0xffffffff, left, 0);
++  const int token0 = page_idx * T::BLOCK_N + lane;
++  const int token1 = token0 + 32;
++  const float scale = softmax_scale * 1.4426950408889634f;
++  const float score0 =
++      row_valid && token0 >= left && token0 <= q_pos ? sScore(row, lane) * scale : -CUDART_INF_F;
++  const float score1 = row_valid && token1 >= left && token1 <= q_pos
++                           ? sScore(row, lane + 32) * scale
++                           : -CUDART_INF_F;
++  float tile_max = fmaxf(score0, score1);
++#pragma unroll
++  for (int offset = 16; offset > 0; offset >>= 1)
++    tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffff, tile_max, offset));
++  float new_max = -CUDART_INF_F, row_scale = 0.0f;
++  if (lane == 0) {
++    const float old_max = plan.row_max[row];
++    new_max = fmaxf(old_max, tile_max);
++    row_scale = isfinite(old_max) ? exp2f(old_max - new_max) : 0.0f;
++    plan.row_scale[row] = row_scale;
++    plan.row_max[row] = new_max;
++  }
++  new_max = __shfl_sync(0xffffffff, new_max, 0);
++  row_scale = __shfl_sync(0xffffffff, row_scale, 0);
++  const float p0 = isfinite(score0) ? exp2f(score0 - new_max) : 0.0f;
++  if constexpr (T::Config::StoreP0First) sP(row, lane) = static_cast<typename T::InputT>(p0);
++  const float p1 = isfinite(score1) ? exp2f(score1 - new_max) : 0.0f;
++  if constexpr (!T::Config::StoreP0First) sP(row, lane) = static_cast<typename T::InputT>(p0);
++  sP(row, lane + 32) = static_cast<typename T::InputT>(p1);
++  float tile_sum = p0 + p1;
++#pragma unroll
++  for (int offset = 16; offset > 0; offset >>= 1)
++    tile_sum += __shfl_down_sync(0xffffffff, tile_sum, offset);
++  if (lane == 0) plan.row_sum[row] = plan.row_sum[row] * row_scale + tile_sum;
++}
++
++template <typename T, typename TensorSP, typename Plan>
++__forceinline__ __device__ void run_m32_p0_softmax_helper(TensorSP const& sP, Plan& plan,
++                                                          int warpgroup, int warp_in_group,
++                                                          int lane, int physical_page, int page_idx,
++                                                          int m_block_idx, int total_rows, int s_q,
++                                                          int num_heads, int cache_len,
++                                                          int window_size, float softmax_scale) {
++  const int warp = warpgroup * 4 + warp_in_group;
++#pragma unroll
++  for (int row_in_warp = 0; row_in_warp < 2; ++row_in_warp) {
++    const int row = warp * 2 + row_in_warp;
++    softmax_one_row<T>(sP, plan, row, lane, physical_page, page_idx, m_block_idx, total_rows, s_q,
++                       num_heads, cache_len, window_size, softmax_scale);
++  }
++}
++
++template <typename T, typename TensorSP, typename Plan>
++__forceinline__ __device__ void run_softmax_helper(
++    TensorSP const& sP, Plan& plan, int pv_group, int warp_in_group, int lane, int physical_page,
++    int page_idx, int m_block_idx, int total_rows, int s_q, int num_heads, int cache_len,
++    int window_size, float softmax_scale, int pstate_slot, float* deferred_p0 = nullptr,
++    float* deferred_p1 = nullptr, float* deferred_row_scale = nullptr) {
++  const int row = pv_group * 4 + warp_in_group;
++  softmax_one_row<T>(sP, plan, row, lane, physical_page, page_idx, m_block_idx, total_rows, s_q,
++                     num_heads, cache_len, window_size, softmax_scale);
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/storage.cuh b/include/flashinfer/attention/mla_swa_sm90/device/storage.cuh
+new file mode 100644
+index 00000000000..a0cf3c392bb
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/storage.cuh
+@@ -0,0 +1,107 @@
++template <class T, int Kind>
++struct PhysicalStorage;
++
++template <class T>
++struct PhysicalStorage<T, 0> {
++  using InputT = typename T::InputT;
++  using SmemLayoutQ = typename T::SmemLayoutQ;
++  using SmemLayoutKV = typename T::SmemLayoutKV;
++  using SmemLayoutKVSlice = typename T::SmemLayoutKVSlice;
++  using SmemLayoutP = typename T::SmemLayoutP;
++  static constexpr int BLOCK_M = T::BLOCK_M, BLOCK_N = T::BLOCK_N;
++  static constexpr int NUM_K_TILES = T::NUM_K_TILES, NUM_V_TILES = T::NUM_V_TILES;
++
++  cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> q;
++  cute::array_aligned<InputT, cosize_v<SmemLayoutKV>> kv;
++  cute::array_aligned<InputT, cosize_v<SmemLayoutP> * 1> p;
++  cute::array_aligned<float, BLOCK_M> row_max;
++  cute::array_aligned<float, BLOCK_M> row_sum;
++  cute::array_aligned<float, BLOCK_M * 1> row_scale;
++  cute::array_aligned<float, 4 * BLOCK_M> reduction;
++  int physical_page;
++  TMABarrier q_barrier;
++  TMABarrier q_slice_barriers[NUM_K_TILES];
++  TMABarrier kv_barriers[NUM_K_TILES];
++  TMABarrier kv_free_barriers[NUM_V_TILES];
++};
++
++template <class T>
++struct PhysicalStorage<T, 1> {
++  using InputT = typename T::InputT;
++  using SmemLayoutQ = typename T::SmemLayoutQ;
++  using SmemLayoutKV = typename T::SmemLayoutKV;
++  using SmemLayoutKVSlice = typename T::SmemLayoutKVSlice;
++  using SmemLayoutP = typename T::SmemLayoutP;
++  static constexpr int BLOCK_M = T::BLOCK_M, BLOCK_N = T::BLOCK_N;
++  static constexpr int NUM_K_TILES = T::NUM_K_TILES, NUM_V_TILES = T::NUM_V_TILES;
++
++  cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> q;
++  cute::array_aligned<InputT, cosize_v<SmemLayoutKV>> kv;
++  cute::array_aligned<InputT, cosize_v<SmemLayoutKVSlice>> aux_kv[4 + 0];
++  cute::array_aligned<InputT, cosize_v<SmemLayoutP> * 1> p;
++  cute::array_aligned<float, BLOCK_M> row_max;
++  cute::array_aligned<float, BLOCK_M> row_sum;
++  cute::array_aligned<float, BLOCK_M * 1> row_scale;
++  cute::array_aligned<float, 4 * BLOCK_M> reduction;
++  cute::array_aligned<float, BLOCK_M * BLOCK_N * 1> softmax_score;
++  int physical_page;
++  TMABarrier q_barrier;
++  TMABarrier pv_done_barrier;
++  TMABarrier kv_barriers[NUM_K_TILES];
++  TMABarrier aux_kv_barriers[4 + 0];
++  TMABarrier kv_free_barriers[NUM_V_TILES];
++  TMABarrier softmax_score_ready;
++  TMABarrier softmax_done;
++};
++
++template <class T>
++struct PhysicalStorage<T, 2> {
++  using InputT = typename T::InputT;
++  using SmemLayoutQ = typename T::SmemLayoutQ;
++  using SmemLayoutKV = typename T::SmemLayoutKV;
++  using SmemLayoutKVSlice = typename T::SmemLayoutKVSlice;
++  using SmemLayoutP = typename T::SmemLayoutP;
++  static constexpr int BLOCK_M = T::BLOCK_M, BLOCK_N = T::BLOCK_N;
++  static constexpr int NUM_K_TILES = T::NUM_K_TILES, NUM_V_TILES = T::NUM_V_TILES;
++
++  cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> q;
++  cute::array_aligned<InputT, cosize_v<SmemLayoutKV>> kv;
++  cute::array_aligned<InputT, cosize_v<SmemLayoutP> * 1> p;
++  cute::array_aligned<float, BLOCK_M> row_max;
++  cute::array_aligned<float, BLOCK_M> row_sum;
++  cute::array_aligned<float, BLOCK_M * 1> row_scale;
++  cute::array_aligned<float, 4 * BLOCK_M> reduction;
++  cute::array_aligned<float, BLOCK_M * BLOCK_N * 1> softmax_score;
++  int physical_page;
++  TMABarrier q_barrier;
++  TMABarrier q_slice_barriers[NUM_K_TILES];
++  TMABarrier kv_barriers[NUM_K_TILES];
++  TMABarrier kv_free_barriers[NUM_V_TILES];
++};
++
++template <class T>
++struct PhysicalStorage<T, 3> {
++  using InputT = typename T::InputT;
++  using SmemLayoutQ = typename T::SmemLayoutQ;
++  using SmemLayoutKV = typename T::SmemLayoutKV;
++  using SmemLayoutKVSlice = typename T::SmemLayoutKVSlice;
++  using SmemLayoutP = typename T::SmemLayoutP;
++  static constexpr int BLOCK_M = T::BLOCK_M, BLOCK_N = T::BLOCK_N;
++  static constexpr int NUM_K_TILES = T::NUM_K_TILES, NUM_V_TILES = T::NUM_V_TILES;
++
++  cute::array_aligned<InputT, cosize_v<SmemLayoutQ>> q;
++  cute::array_aligned<InputT, cosize_v<SmemLayoutKV>> kv;
++  cute::array_aligned<InputT, cosize_v<SmemLayoutP> * 1> p;
++  cute::array_aligned<float, BLOCK_M> row_max;
++  cute::array_aligned<float, BLOCK_M> row_sum;
++  cute::array_aligned<float, BLOCK_M * 1> row_scale;
++  cute::array_aligned<float, 4 * BLOCK_M> reduction;
++  cute::array_aligned<float, BLOCK_M * BLOCK_N * 1> softmax_score;
++  int physical_page;
++  TMABarrier q_barrier;
++  cutlass::arch::ClusterBarrier p1_ready[4];
++  cutlass::arch::ClusterBarrier p1_ack[4];
++  TMABarrier q_slice_barriers[NUM_K_TILES];
++  TMABarrier kv_barriers[NUM_K_TILES];
++  TMABarrier kv_free_barriers[NUM_V_TILES];
++};
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/sync.cuh b/include/flashinfer/attention/mla_swa_sm90/device/sync.cuh
+new file mode 100644
+index 00000000000..975c71b5497
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/sync.cuh
+@@ -0,0 +1,66 @@
++#pragma once
++
++__forceinline__ __device__ void role_barrier() { asm volatile("bar.sync 0;" ::: "memory"); }
++
++__forceinline__ __device__ void qk_warpgroup_barrier() {
++  asm volatile("bar.sync 1, 128;" ::: "memory");
++}
++
++__forceinline__ __device__ void v0_score_ready() {
++  asm volatile("bar.arrive 8, 640;" ::: "memory");
++}
++
++__forceinline__ __device__ void v0_wait_helper_done() {
++  asm volatile("bar.sync 9, 640;" ::: "memory");
++}
++
++__forceinline__ __device__ void m32_p0_qk_warpgroup_barrier() {
++  asm volatile("bar.sync 1, 128;" ::: "memory");
++}
++
++__forceinline__ __device__ void m32_p0_score_ready_producer() {
++  asm volatile("bar.arrive 8, 512;" ::: "memory");
++}
++
++__forceinline__ __device__ void m32_p0_p_ready() { asm volatile("bar.sync 9, 512;" ::: "memory"); }
++
++__forceinline__ __device__ void m32_p0_p_free() { asm volatile("bar.sync 10, 512;" ::: "memory"); }
++
++__forceinline__ __device__ void p1_wg_sync(int wg) {
++  asm volatile("bar.sync %0, 128;" ::"r"(wg + 12) : "memory");
++}
++
++__forceinline__ __device__ void p1_release(cutlass::arch::ClusterBarrier const& event, int peer) {
++  const uint32_t address = cute::cast_smem_ptr_to_uint(&event);
++  asm volatile(
++      "{ .reg .b32 remote; mapa.shared::cluster.u32 remote, %0, %1; "
++      "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remote]; }" ::"r"(address),
++      "r"(peer)
++      : "memory");
++}
++
++__forceinline__ __device__ void p1_acquire(cutlass::arch::ClusterBarrier const& event) {
++  const uint32_t address = cute::cast_smem_ptr_to_uint(&event);
++  asm volatile(
++      "{ .reg .pred ready; P1_WAIT: "
++      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 ready, [%0], 0, %1; "
++      "@!ready bra P1_WAIT; }" ::"r"(address),
++      "r"(0x989680)
++      : "memory");
++}
++
++__forceinline__ __device__ void v0_wait_score_ready() {
++  asm volatile("bar.sync 8, 640;" ::: "memory");
++}
++
++__forceinline__ __device__ void v0_helper_done() {
++  asm volatile("bar.arrive 9, 640;" ::: "memory");
++}
++
++__forceinline__ __device__ void v0_pv_warpgroups_barrier() {
++  asm volatile("bar.sync 10, 512;" ::: "memory");
++}
++
++__forceinline__ __device__ void m32_p0_score_ready_consumer() {
++  asm volatile("bar.sync 8, 512;" ::: "memory");
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/tma.cuh b/include/flashinfer/attention/mla_swa_sm90/device/tma.cuh
+new file mode 100644
+index 00000000000..b31a8b85aa2
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/tma.cuh
+@@ -0,0 +1,178 @@
++#pragma once
++
++template <int Start, int End, typename TMAK, typename TensorG, typename TensorS>
++__forceinline__ __device__ void launch_kv_tma(TensorG const& gkv, TensorS& skv, TMAK const& tma_k,
++                                              TMABarrier* barriers, int thread_idx) {
++  if (thread_idx == 0) {
++    auto thr_tma = tma_k.get_slice(_0{});
++    Tensor src = thr_tma.partition_S(gkv)(_, _0{}, Int<Start>{});
++    Tensor dst = thr_tma.partition_D(skv)(_, _0{}, Int<Start>{});
++    cute::copy(tma_k.with(reinterpret_cast<typename TMABarrier::ValueType&>(barriers[Start]), 0,
++                          cute::TMA::CacheHintSm90::EVICT_FIRST),
++               src, dst);
++    if constexpr (Start + 1 < End) {
++      launch_kv_tma<Start + 1, End>(gkv, skv, tma_k, barriers, thread_idx);
++    }
++  }
++}
++
++template <int Tile, bool WaitForFree, typename T, typename TmaParamsT, typename TensorSKV,
++          typename Plan>
++__forceinline__ __device__ void issue_kv_tma_async(TensorSKV& sKV, Plan& plan, int physical_page,
++                                                   int lane, bool free_phase,
++                                                   TmaParamsT const& tma_params) {
++  static_assert(Tile < T::NUM_K_TILES);
++  if (lane != 0) {
++    return;
++  }
++  if constexpr (WaitForFree) {
++    static_assert(Tile < T::NUM_V_TILES);
++    plan.kv_free_barriers[Tile].wait(free_phase);
++  }
++  if (physical_page < 0) {
++    return;
++  }
++  Tensor gkv = tma_params.tma_k.get_tma_tensor(tma_params.shape_k)(_, _, physical_page);
++  launch_kv_tma<Tile, Tile + 1>(gkv, sKV, tma_params.tma_k, plan.kv_barriers, 0);
++  plan.kv_barriers[Tile].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K * sizeof(typename T::InputT));
++}
++
++template <int Tile, int End, typename T, typename TmaParamsT, typename TensorSKV, typename Plan>
++__forceinline__ __device__ void issue_kv_tma_stream(TensorSKV& sKV, Plan& plan, int physical_page,
++                                                    int lane, bool free_phase,
++                                                    TmaParamsT const& tma_params) {
++  static_assert(Tile < End && End <= T::NUM_V_TILES);
++  issue_kv_tma_async<Tile, true, T>(sKV, plan, physical_page, lane, free_phase, tma_params);
++  if constexpr (Tile + 1 < End) {
++    issue_kv_tma_stream<Tile + 1, End, T>(sKV, plan, physical_page, lane, free_phase, tma_params);
++  }
++}
++
++template <typename T, typename TmaParamsT, typename TensorSKV, typename Plan>
++__forceinline__ __device__ void issue_base_kv_tma_dynamic(TensorSKV& sKV, Plan& plan,
++                                                          int physical_page, int tile, int lane,
++                                                          TmaParamsT const& tma_params) {
++  if (lane != 0 || physical_page < 0) {
++    return;
++  }
++  Tensor gkv = tma_params.tma_k.get_tma_tensor(tma_params.shape_k)(_, _, physical_page);
++  auto thr_tma = tma_params.tma_k.get_slice(_0{});
++  Tensor src = thr_tma.partition_S(gkv)(_, _0{}, tile);
++  Tensor dst = thr_tma.partition_D(sKV)(_, _0{}, tile);
++  cute::copy(tma_params.tma_k.with(
++                 reinterpret_cast<typename TMABarrier::ValueType&>(plan.kv_barriers[tile]), 0,
++                 cute::TMA::CacheHintSm90::EVICT_FIRST),
++             src, dst);
++  plan.kv_barriers[tile].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K * sizeof(typename T::InputT));
++}
++
++template <typename T, typename TmaParamsT, typename Plan>
++__forceinline__ __device__ void issue_aux_kv_tma_dynamic(Plan& plan, int physical_page, int tile,
++                                                         int slot, int lane,
++                                                         TmaParamsT const& tma_params) {
++  if (lane != 0 || physical_page < 0) {
++    return;
++  }
++  Tensor gkv = tma_params.tma_k.get_tma_tensor(tma_params.shape_k)(_, _, physical_page);
++  Tensor sAux =
++      make_tensor(make_smem_ptr(plan.aux_kv[slot].data()), typename T::SmemLayoutKVSlice{});
++  auto thr_tma = tma_params.tma_k.get_slice(_0{});
++  Tensor src = thr_tma.partition_S(gkv)(_, _0{}, tile);
++  Tensor dst = thr_tma.partition_D(sAux)(_, _0{}, _0{});
++  cute::copy(tma_params.tma_k.with(
++                 reinterpret_cast<typename TMABarrier::ValueType&>(plan.aux_kv_barriers[slot]), 0,
++                 cute::TMA::CacheHintSm90::EVICT_FIRST),
++             src, dst);
++  plan.aux_kv_barriers[slot].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K *
++                                                  sizeof(typename T::InputT));
++}
++
++template <typename T, typename TmaParamsT, typename TensorSKV, typename Plan>
++__forceinline__ __device__ void issue_owner_tma_for_slice(int global_slice, TensorSKV& sKV,
++                                                          Plan& plan, int next_physical_page,
++                                                          int page_plus2_physical, int local_page,
++                                                          int lane, TmaParamsT const& tma_params) {
++  static_assert(T::NUM_V_TILES == 16);
++  if (global_slice >= T::NUM_V_TILES - T::LOOKAHEAD_K) {
++    const int slot = global_slice - (T::NUM_V_TILES - T::LOOKAHEAD_K);
++    if ((local_page & 1) == 0) {
++      issue_base_kv_tma_dynamic<T>(sKV, plan, page_plus2_physical, global_slice, lane, tma_params);
++    } else {
++      issue_aux_kv_tma_dynamic<T>(plan, page_plus2_physical, global_slice, slot, lane, tma_params);
++    }
++  } else {
++    issue_base_kv_tma_dynamic<T>(sKV, plan, next_physical_page, global_slice, lane, tma_params);
++  }
++}
++
++template <int Tile, int End, typename T, typename TmaParamsT, typename TensorSKV, typename Plan>
++__forceinline__ __device__ void issue_base_kv_range_async(TensorSKV& sKV, Plan& plan,
++                                                          int physical_page, int lane,
++                                                          TmaParamsT const& tma_params) {
++  static_assert(Tile < End && End <= T::NUM_K_TILES);
++  issue_kv_tma_async<Tile, false, T>(sKV, plan, physical_page, lane, false, tma_params);
++  if constexpr (Tile + 1 < End) {
++    issue_base_kv_range_async<Tile + 1, End, T>(sKV, plan, physical_page, lane, tma_params);
++  }
++}
++
++template <int Slot, typename T, typename TmaParamsT, typename TensorSKV, typename Plan>
++__forceinline__ __device__ void issue_prologue_selected_base_descending(
++    TensorSKV& sKV, Plan& plan, int physical_page, int lane, TmaParamsT const& tma_params) {
++  constexpr int Tile = T::NUM_V_TILES - T::LOOKAHEAD_K + Slot;
++  issue_kv_tma_async<Tile, false, T>(sKV, plan, physical_page, lane, false, tma_params);
++  if constexpr (Slot > 0) {
++    issue_prologue_selected_base_descending<Slot - 1, T>(sKV, plan, physical_page, lane,
++                                                         tma_params);
++  }
++}
++
++template <int Tile, int Slot, typename T, typename TmaParamsT, typename Plan>
++__forceinline__ __device__ void issue_aux_kv_tma_async(Plan& plan, int physical_page, int lane,
++                                                       TmaParamsT const& tma_params) {
++  static_assert(T::LOOKAHEAD_K > 0);
++  static_assert(Tile >= T::NUM_V_TILES - T::LOOKAHEAD_K);
++  static_assert(Tile < T::NUM_V_TILES);
++  static_assert(Slot == Tile - (T::NUM_V_TILES - T::LOOKAHEAD_K));
++  if (lane != 0 || physical_page < 0) {
++    return;
++  }
++  Tensor gkv = tma_params.tma_k.get_tma_tensor(tma_params.shape_k)(_, _, physical_page);
++  Tensor sAux = make_tensor(make_smem_ptr(plan.aux_kv[Slot + T::AUX_GUARD_SLICES].data()),
++                            typename T::SmemLayoutKVSlice{});
++  auto thr_tma = tma_params.tma_k.get_slice(_0{});
++  Tensor src = thr_tma.partition_S(gkv)(_, _0{}, Int<Tile>{});
++  Tensor dst = thr_tma.partition_D(sAux)(_, _0{}, _0{});
++  cute::copy(tma_params.tma_k.with(reinterpret_cast<typename TMABarrier::ValueType&>(
++                                       plan.aux_kv_barriers[Slot + T::AUX_GUARD_SLICES]),
++                                   0, cute::TMA::CacheHintSm90::EVICT_FIRST),
++             src, dst);
++  plan.aux_kv_barriers[Slot + T::AUX_GUARD_SLICES].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K *
++                                                                        sizeof(typename T::InputT));
++}
++
++template <int Slot, typename T, typename TmaParamsT, typename Plan>
++__forceinline__ __device__ void issue_prologue_selected_aux_descending(
++    Plan& plan, int physical_page, int lane, TmaParamsT const& tma_params) {
++  constexpr int Tile = T::NUM_V_TILES - T::LOOKAHEAD_K + Slot;
++  issue_aux_kv_tma_async<Tile, Slot, T>(plan, physical_page, lane, tma_params);
++  if constexpr (Slot > 0) {
++    issue_prologue_selected_aux_descending<Slot - 1, T>(plan, physical_page, lane, tma_params);
++  }
++}
++
++template <typename T, typename TmaParamsT, typename TensorSKV, typename Plan>
++__forceinline__ __device__ void issue_lookahead_prologue(TensorSKV& sKV, Plan& plan,
++                                                         int first_physical_page,
++                                                         int second_physical_page, int lane,
++                                                         TmaParamsT const& tma_params) {
++  static_assert(T::LOOKAHEAD_K > 0);
++  issue_prologue_selected_base_descending<T::LOOKAHEAD_K - 1, T>(sKV, plan, first_physical_page,
++                                                                 lane, tma_params);
++  issue_kv_tma_async<T::NUM_V_TILES, false, T>(sKV, plan, first_physical_page, lane, false,
++                                               tma_params);
++  issue_base_kv_range_async<0, T::NUM_V_TILES - T::LOOKAHEAD_K, T>(sKV, plan, first_physical_page,
++                                                                   lane, tma_params);
++  issue_prologue_selected_aux_descending<T::LOOKAHEAD_K - 1, T>(plan, second_physical_page, lane,
++                                                                tma_params);
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/traits.cuh b/include/flashinfer/attention/mla_swa_sm90/device/traits.cuh
+new file mode 100644
+index 00000000000..10bf6fea7a0
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/traits.cuh
+@@ -0,0 +1,67 @@
++template <typename InputT_, typename Config_>
++struct Traits {
++  using Config = Config_;
++  using InputT = InputT_;
++  static constexpr int BLOCK_M = Config::M;
++  static constexpr int BLOCK_N = Config::Page;
++  static constexpr int HEAD_DIM_K = Config::Dq;
++  static constexpr int HEAD_DIM_V = Config::Dv;
++  static constexpr int TILE_K = Config::Slice;
++  static constexpr int NUM_K_TILES = HEAD_DIM_K / TILE_K;
++  static constexpr int NUM_V_TILES = HEAD_DIM_V / TILE_K;
++  static constexpr int LOOKAHEAD_K = Config::LookAhead;
++  static constexpr int AUX_GUARD_SLICES = 0;
++  static constexpr int NUM_PV_WARPGROUPS = Config::PvWG;
++  static constexpr int NUM_SOFTMAX_WARPGROUPS = 0 ? 1 : 0;
++  static constexpr int NUM_THREADS = (1 + NUM_SOFTMAX_WARPGROUPS + NUM_PV_WARPGROUPS + 0) * 128;
++  static constexpr int QK_WG_REGISTERS =
++      NUM_PV_WARPGROUPS == 2 ? 128 : (NUM_PV_WARPGROUPS == 3 ? 96 : 64);
++  static constexpr int PV_WG_REGISTERS =
++      NUM_PV_WARPGROUPS == 2 ? 192 : (NUM_PV_WARPGROUPS == 3 ? 136 : 112);
++  static_assert(HEAD_DIM_K % TILE_K == 0);
++  static_assert(LOOKAHEAD_K == 0 || LOOKAHEAD_K == 2 || LOOKAHEAD_K == 3 || LOOKAHEAD_K == 4 ||
++                LOOKAHEAD_K == 5 || LOOKAHEAD_K == 6);
++  static_assert(AUX_GUARD_SLICES == 0 || AUX_GUARD_SLICES == 1);
++  static_assert(BLOCK_M == 8 || BLOCK_M == 16 || BLOCK_M == 32);
++  static_assert(HEAD_DIM_V % TILE_K == 0);
++  static_assert(std::is_same_v<InputT, cutlass::bfloat16_t>,
++                "The first target implementation is BF16 only");
++  using TiledMMAQK = decltype(make_tiled_mma(
++      GMMA::ss_op_selector<InputT, InputT, float, Shape<Int<BLOCK_N>, Int<BLOCK_M>, Int<TILE_K>>,
++                           GMMA::Major::K, GMMA::Major::K>(),
++      Layout<Shape<_1, _1, _1>>{}));
++  using TiledMMAPV = decltype(make_tiled_mma(
++      GMMA::ss_op_selector<InputT, InputT, float, Shape<Int<TILE_K>, Int<BLOCK_M>, Int<BLOCK_N>>,
++                           GMMA::Major::MN, GMMA::Major::K>(),
++      Layout<Shape<_1, _1, _1>>{}));
++  using SmemLayoutQ = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<InputT>{},
++                                             Shape<Int<BLOCK_M>, Int<HEAD_DIM_K>>{}));
++  using SmemLayoutQSlice = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<InputT>{},
++                                                  Shape<Int<BLOCK_M>, Int<TILE_K>>{}));
++  using SmemLayoutKV = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<InputT>{},
++                                              Shape<Int<BLOCK_N>, Int<HEAD_DIM_K>>{}));
++  using SmemLayoutKVSlice = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<InputT>{},
++                                                   Shape<Int<BLOCK_N>, Int<TILE_K>>{}));
++  using SmemLayoutP = decltype(tile_to_shape(GMMA::Layout_K_SW128_Atom<InputT>{},
++                                             Shape<Int<BLOCK_M>, Int<BLOCK_N>>{}));
++  using SmemLayoutScore = decltype(make_layout(Shape<Int<BLOCK_M>, Int<BLOCK_N>>{}, GenRowMajor{}));
++  using SmemLayoutV = decltype(composition(
++      SmemLayoutKV{}, make_layout(Shape<Int<HEAD_DIM_V>, Int<BLOCK_N>>{}, GenRowMajor{})));
++  using SmemLayoutVSlice = decltype(composition(
++      SmemLayoutKVSlice{}, make_layout(Shape<Int<TILE_K>, Int<BLOCK_N>>{}, GenRowMajor{})));
++  using ScoreFragmentLayout =
++      decltype(layout(partition_fragment_C(TiledMMAQK{}, Shape<Int<BLOCK_N>, Int<BLOCK_M>>{})));
++  using OutputSliceFragmentLayout =
++      decltype(layout(partition_fragment_C(TiledMMAPV{}, Shape<Int<TILE_K>, Int<BLOCK_M>>{})));
++  static constexpr int SCORE_FLOATS_PER_THREAD = cosize_v<ScoreFragmentLayout>;
++  static constexpr int OUTPUT_FLOATS_PER_THREAD_PER_SLICE = cosize_v<OutputSliceFragmentLayout>;
++  static constexpr int OUTPUT_SLICES_PER_PV_WG =
++      (NUM_V_TILES + NUM_PV_WARPGROUPS - 1) / NUM_PV_WARPGROUPS;
++  static constexpr int OUTPUT_FLOATS_PER_PV_THREAD =
++      OUTPUT_FLOATS_PER_THREAD_PER_SLICE * OUTPUT_SLICES_PER_PV_WG;
++  using SharedMemoryPlan = PhysicalStorage<Traits<InputT_, Config_>, Config::StorageKind>;
++
++  static constexpr int SHARED_BYTES = sizeof(SharedMemoryPlan);
++  static_assert(SHARED_BYTES < 227 * 1024,
++                "M32/N64 single-buffer design must fit Hopper shared memory");
++};
+diff --git a/include/flashinfer/attention/mla_swa_sm90/device/wgmma.cuh b/include/flashinfer/attention/mla_swa_sm90/device/wgmma.cuh
+new file mode 100644
+index 00000000000..43b80565742
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/device/wgmma.cuh
+@@ -0,0 +1,19 @@
++#pragma once
++template <bool ZeroInit, bool WaitForCompletion = true, class TiledMMA, class TensorA,
++          class TensorB, class TensorC>
++__forceinline__ __device__ void issue_wgmma(TiledMMA& tiled_mma, TensorA const& a, TensorB const& b,
++                                            TensorC& c) {
++  warpgroup_fence_operand(c);
++  warpgroup_arrive();
++  tiled_mma.accumulate_ = ZeroInit ? GMMA::ScaleOut::Zero : GMMA::ScaleOut::One;
++  CUTLASS_PRAGMA_UNROLL
++  for (int k_block = 0; k_block < size<2>(a); ++k_block) {
++    cute::gemm(tiled_mma, a(_, _, k_block), b(_, _, k_block), c);
++    tiled_mma.accumulate_ = GMMA::ScaleOut::One;
++  }
++  warpgroup_commit_batch();
++  if constexpr (WaitForCompletion) {
++    warpgroup_wait<0>();
++    warpgroup_fence_operand(c);
++  }
++}
+diff --git a/include/flashinfer/attention/mla_swa_sm90/kernel.cuh b/include/flashinfer/attention/mla_swa_sm90/kernel.cuh
+new file mode 100644
+index 00000000000..bdbae3ea490
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/kernel.cuh
+@@ -0,0 +1,54 @@
++#pragma once
++#include "config.cuh"
++#include "primitives.cuh"
++// Shared executable code; structural branches preserve lexical scope.
++#include <cuda_runtime.h>
++#include <cutlass/arch/reg_reconfig.h>
++#include <cutlass/barrier.h>
++#include <cutlass/bfloat16.h>
++#include <cutlass/cutlass.h>
++#include <cutlass/numeric_types.h>
++#include <math_constants.h>
++
++#include <cute/arch/cluster_sm90.hpp>
++#include <cute/tensor.hpp>
++#include <cutlass/cluster_launch.hpp>
++#include <vector>
++namespace sm90::dense_swa {
++using namespace cute;
++using TMABarrier = cutlass::arch::ClusterTransactionBarrier;
++template <typename ShapeQ, typename TMAQ, typename ShapeK, typename TMAK>
++struct TmaParams {
++  ShapeQ shape_q;
++  TMAQ tma_q;
++  ShapeK shape_k;
++  TMAK tma_k;
++};
++
++#include "device/storage.cuh"
++#include "device/traits.cuh"
++}  // namespace sm90::dense_swa
++namespace sm90::dense_swa::roles {
++using namespace cute;
++// These implementation fragments are included in declaration dependency order.
++// clang-format off
++#include "device/contracts.cuh"
++#include "device/wgmma.cuh"
++#include "device/accumulator.cuh"
++#include "device/memory.cuh"
++#include "device/sync.cuh"
++#include "device/tma.cuh"
++#include "device/gemm.cuh"
++#include "device/softmax.cuh"
++#include "device/mailbox.cuh"
++#include "device/owner_pv.cuh"
++#include "device/qk_sequence.cuh"
++#include "device/native_softmax.cuh"
++#include "device/pv.cuh"
++#include "device/pv_role.cuh"
++#include "device/qk.cuh"
++#include "device/attention.cuh"
++#include "device/entries.cuh"
++#include "device/combine.cuh"
++// clang-format on
++}  // namespace sm90::dense_swa::roles
+diff --git a/include/flashinfer/attention/mla_swa_sm90/launch.cuh b/include/flashinfer/attention/mla_swa_sm90/launch.cuh
+new file mode 100644
+index 00000000000..24493bc230e
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/launch.cuh
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "kernel.cuh"
++
++namespace flashinfer::mla_swa_sm90 {
++// No framework allocation, stream lookup, or host reads of metadata values.
++struct Arguments {
++  const cutlass::bfloat16_t* q;
++  const cutlass::bfloat16_t* kv;
++  const int* table;
++  const int* lengths;
++  cutlass::bfloat16_t* out;
++  void* workspace;
++  int batch, sq, heads, pages, table_cols, window;
++  float scale;
++  int64_t q_stride_b, table_stride_b;
++  cudaStream_t stream;
++};
++
++inline int64_t align256(int64_t n) { return (n + 255) / 256 * 256; }
++inline int64_t workspace_bytes(int64_t rows) {
++  return align256(rows * 9 * 1024 * sizeof(float)) + align256(rows * 9 * sizeof(float));
++}
++
++template <class Config>
++cudaError_t launch(const Arguments& a) {
++  using namespace cute;
++  using namespace sm90::dense_swa;
++  using namespace sm90::dense_swa::roles;
++  using T = Traits<cutlass::bfloat16_t, Config>;
++  using InputT = typename T::InputT;
++  const auto shape_q = make_shape(a.sq * a.heads, Int<T::HEAD_DIM_K>{}, a.batch);
++  const auto tma_q = make_tma_copy(
++      SM90_TMA_LOAD{},
++      make_tensor(make_gmem_ptr(const_cast<InputT*>(a.q)),
++                  make_layout(shape_q, make_stride(int64_t{1088}, _1{}, a.q_stride_b))),
++      typename T::SmemLayoutQ{});
++  const auto shape_k = make_shape(Int<T::BLOCK_N>{}, Int<T::HEAD_DIM_K>{}, a.pages);
++  const auto tma_k = make_tma_copy(
++      SM90_TMA_LOAD{},
++      make_tensor(make_gmem_ptr(const_cast<InputT*>(a.kv)),
++                  make_layout(shape_k, make_stride(int64_t{1088}, _1{}, int64_t{64 * 1088}))),
++      tile_to_shape(
++          GMMA::Layout_K_SW128_Atom<InputT>{},
++          Layout<Shape<Int<T::BLOCK_N>, Int<T::TILE_K>>, Stride<Int<T::HEAD_DIM_K>, _1>>{}));
++  TmaParams<decltype(shape_q), decltype(tma_q), decltype(shape_k), decltype(tma_k)> params{
++      shape_q, tma_q, shape_k, tma_k};
++  auto kernel = tactic_kernel_pointer<T, decltype(params)>();
++  auto status =
++      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, T::SHARED_BYTES);
++  if (status != cudaSuccess) return status;
++  const int64_t rows = int64_t{a.batch} * a.sq * a.heads;
++  const int64_t out_b = int64_t{a.sq} * a.heads * 1024;
++  const int64_t out_s = int64_t{a.heads} * 1024;
++  const int64_t q_s = int64_t{a.heads} * 1088;
++  const int tiles = cute::ceil_div(a.sq * a.heads, T::BLOCK_M);
++  if constexpr (Config::Backend == mla_swa::Reduce::DSM) {
++    auto cluster_status = cutlass::launch_kernel_on_cluster(
++        {dim3(a.batch * Config::S, tiles, 1), dim3(T::NUM_THREADS), dim3(Config::S, 1, 1),
++         T::SHARED_BYTES, a.stream},
++        reinterpret_cast<void const*>(kernel), a.q, a.kv, a.table, a.lengths, a.out,
++        static_cast<float*>(nullptr), Config::S, int64_t{0}, a.batch, a.sq, a.heads, a.table_cols,
++        a.window, a.scale, a.q_stride_b, q_s, int64_t{1088}, int64_t{1088}, a.table_stride_b, out_b,
++        out_s, int64_t{1024}, params);
++    if (cluster_status != cutlass::Status::kSuccess) return cudaErrorInvalidConfiguration;
++  } else if constexpr (Config::Backend == mla_swa::Reduce::GlobalFP32) {
++    auto partial = static_cast<float*>(a.workspace);
++    auto lse = reinterpret_cast<float*>(static_cast<char*>(a.workspace) +
++                                        align256(rows * Config::S * 1024 * sizeof(float)));
++    // Device entry retains its historical InputT* ABI. The split strides are
++    // expressed in BF16 elements (x2), while the epilogue stores FP32.
++    kernel<<<dim3(a.batch, tiles, Config::S), T::NUM_THREADS, T::SHARED_BYTES, a.stream>>>(
++        a.q, a.kv, a.table, a.lengths, reinterpret_cast<InputT*>(partial), lse, Config::S,
++        int64_t{1024 * 2}, a.batch, a.sq, a.heads, a.table_cols, a.window, a.scale, a.q_stride_b,
++        q_s, int64_t{1088}, int64_t{1088}, a.table_stride_b, out_b * Config::S, out_s * Config::S,
++        int64_t{Config::S * 1024}, params);
++    status = cudaGetLastError();
++    if (status != cudaSuccess) return status;
++    dense_swa_roles_split_combine_kernel<InputT, 1024, Config::S>
++        <<<rows, 256, 0, a.stream>>>(partial, lse, a.out, rows, Config::S);
++  } else {
++    kernel<<<dim3(a.batch, tiles), T::NUM_THREADS, T::SHARED_BYTES, a.stream>>>(
++        a.q, a.kv, a.table, a.lengths, a.out, a.batch, a.sq, a.heads, a.table_cols, a.window,
++        a.scale, a.q_stride_b, q_s, int64_t{1088}, int64_t{1088}, a.table_stride_b, out_b, out_s,
++        int64_t{1024}, params);
++  }
++  return cudaGetLastError();
++}
++}  // namespace flashinfer::mla_swa_sm90
+diff --git a/include/flashinfer/attention/mla_swa_sm90/primitives.cuh b/include/flashinfer/attention/mla_swa_sm90/primitives.cuh
+new file mode 100644
+index 00000000000..95815c5fe90
+--- /dev/null
++++ b/include/flashinfer/attention/mla_swa_sm90/primitives.cuh
+@@ -0,0 +1,22 @@
++#pragma once
++namespace mla_swa {
++// Identical physical-page traversal for every role and configuration. The
++// iterator deliberately returns an int, preserving the previous scalar loop.
++template <class Config>
++struct PageRange {
++  struct Iterator {
++    int page;
++    __host__ __device__ __forceinline__ int operator*() const { return page; }
++    __host__ __device__ __forceinline__ void operator++() { ++page; }
++    __host__ __device__ __forceinline__ bool operator!=(Iterator other) const {
++      // This is a forward range/sentinel, not a general bidirectional
++      // iterator. Preserve the old loop's < bound, including empty or
++      // inverted ranges, and avoid silently changing its predicate.
++      return page < other.page;
++    }
++  };
++  int first, last;
++  __host__ __device__ __forceinline__ Iterator begin() const { return {first}; }
++  __host__ __device__ __forceinline__ Iterator end() const { return {last}; }
++};
++}  // namespace mla_swa
+diff --git a/tests/attention/test_mla_swa_sm90.py b/tests/attention/test_mla_swa_sm90.py
+new file mode 100644
+index 00000000000..beff9edba32
+--- /dev/null
++++ b/tests/attention/test_mla_swa_sm90.py
+@@ -0,0 +1,194 @@
++# SPDX-License-Identifier: Apache-2.0
++import math
++
++import pytest
++import torch
++
++import flashinfer
++from flashinfer.mla import batch_decode_with_kv_cache_mla_swa as run
++from flashinfer.mla import get_mla_swa_workspace_size_bytes
++from flashinfer.mla._swa import _runner
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
++    reason="SM90 required",
++)
++
++
++def inputs(b=2, sq=4, context=1055):
++    torch.manual_seed(123)
++    pages = math.ceil(context / 64)
++    q = torch.randn(b, sq, 64, 1088, device="cuda", dtype=torch.bfloat16)
++    kv = torch.randn(b * pages, 64, 1088, device="cuda", dtype=torch.bfloat16)
++    table = torch.arange(b * pages, device="cuda", dtype=torch.int32).reshape(b, pages)
++    lengths = torch.full((b,), context, device="cuda", dtype=torch.int32)
++    workspace = torch.empty(
++        get_mla_swa_workspace_size_bytes(b, sq), device="cuda", dtype=torch.uint8
++    )
++    out = torch.empty(b, sq, 64, 1024, device="cuda", dtype=torch.bfloat16)
++    return [q, kv, workspace, table, lengths, out]
++
++
++def reference(args):
++    q, kv, _, table, lengths, _ = args
++    result = torch.zeros((*q.shape[:-1], 1024), device=q.device, dtype=torch.float64)
++    weighted_abs = torch.zeros_like(result)
++    for b in range(q.shape[0]):
++        length = int(lengths[b])
++        cache = kv[table[b].long()].reshape(-1, 1088).double()
++        for i in range(q.shape[1]):
++            pos = length - q.shape[1] + i
++            if pos < 0:
++                continue
++            k = cache[max(0, pos - 512) : pos + 1]
++            p = torch.softmax(q[b, i].double() @ k.T * 0.0625, dim=-1)
++            result[b, i] = p @ k[:, :1024]
++            weighted_abs[b, i] = p @ k[:, :1024].abs()
++    return result, weighted_abs
++
++
++def assert_accuracy(actual, args):
++    gold, weighted_abs = reference(args)
++    actual = actual.double()
++    assert torch.isfinite(actual).all()
++    diff = actual - gold
++    norm = gold.norm(dim=-1)
++    floor = 1e-5 * 1024**0.5
++    assert (diff.norm(dim=-1) / norm.clamp_min(floor)).max().item() <= 2 * 2**-8
++    assert (diff.abs() / (4 * 2**-8 * weighted_abs + 1e-5)).max().item() <= 1
++    nonzero = norm > floor
++    if nonzero.any():
++        assert (
++            torch.nn.functional.cosine_similarity(
++                actual[nonzero], gold[nonzero], dim=-1
++            )
++            .min()
++            .item()
++            >= 0.99999
++        )
++
++
++@pytest.mark.parametrize("tactic", range(6))
++@pytest.mark.parametrize("sq", [1, 4])
++@pytest.mark.parametrize("offset", [0, 1, 31, 63])
++def test_correctness(tactic, sq, offset):
++    args = inputs(sq=sq, context=1024 + offset)
++    _runner(0.0625, 512)(args, tactic=tactic)
++    assert_accuracy(args[-1], args)
++
++
++@pytest.mark.parametrize("tactic", range(6))
++@pytest.mark.parametrize("sq", [1, 4])
++@pytest.mark.parametrize("context", [63, 65, 191, 255, 511, 1024, 1025, 1055, 1087])
++def test_nonfinite_masked_cache_slots(tactic, sq, context):
++    args = inputs(sq=sq, context=context)
++    kv, table = args[1], args[3]
++    tokens = torch.arange(table.shape[1] * 64, device=kv.device).reshape(-1, 64)
++    poison = torch.tensor(
++        [float("nan"), float("inf"), -float("inf")],
++        device=kv.device,
++        dtype=kv.dtype,
++    ).repeat(363)[:1088]
++    for b in range(table.shape[0]):
++        # Poison only slots excluded by every query in the request. Valid
++        # K/V values must remain finite; the last sq tokens are not padding.
++        left = max(context - sq - 512, 0)
++        masked = (tokens < left) | (tokens >= context)
++        page_values = kv[table[b].long()].clone()
++        page_values[masked] = poison
++        kv[table[b].long()] = page_values
++    original = kv.clone()
++    _runner(0.0625, 512)(args, tactic=tactic)
++    assert_accuracy(args[-1], args)
++    torch.testing.assert_close(kv, original, rtol=0, atol=0, equal_nan=True)
++
++
++@pytest.mark.parametrize("b", [1, 2, 4, 8, 16])
++@pytest.mark.parametrize("sq", [1, 4])
++def test_graph_and_dummy_rows(b, sq):
++    args = inputs(b=b, sq=sq, context=1055)
++    if b > 1:
++        args[4][-1] = 0
++    run(*args[:-1], window_left=512, sm_scale=0.0625, out=args[-1])
++    expected = args[-1].clone()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        run(*args[:-1], window_left=512, sm_scale=0.0625, out=args[-1])
++    graph.replay()
++    torch.cuda.synchronize()
++    torch.testing.assert_close(args[-1], expected, rtol=0, atol=0)
++    assert_accuracy(args[-1], args)
++    if b > 1:
++        assert torch.count_nonzero(args[-1][-1]) == 0
++
++
++def test_autotune(tmp_path):
++    args = inputs(b=1, sq=1)
++    metadata = args[3].clone(), args[4].clone()
++    cache = tmp_path / "mla_swa.json"
++    with flashinfer.autotune(True, cache=str(cache)):
++        run(*args[:-1], window_left=512, sm_scale=0.0625, out=args[-1])
++    assert cache.is_file()
++    assert "mla_swa_sm90" in cache.read_text()
++    torch.testing.assert_close(args[3], metadata[0], rtol=0, atol=0)
++    torch.testing.assert_close(args[4], metadata[1], rtol=0, atol=0)
++    assert_accuracy(args[-1], args)
++
++
++def test_bad_workspace_and_alias():
++    args = inputs()
++    with pytest.raises(ValueError, match="workspace"):
++        run(
++            args[0],
++            args[1],
++            args[2][:256],
++            args[3],
++            args[4],
++            window_left=512,
++            sm_scale=0.0625,
++        )
++    with pytest.raises(ValueError, match="window_left"):
++        run(*args[:-1], window_left=511, sm_scale=0.0625)
++    alias = args[0].view(-1)[: args[-1].numel()].view(args[-1].shape)
++    with pytest.raises(ValueError, match="overlap"):
++        run(*args[:-1], window_left=512, sm_scale=0.0625, out=alias)
++
++
++@pytest.mark.parametrize("tactic", range(6))
++def test_short_and_empty(tactic):
++    args = inputs(b=2, sq=4, context=63)
++    args[4][-1] = 0
++    _runner(0.0625, 512)(args, tactic=tactic)
++    assert_accuracy(args[-1], args)
++
++
++@pytest.mark.parametrize("tactic", range(6))
++def test_large_scores(tactic):
++    args = inputs(b=2, sq=4, context=1055)
++    args[0].mul_(3)
++    args[1].mul_(3)
++    _runner(0.0625, 512)(args, tactic=tactic)
++    assert_accuracy(args[-1], args)
++
++
++def test_nondefault_stream_strides_and_updated_metadata():
++    args = inputs(b=2, sq=4)
++    q = torch.empty(2, 5, 64, 1088, dtype=torch.bfloat16, device="cuda")[:, :4]
++    q.copy_(args[0])
++    args[0] = q
++    table = torch.empty(2, args[3].shape[1] + 3, dtype=torch.int32, device="cuda")[
++        :, : args[3].shape[1]
++    ]
++    table.copy_(args[3])
++    args[3] = table
++    run(*args[:-1], window_left=512, sm_scale=0.0625, out=args[-1])
++    stream = torch.cuda.Stream()
++    stream.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(stream):
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            run(*args[:-1], window_left=512, sm_scale=0.0625, out=args[-1])
++        args[4].fill_(63)
++        graph.replay()
++    stream.synchronize()
++    assert_accuracy(args[-1], args)
+diff --git a/tests/trace/example.py b/tests/trace/example.py
+index 3770ed0bdd8..ea71c807852 100644
+--- a/tests/trace/example.py
++++ b/tests/trace/example.py
+@@ -73,6 +73,7 @@
+ minimax_h3_qkv_quantize_pack_p8_hdst7_d128_pk64.json
+ mla_paged_decode_h16_ckv512_kpe64_ps1.json
+ mla_paged_decode_h16_ckv512_kpe64_ps64.json
++mla_swa_decode_sq1_h64_d1088_dv1024_ps64.json
+ attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
+ prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
+ prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
+@@ -213,6 +214,25 @@
+ generate_moe_layer_traces(SAVE_DIR)
+ 
+ device = "cuda"
++
++# Metadata-only SM90 MLA+SWA example, also usable without SM90 hardware.
++from flashinfer.mla import (
++    batch_decode_with_kv_cache_mla_swa,
++    get_mla_swa_workspace_size_bytes,
++)
++
++batch_decode_with_kv_cache_mla_swa.fi_trace(
++    save_dir=SAVE_DIR,
++    query=torch.empty((1, 1, 64, 1088), device="meta", dtype=torch.bfloat16),
++    kv_cache=torch.empty((9, 64, 1088), device="meta", dtype=torch.bfloat16),
++    workspace_buffer=torch.empty(
++        get_mla_swa_workspace_size_bytes(1, 1), device="meta", dtype=torch.uint8
++    ),
++    block_tables=torch.empty((1, 9), device="meta", dtype=torch.int32),
++    seq_lens=torch.empty((1,), device="meta", dtype=torch.int32),
++    window_left=512,
++    sm_scale=0.0625,
++)
+ WORKSPACE = 128 * 1024 * 1024  # 128 MB
+ 
+ # PCIe traces need only world_size and tensor metadata, not an IPC allocation
+diff --git a/tests/trace/fi_trace_out/mla_swa_decode_sq1_h64_d1088_dv1024_ps64.json b/tests/trace/fi_trace_out/mla_swa_decode_sq1_h64_d1088_dv1024_ps64.json
+new file mode 100644
+index 00000000000..021b532cdf1
+--- /dev/null
++++ b/tests/trace/fi_trace_out/mla_swa_decode_sq1_h64_d1088_dv1024_ps64.json
+@@ -0,0 +1,105 @@
++{
++  "name": "mla_swa_decode_sq1_h64_d1088_dv1024_ps64",
++  "description": "BF16 Page64 causal latent MLA sliding-window decode on SM90.",
++  "op_type": "mla_swa",
++  "tags": [
++    "fi_api:flashinfer.mla._swa.batch_decode_with_kv_cache_mla_swa"
++  ],
++  "axes": {
++    "batch_size": {
++      "type": "var"
++    },
++    "q_len_per_req": {
++      "type": "const",
++      "value": 1
++    },
++    "num_heads": {
++      "type": "const",
++      "value": 64
++    },
++    "head_dim_qk": {
++      "type": "const",
++      "value": 1088
++    },
++    "head_dim_v": {
++      "type": "const",
++      "value": 1024
++    },
++    "num_pages": {
++      "type": "var"
++    },
++    "page_size": {
++      "type": "const",
++      "value": 64
++    },
++    "table_width": {
++      "type": "var"
++    },
++    "workspace_bytes": {
++      "type": "var"
++    }
++  },
++  "inputs": {
++    "query": {
++      "shape": [
++        "batch_size",
++        "q_len_per_req",
++        "num_heads",
++        "head_dim_qk"
++      ],
++      "dtype": "bfloat16"
++    },
++    "kv_cache": {
++      "shape": [
++        "num_pages",
++        "page_size",
++        "head_dim_qk"
++      ],
++      "dtype": "bfloat16"
++    },
++    "workspace_buffer": {
++      "shape": [
++        "workspace_bytes"
++      ],
++      "dtype": "uint8"
++    },
++    "block_tables": {
++      "shape": [
++        "batch_size",
++        "table_width"
++      ],
++      "dtype": "int32"
++    },
++    "seq_lens": {
++      "shape": [
++        "batch_size"
++      ],
++      "dtype": "int32"
++    },
++    "window_left": {
++      "shape": null,
++      "dtype": "int32"
++    },
++    "sm_scale": {
++      "shape": null,
++      "dtype": "float32"
++    },
++    "backend": {
++      "shape": null,
++      "dtype": "string",
++      "optional": true
++    }
++  },
++  "outputs": {
++    "output": {
++      "shape": [
++        "batch_size",
++        "q_len_per_req",
++        "num_heads",
++        "head_dim_v"
++      ],
++      "dtype": "bfloat16"
++    }
++  },
++  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
++}
+diff --git a/tests/trace/test_mla_swa.py b/tests/trace/test_mla_swa.py
+new file mode 100644
+index 00000000000..221b4a32823
+--- /dev/null
++++ b/tests/trace/test_mla_swa.py
+@@ -0,0 +1,20 @@
++# SPDX-License-Identifier: Apache-2.0
++import torch
++
++from flashinfer.mla import batch_decode_with_kv_cache_mla_swa as run
++
++
++def test_mla_swa_trace(tmp_path):
++    definition = run.fi_trace(
++        save_dir=tmp_path,
++        query=torch.empty(1, 1, 64, 1088, dtype=torch.bfloat16, device="meta"),
++        kv_cache=torch.empty(9, 64, 1088, dtype=torch.bfloat16, device="meta"),
++        workspace_buffer=torch.empty(2361600, dtype=torch.uint8, device="meta"),
++        block_tables=torch.empty(1, 9, dtype=torch.int32, device="meta"),
++        seq_lens=torch.empty(1, dtype=torch.int32, device="meta"),
++        window_left=512,
++        sm_scale=0.0625,
++    )
++    assert definition["op_type"] == "mla_swa"
++    assert definition["axes"]["head_dim_v"]["value"] == 1024
++    assert list(tmp_path.glob("*.json"))

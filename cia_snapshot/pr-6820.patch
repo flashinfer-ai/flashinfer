@@ -1,0 +1,51 @@
+diff --git a/csrc/cake_minimax_h3_bf16_pre_attention_sm103a.cu b/csrc/cake_minimax_h3_bf16_pre_attention_sm103a.cu
+index b1f11628d50..72a7978a5e5 100644
+--- a/csrc/cake_minimax_h3_bf16_pre_attention_sm103a.cu
++++ b/csrc/cake_minimax_h3_bf16_pre_attention_sm103a.cu
+@@ -658,6 +658,12 @@ kernel_minimax_h3_bf16_pre_attention_gemm(const __grid_constant__ CUtensorMap ac
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 7; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
+diff --git a/csrc/cake_minimax_h3_nvfp4_pre_attention/cake_minimax_h3_nvfp4_pre_attention_10cb85a9569b85023fde_kernel.cu b/csrc/cake_minimax_h3_nvfp4_pre_attention/cake_minimax_h3_nvfp4_pre_attention_10cb85a9569b85023fde_kernel.cu
+index d6312316ccf..c63b0a39118 100644
+--- a/csrc/cake_minimax_h3_nvfp4_pre_attention/cake_minimax_h3_nvfp4_pre_attention_10cb85a9569b85023fde_kernel.cu
++++ b/csrc/cake_minimax_h3_nvfp4_pre_attention/cake_minimax_h3_nvfp4_pre_attention_10cb85a9569b85023fde_kernel.cu
+@@ -629,6 +629,12 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_10cb85a9569b85023fde(const __grid_con
+                         }
+                         this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                     }
++                    #pragma unroll 1
++                    for (int _ = 0; _ < 5; _++) {
++                        mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                        load_stage += 1;
++                        if (load_stage == 5) { load_stage = 0; _phase_mma_done ^= 1; }
++                    }
+                 }
+             }
+         // ---- Role: mma ----
+diff --git a/csrc/cake_minimax_h3_nvfp4_pre_attention/cake_minimax_h3_nvfp4_pre_attention_bdfc61bd8a6ada56a764_kernel.cu b/csrc/cake_minimax_h3_nvfp4_pre_attention/cake_minimax_h3_nvfp4_pre_attention_bdfc61bd8a6ada56a764_kernel.cu
+index ab634eead28..1ab81d335d2 100644
+--- a/csrc/cake_minimax_h3_nvfp4_pre_attention/cake_minimax_h3_nvfp4_pre_attention_bdfc61bd8a6ada56a764_kernel.cu
++++ b/csrc/cake_minimax_h3_nvfp4_pre_attention/cake_minimax_h3_nvfp4_pre_attention_bdfc61bd8a6ada56a764_kernel.cu
+@@ -517,6 +517,12 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_bdfc61bd8a6ada56a764(const __grid_con
+                     }
+                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                 }
++                #pragma unroll 1
++                for (int _ = 0; _ < 5; _++) {
++                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
++                    load_stage += 1;
++                    if (load_stage == 5) { load_stage = 0; _phase_mma_done ^= 1; }
++                }
+             }
+         }
+     }
