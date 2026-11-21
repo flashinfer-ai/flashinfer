@@ -244,11 +244,11 @@ class KdaDecodeWyOutputOnlyKernel:
         s_g_tok: cutlass.Int32,
         s_b_tok: cutlass.Int32,
         s_o_tok: cutlass.Int32,
-        s_c_blk: cutlass.Int32,
-        s_c_head: cutlass.Int32,
+        s_c_blk: cutlass.Int64,
+        s_c_head: cutlass.Int64,
         s_c_pos: cutlass.Int32,
-        s_kg_blk: cutlass.Int32,
-        s_kg_head: cutlass.Int32,
+        s_kg_blk: cutlass.Int64,
+        s_kg_head: cutlass.Int64,
         s_kg_pos: cutlass.Int32,
         s_h0_blk: cutlass.Int64,
         HV: cutlass.Int32,
@@ -359,11 +359,11 @@ class KdaDecodeWyOutputOnlyKernel:
         s_g_tok: cutlass.Int32,
         s_b_tok: cutlass.Int32,
         s_o_tok: cutlass.Int32,
-        s_c_blk: cutlass.Int32,
-        s_c_head: cutlass.Int32,
+        s_c_blk: cutlass.Int64,
+        s_c_head: cutlass.Int64,
         s_c_pos: cutlass.Int32,
-        s_kg_blk: cutlass.Int32,
-        s_kg_head: cutlass.Int32,
+        s_kg_blk: cutlass.Int64,
+        s_kg_head: cutlass.Int64,
         s_kg_pos: cutlass.Int32,
         tiled_mma: cute.TiledMma,
         HV: cutlass.Int32,
@@ -428,11 +428,13 @@ class KdaDecodeWyOutputOnlyKernel:
         _beta_bf16 = f32(0.0)
         if const_expr(self._dropin):
             if warp_id == 3 and lane_id < _seq_len:
-                _beta_bf16 = gBeta.iterator[(_bos + lane_id) * s_b_tok + pid_hv].to(f32)
+                _beta_bf16 = (gBeta.iterator + Int64(_bos) * s_b_tok)[
+                    lane_id * s_b_tok + pid_hv
+                ].to(f32)
         else:
             if warp_id == 3 and lane_id < _nv:
-                _beta_bf16 = gBeta.iterator[
-                    pid_b * sb_b + lane_id * sb_t + pid_hv * sb_hv
+                _beta_bf16 = (gBeta.iterator + Int64(pid_b) * sb_b)[
+                    lane_id * sb_t + pid_hv * sb_hv
                 ].to(f32)
         # Per-head gate constants for the in-kernel gate modes: A_log scalar
         # (broadcast) and one dt_bias element per K channel (thread == channel).
@@ -531,23 +533,27 @@ class KdaDecodeWyOutputOnlyKernel:
         # ============================================================
         # cp.async stage 1: K + Q + G (8 bf16 / instr, .ca)
         # ============================================================
-        k_base = pid_b * sk_b + i_h * sk_h
-        q_base = pid_b * sq_b + i_h * sq_h
-        g_base = pid_b * sg_b + pid_hv * sg_hv
+        # 64-bit address math: the sequence term (batch / token offset, which
+        # can exceed 2^31 elements on large inputs) is folded into the 64-bit
+        # base address; head + per-row offsets stay 32-bit (bounded by
+        # H * 2K + T * token stride, validated on the host).
+        k_base = i_h * sk_h
+        q_base = i_h * sq_h
+        g_base = pid_hv * sg_hv
         _sq_tok = cutlass.Int32(sq_t)
         _sk_tok = cutlass.Int32(sk_t)
         _sg_tok = cutlass.Int32(sg_t)
+        _gK_base = gK.iterator.toint() + Int64(pid_b) * (sk_b * 2)
+        _gQ_base = gQ.iterator.toint() + Int64(pid_b) * (sq_b * 2)
+        _gG_base = gG.iterator.toint() + Int64(pid_b) * (sg_b * 2)
         if const_expr(self._dropin):
             # varlen token addressing: rows live at (bos + t) * token_stride
-            k_base = _bos * s_k_tok + i_h * sk_h
-            q_base = _bos * s_q_tok + i_h * sq_h
-            g_base = _bos * s_g_tok + pid_hv * sg_hv
             _sq_tok = s_q_tok
             _sk_tok = s_k_tok
             _sg_tok = s_g_tok
-        _gK_base = gK.iterator.toint()
-        _gQ_base = gQ.iterator.toint()
-        _gG_base = gG.iterator.toint()
+            _gK_base = gK.iterator.toint() + Int64(_bos) * s_k_tok * 2
+            _gQ_base = gQ.iterator.toint() + Int64(_bos) * s_q_tok * 2
+            _gG_base = gG.iterator.toint() + Int64(_bos) * s_g_tok * 2
         _sK_i32 = cute.recast_tensor(sK, cutlass.Int32)
         _sQ_i32 = cute.recast_tensor(sQ, cutlass.Int32)
         _kpad_i32 = K_PADDED // 2
@@ -678,12 +684,15 @@ class KdaDecodeWyOutputOnlyKernel:
         if const_expr(self._dropin):
             # skip null slots (avoid DSL `not` on runtime bool)
             if _state_idx >= cutlass.Int32(self._null_min):
-                _kg_cta = _state_idx * s_kg_blk + pid_hv * s_kg_head
+                # 64-bit slot term: blocks * H * spec_len * 2K can exceed 2^31
+                _kg_cta = gKg.iterator + (
+                    Int64(_state_idx) * s_kg_blk + Int64(pid_hv) * s_kg_head
+                )
                 for _kt in cutlass.range_constexpr(T):
                     if cutlass.Int32(_kt) < _seq_len:
-                        _kg_off = _kg_cta + _kt * s_kg_pos + tidx
-                        gKg.iterator[_kg_off] = sK.iterator[_kt * K_PADDED + tidx]
-                        gKg.iterator[_kg_off + K_DIM] = sG.iterator[_kt * K_DIM + tidx]
+                        _kg_off = _kt * s_kg_pos + tidx
+                        _kg_cta[_kg_off] = sK.iterator[_kt * K_PADDED + tidx]
+                        _kg_cta[_kg_off + K_DIM] = sG.iterator[_kt * K_DIM + tidx]
             sync_threads()
 
         if const_expr(self._t_input <= 8):
@@ -819,9 +828,10 @@ class KdaDecodeWyOutputOnlyKernel:
             if const_expr(self._emit and not self._dropin):
                 # kg cache row: sK still holds the L2-normalized k here; sG
                 # holds the raw gate. Coalesced 2-byte stores across channels.
-                _kg_off = pid_b * skg_b + t * skg_t + pid_hv * skg_hv + tidx
-                gKg.iterator[_kg_off] = sK.iterator[_koff]
-                gKg.iterator[_kg_off + K_DIM] = sG.iterator[t * K_DIM + tidx]
+                _kg_cta = gKg.iterator + Int64(pid_b) * skg_b
+                _kg_off = t * skg_t + pid_hv * skg_hv + tidx
+                _kg_cta[_kg_off] = sK.iterator[_koff]
+                _kg_cta[_kg_off + K_DIM] = sG.iterator[t * K_DIM + tidx]
             sK.iterator[_koff] = (_kval * _ep).to(io)
             sKtil.iterator[_koff] = (_kval * _en).to(io)
             sQ.iterator[_koff] = (_qval * _ep).to(io)
@@ -1142,13 +1152,13 @@ class KdaDecodeWyOutputOnlyKernel:
         # Same t-aware iteration count / zero-propagation proof as GDN:
         # sPowk[0..t-1, 8..15] == 0 at t<=8, so sV rows [8:16) garbage * 0 = 0.
         # ============================================================
-        _gV_base = gV.iterator.toint()
         _sV_base_async = sV.iterator.toint()
-        _v_base_bf16 = pid_b * sv_b + pid_hv * sv_hv
+        _v_base_bf16 = pid_hv * sv_hv
         _sv_tok = cutlass.Int32(sv_t)
+        _gV_base = gV.iterator.toint() + Int64(pid_b) * (sv_b * 2)
         if const_expr(self._dropin):
-            _v_base_bf16 = _bos * s_v_tok + pid_hv * sv_hv
             _sv_tok = s_v_tok
+            _gV_base = gV.iterator.toint() + Int64(_bos) * s_v_tok * 2
         _v_iters = 1 if self._t_input <= 8 else (T * V_DIM_C // (THREADS * 8))
         for i in cutlass.range_constexpr(_v_iters):
             _v_group = tidx + i * THREADS
@@ -1468,12 +1478,12 @@ class KdaDecodeWyOutputOnlyKernel:
         # ============================================================
         _qt_a0, _qt_a1, _qt_a2, _qt_a3 = _ldmatrix_x4(sPowk, lane_id)
         _sV_base = sV.iterator.toint()
-        _gOut_base = gOut.iterator.toint()
-        _out_base = pid_b * so_b + pid_hv * so_hv
+        _out_base = pid_hv * so_hv
         _so_tok = cutlass.Int32(so_t)
+        _gOut_base = gOut.iterator.toint() + Int64(pid_b) * (so_b * 2)
         if const_expr(self._dropin):
-            _out_base = _bos * s_o_tok + pid_hv * so_hv
             _so_tok = s_o_tok
+            _gOut_base = gOut.iterator.toint() + Int64(_bos) * s_o_tok * 2
         _v_off_base = Int32(0)
         _sOutStage_base = sH.iterator.toint()
         # EMIT: D = (V - U_hat) staging tile in the upper part of h_buf at
@@ -1626,18 +1636,22 @@ class KdaDecodeWyOutputOnlyKernel:
                             _wr[h_iter * 4 + 3],
                         )
                 sync_threads()
-                _gCorr_base = gCorr.iterator.toint()
+                # slot-indexed base in f32 elements (64-bit: blocks * H *
+                # spec_len * V can exceed 2^31) folded into the base address;
+                # the 16 B store helper offsets in 2-byte units, so the
+                # in-CTA f32 element index * 2.
+                _gCorr_base = (
+                    gCorr.iterator.toint()
+                    + (Int64(_state_idx) * s_c_blk + Int64(pid_hv) * s_c_head) * 4
+                )
                 _sW_base = _sOutStage_base
-                # slot-indexed base in f32 elements; the 16 B store helper
-                # offsets in 2-byte units, so f32 element index * 2.
-                _corr_cta = _state_idx * s_c_blk + pid_hv * s_c_head
                 # 32 x 16 B chunks per row of 128 f32.
                 for _fl_pass in cutlass.range_constexpr(4 if self._t_input > 8 else 2):
                     _fl_chunk = _fl_pass * 128 + tidx
                     _fl_row = _fl_chunk // 32
                     _fl_pos = _fl_chunk % 32
                     _fl_lds = _sW_base + _fl_row * Int32(V_PADDED * 4) + _fl_pos * 16
-                    _fl_off = (_corr_cta + _fl_row * s_c_pos + _fl_pos * 4) * 2
+                    _fl_off = (_fl_row * s_c_pos + _fl_pos * 4) * 2
                     _v0, _v1, _v2, _v3 = _lds_v4_b32(_fl_lds)
                     if _state_idx >= cutlass.Int32(self._null_min):
                         if _fl_row < _seq_len:
@@ -1660,8 +1674,8 @@ class KdaDecodeWyOutputOnlyKernel:
                             _wr[h_iter * 4 + 3],
                         )
                 sync_threads()
-                _gCorr_base = gCorr.iterator.toint()
-                _corr_base = pid_b * so_b + pid_hv * so_hv
+                _gCorr_base = gCorr.iterator.toint() + Int64(pid_b) * (so_b * 2)
+                _corr_base = pid_hv * so_hv
                 for _fl_pass in cutlass.range_constexpr(2 if self._t_input > 8 else 1):
                     _fl_chunk = _fl_pass * 128 + tidx
                     _fl_row = _fl_chunk // 16
@@ -2422,6 +2436,10 @@ __all__ = [
 # ============================================================================
 
 NULL_BLOCK_ID = 0  # matches vllm.v1.attention.backends.utils.NULL_BLOCK_ID
+# Per-row (token / cache-position) strides are applied in 32-bit inside a CTA
+# (at most 16 rows past a 64-bit per-CTA base address), so they must keep
+# 16 * stride (scaled to 2-byte units for the fp32 cache) within int32.
+_MAX_ROW_STRIDE = 1 << 26
 
 
 def kda_recoverssm_verify(
@@ -2522,6 +2540,25 @@ def kda_recoverssm_verify(
         raise ValueError("KDA RecoverSSM output heads must be contiguous")
     if out.dtype != v.dtype:
         raise ValueError("KDA RecoverSSM output must match the activation dtype")
+    # q/k/v/gate rows are loaded and output rows stored as 16 B vectors.
+    for name, t_ in (("q", q), ("k", k), ("v", v), ("gate", raw_g), ("out", out)):
+        if t_.data_ptr() % 16 != 0:
+            raise ValueError(f"KDA RecoverSSM {name} must be 16B-aligned")
+        if total_tokens > 1 and t_.stride(1) % 8 != 0:
+            raise ValueError(
+                f"KDA RecoverSSM {name} token stride must be a multiple of 8 "
+                f"elements (16B); got {t_.stride(1)}"
+            )
+    row_strides = [0]
+    if total_tokens > 1:
+        row_strides += [t_.stride(1) for t_ in (q, k, v, raw_g, raw_beta, out)]
+    if spec_query_len > 1:
+        row_strides += [correction_cache.stride(2), kg_cache.stride(2)]
+    if max(row_strides) >= _MAX_ROW_STRIDE:
+        raise ValueError(
+            "KDA RecoverSSM token / cache-position strides must be below "
+            f"{_MAX_ROW_STRIDE} elements"
+        )
     if any(t.dtype != torch.bfloat16 for t in (q, k, v, raw_g, raw_beta)):
         raise ValueError("KDA RecoverSSM activations must be bf16")
     if any(
