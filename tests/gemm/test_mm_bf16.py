@@ -15,7 +15,7 @@ from flashinfer import autotune, mm_bf16
 from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
-from flashinfer.utils import get_compute_capability, is_sm100a_supported
+from flashinfer.utils import LibraryError, get_compute_capability, is_sm100a_supported
 from tests.utils.test_helpers.pdl import late_store
 
 
@@ -524,9 +524,10 @@ def test_mm_bf16_cute_dsl_warp_splitk_pdl_waits_for_bias():
 
 @pytest.mark.parametrize("pdl", [False, True])
 def test_mm_bf16_cute_dsl_low_m_only(monkeypatch, pdl):
-    """backend="cute-dsl" serves M <= 32 only. Under "auto", a larger M still
-    lists its low-M runners (one large-M warm-up tunes the M <= 32 buckets)
-    and cuBLASLt only once, as its own backend."""
+    """backend="cute-dsl" serves M <= 32 only, except on SM107, where a
+    persistent kernel serves larger M. Under "auto", a larger M still lists the
+    low-M runners (one large-M warm-up tunes the M <= 32 buckets), cuBLASLt
+    only once, as its own backend, and not the SM107 persistent runner."""
     if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
 
@@ -538,8 +539,18 @@ def test_mm_bf16_cute_dsl_low_m_only(monkeypatch, pdl):
 
     a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16).T
-    with pytest.raises(ValueError, match="M <= 32"):
-        mm_bf16(a, b, pdl=pdl, backend="cute-dsl")
+    from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
+
+    if get_compute_capability(a.device) == (10, 7) and is_rubin_cute_dsl_available():
+        if pdl:
+            with pytest.raises(ValueError, match="PDL"):
+                mm_bf16(a, b, pdl=pdl, backend="cute-dsl")
+        else:
+            out = mm_bf16(a, b, pdl=pdl, backend="cute-dsl")
+            torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
+    else:
+        with pytest.raises((ValueError, LibraryError), match="SM107"):
+            mm_bf16(a, b, pdl=pdl, backend="cute-dsl")
 
     choose_one = AutoTuner.choose_one
     runner_lists = []
@@ -555,6 +566,7 @@ def test_mm_bf16_cute_dsl_low_m_only(monkeypatch, pdl):
     names = [type(runner).__name__ for runner in runners]
     assert sum("Cublaslt" in name for name in names) == 1, names
     assert any(isinstance(r, gemm_base._CuteDSLBf16Runner) for r in runners), names
+    assert "CuteDSLSm107PersistentBf16Runner" not in names, names
     torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
 
 
