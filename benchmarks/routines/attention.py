@@ -2166,8 +2166,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     has_reference_output = False
     reference_backend = None
-    # Iterate over each backend:
-    for cur_backend in backends:
+    # Iterate over a copy: an unsupported cudnn case is dropped from backends below.
+    for cur_backend in list(backends):
         # Clear workspace buffer to prevent unexpected interactions between backends.
         workspace_buffer.zero_()
         if cur_backend == "prims-ts":
@@ -2188,6 +2188,30 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             else kv_cache
         )
         runtime_workspace = None if cur_backend == "prims-ts" else workspace_buffer
+        if cur_backend in ("cudnn", "cudnn-native") and CUDNN_AVAILABLE:
+            # cuDNN builds its graph on the first run, and whether an engine exists
+            # for this dtype mix depends on the GPU and cuDNN version, so ask it.
+            try:
+                run_backend_wrapper(
+                    cur_backend,
+                    q,
+                    runtime_kv_cache,
+                    runtime_k_cache,
+                    runtime_v_cache,
+                    runtime_workspace,
+                    block_tables,
+                    actual_seq_lens_q_device,
+                    actual_seq_lens_kv_device,
+                    q_indptr,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_token_indptr,
+                    runtime_out,
+                )
+            except cudnn.cudnnGraphNotSupportedError as e:
+                reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+                _drop_backend(backends, cur_backend, f"has no engine here ({reason})")
+                continue
         if run_refcheck:
             outputs[cur_backend] = (
                 run_backend_wrapper(
