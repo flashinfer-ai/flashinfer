@@ -13,7 +13,7 @@ from .....core.validation.common import MoEEpConfigError
 def make_workspace_config(
     k, fleet_params, *, rank, world_size, quant_kind, gate_up_clamp, overrides
 ):
-    from .....kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         KNOB_KEYS,
         Sm107BlockScaledMoeConfig,
     )

@@ -4,6 +4,7 @@ import io
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -20,6 +21,14 @@ import ai_test_scope as scope
 WORKFLOW_TEXT = (ROOT / ".github/workflows/ci-bot-commands.yml").read_text()
 NOTE_MARKER = "<!-- flashinfer-bot:ci-bot-commands-note -->"
 PR_WORKFLOW_TEXT = (ROOT / ".github/workflows/pr-test.yml").read_text()
+
+
+def job_block(name, workflow_text=PR_WORKFLOW_TEXT):
+    return re.split(
+        r"(?m)^  [\w-]+:\n",
+        workflow_text.split(f"\n  {name}:\n", 1)[1],
+        maxsplit=1,
+    )[0]
 
 
 def step_block(name, workflow_text=WORKFLOW_TEXT):
@@ -796,40 +805,156 @@ class MergeSnapshotWorkflowTests(unittest.TestCase):
         self.assertIn("snapshot_tree=" + self.tree, output)
         self.assertIn("checkout_sha=" + self.head, output)
 
-    def test_gpu_source_preparation_recovers_shallow_head_ancestry(self):
+    def test_source_preparation_recovers_shallow_head_ancestry(self):
+        for job in ("test", "spec-lint"):
+            job_text = job_block(job)
+            checkout = job_text.split("uses: actions/checkout@", 1)[1].split(
+                "\n      - ", 1
+            )[0]
+            # Submodules must come from the verified tree, not the unmerged head.
+            self.assertNotIn("submodules:", checkout)
+            for use_snapshot in (True, False):
+                with (
+                    self.subTest(job=job, snapshot=use_snapshot),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    clone = Path(directory) / "checkout"
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "--depth=1",
+                            "--branch=pr",
+                            self.repo.as_uri(),
+                            str(clone),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    result = subprocess.run(
+                        [
+                            "bash",
+                            "-euo",
+                            "pipefail",
+                            "-c",
+                            step("Prepare selected source and submodules", job_text),
+                        ],
+                        cwd=clone,
+                        env=dict(
+                            os.environ,
+                            SELECTED_BASE=self.base if use_snapshot else "",
+                            SELECTED_TREE=self.tree if use_snapshot else "",
+                        ),
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    expected = self.tree if use_snapshot else self.head + "^{tree}"
+                    expected_tree = subprocess.check_output(
+                        ["git", "rev-parse", expected], cwd=self.repo, text=True
+                    ).strip()
+                    tree = subprocess.check_output(
+                        ["git", "rev-parse", "HEAD^{tree}"], cwd=clone, text=True
+                    ).strip()
+                    self.assertEqual(expected_tree, tree)
+                    self.assertTrue((clone / "pr.txt").exists())
+                    self.assertEqual(
+                        "advanced base\n" if use_snapshot else "base\n",
+                        (clone / "base.txt").read_text(),
+                    )
+
+    def test_source_preparation_verifies_tree_before_initializing_submodules(self):
         with tempfile.TemporaryDirectory() as directory:
-            clone = Path(directory) / "checkout"
-            subprocess.run(
-                [
-                    "git",
-                    "clone",
-                    "--depth=1",
-                    "--branch=pr",
-                    self.repo.as_uri(),
-                    str(clone),
-                ],
-                check=True,
-                capture_output=True,
+            directory = Path(directory)
+            library = directory / "library"
+            library.mkdir()
+
+            def git(repo, *args):
+                return subprocess.check_output(
+                    ["git", "-C", str(repo), *args],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+
+            git(library, "init", "--initial-branch=main")
+            git(library, "config", "user.name", "CI Snapshot Test")
+            git(library, "config", "user.email", "snapshot@example.invalid")
+            (library / "version.txt").write_text("old\n")
+            git(library, "add", ".")
+            git(library, "commit", "-m", "old dependency")
+            source = directory / "source"
+            git(self.repo, "clone", self.repo.as_uri(), str(source))
+            git(source, "config", "user.name", "CI Snapshot Test")
+            git(source, "config", "user.email", "snapshot@example.invalid")
+            git(source, "checkout", "-B", "pr", self.head)
+            git(
+                source,
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(library),
+                "dependency",
             )
-            result = subprocess.run(
-                [
-                    "bash",
-                    "-euo",
-                    "pipefail",
-                    "-c",
-                    step("Prepare selected source and submodules", PR_WORKFLOW_TEXT),
-                ],
-                cwd=clone,
-                env=dict(os.environ, SELECTED_BASE=self.base, SELECTED_TREE=self.tree),
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(0, result.returncode, result.stderr)
-            tree = subprocess.check_output(
-                ["git", "rev-parse", "HEAD^{tree}"], cwd=clone, text=True
-            ).strip()
-            self.assertEqual(self.tree, tree)
-            self.assertTrue((clone / "pr.txt").exists())
+            git(source, "commit", "-am", "add dependency")
+            head = git(source, "rev-parse", "HEAD")
+            head_tree = git(source, "rev-parse", "HEAD^{tree}")
+            (library / "version.txt").write_text("new\n")
+            git(library, "commit", "-am", "new dependency")
+            revision = git(library, "rev-parse", "HEAD")
+            git(source, "checkout", "-b", "selected-base")
+            git(source / "dependency", "fetch", "origin")
+            git(source / "dependency", "checkout", revision)
+            git(source, "commit", "-am", "advance dependency")
+            base = git(source, "rev-parse", "HEAD")
+            tree = git(source, "rev-parse", "HEAD^{tree}")
+
+            for job in ("test", "spec-lint"):
+                for expected_tree in (tree, head_tree):
+                    with self.subTest(job=job, matching_tree=expected_tree == tree):
+                        clone = directory / f"{job}-{expected_tree}"
+                        git(
+                            source,
+                            "clone",
+                            "--depth=1",
+                            "--branch=pr",
+                            source.as_uri(),
+                            str(clone),
+                        )
+                        self.assertEqual(head, git(clone, "rev-parse", "HEAD"))
+                        result = subprocess.run(
+                            [
+                                "bash",
+                                "-euo",
+                                "pipefail",
+                                "-c",
+                                step(
+                                    "Prepare selected source and submodules",
+                                    job_block(job),
+                                ),
+                            ],
+                            cwd=clone,
+                            env=dict(
+                                os.environ,
+                                SELECTED_BASE=base,
+                                SELECTED_TREE=expected_tree,
+                                # Only this local fixture uses file:// submodules.
+                                GIT_ALLOW_PROTOCOL="file",
+                            ),
+                            capture_output=True,
+                            text=True,
+                        )
+                        if expected_tree == tree:
+                            self.assertEqual(0, result.returncode, result.stderr)
+                            self.assertEqual(
+                                revision, git(clone / "dependency", "rev-parse", "HEAD")
+                            )
+                            self.assertEqual(
+                                "new\n", (clone / "dependency/version.txt").read_text()
+                            )
+                        else:
+                            self.assertNotEqual(0, result.returncode)
+                            self.assertFalse((clone / "dependency/.git").exists())
 
     def test_stale_or_malformed_automatic_snapshots_fail_before_scheduling(self):
         correct = self.snapshot_description()

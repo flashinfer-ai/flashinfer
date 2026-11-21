@@ -278,16 +278,22 @@ class _VCCase:
 _CASES = (
     _VCCase("single-tile", 1, 512, 1),
     _VCCase("partial-tile", 1, 2000, 2),
+    # One token in the last tile. Every other row of that tile is past the sequence.
+    _VCCase("one-token-tail", 1, 1025, 2),
     # Odd Q-tile count (cluster padding), partial last K/V tile, two batches.
     _VCCase("two-batches", 2, 2120, 2),
     _VCCase("one-shot", 1, 2000, 2, one_shot=True),
     _VCCase("qk8", 2, 2048, 2, qk_dtype=_FP8),
     _VCCase("qk8-partial-tile", 1, 2000, 2, qk_dtype=_FP8),
-    # V repair, one repair tile before the masked partial tail, two tiles with no tail.
+    # V repair. 2000 tokens place one repair tile before the masked partial tail,
+    # 4096 two tiles with no tail, 35 a repair tile ahead of a tail whose zero
+    # padding outnumbers the tokens.
     _VCCase("repair-partial-tile", 1, 2000, 2, repair_budget=0.02),
     _VCCase("repair-two-batches", 2, 4096, 2, repair_budget=0.05),
+    _VCCase("repair-short", 1, 35, 2, repair_budget=0.02),
     _VCCase("qk8-repair-partial-tile", 1, 2000, 2, qk_dtype=_FP8, repair_budget=0.02),
     _VCCase("qk8-repair-two-batches", 2, 4096, 2, qk_dtype=_FP8, repair_budget=0.05),
+    _VCCase("qk8-repair-short", 1, 35, 2, qk_dtype=_FP8, repair_budget=0.02),
     # Q and K/V lengths differ, so the Q and K scale tables have different block counts.
     _VCCase("cross-length", 2, 2000, 2, seq_len_q=1000),
     _VCCase("qk8-cross-length", 2, 2000, 2, seq_len_q=1000, qk_dtype=_FP8),
@@ -800,9 +806,22 @@ def test_vc_preprocessor_step_schedule():
     exact = torch.nn.functional.scaled_dot_product_attention(
         q.float().transpose(1, 2), k.float().transpose(1, 2), v.float().transpose(1, 2)
     ).transpose(1, 2)
+    rng_state = torch.cuda.get_rng_state()
     step0 = prep.prepare(k, v, denoise_step=(0, 40))
     assert step0.demean
     perm0 = step0.perm.clone()
+    # The k-means leaves the caller's generator untouched.
+    assert torch.equal(torch.cuda.get_rng_state(), rng_state)
+    # Step 0 cold-starts every generation from the same seed. The grouping
+    # depends neither on the generation before it nor on the other batch
+    # elements.
+    assert torch.equal(
+        VCAttentionPreprocessor().prepare(k, v, denoise_step=(0, 40)).perm, perm0
+    )
+    batched = VCAttentionPreprocessor().prepare(
+        torch.cat([k, k.flip(1)]), torch.cat([v, v.flip(1)]), denoise_step=(0, 40)
+    )
+    assert torch.equal(batched.perm[:1], perm0)
     out = wrapper.run(q, step0.k, step0.v, vc=step0.params)
     assert (
         _relative_error(out.float(), vca.vc_reference(q, step0, sm_scale=sm_scale))
@@ -810,14 +829,60 @@ def test_vc_preprocessor_step_schedule():
     )
     step1 = prep.prepare(k, v, denoise_step=(1, 40))
     assert torch.equal(step1.perm, perm0)  # no refresh at step 1
-    perm_ptr = prep._groupings[(1, 1024, 2)]["perm"].data_ptr()
+    perm_ptr = prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr()
     step4 = prep.prepare(k, v.flip(1), denoise_step=(4, 40))
     assert not torch.equal(step4.perm, perm0)  # refreshed at step 4
     # The new grouping lands in the existing buffer so a captured CUDA graph reads it.
-    assert prep._groupings[(1, 1024, 2)]["perm"].data_ptr() == perm_ptr
+    assert prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr() == perm_ptr
     late = prep.prepare(k, v, denoise_step=(20, 40))  # V-Smooth off
     assert not late.demean
     assert torch.equal(late.perm, step4.perm)
+    # A later generation that begins before the last refresh starts cold, as
+    # for a sampler that starts late. The grouping matches a fresh
+    # preprocessor's.
+    prep.prepare(k, v.flip(1), denoise_step=(8, 40))
+    assert torch.equal(prep.prepare(k, v, denoise_step=(4, 40)).perm, perm0)
+    # The same holds after the previous generation ran past the smooth window
+    # and the new one begins at a step that is not a refresh step.
+    prep.prepare(k, v.flip(1), denoise_step=(20, 40))
+    assert torch.equal(prep.prepare(k, v, denoise_step=(1, 16)).perm, perm0)
+    # Outside the smooth window a new generation runs in input order instead of
+    # on the previous generation's permutation.
+    prep.prepare(k, v, denoise_step=(20, 40))
+    stale = prep.prepare(k, v, denoise_step=(19, 40))
+    assert not stale.demean
+    assert torch.equal(stale.perm, torch.arange(1024).to(stale.perm).expand(1, 2, -1))
+    # A CUDA graph runner names the step kind in place of a step. There is no
+    # step bookkeeping and a missing grouping starts cold. The cold graph
+    # replays the fixed seed rows and matches the eager grouping.
+    runner_prep = VCAttentionPreprocessor()
+    assert torch.equal(runner_prep.prepare(k, v, mode="keep").perm, perm0)
+    warm = runner_prep.prepare(k, v.flip(1), mode="warm")
+    assert warm.demean and not torch.equal(warm.perm, perm0)
+    plain = runner_prep.prepare(k, v, mode="plain")
+    assert not plain.demean and torch.equal(plain.perm, warm.perm)
+    assert torch.equal(runner_prep.prepare(k, v, mode="cold").perm, perm0)
+    assert runner_prep._last_step is None
+    static_v = v.clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            runner_prep.prepare(k, static_v, mode="cold")
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner_prep.prepare(k, static_v, mode="cold")
+    static_v.copy_(v.flip(1))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        captured.perm, VCAttentionPreprocessor().prepare(k, v.flip(1), mode="cold").perm
+    )
+    static_v.copy_(v)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured.perm, perm0)
     wrapper_late = BatchPrefillTSWrapper()
     _plan(
         wrapper_late,
@@ -836,3 +901,27 @@ def test_vc_preprocessor_step_schedule():
     qk8 = VCAttentionPreprocessor().prepare(k, v, q=q, denoise_step=(0, 40))
     assert qk8.q.dtype == _QK8 and qk8.q_scale is not None and qk8.demean
     assert torch.equal(qk8.v_scale, vc_quantize_fp8(q, k, v, perm=qk8.perm).v_scale)
+    # A token range groups only the tokens inside it. The others follow in
+    # input order.
+    ranged = VCAttentionPreprocessor().prepare(k, v, grouped_tokens=(200, 900)).perm
+    assert torch.equal(
+        ranged[..., :700].sort(dim=-1).values,
+        torch.arange(200, 900).to(ranged).expand(1, 2, -1),
+    )
+    rest = torch.cat([torch.arange(200), torch.arange(900, 1024)]).to(ranged)
+    assert torch.equal(ranged[..., 700:], rest.expand(1, 2, -1))
+    # A refresh with the range warm-starts from the range's centroids.
+    ranged_prep = VCAttentionPreprocessor()
+    ranged_prep.prepare(k, v, grouped_tokens=(200, 900), denoise_step=(0, 40))
+    refreshed = ranged_prep.prepare(
+        k, v.flip(1), grouped_tokens=(200, 900), denoise_step=(4, 40)
+    )
+    assert torch.equal(refreshed.perm[..., 700:], rest.expand(1, 2, -1))
+    # A new generation seen through one grouping cold-starts the others too.
+    # The range here last refreshed at step 4 of the previous generation.
+    ranged_prep.prepare(k, v, denoise_step=(20, 40))
+    ranged_prep.prepare(k, v, denoise_step=(0, 40))
+    assert torch.equal(
+        ranged_prep.prepare(k, v, grouped_tokens=(200, 900), denoise_step=(1, 40)).perm,
+        ranged,
+    )

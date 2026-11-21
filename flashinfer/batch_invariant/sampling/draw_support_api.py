@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple, Union
 
+import functools
+
 import torch
 
 from ..support import check_no_overlap, out_buffer, scratch, unsupported
@@ -56,6 +58,58 @@ def _check_input(x: torch.Tensor, name: str) -> int:
     return check_input(x, name, CLASS, SUPPORT_ARCHS)
 
 
+#: (device, dtype, value, rows) -> [the tensor, the event of its fill (None once that fill is known complete)]
+_CONST_ROWS: Dict[tuple, list] = {}
+_CONST_ROWS_MAX = 256
+
+
+def _const_rows(device, dtype: torch.dtype, v, M: int) -> torch.Tensor:
+    """The per-row tensor of a Python-scalar filter value, cached per (device, dtype, value, rows): the kernel only reads
+    it, so one fill serves every call with that scalar (a fill kernel and an allocation per scalar filter per call before
+    2026-11-18). The fill runs on the creating call's stream and the entry carries its event: a call on another stream
+    waits on that event, device side, until the fill is known complete, after which the entry is used as it stands (the
+    review of #9695 read the tensor from a second stream before its fill had run). Inside a CUDA-graph capture on the
+    tensor's device the cache is not consulted: the call fills its own tensor into the graph, as every call did before (an
+    event recorded outside a capture cannot be waited on inside it). The cache is bounded (past the bound a call fills a
+    fresh tensor)."""
+    dev = torch.device(device)
+    if dev.index is not None and dev.index != torch.cuda.current_device():
+        with torch.cuda.device(dev):
+            capturing = torch.cuda.is_current_stream_capturing()
+    else:
+        capturing = torch.cuda.is_current_stream_capturing()
+    if capturing:
+        return torch.full((M,), v, dtype=dtype, device=device)
+    key = (device, dtype, v, M)
+    entry = _CONST_ROWS.get(key)
+    if entry is None:
+        t = torch.full((M,), v, dtype=dtype, device=device)
+        if len(_CONST_ROWS) < _CONST_ROWS_MAX:
+            fill_done = torch.cuda.Event()
+            fill_done.record(torch.cuda.current_stream(dev))
+            _CONST_ROWS[key] = [t, fill_done]
+        return t
+    t, fill_done = entry
+    if fill_done is not None:
+        if fill_done.query():
+            entry[1] = None  # the fill is complete: no ordering needed from here on
+        else:
+            torch.cuda.current_stream(dev).wait_event(fill_done)
+    return t
+
+
+@functools.lru_cache(maxsize=None)
+def _filters_for(use_k: bool, use_p: bool, use_m: bool, order: str) -> Filters:
+    """The filter-set descriptor of a call (which filters, the order): the values are the class's placeholders (the kernel reads
+    the per-row tensors), so one object per set -- its construction rounds the placeholders through the exact binary32 model."""
+    return Filters(
+        top_k=1 if use_k else None,
+        top_p=1.0 if use_p else None,
+        min_p=0.0 if use_m else None,
+        order=order,
+    )
+
+
 def _row_param(
     value,
     M: int,
@@ -74,6 +128,14 @@ def _row_param(
     if value is None:
         return None, False
     if isinstance(value, torch.Tensor):
+        if (
+            value.dtype == dtype
+            and value.device == device
+            and value.dim() == 1
+            and value.shape[0] == M
+            and value.is_contiguous()
+        ):
+            return value, True  # already the kernel's form: no copy, no view
         t = value.to(device=device)
         if (
             dtype == torch.int32
@@ -100,7 +162,7 @@ def _row_param(
         v = float(value)
         if not (v >= lo) or v != v or v == float("inf"):
             raise ValueError(f"{name}={value!r} must be a finite number >= {lo}")
-    return torch.full((M,), v, dtype=dtype, device=device), True
+    return _const_rows(device, dtype, v, M), True
 
 
 def _source_row_param(value, indices, idx, Msrc: int, name: str):
@@ -214,12 +276,7 @@ def draw_support(
     k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k", hi=N)
     p_t, use_p = _row_param(top_p, M, lead, dev, torch.float32, "top_p")
     m_t, use_m = _row_param(min_p, M, lead, dev, torch.float32, "min_p")
-    filters = Filters(
-        top_k=1 if use_k else None,
-        top_p=1.0 if use_p else None,
-        min_p=0.0 if use_m else None,
-        order=order,
-    )
+    filters = _filters_for(use_k, use_p, use_m, order)
     temp_t, c = _temperature(temperature, M, lead, dev) if from_logits else (None, 0.0)
     elem_bytes = x.element_size()
     if config is None:
@@ -327,6 +384,7 @@ def draw_support(
             M,
             Msrc,
             N,
+            int(bool(enable_pdl)),
         )
     elif M > 0:
         # a gather from an empty source: every index lies outside the source rows, nothing is read or kept
@@ -407,12 +465,7 @@ def kept_log_probs(
     k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k", hi=N)
     p_t, use_p = _row_param(top_p, M, lead, dev, torch.float32, "top_p")
     m_t, use_m = _row_param(min_p, M, lead, dev, torch.float32, "min_p")
-    filters = Filters(
-        top_k=1 if use_k else None,
-        top_p=1.0 if use_p else None,
-        min_p=0.0 if use_m else None,
-        order=order,
-    )
+    filters = _filters_for(use_k, use_p, use_m, order)
     temp_t, c = _temperature(temperature, M, lead, dev)
     elem_bytes = logits.element_size()
     if config is None:
@@ -508,6 +561,7 @@ def kept_log_probs(
             M,
             M,
             N,
+            int(bool(enable_pdl)),
         )
     res = {"kept_logp": kb if kb is not None else lpk.view(lead)}
     if return_logprob:

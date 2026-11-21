@@ -906,7 +906,8 @@ def fold_group(
                         mLse,
                         mSink,
                         lse_mode,
-                        st.sinks,
+                        causal=st.causal,
+                        sinks=st.sinks,
                     )
             if thread_idx == 0:
                 mCounters[grp] = Int32(

@@ -31,7 +31,7 @@ from tests.moe_ep import test_moe_ep_sm107_block_scaled_mega_multirank as proble
 
 @pytest.fixture(autouse=True)
 def quiet_native_progress(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import autotune
 
     monkeypatch.setattr(autotune, "print", lambda *args, **kwargs: None, raising=False)
 
@@ -393,7 +393,7 @@ def test_ineligible_split_and_rank_agreement(
     monkeypatch,
     tmp_path,
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE as NATIVE_NAMESPACE,
     )
 
@@ -462,7 +462,7 @@ def test_empty_rank_output_copy_and_multiple_captures(
     tmp_path,
     forced,
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE as NATIVE_NAMESPACE,
     )
 

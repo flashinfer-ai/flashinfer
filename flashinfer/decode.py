@@ -1328,6 +1328,14 @@ def single_decode_with_kv_cache(
         return out
 
 
+def _batch_invariant_decode_causal(
+    q_len_per_req: int, is_causal: Optional[bool]
+) -> bool:
+    """The mask mode of the batch-invariant decode class: a single token per request is the causal class whatever
+    ``is_causal`` says; multi-token decode is causal unless ``is_causal=False``."""
+    return True if q_len_per_req <= 1 or is_causal is None else bool(is_causal)
+
+
 class BatchDecodeWithPagedKVCacheWrapper:
     r"""Wrapper class for decode attention with a paged KV cache (first proposed in
     `vLLM <https://arxiv.org/abs/2309.06180>`_) for a batch of requests.
@@ -1508,12 +1516,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales) raise
+            requires ``backend="auto"``. The mask mode is a class dimension: multi-token decode (``q_len_per_req > 1``) runs the
+            causal class (bottom-right aligned, optional ``window_left``) or, with ``is_causal=False``, the non-causal class (every
+            token sees its request's whole key range; no window); a single token per request is the causal class either way.
+            Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window with
+            ``is_causal=False``, logits soft cap, custom masks, RoPE, scales) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
             the class's LSE member (fp32; the output bits are the same with and without it). ``run(..., sinks=)`` with an
             fp32 ``[num_qo_heads]`` tensor runs the class's sink member (one virtual key per head in the softmax
-            denominator, merged once after the row's last chunk; the LSE includes it). CUDA graphs: capture
+            denominator, merged once after the row's last chunk; the LSE includes it). Both members exist in both mask
+            modes, with their own receipts per mode. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -1821,6 +1833,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
+        is_causal: Optional[bool] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -1833,6 +1846,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         This query is not available for ``cute-dsl``, ``trtllm-gen``, ``cudnn``,
         or ``cutile`` backends and raises ``NotImplementedError`` for them.
+
+        Under ``batch_invariant=True`` the size is that of the split-KV plan of
+        the mask mode :meth:`plan` will run, so pass the same ``q_len_per_req``,
+        ``is_causal`` and ``window_left`` as to :meth:`plan`: the two classes
+        plan different units for the same batch, and an input :meth:`plan`
+        refuses raises the same
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` here.
 
         Parameters
         ----------
@@ -1889,6 +1909,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             when this is ``True``.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
+        is_causal : Optional[bool]
+            Whether the mask is causal within each request block, as in :meth:`plan`.
+            Defaults to ``None``, which derives it from ``q_len_per_req > 1``. Values
+            that differ from that default are not supported by this wrapper, except
+            under ``batch_invariant=True``, where ``is_causal=False`` with
+            ``q_len_per_req > 1`` sizes the non-causal batch-invariant class and a
+            single token per request is the causal class either way.
 
         Returns
         -------
@@ -1915,7 +1942,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 page_size,
                 window_left,
                 q_len_per_req,
+                causal=_batch_invariant_decode_causal(q_len_per_req, is_causal),
             ), 0
+        if is_causal is not None and is_causal != (q_len_per_req > 1):
+            raise NotImplementedError(
+                f"backend={self._backend!r} derives the decode mask from "
+                "q_len_per_req; an explicit is_causal override is not supported"
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2250,7 +2283,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         is_causal : Optional[bool]
             Whether the mask is causal within each request block. Defaults to ``None``,
             which derives it from ``q_len_per_req > 1``. Values that differ from
-            that default are not supported by this wrapper.
+            that default are not supported by this wrapper, except under
+            ``batch_invariant=True``, where ``is_causal=False`` with ``q_len_per_req > 1``
+            runs the non-causal batch-invariant class (every token sees its request's
+            whole key range) and a single token per request is the causal class either way.
         use_token_head_sf : bool
             Whether the FP8 KV cache uses the per-(token, head) scale layout: a separate
             ``float32`` scale tensor (passed via ``kv_cache_sf`` in :meth:`run`) dequantizes
@@ -2363,14 +2399,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._batch_invariant.refuse(
                 window_right=window_right, seq_lens=seq_lens, block_tables=block_tables
             )
-            if is_causal is not None and is_causal != (q_len_per_req > 1):
-                from .batch_invariant.support import unsupported
-
-                raise unsupported(
-                    self._batch_invariant.CLASS,
-                    f"is_causal={is_causal} with q_len_per_req={q_len_per_req}",
-                    "the bottom-right causal mask (is_causal follows q_len_per_req > 1)",
-                )
+            causal = _batch_invariant_decode_causal(q_len_per_req, is_causal)
             self._batch_invariant.plan(
                 qo_indptr=None,
                 kv_indptr=indptr,
@@ -2381,7 +2410,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 head_dim_qk=head_dim,
                 head_dim_vo=None,
                 page_size=page_size,
-                causal=True,
+                causal=causal,
                 window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
                 pos_encoding_mode=pos_encoding_mode,

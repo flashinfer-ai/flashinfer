@@ -1,5 +1,6 @@
 """Staging parity and preparation helpers under CUDA graph replay."""
 
+import gc
 from types import SimpleNamespace
 
 import pytest
@@ -32,9 +33,7 @@ def test_nvfp4_fused_staging_matches_torch(monkeypatch, dtype, norm):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        unpack_fp4_to_f32,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import unpack_fp4_to_f32
 
     hidden, capacity, topk = 512, 64, 8
     actual = _buffers(capacity, hidden, topk, dtype)
@@ -217,6 +216,8 @@ def test_routing_check_reuses_kernel_across_row_counts(
         pytest.fail("A new row count must reuse the warmed routing kernel")
 
     monkeypatch.setattr(routing_validation.cute, "compile", unexpected_compile)
+    # Collect retired CuTe modules before capture: their finalizers unload CUDA libraries.
+    gc.collect()
     graphs = []
     inputs = []
     try:
@@ -434,7 +435,7 @@ def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_d
         for index in (0, 1):
             a, b = actual[index][:live], expected[index][:live]
             if kind == "mxfp4" and index == 0 and live:
-                from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+                from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
                     unpack_fp4_to_f32,
                 )
 
@@ -456,9 +457,7 @@ def test_mxfp8_fused_staging_finite_bf16(monkeypatch, kind):
         _data_dtype,
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        quantize_mxfp8_block32,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import quantize_mxfp8_block32
 
     monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")
     # Cover every finite BF16 value, including signed zero and subnormals.
@@ -484,7 +483,7 @@ def test_mxfp8_fused_staging_finite_bf16(monkeypatch, kind):
         kind=kind,
     )
     if kind == "mxfp4":
-        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             quantize_mxfp4_block32,
             unpack_fp4_to_f32,
         )
@@ -505,7 +504,9 @@ def test_mxfp8_fused_staging_finite_bf16(monkeypatch, kind):
 
 @pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2"])
 def test_mxfp8_fused_staging_keeps_scale_policies_separate(kind):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import fused_quant_stage
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        fused_quant_stage,
+    )
 
     dtype = torch.float8_e4m3fn if kind == "mxfp8_e4m3" else torch.float8_e5m2
     x = torch.zeros(8, 512, device="cuda", dtype=torch.bfloat16)
@@ -580,7 +581,9 @@ def test_shared_route_staging_keeps_score_policies_separate(id_dtype, ffi):
 
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
 def test_shared_staging_keeps_default_score_policy(id_dtype):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import fused_quant_stage
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        fused_quant_stage,
+    )
 
     x = torch.ones(8, 512, device="cuda", dtype=torch.bfloat16)
     ids = torch.tensor([0, -1, -1, -1], device="cuda", dtype=id_dtype).repeat(8, 1)
@@ -710,7 +713,7 @@ def test_quantized_staging_graph_masks_dirty_tail(
 @pytest.mark.parametrize("check_routes", [None, "0", "1"])
 def test_fused_staging_routing_check_policy(monkeypatch, kind, check_routes):
     from unittest.mock import Mock
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as shared
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as shared
     from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_mega_moe_inputs as stage_mx,
     )

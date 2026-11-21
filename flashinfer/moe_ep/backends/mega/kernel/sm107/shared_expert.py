@@ -10,7 +10,7 @@ from .....config import Sm107SharedExpertConfig as Sm107SharedExpertConfig
 
 
 def validate_feature_config(config):
-    from .....kernel_src.sm107.next_cutedsl_megamoe import validate_feature_config
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import validate_feature_config
 
     validate_feature_config(config)
 
@@ -147,7 +147,7 @@ def stage_shared_inputs(tensors, workspace, *, quantize_input):
     if shared is None:
         return
     import torch
-    from .....kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         quantize_mxfp8_block32,
         to_blocked,
     )

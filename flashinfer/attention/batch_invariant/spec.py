@@ -1,6 +1,11 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>``.
+"""Canonical dataflow of paged-KV attention: the classes ``attn.bf16.d<D>`` (causal) and ``attn.bf16.d<D>.nc`` (non-causal).
+
+The mask mode is a class dimension, not a per-call input: a causal row at position ``p`` sees the keys ``[lo, p + 1)`` (bottom-right
+aligned, ``lo`` from the optional sliding window), a non-causal row sees every key of its request, ``[0, kv_len)`` (no window). The
+tiles, the chunks, the online softmax and the merge are the same dataflow in both modes; only the visible set a token gets from the
+request metadata differs, so a token's term (and the fingerprint) differs between the two classes.
 
 The class is stated for finite bf16 operands: a non-finite Q / K / V value, or scaled scores outside the binary32 range, give
 the NaN that fp32 softmax arithmetic gives (bit for bit, like every other value) and are not guarded against.
@@ -34,6 +39,11 @@ symbolic spec and the Lean coupling, ``CuteF32`` inside the kernel). Per logical
   (``b = EX2(add(+inf, -inf))``), like any non-finite operand. The step works on ``s2``, so a finite sink whose ``s2``
   overflows binary32 (a magnitude above about ``FLT_MAX / log2 e``, ``2.36e38``) is the sink of that infinity: NaN above,
   the bits of the row without sinks below.
+
+Both members read a row's final ``(m, l)`` and nothing else, so they exist in both mask modes: under the non-causal class
+every query row of a request folds the same keys ``[0, kv_len)``, its LSE depends on the request's key count, its head and its
+own query alone, and the sink joins that key set. The members of the two classes are different terms with their own
+fingerprints (``attn-bf16-d<D>-nc-lse-<base>-...``, ``attn-bf16-d<D>-nc-sink-...``, ``attn-bf16-d<D>-nc-sink-lse-<base>-...``).
 
 Tile and chunk boundaries are absolute, ``T`` and ``C`` are functions of ``D`` only, so decode at
 position ``p`` and prefill of the token at position ``p`` build the same term (R4), and nothing in
@@ -123,19 +133,39 @@ def scale_log2(sm_scale: float) -> float:
 
 @dataclass(frozen=True)
 class RowSpec:
-    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys ``[lo, L)`` with
-    ``L = p + 1`` (causal) and ``lo = max(0, p - window_left)``; ``row`` names the row (query token and head) in the leaf terms."""
+    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys ``[lo, L)``. Causal
+    (the default): ``L = p + 1`` and ``lo = max(0, p - window_left)``. Non-causal (``causal=False``): ``L = kv_len`` (every key of
+    the request) and ``lo = 0``; the position only names the row and a window is not a parameter of that class. ``row`` names the row
+    (query token and head) in the leaf terms."""
 
     p: int
     window_left: int = -1
     row: int = 0  # the row's identity in the leaf terms (query token / head index)
+    causal: bool = True
+    kv_len: Optional[int] = (
+        None  # the request's key count (non-causal: the visible range is [0, kv_len))
+    )
+
+    def __post_init__(self) -> None:
+        if not self.causal:
+            assert self.kv_len is not None and self.kv_len >= 1, (
+                "a non-causal row needs the request's kv_len (at least one key)"
+            )
+            assert self.window_left < 0, (
+                "window_left is not a parameter of the non-causal class"
+            )
 
     @property
     def L(self) -> int:
+        if not self.causal:
+            assert self.kv_len is not None
+            return self.kv_len
         return self.p + 1
 
     @property
     def lo(self) -> int:
+        if not self.causal:
+            return 0
         return 0 if self.window_left < 0 else max(0, self.p - self.window_left)
 
     def visible(self, k: int) -> bool:
@@ -484,18 +514,29 @@ FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
 FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D256}
 
 
-def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
-    """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose prefix
-    spans one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
-    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``. The window is a per-call
-    input of the class (like the KV position), not a class dimension: the public receipt (``flashinfer.batch_invariant.fingerprint``)
-    is the digest of the no-window sample row; ``window_left`` here only selects another sample row."""
-    key = (D, window_left)
+def spec_fingerprint(D: int = 128, window_left: int = -1, causal: bool = True) -> str:
+    """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose visible keys
+    span one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
+    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C`` and the mask mode. The window is a
+    per-call input of the causal class (like the KV position), not a class dimension: the public receipt
+    (``flashinfer.batch_invariant.fingerprint``) is the digest of the no-window sample row; ``window_left`` here only selects
+    another sample row. The mask mode IS a class dimension: the non-causal class (``causal=False``, name ``attn-bf16-d<D>-nc-*``)
+    gives a token the visible set ``[0, kv_len)`` of its request where the causal class gives ``[0, p + 1)``, so the same token
+    has a different term under the two classes; the sample row's term is the same dataflow over the same visible keys in both
+    modes, and the mode enters the digest explicitly."""
+    if not causal and window_left >= 0:
+        raise ValueError("window_left is not a parameter of the non-causal class")
+    key = (D, window_left, bool(causal))
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
         spec = AttentionSpec(D)
-        row = RowSpec(p=spec.C + spec.T // 2, window_left=window_left)
+        L = spec.C + spec.T // 2 + 1
+        row = (
+            RowSpec(p=L - 1, window_left=window_left)
+            if causal
+            else RowSpec(p=0, causal=False, kv_len=L)
+        )
         parts = [
             f"D={D}",
             f"T={spec.T}",
@@ -504,8 +545,11 @@ def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
             fingerprint(spec.output(row, 0)),
             fingerprint(spec.output(row, 1)),
         ]
+        if not causal:
+            parts.insert(3, "mask=noncausal")
         _FINGERPRINTS[key] = (
             f"attn-bf16-d{D}-"
+            + ("" if causal else "nc-")
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _FINGERPRINTS[key]
@@ -537,21 +581,58 @@ SINK_LSE_FINGERPRINTS = {
     (256, "log2"): "attn-bf16-d256-sink-lse-log2-fcdaa847d25ab16a",
     (256, "ln"): "attn-bf16-d256-sink-lse-ln-8bd8ede7bafb8ca0",
 }
+# the recorded fingerprints of the non-causal class and of its members: the mode precedes the member in the name
+NC_FINGERPRINTS = {
+    64: "attn-bf16-d64-nc-5c64fc377eb66759",
+    128: "attn-bf16-d128-nc-421e018610a7f93c",
+    256: "attn-bf16-d256-nc-603c24eeb8691c0a",
+}
+NC_LSE_FINGERPRINTS = {
+    (64, "log2"): "attn-bf16-d64-nc-lse-log2-f287f9e1fd18384f",
+    (64, "ln"): "attn-bf16-d64-nc-lse-ln-f1552997d639d2ce",
+    (128, "log2"): "attn-bf16-d128-nc-lse-log2-66ad5536ca59cb76",
+    (128, "ln"): "attn-bf16-d128-nc-lse-ln-8953d00478ded858",
+    (256, "log2"): "attn-bf16-d256-nc-lse-log2-9bfafd1d8cbeb36d",
+    (256, "ln"): "attn-bf16-d256-nc-lse-ln-67f2e98028fae0ef",
+}
+NC_SINK_FINGERPRINTS = {
+    64: "attn-bf16-d64-nc-sink-e2b883b827085097",
+    128: "attn-bf16-d128-nc-sink-f380a0e936c103f3",
+    256: "attn-bf16-d256-nc-sink-f0a0bf2c7f86e1b7",
+}
+NC_SINK_LSE_FINGERPRINTS = {
+    (64, "log2"): "attn-bf16-d64-nc-sink-lse-log2-e973b28b732c6827",
+    (64, "ln"): "attn-bf16-d64-nc-sink-lse-ln-2a3b2f4f2e221fe6",
+    (128, "log2"): "attn-bf16-d128-nc-sink-lse-log2-760246bf1153b0c1",
+    (128, "ln"): "attn-bf16-d128-nc-sink-lse-ln-43249ae085aa93a0",
+    (256, "log2"): "attn-bf16-d256-nc-sink-lse-log2-edc47c7137f23613",
+    (256, "ln"): "attn-bf16-d256-nc-sink-lse-ln-5e999137d1b8c7e3",
+}
 
 
-def lse_fingerprint(D: int = 128, base: str = "log2", sinks: bool = False) -> str:
+def _sample_row(spec: "AttentionSpec", causal: bool) -> RowSpec:
+    """``spec_fingerprint``'s no-window sample row (one full chunk plus one tile of visible keys) under a mask mode."""
+    L = spec.C + spec.T // 2 + 1
+    return RowSpec(p=L - 1) if causal else RowSpec(p=0, causal=False, kv_len=L)
+
+
+def lse_fingerprint(
+    D: int = 128, base: str = "log2", sinks: bool = False, *, causal: bool = True
+) -> str:
     """Identifier of the LSE member of the class at head dim ``D`` in ``base`` (``"log2"`` | ``"ln"``): hashes the LSE term of
-    ``spec_fingerprint``'s sample row together with ``D``, ``T``, ``C`` and the base. A receipt of its own: the class
-    fingerprints (``spec_fingerprint``) hash the output terms alone and do not move with it. ``sinks``: the LSE of the sink
-    member (the sink included), ``attn-bf16-d<D>-sink-lse-<base>-...``."""
+    ``spec_fingerprint``'s sample row together with ``D``, ``T``, ``C``, the mask mode and the base. A receipt of its own: the
+    class fingerprints (``spec_fingerprint``) hash the output terms alone and do not move with it. ``sinks``: the LSE of the sink
+    member (the sink included), ``attn-bf16-d<D>-sink-lse-<base>-...``. ``causal=False``: the member of the non-causal class
+    (``attn-bf16-d<D>-nc-lse-<base>-...``, ``attn-bf16-d<D>-nc-sink-lse-<base>-...``; the class dimension precedes the
+    members in the name)."""
     if base not in LSE_BASES:
         raise ValueError(f"lse_base must be one of {LSE_BASES}, got {base!r}")
-    key = (D, base, bool(sinks))
+    key = (D, base, bool(sinks), bool(causal))
     if key not in _LSE_FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
         spec = AttentionSpec(D)
-        row = RowSpec(p=spec.C + spec.T // 2)
+        row = _sample_row(spec, bool(causal))
         parts = [
             f"D={D}",
             f"T={spec.T}",
@@ -561,23 +642,26 @@ def lse_fingerprint(D: int = 128, base: str = "log2", sinks: bool = False) -> st
         ]
         if sinks:
             parts.insert(3, "sinks")
+        if not causal:
+            parts.insert(3, "mask=noncausal")
         _LSE_FINGERPRINTS[key] = (
-            f"attn-bf16-d{D}-{'sink-' if sinks else ''}lse-{base}-"
+            f"attn-bf16-d{D}-{'' if causal else 'nc-'}{'sink-' if sinks else ''}lse-{base}-"
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _LSE_FINGERPRINTS[key]
 
 
-def sink_fingerprint(D: int = 128) -> str:
+def sink_fingerprint(D: int = 128, *, causal: bool = True) -> str:
     """Identifier of the sink member of the class at head dim ``D`` (a call with ``sinks``): hashes the output terms of
-    ``spec_fingerprint``'s sample row with the sink step, together with ``D``, ``T``, ``C``. The sink values are per-call inputs,
-    like the scale; the fingerprints of the class without sinks do not move with it."""
-    key = (D, "sink")
+    ``spec_fingerprint``'s sample row with the sink step, together with ``D``, ``T``, ``C`` and the mask mode. The sink values
+    are per-call inputs, like the scale; the fingerprints of the class without sinks do not move with it. ``causal=False``:
+    the member of the non-causal class, ``attn-bf16-d<D>-nc-sink-...``."""
+    key = (D, "sink", bool(causal))
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint
 
         spec = AttentionSpec(D)
-        row = RowSpec(p=spec.C + spec.T // 2)
+        row = _sample_row(spec, bool(causal))
         parts = [
             f"D={D}",
             f"T={spec.T}",
@@ -586,8 +670,10 @@ def sink_fingerprint(D: int = 128) -> str:
             fingerprint(spec.output(row, 0, sinks=True)),
             fingerprint(spec.output(row, 1, sinks=True)),
         ]
+        if not causal:
+            parts.insert(3, "mask=noncausal")
         _FINGERPRINTS[key] = (
-            f"attn-bf16-d{D}-sink-"
+            f"attn-bf16-d{D}-{'' if causal else 'nc-'}sink-"
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _FINGERPRINTS[key]
