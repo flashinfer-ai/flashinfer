@@ -192,3 +192,34 @@ def test_paged_mqa_logits_json_init_and_reference_standalone(json_path, prefix):
     # artifact's output schema advertises.
     assert str(out.dtype).rsplit(".", 1)[-1] == doc["outputs"]["logits"]["dtype"]
     assert torch.isfinite(out.float()[out.float() > float("-inf")]).all()
+
+
+@pytest.mark.cpu_only
+def test_fp4_trace_reference_rounds_midpoints_to_even():
+    from flashinfer.trace.templates.quantize import fp4_quantize_trace
+
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    lower = torch.nextafter(midpoints, torch.zeros_like(midpoints))
+    upper = torch.nextafter(midpoints, torch.full_like(midpoints, torch.inf))
+    magnitudes = torch.cat((lower, midpoints, upper))
+    below = list(range(7))
+    ties = [0, 2, 2, 4, 4, 6, 6]
+    above = list(range(1, 8))
+    codes = torch.tensor(below + ties + above, dtype=torch.uint8)
+    inputs = torch.zeros((2 * magnitudes.numel(), 16))
+    inputs[:, 0] = torch.cat((magnitudes, -magnitudes))
+    inputs[:, 1] = 6.0  # Pin the scale to one and the high nibble to seven.
+    expected = torch.zeros((inputs.size(0), 8), dtype=torch.uint8)
+    expected[:, 0] = 0x70 | torch.cat((codes, codes | 0x08))
+
+    fixture = FI_TRACE_OUT / "silu_and_mul_nvfp4_quantize_k16384.json"
+    namespace = _exec_in_fresh_namespace(json.loads(fixture.read_text())["reference"])
+    # sigmoid(32) is exactly 1 in FP32, so SiLU(32) * (inputs / 32) recovers inputs.
+    fused_inputs = torch.cat((torch.full_like(inputs, 32), inputs / 32), dim=-1)
+    for reference, x in (
+        (fp4_quantize_trace.reference, inputs),
+        (namespace["_silu_and_mul_nvfp4_quantize_reference"], fused_inputs),
+    ):
+        packed, scales = reference(x, global_scale=torch.ones(1))
+        torch.testing.assert_close(packed, expected)
+        assert (scales.view(torch.uint8) == 0x38).all()
