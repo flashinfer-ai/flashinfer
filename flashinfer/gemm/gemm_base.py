@@ -6212,6 +6212,22 @@ def _cudnn_gemm_bf16_runner(
             if pool is None or torch.cuda.is_current_stream_capturing():
                 return None
             kwargs = self._override_graph_kwargs(a, b, bias, out)
+            # Worker plans run only at their built geometry. When this call's
+            # layout could never pass that check (bias, batched, or a layout
+            # the profiler does not reproduce), the workers' plans would go
+            # unused and each candidate would be built here one by one.
+            if not _bf16_worker_plan_geometry_ok(
+                a,
+                b,
+                bias,
+                out,
+                m=a.shape[-2],
+                n=kwargs["n"],
+                k=kwargs["k"],
+                is_a_k_major=self._is_a_k_major,
+                is_b_k_major=self._is_b_k_major,
+            ):
+                return None
             key = _cudnn_override_key(
                 build_cudnn_gemm_bf16_graph_override_shape, kwargs
             )

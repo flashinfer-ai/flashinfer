@@ -138,19 +138,34 @@ def test_pool_plans_do_not_write_outside_output(pool_off, pool_on, m):
     assert pool.last_responses, "the pool was not used"
 
 
+@pytest.mark.parametrize("case", ["bias", "a-mn-major"])
+def test_pool_skipped_when_worker_plans_cannot_run(pool_off, pool_on, case):
+    # Calls the geometry gate always rejects would pay for the workers and
+    # then build every candidate in-process one by one; build them here.
+    inputs = _inputs(64)
+    if case == "bias":
+        inputs[2] = torch.randn(N, dtype=torch.bfloat16, device="cuda")
+        runner = _runner()
+    else:
+        runner = gb._cudnn_gemm_bf16_runner(is_a_k_major=False, is_b_k_major=True)
+    expected = runner.get_valid_tactics(inputs, None)
+    pool = pool_on()
+    assert runner.get_valid_tactics(inputs, None) == expected
+    assert not pool.last_responses, "the pool built plans that cannot run"
+
+
 def test_worker_plans_used_only_at_built_geometry(pool_on):
     pool = pool_on()
     runner = _runner()
-    a, b, bias, _, out, _ = warm = _inputs(64)
-    tactics = runner.get_valid_tactics(warm, None)
+    runner.get_valid_tactics(_inputs(64), None)
     assert pool.last_responses, "the pool was not used"
+    (registered,) = gb._cudnn_override_prebuilt.values()
     tactic = next(
-        t
-        for t in tactics
-        if gb._is_cudnn_single_plan_graph(
-            runner._get_override_graph(a, b, bias, out, tactic=t)
-        )
+        (t for t, g in registered.items() if gb._is_cudnn_single_plan_graph(g)),
+        None,
     )
+    if tactic is None:
+        pytest.skip("no worker plan was exportable on this GPU")
 
     def graph_for(m, out=None):
         a, b, bias, _, default_out, workspace = _inputs(m)
