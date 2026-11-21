@@ -149,7 +149,8 @@ def test_deferred_failure_keeps_stock_candidate_eligible(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(smallt, "_eligibility", lambda *args, **kwargs: None)
+    eligibility = Mock(return_value=None)
+    monkeypatch.setattr(smallt, "_eligibility", eligibility)
     monkeypatch.setenv(DISABLE_ENV, "1")
     runner = object.__new__(SpecializedFp8BlockSmallTRunner)
     runner._build()
@@ -173,6 +174,12 @@ def test_deferred_failure_keeps_stock_candidate_eligible(monkeypatch):
     assert layer._eligible_runners(act, weights) == (1,)
     generate.assert_not_called()
     monkeypatch.delenv(DISABLE_ENV)
+    eligibility.side_effect = RuntimeError("injected guard failure")
+    assert layer._eligible_runners(act, weights) == (1,)
+    generate.assert_not_called()
+    assert smallt._module_error is None
+    runner.pack_inputs.reset_mock()
+    eligibility.side_effect = None
     for _ in range(2):
         assert layer._eligible_runners(act, weights) == (1,)
     generate.assert_called_once_with()

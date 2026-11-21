@@ -3010,8 +3010,8 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
                 # A deferred build used to follow dispatch's structural guard.
                 # Keep that ordering even for packs that pass the runner checks.
                 inputs = self.pack_inputs(act, weights)
-                if (
-                    smallt._eligibility(
+                try:
+                    reason = smallt._eligibility(
                         inputs[1],
                         inputs[2],
                         inputs[3],
@@ -3022,8 +3022,11 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
                         inputs[0],
                         flags={},
                     )
-                    is not None
-                ):
+                except Exception:
+                    # Match dispatch's guard-failure decline. Build and launch
+                    # failures retain their own handling.
+                    return False
+                if reason is not None:
                     return False
                 if smallt._get_module() is None:
                     return False
