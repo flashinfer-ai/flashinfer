@@ -66,6 +66,7 @@ jobs:
         cuda: ${{ fromJSON(needs.generate-tag.outputs.runtime_cuda_matrix) }}
         arch: [amd64, arm64]
     env:
+      IMAGE_REPOSITORY: flashinfer/flashinfer-ci-${{ matrix.cuda.label }}
       IMAGE_TAG: flashinfer/flashinfer-ci-${{ matrix.cuda.label }}:${{ matrix.arch }}-${{ needs.generate-tag.outputs.date_sha }}
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +81,15 @@ jobs:
           username: flashinfer
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and load ${{ matrix.cuda.label }} ${{ matrix.arch }} image
+      # Pull requests build into the local daemon only. Publishing builds push
+      # the image untagged (by digest) with zstd-compressed layers, test the
+      # pushed image, and tag it only after the tests pass. `docker push` of a
+      # loaded image cannot choose the layer compression, and consumers spent
+      # most of each 4-6 minute pull decompressing gzip layers one at a time.
+      # force-compression also recompresses the inherited nvidia/cuda layers.
+      # zstd layers need Docker Engine 23+ (the CPU runners report 29.9).
+      - name: Build ${{ matrix.cuda.label }} ${{ matrix.arch }} image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -91,10 +100,11 @@ jobs:
             PYTORCH_INDEX=${{ matrix.cuda.pytorch_index }}
             CUDNN_VERSION=${{ matrix.cuda.cudnn_version }}
           platforms: linux/${{ matrix.arch }}
-          load: true
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ github.event_name == 'pull_request' && env.IMAGE_TAG || '' }}
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true,compression=zstd,force-compression=true', env.IMAGE_REPOSITORY) || '' }}
           pull: true  # Always pull the latest base image
           no-cache: true  # Disable all caching
-          tags: ${{ env.IMAGE_TAG }}
           provenance: false
           sbom: false
 
@@ -102,20 +112,37 @@ jobs:
         env:
           CUDA_VERSION: ${{ matrix.cuda.version }}
           TARGET_ARCH: ${{ matrix.arch }}
+          TEST_IMAGE: ${{ github.event_name == 'pull_request' && env.IMAGE_TAG || format('{0}@{1}', env.IMAGE_REPOSITORY, steps.build.outputs.digest) }}
         run: |
-          docker image inspect "${IMAGE_TAG}" >/dev/null
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            # Pull the pushed zstd image, as consumers will.
+            start=$(date +%s)
+            docker pull --platform "linux/${TARGET_ARCH}" "${TEST_IMAGE}"
+            echo "Pulled ${TEST_IMAGE} in $(( $(date +%s) - start ))s"
+            docker buildx imagetools inspect --raw "${TEST_IMAGE}" \
+              | grep -o '"mediaType": *"[^"]*"' | sort | uniq -c
+          fi
+          docker image inspect "${TEST_IMAGE}" >/dev/null
           docker run --rm --pull=never --platform "linux/${TARGET_ARCH}" -i \
-            "${IMAGE_TAG}" \
+            "${TEST_IMAGE}" \
             python3 - "${CUDA_VERSION}" "${TARGET_ARCH}" \
             < docker/test_ci_image.py
 
-      - name: Push tested image
+      - name: Tag tested image
         if: github.event_name != 'pull_request'
-        run: docker push "${IMAGE_TAG}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          # --prefer-index=false points the tag at the pushed manifest itself
+          # instead of wrapping it in a single-entry index.
+          docker buildx imagetools create --prefer-index=false \
+            -t "${IMAGE_TAG}" "${IMAGE_REPOSITORY}@${DIGEST}"
 
       - name: Remove candidate image
         if: always()
-        run: docker image rm "${IMAGE_TAG}" || true
+        env:
+          TEST_IMAGE: ${{ github.event_name == 'pull_request' && env.IMAGE_TAG || format('{0}@{1}', env.IMAGE_REPOSITORY, steps.build.outputs.digest) }}
+        run: docker image rm "${TEST_IMAGE}" || true
 
   create-manifests:
     name: CI manifest (${{ matrix.cuda.label }})
