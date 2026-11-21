@@ -50,7 +50,9 @@
 // Compute contract: the QK and PV products run on tcgen05 `kind::f8f6f4` with
 // FP32 accumulators.  Native FP4 MMA (`kind::mxf4nvf4`) is deliberately NOT
 // used -- the block scales are applied during the e2m1 -> e4m3 dequant so that
-// the operand precision matches the uniform-FP8 decode route.
+// the operand precision matches the uniform-FP8 decode route.  The dequantized
+// operand is shifted by a power of two into e4m3's range first (see
+// `scale_shift_flags`), and the shift is undone exactly outside the MMA.
 //
 // SOFTMAX STABILITY INVARIANT (do not weaken):
 //     every exponential argument resolves to a difference against a running row
@@ -198,6 +200,62 @@ __device__ __forceinline__ uint16_t pack_bf16x2_to_e4m3x2(uint32_t src) {
   return pack_e4m3x2(low, high);
 #endif
 }
+
+// ---------------------------------------------------------------------------
+// E4M3 HEADROOM OF THE DEQUANTIZED OPERAND (both families).
+//
+// A dequantized element is e2m1 * block_scale with |e2m1| <= 6 and an e4m3
+// block scale up to 448, i.e. up to 2688 -- past e4m3's 448, where the
+// `satfinite` conversion would clip it.  The standard NVFP4 recipe
+// (global_scale = amax / (6 * 448)) puts the largest block scales there.
+//
+// Each CTA therefore scans the block scales of the tokens it will read before
+// dequantizing anything, and stages K and V as e2m1 * block_scale * 2^-shift
+// with the smallest shift in [0, 3] that keeps every product inside e4m3 (one
+// shift per operand).  2^shift is restored exactly outside the FP8 operand: in
+// the QK logit scale for K and in the output normalization for V.  A CTA whose
+// scales already fit (all <= 448 / 6) runs with shift 0, unchanged.
+//
+// e4m3 magnitudes order like their low seven bits: 72 (0x69), 144 (0x71) and
+// 288 (0x79) are the largest scales whose 6x product still fits after a shift
+// of 0, 1 and 2.  `scale_shift_flags` turns the per-byte maxima of a thread's
+// scale words into "needs a shift of at least 1 / 2 / 3" bits, which OR across
+// the CTA into the shift.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint32_t scale_shift_flags(uint32_t bytes_max) {
+  const uint32_t m = max(max(bytes_max & 0xffu, (bytes_max >> 8) & 0xffu),
+                         max((bytes_max >> 16) & 0xffu, bytes_max >> 24));
+  return static_cast<uint32_t>(m > 0x69u) | (static_cast<uint32_t>(m > 0x71u) << 1) |
+         (static_cast<uint32_t>(m > 0x79u) << 2);
+}
+
+// Per-byte maximum of the 7-bit e4m3 magnitudes of `word`, over the bytes kept by
+// `byte_mask`, folded into `acc`.
+__device__ __forceinline__ uint32_t fold_scale_magnitudes(uint32_t acc, uint32_t word,
+                                                          uint32_t byte_mask) {
+  return __vmaxu4(acc, word & byte_mask & 0x7f7f7f7fu);
+}
+
+// The low `n` (0..4) bytes of a word.
+__device__ __forceinline__ uint32_t low_bytes_mask(int n) {
+  return n >= 4 ? 0xffffffffu : (1u << (8 * n)) - 1u;
+}
+
+// 2^-shift broadcast to f16x2, for scaling an f16x2 block-scale pair exactly
+// (the smallest e4m3 scale, 2^-9, stays a normal f16 after the largest shift).
+__device__ __forceinline__ uint32_t f16x2_exp2_neg(int shift) {
+  const uint32_t f = 0x3c00u - (static_cast<uint32_t>(shift) << 10);
+  return f | (f << 16);
+}
+
+__device__ __forceinline__ uint32_t mul_f16x2(uint32_t a, uint32_t b) {
+  uint32_t r;
+  asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
+
+// 2^e as an fp32, for small non-negative e.
+__device__ __forceinline__ float exp2i(int e) { return __int_as_float((127 + e) << 23); }
 
 // ---------------------------------------------------------------------------
 // Is this call inside the pinned family's envelope?
@@ -734,7 +792,10 @@ __device__ __forceinline__ void load_v_pages(const uint8_t* v_data, const uint8_
   load_v_batch<kFullPageTile>(v_data, v_scale, off0, off1, hkv, tid, g, r);
 }
 
-__device__ __forceinline__ void store_batch(uint8_t* dst, int tid, const RawBatch& r, int npage) {
+// `sf_mul` is the operand's headroom factor 2^-shift as f16x2 (see
+// `scale_shift_flags`).
+__device__ __forceinline__ void store_batch(uint8_t* dst, int tid, const RawBatch& r, int npage,
+                                            uint32_t sf_mul) {
   const int tok = tid >> 2;
   const int pair = tid & 3;
 #pragma unroll
@@ -743,9 +804,10 @@ __device__ __forceinline__ void store_batch(uint8_t* dst, int tid, const RawBatc
     uint8_t* base = dst + p * kKvTileBytes;
     const F16ScalePair sf = convert_scale_pair(r.sf >> (16 * p));
     const int col = pair * 32;
-    *reinterpret_cast<uint4*>(base + swz(tok, col)) = dequant_fp4x16_to_fp8(r.d[p * 2], sf.lo);
+    *reinterpret_cast<uint4*>(base + swz(tok, col)) =
+        dequant_fp4x16_to_fp8(r.d[p * 2], mul_f16x2(sf.lo, sf_mul));
     *reinterpret_cast<uint4*>(base + swz(tok, col + 16)) =
-        dequant_fp4x16_to_fp8(r.d[p * 2 + 1], sf.hi);
+        dequant_fp4x16_to_fp8(r.d[p * 2 + 1], mul_f16x2(sf.hi, sf_mul));
   }
 }
 
@@ -791,6 +853,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged(
   __shared__ int sTokenBase[kSelectedCapacity];
   __shared__ uint64_t sPageOff[kSelectedCapacity];
   __shared__ int sNpages;
+  __shared__ uint32_t sShiftFlags;  // K in bits 0..2, V in bits 3..5
   __shared__ int sPT[kPageTableCapacity];
 
   const int mbar = static_cast<int>(__cvta_generic_to_shared(&mma_bar));
@@ -876,12 +939,59 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged(
       sTokenBase[compact] = blk * page_size;
       sPageOff[compact] = static_cast<uint64_t>(physical) * static_cast<uint64_t>(page_bytes);
     }
-    if (lane == 0) sNpages = __popc(mask);
+    if (lane == 0) {
+      sNpages = __popc(mask);
+      sShiftFlags = 0;
+    }
   }
   __syncthreads();
   RawBatch rawK, rawV;
   const int npages = sNpages;
   const int nbatch = (npages + 1) >> 1;
+
+  if (npages > 0) {
+    const uint64_t p0 = sPageOff[0];
+    const uint64_t p1 = npages > 1 ? sPageOff[1] : p0;
+    // Both sides of the first batch are in flight before either is consumed:
+    // K and V of a page live in the same page, so their misses overlap instead
+    // of costing two serial round trips on the critical path.  They are issued
+    // before the headroom scan below, whose scale reads then overlap them.
+    load_k_pages<kOddTail, kFullPageTile>(k_data, k_scale, p0, p1, npages > 1, 0, tid, cache, rawK);
+    load_v_pages<kOddTail, kFullPageTile>(v_data, v_scale, p0, p1, npages > 1, 0, tid, cache, rawV);
+  }
+
+  // ---- e4m3 headroom: scan the block scales of every token this CTA reads ----
+  // (see `scale_shift_flags`).  A page's scales are page_size * 2 words per
+  // operand: threads 0..255 read K's (token t's eight at words 2t, 2t + 1),
+  // threads 256..511 V's ((4,4) swizzle: tokens 4g..4g+3 in the byte lanes of
+  // words 8g..8g+7), one word per thread per page.  Tokens past the request's
+  // length are not read by the softmax and are left out.
+  {
+    const bool scans_v = tid >= 256;
+    const int wp = tid & 255;
+    const uint8_t* scales = scans_v ? v_scale : k_scale;
+    uint32_t bytes_max = 0;
+    if (wp < page_size * 2) {
+#pragma unroll 4
+      for (int p = 0; p < npages; ++p) {
+        const int valid = min(page_size, seq - sTokenBase[p]);
+        const int n = scans_v ? valid - 4 * (wp >> 3) : ((wp >> 1) < valid ? 4 : 0);
+        if (n > 0)
+          bytes_max = fold_scale_magnitudes(
+              bytes_max, __ldg(reinterpret_cast<const uint32_t*>(scales + sPageOff[p]) + wp),
+              low_bytes_mask(n));
+      }
+    }
+    // Warps 0..7 scan K and warps 8..15 V, so a warp's flags belong to one operand.
+    const uint32_t flags = __reduce_or_sync(0xffffffffu, scale_shift_flags(bytes_max))
+                           << (scans_v ? 3 : 0);
+    if (lane == 0 && flags != 0) atomicOr(&sShiftFlags, flags);
+  }
+  __syncthreads();
+  // Read back from shared memory at each use rather than held in registers
+  // across the page loop, which this kernel's register budget has no room for.
+  const auto k_shift = [&] { return __popc(sShiftFlags & 7u); };
+  const auto v_shift = [&] { return __popc((sShiftFlags >> 3) & 7u); };
   if (npages == 0) {
     for (int e = tid; e < heads_per_kv * kHeadDim; e += kThreads)
       sO[(e >> 7) * kOStride + (e & (kHeadDim - 1))] = 0.0f;
@@ -892,7 +1002,8 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged(
   constexpr uint32_t qk_desc = (1U << 4U) | (16U >> 3U << 17U) | (128U >> 4U << 24U);
   constexpr uint32_t pv_desc = qk_desc | (1U << 15U);
 
-  const float ls2 = softmax_scale * k_global_scale * kLog2e;
+  // K was staged as k * 2^-k_shift: the logit scale restores it exactly.
+  const float ls2 = softmax_scale * k_global_scale * kLog2e * exp2i(k_shift());
   float2 run_sum2 = make_float2(0.0f, 0.0f);
   // Online softmax state, private to the warp that owns this query head.
   float run_max = kNegRunMaxOrigin;         // running row maximum, in log2 units
@@ -907,14 +1018,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged(
   const int shead = warp;  // one warp per query head
 
   if (npages > 0) {
-    const uint64_t p0 = sPageOff[0];
-    const uint64_t p1 = npages > 1 ? sPageOff[1] : p0;
-    // Both sides of the first batch are in flight before either is consumed:
-    // K and V of a page live in the same page, so their misses overlap instead
-    // of costing two serial round trips on the critical path.
-    load_k_pages<kOddTail, kFullPageTile>(k_data, k_scale, p0, p1, npages > 1, 0, tid, cache, rawK);
-    load_v_pages<kOddTail, kFullPageTile>(v_data, v_scale, p0, p1, npages > 1, 0, tid, cache, rawV);
-    store_batch(sK, tid, rawK, npages > 1 ? 2 : 1);
+    store_batch(sK, tid, rawK, npages > 1 ? 2 : 1, f16x2_exp2_neg(k_shift()));
     if (nbatch > 1) {
       const uint64_t q0 = sPageOff[2];
       const uint64_t q1 = npages > 3 ? sPageOff[3] : q0;
@@ -962,7 +1066,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged(
     }
 
     // ---- V dequant + next-batch V prefetch, overlapped with the QK MMA ----
-    store_batch(sV, tid, rawV, has2 ? 2 : 1);
+    store_batch(sV, tid, rawV, has2 ? 2 : 1, f16x2_exp2_neg(v_shift()));
     if (it + 1 < nbatch) {
       const int n0 = first + 2;
       const uint64_t p0 = sPageOff[n0];
@@ -1108,7 +1212,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged(
     // ---- Next batch's K dequant, overlapped with the PV MMA ----
     if (it + 1 < nbatch) {
       const int n0 = first + 2;
-      store_batch(sK, tid, rawK, (n0 + 1) < npages ? 2 : 1);
+      store_batch(sK, tid, rawK, (n0 + 1) < npages ? 2 : 1, f16x2_exp2_neg(k_shift()));
       if (it + 2 < nbatch) {
         const int m0 = first + 4;
         const uint64_t p0 = sPageOff[m0];
@@ -1140,7 +1244,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged(
 
   if constexpr (kSplit == 1) {
     if (lane == 0 && warp < heads_per_kv)
-      sInv[warp] = run_sum > 0.0f ? v_global_scale / run_sum : 0.0f;
+      sInv[warp] = run_sum > 0.0f ? v_global_scale * exp2i(v_shift()) / run_sum : 0.0f;
     __syncthreads();
     if (warp < 4) {
 #pragma unroll
@@ -1176,7 +1280,8 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged(
 #pragma unroll
         for (int h = 0; h < 8; ++h) {
           const int hh = half * 8 + h;
-          if (hh < heads_per_kv) dst_o[hh * kOStride] = o[h];
+          // V was staged as v * 2^-v_shift; this rank's partial restores it.
+          if (hh < heads_per_kv) dst_o[hh * kOStride] = o[h] * exp2i(v_shift());
         }
       }
     }
@@ -1659,8 +1764,11 @@ __device__ __forceinline__ void load_raw(const uint8_t* __restrict__ data,
   }
 }
 
-__device__ __forceinline__ void store_tile(uint8_t* tile, const Addr& a, const Raw& r) {
-  const uint32_t sfh = scales_to_f16x2(r.sf);
+// `sf_mul` is the operand's headroom factor 2^-shift as f16x2 (see
+// `scale_shift_flags`).
+__device__ __forceinline__ void store_tile(uint8_t* tile, const Addr& a, const Raw& r,
+                                           uint32_t sf_mul) {
+  const uint32_t sfh = mul_f16x2(scales_to_f16x2(r.sf), sf_mul);
   const uint32_t s0 = prmt(sfh, sfh, 0x1010u);
   const uint32_t s1 = prmt(sfh, sfh, 0x3232u);
   *reinterpret_cast<uint4*>(tile + a.st0) = dq16(r.d.x, r.d.y, s0);
@@ -1731,6 +1839,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
   __shared__ size_t sPageOff[kPages];
   __shared__ int sBlk[kPages];
   __shared__ int sNpages;
+  __shared__ uint32_t sShiftFlags;  // K in bits 0..2, V in bits 3..5
   __shared__ int sSelected[kTopK];
   __shared__ int sPT[kMaxBlocks];
 
@@ -1818,17 +1927,51 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
       sBlk[compact] = blk_reg;
       sPageOff[compact] = static_cast<size_t>(physical) * page_bytes;
     }
-    if (lane == 0) sNpages = __popc(mask);
+    if (lane == 0) {
+      sNpages = __popc(mask);
+      sShiftFlags = 0;
+    }
   }
   __syncthreads();
   const int npages = sNpages;
+
+  // ---- e4m3 headroom: scan the block scales of every token this CTA reads ----
+  // (see `scale_shift_flags`).  It folds into the barrier below, which
+  // already exists.  Per page the K and V scales are 256 words each (token
+  // t's eight K scales at words 2t / 2t + 1; V's (4,4) swizzle puts tokens
+  // 4g..4g+3 in the byte lanes of words 8g..8g+7); every thread reads a K and
+  // a V word of kPages * 256 / kThreads pages, so all of them are in flight
+  // at once.  Tokens past the request's length are left out.
+  {
+    constexpr int kWordsPerPage = kPageSize * 2;
+    uint32_t kmax = 0, vmax = 0;
+#pragma unroll 4
+    for (int w = tid; w < npages * kWordsPerPage; w += kThreads) {
+      const int p = w / kWordsPerPage;
+      const int wp = w % kWordsPerPage;
+      const int valid = min(kPageSize, seq - sBlk[p] * kPageSize);
+      const size_t off =
+          sPageOff[p] + static_cast<size_t>(hkv) * scale_head_stride + static_cast<size_t>(wp) * 4;
+      if ((wp >> 1) < valid)
+        kmax = fold_scale_magnitudes(kmax, __ldg(reinterpret_cast<const uint32_t*>(k_scale + off)),
+                                     0xffffffffu);
+      const int v_bytes = valid - 4 * (wp >> 3);
+      if (v_bytes > 0)
+        vmax = fold_scale_magnitudes(vmax, __ldg(reinterpret_cast<const uint32_t*>(v_scale + off)),
+                                     low_bytes_mask(v_bytes));
+    }
+    const uint32_t flags =
+        __reduce_or_sync(0xffffffffu, scale_shift_flags(kmax) | (scale_shift_flags(vmax) << 3));
+    if (lane == 0 && flags != 0) atomicOr(&sShiftFlags, flags);
+  }
 
   const int taddrS = tmem_slot;
   const int taddrO = tmem_slot + kChunk * 16;
   constexpr uint32_t qk_desc = (1U << 4U) | (16U >> 3U << 17U) | (128U >> 4U << 24U);
   constexpr uint32_t pv_desc = qk_desc | (1U << 15U);
 
-  const float ls2 = softmax_scale * k_global_scale * kLog2e;
+  // K is staged as k * 2^-k_shift (set below): the logit scale restores it.
+  float ls2 = softmax_scale * k_global_scale * kLog2e;
   float run_max = kNegInf;
   float run_sum = 0.0f;
   int phaseA = 0, phaseB = 0;
@@ -1848,6 +1991,11 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
   // their scores are masked to -inf so they contribute nothing.
   if (tid < kPages && tid >= npages && npages > 0) sPageOff[tid] = sPageOff[0];
   __syncthreads();
+  const int k_shift = __popc(sShiftFlags & 7u);
+  const int v_shift = __popc((sShiftFlags >> 3) & 7u);
+  const uint32_t k_sf_mul = f16x2_exp2_neg(k_shift);
+  const uint32_t v_sf_mul = f16x2_exp2_neg(v_shift);
+  ls2 *= exp2i(k_shift);
 
   Raw rk[kHalf], rv[kHalf];
 
@@ -1869,7 +2017,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
     // ---- first half: K -> tiles [0, kHalf) ----
 #pragma unroll
     for (int i = 0; i < kHalf; ++i)
-      if (!kTailAware || i < nfirst) store_tile(sT + i * kTileBytes, addr, rk[i]);
+      if (!kTailAware || i < nfirst) store_tile(sT + i * kTileBytes, addr, rk[i], k_sf_mul);
 #pragma unroll
     for (int i = 0; i < kHalf; ++i)
       if (!kTailAware || i < nsecond)
@@ -1892,7 +2040,8 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
     // ---- second half: K -> tiles [kHalf, kChunk) ----
 #pragma unroll
     for (int i = 0; i < kHalf; ++i)
-      if (!kTailAware || i < nsecond) store_tile(sT + (kHalf + i) * kTileBytes, addr, rk[i]);
+      if (!kTailAware || i < nsecond)
+        store_tile(sT + (kHalf + i) * kTileBytes, addr, rk[i], k_sf_mul);
 #pragma unroll
     for (int i = 0; i < kHalf; ++i)
       if (!kTailAware || i < nfirst) load_raw<true>(v_data, v_scale, sPageOff[p0 + i], addr, rv[i]);
@@ -1918,7 +2067,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
     asm volatile("tcgen05.fence::after_thread_sync;");
 #pragma unroll
     for (int i = 0; i < kHalf; ++i)
-      if (!kTailAware || i < nfirst) store_tile(sT + i * kTileBytes, addr, rv[i]);
+      if (!kTailAware || i < nfirst) store_tile(sT + i * kTileBytes, addr, rv[i], v_sf_mul);
 #pragma unroll
     for (int i = 0; i < kHalf; ++i)
       if (!kTailAware || i < nsecond)
@@ -2052,7 +2201,8 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
     // ---- V for the second half, overlapped with the first half's PV MMA ----
 #pragma unroll
     for (int i = 0; i < kHalf; ++i)
-      if (!kTailAware || i < nsecond) store_tile(sT + (kHalf + i) * kTileBytes, addr, rv[i]);
+      if (!kTailAware || i < nsecond)
+        store_tile(sT + (kHalf + i) * kTileBytes, addr, rv[i], v_sf_mul);
     if (c + 1 < kChunks && p0 + kChunk < npages) {
 #pragma unroll
       for (int i = 0; i < kHalf; ++i)
@@ -2101,8 +2251,10 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
     tmem_ld16(taddrO, o);
     tmem_wait_ld();
     float* dst_o = sO + warp * 32 + lane;
+    // V was staged as v * 2^-v_shift; the partial restores it.
+    const float v_restore = exp2i(v_shift);
 #pragma unroll
-    for (int h = 0; h < 16; ++h) dst_o[h * kOStride] = o[h];
+    for (int h = 0; h < 16; ++h) dst_o[h * kOStride] = o[h] * v_restore;
   }
   if (lane == 0 && warp < kHeadsPerKV) {
     if constexpr (kSplit == 1)
