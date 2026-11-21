@@ -21,6 +21,7 @@ from .attn_scores import (
     precompile_paged_mqa_logits,
 )
 from .mqa_topk import FP8MQATopKWrapper
+from .prefill_indexer import fp8_paged_mqa_topk_indexer
 
 __all__ = [
     "fp8_paged_mqa_logits",
@@ -30,4 +31,5 @@ __all__ = [
     "padded_seq_len",
     "precompile_paged_mqa_logits",
     "FP8MQATopKWrapper",
+    "fp8_paged_mqa_topk_indexer",
 ]
