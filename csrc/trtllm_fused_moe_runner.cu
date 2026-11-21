@@ -133,6 +133,8 @@ static inline EltwiseActType activationTypeToEltwiseActType(ActivationType actTy
   switch (actType) {
     case ActivationType::Relu2:
       return EltwiseActType::Relu2;
+    case ActivationType::ClampedRelu2:
+      return EltwiseActType::ClampedRelu2;
     case ActivationType::Identity:
       return EltwiseActType::None;
     default:
@@ -149,9 +151,15 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     batchedGemm::gemm::MatrixLayout weightLayout, batchedGemm::gemm::BiasType biasType,
     bool usePerTokenScaling, bool usePerChannelScaling) {
   int64_t actTypeInt = static_cast<int64_t>(activationType);
-  FLASHINFER_CHECK(
-      0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
-      "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
+  bool validActivation =
+      0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType);
+  validActivation = validActivation ||
+                    (activationType == ActivationType::ClampedRelu2 &&
+                     ((dtypeAct == btg::Dtype::MxE4m3 && dtypeWeights == btg::Dtype::MxE4m3) ||
+                      (dtypeAct == btg::Dtype::Bfloat16 && dtypeWeights == btg::Dtype::Bfloat16)) &&
+                     !useDeepSeekFp8);
+  FLASHINFER_CHECK(validActivation, "Unknown or unsupported activation type",
+                   serializeActivationType(activationType), "of enum", actTypeInt);
   bool isGatedAct = isGatedActivation(activationType);
   bool useBiasMn = biasType == batchedGemm::gemm::BiasType::Mn;
   // ReorderAndShuffle is only supported on fused-act (gated) paths in trtllm-gen.
@@ -778,6 +786,15 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
         reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, recipe, stream, enable_pdl);
+    if (args.fc2_input_out != nullptr) {
+      invokeNvfp4PermutedRowsToExpanded(
+          args.num_tokens * totalExpertsPerToken, args.intermediate_size,
+          workspace.expanded_idx_to_permuted_idx,
+          reinterpret_cast<uint8_t const*>(workspace.activation_output),
+          reinterpret_cast<uint8_t const*>(workspace.activation_output_scale),
+          reinterpret_cast<float const*>(workspace.token_scales_fc2), sfLayout, args.fc2_input_out,
+          args.fc2_input_scale_out, args.fc2_input_token_scale_out, stream);
+    }
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

@@ -63,7 +63,7 @@ def nvfp4_batch_invariant_implementation(config: Any) -> str:
     if getattr(config, "kernel_variant", "inference") == "genphase":
         return "genphase"
     name = getattr(config, "kernel_name", "")
-    if name in ("sm100_nvfp4_nvfp4_bf16_cutedsl", "nvfp4_cutedsl"):
+    if name == "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy":
         return "legacy"
     if config.__class__.__name__ == "MegaMoENvfp4Config":
         return "legacy"

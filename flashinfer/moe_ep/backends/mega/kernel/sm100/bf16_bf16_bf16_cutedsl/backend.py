@@ -82,7 +82,7 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
-            # The drop's own shim bound (kernel_src/sm100/cutedsl_megamoe/shim/
+            # The drop's own shim bound (shims/sm100/cutedsl_megamoe/pre_unification/
             # bf16.py): hidden % 32, intermediate % 64 — not the deep_gemm
             # SF-word 128 default. 32 covers hidden here; the stricter
             # intermediate bound is enforced below.
@@ -118,7 +118,7 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
 
     supports_live_token_tuning = True
     _knob_cache_module = (
-        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+        "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.knob_cache"
     )
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
@@ -160,7 +160,7 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.sm100.cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
             get_symm_buffer_for_bf16_mega_moe,
         )
 
@@ -219,7 +219,9 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         del quantize_input
-        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+            note_staged_tokens,
+        )
 
         stage_mega_moe_inputs(
             t.hidden_states,
@@ -238,7 +240,10 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.sm100.cutedsl_megamoe import bf16_mega_moe, staged_tokens
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+            bf16_mega_moe,
+            staged_tokens,
+        )
 
         if self.supports_unfinalized_output:
             raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
@@ -259,7 +264,9 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
             num_tokens = staged
 
         if self._autotune_pending:
-            from ......kernel_src.sm100.cutedsl_megamoe import autotune_bf16_mega_moe
+            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+                autotune_bf16_mega_moe,
+            )
 
             self._autotune_winner = autotune_bf16_mega_moe(
                 output,
@@ -287,7 +294,7 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from ......kernel_src.sm100.cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
             MegaMoEBf16Inputs,
             staged_tokens,
         )
@@ -367,7 +374,7 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         import sys
 
         quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
+            "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.quant_stage"
         )
         topk_idx = getattr(workspace, "topk_idx", None)
         if quant_stage is not None and topk_idx is not None:

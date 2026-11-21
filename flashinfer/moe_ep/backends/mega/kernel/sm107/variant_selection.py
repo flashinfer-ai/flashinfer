@@ -22,7 +22,7 @@ from .shared_expert import Sm107SharedExpertWeights
 if TYPE_CHECKING:
     from .....config import FleetParams
     from .....tensors import MoEEpTensors
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledSymmBuffer,
     )
     from .automatic import RubinBackend
@@ -45,7 +45,7 @@ def _json(value):
 
 
 def _context() -> TuningContext:
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         validate_context,
     )
 
@@ -55,7 +55,7 @@ def _context() -> TuningContext:
 
 
 def _cache_identity(context: TuningContext) -> tuple:
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE as NATIVE_NAMESPACE,
     )
 
@@ -177,7 +177,7 @@ class RubinVariantBackend(MegaKernelBackend):
         return backend
 
     def _fixed_backend(self, workspace):
-        from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
 
         knobs = {key: getattr(workspace.config, key) for key in KNOB_KEYS}
         return self._backend(workspace.config.kernel_variant, knobs)
@@ -187,11 +187,11 @@ class RubinVariantBackend(MegaKernelBackend):
         return VariantWorkspace(fleet_params, self._fixed_backend(workspace), workspace)
 
     def _eligible(self, fleet):
-        from .....kernel_src.sm107.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             Sm107BlockScaledSymmBuffer,
             sm107_candidates,
         )
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             is_valid_sm107,
         )
 
@@ -366,7 +366,7 @@ class _VariantProtocol:
         self.install_winner = install_winner
 
     def _contract(self, variants, context):
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
             RubinTuningProtocol,
         )
 
@@ -410,7 +410,7 @@ class _VariantProtocol:
         }
 
     def _install(self, record):
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             _prepare_collectively,
         )
 
@@ -433,10 +433,10 @@ class _VariantProtocol:
         if record.get("variant") not in contract["variants"]:
             return False
         try:
-            from .....kernel_src.sm107.next_cutedsl_megamoe import (
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
                 Sm107BlockScaledSymmBuffer,
             )
-            from .....kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache import (
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.knob_cache import (
                 _knobs_from_json,
             )
 
@@ -465,7 +465,7 @@ class _VariantProtocol:
 
     def run(self, context: TuningContext):
         from .....core.tuning_measurement import measurement_settings
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
             NAMESPACE as NATIVE_NAMESPACE,
             RubinTuningProtocol,
             _publish_record,
@@ -541,9 +541,9 @@ class _VariantProtocol:
             state.record_selection(None, _cache_identity(context), None)
             return TuningResult(None)
         if record is None:
-            from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
-            from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
-            from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
                 NoPassingCandidate,
                 _sweep_sm107_block_scaled_mega_moe,
                 sm107_candidates,
@@ -667,7 +667,7 @@ class _VariantProtocol:
                 "measurement": measurement,
             }
         # Managed JSON decoding preserves payload lists; native knobs use tuples.
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
 
         record = deepcopy(record)
         record["knobs"] = knob_cache._knobs_from_json(record["knobs"])

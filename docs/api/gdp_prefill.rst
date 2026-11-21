@@ -22,12 +22,15 @@ with the same argument contract.
 
     chunk_gated_delta_product
 
-Decode and MTP verification (Cake, SM90 / SM100 / SM103)
---------------------------------------------------------
+Decode and MTP verification (Cake, SM90 / SM100 / SM103 / SM107)
+----------------------------------------------------------------
 
 Gated DeltaProduct decode and multi-token (MTP) verification:
 K=128, V=64, one to four Householder steps per token, over an FP32
 pretranspose state pool with indexed read / write / per-token snapshot slots.
+On SM100 / SM103 / SM107 the pool may be FP16: the recurrence stays FP32, and
+every store rounds to FP16, to nearest even or stochastically with a
+``rand_seed`` (Philox random bits, hardware ``cvt.rs``).
 One fused kernel per call; the docstring states the input contracts.
 
 .. currentmodule:: flashinfer.cake_gdp

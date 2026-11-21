@@ -18,7 +18,7 @@ from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidat
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    from ......kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         autotune_bf16_mxfp8_mega_moe,
         bf16_mxfp8_candidates,
         create_dummy_bf16_mxfp8_inputs,

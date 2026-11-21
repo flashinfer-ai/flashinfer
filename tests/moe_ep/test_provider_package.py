@@ -1,4 +1,4 @@
-"""Rubin export integrity and coexistence with the Blackwell package."""
+"""Combined provider export integrity and architecture coexistence."""
 
 import ast
 import hashlib
@@ -12,13 +12,12 @@ import pytest
 
 
 _ROOT = (
-    Path(__file__).resolve().parents[2]
-    / "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src"
+    Path(__file__).resolve().parents[2] / "flashinfer/moe_ep/kernels/cutedsl_megamoe"
 )
 
 
 def test_export_manifest_matches_sources():
-    manifest = json.loads((_ROOT.parent / "export_manifest.json").read_text())
+    manifest = json.loads((_ROOT / "export_manifest.json").read_text())
     files = manifest["files"]
     assert set(files) == {str(path.relative_to(_ROOT)) for path in _ROOT.rglob("*.py")}
     for name, digest in files.items():
@@ -60,16 +59,13 @@ import sys
 import types
 import torch
 
-namespace = "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src"
+namespace = "flashinfer.moe_ep.kernels.cutedsl_megamoe"
 foreign = {name: types.ModuleType(name) for name in ("sources", "common")}
 sys.modules.update(foreign)
 provider = importlib.import_module(namespace)
 assert not any(name.startswith(namespace + ".sources.kernel_src.") for name in sys.modules)
-blackwell = importlib.import_module(
-    "flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources"
-)
-getattr(blackwell, "BlackwellInferenceMegaMoE")
-getattr(blackwell, "BlackwellInferenceGenphaseMegaMoE")
+getattr(provider, "BlackwellInferenceMegaMoE")
+getattr(provider, "BlackwellInferenceGenphaseMegaMoE")
 assert not any(name.startswith(namespace + ".sources.kernel_src.rubin.") for name in sys.modules)
 getattr(provider, "RubinInferenceMegaMoE")
 getattr(provider, "RubinInferenceGenphaseMegaMoE")
