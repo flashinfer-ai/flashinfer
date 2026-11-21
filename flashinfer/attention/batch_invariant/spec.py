@@ -512,6 +512,13 @@ FINGERPRINTS_SOFT_CAP = {
     128: "attn-bf16-d128-sc-4d20bafe3df5e7bb",
     256: "attn-bf16-d256-sc-e5998570166e4b31",
 }
+# the capped non-causal classes (``spec_fingerprint(D, causal=False, soft_cap=True)``): the non-causal visible set over capped
+# score leaves; the name carries the mask mode first, then the score
+FINGERPRINTS_NONCAUSAL_SOFT_CAP = {
+    64: "attn-bf16-d64-nc-sc-94fdecc5082945e3",
+    128: "attn-bf16-d128-nc-sc-f48ebd821a3cff79",
+    256: "attn-bf16-d256-nc-sc-1357f4be93f27f4f",
+}
 
 
 def spec_fingerprint(
