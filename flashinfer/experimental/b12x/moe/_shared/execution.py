@@ -947,8 +947,8 @@ def plan_moe_weight_preparation(
             )
             continue
         if spec.quant_mode == "w8a8_mx":
-            if spec.activation != "silu":
-                raise ValueError("W8A8-MXFP8 preparation requires silu")
+            if spec.activation not in {"silu", "situ"}:
+                raise ValueError("W8A8-MXFP8 preparation requires silu or situ")
             # FC1 streams 128-wide K tiles over hidden (one E4M3 byte per
             # element), so hidden must be 128-aligned.  The intermediate is
             # the FC2 K extent and the FC1 N extent: FC2 needs whole UE8M0
