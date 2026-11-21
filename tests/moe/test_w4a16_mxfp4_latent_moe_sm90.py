@@ -651,7 +651,7 @@ def test_graph_workspace_ordered_and_independent(T):
 def test_green_stream_decode_capacity_and_replay():
     _sm90_or_skip()
     green_contexts = pytest.importorskip("torch.cuda.green_contexts")
-    ctx = green_contexts.GreenContext(num_sms=8)
+    ctx = green_contexts.GreenContext.create(num_sms=8)
     reduced = ctx.Stream()
     full = torch.cuda.default_stream()
     # One weight pack, one reduced workspace. Warm to the maximum before
