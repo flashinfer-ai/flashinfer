@@ -446,10 +446,9 @@ def gen_cake_alltoall_module(target: CakeAlltoAllTarget) -> JitSpec:
 def gen_nvlink_one_sided_alltoall_module() -> JitSpec:
     """NVLink one-sided MoE all-to-all behind ``flashinfer.moe_ep.NVLinkOneSidedAlltoAll``.
 
-    Includes the fence and sentinel paths, and a CFT counted-write path that
-    ``NVLinkOneSidedAlltoAll`` does not use. The CFT path and the
-    logical-endpoint ops are compiled in when the CUDA toolkit provides the
-    logical-endpoint API (13.4+) and resolved from the driver at runtime.
+    Includes the fence and sentinel paths and the CFT logical-endpoint ops,
+    whose driver API is compiled in when the CUDA toolkit provides it (13.4+)
+    and resolved from the driver at runtime.
     """
     nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     common = nv_internal / "cpp" / "common"
