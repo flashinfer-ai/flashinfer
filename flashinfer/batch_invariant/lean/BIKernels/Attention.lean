@@ -41,7 +41,7 @@ definitionally the uncapped class of the mode (`outputC_off`), the classes diffe
 `soft_cap_changes_the_term_noncausal`, `capped_output_depends_on_mode`), and every guarantee below is stated for all four.
 
 The S-expression printer reproduces `term.sexpr` textually; the generated cases (`Cases/Attention*.lean`, and
-`Cases/AttentionSoftCap.lean` for the capped classes) check
+`Cases/AttentionSoftCap*.lean` for the capped classes) check
 the Python spec's terms node for node by `native_decide`.
 -/
 namespace BIK.Attn

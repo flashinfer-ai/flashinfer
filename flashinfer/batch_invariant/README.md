@@ -121,7 +121,7 @@ the Lean model reproduces the Python S-expressions node for node, re-derives the
 every record of a configuration space and every dispatcher pick against the class's constraints. The device-free test
 `tests/batch_invariant/test_lean.py` byte-compares the committed modules and fails on a stale or missing generated one; its `lake`
 steps run when the toolchain is installed. The capped attention classes' cases are a family module of their own,
-`Cases/AttentionSoftCap.lean` (causal and non-causal rows): `Attn.outputC true` reproduces the spec's terms with every score
+`Cases/AttentionSoftCap*.lean` (causal and non-causal rows; numbered parts like every family over the per-file budget): `Attn.outputC true` reproduces the spec's terms with every score
 leaf `tanh(mul(s, ca))`, and `Attention.lean` states the class's guarantees for the capped and the uncapped class of both
 mask modes (`outputC_off`: no cap is the uncapped class by definition; `soft_cap_changes_the_term`,
 `soft_cap_changes_the_term_noncausal`, `capped_output_depends_on_mode`: the four classes of a head dim are four terms).

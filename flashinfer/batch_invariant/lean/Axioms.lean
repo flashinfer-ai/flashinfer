@@ -43,7 +43,7 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mxw48k64_space_ok, ``BIK.gemm_mxw48k64_space_c4_ok, ``BIK.gemm_mxw48k64_space_c4_cta_twins, ``BIK.gemm_mxw48k64_dispatch_in_space,
    ``BIK.gemm_mxw48k64_space_decode_ok, ``BIK.gemm_mxw48k64_space_c2_ok,
    ``BIK.attn_a0_spec, ``BIK.attn_a1_spec, ``BIK.attn_a2_spec, ``BIK.attn_a3_spec, ``BIK.attn_a4_spec, ``BIK.attn_a5_spec, ``BIK.attn_a6_spec, ``BIK.attn_a7_spec, ``BIK.attn_a8_spec, ``BIK.attn_a9_spec, ``BIK.attn_a10_spec, ``BIK.attn_a11_spec, ``BIK.attn_a12_spec, ``BIK.attn_a13_spec, ``BIK.attn_space_d64_size, ``BIK.attn_space_d64_ok, ``BIK.attn_space_d128_size, ``BIK.attn_space_d128_ok, ``BIK.attn_space_d256_size, ``BIK.attn_space_d256_ok, ``BIK.Attn.output_depends_on_C, ``BIK.Attn.output_depends_on_D, ``BIK.Attn.output_depends_on_D_64, ``BIK.Attn.output_depends_on_mode,
-   ``BIK.attnsc_s0_spec, ``BIK.attnsc_s1_spec, ``BIK.attnsc_s2_spec, ``BIK.attnsc_s3_spec, ``BIK.attnsc_s4_spec, ``BIK.Attn.soft_cap_changes_the_term, ``BIK.Attn.soft_cap_changes_the_term_noncausal, ``BIK.Attn.capped_output_depends_on_mode]
+   ``BIK.attnsc_s0_spec, ``BIK.attnsc_s1_spec, ``BIK.attnsc_s2_spec, ``BIK.attnsc_s3_spec, ``BIK.attnsc_s4_spec, ``BIK.attnsc_s5_spec, ``BIK.attnsc_s6_spec, ``BIK.attnsc_s7_spec, ``BIK.Attn.soft_cap_changes_the_term, ``BIK.Attn.soft_cap_changes_the_term_noncausal, ``BIK.Attn.capped_output_depends_on_mode]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with
   | some idx => env.header.moduleNames[idx.toNat]?
