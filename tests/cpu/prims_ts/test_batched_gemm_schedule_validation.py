@@ -901,8 +901,13 @@ def test_trtllm_equiv_task_manager_smem_matches_kernel_allocation():
 
 @pytest.mark.cpu_only
 @pytest.mark.timeout(180)
-def test_sm107_task_manager_smem_matches_kernel_capacity_check():
+def test_sm107_task_manager_smem_matches_kernel_capacity_check(monkeypatch):
     """Validation includes the standalone SMEM slots allocated by the kernel."""
+    # This test checks allocation sizes, not schedule interleavings. The valid
+    # configuration exhausts the checker's state budget and can time out in CI.
+    # Keep TaskManager's structural and capacity checks, without the BFS search.
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")
+
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         ActKind,
         BatchMode,

@@ -312,7 +312,17 @@ class MoEEpAutoLayer(nn.Module):
 
                         name = getattr(candidate.comm, "backend_name", candidate.comm)
                         if isinstance(name, str):
-                            validate_ll_hidden_size(fleet_params, name)
+                            from ..backends.split.comm.nccl_ep._runtime import (
+                                ep_version,
+                            )
+
+                            validate_ll_hidden_size(
+                                fleet_params,
+                                name,
+                                nccl_ep_version=ep_version()
+                                if name == "nccl_ep"
+                                else None,
+                            )
                         available = {"nccl_ep": have_nccl_ep, "nixl_ep": have_nixl_ep}
                         if (
                             isinstance(name, str)

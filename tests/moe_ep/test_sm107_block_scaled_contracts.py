@@ -18,16 +18,13 @@ from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
     validate_unit_scalars,
     validate_weight_layout,
 )
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
     Sm107BlockScaledMoeConfig,
     Sm107BlockScaledSymmBuffer,
     lookup_knobs,
     record_knobs,
 )
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
-    block_scaled,
-    comm,
-)
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import block_scaled, comm
 
 
 def _config(**kw):
@@ -51,7 +48,7 @@ def _config(**kw):
     "kind", ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
 )
 def test_inference_grid_covers_uniform_phase_launches(kind):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         is_valid_sm107,
         sm107_candidates,
     )
@@ -177,10 +174,8 @@ def test_mxfp4_weights_have_independent_dtype_and_packing():
 def test_mxfp4_w4a4_config_and_candidates(variant):
     from flashinfer.moe_ep import Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import sm107_candidates
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache import (
-        default_knobs,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import sm107_candidates
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.knob_cache import default_knobs
 
     public = Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(128, 2)
     assert public.kind == "mxfp4"
@@ -244,7 +239,7 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     from flashinfer.moe_ep import tune, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import forward_tuning, tuning
     from flashinfer.moe_ep.core.kernel import registry
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     def gather(results, value, **kwargs):
         results[:] = [value] * len(results)
@@ -541,7 +536,7 @@ def test_cache_keeps_reduction_and_weighting_policy_separate(tmp_path, monkeypat
 
 
 def test_sm100_and_sm107_cache_entries_cannot_collide(tmp_path, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as sm100
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as sm100
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "shared.json"))
     key = dict(
@@ -804,9 +799,7 @@ def test_ikr_requires_early_weighting():
 
 @pytest.mark.parametrize("tanh_sigmoid,warpgroups", [(False, 1), (True, 1), (True, 2)])
 def test_rubin_execution_options_reach_kernel(monkeypatch, tanh_sigmoid, warpgroups):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
-        block_scaled,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import block_scaled
 
     monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
     cfg = block_scaled.Sm107BlockScaledMoeConfig(
@@ -830,7 +823,7 @@ def test_rubin_execution_options_reach_kernel(monkeypatch, tanh_sigmoid, warpgro
 
 
 def test_execution_options_separate_cache_entries(tmp_path, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
     common = dict(
@@ -865,10 +858,8 @@ def test_execution_options_separate_cache_entries(tmp_path, monkeypatch):
 
 
 def _native_inference_kernel(monkeypatch, **overrides):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import src
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.api import (
-        ImplDesc,
-    )
+    from flashinfer.moe_ep.kernels import cutedsl_megamoe as src
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.api import ImplDesc
 
     monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
     cls = src.RubinInferenceMegaMoE

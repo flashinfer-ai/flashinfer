@@ -15,6 +15,7 @@ import BIKernels.QuantCases
 import BIKernels.Sampling
 import BIKernels.Stream
 import BIKernels.Draw
+import BIKernels.SupportRow
 import BIKernels.SamplingCases
 import BIKernels.MoE
 import BIKernels.MoEFp8

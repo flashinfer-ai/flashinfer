@@ -1,9 +1,7 @@
-"""Single-GPU checks: FlashInfer MXFP8 preprocess vs ``compute_megamoe_reference_mxfp8``.
+"""Check MXFP8 weight preparation and standard inference against Torch.
 
-Validates that ``sm100_mxfp8_mxfp8_bf16_cutedsl.preprocess_mega_weights`` produces fp8 weights and
-plain E8M0 scale layouts consistent with the CuTeDSL torch reference, and that a
-single-rank ``mxfp8_mega_moe`` launch matches the reference after weighted top-k
-reduction.
+The public weight transform must use the sources kernel's 16-row gate/up
+interleave. The forward check compares with independently reduced expert terms.
 
 Run on one Blackwell GPU from the FlashInfer repo root (no torchrun required)::
 
@@ -22,7 +20,7 @@ import pytest
 # cutedsl_megamoe shim public API (including the torch reference it re-exports);
 # it never imports the src/ kernel packages directly, so a new src/ drop can't
 # silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources")
 
 
 def _require_cuda():
@@ -97,7 +95,6 @@ def _plain_mxfp8_from_bf16(problem: dict):
 
     from flashinfer.moe_ep import MoEWeightPack
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
-        _fc1_weight_from_w13,
         _quantize_mxfp8_weight_k_major,
     )
 
@@ -106,7 +103,20 @@ def _plain_mxfp8_from_bf16(problem: dict):
     pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     num_experts = pack.w13.shape[0]
 
-    fc1_fp32 = _fc1_weight_from_w13(pack.w13, intermediate_size=intermediate_size)
+    gate, up = pack.w13.split(intermediate_size, dim=1)
+    fc1_fp32 = (
+        torch.cat(
+            [
+                torch.cat(
+                    (gate[:, start : start + 16], up[:, start : start + 16]), dim=1
+                )
+                for start in range(0, intermediate_size, 16)
+            ],
+            dim=1,
+        )
+        .transpose(1, 2)
+        .contiguous()
+    )
     fc1_weights = []
     fc1_plain_sf = []
     fc2_weights = []
@@ -194,47 +204,34 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
         preprocess_mega_weights,
     )
 
-    # Verify only against the cutedsl_megamoe shim boundary: pull constants and
-    # reference tensor-makers from the package public API, never from the src/
-    # kernel packages directly (so a new src/ drop can't silently break tests).
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-        Mxfp8BlockSize,
-        Mxfp8ScaleDtype,
-        _make_e8m0_scale_tensor,
-        _make_fp8_tensor,
-    )
-
     problem = _single_rank_problem()
     num_experts = problem["num_experts"]
-    hidden = problem["hidden"]
-    intermediate = problem["intermediate"]
+    hidden, intermediate = problem["hidden"], problem["intermediate"]
     data_dtype = torch.float8_e4m3fn
-
-    g = torch.Generator(device="cuda").manual_seed(19)
-    w13 = _make_fp8_tensor(
-        g,
-        (num_experts, 2 * intermediate, hidden),
-        data_dtype,
-        perf_run=True,
-    )
-    w2 = _make_fp8_tensor(
-        g,
-        (num_experts, hidden, intermediate),
-        data_dtype,
-        perf_run=True,
-    )
-    w13_scale = _make_e8m0_scale_tensor(
-        g,
-        num_experts * 2 * intermediate,
-        hidden,
-        blocksize=Mxfp8BlockSize,
-    ).reshape(num_experts, 2 * intermediate, hidden // Mxfp8BlockSize)
-    w2_scale = _make_e8m0_scale_tensor(
-        g,
-        num_experts * hidden,
-        intermediate,
-        blocksize=Mxfp8BlockSize,
-    ).reshape(num_experts, hidden, intermediate // Mxfp8BlockSize)
+    Mxfp8ScaleDtype = torch.float8_e8m0fnu
+    generator = torch.Generator(device="cuda").manual_seed(19)
+    w13 = torch.randn(
+        num_experts, 2 * intermediate, hidden, device="cuda", generator=generator
+    ).to(data_dtype)
+    w2 = torch.randn(
+        num_experts, hidden, intermediate, device="cuda", generator=generator
+    ).to(data_dtype)
+    w13_scale = torch.randint(
+        124,
+        131,
+        (num_experts, 2 * intermediate, hidden // 32),
+        device="cuda",
+        generator=generator,
+        dtype=torch.uint8,
+    ).view(Mxfp8ScaleDtype)
+    w2_scale = torch.randint(
+        124,
+        131,
+        (num_experts, hidden, intermediate // 32),
+        device="cuda",
+        generator=generator,
+        dtype=torch.uint8,
+    ).view(Mxfp8ScaleDtype)
 
     transformed_l1, transformed_l2 = preprocess_mega_weights(
         MoEWeightPack(
@@ -257,7 +254,36 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     assert fc1_sf.dtype == Mxfp8ScaleDtype
     assert fc2_sf.dtype == Mxfp8ScaleDtype
 
-    block = Mxfp8BlockSize
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.kernel_helpers import (
+        from_blocked,
+    )
+
+    block = 16
+    gate_sf, up_sf = w13_scale.chunk(2, dim=1)
+    expected_fc1_sf = torch.stack(
+        (
+            gate_sf.view(torch.uint8).reshape(num_experts, -1, block, hidden // 32),
+            up_sf.view(torch.uint8).reshape(num_experts, -1, block, hidden // 32),
+        ),
+        dim=2,
+    ).reshape(num_experts, 2 * intermediate, hidden // 32)
+    for expert in range(num_experts):
+        torch.testing.assert_close(
+            from_blocked(fc1_sf[expert], 2 * intermediate, hidden // 32).view(
+                torch.uint8
+            ),
+            expected_fc1_sf[expert],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            from_blocked(fc2_sf[expert], hidden, intermediate // 32).view(torch.uint8),
+            w2_scale[expert].view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+
+    block = 16
     expected_gate0 = w13[:, :block, :].transpose(1, 2).contiguous()
     expected_up0 = (
         w13[:, intermediate : intermediate + block, :].transpose(1, 2).contiguous()
@@ -284,128 +310,83 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
 
 @pytest.mark.arch_blackwell
 def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
-    """Single-rank kernel output matches ``compute_megamoe_reference_mxfp8``."""
+    """Check the public weight transform and standard kernel against Torch terms."""
     _require_cuda()
-
     import torch
 
-    cap = torch.cuda.get_device_capability()
-    if cap[0] != 10:
-        pytest.skip(
-            f"mxfp8_mega_moe requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
-        )
-
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-        get_symm_buffer_for_mxfp8_mega_moe,
-        mxfp8_mega_moe,
-    )
-    from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
-        stage_mega_moe_inputs,
-    )
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights import (
-        preprocess_mega_weights,
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100/SM103")
+    from flashinfer.moe_ep import MoEWeightPack, preprocess_mxfp8_cutedsl_mega_weights
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.kernel_helpers import (
+        compute_megamoe_reference_block_scaled,
     )
 
-    # The MXFP8 torch reference is consumed via the shim boundary, not the src/
-    # package directly, so tests verify against a stable public surface.
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-        compute_megamoe_reference_mxfp8,
-    )
-
-    # monkeypatch (not os.environ): restored after the test, so it cannot
-    # silently downgrade later nvshmem-path tests in the same process.
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     problem = _single_rank_problem()
-    rank = 0
-    world_size = 1
-    num_tokens = problem["num_tokens"]
-    kind = problem["kind"]
-    data_dtype = torch.float8_e4m3fn
-
-    pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
-    transformed_l1, transformed_l2 = preprocess_mega_weights(
-        pack,
+    weights = preprocess_mxfp8_cutedsl_mega_weights(
+        MoEWeightPack(problem["w13"], problem["w2"]),
         intermediate_size=problem["intermediate"],
         hidden_size=problem["hidden"],
-        kind=kind,
-        gate_up_clamp=problem["gate_up_clamp"],
+        kind=problem["kind"],
     )
-
-    fc1_kernel, fc1_plain_sf, fc2_kernel, fc2_plain_sf = _plain_mxfp8_from_bf16(problem)
-    _pre_fc1, _pre_fc2 = transformed_l1[0], transformed_l2[0]
+    plain1, _, plain2, _ = _plain_mxfp8_from_bf16(problem)
     torch.testing.assert_close(
-        _pre_fc1.view(torch.uint8), fc1_kernel.view(torch.uint8), atol=0, rtol=0
+        weights[0][0].view(torch.uint8), plain1.view(torch.uint8), atol=0, rtol=0
     )
     torch.testing.assert_close(
-        _pre_fc2.view(torch.uint8), fc2_kernel.view(torch.uint8), atol=0, rtol=0
+        weights[1][0].view(torch.uint8), plain2.view(torch.uint8), atol=0, rtol=0
     )
-
-    symm_buffer = get_symm_buffer_for_mxfp8_mega_moe(
-        problem["num_experts"],
-        problem["max_tokens"],
-        problem["topk"],
-        problem["hidden"],
-        problem["intermediate"],
-        rank,
-        world_size,
-        kind=kind,
+    cfg = pkg.Sm100BlockScaledMoeConfig(
+        num_total_experts=problem["num_experts"],
+        max_tokens_per_rank=problem["max_tokens"],
+        num_topk=problem["topk"],
+        hidden=problem["hidden"],
+        intermediate=problem["intermediate"],
+        rank=0,
+        world_size=1,
+        quant_kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
+        apply_routing_weights_before_fc2=True,
     )
+    workspace = pkg.Sm100BlockScaledSymmBuffer(cfg)
+    tokens = problem["num_tokens"]
     try:
-        stage_mega_moe_inputs(
-            problem["hidden_states"],
-            problem["topk_weights"],
-            problem["topk_ids"],
-            symm_buffer.x,
-            symm_buffer.x_sf,
-            symm_buffer.topk_idx,
-            symm_buffer.topk_weights,
-            kind=kind,
+        data, scales = pkg.quantize_mxfp8_block32(
+            problem["hidden_states"].float(), torch.float8_e4m3fn
         )
-
-        act = symm_buffer.x[:num_tokens]
-        act_sf = symm_buffer.x_sf[:num_tokens]
-        topk_idx = symm_buffer.topk_idx[:num_tokens]
-        topk_weights = symm_buffer.topk_weights[:num_tokens]
-
-        # The kernel folds the routing weight in before the MXFP8 FC1-output
-        # round-trip; post-hoc
-        # weighting would NOT match, because the quant step changes the effective
-        # magnitude. Apply it in the reference the same way and reduce with a
-        # plain sum over topk (the weight is already folded in).
-        combine_ref = compute_megamoe_reference_mxfp8(
-            input_activation=act.unsqueeze(0),
-            input_activation_sf=act_sf.unsqueeze(0),
-            input_topk_idx=topk_idx.unsqueeze(0),
-            input_topk_weights=topk_weights.unsqueeze(0),
-            fc1_weight=fc1_kernel.unsqueeze(0),
-            fc1_weight_sf=fc1_plain_sf.unsqueeze(0),
-            fc2_weight=fc2_kernel.unsqueeze(0),
-            fc2_weight_sf=fc2_plain_sf.unsqueeze(0),
-            ab_dtype=data_dtype,
-            gate_up_clamp=problem["gate_up_clamp"],
-            apply_routing_weights_before_fc2=True,
+        workspace.x[:tokens].view(torch.uint8).copy_(data.view(torch.uint8))
+        workspace.x_sf[:tokens, : scales.shape[1]].view(torch.uint8).copy_(
+            scales.view(torch.uint8)
         )
-        y_kernel = torch.empty(
-            num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-        )
-        mxfp8_mega_moe(
-            y_kernel,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=num_tokens,
-            gate_up_clamp=problem["gate_up_clamp"],
-        )
+        workspace.topk_idx[:tokens].copy_(problem["topk_ids"])
+        workspace.topk_weights[:tokens].copy_(problem["topk_weights"])
+        workspace.note_staged_tokens(tokens)
+        terms = [
+            compute_megamoe_reference_block_scaled(
+                workspace.x[:tokens],
+                workspace.x_sf[:tokens],
+                workspace.topk_idx[:tokens, k : k + 1],
+                workspace.topk_weights[:tokens, k : k + 1],
+                weights[0][0].permute(0, 2, 1),
+                weights[0][1],
+                weights[1][0].permute(0, 2, 1),
+                weights[1][1],
+                quant_kind=problem["kind"],
+                local_expert_offset=0,
+                gate_up_clamp=problem["gate_up_clamp"],
+                apply_routing_weights_before_fc2=True,
+                weight_scales_are_swizzled=True,
+            )
+            for k in range(problem["topk"])
+        ]
+        pkg.sm100_block_scaled_mega_launch_thunk(*weights, workspace)()
         torch.cuda.synchronize()
-
-        # The kernel now reduces the top-k combine internally, so only the
-        # reduced (T, hidden) output is exposed (the old form-A per-(token, topk)
-        # ``combine_output`` is gone). Compare inside the per-cell bf16
-        # term-magnitude band (see _assert_mega_oracle_term_band_close).
         _assert_mega_oracle_term_band_close(
-            y_kernel, combine_ref[0], ikr=False, label="1gpu"
+            workspace.output_activation[:tokens],
+            torch.stack(terms, dim=1),
+            ikr=False,
+            label="1gpu",
         )
     finally:
-        symm_buffer.destroy()
+        workspace.destroy()
