@@ -105,8 +105,10 @@ def chunk_len(D: int, L: Optional[int] = None) -> int:
     return CHUNK_LEN_OF[D]
 
 
-def class_name(fmt: str = "bf16") -> str:
-    """The class family of an operand format: ``attention.bf16`` or ``attention.fp16``."""
+def class_name(*, fmt: str = "bf16") -> str:
+    """The class family of an operand format: ``attention.bf16`` or ``attention.fp16``. ``fmt`` is keyword-only here and in
+    every function of this module that takes it: it names the OPERAND format (q, the probabilities, the output and the MMA
+    step), a dimension of its own next to the mask mode and to any format of the stored K / V."""
     assert fmt in OPERAND_FMTS, fmt
     return f"attention.{CLASS_TAG[fmt]}"
 
@@ -254,7 +256,7 @@ def init_state(fp) -> State:
     return State(fp.const(NEG_INF), fp.const(0.0), fp.const(0.0))
 
 
-def score_term(fp, row: RowSpec, k: int, D: int, fmt: str = "bf16"):
+def score_term(fp, row: RowSpec, k: int, D: int, *, fmt: str = "bf16"):
     """``s_k``: the GEMM's K-fold over ``D`` (``D/16`` opaque ``MMA16`` steps from +0) for A row
     ``row.row`` and B column ``k``: the same reduction object as ``gemm.bf16.kfold[K=D]``. The fp16 class folds the same
     slices (binary16 leaves) with its own step (``MMA_OP_OF["f16"]``)."""
@@ -326,6 +328,7 @@ def pv_fold(
     o_scaled,
     probs_bf16: Sequence[Any],
     v_slice: Callable[[int], Any],
+    *,
     fmt: str = "bf16",
 ):
     """``O' = MMA16-fold over the tile's key-steps from ``o_scaled = mul(O, alpha)``: step ``j`` takes
@@ -339,14 +342,14 @@ def pv_fold(
 
 
 def tile_step(
-    fp, st: State, tile: Dict[str, Any], c, nc, D: int, d: int, fmt: str = "bf16"
+    fp, st: State, tile: Dict[str, Any], c, nc, D: int, d: int, *, fmt: str = "bf16"
 ) -> State:
     """One tile of the per-chunk fold (the ``tile`` digit's step). ``tile`` = ``{"t": abs tile index,
     "keys": visible absolute keys, "row": RowSpec}``. ``fmt`` is the class's operand format: the probabilities are rounded to it
     (one ``cvt.rn`` each: a declared rounding of the term) before the PV step of that format."""
     row, t, keys, T = tile["row"], tile["t"], tile["keys"], tile["T"]
     scores = [
-        score_term(fp, row, t * T + k, D, fmt) if (t * T + k) in keys else None
+        score_term(fp, row, t * T + k, D, fmt=fmt) if (t * T + k) in keys else None
         for k in range(T)
     ]
     m_new, alpha, probs, l_new = tile_stats(fp, st.m, st.l, scores, c, nc)
@@ -356,7 +359,7 @@ def tile_step(
         fp.mul(st.o, alpha),
         probs_bf16,
         lambda j: fp.op("v_slice", t * (T // MMA_K) + j, d),
-        fmt,
+        fmt=fmt,
     )
     return State(m_new, l_new, o_new)
 
@@ -388,6 +391,7 @@ def attention_reduction(
     nc,
     T: int = TILE_KEYS,
     C: Optional[int] = None,
+    *,
     fmt: str = "bf16",
 ) -> Reduction:
     """The per-row dataflow as an engine ``Reduction`` with two ``fold`` digits: ``tile`` (radix
@@ -409,7 +413,7 @@ def attention_reduction(
         C // T,
         "fold",
         init=init_state,
-        step=lambda fp, st, tl: tile_step(fp, st, tl, c, nc, D, d, fmt),
+        step=lambda fp, st, tl: tile_step(fp, st, tl, c, nc, D, d, fmt=fmt),
         identity_note="absent tiles are dropped; a kernel's null step (P row = 0, alpha = 1) is exact on (m, l) "
         "and exact on O up to the sign of an exact zero, which the epilogue's add(+0) erases",
     )
@@ -453,6 +457,7 @@ class AttentionSpec:
         T: int = TILE_KEYS,
         C: Optional[int] = None,
         out_fmt: Optional[str] = None,
+        *,
         fmt: str = "bf16",
     ):
         assert fmt in OPERAND_FMTS, fmt
@@ -465,7 +470,7 @@ class AttentionSpec:
 
     def reduction(self, row: RowSpec, d: int) -> Reduction:
         return attention_reduction(
-            row, self.D, d, self.c, self.nc, self.T, self.C, self.fmt
+            row, self.D, d, self.c, self.nc, self.T, self.C, fmt=self.fmt
         )
 
     def state(self, row: RowSpec, d: int) -> State:

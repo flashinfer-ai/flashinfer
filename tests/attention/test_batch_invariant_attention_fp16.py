@@ -310,7 +310,7 @@ def test_fp16_term_names_its_format_everywhere():
     )
     # 41 visible keys: every one is a probability rounded to the class's format (the masked keys of the last tile carry +0)
     assert f16.count("(cvt f16 (ex2 ") == bf16.count("(cvt bf16 (ex2 ") > 0
-    assert spec.class_name("f16") == "attention.fp16"
+    assert spec.class_name(fmt="f16") == "attention.fp16"
     assert spec.class_name() == "attention.bf16"
     for D in (64, 128, 256):
         assert spec.spec_fingerprint(D, fmt="f16") == FP16_FINGERPRINTS[D]

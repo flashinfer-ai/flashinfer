@@ -432,7 +432,7 @@ class BatchInvariantAttention:
                 f"q_data_type {q_dtype}",
                 "bf16 or fp16 queries, keys, values and output (one format for all four)",
             )
-        cls = class_name(OPERAND_DTYPES[q_dtype])
+        cls = class_name(fmt=OPERAND_DTYPES[q_dtype])
         fmt_name = _FMT_NAME[OPERAND_DTYPES[q_dtype]]
         for name, dt in (("kv_data_type", kv_data_type), ("o_data_type", o_data_type)):
             if dt is not None and _dtype(dt) != q_dtype:
