@@ -277,6 +277,21 @@ def get_norm_module():
     return gen_norm_module().build_and_load()
 
 
+@functools.cache
+def _weightless_cute_weight(device_index: int, dtype: torch.dtype, hidden_size: int):
+    """Reuse the zero weight required by CuTe's weight + 1 kernel path."""
+    return torch.zeros(hidden_size, dtype=dtype, device=f"cuda:{device_index}")
+
+
+def _cute_weight_and_bias(input: torch.Tensor, weight: Optional[torch.Tensor]):
+    if weight is not None:
+        return weight, 0.0
+    device_index = input.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _weightless_cute_weight(device_index, input.dtype, input.shape[-1]), 1.0
+
+
 def _normalize_scale_tensor(
     scale: Union[float, torch.Tensor], ref_tensor: torch.Tensor
 ) -> torch.Tensor:
@@ -1237,21 +1252,23 @@ def _rmsnorm_sigmoid_gate_fake(
 @flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
-    ``out[i] = (input[i] / RMS(input)) * weight[i]``
+    ``out[i] = (input[i] / RMS(input)) * weight[i]`` if ``weight`` is provided,
+    otherwise ``out[i] = input[i] / RMS(input)``.
 
     Parameters
     ----------
     input: torch.Tensor
         Input tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
+    weight: Optional[torch.Tensor]
+        Weight tensor, shape (hidden_size,). If None, RMSNorm runs without
+        normalization weights.
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
@@ -1275,7 +1292,7 @@ def rmsnorm(
 def _rmsnorm_impl(
     out: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
@@ -1284,13 +1301,24 @@ def _rmsnorm_impl(
     if _use_cuda_norm(input.device):
         get_norm_module().rmsnorm(out, input, weight, eps, enable_pdl)
     else:
+        cute_weight, weight_bias = _cute_weight_and_bias(input, weight)
         if input.dim() == 3:
             qk_rmsnorm_cute(
-                input, weight, out, eps, weight_bias=0.0, enable_pdl=enable_pdl
+                input,
+                cute_weight,
+                out,
+                eps,
+                weight_bias=weight_bias,
+                enable_pdl=enable_pdl,
             )
         else:
             rmsnorm_cute(
-                input, weight, out, eps, weight_bias=0.0, enable_pdl=enable_pdl
+                input,
+                cute_weight,
+                out,
+                eps,
+                weight_bias=weight_bias,
+                enable_pdl=enable_pdl,
             )
 
 
@@ -1298,7 +1326,7 @@ def _rmsnorm_impl(
 def _rmsnorm_impl_fake(
     out: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     enable_pdl: Optional[bool],
 ) -> None:
@@ -1365,7 +1393,7 @@ def _rmsnorm_quant_fake(
 def fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
@@ -1375,7 +1403,8 @@ def fused_add_rmsnorm(
     ``residual[i] += input[i]``
 
     Step 2:
-    ``input[i] = (residual[i] / RMS(residual)) * weight[i]``
+    ``input[i] = (residual[i] / RMS(residual)) * weight[i]`` if ``weight`` is
+    provided, otherwise ``input[i] = residual[i] / RMS(residual)``.
 
     Parameters
     ----------
@@ -1383,8 +1412,9 @@ def fused_add_rmsnorm(
         Input tensor, shape (batch_size, hidden_size).
     residual: torch.Tensor
         Residual tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
+    weight: Optional[torch.Tensor]
+        Weight tensor, shape (hidden_size,). If None, RMSNorm runs without
+        normalization weights.
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool
@@ -1396,8 +1426,14 @@ def fused_add_rmsnorm(
     if _use_cuda_norm(input.device):
         get_norm_module().fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
     else:
+        cute_weight, weight_bias = _cute_weight_and_bias(input, weight)
         fused_add_rmsnorm_cute(
-            input, residual, weight, eps, weight_bias=0.0, enable_pdl=enable_pdl
+            input,
+            residual,
+            cute_weight,
+            eps,
+            weight_bias=weight_bias,
+            enable_pdl=enable_pdl,
         )
 
 
@@ -1405,7 +1441,7 @@ def fused_add_rmsnorm(
 def _fused_add_rmsnorm_fake(
     input: torch.Tensor,
     residual: torch.Tensor,
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float = 1e-6,
     enable_pdl: Optional[bool] = None,
 ) -> None:
