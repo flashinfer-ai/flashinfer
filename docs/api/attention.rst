@@ -3,36 +3,42 @@
 FlashInfer Attention Kernels
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Choose an entry point
+====================
 
-Experimental Task-Scheduled Attention
-=====================================
+* Mixed prefill and decode batches: :class:`flashinfer.attention.BatchAttention`.
+* Paged decode: :class:`flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper`.
+* Paged prefill: :class:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper`.
+* Ragged prefill: :class:`flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper`.
+* Single requests: :func:`flashinfer.decode.single_decode_with_kv_cache` and
+  :func:`flashinfer.prefill.single_prefill_with_kv_cache`.
 
-The experimental Blackwell task-scheduled FMHA context, FMHA decode,
-block-sparse FMHA, and MLA decode APIs are imported from
-``flashinfer.attention.prims_ts``. Scheduling, tile selection, and split-KV
-reduction are automatic implementation details; there are no public tuning
-knobs.
+Backend-specific functions, workspace queries and plan types below support
+specialized integrations. They are grouped separately from the general wrappers.
 
-See the `PrimTS guide index <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/attention/prims_ts/README.md>`_
-for the public entry points, supported contracts, and examples. Current accuracy
-and performance signoff is on SM100a/B200; SM103a/B300 is architecture-gated
-but not yet signoff-qualified.
+Unified BatchAttention
+----------------------
 
-Calling these APIs is an explicit opt-in and emits an
-``ExperimentalWarning`` once per decorated function. They provide no API
-compatibility guarantee; generated stable API reference entries are deferred
-until graduation. Logging and existing ``fi_trace`` bindings remain available.
+.. currentmodule:: flashinfer.attention
 
-QToken-KvBlock-Sparse-Attention
---------------------------------
+The ``BatchAttention`` class provides a holistic attention wrapper that automatically dispatches
+between paged-prefill and paged-decode based on per-request sequence lengths. It is the
+recommended entry point for serving stacks that batch mixed prefill/decode requests in a
+single kernel launch.
 
-QToken-KvBlock-Sparse-Attention consumes per-query
-``indexer_block_ids[total_q, block_topk]`` and a dense physical
-``block_table``. Packed prefill uses ``[total_q, Hq, D]`` with
-``qo_indptr``; fixed MTP decode uses ``[B, Nq, G, Hq, D]``.
-``kv_block_size`` is the semantic sparse K/V atom and currently supports
-only four tokens. The wrapper plans capacity outside CUDA Graph capture and
-runs live route metadata on the hot path.
+.. autoclass:: BatchAttention
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: BatchAttentionWithAttentionSinkWrapper
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: BatchDecodeWithAttentionSinkWrapper
+
+    .. automethod:: __init__
 
 
 flashinfer.decode
@@ -183,31 +189,6 @@ rejected rather than ignored.
     .. automethod:: __init__
 
 
-Unified BatchAttention
-----------------------
-
-.. currentmodule:: flashinfer.attention
-
-The ``BatchAttention`` class provides a holistic attention wrapper that automatically dispatches
-between paged-prefill and paged-decode based on per-request sequence lengths. It is the
-recommended entry point for serving stacks that batch mixed prefill/decode requests in a
-single kernel launch.
-
-.. autoclass:: BatchAttention
-    :members:
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchAttentionWithAttentionSinkWrapper
-    :members:
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchDecodeWithAttentionSinkWrapper
-
-    .. automethod:: __init__
-
-
 SM120 NVFP4 Attention
 ---------------------
 
@@ -235,15 +216,35 @@ Sliding-window MLA (SM90)
 .. autofunction:: batch_decode_with_kv_cache_mla_swa
 .. autofunction:: get_mla_swa_workspace_size_bytes
 
-PageAttention for MLA
----------------------
+.. _pageattention-for-mla:
+
+Paged MLA
+---------
 
 .. autosummary::
     :toctree: ../generated
 
     trtllm_batch_decode_with_kv_cache_mla
     trtllm_prefill_with_kv_cache_mla
+    xqa_batch_decode_with_kv_cache_mla
+
+DeepSeek-V4 Sparse MLA
+----------------------
+
+.. autosummary::
+    :toctree: ../generated
+
     trtllm_batch_decode_sparse_mla_dsv4
+    SparseMLASm120Wrapper
+    cake_sparse_mla_sm120_dsv4_nvfp4_decode
+    cake_sparse_mla_sm120_dsv4_nvfp4_prefill
+
+MLA Cache Construction and Metadata
+-----------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
     nvfp4_quantize_pack_sparse_mla_cache
     nvfp4_quantize_append_sparse_mla_cache
     dsv41_fp4_quantize_pack_sparse_mla_cache
@@ -252,19 +253,32 @@ PageAttention for MLA
     dsv41_fp8_quantize_append_sparse_mla_cache
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
     DSV4HCAMetadata
-    xqa_batch_decode_with_kv_cache_mla
+    cake_dsv4_nvfp4_rope_quantize_insert
+    cake_dsv4_nvfp4_kv_rope_quantize_insert
+
+Sparse MLA Configuration
+------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
     supported_sparse_mla_sm120_configs
     SparseMLASm120DecodeConfig
-    SparseMLASm120Wrapper
-    cake_sparse_mla_sm120_dsv4_nvfp4_decode
-    cake_sparse_mla_sm120_dsv4_nvfp4_prefill
+
+Sparse MLA Planning and Workspace
+---------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
     cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits
     cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes
-    cake_dsv4_nvfp4_rope_quantize_insert
-    cake_dsv4_nvfp4_kv_rope_quantize_insert
+
+MLA Backend Contracts
+---------------------
 
 .. note::
 
@@ -339,3 +353,33 @@ PageAttention for MLA
     :members:
 
     .. automethod:: __init__
+
+Experimental Task-Scheduled Attention
+=====================================
+
+The experimental Blackwell task-scheduled FMHA context, FMHA decode,
+block-sparse FMHA, and MLA decode APIs are imported from
+``flashinfer.attention.prims_ts``. Scheduling, tile selection, and split-KV
+reduction are automatic implementation details; there are no public tuning
+knobs.
+
+See the `PrimTS guide index <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/attention/prims_ts/README.md>`_
+for the public entry points, supported contracts, and examples. Current accuracy
+and performance signoff is on SM100a/B200; SM103a/B300 is architecture-gated
+but not yet signoff-qualified.
+
+Calling these APIs is an explicit opt-in and emits an
+``ExperimentalWarning`` once per decorated function. They provide no API
+compatibility guarantee; generated stable API reference entries are deferred
+until graduation. Logging and existing ``fi_trace`` bindings remain available.
+
+QToken-KvBlock-Sparse-Attention
+--------------------------------
+
+QToken-KvBlock-Sparse-Attention consumes per-query
+``indexer_block_ids[total_q, block_topk]`` and a dense physical
+``block_table``. Packed prefill uses ``[total_q, Hq, D]`` with
+``qo_indptr``; fixed MTP decode uses ``[B, Nq, G, Hq, D]``.
+``kv_block_size`` is the semantic sparse K/V atom and currently supports
+only four tokens. The wrapper plans capacity outside CUDA Graph capture and
+runs live route metadata on the hot path.
