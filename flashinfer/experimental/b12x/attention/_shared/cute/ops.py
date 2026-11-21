@@ -10,6 +10,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 LOG2_E = math.log2(math.e)
+LN_2 = math.log(2)
 
 
 def compute_softmax_scale_log2(softmax_scale):

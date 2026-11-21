@@ -259,6 +259,7 @@ class _SparseMlaState:
                     fp8_rope=self.caps.fp8_rope,
                     latent_scale_per_token=self.caps.latent_scale_per_token,
                     traits_override=self.caps.cache_traits,
+                    lse_scale=self.caps.lse_scale if self.caps.return_lse else "base2",
                     mg_enabled=self.query.prefill_mg_enabled,
                 )
         object.__setattr__(self, "prepared", prepared)
@@ -310,6 +311,7 @@ class _SparseMlaState:
             latent_scale_per_token=self.caps.latent_scale_per_token,
             traits_override=self.caps.cache_traits,
             prepared=self.prepared,
+            lse_scale=self.caps.lse_scale if self.caps.return_lse else "base2",
             mg_enabled=self.query.prefill_mg_enabled,
         )
 
