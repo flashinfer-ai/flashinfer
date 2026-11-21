@@ -40,6 +40,36 @@ from tests.utils.test_helpers.sampling import (
 pytestmark = pytest.mark.gpu_exclusive
 
 
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "top_p_sampling_from_probs",
+        "min_p_sampling_from_probs",
+        "top_k_top_p_sampling_from_probs",
+        "top_p_renorm_probs",
+    ],
+)
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_per_row_probability_threshold_layout(operation, broadcast):
+    generator = torch.Generator(device="cuda").manual_seed(1967)
+    probs = torch.softmax(torch.randn(8, 257, device="cuda", generator=generator), -1)
+    backing = torch.full((8, 2), 0.99, device="cuda")
+    backing[:, 0] = torch.linspace(0.1, 0.9, 8, device="cuda")
+    threshold = backing[0, :1].expand(8) if broadcast else backing[:, 0]
+
+    def sample(p):
+        fn = getattr(flashinfer.sampling, operation)
+        if operation == "top_p_renorm_probs":
+            return fn(probs, p, is_deterministic=True)
+        if operation == "top_k_top_p_sampling_from_probs":
+            return fn(probs, 128, p, filter_apply_order="joint", seed=17, offset=11)
+        return fn(probs, p, seed=17, offset=11)
+
+    torch.testing.assert_close(
+        sample(threshold), sample(threshold.contiguous()), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("use_default_generator", [False, True])
 def test_get_seed_and_offset_threaded_reservations(use_default_generator):
     device = torch.device("cuda", torch.cuda.current_device())
