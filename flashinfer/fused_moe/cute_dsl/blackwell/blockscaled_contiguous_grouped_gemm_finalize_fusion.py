@@ -845,6 +845,51 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
         ) * atom_thr_size
 
+        # Skip padding rows of A (MXFP8 and NVFP4). Rows past a tile's mn_limit
+        # are routing padding that the epilogue never stores, and at decode
+        # sizes they are most of each 128-row tile. A partial tile loads only
+        # its routed rows, rounded up to 8, as at most one TMA box each of 64,
+        # 32, 16 and 8 rows. One 8-row box per block would cost up to 16 TMA
+        # issues per stage, which makes the producer warp the bottleneck. With
+        # a K-major SW128 stage of 128-byte rows, every 8 rows are one 1 KB
+        # swizzle atom, so the boxes land where the full-tile load would put
+        # them. Each stage expects only the A bytes it loads, and the producer
+        # issues B/SFA/SFB before the A boxes so that they do not delay the B load.
+        k_tile_elems = self.mma_tiler[2]
+        self.skip_padding_rows = (
+            (
+                (self.a_dtype is cutlass.Float8E4M3FN and self.sf_vec_size == 32)
+                or (self.a_dtype is cutlass.Float4E2M1FN and self.sf_vec_size == 16)
+            )
+            and atom_thr_size == 1
+            and cute.size(self.cluster_layout_vmnk) == 1
+            and self.a_major_mode == tcgen05.OperandMajorMode.K
+            and self.cta_tile_shape_mnk[0] == 128
+            and k_tile_elems * self.a_dtype.width // 8 == 128
+            and cute.size_in_bytes(self.a_dtype, a_smem_layout) == 128 * 128
+        )
+        self.a_box_rows = (64, 32, 16, 8)
+        tma_a_boxes = [None] * 8
+        self.a_row_bytes = k_tile_elems * self.a_dtype.width // 8
+        if cutlass.const_expr(self.skip_padding_rows):
+            for box_i, box_rows in enumerate(self.a_box_rows):
+                box_smem_layout = cute.make_composed_layout(
+                    self.a_smem_layout_staged.inner,
+                    0,
+                    cute.make_layout(
+                        (box_rows, k_tile_elems), stride=(k_tile_elems, 1)
+                    ),
+                )
+                tma_a_boxes[2 * box_i : 2 * box_i + 2] = cpasync.make_tiled_tma_atom(
+                    cpasync.CopyBulkTensorTileG2SOp(),
+                    a,
+                    box_smem_layout,
+                    (box_rows, k_tile_elems),
+                )
+            self.num_tma_load_bytes = (
+                b_copy_size + sfa_copy_size + sfb_copy_size
+            ) * atom_thr_size
+
         self.tile_sched_params, grid = self._compute_grid(
             (a.shape[0], b.shape[0], a.shape[2]),
             self.cta_tile_shape_mnk,
@@ -960,6 +1005,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tiled_mma_sfb,
             tma_atom_a,
             tma_tensor_a,
+            *tma_a_boxes,
             tma_atom_b,
             tma_tensor_b,
             tma_atom_sfa,
@@ -1048,6 +1094,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         tiled_mma_sfb: cute.TiledMma,
         tma_atom_a: cute.CopyAtom,
         mA_mkl: cute.Tensor,
+        tma_atom_a64: Optional[cute.CopyAtom],
+        mA64_mkl: Optional[cute.Tensor],
+        tma_atom_a32: Optional[cute.CopyAtom],
+        mA32_mkl: Optional[cute.Tensor],
+        tma_atom_a16: Optional[cute.CopyAtom],
+        mA16_mkl: Optional[cute.Tensor],
+        tma_atom_a8: Optional[cute.CopyAtom],
+        mA8_mkl: Optional[cute.Tensor],
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
         tma_atom_sfa: cute.CopyAtom,
@@ -1305,6 +1359,36 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
+        # 64/32/16/8-row boxes of A for partial tiles (see skip_padding_rows)
+        tAsA_box = [None] * 4
+        tAgA_box = [None] * 4
+        box_atoms = (tma_atom_a64, tma_atom_a32, tma_atom_a16, tma_atom_a8)
+        if cutlass.const_expr(self.skip_padding_rows):
+            k_el = self.mma_tiler[2]
+            tile_m = self.cta_tile_shape_mnk[0]
+            box_tensors = (mA64_mkl, mA32_mkl, mA16_mkl, mA8_mkl)
+            for box_i in cutlass.range_constexpr(4):
+                box_rows = self.a_box_rows[box_i]
+                # (box, box index in the tile, STAGE); the swizzle is on sA's pointer
+                sA_box = cute.make_tensor(
+                    sA.iterator,
+                    cute.make_layout(
+                        ((box_rows, k_el), tile_m // box_rows, self.num_ab_stage),
+                        stride=((k_el, 1), box_rows * k_el, tile_m * k_el),
+                    ),
+                )
+                # ((box_rows, K), loopM, loopK, loopL)
+                gA_box = cute.group_modes(
+                    cute.local_tile(
+                        box_tensors[box_i], (box_rows, k_el), (None, None, None)
+                    ),
+                    0,
+                    2,
+                )
+                tAsA_box[box_i], tAgA_box[box_i] = cpasync.tma_partition(
+                    box_atoms[box_i], 0, cute.make_layout(1), sA_box, gA_box
+                )
+
         # TMA load B partition_S/D
         b_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
@@ -1586,6 +1670,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
             tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
             tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+            if cutlass.const_expr(self.skip_padding_rows):
+                tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
                 "async.shared",
@@ -1605,6 +1691,18 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 # ((atom_v, rest_v), loopK)
                 tAgA_slice = tAgA[(None, mma_tile_coord_mnl[0], None, 0)]
+                ab_tx_bytes = cutlass.Int32(self.num_tma_load_bytes)
+                if cutlass.const_expr(self.skip_padding_rows):
+                    # Partial tile: number of 8-row A blocks holding routed rows
+                    # (a_rows >= 0 for a valid tile). The Uint32 cast keeps the
+                    # count in [0, 16] for bad metadata (a_rows < 0 wraps to a
+                    # full or empty A load), so expected_tx matches the copies.
+                    a_rows = (
+                        tile_info[4]
+                        - mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
+                    )
+                    a_blocks8 = cutlass.min((cutlass.Uint32(a_rows) + 7) >> 3, 16)
+                    ab_tx_bytes = ab_tx_bytes + a_blocks8 * 8 * self.a_row_bytes
                 # ((atom_v, rest_v), loopK)
                 tBgB_slice = tBgB[
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
@@ -1644,17 +1742,20 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
-                        ab_producer_state, peek_ab_empty_status
+                        ab_producer_state,
+                        peek_ab_empty_status,
+                        expected_tx=ab_tx_bytes,
                     )
 
                     # TMA load A/B
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_k,
-                        tAsA_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=a_full_mcast_mask,
-                    )
+                    if cutlass.const_expr(not self.skip_padding_rows):
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA_k,
+                            tAsA_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=a_full_mcast_mask,
+                        )
                     cute.copy(
                         tma_atom_b,
                         tBgB_k,
@@ -1678,6 +1779,43 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         mcast_mask=sfb_full_mcast_mask,
                     )
 
+                    # Partial-tile A after B/SFA/SFB (see skip_padding_rows)
+                    if cutlass.const_expr(self.skip_padding_rows):
+                        if a_blocks8 == 16:
+                            cute.copy(
+                                tma_atom_a,
+                                tAgA_k,
+                                tAsA_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=a_full_mcast_mask,
+                            )
+                        else:
+                            # Box box_i holds the 8-row blocks of bit (3 - box_i).
+                            a_off = cutlass.Int32(0)
+                            for box_i in cutlass.range_constexpr(4):
+                                box_rows = self.a_box_rows[box_i]
+                                if a_blocks8 & (box_rows // 8):
+                                    m_box = (
+                                        mma_tile_coord_mnl[0]
+                                        * (self.cta_tile_shape_mnk[0] // box_rows)
+                                        + a_off // box_rows
+                                    )
+                                    cute.copy(
+                                        box_atoms[box_i],
+                                        tAgA_box[box_i][
+                                            (None, m_box, ab_producer_state.count, 0)
+                                        ],
+                                        tAsA_box[box_i][
+                                            (
+                                                None,
+                                                a_off // box_rows,
+                                                ab_producer_state.index,
+                                            )
+                                        ],
+                                        tma_bar_ptr=tma_bar,
+                                    )
+                                    a_off = a_off + box_rows
+
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
@@ -1694,6 +1832,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
                 tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
                 tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
+                if cutlass.const_expr(self.skip_padding_rows):
+                    tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
                     "async.shared",
