@@ -9,8 +9,7 @@ vendored package.  Instead, it independently reverses the physical Humming
 interleave, unfolds offsets, constructs the exact E4M3 operand bytes, and
 models the two FP8 WGMMA legs and their hybrid scales.
 
-The SM90 and SM100 CuTeDSL trees use colliding top-level vendor module names,
-so this file is intended to run in an isolated Hopper pytest process::
+Run the single-GPU check on Hopper::
 
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 pytest -v -m arch_hopper \
         tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py
