@@ -5,8 +5,9 @@ constexpr uint32_t kNumElemsPerUint4 = sizeof(uint4) / sizeof(nv_bfloat162);
 constexpr uint32_t kNumChunkSlots = 3;
 constexpr uint32_t kNumMaxRegistersForBuffer = 128;
 constexpr uint32_t kNumChunks =
-    (kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE and
-     kHidden <= 32 * kNumMaxRegistersForBuffer)
+    kLocalCombineStripe8 ? 8u
+    : (kNumChunkSlots * kNumEpilogueWarps * kNumHiddenBytes <= SMEM_BEFORE_BARRIER_SIZE and
+       kHidden <= 32 * kNumMaxRegistersForBuffer)
         ? 1
         : 2;
 constexpr uint32_t kNumChunkBytes = kNumHiddenBytes / kNumChunks;

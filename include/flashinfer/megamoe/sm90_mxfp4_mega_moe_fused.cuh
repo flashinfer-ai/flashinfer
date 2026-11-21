@@ -1,3 +1,4 @@
+// Portions derived from GC-MoE. See LICENSE.GC-MoE.txt.
 #pragma once
 
 #pragma clang diagnostic push
@@ -18,7 +19,9 @@
 #include <flashinfer/megamoe/detail/ptx.cuh>
 #include <flashinfer/megamoe/detail/tma_copy.cuh>
 #include <flashinfer/megamoe/layout.cuh>
+#include <flashinfer/megamoe/mega_moe_eplb.cuh>
 #include <flashinfer/megamoe/mxfp4_dequant.cuh>
+#include <flashinfer/megamoe/remote.cuh>
 #include <flashinfer/megamoe/scheduler.cuh>
 #include <flashinfer/megamoe/sym_buffer.cuh>
 #include <type_traits>
@@ -143,46 +146,55 @@ __device__ __forceinline__ void dequant_braided_quad(uint8_t* __restrict__ fp8_d
 // enough for the WGMMA to hide it; the register-source path has no decoded-B
 // ring to fill, and BLOCK_M 8 is faster decoding on the math warps. An
 // unconditional 640 would also cut the compiler's per-thread register budget
-// for the narrow tiers. Must stay in step with
-// SM90MXFP4H200FusedConfig::num_threads().
+// for the narrow tiers. The JIT uses this helper for the launch geometry.
 constexpr bool sm90_mxfp4_split_decode(const bool swap_ab, const bool use_rs,
-                                       const uint32_t block_m) {
-  return swap_ab and not use_rs and block_m >= 16;
+                                       const uint32_t block_m,
+                                       const uint32_t weight_tile_bytes = 8704) {
+  return weight_tile_bytes == 8704 && swap_ab && !use_rs && block_m >= 16;
 }
 
 constexpr uint32_t sm90_mxfp4_num_threads(const bool swap_ab, const bool use_rs,
-                                          const uint32_t block_m) {
-  return 64 + 64 + 256 + (sm90_mxfp4_split_decode(swap_ab, use_rs, block_m) ? 256 : 0);
+                                          const uint32_t block_m,
+                                          const uint32_t weight_tile_bytes = 8704) {
+  return 64 + 64 + 256 +
+         (sm90_mxfp4_split_decode(swap_ab, use_rs, block_m, weight_tile_bytes) ? 256 : 0);
 }
 
-template <uint32_t kNumSMs,
-          // Expert-parallel width. SymBuffer<N> has one layout for every N, and the
-          // barriers, scheduler and workspace were already templated on it.
-          uint32_t kNumRanks,
-          // Shape is a template parameter, not a baked-in constant. The kernel body
-          // was already written against these names; only the wrapper hardcoded the
-          // H200 384-expert / 6144-hidden model, which locked out every other shape
-          // (e.g. DeepSeek-V4-Flash: 4096 hidden, 256 experts, topk 6).
-          uint32_t kHidden, uint32_t kIntermediateHidden, uint32_t kNumExperts, uint32_t kNumTopk,
-          uint32_t kNumMaxTokensPerRank, uint32_t kNumExpertsPerWave, uint32_t BLOCK_M,
-          uint32_t BLOCK_N, uint32_t kNumMaxPoolTokens, uint32_t kNumPaddedSFPoolTokens,
-          uint32_t kNumStages, float kActivationClamp, bool kFastMath, bool kSwapABRequested,
+template <uint32_t kNumSMs, uint32_t kNumRanks, uint32_t kHidden, uint32_t kIntermediateHidden,
+          uint32_t kNumExperts, uint32_t kNumTopk, uint32_t kNumMaxTokensPerRank,
+          uint32_t kNumExpertsPerWave, uint32_t BLOCK_M, uint32_t BLOCK_N,
+          uint32_t kNumMaxPoolTokens, uint32_t kNumPaddedSFPoolTokens, uint32_t kNumStages,
+          float kActivationClamp, bool kFastMath, bool kSwapABRequested,
           bool kSingleActiveDispatchWarp, bool kUseMode2RowDecoder, bool kUseInterleavedScheduler,
           // Feed the WGMMA's A operand from registers instead of decoding the weight
           // tile into shared memory first. swapAB only; removes the decoded-B ring.
           bool kUseRSOperand,
-          // Phase timestamps are a compile-time variant, not a runtime flag. Checking
-          // a pointer per task is not free -- the same accumulators cost ~5% per task
-          // on the NVFP4 side when they were runtime-gated -- so the shipped kernel
-          // must not contain them at all. Defaulted, so every existing instantiation
-          // (and every compile-gate row) keeps its current meaning.
-          bool kPhaseStamps = false>
+          // In-kernel weight copy of a replica plan: the dispatch warps copy the
+          // changed redundant expert slots from their resident ranks after the token
+          // pull, and the weight loader gates each redundant slot's tasks on its
+          // readiness counters. Off by default, so every existing instantiation is
+          // unchanged.
+          bool kInKernelWeightCopy = false,
+          // Nodes the ranks are spread over, node-major. Above one, ranks on other
+          // nodes are reached through the inbox and outbox of their mirror rank on
+          // this node (GIN puts), see layout::RemoteRegions.
+          uint32_t kNumNodes = 1, uint32_t kWeightTileBytes = 8704>
 CUTLASS_GLOBAL __launch_bounds__(
-    sm90_mxfp4_num_threads(kSwapABRequested, kUseRSOperand, BLOCK_M),
+    sm90_mxfp4_num_threads(kSwapABRequested, kUseRSOperand, BLOCK_M, kWeightTileBytes),
     1) void sm90_mxfp4_mega_moe_fused_impl(void* y, int* cumulative_local_expert_recv_stats,
                                            const uint32_t num_tokens,
                                            const __grid_constant__ layout::SymBuffer<kNumRanks>
                                                sym_buffer,
+                                           // Where a peer's input block and combine block are
+                                           // read and written; equal to `sym_buffer` inside one
+                                           // NVLink domain, the mirror's inbox and outbox for a
+                                           // rank on another node.
+                                           const __grid_constant__ layout::SymRegions<kNumRanks>
+                                               sym_regions,
+                                           // Mirror ranks on the other nodes and the carrier
+                                           // that reaches them; unused with one node.
+                                           const __grid_constant__ comm::RemoteLinks<kNumNodes - 1>
+                                               remote_links,
                                            const __grid_constant__ cute::TmaDescriptor
                                                tensor_map_l1_acts,
                                            const __grid_constant__ cute::TmaDescriptor
@@ -200,23 +212,23 @@ CUTLASS_GLOBAL __launch_bounds__(
                                            const uint8_t* __restrict__ l2_weights,
                                            const float* __restrict__ l1_global_scales,
                                            const float* __restrict__ l2_global_scales,
-                                           // Only written when kPhaseStamps; see the slot map in
-                                           // the body.
-                                           unsigned long long* __restrict__ phase_stamps) {
+                                           // Only read when kInKernelWeightCopy.
+                                           const __grid_constant__ eplb::InKernelCopy<kNumRanks>
+                                               in_kernel_copy) {
   constexpr uint32_t BLOCK_K = 128;
   constexpr uint32_t kNumDispatchThreads = 64;
   constexpr uint32_t kNumNonEpilogueThreads = 64;
   // Decode gets its own warps so it overlaps the WGMMA rather than
   // serialising with it on the math warps.
   constexpr bool kSplitDecodeWarps =
-      sm90_mxfp4_split_decode(kSwapABRequested, kUseRSOperand, BLOCK_M);
+      sm90_mxfp4_split_decode(kSwapABRequested, kUseRSOperand, BLOCK_M, kWeightTileBytes);
   constexpr uint32_t kNumDecodeThreads = kSplitDecodeWarps ? 256 : 0;
   constexpr uint32_t kNumEpilogueThreads = 256;
   constexpr uint32_t kNumThreads =
       kNumDispatchThreads + kNumNonEpilogueThreads + kNumDecodeThreads + kNumEpilogueThreads;
-  FI_MEGAMOE_STATIC_ASSERT(
-      kNumThreads == sm90_mxfp4_num_threads(kSwapABRequested, kUseRSOperand, BLOCK_M),
-      "Launch bounds and the role partition disagree");
+  FI_MEGAMOE_STATIC_ASSERT(kNumThreads == sm90_mxfp4_num_threads(kSwapABRequested, kUseRSOperand,
+                                                                 BLOCK_M, kWeightTileBytes),
+                           "Launch bounds and the role partition disagree");
   FI_MEGAMOE_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Experts must divide evenly across ranks");
   FI_MEGAMOE_STATIC_ASSERT(kHidden % 128 == 0, "Hidden must be a multiple of BLOCK_K");
   FI_MEGAMOE_STATIC_ASSERT(kIntermediateHidden % 128 == 0,
@@ -235,6 +247,10 @@ CUTLASS_GLOBAL __launch_bounds__(
   constexpr uint32_t kNumEpilogueWarpgroups = kNumEpilogueWarps / 4;
   constexpr uint32_t kNumTokensPerWarp = 32 / kNumTopk;
   constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
+  FI_MEGAMOE_STATIC_ASSERT(kNumNodes >= 1 and kNumRanks % kNumNodes == 0,
+                           "Ranks must split evenly across nodes");
+  constexpr uint32_t kNumRemoteNodes = kNumNodes - 1;
+  constexpr uint32_t kNumLocalRanks = kNumRanks / kNumNodes;
 #include <flashinfer/megamoe/sm90_mxfp4_mega_moe_fused_body.inl>
 }
 

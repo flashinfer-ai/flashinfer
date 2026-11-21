@@ -16,6 +16,22 @@ Usage::
     # Every step: stage FP8 activations and routing, then run.
     buf.stage(x_fp8, x_sf, topk_idx, topk_weights)
     nvfp4_mega_moe(y, w1, w2, buf, l1_global_scales=g1, l2_global_scales=g2)
+
+MXFP4 with redundant expert slots (``MegaMoEExpertSlots``): the buffer is sized
+for the physical slots, the weights live in the slots' symmetric arena, the
+logical routing is remapped onto the slots before the kernel runs, and the
+kernel copies the slots whose expert changed from their resident ranks::
+
+    buf = MegaMoESymmBuffer(group, num_experts=256 + 8 * 4, ...)
+    slots = MegaMoEExpertSlots(buf, num_experts=256, num_redundant_slots=4)
+    slots.set_resident_weights(w1, w2, g1, g2)
+    slots.set_replica_plan(slot_expert, copies, expert_base)
+    buf.stage(x_fp8, x_sf, topk_idx, topk_weights)
+    slots.remap(num_tokens)
+    mxfp4_mega_moe(y, slots.l1_weights, slots.l2_weights, buf,
+                   l1_global_scales=slots.l1_global_scales,
+                   l2_global_scales=slots.l2_global_scales,
+                   expert_slots=slots)
 """
 
 import dataclasses
@@ -31,6 +47,9 @@ from ..jit.megamoe import (
     gen_megamoe_sm90_nvfp4_split_module,
     gen_megamoe_sm90_nvfp4_split_plan_module,
 )
+from ._jit import _get_jit_module
+from .transport import MegaMoENcclTransport
+from .eplb import MegaMoEExpertSlots
 from .heuristics import (
     CANDIDATE_BLOCK_M,
     FusedPlan,
@@ -47,6 +66,7 @@ from .weights import (
 
 __all__ = [
     "MegaMoESymmBuffer",
+    "MegaMoEExpertSlots",
     "nvfp4_mega_moe",
     "mxfp4_mega_moe",
     "transform_nvfp4_weights_for_mega_moe",
@@ -60,12 +80,8 @@ __all__ = [
 ]
 
 
-@functools.cache
-def _get_jit_module(factory, *args):
-    return factory(*args).build_and_load()
-
-
 def _jit_args(factory, plan, b):
+    """Positional JIT arguments for ``factory`` from ``plan`` and buffer ``b``, with the rank count where that factory expects it."""
     args = (plan, b.num_sms)
     # Keep the trailing fused rank argument compatible with existing JIT callers.
     if factory is not gen_megamoe_sm90_nvfp4_module:
@@ -84,8 +100,23 @@ def _jit_args(factory, plan, b):
     return args
 
 
-def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
-    module = _get_jit_module(factory, *_jit_args(factory, plan, b))
+def _run_kernel(
+    factory,
+    entry,
+    plan,
+    y,
+    w1,
+    w2,
+    b,
+    m,
+    stats,
+    gs1,
+    gs2,
+    extra_jit_args=(),
+    extra_kernel_args=(),
+):
+    """Launch ``entry`` of the module ``factory`` builds for ``plan`` and buffer ``b``."""
+    module = _get_jit_module(factory, *_jit_args(factory, plan, b), *extra_jit_args)
     getattr(module, entry)(
         y,
         b.buffer,
@@ -98,6 +129,7 @@ def _run_kernel(factory, entry, plan, y, w1, w2, b, m, stats, gs1, gs2):
         stats,
         gs1,
         gs2,
+        *extra_kernel_args,
     )
     return y
 
@@ -127,6 +159,13 @@ class MegaMoESymmBuffer:
         SwiGLU clamp value. Defaults to 10.0.
     fast_math : bool
         Use the family's fast-math policy. Defaults to True.
+    transport : MegaMoENcclTransport, optional
+        NCCL-window transport that owns the buffer memory. The default
+        allocates torch symmetric memory, which reaches ranks on one node
+        only; ranks on several nodes need the transport.
+    num_nodes : int
+        Nodes the ranks are spread over, node-major (rank ``r`` and
+        ``r + ranks / num_nodes`` are mirror ranks). Defaults to 1.
 
     Attributes
     ----------
@@ -148,8 +187,14 @@ class MegaMoESymmBuffer:
         intermediate_hidden: int,
         activation_clamp: float = 10.0,
         fast_math: bool = True,
+        transport: Optional["MegaMoENcclTransport"] = None,
+        num_nodes: int = 1,
     ) -> None:
-        import torch.distributed._symmetric_memory as symm_mem
+        """Validate the geometry, allocate the symmetric buffer and expose this rank's staging views."""
+        if num_nodes < 1 or group.size() % num_nodes:
+            raise ValueError("num_nodes must divide the group size")
+        if num_nodes > 1 and transport is None:
+            raise ValueError("ranks on several nodes need the NCCL transport")
 
         # Buffer geometry is format-independent; NVFP4 checks its narrower
         # deployment constraints when selecting a fused/split plan.
@@ -167,6 +212,7 @@ class MegaMoESymmBuffer:
             raise ValueError("SM90 MegaMoE requires a Hopper GPU")
 
         self.group = group
+        self.num_nodes = num_nodes
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_topk = num_topk
@@ -196,16 +242,31 @@ class MegaMoESymmBuffer:
                 intermediate_hidden,
                 pool,
                 sf_pool,
+                num_nodes - 1,
             )
         )
         self._offsets = layout
         num_bytes = layout[0]
         self.num_max_pool_tokens = layout[9]
         self.num_padded_sf_pool_tokens = layout[10]
+        self._remote_args: Tuple[Any, ...] = ()
 
-        self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device="cuda")
-        self.handle = symm_mem.rendezvous(self.buffer, group=group)
-        self.buffer.zero_()
+        self.transport = transport
+        if transport is None:
+            import torch.distributed._symmetric_memory as symm_mem
+
+            self.buffer = symm_mem.empty(num_bytes, dtype=torch.int8, device="cuda")
+            self.handle = symm_mem.rendezvous(self.buffer, group=group)
+            self.buffer.zero_()
+        else:
+            if transport.group is not group:
+                raise ValueError(
+                    "the transport must belong to the buffer's process group"
+                )
+            self.window = transport.alloc_window(num_bytes)
+            self.buffer = transport.window_tensor(self.window, torch.int8)
+            self.handle = transport.peer_handle(self.window)
+        self._remote_args = self._compute_remote_args(layout)
         group.barrier()
         torch.cuda.synchronize()
 
@@ -222,7 +283,68 @@ class MegaMoESymmBuffer:
             layout[4], (num_max_tokens_per_rank, num_topk), torch.float32
         )
 
+    def _compute_remote_args(self, layout) -> Tuple[Any, ...]:
+        """Kernel arguments that place every peer's input and combine blocks and
+        describe the mirror ranks: a peer on this node is its own buffer, a peer
+        on another node is reached through its mirror's inbox / outbox."""
+        ranks, rank, nodes = self.group.size(), self.group.rank(), self.num_nodes
+        local = ranks // nodes
+        my_node = rank // local
+        bases = [int(p) for p in self.handle.buffer_ptrs]
+        base = bases[rank]
+        input_off, combine_off = layout[1], layout[11]
+        remote_base, per_node, inbox = layout[12], layout[13], layout[15]
+        input_ptrs, combine_ptrs = [], []
+        for r in range(ranks):
+            node = r // local
+            if node == my_node:
+                if bases[r] == 0:
+                    raise ValueError(
+                        f"rank {r} on this node is not load/store reachable"
+                    )
+                input_ptrs.append(bases[r] + input_off)
+                combine_ptrs.append(bases[r] + combine_off)
+            else:
+                j = node if node < my_node else node - 1
+                mirror = r % local + my_node * local
+                region = bases[mirror] + remote_base + j * per_node
+                input_ptrs.append(region)
+                combine_ptrs.append(region + 2 * inbox)
+        link_ranks, link_nodes, link_lsa = [], [], []
+        for j in range(nodes - 1):
+            node = j if j < my_node else j + 1
+            peer = rank % local + node * local
+            link_ranks.append(peer)
+            link_nodes.append(my_node if my_node < node else my_node - 1)
+            link_lsa.append(bases[peer] - base if bases[peer] else 0)
+        transport = self.transport
+        needs_gin = any(offset == 0 for offset in link_lsa)
+        dev_comm = (
+            transport.dev_comm_pointer if (transport is not None and needs_gin) else 0
+        )
+        window = (
+            transport.window_handle(self.window)
+            if (transport is not None and needs_gin)
+            else 0
+        )
+        if needs_gin and (dev_comm == 0 or window == 0):
+            raise ValueError(
+                "a mirror rank on another host needs a transport created with GIN contexts"
+            )
+        return (
+            input_ptrs,
+            combine_ptrs,
+            link_ranks,
+            link_nodes,
+            link_lsa,
+            dev_comm,
+            window,
+            base,
+            0,
+        )
+
     def _view(self, byte_offset: int, shape: Tuple[int, ...], dtype: torch.dtype):
+        """Typed view of ``shape`` into the symmetric buffer starting at ``byte_offset``."""
         itemsize = torch.empty((), dtype=dtype).element_size()
         numel = 1
         for s in shape:
@@ -422,6 +544,8 @@ def nvfp4_mega_moe(
     supports four or eight ranks, which must call matching families in matching order.
     """
     b = symm_buffer
+    if b.num_nodes != 1:
+        raise ValueError("NVFP4 MegaMoE supports a single node")
     m = int(num_tokens if num_tokens is not None else y.shape[0])
     _validate_call(
         y,
@@ -482,7 +606,22 @@ def nvfp4_mega_moe(
     )
 
 
+def _mxfp4_weight_tile_bytes(w1, w2):
+    """Identify matching canonical, compact or predecoded weight records."""
+    if (
+        w1.ndim != 3
+        or w2.ndim != 3
+        or w1.shape[-1] != w2.shape[-1]
+        or w1.shape[-1] not in (MXFP4_TILE_BYTES, 8448, 16384)
+    ):
+        raise ValueError(
+            "MXFP4 weights must use matching 3-D records of 8704, 8448 or 16384 bytes"
+        )
+    return w1.shape[-1]
+
+
 def _validate_call(y, w1, w2, b, m, weight_format, stats, gs1, gs2):
+    """Check ``y``, the expert weights and the optional per-expert tensors against the buffer geometry; raise ``ValueError`` on a mismatch."""
     if b.buffer is None:
         raise ValueError("symmetric buffer has been destroyed")
     if not 0 < m <= b.num_max_tokens_per_rank or m > getattr(b, "num_staged_tokens", 0):
@@ -494,13 +633,14 @@ def _validate_call(y, w1, w2, b, m, weight_format, stats, gs1, gs2):
             (epr, b.hidden, b.intermediate_hidden // 128 * 80),
         )
     else:
+        tile_bytes = _mxfp4_weight_tile_bytes(w1, w2)
         shapes = (
             (
                 epr,
                 b.intermediate_hidden * 2 // 128 * (b.hidden // 128),
-                MXFP4_TILE_BYTES,
+                tile_bytes,
             ),
-            (epr, b.hidden // 128 * (b.intermediate_hidden // 128), MXFP4_TILE_BYTES),
+            (epr, b.hidden // 128 * (b.intermediate_hidden // 128), tile_bytes),
         )
     if (
         y.ndim != 2
@@ -544,6 +684,7 @@ def mxfp4_mega_moe(
     cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
     l1_global_scales: Optional[torch.Tensor] = None,
     l2_global_scales: Optional[torch.Tensor] = None,
+    expert_slots: Optional[MegaMoEExpertSlots] = None,
 ) -> torch.Tensor:
     """Run fused MXFP4 MegaMoE with chunk-major weights and FP8 activations.
 
@@ -553,7 +694,8 @@ def mxfp4_mega_moe(
         Contiguous BF16 output with shape ``[at least num_tokens, hidden]``.
         The kernel writes the first ``num_tokens`` rows in place.
     l1_weights, l2_weights : torch.Tensor
-        Packed MXFP4 weights from :func:`transform_mxfp4_weights_for_mega_moe`.
+        Weights from :func:`transform_mxfp4_weights_for_mega_moe`. Both tensors
+        must use the same canonical MXFP4, compact MXFP4 or predecoded FP8 storage.
     symm_buffer : MegaMoESymmBuffer
         Buffer populated by :meth:`MegaMoESymmBuffer.stage` on every rank.
     num_tokens : int, optional
@@ -565,7 +707,15 @@ def mxfp4_mega_moe(
         INT32 vector with one entry per local expert. Receive counts are
         accumulated in place; initialize the vector before first use.
     l1_global_scales, l2_global_scales : torch.Tensor, optional
-        FP32 vectors with one multiplier per local expert. Omitted scales use 1.
+        FP32 vectors with one multiplier per local expert. Omitted scales use 1,
+        or the slots' arena scales when ``expert_slots`` is given.
+    expert_slots : MegaMoEExpertSlots, optional
+        Redundant expert slots of this buffer. The kernel then copies the slots
+        listed in the slots' workspace (:meth:`MegaMoEExpertSlots.set_replica_plan`)
+        from their resident ranks while it computes, and the weights and global
+        scales must be the slots' arena views. The routing staged in the buffer
+        must already be physical (:meth:`MegaMoEExpertSlots.remap`).
+        Only single-node canonical MXFP4 storage supports expert slots.
 
     Returns
     -------
@@ -580,6 +730,16 @@ def mxfp4_mega_moe(
     """
     b = symm_buffer
     m = int(num_tokens if num_tokens is not None else y.shape[0])
+    weight_tile_bytes = _mxfp4_weight_tile_bytes(l1_weights, l2_weights)
+    if expert_slots is not None:
+        if b.num_nodes > 1 or weight_tile_bytes != MXFP4_TILE_BYTES:
+            raise ValueError("expert slots require single-node canonical MXFP4 storage")
+        # The slots' arena carries the resident scales; an omitted argument
+        # must not silently run the kernel without them.
+        if l1_global_scales is None:
+            l1_global_scales = expert_slots.l1_global_scales
+        if l2_global_scales is None:
+            l2_global_scales = expert_slots.l2_global_scales
     _validate_call(
         y,
         l1_weights,
@@ -600,10 +760,30 @@ def mxfp4_mega_moe(
         b.intermediate_hidden,
         b.num_max_tokens_per_rank,
         m,
+        num_logical_experts=None if expert_slots is None else expert_slots.num_experts,
+        weight_tile_bytes=weight_tile_bytes,
     )
+    entry = "megamoe_sm90_mxfp4_fused"
+    # Positional tail of gen_megamoe_sm90_mxfp4_module: in-kernel weight copy,
+    # nodes, weight-record bytes.
+    extra_jit_args: Tuple[Any, ...] = (
+        expert_slots is not None,
+        b.num_nodes,
+        weight_tile_bytes,
+    )
+    # Region pointers and mirror links precede the in-kernel copy operands.
+    extra_kernel_args: Tuple[Any, ...] = b._remote_args
+    if expert_slots is not None:
+        expert_slots._check_kernel_operands(
+            b, l1_weights, l2_weights, l1_global_scales, l2_global_scales
+        )
+        entry = "megamoe_sm90_mxfp4_fused_in_kernel_copy"
+        extra_kernel_args = extra_kernel_args + tuple(
+            expert_slots._in_kernel_copy_args()
+        )
     return _run_kernel(
         gen_megamoe_sm90_mxfp4_module,
-        "megamoe_sm90_mxfp4_fused",
+        entry,
         plan,
         y,
         l1_weights,
@@ -613,6 +793,8 @@ def mxfp4_mega_moe(
         cumulative_local_expert_recv_stats,
         l1_global_scales,
         l2_global_scales,
+        extra_jit_args=extra_jit_args,
+        extra_kernel_args=extra_kernel_args,
     )
 
 
@@ -626,6 +808,8 @@ FAMILY_THRESHOLD = 256
 
 @dataclasses.dataclass(frozen=True)
 class SplitPlan:
+    """Compile-time configuration of the NVFP4 split kernel: L1/L2 pipeline depth and shared memory, wave width, pool sizes and dispatch policies."""
+
     l1_num_stages: int
     l1_smem_size: int
     l2_num_stages: int
@@ -700,6 +884,7 @@ def select_split_plan(
 
 
 def _run_split(y, l1_weights, l2_weights, b, m, stats, gs1, gs2):
+    """Select the split plan for ``m`` tokens and launch the NVFP4 split kernel on buffer ``b``."""
     plan = select_split_plan(
         b.num_sms,
         b.group.size(),

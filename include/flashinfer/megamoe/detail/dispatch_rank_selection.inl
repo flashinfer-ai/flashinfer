@@ -1,11 +1,17 @@
-// Warp-wide round-robin selection from per-rank expert counts.
+// Warp-wide round-robin selection from per-rank expert counts. The rows of an
+// expert come in two groups: the `remote_rows` pulled from other nodes first,
+// then the rows of this node's ranks (`rank_is_remote` tells the group of a
+// rank), each group round-robin over its ranks. With one node every rank is
+// local and the second group is the whole expert.
 uint32_t current_rank_in_expert_idx;
 uint32_t remaining[kNumRanksPerLane];
-#pragma unroll
-for (uint32_t i = 0; i < kNumRanksPerLane; ++i) remaining[i] = stored_rank_count[i];
-uint32_t offset = 0;
 uint32_t token_idx_in_expert = token_idx - expert_start_idx;
-uint32_t slot_idx = token_idx_in_expert;
+const bool remote_group = token_idx_in_expert < remote_rows;
+#pragma unroll
+for (uint32_t i = 0; i < kNumRanksPerLane; ++i)
+  remaining[i] = rank_is_remote(i * 32 + lane_idx) == remote_group ? stored_rank_count[i] : 0u;
+uint32_t offset = 0;
+uint32_t slot_idx = remote_group ? token_idx_in_expert : token_idx_in_expert - remote_rows;
 uint32_t token_idx_in_rank;
 while (true) {
   uint32_t num_actives_in_lane = 0;

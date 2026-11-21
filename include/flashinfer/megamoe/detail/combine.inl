@@ -11,15 +11,30 @@ auto combine_load_barriers = utils::PatternVisitor(
 
 uint32_t combine_phase = 0;
 uint32_t load_stage_idx = 0;
-for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx; token_idx < num_tokens;
-     token_idx += kNumSMs * kNumEpilogueWarps) {
+const uint32_t combine_first_token =
+    kLocalCombineStripe8 ? sm_idx : sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
+constexpr uint32_t combine_token_stride =
+    kLocalCombineStripe8 ? kNumSMs : kNumSMs * kNumEpilogueWarps;
+for (uint32_t token_idx = combine_first_token; token_idx < num_tokens;
+     token_idx += combine_token_stride) {
   const int stored_topk_slot_idx =
       lane_idx < kNumTopk ? static_cast<int>(__ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() +
                                                    token_idx * kNumTopk + lane_idx))
                           : -1;
+#if defined(FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES)
+  // Slots whose experts live on other nodes were reduced there; their rows are
+  // added by `remote_add_returns` after this pass, so the return latency hides
+  // behind the node-local reduction.
+  const uint32_t total_mask = __ballot_sync(
+      0xffffffff, stored_topk_slot_idx >= 0 and
+                      (kNumRemoteNodes == 0 or
+                       node_of_expert(static_cast<uint32_t>(stored_topk_slot_idx)) == my_node));
+#else
   const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
+#endif
 
-  for (uint32_t chunk = 0; chunk < kNumChunks; ++chunk) {
+  for (uint32_t chunk = kLocalCombineStripe8 ? epilogue_warp_idx : 0u; chunk < kNumChunks;
+       chunk += kLocalCombineStripe8 ? kNumEpilogueWarps : 1u) {
     const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
 
     uint32_t mask = total_mask;
