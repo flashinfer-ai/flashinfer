@@ -451,6 +451,17 @@ class TestFp4Fc1GPU:
         tolerance = max(0.75, out_bf16.float().abs().max().item() * 0.35)
         assert diff.max().item() < tolerance
 
+    def test_tile8_swiglu_swap_epilogue_quant_all_zero_inputs(self):
+        """A zero E4M3 output scale must select zero after rcp(0)."""
+        _run_fp4_fc1(
+            tile_n=8,
+            swap_ab=True,
+            act_kind=int(ActKind.SWIGLU),
+            pipeline_stages=9,
+            dtype_c=int(DType.E2M1),
+            data_distribution="allZeros",
+        )
+
     @requires_dsl_4_8_for_c_partition_offset
     @pytest.mark.parametrize(
         "tile_n,epi_tile_n,use_tma_store,sf_layout_c,umma_cta_count,mma_m",

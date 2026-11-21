@@ -38,6 +38,16 @@ class SplitKernelContext:
     # quantized before dispatch (see SplitKernelBackend.dispatch_format), one
     # row per received token; None when ``expert_tensors`` is unquantized.
     expert_tensors_scale: Optional["torch.Tensor"] = None
+    # [num_tokens, hidden] bfloat16 buffer the kernel may write its output
+    # into, such as the communication's combine input region
+    # (MoEEpCommunication.get_combine_input_buffer), which the combine then
+    # reads in place; None lets the kernel allocate. The kernel returns the
+    # tensor it wrote, which need not be this one.
+    output: Optional["torch.Tensor"] = None
+    # Whether the kernel must write zeros into the ``output`` rows of received
+    # tokens without an expert on this rank; False when the combine never
+    # reads them (MoEEpCommunication.combine_reads_only_local_expert_rows).
+    zero_rows_without_local_expert: bool = True
 
 
 class SplitKernelBackend(ABC):
@@ -151,6 +161,10 @@ class MegaKernelBackend(ABC):
         """Convert the selector's [up, gate] FC1 rows to the backend's input order."""
         return weights
 
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        """Arithmetic receipt when the backend implements a specified BI class."""
+        return None
+
     def ep_selected_config(self, workspace):
         return self.get_tuned_config(workspace)
 
@@ -167,14 +181,34 @@ class MegaKernelBackend(ABC):
         from flashinfer.autotuner.autotuner import _json_to_tactic
         from .registry import create_mega_kernel
 
-        config = dataclasses.replace(
-            self._config,
-            kernel_variant=selection["kernel_variant"],
-            knobs={k: _json_to_tactic(v) for k, v in selection["knobs"].items()},
+        expected = (
+            {"kernel_variant", "knobs"}
+            if hasattr(self._config, "kernel_variant")
+            else {"knobs"}
         )
+        if set(selection) != expected:
+            raise ValueError(
+                "cached MegaMoE selection fields do not match its configuration"
+            )
+        fields = {
+            "knobs": {k: _json_to_tactic(v) for k, v in selection["knobs"].items()}
+        }
+        if "kernel_variant" in selection:
+            if not hasattr(self._config, "kernel_variant"):
+                raise ValueError("this MegaMoE configuration has no kernel_variant")
+            fields["kernel_variant"] = selection["kernel_variant"]
+        config = dataclasses.replace(self._config, **fields)
         kernel = create_mega_kernel(config)
         kernel.bind_ep_bootstrap(self._ep_bootstrap)
         kernel.validate_init(self._ep_bootstrap, fleet_params)
+        if getattr(self._config, "batch_invariant", False):
+            self.validate_init(self._ep_bootstrap, fleet_params)
+            if kernel.batch_invariant_fingerprint(
+                fleet_params
+            ) != self.batch_invariant_fingerprint(fleet_params):
+                raise ValueError(
+                    "cached MegaMoE selection changes the arithmetic fingerprint"
+                )
 
     def ep_force_tune(self, workspace, tensors, weights, output):
         """Run a fresh inner search for an explicitly forced outer search."""

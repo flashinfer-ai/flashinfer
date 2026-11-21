@@ -60,6 +60,7 @@ from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
     rubin_moe_cluster_covers_one_tile,
     validate_cute_dsl_moe_clamped_relu2_config,
+    validate_pre_fc2_routing,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -527,6 +528,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_sm_count: Optional[int] = None,
         localized_memset_stream: Optional[torch.cuda.Stream] = None,
         swap_ab: bool = False,
+        routing_weights_before_fc2: bool = False,
+        localized_options: Optional[dict] = None,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_clamped_relu2_config(activation_type, clamped_relu2_limit)
@@ -538,8 +541,20 @@ class CuteDslFusedMoERunner(TunableRunner):
             raise ValueError(
                 f"per-token activation scaling is not supported for {quant_mode}"
             )
-        if localized_weights is not None and quant_mode != "w4a4":
-            raise ValueError("localized runner supports quant_mode='w4a4' only")
+        if localized_weights is not None and quant_mode not in ("w4a4", "mxfp8"):
+            raise ValueError(
+                "localized runner supports quant_mode='w4a4' and 'mxfp8' only"
+            )
+        validate_pre_fc2_routing(
+            routing_weights_before_fc2,
+            quant_mode,
+            activation_type,
+            output_dtype,
+            swap_ab,
+            per_token_scale=use_per_token_activation,
+            localized_weights=localized_weights is not None,
+        )
+        self.routing_weights_before_fc2 = routing_weights_before_fc2
         self.forward_impl = forward_impl
         self.num_experts = num_experts
         self.top_k = top_k
@@ -564,6 +579,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.localized_streams = localized_streams
         self.localized_sm_count = localized_sm_count
         self.localized_memset_stream = localized_memset_stream
+        self.localized_options = localized_options
 
         if localized_weights is not None and (
             len(localized_weights) != 2
@@ -699,11 +715,15 @@ class CuteDslFusedMoERunner(TunableRunner):
             )
             for shard in self.localized_weights
         )
+        options = self.localized_options or {}
         return (
             "localized",
             self.localized_sm_count,
             shard_shapes,
             self.localized_memset_stream is not None,
+            options.get("fc2_split", "n"),
+            options.get("fc2_accumulator", "float32"),
+            options.get("output_memset", "overlap_fc1"),
         )
 
     def __hash__(self):
@@ -727,6 +747,11 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self._localization_signature(),
             )
             + (("swap_ab",) if self.swap_ab else ())
+            + (
+                ("routing_weights_before_fc2",)
+                if self.routing_weights_before_fc2
+                else ()
+            )
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -744,6 +769,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.output_dtype,
             self.enable_pdl,
         )
+        if self.routing_weights_before_fc2:
+            extras += ("routing_weights_before_fc2",)
         if self.swap_ab:
             extras += ("swap_ab",)
         if self.use_cuda_graph:
@@ -769,6 +796,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         can_implement methods using the actual problem dimensions from inputs.
         Supports both Blackwell and Rubin architectures.
         """
+        if self.routing_weights_before_fc2:
+            return [DEFAULT_BLACKWELL_MOE_TACTIC]
         if self.swap_ab:
             from .blackwell.moe_swap_ab_tuner import get_valid_swap_ab_tactics
 
@@ -1008,6 +1037,13 @@ class CuteDslFusedMoERunner(TunableRunner):
         Returns:
             Output tensor from the MoE computation.
         """
+        if self.routing_weights_before_fc2:
+            if tactic is None or tactic == -1:
+                tactic = DEFAULT_BLACKWELL_MOE_TACTIC
+            if tactic != DEFAULT_BLACKWELL_MOE_TACTIC:
+                raise ValueError(
+                    "Pre-FC2 routing weighting requires single-CTA 128x128 tactics"
+                )
         if self.swap_ab:
             from .blackwell.moe_swap_ab_tuner import (
                 DEFAULT_SWAP_AB_MOE_TACTIC,
@@ -1070,7 +1106,11 @@ class CuteDslFusedMoERunner(TunableRunner):
                 localized_streams=self.localized_streams,
                 localized_memset_stream=self.localized_memset_stream,
                 sm_count=self.localized_sm_count,
+                localized_options=self.localized_options,
             )
+
+        if self.routing_weights_before_fc2:
+            kwargs["routing_weights_before_fc2"] = True
 
         return self.forward_impl(
             x=x,

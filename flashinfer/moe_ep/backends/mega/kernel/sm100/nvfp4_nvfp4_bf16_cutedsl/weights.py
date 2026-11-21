@@ -41,14 +41,15 @@ def _quantize_expert_weights(
     """Return NVFP4 weight + raw fp8 block scales with K on the trailing dim."""
     import torch
 
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.sm100.cutedsl_megamoe import nvfp4_quantize_per_block_16
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        nvfp4_quantize_per_block_16,
+    )
 
     return nvfp4_quantize_per_block_16(weight_k_major.to(torch.float32), norm_const)
 
 
 def _swizzle_expert_scales(raw_sf: "torch.Tensor") -> "torch.Tensor":
-    from ......kernel_src.sm100.cutedsl_megamoe import to_blocked
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import to_blocked
 
     return to_blocked(raw_sf)
 
@@ -110,9 +111,7 @@ def preprocess_mega_weights(
     """bf16 (or pre-quantized) weights → NVFP4 + swizzled-SF mega layout."""
     import torch
 
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
-    # shim exposes this cutlass-pulling helper lazily via the package boundary.
-    from ......kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         _stack_byte_reinterpretable_tensors,
     )
 
@@ -245,11 +244,62 @@ def preprocess_mega_weights(
     return (fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf)
 
 
+def preprocess_standard_mega_weights(
+    weights: "MoEWeightPack",
+    *,
+    intermediate_size: int,
+    hidden_size: int,
+    gate_up_clamp: float | None = None,
+    activation_clamp: float | None = None,
+) -> TransformedMegaWeights:
+    """Prepare weights for the unsuffixed SM100 NVFP4 selector.
+
+    FC1 is canonical [E, 2I, H] with gate rows followed by up rows; FC2 is
+    [E, H, I]. Packed inputs use half the trailing extent and plain E4M3
+    scales. Returned weights and swizzled scales have the kernel's typed views.
+    The retained ``_legacy`` selector uses ``preprocess_mega_weights`` in this
+    module, which returns byte-view scales instead.
+    """
+    import torch
+
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+        preprocess_block_scaled_weights,
+        preprocess_prequantized_block_scaled_weights,
+    )
+
+    _resolve_gate_up_clamp(
+        gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
+    )
+    if isinstance(weights, PrequantizedMoEWeights):
+
+        def typed_scale(scale):
+            return (
+                scale.view(torch.float8_e4m3fn) if scale.dtype == torch.uint8 else scale
+            )
+
+        return preprocess_prequantized_block_scaled_weights(
+            weights.w13,
+            weights.w2,
+            typed_scale(weights.w13_scale),
+            typed_scale(weights.w2_scale),
+            hidden_size=hidden_size,
+            quant_kind="nvfp4",
+            intermediate_size=intermediate_size,
+        )
+    if weights.w13.shape[1:] != (2 * intermediate_size, hidden_size):
+        raise ValueError("w13 must have canonical shape [E, 2I, H].")
+    return preprocess_block_scaled_weights(
+        weights.w13,
+        weights.w2,
+        quant_kind="nvfp4",
+        intermediate_size=intermediate_size,
+    )
+
+
 def _nvfp4_swizzled_flat_sf_size(rows: int, cols: int) -> int:
     import torch
 
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.sm100.cutedsl_megamoe import to_blocked
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import to_blocked
 
     plain = torch.zeros(rows, cols, dtype=torch.float32)
     return to_blocked(plain).numel()
@@ -293,8 +343,10 @@ def validate_transformed_mega_weights(
     fc1_out = 2 * intermediate_size
     weight_dtype = _nvfp4_kernel_weight_dtype()
 
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.sm100.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        Nvfp4BlockSize,
+        ceil_div,
+    )
 
     hidden_sf_cols = ceil_div(hidden_size, Nvfp4BlockSize)
     intermediate_sf_cols = ceil_div(intermediate_size, Nvfp4BlockSize)
@@ -326,5 +378,6 @@ __all__ = [
     "MoEWeightPack",
     "TransformedMegaWeights",
     "preprocess_mega_weights",
+    "preprocess_standard_mega_weights",
     "validate_transformed_mega_weights",
 ]

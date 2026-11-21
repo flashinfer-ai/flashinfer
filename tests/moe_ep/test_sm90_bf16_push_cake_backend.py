@@ -561,9 +561,7 @@ def test_ep1_fc2_early_shape_window_bitwise(mode: str, wire: str, monkeypatch) -
     """Rounds in the pipe shape's window (lo, hi] above the decode window also run the
     early-start GEMM pair and write the same bytes as the regular pair; rounds above
     the window run the regular pair."""
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_runner,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     monkeypatch.delenv(cake_runner.FC2_EARLY_WINDOWS_ENV, raising=False)
     monkeypatch.setitem(
@@ -658,9 +656,7 @@ def test_ep1_fc2_early_shape_window_bitwise(mode: str, wire: str, monkeypatch) -
 def test_ep1_fc2_early_windows_table() -> None:
     """The shipped windows sit above the decode window and the round predicate
     switches exactly at each window's bounds (host-only check)."""
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_runner,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     dmax = cake_runner.FC2_EARLY_MAX_TOKENS
     assert cake_runner.FC2_EARLY_WINDOWS == FC2_EARLY_SHIPPED_WINDOWS
@@ -716,9 +712,7 @@ class _WcxSpy(_GemmSpy):
 
 
 def _layer_weights(layer):
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim.cake_weights import (
-        Sm90CakeBf16Weights,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_weights import Sm90CakeBf16Weights
 
     weights = _find_runner(layer, class_name="Sm90CakeBf16MegaKernelBackend")
     assert weights is not None
@@ -852,7 +846,7 @@ def test_ep1_wcx_default_off(monkeypatch) -> None:
     bf16 GEMM pairs; a layer without the early-start pair cannot enable WCX."""
     import warnings
 
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_runner
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     for name in ROUND_SWITCH_ENVS:
         monkeypatch.delenv(name, raising=False)
@@ -909,7 +903,7 @@ def test_wcx_resolves_on_conditions(monkeypatch) -> None:
     """WCX copies are needed only when the runner resolves WCX on: wcx_max_tokens
     > 0, an effective fc2_early_max_tokens > 0 (argument, else the environment)
     and an early-start geometry (CPU only)."""
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_runner
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     monkeypatch.delenv(cake_runner.FC2_EARLY_MAX_TOKENS_ENV, raising=False)
     monkeypatch.delenv("FLASHINFER_SM90_CAKE_BF16_DEV_LAUNCHER", raising=False)
@@ -945,7 +939,7 @@ def test_wcx_resolves_on_conditions(monkeypatch) -> None:
 def test_ep1_wcx_switch_validation(monkeypatch) -> None:
     """wcx_max_tokens accepts ints in [0, 128] only (config field and environment)."""
     from flashinfer.moe_ep import MoEEpConfigError
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_runner
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     device = torch.device("cuda", 0)
     for value in (-1, 129, True, 1.5, "8"):
@@ -965,10 +959,8 @@ def test_ep1_wcx_encode_fallback() -> None:
 
     import numpy as np
 
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_wcx
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_weights as cw,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_wcx
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_weights as cw
 
     device = torch.device("cuda", 0)
     w13, w2 = _make_weights(2, 101, device)
@@ -1014,9 +1006,7 @@ def test_ep1_wcx_windows_table() -> None:
     """The shipped WCX windows start at or above the decode-window limit, do not
     overlap the shape's FC2 early-start window, and the round predicate switches
     exactly at each window's bounds (host-only check)."""
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_runner,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     assert cake_runner.WCX_WINDOWS == WCX_SHIPPED_WINDOWS
     for key, (lo, hi) in cake_runner.WCX_WINDOWS.items():
@@ -1065,9 +1055,7 @@ def test_ep1_wcx_shape_window_bitwise(
     m-tiles per expert) and write the same bytes as a layer with WCX off; rounds
     above the window keep the bf16 pair; a CUDA graph of a window round replays
     bitwise with new routing."""
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_runner,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     monkeypatch.setitem(
         cake_runner.WCX_WINDOWS,
@@ -1181,12 +1169,8 @@ def test_ep1_wcx_shape_window_fallback_layer(monkeypatch) -> None:
     the rounds of the shape's WCX window: the regular pair, no WCX round."""
     import warnings
 
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_runner,
-    )
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_weights as cw,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_weights as cw
 
     monkeypatch.setitem(
         cake_runner.WCX_WINDOWS,
@@ -1440,7 +1424,7 @@ def test_ep1_direct_place_switch(monkeypatch) -> None:
     raises), the round bound, the pipes that cannot run it (inbox path, no error), the
     config validation and the workspace pool key."""
     from flashinfer.moe_ep import MoEEpConfigError
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim.cake_runner import (
+    from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_runner import (
         DIRECT_PLACE_ENV,
         DIRECT_PLACE_MIN_TOKENS_ENV,
     )
@@ -1515,9 +1499,7 @@ def test_ep1_direct_place_defaults(monkeypatch) -> None:
     DIRECT_PLACE_DEFAULTS with their round bound raised to the routed-element
     floor, off at the others, and the environment fallbacks override it
     (host-only check)."""
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_runner,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     assert cake_runner.DIRECT_PLACE_DEFAULTS == {8: 513, 4: 513}
     assert cake_runner.DIRECT_PLACE_MIN_ROUTE_ELEMS == 1 << 25
@@ -1559,9 +1541,7 @@ def test_ep1_grid_dispatch_defaults(monkeypatch) -> None:
     """The shipped per-EP bound of the grid-strided dispatch: 512 at EP 8, the
     rounds above the fused bound (513) at the other EP sizes, and the environment
     fallback overrides it (host-only check)."""
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_runner,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     assert cake_runner.GRID_DISPATCH_MIN_TOKENS_DEFAULTS == {8: 512}
     assert cake_runner.GRID_DISPATCH_MIN_TOKENS == 513
@@ -1709,7 +1689,7 @@ def test_ep1_combine_wire_per_shape_default(
     """combine_wire=None: the environment override wins when set; otherwise the
     per-shape default picks per_route for max_tokens_per_rank <= 8 and
     prereduced above.  The output stays correct either way."""
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe import (
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import (
         COMBINE_WIRE_ENV,
         COMBINE_WIRE_PER_SHAPE_MAX_TOKENS,
     )
@@ -1809,7 +1789,7 @@ def test_ep1_unsupported_geometry_raises() -> None:
 def test_grouped_gemm_guards_reject_misaligned_and_oversized_geometry() -> None:
     """CPU-only: the launcher and runner-level guards refuse what the kernels tile exactly."""
     from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_gemm
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_gemm
 
     def operands(rows: int, n: int, k: int, *, gated: bool) -> dict:
         # expand() keeps the storage tiny so the 32-bit bound can be exercised on a host.
@@ -1908,7 +1888,7 @@ def test_ep1_graph_replay(wire: str) -> None:
 def test_ep1_exported_gemm_matches_in_process(clamp: float | None) -> None:
     """The shipped (generated, manifest-sealed) GEMM modules reproduce the
     generator's in-process build bit for bit on both layers."""
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim.cake_gemm import (
+    from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_gemm import (
         DEV_LAUNCHER_ENV,
         ExportedGroupedGemm,
         create_grouped_gemm,
@@ -1920,9 +1900,7 @@ def test_ep1_exported_gemm_matches_in_process(clamp: float | None) -> None:
     pytest.importorskip(
         spec.partition(":")[0], reason="development launcher module not importable"
     )
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim.cake_weights import (
-        interleave_gate_up,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_weights import interleave_gate_up
 
     device = torch.device("cuda", 0)
     gen = torch.Generator(device=device).manual_seed(891)
@@ -2084,9 +2062,7 @@ def test_ep_grid_dispatch_default_bound(mode: str, monkeypatch) -> None:
     every round writes the bytes of the vendored dispatch."""
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_runner,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     monkeypatch.delenv(cake_runner.GRID_DISPATCH_MIN_TOKENS_ENV, raising=False)
     monkeypatch.delenv(cake_runner.FUSED_DISPATCH_ENV, raising=False)
@@ -2604,7 +2580,7 @@ def test_ep_direct_place_default(monkeypatch) -> None:
     at least that bound directly.  The bytes equal the inbox path."""
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim.cake_runner import (
+    from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_runner import (
         DIRECT_PLACE_DEFAULTS,
         DIRECT_PLACE_ENV,
         DIRECT_PLACE_MIN_ROUTE_ELEMS,
@@ -3285,9 +3261,7 @@ def test_ep_wcx_window_straddle_bitwise(mode: str, monkeypatch) -> None:
     CUDA graph of a window round replayed with new routing."""
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-        cake_runner,
-    )
+    from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_runner
 
     rank, world_size = _dist_setup()
     device = torch.device("cuda", rank)
