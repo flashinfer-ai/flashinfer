@@ -147,6 +147,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend(TunableRunner):
         sparse_mla_top_k: int = 0,
         uses_shared_paged_kv_idx: bool = True,
         use_fp16_softmax: Optional[bool] = None,
+        fill_empty_kv_rows: bool = False,
     ) -> None:
         """Bind native configuration after adapter-specific lowering.
 
@@ -165,6 +166,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend(TunableRunner):
         self._sparse_mla_top_k = sparse_mla_top_k
         self._uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self._use_fp16_softmax = use_fp16_softmax
+        self._fill_empty_kv_rows = fill_empty_kv_rows
 
     # Wrapper planning and execution
 
@@ -617,6 +619,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend(TunableRunner):
         lse: Optional[torch.Tensor],
         return_lse_base: Optional[Literal["basee", "base2"]] = None,
         use_fp16_softmax: Optional[bool] = None,
+        fill_empty_kv_rows: bool = False,
     ) -> "_BatchMLAPagedAttentionTrtllmGenBackend":
         """Bind call-local configuration without preparing a wrapper plan."""
         backend = cls(workspace_buffer)
@@ -636,6 +639,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend(TunableRunner):
             enable_pdl=enable_pdl,
             uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             use_fp16_softmax=use_fp16_softmax,
+            fill_empty_kv_rows=fill_empty_kv_rows,
         )
         backend.kv_cache = kv_cache
         backend._qk_nope_head_dim = qk_nope_head_dim
@@ -821,6 +825,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend(TunableRunner):
             sparse_mla_top_k_lens,
             0,  # bf16q_fp8kv_transform_mode
             self._use_fp16_softmax,
+            self._fill_empty_kv_rows,
         )
 
     # Autotuning support
