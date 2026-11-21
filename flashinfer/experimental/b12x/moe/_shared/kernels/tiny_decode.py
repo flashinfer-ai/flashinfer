@@ -1,4 +1,4 @@
-"""MoETinyDecodeKernelBackend — tiny-decode (M<=4) W4A8-MX MoE for SM120.
+"""MoETinyDecodeKernelBackend — tiny-decode (M<=8) W4A8-MX MoE for SM120.
 
 Reads the N256/K128 in-place-REPACKED weight storage (the "rp" layout produced
 by _logical_weight_to_w4a8_rp_inplace) directly.
@@ -90,8 +90,8 @@ class MoETinyDecodeKernelBackend:
         # FC2 bounds its intermediate loads by k2_tail_g32 (see the kernel).
         if k % 256 != 0 or n % 32 != 0:
             raise ValueError("tiny_decode requires k % 256 == 0 and n % 32 == 0")
-        if m < 1 or m > 4:
-            raise ValueError("tiny_decode supports 1 <= m <= 4")
+        if m < 1 or m > 8:
+            raise ValueError("tiny_decode supports 1 <= m <= 8")
         rt = m * num_topk
         kt13 = k // 128
         kt2 = -(-n // 128)
