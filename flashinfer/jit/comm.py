@@ -490,6 +490,15 @@ def _dcp_alltoall_helix_sources() -> list:
         / "kernels"
         / "helixAllToAll.cu",
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "cpp" / "common" / "envUtils.cpp",
+        # logger.cpp and stringUtils.cpp define Logger::getLogger and fmtstr_, which
+        # envUtils/tllmException/helixAllToAll reference; a Windows DLL link needs
+        # every symbol resolved (an ELF shared object defers them to load time).
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "cpp" / "common" / "logger.cpp",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal"
+        / "cpp"
+        / "common"
+        / "stringUtils.cpp",
         jit_env.FLASHINFER_CSRC_DIR
         / "nv_internal"
         / "cpp"

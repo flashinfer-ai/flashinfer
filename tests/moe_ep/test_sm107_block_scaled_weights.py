@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
     concatenate_block_scaled_weights,
     from_blocked,
     interleave_gate_up_16,
@@ -113,9 +113,7 @@ def test_nvfp4_preprocessing_bounds_fp32_temporaries():
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e8m0fnu])
 @pytest.mark.parametrize("strided", [False, True])
 def test_e8m0_decoder_all_encodings(dtype, strided):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        scale_to_f32,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import scale_to_f32
 
     codes = torch.arange(256, dtype=torch.uint8)
     if strided:
@@ -165,10 +163,7 @@ def test_mxfp4_block_scales_and_packed_values():
 
 @pytest.mark.parametrize("rows, cols", [(64, 6), (128, 8), (192, 6), (256, 12)])
 def test_scale_unswizzle_recovers_logical_plane(rows, cols):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        from_blocked,
-        to_blocked,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import from_blocked, to_blocked
 
     raw = torch.arange(rows * cols).reshape(rows, cols).to(torch.uint8)
     torch.testing.assert_close(from_blocked(to_blocked(raw), rows, cols), raw)

@@ -122,7 +122,7 @@ prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4_scales_tf.json
-prims_ts_decode_mla_one_shot_kv_bounds_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
+prims_ts_decode_mla_one_shot_cp8_i128_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
@@ -3093,6 +3093,7 @@ with contextlib.suppress(Exception):
     _pmla_seq_lens = torch.full((_pmla_B,), _pmla_SK, dtype=torch.int32, device=device)
 
     _attention_ts_mla_decode.fi_trace(
+        save_dir=SAVE_DIR,
         query=_pmla_q,
         kv_cache=_pmla_cache,
         block_tables=_pmla_block_tables,
@@ -3102,9 +3103,9 @@ with contextlib.suppress(Exception):
         kv_lora_rank=_pmla_CKV,
         qk_rope_head_dim=_pmla_KPE,
         mask_type="causal",
-        kv_bounds=torch.arange(
-            _pmla_SK - _pmla_SQ + 1, _pmla_SK + 1, dtype=torch.int32, device=device
-        ).repeat(_pmla_B),
+        cp_world=8,
+        cp_interleave_size=128,
+        cp_rank=0,
         zero_empty_rows=True,
     )
 

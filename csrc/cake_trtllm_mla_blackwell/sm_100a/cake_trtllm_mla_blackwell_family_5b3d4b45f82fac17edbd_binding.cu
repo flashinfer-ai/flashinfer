@@ -46,7 +46,7 @@
 #define CAKE_STR_(x) #x
 #define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k_nope, const __grid_constant__ CUtensorMap tmap_k_rope, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ O, int* __restrict__ seq_lens_kv, int* __restrict__ page_table, float* __restrict__ sinks, float softmax_scale_log2, float bmm2_scale, int total_work_items, int value_split_count, int max_pages_per_seq, int enable_sink);
+extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k_nope, const __grid_constant__ CUtensorMap tmap_k_rope, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ O, int* __restrict__ seq_lens_kv, int* __restrict__ page_table, float* __restrict__ sinks, float softmax_scale_log2, float bmm2_scale, int total_work_items, int value_split_count, int max_pages_per_seq, int enable_sink, int* __restrict__ row_batches, int* __restrict__ row_seq_lens, int q_len, int page_shift);
 
 namespace CAKE_PROGRAM_SHIM {
 
@@ -308,7 +308,7 @@ inline CUtensorMap EncodeTma_tmap_v(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_k_rope, TensorView arg_tmap_v, TensorView arg_O, TensorView arg_seq_lens_kv, TensorView arg_page_table, TensorView arg_sinks, double arg_softmax_scale_log2, double arg_bmm2_scale, int64_t arg_total_work_items, int64_t arg_value_split_count, int64_t arg_max_pages_per_seq, int64_t arg_enable_sink, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
+void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_k_rope, TensorView arg_tmap_v, TensorView arg_O, TensorView arg_seq_lens_kv, TensorView arg_page_table, TensorView arg_sinks, double arg_softmax_scale_log2, double arg_bmm2_scale, int64_t arg_total_work_items, int64_t arg_value_split_count, int64_t arg_max_pages_per_seq, int64_t arg_enable_sink, TensorView arg_row_batches, TensorView arg_row_seq_lens, int64_t arg_use_row_plan, int64_t arg_q_len, int64_t arg_page_shift, int64_t grid_x, int64_t grid_y, int64_t grid_z, cudaStream_t stream) {
   DLDevice dev = arg_tmap_q.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   {
@@ -342,6 +342,12 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   check_cuda_tensor(arg_sinks, "sinks");
   check_dtype(arg_sinks, DLDataType{kDLFloat, 32, 1}, "sinks");
   check_contiguous(arg_sinks, "sinks");
+  check_cuda_tensor(arg_row_batches, "row_batches");
+  check_dtype(arg_row_batches, DLDataType{kDLInt, 32, 1}, "row_batches");
+  check_contiguous(arg_row_batches, "row_batches");
+  check_cuda_tensor(arg_row_seq_lens, "row_seq_lens");
+  check_dtype(arg_row_seq_lens, DLDataType{kDLInt, 32, 1}, "row_seq_lens");
+  check_contiguous(arg_row_seq_lens, "row_seq_lens");
   TVM_FFI_CHECK(arg_total_work_items >= -2147483648LL && arg_total_work_items <= 2147483647LL, ValueError)
       << "scalar 'total_work_items' value " << arg_total_work_items
       << " is outside i32 range [-2147483648, 2147483647]";
@@ -354,6 +360,12 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   TVM_FFI_CHECK(arg_enable_sink >= -2147483648LL && arg_enable_sink <= 2147483647LL, ValueError)
       << "scalar 'enable_sink' value " << arg_enable_sink
       << " is outside i32 range [-2147483648, 2147483647]";
+  // The kernel divides the row index by q_len and shifts caller page ids by
+  // page_shift (0: page 32, 1: page 64).
+  TVM_FFI_CHECK(arg_q_len >= 1 && arg_q_len <= 2147483647LL, ValueError)
+      << "scalar 'q_len' value " << arg_q_len << " must be a positive i32";
+  TVM_FFI_CHECK(arg_page_shift == 0 || arg_page_shift == 1, ValueError)
+      << "scalar 'page_shift' value " << arg_page_shift << " must be 0 or 1";
   check_same_device(arg_tmap_k_nope, arg_tmap_q, "tmap_k_nope", "tmap_q");
   check_same_device(arg_tmap_k_rope, arg_tmap_q, "tmap_k_rope", "tmap_q");
   check_same_device(arg_tmap_v, arg_tmap_q, "tmap_v", "tmap_q");
@@ -361,6 +373,8 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   check_same_device(arg_seq_lens_kv, arg_tmap_q, "seq_lens_kv", "tmap_q");
   check_same_device(arg_page_table, arg_tmap_q, "page_table", "tmap_q");
   check_same_device(arg_sinks, arg_tmap_q, "sinks", "tmap_q");
+  check_same_device(arg_row_batches, arg_tmap_q, "row_batches", "tmap_q");
+  check_same_device(arg_row_seq_lens, arg_tmap_q, "row_seq_lens", "tmap_q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
@@ -383,10 +397,16 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   int32_t v_value_split_count = (int32_t)arg_value_split_count;
   int32_t v_max_pages_per_seq = (int32_t)arg_max_pages_per_seq;
   int32_t v_enable_sink = (int32_t)arg_enable_sink;
-  void* kargs[] = {&p_tmap_q, &p_tmap_k_nope, &p_tmap_k_rope, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink};
+  // Planned rows (ragged queries) iff use_row_plan; null pointers select the rows
+  // derived from seq_lens_kv and q_len on the device.
+  int* p_row_batches = arg_use_row_plan != 0 ? static_cast<int*>(arg_row_batches.data_ptr()) : nullptr;
+  int* p_row_seq_lens = arg_use_row_plan != 0 ? static_cast<int*>(arg_row_seq_lens.data_ptr()) : nullptr;
+  int32_t v_q_len = (int32_t)arg_q_len;
+  int32_t v_page_shift = (int32_t)arg_page_shift;
+  void* kargs[] = {&p_tmap_q, &p_tmap_k_nope, &p_tmap_k_rope, &p_tmap_v, &p_O, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_total_work_items, &v_value_split_count, &v_max_pages_per_seq, &v_enable_sink, &p_row_batches, &p_row_seq_lens, &v_q_len, &v_page_shift};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0), 231424);
+      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4), 231424);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(384u, 1u, 1u);
@@ -410,20 +430,22 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0 failed: "
+      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_9836e82803b347d1e9e4 failed: "
       << cudaGetErrorString(launch_status);
 }
 }  // namespace CAKE_VARIANT_NS
 
-void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages, tvm::ffi::TensorView arg_output, tvm::ffi::TensorView arg_seq_lens, tvm::ffi::TensorView arg_page_table, tvm::ffi::TensorView arg_sinks, float softmax_scale_log2, float bmm2_scale, int32_t total_work_items, int32_t value_split_count, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t grid_z, int64_t cuda_stream_ptr) {
+void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages, tvm::ffi::TensorView arg_output, tvm::ffi::TensorView arg_seq_lens, tvm::ffi::TensorView arg_page_table, tvm::ffi::TensorView arg_sinks, float softmax_scale_log2, float bmm2_scale, int32_t total_work_items, int32_t value_split_count, int32_t max_pages_per_seq, int32_t enable_sink, int32_t grid_x, int32_t grid_z, tvm::ffi::TensorView arg_row_batches, tvm::ffi::TensorView arg_row_seq_lens, int32_t use_row_plan, int32_t q_len, int32_t page_shift, int64_t cuda_stream_ptr) {
   check_cuda_tensor(arg_q_rows, "q_rows");
   check_cuda_tensor(arg_kv_pages, "kv_pages");
   check_cuda_tensor(arg_output, "output");
   check_cuda_tensor(arg_seq_lens, "seq_lens");
   check_cuda_tensor(arg_page_table, "page_table");
   check_cuda_tensor(arg_sinks, "sinks");
+  check_cuda_tensor(arg_row_batches, "row_batches");
+  check_cuda_tensor(arg_row_seq_lens, "row_seq_lens");
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream_ptr));
   if (!(((total_work_items > 0) && (grid_x > 0)) && (grid_z > 0))) {
     TVM_FFI_CHECK(false, ValueError) << "no dispatch route for " CAKE_STR(CAKE_FAMILY_NAME) " shape (softmax_scale_log2=" << softmax_scale_log2 << ", bmm2_scale=" << bmm2_scale << ", total_work_items=" << total_work_items << ", value_split_count=" << value_split_count << ", max_pages_per_seq=" << max_pages_per_seq << ", enable_sink=" << enable_sink << ", grid_x=" << grid_x << ", grid_z=" << grid_z << ")";
@@ -432,7 +454,7 @@ void Dispatch(tvm::ffi::TensorView arg_q_rows, tvm::ffi::TensorView arg_kv_pages
     int64_t gx = grid_x;
     int64_t gy = 1;
     int64_t gz = grid_z;
-    CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, gx, gy, gz, stream);
+    CAKE_PROGRAM_SHIM::CAKE_VARIANT_NS::Run(arg_q_rows, arg_kv_pages, arg_kv_pages, arg_kv_pages, arg_output, arg_seq_lens, arg_page_table, arg_sinks, softmax_scale_log2, bmm2_scale, total_work_items, value_split_count, max_pages_per_seq, enable_sink, arg_row_batches, arg_row_seq_lens, use_row_plan, q_len, page_shift, gx, gy, gz, stream);
   }
 }
 

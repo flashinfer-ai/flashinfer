@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -47,6 +47,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
+#ifndef CAKE_U128_T_DECLARED
+#define CAKE_U128_T_DECLARED
+#if defined(_MSC_VER)
+struct __align__(16) cake_u128_t { unsigned int x, y, z, w; };
+#else
+typedef unsigned __int128 cake_u128_t;
+#endif
+#endif
 #define CAKE_INF CUDART_INF_F
 #define SMEM_REDUCE_SCRATCH_OFF 0
 #define SMEM_REDUCE_SCRATCH_STAGE_BYTES 128
@@ -344,7 +352,7 @@ kernel_cake_kimi_k3_tp12_tail_17117e251598ef1a38ad(__nv_bfloat16* __restrict__ r
         unsigned int boundary = (clear[stage] + 15) / 16;
         for (unsigned int packed = thread; packed < boundary; packed += threads) {
             {
-                auto _gst_12 = reinterpret_cast<unsigned __int128*>(bytes_base + stage_offset) + packed;
+                auto _gst_12 = reinterpret_cast<cake_u128_t*>(bytes_base + stage_offset) + packed;
                 __builtin_assume(__isGlobal(_gst_12));
                 reinterpret_cast<int4*>(_gst_12)[0] = reinterpret_cast<int4*>(sentinel)[0];
             }

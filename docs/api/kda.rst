@@ -216,6 +216,11 @@ of the open 16-token chunk. The contract (fp32 pool addressed by
 ``ssm_state_indices``, chunked prefill cut at multiples of 16 tokens, the
 supported arguments, CUDA graphs) is in ``flashinfer/batch_invariant/README.md``;
 ``flashinfer.batch_invariant.fingerprint("recurrent_kda")`` names the class.
+Without ``initial_state`` the call is stateless (a trainer's forward pass):
+whole sequences from the zero state, the same rows, no state kept and no
+``grad_fn``. With ``checkpoint_every_n_tokens=16`` it also returns the state
+before every 16-token chunk (``state_checkpoints``), the series a backward
+such as the cuDNN frontend's KDA backward reads.
 
 .. _apikda_decode:
 
