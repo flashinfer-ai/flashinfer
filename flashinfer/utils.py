@@ -1418,6 +1418,9 @@ def backend_requirement(
     common_check: Optional[Callable] = None,
     heuristic_func: Optional[Callable] = None,
     bypass: Optional[Callable[..., bool]] = None,
+    *,
+    call_check: Optional[Callable] = None,
+    validate_on_call: bool = True,
 ) -> Callable:
     """
     Decorator to enforce backend and problem size requirements for kernel functions.
@@ -1457,6 +1460,17 @@ def backend_requirement(
         The predicate runs on every call, so keep it a cheap keyword lookup. It gets the call's arguments as passed
         (no defaults applied, positional arguments not bound to names), so key it on a keyword-only parameter: a
         positional-or-keyword flag passed by position would silently never bypass.
+    call_check : callable, optional
+        Complete call validator accepting the decorated function's arguments with
+        defaults applied. It returns None or raises, and owns all routing and input
+        requirements, including CPU paths. It cannot be combined with
+        common_check or heuristic_func, whose validation it replaces.
+    validate_on_call : bool, optional
+        Defaults to True. If False, return the original callable with the query
+        methods attached, without an execution wrapper or a new skip_check keyword.
+        Call validate_call explicitly to check inputs before execution.
+        Cannot be combined with heuristic_func, bypass or experimental backends,
+        whose execution policies require the wrapper.
 
     Returns
     -------
@@ -1482,6 +1496,12 @@ def backend_requirement(
     is_compute_capability_supported : callable
         Method with signature `is_compute_capability_supported(cc)` that returns True
         if any backend supports the given compute capability.
+    validate_call : callable
+        Validate the same call arguments without executing the function. Returns
+        None or raises. Wrapped APIs ignore skip_check here and still validate;
+        manual mode follows the original signature, without an added keyword.
+        A bypassed mode without a complete call_check raises NotImplementedError:
+        its validation belongs to that mode, not the generic backend checks.
 
     Keyword Arguments Added to Decorated Function
     ---------------------------------------------
@@ -1539,6 +1559,17 @@ def backend_requirement(
       provide fine-grained control over backend and architecture support.
     """
 
+    if call_check is not None and (
+        common_check is not None or heuristic_func is not None
+    ):
+        raise ValueError(
+            "call_check cannot be combined with common_check or heuristic_func"
+        )
+    if not validate_on_call and (heuristic_func is not None or bypass is not None):
+        raise ValueError(
+            "validate_on_call=False cannot be combined with heuristic_func or bypass"
+        )
+
     def decorator(func):
         # Get the function signature once for reuse
         sig = inspect.signature(func)
@@ -1553,6 +1584,10 @@ def backend_requirement(
             for name, checker in backend_checks.items()
             if getattr(checker, "is_experimental", False)
         )
+        if not validate_on_call and experimental_backends:
+            raise ValueError(
+                "validate_on_call=False cannot be combined with experimental backends"
+            )
         for name, checker in backend_checks.items():
             module = getattr(checker, "__module__", "") or ""
             if (
@@ -1689,80 +1724,84 @@ def backend_requirement(
                 capability = major * 10 + minor
             return capability
 
-        # @brief: Wrapper function that calls the orignal, decorated function, after applying a number of checks.
-        # @note that here we manually apply defaults to the arguments in the wrapper function when doing validation.
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # skip_check is an optional argument that the decorator adds to any API function.
-            # It prevents the performance overhead of checking.
-            skip_check = kwargs.pop("skip_check", False)
+        def _validate(args, kwargs, kwargs_with_defaults):
+            if call_check is not None:
+                call_check(**kwargs_with_defaults)
+                return
 
-            if bypass is not None and bypass(*args, **kwargs):
-                # A mode the function validates and dispatches itself: no backend selection here.
-                return func(*args, **kwargs)
+            backend = kwargs_with_defaults.get("backend")
+            capability = _get_capability(*args, **kwargs)
+            if not has_backend_choices() and common_check is None:
+                raise ValueError(
+                    f"Invalid @backend_requirement decorator usage: no backend choices and no common_check for {func.__name__}"
+                )
 
-            if not skip_check:
-                # Apply defaults from the function signature for validation
-                # This ensures that all parameters (including backend) have their default values
-                # if not explicitly provided by the caller
-                kwargs_with_defaults = bind_with_defaults(args, kwargs)
-                backend = kwargs_with_defaults.get("backend")
-                capability = _get_capability(*args, **kwargs)
-                if not has_backend_choices() and common_check is None:
-                    raise ValueError(
-                        f"Invalid @backend_requirement decorator usage: no backend choices and no common_check for {func.__name__}"
-                    )
-
-                if has_backend_choices():
-                    if backend == "auto":
-                        if not suitable_auto_backends(
-                            capability, **kwargs_with_defaults
-                        ):
-                            dropped = wrapper.dropped_experimental_backends
-                            hint = (
-                                f" (experimental backend(s) {sorted(dropped)} were "
-                                f"excluded from automatic selection; set "
-                                f"FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1 to "
-                                f"include them, or pass backend= explicitly)"
-                                if dropped
-                                else ""
-                            )
-                            raise BackendSupportedError(
-                                f"No suitable auto backends found for {func.__name__}{hint}"
-                            )
-                    else:
-                        if not is_backend_supported(backend, capability):
-                            extra = (
-                                f" with capability {capability}" if capability else ""
-                            )
-                            raise BackendSupportedError(
-                                f"{func.__name__} does not support backend '{backend}'{extra}"
-                            )
-                        if not _is_problem_size_supported(**kwargs_with_defaults):
-                            raise ValueError(
-                                f"Problem size is not supported for {func.__name__}"
-                            )
-                        if backend in experimental_backends:
-                            # Explicit selection is the opt-in; just make it visible.
-                            warn_experimental_backend_once(func.__name__, backend)
-                else:
-                    # If the function doesnt have backends (i.e., there is only 1, implicit backend), run the following checks.
-                    if not is_compute_capability_supported(capability):
-                        _ccs = getattr(common_check, "_supported_ccs", None)
-                        _supported = (
-                            f"; supported compute capabilities: {sorted(_ccs)}"
-                            if _ccs
+            if has_backend_choices():
+                if backend == "auto":
+                    if not suitable_auto_backends(capability, **kwargs_with_defaults):
+                        dropped = wrapper.dropped_experimental_backends
+                        hint = (
+                            f" (experimental backend(s) {sorted(dropped)} were "
+                            f"excluded from automatic selection; set "
+                            f"FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1 to "
+                            f"include them, or pass backend= explicitly)"
+                            if dropped
                             else ""
                         )
                         raise BackendSupportedError(
-                            f"{func.__name__} does not support compute capability "
-                            f"{capability}{_supported}"
+                            f"No suitable auto backends found for {func.__name__}{hint}"
+                        )
+                else:
+                    if not is_backend_supported(backend, capability):
+                        extra = f" with capability {capability}" if capability else ""
+                        raise BackendSupportedError(
+                            f"{func.__name__} does not support backend '{backend}'{extra}"
                         )
                     if not _is_problem_size_supported(**kwargs_with_defaults):
                         raise ValueError(
                             f"Problem size is not supported for {func.__name__}"
                         )
-            elif skip_check:
+                    if backend in experimental_backends:
+                        warn_experimental_backend_once(func.__name__, backend)
+            else:
+                if not is_compute_capability_supported(capability):
+                    _ccs = getattr(common_check, "_supported_ccs", None)
+                    _supported = (
+                        f"; supported compute capabilities: {sorted(_ccs)}"
+                        if _ccs
+                        else ""
+                    )
+                    raise BackendSupportedError(
+                        f"{func.__name__} does not support compute capability "
+                        f"{capability}{_supported}"
+                    )
+                if not _is_problem_size_supported(**kwargs_with_defaults):
+                    raise ValueError(
+                        f"Problem size is not supported for {func.__name__}"
+                    )
+
+        @functools.wraps(func)
+        def validate_call(*args, **kwargs):
+            # Explicit validation cannot be disabled by the execution-only flag.
+            if validate_on_call:
+                kwargs.pop("skip_check", None)
+            kwargs_with_defaults = bind_with_defaults(args, kwargs)
+            if call_check is None and bypass is not None and bypass(*args, **kwargs):
+                raise NotImplementedError(
+                    f"{func.__name__}.validate_call is not available for this bypassed "
+                    "mode; the mode owns input validation"
+                )
+            return _validate(args, kwargs, kwargs_with_defaults)
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            skip_check = kwargs.pop("skip_check", False)
+            if bypass is not None and bypass(*args, **kwargs):
+                # A mode the function validates and dispatches itself: no backend selection here.
+                return func(*args, **kwargs)
+            if not skip_check:
+                _validate(args, kwargs, bind_with_defaults(args, kwargs))
+            elif call_check is None:
                 backend = kwargs.get("backend")
                 if backend == "auto" and heuristic_func is not None:
                     # This needs to be called for heuristic function
@@ -1773,6 +1812,9 @@ def backend_requirement(
 
             return func(*args, **kwargs)
 
+        if not validate_on_call:
+            wrapper = func
+        wrapper.validate_call = validate_call
         wrapper.is_backend_supported = is_backend_supported
         wrapper.is_compute_capability_supported = is_compute_capability_supported
         wrapper.has_backend = has_backend
