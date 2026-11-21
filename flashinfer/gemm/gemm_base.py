@@ -11564,6 +11564,25 @@ def _cutlass_gemm_fp8_nt_groupwise_requirement(
     if scale_major_mode is None:
         raise ValueError("scale_major_mode is required in CUTLASS")
 
+    if is_sm12x_supported(a.device):
+        m_g, n_g, k_g = scale_granularity_mnk
+        if m_g not in (1, 128) or (n_g, k_g) != (128, 128):
+            raise ValueError(
+                "SM12x CUTLASS requires scale_granularity_mnk=(1, 128, 128) "
+                f"or (128, 128, 128), got {scale_granularity_mnk}"
+            )
+        m, n = a.shape[0], b.shape[0]
+        if m % m_g:
+            raise ValueError(
+                f"M must be a multiple of {m_g} for scale granularity "
+                f"{scale_granularity_mnk} on SM12x CUTLASS, got M={m}"
+            )
+        if n % n_g:
+            raise ValueError(
+                f"N must be a multiple of {n_g} for scale granularity "
+                f"{scale_granularity_mnk} on SM12x CUTLASS, got N={n}"
+            )
+
     return True
 
 
