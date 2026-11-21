@@ -65,6 +65,9 @@ class TemperatureOp(ParameterizedOp):
 
         if maybe_temperature_arr is not None:
             temperature = maybe_temperature_arr
+            # Broadcast per-batch temperatures along each vocabulary row.
+            if temperature.ndim == 1:
+                temperature = temperature.unsqueeze(-1)
         else:
             temperature = temperature_val
 
