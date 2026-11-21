@@ -41,6 +41,7 @@
 #include <limits>
 
 #include "flashinfer/comm/pcie_ipc_common.cuh"
+#include "pcie_ipc_spin_guard.cuh"
 
 namespace flashinfer {
 namespace comm {
@@ -265,7 +266,9 @@ __device__ __forceinline__ void block_all_rank_barrier(const KernelParams& param
                                     generation);
       const uint32_t* local_flag =
           self + params.flag_base_word + barrier_record(params, flag_slot, blockIdx.x, peer);
+      SpinGuard spin_guard("block_all_rank_barrier::wait");
       while (ipc::generation_pending(ipc::load_acquire_system_u32(local_flag), generation)) {
+        spin_guard.tick(peer);
       }
     }
   }
@@ -292,7 +295,9 @@ __device__ __forceinline__ void block_peer_barrier(const KernelParams& params, i
         generation);
     const uint32_t* local_flag =
         self + params.flag_base_word + barrier_record(params, flag_slot, blockIdx.x, peer);
+    SpinGuard spin_guard("block_peer_barrier::wait");
     while (ipc::generation_pending(ipc::load_acquire_system_u32(local_flag), generation)) {
+      spin_guard.tick(peer);
     }
   }
   __syncthreads();
@@ -323,9 +328,11 @@ __global__ void copy_engine_pair_barrier_kernel(CopyEngineBarrierParams params, 
   uint32_t* remote = copy_engine_signal_base(params, peer);
   ipc::store_release_system_u32(remote + copy_engine_flag_word(params, params.rank, stage),
                                 generation);
+  SpinGuard spin_guard("copy_engine_signal_kernel::wait");
   while (ipc::generation_pending(
       ipc::load_acquire_system_u32(self + copy_engine_flag_word(params, peer, stage)),
       generation)) {
+    spin_guard.tick(peer);
   }
 }
 
@@ -351,10 +358,12 @@ __global__ void copy_engine_retire_kernel(CopyEngineBarrierParams params) {
   __syncthreads();
 
   if (peer < kCopyEngineWorldSize && peer != params.rank) {
+    SpinGuard spin_guard("copy_engine_retire_kernel::wait");
     while (ipc::generation_pending(
         ipc::load_acquire_system_u32(self +
                                      copy_engine_flag_word(params, peer, kCopyEngineRetireStage)),
         generation)) {
+      spin_guard.tick(peer);
     }
   }
 }

@@ -23,6 +23,7 @@ from .core import (
 )
 from .utils import write_if_different
 from . import env as jit_env
+import math
 import os
 import pathlib
 import sys
@@ -267,28 +268,60 @@ def gen_pcie_ipc_comm_debug_module(
     )
 
 
+def _pcie_ipc_spin_timeout_ns() -> int:
+    """Deadline for the PCIe IPC peer-poll loops, from FLASHINFER_PCIE_IPC_TIMEOUT_S.
+
+    Seconds as a non-negative float; 0 or unset means unbounded (today's
+    behavior). The value is baked into the kernels as a compile-time constant
+    (see pcie_ipc_spin_guard.cuh), so it also keys the JIT cache: different
+    values produce different modules, and the default shares a module with the
+    timeout-free build.
+    """
+    raw = os.environ.get("FLASHINFER_PCIE_IPC_TIMEOUT_S", "").strip()
+    if not raw:
+        return 0
+    seconds = float(raw)
+    if seconds < 0.0 or math.isnan(seconds):
+        raise ValueError(
+            f"FLASHINFER_PCIE_IPC_TIMEOUT_S must be >= 0 (seconds), got {raw!r}"
+        )
+    return int(seconds * 1_000_000_000)
+
+
+def _pcie_ipc_spin_cflags(name: str) -> tuple[str, list[str]]:
+    """Module name and extra nvcc flags carrying the spin deadline."""
+    ns = _pcie_ipc_spin_timeout_ns()
+    if ns == 0:
+        return name, []
+    return f"{name}_spin{ns}", [f"-DFLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS={ns}"]
+
+
 def gen_pcie_ipc_comm_module() -> JitSpec:
     # No architecture restriction: the kernels use only plain PTX loads/stores
     # and CUDA IPC, both of which predate every architecture flashinfer builds
     # for. The target is a PCIe machine without NVLink, which is orthogonal to
     # the SM version.
+    name, spin_cflags = _pcie_ipc_spin_cflags("pcie_ipc_comm")
     return gen_jit_spec(
-        "pcie_ipc_comm",
+        name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
         ],
         extra_ldflags=["-lcuda"],
+        extra_cuda_cflags=spin_cflags,
     )
 
 
 def gen_pcie_ipc_ag_rs_module() -> JitSpec:
     """Build the standalone PCIe IPC AllGather and ReduceScatter ops."""
+    name, spin_cflags = _pcie_ipc_spin_cflags("pcie_ipc_ag_rs")
     return gen_jit_spec(
-        "pcie_ipc_ag_rs",
+        name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_gather.cu",
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_reduce_scatter.cu",
         ],
+        extra_cuda_cflags=spin_cflags,
     )
 
 
