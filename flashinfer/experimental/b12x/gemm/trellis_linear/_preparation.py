@@ -44,8 +44,15 @@ def query_from_weight(
     rotated_compute_provided: bool = False,
     gemm_output_f16_provided: bool = False,
     output_f16_provided: bool = False,
+    allow_split_k: bool = False,
 ) -> TrellisQuery:
-    """Describe every fixed dense-Trellis execution semantic before preparation."""
+    """Describe every fixed dense-Trellis execution semantic before preparation.
+
+    ``allow_split_k=True`` lets small-M plans split each output tile's K range
+    across CTAs. That changes the K summation order, so a row's bits can differ
+    from a plan with another ``max_rows``; the default keeps the whole-tile
+    schedule.
+    """
     if not isinstance(weight, PreparedTrellis256DenseWeight):
         raise TypeError("Trellis declarations require PreparedTrellis256DenseWeight")
     pair_kind = weight.trellis_pair_kind
@@ -73,6 +80,7 @@ def query_from_weight(
         rotated_compute_provided=rotated_compute_provided,
         gemm_output_f16_provided=gemm_output_f16_provided,
         output_f16_provided=output_f16_provided,
+        allow_split_k=allow_split_k,
     )
 
 
@@ -107,6 +115,7 @@ def _compile_trellis(query_payload, config_payload, ordinal, sm_count):
                 trellis_pair_kind=query.pair_kind,
                 trellis_rate_axis=query.rate_axis,
                 dense_route_fast_path=True,
+                schedule_whole_tiles=config.split_k_slices is None,
             )
         }
 
@@ -160,6 +169,7 @@ class _TrellisExecutionState:
     hadamard_128: object
     grid_cap: int
     c_tmp_owner: tuple[object, ...] | None
+    split_k_slices: int | None = None
 
     def run(
         self,
@@ -213,6 +223,7 @@ class _TrellisExecutionState:
             gemm_output_f16=gemm_output_f16,
             output_f16=output_f16,
             hadamard_128=self.hadamard_128,
+            split_k_slices=self.split_k_slices,
         )
 
 
@@ -376,6 +387,7 @@ def plan(
             hadamard_128=_resolve_exl3_hadamard_128(hadamard_128),
             grid_cap=device.identity.sm_count * int(programs["gemm"].blocks_per_sm),
             c_tmp_owner=c_tmp_owner,
+            split_k_slices=config.split_k_slices,
         )
 
     return Plan(
