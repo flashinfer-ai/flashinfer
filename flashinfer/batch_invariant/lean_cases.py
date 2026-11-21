@@ -239,6 +239,14 @@ ATTN_CASES = [
         0,
         "e4m3th",
     ),  # two PV slices per tile: the scales of both slices' keys
+    # the low-bit KV classes under the non-causal mode: the same leaves and chains over the request's whole key range (a partial
+    # last tile in each, two chunks merged in a21 / a24; the token-head-scale rows carry the scales of every key of the
+    # request and of no other)
+    ("a21", 64, 16, 32, 5, -1, 0, 0, False, 36, "e4m3"),
+    ("a22", 64, 16, 32, 0, -1, 0, 1, False, 20, "e5m2"),
+    ("a23", 64, 16, 32, 5, -1, 0, 17, False, 20, "nvfp4"),
+    ("a24", 64, 16, 32, 5, -1, 1, 0, False, 36, "e4m3th"),
+    ("a25", 128, 16, 32, 19, -1, 1, 2, False, 20, "e5m2th"),
 ]
 ATTN_HEAD_DIMS = (64, 128, 256)
 
@@ -717,6 +725,8 @@ MODULE_DECIDED_THEOREMS = (
     "Attn.output_depends_on_kv_th_fmt",
     "Attn.output_depends_on_kv_th_bf16",
     "Attn.masked_scales_absent",
+    "Attn.output_depends_on_mode_kv",
+    "Attn.noncausal_scales_are_the_requests",
 )
 
 

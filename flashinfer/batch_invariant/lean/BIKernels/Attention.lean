@@ -436,6 +436,18 @@ theorem masked_scales_absent :
     ((List.range 32).filter (fun k => (sx.splitOn s!"(sfk {k})").length > 1)) = [17, 18, 19, 20]
       ∧ ((List.range 32).filter (fun k => (sx.splitOn s!"(sfvt {k})").length > 1)) = [17, 18, 19, 20] := by native_decide
 
+/-- **The mask mode is a class dimension of every KV format**, and the scales of a non-causal row are its request's: the
+token at position 9 of a request with 12 keys has a different term under the two modes of the fp8-KV class, and a non-causal
+token-head-scale row of a request with 20 keys names the scales of the keys `0..19` whatever its position -- the keys past
+the request's length, which share its last tile, appear without a scale. Decided. -/
+theorem output_depends_on_mode_kv :
+    output ⟨1, 2, 8, 9, -1, 0, 0, true, 12, "e4m3"⟩ ≠ output ⟨1, 2, 8, 9, -1, 0, 0, false, 12, "e4m3"⟩ := by native_decide
+
+theorem noncausal_scales_are_the_requests :
+    let sx := (output ⟨1, 4, 32, 5, -1, 0, 0, false, 20, "e4m3th"⟩).sexpr
+    ((List.range 32).filter (fun k => (sx.splitOn s!"(sfk {k})").length > 1)) = List.range 20
+      ∧ ((List.range 32).filter (fun k => (sx.splitOn s!"(sfvt {k})").length > 1)) = List.range 20 := by native_decide
+
 /-- The visible keys, the tiles and the chunks of a row depend on `(causal, p, win, kvLen, T, C)` only: the page
 table, the batch and the configuration do not appear. -/
 theorem boundaries_absolute (P Q : Params) (hp : P.p = Q.p) (hw : P.win = Q.win) (hT : P.tbits = Q.tbits) (hC : P.C = Q.C)
