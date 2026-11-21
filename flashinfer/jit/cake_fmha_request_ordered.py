@@ -315,6 +315,56 @@ def _file_identity(path: Path) -> dict[str, object]:
     return {"path": str(path), "sha256": digest.hexdigest(), "size_bytes": size}
 
 
+def _loaded_nvrtc_libraries() -> set[Path]:
+    """Return the NVRTC shared libraries mapped into this process."""
+
+    libraries: set[Path] = set()
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetModuleFileNameW.argtypes = [
+            wintypes.HMODULE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+        ]
+        kernel32.GetModuleFileNameW.restype = wintypes.DWORD
+        psapi.EnumProcessModulesEx.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.HMODULE),
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.DWORD,
+        ]
+        psapi.EnumProcessModulesEx.restype = wintypes.BOOL
+        handles = (wintypes.HMODULE * 2048)()
+        needed = wintypes.DWORD()
+        process = kernel32.GetCurrentProcess()
+        if not psapi.EnumProcessModulesEx(
+            process, handles, ctypes.sizeof(handles), ctypes.byref(needed), 0x03
+        ):
+            raise RuntimeError("cannot resolve the loaded NVRTC library")
+        count = min(needed.value // ctypes.sizeof(wintypes.HMODULE), len(handles))
+        buffer = ctypes.create_unicode_buffer(32768)
+        for handle in handles[:count]:
+            if kernel32.GetModuleFileNameW(handle, buffer, len(buffer)):
+                path = Path(buffer.value)
+                if "nvrtc" in path.name.lower():
+                    libraries.add(path.resolve(strict=True))
+        return libraries
+    maps = Path("/proc/self/maps")
+    if not maps.is_file():
+        raise RuntimeError("cannot resolve the loaded NVRTC library")
+    for line in maps.read_text(encoding="utf-8").splitlines():
+        raw = line.rpartition(" ")[2]
+        if "libnvrtc" in Path(raw).name:
+            libraries.add(Path(raw).resolve(strict=True))
+    return libraries
+
+
 @functools.cache
 def _nvrtc_toolchain_identity() -> dict[str, object]:
     from cuda.bindings import nvrtc
@@ -322,14 +372,7 @@ def _nvrtc_toolchain_identity() -> dict[str, object]:
     result, major, minor = nvrtc.nvrtcVersion()
     if not _result_ok(result):
         raise RuntimeError(f"nvrtcVersion failed: {result}")
-    maps = Path("/proc/self/maps")
-    if not maps.is_file():
-        raise RuntimeError("cannot resolve the loaded NVRTC library")
-    libraries: set[Path] = set()
-    for line in maps.read_text(encoding="utf-8").splitlines():
-        raw = line.rpartition(" ")[2]
-        if "libnvrtc" in Path(raw).name:
-            libraries.add(Path(raw).resolve(strict=True))
+    libraries = _loaded_nvrtc_libraries()
     if not libraries:
         raise RuntimeError("cannot resolve the loaded NVRTC library")
     return {
