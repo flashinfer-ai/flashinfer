@@ -5508,7 +5508,12 @@ def _mla_with_kv_cache_impl(
         ``"sparse"``.
         ``"cake"`` explicitly selects the source-level Blackwell semantic
         dispatcher. It covers its qualified BF16/FP8 dense, sparse, compact-Q,
-        sink, LSE, and caller-owned-output envelope. An untuned ``"auto"`` call
+        sink, LSE, and caller-owned-output envelope. Requests its tuned
+        Blackwell programs do not serve (LSE output, FP8 with page size 32
+        outside one exact geometry, FP8 with sinks, head counts other than
+        128, sparse top-k) run a scalar
+        generic tail program that takes milliseconds per call; the first such
+        call per reason logs a warning. An untuned ``"auto"`` call
         never selects it; under ``flashinfer.autotune(True)`` its dense
         Blackwell route can win a uniform-Q ``"auto"`` request (see Autotune
         below). ``"auto"``
@@ -5560,10 +5565,11 @@ def _mla_with_kv_cache_impl(
     return_lse_base : Optional[Literal["basee", "base2"]] = None
         Logarithm base of LSE values, including values written to a supplied
         ``lse`` buffer. Supported by ``trtllm-gen``, ``cute-dsl``, ``sparse`` and
-        the ``cake`` Kimi-K3 FP8 route. ``"basee"`` selects natural-log units and
+        both ``cake`` routes. ``"basee"`` selects natural-log units and
         ``"base2"`` selects base-2 units. ``None`` preserves each backend's
-        historical default: base-2 for ``trtllm-gen`` and ``sparse``, and
-        natural-log for monolithic ``cute-dsl`` and the ``cake`` Kimi-K3 route.
+        historical default: base-2 for ``trtllm-gen``, ``sparse`` and the
+        ``cake`` Blackwell route, and natural-log for monolithic ``cute-dsl``
+        and the ``cake`` Kimi-K3 route.
         Select an explicit base for stable units under
         ``backend="auto"``. This option does not enable LSE output; use
         ``return_lse=True`` to request it. Other values raise
@@ -6533,7 +6539,7 @@ def _mla_with_kv_cache_impl(
             # (below) for everything else in its contract.
             from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
 
-            return trtllm_mla_blackwell_decode(
+            result = trtllm_mla_blackwell_decode(
                 query=query,
                 kv_cache=kv_cache,
                 block_tables=block_tables,
@@ -6559,6 +6565,14 @@ def _mla_with_kv_cache_impl(
                 enable_dcp=enable_dcp,
                 backend="cake",
             )
+            # The Blackwell programs write base-2 LSE (log2 of the softmax
+            # denominator of the bmm1-scaled logits), also into a supplied
+            # ``lse``; natural-log units are converted in place.
+            if return_lse_base == "basee":
+                written = result[1] if return_lse else lse
+                if written is not None:
+                    written.mul_(1.0 / log2e)
+            return result
 
         # Cake-generated Kimi-K3 MLA over the FP8 paged latent cache (SM100 / SM103): dense
         # decode, packed variable-Q / MTP and incremental prefill; BF16 output, caller-owned
