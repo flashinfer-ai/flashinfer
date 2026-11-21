@@ -31,6 +31,7 @@ struct PrefillColdParams {
   flashinfer::uint_fastdiv extra_div;
   float lse_scale = 1.f;
   SparseMlaMegaParams mega{};
+  int num_heads = 0;  // Runtime-head prefill; fixed-head kernels ignore this field.
 };
 
 struct Dsv4PageDivisors {

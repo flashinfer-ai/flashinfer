@@ -47,6 +47,19 @@ PrefillLaunchResult visit_prefill_heads(int heads, F&& call) {
     HEAD(128)
   }
 #undef HEAD
+  // Keep dedicated routes for their existing shapes; the runtime-H
+  // instantiations mask the last head tile.
+  if constexpr (MT == ModelType::DSV3_2) {
+    if constexpr (sg) {
+      if (heads > 0 && heads < 16) return call(std::integral_constant<int, 0>{});
+    }
+    if constexpr (mg) {
+      if (heads > 16 && heads <= DecodeMaxHeads) return call(std::integral_constant<int, 0>{});
+    }
+    if constexpr (swap) {
+      if (heads > 32 && heads <= DecodeMaxHeads) return call(std::integral_constant<int, 0>{});
+    }
+  }
   return false;
 }
 
