@@ -400,6 +400,69 @@ def test_grouped_gemm_nt_masked_output_layout_contract():
         run(torch.zeros(m, n, E, dtype=torch.bfloat16, device=dev), 0x7F)
 
 
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.skipif(
+    torch.cuda.is_available()
+    and not is_cute_dsl_arch_supported(
+        *torch.cuda.get_device_capability(0), native_only=True
+    ),
+    reason="installed CuTe DSL does not support this GPU architecture",
+)
+@pytest.mark.parametrize("cluster_shape_mn", [(2, 1), (1, 2), (2, 2)])
+@pytest.mark.parametrize("is_swap_ab", [False, True])
+def test_grouped_gemm_nt_masked_cluster_shapes(cluster_shape_mn, is_swap_ab):
+    """End-to-end GPU test for grouped_gemm_nt_masked with cluster_shape_mn > (1, 1)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    dev = torch.device("cuda:0")
+    if not (is_sm100a_supported(dev) or is_sm100f_supported(dev)):
+        pytest.skip("NVFP4 grouped GEMM requires SM100")
+
+    sf_vec = 16
+    m, n, k, num_experts = 384, 256, 256, 3
+    k_packed = k // 2
+    num_k_sf_tiles = (k // sf_vec) // 4
+    sfa_shape = (32, 4, m // 128, 4, num_k_sf_tiles, num_experts)
+    sfb_shape = (32, 4, n // 128, 4, num_k_sf_tiles, num_experts)
+
+    torch.manual_seed(0)
+    a = torch.randint(
+        0, 256, (num_experts, m, k_packed), dtype=torch.uint8, device=dev
+    ).permute(1, 2, 0)
+    b = torch.randint(
+        0, 256, (num_experts, n, k_packed), dtype=torch.uint8, device=dev
+    ).permute(1, 2, 0)
+    sfa = torch.ones(sfa_shape, dtype=torch.float8_e4m3fn, device=dev)
+    sfb = torch.ones(sfb_shape, dtype=torch.float8_e4m3fn, device=dev)
+    masked_m = torch.tensor([384, 128, 200], dtype=torch.int32, device=dev)
+
+    def run(cluster):
+        output = torch.zeros((num_experts, m, n), dtype=torch.bfloat16, device=dev)
+        out = output.permute(2, 1, 0) if is_swap_ab else output.permute(1, 2, 0)
+        grouped_gemm_nt_masked(
+            (a, sfa),
+            (b, sfb),
+            out,
+            masked_m,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=sf_vec,
+            mma_tiler_mn=(128, 128),
+            cluster_shape_mn=cluster,
+            is_swap_ab=is_swap_ab,
+        )
+        torch.cuda.synchronize()
+        return output
+
+    ref = run((1, 1))
+    actual = run(cluster_shape_mn)
+    for i, rows in enumerate(masked_m.tolist()):
+        torch.testing.assert_close(actual[i, :rows], ref[i, :rows], atol=0.0, rtol=0.0)
+
+
 if __name__ == "__main__":
     test_blockscaled_gemm_python_interface(
         lm=(1, 1024),
