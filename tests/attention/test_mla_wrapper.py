@@ -974,6 +974,92 @@ def test_planned_cutlass_reuses_plan_owned_empty_lse(monkeypatch):
     assert first_empty_lse is second_empty_lse
 
 
+@pytest.mark.parametrize("page_id", [-1, 2])
+@pytest.mark.parametrize("metadata_form", ["csr", "dense"])
+def test_planned_cutlass_rejects_kv_pool_bounds(monkeypatch, page_id, metadata_form):
+    import flashinfer.mla as mla
+
+    fake_module = _FakeBatchMLAModule()
+    _patch_fake_cutlass_module(monkeypatch, fake_module)
+    wrapper = mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(1024, dtype=torch.uint8), backend="cutlass"
+    )
+    kwargs = _cutlass_plan_kwargs()
+    qptr = torch.tensor([0, 1, 2], dtype=torch.int32)
+    lengths = torch.tensor([63, 64], dtype=torch.int32)
+    if metadata_form == "csr":
+        kwargs["metadata"] = mla.MLAPlanMetadata.csr(
+            qptr, qptr.clone(), torch.tensor([page_id, 0], dtype=torch.int32), lengths
+        )
+    else:
+        kwargs["metadata"] = mla.MLAPlanMetadata.dense(
+            qptr, torch.tensor([[page_id, -9], [0, 999]], dtype=torch.int32), lengths, 1
+        )
+    wrapper.plan(**kwargs)
+    query = torch.empty(2, 128, 576, dtype=torch.bfloat16)
+    cache = torch.empty(2, 64, 576, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="KV cache.*page indices"):
+        wrapper.run(query=query, kv_cache=cache)
+    with pytest.raises(ValueError, match="KV cache.*page indices"):
+        wrapper._planned_backend.get_valid_tactics((query, cache, None), None)
+    assert fake_module.cutlass_calls == []
+
+
+@pytest.mark.parametrize(
+    "wrong_shape,field", [("batch", "batch size"), ("page", "page size")]
+)
+def test_planned_cutlass_checks_geometry_before_pool_extent(
+    monkeypatch, wrong_shape, field
+):
+    import flashinfer.mla as mla
+
+    module = _FakeBatchMLAModule()
+    _patch_fake_cutlass_module(monkeypatch, module)
+    wrapper = mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(1024, dtype=torch.uint8), backend="cutlass"
+    )
+    wrapper.plan(**_cutlass_plan_kwargs())
+    batch = 1 if wrong_shape == "batch" else 2
+    page_size = 32 if wrong_shape == "page" else 64
+    query = torch.empty(batch, 128, 576, dtype=torch.bfloat16)
+    cache = torch.empty(0, page_size, 576, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=field):
+        wrapper.run(query=query, kv_cache=cache)
+    assert not module.cutlass_calls
+
+
+def test_planned_cutlass_owns_metadata_and_preserves_runtime_aliases(monkeypatch):
+    import flashinfer.mla as mla
+
+    fake_module = _FakeBatchMLAModule()
+    _patch_fake_cutlass_module(monkeypatch, fake_module)
+    wrapper = mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(1024, dtype=torch.uint8), backend="cutlass"
+    )
+    kwargs = _cutlass_plan_kwargs()
+    lengths = torch.tensor([63, 64], dtype=torch.int32)
+    table = torch.tensor([[1, -9], [0, 999]], dtype=torch.int32)
+    kwargs["metadata"] = mla.MLAPlanMetadata.dense(
+        torch.tensor([0, 1, 2], dtype=torch.int32), table, lengths, 1
+    )
+    wrapper.plan(**kwargs)
+    table.zero_()
+    lengths.fill_(1)
+    query = torch.empty(2, 128, 576, dtype=torch.bfloat16)
+    cache = torch.empty(2, 64, 576, dtype=torch.bfloat16)
+    wrapper.run(query=query, kv_cache=cache)
+    torch.testing.assert_close(
+        fake_module.cutlass_calls[-1][5], torch.tensor([63, 64], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        fake_module.cutlass_calls[-1][6],
+        torch.tensor([[1, 0], [0, 0]], dtype=torch.int32),
+    )
+    wrapper.run(query=query, kv_cache=cache[:1], kv_len=lengths, page_table=table)
+    assert fake_module.cutlass_calls[-1][5] is lengths
+    assert fake_module.cutlass_calls[-1][6] is table
+
+
 @pytest.mark.parametrize("tensor_name", ["query", "kv_cache", "out"])
 def test_planned_cutlass_rejects_non_contiguous_launch_tensors_before_dispatch(
     monkeypatch, tensor_name
@@ -2297,7 +2383,7 @@ def _make_planned_backend_runtime_case(
         output_dtype=torch.bfloat16,
         enable_pdl=backend in ("trtllm-gen", "xqa"),
         use_sinks=use_sinks,
-        scale_mode="default" if backend == "cutile" else "bmm-scalar",
+        scale_mode="default" if backend in ("cutile", "cutlass") else "bmm-scalar",
     )
     if plan:
         wrapper.plan(**plan_kwargs)
@@ -2333,7 +2419,7 @@ def _make_planned_backend_runtime_case(
 def _run_planned_backend_runtime_case(case):
     scales = (
         {}
-        if case["backend"] == "cutile"
+        if case["backend"] in ("cutile", "cutlass")
         else dict(bmm1_scale=case["bmm1_scale"], bmm2_scale=case["bmm2_scale"])
     )
     result = case["wrapper"].run(
@@ -2351,7 +2437,7 @@ def _direct_planned_backend_runtime_oracle(case):
     import flashinfer
 
     backend = case["backend"]
-    if backend == "cutile":
+    if backend in ("cutile", "cutlass"):
         dim = case["head_dim_ckv"]
         return _cutile_reference(
             (case["query"][..., :dim], case["query"][..., dim:]),
@@ -2507,6 +2593,8 @@ def test_planned_backend_wrapper_matches_direct(backend, dtype, use_sinks):
         ("xqa", "csr"),
         ("cute-dsl-monolithic", "block_tables"),
         ("cute-dsl", "csr"),
+        ("cutlass", "seq_lens"),
+        ("cutlass", "csr"),
     ],
 )
 def test_planned_backend_graph_requires_device_dense_metadata(backend, source):
@@ -2684,7 +2772,7 @@ def test_xqa_planned_integer_scale(scale_name):
 
 @pytest.mark.parametrize(
     "backend",
-    ["trtllm-gen", "xqa", "cute-dsl-monolithic", "cutile"],
+    ["trtllm-gen", "xqa", "cute-dsl-monolithic", "cutile", "cutlass"],
 )
 def test_planned_backend_wrapper_cuda_graph_replay_and_replan_rejection(backend):
     case = _make_planned_backend_runtime_case(
@@ -3945,3 +4033,23 @@ def test_cute_planned_fp8_output_admission(
     else:
         with pytest.raises(_BackendPlanUnsupportedError):
             backend.preflight_plan_from_wrapper(args)
+
+
+def test_cutlass_csr_rejects_partial_dense_metadata(monkeypatch):
+    import flashinfer.mla as mla
+
+    _patch_fake_cutlass_module(monkeypatch, _FakeBatchMLAModule())
+    wrapper = mla.BatchMLAPagedAttentionWrapper(
+        torch.empty(1024, dtype=torch.uint8), backend="cutlass"
+    )
+    ptr = torch.tensor([0, 1], dtype=torch.int32)
+    kwargs = _cutlass_plan_kwargs()
+    kwargs["metadata"] = mla.MLAPlanMetadata(
+        qo_indptr=ptr,
+        kv_indptr=ptr,
+        kv_indices=ptr[:1],
+        kv_len_arr=ptr[1:],
+        cum_seq_lens_q=ptr,
+    )
+    with pytest.raises(ValueError, match="dense metadata form is partial"):
+        wrapper.plan(**kwargs)
