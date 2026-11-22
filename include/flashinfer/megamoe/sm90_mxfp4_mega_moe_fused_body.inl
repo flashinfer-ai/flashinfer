@@ -1252,9 +1252,6 @@ if (warp_idx < kFirstDecodeWarp) {
         scale_a_1_hi = ptx::ld_shared(smem_sfa[stage_idx] + kL2SFAHalfStride + row_offset_r1);
       }
 
-      // NVFP4 UE4M3 weight scales are applied during FP4 -> FP8 smem
-      // expansion, so the WGMMA accumulator only needs activation SF.
-
       if constexpr (!kBlockIsL2) {
         if constexpr (kSwapABRequested) {
           auto run_swap_ab_l1 = [&]<uint32_t N_SWAP>() {

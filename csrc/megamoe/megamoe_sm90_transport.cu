@@ -145,19 +145,26 @@ int64_t megamoe_sm90_transport_alloc_window(int64_t handle, int64_t bytes) {
     TVM_FFI_ICHECK(false) << "ncclCommWindowRegister failed: " << ncclGetErrorString(registered)
                           << " (without GIN every rank must be load/store reachable)";
   }
-  check_cuda(cudaMemset(w.pointer, 0, w.bytes), "cudaMemset(window)");
-  check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(window)");
-  w.peers.assign(static_cast<size_t>(s.world_size), 0);
-  for (int peer = 0; peer < s.world_size; ++peer) {
-    if (peer == s.rank) {
-      w.peers[peer] = reinterpret_cast<int64_t>(w.pointer);
-      continue;
+  try {
+    check_cuda(cudaMemset(w.pointer, 0, w.bytes), "cudaMemset(window)");
+    check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(window)");
+    w.peers.assign(static_cast<size_t>(s.world_size), 0);
+    for (int peer = 0; peer < s.world_size; ++peer) {
+      if (peer == s.rank) {
+        w.peers[peer] = reinterpret_cast<int64_t>(w.pointer);
+        continue;
+      }
+      void* pointer = nullptr;
+      if (ncclGetPeerDevicePointer(w.window, 0, peer, &pointer) == ncclSuccess &&
+          pointer != nullptr)
+        w.peers[peer] = reinterpret_cast<int64_t>(pointer);
     }
-    void* pointer = nullptr;
-    if (ncclGetPeerDevicePointer(w.window, 0, peer, &pointer) == ncclSuccess && pointer != nullptr)
-      w.peers[peer] = reinterpret_cast<int64_t>(pointer);
+    s.windows.push_back(std::move(w));
+  } catch (...) {
+    ncclCommWindowDeregister(s.comm, w.window);
+    ncclMemFree(w.pointer);
+    throw;
   }
-  s.windows.push_back(std::move(w));
   return static_cast<int64_t>(s.windows.size()) - 1;
 }
 

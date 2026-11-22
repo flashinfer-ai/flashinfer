@@ -66,6 +66,7 @@ from .weights import (
 
 __all__ = [
     "MegaMoESymmBuffer",
+    "MegaMoENcclTransport",
     "MegaMoEExpertSlots",
     "nvfp4_mega_moe",
     "mxfp4_mega_moe",

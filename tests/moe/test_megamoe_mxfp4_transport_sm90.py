@@ -22,7 +22,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from benchmarks.megamoe_sm90_utils import make_input, make_weights, resolve_tokens  # noqa: E402
+from tests.moe.megamoe_sm90_utils import make_input, make_weights, resolve_tokens  # noqa: E402
 from tests.moe.test_megamoe_fp4_sm90 import _reference  # noqa: E402
 from tests.moe.test_megamoe_mxfp4_eplb_sm90 import (  # noqa: E402
     BITWISE_REPEAT_MAX_TOKENS,
@@ -98,7 +98,7 @@ def _worker(rank, args):
         args.slots,
     )
     H = E // ep
-    raw, _ = make_weights(rank * H, H, h, ih, 32, args.seed, "cuda")
+    raw = make_weights(rank * H, H, h, ih, args.seed, "cuda")
     ref1, ref2 = (_reference_weights(value) for value in raw)
     w1, w2 = transform_mxfp4_weights_for_mega_moe(*raw, storage=args.weight_storage)
     del raw
@@ -155,11 +155,34 @@ def _worker(rank, args):
         )
 
     for m in args.tokens:
-        (x, sf, idx, routing), _ = make_input(
+        x, sf, idx, routing = make_input(
             m, rank, h, E, topk, args.seed, "cuda", hot=hot
         )
+        if getattr(args, "nonuniform_sf", False):
+            rows = torch.arange(m, device=x.device, dtype=torch.float32)[:, None]
+            chunks = torch.arange(h // 128, device=x.device, dtype=torch.float32)[
+                None, :
+            ]
+            sf = (1 + rank / 16 + rows / 64 + chunks / 256) / 128
+            owner = rank ^ (ep // 2)
+            idx = (
+                owner * H
+                + (
+                    torch.arange(m, device=x.device)[:, None] * topk
+                    + torch.arange(topk, device=x.device)[None, :]
+                )
+                % H
+            )
         expected, counts_logical = _reference(
-            x.float() / 128, idx, routing, ref1, ref2, gs1, gs2, rank, H
+            x.float() * sf.repeat_interleave(128, dim=-1),
+            idx,
+            routing,
+            ref1,
+            ref2,
+            gs1,
+            gs2,
+            rank,
+            H,
         )
 
         if nodes_buffer is not None:
@@ -358,6 +381,28 @@ def test_mxfp4_two_virtual_nodes():
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("SM90 only")
     _run(_namespace(8, nodes=2, nodes_only=True))
+
+
+@pytest.mark.parametrize("hidden,intermediate", [(256, 128), (768, 256)])
+def test_mxfp4_two_virtual_nodes_sf_tail(hidden, intermediate):
+    """Copy nonuniform scale rows through odd remote packed slots without padding."""
+    if torch.cuda.device_count() < 8:
+        pytest.skip("needs 8 GPUs")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 only")
+    _run(
+        _namespace(
+            8,
+            hidden=hidden,
+            intermediate=intermediate,
+            slots=0,
+            capacity=3,
+            tokens=[3],
+            nodes=2,
+            nodes_only=True,
+            nonuniform_sf=True,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -294,6 +294,7 @@ class MegaMoEExpertSlots:
         Takes the output of :func:`transform_mxfp4_weights_for_mega_moe` and
         the optional per-expert global scales (1 when omitted). Collective:
         every redundant slot is emptied and the plan reset to resident-only.
+        All ranks' uploads complete before this method returns.
         """
         H = self.num_resident_experts
         for tensor, view in (
@@ -324,7 +325,7 @@ class MegaMoEExpertSlots:
             self.l2_global_scales[:H].copy_(l2_global_scales)
         self._reset_plan()
         torch.cuda.synchronize()
-        self.group.barrier()
+        self.group.barrier().wait()
 
     def set_replica_plan(
         self,

@@ -506,7 +506,10 @@ struct MegaMoEBuffers {
                               input_sf_buffer.get_end_ptr()),
         input_topk_weights_buffer(Data(topk * sizeof(float), false), 1, capacity,
                                   input_topk_idx_buffer.get_end_ptr()),
-        l1_token_buffer(Data(hidden), 1, pool_tokens, input_topk_weights_buffer.get_end_ptr()),
+        l1_token_buffer(
+            Data(hidden), 1, pool_tokens,
+            reinterpret_cast<void*>(math::align<uint64_t>(
+                reinterpret_cast<uint64_t>(input_topk_weights_buffer.get_end_ptr()), 16))),
         l1_sf_buffer(Data(hidden / 32, false), 1, sf_pool_tokens, l1_token_buffer.get_end_ptr()),
         l1_topk_weights_buffer(Data(sizeof(float), false), 1, pool_tokens,
                                l1_sf_buffer.get_end_ptr()),
@@ -517,7 +520,7 @@ struct MegaMoEBuffers {
                              l2_sf_buffer.get_end_ptr()),
         remote(combine_token_buffer.get_end_ptr(), num_remote_nodes,
                ranks / (num_remote_nodes + 1) * (experts / ranks), capacity, topk, hidden,
-               reinterpret_cast<uint64_t>(input_topk_weights_buffer.get_end_ptr()) -
+               reinterpret_cast<uint64_t>(l1_token_buffer.get_base_ptr()) -
                    reinterpret_cast<uint64_t>(input_token_buffer.get_base_ptr()),
                combine_token_buffer.get_num_bytes()) {}
 };

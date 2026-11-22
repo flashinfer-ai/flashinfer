@@ -52,10 +52,19 @@ const auto remote_pack_tokens = [&](const uint32_t& first_token, const uint32_t&
                 input_token_buffer.get_data_buffer(token_idx).get_base_ptr<uint8_t>();
             comm::copy_16b_warp(out_block + static_cast<uint64_t>(slot) * kHidden, src_row, kHidden,
                                 lane_idx);
-            comm::copy_16b_warp(
-                out_block + sf_block_offset + static_cast<uint64_t>(slot) * kSFBytes,
-                input_sf_buffer.get_data_buffer(token_idx).get_base_ptr<uint8_t>(), kSFBytes,
-                lane_idx);
+            if constexpr (kSFBytes % sizeof(uint4) == 0) {
+              comm::copy_16b_warp(
+                  out_block + sf_block_offset + static_cast<uint64_t>(slot) * kSFBytes,
+                  input_sf_buffer.get_data_buffer(token_idx).get_base_ptr<uint8_t>(), kSFBytes,
+                  lane_idx);
+            } else {
+              auto* dst_sf = reinterpret_cast<uint32_t*>(out_block + sf_block_offset +
+                                                         static_cast<uint64_t>(slot) * kSFBytes);
+              const auto* src_sf =
+                  input_sf_buffer.get_data_buffer(token_idx).get_base_ptr<uint32_t>();
+              for (uint32_t s = lane_idx; s < kSFBytes / sizeof(uint32_t); s += 32)
+                dst_sf[s] = src_sf[s];
+            }
             if (lane_idx < kNumTopk) {
               reinterpret_cast<int64_t*>(out_block + idx_block_offset)[slot * kNumTopk + lane_idx] =
                   __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + token_idx * kNumTopk +

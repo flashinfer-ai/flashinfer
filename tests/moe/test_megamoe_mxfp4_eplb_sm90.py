@@ -8,6 +8,7 @@ import argparse
 import datetime
 import os
 import sys
+import time
 
 import pytest
 import torch
@@ -359,6 +360,69 @@ def test_mxfp4_external_replica_plan(ep):
     if torch.cuda.device_count() < ep or torch.cuda.get_device_capability()[0] != 9:
         pytest.skip(f"requires {ep} Hopper GPUs")
     _run(_namespace(ep))
+
+
+def _resident_copy_patterns(slots, rank):
+    """Create rank-distinct packed weights and global scales."""
+    h = slots.num_resident_experts
+    weights = [
+        torch.full_like(view[:h], 123) for view in (slots.l1_weights, slots.l2_weights)
+    ]
+    for layer, weight in enumerate(weights):
+        weight[..., :8192].fill_((rank + layer + 1) * 17)
+    scales = [
+        torch.full_like(slots.l1_global_scales[:h], rank + 2.0),
+        torch.full_like(slots.l2_global_scales[:h], rank + 10.0),
+    ]
+    return (*weights, *scales)
+
+
+def _resident_install_worker(rank, args):
+    """Copy a peer's newly installed residents without an intervening collective."""
+    _, buffer, slots, *_ = _setup(rank, args, seed=7919, hot_seed=29, num_hot=1)
+    h = slots.num_resident_experts
+    table = torch.zeros((args.ep, 1), dtype=torch.int32)
+    table[0, 0] = h
+    slots.set_replica_plan(table)
+    slots.copy_weights()
+    new_residents = _resident_copy_patterns(slots, rank)
+    expected = _resident_copy_patterns(slots, 1 if rank == 0 else 0)
+    device_table = table.to(device="cuda")
+    copy_list = torch.tensor(
+        [[0, h if rank == 0 else 0]], dtype=torch.int32, device="cuda"
+    )
+    torch.cuda.synchronize()
+    control = dist.new_group(backend="gloo")
+    dist.barrier(group=control)
+    if rank == 0:
+        time.sleep(1)
+    slots.set_resident_weights(*new_residents)
+    # Use the prepared device plan: no CPU read or collective may order this copy.
+    slots.slot_expert.copy_(device_table)
+    slots.copy_list.copy_(copy_list)
+    slots.copy_count.fill_(1)
+    slots.copy_weights()
+    torch.cuda.synchronize()
+    for name, wanted in zip(
+        ("l1_weights", "l2_weights", "l1_global_scales", "l2_global_scales"),
+        expected,
+        strict=True,
+    ):
+        actual = getattr(slots, name)[h : h + 1].view(torch.uint8)
+        assert torch.equal(actual, wanted[:1].view(torch.uint8)), (rank, name)
+    assert slots.copy_count.item() == 0
+    slots.destroy()
+    buffer.destroy()
+    dist.destroy_process_group(control)
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("ep", [4, 8])
+def test_resident_install_waits_for_peers_before_separate_copy(ep):
+    """Check delayed peer installation followed immediately by a separate copy."""
+    if torch.cuda.device_count() < ep or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip(f"requires {ep} Hopper GPUs")
+    _run(_namespace(ep, slots=1, capacity=2), _resident_install_worker)
 
 
 # ---------------------------------------------------------------------------
