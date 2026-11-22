@@ -29,11 +29,10 @@ the max_seq_len 2049 where the listed ranges of B200 and GB300 start):
   max_seq_len KV tiles hold at least 32768 tokens, every other launch unchanged,
   and the binding's caps equal the host's (no GPU needed);
 - more than 32 splits (the wide reducer build), forced at 33, 37, 38, 48 and 64
-  splits and at the counts the rule picks: on live rows the error against FP64 is
-  at most the BF16 naive attention's in maximum absolute and L2 error (median
-  and maximum over three draws), padded rows are exact zeros, and the bits are
-  run-to-run identical, eager and under CUDA-graph replay; 65 splits have no
-  dispatch route.
+  splits and at the counts the rule picks: on live rows accuracy against FP64 at
+  the level of TRTLLM-GEN (as above, three draws), padded rows are exact zeros,
+  and the bits are run-to-run identical, eager and under CUDA-graph replay; 65
+  splits have no dispatch route.
 """
 
 import math
@@ -770,50 +769,6 @@ def test_splitkv_binding_caps_match_the_host():
             assert not flag.startswith("-DCAKE_SPLITKV_NARROW_MAX_SPLIT"), name
 
 
-def _reference_naive_bf16(query, kv_cache, block_tables, seq_lens, sink, bmm2_scale):
-    """The BF16 naive attention of every query row (``_reference_fp64`` in
-    BF16): logits and the softmax in BF16, an FP32 sink kept FP32 by promotion,
-    the probabilities cast to BF16 before the product with V, the output rounded
-    to BF16; returned as FP64, a row without causal KV token is zero."""
-    batch, q_len = query.shape[:2]
-    page_size = kv_cache.shape[-2]
-    dtype = torch.bfloat16
-    kv_flat = kv_cache.reshape(-1, QK_DIM).to(dtype)
-    out = torch.zeros(
-        batch, q_len, NUM_HEADS, LATENT, dtype=torch.float64, device="cuda"
-    )
-    tokens = torch.arange(page_size, device="cuda")
-    lengths = _row_lengths(seq_lens, q_len).tolist()
-    for b in range(batch):
-        longest = max(lengths[b])
-        if longest <= 0:
-            continue
-        pages = block_tables[b, : -(-longest // page_size)].long()
-        keys = kv_flat[(pages[:, None] * page_size + tokens[None, :]).reshape(-1)]
-        keys = keys[:longest]
-        for i in range(q_len):
-            length = lengths[b][i]
-            if length <= 0:
-                continue
-            logits = (query[b, i].to(dtype) @ keys[:length].T) * BMM1
-            if sink is not None:
-                column = sink.float()[:, None]
-                top = torch.maximum(logits.amax(-1, keepdim=True), column)
-                weights = (logits - top).exp()
-                total = weights.sum(-1, keepdim=True) + (column - top).exp()
-                probabilities = (weights / total).to(dtype)
-            else:
-                probabilities = torch.softmax(logits, dim=-1)
-            value = (probabilities @ keys[:length, :LATENT]) * bmm2_scale
-            out[b, i] = value.to(dtype).double()
-    return out
-
-
-def _errors(output, reference):
-    difference = output - reference
-    return float(difference.abs().max()), float(difference.norm())
-
-
 @pytest.fixture
 def forced_split(monkeypatch):
     """Force the split count ``plan_kv_split`` returns to the launch (``None``:
@@ -844,12 +799,12 @@ _WIDE_DRAWS = range(3)
 
 
 def _wide_accuracy(case, label):
-    """Run the cells of ``case`` (``_WIDE_CASES`` layout) and check, over the
-    draws, that the median and the maximum of the Cake error against FP64 are
-    at most the BF16 naive attention's, in maximum absolute and L2 error; padded
-    rows are exact zeros and the default and the stateless mode agree."""
+    """Run the cells of ``case`` (``_WIDE_CASES`` layout) and check every draw as
+    ``test_splitkv_matches_trtllm_gen_and_fp64`` does: on live rows the maximum
+    absolute error against FP64 is within TRTLLM-GEN's plus one BF16 unit of the
+    largest reference value, and within the suite's tolerance; padded rows are
+    exact zeros and the default and the stateless mode agree."""
     batch, q_len, page_size, has_sink, bmm2_scale, pattern, max_seq_len = case
-    cake_errors, naive_errors = [], []
     for seed in _WIDE_DRAWS:
         query, kv_cache, block_tables, seq_lens = _inputs(
             batch, q_len, page_size, max_seq_len, pattern, seed
@@ -882,34 +837,46 @@ def _wide_accuracy(case, label):
         reference = _reference_fp64(
             query, kv_cache, block_tables, seq_lens, sink, bmm2_scale
         )[live]
-        naive = _reference_naive_bf16(
-            query, kv_cache, block_tables, seq_lens, sink, bmm2_scale
-        )[live]
+        trtllm_gen = _trtllm_gen(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            sink=sink,
+            bmm2_scale=bmm2_scale,
+            out=_nan_out(query),
+        )
+        torch.cuda.synchronize()
         cake_live = outputs[0][live].double()
         assert bool(cake_live.isfinite().all()), cell
-        cake_errors.append(_errors(cake_live, reference))
-        naive_errors.append(_errors(naive, reference))
-        within = torch.allclose(cake_live, reference, rtol=TOLERANCE, atol=TOLERANCE)
-        print(
-            f"{cell}: max_abs cake {cake_errors[-1][0]:.3e} naive "
-            f"{naive_errors[-1][0]:.3e} l2 cake {cake_errors[-1][1]:.3e} naive "
-            f"{naive_errors[-1][1]:.3e} within {TOLERANCE} (information): {within}"
+        cake_error = float((cake_live - reference).abs().max())
+        trtllm_gen_error = float((trtllm_gen[live].double() - reference).abs().max())
+        ulp = _bf16_ulp(float(reference.abs().max()))
+        rel_l2 = float(
+            (cake_live - reference).norm() / reference.norm().clamp_min(1e-30)
         )
-    for norm, name in enumerate(("max_abs", "l2")):
-        cake_values = sorted(error[norm] for error in cake_errors)
-        naive_values = sorted(error[norm] for error in naive_errors)
-        middle = len(cake_values) // 2
-        assert cake_values[middle] <= naive_values[middle], (label, name)
-        assert cake_values[-1] <= naive_values[-1], (label, name)
+        print(
+            f"{cell}: max_abs cake {cake_error:.3e} trtllm-gen "
+            f"{trtllm_gen_error:.3e} ulp {ulp:.3e} rel_l2 {rel_l2:.3e}"
+        )
+        assert cake_error <= trtllm_gen_error + ulp, cell
+        torch.testing.assert_close(
+            cake_live.float(),
+            reference.float(),
+            rtol=TOLERANCE,
+            atol=TOLERANCE,
+            msg=lambda message: f"{cell}: {message}",
+        )
 
 
 @pytest.mark.parametrize("num_split", _WIDE_SPLITS)
 @pytest.mark.parametrize("case", sorted(_WIDE_CASES))
-def test_splitkv_wide_split_counts_match_fp64_within_bf16_naive(
+def test_splitkv_wide_split_counts_match_trtllm_gen_and_fp64(
     splitkv_device, splitkv_domains, forced_split, case, num_split
 ):
-    """33 to 64 splits (the wide reducer build), forced: accuracy against FP64
-    within the BF16 naive attention's error, padded rows exact zeros."""
+    """33 to 64 splits (the wide reducer build), forced: accuracy against FP64 at
+    the level of TRTLLM-GEN, padded rows exact zeros."""
     used = forced_split(num_split)
     _wide_accuracy(_WIDE_CASES[case], f"{case} split{num_split}")
     assert used and set(used) == {num_split}
@@ -925,12 +892,12 @@ _WIDE_PLAN_CASES = {
 
 
 @pytest.mark.parametrize("case", sorted(_WIDE_PLAN_CASES))
-def test_splitkv_wide_plan_cases_match_fp64_within_bf16_naive(
+def test_splitkv_wide_plan_cases_match_trtllm_gen_and_fp64(
     splitkv_device, splitkv_domains, forced_split, case
 ):
     """The split counts the rule picks above 32 (64 at one row of KV 65536, 37
-    or 38 at two rows, 52 at one row of KV 33280): accuracy against FP64 within
-    the BF16 naive attention's error."""
+    or 38 at two rows, 52 at one row of KV 33280): accuracy against FP64 at the
+    level of TRTLLM-GEN."""
     batch, q_len, max_seq_len = (
         _WIDE_PLAN_CASES[case][0],
         _WIDE_PLAN_CASES[case][1],
