@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Public SM90 INT4 x FP8 MegaMoE correctness on 2, 4, or 8 Hopper ranks.
 
-Run in its own process, separate from the SM100 kernel imports::
+Run with torchrun::
 
     torchrun --standalone --nproc_per_node=2 -m pytest \
         tests/moe_ep/test_moe_ep_sm90_pull_int4_mega_multirank.py -v

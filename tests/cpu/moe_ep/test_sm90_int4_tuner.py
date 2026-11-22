@@ -15,13 +15,14 @@ import pytest
 
 
 pytestmark = pytest.mark.cpu_only
-_SHIM = "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim"
+_SHIM = "flashinfer.moe_ep.shims.sm90.cutedsl_megamoe"
 _SHAPE = dict(hidden=3072, intermediate=1024, num_experts=256, world_size=2)
 
 
-@pytest.mark.parametrize("check", ["candidates", "cache", "clamp", "auto_lifecycle"])
+@pytest.mark.parametrize(
+    "check", ["candidates", "cache", "clamp", "empty_launch", "auto_lifecycle"]
+)
 def test_int4_tuning_contract(check, tmp_path):
-    # SM90 and SM100 kernel drops have mutually exclusive top-level modules.
     result = subprocess.run(
         [
             sys.executable,
@@ -146,6 +147,43 @@ def _check_clamp(monkeypatch, cache_path):
             resolve(**problem, gate_up_clamp=10.0, activation_clamp=6.0)
 
 
+def _check_empty_launch(monkeypatch, cache_path):
+    import torch
+
+    module = importlib.import_module(_SHIM + ".hopper_int4")
+    config = module.MegaMoEHopperInt4Config(
+        rank=0,
+        world_size=2,
+        num_tokens_per_rank=16,
+        num_topk=2,
+        num_total_experts=4,
+        hidden=128,
+        intermediate=128,
+        in_kernel_fc2_reduce=True,
+    )
+    frontend = module.MegaMoEHopperInt4Frontend(config)
+    output = torch.empty(16, 128, dtype=torch.bfloat16)
+    workspace = SimpleNamespace(
+        _destroyed=False,
+        num_max_tokens=16,
+        hidden=128,
+        output_activation=output,
+        _frontend=frontend,
+    )
+    inputs = object()
+    monkeypatch.setattr(module, "_build_int4_inputs", lambda *args: inputs)
+    run = mock.Mock(return_value=output)
+    monkeypatch.setattr(frontend, "run", run)
+    for y in (None, output[:0]):
+        run.reset_mock()
+        result = module.hopper_int4_mega_moe(y, None, None, workspace, num_tokens=0)
+        run.assert_called_once_with(inputs, num_tokens=None, sync=False)
+        if y is None:
+            assert result.shape == (0, 128)
+        else:
+            assert result is None
+
+
 def _check_auto_lifecycle(monkeypatch, cache_path):
     import torch
 
@@ -164,7 +202,7 @@ def _check_auto_lifecycle(monkeypatch, cache_path):
     backend.bind_ep_bootstrap(
         BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
     )
-    pkg = importlib.import_module(_SHIM.rsplit(".", 1)[0])
+    pkg = importlib.import_module(_SHIM)
     winner = {"mma_tiler_mnk": (256, 32, 128), "group_hint": 132}
     tune = mock.Mock(side_effect=[RuntimeError("sweep failed"), winner])
     launch = mock.Mock()

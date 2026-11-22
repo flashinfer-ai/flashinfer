@@ -13,6 +13,294 @@ import logging
 import pytest
 
 
+@pytest.fixture
+def modern_nccl_ep(fake_nccl_ep):
+    import enum
+
+    from packaging.version import Version
+
+    fake_nccl_ep.get_lib_version = lambda: Version("0.3.0")
+    fake_nccl_ep.HtFlow = enum.IntEnum(
+        "HtFlow", {"AUTO": 0, "PUSH_PULL": 1, "PULL_PUSH": 2}
+    )
+    fake_nccl_ep.MetaExchangePolicy = enum.IntEnum(
+        "MetaExchangePolicy", {"AUTO": 0, "REQUIRE_FUSED": 1, "FORCE_SCAN": 2}
+    )
+    return fake_nccl_ep
+
+
+@pytest.mark.parametrize(
+    "modern,algorithm,policy,message",
+    [
+        (False, "HIGH_THROUGHPUT", None, "EP 0.3"),
+        (True, "LOW_LATENCY", None, "HIGH_THROUGHPUT"),
+        (True, "HIGH_THROUGHPUT", "require_fused", "early received-token"),
+    ],
+)
+def test_eager_ht_admission(
+    fake_nccl_ep, bypass_build_checks, modern, algorithm, policy, message
+):
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        FleetAlgoKnobNcclEpConfig,
+    )
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    if modern:
+        fake_nccl_ep.get_lib_version = lambda: "0.3.0"
+    with pytest.raises(ValueError, match=message):
+        NcclEpFleet(
+            BootstrapConfig(world_size=4, rank=0),
+            _fleet_params(algorithm=EpAlgorithm[algorithm]),
+            [FleetAlgoKnobNcclEpConfig(eager_recv=True, meta_exchange_policy=policy)],
+        )
+    assert fake_nccl_ep._log["groups"] == []
+
+
+def test_eager_ht_requires_boolean():
+    from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
+
+    with pytest.raises(ValueError, match="eager_recv must be a bool"):
+        FleetAlgoKnobNcclEpConfig(eager_recv=1)
+
+
+@pytest.mark.parametrize("hidden", [3072, 3584])
+def test_release_ll_hidden_sizes(modern_nccl_ep, bypass_build_checks, hidden):
+    from flashinfer.moe_ep.config import BootstrapConfig
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    NcclEpFleet(
+        BootstrapConfig(world_size=4, rank=0), _fleet_params(token_hidden_size=hidden)
+    )
+    assert modern_nccl_ep._log["groups"][-1].config.max_token_bytes == hidden * 2
+
+
+@pytest.mark.parametrize("hidden", [3072, 3584])
+def test_legacy_ll_hidden_sizes_remain_guarded(
+    fake_nccl_ep, bypass_build_checks, hidden
+):
+    from flashinfer.moe_ep.config import BootstrapConfig
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    with pytest.raises(ValueError, match="admits the LL sizes"):
+        NcclEpFleet(
+            BootstrapConfig(world_size=4, rank=0),
+            _fleet_params(token_hidden_size=hidden),
+        )
+    assert fake_nccl_ep._log["groups"] == []
+
+
+def test_release_ht_controls_preserve_provider_flow(
+    modern_nccl_ep, bypass_build_checks
+):
+    from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
+    from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    fleet = NcclEpFleet(
+        BootstrapConfig(world_size=4, rank=0),
+        _fleet_params(algorithm=EpAlgorithm.HIGH_THROUGHPUT),
+        [
+            FleetAlgoKnobNcclEpConfig(
+                num_topk=4,
+                max_num_sms=8,
+                dispatch_num_sms=4,
+                combine_num_sms=6,
+                meta_exchange_policy="force_scan",
+            )
+        ],
+    )
+    cfg = fleet.group.config
+    assert (
+        cfg.num_topk,
+        cfg.max_num_sms,
+        cfg.dispatch_num_sms,
+        cfg.combine_num_sms,
+    ) == (4, 8, 4, 6)
+    assert "ht_flow" not in cfg.kwargs
+    assert cfg.meta_exchange_policy == modern_nccl_ep.MetaExchangePolicy.FORCE_SCAN
+
+
+@pytest.mark.parametrize("flow", ["auto", "push_pull", "pull_push"])
+def test_release_ht_flow_selection(modern_nccl_ep, bypass_build_checks, flow):
+    from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
+    from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    fleet = NcclEpFleet(
+        BootstrapConfig(world_size=4, rank=0),
+        _fleet_params(algorithm=EpAlgorithm.HIGH_THROUGHPUT),
+        [FleetAlgoKnobNcclEpConfig(num_topk=4, ht_flow=flow)],
+    )
+    assert fleet.group.config.ht_flow == getattr(modern_nccl_ep.HtFlow, flow.upper())
+
+
+def test_ll_rejects_ht_flow(modern_nccl_ep, bypass_build_checks):
+    from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
+    from flashinfer.moe_ep.config import BootstrapConfig
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    with pytest.raises(ValueError, match="only to HIGH_THROUGHPUT"):
+        NcclEpFleet(
+            BootstrapConfig(world_size=4, rank=0),
+            _fleet_params(),
+            [FleetAlgoKnobNcclEpConfig(ht_flow="pull_push")],
+        )
+    assert modern_nccl_ep._log["groups"] == []
+
+
+def test_ht_flow_rejects_unknown_value():
+    from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
+
+    with pytest.raises(ValueError, match="ht_flow must"):
+        FleetAlgoKnobNcclEpConfig(ht_flow="unknown")
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"dispatch_num_sms": 4},
+        {"combine_num_sms": 4},
+        {"meta_exchange_policy": "auto"},
+        {"ht_flow": "pull_push"},
+    ],
+)
+def test_new_controls_reject_legacy_provider(
+    fake_nccl_ep, bypass_build_checks, options
+):
+    from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
+    from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    with pytest.raises(ValueError, match="requires nccl-extensions 0.2"):
+        NcclEpFleet(
+            BootstrapConfig(world_size=4, rank=0),
+            _fleet_params(algorithm=EpAlgorithm.HIGH_THROUGHPUT),
+            [FleetAlgoKnobNcclEpConfig(**options)],
+        )
+    assert fake_nccl_ep._log["groups"] == []
+
+
+def test_legacy_shared_controls(fake_nccl_ep, bypass_build_checks):
+    from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
+    from flashinfer.moe_ep.config import BootstrapConfig
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    fleet = NcclEpFleet(
+        BootstrapConfig(world_size=4, rank=0),
+        _fleet_params(),
+        [FleetAlgoKnobNcclEpConfig(num_topk=2, max_num_sms=4)],
+    )
+    assert fleet.group.config.num_topk == 2
+    assert fleet.group.config.max_num_sms == 4
+    assert "ht_flow" not in fleet.group.config.kwargs
+
+
+def test_fused_metadata_counter_contract(modern_nccl_ep, bypass_build_checks):
+    import torch
+
+    from flashinfer.moe_ep import (
+        FleetAlgoKnobNcclEpConfig,
+        HandleAlgoKnobNumReceivedTokens,
+    )
+    from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm, HandleParams
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    fleet = NcclEpFleet(
+        BootstrapConfig(world_size=4, rank=0),
+        _fleet_params(algorithm=EpAlgorithm.HIGH_THROUGHPUT),
+        [FleetAlgoKnobNcclEpConfig(num_topk=2, meta_exchange_policy="require_fused")],
+    )
+    with pytest.raises(ValueError, match="received-token counters"):
+        fleet.create_handle(
+            HandleParams(topk_ids=torch.zeros(16, 2, dtype=torch.int64)),
+            [HandleAlgoKnobNumReceivedTokens(torch.zeros(1, dtype=torch.int32))],
+        )
+    assert not fleet._any_handle_created
+    assert modern_nccl_ep._log["handles"] == []
+
+
+def test_group_topk_bound_checked_before_handle(modern_nccl_ep, bypass_build_checks):
+    import torch
+
+    from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
+    from flashinfer.moe_ep.config import BootstrapConfig, HandleParams
+    from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
+
+    fleet = NcclEpFleet(
+        BootstrapConfig(world_size=4, rank=0),
+        _fleet_params(),
+        [FleetAlgoKnobNcclEpConfig(num_topk=1)],
+    )
+    with pytest.raises(ValueError, match="handle top-k exceeds"):
+        fleet.create_handle(
+            HandleParams(topk_ids=torch.zeros(16, 2, dtype=torch.int64))
+        )
+    assert not fleet._any_handle_created
+
+
+def test_mask_update_keeps_host_input_unchanged_until_copy_finishes(
+    fake_nccl_ep, bypass_build_checks, recording_ffi, monkeypatch
+):
+    import torch
+
+    fleet = _ft_fleet()
+    host = torch.empty(4, dtype=torch.int32)
+    monkeypatch.setattr(fleet, "_ft_bufs", lambda: (None, host))
+    trace = []
+
+    class PendingCopy:
+        def record(self, stream):
+            assert stream == 0
+            self.expected = host.clone()
+            trace.append("copy")
+
+        def synchronize(self):
+            assert torch.equal(host, self.expected), "host mask changed during its copy"
+            trace.append("wait")
+
+    monkeypatch.setattr(torch.cuda, "Event", PendingCopy)
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet.torch_stream",
+        lambda stream: stream,
+    )
+    fleet.set_active_mask([1, 0, 1, 1])
+    fleet.set_active_mask([1, 1, 0, 1])
+    assert trace == ["copy", "wait", "copy"]
+    fleet.destroy()
+    assert trace == ["copy", "wait", "copy", "wait"]
+
+
+def test_readmission_requires_a_handle_in_the_replacement_group(
+    fake_nccl_ep, bypass_build_checks, recording_ffi
+):
+    import torch
+
+    from flashinfer.moe_ep.config import BootstrapConfig, HandleParams
+
+    fleet = _ft_fleet()
+    handle = fleet.create_handle(
+        HandleParams(topk_ids=torch.arange(8, dtype=torch.int64).reshape(4, 2))
+    )
+    handle.destroy()
+    fleet.update_topology(BootstrapConfig(world_size=4, rank=0))
+    with pytest.raises(RuntimeError, match="requires at least one handle"):
+        fleet.clear_faults(readmit=True)
+    assert recording_ffi.calls == []
+
+
+@pytest.mark.parametrize(
+    "field", ["num_topk", "max_num_sms", "dispatch_num_sms", "combine_num_sms"]
+)
+@pytest.mark.parametrize("value", [-1, True])
+def test_nccl_group_control_validation(field, value):
+    from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
+
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        FleetAlgoKnobNcclEpConfig(**{field: value})
+
+
 def _fleet_params(**overrides):
     from flashinfer.moe_ep.config import FleetParams
 
@@ -481,3 +769,12 @@ def test_capture_guard_reason_is_per_operation(
             fleet.set_active_mask([1, 1, 0, 1])
         with pytest.raises(RuntimeError, match="consumed on the host"):
             fleet.query_active_mask()
+
+
+def test_build_fixture_preserves_cuda_capture_detection(monkeypatch, request):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    request.getfixturevalue("bypass_build_checks")
+    assert torch.cuda.is_current_stream_capturing()

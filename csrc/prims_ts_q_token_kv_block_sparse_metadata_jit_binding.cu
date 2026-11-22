@@ -36,6 +36,12 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_fixed, PrimsTSQTokenKvBlockSparseMetadataRunFixed);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_packed, PrimsTSQTokenKvBlockSparseMetadataRunPacked);
 
+int64_t PrimsTSQTokenKvBlockSparseWideMetadataSmemBytes(int64_t group_size, int64_t max_seq_len_kv,
+                                                        int64_t sparse_block_size);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(wide_metadata_smem_bytes,
+                              PrimsTSQTokenKvBlockSparseWideMetadataSmemBytes);
+
 void PrimsTSQTokenKvBlockSparseMetadataRunFixedQueryMajor(
     TensorView block_indices, TensorView block_table, Optional<TensorView> token_to_request,
     TensorView query_positions, TensorView q_token_kv_block_sparse_page_indices,

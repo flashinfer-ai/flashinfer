@@ -24,6 +24,7 @@ from .core import (
     JitSpec,
     gen_jit_spec,
 )
+from .cpp_ext import is_windows
 
 xqa_nvcc_flags = [
     "-DNDEBUG=1",
@@ -180,6 +181,22 @@ def gen_xqa_module(
     )
 
 
+def get_xqa_mla_uri(
+    input_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    page_size: int,
+    head_dim: int,
+    head_group_ratio: int,
+    use_sliding_window: bool,
+) -> str:
+    # Windows limits a path to 260 characters and the JIT cache repeats the module
+    # name inside its directory, so the module name is shortened there.
+    # Linux keeps the original name, so existing caches and AOT modules are unchanged.
+    if not is_windows:
+        return f"xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
+    return f"xm{filename_safe_dtype_map[input_dtype]}k{filename_safe_dtype_map[kv_cache_dtype]}p{page_size}h{head_dim}g{head_group_ratio}w{use_sliding_window}"
+
+
 def gen_xqa_module_mla(
     input_dtype: torch.dtype,
     kv_cache_dtype: torch.dtype,
@@ -224,8 +241,17 @@ def gen_xqa_module_mla(
 
     flag_mla_wrapper = ["-DMLA_WRAPPER=1"]
 
+    uri = get_xqa_mla_uri(
+        input_dtype,
+        kv_cache_dtype,
+        page_size,
+        head_dim,
+        head_group_ratio,
+        use_sliding_window,
+    )
+
     return gen_jit_spec(
-        f"xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
+        uri,
         [
             jit_env.FLASHINFER_CSRC_DIR / "xqa/mla_sm120.cu",
             jit_env.FLASHINFER_CSRC_DIR / "xqa/tensorMap.cpp",

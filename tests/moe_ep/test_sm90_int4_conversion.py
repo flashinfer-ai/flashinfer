@@ -22,7 +22,7 @@ def test_int4_conversion_all_positive_bf16_scales():
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.int4_conversion import (
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.int4_conversion import (
         convert_int4x8_to_fp8x8,
     )
 
@@ -123,7 +123,7 @@ def test_int4_scale_layout_coordinates(tile_m, tile_k):
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.int4_conversion import (
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.int4_conversion import (
         make_expanded_offset_view,
         make_expanded_offset_view_k256,
         make_offset_smem_layout,

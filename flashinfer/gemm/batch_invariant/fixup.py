@@ -176,7 +176,7 @@ def get_fixup(
         + ("_bias" if bias else "")
     )
 
-    def compile_fn():
+    def compile_fn(**compile_options):
         sym_m, sym_n = cute.sym_int(64), cute.sym_int(32, divisibility=4)
         w_fake = cute.runtime.make_fake_tensor(
             Float32,
@@ -205,6 +205,7 @@ def get_fixup(
                 Int32(1),
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         if alpha_given:
             alpha_fake = cute.runtime.make_fake_tensor(
@@ -220,6 +221,7 @@ def get_fixup(
                 Int32(1),
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         if scaled:
             sa_fake = cute.runtime.make_fake_tensor(
@@ -239,6 +241,7 @@ def get_fixup(
                 Int32(1),
                 stream_fake,
                 options="--enable-tvm-ffi",
+                **compile_options,
             )
         return cute.compile(
             SplitKFixup(C, out_dt, chain),
@@ -249,6 +252,7 @@ def get_fixup(
             Int32(1),
             stream_fake,
             options="--enable-tvm-ffi",
+            **compile_options,
         )
 
     return jit.build_and_load(MODULE, name, compile_fn)

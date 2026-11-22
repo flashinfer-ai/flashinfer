@@ -14,24 +14,9 @@ import pytest
 
 
 def _pkg():
-    # The SM90 tree shares top-level kernel module names with the SM100
-    # cutedsl_megamoe tree and the shim refuses to mix them in one process
-    # (see shim/_paths.py).  tests/moe_ep/run_tests.sh runs this file in its
-    # own interpreter; an ad-hoc whole-directory pytest run skips it instead.
-    import os
-    import sys
-
-    common = sys.modules.get("common")
-    common_file = getattr(common, "__file__", None) if common is not None else None
-    if (
-        common_file is not None
-        and "pull_style_cutedsl_megakernel" not in os.path.abspath(common_file)
-    ):
-        pytest.skip(
-            "SM100 cutedsl_megamoe kernel tree already imported in this process; "
-            "run tests/moe_ep/test_sm90_pull_fp8_tuner.py in its own interpreter"
-        )
-    from flashinfer.moe_ep.kernel_src.sm90 import pull_style_cutedsl_megakernel
+    from flashinfer.moe_ep.shims.sm90 import (
+        cutedsl_megamoe as pull_style_cutedsl_megakernel,
+    )
 
     return pull_style_cutedsl_megakernel
 
@@ -42,10 +27,12 @@ class TestDefaultKnobs:
     def test_matches_heuristic_table(self, scale_mode, tokens):
         pkg = _pkg()
         pkg.bootstrap_paths()
-        from moe_hopper_fp8.heuristic_config import select_heuristic_config
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_hopper_fp8.heuristic_config import (
+            select_heuristic_config,
+        )
 
         knobs = pkg.default_knobs(tokens, fp8_scale_mode=scale_mode)
-        sel = select_heuristic_config(scale_mode, tokens)
+        sel = select_heuristic_config(scale_mode, tokens, fc2_activation_scale_k=64)
         assert knobs["swap_ab"] == sel.config.swap_ab
         assert knobs["pingpong"] == sel.config.pingpong
         assert knobs["mma_tiler_mnk"] == tuple(sel.config.mma_tiler_mnk)

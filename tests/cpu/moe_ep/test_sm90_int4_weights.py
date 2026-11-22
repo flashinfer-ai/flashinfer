@@ -80,10 +80,8 @@ def test_public_preprocessing_does_not_bootstrap_kernel_tree():
             "from flashinfer.moe_ep import preprocess_sm90_pull_int4_mega_weights; "
             "preprocess_sm90_pull_int4_mega_weights("
             "_pack(), hidden_size=256, intermediate_size=128); "
-            "assert not any(n.startswith('flashinfer.moe_ep.kernel_src.sm90') "
-            "for n in sys.modules); "
-            "assert not any('pull_style_cutedsl_megakernel/src' in p "
-            "for p in sys.path)",
+            "assert not any(n.startswith(('flashinfer.moe_ep.shims.sm90', "
+            "'flashinfer.moe_ep.kernels')) for n in sys.modules)",
         ],
         capture_output=True,
         text=True,

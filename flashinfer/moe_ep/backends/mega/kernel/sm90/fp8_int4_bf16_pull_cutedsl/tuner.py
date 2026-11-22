@@ -36,7 +36,7 @@ def create_tuning_weights(*, local_experts, hidden, intermediate, rank, device, 
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
+    from flashinfer.moe_ep.shims.sm90 import cutedsl_megamoe as pkg
 
     pkg.require_hopper_mxfp4_fused_tuning_device()
     candidates = pkg.hopper_int4_candidates(
@@ -77,6 +77,6 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
 
 
 def run_tuning(args) -> int:
-    from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
+    from flashinfer.moe_ep.shims.sm90 import cutedsl_megamoe as pkg
 
     return _run_tuning(args, tune_one, pkg=pkg)

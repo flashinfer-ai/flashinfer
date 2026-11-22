@@ -13,16 +13,14 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.moe_ep import BootstrapConfig, FleetParams, MoEEpTensors
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
     autotune as native,
     block_scaled,
     knob_cache,
     tuning_protocol,
 )
 from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
-    AutoTuningState,
-)
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_state import AutoTuningState
 
 
 def _stage_for_auto(workspace, num_tokens=4):
@@ -342,7 +340,7 @@ def test_foreign_records_are_filtered_before_kernel_validation(state, monkeypatc
 def test_execution_storage_allocation_preserves_staged_state(
     state, monkeypatch, variant
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import comm
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import comm
 
     workspace = object.__new__(block_scaled.Sm107BlockScaledSymmBuffer)
     workspace.config = dataclasses.replace(
@@ -408,7 +406,7 @@ def test_execution_storage_allocation_preserves_staged_state(
 def test_cli_persists_managed_cache_by_default(state, monkeypatch, tmp_path):
     from flashinfer.moe_ep import tune
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     monkeypatch.setattr(package, "require_sm107_dsl", lambda: None)
@@ -513,7 +511,7 @@ def test_automatic_workspace_returns_to_initial_knobs(
     state, monkeypatch, tmp_path, fallback
 ):
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
     monkeypatch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
@@ -567,7 +565,7 @@ def test_automatic_workspace_returns_to_initial_knobs(
 
 def test_capture_cannot_accept_a_cache_change_without_selection(state, monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
     backend = SimpleNamespace(
@@ -646,7 +644,7 @@ def test_prepared_execution_respects_scoped_and_empty_contexts(
     state, monkeypatch, tmp_path, other_thread
 ):
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
     monkeypatch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
@@ -694,7 +692,7 @@ def test_replay_winner_invalidates_previous_tuning_identity(
 ):
     from flashinfer.autotune_cache import MeasurementPolicy
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
     monkeypatch.setattr(
@@ -995,9 +993,7 @@ def _subgroup_worker(rank, rendezvous):
                     ep_world_size=2,
                     ep_comm_group=group,
                 )
-                from flashinfer.moe_ep.kernel_src.sm107 import (
-                    next_cutedsl_megamoe as package,
-                )
+                from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
                 patch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
                 from flashinfer.moe_ep.backends.mega.kernel.sm107.forward_tuning import (

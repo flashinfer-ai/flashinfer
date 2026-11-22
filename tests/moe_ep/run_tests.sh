@@ -321,11 +321,7 @@ run_oracle() {
 # Single-GPU Hopper torch-oracle correctness: sm90 pull FP8 + BF16 mega kernels
 # (sm90_fp8_fp8_bf16_pull_cutedsl, sm90_bf16_bf16_bf16_pull_cutedsl) vs the
 # kernel drop's own pure-torch references (compute_megamoe_reference_fp8/_bf16).
-# Runs in its OWN pytest process: the SM90 and SM100 kernel trees share
-# top-level module names and are mutually exclusive per process, so these files
-# are excluded from run_unit and must not share an invocation with
-# SM100-importing tests.  MEGA_NO_DIST=1 single-rank (the sm90 shim's comm
-# bootstrap supports it, like the sm100 cutedsl oracle runs above).
+# Run separately from run_unit with MEGA_NO_DIST=1 for single-rank execution.
 run_oracle_sm90() {
   MEGA_NO_DIST=1 "${PY}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
@@ -434,12 +430,8 @@ run_oracle_sm107() {
 }
 
 # 4-GPU Hopper sm90 pull FP8 + BF16 mega multirank (layer-vs-direct-shim parity
-# on real cross-rank EP traffic).  Own torchrun pytest process: the SM90 and
-# SM100 kernel trees share top-level module names and are mutually exclusive
-# per process, so this must not share an invocation with the Blackwell mega
-# tests above (and is excluded from run_unit).  FP8 and BF16 run as separate
-# invocations so a failure (or a poisoned NVSHMEM session) in one cannot mask
-# the other.
+# on real cross-rank EP traffic). FP8 and BF16 use separate torchrun pytest
+# invocations so each owns its NVSHMEM session.
 run_mega_sm90() {
   local rc=0
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
@@ -515,9 +507,7 @@ run_sm90_bf16_push_cake() {
 }
 
 # 4-GPU Blackwell-consumer sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank.
-# Own torchrun pytest process for the same reason as run_mega_sm90: the
-# SM120 kernel tree shares top-level module names with the SM100/SM90 trees
-# and is mutually exclusive per process (and is excluded from run_unit).
+# Run in its own torchrun pytest process with an independent NVSHMEM session.
 run_mega_sm120() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \

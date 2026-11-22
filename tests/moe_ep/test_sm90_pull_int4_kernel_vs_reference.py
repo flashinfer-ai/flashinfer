@@ -26,7 +26,7 @@ def _reference(buffer, legs, n, intermediate, clamp):
     )
 
     from tests.moe_ep._sm90_fp8_wgmma_reference import fma_add, rs_k32_mm
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
         _swiglu_pair_hw_match_cuda,
     )
 
@@ -77,7 +77,7 @@ def test_int4_full_moe_reference_reuse_and_graph(monkeypatch, tile, hidden):
     if not torch.cuda.is_available() or not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("requires SM90 and CUDA 12.3+")
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    import flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel as pkg
+    import flashinfer.moe_ep.shims.sm90.cutedsl_megamoe as pkg
     from flashinfer.moe_ep import (
         MoEWeightPack,
         preprocess_sm90_pull_int4_mega_weights,

@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -259,6 +259,22 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
     #define q_full_addr (mbar_base + 0)
     #define q_empty_addr (mbar_base + 16)
     #define kv_full_addr (mbar_base + 32)
+#if __CUDA_ARCH__ == 1030
+    #define kv_empty_addr (mbar_base + 96)
+    #define s_full_addr (mbar_base + 160)
+    #define p_full_addr (mbar_base + 176)
+    #define pv_done_addr (mbar_base + 208)
+    #define corr_sig_addr (mbar_base + 224)
+    #define corr_done_addr (mbar_base + 240)
+    #define o_full_addr (mbar_base + 256)
+    #define tile_done_addr (mbar_base + 264)
+    #define xfer_addr (mbar_base + 272)
+    #define s_empty_addr (mbar_base + 280)
+    #define meta_full_addr (mbar_base + 296)
+    #define meta_empty_addr (mbar_base + 312)
+    #define step_full_addr (mbar_base + 328)
+    #define step_empty_addr (mbar_base + 392)
+#else
     #define kv_empty_addr (mbar_base + 80)
     #define s_full_addr (mbar_base + 128)
     #define p_full_addr (mbar_base + 144)
@@ -273,6 +289,7 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
     #define meta_empty_addr (mbar_base + 280)
     #define step_full_addr (mbar_base + 296)
     #define step_empty_addr (mbar_base + 360)
+#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -290,6 +307,26 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
     const int kv_smem_addr = smem + 17408;
     uint8_t* v_smem = reinterpret_cast<uint8_t*>(smem_raw + 17408);
     const int v_smem_addr = smem + 17408;
+#if __CUDA_ARCH__ == 1030
+    float* scale_smem = reinterpret_cast<float*>(smem_raw + 148480);
+    const int scale_smem_addr = smem + 148480;
+    float* pf_sink_f = reinterpret_cast<float*>(smem_raw + 151552);
+    const int pf_sink_f_addr = smem + 151552;
+    int* pf_sink_i = reinterpret_cast<int*>(smem_raw + 151680);
+    const int pf_sink_i_addr = smem + 151680;
+    float* meta_f = reinterpret_cast<float*>(smem_raw + 151808);
+    const int meta_f_addr = smem + 151808;
+    int* meta_i = reinterpret_cast<int*>(smem_raw + 151808);
+    const int meta_i_addr = smem + 151808;
+    float* ring_f = reinterpret_cast<float*>(smem_raw + 152608);
+    const int ring_f_addr = smem + 152608;
+    int* ring_i = reinterpret_cast<int*>(smem_raw + 152608);
+    const int ring_i_addr = smem + 152608;
+    float* vs_f = reinterpret_cast<float*>(smem_raw + 152992);
+    const int vs_f_addr = smem + 152992;
+    float* xbuf = reinterpret_cast<float*>(smem_raw + 154016);
+    const int xbuf_addr = smem + 154016;
+#else
     float* scale_smem = reinterpret_cast<float*>(smem_raw + 115712);
     const int scale_smem_addr = smem + 115712;
     float* pf_sink_f = reinterpret_cast<float*>(smem_raw + 118784);
@@ -308,8 +345,13 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
     const int vs_f_addr = smem + 120224;
     float* xbuf = reinterpret_cast<float*>(smem_raw + 121248);
     const int xbuf_addr = smem + 121248;
+#endif
 
+#if __CUDA_ARCH__ == 1030
+    // Mbarrier init (57 barriers at smem_raw[0..456))
+#else
     // Mbarrier init (53 barriers at smem_raw[0..424))
+#endif
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -322,70 +364,158 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
             mbarrier_init(smem + 16, 1);
             mbarrier_init(smem + 24, 1);
             // --- pipeline 'kv_pipe' ---
+#if __CUDA_ARCH__ == 1030
+            // kv_full: 8 barriers, init_count=1
+#else
             // kv_full: 6 barriers, init_count=1
+#endif
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
+#if __CUDA_ARCH__ == 1030
+#else
             // kv_empty: 6 barriers, init_count=1
+#endif
             mbarrier_init(smem + 80, 1);
             mbarrier_init(smem + 88, 1);
+#if __CUDA_ARCH__ == 1030
+            // kv_empty: 8 barriers, init_count=1
+#else
+#endif
             mbarrier_init(smem + 96, 1);
             mbarrier_init(smem + 104, 1);
             mbarrier_init(smem + 112, 1);
             mbarrier_init(smem + 120, 1);
+#if __CUDA_ARCH__ == 1030
+#else
             // s_full: 2 barriers, init_count=1
+#endif
             mbarrier_init(smem + 128, 1);
             mbarrier_init(smem + 136, 1);
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 144, 1);
+            mbarrier_init(smem + 152, 1);
+            // s_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 160, 1);
+            mbarrier_init(smem + 168, 1);
+#else
+#endif
             // p_full: 4 barriers, init_count=256
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 176, 256);
+            mbarrier_init(smem + 184, 256);
+            mbarrier_init(smem + 192, 256);
+            mbarrier_init(smem + 200, 256);
+#else
             mbarrier_init(smem + 144, 256);
             mbarrier_init(smem + 152, 256);
             mbarrier_init(smem + 160, 256);
             mbarrier_init(smem + 168, 256);
+#endif
             // pv_done: 2 barriers, init_count=1
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 208, 1);
+            mbarrier_init(smem + 216, 1);
+#else
             mbarrier_init(smem + 176, 1);
             mbarrier_init(smem + 184, 1);
+#endif
             // corr_sig: 2 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 224, 128);
+            mbarrier_init(smem + 232, 128);
+#else
             mbarrier_init(smem + 192, 128);
             mbarrier_init(smem + 200, 128);
+#endif
             // corr_done: 2 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 240, 128);
+            mbarrier_init(smem + 248, 128);
+#else
             mbarrier_init(smem + 208, 128);
             mbarrier_init(smem + 216, 128);
+#endif
             // o_full: 1 barriers, init_count=1
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 256, 1);
+#else
             mbarrier_init(smem + 224, 1);
+#endif
             // tile_done: 1 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 264, 128);
+#else
             mbarrier_init(smem + 232, 128);
+#endif
             // xfer: 1 barriers, init_count=1
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 272, 1);
+#else
             mbarrier_init(smem + 240, 1);
+#endif
             // s_empty: 2 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 280, 128);
+            mbarrier_init(smem + 288, 128);
+#else
             mbarrier_init(smem + 248, 128);
             mbarrier_init(smem + 256, 128);
+#endif
             // meta_full: 2 barriers, init_count=32
+#if __CUDA_ARCH__ == 1030
+#else
             mbarrier_init(smem + 264, 32);
             mbarrier_init(smem + 272, 32);
             // meta_empty: 2 barriers, init_count=384
             mbarrier_init(smem + 280, 384);
             mbarrier_init(smem + 288, 384);
             // step_full: 8 barriers, init_count=32
+#endif
             mbarrier_init(smem + 296, 32);
             mbarrier_init(smem + 304, 32);
+#if __CUDA_ARCH__ == 1030
+            // meta_empty: 2 barriers, init_count=384
+            mbarrier_init(smem + 312, 384);
+            mbarrier_init(smem + 320, 384);
+            // step_full: 8 barriers, init_count=32
+#else
             mbarrier_init(smem + 312, 32);
             mbarrier_init(smem + 320, 32);
+#endif
             mbarrier_init(smem + 328, 32);
             mbarrier_init(smem + 336, 32);
             mbarrier_init(smem + 344, 32);
             mbarrier_init(smem + 352, 32);
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 360, 32);
+            mbarrier_init(smem + 368, 32);
+            mbarrier_init(smem + 376, 32);
+            mbarrier_init(smem + 384, 32);
+#else
+#endif
             // step_empty: 8 barriers, init_count=128
+#if __CUDA_ARCH__ == 1030
+#else
             mbarrier_init(smem + 360, 128);
             mbarrier_init(smem + 368, 128);
             mbarrier_init(smem + 376, 128);
             mbarrier_init(smem + 384, 128);
+#endif
             mbarrier_init(smem + 392, 128);
             mbarrier_init(smem + 400, 128);
             mbarrier_init(smem + 408, 128);
             mbarrier_init(smem + 416, 128);
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 424, 128);
+            mbarrier_init(smem + 432, 128);
+            mbarrier_init(smem + 440, 128);
+            mbarrier_init(smem + 448, 128);
+#else
+#endif
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -395,9 +525,17 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
+#if __CUDA_ARCH__ == 1030
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 456);
+#else
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 424);
+#endif
     if (warp == 0) {
+#if __CUDA_ARCH__ == 1030
+        int _tmem_hold = smem + 456;
+#else
         int _tmem_hold = smem + 424;
+#endif
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -439,7 +577,7 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
             int steps_before = 0;
             unsigned int _phase_step_full = 0;
             unsigned int _phase_s_full = 0;
-            unsigned int _phase_corr_done = 0;
+            unsigned int _phase_corr_done = 1;
             #pragma unroll 1
             for (int tile_iter = 0; tile_iter < my_tiles; tile_iter++) {
                 unsigned int meta_stage = (unsigned int)(tile_iter % 2);
@@ -812,23 +950,18 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                     asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_11) : "f"(chunk_max[0]), "f"(chunk_max[1]), "f"(chunk_max[2]));
                     float tile_max;
                     asm("max.f32 %0, %1, %2;" : "=f"(tile_max) : "f"(_max3_11), "f"(chunk_max[3]));
-                    if (m_valid <= 0) {
-                        tile_max = -CUDART_INF_F;
-                    }
+                    tile_max = ((m_valid > 0) ? tile_max : -CUDART_INF_F);
                     float _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, tile_max, 16);
                     tile_max = max_noftz(tile_max, _shfl_xor_sync_12);
                     float new_max;
                     asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(tile_max), "f"(row_max));
                     float acc_scale = 1.0f;
-                    if (new_max > -CUDART_INF_F) {
-                        if (row_max == -CUDART_INF_F) {
-                            row_max = new_max;
-                        } else if (new_max - row_max > 0.8073549f) {
-                            float _exp2_13 = approx_exp2(row_max - new_max);
-                            acc_scale = _exp2_13;
-                            row_max = new_max;
-                        }
-                    }
+                    float old_max = row_max;
+                    float grow = new_max - old_max;
+                    row_max = ((grow > 0.8073549f) ? new_max : old_max);
+                    float _exp2_13 = approx_exp2(old_max - new_max);
+                    acc_scale = ((grow > 0.8073549f && old_max > -CUDART_INF_F) ? _exp2_13 : 1.0f);
+                    mbarrier_wait(corr_done_addr + (group) * 8, _phase_corr_done);
                     scale_smem[slot] = acc_scale;
 #if __CUDA_ARCH__ == 1030
 #else
@@ -1167,10 +1300,10 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                     mbarrier_arrive(p_full_addr + ((unsigned int)group + p_sd_cursor) * 8);
                     p_sd_cursor += 2;
                     if (p_sd_cursor >= 4) { p_sd_cursor -= 4; }
-                    mbarrier_wait(corr_done_addr + (group) * 8, _phase_corr_done);
                     _phase_corr_done ^= 1;
                     row_sum = __fmaf_rn(row_sum, acc_scale, step_sum);
                 }
+                mbarrier_wait(corr_done_addr + (group) * 8, _phase_corr_done);
                 scale_smem[256 + slot] = row_sum;
                 scale_smem[512 + slot] = row_max;
 #if __CUDA_ARCH__ == 1030
@@ -1178,7 +1311,6 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #endif
                 mbarrier_arrive(corr_sig_addr + (group) * 8);
-                mbarrier_wait(corr_done_addr + (group) * 8, _phase_corr_done);
                 _phase_corr_done ^= 1;
                 steps_before = steps_before + pair_count;
             }
@@ -1288,7 +1420,7 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                 if (s_cur == 2) { s_cur = 0; }
                 elect_commit(kv_empty_addr + (kv_stage) * 8);
                 kv_stage += 1;
-                if (kv_stage == 6) { kv_stage = 0; _phase_kv_full ^= 1; }
+                if (kv_stage == 8) { kv_stage = 0; _phase_kv_full ^= 1; }
                 q_step = q_step + 1;
                 if (q_step == q_pairs) {
                     if (my_tiles_1 > q_iter + 1) {
@@ -1387,7 +1519,7 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                 if (s_cur == 2) { s_cur = 0; }
                 elect_commit(kv_empty_addr + (kv_stage) * 8);
                 kv_stage += 1;
-                if (kv_stage == 6) { kv_stage = 0; _phase_kv_full ^= 1; }
+                if (kv_stage == 8) { kv_stage = 0; _phase_kv_full ^= 1; }
                 q_step = q_step + 1;
                 if (q_step == q_pairs) {
                     if (my_tiles_1 > q_iter + 1) {
@@ -1547,7 +1679,7 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                         if (s_cur == 2) { s_cur = 0; }
                         elect_commit(kv_empty_addr + (kv_stage) * 8);
                         kv_stage += 1;
-                        if (kv_stage == 6) { kv_stage = 0; _phase_kv_full ^= 1; }
+                        if (kv_stage == 8) { kv_stage = 0; _phase_kv_full ^= 1; }
                         q_step = q_step + 1;
                         if (q_step == q_pairs) {
                             if (my_tiles_1 > q_iter + 1) {
@@ -1600,7 +1732,7 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                     :: "r"((tmem_output_0 + ((int)group_cols))), "r"(mma_b_lo_3), "r"(tmem_probs_0 + p_cols), "r"(((first_pv) ? 0 : 1)) : "memory");
                     elect_commit(kv_empty_addr + (kv_stage) * 8);
                     kv_stage += 1;
-                    if (kv_stage == 6) { kv_stage = 0; _phase_kv_full ^= 1; }
+                    if (kv_stage == 8) { kv_stage = 0; _phase_kv_full ^= 1; }
                     elect_commit(pv_done_addr + (pv_cur) * 8);
                     pv_cur += 1;
                     if (pv_cur == 2) { pv_cur = 0; }
@@ -3670,7 +3802,7 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                     tma_4d_gmem2smem(kv_smem_addr + load_stage * 16384 + 8192, (&k), 0, block1 * 64, k_kv_head, k_batch, kv_full_addr + (load_stage) * 8);
                 }
                 load_stage += 1;
-                if (load_stage == 6) { load_stage = 0; _phase_kv_empty ^= 1; }
+                if (load_stage == 8) { load_stage = 0; _phase_kv_empty ^= 1; }
                 k_step = k_step + 1;
                 if (k_step == k_pairs) {
                     k_step = 0;
@@ -3760,40 +3892,26 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                     tma_4d_gmem2smem(kv_smem_addr + load_stage * 16384 + 8192, (&k), 0, block1_1 * 64, k_kv_head, k_batch, kv_full_addr + (load_stage) * 8);
                 }
                 load_stage += 1;
+#if __CUDA_ARCH__ == 1030
+                if (load_stage == 8) { load_stage = 0; _phase_kv_empty ^= 1; }
+#else
                 if (load_stage == 6) { load_stage = 0; _phase_kv_empty ^= 1; }
+#endif
                 k_step = k_step + 1;
                 if (k_step == k_pairs) {
                     k_step = 0;
                     k_iter = k_iter + 1;
                 }
             }
-            #pragma unroll 1
 #if __CUDA_ARCH__ == 1030
-            for (int tile_iter_4 = 0; tile_iter_4 < my_tiles_4; tile_iter_4++) {
-                int tile_idx_3 = blockIdx.x + tile_iter_4 * gridDim.x;
-                int split_d_6 = tile_idx_3 - split_from;
-                if (split_d_6 < 0) {
-                    split_d_6 = 0;
 #else
+            #pragma unroll 1
             for (int tile_iter_3 = 0; tile_iter_3 < my_tiles_3; tile_iter_3++) {
                 int tile_idx_2 = blockIdx.x + tile_iter_3 * gridDim.x;
                 int split_d_5 = tile_idx_2 - split_from;
                 if (split_d_5 < 0) {
                     split_d_5 = 0;
-#endif
                 }
-#if __CUDA_ARCH__ == 1030
-                int tile_id_6 = tile_idx_3 - (split_d_6 + 1) / 2;
-                int q_block_6 = tile_id_6 % q_blocks;
-                int bh_7 = tile_id_6 / q_blocks;
-                int head_7 = bh_7 % num_heads;
-                int batch_8 = bh_7 / num_heads;
-                int kv_head_8 = head_7 / (num_heads / num_kv_heads);
-                int query_base_7 = q_block_6 * 64;
-                int q_valid_8 = seqlen_q - query_base_7;
-                if (q_valid_8 > 64) {
-                    q_valid_8 = 64;
-#else
                 int tile_id_5 = tile_idx_2 - (split_d_5 + 1) / 2;
                 int q_block_5 = tile_id_5 % q_blocks;
                 int bh_6 = tile_id_5 / q_blocks;
@@ -3804,136 +3922,59 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                 int q_valid_7 = seqlen_q - query_base_6;
                 if (q_valid_7 > 64) {
                     q_valid_7 = 64;
-#endif
                 }
-#if __CUDA_ARCH__ == 1030
-                if (q_valid_8 < 0) {
-                    q_valid_8 = 0;
-#else
                 if (q_valid_7 < 0) {
                     q_valid_7 = 0;
-#endif
                 }
-#if __CUDA_ARCH__ == 1030
-                int row_slot_6 = bh_7 * q_blocks + q_block_6;
-                int selected_count_7 = block_sparse_num;
-#else
                 int row_slot_5 = bh_6 * q_blocks + q_block_5;
                 int selected_count_6 = block_sparse_num;
-#endif
                 if (has_block_nums != 0) {
-#if __CUDA_ARCH__ == 1030
-                    selected_count_7 = block_nums[row_slot_6];
-#else
                     selected_count_6 = block_nums[row_slot_5];
-#endif
                 }
-#if __CUDA_ARCH__ == 1030
-                if (selected_count_7 < 0) {
-                    selected_count_7 = 0;
-#else
                 if (selected_count_6 < 0) {
                     selected_count_6 = 0;
-#endif
                 }
-#if __CUDA_ARCH__ == 1030
-                if (selected_count_7 > capacity) {
-                    selected_count_7 = capacity;
-#else
                 if (selected_count_6 > capacity) {
                     selected_count_6 = capacity;
-#endif
                 }
-#if __CUDA_ARCH__ == 1030
-                int pair_count_8 = (selected_count_7 + 1) / 2;
-                if (pair_count_8 < 1) {
-                    pair_count_8 = 1;
-#else
                 int pair_count_7 = (selected_count_6 + 1) / 2;
                 if (pair_count_7 < 1) {
                     pair_count_7 = 1;
-#endif
                 }
-#if __CUDA_ARCH__ == 1030
-                int index_base_7 = row_slot_6 * capacity;
-                if (tile_idx_3 >= split_from) {
-                    int half_pairs_7 = (pair_count_8 + 1) / 2;
-                    if ((tile_idx_3 - split_from) % 2 == 0) {
-                        pair_count_8 = half_pairs_7;
-#else
                 int index_base_6 = row_slot_5 * capacity;
                 if (tile_idx_2 >= split_from) {
                     int half_pairs_6 = (pair_count_7 + 1) / 2;
                     if ((tile_idx_2 - split_from) % 2 == 0) {
                         pair_count_7 = half_pairs_6;
-#endif
                     } else {
-#if __CUDA_ARCH__ == 1030
-                        pair_count_8 = pair_count_8 - half_pairs_7;
-                        if (pair_count_8 < 1) {
-                            pair_count_8 = 1;
-#else
                         pair_count_7 = pair_count_7 - half_pairs_6;
                         if (pair_count_7 < 1) {
                             pair_count_7 = 1;
-#endif
                         }
-#if __CUDA_ARCH__ == 1030
-                        index_base_7 = index_base_7 + half_pairs_7 * 2;
-                        selected_count_7 = selected_count_7 - half_pairs_7 * 2;
-                        if (selected_count_7 < 0) {
-                            selected_count_7 = 0;
-#else
                         index_base_6 = index_base_6 + half_pairs_6 * 2;
                         selected_count_6 = selected_count_6 - half_pairs_6 * 2;
                         if (selected_count_6 < 0) {
                             selected_count_6 = 0;
-#endif
                         }
                     }
                 }
                 int lane_0 = lane;
-#if __CUDA_ARCH__ == 1030
-                int k_scale_base_2 = (batch_8 * num_kv_heads + kv_head_8) * k_scale_groups;
-#else
                 int k_scale_base_1 = (batch_7 * num_kv_heads + kv_head_7) * k_scale_groups;
-#endif
                 float acc = 0.0f;
-#if __CUDA_ARCH__ == 1030
-                if (lane_0 < q_valid_8) {
-                    acc = q_scale[bh_7 * seqlen_q + query_base_7 + lane_0];
-#else
                 if (lane_0 < q_valid_7) {
                     acc = q_scale[bh_6 * seqlen_q + query_base_6 + lane_0];
-#endif
                 }
-#if __CUDA_ARCH__ == 1030
-                if (q_valid_8 > lane_0 + 32) {
-                    acc = acc + q_scale[bh_7 * seqlen_q + query_base_7 + lane_0 + 32];
-#else
                 if (q_valid_7 > lane_0 + 32) {
                     acc = acc + q_scale[bh_6 * seqlen_q + query_base_6 + lane_0 + 32];
-#endif
                 }
-#if __CUDA_ARCH__ == 1030
-                int valid_1 = 0;
-#else
                 int valid = 0;
-#endif
                 if (lane_0 < 16) {
                     int entry = lane_0 / 4;
                     int block = 0;
-#if __CUDA_ARCH__ == 1030
-                    if (entry < selected_count_7) {
-                        block = block_index[index_base_7 + entry];
-                    } else if (entry % 2 == 1 && selected_count_7 > entry - 1) {
-                        block = block_index[index_base_7 + entry - 1];
-#else
                     if (entry < selected_count_6) {
                         block = block_index[index_base_6 + entry];
                     } else if (entry % 2 == 1 && selected_count_6 > entry - 1) {
                         block = block_index[index_base_6 + entry - 1];
-#endif
                     }
                     int group_idx = block * 4 + lane_0 % 4;
                     if (group_idx > k_scale_groups - 1) {
@@ -3942,87 +3983,37 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                     if (group_idx < 0) {
                         group_idx = 0;
                     }
-#if __CUDA_ARCH__ == 1030
-                    acc = acc + k_scale[k_scale_base_2 + group_idx];
-#else
                     acc = acc + k_scale[k_scale_base_1 + group_idx];
-#endif
                     if (lane_0 % 4 == 0) {
-#if __CUDA_ARCH__ == 1030
-                        int valid_1_1 = seqlen_k - block * 64;
-                        if (valid_1_1 > 64) {
-                            valid_1_1 = 64;
-#else
                         int valid_1 = seqlen_k - block * 64;
                         if (valid_1 > 64) {
                             valid_1 = 64;
-#endif
                         }
-#if __CUDA_ARCH__ == 1030
-                        if (valid_1_1 < 0) {
-                            valid_1_1 = 0;
-#else
                         if (valid_1 < 0) {
                             valid_1 = 0;
-#endif
                         }
                         if (block_sizes_mode != 0) {
-#if __CUDA_ARCH__ == 1030
-                            int declared_1 = 0;
-#else
                             int declared = 0;
-#endif
                             if (block_sizes_mode == 1) {
-#if __CUDA_ARCH__ == 1030
-                                declared_1 = block_sizes[block];
-#else
                                 declared = block_sizes[block];
-#endif
                             } else if (block_sizes_mode == 2) {
-#if __CUDA_ARCH__ == 1030
-                                declared_1 = block_sizes[batch_8 * k_blocks + block];
-#else
                                 declared = block_sizes[batch_7 * k_blocks + block];
-#endif
                             } else {
-#if __CUDA_ARCH__ == 1030
-                                declared_1 = block_sizes[(batch_8 * num_kv_heads + kv_head_8) * k_blocks + block];
-#else
                                 declared = block_sizes[(batch_7 * num_kv_heads + kv_head_7) * k_blocks + block];
-#endif
                             }
-#if __CUDA_ARCH__ == 1030
-                            if (declared_1 < 0) {
-                                declared_1 = 0;
-#else
                             if (declared < 0) {
                                 declared = 0;
-#endif
                             }
-#if __CUDA_ARCH__ == 1030
-                            if (declared_1 < valid_1_1) {
-                                valid_1_1 = declared_1;
-#else
                             if (declared < valid_1) {
                                 valid_1 = declared;
-#endif
                             }
                         }
-#if __CUDA_ARCH__ == 1030
-                        valid_1 = valid_1_1;
-#else
                         valid = valid_1;
-#endif
                     }
                 }
                 #pragma unroll 1
-#if __CUDA_ARCH__ == 1030
-                for (int step_2 = 0; step_2 < pair_count_8; step_2++) {
-                    if (k_iter < my_tiles_4) {
-#else
                 for (int step_2 = 0; step_2 < pair_count_7; step_2++) {
                     if (k_iter < my_tiles_3) {
-#endif
                         if (k_step == 0) {
                             int split_d_0 = blockIdx.x + k_iter * gridDim.x - split_from;
                             if (split_d_0 < 0) {
@@ -4059,33 +4050,16 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             }
                             int index_base_0 = row_slot_0 * capacity;
                             if (blockIdx.x + k_iter * gridDim.x >= split_from) {
-#if __CUDA_ARCH__ == 1030
-                                int half_pairs_8 = (pair_count_0 + 1) / 2;
-#else
                                 int half_pairs_7 = (pair_count_0 + 1) / 2;
-#endif
                                 if ((blockIdx.x + k_iter * gridDim.x - split_from) % 2 == 0) {
-#if __CUDA_ARCH__ == 1030
-                                    pair_count_0 = half_pairs_8;
-#else
                                     pair_count_0 = half_pairs_7;
-#endif
                                 } else {
-#if __CUDA_ARCH__ == 1030
-                                    pair_count_0 = pair_count_0 - half_pairs_8;
-#else
                                     pair_count_0 = pair_count_0 - half_pairs_7;
-#endif
                                     if (pair_count_0 < 1) {
                                         pair_count_0 = 1;
                                     }
-#if __CUDA_ARCH__ == 1030
-                                    index_base_0 = index_base_0 + half_pairs_8 * 2;
-                                    selected_count_0 = selected_count_0 - half_pairs_8 * 2;
-#else
                                     index_base_0 = index_base_0 + half_pairs_7 * 2;
                                     selected_count_0 = selected_count_0 - half_pairs_7 * 2;
-#endif
                                     if (selected_count_0 < 0) {
                                         selected_count_0 = 0;
                                     }
@@ -4129,41 +4103,23 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                     }
                     int entry0_3 = step_2 * 2;
                     int block0_3 = 0;
-#if __CUDA_ARCH__ == 1030
-                    if (entry0_3 < selected_count_7) {
-                        block0_3 = block_index[index_base_7 + entry0_3];
-#else
                     if (entry0_3 < selected_count_6) {
                         block0_3 = block_index[index_base_6 + entry0_3];
-#endif
                     }
                     int block1_3 = block0_3;
-#if __CUDA_ARCH__ == 1030
-                    if (selected_count_7 > entry0_3 + 1) {
-                        block1_3 = block_index[index_base_7 + entry0_3 + 1];
-#else
                     if (selected_count_6 > entry0_3 + 1) {
                         block1_3 = block_index[index_base_6 + entry0_3 + 1];
-#endif
                     }
                     mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 16384);
-#if __CUDA_ARCH__ == 1030
-                        tma_4d_gmem2smem(v_smem_addr + load_stage * 16384, (&v), 0, block0_3 * 64, kv_head_8, batch_8, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(v_smem_addr + load_stage * 16384 + 8192, (&v), 0, block1_3 * 64, kv_head_8, batch_8, kv_full_addr + (load_stage) * 8);
-#else
                         tma_4d_gmem2smem(v_smem_addr + load_stage * 16384, (&v), 0, block0_3 * 64, kv_head_7, batch_7, kv_full_addr + (load_stage) * 8);
                         tma_4d_gmem2smem(v_smem_addr + load_stage * 16384 + 8192, (&v), 0, block1_3 * 64, kv_head_7, batch_7, kv_full_addr + (load_stage) * 8);
-#endif
                     }
                     load_stage += 1;
                     if (load_stage == 6) { load_stage = 0; _phase_kv_empty ^= 1; }
                 }
                 pf_sink_f[lane_0] = acc;
-#if __CUDA_ARCH__ == 1030
-                pf_sink_i[lane_0] = valid_1;
-#else
                 pf_sink_i[lane_0] = valid;
             }
         }
@@ -4180,6 +4136,7 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
             int my_tiles_4 = count_4;
             int steps_before_2 = 0;
             unsigned int _phase_step_empty = 1;
+#endif
             #pragma unroll 1
             for (int tile_iter_4 = 0; tile_iter_4 < my_tiles_4; tile_iter_4++) {
                 int tile_idx_3 = blockIdx.x + tile_iter_4 * gridDim.x;
@@ -4218,22 +4175,94 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                 }
                 int index_base_7 = row_slot_6 * capacity;
                 if (tile_idx_3 >= split_from) {
+#if __CUDA_ARCH__ == 1030
+                    int half_pairs_7 = (pair_count_8 + 1) / 2;
+#else
                     int half_pairs_8 = (pair_count_8 + 1) / 2;
+#endif
                     if ((tile_idx_3 - split_from) % 2 == 0) {
+#if __CUDA_ARCH__ == 1030
+                        pair_count_8 = half_pairs_7;
+#else
                         pair_count_8 = half_pairs_8;
+#endif
                     } else {
+#if __CUDA_ARCH__ == 1030
+                        pair_count_8 = pair_count_8 - half_pairs_7;
+#else
                         pair_count_8 = pair_count_8 - half_pairs_8;
+#endif
                         if (pair_count_8 < 1) {
                             pair_count_8 = 1;
                         }
+#if __CUDA_ARCH__ == 1030
+                        index_base_7 = index_base_7 + half_pairs_7 * 2;
+                        selected_count_7 = selected_count_7 - half_pairs_7 * 2;
+#else
                         index_base_7 = index_base_7 + half_pairs_8 * 2;
                         selected_count_7 = selected_count_7 - half_pairs_8 * 2;
+#endif
                         if (selected_count_7 < 0) {
                             selected_count_7 = 0;
                         }
                     }
                 }
+#if __CUDA_ARCH__ == 1030
+                int lane_0 = lane;
+#else
+#endif
                 int k_scale_base_2 = (batch_8 * num_kv_heads + kv_head_8) * k_scale_groups;
+#if __CUDA_ARCH__ == 1030
+                float acc = 0.0f;
+                if (lane_0 < q_valid_8) {
+                    acc = q_scale[bh_7 * seqlen_q + query_base_7 + lane_0];
+                }
+                if (q_valid_8 > lane_0 + 32) {
+                    acc = acc + q_scale[bh_7 * seqlen_q + query_base_7 + lane_0 + 32];
+                }
+                int valid_1 = 0;
+                if (lane_0 < 16) {
+                    int entry = lane_0 / 4;
+                    int block = 0;
+                    if (entry < selected_count_7) {
+                        block = block_index[index_base_7 + entry];
+                    } else if (entry % 2 == 1 && selected_count_7 > entry - 1) {
+                        block = block_index[index_base_7 + entry - 1];
+                    }
+                    int group_idx = block * 4 + lane_0 % 4;
+                    if (group_idx > k_scale_groups - 1) {
+                        group_idx = k_scale_groups - 1;
+                    }
+                    if (group_idx < 0) {
+                        group_idx = 0;
+                    }
+                    acc = acc + k_scale[k_scale_base_2 + group_idx];
+                    if (lane_0 % 4 == 0) {
+                        int valid_1_1 = seqlen_k - block * 64;
+                        if (valid_1_1 > 64) {
+                            valid_1_1 = 64;
+                        }
+                        if (valid_1_1 < 0) {
+                            valid_1_1 = 0;
+                        }
+                        if (block_sizes_mode != 0) {
+                            int declared_1 = 0;
+                            if (block_sizes_mode == 1) {
+                                declared_1 = block_sizes[block];
+                            } else if (block_sizes_mode == 2) {
+                                declared_1 = block_sizes[batch_8 * k_blocks + block];
+                            } else {
+                                declared_1 = block_sizes[(batch_8 * num_kv_heads + kv_head_8) * k_blocks + block];
+                            }
+                            if (declared_1 < 0) {
+                                declared_1 = 0;
+                            }
+                            if (declared_1 < valid_1_1) {
+                                valid_1_1 = declared_1;
+                            }
+                        }
+                        valid_1 = valid_1_1;
+#else
                 int first_pair_1 = (p_group + steps_before_2) % 2;
                 int e_entry0 = first_pair_1 * 2;
                 int e_block = 0;
@@ -4242,8 +4271,11 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                         e_block = block_index[index_base_7 + e_entry0 + p_blk];
                     } else if (p_blk == 1 && e_entry0 < selected_count_7) {
                         e_block = block_index[index_base_7 + e_entry0];
+#endif
                     }
                 }
+#if __CUDA_ARCH__ == 1030
+#else
                 int cur_block = e_block;
                 if (p_group == 0) {
                     float s_q_lo = 0.0f;
@@ -4290,7 +4322,97 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                     meta_i[s_off + 88 + 10] = piece_1;
                     mbarrier_arrive(meta_full_addr + ((int)((unsigned int)tile_iter_4 % 2)) * 8);
                 }
+#endif
                 #pragma unroll 1
+#if __CUDA_ARCH__ == 1030
+                for (int step_2 = 0; step_2 < pair_count_8; step_2++) {
+                    if (k_iter < my_tiles_4) {
+                        if (k_step == 0) {
+                            int split_d_0 = blockIdx.x + k_iter * gridDim.x - split_from;
+                            if (split_d_0 < 0) {
+                                split_d_0 = 0;
+                            }
+                            int tile_id_0 = blockIdx.x + k_iter * gridDim.x - (split_d_0 + 1) / 2;
+                            int q_block_0 = tile_id_0 % q_blocks;
+                            int bh_0 = tile_id_0 / q_blocks;
+                            int head_0 = bh_0 % num_heads;
+                            int batch_0 = bh_0 / num_heads;
+                            int kv_head_0 = head_0 / (num_heads / num_kv_heads);
+                            int query_base_0 = q_block_0 * 64;
+                            int q_valid_0 = seqlen_q - query_base_0;
+                            if (q_valid_0 > 64) {
+                                q_valid_0 = 64;
+                            }
+                            if (q_valid_0 < 0) {
+                                q_valid_0 = 0;
+                            }
+                            int row_slot_0 = bh_0 * q_blocks + q_block_0;
+                            int selected_count_0 = block_sparse_num;
+                            if (has_block_nums != 0) {
+                                selected_count_0 = block_nums[row_slot_0];
+                            }
+                            if (selected_count_0 < 0) {
+                                selected_count_0 = 0;
+                            }
+                            if (selected_count_0 > capacity) {
+                                selected_count_0 = capacity;
+                            }
+                            int pair_count_0 = (selected_count_0 + 1) / 2;
+                            if (pair_count_0 < 1) {
+                                pair_count_0 = 1;
+                            }
+                            int index_base_0 = row_slot_0 * capacity;
+                            if (blockIdx.x + k_iter * gridDim.x >= split_from) {
+                                int half_pairs_8 = (pair_count_0 + 1) / 2;
+                                if ((blockIdx.x + k_iter * gridDim.x - split_from) % 2 == 0) {
+                                    pair_count_0 = half_pairs_8;
+                                } else {
+                                    pair_count_0 = pair_count_0 - half_pairs_8;
+                                    if (pair_count_0 < 1) {
+                                        pair_count_0 = 1;
+                                    }
+                                    index_base_0 = index_base_0 + half_pairs_8 * 2;
+                                    selected_count_0 = selected_count_0 - half_pairs_8 * 2;
+                                    if (selected_count_0 < 0) {
+                                        selected_count_0 = 0;
+                                    }
+                                }
+                            }
+                            k_pairs = pair_count_0;
+                            k_sel = selected_count_0;
+                            k_base = index_base_0;
+                            k_kv_head = kv_head_0;
+                            k_batch = batch_0;
+                            mbarrier_wait(q_empty_addr + (q_load_stage) * 8, _phase_q_empty);
+                            if (elect_sync()) {
+                                mbarrier_arrive_expect_tx(q_full_addr + (q_load_stage) * 8, 8192);
+                                tma_4d_gmem2smem(q_smem_addr + q_load_stage * 8192, (&q), 0, head_0, query_base_0, batch_0, q_full_addr + (q_load_stage) * 8);
+                            }
+                            q_load_stage += 1;
+                            if (q_load_stage == 2) { q_load_stage = 0; _phase_q_empty ^= 1; }
+                        }
+                        int entry0_2 = k_step * 2;
+                        int block0_2 = 0;
+                        if (entry0_2 < k_sel) {
+                            block0_2 = block_index[k_base + entry0_2];
+                        }
+                        int block1_2 = block0_2;
+                        if (k_sel > entry0_2 + 1) {
+                            block1_2 = block_index[k_base + entry0_2 + 1];
+                        }
+                        mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
+                        if (elect_sync()) {
+                            mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 16384);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 16384, (&k), 0, block0_2 * 64, k_kv_head, k_batch, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 16384 + 8192, (&k), 0, block1_2 * 64, k_kv_head, k_batch, kv_full_addr + (load_stage) * 8);
+                        }
+                        load_stage += 1;
+                        if (load_stage == 8) { load_stage = 0; _phase_kv_empty ^= 1; }
+                        k_step = k_step + 1;
+                        if (k_step == k_pairs) {
+                            k_step = 0;
+                            k_iter = k_iter + 1;
+#else
                 for (int pi = first_pair_1; pi < pair_count_8; pi += 2) {
                     int e_entry0_0 = (pi + 2) * 2;
                     int e_block_0 = 0;
@@ -4299,8 +4421,15 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             e_block_0 = block_index[index_base_7 + e_entry0_0 + p_blk];
                         } else if (p_blk == 1 && e_entry0_0 < selected_count_7) {
                             e_block_0 = block_index[index_base_7 + e_entry0_0];
+#endif
                         }
                     }
+#if __CUDA_ARCH__ == 1030
+                    int entry0_3 = step_2 * 2;
+                    int block0_3 = 0;
+                    if (entry0_3 < selected_count_7) {
+                        block0_3 = block_index[index_base_7 + entry0_3];
+#else
                     int nxt_block = e_block_0;
                     float w_f = 0.0f;
                     int w_i = 0;
@@ -4342,7 +4471,13 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             }
                             w_i = valid_2;
                         }
+#endif
                     }
+#if __CUDA_ARCH__ == 1030
+                    int block1_3 = block0_3;
+                    if (selected_count_7 > entry0_3 + 1) {
+                        block1_3 = block_index[index_base_7 + entry0_3 + 1];
+#else
                     int r_e = p_n % 4;
                     int r_base = (p_group * 4 + r_e) * 12;
                     mbarrier_wait(step_empty_addr + (p_n) * 8, _phase_step_empty);
@@ -4354,12 +4489,28 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                         if (p_lane < 12) {
                             ring_i[r_base + 2 + p_blk] = w_i;
                         }
+#endif
                     }
+#if __CUDA_ARCH__ == 1030
+                    mbarrier_wait(kv_empty_addr + (load_stage) * 8, _phase_kv_empty);
+                    if (elect_sync()) {
+                        mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 16384);
+                        tma_4d_gmem2smem(v_smem_addr + load_stage * 16384, (&v), 0, block0_3 * 64, kv_head_8, batch_8, kv_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(v_smem_addr + load_stage * 16384 + 8192, (&v), 0, block1_3 * 64, kv_head_8, batch_8, kv_full_addr + (load_stage) * 8);
+                    }
+                    load_stage += 1;
+                    if (load_stage == 8) { load_stage = 0; _phase_kv_empty ^= 1; }
+#else
                     mbarrier_arrive(step_full_addr + (p_n) * 8);
                     cur_block = nxt_block;
                     p_n += 1;
                     if (p_n == (p_group * 4 + 4)) { p_n = p_group * 4; _phase_step_empty ^= 1; }
+#endif
                 }
+#if __CUDA_ARCH__ == 1030
+                pf_sink_f[lane_0] = acc;
+                pf_sink_i[lane_0] = valid_1;
+#else
                 steps_before_2 = steps_before_2 + pair_count_8;
 #endif
             }
