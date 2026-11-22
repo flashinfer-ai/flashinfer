@@ -64,6 +64,7 @@ from .prefill import (
     get_single_prefill_module,
 )
 from .utils import (
+    _PACKED_INDEX_BACKENDS,
     _to_device_packed,
     log2e,
     FP4Tensor,
@@ -2616,6 +2617,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 (indptr, last_page_len, qo_indptr_host, indices),
                 self.device,
                 non_blocking,
+                pack=self._backend in _PACKED_INDEX_BACKENDS,
             )
 
         indptr_host = indptr.to("cpu")

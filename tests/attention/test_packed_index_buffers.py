@@ -48,6 +48,58 @@ def test_to_device_packed_leaves_device_and_mixed_tensors_alone():
     assert torch.equal(mixed[1].cpu(), host_b.to(torch.int64))
 
 
+def test_to_device_packed_can_keep_one_allocation_per_tensor():
+    host = [torch.arange(n, dtype=torch.int32) for n in (3, 2, 5)]
+    out = _to_device_packed(host, DEVICE, False, pack=False)
+    for h, d in zip(host, out, strict=True):
+        assert torch.equal(d.cpu(), h) and d.data_ptr() % 16 == 0
+    assert not _follows(out[0], out[1]) and not _follows(out[1], out[2])
+
+
+def test_batch_decode_cute_dsl_host_metadata_stays_aligned():
+    # The CuTe DSL kernels reject index tensors that are not 16-byte aligned, so
+    # this backend must keep one allocation per tensor.
+    from flashinfer.cute_dsl import is_cute_dsl_available
+    from flashinfer.utils import is_sm100a_supported
+
+    if not is_cute_dsl_available() or not is_sm100a_supported(DEVICE):
+        pytest.skip("cute-dsl GQA decode requires CuTe DSL on Blackwell (SM100a)")
+    torch.manual_seed(0)
+    num_qo_heads, num_kv_heads, head_dim, page_size = 8, 2, 128, 16
+    kv_lens = [40, 90, 64, 200]
+    metadata = _metadata(kv_lens, page_size)
+    kv_data = torch.randn(
+        len(metadata[1]),
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    q = torch.randn(
+        len(kv_lens), num_qo_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    outputs = []
+    for metadata_device in ("cpu", DEVICE):
+        workspace = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device=DEVICE)
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace, "NHD", backend="cute-dsl"
+        )
+        wrapper.plan(
+            *(t.to(metadata_device) for t in metadata),
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
+        assert wrapper._paged_kv_indices_buf.data_ptr() % 16 == 0
+        outputs.append(wrapper.run(q, kv_data))
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("use_tensor_cores", [False, True])
 def test_batch_decode_host_metadata_matches_device_metadata(use_tensor_cores):
     torch.manual_seed(0)

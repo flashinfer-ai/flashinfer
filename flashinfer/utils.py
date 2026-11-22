@@ -939,8 +939,17 @@ def check_shape_dtype_device(
         )
 
 
+# Backends that read the paged-KV index tensors as plain int32 arrays, for which sharing
+# one device buffer was measured and validated. Other backends keep one allocation per
+# tensor: the CuTe DSL kernels, for one, reject tensors that are not 16-byte aligned.
+_PACKED_INDEX_BACKENDS = ("auto", "fa2", "fa3")
+
+
 def _to_device_packed(
-    tensors: Sequence[torch.Tensor], device: torch.device, non_blocking: bool
+    tensors: Sequence[torch.Tensor],
+    device: torch.device,
+    non_blocking: bool,
+    pack: bool = True,
 ) -> List[torch.Tensor]:
     """Move 1-D index tensors to ``device``, host tensors sharing one device buffer.
 
@@ -952,7 +961,9 @@ def _to_device_packed(
     per-request arrays first so that they share the leading cache lines.
 
     Tensors that are already on ``device`` are returned by ``Tensor.to`` as
-    before (no copy), as are host tensors that cannot be concatenated.
+    before (no copy), as are host tensors that cannot be concatenated. With
+    ``pack=False`` every tensor is moved by ``Tensor.to``. Packed tensors are
+    aligned to their element size only.
     """
     device = torch.device(device)
     host = [
@@ -961,7 +972,8 @@ def _to_device_packed(
         if t.device.type == "cpu" and t.dim() == 1 and t.numel() > 0
     ]
     if (
-        device.type != "cuda"
+        not pack
+        or device.type != "cuda"
         or len(host) < 2
         or len({tensors[i].dtype for i in host}) != 1
     ):

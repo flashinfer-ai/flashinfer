@@ -94,6 +94,7 @@ from .trace.templates.gemm import (
 )
 from .trace.templates.page import trtllm_fmha_v2_prefill_trace
 from .utils import (
+    _PACKED_INDEX_BACKENDS,
     SINGLE_KERNEL_TMP_SIZE,
     _to_device_packed,
     FP4Tensor,
@@ -4577,6 +4578,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     ),
                     self.device,
                     non_blocking,
+                    pack=self._backend in _PACKED_INDEX_BACKENDS,
                 )
             if packed_custom_mask is not None:
                 self._custom_mask_buf = packed_custom_mask.to(
