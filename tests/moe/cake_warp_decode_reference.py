@@ -206,10 +206,42 @@ def cake_module(device: torch.device) -> Any:
     return get_cake_fused_moe_warp_decode_module(target, device=device)
 
 
-def reference(fixture: Fixture, num_tokens: int) -> torch.Tensor:
-    """Run the public TRT-LLM NVFP4 routed MoE on the same physical tensors."""
+def reference_routing(
+    num_experts: int, topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The routing the public reference receives for the routing Cake receives.
+
+    Cake drops every slot whose id lies outside ``[0, num_experts)``. The
+    reference receives such a slot as id ``-1`` with weight zero, the padding
+    slot its routing drops, so it never depends on how it treats other
+    out-of-range values or a non-finite weight on a dropped slot. Valid slots
+    pass unchanged. The mapping runs on the device and reads nothing on the host.
+    """
+    valid = (topk_ids >= 0) & (topk_ids < num_experts)
+    ids = torch.where(valid, topk_ids, torch.full_like(topk_ids, -1))
+    weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights))
+    return ids.contiguous(), weights.contiguous()
+
+
+def reference(
+    fixture: Fixture,
+    num_tokens: int,
+    *,
+    topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the public TRT-LLM NVFP4 routed MoE on the same physical tensors.
+
+    ``topk_ids`` / ``topk_weights`` (``[num_tokens, top_k]``) replace the
+    fixture routing; dropped slots are mapped by :func:`reference_routing`.
+    """
     geometry = fixture.geometry
     view = fixture.weight_view
+    ids, weights = reference_routing(
+        geometry.num_experts,
+        fixture.topk_ids[:num_tokens] if topk_ids is None else topk_ids,
+        fixture.topk_weights[:num_tokens] if topk_weights is None else topk_weights,
+    )
     official_beta = view.get("gemm1_beta")
     official_clamp_limit = view.get("gemm1_clamp_limit")
     if geometry.name == "e128_i3072_k4_swiglu_oa":
@@ -222,7 +254,7 @@ def reference(fixture: Fixture, num_tokens: int) -> torch.Tensor:
         num_tokens, geometry.hidden_size, dtype=torch.bfloat16, device=fixture.device
     )
     result = trtllm_fp4_block_scale_routed_moe(
-        topk_ids=(fixture.topk_ids[:num_tokens], fixture.topk_weights[:num_tokens]),
+        topk_ids=(ids, weights),
         routing_bias=None,
         hidden_states=fixture.hidden_states_q[:num_tokens],
         hidden_states_scale=fixture.hidden_states_scale[:num_tokens],
@@ -292,8 +324,16 @@ def run_cake(
     output: torch.Tensor,
     workspace: torch.Tensor,
     receipt: int,
+    *,
+    topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Launch the generated warp-decode kernels into ``output`` and return it."""
+    """Launch the generated warp-decode kernels into ``output`` and return it.
+
+    ``topk_ids`` / ``topk_weights`` (``[num_tokens, top_k]``, contiguous)
+    replace the fixture routing and reach the kernels unchanged, including ids
+    outside ``[0, num_experts)``.
+    """
     geometry = fixture.geometry
     view = fixture.weight_view
     inputs = (
@@ -301,8 +341,8 @@ def run_cake(
         workspace,
         fixture.hidden_states_q[:num_tokens],
         fixture.hidden_states_scale[:num_tokens],
-        fixture.topk_ids[:num_tokens],
-        fixture.topk_weights[:num_tokens],
+        fixture.topk_ids[:num_tokens] if topk_ids is None else topk_ids,
+        fixture.topk_weights[:num_tokens] if topk_weights is None else topk_weights,
         view["gemm1_weights"],
         view["gemm1_weights_scale"],
         view["gemm2_weights"],

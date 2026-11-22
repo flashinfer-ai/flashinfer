@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification")
 
 from .test_nvfp4_cutedsl_kernel_vs_reference import (  # noqa: E402, F401 -- shared pytest fixture
     w4a16_single_rank_runtime,

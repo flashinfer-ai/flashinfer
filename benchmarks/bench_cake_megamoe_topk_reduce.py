@@ -7,7 +7,7 @@ kernel and not a claimed historical FlashInfer performance baseline.
 
 ``--baseline vendored-cutedsl-matched`` (the default) selects the exact vendored
 implementation at
-``flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py``.
+``flashinfer/moe_ep/kernels/cutedsl_megamoe/pre_unification/moe_nvfp4_swapab/topk_reduce.py``.
 Both kernels process the same live ``T x 6 x 4096`` elements in this primary
 comparison. ``--baseline vendored-cutedsl-fixed-capacity`` separately measures
 the serving scenario where the old reducer processes a prefill-sized ``C=4096``
@@ -16,7 +16,7 @@ workspace work, not an apples-to-apples kernel speedup.
 
 ``--baseline rubin-cutedsl-matched`` selects the vendored SM107 (Rubin) MegaMoE
 reducer at
-``flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/topk_reduce.py``
+``flashinfer/moe_ep/kernels/cutedsl_megamoe/sources/helpers/topk_reduce.py``
 on the same live ``T x 6 x 4096`` elements, called without routing scores or
 indices (an unweighted sum in increasing K, rounded once, as the native
 reducer). It needs a CuTe DSL that targets sm_107a natively and
@@ -65,13 +65,15 @@ _GRID_CTAS_PER_TOKEN = 4
 _LEGACY_BASELINE_CAPACITY = 4096
 _ATOL = 1e-2
 _RTOL = 1e-2
-_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py"
+_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernels/cutedsl_megamoe/pre_unification/moe_nvfp4_swapab/topk_reduce.py"
 _CUTEDSL_SOURCE_SHA256 = (
-    "6b8f55a222511281daa7694779ee96c23276d31f39754552cec97c36dd7b0b95"
+    "e874fa11c4859e2ab9974a0de585fa9600d394133739afaf895b67529fcbfe52"
 )
-_RUBIN_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/topk_reduce.py"
+_RUBIN_CUTEDSL_SOURCE = (
+    "flashinfer/moe_ep/kernels/cutedsl_megamoe/sources/helpers/topk_reduce.py"
+)
 _RUBIN_CUTEDSL_SOURCE_SHA256 = (
-    "b38d2733da0ed35bd25cca88a589471806b7316b8fe91f8021618e3eacabb644"
+    "d9d0012cda2a27086c2997556ef0183428a3c56add7cf537de2c2eac87f8e43f"
 )
 
 
@@ -161,13 +163,17 @@ def _make_vendored_cutedsl_runner(
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
 
-        from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim._paths import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification._paths import (
             bootstrap_paths,
         )
 
         bootstrap_paths()
-        from moe_nvfp4_swapab.topk_reduce import TopkReduce
-        from src.token_comm import CombineFormat
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_nvfp4_swapab.topk_reduce import (
+            TopkReduce,
+        )
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.comm.token_comm import (
+            CombineFormat,
+        )
     except Exception as error:
         raise RuntimeError(
             f"vendored CuTeDSL baseline {_CUTEDSL_SOURCE} is unavailable; "
@@ -266,13 +272,12 @@ def _make_rubin_cutedsl_runner(
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
 
-        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-            bootstrap_paths,
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.helpers.topk_reduce import (
+            TopkReduce,
         )
-
-        bootstrap_paths()
-        from sources.kernel_src.rubin.inference.mega.topk_reduce import TopkReduce
-        from sources.quant_def import CombineFormat
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.quant_def import (
+            CombineFormat,
+        )
     except Exception as error:
         raise RuntimeError(
             f"vendored CuTeDSL baseline {_RUBIN_CUTEDSL_SOURCE} is unavailable; "
