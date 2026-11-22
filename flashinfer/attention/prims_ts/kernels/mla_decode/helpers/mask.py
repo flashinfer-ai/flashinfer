@@ -40,21 +40,19 @@ def normalize_mask_type(mask_type: MaskType | str) -> str:
         ) from error
 
 
-def rows_have_distinct_kv_prefix(cfg, cu_seqlens_q, logical_seq_len_q) -> bool:
+def rows_have_distinct_kv_prefix(
+    mask_type: str, runtime_q_lengths: bool, logical_seq_len_q
+) -> bool:
     """Return whether the query rows of one tile can see different K prefixes.
 
-    Bottom-right causal prefixes over more than one query token grow with the
-    row; a work tile caches the prefix its first row sees. Otherwise every row
-    sees the request's whole K length, which the softmax already holds.
+    Bottom-right causal prefixes grow with the query token, so they differ
+    unless every request has exactly one token. A work tile then caches the
+    prefix its first row sees; otherwise every row sees the whole K length.
     """
-    if cfg.mask_type != MaskType.CAUSAL.value:
-        return False
-    single_token = (
-        cu_seqlens_q is None
-        and isinstance(logical_seq_len_q, int)
-        and logical_seq_len_q == 1
+    single_token = not runtime_q_lengths and (
+        isinstance(logical_seq_len_q, int) and logical_seq_len_q == 1
     )
-    return not single_token
+    return mask_type == MaskType.CAUSAL.value and not single_token
 
 
 @cute.jit

@@ -2029,7 +2029,9 @@ def _loop_row_max(
     if kind == "left_window":
         return sp.left_masked_row_max(row_max=row_max, q_offset=mask.q_offset)
     if kind == "varlen_right":
-        return sp.right_masked_loop_row_max(row_max=row_max, q_offset=mask.q_offset)
+        return sp.right_masked_row_max(
+            row_max=row_max, q_offset=mask.q_offset, section=FmhaStage.Loop
+        )
     if kind == "query_paired_causal":
         return sp.loop_masked_row_max(row_max=row_max, q_offset=mask.q_offset)
     if kind == "fixed_dense_k_tail" and not fixed_dense_k_tail_in_fallback:

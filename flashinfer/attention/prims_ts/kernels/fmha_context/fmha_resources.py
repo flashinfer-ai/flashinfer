@@ -4333,28 +4333,6 @@ class TmemSPResource(MemoryResource):
         )
 
     @cute.jit
-    def _mask_causal_k_end_chunks(
-        self, s_data: SoftmaxChunks, kv_tile_idx: Int32, causal_k_end: Int32
-    ) -> SoftmaxChunks:
-        """Mask every key at or past this row's causal end."""
-        tmem_x = self.cfg.tmem_x_load_s
-        kv_base = kv_tile_idx * self.cfg.kv_tile_n
-        row_k_end = self._causal_row_k_end(causal_k_end)
-        for chunk_idx in cutlass.range_constexpr(len(s_data)):
-            num_valid = cute.math.min(
-                cute.math.max(row_k_end - (kv_base + chunk_idx * tmem_x), Int32(0)),
-                Int32(tmem_x),
-            )
-            mask = cutlass.vector.create_mask([tmem_x], [num_valid])
-            masked_values = cutlass.vector.full_like(
-                s_data[chunk_idx], Float32(_SOFTMAX_MASK_VALUE)
-            )
-            s_data[chunk_idx] = cutlass.vector.where(
-                mask, s_data[chunk_idx], masked_values
-            )
-        return s_data
-
-    @cute.jit
     def _mask_range_word(self, stage_info: StageInfo) -> tuple[cutlass.Array, Int32]:
         """Return the SMEM range words and this warp's slot in them."""
         words = cutlass.Array(
@@ -5798,11 +5776,9 @@ class TmemSPResource(MemoryResource):
         """
         s_data = self._load_s_chunks(stage_info)
         if self._loop_tile_needs_mask(stage_info):
-            masked = self._mask_variable_window_chunks(
+            s_data = self._mask_variable_window_chunks(
                 stage_info, s_data, window_start, window_end
             )
-            for chunk_idx in cutlass.range_constexpr(len(s_data)):
-                s_data[chunk_idx] = masked[chunk_idx]
         return self._reduce_row_max(s_data, row_max)
 
     @cute.jit
@@ -5951,11 +5927,9 @@ class TmemSPResource(MemoryResource):
                 # Packed requests share a worst-case window span, and fixed
                 # bottom-right windows can begin at a non-aligned Q/K offset.
                 window_end = index_q + q_offset + Int32(1)
-            masked = self._mask_window_chunks(
+            s_data = self._mask_window_chunks(
                 s_data, base_k, window_bound_left, window_end
             )
-            for chunk_idx in cutlass.range_constexpr(len(s_data)):
-                s_data[chunk_idx] = masked[chunk_idx]
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -5967,17 +5941,18 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
         q_offset: Int32,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """Loop stage: query-paired causal mask on tiles crossing the causal end."""
-        causal_k_end = self._causal_k_end(stage_info, q_offset)
+        """Loop stage: apply causal masking for mixed Q right-offset batches."""
         if cutlass.const_expr(self.cfg.uses_ldtm_stat):
             return self._load_s_chunks_and_reduce_row_max(
-                stage_info, row_max, causal_loop_mask=True, causal_k_end=causal_k_end
+                stage_info,
+                row_max,
+                causal_loop_mask=True,
+                causal_k_end=self._causal_k_end(stage_info, q_offset),
             )
         s_data = self._load_s_chunks(stage_info)
-        if self._causal_k_end_needs_mask(stage_info.loop_offset, causal_k_end):
-            s_data = self._mask_causal_k_end_chunks(
-                s_data, stage_info.loop_offset, causal_k_end
-            )
+        s_data = self._apply_causal_mask_for_kv_tile(
+            stage_info, s_data, kv_tile_idx=stage_info.loop_offset, q_offset=q_offset
+        )
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -6220,55 +6195,16 @@ class TmemSPResource(MemoryResource):
         Unlike the query-paired tail mask, this keeps Q0/Q1 on the same
         sequence tile; q_half selects a Q head, not a later sequence tile.
         Sliding-window tails need both bounds because the final tile can also
-        contain keys to the left of the visible window.
-        """
-        return self._right_masked_row_max(
-            stage_info,
-            row_max=row_max,
-            q_offset=q_offset,
-            section=section,
-            needs_mask=None,
-        )
-
-    @consumer_work(returns=(old_row_max, row_max))
-    @cute.jit
-    def right_masked_loop_row_max(
-        self,
-        stage_info: StageInfo,
-        *,
-        row_max: SoftmaxScalar,
-        q_offset: Int32,
-    ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """LOOP form of ``right_masked_row_max``.
-
-        Tiles inside the warp's cached unmasked range skip the mask.
-        """
-        return self._right_masked_row_max(
-            stage_info,
-            row_max=row_max,
-            q_offset=q_offset,
-            section=FmhaStage.Loop,
-            needs_mask=self._loop_tile_needs_mask(stage_info),
-        )
-
-    @cute.jit
-    def _right_masked_row_max(
-        self,
-        stage_info: StageInfo,
-        *,
-        row_max: SoftmaxScalar,
-        q_offset: Int32,
-        section: cutlass.Constexpr[FmhaStage],
-        needs_mask: Optional[cutlass.Boolean],
-    ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """Load S, apply the head-paired causal/window mask, and reduce.
-
-        ``needs_mask=None`` masks unconditionally (TAIL).
+        contain keys to the left of the visible window. LOOP tiles inside the
+        warp's cached unmasked range skip the mask.
         """
         s_data = self._load_s_chunks(stage_info)
         if cutlass.const_expr(self.cfg.is_causal):
-            if cutlass.const_expr(needs_mask is None):
-                needs_mask = True
+            needs_mask = True
+            if cutlass.const_expr(
+                section == FmhaStage.Loop and self.uses_loop_unmasked_tile_range
+            ):
+                needs_mask = self._loop_tile_needs_mask(stage_info)
             if needs_mask:
                 index_q, kv_tile_start, window_bound_left = self._row_window_geometry(
                     stage_info, q_offset
@@ -6281,14 +6217,12 @@ class TmemSPResource(MemoryResource):
                 window_start = None
                 if cutlass.const_expr(self.needs_window_tail_left_mask):
                     window_start = window_bound_left
-                masked = self._mask_window_chunks(
+                s_data = self._mask_window_chunks(
                     s_data,
                     kv_tile_idx * self.cfg.kv_tile_n,
                     window_start,
                     index_q + q_offset + Int32(1),
                 )
-                for chunk_idx in cutlass.range_constexpr(len(s_data)):
-                    s_data[chunk_idx] = masked[chunk_idx]
         return self._reduce_row_max(s_data, row_max)
 
     @cute.jit

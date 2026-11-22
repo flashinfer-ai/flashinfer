@@ -247,52 +247,38 @@ def task_cache_visible_kv_interval_index(cfg: FmhaDecodeConfig) -> int:
 
 @cute.jit
 def kv_tile_is_unmasked(
-    cfg: FmhaDecodeConfig, stage_info: StageInfo, tile_offset_k: Int32
-) -> cutlass.Boolean:
-    """Return whether the K tile at ``tile_offset_k`` lies in the cached interval.
-
-    A task without the cached interval (no task cache, or a non-softmax task)
-    masks every tile, which is always exact.
-    """
-    end_idx = task_cache_visible_kv_interval_index(cfg)
-    words = cta_visible_kv_interval_words(cfg)
-    if cutlass.const_expr(
-        stage_info.task_cache is None or len(stage_info.task_cache) < end_idx + words
-    ):
-        return cutlass.Boolean(False)
-    visible_k_begin = Int32(0)
-    if cutlass.const_expr(words == 2):
-        visible_k_begin = Int32(stage_info.task_cache[end_idx + 1])
-    return kv_tile_is_fully_visible(
-        tile_offset_k,
-        Int32(cfg.tile_size_kv),
-        visible_k_begin,
-        Int32(stage_info.task_cache[end_idx]),
-    )
-
-
-@cute.jit
-def _kv_tile_is_fully_unmasked_for_q_group(
     cfg: FmhaDecodeConfig,
+    stage_info: StageInfo,
     tile_offset_k: Int32,
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
-    tile_has_valid_scores: cutlass.Boolean,
 ) -> cutlass.Boolean:
-    """Return whether a KV tile needs no score mask for any active Q row.
+    """Return whether the K tile at ``tile_offset_k`` needs no score mask.
 
-    For configs that do not cache the interval (``cta_caches_visible_kv_interval``),
-    whose rows share one right bound.
+    The tile must lie inside the keys every active row of the Q CTA sees.
+    Configs that cache that interval (``cta_caches_visible_kv_interval``) read
+    it from the task cache; a task without it masks every tile, which is
+    always exact. Other configs have one right bound and compute it here.
     """
-    visible_k_begin, visible_k_end = cta_visible_kv_interval(
-        cfg, seq_len_kv, seq_len_q, q_token_base
-    )
-    return tile_has_valid_scores and kv_tile_is_fully_visible(
-        tile_offset_k,
-        Int32(cfg.tile_size_kv),
-        visible_k_begin,
-        visible_k_end,
+    if cutlass.const_expr(cta_caches_visible_kv_interval(cfg)):
+        end_idx = task_cache_visible_kv_interval_index(cfg)
+        words = cta_visible_kv_interval_words(cfg)
+        if cutlass.const_expr(
+            stage_info.task_cache is None
+            or len(stage_info.task_cache) < end_idx + words
+        ):
+            return cutlass.Boolean(False)
+        visible_k_begin = Int32(0)
+        if cutlass.const_expr(words == 2):
+            visible_k_begin = Int32(stage_info.task_cache[end_idx + 1])
+        visible_k_end = Int32(stage_info.task_cache[end_idx])
+    else:
+        visible_k_begin, visible_k_end = cta_visible_kv_interval(
+            cfg, seq_len_kv, seq_len_q, q_token_base
+        )
+    return kv_tile_is_fully_visible(
+        tile_offset_k, Int32(cfg.tile_size_kv), visible_k_begin, visible_k_end
     )
 
 
@@ -592,19 +578,9 @@ def resolve_keeps_tile_context(
         and (tile_offset_k < seq_len_kv)
         and not is_masked_final_wave
     )
-    if cutlass.const_expr(cta_caches_visible_kv_interval(cfg)):
-        tile_is_unmasked = tile_has_valid_scores and kv_tile_is_unmasked(
-            cfg, stage_info, tile_offset_k
-        )
-    else:
-        tile_is_unmasked = _kv_tile_is_fully_unmasked_for_q_group(
-            cfg,
-            tile_offset_k,
-            seq_len_kv,
-            seq_len_q,
-            q_token_base,
-            tile_has_valid_scores,
-        )
+    tile_is_unmasked = tile_has_valid_scores and kv_tile_is_unmasked(
+        cfg, stage_info, tile_offset_k, seq_len_kv, seq_len_q, q_token_base
+    )
     # Flattened SQ=1 QToken-KvBlock-Sparse-Attention routes use their compacted causal length as
     # seq_len_kv. At or above the 2048-token budget this marks all first
     # sixteen KV128 tiles unmasked; only the optional 0--3-token tail in a

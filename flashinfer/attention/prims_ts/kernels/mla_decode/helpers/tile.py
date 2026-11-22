@@ -27,7 +27,7 @@ from .layout import (
     _TASK_CACHE_LOCAL_KV_TILES,
     _TASK_CACHE_SEQ_LEN_KV,
 )
-from .mask import MaskType, mask_visible_k_length
+from .mask import MaskType, mask_visible_k_length, rows_have_distinct_kv_prefix
 from .query import (
     flat_query_row_state,
     query_batch_bounds,
@@ -435,9 +435,9 @@ def runtime_seq_len_kv_for_query_row(
 
 
 def cta_rows_have_distinct_kv_prefix(cfg: MlaConfig) -> bool:
-    """Return whether query rows of one CTA can see different K prefixes."""
-    return cfg.mask_type == MaskType.CAUSAL.value and (
-        not cfg.fixed_seqlen or cfg.logical_seq_len_q > 1
+    """Return whether query rows of one 1CTA tile can see different K prefixes."""
+    return rows_have_distinct_kv_prefix(
+        cfg.mask_type, not cfg.fixed_seqlen, cfg.logical_seq_len_q
     )
 
 
