@@ -191,8 +191,9 @@ def _pdl_epilogue_waits(cfg: BatchedGemmConfig) -> bool:
     """Whether the epilogue waits before its first global read.
 
     Before its first TMEM-full wait the epilogue loads routing metadata
-    (``tile_idx``, ``mn_limit``, ``route_map``, the padded token count), the
-    expert's scales and bias, and any per-token scales. Under
+    (``tile_idx``, ``mn_limit``, ``route_map``, the padded token count, and
+    with fused finalize the expanded-to-permuted index map and the expert
+    weights), the expert's scales and bias, and any per-token scales. Under
     ``skip_early_exit_pdl`` only a per-token activation scale can come from the
     predecessor: the routing outputs fall under the option's precondition and
     the rest are static per-expert operands. Every other task-level-wait config

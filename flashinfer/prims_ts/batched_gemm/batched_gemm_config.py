@@ -722,8 +722,9 @@ class BatchedGemmConfig:
     become resident while the predecessor is still running. The count, the
     ``tile_idx``/``mn_limit`` entries the weight loaders use to prefetch the
     expert's weights and weight scale factors, and the routing metadata the
-    epilogue loads are then read without waiting for the predecessor, so the
-    kernel that produced them must have completed before this kernel could
+    epilogue loads (with fused finalize also the expanded-to-permuted index map
+    and the expert weights) are then read without waiting for the predecessor,
+    so the kernel that produced them must have completed before this kernel could
     launch: some kernel between the two must wait for the producer before it
     triggers ``launch_dependents``. In the MoE, routing produces them and FC1
     waits for routing before it triggers; FC2 launches after FC1 either
