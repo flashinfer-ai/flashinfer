@@ -87,7 +87,7 @@ def render() -> str:
 
 def main(out_path: str = CASES_PATH) -> str:
     text = render()
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(text)
     return out_path
 

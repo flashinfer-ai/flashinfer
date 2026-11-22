@@ -163,4 +163,4 @@ def render():
 
 
 if __name__ == "__main__":
-    Path(CASES_PATH).write_text(render())
+    Path(CASES_PATH).write_text(render(), encoding="utf-8")

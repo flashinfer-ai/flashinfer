@@ -9,7 +9,7 @@ from .test_megamoe_lean import _lake, needs_lake
 
 def test_generated_numerical_and_wire_cases_are_current():
     for module in (numerical_lean_cases, wire_lean_cases):
-        text = Path(module.CASES_PATH).read_text()
+        text = Path(module.CASES_PATH).read_text(encoding="utf-8")
         assert text == module.render()
         assert "sorry" not in text and "native_decide" not in text
     assert len(numerical_lean_cases.conformance_cases()) == 48
