@@ -601,11 +601,19 @@ class _BatchMLAGeneratedFaMechanics:
         # uses only the page ranges belonging to the planned KV batch.
         page_start = int(kv_indptr_host[0].item())
         page_end = int(kv_indptr_host[batch_size].item())
-        if page_start < page_end:
+        planned_kv_page_range: Optional[Tuple[int, int]]
+        if page_start >= page_end:
+            planned_kv_page_range = (0, 0)
+        elif self._use_cuda_graph and kv_indices.device.type != "cpu":
+            # CUDA graph callers may refresh the reserved kv_indices buffer
+            # after plan(), and replays read it as it is then, so a plan-time
+            # snapshot cannot bound replayed page ids. Snapshotting device
+            # indices would also cost a host-device sync on every plan().
+            # Leave the range unknown and skip the run-time page-pool check.
+            planned_kv_page_range = None
+        else:
             page_min, page_max = torch.aminmax(kv_indices[page_start:page_end])
             planned_kv_page_range = (int(page_min.item()), int(page_max.item()) + 1)
-        else:
-            planned_kv_page_range = (0, 0)
         plan_args = (
             self._float_workspace_buffer,
             self._int_workspace_buffer,
@@ -1004,9 +1012,12 @@ class _BatchMLAPagedAttentionFaBackendBase(
             raise ValueError(
                 "q_nope and ckv_cache must be on the planned workspace device."
             )
-        page_min, required_pages = self._planned_kv_page_range
-        if page_min < 0 or cache_shape[0] < required_pages:
-            raise ValueError("KV cache does not cover the planned CSR page indices.")
+        if self._planned_kv_page_range is not None:
+            page_min, required_pages = self._planned_kv_page_range
+            if page_min < 0 or cache_shape[0] < required_pages:
+                raise ValueError(
+                    "KV cache does not cover the planned CSR page indices."
+                )
 
     def run_from_wrapper(
         self,
@@ -1113,9 +1124,12 @@ class _BatchMLAPagedAttentionFaBackendBase(
                 self.device,
                 name,
             )
-        page_min, required_pages = self._planned_kv_page_range
-        if page_min < 0 or cache[0].shape[0] < required_pages:
-            raise ValueError("KV cache does not cover the planned CSR page indices.")
+        if self._planned_kv_page_range is not None:
+            page_min, required_pages = self._planned_kv_page_range
+            if page_min < 0 or cache[0].shape[0] < required_pages:
+                raise ValueError(
+                    "KV cache does not cover the planned CSR page indices."
+                )
         if inputs[2] is not None:
             check_shape_dtype_device(
                 inputs[2],
