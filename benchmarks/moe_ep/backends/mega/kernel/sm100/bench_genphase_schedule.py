@@ -119,7 +119,7 @@ from flashinfer.moe_ep import (
     finalize_moe_ep_runtime,
 )
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
 assert Path(flashinfer.__file__).resolve().is_relative_to(source)
 rank, world = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))

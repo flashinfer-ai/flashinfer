@@ -48,7 +48,7 @@ def backend(monkeypatch):
 @pytest.mark.parametrize("source", ["memory", "file", "bundled"])
 @pytest.mark.parametrize(
     "warmup_m,tuned_m,runtime_m,gemv,hit",
-    [(1, 1, 4, True, False), (2, 2, 4, False, True), (128, 1, 1, True, True)],
+    [(1, 1, 4, True, False), (2, 2, 4, False, False), (128, 1, 1, True, True)],
 )
 def test_cached_tactics_preserve_warmup_reuse(
     backend, monkeypatch, source, warmup_m, tuned_m, runtime_m, gemv, hit

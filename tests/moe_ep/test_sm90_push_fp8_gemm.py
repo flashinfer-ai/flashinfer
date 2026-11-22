@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 # Private grouped SM90 FP8 block-scale MoE GEMM vs a pure-torch oracle.
-# Layout contract (kernel_src/sm90/push_style_megamoe/src/fp8_gemm/fp8_moe_binding.cu):
+# Layout contract (kernels/flashinfer/push_style_megamoe/fp8_gemm/fp8_moe_binding.cu):
 #     a:        (M, K) fp8, rows expert-contiguous per `offsets`
 #     b:        (G, N, K) fp8 contiguous
 #     offsets:  cumulative int64 of length G + 1
@@ -89,7 +89,7 @@ def runner():
 
     if not is_cuda_version_at_least("12.8"):
         pytest.skip("SM90 push FP8 MoE GEMM requires CUDA Toolkit 12.8+")
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.gemm import (
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe.gemm import (
         create_sm90_push_fp8_moe_gemm_runner,
     )
 

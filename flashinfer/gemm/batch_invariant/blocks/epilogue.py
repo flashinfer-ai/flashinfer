@@ -172,12 +172,13 @@ def epilogue_loop(
     epi_tile: cute.Tile,
     acc_pipeline,
     alpha,
-    chunks: cutlass.Constexpr = 1,
+    chunks=1,
     mBias: Optional[cute.Tensor] = None,
     tCcC_base: Optional[cute.Tensor] = None,
+    cc: cutlass.Constexpr = False,
 ):
     """``chain`` is the specification's epilogue chain (``spec.EpilogueChain``) and ``alpha`` its runtime scalar (None for
-    the unscaled chain). ``chunks > 1``: the in-CTA chunk fold (module docstring) -- the mainloop commits one accumulator
+    the unscaled chain). ``cc`` (static) with ``chunks`` its runtime count: the in-CTA chunk fold (module docstring) -- the mainloop commits one accumulator
     stage per chunk, the first ``chunks - 1`` are folded into the TMEM running sum (``st.sum_stage``) and released, the
     last one receives the fold and is stored through the ordinary subtile loop below (the chain once, after the fold).
     ``mBias`` (the (N,) bias) with ``tCcC_base`` (the output coordinates partitioned like C): the biased chain, the
@@ -217,7 +218,7 @@ def epilogue_loop(
         )
     # the in-CTA chunk fold: the running sum's TMEM partitions (the stage `st.sum_stage`), the store twin of the load atom, a second fragment
     tiled_copy_r2t = tTR_tSum = tTR_tSumSt = tTR_rSum = None
-    if cutlass.const_expr(chunks > 1):
+    if cutlass.const_expr(cc):
         tiled_copy_r2t = tcgen05.make_tmem_copy(
             tmem_store_atom_for(copy_atom_t2r, ACC_DTYPE),
             tAcc_epi[(None, None, 0, 0, 0)],
@@ -267,7 +268,7 @@ def epilogue_loop(
         work_tile = tile_sched.get_current_work()
         num_tiles_executed = tile_sched.num_tiles_executed
         bSG_gC = bSG_gC_all[(None, None, None, *mnl)]
-        if cutlass.const_expr(chunks > 1):
+        if cutlass.const_expr(cc):
             # chunks 0 .. C-2: fold each completed partial into the TMEM running sum (chunk order from +0), release its stage
             for c in cutlass.range(0, chunks - 1, 1, unroll=1):
                 acc_pipeline.consumer_wait(acc_state)  # chunk c's fold is complete
@@ -304,7 +305,7 @@ def epilogue_loop(
             acc_state
         )  # the fold of this tile (its last chunk) is complete
         tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-        if cutlass.const_expr(chunks > 1):
+        if cutlass.const_expr(cc):
             # the last chunk: acc = add(sum, P_{C-1}) in place; the subtile loop below stores the class's fold
             tAccSt_c = cute.group_modes(
                 tTR_tAccSt_base[(None, None, None, None, None, acc_state.index)], 3, 5

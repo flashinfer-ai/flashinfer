@@ -26,7 +26,12 @@ cells its route table lists
 (``flashinfer.jit.cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES``): one
 launch over both dies whose CTAs take the (batch row, value head) items of their
 own die's rows first. Its output and updated state are those of the whole-GPU
-body bit for bit. Every other call runs the whole-GPU route.
+body bit for bit. Every other call that the Cake kernels serve runs the whole-GPU
+route; one they do not serve runs the FlashInfer kernel under ``backend="auto"``
+and raises ``CakeGDNUnsupportedError`` under ``backend="cake_gdn"``. A call with
+the dtypes, shapes and contiguity those kernels take raises ``ValueError`` under
+both, on every row and GPU, if q or k is not 8-byte aligned or the state is not
+16-byte aligned.
 """
 
 from __future__ import annotations
@@ -127,7 +132,8 @@ def localize_gdn_decode_state(
     Pass the returned tensor as ``state`` to
     :func:`flashinfer.gdn_decode.gated_delta_rule_decode` from then on (the call
     updates it in place, as any state). A T=1 call with ``num_q_heads`` query
-    heads, this ``scale`` and ``use_qk_l2norm=True`` under ``backend="auto"`` or
+    heads, this ``scale``, contiguous BF16 q/k/v/a/b and output, FP32 ``A_log`` and
+    ``dt_bias`` and ``use_qk_l2norm=True`` under ``backend="auto"`` or
     ``backend="cake_gdn"`` then runs the locality-domain twin of the Cake
     nontranspose FP32 decode body: one launch over both dies whose CTAs take the
     (batch row, value head) items of their own die's rows first, so most state
@@ -138,20 +144,31 @@ def localize_gdn_decode_state(
     die 0 (``split_units(B, (1, 1))[0]``). ``scale`` defaults to ``K ** -0.5``,
     the default of the decode call.
 
-    Returns ``state`` itself, unhomed, when the call is under CUDA graph capture,
-    or when no call of this row would run the twin: ``state`` is not FP32 with
-    ``K = V = 128`` on an SM107a device, the call row (``B``, ``num_q_heads``,
-    ``HV``, ``scale``) has no twin listed for the device's SM count in any die
-    class (the twin covers ``H=16``, ``HV=32`` from ``B=48`` on, at
-    ``scale`` ``K ** -0.5`` or ``1.0``, on 212-SM devices), the device has no SM
-    table (:func:`flashinfer.cake_locality.sm_table` is ``None``: a CUDA 13.5
-    toolkit and driver are needed), the row is not listed for the die class of
-    the device, or the cut is not a multiple of the allocation granularity of
-    locality-domain memory. The checks that need no device work come first: a
-    refused row is returned before the SM table is probed or anything is
-    allocated. Raises ``ValueError`` for a ``state`` that is not a contiguous
-    4-D CUDA tensor, a non-positive ``num_q_heads`` or a ``rows0`` outside
-    ``[0, B]``.
+    The returned tensor is a new allocation of the size of ``state``, made by the
+    CUDA driver outside PyTorch's caching allocator
+    (``torch.cuda.memory_allocated()`` does not count it). ``state`` itself is not
+    freed: drop the last reference to it after this call so that the state is not
+    held twice.
+
+    Returns ``state`` itself, without a copy, when the call is under CUDA graph
+    capture, or when it does not home the state: ``state`` is not FP32 with
+    ``K = V = 128`` on an SM107a device, ``state`` is a ``__torch_dispatch__``
+    wrapper subclass, the call row (``B``, ``num_q_heads``, ``HV``, ``scale``) has
+    no twin listed for the device's SM count in any die class (the twin covers
+    ``H=16``, ``HV=32`` from ``B=48`` on, at ``scale`` ``K ** -0.5`` or ``1.0``, on
+    212-SM devices), the device has no SM table
+    (:func:`flashinfer.cake_locality.sm_table` is ``None``: a CUDA 13.5 toolkit and
+    driver are needed), the row is not listed for the die class of the device, or
+    the cut is not a multiple of the allocation granularity of locality-domain
+    memory. The checks that need no device work come first: a refused row is
+    returned before the SM table is probed or anything is allocated. A result other
+    than ``state`` is therefore a new homed copy, and ``state`` itself as the result
+    means only that no copy was made, not which kernel a decode call runs: a call
+    on a ``state`` that was never homed never runs the twin, but a ``state`` that
+    was already homed (for example by an earlier call of this helper) stays homed,
+    and a call of a listed row on it can still run the twin. Raises ``ValueError``
+    for a ``state`` that is not a contiguous 4-D CUDA tensor, a non-positive
+    ``num_q_heads`` or a ``rows0`` outside ``[0, B]``.
 
     Only the whole returned allocation is homed: the tensor itself and every
     alias of it with the same shape (a ``detach()``, a view of the same shape).

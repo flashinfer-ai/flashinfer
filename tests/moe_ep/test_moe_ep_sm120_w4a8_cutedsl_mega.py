@@ -63,7 +63,7 @@ def test_sm120_w4a8_green_context_requirements(
 
 
 def test_sm120_w4a8_graph_compile_bucket_selection() -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import (
         select_graph_compile_bucket,
     )
 
@@ -100,9 +100,7 @@ def test_sm120_w4a8_graph_compile_bucket_selection() -> None:
         assert select_graph_compile_bucket(321, capacity) == 384
     assert not caught
     with pytest.warns(RuntimeWarning, match="falling back to workspace capacity"):
-        from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel.shim import (
-            runtime,
-        )
+        from flashinfer.moe_ep.shims.sm120.split_cutedsl import runtime
 
         runtime._WARNED_DECODE_CAPACITY_FALLBACKS.discard(capacity)
         assert select_graph_compile_bucket(4097, capacity) == capacity
@@ -110,7 +108,7 @@ def test_sm120_w4a8_graph_compile_bucket_selection() -> None:
 
 @pytest.mark.parametrize("capacity", (4, 300, 384, 700, 2048, 8192, 16384))
 def test_sm120_w4a8_buckets_respect_capacity(capacity: int) -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel.shim import runtime
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import runtime
 
     buckets = sorted(
         {b for b in runtime.DECODE_GRAPH_COMPILE_BUCKETS if b <= capacity} | {capacity}
@@ -131,9 +129,7 @@ def test_sm120_w4a8_buckets_respect_capacity(capacity: int) -> None:
 def test_sm120_w4a8_medium_buckets_select_distinct_kernel_specs(
     bucket, expected_n
 ) -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel import (
-        bootstrap_paths,
-    )
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import bootstrap_paths
 
     bootstrap_paths()
     from moe_sm120_mxfp4mxfp8_split.api import MegaMoEProblemSpec, select_compile_spec
@@ -163,9 +159,7 @@ def test_sm120_w4a8_medium_buckets_select_distinct_kernel_specs(
 
 
 def test_sm120_w4a8_dp4_decode_320_uses_n32_and_unique_cache_key() -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel import (
-        bootstrap_paths,
-    )
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import bootstrap_paths
 
     bootstrap_paths()
     from moe_sm120_mxfp4mxfp8_split.api import (
@@ -202,9 +196,7 @@ def test_sm120_w4a8_dp4_decode_320_uses_n32_and_unique_cache_key() -> None:
 
 
 def test_sm120_w4a8_frontend_graph_cache_key_includes_bucket() -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel.shim import (
-        runtime,
-    )
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import runtime
 
     weights = (
         (torch.empty(1), torch.empty(1)),
@@ -311,7 +303,9 @@ def _dequant(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 
 
 def _torch_reference(problem: dict) -> torch.Tensor:
-    from common.host_utils import mxfp8_quantize_per_block_32_row
+    from flashinfer.moe_ep.kernels.flashinfer.sm120_split.common.host_utils import (
+        mxfp8_quantize_per_block_32_row,
+    )
 
     inputs = problem["inputs"]
     weights = problem["weights"]

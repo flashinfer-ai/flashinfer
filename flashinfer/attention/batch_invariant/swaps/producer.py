@@ -16,6 +16,9 @@ from cutlass.cute.nvgpu import cpasync
 
 from ..blocks.operands import HALF
 
+GATE_AFTER_V = 0  # the first unit's burst: Q, K_0, K_1, K_2, V_0 issued, then wait for K_0 before the rest of the ring
+GATE_TILES = 4  # K / V tiles of that burst: the gate exists only when they fit the ring (slot 0 not yet reused)
+
 
 @cute.jit
 def issue_slot(
@@ -34,7 +37,7 @@ def issue_slot(
     """One ring slot: 128 keys from absolute key ``key0``, dims ``[sl slot_dims, (sl + 1) slot_dims)``: acquire it, issue
     ``boxes_per_slot x halves`` TMA boxes (a box is ``box_rows = min(page, 128)`` keys of one page, one 64-wide half).
     Under ``st.ragged`` the pool is one page of ``total_kv`` tokens and the box starts at the request's token offset plus the key
-    (the domain shifted by ``kv_indptr[req]``, a token offset, in ``load_loop``); coordinates past the pool are zero-filled by the TMA and keys past the
+    (the domain shifted by the request's token offset ``kv_ptr0`` in ``load_loop``); coordinates past the pool are zero-filled by the TMA and keys past the
     request's length are masked / zeroed exactly as the junk of a paged pool's pages is."""
     page = st.page
     h = kv_prod.acquire_and_advance()
@@ -111,16 +114,22 @@ def load_loop(
     sKV_view: cute.Tensor,
     q_prod,
     kv_prod,
-    mKvIndptr: cute.Tensor,
     mKvIndices: cute.Tensor,
-    req: Int32,
+    kv_ptr0: Int32,
+    n_pages: Int32,
     tok_abs: Int32,
     kv_head: Int32,
     tile_lo: Int32,
     tile_hi: Int32,
+    kv_full_bar0: cute.Pointer,
+    gate,
 ):
-    kv_ptr0 = mKvIndptr[req]
-    n_pages = mKvIndptr[req + 1] - kv_ptr0
+    # ``gate`` (the CTA's first unit): once the first ring slots are issued (K_0, K_1, K_2, V_0: the MMA warp's first needs) the warp
+    # waits for slot 0's bytes (its full barrier, first phase) before issuing the rest, so the wave's first tiles are not interleaved
+    # with every CTA's whole burst
+    # ``kv_ptr0`` / ``n_pages``: the request's first page-table entry and page count, plan constants the descriptor carries
+    # (F_KVPTR0 / F_NPAGES) like the query offsets: a plan runs with its own kv_indptr (engine.run_attention), so no lookup of
+    # kv_indptr[req] stands between the descriptor and the first K / V box
     # Q: the unit's tokens start at the packed row tok_abs (tokens past the request are padding rows, never stored; past total_q the TMA zero-fills)
     tQ_off = cute.domain_offset((0, 0, tok_abs), tQ)
     gQ = cute.zipped_divide(
@@ -192,4 +201,10 @@ def load_loop(
             n_pages,
             kv_head,
         )
+        if n == GATE_AFTER_V:
+            if cutlass.const_expr(GATE_TILES * st.slots_per_tile <= st.n_slots):
+                # slot 0 still holds K_0's first fill (phase 0) when the ring takes the whole burst; a smaller ring has refilled it
+                # by now (K_0 landed long ago) and a parity-0 wait would need the producer itself: no gate
+                if gate:
+                    cute.arch.mbarrier_wait(kv_full_bar0, 0)
     return q_prod, kv_prod

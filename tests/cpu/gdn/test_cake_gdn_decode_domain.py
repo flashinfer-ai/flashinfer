@@ -330,7 +330,10 @@ def test_nontranspose_domain_variant_follows_the_whole_route() -> None:
 
 
 class _FakeCuda(torch.Tensor):
-    """A meta tensor that the nontranspose host checks take for a tensor of cuda:0."""
+    """A meta tensor that the nontranspose host checks take for a tensor of cuda:0,
+    at base address ``address`` (0 unless set)."""
+
+    address = 0
 
     @property
     def is_cuda(self):
@@ -343,11 +346,16 @@ class _FakeCuda(torch.Tensor):
     def get_device(self):
         return 0
 
+    def data_ptr(self):
+        return self.address
 
-def _fake(shape, dtype) -> torch.Tensor:
-    return torch.Tensor._make_subclass(
+
+def _fake(shape, dtype, address=0) -> torch.Tensor:
+    tensor = torch.Tensor._make_subclass(
         _FakeCuda, torch.empty(shape, dtype=dtype, device="meta")
     )
+    tensor.address = address
+    return tensor
 
 
 class _FakeCudaWrapper(_FakeCuda):
@@ -546,6 +554,86 @@ def test_unhomed_state_launches_the_whole_route_as_before(monkeypatch) -> None:
         assert gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES == {}
         assert gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES == {}
         assert not any(_TWIN in name for name in device.loads)
+
+
+@pytest.mark.parametrize("backend", [None, "auto", "cake_gdn"])
+def test_unaligned_inputs_raise_before_any_launch(monkeypatch, backend) -> None:
+    # Contiguous views at an unaligned storage offset: the kernels read q and k in
+    # 8-byte vectors and the state in 16-byte copies, so the call raises before it
+    # resolves or launches anything, homed or not, with the row's launch cached or
+    # not.  The check is row- and GPU-independent: through the public call
+    # (``backend`` not None) backend="auto" raises too, also on a device the Cake
+    # kernels do not serve; it does not fall back to the FlashInfer kernel.
+    device = _Device(monkeypatch)
+
+    def flashinfer_kernel(*args, **kwargs):
+        raise AssertionError("fell back to the FlashInfer kernel")
+
+    monkeypatch.setattr(gdn_decode, "run_nontranspose_decode", flashinfer_kernel)
+
+    def run(inputs):
+        if backend is None:
+            return _run(inputs)
+        output, _ = gdn_decode.gated_delta_rule_decode(
+            **inputs, scale=_SCALE, backend=backend
+        )
+        return output
+
+    def run_misaligned(device):
+        for homed in (False, True):
+            for name, address in (
+                ("q", 2),
+                ("q", 4),
+                ("k", 6),
+                ("state", 4),
+                ("state", 8),
+            ):
+                inputs = _decode_inputs(64)
+                tensor = inputs[name]
+                inputs[name] = _fake(tensor.shape, tensor.dtype, address)
+                if homed:
+                    device.home(inputs["state"])
+                with pytest.raises(ValueError, match="aligned"):
+                    run(inputs)
+
+    # 8-byte aligned q and k and a 16-byte aligned state launch as before; the other
+    # tensors, read and written one element at a time, need only their element
+    # alignment.  This runs first: no state is homed yet, and the row's launch is
+    # cached for the misaligned calls that follow.
+    inputs = _decode_inputs(64)
+    for name, address in (
+        ("q", 8),
+        ("k", 1032),
+        ("state", 16),
+        ("v", 2),
+        ("a", 2),
+        ("b", 6),
+        ("output", 2),
+        ("A_log", 4),
+        ("dt_bias", 12),
+    ):
+        inputs[name] = _fake(inputs[name].shape, inputs[name].dtype, address)
+    assert run(inputs) is inputs["output"]
+    ((route, args),) = device.calls
+    assert _TWIN not in route and args[:9] == _whole_args(inputs, 0)[:9]
+    loads = list(device.loads)
+    run_misaligned(device)
+    assert len(device.calls) == 1 and device.loads == loads
+    # On a device the Cake kernels do not serve (SM90), the misaligned calls raise
+    # all the same, before the architecture is looked up.  An aligned call there
+    # raises CakeGDNUnsupportedError, which backend="auto" turns into a fallback.
+    device = _Device(monkeypatch, capability=(9, 0), sm_count=132)
+    run_misaligned(device)
+    assert device.calls == [] and device.loads == []
+    if backend == "auto":
+        unsupported = pytest.raises(AssertionError, match="fell back")
+    else:
+        unsupported = pytest.raises(
+            cake_gdn.CakeGDNUnsupportedError, match=r"compute capability 9\.0"
+        )
+    with unsupported:
+        run(_decode_inputs(64))
+    assert device.calls == [] and device.loads == []
 
 
 @pytest.mark.parametrize("scale", [_SCALE, 1.0])

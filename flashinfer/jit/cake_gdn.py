@@ -35,10 +35,10 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from filelock import FileLock
-from tvm_ffi import cpp
 
 from . import env as jit_env
 from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
+from .inline_cubin import load_inline_with_cubin
 
 CakeGDNArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
@@ -456,7 +456,7 @@ def load_cake_gdn_kernel(
     host_digest = hashlib.sha256(host_source.encode("utf-8")).hexdigest()
     module_key = f"{cubin.stem}\0{host_digest}".encode()
     module_digest = hashlib.sha256(module_key).hexdigest()
-    module = cpp.load_inline(
+    module = load_inline_with_cubin(
         f"flashinfer_cake_gdn_{name}_{arch}_{module_digest[:12]}",
         cpp_sources=host_source,
         embed_cubin={host["module_ident"]: cubin.read_bytes()},
