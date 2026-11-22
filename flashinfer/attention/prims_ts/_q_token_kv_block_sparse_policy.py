@@ -265,16 +265,17 @@ DEFAULT_UNION_EXPONENT = 0.35
 # and the split reduction. Only the argmin matters: with
 # DEFAULT_UNION_EXPONENT the constants minimize chosen/best-measured latency
 # (geomean, then worst case) over NVFP4 sweeps on real indexer top-k of two
-# corpora (4/1 and 16/2 Q/KV heads per GPU, one request, 0-64K
+# corpora (4/1, 16/1 and 16/2 Q/KV heads per GPU, one request, 0-64K
 # prefix, 1-4096 queries, explicit G in {1, 2, 4, 8, 16, 32}; 152 SMs),
-# cross-validated between the corpora: geomean 1.000-1.001x, worst
-# 1.01-1.04x of the best G. NVFP4 K/V is transformed in the kernel (no
-# per-call K/V conversion), and the expected union is capped at the longest
-# request's KV length (``seq_len_kv``).
-_TILE_US = {64: 1.215, 128: 2.062}
-_ITEM_US = 1.041
-_METADATA_US = {4: 3.742, 8: 6.36, 16: 7.89, 32: 10.423}
-_REDUCE_US = 0.83
+# fitted on one corpus and checked on the other: geomean within 1.001x,
+# worst 1.01x of the best G. NVFP4 K/V is transformed in the kernel
+# (no per-call K/V conversion). With the longest request's KV length
+# (``seq_len_kv``), each route's expected union is capped at the context
+# its last query sees (``_mean_route_union_tokens``).
+_TILE_US = {64: 1.715, 128: 2.886}
+_ITEM_US = 3.736
+_METADATA_US = {4: 6.748, 8: 9.996, 16: 12.195, 32: 16.296}
+_REDUCE_US = 1.1
 # Candidate groups: powers of two up to G32 (two to four membership planes
 # beyond G8), plus the largest legal group (a short request then forms one
 # route). Other odd groups measured no better and only add JIT variants.
@@ -289,6 +290,28 @@ def expected_union_tokens(
     """Expected union of ``group_size`` adjacent queries' selections, in tokens."""
     grown = selected_kv_tokens * group_size**union_exponent
     return max(1, min(group_size * selected_kv_tokens, int(round(grown))))
+
+
+def _mean_route_union_tokens(
+    union: int, group_size: int, seq_len_q: int, kv_tokens: int
+) -> int:
+    """Mean over a request's routes of ``union`` capped by the route's context.
+
+    The request's ``seq_len_q`` queries end at KV length ``kv_tokens``; route
+    r covers queries rG..rG+G-1, whose last query sees ``kv_tokens -
+    seq_len_q + min((r + 1) G, seq_len_q)`` tokens. Causal prefill from a
+    short prefix therefore gathers far less than ``union`` in early routes.
+    """
+    prefix = max(0, kv_tokens - seq_len_q)
+    full_groups, tail = divmod(seq_len_q, group_size)
+    routes = full_groups + int(tail > 0)
+    # Full routes r < below end at or under the union: prefix + (r + 1) G.
+    below = min(full_groups, max(0, (union - prefix) // group_size))
+    total = below * prefix + group_size * below * (below + 1) // 2
+    total += (full_groups - below) * union
+    if tail:
+        total += min(union, kv_tokens)
+    return max(1, -(-total // routes))
 
 
 def suggest_sparse_group(
@@ -312,9 +335,10 @@ def suggest_sparse_group(
 
     For each legal G (powers of two up to G32 with at most TileQ128 rows),
     the selected recipe's configured split fanout is applied to the group's
-    *expected* union (``expected_union_tokens``, capped at ``kv_tokens``,
-    the longest request's KV length, when positive) to obtain the active splits
-    and KV tiles per work item; the estimate is
+    *expected* union (``expected_union_tokens``; when ``kv_tokens``, the
+    longest request's KV length, is positive, each route's union is capped
+    at its last query's context and averaged, ``_mean_route_union_tokens``)
+    to obtain the active splits and KV tiles per work item; the estimate is
     ``waves * (tiles_per_item * tile_cost[TileQ] + item_cost)`` plus the
     grouped metadata launch and the split reduction (active splits > 1).
     ``nvfp4_kv`` plans the NVFP4 transform recipes as the resolver does
@@ -381,7 +405,7 @@ def suggest_sparse_group(
             launch = replace(launch, num_insts_kv=1)
         union = expected_union_tokens(group, selected_kv_tokens, union_exponent)
         if kv_tokens > 0:
-            union = min(union, kv_tokens)
+            union = _mean_route_union_tokens(union, group, seq_len_q, kv_tokens)
         tiles = (union + TILE_SIZE_KV - 1) // TILE_SIZE_KV
         active_splits = compute_runtime_active_splits_kv(
             valid_k=union,

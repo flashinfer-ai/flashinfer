@@ -4319,6 +4319,30 @@ def fmha_decode_launch(
                 if cutlass.const_expr(cfg.swizzles_v_scale_factors)
                 else cuda.TensorMapSwizzle.none,
             )
+        if cutlass.const_expr(cfg.uses_nvfp4_scale_gather4):
+            # Compact scale tensors: each page fragment's scale rows are one
+            # contiguous row of a flat 2-D map (32-bit words), gathered four
+            # rows per copy (FmhaDecodeConfig.uses_nvfp4_scale_gather4).
+            sf_frag_bytes = cfg.num_tokens_per_page * sf_per_token
+            sf_frag_rows = Int32(
+                Int64(total_pages)
+                * Int64(sf_storage_tokens_per_page // cfg.num_tokens_per_page)
+                * Int64(cfg.flat_nvfp4_scale_num_heads)
+            )
+
+            def sf_gather4_desc(sf_iter):
+                """Flat fragment-row TensorMap of one compact scale tensor."""
+                return create_tensor_map_tiled(
+                    global_address=sf_iter.toint(),
+                    dtype=Int32,
+                    global_dims=[sf_frag_bytes // 4, sf_frag_rows],
+                    global_strides=[sf_frag_bytes // 16],
+                    box_dims=[sf_frag_bytes // 4, 1],
+                    swizzle=cuda.TensorMapSwizzle.none,
+                )
+
+            tma_desc_k_sf = sf_gather4_desc(k_sf_iter)
+            tma_desc_v_sf = sf_gather4_desc(v_sf_iter)
 
     grid_x = q_groups
     grid_batch = b

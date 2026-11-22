@@ -4302,7 +4302,9 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
     fewer than four fragments per KV tile (``block64``), or with fragments
     wider than one gather4 box (``block8``: 8 x 144 bytes; ``block8-heads2``
     also checks the second KV head's coordinates). Separate scale tensors
-    stage 128-byte SW128 payload rows and a separate scale stage.
+    stage 128-byte SW128 payload rows and a separate scale stage; compact
+    scale tensors gather four fragments' scale rows per TMA gather4, and the
+    transposed ``nhd-view`` scales keep one copy per fragment.
 
     ``packed`` passes the same queries as packed ``[total_q, Hq, D]`` rows
     with ``qo_indptr``: FP8 Q up to G4 with at most 16 Q rows per KV head runs
@@ -4739,6 +4741,42 @@ def test_wide_group_suggestion_for_long_nvfp4_prefill() -> None:
     short = suggest(1, 4, 2051, 16, 2, 148, seq_len_kv=65536 + 4, **packed)
     assert (long_4_1, fresh_4_1, long_16_2) == (16, 32, 8) and short <= 4
     assert suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=4096, nvfp4_kv=True) <= 8
+
+
+def test_group_suggestion_caps_route_unions_at_causal_context() -> None:
+    """Routes of a prefill from a short prefix see only their own context.
+
+    The expected union of each route is capped at the KV length its last
+    query sees and averaged over the request's routes (checked against a
+    direct mean). Sixteen Q heads per KV head from an empty prefix then
+    take G8 (one TileQ128 per eight queries, GB300: 136 us vs 169 us for
+    G4 at 4096 queries), where a single request-length cap preferred G4.
+    """
+
+    from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
+        _mean_route_union_tokens,
+    )
+
+    for prefix in (0, 100, 4000, 65536):
+        for seq_len_q in (1, 7, 100, 4096):
+            for group_size in (1, 4, 8, 32):
+                for union in (1, 2051, 4241):
+                    routes = -(-seq_len_q // group_size)
+                    capped = [
+                        min(union, prefix + min((r + 1) * group_size, seq_len_q))
+                        for r in range(routes)
+                    ]
+                    expected = max(1, -(-sum(capped) // routes))
+                    assert (
+                        _mean_route_union_tokens(
+                            union, group_size, seq_len_q, prefix + seq_len_q
+                        )
+                        == expected
+                    )
+
+    suggest = suggest_prims_ts_q_token_kv_block_sparse_group_size
+    packed = dict(nvfp4_kv=True, packed_query=True)
+    assert suggest(1, 4096, 2051, 16, 1, 152, seq_len_kv=4096, **packed) == 8
 
 
 def test_wide_group_suggestion_needs_small_blocks() -> None:

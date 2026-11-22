@@ -1599,6 +1599,7 @@ def _make_decode_compile_spec(
     out_dtype_key: str,
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None,
     flat_native_kv_tma: bool = False,
+    flat_nvfp4_scale_num_heads: int = 0,
     lse_mode: str = "none",
     runtime_kv_lengths: bool = False,
     scale_types: tuple[bool, bool] = (False, False),
@@ -1635,6 +1636,7 @@ def _make_decode_compile_spec(
     config_items["lse_mode"] = lse_mode
     config_items["use_flat_native_kv_tma"] = flat_native_kv_tma
     config_items["flat_native_kv_num_heads"] = num_kv_heads if flat_native_kv_tma else 1
+    config_items["flat_nvfp4_scale_num_heads"] = flat_nvfp4_scale_num_heads
     return _DecodeCompileSpec(
         device_index=device_index,
         config_items=tuple(config_items.items()),
@@ -4183,6 +4185,21 @@ def _prepare_prims_ts_batch_decode_plan(
             <= NVFP4_GATHER4_MAX_FRAGMENT_BYTES
         )
     )
+    # Compact separate scale tensors view every page fragment's scale rows
+    # as one row of a flat 2-D map, which the Keeps raw ring gathers four
+    # fragments at a time (FmhaDecodeConfig.uses_nvfp4_scale_gather4).
+    flat_nvfp4_scale_num_heads = 0
+    if (
+        use_q_token_kv_block_sparse_route
+        and spec.config.uses_nvfp4_scale_tensors
+        and k_sf_cache.is_contiguous()
+        and v_sf_cache.is_contiguous()
+        and k_sf_cache.numel() // max(1, page_size * k_sf_cache.shape[-1]) < (1 << 31)
+        and replace(
+            spec.config, flat_nvfp4_scale_num_heads=num_kv_heads
+        ).uses_nvfp4_scale_gather4
+    ):
+        flat_nvfp4_scale_num_heads = num_kv_heads
     compile_spec = _make_decode_compile_spec(
         spec,
         device_index=device_index,
@@ -4196,6 +4213,7 @@ def _prepare_prims_ts_batch_decode_plan(
         out_dtype_key=_dtype_key(out_dtype),
         direct_q1_spec=direct_q1_spec,
         flat_native_kv_tma=flat_native_kv_tma,
+        flat_nvfp4_scale_num_heads=flat_nvfp4_scale_num_heads,
         lse_mode=lse_mode,
         scale_types=scale_types(softmax_scale, output_scale),
     )
