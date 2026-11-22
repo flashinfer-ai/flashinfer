@@ -77,7 +77,7 @@ def download_file(
     retries: int = 4,
     delay: int = 5,
     timeout: int = 10,
-    lock_timeout: int = 30,
+    lock_timeout: float = -1,
     session: "requests.Session | None" = None,
     *,
     expected_sha256: str | None = None,
@@ -93,7 +93,9 @@ def download_file(
     - retries (int): Number of retry attempts for URL downloads (default: 3).
     - delay (int): Initial delay in seconds for exponential backoff (default: 5).
     - timeout (int): Timeout for the HTTP request in seconds (default: 10).
-    - lock_timeout (int): Timeout in seconds for the file lock (default: 30).
+    - lock_timeout (float): Timeout in seconds for the file lock. The default
+      (-1) waits for the holder: a waiter that gives up first finds no file,
+      and a large artifact can take minutes to download.
     - expected_sha256 (str | None): Reuse a matching cached file after acquiring
       the lock. None preserves unconditional download/copy behavior.
 
