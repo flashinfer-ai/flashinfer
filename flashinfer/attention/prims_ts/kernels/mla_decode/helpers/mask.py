@@ -40,6 +40,23 @@ def normalize_mask_type(mask_type: MaskType | str) -> str:
         ) from error
 
 
+def rows_have_distinct_kv_prefix(cfg, cu_seqlens_q, logical_seq_len_q) -> bool:
+    """Return whether the query rows of one tile can see different K prefixes.
+
+    Bottom-right causal prefixes over more than one query token grow with the
+    row; a work tile caches the prefix its first row sees. Otherwise every row
+    sees the request's whole K length, which the softmax already holds.
+    """
+    if cfg.mask_type != MaskType.CAUSAL.value:
+        return False
+    single_token = (
+        cu_seqlens_q is None
+        and isinstance(logical_seq_len_q, int)
+        and logical_seq_len_q == 1
+    )
+    return not single_token
+
+
 @cute.jit
 def mask_visible_k_length(
     mask_type: cutlass.Constexpr[str],

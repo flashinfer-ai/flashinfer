@@ -439,7 +439,9 @@ def test_kv_tile_is_fully_visible(
     from flashinfer.attention.prims_ts.kernels.mask import kv_tile_is_fully_visible
 
     assert (
-        kv_tile_is_fully_visible(tile_offset_k, tile_size_kv, visible_begin, visible_end)
+        kv_tile_is_fully_visible(
+            tile_offset_k, tile_size_kv, visible_begin, visible_end
+        )
         is expected
     )
 
@@ -466,3 +468,30 @@ def test_unmasked_kv_tile_range_matches_per_tile_bounds() -> None:
                         and tile_offset_k + tile_size_kv <= visible_end
                     )
                     assert kv_tile_in_range(tile_idx, begin, end) is fully_visible
+
+
+@pytest.mark.parametrize(
+    ("mask_type", "cu_seqlens_q", "seq_len_q", "expected"),
+    (
+        pytest.param("dense", None, 4, False, id="dense"),
+        pytest.param("causal", None, 1, False, id="causal-one-token"),
+        pytest.param("causal", None, 4, True, id="causal-fixed-mtp"),
+        pytest.param("causal", object(), 1, True, id="causal-packed-q"),
+    ),
+)
+def test_mla_rows_have_distinct_kv_prefix(
+    mask_type: str,
+    cu_seqlens_q: object,
+    seq_len_q: int,
+    expected: bool,
+) -> None:
+    """MLA caches a work tile's common K prefix exactly when its rows differ."""
+    pytest.importorskip("cutlass", minversion="4.7.0")
+    from types import SimpleNamespace
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.mask import (
+        rows_have_distinct_kv_prefix,
+    )
+
+    cfg = SimpleNamespace(mask_type=mask_type)
+    assert rows_have_distinct_kv_prefix(cfg, cu_seqlens_q, seq_len_q) is expected
