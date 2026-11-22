@@ -37,7 +37,8 @@ limitations under the License.
 # generic CLC launch of ``num_sms // 2 < rows <= 1024`` rows is preceded by a small
 # program that writes its longest-first work order.  The split-KV program cuts each
 # row's KV tiles into ``num_split`` equal ranges (``plan_kv_split``, from host-known
-# sizes only) and a reducer program merges the partials in a fixed order.
+# sizes and the device only: up to 32 splits, 64 for one query row of long KV) and a
+# reducer program merges the partials in a fixed order.
 # Ragged value-split calls, the exact-geometry and native split-KV programs and
 # the generic tails read
 # per-row metadata (row -> request, causal KV length, page rows, work order) that
@@ -182,6 +183,11 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
 }
 FAMILIES: dict[str, dict[str, Any]] = {
     "cake_trtllm_mla_blackwell_family_3542f15da2f1ae0fc00c": {
@@ -310,6 +316,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9",
             "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
             "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15",
+            "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc",
         ],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_splitkv",
@@ -411,12 +418,14 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_VARIANT_NS_0=variant_cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9_sm_103a_32a1975e851a",
             "-DCAKE_VARIANT_NS_1=variant_cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed_sm_103a_b314ebedc258",
             "-DCAKE_VARIANT_NS_2=variant_cake_trtllm_mla_blackwell_26168a31cc8a607d8a15_sm_103a_b314ebedc258",
+            "-DCAKE_VARIANT_NS_3=variant_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc_sm_103a_b314ebedc258",
             "-DCAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS=7",
         ],
         "dependencies": [
             "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9",
             "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
             "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15",
+            "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc",
         ],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_splitkv",
@@ -703,8 +712,24 @@ _SPLITKV_RANGE: dict[tuple[str, int], tuple[int, int]] = {
     ("sm_100a", 148): (2049, 18),
     ("sm_103a", 152): (2049, 18),
 }
-# Most KV splits the split-KV reducer merges.
-_SPLITKV_MAX_SPLIT = 32
+# Most KV splits the split-KV reducers merge (the binding's CAKE_SPLITKV_MAX_SPLIT).
+_SPLITKV_MAX_SPLIT = 64
+# Most KV splits below the device's _SPLITKV_WIDE_MIN_SEQ_LEN or above
+# _SPLITKV_WIDE_MAX_ROWS query rows (the binding's CAKE_SPLITKV_NARROW_MAX_SPLIT).  At
+# 32 splits, one query row uses 32 of the 74 (B200) or 76 (GB300) resident clusters;
+# from the listed max_seq_len on, one query row measured faster at up to 64 splits.
+# Below it, and at two query rows (37 or 38 splits), rows much shorter than
+# max_seq_len measured slower than at 32 splits: each split of such a row holds one or
+# two KV tiles, or none.  On GB300 that held up to max_seq_len 65536 (rows of 8192 to
+# 16384 tokens), on B200 up to 32768.  A device that is not listed keeps 32 splits.
+# ``plan_kv_split`` compares the KV tiles of max_seq_len (a multiple of _KV_TILE
+# tokens) with the device's start.
+_SPLITKV_NARROW_MAX_SPLIT = 32
+_SPLITKV_WIDE_MIN_SEQ_LEN: dict[tuple[str, int], int] = {
+    ("sm_100a", 148): 65536,
+    ("sm_103a", 152): 131072,
+}
+_SPLITKV_WIDE_MAX_ROWS = 1
 
 DOMAIN_BF16_NATIVE_SPLIT8 = "mla_bf16_native_split8_pdl"
 DOMAIN_BF16_VQUARTER = "mla_bf16_vquarter"
@@ -1072,18 +1097,34 @@ def plan_num_split(work_items: int, max_seq_len: int, num_sms: int) -> int:
     return min(cap, target)
 
 
-def plan_kv_split(total_q: int, max_seq_len: int, num_sms: int) -> int:
+def plan_kv_split(
+    total_q: int, max_seq_len: int, num_sms: int, arch: Optional[str] = None
+) -> int:
     """KV split count of the split-KV program from host-known sizes.
 
     At most one wave of clusters (``total_q * split <= num_sms // 2``) and at
-    most ``_SPLITKV_MAX_SPLIT`` splits; then the smallest count with the same
-    tiles per split, so every split of a ``max_seq_len`` row holds equal work.
-    A shorter row leaves its last splits empty: the program cuts each row's
-    tiles from its KV length on the device.
+    most ``_SPLITKV_NARROW_MAX_SPLIT`` splits, or ``_SPLITKV_MAX_SPLIT`` for at
+    most ``_SPLITKV_WIDE_MAX_ROWS`` query rows whose ``max_seq_len`` KV tiles
+    hold at least the ``_SPLITKV_WIDE_MIN_SEQ_LEN`` tokens of the device
+    (``arch``, ``num_sms``; an unlisted device or ``arch=None`` keeps
+    ``_SPLITKV_NARROW_MAX_SPLIT``); then the smallest count with the same tiles
+    per split, so every split of a ``max_seq_len`` row holds equal work.  The
+    program cuts each row's own KV tiles into at most that many equal ranges on
+    the device; a row with fewer tiles than splits leaves its last splits
+    empty.  The count depends on
+    ``max_seq_len`` only through its KV tile count, which the ``backend="auto"``
+    decision memo keys on.
     """
     resident = max(1, num_sms // _CLUSTER_SIZE)
     tiles = max(1, (max_seq_len + _KV_TILE - 1) // _KV_TILE)
-    split = min(_SPLITKV_MAX_SPLIT, max(1, resident // max(1, total_q)), tiles)
+    wide_min = _SPLITKV_WIDE_MIN_SEQ_LEN.get((arch, num_sms))
+    wide = (
+        wide_min is not None
+        and total_q <= _SPLITKV_WIDE_MAX_ROWS
+        and tiles * _KV_TILE >= wide_min
+    )
+    cap = _SPLITKV_MAX_SPLIT if wide else _SPLITKV_NARROW_MAX_SPLIT
+    split = min(cap, max(1, resident // max(1, total_q)), tiles)
     return -(-tiles // -(-tiles // split))
 
 
@@ -1472,7 +1513,7 @@ def device_row_launch(
         # row's KV tiles into num_split ranges; the reducer applies the sink and
         # bmm2_scale.  The split count, grid and scratch shape come from shapes,
         # max_seq_len and the device facts alone.
-        num_split = plan_kv_split(total_q, int(max_seq_len), num_sms)
+        num_split = plan_kv_split(total_q, int(max_seq_len), num_sms, arch)
         resident = max(1, num_sms // _CLUSTER_SIZE)
         return DeviceRowLaunch(
             kind=_LAUNCH_SPLITKV,
