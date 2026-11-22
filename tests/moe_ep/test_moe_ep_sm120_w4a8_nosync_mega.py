@@ -454,7 +454,7 @@ def _check_borrowed_input_contract(pack, transformed, hidden, intermediate):
         )
 
 
-def _weight_layout_worker(rank):
+def _weight_layout_worker(rank, duplicate_destinations=False):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -605,10 +605,52 @@ def _weight_layout_worker(rank):
                 rows, hidden, device="cuda", generator=generator, dtype=torch.bfloat16
             )
             ids, weights = _routing(args, rows, experts, topk, generator)
+            if duplicate_destinations:
+                ids.copy_(
+                    rank * (experts // ep) + torch.arange(topk, device=ids.device)
+                )
             t = MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=weights)
             layer.stage_inputs(t, compile_tokens_per_rank=bound)
             layer.compute_staged(output=output)
             torch.cuda.synchronize()
+            if duplicate_destinations and scale_layout == "kernel" and bound == 128:
+                from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync.workspace import (
+                    pool_row_bytes,
+                )
+
+                workspace = layer._workspace
+                route_map = workspace._view(19, (ep, experts // ep, 128), torch.int32)
+                source_ids = [None] * ep
+                dist.all_gather_object(source_ids, ids.cpu())
+                for source, routes in enumerate(source_ids):
+                    expected_routes = {}
+                    for token, expert_ids in enumerate(routes.tolist()):
+                        for k, expert in enumerate(expert_ids):
+                            if expert // (experts // ep) == rank:
+                                expected_routes.setdefault(
+                                    expert % (experts // ep), []
+                                ).append(token * 8 + k)
+                    for expert, expected_meta in expected_routes.items():
+                        actual_meta = (
+                            route_map[source, expert, : len(expected_meta)]
+                            .cpu()
+                            .tolist()
+                        )
+                        assert actual_meta == expected_meta, (
+                            rank,
+                            source,
+                            expert,
+                            actual_meta[:16],
+                            expected_meta[:16],
+                        )
+                pool = workspace._view(
+                    5, (ep, 128, pool_row_bytes(hidden)), torch.uint8
+                )
+                assert torch.equal(pool[rank, :rows, :hidden], workspace.x[:rows])
+                assert torch.equal(
+                    pool[rank, :rows, hidden : hidden + hidden // 32],
+                    workspace.x_sf[:rows],
+                )
             expected = _reference(
                 x.float(),
                 _effective_routes(ids, experts),
@@ -639,9 +681,12 @@ def _weight_layout_worker(rank):
                     dtype=torch.bfloat16,
                 )
             )
-            ids.copy_(
-                torch.randint(0, experts, ids.shape, device="cuda", generator=generator)
-            )
+            if not duplicate_destinations:
+                ids.copy_(
+                    torch.randint(
+                        0, experts, ids.shape, device="cuda", generator=generator
+                    )
+                )
             weights.copy_(torch.rand(rows, topk, device="cuda", generator=generator))
             expected = _reference(
                 x.float(),
@@ -667,6 +712,34 @@ def _weight_layout_worker(rank):
             )
         layer.destroy()
     dist.destroy_process_group()
+
+
+def test_sm120_nosync_p2p_workspace_layout():
+    """P2P shares token rows and keeps route metadata in a bounded local map."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync.workspace import (
+        buffer_layout,
+        pool_row_bytes,
+    )
+
+    ranks, experts, capacity, topk = 8, 384, 128, 6
+    hidden, intermediate = 5120, 2304
+    offsets = buffer_layout(ranks, experts, capacity, topk, hidden, intermediate)
+    assert offsets[6] - offsets[5] == ranks * capacity * pool_row_bytes(hidden)
+    route_map_bytes = experts * capacity * 4
+    assert offsets[20] - offsets[19] == route_map_bytes
+    gin_offsets = buffer_layout(
+        ranks, experts, capacity, topk, hidden, intermediate, gin=True
+    )
+    assert gin_offsets[20] - gin_offsets[19] == (
+        route_map_bytes + ranks * capacity * topk * 4
+    )
+
+
+def test_sm120_nosync_p2p_shared_token_rows():
+    """Routes from one token to one rank share a row without losing route metadata."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    torch.multiprocessing.spawn(_weight_layout_worker, args=(True,), nprocs=4)
 
 
 def test_sm120_nosync_weight_layouts():
