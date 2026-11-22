@@ -715,8 +715,8 @@ _SPLITKV_RANGE: dict[tuple[str, int], tuple[int, int]] = {
 # Most KV splits the split-KV reducers merge (the binding's CAKE_SPLITKV_MAX_SPLIT).
 _SPLITKV_MAX_SPLIT = 64
 # Most KV splits below _SPLITKV_WIDE_MIN_SEQ_LEN or above _SPLITKV_WIDE_MAX_ROWS query
-# rows (the binding's CAKE_SPLITKV_NARROW_MAX_SPLIT).  One and two query rows use at
-# most 32 of the 74 (B200) or 76 (GB300) resident clusters at 32 splits; from
+# rows (the binding's CAKE_SPLITKV_NARROW_MAX_SPLIT).  At 32 splits, one query row uses
+# 32 and two query rows use 64 of the 74 (B200) or 76 (GB300) resident clusters; from
 # max_seq_len 32768 on, up to 64 splits measured faster, while max_seq_len 8192
 # and 16384 measured slower at 64 splits than at 32.  ``plan_kv_split`` compares
 # the KV tiles of max_seq_len (a multiple of _KV_TILE tokens) with the start.
