@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -618,25 +618,18 @@ kernel_cake_sage_block_sparse_attention_8b112470569cb7a4826a(const __grid_consta
                     asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_11) : "f"(chunk_max[0]), "f"(chunk_max[1]), "f"(chunk_max[2]));
                     float tile_max;
                     asm("max.f32 %0, %1, %2;" : "=f"(tile_max) : "f"(_max3_11), "f"(chunk_max[3]));
-                    if (m_valid <= 0) {
-                        tile_max = -CUDART_INF_F;
-                    }
+                    tile_max = ((m_valid > 0) ? tile_max : -CUDART_INF_F);
                     float _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, tile_max, 16);
                     tile_max = max_noftz(tile_max, _shfl_xor_sync_12);
                     float new_max;
                     asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(tile_max), "f"(row_max));
                     float acc_scale = 1.0f;
-                    if (new_max > -CUDART_INF_F) {
-                        if (row_max == -CUDART_INF_F) {
-                            row_max = new_max;
-                        } else if (new_max - row_max > 0.8073549f) {
-                            float _exp2_13 = approx_exp2(row_max - new_max);
-                            acc_scale = _exp2_13;
-                            row_max = new_max;
-                        }
-                    }
+                    float old_max = row_max;
+                    float grow = new_max - old_max;
+                    row_max = ((grow > 0.8073549f) ? new_max : old_max);
+                    float _exp2_13 = approx_exp2(old_max - new_max);
+                    acc_scale = ((grow > 0.8073549f && old_max > -CUDART_INF_F) ? _exp2_13 : 1.0f);
                     scale_smem[slot] = acc_scale;
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(corr_sig_addr + (group) * 8);
                     float score_bias = ((row_max > -CUDART_INF_F) ? 8.0f - row_max : 0.0f);
@@ -881,7 +874,6 @@ kernel_cake_sage_block_sparse_attention_8b112470569cb7a4826a(const __grid_consta
                 }
                 scale_smem[256 + slot] = row_sum;
                 scale_smem[512 + slot] = row_max;
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(corr_sig_addr + (group) * 8);
                 mbarrier_wait(corr_done_addr + (group) * 8, _phase_corr_done);
                 _phase_corr_done ^= 1;

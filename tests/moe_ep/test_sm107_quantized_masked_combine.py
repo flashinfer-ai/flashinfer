@@ -18,14 +18,14 @@ def test_quantized_masked_combine_graph(combine, tokens, hidden, topk, weighted)
     from cuda.bindings import driver as cuda
     from cutlass.cute.runtime import from_dlpack
 
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 
     pkg.require_sm107_dsl()
     pkg.bootstrap_paths()
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.helpers.topk_reduce import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.helpers.topk_reduce import (
         TopkReduce,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.quant_def import (
         CombineFormat,
     )
 

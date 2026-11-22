@@ -24,6 +24,7 @@ from .....config import (
 )
 from .....core.comm.handle import Handle
 from .....core.validation.common import MoEEpConfigError
+from ._runtime import stream_context, stream_is_capturing
 
 _HP = _os.environ.get("EP_PROFILE_HOST") == "1"
 _HP_SKIP = int(_os.environ.get("EP_PROFILE_SKIP", "15"))
@@ -85,6 +86,8 @@ class NcclEpHandle(Handle):
         _t = _pc() if _HP else None
         self._fleet = fleet
         self._ep = fleet.nccl_ep
+        self._native_options = fleet._nccl_options()
+        self._dispatch_zero_copy = self._native_options.dispatch_zero_copy
         # Cross-handle host-path cache (declared on NcclEpFleet). vLLM creates
         # a fresh Handle every MoE layer x step (routing binds at
         # create_handle), so per-handle caches never hit; anchoring them on the
@@ -101,6 +104,7 @@ class NcclEpHandle(Handle):
         self._destroyed = False
 
         self._is_ht = fleet.params.algorithm == EpAlgorithm.HIGH_THROUGHPUT
+        self._eager_recv = self._is_ht and fleet._nccl_options().eager_recv
         self._is_rank_major = (not self._is_ht) and (
             fleet.params.layout is EpLayout.RANK_MAJOR
         )
@@ -142,20 +146,19 @@ class NcclEpHandle(Handle):
         else:
             layout = self._ep.Layout.EXPERT_MAJOR
 
-        # GAP 3 (opt-in): expose HT's actual received-token count. When the caller
-        # sets HandleAlgoKnobNumReceivedTokens, bind its target as
-        # LayoutInfo.recv_total_counter so ncclEpCreateHandle -> ncclEpUpdateHandle
-        # -> metadata preprocessing writes the actual total into it (nccl_ep.cc
-        # ~2316-2357). This works in the static max_tokens mode too — only dynamic
-        # *buffer sizing* is unsupported in v0.1, not the count readback — letting an
-        # HT consumer trim compute to recv_x[:actual_recv] on the static buffer.
-        # HT-only: LL rejects handle-time layout_info (nccl_ep.cc:2201), and without
-        # the knob HT keeps the verified layout_info=None path unchanged.
+        # HT preprocessing writes this counter before dispatch. Fixed sizing
+        # exposes it only when requested; eager sizing also needs it internally.
+        # LL rejects handle-time layout_info.
         self._recv_total_target = None
+        self._recv_total_output = None
         create_layout_info = None
         num_recv_knob = self._handle_knobs.get(HandleAlgoKnobNumReceivedTokens)
-        if num_recv_knob is not None and self._is_ht:
-            tgt = num_recv_knob.target  # type: ignore[attr-defined]
+        if self._is_ht and (num_recv_knob is not None or self._eager_recv):
+            tgt = (
+                num_recv_knob.target  # type: ignore[attr-defined]
+                if num_recv_knob is not None
+                else self._allocate_receive((1,), torch.int32, topk_idx.device)
+            )
             if tgt.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
                     "HandleAlgoKnobNumReceivedTokens.target must be int32 or int64, "
@@ -166,6 +169,11 @@ class NcclEpHandle(Handle):
                     "HandleAlgoKnobNumReceivedTokens.target must have >= 1 element, "
                     f"got shape {tuple(tgt.shape)}"
                 )
+            if self._eager_recv and num_recv_knob is not None:
+                # A caller may share its output counter with another handle.
+                # Sizing must use metadata owned by this handle alone.
+                self._recv_total_output = tgt
+                tgt = self._allocate_receive((1,), torch.int32, topk_idx.device)
             self._recv_total_target = tgt
             create_layout_info = self._ep.LayoutInfo(
                 recv_total_counter=self._ep.Tensor(tgt)
@@ -181,6 +189,7 @@ class NcclEpHandle(Handle):
             # capture (nccl_ep.h:422), so it stays on the handle's own stream.
             stream=self._stream,
         )
+        self._publish_recv_count(self._stream)
         _t = _hp("hinit.create_handle_c", _t)
 
         # InitHandle ran on self._stream. Every later op issued on that same
@@ -193,6 +202,17 @@ class NcclEpHandle(Handle):
     def _knob_stream(self) -> int:
         k = self._handle_knobs.get(HandleAlgoKnobUserStream)
         return int(k.stream) if k is not None else self._fleet.stream  # type: ignore[attr-defined]
+
+    def _publish_recv_count(self, stream):
+        if self._recv_total_output is not None:
+            with stream_context(
+                stream,
+                device=self._recv_total_target.device,
+                enabled=self._recv_total_target.is_cuda,
+            ):
+                self._recv_total_output.as_strided((1,), (1,)).copy_(
+                    self._recv_total_target
+                )
 
     def _op_stream(self) -> int:
         """Stream to issue transport work on.
@@ -242,7 +262,7 @@ class NcclEpHandle(Handle):
         here on the assumption that a repeated address proves stability, since
         a freed-then-reallocated buffer repeats on the very next call.
         """
-        if t.numel() * t.element_size() > self._WRAP_MEMO_MAX_BYTES:
+        if self._eager_recv or t.numel() * t.element_size() > self._WRAP_MEMO_MAX_BYTES:
             return self._ep.Tensor(t)
         hot = self._hot
         key = (t.data_ptr(), t.dtype, tuple(t.shape))
@@ -290,6 +310,8 @@ class NcclEpHandle(Handle):
         """
         import torch
 
+        if self._eager_recv and stream_is_capturing(self._stream):
+            raise MoEEpConfigError("eager_recv does not support CUDA graph capture")
         topk_idx = params.topk_ids
         if topk_idx.dtype != torch.int64:
             topk_idx = topk_idx.to(torch.int64)
@@ -358,8 +380,12 @@ class NcclEpHandle(Handle):
             layout_info=self._create_layout_info,
             stream=op_stream,
         )
+        self._publish_recv_count(op_stream)
 
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
+        expected = 2 if self._native_options.dispatch_quantization == "forward" else 1
+        if len(params.x) != expected:
+            raise MoEEpConfigError(f"dispatch requires {expected} payload tensors")
         x = params.x[0]
         # The activation count must match the routing the handle currently
         # holds. A mismatch passes the per-path capacity guards and reaches
@@ -371,11 +397,212 @@ class NcclEpHandle(Handle):
                 "token count as the topk_ids this handle was created with or "
                 "last updated to."
             )
+        if expected == 2:
+            return self._dispatch_forwarded(x, params.x[1])
         if self._is_ht:
             return self._dispatch_ht(x)
         if self._is_rank_major:
             return self._dispatch_ll_rank_major(x)
         return self._dispatch_ll(x)
+
+    def _native_receive(self, name, shape, dtype, device, *, window=False):
+        if window:
+            return self._fleet._dispatch_window(name, shape, dtype, device)
+        if self._eager_recv:
+            tensor = self._allocate_receive(shape, dtype, device)
+            return tensor, self._ep.Tensor(tensor)
+        key = ("native_receive", name)
+        tensor = self._hot.get(key)
+        if tensor is not None and (
+            tuple(tensor.shape) != tuple(shape)
+            or tensor.dtype != dtype
+            or tensor.device != device
+        ):
+            raise MoEEpConfigError(
+                "forwarded receive geometry changed; create a new Fleet to "
+                "preserve buffers referenced by captured graphs"
+            )
+        if tensor is None:
+            tensor = self._allocate_receive(shape, dtype, device)
+            self._hot[key] = tensor
+        return tensor, self._ep.Tensor(tensor)
+
+    def _allocate_receive(self, shape, dtype, device):
+        import torch
+
+        with stream_context(
+            self._op_stream(),
+            device=device,
+            enabled=torch.device(device).type == "cuda",
+        ):
+            return torch.empty(shape, dtype=dtype, device=device)
+
+    def _dispatch_forwarded(self, x, scales):
+        """Forward quantized value/scale rows to the selected NCCL layout."""
+        import torch
+
+        p = self._fleet.params
+        if x.ndim != 2 or not x.is_contiguous():
+            raise MoEEpConfigError("native dispatch requires contiguous 2D tokens")
+        if x.shape[0] > p.max_tokens_per_rank:
+            raise MoEEpConfigError("native dispatch exceeds max_tokens_per_rank")
+        if self._eager_recv and stream_is_capturing(self._stream):
+            raise MoEEpConfigError(
+                "eager_recv does not support CUDA graph dispatch capture"
+            )
+        payload_bytes = x.shape[1] * x.element_size()
+        if scales is not None:
+            allowed = (
+                torch.float32,
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            )
+            if x.dtype not in allowed or scales.dtype not in (*allowed, torch.uint8):
+                raise MoEEpConfigError("unsupported forwarded token/scale dtype")
+            if (
+                scales.ndim != 2
+                or scales.shape[0] != x.shape[0]
+                or scales.device != x.device
+                or not scales.is_contiguous()
+            ):
+                raise MoEEpConfigError(
+                    "forwarded scales must be contiguous 2D rows matching tokens"
+                )
+            for tensor in (x, scales):
+                if (
+                    tensor.shape[1] * tensor.element_size() % 16
+                    or tensor.data_ptr() % 16
+                ):
+                    raise MoEEpConfigError(
+                        "forwarded token and scale rows require 16-byte alignment"
+                    )
+            payload_bytes += scales.shape[1] * scales.element_size()
+        if payload_bytes > p.token_hidden_size * p.dtype_bytes:
+            raise MoEEpConfigError("native dispatch payload exceeds max_token_bytes")
+
+        world, cap = self._world_size, p.max_tokens_per_rank
+        num_recv = world * cap
+        if self._eager_recv:
+            context = stream_context(
+                self._op_stream(), device=x.device, enabled=x.is_cuda
+            )
+            with context:
+                num_recv = int(self._recv_total_target.reshape(-1)[0].item())
+            if not 0 <= num_recv <= world * cap:
+                raise MoEEpConfigError("invalid received-token count")
+        if self._is_ht:
+            leading = (max(1, num_recv),)
+        elif self._is_rank_major:
+            leading = (world, cap)
+        else:
+            leading = (self._num_local_experts, world * cap)
+        window = self._native_options.dispatch_zero_copy
+        out_t, token_desc = self._native_receive(
+            "tokens", (*leading, x.shape[1]), x.dtype, x.device, window=window
+        )
+        inputs_kw = dict(tokens=self._ep.Tensor(x))
+        outputs_kw = dict(tokens=token_desc)
+        config_kw = dict(send_only=int(self._staged), round_scales=0)
+        out_scale = None
+        if scales is not None:
+            out_scale, scale_desc = self._native_receive(
+                "scales",
+                (*leading, scales.shape[1]),
+                scales.dtype,
+                x.device,
+                window=window,
+            )
+            inputs_kw["scales"] = self._ep.Tensor(scales)
+            outputs_kw["scales"] = scale_desc
+            config_kw["quantization_recipe"] = self._ep.DispatchQuantizationRecipe.FWD
+
+        out_w = out_idx = None
+        if self._is_ht or self._is_rank_major:
+            tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
+            if tw is None:
+                raise MoEEpConfigError("native routed dispatch requires top-k weights")
+            weights = tw.weights.to(torch.float32)
+            out_w, weight_desc = self._native_receive(
+                "weights", (*leading, self._top_k), torch.float32, x.device
+            )
+            out_idx, index_desc = self._native_receive(
+                "indices",
+                (*leading, self._top_k),
+                torch.int64 if self._is_ht else torch.int32,
+                x.device,
+            )
+            inputs_kw["topk_weights"] = self._ep.Tensor(weights)
+            outputs_kw.update(topk_weights=weight_desc, topk_idx=index_desc)
+        layout = None
+        if not self._is_ht:
+            field = "src_rank_counters" if self._is_rank_major else "expert_counters"
+            layout = self._ep.LayoutInfo(**{field: self._ep.Tensor(self._recv_count_t)})
+        if self._eager_recv and num_recv == 0:
+            context = stream_context(
+                self._op_stream(), device=x.device, enabled=x.is_cuda
+            )
+            with context:
+                out_t.zero_()
+                if out_scale is not None:
+                    out_scale.zero_()
+                out_w.zero_()
+                out_idx.fill_(-1)
+        inputs = self._ep.DispatchInputs(**inputs_kw)
+        outputs = self._ep.DispatchOutputs(**outputs_kw)
+        self._handle.dispatch(
+            inputs,
+            outputs,
+            layout_info=layout,
+            config=self._ep.DispatchConfig(**config_kw),
+            stream=self._op_stream(),
+        )
+        self._handle.complete(stream=self._op_stream())
+        self._dispatch_inputs, self._dispatch_outputs = inputs, outputs
+        self._dispatch_layout = layout
+        self._dispatch_output_t, self._dispatch_scale_t = out_t, out_scale
+        self._dispatch_out_w, self._dispatch_out_idx = out_w, out_idx
+        if self._is_ht:
+            view_leading = (1, leading[0]) if self._eager_recv else (world, cap)
+            out_t = out_t.view(*view_leading, -1)
+            if out_scale is not None:
+                out_scale = out_scale.view(*view_leading, -1)
+        return DispatchOutput(
+            expert_tensors=out_t,
+            num_tokens=num_recv,
+            expert_scales=out_scale,
+            recv_topk_idx=out_idx.reshape(-1, self._top_k)
+            if out_idx is not None
+            else None,
+            recv_topk_weights=out_w.reshape(-1, self._top_k)
+            if out_w is not None
+            else None,
+            expert_counts=self._recv_count_t if not self._is_ht else None,
+            recv_total_counter=self._recv_total_target,
+        )
+
+    def _combine_config(self):
+        kwargs = dict(send_only=int(self._staged))
+        if self._native_options.combine_quantization == "nvfp4":
+            kwargs["quantization_recipe"] = self._ep.CombineQuantizationRecipe.NVFP4
+        return self._ep.CombineConfig(**kwargs)
+
+    def _combine_input(self, x, descriptor):
+        if self._native_options.combine_quantization != "nvfp4":
+            return self._ep.CombineInputs(tokens=descriptor)
+        import torch
+
+        if x.dtype != torch.bfloat16 or x.ndim != 3 or not x.is_contiguous():
+            raise MoEEpConfigError(
+                "NVFP4 combine requires contiguous 3D BF16 expert outputs"
+            )
+        context = stream_context(self._op_stream(), device=x.device, enabled=x.is_cuda)
+        with context:
+            amax = x.abs().amax(dim=-1, keepdim=True).float()
+            scales = torch.where(amax > 0, 2688.0 / amax, 0.0)
+        self._combine_scales = scales
+        return self._ep.CombineInputs(tokens=descriptor, scales=self._ep.Tensor(scales))
 
     def _dispatch_ll(self, x) -> DispatchOutput:
         import torch
@@ -506,9 +733,15 @@ class NcclEpHandle(Handle):
         if weights.dtype != torch.float32:
             weights = weights.to(torch.float32)
 
-        out_t = torch.empty(
-            world_size, max_per_rank, hidden, dtype=x.dtype, device=x.device
-        )
+        if self._dispatch_zero_copy:
+            out_t, out_descriptor = self._fleet._dispatch_window(
+                "tokens", (world_size, max_per_rank, hidden), x.dtype, x.device
+            )
+        else:
+            out_t = torch.empty(
+                world_size, max_per_rank, hidden, dtype=x.dtype, device=x.device
+            )
+            out_descriptor = self._ep.Tensor(out_t)
         out_w = torch.empty(
             world_size, max_per_rank, self._top_k, dtype=torch.float32, device=x.device
         )
@@ -520,7 +753,7 @@ class NcclEpHandle(Handle):
             tokens=self._ep.Tensor(x), topk_weights=self._ep.Tensor(weights)
         )
         outputs = self._ep.DispatchOutputs(
-            tokens=self._ep.Tensor(out_t),
+            tokens=out_descriptor,
             topk_weights=self._ep.Tensor(out_w),
             topk_idx=self._ep.Tensor(out_idx),
         )
@@ -556,11 +789,26 @@ class NcclEpHandle(Handle):
     def _dispatch_ht(self, x) -> DispatchOutput:
         import torch
 
+        if self._eager_recv and stream_is_capturing(self._stream):
+            raise MoEEpConfigError(
+                "eager_recv does not support CUDA graph dispatch capture"
+            )
         max_per_rank = self._fleet.params.max_tokens_per_rank
         # Recv row mirrors the sent row; see _dispatch_ll.
         hidden = x.shape[1]
         world = self._fleet.params.num_experts // self._num_local_experts
         num_recv = max_per_rank * world
+        if self._eager_recv:
+            target = self._recv_total_target
+            if target.is_cuda:
+                with stream_context(self._op_stream(), device=x.device):
+                    num_recv = int(target.reshape(-1)[0].item())
+            else:
+                num_recv = int(target.reshape(-1)[0].item())
+            if not 0 <= num_recv <= max_per_rank * world:
+                raise MoEEpConfigError(f"invalid received-token count: {num_recv}")
+        # Keep an inactive row for compute backends that reject an empty batch.
+        capacity = max(1, num_recv) if self._eager_recv else num_recv
 
         # The HT staging buffers (and this recv buffer) are sized to max_per_rank,
         # which the fleet clamps to the library's MAX_SUPPORTED_TOKENS_PER_RANK. A
@@ -591,21 +839,29 @@ class NcclEpHandle(Handle):
         cached = self._hot.get("ht_recv_bufs")
         if (
             cached is None
-            or cached[0].shape != (num_recv, hidden)
+            or cached[0].shape != (capacity, hidden)
             or cached[1].shape[1] != self._top_k
             or cached[0].dtype != x.dtype
             or cached[0].device != x.device
         ):
-            out_t = torch.empty(num_recv, hidden, dtype=x.dtype, device=x.device)
-            out_w = torch.empty(
-                num_recv, self._top_k, dtype=torch.float32, device=x.device
+            out_t = self._allocate_receive((capacity, hidden), x.dtype, x.device)
+            out_w = self._allocate_receive(
+                (capacity, self._top_k), torch.float32, x.device
             )
-            out_idx = torch.empty(
-                num_recv, self._top_k, dtype=torch.int64, device=x.device
+            out_idx = self._allocate_receive(
+                (capacity, self._top_k), torch.int64, x.device
             )
             self._hot["ht_recv_bufs"] = (out_t, out_w, out_idx)
         else:
             out_t, out_w, out_idx = cached
+        if self._eager_recv and num_recv == 0:
+            context = stream_context(
+                self._op_stream(), device=x.device, enabled=x.is_cuda
+            )
+            with context:
+                out_t.zero_()
+                out_w.zero_()
+                out_idx.fill_(-1)
         _t = _hp("ht_disp.alloc_cached", _t)
 
         # Fleet-cached output wraps (over the cached recv bufs) + config; the
@@ -645,7 +901,11 @@ class NcclEpHandle(Handle):
         self._dispatch_out_w = out_w
         self._dispatch_out_idx = out_idx
 
-        out_3d = out_t.view(world, max_per_rank, hidden)
+        out_3d = (
+            out_t.view(1, capacity, hidden)
+            if self._eager_recv
+            else out_t.view(world, max_per_rank, hidden)
+        )
         return DispatchOutput(
             expert_tensors=out_3d,
             num_tokens=num_recv,
@@ -679,11 +939,11 @@ class NcclEpHandle(Handle):
             ck = ("ht_comb_cfg", self._staged)
             config = self._hot.get(ck)
             if config is None:
-                config = self._ep.CombineConfig(send_only=int(self._staged))
+                config = self._combine_config()
                 self._hot[ck] = config
             out_w = self._wrap(out_t) if out_is_stable else self._ep.Tensor(out_t)
             outputs = self._ep.CombineOutputs(tokens=out_w)
-            inputs = self._ep.CombineInputs(tokens=self._wrap(x2d))
+            inputs = self._combine_input(x2d, self._wrap(x2d))
             self._handle.combine(
                 inputs, outputs, config=config, stream=self._op_stream()
             )
@@ -694,9 +954,9 @@ class NcclEpHandle(Handle):
             return CombineOutput(x=out_t)
 
         if self._is_rank_major:
-            inputs = self._ep.CombineInputs(tokens=self._ep.Tensor(x))
+            inputs = self._combine_input(x, self._ep.Tensor(x))
             outputs = self._ep.CombineOutputs(tokens=self._ep.Tensor(out_t))
-            config = self._ep.CombineConfig(send_only=int(self._staged))
+            config = self._combine_config()
             self._handle.combine(
                 inputs, outputs, config=config, stream=self._op_stream()
             )
@@ -724,9 +984,9 @@ class NcclEpHandle(Handle):
         ck = ("ll_comb_cfg", self._staged)
         config = self._hot.get(ck)
         if config is None:
-            config = self._ep.CombineConfig(send_only=int(self._staged))
+            config = self._combine_config()
             self._hot[ck] = config
-        inputs = self._ep.CombineInputs(tokens=self._wrap(x))
+        inputs = self._combine_input(x, self._wrap(x))
         # Memoize the output descriptor only when the caller owns a stable
         # buffer (a graph state does; the default forward's empty_like does
         # not). Caching a per-call buffer retains one output per forward until

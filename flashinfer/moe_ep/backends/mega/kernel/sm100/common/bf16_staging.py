@@ -22,7 +22,9 @@ def stage_mega_moe_inputs(
         hidden_states.is_cuda
         and os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
     ):
-        from ......kernel_src.sm100.cutedsl_megamoe import fused_bf16_stage
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+            fused_bf16_stage,
+        )
 
         if fused_bf16_stage(
             hidden_states, topk_ids, topk_weights, x, topk_idx_out, topk_weights_out

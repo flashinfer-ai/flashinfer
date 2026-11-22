@@ -5,7 +5,7 @@
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
 ``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
 proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``) or, for the
-operators without a package of their own, in a subpackage here (``quantization``, ``sampling``, ``gdn``). ``README.md``
+operators without a package of their own, in a subpackage here (``quantization``, ``sampling``, ``gdn``, ``kda``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
@@ -24,13 +24,15 @@ from .support import (
 
 class ClassInfo(NamedTuple):
     """A consistency class behind a FlashInfer API: its name, the fixed dimensions its fingerprint takes, the
-    function computing the fingerprint from them, and the optional dimensions (flags of the specification with a
-    default, such as a bias) the function also accepts."""
+    function computing the fingerprint from them, the optional dimensions (flags of the specification with a
+    default, such as a bias) the function also accepts, and a note the missing-dimension error carries (what the
+    fixed dimensions select, where a caller could expect a default)."""
 
     name: str
     dims: tuple
     fingerprint: Callable[..., str]
     optional: tuple = ()
+    note: str = ""
 
 
 def _mm_bf16_fingerprint(N: int, K: int, bias: bool = False) -> str:
@@ -90,10 +92,20 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int) -> str:
+def _attention_fingerprint(head_dim: int, causal: Optional[bool] = None) -> str:
+    """The attention class at ``head_dim`` under a mask mode; ``None`` is the causal class (the decode wrapper's
+    ``is_causal=None``), never a truth value."""
     from ..attention.batch_invariant.spec import spec_fingerprint
 
-    return spec_fingerprint(head_dim)
+    return spec_fingerprint(head_dim, causal=True if causal is None else bool(causal))
+
+
+#: The prefill wrappers' ``plan()`` defaults to ``causal=False``, which runs the non-causal class: their receipt has no
+#: default mode.
+_PREFILL_CAUSAL_NOTE = (
+    "`causal` selects one of the two attention classes -- causal=True the causal class, causal=False the non-causal "
+    "class -- and the wrapper's plan() defaults to causal=False"
+)
 
 
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
@@ -609,16 +621,25 @@ CLASSES: Dict[str, ClassInfo] = {
         _mm_mxfp4w8a_fingerprint,
         ("arch",),
     ),
-    # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    # the three attention wrappers compute one class per head dim and mask mode: under the causal class a token's output depends
+    # on its KV position, its head and the window alone, under the non-causal class (`causal=False`) on its request's key count
+    # and its head alone; prefill and decode (and the paged and ragged KV layouts) are one class per mode. The mode is a fixed
+    # dimension of the prefill wrappers' receipt (their plan() defaults to the non-causal class) and optional for the decode
+    # wrapper, whose default (a single token per request, or `is_causal=None`) is the causal class
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("causal",)
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16",
+        ("head_dim", "causal"),
+        _attention_fingerprint,
+        note=_PREFILL_CAUSAL_NOTE,
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16",
+        ("head_dim", "causal"),
+        _attention_fingerprint,
+        note=_PREFILL_CAUSAL_NOTE,
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
@@ -711,17 +732,36 @@ def fingerprint(op: str, **dims) -> str:
     and the decode step kernel that computes its rows; the head counts, the batch, the slot and the position are not
     dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
 
-    The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
-    functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
-    do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
-    ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
-    sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too.
+    ``recurrent_kda`` takes no dimension: the class ``kda.bf16.c16`` is the native SM100 / SM103 / SM107 chunked KDA prefill
+    kernel on its pinned route (16-token chunks, fp32 state, the fused gate and Q / K normalization) and the decode
+    step kernel that computes its rows from the open chunk's cached rows; the head count, the batch, the slot and the position are
+    not dimensions of the per-head term, and the receipt digests the kernel sources that are the term.
+
+    The attention wrappers take ``head_dim`` and the mask mode ``causal``: the tile and chunk grid, the online-softmax step
+    and the chunk merge are functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout
+    and the configuration do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``,
+    ``BatchDecodeWithPagedKVCacheWrapper`` and ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint of a mode
+    (their outputs for one token are the same bits). ``causal=True`` names the causal class, ``causal=False`` the non-causal
+    class (prefill with ``causal=False``, decode with ``q_len_per_req > 1`` and ``is_causal=False``): every token sees its
+    request's whole key range, so the same token has a different term and a different fingerprint
+    (``attn-bf16-d<D>-nc-*``). For the two prefill wrappers ``causal`` is a fixed dimension, to be given as the value passed
+    to ``plan()``: their ``plan()`` defaults to ``causal=False``, the non-causal class, so a receipt without the mode would
+    name a class the default plan does not run, and an omitted or ``None`` ``causal`` raises. For the decode wrapper it is
+    optional: omitted or ``None`` is the causal class, as ``is_causal=None`` is in its ``plan()``, and a single-token decode
+    step is the causal class whatever ``is_causal`` says. The sliding window (``window_left``) is a per-call input of the
+    causal class, like the KV position: the receipt is the digest of the class's no-window sample row and covers windowed
+    calls too.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
     >>> fingerprint("mm_bf16", N=4096, K=4096, bias=True)  # doctest: +SKIP
     'gemm-bf16-kfold-bias-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, causal=True)  # doctest: +SKIP
+    'attn-bf16-d128-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, causal=False)  # doctest: +SKIP
+    'attn-bf16-d128-nc-...'
+    >>> fingerprint("BatchDecodeWithPagedKVCacheWrapper", head_dim=128)  # doctest: +SKIP
+    'attn-bf16-d128-...'
     >>> fingerprint("bmm_fp8", N=4096, K=4096, dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16)  # doctest: +SKIP
     'gemm-e4m3-kfold-scaled-...'
     >>> fingerprint("gemm_fp8_nt_groupwise", K=7168, out_dtype=torch.bfloat16)  # doctest: +SKIP
@@ -730,6 +770,8 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-mxfp8-k64-kfold-...'
     >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
     'gemm-nvfp4-kfold-...'
+    >>> fingerprint("recurrent_kda")  # doctest: +SKIP
+    'kda-bf16-c16-engine-...'
     >>> fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=128)  # doctest: +SKIP
     'moe-...'
 
@@ -750,9 +792,13 @@ def fingerprint(op: str, **dims) -> str:
         raise TypeError(
             f"fingerprint({op!r}) takes the fixed dimensions {list(info.dims)} and the optional {list(info.optional)}, not {unknown}"
         )
-    missing = [d for d in info.dims if d not in dims]
+    # a fixed dimension has no default: one passed as None is as missing as one left out
+    missing = [d for d in info.dims if dims.get(d) is None]
     if missing:
-        raise TypeError(f"fingerprint({op!r}) needs the fixed dimensions {missing}")
+        raise TypeError(
+            f"fingerprint({op!r}) needs the fixed dimensions {missing}"
+            + (f": {info.note}" if info.note else "")
+        )
     return info.fingerprint(**dims)
 
 
@@ -780,11 +826,13 @@ __all__ = [
     "is_supported_device",
 ]
 
-# The quantization, sampling and GDN classes register themselves here (their modules keep the mode's registry generic).
+# The quantization, sampling, GDN and KDA classes register themselves here (their modules keep the mode's registry generic).
 from .gdn.classes import register as _register_gdn  # noqa: E402
+from .kda.classes import register as _register_kda  # noqa: E402
 from .quantization.classes import register as _register_quantization  # noqa: E402
 from .sampling.classes import register as _register_sampling  # noqa: E402
 
 _register_quantization(CLASSES, ClassInfo)
 _register_sampling(CLASSES, ClassInfo)
 _register_gdn(CLASSES, ClassInfo)
+_register_kda(CLASSES, ClassInfo)

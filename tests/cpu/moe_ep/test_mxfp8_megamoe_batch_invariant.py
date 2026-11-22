@@ -6,7 +6,6 @@ from copy import deepcopy
 from dataclasses import replace
 import importlib
 import json
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,7 +19,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant i
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.usefixtures("host_only_cuda")]
-PROVIDERS = ("legacy", "standard", "genphase", "107-standard", "107-genphase")
+PROVIDERS = ("standard", "genphase", "107-standard", "107-genphase")
 KINDS = ("mxfp8_e4m3", "mxfp8_e5m2")
 
 
@@ -32,7 +31,7 @@ def _public(provider, kind="mxfp8_e4m3", **overrides):
     )
     kwargs = dict(intermediate_size=384, top_k=3, kind=kind, batch_invariant=True)
     if provider == "standard":
-        kwargs["kernel_name"] = "sm100_mxfp8_mxfp8_bf16_cutedsl_next"
+        kwargs["kernel_name"] = "sm100_mxfp8_mxfp8_bf16_cutedsl"
     if "genphase" in provider:
         kwargs["kernel_variant"] = "genphase"
         if provider.startswith("107"):
@@ -56,14 +55,7 @@ def _fleet(capacity=17, hidden=384):
 
 
 def _resolved(backend, fleet):
-    if backend._config.kernel_name == "sm100_mxfp8_mxfp8_bf16_cutedsl":
-        getter = (
-            backend._genphase_config
-            if backend._config.kernel_variant == "genphase"
-            else backend._legacy_config
-        )
-    else:
-        getter = getattr(backend, "_resolved_config", None) or backend._workspace_config
+    getter = getattr(backend, "_resolved_config", None) or backend._workspace_config
     return getter(fleet)
 
 
@@ -84,19 +76,8 @@ def test_receipt_matches_actual_plan_and_all_admitted_candidates(
     assert mxfp8_batch_invariant_fingerprint(cfg, arch=arch) == expected
     assert backend.batch_invariant_fingerprint(_fleet(257)) == expected
     assert cfg.input_norm_const == 1.0
-    if provider == "legacy":
-        from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
-            mxfp8_candidates,
-            with_knobs,
-        )
-
-        assert cfg.mma_tiler_mnk == (256, 256, 128)
-        assert cfg.has_3_global_scales is False
-        candidates = mxfp8_candidates(batch_invariant=True)
-        plans = [with_knobs(cfg, knobs) for knobs in candidates]
-        assert len(plans) == 4
-    elif provider.startswith("107"):
-        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+    if provider.startswith("107"):
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             is_valid_sm107,
             sm107_candidates,
         )
@@ -106,7 +87,7 @@ def test_receipt_matches_actual_plan_and_all_admitted_candidates(
         )
         plans = [replace(cfg, **k) for k in candidates if is_valid_sm107(k, cfg)]
     else:
-        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import tuning
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import tuning
 
         generator = (
             tuning.sm100_genphase_candidates
@@ -121,13 +102,12 @@ def test_receipt_matches_actual_plan_and_all_admitted_candidates(
     assert {mxfp8_batch_invariant_fingerprint(plan, arch=arch) for plan in plans} == {
         expected
     }
-    if provider != "legacy":
-        assert (cfg.has_fc1_alpha, cfg.has_fc2_alpha, cfg.has_fc1_norm_const) == (
-            False,
-            False,
-            False,
-        )
-        assert cfg.resolved_mma_tiler_mnk == (256, 128, 128)
+    assert (cfg.has_fc1_alpha, cfg.has_fc2_alpha, cfg.has_fc1_norm_const) == (
+        False,
+        False,
+        False,
+    )
+    assert cfg.resolved_mma_tiler_mnk == (256, 128, 128)
 
 
 @pytest.mark.parametrize("provider", PROVIDERS)
@@ -146,25 +126,6 @@ def test_receipt_matches_actual_plan_and_all_admitted_candidates(
 def test_public_rejects_unadmitted_arithmetic_before_allocation(provider, overrides):
     with pytest.raises(ValueError):
         _public(provider, **overrides)
-
-
-def test_legacy_pins_flags_carriers_and_early_weights(monkeypatch):
-    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import with_knobs
-
-    with pytest.raises(ValueError, match="early"):
-        _public("legacy", apply_routing_weights_before_fc2=False)
-    cfg = _resolved(_backend("legacy"), _fleet())
-    for knobs in (
-        {"token_back_mode": "standalone_warps"},
-        {"flag_batch": 8},
-        {"epi_flag_batch": (2, 4)},
-        {"in_kernel_fc2_reduce": True},
-    ):
-        with pytest.raises(ValueError):
-            with_knobs(cfg, knobs)
-    with pytest.raises(ValueError, match="hidden"):
-        _backend("legacy").batch_invariant_fingerprint(_fleet(hidden=192))
 
 
 def test_genphase_rejects_unsupported_public_carriers_and_flags():
@@ -192,58 +153,12 @@ def test_phase_interleave_requires_atomic_work_ids():
         _public("107-standard", schedule_policy=("phase_interleave", None))
 
 
-def test_legacy_autotune_records_effective_clamp_and_filters_explicit_bad_plan(
-    monkeypatch,
-):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import (
-        autotune,
-        knob_cache,
-    )
-
-    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
-    cfg = _resolved(_backend("legacy", "mxfp8_e5m2", gate_up_clamp=1.0), _fleet())
-    frontend = SimpleNamespace(config=cfg)
-    frontend.set_gate_up_clamp = lambda value: setattr(
-        frontend, "config", replace(frontend.config, gate_up_clamp=value)
-    )
-    recorded = []
-    monkeypatch.setattr(
-        knob_cache,
-        "record_knobs",
-        lambda knobs, **kwargs: recorded.append((knobs, kwargs)),
-    )
-    safe = autotune.mxfp8_candidates(batch_invariant=True)[0]
-
-    def tune(_frontend, _launch, candidates, **kwargs):
-        candidates = kwargs["candidate_filter"](candidates)
-        assert candidates == [safe]
-        autotune._apply_config_overrides(_frontend, kwargs["config_overrides"])
-        kwargs["on_winner"](safe, 1e-6)
-        return safe
-
-    monkeypatch.setattr(autotune, "autotune_knobs", tune)
-    with pytest.warns(RuntimeWarning, match="flag_batch"):
-        autotune.autotune_mxfp8_mega_moe(
-            None,
-            None,
-            None,
-            SimpleNamespace(_frontend=frontend),
-            gate_up_clamp=3.0,
-            candidates=[{**safe, "flag_batch": 8}, safe],
-        )
-    assert recorded[0][1]["gate_up_clamp"] == 3.0
-    assert recorded[0][1]["batch_invariant"] is True
-    assert recorded[0][1]["apply_routing_weights_before_fc2"] is True
-    assert recorded[0][1]["intermediate"] == 384
-
-
 @pytest.mark.parametrize("provider", PROVIDERS)
 def test_native_metadata_cannot_add_scalar_multiplications(provider, monkeypatch):
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
     cfg = _resolved(_backend(provider), _fleet())
-    field = "has_3_global_scales" if provider == "legacy" else "has_fc1_alpha"
     with pytest.raises(ValueError):
-        replace(cfg, **{field: True})
+        replace(cfg, has_fc1_alpha=True)
     with pytest.raises(ValueError):
         replace(cfg, input_norm_const=2.0)
 
@@ -253,7 +168,6 @@ def test_auto_contract_isolates_dtype_provider_input_boundary_and_weight_placeme
     moe_ep.AutoConfig(candidates=(a, replace(a)))
     for other in (
         _public("standard", "mxfp8_e5m2"),
-        _public("legacy"),
         _public("genphase"),
         _public("107-standard"),
         _public("standard", gate_up_clamp=1.0),
@@ -269,10 +183,10 @@ def test_auto_contract_isolates_dtype_provider_input_boundary_and_weight_placeme
 
 
 @pytest.mark.parametrize("kind", KINDS)
-def test_legacy_disk_cache_roundtrip_and_invalid_plan_rejection(
+def test_historical_legacy_cache_does_not_match_sources_kernel(
     kind, tmp_path, monkeypatch
 ):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import knob_cache
 
     path = tmp_path / "cache.json"
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
@@ -309,6 +223,16 @@ def test_legacy_disk_cache_roundtrip_and_invalid_plan_rejection(
         knob_cache.lookup_knobs(**{**key, "dtype": KINDS[1 - KINDS.index(kind)]})
         is None
     )
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+        knob_cache as sources_cache,
+    )
+
+    assert (
+        sources_cache._entries(
+            _resolved(_backend("standard", kind), _fleet()), device="test"
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize("provider", ("standard", "genphase"))
@@ -317,7 +241,7 @@ def test_blackwell_cache_isolates_kind_receipt_and_policy(
     provider, kind, tmp_path, monkeypatch
 ):
     from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
         knob_cache,
         tuning,
     )
@@ -343,7 +267,7 @@ def test_blackwell_cache_isolates_kind_receipt_and_policy(
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("variant", ("inference", "genphase"))
 def test_rubin_cache_roundtrip_and_fail_closed(kind, variant):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
 
     knobs = mxfp8_batch_invariant_default_knobs(
         "genphase" if variant == "genphase" else "standard", quant_kind=kind
@@ -391,7 +315,7 @@ def test_input_stage_pins_floor_scales_and_format_without_fallback(
     staging = importlib.import_module(
         f"flashinfer.moe_ep.backends.mega.kernel.{arch}.mxfp8_mxfp8_bf16_cutedsl.staging"
     )
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as shim
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as shim
 
     class CudaMetadataTensor(torch.Tensor):
         @property

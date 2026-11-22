@@ -32,10 +32,6 @@ D, H = 128, 4
 
 @pytest.fixture(params=["gdn2", "gdp"])
 def family(request):
-    import cudnn
-
-    if tuple(map(int, cudnn.__version__.split(".")[:2])) < (1, 31):
-        pytest.skip("state pools require cuDNN frontend 1.31+")
     return request.param
 
 

@@ -815,6 +815,7 @@ class SmemPageOffsetsResource(MlaResource):
                 cta_idx_q,
                 self.cu_seqlens_q,
                 batch_idx,
+                cp_rank=self.cp_rank,
             )
             local_tile_idx = local_kv_tile_idx(
                 cfg,
@@ -957,6 +958,7 @@ class SmemPageOffsetsResource(MlaResource):
                     cta_idx_q,
                     self.cu_seqlens_q,
                     batch_idx,
+                    cp_rank=self.cp_rank,
                 )
                 local_tile_idx = local_kv_tile_idx(
                     cfg,
@@ -996,7 +998,7 @@ class SmemPageOffsetsResource(MlaResource):
                     3,
                     cutlass.Int32,
                 )
-                if cutlass.const_expr(cfg.use_kv_bounds):
+                if cutlass.const_expr(cfg.cp_world > 1):
                     if seq_len_kv == Int32(0):
                         # An empty rank need not own any valid physical pages.
                         # A negative page selects TMA's out-of-bounds zero fill.
@@ -1767,6 +1769,7 @@ class SmemKvResource(MlaResource):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
         tile_idx = global_kv_tile_idx(
             cfg,
@@ -2021,7 +2024,7 @@ class SmemKvResource(MlaResource):
                         tile_idx * Int32(pages_per_tile) + Int32(page_frag),
                         last_valid_page,
                     )
-                    if cutlass.const_expr(cfg.use_kv_bounds):
+                    if cutlass.const_expr(cfg.cp_world > 1):
                         page_id = Int32(-1)
                         if seq_len_kv > Int32(0):
                             page_id = Int32(

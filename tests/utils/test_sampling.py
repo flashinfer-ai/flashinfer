@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from threading import Barrier
@@ -22,6 +23,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer import _top_p_renorm_specialized
 from flashinfer.utils import device_support_pdl
 from tests.infra.test_helpers.parametrize import (
     parametrize_product,
@@ -2459,6 +2461,1327 @@ def test_top_p_renorm_probs_per_request(batch_size, vocab_size):
         renorm_prob,
         rtol=1e-3,
         atol=1e-3,
+    )
+
+
+# top_p_renorm_probs on compute capability 10.3 (B300 / GB300): float32 ``probs`` with a per-row
+# float32 ``top_p`` tensor and ``is_deterministic=False`` are served by a thread-block-cluster
+# kernel (``flashinfer/_top_p_renorm_specialized.py``) for the exact (batch_size, vocab_size)
+# rows of ``flashinfer/top_p_renorm_probs_specialized_workloads.json``; every other call keeps
+# the AIR top-p path. The calls it can never serve return before any counter or diagnostics; the
+# kill-switch / fallback lines of the others reach stderr only for calls on an SM103 device. The
+# guard and marker tests use CPU tensors (some reporting a fake CUDA device); the shape and
+# never-served-call tests run on every GPU (off SM103 they check that the call stays on the AIR
+# path and off stderr); the remaining tests need SM103.
+
+_TOP_P_SPECIALIZED_KILL_SWITCH = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+_TOP_P_SPECIALIZED_SHAPES = [
+    (5, 154880),
+    (6, 154880),
+    (12, 154880),
+    (18, 154880),
+    (24, 154880),
+    (30, 154880),
+    (36, 154880),
+    (54, 154880),
+    (4, 248320),
+    (7, 248320),
+    (12, 248320),
+    (16, 248320),
+    (20, 248320),
+    (24, 248320),
+    (28, 248320),
+    (32, 248320),
+    (68, 248320),
+]
+
+
+def _is_sm103():
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 3)
+
+
+def _skip_unless_sm103():
+    if not _is_sm103():
+        pytest.skip("The specialized top-p renorm kernel dispatches on SM103 only")
+
+
+def _top_p_specialized_stats():
+    return _top_p_renorm_specialized._top_p_renorm_probs_specialized_stats()
+
+
+@pytest.fixture
+def top_p_specialized_enabled(monkeypatch):
+    monkeypatch.delenv(_TOP_P_SPECIALIZED_KILL_SWITCH, raising=False)
+
+
+def _top_p_specialized_target(probs, top_p):
+    """The nucleus target of each row, as on the AIR path (blockSum * p): top_p times the row's
+    mass (float64), so a row that does not sum to 1 keeps the same entries."""
+    p = probs.double()
+    return top_p.double().reshape(-1, 1).to(p.device) * p.clamp(min=0).sum(
+        dim=-1, keepdim=True
+    )
+
+
+def _top_p_specialized_reference(probs, top_p):
+    """Exact semantics in float64: keep p >= threshold, where threshold is the smallest value of
+    the shortest descending prefix whose mass reaches top_p times the row's mass (ties kept);
+    renormalise, unless the kept mass is <= 1e-8 (that row is left as it is, like on AIR)."""
+    p = probs.double()
+    sp, _ = torch.sort(p, dim=-1, descending=True)
+    excl = torch.cumsum(sp, dim=-1) - sp
+    target = _top_p_specialized_target(p, top_p)
+    k = (excl < target).sum(dim=-1, keepdim=True).clamp(min=1)
+    thr = sp.gather(-1, k - 1)
+    kept = torch.where(p >= thr, p, torch.zeros_like(p))
+    mass = kept.sum(dim=-1, keepdim=True)
+    cut = float(torch.tensor(1e-8, dtype=torch.float32))
+    return torch.where(mass > cut, kept / mass, kept).float()
+
+
+def _top_p_specialized_edge_margin(probs, top_p):
+    """Distance of each row's nucleus edge from its target, relative to the row's mass
+    (float64); rows whose edge entry is at most 1e-6 of the mass are exempt (flipping it moves
+    no output beyond the tolerance)."""
+    sp, _ = torch.sort(probs.double(), dim=-1, descending=True)
+    cum = torch.cumsum(sp, dim=-1)
+    excl = cum - sp
+    tp = _top_p_specialized_target(probs, top_p)
+    mass = sp.clamp(min=0).sum(dim=-1, keepdim=True).clamp(min=1e-300)
+    k = (excl < tp).sum(dim=-1, keepdim=True).clamp(min=1)
+    inc = cum.gather(-1, k - 1)
+    exc = excl.gather(-1, k - 1)
+    edge = sp.gather(-1, k - 1)
+    m = torch.minimum((inc - tp).abs(), (exc - tp).abs()) / mass
+    return torch.where(edge > 1e-6 * mass, m, torch.ones_like(m)).reshape(-1)
+
+
+def _top_p_specialized_robust_top_p(probs, top_p):
+    """Lower top_p (2e-4 steps) on rows whose nucleus edge lies within 1e-5 of the row's mass
+    from the target, so the kept set does not depend on the float32 summation order of the path
+    under test."""
+    tp = top_p.clone()
+    for _ in range(50):
+        bad = _top_p_specialized_edge_margin(probs, tp) < 1e-5
+        if not bool(bad.any()):
+            break
+        tp = torch.where(bad, tp - 2e-4, tp)
+    return tp
+
+
+def _top_p_specialized_row(kind, vocab_size, g):
+    """One float64 probability row of a serving-like or adversarial kind."""
+    v = vocab_size
+    if kind == 0:
+        # truncated upstream (top-k 20): a few peaked values, exact zeros elsewhere
+        vals = torch.softmax(torch.randn(20, generator=g, dtype=torch.float64) * 4.0, 0)
+        row = torch.zeros(v, dtype=torch.float64)
+        row[torch.randperm(v, generator=g)[:20]] = vals
+    elif kind == 1:
+        # one dominant token over a smooth log-normal bulk (nucleus of 1-2 tokens)
+        row = torch.exp(torch.randn(v, generator=g, dtype=torch.float64) * 3.0)
+        row = row / row.sum() * 0.03
+        row[int(torch.randint(0, v, (1,), generator=g))] += 0.97
+    elif kind == 2:
+        # wide nucleus: the entries >= 2^-8 cannot reach top_p (exact radix fallback)
+        row = torch.softmax(torch.randn(v, generator=g, dtype=torch.float64), 0)
+    elif kind == 3:
+        # dominant token plus a heavy bulk: the nucleus reaches deep into tiny entries
+        row = torch.exp(torch.randn(v, generator=g, dtype=torch.float64) * 2.0)
+        row = row / row.sum() * 0.25
+        row[int(torch.randint(0, v, (1,), generator=g))] += 0.75
+    else:
+        # about 100 entries >= 2^-8 holding 97 % of the mass (block-wide resolve of the head set)
+        idx = torch.randperm(v, generator=g)
+        head = 0.005 + 0.01 * torch.rand(100, generator=g, dtype=torch.float64)
+        tail = torch.rand(2000, generator=g, dtype=torch.float64)
+        row = torch.zeros(v, dtype=torch.float64)
+        row[idx[:100]] = head / head.sum() * 0.97
+        row[idx[100:2100]] = tail / tail.sum() * 0.03
+    return row / row.sum()
+
+
+def _top_p_specialized_inputs(
+    batch_size, vocab_size, seed, top_p=0.95, kinds=(0, 1, 0, 2, 1, 3, 4)
+):
+    g = torch.Generator().manual_seed(seed)
+    probs = torch.stack(
+        [
+            _top_p_specialized_row(kinds[b % len(kinds)], vocab_size, g)
+            for b in range(batch_size)
+        ]
+    ).float()
+    top_ps = top_p if isinstance(top_p, (list, tuple)) else [top_p]
+    tp = torch.tensor(
+        [float(top_ps[b % len(top_ps)]) for b in range(batch_size)],
+        dtype=torch.float32,
+    )
+    return probs.cuda(), _top_p_specialized_robust_top_p(probs, tp).cuda()
+
+
+def _assert_top_p_specialized_contract(out, ref):
+    """The specialized kernel's contract: the float64 reference within atol 1e-6, rtol 1e-5."""
+    assert out.dtype == torch.float32 and out.shape == ref.shape
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref.to(out.device), atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("batch_size,vocab_size", _TOP_P_SPECIALIZED_SHAPES)
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9, 1.0, "per_request"])
+def test_top_p_renorm_probs_specialized_shapes(
+    batch_size, vocab_size, p, top_p_specialized_enabled
+):
+    # test_top_p_renorm_probs / test_top_p_renorm_probs_per_request on the rows the SM103 kernel
+    # serves, with top_p passed as a per-row float32 tensor (the served signature).
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    if p == "per_request":
+        top_p_arr = torch.linspace(0.1, 0.9, batch_size, device="cuda:0")
+    else:
+        top_p_arr = torch.full((batch_size,), p, device="cuda:0")
+    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda:0")
+    mask.scatter_add_(1, indices, (cdf >= (1 - top_p_arr.unsqueeze(1))).int())
+    renorm_prob_ground_truth = normalized_prob.clone()
+    renorm_prob_ground_truth[mask == 0] = 0
+    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
+        dim=-1, keepdim=True
+    )
+
+    dispatched = _top_p_specialized_stats()["dispatch_count"]
+    renorm_prob = flashinfer.sampling.top_p_renorm_probs(normalized_prob, top_p_arr)
+    # SM103 serves the call with the specialized kernel; every other GPU keeps the AIR path.
+    assert _top_p_specialized_stats()["dispatch_count"] == dispatched + int(_is_sm103())
+    torch.testing.assert_close(
+        renorm_prob_ground_truth,
+        renorm_prob,
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+def test_top_p_renorm_probs_specialized_allowlist():
+    assert _top_p_renorm_specialized._load_allowlist() == frozenset(
+        _TOP_P_SPECIALIZED_SHAPES
+    )
+
+
+@pytest.fixture
+def top_p_specialized_cpu_call():
+    batch_size, vocab_size = _TOP_P_SPECIALIZED_SHAPES[0]
+    return torch.rand(batch_size, vocab_size), torch.full((batch_size,), 0.95)
+
+
+def _top_p_specialized_unlisted_batch(vocab_size):
+    return next(
+        b
+        for b in range(1, 1024)
+        if (b, vocab_size) not in set(_TOP_P_SPECIALIZED_SHAPES)
+    )
+
+
+def test_top_p_renorm_probs_specialized_guard_accepts_until_the_device_check(
+    top_p_specialized_cpu_call, top_p_specialized_enabled
+):
+    probs, top_p = top_p_specialized_cpu_call
+    # every semantic and layout gate passes; a CPU tensor stops at the device gate
+    assert _top_p_renorm_specialized._reject_reason(probs, top_p, False) == "device"
+
+
+@pytest.mark.parametrize(
+    "mutate, reason",
+    [
+        (lambda p, t: (p, t, True), "deterministic"),
+        (lambda p, t: (p, 0.95, False), "scalar_top_p"),
+        (lambda p, t: (p.bfloat16(), t, False), "dtype"),
+        (lambda p, t: (p, t.double(), False), "dtype"),
+        (lambda p, t: (p, t[1:], False), "shape"),
+        (lambda p, t: (p.unsqueeze(0), t, False), "shape"),
+        (lambda p, t: (p.t().contiguous().t(), t, False), "non_contiguous"),
+        (lambda p, t: (p, torch.empty(2 * t.numel())[::2], False), "non_contiguous"),
+        (
+            lambda p, t: (
+                p.new_empty(_top_p_specialized_unlisted_batch(p.shape[1]), p.shape[1]),
+                t.new_empty(_top_p_specialized_unlisted_batch(p.shape[1])),
+                False,
+            ),
+            "shape_not_allowlisted",
+        ),
+        (
+            lambda p, t: (p[:, : p.shape[1] - 4].contiguous(), t, False),
+            "shape_not_allowlisted",
+        ),
+        (
+            lambda p, t: (torch.empty(p.numel() + 1)[1:].view(p.shape), t, False),
+            "alignment",
+        ),
+    ],
+)
+def test_top_p_renorm_probs_specialized_guard_rejections(
+    top_p_specialized_cpu_call, top_p_specialized_enabled, mutate, reason
+):
+    probs, top_p, is_deterministic = mutate(*top_p_specialized_cpu_call)
+    assert (
+        _top_p_renorm_specialized._reject_reason(probs, top_p, is_deterministic)
+        == reason
+    )
+
+
+def test_top_p_renorm_probs_specialized_kill_switch_is_read_at_call_time(
+    top_p_specialized_cpu_call, monkeypatch
+):
+    probs, top_p = top_p_specialized_cpu_call
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    assert (
+        _top_p_renorm_specialized._reject_reason(probs, top_p, False) == "kill_switch"
+    )
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "0")
+    assert _top_p_renorm_specialized._reject_reason(probs, top_p, False) == "device"
+
+
+def test_top_p_renorm_probs_specialized_ineligible_call_returns_none(
+    top_p_specialized_cpu_call, top_p_specialized_enabled
+):
+    # A call the kernel can never serve (here: CPU tensors) is not counted.
+    probs, top_p = top_p_specialized_cpu_call
+    before = _top_p_specialized_stats()
+    assert (
+        _top_p_renorm_specialized.top_p_renorm_probs_specialized(probs, top_p, False)
+        is None
+    )
+    after = _top_p_specialized_stats()
+    for key in ("calls", "dispatch_count", "fallbacks"):
+        assert after[key] == before[key]
+    assert after["fallback_reasons"] == before["fallback_reasons"]
+
+
+class _TopPSpecializedLogRecorder:
+    """Stand-in for the ``flashinfer.jit`` logger of the specialized path: (level, message)."""
+
+    def __init__(self):
+        self.records = []
+
+    def _record(self, level, msg, *args):
+        self.records.append((level, msg % args if args else msg))
+
+    def debug(self, msg, *args):
+        self._record("debug", msg, *args)
+
+    def info(self, msg, *args):
+        self._record("info", msg, *args)
+
+    def warning(self, msg, *args):
+        self._record("warning", msg, *args)
+
+
+@pytest.fixture
+def top_p_specialized_markers(monkeypatch):
+    """Fresh one-time marker state; returns the recorder standing in for the logger."""
+    monkeypatch.setattr(_top_p_renorm_specialized, "_markers_emitted", set())
+    monkeypatch.setattr(_top_p_renorm_specialized, "_markers_logged_debug", set())
+    recorder = _TopPSpecializedLogRecorder()
+    monkeypatch.setattr(_top_p_renorm_specialized, "logger", recorder)
+    return recorder
+
+
+class _TopPSpecializedFakeCudaDevices:
+    """Stand-in for torch.cuda's current device and per-device stream capture (no GPU needed):
+    ``is_current_stream_capturing()`` reports the current device's stream, as torch does."""
+
+    def __init__(self, monkeypatch, current=0, capturing=()):
+        self.current = current
+        self.capturing = set(capturing)
+        fake = self
+
+        class _Device:
+            def __init__(self, device):
+                self.index = (
+                    device if isinstance(device, int) else torch.device(device).index
+                )
+
+            def __enter__(self):
+                self.previous, fake.current = fake.current, self.index
+
+            def __exit__(self, *exc):
+                fake.current = self.previous
+                return False
+
+        monkeypatch.setattr(torch.cuda, "device", _Device)
+        monkeypatch.setattr(
+            torch.cuda,
+            "is_current_stream_capturing",
+            lambda: fake.current in fake.capturing,
+        )
+
+
+class _TopPSpecializedFakeCudaTensor(torch.Tensor):
+    """A CPU tensor that reports a CUDA device, for the guard's device gates without a GPU (the
+    device is a class attribute, so tensors derived from it report it too)."""
+
+    _fake_device = torch.device("cuda", 0)
+
+    @property
+    def device(self):
+        return self._fake_device
+
+
+def _top_p_specialized_fake_cuda_call(index, shape=None):
+    batch_size, vocab_size = shape or _TOP_P_SPECIALIZED_SHAPES[0]
+    fake = type(
+        f"_TopPSpecializedFakeCuda{index}Tensor",
+        (_TopPSpecializedFakeCudaTensor,),
+        {"_fake_device": torch.device("cuda", index)},
+    )
+    probs = torch.rand(batch_size, vocab_size).as_subclass(fake)
+    top_p = torch.full((batch_size,), 0.95).as_subclass(fake)
+    return probs, top_p
+
+
+@pytest.fixture
+def top_p_specialized_fake_devices(monkeypatch):
+    """Fake CUDA devices for fake-CUDA tensors: cuda:0 and cuda:2 of compute capability 10.3,
+    cuda:1 of 10.0, none capturing; fresh per-device caches."""
+    devices = _TopPSpecializedFakeCudaDevices(monkeypatch, current=0)
+    capabilities = {0: (10, 3), 1: (10, 0), 2: (10, 3)}
+    monkeypatch.setattr(
+        _top_p_renorm_specialized,
+        "get_compute_capability",
+        lambda device: capabilities[device.index],
+    )
+    monkeypatch.setattr(_top_p_renorm_specialized, "_device_capability", {})
+    monkeypatch.setattr(_top_p_renorm_specialized, "_device_supported", {})
+    monkeypatch.setattr(_top_p_renorm_specialized, "_launch_failed_devices", set())
+    return devices
+
+
+def test_top_p_renorm_probs_specialized_target_device_gate(monkeypatch):
+    # stderr is reserved for calls on a CUDA device of compute capability 10.3, read from a
+    # per-device cache that is never filled while that device's stream is capturing a CUDA graph.
+    capabilities = {0: (10, 3), 1: (10, 0), 2: (10, 3), 3: (10, 3)}
+    queried = []
+
+    def get_compute_capability(device):
+        queried.append(device.index)
+        return capabilities[device.index]
+
+    devices = _TopPSpecializedFakeCudaDevices(monkeypatch, current=0)
+    monkeypatch.setattr(
+        _top_p_renorm_specialized, "get_compute_capability", get_compute_capability
+    )
+    monkeypatch.setattr(_top_p_renorm_specialized, "_device_capability", {})
+    gate = _top_p_renorm_specialized._is_target_device
+    assert gate(torch.device("cuda", 0)) and gate(torch.device("cuda", 0))
+    assert not gate(torch.device("cuda", 1))
+    assert queried == [0, 1]
+    devices.capturing = {0, 2}
+    assert gate(torch.device("cuda", 0))
+    # a device not seen before the capture counts as another device, without a query
+    assert not gate(torch.device("cuda", 2))
+    # ... also while another device (not capturing) is current
+    devices.capturing = {2}
+    assert not gate(torch.device("cuda", 2))
+    assert queried == [0, 1]
+    # a capture on the current device does not hide a device whose stream is not capturing
+    devices.capturing = {0}
+    assert gate(torch.device("cuda", 3))
+    assert queried == [0, 1, 3]
+    assert devices.current == 0
+    assert not gate(torch.device("cpu")) and not gate(None)
+
+
+def test_top_p_renorm_probs_specialized_capture_check_reads_the_tensor_device(
+    top_p_specialized_enabled, monkeypatch
+):
+    # Before the module is built, a capture on the stream of probs' device keeps the
+    # (capture-safe) stock path, also while another device is current:
+    # torch.cuda.is_current_stream_capturing() alone reads the current device's stream.
+    probs, top_p = _top_p_specialized_fake_cuda_call(1)
+    devices = _TopPSpecializedFakeCudaDevices(monkeypatch, current=0, capturing={1})
+    monkeypatch.setattr(
+        _top_p_renorm_specialized, "get_compute_capability", lambda device: (10, 3)
+    )
+    monkeypatch.setattr(_top_p_renorm_specialized, "_device_capability", {})
+    monkeypatch.setattr(_top_p_renorm_specialized, "_launch_failed_devices", set())
+    monkeypatch.setattr(_top_p_renorm_specialized, "_module", None)
+    reject = _top_p_renorm_specialized._reject_reason
+    assert reject(probs, top_p, False) == "capturing_before_jit"
+    assert devices.current == 0
+    devices.current = 1
+    assert reject(probs, top_p, False) == "capturing_before_jit"
+    devices.current = 0
+    devices.capturing = set()
+    assert reject(probs, top_p, False) is None
+
+
+def test_top_p_renorm_probs_specialized_fallback_lines_are_silent_off_target(
+    top_p_specialized_cpu_call,
+    top_p_specialized_enabled,
+    top_p_specialized_markers,
+    monkeypatch,
+    capsys,
+):
+    # Calls the kernel can never serve (here: CPU tensors, a scalar top_p), also with the kill
+    # switch set, write nothing at all. The only lines off a compute capability 10.3 device are
+    # those of calls whose arguments the first checks cannot read: once each, at DEBUG level on
+    # the flashinfer.jit logger, never on stderr.
+    probs, top_p = top_p_specialized_cpu_call
+    specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
+    for _ in range(2):
+        assert specialized(probs, top_p, False) is None
+        assert specialized(probs, 0.95, False) is None
+        assert specialized(object(), top_p, False) is None
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    assert specialized(probs, top_p, False) is None
+    assert specialized(probs, top_p, False) is None
+    assert capsys.readouterr().err == ""
+    assert _top_p_renorm_specialized._markers_emitted == set()
+    records = top_p_specialized_markers.records
+    assert [level for level, _ in records] == ["debug"]
+    marker = _top_p_renorm_specialized.FALLBACK_MARKER
+    assert records[0][1].startswith(f"{marker}: guard_error")
+
+
+def test_top_p_renorm_probs_specialized_never_served_calls_skip_the_guard(
+    top_p_specialized_enabled,
+    top_p_specialized_markers,
+    top_p_specialized_fake_devices,
+    monkeypatch,
+    capsys,
+):
+    # The calls the kernel can never serve (is_deterministic, a scalar top_p, other dtypes, a
+    # device other than compute capability 10.3, a shape off the allowlist) return before the
+    # environment, the counters and the diagnostics; all but the last also before the
+    # torch.compile check, which the allowlist check follows (dynamo would specialize the batch
+    # size on it). The capability is read once per device.
+    specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
+    probs, top_p = _top_p_specialized_fake_cuda_call(0)
+    other_probs, other_top_p = _top_p_specialized_fake_cuda_call(1)
+    vocab_size = probs.shape[1]
+    unlisted_batch = _top_p_specialized_unlisted_batch(vocab_size)
+    unlisted_probs, unlisted_top_p = _top_p_specialized_fake_cuda_call(
+        0, (unlisted_batch, vocab_size)
+    )
+    # the first call on each device that passes the device-independent checks records its
+    # capability (a scalar top_p does not get that far)
+    assert specialized(probs, 0.95, False) is None
+    assert _top_p_renorm_specialized._device_supported == {}
+    assert specialized(unlisted_probs, unlisted_top_p, False) is None
+    assert specialized(other_probs, other_top_p, False) is None
+    cpu_probs, cpu_top_p = torch.rand(probs.shape), torch.full((probs.shape[0],), 0.95)
+    assert specialized(cpu_probs, cpu_top_p, False) is None
+    assert _top_p_renorm_specialized._device_supported == {
+        torch.device("cuda", 0): True,
+        torch.device("cuda", 1): False,
+        torch.device("cpu"): False,
+    }
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("a call the kernel never serves reached the guard")
+
+    for name in (
+        "_reject_reason",
+        "_bump_fallback",
+        "_report_once",
+        "_emit_once",
+        "get_compute_capability",
+    ):
+        monkeypatch.setattr(_top_p_renorm_specialized, name, must_not_run)
+    compile_checks = []
+    monkeypatch.setattr(
+        torch.compiler, "is_compiling", lambda: bool(compile_checks.append(1))
+    )
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    before = _top_p_specialized_stats()
+    for args in [
+        (probs, top_p, True),
+        (probs, 0.95, False),
+        (probs.double(), top_p, False),
+        (probs, top_p.double(), False),
+        (probs.bfloat16(), top_p, False),
+        (other_probs, other_top_p, False),
+        (cpu_probs, cpu_top_p, False),
+    ]:
+        assert specialized(*args) is None
+    assert compile_checks == []
+    assert specialized(unlisted_probs, unlisted_top_p, False) is None
+    assert compile_checks == [1]
+    after = _top_p_specialized_stats()
+    for key in ("calls", "dispatch_count", "fallbacks"):
+        assert after[key] == before[key]
+    assert after["fallback_reasons"] == before["fallback_reasons"]
+    assert top_p_specialized_markers.records == []
+    assert capsys.readouterr().err == ""
+
+
+def test_top_p_renorm_probs_specialized_never_served_checks_trace_under_torch_compile(
+    top_p_specialized_cpu_call,
+):
+    # The first checks run before the torch.compile check, so dynamo traces them: no graph break
+    # (fullgraph), and a call it can never serve keeps the stock path.
+    probs, top_p = top_p_specialized_cpu_call
+    specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
+
+    def call(p, t):
+        out = specialized(p, t, False)
+        return p * 2 if out is None else out
+
+    compiled = torch.compile(call, backend="eager", fullgraph=True, dynamic=True)
+    torch.testing.assert_close(compiled(probs, top_p), probs * 2)
+    torch.testing.assert_close(compiled(probs[:3], top_p[:3]), probs[:3] * 2)
+
+
+def test_top_p_renorm_probs_specialized_fallback_reason_is_written_once(
+    top_p_specialized_enabled,
+    top_p_specialized_markers,
+    top_p_specialized_fake_devices,
+    capsys,
+):
+    # On a compute capability 10.3 device the first fallback of each reason of a call the kernel
+    # would serve is one stderr line (whatever the host's logging configuration), later ones are
+    # silent.
+    probs, top_p = _top_p_specialized_fake_cuda_call(0)
+    strided = probs.t().contiguous().t()
+    specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
+    assert specialized(strided, top_p, False) is None
+    assert specialized(strided, top_p, False) is None
+    assert specialized(probs, top_p[1:], False) is None
+    marker = _top_p_renorm_specialized.FALLBACK_MARKER
+    lines = [line for line in capsys.readouterr().err.splitlines() if marker in line]
+    assert len(lines) == 2
+    assert lines[0].startswith(
+        f"{marker}: non_contiguous (shape={tuple(probs.shape)}, dtype=torch.float32, "
+        "device=cuda:0"
+    )
+    assert lines[1].startswith(f"{marker}: shape")
+    assert top_p_specialized_markers.records == [("info", line) for line in lines]
+
+
+def test_top_p_renorm_probs_specialized_kill_switch_marker_is_written_once(
+    top_p_specialized_markers,
+    top_p_specialized_fake_devices,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    probs, top_p = _top_p_specialized_fake_cuda_call(0)
+    _top_p_renorm_specialized.top_p_renorm_probs_specialized(probs, top_p, False)
+    _top_p_renorm_specialized.top_p_renorm_probs_specialized(probs, top_p, False)
+    err = capsys.readouterr().err
+    assert err.count(_top_p_renorm_specialized.KILL_SWITCH_MARKER) == 1
+    assert _top_p_renorm_specialized.FALLBACK_MARKER not in err
+
+
+@pytest.fixture
+def top_p_specialized_missing_allowlist(monkeypatch):
+    monkeypatch.setattr(
+        _top_p_renorm_specialized, "_WORKLOAD_FILE", "missing_workloads.json"
+    )
+    _top_p_renorm_specialized._load_allowlist.cache_clear()
+    yield
+    monkeypatch.undo()
+    _top_p_renorm_specialized._load_allowlist.cache_clear()
+    assert _top_p_renorm_specialized._load_allowlist()
+    assert _top_p_renorm_specialized._allowlist_error is None
+
+
+@pytest.mark.parametrize("device_index", [0, 1])
+def test_top_p_renorm_probs_specialized_missing_allowlist_is_reported(
+    device_index,
+    top_p_specialized_enabled,
+    top_p_specialized_markers,
+    top_p_specialized_fake_devices,
+    top_p_specialized_missing_allowlist,
+    capsys,
+):
+    # Without its allowlist no call is served; the load error is reported once, on stderr (after
+    # a warning), by the first call the kernel would otherwise serve: a call on a compute
+    # capability 10.3 device (cuda:0). A call on another device (cuda:1) never reads the
+    # allowlist and writes nothing.
+    probs, top_p = _top_p_specialized_fake_cuda_call(device_index)
+    specialized = _top_p_renorm_specialized.top_p_renorm_probs_specialized
+    assert specialized(probs, top_p, False) is None
+    assert specialized(probs, top_p, False) is None
+    assert _top_p_specialized_stats()["allowlist_error"].startswith("FileNotFoundError")
+    marker = _top_p_renorm_specialized.FALLBACK_MARKER
+    err = capsys.readouterr().err
+    records = top_p_specialized_markers.records
+    if device_index == 0:
+        lines = [line for line in err.splitlines() if marker in line]
+        assert len(lines) == 1
+        assert lines[0].startswith(
+            f"{marker}: allowlist_unavailable (FileNotFoundError"
+        )
+        assert [level for level, _ in records] == ["warning", "info"]
+        assert "allowlist unavailable (FileNotFoundError" in records[0][1]
+    else:
+        assert err == ""
+        assert records == []
+
+
+def test_top_p_renorm_probs_specialized_guard_exception_keeps_the_stock_path(
+    top_p_specialized_enabled,
+):
+    assert (
+        _top_p_renorm_specialized.top_p_renorm_probs_specialized(
+            object(), torch.ones(1), False
+        )
+        is None
+    )
+    stats = _top_p_specialized_stats()
+    assert stats["fallback_reasons"].get("guard_error", 0) >= 1
+    assert stats["guard_error"]
+
+
+def test_top_p_renorm_probs_specialized_stats_report_the_compile_footprint():
+    stats = _top_p_specialized_stats()
+    assert stats["allowlist_rows"] == len(_TOP_P_SPECIALIZED_SHAPES)
+    assert stats["compiled_variants"] in (0, 1)
+    assert stats["kernel_instantiations"] == 18
+    # the allowlisted rows (float4 rows) reach 8 of the 9 launch configurations (all but the
+    # short-row one)
+    assert stats["distinct_kernels_for_allowlist"] == 8
+    configs = {
+        (c["cluster_size"], c["num_threads"], c["min_blocks"], c["unroll"])
+        for c in stats["allowlist_kernel_configs"]
+    }
+    assert configs == set(_top_p_renorm_specialized._LAUNCH_CONFIGS[1:])
+    assert all(c["vectorized"] for c in stats["allowlist_kernel_configs"])
+
+
+def test_top_p_renorm_probs_specialized_launch_plan_mirror():
+    # Spot checks of the B x V launch table (serving rows) against the configurations it names.
+    plan = _top_p_renorm_specialized._plan_config
+    assert plan(7, 248320) == (16, 1024, 1, 4, True)
+    assert plan(6, 154880) == (16, 1024, 1, 3, True)
+    assert plan(12, 154880) == (16, 512, 3, 5, True)
+    assert plan(16, 248320) == (16, 512, 3, 8, True)
+    assert plan(30, 154880) == (16, 256, 4, 10, True)
+    assert plan(36, 154880) == (8, 512, 3, 8, True)
+    assert plan(32, 248320) == (8, 512, 2, 16, True)
+    assert plan(68, 248320) == (8, 512, 4, 8, True)
+    assert plan(4, 32000) == (8, 256, 6, 8, True)
+
+
+def test_top_p_renorm_probs_specialized_never_served_calls_are_silent(
+    top_p_specialized_enabled, top_p_specialized_markers, capsys
+):
+    # Calls the kernel never serves (a scalar top_p, a shape off the allowlist, bfloat16 rows)
+    # take the AIR path on every GPU without a counter, a marker or a log line.
+    probs = torch.rand(4, 1024, device="cuda:0")
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    top_p = torch.full((4,), 0.95, device="cuda:0")
+    before = _top_p_specialized_stats()
+    for _ in range(2):
+        flashinfer.sampling.top_p_renorm_probs(probs, 0.95)
+        flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+        flashinfer.sampling.top_p_renorm_probs(probs.bfloat16(), top_p)
+    after = _top_p_specialized_stats()
+    for key in ("calls", "dispatch_count", "fallbacks"):
+        assert after[key] == before[key]
+    assert _top_p_renorm_specialized.FALLBACK_MARKER not in capsys.readouterr().err
+    assert top_p_specialized_markers.records == []
+
+
+@pytest.mark.parametrize("batch_size,vocab_size", _TOP_P_SPECIALIZED_SHAPES)
+def test_top_p_renorm_probs_specialized_matches_reference(
+    batch_size, vocab_size, top_p_specialized_enabled, monkeypatch
+):
+    _skip_unless_sm103()
+    probs, top_p = _top_p_specialized_inputs(
+        batch_size, vocab_size, seed=batch_size * 7 + vocab_size
+    )
+    ref = _top_p_specialized_reference(probs, top_p)
+    before = _top_p_specialized_stats()["dispatch_count"]
+    out = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    assert _top_p_specialized_stats()["dispatch_count"] == before + 1
+    _assert_top_p_specialized_contract(out, ref)
+
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    stock = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    assert _top_p_specialized_stats()["dispatch_count"] == before + 1
+    # the AIR path's own test tolerance (float32 accumulation)
+    torch.testing.assert_close(out, stock, atol=1e-3, rtol=1e-3)
+
+
+def test_top_p_renorm_probs_specialized_dispatch_marker_is_written_once(
+    top_p_specialized_enabled, top_p_specialized_markers, capsys
+):
+    _skip_unless_sm103()
+    batch_size, vocab_size = _TOP_P_SPECIALIZED_SHAPES[0]
+    probs, top_p = _top_p_specialized_inputs(batch_size, vocab_size, seed=11)
+    flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    err = capsys.readouterr().err
+    assert err.count(_top_p_renorm_specialized.DISPATCH_MARKER) == 1
+    assert f"(batch_size={batch_size}, vocab_size={vocab_size}" in err
+    assert _top_p_renorm_specialized.FALLBACK_MARKER not in err
+
+
+def test_top_p_renorm_probs_specialized_kill_switch_takes_the_stock_path(monkeypatch):
+    _skip_unless_sm103()
+    batch_size, vocab_size = _TOP_P_SPECIALIZED_SHAPES[0]
+    probs, top_p = _top_p_specialized_inputs(batch_size, vocab_size, seed=1)
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    before = _top_p_specialized_stats()
+    out = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    after = _top_p_specialized_stats()
+    assert after["dispatch_count"] == before["dispatch_count"]
+    assert (
+        after["fallback_reasons"]["kill_switch"]
+        == before["fallback_reasons"].get("kill_switch", 0) + 1
+    )
+    torch.testing.assert_close(
+        out, _top_p_specialized_reference(probs, top_p).cuda(), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize("batch_size,vocab_size", [(8, 248320), (40, 154880)])
+def test_top_p_renorm_probs_specialized_unlisted_shape_takes_the_stock_path(
+    batch_size, vocab_size, top_p_specialized_enabled
+):
+    _skip_unless_sm103()
+    probs, top_p = _top_p_specialized_inputs(batch_size, vocab_size, seed=2)
+    before = _top_p_specialized_stats()["dispatch_count"]
+    out = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    assert _top_p_specialized_stats()["dispatch_count"] == before
+    torch.testing.assert_close(
+        out, _top_p_specialized_reference(probs, top_p).cuda(), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize("batch_size,vocab_size", [(7, 248320), (54, 154880)])
+def test_top_p_renorm_probs_specialized_uninitialised_output(
+    batch_size, vocab_size, top_p_specialized_enabled
+):
+    # The kernel must not rely on a zero-filled output: every element is written.
+    _skip_unless_sm103()
+    probs, top_p = _top_p_specialized_inputs(batch_size, vocab_size, seed=3)
+    module = _top_p_renorm_specialized._get_module()
+    assert module is not None
+    out = torch.full_like(probs, float("nan"))
+    module.top_p_renorm_probs_specialized(probs, top_p, out)
+    _assert_top_p_specialized_contract(out, _top_p_specialized_reference(probs, top_p))
+
+
+@pytest.mark.parametrize("kind", [0, 1, 2, 3, 4])
+@pytest.mark.parametrize("top_p", [0.95, 0.5, 0.999, 1.0])
+def test_top_p_renorm_probs_specialized_row_kinds(
+    kind, top_p, top_p_specialized_enabled
+):
+    # Head-set rows (0, 1: one-entry exit and warp-level resolve; 4: block-wide resolve) and
+    # exact radix-fallback rows (2, 3) at several thresholds.
+    _skip_unless_sm103()
+    probs, tp = _top_p_specialized_inputs(
+        6, 154880, seed=10 + kind, top_p=top_p, kinds=(kind,)
+    )
+    out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    _assert_top_p_specialized_contract(out, _top_p_specialized_reference(probs, tp))
+
+
+def test_top_p_renorm_probs_specialized_mixed_per_row_top_p(top_p_specialized_enabled):
+    _skip_unless_sm103()
+    probs, tp = _top_p_specialized_inputs(
+        12,
+        248320,
+        seed=4,
+        top_p=[0.95, 0.1, 1.0, 0.5, 0.999, 0.8],
+        kinds=(0, 1, 2, 3, 4),
+    )
+    out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    _assert_top_p_specialized_contract(out, _top_p_specialized_reference(probs, tp))
+
+
+def test_top_p_renorm_probs_specialized_ties_at_the_threshold(
+    top_p_specialized_enabled,
+):
+    _skip_unless_sm103()
+    batch_size, vocab_size = 5, 154880
+    probs = torch.zeros(batch_size, vocab_size)
+    probs[:, :5] = 0.125  # five exact ties
+    probs[:, 5:3005] = 0.375 / 3000  # the rest of the mass below 2^-8
+    top_p = torch.full((batch_size,), 0.3)
+    out = flashinfer.sampling.top_p_renorm_probs(probs.cuda(), top_p.cuda())
+    ref = _top_p_specialized_reference(probs, top_p)
+    assert (ref[:, :5] > 0).all() and (ref[:, 5:] == 0).all()
+    _assert_top_p_specialized_contract(out, ref)
+
+
+def test_top_p_renorm_probs_specialized_tiny_top_p(top_p_specialized_enabled):
+    # A top_p below the fixed-point resolution keeps the row maximum.
+    _skip_unless_sm103()
+    probs, _ = _top_p_specialized_inputs(4, 248320, seed=5, kinds=(1, 2))
+    tp = torch.full((4,), 1e-30, device="cuda")
+    out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    _assert_top_p_specialized_contract(out, _top_p_specialized_reference(probs, tp))
+
+
+@pytest.mark.parametrize("top_p_value", [0.0, 0.5, 0.95])
+def test_top_p_renorm_probs_specialized_zero_mass_rows(
+    top_p_value, top_p_specialized_enabled, monkeypatch
+):
+    # A row whose kept mass is <= 1e-8 (all zeros, or vanishing values) is left unnormalised,
+    # exactly like the AIR path (norm 1.0), never 0/0 = NaN or x/0 = inf. The nucleus target is
+    # relative to the row's mass there too: of the different vanishing values in row 2, top_p 0.5
+    # keeps 2^-28 alone, like AIR (an absolute target would keep both).
+    _skip_unless_sm103()
+    batch_size, vocab_size = 4, 248320
+    probs = torch.zeros(batch_size, vocab_size, device="cuda")
+    probs[1] = 1e-14  # every entry vanishing: total mass 2.5e-9
+    probs[2, 7] = 2.0**-28
+    probs[2, vocab_size // 2] = 2.0**-29
+    probs[3, ::7] = 1e-13
+    tp = torch.full((batch_size,), top_p_value, device="cuda")
+    out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    stock = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, stock, atol=0.0, rtol=0.0)
+    assert int((out[2] > 0).sum()) == (1 if top_p_value <= 0.5 else 2)
+
+
+def test_top_p_renorm_probs_specialized_nan_entries_are_never_kept(
+    top_p_specialized_enabled, monkeypatch
+):
+    # A NaN entry has no mass and is never kept, on the radix path (whose bit-prefix test alone
+    # would keep it: +NaN's bits sort above every finite value) as on the head paths (a NaN
+    # converts to 2^63 fixed-point units, so a NaN head entry or histogram entry would carry that
+    # mass): the output is the float64 reference of the row with its NaNs set to 0. The AIR path
+    # writes no NaN either, but its float32 sums become NaN, so it keeps every finite positive
+    # entry of such a row (top_p is lost); only the absence of NaN is compared with it.
+    _skip_unless_sm103()
+    vocab_size = 154880  # 6 rows: an allowlisted shape
+    g = torch.Generator().manual_seed(31)
+    # radix, radix (keep all at top_p 1), radix, and the head paths: warp-level (a +NaN is a
+    # head candidate: its bits are >= those of 2^-8) and block-wide
+    kinds = [2, 2, 3, 1, 4]
+    rows = [_top_p_specialized_row(kind, vocab_size, g) for kind in kinds]
+    rows.append(torch.zeros(vocab_size, dtype=torch.float64))
+    probs = torch.stack(rows).float()
+    assert probs.shape == (6, vocab_size)
+    nan_at = torch.arange(5) * (vocab_size // 5) + 3  # one NaN in several CTAs' slices
+    probs[:5, nan_at] = float("nan")
+    # NaNs with the sign bit set (bits 0xffffffff) in every CTA's slice too
+    neg_nan_at = nan_at + vocab_size // 10
+    probs[:5, neg_nan_at] = torch.tensor(-1, dtype=torch.int32).view(torch.float32)
+    probs[5] = float("nan")  # all NaN: no mass, stays all zero
+    clean = torch.nan_to_num(probs, nan=0.0)
+    tp = torch.tensor([0.9, 1.0, 0.95, 0.95, 0.9, 0.5])
+    tp = _top_p_specialized_robust_top_p(clean, tp)
+    before = _top_p_specialized_stats()["dispatch_count"]
+    out = flashinfer.sampling.top_p_renorm_probs(probs.cuda(), tp.cuda())
+    assert _top_p_specialized_stats()["dispatch_count"] == before + 1
+    assert not torch.isnan(out).any()
+    assert (out[:5, nan_at] == 0).all() and (out[:5, neg_nan_at] == 0).all()
+    assert not out[5].any()
+    _assert_top_p_specialized_contract(out, _top_p_specialized_reference(clean, tp))
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    stock = flashinfer.sampling.top_p_renorm_probs(probs.cuda(), tp.cuda())
+    assert not torch.isnan(stock).any()
+
+
+def test_top_p_renorm_probs_specialized_unnormalised_cutoff_is_exact(
+    top_p_specialized_enabled, monkeypatch
+):
+    # Rows whose kept mass lies within the 2^-56 fixed-point rounding of the 1e-8 cutoff: the
+    # kernel decides on the exact kept mass, not on the rounded fixed-point sum.
+    _skip_unless_sm103()
+    batch_size, vocab_size = 5, 154880
+    below = 1.9531246411852443e-11  # 512 x = 9.999998e-9; its fixed-point sum rounds above 1e-8
+    above = 3.300330148059416e-11  # 303 x = 1e-8 + 29.5 * 2^-56; its fixed-point sum rounds below
+
+    def spread(n):  # n positions across every CTA's slice of the row
+        return torch.arange(n) * (vocab_size // n)
+
+    probs = torch.zeros(batch_size, vocab_size, dtype=torch.float64)
+    probs[0, spread(512)] = below
+    probs[1, spread(303)] = above
+    # row 2 stays all zero
+    # row 3: far above the cutoff, decided by the fixed-point sum alone
+    probs[3, spread(513)] = below
+    # row 4: the row-0 entries plus a tail outside the nucleus (top_p 5e-9 keeps the ties)
+    probs[4, spread(512)] = below
+    probs[4, torch.arange(1000) * 154 + 1] = 1e-15
+    probs = probs.float().cuda()
+    tp = torch.tensor([0.5, 0.5, 0.5, 0.5, 5e-9], device="cuda")
+    out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+
+    # float64 reference: keep the nucleus, divide by its mass unless that mass is <= 1e-8f
+    p = probs.double().cpu()
+    sp, _ = torch.sort(p, dim=-1, descending=True)
+    excl = torch.cumsum(sp, dim=-1) - sp
+    k = (
+        (excl < _top_p_specialized_target(p, tp.cpu()))
+        .sum(dim=-1, keepdim=True)
+        .clamp(min=1)
+    )
+    kept = torch.where(p >= sp.gather(-1, k - 1), p, torch.zeros_like(p))
+    mass = kept.sum(dim=-1, keepdim=True)
+    cut = float(torch.tensor(1e-8, dtype=torch.float32))
+    assert mass[0].item() <= cut < mass[1].item() and mass[4].item() <= cut
+    ref = torch.where(mass > cut, kept / mass, kept).float()
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.cpu(), ref, atol=0.0, rtol=1e-6)
+
+    # The stock path leaves the below-cutoff and all-zero rows unnormalised too (its float32
+    # sum of these equal entries is exact).
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    stock = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    torch.testing.assert_close(out[[0, 2]], stock[[0, 2]], atol=0.0, rtol=0.0)
+
+
+def _top_p_specialized_non_unit_rows(vocab_size, g):
+    """Rows that do not sum to 1, with their top_p (float64)."""
+    v = vocab_size
+    rows, top_ps = [], []
+    # the review's row: AIR's target is 0.5 * 0.5 = 0.25, so 0.375 alone is kept (output 1)
+    row = torch.zeros(v, dtype=torch.float64)
+    row[0], row[1] = 0.375, 0.125
+    rows.append(row)
+    top_ps.append(0.5)
+    # vanishing, different values: 2^-28 alone is kept, left unnormalised (kept mass <= 1e-8)
+    row = torch.zeros(v, dtype=torch.float64)
+    row[7], row[v // 2] = 2.0**-28, 2.0**-29
+    rows.append(row)
+    top_ps.append(0.5)
+    # vanishing everywhere (mass 7e-4): the 2^-28 half is kept and renormalised
+    rows.append(
+        torch.where(torch.arange(v) % 2 == 0, 2.0**-28, 2.0**-29).to(torch.float64)
+    )
+    top_ps.append(0.5)
+    # a serving row at half mass (one-entry nucleus) and at mass 3.7 (block-wide head resolve)
+    rows.append(_top_p_specialized_row(1, v, g) * 0.5)
+    top_ps.append(0.95)
+    rows.append(_top_p_specialized_row(4, v, g) * 3.7)
+    top_ps.append(0.9)
+    # an unnormalised uniform row (mass ~v/2): too heavy for the 2^-56 fixed point
+    rows.append(torch.rand(v, generator=g, dtype=torch.float64))
+    top_ps.append(0.5)
+    # a wide nucleus at mass 1e-3 (exact radix path)
+    rows.append(_top_p_specialized_row(2, v, g) * 1e-3)
+    top_ps.append(0.8)
+    return torch.stack(rows).float(), torch.tensor(top_ps, dtype=torch.float32)
+
+
+def test_top_p_renorm_probs_specialized_non_unit_mass_rows_match_air(
+    top_p_specialized_enabled, monkeypatch
+):
+    # The nucleus target is top_p times the row's own mass, as on the AIR path (blockSum * p),
+    # so rows that do not sum to 1 keep the same entries as there.
+    _skip_unless_sm103()
+    batch_size, vocab_size = 7, 248320
+    probs, tp = _top_p_specialized_non_unit_rows(
+        vocab_size, torch.Generator().manual_seed(12)
+    )
+    assert probs.shape[0] == batch_size
+    tp = _top_p_specialized_robust_top_p(probs, tp)
+    probs, tp = probs.cuda(), tp.cuda()
+    before = _top_p_specialized_stats()["dispatch_count"]
+    out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    assert _top_p_specialized_stats()["dispatch_count"] == before + 1
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    stock = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    assert torch.isfinite(out).all()
+    # the same entries as the AIR path, the same values up to its float32 sums
+    assert torch.equal(out > 0, stock > 0)
+    torch.testing.assert_close(out, stock, atol=1e-6, rtol=1e-4)
+    _assert_top_p_specialized_contract(out, _top_p_specialized_reference(probs, tp))
+    # the review's rows, exactly
+    assert out[0, 0].item() == 1.0 and int((out[0] > 0).sum()) == 1
+    assert out[1, 7].item() == 2.0**-28 and int((out[1] > 0).sum()) == 1
+    assert int((out[2] > 0).sum()) == vocab_size // 2
+
+
+def _top_p_specialized_vanishing_rows(vocab_size, g):
+    """Rows whose positive entries all lie below the head paths' 2^-57 resolution, with their
+    top_p (float32): the radix path's fixed point follows the row's own mass."""
+    v = vocab_size
+    rows, top_ps = [], []
+    # the review's row: 2^-60 alone reaches top_p * mass, left unnormalised
+    row = torch.zeros(v, dtype=torch.float64)
+    row[0], row[1] = 2.0**-60, 2.0**-61
+    rows.append(row)
+    top_ps.append(0.5)
+    # the same values spread over every CTA's slice
+    row = torch.zeros(v, dtype=torch.float64)
+    row[::150] = 2.0**-60
+    row[75::150] = 2.0**-61
+    rows.append(row)
+    top_ps.append(0.5)
+    # vanishing everywhere
+    rows.append(
+        torch.where(torch.arange(v) % 2 == 0, 2.0**-70, 2.0**-71).to(torch.float64)
+    )
+    top_ps.append(0.5)
+    # a wide serving-like row scaled to mass 1e-25 (a nucleus deep in the tail)
+    rows.append(_top_p_specialized_row(2, v, g) * 1e-25)
+    top_ps.append(0.8)
+    # subnormal entries (AIR's -use_fast_math build flushes them: compared with float64 only)
+    row = torch.zeros(v, dtype=torch.float64)
+    row[3], row[v - 5] = 2.0**-140, 2.0**-141
+    rows.append(row)
+    top_ps.append(0.5)
+    # all zero: stays all zero
+    rows.append(torch.zeros(v, dtype=torch.float64))
+    top_ps.append(0.5)
+    return torch.stack(rows).float(), torch.tensor(top_ps, dtype=torch.float32)
+
+
+def test_top_p_renorm_probs_specialized_vanishing_rows_match_air(
+    top_p_specialized_enabled, monkeypatch
+):
+    # Positive entries too small for the head paths' 2^-56 fixed point still carry mass: the
+    # radix path selects in a per-row power-of-two fixed point (the row's mass in [2^58, 2^61)
+    # units), so these rows keep the same entries as AIR and the float64 reference, left
+    # unnormalised (kept mass <= 1e-8).
+    _skip_unless_sm103()
+    batch_size, vocab_size = 6, 154880
+    probs, tp = _top_p_specialized_vanishing_rows(
+        vocab_size, torch.Generator().manual_seed(21)
+    )
+    assert probs.shape[0] == batch_size
+    assert (probs[4] > 0).sum() == 2 and float(probs[4].max()) < 2.0**-126
+    tp = _top_p_specialized_robust_top_p(probs, tp)
+    probs, tp = probs.cuda(), tp.cuda()
+    before = _top_p_specialized_stats()["dispatch_count"]
+    out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    assert _top_p_specialized_stats()["dispatch_count"] == before + 1
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    stock = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    ref = _top_p_specialized_reference(probs, tp).to(out.device)
+    assert torch.isfinite(out).all()
+    air_rows = [0, 1, 2, 3, 5]
+    torch.testing.assert_close(out[air_rows], stock[air_rows], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(out, ref, atol=0.0, rtol=0.0)
+    assert out[0, 0].item() == 2.0**-60 and int((out[0] > 0).sum()) == 1
+    assert int((out[1] > 0).sum()) == int((probs[1] == 2.0**-60).sum())
+    assert int((out[2] > 0).sum()) == vocab_size // 2
+    assert out[4, 3].item() == 2.0**-140 and int((out[4] > 0).sum()) == 1
+    assert not out[5].any()
+
+
+def test_top_p_renorm_probs_specialized_exact_mass_contract(top_p_specialized_enabled):
+    # The nucleus target is top_p times the row's fixed-point mass (exact for these entries,
+    # independent of any summation order), so the kept set is the float64 reference's. Float32
+    # [0.5, 0.3, 0.2] sums to 1 + 2^-26 exactly: at top_p 0.5 the target is just above 0.5, so 0.3
+    # is kept too and the
+    # output is [0.625, 0.375]. AIR's float32 row sum rounds to 1.0 here and keeps 0.5 alone; at
+    # such ties AIR's float32 result depends on its accumulation order (float atomics across
+    # CTAs), so the kernel follows exact arithmetic instead (documented in the kernel header).
+    _skip_unless_sm103()
+    batch_size, vocab_size = 5, 154880
+    probs = torch.zeros(batch_size, vocab_size)
+    probs[0, :3] = torch.tensor([0.5, 0.3, 0.2])
+    # the same row with its entries in other CTAs' slices
+    probs[1, [vocab_size - 1, 0, vocab_size // 2]] = torch.tensor([0.5, 0.3, 0.2])
+    # the same tie at mass 2 + 2^-25
+    probs[2, :3] = torch.tensor([1.0, 0.6, 0.4])
+    # an exact tie: the prefix {0.5} reaches the target 0.5 exactly, so 0.25 is not kept
+    probs[3, :3] = torch.tensor([0.5, 0.25, 0.25])
+    # row 4 stays all zero
+    tp = torch.full((batch_size,), 0.5)
+    out = flashinfer.sampling.top_p_renorm_probs(probs.cuda(), tp.cuda()).cpu()
+    expected = torch.zeros(batch_size, vocab_size)
+    expected[0, :2] = torch.tensor([0.625, 0.375])
+    expected[1, [vocab_size - 1, 0]] = torch.tensor([0.625, 0.375])
+    expected[2, :2] = torch.tensor([0.625, 0.375])
+    expected[3, 0] = 1.0
+    torch.testing.assert_close(out, expected, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(
+        out, _top_p_specialized_reference(probs, tp), atol=0.0, rtol=0.0
+    )
+
+
+def test_top_p_renorm_probs_specialized_fixed_point_target_and_resolution(
+    top_p_specialized_enabled,
+):
+    # The radix path's masses are whole units of 2^-q of the row's scale (q = 59 for these rows of
+    # mass ~1): an entry of at least 2^-35 of the mass converts exactly, a smaller one rounds to
+    # the nearest unit, and the target top_p * mass is rounded up to a whole unit.
+    _skip_unless_sm103()
+    batch_size, vocab_size = 5, 154880
+    probs = torch.zeros(batch_size, vocab_size, dtype=torch.float64)
+    # row 0: 2^-16, then 131070 x 2^-17 and one 2^-46, at top_p 2^-16. The exact target is
+    # 2^-16 + 2^-62, above the 2^-16 entry alone, so every 2^-17 entry is kept (their mass with
+    # 2^-16 is exactly 1, so the output is the input there). The target rounded to the nearest
+    # unit (2^43 + 1/8 -> 2^43) kept 2^-16 alone; rounded up (2^43 + 1) it does not.
+    probs[0, 0] = 2.0**-16
+    probs[0, 1:131071] = 2.0**-17
+    probs[0, 131071] = 2.0**-46
+    # row 1: [0.5, 0.25, 0.25] plus 131072 x 2^-61 (2^-44 in all) at top_p 0.5. Exact arithmetic
+    # keeps the three entries (target 0.5 + 2^-45), but each 2^-61 entry is a quarter unit and
+    # rounds to 0: the fixed-point target is 0.5, reached by 0.5 alone. The tail mass is within
+    # the documented bound (V/2 units, 2^-41 of the row's mass), so this row is pinned to the
+    # fixed-point result, which is also AIR's float32 result.
+    probs[1, :3] = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float64)
+    probs[1, 3:131075] = 2.0**-61
+    # row 2: the same row with one 2^-35 entry (2^24 units, converted exactly): target
+    # 0.5 + 2^-36, so the 0.25 ties are kept, as exact arithmetic keeps them (AIR's float32 sum
+    # rounds 1 + 2^-35 to 1 and keeps 0.5 alone).
+    probs[2, :3] = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float64)
+    probs[2, vocab_size - 1] = 2.0**-35
+    # row 3: an exact tie at the target (0.5 alone reaches 0.5 * 1.0); row 4: all zero
+    probs[3, :3] = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float64)
+    probs = probs.float()
+    tp = torch.tensor([2.0**-16, 0.5, 0.5, 0.5, 0.5])
+    out = flashinfer.sampling.top_p_renorm_probs(probs.cuda(), tp.cuda()).cpu()
+    ref = _top_p_specialized_reference(probs, tp)
+    exact_rows = [0, 2, 3, 4]
+    torch.testing.assert_close(out[exact_rows], ref[exact_rows], atol=0.0, rtol=0.0)
+    assert int((out[0] > 0).sum()) == 131071
+    torch.testing.assert_close(out[0, :131071], probs[0, :131071], atol=0.0, rtol=0.0)
+    assert out[0, 131071].item() == 0.0
+    expected_1 = torch.zeros(vocab_size)
+    expected_1[0] = 1.0
+    torch.testing.assert_close(out[1], expected_1, atol=0.0, rtol=0.0)
+    # exact arithmetic (an exactly rounded sum, which is exact here) puts the target above 0.5
+    assert math.fsum(probs[1].double().tolist()) == 1.0 + 2.0**-44
+    assert out[2, :3].tolist() == [0.5, 0.25, 0.25] and out[3, 0].item() == 1.0
+
+
+def test_top_p_renorm_probs_specialized_launch_plan_matches_the_kernel(
+    top_p_specialized_enabled,
+):
+    _skip_unless_sm103()
+    module = _top_p_renorm_specialized._get_module()
+    for b, v in _TOP_P_SPECIALIZED_SHAPES + [
+        (1, 1000),
+        (200, 32000),
+        (9, 262144),
+        (21, 200001),
+        (41, 200001),
+    ]:
+        c, nt, mb, unr, vec = _top_p_renorm_specialized._plan_config(b, v)
+        assert module.top_p_renorm_probs_specialized_plan(b, v) == (
+            c * 100000000 + nt * 10000 + mb * 1000 + unr * 10 + int(vec)
+        )
+
+
+def test_top_p_renorm_probs_specialized_cuda_graph_after_eager_dispatch(
+    top_p_specialized_enabled,
+):
+    _skip_unless_sm103()
+    batch_size, vocab_size = 7, 248320
+    probs, top_p = _top_p_specialized_inputs(batch_size, vocab_size, seed=6)
+    # eager: builds and loads the module
+    flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    assert _top_p_specialized_stats()["precompiled"]
+    before = _top_p_specialized_stats()["dispatch_count"]
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    torch.cuda.current_stream().wait_stream(s)
+    assert _top_p_specialized_stats()["dispatch_count"] == before + 1
+
+    new_probs, new_top_p = _top_p_specialized_inputs(batch_size, vocab_size, seed=7)
+    probs.copy_(new_probs)
+    top_p.copy_(new_top_p)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_top_p_specialized_contract(
+        out, _top_p_specialized_reference(new_probs, new_top_p)
+    )
+
+
+def test_top_p_renorm_probs_specialized_capture_before_jit(
+    top_p_specialized_enabled, monkeypatch
+):
+    _skip_unless_sm103()
+    probs, top_p = _top_p_specialized_inputs(6, 154880, seed=8)
+    # warm the AIR path eagerly so its module is loaded outside the capture
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    monkeypatch.delenv(_TOP_P_SPECIALIZED_KILL_SWITCH)
+    monkeypatch.setattr(_top_p_renorm_specialized, "_module", None)
+
+    def _must_not_build():
+        raise AssertionError("the specialized module was built inside a capture")
+
+    monkeypatch.setattr(_top_p_renorm_specialized, "_get_module", _must_not_build)
+    before = _top_p_specialized_stats()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    torch.cuda.current_stream().wait_stream(s)
+    after = _top_p_specialized_stats()
+    assert after["dispatch_count"] == before["dispatch_count"]
+    assert (
+        after["fallback_reasons"]["capturing_before_jit"]
+        == before["fallback_reasons"].get("capturing_before_jit", 0) + 1
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out, _top_p_specialized_reference(probs, top_p).cuda(), atol=1e-3, rtol=1e-3
+    )
+
+
+def test_top_p_renorm_probs_specialized_capture_on_another_device(
+    top_p_specialized_enabled, monkeypatch
+):
+    # A graph captured on cuda:1 while cuda:0 is current, before the module is built: the call
+    # on cuda:1 takes the (capture-safe) stock path instead of building inside the capture.
+    _skip_unless_sm103()
+    if torch.cuda.device_count() < 2 or torch.cuda.get_device_capability(1) != (10, 3):
+        pytest.skip("needs two SM103 GPUs")
+    probs, top_p = _top_p_specialized_inputs(6, 154880, seed=13)
+    probs, top_p = probs.to("cuda:1"), top_p.to("cuda:1")
+    # warm the AIR path on cuda:1 eagerly so its module is loaded outside the capture
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    monkeypatch.delenv(_TOP_P_SPECIALIZED_KILL_SWITCH)
+    monkeypatch.setattr(_top_p_renorm_specialized, "_module", None)
+
+    def _must_not_build():
+        raise AssertionError("the specialized module was built inside a capture")
+
+    monkeypatch.setattr(_top_p_renorm_specialized, "_get_module", _must_not_build)
+    before = _top_p_specialized_stats()
+    with torch.cuda.device(1):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=s), torch.cuda.device(0):
+            assert not torch.cuda.is_current_stream_capturing()
+            out = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+        torch.cuda.current_stream().wait_stream(s)
+    after = _top_p_specialized_stats()
+    assert after["dispatch_count"] == before["dispatch_count"]
+    assert (
+        after["fallback_reasons"]["capturing_before_jit"]
+        == before["fallback_reasons"].get("capturing_before_jit", 0) + 1
+    )
+    graph.replay()
+    torch.cuda.synchronize(1)
+    torch.testing.assert_close(
+        out,
+        _top_p_specialized_reference(probs, top_p).to(out.device),
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
+def test_top_p_renorm_probs_specialized_other_compute_capability(
+    top_p_specialized_enabled, monkeypatch
+):
+    _skip_unless_sm103()
+    batch_size, vocab_size = _TOP_P_SPECIALIZED_SHAPES[0]
+    probs, top_p = _top_p_specialized_inputs(batch_size, vocab_size, seed=9)
+    monkeypatch.setattr(
+        _top_p_renorm_specialized, "get_compute_capability", lambda device: (10, 0)
+    )
+    # keep the faked capability out of the per-device cache other tests read
+    monkeypatch.setattr(_top_p_renorm_specialized, "_device_capability", {})
+    assert (
+        _top_p_renorm_specialized._reject_reason(probs, top_p, False)
+        == "compute_capability"
     )
 
 

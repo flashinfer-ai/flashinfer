@@ -113,12 +113,11 @@ def test_inference_pool_is_checked_before_native_write():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("family", ["gdn2", "gdp"])
-def test_new_family_pool_requires_frontend_131_before_mutation(monkeypatch, family):
+def test_new_family_pool_rejects_invalid_index_dtype_before_mutation(family):
     from flashinfer.cudnn import linear_attention as adapter
 
     if not adapter.CUDNN_AVAILABLE:
         pytest.skip("requires the cuDNN Python package")
-    monkeypatch.setattr(adapter.cudnn, "__version__", "1.30.0")
     q = torch.ones(4, 4, 64)
     pool = torch.randn(6, 4, 64, 64)
     before = pool.clone()
@@ -127,13 +126,13 @@ def test_new_family_pool_requires_frontend_131_before_mutation(monkeypatch, fami
         output_state=pool,
         output_final_state=True,
         cu_seqlens=torch.tensor([0, 1, 4], dtype=torch.int32),
-        state_indices=torch.tensor([4, 1], dtype=torch.int32),
+        state_indices=torch.tensor([4, 1], dtype=torch.int64),
     )
     fn = (
         adapter.cudnn_chunk_gated_delta_rule2
         if family == "gdn2"
         else adapter.cudnn_chunk_gated_delta_product
     )
-    with pytest.raises(RuntimeError, match="state pools.*1.31"):
+    with pytest.raises(ValueError, match="int32"):
         fn(q, q, q, **kwargs)
     assert torch.equal(pool, before)
