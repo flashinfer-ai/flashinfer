@@ -1116,7 +1116,9 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
         // can complete a phase twice before PV observes it.
         tcFenceBefore();
         mbarArrive(&bars[C::BarPFull + sIt % C::PStages]);
-        if constexpr (!C::EarlyS) mbarArrive(&bars[C::BarSEmpty + sStage]);
+        // Only QK waits on S release, and only when P lags further (PStages > Stages).
+        if constexpr (!C::EarlyS && C::PStages > C::Stages)
+          mbarArrive(&bars[C::BarSEmpty + sStage]);
         ++sIt;
 #pragma unroll
         for (int lt = 0; lt < C::TokPerGrp; ++lt) {
@@ -1217,161 +1219,163 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
                      : "memory");
       }
     }
-  } else if (warp == C::WarpQk) {
-    // ============================================================================== QK MMA issuer
+  } else if (warp < C::WarpQk + 4) {
+    // The four 1-warp roles form one warpgroup, which must give up registers with one
+    // setmaxnreg instruction.
     setMaxNRegDec<C::RegsMisc>();
-    uint32_t qIt = 0, sIt = 0, kStage = 0, kPhase = 0;
-    for (int si = 0; si < numSegs; ++si) {
-      KvSeg const seg = loadSegUniform(segs, si);
-      int const numSteps = seg.numPages / C::SP;
-      if (numSteps == 0) continue;
-      mbarWait(&bars[C::BarQFull + qIt % 2], (qIt / 2) & 1u);
-      tcFenceAfter();
-      uint64_t const qDesc = smemDescSw128(smem + C::SmemQ + (qIt % 2) * C::QStageBytes);
-      for (int t = 0; t < numSteps; ++t) {
-        if constexpr (C::EarlyS) {
-          // S[sIt - Stages] has been loaded into the softmax registers (P reuse is guarded by the
-          // softmax).
-          if (sIt >= C::Stages) {
-            uint32_t const prevS = sIt - C::Stages;
-            mbarWait(&bars[C::BarSEmpty + prevS % C::Stages], (prevS / C::Stages) & 1u);
+    if (warp == C::WarpQk) {
+      // ========================================================================== QK MMA issuer
+      uint32_t qIt = 0, sIt = 0, kStage = 0, kPhase = 0;
+      for (int si = 0; si < numSegs; ++si) {
+        KvSeg const seg = loadSegUniform(segs, si);
+        int const numSteps = seg.numPages / C::SP;
+        if (numSteps == 0) continue;
+        mbarWait(&bars[C::BarQFull + qIt % 2], (qIt / 2) & 1u);
+        tcFenceAfter();
+        uint64_t const qDesc = smemDescSw128(smem + C::SmemQ + (qIt % 2) * C::QStageBytes);
+        for (int t = 0; t < numSteps; ++t) {
+          if constexpr (C::EarlyS) {
+            // S[sIt - Stages] has been loaded into the softmax registers (P reuse is guarded by the
+            // softmax).
+            if (sIt >= C::Stages) {
+              uint32_t const prevS = sIt - C::Stages;
+              mbarWait(&bars[C::BarSEmpty + prevS % C::Stages], (prevS / C::Stages) & 1u);
+            }
+          } else {
+            // PV publishes that the MMAs reading P[s] are complete before QK makes S[s + PStages]
+            // available to softmax, which overwrites the same probability buffer.
+            if (C::PStages > C::Stages && sIt >= C::Stages) {
+              // S[sIt - Stages] has been read by the softmax (P lags further behind).
+              uint32_t const prevS = sIt - C::Stages;
+              mbarWait(&bars[C::BarSEmpty + prevS % C::Stages], (prevS / C::Stages) & 1u);
+            }
+            if (sIt >= C::PStages) {
+              uint32_t const prev = sIt - C::PStages;
+              mbarWait(&bars[C::BarPCons + prev % C::PStages], (prev / C::PStages) & 1u);
+            }
           }
-        } else {
-          // PV publishes that the MMAs reading P[s] are complete before QK makes S[s + PStages]
-          // available to softmax, which overwrites the same probability buffer.
-          if (C::PStages > C::Stages && sIt >= C::Stages) {
-            // S[sIt - Stages] has been read by the softmax (P lags further behind).
-            uint32_t const prevS = sIt - C::Stages;
-            mbarWait(&bars[C::BarSEmpty + prevS % C::Stages], (prevS / C::Stages) & 1u);
-          }
-          if (sIt >= C::PStages) {
-            uint32_t const prev = sIt - C::PStages;
-            mbarWait(&bars[C::BarPCons + prev % C::PStages], (prev / C::PStages) & 1u);
-          }
-        }
-        uint32_t const sCol = tmem + C::TmemS + (sIt % C::Stages) * C::SCols;
+          uint32_t const sCol = tmem + C::TmemS + (sIt % C::Stages) * C::SCols;
 #pragma unroll 1
-        for (int pp = 0; pp < C::SP; ++pp) {
-          mbarWait(&bars[C::BarTkFull + kStage], kPhase);
-          tcFenceAfter();
-          uint32_t const aTmem = tmem + C::TmemK + kStage * 32;
-          if (electOne()) {
+          for (int pp = 0; pp < C::SP; ++pp) {
+            mbarWait(&bars[C::BarTkFull + kStage], kPhase);
+            tcFenceAfter();
+            uint32_t const aTmem = tmem + C::TmemK + kStage * 32;
+            if (electOne()) {
 #pragma unroll
-            for (int k = 0; k < 4; ++k)
-              tcMma(sCol + pp * C::N, aTmem + k * 8, qDesc + 2 * k, C::Idesc, k > 0);
-            tcCommit(&bars[C::BarTkEmpty + kStage]);
+              for (int k = 0; k < 4; ++k)
+                tcMma(sCol + pp * C::N, aTmem + k * 8, qDesc + 2 * k, C::Idesc, k > 0);
+              tcCommit(&bars[C::BarTkEmpty + kStage]);
+            }
+            __syncwarp();
+            if (++kStage == C::KT) {
+              kStage = 0;
+              kPhase ^= 1u;
+            }
           }
+          if (electOne()) tcCommit(&bars[C::BarSFull + sIt % C::Stages]);
           __syncwarp();
-          if (++kStage == C::KT) {
-            kStage = 0;
-            kPhase ^= 1u;
-          }
+          ++sIt;
         }
-        if (electOne()) tcCommit(&bars[C::BarSFull + sIt % C::Stages]);
-        __syncwarp();
-        ++sIt;
-      }
-      if (electOne()) tcCommit(&bars[C::BarQEmpty + qIt % 2]);
-      __syncwarp();
-      ++qIt;
-    }
-    tcFenceBefore();
-    namedBarArrive(kNbTmemDone, kTmemUserThreads);
-  } else if (warp == C::WarpQk + 1 || warp == C::WarpQk + 3) {
-    // ============================================================================== loaders
-    setMaxNRegDec<C::RegsMisc>();
-    bool const isK = warp == C::WarpQk + 3;
-    uint32_t pageBase = 0, qIt = 0;
-    for (int si = 0; si < numSegs; ++si) {
-      KvSeg const seg = loadSegUniform(segs, si);
-      int const numPages = seg.numPages;
-      if (numPages == 0) continue;
-      int const seqLen = groupSeqLen(p, seg.virt, G);
-      int const pageUb = ((seqLen + (1 << kPageSizeLog2) - 1) >> kPageSizeLog2) - 1;
-      int32_t const* pageTable =
-          p.pageTable + static_cast<size_t>(seg.virt / p.numGroups) * p.maxPagesPerSeq;
-      if (isK) {
-        uint32_t const stage = qIt % 2;
-        mbarWait(&bars[C::BarQEmpty + stage], ((qIt / 2) & 1u) ^ 1u);
-        if (electOne()) {
-          mbarArriveExpectTx(&bars[C::BarQFull + stage], C::QStageBytes);
-          tmaLoad4d(smem + C::SmemQ + stage * C::QStageBytes, &p.tmaQ, &bars[C::BarQFull + stage],
-                    0, 0, seg.head, queryRow(p, seg.virt, G));
-        }
+        if (electOne()) tcCommit(&bars[C::BarQEmpty + qIt % 2]);
         __syncwarp();
         ++qIt;
-        issueKvPages<C, false>(p, smem, bars, pageBase, numPages, pageTable, seg.pageStart, pageUb,
-                               seg.head);
-      } else {
-        issueKvPages<C, true>(p, smem, bars, pageBase, numPages, pageTable, seg.pageStart, pageUb,
-                              seg.head);
       }
-      pageBase += static_cast<uint32_t>(numPages);
-    }
-  } else if (warp == C::WarpQk + 2) {
-    // ============================================================================== PV MMA issuer
-    setMaxNRegDec<C::RegsMisc>();
-    int totalSteps = 0;
-    for (int si = 0; si < numSegs; ++si) totalSteps += loadSegUniform(segs, si).numPages / C::SP;
-    uint32_t pIt = 0, vStage = 0, vPhase = 0, segDone = 0;
-    for (int si = 0; si < numSegs; ++si) {
-      KvSeg const seg = loadSegUniform(segs, si);
-      int const numSteps = seg.numPages / C::SP;
-      if (numSteps == 0) continue;
-      for (int t = 0; t < numSteps; ++t) {
-        mbarWait(&bars[C::BarPFull + pIt % C::PStages], (pIt / C::PStages) & 1u);
-        tcFenceAfter();
-        uint32_t const pSlot = pIt % C::PStages;
-        uint8_t const* pStage = smem + C::SmemP + pSlot * C::PStageBytes;
-        if (t == 0 && segDone > 0) {
-          // The previous segment's final O has been read.
-          mbarWait(&bars[C::BarOFree], (segDone - 1) & 1u);
-          tcFenceAfter();
-        }
-#pragma unroll 1
-        for (int pp = 0; pp < C::SP; ++pp) {
-          mbarWait(&bars[C::BarTvFull + vStage], vPhase);
-          tcFenceAfter();
-          uint32_t const aTmem = tmem + C::TmemV + vStage * 32;
-          uint64_t const pDesc = smemDescSw128(pStage + pp * (G * 2048));
+      tcFenceBefore();
+      namedBarArrive(kNbTmemDone, kTmemUserThreads);
+    } else if (warp == C::WarpQk + 1 || warp == C::WarpQk + 3) {
+      // ============================================================================== loaders
+      bool const isK = warp == C::WarpQk + 3;
+      uint32_t pageBase = 0, qIt = 0;
+      for (int si = 0; si < numSegs; ++si) {
+        KvSeg const seg = loadSegUniform(segs, si);
+        int const numPages = seg.numPages;
+        if (numPages == 0) continue;
+        int const seqLen = groupSeqLen(p, seg.virt, G);
+        int const pageUb = ((seqLen + (1 << kPageSizeLog2) - 1) >> kPageSizeLog2) - 1;
+        int32_t const* pageTable =
+            p.pageTable + static_cast<size_t>(seg.virt / p.numGroups) * p.maxPagesPerSeq;
+        if (isK) {
+          uint32_t const stage = qIt % 2;
+          mbarWait(&bars[C::BarQEmpty + stage], ((qIt / 2) & 1u) ^ 1u);
           if (electOne()) {
-#pragma unroll
-            for (int k = 0; k < 4; ++k)
-              tcMma(tmem + C::TmemO, aTmem + k * 8, pDesc + 2 * k, C::Idesc,
-                    (k > 0) || (t > 0) || (pp > 0));
-            tcCommit(&bars[C::BarTvEmpty + vStage]);
+            mbarArriveExpectTx(&bars[C::BarQFull + stage], C::QStageBytes);
+            tmaLoad4d(smem + C::SmemQ + stage * C::QStageBytes, &p.tmaQ, &bars[C::BarQFull + stage],
+                      0, 0, seg.head, queryRow(p, seg.virt, G));
           }
           __syncwarp();
-          if (++vStage == C::VT) {
-            vStage = 0;
-            vPhase ^= 1u;
-          }
+          ++qIt;
+          issueKvPages<C, false>(p, smem, bars, pageBase, numPages, pageTable, seg.pageStart,
+                                 pageUb, seg.head);
+        } else {
+          issueKvPages<C, true>(p, smem, bars, pageBase, numPages, pageTable, seg.pageStart, pageUb,
+                                seg.head);
         }
-        // Every step's MMAs are tracked by the O-done ring (softmax warpgroups wait on it before an
-        // O rescale). The slot's previous phase (PStages steps back, long complete) is consumed
-        // before it is reused.
-        if (pIt >= C::PStages) {
-          uint32_t const old = pIt - C::PStages;
-          mbarWait(&bars[C::BarODone + old % C::PStages], (old / C::PStages) & 1u);
-        }
-        if (electOne()) tcCommit(&bars[C::BarODone + pIt % C::PStages]);
-        __syncwarp();
-        // P[pSlot] may be overwritten once the MMAs that read it complete (tcgen05.mma is
-        // asynchronous, so issuing them is not enough).
-        if (!C::EarlyS && static_cast<int>(pIt) + C::PStages < totalSteps) {
-          if (electOne()) tcCommit(&bars[C::BarPCons + pIt % C::PStages]);
-          __syncwarp();
-        }
-        if (t == numSteps - 1) {
-          if (electOne()) tcCommit(&bars[C::BarOFull]);
-          __syncwarp();
-        }
-        ++pIt;
+        pageBase += static_cast<uint32_t>(numPages);
       }
-      ++segDone;
+    } else {  // warp == C::WarpQk + 2
+      // ========================================================================== PV MMA issuer
+      int totalSteps = 0;
+      for (int si = 0; si < numSegs; ++si) totalSteps += loadSegUniform(segs, si).numPages / C::SP;
+      uint32_t pIt = 0, vStage = 0, vPhase = 0, segDone = 0;
+      for (int si = 0; si < numSegs; ++si) {
+        KvSeg const seg = loadSegUniform(segs, si);
+        int const numSteps = seg.numPages / C::SP;
+        if (numSteps == 0) continue;
+        for (int t = 0; t < numSteps; ++t) {
+          mbarWait(&bars[C::BarPFull + pIt % C::PStages], (pIt / C::PStages) & 1u);
+          tcFenceAfter();
+          uint32_t const pSlot = pIt % C::PStages;
+          uint8_t const* pStage = smem + C::SmemP + pSlot * C::PStageBytes;
+          if (t == 0 && segDone > 0) {
+            // The previous segment's final O has been read.
+            mbarWait(&bars[C::BarOFree], (segDone - 1) & 1u);
+            tcFenceAfter();
+          }
+#pragma unroll 1
+          for (int pp = 0; pp < C::SP; ++pp) {
+            mbarWait(&bars[C::BarTvFull + vStage], vPhase);
+            tcFenceAfter();
+            uint32_t const aTmem = tmem + C::TmemV + vStage * 32;
+            uint64_t const pDesc = smemDescSw128(pStage + pp * (G * 2048));
+            if (electOne()) {
+#pragma unroll
+              for (int k = 0; k < 4; ++k)
+                tcMma(tmem + C::TmemO, aTmem + k * 8, pDesc + 2 * k, C::Idesc,
+                      (k > 0) || (t > 0) || (pp > 0));
+              tcCommit(&bars[C::BarTvEmpty + vStage]);
+            }
+            __syncwarp();
+            if (++vStage == C::VT) {
+              vStage = 0;
+              vPhase ^= 1u;
+            }
+          }
+          // Every step's MMAs are tracked by the O-done ring (softmax warpgroups wait on it before
+          // an O rescale). The slot's previous phase (PStages steps back, long complete) is
+          // consumed before it is reused.
+          if (pIt >= C::PStages) {
+            uint32_t const old = pIt - C::PStages;
+            mbarWait(&bars[C::BarODone + old % C::PStages], (old / C::PStages) & 1u);
+          }
+          if (electOne()) tcCommit(&bars[C::BarODone + pIt % C::PStages]);
+          __syncwarp();
+          // P[pSlot] may be overwritten once the MMAs that read it complete (tcgen05.mma is
+          // asynchronous, so issuing them is not enough).
+          if (!C::EarlyS && static_cast<int>(pIt) + C::PStages < totalSteps) {
+            if (electOne()) tcCommit(&bars[C::BarPCons + pIt % C::PStages]);
+            __syncwarp();
+          }
+          if (t == numSteps - 1) {
+            if (electOne()) tcCommit(&bars[C::BarOFull]);
+            __syncwarp();
+          }
+          ++pIt;
+        }
+        ++segDone;
+      }
+      tcFenceBefore();
+      namedBarArrive(kNbTmemDone, kTmemUserThreads);
     }
-    tcFenceBefore();
-    namedBarArrive(kNbTmemDone, kTmemUserThreads);
   } else {
     // ============================================================================== dequant
     if constexpr (C::RegsDequant > C::RegsLaunch)

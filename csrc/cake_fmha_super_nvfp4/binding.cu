@@ -99,6 +99,7 @@ std::string readCall(super_nvfp4::Call& c, TensorView const& out, TensorView con
     if (auto tensor = scale->as<ffi::Tensor>()) {
       if (!onDevice(tensor.value().device(), query.device())) return otherDevice;
       if (!sameDtype(tensor.value().dtype(), dl_float32)) return "scale tensor is not float32";
+      if (tensor.value().numel() != 1) return "scale tensor is not a single value";
     }
   }
   std::string reason = tokenTensorReason(query, "query");

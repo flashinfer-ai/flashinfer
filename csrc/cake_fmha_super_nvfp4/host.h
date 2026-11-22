@@ -184,6 +184,10 @@ inline std::string decodeCommonReason(Call const& c, Device const& dev) {
   if (!reason.empty()) return reason;
   if (c.batch <= 0 || c.batch > kDecodeMaxBatch)
     return "batch " + std::to_string(c.batch) + " outside 1.." + std::to_string(kDecodeMaxBatch);
+  // Decode reads V through a CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B map, which needs a 32-byte
+  // aligned base and strides.
+  if (!aligned(c.v, 32) || c.vStrideHead % 32 || c.vStridePage % 32)
+    return "V pointer or strides not 32-byte aligned";
   return layoutReason(c);
 }
 

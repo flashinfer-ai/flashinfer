@@ -602,3 +602,17 @@ def test_trtllm_gen_decode_gets_trtllm_gen_arguments(trtllm_gen):
     ((stage, args),) = trtllm_gen.calls
     assert stage == "decode"
     assert list(args) == [*cake_args[:29], 1.0, *cake_args[29:], 0, None]
+
+
+@pytest.mark.parametrize("kernel", [MTP, BASE, TRTLLM_GEN])
+def test_route_is_optimized_accepts_decode_routes(kernel):
+    from flashinfer.cake_fmha import cake_fmha_route_is_optimized
+
+    assert cake_fmha_route_is_optimized(_decode_route(kernel))
+
+
+@pytest.mark.parametrize("kernel", [PREFILL, TRTLLM_GEN])
+def test_route_is_optimized_accepts_context_routes(module, kernel):
+    from flashinfer.cake_fmha import cake_fmha_route_is_optimized
+
+    assert cake_fmha_route_is_optimized(_context_module(module, kernel).route)

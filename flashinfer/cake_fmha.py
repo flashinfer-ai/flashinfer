@@ -3141,6 +3141,12 @@ def cake_fmha_route_is_optimized(
 
     if route is None:
         return False
+    if route.component in (
+        _SUPER_NVFP4_DECODE_COMPONENT,
+        _SUPER_NVFP4_CONTEXT_COMPONENT,
+    ):
+        # Served by their own kernels or trtllm-gen, outside the registry.
+        return True
     if (
         isinstance(route, CakeFmhaDecodeRoute)
         and route.component == _ALIGNED_MTP_Q32_COMPONENT

@@ -641,6 +641,43 @@ def test_decode_unaligned_tensors_fail_as_on_trtllm_gen(unaligned):
             assert _routes_taken() == _routes("decode", TRTLLM_GEN)
 
 
+@pytest.mark.parametrize("declined", ["v_cache 16 bytes past 32", "empty bmm2_scale"])
+def test_decode_route_declines_before_launch(declined):
+    # Decode reads V through a tensor map that needs 32-byte alignment, and a
+    # scale tensor must hold one value: route selection hands such calls to
+    # trtllm-gen instead of launching a kernel that would fail.
+    torch.manual_seed(1)
+    inputs = _make_inputs(torch.randint(8300, 10000, (4,)), 4)
+    k_cache, v_cache = inputs.kv_cache
+    k_sf, v_sf = inputs.kv_cache_sf
+    bmm2_scale = inputs.bmm2_scale
+    if declined == "v_cache 16 bytes past 32":
+        v_cache = _offset(v_cache, 16)
+    else:
+        bmm2_scale = torch.empty(0, dtype=torch.float32, device="cuda")
+    out = torch.zeros_like(inputs.query)
+    kernel = super_nvfp4.select_decode_route(
+        out=out,
+        query=inputs.query,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k_block_scales=k_sf,
+        v_block_scales=v_sf,
+        workspace_buffer=_workspace(),
+        block_tables=inputs.block_tables,
+        seq_lens=inputs.seq_lens,
+        cum_seq_lens_q=None,
+        batch_size=4,
+        max_q_len=1,
+        max_kv_len=int(inputs.seq_lens.max()),
+        bmm1_scale=inputs.bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        enable_pdl=True,
+        dense_causal=True,
+    )
+    assert kernel == TRTLLM_GEN
+
+
 def test_decode_features_run_trtllm_gen():
     torch.manual_seed(0)
     inputs = _make_inputs(torch.randint(8300, 10000, (4,)), 4)
