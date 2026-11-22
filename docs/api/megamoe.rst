@@ -12,7 +12,8 @@ collectively before CUDA graph capture. NVFP4 supports four or eight ranks on
 one node. MXFP4 supports power-of-two rank counts from one to 32, including
 multiple nodes through :class:`MegaMoENcclTransport`. The inter-node path needs
 NCCL device API headers and a GIN-capable NCCL installation; set ``NCCL_HOME``
-when these are not provided by the ``nvidia-nccl`` wheel.
+when these are not provided by the ``nvidia-nccl`` wheel. Set ``NCCL_GIN_TYPE=2``
+before initializing the process group to select the supported GIN proxy backend.
 
 Buffer and execution
 --------------------

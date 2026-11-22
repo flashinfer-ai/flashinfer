@@ -99,6 +99,15 @@ int64_t megamoe_sm90_transport_create(int64_t comm_pointer, int64_t rank, int64_
   TVM_FFI_ICHECK(runtime_version == NCCL_VERSION_CODE)
       << "the NCCL runtime (" << runtime_version
       << ") differs from the headers this module was built with (" << NCCL_VERSION_CODE << ")";
+  if (gin_contexts > 0) {
+    ncclCommProperties_t properties = NCCL_COMM_PROPERTIES_INITIALIZER;
+    check_nccl(ncclCommQueryProperties(reinterpret_cast<ncclComm_t>(comm_pointer), &properties),
+               "ncclCommQueryProperties");
+    TVM_FFI_ICHECK(properties.deviceApiSupport && properties.ginType == NCCL_GIN_TYPE_PROXY)
+        << "cross-node MegaMoE requires the NCCL GIN proxy backend; set NCCL_GIN_TYPE=2 before "
+           "initializing the process group (selected GIN type "
+        << static_cast<int>(properties.ginType) << ")";
+  }
 
   auto s = std::make_unique<Session>();
   s->comm = reinterpret_cast<ncclComm_t>(comm_pointer);

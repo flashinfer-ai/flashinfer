@@ -363,6 +363,38 @@ def _namespace(ep, **overrides):
     return argparse.Namespace(**args)
 
 
+def _worker_without_gin(rank, rendezvous):
+    """Reject a communicator without GIN before creating its device communicator."""
+    os.environ["NCCL_GIN_TYPE"] = "0"
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=1,
+        timeout=datetime.timedelta(minutes=2),
+        device_id=torch.device("cuda", rank),
+    )
+    from flashinfer.megamoe import MegaMoENcclTransport
+
+    try:
+        with pytest.raises(RuntimeError, match=r"NCCL_GIN_TYPE=2.*selected GIN type 0"):
+            MegaMoENcclTransport(dist.group.WORLD, gin_contexts=1)
+        transport = MegaMoENcclTransport(dist.group.WORLD, gin_contexts=0)
+        transport.close()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_mxfp4_nccl_transport_without_gin(tmp_path):
+    """Require the proxy backend only when GIN contexts are requested."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("needs an SM90 GPU")
+    torch.multiprocessing.spawn(
+        _worker_without_gin, args=((tmp_path / "nccl").as_uri(),), nprocs=1
+    )
+
+
 @pytest.mark.parametrize("ep", [4, 8])
 def test_mxfp4_nccl_transport(ep):
     """Torch symmetric memory and NCCL windows give the same kernel output."""
