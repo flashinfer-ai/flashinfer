@@ -28,6 +28,7 @@ all of its partial rows; the slice build otherwise. These tests check:
 
 import math
 import re
+import warnings
 
 import pytest
 import torch
@@ -345,7 +346,9 @@ def _reducers(rows):
 
 def _launched_reducers(call, names):
     """The reducer kernels among ``names`` that ``call`` launches, from the
-    profiler's device activities."""
+    profiler's device activities; ``None`` when the profiler records no device
+    activity (a CUPTI client such as compute-sanitizer is attached), so the
+    caller still compares the bits."""
     from torch.profiler import ProfilerActivity, profile
 
     torch.cuda.synchronize()
@@ -358,7 +361,12 @@ def _launched_reducers(call, names):
         if event.device_type == torch.autograd.DeviceType.CUDA
     ]
     if not launched:
-        pytest.skip("torch.profiler captured no device events")
+        warnings.warn(
+            "torch.profiler captured no device events: the launched reducer is "
+            "not checked",
+            stacklevel=2,
+        )
+        return result, None
     return result, sorted({name for name in launched if name in names})
 
 
@@ -411,12 +419,13 @@ def _check_runs(decode, rows, ctas_values, forced_ctas, names, label):
         work_items, num_split, ctas = used[0]
         assert work_items == rows and num_split >= 2, (label, used)
         is_head = cake_module.fp8_head_reduce(rows, num_split, ctas, arch)
-        assert launched == [head_name if is_head else slice_name], (
-            label,
-            value,
-            ctas,
-            launched,
-        )
+        if launched is not None:
+            assert launched == [head_name if is_head else slice_name], (
+                label,
+                value,
+                ctas,
+                launched,
+            )
         bits = _bits(result)
         if first is None:
             first, natural_head = bits, is_head
@@ -548,7 +557,8 @@ def test_fp8_head_reduce_is_deterministic(fp8_domains, forced_ctas, case):
     first = first.clone()
     is_head = cake_module.fp8_head_reduce(rows, num_split, used[-1][2], arch)
     assert is_head == _expected_head(rows, num_split), case
-    assert launched == [head_name if is_head else slice_name], (case, launched)
+    if launched is not None:
+        assert launched == [head_name if is_head else slice_name], (case, launched)
     assert bool(first.isfinite().all())
     for call in range(200):
         assert torch.equal(decode(_nan_out(query)), first), call
