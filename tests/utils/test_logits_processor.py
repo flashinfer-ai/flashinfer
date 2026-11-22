@@ -744,6 +744,66 @@ class TestLogitsPipeVsSamplingOps:
 
         assert torch.all(samples_pipe == samples_direct)
 
+    def test_probs_topp_sample_per_row_tensor(self):
+        set_random_seed(42)
+
+        batch_size, vocab_size = 99, 32000
+        probs = torch.rand(batch_size, vocab_size, device="cuda:0")
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        top_p = torch.rand(batch_size, device="cuda:0") * 0.8 + 0.1
+
+        gen1, gen2 = get_generators()
+
+        samples_direct = flashinfer.sampling.top_p_sampling_from_probs(
+            probs, top_p, generator=gen1
+        )
+
+        pipe = LogitsPipe([TopP(), Sample()])
+        samples_pipe = pipe(probs, top_p=top_p, generator=gen2)
+
+        assert torch.all(samples_pipe == samples_direct)
+
+    def test_probs_minp_sample_per_row_tensor(self):
+        set_random_seed(42)
+
+        batch_size, vocab_size = 99, 32000
+        probs = torch.rand(batch_size, vocab_size, device="cuda:0")
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        min_p = torch.rand(batch_size, device="cuda:0") * 0.5 + 0.05
+
+        gen1, gen2 = get_generators()
+
+        samples_direct = flashinfer.sampling.min_p_sampling_from_probs(
+            probs, min_p, generator=gen1
+        )
+
+        pipe = LogitsPipe([MinP(), Sample()])
+        samples_pipe = pipe(probs, min_p=min_p, generator=gen2)
+
+        assert torch.all(samples_pipe == samples_direct)
+
+    def test_joint_probs_topk_topp_sample_per_row_tensors(self):
+        set_random_seed(42)
+
+        batch_size, vocab_size = 99, 32000
+        probs = torch.rand(batch_size, vocab_size, device="cuda:0")
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0")
+        top_p = torch.rand(batch_size, device="cuda:0") * 0.8 + 0.1
+
+        gen1, gen2 = get_generators()
+
+        samples_direct = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, top_p, filter_apply_order="joint", generator=gen1
+        )
+
+        pipe = LogitsPipe(
+            [TopK(joint_topk_topp=True), TopP(), Sample()], input_type=TensorType.PROBS
+        )
+        samples_pipe = pipe(probs, top_k=top_k, top_p=top_p, generator=gen2)
+
+        assert torch.all(samples_pipe == samples_direct)
+
     @pytest.mark.parametrize("batch_size", [1, 99, 989])
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
     def test_probs_sample(self, batch_size, vocab_size):
