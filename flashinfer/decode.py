@@ -64,6 +64,7 @@ from .prefill import (
     get_single_prefill_module,
 )
 from .utils import (
+    _to_device_packed,
     log2e,
     FP4Tensor,
     MaskMode,
@@ -2605,17 +2606,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 # later in plan()
                 self._qo_indptr_buf.copy_(qo_indptr_host, non_blocking=non_blocking)
         else:
-            self._paged_kv_indptr_buf = indptr.to(
-                self.device, non_blocking=non_blocking
-            )
-            self._paged_kv_indices_buf = indices.to(
-                self.device, non_blocking=non_blocking
-            )
-            self._paged_kv_last_page_len_buf = last_page_len.to(
-                self.device, non_blocking=non_blocking
-            )
-            self._qo_indptr_buf = qo_indptr_host.to(
-                self.device, non_blocking=non_blocking
+            # One device buffer for the host index tensors: see _to_device_packed.
+            (
+                self._paged_kv_indptr_buf,
+                self._paged_kv_last_page_len_buf,
+                self._qo_indptr_buf,
+                self._paged_kv_indices_buf,
+            ) = _to_device_packed(
+                (indptr, last_page_len, qo_indptr_host, indices),
+                self.device,
+                non_blocking,
             )
 
         indptr_host = indptr.to("cpu")

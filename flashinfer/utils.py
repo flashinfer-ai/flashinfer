@@ -939,6 +939,46 @@ def check_shape_dtype_device(
         )
 
 
+def _to_device_packed(
+    tensors: Sequence[torch.Tensor], device: torch.device, non_blocking: bool
+) -> List[torch.Tensor]:
+    """Move 1-D index tensors to ``device``, host tensors sharing one device buffer.
+
+    A paged attention kernel reads its index arrays (indptr, last_page_len,
+    indices, ...) one after another before it can fetch any K/V data, and every
+    array that sits in its own allocation costs one more memory round trip at
+    kernel entry. Host tensors are therefore concatenated in the given order and
+    copied once; the returned tensors are slices of that copy. Put the
+    per-request arrays first so that they share the leading cache lines.
+
+    Tensors that are already on ``device`` are returned by ``Tensor.to`` as
+    before (no copy), as are host tensors that cannot be concatenated.
+    """
+    device = torch.device(device)
+    host = [
+        i
+        for i, t in enumerate(tensors)
+        if t.device.type == "cpu" and t.dim() == 1 and t.numel() > 0
+    ]
+    if (
+        device.type != "cuda"
+        or len(host) < 2
+        or len({tensors[i].dtype for i in host}) != 1
+    ):
+        return [t.to(device, non_blocking=non_blocking) for t in tensors]
+    packed = torch.cat([tensors[i] for i in host]).to(device, non_blocking=non_blocking)
+    out: List[Optional[torch.Tensor]] = [None] * len(tensors)
+    offset = 0
+    for i in host:
+        n = tensors[i].numel()
+        out[i] = packed[offset : offset + n]
+        offset += n
+    return [
+        t.to(device, non_blocking=non_blocking) if o is None else o
+        for t, o in zip(tensors, out, strict=True)
+    ]
+
+
 def _check_workspace_buffer_alignment(
     x: torch.Tensor, name: str, alignment: int = 16
 ) -> None:
