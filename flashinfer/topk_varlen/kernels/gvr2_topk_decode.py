@@ -414,9 +414,8 @@ def atomic_add_u64_acq_rel_gpu(addr_i64, val, *, loc=None, ip=None):
     a CTA barrier after it extends that to every thread of the CTA. (PTX: the
     barriers synchronize, observation order runs through atomic RMWs, causality
     order is transitive.) It replaces a fence.acq_rel.gpu before a relaxed RMW
-    plus one after it in the last CTA: ptxas lowers both forms' release half to
-    the same MEMBAR.ALL.GPU, while the acquire half needs only CCTL.IVALL, so
-    the last CTA no longer pays a second GPU-scope fence.
+    plus one after it in the last CTA, so the last CTA no longer pays a second
+    GPU-scope fence.
 
     Inline asm so the PTX names the scope: the DSL form
     (``cute.arch.atomic_add(..., sem="acq_rel", scope="gpu")``) emits
