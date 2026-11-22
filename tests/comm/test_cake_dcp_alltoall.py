@@ -82,6 +82,7 @@ def _correctness_worker(world_size, rank, port):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         from flashinfer.comm import decode_cp_a2a_alltoall, decode_cp_a2a_init_workspace
@@ -141,6 +142,7 @@ def _graph_worker(world_size, rank, port):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         from flashinfer.comm import decode_cp_a2a_alltoall, decode_cp_a2a_init_workspace
