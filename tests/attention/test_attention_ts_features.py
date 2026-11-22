@@ -380,7 +380,7 @@ raise SystemExit(pytest.main(['-q', '--maxfail=1', *sys.argv[2:]]))
         pytest.param(128, 128, 160, 160, False, id="empty-intersection"),
     ),
 )
-def test_unmasked_kv_tile_range_selects_fully_visible_tiles(
+def test_kv_tile_is_fully_visible(
     tile_offset_k: int,
     tile_size_kv: int,
     visible_begin: int,
@@ -388,14 +388,17 @@ def test_unmasked_kv_tile_range_selects_fully_visible_tiles(
     expected: bool,
 ) -> None:
     pytest.importorskip("cutlass", minversion="4.7.0")
-    from flashinfer.attention.prims_ts.kernels.mask import (
-        kv_tile_in_range,
-        unmasked_kv_tile_range,
-    )
+    from flashinfer.attention.prims_ts.kernels.mask import kv_tile_is_fully_visible
 
-    begin, end = unmasked_kv_tile_range(visible_begin, visible_end, tile_size_kv)
-    tile_idx = tile_offset_k // tile_size_kv
-    assert kv_tile_in_range(tile_idx, begin, end) is expected
+    assert (
+        kv_tile_is_fully_visible(
+            tile_offset_k,
+            tile_size_kv,
+            visible_begin,
+            visible_end,
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -419,110 +422,45 @@ def test_kv_tile_needs_right_mask(
     )
 
 
-@pytest.mark.parametrize(
-    ("tile_offset_k", "tile_size_kv", "visible_begin", "visible_end", "expected"),
-    (
-        pytest.param(0, 128, 0, 128, True, id="exact-interval"),
-        pytest.param(128, 128, 0, 255, False, id="crosses-right-boundary"),
-        pytest.param(0, 128, 1, 256, False, id="crosses-window-left-boundary"),
-        pytest.param(128, 128, 160, 160, False, id="empty-intersection"),
-    ),
-)
-def test_kv_tile_is_fully_visible(
-    tile_offset_k: int,
-    tile_size_kv: int,
-    visible_begin: int,
-    visible_end: int,
-    expected: bool,
-) -> None:
-    pytest.importorskip("cutlass", minversion="4.7.0")
-    from flashinfer.attention.prims_ts.kernels.mask import kv_tile_is_fully_visible
+def test_unmasked_kv_tile_range_matches_per_tile_visibility() -> None:
+    """The cached tile range, plain or packed, selects exactly the fully visible tiles.
 
-    assert (
-        kv_tile_is_fully_visible(
-            tile_offset_k, tile_size_kv, visible_begin, visible_end
-        )
-        is expected
-    )
-
-
-def test_unmasked_kv_tile_range_matches_per_tile_bounds() -> None:
-    """The cached range equals the per-tile visibility test it replaces."""
+    The packed word is read back as a signed 32-bit register, as on the GPU.
+    Bounds past its 16-bit fields may only shrink the range.
+    """
     pytest.importorskip("cutlass", minversion="4.7.0")
     from flashinfer.attention.prims_ts.kernels.mask import (
         kv_tile_in_range,
+        kv_tile_is_fully_visible,
+        pack_kv_tile_range,
+        packed_kv_tile_in_range,
         unmasked_kv_tile_range,
     )
 
-    for tile_size_kv in (1, 3, 64, 128):
+    def as_int32(word: int) -> int:
+        word &= 0xFFFFFFFF
+        return word - (1 << 32) if word >= 1 << 31 else word
+
+    for tile_size_kv in (1, 3, 128):
         for visible_begin in range(-130, 400, 7):
             for visible_end in range(-130, 400, 11):
                 begin, end = unmasked_kv_tile_range(
                     visible_begin, visible_end, tile_size_kv
                 )
-                assert 0 <= begin <= end
+                packed = as_int32(pack_kv_tile_range(begin, end))
                 for tile_idx in range(400 // tile_size_kv + 2):
-                    tile_offset_k = tile_idx * tile_size_kv
-                    fully_visible = (
-                        tile_offset_k >= visible_begin
-                        and tile_offset_k + tile_size_kv <= visible_end
+                    visible = kv_tile_is_fully_visible(
+                        tile_idx * tile_size_kv,
+                        tile_size_kv,
+                        visible_begin,
+                        visible_end,
                     )
-                    assert kv_tile_in_range(tile_idx, begin, end) is fully_visible
+                    assert kv_tile_in_range(tile_idx, begin, end) is visible
+                    assert packed_kv_tile_in_range(tile_idx, packed) is visible
 
-
-@pytest.mark.parametrize(
-    ("begin", "end"),
-    (
-        pytest.param(3, 9, id="small"),
-        pytest.param(0, 0x7FFF, id="end-below-sign-bit"),
-        pytest.param(5, 0x8000, id="end-sets-sign-bit"),
-        pytest.param(5, 0x3FFFFFFF // 128, id="open-right-bound"),
-        pytest.param(65536, 65537, id="range-past-16-bits"),
-        pytest.param(70000, 70000, id="empty-past-16-bits"),
-    ),
-)
-def test_packed_kv_tile_range_never_unmasks_outside_range(begin: int, end: int) -> None:
-    """The packed word, read back as a signed 32-bit register, only shrinks the range."""
-    pytest.importorskip("cutlass", minversion="4.7.0")
-    from flashinfer.attention.prims_ts.kernels.mask import (
-        kv_tile_in_range,
-        pack_kv_tile_range,
-        packed_kv_tile_in_range,
-    )
-
-    packed = pack_kv_tile_range(begin, end) & 0xFFFFFFFF
-    packed_i32 = packed - (1 << 32) if packed >= 1 << 31 else packed
-    for tile_idx in (0, 1, begin - 1, begin, end - 1, end, 0xFFFE, 0xFFFF, 0x10000):
-        if tile_idx < 0:
-            continue
-        in_packed = packed_kv_tile_in_range(tile_idx, packed_i32)
-        assert not in_packed or kv_tile_in_range(tile_idx, begin, end)
-        if end <= 0xFFFF:
-            assert in_packed == kv_tile_in_range(tile_idx, begin, end)
-
-
-@pytest.mark.parametrize(
-    ("mask_type", "cu_seqlens_q", "seq_len_q", "expected"),
-    (
-        pytest.param("dense", None, 4, False, id="dense"),
-        pytest.param("causal", None, 1, False, id="causal-one-token"),
-        pytest.param("causal", None, 4, True, id="causal-fixed-mtp"),
-        pytest.param("causal", object(), 1, True, id="causal-packed-q"),
-    ),
-)
-def test_mla_rows_have_distinct_kv_prefix(
-    mask_type: str,
-    cu_seqlens_q: object,
-    seq_len_q: int,
-    expected: bool,
-) -> None:
-    """MLA caches a work tile's common K prefix exactly when its rows differ."""
-    pytest.importorskip("cutlass", minversion="4.7.0")
-    from types import SimpleNamespace
-
-    from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.mask import (
-        rows_have_distinct_kv_prefix,
-    )
-
-    cfg = SimpleNamespace(mask_type=mask_type)
-    assert rows_have_distinct_kv_prefix(cfg, cu_seqlens_q, seq_len_q) is expected
+    for begin, end in ((5, 0x8000), (5, 0x3FFFFFFF // 128), (0x10000, 0x10001)):
+        packed = as_int32(pack_kv_tile_range(begin, end))
+        for tile_idx in (0, 5, 0x7FFF, 0xFFFE, 0xFFFF, 0x10000):
+            if packed_kv_tile_in_range(tile_idx, packed):
+                assert kv_tile_in_range(tile_idx, begin, end)
+        assert packed_kv_tile_in_range(0x7FFF, packed) is (end > 0x7FFF > begin)

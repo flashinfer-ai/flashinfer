@@ -10666,55 +10666,38 @@ def test_attention_ts_decode_large_grouped_nvfp4_grid(queries: int, page: int):
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize(
-    ("seq_len_q", "num_qo_heads"), ((8, 128), (4, 256)), ids=("sq8", "sq4")
-)
+@pytest.mark.parametrize(("seq_len_q", "num_qo_heads"), ((8, 128), (4, 256)))
 def test_attention_ts_decode_fp8_q128_streamed_swaps_causal(
     monkeypatch, seq_len_q: int, num_qo_heads: int
 ):
     """FP8 Swaps Q128 streams Q32 score bands and masks only boundary tiles.
 
-    Unaligned causal lengths put each request's per-row causal ends inside
-    one K tile, so the streamed path takes both the masked and the skipped
-    per-band branches.
+    Unaligned causal lengths put per-row causal ends inside one K tile, so
+    both the masked and the skipped per-band branches run.
     """
-    original = fmha_decode_config.make_decode_config
-
-    def configured(*args, **kwargs):
-        profile = dict(
-            use_keeps_mma_ab=False,
-            tile_size_q=128,
-            tile_size_kv=128,
-            use_persistent_scheduler=False,
-        )
-        kwargs["args"] = (kwargs["args"], profile) if kwargs.get("args") else profile
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(fmha_decode_config, "make_decode_config", configured)
-    _resolve_decode_launch_spec.cache_clear()
-    try:
-        case = _make_decode_case(
-            kv_lens=(1000, 2055, 4099, 3001),
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=8,
-            head_dim=128,
-            seq_len_q=seq_len_q,
-            page_size=32,
-            qkv_dtype=_FP8,
-            out_dtype=torch.bfloat16,
-            cache_form="tuple",
-            mask_type="causal",
-            device="cuda",
-            seed=921121,
-        )
-        wrapper = _plan_case(case, max_kv_len=4099)
-        assert wrapper._plan_state.config.streams_scores_in_q32_bands
-        _exercise_public_paths(
-            wrapper,
-            case,
-            case.seq_lens_kv,
-            max_kv_len=4099,
-            exercise_all_paths=False,
-        )
-    finally:
-        _resolve_decode_launch_spec.cache_clear()
+    case = _make_decode_case(
+        kv_lens=(1000, 2055, 4099, 3001),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=8,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=32,
+        qkv_dtype=_FP8,
+        out_dtype=torch.bfloat16,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=921121,
+    )
+    policy = _exercise_explicit_profile_case(
+        monkeypatch,
+        case,
+        {
+            "use_keeps_mma_ab": False,
+            "tile_size_q": 128,
+            "tile_size_kv": 128,
+            "use_persistent_scheduler": False,
+        },
+    )
+    assert policy["mma_variant"] == "swaps_mma_ab"
+    assert (policy["tile_size_q"], policy["num_insts_kv"]) == (128, 1)
