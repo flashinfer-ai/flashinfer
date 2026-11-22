@@ -31,9 +31,17 @@ from .types import TaggedTensor, TensorType
 
 def _to_tensor_scalar_tuple(
     x: Union[torch.Tensor, float, int],
+    scalar_if_tensor: Union[float, int] = 0.0,
 ) -> Tuple[Optional[torch.Tensor], Union[float, int]]:
+    """Split a scalar-or-tensor argument into ``(tensor, scalar)``.
+
+    With a tensor, the scalar is a placeholder the kernels ignore, but it still
+    crosses the FFI boundary and is checked against the declared parameter, so
+    a parameter declared as an integer must pass an int placeholder whatever the
+    tensor dtype is.
+    """
     if isinstance(x, torch.Tensor):
-        return (x, 0 if x.dtype == torch.int32 else 0.0)
+        return (x, scalar_if_tensor)
     else:
         return (None, x)
 
@@ -126,7 +134,7 @@ class ProbsTopKOp(ParameterizedOp):
         output_type = self._validate_input_type(tensor)
 
         top_k = self._get_param("top_k", kwargs, required=True)
-        maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
+        maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k, 0)
 
         if maybe_top_k_arr is None and (
             not isinstance(top_k_val, int) or top_k_val <= 0
@@ -168,7 +176,7 @@ class LogitsTopKOp(ParameterizedOp):
         output_type = self._validate_input_type(tensor)
 
         top_k = self._get_param("top_k", kwargs, required=True)
-        maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
+        maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k, 0)
 
         if maybe_top_k_arr is None and (
             not isinstance(top_k_val, int) or top_k_val <= 0
@@ -436,7 +444,7 @@ class FusedProbsTopKSampleOp(ParameterizedOp):
         deterministic = self.default_params.get("deterministic", True)
 
         top_k = self._get_param("top_k", kwargs, required=True)
-        maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
+        maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k, 0)
 
         if maybe_top_k_arr is None and (
             not isinstance(top_k_val, int) or top_k_val <= 0
@@ -593,7 +601,7 @@ class FusedProbsTopKTopPSampleOp(ParameterizedOp):
         deterministic = self.default_params.get("deterministic", True)
 
         top_k = self._get_param("top_k", kwargs, required=True)
-        maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k)
+        maybe_top_k_arr, top_k_val = _to_tensor_scalar_tuple(top_k, 0)
 
         top_p = self._get_param("top_p", kwargs, required=True)
         maybe_top_p_arr, top_p_val = _to_tensor_scalar_tuple(top_p)

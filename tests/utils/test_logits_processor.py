@@ -647,6 +647,39 @@ class TestLogitsPipeVsSamplingOps:
 
         assert torch.allclose(samples_pipe, samples_direct)
 
+    @pytest.mark.parametrize("batch_size", [1, 99])
+    @pytest.mark.parametrize("vocab_size", [111, 32000])
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
+    def test_probs_topk_per_row_tensor(self, batch_size, vocab_size, dtype):
+        set_random_seed(42)
+
+        probs = torch.rand(batch_size, vocab_size, device="cuda:0")
+        probs = probs / probs.sum(dim=-1, keepdim=True)
+        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0").to(dtype)
+
+        samples_direct = flashinfer.sampling.top_k_renorm_probs(probs, top_k)
+
+        pipe = LogitsPipe([TopK()], input_type=TensorType.PROBS)
+        samples_pipe = pipe(probs, top_k=top_k)
+
+        assert torch.allclose(samples_pipe, samples_direct)
+
+    @pytest.mark.parametrize("batch_size", [1, 99])
+    @pytest.mark.parametrize("vocab_size", [111, 32000])
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
+    def test_logits_topk_per_row_tensor(self, batch_size, vocab_size, dtype):
+        set_random_seed(42)
+
+        logits = torch.randn(batch_size, vocab_size, device="cuda:0")
+        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0").to(dtype)
+
+        samples_direct = flashinfer.sampling.top_k_mask_logits(logits, top_k)
+
+        pipe = LogitsPipe([TopK()], input_type=TensorType.LOGITS)
+        samples_pipe = pipe(logits, top_k=top_k)
+
+        assert torch.allclose(samples_pipe, samples_direct, equal_nan=True)
+
     @pytest.mark.parametrize("batch_size", [1, 99, 989])
     @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
     @pytest.mark.parametrize("k", [10, 100, 500])
