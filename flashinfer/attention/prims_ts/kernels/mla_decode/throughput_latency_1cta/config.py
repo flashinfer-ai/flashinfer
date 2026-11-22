@@ -31,9 +31,10 @@ from math import ceil
 from typing import Any
 
 from ....split_kv_mode_policy import select_split_kv_modes
-from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.nvfp4_kv import (
     Nvfp4KVConfig,
+    is_sm107_target,
     nvfp4_row_bytes,
 )
 from ..helpers.mask import MaskType, normalize_mask_type
@@ -50,6 +51,18 @@ SUPPORTED_TILE_SIZE_Q = (8, 16, 32, 64)
 SM100A_SMEM_CAPACITY_BYTES = 232448
 ESTIMATED_TS_BARRIER_BYTES = 512
 MAX_CLUSTER_SMEM_DATA_BYTES = SM100A_SMEM_CAPACITY_BYTES - ESTIMATED_TS_BARRIER_BYTES
+# SM107 exposes 327 KiB of dynamic SMEM per CTA. Only resources gated on an
+# SM107 compile target (see is_sm107_target) may use the difference.
+SM107_SMEM_CAPACITY_BYTES = 327 * 1024
+
+
+def target_smem_capacity_bytes() -> int:
+    """Return the per-CTA dynamic SMEM capacity of the CuTe DSL compile target."""
+    return (
+        SM107_SMEM_CAPACITY_BYTES if is_sm107_target() else SM100A_SMEM_CAPACITY_BYTES
+    )
+
+
 # CUDA's nonportable cluster launch attribute accepts at most 32 CTAs.  This is
 # a launch-geometry limit, not a problem-shape policy.
 MAX_CLUSTER_SIZE = 32
@@ -96,17 +109,22 @@ class MlaConfig(Nvfp4KVConfig):
     batch_size: int = 1
     num_heads_q: int = 16
     seq_len_q: int = 4
-    seq_len_kv: int = 4096
+    seq_len_kv: int | None = 4096
     logical_num_heads_q: int = 16
     logical_seq_len_q: int = 4
-    # Causal is bottom-right aligned for speculative decode. Dense keeps only
-    # the ordinary per-batch KV-tail predicate.
+    # True: the Q lengths are compile-time. Sparse flattened Q is always fixed.
+    fixed_seqlen: bool = False
+    # Causal is bottom-right aligned in the global logical sequence. Dense
+    # uses the full global length; both map their prefixes to the local cache.
     mask_type: str = MaskType.CAUSAL.value
+    cp_world: int = 1
+    cp_interleave_size: int = 1
     # Threshold skip correction in log2 units (binades; 0 disables it): freeze
     # the running row max while a K tile raises it by at most this
     # compile-time amount and skip that tile's O rescale.  E4M3 P then uses
     # the scale ``448 * 2**-T`` instead of 448.
     softmax_rescale_threshold_log2: float = 0.0
+    lse_base_on_e: bool = False
     head_dim_qk: int = 576
     head_dim_v: int = 512
     latent_dim: int = 512
@@ -176,14 +194,31 @@ class MlaConfig(Nvfp4KVConfig):
     load_num_warps: int = 1
     whole_kv_tile: bool = False
     single_raw_prefetch: bool = False
+    # Whole-tile raw NVFP4 record buffers (1 or 2); see raw_record_stages.
+    raw_record_ring: int = 1
     compact_nv_rope: bool = False
     q_tma_stage: bool = False
     q_nope_tmem: bool = False
+    # Q NoPE stays in a full SMEM stage the loader prefetches; the MMA warp
+    # copies it into TMEM before the tile's first QK and releases the stage.
+    q_tmem_mma_copy: bool = False
     # Softmax/correction already use the native WS Layout-E row ownership.
     ws_native_e: bool = False
     ws_qk: bool = False
     # Use M64 tcgen05.mma.ws for PV; P is staged in SMEM, O follows Layout E.
     ws_pv: bool = False
+    # WS final BF16 output: columns per SMEM-transposed chunk (32 or 64), 0 for
+    # direct per-lane stores.
+    ws_coalesce_cols: int = 0
+    # WS final BF16 output leaves each SW128 SMEM chunk through a TMA tensor
+    # store instead of thread stores (requires ws_coalesce_cols == 64).
+    ws_tma_output: bool = False
+    # WS quantized tail: lane stripes held as BF16 words across the O release
+    # (requires ws_tma_output); 0 quantizes every stripe before the release.
+    ws_tail_staged_stripes: int = 0
+    # Q lands in two K/V ring slices and the MMA warp copies it to TMEM from
+    # there; the Q pipeline only carries a zero-byte tile token (see SparseMlaProfile).
+    q_in_kv: bool = False
     kv_cache_format: str = "native"
     extra_kv_cache_format: str = "native"
     sparse_reuse_kv: bool = False
@@ -194,8 +229,21 @@ class MlaConfig(Nvfp4KVConfig):
     fuse_sparse_cluster_epilogue: bool = False
     fuse_sparse_reduction: bool = False
     sparse_direct: bool = False
+    # Keep-AB direct BF16 output staged through SMEM for full-line stores.
+    coalesce_keeps_output: bool = False
+    # Programmatic dependent launch for the attention kernel itself: it waits
+    # for the preceding grid before any input read and releases dependents.
+    use_pdl: bool = False
+    # Grids of at most this many CTAs release PDL dependents right after the
+    # entry wait instead of at exit (0: never). Dependents always wait for the
+    # whole grid; an early release only moves their launch and prologue onto
+    # SMs this grid leaves idle, which crowds them once the grid is large.
+    pdl_entry_trigger_max_ctas: int = 0
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
+    # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects
+    # a runtime loop domain, while None derives the group from static lengths.
+    sparse_instruction_group: int | None = None
     page_offsets_num_warps: int = 1
     scheduler_num_warps: int = 1
     clc_padding_warp_idx: int = 14
@@ -271,6 +319,50 @@ class MlaConfig(Nvfp4KVConfig):
     def async_nvfp4_kv_gather(self) -> bool:
         """Use independent gather/transform warps with two retained tiles."""
         return self.has_nvfp4_kv and self.whole_kv_tile
+
+    def raw_record_ring_fits(self) -> bool:
+        """Return whether a second 128-row raw record buffer fits in SMEM.
+
+        D512 pure-NVFP4 records (288 B, 36 KiB per buffer) leave room beside
+        the two retained whole tiles. D576 records (352 B, 44 KiB per buffer)
+        take the H64 whole-tile schedule to 264 KB, which fits only SM107's
+        327 KiB. Mixed FP8 sources (512 B records) keep one raw buffer.
+        """
+        if self.rope_dim:
+            return is_sm107_target() and self.raw_record_stride <= 352
+        return self.raw_record_stride <= 288
+
+    @property
+    def raw_record_stages(self) -> int:
+        """Return how many whole-tile raw NVFP4 record buffers the gather ring holds.
+
+        With two buffers the metadata warps gather tile i+1 while converters
+        still read tile i; see configure_sparse_mla for when it is selected.
+        """
+        if not self.single_raw_prefetch:
+            return 1
+        assert self.raw_record_ring in (1, 2)
+        assert self.raw_record_ring == 1 or self.raw_record_ring_fits()
+        return self.raw_record_ring
+
+    @property
+    def early_raw_snapshot(self) -> bool:
+        """Snapshot raw NVFP4 records into registers before acquiring the KV tile.
+
+        Enabled with the two-slot raw ring (pure NVFP4 D512 sources only), so
+        the converter's raw-slot release no longer waits for PV to free a
+        retained whole-tile stage and two gathers stay in flight.
+        """
+        return (
+            self.async_nvfp4_kv_gather
+            and self.raw_record_stages == 2
+            and self.kv_cache_format != "fp8"
+        )
+
+    @property
+    def raw_record_stage_bytes(self) -> int:
+        """Return SMEM bytes of one raw record buffer (128 gathered rows)."""
+        return 128 * self.raw_record_stride
 
     @property
     def one_insts_kv_swap(self) -> bool:
@@ -352,16 +444,22 @@ class MlaConfig(Nvfp4KVConfig):
 
         return ceil(self.tile_size_kv / self.num_tokens_per_page)
 
+    # Return the static KV tile count, or zero when live metadata owns the domain.
     @property
     def total_kv_tiles(self) -> int:
+        if self.seq_len_kv is None:
+            return 0
         return ceil(self.seq_len_kv / self.tile_size_kv)
 
     @property
     def kv_tiles_per_multi_cta_group(self) -> int:
         return self.num_ctas_per_seq_kv * self.num_insts_kv
 
+    # Return static loop steps per split CTA, or zero for a runtime KV domain.
     @property
     def num_steps_per_cta_kv(self) -> int:
+        if self.seq_len_kv is None:
+            return 0
         tokens_per_multi_cta_step = (
             self.num_ctas_per_seq_kv * self.num_insts_kv * self.tile_size_kv
         )
@@ -502,6 +600,8 @@ class MlaConfig(Nvfp4KVConfig):
         If the maximum planned split fits that group, every shorter valid
         prefix already has the same partition. Live lengths still mask data.
         """
+        if self.sparse_instruction_group is not None:
+            return self.sparse_instruction_group
         tiles = self.local_kv_tiles(self.total_kv_tiles)
         return (
             self.num_insts_kv
@@ -700,10 +800,15 @@ def q_tile_work_count(
 
 
 def automatic_split_kv_step_tokens(tile_size_q: int) -> int:
-    """Return one steady-state K step for the selected task graph."""
+    """Return a profitable K span per split, at least two physical KV tiles.
+
+    One-tile splits do not amortize CTA setup and final reduction. The
+    one-instance Q64+ schedules retain two tiles as a policy work bound,
+    while the kernel and its hardware ceiling still accept larger counts.
+    """
 
     num_kv_insts = 1 if tile_size_q >= 64 else MlaConfig.num_insts_kv
-    return MlaConfig.tile_size_kv * num_kv_insts
+    return MlaConfig.tile_size_kv * max(num_kv_insts, 2)
 
 
 def select_auto_split_kv(
@@ -720,7 +825,6 @@ def select_auto_split_kv(
     split_kv = min(
         max_split_kv,
         max(1, target_work // base_work),
-        MAX_MLA_SPLITS_KV,
     )
     local_k_steps = ceil(max_split_kv / split_kv)
     return ceil(max_split_kv / local_k_steps)
@@ -966,6 +1070,8 @@ def resolve_runtime_cluster_reduction_mode(
     cfg: MlaConfig | None,
     *,
     reduction_mode: str | None,
+    hardware_info=None,
+    stream=None,
     log=None,
 ) -> str | None:
     """Use cached device occupancy to resolve the runtime reduction mode."""
@@ -981,7 +1087,11 @@ def resolve_runtime_cluster_reduction_mode(
     cluster_size = cluster_shape[0] * cluster_shape[1] * cluster_shape[2]
     from ...._hardware import get_max_active_clusters
 
-    active_clusters = get_max_active_clusters(cluster_size)
+    active_clusters = (
+        get_max_active_clusters(cluster_size)
+        if hardware_info is None
+        else hardware_info.get_max_active_clusters(cluster_size, stream)
+    )
     cluster_count = cluster_reduction_cluster_count(cfg)
     if log is not None:
         log(
@@ -1909,8 +2019,9 @@ def configure_sparse_mla(
         raise ValueError(
             "one-instance Swap-AB requires a supported tile/loader layout, one V owner and no cluster reduction"
         )
-    if reuse and cfg.num_ctas_per_head_dim != 1:
-        raise ValueError("retained KV requires one V owner")
+    if reuse and cfg.num_ctas_per_head_dim != 1 and not keep:
+        # Keep-AB V owners read their own D128 slices of the retained K tile.
+        raise ValueError("retained KV with a V split requires Keep-AB")
     if profile.kv_tile_size not in (64, 128) or (
         profile.kv_tile_size == 64 and (not keep or cfg.is_fp8_qkv() or not reuse)
     ):
@@ -1986,6 +2097,45 @@ def configure_sparse_mla(
         cfg.has_nvfp4_kv and keep and issuers == 8 and reuse
     ) or whole_nvfp4_kv
     ws_mma = retained_nvfp4_kv and keep
+    if ws_mma and cfg.num_ctas_per_head_dim != 1:
+        # One WS N256 PV pass reads two adjacent D128 slices and the tail stores
+        # 256 columns, so a V owner would read and write its neighbor's slices.
+        # Only the non-WS Keep-AB PV (one D128 slice per pass) splits V.
+        raise ValueError("retained NVFP4 Keep-AB KV (WS MMA) requires one V owner")
+    # Retained native FP8 K tiles feed the same WS QK/PV, with Q copied to TMEM.
+    ws_fp8 = profile.ws_mma
+    if ws_fp8 and not (
+        keep
+        and reuse
+        and issuers == 8
+        and cfg.is_fp8_qkv()
+        and not cfg.has_nvfp4_kv
+        and cfg.rope_dim == 0
+        and profile.kv_tile_size == 128
+        and cfg.num_ctas_per_head_dim == 1
+    ):
+        raise ValueError(
+            "FP8 WS MMA requires D512 Keep-AB with retained BK128 E4M3 K, eight issuers "
+            "and one V owner"
+        )
+    if (profile.ws_store_cols or profile.ws_tma_store) and not ws_fp8:
+        raise ValueError("coalesced WS output stores require the FP8 WS MMA layout")
+    if profile.ws_store_cols not in (0, 32, 64):
+        raise ValueError("ws_store_cols must be 0, 32 or 64")
+    if profile.ws_tma_store and profile.ws_store_cols != 64:
+        raise ValueError("WS TMA output stores need 64-column (128-byte) chunks")
+    if not 0 <= profile.ws_tail_staged_stripes <= 8:
+        raise ValueError("ws_tail_staged_stripes must be in [0, 8]")
+    if profile.ws_tail_staged_stripes and not profile.ws_tma_store:
+        raise ValueError("a staged WS tail needs WS TMA output stores")
+    if profile.ws_q_in_kv and not (keep and ws_fp8):
+        raise ValueError("Q in the K/V ring needs the keeps-MMA-AB WS FP8 schedule")
+    if profile.ws_tma_store and cfg.logical_num_heads_q % 32:
+        # One box holds a correction warp's 32 consecutive heads of one query.
+        raise ValueError("WS TMA output stores need a multiple of 32 heads")
+    if ws_fp8 and profile.reuse_kv_stages % 2:
+        # One N256 PV pass reads two adjacent D128 stages as one operand.
+        raise ValueError("FP8 WS MMA needs an even number of retained KV stages")
     # Four D128 slices make one D512 tile. FP8/BK64 reuse keeps two tiles;
     # BF16 BK128 retains one, with additional stages used for prefetch.
     kv_stages = (
@@ -2009,8 +2159,26 @@ def configure_sparse_mla(
         page_stages = 1
     if profile.page_pipeline_stages:
         page_stages = profile.page_pipeline_stages
+    # Persistent D512 NVFP4 schedules (several work tiles per CTA) use a
+    # two-slot raw record ring with early register snapshots and four
+    # metadata stages, so two gathers stay in flight while PV holds both
+    # retained tiles (GB300 H64 B128 top-k 1024 Sq4: 83.4 -> 78.3 us;
+    # prefill H64 Sq1024: 136.5 -> 130.0 us). Short nonpersistent split
+    # loops keep one raw buffer: there the extra 36 KiB of SMEM costs
+    # ~0.3 us (H128 B1-B4: 13.3 -> 13.6 us) and gains nothing. D576 records
+    # need SM107's SMEM (raw_record_ring_fits); there the ring makes
+    # persistent top-k 2048 decode 5-9% faster (VR200 H12 832 rows: 125.8 ->
+    # 115.6 us; H64: 145.9 -> 132.5 us).
+    raw_record_ring = (
+        2
+        if retained_nvfp4_kv
+        and cfg.raw_record_ring_fits()
+        and cfg.kv_cache_format != "fp8"
+        and cfg.use_persistent_scheduler
+        else 1
+    )
     if retained_nvfp4_kv:
-        page_stages = 2
+        page_stages = 4 if raw_record_ring == 2 else 2
     if single and reuse and kv_stages >= 6 and not cfg.is_fp8_qkv():
         page_stages = 1
 
@@ -2051,6 +2219,21 @@ def configure_sparse_mla(
             correction_regs=160 if issuers == 8 else 192,
             mma_load_regs=96 if uniform and issuers == 4 else 64,
         )
+        if ws_fp8:
+            # Q NoPE is read from TMEM; the MMA warp copies each prefetched SMEM
+            # stage into it, in tcgen05 order after the previous tile's QK.
+            roles.update(
+                ws_pv=True,
+                ws_qk=True,
+                ws_native_e=True,
+                q_nope_tmem=True,
+                q_tmem_mma_copy=True,
+                ws_coalesce_cols=profile.ws_store_cols,
+                ws_tma_output=profile.ws_tma_store,
+                ws_tail_staged_stripes=profile.ws_tail_staged_stripes,
+                q_in_kv=profile.ws_q_in_kv,
+                tmem_s_cols=64,
+            )
     else:
         balanced = profile.balanced_registers
         roles = dict(
@@ -2090,6 +2273,7 @@ def configure_sparse_mla(
             single_raw_prefetch=True,
             page_offsets_entries_per_stage=132,
             whole_kv_tile=True,
+            raw_record_ring=raw_record_ring,
         )
         kv_stages = 2
     return dataclass_replace(
@@ -2098,6 +2282,6 @@ def configure_sparse_mla(
         kv_stages=kv_stages,
         page_offsets_stages=page_stages,
         q_stages=1
-        if retained_nvfp4_kv or single or (reuse and profile.reuse_kv_stages)
+        if retained_nvfp4_kv or ws_fp8 or single or (reuse and profile.reuse_kv_stages)
         else cfg.q_stages,
     )

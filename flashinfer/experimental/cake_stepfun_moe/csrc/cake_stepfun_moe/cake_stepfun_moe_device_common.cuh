@@ -24,7 +24,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -67,7 +67,7 @@ union MmaSmemDesc {
 #include "cake_device_helpers/cake_elect_commit_8131fdc67daf4d23.cuh"
 #include "cake_device_helpers/cake_elect_commit2_a7bb30f940121974.cuh"
 #include "cake_device_helpers/cake_tma_4d_gmem2smem_5a3b7d28a4d0b342.cuh"
-#include "cake_device_helpers/cake_make_warp_uniform_26e432f3ff129648.cuh"
+#include "cake_device_helpers/cake_make_warp_uniform_3f01f1a946aaf5c5.cuh"
 #include "cake_device_helpers/cake_mbarrier_wait_cluster_hint_bdb29a0e36dedbee.cuh"
 #include "cake_device_helpers/cake_mma_ss_step_cg2_1d025b1d3d5cdb77.cuh"
 #include "cake_device_helpers/cake_tcgen05_mma_mxf4nvf4_bs_82eb5079722601c2.cuh"

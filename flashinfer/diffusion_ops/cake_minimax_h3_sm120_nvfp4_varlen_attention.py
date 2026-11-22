@@ -43,6 +43,8 @@ from ..jit.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     ATTENTION_WS_NODELTA,
     ATTENTION_WS_NODELTA_LEAD,
     ATTENTION_WS_NODELTA_TAIL,
+    ATTENTION_WS_NODELTA_WSIL_LEAD,
+    ATTENTION_WS_NODELTA_WSIL_TAIL,
     PREPROCESS,
     PREPROCESS_HEAD_MAJOR,
     PREPROCESS_HEAD_MAJOR_KA,
@@ -145,13 +147,21 @@ _OVERLAP_SFSEL_SMS = (170,)
 # ``PREPROCESS_HEAD_MAJOR`` (the same launch and outputs; a K item waits for its head's K sums in the worker's second
 # warp, beside the first warp's counts of the previous item and claim of the next one).
 _OVERLAP_WS_NODELTA_SMS = (188,)
+# There, a plan whose attention-weighted mean segment length (``sum(len ** 2) / tokens``) is at least
+# ``_OVERLAP_WSIL_MIN_SEGMENT[SM count]`` tokens takes ``ATTENTION_WS_NODELTA_WSIL_LEAD`` /
+# ``ATTENTION_WS_NODELTA_WSIL_TAIL`` in place of ``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL``: the
+# same units, arguments, grids, head-control words and protocol, with the softmax of ``ATTENTION_WS_NODELTA``'s
+# issue order (the first key half packed before the second half's maxima, the K stage released after the row
+# maximum), so the outputs are bitwise equal.  That order is faster on plans of long segments and not on plans of
+# short ones.
+_OVERLAP_WSIL_MIN_SEGMENT = {188: 2560}
 # A plan of more than 16384 padded tokens (the statistics / quantizer plans) takes the overlapped form too when its
 # attention-weighted mean segment length -- the sum of the squared segment lengths over the token count, which the
 # pre-processing share of the call falls with -- is at most ``_OVERLAP_LONG_MAX_SEGMENT[(SM count, delta)]`` tokens
 # (no entry: never), with the overlap width ``_OVERLAP_WIDTH_LONG``.  On 170 SMs both routes and on 188 SMs the
 # compensated route overlap every such plan: the hidden pre-processing pays for the overlap attention's per-unit Q
 # load at any segment length.  On 188 SMs the uncompensated route overlaps such a plan up to an attention-weighted
-# mean segment of 40960 tokens; above it the separate launches with the warp-specialised attention
+# mean segment of 53248 tokens; above it the separate launches with the warp-specialised attention
 # (``ATTENTION_WS_NODELTA``, three warps per SM sub-partition) finish first, unless the plan's mean segment keeps
 # the separate launches on the base attention (``_warp_specialised``), which keeps the overlap.
 _OVERLAP_WIDTH_LONG = {170: 64, 188: 46}
@@ -159,7 +169,25 @@ _OVERLAP_LONG_MAX_SEGMENT = {
     (170, True): 1 << 40,
     (170, False): 1 << 40,
     (188, True): 1 << 40,
-    (188, False): 40960,
+    (188, False): 53248,
+}
+# The overlapped form of a plan of the fused pre-processing whose attention-weighted mean segment length (the sum of
+# the squared segment lengths over the token count: the attention work per pre-processed token) is short is bound
+# by its producers: it takes the width P of the first ``(bound, P)`` of ``_OVERLAP_LIGHT_WIDTHS[(SM count, delta)]``
+# (rising bounds) whose bound is at least that mean; a plan above every bound keeps ``_OVERLAP_WIDTH``.
+_OVERLAP_LIGHT_WIDTHS: Dict[Tuple[int, bool], Tuple[Tuple[int, int], ...]] = {
+    (170, False): ((1280, 64), (1536, 56), (2048, 50)),
+    (170, True): ((1280, 64), (1536, 56), (1792, 50)),
+    (188, False): ((1280, 80), (1536, 64), (2048, 56)),
+    (188, True): ((1280, 80), (1536, 64), (2048, 56)),
+}
+# The overlapped form of a longer plan (more than ``_PREPROCESS_MAX_TOKENS`` padded tokens) whose attention-weighted
+# mean segment length is short takes the width P of the first ``(bound, P)`` of
+# ``_OVERLAP_LONG_LIGHT_WIDTHS[(SM count, delta)]`` (rising bounds) whose bound is at least that mean; a plan above
+# every bound, and an SM count or route without an entry, keeps ``_OVERLAP_WIDTH_LONG``.
+_OVERLAP_LONG_LIGHT_WIDTHS: Dict[Tuple[int, bool], Tuple[Tuple[int, int], ...]] = {
+    (170, False): ((1792, 64), (2560, 48)),
+    (170, True): ((1792, 64), (2560, 48)),
 }
 # Workers per producer CTA of the overlapped form (one 768-thread CTA runs three 256-thread workers).
 _OVERLAP_PRODUCER_WORKERS = 3
@@ -184,6 +212,8 @@ _NVFP4_PROGRAMS = (
     PREPROCESS_HEAD_MAJOR_KA,
     ATTENTION_SFSEL_LEAD,
     ATTENTION_SFSEL_TAIL,
+    ATTENTION_WS_NODELTA_WSIL_LEAD,
+    ATTENTION_WS_NODELTA_WSIL_TAIL,
 )
 # The producer programs of the overlapped form (its first launch).
 _NVFP4_PRODUCERS = (PREPROCESS_HEAD_MAJOR, PREPROCESS_HEAD_MAJOR_KA)
@@ -747,7 +777,8 @@ def minimax_h3_sm120_nvfp4_programs(
     (``ATTENTION_SFSEL_LEAD`` / ``ATTENTION_SFSEL_TAIL`` for a longer plan on the SM counts of
     ``_OVERLAP_SFSEL_SMS``; ``ATTENTION_NODELTA_LEAD`` / ``ATTENTION_NODELTA_TAIL`` when ``delta`` is false, the warp-specialised
     ``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL`` with the producers ``PREPROCESS_HEAD_MAJOR_KA``
-    on the SM counts of ``_OVERLAP_WS_NODELTA_SMS``) -- the head-major
+    on the SM counts of ``_OVERLAP_WS_NODELTA_SMS``, ``ATTENTION_WS_NODELTA_WSIL_LEAD`` /
+    ``ATTENTION_WS_NODELTA_WSIL_TAIL`` there for a plan of long segments (``_wsil``)) -- the head-major
     pre-processing producers (a plain launch), the lead attention launch on the SMs the producers leave free
     (a programmatic dependent of the producers), then the tail attention launch (a programmatic dependent of
     the lead), which takes the remaining work on the producers' SMs as they drain."""
@@ -765,6 +796,12 @@ def minimax_h3_sm120_nvfp4_programs(
                 )
             return (PREPROCESS_HEAD_MAJOR, ATTENTION_LEAD, ATTENTION_TAIL)
         if int(num_sms) in _OVERLAP_WS_NODELTA_SMS:
+            if _wsil(plan, num_sms):
+                return (
+                    PREPROCESS_HEAD_MAJOR_KA,
+                    ATTENTION_WS_NODELTA_WSIL_LEAD,
+                    ATTENTION_WS_NODELTA_WSIL_TAIL,
+                )
             return (
                 PREPROCESS_HEAD_MAJOR_KA,
                 ATTENTION_WS_NODELTA_LEAD,
@@ -795,6 +832,21 @@ def _warp_specialised(plan, num_sms: int, delta: bool, fused: bool) -> bool:
         (int(num_sms) >= _WS_MIN_SMS and (bound <= 0 or tokens < bound * segments))
         or (not delta and fused and int(num_sms) >= _WS_NODELTA_FUSED_MIN_SMS)
     )
+
+
+def _wsil(plan, num_sms: int) -> bool:
+    """Whether the warp-specialised uncompensated overlap of ``plan`` takes the WS-IL lead and tail: its
+    attention-weighted mean segment length ``sum(len ** 2) / tokens`` is at least
+    ``_OVERLAP_WSIL_MIN_SEGMENT[num_sms]`` tokens."""
+    limit = _OVERLAP_WSIL_MIN_SEGMENT.get(int(num_sms))
+    tokens = int(plan.bounds[-1])
+    return limit is not None and tokens > 0 and _attention_work(plan) >= limit * tokens
+
+
+def _attention_work(plan) -> int:
+    """The plan's attention work: the sum of its squared segment lengths."""
+    bounds = [int(b) for b in plan.bounds]
+    return sum((b - a) ** 2 for a, b in zip(bounds[:-1], bounds[1:], strict=False))
 
 
 def _overlap_long(plan, num_sms: int, delta: bool) -> bool:
@@ -874,16 +926,28 @@ def minimax_h3_sm120_nvfp4_launch_grids(
 
 
 def minimax_h3_sm120_nvfp4_overlap_grids(
-    num_sms: int, *, num_units: int, padded_tokens: Optional[int] = None
+    num_sms: int,
+    *,
+    num_units: int,
+    padded_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    work: Optional[int] = None,
+    delta: bool = True,
 ) -> Optional[Tuple[int, int, int]]:
     """The ``(lead attention, producers, tail attention)`` launch grids of the overlapped form on a device of
     ``num_sms`` SMs, or ``None`` when that SM count has no overlap width ``P`` (170 SMs: 42, 188 SMs: 46;
-    for a plan of more than 16384 padded tokens 64 and 46).  The tuple keeps this order; the launch order is
-    producers, lead, tail (``minimax_h3_sm120_nvfp4_programs``).  The lead attention takes one persistent CTA
-    per SM on all but ``P`` SMs up to the unit count, ``lead = max(1, min(num_sms - P, num_units))``; the
-    producers ``min(3 * P, num_sms - lead)`` CTAs, one per SM, each running three workers (``P`` CTAs when
-    the lead fills its SMs); the tail attention ``P`` CTAs.  Both attention launches take the units from one
-    shared counter, so the tail CTAs run the units the lead CTAs have not taken."""
+    for a plan of more than 16384 padded tokens 64 and 46).  With the plan's ``total_tokens`` and ``work``
+    (the sum of the squared segment lengths), a plan of at most 16384 padded tokens takes the width of the
+    first ``(bound, P)`` of ``_OVERLAP_LIGHT_WIDTHS[(num_sms, delta)]`` whose bound is at least
+    ``work / total_tokens``: on 188 SMs 80, 64 and 56 up to 1280, 1536 and 2048 tokens; on 170 SMs 64, 56
+    and 50 up to 1280, 1536 and (``delta`` false) 2048 or (``delta`` true) 1792 tokens.  A longer plan takes
+    the width of ``_OVERLAP_LONG_LIGHT_WIDTHS`` the same way: on 170 SMs 48 for a mean above 1792 and up to
+    2560 tokens, else the long width; on 188 SMs always the long width.  The tuple keeps this
+    order; the launch order is producers, lead, tail (``minimax_h3_sm120_nvfp4_programs``).  The lead attention
+    takes one persistent CTA per SM on all but ``P`` SMs up to the unit count, ``lead = max(1, min(num_sms - P,
+    num_units))``; the producers ``min(3 * P, num_sms - lead)`` CTAs, one per SM, each running three workers
+    (``P`` CTAs when the lead fills its SMs); the tail attention ``P`` CTAs.  Both attention launches take the
+    units from one shared counter, so the tail CTAs run the units the lead CTAs have not taken."""
     sms = int(num_sms)
     if sms <= 0:
         raise ValueError(f"num_sms must be positive, got {num_sms}")
@@ -892,6 +956,14 @@ def minimax_h3_sm120_nvfp4_overlap_grids(
         return None
     if padded_tokens is not None and int(padded_tokens) > _PREPROCESS_MAX_TOKENS:
         width = _OVERLAP_WIDTH_LONG.get(sms, width)
+        light_widths = _OVERLAP_LONG_LIGHT_WIDTHS
+    else:
+        light_widths = _OVERLAP_LIGHT_WIDTHS
+    if total_tokens is not None and work is not None and int(total_tokens) > 0:
+        for bound, light in light_widths.get((sms, bool(delta)), ()):
+            if int(work) <= bound * int(total_tokens):
+                width = light
+                break
     lead = max(1, min(sms - width, int(num_units)))
     return lead, min(_OVERLAP_PRODUCER_WORKERS * width, sms - lead), width
 
@@ -1047,7 +1119,12 @@ class _Nvfp4Launch:
             # (producers, lead attention, tail attention), the launch order: the producers take the
             # pre-processing slot, the lead the attention slot; the attention CTAs take the head-major units
             grids = minimax_h3_sm120_nvfp4_overlap_grids(
-                sms, num_units=plan.num_units, padded_tokens=plan.padded_tokens
+                sms,
+                num_units=plan.num_units,
+                padded_tokens=plan.padded_tokens,
+                total_tokens=plan.total_tokens,
+                work=_attention_work(plan),
+                delta=delta,
             )
             assert grids is not None
             attention_grid, preprocess_grid, tail_grid = grids
@@ -1700,7 +1777,8 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
       skip the compensation term); its warp-specialised form is taken from a mean segment of 1536 tokens
       with no upper bound, and on parts of at least 170 SMs also for a plan of 2048 to 16384 padded tokens;
       on parts of 188 SMs the overlapped form's two attention launches are warp-specialised too
-      (``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL``), behind the producers
+      (``ATTENTION_WS_NODELTA_LEAD`` / ``ATTENTION_WS_NODELTA_TAIL``, or for plans of long segments
+      ``ATTENTION_WS_NODELTA_WSIL_LEAD`` / ``ATTENTION_WS_NODELTA_WSIL_TAIL``), behind the producers
       ``PREPROCESS_HEAD_MAJOR_KA`` (the outputs of ``PREPROCESS_HEAD_MAJOR``; a K item waits for its
       head's K sums in a second warp).
 

@@ -35,6 +35,8 @@ from flashinfer.attention.prims_ts import (
     vc_attention as vca,
 )
 from flashinfer.attention.prims_ts.vc_attention.quantization import (
+    vc_quantize_int8,
+    vc_quantize_repair_int8,
     VC_KMEANS_ITERS,
     VCAttentionOperands,
     VCAttentionPreprocessor,
@@ -54,6 +56,19 @@ _VC_PLAN_GPU = pytest.mark.skipif(
 )
 
 _FP8 = torch.float8_e4m3fn
+_INT8 = torch.int8
+# The QK8 quantizers (means, repair) by Q/K code type.
+_QK8_QUANTIZERS = {
+    _FP8: (vc_quantize_fp8, vc_quantize_repair),
+    _INT8: (vc_quantize_int8, vc_quantize_repair_int8),
+}
+# INT8 Q/K needs the INT8 tensor core of SM100 (B200).
+_INT8_QK_GPU = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() != (10, 0),
+    reason="INT8 Q/K needs the INT8 tcgen05 MMA of SM100",
+)
+# The code type VCAttentionPreprocessor picks on this GPU: INT8 on B200, E4M3 elsewhere.
+_QK8 = vca.vc_qk8_dtype("cuda") if torch.cuda.is_available() else _FP8
 _HEAD_DIM = 128
 
 
@@ -74,20 +89,30 @@ def _exact_fp32_matmul():
 # Torch references of the two preparations (the library ships only the CuTe
 # DSL kernels); the fused-vs-reference tests compare against these.
 # ---------------------------------------------------------------------------
-def _block_amax_scale(x: torch.Tensor, block: int) -> torch.Tensor:
-    """Per-(batch, head, token block) E4M3 scale of ``[B, S, H, D]``: amax / 448."""
+def _block_amax_scale(
+    x: torch.Tensor, block: int, qk_dtype: torch.dtype
+) -> torch.Tensor:
+    """Per-(batch, head, token block) scale of ``[B, S, H, D]``: amax / 448 for
+    E4M3 codes, amax / 127 for INT8 codes."""
     b, s, h, d = x.shape
     xp = _pad_tokens(x.float().abs(), block)
     nb = xp.shape[1] // block
     amax = xp.view(b, nb, block, h, d).amax(dim=(2, 4))  # [B, nb, H]
-    return (amax / vca.E4M3_MAX).clamp_min(1e-12).permute(0, 2, 1).contiguous()
+    qmax = vca.INT8_QK_MAX if qk_dtype is torch.int8 else vca.E4M3_MAX
+    return (amax / qmax).clamp_min(1e-12).permute(0, 2, 1).contiguous()
 
 
-def _quantize_blocks(x: torch.Tensor, scale: torch.Tensor, block: int) -> torch.Tensor:
-    """Divide ``[B, S, H, D]`` by its ``[B, H, nb]`` block scale and round to E4M3."""
+def _quantize_blocks(
+    x: torch.Tensor, scale: torch.Tensor, block: int, qk_dtype: torch.dtype
+) -> torch.Tensor:
+    """Divide ``[B, S, H, D]`` by its ``[B, H, nb]`` block scale and round to
+    E4M3 or, for INT8 codes, to the nearest integer in ``[-127, 127]``."""
     b, s, h, d = x.shape
     per_token = vca._per_token_scales(scale, s, block)  # [B, S, H]
-    return (x.float() / per_token.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    scaled = x.float() / per_token.unsqueeze(-1)
+    if qk_dtype is torch.int8:
+        return torch.round(scaled).clamp_(-127, 127).to(torch.int8)
+    return scaled.to(torch.float8_e4m3fn)
 
 
 def _pad_tokens(x: torch.Tensor, block: int) -> torch.Tensor:
@@ -168,6 +193,7 @@ def _reference_quantize_fp8(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
+    qk_dtype: torch.dtype = _FP8,
     perm: torch.Tensor | None = None,
     kmeans_iters: int = VC_KMEANS_ITERS,
     generator: torch.Generator | None = None,
@@ -193,10 +219,10 @@ def _reference_quantize_fp8(
     hm = hadamard_matrix(d, q.device)
     q_f = q.float() @ hm
     k_p = k_p @ hm
-    q_scale = _block_amax_scale(q_f, vca.VC_K_BLOCK_SIZE)
-    k_scale = _block_amax_scale(k_p, vca.VC_K_BLOCK_SIZE)
-    q8 = _quantize_blocks(q_f, q_scale, vca.VC_K_BLOCK_SIZE)
-    k8 = _quantize_blocks(k_p, k_scale, vca.VC_K_BLOCK_SIZE)
+    q_scale = _block_amax_scale(q_f, vca.VC_K_BLOCK_SIZE, qk_dtype)
+    k_scale = _block_amax_scale(k_p, vca.VC_K_BLOCK_SIZE, qk_dtype)
+    q8 = _quantize_blocks(q_f, q_scale, vca.VC_K_BLOCK_SIZE, qk_dtype)
+    k8 = _quantize_blocks(k_p, k_scale, vca.VC_K_BLOCK_SIZE, qk_dtype)
     num_kv_tiles = vca._blocks(s_k, vca.VC_K_BLOCK_SIZE)
     v_pad = _pad_tokens(v_p, vca.VC_K_BLOCK_SIZE).view(
         b, num_kv_tiles, vca.VC_K_BLOCK_SIZE, h, d
@@ -252,19 +278,41 @@ class _VCCase:
 _CASES = (
     _VCCase("single-tile", 1, 512, 1),
     _VCCase("partial-tile", 1, 2000, 2),
+    # One token in the last tile. Every other row of that tile is past the sequence.
+    _VCCase("one-token-tail", 1, 1025, 2),
     # Odd Q-tile count (cluster padding), partial last K/V tile, two batches.
     _VCCase("two-batches", 2, 2120, 2),
     _VCCase("one-shot", 1, 2000, 2, one_shot=True),
     _VCCase("qk8", 2, 2048, 2, qk_dtype=_FP8),
     _VCCase("qk8-partial-tile", 1, 2000, 2, qk_dtype=_FP8),
-    # V repair, one repair tile before the masked partial tail, two tiles with no tail.
+    # V repair. 2000 tokens place one repair tile before the masked partial tail,
+    # 4096 two tiles with no tail, 35 a repair tile ahead of a tail whose zero
+    # padding outnumbers the tokens.
     _VCCase("repair-partial-tile", 1, 2000, 2, repair_budget=0.02),
     _VCCase("repair-two-batches", 2, 4096, 2, repair_budget=0.05),
+    _VCCase("repair-short", 1, 35, 2, repair_budget=0.02),
     _VCCase("qk8-repair-partial-tile", 1, 2000, 2, qk_dtype=_FP8, repair_budget=0.02),
     _VCCase("qk8-repair-two-batches", 2, 4096, 2, qk_dtype=_FP8, repair_budget=0.05),
+    _VCCase("qk8-repair-short", 1, 35, 2, qk_dtype=_FP8, repair_budget=0.02),
     # Q and K/V lengths differ, so the Q and K scale tables have different block counts.
     _VCCase("cross-length", 2, 2000, 2, seq_len_q=1000),
     _VCCase("qk8-cross-length", 2, 2000, 2, seq_len_q=1000, qk_dtype=_FP8),
+    # INT8 Q/K, the paper's B200 recipe: INT32 scores on the float bias.
+    pytest.param(
+        _VCCase("qk8-int8-partial-tile", 1, 2000, 2, qk_dtype=_INT8),
+        marks=_INT8_QK_GPU,
+    ),
+    pytest.param(
+        _VCCase(
+            "qk8-int8-repair-partial-tile",
+            1,
+            2000,
+            2,
+            qk_dtype=_INT8,
+            repair_budget=0.02,
+        ),
+        marks=_INT8_QK_GPU,
+    ),
 )
 
 
@@ -292,7 +340,7 @@ def _random_inputs(batch_size, seq_len, num_heads, *, seed=0, seq_len_q=None):
 _MEAN_CONFIG = VCAttentionConfig()
 
 
-def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
+def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor | float) -> torch.Tensor:
     """Torch reference of the packed bf16 mean operands the preparation writes.
 
     Each group of 16 tiles gives two operands in unswizzled tcgen05 K-major
@@ -300,7 +348,13 @@ def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
     tile 8o+i and the tiles past the sequence are zero.
     """
     b, h, t, d = mean.shape
-    vs = v_scale.reshape(b, h, 1, d)
+    if d % 8 != 0:
+        raise ValueError("head_dim must be a multiple of 8")
+    vs = (
+        v_scale.reshape(b, h, 1, d)
+        if isinstance(v_scale, torch.Tensor) and v_scale.dim() == 3
+        else v_scale
+    )
     m = (mean.float() / vs).to(torch.bfloat16)
     g = -(-t // vca.VC_MEAN_GROUP_TILES)
     tiles_per_operand = vca.VC_MEAN_MMA_K // 2
@@ -308,14 +362,14 @@ def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
         (b, h, g * vca.VC_MEAN_GROUP_TILES, d), dtype=torch.bfloat16, device=mean.device
     )
     rows[:, :, :t] = m
-    # Operand o of a group holds its tiles 8o to 8o+7 in K slots 2i and 2i+1.
+    # Operand o of a group holds its tiles 8o..8o+7; K slots 2i and 2i+1 hold tile i.
     rows = rows.view(
         b, h, g, vca.VC_MEAN_OPERANDS, tiles_per_operand, d // 8, 8
     ).permute(0, 1, 2, 3, 5, 6, 4)
     tile = torch.stack((rows, rows), dim=-1).reshape(
         b, h, g, vca.VC_MEAN_OPERANDS, d // 8, 8, vca.VC_MEAN_MMA_K
     )
-    # Core-matrix order of 8-row group, K core matrix, row and k.
+    # [8-row group, K core matrix, row, k] in core-matrix order.
     tile = tile.view(
         b, h, g, vca.VC_MEAN_OPERANDS, d // 8, 8, 2, vca.VC_MEAN_MMA_K // 2
     ).permute(0, 1, 2, 3, 4, 6, 5, 7)
@@ -337,7 +391,7 @@ def _plan(
     arguments = dict(
         device=torch.device("cuda"),
         batch_size=batch_size,
-        max_seq_len_q=seq_len_q or seq_len,
+        max_q_len=seq_len_q or seq_len,
         max_kv_len=seq_len,
         num_qo_heads=num_heads,
         num_kv_heads=num_heads,
@@ -346,19 +400,20 @@ def _plan(
         k_dtype=qk_dtype,
         v_dtype=_FP8,
         out_dtype=torch.bfloat16,
-        sm_scale=sm_scale,
+        softmax_scale=sm_scale,
         vc_config=vc_config,
     )
     wrapper.plan(**{**arguments, **overrides})
 
 
 def _quantize(case: _VCCase, q, k, v):
+    qk8 = _QK8_QUANTIZERS.get(case.qk_dtype)  # None under QK16
+    if case.repair_budget and qk8 is not None:
+        return qk8[1](k, v, budget=case.repair_budget, q=q)
     if case.repair_budget:
-        return vc_quantize_repair(
-            k, v, budget=case.repair_budget, q=q if case.qk_dtype == _FP8 else None
-        )
-    if case.qk_dtype == _FP8:
-        return vc_quantize_fp8(q, k, v)
+        return vc_quantize_repair(k, v, budget=case.repair_budget)
+    if qk8 is not None:
+        return qk8[0](q, k, v)
     return vc_quantize(k, v)
 
 
@@ -374,7 +429,7 @@ def _run_case(case: _VCCase):
             q_run,
             ops.k,
             ops.v,
-            sm_scale=sm_scale,
+            softmax_scale=sm_scale,
             out_dtype=torch.bfloat16,
             vc=ops.params,
             vc_config=VCAttentionConfig(
@@ -399,7 +454,7 @@ def _run_case(case: _VCCase):
         )
         out = wrapper.run(q_run, ops.k, ops.v, vc=ops.params)
     reference = vca.vc_reference(q, ops, sm_scale=sm_scale)
-    if case.repair_budget and case.qk_dtype != _FP8:
+    if case.repair_budget and case.qk_dtype not in _QK8_QUANTIZERS:
         # Under QK8 the repair tiles carry their own K scale, so their key
         # copies are not byte identical and this match does not apply.
         torch.testing.assert_close(
@@ -509,7 +564,9 @@ def test_vc_mean_step():
         pytest.param(
             {"mask_type": "causal"}, ValueError, "dense contiguous", id="causal"
         ),
-        pytest.param({"packed": True}, ValueError, "dense contiguous", id="packed"),
+        pytest.param(
+            {"packed_query": True}, ValueError, "dense contiguous", id="packed"
+        ),
         pytest.param(
             {"mask_type": "causal", "window_left": 256, "num_qo_heads": 2},
             ValueError,
@@ -598,6 +655,20 @@ def test_vc_run_rejects_mismatched_operands():
     qk8 = BatchPrefillTSWrapper()
     _plan(qk8, batch_size=1, seq_len=1024, num_heads=2, qk_dtype=_FP8)
     good8 = ops8.params
+    if _QK8 is _INT8:
+        # INT8 Q/K plans default to the E4M3 V and bf16 output VC supplies.
+        defaults = BatchPrefillTSWrapper()
+        _plan(
+            defaults,
+            batch_size=1,
+            seq_len=1024,
+            num_heads=2,
+            qk_dtype=_INT8,
+            v_dtype=None,
+            out_dtype=None,
+        )
+        geometry = defaults._plan_state.geometry
+        assert (geometry.pv_dtype, geometry.out_dtype) == (_FP8, torch.bfloat16)
     with pytest.raises(ValueError, match="k_scale must have shape"):
         qk8.run(
             ops8.q, ops8.k, ops8.v, vc=replace(good8, k_scale=good8.k_scale[:, :-1])
@@ -648,12 +719,16 @@ def test_vc_quantize_fused_matches_reference(batch, seq_len, heads):
 
 
 @_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize(
+    "qk_dtype", [_FP8, pytest.param(_INT8, marks=_INT8_QK_GPU)], ids=["e4m3", "int8"]
+)
 @pytest.mark.parametrize("batch,seq_len,heads", [(1, 2000, 2), (2, 4096, 4)])
-def test_vc_quantize_fp8_fused_matches_reference(batch, seq_len, heads):
+def test_vc_quantize_fp8_fused_matches_reference(batch, seq_len, heads, qk_dtype):
     q, k, v = _random_inputs(batch, seq_len, heads)
     perm = vc_token_permutation(v)[0]
-    ref = _reference_quantize_fp8(q, k, v, perm=perm)
-    fused = vc_quantize_fp8(q, k, v, perm=perm)
+    ref = _reference_quantize_fp8(q, k, v, qk_dtype=qk_dtype, perm=perm)
+    fused = _QK8_QUANTIZERS[qk_dtype][0](q, k, v, perm=perm)
+    assert fused.q.dtype == qk_dtype and fused.k.dtype == qk_dtype
     torch.testing.assert_close(fused.q_scale, ref.q_scale, rtol=1e-6, atol=0)
     torch.testing.assert_close(fused.k_scale, ref.k_scale, rtol=1e-6, atol=0)
     torch.testing.assert_close(fused.v_scale, ref.v_scale, rtol=1e-6, atol=0)
@@ -665,6 +740,57 @@ def test_vc_quantize_fp8_fused_matches_reference(batch, seq_len, heads):
             (getattr(fused, name).float() != getattr(ref, name).float()).float().mean()
         )
         assert mismatch.item() < 1e-3, name
+
+
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("batch,seq_len,heads", [(1, 2000, 2), (2, 4096, 4)])
+def test_vc_quantize_repair_matches_torch_selection(batch, seq_len, heads):
+    """Whole tiles and the shifted tail hold the input (K) and its per-channel
+    E4M3 (V); the repair tiles hold the tokens of largest residual energy
+    (copied keys, then E4M3 residuals that complement the stored V codes), then
+    zero rows."""
+    _, k, v = _random_inputs(batch, seq_len, heads)
+    budget = 0.02
+    ops = vc_quantize_repair(k, v, budget=budget)
+    selected = max(1, round(budget * seq_len))
+    whole = seq_len // vca.VC_K_BLOCK_SIZE * vca.VC_K_BLOCK_SIZE
+    shift = ops.repair_tiles * vca.VC_K_BLOCK_SIZE
+    vs = (v.float().abs().amax(dim=1) / vca.E4M3_MAX).clamp_min(1e-12)
+    vs_t = vs.unsqueeze(1)
+    v8 = (v.float() / vs_t).to(_FP8)
+    energy = (
+        ((v.float() - v8.float() * vs_t) ** 2).sum(-1).permute(0, 2, 1)
+    )  # [B, H, S]
+    kth = energy.topk(selected, dim=2).values[:, :, -1]
+    torch.testing.assert_close(ops.v_scale, vs, rtol=1e-6, atol=0)
+    for rows, src in ((ops.k, k), (ops.v, v8)):
+        kept = torch.cat([rows[:, :whole], rows[:, whole + shift : seq_len + shift]], 1)
+        # E4M3 rounding ties may differ by one code between the two paths.
+        assert (kept.float() != src.float()).float().mean().item() < 2e-3
+        assert not rows[:, whole + selected : whole + shift].float().any()
+        assert not rows[:, seq_len + shift :].float().any()
+    for b in range(batch):
+        for h in range(heads):
+            # The copied keys identify the selected tokens.
+            match = (
+                k[b, :, h].unsqueeze(0)
+                == ops.k[b, whole : whole + selected, h].unsqueeze(1)
+            ).all(-1)
+            assert (match.sum(1) == 1).all()
+            toks = match.float().argmax(1)
+            assert toks.unique().numel() == selected
+            # Up to fp32 summation order, every selected token is at or above the k-th energy.
+            assert (energy[b, h, toks] >= kth[b, h] * (1 - 1e-4)).all()
+            # Stored code + residual reconstructs the value within the residual's E4M3 half-ulp.
+            x = v[b, toks, h].float() / vs[b, h]
+            stored = (
+                toks + (toks >= whole).int() * shift
+            )  # the tail sits after the repair tiles
+            back = (
+                ops.v[b, stored, h].float()
+                + ops.v[b, whole : whole + selected, h].float()
+            )
+            assert ((back - x).abs() <= 0.5 + 1e-3).all()
 
 
 @_REQUIRES_CONTEXT_GPU
@@ -680,20 +806,83 @@ def test_vc_preprocessor_step_schedule():
     exact = torch.nn.functional.scaled_dot_product_attention(
         q.float().transpose(1, 2), k.float().transpose(1, 2), v.float().transpose(1, 2)
     ).transpose(1, 2)
+    rng_state = torch.cuda.get_rng_state()
     step0 = prep.prepare(k, v, denoise_step=(0, 40))
     assert step0.demean
+    perm0 = step0.perm.clone()
+    # The k-means leaves the caller's generator untouched.
+    assert torch.equal(torch.cuda.get_rng_state(), rng_state)
+    # Step 0 cold-starts every generation from the same seed. The grouping
+    # depends neither on the generation before it nor on the other batch
+    # elements.
+    assert torch.equal(
+        VCAttentionPreprocessor().prepare(k, v, denoise_step=(0, 40)).perm, perm0
+    )
+    batched = VCAttentionPreprocessor().prepare(
+        torch.cat([k, k.flip(1)]), torch.cat([v, v.flip(1)]), denoise_step=(0, 40)
+    )
+    assert torch.equal(batched.perm[:1], perm0)
     out = wrapper.run(q, step0.k, step0.v, vc=step0.params)
     assert (
         _relative_error(out.float(), vca.vc_reference(q, step0, sm_scale=sm_scale))
         < 6e-2
     )
     step1 = prep.prepare(k, v, denoise_step=(1, 40))
-    assert torch.equal(step1.perm, step0.perm)  # no refresh at step 1
+    assert torch.equal(step1.perm, perm0)  # no refresh at step 1
+    perm_ptr = prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr()
     step4 = prep.prepare(k, v.flip(1), denoise_step=(4, 40))
-    assert not torch.equal(step4.perm, step0.perm)  # refreshed at step 4
+    assert not torch.equal(step4.perm, perm0)  # refreshed at step 4
+    # The new grouping lands in the existing buffer so a captured CUDA graph reads it.
+    assert prep._groupings[(1, 1024, 2, None)]["perm"].data_ptr() == perm_ptr
     late = prep.prepare(k, v, denoise_step=(20, 40))  # V-Smooth off
     assert not late.demean
     assert torch.equal(late.perm, step4.perm)
+    # A later generation that begins before the last refresh starts cold, as
+    # for a sampler that starts late. The grouping matches a fresh
+    # preprocessor's.
+    prep.prepare(k, v.flip(1), denoise_step=(8, 40))
+    assert torch.equal(prep.prepare(k, v, denoise_step=(4, 40)).perm, perm0)
+    # The same holds after the previous generation ran past the smooth window
+    # and the new one begins at a step that is not a refresh step.
+    prep.prepare(k, v.flip(1), denoise_step=(20, 40))
+    assert torch.equal(prep.prepare(k, v, denoise_step=(1, 16)).perm, perm0)
+    # Outside the smooth window a new generation runs in input order instead of
+    # on the previous generation's permutation.
+    prep.prepare(k, v, denoise_step=(20, 40))
+    stale = prep.prepare(k, v, denoise_step=(19, 40))
+    assert not stale.demean
+    assert torch.equal(stale.perm, torch.arange(1024).to(stale.perm).expand(1, 2, -1))
+    # A CUDA graph runner names the step kind in place of a step. There is no
+    # step bookkeeping and a missing grouping starts cold. The cold graph
+    # replays the fixed seed rows and matches the eager grouping.
+    runner_prep = VCAttentionPreprocessor()
+    assert torch.equal(runner_prep.prepare(k, v, mode="keep").perm, perm0)
+    warm = runner_prep.prepare(k, v.flip(1), mode="warm")
+    assert warm.demean and not torch.equal(warm.perm, perm0)
+    plain = runner_prep.prepare(k, v, mode="plain")
+    assert not plain.demean and torch.equal(plain.perm, warm.perm)
+    assert torch.equal(runner_prep.prepare(k, v, mode="cold").perm, perm0)
+    assert runner_prep._last_step is None
+    static_v = v.clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            runner_prep.prepare(k, static_v, mode="cold")
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner_prep.prepare(k, static_v, mode="cold")
+    static_v.copy_(v.flip(1))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        captured.perm, VCAttentionPreprocessor().prepare(k, v.flip(1), mode="cold").perm
+    )
+    static_v.copy_(v)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured.perm, perm0)
     wrapper_late = BatchPrefillTSWrapper()
     _plan(
         wrapper_late,
@@ -708,7 +897,31 @@ def test_vc_preprocessor_step_schedule():
     )
     out_late = wrapper_late.run(q, late.k, late.v, vc=late.params)
     assert _relative_error(out_late.float(), exact) < 1e-1
-    # The same schedule drives the QK8 preparation, which also returns E4M3 Q.
+    # The same schedule drives the QK8 preparation, which also returns coded Q.
     qk8 = VCAttentionPreprocessor().prepare(k, v, q=q, denoise_step=(0, 40))
-    assert qk8.q.dtype == _FP8 and qk8.q_scale is not None and qk8.demean
+    assert qk8.q.dtype == _QK8 and qk8.q_scale is not None and qk8.demean
     assert torch.equal(qk8.v_scale, vc_quantize_fp8(q, k, v, perm=qk8.perm).v_scale)
+    # A token range groups only the tokens inside it. The others follow in
+    # input order.
+    ranged = VCAttentionPreprocessor().prepare(k, v, grouped_tokens=(200, 900)).perm
+    assert torch.equal(
+        ranged[..., :700].sort(dim=-1).values,
+        torch.arange(200, 900).to(ranged).expand(1, 2, -1),
+    )
+    rest = torch.cat([torch.arange(200), torch.arange(900, 1024)]).to(ranged)
+    assert torch.equal(ranged[..., 700:], rest.expand(1, 2, -1))
+    # A refresh with the range warm-starts from the range's centroids.
+    ranged_prep = VCAttentionPreprocessor()
+    ranged_prep.prepare(k, v, grouped_tokens=(200, 900), denoise_step=(0, 40))
+    refreshed = ranged_prep.prepare(
+        k, v.flip(1), grouped_tokens=(200, 900), denoise_step=(4, 40)
+    )
+    assert torch.equal(refreshed.perm[..., 700:], rest.expand(1, 2, -1))
+    # A new generation seen through one grouping cold-starts the others too.
+    # The range here last refreshed at step 4 of the previous generation.
+    ranged_prep.prepare(k, v, denoise_step=(20, 40))
+    ranged_prep.prepare(k, v, denoise_step=(0, 40))
+    assert torch.equal(
+        ranged_prep.prepare(k, v, grouped_tokens=(200, 900), denoise_step=(1, 40)).perm,
+        ranged,
+    )

@@ -159,6 +159,7 @@ def test_disabled_cache_compiles_directly(monkeypatch):
 
 def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypatch):
     utils = pytest.importorskip("cutlass.utils")
+    driver = pytest.importorskip("cuda.bindings.driver")
     device = [0]
     calls = []
     fail = [False]
@@ -176,23 +177,35 @@ def test_occupancy_queries_are_device_local_and_failures_are_not_cached(monkeypa
     )
     monkeypatch.setattr(torch, "empty", lambda *a, **kw: None)
     monkeypatch.setattr(
-        utils, "HardwareInfo", lambda *_: SimpleNamespace(get_max_active_clusters=query)
+        utils,
+        "HardwareInfo",
+        lambda *_: SimpleNamespace(kernel=None, get_max_active_clusters=query),
+    )
+    monkeypatch.setattr(
+        driver,
+        "cuOccupancyMaxPotentialClusterSize",
+        lambda *_: (driver.CUresult.CUDA_SUCCESS, (16, 8)[device[0]]),
     )
     _hardware._query_max_active_clusters.cache_clear()
+    _hardware._cluster_limits.cache_clear()
     try:
         assert _hardware.get_max_active_clusters(1) == 148
         assert _hardware.get_max_active_clusters(1) == 148
         assert _hardware.get_max_active_clusters(2) == 74
+        assert _hardware.get_max_active_clusters(16) == 9
+        assert _hardware.get_max_active_clusters(17) == 0
         device[0] = 1
         assert _hardware.get_max_active_clusters(1) == 147
+        assert _hardware.get_max_active_clusters(16) == 0
         fail[0] = True
         with pytest.raises(RuntimeError, match="probe failed"):
             _hardware.get_max_active_clusters(2)
         fail[0] = False
         assert _hardware.get_max_active_clusters(2) == 73
-        assert calls == [(0, 1), (0, 2), (1, 1), (1, 2), (1, 2)]
+        assert calls == [(0, 1), (0, 2), (0, 16), (1, 1), (1, 2), (1, 2)]
     finally:
         _hardware._query_max_active_clusters.cache_clear()
+        _hardware._cluster_limits.cache_clear()
 
 
 @pytest.mark.skipif(
@@ -286,7 +299,7 @@ def test_public_attention_disk_cache_in_fresh_processes(tmp_path):
         "test_attention_ts_decode.py::test_attention_ts_decode_compact_variable_k_acceptance[F7-fp8-sq4-q128-separate]",
         "test_attention_ts_decode.py::test_attention_ts_decode_fixed_q_dtype_mask_product[sq2-dense-fp8-bf16]",
         "test_attention_ts_context.py::test_attention_ts_context_bounded_public_correctness_matrix[fixed-fp16-dense-mha-one-shot]",
-        "test_attention_ts_context.py::test_attention_ts_context_paged_supported_page_sizes_accuracy[d128-bf16-32]",
+        "test_attention_ts_context.py::test_attention_ts_context_paged_supported_page_sizes_accuracy[p32-d128-torch.bfloat16-causal]",
         "test_attention_ts_mla_decode.py::test_attention_ts_mla_fp8_fully_masked_split_partials",
         "test_attention_ts_mla_decode.py::test_attention_ts_mla_2cta_graph_reloads_remapped_page_window",
         "test_attention_ts_block_sparse.py::test_public_block_sparse_correctness[q16_kv16_fp16_noncausal_holey_static]",

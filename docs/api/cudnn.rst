@@ -96,11 +96,19 @@ GQA1/2/4/8/16, Q64–1024, and KV2K–32K at least four times Q. Small workloads
 with ``total_query_tokens * Hq * max_KV < 8 * 1024 * 1024`` retain FA2 to
 avoid paged setup and split/combine overhead. This admission
 requires stable cuDNN Frontend 1.32 or newer, its matching native paged
-capability, a compatible FROST runtime, and cuDNN 9.27 or newer. Older stacks
+capability, a compatible FROST runtime, and cuDNN 9.24 or newer. Bounded
+paged plans use explicit per-request Q/KV lengths with token-unit physical
+origins; mixed cumulative-Q/per-request-KV lengths and FP8 retain their
+cuDNN 9.25 floor. Older stacks
 and unsupported attention options retain their existing auto route.
 The wrapper reuses bounded plans and refreshes metadata in ``plan()``;
 first use of a new bucket still requires prewarming. GPU replay gains do not
 imply lower eager submission cost or higher serving throughput.
+
+Explicit paged ``backend="cudnn"`` also reuses prepared plans on cuDNN 9.24
+when both per-request Q and KV lengths are available. This does not require
+bounded auto dispatch. The single-token GQA Stats workaround retains its
+cuDNN 9.27 guard.
 
 For FP16/BF16 cuDNN prefill, runtime ``q_scale`` and ``k_scale`` multiply the
 attention score scale, and ``v_scale`` multiplies the output without changing

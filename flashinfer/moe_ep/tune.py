@@ -8,7 +8,7 @@ wired for SM107.
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
     torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
-        --dtype nvfp4 --hidden 7168 --intermediate 2048 \
+        --dtype nvfp4 --implementation next --hidden 7168 --intermediate 2048 \
         --num-experts 256 --topk 8 --max-tokens 8 512 2048
 
 Hopper Humming MXFP4 fused (the scale ABI is selected automatically)::
@@ -58,6 +58,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "nvfp4",
             "mxfp8_e4m3",
             "mxfp8_e5m2",
+            "mxfp4",
             "mxfp4_mxfp8",
             "sm120_mxfp4_mxfp8",
             "sm90_fp8_e4m3",
@@ -131,9 +132,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--kernel-variant",
-        choices=("inference", "genphase"),
+        choices=("inference", "genphase", "auto"),
         default="inference",
-        help="SM107 or SM100 MXFP8 kernel composition; GenPhase capacity <= 1024",
+        help="kernel composition; auto compares eligible SM107 variants; "
+        "GenPhase capacity <= 1024",
     )
     parser.add_argument(
         "--gate-up-clamp",
@@ -191,13 +193,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--apply-topk-in-fc1",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="apply routing weights in FC1; disable for post-FC2 weighting (SM100 NVFP4)",
+        help="apply routing weights before FC2; disable for post-FC2 weighting",
     )
     parser.add_argument(
         "--max-candidates",
         type=int,
         default=None,
-        help="truncate the candidate list (smoke testing)",
+        help="truncate the candidate list per variant (smoke testing)",
     )
     parser.add_argument(
         "--live-tokens",
@@ -254,6 +256,19 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def _argument_error(args: argparse.Namespace) -> Optional[str]:
     """Return an error for unsupported dtype-specific tuning options."""
+    if args.kernel_variant == "auto":
+        if args.arch not in ("auto", "sm107") or args.dtype not in (
+            "nvfp4",
+            "mxfp8_e4m3",
+            "mxfp8_e5m2",
+            "mxfp4_mxfp8",
+            "mxfp4",
+        ):
+            return "--kernel-variant auto requires SM107 block-scaled quantization"
+        if args.warmup_iters < 1 or args.timed_iters < 1:
+            return "--warmup-iters and --timed-iters must be positive"
+        if args.max_candidates is not None and args.max_candidates < 1:
+            return "--max-candidates must be positive"
     is_mxfp4 = args.dtype == "sm90_mxfp4"
 
     if not is_mxfp4:
@@ -361,15 +376,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if family == "sm90" or (family == "sm107" and args.dtype.startswith("bf16")):
             print(f"--dtype {args.dtype} is unsupported on {family}", file=sys.stderr)
             return 2
-        if args.dtype == "mxfp4_mxfp8":
-            if family != "sm107" and not (
-                family == "sm100" and args.kernel_variant == "genphase"
-            ):
-                print(
-                    "--dtype mxfp4_mxfp8 requires SM107 or SM100 GenPhase",
-                    file=sys.stderr,
-                )
+        if args.dtype == "mxfp4":
+            if family != "sm107":
+                print("--dtype mxfp4 requires SM107", file=sys.stderr)
                 return 2
+            backend = "mxfp4_mxfp4_bf16_cutedsl"
+        elif args.dtype == "mxfp4_mxfp8":
             backend = (
                 "mxfp8_mxfp4_bf16_cutedsl"
                 if family == "sm107"
@@ -384,16 +396,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
 
-    next_standard = args.implementation == "next"
-    if next_standard and (
+    if args.kernel_variant == "auto" and family != "sm107":
+        print("--kernel-variant auto requires SM107", file=sys.stderr)
+        return 2
+
+    requested_next = args.implementation == "next"
+    if requested_next and (
         family != "sm100"
         or args.dtype not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
     ):
-        print("--implementation next requires SM100 NVFP4 or MXFP8", file=sys.stderr)
+        print(
+            "--implementation next requires SM100 block-scaled inference",
+            file=sys.stderr,
+        )
         return 2
+    next_standard = requested_next or (
+        family == "sm100" and args.dtype in ("mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+    )
 
     if not args.do_finalize or (
-        not args.apply_routing_weights_before_fc2 and args.kernel_variant != "genphase"
+        not args.apply_routing_weights_before_fc2
+        and args.kernel_variant != "genphase"
+        and family != "sm107"
     ):
         if family != "sm100" or not (
             args.dtype == "nvfp4"
@@ -415,7 +439,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("--no-do-finalize requires --combine-dtype bf16", file=sys.stderr)
             return 2
 
-    if family != "sm107" and args.combine_dtype != "bf16" and args.dtype != "nvfp4":
+    if (
+        family != "sm107"
+        and args.combine_dtype != "bf16"
+        and args.dtype != "nvfp4"
+        and not next_standard
+    ):
         print("--combine-dtype requires SM100 NVFP4 or SM107", file=sys.stderr)
         return 2
     if args.kernel_variant == "genphase" and args.combine_dtype != "bf16":

@@ -35,11 +35,10 @@ from pathlib import Path
 
 import pytest
 
-from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_gemm as _gemm
-from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_jit as _jit
-from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
-    cake_weights as _weights,
-)
+from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_gemm as _gemm
+from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_jit as _jit
+from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_weights as _weights
+from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_wcx as _wcx
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -70,16 +69,32 @@ EARLY_STAGES = {
     "fc2_early": "fc2",
 }
 EARLY_DYNAMIC_SMEM_BYTES = 196768
+# WCX stage (swap-AB early-start pair reading compressed weights) -> the
+# early-start stage it is derived from (same route, protocol and bits)
+WCX_STAGES = {
+    "fc1_gated_signal_swap": "fc1_gated_signal",
+    "fc1_gated_clamp_signal_swap": "fc1_gated_clamp_signal",
+    "fc2_early_swap": "fc2_early",
+}
+WCX_DYNAMIC_SMEM_BYTES = 218368
 
 
 def _expected_launch(stage: str) -> dict:
     launch = dict(EXPECTED_LAUNCH)
     if stage in EARLY_STAGES:
         launch["dynamic_smem_bytes"] = EARLY_DYNAMIC_SMEM_BYTES
+    if stage in WCX_STAGES:
+        launch["dynamic_smem_bytes"] = WCX_DYNAMIC_SMEM_BYTES
     return launch
 
 
 def _expected_arg_plan(stage: str) -> list:
+    if stage in WCX_STAGES:
+        plan = _expected_arg_plan(WCX_STAGES[stage])
+        w = plan.index(["tma_buffer", "W"])
+        return (
+            plan[:w] + [["buffer", "Wc"], ["parameter", "stage_bytes"]] + plan[w + 1 :]
+        )
     if stage not in EARLY_STAGES:
         return EXPECTED_ARG_PLAN
     extra = [["buffer", "sched"]]
@@ -110,11 +125,11 @@ def test_package_data_declares_frozen_sources() -> None:
     if not pyproject_path.is_file():
         pytest.skip("pyproject.toml is only available in source-tree test runs")
     pyproject = pyproject_path.read_text(encoding="utf-8")
-    key = '"flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe" = ['
+    key = '"flashinfer.moe_ep.kernels.cake.bf16_megamoe_sm90" = ['
     assert key in pyproject
     package_block = pyproject.split(key, maxsplit=1)[1].split("]", maxsplit=1)[0]
-    assert '"src/*.cu"' in package_block
-    assert '"src/*.json"' in package_block
+    assert '"*.cu"' in package_block
+    assert '"*.json"' in package_block
 
 
 def test_every_sealed_file_is_present_and_matches() -> None:
@@ -140,7 +155,16 @@ def test_stage_record(stage: str) -> None:
     assert record["kernel_symbol"] == f"kernel_cake_sm90_bf16_megamoe_{stage}"
     assert record["route"]["gated"] is (not stage.startswith("fc2"))
     assert record["route"]["use_clamp"] is ("clamp" in stage)
-    assert record["route"].get("early_start") == EARLY_STAGES.get(stage)
+    assert record["route"].get("early_start") == EARLY_STAGES.get(
+        WCX_STAGES.get(stage, stage)
+    )
+    if stage in WCX_STAGES:
+        wcx = record["route"]["wcx"]
+        assert wcx["codec_version"] == 2
+        assert wcx["s_cap"] == _wcx.WCX2_S_CAP
+        assert wcx["derived_from"] == WCX_STAGES[stage]
+    else:
+        assert "wcx" not in record["route"]
     expected_launch = _expected_launch(stage)
     assert {k: record["launch"][k] for k in expected_launch} == expected_launch
     assert record["arg_plan"] == _expected_arg_plan(stage)

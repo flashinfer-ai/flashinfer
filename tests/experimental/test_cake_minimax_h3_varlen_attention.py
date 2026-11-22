@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import dataclasses
 import math
 import re
 import subprocess
@@ -2429,6 +2430,180 @@ def test_one_shot_side_streams_follow_the_caller_stream(route, cu, heads):
         BF16_ATOL if route == "bf16" else NVFP4_ATOL,
         BF16_RTOL if route == "bf16" else NVFP4_RTOL,
     )
+
+
+# A GPU busy kernel of about 50 ms (B200 / GB300 clocks) queued on a stream.
+BUSY_CYCLES = 100_000_000
+
+
+def _stream_recording_parts(runner, launches, delayed=None):
+    """The runner's two-launch parts, each entry wrapped to record the current
+    torch stream it launches on (the stream the bound launches take); part
+    ``delayed`` first queues a busy kernel on that stream."""
+    parts = []
+    for i, part in enumerate(runner._parts):
+        if part is None:
+            parts.append(None)
+            continue
+        entry, arguments = part
+
+        def wrapped(*args, _entry=entry, _i=i):
+            launches.append((_i, torch.cuda.current_stream().cuda_stream))
+            if _i == delayed:
+                torch.cuda._sleep(BUSY_CYCLES)
+            return _entry(*args)
+
+        parts.append((wrapped, arguments))
+    return tuple(parts)
+
+
+@pytest.mark.parametrize(
+    "pv_mode,cu,heads,schedule",
+    [
+        ("fp4", [0, 19296], 28, "ptg"),  # center_5s_p2: a tail-grid plan on B200
+        ("fp4", [0, 27488], 14, "tfs"),  # center_15s_p4: a tail-first plan on B200
+        ("fp8", [0, 27488], 14, "tfs"),  # center_15s_p4: a tail-first plan on B200
+    ],
+)
+def test_nvfp4_two_launch_schedules_follow_the_caller_stream_order(
+    pv_mode, cu, heads, schedule
+):
+    """A two-launch schedule launches its parts on the runner's side streams
+    (TFS: QZ(B) on S2, the rest on S1; PTG: L2 on S2, the rest on S1) between
+    a fork from and a join into the caller's stream.  With a busy kernel queued
+    on the caller's stream before the inputs are written, a busy kernel ahead
+    of each part in turn on its own stream, the output read at once,
+    back-to-back calls over one workspace, two caller streams at a time and
+    graph replays, every output is bitwise the one-stream ``quantize()`` +
+    ``attention()`` output of its inputs.  Off the two-launch architectures
+    the plan is single-stream and the same checks hold on the caller's
+    stream."""
+    arch = _require_program(cake_backend.NVFP4_VARIANT[pv_mode])
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=21)
+    out = torch.empty_like(q)
+    runner = prepare_minimax_h3_varlen_nvfp4_attention(
+        q, k, v, cu_seqlens, pv_mode=pv_mode, out=out, cu_seqlens_host=cu
+    )
+    two_launch = arch in cake_backend.NVFP4_TFS_ARCHES
+    if two_launch:
+        assert runner._schedule == schedule, (
+            f"expected a {schedule} plan on {arch}, got {runner._schedule}"
+        )
+    else:
+        assert runner._schedule == "single" and runner._side is None
+
+    # One-stream reference per input set: the whole quantizer, then the bound
+    # attention program over all of the plan's records.
+    inputs = [_make_inputs(cu, heads, seed=s)[:3] for s in (21, 22, 23)]
+    expected = []
+    for values in inputs:
+        for dst, src in zip((q, k, v), values, strict=True):
+            dst.copy_(src)
+        out.fill_(float("nan"))
+        runner.quantize()
+        runner.attention()
+        expected.append(out.clone())
+    torch.cuda.synchronize()
+    assert not torch.equal(expected[0], expected[1])
+    assert not torch.isnan(expected[0]).any()
+
+    main = torch.cuda.current_stream()
+    if two_launch:
+        # Every part launches on the side stream its schedule names.  Part 3
+        # runs on S2: QZ(B) of TFS (amax, QZ(A), ATT-tail, QZ(B), ATT-bulk),
+        # L2 of PTG (amax, the quantizer, L1, L2).
+        s1, s2 = (s.cuda_stream for s in runner._side[:2])
+        assert main.cuda_stream not in (s1, s2) and s1 != s2
+        on_s2 = 3
+        present = [i for i, part in enumerate(runner._parts) if part is not None]
+        expected_streams = [(i, s2 if i == on_s2 else s1) for i in present]
+        # Each part in turn behind a busy kernel on its stream, the inputs
+        # behind one on the caller's stream, the output read at once: a
+        # missing wait lets a part read the previous call's operands (each
+        # call takes other inputs than the one before) or the caller read
+        # the output before the delayed part has written it.
+        for n, delayed in enumerate(present):
+            launches = []
+            recording = dataclasses.replace(
+                runner, _parts=_stream_recording_parts(runner, launches, delayed)
+            )
+            torch.cuda._sleep(BUSY_CYCLES)
+            for dst, src in zip((q, k, v), inputs[n % 3], strict=True):
+                dst.copy_(src)
+            out.fill_(float("nan"))
+            assert recording() is out
+            got = out.clone()
+            torch.cuda.synchronize()
+            assert launches == expected_streams
+            assert torch.equal(got, expected[n % 3]), f"part {delayed} delayed"
+
+    # Back-to-back calls on the caller's stream, no host synchronization: the
+    # inputs land behind a busy kernel, each output is read at once and the
+    # next call rewrites the same workspace.
+    consumed = []
+    for values in inputs:
+        torch.cuda._sleep(BUSY_CYCLES)
+        for dst, src in zip((q, k, v), values, strict=True):
+            dst.copy_(src)
+        out.fill_(float("nan"))
+        assert runner() is out
+        consumed.append(out.clone())
+    torch.cuda.synchronize()
+    for got, want in zip(consumed, expected, strict=True):
+        assert torch.equal(got, want)
+
+    # Two caller streams at a time: two prepared runners (each with its own
+    # side streams) and the one-shot entry (the thread's set per caller
+    # stream), each behind a busy kernel on its stream.
+    for dst, src in zip((q, k, v), inputs[0], strict=True):
+        dst.copy_(src)
+    out_y = torch.empty_like(q)
+    runner_y = prepare_minimax_h3_varlen_nvfp4_attention(
+        q, k, v, cu_seqlens, pv_mode=pv_mode, out=out_y, cu_seqlens_host=cu
+    )
+    x, y = torch.cuda.Stream(), torch.cuda.Stream()
+    x.wait_stream(main)
+    y.wait_stream(main)
+    results = []
+    for stream, call in ((x, runner), (y, runner_y)):
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(BUSY_CYCLES)
+            call.out.fill_(float("nan"))
+            results.append(call().clone())
+    for stream in (x, y):
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(BUSY_CYCLES)
+            results.append(
+                minimax_h3_varlen_nvfp4_attention(
+                    q, k, v, cu_seqlens, pv_mode=pv_mode, cu_seqlens_host=cu
+                ).clone()
+            )
+    main.wait_stream(x)
+    main.wait_stream(y)
+    torch.cuda.synchronize()
+    for got in results:
+        assert torch.equal(got, expected[0])
+
+    # Graph replays behind a busy kernel, the output read at once.
+    capture = torch.cuda.Stream()
+    capture.wait_stream(main)
+    with torch.cuda.stream(capture):
+        runner()
+    main.wait_stream(capture)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture):
+        runner()
+    replayed = []
+    for values in inputs:
+        torch.cuda._sleep(BUSY_CYCLES)
+        for dst, src in zip((q, k, v), values, strict=True):
+            dst.copy_(src)
+        out.fill_(float("nan"))
+        graph.replay()
+        replayed.append(out.clone())
+    torch.cuda.synchronize()
+    for got, want in zip(replayed, expected, strict=True):
+        assert torch.equal(got, want)
 
 
 # Large offsets through the public calls: 301 segments of 8192 tokens, a ragged

@@ -16,6 +16,8 @@ import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass.cute.runtime import from_dlpack
 
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
 HD = 128  # head dim
 PG = 128  # page size == kv block size
 NT = 128  # threads per CTA (4 warps)
@@ -282,7 +284,7 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
         stream = cuda.CUstream(raw)
         _STREAM[raw] = stream
 
-    key = (Hkv, KPS, KHS, G, SQ, tpb)
+    key = (Hkv, KPS, KHS, G, SQ, tpb, q.dtype, k.dtype, max_score.dtype)
     fn = _COMPILED.get(key)
     if fn is None:
         mQ = from_dlpack(q, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
@@ -303,22 +305,14 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
         mO = from_dlpack(
             max_score, assumed_align=16, enable_tvm_ffi=True
         ).mark_layout_dynamic(leading_dim=2)
-        fn = cute.compile(
-            _msa_host,
-            mQ,
-            mK,
-            mCu,
-            mPT,
-            mSK,
-            mO,
-            stream,
-            Hkv,
-            KPS,
-            KHS,
-            G,
-            SQ,
-            tpb,
-            options="--enable-tvm-ffi",
+        args = (_msa_host, mQ, mK, mCu, mPT, mSK, mO, stream)
+        args += (Hkv, KPS, KHS, G, SQ, tpb)
+        fn = build_and_load_cute_dsl_kernel(
+            "msa_proxy_score_decode_bf16_sm90",
+            f"hkv{Hkv}_kps{KPS}_khs{KHS}_g{G}_sq{SQ}_tpb{tpb}"
+            f"_{q.dtype}_{k.dtype}_{max_score.dtype}",
+            lambda: cute.compile(*args, options="--enable-tvm-ffi"),
+            (__file__,),
         )
         _COMPILED[key] = fn
     fn(q, k, cu_seqlens_q, page_table, seqused_k, max_score, stream)

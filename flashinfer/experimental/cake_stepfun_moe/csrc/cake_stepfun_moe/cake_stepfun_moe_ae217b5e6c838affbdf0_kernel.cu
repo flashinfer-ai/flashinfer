@@ -19,20 +19,6 @@
 #define CAKE_NEED_INT_WARP_UNIFORM
 #include "cake_stepfun_moe_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_SMEM_OFFSET8_OFF 0
-#define SMEM_SMEM_OFFSET8_STAGE_BYTES 512
-#define SMEM_SMEM_OFFSET8_STRIDE 512
-#define SMEM_SMEM_KIDX_OFF 512
-#define SMEM_SMEM_KIDX_STAGE_BYTES 512
-#define SMEM_SMEM_KIDX_STRIDE 512
-#define SMEM_WARP_TOTALS_OFF 1024
-#define SMEM_WARP_TOTALS_STAGE_BYTES 128
-#define SMEM_WARP_TOTALS_STRIDE 128
-#define SMEM_TOTAL 1152
-#define THREADS 128
-
 
 __device__ __forceinline__ unsigned int __as_u32(float v) {
     unsigned int u;
@@ -78,7 +64,7 @@ kernel_cake_stepfun_moe_ae217b5e6c838affbdf0(float* __restrict__ scores, __nv_bf
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int8_t* smem_offset8 = reinterpret_cast<int8_t*>(smem_raw + 0);
     const int smem_offset8_addr = smem + 0;
     int8_t* smem_kidx = reinterpret_cast<int8_t*>(smem_raw + 512);
@@ -114,28 +100,28 @@ kernel_cake_stepfun_moe_ae217b5e6c838affbdf0(float* __restrict__ scores, __nv_bf
             raw_bits = __as_u32(scores[warp_idx * num_experts + expert_cand]);
         }
         tw_mask = (((raw_bits & 2147483648u) != 0) ? 4294967295u : 2147483648u);
-        keys[0] = (unsigned long long)(raw_bits ^ tw_mask) << 32 | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
+        keys[0] = (unsigned long long)(raw_bits ^ tw_mask) << 32ull | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
         expert_cand = 32 + lane_0;
         raw_bits = __as_u32(-CUDART_INF_F);
         if (expert_cand < num_experts) {
             raw_bits = __as_u32(scores[warp_idx * num_experts + expert_cand]);
         }
         tw_mask = (((raw_bits & 2147483648u) != 0) ? 4294967295u : 2147483648u);
-        keys[1] = (unsigned long long)(raw_bits ^ tw_mask) << 32 | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
+        keys[1] = (unsigned long long)(raw_bits ^ tw_mask) << 32ull | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
         expert_cand = 64 + lane_0;
         raw_bits = __as_u32(-CUDART_INF_F);
         if (expert_cand < num_experts) {
             raw_bits = __as_u32(scores[warp_idx * num_experts + expert_cand]);
         }
         tw_mask = (((raw_bits & 2147483648u) != 0) ? 4294967295u : 2147483648u);
-        keys[2] = (unsigned long long)(raw_bits ^ tw_mask) << 32 | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
+        keys[2] = (unsigned long long)(raw_bits ^ tw_mask) << 32ull | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
         expert_cand = 96 + lane_0;
         raw_bits = __as_u32(-CUDART_INF_F);
         if (expert_cand < num_experts) {
             raw_bits = __as_u32(scores[warp_idx * num_experts + expert_cand]);
         }
         tw_mask = (((raw_bits & 2147483648u) != 0) ? 4294967295u : 2147483648u);
-        keys[3] = (unsigned long long)(raw_bits ^ tw_mask) << 32 | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
+        keys[3] = (unsigned long long)(raw_bits ^ tw_mask) << 32ull | (unsigned long long)((unsigned int)(65535 - expert_cand) & 65535);
         unsigned long long _min_0 = ((keys[0]) < (keys[2]) ? (keys[0]) : (keys[2]));
         unsigned long long _max_0 = ((keys[0]) > (keys[2]) ? (keys[0]) : (keys[2]));
         keys[0] = _max_0;
@@ -156,164 +142,164 @@ kernel_cake_stepfun_moe_ae217b5e6c838affbdf0(float* __restrict__ scores, __nv_bf
         unsigned long long _max_4 = ((keys[1]) > (keys[2]) ? (keys[1]) : (keys[2]));
         keys[1] = _max_4;
         keys[2] = _min_4;
-        unsigned long long refill64 = 36028792723996672 | (unsigned long long)((unsigned int)(65535 - (96 + lane_0)) & 65535);
-        unsigned long long packed_max64 = 0;
+        unsigned long long refill = 36028792723996672ull | (unsigned long long)((unsigned int)(65535 - (96 + lane_0)) & 65535);
+        unsigned long long packed_max = 0ull;
         unsigned int hi0 = 0;
         unsigned int lo0 = 0;
         unsigned int max_hi = 0;
         unsigned int lo_contrib = 0;
         unsigned int max_lo = 0;
         if (top_k > 0) {
-            hi0 = (unsigned int)(keys[0] >> 32);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_5;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_5) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_5) : "r"(hi0));
             max_hi = _warp_redux_5;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_6;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_6) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_6) : "r"(lo_contrib));
             max_lo = _warp_redux_6;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[0] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[0] = max_hi ^ tw_mask;
         }
         if (top_k > 1) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_7;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_7) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_7) : "r"(hi0));
             max_hi = _warp_redux_7;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_8;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_8) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_8) : "r"(lo_contrib));
             max_lo = _warp_redux_8;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[1] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[1] = max_hi ^ tw_mask;
         }
         if (top_k > 2) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_9;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_9) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_9) : "r"(hi0));
             max_hi = _warp_redux_9;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_10;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_10) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_10) : "r"(lo_contrib));
             max_lo = _warp_redux_10;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[2] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[2] = max_hi ^ tw_mask;
         }
         if (top_k > 3) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_11;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_11) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_11) : "r"(hi0));
             max_hi = _warp_redux_11;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_12;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_12) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_12) : "r"(lo_contrib));
             max_lo = _warp_redux_12;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[3] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[3] = max_hi ^ tw_mask;
         }
         if (top_k > 4) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_13;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_13) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_13) : "r"(hi0));
             max_hi = _warp_redux_13;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_14;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_14) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_14) : "r"(lo_contrib));
             max_lo = _warp_redux_14;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[4] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[4] = max_hi ^ tw_mask;
         }
         if (top_k > 5) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_15;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_15) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_15) : "r"(hi0));
             max_hi = _warp_redux_15;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_16;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_16) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_16) : "r"(lo_contrib));
             max_lo = _warp_redux_16;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[5] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[5] = max_hi ^ tw_mask;
         }
         if (top_k > 6) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_17;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_17) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_17) : "r"(hi0));
             max_hi = _warp_redux_17;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_18;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_18) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_18) : "r"(lo_contrib));
             max_lo = _warp_redux_18;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[6] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[6] = max_hi ^ tw_mask;
         }
         if (top_k > 7) {
-            update = ((packed_max64 == keys[0]) ? 1 : 0);
+            update = ((packed_max == keys[0]) ? 1 : 0);
             keys[0] = ((update != 0) ? keys[1] : keys[0]);
             keys[1] = ((update != 0) ? keys[2] : keys[1]);
             keys[2] = ((update != 0) ? keys[3] : keys[2]);
-            keys[3] = ((update != 0) ? refill64 : keys[3]);
-            hi0 = (unsigned int)(keys[0] >> 32);
+            keys[3] = ((update != 0) ? refill : keys[3]);
+            hi0 = (unsigned int)(keys[0] >> 32ull);
             lo0 = (unsigned int)keys[0];
             unsigned int _warp_redux_19;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_19) : "r"(hi0));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_19) : "r"(hi0));
             max_hi = _warp_redux_19;
             lo_contrib = ((hi0 == max_hi) ? lo0 : 0);
             unsigned int _warp_redux_20;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_20) : "r"(lo_contrib));
+            asm volatile("redux.sync.max.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_20) : "r"(lo_contrib));
             max_lo = _warp_redux_20;
-            packed_max64 = (unsigned long long)max_hi << 32 | (unsigned long long)max_lo;
+            packed_max = (unsigned long long)max_hi << 32ull | (unsigned long long)max_lo;
             out_idx[7] = 65535 - (int)(max_lo & 65535);
             tw_mask = (((max_hi & 2147483648u) != 0) ? 2147483648u : 4294967295u);
             out_bits[7] = max_hi ^ tw_mask;
@@ -419,130 +405,74 @@ kernel_cake_stepfun_moe_ae217b5e6c838affbdf0(float* __restrict__ scores, __nv_bf
     if (padding_log2 > 0) {
         num_cta = acc_count + (1 << padding_log2) - 1 >> padding_log2;
     }
-    int inclusive = num_cta;
-    int lane_s = (int)lane;
-    int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, inclusive, 1, 32);
-    if (lane_s >= 1) {
-        inclusive = inclusive + _shfl_up_0;
+    // CtaScanSum: threads=128, warps=4
+    int exclusive;
+    int block_total;
+    {
+        const uint32_t exclusive_own = (uint32_t)(num_cta);
+        uint32_t exclusive_ws = exclusive_own;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_ws, 1, 32); if (lane >= 1) { exclusive_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_ws, 2, 32); if (lane >= 2) { exclusive_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_ws, 4, 32); if (lane >= 4) { exclusive_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_ws, 8, 32); if (lane >= 8) { exclusive_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_ws, 16, 32); if (lane >= 16) { exclusive_ws += peer; } }
+        if (lane == 31) { warp_totals[warp] = (int)exclusive_ws; }
+        __syncthreads();
+        const uint32_t exclusive_wt = (lane < 4) ? (uint32_t)warp_totals[lane] : 0;
+        uint32_t exclusive_wsum = exclusive_wt;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_wsum, 1, 32); if (lane >= 1) { exclusive_wsum += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_wsum, 2, 32); if (lane >= 2) { exclusive_wsum += peer; } }
+        block_total = (int)__shfl_sync(0xFFFFFFFF, exclusive_wsum, 3);
+        const uint32_t exclusive_before = __shfl_sync(0xFFFFFFFF, exclusive_wsum - exclusive_wt, warp);
+        exclusive = (int)(exclusive_ws - exclusive_own + exclusive_before);
     }
-    int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, inclusive, 2, 32);
-    if (lane_s >= 2) {
-        inclusive = inclusive + _shfl_up_1;
-    }
-    int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, inclusive, 4, 32);
-    if (lane_s >= 4) {
-        inclusive = inclusive + _shfl_up_2;
-    }
-    int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, inclusive, 8, 32);
-    if (lane_s >= 8) {
-        inclusive = inclusive + _shfl_up_3;
-    }
-    int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, inclusive, 16, 32);
-    if (lane_s >= 16) {
-        inclusive = inclusive + _shfl_up_4;
-    }
-    if (lane_s == 31) {
-        warp_totals[warp] = inclusive;
-    }
-    __syncthreads();
-    int warp_prefix = 0;
-    int block_total = 0;
-    int wt = warp_totals[0];
-    if (warp > 0) {
-        warp_prefix = warp_prefix + wt;
-    }
-    block_total = block_total + wt;
-    int wt_0 = warp_totals[1];
-    if (warp > 1) {
-        warp_prefix = warp_prefix + wt_0;
-    }
-    block_total = block_total + wt_0;
-    int wt_1 = warp_totals[2];
-    if (warp > 2) {
-        warp_prefix = warp_prefix + wt_1;
-    }
-    block_total = block_total + wt_1;
-    int wt_2 = warp_totals[3];
-    if (warp > 3) {
-        warp_prefix = warp_prefix + wt_2;
-    }
-    block_total = block_total + wt_2;
-    int exclusive = inclusive - num_cta + warp_prefix;
     __syncthreads();
     int scaled = num_cta * tile_tokens_dim;
     if (padding_log2 > 0) {
         scaled = num_cta << padding_log2;
     }
-    int inclusive_3 = scaled;
-    int lane_s_4 = (int)lane;
-    int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, inclusive_3, 1, 32);
-    if (lane_s_4 >= 1) {
-        inclusive_3 = inclusive_3 + _shfl_up_5;
+    // CtaScanSum: threads=128, warps=4
+    int exclusive_11;
+    int block_total_6;
+    {
+        const uint32_t exclusive_11_own = (uint32_t)(scaled);
+        uint32_t exclusive_11_ws = exclusive_11_own;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_11_ws, 1, 32); if (lane >= 1) { exclusive_11_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_11_ws, 2, 32); if (lane >= 2) { exclusive_11_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_11_ws, 4, 32); if (lane >= 4) { exclusive_11_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_11_ws, 8, 32); if (lane >= 8) { exclusive_11_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_11_ws, 16, 32); if (lane >= 16) { exclusive_11_ws += peer; } }
+        if (lane == 31) { warp_totals[warp] = (int)exclusive_11_ws; }
+        __syncthreads();
+        const uint32_t exclusive_11_wt = (lane < 4) ? (uint32_t)warp_totals[lane] : 0;
+        uint32_t exclusive_11_wsum = exclusive_11_wt;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_11_wsum, 1, 32); if (lane >= 1) { exclusive_11_wsum += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, exclusive_11_wsum, 2, 32); if (lane >= 2) { exclusive_11_wsum += peer; } }
+        block_total_6 = (int)__shfl_sync(0xFFFFFFFF, exclusive_11_wsum, 3);
+        const uint32_t exclusive_11_before = __shfl_sync(0xFFFFFFFF, exclusive_11_wsum - exclusive_11_wt, warp);
+        exclusive_11 = (int)(exclusive_11_ws - exclusive_11_own + exclusive_11_before);
     }
-    int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, inclusive_3, 2, 32);
-    if (lane_s_4 >= 2) {
-        inclusive_3 = inclusive_3 + _shfl_up_6;
-    }
-    int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, inclusive_3, 4, 32);
-    if (lane_s_4 >= 4) {
-        inclusive_3 = inclusive_3 + _shfl_up_7;
-    }
-    int _shfl_up_8 = __shfl_up_sync(0xFFFFFFFF, inclusive_3, 8, 32);
-    if (lane_s_4 >= 8) {
-        inclusive_3 = inclusive_3 + _shfl_up_8;
-    }
-    int _shfl_up_9 = __shfl_up_sync(0xFFFFFFFF, inclusive_3, 16, 32);
-    if (lane_s_4 >= 16) {
-        inclusive_3 = inclusive_3 + _shfl_up_9;
-    }
-    if (lane_s_4 == 31) {
-        warp_totals[warp] = inclusive_3;
-    }
-    __syncthreads();
-    int warp_prefix_5 = 0;
-    int block_total_6 = 0;
-    int wt_7 = warp_totals[0];
-    if (warp > 0) {
-        warp_prefix_5 = warp_prefix_5 + wt_7;
-    }
-    block_total_6 = block_total_6 + wt_7;
-    int wt_8 = warp_totals[1];
-    if (warp > 1) {
-        warp_prefix_5 = warp_prefix_5 + wt_8;
-    }
-    block_total_6 = block_total_6 + wt_8;
-    int wt_9 = warp_totals[2];
-    if (warp > 2) {
-        warp_prefix_5 = warp_prefix_5 + wt_9;
-    }
-    block_total_6 = block_total_6 + wt_9;
-    int wt_10 = warp_totals[3];
-    if (warp > 3) {
-        warp_prefix_5 = warp_prefix_5 + wt_10;
-    }
-    block_total_6 = block_total_6 + wt_10;
-    int exclusive_11 = inclusive_3 - scaled + warp_prefix_5;
     __syncthreads();
     if (is_local != 0) {
         int local_idx_0 = expert - local_experts_start_idx >> local_experts_stride_log2;
         for (int cta = 0; cta < num_cta; cta++) {
             cta_idx_xy_to_batch_idx[exclusive + cta] = local_idx_0;
-            int scaled_0 = (exclusive + cta + 1) * tile_tokens_dim;
+            int scaled_2 = (exclusive + cta + 1) * tile_tokens_dim;
             if (padding_log2 > 0) {
-                scaled_0 = exclusive + cta + 1 << padding_log2;
+                scaled_2 = exclusive + cta + 1 << padding_log2;
             }
-            int scaled_1 = exclusive * tile_tokens_dim;
+            int scaled_3 = exclusive * tile_tokens_dim;
             if (padding_log2 > 0) {
-                scaled_1 = exclusive << padding_log2;
+                scaled_3 = exclusive << padding_log2;
             }
-            int mn_limit2 = scaled_1 + acc_count;
-            int _min_5 = ((scaled_0) < (mn_limit2) ? (scaled_0) : (mn_limit2));
-            cta_idx_xy_to_mn_limit[exclusive + cta] = _min_5;
-            int head_end = ((scaled_0) < (_min_5 + (-_min_5 & 3)) ? (scaled_0) : (_min_5 + (-_min_5 & 3)));
-            for (int head = _min_5; head < head_end; head++) {
+            int mn_limit2 = scaled_3 + acc_count;
+            int min_1 = ((scaled_2) < (mn_limit2) ? (scaled_2) : (mn_limit2));
+            cta_idx_xy_to_mn_limit[exclusive + cta] = min_1;
+            int head_end = ((scaled_2) < (min_1 + (-min_1 & 3)) ? (scaled_2) : (min_1 + (-min_1 & 3)));
+            for (int head = min_1; head < head_end; head++) {
                 permuted_idx_to_token_idx[head] = -1;
             }
-            int body_len = ((scaled_0 - head_end) > (0) ? (scaled_0 - head_end) : (0));
+            int body_len = ((scaled_2 - head_end) > (0) ? (scaled_2 - head_end) : (0));
             int tail_begin = head_end + (body_len >> 2 << 2);
             for (int body = head_end; body < tail_begin; body += 4) {
                 {
@@ -550,17 +480,17 @@ kernel_cake_stepfun_moe_ae217b5e6c838affbdf0(float* __restrict__ scores, __nv_bf
                     *reinterpret_cast<int4*>(permuted_idx_to_token_idx + body) = _iv4;
                 }
             }
-            for (int tail = tail_begin; tail < scaled_0; tail++) {
+            for (int tail = tail_begin; tail < scaled_2; tail++) {
                 permuted_idx_to_token_idx[tail] = -1;
             }
         }
     }
     if (thread_idx == 0) {
-        int scaled_0_1 = block_total * tile_tokens_dim;
+        int scaled_4 = block_total * tile_tokens_dim;
         if (padding_log2 > 0) {
-            scaled_0_1 = block_total << padding_log2;
+            scaled_4 = block_total << padding_log2;
         }
-        permuted_idx_size[0] = scaled_0_1;
+        permuted_idx_size[0] = scaled_4;
         num_non_exiting_ctas[0] = block_total;
     }
     int slot_p = 0;

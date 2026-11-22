@@ -186,6 +186,20 @@ def _zero_input_data_tensors(*tensors: torch.Tensor | None) -> None:
             tensor.zero_()
 
 
+def _move_to_cuda_memo(
+    memo: dict[int, torch.Tensor], tensor: torch.Tensor | None
+) -> torch.Tensor | None:
+    """Move a tensor to CUDA once while preserving exact-object aliases."""
+    if tensor is None:
+        return None
+    key = id(tensor)
+    moved = memo.get(key)
+    if moved is None:
+        moved = tensor if tensor.is_cuda else tensor.to("cuda")
+        memo[key] = moved
+    return moved
+
+
 def _per_token_torch_dtype(cfg):
     if cfg.per_token_sf_dtype == int(DType.BF16):
         return torch.bfloat16
@@ -552,18 +566,38 @@ def _normalize_early_exit_launch_extent(
     return int(early_exit_max_token_ctas)
 
 
+def _validate_swap_ab_out_hidden(cfg, out_hidden: int) -> None:
+    """Reject swapAB output widths the weight-row tiling cannot serve.
+
+    DeepSeek FP8 predicates a partial last ``tile_m`` tile in the epilogue and
+    zero-fills its rows through the TMA map, so it only needs whole scale row
+    groups: a multiple of 32, the smallest ``deepseek_fp8_block_size``. The
+    other swapAB paths keep the whole-tile requirement.
+    """
+    if not cfg.is_swap_ab:
+        return
+    unit = 32 if cfg.use_deepseek_fp8 else cfg.tile_m
+    if out_hidden % unit != 0:
+        raise ValueError(
+            f"swapAB requires out_hidden to be a multiple of {unit}, got {out_hidden}"
+        )
+
+
 def _runtime_config(cfg, in_hidden: int):
     """Normalize runtime options for a concrete K."""
     if cfg.use_deepseek_fp8:
+        block = cfg.deepseek_fp8_block_size
         if cfg.tile_k != 128:
             raise ValueError(
                 "use_deepseek_fp8=1 requires tile_k=128 to match the "
-                f"128-K DeepSeek scale-factor blocks, got {cfg.tile_k}"
+                f"DeepSeek scale-factor tiles, got {cfg.tile_k}"
             )
-        if in_hidden % cfg.tile_k != 0:
+        # A partial last K tile is zero-filled by TMA and its sub-blocks past
+        # K are skipped by the epilogue, so K only has to be block-aligned.
+        if in_hidden % block != 0:
             raise ValueError(
                 "use_deepseek_fp8=1 requires problem_k to be a multiple of "
-                f"tile_k={cfg.tile_k}, got problem_k={in_hidden}"
+                f"deepseek_fp8_block_size={block}, got problem_k={in_hidden}"
             )
     return resolve_problem_config(cfg, in_hidden)
 
@@ -703,14 +737,17 @@ def _create_deepseek_fp8_sf_tensors(
     """Create DeepSeek FP8 AB dequant scale tensors.
 
     Activation scales are K-major: ``sf_activations[k_block, token_row]``.
-    Weight scales are per expert, output tile, and 128-K block.
+    Weight scales are per expert, output row group, and K block. SwapAB groups
+    output rows by ``deepseek_fp8_block_size``; the non-swap path groups them
+    by ``tile_n``.
     """
     if not cfg.use_deepseek_fp8:
         raise ValueError("DeepSeek FP8 scale tensors require use_deepseek_fp8=1")
 
-    ds_k_blocks = _round_up(in_hidden, 128) // 128
+    block = cfg.deepseek_fp8_block_size
+    ds_k_blocks = _round_up(in_hidden, block) // block
     if cfg.is_swap_ab:
-        ds_weight_tiles = _round_up(out_hidden, cfg.tile_m) // cfg.tile_m
+        ds_weight_tiles = _round_up(out_hidden, block) // block
     else:
         ds_weight_tiles = _round_up(out_hidden, cfg.tile_n) // cfg.tile_n
     ds_act_rows = num_tokens if cfg.has_routed_act else total_padded_tokens
@@ -968,8 +1005,11 @@ def _kaiming_quantized_block_scaled_inputs(
             token_layout.expanded_to_expert, dtype=torch.long, device=device
         )
         exp_rows = (expanded_to_expert >= 0).nonzero().flatten()
+        expanded_a_sf = a_sf.view(torch.uint8)[expanded_to_token[exp_rows]].view(
+            a_sf.dtype
+        )
         sf_activations = _build_sf_buffer(
-            a_sf[expanded_to_token[exp_rows]],
+            expanded_a_sf,
             total_bytes=a_sf_total,
             layout=activation_sf_layout,
             data_blk_cols=sf_k,
@@ -1124,26 +1164,27 @@ def compute_reference_dsfp8(
     n_dim: int,
 ) -> torch.Tensor:
     """
-    DeepSeek FP8 reference: per-128K FP32 dequant before accumulation.
+    DeepSeek FP8 reference: per-K-block FP32 dequant before accumulation.
     For DSFP8, the scale factors are separate FP32 tensors and are applied per K-block.
     The reference implementation needs to loop over expanded token, expert, output tile, and K-block.
     """
     ref_gemm = torch.zeros(
         (m_dim, n_dim), dtype=torch.float32, device=weights_ref.device
     )
-    k_block = 128
+    k_block = cfg.deepseek_fp8_block_size
     num_k_blocks = _round_up(in_hidden, k_block) // k_block
 
     if cfg.is_swap_ab:
-        num_weight_tiles = _round_up(m_dim, cfg.tile_m) // cfg.tile_m
+        m_block = cfg.deepseek_fp8_block_size
+        num_weight_tiles = _round_up(m_dim, m_block) // m_block
         for expanded_idx, expert_idx in enumerate(token_layout.expanded_to_expert):
             if expert_idx < 0:
                 continue
             token_idx = token_layout.expanded_to_token[expanded_idx]
             act_sf_row = token_idx if cfg.has_routed_act else expanded_idx
             for m_tile in range(num_weight_tiles):
-                m0 = m_tile * cfg.tile_m
-                m1 = min(m0 + cfg.tile_m, m_dim)
+                m0 = m_tile * m_block
+                m1 = min(m0 + m_block, m_dim)
                 for kb in range(num_k_blocks):
                     k0 = kb * k_block
                     k1 = min(k0 + k_block, in_hidden)
@@ -1367,10 +1408,10 @@ def _sf_c_numel(
     raise ValueError(f"Unsupported sfLayoutC for quantized output: {layout}")
 
 
-def _dsfp8_c_numel(output_m: int, n: int, *, is_swap_ab: bool) -> int:
+def _dsfp8_c_numel(output_m: int, n: int, *, is_swap_ab: bool, block: int = 128) -> int:
     """Number of FP32 DeepSeek output dq-scale values."""
     if is_swap_ab:
-        return _round_up(output_m, 128) // 128 * n
+        return _round_up(output_m, block) // block * n
     return _round_up(n, 128) // 128 * output_m
 
 
@@ -1381,6 +1422,7 @@ def _dsfp8_c_scale_index_grid(
     is_swap_ab: bool,
     device: str,
     scale_stride: int | None = None,
+    block: int = 128,
 ) -> torch.Tensor:
     m_idx = torch.arange(output_m, device=device).view(output_m, 1)
     n_idx = torch.arange(n, device=device).view(1, n)
@@ -1388,23 +1430,25 @@ def _dsfp8_c_scale_index_grid(
         # The swapAB epilogue strides scale blocks by the routed padded token
         # count, which is narrower than N when the caller declares a wider
         # token capacity.
-        return (m_idx // 128) * (n if scale_stride is None else scale_stride) + n_idx
+        return (m_idx // block) * (n if scale_stride is None else scale_stride) + n_idx
     return (n_idx // 128) * output_m + m_idx
 
 
-def _reference_dsfp8_c_scales(ref: torch.Tensor, *, is_swap_ab: bool) -> torch.Tensor:
+def _reference_dsfp8_c_scales(
+    ref: torch.Tensor, *, is_swap_ab: bool, block: int = 128
+) -> torch.Tensor:
     """Compute DeepSeek FP8 C dequant scales for an FP32 reference."""
     output_m, n = ref.shape
     sf_c = torch.zeros(
-        (_dsfp8_c_numel(output_m, n, is_swap_ab=is_swap_ab),),
+        (_dsfp8_c_numel(output_m, n, is_swap_ab=is_swap_ab, block=block),),
         dtype=torch.float32,
         device=ref.device,
     )
     if is_swap_ab:
-        for m0 in range(0, output_m, 128):
-            m1 = min(m0 + 128, output_m)
-            block = ref[m0:m1, :].abs().amax(dim=0)
-            sf_c[(m0 // 128) * n : (m0 // 128) * n + n] = block / 448.0
+        for m0 in range(0, output_m, block):
+            m1 = min(m0 + block, output_m)
+            group = m0 // block
+            sf_c[group * n : group * n + n] = ref[m0:m1, :].abs().amax(dim=0) / 448.0
     else:
         for n0 in range(0, n, 128):
             n1 = min(n0 + 128, n)
@@ -1566,8 +1610,9 @@ def _dequantize_dsfp8_output(
     n: int,
     is_swap_ab: bool,
     scale_stride: int | None = None,
+    block: int = 128,
 ) -> torch.Tensor:
-    """Decode E4M3 C using DeepSeek FP32 per-128-hidden dequant scales."""
+    """Decode E4M3 C using DeepSeek FP32 per-block-row dequant scales."""
     fp8_view = _decode_fp8_output(
         c_storage,
         output_m=output_m,
@@ -1580,6 +1625,7 @@ def _dequantize_dsfp8_output(
         is_swap_ab=is_swap_ab,
         device=c_storage.device,
         scale_stride=scale_stride,
+        block=block,
     )
     return fp8_view * sf_c.float()[sf_idx]
 
@@ -2040,6 +2086,7 @@ def reference_check(
     c_partition_offset=0,
     early_exit_max_token_ctas=0,
     token_capacity=None,
+    input_device: str = "cuda",
     **cfg_overrides,
 ):
     """Compile, launch the kernel, compare to a PyTorch reference.
@@ -2096,7 +2143,7 @@ def reference_check(
         cfg = replace(cfg, record_runtime_cga_shapes=1)
 
     torch.manual_seed(seed)
-    device = "cuda"
+    device = input_device
     from cutlass.cute.runtime import make_ptr
 
     # --- Domain-level problem shape ---
@@ -2115,11 +2162,7 @@ def reference_check(
         scale_gate_value=scale_gate_value,
     )
 
-    if cfg.is_swap_ab and out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_out_hidden(cfg, out_hidden)
 
     token_tile_size = cfg.token_tile_size
     cluster_dim_in_token = cfg.token_cluster_dim
@@ -2459,6 +2502,16 @@ def reference_check(
             sf_activations,
         )
 
+    # Keep the reference math and kernel launch on CUDA while allowing the
+    # expensive random input construction to run on the host.
+    move_memo: dict[int, torch.Tensor] = {}
+    weights_torch = _move_to_cuda_memo(move_memo, weights_torch)
+    activation_compact_torch = _move_to_cuda_memo(move_memo, activation_compact_torch)
+    activations_torch = _move_to_cuda_memo(move_memo, activations_torch)
+    sf_weights = _move_to_cuda_memo(move_memo, sf_weights)
+    sf_activations = _move_to_cuda_memo(move_memo, sf_activations)
+    device = "cuda"
+
     # --- Map to kernel GEMM dimensions ---
     # Kernel computes C[M,N] = A[M,K] × B[N,K]^T per expert.
     # swapAB:     A=weights(out_hidden×in_hidden), B=activations(tokens×in_hidden)
@@ -2645,6 +2698,7 @@ def reference_check(
                         logical_output_m,
                         logical_output_n,
                         is_swap_ab=cfg.is_swap_ab,
+                        block=cfg.deepseek_fp8_block_size,
                     ),
                 ),
                 dtype=torch.float32,
@@ -3084,6 +3138,7 @@ def reference_check(
             n=logical_output_n,
             is_swap_ab=cfg.is_swap_ab,
             scale_stride=total_padded_tokens if cfg.is_swap_ab else None,
+            block=cfg.deepseek_fp8_block_size,
         )
     elif cfg.uses_fp8_output:
         c_logical = _decode_fp8_output(
@@ -3580,7 +3635,9 @@ def reference_check(
         if cfg.is_swap_ab and declared_padded_tokens > total_padded_tokens:
             sf_c_ref_source = sf_c_ref_source[:, :total_padded_tokens]
         expected_sf_c = _reference_dsfp8_c_scales(
-            sf_c_ref_source, is_swap_ab=cfg.is_swap_ab
+            sf_c_ref_source,
+            is_swap_ab=cfg.is_swap_ab,
+            block=cfg.deepseek_fp8_block_size,
         )
         sf_c_diff = (sf_c_torch.float()[: expected_sf_c.numel()] - expected_sf_c).abs()
         sf_c_max_abs = sf_c_diff.max().item()
@@ -3714,6 +3771,7 @@ def _build_launch_io(
     gemm1_beta_value=None,
     gemm1_clamp_limit_value=2.0,
     early_exit_max_token_ctas=0,
+    input_device: str = "cuda",
     weight_cache=None,
     **cfg_overrides,
 ):
@@ -3738,7 +3796,7 @@ def _build_launch_io(
     cfg = make_config(**cfg_overrides)
 
     torch.manual_seed(seed)
-    device = "cuda"
+    device = input_device
     from cutlass.cute.runtime import make_ptr
 
     # Keep shape semantics aligned with reference_check and generated batch-N
@@ -3754,11 +3812,7 @@ def _build_launch_io(
         in_hidden=in_hidden,
         scale_gate_value=scale_gate_value,
     )
-    if cfg.is_swap_ab and out_hidden % cfg.tile_m != 0:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_out_hidden(cfg, out_hidden)
 
     token_tile_size = cfg.token_tile_size
     cluster_dim_in_token = cfg.token_cluster_dim
@@ -3792,6 +3846,7 @@ def _build_launch_io(
         )
         weight_cache_key = (
             "prims-ts-launch-weight-v1",
+            str(input_device),
             int(num_experts),
             int(out_hidden),
             int(in_hidden),
@@ -4029,10 +4084,6 @@ def _build_launch_io(
             weight_sf_layout=weight_sf_layout,
             shuffle_weight_rows=(shuffle_weight_rows and not cfg.use_deepseek_fp8),
         )
-        if weight_cache_key is not None:
-            weight_cache[weight_cache_key] = (kernel_weights, kernel_weight_sf)
-            while len(weight_cache) > 2:
-                weight_cache.pop(next(iter(weight_cache)))
     else:
         kernel_weights, kernel_weight_sf = cached_weight_io
 
@@ -4051,6 +4102,7 @@ def _build_launch_io(
 
     logical_output_m, logical_output_n = _logical_output_shape(cfg, M, N, is_gated)
     plain_output_dtype = _plain_output_torch_dtype(cfg)
+    c_storage = None
     if cfg.has_output_block_scaling:
         c_storage = torch.zeros(
             (_quantized_c_numel(cfg, logical_output_m, logical_output_n),),
@@ -4085,6 +4137,7 @@ def _build_launch_io(
                         logical_output_m,
                         logical_output_n,
                         is_swap_ab=cfg.is_swap_ab,
+                        block=cfg.deepseek_fp8_block_size,
                     ),
                 ),
                 dtype=torch.float32,
@@ -4127,6 +4180,98 @@ def _build_launch_io(
         if cfg.has_routed_act
         else torch.zeros(1, dtype=torch.bfloat16, device=device)
     )
+
+    bias_torch = torch.zeros((L, M), dtype=torch.float32, device=device)
+    scale_c_torch = torch.full((L,), scale_c_value, dtype=torch.float32, device=device)
+    scale_gate_torch = torch.full(
+        (L,), scale_gate_value, dtype=torch.float32, device=device
+    )
+    gemm1_alpha_torch = _make_per_expert_f32_tensor(
+        gemm1_alpha_value,
+        default=1.0,
+        num_experts=L,
+        device=device,
+    )
+    gemm1_beta_torch = _make_per_expert_f32_tensor(
+        gemm1_beta_value,
+        default=1.0 if cfg.act_kind == int(ActKind.SITU) else 0.0,
+        num_experts=L,
+        device=device,
+    )
+    gemm1_clamp_limit_torch = _make_per_expert_f32_tensor(
+        gemm1_clamp_limit_value if cfg.has_gemm1_clamp_limit else None,
+        default=0.0,
+        num_experts=L,
+        device=device,
+    )
+    per_token_dtype = _per_token_torch_dtype(cfg)
+    per_token_count = max(num_tokens, total_padded_tokens, M, N)
+    per_token_sf_a_torch = torch.ones(
+        (per_token_count,), dtype=per_token_dtype, device=device
+    )
+    per_token_sf_b_torch = torch.ones(
+        (per_token_count,), dtype=per_token_dtype, device=device
+    )
+    if all_zero_input_data:
+        _zero_input_data_tensors(
+            per_token_sf_a_torch if cfg.has_per_token_sf_a else None,
+            per_token_sf_b_torch if cfg.has_per_token_sf_b else None,
+        )
+    num_non_exiting_ctas = torch.tensor(
+        [token_layout.num_token_cgas, 0, 0], dtype=torch.int32, device=device
+    )
+    total_num_padded_tokens_torch = torch.tensor(
+        [total_padded_tokens], dtype=torch.int32, device=device
+    )
+
+    # Finish random generation and layout preprocessing on the host, then issue
+    # only HtoD copies before the kernel.
+    move_memo: dict[int, torch.Tensor] = {}
+
+    def _move(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        original_stride = tensor.stride()
+        moved = _move_to_cuda_memo(move_memo, tensor)
+        assert moved is not None and moved.is_cuda
+        assert moved.stride() == original_stride
+        return moved
+
+    kernel_a = _move(kernel_a)
+    kernel_b = _move(kernel_b)
+    sf_a = _move(sf_a)
+    sf_b = _move(sf_b)
+    c_storage = _move(c_storage)
+    sf_c_torch = _move(sf_c_torch)
+    tile_idx = _move(tile_idx)
+    mn_limit = _move(mn_limit)
+    route_map = _move(route_map)
+    act_torch = _move(act_torch)
+    bias_torch = _move(bias_torch)
+    scale_c_torch = _move(scale_c_torch)
+    scale_gate_torch = _move(scale_gate_torch)
+    gemm1_alpha_torch = _move(gemm1_alpha_torch)
+    gemm1_beta_torch = _move(gemm1_beta_torch)
+    gemm1_clamp_limit_torch = _move(gemm1_clamp_limit_torch)
+    per_token_sf_a_torch = _move(per_token_sf_a_torch)
+    per_token_sf_b_torch = _move(per_token_sf_b_torch)
+    num_non_exiting_ctas = _move(num_non_exiting_ctas)
+    total_num_padded_tokens_torch = _move(total_num_padded_tokens_torch)
+    if c_storage is not None and c_torch is not None:
+        c_torch = torch.as_strided(
+            c_storage,
+            (logical_output_m, logical_output_n),
+            (1, logical_output_m),
+        )
+    else:
+        c_torch = _move(c_torch)
+
+    if weight_cache_key is not None and cached_weight_io is None:
+        kernel_weights = kernel_a if cfg.is_swap_ab else kernel_b
+        kernel_weight_sf = sf_a if cfg.is_swap_ab else sf_b
+        weight_cache[weight_cache_key] = (kernel_weights, kernel_weight_sf)
+        while len(weight_cache) > 2:
+            weight_cache.pop(next(iter(weight_cache)))
 
     a_dp = make_ptr(
         a_dtype, kernel_a.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
@@ -4175,34 +4320,11 @@ def _build_launch_io(
     tile_idx_dp = make_ptr(
         cutlass.Int32, tile_idx.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
     )
-    bias_torch = torch.zeros((L, M), dtype=torch.float32, device=device)
     bias_dp = make_ptr(
         cutlass.Float32,
         bias_torch.data_ptr(),
         cutlass.AddressSpace.gmem,
         assumed_align=16,
-    )
-    scale_c_torch = torch.full((L,), scale_c_value, dtype=torch.float32, device=device)
-    scale_gate_torch = torch.full(
-        (L,), scale_gate_value, dtype=torch.float32, device=device
-    )
-    gemm1_alpha_torch = _make_per_expert_f32_tensor(
-        gemm1_alpha_value,
-        default=1.0,
-        num_experts=L,
-        device=device,
-    )
-    gemm1_beta_torch = _make_per_expert_f32_tensor(
-        gemm1_beta_value,
-        default=1.0 if cfg.act_kind == int(ActKind.SITU) else 0.0,
-        num_experts=L,
-        device=device,
-    )
-    gemm1_clamp_limit_torch = _make_per_expert_f32_tensor(
-        gemm1_clamp_limit_value if cfg.has_gemm1_clamp_limit else None,
-        default=0.0,
-        num_experts=L,
-        device=device,
     )
     scale_c_dp = make_ptr(
         cutlass.Float32,
@@ -4234,19 +4356,6 @@ def _build_launch_io(
         cutlass.AddressSpace.gmem,
         assumed_align=16,
     )
-    per_token_dtype = _per_token_torch_dtype(cfg)
-    per_token_count = max(num_tokens, total_padded_tokens, M, N)
-    per_token_sf_a_torch = torch.ones(
-        (per_token_count,), dtype=per_token_dtype, device=device
-    )
-    per_token_sf_b_torch = torch.ones(
-        (per_token_count,), dtype=per_token_dtype, device=device
-    )
-    if all_zero_input_data:
-        _zero_input_data_tensors(
-            per_token_sf_a_torch if cfg.has_per_token_sf_a else None,
-            per_token_sf_b_torch if cfg.has_per_token_sf_b else None,
-        )
     per_token_cutlass_dtype = _per_token_cutlass_dtype(cfg)
     per_token_sf_a_dp = make_ptr(
         per_token_cutlass_dtype,
@@ -4270,17 +4379,11 @@ def _build_launch_io(
     mn_limit_dp = make_ptr(
         cutlass.Int32, mn_limit.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
     )
-    num_non_exiting_ctas = torch.tensor(
-        [token_layout.num_token_cgas, 0, 0], dtype=torch.int32, device=device
-    )
     num_non_exiting_ctas_dp = make_ptr(
         cutlass.Int32,
         num_non_exiting_ctas.data_ptr(),
         cutlass.AddressSpace.gmem,
         assumed_align=4,
-    )
-    total_num_padded_tokens_torch = torch.tensor(
-        [total_padded_tokens], dtype=torch.int32, device=device
     )
     total_num_padded_tokens_dp = make_ptr(
         cutlass.Int32,
@@ -4392,6 +4495,18 @@ class _BatchedGemmExecutable:
     torch_stream: object = None
 
 
+def _fused_finalize_args(io: dict) -> tuple:
+    """MoE output, expanded-to-permuted map and routing weight pointers of a
+    fused-finalize launch; other launches pass typed placeholders."""
+    names = ("finalize_out_dp", "expanded_idx_dp", "expert_weights_dp")
+    if io["cfg"].fused_finalize_top_k:
+        missing = [name for name in names if name not in io]
+        if missing:
+            raise ValueError(f"a fused-finalize launch needs {', '.join(missing)}")
+        return tuple(io[name] for name in names)
+    return (io["c0_dp"], io["route_map_dp"], io["scale_c_dp"])
+
+
 def _compile_arg_tuple(io: dict, stream) -> tuple:
     """Positional args for ``cute.compile(gemm, ...)``.
 
@@ -4420,6 +4535,7 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_alpha_dp"],
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
+        *_fused_finalize_args(io),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
@@ -4476,6 +4592,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_alpha_dp"],
         io["gemm1_beta_dp"],
         io["gemm1_clamp_limit_dp"],
+        *_fused_finalize_args(io),
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
@@ -4585,6 +4702,7 @@ def benchmark_compiled(
     num_rotated_buffers: int | None = None,
     cuda_profiler_range: bool = False,
     use_cuda_graphs: bool = True,
+    host_input_gen: bool = False,
 ) -> float:
     """Time an already-compiled batched GEMM against one launch IO.
 
@@ -4612,8 +4730,9 @@ def benchmark_compiled(
     _io_keepalive = io["_keepalive"]
 
     def generate_tensors():
+        output_factory = torch.empty if host_input_gen else torch.zeros
         if cfg.has_output_block_scaling or cfg.uses_fp8_output:
-            c_buf = torch.zeros(
+            c_buf = output_factory(
                 (
                     _quantized_c_numel(cfg, logical_output_m, logical_output_n)
                     if cfg.has_output_block_scaling
@@ -4633,7 +4752,11 @@ def benchmark_compiled(
                 cutlass.AddressSpace.gmem,
                 assumed_align=16,
             )
-            sf_c_buf = torch.zeros_like(sf_c_torch)
+            if host_input_gen:
+                sf_c_buf = torch.empty_like(sf_c_torch)
+                sf_c_buf.copy_(sf_c_torch)
+            else:
+                sf_c_buf = torch.zeros_like(sf_c_torch)
             sf_c_ptr = make_ptr(
                 _sf_c_cutlass_dtype(cfg),
                 sf_c_buf.data_ptr(),
@@ -4641,7 +4764,7 @@ def benchmark_compiled(
                 assumed_align=16,
             )
         else:
-            c_buf = torch.zeros(
+            c_buf = output_factory(
                 logical_output_m,
                 logical_output_n,
                 dtype=plain_output_dtype,
@@ -4742,6 +4865,7 @@ def benchmark(
     cuda_profiler_range=False,
     early_exit_max_token_ctas=0,
     use_cuda_graphs=True,
+    input_device: str = "cuda",
     **cfg_overrides,
 ):
     """Benchmark with CUDA graphs and report logical GEMM throughput.
@@ -4766,6 +4890,7 @@ def benchmark(
         gemm1_beta_value=gemm1_beta_value,
         gemm1_clamp_limit_value=gemm1_clamp_limit_value,
         early_exit_max_token_ctas=early_exit_max_token_ctas,
+        input_device=input_device,
         **cfg_overrides,
     )
     cfg = io["cfg"]
@@ -4801,6 +4926,7 @@ def benchmark(
         num_rotated_buffers=num_rotated_buffers,
         cuda_profiler_range=cuda_profiler_range,
         use_cuda_graphs=use_cuda_graphs,
+        host_input_gen=input_device == "cpu",
     )
     # Match the reference-check path: clustered persistent kernels are sensitive
     # to compiled CUDA library lifetime if unload overlaps the next compile or
@@ -4834,6 +4960,48 @@ def benchmark(
     return exec_time
 
 
+def profile(
+    *,
+    cuda_profiler_range=False,
+    input_device: str = "cuda",
+    **launch_cfg,
+) -> None:
+    """Compile and launch the kernel exactly once, with no timing or reference.
+
+    Intended for external profilers. Unlike :func:`benchmark`, this never
+    stream-captures the kernel: the stream check in
+    ``cutlass.cute.testing.benchmark`` captures a launch it never replays, so it
+    is unsuitable when exactly one observable launch is required.
+    """
+    import cuda.bindings.driver as cuda_drv
+
+    io = _build_launch_io(input_device=input_device, **launch_cfg)
+    cfg = io["cfg"]
+    print(
+        f"Profile: tokens={io['num_tokens']}, "
+        f"padded_tokens={io['total_padded_tokens']}, experts={io['L']}, "
+        f"M={io['M']}, N={io['N']}, K={io['K']}, "
+        f"tile=({cfg.tile_m}x{cfg.tile_n}x{cfg.tile_k})"
+    )
+    torch_stream = torch.cuda.Stream()
+    stream = cuda_drv.CUstream(torch_stream.cuda_stream)
+    compiled_fn = _compile_for_launch(io, stream)
+    launch_args = _launch_arg_tuple(io, stream)
+    torch.cuda.synchronize()
+    if cuda_profiler_range:
+        torch.cuda.cudart().cudaProfilerStart()
+    try:
+        compiled_fn(*launch_args)
+        torch.cuda.synchronize()
+    finally:
+        if cuda_profiler_range:
+            torch.cuda.cudart().cudaProfilerStop()
+    print("  Launched kernel once.")
+    # Clustered persistent kernels are sensitive to compiled-library lifetime.
+    del compiled_fn
+    gc.collect()
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the BatchedGemm TS command-line parser."""
     parser = argparse.ArgumentParser(description="BatchedGemm TS runner")
@@ -4853,6 +5021,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Skip the correctness check (correctness runs by default).",
     )
     parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Launch the kernel exactly once with no correctness check, timing, "
+            "or stream capture (for external profilers)."
+        ),
+    )
+    parser.add_argument(
         "--no-cuda-graphs",
         action="store_true",
         help="Disable CUDA graphs in the benchmark.",
@@ -4861,6 +5037,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-cold-l2",
         action="store_true",
         help="Disable cold-L2 workspace rotation (reuse a single workspace).",
+    )
+    parser.add_argument(
+        "--host-input-gen",
+        action="store_true",
+        help=(
+            "Generate inputs on CPU and copy them to CUDA, avoiding pre-GEMM "
+            "device kernels. CPU and CUDA RNG values differ."
+        ),
     )
 
     parser.add_argument(
@@ -5096,10 +5280,14 @@ def main(argv: list[str] | None = None) -> int:
       (default)       : correctness check on GPU.
       --benchmark     : timed benchmark (preceded by the correctness check
                         unless --skip-ref-check is given).
+      --profile       : a single untimed launch, no correctness check.
     """
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.profile and (args.benchmark or args.validate_only):
+        parser.error("--profile cannot be combined with --benchmark or --validate-only")
     overrides = _parse_overrides(args)
+    input_device = "cpu" if args.host_input_gen else "cuda"
 
     if args.validate_only:
         validate_schedule(
@@ -5107,6 +5295,29 @@ def main(argv: list[str] | None = None) -> int:
             num_tokens=args.num_tokens,
             top_k=args.top_k,
             early_exit_max_token_ctas=args.early_exit_max_token_ctas,
+            **overrides,
+        )
+        return 0
+
+    if args.profile:
+        profile(
+            num_experts=args.num_experts,
+            num_tokens=args.num_tokens,
+            top_k=args.top_k,
+            routing=args.routing,
+            routing_seed=args.routing_seed,
+            problem_n=args.problem_n,
+            problem_k=args.problem_k,
+            seed=args.seed,
+            data_distribution=args.dist,
+            scale_c_value=args.scale_c,
+            scale_gate_value=args.scale_gate,
+            gemm1_alpha_value=args.gemm1_alpha,
+            gemm1_beta_value=args.gemm1_beta,
+            gemm1_clamp_limit_value=args.gemm1_clamp_limit,
+            cuda_profiler_range=args.cuda_profiler_range,
+            early_exit_max_token_ctas=args.early_exit_max_token_ctas,
+            input_device=input_device,
             **overrides,
         )
         return 0
@@ -5129,6 +5340,7 @@ def main(argv: list[str] | None = None) -> int:
             gemm1_beta_value=args.gemm1_beta,
             gemm1_clamp_limit_value=args.gemm1_clamp_limit,
             early_exit_max_token_ctas=args.early_exit_max_token_ctas,
+            input_device=input_device,
             **overrides,
         )
 
@@ -5155,6 +5367,7 @@ def main(argv: list[str] | None = None) -> int:
             cuda_profiler_range=args.cuda_profiler_range,
             early_exit_max_token_ctas=args.early_exit_max_token_ctas,
             use_cuda_graphs=not args.no_cuda_graphs,
+            input_device=input_device,
             **overrides,
         )
     return 0

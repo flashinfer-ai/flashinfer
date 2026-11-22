@@ -3,13 +3,101 @@
 import pytest
 import torch
 
-from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 
 KINDS = ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2")
+
 pytestmark = pytest.mark.arch_rubin
 
 
-def _run_case(kind, capacity, topk, knobs):
+@pytest.mark.parametrize("prequantized", [False, True])
+def test_nvfp4_default_scalars_survive_other_graphs(monkeypatch, prequantized):
+    """Default scalar bindings survive graphs that overwrite pooled scratch."""
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import quantize_nvfp4_block16
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    experts, hidden, intermediate, live, topk = 8, 128, 64, 4, 2
+    torch.manual_seed(682)
+    layer = MoEEpLayer(
+        bootstrap=BootstrapConfig(rank=0, world_size=1, auto_bootstrap=False),
+        fleet_params=FleetParams(
+            num_experts=experts, max_tokens_per_rank=8, token_hidden_size=hidden
+        ),
+        weights=MoEWeightPack(
+            w13=(
+                torch.randn(experts, 2 * intermediate, hidden, device="cuda")
+                / hidden**0.5
+            ).bfloat16(),
+            w2=(
+                torch.randn(experts, hidden, intermediate, device="cuda")
+                / intermediate**0.5
+            ).bfloat16(),
+        ),
+        backend=MegaConfig(
+            megakernel=Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(intermediate, topk),
+            quantize_input=not prequantized,
+        ),
+    )
+    x = torch.randn(live, hidden, device="cuda", dtype=torch.bfloat16)
+    x_input, scales = quantize_nvfp4_block16(x) if prequantized else (x, None)
+    ids = torch.arange(live * topk, device="cuda").reshape(live, topk)
+    scores = torch.full((live, topk), 1 / topk, device="cuda")
+    captures, inputs = {}, []
+    names = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+    try:
+        for stride in (2, 1, 0):
+            output = (
+                torch.empty(live * hidden + 8, dtype=x.dtype, device=x.device)[
+                    8:
+                ].view_as(x)
+                if prequantized
+                else torch.empty_like(x)
+            )
+            if prequantized:
+                assert output.data_ptr() % 32 == 16
+            tensors = MoEEpTensors(x_input, ids, scores, scales=scales, output=output)
+            if stride:
+                for name, value in zip(names, (0.5, 1.5, 0.75), strict=True):
+                    setattr(
+                        tensors,
+                        name,
+                        torch.full((experts * stride,), value, device="cuda")[::stride],
+                    )
+            layer.forward(tensors)
+            torch.cuda.synchronize()
+            expected = output.clone()
+            assert expected.float().norm().item() > 0
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                layer.forward(tensors)
+            captures[stride] = (graph, output, expected)
+            inputs.append(tensors)
+        # Copies from a strided override and unrelated buffer writes must not
+        # change the scalar values baked into the default or bound graph.
+        for index in (2, 1, 0, 0, 2, 0):
+            for name in names:
+                getattr(layer._workspace, name).fill_(7)
+            graph, output, expected = captures[index]
+            graph.replay()
+            torch.cuda.synchronize()
+            error = (output.float() - expected.float()).norm() / expected.float().norm()
+            assert error.item() < 0.02
+    finally:
+        for graph, _, _ in captures.values():
+            graph.reset()
+        layer.destroy()
+
+
+def _run_case(kind, capacity, topk, knobs, num_experts=8):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_mega_moe_inputs as stage_mx,
     )
@@ -22,16 +110,17 @@ def _run_case(kind, capacity, topk, knobs):
         intermediate = 256
     torch.manual_seed(1973)
     w13 = (
-        torch.randn(8, 2 * intermediate, hidden, device="cuda") / hidden**0.5
+        torch.randn(num_experts, 2 * intermediate, hidden, device="cuda") / hidden**0.5
     ).bfloat16()
     w2 = (
-        torch.randn(8, hidden, intermediate, device="cuda") / intermediate**0.5
+        torch.randn(num_experts, hidden, intermediate, device="cuda")
+        / intermediate**0.5
     ).bfloat16()
     weights = pkg.preprocess_block_scaled_weights(
         w13, w2, quant_kind=kind, intermediate_size=intermediate
     )
     ws = pkg.get_symm_buffer_for_sm107_block_scaled_mega_moe(
-        8,
+        num_experts,
         capacity,
         topk,
         hidden,
@@ -48,7 +137,7 @@ def _run_case(kind, capacity, topk, knobs):
                 torch.arange(capacity * topk, device="cuda", dtype=torch.int32).view(
                     capacity, topk
                 )
-                % 8
+                % num_experts
             )
             if iteration:
                 ids[::3, 0] = -1
@@ -291,6 +380,7 @@ def test_caller_output_rebinds_live_rows_in_graph(
         def unexpected_compile(*args, **kwargs):
             pytest.fail("Changing the output must reuse the warmed kernel")
 
+        original_compile = cute.compile
         monkeypatch.setattr(cute, "compile", unexpected_compile)
         for live, layout in (
             (1, "contiguous"),
@@ -317,6 +407,7 @@ def test_caller_output_rebinds_live_rows_in_graph(
                 run(x[:live], ids[:live], scores[:live], y)
             captures.append((graph, live, y))
 
+        monkeypatch.setattr(cute, "compile", original_compile)
         for graph, live, y in reversed(captures):
             graph.replay()
             torch.cuda.synchronize()
@@ -332,3 +423,29 @@ def test_caller_output_rebinds_live_rows_in_graph(
         for graph, _, _ in captures:
             graph.reset()
         ws.destroy()
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp4_mxfp8"])
+@pytest.mark.parametrize(
+    "activation,tanh_sigmoid,warpgroups",
+    [("situ", False, 1), ("situ", True, 1), ("situ", True, 2), ("swiglu", True, 2)],
+)
+@pytest.mark.parametrize("early", [False, True])
+def test_activation_execution_options(
+    monkeypatch, kind, activation, tanh_sigmoid, warpgroups, early
+):
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    _run_case(
+        kind,
+        65,
+        3,
+        dict(
+            activation=activation,
+            situ_beta=4.0 if activation == "situ" else None,
+            situ_linear_beta=25.0 if activation == "situ" else None,
+            use_tanh_sigmoid=tanh_sigmoid,
+            epilogue_warpgroups=warpgroups,
+            fc2_use_bulk=True,
+            apply_routing_weights_before_fc2=early,
+        ),
+    )

@@ -678,7 +678,18 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert prepared.program_name == "exactfused_bf16_varlen"
     assert prepared.preprocess_grid == (0, 1, 1)
     assert prepared.workspace_key == module._WorkspaceKey(
-        None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, True, False, "never"
+        None,
+        1,
+        seqlen,
+        3,
+        3,
+        num_seqs,
+        torch.bfloat16,
+        False,
+        True,
+        False,
+        False,
+        "never",
     )
     assert loads == [("exactfused_bf16_varlen", arch)]
     assert runner._workspaces.get(prepared.workspace_key).prepared
@@ -727,7 +738,18 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert launch["main"]["seq_chunk_cumsum"] is table
     assert (
         module._WorkspaceKey(
-            None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, False, True, "never"
+            None,
+            1,
+            seqlen,
+            3,
+            3,
+            num_seqs,
+            torch.bfloat16,
+            False,
+            False,
+            True,
+            False,
+            "never",
         )
         in runner._workspaces
     )
@@ -1197,16 +1219,28 @@ def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
             assert runner._allocations_in_last_run == 0
         program = module._PROGRAMS[name]
         assert program.family == family, (arch, form, name)
-        # SM107's one-launch program takes the prologue form of its grid.
-        table_form = (
-            module.exactone_table_variant(
-                capability=module._ARCH_CAPABILITIES[arch],
-                variant="",
-                state_dtype=torch.bfloat16,
-                grid=grid,
-            )
-            if family == "exactone"
-            else ""
+        # SM107's one-launch program takes the prologue form of its grid,
+        # and its one-CTA-cluster twin where ``unit_cluster_variant`` admits
+        # the call (here the two-kernel ``exactpre`` program of the
+        # publishing form: 16 items).
+        table_form = module.unit_cluster_variant(
+            capability=module._ARCH_CAPABILITIES[arch],
+            family=family,
+            variant=(
+                module.exactone_table_variant(
+                    capability=module._ARCH_CAPABILITIES[arch],
+                    variant="",
+                    state_dtype=torch.bfloat16,
+                    grid=grid,
+                )
+                if family == "exactone"
+                else ""
+            ),
+            state_dtype=torch.bfloat16,
+            mode_varlen=True,
+            num_sequences=num_seqs,
+            nheads=8,
+            total_tokens=seqlen,
         )
         assert program.variant == table_form and program.cluster_dims == (1, 1, 1)
         assert not name.endswith("_tail")
@@ -1295,7 +1329,7 @@ def test_prepare_resolves_the_shape_without_launching_without_gpu(monkeypatch):
     assert prepared == module.PreparedSSDCombined(
         program_name="chunkpar_bf16_batched",
         workspace_key=module._WorkspaceKey(
-            None, 1, 256, 2, 2, 1, torch.bfloat16, False, False, False, "always"
+            None, 1, 256, 2, 2, 1, torch.bfloat16, False, False, False, False, "always"
         ),
         grid=(16, 1, 1),
         preprocess_grid=(2, 1, 1),
@@ -1505,7 +1539,16 @@ def test_public_prepare_delegates_to_the_cake_runner_without_gpu():
         "num_seqs",
         "cu_seqlens",
         "out",
+        "final_states",
+        "initial_state_slots",
+        "final_state_slots",
+        "initial_state_flags",
+        "null_slot_id",
+        "checkpoint_token_indices",
+        "checkpoint_state_slots",
+        "checkpoint_states",
     }
+    assert kwargs["null_slot_id"] == -1
     runner._backend = "cute"
     with pytest.raises(NotImplementedError, match="backend='cake'"):
         runner.prepare(x=x, dt=dt, A=A, B=B, C=C)

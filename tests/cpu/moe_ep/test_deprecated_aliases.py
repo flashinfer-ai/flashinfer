@@ -1,15 +1,4 @@
-"""Deprecated pre-taxonomy name coverage (no CUDA, no comms).
-
-The taxonomy rename (kernel/config names of the form
-``sm<arch>_<act>_<weight>_<out>_<style>``) kept the old spellings alive for
-external callers such as the vLLM integration patch, via two mechanisms:
-
-- registry aliases: ``register_mega_kernel(..., deprecated_aliases=...)``
-  resolves the old kernel_name and emits a DeprecationWarning on use;
-- config class aliases in ``flashinfer.moe_ep.__init__``.
-
-These tests pin both down so a re-sync or refactor can't silently drop them.
-"""
+"""Retained config aliases and backend-name deprecations, without CUDA."""
 
 from __future__ import annotations
 
@@ -54,10 +43,14 @@ ALIAS_ROWS = [
 ]
 
 IDS = [row[0] for row in ALIAS_ROWS]
+REMOVED_KERNEL_ALIASES = ("nvfp4_cutedsl", "mxfp8_cutedsl")
+REGISTRY_ALIAS_ROWS = [
+    row for row in ALIAS_ROWS if row[0] not in REMOVED_KERNEL_ALIASES
+]
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(("alias", "canonical", "_old", "_new"), ALIAS_ROWS, ids=IDS)
+@pytest.mark.parametrize(("alias", "canonical", "_old", "_new"), REGISTRY_ALIAS_ROWS)
 def test_registry_alias_resolves_to_canonical_backend(
     alias: str, canonical: str, _old: str, _new: str
 ) -> None:
@@ -69,7 +62,7 @@ def test_registry_alias_resolves_to_canonical_backend(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(("alias", "canonical", "_old", "_new"), ALIAS_ROWS, ids=IDS)
+@pytest.mark.parametrize(("alias", "canonical", "_old", "_new"), REGISTRY_ALIAS_ROWS)
 def test_registry_alias_warns_deprecation(
     alias: str, canonical: str, _old: str, _new: str
 ) -> None:
@@ -92,9 +85,12 @@ def test_canonical_name_does_not_warn(
 @pytest.mark.cpu_only
 def test_available_mega_kernels_hides_aliases() -> None:
     available = registry._available_mega_kernels()
-    for alias, canonical, _old, _new in ALIAS_ROWS:
+    for alias, canonical, _old, _new in REGISTRY_ALIAS_ROWS:
         assert canonical in available
         assert alias not in available
+    for alias in REMOVED_KERNEL_ALIASES:
+        assert alias not in registry._MEGA_KERNEL_REGISTRY
+        assert alias not in registry._MEGA_KERNEL_DEPRECATED_ALIASES
 
 
 @pytest.mark.cpu_only
@@ -106,7 +102,7 @@ def test_config_class_alias_is_same_class(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(("alias", "_canonical", "old", "_new"), ALIAS_ROWS, ids=IDS)
+@pytest.mark.parametrize(("alias", "_canonical", "old", "_new"), REGISTRY_ALIAS_ROWS)
 def test_alias_config_is_mega_kernel_config(
     alias: str, _canonical: str, old: str, _new: str
 ) -> None:

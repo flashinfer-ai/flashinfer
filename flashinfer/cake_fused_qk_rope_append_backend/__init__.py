@@ -25,7 +25,8 @@ The submit path allocates nothing on the device, never synchronises the host
 and is CUDA-graph capturable: every launch argument is a by-value scalar or a
 tensor pointer, and the stage (the generated build) is selected from the
 architecture, the SM count and the problem shape only, so a captured graph
-replays the same build.
+replays the same build.  ``enable_pdl`` selects the stage's pdl build (launched
+with programmatic dependent launch) where ``PDL_POLICY`` admits the problem.
 """
 
 from __future__ import annotations
@@ -41,10 +42,12 @@ from .cake_jit import (
     HEAD_DIM,
     KNOB_KEYS,
     MODULES,
+    PDL_POLICY,
     STAGE_POLICY,
     SUPPORTED_HEADS,
     arch_for_capability,
     clear_units_per_request,
+    pdl_enabled,
     stage_for,
     stages_for,
 )
@@ -115,6 +118,7 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
     out_k: Optional[torch.Tensor] = None,
     out_v: Optional[torch.Tensor] = None,
     clear_unused_last_page_rows: bool = True,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Body of :func:`flashinfer.cake_fused_qk_rope_append.cake_fused_qk_rmsnorm_rope_append_paged_kv_cache`."""
     _check(qk_norm_policy in (0, 1, 2), "qk_norm_policy must be 0, 1 or 2")
@@ -226,6 +230,7 @@ def cake_fused_qk_rmsnorm_rope_append_paged_kv_cache(
         page_size=page_size,
         num_sms=_loader.sm_count(device_index),
         qk_norm_policy=int(qk_norm_policy),
+        enable_pdl=bool(enable_pdl),
     )
     plan = _loader.launch_plan(
         MODULES[stage],
@@ -260,6 +265,7 @@ __all__ = [
     "HEAD_DIM",
     "KNOB_KEYS",
     "MODULES",
+    "PDL_POLICY",
     "STAGE_POLICY",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "SUPPORTED_HEADS",
@@ -267,6 +273,7 @@ __all__ = [
     "cake_fused_qk_rmsnorm_rope_append_paged_kv_cache",
     "clear_units_per_request",
     "launch_plan",
+    "pdl_enabled",
     "stage_for",
     "stages_for",
 ]

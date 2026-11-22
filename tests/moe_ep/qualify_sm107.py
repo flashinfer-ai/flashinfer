@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 SUITES = {
     "host": [
+        "tests/moe_ep/test_provider_package.py",
         "tests/moe_ep/test_sm107_block_scaled_config.py",
         "tests/moe_ep/test_sm107_block_scaled_contracts.py",
         "tests/moe_ep/test_sm107_runtime_options.py",
@@ -42,6 +43,7 @@ SUITES = {
     "multi": [
         "tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py",
         "tests/moe_ep/test_sm107_routing_graph_multirank.py",
+        "tests/moe_ep/test_sm107_shared_expert.py",
     ],
 }
 
@@ -113,9 +115,7 @@ def _worker(args):
         ]
         os.chdir(output)
     import flashinfer
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        require_sm107_dsl,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import require_sm107_dsl
 
     package_file = Path(flashinfer.__file__).resolve()
     if args.installed_package and ROOT in package_file.parents:

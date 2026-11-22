@@ -8,14 +8,14 @@ from ......core.validation.common import MoEEpConfigError
 from ......weights import MoEWeightPack
 
 if TYPE_CHECKING:
-    from ......kernel_src.sm90.push_style_megamoe import Sm90PushWeights
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import Sm90PushWeights
 
     TransformedMegaWeights: TypeAlias = Sm90PushWeights
 
 
 def __getattr__(name: str) -> object:
     if name == "TransformedMegaWeights":
-        from ......kernel_src.sm90.push_style_megamoe import Sm90PushWeights
+        from flashinfer.moe_ep.shims.sm90.push_style_megamoe import Sm90PushWeights
 
         return Sm90PushWeights
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -31,7 +31,7 @@ def validate_transformed_mega_weights(
 ) -> None:
     import torch
 
-    from ......kernel_src.sm90.push_style_megamoe import Sm90PushWeights
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import Sm90PushWeights
 
     if not isinstance(transformed_weights, Sm90PushWeights):
         raise MoEEpConfigError(
@@ -97,7 +97,7 @@ def preprocess_mega_weights(
 ) -> Any:
     import torch
 
-    from ......kernel_src.sm90.push_style_megamoe import make_sm90_push_weights
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import make_sm90_push_weights
 
     if not isinstance(weights, MoEWeightPack):
         raise MoEEpConfigError(

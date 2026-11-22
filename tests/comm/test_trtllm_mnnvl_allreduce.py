@@ -17,11 +17,11 @@ from flashinfer.utils import get_compute_capability
 from flashinfer.norm import rmsnorm
 
 # Test helpers
-from tests.test_helpers.comm import (
+from tests.comm.test_helpers.comm import (
     _get_rank_info_from_env,
     init_torch_distributed_from_mpi,
 )
-from tests.test_helpers.utils_fp4 import (
+from tests.quantization.test_helpers.utils_fp4 import (
     cast_from_fp4,
     recover_swizzled_scales,
     ref_fp4_quant,

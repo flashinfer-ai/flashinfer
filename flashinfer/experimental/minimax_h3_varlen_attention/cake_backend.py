@@ -2396,7 +2396,8 @@ _THREAD_SIDE_STREAMS = threading.local()
 def _new_side_streams(device: torch.device) -> tuple:
     """``(high, low, e0, e1, e2, e3, ffi_device)``: a greatest-priority and a
     least-priority stream on ``device``, four events and the device's FFI
-    handle (the launches name the side streams by their raw handles)."""
+    handle (the BF16 tail grid names the side streams by their raw handles;
+    the NVFP4 schedules enter them as the current torch stream)."""
     least, greatest = torch.cuda.Stream.priority_range()
     return (
         torch.cuda.Stream(device=device, priority=greatest),
@@ -2601,18 +2602,25 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
     the same attribute towards the preceding ``amax`` stage (its Q/K/V loads
     overlap the partial-max kernel's tail; the fold of the partials waits),
     and ``quantize_early_qk`` also quantizes and stores Q and K before that
-    wait.  This is safe because the first launch of a call (``amax`` for fp8,
-    the quantizer, ``quantize`` or ``quantize_tp``, for fp4) carries no such
-    attribute: it starts only after all earlier work on the stream, the
-    previous call's attention and ``combine`` included, has finished.  All
-    launches are enqueued on the current torch stream in order, which is all
-    the handshakes require from the host.
+    wait.  On a one-stream plan this is safe because the first launch of a
+    call (``amax`` for fp8, the quantizer, ``quantize`` or ``quantize_tp``,
+    for fp4) carries no such attribute: it starts only after all earlier work
+    on the stream, the previous call's attention and ``combine`` included,
+    has finished.  All launches of a one-stream plan are enqueued on the
+    current torch stream in order, which is all the handshakes require from
+    the host.
 
     A plan on a two-launch schedule (:class:`ScheduledTileTables`, ``"tfs"``
     / ``"ptg"``, see ``NVFP4_TFS_ARCHES``) launches on the runner's two side
     streams: ``launch()`` forks from the current stream, runs the schedule and
     makes the current stream wait for it (stream capture follows the fork and
-    the join).  ``quantize()`` and ``attention()`` stay one-stream: the whole
+    the join).  The first launch on S1 (``amax`` or the quantizer) carries no
+    such attribute.  The first launch on S2 (QZ(B) of an fp8 tail-first plan,
+    L2 of a tail-grid plan) carries it and is safe through the cross-stream
+    event wait in front of it: S2 waits for the event recorded on S1 after
+    the quantizer (TFS: QZ(A)), so the launch starts only after that work,
+    and its ``griddepcontrol.wait`` still precedes its dependent reads.
+    ``quantize()`` and ``attention()`` stay one-stream: the whole
     quantizer, then the bound attention program over all of the plan's
     records.
     """
@@ -2676,42 +2684,46 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
             self._run(None)
         return self.out
 
+    # The launches enter S1 / S2 as the current torch stream, the stream the
+    # bound launches take, so QZ(B) runs beside the attention tail (TFS) and
+    # L2 beside L1 (PTG).
+
     def _launch_tfs(self) -> None:
-        s1, s2, fork, quantized_a, quantized_b, done, ffi = self._side
+        s1, s2, fork, quantized_a, quantized_b, done, _ = self._side
         amax, qz_a, att_tail, qz_b, att_bulk = self._parts
         caller = torch.cuda.current_stream(self.out.device)
         fork.record(caller)
         s1.wait_event(fork)
-        with tvm_ffi.use_raw_stream(ffi, s1.cuda_stream):
+        with torch.cuda.stream(s1), tvm_ffi.use_torch_stream():
             if amax is not None:
                 amax[0](*amax[1])
             qz_a[0](*qz_a[1])
             quantized_a.record(s1)
             att_tail[0](*att_tail[1])
         s2.wait_event(quantized_a)
-        with tvm_ffi.use_raw_stream(ffi, s2.cuda_stream):
+        with torch.cuda.stream(s2), tvm_ffi.use_torch_stream():
             qz_b[0](*qz_b[1])
         quantized_b.record(s2)
         s1.wait_event(quantized_b)
-        with tvm_ffi.use_raw_stream(ffi, s1.cuda_stream):
+        with torch.cuda.stream(s1), tvm_ffi.use_torch_stream():
             att_bulk[0](*att_bulk[1])
         done.record(s1)
         caller.wait_event(done)
 
     def _launch_ptg(self) -> None:
-        s1, s2, fork, quantized, done_1, done_2, ffi = self._side
+        s1, s2, fork, quantized, done_1, done_2, _ = self._side
         amax, qz, launch_1, launch_2 = self._parts
         caller = torch.cuda.current_stream(self.out.device)
         fork.record(caller)
         s1.wait_event(fork)
-        with tvm_ffi.use_raw_stream(ffi, s1.cuda_stream):
+        with torch.cuda.stream(s1), tvm_ffi.use_torch_stream():
             if amax is not None:
                 amax[0](*amax[1])
             qz[0](*qz[1])
             quantized.record(s1)
             launch_1[0](*launch_1[1])
         s2.wait_event(quantized)
-        with tvm_ffi.use_raw_stream(ffi, s2.cuda_stream):
+        with torch.cuda.stream(s2), tvm_ffi.use_torch_stream():
             launch_2[0](*launch_2[1])
         done_1.record(s1)
         done_2.record(s2)

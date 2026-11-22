@@ -19,8 +19,10 @@ with per-variant SASS equivalence checks against the generated originals.
   it loads the manifest, so the record name `<domain>_<schedule>_<12 hex>`
   is load-bearing for the resolver key. `domain` is its first token,
   `source_schedule` is `flashinfer.cake_gdn.generated.<domain>:<schedule>`,
-  `tma_abi` is `grid_constant` for prefill and `pointer` for decode,
-  `host_binding.entry` is `run_<name>`, and the record-level
+  `tma_abi` is `grid_constant` for prefill and `pointer` for decode
+  (a decode record whose kernel takes its state as a tensor map spells
+  `"tma_abi": "grid_constant"`, and only such a record uses the TMA-state
+  host template), `host_binding.entry` is `run_<name>`, and the record-level
   `architectures` is the sorted union of its outputs' `architectures`. An
   entry that spells one of these out must agree with the derived value; the
   loader refuses a disagreeing entry.
@@ -225,6 +227,77 @@ exported for `sm_107a` only; SM100a/SM103a keep `splitv8` at every count.  The
 host launches `B * HV` times the CTAs per state head of the resolved record
 (`cake_gdn_fp32_t1_ctas_per_state`, keyed by the record's schedule), and each
 shim checks that grid.
+
+The K-major (nontranspose) fp32-state T=1 row (`gated_delta_rule_decode`,
+H=16 / HV=32) follows the batch size on SM107a
+(`cake_gdn_nontranspose_fp32_t1_route`): `mid4_rc_kq128` below 10 rows and,
+from 10 rows on (the upper small band 10-31, which formerly ran
+`mid4_rc_kq128`, and the whole large band, which formerly ran `tilev32_x2` for
+32-36 and `hqsplit` from 37), `gdn_decode_nontranspose_fp32_t1_hqsplit_tma3`:
+the `hqsplit` statements and
+accumulation order (bitwise-identical output and state) with each 32-wide V
+panel of the state loaded and stored by TMA through a three-stage ring of
+128-byte-swizzled shared-memory panels (51328 bytes of dynamic shared memory,
+above the 48 KiB default, so the shim opts in once per device). Its kernel
+takes the state as a `const __grid_constant__ CUtensorMap`, so its records
+spell `"tma_abi": "grid_constant"` and launch through
+`host/templates/decode_fp32_t1_tma_state.cc.in`, which checks the state as
+the pointer template does (FP32, contiguous `[B, HV, 128, 128]`) plus a
+16-byte aligned base address, and passes the 4D map (V, K, HV, B; box
+32 x 128 x 1 x 1). The map is a function of the state's base address, batch
+and head count alone, so each host thread keeps the maps it encoded in a
+64-slot table keyed by (device, address, B, HV) and encodes only on a miss; a
+hit passes the bytes a fresh encode returns. The map is a by-value kernel
+parameter: a CUDA graph captures it with the launch, so a replay addresses the
+state tensor the capture saw, exactly as the pointer ABI's captured pointer
+does; a different state tensor needs its own capture (or the eager path, which
+looks the map up per call). The TMA-state records cover
+H=16 / HV=32 only; the H=4 / HV=8 trace row keeps `mid4_rc_kq128` in the
+upper small band. The H=16 / HV=32 B=28 row at scale 1.0 also keeps
+`mid4_rc_kq128` (`hqsplit_tma3` ran it at 0.996x on a 216-SM R200; the same
+row at scale K^-0.5 takes `hqsplit_tma3`). SM100a/SM103a keep the shipped
+bodies. On every architecture the public nontranspose decode keeps the kernel
+entry and grid it resolved per (device, B, H, HK, HV, scale, l2norm)
+(`gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES`) after the per-call checks, so an
+eager call resolves its route and loads its module only on the first call of
+a row.
+
+On a dual-die SM107a GPU the `hqsplit_tma3` row also has a locality-domain
+twin, `gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain` (H=16 / HV=32, both
+scales, `sm_107a` only). It runs only on a state that
+`flashinfer.gdn_decode.localize_gdn_decode_state` homed: one allocation whose
+batch rows `[0, rows0)` are memory of die 0 and the rest memory of die 1. The
+twin is one launch over both dies. Each CTA claims (batch row, value head)
+items from its own die's rows first (its die comes from the SM table), then
+from the other die's, and runs each item as the whole body's CTA does, so the
+output and the state are the whole body's bit for bit for any `rows0` and any
+grid. Its kernel takes the whole body's arguments, the batch size, `rows0`,
+one int32 claim counter per die (zero before a launch, left zero by it) and
+the 256-word SM table by value. Its records launch through
+`host/templates/cake_decode_fp32_t1_tma_state_domain.cc.in`, which adds those
+checks to the TMA-state template's and launches the requested grid
+(`1 .. B * HV`) capped by the resident CTAs of the kernel (an occupancy query
+after the dynamic shared-memory opt-in; 4 CTAs per SM if the query fails).
+`CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES` lists the cells by architecture
+and SM count, die class (even when the dies' SM counts differ by at most 4)
+and batch class: on 212-SM devices both die classes from B = 48 on, where the
+twin on a homed state was faster through the public call, timed in CUDA graphs
+with the L2 flushed by a read before each replay. Below B = 48 it was timed at
+B = 32, 34, 36, 37, 40, 44 and 47 (at scale 1.0, 34, 36, 40 and 44 on one
+board only). Up to B = 44 it was not faster at most timed batches, in CUDA
+graphs (read flush before each replay) or in back-to-back eager calls (no
+flush between calls); at B = 47 it was faster, which the B = 48 bound gives
+up, so the `B32-47` class lists no cell. The public nontranspose decode runs
+the twin only for a state that is the whole homed allocation on a device with
+an SM table, in a listed cell; it keeps those launches in
+`gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`, keyed by the row, the
+dies' SM counts and the die cut, and every other call runs the launch it runs
+without the twin. The first call on a homed allocation binds it to its launch
+(`_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES`, by the allocation's homing record),
+so later calls on it make no SM table query and no launch lookup; an eager
+twin launch reuses the claim counter pair that `cake_locality.launch_counters`
+gave its thread and stream, and a captured one takes its pair from
+`launch_counters`.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)
