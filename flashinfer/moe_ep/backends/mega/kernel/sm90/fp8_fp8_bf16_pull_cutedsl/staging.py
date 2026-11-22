@@ -16,7 +16,7 @@ def _fp8_data_dtype(kind: str) -> torch.dtype:
     # Backend talks only to the pull_style_cutedsl_megakernel shim (never src/
     # directly); the package import also bootstraps sys.path for the kernel
     # packages.
-    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import kind_data_dtype
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import kind_data_dtype
 
     return kind_data_dtype(kind)
 
@@ -82,7 +82,7 @@ def stage_mega_moe_inputs(
 
     if fp8_scale_mode == "blockwise":
         # Backend talks only to the pull_style_cutedsl_megakernel shim boundary.
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
             Fp8BlockScaleK,
             quantize_fp8_per_token_block,
         )
@@ -190,7 +190,7 @@ def validate_sm90_fp8_forward_inputs(
         )
     if blockwise:
         # Backend talks only to the pull_style_cutedsl_megakernel shim boundary.
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import Fp8BlockScaleK
+        from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import Fp8BlockScaleK
 
         sf_cols = hidden // Fp8BlockScaleK
         if scales.dtype != torch.float32:
@@ -198,7 +198,7 @@ def validate_sm90_fp8_forward_inputs(
                 f"blockwise scales must have dtype torch.float32, got {scales.dtype}"
             )
     else:
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
             Fp8E8M0SfVecSize,
             ceil_div,
         )

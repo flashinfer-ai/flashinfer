@@ -286,6 +286,17 @@ def _cake_gdn_assert_state_slots(
     )
 
 
+def _cake_gdn_strides_keep_alignment(tensor: torch.Tensor, align: int) -> bool:
+    """Whether each stride of a dimension longer than 1 (all but the unit inner one) is
+    a whole number of ``align``-byte vectors."""
+
+    item = tensor.element_size()
+    return all(
+        extent == 1 or stride * item % align == 0
+        for extent, stride in zip(tensor.shape[:-1], tensor.stride()[:-1], strict=True)
+    )
+
+
 def _run_cake_gdn_decode_pretranspose(
     *,
     q: torch.Tensor,
@@ -304,7 +315,13 @@ def _run_cake_gdn_decode_pretranspose(
     intermediate_states_buffer: Optional[torch.Tensor],
     disable_state_update: bool,
 ) -> torch.Tensor:
-    """Launch one exact manifest-backed GDN non-CP decode row or fail closed."""
+    """Launch one exact manifest-backed GDN non-CP decode row or fail closed.
+
+    After the contract checks and before the row resolves, a row-independent
+    alignment check raises ``ValueError`` for a misaligned q, k, v, output, state or
+    checkpoint base, and ``CakeGDNUnsupportedError`` for q, k, v or state strides that
+    break the kernels' vector alignment.
+    """
 
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
         raise RuntimeError("the source-only Cake GDN backend is not installed")
@@ -431,6 +448,46 @@ def _run_cake_gdn_decode_pretranspose(
         cache_steps = int(intermediate_states_buffer.shape[1])
     else:
         cache_steps = 0
+    # Contiguous views may still start at an unaligned storage offset. The kernels this
+    # path launches (each row and architecture) read q and k in up to 16-byte vectors on
+    # the BF16-state rows (8-byte on the FP32-state rows), read v and write the output
+    # in 8-byte vectors on some rows, and move the state and the checkpoint buffer in
+    # up to 16-byte copies (cp.async, uint4 or float4), so such a view would fault
+    # asynchronously; they read a, b, A_log, dt_bias and the slot indices one element at
+    # a time, so their element alignment is enough. The check is deliberately
+    # row-independent: it runs before the row resolves. ValueError, not
+    # CakeGDNUnsupportedError: the FlashInfer kernels that backend="auto" falls back to
+    # assume 16-byte (FP32 state) or 32-byte (BF16 state) aligned q, k, v, output and
+    # state and refuse a misaligned base at launch.
+    qk_align = 16 if state_pool.dtype == torch.bfloat16 else 8
+    if (
+        (q.data_ptr() | k.data_ptr()) % qk_align
+        or (v.data_ptr() | output.data_ptr()) % 8
+        or state_pool.data_ptr() % 16
+        or (
+            intermediate_states_buffer is not None
+            and intermediate_states_buffer.data_ptr() % 16
+        )
+    ):
+        raise ValueError(
+            f"GDN non-CP pretranspose decode requires {qk_align}-byte aligned q and k, "
+            "8-byte aligned v and output, and 16-byte aligned initial_state and "
+            "intermediate_states_buffer"
+        )
+    # Strided q/k/v views and a padded pool add their strides to those vector addresses.
+    # A stride that breaks the alignment is a layout these kernels do not serve; the
+    # FlashInfer kernels accept such strides (as runtime strides or by compiling for
+    # them), so backend="auto" falls back.
+    if not (
+        _cake_gdn_strides_keep_alignment(q, qk_align)
+        and _cake_gdn_strides_keep_alignment(k, qk_align)
+        and _cake_gdn_strides_keep_alignment(v, 8)
+        and _cake_gdn_strides_keep_alignment(state_pool, 16)
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP pretranspose decode requires q, k, v and state strides that "
+            "keep their vector alignment"
+        )
     pool_size = int(state_pool.shape[0])
     _cake_gdn_assert_state_slots(
         initial_state_indices,
@@ -573,10 +630,17 @@ _CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES: dict[int, tuple] = {}
 # The twin's claim counter pairs of this thread's eager launches, by (device index, raw
 # stream handle): the pair ``cake_locality.launch_counters`` returned for that stream,
 # as tvm-ffi tensors (``_cake_gdn_launch_arg``), reused by later eager launches on it
-# without that call.  That is the reuse ``launch_counters`` makes itself: launches on
-# one stream are ordered, and each launch leaves its pair zero.  Never used under CUDA
-# graph capture.  At most ``cake_locality.STREAM_PAIR_LIMIT`` pairs per thread; past it
-# they are dropped.
+# without that call.  Never used under CUDA graph capture.  At most
+# ``cake_locality.STREAM_PAIR_LIMIT`` pairs per thread; past it they are dropped.
+#
+# The reuse is the one ``launch_counters`` makes itself: launches on one stream are
+# ordered, and each launch leaves its pair zero.  Per thread because the handles 0, 1
+# and 2 can name another stream in each thread (``launch_counters`` keys those per
+# thread too); for any other handle every thread memoizes the one pair
+# ``launch_counters`` keeps for that stream (or one it has since dropped, still used on
+# that stream only).  As for ``launch_counters``, a stream wrapped by
+# ``torch.cuda.ExternalStream`` must not be destroyed while launches on it are in
+# flight.
 _CAKE_GDN_DOMAIN_PAIRS = threading.local()
 # Devices on which a captured twin launch took a pair of the capture reserve since the
 # last eager twin launch through ``cake_locality.launch_counters``: the next eager twin
@@ -789,7 +853,8 @@ def _run_cake_gdn_decode_nontranspose(
     Runs on every eager decode call, so the checks compare the device index, dtype
     identity and shapes directly (no ``torch.device`` built per tensor) and the launch
     comes from ``_CAKE_GDN_NONTRANSPOSE_LAUNCHES``; the checks, their order, the error
-    types and the messages are those of the resolver path.
+    types and the messages are those of the resolver path, followed by one check that
+    path did not have: the row-independent alignment check (``ValueError``).
     """
 
     if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
@@ -863,6 +928,19 @@ def _run_cake_gdn_decode_nontranspose(
     ):
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP nontranspose decode requires exact contiguous T=1 tensors"
+        )
+    # Contiguous views may still start at an unaligned storage offset. Every kernel this
+    # path launches (each row and architecture, and the twin) reads q and k in 8-byte
+    # vectors and the state in 16-byte copies (cp.async, float4 or TMA), so such a view
+    # would fault asynchronously; it reads and writes v, a, b, A_log, dt_bias and the
+    # output one element at a time, so their element alignment is enough.
+    # The check is deliberately row-independent: it runs before the row resolves.
+    # ValueError, not CakeGDNUnsupportedError: the FlashInfer kernel that
+    # backend="auto" falls back to assumes 16-byte aligned q, k, v, output and state.
+    if (q.data_ptr() | k.data_ptr()) % 8 or state.data_ptr() % 16:
+        raise ValueError(
+            "GDN non-CP nontranspose decode requires 8-byte aligned q and k and a "
+            "16-byte aligned state"
         )
     num_k_heads = k.shape[2]
     key = (
@@ -1041,8 +1119,9 @@ def gated_delta_rule_decode_pretranspose(
         ``auto`` selects GDN non-CP only for an exact frozen manifest row and
         otherwise uses the existing FlashInfer implementation; on Rubin
         (compute capability 10.7) its T=1 bf16-state calls with
-        ``B * HV >= 512`` use the Rubin-tuned kernel, which gives the same
-        bits as the generic kernel there. ``flashinfer`` always uses the
+        ``B * HV >= 512`` and state slot, head and row strides that are
+        multiples of 8 elements use the Rubin-tuned kernel, which gives the
+        same bits as the generic kernel there. ``flashinfer`` always uses the
         generic FlashInfer kernels. Explicit ``cake_gdn`` requests fail
         closed when the contract is unsupported. ``rubin`` forces the
         Rubin-tuned T=1 kernel and raises ``ValueError`` on other GPUs or
@@ -1080,7 +1159,9 @@ def gated_delta_rule_decode_pretranspose(
       MTP for T>1); the pool+indices path routes through the MTP kernel.
       On SM107 (Rubin), T=1 with ``B * HV >= 512`` uses the Rubin-tuned
       kernel (``gdn_kernels/gdn_decode_bf16_state_rubin.py``) under
-      ``backend="auto"``. With a pool from :func:`ugpu_state_pool` every
+      ``backend="auto"`` when the state's slot, head and row strides are
+      multiples of 8 elements (the Rubin kernel cannot be built for other
+      strides). With a pool from :func:`ugpu_state_pool` every
       T=1 call on Rubin runs each half of every state on its own die (two
       per-die launches on green-context streams). This targets CUDA-graph
       captured decode (capturable after one eager call); eager calls with
@@ -1093,6 +1174,14 @@ def gated_delta_rule_decode_pretranspose(
     - Legacy path (float32 state, T=1): ``K`` and ``V`` must each be
       ``>= 128``, and ``V`` must be a multiple of 8 (the pretranspose tile
       size ``TILE_V``).
+    - GDN non-CP alignment (``initial_state`` pool, ``backend="auto"`` or
+      ``"cake_gdn"``): a call that passes its tensor checks raises
+      ``ValueError`` under both backends, whatever its row, unless q and k
+      start 16-byte aligned (8-byte with a float32 state), v and ``output``
+      8-byte aligned, and ``initial_state`` and ``intermediate_states_buffer``
+      16-byte aligned. q, k, v or ``initial_state`` strides that break that
+      alignment are not served by GDN non-CP: ``auto`` uses the FlashInfer
+      kernel and ``cake_gdn`` raises ``CakeGDNUnsupportedError``.
     """
     # Validate input shapes
     B, T, H, K = q.shape
@@ -1240,11 +1329,15 @@ def gated_delta_rule_decode_pretranspose(
         )
         # Rubin (SM107): the Rubin-tuned T=1 kernel. It keeps the whole state tile in
         # flight with fewer instructions and is bitwise equal to the generic T=1
-        # wide_vec kernel, which the generic dispatcher uses from B * HV >= 512.
+        # wide_vec kernel, which the generic dispatcher uses from B * HV >= 512. It
+        # compiles a strided pool with its strides baked into 16-byte state copies
+        # (cp.async), so it cannot be built unless the pool's slot, head and row strides
+        # are multiples of 8 elements; "auto" keeps the generic kernel otherwise.
         use_rubin = backend == "rubin" or (
             backend == "auto"
             and T == 1
             and B * HV >= 512
+            and all(stride % 8 == 0 for stride in bf16_pool.stride()[:-1])
             and _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE
             and get_compute_capability(q.device) == (10, 7)
         )

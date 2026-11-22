@@ -11,8 +11,10 @@ one class per head dim, ``spec.HEAD_DIMS``).
 
 Q is ``(total_q, Hq, D)`` bf16, K/V caches ``(num_pages, page, Hkv, D)`` (NHD) or ``(num_pages, Hkv, page, D)``
 (HND) bf16, metadata int32 on the device; the output is ``(total_q, Hq, D)`` bf16. The planner runs on
-host copies of the indptr arrays (as FlashInfer's ``plan`` does); ``run`` launches the kernel and, for
-split units, the fixup.
+host copies of the indptr arrays (as FlashInfer's ``plan`` does) and a plan runs with the index offsets it was
+built from: the descriptor table carries every request's query offset, KV length and page-table range, so
+``run_attention`` launches the plan's own ``kv_indptr`` and rejects a differing one (``kv_indices`` is read at
+run time). ``run`` launches the kernel and, for split units, the fixup.
 """
 
 from __future__ import annotations
@@ -375,6 +377,9 @@ class _Planned:
         self.window_left: Optional[int] = None
         self.config: Optional[AttnConfig] = None
         self.page: Optional[int] = None
+        self.causal: bool = True  # the mask mode the table was built for (a class dimension; the kernels are compiled per mode)
+        # the plan's kv_indptr (int32 on the device): the page-table offsets the descriptor table holds; the kernels run with it
+        self.kv_indptr: Optional[torch.Tensor] = None
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
@@ -396,10 +401,17 @@ def plan_attention(
     device=None,
     sm_count: Optional[int] = None,
     ragged: bool = False,
+    *,
+    causal: bool = True,
 ) -> _Planned:
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
-    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer."""
+    holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer. ``causal``: the
+    mask mode, a class dimension (``False``: every token sees its request's whole key range; no window)."""
+    if not causal and window_left >= 0:
+        raise ValueError(
+            "window_left is not a parameter of the non-causal class (the whole key range is visible)"
+        )
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
@@ -428,6 +440,7 @@ def plan_attention(
         swap_max_rows=SWAPS_MAX_ROWS,
         grid=config.grid,
         grid_search=planner_grid_search(device),
+        causal=causal,
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
     desc = torch.tensor(
@@ -488,6 +501,10 @@ def plan_attention(
     planned.window_left = int(window_left)
     planned.config = config
     planned.page = int(page)
+    planned.causal = bool(causal)
+    planned.kv_indptr = kv_indptr.to(
+        device=device, dtype=torch.int32, copy=True
+    ).contiguous()
     return planned
 
 
@@ -503,6 +520,8 @@ def workspace_bytes(
     config: Optional[AttnConfig] = None,
     device=None,
     ragged: bool = False,
+    *,
+    causal: bool = True,
 ) -> int:
     """The float workspace bytes ``plan_attention`` needs for this batch's split-KV partials (0 when the plan has no split
     group); the planner runs on the host, nothing is allocated."""
@@ -529,6 +548,7 @@ def workspace_bytes(
         small_swap=config.small == "swap" and D in SWAPS_DIMS,
         swap_max_rows=SWAPS_MAX_ROWS,
         grid_search=planner_grid_search(device),
+        causal=causal,
     )
     return plan.ws_rows * ws_row(D) * 4
 
@@ -560,6 +580,38 @@ def _output_overlaps_kv(out: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> 
     return False
 
 
+def plan_kv_indptr(planned: _Planned, kv_indptr: torch.Tensor) -> torch.Tensor:
+    """The ``kv_indptr`` a plan runs with. The descriptor table holds every request's page-table offset and page count
+    (``plan.F_KVPTR0`` / ``F_NPAGES``) next to its query offset and KV length, so the kernels take the plan's own snapshot
+    (``plan_attention`` records it); ``kv_indptr`` must be the array the plan was built from. The same storage is accepted as is;
+    another tensor is compared on the device and rejected when it differs, except under CUDA graph capture (no device read), where
+    the snapshot runs as planned. A moved page table needs a new plan; ``kv_indices`` is read at run time."""
+    snap = planned.kv_indptr
+    assert snap is not None, "plan_attention records the plan's kv_indptr"
+    if kv_indptr is snap or (
+        kv_indptr.device == snap.device
+        and kv_indptr.dtype == snap.dtype
+        and kv_indptr.data_ptr() == snap.data_ptr()
+        and kv_indptr.numel() == snap.numel()
+        and kv_indptr.is_contiguous()
+    ):
+        return snap
+    if kv_indptr.numel() != snap.numel():
+        raise ValueError(
+            f"kv_indptr of {kv_indptr.numel()} entries at run_attention over a plan built from {snap.numel()}: the descriptor "
+            "table holds the planned requests' page-table ranges; plan again"
+        )
+    if snap.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        return snap
+    if not torch.equal(kv_indptr.to(device=snap.device, dtype=snap.dtype), snap):
+        raise ValueError(
+            "kv_indptr at run_attention differs from the plan's: the descriptor table holds the requests' page-table offsets and "
+            "page counts, so a plan runs with the kv_indptr it was built from; plan again for a changed page table (kv_indices "
+            "may change between runs, kv_indptr may not)"
+        )
+    return snap
+
+
 def run_attention(
     planned: _Planned,
     q: torch.Tensor,
@@ -574,6 +626,9 @@ def run_attention(
     config: Optional[AttnConfig] = None,
     ragged: bool = False,
 ) -> torch.Tensor:
+    """Launch a plan from ``plan_attention``. ``kv_indptr`` must be the array the plan was built from (``plan_kv_indptr``: the plan
+    runs with its own snapshot; a differing array is rejected, except under CUDA graph capture, where no device compare is possible
+    and the snapshot runs uncompared); ``kv_indices`` is read at run time."""
     total_q, Hq, D = q.shape
     if config is None:
         config = planned.config or default_config(D=D)
@@ -588,6 +643,10 @@ def run_attention(
     if planned.window_left is not None and int(window_left) != planned.window_left:
         raise ValueError(
             f"window_left {window_left} at run_attention over a plan built for window_left {planned.window_left}"
+        )
+    if not planned.causal and int(window_left) >= 0:
+        raise ValueError(
+            "window_left is not a parameter of the non-causal class (the whole key range is visible)"
         )
     if ragged:
         # Packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND.
@@ -656,7 +715,7 @@ def run_attention(
         q,
         k_cache,
         v_cache,
-        kv_indptr,
+        plan_kv_indptr(planned, kv_indptr),
         kv_indices,
         c,
         window_left,
@@ -682,8 +741,9 @@ def _run_attention_validated(
     ragged: bool,
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale. ``enable_pdl``: launch the
-    attention kernel as a programmatic dependent of the preceding kernel (None: the device's default, ``device_support_pdl``)."""
+    """Launch after the public engine or wrapper has checked inputs; ``kv_indptr`` is the plan's snapshot (``plan_kv_indptr``), ``c``
+    the binary32 log2 scale. ``enable_pdl``: launch the attention kernel as a programmatic dependent of the preceding kernel (None:
+    the device's default, ``device_support_pdl``)."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
@@ -717,6 +777,9 @@ def _run_attention_validated(
     assert planned.fold_counters is not None and planned.scratch is not None, (
         "plan_attention must be called with the same (FMHA) config"
     )
+    causal = bool(
+        planned.causal
+    )  # the mask mode: a compile-time constant of every kernel (the causal bodies are untouched)
     n_pad = swaps_n_pad(plan) if (config.small == "swap" and D in SWAPS_DIMS) else 0
     if n_pad:  # every unit has <= 32 live rows: the Swaps-AB kernel (same descriptors, same bits)
         from .swaps.compile import get_compiled_swaps
@@ -728,7 +791,7 @@ def _run_attention_validated(
         pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
         kernel = get_compiled_swaps(
-            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl
+            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl, causal=causal
         )
         kernel(
             q_view,
@@ -739,7 +802,6 @@ def _run_attention_validated(
             planned.groups,
             planned.fold_counters,
             planned.desc,
-            kv_indptr,
             kv_indices,
             float(c),
             float(-c),
@@ -760,7 +822,7 @@ def _run_attention_validated(
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap
+                D, g, page, DEFAULT_RING[D], 1, False, ragged, hwm, cap, causal=causal
             )
         else:
             kernel = get_compiled_attention(
@@ -773,6 +835,7 @@ def _run_attention_validated(
                 ragged,
                 hwm,
                 cap,
+                causal=causal,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
@@ -808,7 +871,7 @@ def _run_attention_validated(
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
         max_rows = max(gr[1] for gr in fx)
-        get_fixup(D, g)(
+        get_fixup(D, g, causal=causal)(
             planned.ws,
             o_view,
             planned.fixup_groups,
@@ -837,8 +900,11 @@ def attention_paged(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     workspace: Optional[torch.Tensor] = None,
+    *,
+    causal: bool = True,
 ) -> torch.Tensor:
-    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned)."""
+    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned, or with ``causal=False`` the
+    non-causal class: every token sees its request's whole key range)."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -855,6 +921,7 @@ def attention_paged(
         config,
         workspace,
         q.device,
+        causal=causal,
     )
     return run_attention(
         planned,

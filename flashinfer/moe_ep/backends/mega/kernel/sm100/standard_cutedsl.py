@@ -1,4 +1,4 @@
-"""Opt-in standard Blackwell inference from the current provider export."""
+"""Blackwell block-scaled inference from the sources-backed provider export."""
 
 from __future__ import annotations
 
@@ -58,6 +58,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             )
         if config.kernel_variant == "genphase":
             self._init_genphase_config()
+        self.supports_live_token_tuning = config.kernel_variant == "genphase"
         if config.knobs not in (None, "auto") and not isinstance(config.knobs, dict):
             raise MoEEpConfigError("knobs must be a dictionary, 'auto', or None.")
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
@@ -76,6 +77,20 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         from .automatic import get_tuned_knobs
 
         return get_tuned_knobs(workspace)
+
+    def live_token_buckets(self, fleet_params):
+        if (
+            self._config.kernel_variant != "genphase"
+            or self._config.knobs is not None
+            or self._genphase_constraints()
+            or not torch.cuda.is_available()
+        ):
+            return []
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            genphase_live_token_buckets,
+        )
+
+        return genphase_live_token_buckets(self._genphase_base_config(fleet_params))
 
     def _finalize_mode(self, fleet):
         """Resolve AUTO for inference; GenPhase requires default finalization."""
@@ -139,7 +154,9 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             return block_scaled_batch_invariant_default_knobs(
                 self._config, "standard", arch=self._arithmetic_arch
             )
-        from .....kernel_src.sm100.cutedsl_megamoe import default_knobs
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+            default_knobs,
+        )
 
         return default_knobs(
             fleet.max_tokens_per_rank,
@@ -154,7 +171,9 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             config = self._genphase_config(fleet)
             self._check_genphase_selection(config)
             return config
-        from .....kernel_src.sm100.next_cutedsl_megamoe import Sm100BlockScaledMoeConfig
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            Sm100BlockScaledMoeConfig,
+        )
 
         k = self._config
         if getattr(k, "batch_invariant", False):
@@ -204,7 +223,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         kind = self._kind()
         wire = getattr(k, "combine_dtype", "bf16")
         knobs = self._default_knobs(fleet)
-        from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
             STANDARD_KNOB_KEYS,
         )
 
@@ -320,7 +339,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         return Sm100BlockScaledMoeConfig(**options)
 
     def preprocess_weights(self, weights, fleet_params):
-        from .....kernel_src.sm100.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             preprocess_block_scaled_weights,
             preprocess_prequantized_block_scaled_weights,
         )
@@ -349,7 +368,9 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     def validate_transformed_weights(
         self, transformed_weights, bootstrap, fleet_params
     ):
-        from .....kernel_src.sm100.next_cutedsl_megamoe import validate_standard_weights
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            validate_standard_weights,
+        )
 
         validate_standard_weights(
             transformed_weights,
@@ -359,7 +380,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
 
     def _allocate_workspace(self, fleet_params):
         """Allocate variant-specific buffers and initialize expert scale tensors."""
-        from .....kernel_src.sm100.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             Sm100BlockScaledSymmBuffer,
             Sm100GenphaseSymmBuffer,
         )
@@ -395,7 +416,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                     elif value is not None:
                         getattr(workspace, name).copy_(value)
 
-        from .....kernel_src.sm100.next_cutedsl_megamoe.shim import comm
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import comm
 
         comm.prepare_local(
             prepare_outputs,
@@ -445,17 +466,15 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         cfg = self._workspace_config(fleet_params)
         return block_scaled_batch_invariant_fingerprint(cfg, arch=self._arithmetic_arch)
 
-    def _legacy_backend(self):
-        from . import mxfp8_mxfp8_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl
-
-        return (
-            nvfp4_nvfp4_bf16_cutedsl
-            if self._kind() == "nvfp4"
-            else mxfp8_mxfp8_bf16_cutedsl
-        )
+    def _staging(self):
+        if self._kind() == "nvfp4":
+            from .nvfp4_nvfp4_bf16_cutedsl import staging
+        else:
+            from .mxfp8_mxfp8_bf16_cutedsl import staging
+        return staging
 
     def validate_forward(self, t, fleet_params, *, quantize_input):
-        staging = self._legacy_backend().staging
+        staging = self._staging()
         if self._kind() == "nvfp4":
             staging.validate_nvfp4_forward_inputs(
                 t.hidden_states,
@@ -500,7 +519,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         n = t.hidden_states.shape[0]
         cfg = workspace.config
         if self._kind() == "nvfp4":
-            self._legacy_backend().staging.validate_fc1_activation_per_token_scale(
+            self._staging().validate_fc1_activation_per_token_scale(
                 t.fc1_activation_per_token_scale,
                 num_tokens=n,
                 enabled=getattr(cfg, "enable_fc1_activation_per_token_scale", False),
@@ -523,7 +542,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             )
             # The shared stager rounds scale columns to four; the native
             # workspace keeps a wider row stride for its TMA alignment.
-            self._legacy_backend().staging.stage_mega_moe_inputs(
+            self._staging().stage_mega_moe_inputs(
                 t.hidden_states,
                 t.topk_weights,
                 t.topk_ids,
@@ -554,7 +573,9 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 workspace.topk_idx[:n].copy_(t.topk_ids)
                 workspace.topk_weights[:n].copy_(t.topk_weights)
             workspace.topk_idx[n:].fill_(-1)
-            from .....kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+                note_staged_tokens,
+            )
 
             note_staged_tokens(workspace.topk_idx, n)
         workspace.note_staged_tokens(n)
@@ -588,6 +609,8 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     def validate_capture_ready(self, workspace, transformed_weights):
         """Require the workspace and any terminal reducer to be warmed up."""
         if workspace._compiled is None:
+            if self._config.kernel_variant == "genphase":
+                raise MoEEpConfigError("Warm up GenPhase before CUDA graph capture")
             raise RuntimeError("Warm up the standard workspace before graph capture.")
         if (
             getattr(workspace.config, "use_custom_finalize", False)
@@ -602,7 +625,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
 
     def compute(self, workspace, transformed_weights, *, output):
         """Launch the prepared MoE and its selected BF16 finalization path."""
-        from .....kernel_src.sm100.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             sm100_block_scaled_mega_launch_thunk,
             sm100_block_scaled_mega_moe,
         )
@@ -652,7 +675,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         return output
 
     def compute_unfinalized(self, workspace, transformed_weights):
-        from .....kernel_src.sm100.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             sm100_block_scaled_mega_launch_thunk,
         )
 
@@ -686,20 +709,20 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         return rows, weights, route_map
 
 
-@register_mega_kernel("sm100_nvfp4_nvfp4_bf16_cutedsl_next")
+@register_mega_kernel("sm100_nvfp4_nvfp4_bf16_cutedsl")
 class StandardNvfp4Backend(_StandardBlockScaledBackend):
     quant_kind = "nvfp4"
 
     @classmethod
     def kernel_name(cls):
-        return "sm100_nvfp4_nvfp4_bf16_cutedsl_next"
+        return "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
-@register_mega_kernel("sm100_mxfp8_mxfp8_bf16_cutedsl_next")
+@register_mega_kernel("sm100_mxfp8_mxfp8_bf16_cutedsl")
 class StandardMxfp8Backend(_StandardBlockScaledBackend):
     @classmethod
     def kernel_name(cls):
-        return "sm100_mxfp8_mxfp8_bf16_cutedsl_next"
+        return "sm100_mxfp8_mxfp8_bf16_cutedsl"
 
 
 @register_mega_kernel("sm100_mxfp8_mxfp4_bf16_cutedsl")
@@ -715,7 +738,7 @@ class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
 
     def _active_clusters(self, cluster_size):
         """Query cached cluster occupancy on the bound EP device."""
-        from .....kernel_src.sm100.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             max_active_clusters,
         )
 

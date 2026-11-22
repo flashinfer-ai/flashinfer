@@ -42,7 +42,7 @@ from flashinfer.moe_ep import (
 from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_rank_major_cuda.weights import (
     preprocess_mega_weights,
 )
-from flashinfer.moe_ep.kernel_src.blackwell_bf16_rank_major.session import (
+from flashinfer.moe_ep.kernels.flashinfer.bf16_rank_major.session import (
     BlackwellBf16RankMajorSession,
 )
 

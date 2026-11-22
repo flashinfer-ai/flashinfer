@@ -428,7 +428,7 @@ import sys
 from flashinfer.batch_invariant import fingerprint
 value = fingerprint('megamoe_bf16', hidden=96, intermediate=128, top_k=3,
                     num_experts=4, arch=sys.argv[1])
-prefix = 'flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe'
+prefix = 'flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification'
 assert not any(name == prefix or name.startswith(prefix + '.') for name in sys.modules)
 print(value)
 """
@@ -448,7 +448,7 @@ def test_autotune_records_the_effective_launch_clamp_receipt(
 ):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         autotune,
         bf16,
         knob_cache,

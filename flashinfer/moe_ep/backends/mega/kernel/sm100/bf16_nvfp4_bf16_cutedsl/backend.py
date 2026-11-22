@@ -114,7 +114,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
 
     supports_live_token_tuning = True
     _knob_cache_module = (
-        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+        "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.knob_cache"
     )
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
@@ -154,7 +154,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......cute_dsl.megamoe.bf16_nvfp4 import (
+        from flashinfer.moe_ep.kernels.flashinfer.bf16_nvfp4 import (
             get_symm_buffer_for_bf16_nvfp4_mega_moe,
         )
 
@@ -377,13 +377,13 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ......cute_dsl.megamoe.bf16_nvfp4 import bf16_nvfp4_mega_moe
+        from flashinfer.moe_ep.kernels.flashinfer.bf16_nvfp4 import bf16_nvfp4_mega_moe
 
         if self.supports_unfinalized_output:
             raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         try:
             if self._autotune_pending:
-                from ......cute_dsl.megamoe.bf16_nvfp4 import (
+                from flashinfer.moe_ep.kernels.flashinfer.bf16_nvfp4 import (
                     autotune_bf16_nvfp4_mega_moe,
                 )
 
@@ -423,7 +423,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from ......cute_dsl.megamoe.bf16_nvfp4 import bf16_nvfp4_mega_moe
+        from flashinfer.moe_ep.kernels.flashinfer.bf16_nvfp4 import bf16_nvfp4_mega_moe
 
         if not self.supports_unfinalized_output:
             raise ValueError("compute_unfinalized() requires finalize_mode=NONE")

@@ -15,29 +15,30 @@ from types import SimpleNamespace
 import pytest
 
 
-_PACKAGE_NAME = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
+_PACKAGE_NAME = "flashinfer.moe_ep.shims.sm90.push_style_megamoe"
 _BACKEND_PACKAGE_NAME = (
     "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda"
 )
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_PACKAGE_PATH = "flashinfer/moe_ep/kernel_src/sm90/push_style_megamoe"
+_PACKAGE_PATH = "flashinfer/moe_ep/shims/sm90/push_style_megamoe"
+_SOURCE_PACKAGE_NAME = "flashinfer.moe_ep.kernels.flashinfer.push_style_megamoe"
+_SOURCE_PACKAGE_PATH = _SOURCE_PACKAGE_NAME.replace(".", "/")
 _CUDA_RESOURCES = (
-    "src/a2a/sm90_push_a2a_ops.cu",
-    "src/a2a/sm90_push_a2a.cuh",
-    "src/fp8_gemm/fp8_moe_binding.cu",
-    "src/fp8_gemm/fp8_moe_fc1_fused.cuh",
-    "src/fp8_gemm/fp8_moe_jit.cuh",
-    "src/fp8_gemm/fp8_moe_launcher.cuh",
-    "src/fp8_gemm/fp8_moe_scheduler.cuh",
+    "a2a/sm90_push_a2a_ops.cu",
+    "a2a/sm90_push_a2a.cuh",
+    "fp8_gemm/fp8_moe_binding.cu",
+    "fp8_gemm/fp8_moe_fc1_fused.cuh",
+    "fp8_gemm/fp8_moe_jit.cuh",
+    "fp8_gemm/fp8_moe_launcher.cuh",
+    "fp8_gemm/fp8_moe_scheduler.cuh",
 )
 _PYTHON_RESOURCES = (
     "__init__.py",
-    "shim/__init__.py",
-    "shim/gemm.py",
-    "shim/jit.py",
-    "shim/protocol.py",
-    "shim/runner.py",
-    "shim/weights.py",
+    "gemm.py",
+    "jit.py",
+    "protocol.py",
+    "runner.py",
+    "weights.py",
 )
 _DOCUMENT_RESOURCES = ("ACKNOWLEDGEMENT.md",)
 
@@ -80,13 +81,13 @@ def test_sm90_push_package_data_contains_cuda_sources():
     if not pyproject_path.is_file():
         pytest.skip("pyproject.toml is only available in source-tree test runs")
     pyproject = pyproject_path.read_text(encoding="utf-8")
-    key = '"flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = ['
+    key = '"flashinfer.moe_ep.kernels.flashinfer.push_style_megamoe" = ['
     package_block = pyproject.split(key, maxsplit=1)[1].split("]", maxsplit=1)[0]
     assert '"*.md"' in package_block
-    assert '"src/a2a/*.cu"' in package_block
-    assert '"src/a2a/*.cuh"' in package_block
-    assert '"src/fp8_gemm/*.cu"' in package_block
-    assert '"src/fp8_gemm/*.cuh"' in package_block
+    assert '"a2a/*.cu"' in package_block
+    assert '"a2a/*.cuh"' in package_block
+    assert '"fp8_gemm/*.cu"' in package_block
+    assert '"fp8_gemm/*.cuh"' in package_block
 
 
 def test_sm90_push_runtime_resources_expose_packaged_cuda_sources():
@@ -96,7 +97,12 @@ def test_sm90_push_runtime_resources_expose_packaged_cuda_sources():
         *_PYTHON_RESOURCES,
         *_DOCUMENT_RESOURCES,
     ):
-        resource = _resource_at(package_root, relative_path)
+        resource_root = (
+            package_root
+            if relative_path.endswith(".py")
+            else resources.files(_SOURCE_PACKAGE_NAME)
+        )
+        resource = _resource_at(resource_root, relative_path)
         assert resource.is_file()
         assert resource.read_text(encoding="utf-8").strip()
 
@@ -113,7 +119,9 @@ def test_sm90_push_prebuilt_wheel_contains_runtime_package():
         members = set(archive.namelist())
 
     required = {
-        f"{_PACKAGE_PATH}/{relative_path}"
+        (_PACKAGE_PATH if relative_path.endswith(".py") else _SOURCE_PACKAGE_PATH)
+        + "/"
+        + relative_path
         for relative_path in (
             *_CUDA_RESOURCES,
             *_PYTHON_RESOURCES,
@@ -127,13 +135,13 @@ def test_sm90_push_prebuilt_wheel_contains_runtime_package():
 
 
 def test_sm90_push_backend_imports_kernel_package_through_public_boundaries():
-    package_marker = "kernel_src.sm90.push_style_megamoe"
+    package_marker = "shims.sm90.push_style_megamoe"
 
     sources = _backend_sources()
     assert sources, f"no Python modules found for {_BACKEND_PACKAGE_NAME}"
     for path in sources:
         source = path.read_text(encoding="utf-8")
-        assert f"{package_marker}.src" not in source
+        assert "kernels.flashinfer.push_style_megamoe" not in source
         tree = ast.parse(source, filename=str(path))
         targets = []
         for node in ast.walk(tree):
@@ -145,7 +153,7 @@ def test_sm90_push_backend_imports_kernel_package_through_public_boundaries():
             if package_marker not in target:
                 continue
             suffix = target.split(package_marker, maxsplit=1)[1]
-            assert suffix in ("", ".shim") or suffix.startswith(".shim."), (
+            assert suffix == "", (
                 f"{path} bypasses the SM90 push package boundary with import {target!r}"
             )
 
@@ -160,7 +168,7 @@ def test_sm90_push_weight_helpers_defer_kernel_package_import():
             "-c",
             "import sys; "
             "import flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda.weights; "
-            "assert 'flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe' "
+            "assert 'flashinfer.moe_ep.shims.sm90.push_style_megamoe' "
             "not in sys.modules",
         ],
         cwd=project_root,
@@ -174,7 +182,7 @@ def test_sm90_push_weight_helpers_defer_kernel_package_import():
 def test_sm90_push_snapshot_is_content_addressed_and_mtime_stable(
     tmp_path, monkeypatch
 ):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import jit
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import jit
 
     captured = []
 
@@ -212,7 +220,7 @@ def test_sm90_push_snapshot_is_content_addressed_and_mtime_stable(
 def test_sm90_push_private_gemm_snapshot_is_complete_and_mtime_stable(
     tmp_path, monkeypatch
 ):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import gemm
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import gemm
 
     captured = []
 
@@ -250,7 +258,7 @@ def test_sm90_push_private_gemm_snapshot_is_complete_and_mtime_stable(
 
 
 def test_sm90_push_private_gemm_requires_cuda_12_8(tmp_path, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import gemm
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import gemm
 
     checked = []
 
@@ -269,7 +277,7 @@ def test_sm90_push_private_gemm_requires_cuda_12_8(tmp_path, monkeypatch):
 
 
 def test_sm90_push_private_gemm_cubin_digest_covers_dependencies():
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import gemm
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import gemm
 
     sources = {name: name.encode() for name in gemm._SOURCE_NAMES}
     dependencies = {name: name.encode() for name in gemm._DEPENDENCY_NAMES}
@@ -287,7 +295,7 @@ def test_sm90_push_private_gemm_cubin_digest_covers_dependencies():
 
 
 def test_sm90_push_private_gemm_module_cache_is_keyed_by_uri(monkeypatch, request):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import gemm
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import gemm
 
     built = []
     current_uri = ["private_gemm_a"]
@@ -324,7 +332,7 @@ def test_sm90_push_private_gemm_module_cache_is_keyed_by_uri(monkeypatch, reques
 
 
 def test_sm90_push_snapshot_replaces_from_unique_sibling_files(tmp_path, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import jit
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import jit
 
     target = tmp_path / "snapshot.cu"
     real_replace = jit.os.replace
@@ -353,7 +361,7 @@ def test_sm90_push_snapshot_replaces_from_unique_sibling_files(tmp_path, monkeyp
 def test_sm90_push_snapshot_permission_error_requires_matching_target(
     tmp_path, monkeypatch, matching_target
 ):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import jit
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import jit
 
     target = tmp_path / "snapshot.cuh"
     target.write_text("old\n")
@@ -378,7 +386,7 @@ def test_sm90_push_snapshot_permission_error_requires_matching_target(
 
 
 def test_sm90_push_uri_changes_with_cuda_flags():
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import sm90_push_a2a_uri
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import sm90_push_a2a_uri
 
     assert sm90_push_a2a_uri(("-arch=sm_90a",)) != sm90_push_a2a_uri(
         ("-arch=sm_90a", "-lineinfo")
@@ -386,7 +394,7 @@ def test_sm90_push_uri_changes_with_cuda_flags():
 
 
 def test_sm90_push_uri_canonicalizes_crlf_and_lf_sources(tmp_path, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import jit
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import jit
 
     lf_dir = tmp_path / "lf"
     crlf_dir = tmp_path / "crlf"
@@ -406,7 +414,7 @@ def test_sm90_push_uri_canonicalizes_crlf_and_lf_sources(tmp_path, monkeypatch):
 
 
 def test_sm90_push_cuda_source_uses_package_local_header():
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import jit
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import jit
 
     source = (jit._SOURCE_DIR / "sm90_push_a2a_ops.cu").read_text(encoding="utf-8")
     assert '#include "sm90_push_a2a.cuh"' in source
@@ -414,7 +422,7 @@ def test_sm90_push_cuda_source_uses_package_local_header():
 
 
 def test_sm90_push_weights_do_not_depend_on_trace_templates():
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import weights
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import weights
 
     source = Path(weights.__file__).read_text(encoding="utf-8")
     assert "trace.templates" not in source
