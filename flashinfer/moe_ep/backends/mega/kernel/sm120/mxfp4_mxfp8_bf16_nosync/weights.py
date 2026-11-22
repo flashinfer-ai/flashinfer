@@ -102,6 +102,15 @@ def _deepgemm_mn_major(sf: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _deepgemm_scale_strides(
+    hidden: int, intermediate: int
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    return (
+        (2 * intermediate * hidden // 32, 8 * intermediate, 1),
+        (hidden * intermediate // 32, 4 * hidden, 1),
+    )
+
+
 def _checked(weights: MoEWeightPack, hidden: int, intermediate: int, scale_layout: str):
     if scale_layout not in ("kernel", "canonical", "deepgemm"):
         raise ValueError(f"unsupported scale layout {scale_layout!r}")
@@ -133,24 +142,33 @@ def _checked(weights: MoEWeightPack, hidden: int, intermediate: int, scale_layou
     w13, w2 = weights.w13.view(torch.uint8), weights.w2.view(torch.uint8)
     s13, s2 = s13.view(torch.uint8), s2.view(torch.uint8)
     e, h, i = w13.shape[0], hidden, intermediate
-    for name, tensor, shape in (
-        ("w13", w13, (e, 2 * i, h // 2)),
-        ("w2", w2, (e, h, i // 2)),
+    scale_strides = (
+        _deepgemm_scale_strides(h, i) if scale_layout == "deepgemm" else (None, None)
+    )
+    for name, tensor, shape, strides in (
+        ("w13", w13, (e, 2 * i, h // 2), None),
+        ("w2", w2, (e, h, i // 2), None),
         (
             "w13_scale",
             s13,
             (e, h // 128, 8 * i) if scale_layout == "deepgemm" else (e, 2 * i, h // 32),
+            scale_strides[0],
         ),
         (
             "w2_scale",
             s2,
             (e, i // 128, 4 * h) if scale_layout == "deepgemm" else (e, h, i // 32),
+            scale_strides[1],
         ),
     ):
         if tuple(tensor.shape) != shape or not tensor.is_cuda:
             raise ValueError(
                 f"{name} must be a CUDA tensor of shape {shape}, "
                 f"got {tuple(tensor.shape)}"
+            )
+        if strides is not None and tensor.stride() != strides:
+            raise ValueError(
+                f"{name} must have DeepGEMM stride {strides}, got {tensor.stride()}"
             )
     return w13, w2, s13, s2
 
@@ -257,10 +275,7 @@ def validate_transformed_mega_weights(
     scale_shapes: tuple[tuple[int, ...], tuple[int, ...]]
     if transformed.scale_layout == "deepgemm":
         scale_shapes = ((e, h // 128, 8 * i), (e, i // 128, 4 * h))
-        scale_strides = (
-            (2 * i * h // 32, 8 * i, 1),
-            (h * i // 32, 4 * h, 1),
-        )
+        scale_strides = _deepgemm_scale_strides(h, i)
     elif transformed.scale_layout == "canonical":
         scale_shapes = ((e, 2 * i, h // 32), (e, h, i // 32))
         scale_strides = None

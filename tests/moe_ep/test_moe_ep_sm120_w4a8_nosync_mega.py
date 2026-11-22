@@ -528,6 +528,31 @@ def _weight_layout_worker(rank):
                 local_experts=experts // ep,
             )
             if scale_layout == "deepgemm":
+                uint8_scale = transformed.w13_scale
+                checked = preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+                    dataclasses.replace(pack, w13_scale=uint8_scale),
+                    hidden_size=hidden,
+                    intermediate_size=intermediate,
+                    interleave_w13=interleave,
+                    scale_layout=scale_layout,
+                )
+                assert checked.w13_scale.data_ptr() == uint8_scale.data_ptr()
+                invalid_scale = uint8_scale.as_strided(
+                    uint8_scale.shape,
+                    (
+                        uint8_scale.stride(0),
+                        1,
+                        uint8_scale.stride(2),
+                    ),
+                )
+                with pytest.raises(ValueError, match="DeepGEMM stride"):
+                    preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+                        dataclasses.replace(pack, w13_scale=invalid_scale),
+                        hidden_size=hidden,
+                        intermediate_size=intermediate,
+                        interleave_w13=interleave,
+                        scale_layout=scale_layout,
+                    )
                 with pytest.raises(ValueError, match="stride"):
                     validate_transformed_mega_weights(
                         dataclasses.replace(
