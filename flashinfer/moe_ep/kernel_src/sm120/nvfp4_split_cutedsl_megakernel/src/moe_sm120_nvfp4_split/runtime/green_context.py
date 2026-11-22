@@ -8,6 +8,31 @@ from typing import Any, Callable, Optional
 
 import torch
 
+# Diagnostics only (p2p_split): emulate model work between dispatch and compute
+# (MEGAMOE_XNUMA_OVERLAP_US with MODE overlap|serial), or inject per-rank
+# delays before the dispatch and the forwarder (MEGAMOE_XNUMA_JITTER_US).
+_OVERLAP_US = float(os.environ.get("MEGAMOE_XNUMA_OVERLAP_US", "0"))
+_OVERLAP_MODE = os.environ.get("MEGAMOE_XNUMA_OVERLAP_MODE", "overlap")
+JITTER_US = float(os.environ.get("MEGAMOE_XNUMA_JITTER_US", "0"))
+# Diagnostics only: per-launch CUDA-event phase times, printed at close().
+_PHASES = os.environ.get("MEGAMOE_LAUNCH_PHASES", "0") == "1"
+_CYCLES_PER_US = None
+
+
+def spin_us(stream: torch.cuda.Stream, us: float) -> None:
+    """Enqueue a device busy-wait of about ``us`` microseconds on ``stream``."""
+    global _CYCLES_PER_US
+    if us <= 0:
+        return
+    if _CYCLES_PER_US is None:
+        from cuda.bindings import runtime as cudart
+
+        err, khz = cudart.cudaDeviceGetAttribute(
+            cudart.cudaDeviceAttr.cudaDevAttrClockRate, torch.cuda.current_device())
+        _CYCLES_PER_US = (khz / 1000.0) if int(err) == 0 and khz else 2000.0
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(int(us * _CYCLES_PER_US))
+
 
 def _check_cuda(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
     error = result[0]
@@ -369,6 +394,9 @@ class NativeGreenContextGraph:
     _closed: bool = False
     # p2p_split cross-NUMA transport (transport.xnuma.XnumaTransport) or None.
     _xnuma: Optional[Any] = None
+    _compute_ready: Optional[torch.cuda.Event] = None
+    _jitter_rng: Optional[Any] = None
+    _phase_events: Optional[list] = None
 
     @staticmethod
     def _library_kernels(compiled_kernels: tuple[Any, ...]) -> dict[int, Any]:
@@ -753,74 +781,99 @@ class NativeGreenContextGraph:
 
     def _launch_post_graph(self) -> None:
         # Callbacks use the current stream for both eager and outer capture.
+        # The K2 finalizer precedes the p2p_split scatter, which precedes K3.
         if self._post_graph_finalizer is not None:
             self._post_graph_finalizer()
+        if _PHASES and not torch.cuda.is_current_stream_capturing():
+            self._phase_mark()
         if self._xnuma is not None:
             # p2p_split: copy the returned cross-NUMA rows before K3 reads them.
             self._xnuma.before_k3(torch.cuda.current_stream())
+        if _PHASES and not torch.cuda.is_current_stream_capturing():
+            self._phase_mark()
         if self._post_graph_k3 is not None:
             self._post_graph_k3()
+        if _PHASES and not torch.cuda.is_current_stream_capturing():
+            self._phase_mark()
 
-    def launch(self, caller_stream: torch.cuda.Stream) -> None:
-        """Replay, complete K3, then rejoin before the next caller reset."""
+    def _launch_captured(self, caller_stream: torch.cuda.Stream) -> None:
+        """Outer CUDA graph capture: add the compute graph as a child node."""
         from cuda.bindings import driver as cuda
 
         caller_cuda = cuda.CUstream(caller_stream.cuda_stream)
-        if torch.cuda.is_current_stream_capturing():
-            if self._xnuma is not None:
-                # Epoch bump + sender precede the child graph in capture order;
-                # the capture info below then includes them as dependencies.
-                self._xnuma.before_compute(caller_stream)
-            (
-                capture_status,
-                _capture_id,
+        if self._xnuma is not None:
+            # Epoch bump + sender precede the child graph in capture order;
+            # the capture info below then includes them as dependencies.
+            self._xnuma.before_compute(caller_stream)
+        (
+            capture_status,
+            _capture_id,
+            capture_graph,
+            dependencies,
+            _edge_data,
+            num_dependencies,
+        ) = _check_cuda(
+            cuda.cuStreamGetCaptureInfo(caller_cuda),
+            "cuStreamGetCaptureInfo",
+        )
+        if capture_status != cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
+            raise RuntimeError(
+                "the current torch stream reported capture without an active "
+                "CUDA capture graph"
+            )
+        (child_node,) = _check_cuda(
+            cuda.cuGraphAddChildGraphNode(
                 capture_graph,
                 dependencies,
-                _edge_data,
                 num_dependencies,
-            ) = _check_cuda(
-                cuda.cuStreamGetCaptureInfo(caller_cuda),
-                "cuStreamGetCaptureInfo",
-            )
-            if (
-                capture_status
-                != cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE
-            ):
-                raise RuntimeError(
-                    "the current torch stream reported capture without an active "
-                    "CUDA capture graph"
-                )
-            (child_node,) = _check_cuda(
-                cuda.cuGraphAddChildGraphNode(
-                    capture_graph,
-                    dependencies,
-                    num_dependencies,
-                    self._graph,
-                ),
-                "cuGraphAddChildGraphNode",
-            )
-            _check_cuda(
-                cuda.cuStreamUpdateCaptureDependencies(
-                    caller_cuda,
-                    [child_node],
-                    None,
-                    1,
-                    cuda.CUstreamUpdateCaptureDependencies_flags.CU_STREAM_SET_CAPTURE_DEPENDENCIES,
-                ),
-                "cuStreamUpdateCaptureDependencies",
-            )
-            # K3 stays on the primary context after the mixed-context child.
-            # The frontend callback must use the current stream, not a captured
-            # root-stream handle, so outer capture records this dependency.
-            with torch.cuda.stream(caller_stream):
-                self._launch_post_graph()
-            return
+                self._graph,
+            ),
+            "cuGraphAddChildGraphNode",
+        )
+        _check_cuda(
+            cuda.cuStreamUpdateCaptureDependencies(
+                caller_cuda,
+                [child_node],
+                None,
+                1,
+                cuda.CUstreamUpdateCaptureDependencies_flags.CU_STREAM_SET_CAPTURE_DEPENDENCIES,
+            ),
+            "cuStreamUpdateCaptureDependencies",
+        )
+        # K3 stays on the primary context after the mixed-context child.
+        # The frontend callback must use the current stream, not a captured
+        # root-stream handle, so outer capture records this dependency.
+        with torch.cuda.stream(caller_stream):
+            self._launch_post_graph()
 
+    def launch_dispatch(self, caller_stream: torch.cuda.Stream) -> None:
+        """Start the call once the caller's inputs are ready: for p2p_split,
+        the epoch bump and the network sender run on the root stream now, so
+        work the caller enqueues before :meth:`launch_compute` overlaps the
+        transfer."""
         self._launch_ready.record(caller_stream)
         self.root_stream.wait_event(self._launch_ready)
+        if _PHASES:
+            self._phase_mark(start=True)
         if self._xnuma is not None:
             # Epoch bump + sender in stream order before the compute graph.
             self._xnuma.before_compute(self.root_stream)
+        if _PHASES:
+            self._phase_mark()
+
+    def launch_compute(self, caller_stream: torch.cuda.Stream) -> None:
+        """Replay the compute graph after the caller's intervening work, then
+        complete K3 and rejoin the caller before its next reset."""
+        self._launch_compute(caller_stream, after_caller_work=True)
+
+    def _launch_compute(self, caller_stream: torch.cuda.Stream, *, after_caller_work: bool) -> None:
+        from cuda.bindings import driver as cuda
+
+        if after_caller_work:
+            if self._compute_ready is None:
+                self._compute_ready = torch.cuda.Event()
+            self._compute_ready.record(caller_stream)
+            self.root_stream.wait_event(self._compute_ready)
         _check_cuda(
             cuda.cuGraphLaunch(
                 self._graph_exec,
@@ -828,12 +881,66 @@ class NativeGreenContextGraph:
             ),
             "cuGraphLaunch",
         )
+        # Phase marks (diagnostics) follow the finalizer, scatter and K3.
         with torch.cuda.stream(self.root_stream):
             self._launch_post_graph()
         self._launch_done.record(self.root_stream)
         caller_stream.wait_event(self._launch_done)
 
+    def _phase_mark(self, start: bool = False) -> None:
+        if self._phase_events is None:
+            self._phase_events = []
+        if start:
+            self._phase_events.append([])
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(self.root_stream)
+        self._phase_events[-1].append(event)
+
+    def _report_phases(self) -> None:
+        """Median per-phase times over the launches (diagnostics)."""
+        import statistics
+
+        if not self._phase_events:
+            return
+        torch.cuda.synchronize()
+        names = ("dispatch(bump+sender)", "graph(K1+K2)", "scatter", "K3")
+        rows = [[a.elapsed_time(b) * 1000.0 for a, b in zip(ev, ev[1:])]
+                for ev in self._phase_events[len(self._phase_events) // 4:] if len(ev) == 5]
+        if rows:
+            med = [statistics.median(r[i] for r in rows) for i in range(4)]
+            rank = int(self._xnuma.rank) if self._xnuma is not None else -1
+            print(f"[launch phases] rank={rank} n={len(rows)} " + " ".join(
+                f"{n}={v:.1f}us" for n, v in zip(names, med)) + f" sum={sum(med):.1f}us", flush=True)
+        self._phase_events = None
+
+    def launch(self, caller_stream: torch.cuda.Stream) -> None:
+        """Replay, complete K3, then rejoin before the next caller reset."""
+        if torch.cuda.is_current_stream_capturing():
+            self._launch_captured(caller_stream)
+            return
+        if self._xnuma is not None and _OVERLAP_US > 0:
+            if _OVERLAP_MODE == "serial":
+                spin_us(caller_stream, _OVERLAP_US)
+                self.launch_dispatch(caller_stream)
+            else:
+                self.launch_dispatch(caller_stream)
+                spin_us(caller_stream, _OVERLAP_US)
+            self._launch_compute(caller_stream, after_caller_work=True)
+            return
+        if self._xnuma is not None and JITTER_US > 0:
+            if self._jitter_rng is None:
+                import random
+
+                self._jitter_rng = random.Random(1000 + int(self._xnuma.rank))
+            spin_us(caller_stream, self._jitter_rng.uniform(0.0, JITTER_US))
+        self.launch_dispatch(caller_stream)
+        self._launch_compute(caller_stream, after_caller_work=False)
+
     def close(self) -> None:
+        if _PHASES:
+            self._report_phases()
+        if self._xnuma is not None and getattr(self._xnuma, "sender_trace", None) is not None:
+            self._xnuma.report_sender_trace()
         if self._closed:
             return
 

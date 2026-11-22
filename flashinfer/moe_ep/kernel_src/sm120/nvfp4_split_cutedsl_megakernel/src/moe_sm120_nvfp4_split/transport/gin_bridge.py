@@ -26,7 +26,7 @@ def initialize(context, arena_bytes, shadow=None, reserved_bytes=0):
  rank=context.ep_rank;world=context.ep_size
  out=Path(os.environ.get('AUDIT_OUT',str(Path.home()/'.cache/megamoe/gin_logs'/str(os.getpid()))));out.mkdir(parents=True,exist_ok=True)
  hcas=os.environ.get('MEGAMOE_GIN_HCA_MAP','mlx5_3,mlx5_2,mlx5_1,mlx5_0,mlx5_7,mlx5_6,mlx5_5,mlx5_4').split(',')
- os.environ.update(NCCL_IB_HCA='='+hcas[context.local_rank]+':1',NCCL_GIN_TYPE='3',NCCL_GIN_ENABLE='1' if network else '0',NCCL_IB_MERGE_NICS='0',NCCL_GIN_GDAKI_NIC_HANDLER='2',NCCL_GIN_GDAKI_QP_DEPTH='1024',NCCL_P2P_DISABLE='0',NCCL_NVLS_ENABLE='0',NCCL_DEBUG='INFO',NCCL_DEBUG_SUBSYS='INIT,NET,REG',NCCL_DEBUG_FILE=str(out/f'gin_rank{rank}.log'))
+ os.environ.update(NCCL_IB_HCA='='+hcas[context.local_rank]+':1',NCCL_GIN_TYPE='3',NCCL_GIN_ENABLE='1' if network else '0',NCCL_IB_MERGE_NICS='0',NCCL_GIN_GDAKI_NIC_HANDLER=os.environ.get('MEGAMOE_GIN_NIC_HANDLER','2'),NCCL_GIN_GDAKI_QP_DEPTH='1024',NCCL_P2P_DISABLE='0',NCCL_NVLS_ENABLE='0',NCCL_DEBUG='INFO',NCCL_DEBUG_SUBSYS='INIT,NET,REG',NCCL_DEBUG_FILE=str(out/f'gin_rank{rank}.log'))
  library=validate_artifacts();HOST=C.CDLL(str(ROOT/'gin_host.so'));V=C.c_void_p;I=C.c_int;U=C.c_ulonglong
  HOST.eq_set_library.argtypes=[C.c_char_p];HOST.eq_set_library.restype=I;check(HOST.eq_set_library(str(library).encode()))
  HOST.eq_error.restype=C.c_char_p;HOST.eq_version.argtypes=[C.POINTER(I)];HOST.eq_unique_id.argtypes=[V]

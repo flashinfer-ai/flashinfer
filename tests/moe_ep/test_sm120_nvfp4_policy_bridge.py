@@ -145,12 +145,29 @@ def test_ep8_frontend_skips_p2p_split_anchors(monkeypatch):
     assert (k.k1_ctas_per_sm, k.k2_launch_factor) == (1, 1)
 
 
+def _peer(host, numa_node):
+    return SimpleNamespace(
+        host=host, numa_node=numa_node, p2p_domain=(host, numa_node)
+    )
+
+
 def _ep8_topology():
-    peers = tuple(SimpleNamespace(numa_node=0 if r < 4 else 1) for r in range(8))
+    peers = tuple(_peer("h0", 0 if r < 4 else 1) for r in range(8))
     return SimpleNamespace(
         same_numa_peer_count=3,
         cross_numa_peer_count=4,
         force_ibgda_peer_mask=0b11110000,
+        peers=peers,
+    )
+
+
+def _ep16_two_host_topology():
+    # Two hosts of 2 x 4 GPUs; PCI and NUMA numbers repeat across hosts.
+    peers = tuple(_peer(f"h{r // 8}", (r % 8) // 4) for r in range(16))
+    return SimpleNamespace(
+        same_numa_peer_count=3,
+        cross_numa_peer_count=12,
+        force_ibgda_peer_mask=0xFFF0,
         peers=peers,
     )
 
@@ -187,6 +204,48 @@ def test_ep8_p2p_split_bucket_plan(monkeypatch):
         same_numa_peer_count=3, cross_numa_peer_count=0, force_ibgda_peer_mask=0
     )
     assert not runtime.plan_p2p_split_buckets(config(), ep4, buckets)
+
+
+def test_ep16_two_host_p2p_split_bucket_plan(monkeypatch):
+    """The other host's GPUs are cross peers: EP16 over two hosts shadows them
+    like a cross-NUMA EP8, following the EP16 anchors."""
+    bootstrap_paths()
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+    from moe_sm120_nvfp4_split.runtime import green_context
+    from moe_sm120_nvfp4_split.transport.shadow import ShadowLayout
+
+    monkeypatch.setattr(green_context, "query_sm_resource_info", lambda: (110, 8, 8))
+    monkeypatch.delenv(runtime.P2P_SPLIT_MAX_TOKENS_ENV, raising=False)
+    topology = _ep16_two_host_topology()
+    assert ShadowLayout.from_topology(topology, 0).num_cross == 12
+    config = runtime.MegaMoESm120Nvfp4Config(
+        0, 16, 512, 6, 384, 5120, 2304, gate_up_clamp=10.0
+    )
+    assert runtime.plan_p2p_split_buckets(
+        config, topology, [*runtime.DECODE_GRAPH_COMPILE_BUCKETS, 512]
+    ) == set(runtime.DECODE_GRAPH_COMPILE_BUCKETS)
+
+
+@pytest.mark.parametrize(
+    "selected, override, expected",
+    [([4, 4, 4, 2], None, 4), ([2, 4], None, 4), ([2, 2, 4], None, 2), ([], None, 2),
+     ([4, 4], "1", 1)],
+)
+def test_one_xnuma_fsplit_per_workspace(monkeypatch, selected, override, expected):
+    """p2p_split buckets share cumulative commit words, so a workspace runs one
+    forwarder split: the majority selection, ties to the larger value."""
+    bootstrap_paths()
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+        runtime,
+    )
+
+    if override is None:
+        monkeypatch.delenv("MEGAMOE_XNUMA_FSPLIT", raising=False)
+    else:
+        monkeypatch.setenv("MEGAMOE_XNUMA_FSPLIT", override)
+    assert runtime._uniform_xnuma_fsplit(selected) == expected
 
 
 def test_ep8_p2p_split_bucket_uses_folded_selection(monkeypatch):

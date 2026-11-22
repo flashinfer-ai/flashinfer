@@ -9,6 +9,86 @@
     6,
     384
    ],
+   "topology": "ep16_2x2numa",
+   "protocol": {
+    "timing": "pr_timing",
+    "cold_l2": true,
+    "warmup": 20,
+    "rounds": 100,
+    "seed": 9341,
+    "route": "balanced",
+    "min_gain": 0.005,
+    "backends": [
+     "p2p_split"
+    ]
+   },
+   "entries": [
+    {
+     "tokens": 16,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_n": 32,
+      "k2_n": 64,
+      "k2_tail_reclaim": "off",
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 689.1,
+     "default_us": 739.0
+    },
+    {
+     "tokens": 32,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_n": 32,
+      "k2_n": 64,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 743.8,
+     "default_us": 786.6
+    },
+    {
+     "tokens": 64,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k2_launch_factor": 1,
+      "k1_stages": 3,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 806.6,
+     "default_us": 832.1
+    },
+    {
+     "tokens": 128,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_ctas_per_sm": 2,
+      "k2_stages": 3
+     },
+     "p50_us": 906.8,
+     "default_us": 969.9
+    },
+    {
+     "tokens": 256,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 1219.2,
+     "default_us": 1396.5
+    }
+   ]
+  },
+  {
+   "model": "dsv41",
+   "signature": [
+    5120,
+    4608,
+    6,
+    384
+   ],
    "topology": "ep4_1numa",
    "protocol": {
     "timing": "pr_timing",
@@ -27,7 +107,8 @@
      "tokens": 16,
      "knobs": {
       "k1_ctas_per_sm": 2,
-      "k2_stages": 3
+      "k2_stages": 3,
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 1236.4,
      "default_us": 1259.5
@@ -41,7 +122,8 @@
     {
      "tokens": 64,
      "knobs": {
-      "k1_ctas_per_sm": 2
+      "k1_ctas_per_sm": 2,
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 1724.4,
      "default_us": 1738.8
@@ -49,7 +131,8 @@
     {
      "tokens": 128,
      "knobs": {
-      "k1_ctas_per_sm": 2
+      "k1_ctas_per_sm": 2,
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 1746.1,
      "default_us": 1758.3
@@ -71,7 +154,8 @@
        0,
        0,
        46
-      ]
+      ],
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 2456.6,
      "default_us": 2495.7
@@ -81,7 +165,8 @@
      "knobs": {
       "k1_n": 128,
       "k1_stages": 2,
-      "k2_stages": 3
+      "k2_stages": 3,
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 4089.3,
      "default_us": 4362.8
@@ -153,7 +238,9 @@
      "tokens": 16,
      "knobs": {
       "backend": "p2p_split",
-      "k2_n": 64
+      "k2_n": 64,
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4
      },
      "p50_us": 1029.7,
      "default_us": 1128.3
@@ -163,7 +250,9 @@
      "knobs": {
       "backend": "p2p_split",
       "k1_n": 64,
-      "k2_n": 64
+      "k2_n": 64,
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4
      },
      "p50_us": 1241.7,
      "default_us": 1282.6
@@ -173,7 +262,9 @@
      "knobs": {
       "backend": "p2p_split",
       "k1_n": 64,
-      "k2_n": 64
+      "k2_n": 64,
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4
      },
      "p50_us": 1309.7,
      "default_us": 1351.8
@@ -183,7 +274,9 @@
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
-      "fc1_utility_postprocess": "on"
+      "fc1_utility_postprocess": "on",
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4
      },
      "p50_us": 1339.9,
      "default_us": 1393.2
@@ -193,7 +286,8 @@
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
-      "k1_stages": 3
+      "k1_stages": 3,
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 1986.5,
      "default_us": 2274.8
@@ -218,7 +312,8 @@
        0,
        30
       ],
-      "dispatch_rank_cache": "on"
+      "dispatch_rank_cache": "on",
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 5783.2,
      "default_us": 6600.4
@@ -234,7 +329,8 @@
        0,
        30
       ],
-      "dispatch_rank_cache": "on"
+      "dispatch_rank_cache": "on",
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 9979.5,
      "default_us": 11991.2
@@ -294,6 +390,101 @@
     8,
     288
    ],
+   "topology": "ep16_2x2numa",
+   "protocol": {
+    "timing": "pr_timing",
+    "cold_l2": true,
+    "warmup": 20,
+    "rounds": 100,
+    "seed": 9341,
+    "route": "balanced",
+    "min_gain": 0.005,
+    "backends": [
+     "p2p_split"
+    ]
+   },
+   "entries": [
+    {
+     "tokens": 16,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ],
+      "fc1_utility_postprocess": "on",
+      "dispatch_rank_cache": "on"
+     },
+     "p50_us": 443.6,
+     "default_us": 481.3
+    },
+    {
+     "tokens": 32,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "weight_prefetch_ahead": 4
+     },
+     "p50_us": 495.6,
+     "default_us": 504.3
+    },
+    {
+     "tokens": 64,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_ctas_per_sm": 2,
+      "sms": [
+       64,
+       0,
+       0,
+       46
+      ],
+      "xnuma_fsplit": 4
+     },
+     "p50_us": 565.2,
+     "default_us": 609.2
+    },
+    {
+     "tokens": 128,
+     "knobs": {
+      "backend": "p2p_split",
+      "k1_n": 64,
+      "k1_stages": 4
+     },
+     "p50_us": 656.8,
+     "default_us": 740.4
+    },
+    {
+     "tokens": 256,
+     "knobs": {
+      "backend": "p2p_split",
+      "k2_n": 64,
+      "k1_stages": 3,
+      "sms": [
+       72,
+       0,
+       0,
+       38
+      ]
+     },
+     "p50_us": 984.1,
+     "default_us": 1064.5
+    }
+   ]
+  },
+  {
+   "model": "glm53",
+   "signature": [
+    4096,
+    4096,
+    8,
+    288
+   ],
    "topology": "ep4_1numa",
    "protocol": {
     "timing": "pr_timing",
@@ -340,7 +531,9 @@
     },
     {
      "tokens": 512,
-     "knobs": {},
+     "knobs": {
+      "weight_prefetch_ahead": 4
+     },
      "p50_us": 1150.0,
      "default_us": 1150.0
     },
@@ -352,7 +545,9 @@
     },
     {
      "tokens": 2048,
-     "knobs": {},
+     "knobs": {
+      "weight_prefetch_ahead": 8
+     },
      "p50_us": 3935.2,
      "default_us": 3935.2
     },
@@ -422,7 +617,8 @@
      "knobs": {
       "backend": "p2p_split",
       "k2_n": 64,
-      "fc1_utility_postprocess": "on"
+      "fc1_utility_postprocess": "on",
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 657.3,
      "default_us": 707.6
@@ -431,7 +627,9 @@
      "tokens": 32,
      "knobs": {
       "backend": "p2p_split",
-      "k2_n": 64
+      "k2_n": 64,
+      "weight_prefetch_ahead": 4,
+      "xnuma_fsplit": 4
      },
      "p50_us": 690.1,
      "default_us": 733.8
@@ -448,7 +646,8 @@
        0,
        38
       ],
-      "fc1_utility_postprocess": "on"
+      "fc1_utility_postprocess": "on",
+      "xnuma_fsplit": 4
      },
      "p50_us": 686.3,
      "default_us": 765.4
@@ -465,7 +664,8 @@
        0,
        0,
        38
-      ]
+      ],
+      "xnuma_fsplit": 4
      },
      "p50_us": 785.3,
      "default_us": 942.6
@@ -501,7 +701,8 @@
        0,
        38
       ],
-      "dispatch_rank_cache": "on"
+      "dispatch_rank_cache": "on",
+      "xnuma_fsplit": 4
      },
      "p50_us": 5353.2,
      "default_us": 5733.4
@@ -512,7 +713,8 @@
       "backend": "p2p_split",
       "k1_stages": 3,
       "k2_stages": 3,
-      "dispatch_rank_cache": "on"
+      "dispatch_rank_cache": "on",
+      "xnuma_fsplit": 4
      },
      "p50_us": 10325.5,
      "default_us": 11064.0
@@ -523,7 +725,8 @@
       "backend": "p2p_split",
       "k1_stages": 3,
       "k2_stages": 3,
-      "dispatch_rank_cache": "on"
+      "dispatch_rank_cache": "on",
+      "xnuma_fsplit": 4
      },
      "p50_us": 20090.4,
      "default_us": 21295.0
@@ -552,7 +755,8 @@
      "tokens": 20480,
      "knobs": {
       "backend": "gin_hybrid",
-      "k2_launch_factor": 1
+      "k2_launch_factor": 1,
+      "weight_prefetch_ahead": 4
      },
      "p50_us": 42815.7,
      "default_us": 43150.8

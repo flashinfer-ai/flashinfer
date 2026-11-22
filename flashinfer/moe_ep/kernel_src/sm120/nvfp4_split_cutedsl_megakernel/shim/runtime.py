@@ -289,6 +289,8 @@ class MegaMoESm120Nvfp4Workspace:
     )
     _xnuma_region: Any = None
     _xnuma_epoch: Any = None
+    # Forwarder CTAs per cross source, one value for every p2p_split bucket.
+    _xnuma_fsplit: int = 2
     _destroyed: bool = False
 
     def _has_prepared_frontend(self, transformed_weights, output: torch.Tensor) -> bool:
@@ -623,6 +625,7 @@ class MegaMoESm120Nvfp4Frontend:
                 f"dispatch_warps={kernel.dispatch_warps} "
                 f"k1_ctas_per_sm={kernel.k1_ctas_per_sm} "
                 f"k2_launch_factor={kernel.k2_launch_factor} "
+                f"prefetch_ahead={kernel.weight_prefetch_ahead} "
                 f"backend={'p2p_split' if self._is_p2p_split(bucket) else kernel.comm_backend} "
                 f"green={kernel.k1_sms}/{kernel.k2_sms}",
                 flush=True,
@@ -658,6 +661,7 @@ class MegaMoESm120Nvfp4Frontend:
         workspace, cfg, bucket = self.workspace, self.config, self.compile_bucket
         region = workspace._xnuma_region
         layout = XnumaLayout(
+            fsplit=workspace._xnuma_fsplit,
             world=cfg.world_size,
             n_cross=region.n_cross,
             experts_per_rank=cfg.local_experts,
@@ -1184,6 +1188,7 @@ def allocate_workspace(
         size * config.hidden * 2,
     ]
     split_shared_bytes = {}
+    split_fsplits: list[int] = []
     for bucket in buckets:
         frontend = MegaMoESm120Nvfp4Frontend(
             planned, compile_bucket=bucket, control_group=control_group
@@ -1197,6 +1202,7 @@ def allocate_workspace(
             spec, bundle = frontend._ensure_plan(bucket)
         if bucket in split_buckets:
             split_shared_bytes[bucket] = bundle.shared_workspace_bytes
+            split_fsplits.append(spec.kernel.xnuma_fsplit)
         sizes += [
             bundle.shared_workspace_bytes,
             bucket * config.num_topk * config.hidden * 2,
@@ -1215,9 +1221,11 @@ def allocate_workspace(
         from moe_sm120_nvfp4_split.transport.xnuma_layout import XnumaLayout
 
         shadow = ShadowLayout.from_topology(topology, config.rank)
+        xnuma_fsplit = _uniform_xnuma_fsplit(split_fsplits)
         # One control-region placement for every p2p_split bucket: commit
         # words are cumulative signal-adds keyed by address.
         region = XnumaLayout(
+            fsplit=xnuma_fsplit,
             world=config.world_size,
             n_cross=shadow.num_cross,
             experts_per_rank=config.local_experts,
@@ -1314,8 +1322,25 @@ def allocate_workspace(
             if split_buckets
             else None
         ),
+        _xnuma_fsplit=xnuma_fsplit if split_buckets else 2,
     )
     return workspace
+
+
+def _uniform_xnuma_fsplit(selected: list[int]) -> int:
+    """One forwarder split for all p2p_split buckets of a workspace.
+
+    The buckets share one epoch and cumulative commit words, and the scatter
+    waits for ``fsplit * epoch`` commits, so every call must commit the same
+    number of forwarder CTAs. Take the value most buckets selected (ties: the
+    larger); ``MEGAMOE_XNUMA_FSPLIT`` overrides it (diagnostics).
+    """
+    override = os.environ.get("MEGAMOE_XNUMA_FSPLIT")
+    if override is not None:
+        return int(override)
+    if not selected:
+        return 2
+    return max(set(selected), key=lambda value: (selected.count(value), value))
 
 
 def _frontend_graph_cache_key(transformed_weights, output, bucket):

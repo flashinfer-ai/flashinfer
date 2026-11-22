@@ -47,6 +47,7 @@ from .sm120_mma import (
     partition_fragment_sfb_for_sm120_mma,
 )
 from .sm120_ptx_helpers import (
+    prefetch_global_l2,
     clamp_gate_upper_f32,
     clamp_symmetric_f32,
     lds_b32_raw,
@@ -2663,6 +2664,18 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                     peek_ab_empty_status = a_producer.try_acquire()
 
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        # Optional weight L2 prefetch: two 128 B lines per lane, `ahead` K tiles
+                        # ahead, every second tile (compiled out when weight_prefetch_ahead=0).
+                        if cutlass.const_expr(getattr(self, "weight_prefetch_ahead", 0) > 0):
+                            if (k_tile % 2 == 0) and (k_tile + getattr(self, "weight_prefetch_ahead", 0) < k_tile_cnt):
+                                for prefetch_half in cutlass.range_constexpr(2):
+                                    prefetch_row = mma_tile_m * self.mma_tiler[0] + cute.arch.lane_idx() + prefetch_half * 32
+                                    if prefetch_row < fc1_weight_gemm.shape[0]:
+                                        prefetch_ptr = cute.domain_offset(
+                                            (prefetch_row, (k_tile + getattr(self, "weight_prefetch_ahead", 0)) * self.mma_tiler[2], work_tile_info.expert_idx),
+                                            fc1_weight_gemm,
+                                        ).iterator
+                                        prefetch_global_l2(prefetch_ptr.toint())
                         handle = a_producer.acquire_and_advance(
                             peek_ab_empty_status
                         )

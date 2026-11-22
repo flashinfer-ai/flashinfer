@@ -13,6 +13,9 @@ Topologies (110-SM SM120, DP1/TP1, 8-SM partition granularity):
 * ``ep8_2numa``: EP8 as 2 x 4 GPUs on two NUMA nodes. An entry's ``backend``
   is ``p2p_split`` (LSA + cross-NUMA shadow transport) or ``gin_hybrid``;
   its knobs are valid only for that backend.
+* ``ep16_2x2numa``: EP16 over two hosts of 2 x 4 GPUs (P2P only inside a
+  NUMA node, every other peer through GIN). Not tabulated yet; the backend
+  rule below applies.
 
 Knobs are the runner flags the tuner measured on top of the built-in
 selection. The heuristic applies them as overrides (explicit caller overrides
@@ -42,6 +45,10 @@ def _load() -> dict:
     return data
 
 
+# (EP size, same-domain peers, network peers) of the real NUMA-split layouts.
+_SPLIT_LAYOUTS = {8: ("ep8_2numa", 3, 4), 16: ("ep16_2x2numa", 3, 12)}
+
+
 def topology_of(shape) -> Optional[str]:
     """Topology key of a heuristic input, or None if no table can apply."""
     if (shape.data_parallel_size, shape.tensor_parallel_size, shape.num_sms,
@@ -49,18 +56,24 @@ def topology_of(shape) -> Optional[str]:
         return None
     ep, same, cross = (shape.expert_parallel_size, shape.ep_same_numa_peer_count,
                        shape.ep_cross_numa_peer_count)
-    # p2p_split folds the cross-NUMA peers into one P2P group (the runner
-    # passes 7 same-NUMA / 0 cross peers for EP8); that view is the split mode.
-    split = getattr(shape, "ep_numa_split", None)
-    if split is None:
-        split = ep == 8 and (same, cross) == (7, 0)
-    if ep == 4 and (same, cross) == (3, 0) and not split:
+    if ep == 4 and (same, cross) == (3, 0) and not getattr(shape, "ep_numa_split", False):
         return "ep4_1numa"
-    if ep == 8 and (same, cross) == (3, 4) and not split:
-        return "ep8_2numa"
-    if ep == 8 and (same, cross) == (7, 0) and split:
-        return "ep8_2numa"
+    if ep in _SPLIT_LAYOUTS:
+        name, real_same, real_cross = _SPLIT_LAYOUTS[ep]
+        # p2p_split folds the network peers into one P2P group (the runner
+        # passes ep-1 same-domain / 0 network peers); that view is the split mode.
+        split = getattr(shape, "ep_numa_split", None)
+        if split is None:
+            split = (same, cross) == (ep - 1, 0)
+        if (same, cross) == ((ep - 1, 0) if split else (real_same, real_cross)):
+            return name
     return None
+
+
+def _folded(shape) -> bool:
+    ep = shape.expert_parallel_size
+    folded = (shape.ep_same_numa_peer_count, shape.ep_cross_numa_peer_count) == (ep - 1, 0)
+    return getattr(shape, "ep_numa_split", folded)
 
 
 def nearest_entry(signature: Tuple[int, int, int, int], topology: str, tokens: int) -> Optional[dict]:
@@ -82,9 +95,8 @@ def lookup(shape) -> Optional[dict]:
     entry = nearest_entry(signature, topology, shape.tokens_per_rank)
     if entry is None:
         return None
-    if topology == "ep8_2numa":
-        folded = (shape.ep_same_numa_peer_count, shape.ep_cross_numa_peer_count) == (7, 0)
-        want = "p2p_split" if getattr(shape, "ep_numa_split", folded) else "gin_hybrid"
+    if topology != "ep4_1numa":
+        want = "p2p_split" if _folded(shape) else "gin_hybrid"
         if entry["knobs"].get("backend", "gin_hybrid") != want:
             return None  # knobs were tuned for the other backend
     return entry
@@ -99,14 +111,14 @@ SPLIT_MAX_EXPERTS_PER_RANK = 64  # forwarder completion mask is 64-bit
 
 
 def preferred_ep8_backend(shape) -> Optional[str]:
-    """``p2p_split`` / ``gin_hybrid`` for a real 2 x 4 NUMA EP8 shape (cross-NUMA
-    peers not yet folded): the nearest table anchor's backend, else the rule
-    above; None if the topology is not ``ep8_2numa``."""
-    if topology_of(shape) != "ep8_2numa" or (
-            shape.ep_same_numa_peer_count, shape.ep_cross_numa_peer_count) != (3, 4):
+    """``p2p_split`` / ``gin_hybrid`` for a real NUMA-split EP shape (EP8 on
+    2 x 4 GPUs or EP16 on two such hosts, network peers not yet folded): the
+    nearest table anchor's backend, else the rule above; None otherwise."""
+    topology = topology_of(shape)
+    if topology is None or topology == "ep4_1numa" or _folded(shape):
         return None
     signature = (shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts)
-    entry = nearest_entry(signature, "ep8_2numa", shape.tokens_per_rank)
+    entry = nearest_entry(signature, topology, shape.tokens_per_rank)
     if entry is not None:
         return entry["knobs"].get("backend", "gin_hybrid")
     experts_per_rank = shape.num_total_experts // shape.expert_parallel_size
@@ -125,7 +137,7 @@ def overrides_for(knobs: dict) -> dict:
         out["k1_tile"] = (64, int(knobs["k1_n"]), 128)
     if knobs.get("k2_n") is not None:
         out["k2_tile"] = (64, int(knobs["k2_n"]), 128)
-    for key in ("k1_ctas_per_sm", "k2_launch_factor", "k1_stages", "k2_stages", "k2_warps",
+    for key in ("k1_ctas_per_sm", "k2_launch_factor", "weight_prefetch_ahead", "xnuma_fsplit", "k1_stages", "k2_stages", "k2_warps",
                 "dispatch_warps"):
         if knobs.get(key) is not None:
             out[key] = int(knobs[key])

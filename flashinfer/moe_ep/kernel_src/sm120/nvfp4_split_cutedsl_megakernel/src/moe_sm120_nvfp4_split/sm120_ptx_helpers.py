@@ -217,3 +217,19 @@ def utility_load_f32x4(ptr, *, loc=None, ip=None):
         '=f,=f,=f,=f,r,~{memory}', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
     return tuple(Float32(llvm.extractvalue(T.f32(), value, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+@dsl_user_op
+def prefetch_global_l2(addr: Int64, *, loc=None, ip=None) -> None:
+    """Read-only L2 prefetch hint (never a substitute for data readiness)."""
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(loc=loc, ip=ip)],
+        "prefetch.global.L2 [$0];",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )

@@ -69,7 +69,7 @@ def test_rule_full_anchor_guards_all_config_fields():
     rule=policy.GEOMETRY_RULES[0];s=shape(rule['ep'],rule['model'],rule['lo'])
     c=MegaMoEKernelConfig(**dict(rule['anchors'][0],expected_rows_per_expert=s.tokens_per_rank*s.expert_parallel_size*s.num_topk/s.num_total_experts))
     for field,value in asdict(c).items():
-        if field in ('k1_ctas_per_sm','k2_launch_factor'):continue  # validated at construction
+        if field in ('k1_ctas_per_sm','k2_launch_factor','weight_prefetch_ahead','xnuma_fsplit'):continue  # validated at construction
         replacement=(999,999,999) if isinstance(value,tuple) else '__unqualified__' if isinstance(value,str) else 999999
         if isinstance(value,bool):replacement=not value
         altered=replace(c,**{field:replacement})

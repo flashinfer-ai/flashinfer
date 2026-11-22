@@ -45,11 +45,12 @@ class XnumaLayout:
     tokens_per_rank: int
     topk: int
     hidden: int
+    # Forwarder CTAs per cross source (experts split by id modulo fsplit).
     fsplit: int = 2
 
     def __post_init__(self):
-        if self.fsplit not in (1, 2):
-            raise ValueError("fsplit must be 1 or 2")
+        if self.fsplit not in (1, 2, 4):
+            raise ValueError("fsplit must be 1, 2 or 4")
         if self.n_cross <= 0 or self.n_cross >= self.world:
             raise ValueError("xnuma needs 0 < n_cross < world")
         if self.experts_per_rank > 64:

@@ -1033,9 +1033,12 @@ class MegaMoETester(NetworkTransportRuntime):
         replay_term = (
             (replay + 17) * 2862933555777941757
         ) % 9223372036854775783
+        # Python ints must fit int64 before entering the tensor expression
+        # (rank >= 6 overflowed); the tensor products wrap deterministically.
+        rank_term = ((self.rank + 1) * 1442695040888963407) % 9223372036854775783
         mixed = (
             token * route_multiplier
-            + (self.rank + 1) * 1442695040888963407
+            + rank_term
             + replay_term
         )
         strides = torch.tensor(
@@ -1135,6 +1138,7 @@ class MegaMoETester(NetworkTransportRuntime):
             raise RuntimeError("p2p_split needs the per-slot combine (rank_local_combine off)")
         session = gin_bridge.ShadowSession()
         layout = XnumaLayout(
+            fsplit=_xnuma_fsplit(self.kernel_config),
             world=self.world_size,
             n_cross=session.shadow.num_cross,
             experts_per_rank=self.problem.num_experts_per_rank,
@@ -4227,6 +4231,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--k2_launch_factor", type=int, choices=[1, 2], default=None,
         help="Multiply the 8-warp K2 launch grid (2 = two CTAs per K2 SM; K2 tile N <= 32).")
     parser.add_argument(
+        "--weight_prefetch_ahead", type=int, choices=[0, 4, 8], default=None,
+        help="K tiles ahead for the K1/K2 weight-producer L2 prefetch (0 = off).")
+    parser.add_argument(
+        "--xnuma_fsplit", type=int, choices=[1, 2, 4], default=None,
+        help="p2p_split forwarder CTAs per cross source.")
+    parser.add_argument(
         "--k2_ready_queue_bundle",
         type=int,
         default=None,
@@ -4272,6 +4282,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=1234)
     return parser
+
+
+def _xnuma_fsplit(kernel_config) -> int:
+    """Forwarder CTAs per cross source: the selected config, or the
+    MEGAMOE_XNUMA_FSPLIT diagnostic override."""
+    return int(os.environ.get("MEGAMOE_XNUMA_FSPLIT", getattr(kernel_config, "xnuma_fsplit", 2)))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -4396,6 +4412,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         k1_ctas_per_sm=args.k1_ctas_per_sm,
         k1_stages=args.k1_stages,
         k2_launch_factor=args.k2_launch_factor,
+        weight_prefetch_ahead=args.weight_prefetch_ahead,
+        xnuma_fsplit=args.xnuma_fsplit,
         k2_warps=args.k2_warp_count,
         k2_tail_reclaim=(
             args.k2_tail_reclaim == "on"
@@ -4546,6 +4564,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             shadow = ShadowLayout.from_topology(
                 parallel_context.ep_transport_topology, parallel_context.ep_rank)
             split_kwargs = dict(shadow=shadow, reserved_bytes=XnumaLayout(
+                fsplit=_xnuma_fsplit(kernel_config),
                 world=world_size, n_cross=shadow.num_cross,
                 experts_per_rank=args.num_total_experts // world_size,
                 tokens_per_rank=args.num_tokens_per_rank, topk=args.num_topk,
@@ -4585,6 +4604,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "[SM120 split heuristic] "
             f"K1_ctas_per_sm={kernel_config.k1_ctas_per_sm}, "
             f"K2_launch_factor={kernel_config.k2_launch_factor}, "
+            f"prefetch_ahead={kernel_config.weight_prefetch_ahead}, "
             f"K1_stages={kernel_config.k1_stages}, "
             f"rows_per_expert={kernel_config.expected_rows_per_expert:.2f}, "
             f"backend={kernel_config.comm_backend}, "

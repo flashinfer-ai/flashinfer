@@ -13,6 +13,13 @@ class GpuTopologyEntry:
     local_rank: int
     pci_bus_id: str
     numa_node: int
+    # Host identity: PCI bus IDs and NUMA node numbers repeat across hosts, so
+    # a GPU is (host, pci_bus_id) and a P2P domain is (host, numa_node).
+    host: str = ""
+
+    @property
+    def p2p_domain(self) -> Tuple[str, int]:
+        return (self.host, self.numa_node)
 
 
 @dataclass(frozen=True)
@@ -58,11 +65,14 @@ def discover_gpu_topology(local_rank: int, global_rank: int) -> GpuTopologyEntry
             f"CUDA device {local_rank} ({pci_bus_id}) has unknown NUMA node "
             f"{numa_node}; hybrid transport fails closed"
         )
+    import socket
+
     return GpuTopologyEntry(
         global_rank=global_rank,
         local_rank=local_rank,
         pci_bus_id=pci_bus_id,
         numa_node=numa_node,
+        host=socket.gethostname(),
     )
 
 
@@ -91,19 +101,21 @@ def derive_ep_transport_topology(
     ep_size = len(peers)
     if any(not isinstance(peer, GpuTopologyEntry) for peer in peers):
         raise RuntimeError(f"invalid EP topology records: {peers!r}")
-    if len({peer.pci_bus_id for peer in peers}) != ep_size:
+    if len({(peer.host, peer.pci_bus_id) for peer in peers}) != ep_size:
         raise RuntimeError(f"EP ranks do not map to unique GPUs: {peers!r}")
     if not 0 <= ep_rank < ep_size:
         raise RuntimeError(f"EP rank {ep_rank} is outside [0, {ep_size})")
 
-    own_numa = peers[ep_rank].numa_node
+    # Only GPUs on the same host and NUMA node are P2P (LSA) peers; every
+    # other peer, cross-NUMA or on another host, goes through the GIN network.
+    own_domain = peers[ep_rank].p2p_domain
     force_mask = 0
     same_numa = 0
     cross_numa = 0
     for peer_rank, peer in enumerate(peers):
         if peer_rank == ep_rank:
             continue
-        if peer.numa_node == own_numa:
+        if peer.p2p_domain == own_domain:
             same_numa += 1
         else:
             cross_numa += 1
@@ -118,7 +130,7 @@ def derive_ep_transport_topology(
 
 def format_ep_topology(topology: EpTransportTopology) -> str:
     devices = ", ".join(
-        f"pe{rank}={peer.pci_bus_id}/numa{peer.numa_node}"
+        f"pe{rank}={(peer.host + ':') if peer.host else ''}{peer.pci_bus_id}/numa{peer.numa_node}"
         for rank, peer in enumerate(topology.peers)
     )
     return (

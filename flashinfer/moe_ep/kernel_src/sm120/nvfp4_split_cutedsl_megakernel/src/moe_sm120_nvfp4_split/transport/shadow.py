@@ -24,12 +24,17 @@ from typing import Dict, Sequence, Tuple
 
 @dataclass(frozen=True)
 class ShadowLayout:
-    numa_nodes: Tuple[int, ...]  # NUMA node of every EP rank, in EP rank order
+    numa_nodes: Tuple[int, ...]  # P2P domain (host, NUMA node) index of every EP rank, in EP rank order
     rank: int
 
     @classmethod
     def from_topology(cls, topology, rank: int) -> "ShadowLayout":
-        return cls(tuple(int(peer.numa_node) for peer in topology.peers), int(rank))
+        # One integer per P2P domain (host, NUMA node): GPUs on another host
+        # are cross peers exactly like GPUs on the other NUMA node.
+        domains = {}
+        for peer in topology.peers:
+            domains.setdefault(peer.p2p_domain, len(domains))
+        return cls(tuple(domains[peer.p2p_domain] for peer in topology.peers), int(rank))
 
     def __post_init__(self):
         world = len(self.numa_nodes)

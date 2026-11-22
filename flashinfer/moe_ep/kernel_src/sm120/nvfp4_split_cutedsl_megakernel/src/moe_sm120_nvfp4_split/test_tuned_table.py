@@ -73,9 +73,10 @@ def _shipped_cases():
     for table in tuned_table._load()["tables"]:
         h, i, k, e = table["signature"]
         for entry in table["entries"]:
-            ep = 4 if table["topology"] == "ep4_1numa" else 8
+            ep, real = {"ep4_1numa": (4, (3, 0)), "ep8_2numa": (8, (3, 4)),
+                        "ep16_2x2numa": (16, (3, 12))}[table["topology"]]
             split = entry["knobs"].get("backend") == "p2p_split"
-            same, cross = (3, 0) if ep == 4 else ((7, 0) if split else (3, 4))
+            same, cross = (ep - 1, 0) if split else real
             yield MegaMoEHeuristicInput(
                 tokens_per_rank=entry["tokens"], hidden=h, intermediate=i, num_topk=k, num_total_experts=e,
                 data_parallel_size=1, tensor_parallel_size=1, expert_parallel_size=ep,
@@ -94,3 +95,15 @@ def test_shipped_table_entries_select_legal_configs():
         for key, value in tuned_table.overrides_for(entry["knobs"]).items():
             if key != "comm_backend":
                 assert getattr(c, key) == value, (s.tokens_per_rank, key, entry)
+
+
+def test_ep16_two_host_topology_uses_the_split_rule():
+    with patch.object(tuned_table, "_load", return_value=TABLE):
+        real = shape(64, ep=16, same=3, cross=12)
+        assert tuned_table.topology_of(real) == "ep16_2x2numa"
+        assert tuned_table.preferred_ep8_backend(real) == "p2p_split"
+        folded = shape(64, ep=16, same=15, cross=0)
+        assert tuned_table.topology_of(folded) == "ep16_2x2numa"
+        assert tuned_table.preferred_ep8_backend(folded) is None
+        assert tuned_table.lookup(folded) is None  # nothing tabulated for EP16
+        assert tuned_table.topology_of(shape(64, ep=16, same=7, cross=8)) is None

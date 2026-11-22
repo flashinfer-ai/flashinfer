@@ -512,6 +512,9 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
             **finalizer_common, **common_kwargs
         )
 
+    for kernel in (k1, k2, k2_drain):
+        if kernel is not None:
+            kernel.weight_prefetch_ahead = config.weight_prefetch_ahead
     expected_threads = 32 * (11 if dual_n16 else config.k2_warps)
     if k2.threads_per_cta != expected_threads:
         raise RuntimeError(

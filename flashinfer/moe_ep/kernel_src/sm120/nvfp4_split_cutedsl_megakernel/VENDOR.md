@@ -2,7 +2,7 @@
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-nvfp4-split`, commit
-`aa968e6085ec0caa420e06225a7e0c554e33d99d`. The FlashInfer
+`b2fd4cac1d28d6a9be0cdfaf303ccd072ce21f54`. The FlashInfer
 delivery uses ABI `2814542011115` (standalone source ABI `281454201`).
 This revision includes continuous decode policies, M128 workers, utility
 defaults, DATA TMA eviction hints and the NCCL memory/transport runtime.
@@ -10,6 +10,19 @@ It adds the measured anchor table (`tuned_table.json`, DSV4.1-Flash and
 GLM5.3-Flash, EP4 in one NUMA node and EP8 across two) and the residency
 knobs `k1_ctas_per_sm` / `k2_launch_factor`; kernel cache keys include them.
 The FlashInfer frontend scales its K1/K2 launch grids by these knobs.
+This drop (`b2fd4ca`) adds EP16 across two hosts: a GPU is identified by
+(host, PCI bus) and only GPUs on the same host and NUMA node are P2P peers,
+so the other host's GPUs are cross peers served by `p2p_split` like the other
+NUMA node's. It adds EP16 anchors, the K1/K2 weight L2 prefetch knob
+`weight_prefetch_ahead` (0/4/8 K tiles) and the forwarder split `xnuma_fsplit`
+(1/2/4 CTAs per cross source), a fused record+commit GIN put and deferred GIN
+quiet in the sender, and launch-phase / sender / scatter diagnostics.
+FlashInfer keeps one `xnuma_fsplit` per workspace: its p2p_split buckets share
+one epoch and cumulative commit words, and the scatter waits for
+`fsplit * epoch` commits, so the value most p2p_split buckets selected is used
+for all of them (`MEGAMOE_XNUMA_FSPLIT` overrides it). The sender keeps the
+FlashInfer per-tensor input puts and sends only the record content.
+
 On an EP spanning NUMA nodes the frontend can run the `p2p_split` backend
 (`transport/xnuma.py`): same-NUMA peers use direct P2P and every cross-NUMA
 peer is served through a local shadow segment of the workspace arena that

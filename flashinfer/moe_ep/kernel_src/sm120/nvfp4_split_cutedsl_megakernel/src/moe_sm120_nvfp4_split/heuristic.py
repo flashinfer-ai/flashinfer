@@ -29,13 +29,18 @@ class MegaMoEHeuristicOverrides(_LegacyOverrides):
     # Residency knobs (None keeps the selected value).
     k1_ctas_per_sm: Optional[int] = None
     k2_launch_factor: Optional[int] = None
+    # K tiles ahead for the K1/K2 weight-producer L2 prefetch (0 = off).
+    weight_prefetch_ahead: Optional[int] = None
+    # p2p_split forwarder CTAs per cross source (1, 2 or 4).
+    xnuma_fsplit: Optional[int] = None
 
 
 # Largest expected rows per expert at which two resident CTAs of one kernel
 # per SM (k1_ctas_per_sm=2, k2_launch_factor=2) are qualified; at 64 rows per
 # expert the W4A8 port produced intermittent wrong rows.
 RESIDENCY_DOUBLING_MAX_ROWS_PER_EXPERT = 32.0
-_KNOB_FIELDS = ("k1_ctas_per_sm", "k2_launch_factor")
+_KNOB_FIELDS = ("k1_ctas_per_sm", "k2_launch_factor", "weight_prefetch_ahead", "xnuma_fsplit")
+_KNOB_DEFAULTS = {"k1_ctas_per_sm": 1, "k2_launch_factor": 1, "weight_prefetch_ahead": 0, "xnuma_fsplit": 2}
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,10 @@ class MegaMoEKernelConfig(_LegacyConfig):
     k1_ctas_per_sm: int = 1
     # Multiplier on the 8-warp K2 launch grid (2 = two CTAs per K2 SM).
     k2_launch_factor: int = 1
+    # K tiles ahead for the K1/K2 weight-producer L2 prefetch (0 = off).
+    weight_prefetch_ahead: int = 0
+    # p2p_split forwarder CTAs per cross source (experts split by id modulo).
+    xnuma_fsplit: int = 2
 
     def __post_init__(self):
         parent = getattr(_LegacyConfig, "__post_init__", None)
@@ -58,6 +67,10 @@ class MegaMoEKernelConfig(_LegacyConfig):
             raise ValueError("k1_ctas_per_sm must be 1 or 2")
         if self.k2_launch_factor not in (1, 2):
             raise ValueError("k2_launch_factor must be 1 or 2")
+        if self.weight_prefetch_ahead not in (0, 4, 8):
+            raise ValueError("weight_prefetch_ahead must be 0, 4 or 8")
+        if self.xnuma_fsplit not in (1, 2, 4):
+            raise ValueError("xnuma_fsplit must be 1, 2 or 4")
         if self.k1_ctas_per_sm == 2 and self.dispatch_warps != 1:
             raise ValueError("k1_ctas_per_sm=2 needs one dispatch warp")
         if self.k2_launch_factor == 2 and (self.k2_warps == 12 or self.k2_tile[1] > 32):
@@ -759,7 +772,7 @@ def policy_asdict(c):
     match; a non-default knob is kept (the profile then no longer applies)."""
     d = asdict(c)
     for k in _KNOB_FIELDS:
-        if d.get(k) == 1:
+        if d.get(k) == _KNOB_DEFAULTS[k]:
             d.pop(k)
     return d
 
@@ -798,7 +811,7 @@ _PINNED_FROM_ANCHOR = (
     "k1_tile", "k2_tile", "k1_stages", "k2_stages", "k2_warps", "ready_queue_bundle",
     "k1_sms", "k2_sms", "tx_sms", "rx_sms", "k2_tail_reclaim", "dispatch_warps",
     "dispatch_rank_cache", "dispatch_compute_overlap", "dispatch_chunk_tokens",
-    "k1_ctas_per_sm", "k2_launch_factor",
+    "k1_ctas_per_sm", "k2_launch_factor", "weight_prefetch_ahead", "xnuma_fsplit",
 )
 
 

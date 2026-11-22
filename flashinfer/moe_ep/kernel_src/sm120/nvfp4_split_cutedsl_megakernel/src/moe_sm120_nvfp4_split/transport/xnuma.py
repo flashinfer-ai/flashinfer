@@ -19,7 +19,7 @@ shadows in sync with GIN:
                  commits, and persistent K1/K2 CTAs can otherwise occupy every
                  SM before an unordered sender is scheduled.
 * ``forwarder`` (forked after K1 inside the compute graph, beside K2): per
-                 cross source, ``fsplit`` CTAs (experts split by parity) poll the
+                 cross source, ``fsplit`` CTAs (experts split by id modulo fsplit) poll the
                  K2 per-expert progress counters; each newly completed expert's
                  rows are packed in completion order (16 B header + row) and
                  sent with one contiguous put to the source's return region;
@@ -166,6 +166,15 @@ class XnumaTransport:
         self.table = torch.tensor([v for row in rows for v in row], dtype=torch.int64, device="cuda")
         self.epoch = torch.zeros((1,), dtype=torch.int64, device="cuda") if epoch is None else epoch
         self.forward_stream = torch.cuda.Stream()
+        # Diagnostics only: per-stage %globaltimer marks of the sender CTAs.
+        import os as _os
+        self.sender_trace = (torch.zeros((layout.n_cross * 8,), dtype=torch.int64, device="cuda")
+                             if _os.environ.get("MEGAMOE_XNUMA_SENDER_TRACE", "0") == "1" else None)
+        # Scatter CTAs per cross source (MEGAMOE_XNUMA_SCATTER_Q, default 4) and its
+        # diagnostics trace (start / commit seen / end per CTA, with the sender trace).
+        self.scatter_q = max(1, int(_os.environ.get("MEGAMOE_XNUMA_SCATTER_Q", "4")))
+        self.scatter_trace = (torch.zeros((layout.n_cross * self.scatter_q * 4,), dtype=torch.int64, device="cuda")
+                              if self.sender_trace is not None else None)
         self._compile()
 
     # -- configs for the K1/K2 hooks ------------------------------------------
@@ -198,6 +207,14 @@ class XnumaTransport:
         A = dict(self.addr)
         TABLE = int(self.table.data_ptr())
         EPOCH = int(self.epoch.data_ptr())
+        import os as _os2
+        QUIET_EVERY = max(1, int(_os2.environ.get("MEGAMOE_XNUMA_QUIET_EVERY", "32")))
+        FUSED_COMMIT = _os2.environ.get("MEGAMOE_XNUMA_FUSED_COMMIT", "1") != "0"
+        STRACE = self.sender_trace is not None
+        from ..split_timestamp import read_globaltimer
+        STR_ADDR = int(self.sender_trace.data_ptr()) if STRACE else 0
+        SQ = self.scatter_q
+        SCT_ADDR = int(self.scatter_trace.data_ptr()) if STRACE else 0
         TOPK_ADDR = int(self.tester.my_topk_idx.data_ptr())
         CO = self.combine_addr
         CH = (T * TOPK + 127) // 128  # sender: routes per thread
@@ -222,6 +239,13 @@ class XnumaTransport:
 
         def u8(addr, n):
             return cute.make_tensor(ptr(cutlass.Uint8, addr, 16), cute.make_layout(Int32(n)))
+
+        @cute.jit
+        def smark(j, tid, k: cutlass.Constexpr):
+            if cutlass.const_expr(STRACE):
+                if tid == Int32(0):
+                    t = cute.make_tensor(ptr(Int64, Int64(STR_ADDR), 8), cute.make_layout(N * 8))
+                    t[j * Int32(8) + Int32(k)] = read_globaltimer()
 
         @cute.jit
         def tbl(j, field: cutlass.Constexpr):
@@ -267,13 +291,21 @@ class XnumaTransport:
             j = Int32(j)
             owner = Int32(tbl(j, 0))
             epoch = cute.arch.load(ptr(Int64, Int64(EPOCH), 8), Int64, sem="acquire", scope="gpu")
-            # Retire the previous call's puts from this CTA's GIN slot (deferred
-            # flush: by the time a call returns, every owner consumed them).
-            gin.quiet(tx)
+            smark(j, tid, 0)
+            # Retire earlier calls' puts from this CTA's GIN slot (deferred
+            # flush: by the time a call returns, every owner consumed them, so
+            # only completion entries remain; QUIET_EVERY calls share one flush).
+            if cutlass.const_expr(QUIET_EVERY == 1):
+                gin.quiet(tx)
+            else:
+                if epoch % Int64(QUIET_EVERY) == Int64(0):
+                    gin.quiet(tx)
+            smark(j, tid, 1)
             # Data first; the record build overlaps the transfer.
             for r in cutlass.range_constexpr(len(REGIONS)):
                 gin.put_nbi_block(tx, u8(tbl(j, 1) + Int64(REGIONS[r][1]), REGIONS[r][2]),
                                   u8(Int64(REGIONS[r][0]), REGIONS[r][2]), owner)
+            smark(j, tid, 2)
             rec_addr = Int64(A["txrec"]) + Int64(j) * Int64(REC_B)
             rec = cute.make_tensor(ptr(Int32, rec_addr, 4), cute.make_layout(REC_I32))
             topk = cute.make_tensor(ptr(Int64, Int64(TOPK_ADDR), 8), cute.make_layout(T * TOPK))
@@ -298,6 +330,7 @@ class XnumaTransport:
                         scr[slot_i] = scr[slot_i] + Int32(1)
                 i = i + Int32(1)
             cute.arch.barrier(barrier_id=0, number_of_threads=128)
+            smark(j, tid, 3)
             if tid < Int32(E):
                 running = Int32(0)
                 base = tid * Int32(128)
@@ -322,19 +355,37 @@ class XnumaTransport:
                 i = i + Int32(1)
             cute.arch.fence_acq_rel_sys()
             cute.arch.barrier(barrier_id=0, number_of_threads=128)
-            gin.put_nbi_block(tx, u8(tbl(j, 2), REC_PUT), u8(rec_addr, REC_PUT), owner)
-            gin.fence()
+            smark(j, tid, 4)
             word = Int64(A["txd"]) + Int64(j) * Int64(8)
-            if tid == Int32(0):
-                cute.arch.store(ptr(Int64, word, 8), epoch, sem="relaxed", scope="gpu")
-            cute.arch.fence_acq_rel_sys()
-            cute.arch.barrier(barrier_id=0, number_of_threads=128)
-            gin.put_nbi_block(  # 8-byte put = strong VA signal-add commit record
-                tx,
-                cute.make_tensor(ptr(Int64, tbl(j, 3), 8), cute.make_layout(1)),
-                cute.make_tensor(ptr(Int64, word, 8), cute.make_layout(1)),
-                owner,
-            )
+            if cutlass.const_expr(FUSED_COMMIT):
+                # One put carries the record and the commit: NCCL delivers the
+                # strong VA signal-add after the payload.
+                if tid == Int32(0):
+                    cute.arch.store(ptr(Int64, word, 8), epoch, sem="relaxed", scope="gpu")
+                cute.arch.fence_acq_rel_sys()
+                cute.arch.barrier(barrier_id=0, number_of_threads=128)
+                smark(j, tid, 5)
+                gin.put_fused(
+                    tx, u8(tbl(j, 2), REC_PUT), u8(rec_addr, REC_PUT),
+                    cute.make_tensor(ptr(Int64, tbl(j, 3), 8), cute.make_layout(1)),
+                    cute.make_tensor(ptr(Int64, word, 8), cute.make_layout(1)),
+                    owner,
+                )
+            else:
+                gin.put_nbi_block(tx, u8(tbl(j, 2), REC_PUT), u8(rec_addr, REC_PUT), owner)
+                smark(j, tid, 5)
+                gin.fence()
+                if tid == Int32(0):
+                    cute.arch.store(ptr(Int64, word, 8), epoch, sem="relaxed", scope="gpu")
+                cute.arch.fence_acq_rel_sys()
+                cute.arch.barrier(barrier_id=0, number_of_threads=128)
+                gin.put_nbi_block(  # 8-byte put = strong VA signal-add commit record
+                    tx,
+                    cute.make_tensor(ptr(Int64, tbl(j, 3), 8), cute.make_layout(1)),
+                    cute.make_tensor(ptr(Int64, word, 8), cute.make_layout(1)),
+                    owner,
+                )
+            smark(j, tid, 6)
 
         @cute.jit
         def sender(stream: cuda.CUstream):
@@ -363,9 +414,9 @@ class XnumaTransport:
             stage = Int64(A["stage"]) + Int64(b) * Int64(STRIDE)
             ret_base = tbl(j, 5) + Int64(h) * Int64(STRIDE)
             sent = Int64(half_masks[0])
-            if cutlass.const_expr(FS == 2):
-                if h == Int32(1):
-                    sent = Int64(half_masks[1])
+            for hh in cutlass.range_constexpr(1, FS):
+                if h == Int32(hh):
+                    sent = Int64(half_masks[hh])
             go = Int32(1)
             wpos = Int32(0)
             while go == Int32(1):
@@ -431,12 +482,19 @@ class XnumaTransport:
         def scatter_kernel():
             b, _, _ = cute.arch.block_idx()
             tid, _, _ = cute.arch.thread_idx()
-            j = Int32(b) // Int32(4)
-            q4 = Int32(b) % Int32(4)
+            j = Int32(b) // Int32(SQ)
+            q4 = Int32(b) % Int32(SQ)
+            if cutlass.const_expr(STRACE):
+                if tid == Int32(0):
+                    st = cute.make_tensor(ptr(Int64, Int64(SCT_ADDR), 8), cute.make_layout(N * SQ * 4))
+                    st[Int32(b) * Int32(4)] = read_globaltimer()
             epoch = cute.arch.load(ptr(Int64, Int64(EPOCH), 8), Int64, sem="acquire", scope="gpu")
             if tid == Int32(0):
                 gin.wait_commit64(rx, Int32(tbl(j, 0)), ptr(Int64, Int64(A["done"]) + Int64(j) * Int64(8), 8),
                                   Int64(FS) * epoch)
+                if cutlass.const_expr(STRACE):
+                    st = cute.make_tensor(ptr(Int64, Int64(SCT_ADDR), 8), cute.make_layout(N * SQ * 4))
+                    st[Int32(b) * Int32(4) + Int32(1)] = read_globaltimer()
             cute.arch.barrier(barrier_id=0, number_of_threads=128)
             cute.arch.fence_acq_rel_sys()
             rec = cute.make_tensor(ptr(Int32, Int64(A["txrec"]) + Int64(j) * Int64(REC_B), 4), cute.make_layout(REC_I32))
@@ -451,13 +509,17 @@ class XnumaTransport:
                     rslot = ret + Int64(k) * Int64(SLOT)
                     vv = cute.arch.load(ptr(Int64, rslot, 8), Int64, sem="relaxed", scope="gpu")
                     copy_row(Int64(CO) + vv * Int64(ROW), rslot + Int64(16), tid)
-                    k = k + Int32(4)
+                    k = k + Int32(SQ)
             cute.arch.fence_acq_rel_gpu()
             cute.arch.barrier(barrier_id=0, number_of_threads=128)
+            if cutlass.const_expr(STRACE):
+                if tid == Int32(0):
+                    st = cute.make_tensor(ptr(Int64, Int64(SCT_ADDR), 8), cute.make_layout(N * SQ * 4))
+                    st[Int32(b) * Int32(4) + Int32(2)] = read_globaltimer()
 
         @cute.jit
         def scatter(stream: cuda.CUstream):
-            scatter_kernel().launch(grid=[N * 4, 1, 1], block=[128, 1, 1], stream=stream)
+            scatter_kernel().launch(grid=[N * SQ, 1, 1], block=[128, 1, 1], stream=stream)
 
         stream0 = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         link = f"--link-libraries={gin.device_bitcode()}"
@@ -504,6 +566,29 @@ class XnumaTransport:
             unfinished_experts=[e for e in range(E) if cnt[e] < need[e]],
         )
 
+    def report_sender_trace(self) -> None:
+        """Diagnostics: per-stage sender times of the last call (median / max over CTAs)."""
+        if self.sender_trace is None:
+            return
+        import statistics
+
+        torch.cuda.synchronize()
+        t = self.sender_trace.view(-1, 8).cpu().tolist()
+        names = ("quiet", "span_put", "pass1", "scan+pass2", "rec_put", "fence+commit")
+        cols = [[(row[k + 1] - row[k]) / 1000.0 for row in t] for k in range(6)]
+        total = [(row[6] - row[0]) / 1000.0 for row in t]
+        print(f"[sender trace] rank={self.rank} " + " ".join(
+            f"{n}={statistics.median(c):.1f}/{max(c):.1f}us" for n, c in zip(names, cols))
+            + f" total={statistics.median(total):.1f}/{max(total):.1f}us", flush=True)
+        if self.scatter_trace is not None:
+            r = self.scatter_trace.view(-1, 4).cpu().tolist()
+            t0 = min(x[0] for x in r)
+            wait = [(x[1] - x[0]) / 1000.0 for x in r]
+            copy = [(x[2] - x[1]) / 1000.0 for x in r]
+            print(f"[scatter trace] rank={self.rank} q={self.scatter_q} wait={statistics.median(wait):.1f}/{max(wait):.1f}us "
+                  f"copy={statistics.median(copy):.1f}/{max(copy):.1f}us last_commit={(max(x[1] for x in r) - t0) / 1000.0:.1f}us "
+                  f"span={(max(x[2] for x in r) - t0) / 1000.0:.1f}us", flush=True)
+
     def start_debug_watchdog(self, seconds: float) -> None:
         """Debug only (MEGAMOE_XNUMA_WATCHDOG=seconds): if the process is still
         running after ``seconds``, print a snapshot every 10 s."""
@@ -542,6 +627,10 @@ class XnumaTransport:
         k1_launched = torch.cuda.Event()
         k1_launched.record(k1_stream)
         self.forward_stream.wait_event(k1_launched)
+        from ..runtime.green_context import JITTER_US, spin_us
+
+        if JITTER_US > 0:  # diagnostics: per-rank late returns (fixed in the captured graph)
+            spin_us(self.forward_stream, JITTER_US * (self.rank % 4) / 3.0)
         self._forwarder(self._raw(self.forward_stream))
         done = torch.cuda.Event()
         done.record(self.forward_stream)
