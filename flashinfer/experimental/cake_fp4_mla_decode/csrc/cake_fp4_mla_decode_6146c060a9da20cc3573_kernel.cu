@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -3043,10 +3043,10 @@ kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensor
                 asm volatile("stmatrix.sync.aligned.m16n8.x4.trans.shared.b8 [%0], {%1, %2, %3, %4};\n"
                     :: "r"(_stmatrix_b8_addr_71), "r"(pw_7[0]), "r"(pw_7[1]), "r"(pw_7[2]), "r"(pw_7[3])
                     : "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(raw_empty_addr + (raw_x) * 8);
                 raw_x += 1;
                 if (raw_x == 2) { raw_x = 0; _phase_raw_full ^= 1; }
-                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
                     "{\n\t"
                     ".reg .b32 remAddr32;\n\t"
