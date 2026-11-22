@@ -671,14 +671,16 @@ class TestLogitsPipeVsSamplingOps:
 
         assert torch.allclose(samples_pipe, samples_direct, equal_nan=True)
 
-    @pytest.mark.parametrize("top_k_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize(
+        "top_k_dtype", [torch.int32, torch.int64, torch.float32, torch.float16]
+    )
     def test_probs_topk_per_row_tensor(self, top_k_dtype):
         set_random_seed(42)
 
         batch_size, vocab_size = 99, 32000
         probs = torch.rand(batch_size, vocab_size, device="cuda:0")
         probs = probs / probs.sum(dim=-1, keepdim=True)
-        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0", dtype=top_k_dtype)
+        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0").to(top_k_dtype)
 
         samples_direct = flashinfer.sampling.top_k_renorm_probs(probs, top_k)
 
@@ -687,13 +689,15 @@ class TestLogitsPipeVsSamplingOps:
 
         assert torch.allclose(samples_pipe, samples_direct)
 
-    @pytest.mark.parametrize("top_k_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize(
+        "top_k_dtype", [torch.int32, torch.int64, torch.float32, torch.float16]
+    )
     def test_logits_topk_per_row_tensor(self, top_k_dtype):
         set_random_seed(42)
 
         batch_size, vocab_size = 99, 32000
         logits = torch.randn(batch_size, vocab_size, device="cuda:0")
-        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0", dtype=top_k_dtype)
+        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0").to(top_k_dtype)
 
         samples_direct = flashinfer.sampling.top_k_mask_logits(logits, top_k)
 
@@ -702,14 +706,16 @@ class TestLogitsPipeVsSamplingOps:
 
         assert torch.allclose(samples_pipe, samples_direct, equal_nan=True)
 
-    @pytest.mark.parametrize("top_k_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize(
+        "top_k_dtype", [torch.int32, torch.int64, torch.float32, torch.float16]
+    )
     def test_probs_topk_sample_per_row_tensor(self, top_k_dtype):
         set_random_seed(42)
 
         batch_size, vocab_size = 99, 32000
         probs = torch.rand(batch_size, vocab_size, device="cuda:0")
         probs = probs / probs.sum(dim=-1, keepdim=True)
-        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0", dtype=top_k_dtype)
+        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0").to(top_k_dtype)
 
         gen1, gen2 = get_generators()
 
@@ -722,14 +728,16 @@ class TestLogitsPipeVsSamplingOps:
 
         assert torch.all(samples_pipe == samples_direct)
 
-    @pytest.mark.parametrize("top_k_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize(
+        "top_k_dtype", [torch.int32, torch.int64, torch.float32, torch.float16]
+    )
     def test_joint_probs_topk_topp_sample_per_row_tensor(self, top_k_dtype):
         set_random_seed(42)
 
         batch_size, vocab_size = 99, 32000
         probs = torch.rand(batch_size, vocab_size, device="cuda:0")
         probs = probs / probs.sum(dim=-1, keepdim=True)
-        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0", dtype=top_k_dtype)
+        top_k = torch.randint(1, 500, (batch_size,), device="cuda:0").to(top_k_dtype)
 
         gen1, gen2 = get_generators()
 
