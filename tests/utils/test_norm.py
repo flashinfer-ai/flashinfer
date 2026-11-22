@@ -1455,23 +1455,55 @@ _UINT32_ROW_STRIDE = 2**31
 assert (_UINT32_ROWS - 1) * _UINT32_ROW_STRIDE > 2**32 - 1
 
 
-def _rows_past_uint32(*row_shape, dtype=torch.bfloat16):
-    """Random rows of ``row_shape`` stored ``_UINT32_ROW_STRIDE`` elements apart."""
-    numel = (_UINT32_ROWS - 1) * _UINT32_ROW_STRIDE + math.prod(row_shape)
-    need = numel * torch.finfo(dtype).bits // 8
-    free, _ = torch.cuda.mem_get_info()
-    if free < need + (1 << 30):
+def _free_vram():
+    """Free GPU memory, counting the blocks torch has cached from earlier tests."""
+    torch.cuda.empty_cache()
+    return torch.cuda.mem_get_info()[0]
+
+
+def _skip_unless_vram(need):
+    free = _free_vram()
+    if free < need:
         pytest.skip(
             f"Requires ~{need / 1024**3:.1f}GB free VRAM, "
             f"only {free / 1024**3:.1f}GB available"
         )
-    inner_strides = [math.prod(row_shape[i + 1 :]) for i in range(len(row_shape))]
-    storage = torch.empty(numel, dtype=dtype, device="cuda")
-    rows = storage.as_strided(
-        (_UINT32_ROWS, *row_shape), (_UINT32_ROW_STRIDE, *inner_strides)
+
+
+def _rows_past_uint32(*row_shape, dtype=torch.bfloat16):
+    """Rows of ``row_shape`` stored ``_UINT32_ROW_STRIDE`` elements apart.
+
+    The rows hold random values. An fp8 buffer only ever receives output, so it holds
+    the largest fp8 value instead: a row the kernel did not write then cannot pass the
+    loose fp8 comparisons.
+    """
+    numel = (_UINT32_ROWS - 1) * _UINT32_ROW_STRIDE + math.prod(row_shape)
+    _skip_unless_vram(numel * torch.finfo(dtype).bits // 8 + (1 << 30))
+    shape = (_UINT32_ROWS, *row_shape)
+    strides = (
+        _UINT32_ROW_STRIDE,
+        *(math.prod(row_shape[i + 1 :]) for i in range(len(row_shape))),
     )
-    rows.copy_(torch.randn(_UINT32_ROWS, *row_shape, dtype=dtype, device="cuda"))
+    if dtype == torch.float8_e4m3fn:
+        storage = torch.full((numel,), 0x7E, dtype=torch.uint8, device="cuda")
+        return storage.view(dtype).as_strided(shape, strides)
+    rows = torch.empty(numel, dtype=dtype, device="cuda").as_strided(shape, strides)
+    rows.copy_(torch.randn(shape, dtype=dtype, device="cuda"))
     return rows
+
+
+def _rows_for(far, hidden_size, dtype=torch.bfloat16):
+    """``_UINT32_ROWS`` rows: 2**31 elements apart when ``far``, contiguous otherwise."""
+    if far:
+        return _rows_past_uint32(hidden_size, dtype=dtype)
+    if dtype == torch.float8_e4m3fn:
+        return torch.empty(_UINT32_ROWS, hidden_size, dtype=dtype, device="cuda")
+    return torch.randn(_UINT32_ROWS, hidden_size, dtype=dtype, device="cuda")
+
+
+def _fp8_rows(t):
+    """An fp8 tensor as float32, row by row, so that a strided buffer converts too."""
+    return torch.stack([row.float() for row in t])
 
 
 @pytest.mark.parametrize("gemma", [False, True])
@@ -1493,7 +1525,8 @@ def test_rmsnorm_cuda_row_offset_beyond_uint32(gemma, monkeypatch):
     torch.testing.assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
 
 
-def test_rmsnorm_cuda_output_row_offset_beyond_uint32(monkeypatch):
+@pytest.mark.parametrize("gemma", [False, True])
+def test_rmsnorm_cuda_output_row_offset_beyond_uint32(gemma, monkeypatch):
     """The third output row starts 2**32 elements in."""
     monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
     torch.manual_seed(0)
@@ -1502,11 +1535,14 @@ def test_rmsnorm_cuda_output_row_offset_beyond_uint32(monkeypatch):
     w = torch.randn(H, dtype=x.dtype, device="cuda")
     out = _rows_past_uint32(H)
 
-    flashinfer.norm.rmsnorm(x, w, out=out)
+    if gemma:
+        flashinfer.norm.gemma_rmsnorm(x, w, out=out)
+        out_ref = gemma_rms_norm(x, w)
+    else:
+        flashinfer.norm.rmsnorm(x, w, out=out)
+        out_ref = llama_rms_norm(x, w)
 
-    torch.testing.assert_close(
-        out.contiguous(), llama_rms_norm(x, w), rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(out.contiguous(), out_ref, rtol=1e-3, atol=1e-3)
 
 
 def test_qknorm_cuda_batch_offset_beyond_uint32(monkeypatch):
@@ -1541,19 +1577,73 @@ def test_qknorm_cuda_head_offset_beyond_uint32(monkeypatch):
     )
 
 
-def test_rmsnorm_quant_cuda_row_offset_beyond_uint32(monkeypatch):
-    """rmsnorm_quant whose third input row starts 2**32 elements in."""
+@pytest.mark.parametrize("far", ["batch", "head"])
+def test_qknorm_cuda_output_offset_beyond_uint32(far, monkeypatch):
+    """3D rmsnorm whose third output batch entry or head starts 2**32 elements in."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    torch.manual_seed(0)
+    num_heads, head_dim = 4, 128
+    if far == "batch":
+        shape = (_UINT32_ROWS, num_heads, head_dim)
+        out = _rows_past_uint32(num_heads, head_dim)
+    else:
+        shape = (1, _UINT32_ROWS, head_dim)
+        out = _rows_past_uint32(head_dim).as_strided(shape, (1, _UINT32_ROW_STRIDE, 1))
+    x = torch.randn(shape, dtype=out.dtype, device="cuda")
+    w = torch.randn(head_dim, dtype=x.dtype, device="cuda")
+
+    flashinfer.norm.rmsnorm(x, w, out=out)
+
+    torch.testing.assert_close(
+        out.contiguous(), llama_rms_norm(x, w), rtol=1e-3, atol=1e-3
+    )
+
+
+def test_qknorm_cuda_offsets_sum_past_uint32(monkeypatch):
+    """3D rmsnorm on the 32-bit kernel: the batch offset and the head offset each fit
+    in 32 bits and their sum does not.
+
+    The kernel adds the two offsets to the pointer one after the other, so the launcher
+    checks each stride on its own. This case is right on main as well; it guards that
+    property.
+    """
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    torch.manual_seed(0)
+    n, head_dim, stride = 3, 128, 1_100_000_000
+    # n * stride fits in 32 bits, so both dimensions keep uint32_t offsets, and entry
+    # (n - 1, n - 1) starts 2 * (n - 1) * stride elements in, past 2**32.
+    assert n * stride <= 2**32 - 1 < 2 * (n - 1) * stride
+    numel = 2 * (n - 1) * stride + head_dim
+    _skip_unless_vram(2 * numel + (1 << 30))  # bf16
+    storage = torch.empty(numel, dtype=torch.bfloat16, device="cuda")
+    # Entries (b, h) with the same b + h share a row, so fill the 2n - 1 distinct rows.
+    storage.as_strided((2 * n - 1, head_dim), (stride, 1)).copy_(
+        torch.randn(2 * n - 1, head_dim, dtype=storage.dtype, device="cuda")
+    )
+    x = storage.as_strided((n, n, head_dim), (stride, stride, 1))
+    w = torch.randn(head_dim, dtype=x.dtype, device="cuda")
+
+    y = flashinfer.norm.rmsnorm(x, w)
+
+    torch.testing.assert_close(
+        y, llama_rms_norm(x.contiguous(), w), rtol=1e-3, atol=1e-3
+    )
+
+
+@pytest.mark.parametrize("far", ["input", "output"])
+def test_rmsnorm_quant_cuda_row_offset_beyond_uint32(far, monkeypatch):
+    """rmsnorm_quant whose third input or output row starts 2**32 elements in."""
     monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
     torch.manual_seed(0)
     H, quant_scale = 128, 1.0
-    x = _rows_past_uint32(H)
+    x = _rows_for(far == "input", H)
+    y = _rows_for(far == "output", H, dtype=torch.float8_e4m3fn)
     w = torch.randn(H, dtype=x.dtype, device="cuda")
 
-    y = torch.empty(_UINT32_ROWS, H, dtype=torch.float8_e4m3fn, device="cuda")
     flashinfer.norm.rmsnorm_quant(y, x, w, torch.tensor(quant_scale, device="cuda"))
 
     y_ref = llama_rms_norm_quant(x.contiguous(), w, quant_scale, torch.float8_e4m3fn)
-    torch.testing.assert_close(y.float(), y_ref.float(), rtol=1, atol=1)
+    torch.testing.assert_close(_fp8_rows(y), y_ref.float(), rtol=1, atol=1)
 
 
 @pytest.mark.parametrize("gemma", [False, True])
@@ -1585,50 +1675,67 @@ def test_fused_add_rmsnorm_cuda_row_offset_beyond_uint32(far, gemma, monkeypatch
     torch.testing.assert_close(r.contiguous(), r_ref, rtol=1e-3, atol=1e-3)
 
 
-def test_fused_add_rmsnorm_quant_cuda_row_offset_beyond_uint32(monkeypatch):
-    """fused_add_rmsnorm_quant whose third input row starts 2**32 elements in."""
+@pytest.mark.parametrize("far", ["input", "residual", "output"])
+def test_fused_add_rmsnorm_quant_cuda_row_offset_beyond_uint32(far, monkeypatch):
+    """fused_add_rmsnorm_quant with the third row of one tensor 2**32 elements in."""
     monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
     torch.manual_seed(0)
     H, eps, quant_scale = 128, 1e-6, 1.0
-    x = _rows_past_uint32(H)
-    r = torch.randn(_UINT32_ROWS, H, dtype=x.dtype, device="cuda")
+    x = _rows_for(far == "input", H)
+    r = _rows_for(far == "residual", H)
+    y = _rows_for(far == "output", H, dtype=torch.float8_e4m3fn)
     w = torch.randn(H, dtype=x.dtype, device="cuda")
     x_ref, r_ref = fused_add_rms_norm_quant(
-        x.contiguous().clone(), r.clone(), w, quant_scale, torch.float8_e4m3fn, eps
+        x.contiguous().clone(),
+        r.contiguous().clone(),
+        w,
+        quant_scale,
+        torch.float8_e4m3fn,
+        eps,
     )
 
-    y = torch.empty(_UINT32_ROWS, H, dtype=torch.float8_e4m3fn, device="cuda")
     flashinfer.norm.fused_add_rmsnorm_quant(
         y, x, r, w, torch.tensor(quant_scale, device="cuda"), eps
     )
 
-    torch.testing.assert_close(y.float(), x_ref.float(), rtol=1, atol=1)
-    torch.testing.assert_close(r, r_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(_fp8_rows(y), x_ref.float(), rtol=1, atol=1)
+    torch.testing.assert_close(r.contiguous(), r_ref, rtol=1e-3, atol=1e-3)
 
 
-def test_fused_add_rmsnorm_fp8_block_quant_row_offset_beyond_uint32():
-    """The fp8 block-quant producer whose third input row starts 2**32 elements in."""
+@pytest.mark.parametrize("far", ["input", "residual", "output", "normed"])
+def test_fused_add_rmsnorm_fp8_block_quant_row_offset_beyond_uint32(far):
+    """The fp8 block-quant producer with the third row of one tensor 2**32 elements in."""
     torch.manual_seed(0)
     H, eps = 256, 1e-6
-    x = _rows_past_uint32(H)
+    x = _rows_for(far == "input", H)
     x.mul_(0.1)
-    r = torch.randn(_UINT32_ROWS, H, dtype=x.dtype, device="cuda") * 0.1
+    r = _rows_for(far == "residual", H)
+    r.mul_(0.1)
     w = torch.randn(H, dtype=x.dtype, device="cuda")
     _, _, r_ref, normed_ref = fused_add_rms_norm_fp8_block_quant(
-        x.contiguous().clone(), r.clone(), w, eps
+        x.contiguous().clone(), r.contiguous().clone(), w, eps
     )
 
-    out = torch.empty(_UINT32_ROWS, H, dtype=torch.float8_e4m3fn, device="cuda")
+    out = _rows_for(far == "output", H, dtype=torch.float8_e4m3fn)
     block_scale = torch.empty(
         H // 128, (_UINT32_ROWS + 3) & ~3, dtype=torch.float32, device="cuda"
     )
-    normed_out = torch.empty(_UINT32_ROWS, H, dtype=x.dtype, device="cuda")
+    normed_out = _rows_for(far == "normed", H)
     flashinfer.norm.fused_add_rmsnorm_fp8_block_quant(
         out, block_scale, normed_out, x, r, w, eps
     )
 
-    torch.testing.assert_close(r, r_ref, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(normed_out, normed_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(r.contiguous(), r_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(
+        normed_out.contiguous(), normed_ref, rtol=1e-2, atol=1e-2
+    )
+    # The fp8 rows, dequantized, against the reference: the comparison that
+    # test_fused_add_rmsnorm_fp8_block_quant makes.
+    scale = block_scale.transpose(0, 1)[:_UINT32_ROWS].unsqueeze(-1)
+    deq = _fp8_rows(out).view(_UINT32_ROWS, H // 128, 128) * scale
+    torch.testing.assert_close(
+        deq.view(_UINT32_ROWS, H), normed_ref.float(), rtol=0.1, atol=0.3
+    )
 
 
 # Shape (350000, 12288) fp16: the last rows start past 2**32 elements, as they do
@@ -1642,13 +1749,7 @@ def test_rmsnorm_cuda_contiguous_beyond_uint32(monkeypatch):
     """CUDA rmsnorm on a contiguous tensor with M*H > UINT32_MAX."""
     monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
     M, H = _UINT32_OVERFLOW_M, _UINT32_OVERFLOW_H
-    need = 4 * M * H  # fp16 input + output
-    free, _ = torch.cuda.mem_get_info()
-    if free < need * 1.15:
-        pytest.skip(
-            f"Requires ~{need / 1024**3:.1f}GB free VRAM, "
-            f"only {free / 1024**3:.1f}GB available"
-        )
+    _skip_unless_vram(int(4 * M * H * 1.15))  # fp16 input + output, with headroom
     torch.manual_seed(0)
     x = torch.randn(M, H, dtype=torch.float16, device="cuda")
     w = torch.randn(H, dtype=x.dtype, device="cuda")
@@ -1687,7 +1788,7 @@ assert (_OVERFLOW_M - 1) * _OVERFLOW_H > 2**31
 def _skip_if_low_vram_for_overflow(extra_bytes_per_elem: float = 4.0):
     """Skip when free VRAM cannot hold ~extra_bytes_per_elem * M * H bytes."""
     need = int(extra_bytes_per_elem * _OVERFLOW_M * _OVERFLOW_H)
-    free, _ = torch.cuda.mem_get_info()
+    free = _free_vram()
     if free < need * 1.15:
         pytest.skip(
             f"Requires ~{need / 1024**3:.1f}GB free VRAM, "

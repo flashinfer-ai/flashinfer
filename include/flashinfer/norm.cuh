@@ -62,9 +62,9 @@ struct QuantTypeStaticVals<__nv_fp8_e5m2> {
 };
 
 // A row can start 2**32 or more elements into the tensor, where a 32-bit row offset wraps.
-// 64-bit row offsets cost a few percent on short rows, so the RMSNorm kernels take the offset
-// type as IdxT and the host keeps uint32_t whenever every row offset fits (LayerNorm below
-// does the same). Strides may be 0 (broadcast rows).
+// 64-bit row offsets cost a few percent in some of these kernels, so the RMSNorm kernels take
+// the offset type as IdxT and the host keeps uint32_t while num_rows * max_stride fits in 32
+// bits (LayerNorm below makes the same choice with int32_t). Strides may be 0 (broadcast rows).
 inline bool RowOffsetsNeedInt64(uint32_t num_rows, int64_t max_stride) {
   return int64_t(num_rows) * max_stride > int64_t(std::numeric_limits<uint32_t>::max());
 }
