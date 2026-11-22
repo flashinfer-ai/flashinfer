@@ -74,8 +74,7 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
                                tvm::ffi::Array<int64_t> offsets, tvm::ffi::Array<int64_t> dims,
                                int64_t num_tokens, double activation_clamp,
                                tvm::ffi::Array<int64_t> gin, int64_t tokens_per_item,
-                               int64_t w13_gate_up_interleaved,
-                               int64_t scales_are_canonical,
+                               int64_t w13_gate_up_interleaved, int64_t scales_are_canonical,
                                int64_t scales_are_deepgemm) {
   // dims: [num_experts, num_topk, hidden, intermediate_hidden, num_max_tokens_per_rank]
   // l1/l2_weights: packed E2M1 [EL][2I][H/2] / [EL][H][I/2], interleaved or canonical;

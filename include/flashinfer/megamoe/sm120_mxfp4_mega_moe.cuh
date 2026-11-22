@@ -305,14 +305,11 @@ __device__ __forceinline__ uint32_t spread4(uint32_t w, uint32_t half_selector) 
 // and reads activation bytes 8c..8c+7: the same K permutation on both operands (file comment).
 // [kc_begin, kc_end) restricts K to a range of K64 chunks (split-K); both multiples of kUnroll.
 template <int NH>
-__device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const uint8_t* W,
-                                          const uint32_t* WS, int nblocks, int nb0, int K,
-                                          const uint8_t* const (&xrow)[NH],
-                                          const uint32_t* const (&xsrow)[NH], int lane,
-                                          int w13_intermediate = 0, int kc_begin = 0,
-                                          int kc_end = -1, bool canonical_scales = false,
-                                          int canonical_intermediate = 0,
-                                          bool deepgemm_scales = false) {
+__device__ __forceinline__ void item_gemm(
+    float (&acc)[kNbPerWarp][NH][4], const uint8_t* W, const uint32_t* WS, int nblocks, int nb0,
+    int K, const uint8_t* const (&xrow)[NH], const uint32_t* const (&xsrow)[NH], int lane,
+    int w13_intermediate = 0, int kc_begin = 0, int kc_end = -1, bool canonical_scales = false,
+    int canonical_intermediate = 0, bool deepgemm_scales = false) {
   const int g = lane / 4, c = lane % 4;
   const int kch = K / 64, kq = K / 128;
   const uint4* wp[kNbPerWarp][2];  // rows g, g + 8 of block nb0 + j, at this lane's 16 bytes
@@ -326,20 +323,17 @@ __device__ __forceinline__ void item_gemm(float (&acc)[kNbPerWarp][NH][4], const
       const int row = w13_row((nb0 + j) * 16 + g + 8 * r, w13_intermediate);
       wp[j][r] = reinterpret_cast<const uint4*>(W + size_t(row) * (K / 2)) + c;
     }
-    const int scale_row = w13_row((nb0 + j) * 16 + g + (lane & 1) * 8,
-                                  canonical_intermediate);
+    const int scale_row = w13_row((nb0 + j) * 16 + g + (lane & 1) * 8, canonical_intermediate);
     canonical_sp[j] = reinterpret_cast<const uint8_t*>(WS) + scale_row * (K / 32);
     deepgemm_sp[j] = reinterpret_cast<const uint8_t*>(WS) +
                      w13_row((nb0 + j) * 16 + g + (lane & 1) * 8,
-                             w13_intermediate != 0 ? w13_intermediate
-                                                   : canonical_intermediate) *
+                             w13_intermediate != 0 ? w13_intermediate : canonical_intermediate) *
                          4;
     sp[j] = WS + size_t(nb0 + j) * kq * 16 + g + (lane & 1) * 8;
   }
   auto scales_at = [&](int j, int k128) {
     if (deepgemm_scales)
-      return __ldg(reinterpret_cast<const uint32_t*>(deepgemm_sp[j] +
-                                                     size_t(k128) * nblocks * 64));
+      return __ldg(reinterpret_cast<const uint32_t*>(deepgemm_sp[j] + size_t(k128) * nblocks * 64));
     if (!canonical_scales) return __ldg(sp[j] + k128 * 16);
     return __ldg(reinterpret_cast<const uint32_t*>(canonical_sp[j] + k128 * 4));
   };
@@ -840,12 +834,18 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
       while (m.tiles_prefix[el + 1] <= tile_g) ++el;
       const int nb0 = (rb * kRowsPerItem) / 16 + warp * kNbPerWarp;
       const int blk_bytes = (H / 64) * 32 * 16;
+      const int intermediate = a.w13_gate_up_interleaved ? 0 : I;
+      const int num_halves = a.w13_gate_up_interleaved ? 1 : 2;
+      const size_t half_bytes = blk_bytes / num_halves;
+      const size_t half_budget = kPfBytes / num_halves;
 #pragma unroll
       for (int jb = 0; jb < kNbPerWarp; ++jb) {
-        const char* base =
-            reinterpret_cast<const char*>(w13_of(a, el) + size_t(nb0 + jb) * 16 * (H / 2));
-        for (int off = lane * 128; off < min(kPfBytes, blk_bytes); off += 32 * 128)
-          asm volatile("prefetch.global.L2 [%0];" ::"l"(base + off));
+        for (int half = 0; half < num_halves; ++half) {
+          const char* base = reinterpret_cast<const char*>(
+              w13_of(a, el) + size_t(w13_row((nb0 + jb) * 16 + half * 8, intermediate)) * (H / 2));
+          for (int off = lane * 128; off < min(half_budget, half_bytes); off += 32 * 128)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(base + off));
+        }
       }
     }
   }
@@ -942,9 +942,9 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
 #endif
           xs[h] = reinterpret_cast<const uint32_t*>(xr[h] + H);
         }
-        item_gemm<NH>(acc, w13_of(a, el), ws13_of(a, el), 2 * I / 16, nb0, H, xr, xs,
-                      lane, a.w13_gate_up_interleaved ? 0 : I, 0, -1,
-                      a.scales_are_canonical, I, a.scales_are_deepgemm);
+        item_gemm<NH>(acc, w13_of(a, el), ws13_of(a, el), 2 * I / 16, nb0, H, xr, xs, lane,
+                      a.w13_gate_up_interleaved ? 0 : I, 0, -1, a.scales_are_canonical, I,
+                      a.scales_are_deepgemm);
         // SwiGLU: acc rows g (gate) / g+8 (up) of block nb -> inter col nb*8+g; tokens 2c, 2c+1
         constexpr int kItemInter = kRowsPerItem / 2;  // inter cols per item (multiple of 32)
         constexpr int kGroups = kItemInter / 32;
@@ -990,8 +990,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           xr[h] = a.inter + r * I;
           xs[h] = a.inter_s + r * (I / 128);
         }
-        item_gemm<NH>(acc, w2_of(a, el), ws2_of(a, el), H / 16, nb0, I, xr, xs, lane,
-                      0, 0, -1, a.scales_are_canonical, 0, a.scales_are_deepgemm);
+        item_gemm<NH>(acc, w2_of(a, el), ws2_of(a, el), H / 16, nb0, I, xr, xs, lane, 0, 0, -1,
+                      a.scales_are_canonical, 0, a.scales_are_deepgemm);
 #pragma unroll
         for (int jb = 0; jb < kNbPerWarp; ++jb) {
           const int col = (warp * kNbPerWarp + jb) * 16 + g;  // 0..kRowsPerItem-1 within the item

@@ -35,7 +35,7 @@ Set ``interleave_w13=False`` to borrow the canonical gate/up-contiguous FP4 tens
 without a packed-data copy. ``scale_layout="canonical"`` also borrows both canonical
 per-row scale planes. ``scale_layout="deepgemm"`` instead accepts packed UE8M0
 ``int32`` scales with shapes ``[local_E, 2I, H/128]`` and ``[local_E, H, I/128]``,
-stored MN-major with four consecutive K32 exponents per word, and reads them in
+stored MN-major with four consecutive K32 exponents per word, and reads them in place.
 This is the ordinary grouped-GEMM scale layout, not DeepGEMM MegaMoE's
 additional UTCCP-swizzled layout. Layout mismatches are rejected instead of
 silently computing with wrong scales.
@@ -195,6 +195,8 @@ def preprocess_mega_weights(
     """
     if not interleave_w13 and scale_layout == "kernel":
         raise ValueError("gate/up-contiguous FP4 requires canonical or DeepGEMM scales")
+    if not interleave_w13 and fp4 is not None:
+        raise ValueError("pre-interleaved fp4 requires interleave_w13=True")
     w13, w2, s13, s2 = _checked(weights, hidden_size, intermediate_size, scale_layout)
     rows = gate_up_interleave_index(intermediate_size).to(w13.device)
     if fp4 is None:
@@ -203,7 +205,7 @@ def preprocess_mega_weights(
             if interleave_w13
             else (w13, w2)
         )
-    return NosyncMegaWeights(
+    transformed = NosyncMegaWeights(
         w13=fp4[0],
         w2=fp4[1],
         w13_scale=(
@@ -213,6 +215,29 @@ def preprocess_mega_weights(
         w13_gate_up_interleaved=interleave_w13,
         scale_layout=scale_layout,
     )
+    _validate_borrowed_tensor_addresses(transformed)
+    return transformed
+
+
+def _validate_borrowed_tensor_addresses(transformed: NosyncMegaWeights) -> None:
+    for name, tensor, alignment in (
+        ("w13", transformed.w13, 16),
+        ("w2", transformed.w2, 16),
+        ("w13_scale", transformed.w13_scale, 4),
+        ("w2_scale", transformed.w2_scale, 4),
+    ):
+        if tensor.data_ptr() % alignment:
+            raise ValueError(f"{name} must be {alignment}-byte aligned")
+    for name, tensor in (("w13", transformed.w13), ("w2", transformed.w2)):
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous, got {tensor.stride()}")
+    if transformed.scale_layout == "canonical":
+        for name, tensor in (
+            ("w13_scale", transformed.w13_scale),
+            ("w2_scale", transformed.w2_scale),
+        ):
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous, got {tensor.stride()}")
 
 
 def validate_transformed_mega_weights(
@@ -245,8 +270,18 @@ def validate_transformed_mega_weights(
     for name, tensor, shape, strides in (
         ("w13", transformed.w13, (e, 2 * i, h // 2), None),
         ("w2", transformed.w2, (e, h, i // 2), None),
-        ("w13_scale", transformed.w13_scale, scale_shapes[0], scale_strides),
-        ("w2_scale", transformed.w2_scale, scale_shapes[1], scale_strides),
+        (
+            "w13_scale",
+            transformed.w13_scale,
+            scale_shapes[0],
+            scale_strides[0] if scale_strides is not None else None,
+        ),
+        (
+            "w2_scale",
+            transformed.w2_scale,
+            scale_shapes[1],
+            scale_strides[1] if scale_strides is not None else None,
+        ),
     ):
         if (
             tuple(tensor.shape) != shape
@@ -263,6 +298,7 @@ def validate_transformed_mega_weights(
             raise ValueError(
                 f"{name} must have stride {strides}, got {tensor.stride()}"
             )
+    _validate_borrowed_tensor_addresses(transformed)
 
 
 __all__ = [

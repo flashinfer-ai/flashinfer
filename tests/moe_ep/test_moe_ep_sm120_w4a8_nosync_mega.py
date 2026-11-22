@@ -395,6 +395,65 @@ def _sm120_gpus(n):
 _CUTEDSL = os.environ.get("FLASHINFER_TEST_SM120_CUTEDSL") == "1"
 
 
+def _check_borrowed_input_contract(pack, transformed, hidden, intermediate):
+    from flashinfer.moe_ep import preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync.weights import (
+        validate_transformed_mega_weights,
+    )
+
+    kwargs = dict(
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        interleave_w13=False,
+        scale_layout="canonical",
+    )
+    validate_transformed_mega_weights(
+        transformed,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        local_experts=pack.w13.shape[0],
+    )
+
+    def offset(tensor, num_bytes):
+        raw = tensor.view(torch.uint8)
+        padded = torch.empty(
+            raw.numel() + num_bytes, dtype=raw.dtype, device=raw.device
+        )
+        view = padded[num_bytes:].view(tensor.dtype).view(tensor.shape)
+        view.copy_(tensor)
+        return view
+
+    aligned = offset(pack.w13, 16)
+    borrowed = preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+        dataclasses.replace(pack, w13=aligned), **kwargs
+    )
+    assert borrowed.w13.data_ptr() == aligned.data_ptr()
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+            dataclasses.replace(pack, w13=offset(pack.w13, 1)), **kwargs
+        )
+    with pytest.raises(ValueError, match="4-byte aligned"):
+        preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+            dataclasses.replace(pack, w13_scale=offset(pack.w13_scale, 1)), **kwargs
+        )
+    for name, tensor in (("w13", pack.w13), ("w13_scale", pack.w13_scale)):
+        raw = tensor.view(torch.uint8)
+        expanded = raw.new_empty(raw.numel() * 2)
+        noncontiguous = expanded.as_strided(
+            tensor.shape,
+            (tensor.stride(0), tensor.stride(1) * 2, tensor.stride(2)),
+        ).view(tensor.dtype)
+        noncontiguous.copy_(tensor)
+        with pytest.raises(ValueError, match="contiguous"):
+            preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+                dataclasses.replace(pack, **{name: noncontiguous}), **kwargs
+            )
+    with pytest.raises(ValueError, match="pre-interleaved fp4"):
+        preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
+            pack, fp4=(pack.w13, pack.w2), **kwargs
+        )
+
+
 def _weight_layout_worker(rank):
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -462,6 +521,12 @@ def _weight_layout_worker(rank):
             else:
                 assert pointer == source.data_ptr()
         if rank == 0:
+            validate_transformed_mega_weights(
+                transformed,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                local_experts=experts // ep,
+            )
             if scale_layout == "deepgemm":
                 with pytest.raises(ValueError, match="stride"):
                     validate_transformed_mega_weights(
@@ -480,6 +545,8 @@ def _weight_layout_worker(rank):
                         intermediate_size=intermediate,
                         local_experts=experts // ep,
                     )
+            if scale_layout == "canonical" and not interleave:
+                _check_borrowed_input_contract(pack, transformed, hidden, intermediate)
             with pytest.raises(ValueError, match="gate/up-contiguous FP4"):
                 preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights(
                     pack,
