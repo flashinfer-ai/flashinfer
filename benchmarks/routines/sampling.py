@@ -124,8 +124,10 @@ def _make_probs(args, batch_size, vocab_size, device, dtype=None):
         logits = torch.randn(batch_size, vocab_size, device=device)
         probs = torch.softmax(logits, dim=-1)
         return probs if dtype is None else probs.to(dtype)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, dtype=dtype, device=device)
-    return pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    # Normalize in float32: a float16 row sum overflows for large vocabularies.
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
+    probs = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    return probs if dtype is None else probs.to(dtype)
 
 
 @contextlib.contextmanager
@@ -451,7 +453,7 @@ def parse_sampling_args(line, parser):
     # A mode flag on a routine that ignores it would still be written to the CSV.
     for flag, (default, routines) in _MODE_FLAG_ROUTINES.items():
         if getattr(args, flag) != default and args.routine not in routines:
-            parser.error(
+            raise ValueError(
                 f"--{flag} does not apply to {args.routine} (applies to: {', '.join(routines)})"
             )
 
@@ -462,7 +464,7 @@ def parse_sampling_args(line, parser):
         args.routine == "top_k_page_table_transform"
         and args.num_rows % args.batch_size != 0
     ):
-        parser.error(
+        raise ValueError(
             "--num_rows must be a multiple of --batch_size (rows are mapped to requests via row_to_batch)"
         )
 

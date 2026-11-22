@@ -447,7 +447,7 @@ def parse_quantization_args(line, parser):
 
     args = parser.parse_args(line)
     if args.nvfp4_4over6 != "env" and args.routine not in _NVFP4_4OVER6_ROUTINES:
-        parser.error(
+        raise ValueError(
             f"--nvfp4_4over6 does not apply to {args.routine} "
             f"(applies to: {', '.join(_NVFP4_4OVER6_ROUTINES)})"
         )
@@ -501,6 +501,7 @@ def testMxfp8Quantize(args):
     # --no_sf_swizzled_layout selects the linear layout; otherwise --sf_layout
     # (default 128x4) picks the swizzled variant.
     sf_layout_str = args.sf_layout if is_sf_swizzled_layout else "linear"
+    is_sf_swizzled_layout = sf_layout_str != "linear"  # --sf_layout linear too
     sf_layout = {
         "128x4": SfLayout.layout_128x4,
         "8x4": SfLayout.layout_8x4,
@@ -1203,6 +1204,12 @@ def testNvfp4Quantize(args):
                     _assert_nvfp4_refcheck_tensor_equal(
                         "x_q", cur_backend, ref_backend, x_q, ref_x_q, min_match_pct
                     )
+                    if not do_shuffle:
+                        # Logical rows only: swizzle padding would count as agreement.
+                        sf, ref_sf = (
+                            _unswizzled_sf_rows(t, m, k, sf_vec_size, sf_layout_str)
+                            for t in (sf, ref_sf)
+                        )
                     _assert_nvfp4_refcheck_tensor_equal(
                         "sf", cur_backend, ref_backend, sf, ref_sf, min_match_pct
                     )
@@ -1581,15 +1588,26 @@ def testGroupedQuantize(args):
             a, mask, global_sf, **nvfp4_4over6_kwargs
         )
 
-    outputs = {}
+    outputs, out_scales = {}, {}
     if run_refcheck:
         for backend in backends:
-            x_q, _ = run_backend(backend, a, mask, global_sf)
+            x_q, sf = run_backend(backend, a, mask, global_sf)
             # Logical [M, K', B] -> physical [B, M, K'], valid rows / columns only
             outputs[backend] = (
                 x_q.permute(2, 0, 1)[:, :masked_m, : (k if is_mxfp8 else k // 2)]
                 .detach()
                 .clone()
+            )
+            # Logical 6D -> one 128x4-swizzled buffer per group -> [B, masked_m, K / block]
+            sf = sf.permute(5, 2, 4, 0, 1, 3)
+            padded_k = sf.shape[2] * 4 * sf_vec_size
+            out_scales[backend] = torch.stack(
+                [
+                    _unswizzled_sf_rows(g, m, padded_k, sf_vec_size, "128x4")[
+                        :masked_m, : k // sf_vec_size
+                    ]
+                    for g in sf
+                ]
             )
 
     backend_times = _bench_backends(
@@ -1603,10 +1621,11 @@ def testGroupedQuantize(args):
             # (silu_and_mul first for the fused routine, rounded to the input
             # dtype as the kernel does)
             src = flashinfer.silu_and_mul(a.reshape(-1, in_k)) if is_act else a
-            ref_q, _ = flashinfer.mxfp8_quantize(
+            ref_q, ref_sf = flashinfer.mxfp8_quantize(
                 src.reshape(-1, k), is_sf_swizzled_layout=False
             )
             ref_q = ref_q.view(batch_size, m, -1)[:, :masked_m, :k]
+            ref_sf = ref_sf.view(torch.uint8).view(batch_size, m, -1)[:, :masked_m]
             tested = list(outputs.keys())
             for backend in tested:
                 dist = fp8_code_distance(outputs[backend], ref_q)
@@ -1616,6 +1635,13 @@ def testGroupedQuantize(args):
                     f"{backend} vs per-group mxfp8_quantize (> 1 fp8 step)",
                     int((dist > 1).sum().item()),
                     dist.numel(),
+                )
+                _check_mismatch(
+                    args,
+                    routine,
+                    f"{backend} scales vs per-group mxfp8_quantize",
+                    int((out_scales[backend] != ref_sf).sum().item()),
+                    ref_sf.numel(),
                 )
             for backend in tested[1:]:
                 dist = fp8_code_distance(outputs[backend], outputs[tested[0]])
@@ -1630,14 +1656,18 @@ def testGroupedQuantize(args):
             # Per-group fp4_quantize (silu_and_mul first for the fused routine),
             # exact on the valid rows, as tests/utils/test_fp4_quantize.py does.
             ref_name = ("silu_and_mul + " if is_act else "") + "per-group fp4_quantize"
-            ref_rows = []
+            ref_rows, ref_sf_rows = [], []
             for g in range(batch_size):
                 src = flashinfer.silu_and_mul(a[g]) if is_act else a[g]
-                ref_q, _ = flashinfer.fp4_quantize(
+                ref_q, ref_sf = flashinfer.fp4_quantize(
                     src, global_sf[g : g + 1], 16, False, True, **nvfp4_4over6_kwargs
                 )
                 ref_rows.append(ref_q[:masked_m].view(torch.uint8))
+                ref_sf_rows.append(
+                    _unswizzled_sf_rows(ref_sf, m, k, sf_vec_size, "128x4")[:masked_m]
+                )
             ref_bytes = torch.stack(ref_rows)
+            ref_sf_bytes = torch.stack(ref_sf_rows)
             for backend, x_q in outputs.items():
                 cur_bytes = x_q.contiguous().view(torch.uint8)
                 _check_mismatch(
@@ -1646,6 +1676,13 @@ def testGroupedQuantize(args):
                     f"{backend} vs {ref_name}",
                     int((cur_bytes != ref_bytes).sum().item()),
                     cur_bytes.numel(),
+                )
+                _check_mismatch(
+                    args,
+                    routine,
+                    f"{backend} scales vs {ref_name}",
+                    int((out_scales[backend] != ref_sf_bytes).sum().item()),
+                    ref_sf_bytes.numel(),
                 )
 
     valid_elems = batch_size * masked_m * k
@@ -1738,6 +1775,15 @@ def testPerTokenGroupQuant8bit(args):
         if args.quant_dtype == "int8"
         else dtype_str_to_torch_dtype(args.quant_dtype)
     )
+    if "cuda" in backends and (group_size != 128 or input_dtype == torch.float32):
+        print(
+            "[INFO] cuda backend of per_token_group_quant_8bit needs --group_size 128 "
+            "and float16 / bfloat16 input. Skipping."
+        )
+        backends = [b for b in backends if b != "cuda"]
+        if len(backends) == 0:
+            print("[ERROR] No backends to test. Exiting.")
+            return res
     ## Done parsing input arguments
 
     x = torch.randn(m, k, dtype=input_dtype, device=device)
@@ -2169,7 +2215,17 @@ def testNvfp4KvDequantizePaged(args):
     output_k = torch.empty(out_shape, dtype=input_dtype, device=device)
     output_v = torch.empty(out_shape, dtype=input_dtype, device=device)
 
-    def run_backend(backend, output_k, output_v):
+    def run_backend(
+        backend,
+        output_k,
+        output_v,
+        k_cache,
+        v_cache,
+        k_sf,
+        v_sf,
+        block_tables,
+        seq_lens,
+    ):
         if backend != "cuda":
             raise ValueError(f"Unsupported backend: {backend}")
         return flashinfer.nvfp4_kv_dequantize_paged(
@@ -2184,8 +2240,19 @@ def testNvfp4KvDequantizePaged(args):
             kv_layout=kv_layout,
         )
 
+    # The cache is an input_arg, not a closure, so the timer can rotate it.
+    paged_args = (
+        output_k,
+        output_v,
+        k_cache,
+        v_cache,
+        k_sf,
+        v_sf,
+        block_tables,
+        seq_lens,
+    )
     backend_times = _bench_backends(
-        args, backends, run_backend, (output_k, output_v), is_cuda_graph_compatible
+        args, backends, run_backend, paged_args, is_cuda_graph_compatible
     )
 
     if run_refcheck:
@@ -2207,7 +2274,7 @@ def testNvfp4KvDequantizePaged(args):
         ref_k = gathered_reference(k_cache, k_sf, k_scale)
         ref_v = gathered_reference(v_cache, v_sf, v_scale)
         for backend in backends:
-            run_backend(backend, output_k, output_v)
+            run_backend(backend, *paged_args)
             for name, out, ref in (("K", output_k, ref_k), ("V", output_v, ref_v)):
                 num_bad, num_total, _ = is_close_stats(
                     ref.float(), out.float(), rtol=1e-3, atol=1e-3

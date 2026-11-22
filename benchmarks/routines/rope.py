@@ -248,23 +248,27 @@ def parse_rope_args(line, parser):
     )
     mla_kv_routines = ("rope_quantize_fp8", "rope_quantize_fp8_append_paged_kv_cache")
     if args.inplace and args.routine not in inplace_routines:
-        parser.error(f"--inplace has no effect on {args.routine} (no _inplace variant)")
+        raise ValueError(
+            f"--inplace has no effect on {args.routine} (no _inplace variant)"
+        )
     if args.mla_kv and args.routine not in mla_kv_routines:
-        parser.error(
+        raise ValueError(
             f"--mla_kv applies to {', '.join(mla_kv_routines)} only "
             "(mla_rope_quantize_fp8 is always MLA)"
         )
     if args.mla_kv and args.kv_layout != "NHD":
-        parser.error("--mla_kv uses 3D (ckv, kpe) caches; --kv_layout does not apply")
+        raise ValueError(
+            "--mla_kv uses 3D (ckv, kpe) caches; --kv_layout does not apply"
+        )
     # MLA needs a non-empty compressed (no-RoPE) part: k_nope / the ckv cache.
     if args.mla_kv and args.routine == "rope_quantize_fp8" and args.no_rope_dim <= 0:
-        parser.error("--mla_kv requires --no_rope_dim > 0")
+        raise ValueError("--mla_kv requires --no_rope_dim > 0")
     if (
         args.mla_kv
         and args.routine == "rope_quantize_fp8_append_paged_kv_cache"
         and args.rotary_dim >= args.head_dim
     ):
-        parser.error("--mla_kv requires --rotary_dim < --head_dim")
+        raise ValueError("--mla_kv requires --rotary_dim < --head_dim")
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")

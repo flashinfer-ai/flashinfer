@@ -2680,13 +2680,20 @@ def testFusedAddRmsnormFp8BlockQuant(args):
             reference_out = (blocks * (448.0 / amax)).to(torch.float8_e4m3fn)
             reference_scale = (amax / 448.0).squeeze(-1)
             checks = [
-                ("residual", x.to(input_dtype), residual_out, 1e-2),
-                ("normed_out", reference_normed, normed_out, 1e-2),
-                ("block_scale", reference_scale, block_scale.t()[:batch_size], 1e-3),
+                ("residual", x.to(input_dtype), residual_out, 1e-2, 1e-2),
+                ("normed_out", reference_normed, normed_out, 1e-2, 1e-2),
+                # Scales are ~amax / 448 (1e-2 and below): relative tolerance only.
+                (
+                    "block_scale",
+                    reference_scale,
+                    block_scale.t()[:batch_size],
+                    1e-3,
+                    1e-8,
+                ),
             ]
-            for name, ref, got, tol in checks:
+            for name, ref, got, rtol, atol in checks:
                 num_bad, num_elements, pct = is_close_stats(
-                    ref, got, rtol=tol, atol=tol
+                    ref, got, rtol=rtol, atol=atol
                 )
                 if num_bad > 0:
                     print(
