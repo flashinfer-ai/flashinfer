@@ -113,16 +113,29 @@ def kv_tile_is_fully_visible(
     )
 
 
+_PACKED_TILE_MAX = 0xFFFF
+
+
 def pack_kv_tile_range(begin, end):
     """Pack a tile range ``[begin, end)`` into one 32-bit word, ``end << 16 | begin``.
 
     Kernels whose softmax registers are at their budget carry the range
-    through the KV loop as one live value instead of two. Both bounds must
-    lie in ``[0, 65535]``.
+    through the KV loop as one live value instead of two. Both bounds are
+    clamped to 65535, which only shrinks the range: an open or far right bound
+    keeps tiles from 65535 on masked, and a range starting there is empty.
     """
+    begin = _imin(begin, _PACKED_TILE_MAX)
+    end = _imin(end, _PACKED_TILE_MAX)
     return (end << 16) | begin
 
 
 def packed_kv_tile_in_range(tile_idx, packed_range):
-    """Return whether ``tile_idx`` lies in a range packed by :func:`pack_kv_tile_range`."""
-    return kv_tile_in_range(tile_idx, packed_range & 0xFFFF, packed_range >> 16)
+    """Return whether ``tile_idx`` lies in a range packed by :func:`pack_kv_tile_range`.
+
+    The 32-bit word may be negative, so the upper field is decoded unsigned.
+    """
+    return kv_tile_in_range(
+        tile_idx,
+        packed_range & _PACKED_TILE_MAX,
+        (packed_range >> 16) & _PACKED_TILE_MAX,
+    )

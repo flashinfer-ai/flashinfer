@@ -471,6 +471,37 @@ def test_unmasked_kv_tile_range_matches_per_tile_bounds() -> None:
 
 
 @pytest.mark.parametrize(
+    ("begin", "end"),
+    (
+        pytest.param(3, 9, id="small"),
+        pytest.param(0, 0x7FFF, id="end-below-sign-bit"),
+        pytest.param(5, 0x8000, id="end-sets-sign-bit"),
+        pytest.param(5, 0x3FFFFFFF // 128, id="open-right-bound"),
+        pytest.param(65536, 65537, id="range-past-16-bits"),
+        pytest.param(70000, 70000, id="empty-past-16-bits"),
+    ),
+)
+def test_packed_kv_tile_range_never_unmasks_outside_range(begin: int, end: int) -> None:
+    """The packed word, read back as a signed 32-bit register, only shrinks the range."""
+    pytest.importorskip("cutlass", minversion="4.7.0")
+    from flashinfer.attention.prims_ts.kernels.mask import (
+        kv_tile_in_range,
+        pack_kv_tile_range,
+        packed_kv_tile_in_range,
+    )
+
+    packed = pack_kv_tile_range(begin, end) & 0xFFFFFFFF
+    packed_i32 = packed - (1 << 32) if packed >= 1 << 31 else packed
+    for tile_idx in (0, 1, begin - 1, begin, end - 1, end, 0xFFFE, 0xFFFF, 0x10000):
+        if tile_idx < 0:
+            continue
+        in_packed = packed_kv_tile_in_range(tile_idx, packed_i32)
+        assert not in_packed or kv_tile_in_range(tile_idx, begin, end)
+        if end <= 0xFFFF:
+            assert in_packed == kv_tile_in_range(tile_idx, begin, end)
+
+
+@pytest.mark.parametrize(
     ("mask_type", "cu_seqlens_q", "seq_len_q", "expected"),
     (
         pytest.param("dense", None, 4, False, id="dense"),
