@@ -15,7 +15,7 @@
  */
 // SM120 (RTX PRO 6000 / 6000D class) MXFP4 MegaMoE for decode-size batches over PCIe P2P, one
 // persistent kernel per rank: routing exchange -> dispatch (the staged MXFP8 rows, 16 B P2P stores
-// into the destination expert pool) -> FC1 + clamped SwiGLU (swap-AB W4A8 mma.sync) -> FC2 -> P2P
+// into the per-source token inbox) -> FC1 + clamped SwiGLU (swap-AB W4A8 mma.sync) -> FC2 -> P2P
 // push of each (token, k) partial back to its source rank -> top-k combine. No cross-rank barrier:
 // every source writes an epoch-tagged flag into the consumer's memory (st.release.sys) after its
 // data, the consumer polls its own memory (ld.acquire.sys); there are no remote atomics.
@@ -91,7 +91,7 @@ constexpr size_t kPf0Bytes = size_t(64)
 constexpr int kUnroll = 4;           // K64 steps in flight per warp
 constexpr int kMaxWorld = 8;         // ranks: one PCIe host
 constexpr int kMaxEl = 256;          // local experts per rank
-constexpr int kMaxTopk = 8;          // routes per token (pool metadata packs token * 8 + k)
+constexpr int kMaxTopk = 8;          // routes per token (route metadata packs token * 8 + k)
 constexpr uint64_t kSpinNs =
     30000000000ull;  // spin timeout: startup warm-ups can skew ranks by seconds
 
@@ -120,7 +120,8 @@ constexpr int kSigRoute = 0, kSigDispatch = kMaxWorld, kSigComb = 2 * kMaxWorld,
               kGinSignals = 3 * kMaxWorld;
 
 struct Peers {
-  uint8_t* pool[kMaxWorld];        // [EL][W][TCAP] rows of pool_row_bytes(H)   (dest-owned)
+  uint8_t* pool[kMaxWorld];        // [W][TCAP] P2P token rows of pool_row_bytes(H) (dest-owned)
+  int* p2p_map[kMaxWorld];         // [W][EL][TCAP] source (token * 8 + k)
   int* recv_cnt[kMaxWorld];        // [W][EL]
   int* recv_flag[kMaxWorld];       // [W] epoch
   __nv_bfloat16* comb[kMaxWorld];  // [TCAP][TOPK][H]                    (src-owned)
@@ -629,23 +630,22 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
         d4[1] = s4[1];
         s_sc[threadIdx.x] = a.x_sf[size_t(t) * (H / 32) + threadIdx.x];
       }
-      if (warp < TOPK) {  // warp k: destination row of copy k (slot = tokens t' < t routed to the
-                          // same expert)
-        const int e = route_at(a, t, warp);  // < 0: masked route, nothing to send
+      if (warp < TOPK) {  // warp k: route k and its destination rank
+        const int e = route_at(a, t, warp);
         int slot = 0;
         for (int u = lane; u < t * TOPK; u += 32) slot += (route_at(a, u / TOPK, u % TOPK) == e);
 #pragma unroll
         for (int o = 16; o; o >>= 1) slot += __shfl_xor_sync(0xffffffffu, slot, o);
 #if MEGAMOE_SM120_GIN_DEVICE
-        if (e >= 0 && is_gin(a, e / EL)) {  // slot table entry: packed (el, slot) -> this token
-          int pre = 0;                      // this rank's routes to lower experts of that rank
+        if (e >= 0 && is_gin(a, e / EL)) {
+          int pre = 0;
           for (int u = lane; u < a.T * TOPK; u += 32) {
             const int e2 = route_at(a, u / TOPK, u % TOPK);
             pre += (e2 >= 0 && e2 / EL == e / EL && e2 % EL < e % EL);
           }
 #pragma unroll
           for (int o = 16; o; o >>= 1) pre += __shfl_xor_sync(0xffffffffu, pre, o);
-          if (lane == 0) {  // the same packed index places this copy's partial on the way back
+          if (lane == 0) {
             a.gin.stage_slot[(e / EL) * TCAP * TOPK + pre + slot] = t;
             a.gin.cidx[t * TOPK + warp] = pre + slot;
           }
@@ -656,9 +656,12 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
             s_rowk[warp] = -1;
           } else {
             const int dst = e / EL, el = e % EL;
-            const int row = (el * W + a.rank) * TCAP + slot;
-            s_rowk[warp] = row;
+            s_rowk[warp] = a.rank * TCAP + t;
             s_dstk[warp] = dst;
+#if MEGAMOE_SM120_GIN_DEVICE
+            if (!is_gin(a, dst))
+#endif
+              a.peers.p2p_map[dst][(a.rank * EL + el) * TCAP + slot] = t * 8 + warp;
           }
         }
       }
@@ -678,6 +681,9 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           dst = a.gin.stage_row + size_t(t) * RX;
         } else {
           if (s_rowk[k] < 0 || is_gin(a, s_dstk[k])) continue;
+          bool first = true;
+          for (int j = 0; j < k; ++j) first &= !(s_rowk[j] >= 0 && s_dstk[j] == s_dstk[k]);
+          if (!first) continue;
           dst = a.peers.pool[s_dstk[k]] + size_t(s_rowk[k]) * RX;
         }
         if (q < H / 16)
@@ -779,8 +785,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
 #pragma unroll
       for (int q = 0; q < kPer; ++q) {
         const int u = base + q * blockDim.x + threadIdx.x;
-        if (e[q] >= 0 && e[q] / EL == a.rank)
-          atomicAdd(&m.cnt[u / RS][e[q] % EL], 1);  // e < 0: padding
+        if (e[q] >= 0 && e[q] / EL == a.rank) atomicAdd(&m.cnt[u / RS][e[q] % EL], 1);
       }
     }
 #if MEGAMOE_SM120_GIN_DEVICE
@@ -933,13 +938,16 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
         for (int h = 0; h < NH; ++h) {
           int w, i;
           token_src(m, el, jt[h], W, w, i);
-          const size_t row = (size_t(el) * W + w) * TCAP + i;
-          xr[h] = pool + row * RX;
 #if MEGAMOE_SM120_GIN_DEVICE
-          if (is_gin(a, w))
+          if (is_gin(a, w)) {
             xr[h] = a.gin.inbox +
                     (size_t(w) * TCAP + a.gin.slotmap[w * TCAP * TOPK + s_pw[w] + i]) * RX;
+          } else
 #endif
+          {
+            const int meta = a.peers.p2p_map[a.rank][(w * EL + el) * TCAP + i];
+            xr[h] = pool + (size_t(w) * TCAP + meta / 8) * RX;
+          }
           xs[h] = reinterpret_cast<const uint32_t*>(xr[h] + H);
         }
         item_gemm<NH>(acc, w13_of(a, el), ws13_of(a, el), 2 * I / 16, nb0, H, xr, xs, lane,
@@ -1025,8 +1033,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           else
 #endif
           {
-            const int meta = *reinterpret_cast<const int*>(
-                pool + ((size_t(el) * W + w) * TCAP + i) * RX + H + H / 32);
+            const int meta = a.peers.p2p_map[a.rank][(w * EL + el) * TCAP + i];
             dst = a.peers.comb[w] + (size_t(meta / 8) * TOPK + meta % 8) * H;
           }
           *reinterpret_cast<uint4*>(dst + rb * kRowsPerItem + q * 8) =
