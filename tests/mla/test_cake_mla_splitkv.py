@@ -26,7 +26,8 @@ the max_seq_len 2049 where the listed ranges of B200 and GB300 start):
 - the ``max_seq_len`` field of the ``backend="auto"`` decision memo keeps the side
   of the split-KV range start, also a start inside a bucket (no GPU needed);
 - the split-count rule: up to 32 splits, up to 64 for one query row whose
-  max_seq_len KV tiles hold at least 65536 tokens, every other launch unchanged,
+  max_seq_len KV tiles hold at least the device's start (65536 tokens on B200,
+  131072 on GB300; an unlisted device keeps 32), every other launch unchanged,
   and the binding's caps equal the host's (no GPU needed);
 - more than 32 splits (the wide reducer build), forced at 33, 37, 38, 48 and 64
   splits and at the counts the rule picks: on live rows accuracy against FP64 at
@@ -668,23 +669,33 @@ def _wide_plan(total_q, max_seq_len, num_sms):
 
 def test_splitkv_plan_wide_rule():
     """``plan_kv_split`` allows up to 64 splits only for one query row whose
-    max_seq_len KV tiles hold at least 65536 tokens; every other launch
-    keeps the 32-split count it had. One wave of clusters at most, and the count
-    depends on max_seq_len only through its KV tile count. No GPU needed."""
+    max_seq_len KV tiles hold at least the device's start (65536 tokens on B200,
+    131072 on GB300); every other launch, an unlisted device and a call without
+    ``arch`` keep the 32-split count they had. One wave of clusters at most, and
+    the count depends on max_seq_len only through its KV tile count. No GPU
+    needed."""
     assert cake_module._SPLITKV_MAX_SPLIT == 64
     assert cake_module._SPLITKV_NARROW_MAX_SPLIT == 32
-    assert cake_module._SPLITKV_WIDE_MIN_SEQ_LEN == 65536
+    starts = {("sm_100a", 148): 65536, ("sm_103a", 152): 131072}
+    assert starts == cake_module._SPLITKV_WIDE_MIN_SEQ_LEN
     assert cake_module._SPLITKV_WIDE_MAX_ROWS == 1
-    assert cake_module._SPLITKV_WIDE_MIN_SEQ_LEN % cake_module._KV_TILE == 0
+    for start in starts.values():
+        assert start % cake_module._KV_TILE == 0
     plan = cake_module.plan_kv_split
-    # (rows, max_seq_len) -> splits on B200 (148 SMs) and GB300 (152 SMs).
+    devices = (("sm_100a", 148), ("sm_103a", 152))
+    # (rows, max_seq_len) -> splits on B200 (sm_100a, 148 SMs) and GB300
+    # (sm_103a, 152 SMs).
     expected = {
         (1, 32768): (32, 32),
         (1, 33280): (29, 29),
         (1, 65408): (32, 32),
-        (1, 65409): (64, 64),
-        (1, 65536): (64, 64),
-        (1, 65568): (57, 57),
+        (1, 65409): (64, 32),
+        (1, 65536): (64, 32),
+        (1, 65568): (57, 31),
+        (1, 130944): (64, 32),
+        (1, 130945): (64, 64),
+        (1, 131072): (64, 64),
+        (1, 131200): (61, 61),
         (1, 262144): (64, 64),
         (2, 32768): (32, 32),
         (2, 65536): (32, 32),
@@ -693,8 +704,9 @@ def test_splitkv_plan_wide_rule():
         (3, 262144): (24, 25),
     }
     for (rows, max_seq_len), splits in expected.items():
-        for num_sms, split in zip((148, 152), splits, strict=True):
-            assert plan(rows, max_seq_len, num_sms) == split, (
+        for (arch, num_sms), split in zip(devices, splits, strict=True):
+            assert plan(rows, max_seq_len, num_sms, arch) == split, (
+                arch,
                 num_sms,
                 rows,
                 max_seq_len,
@@ -717,23 +729,30 @@ def test_splitkv_plan_wide_rule():
         65409,
         65536,
         65568,
+        130944,
+        130945,
         131072,
+        131200,
         262144,
     )
-    for num_sms in (148, 152):
+    # The listed devices, the other arch at the same SM count, and no arch.
+    for arch, num_sms in devices + (("sm_103a", 148), ("sm_100a", 152), (None, 148)):
+        start = starts.get((arch, num_sms))
         for rows in range(1, 39):
             for max_seq_len in lengths:
-                split = plan(rows, max_seq_len, num_sms)
-                case = (num_sms, rows, max_seq_len)
+                split = plan(rows, max_seq_len, num_sms, arch)
+                case = (arch, num_sms, rows, max_seq_len)
                 tiles = -(-max_seq_len // 128)
-                if rows > 1 or tiles * 128 < 65536:
+                if start is None or rows > 1 or tiles * 128 < start:
                     assert split == _narrow_plan(rows, max_seq_len, num_sms), case
                 else:
                     assert split == _wide_plan(rows, max_seq_len, num_sms), case
+                if arch is None:
+                    assert split == plan(rows, max_seq_len, num_sms), case
                 assert 1 <= split <= 64, case
                 assert rows * split <= num_sms // 2, case
                 # Every max_seq_len of one KV tile count plans one count.
-                assert split == plan(rows, tiles * 128, num_sms), case
+                assert split == plan(rows, tiles * 128, num_sms, arch), case
 
 
 def test_splitkv_binding_caps_match_the_host():
@@ -779,8 +798,10 @@ def forced_split(monkeypatch):
     plan = cake_module.plan_kv_split
 
     def force(value):
-        def spy(total_q, max_seq_len, num_sms):
-            split = plan(total_q, max_seq_len, num_sms) if value is None else value
+        def spy(total_q, max_seq_len, num_sms, arch=None):
+            split = (
+                plan(total_q, max_seq_len, num_sms, arch) if value is None else value
+            )
             used.append(split)
             return split
 
@@ -887,9 +908,9 @@ def test_splitkv_wide_split_counts_match_trtllm_gen_and_fp64(
 
 # name: (batch, q_len, page_size, sink, bmm2_scale, seq_lens pattern, max_seq_len)
 _WIDE_PLAN_CASES = {
-    "rows1_kv65536": (1, 1, 32, False, 1.0, "varied", 65536),
-    "rows1_kv65568": (1, 1, 32, False, 1.0, "varied", 65568),
-    "rows1_q_len1_page64_sink_bmm2_kv131104": (1, 1, 64, True, 0.5, "varied", 131104),
+    "rows1_kv131072": (1, 1, 32, False, 1.0, "varied", 131072),
+    "rows1_kv131200": (1, 1, 32, False, 1.0, "varied", 131200),
+    "rows1_q_len1_page64_sink_bmm2_kv196736": (1, 1, 64, True, 0.5, "varied", 196736),
 }
 
 
@@ -897,15 +918,16 @@ _WIDE_PLAN_CASES = {
 def test_splitkv_wide_plan_cases_match_trtllm_gen_and_fp64(
     splitkv_device, splitkv_domains, forced_split, case
 ):
-    """The split counts the rule picks above 32 (64 at one row of KV 65536, 57
-    at KV 65568, 61 at KV 131104): accuracy against FP64 at the level of
-    TRTLLM-GEN."""
+    """The split counts the rule picks above 32 on B200 and GB300 (64 at one row
+    of KV 131072, 61 at KV 131200, 62 at KV 196736): accuracy against FP64 at
+    the level of TRTLLM-GEN."""
     batch, q_len, max_seq_len = (
         _WIDE_PLAN_CASES[case][0],
         _WIDE_PLAN_CASES[case][1],
         _WIDE_PLAN_CASES[case][6],
     )
-    expected = cake_module.plan_kv_split(batch * q_len, max_seq_len, splitkv_device[1])
+    arch, num_sms = splitkv_device
+    expected = cake_module.plan_kv_split(batch * q_len, max_seq_len, num_sms, arch)
     if expected <= cake_module._SPLITKV_NARROW_MAX_SPLIT:
         pytest.skip(f"this device plans {expected} splits for {case}")
     used = forced_split(None)
@@ -944,17 +966,17 @@ def _check_deterministic(decode, query):
 @pytest.mark.parametrize(
     "case,num_split",
     [("rows2_q_len2_page64_sink_kv32768", split) for split in _WIDE_SPLITS]
-    + [("rows1_kv65536", None)],
+    + [("rows1_kv131072", None)],
 )
 def test_splitkv_wide_split_counts_are_deterministic(
     splitkv_device, splitkv_domains, forced_split, case, num_split
 ):
-    """More than 32 splits (forced, or the rule's 64 at one row of KV 65536):
+    """More than 32 splits (forced, or the rule's 64 at one row of KV 131072):
     200 eager calls and 1000 graph replays give identical bits, and the
     stateless mode agrees."""
     batch, q_len, page_size, max_seq_len, has_sink = {
         "rows2_q_len2_page64_sink_kv32768": (1, 2, 64, 32768, True),
-        "rows1_kv65536": (1, 1, 32, 65536, False),
+        "rows1_kv131072": (1, 1, 32, 131072, False),
     }[case]
     used = forced_split(num_split)
     query, kv_cache, block_tables, seq_lens = _inputs(
