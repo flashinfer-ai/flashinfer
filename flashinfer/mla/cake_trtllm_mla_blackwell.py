@@ -37,7 +37,7 @@ limitations under the License.
 # generic CLC launch of ``num_sms // 2 < rows <= 1024`` rows is preceded by a small
 # program that writes its longest-first work order.  The split-KV program cuts each
 # row's KV tiles into ``num_split`` equal ranges (``plan_kv_split``, from host-known
-# sizes only: up to 32 splits, 64 for one or two query rows of long KV) and a
+# sizes only: up to 32 splits, 64 for one query row of long KV) and a
 # reducer program merges the partials in a fixed order.
 # Ragged value-split calls, the exact-geometry and native split-KV programs and
 # the generic tails read
@@ -716,13 +716,14 @@ _SPLITKV_RANGE: dict[tuple[str, int], tuple[int, int]] = {
 _SPLITKV_MAX_SPLIT = 64
 # Most KV splits below _SPLITKV_WIDE_MIN_SEQ_LEN or above _SPLITKV_WIDE_MAX_ROWS query
 # rows (the binding's CAKE_SPLITKV_NARROW_MAX_SPLIT).  At 32 splits, one query row uses
-# 32 and two query rows use 64 of the 74 (B200) or 76 (GB300) resident clusters; from
-# max_seq_len 32768 on, up to 64 splits measured faster, while max_seq_len 8192
-# and 16384 measured slower at 64 splits than at 32.  ``plan_kv_split`` compares
-# the KV tiles of max_seq_len (a multiple of _KV_TILE tokens) with the start.
+# 32 of the 74 (B200) or 76 (GB300) resident clusters; from max_seq_len 65536 on, one
+# query row measured faster at up to 64 splits.  Below max_seq_len 65536, and at two
+# query rows (37 or 38 splits), rows much shorter than max_seq_len measured slower than
+# at 32 splits: their extra splits hold no KV tile.  ``plan_kv_split`` compares the KV
+# tiles of max_seq_len (a multiple of _KV_TILE tokens) with the start.
 _SPLITKV_NARROW_MAX_SPLIT = 32
-_SPLITKV_WIDE_MIN_SEQ_LEN = 32768
-_SPLITKV_WIDE_MAX_ROWS = 2
+_SPLITKV_WIDE_MIN_SEQ_LEN = 65536
+_SPLITKV_WIDE_MAX_ROWS = 1
 
 DOMAIN_BF16_NATIVE_SPLIT8 = "mla_bf16_native_split8_pdl"
 DOMAIN_BF16_VQUARTER = "mla_bf16_vquarter"
