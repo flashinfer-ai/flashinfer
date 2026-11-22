@@ -6,9 +6,9 @@ The binding links two reducer builds that write the same O and LSE bits: the
 eight-head-slice build, and the head build, which spreads a row's 128 heads over
 up to 128 CTAs and stages every partial row of a CTA once in shared memory. The
 binding launches the head build for at most ``CAKE_FP8_HEAD_REDUCE_MAX_ROWS``
-query rows split at least ``CAKE_FP8_HEAD_REDUCE_MIN_SPLIT`` ways when the
-reducer CTA count the host passes (``plan_fp8_reduce_ctas``) lets a CTA stage
-all of its partial rows; the slice build otherwise. These tests check:
+query rows split at least ``CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW`` ways per
+row when the reducer CTA count the host passes (``plan_fp8_reduce_ctas``) lets a
+CTA stage all of its partial rows; the slice build otherwise. These tests check:
 
 - the host rule: the reducer CTA count of every launch outside the head build
   is the one it was before, a head launch satisfies the head build's bounds,
@@ -76,7 +76,7 @@ def test_fp8_reduce_plan_rule():
     CTA count it had, gives a head launch ``min(128, num_sms // rows)`` CTAs
     within the stage bound, and ``fp8_head_reduce`` of the planned count says
     which build the binding launches. No GPU needed."""
-    assert cake_module._FP8_HEAD_REDUCE_MIN_SPLIT == 2
+    assert cake_module._FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW == 8
     assert cake_module._FP8_HEAD_REDUCE_MAX_CTAS == 128
     assert cake_module._FP8_HEAD_REDUCE_MAX_ITEMS == 112
     max_rows = cake_module._FP8_HEAD_REDUCE_MAX_ROWS
@@ -86,22 +86,27 @@ def test_fp8_reduce_plan_rule():
     plan_split = cake_module.plan_num_split
     plan = cake_module.plan_fp8_reduce_ctas
     head = cake_module.fp8_head_reduce
-    # (num_sms, rows, max_seq_len) -> (splits, head CTAs, slice CTAs).
+    # (num_sms, rows, max_seq_len) -> (splits, head CTAs, slice CTAs); no head CTAs
+    # where the head build does not apply (fewer than eight splits per row, or more
+    # rows than any architecture's maximum).
     expected = {
-        (148, 1, 384): (2, 128, 64),
-        (148, 1, 1024): (4, 128, 64),
+        (148, 1, 384): (2, None, 64),
+        (148, 1, 1024): (4, None, 64),
         (148, 1, 4096): (16, 128, 64),
         (148, 1, 16384): (64, 128, 64),
         (148, 1, 32768): (74, 128, 64),
-        (148, 2, 384): (2, 74, 64),
+        (148, 2, 384): (2, None, 64),
         (148, 2, 16384): (37, 74, 64),
         (148, 2, 32768): (37, 74, 64),
         (148, 3, 32768): (24, None, 49),
-        (152, 1, 384): (2, 128, 64),
+        (152, 1, 384): (2, None, 64),
+        (152, 1, 2048): (8, 128, 64),
         (152, 1, 4096): (16, 128, 64),
         (152, 1, 32768): (76, 128, 64),
         (152, 1, 262144): (76, 128, 64),
-        (152, 2, 1024): (4, 76, 64),
+        (152, 2, 1024): (4, None, 64),
+        (152, 2, 2048): (8, None, 64),
+        (152, 2, 4096): (16, 76, 64),
         (152, 2, 32768): (38, 76, 64),
         (152, 3, 32768): (25, None, 50),
     }
@@ -109,10 +114,11 @@ def test_fp8_reduce_plan_rule():
         num_sms, rows, max_seq_len = key
         assert plan_split(rows, max_seq_len, num_sms) == split
         for arch in ("sm_100a", "sm_103a"):
-            want = head_ctas if rows <= max_rows[arch] else slice_ctas
+            chosen = head_ctas is not None and rows <= max_rows[arch]
+            want = head_ctas if chosen else slice_ctas
             case = (arch, num_sms, rows, max_seq_len)
             assert plan(rows, split, num_sms, arch) == want, case
-            assert head(rows, split, want, arch) == (rows <= max_rows[arch]), case
+            assert head(rows, split, want, arch) == chosen, case
     heads = 0
     for arch in ("sm_100a", "sm_103a", "sm_90a"):
         arch_rows = max_rows.get(arch, 0)
@@ -125,7 +131,7 @@ def test_fp8_reduce_plan_rule():
                     head_ctas = min(128, max(1, num_sms // rows))
                     chosen = (
                         rows <= arch_rows
-                        and split >= 2
+                        and split >= 8 * rows
                         and _head_bound(split, head_ctas)
                     )
                     assert ctas == (
@@ -167,7 +173,9 @@ def test_fp8_reduce_binding_matches_host():
     max_rows = cake_module._FP8_HEAD_REDUCE_MAX_ROWS
     defaults = {
         "CAKE_FP8_HEAD_REDUCE_MAX_ROWS": max_rows["sm_100a"],
-        "CAKE_FP8_HEAD_REDUCE_MIN_SPLIT": cake_module._FP8_HEAD_REDUCE_MIN_SPLIT,
+        "CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW": (
+            cake_module._FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW
+        ),
         "CAKE_FP8_HEAD_REDUCE_MAX_CTAS": cake_module._FP8_HEAD_REDUCE_MAX_CTAS,
         "CAKE_FP8_HEAD_REDUCE_MAX_ITEMS": cake_module._FP8_HEAD_REDUCE_MAX_ITEMS,
     }
@@ -175,8 +183,9 @@ def test_fp8_reduce_binding_matches_host():
         assert text.count(f"#define {macro} ") == 1, macro
         assert f"#define {macro} {value}\n" in text, macro
     assert (
-        "if (num_queries <= CAKE_FP8_HEAD_REDUCE_MAX_ROWS && "
-        "num_split >= CAKE_FP8_HEAD_REDUCE_MIN_SPLIT &&"
+        "if (num_queries <= CAKE_FP8_HEAD_REDUCE_MAX_ROWS &&\n"
+        "        num_split >= (int64_t)CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW"
+        " * num_queries &&"
     ) in text
     assert (
         "((128 + (int64_t)num_reduce_ctas - 1) / num_reduce_ctas) * num_split "
@@ -216,7 +225,7 @@ def test_fp8_reduce_binding_matches_host():
         assert cake_module.MODULES[dependencies[2]]["arches"] == ["sm_100a", "sm_103a"]
         flags = family.get("binding_flags", [])
         for macro in (
-            "CAKE_FP8_HEAD_REDUCE_MIN_SPLIT",
+            "CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW",
             "CAKE_FP8_HEAD_REDUCE_MAX_CTAS",
             "CAKE_FP8_HEAD_REDUCE_MAX_ITEMS",
         ):
@@ -397,7 +406,7 @@ def _expected_head(rows, num_split):
     arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
     return (
         rows <= cake_module._FP8_HEAD_REDUCE_MAX_ROWS.get(arch, 0)
-        and num_split >= 2
+        and num_split >= 8 * rows
         and _head_bound(num_split, min(128, num_sms // rows))
     )
 

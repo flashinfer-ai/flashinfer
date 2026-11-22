@@ -22,8 +22,9 @@
 // It links two builds of the split reducer that write the same O and LSE bits. The head build
 // (CAKE_VARIANT_NS_2) spreads each query row's 128 heads over up to 128 CTAs and stages every partial
 // row of a CTA once in shared memory by bulk copies; the binding launches it for at most
-// CAKE_FP8_HEAD_REDUCE_MAX_ROWS query rows when that stage holds all of a CTA's partial rows, and the
-// eight-head-slice build (CAKE_VARIANT_NS_1) otherwise.
+// CAKE_FP8_HEAD_REDUCE_MAX_ROWS query rows split at least CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW
+// ways per row when that stage holds all of a CTA's partial rows, and the eight-head-slice build
+// (CAKE_VARIANT_NS_1) otherwise.
 // dispatch-policy-revision: unpinned
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -59,9 +60,10 @@
 #ifndef CAKE_FP8_HEAD_REDUCE_MAX_ROWS
 #define CAKE_FP8_HEAD_REDUCE_MAX_ROWS 2
 #endif
-// Fewest splits the head reducer merges.
-#ifndef CAKE_FP8_HEAD_REDUCE_MIN_SPLIT
-#define CAKE_FP8_HEAD_REDUCE_MIN_SPLIT 2
+// Fewest splits the head reducer merges, per query row (num_split >= this x num_queries); below
+// it the slice build is faster.
+#ifndef CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW
+#define CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW 8
 #endif
 // Most head-reducer CTAs per query row (num_reduce_ctas): one head each at 128.
 #ifndef CAKE_FP8_HEAD_REDUCE_MAX_CTAS
@@ -539,7 +541,8 @@ void Dispatch(tvm::ffi::TensorView arg_query, tvm::ffi::TensorView arg_kv, tvm::
     // Both reducer builds write the same O and LSE bits; num_reduce_ctas is the head build's CTA count
     // per query row (grid (num_reduce_ctas, num_queries)) or the other build's per eight-head slice
     // group (grid (num_reduce_ctas, 2, num_queries)).
-    if (num_queries <= CAKE_FP8_HEAD_REDUCE_MAX_ROWS && num_split >= CAKE_FP8_HEAD_REDUCE_MIN_SPLIT &&
+    if (num_queries <= CAKE_FP8_HEAD_REDUCE_MAX_ROWS &&
+        num_split >= (int64_t)CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW * num_queries &&
         num_reduce_ctas >= 1 && num_reduce_ctas <= CAKE_FP8_HEAD_REDUCE_MAX_CTAS &&
         ((128 + (int64_t)num_reduce_ctas - 1) / num_reduce_ctas) * num_split <= CAKE_FP8_HEAD_REDUCE_MAX_ITEMS) {
       int64_t gx = num_reduce_ctas;

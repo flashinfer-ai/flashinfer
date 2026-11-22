@@ -1099,14 +1099,16 @@ def _warn_generic_tail(reason: str) -> None:
 # num_split splits, at most _FP8_HEAD_REDUCE_MAX_ITEMS) once in shared memory, with one CTA
 # per SM.  On B200 (sm_100a) and GB300 (sm_103a) the head build measured faster at one
 # and two query rows, where the slice build leaves most SMs idle, and slower at four
-# query rows (on GB300 from three).
+# query rows (on GB300 from three); at one and two rows it is slower below about eight
+# splits per row, where each CTA has little to merge.
 # Most query rows the head build serves, per architecture (the binding's
 # CAKE_FP8_HEAD_REDUCE_MAX_ROWS: its default is the sm_100a value, the sm_103a module sets
 # its own); an unlisted architecture never takes the head build.
 _FP8_HEAD_REDUCE_MAX_ROWS: dict[str, int] = {"sm_100a": 2, "sm_103a": 2}
-# Fewest splits, most CTAs per query row and most staged partial rows per CTA of the head
-# build (the binding's CAKE_FP8_HEAD_REDUCE_MIN_SPLIT, _MAX_CTAS and _MAX_ITEMS).
-_FP8_HEAD_REDUCE_MIN_SPLIT = 2
+# Fewest splits per query row (``num_split >= _FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW *
+# work_items``), most CTAs per query row and most staged partial rows per CTA of the head
+# build (the binding's CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW, _MAX_CTAS and _MAX_ITEMS).
+_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW = 8
 _FP8_HEAD_REDUCE_MAX_CTAS = 128
 _FP8_HEAD_REDUCE_MAX_ITEMS = 112
 
@@ -1130,14 +1132,14 @@ def fp8_head_reduce(work_items: int, num_split: int, num_ctas: int, arch: str) -
     """Whether the FP8 page-64 binding launches the head build of the split
     reducer for ``work_items`` query rows, ``num_split`` splits and ``num_ctas``
     reducer CTAs per row: at most ``_FP8_HEAD_REDUCE_MAX_ROWS[arch]`` rows, at
-    least ``_FP8_HEAD_REDUCE_MIN_SPLIT`` splits, 1 to
+    least ``_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW * work_items`` splits, 1 to
     ``_FP8_HEAD_REDUCE_MAX_CTAS`` CTAs, and a CTA's partial rows
     (``ceil(128 / num_ctas)`` heads x ``num_split`` splits) within
     ``_FP8_HEAD_REDUCE_MAX_ITEMS``.  The binding makes the same test with its
     module's compile definitions."""
     return (
         work_items <= _FP8_HEAD_REDUCE_MAX_ROWS.get(arch, 0)
-        and num_split >= _FP8_HEAD_REDUCE_MIN_SPLIT
+        and num_split >= _FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW * work_items
         and 1 <= num_ctas <= _FP8_HEAD_REDUCE_MAX_CTAS
         and -(-_ALIGNED_HEADS // num_ctas) * num_split <= _FP8_HEAD_REDUCE_MAX_ITEMS
     )
@@ -1158,7 +1160,7 @@ def plan_fp8_reduce_ctas(
     slice_ctas = min(64, max(1, (num_sms * 2) // max(1, work_items * 2)))
     if (
         work_items > _FP8_HEAD_REDUCE_MAX_ROWS.get(arch, 0)
-        or num_split < _FP8_HEAD_REDUCE_MIN_SPLIT
+        or num_split < _FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW * work_items
     ):
         return slice_ctas
     head_ctas = min(_FP8_HEAD_REDUCE_MAX_CTAS, max(1, num_sms // max(1, work_items)))
