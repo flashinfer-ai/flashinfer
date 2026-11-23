@@ -70,20 +70,22 @@ def buffer_layout(
 ) -> list[int]:
     """Byte offsets of the symmetric buffer, in the order the binding reads them:
     [total, x, x_sf, topk_idx, topk_weights, pool, recv_cnt, recv_flag, comb, comb_flag,
-    route, route_flag, inter, inter_s, ctr, stage_row, inbox, stage_comb, comb_gin, slotmap,
-    stage_slot, cidx, stage_route]. Every region sits at the same offset on every rank; pool /
+    route, route_flag, inter, inter_s, ctr, stage_row, inbox, stage_comb, comb_gin, cidx,
+    stage_route]. Every region sits at the same offset on every rank; pool /
     recv_* / route* are written by the other ranks, comb by the expert ranks, the rest only
     locally. route holds, per source rank, its routes to each local expert and the number of its
-    tokens routed here. The last eight regions (empty without NIC pairs) serve GIN, which sends a token once per
-    rank: the token rows staged for (packed per GIN rank) and received from GIN ranks, the partials staged for and
-    received from GIN ranks, the slot tables received from and staged for GIN ranks (both
-    packed in the expert rank's (local expert, slot) order), and the packed row of each
-    (token, k)). ``wide``: the layout of the 32-rank kernel build (a larger counter block)."""
+    tokens routed here. The last six regions (empty without NIC pairs) serve GIN, which sends a
+    token once per rank: per GIN rank a block staged for it / received from it, its slot table
+    (packed in the expert rank's (local expert, slot) order, ending where the token rows start)
+    then the token rows (packed), so one put carries both; the partials staged for and received
+    from GIN ranks; the packed row of each (token, k); the routing counts staged for GIN ranks.
+    ``wide``: the layout of the 32-rank kernel build (a larger counter block)."""
     epr = experts // ranks
     rows = (
         epr * ranks * capacity
     )  # an expert pool slot per (local expert, source rank, token)
     row_bytes = pool_row_bytes(hidden)
+    gin_block = _align(capacity * topk * 4, 16) + capacity * row_bytes  # per GIN rank
     sizes = (
         capacity * hidden,
         capacity * (hidden // 32),
@@ -99,12 +101,10 @@ def buffer_layout(
         rows * intermediate,
         rows * (intermediate // 128) * 4,
         counter_ints(wide) * 4,
-        ranks * capacity * row_bytes if gin else 0,
-        ranks * capacity * row_bytes if gin else 0,
+        ranks * gin_block if gin else 0,
+        ranks * gin_block if gin else 0,
         ranks * capacity * topk * hidden * 2 if gin else 0,
         ranks * capacity * topk * hidden * 2 if gin else 0,
-        ranks * capacity * topk * 4 if gin else 0,
-        ranks * capacity * topk * 4 if gin else 0,
         capacity * topk * 4 if gin else 0,
         ranks * (epr + 1) * 4 if gin else 0,
     )

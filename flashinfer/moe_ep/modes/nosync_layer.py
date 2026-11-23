@@ -45,13 +45,14 @@ class NosyncOptions:
     A call runs the nosync kernel when every rank holds at most ``max_tokens_per_rank`` tokens
     (at most 128, the kernel's capacity) and the call's tokens on all ranks times ``top_k``
     average at most ``max_tokens_per_expert`` per expert; the layer bounds the total by the
-    largest rank's count times the EP size. Both must be the same on every rank. The default 32
-    is validated on DeepSeek-V4.1-Flash and GLM-5.3-Flash (RTX 6000D, EP8 on one host and EP16
-    across two): within it the kernel is faster than cake at most measured batches, slower at
-    some of the largest (random / balanced routing). Where the kernel stops winning depends on
-    the model, the routing and how the ranks are connected, so for the best performance measure
-    it on the deployment (``benchmarks/bench_megamoe_mxfp4_sm120.py --max-tokens-per-expert``)
-    and set it. ``transport`` and
+    largest rank's count times the EP size. Both must be the same on every rank. The default 128
+    keeps every call of DeepSeek-V4.1-Flash and GLM-5.3-Flash up to 128 tokens per rank on the
+    kernel through EP32; measured on RTX 6000D (EP8 on one host, EP16 across two, balanced
+    routing) the kernel is faster than cake there, and from 57 tokens per expert on the two are
+    within 1.5%. Where the kernel stops winning depends on the model, the routing and how the
+    ranks are connected, so for the best performance measure it on the deployment
+    (``benchmarks/bench_megamoe_mxfp4_sm120.py --max-tokens-per-expert``) and set it.
+    ``transport`` and
     ``tokens_per_item`` are the nosync kernel's
     (:class:`~flashinfer.moe_ep.Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig`); ``transport``
     ``None`` (default) takes the per-pair table the configured cake backend resolved
@@ -65,7 +66,7 @@ class NosyncOptions:
     """
 
     max_tokens_per_rank: int = 128
-    max_tokens_per_expert: int = 32
+    max_tokens_per_expert: int = 128
     transport: str | tuple[int, ...] | None = None
     tokens_per_item: int | None = None
     top_k: int | None = None

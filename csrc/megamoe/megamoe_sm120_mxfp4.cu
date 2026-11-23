@@ -33,8 +33,6 @@ enum Sm120Offset : int {
   kOffInbox,
   kOffStageComb,
   kOffCombGin,
-  kOffSlotMap,
-  kOffStageSlot,
   kOffCidx,
   kOffStageRoute,
   kNumSm120Offsets
@@ -91,6 +89,9 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
       << world << " ranks on a module built for at most " << s::kMaxWorld;
   TVM_FFI_ICHECK(rank_idx >= 0 && rank_idx < world);
   TVM_FFI_ICHECK(num_tokens >= 1 && num_tokens <= capacity);
+  TVM_FFI_ICHECK(capacity <= s::kMaxTokens && topk <= s::kMaxTopk)
+      << "capacity " << capacity << " / top-k " << topk << " over the kernel's " << s::kMaxTokens
+      << " / " << s::kMaxTopk;
   TVM_FFI_ICHECK_EQ(experts % world, 0);
   TVM_FFI_ICHECK_GE(offsets[kOffCtr + 1] - offsets[kOffCtr], int64_t(s::kCtrInts) * 4)
       << "the buffer layout's counter block is smaller than this build's";
@@ -134,14 +135,10 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
     a.gin.off_comb_gin = offsets[kOffCombGin];
     a.gin.off_stage_row = offsets[kOffStageRow];
     a.gin.off_stage_comb = offsets[kOffStageComb];
-    a.gin.off_slotmap = offsets[kOffSlotMap];
-    a.gin.off_stage_slot = offsets[kOffStageSlot];
     a.gin.stage_row = reinterpret_cast<uint8_t*>(local + offsets[kOffStageRow]);
     a.gin.inbox = reinterpret_cast<uint8_t*>(local + offsets[kOffInbox]);
     a.gin.stage_comb = reinterpret_cast<__nv_bfloat16*>(local + offsets[kOffStageComb]);
     a.gin.comb_gin = reinterpret_cast<__nv_bfloat16*>(local + offsets[kOffCombGin]);
-    a.gin.slotmap = reinterpret_cast<int*>(local + offsets[kOffSlotMap]);
-    a.gin.stage_slot = reinterpret_cast<int*>(local + offsets[kOffStageSlot]);
     a.gin.cidx = reinterpret_cast<int*>(local + offsets[kOffCidx]);
     a.gin.off_stage_route = offsets[kOffStageRoute];
     a.gin.stage_route = reinterpret_cast<int*>(local + offsets[kOffStageRoute]);

@@ -32,7 +32,7 @@ layer = MoEEpLayer(
     bootstrap, fleet_params,
     PrequantizedMoEWeights(w13=..., w2=..., w13_scale=..., w2_scale=...),
     backend=MegaConfig(megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(...), ...),
-    nosync=NosyncOptions(),  # max_tokens_per_rank=128, max_tokens_per_expert=32, transport=None (cake's table)
+    nosync=NosyncOptions(),  # max_tokens_per_rank=128, max_tokens_per_expert=128, transport=None (cake's table)
 )
 ```
 
@@ -54,20 +54,20 @@ layer = MoEEpLayer(
 - A call runs the nosync kernel when its bound is at most `max_tokens_per_rank`
   and the routes it bounds average at most `max_tokens_per_expert` per expert:
   `bound * ep_size * top_k / num_experts <= max_tokens_per_expert`. The per-expert
-  load, not the per-rank count, decides where the kernel stops winning: at
-  128 tokens per rank and EP8 over the NIC, DeepSeek-V4.1-Flash (16 tokens per
-  expert) is faster than cake, DeepSeek-V4-Flash (24) and GLM-5.3-Flash (28) are
-  slower. The default 32 is recommended: it is validated on DeepSeek-V4.1-Flash
-  and GLM-5.3-Flash (EP8 on one host and EP16 across two, random and balanced
-  routing). It keeps 128 tokens per rank on the kernel at EP8
-  for all three models; at EP16 the switch is at 128 tokens per rank for
-  DeepSeek-V4.1-Flash and 72 for GLM-5.3-Flash. **For the best performance,
+  load, not the per-rank count, decides where the kernel stops winning. The
+  default 128 keeps every call up to 128 tokens per rank on the kernel through
+  EP32 for DeepSeek-V4.1-Flash and GLM-5.3-Flash. Measured on RTX 6000D with
+  balanced routing and ConnectX-8 switches, GLM-5.3-Flash at EP16 (57 tokens per
+  expert at 128 tokens per rank) takes 397 / 469 µs per layer at 96 / 128 tokens
+  per rank on the kernel, 534 / 608 µs when a limit of 32 hands them to cake;
+  past 57 tokens per expert (measured with a larger per-rank cap) the kernel
+  and cake are within 1.5%. **For the best performance,
   measure the switch point on the deployment and set `max_tokens_per_expert`
   yourself**: where the kernel stops winning depends on the model, the routing
   and the interconnect (e.g. 12–24 tokens per expert for EP8 over the NIC, beyond
   28 with every pair P2P), so no single value is best everywhere.
 - `NosyncOptions` fields: `max_tokens_per_rank` (1–128) and
-  `max_tokens_per_expert` (default 32), both the same on every rank;
+  `max_tokens_per_expert` (default 128), both the same on every rank;
   `transport` and `tokens_per_item` (below), and `top_k` / `swiglu_limit`, which
   default to the configured cake or cutedsl backend's and must be set for any
   other backend.
@@ -102,7 +102,10 @@ every CTA is resident (CTAs wait on each other's flags). Phases:
    CTA also pulls the weights and scales of its static first work item (FC1 or
    FC2).
 3. **Dispatch.** One CTA per token: the staged MXFP8 row (codes and scales) goes
-   to each destination rank's expert pool with 16-byte P2P stores, then a flag.
+   to each destination rank's expert pool with 16-byte P2P stores. The CTA reads
+   the rank's routes into shared memory once (each copy's pool slot counts the
+   earlier routes to its expert). The last CTA out flags the P2P ranks, a thread
+   per rank, then puts each GIN rank its rows.
 4. **Expert map.** Each rank builds the per-expert token lists from the exchanged
    counts (same slot order as the dispatch) and waits for every source's rows.
 5. **FC1 / FC2 work queue.** A work item is one expert's 128 weight rows times a
@@ -132,19 +135,17 @@ rows × 8 tokens per MMA. Each lane loads 16 contiguous bytes of a weight row pe
 K128 with streaming loads (`__ldcs`) and the four lanes of a quad transpose them
 into MMA fragments; within each 32-wide scale block K is permuted identically
 for both operands. Each warp also prefetches its rows 128 B ahead into L2. With
-8-token items (one MMA per weight fragment) the loop waits on DRAM, so in the
-P2P build the next step's weights and scales are loaded into a second register
-buffer while the current step's MMAs run. That buffer takes the 8-token kernel
-to about 168 registers and one CTA per SM. The GIN build keeps 128 registers,
-where the second buffer does not fit, and keeps the single-buffer loop.
+8-token items (one MMA per weight fragment) the loop waits on DRAM, so the next
+step's weights and scales are loaded into a second register buffer while the
+current step's MMAs run. Wider items keep the single-buffer loop: under the
+128-register budget the second buffer made 64–128 tokens per rank 3–5% slower.
 
-**Code generation is sensitive.** The grid follows the occupancy, so a change
-in register allocation changes the number of CTAs. Two observed cases: removing
-the debug phase stamps (`Args::stamps`, null in production) made nvcc 13 give
-the 8-token loop 128 registers with spills instead of 168, 2–11% slower at
-1–128 tokens per rank, so the stamps stay; adding a single-CTA flag poller cut
-the 8- and 16-token kernels to 64–80 registers, more CTAs, 10–58 µs slower.
-Check `cuobjdump --dump-resource-usage` of both builds after kernel edits.
+**Occupancy.** The kernel is built for two CTAs per SM (`__launch_bounds__(256,
+2)`, 128 registers) and the grid follows the occupancy. With one CTA per SM
+(the 8-token loop at ~168 registers) an expert's 8-token items did not fill one
+wave of load slots: EP8 at 1 token per rank was 207 µs, 195 µs with two. A
+change in register allocation still changes the grid; check `cuobjdump
+--dump-resource-usage` of both builds after kernel edits.
 
 **Synchronization and errors.** Flags are written with `st.release.sys` after
 the data and read with `ld.acquire.sys`; there are no remote atomics. For each
@@ -181,8 +182,9 @@ module per GIN backend (proxy / GDAKI / GPI) with the NCCL device code in the
 device pass only. A token goes once to each GIN rank's inbox, whatever number of
 that rank's experts it routes to: the rows for one GIN rank are staged packed
 and put once after the dispatch (one put per token queued on the NIC with many
-GIN ranks), with one slot table per call; partials come back one put per run of
-finished rows of an FC2 tile. A CTA posts its puts to one peer on one context
+GIN ranks), with the slot table mapping the rank's pool slots to the packed rows
+right before them in the same buffer, so one put carries both; partials come
+back one put per run of finished rows of an FC2 tile. A CTA posts its puts to one peer on one context
 and spreads peers over the contexts' queue pairs, so puts to several peers go
 out in parallel. The receiver counts GIN signals per source instead of polling
 a flag.
@@ -257,5 +259,5 @@ description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
   dispatched tokens (the per-token puts queue behind each other), on RTX PRO 6000
   in waiting for the pushed-back partials. On such hosts `max_tokens_per_expert=16`
   hands these calls to cake. Hosts where every pair is P2P (the Broadcom RTX 6000D
-  host) stay faster up to 28 tokens per expert, which the default 32 keeps on the
+  host) stay faster up to 28 tokens per expert, which the default keeps on the
   kernel.

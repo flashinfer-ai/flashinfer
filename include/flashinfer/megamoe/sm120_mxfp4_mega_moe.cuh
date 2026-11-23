@@ -45,12 +45,13 @@
 // A token's MXFP8 row goes once to a GIN rank's inbox however many of that rank's experts it routes
 // to: the rows for one GIN rank are staged packed (the source's tokens routed there, in token
 // order) and put once after the dispatch (one put per token was bound by the NIC's message rate
-// with many GIN ranks), with one table per call mapping the rank's pool slots (packed in (local
-// expert, slot) order) to the packed rows. Partials come back one put per run of finished rows of
-// an FC2 tile, packed in the same order, so a tile's rows are contiguous. The receiver counts GIN
-// signals per source instead of polling a flag: the routing put adds 1, each token row 1, the slot
-// table 1, each pushed-back partial row 1 and a final per-call "done" 1. Signal values are
-// cumulative; the expected totals per source live in the counter block and advance at exit.
+// with many GIN ranks), with a table mapping the rank's pool slots (packed in (local expert, slot)
+// order) to the packed rows. The table ends where the rows start (gin_block), so one put carries
+// both. Partials come back one put per run of finished rows of an FC2 tile, packed in the same
+// order, so a tile's rows are contiguous. The receiver counts GIN signals per source instead of
+// polling a flag: the routing put adds 1, the rows put its token rows + 1, each pushed-back
+// partial row 1 and a final per-call "done" 1. Signal values are cumulative; the expected totals
+// per source live in the counter block and advance at exit.
 #pragma once
 
 #include <cuda_bf16.h>
@@ -100,6 +101,7 @@ constexpr int kMaxWorld = FLASHINFER_MEGAMOE_SM120_MAX_WORLD;
 static_assert(kMaxWorld == 8 || kMaxWorld == 32, "builds for up to 8 and up to 32 ranks");
 constexpr int kMaxEl = 2048 / kMaxWorld;  // local experts per rank: 256, or 64 in the 32-rank build
 constexpr int kMaxTopk = 8;               // routes per token (pool metadata packs token * 8 + k)
+constexpr int kMaxTokens = 128;           // tokens per rank (the workspace capacity)
 constexpr uint64_t kSpinNs =
     30000000000ull;  // spin timeout: startup warm-ups can skew ranks by seconds
 
@@ -108,6 +110,15 @@ constexpr uint64_t kSpinNs =
 __host__ __device__ constexpr size_t pool_row_bytes(int H) {
   return size_t(H) + ((size_t(H) / 32 + sizeof(int) + 15) & ~size_t(15));
 }
+// GIN block per rank of stage_row / inbox: the slot table ([TCAP*TOPK] ints, 16-byte aligned),
+// then TCAP token rows. A call's table of n entries is the slot_words(n) ints right before the rows
+__host__ __device__ constexpr size_t gin_slot_bytes(int TCAP, int TOPK) {
+  return (size_t(TCAP) * TOPK * sizeof(int) + 15) & ~size_t(15);
+}
+__host__ __device__ constexpr size_t gin_block(int TCAP, int TOPK, int H) {
+  return gin_slot_bytes(TCAP, TOPK) + size_t(TCAP) * pool_row_bytes(H);
+}
+__host__ __device__ constexpr int slot_words(int n) { return n > 4 ? (n + 3) & ~3 : 4; }
 
 // error codes (counter kCtrErr)
 constexpr int kErrDispatchWait = 1, kErrL1Wait = 2, kErrCombineWait = 3, kErrRouteWait = 4;
@@ -121,7 +132,8 @@ constexpr int kFlagRoute = 0, kFlagRows = 1, kFlagComb = 2;
 static_assert(kCtrCalls % 2 == 0, "the u64 call count must be 8-byte aligned");
 // GIN transport state: per-tile FC2 completion counts, this call's expected GIN signal counts per
 // source (dispatch, combine) and the cumulative totals (u64, persistent across calls)
-constexpr int kMaxTiles = kMaxEl + kMaxWorld * 128 * kMaxTopk / 8;  // sum_el ceil(n_el / kTile)
+constexpr int kMaxTiles =
+    kMaxEl + kMaxWorld * kMaxTokens * kMaxTopk / 8;  // sum_el ceil(n_el / kTile)
 constexpr int kCtrTile = kCtrL1 + kMaxEl, kCtrCnt = kCtrTile + kMaxTiles,
               kCtrCum = kCtrCnt + 2 * kMaxWorld;
 constexpr int kCtrInts = kCtrCum + 2 * 2 * kMaxWorld;
@@ -149,16 +161,13 @@ struct Gin {
   void* win;         // ncclWindow_t of the whole buffer
   uint32_t mask;     // bit w: rank w is reached over GIN
   int nctx;          // GIN contexts: CTA b posts on context b % nctx; a signal is the sum over them
-  size_t off_route, off_inbox, off_comb_gin, off_stage_row, off_stage_comb, off_slotmap,
-      off_stage_slot, off_stage_route;
-  uint8_t* stage_row;         // [W][TCAP] pool rows: per GIN rank, the tokens routed there, packed
-  uint8_t* inbox;             // [W][TCAP] pool rows: tokens received from each GIN source
+  size_t off_route, off_inbox, off_comb_gin, off_stage_row, off_stage_comb, off_stage_route;
+  uint8_t* stage_row;  // [W] gin_block: per GIN rank, its slot table, then the tokens routed there
+  uint8_t* inbox;      // [W] gin_block: the same, received from each GIN source
   __nv_bfloat16* stage_comb;  // [W][TCAP*TOPK][H]: partials per GIN source, packed (el, slot)
   __nv_bfloat16* comb_gin;    // [W][TCAP*TOPK][H]: partials from each GIN expert rank, packed
-  int* slotmap;      // [W][TCAP*TOPK]: GIN source's pool slots, packed (el, slot) -> its packed row
-  int* stage_slot;   // [W][TCAP*TOPK]: the slot table sent to each GIN rank
-  int* cidx;         // [TCAP*TOPK]: packed row of (token, k) sent to a GIN rank
-  int* stage_route;  // [W][EL + 1]: the routing counts sent to each GIN rank
+  int* cidx;                  // [TCAP*TOPK]: packed row of (token, k) sent to a GIN rank
+  int* stage_route;           // [W][EL + 1]: the routing counts sent to each GIN rank
 };
 
 struct Args {
@@ -698,9 +707,10 @@ __device__ __forceinline__ void token_src(const Map& m, int el, int j, int W, in
 
 // kTileN tokens per work item (a multiple of 8): the kTileN / 8 MMAs of a step share each weight
 // fragment, so larger items cut the weight traffic when the experts hold many rows each, smaller
-// ones keep more of the grid busy when they hold few
+// ones keep more of the grid busy when they hold few. Two CTAs per SM (the grid is sized from the
+// occupancy): with one, 8-token items fill only one wave of the SMs' load slots
 template <int kTileN>
-__global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
+__global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) {
   constexpr int NH = kTileN / kTile;
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int H = a.H, I = a.I, EL = a.EL, W = a.W, TOPK = a.TOPK, TCAP = a.TCAP;
@@ -741,6 +751,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
   // posts the next call's (it cannot get two calls ahead: each call waits for every rank's routes)
   const int rhalf = (epoch & 1) * W * RS;
   const size_t RX = pool_row_bytes(H);
+  const size_t SB = gin_slot_bytes(TCAP, TOPK), GB = gin_block(TCAP, TOPK, H);
   if (blockIdx.x == (a.T < int(gridDim.x) ? a.T : int(gridDim.x) - 1)) {
     __shared__ int s_ntok[kMaxWorld];  // this rank's tokens routed to each rank
     for (int u = threadIdx.x; u < W * EL; u += blockDim.x) m.cnt[u / EL][u % EL] = 0;
@@ -822,6 +833,13 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
         &s_tile[0][0]);  // [H] e4m3, then [H/32] ue8m0 (H + H/32 <= smem)
     uint8_t* s_sc = s_q + H;
     __shared__ int s_rowk[8], s_dstk[8], s_posk[8];
+    // the rank's routes (route_at, masked: -1), read once: every copy's slot scans all of them
+    __shared__ int16_t s_rt[kMaxTokens * kMaxTopk];
+    if (int(blockIdx.x) < a.T) {
+      for (int u = threadIdx.x; u < nitems; u += blockDim.x)
+        s_rt[u] = int16_t(route_at(a, u / TOPK, u % TOPK));
+      __syncthreads();
+    }
     for (int t = blockIdx.x; t < a.T; t += gridDim.x) {
       if (threadIdx.x < H / 32) {  // one thread per K32 group: the staged codes and their scale
         const uint4* s4 = reinterpret_cast<const uint4*>(a.x + size_t(t) * H + threadIdx.x * 32);
@@ -832,24 +850,25 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
       }
       if (warp < TOPK) {  // warp k: destination row of copy k (slot = tokens t' < t routed to the
                           // same expert)
-        const int e = route_at(a, t, warp);  // < 0: masked route, nothing to send
+        const int e = s_rt[t * TOPK + warp];  // < 0: masked route, nothing to send
         int slot = 0;
-        for (int u = lane; u < t * TOPK; u += 32) slot += (route_at(a, u / TOPK, u % TOPK) == e);
+        for (int u = lane; u < t * TOPK; u += 32) slot += (s_rt[u] == e);
 #pragma unroll
         for (int o = 16; o; o >>= 1) slot += __shfl_xor_sync(0xffffffffu, slot, o);
 #if MEGAMOE_SM120_GIN_DEVICE
         if (e >= 0 && is_gin(a, e / EL)) {  // slot table entry: packed (el, slot) -> packed row
           const int d = e / EL;
-          int pre = 0;  // this rank's routes to lower experts of that rank
-          for (int u = lane; u < a.T * TOPK; u += 32) {
-            const int e2 = route_at(a, u / TOPK, u % TOPK);
+          int pre = 0, nd = 0;  // this rank's routes to lower experts of that rank / to it
+          for (int u = lane; u < nitems; u += 32) {
+            const int e2 = s_rt[u];
+            nd += (e2 >= 0 && e2 / EL == d);
             pre += (e2 >= 0 && e2 / EL == d && e2 % EL < e % EL);
           }
           int pos = 0;  // the token's row among this rank's tokens t' < t routed to rank d
           for (int u = lane; u < t; u += 32) {
             bool to = false;
             for (int k = 0; k < TOPK; ++k) {
-              const int e2 = route_at(a, u, k);
+              const int e2 = s_rt[u * TOPK + k];
               to |= e2 >= 0 && e2 / EL == d;
             }
             pos += to;
@@ -857,10 +876,12 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
 #pragma unroll
           for (int o = 16; o; o >>= 1) {
             pre += __shfl_xor_sync(0xffffffffu, pre, o);
+            nd += __shfl_xor_sync(0xffffffffu, nd, o);
             pos += __shfl_xor_sync(0xffffffffu, pos, o);
           }
           if (lane == 0) {  // the same packed index places this copy's partial on the way back
-            a.gin.stage_slot[d * TCAP * TOPK + pre + slot] = pos;
+            reinterpret_cast<int*>(a.gin.stage_row + d * GB + SB)[pre + slot - slot_words(nd)] =
+                pos;
             a.gin.cidx[t * TOPK + warp] = pre + slot;
             s_posk[warp] = pos;
           }
@@ -892,7 +913,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           bool first = q != per - 1;
           for (int k2 = 0; k2 < k; ++k2) first &= !(s_rowk[k2] >= 0 && s_dstk[k2] == s_dstk[k]);
           if (!first) continue;
-          dst = a.gin.stage_row + (size_t(s_dstk[k]) * TCAP + s_posk[k]) * RX;
+          dst = a.gin.stage_row + s_dstk[k] * GB + SB + s_posk[k] * RX;
         } else {
           dst = a.peers.pool[s_dstk[k]] + size_t(s_rowk[k]) * RX;
         }
@@ -912,44 +933,31 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
   st_[1] = gtime();
   if (threadIdx.x == 0) s_item = (atomicAdd(ctr + kCtrDispatch, 1) == int(gridDim.x) - 1);
   __syncthreads();
+  if (s_item) {  // last CTA out of the dispatch: every row of this rank is visible -> a thread per
+                 // P2P rank flags it, then a thread per GIN rank puts its slot table and rows
+    if (threadIdx.x < W && !is_gin(a, threadIdx.x))
+      st_release_sys(a.peers.recv_flag[threadIdx.x] + a.rank, epoch);
 #if MEGAMOE_SM120_GIN_DEVICE
-  if (s_item && a.gin.mask) {  // last CTA out of the dispatch: every staged row and slot table
-                               // entry is written
-    __shared__ int s_nd[kMaxWorld];  // this rank's routes per GIN rank = its slot table length
-    __shared__ int s_nt[kMaxWorld];  // this rank's tokens per GIN rank = its packed rows there
-    if (threadIdx.x < W) s_nd[threadIdx.x] = s_nt[threadIdx.x] = 0;
-    __threadfence();
-    __syncthreads();
-    for (int t = threadIdx.x; t < a.T; t += blockDim.x) {
-      unsigned to = 0;
-      for (int k = 0; k < TOPK; ++k) {
-        const int e = route_at(a, t, k);
-        if (e < 0) continue;
-        atomicAdd(&s_nd[e / EL], 1);
-        to |= 1u << (e / EL);
+    if (a.gin.mask) {
+      // the routing counts staged for each GIN rank: this rank's routes there (its slot table
+      // length) and its tokens there (its packed rows)
+      __shared__ int s_nd[kMaxWorld];
+      if (threadIdx.x < W) s_nd[threadIdx.x] = 0;
+      __syncthreads();
+      for (int u = threadIdx.x; u < W * RS; u += blockDim.x)
+        if (u % RS < EL && is_gin(a, u / RS))
+          atomicAdd(&s_nd[u / RS], __ldcg(a.gin.stage_route + u));
+      __syncthreads();
+      if (threadIdx.x < W && is_gin(a, threadIdx.x)) {  // one put from the table's start through
+                                                        // the last row
+        const int d = threadIdx.x, nt = __ldcg(a.gin.stage_route + d * RS + EL);
+        const size_t head = SB - size_t(slot_words(s_nd[d])) * sizeof(int);
+        gin_put(a, d, a.gin.off_inbox + a.rank * GB + head, a.gin.off_stage_row + d * GB + head,
+                SB - head + size_t(nt) * RX,
+                ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigDispatch + a.rank), uint64_t(nt) + 1});
       }
-      for (; to; to &= to - 1) atomicAdd(&s_nt[__ffs(to) - 1], 1);
     }
-    __syncthreads();
-    if (threadIdx.x < W && is_gin(a, threadIdx.x)) {
-      const int d = threadIdx.x;  // the rows, then the slot table, on one thread and context
-      if (s_nt[d] > 0)
-        gin_put(a, d, a.gin.off_inbox + size_t(a.rank) * TCAP * RX,
-                a.gin.off_stage_row + size_t(d) * TCAP * RX, size_t(s_nt[d]) * RX,
-                ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigDispatch + a.rank), uint64_t(s_nt[d])});
-      gin_put(a, d, a.gin.off_slotmap + size_t(a.rank) * TCAP * TOPK * sizeof(int),
-              a.gin.off_stage_slot + size_t(d) * TCAP * TOPK * sizeof(int),
-              size_t(s_nd[d] > 0 ? s_nd[d] : 1) * sizeof(int),
-              ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigDispatch + a.rank), 1});
-    }
-    __syncthreads();
-  }
 #endif
-  if (s_item && threadIdx.x ==
-                    0) {  // last CTA out of the dispatch: every row of this rank is visible -> flag
-    __threadfence_system();
-    for (int dst = 0; dst < W; ++dst)
-      if (!is_gin(a, dst)) st_release_sys(a.peers.recv_flag[dst] + a.rank, epoch);
     st_[12] = gtime();
   }
   __syncthreads();
@@ -1085,12 +1093,18 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
 #pragma unroll
       for (int h = 0; h < NH; ++h) jt[h] = tile * kTileN + (h * 8 + g < ntok ? h * 8 + g : 0);
 #if MEGAMOE_SM120_GIN_DEVICE
-      __shared__ int s_pw[kMaxWorld];  // GIN source w: its slot table index of (el, slot 0)
+      __shared__ int s_pw[kMaxWorld];          // GIN source w: its slot table index of (el, slot 0)
+      __shared__ const int* s_tab[kMaxWorld];  // ... and that entry in its inbox block
       if (a.gin.mask) {
         if (threadIdx.x < W && is_gin(a, threadIdx.x)) {
-          int p = 0;
-          for (int e2 = 0; e2 < el; ++e2) p += m.cnt[threadIdx.x][e2];
-          s_pw[threadIdx.x] = p;
+          const int w = threadIdx.x;
+          int p = 0, n = 0;
+          for (int e2 = 0; e2 < EL; ++e2) {
+            p += e2 < el ? m.cnt[w][e2] : 0;
+            n += m.cnt[w][e2];
+          }
+          s_pw[w] = p;
+          s_tab[w] = reinterpret_cast<const int*>(a.gin.inbox + w * GB + SB) - slot_words(n) + p;
         }
         __syncthreads();
       }
@@ -1123,9 +1137,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
           const size_t row = (size_t(el) * W + w) * TCAP + i;
           xr[h] = pool + row * RX;
 #if MEGAMOE_SM120_GIN_DEVICE
-          if (is_gin(a, w))
-            xr[h] = a.gin.inbox +
-                    (size_t(w) * TCAP + a.gin.slotmap[w * TCAP * TOPK + s_pw[w] + i]) * RX;
+          if (is_gin(a, w)) xr[h] = a.gin.inbox + w * GB + SB + s_tab[w][i] * RX;
 #endif
           xs[h] = reinterpret_cast<const uint32_t*>(xr[h] + H);
         }
@@ -1136,9 +1148,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
             token_src(m, el, tile * kTileN + tk, W, w, i);
             const uint8_t* row = pool + ((size_t(el) * W + w) * TCAP + i) * RX;
 #if MEGAMOE_SM120_GIN_DEVICE
-            if (is_gin(a, w))
-              row = a.gin.inbox +
-                    (size_t(w) * TCAP + a.gin.slotmap[w * TCAP * TOPK + s_pw[w] + i]) * RX;
+            if (is_gin(a, w)) row = a.gin.inbox + w * GB + SB + s_tab[w][i] * RX;
 #endif
             s_xr[threadIdx.x] = row;
             s_xs[threadIdx.x] = reinterpret_cast<const uint32_t*>(row + H);

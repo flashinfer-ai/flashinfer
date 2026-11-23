@@ -390,7 +390,7 @@ def _args(**overrides):
         topk=6,
         capacity=128,
         threshold=128,
-        tokens_per_expert=32,
+        tokens_per_expert=128,
         tokens=[1, 8, 20, 64, 128],
         routing="random",
         repeats=2,
@@ -462,7 +462,12 @@ def test_nosync_token_limit():
     """Per-rank bound: the per-rank cap and the per-expert average over all ranks' routes."""
     from flashinfer.moe_ep.modes.nosync_layer import nosync_token_limit
 
-    # the default 32: EP8 keeps the 128 cap, EP16 / EP32 come below it
+    # the default 128: DeepSeek-V4.1-Flash and GLM-5.3-Flash keep the 128 cap through EP32
+    assert nosync_token_limit(128, 128, 384, 32, 6) == 128
+    assert nosync_token_limit(128, 128, 288, 16, 8) == 128
+    assert nosync_token_limit(128, 128, 288, 32, 8) == 128
+    assert nosync_token_limit(128, 128, 128, 32, 8) == 64
+
     assert nosync_token_limit(128, 32, 256, 8, 6) == 128
     assert nosync_token_limit(128, 32, 288, 16, 8) == 72
     assert nosync_token_limit(128, 32, 384, 16, 6) == 128
@@ -477,16 +482,24 @@ def test_nosync_token_limit():
 
 
 @pytest.mark.parametrize(
-    "experts,topk,tokens",
-    [(256, 6, [128]), (288, 8, [128]), (384, 6, [128]), (128, 8, [64, 65])],
-    ids=["dsv4_flash", "glm53_flash", "dsv41_flash", "128_experts_top8"],
+    "experts,topk,limit,tokens",
+    [
+        (256, 6, 128, [128]),
+        (288, 8, 128, [128]),
+        (384, 6, 128, [128]),
+        (128, 8, 32, [64, 65]),
+    ],
+    ids=["dsv4_flash", "glm53_flash", "dsv41_flash", "128_experts_top8_limit32"],
 )
-def test_sm120_nosync_tokens_per_expert(experts, topk, tokens):
-    """EP8 with the default 32 tokens per expert: DeepSeek-V4-Flash, GLM-5.3-Flash and
-    DeepSeek-V4.1-Flash keep the 128 cap; 128 experts with top-8 switch at 64 tokens per rank."""
+def test_sm120_nosync_tokens_per_expert(experts, topk, limit, tokens):
+    """EP8 with the default 128 tokens per expert: DeepSeek-V4-Flash, GLM-5.3-Flash and
+    DeepSeek-V4.1-Flash keep the 128 cap; with 32, 128 experts with top-8 switch at 64 tokens
+    per rank."""
     if not _sm120_gpus(8):
         pytest.skip("requires 8 SM120 GPUs")
-    _run(_args(ep=8, experts=experts, topk=topk, tokens=tokens))
+    _run(
+        _args(ep=8, experts=experts, topk=topk, tokens_per_expert=limit, tokens=tokens)
+    )
 
 
 @pytest.mark.parametrize("ep", [4, 8])
@@ -507,7 +520,6 @@ def test_sm120_nosync_model_shapes(ep, hidden, intermediate, experts, topk):
             experts=experts,
             topk=topk,
             tokens=[1, 16, 64, 128],
-            tokens_per_expert=32,  # keep 128 tokens per rank on the kernel at EP8
         )
     )
 
