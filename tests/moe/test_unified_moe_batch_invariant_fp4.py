@@ -1623,6 +1623,41 @@ def test_packed_f32_weights_are_rounded_by_the_combine(pair):
 
 @needs_device
 @each_pair
+def test_rounding_flag_is_bound_to_the_pack_not_the_runner(pair):
+    """The packed form's weight rounding is a property of the packed inputs (the bf16 runner's rule): two packs of different
+    forms packed in turn -- the packed form with f32 weights that are not bf16 values, then the unpacked form with the same
+    weights -- forwarded in either order give the bits of their single-pack runs (the packed one rounds, the unpacked one does
+    not), and the autotuner's plain input lists read as unrounded."""
+    T, k, H, I, E = 97, 4, 256, 128, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=63)
+    layer = _layer(k, E, I, quant=_QUANT[pair])
+    W = _weights(w1, w2, quant=_QUANT[pair])
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    raw = (weights.float() * (1.0 + 2.0**-12)).cuda()
+    assert not torch.equal(raw.to(torch.bfloat16).float(), raw)
+    packed_act = _routed_pack(x, ids.cuda(), raw, packed=True)
+    unpacked_act = _routed_pack(x, ids.cuda(), raw)
+    ref_packed = bits(layer(packed_act, W))
+    ref_unpacked = bits(layer(unpacked_act, W))
+    assert not torch.equal(ref_packed, ref_unpacked)  # the rounding is real work
+    runner = layer.runners[0]
+    for first, second in ((packed_act, unpacked_act), (unpacked_act, packed_act)):
+        in1 = runner.pack_inputs(first, W)
+        in2 = runner.pack_inputs(second, W)
+        out1 = bits(runner.forward(in1))
+        out2 = bits(runner.forward(in2))
+        assert torch.equal(out1, ref_packed if first is packed_act else ref_unpacked)
+        assert torch.equal(out2, ref_packed if second is packed_act else ref_unpacked)
+    assert runner.pack_inputs(packed_act, W).w_round is True
+    assert runner.pack_inputs(unpacked_act, W).w_round is False
+    plain = list(
+        runner.pack_inputs(packed_act, W)
+    )  # the autotuner's profiling lists carry no attribute
+    assert torch.equal(bits(runner.forward(plain)), ref_unpacked)
+
+
+@needs_device
+@each_pair
 def test_three_routing_modes_agree_and_runs_are_deterministic(pair):
     T, k, H, I, E = 257, 8, 1024, 512, 128
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=3)

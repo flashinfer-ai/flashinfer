@@ -51,7 +51,7 @@ from ..api import (
 )
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
 from .api_fp4 import MXFP4, NVFP4, Fp4Pair
-from .runner import MOE_BF16_ARCHS, routing_term
+from .runner import MOE_BF16_ARCHS, _PackedInputs, routing_term
 
 #: The backend's key: the name of its weight view and of its autotuner records.
 BACKEND_KEY = "batch_invariant_fp4"
@@ -180,7 +180,6 @@ class BatchInvariantFp4Runner(MoERunner):
         super().__init__()
         self.config = config
         self.device = torch.device(device)
-        self._round_scales = False
         if self.device.index is None and self.device.type == "cuda":
             self.device = torch.device("cuda", torch.cuda.current_device())
         # an unserved pair is refused by check_support (the layer's filter never constructs this case)
@@ -399,7 +398,7 @@ class BatchInvariantFp4Runner(MoERunner):
 
         cfg, pair, cls = self.config, self.pair, self.pair.cls
         plan: List[torch.Tensor] = []
-        self._round_scales = False
+        w_round = False  # bound to the pack (the bf16 runner's rule): a later pack never changes an earlier one's rounding
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype not in (torch.bfloat16, torch.uint8):
             raise unsupported(
@@ -507,7 +506,7 @@ class BatchInvariantFp4Runner(MoERunner):
             wts = act.topk_weights
             # the packed word carries the weight as bf16: the rounded weights are the inputs -- f32 weights are rounded by
             # the combine itself (no host passes over the slots), bf16 weights widen exactly
-            self._round_scales = (
+            w_round = (
                 mode is RoutingInputMode.PackedPrecomputed
                 and wts.dtype != torch.bfloat16
             )
@@ -518,11 +517,13 @@ class BatchInvariantFp4Runner(MoERunner):
         def opt(t):
             return t if t is not None else none
 
-        return [
+        packed = _PackedInputs([
             x, sf, pts, ids, wts,
             w.w1, w.w1_sf, opt(w.w1_alpha), w.w2, w.w2_sf, opt(w.w2_alpha),
             out, opt(w.gs2), opt(w.inv2),
-        ] + plan  # fmt: skip
+        ] + plan)  # fmt: skip
+        packed.w_round = w_round
+        return packed
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
     def _scatter_launch(self, x: torch.Tensor) -> bool:
@@ -648,7 +649,7 @@ class BatchInvariantFp4Runner(MoERunner):
             config1=c1,
             config2=c2,
             plan=plan,
-            round_scales=self._round_scales,
+            round_scales=getattr(inputs, "w_round", False),
             sf_layout=None
             if x.dtype == torch.bfloat16
             else ("linear" if sf.ndim == 2 else "128x4"),
