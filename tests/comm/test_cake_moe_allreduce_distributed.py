@@ -277,6 +277,7 @@ def _reduction_worker(
         init_method=f"tcp://localhost:{distributed_init_port}",
         rank=rank,
         world_size=world_size,
+        device_id=device,
     )
     group = dist.group.WORLD
     ipc_handles = None

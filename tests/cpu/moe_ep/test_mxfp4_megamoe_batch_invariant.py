@@ -39,7 +39,7 @@ def _public(provider, **overrides):
             cls = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
             kwargs.update(kind="mxfp4_mxfp8", kernel_variant="genphase")
             if "next" in provider:
-                kwargs["kernel_name"] = "sm100_mxfp8_mxfp8_bf16_cutedsl_next"
+                kwargs["kernel_name"] = "sm100_mxfp8_mxfp8_bf16_cutedsl"
     else:
         cls = (
             moe_ep.Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
@@ -101,7 +101,7 @@ def test_public_receipt_matches_pinned_workspace_and_all_candidates(
     cfg2, _ = _resolved(backend, capacity=257)
     assert mxfp4_batch_invariant_fingerprint(cfg2, arch=arch) == expected
     if arch == "sm_107":
-        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             sm107_candidates,
             is_valid_sm107,
         )
@@ -114,7 +114,7 @@ def test_public_receipt_matches_pinned_workspace_and_all_candidates(
             if is_valid_sm107(k, cfg)
         ]
     else:
-        from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
             sm100_standard_candidates,
             sm100_genphase_candidates,
         )
@@ -189,7 +189,7 @@ def test_auto_contract_isolates_kind_provider_clamp_and_weight_placement():
 @pytest.mark.parametrize("provider", ["100-standard", "100-genphase"])
 def test_blackwell_cache_separates_policy_and_receipt(provider, tmp_path, monkeypatch):
     from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
         knob_cache,
         tuning,
     )
@@ -219,7 +219,7 @@ def test_blackwell_cache_separates_policy_and_receipt(provider, tmp_path, monkey
 @pytest.mark.parametrize("kind", ["mxfp4", "mxfp4_mxfp8"])
 @pytest.mark.parametrize("variant", ["inference", "genphase"])
 def test_rubin_cache_roundtrip_and_fail_closed(kind, variant):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
 
     implementation = "standard" if variant == "inference" else variant
     knobs = mxfp4_batch_invariant_default_knobs(
@@ -263,7 +263,7 @@ def test_fixed_fused_staging_with_padded_sf_and_no_stride_fallback(
     staging = importlib.import_module(
         f"flashinfer.moe_ep.backends.mega.kernel.{arch}.mxfp8_mxfp8_bf16_cutedsl.staging"
     )
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as shim
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as shim
 
     class CudaMetadataTensor(torch.Tensor):
         @property

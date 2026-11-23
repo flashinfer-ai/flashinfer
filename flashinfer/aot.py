@@ -222,7 +222,9 @@ from .jit.qsa_sparse_paged import gen_qsa_sparse_paged_module
 from .jit.rope import gen_rope_module
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.gdn_batch_invariant import gen_gdn_batch_invariant_module
+from .jit.kda_batch_invariant import gen_kda_batch_invariant_module
 from .jit.sampling import gen_sampling_module
+from .jit.top_p_renorm_specialized import gen_top_p_renorm_specialized_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.colonels import gen_colonels_aot_modules
@@ -1068,7 +1070,7 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm120_module())
             # Imported here: the package import initializes flashinfer.moe_ep (every
             # MegaMoE backend), which builds without SM120 do not need.
-            from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+            from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import (
                 cake_sm120_megamoe_available,
                 gen_cake_sm120_megamoe_aot_modules,
             )
@@ -1192,10 +1194,15 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        # Specialized cluster top-p renorm (top_p_renorm_probs on compute capability 10.3):
+        # one module, built for the exact sm_103a target only.
+        if has_sm103a_exact:
+            jit_specs.append(gen_top_p_renorm_specialized_module())
         if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
         if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_gdn_batch_invariant_module())
+            jit_specs.append(gen_kda_batch_invariant_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
         if any(
             (has_sm90, has_sm100, has_sm103, has_sm107, has_sm110, has_sm120, has_sm121)

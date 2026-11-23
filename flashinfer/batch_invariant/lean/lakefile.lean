@@ -34,6 +34,9 @@ lean_exe mxfp8megamoeconformance where
 lean_exe gdnconformance where
   root := `GdnMain
 
+lean_exe kdaconformance where
+  root := `KdaMain
+
 lean_exe axioms where
   root := `Axioms
   supportInterpreter := true

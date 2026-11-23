@@ -23,7 +23,7 @@ import torch
 
 def write_if_different(path: pathlib.Path, content: str) -> None:
     if path.exists():
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
             if f.read() == content:
                 return
     else:
@@ -32,7 +32,7 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
         os.replace(temporary, path)
     finally:

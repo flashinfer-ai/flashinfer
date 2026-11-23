@@ -3,7 +3,8 @@
 """The Lean coupling of the classes ``gemm.bf16``, ``gemm.e4m3`` / ``gemm.e5m2``, ``gemm.e4m3.kblock128`` (the block-scale
 fp8 class) and ``gemm.mxfp8`` (both instructions' classes) (``flashinfer/batch_invariant/lean/``).
 
-Device-free (every CI job): the committed ``Cases.lean`` is byte for byte what the Python spec and engine emit, so a
+Device-free (every CI job): the committed ``Cases.lean`` and every family module under ``Cases/`` are byte for byte what
+the Python spec and engine emit (a stale or missing module fails as well), so a
 change to the dataflow, the lowering, a knob constraint or the chunk rule that was not propagated to the Lean cases
 fails here without a toolchain. With ``lake`` installed: ``lake build`` elaborates the class, its configuration space
 and the generated cases (kernel ``decide``; ``native_decide`` for the named exhaustive space checks),
@@ -29,11 +30,21 @@ needs_lake = pytest.mark.skipif(
 
 
 def test_generated_cases_are_current():
-    with open(lean_cases.CASES_PATH) as f:
-        committed = f.read()
-    assert committed == lean_cases.render(), (
-        "regenerate with: python -m flashinfer.batch_invariant.lean_cases"
-    )
+    modules = lean_cases.render_modules()
+    root = os.path.dirname(lean_cases.CASES_PATH)
+    # the generated modules on disk: a stale one (it carries the generator's marker) fails here, a hand-written file does not
+    on_disk = ["Cases.lean"] + [
+        f"Cases/{name}" for name in lean_cases.generated_parts(lean_cases.CASES_DIR)
+    ]
+    hint = "regenerate with: python -m flashinfer.batch_invariant.lean_cases"
+    assert sorted(on_disk) == sorted(modules), hint
+    committed = ""
+    for rel, text in modules.items():
+        with open(os.path.join(root, rel), encoding="utf-8") as f:
+            module = f.read()
+        assert module == text, f"{rel}: {hint}"
+        assert len(text.encode("utf-8")) <= lean_cases.PART_HARD_LIMIT, rel
+        committed += module
     assert "sorry" not in committed
     assert committed.count("native_decide") == len(lean_cases.DECIDED_THEOREMS)
     for name in lean_cases.DECIDED_THEOREMS:
@@ -44,9 +55,47 @@ def test_generated_cases_are_current():
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
 
 
+def test_writing_removes_only_stale_generated_modules(tmp_path):
+    """The write step on a fake rendering: the modules are written next to the umbrella, a generated module the rendering no
+    longer emits is removed, and a file without the generator's marker (hand-written Lean, anything else) is left alone."""
+    part = "\n".join(
+        lean_cases.LICENSE
+        + lean_cases.BASE_IMPORTS
+        + ["namespace BIK", lean_cases.GENERATED, "", "def x : Nat := 0", "end BIK"]
+    )
+    cases = tmp_path / "Cases"
+    cases.mkdir()
+    (cases / "Old1.lean").write_text(part + "\n", encoding="utf-8")
+    (cases / "Family1.lean").write_text(
+        part.replace(":= 0", ":= 7") + "\n", encoding="utf-8"
+    )
+    hand_written = "\n".join(
+        lean_cases.LICENSE + ["import BIKernels.GEMM", "theorem mine : True := trivial"]
+    )
+    (cases / "Notes.lean").write_text(hand_written + "\n", encoding="utf-8")
+    (cases / "README.txt").write_text(lean_cases.GENERATED + "\n", encoding="utf-8")
+    assert lean_cases.generated_parts(str(cases)) == ["Family1.lean", "Old1.lean"]
+    modules = {
+        "Cases/Family1.lean": part + "\n",
+        "Cases/Family2.lean": part.replace("def x", "def y") + "\n",
+        "Cases.lean": "import BIKernels.Cases.Family1\nimport BIKernels.Cases.Family2\n",
+    }
+    lean_cases.write_modules(str(tmp_path / "Cases.lean"), modules)
+    assert sorted(p.name for p in cases.iterdir()) == [
+        "Family1.lean",
+        "Family2.lean",
+        "Notes.lean",
+        "README.txt",
+    ]
+    for rel, text in modules.items():
+        assert (tmp_path / rel).read_text(encoding="utf-8") == text
+    assert (cases / "Notes.lean").read_text(encoding="utf-8") == hand_written + "\n"
+    assert lean_cases.generated_parts(str(cases)) == ["Family1.lean", "Family2.lean"]
+
+
 def test_rendering_takes_the_nominal_parts():
     """The dispatch cases are the nominal parts' (``nominal=True``): a device's queried co-resident capacity or L2 size,
-    recorded by the API earlier in the same process, never changes what `render` emits, while the device's own dispatch
+    recorded by the API earlier in the same process, never changes what `render_modules` emits, while the device's own dispatch
     does follow its numbers."""
     from flashinfer.gemm.batch_invariant import heuristic as H
     from flashinfer.gemm.batch_invariant.schedule import chunks_for, default_config

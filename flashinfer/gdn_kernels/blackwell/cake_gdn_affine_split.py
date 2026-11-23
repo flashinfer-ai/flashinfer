@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in exact sequence split of the Cake GDN prefill on SM103.
+"""Opt-in exact sequence split of the Cake GDN prefill on SM100, SM103 and
+SM107.
 
 ``chunk_gated_delta_rule(..., backend="cake_gdn", use_affine_split=True)``
 cuts a sequence of ``L`` tokens into ``P`` chunk-aligned segments and runs
@@ -36,8 +37,16 @@ clamp(cu[n], 0, T)``, ``L = clamp(cu[n + 1], start, T) - start`` and
 ``clamp(nchunks // c_min, 1, p_cap)`` otherwise; segment ``s`` holds the
 tokens ``[start + 64 * floor(s * nchunks / P), start + min(64 * floor((s +
 1) * nchunks / P), L))``.  ``p_cap`` and ``c_min`` are plan constants of the
-device and the value-head count only (:func:`plan_constants`), so a
-sequence's bits do not depend on the other sequences of a batch.
+device (its target and SM count) and the value-head count only
+(:func:`plan_constants`), so a sequence's bits do not depend on the other
+sequences of a batch.
+
+A call of ``N`` sequences launches with the cap ``p_launch``, the segment
+count of its longest possible sequence (:func:`plan_split`): every live
+sequence is at most that long, so the clamp gives it the same ``P`` and the
+same segments as at ``p_cap``, and only the slots of the segment-state
+workspace move.  ``p_launch = 1`` runs pass 1 alone, every sequence in one
+segment, over no split workspace.
 
 A plan entry owns its workspaces, allocated and zeroed once: the launch path
 allocates nothing, reads nothing back from the device and issues no memset
@@ -62,9 +71,12 @@ from ...jit import cake_gdn_affine_split as _programs
 
 __all__ = [
     "C_MIN",
+    "MAX_PASS1_TILES",
+    "MAX_TOKENS",
     "P_MAX",
     "SPLIT_MIN_TOKENS",
     "SplitPlan",
+    "TARGETS",
     "chunk_gated_delta_rule_gdn_affine_split_sm100",
     "clear_affine_split_plans",
     "pass1_grid",
@@ -75,18 +87,35 @@ __all__ = [
     "tile_cap",
 ]
 
-_TARGET = "sm_103a"
+#: The targets the programs ship for.
+TARGETS = ("sm_100a", "sm_103a", "sm_107a")
 _HEAD_SIZE = 128
 _CHUNK = 64
 #: Bytes of the pass-1 device tensor-map scratch per CTA.
 _TMAP_BYTES = 512
-#: The largest segment count per value-head count on SM103 (one pass-1 wave).
-P_MAX: dict[int, int] = {4: 8, 8: 5, 16: 2, 32: 1}
-#: The fewest chunks per segment per value-head count.
-C_MIN: dict[int, int] = {4: 8, 8: 8, 16: 16, 32: 16}
-#: A call whose longest possible sequence has at most this many tokens runs
-#: the unsplit kernel: on SM103 two segments do not beat it there.
-SPLIT_MIN_TOKENS = 1024
+#: The largest segment count per target and value-head count, measured on
+#: B200 (sm_100a), GB300 (sm_103a) and VR200 (sm_107a). One pass-1 wave
+#: bounds it too (:func:`tile_cap`).
+P_MAX: dict[str, dict[int, int]] = {
+    "sm_100a": {4: 8, 8: 5, 16: 2, 32: 1},
+    "sm_103a": {4: 8, 8: 5, 16: 2, 32: 1},
+    "sm_107a": {4: 8, 8: 6, 16: 3, 32: 2},
+}
+#: The fewest chunks per segment per target and value-head count.
+C_MIN: dict[str, dict[int, int]] = {
+    "sm_100a": {4: 8, 8: 8, 16: 16, 32: 16},
+    "sm_103a": {4: 8, 8: 8, 16: 16, 32: 16},
+    "sm_107a": {4: 8, 8: 8, 16: 12, 32: 32},
+}
+#: No sequence of at most this many tokens is split, on any target and at any
+#: value-head count: a consequence of :data:`C_MIN`, which the device rule
+#: applies to every live length (15 chunks at 8 chunks per segment).
+SPLIT_MIN_TOKENS = _CHUNK * (
+    2 * min(min(table.values()) for table in C_MIN.values()) - 1
+)
+#: The pass-1 kernel's limits on its tiles and tokens.
+MAX_PASS1_TILES = 131072
+MAX_TOKENS = 1 << 20
 #: The pass-2 program name of each value-head count (its compose slice width).
 _PASS2_NAMES: dict[int, str] = {
     4: "PASS2_W4",
@@ -154,22 +183,28 @@ _PASS2_ARGS = (
 
 
 def tile_cap(num_heads: int, sm_count: int) -> int:
-    """The largest segment count whose pass-1 tiles fit one wave:
-    ``num_heads * (4 * P - 2) <= sm_count``, at least 1."""
+    """The largest segment count whose pass-1 tiles of one sequence fit one
+    wave: ``num_heads * (4 * P - 2) <= sm_count``, at least 1. A batch may
+    have more tiles than CTAs."""
 
     return max(1, (sm_count // num_heads + 2) // 4)
 
 
 def plan_constants(
-    num_heads: int, sm_count: int, split_count: Optional[int] = None
+    num_heads: int,
+    sm_count: int,
+    split_count: Optional[int] = None,
+    *,
+    target: str,
 ) -> tuple[int, int]:
-    """``(p_cap, c_min)``: the planner's constants, or with ``split_count``
-    the forced cap ``min(split_count, tile_cap)`` at one chunk per segment."""
+    """``(p_cap, c_min)``: the planner's constants of ``target``, or with
+    ``split_count`` the forced cap ``min(split_count, tile_cap)`` at one chunk
+    per segment."""
 
     cap = tile_cap(num_heads, sm_count)
     if split_count is not None:
         return min(int(split_count), cap), 1
-    return min(cap, P_MAX[num_heads]), C_MIN[num_heads]
+    return min(cap, P_MAX[target][num_heads]), C_MIN[target][num_heads]
 
 
 def segment_count(length: int, p_cap: int, c_min: int) -> int:
@@ -183,8 +218,9 @@ def segment_count(length: int, p_cap: int, c_min: int) -> int:
 class SplitPlan(NamedTuple):
     p_cap: int
     c_min: int
-    #: The segment count of the longest possible sequence: 1 means every
-    #: sequence of the call runs unsplit.
+    #: The segment count of the longest possible sequence, the cap the call
+    #: launches with (``p_launch``): 1 means every sequence of the call runs
+    #: in one segment, pass 1 alone.
     p_bound: int
 
 
@@ -193,17 +229,17 @@ def plan_split(
     num_heads: int,
     max_seqlen: int,
     sm_count: int,
+    target: str,
     split_count: Optional[int] = None,
 ) -> SplitPlan:
-    """The plan constants and the host bound on the segment count.
+    """The plan constants of ``target`` and the segment count of a sequence of
+    ``max_seqlen`` tokens, an upper bound on every live sequence's (the
+    device rule is monotone in the length).
 
     Without ``split_count``, ``max_seqlen <= SPLIT_MIN_TOKENS`` gives
-    ``p_bound = 1``. A larger bound keeps the device segment rule for every
-    live length, so a shorter live sequence of that call may still split."""
+    ``p_bound = 1``."""
 
-    p_cap, c_min = plan_constants(num_heads, sm_count, split_count)
-    if split_count is None and max_seqlen <= SPLIT_MIN_TOKENS:
-        return SplitPlan(p_cap, c_min, 1)
+    p_cap, c_min = plan_constants(num_heads, sm_count, split_count, target=target)
     return SplitPlan(p_cap, c_min, segment_count(max_seqlen, p_cap, c_min))
 
 
@@ -211,7 +247,8 @@ def pass1_grid(
     num_seqs: int, num_heads: int, p_cap: int, sm_count: int
 ) -> tuple[int, int]:
     """``(total_tiles, grid_x)`` of pass 1: segment 0 has ``2 * H`` tiles,
-    every later segment ``4 * H``; one wave of at most ``sm_count`` CTAs."""
+    every later segment ``4 * H``; at most ``sm_count`` CTAs, so a CTA runs
+    several tiles when there are more tiles than CTAs."""
 
     tiles = num_seqs * num_heads * (4 * p_cap - 2)
     return tiles, min(tiles, sm_count)
@@ -230,7 +267,10 @@ def pass2_grid(
 
     compose = num_seqs * num_heads * _HEAD_SIZE // slice_width
     bound = compose + 2 * num_heads * (-(-total_tokens // 128) + num_seqs * p_cap)
-    return min(bound, compose + max(2 * sm_count - compose, 32))
+    grid = min(bound, compose + max(2 * sm_count - compose, 32))
+    # Progress needs a correction CTA past the compose tickets.
+    assert grid > compose
+    return grid
 
 
 def _pass2_program(num_heads: int) -> Any:
@@ -255,7 +295,7 @@ def _entries(device_index: int, pass2: Any) -> tuple[Any, Optional[Any]]:
     _check_args(_programs.PASS1, _PASS1_ARGS)
     capability = torch.cuda.get_device_capability(device_index)
     target = _programs.PASS1.target_for(capability)
-    if target != _TARGET:
+    if target not in TARGETS:
         raise RuntimeError(
             f"the Cake GDN affine-split programs ship no build for compute "
             f"capability {capability[0]}.{capability[1]}"
@@ -291,6 +331,8 @@ class _Entry:
         self.num_q_heads, self.num_heads = num_q_heads, h
         self.p_cap, self.c_min = p_cap, c_min
         self.tiles1, self.grid1 = pass1_grid(n, h, p_cap, sm_count)
+        # p_cap = 1: every sequence in one segment, which writes no split
+        # workspace, so pass 1 takes placeholders and pass 2 does not run.
         self.run_pass2 = p_cap >= 2
         pass2 = _pass2_program(h) if self.run_pass2 else None
         self.grid2 = (
@@ -301,13 +343,24 @@ class _Entry:
         self.pass1, self.pass2 = _entries(int(device.index), pass2)
         f32, bf16, i32 = torch.float32, torch.bfloat16, torch.int32
         d = _HEAD_SIZE
-        self.o_loc = torch.zeros(t, h, d, dtype=f32, device=device)
-        self.c = torch.zeros(t, h, d, dtype=bf16, device=device)
-        self.bm = torch.zeros(n, 2, p_cap, h, d, d, dtype=f32, device=device)
+        rows, slots = (t, n * p_cap) if self.run_pass2 else (0, 0)
+        self.o_loc = torch.zeros(max(rows * h * d, 1), dtype=f32, device=device)
+        self.c = torch.zeros(max(rows * h * d, 1), dtype=bf16, device=device)
+        self.bm = torch.zeros(max(slots * 2 * h * d * d, 1), dtype=f32, device=device)
+        if self.run_pass2:
+            self.o_loc = self.o_loc.view(t, h, d)
+            self.c = self.c.view(t, h, d)
+            self.bm = self.bm.view(n, 2, p_cap, h, d, d)
         self.hpub = torch.zeros(
-            n * max(p_cap - 1, 1) * h * 2, d, d, dtype=bf16, device=device
+            n * max(p_cap - 1, 1) * h * 2 if self.run_pass2 else 1,
+            d,
+            d,
+            dtype=bf16,
+            device=device,
         )
-        self.flags = torch.zeros(n, p_cap, h, 2, dtype=torch.uint32, device=device)
+        self.flags = torch.zeros(
+            n if self.run_pass2 else 1, p_cap, h, 2, dtype=torch.uint32, device=device
+        )
         self.ticket = torch.zeros(4, dtype=torch.uint32, device=device)
         self.tensormap_workspace = torch.zeros(
             self.grid1 * _TMAP_BYTES, dtype=torch.uint8, device=device
@@ -489,9 +542,9 @@ def chunk_gated_delta_rule_gdn_affine_split_sm100(
     plan: SplitPlan,
     sm_count: int,
 ) -> None:
-    """Launch pass 1 and pass 2 of a validated call (the public entry checks
-    the scope and routes ``plan.p_bound == 1`` to the unsplit kernel).
-    ``output_state`` is the caller's final-state destination or ``None``."""
+    """Launch pass 1 and pass 2 of a validated call at the cap
+    ``plan.p_bound`` (pass 1 alone when it is 1). ``output_state`` is the
+    caller's final-state destination or ``None``."""
 
     device = q.device
     device_index = int(
@@ -514,7 +567,7 @@ def chunk_gated_delta_rule_gdn_affine_split_sm100(
         output_final_state,
         gates_present,
         cu_seqlens.dtype,
-        plan.p_cap,
+        plan.p_bound,
         plan.c_min,
         int(stream),
     )
@@ -527,7 +580,7 @@ def chunk_gated_delta_rule_gdn_affine_split_sm100(
             total_tokens=total_tokens,
             num_q_heads=num_q_heads,
             num_heads=num_heads,
-            p_cap=plan.p_cap,
+            p_cap=plan.p_bound,
             c_min=plan.c_min,
             has_initial_state=initial_state is not None,
             output_final_state=output_final_state,

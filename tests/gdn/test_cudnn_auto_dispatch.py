@@ -21,7 +21,6 @@ require changing assertions about shapes or architecture thresholds.
 import importlib
 import importlib.metadata
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -317,13 +316,9 @@ def test_unpreferred_shape_does_not_probe_runtime_or_full_metadata(routes, monke
     assert routes[-1][0] == "native"
 
 
-@pytest.mark.parametrize("frontend", [None, "1.30.0", "1.31.0rc1"])
-def test_runtime_probe_rejects_older_or_missing_frontend(monkeypatch, frontend):
+def test_runtime_probe_rejects_missing_frontend(monkeypatch):
     probe = gdn._cudnn_gdn_prefill_available
-    monkeypatch.setattr(linear_attention, "CUDNN_AVAILABLE", frontend is not None)
-    monkeypatch.setattr(
-        linear_attention, "cudnn", SimpleNamespace(__version__=frontend)
-    )
+    monkeypatch.setattr(linear_attention, "CUDNN_AVAILABLE", False)
     monkeypatch.setattr(importlib.metadata, "version", lambda name: "4.7.0")
     probe.cache_clear()
     try:

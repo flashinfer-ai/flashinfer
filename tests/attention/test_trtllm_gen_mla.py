@@ -1938,6 +1938,28 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
             "mla_bf16_clc_exact007826",
         ),
         ({"batch_size": 512, "q_len": 16, "total_q": 8192}, "mla_bf16_clc"),
+        # A padded request (KV length below q_len) leaves the exact programs, which
+        # read the host row plan, for the generic CLC program.
+        (
+            {
+                "batch_size": 512,
+                "q_len": 16,
+                "total_q": 8192,
+                "kv_lens": (0,) + (1024,) * 511,
+            },
+            "mla_bf16_clc",
+        ),
+        (
+            {
+                "batch_size": 64,
+                "q_len": 2,
+                "total_q": 128,
+                "max_seq_len": 8192,
+                "table_width": 256,
+                "kv_lens": (1,) + (4096,) * 62 + (8192,),
+            },
+            "mla_bf16_clc",
+        ),
         (
             {
                 "page_size": 64,
@@ -1983,6 +2005,189 @@ def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
             {"dtype": torch.float8_e4m3fn, "page_size": 64, "ragged_query": True},
             "mla_fp8_tail",
         ),
+        # FP8 page 64 writes the LSE itself, at any max_seq_len; the other
+        # aligned programs leave LSE requests to the generic tails.
+        (
+            {"dtype": torch.float8_e4m3fn, "page_size": 64, "wants_lse": True},
+            "mla_fp8_page64_pdl",
+        ),
+        (
+            {
+                "dtype": torch.float8_e4m3fn,
+                "page_size": 64,
+                "wants_lse": True,
+                "q_len": 2,
+                "total_q": 2,
+                "max_seq_len": 16384,
+            },
+            "mla_fp8_page64_pdl",
+        ),
+        (
+            {
+                "dtype": torch.float8_e4m3fn,
+                "page_size": 64,
+                "wants_lse": True,
+                "enable_sink": True,
+            },
+            "mla_fp8_tail",
+        ),
+        (
+            {
+                "dtype": torch.float8_e4m3fn,
+                "wants_lse": True,
+                "q_len": 2,
+                "total_q": 2,
+                "kv_lens": (1024,),
+            },
+            "mla_fp8_tail",
+        ),
+        ({"page_size": 64, "wants_lse": True}, "mla_bf16_tail"),
+        # The split-KV domain serves the devices _SPLITKV_RANGE lists (GB300: from
+        # max_seq_len 2049, the first max_seq_len of tuning bucket 4096, up to 18
+        # query rows), sinks, page 64, bmm2_scale != 1 and q_len > 1 included.
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 2048,
+            },
+            "mla_bf16_vquarter",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 2049,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "batch_size": 9,
+                "q_len": 2,
+                "total_q": 18,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "batch_size": 19,
+                "q_len": 1,
+                "total_q": 19,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_vquarter",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "page_size": 64,
+                "enable_sink": True,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 16384,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "bmm2_scale": 0.5,
+                "q_len": 2,
+                "total_q": 2,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "skip_softmax": True,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_vquarter",
+        ),
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "ragged_query": True,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_vquarter",
+        ),
+        (
+            {"arch": "sm_103a", "num_sms": 152, "wants_lse": True, "max_seq_len": 4096},
+            "mla_bf16_tail",
+        ),
+        # The native split-8 program keeps its exact geometry.
+        (
+            {
+                "arch": "sm_103a",
+                "num_sms": 152,
+                "q_len": 4,
+                "total_q": 4,
+                "max_seq_len": 2048,
+                "kv_lens": (1024,),
+            },
+            "mla_bf16_native_split8_pdl",
+        ),
+        # B200: from max_seq_len 2049, the first max_seq_len of tuning bucket
+        # 4096, up to 18 query rows.
+        (
+            {
+                "arch": "sm_100a",
+                "num_sms": 148,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 2048,
+            },
+            "mla_bf16_vquarter",
+        ),
+        (
+            {
+                "arch": "sm_100a",
+                "num_sms": 148,
+                "q_len": 1,
+                "total_q": 1,
+                "max_seq_len": 2049,
+            },
+            "mla_bf16_splitkv",
+        ),
+        (
+            {"arch": "sm_100a", "num_sms": 148, "max_seq_len": 4096},
+            "mla_bf16_splitkv",
+        ),
+        (
+            {
+                "arch": "sm_100a",
+                "num_sms": 148,
+                "batch_size": 19,
+                "q_len": 1,
+                "total_q": 19,
+                "max_seq_len": 4096,
+            },
+            "mla_bf16_vhalf",
+        ),
+        # Devices not listed (B300 and other SM counts) and callers without arch
+        # never select it.
+        (
+            {"arch": "sm_103a", "num_sms": 148, "max_seq_len": 4096},
+            "mla_bf16_vquarter",
+        ),
+        ({"num_sms": 152, "max_seq_len": 4096}, "mla_bf16_vquarter"),
     ],
 )
 def test_trtllm_mla_blackwell_domain_selection(
@@ -2015,6 +2220,7 @@ def test_trtllm_mla_blackwell_domain_selection(
         "table_width": 32,
         "kv_lens": None,
         "num_sms": 148,
+        "arch": None,
     }
     values.update(overrides)
     # The host reads the KV lengths only for the pre-filtered geometries; a row
@@ -2046,6 +2252,7 @@ def test_trtllm_mla_blackwell_domain_selection(
             "mla_bf16_vquarter",
             "mla_bf16_vhalf",
             "mla_bf16_clc",
+            "mla_bf16_splitkv",
             "mla_bf16_tail",
             "mla_fp8_tail",
             "mla_fp8_page64_pdl",
@@ -2123,12 +2330,81 @@ def test_trtllm_mla_blackwell_row_metadata_is_computed_without_host_reads() -> N
 
 
 def test_trtllm_mla_blackwell_page64_split_plan_is_size_based() -> None:
+    """The FP8 page-64 split count reads the work items, max_seq_len and SM
+    count alone. It is one split when the work items exceed half the clusters
+    of a wave (``4 * work_items > num_sms``) or a ``max_seq_len`` row has at
+    most two KV tiles; otherwise the largest count within one wave of clusters
+    and half the row's KV tiles, rounded up."""
     from flashinfer.mla.cake_trtllm_mla_blackwell import plan_num_split
 
     assert plan_num_split(16, 4096, 148) == 4
     assert plan_num_split(1, 1024, 148) == 4
-    assert plan_num_split(64, 8192, 152) == 2
-    assert plan_num_split(1, 128, 148) == 2
+    assert plan_num_split(2, 600, 148) == 3
+    assert plan_num_split(37, 1024, 148) == 2
+    assert plan_num_split(38, 1024, 152) == 2
+    # One split: the producer writes the output and the LSE, no reducer runs.
+    assert plan_num_split(38, 1024, 148) == 1
+    assert plan_num_split(39, 1024, 152) == 1
+    assert plan_num_split(64, 8192, 152) == 1
+    assert plan_num_split(128, 1024, 148) == 1
+    assert plan_num_split(1, 128, 148) == 1
+    assert plan_num_split(1, 256, 152) == 1
+    assert plan_num_split(1, 257, 152) == 2
+    for num_sms in (148, 152):
+        for work_items in range(1, 257):
+            for max_seq_len in (1, 128, 256, 257, 600, 1024, 4096, 16384):
+                split = plan_num_split(work_items, max_seq_len, num_sms)
+                tiles = -(-max_seq_len // 128)
+                half = -(-tiles // 2)
+                case = (work_items, max_seq_len, num_sms)
+                assert 1 <= split <= half, case
+                assert split == 1 or work_items * split * 2 <= num_sms, case
+                if work_items * 4 > num_sms or tiles <= 2:
+                    assert split == 1, case
+                else:
+                    # The largest count within the wave and the tile cap.
+                    assert split >= 2, case
+                    wave_full = work_items * (split + 1) * 2 > num_sms
+                    assert wave_full or split == half, case
+
+
+def test_trtllm_mla_blackwell_splitkv_plan_matches_rule() -> None:
+    """The split-KV count comes from host-known sizes: one wave of clusters at
+    most, at most 32 splits, equal tiles per split of a max_seq_len row."""
+    from flashinfer.mla.cake_trtllm_mla_blackwell import (
+        _SPLITKV_MAX_SPLIT,
+        plan_kv_split,
+    )
+
+    # GB300 (152 SMs, 76 resident clusters): (rows, max_seq_len) -> splits.
+    expected = {
+        (1, 2048): 16,
+        (1, 4096): 32,
+        (1, 16384): 32,
+        (2, 4096): 32,
+        (4, 16384): 19,
+        (8, 2048): 8,
+        (8, 16384): 9,
+        (9, 4096): 8,
+        (16, 4096): 4,
+        (18, 16384): 4,
+        (1, 1025): 9,
+    }
+    for (rows, max_seq_len), split in expected.items():
+        assert plan_kv_split(rows, max_seq_len, 152) == split, (rows, max_seq_len)
+    for num_sms in (148, 152):
+        resident = num_sms // 2
+        for rows in range(1, 39):
+            for max_seq_len in (1025, 2048, 4096, 8192, 16384, 131072):
+                split = plan_kv_split(rows, max_seq_len, num_sms)
+                tiles = -(-max_seq_len // 128)
+                per_split = -(-tiles // split)
+                assert 1 <= split <= _SPLITKV_MAX_SPLIT
+                assert rows * split <= resident, (num_sms, rows, max_seq_len)
+                # Every split of a max_seq_len row is busy and no count below
+                # gives the same tiles per split.
+                assert (split - 1) * per_split < tiles
+                assert split == 1 or -(-tiles // (split - 1)) > per_split
 
 
 _SMEM_FILL_SOURCE = r"""
@@ -2360,6 +2636,1335 @@ def test_trtllm_mla_blackwell_fp8_page64_attends_the_last_key(
             torch.testing.assert_close(
                 output[batch, row], reference, rtol=0.1, atol=0.1
             )
+
+
+# --- Device-derived rows of the value-split, generic CLC and FP8 page-64 programs ---
+
+_BLACKWELL_BMM1 = 1.0 / (192**0.5)
+
+
+def _skip_unless_blackwell() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
+    if get_compute_capability(torch.device("cuda")) not in {(10, 0), (10, 3)}:
+        pytest.skip("TRT-LLM MLA Blackwell requires SM100a or SM103a")
+
+
+def _blackwell_resident() -> int:
+    return max(1, get_device_sm_count(torch.device("cuda")) // 2)
+
+
+def _list_splitkv_device(domain: str, monkeypatch) -> None:
+    """For a split-KV case, list the current device in ``_SPLITKV_RANGE`` from
+    max_seq_len 1025 up to 18 query rows, so the case reaches the split-KV
+    program on every Blackwell device, also one that is not listed or whose
+    listed range starts at a longer max_seq_len (B200 and GB300: 2049)."""
+    from flashinfer.mla import cake_trtllm_mla_blackwell as module
+
+    if domain != "mla_bf16_splitkv":
+        return
+    facts = module._device_facts(torch.cuda.current_device())
+    if module._SPLITKV_RANGE.get(facts) != (1025, 18):
+        monkeypatch.setattr(
+            module, "_SPLITKV_RANGE", {**module._SPLITKV_RANGE, facts: (1025, 18)}
+        )
+
+
+def _blackwell_decode(query, kv_cache, block_tables, seq_lens, max_seq_len, **kwargs):
+    """``backend="cake"`` decode called on the Blackwell module directly."""
+    from flashinfer.mla.cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
+
+    sinks = kwargs.pop("sinks", None)
+    arguments = {
+        "qk_nope_head_dim": 128,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "sparse_mla_top_k": 0,
+        "out": None,
+        "bmm1_scale": _BLACKWELL_BMM1,
+        "bmm2_scale": 1.0,
+        "sinks": None if sinks is None else [sinks],
+        "skip_softmax_threshold_scale_factor": None,
+        "enable_pdl": None,
+        "uses_shared_paged_kv_idx": True,
+        "lse": None,
+        "return_lse": False,
+        "cum_seq_lens_q": None,
+        "max_q_len": None,
+        "multi_ctas_kv_counter_buffer": None,
+        "sparse_mla_top_k_lens": None,
+        "enable_dcp": False,
+        "backend": "cake",
+    }
+    arguments.update(kwargs)
+    return trtllm_mla_blackwell_decode(
+        query, kv_cache, block_tables, seq_lens, max_seq_len, **arguments
+    )
+
+
+def _blackwell_inputs(
+    kv_lens: list[int],
+    q_len: int,
+    page_size: int,
+    dtype: torch.dtype,
+    *,
+    width: Optional[int] = None,
+    trailing_poison: int = 0,
+    seed: int = 0,
+):
+    """Query, KV cache, page table and KV lengths of a paged decode request.
+
+    Page ids are a permutation of the first ``batch * width`` pages; one more page holds
+    NaN and no table entry names it.  ``trailing_poison`` entries naming that page
+    follow the table in its allocation, so a page-id read past the caller's table
+    that feeds a V tile turns its row non-finite.  With ``trailing_poison=0`` the
+    table is its own allocation of exactly ``batch * width`` entries.
+    """
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(seed)
+    batch = len(kv_lens)
+    if width is None:
+        width = max(1, -(-max(kv_lens) // page_size))
+    nan_page = batch * width
+    query = (
+        torch.randn(batch, q_len, 128, 576, device=device, generator=generator) * 0.5
+    ).to(dtype)
+    kv_cache = (
+        torch.randn(nan_page + 1, page_size, 576, device=device, generator=generator)
+        * 0.5
+    )
+    kv_cache[nan_page] = float("nan")
+    kv_cache = kv_cache.to(dtype)
+    storage = torch.full(
+        (batch * width + trailing_poison,), nan_page, dtype=torch.int32, device=device
+    )
+    storage[: batch * width] = torch.randperm(
+        batch * width, device=device, generator=generator
+    ).to(torch.int32)
+    block_tables = storage[: batch * width].view(batch, width)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    return query, kv_cache, block_tables, seq_lens
+
+
+def _padded_kv_lens(batch: int, q_len: int, max_len: int) -> list[int]:
+    """Live requests interleaved with padded ones (KV length 0, or shorter than q_len)."""
+    lens = []
+    for b in range(batch):
+        kind = b % 4
+        if kind == 0:
+            lens.append(max_len - (37 * b) % (max_len // 2))
+        elif kind == 1:
+            lens.append(0)
+        elif kind == 2:
+            lens.append(max_len)
+        else:
+            lens.append(q_len // 2)
+    return lens
+
+
+def _query_rows(kv_lens, q_lens) -> list[tuple[int, int]]:
+    """(request, causal KV length) of every query row."""
+    return [
+        (batch, kv_len - q_len + index + 1)
+        for batch, (kv_len, q_len) in enumerate(zip(kv_lens, q_lens, strict=True))
+        for index in range(q_len)
+    ]
+
+
+def _blackwell_rows_reference(
+    q_rows: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    rows: list[tuple[int, int]],
+    page_size: int,
+    sinks: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP32 attention of every query row ``[rows, heads, 576]``; a row of KV length <= 0 is zero."""
+    device = q_rows.device
+    queries = q_rows.float()
+    kv_flat = kv_cache.reshape(-1, 576).float()
+    tokens = torch.arange(page_size, device=device)
+    output = torch.zeros(q_rows.shape[0], q_rows.shape[1], 512, device=device)
+    by_batch: dict[int, list[tuple[int, int]]] = {}
+    for row, (batch, length) in enumerate(rows):
+        if length > 0:
+            by_batch.setdefault(batch, []).append((row, length))
+    for batch, items in by_batch.items():
+        longest = max(length for _, length in items)
+        pages = block_tables[batch, : -(-longest // page_size)].long()
+        kv = kv_flat[
+            (pages[:, None] * page_size + tokens[None, :]).reshape(-1)[:longest]
+        ]
+        index = torch.tensor([row for row, _ in items], device=device)
+        lengths = torch.tensor([length for _, length in items], device=device)
+        logits = torch.einsum("rhd,kd->rhk", queries[index], kv) * _BLACKWELL_BMM1
+        visible = torch.arange(longest, device=device)[None, :] < lengths[:, None]
+        logits = logits.masked_fill(~visible[:, None, :], float("-inf"))
+        if sinks is not None:
+            sink_logits = sinks.float()[None, :, None].expand(len(items), -1, 1)
+            logits = torch.cat([logits, sink_logits], dim=-1)
+        probabilities = torch.softmax(logits, dim=-1)[..., :longest]
+        output[index] = torch.einsum("rhk,kd->rhd", probabilities, kv[:, :512])
+    return output.to(torch.bfloat16)
+
+
+def _assert_rows(output, reference, rows, dtype) -> None:
+    """Padded rows are exactly zero; live rows match the reference."""
+    output = output.reshape(len(rows), 128, 512)
+    dead = torch.tensor([length <= 0 for _, length in rows], device=output.device)
+    if bool(dead.any()):
+        assert torch.equal(output[dead], torch.zeros_like(output[dead]))
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-1
+    torch.testing.assert_close(
+        output[~dead], reference[~dead], rtol=tolerance, atol=tolerance
+    )
+
+
+@pytest.fixture
+def blackwell_domains(monkeypatch):
+    """The domains ``trtllm_mla_blackwell_decode`` selects, in call order."""
+    from flashinfer.mla import cake_trtllm_mla_blackwell as module
+
+    seen: list[str] = []
+    select = module.select_domain
+
+    def spy(**kwargs):
+        domain = select(**kwargs)
+        seen.append(domain)
+        return domain
+
+    monkeypatch.setattr(module, "select_domain", spy)
+    return seen
+
+
+def test_trtllm_mla_blackwell_device_row_bindings() -> None:
+    from flashinfer.mla.cake_trtllm_mla_blackwell import (
+        _CLC_BINDING,
+        _FP8_PAGE64_BINDING,
+        _SPLITKV_BINDING,
+        _VALUE_SPLIT_BINDINGS,
+        FAMILIES,
+        ROUTES,
+    )
+
+    # The launched binding decides the row inputs: every route of the generic CLC
+    # domain, its one-wave programs and the exact-geometry routes of the sm_100a and
+    # 152-SM sm_103a modules launch the device-row CLC binding.
+    for route in (
+        "mla_bf16_clc__sm_100a",
+        "mla_bf16_clc__sm_103a",
+        "mla_bf16_clc__sm_103a__152",
+        "mla_bf16_clc_one_wave__sm_100a__148",
+        "mla_bf16_clc_one_wave__sm_103a__152",
+        "mla_bf16_clc_exact007826__sm_100a",
+        "mla_bf16_clc_exact007826__sm_103a__152",
+    ):
+        assert FAMILIES[ROUTES[route]]["binding"] == _CLC_BINDING, route
+    for route in (
+        "mla_bf16_clc_exact007790__sm_100a",
+        "mla_bf16_clc_exact007790__sm_103a",
+        "mla_bf16_clc_exact007826__sm_103a",
+        "mla_bf16_native_split8_pdl__sm_100a",
+        "mla_bf16_native_split8_pdl__sm_103a",
+    ):
+        binding = FAMILIES[ROUTES[route]]["binding"]
+        assert binding != _CLC_BINDING and binding not in _VALUE_SPLIT_BINDINGS, route
+    for arch in ("sm_100a", "sm_103a"):
+        assert (
+            _VALUE_SPLIT_BINDINGS[
+                FAMILIES[ROUTES[f"mla_bf16_vquarter__{arch}"]]["binding"]
+            ]
+            == 4
+        )
+        assert (
+            _VALUE_SPLIT_BINDINGS[
+                FAMILIES[ROUTES[f"mla_bf16_vhalf__{arch}"]]["binding"]
+            ]
+            == 2
+        )
+        assert (
+            FAMILIES[ROUTES[f"mla_fp8_page64_pdl__{arch}"]]["binding"]
+            == _FP8_PAGE64_BINDING
+        )
+        order = FAMILIES[ROUTES[f"mla_bf16_clc_order__{arch}"]]
+        assert order["arch"] == arch and order["domain"] == "mla_bf16_clc_order"
+        # The split-KV binding takes the caller's seq_lens and block_tables too and
+        # links its mainloop and three reducer builds (prefetch_any, prefetch_all
+        # and the wide build for more than 32 splits).
+        splitkv = FAMILIES[ROUTES[f"mla_bf16_splitkv__{arch}"]]
+        assert splitkv["binding"] == _SPLITKV_BINDING
+        assert splitkv["arch"] == arch and splitkv["domain"] == "mla_bf16_splitkv"
+        assert splitkv["dependencies"] == [
+            "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9",
+            "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
+            "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15",
+            "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc",
+        ]
+    assert _SPLITKV_BINDING != _CLC_BINDING
+    assert _SPLITKV_BINDING not in _VALUE_SPLIT_BINDINGS
+    assert _SPLITKV_BINDING != _FP8_PAGE64_BINDING
+
+
+# name: (dtype, batch, q_len, page_size, sink, return_lse, max_len, domain)
+_PADDED_ROW_CASES = {
+    "vquarter": (torch.bfloat16, 4, 4, 32, False, False, 1024, "mla_bf16_vquarter"),
+    "vquarter_page64_sink": (
+        torch.bfloat16,
+        3,
+        2,
+        64,
+        True,
+        False,
+        1024,
+        "mla_bf16_vquarter",
+    ),
+    "vhalf": (torch.bfloat16, 8, 4, 32, False, False, 1024, "mla_bf16_vhalf"),
+    "clc_one_wave": (torch.bfloat16, 16, 4, 32, False, False, 1024, "mla_bf16_clc"),
+    "clc_ordered": (torch.bfloat16, 64, 4, 32, False, False, 1024, "mla_bf16_clc"),
+    "clc_unordered": (torch.bfloat16, 300, 4, 32, False, False, 256, "mla_bf16_clc"),
+    "fp8_page64": (
+        torch.float8_e4m3fn,
+        4,
+        2,
+        64,
+        False,
+        False,
+        1024,
+        "mla_fp8_page64_pdl",
+    ),
+    # One split (plan_num_split): 128 and 40 query rows exceed half the
+    # clusters of a wave; a 256-token max_seq_len has two KV tiles.
+    "fp8_page64_one_split": (
+        torch.float8_e4m3fn,
+        128,
+        1,
+        64,
+        False,
+        False,
+        1024,
+        "mla_fp8_page64_pdl",
+    ),
+    "fp8_page64_q2_one_split": (
+        torch.float8_e4m3fn,
+        20,
+        2,
+        64,
+        False,
+        False,
+        1024,
+        "mla_fp8_page64_pdl",
+    ),
+    "fp8_page64_short_one_split": (
+        torch.float8_e4m3fn,
+        4,
+        1,
+        64,
+        False,
+        False,
+        256,
+        "mla_fp8_page64_pdl",
+    ),
+    # LSE output: the reducer (split-K) and the one-split producer write it.
+    "fp8_page64_lse": (
+        torch.float8_e4m3fn,
+        8,
+        1,
+        64,
+        False,
+        True,
+        1024,
+        "mla_fp8_page64_pdl",
+    ),
+    "fp8_page64_lse_one_split": (
+        torch.float8_e4m3fn,
+        128,
+        1,
+        64,
+        False,
+        True,
+        1024,
+        "mla_fp8_page64_pdl",
+    ),
+    "bf16_tail": (torch.bfloat16, 4, 2, 32, False, True, 1024, "mla_bf16_tail"),
+    "fp8_tail": (torch.float8_e4m3fn, 4, 2, 32, False, False, 1024, "mla_fp8_tail"),
+    "splitkv": (torch.bfloat16, 4, 2, 32, False, False, 4096, "mla_bf16_splitkv"),
+    "splitkv_page64_sink": (
+        torch.bfloat16,
+        3,
+        2,
+        64,
+        True,
+        False,
+        2048,
+        "mla_bf16_splitkv",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_PADDED_ROW_CASES))
+def test_trtllm_mla_blackwell_padded_rows_output_zero(
+    case, blackwell_domains, monkeypatch
+) -> None:
+    """Rows of KV length <= 0 output exact zeros (LSE -inf); live rows are unaffected.
+
+    The output is NaN-filled before every call, so a padded row the route leaves
+    unwritten stays NaN.  Padded requests (KV length 0, or shorter than the query)
+    are interleaved with live ones; a batch of padded requests only must complete.
+    """
+    _skip_unless_blackwell()
+    dtype, batch, q_len, page_size, sink, return_lse, max_len, domain = (
+        _PADDED_ROW_CASES[case]
+    )
+    _list_splitkv_device(domain, monkeypatch)
+    kv_lens = _padded_kv_lens(batch, q_len, max_len)
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, q_len, page_size, dtype
+    )
+    sinks = torch.randn(128, device="cuda", dtype=torch.float32) * 2.0 if sink else None
+    rows = _query_rows(kv_lens, [q_len] * batch)
+    if domain == "mla_fp8_page64_pdl":
+        from flashinfer.mla.cake_trtllm_mla_blackwell import plan_num_split
+
+        num_sms = get_device_sm_count(torch.device("cuda"))
+        one_split = plan_num_split(len(rows), max_len, num_sms) == 1
+        if case.endswith("one_split"):
+            assert one_split
+        elif num_sms >= 148:
+            # The other sizes split on full B200 / GB300 parts; a part with
+            # fewer SMs (a MIG slice) may plan one split for them.
+            assert not one_split
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size, sinks
+    )
+    out = torch.empty(batch, q_len, 128, 512, dtype=torch.bfloat16, device="cuda")
+    first = None
+    for _ in range(3):
+        out.fill_(float("nan"))
+        result = _blackwell_decode(
+            query,
+            kv_cache,
+            block_tables,
+            seq_lens,
+            max_len,
+            out=out,
+            sinks=sinks,
+            return_lse=return_lse,
+        )
+        _assert_rows(out, reference, rows, dtype)
+        if return_lse:
+            lse = result[1].reshape(len(rows), 128)
+            dead = torch.tensor([length <= 0 for _, length in rows], device="cuda")
+            assert bool((lse[dead] == float("-inf")).all())
+            assert bool(lse[~dead].isfinite().all())
+        if first is None:
+            first = out.clone()
+        else:
+            assert torch.equal(out, first)
+    assert blackwell_domains and set(blackwell_domains) == {domain}
+
+    seq_lens.zero_()
+    out.fill_(float("nan"))
+    result = _blackwell_decode(
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        max_len,
+        out=out,
+        sinks=sinks,
+        return_lse=return_lse,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.zeros_like(out))
+    if return_lse:
+        assert bool((result[1] == float("-inf")).all())
+
+
+# name: (dtype, batch, q_len, page_size, max_len)
+_GRAPH_CASES = {
+    "vquarter": (torch.bfloat16, 4, 4, 32, 1024),
+    "vhalf": (torch.bfloat16, 8, 4, 32, 1024),
+    "vhalf_page64": (torch.bfloat16, 8, 4, 64, 1024),
+    "clc_one_wave": (torch.bfloat16, 16, 4, 32, 1024),
+    "clc_ordered": (torch.bfloat16, 64, 4, 32, 1024),
+    "fp8_page64": (torch.float8_e4m3fn, 4, 2, 64, 1024),
+    "fp8_page64_one_split": (torch.float8_e4m3fn, 64, 1, 64, 1024),
+    "splitkv": (torch.bfloat16, 4, 2, 32, 4096),
+    "splitkv_page64": (torch.bfloat16, 3, 1, 64, 2048),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_GRAPH_CASES))
+def test_trtllm_mla_blackwell_graph_replay_reads_current_rows(
+    case, blackwell_domains, monkeypatch
+) -> None:
+    """A graph captured once follows later in-place changes of seq_lens and block_tables.
+
+    Rows are derived on the device from the caller's tensors at every replay, so the
+    replay equals an eager call on fresh tensors holding the same values.
+    """
+    _skip_unless_blackwell()
+    dtype, batch, q_len, page_size, max_len = _GRAPH_CASES[case]
+    if case.startswith("splitkv"):
+        _list_splitkv_device("mla_bf16_splitkv", monkeypatch)
+    width = max_len // page_size
+    kv_lens = _padded_kv_lens(batch, q_len, max_len)
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, q_len, page_size, dtype, width=width
+    )
+    out = torch.full(
+        (batch, q_len, 128, 512), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+
+    def decode(lens, table, output):
+        return _blackwell_decode(query, kv_cache, table, lens, max_len, out=output)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        decode(seq_lens, block_tables, out)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode(seq_lens, block_tables, out)
+
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    for values in (
+        [0] * batch,
+        [max_len] * batch,
+        _padded_kv_lens(batch, q_len, max_len)[::-1],
+    ):
+        seq_lens.copy_(torch.tensor(values, dtype=torch.int32))
+        permutation = torch.randperm(batch * width, device="cuda", generator=generator)
+        block_tables.copy_(block_tables.reshape(-1)[permutation].reshape(batch, width))
+        out.fill_(float("nan"))
+        graph.replay()
+        eager = decode(seq_lens.clone(), block_tables.clone(), None)
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager), values
+        rows = _query_rows(values, [q_len] * batch)
+        reference = _blackwell_rows_reference(
+            query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+        )
+        _assert_rows(out, reference, rows, dtype)
+    if case.startswith("splitkv"):
+        assert set(blackwell_domains) == {"mla_bf16_splitkv"}
+    if case.startswith("fp8_page64"):
+        assert set(blackwell_domains) == {"mla_fp8_page64_pdl"}
+
+
+# name: (batch, q_len, page_size, ragged q_lens with the same total, domain)
+_RAGGED_CASES = {
+    "vquarter": (4, 4, 32, [1, 7, 4, 4], "mla_bf16_vquarter"),
+    "vhalf": (8, 4, 32, [1, 7, 4, 4, 2, 6, 3, 5], "mla_bf16_vhalf"),
+    "vquarter_page64": (4, 2, 64, [1, 3, 2, 2], "mla_bf16_vquarter"),
+    "vhalf_page64": (8, 4, 64, [1, 7, 4, 4, 2, 6, 3, 5], "mla_bf16_vhalf"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_RAGGED_CASES))
+def test_trtllm_mla_blackwell_ragged_value_split(case, blackwell_domains) -> None:
+    """Ragged value-split calls read the host row plan; uniform ragged equals the fixed call."""
+    _skip_unless_blackwell()
+    batch, q_len, page_size, ragged_q_lens, domain = _RAGGED_CASES[case]
+    assert sum(ragged_q_lens) == batch * q_len
+    max_len = 1024
+    kv_lens = _padded_kv_lens(batch, max(ragged_q_lens), max_len)
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, q_len, page_size, torch.bfloat16
+    )
+    compact = query.reshape(batch * q_len, 128, 576)
+
+    def cumulative(q_lens):
+        offsets = [0]
+        for length in q_lens:
+            offsets.append(offsets[-1] + length)
+        return torch.tensor(offsets, dtype=torch.int32, device="cuda")
+
+    fixed = _blackwell_decode(query, kv_cache, block_tables, seq_lens, max_len)
+    uniform = _blackwell_decode(
+        compact,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        max_len,
+        cum_seq_lens_q=cumulative([q_len] * batch),
+        max_q_len=q_len,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(uniform.reshape(fixed.shape), fixed)
+
+    out = torch.full(
+        (batch * q_len, 128, 512), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    _blackwell_decode(
+        compact,
+        kv_cache,
+        block_tables,
+        seq_lens,
+        max_len,
+        out=out,
+        cum_seq_lens_q=cumulative(ragged_q_lens),
+        max_q_len=max(ragged_q_lens),
+    )
+    rows = _query_rows(kv_lens, ragged_q_lens)
+    reference = _blackwell_rows_reference(
+        compact, kv_cache, block_tables, rows, page_size
+    )
+    _assert_rows(out, reference, rows, torch.bfloat16)
+    assert set(blackwell_domains) == {domain}
+
+
+# name: (dtype, batch, q_len, page_size, domain)
+_TABLE_WIDTH_CASES = {
+    "vquarter": (torch.bfloat16, 2, 2, 32, "mla_bf16_vquarter"),
+    "vhalf": (torch.bfloat16, 8, 4, 32, "mla_bf16_vhalf"),
+    "clc_ordered": (torch.bfloat16, 64, 2, 32, "mla_bf16_clc"),
+    "vquarter_page64": (torch.bfloat16, 2, 1, 64, "mla_bf16_vquarter"),
+    "fp8_page64": (torch.float8_e4m3fn, 4, 2, 64, "mla_fp8_page64_pdl"),
+}
+
+
+# name: (dtype, batch, q_len, page_size, domain); widths whose capacity exceeds
+# 1024 tokens, so the split-KV domain serves them where _SPLITKV_RANGE lists the
+# device.
+_SPLITKV_TABLE_WIDTH_CASES = {
+    "splitkv": (torch.bfloat16, 2, 2, 32, "mla_bf16_splitkv"),
+    "splitkv_page64": (torch.bfloat16, 2, 1, 64, "mla_bf16_splitkv"),
+}
+
+
+@pytest.mark.parametrize("table_end", ["poison", "allocation_end"])
+@pytest.mark.parametrize("width", [17, 19, 33, 34, 35, 37])
+@pytest.mark.parametrize("case", sorted(_SPLITKV_TABLE_WIDTH_CASES))
+def test_trtllm_mla_blackwell_splitkv_reads_no_page_id_past_the_table(
+    case, width, table_end, blackwell_domains, monkeypatch
+) -> None:
+    """The split-KV program reads page ids only inside the caller's table (see
+    ``test_trtllm_mla_blackwell_reads_no_page_id_past_the_table``)."""
+    _skip_unless_blackwell()
+    dtype, batch, q_len, page_size, domain = _SPLITKV_TABLE_WIDTH_CASES[case]
+    if (page_size == 64) != (width < 32):
+        pytest.skip("page 32 takes widths 33-37, page 64 widths 17 and 19")
+    _list_splitkv_device(domain, monkeypatch)
+    _check_page_ids_inside_the_table(
+        dtype, batch, q_len, page_size, domain, width, table_end, blackwell_domains
+    )
+
+
+@pytest.mark.parametrize("table_end", ["poison", "allocation_end"])
+@pytest.mark.parametrize("case", sorted(_SPLITKV_TABLE_WIDTH_CASES))
+def test_trtllm_mla_blackwell_splitkv_clamps_rows_to_the_table(
+    case, table_end, blackwell_domains, monkeypatch
+) -> None:
+    """KV lengths past the caller's table width read no page id past the table.
+
+    The first and the last request are 300 keys longer than their table rows hold
+    (the last one ends at the table's allocation, or before poison entries naming a
+    NaN page). The split-KV program clamps every row's causal KV length to its table
+    row, so the output is finite and equals attention over the keys the table row
+    holds; the other rows are unchanged.
+    """
+    _skip_unless_blackwell()
+    dtype, _, q_len, page_size, domain = _SPLITKV_TABLE_WIDTH_CASES[case]
+    _list_splitkv_device(domain, monkeypatch)
+    width = 33 if page_size == 32 else 17
+    capacity = width * page_size
+    kv_lens = [capacity + 300, capacity - 7, capacity + 300]
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens,
+        q_len,
+        page_size,
+        dtype,
+        width=width,
+        trailing_poison=8 if table_end == "poison" else 0,
+    )
+    if table_end == "allocation_end":
+        assert block_tables.untyped_storage().nbytes() == block_tables.nbytes
+    output = _blackwell_decode(query, kv_cache, block_tables, seq_lens, max(kv_lens))
+    torch.cuda.synchronize()
+    assert bool(output.isfinite().all())
+    rows = [
+        (b, min(kv_len - q_len + index + 1, capacity))
+        for b, kv_len in enumerate(kv_lens)
+        for index in range(q_len)
+    ]
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    _assert_rows(output, reference, rows, dtype)
+    assert set(blackwell_domains) == {domain}
+
+
+@pytest.mark.parametrize("kv_len", [0, 500])
+def test_trtllm_mla_blackwell_splitkv_empty_table_outputs_zero(
+    kv_len, blackwell_domains, monkeypatch
+) -> None:
+    """A table of width 0 holds no key: every row outputs exact zeros and the
+    program reads no page id, whatever ``seq_lens`` claims."""
+    _skip_unless_blackwell()
+    _list_splitkv_device("mla_bf16_splitkv", monkeypatch)
+    batch, q_len, page_size = 2, 1, 32
+    query, kv_cache, _, _ = _blackwell_inputs(
+        [1] * batch, q_len, page_size, torch.bfloat16
+    )
+    block_tables = torch.empty((batch, 0), dtype=torch.int32, device="cuda")
+    seq_lens = torch.full((batch,), kv_len, dtype=torch.int32, device="cuda")
+    out = torch.full(
+        (batch, q_len, 128, 512), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    _blackwell_decode(query, kv_cache, block_tables, seq_lens, 2048, out=out)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.zeros_like(out))
+    assert set(blackwell_domains) == {"mla_bf16_splitkv"}
+
+
+@pytest.mark.parametrize("table_end", ["poison", "allocation_end"])
+@pytest.mark.parametrize("width", [1, 2, 3, 5])
+@pytest.mark.parametrize("case", sorted(_TABLE_WIDTH_CASES))
+def test_trtllm_mla_blackwell_reads_no_page_id_past_the_table(
+    case, width, table_end, blackwell_domains
+) -> None:
+    """Page ids are read only inside the caller's table, whatever its width.
+
+    A 128-token KV tile spans four page-32 (two page-64) entries, so a table width
+    that is not a multiple of that leaves the last row's last tile short.  Every
+    request's last page is its last entry.
+
+    ``poison``: the entries right after the table name a NaN page, so a read of one
+    that feeds a V tile turns the last request's rows non-finite.  The CLC route
+    loads only the last tile's K pages there, whose columns softmax masks, so its
+    over-read leaves the output finite.  ``allocation_end``: the table is its own
+    allocation of exactly ``batch * width`` entries, so any read past it is out of
+    bounds.  Run that variant under ``compute-sanitizer --tool memcheck`` with
+    ``PYTORCH_NO_CUDA_MEMORY_CACHING=1`` (the caching allocator rounds the table's
+    block up) to catch every route's over-read, the CLC one included.
+    """
+    _skip_unless_blackwell()
+    dtype, batch, q_len, page_size, domain = _TABLE_WIDTH_CASES[case]
+    _check_page_ids_inside_the_table(
+        dtype, batch, q_len, page_size, domain, width, table_end, blackwell_domains
+    )
+
+
+def _check_page_ids_inside_the_table(
+    dtype, batch, q_len, page_size, domain, width, table_end, blackwell_domains
+) -> None:
+    if page_size == 64 and width % 2 == 0:
+        pytest.skip("page 64 reads two entries per tile: odd widths only")
+    capacity = width * page_size
+    kv_lens = [capacity - (7 * b) % min(capacity, 32) for b in range(batch)]
+    kv_lens[-1] = capacity
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens,
+        q_len,
+        page_size,
+        dtype,
+        width=width,
+        trailing_poison=8 if table_end == "poison" else 0,
+    )
+    if table_end == "allocation_end":
+        assert block_tables.untyped_storage().nbytes() == block_tables.nbytes
+    output = _blackwell_decode(query, kv_cache, block_tables, seq_lens, capacity)
+    torch.cuda.synchronize()
+    assert bool(output.isfinite().all())
+    rows = _query_rows(kv_lens, [q_len] * batch)
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    _assert_rows(output, reference, rows, dtype)
+    assert set(blackwell_domains) == {domain}
+
+
+@pytest.mark.parametrize(
+    "rows_offset", ["resident", "resident+1", "300", "513", "1024", "1025"]
+)
+@pytest.mark.parametrize("q_len", [1, 2])
+def test_trtllm_mla_blackwell_clc_device_work_order(rows_offset, q_len) -> None:
+    """The generic CLC launch takes the longest-first order written on the device.
+
+    Launches of more rows than one wave of clusters and at most 1024 rows are
+    preceded by the order program; its order equals the host argsort of the rows'
+    KV tiles (padded rows count zero tiles, ties keep row order), and its second
+    half holds the ordered rows' KV lengths clamped at zero.
+    """
+    _skip_unless_blackwell()
+    from flashinfer.mla.cake_trtllm_mla_blackwell import (
+        _MAX_ORDERED_ROWS,
+        _WORK_ORDER_BUFFERS,
+        longest_first_order,
+        row_metadata,
+    )
+
+    resident = _blackwell_resident()
+    total = {
+        "resident": resident,
+        "resident+1": resident + 1,
+        "300": 300,
+        "513": 513,
+        "1024": 1024,
+        "1025": 1025,
+    }[rows_offset]
+    if total % q_len:
+        pytest.skip("row count is not a multiple of q_len")
+    batch = total // q_len
+    choices = [0, 1, 128, 129, 256, 300, 512]
+    kv_lens = [choices[(5 * b + b // 3) % len(choices)] for b in range(batch)]
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, q_len, 32, torch.bfloat16
+    )
+    output = _blackwell_decode(query, kv_cache, block_tables, seq_lens, 512)
+    stream = int(torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    if resident < total <= _MAX_ORDERED_ROWS:
+        _, row_seq_lens = row_metadata(
+            seq_lens, None, batch_size=batch, q_len=q_len, total_q=total
+        )
+        clamped = row_seq_lens.clamp_min(0)
+        expected = longest_first_order(clamped)
+        work_order = _WORK_ORDER_BUFFERS[(torch.cuda.current_device(), stream)]
+        assert torch.equal(work_order[:total], expected)
+        assert torch.equal(
+            work_order[_MAX_ORDERED_ROWS : _MAX_ORDERED_ROWS + total],
+            clamped[expected.long()].to(torch.int32),
+        )
+    rows = _query_rows(kv_lens, [q_len] * batch)
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, 32
+    )
+    _assert_rows(output, reference, rows, torch.bfloat16)
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_trtllm_mla_blackwell_exact007826_geometry(padded, blackwell_domains) -> None:
+    """The 512x16 geometry keeps its exact route unless a request is padded.
+
+    On sm_100a and the 152-SM sm_103a the exact route launches the device-row CLC
+    binding; a padded request (KV length below the query length) leaves the host
+    row-plan programs for the generic CLC route.
+    """
+    _skip_unless_blackwell()
+    batch, q_len, width, page_size = 512, 16, 32, 32
+    kv_lens = [1024] * batch
+    if padded:
+        kv_lens[3] = 0
+        kv_lens[100] = 7
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, q_len, page_size, torch.bfloat16, width=width
+    )
+    output = _blackwell_decode(query, kv_cache, block_tables, seq_lens, 1024)
+    rows = _query_rows(kv_lens, [q_len] * batch)
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    _assert_rows(output, reference, rows, torch.bfloat16)
+    expected = "mla_bf16_clc" if padded else "mla_bf16_clc_exact007826"
+    assert blackwell_domains == [expected]
+
+
+def test_trtllm_mla_blackwell_kv_lens_identity_outlives_its_tensor() -> None:
+    """A KV-length read cached for a freed tensor never serves a new tensor.
+
+    The cache entry holds the tensor it read, so a later ``seq_lens`` with other
+    values cannot take its address and version counter; the padded request then
+    leaves the exact-geometry route.
+    """
+    _skip_unless_blackwell()
+    from flashinfer.mla.cake_trtllm_mla_blackwell import _host_kv_lens
+
+    live = [1024] * 512
+    padded = [0] + live[1:]
+    first = torch.tensor(live, dtype=torch.int32, device="cuda")
+    assert _host_kv_lens(first) == tuple(live)
+    address = first.data_ptr()
+    del first
+    second = torch.tensor(padded, dtype=torch.int32, device="cuda")
+    assert second.data_ptr() != address
+    assert _host_kv_lens(second) == tuple(padded)
+
+
+@pytest.mark.parametrize("layout", ["rows", "tail"])
+def test_trtllm_mla_blackwell_row_plan_identity_outlives_its_tensor(layout) -> None:
+    """A row plan cached for a freed ``seq_lens`` never serves a new tensor.
+
+    The plan holds the tensors it was derived from, so a later ``seq_lens`` with
+    other values cannot take its address, version counter, shape and strides.
+    Each ``seq_lens`` is a view of its own 64 MiB block: the plan's small device
+    temporaries never reuse that block, so without the held source the second
+    block lands at the first one's address and the stale plan is returned.
+    """
+    _skip_unless_blackwell()
+    from flashinfer.mla.cake_trtllm_mla_blackwell import _row_plan, row_metadata
+
+    cum_seq_lens_q = torch.tensor([0, 1, 3, 4, 6], dtype=torch.int32, device="cuda")
+    block_tables = torch.zeros(4, 4, dtype=torch.int32, device="cuda")
+    plan_args = dict(
+        cum_seq_lens_q=cum_seq_lens_q,
+        block_tables=block_tables,
+        batch_size=4,
+        q_len=2,
+        total_q=6,
+        page_size=32,
+        topk=0,
+    )
+
+    def seq_lens_in_own_block(values):
+        block = torch.empty(16 << 20, dtype=torch.int32, device="cuda")
+        block[: len(values)].copy_(torch.tensor(values, dtype=torch.int32))
+        return block[: len(values)]
+
+    first = seq_lens_in_own_block([10, 20, 30, 40])
+    _row_plan(layout, seq_lens=first, **plan_args)
+    address = first.data_ptr()
+    del first
+    second = seq_lens_in_own_block([5, 1, 70, 0])
+    assert second.data_ptr() != address
+    plan = _row_plan(layout, seq_lens=second, **plan_args)
+    row_batches, row_seq_lens = row_metadata(
+        second, cum_seq_lens_q, batch_size=4, q_len=2, total_q=6
+    )
+    if layout == "tail":
+        row_seq_lens = row_seq_lens.clamp_min(0)
+    assert torch.equal(plan["row_batches"], row_batches)
+    assert torch.equal(plan["row_seq_lens"], row_seq_lens)
+
+
+_PDL_PREDECESSOR_SOURCE = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+// Lets its programmatic dependents launch at once, then writes dst only after spinning,
+// so a dependent that reads dst before its griddepcontrol.wait sees the old values.
+__global__ void write_after_spin(int* dst, const int* src, int n, unsigned long long spin_ns) {
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  unsigned long long start, now;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+  do {
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+  } while (now - start < spin_ns);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+
+void write_after_spin_launch(torch::Tensor dst, torch::Tensor src, int64_t spin_ns) {
+  write_after_spin<<<1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      dst.data_ptr<int>(), src.data_ptr<int>(), static_cast<int>(dst.numel()),
+      static_cast<unsigned long long>(spin_ns));
+}
+"""
+
+
+@pytest.mark.parametrize(
+    "dtype,batch,q_len,page_size,max_len",
+    [
+        (torch.bfloat16, 64, 4, 32, 1024),
+        (torch.bfloat16, 16, 4, 32, 1024),
+        (torch.float8_e4m3fn, 4, 2, 64, 1024),
+        (torch.float8_e4m3fn, 64, 1, 64, 1024),
+        (torch.bfloat16, 4, 2, 32, 2048),
+        (torch.bfloat16, 3, 1, 64, 4096),
+    ],
+    ids=[
+        "clc_ordered",
+        "clc_one_wave",
+        "fp8_page64",
+        "fp8_page64_one_split",
+        "splitkv",
+        "splitkv_page64",
+    ],
+)
+def test_trtllm_mla_blackwell_reads_rows_after_the_dependency_wait(
+    dtype, batch, q_len, page_size, max_len, blackwell_domains, monkeypatch
+) -> None:
+    """The PDL programs read seq_lens only after their programmatic dependency wait.
+
+    A predecessor that triggers its dependents at entry writes seq_lens 200 us later;
+    a program reading it earlier sees all requests empty and outputs zeros.  In the
+    split-KV cases (the mainloop and its PDL reducer) only the final output is
+    checked, so a reducer reading partials early is caught only when it changes
+    that output.
+    """
+    _skip_unless_blackwell()
+    if max_len > 1024:
+        _list_splitkv_device("mla_bf16_splitkv", monkeypatch)
+    from torch.utils.cpp_extension import load_inline
+
+    predecessor = load_inline(
+        name="test_trtllm_mla_blackwell_pdl_predecessor",
+        cpp_sources=[
+            "void write_after_spin_launch(torch::Tensor dst, torch::Tensor src, int64_t spin_ns);"
+        ],
+        cuda_sources=[_PDL_PREDECESSOR_SOURCE],
+        functions=["write_after_spin_launch"],
+        verbose=False,
+    )
+    kv_lens = _padded_kv_lens(batch, q_len, max_len)
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, q_len, page_size, dtype
+    )
+    _blackwell_decode(query, kv_cache, block_tables, seq_lens.clone(), max_len)
+    torch.cuda.synchronize()
+    rows = _query_rows(kv_lens, [q_len] * batch)
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    for _ in range(4):
+        stale = torch.zeros_like(seq_lens)
+        predecessor.write_after_spin_launch(stale, seq_lens, 200_000)
+        output = _blackwell_decode(query, kv_cache, block_tables, stale, max_len)
+        _assert_rows(output, reference, rows, dtype)
+    if max_len > 1024:
+        assert set(blackwell_domains) == {"mla_bf16_splitkv"}
+
+
+def test_trtllm_mla_blackwell_tail_guards_lengths_beyond_4096() -> None:
+    """A tail row longer than 4096 keys outputs NaN (O and LSE); other rows are unchanged.
+
+    The host knows only max_seq_len <= 4096; a captured graph replayed after
+    seq_lens grew past it must flag the row instead of reading out of range.
+    """
+    _skip_unless_blackwell()
+    page_size, width, q_len = 32, 130, 1
+    kv_lens = [4096, 100, 0, 2000]
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, q_len, page_size, torch.bfloat16, width=width
+    )
+    out = torch.empty(4, q_len, 128, 512, dtype=torch.bfloat16, device="cuda")
+
+    def decode(lens, output):
+        return _blackwell_decode(
+            query, kv_cache, block_tables, lens, 4096, out=output, return_lse=True
+        )
+
+    # Warm up on other tensors: the tail's row plan of an identity seen before
+    # capture would be reused by the graph instead of recomputed at each replay.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        decode(seq_lens.clone(), out.clone())
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _, lse = decode(seq_lens, out)
+
+    graph.replay()
+    torch.cuda.synchronize()
+    valid_out, valid_lse = out.clone(), lse.clone()
+    rows = _query_rows(kv_lens, [q_len] * 4)
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    _assert_rows(out, reference, rows, torch.bfloat16)
+
+    seq_lens[1] = 4097
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool(out[1].isnan().all()) and bool(lse.reshape(4, 128)[1].isnan().all())
+    for batch in (0, 2, 3):
+        assert torch.equal(out[batch], valid_out[batch])
+        assert torch.equal(lse.reshape(4, 128)[batch], valid_lse.reshape(4, 128)[batch])
+
+    seq_lens[1] = 100
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, valid_out) and torch.equal(lse, valid_lse)
+
+
+_TAIL_REQUEST = {
+    "dtype": torch.bfloat16,
+    "num_heads": 128,
+    "qk_dim": 576,
+    "value_dim": 512,
+    "qk_nope_head_dim": 128,
+    "page_size": 32,
+    "topk": 0,
+    "uses_shared_paged_kv_idx": True,
+    "ragged_query": False,
+    "enable_sink": False,
+    "skip_softmax": False,
+    "wants_lse": False,
+}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"wants_lse": True}, "BF16 with LSE output"),
+        ({"wants_lse": True, "page_size": 64}, "BF16 with LSE output"),
+        (
+            {"num_heads": 32, "qk_dim": 320, "value_dim": 256},
+            "32 heads of dimensions (128, 256, 64)",
+        ),
+        ({"topk": 64}, "sparse top-k"),
+        ({"uses_shared_paged_kv_idx": False}, "separate K and V page indices"),
+        ({"dtype": torch.float8_e4m3fn}, "FP8 with page size 32"),
+        (
+            {"dtype": torch.float8_e4m3fn, "wants_lse": True},
+            "FP8 with page size 32 and LSE output",
+        ),
+        (
+            {"dtype": torch.float8_e4m3fn, "page_size": 64, "enable_sink": True},
+            "FP8 with sinks",
+        ),
+        (
+            {"dtype": torch.float8_e4m3fn, "page_size": 64, "ragged_query": True},
+            "FP8 with a compact variable-length query",
+        ),
+        (
+            {"dtype": torch.float8_e4m3fn, "page_size": 64, "skip_softmax": True},
+            "FP8 with skip-softmax",
+        ),
+        (
+            {
+                "dtype": torch.float8_e4m3fn,
+                "page_size": 64,
+                "wants_lse": True,
+                "enable_sink": True,
+            },
+            "FP8 with sinks",
+        ),
+    ],
+)
+def test_trtllm_mla_blackwell_generic_tail_reason(overrides: dict, reason: str) -> None:
+    """Every request ``select_domain`` sends to a generic tail program names the
+    feature that took it there. No GPU needed."""
+    from flashinfer.mla.cake_trtllm_mla_blackwell import (
+        DOMAIN_BF16_TAIL,
+        DOMAIN_FP8_TAIL,
+        generic_tail_reason,
+        select_domain,
+    )
+
+    request = dict(_TAIL_REQUEST, **overrides)
+    domain = select_domain(
+        **request,
+        bmm2_scale=1.0,
+        total_q=8,
+        max_seq_len=1024,
+        batch_size=8,
+        q_len=1,
+        table_width=32,
+        kv_lens=None,
+        num_sms=148,
+        arch="sm_100a",
+    )
+    assert domain in (DOMAIN_BF16_TAIL, DOMAIN_FP8_TAIL)
+    assert generic_tail_reason(**request) == reason
+
+
+def test_trtllm_mla_blackwell_tail_warns_once_per_reason(monkeypatch) -> None:
+    """An explicit call that takes a generic tail program logs one warning per
+    reason and process; repeated calls log nothing and return the same bits,
+    and calls served by a tuned program log nothing."""
+    _skip_unless_blackwell()
+    from flashinfer.mla import cake_trtllm_mla_blackwell as module
+
+    warnings: list[tuple] = []
+
+    class _Recorder:
+        def warning(self, message, *args):
+            warnings.append(args)
+
+    monkeypatch.setattr(module, "_TAIL_WARNED", set())
+    monkeypatch.setattr(module, "logger", _Recorder())
+    kv_lens = [1024, 0, 700, 1024, 513, 1, 1024, 900]
+    rows = _query_rows(kv_lens, [1] * len(kv_lens))
+    for dtype, page_size, lse in (
+        (torch.bfloat16, 32, True),
+        (torch.float8_e4m3fn, 32, False),
+    ):
+        query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+            kv_lens, 1, page_size, dtype
+        )
+        outputs = [
+            _blackwell_decode(
+                query, kv_cache, block_tables, seq_lens, 1024, return_lse=lse
+            )
+            for _ in range(3)
+        ]
+        torch.cuda.synchronize()
+        first = outputs[0][0] if lse else outputs[0]
+        for repeated in outputs[1:]:
+            if lse:
+                assert torch.equal(repeated[0], first)
+                assert torch.equal(repeated[1], outputs[0][1])
+            else:
+                assert torch.equal(repeated, first)
+        reference = _blackwell_rows_reference(
+            query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+        )
+        _assert_rows(first, reference, rows, dtype)
+    assert warnings == [("BF16 with LSE output",), ("FP8 with page size 32",)]
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, 1, 32, torch.bfloat16
+    )
+    _blackwell_decode(query, kv_cache, block_tables, seq_lens, 1024)
+    torch.cuda.synchronize()
+    assert len(warnings) == 2
+
+
+def _blackwell_lse_reference(
+    q_rows: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    rows: list[tuple[int, int]],
+    page_size: int,
+) -> torch.Tensor:
+    """FP64 base-2 LSE ``[rows, heads]`` of the bmm1-scaled logits; ``-inf`` for
+    a row of KV length <= 0."""
+    device = q_rows.device
+    queries = q_rows.double()
+    kv_flat = kv_cache.reshape(-1, 576).double()
+    tokens = torch.arange(page_size, device=device)
+    lse = torch.full(
+        (q_rows.shape[0], q_rows.shape[1]),
+        float("-inf"),
+        dtype=torch.float64,
+        device=device,
+    )
+    for row, (batch, length) in enumerate(rows):
+        if length <= 0:
+            continue
+        pages = block_tables[batch, : -(-length // page_size)].long()
+        kv = kv_flat[
+            (pages[:, None] * page_size + tokens[None, :]).reshape(-1)[:length]
+        ]
+        logits = queries[row] @ kv.T * _BLACKWELL_BMM1
+        lse[row] = torch.logsumexp(logits, dim=-1) / math.log(2.0)
+    return lse
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_trtllm_mla_blackwell_lse_follows_return_lse_base(dtype) -> None:
+    """Explicit ``backend="cake"`` on the Blackwell route returns base-2 LSE by
+    default and with ``"base2"``, natural-log LSE with ``"basee"`` (also in a
+    supplied buffer), equal to the FP64 reference on live rows and ``-inf`` on
+    padded rows; the output does not depend on the base."""
+    _skip_unless_blackwell()
+    page_size = 32 if dtype == torch.bfloat16 else 64
+    kv_lens = [1024, 0, 700, 1024, 513, 1, 300, 900]
+    batch = len(kv_lens)
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, 1, page_size, dtype
+    )
+    rows = _query_rows(kv_lens, [1] * batch)
+    reference = _blackwell_lse_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+
+    def decode(**kwargs):
+        return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=1024,
+            bmm1_scale=_BLACKWELL_BMM1,
+            bmm2_scale=1.0,
+            backend="cake",
+            **kwargs,
+        )
+
+    out_default, lse_default = decode(return_lse=True)
+    out_base2, lse_base2 = decode(return_lse=True, return_lse_base="base2")
+    out_basee, lse_basee = decode(return_lse=True, return_lse_base="basee")
+    supplied = torch.full(
+        (batch, 128), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    out_supplied = decode(lse=supplied, return_lse_base="basee")
+    torch.cuda.synchronize()
+    for output in (out_base2, out_basee, out_supplied):
+        assert torch.equal(output, out_default)
+    assert torch.equal(lse_base2, lse_default)
+    lse_base2 = lse_base2.reshape(batch, 128)
+    assert torch.equal(lse_basee.reshape(batch, 128), supplied)
+    torch.testing.assert_close(
+        supplied, lse_base2 * math.log(2.0), rtol=1e-6, atol=1e-6
+    )
+    live = torch.tensor([length > 0 for _, length in rows], device="cuda")
+    assert bool(torch.isneginf(lse_base2[~live]).all())
+    assert bool(torch.isneginf(supplied[~live]).all())
+    torch.testing.assert_close(
+        lse_base2[live].double(), reference[live], rtol=1e-3, atol=5e-3
+    )
+    torch.testing.assert_close(
+        supplied[live].double(), reference[live] * math.log(2.0), rtol=1e-3, atol=5e-3
+    )
+
+
+@pytest.mark.parametrize(
+    ("batch", "q_len", "max_len", "padded"),
+    [
+        (1, 1, 1024, False),  # split-K: the reducer writes the LSE
+        (1, 1, 8192, False),  # beyond the generic tail's 4096 keys
+        (8, 1, 1024, False),
+        (8, 1, 4096, True),
+        (32, 1, 1024, True),
+        (128, 1, 1024, False),  # one split: the producer writes the LSE
+        (128, 1, 4096, True),
+        (20, 2, 1024, True),
+    ],
+)
+def test_trtllm_mla_blackwell_fp8_page64_lse(
+    batch, q_len, max_len, padded, blackwell_domains
+) -> None:
+    """An FP8 page-64 request with LSE output runs the FP8 page-64 program (one
+    split and split-K): the output equals, bit for bit, the same request without
+    LSE; the base-2 LSE, written into the caller's buffer of either accepted
+    shape, matches the FP64 reference on live rows and is ``-inf`` on padded
+    rows."""
+    _skip_unless_blackwell()
+    from flashinfer.mla.cake_trtllm_mla_blackwell import (
+        _device_facts,
+        plan_num_split,
+    )
+
+    page_size = 64
+    if padded:
+        kv_lens = _padded_kv_lens(batch, q_len, max_len)
+    else:
+        generator = random.Random(batch * 7 + max_len)
+        kv_lens = [generator.randint(max_len // 2, max_len) for _ in range(batch)]
+        kv_lens[-1] = max_len
+    query, kv_cache, block_tables, seq_lens = _blackwell_inputs(
+        kv_lens, q_len, page_size, torch.float8_e4m3fn
+    )
+    rows = _query_rows(kv_lens, [q_len] * batch)
+    total_q = batch * q_len
+    _, num_sms = _device_facts(torch.cuda.current_device())
+    splits = plan_num_split(total_q, max_len, num_sms)
+
+    plain = _blackwell_decode(query, kv_cache, block_tables, seq_lens, max_len)
+    out, lse = _blackwell_decode(
+        query, kv_cache, block_tables, seq_lens, max_len, return_lse=True
+    )
+    nested = torch.full(
+        (batch, q_len, 128), float("nan"), dtype=torch.float32, device="cuda"
+    )
+    out_nested = _blackwell_decode(
+        query, kv_cache, block_tables, seq_lens, max_len, lse=nested
+    )
+    torch.cuda.synchronize()
+    assert blackwell_domains == ["mla_fp8_page64_pdl"] * 3, (blackwell_domains, splits)
+    assert torch.equal(out, plain) and torch.equal(out_nested, plain)
+    assert tuple(lse.shape) == (total_q, 128)
+    assert torch.equal(nested.reshape(total_q, 128), lse)
+    reference = _blackwell_rows_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    _assert_rows(out, reference, rows, torch.float8_e4m3fn)
+    lse_reference = _blackwell_lse_reference(
+        query.reshape(-1, 128, 576), kv_cache, block_tables, rows, page_size
+    )
+    live = torch.tensor([length > 0 for _, length in rows], device="cuda")
+    assert bool(torch.isneginf(lse[~live]).all()), splits
+    torch.testing.assert_close(
+        lse[live].double(), lse_reference[live], rtol=1e-3, atol=5e-3
+    )
 
 
 @pytest.mark.parametrize(
@@ -2820,6 +4425,53 @@ def test_functional_dispatch_cake_kimi_returns_lse(
     assert lse.shape == case["query"].shape[:-1]
     torch.testing.assert_close(out, torch.full_like(out, 7))
     torch.testing.assert_close(lse, torch.full_like(lse, 3))
+
+
+@pytest.mark.parametrize("caller_lse", [False, True])
+@pytest.mark.parametrize("lse_base", [None, "basee", "base2"])
+def test_functional_dispatch_cake_blackwell_lse_base(
+    functional_request, monkeypatch, lse_base, caller_lse
+):
+    """The Blackwell Cake route writes base-2 LSE: ``return_lse_base="basee"``
+    converts the returned LSE (the caller's buffer when given) to natural-log
+    units in place; ``None`` and ``"base2"`` keep base 2."""
+    import sys
+
+    case = functional_request
+    case.update(backend="cake", return_lse=True, return_lse_base=lse_base)
+    user_lse = None
+    if caller_lse:
+        user_lse = torch.empty(
+            case["query"].shape[:-1], dtype=torch.float32, device="cuda"
+        )
+        case.update(lse=user_lse)
+    calls = []
+
+    def launch(**kwargs):
+        calls.append(kwargs)
+        lse = kwargs["lse"]
+        if lse is None:
+            lse = torch.empty(
+                (2, 16), dtype=torch.float32, device=kwargs["query"].device
+            )
+        kwargs["out"].fill_(7)
+        lse.fill_(3)
+        return kwargs["out"], lse
+
+    monkeypatch.setattr(core, "_cake_trtllm_mla_blackwell_supports", lambda *args: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.mla.cake_trtllm_mla_blackwell",
+        SimpleNamespace(trtllm_mla_blackwell_decode=launch),
+    )
+    out, lse = core.trtllm_batch_decode_with_kv_cache_mla(**case)
+    assert out is case["out"] and len(calls) == 1
+    assert calls[0]["lse"] is user_lse and calls[0]["return_lse"]
+    if caller_lse:
+        assert lse is user_lse
+    expected = 3 * math.log(2.0) if lse_base == "basee" else 3.0
+    torch.testing.assert_close(lse, torch.full_like(lse, expected))
+    torch.testing.assert_close(out, torch.full_like(out, 7))
 
 
 def test_functional_dispatch_cake_kimi_rejects_pdl(functional_request, monkeypatch):
