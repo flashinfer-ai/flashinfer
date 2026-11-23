@@ -203,6 +203,36 @@ class PackedDecodeWorkQueue(WorkQueue):
         self.num_heads_kv = num_heads_kv
 
     @cute.jit
+    def _route_ordered(self, work_tile: Any) -> Any:
+        """Map CLC route index i to ``route_order[i]`` (longest first).
+
+        The metadata grid stores the order right after its per-route lengths;
+        TaskManager reads it after the attention grid's dependency wait.
+        """
+        if cutlass.const_expr(self.cfg.uses_longest_first_route_order):
+            q_group_idx, h_idx, route_idx = work_tile.tile_idx
+            routes = cutlass.Int32(cute.arch.grid_dim()[2])
+            route_idx = cutlass.Int32(
+                self.seqlens_kv[routes + cutlass.Int32(route_idx)]
+            )
+            return type(work_tile)(
+                (q_group_idx, h_idx, route_idx), work_tile.is_valid_tile
+            )
+        return work_tile
+
+    @cute.jit
+    def initial_work_tile_info(self) -> Any:
+        """Return this CTA's first work tile in longest-first route order."""
+        return self._route_ordered(self._make_initial_work_tile())
+
+    @cute.jit
+    def _work_tile_info_from_clc_response(self, response_ptr: Any) -> Any:
+        """Decode a CLC response, then apply the longest-first route order."""
+        return self._route_ordered(
+            WorkQueue._work_tile_info_from_clc_response(self, response_ptr)
+        )
+
+    @cute.jit
     def skip_work_tile_if(self, work_tile: Any) -> cutlass.Boolean:
         """Skip empty KV requests and Q groups outside their live sequence."""
         q_group_cta_idx, h_idx, b_idx = work_tile.tile_idx

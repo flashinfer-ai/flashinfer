@@ -1082,6 +1082,23 @@ class FmhaDecodeConfig:
         return self.share_pattern_across_kv_heads
 
     @property
+    def uses_longest_first_route_order(self) -> bool:
+        """Persistent grouped QToken routes take CLC work longest first.
+
+        The metadata kernel then writes ``route_order`` (route IDs by
+        descending KV128 tiles) right after the per-route lengths, and the
+        work queue maps CLC index i to ``route_order[i]``: long routes start
+        in the first wave instead of extending the last.
+        """
+        return (
+            self.balanced_scheduler
+            and self.use_q_token_kv_block_sparse_route
+            and self.use_persistent_scheduler
+            and self.shares_sparse_pattern
+            and not self.fixed_seqlen
+        )
+
+    @property
     def widens_sparse_metadata_rows_per_head(self) -> bool:
         """Whether a nonpersistent CTA offsets per-head metadata to its KV head
         and widens the row strides to ``Hkv`` rows (one row per batch)."""
@@ -2427,6 +2444,10 @@ class FmhaDecodeConfig:
     # Enable persistent scheduling: one physical worker may consume multiple
     # logical work tiles. Mutually exclusive with split-KV mode.
     use_persistent_scheduler: bool = False
+    # Balanced persistent scheduling: CLC hands out work tiles longest first
+    # (QToken routes: the metadata kernel writes their order after seq_lens).
+    # Resolved by the plan; part of the compile signature.
+    balanced_scheduler: bool = False
     # Split-KV: split the K-sequence across several CTAs that produce partial
     # O/stats, with a GMEM reduction epilogue.
     use_split_kv: bool = False

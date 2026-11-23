@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import math
 from contextlib import contextmanager
@@ -368,6 +369,7 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "split_kv",
         "share_pattern_across_kv_heads",
         "count_current_block_in_topk",
+        "balanced_scheduler",
         "mask_type",
         "q_dtype",
         "kv_dtype",
@@ -2321,6 +2323,7 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
         _flat_locator_heads = 1
+        _uses_route_order = False
 
         def _run_unchecked(
             self,
@@ -2475,6 +2478,7 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
         _flat_locator_heads = 1
+        _uses_route_order = False
 
         def _run_unchecked(
             self,
@@ -2580,6 +2584,7 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
         _flat_locator_heads = 1
+        _uses_route_order = False
 
         def _run_unchecked(
             self,
@@ -2966,6 +2971,7 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
         _flat_locator_heads = 1
+        _uses_route_order = False
 
         def _run_unchecked(
             self,
@@ -4699,6 +4705,225 @@ def test_wide_group_packed_attention_matches_reference(
             ]
             error = (output[token, heads].float() - reference).norm() / reference.norm()
             assert error < 0.01, (token, token % group_size, kv_head, float(error))
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize(
+    ("kv_dtype", "head_dim"),
+    ((torch.bfloat16, 128), (torch.uint8, 256)),
+    ids=("bf16-d128", "nvfp4-d256"),
+)
+def test_persistent_routes_run_longest_first(
+    kv_dtype: torch.dtype, head_dim: int
+) -> None:
+    """``balanced_scheduler=True`` takes persistent routes longest first.
+
+    The metadata kernel's last CTA writes ``route_order`` (a permutation of
+    the routes by descending KV128 tiles) and rearms its counter; attention
+    maps CLC index i to ``route_order[i]``. Two requests with different
+    prefixes and per-query selection sizes give routes of different lengths;
+    every query of every route (including short tail routes) matches FP32,
+    and a second run reuses the rearmed counter. These 37 routes fit in one
+    wave, so the default (``None``) leaves the order off. Their K/V fits in
+    L2, so every route is ordered; the third run reorders only the 8 shortest
+    routes (as when K/V exceeds L2), and the others keep index order.
+    """
+
+    num_qo_heads, num_kv_heads, group_size, block_size, page_size = 16, 1, 4, 4, 64
+    block_topk = 64
+    generator = torch.Generator(device="cuda").manual_seed(4093)
+    prefixes, counts = (300, 1800), (61, 83)
+    seq_lens = [p + c for p, c in zip(prefixes, counts, strict=True)]
+    pages_per_request = (max(seq_lens) + page_size - 1) // page_size
+    table = (
+        torch.randperm(2 * pages_per_request, generator=generator, device="cuda")
+        .to(torch.int32)
+        .view(2, pages_per_request)
+    )
+    shape = (2 * pages_per_request, num_kv_heads, page_size)
+    if kv_dtype == torch.bfloat16:
+        caches = tuple(
+            torch.randn((*shape, head_dim), generator=generator, device="cuda").to(
+                torch.bfloat16
+            )
+            for _ in range(2)
+        )
+        kv_scale_factors = None
+        keys, values = (cache.float() for cache in caches)
+    else:
+        caches = tuple(
+            torch.randint(
+                0, 256, (*shape, head_dim // 2), generator=generator, device="cuda"
+            ).to(torch.uint8)
+            for _ in range(2)
+        )
+        scales = [
+            (
+                torch.rand((*shape, head_dim // 16), generator=generator, device="cuda")
+                / 2
+            )
+            .add(0.05)
+            .to(torch.float8_e4m3fn)
+            for _ in range(2)
+        ]
+        kv_scale_factors = (scales[0], _interleave_v_scale_factors(scales[1]))
+        keys, values = (
+            dequantize_nvfp4_reference(data, scale)
+            for data, scale in zip(caches, scales, strict=True)
+        )
+
+    num_queries = sum(counts)
+    positions = torch.cat(
+        [
+            torch.arange(p, p + c, dtype=torch.int32, device="cuda")
+            for p, c in zip(prefixes, counts, strict=True)
+        ]
+    )
+    requests = torch.cat(
+        [
+            torch.full((c,), r, dtype=torch.int32, device="cuda")
+            for r, c in enumerate(counts)
+        ]
+    )
+    blocks = torch.full((num_queries, block_topk), -1, dtype=torch.int32, device="cuda")
+    for token in range(num_queries):
+        bound = (int(positions[token]) + 1) // block_size
+        take = min(
+            bound,
+            int(
+                torch.randint(
+                    8, block_topk + 1, (1,), generator=generator, device="cuda"
+                )
+            ),
+        )
+        chosen = torch.randperm(bound, generator=generator, device="cuda")[:take]
+        blocks[token, :take] = chosen.to(torch.int32)
+    query = torch.randn(
+        (num_queries, num_qo_heads, head_dim), generator=generator, device="cuda"
+    ).to(torch.bfloat16)
+    qo_indptr = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
+        torch.tensor([0, counts[0], num_queries], dtype=torch.int32),
+        num_queries,
+        group_size=group_size,
+        device="cuda",
+    )
+    workspace = torch.full(
+        (
+            get_q_token_kv_block_sparse_workspace_size(
+                query,
+                caches[0],
+                table,
+                block_topk=block_topk,
+                max_seq_len_kv=max(seq_lens),
+                out_dtype=torch.bfloat16,
+                qo_indptr=qo_indptr,
+                group_size=group_size,
+                kv_block_size=block_size,
+                split_kv=False,
+            ),
+        ),
+        0xFF,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    def plan(balanced_scheduler):
+        wrapper = QTokenKvBlockSparsePagedTSWrapper()
+        wrapper.plan(
+            qo_indptr.numel() - 1,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            page_size,
+            block_topk,
+            max(seq_lens),
+            device="cuda",
+            workspace_buffer=workspace,
+            group_size=group_size,
+            packed_query=True,
+            split_kv=False,
+            balanced_scheduler=balanced_scheduler,
+            q_dtype=torch.bfloat16,
+            kv_dtype=kv_dtype,
+            out_dtype=torch.bfloat16,
+        )
+        return wrapper
+
+    single_wave = plan(None)
+    single_wave.run(
+        query,
+        caches,
+        table,
+        blocks,
+        requests,
+        positions,
+        qo_indptr=qo_indptr,
+        kv_scale_factors=kv_scale_factors,
+    )
+    assert single_wave._prepared_plan._metadata_plan.route_order is None
+
+    wrapper = plan(True)
+    for run in range(3):  # run 1 reuses the rearmed counter; run 2 has a short tail
+        if run == 2:
+            prepared = wrapper._prepared_plan
+            wrapper._prepared_plan = dataclasses.replace(
+                prepared,
+                _metadata_plan=dataclasses.replace(
+                    prepared._metadata_plan, route_order_tail=8
+                ),
+            )
+        output = torch.full_like(query, float("nan"))
+        wrapper.run(
+            query,
+            caches,
+            table,
+            blocks,
+            requests,
+            positions,
+            qo_indptr=qo_indptr,
+            out=output,
+            kv_scale_factors=kv_scale_factors,
+        )
+        torch.cuda.synchronize()
+
+        metadata = wrapper._prepared_plan._metadata_plan
+        assert metadata.route_order is not None
+        routes = qo_indptr.numel() - 1
+        order = metadata.route_order.cpu()
+        assert sorted(order.tolist()) == list(range(routes))
+        tail = routes if metadata.route_order_tail == 0 else metadata.route_order_tail
+        head, ordered = order[: routes - tail], order[routes - tail :]
+        all_tiles = (metadata.seq_lens.cpu() + 127) // 128
+        tiles = all_tiles[ordered.long()]
+        assert bool((tiles[:-1] >= tiles[1:]).all()), tiles.tolist()
+        assert bool((head[:-1] < head[1:]).all()), head.tolist()
+        if head.numel():
+            # The tail holds the shortest routes; one tile bucket may straddle.
+            assert int(all_tiles[head.long()].min()) >= int(tiles.max())
+        assert int(metadata.route_order_counter.item()) == 0
+
+        for token in range(num_queries):
+            request = int(requests[token])
+            visible = int(positions[token]) + 1
+            tail = torch.arange(visible - visible % block_size, visible, device="cuda")
+            selected = blocks[token]
+            live = selected[selected >= 0].long()
+            token_ids = torch.cat(
+                (
+                    (
+                        live[:, None] * block_size
+                        + torch.arange(block_size, device="cuda")
+                    ).flatten(),
+                    tail,
+                )
+            )
+            pages = table[request, token_ids // page_size].long()
+            slots = token_ids % page_size
+            scores = query[token].float() @ keys[pages, 0, slots].T
+            reference = (scores / head_dim**0.5).softmax(-1) @ values[pages, 0, slots]
+            error = (output[token].float() - reference).norm() / reference.norm()
+            assert error < 0.01, (token, float(error))
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION

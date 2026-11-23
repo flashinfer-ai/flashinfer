@@ -2803,6 +2803,8 @@ class PrimsTSBatchDecodePlan:
     _output_scale: GlobalScale
     _direct_q1_inputs: tuple[Optional[torch.Tensor], ...] = ()
     _flat_locator_heads: int = 1
+    # Persistent grouped QToken launches read the metadata's route order.
+    _uses_route_order: bool = False
     _lse_mode: str = "none"
     _use_attention_sinks: bool = False
     _requested_splits: int = 1
@@ -3923,6 +3925,7 @@ def _prepare_prims_ts_batch_decode_plan(
     lse_mode: Literal["none", "base2"] = "none",
     softmax_scale: Optional[GlobalScale] = None,
     output_scale: GlobalScale = 1.0,
+    balanced_scheduler: Optional[bool] = None,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
 
@@ -4074,6 +4077,21 @@ def _prepare_prims_ts_batch_decode_plan(
         *policy_args,
         use_attention_sinks=use_attention_sinks,
     )
+    if balanced_scheduler is not False and (
+        use_q_token_kv_block_sparse_route
+        and packed_query
+        and seq_len_q > 1
+        and not direct_q1_inputs
+        and spec.config.use_persistent_scheduler
+        and spec.config.shares_sparse_pattern
+    ):
+        # Longest-first CLC dispatch pays when work spans more than one wave of
+        # SMs; within one wave every route starts at once. True forces it.
+        enable = balanced_scheduler or batch_size * num_kv_heads > get_device_sm_count(
+            torch.device("cuda", device_index)
+        )
+        if enable:
+            spec = replace(spec, config=replace(spec.config, balanced_scheduler=True))
     nvfp4_keeps = spec.config.uses_keeps_transformed_kv
     policy_config = replace(spec.config, fixed_seqlen=True)
     if query_major_memberships:
@@ -4265,6 +4283,7 @@ def _prepare_prims_ts_batch_decode_plan(
         _output_scale=output_scale,
         _direct_q1_inputs=direct_q1_inputs,
         _flat_locator_heads=num_kv_heads if flat_native_kv_tma else 1,
+        _uses_route_order=bool(spec.config.uses_longest_first_route_order),
         _lse_mode=lse_mode,
         _use_attention_sinks=use_attention_sinks,
         _requested_splits=spec.requested_splits or int(spec.config.splits_kv),
