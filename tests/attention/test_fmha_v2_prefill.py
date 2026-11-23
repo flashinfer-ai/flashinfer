@@ -2352,6 +2352,14 @@ def test_trtllm_fmha_v2_chunked_prefill_chunked_attention(
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
 
 
+_gen_start_barrier = None
+
+
+def _init_gen_worker(barrier):
+    global _gen_start_barrier
+    _gen_start_barrier = barrier
+
+
 def _gen_fmha_v2_sm120_sources_worker(_):
     # Runs in a fresh (spawned) process whose FLASHINFER_WORKSPACE_BASE points
     # at the shared workspace under test; this is the source-generation step
@@ -2359,6 +2367,8 @@ def _gen_fmha_v2_sm120_sources_worker(_):
     from flashinfer.jit.attention.modules import gen_trtllm_fmha_v2_sm120_module
 
     try:
+        # Start all workers together so the generation calls overlap.
+        _gen_start_barrier.wait(timeout=120)
         gen_trtllm_fmha_v2_sm120_module()
     except Exception as e:  # report instead of raising across the pool
         return f"{type(e).__name__}: {e}"
@@ -2377,7 +2387,13 @@ def test_fmha_v2_sm120_module_generation_concurrent(tmp_path, monkeypatch):
         monkeypatch.setenv(
             "FLASHINFER_WORKSPACE_BASE", str(tmp_path / f"ws{iteration}")
         )
-        with multiprocessing.get_context("spawn").Pool(num_processes) as pool:
-            errors = pool.map(_gen_fmha_v2_sm120_sources_worker, range(num_processes))
+        ctx = multiprocessing.get_context("spawn")
+        barrier = ctx.Barrier(num_processes)
+        with ctx.Pool(
+            num_processes, initializer=_init_gen_worker, initargs=(barrier,)
+        ) as pool:
+            errors = pool.map(
+                _gen_fmha_v2_sm120_sources_worker, range(num_processes), chunksize=1
+            )
         failed = [e for e in errors if e is not None]
         assert not failed, f"iteration {iteration}: {failed}"
