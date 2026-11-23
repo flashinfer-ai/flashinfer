@@ -94,9 +94,9 @@ from .shared.inputs import (
     unpack_trtllm_moe_output as _unpack_trtllm_moe_output,
 )
 from .shared.validation import (
-    resolve_moe_act_sf_layout,
     validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
 )
+from .shared.validation import resolve_moe_act_sf_layout
 
 # Aliased to avoid clashing with the CUTLASS runner class of the same name that
 # get_cutlass_fused_moe_module() defines locally.
