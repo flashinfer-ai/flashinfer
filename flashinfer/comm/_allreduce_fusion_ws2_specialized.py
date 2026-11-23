@@ -79,9 +79,11 @@ the current stream with no host synchronisation, so it is CUDA-graph capturable 
 an omitted output or the aligned copies of a misaligned view, from the caching allocator); the
 module is built at workspace creation, never at call time. Its grid holds every co-resident CTA
 slot of the device and waits on its peer, so the launcher runs eager launches on one device one
-grid at a time, also across streams, in the order the host issued them (see
-``csrc/allreduce_fusion_ws2_specialized.cu``); launches captured in a CUDA graph follow the
-stream the graph is replayed on.
+grid at a time, also across streams, in the order the host issued them: the order in which the
+calls take the device's launch mutex, which is held until the kernel is enqueued (see
+``csrc/allreduce_fusion_ws2_specialized.cu``). Calls issued concurrently from several host
+threads must therefore be issued in the same order on every rank, as for any collective.
+Launches captured in a CUDA graph follow the stream the graph is replayed on.
 
 Markers, once per process each, written to ``sys.stderr`` (serving frameworks may route or drop
 library loggers) and to the ``flashinfer.jit`` logger: :data:`STATE_MARKER` when a state is created,

@@ -27,18 +27,22 @@ bool is_aligned_16(const TensorView& t) {
 }
 
 // Eager launches of the kernel on one device run one grid at a time, also across streams, in
-// the order the host issued them (the same order on every rank). Each grid holds every
-// co-resident CTA slot of its device and waits on its peer, so two grids in flight on different
-// streams can deadlock across the ranks: rank 0 runs grid A first and waits for the peer's A,
-// while the peer runs grid B first (its A queued behind other work) and A cannot become resident
-// behind B. A launch on another stream than the device's previous eager launch therefore waits
-// for the work enqueued on that previous stream so far (an event recorded there now). A launch
-// on the same stream as the previous one (the usual case) costs a comparison. Launches during a
-// stream capture are not ordered here: a graph's launches follow the stream it is replayed on.
-// The previous stream is used again only to record that event; PyTorch's streams are never
-// destroyed (an external stream must outlive the next launch on another stream). Ordering is
-// best effort: a CUDA error here is cleared and the launch proceeds unordered, since raising on
-// one rank only would leave its peer waiting in the kernel.
+// the order their calls take the device's mutex below, which is also the order their kernels are
+// enqueued: the mutex is held from the ordering through the launch. A single host thread issues
+// them in its program order; calls issued concurrently from several host threads must be issued
+// in the same order on every rank (the caller's job, as for any collective). Each grid holds
+// every co-resident CTA slot of its device and waits on its peer, so two grids in flight on
+// different streams can deadlock across the ranks: rank 0 runs grid A first and waits for the
+// peer's A, while the peer runs grid B first (its A queued behind other work) and A cannot become
+// resident behind B. A launch on another stream than the device's previous eager launch therefore
+// waits for the work enqueued on that previous stream so far (an event recorded there now). A
+// launch on the same stream as the previous one (the usual case) costs a comparison. Launches
+// during a stream capture are not ordered here: a graph's launches follow the stream it is
+// replayed on. The previous stream is recorded only after a successful launch and is used again
+// only to record that event; PyTorch's streams are never destroyed (an external stream must
+// outlive the next launch on another stream). Ordering is best effort: a CUDA error here is
+// cleared and the launch proceeds unordered, since raising on one rank only would leave its peer
+// waiting in the kernel.
 constexpr int kMaxDevices = 64;
 
 struct LaunchOrder {
@@ -48,18 +52,19 @@ struct LaunchOrder {
   cudaEvent_t done = nullptr;
 };
 
-void order_after_previous_launch(int device, cudaStream_t stream) {
+template <typename Launch>
+cudaError_t launch_in_issue_order(int device, cudaStream_t stream, Launch&& launch) {
   static LaunchOrder orders[kMaxDevices];
-  if (device < 0 || device >= kMaxDevices) return;
+  if (device < 0 || device >= kMaxDevices) return launch();
   LaunchOrder& order = orders[device];
-  std::lock_guard<std::mutex> lock(order.mu);
-  if (order.has_last && order.last == stream) return;
+  std::lock_guard<std::mutex> lock(order.mu);  // held until the kernel is enqueued
+  if (order.has_last && order.last == stream) return launch();
   cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
   if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) {
     (void)cudaGetLastError();
-    return;
+    return launch();
   }
-  if (capture != cudaStreamCaptureStatusNone) return;
+  if (capture != cudaStreamCaptureStatusNone) return launch();
   if (order.has_last) {
     cudaStreamCaptureStatus last_capture = cudaStreamCaptureStatusNone;
     cudaError_t err = cudaStreamIsCapturing(order.last, &last_capture);
@@ -72,8 +77,12 @@ void order_after_previous_launch(int device, cudaStream_t stream) {
     }
     if (err != cudaSuccess) (void)cudaGetLastError();
   }
-  order.last = stream;
-  order.has_last = true;
+  const cudaError_t status = launch();
+  if (status == cudaSuccess) {
+    order.last = stream;
+    order.has_last = true;
+  }
+  return status;
 }
 
 }  // namespace
@@ -84,11 +93,13 @@ void order_after_previous_launch(int device, cudaStream_t stream) {
 // tensor as input or residual_in. own_region / peer_region: this rank's and the peer's mapping of
 // the peer-mapped region (ws2::region_bytes(capacity) bytes each); epoch: rank-local int32 call
 // counter of ws2::epoch_words(grid) words. Launches on the caller's current stream, after the
-// device's previous eager launch of this kernel (see order_after_previous_launch); no host sync,
-// no allocation (CUDA-graph capturable). Returns 0 after the launch, or 1 without launching when
-// a tensor is not 16-byte aligned (the caller stages aligned copies and calls again, so a rank
-// with a misaligned view still runs the kernel its peer runs). Every other failure raises: the
-// call is collective, so a rank must never silently take another path than its peer.
+// device's previous eager launch of this kernel, in the order the calls take the device's mutex
+// (see launch_in_issue_order; calls from several host threads must be issued in the same order on
+// every rank); no host sync, no allocation (CUDA-graph capturable). Returns 0 after the launch, or
+// 1 without launching when a tensor is not 16-byte aligned (the caller stages aligned copies and
+// calls again, so a rank with a misaligned view still runs the kernel its peer runs). Every other
+// failure raises: the call is collective, so a rank must never silently take another path than its
+// peer.
 int64_t allreduce_fusion_ws2_ar_rmsnorm(TensorView input, TensorView residual_in,
                                         TensorView rms_gamma, TensorView residual_out,
                                         TensorView norm_out, int64_t own_region,
@@ -133,13 +144,14 @@ int64_t allreduce_fusion_ws2_ar_rmsnorm(TensorView input, TensorView residual_in
 
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
   const cudaStream_t stream = get_stream(input.device());
-  order_after_previous_launch(input.device().device_id, stream);
-  const cudaError_t status = ws2::launch(
-      input.data_ptr(), residual_in.data_ptr(), rms_gamma.data_ptr(), residual_out.data_ptr(),
-      norm_out.data_ptr(), reinterpret_cast<void*>(own_region),
-      reinterpret_cast<void*>(peer_region), static_cast<uint32_t*>(epoch.data_ptr()), capacity,
-      static_cast<int>(num_tokens), static_cast<int>(grid), static_cast<float>(rms_eps),
-      static_cast<float>(weight_bias), launch_with_pdl, stream);
+  const cudaError_t status = launch_in_issue_order(input.device().device_id, stream, [&] {
+    return ws2::launch(
+        input.data_ptr(), residual_in.data_ptr(), rms_gamma.data_ptr(), residual_out.data_ptr(),
+        norm_out.data_ptr(), reinterpret_cast<void*>(own_region),
+        reinterpret_cast<void*>(peer_region), static_cast<uint32_t*>(epoch.data_ptr()), capacity,
+        static_cast<int>(num_tokens), static_cast<int>(grid), static_cast<float>(rms_eps),
+        static_cast<float>(weight_bias), launch_with_pdl, stream);
+  });
   if (status != cudaSuccess) {
     // Clear a non-sticky launch error so later kernels do not observe it; the call still raises.
     (void)cudaGetLastError();
