@@ -51,11 +51,13 @@ automatic selection compares Keeps Q64 there, and FP8 K/V D512 is rejected
 at other ratios. Both run fixed Q with dense or causal masks, direct or with
 GMEM split-KV reduction (fused or separate kernel); cluster-SMEM reduction
 has no Keeps implementation, and the NVFP4 profile also excludes persistent
-scheduling. NVFP4 K/V D512 at other head ratios runs on Swaps. One-token
-decode uses grouped Swaps Q8-Q32 up to 32 Q heads per KV head and ungrouped
-Swaps Q16 above that. Eight-token decode uses grouped Swaps Q16-Q64 while the
-head group fits a Q64 tile (up to 64 Q heads per KV head) and ungrouped Swaps
-Q16 beyond it.
+scheduling. NVFP4 K/V D512 at other head ratios runs on Swaps, with a tile
+that depends on the workload (query length, batch, KV length and how many
+CTAs fill the GPU). Grouped Swaps tiles, up to Q64, are candidates while one
+KV head's Q heads fit a Q64 tile (up to 64 Q heads per KV head); ungrouped
+head-band tiles (Q8, Q16) are candidates as well, for example when a grouped
+one-token launch would leave most of the first wave idle. Above 64 Q heads per
+KV head only ungrouped tiles remain.
 
 Native SM107 targets use compact FP4 repacking for TMEM conversion and retain
 dense nibble pairs for SMEM conversion. Dense D256 one-instance Keeps profiles
