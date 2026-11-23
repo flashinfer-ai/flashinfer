@@ -506,9 +506,9 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
     // Match TE's encode scale: min(1 / (fp32(fp8(SFValue)) * (1 / SFScaleVal)), fp32_max).
-    outputScale = vecMax != 0
-                      ? fminf(reciprocal_nr_ftz(SFValue * reciprocal_nr_ftz(SFScaleVal)), FLT_MAX)
-                      : 0.0f;
+    float const prod = SFValue * reciprocal_nr_ftz(SFScaleVal);
+    outputScale =
+        vecMax != 0 ? (prod > 0.0f ? fminf(reciprocal_nr_ftz(prod), FLT_MAX) : FLT_MAX) : 0.0f;
   } else if constexpr (!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
@@ -566,8 +566,10 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     float outputScale4;
     float outputScale6;
     if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-      outputScale4 = fminf(reciprocal_nr_ftz(__fmul_rn(sfValue4, globalDecodeScale)), FLT_MAX);
-      outputScale6 = fminf(reciprocal_nr_ftz(__fmul_rn(sfValue6, globalDecodeScale)), FLT_MAX);
+      float const prod4 = __fmul_rn(sfValue4, globalDecodeScale);
+      float const prod6 = __fmul_rn(sfValue6, globalDecodeScale);
+      outputScale4 = prod4 > 0.0f ? fminf(reciprocal_nr_ftz(prod4), FLT_MAX) : FLT_MAX;
+      outputScale6 = prod6 > 0.0f ? fminf(reciprocal_nr_ftz(prod6), FLT_MAX) : FLT_MAX;
     } else {
       outputScale4 = reciprocal_approximate_ftz(sfValue4 * globalDecodeScale);
       outputScale6 = reciprocal_approximate_ftz(sfValue6 * globalDecodeScale);
