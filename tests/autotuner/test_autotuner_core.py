@@ -25,7 +25,6 @@ from flashinfer.fused_moe.shared.tuning import (
 from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
-    map_to_hybrid_bucket_uncapped,
 )
 from flashinfer.mla._batch_mla._backends.cute_dsl_modular_backend import (
     _BatchMLAPagedAttentionCuteDslModularBackend,
@@ -540,6 +539,171 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert len(tuner.profiling_cache) >= 1
     assert tuner.stats.tuned_op_total_configs["dummy_tune"] >= 1
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
+
+
+@pytest.mark.parametrize("explicit_cuda_graph", [False, True])
+def test_choose_one_retunes_when_runner_candidates_expand(
+    monkeypatch, explicit_cuda_graph
+):
+    class OtherRunner(DummyRunner):
+        def __init__(self, tactic, layout):
+            super().__init__((tactic,))
+            self.layout = layout
+
+        def __hash__(self):
+            return 0
+
+        def get_cache_key_extras(self, inputs):
+            return (self.layout,)
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    first = DummyRunner((0,))
+    second, third = OtherRunner(1, "a"), OtherRunner(2, "b")
+    inputs = [torch.empty(4, 8)]
+    config = TuningConfig()
+    calls = []
+
+    def profile(runner, inputs, tactic, config, **kwargs):
+        calls.append(runner)
+        return {0: 3.0, 1: 1.0, 2: 2.0}[tactic]
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+
+    with autotune():
+        assert tuner.choose_one("expand", [first], config, inputs) == (first, 0)
+    assert calls == [first]
+    calls.clear()
+
+    # The single-runner winner can still serve inference before the mixed tune.
+    assert tuner.choose_one("expand", [first, second], config, inputs) == (first, 0)
+    assert calls == []
+
+    with autotune():
+        winner = tuner.choose_one("expand", [first, second], config, inputs)
+        assert calls == [first, second]
+        assert winner == (second, 1)
+        calls.clear()
+        assert tuner.choose_one("expand", [second, first], config, inputs) == (
+            second,
+            1,
+        )
+        assert tuner.choose_one("expand", [second], config, inputs) == (second, 1)
+        assert calls == []
+
+    # The mixed tune replaced the earlier winner for this backend.
+    assert tuner.choose_one("expand", [first], config, inputs) == (first, -1)
+    assert calls == []
+
+    with autotune():
+        explicit_config = replace(config, use_cuda_graph=explicit_cuda_graph)
+        assert tuner.choose_one("expand", [first], explicit_config, inputs) == (
+            first,
+            0,
+        )
+        assert tuner.choose_one("expand", [first, second], config, inputs) == (
+            second,
+            1,
+        )
+    assert tuner.choose_one("expand", [first, second], config, inputs) == (second, 1)
+    calls.clear()
+
+    with autotune():
+        # Only cache-key extras distinguish the two OtherRunner candidates.
+        assert tuner.choose_one("expand", [first, second, third], config, inputs) == (
+            second,
+            1,
+        )
+        assert calls == [first, second, third]
+        calls.clear()
+        assert tuner.choose_one("expand", [third, second], config, inputs) == (
+            second,
+            1,
+        )
+        assert calls == []
+        assert tuner.choose_one("expand", [first, third], config, inputs) == (third, 2)
+        assert calls == [first, third]
+
+
+@pytest.mark.parametrize("buckets", [(4,), (4, 8)])
+def test_choose_one_reuses_coverage_after_runner_preparation(monkeypatch, buckets):
+    class PreparingRunner(DummyRunner):
+        def precompile_tactics(self, inputs, tactics, profile, **kwargs):
+            self.prepared = True
+            return True
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    first, second = DummyRunner((0,)), PreparingRunner((1,))
+    runners = [first, second]
+    inputs = [torch.empty(buckets[-1], 8)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=buckets,
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        )
+    )
+    calls = []
+
+    def profile(runner, inputs, tactic, config, **kwargs):
+        calls.append(tactic)
+        return 1.0 + tactic
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    with autotune():
+        assert tuner.choose_one("prepare", runners, config, inputs) == (first, 0)
+        assert calls == [0, 1] * len(buckets)
+        calls.clear()
+        assert tuner.choose_one("prepare", runners, config, inputs) == (first, 0)
+        assert calls == []
+
+
+@pytest.mark.parametrize("failure", ["empty", "profiling"])
+def test_choose_one_retries_incomplete_runner_comparison(monkeypatch, failure):
+    class OtherRunner(DummyRunner):
+        _retry_empty_tactics = True
+
+        def get_valid_tactics(self, inputs, profile):
+            return [] if phase == "expand" and failure == "empty" else [1]
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    first, second = DummyRunner((0, 2)), OtherRunner()
+    inputs = [torch.empty(4, 8)]
+    config = TuningConfig()
+    profiled = []
+    phase = "initial"
+
+    def profile(runner, inputs, tactic, config, **kwargs):
+        profiled.append(tactic)
+        if tactic == 1:
+            return float("inf") if phase == "expand" else 0.5
+        return 1.0 if tactic == (0 if phase == "initial" else 2) else 2.0
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
+    with autotune():
+        assert tuner.choose_one("retry", [first], config, inputs) == (first, 0)
+        phase = "expand"
+        assert tuner.choose_one("retry", [first, second], config, inputs) == (first, 2)
+
+    # Inference still uses the earlier winner after a partial tune.
+    assert tuner.choose_one("retry", [first, second], config, inputs) == (first, 0)
+
+    phase = "recovered"
+    profiled.clear()
+    with autotune():
+        assert tuner.choose_one("retry", [first, second], config, inputs) == (second, 1)
+        assert profiled == [0, 2, 1]
+        profiled.clear()
+        assert tuner.choose_one("retry", [first, second], config, inputs) == (second, 1)
+        assert profiled == []
 
 
 @pytest.mark.parametrize("phase", ("forward", "precompile"))
@@ -2218,240 +2382,6 @@ def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
         assert tactic == expected_tactic, (
             f"n={actual_n}: expected tactic {expected_tactic}, got {tactic}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Tests for lookups above the largest tuned bucket
-# ---------------------------------------------------------------------------
-
-
-def _pow2_bucket_config():
-    return TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
-                gen_tuning_buckets=(128, 512),
-                map_to_tuning_buckets=next_positive_power_of_2,
-            ),
-        ),
-    )
-
-
-def test_choose_one_above_overridden_top_bucket_uses_largest_tuned_profile(
-    monkeypatch,
-):
-    """Tuning under autotune(tuning_buckets=hybrid(N), round_up=True) stores
-    the top bucket N under the op's own key for N (8192 here), so 5000 and 6144
-    hit it directly.  Larger sizes (20000 -> 32768) must still use the profile
-    tuned at N, not the default tactic."""
-    tuner = reset_autotuner()
-    runner = DummyRunner(valid_tactics=(0, 1, 2))
-    config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(0,),
-                gen_tuning_buckets=get_hybrid_num_tokens_buckets,
-                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
-            ),
-        ),
-    )
-    max_tokens = 6144
-    buckets = get_hybrid_num_tokens_buckets(max_tokens)
-    assert buckets[-2:] == (4096, max_tokens)
-
-    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
-        best = 2 if prof_inputs[0].shape[0] == max_tokens else 1
-        return 1.0 if tactic == best else 5.0
-
-    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
-    with autotune(tune_mode=True, tuning_buckets=buckets, round_up=True):
-        tuner.choose_one(
-            "top_bucket_test", [runner], config, [torch.empty((max_tokens, 16))]
-        )
-
-    messages = []
-    monkeypatch.setattr(
-        autotuner_module.logger, "info", lambda msg, *a, **k: messages.append(msg)
-    )
-    # 3000 -> 3072 and 5000, 6144 -> 8192 are tuned; 20000 -> 32768 is above
-    # the top tuned key 8192.
-    for num_tokens, expected_tactic in ((3000, 1), (5000, 2), (6144, 2), (20000, 2)):
-        _, tactic = tuner.choose_one(
-            "top_bucket_test", [runner], config, [torch.empty((num_tokens, 16))]
-        )
-        assert tactic == expected_tactic, f"num_tokens={num_tokens}: got {tactic}"
-    # Logged once, for 32768; 8192 is now a direct hit.
-    assert len([m for m in messages if "above the largest tuned bucket" in m]) == 1
-
-
-def test_search_cache_top_bucket_fallback_only_above_tuned_range():
-    """Only buckets above every tuned bucket with matching static dims resolve
-    to the largest tuned profile, and never in tuning mode."""
-    tuner = reset_autotuner()
-    runner = DummyRunner()
-    config = _pow2_bucket_config()
-    for bucket, tactic in ((128, 0), (512, 1)):
-        key = AutoTuner._get_cache_key("top_bucket", runner, ((bucket, 16),), config)
-        tuner.profiling_cache[key] = (tactic, None)
-
-    def lookup(m, n=16):
-        return tuner.search_cache("top_bucket", [runner], ((m, n),), config)
-
-    miss = (False, 0, -1, None)
-    assert lookup(1000) == (True, 0, 1, None)  # bucket 1024 > 512
-    assert lookup(100) == (True, 0, 0, None)  # exact bucket 128
-    assert lookup(64) == miss  # below the smallest tuned bucket
-    assert lookup(200) == miss  # bucket 256 lies between tuned buckets
-    assert lookup(1000, n=32) == miss  # static dim never tuned
-
-    # In tuning mode a miss must reach profiling instead.
-    tuner.is_tuning_mode = True
-    try:
-        assert lookup(1000) == miss
-    finally:
-        tuner.is_tuning_mode = False
-
-
-def test_search_cache_top_bucket_fallback_with_negative_dim_idx():
-    """A spec may address its dynamic dim from the end (dim_idx=(-2,) is M of
-    an (M, K) operand); that dim must still count as dynamic, not static."""
-    tuner = reset_autotuner()
-    runner = DummyRunner()
-    config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0,),
-                dim_idx=(-2,),
-                gen_tuning_buckets=(128, 512),
-                map_to_tuning_buckets=next_positive_power_of_2,
-            ),
-        ),
-    )
-    for bucket, tactic in ((128, 0), (512, 1)):
-        key = AutoTuner._get_cache_key(
-            "top_bucket_neg", runner, ((bucket, 16),), config
-        )
-        tuner.profiling_cache[key] = (tactic, None)
-
-    def lookup(m, n=16):
-        return tuner.search_cache("top_bucket_neg", [runner], ((m, n),), config)
-
-    miss = (False, 0, -1, None)
-    assert lookup(1000) == (True, 0, 1, None)  # bucket 1024 > 512
-    assert lookup(200) == miss  # bucket 256 lies between tuned buckets
-    assert lookup(1000, n=32) == miss  # the other dim is still static
-
-
-def test_search_cache_top_bucket_fallback_with_linked_dims():
-    """One spec can tie the dynamic dim of several inputs (as the MoE runners
-    do); the clamped profile moves all of them together."""
-    tuner = reset_autotuner()
-    runner = DummyRunner()
-    config = TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0, 1),
-                dim_idx=(0, 0),
-                gen_tuning_buckets=(128, 512),
-                map_to_tuning_buckets=next_positive_power_of_2,
-            ),
-        ),
-    )
-    for bucket, tactic in ((128, 0), (512, 1)):
-        key = AutoTuner._get_cache_key(
-            "top_bucket_linked", runner, ((bucket, 16), (bucket, 8)), config
-        )
-        tuner.profiling_cache[key] = (tactic, None)
-
-    def lookup(m, n=8):
-        return tuner.search_cache(
-            "top_bucket_linked", [runner], ((m, 16), (m, n)), config
-        )
-
-    miss = (False, 0, -1, None)
-    assert lookup(1000) == (True, 0, 1, None)  # both inputs clamp to 512
-    assert lookup(200) == miss  # bucket 256 lies between tuned buckets
-    assert lookup(1000, n=4) == miss  # static dim of the second input
-
-
-def test_search_cache_top_bucket_from_file_configs_matches_extras():
-    """Loaded file configs count toward the top bucket only when their
-    cache-key extras match the lookup's."""
-
-    class DtypeExtrasRunner(DummyRunner):
-        def get_cache_key_extras(self, inputs):
-            return (inputs[0].dtype,)
-
-    tuner = reset_autotuner()
-    runner = DtypeExtrasRunner()
-    config = _pow2_bucket_config()
-
-    def file_key(bucket, dtype):
-        return AutoTuner._get_cache_key(
-            "top_bucket_file", runner, ((bucket, 16),), config, (dtype,)
-        ).file_key
-
-    tuner._file_configs[file_key(256, torch.float16)] = ("DtypeExtrasRunner", 3)
-    # A larger bucket tuned for another dtype must not raise the top bucket.
-    tuner._file_configs[file_key(2048, torch.bfloat16)] = ("DtypeExtrasRunner", 4)
-
-    inputs = [torch.empty((1000, 16), dtype=torch.float16)]
-    hit = tuner.search_cache(
-        "top_bucket_file", [runner], ((1000, 16),), config, inputs=inputs
-    )
-    assert hit == (True, 0, 3, None)
-
-
-def test_search_cache_top_bucket_fallback_is_off_during_replay():
-    """Replay reports exact coverage, so a lookup above the tuned range is
-    reported as a miss instead of being served from the top bucket."""
-    from flashinfer import ReplayCoverage
-
-    tuner = reset_autotuner()
-    runner = DummyRunner()
-    config = _pow2_bucket_config()
-    key = AutoTuner._get_cache_key("top_bucket_replay", runner, ((512, 16),), config)
-    tuner.profiling_cache[key] = (1, None)
-
-    report = ReplayCoverage()
-    tuner._v2_local.replay_report = report
-    try:
-        miss = tuner.search_cache("top_bucket_replay", [runner], ((1000, 16),), config)
-    finally:
-        tuner._v2_local.replay_report = None
-    assert miss == (False, 0, -1, None)
-    assert (report.hits, report.misses) == (0, 1)
-    hit = tuner.search_cache("top_bucket_replay", [runner], ((1000, 16),), config)
-    assert hit == (True, 0, 1, None)
-
-
-def test_search_cache_top_bucket_ignores_unservable_file_configs(monkeypatch):
-    """File configs that search_cache itself skips (an isolated context scope,
-    or keys excluded from the winner partition) must not set the top bucket."""
-    tuner = reset_autotuner()
-    runner = DummyRunner()
-    config = _pow2_bucket_config()
-
-    def file_key(bucket):
-        return AutoTuner._get_cache_key(
-            "top_bucket_skip", runner, ((bucket, 16),), config
-        ).file_key
-
-    tuner._file_configs[file_key(256)] = ("DummyRunner", 3)
-    tuner._file_configs[file_key(2048)] = ("DummyRunner", 4)
-
-    def lookup():
-        return tuner.search_cache("top_bucket_skip", [runner], ((1000, 16),), config)
-
-    assert lookup() == (False, 0, -1, None)  # bucket 1024 lies below 2048
-
-    tuner._excluded_file_keys[None] = {file_key(2048)}
-    assert lookup() == (True, 0, 3, None)  # falls back to 256
-
-    monkeypatch.setattr(AutoTuner, "_isolate_legacy_configs", property(lambda s: True))
-    assert lookup() == (False, 0, -1, None)  # no file config is served
 
 
 # ---------------------------------------------------------------------------

@@ -51,9 +51,7 @@ def stage_mega_moe_inputs(
     (quant + routing repack in one launch); ``FLASHINFER_MEGA_FUSED_STAGE=0``
     falls back to the original torch-composed staging below.
     """
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
-    # package import also bootstraps sys.path for the kernel packages.
-    from ......kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         Nvfp4BlockSize,
         ceil_div,
         fused_quant_stage,
@@ -171,8 +169,10 @@ def validate_nvfp4_forward_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise MoEEpConfigError("topk_weights and topk_ids must have the same shape")
 
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.sm100.cutedsl_megamoe import Nvfp4BlockSize, ceil_div
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        Nvfp4BlockSize,
+        ceil_div,
+    )
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     if scales.ndim != 2 or scales.shape[0] != num_tokens:

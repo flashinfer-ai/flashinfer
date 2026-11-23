@@ -29,7 +29,7 @@ import numpy as np
 import pytest
 import torch
 
-from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_wcx as wcx
+from flashinfer.moe_ep.shims.sm90.cake_bf16 import cake_wcx as wcx
 
 RNG_SEED = 1360_27
 

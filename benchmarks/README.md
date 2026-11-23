@@ -46,6 +46,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mm_fp8` - Matrix multiplication with FP8 inputs using the trtllm-gen low-latency GEMM (Blackwell SM10.0+, small-M optimized, pre-shuffled weights).
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
+    - `mm_tf32` - Matrix multiplication with FP32 inputs and output, TF32 MMAs (CuTe DSL cluster split-K on SM100/SM103/SM107; cuBLAS on SM80+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - Batch-invariant mode: `--backends batch_invariant` runs on supported APIs with `batch_invariant=True` [Batch-invariant mode](#batch-invariant-mode).
 - MOE:
@@ -106,7 +107,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 - GDN (Gated Delta Net linear attention, SM90+):
     - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (the public API with its default `backend="auto"`: whatever FlashInfer dispatches to on this GPU), `cute` (`backend="flashinfer"`: the generic CuTe-DSL kernels), `cake_gdn` (`backend="cake_gdn"`: the Cake GDN kernels; SM100/SM103/SM107, bf16 inputs), `triton` (reference), `rubin` (`backend="rubin"`: the Rubin-tuned T=1 bf16-state kernel; SM107 only) and `rubin_ugpu` (`rubin` with uGPU localization: a `ugpu_state_pool`, each die updates the half of every state in its own memory).
     - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. `--state_dtype float32` uses `gated_delta_rule_mtp`; `--state_dtype bfloat16` uses the BF16 MTP kernel via `gated_delta_rule_decode_pretranspose`. Backends: `flashinfer`, `triton`.
-    - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
+    - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 and SM110 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
 - KDA (SM120a):
     - `recurrent_kda_prefill` - Ordinary multi-token recurrent KDA prefill with fixed or packed inputs. Backends: `flashinfer` (automatic variant policy), `flashinfer-decomp`, `flashinfer-fused`, and optional external `cutekda` / `flash-kda` baselines.
 
@@ -324,7 +325,7 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
-| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
+| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `mm_tf32`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
 | `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
 
 ### MOE Flags
@@ -511,6 +512,7 @@ Applies to `gated_delta_rule_decode`, `gated_delta_rule_mtp`, and `chunk_gated_d
 | `--pool_mode`                 | `single` (default, read == write slots) or `split` (pool of 2B; reads slots [0..B), writes [B..2B))        |
 | `--seq_len`                   | MTP only: tokens per request (>= 2). Default: 2                                                            |
 | `--s_qo`                      | Prefill only: per-sequence length (uniform). Default: 2048                                                 |
+| `--use_cp`                    | Prefill only: `use_cp` of `chunk_gated_delta_rule`: `auto` (default), `true` (context-parallel route) or `false` (non-CP kernel) |
 | `--update_state`              | MTP only: write the final state back (`disable_state_update=False`). BF16 state always updates in-place    |
 | `--cache_intermediate_states` | MTP with `float32` state only: cache per-token intermediate states                                         |
 | `--no_qk_l2norm`              | Decode/MTP: disable in-kernel Q/K L2 normalization                                                         |

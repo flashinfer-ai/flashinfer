@@ -105,8 +105,13 @@ def _q_token_membership_keep_word16(
     word2: Uint32,
     word3: Uint32,
     query_idx: Int32,
+    max_queries: int = 8,
 ) -> Uint32:
-    """Extract one query's membership bit from sixteen packed page bytes."""
+    """Extract one query's membership bit from sixteen packed page bytes.
+
+    With two membership planes the caller already loaded the query's plane;
+    ``max_queries`` (8 per plane) bounds the valid query indices.
+    """
     keep_word = Uint32(0)
     shift = query_idx & Int32(7)
     words = (word0, word1, word2, word3)
@@ -115,7 +120,9 @@ def _q_token_membership_keep_word16(
         # The disjoint partial products gather four byte bits without carries.
         nibble = (bits * Uint32(0x01020408)) >> Uint32(24)
         keep_word |= nibble << Uint32(word_idx * 4)
-    return cutlass.select_(Uint32(query_idx) < Uint32(8), keep_word, Uint32(0))
+    return cutlass.select_(
+        Uint32(query_idx) < Uint32(max_queries), keep_word, Uint32(0)
+    )
 
 
 def _paged_sparse_kv_tma_transaction_geometry(
@@ -1693,6 +1700,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     page_table_stride: cutlass.Int64 = None
     num_heads_kv: Int32 = None
     q_token_kv_block_sparse_page_membership_stride: Int32 = None
+    # G9-G32: words between consecutive membership planes of one route row.
+    q_token_kv_block_sparse_page_membership_plane_stride: Int32 | None = None
     max_seq_len_kv: Int32 = None
     h_k_idx: Int32 = None
     b_idx: Int32 = None
@@ -1986,7 +1995,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
 
     @cute.jit
     def _q_token_kv_block_sparse_membership_word(
-        self, stage_info: StageInfo, membership_idx: Int32
+        self, stage_info: StageInfo, membership_idx: Int32, query_idx=None
     ) -> tuple[Uint32, Int32]:
         """Read a cached word, or fetch only the current tile's word from GMEM.
 
@@ -1995,6 +2004,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         an unaligned split's byte offset. Never expose poisoned padding bytes.
         """
         if cutlass.const_expr(self.cache_memberships_in_smem):
+            assert self.cfg.page_membership_planes == 1
             self._create_initial_task_locals(stage_info.context)
             word = Uint32(
                 self._smem_q_token_kv_block_sparse_memberships[
@@ -2004,14 +2014,14 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             )
         else:
             word, membership_idx = self.load_gmem_membership_word(
-                stage_info, membership_idx
+                stage_info, membership_idx, query_idx
             )
             word = self.mask_gmem_membership_word_tail(stage_info, membership_idx, word)
         return word, membership_idx
 
     @cute.jit
     def load_gmem_membership_word(
-        self, stage_info: StageInfo, membership_idx: Int32
+        self, stage_info: StageInfo, membership_idx: Int32, query_idx=None
     ) -> tuple[Uint32, Int32]:
         """Load the GMEM word holding one page's grouped-Q membership byte.
 
@@ -2040,10 +2050,19 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 cfg.use_persistent_scheduler and not cfg.shares_sparse_pattern
             ):
                 row = row * cutlass.Int64(self.num_heads_kv) + cutlass.Int64(head)
+            plane_offset = cutlass.Int64(0)
+            if cutlass.const_expr(cfg.page_membership_planes > 1):
+                # Queries 8p..8p+7 read byte plane p, p plane strides into the
+                # row. Callers pass ``wrap_membership_plane_query`` indices.
+                assert query_idx is not None
+                plane_offset = cutlass.Int64(query_idx >> Int32(3)) * cutlass.Int64(
+                    self.q_token_kv_block_sparse_page_membership_plane_stride
+                )
             word = Uint32(
                 self.q_token_kv_block_sparse_page_memberships[
                     row
                     * cutlass.Int64(self.q_token_kv_block_sparse_page_membership_stride)
+                    + plane_offset
                     + cutlass.Int64(word_idx)
                 ]
             )
@@ -2069,15 +2088,38 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         return word
 
     @cute.jit
+    def wrap_membership_plane_query(self, query_idx: Int32) -> Int32:
+        """Map a row's query index into ``[0, 8 * planes)`` for plane selection.
+
+        Padded Keeps rows can carry query indices past the last plane. Wrapping
+        keeps their GMEM read inside the route row; the keep-word extraction
+        still zeroes those queries from the unwrapped index. Valid queries are
+        unchanged. Apply once per row, not per membership word. Grouped tiles
+        whose rows hold at most ``8 * planes`` queries have no such rows, so
+        their index passes through unchanged.
+        """
+        cfg = self.cfg
+        if cutlass.const_expr(
+            cfg.uses_nontrivial_grouped_q_layout
+            and cfg.q_tokens_per_cta <= 8 * cfg.page_membership_planes
+        ):
+            return query_idx
+        return query_idx & Int32(8 * cfg.page_membership_planes - 1)
+
+    @cute.jit
     def load_q_token_kv_block_sparse_page_membership_raw(
-        self, stage_info: StageInfo, local_tile_idx: Int32, page_frag: Int32
+        self,
+        stage_info: StageInfo,
+        local_tile_idx: Int32,
+        page_frag: Int32,
+        query_idx=None,
     ) -> Uint32:
         """Issue one GMEM membership load for a later
         ``q_token_kv_block_sparse_page_membership_from_raw`` (no dependent use)."""
         assert not self.cache_memberships_in_smem
         pages_per_tile = Int32(self.cfg.tile_size_kv // self.cfg.num_tokens_per_page)
         word, _ = self.load_gmem_membership_word(
-            stage_info, local_tile_idx * pages_per_tile + page_frag
+            stage_info, local_tile_idx * pages_per_tile + page_frag, query_idx
         )
         return word
 
@@ -2187,6 +2229,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         stage_info: StageInfo,
         local_tile_idx: Int32,
         page_frag: Int32,
+        query_idx=None,
     ) -> Uint32:
         """Load the packed word for four aligned grouped-Q page memberships."""
 
@@ -2194,7 +2237,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         pages_per_tile = Int32(self.cfg.tile_size_kv // self.cfg.num_tokens_per_page)
         membership_idx = local_tile_idx * pages_per_tile + page_frag
         membership_word, _ = self._q_token_kv_block_sparse_membership_word(
-            stage_info, membership_idx
+            stage_info, membership_idx, query_idx
         )
         return membership_word
 
@@ -2210,6 +2253,9 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         assert self.cfg.uses_q_token_kv_block_sparse_page_membership
         assert not self.cfg.query_major_memberships
         if cutlass.const_expr(self.cache_memberships_in_smem):
+            # The SMEM cache holds one plane; plan() rejects G9-G32 on the
+            # fixed-Q routes that cache memberships in SMEM.
+            assert self.cfg.page_membership_planes == 1
             self._create_initial_task_locals(stage_info.context)
             pages_per_tile = Int32(
                 self.cfg.tile_size_kv // self.cfg.num_tokens_per_page
@@ -2226,19 +2272,24 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         else:
             # Public GMEM rows need not have sixteen readable tail bytes.
             # Preserve the existing live-prefix checks for each packed word.
+            plane_query = query_idx
+            if cutlass.const_expr(self.cfg.page_membership_planes > 1):
+                plane_query = self.wrap_membership_plane_query(query_idx)
             word0 = self.q_token_kv_block_sparse_page_membership_word4(
-                stage_info, local_tile_idx, page_frag
+                stage_info, local_tile_idx, page_frag, plane_query
             )
             word1 = self.q_token_kv_block_sparse_page_membership_word4(
-                stage_info, local_tile_idx, page_frag + Int32(4)
+                stage_info, local_tile_idx, page_frag + Int32(4), plane_query
             )
             word2 = self.q_token_kv_block_sparse_page_membership_word4(
-                stage_info, local_tile_idx, page_frag + Int32(8)
+                stage_info, local_tile_idx, page_frag + Int32(8), plane_query
             )
             word3 = self.q_token_kv_block_sparse_page_membership_word4(
-                stage_info, local_tile_idx, page_frag + Int32(12)
+                stage_info, local_tile_idx, page_frag + Int32(12), plane_query
             )
-        return _q_token_membership_keep_word16(word0, word1, word2, word3, query_idx)
+        return _q_token_membership_keep_word16(
+            word0, word1, word2, word3, query_idx, 8 * self.cfg.page_membership_planes
+        )
 
     @cute.jit
     def q_token_kv_block_sparse_page_keep_word16_from_raw(
@@ -2265,7 +2316,12 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             for i in range(4)
         ]
         return _q_token_membership_keep_word16(
-            words[0], words[1], words[2], words[3], query_idx
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+            query_idx,
+            8 * self.cfg.page_membership_planes,
         )
 
     @consumer_work(returns=cached_page_ids)

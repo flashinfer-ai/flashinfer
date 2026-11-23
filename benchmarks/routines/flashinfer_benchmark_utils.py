@@ -180,6 +180,7 @@ output_column_dict = {
         "pool_mode",
         "update_state",
         "use_qk_l2norm",
+        "use_cp",
     ],
     "kda": [
         # Which variant the policy chose, and whether this device's thresholds
@@ -261,6 +262,7 @@ benchmark_apis = {
         "mm_bf16_fp4",
         "mm_mxfp8",
         "mm_bf16",
+        "mm_tf32",
         "bmm_bf16",
         "tinygemm_bf16",
     ],
@@ -663,7 +665,7 @@ routine_cc_to_supported_backends = {
         "12.0": ["tinygemm"],
         "12.1": ["tinygemm"],
     },
-    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
+    # Note: bmm_fp8, mm_fp8, mm_fp4, mm_bf16, mm_tf32, bmm_bf16, and top_k_varlen use support checkers to filter backends, so they are not listed here
     # MOE
     "trtllm_fp4_block_scale_moe": {
         "7.5": [],
@@ -1281,7 +1283,7 @@ routine_cc_to_supported_backends = {
         "10.0": ["flashinfer", "fla"],
         "10.3": ["flashinfer", "fla"],
         "10.7": ["flashinfer"],
-        "11.0": [],
+        "11.0": ["flashinfer"],
         "12.0": [],
         "12.1": [],
     },

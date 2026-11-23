@@ -11,7 +11,7 @@ from tests.attention.sparse_mla_prefill_utils import (
 )
 
 
-@pytest.mark.parametrize("cache_format", ["fp8", "v41_fp8"])
+@pytest.mark.parametrize("cache_format", ["fp8", "v41_fp8", "nvfp4"])
 @pytest.mark.parametrize("tokens,heads", [(128, 16), (128, 64)])
 @pytest.mark.parametrize("empty", [False, True])
 def test_fused_single_cache_and_empty_prefill(cache_format, tokens, heads, empty):
@@ -154,7 +154,7 @@ def test_mega_v41_cache_layouts(inline, mixed, tokens):
         )
 
 
-@pytest.mark.parametrize("cache_format", ["v41_fp8"])
+@pytest.mark.parametrize("cache_format", ["v41_fp8", "nvfp4"])
 @pytest.mark.parametrize("tokens", [128])
 def test_mega_graph_kernel_boundaries(cache_format, tokens, tmp_path):
     import re
@@ -174,7 +174,10 @@ def test_mega_graph_kernel_boundaries(cache_format, tokens, tmp_path):
     text = path.read_text()
     nodes = re.findall(r'"graph_\d+_node_\d+"\[.*?\];', text, re.DOTALL)
     kernels = [node for node in nodes if 'label="{KERNEL' in node]
-    assert plan["variant"] != 0
+    if cache_format == "nvfp4":
+        assert plan["implementation"] == "dsv4_nvfp4_prefill"
+    else:
+        assert plan["implementation"] in ("dsv4_fp8_decode", "dsv4_fp8_splitkv_decode")
     assert len(kernels) == 1, text
     assert all("sparse_mla" in node for node in kernels), text
     assert len(nodes) == len(kernels), text
@@ -199,7 +202,9 @@ def test_default_mega_decode_merge(cache_format, inline, tokens, topk):
     )
     lengths = torch.tensor([topk, 0, 1, 63, 64, 65, topk - 1], device="cuda")
     f["lengths"][0].copy_(lengths[torch.arange(tokens, device="cuda") % len(lengths)])
-    _check_default_mega(f, variant=0, large_merge=topk > 2048)
+    _check_default_mega(
+        f, variant=None if cache_format == "v41_fp8" else 0, large_merge=topk > 2048
+    )
 
 
 @pytest.mark.parametrize("heads", [16, 32, 64])
@@ -234,11 +239,22 @@ def _check_default_mega(f, *, variant, implementation=None, large_merge=None):
     lse = torch.empty_like(expected[2])
     fused_call(f, out_lse=lse)
     plan = next(iter(f["wrapper"]._prepared_calls.values())).plan.inspect()
-    assert plan["variant"] == variant, plan
+    if variant is not None:
+        assert plan["variant"] == variant, plan
+    else:
+        assert plan["variant"] == int(plan["implementation"] == "dsv4_fp8_decode"), plan
     if implementation is not None:
         assert plan["implementation"] == implementation, plan
     if large_merge is not None:
-        assert (plan["scratch_split_stride"] > 32) == large_merge, plan
+        if plan["implementation"] == "dsv4_fp8_splitkv_decode":
+            # Both scale placements merge up to eight cluster splits inside
+            # attention without a separate finalization kernel.
+            assert plan["merge"] == "direct", plan
+            assert 1 <= plan["active_splits"] <= 8, plan
+        elif plan["implementation"] == "dsv4_fp8_decode":
+            assert plan["merge"] == "direct" and plan["partial_bytes"] == 0, plan
+        else:
+            assert (plan["scratch_split_stride"] > 32) == large_merge, plan
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         fused_call(f, out_lse=lse)

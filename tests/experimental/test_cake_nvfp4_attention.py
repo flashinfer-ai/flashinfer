@@ -76,9 +76,34 @@ def _arch():
     return loader.arch_for_capability(capability) if capability is not None else None
 
 
+def _toolkit_floor(arch):
+    """The highest ``min_cuda`` of the ``arch`` libraries without a prebuilt file
+    when the local nvcc is below it, else ``None``: ``cake_build.jit_spec``
+    refuses such an entry (the sm100_sm103 quantizer needs CUDA 13.0: ptxas
+    12.9 miscompiles its E2M1 decode)."""
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    version = get_cuda_version()
+    local = (int(version.major), int(version.minor))
+    floors = [
+        entry["min_cuda"]
+        for name, entry in cake_build.libraries_by_name().items()
+        if entry["arch"] == arch and not cake_build.prebuilt_path(name).is_file()
+    ]
+    needed = max(
+        floors, key=lambda text: tuple(map(int, text.split("."))), default=None
+    )
+    if needed is None or local >= tuple(map(int, needed.split("."))):
+        return None
+    return needed
+
+
 def _skip_unless_supported():
     if _arch() is None:
         pytest.skip("an SM100, SM103 or SM120 GPU is required")
+    needed = _toolkit_floor(_arch())
+    if needed is not None:
+        pytest.skip(f"Cake NVFP4 attention on {_arch()} needs CUDA {needed} or newer")
 
 
 @pytest.fixture(autouse=True, scope="module")

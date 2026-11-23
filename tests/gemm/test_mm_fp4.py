@@ -21,6 +21,8 @@ from flashinfer.utils import (
     LibraryError,
 )
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+from tests.utils.test_helpers.pdl import late_store
 
 
 def _test_mm_fp4(
@@ -260,6 +262,65 @@ def _nvfp4_operands(m, n, k):
     return a, b, a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
 
 
+def _nvfp4_operands_wide_range(m, n, k, seed):
+    # Log-normal magnitudes, seeded so a run is repeatable. With plain randn operands,
+    # every SM120 tactic returned the same bits at this test's shapes, stream-K
+    # included (RTX 5090 and RTX 5060 Ti). A test built on them could not tell a
+    # data-parallel tactic from a stream-K one. With the magnitudes spread over
+    # several powers of two (sigma 2.5), the stream-K tactics return different bits
+    # on most seeds. Narrower and wider spreads were measured to be worse.
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    a = torch.randn([m, k], device="cuda", dtype=torch.float32, generator=gen)
+    b = torch.randn([n, k], device="cuda", dtype=torch.float32, generator=gen)
+    a = (a * torch.exp(2.5 * torch.randn(a.shape, device="cuda", generator=gen))).to(
+        torch.bfloat16
+    )
+    b = (b * torch.exp(2.5 * torch.randn(b.shape, device="cuda", generator=gen))).to(
+        torch.bfloat16
+    )
+    g_in = (448 * 6) / a.float().abs().nan_to_num().max()
+    g_w = (448 * 6) / b.float().abs().nan_to_num().max()
+    a_fp4, a_s = nvfp4_quantize(
+        a, g_in, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    b_fp4, b_s = nvfp4_quantize(
+        b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
+    )
+    return a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
+
+
+def _exact_b12x_fp4_operands(m, n, k, use_nvfp4):
+    # Every block has max=6*scale, with power-of-two scales and E2M1 values.
+    # Quantization is lossless, so the original inputs give an independent oracle.
+    block_size = 16 if use_nvfp4 else 32
+
+    def operand(rows, global_scale):
+        x = torch.randint(-2, 3, (rows, k), device="cuda").to(torch.bfloat16)
+        x[:, ::block_size] = 6
+        exponents = (
+            torch.arange(rows, device="cuda")[:, None]
+            + torch.arange(k // block_size, device="cuda")[None, :]
+        ) % 3 - 1
+        x *= (2.0**exponents).repeat_interleave(block_size, dim=1)
+        if use_nvfp4:
+            q, sf = nvfp4_quantize(
+                x,
+                torch.tensor(global_scale, device="cuda"),
+                sfLayout=SfLayout.layout_128x4,
+                do_shuffle=False,
+                nvfp4_4over6=None,
+            )
+        else:
+            q, sf = mxfp4_quantize(x)
+        return x, q, sf
+
+    a, a_fp4, a_s = operand(m, 2.0)
+    b, b_fp4, b_s = operand(n, 4.0)
+    alpha = torch.tensor(1.0 / 8, device="cuda") if use_nvfp4 else None
+    reference = a.float() @ b.float().T
+    return a_fp4, a_s, b_fp4, b_s, alpha, reference
+
+
 @pytest.mark.parametrize(
     "m,n,out_dtype,backend,use_nvfp4,auto_tuning",
     [
@@ -275,23 +336,28 @@ def test_mm_fp4_b12x_output_row_alignment(
     m, n, out_dtype, backend, use_nvfp4, auto_tuning
 ):
     """Unaligned output rows must not use TMA, including cached FP4 tactics."""
+    min_cuda = "12.9" if use_nvfp4 else "13.0"
     if not (
-        is_sm12x_supported(torch.device("cuda"))
-        and version_at_least(torch.version.cuda, "13.0")
+        is_sm12x_supported(torch.device("cuda")) and is_cuda_version_at_least(min_cuda)
     ):
-        pytest.skip("b12x NVFP4/MXFP4 requires SM120/SM121 + CUDA 13+.")
+        pytest.skip(f"b12x FP4 requires SM120/SM121 + CUDA {min_cuda}+.")
 
+    from flashinfer.gemm.gemm_base import _b12x_gemm_fp4_runner
+
+    sm_major, sm_minor = get_compute_capability(torch.device("cuda"))
+    runner = _b12x_gemm_fp4_runner(sm_major, sm_minor, True, out_dtype, use_nvfp4)
     torch.manual_seed(0)
     k = 256
+    # These bounded, lossless inputs accumulate exactly in FP32 at K=256,
+    # including whichever backend "auto" selects; only the output cast rounds.
     # Alternate store modes in one process: the compiled-kernel cache must
     # distinguish the aligned TMA path from the predicated global-store path.
     aligned_n = (n + 7) // 8 * 8
     for cols in (aligned_n, n, aligned_n):
-        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, cols, k)
-        if not use_nvfp4:
-            a_fp4, a_s = mxfp4_quantize(a)
-            b_fp4, b_s = mxfp4_quantize(b)
-            alpha = None
+        a_fp4, a_s, b_fp4, b_s, alpha, reference = _exact_b12x_fp4_operands(
+            m, cols, k, use_nvfp4
+        )
+        reference = reference.to(out_dtype)
         guard = 128
         storage = torch.full(
             (guard + m * cols + m * 128 + guard,),
@@ -320,25 +386,44 @@ def test_mm_fp4_b12x_output_row_alignment(
         # Profile this regression shape without allocating unrelated M buckets.
         with autotune(auto_tuning, tuning_buckets=(m,)):
             run()
-        torch.cuda.synchronize()
-        assert torch.all(storage[:guard] == 42)
-        assert torch.all(storage[guard + m * cols :] == 42)
-        assert torch.isfinite(out).all()
-        reference = torch.mm(a, b.T).float()
-        assert torch.all(F.cosine_similarity(reference, out.float(), dim=1) > 0.97)
+
+        def check_output():
+            torch.cuda.synchronize()
+            assert torch.all(storage[:guard] == 42)
+            assert torch.all(storage[guard + m * cols :] == 42)
+            torch.testing.assert_close(out, reference, rtol=0, atol=0)
+
+        check_output()
 
         if cols == n:
-            expected = out.clone()
+            # Profiling only times candidates. Verify every advertised tactic,
+            # including candidates that do not win autotuning, on the tail-N path.
+            inputs = [
+                a_fp4,
+                b_fp4.T,
+                a_s,
+                b_s.T,
+                alpha,
+                out_dtype,
+                out,
+                16 if use_nvfp4 else 32,
+                use_nvfp4,
+                None,
+            ]
+            tactics = runner.get_valid_tactics(inputs, None)
+            assert tactics, "b12x must advertise tactics for this supported shape"
+            for tactic in tactics:
+                out.fill_(float("nan"))
+                runner.forward(inputs, tactic=tactic)
+                check_output()
+
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 run()
             for _ in range(2):
                 out.fill_(float("nan"))
                 graph.replay()
-                torch.cuda.synchronize()
-                torch.testing.assert_close(out, expected, rtol=0, atol=0)
-                assert torch.all(storage[:guard] == 42)
-                assert torch.all(storage[guard + m * cols :] == 42)
+                check_output()
 
 
 def test_mm_fp4_b12x_short_k_multi_wave():
@@ -793,6 +878,84 @@ def test_mm_fp4_per_token_alpha_low_m_untuned(m, n, k, res_dtype):
     _check_per_token_alpha_untuned(m, n, k, res_dtype)
 
 
+@pytest.mark.parametrize("m", [1, 16, 128])
+def test_mm_fp4_cutlass_sm120_disable_stream_k(m, monkeypatch):
+    # With FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 the SM120 CUTLASS runner offers the
+    # autotuner only data-parallel tactics. On wide-dynamic-range operands they all
+    # return the same bits, and the stream-K tactics do not. So the test checks both
+    # halves: the offered set agrees, and the excluded set would not have. The second
+    # half is checked from m = 16 up. At m = 1 the stream-K tactics differed on only
+    # 2 of 24 seeds on an RTX 5090 and 1 of 24 on a 36-SM RTX 5060 Ti, so a control
+    # there would be flaky.
+    from flashinfer.gemm import gemm_base
+
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("The SM120 CUTLASS FP4 GEMM needs SM12x.")
+    n, k = 4096, 4096
+    workspace = torch.empty(
+        gemm_base.DEFAULT_WORKSPACE_SIZE, device="cuda", dtype=torch.uint8
+    )
+    runner = gemm_base.get_gemm_sm120_module_cutlass_fp4().cutlass_fp4_gemm_runner()
+
+    def run(operands, tactic):
+        a_fp4, a_s, b_fp4, b_s, alpha = operands
+        alpha = torch.tensor([alpha], device="cuda", dtype=torch.float32)
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        inputs = [a_fp4, b_fp4.T, a_s, b_s.T, alpha, None, out, None, None, workspace]
+        runner(inputs=inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        return out
+
+    monkeypatch.delenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", raising=False)
+    all_tactics = runner.get_valid_tactics([], None)
+    for value in ("0", "", "false", "true"):
+        monkeypatch.setenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", value)
+        assert runner.get_valid_tactics([], None) == all_tactics
+    monkeypatch.setenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "1")
+    tactics = runner.get_valid_tactics([], None)
+    # Two of the four configs of each tile shape are data-parallel.
+    assert len(tactics) == len(all_tactics) // 2 and set(tactics) < set(all_tactics)
+    # a stream-K tactic loaded from a saved autotune cache is rejected too
+    excluded = sorted(set(all_tactics) - set(tactics))
+    assert not any(runner.validate_tactic([], t) for t in excluded)
+    assert all(runner.validate_tactic([], t) for t in tactics + [-1])
+    # an index past the end of the config list is rejected, not passed to C++
+    assert not runner.validate_tactic([], len(all_tactics))
+
+    # Several seeds: whether a stream-K tactic rounds differently depends on the
+    # operands. At m = 16, 2 of 24 seeds showed no difference on an RTX 5090 and 7 of
+    # 24 on a 36-SM RTX 5060 Ti; at m = 128, 1 of 24 on both. So the equality half is
+    # checked on every seed tried. The negative control draws seeds until one shows a
+    # stream-K difference: four seeds always, then up to eight more while none has
+    # differed. A part where the first four happen to agree then does not fail a
+    # healthy test.
+    stream_k_differs = False
+    first_seed, min_seeds, max_seeds = 20261029, 4, 12
+    for i in range(max_seeds):
+        if i >= min_seeds and (m < 16 or stream_k_differs):
+            break
+        seed = first_seed + i
+        operands = _nvfp4_operands_wide_range(m, n, k, seed)
+        ref = run(operands, tactics[0])
+        for t in tactics[1:]:
+            assert torch.equal(run(operands, t), ref), (
+                f"tactic {t} differs from tactic {tactics[0]} (seed {seed})"
+            )
+        if m >= 16:
+            stream_k_differs |= any(
+                not torch.equal(run(operands, t), ref) for t in excluded
+            )
+    # Negative control: the same equality over the excluded stream-K tactics must fail
+    # on some seed, or the operands could not have told a stream-K tactic apart from a
+    # data-parallel one and the assertion above would be empty.
+    if m >= 16:
+        assert stream_k_differs, (
+            f"every stream-K tactic matched the data-parallel output on all {max_seeds} "
+            "seeds; the operands do not expose the summation order, so the equality check "
+            "above could not fail"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
 
@@ -816,3 +979,51 @@ def test_mm_fp4_l2_policy_rule():
     # other kernels are untouched
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm100sk") is None
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm103") is None
+
+
+@pytest.mark.parametrize(
+    "backend,m,n,k",
+    [
+        ("cute-dsl", 128, 512, 512),
+        ("cute-dsl", 8, 2048, 4096),
+        ("cutedsl_low_latency", 8, 1280, 2944),
+        ("b12x", 128, 512, 512),
+    ],
+)
+def test_mm_fp4_pdl_waits_for_alpha(backend, m, n, k):
+    cc = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported(backend, cc[0] * 10 + cc[1]):
+        pytest.skip(f"{backend} is not supported on SM{cc[0]}{cc[1]}")
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    a_global_sf = (448 * 6) / a.float().abs().max()
+    b_global_sf = (448 * 6) / b.float().abs().max()
+    a_fp4, a_sf = nvfp4_quantize(a, a_global_sf, do_shuffle=False)
+    b_fp4, b_sf = nvfp4_quantize(b, b_global_sf, do_shuffle=False)
+    alpha_value = (1.0 / (a_global_sf * b_global_sf)).item()
+    alpha = torch.tensor(alpha_value, device="cuda")
+
+    def run():
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_sf,
+            b_sf.T,
+            alpha,
+            torch.bfloat16,
+            out,
+            backend=backend,
+            enable_pdl=True,
+        )
+        return out
+
+    expected = run()
+
+    # alpha is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the GEMM.
+    alpha.fill_(alpha_value * 4)
+    late_store(alpha, alpha_value)
+    out = run()
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)

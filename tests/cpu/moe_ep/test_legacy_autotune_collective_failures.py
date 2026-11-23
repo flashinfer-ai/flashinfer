@@ -19,10 +19,13 @@ def _next_allocation_failure(rank, architecture):
     import torch
     import torch.distributed as dist
 
-    module = importlib.import_module(
-        f"flashinfer.moe_ep.kernel_src.{architecture}.next_cutedsl_megamoe.shim.block_scaled"
-    )
     rubin = architecture == "sm107"
+    namespace = (
+        "shims.sm107.cutedsl_megamoe"
+        if rubin
+        else "shims.sm100.cutedsl_megamoe.sources"
+    )
+    module = importlib.import_module(f"flashinfer.moe_ep.{namespace}.block_scaled")
     config_type = (
         module.Sm107BlockScaledMoeConfig if rubin else module.BlockScaledMoeConfig
     )
@@ -42,6 +45,7 @@ def _next_allocation_failure(rank, architecture):
     )
     nbytes = config.padded_tokens_per_rank * config.num_topk * config.hidden * 2
     kernel = SimpleNamespace(
+        get_tmp_buffer_bytes=lambda: nbytes,
         _device_workspace=SimpleNamespace(
             total_bytes=lambda _region: nbytes,
             offset=lambda _region: 0,
@@ -85,6 +89,7 @@ def _next_allocation_failure(rank, architecture):
 
     with (
         patch.object(module.torch, "zeros", local_zeros),
+        patch.object(module.torch, "empty", local_zeros),
         patch.object(module.comm, "sym_zeros", symmetric_zeros),
         patch.object(
             module.comm,
@@ -115,7 +120,7 @@ def _next_allocation_failure(rank, architecture):
 def _rank_worker(rank, directory):
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.autotune import (
         _session_candidates,
         autotune_knobs,
     )
@@ -187,12 +192,12 @@ def _rank_worker(rank, directory):
             winner, error = None, None
             try:
                 if failure == "w4_candidate_filter":
-                    from flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4 import (
+                    from flashinfer.moe_ep.kernels.flashinfer.bf16_nvfp4 import (
                         MegaMoEBf16Nvfp4Config,
                         autotune_bf16_nvfp4_mega_moe,
                         bf16_nvfp4_candidates,
                     )
-                    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+                    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
                         tuner,
                     )
 
