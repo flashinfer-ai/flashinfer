@@ -69,7 +69,8 @@ replace, what to audit) lives in `SKILL.md`.
 
 - `moe_sm120_mxfp8_swapab/sm120_mma.py` emits scalar-scale MMA directly in PTX
   for compatibility with CuTeDSL releases that removed the intermediate
-  SM120 MMA operation. Keep this fix until it is included in the upstream drop.
+  SM120 MMA operation. The inline assembly marks the warp-collective MMA as
+  side-effecting. Keep this fix until it is included in the upstream drop.
 
 - Release preparation adjusts source comments and runner messages without
   changing kernel calculations or launch settings.

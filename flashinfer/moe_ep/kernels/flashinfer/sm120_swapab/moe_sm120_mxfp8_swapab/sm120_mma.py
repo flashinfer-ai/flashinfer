@@ -264,7 +264,8 @@ def _arch_mma_m16n8k32_mxfp8(
         {0, $13};
         """,
         "=f,=f,=f,=f,r,r,r,r,r,r,r,h,r,h,0,1,2,3",
-        has_side_effects=False,
+        # All lanes must issue the MMA even when only some consume the result.
+        has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
