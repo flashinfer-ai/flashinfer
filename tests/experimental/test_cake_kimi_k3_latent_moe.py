@@ -4444,6 +4444,8 @@ def test_cooperative_refusal_in_small_green_context(monkeypatch, row):
         from torch.cuda.green_contexts import GreenContext
     except ImportError:
         pytest.skip("requires torch.cuda.green_contexts")
+    if not hasattr(GreenContext, "create"):
+        pytest.skip("requires the GreenContext.create factory")
     runner = _x2_runner(device, monkeypatch, row, 11)
     reference = _snapshot(runner.outputs)
     cooperative = [launch for launch in runner.launches if launch.cooperative_ctas]
@@ -4454,7 +4456,7 @@ def test_cooperative_refusal_in_small_green_context(monkeypatch, row):
     assert need == launch.cooperative_ctas
     sms = 16
     assert sms < need
-    green = GreenContext(num_sms=sms, device_id=0)
+    green = GreenContext.create(num_sms=sms, device_id=0)
     stream = green.Stream()
 
     def torch_op_ok():
