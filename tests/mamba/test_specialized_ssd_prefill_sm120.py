@@ -27,6 +27,8 @@ restores the refusal. Numeric correctness is checked against a sequential
 fp64 reference recurrence, plus a CUDA-graph capture/replay smoke.
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -454,8 +456,8 @@ def test_native_operand_checks(nh):
     def call(inputs, dst):
         run(*(inputs[k] for k in keys), dst)
 
-    # Count executed SSD kernels independently of the Python dispatch stats;
-    # the valid control also checks that device events are actually visible.
+    # Every accepted call submits the primary SSD kernel before any recovery.
+    # Check its device events independently of Python dispatch statistics.
     def profile():
         return torch.profiler.profile(
             activities=[
@@ -466,7 +468,8 @@ def test_native_operand_checks(nh):
 
     def launches(trace):
         return sum(
-            e.device_type == torch.autograd.DeviceType.CUDA and "ssd_kernel" in e.name
+            e.device_type == torch.autograd.DeviceType.CUDA
+            and "ssd_primary2051" in e.name
             for e in trace.events()
         )
 
@@ -549,7 +552,7 @@ def _retry_worker(a, b, nh):
     foreign = torch.cuda.ExternalStream(owner.cuda_stream, device=a)
     with (
         torch.cuda.stream(foreign),
-        pytest.raises(RuntimeError, match="invalid resource handle"),
+        pytest.raises(RuntimeError, match="stream belongs to another CUDA context"),
     ):
         run(*p.values(), y)
     assert (y == 7).all()
@@ -567,14 +570,15 @@ def _retry_worker(a, b, nh):
         torch.cuda.synchronize(b)
     assert (
         sum(
-            e.device_type == torch.autograd.DeviceType.CUDA and "ssd_kernel" in e.name
+            e.device_type == torch.autograd.DeviceType.CUDA
+            and "ssd_primary2051" in e.name
             for e in trace.events()
         )
         == 1
     )
     assert _rel_max(dst, _reference(q, t, nh)) <= REL_TOL
     torch.cuda.set_device(a)
-    with pytest.raises(RuntimeError, match=f"bound to CUDA device {b}"):
+    with pytest.raises(RuntimeError, match="SSD bound to another CUDA device"):
         run(*p.values(), y)
     assert (y == 7).all()
 
@@ -645,3 +649,277 @@ def test_cuda_graph_replay_matches_eager(nh, t):
         if child.is_alive():
             child.kill()
             child.join()
+
+
+@requires_toolkit
+@pytest.mark.parametrize("nheads", [64, 128])
+@pytest.mark.parametrize("readout", [64, 192])
+@pytest.mark.parametrize("amplitude", [1.0, 1024.0])
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+def test_carried_state_cancellation(nheads, readout, amplitude, backend):
+    from flashinfer.mamba import SSDCombined
+
+    t = readout + 1
+    device = torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.get_device_capability(device) != (12, 0):
+        pytest.skip("requires SM120")
+    if (
+        nheads == 128
+        and torch.cuda.get_device_properties(device).multi_processor_count < 136
+    ):
+        pytest.skip("NH128 requires 136 resident CTAs")
+    x = torch.zeros((1, t, nheads, 64), dtype=torch.bfloat16, device=device)
+    dt = torch.zeros((1, t, nheads), dtype=torch.bfloat16, device=device)
+    A = torch.full((nheads,), -1.0, dtype=torch.float32, device=device)
+    B = torch.zeros((1, t, 8, 128), dtype=torch.bfloat16, device=device)
+    C = torch.zeros_like(B)
+    D = torch.zeros((nheads,), dtype=torch.bfloat16, device=device)
+    bias = torch.zeros_like(D)
+    x[:, readout - 2 : readout].fill_(amplitude)
+    B[:, readout - 2, :, :2] = 1.0
+    B[:, readout - 1, :, 0] = 2.0**-10
+    C[:, readout, :, 0] = 1.0
+    C[:, readout, :, 1] = -1.0
+    # softplus(0)=ln(2), exp(-ln(2))=1/2. The equal carried
+    # components cancel, leaving the small injection times one decay.
+    expected = torch.zeros_like(x)
+    expected[:, readout].fill_(math.log(2.0) * amplitude * 2.0**-11)
+    op = SSDCombined(
+        chunk_size=128,
+        nheads=nheads,
+        headdim=64,
+        dstate=128,
+        ngroups=8,
+        backend=backend,
+    )
+    for supplied in (False, True):
+        out = torch.full_like(x, float("nan")) if supplied else None
+        actual, state = op.run(
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=bias,
+            dt_softplus=True,
+            return_final_states=False,
+            out=out,
+        )
+        assert state is None
+        if supplied:
+            assert actual is out
+        assert torch.equal(actual, expected)
+
+
+@requires_toolkit
+@pytest.mark.parametrize("nheads", [64, 128])
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+@pytest.mark.parametrize(
+    "case", ["weighted_state", "gram_cancellation", "gram_underflow"]
+)
+def test_precision_before_staging(nheads, backend, case):
+    from flashinfer.mamba import SSDCombined
+    from flashinfer.mamba.specialized import ssd_prefill_sm120 as impl
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.get_device_capability(device) != (12, 0):
+        pytest.skip("requires SM120")
+    if (
+        nheads == 128
+        and torch.cuda.get_device_properties(device).multi_processor_count < 136
+    ):
+        pytest.skip("NH128 requires 136 resident CTAs")
+    length = 65 if case == "weighted_state" else 2
+
+    def zeros(*shape):
+        return torch.zeros(shape, device=device, dtype=torch.bfloat16)
+
+    x = zeros(1, length, nheads, 64)
+    dt = zeros(1, length, nheads)
+    A = torch.zeros(nheads, device=device, dtype=torch.float32)
+    B, C = zeros(1, length, 8, 128), zeros(1, length, 8, 128)
+    D, bias = zeros(nheads), zeros(nheads)
+    if case == "weighted_state":
+        # With A=0 the two injections are 256 and -256.5.
+        # Rounding both weights to BF16 before injection erases the result.
+        bias.fill_(256)
+        dt[:, 63] = 0.5
+        x[:, 62:64] = 1
+        B[:, 62, :, 0], B[:, 63, :, 0] = 1, -1
+        C[:, 64, :, 0] = 1
+        expected_value = -0.5
+    elif case == "gram_cancellation":
+        # Sequential FP32 Gram summation loses 2^-30 between +1 and -1.
+        dt.fill_(32)
+        x[:, 0] = 1
+        B[:, 0, :, 0], B[:, 0, :, 1], B[:, 0, :, 2] = 1, 2.0**-30, -1
+        C[:, 1, :, :3] = 1
+        expected_value = 2.0**-25
+    else:
+        # B*C underflows FP32 before the large X rescales the normal output.
+        dt.fill_(32)
+        x[:, 0] = 2.0**100
+        B[:, 0, :, 0] = C[:, 1, :, 0] = 2.0**-80
+        expected_value = 2.0**-55
+    expected = torch.zeros_like(x)
+    expected[:, -1] = expected_value
+    op = SSDCombined(
+        chunk_size=128,
+        nheads=nheads,
+        headdim=64,
+        dstate=128,
+        ngroups=8,
+        backend=backend,
+    )
+    for supplied in (False, True):
+        out = torch.full_like(x, float("nan")) if supplied else None
+        before = dict(impl._stats)
+        actual, state = op.run(
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=bias,
+            dt_softplus=True,
+            return_final_states=False,
+            out=out,
+        )
+        assert state is None
+        if supplied:
+            assert actual is out
+        assert (
+            impl._stats["specialized_dispatches"]
+            == before["specialized_dispatches"] + 1
+        )
+        assert impl._stats["fallback_dispatches"] == before["fallback_dispatches"]
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@requires_toolkit
+@pytest.mark.parametrize("nheads", [64, 128])
+@pytest.mark.parametrize(
+    "failure", ["optional_oom", "small_oom", "conversion_oom", "other_error"]
+)
+def test_framework_workspace_allocation_failures(nheads, failure, monkeypatch):
+    import tvm_ffi
+    from flashinfer.mamba.specialized import ssd_prefill_sm120 as impl
+
+    _skip_unless_resident(nheads)
+    t = 65
+    p = _make_inputs(t, nheads, seed=91)
+    p["B"].zero_()
+    p["C"].zero_()
+    p["D"].fill_(1)
+    ssd = _make_ssd(nheads)
+    out = torch.empty_like(p["x"]).unsqueeze(0)
+    _run(ssd, p, t, nheads, out)
+    torch.cuda.synchronize()
+    assert torch.equal(out[0], p["x"])
+    base_bytes = 1032 * nheads
+    real_empty, real_convert = torch.empty, tvm_ffi.from_dlpack
+    requests, conversions = [], []
+
+    def allocate(size, *args, **kwargs):
+        nbytes = size[0] if isinstance(size, tuple) else size
+        if kwargs.get("dtype") == torch.uint8:
+            requests.append(nbytes)
+            if failure == "small_oom":
+                raise torch.OutOfMemoryError("QA small allocation refusal")
+            if failure == "optional_oom" and nbytes > base_bytes:
+                raise torch.OutOfMemoryError("QA optional allocation refusal")
+            if failure == "other_error":
+                raise RuntimeError("QA unrelated allocation error")
+        return real_empty(size, *args, **kwargs)
+
+    def convert(tensor, *args, **kwargs):
+        conversions.append(tensor.numel())
+        if failure == "conversion_oom":
+            raise torch.OutOfMemoryError("QA conversion refusal")
+        return real_convert(tensor, *args, **kwargs)
+
+    out.fill_(-19)
+    torch.cuda.synchronize()
+    stamp = impl.specialized_ssd_prefill_stats()["specialized_dispatches"]
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", allocate)
+        patch.setattr(tvm_ffi, "from_dlpack", convert)
+        if failure == "optional_oom":
+            _run(ssd, p, t, nheads, out)
+            torch.cuda.synchronize()
+            assert torch.equal(out[0], p["x"])
+            assert len(requests) == 2 and requests[0] > base_bytes
+            assert requests[1] == base_bytes and conversions == [base_bytes]
+            assert (
+                impl.specialized_ssd_prefill_stats()["specialized_dispatches"]
+                == stamp + 1
+            )
+        else:
+            message = {
+                "small_oom": "QA small allocation refusal",
+                "conversion_oom": "QA conversion refusal",
+                "other_error": "QA unrelated allocation error",
+            }[failure]
+            with pytest.raises(Exception, match=message):
+                _run(ssd, p, t, nheads, out)
+            torch.cuda.synchronize()
+            assert (out == -19).all()
+            assert (
+                impl.specialized_ssd_prefill_stats()["specialized_dispatches"] == stamp
+            )
+            assert len(requests) == (2 if failure == "small_oom" else 1)
+            if failure == "conversion_oom":
+                assert len(conversions) == 1
+    _run(ssd, p, t, nheads, out)
+    torch.cuda.synchronize()
+    assert torch.equal(out[0], p["x"])
+
+
+@requires_toolkit
+@pytest.mark.parametrize("nh", [64, 128])
+def test_capture_guard_uses_operand_device(nh, monkeypatch):
+    from flashinfer.mamba.specialized import ssd_prefill_sm120 as impl
+
+    devices = [
+        i
+        for i in range(torch.cuda.device_count())
+        if torch.cuda.get_device_capability(i) == (12, 0)
+        and (
+            nh == 64 or torch.cuda.get_device_properties(i).multi_processor_count >= 136
+        )
+    ]
+    if len(devices) < 2:
+        pytest.skip("requires two eligible SM120 devices")
+    a, b = devices[:2]
+    t = 65
+    with torch.cuda.device(a):
+        ssd = _make_ssd(nh)
+        p = _make_inputs(t, nh, seed=71)
+        out = torch.empty_like(p["x"]).unsqueeze(0)
+        _run(ssd, p, t, nh, out)
+        torch.cuda.synchronize(a)
+        stream = torch.cuda.Stream(device=a)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream), torch.cuda.device(b):
+            _run(ssd, p, t, nh, out)
+            assert torch.cuda.current_device() == b
+        for _ in range(3):
+            p["x"].neg_()
+            out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize(a)
+            with torch.cuda.device(b):
+                expected = _run(ssd, p, t, nh)
+                assert torch.cuda.current_device() == b
+            torch.cuda.synchronize(a)
+            assert torch.equal(out[0].view(torch.int16), expected.view(torch.int16))
+        # Capture status remains dynamic even after immutable facts are cached.
+        with monkeypatch.context() as patch:
+            patch.setattr(impl, "_warmed", set())
+            empty = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(empty, stream=stream), torch.cuda.device(b):
+                with pytest.raises(NotImplementedError, match="capture_unwarmed"):
+                    _run(ssd, p, t, nh, out)
+                assert torch.cuda.current_device() == b

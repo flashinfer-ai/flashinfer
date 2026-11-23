@@ -1,12 +1,15 @@
 """Specialized Mamba2 SSD chunk-scan prefill for SM120 (RTX PRO 6000):
 single-sequence, zero-initial-state, chunk_size=128, headdim=64, dstate=128,
-ngroups=8, bf16 io with fp32 state/accumulation, ``dt_softplus``, no z, no
+ngroups=8, bf16 io with certified state/accumulation, ``dt_softplus``, no z, no
 final-state output.
 
 This is an agent-generated kernel (CUDA, tvm-ffi destination-passing entry,
 JIT-built for ``sm_120a``): a cooperative persistent-CTA design that keeps the
-SSM state in registers (bf16 ``mma.sync`` with fp32 accumulation) and runs the
-whole varlen scan in one launch. ``SSDCombined`` refuses SM120 outright today
+SSM state in registers and uses certification and conditional repair passes
+to preserve the numerical contract. The framework path can use bounded
+scratch for parallel tile recovery, falling back to the original recovery
+when that scratch is unavailable or too many halves need repair.
+``SSDCombined`` refuses SM120 outright today
 ("requires datacenter Blackwell ... for tcgen05 MMA"); this backend is the
 first FlashInfer-resident SSD prefill path on that arch.
 
@@ -35,6 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import tvm_ffi
 
 from ...jit import env as jit_env
 from ...jit.core import JitSpec, gen_jit_spec
@@ -125,7 +129,10 @@ def gen_specialized_ssd_prefill_sm120_module() -> JitSpec:
         sources,
         extra_cuda_cflags=[
             "-O3",
-            "--use_fast_math",
+            "--ftz=false",
+            "--fmad=false",
+            "--prec-div=true",
+            "--prec-sqrt=true",
             "-std=c++17",
             "--pre-include=cooperative_groups.h,mutex,tvm/ffi/extra/cuda/base.h",
             # single-token form REQUIRED: cpp_ext only treats "-gencode=..."
@@ -134,6 +141,7 @@ def gen_specialized_ssd_prefill_sm120_module() -> JitSpec:
             "-gencode=arch=compute_120a,code=sm_120a",
         ],
         extra_ldflags=["-lcuda"],
+        use_fast_math=False,
     )
 
 
@@ -145,7 +153,42 @@ def _get_cuda_module():
 def _kernel_entry():
     """The DPS kernel entry (JIT/module load happens here — never under
     CUDA-graph capture, which the guard's warmed rule already prevents)."""
-    return _get_cuda_module().run
+    _get_cuda_module()
+    return _run_framework_workspace
+
+
+def _make_framework_workspace(
+    nbytes, device_index, stream_handle, *, fallback_bytes=None
+):
+    device = torch.device("cuda", device_index)
+    if torch.cuda.current_stream(device).cuda_stream != stream_handle:
+        raise RuntimeError("SSD scratch allocation stream differs from launch stream")
+    # Only allocation refusal can select the original small workspace.
+    # Stream checks and conversion failures must propagate unchanged.
+    try:
+        storage = torch.empty((nbytes,), dtype=torch.uint8, device=device)
+    except torch.OutOfMemoryError:
+        if fallback_bytes is None or nbytes <= fallback_bytes:
+            raise
+        storage = torch.empty((fallback_bytes,), dtype=torch.uint8, device=device)
+    # Return an owning FFI Tensor, not a borrowed DLTensor call argument.
+    return tvm_ffi.from_dlpack(storage)
+
+
+def _run_framework_workspace(x, dt, A, B, C, D, dt_bias, y):
+    # As in the direct run8 call, x is the first Torch argument. Do not
+    # select a primary context in Python before native context selection.
+    base_bytes = 1032 * x.shape[1]
+
+    def allocate_workspace(nbytes, device_index, stream_handle):
+        # No kernel has been submitted when the native entry invokes this.
+        return _make_framework_workspace(
+            nbytes, device_index, stream_handle, fallback_bytes=base_bytes
+        )
+
+    _get_cuda_module()["_run_framework_lazy"](
+        x, dt, A, B, C, D, dt_bias, y, allocate_workspace
+    )
 
 
 def construction_supported(
@@ -186,6 +229,16 @@ def construction_supported(
     if has_initial_states:
         return "initial_states_unsupported"
     return None
+
+
+@functools.cache
+def _device_cc(device_index: int) -> Tuple[int, int]:
+    return tuple(get_compute_capability(torch.device("cuda", device_index)))
+
+
+@functools.cache
+def _device_sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 def _guard_call(
@@ -310,7 +363,7 @@ def _guard_call(
             if o0 < t1 and t0 < o1:
                 return "out_overlap"
     # --- device guards ---
-    cc = tuple(get_compute_capability(x.device))
+    cc = _device_cc(x.device.index)
     if not (allow["min_cc"] <= cc <= allow["max_cc"]):
         return "compute_capability"
     # The NH128 path is one cooperative launch of ``nheads + 8`` CTAs whose
@@ -319,11 +372,7 @@ def _guard_call(
     # letting the native residency check raise on every call.  (The NH64
     # path is a plain launch with no residency requirement.)  The native
     # kernel still enforces the exact occupancy envelope at first launch.
-    if (
-        nheads >= 96
-        and torch.cuda.get_device_properties(x.device).multi_processor_count
-        < nheads + 8
-    ):
+    if nheads >= 96 and _device_sm_count(x.device.index) < nheads + 8:
         return "insufficient_sm_count"
     if _native_device is not None and x.device.index != _native_device:
         return "native_state_other_device"
@@ -331,8 +380,11 @@ def _guard_call(
     # cooperative-launch state on the host — never under capture.  Query the
     # capture state on the operand's device: the launch runs on that
     # device's current stream, not on the host-current device's.
-    with torch.cuda.device(x.device):
+    if x.device.index == torch.cuda.current_device():
         capturing = torch.cuda.is_current_stream_capturing()
+    else:
+        with torch.cuda.device(x.device):
+            capturing = torch.cuda.is_current_stream_capturing()
     if capturing and (x.device.index or 0, nheads) not in _warmed:
         return "capture_unwarmed"
     return None
@@ -430,15 +482,12 @@ def warmup(nheads: int, device=None) -> None:
         device = torch.device("cuda", torch.cuda.current_device())
     if _native_device is not None and device.index != _native_device:
         return
-    cc = tuple(get_compute_capability(device))
+    cc = _device_cc(device.index)
     if not (allow["min_cc"] <= cc <= allow["max_cc"]):
         return
     # Mirror the dispatch guard's cooperative-residency refusal: warming the
     # NH128 variant on a device that cannot hold the whole grid would raise.
-    if (
-        nheads >= 96
-        and torch.cuda.get_device_properties(device).multi_processor_count < nheads + 8
-    ):
+    if nheads >= 96 and _device_sm_count(device.index) < nheads + 8:
         return
     run = _kernel_entry()
     hd, ds, ng = allow["headdim"], allow["dstate"], allow["ngroups"]
