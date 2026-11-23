@@ -305,3 +305,17 @@ def test_fused_routing_needs_one_source_row_per_input_row() -> None:
     assert torch.all(ids_out[rows:] == -7)
     with pytest.raises(ValueError, match="buffer on"):
         mxfp4_quantize_fused(x, codes=torch.empty(rows, 2048, dtype=torch.uint8))
+
+
+def test_scale_byte_254_keeps_finite_values() -> None:
+    """A block with +inf takes scale byte 254 (2**-127): finite values still scale (2**127 -> 1.0)
+    and the infinity saturates to the largest code, in the torch rule and the fused kernel."""
+    x = torch.zeros(1, 32, device="cuda")
+    x[0, :4] = torch.tensor([float("inf"), 2.0**127, -(2.0**127), 2.0**126])
+    codes, sf = mxfp4_quantize_torch(x)
+    assert sf[0, 0].item() == 254
+    nibbles = torch.stack([codes & 15, codes >> 4], dim=-1).reshape(1, 32)
+    # e2m1 codes: 6.0 -> 7, 1.0 -> 2, -1.0 -> 8 | 2, 0.5 -> 1
+    assert nibbles[0, :4].tolist() == [7, 2, 10, 1]
+    c1, s1 = mxfp4_quantize_fused(x)
+    assert torch.equal(c1, codes) and torch.equal(s1, sf)

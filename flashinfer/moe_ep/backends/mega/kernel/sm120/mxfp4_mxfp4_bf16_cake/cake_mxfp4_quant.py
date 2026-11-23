@@ -69,8 +69,12 @@ def mxfp4_quantize_torch(
     exponent = (((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(torch.int32)).clamp(
         min=1, max=254
     )
-    inverse = ((254 - exponent) << 23).view(torch.float32)
-    nibbles = e2m1_codes(blocks * inverse.unsqueeze(-1)).reshape(shape)
+    # 2**(127 - e); byte 254 (only reached by inf / NaN blocks) is 2**-127, a subnormal, so it is
+    # applied as 2**-126 then 0.5 (no subnormal operand; same order as the fused kernel)
+    inverse = ((254 - exponent.clamp(max=253)) << 23).view(torch.float32)
+    half = torch.where(exponent == 254, 0.5, 1.0)
+    scaled = blocks * inverse.unsqueeze(-1) * half.unsqueeze(-1)
+    nibbles = e2m1_codes(scaled).reshape(shape)
     packed = (nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)).to(torch.uint8)
     return packed, exponent.to(torch.uint8)
 
@@ -133,8 +137,9 @@ if _HAVE_TRITON:
         bits = (amax * RCP).to(tl.int32, bitcast=True)
         e = ((bits >> 23) & 255) + (((bits & 0x7FFFFF) + 0x7FFFFF) >> 23)
         e = tl.where(has_nan > 0, 254, tl.minimum(tl.maximum(e, 1), 254))
-        inv = ((254 - e) << 23).to(tl.float32, bitcast=True)
-        y = x * inv[:, None]
+        inv = ((254 - tl.minimum(e, 253)) << 23).to(tl.float32, bitcast=True)
+        half = tl.where(e == 254, 0.5, 1.0)
+        y = x * inv[:, None] * half[:, None]
         lo, hi = tl.split(tl.reshape(y, (BLOCKS, 16, 2)))  # even / odd values
         packed = (_e2m1_code(lo) | (_e2m1_code(hi) << 4)).to(tl.uint8)  # [BLOCKS, 16]
         pcol = b[:, None] * 16 + tl.arange(0, 16)[None, :]

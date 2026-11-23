@@ -423,6 +423,12 @@ def test_per_call_scales_override_config(ep_layer) -> None:
     out2 = layer(plain)
     torch.cuda.synchronize()
     check_close(out2, oracle(plain))
+    # a wrongly sized override is rejected on a repeated call too (the input signature cache skips
+    # validate_forward; staging still checks the scales instead of broadcasting them)
+    bad = make_inputs(700, seed=650 + rank, shape=shape)
+    bad.fc1_alpha = torch.ones(1, device="cuda")
+    with pytest.raises(ValueError, match="fc1_alpha"):
+        layer(bad)
     _protocol_clean(layer)
 
 

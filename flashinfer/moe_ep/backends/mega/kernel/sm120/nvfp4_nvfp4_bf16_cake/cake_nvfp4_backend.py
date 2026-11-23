@@ -177,6 +177,10 @@ class Sm120Nvfp4Nvfp4CakeMegaKernelBackend(Sm120Mxfp4Mxfp8CakeMegaKernelBackend)
     def _stage_activations(
         self, t: MoEEpTensors, ws: Any, *, quantize_input: bool
     ) -> int:
+        # metadata only (no device sync); run on every call, since the layer skips validate_forward
+        # when its cached input signature (which excludes these tensors) matches
+        for name in _SCALE_FIELDS:
+            check_expert_scale(name, getattr(t, name, None), ws.local_experts)
         self._call_scales = {name: getattr(t, name, None) for name in _SCALE_FIELDS}
         return stage_fp4_inputs(
             NVFP4_CODEC,
