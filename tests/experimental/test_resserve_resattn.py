@@ -227,10 +227,19 @@ def test_reject_non_dense_inner_pages(index):
 @pytest.mark.parametrize("scale", [1e-30, 1e30, 1e-200])
 def test_reject_invalid_fp32_score_scale(scale):
     args = inputs(4, 128, length=1)
-    with pytest.raises(
-        ValueError, match=r"sm_scale \* key_scale must be a positive finite FP32 value"
-    ):
+    with pytest.raises(ValueError, match="must be positive finite FP32 values"):
         paged_decode_residue(*args, sm_scale=scale, key_scale=scale)
+
+
+@pytest.mark.parametrize(
+    "scales",
+    [{"sm_scale": 3e38, "key_scale": 1.0}, {"value_scale": 4e38}],
+    ids=["base2-score-overflow", "value-overflow"],
+)
+def test_reject_fp32_overflow_after_conversion(scales):
+    args = inputs(4, 128, length=1)
+    with pytest.raises(ValueError, match="must be positive finite FP32 values"):
+        paged_decode_residue(*args, **scales)
 
 
 @pytest.mark.parametrize("d", [128, 256])
