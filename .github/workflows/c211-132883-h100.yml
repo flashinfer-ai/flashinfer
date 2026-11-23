@@ -8,13 +8,16 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: c211-132883-${{ github.ref }}-${{ matrix.shard }}
+  group: c211-132883-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   h100:
     name: h100-c211-132883-s${{ matrix.shard }}
     runs-on: [self-hosted, linux, x64, gpu, h100]
     timeout-minutes: 40
+    concurrency:
+      group: c211-132883-${{ github.ref }}-s${{ matrix.shard }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 3
