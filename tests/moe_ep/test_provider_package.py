@@ -2,6 +2,7 @@
 
 import ast
 import hashlib
+from importlib import metadata
 import json
 import os
 from pathlib import Path
@@ -11,9 +12,14 @@ import sys
 import pytest
 
 
-_ROOT = (
-    Path(__file__).resolve().parents[2] / "flashinfer/moe_ep/kernels/cutedsl_megamoe"
-)
+_PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "flashinfer"
+if not _PACKAGE_ROOT.is_dir():
+    # Nightly stages tests and benchmarks without the source package tree.
+    # Locate data without importing FlashInfer or its optional GPU dependencies.
+    _PACKAGE_ROOT = Path(
+        metadata.distribution("flashinfer-python").locate_file("flashinfer")
+    )
+_ROOT = _PACKAGE_ROOT / "moe_ep/kernels/cutedsl_megamoe"
 
 
 def test_export_manifest_matches_sources():
@@ -44,7 +50,7 @@ def test_reducer_benchmark_pins_match_vendored_sources():
     }
     assert set(bindings) == names
     for prefix in ("_CUTEDSL", "_RUBIN_CUTEDSL"):
-        source = root / bindings[prefix + "_SOURCE"]
+        source = _PACKAGE_ROOT.parent / bindings[prefix + "_SOURCE"]
         assert (
             hashlib.sha256(source.read_bytes()).hexdigest()
             == bindings[prefix + "_SOURCE_SHA256"]
