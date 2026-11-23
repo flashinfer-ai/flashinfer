@@ -27,6 +27,7 @@ from flashinfer.prims_ts.moe import compile_cache
 
 @pytest.mark.cpu_only
 def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, request):
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "0")
     compiled = []
     target = [(0, "sm100a")]
 
@@ -55,9 +56,15 @@ def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, requ
     target[0] = (1, "sm103a")
     third = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
 
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "1")
+    reencoded = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
+    assert reencoded is not third
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "0")
+    assert compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream") is third
+
     assert first is not second
     assert second is not third
-    assert len(compiled) == 3
+    assert len(compiled) == 4
 
 
 def _fake_launch_io(address: int = 1 << 20, *, align: int = 16, shape=None) -> dict:

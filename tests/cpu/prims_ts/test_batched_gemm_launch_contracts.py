@@ -157,3 +157,32 @@ def test_descriptor_rebinding_failure_preserves_cached_binding(
         io[name] is not value for name, value in zip(cached_names, cached, strict=True)
     )
     assert io["tma_desc_storage_dp"] is preparations[-1][-1]
+
+
+def test_descriptor_mode_is_bound_at_preparation_and_rebinds_safely(monkeypatch):
+    from cutlass.cutlass_dsl import BaseDSL
+
+    monkeypatch.delenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", raising=False)
+    monkeypatch.setattr(BaseDSL, "enable_pyir", contextlib.nullcontext)
+    preparations = []
+    monkeypatch.setattr(
+        runner.cute, "compile", lambda *args, **kwargs: preparations.append
+    )
+    io = _io()
+    runner._prepare_tma_descriptors(io, None)
+    first = io["tma_desc_storage_dp"]
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "1")
+    assert runner._launch_arg_tuple(io, None)[-1] is first
+
+    io["c0_dp"] = _fake_launch_io(1 << 24)["c0_dp"]
+    runner._prepare_tma_descriptors(io, None)
+    assert len(preparations) == 1
+    assert runner._compile_arg_tuple(io, None)[-2] is None
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "0")
+    assert runner._launch_arg_tuple(io, None)[-1] is None
+
+    runner._prepare_tma_descriptors(io, None)
+    assert len(preparations) == 2
+    assert preparations[-1][4] is io["c0_dp"]
+    assert runner._launch_arg_tuple(io, None)[-1] is io["tma_desc_storage_dp"]
+    assert io["tma_desc_storage_dp"] is not first

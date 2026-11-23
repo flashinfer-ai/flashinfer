@@ -171,6 +171,12 @@ def main():
         parser.error(
             "Require 0 < top-k <= experts, rounds >= 1 and positive token counts."
         )
+    if args.hidden <= 0 or args.intermediate <= 0:
+        parser.error("Hidden and intermediate dimensions must be positive.")
+    if args.layout == "BlockMajorK" and (args.hidden % 256 or args.intermediate % 256):
+        parser.error(
+            "BlockMajorK hidden and intermediate dimensions must be divisible by 256."
+        )
     tactics_by_tokens = {
         tokens: [
             [-1, -1] if name == "default" else list(map(int, name.split("_")))
@@ -271,14 +277,6 @@ def main():
                     output = run()
                 error = float((output.float() - baseline).norm() / baseline.norm())
                 assert torch.isfinite(output).all() and error < 0.12, (label, error)
-                errors[label] = error
-                output_stats[label] = dict(
-                    min=float(output.min()),
-                    max=float(output.max()),
-                    rms=float(output.float().square().mean().sqrt()),
-                    nonzero_fraction=float(torch.count_nonzero(output))
-                    / output.numel(),
-                )
                 for _ in range(3):
                     run()
                 graph = torch.cuda.CUDAGraph()
@@ -287,6 +285,19 @@ def main():
                         outputs.append(run())
                 graph.replay()
                 torch.cuda.synchronize()
+                replay_errors = []
+                for output in outputs[-10:]:
+                    error = float((output.float() - baseline).norm() / baseline.norm())
+                    assert torch.isfinite(output).all() and error < 0.12, (label, error)
+                    replay_errors.append(error)
+                errors[label] = max(replay_errors)
+                output_stats[label] = dict(
+                    min=float(output.min()),
+                    max=float(output.max()),
+                    rms=float(output.float().square().mean().sqrt()),
+                    nonzero_fraction=float(torch.count_nonzero(output))
+                    / output.numel(),
+                )
                 graphs[label], samples[label] = graph, []
                 if args.breakdown:
                     timed_graph, stages, timed_outputs = capture_breakdown(run)

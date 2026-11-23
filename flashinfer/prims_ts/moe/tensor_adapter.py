@@ -1181,6 +1181,12 @@ def build_nvfp4_launch_io(
     if not cfg.is_swap_ab:
         # The ABI's pitch is along logical M. Batch-M stores contiguous hidden
         # rows and derives its C/SF-C strides from N; no output repack is needed.
+        storage_width = output_hidden // (2 if cfg.has_output_block_scaling else 1)
+        if output_buf.dim() == 2 and output_buf.stride() != (storage_width, 1):
+            raise ValueError(
+                f"{fc} Batch-M output requires storage row stride {storage_width} "
+                f"with unit column stride, got {output_buf.stride()}"
+            )
         c_row_stride_val = logical_output_m
     bias_torch = _select_bias(
         fc=fc,

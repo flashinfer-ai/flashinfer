@@ -3171,6 +3171,14 @@ def reference_check(
                 # For whole-byte rows, compare raw bytes for every real token,
                 # with the same padding exclusion as plain output below.
                 output_tensor = _active_routes(c_storage.reshape(logical_output_m, -1))
+            elif cfg.uses_fp8_output:
+                output_tensor = _active_routes(
+                    torch.as_strided(
+                        c_storage[c_partition_offset:],
+                        (logical_output_m, logical_output_n),
+                        (1, c_pitch) if cfg.is_swap_ab else (logical_output_n, 1),
+                    )
+                )
             elif not (cfg.has_output_block_scaling or cfg.uses_fp8_output):
                 # Routed loads may leave inactive SMEM rows unspecified, and
                 # an epilogue can store those rows as part of a full tile.
@@ -4663,6 +4671,12 @@ def _validate_launch_expert_count(io: dict) -> None:
         raise ValueError("dense_single_expert requires num_experts_dim=1")
 
 
+def _tma_descriptor_storage(io: dict):
+    # The signature is fixed when preparing this IO, not by the environment
+    # at launch time. Re-encoding kernels must never see cached TensorMaps.
+    return None if io.get("_reencode_tma", False) else io.get("tma_desc_storage_dp")
+
+
 def _compile_arg_tuple(io: dict, stream) -> tuple:
     """Positional args for ``cute.compile(gemm, ...)``.
 
@@ -4700,7 +4714,7 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         int(io.get("sf_c_m_offset", 0)),
         io["cfg"],
         stream,
-        io.get("tma_desc_storage_dp"),
+        _tma_descriptor_storage(io),
         False,
     )
 
@@ -4760,7 +4774,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         _c_row_stride(io),
         int(io.get("sf_c_m_offset", 0)),
         stream,
-        io.get("tma_desc_storage_dp"),
+        _tma_descriptor_storage(io),
     )
 
 
@@ -4770,11 +4784,13 @@ def _prepare_tma_descriptors(io: dict, stream, *, prepare=None):
     from cutlass.cute.runtime import make_ptr
 
     if _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA"):
+        io["_reencode_tma"] = True
         return
     key = tuple(
         io[name]._pointer for name in ("a_dp", "b_dp", "c0_dp", "sfa_dp", "sfb_dp")
     ) + (io["shape"], _c_row_stride(io), repr(io["cfg"]))
     if io.get("_tma_descriptor_key") == key:
+        io["_reencode_tma"] = False
         return prepare
     # CUtensorMap is 128 bytes and requires 64-byte alignment. Keep its owner
     # in the same IO object as the device allocations it describes.
@@ -4783,7 +4799,7 @@ def _prepare_tma_descriptors(io: dict, stream, *, prepare=None):
     descriptor_ptr = make_ptr(
         cutlass.Uint8, address, cutlass.AddressSpace.generic, assumed_align=64
     )
-    preparation_io = dict(io, tma_desc_storage_dp=descriptor_ptr)
+    preparation_io = dict(io, tma_desc_storage_dp=descriptor_ptr, _reencode_tma=False)
     args = _launch_arg_tuple(preparation_io, stream)
     if prepare is None:
         with task_scheduling_scope(), BaseDSL.enable_pyir():
@@ -4798,6 +4814,7 @@ def _prepare_tma_descriptors(io: dict, stream, *, prepare=None):
         tma_desc_storage_dp=descriptor_ptr,
         _tma_descriptor_storage=storage,
         _tma_descriptor_key=key,
+        _reencode_tma=False,
     )
     return prepare
 

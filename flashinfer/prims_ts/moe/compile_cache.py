@@ -72,7 +72,7 @@ class _CompiledGemm:
     prepare_descriptors: Any = None
 
 
-_COMPILED_GEMM_CACHE: dict[tuple[str, str, str, int, str], _CompiledGemm] = {}
+_COMPILED_GEMM_CACHE: dict[tuple[str, str, str, bool, int, str], _CompiledGemm] = {}
 
 
 def clear_compiled_gemm_cache() -> None:
@@ -251,11 +251,14 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> 
 
     import torch
 
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _env_flag_enabled
+
     device_index, compile_arch = _compile_target_key(io)
     key = (
         cfg_hash,
         fc1_or_fc2,
         get_compile_options(),
+        _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA"),
         device_index,
         compile_arch,
     )

@@ -116,3 +116,53 @@ def test_gemm1_oa_validation_uses_local_expert_count():
     )
 
     assert ok, reason
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rows,width", [(512, 256), (768, 256), (512, 288)])
+def test_nvfp4_batch_m_output_requires_exact_row_pitch(rows, width):
+    from flashinfer.prims_ts.moe.config_mapper import map_trtllm_nvfp4_moe_tactic
+    from flashinfer.prims_ts.moe.tensor_adapter import build_nvfp4_launch_io
+
+    cfg = map_trtllm_nvfp4_moe_tactic([1024, 0], sm_arch=107).fc2.cfg.build()
+    data = torch.empty((512, 128), dtype=torch.uint8)
+    scales = torch.empty((512, 16), dtype=torch.float8_e4m3fn)
+    weights = torch.empty((2, 256, 128), dtype=torch.uint8)
+    metadata = torch.zeros(2, dtype=torch.int32)
+    scale = torch.ones(2)
+    kwargs = dict(
+        fc="fc2",
+        cfg=cfg,
+        hidden_states=data,
+        hidden_states_scale=scales,
+        gemm1_weights=weights,
+        gemm1_weights_scale=scales,
+        gemm2_weights=weights,
+        gemm2_weights_scale=scales,
+        gemm1_output=data,
+        gemm1_output_scale=scales,
+        gemm2_output=torch.empty((rows, width), dtype=torch.bfloat16),
+        output1_scale_scalar=scale,
+        output1_scale_gate_scalar=scale,
+        output2_scale_scalar=scale,
+        tile_idx=metadata,
+        mn_limit=metadata,
+        route_map=torch.zeros(512, dtype=torch.int32),
+        num_non_exiting_ctas=metadata,
+        total_num_padded_tokens=metadata,
+        routed_token_capacity=512,
+        activation_type=int(ActivationType.Swiglu),
+        num_experts=2,
+        num_tokens=17,
+        top_k=2,
+        intermediate_size=256,
+        hidden_size=256,
+    )
+    if width != 256:
+        with pytest.raises(
+            ValueError, match="Batch-M output requires storage row stride"
+        ):
+            build_nvfp4_launch_io(**kwargs)
+    else:
+        io = build_nvfp4_launch_io(**kwargs)
+        assert io["c0_dp"]._pointer == kwargs["gemm2_output"].data_ptr()

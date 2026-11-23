@@ -81,6 +81,34 @@ def test_generated_fp4_mapping_has_bounded_temporaries():
     assert sizes == [1 << 20, 1 << 20, 16]
 
 
+@pytest.mark.parametrize("name", ["A", "B", "SFA", "SFB"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.float32])
+def test_packed_fixture_validates_dtype_even_with_valid_checksum(tmp_path, name, dtype):
+    array = np.zeros(16, dtype=dtype)
+    np.save(tmp_path / f"{name}.npy", array)
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            dict(
+                shape=[512, 256, 256, 1],
+                tensors={
+                    name: dict(
+                        sha256=hashlib.sha256(array.tobytes()).hexdigest(),
+                        bytes=array.nbytes,
+                        dtype=str(array.dtype),
+                    )
+                },
+            )
+        )
+    )
+    fixture = Fixture(tmp_path, (512, 256, 256, 1))
+    if dtype == np.uint8:
+        loaded = fixture.load(name)
+        assert loaded.dtype == torch.uint8 and torch.count_nonzero(loaded) == 0
+    else:
+        with pytest.raises(ValueError, match="packed uint8"):
+            fixture.load(name)
+
+
 @pytest.mark.parametrize("shape", [(0, 1), (1, 0), (-2, 4), (2, -4)])
 def test_routed_cli_rejects_nonpositive_cluster_dimensions(monkeypatch, capsys, shape):
     import sys

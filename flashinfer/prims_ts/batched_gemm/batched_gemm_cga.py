@@ -848,9 +848,7 @@ def complete_input_tma_bytes(
         )
     for owner in cutlass.range_constexpr(max_ctas):
         if (owners & (Int32(1) << Int32(owner))) != Int32(0):
-            remote = prims.cvta_to(
-                prims.mapa(barrier, Int32(owner)), prims.CvtaSpace.SHARED
-            )
+            remote = prims.mapa(barrier, Int32(owner))
             prims.inline_ptx_hl(
                 "mbarrier.complete_tx.relaxed.cluster.shared::cluster.b64 [{$r0}], {$r1};",
                 read_only_args=[remote.data_ptr(), tx_bytes],

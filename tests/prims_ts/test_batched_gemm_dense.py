@@ -369,6 +369,7 @@ def test_tile512_resource_contract(single_expert):
         dict(use_max_tmem_overlap=1),
         dict(dense_rolled_epilogue=0),
         dict(use_tma_store=0),
+        dict(use_tma_store=0, num_stages_c_smem=0),
         dict(
             num_stages_a=6, num_stages_b=6, num_stages_smem_sfa=6, num_stages_smem_sfb=6
         ),

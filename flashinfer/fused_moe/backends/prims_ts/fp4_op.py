@@ -315,6 +315,8 @@ def prims_ts_fp4_block_scale_moe(
             hidden_states.device,
             "output",
         )
+        if not output.is_contiguous():
+            raise ValueError("output must be contiguous")
 
     routing_logits, topk_ids, expert_weights = _resolve_routing_inputs(
         routing_input_mode=routing_input_mode,

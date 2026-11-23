@@ -226,29 +226,32 @@ def test_native_fp4_fc1_padding_graph_replay(
                 fn(*runner._launch_arg_tuple(io, capture_stream))
         graphs.append(graph)
 
-    def decoded_output():
-        return runner._dequantize_fp4_output(
-            output,
-            scales,
-            output_m=io["logical_output_m"],
-            n=io["logical_output_n"],
-            is_swap_ab=False,
-            sf_layout_c=io["cfg"].sf_layout_c,
-            uses_mxfp4=False,
-        ).view(experts, rows_per_expert, -1)
-
     rows = torch.arange(rows_per_expert, device="cuda")
     full = rows_per_expert
     for counts in ([full] * experts, [0, 1, 3], [4, 5, full - 1], [full // 2, 0, full]):
         counts = torch.tensor(counts, device="cuda", dtype=limits.dtype)
         limits.copy_(offsets + counts)
         valid = rows[None, :] < counts[:, None]
+        sf_cols = io["logical_output_n"] // io["cfg"].output_sf_block_size_c
+        sf_offsets = runner._sf_offsets(
+            row_idx=torch.nonzero(valid.flatten(), as_tuple=False).flatten(),
+            sf_cols=sf_cols,
+            layout=io["cfg"].sf_layout_c,
+            num_padded_sf_cols=runner._round_up(sf_cols, 4),
+            device="cuda",
+        )
         graphs[0].replay()
-        expected = decoded_output()[valid].clone()
+        expected = output.view(experts, rows_per_expert, -1)[valid].clone()
+        expected_scales = scales.view(torch.uint8)[sf_offsets].clone()
         output.fill_(0xFF)
         scales.fill_(0x7F)
         graphs[1].replay()
-        torch.testing.assert_close(decoded_output()[valid], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            output.view(experts, rows_per_expert, -1)[valid], expected, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            scales.view(torch.uint8)[sf_offsets], expected_scales, rtol=0, atol=0
+        )
 
 
 @pytest.mark.parametrize("c_stages", [1, 2, 3, 4])

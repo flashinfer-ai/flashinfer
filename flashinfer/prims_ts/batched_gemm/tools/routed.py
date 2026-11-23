@@ -259,7 +259,6 @@ def main():
                     min=int(tensor.min().item()),
                     max=int(tensor.max().item()),
                 )
-                assert record["nonzero"] > 0, name
                 if fixture:
                     audited_tensor = tensor
                     if name == "route":

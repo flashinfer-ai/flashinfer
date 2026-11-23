@@ -89,15 +89,23 @@ def test_omitted_gather_bytes_reach_all_full_barrier_owners(
     for rank in range(active_shape[0] * active_shape[1]):
         _host_masks(monkeypatch, active_shape, rank)
         credits = []
-        monkeypatch.setattr(cga.prims, "mapa", lambda barrier, owner: owner)
+        monkeypatch.setattr(
+            cga.prims,
+            "mapa",
+            lambda barrier, owner: SimpleNamespace(data_ptr=lambda: owner),
+        )
         monkeypatch.setattr(
             cga.prims,
             "cvta_to",
-            lambda owner, space: SimpleNamespace(data_ptr=lambda: owner),
+            lambda *args: pytest.fail(
+                "owner credits must retain cluster address space"
+            ),
         )
 
         def record(instruction, *, read_only_args):
-            assert instruction.startswith("mbarrier.complete_tx.")
+            assert instruction.startswith(
+                "mbarrier.complete_tx.relaxed.cluster.shared::cluster."
+            )
             credits.append(tuple(read_only_args))
 
         monkeypatch.setattr(cga.prims, "inline_ptx_hl", record)
@@ -233,8 +241,15 @@ def test_independent_member_try_acquire_work_and_tail_are_gated(monkeypatch):
             python_body(ts.InputTmaTask._producer_acquire)(task, resource, None)
             python_body(ts.InputTmaTask._producer_work)(task, resource, None, None)
             python_body(ts.InputTmaTask._producer_tail)(task, resource)
-        assert Counter(name for _, name in calls) == (
-            {b.name: 4, sb.name: 4} if rank % 4 == 0 else {b.name: 4}
+        assert Counter(calls) == Counter(
+            (hook, resource.name)
+            for resource in ((b, sb) if rank % 4 == 0 else (b,))
+            for hook in (
+                "_producer_try_acquire",
+                "_producer_acquire",
+                "_producer_work",
+                "_producer_tail",
+            )
         )
 
 

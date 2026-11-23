@@ -1312,7 +1312,11 @@ class GmemCResource(MemoryResource):
             if local_row < self.tile_token_limit:
                 permuted_row = tile_m * Int32(self.cfg.tile_m) + local_row
                 token = self.route_map_view.load(idx=permuted_row, vector_size=1)[0]
-                if (token >= Int32(0)) & (token < self.num_tokens):
+                if (
+                    (token >= Int32(0))
+                    & (token < self.num_tokens)
+                    & (tile_n < self.problem_n // Int32(self.cfg.tile_n))
+                ):
                     prims.cp_reduce_async_bulk_global_shared_cta(
                         self.gC.subview(
                             cutlass.Int64(token) * self.problem_n
@@ -1363,7 +1367,11 @@ class GmemCResource(MemoryResource):
                 if local_row < self.tile_token_limit:
                     permuted_row = tile_m * Int32(self.cfg.tile_m) + local_row
                     token = self.route_map_view.load(idx=permuted_row, vector_size=1)[0]
-                    if (token >= Int32(0)) & (token < self.num_tokens):
+                    if (
+                        (token >= Int32(0))
+                        & (token < self.num_tokens)
+                        & (tile_n < self.problem_n // Int32(self.cfg.tile_n))
+                    ):
                         col = tile_n * Int32(self.cfg.tile_n)
                         prims.cp_reduce_async_bulk_global_shared_cta(
                             self.gC.subview(
@@ -1641,7 +1649,11 @@ class GmemCResource(MemoryResource):
                         token = self.route_map_view.load(
                             idx=permuted_row, vector_size=1
                         )[0]
-                        if (token >= Int32(0)) & (token < self.num_tokens):
+                        if (
+                            (token >= Int32(0))
+                            & (token < self.num_tokens)
+                            & (tile_n < self.problem_n // Int32(self.cfg.tile_n))
+                        ):
                             prims.cp_reduce_async_bulk_global_shared_cta(
                                 self.gC.subview(
                                     cutlass.Int64(token) * self.problem_n

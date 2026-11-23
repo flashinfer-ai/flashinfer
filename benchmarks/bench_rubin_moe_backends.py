@@ -236,7 +236,10 @@ def main():
             row["tokens"]: _tuple_tree(row["tactic"])
             for row in saved["results"]
             if row["backend"] == "cute_best_from_logits"
-            and row.get("is_sweep_winner", True)
+            and (
+                row.get("is_sweep_winner", "tactic_source" not in row)
+                or (row.get("tactic_source") == "replay" and row.get("replayed_from"))
+            )
         }
         if any(tokens not in saved_tactics for tokens in args.tokens):
             parser.error(
@@ -279,18 +282,21 @@ def main():
         gpu=torch.cuda.get_device_name(),
         compute_capability=list(torch.cuda.get_device_capability()),
         timer="CUDA events; 10 blocks per graph; 30 samples per round; warm L2",
+        candidate_timer="CUDA events; 2 blocks per graph; 10 samples; 20 ms warmup; warm L2",
         gate_gemm_included=False,
         routing="Balanced Renormalize logits; CuTe from-logits uses trtllm_gen_routing plus FP32 router-weight cast",
         selection=(
             "CuTe default tactic only; no sweep winner"
             if args.default_only
+            else "Replay saved CuTe tactics; no new sweep winner"
+            if args.tactics_from
             else "Explicit shape-valid CuTe tactic sweep using actual inputs and CUDA graphs"
         ),
         default_only=args.default_only,
         tactics_from=str(args.tactics_from) if args.tactics_from else None,
         breakdown=args.breakdown,
         cute_fused_finalize=not args.cute_unfused_finalize,
-        prims_fused_finalize=not args.prims_unfused_finalize,
+        requested_prims_fused_finalize=not args.prims_unfused_finalize,
         requested_enable_pdl=not args.disable_pdl,
         breakdown_note=(
             "External CUDA events can inhibit PDL overlap. "
@@ -303,10 +309,6 @@ def main():
         results=[],
         sweeps=[],
     )
-    if args.tactics_from:
-        report["selection"] = (
-            "Replay prior winning tactics, validated against the current candidate menu"
-        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
@@ -387,6 +389,7 @@ def main():
             reference = run_prims().float()
             graphs = {}
             breakdown_graphs = {}
+            prims_finalize_modes = {}
             prims_variants = [("prims_default", [-1, -1], False)]
             if not args.prims_unfused_finalize:
                 prims_variants.append(("prims_1024_unfused", [1024, 0], False))
@@ -398,6 +401,9 @@ def main():
                 if selected[0] == 1024 and tokens * k // e < 512:
                     continue
                 graph, outputs = capture(run_prims)
+                prims_finalize_modes[label] = (
+                    fused and not torch.are_deterministic_algorithms_enabled()
+                )
                 graphs[label] = (
                     graph,
                     outputs,
@@ -459,8 +465,13 @@ def main():
             del graph, outputs
             gc.collect()
             save()
-        sweep["winner"] = None if args.default_only else best[1]
-        for name, tactic in (("default", DEFAULT_RUBIN_MOE_TACTIC), ("best", best[1])):
+        sweep["winner"] = None if args.default_only or args.tactics_from else best[1]
+        if args.tactics_from:
+            sweep["replayed_tactic"] = best[1]
+        variants = [("default", DEFAULT_RUBIN_MOE_TACTIC)]
+        if not args.default_only:
+            variants.append(("best", best[1]))
+        for name, tactic in variants:
             for from_logits in (True, False):
                 label = f"cute_{name}_{'from_logits' if from_logits else 'prerouted'}"
                 graph, outputs = capture(lambda: run_cute(tactic, from_logits))
@@ -498,8 +509,22 @@ def main():
                 output_stats=graphs[label][2],
                 tactic=graphs[label][3],
                 is_sweep_winner=label.startswith("cute_best_")
-                and not args.default_only,
+                and not args.default_only
+                and not args.tactics_from,
             )
+            if label in prims_finalize_modes:
+                result["fused_finalize"] = prims_finalize_modes[label]
+            else:
+                replayed = label.startswith("cute_best_") and bool(args.tactics_from)
+                result["tactic_source"] = (
+                    "replay"
+                    if replayed
+                    else "sweep"
+                    if result["is_sweep_winner"]
+                    else "default"
+                )
+                if replayed:
+                    result["replayed_from"] = str(args.tactics_from)
             result["moe_tflops"] = 6 * tokens * k * h * i / (result["median_us"] * 1e6)
             if args.breakdown:
                 components = breakdown_samples[label]

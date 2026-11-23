@@ -7727,6 +7727,27 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             self._weight_layout(),
         )
 
+    def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        if self._pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            return ()
+        from flashinfer.prims_ts.moe.epilogue_policy import fused_finalize_requested
+
+        options = dict(
+            use_fused_finalize=self.config.finalize.use_fused_finalize,
+            do_finalize=self.config.finalize.do_finalize,
+        )
+        state = self.launch_state_for(inputs)
+        if isinstance(state, _TrtllmLaunchState):
+            options.update(state.static_kwargs)
+        elif self._inner is not None:
+            # Profiling uses a plain list; inputs_pre_hook binds this call's
+            # options to the inner runner before enumeration and cache writes.
+            options.update(dict(self._inner._cache_key_static_extras))
+        return (
+            "effective_fused_finalize",
+            fused_finalize_requested(self._inner or self, options),
+        )
+
     def _weight_layout(self, view: Optional[dict] = None) -> int:
         from flashinfer.tllm_enums import WeightLayout
 

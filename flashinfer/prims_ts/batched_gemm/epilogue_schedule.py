@@ -267,6 +267,8 @@ def normalize_epilogue_steps(steps):
     selects one plan before calling this function; an empty tuple disables
     explicit scheduling in Python configurations.
     """
+    if not isinstance(steps, (tuple, list)):
+        raise ValueError("epilogue_steps must be a tuple or list")
     if isinstance(steps, list) and not steps:
         raise ValueError("epilogue_steps must contain a nonempty plan")
     result = []

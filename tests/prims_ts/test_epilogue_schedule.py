@@ -107,6 +107,13 @@ def test_cooperative_prefix_cannot_request_unimplemented_read_ahead():
         )
 
 
+@pytest.mark.parametrize("value", [{}, {"load_fragments": 1}, "", None, 0, set()])
+def test_epilogue_steps_reject_non_arrays(value):
+    with pytest.raises(ValueError, match="tuple or list"):
+        schedules.normalize_epilogue_steps(value)
+    assert schedules.normalize_epilogue_steps(()) == ()
+
+
 def test_schedule_controls_cli_and_source_key():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         _parse_overrides,
@@ -163,16 +170,31 @@ def _verify_repeated_tile_lifetimes(plan):
         issuing = set()
         seen = []
         pending_reads = set()
+        issued_reads = {}
+        completed_reads = {}
         registers = set()
         released = False
         for action in plan.actions:
             if action.op == op.READ:
                 assert not released
+                assert action.read_id not in issued_reads
+                issued_reads[action.read_id] = (
+                    action.fragment,
+                    action.offset,
+                    action.width,
+                )
                 pending_reads.add(action.read_id)
             elif action.op == op.READ_WAIT:
+                completed_reads.update(
+                    (read_id, issued_reads[read_id]) for read_id in pending_reads
+                )
                 pending_reads.clear()
             elif action.op == op.CONVERT:
-                assert action.read_id not in pending_reads
+                assert completed_reads.pop(action.read_id) == (
+                    action.fragment,
+                    action.offset,
+                    action.width,
+                )
                 if plan.gated:
                     for fragment in range(
                         action.fragment, action.fragment + action.width // 64
@@ -203,7 +225,8 @@ def _verify_repeated_tile_lifetimes(plan):
             elif action.op == op.RELEASE:
                 assert not released and not pending_reads
                 released = True
-        assert released and not registers and seen == list(range(plan.fragment_count))
+        assert released and not registers and not completed_reads
+        assert seen == list(range(plan.fragment_count))
 
 
 @pytest.mark.parametrize("warps", [4, 8])

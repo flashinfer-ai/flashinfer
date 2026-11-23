@@ -143,6 +143,7 @@ def test_runner_candidate_cache_tracks_finalize_mode(monkeypatch):
     assert not fused_finalize_requested(SimpleNamespace(_is_partitioned=True), {})
 
 
+@pytest.mark.arch_rubin
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("layout", ("MajorK", "BlockMajorK"))
 def test_shortlist_production_dispatch_replay(monkeypatch, layout):

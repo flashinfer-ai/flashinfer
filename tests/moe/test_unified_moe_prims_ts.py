@@ -1230,7 +1230,86 @@ def test_prims_ts_tuning_cache_distinguishes_finalize_and_weight_layout():
             )
             runner = PrimsTsRunner(cfg, torch.device("cpu"))
             key = runner.get_cache_key_extras([])
-            assert key == runner._cache_key_extras()
+            assert key == runner._cache_key_extras() + runner._input_cache_key_extras(
+                []
+            )
             keys.add(key)
             hashes.add(hash(runner))
     assert len(keys) == len(hashes) == 4
+
+
+def test_prims_ts_unified_cache_tracks_effective_finalize_for_each_call(monkeypatch):
+    from types import SimpleNamespace
+    from flashinfer.fused_moe.runners import _TrtllmLaunchState, _TrtllmPackedInputs
+    from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+    from flashinfer.prims_ts.moe import runner as module
+
+    monkeypatch.setattr(module, "_sm_arch_for_tensor", lambda tensor: 107)
+    deterministic = False
+    monkeypatch.setattr(
+        torch, "are_deterministic_algorithms_enabled", lambda: deterministic
+    )
+    runner = PrimsTsRunner(
+        _config(execution=ExecutionConfig(enable_pdl=False)), torch.device("cpu")
+    )
+    inner = module.PrimsTsNvfp4MoERunner(
+        None, top_k=2, num_local_experts=32, hidden_size=1024, intermediate_size=512
+    )
+    runner._inner = inner
+    monkeypatch.setattr(runner, "_require_built", lambda: None)
+    tensors = MoeRunnerInputs(
+        torch.empty(8192, 1024, device="meta", dtype=torch.bfloat16),
+        torch.empty(8192, 32, device="meta"),
+        None,
+        None,
+        torch.empty(8192, 512, device="meta", dtype=torch.uint8),
+        torch.empty(8192, 64, device="meta", dtype=torch.uint8),
+        None,
+        None,
+    ).to_list()
+    packed = _TrtllmPackedInputs(
+        tensors,
+        tuning_config=None,
+        launch_state=_TrtllmLaunchState(
+            dict(weight_layout=int(WeightLayout.MajorK), do_finalize=True)
+        ),
+    )
+    original_hash = hash(runner)
+    fused_key = runner.get_cache_key_extras(packed)
+    assert (
+        len(
+            [
+                t
+                for t in runner.get_valid_tactics(packed, None)
+                if t != -1 and t[0] == 512
+            ]
+        )
+        == 16
+    )
+    assert runner.get_cache_key_extras(list(packed)) == fused_key
+    for overrides in (
+        {"use_fused_finalize": False},
+        {"do_finalize": False},
+        {"zero_rows_without_local_expert": False},
+    ):
+        unfused = packed.with_launch_overrides(**overrides)
+        assert runner.get_cache_key_extras(unfused) != fused_key
+        assert [
+            t
+            for t in runner.get_valid_tactics(unfused, None)
+            if t != -1 and t[0] == 512
+        ] == [[512, 0], [512, 1]]
+        assert runner.get_cache_key_extras(
+            list(unfused)
+        ) == runner.get_cache_key_extras(unfused)
+        # A previously packed call must not inherit another call's options.
+        assert runner.get_cache_key_extras(packed) == fused_key
+    deterministic = True
+    assert runner.get_cache_key_extras(packed) != fused_key
+    assert [
+        t for t in runner.get_valid_tactics(packed, None) if t != -1 and t[0] == 512
+    ] == [[512, 0], [512, 1]]
+    assert hash(runner) == original_hash
+    deterministic = False
+    runner._inner = SimpleNamespace(_is_partitioned=True)
+    assert runner.get_cache_key_extras(packed) != fused_key

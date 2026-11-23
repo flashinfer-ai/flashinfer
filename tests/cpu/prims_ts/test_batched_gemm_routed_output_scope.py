@@ -75,3 +75,83 @@ def test_routed_repeat_scope_compares_signed_zero_bits(dtype, is_swap_ab):
     assert _same_launch_output(observable(first), observable(second))
     second[0, 0] = -0.0
     assert not _same_launch_output(observable(first), observable(second))
+
+
+@pytest.mark.parametrize("path", ["preloaded", "cooperative", "steps"])
+def test_finalize_padded_n_skips_reductions_without_changing_scratch_protocol(
+    monkeypatch, path
+):
+    from types import SimpleNamespace as NS
+    from tests.prims_ts.python_body import python_body
+    from flashinfer.prims_ts.batched_gemm import gmem_c_resources as module
+    from flashinfer.prims_ts.batched_gemm.epilogue_schedule import (
+        EpilogueAction,
+        EpilogueOp,
+    )
+
+    monkeypatch.setattr(module, "Int32", int)
+    monkeypatch.setattr(module.cutlass, "Int64", int)
+    monkeypatch.setattr(module.cutlass, "range_constexpr", range)
+    monkeypatch.setattr(module.cute.arch, "warp_idx", lambda: 0)
+    monkeypatch.setattr(module.cute.arch, "lane_idx", lambda: 0)
+    monkeypatch.setattr(module, "nonnegative_div", lambda a, b: a // b)
+    monkeypatch.setattr(module, "nonnegative_mod", lambda a, b: a % b)
+    events = []
+    for name in (
+        "cp_reduce_async_bulk_global_shared_cta",
+        "cp_async_bulk_commit_group",
+        "cp_async_bulk_wait_group",
+        "barrier_cta_sync",
+    ):
+        monkeypatch.setattr(
+            module.prims, name, lambda *a, name=name, **kw: events.append(name)
+        )
+    monkeypatch.setattr(module.cute.arch, "fence_view_async_shared", lambda: None)
+    memory = NS(subview=lambda *a: memory, store=lambda *a, **kw: None)
+    cfg = NS(
+        tile_m=256,
+        tile_n=256,
+        num_bytes_c_per_stage=128 * 256 * 2,
+        num_stages_c_smem=2,
+        dtype_c_bits=16,
+        finalize_smem_row_stride=256,
+        warp_layout=NS(epilogue_warp_idx=0),
+        preload_epilogue_plan=NS(gated=False, finalize=True, barrier_threads=256),
+    )
+    resource = NS(
+        cfg=cfg,
+        tile_token_limit=256,
+        problem_n=1280,
+        num_tokens=1,
+        route_map_view=NS(load=lambda **kw: [0]),
+        gC=memory,
+        sC=memory,
+    )
+    protocols = []
+    for tile_n in (4, 5):
+        events.clear()
+        stage = NS(work_tile=NS(tile_idx=(0, tile_n, 0)))
+        if path == "preloaded":
+            python_body(module.GmemCResource._store_preloaded_finalize)(resource, stage)
+            expected_reductions = 2
+        elif path == "cooperative":
+            python_body(module.GmemCResource._reduce_cooperative_fragment)(
+                resource, None, 0, tile_n, 3
+            )
+            expected_reductions = 1
+        else:
+            action = python_body(module.GmemCResource._step_output_action)
+            for op in (
+                EpilogueOp.EMIT,
+                EpilogueOp.COMMIT,
+                EpilogueOp.SOURCE_WAIT,
+                EpilogueOp.BARRIER,
+            ):
+                action(resource, stage, EpilogueAction(op, fragment=0, slot=0))
+            expected_reductions = 1
+        reduce = "cp_reduce_async_bulk_global_shared_cta"
+        assert events.count(reduce) == (expected_reductions if tile_n == 4 else 0)
+        protocols.append([event for event in events if event != reduce])
+    assert protocols[0] == protocols[1]
+    assert "cp_async_bulk_commit_group" in protocols[1]
+    assert "cp_async_bulk_wait_group" in protocols[1]

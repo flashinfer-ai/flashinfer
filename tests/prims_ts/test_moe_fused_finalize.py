@@ -71,6 +71,8 @@ def test_fused_finalize_replay(
     steps=(),
     fc1_overrides=None,
     router_weight_dtype=torch.bfloat16,
+    hidden=1024,
+    guard_output=False,
 ):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Native BatchM finalization requires Rubin")
@@ -110,9 +112,8 @@ def test_fused_finalize_replay(
     monkeypatch.setattr(runner, "build_nvfp4_launch_io", with_epilogue)
 
     torch.manual_seed(83)
-    tokens, hidden, intermediate, experts, local, offset, top_k = (
+    tokens, intermediate, experts, local, offset, top_k = (
         1031,
-        1024,
         512,
         8,
         4,
@@ -139,7 +140,18 @@ def test_fused_finalize_replay(
     )
     ids = torch.empty((tokens, top_k), device="cuda", dtype=torch.int32)
     router_weights = torch.empty_like(ids, dtype=router_weight_dtype)
-    out = torch.empty((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+    guarded_outputs = []
+
+    def allocate_output():
+        if not guard_output:
+            return torch.empty((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+        backing = torch.full(
+            (tokens * hidden + 512,), 19.0, device="cuda", dtype=torch.bfloat16
+        )
+        guarded_outputs.append(backing)
+        return backing[256:-256].view(tokens, hidden)
+
+    out = allocate_output()
     kwargs = dict(
         routing_logits=None,
         routing_bias=None,
@@ -186,6 +198,13 @@ def test_fused_finalize_replay(
         return prims_ts_fp4_block_scale_moe(**kwargs, use_fused_finalize=fused, **extra)
 
     inputs_for(0)
+    if guard_output:
+        backing = torch.full(
+            (tokens, hidden * 2), 7.0, device="cuda", dtype=torch.bfloat16
+        )
+        with pytest.raises(ValueError, match="contiguous"):
+            run(output=backing[:, ::2])
+        assert torch.all(backing == 7)
     reference = run(False)[0]
     run(output=out)
     assert torch.isfinite(out).all() and out.abs().max() > 0
@@ -232,7 +251,7 @@ def test_fused_finalize_replay(
     if layout == "BlockMajorK" and tactic == [1024, 0]:
         # Retain two captures and replay them on independent caller streams.
         # Both must keep their own zeroing dependencies and destination buffer.
-        other_out = torch.empty_like(out)
+        other_out = allocate_output()
         other_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(other_graph):
             run(output=other_out)
@@ -295,6 +314,43 @@ def test_fused_finalize_replay(
         assert (
             topk_output.float() - reference.float()
         ).norm() / reference.float().norm() < 0.015
+
+    for backing in guarded_outputs:
+        assert torch.all(backing[:256] == 19)
+        assert torch.all(backing[-256:] == 19)
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("path", ["four_warp", "cooperative", "explicit_steps"])
+def test_fused_finalize_padded_n_replay(monkeypatch, path):
+    from flashinfer.prims_ts.batched_gemm.epilogue_schedule import (
+        epilogue_steps_for_prefix,
+    )
+
+    test_fused_finalize_replay(
+        monkeypatch,
+        layout="BlockMajorK",
+        tactic=[1024, 0],
+        prefix=2 if path == "cooperative" else 0,
+        stages=1 if path == "cooperative" else 2,
+        warps=4 if path == "four_warp" else 8,
+        release=0,
+        ahead=-1,
+        steps=epilogue_steps_for_prefix(4, read_ahead=1)
+        if path == "explicit_steps"
+        else (),
+        hidden=1280,  # Five valid N tiles, rounded up by the two-CTA N cluster.
+        guard_output=True,
+    )
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("reencode", [False, True])
+def test_fused_finalize_descriptor_modes_replay(monkeypatch, reencode):
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", str(int(reencode)))
+    test_fused_finalize_replay(monkeypatch, "BlockMajorK", [1024, 0], 2, 1, 8, 0, -1)
 
 
 @pytest.mark.arch_rubin

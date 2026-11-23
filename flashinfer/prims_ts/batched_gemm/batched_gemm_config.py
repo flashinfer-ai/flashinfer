@@ -3819,6 +3819,7 @@ def validate_config(
         )
     if cfg.dense_epilogue_warps == 8 and not (
         cfg.dense_rolled_epilogue
+        and cfg.use_tma_store
         and not cfg.is_swap_ab
         and not cfg.use_max_tmem_overlap
         and (

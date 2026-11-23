@@ -76,7 +76,12 @@ class Fixture:
             hashlib.sha256(memoryview(array).cast("B")).hexdigest()
             == self.manifest["tensors"][name]["sha256"]
         )
-        return torch.from_numpy(array).to(device=device)
+        tensor = torch.from_numpy(array)
+        if name in ("A", "B", "SFA", "SFB") and tensor.dtype != torch.uint8:
+            raise ValueError(
+                f"{name} fixture must use packed uint8 storage, got {tensor.dtype}"
+            )
+        return tensor.to(device=device)
 
     def audit(self, name, tensor):
         # A matching prefix must not hide corruption elsewhere in its source.
