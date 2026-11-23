@@ -355,6 +355,16 @@ def test_empty_split_by_locality_domain(shape, dim):
     assert (full.narrow(d, 0, part_shape[d]) == 7).all()
 
 
+@pytest.mark.parametrize("shape,dim", [((0, 4096, 1024), 1), ((4, 0, 1024), 1)])
+def test_empty_split_by_locality_domain_empty(shape, dim):
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    n = green_ctx.get_locality_domain_count(dev)
+    parts, full = green_ctx.empty_split_by_locality_domain(shape, dim, torch.uint8, dev)
+    assert full.shape == shape and full.device == dev
+    assert parts.shape == (n, *shape[:dim], shape[dim] // n, *shape[dim + 1 :])
+
+
 def test_empty_split_by_locality_domain_rejects_bad_split():
     dev = torch.device("cuda:0")
     _need_locality_domains(dev)

@@ -615,6 +615,11 @@ def empty_split_by_locality_domain(
     elem = torch.tensor([], dtype=dtype).element_size()
     outer = math.prod(shape[:dim])
     part_shape = (*shape[:dim], shape[dim] // num_domains, *shape[dim + 1 :])
+    if math.prod(shape) == 0:  # nothing to map
+        return (
+            torch.empty((num_domains, *part_shape), dtype=dtype, device=dev),
+            torch.empty(shape, dtype=dtype, device=dev),
+        )
     chunk_bytes = shape[dim] // num_domains * math.prod(shape[dim + 1 :]) * elem
     gran = _locality_domain_granularity(cu_dev)
     if chunk_bytes % gran:
