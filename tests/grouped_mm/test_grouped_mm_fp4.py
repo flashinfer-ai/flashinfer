@@ -21,10 +21,9 @@ class TestGroupedMmFp4:
     """Tests for grouped_mm_fp4 (NVFP4 grouped GEMM)."""
 
     MIN_COS_SIM = 0.9
-    # Expert segments that do not start on a multiple of 128 rows, the shape real
-    # routing produces. cuDNN reads token scales padded to 128 rows per group, so
-    # these exercise the re-layout in _segment_token_descale_per_group; before it,
-    # every segment that started mid-tile was silently wrong (or NaN).
+    # Segment lists in which some segments do not start on a multiple of 128 rows,
+    # as real routing produces. cuDNN reads token scales padded to 128 rows per group, so these
+    # exercise the re-layout in _segment_token_descale_per_group.
     UNALIGNED_SEGMENTS = [
         [64, 64],
         [120, 136],
@@ -198,7 +197,7 @@ class TestGroupedMmFp4:
     @requires_cudnn_moe_block_scale
     @pytest.mark.parametrize("seg_lens", UNALIGNED_SEGMENTS)
     def test_unaligned_segments(self, seg_lens):
-        """Segments starting off a 128-row boundary are as accurate as aligned ones."""
+        """Each non-empty segment, aligned or not, has cosine similarity above MIN_SEGMENT_COS_SIM."""
         torch.manual_seed(3)
         num_experts = len(seg_lens)
         cum_m = sum(seg_lens)
@@ -243,6 +242,38 @@ class TestGroupedMmFp4:
             assert cos_sim > self.MIN_SEGMENT_COS_SIM, (
                 f"segment {e} rows [{start}, {end}): cosine similarity {cos_sim:.4f}"
             )
+
+    @requires_cudnn_moe_block_scale
+    @pytest.mark.parametrize("starts", [[0], [0, 64]])
+    def test_rows_past_last_offset_belong_to_last_expert(self, starts):
+        """cuDNN runs the last expert to cum_m: ending m_indptr at 200 gives the output of ending it at cum_m."""
+        torch.manual_seed(4)
+        cum_m, k, n = 256, 512, 256
+        experts = len(starts)
+        a_bf16 = torch.randn(cum_m, k, dtype=torch.bfloat16, device="cuda")
+        b_bf16 = torch.randn(experts, n, k, dtype=torch.bfloat16, device="cuda")
+        a_fp4, a_sf, a_gsf = self._quantize_a(a_bf16)
+        b_fp4, b_sf, b_gsf = self._quantize_b(b_bf16)
+        alpha = torch.tensor(
+            [1.0 / (a_gsf * b_gsf)], dtype=torch.float32, device="cuda"
+        )
+
+        def run(last_end):
+            m_indptr = torch.tensor(
+                starts + [last_end], dtype=torch.int32, device="cuda"
+            )
+            return grouped_mm_fp4(
+                a_fp4,
+                b_fp4,
+                a_sf,
+                b_sf,
+                m_indptr,
+                alpha=alpha,
+                out_dtype=torch.bfloat16,
+                block_size=16,
+            )
+
+        assert torch.equal(run(200), run(cum_m))
 
     @requires_cudnn_moe_block_scale
     def test_single_expert(self):

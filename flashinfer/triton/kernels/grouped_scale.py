@@ -1,18 +1,5 @@
-"""
-Copyright (c) 2026 by FlashInfer team.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-  http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 
 import triton
 import triton.language as tl
@@ -31,10 +18,11 @@ def segment_scale_128x4_per_group_kernel(
 ):
     """One program writes one destination 128-row block for ``BLOCK_C`` column words.
 
-    In the F8_128x4 layout the four scales of row ``r`` in column group ``c`` are one
-    32-bit word at ``((r // 128) * C4 + c) * 128 + (r % 32) * 4 + (r // 32) % 4``. The
-    destination holds every group padded to whole 128-row blocks, groups in order;
-    rows past a group's end, and blocks past the last group, are zero.
+    In the F8_128x4 layout the four scales of row ``r`` in column group ``c`` form one
+    32-bit word. With ``num_col_words`` words per row, the word sits at
+    ``((r // 128) * num_col_words + c) * 128 + (r % 32) * 4 + (r // 32) % 4``.
+    The destination holds every group padded to whole 128-row blocks, groups in order.
+    Rows past a group's end, and blocks past the last group, are zero.
     """
     dst_block = tl.program_id(0)
     col_tile = tl.program_id(1)
@@ -56,8 +44,9 @@ def segment_scale_128x4_per_group_kernel(
     r = tl.arange(0, 128)
     c = col_tile * BLOCK_C + tl.arange(0, BLOCK_C)
     local = (dst_block - g_block_start) * 128 + r
-    row_ok = in_range & (local < g_rows)
-    s = tl.minimum(g_lo + local, src_rows - 1)
+    # local >= 0 and the clamp keep reads inside the source for a malformed m_indptr
+    row_ok = in_range & (local >= 0) & (local < g_rows)
+    s = tl.minimum(tl.maximum(g_lo + local, 0), src_rows - 1)
     src_word = ((s // 128)[:, None] * num_col_words + c[None, :]) * 128 + (
         (s % 32) * 4 + (s // 32) % 4
     )[:, None]

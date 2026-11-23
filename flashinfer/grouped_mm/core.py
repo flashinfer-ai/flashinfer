@@ -319,7 +319,8 @@ def _check_grouped_mm_mxfp8(
         raise ValueError(f"b must be 3D (num_experts, n, k), got {b.shape}")
     if a_descale.ndim != 2:
         raise ValueError(
-            f"a_descale must be 2D (cum_m, k // 32), got {a_descale.shape}"
+            "a_descale must be 2D (round_up(cum_m, 128), round_up(k // 32, 4)), "
+            f"got {a_descale.shape}"
         )
     if b_descale.ndim != 3:
         raise ValueError(
@@ -334,6 +335,8 @@ def _check_grouped_mm_mxfp8(
         )
     if a.shape[1] != b.shape[2]:
         raise ValueError(f"K mismatch: a has {a.shape[1]}, b has {b.shape[2]}")
+    if tactic < -1:
+        raise ValueError(f"tactic must be -1 or a plan index >= 0, got {tactic}")
     if out is not None:
         expected_shape = (a.shape[0], b.shape[1])
         if out.shape != expected_shape:
@@ -371,7 +374,8 @@ def grouped_mm_mxfp8(
         \text{out}[\text{start}:\text{end}] = a[\text{start}:\text{end}] \times b[e]^T
         \quad \text{for each expert } e
 
-    where ``start, end = m_indptr[e], m_indptr[e+1]``.
+    where ``start, end = m_indptr[e], m_indptr[e+1]``. With the cuDNN backend the
+    last expert's rows run to ``cum_m`` even when ``m_indptr[-1]`` is smaller.
 
     Parameters
     ----------
@@ -381,13 +385,14 @@ def grouped_mm_mxfp8(
         Expert weights, shape ``(batch_size, n, k)``, e4m3 or e5m2.
     a_descale : torch.Tensor
         Block scale tensor for A. Can be:
-        - 2D swizzled 128x4: shape (cum_m, k // 32)
+        - 2D swizzled 128x4: shape (round_up(cum_m, 128), round_up(k // 32, 4))
         dtype: uint8.
         The tensor is the 128x4 swizzle of all ``cum_m`` token rows as one
-        matrix (rows padded to a multiple of 128), e.g. the output of
-        ``nvfp4_quantize``/``mxfp8_quantize`` on ``a``. Expert segments in
-        ``m_indptr`` need not start on multiples of 128: the scales are
-        re-laid out internally into the per-expert padded order cuDNN reads.
+        matrix. ``mxfp8_quantize(a, is_sf_swizzled_layout=True)`` returns it
+        flat; pass it reshaped to two dimensions.
+        Expert segments in ``m_indptr`` need not start on multiples of 128.
+        The cuDNN backend re-lays out the scales internally into the
+        per-group padded order that cuDNN reads.
     b_descale : torch.Tensor
         Block scale tensor for B. Can be:
         - 3D swizzled 128x4: shape (batch_size, n, k // 32)
@@ -402,7 +407,10 @@ def grouped_mm_mxfp8(
         Backend selector.  Currently only ``"cudnn"`` is supported.
     tactic : int
         cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
-        plan; non-negative values select a specific plan.
+        plan; non-negative values select a specific plan. Some cuDNN engines are
+        known to give wrong results on some devices and cuDNN versions; they are
+        excluded (see ``FLASHINFER_CUDNN_EXCLUDE_BAD_ENGINES``). The indices number
+        the remaining plans contiguously.
 
     Returns
     -------
@@ -466,11 +474,12 @@ def _check_grouped_mm_fp4(
         raise ValueError(f"b must be 3D (num_experts, n, k), got {b.shape}")
     if a_descale.ndim != 2:
         raise ValueError(
-            f"a_descale must be 2D (cum_m, k // 32), got {a_descale.shape}"
+            "a_descale must be 2D (round_up(cum_m, 128), round_up(2 * k // block_size, 4)), "
+            f"got {a_descale.shape}"
         )
     if b_descale.ndim != 3:
         raise ValueError(
-            f"b_descale must be 3D (num_experts, n, k // 32), got {b_descale.shape}"
+            f"b_descale must be 3D (num_experts, n, 2 * k // block_size), got {b_descale.shape}"
         )
     if m_indptr.dtype != torch.int32:
         raise ValueError(f"m_indptr must be int32, got {m_indptr.dtype}")
@@ -486,6 +495,8 @@ def _check_grouped_mm_fp4(
             raise ValueError(f"alpha must be float32, got {alpha.dtype}")
         if alpha.shape != (1,):
             raise ValueError(f"alpha must be a scalar, got {alpha.shape}")
+    if tactic < -1:
+        raise ValueError(f"tactic must be -1 or a plan index >= 0, got {tactic}")
     if out is not None:
         expected_shape = (a.shape[0], b.shape[1])
         if out.shape != expected_shape:
@@ -541,7 +552,8 @@ def grouped_mm_fp4(
         \text{out}[\text{start}:\text{end}] = a[\text{start}:\text{end}] \times b[e]^T
         \quad \text{for each expert } e
 
-    where ``start, end = m_indptr[e], m_indptr[e+1]``.
+    where ``start, end = m_indptr[e], m_indptr[e+1]``. With the cuDNN backend the
+    last expert's rows run to ``cum_m`` even when ``m_indptr[-1]`` is smaller.
 
     Parameters
     ----------
@@ -551,16 +563,19 @@ def grouped_mm_fp4(
         Expert weights, shape ``(batch_size, n, k)``, fp4 e2m1fn_x2 or uint8.
     a_descale : torch.Tensor
         Block scale tensor for A. Can be:
-        - 2D swizzled 128x4: shape (cum_m, k // block_size)
+        - 2D swizzled 128x4: shape (round_up(cum_m, 128), round_up(2 * k // block_size, 4))
+        (``k`` is the packed width of ``a``, two FP4 values per byte)
         dtype: float8_e4m3fn or uint8.
         The tensor is the 128x4 swizzle of all ``cum_m`` token rows as one
-        matrix (rows padded to a multiple of 128), e.g. the output of
-        ``nvfp4_quantize``/``mxfp8_quantize`` on ``a``. Expert segments in
-        ``m_indptr`` need not start on multiples of 128: the scales are
-        re-laid out internally into the per-expert padded order cuDNN reads.
+        matrix. ``nvfp4_quantize`` returns it flat as uint8; for NVFP4
+        (``block_size=16``) pass it viewed as float8_e4m3fn and reshaped to two
+        dimensions, e.g. ``a_sf.view(torch.float8_e4m3fn).reshape(round_up(cum_m, 128), -1)``.
+        Expert segments in ``m_indptr`` need not start on multiples of 128.
+        The cuDNN backend re-lays out the scales internally into the
+        per-group padded order that cuDNN reads.
     b_descale : torch.Tensor
         Block scale tensor for B. Can be:
-        - 3D swizzled 128x4: shape (batch_size, n, k // block_size)
+        - 3D swizzled 128x4: shape (batch_size, n, 2 * k // block_size)
         dtype: float8_e4m3fn or uint8.
     m_indptr : torch.Tensor
         Cumulative token counts, shape ``(batch_size + 1,)``, ``int32``.
@@ -578,7 +593,10 @@ def grouped_mm_fp4(
         Backend selector.  Currently only ``"cudnn"`` is supported.
     tactic : int
         cuDNN execution-plan index.  ``-1`` (default) uses the heuristic-best
-        plan; non-negative values select a specific plan.
+        plan; non-negative values select a specific plan. Some cuDNN engines are
+        known to give wrong results on some devices and cuDNN versions; they are
+        excluded (see ``FLASHINFER_CUDNN_EXCLUDE_BAD_ENGINES``). The indices number
+        the remaining plans contiguously.
 
     Returns
     -------

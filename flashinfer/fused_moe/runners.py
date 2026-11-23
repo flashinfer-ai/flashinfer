@@ -24,6 +24,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 from __future__ import annotations
 
 import functools
+import os
 import warnings
 import weakref
 from collections import OrderedDict
@@ -10473,6 +10474,16 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
             int(cudnn.backend_version()),
         )
 
+    def _plan_list_key(self) -> tuple:
+        """Tactic cache-key fields that decide which plans the indices refer to.
+
+        They go into the tactic lookup key but not into the runner's ``__hash__``.
+        """
+        return ()
+
+    def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return super()._input_cache_key_extras(inputs) + self._plan_list_key()
+
 
 class CudnnGroupedGemmBf16Runner(_CudnnGroupedGemmRunnerBase):
     """BF16 MoE over ``grouped_mm_bf16``; no extra packed inputs."""
@@ -10643,6 +10654,15 @@ class _CudnnGroupedGemmBlockScaleRunnerBase(_CudnnGroupedGemmRunnerBase):
     _segment_alignment = _BLOCK_SCALE_TILE
     _block_size: ClassVar[int]
     _block_scale_dtype: ClassVar[torch.dtype]
+
+    def _plan_list_key(self) -> tuple:
+        # FLASHINFER_CUDNN_EXCLUDE_BAD_ENGINES decides which plans the tactic indices
+        # of the block-scale graphs cover. It goes in as "0", "1" or None: any other
+        # value acts as unset.
+        from ..grouped_mm.cudnn.core import _CUDNN_BAD_ENGINES_ENV
+
+        override = os.environ.get(_CUDNN_BAD_ENGINES_ENV, "").strip()
+        return (override if override in ("0", "1") else None,)
 
     @property
     def _hidden_states_scale_input(self) -> int:
@@ -11013,7 +11033,12 @@ class _GroupedGemmStageRunner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        return (*self.parent._cache_key_extras(), "stage", self.stage)
+        return (
+            *self.parent._cache_key_extras(),
+            *self.parent._plan_list_key(),
+            "stage",
+            self.stage,
+        )
 
     def __hash__(self) -> int:
         return hash((hash(self.parent), "stage", self.stage))
