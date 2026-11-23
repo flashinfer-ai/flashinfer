@@ -35,6 +35,9 @@ from ...gemm.batch_invariant.spec import MXFP4_FMTS, NVFP4_FMTS
 from . import spec as S
 from .api import interleave_fc1, permute_plan, route  # noqa: F401  (route re-exported for the class's callers)
 from .blocks.epilogue import MXFP4_GEMM2_CHAIN, GroupedChain, Mxfp4Chain, W4A4Chain
+
+#: The block-scaled chain blocks: the pair's GEMM1 / GEMM2 chains (``.at(in_fmt)`` places them on an instruction class).
+Fp4Chain = Union[W4A4Chain, Mxfp4Chain]
 from .schedule import launch_tile_bound
 from .spec_mxfp4 import CLASS as MX_CLASS
 from .spec_mxfp4 import MX_BLOCK, expert_classes_mx
@@ -409,7 +412,7 @@ class MoEWeightsFp4:
         return self.intermediate == "static"
 
     @property
-    def chain1(self) -> GroupedChain:
+    def chain1(self) -> Fp4Chain:
         """The GEMM1 chain of the class: the gated ``act`` on the (gate, up) pair or the ungated ``act`` on the accumulator,
         with the parameters; bf16 output, or the fused block quantization (``nvfp4``) of the static class."""
         kind = "glu" if self.gated else "act"
@@ -420,7 +423,7 @@ class MoEWeightsFp4:
         )
 
     @property
-    def chain2(self) -> GroupedChain:
+    def chain2(self) -> Fp4Chain:
         """The GEMM2 chain: NVFP4 ``cvt_bf16(mul(acc, mul(alpha2[e], pts2)))`` (the static class's with ``inv2[e]``), MXFP4
         ``cvt_bf16(acc)``."""
         if not self.pair.scaled:
@@ -530,7 +533,7 @@ def grouped_gemm_fp4(
     w_sf: torch.Tensor,
     counts: torch.Tensor,
     config: Knobs,
-    chain: GroupedChain,
+    chain: Fp4Chain,
     in_fmt: str,
     *,
     pts: Optional[torch.Tensor] = None,
