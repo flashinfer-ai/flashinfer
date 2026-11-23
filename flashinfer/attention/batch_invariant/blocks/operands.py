@@ -126,6 +126,8 @@ REGS_SOFTMAX, REGS_OTHER = 192, 32
 # every prefill shape on SM107 (the paired placement keeps 192 / 96: its budget is full)
 REGS_1WG_DIMS = (64,)
 REGS_SOFTMAX_1WG, REGS_CORRECTION_1WG = 200, 96
+REGS_Q2_DIMS = (128,)
+REGS_Q2_128 = (184, 80, 64)
 
 
 class Roles:
@@ -153,6 +155,11 @@ class Roles:
         self.regs_other = REGS_OTHER
         if two_slices:
             self.regs_correction = REGS_CORRECTION_W2
+        elif q2 and D in REGS_Q2_DIMS:
+            # the paired placement at D = 128: the MMA / load warpgroup at 64 so the MMA warp's two Q tiles' descriptors and pipeline
+            # state stay in registers (its spills miss L1 next to the 300 KB smem plan and sit on every tile's chain), the correction
+            # at 80 with 8-column pieces, the softmax at 184 with the streamed exponential form (StaticPlan.streamed)
+            self.regs_softmax, self.regs_correction, self.regs_other = REGS_Q2_128
         elif q2:
             self.regs_correction = 96
         elif D in REGS_1WG_DIMS:
@@ -186,11 +193,16 @@ class StaticPlan:
         ragged: bool = False,
         hw_rowmax: bool = False,
         cap: int = 0,
+        *,
+        causal: bool = True,
     ):
         """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
         have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
         self.hw_rowmax = hw_rowmax
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
+        # the mask mode (a class dimension): causal rows see [0, p], or [max(0, p - window_left), p] with a window (window_left >= 0),
+        # non-causal rows see every key of the request, [0, kv_len). A compile-time constant: the softmax masks and the fold's present chunks read it, the causal code is unchanged
+        self.causal = causal
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
         # the SM; the MMA warp issues both tiles' folds off one K / V stream; the correction warpgroup steps both tiles' statistics, A then B
@@ -248,6 +260,9 @@ class StaticPlan:
         # tile whenever one warpgroup worked alone; at D = 128 its P exchange and four-slice stats payload would also not leave room for
         # the third ring slot next to the two Q tiles and the smem O_m
         self.rep_ok = g <= REP_ROWS and not q2
+        # the softmax's exponential form: streamed (the P words take the scores' registers) for the one-warpgroup body and the paired
+        # placement at D = 128, where the register split needs the smaller live set; packed for the paired placement at D = 64
+        self.streamed = not q2 or D in (128,)
         self.tokens_rep = REP_ROWS // g if self.rep_ok else 1
         self.rep_rows = self.tokens_rep * g if self.rep_ok else 0
         self.n_slices = (

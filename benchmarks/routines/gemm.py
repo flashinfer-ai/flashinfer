@@ -53,6 +53,8 @@ def run_gemm_test(args):
         return testMmMxfp8(args)
     elif args.routine == "mm_bf16":
         return testMmBf16(args)
+    elif args.routine == "mm_tf32":
+        return testMmTf32(args)
     elif args.routine == "bmm_bf16":
         return testBmmBf16(args)
     elif args.routine == "tinygemm_bf16":
@@ -188,7 +190,7 @@ def parse_gemm_args(line, parser):
         action="store_true",
         default=False,
         help=(
-            "Enable autotuner warmup for supported routines (mm_fp4, bmm_fp8, mm_fp8, bmm_mxfp8, mm_mxfp8, mm_bf16, bmm_bf16; "
+            "Enable autotuner warmup for supported routines (mm_fp4, bmm_fp8, mm_fp8, bmm_mxfp8, mm_mxfp8, mm_bf16, mm_tf32, bmm_bf16; "
             "the batch_invariant backend of those and of gemm_fp8_nt_groupwise, which profiles the class's top configurations)."
         ),
     )
@@ -224,6 +226,9 @@ def parse_gemm_args(line, parser):
     if args.routine == "mm_fp8":
         if not has_backends_arg:
             args.backends = ["trtllm_low_latency"]
+    if args.routine == "mm_tf32":
+        if not has_backends_arg:
+            args.backends = ["cute-dsl"]
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
     return args
@@ -2546,6 +2551,156 @@ def testMmBf16(args):
                 cur_res["out_dtype"] = str(out_dtype)
                 cur_res["backend"] = backend_name
                 cur_res["bias"] = use_bias
+                cur_res["enable_pdl"] = use_pdl
+                cur_res["case_tag"] = args.case_tag
+                res.append(cur_res)
+    return res
+
+
+def testMmTf32(args):
+    """
+    Test mm_tf32 API (fp32 inputs and output, TF32 MMAs).
+
+    This test:
+    1. Generates random FP32 input tensors
+    2. Runs mm_tf32 with specified backend
+    3. Runs reference check (torch.mm in FP64)
+    4. Measures performance metrics (TFLOPS, TB/sec)
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    # The cuBLAS backend follows the process TF32 setting; restore the caller's.
+    saved_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        return _run_mm_tf32(args)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = saved_allow_tf32
+
+
+def _run_mm_tf32(args):
+    if args.verbose >= 1:
+        print("[INFO] Running testMmTf32")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    backends = args.backends
+    m, n, k = args.m, args.n, args.k
+    use_pdl = getattr(args, "enable_pdl", False)
+    is_cuda_graph_compatible = not args.no_cuda_graph
+    run_refcheck = args.refcheck
+    autotune_supported_backends = ["cute-dsl", "cublas", "auto"]
+    res = []
+
+    # a: (m, k) row-major; b: (n, k) transposed to a (k, n) column-major view.
+    a = torch.randn([m, k], device=device, dtype=torch.float32)
+    b = torch.randn([n, k], device=device, dtype=torch.float32).transpose(-2, -1)
+
+    def run_backend(backend, a, b, use_pdl):
+        return flashinfer.mm_tf32(a, b, pdl=use_pdl, backend=backend)
+
+    backends_to_remove = []
+    for backend in backends:
+        if (
+            getattr(args, "autotune", False)
+            and backend not in autotune_supported_backends
+        ):
+            print(f"[INFO] {backend} backend does not support autotune")
+            backends_to_remove.append(backend)
+            continue
+        try:
+            run_backend(backend, a, b, use_pdl)
+        except Exception as e:
+            print(
+                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+            )
+            backends_to_remove.append(backend)
+    for backend in backends_to_remove:
+        backends.remove(backend)
+    if len(backends) == 0:
+        print("[ERROR] No backends passed validation. Exiting.")
+        return res
+
+    cache_path = getattr(args, "autotune_cache", None)
+    if getattr(args, "autotune", False):
+        warmup_iters = (
+            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
+        )
+        for cur_backend in backends:
+            if args.verbose >= 1:
+                print(f"[INFO] Autotune warmup for mm_tf32: {warmup_iters} iters")
+            with autotune(True, cache=cache_path):
+                for _ in range(warmup_iters):
+                    run_backend(cur_backend, a, b, use_pdl)
+    elif cache_path:
+        with autotune(False, cache=cache_path):
+            pass
+
+    backend_times = {backend: [] for backend in backends}
+    outputs = {}
+    for cur_backend in backends:
+        if run_refcheck:
+            outputs[cur_backend] = run_backend(cur_backend, a, b, use_pdl).detach()
+        backend_times[cur_backend] = bench_gpu_time(
+            fn=run_backend,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=True,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=is_cuda_graph_compatible,
+            cold_l2_cache=True,
+            input_args=(cur_backend, a, b, use_pdl),
+        )
+
+    if run_refcheck:
+        reference_output = torch.mm(a.double(), b.double())
+        for backend, output in outputs.items():
+            cos_sim = F.cosine_similarity(
+                reference_output.reshape(-1), output.double().reshape(-1), dim=0
+            )
+            if torch.isnan(cos_sim) or cos_sim < 0.99:
+                print(
+                    f"[ERROR] Output tensor mismatch from backend {backend} with cos_sim={cos_sim}"
+                )
+                if not args.allow_output_mismatch:
+                    raise AssertionError(
+                        f"[ERROR] Backend {backend} output mismatch with cos_sim={cos_sim}"
+                    )
+
+    for backend in backends:
+        backend_name = backend + (
+            "_autotune" if getattr(args, "autotune", False) else ""
+        )
+        if len(backend_times[backend]) > 0:
+            median_time = np.median(backend_times[backend])
+            std_time = np.std(backend_times[backend])
+            problem_flops = 2 * m * n * k
+            problem_bytes = (m * k + k * n + m * n) * torch.float32.itemsize
+            tflops = problem_flops / (10**9 * median_time)  # in TFLOPs/sec
+            tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
+            print_perf_metrics(backend_name, median_time, std_time, tflops, tb_per_sec)
+
+            if args.output_path is not None:
+                cur_res = defaultdict(str)
+                cur_res["routine"] = args.routine
+                cur_res["median_time"] = median_time
+                cur_res["std_time"] = std_time
+                cur_res["tflops"] = tflops
+                cur_res["tb_per_sec"] = tb_per_sec
+                cur_res["m"] = m
+                cur_res["n"] = n
+                cur_res["k"] = k
+                cur_res["out_dtype"] = str(torch.float32)
+                cur_res["backend"] = backend_name
                 cur_res["enable_pdl"] = use_pdl
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)

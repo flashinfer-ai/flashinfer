@@ -28,12 +28,10 @@ def test_paged_window_retained_capture(
     dtype, backend, return_lse, dim, window, page, causal
 ):
     """Inclusive windows survive replanning, retained replay and scale fallback."""
-    from packaging.version import Version
 
     cudnn = cudnn_prefill.cudnn
     if (
         cudnn.backend_version() < 92400
-        or Version(cudnn.__version__) < Version("1.33.0")
         or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
         or not cudnn_prefill.cudnn_frontend_frost_runtime_available()
     ):

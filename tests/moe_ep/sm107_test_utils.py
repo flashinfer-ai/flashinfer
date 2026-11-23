@@ -12,7 +12,7 @@ from threading import Event
 import torch
 
 from flashinfer.moe_ep import PrequantizedMoEWeights
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
     quantize_mxfp4_block32,
     quantize_mxfp8_block32,
     quantize_nvfp4_block16,

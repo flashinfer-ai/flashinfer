@@ -6,27 +6,17 @@ import torch
 
 from flashinfer import moe_ep
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
 KINDS = ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4", "mxfp4_mxfp8")
 
 
-@pytest.mark.parametrize(
-    "kind,selector",
-    [
-        (kind, selector)
-        for kind in KINDS
-        for selector in ("legacy", "next")
-        if kind != "nvfp4" or selector == "next"
-    ],
-)
+@pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize(
     "finalize_mode", [moe_ep.FinalizeMode.AUTO, moe_ep.FinalizeMode.DEFAULT]
 )
 @pytest.mark.parametrize("with_live_count", [False, True])
-def test_genphase_finalize_live_count_admission(
-    kind, selector, finalize_mode, with_live_count
-):
+def test_genphase_finalize_live_count_admission(kind, finalize_mode, with_live_count):
     """AUTO must not silently discard a requested persistent live-token count."""
     count = torch.zeros(1, dtype=torch.int32) if with_live_count else None
     options = dict(
@@ -38,13 +28,12 @@ def test_genphase_finalize_live_count_admission(
     )
     if kind == "nvfp4":
         config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next", **options
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl", **options
         )
     else:
         config = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             kind=kind,
-            kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl"
-            + ("_next" if selector == "next" else ""),
+            kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl",
             **options,
         )
     if finalize_mode is moe_ep.FinalizeMode.AUTO and with_live_count:
@@ -52,8 +41,7 @@ def test_genphase_finalize_live_count_admission(
             create_mega_kernel(config)
     else:
         backend = create_mega_kernel(config)
-        if selector == "next":
-            assert backend._finalize_mode(None) is moe_ep.FinalizeMode.DEFAULT
+        assert backend._finalize_mode(None) is moe_ep.FinalizeMode.DEFAULT
 
 
 def _config(kind, **kwargs):
@@ -74,9 +62,7 @@ def _config(kind, **kwargs):
 @pytest.mark.parametrize("kind", KINDS)
 def test_genphase_dtype_geometries_and_workspace_plan(kind, monkeypatch):
     """Every tuning geometry must build a native 512-column Blackwell plan."""
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
-        block_scaled,
-    )
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import block_scaled
 
     monkeypatch.setattr(
         block_scaled, "_max_active_clusters", lambda cluster: 148 // cluster
@@ -99,22 +85,18 @@ def test_genphase_dtype_geometries_and_workspace_plan(kind, monkeypatch):
 
 
 @pytest.mark.parametrize("kind", KINDS)
-@pytest.mark.parametrize("selector", ["legacy", "next"])
-def test_genphase_backend_dtype_selection(kind, selector, monkeypatch):
+def test_genphase_backend_dtype_selection(kind, monkeypatch):
     """Public configs retain the requested dtype throughout workspace selection."""
-    if selector == "legacy" and kind == "nvfp4":
-        pytest.skip("NVFP4 GenPhase uses the next selector")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     options = dict(intermediate_size=256, top_k=3, kernel_variant="genphase")
     if kind == "nvfp4":
         config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next", **options
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl", **options
         )
     else:
         config = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             kind=kind,
-            kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl"
-            + ("_next" if selector == "next" else ""),
+            kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl",
             **options,
         )
     backend = create_mega_kernel(config)
@@ -128,8 +110,48 @@ def test_genphase_backend_dtype_selection(kind, selector, monkeypatch):
     assert cfg.quant_kind == kind
     assert cfg.fc2_use_bulk
     assert not cfg.reduce_topk_in_kernel
-    if selector == "next":
-        assert backend._workspace_config(fleet) == cfg
+    assert backend._workspace_config(fleet) == cfg
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_genphase_validation_before_bootstrap_and_rank_agreement(kind, monkeypatch):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100 import standard_cutedsl
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(standard_cutedsl, "validate_mega_arch", lambda: None)
+    options = dict(intermediate_size=256, top_k=3, kernel_variant="genphase")
+    if kind == "nvfp4":
+        config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**options)
+    else:
+        config = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            kind=kind, **options
+        )
+    backend = create_mega_kernel(config)
+    bootstrap = moe_ep.BootstrapConfig(world_size=2, rank=0, auto_bootstrap=False)
+    fleet = moe_ep.FleetParams(8, 129, 384)
+    calls = []
+
+    def gather(proposals, proposal, *, group):
+        calls.append(group)
+        proposals[:] = [proposal.copy() for _ in proposals]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    backend.validate_init(bootstrap, fleet)
+    assert calls == []
+
+    group = object()
+    backend._ep_comm_group = group
+    backend.validate_init(bootstrap, fleet)
+    assert calls == [group]
+
+    def disagree(proposals, proposal, *, group):
+        gather(proposals, proposal, group=group)
+        proposals[1]["hidden"] += 64
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", disagree)
+    with pytest.raises(moe_ep.MoEEpConfigError, match="differs across EP ranks"):
+        backend.validate_init(bootstrap, fleet)
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -170,7 +192,7 @@ def test_genphase_prequantized_weight_layout(kind):
     )
     kernel_config = (
         moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next", **options
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl", **options
         )
         if kind == "nvfp4"
         else moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind=kind, **options)
@@ -248,7 +270,7 @@ def test_genphase_layer_input_formats(kind, early, quantize_input, monkeypatch):
     )
     if kind == "nvfp4":
         kernel_config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next", **options
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl", **options
         )
     else:
         kernel_config = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(

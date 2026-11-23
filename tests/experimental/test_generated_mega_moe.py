@@ -1,5 +1,6 @@
 """Public packed-input MoE behavior, metadata and replay tests on SM100a and SM103a."""
 
+import ctypes
 import importlib.util
 from pathlib import Path
 
@@ -233,6 +234,17 @@ def check_single_kernel_graph(names):
     assert len(names) == 1, names
 
 
+class _EdgeData(ctypes.Structure):
+    """``CUgraphEdgeData`` of ``cuda.h``."""
+
+    _fields_ = (
+        ("from_port", ctypes.c_uint8),
+        ("to_port", ctypes.c_uint8),
+        ("type", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 5),
+    )
+
+
 def graph_edges(graph):
     """``(from, to, dependency type)`` of every edge of ``graph`` (kept, not
     yet instantiated) between kernel nodes, the ends named as in
@@ -240,30 +252,43 @@ def graph_edges(graph):
     name: a launch captured with the programmatic stream serialization
     attribute records a ``CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC`` edge from
     the kernel node before it on the stream; a plain launch records the
-    default full dependency."""
+    default full dependency.
+
+    The edges are read with ``cuGraphGetEdges_v2`` of the driver library
+    itself: cuda-bindings 13.0 to 13.2 return the edge data of
+    ``cuGraphGetEdges`` from a buffer they have already freed (cuda-python
+    issue #1804), so the types they report are whatever that memory holds."""
     driver = pytest.importorskip("cuda.bindings.driver")
-    raw = driver.CUgraph(graph.raw_cuda_graph())
-    # The edge-data form of the query: suffixed in cuda-bindings 12, the plain
-    # name in 13.
-    get_edges = getattr(driver, "cuGraphGetEdges_v2", None) or driver.cuGraphGetEdges
-    *_, count = checked(get_edges(raw, 0))
-    edges = checked(get_edges(raw, count))
-    assert len(edges) == 4, f"{get_edges.__name__} exposes no edge data: {edges!r}"
-    sources, targets, data, count = edges
+    get_edges = ctypes.CDLL("libcuda.so.1").cuGraphGetEdges_v2
+    get_edges.restype = ctypes.c_int
+    get_edges.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(_EdgeData),
+        ctypes.POINTER(ctypes.c_size_t),
+    )
+    raw = graph.raw_cuda_graph()
+    count = ctypes.c_size_t(0)
+    assert get_edges(raw, None, None, None, ctypes.byref(count)) == 0
+    total = count.value
+    sources = (ctypes.c_void_p * total)()
+    targets = (ctypes.c_void_p * total)()
+    data = (_EdgeData * total)()
+    assert get_edges(raw, sources, targets, data, ctypes.byref(count)) == 0
+    assert count.value == total, (count.value, total)
 
     def kernel_name(node):
-        params = checked(driver.cuGraphKernelNodeGetParams(node))
+        params = checked(driver.cuGraphKernelNodeGetParams(driver.CUgraphNode(node)))
         return checked(driver.cuFuncGetName(params.func)).decode()
 
     return [
         (
-            kernel_name(source),
-            kernel_name(target),
-            driver.CUgraphDependencyType(edge.type).name,
+            kernel_name(sources[i]),
+            kernel_name(targets[i]),
+            driver.CUgraphDependencyType(data[i].type).name,
         )
-        for source, target, edge in zip(
-            sources[:count], targets[:count], data[:count], strict=True
-        )
+        for i in range(total)
     ]
 
 

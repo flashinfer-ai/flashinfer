@@ -417,8 +417,20 @@ class MoEEpMegaLayer(nn.Module):
         _, backend_workspace, kernel = self._resolve_workspace(None)
         return kernel.workspace_output(backend_workspace)
 
-    def _get_transformed_weights(self) -> Any:
-        """Return this layer's one-time backend weight transformation."""
+    def get_transformed_weights(self) -> Any:
+        """Return writable aliases of the prepared tensors used by execution.
+
+        The structure and tensor layouts are backend-specific, matching
+        ``MegaConfig.transformed_weights``. No tensors are copied. Callers
+        implementing expert migration must move every per-expert tensor and
+        any separately supplied per-expert normalization state together.
+
+        In-place updates preserve CUDA graph bindings. Finish previous reads
+        and weight transfers before publishing routing for the new placement;
+        keep tensor addresses, physical slot capacity, and EP membership fixed.
+        """
+        if self._destroyed:
+            raise MoEEpConfigError("MegaMoE layer has been destroyed")
         if self._transformed is None:
             if not self._mega_config.preprocess_weights:
                 raise MoEEpConfigError(
@@ -669,7 +681,7 @@ class MoEEpMegaLayer(nn.Module):
             assert validation_key is not None
             self._forward_signatures[validation_key] = signature
 
-        transformed_weights = self._get_transformed_weights()
+        transformed_weights = self.get_transformed_weights()
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             kernel.validate_capture_ready(
                 backend_workspace,

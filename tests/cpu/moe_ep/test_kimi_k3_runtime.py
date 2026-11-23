@@ -20,7 +20,7 @@ def runtime(monkeypatch):
     pytest.importorskip("cuda.bindings.driver")
     if not all(hasattr(torch, name) for name in ("float4_e2m1fn_x2", "float8_e8m0fnu")):
         pytest.skip("Kimi runtime requires FP4 and E8M0 Torch dtypes")
-    from flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.shim import runtime
+    from flashinfer.moe_ep.shims.sm100.kimi_k3 import runtime
 
     monkeypatch.setattr(runtime, "_launch_counts", lambda *a: (32, 32, 0))
     return runtime

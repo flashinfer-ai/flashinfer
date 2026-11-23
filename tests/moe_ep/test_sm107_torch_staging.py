@@ -9,7 +9,7 @@ from flashinfer.moe_ep import FleetParams
 from flashinfer.moe_ep.backends.mega.kernel.sm107.validation import (
     validate_forward_metadata,
 )
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
     Sm107BlockScaledMoeConfig,
     compute_megamoe_reference_sm107_block_scaled,
     interleave_gate_up_16,
@@ -17,12 +17,8 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
     quantize_mxfp8_block32,
     quantize_nvfp4_block16,
 )
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.correctness import (
-    sampled_reference,
-)
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
-    AutoTuningState,
-)
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.correctness import sampled_reference
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_state import AutoTuningState
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required; any supported Torch GPU"
@@ -127,7 +123,7 @@ def test_prequantized_metadata_rejects_wrong_encoding_and_oversized_scales(kind)
 
 
 def test_fp4_pack_unpack_graph_replay():
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         pack_f32_to_fp4,
         unpack_fp4_to_f32,
     )
@@ -156,9 +152,7 @@ def test_fp4_pack_unpack_graph_replay():
 
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
 def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        Sm107BlockScaledSymmBuffer,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import Sm107BlockScaledSymmBuffer
 
     cfg = Sm107BlockScaledMoeConfig(
         num_total_experts=4,

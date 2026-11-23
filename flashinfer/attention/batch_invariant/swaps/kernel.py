@@ -30,11 +30,12 @@ from ..plan import (
     F_GROUP,
     F_KVHEAD,
     F_KVLEN,
+    F_KVPTR0,
     F_MODE,
+    F_NPAGES,
     F_QBASE,
     F_QLEN,
     F_QTOK0,
-    F_REQ,
     F_ROWS,
     F_SLOT,
     F_TILE_HI,
@@ -74,10 +75,13 @@ class SwapsKernel:
         ragged: bool = False,
         cap: int = 0,
         pdl: bool = False,
+        *,
+        causal: bool = True,
     ):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
         self.cap = cap  # the shared-memory capacity the ring is sized for (0: the current device's)
         self.pdl = pdl  # launched as a programmatic dependent: the load warp waits for the preceding grid before its first TMA
+        self.causal = causal  # the mask mode (a class dimension; compile-time)
 
     @cute.jit
     def __call__(
@@ -90,7 +94,6 @@ class SwapsKernel:
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
         mDesc: cute.Tensor,
-        mKvIndptr: cute.Tensor,
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
@@ -99,7 +102,15 @@ class SwapsKernel:
         grid: Int32,
         stream: cuda.CUstream,
     ):
-        st = SwapsPlan(self.D, self.g, self.page, self.n_pad, self.ragged, self.cap)
+        st = SwapsPlan(
+            self.D,
+            self.g,
+            self.page,
+            self.n_pad,
+            self.ragged,
+            self.cap,
+            causal=self.causal,
+        )
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
 
@@ -124,7 +135,6 @@ class SwapsKernel:
             mGroups,
             mCounters,
             mDesc,
-            mKvIndptr,
             mKvIndices,
             c,
             nc,
@@ -161,7 +171,6 @@ class SwapsKernel:
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
         mDesc: cute.Tensor,
-        mKvIndptr: cute.Tensor,
         mKvIndices: cute.Tensor,
         c: Float32,
         nc: Float32,
@@ -328,13 +337,15 @@ class SwapsKernel:
                     sKV_view,
                     q_prod,
                     kv_prod,
-                    mKvIndptr,
                     mKvIndices,
-                    mDesc[(u, F_REQ)],
+                    mDesc[(u, F_KVPTR0)],
+                    mDesc[(u, F_NPAGES)],
                     mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
                     mDesc[(u, F_KVHEAD)],
                     mDesc[(u, F_TILE_LO)],
                     mDesc[(u, F_TILE_HI)],
+                    storage.kv_mbar.data_ptr(),
+                    u == bidx,
                 )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:

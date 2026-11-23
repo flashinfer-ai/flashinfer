@@ -144,6 +144,7 @@ from .jit.gemm import (
     gen_gemm_sm120_module,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_mm_bf16_cublaslt_module,
+    gen_mm_mxfp8_smallm_sm107_module,
     gen_gemm_sm120_module_cutlass_mxfp8,
     gen_tgv_gemm_sm10x_module,
     gen_trtllm_gen_gemm_module,
@@ -224,6 +225,7 @@ from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.gdn_batch_invariant import gen_gdn_batch_invariant_module
 from .jit.kda_batch_invariant import gen_kda_batch_invariant_module
 from .jit.sampling import gen_sampling_module
+from .jit.top_p_renorm_specialized import gen_top_p_renorm_specialized_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
@@ -1051,6 +1053,11 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_gen_routing_module())
+        if has_sm107a_exact:
+            # Small-M MXFP8 "specialized" GEMM backend: sm_107a-exact (fused
+            # scaled cvt + DSMEM cluster reductions), so it ships pre-built
+            # only for exact-SM107a wheels; other targets JIT it on demand.
+            jit_specs.append(gen_mm_mxfp8_smallm_sm107_module())
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
             # fp4_gemm_cutlass also targets SM110 and must ship in its provider
@@ -1064,7 +1071,7 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm120_module())
             # Imported here: the package import initializes flashinfer.moe_ep (every
             # MegaMoE backend), which builds without SM120 do not need.
-            from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+            from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import (
                 cake_sm120_megamoe_available,
                 gen_cake_sm120_megamoe_aot_modules,
             )
@@ -1188,6 +1195,10 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        # Specialized cluster top-p renorm (top_p_renorm_probs on compute capability 10.3):
+        # one module, built for the exact sm_103a target only.
+        if has_sm103a_exact:
+            jit_specs.append(gen_top_p_renorm_specialized_module())
         if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
         if has_sm100 or has_sm103 or has_sm107:

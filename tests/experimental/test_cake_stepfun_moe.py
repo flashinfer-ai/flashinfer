@@ -60,6 +60,7 @@ import torch
 
 from tests.experimental.test_helpers import cake_stepfun_moe_reference as ref
 from tests.cake.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 pkg = cake_package("cake_stepfun_moe")
 cb = cake_package("cake_stepfun_moe", "cake_backend")
@@ -232,27 +233,6 @@ def _plan_kernels(launch) -> list[str]:
     if launch.finalize_program is not None:
         programs.append(launch.finalize_program)
     return [loader.PROGRAMS[program]["kernel"] for program in programs]
-
-
-def _profiled_kernel_names(fn) -> list[str]:
-    """CUDA kernel names of one call of ``fn`` (memcpy / memset activities excluded).  The profiler's
-    warm-up step runs one call whose records are discarded: CUDA activity collection starts
-    asynchronously once the profiler is entered."""
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
-    ) as profile:
-        fn()
-        _sync()
-        profile.step()
-        fn()
-        _sync()
-    return [
-        event.name
-        for event in profile.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-        and not event.name.startswith(("Memcpy", "Memset"))
-    ]
 
 
 def _capture(launch, outputs):
@@ -1400,7 +1380,7 @@ def test_whole_graph_launches_only_cake_kernels(precision, num_tokens, weights_c
     launch = _prepare_graph(case, logits)
     launch.launch()
     _sync()
-    names = _profiled_kernel_names(launch.launch)
+    names = cuda_kernel_names(launch.launch)
     assert names, "the profiler captured no kernel"
     offenders = [name for name in names if CAKE_KERNEL_SYMBOL.search(name) is None]
     assert not offenders, (
