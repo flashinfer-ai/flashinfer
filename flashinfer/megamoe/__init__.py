@@ -698,6 +698,11 @@ def mxfp4_mega_moe(
     l1_weights, l2_weights : torch.Tensor
         Weights from :func:`transform_mxfp4_weights_for_mega_moe`. Both tensors
         must use the same canonical MXFP4, compact MXFP4 or predecoded FP8 storage.
+        Nonzero groups require raw E8M0 scale bytes in [122, 133]; see
+        :mod:`flashinfer.megamoe.weights` for scale preparation and storage layouts.
+        Canonical storage requires hidden >= 2 * intermediate and intermediate
+        <= 8192. Compact/FP8 storage requires H20, EP8 or EP16,
+        E256/H4096/I2048/top6 and an explicitly supported token-count plan.
     symm_buffer : MegaMoESymmBuffer
         Buffer populated by :meth:`MegaMoESymmBuffer.stage` on every rank.
     num_tokens : int, optional

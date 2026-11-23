@@ -608,3 +608,28 @@ def test_compact_prefill_rejected_before_kernel_dispatch(monkeypatch, ep, tokens
     )
     with pytest.raises(ValueError, match="8448-byte records"):
         megamoe.mxfp4_mega_moe(y, w1, w2, buffer)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "hidden,intermediate,message",
+    [
+        (4096, 2176, r"hidden >= 2 \* intermediate_hidden"),
+        (16640, 8320, "intermediate_hidden <= 8192"),
+    ],
+)
+def test_mxfp4_canonical_rejects_scheduler_shape_limits(hidden, intermediate, message):
+    with pytest.raises(ValueError, match=message):
+        select_mxfp4_fused_plan(78, 16, 256, 6, hidden, intermediate, 2, 1)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("hidden,intermediate,topk", [(512, 256, 32), (16384, 8192, 6)])
+def test_mxfp4_canonical_scheduler_boundaries_reach_jit(hidden, intermediate, topk):
+    plan = select_mxfp4_fused_plan(78, 16, 256, topk, hidden, intermediate, 2, 1)
+    assert plan.use_interleaved_scheduler and plan.block_n == 256
+    uri = get_megamoe_sm90_mxfp4_uri(
+        plan, 78, 16, 2, 256, topk, hidden, intermediate, 10.0, True, num_nodes=2
+    )
+    assert f"_k{topk}_h{hidden}_i{intermediate}_cap2_" in uri
+    assert uri.endswith("_wt8704_nodes2")

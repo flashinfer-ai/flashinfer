@@ -211,6 +211,8 @@ def select_mxfp4_fused_plan(
     ``num_logical_experts`` is the routed expert count when ``num_experts``
     also counts redundant expert slots: the token block is sized by the rows
     a routed expert receives, which the slots split but do not add to.
+    Canonical plans require hidden >= 2 * intermediate_hidden and
+    intermediate_hidden <= 8192.
     Noncanonical weight storage uses explicit H20 small-batch plans and never
     falls through to a kernel expecting a different record format.
     """
@@ -241,6 +243,14 @@ def select_mxfp4_fused_plan(
 
     if weight_tile_bytes not in (8704, 8448, 16384):
         raise ValueError("MXFP4 weight records must contain 8704, 8448 or 16384 bytes")
+
+    if weight_tile_bytes == 8704:
+        if hidden < 2 * intermediate_hidden:
+            raise ValueError(
+                "canonical MXFP4 requires hidden >= 2 * intermediate_hidden"
+            )
+        if intermediate_hidden > 8192:
+            raise ValueError("canonical MXFP4 requires intermediate_hidden <= 8192")
 
     def max_tokens(bm):
         return bm * num_logical_experts // (num_ranks * num_topk)

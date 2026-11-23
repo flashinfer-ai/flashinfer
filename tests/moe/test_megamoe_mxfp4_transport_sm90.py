@@ -515,6 +515,19 @@ def test_mxfp4_two_virtual_nodes():
     _run(_namespace(8, nodes=2, nodes_only=True))
 
 
+def test_mxfp4_two_virtual_nodes_topk32():
+    """Exercise all 32 route-mask bits through eager and captured calls."""
+    if torch.cuda.device_count() < 8:
+        pytest.skip("needs 8 GPUs")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 only")
+    _run(
+        _namespace(
+            8, topk=32, slots=0, capacity=4, tokens=[1, 4], nodes=2, nodes_only=True
+        )
+    )
+
+
 @pytest.mark.parametrize("hidden,intermediate", [(256, 128), (768, 256)])
 def test_mxfp4_two_virtual_nodes_sf_tail(hidden, intermediate):
     """Copy nonuniform scale rows through odd remote packed slots without padding."""

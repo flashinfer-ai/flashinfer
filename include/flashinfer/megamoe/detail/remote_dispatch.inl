@@ -27,7 +27,7 @@
 const auto remote_pack_tokens = [&](const uint32_t& first_token, const uint32_t& token_step) {
   if constexpr (kNumRemoteNodes > 0) {
     constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
-    constexpr uint32_t kTokenMask = (1u << kNumTopk) - 1;
+    constexpr uint32_t kTokenMask = 0xffffffffu >> (32 - kNumTopk);
     for (uint32_t i = first_token; i < num_tokens; i += token_step) {
       int expert_idx = -1;
       const uint32_t token_in_warp = lane_idx / kNumTopk;
