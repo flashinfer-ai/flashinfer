@@ -1133,7 +1133,14 @@ def _input(
             )
         if x.shape[1] != H:
             raise ValueError(f"{op}: x has H = {x.shape[1]}, the weights H = {H}")
-        return x.shape[0], x.device, x.contiguous(), None, None, None, "128x4", False
+        x = x.contiguous()
+        if x.data_ptr() % 16:
+            raise unsupported(
+                pair.cls,
+                "bf16 rows at a storage offset that is not a multiple of 16 bytes",
+                "16-byte aligned rows (the kernels' vector loads and TMA boxes)",
+            )
+        return x.shape[0], x.device, x, None, None, None, "128x4", False
     if pair.scaled:
         x4, x_sf, x_pts = x
     else:
@@ -1161,10 +1168,20 @@ def _input(
             f"[T, H/{pair.block}] bytes"
             + (", x_pts [T] f32 or None)" if pair.scaled else ")")
         )
+    if x4.data_ptr() % 16 or x_sf.data_ptr() % 16:
+        raise unsupported(
+            pair.cls,
+            "packed codes or scale bytes at a storage offset that is not a multiple of 16 bytes",
+            "16-byte aligned codes and scale bytes (the kernels' vector loads and TMA boxes)",
+        )
     if pair.scaled and unit_pts:
         x_pts = _gs_inv(
             1.0, x4.device
         )  # a placeholder the unit-scale scatter never reads
+    elif pair.scaled:
+        x_pts = (
+            x_pts.contiguous()
+        )  # a strided per-token scale is read as given by the scatter: a placement
     return T, x4.device, None, x4, x_sf, x_pts, sf_src, unit_pts
 
 

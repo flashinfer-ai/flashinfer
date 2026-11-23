@@ -3157,6 +3157,61 @@ def _guards_untouched(
 
 @needs_device
 @each_pair
+def test_misaligned_inputs_are_refused_with_the_alignment_named(pair):
+    """bf16 rows, packed codes or scale bytes whose storage offset is not a multiple of 16 bytes (the kernels' vector loads
+    and TMA boxes) are refused by the layer and by the op with the mode's error naming the alignment, before any kernel
+    (not an assertion, not the binding's error); a strided per-token scale is a placement the op takes as given."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import fused_moe_fp4
+
+    T, k, H, I, E = 40, 4, 256, 128, 8
+    quant = _NVFP4_PTS if pair.scaled else _MX
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=5)
+    layer = _layer(k, E, I, quant=quant)
+    W_pack = _weights(w1, w2, quant=_QUANT[pair])
+    W = _weights_of(W_pack)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    x4, sf, pts = _quantized(x, pair=pair)
+    ref = bits(fused_moe_fp4(_pack(pair, x4, sf, pts), ids, weights, W))
+
+    def misaligned(t: torch.Tensor, off: int) -> torch.Tensor:
+        es, n = t.element_size(), t.numel()
+        big = torch.empty(n * es + 16, dtype=torch.uint8, device="cuda")
+        v = big[off : off + n * es].view(t.dtype).view(t.shape)
+        v.copy_(t)
+        assert v.data_ptr() % 16 == off and v.is_contiguous()
+        return v
+
+    def pack(q, s=None, p=None):
+        return MoEActivationPack(
+            q, s, topk_ids=ids, topk_weights=weights,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed, per_token_scale=p,
+        )  # fmt: skip
+
+    for act, op_in in (
+        (pack(misaligned(x, 2)), misaligned(x, 2)),
+        (pack(misaligned(x4, 1), sf, pts), _pack(pair, misaligned(x4, 1), sf, pts)),
+        (pack(x4, misaligned(sf, 1), pts), _pack(pair, x4, misaligned(sf, 1), pts)),
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError, match="16 bytes"):
+            layer(act, W_pack)
+        with pytest.raises(BatchInvariantUnsupportedError, match="16 bytes"):
+            fused_moe_fp4(op_in, ids, weights, W)
+    # the aligned forms run
+    assert torch.equal(bits(layer(pack(x4, sf, pts), W_pack)), ref)
+    if pair.scaled:
+        big = torch.zeros(2 * T, device="cuda")
+        big[::2] = pts
+        strided = big[::2]
+        assert not strided.is_contiguous()
+        for gather in (None, False, True):
+            out = fused_moe_fp4((x4, sf, strided), ids, weights, W, gather=gather)
+            assert torch.equal(bits(out), ref), gather
+
+
+@needs_device
+@each_pair
 def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
     """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``: a framework's dropped slot) is dropped by the op as
     by the bf16 one: the plan does not count it (``dest -1``, ``dest_pad -1``, ``pos_pad -1`` past the live rows), the scatter,

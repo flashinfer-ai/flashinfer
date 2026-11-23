@@ -367,6 +367,12 @@ class BatchInvariantFp4Runner(MoERunner):
                 f"the 128x4 swizzled buffer of the mode's quantizer ({pair.sf_numel(T, H)} bytes) or the linear "
                 f"[{T}, {H // pair.block}] layout",
             )
+        if sf_flat.data_ptr() % 16:
+            raise unsupported(
+                cls,
+                "hidden_states_scale at a storage offset that is not a multiple of 16 bytes",
+                "16-byte aligned scale bytes (the kernels' vector loads and TMA boxes)",
+            )
         pts = act.per_token_scale
         if pts is None:
             pts = _no_scales(act.hidden_states_q.device)[
@@ -407,6 +413,12 @@ class BatchInvariantFp4Runner(MoERunner):
                 "bf16 [num_tokens, hidden_size] rows, or packed fp4 uint8 [num_tokens, hidden_size / 2] with their scales",
             )
         x = x.contiguous()
+        if x.data_ptr() % 16:
+            raise unsupported(
+                cls,
+                "hidden_states_q at a storage offset that is not a multiple of 16 bytes",
+                "16-byte aligned rows (the kernels' vector loads and TMA boxes)",
+            )
         T = x.shape[0]
         H = self._hidden_of(x)
         k, E = cfg.routing.top_k, cfg.routing.num_experts
