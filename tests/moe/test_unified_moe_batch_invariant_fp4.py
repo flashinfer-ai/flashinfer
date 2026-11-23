@@ -2163,6 +2163,47 @@ def test_narrow_intermediate_scale_tails_under_a_poisoned_allocator(which, I):
 
 
 @needs_device
+def test_all_zero_nvfp4_expert_gives_finite_zero_rows():
+    """An all-zero expert weight takes the unit global scale (FlashInfer's weight-preparation convention: ``448 * 6 / amax``,
+    one for an all-zero tensor), so its alpha, codes and block scales are finite: a token whose slots all land on an expert
+    with zero fc1 and fc2, zero fc1 alone or zero fc2 alone gives a finite zero row; a mixed routing equals the class's
+    composition on the same bytes."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import fp4_global_scale
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    T, k, H, I, E = 32, 2, 256, 128, 4
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=81)
+    w1[1].zero_(), w2[1].zero_()  # both GEMMs zero
+    w1[2].zero_()  # fc1 zero: a zero intermediate
+    w2[3].zero_()  # fc2 zero
+    assert torch.equal(fp4_global_scale(torch.zeros(8, 32)), torch.ones(1))
+    assert torch.isfinite(fp4_global_scale(w1[0])).all()
+    W = _weights(w1, w2)
+    w = _weights_of(W)
+    assert torch.isfinite(w.w1_alpha).all() and torch.isfinite(w.w2_alpha).all()
+    assert bool(w.w1_alpha[1] == 1.0) and bool(w.w2_alpha[1] == 1.0)
+    layer = _layer(k, E, I)
+    weights = torch.full((T, k), 0.5, device="cuda")
+    for e in (1, 2, 3):
+        ids = torch.full((T, k), e, dtype=torch.int32, device="cuda")
+        out = layer(_routed_pack(x, ids, weights), W)
+        assert torch.isfinite(out.float()).all(), e
+        assert torch.equal(out.float(), torch.zeros(T, H, device="cuda")), e
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    out = layer(_routed_pack(x, ids.cuda(), wts.cuda()), W)
+    assert torch.isfinite(out.float()).all()
+    comp = _reference_ffn(
+        _quantized(x),
+        ids.cuda(),
+        wts.cuda(),
+        w,
+        activation_of(_SWIGLU),
+        w.classes(_family()),
+    )
+    assert torch.equal(bits(out.cpu()), bits(comp.cpu()))
+
+
+@needs_device
 @each_pair
 def test_instruction_classes_on_the_part(pair):
     """The part's default instruction class is the pair's rule (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere)

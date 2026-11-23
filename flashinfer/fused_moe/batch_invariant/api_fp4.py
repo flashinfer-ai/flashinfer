@@ -215,15 +215,12 @@ def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
 
 
 def fp4_global_scale(w: torch.Tensor) -> torch.Tensor:
-    """FlashInfer's per-tensor global scale of a weight: ``448 * 6 / amax(w)`` (a 1-element f32 tensor)."""
-    amax = (
-        w.detach()
-        .to(torch.float32)
-        .abs()
-        .amax()
-        .clamp_min(torch.finfo(torch.float32).tiny)
+    """FlashInfer's per-tensor global scale of a weight: ``448 * 6 / amax(w)``, one for an all-zero tensor (the convention of
+    the package's weight preparation; a 1-element f32 tensor)."""
+    amax = w.detach().to(torch.float32).abs().amax().reshape(1)
+    return torch.where(amax > 0, E4M3_MAX * E2M1_MAX / amax, torch.ones_like(amax)).to(
+        torch.float32
     )
-    return (E4M3_MAX * E2M1_MAX / amax).reshape(1).to(torch.float32)
 
 
 @dataclass
