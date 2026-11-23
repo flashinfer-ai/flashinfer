@@ -34,8 +34,8 @@ def _fleet(**kwargs):
 @pytest.mark.parametrize(
     "options",
     [
-        {"intermediate_size": 1536},
-        {"top_k": 8},
+        {"intermediate_size": 0},
+        {"top_k": True},
         {"quant_kind": "mxfp4"},
         {"combine_dtype": "nvfp4"},
         {"activation": "swiglu"},
@@ -113,21 +113,45 @@ def test_k3_and_k31_pro_checkpoint_fields_use_routed_geometry(quant_kind, monkey
     kernel = create_mega_kernel(config)
     kernel.validate_init(bootstrap, fleet)
     assert (kernel._config.situ_beta, kernel._config.situ_linear_beta) == (4.0, 25.0)
-    with pytest.raises(MoEEpConfigError, match="token_hidden_size=3584"):
-        kernel.validate_init(
-            bootstrap, replace(fleet, token_hidden_size=text_config["hidden_size"])
-        )
+
+
+@pytest.mark.parametrize("quant_kind", ["nvfp4", "mxfp4_mxfp8"])
+@pytest.mark.parametrize(
+    "world,experts,hidden,intermediate,top_k",
+    [
+        (2, 128, 1024, 1536, 8),
+        (3, 24, 512, 384, 3),
+        (4, 128, 4096, 2048, 8),
+        (24, 96, 7168, 3072, 16),
+        (32, 896, 3584, 3072, 16),
+        (64, 128, 1024, 512, 1),
+    ],
+)
+def test_init_accepts_variable_geometry(
+    monkeypatch, quant_kind, world, experts, hidden, intermediate, top_k
+):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    kernel = create_mega_kernel(
+        _config(quant_kind=quant_kind, intermediate_size=intermediate, top_k=top_k)
+    )
+    kernel.validate_init(
+        moe_ep.BootstrapConfig(world_size=world, rank=0, auto_bootstrap=False),
+        _fleet(num_experts=experts, token_hidden_size=hidden),
+    )
+    assert kernel.ep_world_size == world
 
 
 @pytest.mark.parametrize(
     "world,options,message",
     [
-        (2, {}, "world_size"),
-        (1, {"num_experts": 128}, "num_experts"),
-        (1, {"token_hidden_size": 4096}, "token_hidden_size"),
+        (3, {}, "divisible"),
+        (1, {"num_experts": 8}, "top_k"),
+        (1, {"token_hidden_size": 3585}, "token_hidden_size"),
         (1, {"max_tokens_per_rank": 0}, "max_tokens_per_rank"),
         (1, {"max_tokens_per_rank": True}, "max_tokens_per_rank"),
         (1, {"max_tokens_per_rank": 65536}, "int32"),
+        (1, {"max_tokens_per_rank": 32768, "token_hidden_size": 7168}, "int32"),
         (1, {"tuning_live_tokens": 8}, "tuning_live_tokens"),
     ],
 )
@@ -142,6 +166,22 @@ def test_init_rejects_unsupported_geometry_before_allocation(world, options, mes
             _fleet(**options),
         )
     shim.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "field,value,alignment",
+    [("token_hidden_size", 256, 512), ("intermediate_size", 192, 128)],
+)
+def test_mxfp4_requires_tma_alignment(field, value, alignment):
+    config = _config(
+        quant_kind="mxfp4_mxfp8",
+        **({field: value} if field == "intermediate_size" else {}),
+    )
+    fleet = _fleet(**({field: value} if field == "token_hidden_size" else {}))
+    with pytest.raises(MoEEpConfigError, match=f"{field}.*multiple of {alignment}"):
+        create_mega_kernel(config).validate_init(
+            moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False), fleet
+        )
 
 
 @pytest.mark.parametrize("world", [1, 8, 16])

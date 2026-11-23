@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Mask-aware Kimi top-16 combine with ordered FP32 accumulation."""
+"""Mask-aware Kimi top-k combine with ordered FP32 accumulation."""
 
 from typing import Optional
 
@@ -24,14 +24,18 @@ class KimiTopkReducer(TopkReduce):
         quant_kind=None,
         max_tokens=None,
     ) -> None:
-        if hidden != 3584 or num_topk != 16:
-            raise ValueError("Kimi combine requires hidden=3584 and num_topk=16")
         if combine_format.name not in ("bf16", "32e4m3xe8m0"):
             raise ValueError("Kimi combine supports BF16 or MXFP8")
         self.hidden = hidden
         self.num_topk = num_topk
         self.combine_format = combine_format
         self.hidden_per_thread = 16 if combine_format.is_quantized else 8
+        alignment = max(self.hidden_per_thread, combine_format.scale_block or 1)
+        if hidden <= 0 or hidden % alignment or num_topk <= 0:
+            raise ValueError(
+                "Kimi combine requires positive top-k and hidden size divisible "
+                f"by {alignment} for whole scale blocks and 16-byte slot loads"
+            )
         self.hidden_tiles = hidden // self.hidden_per_thread
         self.s18 = True
         self.s18_tpb = 32

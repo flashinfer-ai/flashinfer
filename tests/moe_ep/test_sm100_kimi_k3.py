@@ -1,6 +1,7 @@
 """K3 public API checks with a sparse, independent FP64 numerical oracle.
 
-Run on one GPU or with torchrun on 8/16 GPUs. Sparse weights test expert,
+Run on one GPU or with torchrun at an EP size dividing the expert count.
+Sparse weights test expert,
 gate/up and scale layouts; they do not cover dense MMA accumulation error.
 """
 
@@ -19,15 +20,15 @@ EXPERTS, HIDDEN, INTERMEDIATE, TOPK = 896, 3584, 3072, 16
 FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
-def _runtime():
+def _runtime(*, experts=EXPERTS):
     if not torch.cuda.is_available():
         pytest.skip("requires SM100/SM103")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("requires SM100/SM103")
     world = int(os.environ.get("WORLD_SIZE", "1"))
-    if world not in (1, 8, 16):
-        pytest.skip("requires EP1, EP8 or EP16")
+    if experts % world:
+        pytest.skip("EP size must divide the expert count")
     if world > 1 and not dist.is_initialized():
         dist.init_process_group("cpu:gloo,cuda:nccl")
     return dist.get_rank() if dist.is_initialized() else 0, world
@@ -54,10 +55,12 @@ def _sparse_weight(rows, columns, experts, first_expert, kind):
     return packed, scales
 
 
-def _weights(rank, world, kind):
-    count = EXPERTS // world
-    w13, s13 = _sparse_weight(2 * INTERMEDIATE, HIDDEN, count, rank * count, kind)
-    w2, s2 = _sparse_weight(HIDDEN, INTERMEDIATE, count, rank * count, kind)
+def _weights(
+    rank, world, kind, *, experts=EXPERTS, hidden=HIDDEN, intermediate=INTERMEDIATE
+):
+    count = experts // world
+    w13, s13 = _sparse_weight(2 * intermediate, hidden, count, rank * count, kind)
+    w2, s2 = _sparse_weight(hidden, intermediate, count, rank * count, kind)
     return moe_ep.MoEWeightPack(w13, w2, s13, s2)
 
 
@@ -108,19 +111,20 @@ def _row_weight(row, expert, columns, kind):
     return col, value * 2.0**exponent
 
 
-def _reference(tensors, kind, wire):
+def _reference(tensors, kind, wire, *, experts=EXPERTS, intermediate=INTERMEDIATE):
     tokens = tensors.num_tokens
+    hidden = tensors.hidden_states.shape[1]
     if tokens == 0:
-        return torch.empty(0, HIDDEN, dtype=torch.bfloat16, device="cuda")
+        return torch.empty(0, hidden, dtype=torch.bfloat16, device="cuda")
     x = _round_blocks(tensors.hidden_states, kind)
-    result = torch.zeros(tokens, HIDDEN, dtype=torch.float64, device=x.device)
-    rows = torch.arange(2 * INTERMEDIATE, device=x.device)
-    output_rows = torch.arange(HIDDEN, device=x.device)
-    for slot in range(TOPK):
+    result = torch.zeros(tokens, hidden, dtype=torch.float64, device=x.device)
+    rows = torch.arange(2 * intermediate, device=x.device)
+    output_rows = torch.arange(hidden, device=x.device)
+    for slot in range(tensors.topk_ids.shape[1]):
         ids = tensors.topk_ids[:, slot].long()
-        valid = (ids >= 0) & (ids < EXPERTS)
+        valid = (ids >= 0) & (ids < experts)
         expert = ids.masked_fill(~valid, 0)
-        columns, weight = _row_weight(rows, expert, HIDDEN, kind)
+        columns, weight = _row_weight(rows, expert, hidden, kind)
         fc1 = x.gather(1, columns) * weight
         alpha1, alpha2, norm = _alpha(expert)
         if kind == "nvfp4":
@@ -129,7 +133,7 @@ def _reference(tensors, kind, wire):
         activation = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
         activation *= 25.0 * torch.tanh(up / 25.0)
         activation = _round_blocks(activation, kind, norm if kind == "nvfp4" else 1.0)
-        columns, weight = _row_weight(output_rows, expert, INTERMEDIATE, kind)
+        columns, weight = _row_weight(output_rows, expert, intermediate, kind)
         partial = activation.gather(1, columns) * weight
         if kind == "nvfp4":
             partial *= alpha2[:, None]
@@ -141,12 +145,23 @@ def _reference(tensors, kind, wire):
     return result.to(torch.bfloat16)
 
 
-def _inputs(tokens, rank, world, step, *, masked=False, mask_routes=True):
+def _inputs(
+    tokens,
+    rank,
+    world,
+    step,
+    *,
+    masked=False,
+    mask_routes=True,
+    experts=EXPERTS,
+    hidden=HIDDEN,
+    top_k=TOPK,
+):
     row = torch.arange(tokens, device="cuda")[:, None]
-    col = torch.arange(HIDDEN, device="cuda")[None, :]
+    col = torch.arange(hidden, device="cuda")[None, :]
     x = (((row * 5 + col * 17 + rank * 3 + step * 13) % 31 - 15) / 8).bfloat16()
-    slot = torch.arange(TOPK, device="cuda")[None, :]
-    local_experts = EXPERTS // world
+    slot = torch.arange(top_k, device="cuda")[None, :]
+    local_experts = experts // world
     ids = (
         (slot % world) * local_experts
         + (row + slot // world + step * 11) % local_experts
@@ -175,6 +190,81 @@ def _check(actual, expected):
     tolerance = 2 * ulp + 0.001 * ref.square().mean(-1, keepdim=True).sqrt()
     assert (error <= tolerance).double().mean().item() >= 0.99
     assert (error.norm() / ref.norm().clamp(min=1e-20)).item() <= 0.01
+
+
+@pytest.mark.parametrize(
+    "kind,experts,hidden,intermediate,top_k",
+    [
+        ("mxfp4_mxfp8", 24, 512, 384, 3),
+        ("mxfp4_mxfp8", 128, 1024, 1536, 8),
+        ("nvfp4", 24, 768, 192, 3),
+    ],
+)
+@pytest.mark.parametrize("wire", ["bf16", "mxfp8"])
+def test_variable_geometry_eager_and_graph(
+    kind, experts, hidden, intermediate, top_k, wire
+):
+    rank, world = _runtime(experts=experts)
+    calibration = {}
+    if kind == "nvfp4":
+        expert = torch.arange(experts // world, device="cuda") + rank * (
+            experts // world
+        )
+        alpha1, alpha2, norm = _alpha(expert)
+        calibration = dict(
+            fc1_alpha=alpha1.float(),
+            fc2_alpha=alpha2.float(),
+            fc1_norm_const=norm.float(),
+        )
+    config = moe_ep.Sm100_KimiK3_MegaMoeConfig(
+        intermediate_size=intermediate,
+        top_k=top_k,
+        quant_kind=kind,
+        combine_dtype=wire,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        **calibration,
+    )
+    layer = moe_ep.MoEEpMegaLayer(
+        bootstrap=moe_ep.BootstrapConfig(
+            world_size=world,
+            rank=rank,
+            auto_bootstrap=False,
+            process_group=dist.group.WORLD if world > 1 else None,
+            device=torch.cuda.current_device(),
+        ),
+        fleet_params=moe_ep.FleetParams(
+            num_experts=experts, token_hidden_size=hidden, max_tokens_per_rank=128
+        ),
+        weights=_weights(
+            rank, world, kind, experts=experts, hidden=hidden, intermediate=intermediate
+        ),
+        backend=moe_ep.MegaConfig(megakernel=config, quantize_input=True),
+    )
+    graph = None
+    try:
+        workspace = layer.create_workspace(128)
+        tokens = 0 if world > 1 and rank == world - 1 else 17
+        shapes = dict(experts=experts, hidden=hidden, top_k=top_k)
+        tensors = _inputs(tokens, rank, world, 0, **shapes)
+        layer.warmup(tensors, workspace=workspace)
+        eager = layer(tensors, workspace=workspace).clone()
+        reference = dict(experts=experts, intermediate=intermediate)
+        _check(eager, _reference(tensors, kind, wire, **reference))
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = layer(tensors, workspace=workspace)
+        changed = _inputs(tokens, rank, world, 1, **shapes)
+        for name in ("hidden_states", "topk_ids", "topk_weights"):
+            getattr(tensors, name).copy_(getattr(changed, name))
+        graph.replay()
+        torch.cuda.synchronize()
+        _check(captured, _reference(tensors, kind, wire, **reference))
+    finally:
+        graph = None
+        torch.cuda.synchronize()
+        layer.destroy()
 
 
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp4_mxfp8"])

@@ -32,7 +32,8 @@ _KNOB_KEYS = frozenset(
 class Sm100_KimiK3_MegaMoeConfig:
     """K3/K3.1 Pro routed SiTU inference on SM100/SM103.
 
-    Uses 896 experts, routed width 3584, intermediate size 3072 and top-16.
+    Defaults match Kimi K3; expert count, routed width, intermediate size,
+    top-k and EP size may vary within the kernel's geometry requirements.
     Read the routed width from ``routed_expert_hidden_size``, not ``hidden_size``.
     Routing, latent projections, post-MoE norm and shared experts stay outside.
     Both SiTU beta values must be supplied, positive and finite.
@@ -63,10 +64,10 @@ class Sm100_KimiK3_MegaMoeConfig:
     num_valid_tokens_tensor: torch.Tensor | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
-        for name, expected in (("intermediate_size", 3072), ("top_k", 16)):
+        for name in ("intermediate_size", "top_k"):
             value = getattr(self, name)
-            if type(value) is not int or value != expected:
-                raise ValueError(f"Kimi K3 requires {name}={expected}")
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         if self.quant_kind not in ("nvfp4", "mxfp4_mxfp8"):
             raise ValueError("quant_kind must be 'nvfp4' or 'mxfp4_mxfp8'")
         if self.combine_dtype not in ("bf16", "mxfp8"):

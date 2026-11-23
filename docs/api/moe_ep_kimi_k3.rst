@@ -2,9 +2,15 @@ Kimi K3-family MegaMoE
 =====================
 
 ``Sm100_KimiK3_MegaMoeConfig`` selects an isolated Kimi K3-family provider through
-:class:`flashinfer.moe_ep.MoEEpMegaLayer`. It supports SM100/SM103, 896 experts,
-routed hidden size 3584, intermediate size 3072, top-16 routing, and EP sizes 1, 8,
-or 16. Each rank owns a contiguous range of experts.
+:class:`flashinfer.moe_ep.MoEEpMegaLayer` on SM100/SM103. Expert count, routed
+hidden size, intermediate size and top-k are configurable. Any positive EP size
+that divides the expert count is supported; each rank owns a contiguous range
+of experts. Top-k must not exceed the expert count. Hidden sizes must be
+multiples of 512 for MXFP4/MXFP8, or 256 for NVFP4, so compact activation-scale
+rows stay 16-byte aligned for bulk transfers. Intermediate sizes must be
+multiples of 128 for MXFP4/MXFP8, or 64 for NVFP4. The router
+supports at most 16384 experts, and the combine buffer requires
+``max_tokens_per_rank * top_k * token_hidden_size < 2**31``.
 
 All EP ranks must share one NVLink domain. Across GB300 nodes, the container
 must expose the assigned IMEX channel so PyTorch can map peer memory through
