@@ -215,6 +215,7 @@ def _sweep_sm100_mega_moe(
                 "fc2_alpha",
                 "fc1_norm_const",
                 "fc1_activation_per_token_scale",
+                "gemm1_lora_delta",
             ):
                 source = getattr(symm_buffer, name, None)
                 if source is not None:

@@ -539,7 +539,9 @@ def compute_megamoe_reference_block_scaled(
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
     fc1_activation_per_token_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    gemm1_lora_delta: Optional[torch.Tensor] = None,
+    return_post_act: bool = False,
+):
     """Pure-torch single-rank oracle for the Blackwell block-scaled kernel.
 
     Evaluates MoE math from staged quantized inputs and transformed weights.
@@ -567,10 +569,16 @@ def compute_megamoe_reference_block_scaled(
 
     idx = topk_idx[:tokens].to(torch.int64)
     output = torch.zeros((x_data.shape[0], hidden), dtype=torch.float32, device=device)
+    post_act_by_expert: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
     for local_e in range(num_local_experts):
         routed = (idx == local_expert_offset + local_e).nonzero(as_tuple=False)
         if routed.shape[0] == 0:
+            if return_post_act:
+                post_act_by_expert[local_e] = (
+                    torch.empty((0,), dtype=torch.int32, device=device),
+                    torch.empty((0, intermediate), dtype=torch.bfloat16, device=device),
+                )
             continue
         src_t, src_k = routed[:, 0], routed[:, 1]
         vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
@@ -591,6 +599,14 @@ def compute_megamoe_reference_block_scaled(
             fc1 = fc1 * fc1_alpha[local_e]
         pairs = fc1.view(-1, intermediate // GateUpInterleave, 2, GateUpInterleave)
         gate, up = pairs[:, :, 0, :], pairs[:, :, 1, :]
+        if gemm1_lora_delta is not None:
+            delta_rows = gemm1_lora_delta[src_t, src_k].to(torch.float32)
+            gate = gate + delta_rows[:, :intermediate].view(
+                -1, intermediate // GateUpInterleave, GateUpInterleave
+            )
+            up = up + delta_rows[:, intermediate:].view(
+                -1, intermediate // GateUpInterleave, GateUpInterleave
+            )
         if gate_up_clamp is not None:
             gate = gate.clamp(max=gate_up_clamp)
             up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
@@ -604,6 +620,11 @@ def compute_megamoe_reference_block_scaled(
             beta = 0.0 if swiglu_beta is None else swiglu_beta
             act = ((up + beta) * gate * torch.sigmoid(alpha * gate)).reshape(
                 -1, intermediate
+            )
+        if return_post_act:
+            post_act_by_expert[local_e] = (
+                src_t.to(torch.int32),
+                act.to(torch.bfloat16),
             )
         if apply_routing_weights_before_fc2:
             act = act * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
@@ -625,7 +646,10 @@ def compute_megamoe_reference_block_scaled(
             term = term * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         output.index_add_(0, src_t, term)
 
-    return output if return_fp32 else output.to(torch.bfloat16)
+    out = output if return_fp32 else output.to(torch.bfloat16)
+    if return_post_act:
+        return out, post_act_by_expert
+    return out
 
 
 __all__ = [

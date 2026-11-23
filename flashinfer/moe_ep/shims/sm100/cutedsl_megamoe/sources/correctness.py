@@ -39,6 +39,9 @@ def sampled_reference(
     scale = getattr(symm_buffer, "fc1_activation_per_token_scale", None)
     if scale is not None:
         sources.append(scale)
+    lora_delta = getattr(symm_buffer, "gemm1_lora_delta", None)
+    if lora_delta is not None:
+        sources.append(lora_delta)
     local = [
         torch.zeros(
             (sample_size, *t.shape[1:]), dtype=torch.uint8, device=t.device
@@ -66,6 +69,15 @@ def sampled_reference(
                 dist.broadcast(
                     tensor.view(torch.uint8), src=global_source, group=process_group
                 )
+        next_idx = 4
+        payload_scale = None
+        if scale is not None:
+            payload_scale = payload[next_idx]
+            next_idx += 1
+        payload_lora_delta = None
+        if lora_delta is not None:
+            payload_lora_delta = payload[next_idx]
+            next_idx += 1
         partial = compute_megamoe_reference_block_scaled(
             payload[0],
             payload[1],
@@ -90,7 +102,8 @@ def sampled_reference(
             situ_linear_beta=cfg.situ_linear_beta,
             swiglu_alpha=getattr(cfg, "swiglu_alpha", None),
             swiglu_beta=getattr(cfg, "swiglu_beta", None),
-            fc1_activation_per_token_scale=payload[4] if scale is not None else None,
+            fc1_activation_per_token_scale=payload_scale,
+            gemm1_lora_delta=payload_lora_delta,
             fc1_alpha=getattr(symm_buffer, "fc1_alpha", None),
             fc2_alpha=getattr(symm_buffer, "fc2_alpha", None),
             fc1_norm_const=getattr(symm_buffer, "fc1_norm_const", None),

@@ -504,6 +504,17 @@ class MoEEpMegaLayer(nn.Module):
                     dtype=torch.float32,
                     device=device,
                 ),
+                gemm1_lora_delta=(
+                    torch.zeros(
+                        num_tokens,
+                        top_k,
+                        2 * int(self._megakernel_config.intermediate_size),  # type: ignore[attr-defined]
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    if getattr(self._megakernel_config, "enable_fc1_lora_delta", False)
+                    else None
+                ),
             )
         if self._kernel.supports_unfinalized_output:
             self.forward_unfinalized(t, workspace=workspace)
@@ -578,7 +589,7 @@ class MoEEpMegaLayer(nn.Module):
 
     @staticmethod
     def _input_signature(t: "MoEEpTensors") -> tuple[Any, ...]:
-        signature = (
+        signature: tuple[Any, ...] = (
             t.hidden_states.device,
             t.hidden_states.dtype,
             t.hidden_states.ndim,
@@ -593,6 +604,11 @@ class MoEEpMegaLayer(nn.Module):
             t.topk_weights.shape[1] if t.topk_weights.ndim > 1 else None,
         )
 
+        delta = getattr(t, "gemm1_lora_delta", None)
+        if delta is not None:
+            signature += (
+                (delta.device, delta.dtype, delta.ndim, tuple(delta.shape[1:])),
+            )
         if (
             getattr(t, "shared_hidden_states", None) is not None
             or getattr(t, "shared_scales", None) is not None

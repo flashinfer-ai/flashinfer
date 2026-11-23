@@ -18,6 +18,7 @@ from .....core.validation.common import (
     validate_mega_arch,
     validate_mega_fleet_params,
 )
+from .....tensors import MegaMoeLoraOutput
 from .....weights import PrequantizedMoEWeights
 from .genphase_config import GenphaseConfigMixin
 
@@ -33,6 +34,42 @@ if TYPE_CHECKING:
     from .nvfp4_nvfp4_bf16_cutedsl.config import (
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
+
+
+def _validate_gemm1_lora_delta(
+    delta: torch.Tensor | None,
+    *,
+    num_tokens: int,
+    top_k: int,
+    intermediate_size: int,
+    enabled: bool,
+    device: torch.device,
+) -> None:
+    if not enabled:
+        if delta is not None:
+            raise MoEEpConfigError(
+                "MoEEpTensors.gemm1_lora_delta was provided but the "
+                "kernel config has enable_fc1_lora_delta=False"
+            )
+        return
+    if delta is None:
+        raise MoEEpConfigError(
+            "MoEEpTensors.gemm1_lora_delta is required when enable_fc1_lora_delta=True"
+        )
+    if not delta.is_cuda or delta.device != device:
+        raise MoEEpConfigError(
+            "gemm1_lora_delta must be a CUDA tensor on the current device"
+        )
+    if delta.dtype != torch.bfloat16:
+        raise MoEEpConfigError(f"gemm1_lora_delta must be bfloat16, got {delta.dtype}")
+    expected_shape = (num_tokens, top_k, 2 * intermediate_size)
+    if tuple(delta.shape) != expected_shape:
+        raise MoEEpConfigError(
+            f"gemm1_lora_delta must have shape {expected_shape}, "
+            f"got {tuple(delta.shape)}"
+        )
+    if not delta.is_contiguous():
+        raise MoEEpConfigError("gemm1_lora_delta must be contiguous")
 
 
 class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
@@ -329,6 +366,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             enable_fc1_activation_per_token_scale=getattr(
                 k, "enable_fc1_activation_per_token_scale", False
             ),
+            enable_fc1_lora_delta=getattr(k, "enable_fc1_lora_delta", False),
         )
         if native:
             options.update(k.knobs)
@@ -501,6 +539,14 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 scales=t.scales,
                 kind=self._kind(),
             )
+        _validate_gemm1_lora_delta(
+            t.gemm1_lora_delta,
+            num_tokens=t.hidden_states.shape[0],
+            top_k=self._config.top_k,
+            intermediate_size=self._config.intermediate_size,
+            enabled=getattr(self._config, "enable_fc1_lora_delta", False),
+            device=t.hidden_states.device,
+        )
         for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
             value = getattr(t, name)
             if value is not None and (
@@ -524,6 +570,14 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 num_tokens=n,
                 enabled=getattr(cfg, "enable_fc1_activation_per_token_scale", False),
             )
+        _validate_gemm1_lora_delta(
+            t.gemm1_lora_delta,
+            num_tokens=n,
+            top_k=cfg.num_topk,
+            intermediate_size=cfg.intermediate,
+            enabled=getattr(cfg, "enable_fc1_lora_delta", False),
+            device=workspace.device,
+        )
         if quantize_input:
             kwargs = (
                 dict(
@@ -594,6 +648,8 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             workspace.fc1_activation_per_token_scale[:n].copy_(
                 t.fc1_activation_per_token_scale
             )
+        if getattr(cfg, "enable_fc1_lora_delta", False):
+            workspace.gemm1_lora_delta[:n].copy_(t.gemm1_lora_delta)
         for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
             value = getattr(t, name)
             target = getattr(workspace, name)
@@ -638,6 +694,26 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             )
         if self.supports_unfinalized_output:
             raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
+
+        def _wrap_lora_output(y: torch.Tensor):
+            if not getattr(workspace.config, "enable_fc1_lora_delta", False):
+                return y
+            if output is None:
+                return MegaMoeLoraOutput(
+                    output=y,
+                    act=workspace.fc1_post_act_snapshot,
+                    token_id=workspace.fc1_snapshot_token_ids,
+                    expert_offsets=workspace.fc1_snapshot_expert_offsets,
+                    src_rank=workspace.fc1_snapshot_src_ranks,
+                )
+            return MegaMoeLoraOutput(
+                output=y,
+                act=workspace.fc1_post_act_snapshot.clone(),
+                token_id=workspace.fc1_snapshot_token_ids.clone(),
+                expert_offsets=workspace.fc1_snapshot_expert_offsets.clone(),
+                src_rank=workspace.fc1_snapshot_src_ranks.clone(),
+            )
+
         if not getattr(workspace.config, "use_custom_finalize", False):
             view = sm100_block_scaled_mega_moe(
                 output,
@@ -645,7 +721,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
                 workspace,
                 fast_math=self._config.fast_math,
             )
-            return output if output is not None else view
+            return _wrap_lora_output(output if output is not None else view)
         from flashinfer.jit.cake_megamoe_topk_reduce import (
             get_cake_megamoe_topk_reduce_module,
         )
@@ -670,9 +746,9 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         else:
             reducer.run(partials, workspace.output_activation, n, stream)
         if output is None:
-            return workspace.output_activation[:n]
+            return _wrap_lora_output(workspace.output_activation[:n])
         output.copy_(workspace.output_activation[:n])
-        return output
+        return _wrap_lora_output(output)
 
     def compute_unfinalized(self, workspace, transformed_weights):
         from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (

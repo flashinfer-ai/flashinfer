@@ -26,6 +26,7 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
     """Standard block-scaled inference with native Blackwell instruction K."""
 
     enable_fc1_activation_per_token_scale: bool = False
+    enable_fc1_lora_delta: bool = dataclasses.field(default=False, kw_only=True)
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
     use_custom_finalize: bool = False
@@ -53,9 +54,17 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
                 raise ValueError("SwiGLU constants require activation='swiglu'.")
             if not all(math.isfinite(x) for x in (self.swiglu_alpha, self.swiglu_beta)):
                 raise ValueError("SwiGLU constants must be finite.")
-        for name in ("use_custom_finalize", "use_persistent_finalize_kernel"):
+        for name in (
+            "use_custom_finalize",
+            "use_persistent_finalize_kernel",
+            "enable_fc1_lora_delta",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a bool.")
+        if self.enable_fc1_lora_delta and self.batch_invariant:
+            raise ValueError(
+                "enable_fc1_lora_delta is not supported with batch_invariant=True."
+            )
         if self.use_custom_finalize and (
             self.combine_dtype != "bf16"
             or self.reduce_topk_in_kernel
@@ -80,6 +89,11 @@ class Sm100BlockScaledSymmBuffer(BlockScaledSymmBuffer):
     _architecture = "sm_100"
     config: Sm100BlockScaledMoeConfig
     fc1_activation_per_token_scale: torch.Tensor | None
+    gemm1_lora_delta: torch.Tensor | None
+    fc1_post_act_snapshot: torch.Tensor | None
+    fc1_snapshot_token_ids: torch.Tensor | None
+    fc1_snapshot_src_ranks: torch.Tensor | None
+    fc1_snapshot_expert_offsets: torch.Tensor | None
 
     @staticmethod
     def _require_device() -> None:
@@ -151,6 +165,24 @@ class Sm100BlockScaledSymmBuffer(BlockScaledSymmBuffer):
             kwargs["fc1_activation_per_token_scale"] = _to_cute(
                 self.fc1_activation_per_token_scale, assumed_align=4
             )
+        if self.gemm1_lora_delta is not None:
+            kwargs["fc1_lora_delta"] = _to_cute(
+                self.gemm1_lora_delta, assumed_align=16, dynamic_leading=False
+            )
+            kwargs["fc1_post_act_snapshot"] = _to_cute(
+                self.fc1_post_act_snapshot, assumed_align=16, dynamic_leading=False
+            )
+            kwargs["fc1_snapshot_token_ids"] = _to_cute(
+                self.fc1_snapshot_token_ids, assumed_align=4, dynamic_leading=False
+            )
+            kwargs["fc1_snapshot_src_ranks"] = _to_cute(
+                self.fc1_snapshot_src_ranks, assumed_align=4, dynamic_leading=False
+            )
+            kwargs["fc1_snapshot_expert_offsets"] = _to_cute(
+                self.fc1_snapshot_expert_offsets,
+                assumed_align=4,
+                dynamic_leading=False,
+            )
         return kwargs
 
     def custom_finalize_workspace(self) -> torch.Tensor:
@@ -171,6 +203,12 @@ class Sm100BlockScaledSymmBuffer(BlockScaledSymmBuffer):
         super().destroy()
         free_sym_tensor(self.fc1_activation_per_token_scale)
         self.fc1_activation_per_token_scale = None
+        free_sym_tensor(self.gemm1_lora_delta)
+        self.gemm1_lora_delta = None
+        self.fc1_post_act_snapshot = None
+        self.fc1_snapshot_token_ids = None
+        self.fc1_snapshot_src_ranks = None
+        self.fc1_snapshot_expert_offsets = None
         self.num_valid_tokens = None
 
 
