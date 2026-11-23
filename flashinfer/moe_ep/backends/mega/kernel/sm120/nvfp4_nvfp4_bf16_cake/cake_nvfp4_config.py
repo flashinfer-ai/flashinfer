@@ -52,7 +52,8 @@ class Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig(Sm120CakeMegaMoeConfigBase):
       :class:`~flashinfer.moe_ep.MoEEpTensors` override them.  With ``MegaConfig.quantize_input``
       the BF16 input is quantized as ``x * input_norm_const``, so ``fc1_alpha`` carries the
       ``1 / input_norm_const`` (and any weight global scale) and ``fc2_alpha`` the
-      ``1 / fc1_norm_const``.
+      ``1 / fc1_norm_const``.  The in-kernel shared expert has no such correction, so it needs
+      ``input_norm_const == 1`` (the config raises otherwise).
     * ``gate_up_clamp`` (alias ``activation_clamp``): clamp ``gate <= c``, ``-c <= up <= c``
       before the activation (``None``: unclamped).  The kernel compiles the clamp, so it must be a
       whole number.  ``swiglu_limit`` (the MXFP8 backend's name, 0 = unclamped) is accepted as a
@@ -146,6 +147,13 @@ class Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig(Sm120CakeMegaMoeConfigBase):
         ):
             raise ValueError(
                 f"input_norm_const must be a positive finite number, got {self.input_norm_const!r}"
+            )
+        if self.shared_expert is not None and self.input_norm_const != 1:
+            # the in-kernel shared expert reads the staged input as is; only the routed experts
+            # undo the input scale (through fc1_alpha), so the shared expert would see x * c
+            raise ValueError(
+                "input_norm_const must be 1 with the in-kernel shared expert "
+                f"(shared_expert={self.shared_expert!r}, input_norm_const={self.input_norm_const!r})"
             )
         for name in _SCALE_FIELDS:
             check_expert_scale(name, getattr(self, name))

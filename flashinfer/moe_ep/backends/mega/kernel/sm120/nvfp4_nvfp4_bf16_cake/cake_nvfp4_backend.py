@@ -49,6 +49,7 @@ from .cake_nvfp4_weights import (
 
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
+    from ..mxfp4_mxfp8_bf16_cake.cake_weights import TransformedCakeMegaWeights
 
 KERNEL_NAME = "sm120_nvfp4_nvfp4_bf16_cake"
 _SCALE_FIELDS = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
@@ -100,7 +101,7 @@ class Sm120Nvfp4Nvfp4CakeMegaKernelBackend(Sm120Mxfp4Mxfp8CakeMegaKernelBackend)
 
     def validate_transformed_weights(
         self,
-        transformed_weights: TransformedCakeNvfp4MegaWeights,
+        transformed_weights: TransformedCakeMegaWeights,
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:

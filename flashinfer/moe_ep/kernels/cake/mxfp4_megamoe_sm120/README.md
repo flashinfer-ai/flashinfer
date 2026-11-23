@@ -56,8 +56,8 @@ The device source is compiled per deployment with
 | `MOE_EXPERTS` | global routed experts (physical experts under EPLB) | `% MOE_RANKS == 0`, <= 128 per rank, <= 1024 |
 | `MOE_TOPK` | routed experts per token | 1..16; above 9 needs `MOE_HIDDEN` <= 7168 (dispatch staging ring) |
 | `MOE_MAX_ROWS` | tokens per rank per call (capacity) | multiple of 128, <= 32640 (the row fields of the signed 32-bit `active_rows` kernel argument); a routed row pool past 2^31 elements (ranks x rows x top-k x hidden / 4) needs 64-bit pool indices, generated for 32 ranks and only in part for 4 / 8 / 16 ranks (the host geometry names the largest capacity that builds) |
-| `MOE_HIDDEN` | hidden size | multiple of 512, <= 7680 |
-| `MOE_INTERMEDIATE` | expert intermediate size | multiple of 128 |
+| `MOE_HIDDEN` | hidden size | multiple of 512 (W4A4, `MOE_ACT_CODEC` 1 / 2: multiple of 1024), <= 7680 |
+| `MOE_INTERMEDIATE` | expert intermediate size | multiple of 128 (W4A4 with the shared expert: multiple of 256) |
 | `MOE_SHARED_EXPERT` | 1: one in-kernel FP8 e4m3 shared expert added to the output | 0 / 1 |
 | `MOE_SWIGLU_LIMIT` | SwiGLU clamp `L`: `gate <= L`, `-L <= up <= L` (10 = DeepSeek-V4); 0 = unclamped SwiGLU (DeepSeek-V3, Qwen3) | integer >= 0, default 10 |
 | `MOE_CODEC_OVF_BLOCKS` | raw-overflow capacity of the lossless BF16 return codec, in 64-value blocks per row (see below) | 16..256, default 16 |
@@ -68,10 +68,12 @@ The device source is compiled per deployment with
 | `MOE_RETURN_CODEC` | wire format of the expert results: 0 lossless BF16 codec, 1 int8 codes with one BF16 scale per 64 values (see below) | 0 / 1, default 0 |
 
 and `MOE_INSTANCE` from the wrapper: two row schedules (`m128`: 128-row tasks; `m64`: 64-row
-tasks, launched when no rank holds more than 512 tokens in the call) times two copier flavors
+tasks) times two copier flavors
 (`copier`: with the LSA copier CTAs; `nocopier`: for tables without any LSA pair, which frees
 those SMs).  A workspace compiles and loads the two schedules of the flavor its transport table
-needs.  Parameter-dependent code paths are selected by derived switch macros (`MOE_SW_*`)
+needs.  Both schedules accept any row count up to the capacity and return identical bits; the
+backend chooses one per call (config `row_schedule`: `auto` from the per-GPU tile-count model, or
+from the mean rows per rank against 512 on GPUs without a calibration; `m64` / `m128` pin one).  Parameter-dependent code paths are selected by derived switch macros (`MOE_SW_*`)
 inside the source; a parameter set outside the generator's covered region fails at compile time
 with `#error` / `static_assert`, and every derived integer is range-checked, so an overflowing
 instantiation does not compile.

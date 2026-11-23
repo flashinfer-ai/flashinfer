@@ -141,6 +141,14 @@ def test_config_rejects_host_or_malformed_scales() -> None:
             _nvfp4_config(fc1_alpha=bad)
 
 
+def test_config_rejects_shared_expert_with_input_norm_const() -> None:
+    """The in-kernel shared expert has no input-scale correction, so it needs input_norm_const 1."""
+    _nvfp4_config(shared_expert="fp8_in_kernel")
+    _nvfp4_config(input_norm_const=2.0)
+    with pytest.raises(ValueError, match="input_norm_const must be 1"):
+        _nvfp4_config(shared_expert="fp8_in_kernel", input_norm_const=2.0)
+
+
 def test_expert_scale_length_is_checked() -> None:
     from flashinfer.moe_ep.backends.mega.kernel.sm120.nvfp4_nvfp4_bf16_cake.cake_nvfp4_config import (
         check_expert_scale,

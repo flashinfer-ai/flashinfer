@@ -980,7 +980,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             config.return_codec,
             config.variant,
             config.transport_table,
-            config.row_schedule,
+            _row_schedule_setting(config.row_schedule),  # with the env override applied
             knobs_pool_key(config.knobs),
         )
 
@@ -1253,6 +1253,25 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
 
         # -- kernel instances ---------------------------------------------------
         sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+        # Every rank must launch the same row schedule in a call, so the group needs one setting and
+        # one tile-cost calibration: reject differing settings; a group of GPUs with different SM
+        # counts uses the rank-uniform threshold rule instead of the per-GPU model.
+        row_schedule = _row_schedule_setting(self._kernel_config.row_schedule)
+        code = ROW_SCHEDULES.index(row_schedule)
+        probe = torch.tensor(
+            [sm_count, -sm_count, code, -code], dtype=torch.int64, device=device
+        )
+        dist.all_reduce(probe, op=dist.ReduceOp.MIN, group=group)
+        if int(probe[2]) != -int(probe[3]):
+            raise MoEEpConfigError(
+                f"{KERNEL_NAME}: the row schedule (config row_schedule or {_ROW_SCHEDULE_ENV}) "
+                "differs between EP ranks; every rank must use the same value"
+            )
+        tile_cost_ratio = (
+            _ROW_TILE_COST_RATIO.get((sm_count, self.ACT_CODEC))
+            if int(probe[0]) == -int(probe[1])
+            else None
+        )
         instances: dict[str, _Instance] = {}
         device_parameters = kernel["params"].device_parameters()
         gin_backend = _NO_GIN_BACKEND
@@ -1387,8 +1406,8 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             num_experts=E,
             local_experts=int(kernel["local_experts"]),
             m64_max_rows=int(kernel["transport"]["m64_max_rows"]),
-            row_schedule=_row_schedule_setting(self._kernel_config.row_schedule),
-            tile_cost_ratio=_ROW_TILE_COST_RATIO.get((sm_count, self.ACT_CODEC)),
+            row_schedule=row_schedule,
+            tile_cost_ratio=tile_cost_ratio,
             stats=torch.zeros(1 + E, dtype=torch.int32, device=device),
             gathered_stats=torch.zeros(
                 (world_size, 1 + E), dtype=torch.int32, device=device

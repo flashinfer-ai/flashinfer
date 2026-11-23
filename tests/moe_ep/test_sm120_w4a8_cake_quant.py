@@ -234,3 +234,22 @@ def test_stage_inputs_cuda_graph(monkeypatch) -> None:
     assert torch.equal(bufs["x_fp8"][:128], c0) and torch.equal(bufs["x_sf"][:128], s0)
     assert torch.equal(bufs["topk_idx_out"][:128], ids)
     assert torch.equal(bufs["topk_weights_out"][:128], w)
+
+
+def test_fused_routing_needs_one_source_row_per_input_row() -> None:
+    """A routing source with fewer rows than the input (broadcastable [1, k]) takes the copy_ path
+    instead of the fused loads; a codes buffer on another device is rejected."""
+    rows, k = 4, 6
+    x = _make("special", rows, 4096, torch.bfloat16)
+    ids = torch.arange(k, device="cuda", dtype=torch.int64).view(1, k)
+    w = torch.rand(1, k, device="cuda")
+    ids_out = torch.full((8, k), -7, dtype=torch.int64, device="cuda")
+    w_out = torch.zeros(8, k, device="cuda")
+    mxfp8_quantize_fused(
+        x, topk_ids=ids, topk_weights=w, topk_ids_out=ids_out, topk_weights_out=w_out
+    )
+    assert torch.equal(ids_out[:rows], ids.expand(rows, k))
+    assert torch.equal(w_out[:rows], w.expand(rows, k))
+    assert torch.all(ids_out[rows:] == -7)
+    with pytest.raises(ValueError, match="buffer on"):
+        mxfp8_quantize_fused(x, codes=torch.empty(rows, 4096, dtype=torch.uint8))

@@ -168,11 +168,22 @@ def mxfp4_fused_supported(x: torch.Tensor) -> bool:
     )
 
 
-def _routing_fusable(src: torch.Tensor, out: torch.Tensor, dtype: torch.dtype) -> bool:
+def _routing_fusable(
+    src: torch.Tensor,
+    out: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
+    rows: int,
+) -> bool:
+    """One launch can copy this routing tensor: same device as the input, exactly ``rows`` source
+    rows (a broadcastable source keeps the ``copy_`` path), row-contiguous destination."""
     return (
         src.dtype == dtype
         and out.dtype == dtype
-        and src.is_cuda
+        and src.device == device
+        and out.device == device
+        and src.shape[0] == rows
+        and out.shape[0] >= rows
         and src.dim() == 2
         and out.dim() == 2
         and src.shape[1] == out.shape[1]
@@ -235,18 +246,23 @@ def mxfp4_quantize_fused(
             or buf.shape[1] != width
             or buf.stride(1) != 1
             or buf.stride(0) != width
+            or buf.device != values.device
         ):
             raise ValueError(
-                f"{name} must be a row-contiguous uint8 [>= {rows}, {width}] buffer"
+                f"{name} must be a row-contiguous uint8 [>= {rows}, {width}] buffer on {values.device}"
             )
     routing = topk_ids is not None
     fuse_routing = (
         routing
-        and _routing_fusable(topk_ids, topk_ids_out, torch.int64)  # type: ignore[arg-type]
-        and _routing_fusable(topk_weights, topk_weights_out, torch.float32)  # type: ignore[arg-type]
+        and _routing_fusable(topk_ids, topk_ids_out, torch.int64, values.device, rows)  # type: ignore[arg-type]
+        and _routing_fusable(
+            topk_weights,  # type: ignore[arg-type]
+            topk_weights_out,  # type: ignore[arg-type]
+            torch.float32,
+            values.device,
+            rows,
+        )
         and topk_ids.shape == topk_weights.shape  # type: ignore[union-attr]
-        and topk_ids_out.shape[0] >= rows  # type: ignore[union-attr]
-        and topk_weights_out.shape[0] >= rows  # type: ignore[union-attr]
     )
     if rows:
         top_k = int(topk_ids.shape[1]) if fuse_routing else 1  # type: ignore[union-attr]

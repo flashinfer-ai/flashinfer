@@ -8,7 +8,7 @@ call runs the configured layer. The option needs pre-quantized MXFP4 weights, th
 cake and cutedsl SM120 MegaMoE backends, whose packed FP4 tensors it shares. Where the nosync
 kernel cannot run (not compute capability 12.0, weights that are not MXFP4 such as the BF16
 weights of a ``SplitConfig`` layer, a cake layer with its in-kernel shared expert or a gated
-activation other than plain SwiGLU, an unsupported geometry), the option does nothing and every call runs the configured layer.
+activation other than plain SwiGLU, the FP4-activation cake twins, an unsupported geometry), the option does nothing and every call runs the configured layer.
 """
 
 from __future__ import annotations
@@ -166,6 +166,15 @@ class MoEEpNosyncLayer(nn.Module):
             return (
                 "the configured backend uses SiTU or SwiGLU with alpha / beta, which the "
                 "nosync kernel does not"
+            )
+        if _configured(backend, "kernel_name") in (
+            "sm120_nvfp4_nvfp4_bf16_cake",
+            "sm120_mxfp4_mxfp4_bf16_cake",
+        ):
+            # the nosync kernel stages MXFP8 activations; small calls would change activation format
+            return (
+                "the configured backend uses FP4 activations, and the nosync kernel stages MXFP8 "
+                "activations"
             )
         top_k = (
             options.top_k

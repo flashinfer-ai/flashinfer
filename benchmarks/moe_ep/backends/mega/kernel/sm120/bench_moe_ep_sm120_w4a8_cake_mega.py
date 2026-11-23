@@ -260,7 +260,7 @@ def main(
                 torch.cuda.synchronize()
                 timer.spans.clear()
                 forward = _time_forward(lambda: layer(inputs), args.iters, flush)
-                kernel = [a.elapsed_time(b) * 1e3 for a, b in timer.spans]
+                kernel_samples = [a.elapsed_time(b) * 1e3 for a, b in timer.spans]
 
                 def bucketed(inputs=inputs, tokens=tokens):
                     layer.stage_inputs(inputs, compile_tokens_per_rank=tokens)
@@ -294,7 +294,7 @@ def main(
                     "tokens_per_rank": tokens,
                     "table": ws.transport_table.name,
                     "instance": ws.last_launch.get("instance"),
-                    "kernel_us": _max_rank(statistics.median(kernel)),
+                    "kernel_us": _max_rank(statistics.median(kernel_samples)),
                     "forward_us": _max_rank(statistics.median(forward)),
                     "bucket_us": _max_rank(statistics.median(bucket_fwd)),
                     "graph_us": _max_rank(statistics.median(graph_fwd)),
