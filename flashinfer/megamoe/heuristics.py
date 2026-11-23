@@ -9,6 +9,7 @@ Shapes outside those buckets use the generic scheduling policy.
 """
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Optional, Tuple
 
 # SM90 shared-memory capacity, and the mailbox the interleaved scheduler
@@ -192,6 +193,23 @@ class FusedPlan:
     num_padded_sf_pool_tokens: int
 
 
+def _mxfp4_prepared_smem_bytes(
+    block_m: int, stages: int, num_experts: int, hidden: int, weight_tile_bytes: int
+) -> int:
+    """Bound the prepared BN256 swap-AB rings, combine scratch and mailboxes."""
+    cd = align(block_m * 256 * 2 + block_m * 8 * 4, 1024)
+    gemm = (
+        align(num_experts * 4, 1024)
+        + align(hidden, 1024)
+        + cd
+        + stages * (block_m * 128 + 2 * weight_tile_bytes + align(block_m * 4, 128))
+    )
+    combine = 3 * 8 * hidden * 2 // (1 if hidden <= 4096 else 2)
+    barriers = (2 + 2 * stages + 16) * 8
+    return max(gemm, combine) + barriers + INTERLEAVED_SCHEDULER_SMEM_BYTES
+
+
+@lru_cache(maxsize=256)
 def select_mxfp4_fused_plan(
     num_sms: int,
     num_ranks: int,
@@ -213,8 +231,8 @@ def select_mxfp4_fused_plan(
     a routed expert receives, which the slots split but do not add to.
     Canonical plans require hidden >= 2 * intermediate_hidden and
     intermediate_hidden <= 8192.
-    Noncanonical weight storage uses explicit H20 small-batch plans and never
-    falls through to a kernel expecting a different record format.
+    Noncanonical storage uses bounded H20 swap-AB plans, with explicit combine
+    alignment and shared-memory checks; it never changes the weight format.
     """
     if num_sms <= 1:
         raise ValueError("num_sms must be greater than one")
@@ -266,15 +284,26 @@ def select_mxfp4_fused_plan(
         if (
             num_sms != H20_NUM_SMS
             or num_ranks not in (8, 16)
-            or (num_experts, hidden, intermediate_hidden, num_topk)
-            != (256, 4096, 2048, 6)
             or num_tokens not in supported_tokens
             or num_logical_experts != num_experts
         ):
             raise ValueError(
                 f"noncanonical MXFP4 storage ({weight_tile_bytes}-byte records) "
                 "requires H20, EP8 or EP16, "
-                f"E256/H4096/I2048/top6 and M in {supported_tokens}, without expert slots"
+                f"M in {supported_tokens}, without expert slots"
+            )
+        if hidden < 2 * intermediate_hidden or intermediate_hidden > 8192:
+            raise ValueError(
+                "noncanonical MXFP4 storage requires hidden >= 2 * "
+                "intermediate_hidden and intermediate_hidden <= 8192"
+            )
+        if hidden > 4096 and hidden % 512:
+            raise ValueError(
+                "noncanonical MXFP4 combine requires hidden divisible by 512 above 4096"
+            )
+        if weight_tile_bytes == 8448 and num_max_tokens_per_rank <= 2 and hidden % 2048:
+            raise ValueError(
+                "compact MXFP4 with capacity <= 2 requires hidden divisible by 2048"
             )
         epw, swap = 16, True
         rs = weight_tile_bytes == 8448
@@ -282,6 +311,15 @@ def select_mxfp4_fused_plan(
             bm, stages = 8, 4 if num_tokens <= 2 else 6
         else:
             bm, stages = {32: (16, 6), 64: (24, 5), 128: (32, 4)}[num_tokens]
+        if (
+            _mxfp4_prepared_smem_bytes(
+                bm, stages, num_experts, hidden, weight_tile_bytes
+            )
+            > SMEM_CAPACITY
+        ):
+            raise ValueError(
+                "noncanonical MXFP4 plan exceeds SM90 shared-memory capacity"
+            )
     else:
         limit = max_tokens(24) * H20_NUM_SMS // num_sms
         bm = next((b for b in (8, 24, 32) if num_tokens <= max_tokens(b) * 7 // 10), 32)

@@ -9,12 +9,14 @@ FI_MEGAMOE_STATIC_ASSERT(kWeightTileBytes != 8448 || kUseRSOperand,
                          "Compact weights require register-source MMA");
 FI_MEGAMOE_STATIC_ASSERT(kWeightTileBytes != 16384 || !kUseRSOperand,
                          "FP8 weights require shared-source MMA");
-FI_MEGAMOE_STATIC_ASSERT(kWeightTileBytes == 8704 ||
-                             (kNumSMs == 78 && (kNumRanks == 8 || kNumRanks == 16) &&
-                              kNumExperts == 256 && kHidden == 4096 &&
-                              kIntermediateHidden == 2048 && kNumTopk == 6 && BLOCK_N == 256 &&
-                              kSwapABRequested && !kInKernelWeightCopy),
-                         "Prepared weight formats require the supported H20 geometry");
+FI_MEGAMOE_STATIC_ASSERT(
+    kWeightTileBytes == 8704 ||
+        (kNumSMs == 78 && (kNumRanks == 8 || kNumRanks == 16) && kHidden % 256 == 0 &&
+         kIntermediateHidden % 128 == 0 && kHidden >= 2 * kIntermediateHidden &&
+         kIntermediateHidden <= 8192 && (kHidden <= 4096 || kHidden % 512 == 0) &&
+         (kWeightTileBytes != 8448 || kNumMaxTokensPerRank > 2 || kHidden % 2048 == 0) &&
+         BLOCK_N == 256 && kSwapABRequested && !kInKernelWeightCopy),
+    "Prepared weight formats require legal H20 swap-AB geometry");
 
 // =====================================================================
 // Template checks

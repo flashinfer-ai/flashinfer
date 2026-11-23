@@ -550,6 +550,42 @@ def test_mxfp4_two_virtual_nodes_sf_tail(hidden, intermediate):
     )
 
 
+@pytest.mark.parametrize(
+    "storage,hidden,intermediate,experts,topk,capacity,tokens",
+    [
+        ("mxfp4_compact", 2048, 768, 128, 8, 2, [1]),
+        ("mxfp4_compact", 2048, 768, 128, 8, 4, [1, 4]),
+        ("fp8", 2048, 768, 128, 8, 4, [1, 4]),
+        ("mxfp4_compact", 512, 256, 256, 32, 4, [4]),
+    ],
+)
+def test_mxfp4_two_virtual_nodes_prepared_geometry(
+    storage, hidden, intermediate, experts, topk, capacity, tokens
+):
+    """Check prepared records against the dense reference and graph replays."""
+    if torch.cuda.device_count() < 8:
+        pytest.skip("needs 8 GPUs")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 only")
+    if torch.cuda.get_device_properties(0).multi_processor_count != 78:
+        pytest.skip("prepared plans require 78 SMs")
+    _run(
+        _namespace(
+            8,
+            hidden=hidden,
+            intermediate=intermediate,
+            experts=experts,
+            topk=topk,
+            slots=0,
+            capacity=capacity,
+            tokens=tokens,
+            weight_storage=storage,
+            nodes=2,
+            nodes_only=True,
+        )
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ep", type=int)

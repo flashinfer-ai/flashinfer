@@ -211,10 +211,7 @@ def test_mxfp4_canonical_keeps_generic_plans(num_sms, ep, tokens):
     [
         {"num_sms": 132},
         {"num_ranks": 4},
-        {"num_experts": 384},
-        {"hidden": 6144},
         {"intermediate_hidden": 3072},
-        {"num_topk": 8},
         {"num_tokens": 2},
         {"num_logical_experts": 128},
     ],
@@ -633,3 +630,82 @@ def test_mxfp4_canonical_scheduler_boundaries_reach_jit(hidden, intermediate, to
     )
     assert f"_k{topk}_h{hidden}_i{intermediate}_cap2_" in uri
     assert uri.endswith("_wt8704_nodes2")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("ep", [8, 16])
+@pytest.mark.parametrize("tile_bytes", [8448, 16384])
+@pytest.mark.parametrize(
+    "experts,hidden,intermediate,topk,capacity,tokens",
+    [
+        (128, 2048, 768, 8, 2, 1),
+        (128, 2048, 768, 8, 4, 1),
+        (128, 2048, 768, 8, 4, 4),
+        (256, 512, 256, 32, 4, 4),
+    ],
+)
+def test_mxfp4_prepared_model_geometry(
+    ep, tile_bytes, experts, hidden, intermediate, topk, capacity, tokens
+):
+    plan = select_mxfp4_fused_plan(
+        78,
+        ep,
+        experts,
+        topk,
+        hidden,
+        intermediate,
+        capacity,
+        tokens,
+        weight_tile_bytes=tile_bytes,
+    )
+    assert plan.swap_ab and plan.use_interleaved_scheduler
+    assert plan.rs_swap_ab == (tile_bytes == 8448)
+    uri = get_megamoe_sm90_mxfp4_uri(
+        plan,
+        78,
+        ep,
+        capacity,
+        experts,
+        topk,
+        hidden,
+        intermediate,
+        10.0,
+        True,
+        num_nodes=ep // 8,
+        weight_tile_bytes=tile_bytes,
+    )
+    assert f"_e{experts}_k{topk}_h{hidden}_i{intermediate}_cap{capacity}_" in uri
+    assert uri.endswith(f"_wt{tile_bytes}" + ("_nodes2" if ep == 16 else ""))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("ep", [8, 16])
+@pytest.mark.parametrize(
+    "tile_bytes,hidden,intermediate,capacity,tokens,message",
+    [
+        (8448, 512, 256, 2, 1, "hidden divisible by 2048"),
+        (8448, 512, 384, 4, 4, r"hidden >= 2 \* intermediate_hidden"),
+        (16384, 512, 384, 4, 4, r"hidden >= 2 \* intermediate_hidden"),
+        (8448, 32768, 8320, 4, 4, "intermediate_hidden <= 8192"),
+        (16384, 32768, 8320, 4, 4, "intermediate_hidden <= 8192"),
+        (8448, 4352, 1024, 4, 4, "hidden divisible by 512"),
+        (16384, 4352, 1024, 4, 4, "hidden divisible by 512"),
+        (8448, 12288, 2048, 4, 4, "shared-memory capacity"),
+        (16384, 12288, 2048, 4, 4, "shared-memory capacity"),
+    ],
+)
+def test_mxfp4_prepared_rejects_unsafe_geometry(
+    ep, tile_bytes, hidden, intermediate, capacity, tokens, message
+):
+    with pytest.raises(ValueError, match=message):
+        select_mxfp4_fused_plan(
+            78,
+            ep,
+            256,
+            6,
+            hidden,
+            intermediate,
+            capacity,
+            tokens,
+            weight_tile_bytes=tile_bytes,
+        )
