@@ -4981,7 +4981,9 @@ def test_split_row_sampling_reads_scalar_loaded_offset_view_in_place(api):
     # The launch needs both an SM90 device and a kernel compiled for it: a build that
     # targets an older architecture falls back to the single-CTA kernels.
     targets = current_compilation_context.TARGET_CUDA_ARCHS
-    if torch.cuda.get_device_capability()[0] != 9 or all(m != 9 for m, _ in targets):
+    if torch.cuda.get_device_capability("cuda:0")[0] != 9 or all(
+        m != 9 for m, _ in targets
+    ):
         pytest.skip("split-row rejection sampling requires SM90 and an SM90 build")
 
     call, is_logits = _UNALIGNED_INPUT_CALLS[api]
@@ -5009,7 +5011,7 @@ def test_chain_speculative_sampling_rejects_unaligned_probs():
 def test_blackwell_softmax_rejects_unaligned_logits():
     # A base that is not 32-byte aligned takes the OnlineSoftmax fallback, which reads
     # 16 bytes at once: a base that is not 16-byte aligned must be refused before it.
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+    if torch.cuda.get_device_capability("cuda:0") not in ((10, 0), (10, 3)):
         pytest.skip("Blackwell Softmax routes require SM100 or SM103")
 
     logits = _storage_offset_view(_unaligned_input(True, 128), 1)
