@@ -381,8 +381,9 @@ class MoELayer:
                 f"runners: [{mvp}].{hint}{reasons}"
             )
 
-        # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
-        # routing input mode).  See the MoELayer reuse contract (CR4): the
+        # Cross-backend winner cache, keyed by token-count bucket, routing
+        # mode, eligible runners, and effective Prims-TS finalization modes.
+        # See the MoELayer reuse contract (CR4): the
         # fastest backend can differ across token-count buckets, so each bucket
         # caches its own winner; the mode qualifier keeps a winner tuned for
         # one routing input style (e.g. pre-routed → CuteDSL) from being
@@ -403,7 +404,8 @@ class MoELayer:
 
         Only runners that support this pack's ``routing_input_mode`` compete —
         not every backend has an in-kernel router — and the winner is cached
-        per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+        per token-count bucket, routing mode, eligible runners, and effective
+        Prims-TS finalization modes so repeated calls skip reselection.
         Candidate pools containing Frost low-latency use exact token counts
         because their bounded tactics need not cover every row in a bucket.
 
@@ -434,6 +436,7 @@ class MoELayer:
             If no usable backend supports this pack's ``routing_input_mode``.
         """
         eligible = self._eligible_runners(act_pack, weight_pack)
+        runners = [self.runners[index] for index in eligible]
         ceiling = self.config.execution.tune_max_num_tokens
         mode = act_pack.routing_input_mode
 
@@ -442,16 +445,22 @@ class MoELayer:
         # Sharing their winner with T=3 or T=5..7 is not a valid specialization.
         # Other candidate pools retain hybrid bucketing; Frost admits at most
         # eight token counts, so exact keys remain bounded.
-        if any(
-            isinstance(self.runners[index], FrostLowLatencyRunner) for index in eligible
-        ):
+        if any(isinstance(runner, FrostLowLatencyRunner) for runner in runners):
             bucket = act_pack.num_tokens
         # Candidate positions distinguish different options for the same backend
         # and prevent changing weight views or shape eligibility from reusing a winner.
-        winner_key = (bucket, mode, eligible)
+        # A fused-only tactic cannot survive a change to the effective mode.
+        # Use the runner's predicate before packing, including on cache hits.
+        finalize_modes = tuple(
+            runner._effective_fused_finalize(
+                zero_rows_without_local_expert=act_pack.zero_rows_without_local_expert
+            )
+            for runner in runners
+            if isinstance(runner, PrimsTsRunner)
+        )
+        winner_key = (bucket, mode, eligible, finalize_modes)
         winner = self._winners.get(winner_key)
         if winner is None:
-            runners = [self.runners[index] for index in eligible]
             winner = self._select_winner(act_pack, weight_pack, runners)
             self._winners[winner_key] = winner
             if len(self._winners) > 128:

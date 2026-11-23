@@ -1299,9 +1299,9 @@ def test_prims_ts_unified_cache_tracks_effective_finalize_for_each_call(monkeypa
             for t in runner.get_valid_tactics(unfused, None)
             if t != -1 and t[0] == 512
         ] == [[512, 0], [512, 1]]
-        assert runner.get_cache_key_extras(
-            list(unfused)
-        ) == runner.get_cache_key_extras(unfused)
+        # Bare lists carry no call options and must not inherit mutable inner
+        # state. Profiling retains the packed input's launch metadata instead.
+        assert runner.get_cache_key_extras(list(unfused)) == fused_key
         # A previously packed call must not inherit another call's options.
         assert runner.get_cache_key_extras(packed) == fused_key
     deterministic = True

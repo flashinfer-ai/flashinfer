@@ -41,6 +41,7 @@ def test_fused_finalize_config(warps, prefix, stages):
             validate_config(invalid, problem_mnk=(8192, 1024, 512))
 
 
+@pytest.mark.arch_rubin
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "layout,tactic,prefix,stages,warps,release,ahead",
@@ -73,6 +74,7 @@ def test_fused_finalize_replay(
     router_weight_dtype=torch.bfloat16,
     hidden=1024,
     guard_output=False,
+    router_weight_offset=0,
 ):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Native BatchM finalization requires Rubin")
@@ -91,6 +93,12 @@ def test_fused_finalize_replay(
         if kwargs["fc"] == "fc1" and fc1_enabled:
             kwargs["cfg"] = replace(kwargs["cfg"], **fc1_overrides)
         if kwargs["cfg"].fuse_moe_finalize:
+            if router_weight_dtype == torch.bfloat16 and kwargs["num_tokens"] == tokens:
+                # Aligned caller coefficients must retain the zero-copy path.
+                same_pointer = (
+                    kwargs["finalize_scales"].data_ptr() == router_weights.data_ptr()
+                )
+                assert same_pointer == (router_weight_offset == 0)
             kwargs["cfg"] = replace(
                 kwargs["cfg"],
                 dense_epilogue_warps=warps,
@@ -139,7 +147,9 @@ def test_fused_finalize_replay(
         torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16), quant=quant
     )
     ids = torch.empty((tokens, top_k), device="cuda", dtype=torch.int32)
-    router_weights = torch.empty_like(ids, dtype=router_weight_dtype)
+    router_weights = torch.empty(
+        ids.numel() + router_weight_offset, device="cuda", dtype=router_weight_dtype
+    )[router_weight_offset:].view_as(ids)
     guarded_outputs = []
 
     def allocate_output():
@@ -264,6 +274,7 @@ def test_fused_finalize_replay(
             with torch.cuda.stream(worker):
                 target.fill_(float("nan"))
                 replay.replay()
+        for worker in streams:
             caller.wait_stream(worker)
         for target in (out, other_out):
             assert torch.isfinite(target).all()
@@ -284,7 +295,13 @@ def test_fused_finalize_replay(
             topk_weights=router_weights[:1],
         )
         reference = run(False)[0]
-        actual = run()[0]
+        # A contiguous single-row view can have a wider unused row pitch.
+        tiny_backing = torch.full(
+            (1, hidden + 64), 19.0, device="cuda", dtype=torch.bfloat16
+        )
+        actual = tiny_backing[:, :hidden]
+        run(output=actual)
+        assert torch.all(tiny_backing[:, hidden:] == 19)
         assert torch.isfinite(actual).all()
         assert (
             actual.float() - reference.float()
@@ -379,6 +396,36 @@ def test_fused_finalize_fp32_router_weights_replay(monkeypatch):
         router_weight_dtype=torch.float32,
     )
     assert finalize_dtypes and set(finalize_dtypes) == {torch.bfloat16}
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("offset", [0, 1])
+def test_fused_finalize_router_weight_alignment_replay(monkeypatch, offset):
+    from flashinfer.prims_ts.moe import runner
+
+    build_io = runner.build_nvfp4_launch_io
+    seen = []
+
+    def aligned_finalize(**kwargs):
+        if kwargs["cfg"].fuse_moe_finalize:
+            assert kwargs["finalize_scales"].data_ptr() % 16 == 0
+            seen.append(kwargs["finalize_scales"])
+        return build_io(**kwargs)
+
+    monkeypatch.setattr(runner, "build_nvfp4_launch_io", aligned_finalize)
+    test_fused_finalize_replay(
+        monkeypatch,
+        "BlockMajorK",
+        [1024, 0],
+        2,
+        1,
+        8,
+        0,
+        -1,
+        router_weight_offset=offset,
+    )
+    assert seen
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -1182,7 +1182,10 @@ def build_nvfp4_launch_io(
         # The ABI's pitch is along logical M. Batch-M stores contiguous hidden
         # rows and derives its C/SF-C strides from N; no output repack is needed.
         storage_width = output_hidden // (2 if cfg.has_output_block_scaling else 1)
-        if output_buf.dim() == 2 and output_buf.stride() != (storage_width, 1):
+        if output_buf.dim() == 2 and (
+            output_buf.stride(1) != 1
+            or (output_buf.shape[0] > 1 and output_buf.stride(0) != storage_width)
+        ):
             raise ValueError(
                 f"{fc} Batch-M output requires storage row stride {storage_width} "
                 f"with unit column stride, got {output_buf.stride()}"
@@ -1334,7 +1337,11 @@ def build_nvfp4_launch_io(
         cutlass.BFloat16,
         finalize_scales.data_ptr() if cfg.fuse_moe_finalize else dummy_data_ptr,
         cutlass.AddressSpace.gmem,
-        assumed_align=16,
+        assumed_align=(
+            16
+            if not cfg.fuse_moe_finalize or finalize_scales.data_ptr() % 16 == 0
+            else 2
+        ),
     )
     finalize_route_dp = make_ptr(
         cutlass.Int32,

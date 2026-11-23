@@ -1828,6 +1828,17 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             self, kwargs
         ) and supports_fused_finalize(fc2_cfg)
 
+        # A contiguous BF16 view may still start at an unaligned offset.
+        # Bind aligned coefficients before routing or output zeroing; aligned
+        # caller buffers retain their zero-copy path, including graph capture.
+        if (
+            fuse_finalize
+            and moe_inputs.expert_weights is not None
+            and moe_inputs.expert_weights.dtype == torch.bfloat16
+            and moe_inputs.expert_weights.data_ptr() % 16
+        ):
+            moe_inputs.expert_weights = moe_inputs.expert_weights.clone()
+
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
         topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)

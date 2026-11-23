@@ -16,6 +16,7 @@ import contextlib
 from dataclasses import replace
 import gc
 import weakref
+from types import SimpleNamespace
 
 import pytest
 
@@ -186,3 +187,37 @@ def test_descriptor_mode_is_bound_at_preparation_and_rebinds_safely(monkeypatch)
     assert preparations[-1][4] is io["c0_dp"]
     assert runner._launch_arg_tuple(io, None)[-1] is io["tma_desc_storage_dp"]
     assert io["tma_desc_storage_dp"] is not first
+
+
+@pytest.mark.parametrize("reencode", [False, True])
+def test_executable_rejects_descriptor_mode_change(monkeypatch, reencode):
+    calls = []
+    io = _io()
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", str(int(reencode)))
+    monkeypatch.setattr(runner, "_build_launch_io", lambda **kwargs: io)
+    monkeypatch.setattr(
+        runner.torch.cuda, "Stream", lambda: SimpleNamespace(cuda_stream=0)
+    )
+
+    def prepare(io, stream):
+        io["_reencode_tma"] = runner._env_flag_enabled(
+            "FLASHINFER_PRIMS_TS_REENCODE_TMA"
+        )
+
+    def compile(io, stream):
+        prepare(io, stream)
+        return lambda *args: calls.append(args)
+
+    monkeypatch.setattr(runner, "_compile_for_launch", compile)
+    monkeypatch.setattr(runner, "_prepare_tma_descriptors", prepare)
+    executable = runner.compile()
+    assert executable.reencode_tma is reencode
+    runner.run(executable, io, None)
+    assert calls[-1][-1] is (None if reencode else io["tma_desc_storage_dp"])
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", str(int(not reencode)))
+    with pytest.raises(ValueError, match="recompile"):
+        runner.run(executable, io, None)
+    assert len(calls) == 1
+    executable = runner.compile()
+    runner.run(executable, io, None)
+    assert calls[-1][-1] is (io["tma_desc_storage_dp"] if reencode else None)

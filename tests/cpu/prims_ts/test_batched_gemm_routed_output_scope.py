@@ -18,11 +18,88 @@ import pytest
 import torch
 
 from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+    _active_output_scale_offsets,
+    _active_quantized_output,
     _active_route_output,
+    _poison_checked_output,
     _same_launch_output,
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.uint8, torch.float32])
+def test_repeat_poison_detects_missing_c_or_scale_store_and_preserves_guards(dtype):
+    storage = torch.full((32,), 19, dtype=dtype)
+    output = storage[4:-4]
+    touched = torch.zeros_like(output, dtype=torch.bool)
+    touched[4:12] = True
+    first = torch.arange(8).to(dtype)
+    output[touched] = first
+    for repeat in (1, 2, 3):
+        _poison_checked_output(output, repeat, touched)
+        assert not _same_launch_output(output[touched], first)
+        assert torch.all(output[~touched] == 19)
+        assert torch.all(storage[:4] == 19) and torch.all(storage[-4:] == 19)
+        output[touched] = first
+
+
+@pytest.mark.parametrize("values_per_byte", [1, 2])
+@pytest.mark.parametrize("layout", [1, 2])
+def test_quantized_repeat_excludes_padded_tokens_but_keeps_guard_checks(
+    values_per_byte, layout
+):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _sf_c_index_grid
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
+
+    layout = int(SfLayout.R8c4 if layout == 1 else SfLayout.R128c4)
+    active = torch.tensor([True, False, True, False])
+    width, pitch, offset = 64, 128, 32
+    storage = torch.full((4 * pitch // values_per_byte + 16,), 19, dtype=torch.uint8)
+    scales = torch.full((4096,), 23, dtype=torch.uint8)
+    offsets = _active_output_scale_offsets(
+        active, width=width, pitch=pitch, offset=offset, block_size=16, layout=layout
+    )
+    full_grid = _sf_c_index_grid(
+        output_m=width,
+        n=4,
+        sf_layout_c=layout,
+        sf_block_size=16,
+        is_swap_ab=True,
+        device="cpu",
+        pitch=pitch,
+        m_offset=offset,
+    )
+    assert torch.equal(offsets, full_grid[::16, active].T)
+
+    def observable():
+        return _active_quantized_output(
+            storage,
+            active,
+            width=width,
+            pitch=pitch,
+            offset=offset,
+            values_per_byte=values_per_byte,
+        )
+
+    first, first_scales = observable().clone(), scales[offsets].clone()
+    for row in (1, 3):
+        storage[
+            row * pitch // values_per_byte : (row + 1) * pitch // values_per_byte
+        ] = 99
+    padded_offsets = _active_output_scale_offsets(
+        ~active, width=width, pitch=pitch, offset=offset, block_size=16, layout=layout
+    )
+    scales[padded_offsets] = 99
+    assert _same_launch_output(first, observable())
+    assert _same_launch_output(first_scales, scales[offsets])
+    storage[-1] = 0  # Numeric scope does not replace the independent guard audit.
+    assert _same_launch_output(first, observable())
+    assert storage[-1] != 19
+    storage[offset // values_per_byte] ^= 1
+    scales[offsets[0, 0]] ^= 1
+    assert not _same_launch_output(first, observable())
+    assert not _same_launch_output(first_scales, scales[offsets])
 
 
 @pytest.mark.parametrize("is_swap_ab", [False, True])

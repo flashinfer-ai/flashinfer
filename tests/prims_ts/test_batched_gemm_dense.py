@@ -248,6 +248,8 @@ def test_shared_release_matches_dkg_union_and_arrival_count(monkeypatch, dim_x, 
         "_atom_mask",
         "_project_payload_to_barrier_owners",
         "cga_policy_mask",
+        "cga_policy_selected",
+        "input_tma_release",
     ):
         monkeypatch.setattr(cga, name, python_body(getattr(cga, name)))
     arrivals = [0] * (dim_x * dim_y)
@@ -1092,6 +1094,10 @@ def test_dense_fused_cga4_elects_weight_payload_issuers(monkeypatch, dim_x, dim_
 
     cfg = _preloaded_epilogue_config(cluster_dim_x=4, cluster_dim_y=dim_y)
     monkeypatch.setattr(cga, "Int32", int)
+    monkeypatch.setattr(cga, "Boolean", bool)
+    monkeypatch.setattr(
+        cga, "cga_policy_selected", python_body(cga.cga_policy_selected)
+    )
     issued = []
     monkeypatch.setattr(
         cga, "_issue_tma_load_impl", lambda *args, **kwargs: issued.append(args)
@@ -1297,6 +1303,8 @@ def test_split_tma_releases_all_and_only_pair_users(monkeypatch, dim_x, dim_y, w
         "_atom_mask",
         "_project_payload_to_barrier_owners",
         "cga_policy_mask",
+        "cga_policy_selected",
+        "input_tma_release",
     ):
         monkeypatch.setattr(cga, name, python_body(getattr(cga, name)))
     arrivals = [0] * (dim_x * dim_y)

@@ -40,6 +40,8 @@ def _independent_pair(cga_shape=(4, 2), *, partitioned=False, scheduler="clc"):
 
 
 def _host_masks(monkeypatch, shape, rank):
+    from flashinfer.prims_ts.batched_gemm import mixed_cga_ts
+
     x, y = rank % shape[0], rank // shape[0]
     monkeypatch.setattr(cga, "Int32", int)
     monkeypatch.setattr(cga, "Boolean", bool)
@@ -59,6 +61,7 @@ def _host_masks(monkeypatch, shape, rank):
         "input_tma_payload_mask",
     ):
         monkeypatch.setattr(cga, name, python_body(getattr(cga, name)))
+    monkeypatch.setattr(mixed_cga_ts, "input_tma_release", cga.input_tma_release)
 
 
 @pytest.mark.parametrize(

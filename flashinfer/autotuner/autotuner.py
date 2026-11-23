@@ -3534,7 +3534,11 @@ class AutoTuner:
                             # deterministic / realistic distribution before
                             # the per-tactic profile loop.
                             if tuning_config.inputs_pre_hook is not None:
-                                tensors = list(tuning_config.inputs_pre_hook(tensors))
+                                tensors = tuning_config.inputs_pre_hook(tensors)
+                                # List subclasses may bind immutable per-call
+                                # metadata needed for enumeration/cache writes.
+                                if not isinstance(tensors, list):
+                                    tensors = list(tensors)
                             prepared_input_batches = (
                                 self._prepare_input_tensors_with_batches(
                                     tensors, tuning_config
@@ -4221,7 +4225,9 @@ class AutoTuner:
                     )
                 tensors = self._prepare_input_tensors(profile, inputs)
                 if tuning_config.inputs_pre_hook is not None:
-                    tensors = list(tuning_config.inputs_pre_hook(tensors))
+                    tensors = tuning_config.inputs_pre_hook(tensors)
+                    if not isinstance(tensors, list):
+                        tensors = list(tensors)
             except (torch.cuda.OutOfMemoryError, MemoryError):
                 if _tune_process_group is None:
                     raise

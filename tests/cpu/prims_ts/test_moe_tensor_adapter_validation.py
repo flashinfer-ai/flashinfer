@@ -119,8 +119,18 @@ def test_gemm1_oa_validation_uses_local_expert_count():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("rows,width", [(512, 256), (768, 256), (512, 288)])
-def test_nvfp4_batch_m_output_requires_exact_row_pitch(rows, width):
+@pytest.mark.parametrize(
+    "rows,width,coeff_offset",
+    [
+        (512, 256, 0),
+        (768, 256, 0),
+        (512, 288, 0),
+        (1, 256, 0),
+        (1, 288, 0),
+        (1, 288, 1),
+    ],
+)
+def test_nvfp4_batch_m_output_requires_exact_row_pitch(rows, width, coeff_offset):
     from flashinfer.prims_ts.moe.config_mapper import map_trtllm_nvfp4_moe_tactic
     from flashinfer.prims_ts.moe.tensor_adapter import build_nvfp4_launch_io
 
@@ -158,7 +168,19 @@ def test_nvfp4_batch_m_output_requires_exact_row_pitch(rows, width):
         intermediate_size=256,
         hidden_size=256,
     )
-    if width != 256:
+    if rows == 1:
+        from flashinfer.prims_ts.moe.epilogue_policy import fused_finalize_config
+
+        kwargs.update(
+            cfg=fused_finalize_config(cfg),
+            num_tokens=1,
+            finalize_output=kwargs["gemm2_output"][:, :256],
+            finalize_scales=torch.ones(2 + coeff_offset, dtype=torch.bfloat16)[
+                coeff_offset:
+            ].view(1, 2),
+            finalize_route_map=kwargs["route_map"],
+        )
+    if width != 256 and rows > 1:
         with pytest.raises(
             ValueError, match="Batch-M output requires storage row stride"
         ):
@@ -166,3 +188,5 @@ def test_nvfp4_batch_m_output_requires_exact_row_pitch(rows, width):
     else:
         io = build_nvfp4_launch_io(**kwargs)
         assert io["c0_dp"]._pointer == kwargs["gemm2_output"].data_ptr()
+        if rows == 1:
+            assert io["finalize_scale_dp"]._assumed_align == (2 if coeff_offset else 16)

@@ -225,8 +225,29 @@ def _verify_repeated_tile_lifetimes(plan):
             elif action.op == op.RELEASE:
                 assert not released and not pending_reads
                 released = True
+        assert not issuing
         assert released and not registers and not completed_reads
         assert seen == list(range(plan.fragment_count))
+
+
+def test_lifetime_audit_rejects_missing_final_commit():
+    cfg = _step_config(
+        schedules.epilogue_steps_for_prefix(0, finalize=True), finalize=True
+    )
+    plan = cfg.preload_epilogue_plan
+    _verify_repeated_tile_lifetimes(plan)
+    last_commit = max(
+        i
+        for i, action in enumerate(plan.actions)
+        if action.op == schedules.EpilogueOp.COMMIT
+    )
+    with pytest.raises(AssertionError):
+        _verify_repeated_tile_lifetimes(
+            replace(
+                plan,
+                actions=plan.actions[:last_commit] + plan.actions[last_commit + 1 :],
+            )
+        )
 
 
 @pytest.mark.parametrize("warps", [4, 8])
@@ -590,10 +611,15 @@ def test_fc1_emit_uses_streaming_cache_policy(monkeypatch, streaming, group):
         tile_n=256,
         num_bytes_c_tma_store_per_group=4096,
         warp_layout=SimpleNamespace(epilogue_warp_idx=0),
-        preload_epilogue_plan=SimpleNamespace(
-            output_unit=2,
+        preload_epilogue_plan=schedules.EpilogueStepPlan(
+            steps=(),
+            actions=(),
+            warps=8,
+            finalize=False,
             scratch_stages=1,
-            fc1_fragment_index=lambda fragment, group: fragment + group * 4,
+            retained_fragments=(),
+            peak_payload_words=0,
+            gated=True,
         ),
     )
     resource = SimpleNamespace(
@@ -609,7 +635,7 @@ def test_fc1_emit_uses_streaming_cache_policy(monkeypatch, streaming, group):
     )
     assert calls == [
         (
-            ("descriptor", group * 4096, (256, 256 + group * 128)),
+            ("descriptor", group * 4096, (256 + group * 64, 256)),
             dict(l2_cache_hint=policy if streaming else None),
         )
     ]

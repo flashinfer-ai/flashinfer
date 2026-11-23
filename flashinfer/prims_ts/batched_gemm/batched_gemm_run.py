@@ -2052,7 +2052,7 @@ _C_STRIDE_SENTINEL_U8 = 0xA5
 # arithmetic, so any element left poisoned fails the existing NaN check.
 _C_UNWRITTEN_POISON_F = float("nan")
 # E4M3 encodes NaN at 0x7F, so poisoned FP8 storage decodes to NaN too. E2M1
-# has no NaN encoding, so FP4 output keeps its zero fill and is not covered.
+# has no NaN encoding, so checked FP4 repeats use changing bit patterns instead.
 _C_UNWRITTEN_POISON_E4M3_U8 = 0x7F
 
 
@@ -2077,6 +2077,49 @@ def _same_launch_output(first: torch.Tensor, current: torch.Tensor) -> bool:
     return torch.equal(
         first.contiguous().view(torch.uint8), current.contiguous().view(torch.uint8)
     )
+
+
+def _poison_checked_output(output, repeat, touched=None):
+    """Invalidate previous results without resetting allocation/stride guards."""
+    if output.dtype == torch.uint8:
+        # FP4 has no NaN. Change every byte from its previous result, with a
+        # different mask each repeat, so a missing store cannot look unchanged.
+        mask = repeat % 255 + 1
+        if touched is None:
+            output.bitwise_xor_(mask)
+        else:
+            output[touched] = output[touched] ^ mask
+    elif touched is None:
+        output.fill_(_C_UNWRITTEN_POISON_F)
+    else:
+        output[touched] = _C_UNWRITTEN_POISON_F
+
+
+def _active_quantized_output(
+    storage, active, *, width, pitch, offset=0, values_per_byte=2
+):
+    """Token-major packed C bytes (or nibbles for unaligned row boundaries)."""
+    if width % values_per_byte or pitch % values_per_byte or offset % values_per_byte:
+        rows = torch.nonzero(active, as_tuple=False).flatten()[:, None]
+        indices = rows * pitch + torch.arange(width, device=storage.device) + offset
+        return (storage[indices // 2] >> ((indices % 2) * 4)) & 0xF
+    rows = torch.as_strided(
+        storage[offset // values_per_byte :],
+        (active.numel(), width // values_per_byte),
+        (pitch // values_per_byte, 1),
+    )
+    return rows[active]
+
+
+def _active_output_scale_offsets(active, *, width, pitch, offset, block_size, layout):
+    end = _round_up(offset + width, block_size) // block_size
+    return _sf_offsets(
+        row_idx=torch.nonzero(active, as_tuple=False).flatten(),
+        sf_cols=end,
+        layout=layout,
+        num_padded_sf_cols=_round_up(pitch, block_size * 4) // block_size,
+        device=active.device,
+    )[:, offset // block_size :]
 
 
 def _partition_view(storage, width, cols, pitch):
@@ -3129,26 +3172,40 @@ def reference_check(
     outputs_deterministic = True
     scales_deterministic = True
     active_scale_offsets = None
-    if repeat_launches > 1 and cfg.has_output_block_scaling and not cfg.is_swap_ab:
+    if repeat_launches > 1 and cfg.has_output_block_scaling:
         # SF-C for unobserved padded rows is unspecified, just like C. Select
         # every scale used by a real row; allocation guards stay independent.
-        sf_cols = (
-            _round_up(logical_output_n, cfg.output_sf_block_size_c)
-            // cfg.output_sf_block_size_c
-        )
-        active_scale_offsets = _sf_offsets(
-            row_idx=torch.nonzero(active_route_mask, as_tuple=False).flatten(),
-            sf_cols=sf_cols,
+        active_scale_offsets = _active_output_scale_offsets(
+            active_route_mask,
+            width=logical_output_m if cfg.is_swap_ab else logical_output_n,
+            pitch=c_pitch if cfg.is_swap_ab else logical_output_n,
+            offset=sf_c_m_offset if cfg.is_swap_ab else 0,
+            block_size=cfg.output_sf_block_size_c,
             layout=cfg.sf_layout_c,
-            num_padded_sf_cols=_round_up(sf_cols, 4),
-            device=device,
         )
-    for _ in range(repeat_launches):
-        if require_mixed_cga_runtime:
-            # Count one physical grid, not the sum of repeated launches,
-            # when checking whether the logical work exceeds a grid wave.
-            num_non_exiting_ctas[1:].zero_()
-        compiled_fn(*_launch_arg_tuple(ref_io, stream))
+    launch_stream = torch.cuda.ExternalStream(int(stream), device=device)
+    for repeat in range(repeat_launches):
+        launch_stream.wait_stream(torch.cuda.current_stream(device=device))
+        with torch.cuda.stream(launch_stream):
+            if repeat_launches > 1:
+                if cfg.has_output_block_scaling:
+                    _poison_checked_output(c_storage, repeat, c_touched)
+                    _poison_checked_output(sf_c_torch, repeat, sf_c_touched)
+                elif cfg.uses_fp8_output:
+                    output_view = torch.as_strided(
+                        c_storage[c_partition_offset:],
+                        (logical_output_m, logical_output_n),
+                        (1, c_pitch) if cfg.is_swap_ab else (logical_output_n, 1),
+                    )
+                    output_view.fill_(_C_UNWRITTEN_POISON_E4M3_U8)
+                    if cfg.has_deepseek_fp8_c_scale:
+                        _poison_checked_output(sf_c_torch, repeat)
+                else:
+                    _poison_checked_output(c_torch, repeat)
+            if require_mixed_cga_runtime:
+                # Count one physical grid, not the sum of repeated launches.
+                num_non_exiting_ctas[1:].zero_()
+            compiled_fn(*_launch_arg_tuple(ref_io, stream))
         torch.cuda.synchronize()
         if repeat_launches > 1:
             scale_tensor = (
@@ -3161,16 +3218,15 @@ def reference_check(
                 if (cfg.has_output_block_scaling or cfg.uses_fp8_output)
                 else c_torch
             )
-            if (
-                cfg.has_output_block_scaling
-                and not cfg.is_swap_ab
-                and logical_output_n % 2 == 0
-            ):
-                # FP4 has no NaN encoding. Inactive routed rows can therefore
-                # produce arbitrary packed bytes even when SF-C is zero.
-                # For whole-byte rows, compare raw bytes for every real token,
-                # with the same padding exclusion as plain output below.
-                output_tensor = _active_routes(c_storage.reshape(logical_output_m, -1))
+            if cfg.has_output_block_scaling:
+                output_tensor = _active_quantized_output(
+                    c_storage,
+                    active_route_mask,
+                    width=logical_output_m if cfg.is_swap_ab else logical_output_n,
+                    pitch=c_pitch if cfg.is_swap_ab else logical_output_n,
+                    offset=c_partition_offset if cfg.is_swap_ab else 0,
+                    values_per_byte=1 if cfg.uses_mxfp8_output_quant else 2,
+                )
             elif cfg.uses_fp8_output:
                 output_tensor = _active_routes(
                     torch.as_strided(
@@ -4638,6 +4694,7 @@ class _BatchedGemmExecutable:
     compiled_fn: object
     shape: tuple
     torch_stream: object = None
+    reencode_tma: bool = False
 
 
 def _fused_finalize_args(io: dict) -> tuple:
@@ -4859,7 +4916,10 @@ def compile(**cfg) -> _BatchedGemmExecutable:  # noqa: A001
     stream = cuda_drv.CUstream(torch_stream.cuda_stream)
     compiled_fn = _compile_for_launch(io, stream)
     return _BatchedGemmExecutable(
-        compiled_fn=compiled_fn, shape=io["shape"], torch_stream=torch_stream
+        compiled_fn=compiled_fn,
+        shape=io["shape"],
+        torch_stream=torch_stream,
+        reencode_tma=io.get("_reencode_tma", False),
     )
 
 
@@ -4870,6 +4930,8 @@ def prepare_tensors(**cfg) -> dict:
 
 def run(executable: _BatchedGemmExecutable, tensors: dict, stream) -> None:
     """Launch the compiled kernel on ``stream`` with ``tensors``."""
+    if _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA") != executable.reencode_tma:
+        raise ValueError("TMA descriptor mode changed; recompile the kernel before run")
     if tensors["shape"] != executable.shape:
         raise ValueError(
             f"prepared tensors shape {tensors['shape']} does not match the "

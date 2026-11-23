@@ -66,7 +66,9 @@ class Fixture:
             == self.source_tensors[name]["sha256"]
         ), f"source checksum mismatch: {name}"
         if self.prefix and name in ("B", "SFB", "route"):
-            array = array[: array.size // self.source_experts * self.experts]
+            array = array.reshape(-1)[
+                : array.size // self.source_experts * self.experts
+            ]
         return array
 
     def load(self, name, device="cpu"):

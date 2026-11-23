@@ -7727,25 +7727,29 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             self._weight_layout(),
         )
 
-    def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+    def _effective_fused_finalize(self, **overrides) -> bool:
+        """Resolve the call mode before packing with the execution predicate."""
         if self._pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
-            return ()
+            return False
         from flashinfer.prims_ts.moe.epilogue_policy import fused_finalize_requested
 
         options = dict(
             use_fused_finalize=self.config.finalize.use_fused_finalize,
             do_finalize=self.config.finalize.do_finalize,
         )
+        options.update(overrides)
+        return fused_finalize_requested(self._inner or self, options)
+
+    def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        if self._pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            return ()
+        options: dict[str, Any] = {}
         state = self.launch_state_for(inputs)
         if isinstance(state, _TrtllmLaunchState):
             options.update(state.static_kwargs)
-        elif self._inner is not None:
-            # Profiling uses a plain list; inputs_pre_hook binds this call's
-            # options to the inner runner before enumeration and cache writes.
-            options.update(dict(self._inner._cache_key_static_extras))
         return (
             "effective_fused_finalize",
-            fused_finalize_requested(self._inner or self, options),
+            self._effective_fused_finalize(**options),
         )
 
     def _weight_layout(self, view: Optional[dict] = None) -> int:
@@ -7872,8 +7876,8 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
         self._require_built()
-        # Under autotune the pack's ``inputs_pre_hook`` has already synced the
-        # inner extras; a direct call with the packed list syncs here.
+        # Profiling inputs retain the candidate's immutable launch state, even
+        # if another forward has updated the inner runner since preparation.
         self._sync_inner_static_extras(getattr(inputs, "launch_state", None))
         return self._inner.get_valid_tactics(inputs, profile)
 
@@ -7891,6 +7895,23 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             self._inner.weight_layout = WeightLayout(
                 launch_state.static_kwargs["weight_layout"]
             )
+
+    def _bind_tuning_config(
+        self, tuning_config: TuningConfig, launch_state: _TrtllmLaunchState
+    ) -> TuningConfig:
+        # The autotuner calls get_valid_tactics(tensors, profile) with no
+        # launch kwargs, but runs inputs_pre_hook first; retain this pack's
+        # static extras on the synthesized inputs through the cache write.
+        inner, inner_hook = self._inner, tuning_config.inputs_pre_hook
+
+        def _bind_static_extras(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
+            inner.set_cache_key_static_extras(**launch_state.static_kwargs)
+            tensors = inner_hook(tensors) if inner_hook is not None else tensors
+            return _TrtllmPackedInputs(
+                tensors, tuning_config=tuning_config, launch_state=launch_state
+            )
+
+        return dataclasses.replace(tuning_config, inputs_pre_hook=_bind_static_extras)
 
     def precompile_tactics(
         self,
@@ -8218,18 +8239,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             tuning_kwargs["act_sf_layout"] = SfLayout.layout_linear
         tuning_config = self._inner._make_tuning_config(moe_inputs, **tuning_kwargs)
         launch_state = _TrtllmLaunchState(static_kwargs)
-        # The autotuner calls get_valid_tactics(tensors, profile) with no
-        # launch kwargs, but runs inputs_pre_hook first; bind this pack's
-        # static extras there so tuning never reads another pack's state.
-        inner, inner_hook = self._inner, tuning_config.inputs_pre_hook
-
-        def _bind_static_extras(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
-            inner.set_cache_key_static_extras(**launch_state.static_kwargs)
-            return inner_hook(tensors) if inner_hook is not None else tensors
-
-        tuning_config = dataclasses.replace(
-            tuning_config, inputs_pre_hook=_bind_static_extras
-        )
+        tuning_config = self._bind_tuning_config(tuning_config, launch_state)
         return _TrtllmPackedInputs(
             moe_inputs.to_list(),
             tuning_config=tuning_config,

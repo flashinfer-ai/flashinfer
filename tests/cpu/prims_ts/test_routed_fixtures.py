@@ -15,10 +15,10 @@ from flashinfer.prims_ts.batched_gemm.tools.routed_inputs import Fixture
 pytestmark = pytest.mark.cpu_only
 
 
-def _fixture(path):
+def _fixture(path, array_shape=(16,)):
     arrays = {}
     for name in ("B", "SFB", "route"):
-        array = np.arange(16, dtype=np.uint8)
+        array = np.arange(16, dtype=np.uint8).reshape(array_shape)
         np.save(path / f"{name}.npy", array)
         arrays[name] = dict(
             sha256=hashlib.sha256(array.tobytes()).hexdigest(),
@@ -29,6 +29,16 @@ def _fixture(path):
         json.dumps(dict(shape=[512, 256, 256, 2], tensors=arrays))
     )
     return Fixture(path, (512, 256, 256, 1))
+
+
+@pytest.mark.parametrize("array_shape", [(16,), (2, 8), (2, 2, 4)])
+def test_prefix_fixture_slices_all_packed_elements(tmp_path, array_shape):
+    fixture = _fixture(tmp_path, array_shape)
+    for name in ("B", "SFB", "route"):
+        prefix = fixture.load(name)
+        assert prefix.shape == (8,)
+        assert prefix.reshape(2, 4).tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]
+        fixture.audit(name, prefix)
 
 
 @pytest.mark.parametrize("name", ["B", "SFB", "route"])
