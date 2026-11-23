@@ -307,6 +307,16 @@ class BatchInvariantFp4Runner(MoERunner):
         return s
 
     # ---- inputs ----------------------------------------------------------------------------------------------------
+    def accepts(self, act: MoEActivationPack, weights: MoEWeightPack) -> bool:
+        """The layer's candidate filter: the shared rule (a view under the backend's key, the input geometry) and the view's
+        intermediate class being this candidate's -- the two fp4 candidates of a layer share the view key, so a view prepared
+        for the other class is the other candidate's pack and is declined here (the runner driven directly refuses it in
+        ``pack_inputs``); a view of another pair stays a refusal, since no candidate of the layer serves it."""
+        if not super().accepts(act, weights):
+            return False
+        view = weights.get_view(self.backend_key)
+        return str(view.get("intermediate", "per_token")) == self._intermediate
+
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         x = act.hidden_states_q
         if x.ndim != 2:

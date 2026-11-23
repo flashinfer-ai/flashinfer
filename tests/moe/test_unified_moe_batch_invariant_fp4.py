@@ -2946,14 +2946,72 @@ def test_static_class_through_the_layer_batch_invariance_graph_replay_and_pack_c
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(bits(out), bits(full))
-    # the per-token class's output differs (another quantization of the intermediate), and its pack is refused by this layer
+    # the per-token class's output differs (another quantization of the intermediate); its pack is declined by this layer's
+    # only candidate (no candidate serves it) and refused by the runner with the class named
     per_token = _weights(w1, w2)
     assert not torch.equal(
         bits(_layer(k, E, I)(_logits_pack(x, logits), per_token)), bits(full)
     )
-    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+    with pytest.raises(NotImplementedError):
         layer(_logits_pack(x, logits), per_token)
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+        layer.runners[0].pack_inputs(_logits_pack(x, logits), per_token)
     assert "intermediate" in str(excinfo.value)
+
+
+@needs_device
+def test_both_intermediate_classes_as_candidates_serve_their_own_views():
+    """A layer with both fp4 candidates (the per-token and the static class): a static weight view is served by the static
+    candidate and a per-token view by the per-token one, each with its single-candidate layer's bits -- the other candidate
+    declines the pack in the layer's candidate filter instead of aborting the selection; the runners driven directly refuse
+    the other class's view with the mode's error."""
+    T, k, H, I, E = 40, 4, 256, 128, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=77)
+    both = MoELayer(
+        MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E, top_k=k, method=RoutingMethodType.Renormalize
+            ),
+            quant=_NVFP4,
+            experts=ExpertConfig(intermediate_size=I),
+            activation=_SWIGLU,
+            backend=BackendOptions(
+                (
+                    BatchInvariantFp4Config(),
+                    BatchInvariantFp4Config(intermediate="static"),
+                )
+            ),
+            execution=ExecutionConfig(enable_pdl=False),
+        ),
+        device=torch.device("cuda"),
+    )
+    assert [r._intermediate for r in both.runners] == ["per_token", "static"]
+    W_pt = _weights(w1, w2)
+    W_st = MoEWeightPack({})
+    W_st.prepare_for(
+        KEY,
+        BatchInvariantFp4Config.prepare_weights(
+            w1, w2, activation=_SWIGLU, intermediate="static"
+        ),
+    )
+    act = _logits_pack(x, logits)
+    ref_pt = bits(_layer(k, E, I)(act, W_pt))
+    ref_st = bits(
+        _layer(k, E, I, backend=BatchInvariantFp4Config(intermediate="static"))(
+            act, W_st
+        )
+    )
+    assert not torch.equal(ref_pt, ref_st)
+    assert both._eligible_runners(act, W_pt) == (0,) and both._eligible_runners(
+        act, W_st
+    ) == (1,)
+    assert torch.equal(bits(both(act, W_st)), ref_st)
+    assert torch.equal(bits(both(act, W_pt)), ref_pt)
+    assert torch.equal(bits(both(act, W_st)), ref_st)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="intermediate"):
+        both.runners[0].pack_inputs(act, W_st)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="intermediate"):
+        both.runners[1].pack_inputs(act, W_pt)
 
 
 @needs_device
