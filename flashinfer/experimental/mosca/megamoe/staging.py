@@ -67,7 +67,7 @@ def stage_inputs(
     num_tokens = hidden_states.shape[0]
     if num_tokens == 0:
         return
-    from ....moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from ....moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         fused_quant_stage,
         fused_quant_stage_supported,
     )
