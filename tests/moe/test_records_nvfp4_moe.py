@@ -167,6 +167,12 @@ def test_w4a16(gated, tokens):
     )  # fmt: skip
     torch.testing.assert_close(trt, out, atol=0, rtol=0)
     torch.testing.assert_close(cute, out, atol=0, rtol=0)
+    if not gated:  # CUTLASS-only on TRT-LLM, and the sentinel: rejected as on SM100
+        with pytest.raises(ValueError, match="activation type"):
+            bad = {**m, "act": ActivationType.ClampedRelu2}
+            _trt(bad, x, None, ids, weights, None, m["w1_g"], m["w2_g"])
+        with pytest.raises(ValueError, match="activation type"):
+            _cutlass({**m, "act": ActivationType.InvalidType}, x, ids, weights, scales)
 
 
 @pytest.mark.parametrize("recipe", RECIPES, ids=nvfp4_4over6_cache_key)
@@ -448,6 +454,8 @@ def test_from_logits(tokens):
 
     replay = torch.empty(tokens, K, dtype=torch.int16, device="cuda")
     slots, gathered = run(), run(routing_replay_out=replay)
+    with pytest.raises(ValueError, match="activation type"):
+        run(activation_type=ActivationType.InvalidType.value)
     with pytest.raises(NotImplementedError, match="workspace_buffer"):
         run(workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device="cuda"))
     torch.testing.assert_close(slots, gathered, atol=0, rtol=0)

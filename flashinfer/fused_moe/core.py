@@ -2014,6 +2014,8 @@ def cutlass_fused_moe(
                 "input, its third scale FP32, a scalar or [num_experts]."
             )
         act = ActivationType(activation_type)
+        if act == ActivationType.InvalidType:  # as CUTLASS's dispatch
+            raise ValueError(f"Invalid activation type: {activation_type}")
         situ, inf = act == ActivationType.Situ, float("inf")
         pt8 = (
             fp8 and not codes
@@ -8231,6 +8233,8 @@ def trtllm_fp4_block_scale_moe(
         num_tokens=hidden_states.shape[0],
     )
     if get_compute_capability(hidden_states.device)[0] < 10:
+        if activation_type >= ActivationType.InvalidType:  # TRT-LLM's launcher's range
+            raise ValueError(f"Invalid activation type: {activation_type}")
         # Records look each slot's expert up as they route, unless the ids are replayed,
         # local to an EP rank or returned unfinalized.
         gather = (
@@ -8605,6 +8609,8 @@ def trtllm_fp4_block_scale_routed_moe(
     )
     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
     if get_compute_capability(hidden_states.device)[0] < 10:
+        if activation_type >= ActivationType.InvalidType:  # TRT-LLM's launcher's range
+            raise ValueError(f"Invalid activation type: {activation_type}")
         ids, weights = topk_ids_tensor, topk_weights
         if weights is None:  # (expert id << 16) | BF16 weight
             weights, ids = ids.view(torch.bfloat16)[..., ::2].contiguous(), ids >> 16
