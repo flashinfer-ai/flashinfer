@@ -22,7 +22,7 @@ TransformerEngine recipe of :mod:`flashinfer.batch_invariant.quantization`):
 The W4A4 class therefore *contains* the per-token quantization class at row lengths ``H`` and ``I`` (its fingerprints are
 part of this class's) and the dense NVFP4 GEMM classes of the two expert weight shapes (the instruction class per weight
 shape by the dense rule, :func:`flashinfer.gemm.batch_invariant.schedule.fp4_class_for`, applied to the two weight shapes by
-:func:`.api_nvfp4.expert_classes`: a function of the shape and the architecture family only, never of the batch; the rule is
+:func:`.api_fp4.expert_classes`: a function of the shape and the architecture family only, never of the batch; the rule is
 a dispatcher function, so it lives outside this module, which the kernels' cache key includes). A chain with an exponential
 or a division computes those steps with the part's SFU (:func:`.spec.hw_arith_applies`: ``ex2.approx.ftz`` / ``rcp.approx.ftz``,
 deterministic per part; the CPU model holds the part's tables, :mod:`flashinfer.batch_invariant.fp_interface.sfu`). Every

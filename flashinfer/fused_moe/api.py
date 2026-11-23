@@ -3698,45 +3698,24 @@ class BatchInvariantFp4Config:
         (``1 / global scale``); ``intermediate`` / ``intermediate_scales`` select the static-intermediate class and its
         per-expert scales (see the class docstring). MXFP4 x MXFP4: every expert quantized to MXFP4 (one UE8M0 scale per 32
         elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of this pair."""
+        from .batch_invariant.api_fp4 import MoEWeightsFp4
+        from .batch_invariant.runner_fp4 import PAIRS
         from .batch_invariant.spec import activation_of
 
         pair = _fp4_pair(quant)
         chain = activation_of(activation if activation is not None else SwiGLU())
         w1 = w1.to(device=device) if device is not None else w1
         w2 = w2.to(device=device) if device is not None else w2
-        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
-            from .batch_invariant.api_nvfp4 import MoEWeightsNVFP4
-
-            return MoEWeightsNVFP4.prepare(
-                w1.to(torch.bfloat16),
-                w2.to(torch.bfloat16),
-                gated=chain.gated,
-                act=chain.act,
-                params=chain.params,
-                intermediate=intermediate,
-                intermediate_scales=intermediate_scales,
-            ).view()
-        if pair == (QuantFormat.MXFP4, QuantFormat.MXFP4):
-            from ..batch_invariant.support import unsupported
-            from .batch_invariant.api_mxfp4 import MoEWeightsMXFP4
-            from .batch_invariant.spec_mxfp4 import CLASS as MX_CLASS
-
-            if intermediate != "per_token" or intermediate_scales is not None:
-                raise unsupported(
-                    MX_CLASS,
-                    f"intermediate={intermediate!r} with intermediate scales"
-                    if intermediate_scales is not None
-                    else f"intermediate={intermediate!r}",
-                    "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
-                )
-            return MoEWeightsMXFP4.prepare(
-                w1.to(torch.bfloat16),
-                w2.to(torch.bfloat16),
-                gated=chain.gated,
-                act=chain.act,
-                params=chain.params,
-            ).view()
-        raise AssertionError(f"unreachable: {pair!r} passed _fp4_pair")
+        return MoEWeightsFp4.prepare(
+            PAIRS[pair],
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+            intermediate=intermediate,
+            intermediate_scales=intermediate_scales,
+        ).view()
 
     @staticmethod
     def prepare_activations(

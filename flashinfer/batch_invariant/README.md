@@ -99,7 +99,7 @@ launch over a permuted copy. Each is a placement of the class with its dischargi
 (`test_layer_matches_the_class_composition`), every swapped record against a grouped one (`test_swapped_records_equal_the_grouped_records`),
 the gather form against the materialised path (`test_gather_form_of_the_op_equals_the_materialised_path`). The autotuner's
 tactics are the pairs of the top records of the two GEMMs; every pair computes the class. The persistent grid of a grouped GEMM
-is the same launch parameter as the dense one's. The NVFP4 MoE classes' dispatcher (`fused_moe/batch_invariant/schedule_nvfp4.py`) ranks the same way at the
+is the same launch parameter as the dense one's. The fp4 MoE classes' dispatcher (`fused_moe/batch_invariant/schedule_fp4.py`) ranks the same way at the
 dense 4-bit class's instruction class with `M =` the rows of one active expert rounded up to the 128-row scale-factor atom (the
 grouped kernel computes whole atoms per group), and keeps only the records whose M tile fits that padded group: a taller
 tile computes padding the dense estimate does not price. At few rows per active expert the ranking is led by the swapped
