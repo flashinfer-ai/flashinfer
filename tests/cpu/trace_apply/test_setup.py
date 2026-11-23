@@ -726,6 +726,89 @@ def test_an_inference_tensor_is_served_with_identity_keying_only():
     assert life.setups == 1 and wrapper.stats()["weight_sets"] == 1
 
 
+def test_a_frozen_binding_releases_when_the_engine_allows_it(tmp_path, monkeypatch):
+    """allow_frozen releases a capture-observed binding; a reload binds and serves."""
+    monkeypatch.setattr(su, "_is_capturing", lambda device: False)
+    monkeypatch.setattr(
+        pk, "_bound", {}
+    )  # the frozen binding must not outlive the test
+    bound = pk.import_entry(setup_package(tmp_path))
+    a, out = torch.ones(2), torch.empty(2)
+    bound(x=a, out=out)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    bound(x=a, out=out)  # a captured hit freezes the binding
+    assert bound.frozen
+    monkeypatch.setattr(su, "_is_capturing", lambda device: False)
+
+    with pytest.raises(SetupStateError, match="kept for the life of the process"):
+        bound.release()
+    pk.release_packages()
+    assert pk._bound  # kept whole
+    pk.release_packages(allow_frozen=True)
+    assert not pk._bound  # released on the engine's authority
+    module = sys.modules[bound.__module__]
+    assert module.CALLS == {"setup": 1, "run": 2, "teardown": 1}
+
+    # a fresh package for the same Definition binds and serves afterwards
+    bound = pk.import_entry(setup_package(tmp_path))
+    bound(x=a, out=out)
+    assert module.CALLS["run"] == 3 and module.CALLS["setup"] == 2
+
+
+def test_installed_packages_follow_load_release_and_fork(sm_gate_off, monkeypatch):
+    """installed_packages lists what load installed until it is released."""
+    monkeypatch.setattr(
+        pk, "_bound", {}
+    )  # the frozen binding must not outlive the test
+    monkeypatch.setattr(pk, "_installed", {})
+    digests = ["0" * 64, GOLDEN_SETUP_DIGEST]  # the first is refused
+    result = pk.load_packages(GOLDEN_ROOT, digests, strict=False)
+    [(package, bound)] = pk.installed_packages()
+    assert package.digest == GOLDEN_SETUP_DIGEST
+    assert bound is result.callables[GOLDEN_SETUP_KEY]
+
+    hidden, weight, out = torch.randn(2, 16), torch.randn(16), torch.empty(2, 16)
+    bound(hidden_states=hidden, weight=weight, output=out)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    bound(hidden_states=hidden, weight=weight, output=out)  # freezes the binding
+    monkeypatch.setattr(su, "_is_capturing", lambda device: False)
+    pk.release_packages()
+    assert [package.digest for package, _ in pk.installed_packages()] == digests[1:]
+    pk.release_packages(allow_frozen=True)
+    assert pk.installed_packages() == []
+
+    # a forked child lists the package with a binding of its own
+    pk.load_packages(GOLDEN_ROOT, digests[1:])
+    pid = os.getpid()
+    monkeypatch.setattr(os, "getpid", lambda: pid + 1)
+    [(_, forked)] = pk.installed_packages()
+    forked(hidden_states=hidden, weight=weight, output=out)
+    assert pk.setup_stats()[GOLDEN_SETUP_KEY[0]]["runs"] == 1
+
+
+def test_a_binding_released_directly_leaves_the_registry(sm_gate_off, monkeypatch):
+    """After a binding's own release(), the next import binds afresh."""
+    monkeypatch.setattr(
+        pk, "_bound", {}
+    )  # the frozen binding must not outlive the test
+    monkeypatch.setattr(pk, "_installed", {})
+    pk.load_packages(GOLDEN_ROOT, [GOLDEN_SETUP_DIGEST])
+    [(_, bound)] = pk.installed_packages()
+    hidden, weight, out = torch.randn(2, 16), torch.randn(16), torch.empty(2, 16)
+    bound(hidden_states=hidden, weight=weight, output=out)
+    monkeypatch.setattr(su, "_is_capturing", lambda device: True)
+    bound(hidden_states=hidden, weight=weight, output=out)  # freezes the binding
+    monkeypatch.setattr(su, "_is_capturing", lambda device: False)
+
+    bound.release(allow_frozen=True)
+    assert pk.setup_stats() == {}
+    [(_, fresh)] = pk.installed_packages()
+    assert fresh is not bound
+    fresh(hidden_states=hidden, weight=weight, output=out)
+    pk.release_packages()  # the released binding no longer keeps its Definition
+    assert pk.installed_packages() == []
+
+
 def test_a_wrapper_kept_across_release_routes_nowhere(sm_gate_off, monkeypatch):
     """A wrapped API kept across release routes to stock, never to the loader."""
     import flashinfer.trace_apply.apply as apply_module
