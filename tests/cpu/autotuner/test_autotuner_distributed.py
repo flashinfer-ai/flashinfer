@@ -947,6 +947,7 @@ import torch
 import torch.distributed as dist
 from flashinfer.autotuner import (AutoTuner, TunableRunner, TuningConfig, autotune,
                                   get_autotune_process_group, set_autotune_process_group)
+from flashinfer.autotuner import autotuner as at
 from flashinfer.autotuner.autotuner import _TuningGroupError
 
 rank = int(os.environ["RANK"])
@@ -956,6 +957,7 @@ dist.init_process_group("gloo", init_method="file://" + os.environ["STORE"],
 torch.cuda.is_current_stream_capturing = lambda: False
 case = ""
 calls = []  # (runner, tactic, reduced over the tune group)
+cutoffs, stopped = [], []  # early stop: (pair, reduced, cutoff); stopped pairs
 # B0 is the fastest pair; A1 and B4 tie at 4.0.
 TIMES = {**{("A", t): 3.0 + t for t in range(6)}, **{("B", t): 2.0 + t / 2 for t in range(6)}}
 PAIRS = sorted(TIMES)
@@ -976,11 +978,16 @@ def profile(self, runner, inputs, tactic, config, **kwargs):
     pair = (type(runner).__name__, tactic)
     reduced = get_autotune_process_group() is not None
     calls.append((*pair, reduced))
+    cutoffs.append((pair, reduced, at._split_prune_cutoff))
     fail = (case == "failure" and pair == ("A", 3)) or (
         case == "failure" and pair == ("B", 0) and rank == world - 1)
     local = float("inf") if fail else TIMES[pair]
     if case == "bias" and pair == ("B", 0) and not reduced:
         local += 0.6  # this pair's owner measures it slow
+    if at._split_prune_cutoff is not None and local > at._split_prune_cutoff:
+        # The cold-L2 early stop returns a (faster) probe sample.
+        local = max(0.9 * local, 1.01 * at._split_prune_cutoff)
+        stopped.append(pair)
     if reduced:
         t = torch.tensor([local], dtype=torch.float64)
         dist.all_reduce(t, group=get_autotune_process_group())
@@ -995,7 +1002,7 @@ singles = [dist.new_group([r], backend="gloo") for r in range(world)]
 def tune(config=TuningConfig(), **group_kwargs):
     group = group_kwargs.pop("group", dist.group.WORLD)
     AutoTuner._instance = AutoTuner()
-    calls.clear()
+    calls.clear(), cutoffs.clear(), stopped.clear()
     set_autotune_process_group(group, **group_kwargs)
     runners = [A(), B()]
     try:
@@ -1023,11 +1030,12 @@ def check_split(finalists):
 
 try:
     for case in ("default", "lockstep", "lockstep_env", "config", "single", "no_group",
-                 "bias", "failure", "mismatch"):
+                 "bias", "failure", "prune", "mismatch"):
         os.environ.pop("FLASHINFER_AUTOTUNE_SPLIT", None)
         if case == "default":
             assert tune() == ("B", 0)
             check_split(TOP8)
+            assert all(cutoff is None for _, _, cutoff in cutoffs)  # early stop off
         elif case in ("lockstep", "lockstep_env", "config", "single"):
             kwargs = {"lockstep": {"split": False}, "config": {"config": TuningConfig(split_profiling=False)},
                       "single": {"group": singles[rank]}}.get(case, {})
@@ -1050,6 +1058,20 @@ try:
         elif case == "failure":
             # A3 fails where it is timed; B0 fails on the last rank only.
             assert tune() == ("B", 1)
+        elif case == "prune":
+            # Early stop cuts this rank's pairs 1.5x slower than its best so
+            # far; finalists are re-timed in full, so the winner is unchanged.
+            assert tune(split_prune_ratio=1.5) == ("B", 0)
+            best = float("inf")
+            for pair, reduced, cutoff in cutoffs:
+                assert cutoff == (None if reduced else 1.5 * best), (pair, cutoff)
+                if not reduced and pair not in stopped:
+                    best = min(best, TIMES[pair])
+            retimed = [(r, t) for r, t, red in calls if red]
+            everyone = [None] * world
+            dist.all_gather_object(everyone, stopped)
+            all_stopped = {p for share in everyone for p in share}
+            assert len(retimed) == 8 and all_stopped & set(retimed), all_stopped
         elif case == "mismatch":
             try:
                 tune()

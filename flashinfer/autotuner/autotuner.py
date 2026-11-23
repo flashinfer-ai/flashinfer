@@ -1349,6 +1349,10 @@ def is_in_profile_measurement() -> bool:
 _tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
 # Split mode: the number of fastest tactics every rank re-times; 0 is lockstep.
 _tune_split_finalists = 0
+# Split mode early stop: ratio (0 is off), and the cutoff (ms) of the current
+# rank-local cold-L2 timing (see _rank_local_timing).
+_tune_split_prune_ratio = 0.0
+_split_prune_cutoff: float | None = None
 
 
 def set_autotune_process_group(
@@ -1356,6 +1360,7 @@ def set_autotune_process_group(
     *,
     split: bool | None = None,
     split_finalists: int | None = None,
+    split_prune_ratio: float | None = None,
 ) -> None:
     """All-reduce (mean) per-tactic profile timings across ``group`` so every
     rank's ``argmin`` picks the same tactic.
@@ -1398,6 +1403,12 @@ def set_autotune_process_group(
     ``FLASHINFER_AUTOTUNE_SPLIT_FINALISTS`` or 8 (at least 1). Both values are
     read here.
 
+    Optional early stop (off by default): with ``split_prune_ratio`` (or
+    ``FLASHINFER_AUTOTUNE_SPLIT_PRUNE_RATIO``) above 1, the cold-L2 timing of
+    a rank's own pair stops after two samples when the faster one exceeds
+    the ratio times the fastest pair this rank has timed for the shape. The
+    winner is still picked among fully re-timed finalists.
+
     Example::
 
         set_autotune_process_group(cpu_group)  # gloo subgroup
@@ -1407,8 +1418,13 @@ def set_autotune_process_group(
         finally:
             set_autotune_process_group(None)
     """
-    global _tune_process_group, _tune_split_finalists
+    global _tune_process_group, _tune_split_finalists, _tune_split_prune_ratio
     _tune_process_group = group
+    if split_prune_ratio is None:
+        split_prune_ratio = float(
+            os.environ.get("FLASHINFER_AUTOTUNE_SPLIT_PRUNE_RATIO") or 0
+        )
+    _tune_split_prune_ratio = split_prune_ratio if split_prune_ratio > 1 else 0.0
     if split is None:
         split = os.environ.get("FLASHINFER_AUTOTUNE_SPLIT", "1") != "0"
     if split_finalists is None:
@@ -1450,14 +1466,15 @@ def _deal_tactics(runner: "TunableRunner", tactics: list, load: list[int]) -> li
 
 
 @contextlib.contextmanager
-def _rank_local_timing():
+def _rank_local_timing(prune_cutoff: float | None = None):
     """Time this rank's share of a split-mode shape without group collectives."""
-    global _tune_process_group
+    global _tune_process_group, _split_prune_cutoff
     group, _tune_process_group = _tune_process_group, None
+    _split_prune_cutoff = prune_cutoff
     try:
         yield
     finally:
-        _tune_process_group = group
+        _tune_process_group, _split_prune_cutoff = group, None
 
 
 def cake_auto_candidate_open(runner_class_name: str) -> bool:
@@ -3778,7 +3795,12 @@ class AutoTuner:
                                     continue
                                 try:
                                     with (
-                                        _rank_local_timing()
+                                        _rank_local_timing(
+                                            # min_time: this rank's best so far.
+                                            _tune_split_prune_ratio * min_time
+                                            if _tune_split_prune_ratio
+                                            else None
+                                        )
                                         if split
                                         else contextlib.nullcontext()
                                     ):
@@ -4719,6 +4741,7 @@ class AutoTuner:
                 if delay_kernel_time_usec > 0:
                     delay_kernel(delay_kernel_time_usec)
 
+                cutoff = _split_prune_cutoff
                 for sample_idx in range(num_samples):
                     l2_flush()
                     starts[sample_idx].record(stream)
@@ -4729,6 +4752,17 @@ class AutoTuner:
                             input_tensor_batches[sample_idx % len(input_tensor_batches)]
                         )
                     ends[sample_idx].record(stream)
+                    if cutoff is not None and sample_idx == 1 < num_samples - 1:
+                        # Split-mode early stop: a pair this far behind cannot
+                        # win; a finalist is re-timed in full on every rank.
+                        ends[1].synchronize()
+                        probe = min(
+                            starts[i].elapsed_time(ends[i]) for i in range(2)
+                        ) / len(captured_batches)
+                        if probe > cutoff:
+                            return probe
+                        if delay_kernel_time_usec > 0:
+                            delay_kernel(delay_kernel_time_usec)
 
                 # One synchronization after all samples keeps host overhead
                 # out of the per-invocation measurements.
