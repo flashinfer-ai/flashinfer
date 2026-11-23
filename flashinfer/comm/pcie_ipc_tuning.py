@@ -367,6 +367,8 @@ def pcie_ipc_tuning_config(batches: Tuple[int, ...] = TUNE_BATCHES) -> TuningCon
         # would rank host overhead rather than kernels.
         use_cold_l2_cache=False,
         use_cuda_graph=True,
+        # Each candidate is a collective: every rank must time the same one.
+        split_profiling=False,
     )
 
 

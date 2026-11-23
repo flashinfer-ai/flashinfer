@@ -158,6 +158,8 @@ def test_distributed_phase_checks_and_rank_local_shapes(tmp_path, world_size):
                         "WORLD_SIZE": str(world_size),
                         "STORE": str(tmp_path / "rendezvous"),
                         "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE": "0",
+                        # Lockstep; split mode: tests/cpu/autotuner.
+                        "FLASHINFER_AUTOTUNE_SPLIT": "0",
                     },
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,

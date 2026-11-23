@@ -14,6 +14,7 @@ import statistics
 import tempfile
 import threading
 import weakref
+import zlib
 
 import tqdm
 from abc import ABC, abstractmethod
@@ -631,6 +632,10 @@ class TuningConfig:
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
     use_cuda_graph_individual_timing: bool = False
+    # Whether the split mode of ``set_autotune_process_group`` may deal this
+    # op's tactics across the group. False times the op in lockstep: required
+    # when its profiled forward communicates across ranks.
+    split_profiling: bool = True
 
     @property
     def uses_cold_chain(self) -> bool:
@@ -1342,10 +1347,15 @@ def is_in_profile_measurement() -> bool:
 
 
 _tune_process_group: Optional["torch.distributed.ProcessGroup"] = None
+# Split mode: the number of fastest tactics every rank re-times; 0 is lockstep.
+_tune_split_finalists = 0
 
 
 def set_autotune_process_group(
     group: Optional["torch.distributed.ProcessGroup"],
+    *,
+    split: bool | None = None,
+    split_finalists: int | None = None,
 ) -> None:
     """All-reduce (mean) per-tactic profile timings across ``group`` so every
     rank's ``argmin`` picks the same tactic.
@@ -1374,6 +1384,20 @@ def set_autotune_process_group(
     CUPTI availability and initialization are checked collectively before
     candidate execution. A tracing failure makes every rank use CUDA events.
 
+    Split mode (default with two or more ranks): instead of every rank timing
+    every (runner, tactic) pair of a ``choose_one`` shape, the pairs are dealt
+    across the group in balanced shares, and each rank precompiles and times
+    only its share. A pair goes to the same rank for every shape, so a kernel
+    compiled for one shape is reused by the next. One all-reduce merges the
+    times; then every rank re-times the ``split_finalists`` fastest pairs (one
+    all-reduce each, as in lockstep) and the winner is picked among them, near
+    ties included. Every rank has therefore run the winner. ``split=False``
+    or ``FLASHINFER_AUTOTUNE_SPLIT=0`` keeps lockstep timing, as does
+    ``TuningConfig.split_profiling=False`` for one op, and so does
+    ``rank_tactics`` with ``k > 1``. ``split_finalists`` defaults to
+    ``FLASHINFER_AUTOTUNE_SPLIT_FINALISTS`` or 4 (at least 1). Both values are
+    read here.
+
     Example::
 
         set_autotune_process_group(cpu_group)  # gloo subgroup
@@ -1383,13 +1407,57 @@ def set_autotune_process_group(
         finally:
             set_autotune_process_group(None)
     """
-    global _tune_process_group
+    global _tune_process_group, _tune_split_finalists
     _tune_process_group = group
+    if split is None:
+        split = os.environ.get("FLASHINFER_AUTOTUNE_SPLIT", "1") != "0"
+    if split_finalists is None:
+        split_finalists = int(os.environ.get("FLASHINFER_AUTOTUNE_SPLIT_FINALISTS", 4))
+    _tune_split_finalists = max(1, split_finalists) if split else 0
 
 
 def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
     """Return the process group previously passed to ``set_autotune_process_group``."""
     return _tune_process_group
+
+
+def _deal_tactics(runner: "TunableRunner", tactics: list, load: list[int]) -> list:
+    """Return the owner rank of each of ``runner``'s tactics in split mode.
+
+    A tactic prefers rank ``crc32(runner class, tactic) % world``, the same in
+    every shape and process. ``load`` counts each rank's pairs in this shape
+    so far; a rank holding ``ceil(pairs / world)`` passes the tactic on.
+    """
+    world = len(load)
+    cap = -(-(sum(load) + len(tactics)) // world)
+    keys = [
+        zlib.crc32(
+            json.dumps(
+                [type(runner).__name__, _tactic_to_json(t)],
+                sort_keys=True,
+                default=repr,
+            ).encode()
+        )
+        for t in tactics
+    ]
+    owners = [0] * len(tactics)
+    for i in sorted(range(len(tactics)), key=lambda i: (keys[i], i)):
+        owners[i] = keys[i] % world
+        while load[owners[i]] >= cap:
+            owners[i] = (owners[i] + 1) % world
+        load[owners[i]] += 1
+    return owners
+
+
+@contextlib.contextmanager
+def _rank_local_timing():
+    """Time this rank's share of a split-mode shape without group collectives."""
+    global _tune_process_group
+    group, _tune_process_group = _tune_process_group, None
+    try:
+        yield
+    finally:
+        _tune_process_group = group
 
 
 def cake_auto_candidate_open(runner_class_name: str) -> bool:
@@ -3470,6 +3538,13 @@ class AutoTuner:
             # off — representative probe construction is op-level work.
             # Scoped to v2 so plain autotune() selection is byte-identical.
             race_default = self._in_v2_context
+            # Split mode (see set_autotune_process_group): ranks time shares.
+            split = (
+                _tune_split_finalists > 0
+                and tuning_config.split_profiling
+                and _tune_process_group is not None
+                and _tune_process_group.size() > 1
+            )
 
             incomplete_winner: tuple[int, Any] | None = None
             pbar = None
@@ -3593,6 +3668,8 @@ class AutoTuner:
                         runner_id, tactic = None, None
                         skipped_count = 0
                         comparison_complete = True
+                        # Pairs dealt to each rank so far in this shape.
+                        split_load = [0] * _tune_process_group.size() if split else None
                         for r_id, r in enumerate(runners):
                             runner_preparation_oom = False
                             runner_error = None
@@ -3641,13 +3718,23 @@ class AutoTuner:
                                 )
                                 return runners[0], -1
 
+                            # Which tactics this rank times: all of them, or
+                            # its share in split mode.
+                            mine = [True] * len(valid_tactics)
+                            if split_load is not None:
+                                rank = _tune_process_group.rank()
+                                owners = _deal_tactics(r, valid_tactics, split_load)
+                                mine = [owner == rank for owner in owners]
+                            own_tactics = [
+                                t for t, m in zip(valid_tactics, mine, strict=True) if m
+                            ]
                             try:
                                 if (
                                     "do_preparation" in runner_parameters[r_id]
-                                    and valid_tactics
+                                    and own_tactics
                                 ):
                                     handled = r.precompile_tactics(
-                                        tensors, valid_tactics, p, **kwargs
+                                        tensors, own_tactics, p, **kwargs
                                     )
                                     if not handled:
                                         r(
@@ -3682,17 +3769,27 @@ class AutoTuner:
                                 )
                                 return runners[0], -1
 
-                            runner_compared = not valid_tactics
-                            for tac in valid_tactics:
+                            # Split mode checks completeness after the merge.
+                            runner_compared = not valid_tactics or split
+                            for tac, is_mine in zip(valid_tactics, mine, strict=True):
+                                if not is_mine:
+                                    # -inf: another rank times this pair.
+                                    measured.append((float("-inf"), r_id, tac))
+                                    continue
                                 try:
-                                    time_measured = self._profile_single_kernel(
-                                        r,
-                                        tensors,
-                                        tac,
-                                        tuning_config,
-                                        input_tensor_batches=prepared_input_batches,
-                                        **kwargs,
-                                    )
+                                    with (
+                                        _rank_local_timing()
+                                        if split
+                                        else contextlib.nullcontext()
+                                    ):
+                                        time_measured = self._profile_single_kernel(
+                                            r,
+                                            tensors,
+                                            tac,
+                                            tuning_config,
+                                            input_tensor_batches=prepared_input_batches,
+                                            **kwargs,
+                                        )
                                 except (torch.cuda.OutOfMemoryError, MemoryError):
                                     # Distributed autotuning: the per-tactic
                                     # all-reduce must run the same number of
@@ -3759,6 +3856,41 @@ class AutoTuner:
                                     runner_id, tactic = r_id, tac
                             comparison_complete &= runner_compared and not retry_tactics
 
+                        retime = functools.partial(
+                            self._retime_candidate,
+                            runners,
+                            tensors,
+                            tuning_config,
+                            prepared_input_batches,
+                            kwargs,
+                        )
+                        # The winner's index into measured is among these.
+                        finalists = list(range(len(measured)))
+                        if split and measured:
+                            finalists = self._merge_split_times(
+                                measured,
+                                runners,
+                                runner_parameters,
+                                p,
+                                tensors,
+                                retime,
+                                kwargs,
+                            )
+                            for r_seen in {r_id for _, r_id, _ in measured}:
+                                comparison_complete &= any(
+                                    t < float("inf")
+                                    for t, r_id, _ in measured
+                                    if r_id == r_seen
+                                )
+                            runner_id = next(
+                                (
+                                    measured[i][1]
+                                    for i in finalists
+                                    if measured[i][0] < float("inf")
+                                ),
+                                None,
+                            )
+
                         if skipped_count > 0:
                             logger.info(
                                 f"[Autotuner]: Skipped {skipped_count} unsupported tactic(s) for {custom_op} "
@@ -3767,18 +3899,13 @@ class AutoTuner:
 
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
-                            winner = self._settle_near_ties(
-                                measured,
-                                functools.partial(
-                                    self._retime_candidate,
-                                    runners,
-                                    tensors,
-                                    tuning_config,
-                                    prepared_input_batches,
-                                    kwargs,
-                                ),
-                                self._tie_tolerance,
-                            )
+                            winner = finalists[
+                                self._settle_near_ties(
+                                    [measured[i] for i in finalists],
+                                    retime,
+                                    self._tie_tolerance,
+                                )
+                            ]
                             _, runner_id, tactic = measured[winner]
                             # Publish and look up coverage using the prepared runners'
                             # hashes, but the pool signatures read before enumeration.
@@ -4002,6 +4129,64 @@ class AutoTuner:
             ) * (1.0 + tolerance):
                 return i
         return fastest
+
+    def _merge_split_times(
+        self,
+        measured: list[tuple[float, int, Any]],
+        runners: list[TunableRunner],
+        runner_parameters: list,
+        profile: OptimizationProfile,
+        tensors: list[Any],
+        retime: Callable[[int, Any], float],
+        kwargs: dict[str, Any],
+    ) -> list[int]:
+        """Merge the ranks' split-mode times into ``measured`` and settle finalists.
+
+        A ``-inf`` time marks a pair another rank timed. One all-reduce gives
+        every rank every pair's time. The ``_tune_split_finalists`` fastest are
+        then prepared where needed and re-timed on every rank, one lockstep
+        reduce each, so every rank has run the winner before any CUDA graph
+        capture. Returns their indices into ``measured``, in enumeration order.
+        """
+        import torch.distributed as dist
+        from torch.distributed.distributed_c10d import _get_object_coll_device
+
+        inf = float("inf")
+        mine = {i for i, (t, _, _) in enumerate(measured) if t != -inf}
+        times = torch.tensor(
+            [t if i in mine else 0.0 for i, (t, _, _) in enumerate(measured)],
+            dtype=torch.float64,
+            device=_get_object_coll_device(_tune_process_group),
+        )
+        dist.all_reduce(times, op=dist.ReduceOp.SUM, group=_tune_process_group)
+        for i, t in enumerate(times.tolist()):
+            measured[i] = (t, measured[i][1], measured[i][2])
+        finite = [i for i, (t, _, _) in enumerate(measured) if t < inf]
+        finalists = sorted(
+            sorted(finite, key=lambda i: (measured[i][0], i))[:_tune_split_finalists]
+        )
+        prepared = {measured[i][1] for i in mine}
+        for r_id in sorted({measured[i][1] for i in finalists if i not in mine}):
+            if "do_preparation" not in runner_parameters[r_id]:
+                continue
+            tactics = [
+                measured[i][2]
+                for i in finalists
+                if i not in mine and measured[i][1] == r_id
+            ]
+            try:
+                handled = runners[r_id].precompile_tactics(
+                    tensors, tactics, profile, **kwargs
+                )
+                if not handled and r_id not in prepared:
+                    runners[r_id](tensors, tactic=-1, do_preparation=True, **kwargs)
+            except Exception as e:
+                # Re-timing then fails here, which disqualifies the pairs.
+                logger.debug(f"[Autotuner]: preparing {runners[r_id]} failed: {e}")
+        for i in finalists:
+            _, r_id, tactic = measured[i]
+            measured[i] = (retime(r_id, tactic), r_id, tactic)
+        return finalists
 
     def _retime_candidate(
         self,
