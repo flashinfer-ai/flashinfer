@@ -8951,6 +8951,11 @@ def kernel_chain_dv2(
                 raw_ready_mbar.subview(raw_stage),
                 (chunk // K2_RAW_STAGE_COUNT) % 2,
             )
+            # The state projection MMA below reads every K-block of state_as_input,
+            # but state_input_ready only covers the right half (packed by CG1). The
+            # left half is packed by CG0 and signalled on state_input_ready_l, which
+            # warp 13 waits before its own state x k MMA; wait for it here as well.
+            state_input_ready_wait(state_input_ready_l_mbar, chunk % 2)
             si_phase12 = state_input_ready_wait(state_input_ready_mbar, si_phase12)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             output_ready_wait(
