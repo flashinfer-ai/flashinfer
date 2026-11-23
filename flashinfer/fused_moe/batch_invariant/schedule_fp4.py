@@ -1,25 +1,12 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The fp4 MoE classes' grouped-GEMM dispatcher (both pairs): the dense 4-bit GEMM class's ranking heuristic at the grouped
-launch's shape and the pair's instruction class, as the bf16 classes' (:mod:`.schedule`, whose terms this module reuses).
-
-The grouped block-scaled GEMM is the dense NVFP4 class under a different scheduler (one segment of rows per expert, whole
-128-row scale-factor atoms per segment), so its records are ranked by the dense dispatcher's model
-(:func:`flashinfer.gemm.batch_invariant.heuristic.estimate_cycles` at the instruction class ``in_fmt``: the part's roofline
-with nominal constants, no measured tables) at the dense shape whose tiles, M tail and operand bytes are the grouped
-launch's: ``M`` = the rows of one active expert, ``N`` = the active experts' weight rows side by side (every group's tiles
-count, and the weights are read once per group). Two record spaces are ranked together, as the bf16 classes' dispatcher
-ranks them: the grouped records (the dense records at swizzle 1: no in-cluster split, no operand swap, no B-reuse tile, no
-in-CTA chunk fold) and the swapped records (:mod:`.blocks.swap`: the weights on the MMA's M side, 128 rows per CTA, the
-group's tokens a narrow N tile of 8 / 16 / 32 rows), which the dense model prices as a swapped decode record. The grouped
-launch's own terms on the dense estimate are the bf16 dispatcher's: the pair term (the cluster tile's dummy share), the
-swapped records' spill factor (the Poisson expectation of token tiles per active expert), the last tile's exposed epilogue
-chain (this class's chain term: the W4A4 gated chain, or the static class's chain plus its share of the block quantization;
-four epilogue warpgroups) and the token box's zero-fill past the group's rows at the packed fp4 element width, rounded to three
-significant digits so records the estimate cannot separate fall through to the structural raster and the enumeration order.
-Every record of either space is filtered by its body's acceptance. Numerics-neutral: every record of either space is
-canonical (the same bits), so the dispatcher may depend on anything; the ranked list is what the autotuner profiles under
-``batch_invariant``.
+"""The fp4 MoE classes' grouped-GEMM dispatcher (both pairs): the dense 4-bit GEMM class's ranking heuristic
+(:func:`flashinfer.gemm.batch_invariant.heuristic.estimate_cycles` at the pair's instruction class: the part's roofline with
+nominal constants, no measured tables) at the grouped launch's shape (``M`` = the rows of one active expert, ``N`` = the
+active experts' weight rows side by side), over the grouped records (the dense records at swizzle 1) and the swapped records
+(:mod:`.blocks.swap`) together, with the bf16 classes' launch terms (:func:`.schedule.record_cost`) and this class's chain
+term. Numerics-neutral: every record of either space computes the same bits, so the dispatcher may depend on anything; the
+ranked list is what the autotuner profiles. The mode's README ("Dispatcher") states the ranking.
 """
 
 from __future__ import annotations
@@ -87,12 +74,13 @@ def swapped_knobs_blockscaled() -> List[Knobs]:
 
 #: Records the fp4 runners hand the autotuner per GEMM: the ranked list's head (its raster twins included).
 TOP_K_FP4 = 6
-#: The average rows per active expert fill at most three quarters of the swapped token tile (an empirical margin).
+#: The structural rule's fill bound: the average rows per active expert fill at most three quarters of the swapped token
+#: tile (a declared empirical constant).
 SWAP_TILE_FILL = (3, 4)
-#: The narrowest swapped tile: the structural rule's pick (the bench's reference point; the ranking decides the dispatch).
+#: The structural rule's tile: the narrowest swapped tile (the ranking, not the rule, decides the dispatch).
 SWAP_TILES_DEFAULT = (8,)
-#: The gather form's token tile: the swapped record whose one-warp scale producer keeps a stage's row copies in flight; the
-#: wider tiles serialize them (the campaign's lever record).
+#: The gather form's token tile: the swapped record whose one-warp scale producer keeps a stage's row copies in flight (the
+#: wider tiles serialize them).
 GATHER_TILE_N = 8
 
 
@@ -107,9 +95,9 @@ def gather_form_rule(config1: Knobs, scatter_launch: bool) -> Knobs:
 
 
 def token_tile_default(rows: int) -> Optional[int]:
-    """The structural rule of the first campaign (kept as the benches' reference point, not the dispatch): the narrowest swapped
-    tile of ``SWAP_TILES_DEFAULT`` the average rows per active expert fill to at most ``SWAP_TILE_FILL``, ``None`` otherwise. The
-    dispatch ranks the swapped records with the grouped ones (:func:`rank_grouped_fp4`)."""
+    """The structural rule (a reference, not the dispatch): the narrowest swapped tile of ``SWAP_TILES_DEFAULT`` the average
+    rows per active expert fill to at most ``SWAP_TILE_FILL``, ``None`` otherwise; the dispatch ranks the swapped records with
+    the grouped ones (:func:`rank_grouped_fp4`)."""
     num, den = SWAP_TILE_FILL
     for tn in SWAP_TILES_DEFAULT:
         if rows * den <= tn * num:
@@ -260,8 +248,7 @@ def rank_grouped_fp4(
     swap: Optional[bool] = None,
     gather: Optional[bool] = False,
 ) -> List[Knobs]:
-    """The ranked records (:func:`_rank_grouped_fp4`), memoised on the arguments: the ranking runs on the host at every call
-    of the op and of the layer, and enumerating and costing the space is milliseconds of Python per GEMM. ``gather``: the
+    """The ranked records (:func:`_rank_grouped_fp4`), memoised: the ranking runs on the host at every call. ``gather``: the
     swapped records' gather form (GEMM1) -- False excludes it (GEMM2, the default), True replaces the swapped records by their
     gather twins, None ranks both forms (the twin right after its record: the same cost, the form a placement)."""
     return list(
@@ -299,17 +286,14 @@ def _rank_grouped_fp4(
     swap: Optional[bool],
     gather: Optional[bool] = False,
 ) -> Tuple[Knobs, ...]:
-    """The ranked records for one GEMM over both record spaces (the bf16 dispatcher's form, :func:`.schedule.rank_grouped`): the
-    grouped records the grouped body accepts for the weight shape, the chain and the instruction class (at a decode-sized ``rows``
-    the dense dispatcher's structural guard, `heuristic.decode_sane`, selects the candidates; a record whose M tile is taller than
-    the group's padded rows is excluded: the group scheduler's tiles never span groups) and the swapped records the swapped body
-    accepts (``swap``: None ranks them with the rest, True keeps only them, False excludes them), ordered by the shared contract's
-    cost (:func:`.schedule.record_cost` at this class's instruction class, with this class's chain term in nodes: the dense estimate
-    under the ranking's overrides times the pair and token-tile terms, the exposed epilogue chain, the token box's exposed zero fill
-    at the packed fp4 width and the body's per-launch fixed cost), rounded to three significant digits; the grouped scheduler's
-    structural raster first among twins, then the wider N tile among tied grouped records (fewer tiles: fewer per-tile costs),
-    ties in the spaces' enumeration order (the grouped records before the swapped ones, the narrower token tile first). Each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the
-    list: distinct records, at most ``k``, never empty for an implementable shape."""
+    """The ranked records for one GEMM over both record spaces (the bf16 dispatcher's form, :func:`.schedule.rank_grouped`):
+    the grouped records the grouped body accepts (the dense dispatcher's structural guard at a decode-sized ``rows``; no M tile
+    taller than the group's padded rows: the group scheduler's tiles never span groups) and the swapped records the swapped
+    body accepts (``swap``: None ranks them with the rest, True keeps only them, False excludes them), ordered by
+    :func:`.schedule.record_cost` at this class's instruction class and chain term, rounded to three significant digits;
+    ties: the structural raster first among twins, the wider N tile among grouped records, then the enumeration order. Each
+    of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the list: distinct records, at
+    most ``k``, never empty for an implementable shape."""
     from ...gemm.batch_invariant.heuristic import decode_sane
     from .blocks.compile import (
         can_implement_grouped_blockscaled as can_implement_grouped_nvfp4,

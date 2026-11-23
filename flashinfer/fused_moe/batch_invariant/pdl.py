@@ -3,12 +3,11 @@
 """Programmatic dependent launch: where a kernel lets its dependents start. Every kernel waits for its predecessor before
 its first dependent read (``griddepcontrol.wait``); the trigger (``griddepcontrol.launch_dependents``) decides when the next
 kernel's CTAs may become resident. The persistent bodies do not trigger: their dependents launch at completion (``TRIGGER =
-"none"``); the one-wave kernels take ``TRIGGER_SMALL`` (``none``: completion) right after their wait, the placement that measured fastest for the MoE chain (an early trigger lets the dependents' CTAs occupy SM slots
-during the main work; a trigger after the persistent body's last loads still overlaps its epilogue, which at decode is most
-of the kernel). The trigger sites below mark where the other placements would go (``late``: after the CTA's last tile's
-loads; ``early``: right after the wait). The placement is baked into every compiled object and the kernel names do not
-carry it, so it is a constant of the module, not a runtime or environment setting; this file is in the kernels' source
-closure (:mod:`flashinfer.batch_invariant.jit`), so a change to the constant rebuilds every cached object."""
+"none"``); the one-wave kernels take ``TRIGGER_SMALL`` (``none``: completion) right after their wait. The trigger sites below
+mark where the other placements would go (``late``: after the CTA's last tile's loads; ``early``: right after the wait). The
+placement is baked into every compiled object and the kernel names do not carry it, so it is a constant of the module, not a
+runtime or environment setting; this file is in the kernels' source closure (:mod:`flashinfer.batch_invariant.jit`), so a
+change to the constant rebuilds every cached object."""
 
 from __future__ import annotations
 
@@ -18,8 +17,7 @@ import cutlass.cute as cute
 #: The trigger placement of the persistent bodies: ``none`` (the dependents launch at completion).
 TRIGGER = "none"
 #: The trigger placement of the one-wave kernels (gather, scatters, quantizers, combine; the plan-side kernels never
-#: trigger): ``none`` -- the early placement (right after their own wait) leaves the persistent bodies' CTAs resident
-#: while these kernels run and costs the largest prefill cells more than it saves anywhere.
+#: trigger): ``none`` -- an early trigger would keep the persistent bodies' CTAs resident while these kernels run.
 TRIGGER_SMALL = "none"
 #: The placements the swapped box form compiles under (asserted by its builder, ``blocks/swap.py``): the form reads
 #: the plan's group counts -- its predecessor's predecessor's output -- before its own wait, which holds while every

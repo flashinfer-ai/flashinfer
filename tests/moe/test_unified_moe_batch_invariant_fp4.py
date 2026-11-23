@@ -2019,6 +2019,8 @@ def test_instruction_classes_on_the_part(pair):
         assert torch.equal(bits(got.cpu()), bits(ref)), f
     if family != "sm_107":
         return
+    # the box form's permuted operands (the gather form keeps no permuted tensor); the raw folds of the two classes differ
+    _, im = fused_moe_fp4(x, ids, weights, W, return_intermediates=True, gather=False)
     accs = [
         grouped_gemm_fp4(
             im["x_perm4"],

@@ -26,9 +26,8 @@ interleaved weight are TMEM lanes ``l`` and ``l + 8``: a ``shfl.sync.down 8`` of
 element is unchanged. Everything else is placement: which CTA owns which (expert, token tile, weight tile), the TMA
 pipeline, the store pattern.
 
-Per tile the operand bytes are the weight tile plus ``token_tile`` rows of tokens instead of the grouped body's 64- or
-128-row token tile: at a few rows per active expert the GEMM traffic becomes the weights read once, through twice as many
-weight rows per CTA. The dispatcher ranks the swapped records with the grouped ones (:func:`..schedule.rank_grouped`).
+Per tile the operand bytes are the weight tile plus ``token_tile`` rows of tokens, so at a few rows per active expert the
+GEMM traffic is the weights read once; the dispatcher ranks the swapped records with the grouped ones (:func:`..schedule.rank_grouped`).
 
 Operands: ``rows (R, K, 1)`` K-major (the dense permuted rows; ``R >= Tk``: with ``R >= Tk + token_tile`` the last tiles'
 boxes stay inside the buffer, else they are zero-filled past it; the byte-packed ``(R, K / 2, 1)`` of the 4-bit formats),
