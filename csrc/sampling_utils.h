@@ -17,6 +17,8 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
 
+#include "tvm_ffi_utils.h"
+
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
 
@@ -36,6 +38,9 @@ inline void check_tensor_param(const Optional<TensorView>& maybe_param, const Te
                                 << "expected length " << tensor.size(0)
                                 << " to match the reference tensor batch size, "
                                 << "but got length " << param.size(0) << ".";
+    } else {
+      // The kernels read `param` on the device of `tensor`.
+      check_same_device(param, tensor, "Sampling parameter tensor", "the reference tensor");
     }
   }
 }
