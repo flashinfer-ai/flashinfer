@@ -172,8 +172,8 @@ def mm_nvfp4_residue(
     ``alpha`` is one FP32 reconstruction multiplier: the reciprocal of
     the product of activation and weight quantization global multipliers.
     It scales the sum of the base and residue accumulators.
-    Prepare this global multiplier before launch and keep it unchanged until
-    the operation completes; asynchronous alpha production via PDL is unsupported.
+    A preceding kernel on the same stream may produce ``alpha``.
+    Keep the value unchanged after production until the operation completes.
     The output is ``[M, N]`` in FP16 or BF16. Weight quantization is external.
     The Fold tile is a static row-pair choice: ``(128, 24)`` through M 8,
     ``(128, 32)`` through M 16, ``(128, 64)`` below M 256, and ``(256, 128)``

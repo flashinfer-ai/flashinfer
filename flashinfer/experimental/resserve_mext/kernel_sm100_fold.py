@@ -518,11 +518,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         GPU device kernel performing the Persistent batched GEMM computation.
         """
 
-        # As in upstream CuTe GEMM, the caller supplies a ready scalar alpha.
-        alpha_value = cutlass.Float32(1.0)
-        if cutlass.const_expr(alpha is not None):
-            alpha_value = alpha[0].to(cutlass.Float32)
-
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -1096,6 +1091,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 num_stages=self.num_c_stage,
                 producer_group=c_producer_group,
             )
+
+            # Read alpha after griddepcontrol_wait; only the epilogue uses it.
+            alpha_value = cutlass.Float32(1.0)
+            if cutlass.const_expr(alpha is not None):
+                alpha_value = alpha[0].to(cutlass.Float32)
 
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx

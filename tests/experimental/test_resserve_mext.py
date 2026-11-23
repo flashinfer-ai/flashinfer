@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from flashinfer.resserve import mm_nvfp4_residue, nvfp4_quantize_residue
+from tests.utils.test_helpers.pdl import late_store
 
 
 def _decode(packed, scales):
@@ -78,6 +79,24 @@ def test_residue_and_fold(dtype, m, k, n):
     y = mm_nvfp4_residue(p, w, sf, ws, alpha, out_dtype=dtype)
     ref = (base + residue) @ _decode(w, ws).T
     torch.testing.assert_close(y.float(), ref, atol=0.08, rtol=0.02)
+
+
+def test_fold_pdl_waits_for_alpha():
+    torch.manual_seed(42)
+    x = torch.randn(7, 128, device="cuda", dtype=torch.bfloat16)
+    scale = torch.tensor([64.0], device="cuda")
+    a, sa = nvfp4_quantize_residue(x, scale)
+    w = torch.full((128, 64), 0x22, device="cuda", dtype=torch.uint8)
+    sw = torch.full((1024,), 0x38, device="cuda", dtype=torch.uint8)
+    alpha_value = 1.0 / 64.0
+    alpha = torch.tensor([alpha_value], device="cuda", dtype=torch.float32)
+    expected = mm_nvfp4_residue(a, w, sa, sw, alpha)
+
+    alpha.fill_(alpha_value * 4)
+    late_store(alpha, alpha_value)
+    actual = mm_nvfp4_residue(a, w, sa, sw, alpha)
+
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 def test_graph_changed_inputs():
