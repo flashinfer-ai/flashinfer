@@ -3711,28 +3711,6 @@ def _fp4_pair(quant: Optional["QuantConfig"]) -> Tuple[QuantFormat, QuantFormat]
 # MXFP8 x MXFP4 backends, with every op the quantizer class's; its swapped decode records on the twin instruction (the e2m1
 # weight as the MMA's A operand) follow Prims-TS's swap-AB templates as the NVFP4 pair's do. Each is a placement of the
 # class's dataflow: the same bits, placed as those kernels place theirs.
-def _activation_arith_of(activation_arith: str, chain, pair) -> str:
-    """The chain arithmetic of ``BatchInvariantFp4Config.activation_arith`` for the activation: ``"exact"`` -> the declared
-    sequences; ``"hardware"`` -> the hardware-arithmetic class where the chain has an exponential or a division, the exact
-    class otherwise (the ReLU family), and a refusal for PowLU (no hardware form)."""
-    from ..batch_invariant.support import unsupported
-    from .batch_invariant.spec import hw_arith_applies
-
-    if activation_arith not in ("exact", "hardware"):
-        raise ValueError(
-            f"activation_arith must be 'exact' or 'hardware', got {activation_arith!r}."
-        )
-    if activation_arith == "exact":
-        return "exact"
-    if chain.act == "powlu":
-        raise unsupported(
-            "moe.nvfp4" if pair[0] == QuantFormat.NVFP4 else "moe.mxfp4",
-            "activation_arith='hardware' with PowLU",
-            "the exact class: the PowLU chain has no hardware form",
-        )
-    return "hw" if hw_arith_applies(chain.act, chain.gated) else "exact"
-
-
 @dataclass(frozen=True)
 class BatchInvariantFp4Config:
     """The batch-invariant fp4 MoE backend of the unified layer: one backend for the 4-bit-weight quantization pairs, grouped
@@ -3757,7 +3735,11 @@ class BatchInvariantFp4Config:
     ``cvt_bf16(act(mul(g, s)) * mul(u, s))``, ``s = mul(alpha1[e], pts[token])``, the bf16 intermediate quantized per token
     by the same class, GEMM2 with ``cvt_bf16(mul(acc, mul(alpha2[e], pts2)))``, the slot-order combine. The instruction
     class of each expert weight shape is the dense 4-bit class rule's (the sm_107 K = 128 step on SM107, the K = 64 step
-    elsewhere), so the architecture is a dimension of ``fingerprint("fused_moe_nvfp4", ...)``.
+    elsewhere), so the architecture is a dimension of ``fingerprint("fused_moe_nvfp4", ...)``. The NVFP4 and MXFP4 pairs'
+    activation chains compute their exponential and divisions with the part's SFU (``ex2.approx.ftz`` / ``rcp.approx.ftz``):
+    deterministic and batch-invariant per part, the bits a property of the part (the verification standard is in the mode's
+    README); the ReLU family and PowLU have no such step and are the declared sequences, as is the whole chain of the
+    MXFP4 x MXFP8 pair.
 
     Weights (NVFP4 x NVFP4): ``prepare_weights`` takes the canonical bf16 ``w1 [E, 2I, H]`` (rows ``[up, gate]``) or
     ``[E, I, H]`` for the ungated activations, and ``w2 [E, H, I]``, and quantizes every expert with the mode's per-tensor
@@ -3794,7 +3776,7 @@ class BatchInvariantFp4Config:
     grouped placements of the dense batch-invariant mixed GEMM class of the part (both operands' block scales are operands
     of the mixed-format block-scaled step; the SM107 instruction folds 64 elements per step, the SM100 / SM103 one 32 and
     reads the e2m1 weight through the TMA's unpacking format: the architecture is a dimension of the class, as for
-    ``mm_mxfp8_mxfp4``), the activation chain is the bf16 classes' on the dequantised fp32 accumulators, the intermediate
+    ``mm_mxfp8_mxfp4``), the activation chain is the bf16 classes' exact sequence on the dequantised fp32 accumulators, the intermediate
     is quantized by the MXFP8 quantizer class inside GEMM1's epilogue, the combine is the slot-order fp32 fold. Weights:
     the canonical bf16 ``w1`` / ``w2`` on a CUDA device, ``hidden_size`` and ``intermediate_size`` multiples of 32 on SM107
     and of 128 on SM100 / SM103 (the unpacking format's 128-element runs). Activations: the canonical MXFP8 pack, e4m3
@@ -3804,22 +3786,11 @@ class BatchInvariantFp4Config:
     """
 
     intermediate: str = "per_token"
-    #: the arithmetic of the activation chain's exponential and divisions: ``"exact"`` (the declared, correctly rounded
-    #: sequences: the classes ``moe.<pair>.<act>``, reproduced bit for bit on the CPU) or ``"hardware"`` (the classes
-    #: ``moe.<pair>.<act>.hw``: the part's ``ex2.approx`` / ``rcp.approx``, deterministic and batch-invariant per part, their
-    #: bits architecture-specific; the CPU model holds the part's two functions as tables). The field applies to every typed
-    #: activation whose chain has an exponential or a division (SwiGLU, SwiGLUStep, GeGLU, GeGLUTanh, SiTU, SiLU, GELU); the
-    #: ReLU family is the same class under either value; PowLU has no hardware form and is refused under ``"hardware"``.
-    activation_arith: str = "exact"
 
     def __post_init__(self) -> None:
         if self.intermediate not in ("per_token", "static"):
             raise ValueError(
                 f"BatchInvariantFp4Config.intermediate must be 'per_token' or 'static', got {self.intermediate!r}."
-            )
-        if self.activation_arith not in ("exact", "hardware"):
-            raise ValueError(
-                f"BatchInvariantFp4Config.activation_arith must be 'exact' or 'hardware', got {self.activation_arith!r}."
             )
 
     @classmethod
@@ -3839,7 +3810,6 @@ class BatchInvariantFp4Config:
         device: Optional[torch.device] = None,
         intermediate: str = "per_token",
         intermediate_scales: Optional[torch.Tensor] = None,
-        activation_arith: str = "exact",
     ) -> Dict[str, Any]:
         """The backend's weight view for the pair ``quant`` selects (``None``: NVFP4 x NVFP4), to register under
         ``BatchInvariantFp4Runner.backend_key``; the activation's chain is part of the view (``activation`` defaults to
@@ -3849,60 +3819,15 @@ class BatchInvariantFp4Config:
         per-expert scales (see the class docstring). MXFP4 x MXFP4 and MXFP4 x MXFP8: every expert quantized to MXFP4 (one
         UE8M0 scale per 32 elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of
         these pairs."""
+        from .batch_invariant.api_fp4 import MoEWeightsFp4
+        from .batch_invariant.runner_fp4 import MIXED_PAIR, PAIRS
         from .batch_invariant.spec import activation_of
 
         pair = _fp4_pair(quant)
         chain = activation_of(activation if activation is not None else SwiGLU())
-        if (
-            pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-            and activation_arith != "exact"
-        ):
-            from ..batch_invariant.support import unsupported
-            from .batch_invariant.spec_mxfp4w8a import CLASS as MIXED_CLASS
-
-            raise unsupported(
-                MIXED_CLASS,
-                f"activation_arith={activation_arith!r}",
-                "the exact class: the mixed pair has no hardware-arithmetic class",
-            )
-        arith = _activation_arith_of(activation_arith, chain, pair)
         w1 = w1.to(device=device) if device is not None else w1
         w2 = w2.to(device=device) if device is not None else w2
-        if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
-            from .batch_invariant.api_nvfp4 import MoEWeightsNVFP4
-
-            return MoEWeightsNVFP4.prepare(
-                w1.to(torch.bfloat16),
-                w2.to(torch.bfloat16),
-                gated=chain.gated,
-                act=chain.act,
-                params=chain.params,
-                intermediate=intermediate,
-                intermediate_scales=intermediate_scales,
-                arith=arith,
-            ).view()
-        if pair == (QuantFormat.MXFP4, QuantFormat.MXFP4):
-            from ..batch_invariant.support import unsupported
-            from .batch_invariant.api_mxfp4 import MoEWeightsMXFP4
-            from .batch_invariant.spec_mxfp4 import CLASS as MX_CLASS
-
-            if intermediate != "per_token" or intermediate_scales is not None:
-                raise unsupported(
-                    MX_CLASS,
-                    f"intermediate={intermediate!r} with intermediate scales"
-                    if intermediate_scales is not None
-                    else f"intermediate={intermediate!r}",
-                    "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
-                )
-            return MoEWeightsMXFP4.prepare(
-                w1.to(torch.bfloat16),
-                w2.to(torch.bfloat16),
-                gated=chain.gated,
-                act=chain.act,
-                params=chain.params,
-                arith=arith,
-            ).view()
-        if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+        if pair == MIXED_PAIR:
             from ..batch_invariant.support import unsupported
             from .batch_invariant.api_mxfp4w8a import MoEWeightsMXFP4W8A
             from .batch_invariant.spec_mxfp4w8a import CLASS as MIXED_CLASS
@@ -3922,7 +3847,16 @@ class BatchInvariantFp4Config:
                 act=chain.act,
                 params=chain.params,
             ).view()
-        raise AssertionError(f"unreachable: {pair!r} passed _fp4_pair")
+        return MoEWeightsFp4.prepare(
+            PAIRS[pair],
+            w1.to(torch.bfloat16),
+            w2.to(torch.bfloat16),
+            gated=chain.gated,
+            act=chain.act,
+            params=chain.params,
+            intermediate=intermediate,
+            intermediate_scales=intermediate_scales,
+        ).view()
 
     @staticmethod
     def prepare_activations(
@@ -3932,13 +3866,15 @@ class BatchInvariantFp4Config:
         bf16 activations as given (no scale): the class's quantization (per token for NVFP4, per 32-element block for
         MXFP4) is part of the op. MXFP4 x MXFP8: the canonical MXFP8 pack by the batch-invariant quantizer, e4m3 ``[T, H]``
         and the token-major UE8M0 scales ``[T, H / 32]`` (uint8)."""
+        from .batch_invariant.runner_fp4 import MIXED_PAIR
+
         pair = _fp4_pair(quant)
         if pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
             (QuantFormat.MXFP4, QuantFormat.MXFP4),
         ):
             return hidden_states.to(torch.bfloat16).contiguous(), None
-        if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+        if pair == MIXED_PAIR:
             from .batch_invariant.api_mxfp4w8a import quantize_activations_mxfp8
 
             return quantize_activations_mxfp8(

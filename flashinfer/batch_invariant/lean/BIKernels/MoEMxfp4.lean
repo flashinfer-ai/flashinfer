@@ -9,10 +9,11 @@ Mirrors `flashinfer/fused_moe/batch_invariant/spec_mxfp4.py`. The class is the b
 routing, the slot-order combine, the launch model and the grouped placement erasure) with MXFP4 experts and MXFP4
 activations: e2m1 elements with one UE8M0 scale per 32 elements on both operands and no global or per-token scale. The
 block scales are applied inside the instruction, so the epilogue arithmetic on the raw accumulators of the dense MXFP4 GEMM
-classes (opaque: `gemm.mxfp4.kfold` / `kfold128`) is the bf16 class's own:
+classes (opaque: `gemm.mxfp4.kfold` / `kfold128`) is the bf16 class's own, its exponential and divisions on the part's SFU
+as the NVFP4 pair's (`MoE.gluHwT` / `MoE.actElemHwT`: `ex2Approx` / `rcpApprox`, opaque per-part functions):
 
-* `mxGluT`: GEMM1 of the gated classes, `cvt_bf16(glu_pre(g, u))` -- the bf16 class's gated chain (`gluT`, every
-  activation `GAct` with its scalars) on the raw accumulator pair;
+* `mxGluT`: GEMM1 of the gated classes, `cvt_bf16(glu_pre(g, u))` -- the bf16 class's gated chain (every activation `GAct`
+  with its scalars) on the raw accumulator pair;
 * `mxActT`: GEMM1 of the ungated classes, `cvt_bf16(act(acc))` -- the bf16 class's ungated chain (`UAct`);
 * `mxOutT`: GEMM2, `cvt_bf16(acc)` (the dense MX class's conversion at a unit alpha).
 
@@ -25,40 +26,35 @@ over the dense MXFP4 space. The generated `MoEMxfp4Cases.lean` couples every def
 namespace BIK.MoEMxfp4
 open BIK.MoE
 
-/-- GEMM1 of the gated MXFP4 classes: `cvt_bf16(glu_pre(g, u))` on the raw accumulators (`spec.glu_elem`). -/
-def mxGluT (a : GAct) (g u : MTerm) : MTerm := gluT a g u
+/-- GEMM1 of the gated MXFP4 classes: `cvt_bf16(glu_pre(g, u))` on the raw accumulators, the exponential and the
+divisions on the part's SFU (`spec.glu_elem` with `hw`). -/
+def mxGluT (a : GAct) (g u : MTerm) : MTerm := gluHwT a g u
 
-/-- GEMM1 of the ungated MXFP4 classes: `cvt_bf16(act(acc))` on the raw accumulator (`spec.act_elem`). -/
-def mxActT (a : UAct) (acc : MTerm) : MTerm := actElemT a acc
+/-- GEMM1 of the ungated MXFP4 classes: `cvt_bf16(act(acc))` on the raw accumulator (`spec.act_elem` with `hw`). -/
+def mxActT (a : UAct) (acc : MTerm) : MTerm := actElemHwT a acc
 
 /-- GEMM2 of the MXFP4 classes: `cvt_bf16(acc)` (`spec_mxfp4.mx_out_elem`). -/
 def mxOutT (acc : MTerm) : MTerm := .cvt "bf16" acc
 
-/-! ### The hardware-arithmetic classes `moe.mxfp4.<act>.hw`: the chains of `MoE.gluHwT` / `MoE.actElemHwT` on the raw
-accumulators (the part's `ex2` / `rcp` in place of the declared exponential and divisions). -/
+/-- **The MXFP4 GEMM1 chain is the bf16 class's chain on the raw accumulators**: no scale enters the epilogue (the block
+scales are the instruction's), nothing of the chain is re-ordered. -/
+theorem mxGluT_is_gluHwT (a : GAct) (g u : MTerm) : mxGluT a g u = gluHwT a g u := rfl
 
-/-- GEMM1 of the gated hardware classes. -/
-def mxGluHwT (a : GAct) (g u : MTerm) : MTerm := gluHwT a g u
+theorem mxActT_is_actElemHwT (a : UAct) (acc : MTerm) : mxActT a acc = actElemHwT a acc := rfl
 
-/-- GEMM1 of the ungated hardware classes. -/
-def mxActHwT (a : UAct) (acc : MTerm) : MTerm := actElemHwT a acc
+/-- The chains without an exponential or a division are the declared sequences: the ReLU family and PowLU. -/
+theorem mxActT_relu2_exact (acc : MTerm) : mxActT .relu2 acc = actElemT .relu2 acc := rfl
 
-theorem mxGluHwT_is_gluHwT (a : GAct) (g u : MTerm) : mxGluHwT a g u = gluHwT a g u := rfl
-theorem mxActHwT_relu2 (acc : MTerm) : mxActHwT .relu2 acc = mxActT .relu2 acc := rfl
+theorem mxGluT_powlu_exact (m : String) (l : Option String) (g u : MTerm) :
+    mxGluT (.powlu m l) g u = gluT (.powlu m l) g u := rfl
 
-/-- **The MXFP4 GEMM1 chain is the bf16 class's chain**: no scale enters the epilogue (the block scales are the
-instruction's), nothing of the bf16 chain is re-ordered. -/
-theorem mxGluT_is_gluT (a : GAct) (g u : MTerm) : mxGluT a g u = gluT a g u := rfl
+/-- The default gated chain: the SFU SiLU of the gate times the up accumulator. -/
+theorem mxGluT_silu (g u : MTerm) : mxGluT .silu g u = .cvt "bf16" (.mul (siluHwT g) u) := rfl
 
-theorem mxActT_is_actElemT (a : UAct) (acc : MTerm) : mxActT a acc = actElemT a acc := rfl
+/-- GEMM1 is the conversion of the pre-activation value. -/
+theorem mxGluT_is_cvt_of_pre (a : GAct) (g u : MTerm) : mxGluT a g u = .cvt "bf16" (gluPreHwT a g u) := rfl
 
-/-- The default gated chain is the bf16 class's SwiGLU chain. -/
-theorem mxGluT_silu (g u : MTerm) : mxGluT .silu g u = swigluT g u := rfl
-
-/-- GEMM1 is the conversion of the bf16 class's pre-activation value. -/
-theorem mxGluT_is_cvt_of_pre (a : GAct) (g u : MTerm) : mxGluT a g u = .cvt "bf16" (gluPreT a g u) := rfl
-
-theorem mxActT_is_cvt_of_pre (a : UAct) (acc : MTerm) : mxActT a acc = .cvt "bf16" (ungatedT a acc) := rfl
+theorem mxActT_is_cvt_of_pre (a : UAct) (acc : MTerm) : mxActT a acc = .cvt "bf16" (ungatedHwT a acc) := rfl
 
 /-- GEMM2 is the NVFP4 class's GEMM2 chain with the row scale removed, not a unit scale: the MX chain has no `mul`. -/
 theorem mxOutT_eq (acc : MTerm) : mxOutT acc = .cvt "bf16" acc := rfl

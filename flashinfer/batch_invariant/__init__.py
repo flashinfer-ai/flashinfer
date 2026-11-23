@@ -360,16 +360,13 @@ def _moe_nvfp4_fingerprint(
     device by default) selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the
     unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class; ``intermediate`` the
     intermediate's quantization class (``per_token`` / ``static``)."""
-    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
-        ALIGN_NVFP4,
-        expert_classes,
-    )
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import ALIGN_FP4, expert_classes
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import spec_fingerprint_nvfp4
 
     for dim, value in (("H", H), ("I", I)):
-        if value <= 0 or value % ALIGN_NVFP4:
+        if value <= 0 or value % ALIGN_FP4:
             raise ValueError(
-                f"fingerprint('fused_moe_nvfp4'): {dim} {value} must be a positive multiple of {ALIGN_NVFP4} "
+                f"fingerprint('fused_moe_nvfp4'): {dim} {value} must be a positive multiple of {ALIGN_FP4} "
                 "(the class's packed fp4 row alignment: whole scale-factor column groups)"
             )
     rm, name, params, gated = _moe_class_terms(
@@ -416,16 +413,16 @@ def _moe_mxfp4_fingerprint(
     ``arch`` (an architecture family, a compute capability or a device; the current CUDA device by default) selects the
     instruction class of the expert GEMMs (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere): the architecture is
     a dimension of the class."""
-    from flashinfer.fused_moe.batch_invariant.api_mxfp4 import ALIGN_MXFP4
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import ALIGN_FP4
     from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import (
         expert_classes_mx,
         spec_fingerprint_mxfp4,
     )
 
     for dim, value in (("H", H), ("I", I)):
-        if value <= 0 or value % ALIGN_MXFP4:
+        if value <= 0 or value % ALIGN_FP4:
             raise ValueError(
-                f"fingerprint('fused_moe_mxfp4'): {dim} {value} must be a positive multiple of {ALIGN_MXFP4} "
+                f"fingerprint('fused_moe_mxfp4'): {dim} {value} must be a positive multiple of {ALIGN_FP4} "
                 "(the class's packed fp4 row alignment: whole scale blocks)"
             )
     rm, name, params, gated = _moe_class_terms(

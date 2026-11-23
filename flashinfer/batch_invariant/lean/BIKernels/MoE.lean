@@ -244,13 +244,13 @@ def gluPreT : GAct → MTerm → MTerm → MTerm
 /-- The gated GEMM1 chain (`spec.glu_elem(..., "bf16")`): `cvt_bf16(glu_pre(g, u))`; `swigluT` at `.silu`. -/
 def gluT (a : GAct) (g u : MTerm) : MTerm := .cvt "bf16" (gluPreT a g u)
 
-/-! ## The hardware-arithmetic classes (`moe.<pair>.<act>.hw`; `spec.*_term(..., hw=True)`)
+/-! ## The fp4 MoE classes' chains (`moe.nvfp4.<act>`, `moe.mxfp4.<act>`; `spec.*_term(..., hw=True)`)
 
 The same chains with the exponential as the part's `ex2.approx.ftz` (`.ex2`) of `mul(x, log2 e)` and every division as
 `mul(a, rcp(b))` with the part's `rcp.approx.ftz` (`.rcp`). The two primitives are opaque per-part functions (`ex2Approx`,
 `rcpApprox` below: deterministic on one part, their bits implementation-specific); the terms stay pure functions of their
-inputs, so the class's determinism, batch invariance and placement erasure are the exact class's. PowLU has no hardware
-form (its declared log / exp stay); the ReLU family has no exponential or division and is the same class. -/
+inputs, so the class's determinism, batch invariance and placement erasure are the bf16 class's. PowLU keeps its declared
+log / exp; the ReLU family has no exponential or division: both are the declared sequences. -/
 
 /-- `ex2.approx.ftz.f32` of a part (named by its architecture): an opaque function, deterministic on the part. -/
 opaque ex2Approx (part : String) : Float → Float
@@ -289,7 +289,7 @@ def geluHwT (x : MTerm) : MTerm :=
   let y := erfPosHwT (.mul ax (c "0.7071067690849304"))
   .mul (c "0.5") (.add x (.mul ax y))
 
-/-- `spec.glu_pre(..., hw=True)` on the chains with a hardware form (`spec.HW_ACTS`); PowLU has none. -/
+/-- `spec.glu_pre(..., hw=True)`: the SFU steps on the chains that have them (`spec.HW_ACTS`); PowLU is the declared chain. -/
 def gluPreHwT : GAct → MTerm → MTerm → MTerm
   | .silu, g, u => .mul (siluHwT g) u
   | .geluTanh, g, u => .mul (geluTanhHwT g) u
@@ -306,7 +306,7 @@ def gluPreHwT : GAct → MTerm → MTerm → MTerm
     .mul gt ut
   | .powlu m limit, g, u => gluPreT (.powlu m limit) g u
 
-/-- The gated GEMM1 chain of the hardware class: `cvt_bf16(glu_pre_hw(g, u))`. -/
+/-- The gated GEMM1 chain of the fp4 classes: `cvt_bf16(glu_pre_hw(g, u))`. -/
 def gluHwT (a : GAct) (g u : MTerm) : MTerm := .cvt "bf16" (gluPreHwT a g u)
 
 
@@ -341,13 +341,13 @@ def ungatedT : UAct → MTerm → MTerm
 /-- The ungated GEMM1 chain (`spec.act_elem(..., "bf16")`): `cvt_bf16(act(acc))`, one accumulator. -/
 def actElemT (a : UAct) (x : MTerm) : MTerm := .cvt "bf16" (ungatedT a x)
 
-/-- `spec.ungated_term(..., hw=True)`: SiLU and GELU in the hardware arithmetic; the others as the exact class. -/
+/-- `spec.ungated_term(..., hw=True)`: SiLU and GELU with the SFU steps; the others are the declared sequences. -/
 def ungatedHwT : UAct → MTerm → MTerm
   | .silu, x => siluHwT x
   | .gelu, x => geluHwT x
   | a, x => ungatedT a x
 
-/-- The ungated GEMM1 chain of the hardware class. -/
+/-- The ungated GEMM1 chain of the fp4 classes. -/
 def actElemHwT (a : UAct) (x : MTerm) : MTerm := .cvt "bf16" (ungatedHwT a x)
 
 theorem gluPreHwT_powlu_is_exact (m : String) (l : Option String) (g u : MTerm) :

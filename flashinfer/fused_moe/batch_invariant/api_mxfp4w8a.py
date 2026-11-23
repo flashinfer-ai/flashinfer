@@ -599,7 +599,7 @@ def fused_moe_mxfp4w8a(
     pre-routed packed-word convention). ``return_intermediates``: the live buffers (``counts``, ``dest``, ``src``, ``xq``,
     ``xsf``, ``x_perm`` / ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``; the dense packing adds ``dest_pad`` / ``pos_pad``
     and the row counts ``Tk_a`` / ``Tk_sf``), the records used, the packing, the requantization spelling and the bodies."""
-    from .api_mxfp4 import _placeholder
+    from .api_fp4 import _placeholder
     from .permute import warps_per_row
     from .permute_nvfp4 import get_compiled_scatter_fp4, scatter_lanes
     from .schedule_mxfp4w8a import GEMM2_CHAIN, default_configs_mx, packing_for

@@ -965,13 +965,10 @@ python scripts/generate_moe_activation_matrix.py --write
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
 
-The batch-invariant fp4 backend (`BatchInvariantFp4Config`) serves each typed activation above in two chain arithmetics,
-selected by its `activation_arith` field: `"exact"` (the default: the declared, correctly rounded sequences, the classes
-`moe.nvfp4.<act>` / `moe.mxfp4.<act>`) and `"hardware"` (the classes `moe.nvfp4.<act>.hw` / `moe.mxfp4.<act>.hw`: the part's
-`ex2.approx` / `rcp.approx` in place of the exponential and the divisions, deterministic and batch-invariant per part, their bits
-architecture-specific). The field applies to the chains with an exponential or a division (`SwiGLU`, `SwiGLUStep`, `GeGLU`,
-`GeGLUTanh`, `SiTU`, `SiLU`, `GELU`); the ReLU family is the same class under either value; `PowLU` has no hardware form and
-is refused under `"hardware"`. The verification standard of the hardware classes is in `flashinfer/batch_invariant/README.md`.
+The batch-invariant fp4 backend (`BatchInvariantFp4Config`) computes the exponential and the divisions of the typed activations
+above with the part's SFU (`ex2.approx` / `rcp.approx`) on its NVFP4 x NVFP4 and MXFP4 x MXFP4 pairs: deterministic and
+batch-invariant per part, the bits architecture-specific; the ReLU family and `PowLU` are the declared sequences, as is the whole
+chain of the MXFP4 x MXFP8 pair. The verification standard is in `flashinfer/batch_invariant/README.md`.
 
 For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
 [usage, qualification and extension guide](../frost_low_latency_moe.md).

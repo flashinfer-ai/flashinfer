@@ -35,7 +35,7 @@ from ...batch_invariant.support import (
 from ..api import MoEActivationPack, MoEWeightPack, QuantFormat, RoutingInputMode
 from ..runners import _validate_logits_inputs, _validate_prerouted_inputs
 from .runner import routing_term
-from .runner_nvfp4 import MOE_NVFP4_ARCHS, _Fp4PairRunner
+from .runner_fp4 import MOE_FP4_ARCHS, _Fp4RunnerBase
 from .spec_mxfp4w8a import BLOCK, CLASS
 
 
@@ -81,13 +81,13 @@ def _configs_from_tactic_mx(t: tuple):
 
 
 #: The compute capabilities the classes are stated for (the dense mixed GEMM class's parts).
-MOE_MXFP4W8A_ARCHS: Tuple[Tuple[int, int], ...] = MOE_NVFP4_ARCHS
+MOE_MXFP4W8A_ARCHS: Tuple[Tuple[int, int], ...] = MOE_FP4_ARCHS
 #: Positions of the packed inputs: the quantized activations and their scales, the expert ids, the routing weights, the
 #: two weights with their scales and the output.
 _XQ, _XSF, _IDS, _W, _W1, _W1SF, _W2, _W2SF, _OUT = range(9)
 
 
-class BatchInvariantMoeMxfp4w8aRunner(_Fp4PairRunner):
+class BatchInvariantMoeMxfp4w8aRunner(_Fp4RunnerBase):
     """The unified layer's runner for the batch-invariant mixed MXFP4 x MXFP8 MoE classes."""
 
     CLASS = CLASS
@@ -103,7 +103,7 @@ class BatchInvariantMoeMxfp4w8aRunner(_Fp4PairRunner):
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _check_support(self) -> None:
-        self._check_experts()
+        self._check_experts(CLASS)
         super()._check_support()
         from .api_mxfp4w8a import check_shape_mxfp4w8a, mx_class_of
 
@@ -114,12 +114,6 @@ class BatchInvariantMoeMxfp4w8aRunner(_Fp4PairRunner):
                 CLASS,
                 f"BatchInvariantFp4Config(intermediate={self._intermediate!r})",
                 "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
-            )
-        if self._arith != "exact":
-            raise unsupported(
-                CLASS,
-                f"BatchInvariantFp4Config(activation_arith={self._arith_label()!r})",
-                "the exact class: the mixed pair has no hardware-arithmetic class",
             )
         check_device(self.device, CLASS, MOE_MXFP4W8A_ARCHS)
         try:
