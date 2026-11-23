@@ -1006,9 +1006,11 @@ def test_grouped_n_raster_early_exit_preserves_valid_tiles(monkeypatch, group_m)
     monkeypatch.setattr(queue, "_clc_fast_drain_all", lambda: drained.append(True))
 
     visited = []
+    visit_order = []
     for z in range(count_m * count_n):
         tile_idx = rasterize(scheduler, 0, 0, z)
         skipped = should_skip(queue, SimpleNamespace(tile_idx=tile_idx))
+        visit_order.append((tile_idx, skipped))
         if not skipped:
             visited.append(tile_idx)
         maybe_drain(queue)
@@ -1019,6 +1021,9 @@ def test_grouped_n_raster_early_exit_preserves_valid_tiles(monkeypatch, group_m)
     # Ordinary early exit must skip that cluster without cancelling later work.
     assert visited == [(0, n, 0) for n in range(count_n)]
     assert bool(drained) == (group_m == 1)
+    if group_m > 1:
+        first_skip = next(i for i, (_, skip) in enumerate(visit_order) if skip)
+        assert any(not skip for _, skip in visit_order[first_skip + 1 :])
 
 
 @pytest.mark.gpu

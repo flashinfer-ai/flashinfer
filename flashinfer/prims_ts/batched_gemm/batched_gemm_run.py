@@ -4837,12 +4837,14 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
     )
 
 
-def _prepare_tma_descriptors(io: dict, stream, *, prepare=None):
-    """Bind workspace descriptors using an optional cached preparation executable."""
+def _prepare_tma_descriptors(io: dict, stream, *, prepare=None, reencode_tma=None):
+    """Bind descriptors in the supplied mode, or resolve it from the environment."""
     from cutlass.cutlass_dsl import BaseDSL
     from cutlass.cute.runtime import make_ptr
 
-    if _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA"):
+    if reencode_tma is None:
+        reencode_tma = _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA")
+    if reencode_tma:
         io["_reencode_tma"] = True
         return
     key = tuple(
@@ -4944,7 +4946,7 @@ def run(executable: _BatchedGemmExecutable, tensors: dict, stream) -> None:
             f"prepared tensors shape {tensors['shape']} does not match the "
             f"compiled shape {executable.shape}"
         )
-    _prepare_tma_descriptors(tensors, stream)
+    _prepare_tma_descriptors(tensors, stream, reencode_tma=executable.reencode_tma)
     executable.compiled_fn(*_launch_arg_tuple(tensors, stream))
 
 

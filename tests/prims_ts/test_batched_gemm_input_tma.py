@@ -704,14 +704,15 @@ def test_input_tma_cache_policy_survives_dispatch(
     for name in ("issue_tma_load", "_issue_tma_load_impl"):
         monkeypatch.setattr(cga, name, python_body(getattr(cga, name)))
 
-    def record(*args, **kwargs):
-        calls.append(kwargs)
-
     for name in (
         "cp_async_bulk_tensor_shared_cta_global",
         "cp_async_bulk_tensor_shared_cluster_global",
     ):
-        monkeypatch.setattr(cga.prims, name, record)
+        monkeypatch.setattr(
+            cga.prims,
+            name,
+            lambda *args, emitter=name, **kwargs: calls.append((emitter, kwargs)),
+        )
     python_body(cga.load_input_tma)(
         cfg, operand, object(), object(), (), object(), l2_cache_hint=hint
     )
@@ -719,4 +720,6 @@ def test_input_tma_cache_policy_survives_dispatch(
     if not explicit_hint and instruction == "umma":
         expected = activation_hint
     assert len(calls) == 1
-    assert calls[0]["l2_cache_hint"] is expected
+    space = "cta" if instruction == "cta" else "cluster"
+    assert calls[0][0] == f"cp_async_bulk_tensor_shared_{space}_global"
+    assert calls[0][1]["l2_cache_hint"] is expected

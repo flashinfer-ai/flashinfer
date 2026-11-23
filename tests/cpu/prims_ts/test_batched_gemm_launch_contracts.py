@@ -199,9 +199,11 @@ def test_executable_rejects_descriptor_mode_change(monkeypatch, reencode):
         runner.torch.cuda, "Stream", lambda: SimpleNamespace(cuda_stream=0)
     )
 
-    def prepare(io, stream):
-        io["_reencode_tma"] = runner._env_flag_enabled(
-            "FLASHINFER_PRIMS_TS_REENCODE_TMA"
+    def prepare(io, stream, *, reencode_tma=None):
+        io["_reencode_tma"] = (
+            runner._env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA")
+            if reencode_tma is None
+            else reencode_tma
         )
 
     def compile(io, stream):
@@ -235,7 +237,9 @@ def test_executable_rejects_configuration_change_before_preparation(monkeypatch)
         runner, "_compile_for_launch", lambda *args: lambda *args: launches.append(args)
     )
     monkeypatch.setattr(
-        runner, "_prepare_tma_descriptors", lambda *args: preparations.append(args)
+        runner,
+        "_prepare_tma_descriptors",
+        lambda *args, **kwargs: preparations.append(args),
     )
     executable = runner.compile()
     assert executable.cfg is io["cfg"]
@@ -248,3 +252,42 @@ def test_executable_rejects_configuration_change_before_preparation(monkeypatch)
     io["cfg"] = replace(executable.cfg)
     runner.run(executable, io, None)
     assert len(preparations) == len(launches) == 1
+
+
+@pytest.mark.parametrize("reencode", [False, True])
+def test_run_binds_compiled_mode_across_environment_change(monkeypatch, reencode):
+    from cutlass.cutlass_dsl import BaseDSL
+
+    monkeypatch.setattr(BaseDSL, "enable_pyir", contextlib.nullcontext)
+    preparations, launches, reads = [], [], []
+    monkeypatch.setattr(
+        runner.cute, "compile", lambda *args, **kwargs: preparations.append
+    )
+    flag = "FLASHINFER_PRIMS_TS_REENCODE_TMA"
+    monkeypatch.setenv(flag, str(int(reencode)))
+    read_flag = runner._env_flag_enabled
+
+    def changing_environment(name):
+        value = read_flag(name)
+        if name == flag:
+            reads.append(value)
+            monkeypatch.setenv(flag, str(int(not reencode)))
+        return value
+
+    monkeypatch.setattr(runner, "_env_flag_enabled", changing_environment)
+    io = _io()
+    executable = runner._BatchedGemmExecutable(
+        compiled_fn=lambda *args: launches.append(args),
+        shape=io["shape"],
+        cfg=io["cfg"],
+        reencode_tma=reencode,
+    )
+    runner.run(executable, io, None)
+    assert reads == [reencode]
+    assert io["_reencode_tma"] is reencode
+    assert len(preparations) == (0 if reencode else 1)
+    assert launches[0][-1] is (None if reencode else io["tma_desc_storage_dp"])
+    # The next call still rejects a mode that changed before its initial check.
+    with pytest.raises(ValueError, match="recompile"):
+        runner.run(executable, io, None)
+    assert len(launches) == 1

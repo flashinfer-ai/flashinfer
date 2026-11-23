@@ -165,6 +165,7 @@ def _verify_repeated_tile_lifetimes(plan):
     op = schedules.EpilogueOp
     queue = []
     scratch = {}
+    reuse_needs_barrier = set()
     unit = plan.output_unit
     for tile in range(5):
         issuing = set()
@@ -212,6 +213,7 @@ def _verify_repeated_tile_lifetimes(plan):
                 assert action.slot not in issuing and not any(
                     action.slot in group for group in queue
                 )
+                assert action.slot not in reuse_needs_barrier
                 for word in range(plan.words_per_fragment):
                     registers.remove((action.fragment, word))
                 scratch[action.slot, action.fragment % unit] = (tile, action.fragment)
@@ -222,6 +224,7 @@ def _verify_repeated_tile_lifetimes(plan):
             elif action.op == op.BARRIER:
                 unpublished.difference_update(fenced)
                 fenced.clear()
+                reuse_needs_barrier.clear()
             elif action.op == op.EMIT:
                 if not plan.finalize:
                     assert action.slot not in unpublished
@@ -234,6 +237,12 @@ def _verify_repeated_tile_lifetimes(plan):
                 issuing = set()
             elif action.op == op.SOURCE_WAIT:
                 # wait_group N leaves at most the newest N groups pending.
+                completed = queue[: -action.pending] if action.pending else queue
+                if not plan.thread_owns_scratch:
+                    # The issuer's wait still needs publication to other writers.
+                    reuse_needs_barrier.update(
+                        slot for group in completed for slot in group
+                    )
                 queue = queue[-action.pending :] if action.pending else []
             elif action.op == op.RELEASE:
                 assert not released and not pending_reads
@@ -308,6 +317,19 @@ def test_lifetime_audit_rejects_unpublished_plain_emit(removed):
         i for i, a in enumerate(actions) if a.op == schedules.EpilogueOp.STAGE
     )
     actions.pop(publication)
+    with pytest.raises(AssertionError):
+        _verify_repeated_tile_lifetimes(replace(plan, actions=tuple(actions)))
+
+
+def test_lifetime_audit_rejects_reuse_without_writer_barrier():
+    plan = _plain_single_slot_plan()
+    _verify_repeated_tile_lifetimes(plan)
+    actions = list(plan.actions)
+    wait = next(
+        i for i, a in enumerate(actions) if a.op == schedules.EpilogueOp.SOURCE_WAIT
+    )
+    assert actions[wait + 1].op == schedules.EpilogueOp.BARRIER
+    actions.pop(wait + 1)
     with pytest.raises(AssertionError):
         _verify_repeated_tile_lifetimes(replace(plan, actions=tuple(actions)))
 
@@ -388,19 +410,32 @@ def test_group_waits_follow_groups_not_slot_count():
         ],
         [dict(load_fragments=1, release_tmem=True)],
         [dict(load_fragments=1, emit_fragments=1)],
+    ],
+)
+def test_explicit_schedule_rejects_invalid_transfers(steps):
+    with pytest.raises(ValueError):
+        _ = _step_config(steps, stages=1).preload_epilogue_plan
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
         [dict(load_fragments=-1)],
+        [dict(load_fragments=9)],
         [dict(load_fragments=True)],
         [dict(load_fragments=1.5)],
         [dict(load_fragments=1, read_ahead=2)],
+        [dict(load_fragments=1, read_ahead=True)],
+        [dict(load_fragments=1, read_ahead=1.5)],
         [dict(stage_fragments=1, read_ahead=1)],
         [dict(release_tmem=1)],
         [dict(unknown=1)],
         [{}],
     ],
 )
-def test_explicit_schedule_rejects_invalid_transfers(steps):
+def test_normalize_epilogue_steps_rejects_malformed_fields(steps):
     with pytest.raises(ValueError):
-        _ = _step_config(steps, stages=1).preload_epilogue_plan
+        schedules.normalize_epilogue_steps(steps)
 
 
 def test_explicit_schedule_json_identity_and_legacy_conflict():

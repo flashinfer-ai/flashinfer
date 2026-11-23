@@ -76,6 +76,7 @@ def test_fused_finalize_replay(
     guard_output=False,
     router_weight_offset=0,
     input_alias_offset=None,
+    aliased_input_name="hidden_states",
 ):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Native BatchM finalization requires Rubin")
@@ -224,6 +225,23 @@ def test_fused_finalize_replay(
         with pytest.raises(ValueError, match="contiguous"):
             run(output=backing[:, ::2])
         assert torch.all(backing == 7)
+        from flashinfer.prims_ts.moe import finalize
+
+        misaligned_backing = torch.full(
+            (tokens * hidden + 1,), 7.0, device="cuda", dtype=torch.bfloat16
+        )
+        misaligned = misaligned_backing[1:].view(tokens, hidden)
+        assert misaligned.is_contiguous() and misaligned.data_ptr() % 16
+        with monkeypatch.context() as guard:
+            guard.setattr(
+                finalize,
+                "_zero_output",
+                lambda *args: pytest.fail("misaligned output must not be cleared"),
+            )
+            with pytest.raises(ValueError, match="16-byte aligned"):
+                run(output=misaligned)
+        torch.cuda.synchronize()
+        assert torch.all(misaligned_backing == 7)
     reference = run(False)[0]
     run(output=out)
     assert torch.isfinite(out).all() and out.abs().max() > 0
@@ -306,25 +324,31 @@ def test_fused_finalize_replay(
         )
         guarded_outputs.append(backing)
         aliased_out = backing[256:-256].view(tokens, hidden)
+        source = kwargs[aliased_input_name]
         aliased_input = (
             aliased_out.view(torch.uint8)
-            .flatten()[input_alias_offset : input_alias_offset + x.numel()]
-            .view_as(x)
+            .flatten()[
+                input_alias_offset : input_alias_offset
+                + source.numel() * source.element_size()
+            ]
+            .view(source.dtype)
+            .view_as(source)
         )
-        aliased_input.copy_(x)
-        run(hidden_states=aliased_input, output=aliased_out)
+        alias_kwargs = {aliased_input_name: aliased_input, "output": aliased_out}
+        aliased_input.copy_(source)
+        run(**alias_kwargs)
         torch.testing.assert_close(aliased_out, reference, rtol=0.015, atol=0.015)
-        aliased_input.copy_(x)
+        aliased_input.copy_(source)
         alias_graph = torch.cuda.CUDAGraph()
         before_capture = len(fused_launches)
         with torch.cuda.graph(alias_graph):
-            run(hidden_states=aliased_input, output=aliased_out)
+            run(**alias_kwargs)
         assert len(fused_launches) == before_capture + 1
         for step in (1, 3):
             inputs_for(step)
             reference = run(False)[0]
             # FC2 overwrites its aliased input; restore it for every replay.
-            aliased_input.copy_(x)
+            aliased_input.copy_(source)
             alias_graph.replay()
             torch.cuda.synchronize()
             assert torch.isfinite(aliased_out).all()
@@ -483,7 +507,8 @@ def test_fused_finalize_router_weight_alignment_replay(monkeypatch, offset):
 @pytest.mark.arch_rubin
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("offset", [0, 32])
-def test_fused_finalize_aliased_input_replay(monkeypatch, offset):
+@pytest.mark.parametrize("input_name", ["hidden_states", "hidden_states_scale"])
+def test_fused_finalize_aliased_input_replay(monkeypatch, offset, input_name):
     test_fused_finalize_replay(
         monkeypatch,
         "BlockMajorK",
@@ -494,6 +519,8 @@ def test_fused_finalize_aliased_input_replay(monkeypatch, offset):
         0,
         -1,
         input_alias_offset=offset,
+        aliased_input_name=input_name,
+        guard_output=True,
     )
 
 

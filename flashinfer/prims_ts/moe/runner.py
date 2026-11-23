@@ -1828,6 +1828,10 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             self, kwargs
         ) and supports_fused_finalize(fc2_cfg)
 
+        # Reject unsupported views before routing or zeroing can modify output.
+        if fuse_finalize and output.data_ptr() % 16:
+            raise ValueError("fc2 output buffer pointer must be 16-byte aligned")
+
         # A contiguous BF16 view may still start at an unaligned offset.
         # Bind aligned coefficients before routing or output zeroing; aligned
         # caller buffers retain their zero-copy path, including graph capture.
@@ -1974,7 +1978,11 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         if fuse_finalize:
             from .finalize import zero_output_during_fc1
 
-            with zero_output_during_fc1(output, read_input=hidden_states):
+            with zero_output_during_fc1(
+                output,
+                read_input=hidden_states,
+                read_input_scale=moe_inputs.hidden_states_scale,
+            ):
                 fc1_fn(*self._launch_args(fc1_io, stream))
         else:
             fc1_fn(*self._launch_args(fc1_io, stream))

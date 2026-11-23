@@ -26,14 +26,19 @@ def test_output_overlap_uses_byte_ranges(input_start, overlap):
     assert not finalize._overlapping_bytes(output, packed_input.clone())
 
 
-@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("overlap", ["neither", "input", "scales", "both"])
 def test_zeroing_orders_reads_and_preserves_disjoint_overlap(monkeypatch, overlap):
     storage = torch.empty(128, dtype=torch.bfloat16)
     output = storage[:64]
     packed_input = (
         storage.view(torch.uint8)[0:32]
-        if overlap
+        if overlap in ("input", "both")
         else storage.view(torch.uint8)[128:160]
+    )
+    input_scales = (
+        storage.view(torch.uint8)[32:64]
+        if overlap in ("scales", "both")
+        else storage.view(torch.uint8)[160:192]
     )
     calls = []
     main = SimpleNamespace(wait_event=lambda event: calls.append("main waits done"))
@@ -64,11 +69,13 @@ def test_zeroing_orders_reads_and_preserves_disjoint_overlap(monkeypatch, overla
             "zero on main" if stream is main else "zero on aux"
         ),
     )
-    with finalize.zero_output_during_fc1(output, read_input=packed_input):
+    with finalize.zero_output_during_fc1(
+        output, read_input=packed_input, read_input_scale=input_scales
+    ):
         calls.append("FC1")
     assert calls == (
         ["FC1", "zero on main"]
-        if overlap
+        if overlap != "neither"
         else [
             "ready on main",
             "FC1",
