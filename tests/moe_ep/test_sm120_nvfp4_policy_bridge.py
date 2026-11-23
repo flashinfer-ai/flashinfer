@@ -146,9 +146,7 @@ def test_ep8_frontend_skips_p2p_split_anchors(monkeypatch):
 
 
 def _peer(host, numa_node):
-    return SimpleNamespace(
-        host=host, numa_node=numa_node, p2p_domain=(host, numa_node)
-    )
+    return SimpleNamespace(host=host, numa_node=numa_node, p2p_domain=(host, numa_node))
 
 
 def _ep8_topology():
@@ -230,8 +228,13 @@ def test_ep16_two_host_p2p_split_bucket_plan(monkeypatch):
 
 @pytest.mark.parametrize(
     "selected, override, expected",
-    [([4, 4, 4, 2], None, 4), ([2, 4], None, 4), ([2, 2, 4], None, 2), ([], None, 2),
-     ([4, 4], "1", 1)],
+    [
+        ([4, 4, 4, 2], None, 4),
+        ([2, 4], None, 4),
+        ([2, 2, 4], None, 2),
+        ([], None, 2),
+        ([4, 4], "1", 1),
+    ],
 )
 def test_one_xnuma_fsplit_per_workspace(monkeypatch, selected, override, expected):
     """p2p_split buckets share cumulative commit words, so a workspace runs one
