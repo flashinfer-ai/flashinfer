@@ -233,7 +233,7 @@ def construction_supported(
 
 @functools.cache
 def _device_cc(device_index: int) -> Tuple[int, int]:
-    return tuple(get_compute_capability(torch.device("cuda", device_index)))
+    return get_compute_capability(torch.device("cuda", device_index))
 
 
 @functools.cache
