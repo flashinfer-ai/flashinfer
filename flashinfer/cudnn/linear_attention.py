@@ -36,8 +36,6 @@ except Exception:
     cudnn = None
     CUDNN_AVAILABLE = False
 
-_MIN_FRONTEND_VERSION = (1, 29)
-
 
 def _linear_gate(g: Optional[torch.Tensor], ones_shape, dtype, device):
     """The GDN / GDP forget gate for the graph as linear alpha
@@ -162,29 +160,16 @@ def _linear_attention_auto_available() -> bool:
     if not CUDNN_AVAILABLE:
         return False
     try:
-        return Version(cudnn.__version__) >= Version("1.31") and (
-            Version(version("nvidia-cutlass-dsl")) >= Version("4.7")
-        )
+        return Version(version("nvidia-cutlass-dsl")) >= Version("4.7")
     except (AttributeError, InvalidVersion, PackageNotFoundError):
         return False
 
 
-def _check_cudnn_frontend(feature: str, minimum=_MIN_FRONTEND_VERSION) -> None:
-    """Fail fast on a frontend that has no linear-attention graph node."""
+def _check_cudnn_frontend(feature: str) -> None:
+    """Require the optional cuDNN runtime for explicit calls."""
     if not CUDNN_AVAILABLE:
         raise RuntimeError(
             f"cuDNN {feature} requires the cudnn Python frontend. Install with: "
-            "pip install -U 'nvidia-cudnn-frontend[cutedsl]'"
-        )
-    try:
-        version = tuple(int(part) for part in cudnn.__version__.split(".")[:2])
-    except (ValueError, AttributeError):
-        return
-    if version < minimum:
-        want = ".".join(str(part) for part in minimum)
-        raise RuntimeError(
-            f"cuDNN {feature} requires cudnn-frontend >= {want}, found "
-            f"{cudnn.__version__}. Upgrade with: "
             "pip install -U 'nvidia-cudnn-frontend[cutedsl]'"
         )
 
@@ -377,7 +362,9 @@ if CUDNN_AVAILABLE:
             if overwrite_initial_state:
                 attrs["overwrite_initial_state"] = True
 
-            O, fs, _checkpoints = getattr(graph, family)(**ports, **attrs)
+            # Outputs come in a fixed order that FE releases extend at the end
+            # (1.33 appends composed_initial_state); only O and final_state are used.
+            O, fs = getattr(graph, family)(**ports, **attrs)[:2]
 
             O.set_uid(UIDs.O_UID.value).set_output(True).set_dim(
                 list(o.shape)
@@ -420,13 +407,7 @@ if CUDNN_AVAILABLE:
         # Cache the completed build, including a compatibility fallback. A
         # failed overwrite graph must neither enter the cache nor be retried
         # on every warm call. This is an FE capability, not a backend version.
-        try:
-            version = tuple(int(part) for part in cudnn.__version__.split(".")[:2])
-        except (AttributeError, ValueError):
-            version = ()
-        overwrite = overwrite_initial_state and (
-            version >= (1, 30) or kwargs.get("state_indices") is not None
-        )
+        overwrite = overwrite_initial_state
         try:
             result = _create_la_graph(
                 *args, overwrite_initial_state=overwrite, **kwargs
@@ -792,7 +773,6 @@ def cudnn_chunk_gated_delta_rule(
     num_seqs = cu_seqlens.shape[0] - 1
     overwrite = False
     if state_indices is not None:
-        _check_cudnn_frontend("GDN state pools", (1, 31))
         overwrite = _validate_la_state_pool(
             state_indices,
             initial_state,
@@ -958,7 +938,6 @@ def cudnn_chunk_gated_delta_product(
     num_seqs = cu_seqlens.shape[0] - 1
     overwrite = False
     if state_indices is not None:
-        _check_cudnn_frontend("GDP state pools", (1, 31))
         overwrite = _validate_la_state_pool(
             state_indices,
             initial_state,
@@ -1122,7 +1101,6 @@ def cudnn_chunk_gated_delta_rule2(
     num_seqs = cu_seqlens.shape[0] - 1
     overwrite = False
     if state_indices is not None:
-        _check_cudnn_frontend("GDN2 state pools", (1, 31))
         overwrite = _validate_la_state_pool(
             state_indices,
             initial_state,
@@ -1325,7 +1303,6 @@ def cudnn_recurrent_kda(
     o = output.squeeze(0) if output.dim() == 4 else output
     num_seqs = cu_seqlens.shape[0] - 1
     if state_indices is not None:
-        _check_cudnn_frontend("KDA state pools", (1, 31))
         if num_seqs <= 0 or q.shape[0] <= num_seqs:
             raise NotImplementedError(
                 "cuDNN KDA state_indices requires ordinary packed multi-token prefill"

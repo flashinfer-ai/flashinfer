@@ -189,7 +189,7 @@ def _dequant_reference(
     w13: torch.Tensor,
     w2: torch.Tensor,
 ) -> torch.Tensor:
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
         transform_weights_for_sm90_push,
     )
 

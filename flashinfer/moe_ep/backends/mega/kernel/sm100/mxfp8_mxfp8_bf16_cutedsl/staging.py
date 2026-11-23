@@ -16,9 +16,9 @@ def _use_fused_stage() -> bool:
 
 def _mxfp8_data_dtype(kind: str) -> torch.dtype:
     """Resolve activation dtype, using E4M3 for mixed MXFP4/MXFP8 weights."""
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
-    # package import also bootstraps sys.path for the kernel packages.
-    from ......kernel_src.sm100.cutedsl_megamoe import kind_data_dtype
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        kind_data_dtype,
+    )
 
     return kind_data_dtype("mxfp8_e4m3" if kind == "mxfp4_mxfp8" else kind)
 
@@ -64,8 +64,7 @@ def stage_mega_moe_inputs(
     (quant + routing repack in one launch); ``FLASHINFER_MEGA_FUSED_STAGE=0``
     falls back to the original torch-composed staging below.
     """
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         Mxfp8BlockSize,
         ceil_div,
         fused_quant_stage,
@@ -133,7 +132,9 @@ def stage_mega_moe_inputs(
     data_dtype = _mxfp8_data_dtype(kind)
     activation_fp32 = hidden_states.to(torch.float32)
     if mixed:
-        from ......kernel_src.sm100.next_cutedsl_megamoe import quantize_mxfp8_block32
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            quantize_mxfp8_block32,
+        )
 
         q, sf = quantize_mxfp8_block32(activation_fp32, data_dtype)
     else:
@@ -186,8 +187,7 @@ def validate_mxfp8_forward_inputs(
         )
         return
 
-    # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-    from ......kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         Mxfp8BlockSize,
         Mxfp8ScaleDtype,
         ceil_div,
@@ -297,7 +297,9 @@ def stage_genphase_inputs(t, workspace, *, quantize_input: bool) -> None:
             ),
         )
     else:
-        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+            note_staged_tokens,
+        )
 
         workspace.x[:num_tokens].view(torch.uint8).copy_(
             t.hidden_states.view(torch.uint8)

@@ -39,7 +39,7 @@ import pytest
 
 # Import only the public shim boundary.  The package keeps CUDA/CuTe imports
 # lazy, while also preserving the SM90/SM100 process-isolation guard.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel")
+pytest.importorskip("flashinfer.moe_ep.shims.sm90.cutedsl_megamoe")
 
 
 HIDDEN = 128
@@ -298,9 +298,7 @@ def _fast_fp8_mm(a, b):
 
 def _swiglu_sm90_formula(gate, up):
     """Independent bit-match of the SM90 exp2/reciprocal SwiGLU formula."""
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
-        _swiglu_pair_hw_match_cuda,
-    )
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import _swiglu_pair_hw_match_cuda
 
     return _swiglu_pair_hw_match_cuda(gate, up)
 
@@ -859,9 +857,7 @@ def test_moe_ep_sm90_pull_mxfp4_tail_candidates_other_shapes(
     """Execute normal tuning candidates beyond the original model/EP shape."""
     import sys
 
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
-        hopper_mxfp4_candidates,
-    )
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import hopper_mxfp4_candidates
 
     module = sys.modules[__name__]
     for field, value in (
@@ -995,10 +991,8 @@ def test_mxfp4_bulk_offsets_match_cpasync_after_repeat_and_reset(
         preprocess_sm90_pull_mxfp4_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
-        hopper_mxfp4,
-    )
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.comm import (
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import hopper_mxfp4
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.comm import (
         reset_compiled_mega_workspaces,
     )
 
@@ -1070,6 +1064,7 @@ def test_mxfp4_bulk_offsets_match_cpasync_after_repeat_and_reset(
                 # The host compile identity and device specialization must both
                 # select the existing non-bulk copy implementation for control.
                 kernel_module = sys.modules[
+                    "flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification."
                     "moe_hopper_fp8.kernel_mxfp4_fp8_glu_fc12_swapab"
                 ]
                 for module in (hopper_mxfp4, kernel_module):

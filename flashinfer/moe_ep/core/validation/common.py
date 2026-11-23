@@ -18,8 +18,8 @@ _NIXL_EP_SUPPORTED_HIDDEN_SIZES = frozenset(
 )
 _NIXL_EP_MAX_TOKENS_PER_RANK = 1024
 
-# NCCL-EP group-create fails on Blackwell (B200) with older NCCL
-# (2.27.x/2.29.x, at nccl_ep.cc:1438); >=2.30.7 carries the B200 EP support.
+# NCCL-EP group creation needs the validated NCCL runtime floor.
+# Older NCCL 2.27.x/2.29.x runtimes fail at nccl_ep.cc:1438.
 # This floor is enforced HERE rather than as a base-dependency pin because
 # torch's cu13 wheels pin nvidia-nccl-cu13 exactly (e.g. ==2.29.7) — a
 # metadata floor makes pip evict torch (see requirements.txt). The build hook
@@ -232,31 +232,41 @@ def validate_arch_for_backend(backend: str) -> None:
             )
 
 
-# nccl_ep instantiates its low-latency kernels only for these hidden sizes
+# Legacy nccl_ep instantiates its low-latency kernels only for these hidden sizes
 # (contrib/nccl_ep/device/macros.cuh, SWITCH_HIDDEN). Anything else reaches
 # EP_HOST_ASSERT(false and "Unsupported hidden") in device/low_latency.cu, which
 # aborts the process from C++ with no Python traceback -- under a test harness
 # that surfaces only as the worker dying on a signal.
 _NCCL_EP_LL_HIDDEN_SIZES = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
+_NCCL_EP_03_LL_HIDDEN_SIZES = tuple(sorted((*_NCCL_EP_LL_HIDDEN_SIZES, 3072, 3584)))
 
 
-def validate_ll_hidden_size(params: FleetParams, backend: str) -> None:
-    """Reject hidden sizes the LL kernels were never instantiated for.
+def validate_ll_hidden_size(
+    params: FleetParams, backend: str, *, nccl_ep_version=None
+) -> None:
+    """Reject LL hidden sizes outside the adapter's admitted set.
 
     LL only; HT is not hidden-size specialized. Raises rather than letting the
     device-side host assert abort the process.
     """
     if backend != "nccl_ep" or params.algorithm is not EpAlgorithm.LOW_LATENCY:
         return
+    from packaging.version import Version
+
+    sizes: tuple[int, ...] = _NCCL_EP_LL_HIDDEN_SIZES
+    if nccl_ep_version is not None and Version(str(nccl_ep_version)) >= Version(
+        "0.3.0"
+    ):
+        sizes = _NCCL_EP_03_LL_HIDDEN_SIZES
     hidden = params.token_hidden_size
-    if hidden in _NCCL_EP_LL_HIDDEN_SIZES:
+    if hidden in sizes:
         return
-    supported = ", ".join(str(h) for h in _NCCL_EP_LL_HIDDEN_SIZES)
+    supported = ", ".join(str(h) for h in sizes)
     raise MoEEpConfigError(
         f"nccl_ep low-latency does not support token_hidden_size={hidden}. "
-        f"Its kernels are instantiated only for: {supported} "
-        "(contrib/nccl_ep/device/macros.cuh SWITCH_HIDDEN); any other value "
-        "aborts the process in device/low_latency.cu. Round the layer's hidden "
+        f"FlashInfer admits the LL sizes: {supported}. "
+        "Other JIT specializations are not qualified by this adapter. "
+        "Round the layer's hidden "
         "size up to one of the supported values, or use "
         "EpAlgorithm.HIGH_THROUGHPUT, which is not hidden-size specialized."
     )

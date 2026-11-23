@@ -141,3 +141,20 @@ def test_create_graph_state_uses_supplied_output(layer, tensors):
     state = layer.create_graph_state(tensors, out=out)
     assert state.out is out
     state._check(layer, tensors)
+
+
+@pytest.mark.cpu_only
+def test_eager_graph_state_rejects_different_stream_before_transport(
+    layer, tensors, monkeypatch
+):
+    state = layer.create_graph_state(tensors)
+    layer._fleet.create_handle.return_value.reset_mock()
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=7)
+    )
+    with pytest.raises(ValueError, match="creating stream"):
+        layer._fleet_forward(tensors, state)
+    state._handle.update.assert_not_called()
+    # Capturing on another stream remains valid: transport follows capture.
+    monkeypatch.setattr(split_layer, "_is_capturing", lambda: True)
+    state._check_operation_stream()

@@ -10,9 +10,12 @@ tactic list.
 
 from __future__ import annotations
 
-from typing import List, Optional
+import dataclasses
+import functools
+from typing import List, Optional, Tuple
 
 from .generator import CLUSTERS, SWIZZLES, Knobs, enumerate_space  # noqa: F401  (re-exported)
+from .heuristic import on_rank_cache_clear, rank
 from .spec import FP8_BLOCKSCALE_FMTS, MX_MIXED_FMTS, chunk_unit
 
 GemmConfig = Knobs
@@ -126,11 +129,29 @@ def rank_topk(
     distinct records, at most ``k``; ``default_config(...) == rank_topk(...)[0]``. Every entry
     is a member of the class's enumerated space, so an autotuner may pick among them freely without changing a single bit.
     ``sm_count`` and ``family`` name the part (the operand device's); ``nominal`` ranks at the family's nominal table (the
-    generated Lean cases), never a device's queried numbers. Empty when nothing implements the shape."""
-    import dataclasses
+    generated Lean cases), never a device's queried numbers. Empty when nothing implements the shape. Memoised per
+    argument tuple (cleared with the rankings); each call returns its own list."""
+    return list(
+        _rank_topk_cached(
+            M, N, K, chunks, b_major, sm_count, k, family, in_fmt, nominal
+        )
+    )
 
+
+@functools.lru_cache(maxsize=8192)
+def _rank_topk_cached(
+    M: int,
+    N: int,
+    K: int,
+    chunks: int,
+    b_major: str,
+    sm_count: Optional[int],
+    k: int,
+    family: Optional[str],
+    in_fmt: str,
+    nominal: bool,
+) -> Tuple[GemmConfig, ...]:
     from .blocks.operands import can_implement
-    from .heuristic import rank
 
     ranked: List[GemmConfig] = [
         rec
@@ -170,9 +191,10 @@ def rank_topk(
         if rec not in seen:
             out.append(rec)
             seen.add(rec)
-    return out[:k]
+    return tuple(out[:k])
 
 
+@functools.lru_cache(maxsize=65536)
 def default_config(
     M: int,
     N: int,
@@ -185,10 +207,17 @@ def default_config(
     nominal: bool = False,
 ) -> GemmConfig:
     """The dispatcher's pick: `rank_topk(...)[0]`, the heuristic's best record of the class's space for the shape, the layout,
-    the format and the part. May depend on anything: every record is canonical."""
-    top = rank_topk(M, N, K, chunks, b_major, sm_count, 1, family, in_fmt, nominal)
+    the format and the part. May depend on anything: every record is canonical. Memoised per argument tuple: the pick of
+    a tuple is what the ranking computes for it, kept until the rankings are cleared (a device's registered numbers)."""
+    top = _rank_topk_cached(
+        M, N, K, chunks, b_major, sm_count, 1, family, in_fmt, nominal
+    )
     if not top:
         raise ValueError(
             f"no record of the class implements {(M, N, K)} ({in_fmt}) in layout {b_major} with {chunks} chunks"
         )
     return top[0]
+
+
+on_rank_cache_clear(_rank_topk_cached.cache_clear)
+on_rank_cache_clear(default_config.cache_clear)
