@@ -143,6 +143,78 @@ def test_ws2_specialized_guard_order():
     assert not ws2.outside_token_ranges(_NoState(), x)
 
 
+_ENVELOPE_CASES = [
+    ((2, 6144, torch.bfloat16, _MAX_TOKENS, True), None),
+    ((2, 6144, torch.bfloat16, ws2._MIN_TOKEN_NUM, True), None),
+    ((4, 6144, torch.bfloat16, 4096, True), "world_size=4"),
+    ((2, 7168, torch.bfloat16, 4096, True), "hidden_dim=7168"),
+    ((2, 6144, torch.float16, 4096, True), "dtype"),
+    ((2, 6144, torch.bfloat16, 4096, False), "symmetric device memory"),
+    ((2, 6144, torch.bfloat16, ws2._MIN_TOKEN_NUM - 1, True), "max_token_num"),
+    ((2, 6144, torch.bfloat16, None, True), "max_token_num"),
+]
+
+
+def test_ws2_specialized_static_envelope_reads_no_file(monkeypatch):
+    """The static envelope compares ``max_token_num`` with a module constant (the shipped
+    allowlist's smallest token count) and never reads the allowlist, so a rank that cannot read
+    it still reaches the vote with its peer; the allowlist is read in each rank's vote."""
+    assert ws2._load_allowlist().t_min == ws2._MIN_TOKEN_NUM
+
+    def unreadable():
+        raise PermissionError("injected: the allowlist cannot be read")
+
+    monkeypatch.setattr(ws2, "_load_allowlist", unreadable)
+    for args, needle in _ENVELOPE_CASES:
+        reason = ws2.creation_envelope_reason(*args)
+        if needle is None:
+            assert reason is None, (args, reason)
+        else:
+            assert reason is not None and needle in reason, (args, reason)
+
+
+def test_ws2_specialized_unreadable_allowlist_never_raises(monkeypatch):
+    """Any failure to read the allowlist gives an empty one (never dispatch, a veto in the
+    vote) instead of an exception on one rank."""
+    import importlib.resources
+
+    def unreadable(package):
+        raise PermissionError(f"injected: {package} cannot be read")
+
+    monkeypatch.setattr(ws2, "_allowlist_error", ws2._allowlist_error)
+    monkeypatch.setattr(importlib.resources, "files", unreadable)
+    allowlist = ws2._load_allowlist.__wrapped__()
+    assert allowlist.num_tokens == () and allowlist.weight_bias == ()
+    assert ws2._allowlist_error.startswith("PermissionError")
+
+
+@pytest.mark.parametrize(
+    "allowlist, max_token_num, expected",
+    [
+        (
+            ws2._Allowlist(weight_bias=(), num_tokens=()),
+            _MAX_TOKENS,
+            "allowlist_unavailable",
+        ),
+        (
+            ws2._Allowlist(weight_bias=(1.0,), num_tokens=((1024, 2048),)),
+            600,
+            "capacity",
+        ),
+    ],
+)
+def test_ws2_specialized_vote_reads_the_allowlist(
+    monkeypatch, allowlist, max_token_num, expected
+):
+    """Each rank's vote reads the allowlist: an unavailable one, or one whose smallest token
+    count exceeds ``max_token_num``, is a veto (on every rank alike, through the vote)."""
+    monkeypatch.setattr(ws2, "_load_allowlist", lambda: allowlist)
+    monkeypatch.setattr(ws2, "get_compute_capability", lambda device: (10, 3))
+    backend = SimpleNamespace(Get_size=lambda: 2, Get_rank=lambda: 0)
+    reason, *_ = ws2._local_probe(torch.device("cpu"), max_token_num, backend, 0)
+    assert reason == expected
+
+
 # ---------------------------------------------------------------------------
 # The dispatch path with a stand-in launcher (CPU tensors, state on "device" -1).
 # ---------------------------------------------------------------------------

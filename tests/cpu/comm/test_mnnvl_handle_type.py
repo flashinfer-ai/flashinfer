@@ -19,6 +19,7 @@ script, so collective decisions can be checked without launching ranks.
 """
 
 import logging
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -110,7 +111,7 @@ def _attempts(monkeypatch, results):
     """Script _create_and_import_handles: one (handles, errors) per attempt."""
     attempts = []
 
-    def attempt(comm, prop, size):
+    def attempt(comm, prop, size, local_error=None):
         attempts.append(prop)
         return results[len(attempts) - 1]
 
@@ -307,3 +308,137 @@ def test_granularity_fits_both_handle_types(monkeypatch, granularities, expected
     monkeypatch.setattr(mnnvl.cuda, "cuMemGetAllocationGranularity", granularity)
     monkeypatch.setattr(mnnvl.MnnvlMemory, "allocation_granularity", 0)
     assert mnnvl.MnnvlMemory.get_allocation_granularity(0) == expected
+
+
+# ---------------------------------------------------------------------------
+# A make_prop failure on one rank, with two ranks on threads.
+# ---------------------------------------------------------------------------
+
+
+class _ThreadGroup:
+    """An in-process allgather over threads. A rank that makes fewer or more
+    collective calls than its peer breaks the barrier instead of hanging."""
+
+    def __init__(self, size=2, timeout=10.0):
+        self.barrier = threading.Barrier(size, timeout=timeout)
+        self.slots = [None] * size
+        self.calls = [0] * size
+
+    def comm(self, rank):
+        group = self
+
+        class _Comm:
+            def Get_rank(self):
+                return rank
+
+            def Get_size(self):
+                return len(group.slots)
+
+            def allgather(self, value):
+                group.calls[rank] += 1
+                group.slots[rank] = value
+                group.barrier.wait()
+                values = list(group.slots)
+                group.barrier.wait()
+                return values
+
+        return _Comm()
+
+
+def _allocate_on_two_ranks(monkeypatch, fake_driver, single_host, failing):
+    """Run allocate_mnnvl_handles on two ranks; ``failing`` maps a rank to the
+    handle types for which its make_prop raises. Returns each rank's outcome
+    and the collective calls per rank."""
+    fake_driver()
+    closed = []
+    monkeypatch.setattr(mnnvl, "os", SimpleNamespace(close=closed.append))
+
+    def choose(comm, dev_id):
+        comm.allgather(None)
+        return FABRIC, single_host
+
+    monkeypatch.setattr(mnnvl, "choose_mnnvl_handle_type", choose)
+
+    def exchange_fds(comm, fd):
+        return comm.allgather(fd)
+
+    monkeypatch.setattr(mnnvl, "exchange_fds", exchange_fds)
+    group = _ThreadGroup()
+    outcomes = [None, None]
+
+    def rank_main(rank):
+        def make_prop(handle_type):
+            if handle_type in failing.get(rank, ()):
+                raise RuntimeError(f"injected granularity failure ({handle_type})")
+            return SimpleNamespace(requestedHandleTypes=handle_type), 64
+
+        try:
+            handles, handle_type = mnnvl.allocate_mnnvl_handles(
+                group.comm(rank), 0, make_prop
+            )
+            outcomes[rank] = ("ok", handle_type, len(handles))
+        except BaseException as exc:  # noqa: BLE001 - compared below
+            outcomes[rank] = ("raised", type(exc), str(exc))
+
+    threads = [threading.Thread(target=rank_main, args=(r,)) for r in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(30)
+    assert not any(th.is_alive() for th in threads), "a rank hung"
+    return outcomes, group.calls
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("failing_rank", [0, 1])
+def test_make_prop_failure_on_fabric_retries_posix_on_every_rank(
+    monkeypatch, fake_driver, failing_rank
+):
+    outcomes, calls = _allocate_on_two_ranks(
+        monkeypatch, fake_driver, single_host=True, failing={failing_rank: {FABRIC}}
+    )
+    assert outcomes == [("ok", POSIX, 2)] * 2
+    assert calls[0] == calls[1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "failing", [{1: {POSIX}}, {0: {FABRIC}, 1: {POSIX}}, {0: {FABRIC, POSIX}}]
+)
+def test_make_prop_failure_on_the_posix_retry_raises_on_every_rank(
+    monkeypatch, fake_driver, failing
+):
+    # A FABRIC failure (make_prop on one rank, or the allocation) starts the
+    # retry; a make_prop failure on the retry then raises on both ranks.
+    if not any(FABRIC in types for types in failing.values()):
+        monkeypatch.setattr(_FakeDriver, "cuMemCreate", _fail_fabric_create)
+    outcomes, calls = _allocate_on_two_ranks(
+        monkeypatch, fake_driver, single_host=True, failing=failing
+    )
+    for kind, error_type, message in outcomes:
+        assert kind == "raised" and error_type is RuntimeError, outcomes
+        assert "POSIX file descriptor handles failed" in message
+        assert "querying the allocation properties failed" in message
+    assert calls[0] == calls[1]
+
+
+def _fail_fabric_create(self, size, prop, flags):
+    if prop.requestedHandleTypes == FABRIC:
+        return self._error()
+    self.next_handle += 1
+    return self._ok(self.next_handle)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("failing_rank", [0, 1])
+def test_make_prop_failure_across_hosts_raises_on_every_rank(
+    monkeypatch, fake_driver, failing_rank
+):
+    outcomes, calls = _allocate_on_two_ranks(
+        monkeypatch, fake_driver, single_host=False, failing={failing_rank: {FABRIC}}
+    )
+    for kind, error_type, message in outcomes:
+        assert kind == "raised" and error_type is RuntimeError, outcomes
+        assert f"rank {failing_rank}: querying the allocation properties" in message
+        assert "IMEX" in message
+    assert calls[0] == calls[1]

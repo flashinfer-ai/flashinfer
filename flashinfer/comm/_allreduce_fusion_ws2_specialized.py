@@ -26,18 +26,19 @@ backend whenever that returns ``None``.
 
 State (workspace creation). :func:`creation_envelope_reason` is the static part of the envelope:
 world size 2, hidden size 6144, bf16, symmetric device memory (no Confidential Computing) and a
-``max_token_num`` that covers the smallest allowlisted token count. It reads only arguments every
-rank passes identically, so no collective runs for any other configuration. For the envelope,
-:func:`create_state` adds one peer-mapped region (``SymmDeviceMemory``, unicast, no signal pads), a
-rank-local device call counter and a launch grid. Before allocating anything the ranks vote with
-one ``allgather``: every rank must be on compute capability 10.3, on one node, have the JIT module
-built, a non-empty allowlist, enough free memory, pass the allocation pre-flight (the per-device
-driver queries the handle exchange makes between its collectives) and have
-``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` unset. One rank's veto leaves the state absent on every
-rank, and the reason is returned on every rank alike. After the handle exchange (whose own
-collectives gather every rank's allocation error) every rank votes once more, on its local setup
-(mapping, pointer table) and the idle-state initialisation, before any rank returns: a local
-failure on one rank releases the region on every rank and is the same rejection everywhere.
+``max_token_num`` of at least the smallest token count the kernel serves (:data:`_MIN_TOKEN_NUM`).
+It reads only arguments every rank passes identically and module constants (no file), so no
+collective runs for any other configuration. For the envelope, :func:`create_state` adds one
+peer-mapped region (``SymmDeviceMemory``, unicast, no signal pads), a rank-local device call counter
+and a launch grid. Before allocating anything the ranks vote with one ``allgather``: every rank must
+be on compute capability 10.3, on one node, have the JIT module built, a non-empty allowlist (read
+here, on every rank) whose smallest token count ``max_token_num`` covers, enough free memory, pass
+the allocation pre-flight (the per-device driver queries the handle exchange makes between its
+collectives) and have ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` unset. One rank's veto leaves the
+state absent on every rank, and the reason is returned on every rank alike. After the handle
+exchange (whose own collectives gather every rank's allocation error) every rank votes once more, on
+its local setup (mapping, pointer table) and the idle-state initialisation, before any rank returns:
+a local failure on one rank releases the region on every rank and is the same rejection everywhere.
 Creation never raises.
 
 Dispatch (call time). :func:`allreduce_fusion` first asks :func:`outside_token_ranges`, a few
@@ -128,6 +129,9 @@ _DTYPE = torch.bfloat16
 _DTYPE_NAME = "bfloat16"
 _PATTERN = 1  # AllReduceFusionPattern.kARResidualRMSNorm
 _COMPUTE_CAPABILITY = (10, 3)
+# The smallest token count the kernel serves; the allowlist's smallest range starts here. The
+# static envelope compares ``max_token_num`` with it, so that it reads no file.
+_MIN_TOKEN_NUM = 513
 # Free device memory required beyond the region before allocating it.
 _FREE_MEMORY_MARGIN = 256 << 20
 
@@ -228,7 +232,8 @@ def _debug_once(key: str, line: str) -> None:
 @functools.cache
 def _load_allowlist() -> _Allowlist:
     """The dispatch surface; an empty token range list (never dispatch) when the file is missing
-    or inconsistent with this module (the error is kept in ``_allowlist_error``)."""
+    or inconsistent with this module, or cannot be read (the error is kept in
+    ``_allowlist_error``). Never raises."""
     global _allowlist_error
     try:
         payload = json.loads(
@@ -249,14 +254,7 @@ def _load_allowlist() -> _Allowlist:
         ranges = tuple((int(lo), int(hi)) for lo, hi in payload["num_tokens"])
         if not ranges or any(lo < 1 or hi < lo for lo, hi in ranges):
             raise ValueError(f"invalid num_tokens ranges: {ranges}")
-    except (
-        FileNotFoundError,
-        ModuleNotFoundError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-        ValueError,
-    ) as exc:
+    except Exception as exc:  # noqa: BLE001 - an unreadable allowlist never dispatches
         _allowlist_error = f"{type(exc).__name__}: {exc}"[:300]
         return _Allowlist(weight_bias=(), num_tokens=())
     _allowlist_error = None
@@ -397,8 +395,9 @@ def creation_envelope_reason(
     use_symm_dev_mem: bool,
 ) -> Optional[str]:
     """Why no workspace of this configuration can hold the state, or ``None``: the static part
-    of the creation-time envelope. Reads only arguments every rank passes identically and runs no
-    collective, so a workspace outside it never reaches :func:`create_state`."""
+    of the creation-time envelope. Reads only arguments every rank passes identically and module
+    constants (no file; the allowlist is read in each rank's vote) and runs no collective, so a
+    workspace outside it never reaches :func:`create_state`."""
     if tp_size != _WORLD_SIZE:
         return f"world_size={tp_size} (the kernel serves world size {_WORLD_SIZE})"
     if hidden_dim != _HIDDEN:
@@ -408,12 +407,9 @@ def creation_envelope_reason(
     if not use_symm_dev_mem:
         # Confidential Computing (a host-wide mode) uses torch symmetric memory instead.
         return "no symmetric device memory (Confidential Computing)"
-    allowlist = _load_allowlist()
-    if not allowlist.num_tokens:
-        return f"allowlist unavailable ({_allowlist_error})"
-    if max_token_num is None or int(max_token_num) < allowlist.t_min:
+    if max_token_num is None or int(max_token_num) < _MIN_TOKEN_NUM:
         return (
-            f"max_token_num={max_token_num} is below {allowlist.t_min}, the smallest token "
+            f"max_token_num={max_token_num} is below {_MIN_TOKEN_NUM}, the smallest token "
             "count the kernel serves"
         )
     return None
