@@ -5007,11 +5007,12 @@ def test_group_suggestion_caps_route_unions_at_causal_context() -> None:
 def test_group_suggestion_follows_nvfp4_layout_and_wide_head_groups() -> None:
     """Interleaved NVFP4 rows have their own latency constants.
 
-    GB300, 128/8 Q/KV heads, 1024 queries over a 64K prefix: separate scales
-    run G4 in 599 us (G8: 631 us), interleaved rows G8 in 619 us (G4: 645
-    us). With 32 Q heads per KV head, TileQ128 already forms at G4: 4096
-    queries over a 32K prefix take G4 (440/424 us separate/rows) over G2
-    (473/504 us), which a slower-growing union estimate preferred.
+    GB300 (balanced scheduler), 128/8 Q/KV heads, 1024 queries over a 64K
+    prefix: separate scales run G4 in 580 us (G8: 622 us), interleaved rows
+    G8 in 608 us (G4: 637 us). With 32 Q heads per KV head, TileQ128 already
+    forms at G4: 4096 queries over a 32K prefix take G4 (424/406 us
+    separate/rows) over G2 (456/499 us), which a slower-growing union
+    estimate preferred.
     """
 
     suggest = suggest_prims_ts_q_token_kv_block_sparse_group_size

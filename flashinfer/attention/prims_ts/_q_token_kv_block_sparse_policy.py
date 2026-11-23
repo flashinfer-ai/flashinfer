@@ -280,8 +280,11 @@ class _LatencyModel(NamedTuple):
 # corpora (1-64 Q heads per KV head, 1-8 KV heads, 1-64 requests, 0-64K
 # prefix, 1-4096 queries; 152 SMs), fitted on one corpus and checked on the
 # other: geomean 1.002x (separate scales) and 1.004x (interleaved rows),
-# worst 1.13x of the best G. SM waves are fractional (items / SMs, at least
-# one), which fitted better than whole waves. NVFP4 K/V is transformed in
+# worst 1.13x of the best G. The interleaved-rows constants are refit with
+# every launch spanning more than one SM wave measured under the balanced
+# (longest-first) scheduler it takes by default, which favors TileQ128 groups
+# there. SM waves are fractional (items / SMs, at least one), which fitted
+# better than whole waves. NVFP4 K/V is transformed in
 # the kernel (no per-call K/V conversion). With the longest request's KV
 # length (``seq_len_kv``), each route's expected union is capped at the
 # context its last query sees (``_mean_route_union_tokens``).
@@ -293,10 +296,10 @@ _LATENCY_MODELS = {
         reduce_us=1.861,
     ),
     True: _LatencyModel(
-        tile_us={64: 1.32, 128: 2.112},
-        item_us={64: 9.15, 128: 8.736},
-        metadata_us={4: 4.268, 8: 8.2, 16: 9.689, 32: 13.401},
-        reduce_us=1.088,
+        tile_us={64: 1.446, 128: 2.232},
+        item_us={64: 9.827, 128: 12.048},
+        metadata_us={4: 5.898, 8: 9.522, 16: 11.238, 32: 14.935},
+        reduce_us=0.718,
     ),
 }
 # Candidate groups: powers of two up to G32 (two to four membership planes
