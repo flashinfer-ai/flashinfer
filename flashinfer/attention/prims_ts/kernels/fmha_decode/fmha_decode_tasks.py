@@ -76,6 +76,8 @@ from .fmha_decode_resources.helpers_common import (
     _warp_broadcast_i32,
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import (
+    cta_caches_visible_kv_interval,
+    cta_visible_kv_interval,
     _runtime_last_valid_page_idx,
     _runtime_configured_local_kv_tiles,
     _runtime_total_kv_tiles,
@@ -713,6 +715,10 @@ class DecodeGenTask(Task):
         # bound must already count scaled iterations.
         self.domain_scale = kwargs.pop("domain_scale", 1)
         self.q_bound_resources = kwargs.pop("q_bound_resources", ())
+        # Only the softmax tasks read the keys every row of a work tile sees.
+        self.consumes_visible_kv_interval = kwargs.pop(
+            "consumes_visible_kv_interval", False
+        )
         super().__init__(**kwargs)
         self._tmem_base_offset = cutlass.Int32(0)
         self._warp_grp_thread_idx = cutlass.Int32(0)
@@ -724,6 +730,11 @@ class DecodeGenTask(Task):
         self._kv_raw_tile_base = cutlass.Int32(0)
         self._kv_valid_tile_end = cutlass.Int32(0)
         self._kv_window_start = cutlass.Int32(0)
+        if self.caches_visible_kv_interval:
+            # Appended to the task cache only for configs that cache it. An
+            # empty interval masks every tile, which is always exact.
+            self._kv_visible_begin = cutlass.Int32(0)
+            self._kv_visible_end = cutlass.Int32(0)
         # Keep the DSL loop-carried task structure stable. Persistent loops
         # assign this liveness marker on every path, so it must exist before
         # the first dynamic ``while`` is lowered by the stock compiler.
@@ -773,6 +784,12 @@ class DecodeGenTask(Task):
                 else self.requested_splits
             )
             values = (*values, count)
+        if cutlass.const_expr(self.caches_visible_kv_interval):
+            # Slot task_cache_visible_kv_interval_index(cfg), then the
+            # sliding window's begin.
+            values = (*values, self._kv_visible_end)
+            if cutlass.const_expr(self.cfg.use_sliding_window_causal):
+                values = (*values, self._kv_visible_begin)
         return values
 
     @cute.jit
@@ -933,6 +950,49 @@ class DecodeGenTask(Task):
             self.work_queue.producer_tail()
         self.dummy = cutlass.Boolean(True)
 
+    @property
+    def caches_visible_kv_interval(self) -> bool:
+        """Return whether this task computes and carries the visible K interval.
+
+        Only softmax tasks consume it, and only configs whose bounds need a
+        multi-row intersection cache it; every other task keeps the plain
+        task-cache layout and get_domain work.
+        """
+        return (
+            self.consumes_visible_kv_interval
+            and self.cfg is not None
+            and cta_caches_visible_kv_interval(self.cfg)
+        )
+
+    def _cache_visible_kv_interval(
+        self, tile_coord: cute.Coord, seq_len_kv: cutlass.Int32
+    ) -> None:
+        """Cache the keys every row of the work tile sees, for softmax.
+
+        Softmax compares each K tile against this interval instead of
+        rebuilding the CTA's causal/window/tail bounds per tile.
+        """
+        cfg = self.cfg
+        if cfg.uses_compact_split_grid:
+            q_group_idx = cutlass.Int32(cute.arch.block_idx()[2]) % cfg.num_q_ctas
+        elif cfg.has_single_q_cta:
+            q_group_idx = cutlass.Int32(0)
+        elif cfg.use_split_kv:
+            q_group_idx = cutlass.Int32(tile_coord[0]) // cutlass.Int32(cfg.splits_kv)
+        else:
+            q_group_idx = cutlass.Int32(tile_coord[0])
+        seq_len_q = (
+            cutlass.Int32(cfg.max_seq_len_q)
+            if self.seq_len_q is None
+            else cutlass.Int32(self.seq_len_q)
+        )
+        self._kv_visible_begin, self._kv_visible_end = cta_visible_kv_interval(
+            cfg,
+            seq_len_kv,
+            seq_len_q,
+            _q_group_token_base(cfg, q_group_idx),
+        )
+
     def get_domain(self, tile_coord: cute.Coord) -> cutlass.Int32 | int:
         """Return this task's loop domain for one static or persistent tile.
 
@@ -1000,6 +1060,10 @@ class DecodeGenTask(Task):
             self._kv_raw_tile_base = cutlass.Int32(0)
             self._kv_valid_tile_end = route_count
             self._kv_window_start = cutlass.Int32(0)
+            if self.caches_visible_kv_interval:
+                # Sparse routes carry their own masks; no tile skips them.
+                self._kv_visible_begin = cutlass.Int32(0)
+                self._kv_visible_end = cutlass.Int32(0)
 
             loop_domain = _loop_domain_after_head(
                 route_count,
@@ -1026,6 +1090,8 @@ class DecodeGenTask(Task):
                 ) + cutlass.Int64(tile_coord[1])
             seq_len_kv = cutlass.Int32(self.seqlens_kv[metadata_row])
         self._seq_len_kv = seq_len_kv
+        if self.caches_visible_kv_interval:
+            self._cache_visible_kv_interval(tile_coord, seq_len_kv)
         if cutlass.const_expr(self.cfg.use_paged_kv):
             # Native paged KV uses a fixed-stride dense page table. The row's
             # live extent therefore comes from seq_lens; padded entries beyond
@@ -3910,6 +3976,7 @@ def create_softmax0_task(
         schedule=schedule_result,
         num_registers=cfg.softmax_task_num_registers,
         name="Softmax0Task",
+        consumes_visible_kv_interval=True,
         **kw,
     )
 
@@ -4007,6 +4074,7 @@ def create_softmax1_task(
         schedule=schedule_result,
         num_registers=cfg.softmax_task_num_registers,
         name="Softmax1Task",
+        consumes_visible_kv_interval=True,
         **kw,
     )
 
