@@ -165,8 +165,7 @@ def _arch_mma_m16n8k32_mxfp8(
         "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X"
         f".m16n8k32.row.col.f32.{ptx_types[a_dtype]}.{ptx_types[b_dtype]}.f32.ue8m0"
     )
-    # Each scalar scale occupies the low byte of its 32-bit register.
-    scalar_byte_id = cutlass.Int16(0).ir_value(loc=loc, ip=ip)
+    # Encode byte selector 0 in PTX: each scalar occupies the low byte.
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
         [
@@ -177,10 +176,8 @@ def _arch_mma_m16n8k32_mxfp8(
             Uint32(b_i32[0]).ir_value(loc=loc, ip=ip),
             Uint32(b_i32[1]).ir_value(loc=loc, ip=ip),
             Uint32(sfa_u8).ir_value(loc=loc, ip=ip),
-            scalar_byte_id,
             cutlass.Int16(thread_id_a).ir_value(loc=loc, ip=ip),
             Uint32(sfb_u8).ir_value(loc=loc, ip=ip),
-            scalar_byte_id,
             cutlass.Int16(thread_id_b).ir_value(loc=loc, ip=ip),
             Float32(acc[0]).ir_value(loc=loc, ip=ip),
             Float32(acc[1]).ir_value(loc=loc, ip=ip),
@@ -193,11 +190,11 @@ def _arch_mma_m16n8k32_mxfp8(
         {$8, $9},
         {$0, $1, $2, $3},
         {$10},
-        {$11, $12},
-        {$13},
-        {$14, $15};
+        {0, $11},
+        {$12},
+        {0, $13};
         """,
-        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,r,h,0,1,2,3",
         has_side_effects=False,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
