@@ -1595,15 +1595,6 @@ def single_prefill_with_kv_cache(
                 "FP8 token-head scale is only supported with backend='fa2', "
                 f"got backend={backend!r}"
             )
-    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
-    if logits_soft_cap is None:
-        logits_soft_cap = 0.0
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(q.size(-1))
-    if rope_scale is None:
-        rope_scale = 1.0
-    if rope_theta is None:
-        rope_theta = 1e4
     if custom_mask is not None and packed_custom_mask is None:
         kv_len = k.shape[0] if kv_layout == "NHD" else k.shape[1]
         expected_mask_shape = (q.shape[0], kv_len)
@@ -1617,6 +1608,15 @@ def single_prefill_with_kv_cache(
             custom_mask.contiguous().view(-1), bitorder="little"
         )
 
+    tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(q.size(-1))
+    if rope_scale is None:
+        rope_scale = 1.0
+    if rope_theta is None:
+        rope_theta = 1e4
     if packed_custom_mask is not None:
         mask_mode = MaskMode.CUSTOM.value
     else:
