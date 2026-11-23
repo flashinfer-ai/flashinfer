@@ -859,21 +859,33 @@ def test_scratch_plan_binding_rejects_compact_plans_without_prepared_launchers(
 
 
 @pytest.mark.parametrize(
-    "n,capability,requested,expected",
+    "n,capability,setting,requested,expected",
     [
-        (256, (12, 1), False, True),
-        (256, (12, 0), False, False),
-        (256, (12, 0), True, True),
-        (192, (12, 0), False, True),
+        # Full N128 tiles keep N128 unless the setting is exactly "1" on SM121.
+        (256, (12, 1), None, False, False),
+        (256, (12, 1), "1", False, True),
+        (256, (12, 1), "0", False, False),
+        (256, (12, 0), "1", False, False),
+        # A plan that already requests N64 keeps it unless inline is disabled.
+        (256, (12, 0), None, True, True),
+        (256, (12, 0), "0", True, False),
+        # N64 tails always pack, whatever the capability or default.
+        (192, (12, 0), None, False, True),
+        (192, (12, 1), None, False, True),
+        (192, (12, 1), "1", False, True),
+        (192, (12, 1), "0", False, False),
     ],
 )
-def test_full_n128_n64_packing_defaults_to_sm121(
-    n, capability, requested, expected, monkeypatch
+def test_full_n128_n64_packing_is_opt_in_on_sm121(
+    n, capability, setting, requested, expected, monkeypatch
 ):
-    """N64 tails always pack; full N128 tiles pack by default only on SM121."""
+    """N64 tails always pack; full N128 tiles pack only with B12X_W4A8_CSF_INLINE=1."""
     from b12x.moe.fused_moe import planning
 
-    monkeypatch.delenv("B12X_W4A8_CSF_INLINE", raising=False)
+    if setting is None:
+        monkeypatch.delenv("B12X_W4A8_CSF_INLINE", raising=False)
+    else:
+        monkeypatch.setenv("B12X_W4A8_CSF_INLINE", setting)
     monkeypatch.setattr(
         planning.torch.cuda, "get_device_capability", lambda device=None: capability
     )

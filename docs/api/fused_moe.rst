@@ -845,19 +845,24 @@ accepts ``Mxfp4CsfWeights`` with compressed E8M0 scale planes. For W4A8,
 Dynamic plans above the inline token limit expand scales into reusable scratch
 before each invocation; the resident compressed weights remain unchanged.
 
-Weights whose intermediate size is 64 modulo 128 always use N64 packing. With
-``B12X_W4A8_CSF_INLINE`` enabled (the default), SiLU BF16 weights with a
-256-aligned hidden size and a 128-aligned intermediate size also use N64 packing
-on SM121. On other GPUs, and when ``B12X_W4A8_CSF_INLINE=0``, these full
-N128-tile weights keep the native N128 layout and expand scales before each
-invocation.
+Weights whose intermediate size is 64 modulo 128 always use N64 packing. SiLU
+BF16 weights with a 256-aligned hidden size and a 128-aligned intermediate size
+keep the native N128 layout by default. Set ``B12X_W4A8_CSF_INLINE=1`` before
+preparation to use N64 packing for them on SM121. On other GPUs, and when
+``B12X_W4A8_CSF_INLINE=0``, these full N128-tile weights keep the native N128
+layout and expand scales before each invocation.
+
+N64 packing enables inline compressed-scale decoding. This uses less memory and
+is faster at larger decode batches. Decode batches of up to four tokens then use
+MXFP8 activations instead of the BF16-activation tiny-decode kernel, which is
+less accurate.
 
 N64-packed weights need the prepared launchers from
 ``fused_moe.plan_execution()`` for micro plans (up to four tokens). Sparse
 bindings, direct bindings and ``fused_moe.plan()`` scratch plans do not carry
-these launchers and raise ``ValueError`` at decode sizes. To bind full
-N128-tile weights in these ways on SM121, set ``B12X_W4A8_CSF_INLINE=0`` before
-preparation.
+these launchers and raise ``ValueError`` at decode sizes. Full N128-tile weights
+keep the N128 layout unless ``B12X_W4A8_CSF_INLINE=1`` is set before
+preparation, so they bind in these ways by default.
 
 The default limit is 1,536 planned tokens. On SM121, full N128-tile weights
 repacked for N64 execution can use inline decoding through 2,048 tokens when the

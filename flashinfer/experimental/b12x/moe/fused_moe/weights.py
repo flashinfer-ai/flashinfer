@@ -245,11 +245,12 @@ class Mxfp4CsfWeights:
     Scale planes may be canonical CPU tensors or a prepared device batch.
     Buffers may be shared only by serialized layer executions on one CUDA
     stream. Concurrent model execution lanes require separate buffers.
-    Eligible SiLU W4A8 preparation selects N64 packing. On SM121 this includes
-    BF16 shapes with a 256-aligned hidden size and a 128-aligned intermediate
-    size. It uses
-    the buffers once to build inline storage. Plans above the inline capacity
-    expand into those buffers before each call; smaller plans read inline storage directly.
+    Eligible SiLU W4A8 preparation selects N64 packing. Shapes with an N64
+    tail always use it. Full N128-tile shapes keep the N128 layout unless
+    B12X_W4A8_CSF_INLINE=1 is set before preparation on SM121 (BF16, 256-aligned
+    hidden size, 128-aligned intermediate size). N64 packing builds inline
+    storage from the buffers once. Plans above the inline capacity expand into
+    those buffers before each call; smaller plans read inline storage directly.
     B12X_W4A8_CSF_INLINE=0 keeps routed-expert expansion at all capacities.
     Scale bytes are lossless. Kernel selection and compression ratio can differ
     from ordinary PackedWeights, including the BF16 FC1 staging boundary.

@@ -833,12 +833,16 @@ def _w4a8_csf_inline(plan: WeightPlan, device: torch.device) -> bool:
 
     CSF preparation selects N64 packing independently of the output tail.
     Micro and materialized W4A8 kernels can read this storage directly.
-    Full-N128 shapes select N64 packing by default only on SM121, where it
-    was measured. A plan that already requests N64 packing keeps it.
-    B12X_W4A8_CSF_INLINE=0 keeps per-call expansion into scratch.
+    Shapes with an N64 tail always use it unless B12X_W4A8_CSF_INLINE=0.
+    Full-N128 shapes keep the native N128 layout by default. Only
+    B12X_W4A8_CSF_INLINE=1 selects N64 packing for them, and only on SM121,
+    where it was measured. N128 weights keep the BF16-activation tiny-decode
+    kernel for up to four tokens; N64 weights run those batches with MXFP8
+    activations instead. A plan that already requests N64 packing keeps it.
     """
+    setting = os.environ.get("B12X_W4A8_CSF_INLINE")
     return (
-        os.environ.get("B12X_W4A8_CSF_INLINE", "1") != "0"
+        setting != "0"
         and plan.activation.nonlinearity == "silu"
         and (
             plan.geometry.intermediate_size % 128 == 64
@@ -849,7 +853,8 @@ def _w4a8_csf_inline(plan: WeightPlan, device: torch.device) -> bool:
                 and (
                     plan._impl.w4a8_n64_repacked
                     or (
-                        torch.device(device).type == "cuda"
+                        setting == "1"
+                        and torch.device(device).type == "cuda"
                         and torch.cuda.get_device_capability(device) == (12, 1)
                     )
                 )
