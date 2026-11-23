@@ -285,6 +285,12 @@ class MoEWeightsFp4:
                 else f"intermediate={intermediate!r}",
                 "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
             )
+        if intermediate_scales is not None and intermediate != "static":
+            raise unsupported(
+                pair.cls,
+                f"intermediate_scales with intermediate={intermediate!r}",
+                "intermediate scales with intermediate='static' alone (the per-token class derives its scales from the rows)",
+            )
         act = act if act is not None else ("silu" if gated else "relu2")
         if act not in (S.ACTS if gated else S.UNGATED_ACTS):
             raise ValueError(f"no {'gated' if gated else 'ungated'} chain {act!r}")

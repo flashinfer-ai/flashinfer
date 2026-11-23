@@ -299,6 +299,56 @@ def test_unserved_quant_pair_is_refused_and_names_the_served_pairs():
 
 
 @each_pair
+def test_prepare_weights_rejects_dimensions_that_disagree_with_the_weights(pair):
+    """A supplied ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must be the weights' own, for the gated
+    geometry (``I`` = half of w1's rows) and the ungated one (``I`` = w1's rows), and ``intermediate_scales`` need
+    ``intermediate="static"`` (the per-token class would silently drop them): the mode's error before any view is built,
+    naming the dimension; the consistent call and the call without dimensions give the view (on a device)."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    quant = _QUANT[pair]
+    E, I, H = 4, 32, 64
+    w1 = torch.randn(E, 2 * I, H).to(torch.bfloat16)
+    w2 = torch.randn(E, H, I).to(torch.bfloat16)
+    w1u = torch.randn(E, I, H).to(torch.bfloat16)
+    for w1_, act, kw in (
+        (w1, _SWIGLU, dict(num_local_experts=E + 1)),
+        (w1, _SWIGLU, dict(hidden_size=H // 2)),
+        (w1, _SWIGLU, dict(intermediate_size=2 * I)),
+        (w1u, ReLU2(), dict(intermediate_size=I // 2)),
+    ):
+        with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+            BatchInvariantFp4Config.prepare_weights(
+                w1_, w2, quant=quant, activation=act, **kw
+            )
+        assert next(iter(kw)) in str(excinfo.value) and pair.cls in str(excinfo.value)
+    with pytest.raises(TypeError):
+        BatchInvariantFp4Config.prepare_weights(w1[0], w2, quant=quant)
+    with pytest.raises(BatchInvariantUnsupportedError, match="intermediate_scales"):
+        BatchInvariantFp4Config.prepare_weights(
+            w1, w2, quant=quant, intermediate_scales=torch.ones(E)
+        )
+    if pair.scaled:
+        with pytest.raises(BatchInvariantUnsupportedError, match="intermediate_scales"):
+            MoEWeightsFp4.prepare(pair, w1, w2, intermediate_scales=torch.ones(E))
+    if not _supported:
+        return
+    w1, w2, w1u = w1.cuda(), w2.cuda(), w1u.cuda()
+    view = BatchInvariantFp4Config.prepare_weights(
+        w1, w2, quant=quant, num_local_experts=E, hidden_size=H, intermediate_size=I
+    )
+    assert view["gemm1_weights"].shape == (E, 2 * I, H // 2) and view["gated"]
+    assert torch.equal(
+        BatchInvariantFp4Config.prepare_weights(w1, w2, quant=quant)["gemm2_weights"],
+        view["gemm2_weights"],
+    )
+    view_u = BatchInvariantFp4Config.prepare_weights(
+        w1u, w2, quant=quant, intermediate_size=I, activation=ReLU2()
+    )
+    assert not view_u["gated"] and view_u["gemm1_weights"].shape == (E, I, H // 2)
+
+
+@each_pair
 def test_fingerprint_dimensions_and_classes(pair):
     """``fingerprint("fused_moe_<pair>", ...)`` takes the geometry, the routing method, the activation and the architecture
     (the instruction class); the classes differ from the bf16 ones and the other pair's, between activations, between the
