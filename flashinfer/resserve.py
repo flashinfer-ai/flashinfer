@@ -365,6 +365,11 @@ def paged_decode_residue(
         raise ValueError(
             "attention and reconstruction scales must be positive finite scalars"
         )
+    score_scale = torch.tensor(
+        sm_scale * key_scale, dtype=torch.float32, device="cpu"
+    ).item()
+    if not math.isfinite(score_scale) or score_scale <= 0:
+        raise ValueError("sm_scale * key_scale must be a positive finite FP32 value")
     if out is not None:
         _check_tensor(out, "out", device, (torch.bfloat16,))
         if out.shape != q_shape:

@@ -224,6 +224,15 @@ def test_reject_non_dense_inner_pages(index):
         paged_decode_residue(*args)
 
 
+@pytest.mark.parametrize("scale", [1e-30, 1e30, 1e-200])
+def test_reject_invalid_fp32_score_scale(scale):
+    args = inputs(4, 128, length=1)
+    with pytest.raises(
+        ValueError, match=r"sm_scale \* key_scale must be a positive finite FP32 value"
+    ):
+        paged_decode_residue(*args, sm_scale=scale, key_scale=scale)
+
+
 @pytest.mark.parametrize("d", [128, 256])
 @pytest.mark.parametrize(
     "length,splits",
