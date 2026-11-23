@@ -24,7 +24,7 @@
 #endif // moe-select
 #define MOE_X_b4239c2d9f ((int)((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) * 4))
 #define MOE_X_b5c608ab08 ((int)(MOE_HIDDEN_LL / 64))
-#define MOE_X_b734446fec ((int)(MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)))
+#define MOE_X_b734446fec ((int)(MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)))
 #define MOE_X_b9cacffdda ((int)(2 + MOE_TOPK_LL))
 #if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
 #else // moe-select
@@ -32,13 +32,13 @@
 #endif // moe-select
 #define MOE_X_beaa1b2350 ((int)((((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) * 4) / 4) * 4))
 #define MOE_X_c005674f28 ((int)(8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))))
-#define MOE_X_c16e11959c ((int)((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) + 4))
+#define MOE_X_c16e11959c ((int)((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) + 4))
 #if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
 #define MOE_X_c2714a6802 ((int)((8192) < ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024)) ? (8192) : ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024))))
 #else // moe-select
 #endif // moe-select
 #define MOE_X_c57857b977 ((int)((((MOE_HIDDEN_LL / 64) * 2) + ((MOE_HIDDEN_LL / 64) * 96)) / 4))
-#define MOE_X_caa68debd6 ((int)(((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1))
+#define MOE_X_caa68debd6 ((int)(((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1))
 #if MOE_SW_TB_SCR_GLOBAL == 0 // moe-select
 #define MOE_X_cea075b979 ((int)((1 * (((2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) * (9 * MOE_RANKS_LL)) + (9 * MOE_RANKS_LL))) * 4))
 #else // moe-select
@@ -87,25 +87,25 @@
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 1 && (MOE_SW_POOL_INDEX_64 == 1 && MOE_SHARED_EXPERT == 1))) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 1 && (MOE_SW_POOL_INDEX_64 == 1 && MOE_SHARED_EXPERT == 1))))) // moe-select
 #define MOE_X_e0eab20c9f ((int)(((MOE_RANKS_LL + 8) - 1) / 8))
 #define MOE_X_ef53b4eeea ((long long)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #define MOE_X_efe70cec4a ((int)((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)))
 #define MOE_X_f5a80a1c0c ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)))
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_POOL_INDEX_64 == 1) || (MOE_INSTANCE == 2 && MOE_SW_POOL_INDEX_64 == 1))) // moe-select
 #define MOE_X_e0eab20c9f ((int)(((MOE_RANKS_LL + 8) - 1) / 8))
 #define MOE_X_ef53b4eeea ((long long)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #define MOE_X_efe70cec4a ((int)((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)))
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)))) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)))))) // moe-select
 #define MOE_X_e0eab20c9f ((int)(((MOE_RANKS_LL + 8) - 1) / 8))
 #define MOE_X_ec0a98b81f ((int)(((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)))
 #define MOE_X_ef53b4eeea ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #define MOE_X_efe70cec4a ((int)((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)))
 #define MOE_X_f5a80a1c0c ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)))
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
 #define MOE_X_e0eab20c9f ((int)(((MOE_RANKS_LL + 8) - 1) / 8))
 #define MOE_X_ef53b4eeea ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #define MOE_X_efe70cec4a ((int)((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)))
 #define MOE_X_f5a80a1c0c ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)))
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
@@ -113,44 +113,44 @@
 #define MOE_X_e5a000fe0b ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 64) * 64)))
 #define MOE_X_e5cdd16655 ((int)((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) - 1))
 #define MOE_X_eada4540ba ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && MOE_SW_ROLE_PEER_FOLD == 1) || (MOE_INSTANCE == 3 && MOE_SW_WIDE_RANKS == 1))) // moe-select
 #define MOE_X_dffd792f1f ((int)(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) + 4) * (((2 * MOE_INTERMEDIATE_LL) / 128) + (MOE_HIDDEN_LL / 128))))
 #define MOE_X_e0eab20c9f ((int)(((MOE_RANKS_LL + 8) - 1) / 8))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && MOE_SHARED_EXPERT == 1) || (MOE_INSTANCE == 3 && MOE_SHARED_EXPERT == 1))) // moe-select
 #define MOE_X_e5a000fe0b ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 64) * 64)))
 #define MOE_X_e5cdd16655 ((int)((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) - 1))
 #define MOE_X_eada4540ba ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #elif (MOE_SW_POLICY_EP == 16 && (MOE_INSTANCE == 1 || MOE_INSTANCE == 3)) // moe-select
 #define MOE_X_dffd792f1f ((int)(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) + 4) * (((2 * MOE_INTERMEDIATE_LL) / 128) + (MOE_HIDDEN_LL / 128))))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #elif ((MOE_INSTANCE == 1 && MOE_SHARED_EXPERT == 1) || (MOE_INSTANCE == 3 && MOE_SHARED_EXPERT == 1)) // moe-select
 #define MOE_X_e5a000fe0b ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 64) * 64)))
 #define MOE_X_e5cdd16655 ((int)((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) - 1))
 #define MOE_X_eada4540ba ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)))
 #define MOE_X_ec0a98b81f ((int)(((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #define MOE_X_efe70cec4a ((int)((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)))
 #elif (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
 #define MOE_X_dffd792f1f ((int)(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) + 4) * (((2 * MOE_INTERMEDIATE_LL) / 128) + (MOE_HIDDEN_LL / 128))))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #define MOE_X_efe70cec4a ((int)((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)))
 #elif MOE_SW_ROLE_PEER_FOLD == 1 // moe-select
 #define MOE_X_e0eab20c9f ((int)(((MOE_RANKS_LL + 8) - 1) / 8))
 #define MOE_X_ef53b4eeea ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #define MOE_X_efe70cec4a ((int)((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)))
 #elif MOE_SHARED_EXPERT == 1 // moe-select
 #define MOE_X_ec0a98b81f ((int)(((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)))
 #define MOE_X_ef53b4eeea ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #define MOE_X_efe70cec4a ((int)((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)))
 #define MOE_X_f5a80a1c0c ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)))
 #else // moe-select
 #define MOE_X_ef53b4eeea ((int)(((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)))
-#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2))
+#define MOE_X_efe5fd2ddf ((int)((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2))
 #define MOE_X_efe70cec4a ((int)((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)))
 #endif // moe-select
 #define MOE_X_fa76c90be3 ((int)((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))
@@ -207,7 +207,7 @@ static_assert(((8192) < ((((67584 / (MOE_RANKS_LL * 2)) / 1024) * 1024)) ? (8192
 static_assert((MOE_RANKS_LL * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) >= -2147483648LL && (MOE_RANKS_LL * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) <= 2147483647LL, "parametric guard: MOE_X_17536cae9b must fit int");
 static_assert(((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL) + (MOE_RANKS_LL * 8)) >= -2147483648LL && ((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL) + (MOE_RANKS_LL * 8)) <= 2147483647LL, "parametric guard: MOE_X_1925e14f40 must fit int");
 static_assert((((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) * 4) % 4) >= -2147483648LL && (((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) * 4) % 4) <= 2147483647LL, "parametric guard: MOE_X_1b3b5beb4f must fit int");
-static_assert(((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) + 8) >= -2147483648LL && ((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) + 8) <= 2147483647LL, "parametric guard: MOE_X_1b61f2e4e4 must fit int");
+static_assert(((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) + 8) >= -2147483648LL && ((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) + 8) <= 2147483647LL, "parametric guard: MOE_X_1b61f2e4e4 must fit int");
 #if (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 0))) // moe-select
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 128) - 1) / 128) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 128) - 1) / 128) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) <= 2147483647LL, "parametric guard: MOE_X_1d92be5ff8 must fit int");
 static_assert((MOE_LSA_COPIERS_LL + 2) >= -2147483648LL && (MOE_LSA_COPIERS_LL + 2) <= 2147483647LL, "parametric guard: MOE_X_1e6fc64f5a must fit int");
@@ -366,7 +366,7 @@ static_assert(((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ?
 #else // moe-select
 static_assert((((8192) < ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024)) ? (8192) : ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024))) - 1) >= -2147483648LL && (((8192) < ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024)) ? (8192) : ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024))) - 1) <= 2147483647LL, "parametric guard: MOE_X_8a0532c8c4 must fit int");
 #endif // moe-select
-static_assert((MOE_RANKS_LL * ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 1)) >= -2147483648LL && (MOE_RANKS_LL * ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 1)) <= 2147483647LL, "parametric guard: MOE_X_8cf8c45164 must fit int");
+static_assert((MOE_RANKS_LL * ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 1)) >= -2147483648LL && (MOE_RANKS_LL * ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 1)) <= 2147483647LL, "parametric guard: MOE_X_8cf8c45164 must fit int");
 #if ((MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SHARED_EXPERT == 0)))) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SHARED_EXPERT == 0))))) // moe-select
 static_assert((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL))) >= -2147483648LL && (((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL))) <= 2147483647LL, "parametric guard: MOE_X_8eafd1c305 must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + 0) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + 0) <= 2147483647LL, "parametric guard: MOE_X_91f1f0773e must fit int");
@@ -385,9 +385,9 @@ static_assert(((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ?
 static_assert(((1 * ((16) > ((MOE_RANKS_LL + 3)) ? (16) : ((MOE_RANKS_LL + 3)))) * 4) >= -2147483648LL && ((1 * ((16) > ((MOE_RANKS_LL + 3)) ? (16) : ((MOE_RANKS_LL + 3)))) * 4) <= 2147483647LL, "parametric guard: MOE_X_9dd478aaa1 must fit int");
 #if ((MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 1 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SHARED_EXPERT == 1)))) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TB_SCR_GLOBAL == 1 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SHARED_EXPERT == 1)))))) // moe-select
 static_assert((((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) + (9 * MOE_RANKS_LL)) + ((2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) * (9 * MOE_RANKS_LL))) >= -2147483648LL && (((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) + (9 * MOE_RANKS_LL)) + ((2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) * (9 * MOE_RANKS_LL))) <= 2147483647LL, "parametric guard: MOE_X_9e76039edb must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 1) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 1) <= 2147483647LL, "parametric guard: MOE_X_9fc62c3487 must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 1) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 1) <= 2147483647LL, "parametric guard: MOE_X_9fc62c3487 must fit int");
 #elif ((MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && MOE_SW_ROLE_WARP_FOLD == 1)) || (MOE_INSTANCE == 3 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1))) // moe-select
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 1) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 1) <= 2147483647LL, "parametric guard: MOE_X_9fc62c3487 must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 1) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 1) <= 2147483647LL, "parametric guard: MOE_X_9fc62c3487 must fit int");
 #elif (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 1 && MOE_SHARED_EXPERT == 1)) // moe-select
 static_assert((((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) + (9 * MOE_RANKS_LL)) + ((2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) * (9 * MOE_RANKS_LL))) >= -2147483648LL && (((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) + (9 * MOE_RANKS_LL)) + ((2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) * (9 * MOE_RANKS_LL))) <= 2147483647LL, "parametric guard: MOE_X_9e76039edb must fit int");
 #else // moe-select
@@ -446,7 +446,7 @@ static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPE
 #endif // moe-select
 static_assert(((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) * 4) >= -2147483648LL && ((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) * 4) <= 2147483647LL, "parametric guard: MOE_X_b4239c2d9f must fit int");
 static_assert((MOE_HIDDEN_LL / 64) >= -2147483648LL && (MOE_HIDDEN_LL / 64) <= 2147483647LL, "parametric guard: MOE_X_b5c608ab08 must fit int");
-static_assert((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) >= -2147483648LL && (MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) <= 2147483647LL, "parametric guard: MOE_X_b734446fec must fit int");
+static_assert((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) >= -2147483648LL && (MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) <= 2147483647LL, "parametric guard: MOE_X_b734446fec must fit int");
 static_assert((2 + MOE_TOPK_LL) >= -2147483648LL && (2 + MOE_TOPK_LL) <= 2147483647LL, "parametric guard: MOE_X_b9cacffdda must fit int");
 #if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
 #else // moe-select
@@ -454,13 +454,13 @@ static_assert(((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127) >= -2147483648LL && ((MOE_
 #endif // moe-select
 static_assert(((((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) * 4) / 4) * 4) >= -2147483648LL && ((((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) * 4) / 4) * 4) <= 2147483647LL, "parametric guard: MOE_X_beaa1b2350 must fit int");
 static_assert((8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) >= -2147483648LL && (8 + (2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))))) <= 2147483647LL, "parametric guard: MOE_X_c005674f28 must fit int");
-static_assert(((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) + 4) >= -2147483648LL && ((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) + 4) <= 2147483647LL, "parametric guard: MOE_X_c16e11959c must fit int");
+static_assert(((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) + 4) >= -2147483648LL && ((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) + 4) <= 2147483647LL, "parametric guard: MOE_X_c16e11959c must fit int");
 #if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
 static_assert(((8192) < ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024)) ? (8192) : ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024))) >= -2147483648LL && ((8192) < ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024)) ? (8192) : ((((65536 / (MOE_RANKS_LL * 2)) / 1024) * 1024))) <= 2147483647LL, "parametric guard: MOE_X_c2714a6802 must fit int");
 #else // moe-select
 #endif // moe-select
 static_assert(((((MOE_HIDDEN_LL / 64) * 2) + ((MOE_HIDDEN_LL / 64) * 96)) / 4) >= -2147483648LL && ((((MOE_HIDDEN_LL / 64) * 2) + ((MOE_HIDDEN_LL / 64) * 96)) / 4) <= 2147483647LL, "parametric guard: MOE_X_c57857b977 must fit int");
-static_assert((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) >= -2147483648LL && (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) <= 2147483647LL, "parametric guard: MOE_X_caa68debd6 must fit int");
+static_assert((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) >= -2147483648LL && (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) <= 2147483647LL, "parametric guard: MOE_X_caa68debd6 must fit int");
 #if MOE_SW_TB_SCR_GLOBAL == 0 // moe-select
 static_assert(((1 * (((2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) * (9 * MOE_RANKS_LL)) + (9 * MOE_RANKS_LL))) * 4) >= -2147483648LL && ((1 * (((2 * ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)))) * (9 * MOE_RANKS_LL)) + (9 * MOE_RANKS_LL))) * 4) <= 2147483647LL, "parametric guard: MOE_X_cea075b979 must fit int");
 #else // moe-select
@@ -508,24 +508,24 @@ static_assert((((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1)
 static_assert((((MOE_RANKS_LL + 8) - 1) / 8) >= -2147483648LL && (((MOE_RANKS_LL + 8) - 1) / 8) <= 2147483647LL, "parametric guard: MOE_X_e0eab20c9f must fit int");
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 1 && (MOE_SW_POOL_INDEX_64 == 1 && MOE_SHARED_EXPERT == 1))) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 1 && (MOE_SW_POOL_INDEX_64 == 1 && MOE_SHARED_EXPERT == 1))))) // moe-select
 static_assert((((MOE_RANKS_LL + 8) - 1) / 8) >= -2147483648LL && (((MOE_RANKS_LL + 8) - 1) / 8) <= 2147483647LL, "parametric guard: MOE_X_e0eab20c9f must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 static_assert(((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) >= -2147483648LL && ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_efe70cec4a must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)) <= 2147483647LL, "parametric guard: MOE_X_f5a80a1c0c must fit int");
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && MOE_SW_POOL_INDEX_64 == 1) || (MOE_INSTANCE == 2 && MOE_SW_POOL_INDEX_64 == 1))) // moe-select
 static_assert((((MOE_RANKS_LL + 8) - 1) / 8) >= -2147483648LL && (((MOE_RANKS_LL + 8) - 1) / 8) <= 2147483647LL, "parametric guard: MOE_X_e0eab20c9f must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 static_assert(((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) >= -2147483648LL && ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_efe70cec4a must fit int");
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)))) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)))))) // moe-select
 static_assert((((MOE_RANKS_LL + 8) - 1) / 8) >= -2147483648LL && (((MOE_RANKS_LL + 8) - 1) / 8) <= 2147483647LL, "parametric guard: MOE_X_e0eab20c9f must fit int");
 static_assert((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) >= -2147483648LL && (((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_ec0a98b81f must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) <= 2147483647LL, "parametric guard: MOE_X_ef53b4eeea must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 static_assert(((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) >= -2147483648LL && ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_efe70cec4a must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)) <= 2147483647LL, "parametric guard: MOE_X_f5a80a1c0c must fit int");
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
 static_assert((((MOE_RANKS_LL + 8) - 1) / 8) >= -2147483648LL && (((MOE_RANKS_LL + 8) - 1) / 8) <= 2147483647LL, "parametric guard: MOE_X_e0eab20c9f must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) <= 2147483647LL, "parametric guard: MOE_X_ef53b4eeea must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 static_assert(((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) >= -2147483648LL && ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_efe70cec4a must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)) <= 2147483647LL, "parametric guard: MOE_X_f5a80a1c0c must fit int");
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
@@ -533,44 +533,44 @@ static_assert((((MOE_RANKS_LL + 8) - 1) / 8) >= -2147483648LL && (((MOE_RANKS_LL
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 64) * 64)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 64) * 64)) <= 2147483647LL, "parametric guard: MOE_X_e5a000fe0b must fit int");
 static_assert(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) - 1) >= -2147483648LL && ((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) - 1) <= 2147483647LL, "parametric guard: MOE_X_e5cdd16655 must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) <= 2147483647LL, "parametric guard: MOE_X_eada4540ba must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && MOE_SW_ROLE_PEER_FOLD == 1) || (MOE_INSTANCE == 3 && MOE_SW_WIDE_RANKS == 1))) // moe-select
 static_assert((((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) + 4) * (((2 * MOE_INTERMEDIATE_LL) / 128) + (MOE_HIDDEN_LL / 128))) >= -2147483648LL && (((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) + 4) * (((2 * MOE_INTERMEDIATE_LL) / 128) + (MOE_HIDDEN_LL / 128))) <= 2147483647LL, "parametric guard: MOE_X_dffd792f1f must fit int");
 static_assert((((MOE_RANKS_LL + 8) - 1) / 8) >= -2147483648LL && (((MOE_RANKS_LL + 8) - 1) / 8) <= 2147483647LL, "parametric guard: MOE_X_e0eab20c9f must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && MOE_SHARED_EXPERT == 1) || (MOE_INSTANCE == 3 && MOE_SHARED_EXPERT == 1))) // moe-select
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 64) * 64)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 64) * 64)) <= 2147483647LL, "parametric guard: MOE_X_e5a000fe0b must fit int");
 static_assert(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) - 1) >= -2147483648LL && ((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) - 1) <= 2147483647LL, "parametric guard: MOE_X_e5cdd16655 must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) <= 2147483647LL, "parametric guard: MOE_X_eada4540ba must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 #elif (MOE_SW_POLICY_EP == 16 && (MOE_INSTANCE == 1 || MOE_INSTANCE == 3)) // moe-select
 static_assert((((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) + 4) * (((2 * MOE_INTERMEDIATE_LL) / 128) + (MOE_HIDDEN_LL / 128))) >= -2147483648LL && (((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) + 4) * (((2 * MOE_INTERMEDIATE_LL) / 128) + (MOE_HIDDEN_LL / 128))) <= 2147483647LL, "parametric guard: MOE_X_dffd792f1f must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 #elif ((MOE_INSTANCE == 1 && MOE_SHARED_EXPERT == 1) || (MOE_INSTANCE == 3 && MOE_SHARED_EXPERT == 1)) // moe-select
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 64) * 64)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 63)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 64) * 64)) <= 2147483647LL, "parametric guard: MOE_X_e5a000fe0b must fit int");
 static_assert(((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) - 1) >= -2147483648LL && ((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) - 1) <= 2147483647LL, "parametric guard: MOE_X_e5cdd16655 must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + (MOE_MAX_ROWS_LL / 64)) <= 2147483647LL, "parametric guard: MOE_X_eada4540ba must fit int");
 static_assert((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) >= -2147483648LL && (((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_ec0a98b81f must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 static_assert(((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) >= -2147483648LL && ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_efe70cec4a must fit int");
 #elif (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
 static_assert((((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) + 4) * (((2 * MOE_INTERMEDIATE_LL) / 128) + (MOE_HIDDEN_LL / 128))) >= -2147483648LL && (((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + 64) - 1) / 64) + (MOE_EXPERTS_LL / MOE_RANKS_LL)) + 0) + 4) * (((2 * MOE_INTERMEDIATE_LL) / 128) + (MOE_HIDDEN_LL / 128))) <= 2147483647LL, "parametric guard: MOE_X_dffd792f1f must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 static_assert(((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) >= -2147483648LL && ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_efe70cec4a must fit int");
 #elif MOE_SW_ROLE_PEER_FOLD == 1 // moe-select
 static_assert((((MOE_RANKS_LL + 8) - 1) / 8) >= -2147483648LL && (((MOE_RANKS_LL + 8) - 1) / 8) <= 2147483647LL, "parametric guard: MOE_X_e0eab20c9f must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) <= 2147483647LL, "parametric guard: MOE_X_ef53b4eeea must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 static_assert(((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) >= -2147483648LL && ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_efe70cec4a must fit int");
 #elif MOE_SHARED_EXPERT == 1 // moe-select
 static_assert((((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) >= -2147483648LL && (((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) * (((((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) + MOE_RANKS_LL) + MOE_RANKS_LL) + MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_ec0a98b81f must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) <= 2147483647LL, "parametric guard: MOE_X_ef53b4eeea must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 static_assert(((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) >= -2147483648LL && ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_efe70cec4a must fit int");
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) + ((MOE_MAX_ROWS_LL / 128) * 128)) <= 2147483647LL, "parametric guard: MOE_X_f5a80a1c0c must fit int");
 #else // moe-select
 static_assert((((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) >= -2147483648LL && (((((((MOE_RANKS_LL * MOE_MAX_ROWS_LL) * MOE_TOPK_LL) + ((MOE_EXPERTS_LL / MOE_RANKS_LL) * 127)) + 3) / 4) * 4) * (MOE_HIDDEN_LL / 4)) <= 2147483647LL, "parametric guard: MOE_X_ef53b4eeea must fit int");
-static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
+static_assert(((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) >= -2147483648LL && ((((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1) + 2) <= 2147483647LL, "parametric guard: MOE_X_efe5fd2ddf must fit int");
 static_assert(((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) >= -2147483648LL && ((((((0 + MOE_RANKS_LL) + MOE_RANKS_LL) + 9) + 9) + 9) + (9 * MOE_RANKS_LL)) <= 2147483647LL, "parametric guard: MOE_X_efe70cec4a must fit int");
 #endif // moe-select
 static_assert(((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) >= -2147483648LL && ((32) > (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32)) ? (32) : (((((MOE_EXPERTS_LL / MOE_RANKS_LL) + 31) / 32) * 32))) <= 2147483647LL, "parametric guard: MOE_X_fa76c90be3 must fit int");
@@ -617,7 +617,7 @@ static_assert(!((MOE_LSA_COPIERS_LL) < (1)), "parametric guard: comparison <");
 static_assert(!((MOE_LSA_COPIERS_LL) > (16)), "parametric guard: comparison >");
 static_assert(!((MOE_LSA_COPIERS_LL) > ((MOE_RANKS_LL - 1))), "parametric guard: comparison >");
 static_assert(((12 * (((((128 + MOE_HIDDEN_LL) + (MOE_HIDDEN_LL / 32)) + 127) / 128) * 128))) < (98304), "parametric guard: comparison <");
-static_assert(!(((((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) + 4) + (MOE_RANKS_LL * 8))) > (((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 64) + 1)) + ((64) > ((4 + (MOE_RANKS_LL * 8))) ? (64) : ((4 + (MOE_RANKS_LL * 8))))))), "parametric guard: comparison >");
+static_assert(!(((((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) + 4) + (MOE_RANKS_LL * 8))) > (((MOE_RANKS_LL * (((MOE_MAX_ROWS_LL * MOE_TOPK_LL) / 32) + 1)) + ((64) > ((4 + (MOE_RANKS_LL * 8))) ? (64) : ((4 + (MOE_RANKS_LL * 8))))))), "parametric guard: comparison >");
 static_assert(!((((((((128 + MOE_HIDDEN_LL) + (MOE_HIDDEN_LL / 32)) + 127) / 128) * 128) % 16)) != (0)), "parametric guard: comparison !=");
 #if (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 1 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)) || (MOE_INSTANCE == 3 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
 static_assert(!(((65536 / (MOE_RANKS_LL * 2))) < (1024)), "parametric guard: comparison <");
