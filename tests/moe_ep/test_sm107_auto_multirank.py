@@ -23,8 +23,8 @@ from flashinfer.moe_ep import (
 )
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.modes.mega_layer import MoEEpMegaLayer
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import sm107_candidates
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import sm107_candidates
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
     autotune as native,
     knob_cache,
     tuning_protocol,
@@ -163,7 +163,7 @@ def test_rubin_auto_persistence_and_capture(
         monkeypatch.setattr(
             native, "sm107_candidates", lambda *args, **kwargs: candidates
         )
-        from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+        from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
         monkeypatch.setattr(
             package, "sm107_candidates", lambda *args, **kwargs: candidates

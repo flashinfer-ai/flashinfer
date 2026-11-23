@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm100.cutedsl_megamoe.mxfp8_mega_moe``.
+    """MXFP8 expert configuration for the sources-backed Blackwell kernels.
 
     ``intermediate_size`` is the post-SwiGLU width, matching NVFP4 and SGLang.
     The MXFP8 kernel's full FC1 gate+up width is derived internally as
@@ -29,13 +29,12 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     with E4M3 activations). The latter requires 128-aligned intermediate size.
     Its ``knobs=None`` selects an exact cached profile or a host heuristic;
     dictionaries and explicit tile/cluster/schedule fields constrain selection.
-    GenPhase and the standard ``_cutedsl_next`` selector use ``knobs="auto"``
+    GenPhase and standard inference use ``knobs="auto"``
     with ``autotune_v2()`` for collective warmup before graph capture.
-    These selectors support independent automatic handles through
-    ``create_workspace()``. The legacy inference selector retains its
-    single-capacity automatic workspace.
+    Both variants support independent automatic handles through
+    ``create_workspace()``.
 
-    ``kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"`` selects the standard
+    ``kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl"`` selects the standard
     provider export for E4M3 or E5M2. ``kernel_variant="genphase"`` selects
     decoding, including mixed MXFP4/MXFP8. With ``kernel_variant="inference"``,
     use default, fixed or automatic ``knobs``. Activation controls and
@@ -55,8 +54,7 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     fast_math: bool = True
     # Enables in_kernel_fc2_reduce, autotune may still disable this if it is faster
     enable_in_kernel_fc2_reduce: bool = False
-    # NONE exposes per-route outputs through forward_unfinalized(). The legacy
-    # selector requires fixed/offline-tuned knobs for this mode.
+    # NONE exposes per-route outputs through forward_unfinalized().
     finalize_mode: FinalizeMode = field(default=FinalizeMode.AUTO, kw_only=True)
     # Caller-owned CUDA int32 (1,) live-token count the PERSISTENT finalize kernel
     # reads; the workspace borrows it and never writes it. Update before every
@@ -64,18 +62,10 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     num_valid_tokens_tensor: Optional["torch.Tensor"] = field(
         default=None, kw_only=True
     )
-    # GenPhase: None resolves the cache or geometry heuristic; dictionaries
-    # constrain tile/cluster/schedule_policy; "auto" searches within autotune_v2().
-    # Inference tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
-    # the token-count default heuristic entirely when set, e.g. a winner from the
-    # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").
-    # Legacy "auto" -> online autotune at the first forward: collectively time the
-    # shim.autotune candidate set on the live problem and keep the winner
-    # (one cute.compile per candidate, paid once per session).
-    # The standard _cutedsl_next selector defers searches to autotune_v2().
+    # None uses the heuristic or an exact GenPhase cache entry. Dictionaries
+    # constrain native knobs; "auto" searches within autotune_v2().
     knobs: dict | str | None = None
-    # Opt-in decoding pipeline. Existing callers keep the legacy inference
-    # path, including its knob cache and online autotuner.
+    # Select standard inference or the GenPhase decoding pipeline.
     kernel_variant: Literal["inference", "genphase"] = "inference"
     # GenPhase only: None selects cached knobs or geometry-based heuristics.
     # Explicit fields constrain the heuristic and automatic candidate sweep.
@@ -100,13 +90,6 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
             raise ValueError(
                 "quantized combine requires the standard inference provider"
             )
-        if (
-            self.combine_dtype != "bf16"
-            and self.kernel_name == "sm100_mxfp8_mxfp8_bf16_cutedsl"
-            and (not self.batch_invariant or self.combine_dtype != "mxfp8")
-        ):
-            raise ValueError("legacy quantized combine requires BI MXFP8 wire")
-        """Reject incompatible dtype, activation and finalization options."""
         if type(self.batch_invariant) is not bool:
             raise ValueError("batch_invariant must be a bool")
         if self.batch_invariant:
@@ -118,7 +101,6 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError("unsupported batch_invariant MX quantization kind")
             if self.kernel_name not in (
                 "sm100_mxfp8_mxfp4_bf16_cutedsl",
-                "sm100_mxfp8_mxfp8_bf16_cutedsl_next",
                 "sm100_mxfp8_mxfp8_bf16_cutedsl",
             ):
                 raise ValueError(
@@ -137,7 +119,7 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
             and self.kernel_variant != "genphase"
             and self.kernel_name
             not in (
-                "sm100_mxfp8_mxfp8_bf16_cutedsl_next",
+                "sm100_mxfp8_mxfp8_bf16_cutedsl",
                 "sm100_mxfp8_mxfp4_bf16_cutedsl",
             )
         ):
@@ -188,7 +170,7 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
                     "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False."
                 )
             if self.knobs == "auto" and self.kernel_name not in (
-                "sm100_mxfp8_mxfp8_bf16_cutedsl_next",
+                "sm100_mxfp8_mxfp8_bf16_cutedsl",
                 "sm100_mxfp8_mxfp4_bf16_cutedsl",
             ):
                 raise ValueError(

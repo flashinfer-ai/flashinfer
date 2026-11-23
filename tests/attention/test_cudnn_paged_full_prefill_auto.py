@@ -15,8 +15,6 @@ from flashinfer.cudnn import prefill as cp
 @pytest.mark.parametrize("page", [16, 64])
 @pytest.mark.parametrize("return_lse", [False, True])
 def test_full_prefill_auto_retained_capture(dtype, dim, group, page, return_lse):
-    if dtype == torch.float16 and not cp._cudnn_supports_paged_fp16_auto():
-        pytest.skip("FP16 auto requires stable FE 1.33")
     if torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),

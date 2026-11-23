@@ -48,7 +48,6 @@ from .cudnn.prefill import (
     _cudnn_supports_direct_seqlens,
     _cudnn_supports_paged_token_offsets,
     _cudnn_supports_paged_auto,
-    _cudnn_supports_paged_fp16_auto,
     _cudnn_supports_paged_gqa_auto,
     _cudnn_supports_paged_full_prefill_auto,
     CudnnPrefillGraph,
@@ -2648,10 +2647,7 @@ def _blackwell_paged_gqa_auto_cudnn(
     if not (
         layout == "HND"
         and q_dtype == kv_dtype == o_dtype
-        and (
-            q_dtype == torch.bfloat16
-            or (q_dtype == torch.float16 and _cudnn_supports_paged_fp16_auto())
-        )
+        and q_dtype in (torch.bfloat16, torch.float16)
         and head_dim_qk == head_dim_vo
         and head_dim_qk == 256
         and 1 <= batch <= 4
@@ -2721,10 +2717,7 @@ def _blackwell_paged_full_prefill_auto_cudnn(
     if not (
         layout == "HND"
         and q_dtype == kv_dtype == o_dtype
-        and (
-            q_dtype == torch.bfloat16
-            or (q_dtype == torch.float16 and _cudnn_supports_paged_fp16_auto())
-        )
+        and q_dtype in (torch.bfloat16, torch.float16)
         and head_dim_qk == head_dim_vo
         and 8 <= hq <= 64
         and hk > 0
@@ -2841,10 +2834,7 @@ def _blackwell_paged_auto_cudnn(
     if not (
         layout == "HND"
         and q_dtype == kv_dtype == o_dtype
-        and (
-            q_dtype == torch.bfloat16
-            or (q_dtype == torch.float16 and _cudnn_supports_paged_fp16_auto())
-        )
+        and q_dtype in (torch.bfloat16, torch.float16)
         and head_dim_qk == head_dim_vo == 128
         and batch > 0
         and 8 <= hq <= 64
@@ -3346,8 +3336,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            requires ``backend="auto"``. The mask mode is a class dimension: ``causal=True`` runs the causal class (bottom-right
+            aligned, optional ``window_left``), ``causal=False`` the non-causal class (every token sees its request's whole key
+            range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal
+            class, and ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint``
+            takes the same ``causal`` for these wrappers and has no default). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
+            with ``causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
@@ -3680,6 +3674,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
 
+        Under ``batch_invariant=True`` the size is that of the split-KV plan of
+        the mask mode :meth:`plan` will run, so pass the same ``causal`` and
+        ``window_left`` as to :meth:`plan`: ``causal`` defaults to ``False``
+        here as it does there (the non-causal class, which takes no window), a
+        causal plan is sized with ``causal=True``, and an input :meth:`plan`
+        refuses raises the same
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` here.
+
         Parameters
         ----------
         qo_indptr : torch.Tensor
@@ -3784,6 +3786,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_qk,
                 page_size,
                 window_left,
+                causal=causal,
             ), 0
         if self._backend == "cute-dsl-prims":
             qo_indptr_host = qo_indptr.to("cpu")
@@ -6105,8 +6108,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
-            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            requires ``backend="auto"``. The mask mode is a class dimension: ``causal=True`` runs the causal class (bottom-right
+            aligned, optional ``window_left``), ``causal=False`` the non-causal class (every token sees its request's whole key
+            range; no window). ``plan()`` defaults to ``causal=False``: a plan that omits ``causal`` runs the non-causal
+            class, and ``causal=True`` must be passed to select the causal class (``flashinfer.batch_invariant.fingerprint``
+            takes the same ``causal`` for these wrappers and has no default). Inputs outside the classes (dtypes other than bf16, head dims other than 64 / 128 / 256, a window
+            with ``causal=False``, logits soft cap, custom masks, RoPE, scales, LSE output) raise
             :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests

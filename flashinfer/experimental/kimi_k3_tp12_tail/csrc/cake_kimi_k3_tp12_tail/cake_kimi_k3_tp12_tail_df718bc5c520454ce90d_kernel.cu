@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -47,6 +47,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
+#ifndef CAKE_U128_T_DECLARED
+#define CAKE_U128_T_DECLARED
+#if defined(_MSC_VER)
+struct __align__(16) cake_u128_t { unsigned int x, y, z, w; };
+#else
+typedef unsigned __int128 cake_u128_t;
+#endif
+#endif
 #define CAKE_INF CUDART_INF_F
 #define SMEM_REDUCE_SCRATCH_OFF 0
 #define SMEM_REDUCE_SCRATCH_STAGE_BYTES 128
@@ -223,7 +231,7 @@ kernel_cake_kimi_k3_tp12_tail_df718bc5c520454ce90d(__nv_bfloat16* __restrict__ r
             unsigned int boundary = (clear[stage] + 15) / 16;
             for (unsigned int packed = thread; packed < boundary; packed += threads) {
                 {
-                    auto _gst_8 = reinterpret_cast<unsigned __int128*>(bytes_base + stage_offset) + packed;
+                    auto _gst_8 = reinterpret_cast<cake_u128_t*>(bytes_base + stage_offset) + packed;
                     __builtin_assume(__isGlobal(_gst_8));
                     reinterpret_cast<int4*>(_gst_8)[0] = reinterpret_cast<int4*>(sentinel)[0];
                 }
@@ -1093,7 +1101,7 @@ kernel_cake_kimi_k3_tp12_tail_df718bc5c520454ce90d(__nv_bfloat16* __restrict__ r
             unsigned int boundary_1 = (clear_1[0] + 15) / 16;
             for (unsigned int packed_1 = thread_0; packed_1 < boundary_1; packed_1 += threads_0) {
                 {
-                    auto _gst_12 = reinterpret_cast<unsigned __int128*>(bytes_base_0 + stage_offset_0) + packed_1;
+                    auto _gst_12 = reinterpret_cast<cake_u128_t*>(bytes_base_0 + stage_offset_0) + packed_1;
                     __builtin_assume(__isGlobal(_gst_12));
                     reinterpret_cast<int4*>(_gst_12)[0] = reinterpret_cast<int4*>(sentinel_0)[0];
                 }
@@ -1117,7 +1125,7 @@ kernel_cake_kimi_k3_tp12_tail_df718bc5c520454ce90d(__nv_bfloat16* __restrict__ r
             unsigned int boundary_1_1 = (clear_2[1] + 15) / 16;
             for (unsigned int packed_1_1 = thread_1; packed_1_1 < boundary_1_1; packed_1_1 += threads_1) {
                 {
-                    auto _gst_13 = reinterpret_cast<unsigned __int128*>(bytes_base_1 + stage_offset_0_1) + packed_1_1;
+                    auto _gst_13 = reinterpret_cast<cake_u128_t*>(bytes_base_1 + stage_offset_0_1) + packed_1_1;
                     __builtin_assume(__isGlobal(_gst_13));
                     reinterpret_cast<int4*>(_gst_13)[0] = reinterpret_cast<int4*>(sentinel_1)[0];
                 }
@@ -1174,7 +1182,7 @@ kernel_cake_kimi_k3_tp12_tail_df718bc5c520454ce90d(__nv_bfloat16* __restrict__ r
             unsigned int boundary_2 = (clear_3[stage_1] + 15) / 16;
             for (unsigned int packed_2 = thread_2; packed_2 < boundary_2; packed_2 += threads_2) {
                 {
-                    auto _gst_15 = reinterpret_cast<unsigned __int128*>(bytes_base_2 + stage_offset_1) + packed_2;
+                    auto _gst_15 = reinterpret_cast<cake_u128_t*>(bytes_base_2 + stage_offset_1) + packed_2;
                     __builtin_assume(__isGlobal(_gst_15));
                     reinterpret_cast<int4*>(_gst_15)[0] = reinterpret_cast<int4*>(sentinel_2)[0];
                 }
@@ -1282,7 +1290,7 @@ kernel_cake_kimi_k3_tp12_tail_df718bc5c520454ce90d(__nv_bfloat16* __restrict__ r
             unsigned int boundary_1_2 = (clear_3_1[0] + 15) / 16;
             for (unsigned int packed_1_2 = thread_2_1; packed_1_2 < boundary_1_2; packed_1_2 += threads_2_1) {
                 {
-                    auto _gst_19 = reinterpret_cast<unsigned __int128*>(bytes_base_2_1 + stage_offset_0_2) + packed_1_2;
+                    auto _gst_19 = reinterpret_cast<cake_u128_t*>(bytes_base_2_1 + stage_offset_0_2) + packed_1_2;
                     __builtin_assume(__isGlobal(_gst_19));
                     reinterpret_cast<int4*>(_gst_19)[0] = reinterpret_cast<int4*>(sentinel_2_1)[0];
                 }
@@ -2318,7 +2326,7 @@ kernel_cake_kimi_k3_tp12_tail_df718bc5c520454ce90d(__nv_bfloat16* __restrict__ r
             unsigned int boundary_1_3 = (clear_4[1] + 15) / 16;
             for (unsigned int packed_1_3 = thread_3; packed_1_3 < boundary_1_3; packed_1_3 += threads_3) {
                 {
-                    auto _gst_73 = reinterpret_cast<unsigned __int128*>(bytes_base_3 + stage_offset_0_3) + packed_1_3;
+                    auto _gst_73 = reinterpret_cast<cake_u128_t*>(bytes_base_3 + stage_offset_0_3) + packed_1_3;
                     __builtin_assume(__isGlobal(_gst_73));
                     reinterpret_cast<int4*>(_gst_73)[0] = reinterpret_cast<int4*>(sentinel_3)[0];
                 }

@@ -25,6 +25,9 @@ from .api_logging import flashinfer_api
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
 from .topk import _get_row_states_buffer
+from ._top_p_renorm_specialized import (
+    top_p_renorm_probs_specialized as _top_p_renorm_probs_specialized,
+)
 from .trace.templates.sampling import (
     chain_speculative_sampling_trace,
     log_probs_trace,
@@ -2830,12 +2833,28 @@ def top_p_renorm_probs(
     This combination of ``top_p_renorm_probs`` and ``sampling_from_probs`` should be equivalent to
     ``top_p_sampling_from_probs``.
 
+    On compute capability 10.3 (B300 / GB300), float32 ``probs`` with a per-row float32 ``top_p``
+    tensor and ``is_deterministic=False`` are served by a single-launch thread-block-cluster
+    kernel for the ``(batch_size, vocab_size)`` rows listed in
+    ``top_p_renorm_probs_specialized_workloads.json``. It applies the same rule with 64-bit
+    fixed-point masses: each entry is a whole number of units of ``2**-q`` of the row's scale,
+    exact for entries of at least ``2**-35`` of the row's mass and rounded to the nearest unit
+    below that, so the masses lie within ``V / 2`` units of the exact ones (``V`` is
+    ``vocab_size``; below ``2**-41`` of the row's mass for ``V <= 2**18``). The kept set is what
+    exact arithmetic keeps unless a prefix mass lies within that bound of the target; AIR's
+    float32 sums may keep different entries where a prefix mass lies within float32 rounding of
+    the target. A NaN entry is never kept. Every other call takes the AIR top-p kernels;
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read on every call) forces them.
+
     See Also
     --------
     top_p_sampling_from_probs
     sampling_from_probs
     top_k_renorm_probs
     """
+    specialized = _top_p_renorm_probs_specialized(probs, top_p, is_deterministic)
+    if specialized is not None:
+        return specialized
     batch_size = probs.size(0)
     vocab_size = probs.size(1)
     # Workspace size for AIR Top-P radix algorithm.

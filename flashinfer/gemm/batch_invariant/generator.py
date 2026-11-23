@@ -24,6 +24,7 @@ so ``GEMMConfig.lean`` validates the actual spaces (``gemm_space_ok``, ``gemm_fp
 
 from __future__ import annotations
 
+import re
 import functools
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -158,6 +159,10 @@ SWAP_WIDE_FMTS = (
 #: a placement of the class. Dense records only (no swap, no in-cluster split, no in-CTA chunk fold).
 TILE_M_BREUSE = 512
 BREUSE_FMTS = ("nvfp4_k128", "mxfp8_k64", "mxfp4_k128", "mxfp4w8a_k64")
+
+
+#: the ``describe()`` tokens of the launch placements: ``_r<m|n>_sw<s>`` and the forced grid ``_g<n>``
+_PLACEMENT_TOKENS = re.compile(r"_r[mn]_sw\d+|_g\d+")
 
 
 @dataclass(frozen=True)
@@ -309,6 +314,12 @@ class Knobs:
             + ("_cc" if self.cta_chunks else "")
             + (f"_kb{self.k_block}" if self.k_block else "")
         )
+
+    def describe_object(self) -> str:
+        """The compile-time identity of the knobs: ``describe()`` without its placement tokens (the raster order, the
+        swizzle size and the grid are launch arguments of the compiled object, ``blocks/scheduler.py``). Derived from
+        ``describe()`` so that a knob added there is part of the object's identity too."""
+        return _PLACEMENT_TOKENS.sub("", self.describe())
 
     def instruction(self, in_fmt: str = "bf16") -> str:
         """The MMA instruction variant these knobs select for the format: the A2 assumption surface."""

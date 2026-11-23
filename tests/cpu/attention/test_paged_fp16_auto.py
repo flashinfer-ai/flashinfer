@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""FP16 transfers existing domains only after its FE placement is available."""
+"""FP16 follows the same paged auto placement rules as BF16."""
 
 from itertools import accumulate
 from types import SimpleNamespace
@@ -8,25 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 import flashinfer.prefill as fp
-from flashinfer.cudnn import prefill as cp
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.mark.parametrize(
-    "version", ["1.32.3", "1.33.0rc1", "1.33.0", "1.33.0+local", "invalid"]
-)
-@pytest.mark.parametrize("runtime", [False, True])
-def test_fp16_release_gate(monkeypatch, version, runtime):
-    monkeypatch.setattr(cp, "cudnn", SimpleNamespace(__version__=version))
-    monkeypatch.setattr(cp, "_cudnn_supports_paged_auto", lambda: runtime)
-    cp._cudnn_supports_paged_fp16_auto.cache_clear()
-    try:
-        assert cp._cudnn_supports_paged_fp16_auto() is (
-            runtime and version in ("1.33.0", "1.33.0+local")
-        )
-    finally:
-        cp._cudnn_supports_paged_fp16_auto.cache_clear()
 
 
 def kwargs(dim, qs, ks, group=4, page=16):
@@ -67,7 +50,7 @@ def kwargs(dim, qs, ks, group=4, page=16):
         (256, [2048], [8192], 4, 16),
     ],
 )
-def test_fp16_domain_transfer_and_disabled_gate(
+def test_fp16_domain_transfer_and_mixed_dtype_rejection(
     monkeypatch, cc, dim, qs, ks, group, page
 ):
     monkeypatch.setattr(fp, "get_compute_capability", lambda device: cc)
@@ -76,11 +59,7 @@ def test_fp16_domain_transfer_and_disabled_gate(
     monkeypatch.setattr(fp, "_cudnn_supports_paged_full_prefill_auto", lambda dim: True)
     args = kwargs(dim, qs, ks, group, page)
     bf16 = fp._blackwell_paged_auto_cudnn(**args)
-    monkeypatch.setattr(fp, "_cudnn_supports_paged_fp16_auto", lambda: False)
-    assert fp._blackwell_paged_auto_cudnn(**args) == bf16
     args.update(q_dtype=torch.float16, kv_dtype=torch.float16, o_dtype=torch.float16)
-    assert not fp._blackwell_paged_auto_cudnn(**args)
-    monkeypatch.setattr(fp, "_cudnn_supports_paged_fp16_auto", lambda: True)
     assert fp._blackwell_paged_auto_cudnn(**args) == bf16
     for field in ("q_dtype", "kv_dtype", "o_dtype"):
         mixed = {**args, field: torch.bfloat16}
@@ -99,7 +78,6 @@ class DeviceOnly:
 
 @pytest.mark.parametrize("field", ["qo_indptr_host", "kv_lens", "seq_lens_q"])
 def test_fp16_d256_metadata_stays_on_cpu(monkeypatch, field):
-    monkeypatch.setattr(fp, "_cudnn_supports_paged_fp16_auto", lambda: True)
     args = kwargs(256, [128] * 4, [8192] * 4)
     args.update(q_dtype=torch.float16, kv_dtype=torch.float16, o_dtype=torch.float16)
     args[field] = DeviceOnly()
@@ -112,7 +90,6 @@ def test_fp16_d256_metadata_stays_on_cpu(monkeypatch, field):
 @pytest.mark.parametrize("page", [16, 64])
 def test_fp16_includes_entire_d256_gqa_full_region(monkeypatch, cc, group, batch, page):
     monkeypatch.setattr(fp, "get_compute_capability", lambda device: cc)
-    monkeypatch.setattr(fp, "_cudnn_supports_paged_fp16_auto", lambda: True)
     monkeypatch.setattr(
         fp, "_cudnn_supports_paged_full_prefill_auto", lambda dim: dim == 256
     )
