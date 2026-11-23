@@ -956,9 +956,11 @@ dist.init_process_group("gloo", init_method="file://" + os.environ["STORE"],
 torch.cuda.is_current_stream_capturing = lambda: False
 case = ""
 calls = []  # (runner, tactic, reduced over the tune group)
-# B0 is the fastest pair; A0 and B2 tie at 3.0.
+# B0 is the fastest pair; A1 and B4 tie at 4.0.
 TIMES = {**{("A", t): 3.0 + t for t in range(6)}, **{("B", t): 2.0 + t / 2 for t in range(6)}}
 PAIRS = sorted(TIMES)
+# The 8 fastest (the default finalists), in enumeration order.
+TOP8 = [("A", 0), ("A", 1)] + [("B", t) for t in range(6)]
 
 class A(TunableRunner):
     def get_valid_tactics(self, inputs, profile):
@@ -1025,7 +1027,7 @@ try:
         os.environ.pop("FLASHINFER_AUTOTUNE_SPLIT", None)
         if case == "default":
             assert tune() == ("B", 0)
-            check_split([("A", 0), ("B", 0), ("B", 1), ("B", 2)])
+            check_split(TOP8)
         elif case in ("lockstep", "lockstep_env", "config", "single"):
             kwargs = {"lockstep": {"split": False}, "config": {"config": TuningConfig(split_profiling=False)},
                       "single": {"group": singles[rank]}}.get(case, {})
@@ -1044,7 +1046,7 @@ try:
             assert tune(split_finalists=1) == ("B", 1)
             check_split([("B", 1)])
             assert tune() == ("B", 0)
-            check_split([("A", 0), ("B", 0), ("B", 1), ("B", 2)])
+            check_split(TOP8)
         elif case == "failure":
             # A3 fails where it is timed; B0 fails on the last rank only.
             assert tune() == ("B", 1)

@@ -1395,7 +1395,7 @@ def set_autotune_process_group(
     or ``FLASHINFER_AUTOTUNE_SPLIT=0`` keeps lockstep timing, as does
     ``TuningConfig.split_profiling=False`` for one op, and so does
     ``rank_tactics`` with ``k > 1``. ``split_finalists`` defaults to
-    ``FLASHINFER_AUTOTUNE_SPLIT_FINALISTS`` or 4 (at least 1). Both values are
+    ``FLASHINFER_AUTOTUNE_SPLIT_FINALISTS`` or 8 (at least 1). Both values are
     read here.
 
     Example::
@@ -1412,7 +1412,7 @@ def set_autotune_process_group(
     if split is None:
         split = os.environ.get("FLASHINFER_AUTOTUNE_SPLIT", "1") != "0"
     if split_finalists is None:
-        split_finalists = int(os.environ.get("FLASHINFER_AUTOTUNE_SPLIT_FINALISTS", 4))
+        split_finalists = int(os.environ.get("FLASHINFER_AUTOTUNE_SPLIT_FINALISTS", 8))
     _tune_split_finalists = max(1, split_finalists) if split else 0
 
 
