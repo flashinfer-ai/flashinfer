@@ -1024,7 +1024,12 @@ def nvfp4_compute_output_scale(
 def nvfp4_compute_output_scale_rn(
     fp8_val: Uint32, global_scale: Float32, block_amax: Float32, *, loc=None, ip=None
 ) -> Float32:
-    """Compute TE-exact NVFP4 output scale when FP4 quant fast math is disabled."""
+    """Compute TE-exact NVFP4 output scale when FP4 quant fast math is disabled.
+
+    Uses a branchless 1-step Newton-Raphson refinement of `rcp.approx.ftz.f32`,
+    which is 0-ULP bit-identical to `div.rn.f32(1.0, x)` for normal-range positive
+    scales while avoiding full IEEE division latency.
+    """
     return Float32(
         llvm.inline_asm(
             T.f32(),
@@ -1035,22 +1040,37 @@ def nvfp4_compute_output_scale_rn(
             ],
             """
             {
-                .reg .pred p_zero;
+                .reg .pred p_zero, p_gs_pos, p_prod_pos;
                 .reg .b16 fp8_pair;
                 .reg .b32 h2_32;
                 .reg .b16 h_lo, h_hi;
-                .reg .f32 scale_f32, rcp_gs, product, result, max_f32;
+                .reg .f32 scale_f32, s_gs, neg_s_gs, r_gs, err_gs, rcp_gs;
+                .reg .f32 product, s_prod, neg_s_prod, r_prod, err_prod, result, max_f32;
 
                 cvt.u16.u32 fp8_pair, $1;
                 cvt.rn.f16x2.e4m3x2 h2_32, fp8_pair;
                 mov.b32 {h_lo, h_hi}, h2_32;
                 cvt.f32.f16 scale_f32, h_lo;
 
-                div.rn.f32 rcp_gs, 0f3F800000, $2;
+                setp.gt.f32 p_gs_pos, $2, 0f00000000;
+                selp.f32 s_gs, $2, 0f3F800000, p_gs_pos;
+                rcp.approx.ftz.f32 r_gs, s_gs;
+                neg.f32 neg_s_gs, s_gs;
+                fma.rn.f32 err_gs, neg_s_gs, r_gs, 0f3F800000;
+                fma.rn.f32 r_gs, err_gs, r_gs, r_gs;
+                selp.f32 rcp_gs, r_gs, 0f00000000, p_gs_pos;
+
                 mul.rn.f32 product, scale_f32, rcp_gs;
-                div.rn.f32 result, 0f3F800000, product;
+
+                setp.gt.f32 p_prod_pos, product, 0f00000000;
+                selp.f32 s_prod, product, 0f3F800000, p_prod_pos;
+                rcp.approx.ftz.f32 r_prod, s_prod;
+                neg.f32 neg_s_prod, s_prod;
+                fma.rn.f32 err_prod, neg_s_prod, r_prod, 0f3F800000;
+                fma.rn.f32 r_prod, err_prod, r_prod, r_prod;
                 mov.b32 max_f32, 0x7F7FFFFF;
-                min.f32 result, result, max_f32;
+                min.f32 r_prod, r_prod, max_f32;
+                selp.f32 result, r_prod, max_f32, p_prod_pos;
 
                 setp.eq.f32 p_zero, $3, 0f00000000;
                 selp.f32 $0, 0f00000000, result, p_zero;
