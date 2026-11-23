@@ -2707,14 +2707,14 @@ def _trtllm_fp4_records_moe(
     the hidden size receives its leading columns. Per token ``fc2_input_out`` receives GEMM2's
     input as on SM100."""
     x, x_scale, pt = a["hidden_states"], a["hidden_states_scale"], a["per_token_scale"]
-    if x_scale is not None and "hidden_states_scale_layout" in a:  # as on SM100
-        resolve_moe_act_sf_layout(a["hidden_states_scale_layout"])
     s1, s_gate, s2 = (
         a[f"output{i}_scalar"] for i in ("1_scale", "1_scale_gate", "2_scale")
     )
     act, finalize = ActivationType(a["activation_type"]), a["do_finalize"]
     fp8 = x.dtype == torch.float8_e4m3fn  # MXFP8 (with x_scale) or FP8 per tensor
     codes, w4a4 = x.dtype != torch.bfloat16, x_scale is not None and not fp8
+    if codes and x_scale is not None and "hidden_states_scale_layout" in a:  # SM100's
+        resolve_moe_act_sf_layout(a["hidden_states_scale_layout"])
     nv = codes and not fp8  # NVFP4 codes
     tokens, hidden = x.shape[0], x.shape[1] * (2 if nv else 1)
     inter, out, fo = (a[n] for n in ("intermediate_size", "output", "fc2_input_out"))
