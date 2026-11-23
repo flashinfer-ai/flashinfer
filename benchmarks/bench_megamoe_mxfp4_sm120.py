@@ -353,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-tokens-per-expert",
         type=int,
-        default=16,
+        default=32,
         help="nosync: NosyncOptions.max_tokens_per_expert (larger calls run the --fallback backend)",
     )
     parser.add_argument(
