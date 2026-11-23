@@ -1041,7 +1041,7 @@ def nvfp4_compute_output_scale_rn(
             ],
             """
             {
-                .reg .pred p_zero, p_pos, p_lo, p_hi;
+                .reg .pred p_zero, p_pos, p_fin, p_fin_pos, p_lo, p_hi;
                 .reg .b16 fp8_pair;
                 .reg .b32 h2_32;
                 .reg .b16 h_lo, h_hi;
@@ -1058,14 +1058,16 @@ def nvfp4_compute_output_scale_rn(
                 selp.f32 k, 0f33800000, 0f3F800000, p_hi;
                 selp.f32 k, 0f4B800000, k, p_lo;
                 setp.gt.f32 p_pos, $2, 0f00000000;
+                setp.lt.f32 p_fin, $2, 0f7F800000;
+                and.pred p_fin_pos, p_pos, p_fin;
                 mul.rn.f32 sa, $2, k;
-                selp.f32 sa, sa, 0f3F800000, p_pos;
+                selp.f32 sa, sa, 0f3F800000, p_fin_pos;
                 rcp.approx.ftz.f32 r, sa;
                 neg.f32 neg_sa, sa;
                 fma.rn.f32 err, neg_sa, r, 0f3F800000;
                 fma.rn.f32 r, err, r, r;
                 mul.rn.f32 r, r, k;
-                selp.f32 rcp_gs, r, 0f00000000, p_pos;
+                selp.f32 rcp_gs, r, 0f00000000, p_fin_pos;
 
                 mul.rn.f32 product, scale_f32, rcp_gs;
 
@@ -1075,8 +1077,10 @@ def nvfp4_compute_output_scale_rn(
                 selp.f32 k, 0f33800000, 0f3F800000, p_hi;
                 selp.f32 k, 0f4B800000, k, p_lo;
                 setp.gt.f32 p_pos, product, 0f00000000;
+                setp.lt.f32 p_fin, product, 0f7F800000;
+                and.pred p_fin_pos, p_pos, p_fin;
                 mul.rn.f32 sa, product, k;
-                selp.f32 sa, sa, 0f3F800000, p_pos;
+                selp.f32 sa, sa, 0f3F800000, p_fin_pos;
                 rcp.approx.ftz.f32 r, sa;
                 neg.f32 neg_sa, sa;
                 fma.rn.f32 err, neg_sa, r, 0f3F800000;
@@ -1084,6 +1088,7 @@ def nvfp4_compute_output_scale_rn(
                 mul.rn.f32 r, r, k;
                 mov.b32 max_f32, 0x7F7FFFFF;
                 min.f32 r, r, max_f32;
+                selp.f32 r, r, 0f00000000, p_fin;
                 selp.f32 result, r, max_f32, p_pos;
 
                 setp.eq.f32 p_zero, $3, 0f00000000;

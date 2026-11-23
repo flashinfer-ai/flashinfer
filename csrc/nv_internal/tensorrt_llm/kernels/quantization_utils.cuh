@@ -264,13 +264,15 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
 
 // Branchless 1-step Newton-Raphson refinement of `rcp.approx.ftz.f32` with exponent rescaling:
 // 0-ULP bit-identical to `__fdiv_rn(1.0f, a)` for all finite positive FP32 values including
-// FTZ-sensitive subnormals (`< 2^-126`) and `> 2^126` inputs, without emitting `div.rn.f32`.
+// FTZ-sensitive subnormals (`< 2^-126`) and `> 2^126` inputs, returning `0.0f` for `+inf`
+// or non-positive inputs without emitting `div.rn.f32`.
 inline __device__ float reciprocal_nr_ftz(float a) {
+  bool const finite_pos = a > 0.0f && a < __int_as_float(0x7F800000);
   float const k = a < 0x1p-120f ? 0x1p+24f : (a > 0x1p+120f ? 0x1p-24f : 1.0f);
-  float const sa = a > 0.0f ? __fmul_rn(a, k) : 1.0f;
+  float const sa = finite_pos ? __fmul_rn(a, k) : 1.0f;
   float r = reciprocal_approximate_ftz(sa);
   r = __fmaf_rn(__fmaf_rn(-sa, r, 1.0f), r, r);
-  return a > 0.0f ? __fmul_rn(r, k) : 0.0f;
+  return finite_pos ? __fmul_rn(r, k) : 0.0f;
 }
 
 __device__ __forceinline__ float mx_quantize_mul(float a, float b) {
