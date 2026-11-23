@@ -262,14 +262,15 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
   return b;
 }
 
-// Branchless 1-step Newton-Raphson refinement of `rcp.approx.ftz.f32`:
-// 0-ULP bit-identical to `__fdiv_rn(1.0f, a)` across all finite positive E4M3 scales
-// and normal-range FP32 scale products, avoiding full IEEE division latency.
+// Branchless 1-step Newton-Raphson refinement of `rcp.approx.ftz.f32` with exponent rescaling:
+// 0-ULP bit-identical to `__fdiv_rn(1.0f, a)` for all finite positive FP32 values including
+// FTZ-sensitive subnormals (`< 2^-126`) and `> 2^126` inputs, without emitting `div.rn.f32`.
 inline __device__ float reciprocal_nr_ftz(float a) {
-  float const sa = a > 0.0f ? a : 1.0f;
+  float const k = a < 0x1p-120f ? 0x1p+24f : (a > 0x1p+120f ? 0x1p-24f : 1.0f);
+  float const sa = a > 0.0f ? __fmul_rn(a, k) : 1.0f;
   float r = reciprocal_approximate_ftz(sa);
   r = __fmaf_rn(__fmaf_rn(-sa, r, 1.0f), r, r);
-  return a > 0.0f ? r : 0.0f;
+  return a > 0.0f ? __fmul_rn(r, k) : 0.0f;
 }
 
 __device__ __forceinline__ float mx_quantize_mul(float a, float b) {
@@ -748,7 +749,9 @@ cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, flo
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
     // Match TE's encode scale: 1 / (fp32(fp8(SFValue)) * reciprocalSFScaleVal).
-    outputScale = vecMax != 0 ? reciprocal_nr_ftz(SFValue * reciprocalSFScaleVal) : 0.0f;
+    float const prod = SFValue * reciprocalSFScaleVal;
+    outputScale =
+        vecMax != 0 ? (prod > 0.0f ? fminf(reciprocal_nr_ftz(prod), FLT_MAX) : FLT_MAX) : 0.0f;
   } else {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.

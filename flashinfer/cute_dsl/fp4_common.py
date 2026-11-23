@@ -1026,9 +1026,10 @@ def nvfp4_compute_output_scale_rn(
 ) -> Float32:
     """Compute TE-exact NVFP4 output scale when FP4 quant fast math is disabled.
 
-    Uses a branchless 1-step Newton-Raphson refinement of `rcp.approx.ftz.f32`,
-    which is 0-ULP bit-identical to `div.rn.f32(1.0, x)` for normal-range positive
-    scales while avoiding full IEEE division latency.
+    Uses branchless exponent-rescaled 1-step Newton-Raphson refinement of
+    `rcp.approx.ftz.f32`, which is 0-ULP bit-identical to `div.rn.f32(1.0, x)`
+    across all finite positive FP32 values (including FTZ-sensitive subnormals
+    and `> 2^126` operands) without emitting `div.rn.f32`.
     """
     return Float32(
         llvm.inline_asm(
@@ -1040,37 +1041,50 @@ def nvfp4_compute_output_scale_rn(
             ],
             """
             {
-                .reg .pred p_zero, p_gs_pos, p_prod_pos;
+                .reg .pred p_zero, p_pos, p_lo, p_hi;
                 .reg .b16 fp8_pair;
                 .reg .b32 h2_32;
                 .reg .b16 h_lo, h_hi;
-                .reg .f32 scale_f32, s_gs, neg_s_gs, r_gs, err_gs, rcp_gs;
-                .reg .f32 product, s_prod, neg_s_prod, r_prod, err_prod, result, max_f32;
+                .reg .f32 scale_f32, k, sa, neg_sa, r, err, rcp_gs, product, result, max_f32;
 
                 cvt.u16.u32 fp8_pair, $1;
                 cvt.rn.f16x2.e4m3x2 h2_32, fp8_pair;
                 mov.b32 {h_lo, h_hi}, h2_32;
                 cvt.f32.f16 scale_f32, h_lo;
 
-                setp.gt.f32 p_gs_pos, $2, 0f00000000;
-                selp.f32 s_gs, $2, 0f3F800000, p_gs_pos;
-                rcp.approx.ftz.f32 r_gs, s_gs;
-                neg.f32 neg_s_gs, s_gs;
-                fma.rn.f32 err_gs, neg_s_gs, r_gs, 0f3F800000;
-                fma.rn.f32 r_gs, err_gs, r_gs, r_gs;
-                selp.f32 rcp_gs, r_gs, 0f00000000, p_gs_pos;
+                // Stage 1: branchless exponent-rescaled NR rcp(global_scale)
+                setp.lt.f32 p_lo, $2, 0f03800000;
+                setp.gt.f32 p_hi, $2, 0f7B800000;
+                selp.f32 k, 0f33800000, 0f3F800000, p_hi;
+                selp.f32 k, 0f4B800000, k, p_lo;
+                setp.gt.f32 p_pos, $2, 0f00000000;
+                mul.rn.f32 sa, $2, k;
+                selp.f32 sa, sa, 0f3F800000, p_pos;
+                rcp.approx.ftz.f32 r, sa;
+                neg.f32 neg_sa, sa;
+                fma.rn.f32 err, neg_sa, r, 0f3F800000;
+                fma.rn.f32 r, err, r, r;
+                mul.rn.f32 r, r, k;
+                selp.f32 rcp_gs, r, 0f00000000, p_pos;
 
                 mul.rn.f32 product, scale_f32, rcp_gs;
 
-                setp.gt.f32 p_prod_pos, product, 0f00000000;
-                selp.f32 s_prod, product, 0f3F800000, p_prod_pos;
-                rcp.approx.ftz.f32 r_prod, s_prod;
-                neg.f32 neg_s_prod, s_prod;
-                fma.rn.f32 err_prod, neg_s_prod, r_prod, 0f3F800000;
-                fma.rn.f32 r_prod, err_prod, r_prod, r_prod;
+                // Stage 2: branchless exponent-rescaled NR rcp(product)
+                setp.lt.f32 p_lo, product, 0f03800000;
+                setp.gt.f32 p_hi, product, 0f7B800000;
+                selp.f32 k, 0f33800000, 0f3F800000, p_hi;
+                selp.f32 k, 0f4B800000, k, p_lo;
+                setp.gt.f32 p_pos, product, 0f00000000;
+                mul.rn.f32 sa, product, k;
+                selp.f32 sa, sa, 0f3F800000, p_pos;
+                rcp.approx.ftz.f32 r, sa;
+                neg.f32 neg_sa, sa;
+                fma.rn.f32 err, neg_sa, r, 0f3F800000;
+                fma.rn.f32 r, err, r, r;
+                mul.rn.f32 r, r, k;
                 mov.b32 max_f32, 0x7F7FFFFF;
-                min.f32 r_prod, r_prod, max_f32;
-                selp.f32 result, r_prod, max_f32, p_prod_pos;
+                min.f32 r, r, max_f32;
+                selp.f32 result, r, max_f32, p_pos;
 
                 setp.eq.f32 p_zero, $3, 0f00000000;
                 selp.f32 $0, 0f00000000, result, p_zero;
