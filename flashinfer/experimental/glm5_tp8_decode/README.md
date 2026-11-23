@@ -1,6 +1,6 @@
 # Experimental GLM-5 TP8 decode
 
-Owner: Long Cheng (@thynics). Tracking issue: flashinfer-ai/flashinfer#TBD.
+Owner: Long Cheng (@thynics). Tracking issue: flashinfer-ai/flashinfer#9869.
 
 Status: experimental API and experimental backend, JIT-only. Calling an API in
 `flashinfer.glm5_tp8_decode` is the opt-in; no environment variable is
