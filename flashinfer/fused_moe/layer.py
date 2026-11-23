@@ -235,12 +235,27 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
 }
 
 
-def _stream_capturing() -> bool:
-    """Whether the current CUDA stream is capturing a graph."""
+def _stream_capturing(device: Optional[torch.device] = None) -> bool:
+    """Whether the current CUDA stream of ``device`` is capturing a graph.
+
+    ``torch.cuda.is_current_stream_capturing()`` reads the current device's
+    stream, so a capture on ``device`` while another device is current is
+    read under ``torch.cuda.device(device)``. ``None`` (or a device without
+    an index) means the current device.
+    """
+    index = getattr(device, "index", None)
     try:
-        return bool(torch.cuda.is_current_stream_capturing())
-    except RuntimeError:  # no CUDA in this build
+        if index is None or index == torch.cuda.current_device():
+            return bool(torch.cuda.is_current_stream_capturing())
+        with torch.cuda.device(index):
+            return bool(torch.cuda.is_current_stream_capturing())
+    except (RuntimeError, AssertionError):  # no CUDA in this build
         return False
+
+
+def _tuner_op(runner: Any) -> str:
+    """The autotuner op name under which ``runner``'s tactics are tuned."""
+    return f"moe_{runner.backend_key}"
 
 
 class NoEligibleBackend(RuntimeError):
@@ -261,11 +276,13 @@ class _PreferredWinner(tuple):
 
 class _CaptureWinner(tuple):
     """A cached ``(runner, tactic)`` winner taken inside a CUDA-graph capture,
-    where nothing is timed: the first of several candidates, untimed.
+    where nothing is timed, tuned or precompiled: the first candidate, untimed,
+    with the tactic the autotuner already has for it (else the fallback).
 
     It unpacks and compares like the plain tuple; the type only marks the
-    entry, so the next call of that bucket outside a capture selects again,
-    timing the candidates.
+    entry, so the next call of that bucket outside a capture selects again:
+    it tunes the tactic, times the candidates and precompiles the bucket's
+    variants, with one candidate as with several.
     """
 
     __slots__ = ()
@@ -285,6 +302,10 @@ class MoELayer:
     >>> layer = MoELayer(config)
     >>> out = layer(act_pack, weight_pack)
     """
+
+    # Set by __init__; a layer built without it checks capture on the current
+    # device.
+    device: Optional[torch.device] = None
 
     @flashinfer_api
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
@@ -452,14 +473,18 @@ class MoELayer:
         included, and a bucket whose winner was taken untimed is selected
         again.
 
-        Nothing is timed inside a CUDA-graph capture (timing synchronizes the
-        device): a cached winner is replayed, and a first call of a bucket
-        takes the first eligible candidate in configured order untimed,
-        leaving out runners that serve captured calls only for winners
-        selected eagerly (``capture_requires_eager_selection``). The next call
-        of that bucket outside a capture selects again among every eligible
-        candidate. Select before capture (an eager call per captured token
-        count) so that a graph records the selected winner.
+        Nothing is timed, tuned or precompiled inside a CUDA-graph capture
+        (each synchronizes the device), also under ``autotune(True)``. A cached
+        winner is replayed. A first call of a bucket takes the first eligible
+        candidate in configured order untimed, leaving out runners that serve
+        captured calls only for winners selected eagerly
+        (``capture_requires_eager_selection``), with the tactic the autotuner
+        already has for it, else the fallback tactic. The next call of that
+        bucket outside a capture selects again among every eligible candidate,
+        even when there is only one, so that it is tuned and precompiled then.
+        Select before capture (an eager call per captured token count) so that
+        a graph records the selected winner. Capture is checked on the layer's
+        device.
 
         Parameters
         ----------
@@ -505,7 +530,7 @@ class MoELayer:
         winner_key = (bucket, mode, eligible)
         winner = self._winners.get(winner_key)
         pool = eligible
-        if winner is None and len(eligible) > 1 and _stream_capturing():
+        if winner is None and len(eligible) > 1 and _stream_capturing(self.device):
             # A miss inside a CUDA-graph capture selects without the runners that
             # serve captured calls only for winners timed eagerly (see
             # _select_winner). Key that selection by the pool it chose from, never
@@ -684,7 +709,7 @@ class MoELayer:
         with a single candidate (never timed against another) and inside a
         CUDA-graph capture (see ``_select_winner``).
         """
-        if len(runners) < 2 or self._autotuning() or _stream_capturing():
+        if len(runners) < 2 or self._autotuning() or _stream_capturing(self.device):
             return None
         for runner in runners:
             if getattr(runner, "prefer_when_accepted", False):
@@ -703,9 +728,9 @@ class MoELayer:
         backend.
         """
         if isinstance(winner, _CaptureWinner):
-            return not _stream_capturing()
+            return not _stream_capturing(self.device)
         if isinstance(winner, _PreferredWinner):
-            return self._autotuning() and not _stream_capturing()
+            return self._autotuning() and not _stream_capturing(self.device)
         return False
 
     def _select_winner(
@@ -716,36 +741,42 @@ class MoELayer:
     ) -> Tuple[_RunnerT, Any]:
         """Tune each runner, then select by packing + forward GPU latency.
 
-        Inside a CUDA-graph capture nothing is timed: the first of several
-        candidates is returned untimed, as a ``_CaptureWinner``.
+        Inside a CUDA-graph capture nothing is timed, tuned or precompiled:
+        the first candidate is returned untimed, with its tactic looked up
+        (``_capture_tactic``), as a ``_CaptureWinner``.
         """
+        if _stream_capturing(self.device):
+            # A winner-cache miss inside a CUDA-graph capture, where nothing
+            # that synchronizes the device may run: timing the candidates,
+            # profiling a tactic (also under autotune(True)) or precompiling
+            # the bucket's variants. Runners that serve captured calls only for
+            # winners timed eagerly (the specialized backend) step aside, and
+            # the first remaining candidate in configured order is taken
+            # untimed. It is marked, with one candidate as with several, so
+            # that __call__ selects the bucket again on its next call outside
+            # a capture, which tunes, times and precompiles it.
+            runner = next(
+                (
+                    r
+                    for r in runners
+                    if not getattr(r, "capture_requires_eager_selection", False)
+                ),
+                runners[0],
+            )
+            inputs = runner.pack_inputs(act_pack, weight_pack)
+            return _CaptureWinner((runner, self._capture_tactic(runner, inputs)))
+
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
         best_inputs: Optional[List[torch.Tensor]] = None
-
-        capture_pick = False
-        if len(runners) > 1 and _stream_capturing():
-            # A winner-cache miss inside a CUDA-graph capture, where timing the
-            # candidates (it synchronizes the device) is not allowed. Runners
-            # that serve captured calls only for winners timed eagerly (the
-            # specialized backend) step aside, and the first remaining
-            # candidate in configured order is taken untimed; __call__ selects
-            # the bucket again on its next call outside a capture.
-            runners = [
-                r
-                for r in runners
-                if not getattr(r, "capture_requires_eager_selection", False)
-            ] or runners
-            capture_pick = len(runners) > 1
-            runners = runners[:1]
 
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
             launch_kwargs = runner.launch_kwargs_for(inputs)
             # Per-runner tactic selection via autotuner
             _, tactic = self.tuner.choose_one(
-                custom_op=f"moe_{runner.backend_key}",
+                custom_op=_tuner_op(runner),
                 runners=[runner],
                 tuning_config=runner.tuning_config_for(inputs),
                 inputs=inputs,
@@ -789,9 +820,44 @@ class MoELayer:
             # autotune bucket. Compile them as part of selecting that bucket's
             # winner so ordinary serving calls need no separate warmup API.
             precompile(best_inputs, best_tactic)
-        if capture_pick:
-            return _CaptureWinner((best_runner, best_tactic))
         return best_runner, best_tactic
+
+    def _capture_tactic(self, runner: _RunnerT, inputs: List[torch.Tensor]) -> Any:
+        """``runner``'s tactic for ``inputs`` inside a CUDA-graph capture.
+
+        It is looked up as ``AutoTuner.choose_one`` does outside
+        ``autotune(True)``: with the active ``autotune()`` overrides and
+        measurement policy applied, the cached tactic, else the fallback
+        (``-1``). It never profiles, also under ``autotune(True)``, where
+        ``choose_one`` would profile on a cache miss and the autotuner refuses
+        profiling during a capture. ``is_tuning_mode`` is left as it is: it is
+        process-wide.
+        """
+        tuner = self.tuner
+        custom_op = _tuner_op(runner)
+        if custom_op in tuner._effective_skip_ops:
+            return -1
+        tuning_config = runner.tuning_config_for(inputs)
+        with tuner._lock:
+            if (
+                tuner._override_tuning_buckets is not None
+                or tuner._override_round_up
+                or tuner._override_cuda_graph_profile_replays is not None
+            ):
+                tuning_config = tuner._apply_tuning_overrides(tuning_config)
+            measure_policy = tuner._effective_measure_policy
+            if measure_policy is not None:
+                tuning_config = tuner._apply_measure_policy(
+                    tuning_config, measure_policy
+                )
+            _, _, tactic, _ = tuner.search_cache(
+                custom_op,
+                [runner],
+                tuple(tuner._get_input_sizes(inputs)),
+                tuning_config,
+                inputs=inputs,
+            )
+        return tactic
 
     # ---- Introspection helpers ---------------------------------------------
 
