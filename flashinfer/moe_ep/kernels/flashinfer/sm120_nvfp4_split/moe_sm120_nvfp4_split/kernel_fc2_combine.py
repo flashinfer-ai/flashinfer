@@ -741,7 +741,10 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Optional weight L2 prefetch: two 128 B lines per lane, `ahead` K tiles
                     # ahead, every second tile (compiled out when weight_prefetch_ahead=0).
-                    if cutlass.const_expr(getattr(self, "weight_prefetch_ahead", 0) > 0):
+                    # The prefetch is off on 3-stage K2 pipelines: with weight tiles arriving
+                    # from L2 a stage could be refilled before the slowest compute warp
+                    # finished it (intermittent wrong rows at DSv4.1 EP4 T7/T16).
+                    if cutlass.const_expr(getattr(self, "weight_prefetch_ahead", 0) > 0 and self.num_ab_stage < 3):
                         if (k_tile % 2 == 0) and (k_tile + getattr(self, "weight_prefetch_ahead", 0) < k_tile_cnt):
                             for prefetch_half in cutlass.range_constexpr(2):
                                 prefetch_row = mma_tile_m * self.mma_tiler[0] + cute.arch.lane_idx() + prefetch_half * 32
