@@ -31,3 +31,19 @@ def gen_norm_module() -> JitSpec:
         ],
         extra_cuda_cflags=nvcc_flags,
     )
+
+
+def gen_norm_serve_sm90_module() -> JitSpec:
+    """SM90 serve-shape RMSNorm specialist (bf16 2D, H in {512, 2048, 6144}).
+
+    Built lazily, and only when the dispatch guard in
+    flashinfer/norm/kernels/rmsnorm_serve_sm90.py selects the ``cuda``
+    backend; the stock norm module is unaffected.
+    """
+    return gen_jit_spec(
+        "norm_serve_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "norm_serve_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "flashinfer_norm_serve_sm90_binding.cu",
+        ],
+    )
