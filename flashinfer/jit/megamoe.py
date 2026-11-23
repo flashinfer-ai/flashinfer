@@ -377,7 +377,7 @@ def gen_megamoe_sm90_transport_module() -> JitSpec:
     csrc = _csrc_dir()
     include, library = _nccl_paths()
     return gen_jit_spec(
-        "megamoe_sm90_transport",
+        "megamoe_sm90_transport_v2",
         [csrc / "megamoe_sm90_transport.cu"],
         extra_include_paths=[csrc, jit_env.FLASHINFER_CSRC_DIR, include],
         extra_cuda_cflags=["-std=c++20", "--expt-relaxed-constexpr"],

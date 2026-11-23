@@ -147,8 +147,9 @@ int64_t megamoe_sm90_transport_alloc_window(int64_t handle, int64_t bytes) {
   w.bytes = static_cast<size_t>((bytes + NCCL_WIN_REQUIRED_ALIGNMENT - 1) /
                                 NCCL_WIN_REQUIRED_ALIGNMENT * NCCL_WIN_REQUIRED_ALIGNMENT);
   check_nccl(ncclMemAlloc(&w.pointer, w.bytes), "ncclMemAlloc");
+  const int flags = NCCL_WIN_COLL_SYMMETRIC | (s.has_dev_comm ? NCCL_WIN_STRICT_ORDERING : 0);
   const ncclResult_t registered =
-      ncclCommWindowRegister(s.comm, w.pointer, w.bytes, &w.window, NCCL_WIN_COLL_SYMMETRIC);
+      ncclCommWindowRegister(s.comm, w.pointer, w.bytes, &w.window, flags);
   if (registered != ncclSuccess) {
     ncclMemFree(w.pointer);
     TVM_FFI_ICHECK(false) << "ncclCommWindowRegister failed: " << ncclGetErrorString(registered)
