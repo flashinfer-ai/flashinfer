@@ -18,6 +18,8 @@ with UlyssesCommunicator(group, max_bytes=3 * q.nbytes, dtype=q.dtype,
     encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
     # The framework calls the appropriate Sage2 kernel with encoded fields.
     # Its full [B,P*L,H/P,D] output uses encoded.input_dtype and a zero tail.
+    # On the multi-rank PCIe backend gather_heads also needs out= from
+    # comm.allocate_output(attention, "gather_heads") (see ulysses_pcie.md).
     local_output = comm.gather_heads(sage_adapter(encoded))
 ```
 
@@ -71,7 +73,9 @@ into its landing buffer; the
 lifetime, stream and failure contract. On NCCL/NVLink, only chunk exchange
 supports overriding the communicator dtype, including `torch.uint8`; dtype
 selection never performs quantization or conversion.
-All operations are serialized on the current stream. There is no ordinary
+All operations are serialized on the current stream; on the PCIe hybrid and
+all-RDMA routes the pre-exchange vote alone runs on an internal stream that
+the host synchronizes before the exchange. There is no ordinary
 floating `scatter_qkv` mode, automatic workspace cache or Sage package dependency.
 
 Validation is owned by the public entry point. The prepared communicator checks

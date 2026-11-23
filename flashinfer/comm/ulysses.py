@@ -402,6 +402,12 @@ class UlyssesQKVWorkspace:
             values["_vote_stream"] = (
                 torch.cuda.Stream(device=owner.device) if rdma else None
             )
+            if rdma:
+                # The flag is written on the vote stream from now on; order
+                # that after its allocation and zero fill on this stream.
+                values["_vote_stream"].wait_stream(
+                    torch.cuda.current_stream(owner.device)
+                )
         for name, value in values.items():
             object.__setattr__(workspace, name, value)
         return workspace
@@ -2371,11 +2377,13 @@ class UlyssesCommunicator:
         the exchange. Both rules are checked before any work is enqueued, and
         a rejection there is an ordinary error on the RDMA routes. Because
         those routes wait for every peer in an unbounded barrier, they also
-        vote over NCCL just before the exchange: a failure on any rank after
-        admission raises on every rank before any of them enters it, and the
-        communicator stays OPEN. On the all-P2P route, a rejection or failure
-        before this rank enqueues its exchange leaves the communicator BROKEN,
-        as for the backend's other collectives.
+        vote over NCCL just before the exchange, on an internal stream the
+        host synchronizes: a failure on any rank after admission, including
+        allocating the outputs when ``out`` is ``None``, raises on every rank
+        before any of them enters the barrier, and the communicator stays
+        OPEN. On the all-P2P route, a rejection or failure before this rank
+        enqueues its exchange leaves the communicator BROKEN, as for the
+        backend's other collectives.
 
         Parameters
         ----------
@@ -2406,8 +2414,10 @@ class UlyssesCommunicator:
         from . import _ulysses_lowp as lowp
 
         try:
-            result = self._admit_scatter_qkv(q, k, v, workspace, out, lowp)
-            stats = self._quantize_and_exchange_qkv(q, k, v, workspace, lowp)
+            out = self._admit_scatter_qkv(q, k, v, workspace, out, lowp)
+            result, stats = self._quantize_and_exchange_qkv(
+                q, k, v, workspace, out, lowp
+            )
         except Exception as e:  # noqa: BLE001
             if self.backend == "pcie" and self.world_size > 1:
                 # Until this rank has enqueued its exchange, a peer may already
@@ -2434,8 +2444,12 @@ class UlyssesCommunicator:
                 )
         return result
 
-    def _admit_scatter_qkv(self, q, k, v, workspace, out, lowp) -> UlyssesQKV:
-        """Every scatter_qkv check, decided before any work is enqueued."""
+    def _admit_scatter_qkv(self, q, k, v, workspace, out, lowp) -> Optional[UlyssesQKV]:
+        """Every scatter_qkv check, decided before any work is enqueued.
+
+        Returns the validated ``out``; a ``None`` output is allocated later,
+        inside the failure handling of _quantize_and_exchange_qkv.
+        """
         self._require_open("scatter_qkv")
         if (
             not isinstance(workspace, UlyssesQKVWorkspace)
@@ -2479,16 +2493,20 @@ class UlyssesCommunicator:
                     "QKV workspace buffers must not overlap inputs or one another"
                 )
             checked_ranges.append((start, end))
-        result = self._prepare_qkv_out(workspace, out, checked_ranges, lowp)
+        if out is not None:
+            out = self._prepare_qkv_out(workspace, out, checked_ranges, lowp)
         if self.backend == "pcie" and not self._pcie_capturing():
             # The statistics AllGather runs first, and once a rank has
             # enqueued collective work it has no rank-local way back. The
             # exchange itself binds the stream.
             self._pcie_check_stream(bind=False)
-        return result
+        return out
 
-    def _quantize_and_exchange_qkv(self, q, k, v, workspace, lowp):
-        """Statistics, quantization and the payload exchange; returns stats."""
+    def _quantize_and_exchange_qkv(self, q, k, v, workspace, out, lowp):
+        """Outputs, statistics, quantization and the payload exchange.
+
+        Returns ``(outputs, stats)``.
+        """
         layout = workspace._layout_impl
         vote = workspace._exchange_vote
         stage = "stats"
@@ -2496,6 +2514,10 @@ class UlyssesCommunicator:
         stats = None
         with torch.cuda.device(self.device):
             try:
+                if out is None:
+                    # Allocated here rather than at admission: it can fail on
+                    # one rank alone, which the vote must see.
+                    out = self._prepare_qkv_out(workspace, None, [], lowp)
                 with torch.cuda.nvtx.range("lowp_local_stats"):
                     send, ctx = lowp._local_stats_impl(
                         q,
@@ -2555,7 +2577,7 @@ class UlyssesCommunicator:
                 self._exchange_qkv_payload(
                     workspace._send_buffer, workspace._recv_buffer
                 )
-        return stats
+        return out, stats
 
     def _vote_before_rdma_exchange(
         self, workspace: UlyssesQKVWorkspace, failure: Optional[Exception]
@@ -2563,10 +2585,10 @@ class UlyssesCommunicator:
         """Agree on success before any rank enters the RDMA opening barrier.
 
         That barrier waits for every peer without a deadline, while a failure
-        between admission and the exchange (an allocation in the statistics
-        or quantizer, say) is rank-local. Every rank therefore raises here,
-        before entering it, so no peer is left waiting and the communicator
-        stays OPEN.
+        between admission and the exchange (allocating the outputs, or an
+        allocation in the statistics or quantizer, say) is rank-local. Every
+        rank therefore raises here, before entering it, so no peer is left
+        waiting and the communicator stays OPEN.
 
         Every failure the vote reports is raised on the host while the
         statistics and quantizer kernels are enqueued, so the vote need not
@@ -2579,10 +2601,11 @@ class UlyssesCommunicator:
             vote.fill_(0 if failure is None else 1)
             dist.all_reduce(vote, op=dist.ReduceOp.MAX, group=self.group)
             failed = vote.item()
-        if not failed:
-            return
+        # The local failure decides for this rank whatever the vote read.
         if failure is not None:
             raise failure
+        if not failed:
+            return
         raise RuntimeError(
             "scatter_qkv failed on a peer rank before the PCIe exchange; "
             "no rank entered it"
