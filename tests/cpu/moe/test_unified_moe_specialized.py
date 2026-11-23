@@ -33,6 +33,7 @@ from flashinfer.fused_moe import (
     SpecializedMoEConfig,
     SwiGLU,
 )
+from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe import api as moe_api
 from flashinfer.fused_moe import layer as layer_module
 from flashinfer.fused_moe.backends import specialized
@@ -408,33 +409,61 @@ def _bench_outside_capture(monkeypatch, capturing, cost=None):
         return [cost(runner) if cost else float(len(timed))]
 
     monkeypatch.setattr("flashinfer.testing.utils.bench_gpu_time", bench)
-    monkeypatch.setattr(layer_module, "_stream_capturing", lambda: capturing[0])
+    monkeypatch.setattr(
+        layer_module, "_stream_capturing", lambda device=None: capturing[0]
+    )
     return timed
+
+
+def _stub_tuner():
+    """An ``AutoTuner`` (so ``MoELayer``'s capture-time lookup runs on the real
+    override state) whose ``choose_one`` and ``search_cache`` are stubs.
+
+    ``choose_one`` returns the fallback tactic and records, in ``tuned``, each
+    runner it would profile under ``autotune(True)``; like the real one, it
+    refuses to profile inside a CUDA-graph capture. ``search_cache`` records
+    each lookup in ``looked_up`` and returns the tactic in ``cached`` (else the
+    fallback)."""
+    tuner = AutoTuner()
+    tuner.tuned, tuner.looked_up, tuner.cached = [], [], {}
+
+    def choose_one(custom_op, runners, tuning_config, inputs, **kwargs):
+        if tuner.is_tuning_mode:
+            assert not layer_module._stream_capturing(), (
+                "a tactic was profiled inside a CUDA-graph capture"
+            )
+            tuner.tuned.append(runners[0].backend_key)
+        return runners[0], -1
+
+    def search_cache(custom_op, runners, input_shapes, tuning_config, inputs=None):
+        tuner.looked_up.append(runners[0].backend_key)
+        tactic = tuner.cached.get(runners[0].backend_key)
+        return tactic is not None, 0, -1 if tactic is None else tactic, None
+
+    tuner.choose_one = choose_one
+    tuner.search_cache = search_cache
+    return tuner
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("others", [1, 2])
 def test_capture_miss_leaves_the_specialized_backend_out(monkeypatch, others):
     """A winner-cache miss inside a CUDA-graph capture (e.g. an admission whose
-    winner selection failed or was evicted) times nothing: the specialized
-    backend steps aside and the first other candidate is taken untimed, marked
-    so that the next call outside a capture selects again."""
+    winner selection failed or was evicted) times and tunes nothing: the
+    specialized backend steps aside and the first other candidate is taken
+    untimed with its cached tactic, marked so that the next call outside a
+    capture selects again, with one other candidate as with several."""
     runner, _, act, weights = _stub_binding(monkeypatch)
     plain = [_plain_runner(f"plain{i}") for i in range(others)]
     timed = _bench_outside_capture(monkeypatch, [True])
-
-    def choose_one(custom_op, runners, tuning_config, inputs, **kwargs):
-        assert runners[0] is not runner, "the specialized backend was tuned"
-        return runners[0], 3
-
-    layer = SimpleNamespace(tuner=SimpleNamespace(choose_one=choose_one))
+    layer = _cpu_layer(runner, *plain)
+    layer.tuner.cached["plain0"] = 3
     candidates = [runner, *plain]
 
     winner = MoELayer._select_winner(layer, act, weights, candidates)
     assert winner == (plain[0], 3) and timed == []
-    # one other candidate is the selection of the reduced pool; of several,
-    # the first was taken without timing
-    assert isinstance(winner, layer_module._CaptureWinner) == (others > 1)
+    assert layer.tuner.looked_up == ["plain0"] and layer.tuner.tuned == []
+    assert isinstance(winner, layer_module._CaptureWinner)
     assert SpecializedMoERunner.capture_requires_eager_selection is True
 
 
@@ -468,13 +497,7 @@ def _cpu_layer(*runners):
     layer._tuning_runner_ids = list(range(len(runners)))
     layer._winners = OrderedDict()
     layer._last_winner_backend = None
-    layer.tuner = SimpleNamespace(
-        is_tuning_mode=False,
-        choose_one=lambda custom_op, runners, tuning_config, inputs, **kw: (
-            runners[0],
-            -1,
-        ),
-    )
+    layer.tuner = _stub_tuner()
     return layer
 
 
@@ -534,6 +557,105 @@ def test_capture_pick_is_selected_again_outside_capture(monkeypatch):
 
     capturing[0] = True
     assert layer(act, None) == "fast" and len(timed) == 2
+
+
+@pytest.mark.cpu_only
+def test_capture_is_checked_on_the_layer_device(monkeypatch):
+    """A capture on the layer's device is seen while another device is
+    current: a winner-cache miss times nothing and caches a capture pick, and
+    the next call outside the capture selects the bucket again."""
+    real_stream_capturing = layer_module._stream_capturing
+    timed = _bench_outside_capture(monkeypatch, [False], _cost)
+    monkeypatch.setattr(layer_module, "_stream_capturing", real_stream_capturing)
+    current = [0]  # device 0 is current; device 1 is capturing
+    capturing_devices = {1}
+
+    class _device:
+        def __init__(self, index):
+            self.index = index
+
+        def __enter__(self):
+            self.previous, current[0] = current[0], self.index
+
+        def __exit__(self, *exc):
+            current[0] = self.previous
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "device", _device)
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: current[0] in capturing_devices,
+    )
+    assert real_stream_capturing(torch.device("cuda", 1))
+    assert not real_stream_capturing(torch.device("cuda", 0))
+    assert not real_stream_capturing() and current[0] == 0
+
+    layer = _cpu_layer(_layer_runner("slow", cost=2.0), _layer_runner("fast", 1.0))
+    layer.device = torch.device("cuda", 1)
+    act = SimpleNamespace(routing_input_mode=RoutingInputMode.FromLogits, num_tokens=6)
+
+    assert layer(act, None) == "slow" and timed == []
+    assert [type(w) for w in layer._winners.values()] == [layer_module._CaptureWinner]
+
+    capturing_devices.clear()
+    assert layer(act, None) == "fast" and timed == ["slow", "fast"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("candidates", [1, 2])
+def test_capture_miss_under_autotune_does_not_profile(monkeypatch, candidates):
+    """Under ``autotune(True)`` a winner-cache miss inside a capture neither
+    profiles a tactic (the autotuner refuses that during a capture) nor times a
+    candidate, with one candidate as with several: it looks the tactic up. The
+    next call outside the capture tunes the bucket and times its candidates."""
+    runners = [_layer_runner("slow", cost=2.0), _layer_runner("fast", cost=1.0)]
+    layer = _cpu_layer(*runners[:candidates])
+    layer.tuner.is_tuning_mode = True  # flashinfer.autotune(True)
+    capturing = [True]
+    timed = _bench_outside_capture(monkeypatch, capturing, _cost)
+    act = SimpleNamespace(routing_input_mode=RoutingInputMode.FromLogits, num_tokens=6)
+
+    assert layer(act, None) == "slow"
+    assert timed == [] and layer.tuner.tuned == []
+    assert layer.tuner.looked_up == ["slow"]
+    assert all(type(w) is layer_module._CaptureWinner for w in layer._winners.values())
+
+    capturing[0] = False
+    names = [r.backend_key for r in runners[:candidates]]
+    assert layer(act, None) == names[-1]
+    assert layer.tuner.tuned == names
+    assert timed == (names if candidates > 1 else [])
+    assert layer(act, None) == names[-1] and layer.tuner.tuned == names  # cached
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("candidates", [1, 2])
+def test_capture_miss_does_not_precompile(monkeypatch, candidates):
+    """A runner's ``_precompile_bucket_variants`` (it synchronizes the device)
+    is not called by a winner-cache miss inside a capture, with one candidate
+    as with several. The next call outside the capture selects the bucket again
+    and calls it once, and later calls (a capture included) reuse that."""
+    capturing = [True]
+    compiled = []
+
+    def precompile(inputs, tactic):
+        assert not capturing[0], "bucket variants precompiled inside a capture"
+        compiled.append((inputs, tactic))
+
+    runners = [_layer_runner("first", cost=1.0), _layer_runner("second", cost=2.0)]
+    for runner in runners:
+        runner._precompile_bucket_variants = precompile
+    layer = _cpu_layer(*runners[:candidates])
+    timed = _bench_outside_capture(monkeypatch, capturing, _cost)
+    act = SimpleNamespace(routing_input_mode=RoutingInputMode.FromLogits, num_tokens=6)
+
+    assert layer(act, None) == "first" and compiled == [] and timed == []
+    capturing[0] = False
+    assert layer(act, None) == "first" and compiled == [(["first"], -1)]
+    assert layer(act, None) == "first" and len(compiled) == 1
+    capturing[0] = True
+    assert layer(act, None) == "first" and len(compiled) == 1
 
 
 def _preferred_runner(name, cost):
