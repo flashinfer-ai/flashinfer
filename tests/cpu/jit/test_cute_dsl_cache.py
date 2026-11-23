@@ -789,7 +789,14 @@ def test_wrapper_forwards_explicit_arch(monkeypatch):
 
     class RecordingSpec:
         def __init__(
-            self, module_name, kernel_name, compile_fn, source_sha256, arch=None
+            self,
+            module_name,
+            kernel_name,
+            compile_fn,
+            source_sha256,
+            *,
+            arch=None,
+            **_options,
         ):
             captured["arch"] = arch
 

@@ -2162,7 +2162,14 @@ def test_sm120_warm_probe_declines_a_missing_input(name):
     _skip_if_not_sm120()
     inputs = _make_inputs_sm120(seq_lens=[16], num_heads=4, packed=False, seed=SEED)
     inputs[name] = None
-    with pytest.raises(ValueError, match=f"{name} must be a contiguous CUDA"):
+    # K and V may be token-strided views, so their rejection names the dtype
+    # and device; G must still be contiguous.
+    expected = (
+        "g must be a contiguous CUDA"
+        if name == "g"
+        else f"{name} must be a CUDA bfloat16 tensor"
+    )
+    with pytest.raises(ValueError, match=expected):
         _call(inputs, backend="cute-dsl", output=torch.empty_like(inputs["q"]))
 
 
@@ -2438,8 +2445,9 @@ def test_recurrent_kda_prefill_sm120_variants_match_reference(variant, packed, s
     [([2057], 12, False), ([2048, 64], 6, True)],
     ids=["fixed-T2057", "packed-2048-64"],
 )
+@pytest.mark.parametrize("strided", [False, True])
 def test_recurrent_kda_prefill_sm120_decomp_cp_async_producer_matches_reference(
-    seq_lens, num_heads, packed
+    seq_lens, num_heads, packed, strided
 ):
     """Long sequences reach the decomposed recurrence's ``cp.async`` producer.
 
@@ -2448,6 +2456,11 @@ def test_recurrent_kda_prefill_sm120_decomp_cp_async_producer_matches_reference(
     ``CP_ASYNC_MIN_CHUNKS`` chunks, which no shorter case in this file reaches.
     T=2057 ends in a partial chunk; ``[2048, 64]`` puts one sequence on each
     side of the chunk threshold in a single launch, so both producers run.
+
+    ``strided`` passes Q/K/V as views of one packed QKV buffer whose gaps hold
+    NaN.  The ``cp.async`` producer reads V by element index rather than
+    through its descriptor, so it has to follow V's token stride; reading V as
+    if it were contiguous would land in K's columns or the NaN padding.
     """
     _skip_if_not_sm120()
     sm120_prefill = _sm120_prefill()
@@ -2467,9 +2480,16 @@ def test_recurrent_kda_prefill_sm120_decomp_cp_async_producer_matches_reference(
         initial_state=True,
         seed=SEED,
     )
+    if strided:
+        from tests.kda.test_helpers.kda_prefill import _strided_qkv
+
+        inputs.update(_strided_qkv(inputs, independent=False))
+        assert inputs["v"].stride(1) > num_heads * HEAD_DIM
     expected_out, expected_state = _reference_kda_prefill(inputs)
 
-    out = torch.empty_like(inputs["v"])
+    out = torch.empty(
+        inputs["v"].shape, dtype=inputs["v"].dtype, device=inputs["v"].device
+    )
     state = inputs["initial_state"]
     sm120_prefill.run_kda_prefill_sm120(
         q=inputs["q"],
