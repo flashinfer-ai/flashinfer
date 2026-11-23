@@ -60,9 +60,9 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
     EP8 needs the second setting (DSV4-Flash, 128 tokens per rank: 11 ms all-P2P, 0.75 ms).
 
     ``tokens_per_item`` is the number of tokens one work item multiplies per weight load (8,
-    16, 24 or 32). ``None`` picks 16 when this rank's routed rows per local expert
-    (``tokens * top_k / local_experts``) reach 3, else 8 (measured with cold L2 on RTX 6000D).
-    Set it explicitly after sweeping a deployment's shapes.
+    16, 24 or 32). ``None`` picks by this rank's routed rows per local expert
+    (``tokens * top_k / local_experts``): 8 below 3, 16 below 8, else 32 (measured with cold L2
+    on RTX 6000D). Set it explicitly after sweeping a deployment's shapes.
     """
 
     intermediate_size: int

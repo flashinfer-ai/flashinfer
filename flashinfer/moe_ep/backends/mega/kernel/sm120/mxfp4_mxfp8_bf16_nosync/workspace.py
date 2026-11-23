@@ -30,6 +30,7 @@ import torch
 
 ERROR_INDEX = 3
 EPOCH_INDEX = 5
+FLAG_INDEX = 8  # kCtrFlag: per kind, the epoch whose flags from every rank arrived
 _CTR_SLOT = 14
 # GIN contexts (queue-pair sets): CTAs spread their puts over them; on RTX 6000D EP8 four beat one
 # (1.8 vs 2.5 ms at 128 tokens per rank) and sixteen added signal-poll cost at small batches.
@@ -39,13 +40,13 @@ GIN_CONTEXTS = 4
 def counter_ints(wide: bool = False) -> int:
     """The kernel's counter block (sm120_mxfp4_mega_moe.cuh kCtrInts: per-call counters, per-expert
     and per-tile counts, GIN signal totals; error word at 3) in the default or the 32-rank build:
-    1592 or 4424 ints. The launcher checks the layout leaves this much room."""
+    1596 or 4428 ints. The launcher checks the layout leaves this much room."""
     max_world = 32 if wide else 8
     max_local = 2048 // max_world
     max_tiles = (
         max_local + max_world * 128
     )  # kMaxTiles: 128 tokens per rank, top-8, 8 per tile
-    return 8 + max_local + max_tiles + 2 * max_world + 4 * max_world
+    return 12 + max_local + max_tiles + 2 * max_world + 4 * max_world
 
 
 def _align(value: int, alignment: int) -> int:
@@ -70,10 +71,11 @@ def buffer_layout(
     """Byte offsets of the symmetric buffer, in the order the binding reads them:
     [total, x, x_sf, topk_idx, topk_weights, pool, recv_cnt, recv_flag, comb, comb_flag,
     route, route_flag, inter, inter_s, ctr, stage_row, inbox, stage_comb, comb_gin, slotmap,
-    stage_slot, cidx]. Every region sits at the same offset on every rank; pool / recv_* /
-    route* are written by the other ranks, comb by the expert ranks, the rest only locally.
-    The last seven regions (empty without NIC pairs) serve GIN, which sends a token once per
-    rank: the token row staged for and received from GIN ranks, the partials staged for and
+    stage_slot, cidx, stage_route]. Every region sits at the same offset on every rank; pool /
+    recv_* / route* are written by the other ranks, comb by the expert ranks, the rest only
+    locally. route holds, per source rank, its routes to each local expert and the number of its
+    tokens routed here. The last eight regions (empty without NIC pairs) serve GIN, which sends a token once per
+    rank: the token rows staged for (packed per GIN rank) and received from GIN ranks, the partials staged for and
     received from GIN ranks, the slot tables received from and staged for GIN ranks (both
     packed in the expert rank's (local expert, slot) order), and the packed row of each
     (token, k)). ``wide``: the layout of the 32-rank kernel build (a larger counter block)."""
@@ -92,18 +94,19 @@ def buffer_layout(
         ranks * 4,
         capacity * topk * hidden * 2,
         ranks * 4,
-        2 * ranks * (1 + capacity * topk) * 4,  # two halves, by epoch parity
+        2 * ranks * (epr + 1) * 4,  # two halves, by epoch parity
         ranks * 4,
         rows * intermediate,
         rows * (intermediate // 128) * 4,
         counter_ints(wide) * 4,
-        capacity * row_bytes if gin else 0,
+        ranks * capacity * row_bytes if gin else 0,
         ranks * capacity * row_bytes if gin else 0,
         ranks * capacity * topk * hidden * 2 if gin else 0,
         ranks * capacity * topk * hidden * 2 if gin else 0,
         ranks * capacity * topk * 4 if gin else 0,
         ranks * capacity * topk * 4 if gin else 0,
         capacity * topk * 4 if gin else 0,
+        ranks * (epr + 1) * 4 if gin else 0,
     )
     offsets, cursor = [], 0
     for size in sizes:
@@ -345,8 +348,9 @@ class NosyncWorkspace:
         ranks wrote here. Tests use it to cross the epoch's wrap; every rank calls it between
         calls (no kernel in flight), then the EP group synchronizes."""
         value = (epoch + 2**31) % 2**32 - 2**31  # the int32 with these 32 bits
-        ctr = self._view(_CTR_SLOT, (EPOCH_INDEX + 1,), torch.int32)
+        ctr = self._view(_CTR_SLOT, (FLAG_INDEX + 3,), torch.int32)
         ctr[EPOCH_INDEX] = value
+        ctr[FLAG_INDEX : FLAG_INDEX + 3] = value  # the local copies of the peers' flags
         # recv_flag, comb_flag, route_flag: one int per source rank
         for slot in (7, 9, 11):
             self._view(slot, (self.world_size,), torch.int32).fill_(value)

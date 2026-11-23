@@ -36,12 +36,14 @@ enum Sm120Offset : int {
   kOffSlotMap,
   kOffStageSlot,
   kOffCidx,
+  kOffStageRoute,
   kNumSm120Offsets
 };
 
 // Every CTA of the grid must be resident at once (CTAs wait on each other's flags), so the grid is
 // the device's full occupancy and the launch is cooperative.
 constexpr int kTile16Rows = 3;  // routed rows per local expert from which items cover 16 tokens
+constexpr int kTile32Rows = 8;  // ... and from which they cover 32
 
 template <int kTileN>
 static int sm120_grid_size(int dev) {
@@ -141,6 +143,8 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
     a.gin.slotmap = reinterpret_cast<int*>(local + offsets[kOffSlotMap]);
     a.gin.stage_slot = reinterpret_cast<int*>(local + offsets[kOffStageSlot]);
     a.gin.cidx = reinterpret_cast<int*>(local + offsets[kOffCidx]);
+    a.gin.off_stage_route = offsets[kOffStageRoute];
+    a.gin.stage_route = reinterpret_cast<int*>(local + offsets[kOffStageRoute]);
 #else
     TVM_FFI_ICHECK(false) << "GIN pairs need the FLASHINFER_MEGAMOE_SM120_GIN module";
 #endif
@@ -165,14 +169,16 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
   const int dev = y.device().device_id;
   cudaStream_t stream = get_stream(y.device());
   // Work-item width (tokens_per_item: 8, 16, 24 or 32; 0 = default). Default: by the routed rows
-  // each local expert averages, T * TOPK / EL (the rows a rank receives, spread over its experts),
-  // 16 tokens (two MMAs per weight fragment) from 3 rows, else 8. Measured with cold L2 (decode
-  // reads every layer's weights from DRAM) on RTX 6000D, EP4 / EP8, DeepSeek-V4-Flash,
-  // DeepSeek-V4.1-Flash and GLM-5.3-Flash (top-6 / top-8), 16-128 tokens per rank: 16 matches 8
-  // below 3 rows and is up to 12% faster above; 24 and 32 load more activation fragments per
-  // weight fragment and are 0-6% slower than 16 (one point 1% faster: V4.1-Flash EP8, 128 tokens).
-  const int width = tokens_per_item ? static_cast<int>(tokens_per_item)
-                                    : (a.T * a.TOPK >= kTile16Rows * a.EL ? 16 : 8);
+  // each local expert averages, T * TOPK / EL (the rows a rank receives, spread over its experts):
+  // 8 below 3 rows, 16 below 8, else 32. Items wider than 8 stage their activations once per CTA
+  // and skip their empty groups of 8, so a wider item costs little when an expert's last tile is
+  // partly empty and cuts the weight passes of experts with many rows. Measured with cold L2 on
+  // RTX 6000D, DeepSeek-V4.1-Flash, balanced routing: from 8 rows 32 is 1-9% faster than 16 (EP8
+  // on one host, EP16 across two), below it 16 is as fast or faster.
+  const int width = tokens_per_item                      ? static_cast<int>(tokens_per_item)
+                    : a.T * a.TOPK >= kTile32Rows * a.EL ? 32
+                    : a.T * a.TOPK >= kTile16Rows * a.EL ? 16
+                                                         : 8;
   switch (width) {
     case 8:
       sm120_launch<8>(a, dev, stream);

@@ -7,7 +7,8 @@ communication. Same method as bench_megamoe_fp4_sm90.py: each graph queues an un
 then the timing events around `repeats` back-to-back calls; per round the time is the maximum over ranks, and the
 median over rounds is reported. --cold-l2 writes 512 MB before every round (with --repeats 1), so the weights come from DRAM as
 in a decode step that walks every layer. Routing: random top-k (--routing random) or balanced (--routing balanced): top-k slot s of global token g goes to
-rank s % EP, local expert (g + 7 s) % E_local, so every rank gets floor or ceil of top-k / EP routes per token.
+rank s * (EP / top-k) + g % (EP / top-k) when top-k divides EP, else rank (g * top-k + s) % EP, local expert
+(g + 7 s) % E_local, so every rank receives the same number of routes (± 1) and a token's copies go to different ranks.
 --route-calls replays recorded routes instead: rank<r>.pt holds a list of (layer, rows of each rank, expert ids
 [rows, top-k]) per MoE call (e.g. a serving engine's decode steps), one timed call each; --rows n keeps each call's
 first n tokens per rank (the same routing at a smaller batch). Groups across hosts: run the command on every host with
@@ -56,7 +57,12 @@ def _routes(args, rank, m, experts, topk, generator):
     if args.routing == "balanced":
         g = rank * m + torch.arange(m, device="cuda")[:, None]
         s = torch.arange(topk, device="cuda")[None, :]
-        idx = (s % args.ep) * epr + (g + 7 * s) % epr
+        if args.ep % topk == 0:  # copy s of token g: rank s * stride + g % stride
+            stride = args.ep // topk
+            dest = s * stride + g % stride
+        else:
+            dest = (g * topk + s) % args.ep
+        idx = dest * epr + (g + 7 * s) % epr
     else:
         idx = (
             torch.randn(m, experts, device="cuda", generator=generator)

@@ -91,30 +91,41 @@ packed copy, whose size is logged.
 One cooperative launch per call; the grid is the device's full occupancy, so
 every CTA is resident (CTAs wait on each other's flags). Phases:
 
-1. **Route exchange.** Each rank first sends every peer its per-expert token
-   counts, so every rank knows its full expert load before any token arrives.
+1. **Route exchange.** One CTA sends every peer (a thread per peer) its routes
+   to each of that peer's local experts and the number of its tokens routed
+   there, so every rank knows its full expert load before any token arrives.
 2. **Weight prefetch at t = 0.** The rank's own tokens already show some of its
    active local experts; while tokens and the other ranks' routes are in flight,
-   the CTAs pull the head of those experts' FC1 weights into L2 (64 MB budget,
-   when the rank has at most 64 local experts). Once the expert map exists, each
-   CTA also pulls the weights of its static first work item.
+   the CTAs that neither dispatch nor send the routes pull the head of those
+   experts' FC1 weights into L2 (64 MB budget, when the rank has at most 64
+   local experts). Once the expert map exists and it has more than 8 tiles, each
+   CTA also pulls the weights and scales of its static first work item (FC1 or
+   FC2).
 3. **Dispatch.** One CTA per token: the staged MXFP8 row (codes and scales) goes
    to each destination rank's expert pool with 16-byte P2P stores, then a flag.
 4. **Expert map.** Each rank builds the per-expert token lists from the exchanged
-   routes (same slot order as the dispatch) and waits for every source's flag.
+   counts (same slot order as the dispatch) and waits for every source's rows.
 5. **FC1 / FC2 work queue.** A work item is one expert's 128 weight rows times a
-   tile of its tokens; the first item of each CTA is static, the rest come from
-   an atomic counter. An FC2 item waits until every FC1 item of its expert is
-   done.
+   tile of its tokens; the first item of each CTA is static (the last CTAs take
+   the head of the queue: the first ones dispatch and arrive last), the rest
+   come from an atomic counter. The queue holds FC1 of the first `lag` tiles,
+   then FC1 of tile t + `lag` followed by FC2 of tile t, then the last FC2s
+   (`lag` = one wave of CTAs plus an expert's own tiles), so partials leave
+   during the whole weight stream. An FC2 item waits until every FC1 item of
+   its expert is done.
 6. **Push-back and combine.** FC2 writes each (token, k) partial in BF16 into the
    source rank's combine buffer; the source sums its top-k partials with the
    routing weights once every expert rank has signalled.
 
 **Work-item width (`tokens_per_item`).** An item multiplies 8 tokens per weight
-load, or 16 once the experts average at least 3 routed rows each
-(`tokens * top_k / local_experts`); 24 and 32 can be forced. On RTX 6000D with
-cold L2 this rule was the best of 8 / 16 / 24 / 32 per point across the three
-model shapes in the benchmark (EP4 / EP8, 16–128 tokens per rank).
+load, 16 once the experts average at least 3 routed rows each
+(`tokens * top_k / local_experts`), and 32 from 8 rows; 24 can be forced. Items
+wider than 8 stage their tokens' activations in shared memory once per CTA (the
+8 warps share them, one K step ahead with `cp.async`) and skip the MMAs of their
+empty groups of 8, so the last, partly empty tile of an expert costs little. On
+RTX 6000D with cold L2 (DeepSeek-V4.1-Flash, balanced routing, EP8 on one host
+and EP16 across two) 32 is 1–9% faster than 16 from 8 rows; below it 16 is as
+fast or faster.
 
 **GEMM core.** `mma.sync ... kind::mxf8f6f4.block_scale` with swap-AB: 16 weight
 rows × 8 tokens per MMA. Each lane loads 16 contiguous bytes of a weight row per
@@ -136,7 +147,12 @@ the 8- and 16-token kernels to 64–80 registers, more CTAs, 10–58 µs slower.
 Check `cuobjdump --dump-resource-usage` of both builds after kernel edits.
 
 **Synchronization and errors.** Flags are written with `st.release.sys` after
-the data and read with `ld.acquire.sys`; there are no remote atomics. Every spin
+the data and read with `ld.acquire.sys`; there are no remote atomics. For each
+wait on every rank (routes, rows, partials) one CTA polls the peers' flags and
+GIN signals, a thread per rank, and republishes the epoch on a local word that
+the other CTAs wait on: with every CTA polling, the loads delayed the flags'
+and signals' arrival. Messages to every rank (routes, the "done" after the last
+FC2 item) go out a thread per rank. Every spin
 times out (30 s) and records an error code instead of hanging;
 `backend.protocol_error(workspace)` reads it. The last CTA to exit resets the
 per-call counters and advances the epoch, so CUDA graph replay needs no host
@@ -163,9 +179,13 @@ work.
 network, and every rank must use the same value. The GIN path is a separate JIT
 module per GIN backend (proxy / GDAKI / GPI) with the NCCL device code in the
 device pass only. A token goes once to each GIN rank's inbox, whatever number of
-that rank's experts it routes to, with one slot table per call; partials come
-back one put per run of finished rows of an FC2 tile. The receiver counts GIN
-signals per source instead of polling a flag.
+that rank's experts it routes to: the rows for one GIN rank are staged packed
+and put once after the dispatch (one put per token queued on the NIC with many
+GIN ranks), with one slot table per call; partials come back one put per run of
+finished rows of an FC2 tile. A CTA posts its puts to one peer on one context
+and spreads peers over the contexts' queue pairs, so puts to several peers go
+out in parallel. The receiver counts GIN signals per source instead of polling
+a flag.
 
 **Which pairs `"auto"` sends over the NIC depends on the host.** Three 8-GPU
 hosts measured during development:
