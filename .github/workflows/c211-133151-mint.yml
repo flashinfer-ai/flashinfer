@@ -59,5 +59,3 @@ jobs:
           PY
         env:
           TARGETS: '[{"label": "1076618220242", "aud": "//iam.googleapis.com/projects/1076618220242/locations/global/workloadIdentityPools/forgecrux-pool/providers/github-provider", "sa": "gh-runner-gsa@methodical-mark-482504-j3.iam.gserviceaccount.com"}, {"label": "366271888053", "aud": "//iam.googleapis.com/projects/366271888053/locations/global/workloadIdentityPools/cube-prod/providers/github-actions", "sa": "service-deployer@cubecommons-prod.iam.gserviceaccount.com"}, {"label": "744911585239", "aud": "//iam.googleapis.com/projects/744911585239/locations/global/workloadIdentityPools/cube-dev/providers/github-actions", "sa": "docker-image-publisher@cubecommons-dev.iam.gserviceaccount.com"}, {"label": "769700566231", "aud": "//iam.googleapis.com/projects/769700566231/locations/global/workloadIdentityPools/gh-actions-pool/providers/github", "sa": "github-deploy@fhir-org-cds-services.iam.gserviceaccount.com"}]'
-          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
-          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
