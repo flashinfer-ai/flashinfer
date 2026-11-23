@@ -143,30 +143,18 @@ def test_full_prefill_contract_rejections(monkeypatch, change):
 
 
 @pytest.mark.parametrize("dim", [128, 256])
-@pytest.mark.parametrize(
-    "version,base,width,expected",
-    [
-        ("1.32.3", True, True, False),
-        ("1.33.0rc1", True, True, False),
-        ("1.33.0", True, True, True),
-        ("1.33.0+local", True, True, True),
-        ("1.33.0", False, True, False),
-        ("invalid", True, True, False),
-    ],
-)
-def test_full_prefill_release_gate(monkeypatch, dim, version, base, width, expected):
-    monkeypatch.setattr(cp, "cudnn", SimpleNamespace(__version__=version))
+@pytest.mark.parametrize("base", [False, True])
+def test_full_prefill_runtime_gate(monkeypatch, dim, base):
     monkeypatch.setattr(cp, "_cudnn_supports_paged_auto", lambda: base)
-    monkeypatch.setattr(cp, "_cudnn_supports_paged_gqa_auto", lambda d: width)
+    monkeypatch.setattr(cp, "_cudnn_supports_paged_gqa_auto", lambda d: True)
     cp._cudnn_supports_paged_full_prefill_auto.cache_clear()
     try:
-        assert cp._cudnn_supports_paged_full_prefill_auto(dim) is expected
+        assert cp._cudnn_supports_paged_full_prefill_auto(dim) is base
     finally:
         cp._cudnn_supports_paged_full_prefill_auto.cache_clear()
 
 
 def test_full_prefill_d256_keeps_native_guard(monkeypatch):
-    monkeypatch.setattr(cp, "cudnn", SimpleNamespace(__version__="1.33.0"))
     monkeypatch.setattr(cp, "_cudnn_supports_paged_auto", lambda: True)
     monkeypatch.setattr(cp, "_cudnn_supports_paged_gqa_auto", lambda d: False)
     cp._cudnn_supports_paged_full_prefill_auto.cache_clear()

@@ -3734,7 +3734,8 @@ def test_clc_program_matches_the_reference_and_its_static_program(pdl, monkeypat
     cell launches its ``_clc`` program on 4096 CTAs.  Every token's output matches the FP32
     reference (``out`` starts as NaN, so a token no CTA computed fails), and the output and the
     updated prefix equal, bit for bit, those of the program without the suffix launched on its own
-    one-CTA-per-SM grid from the same state."""
+    one-CTA-per-SM grid from the same state.  sm_100a at 152 SMs (GB200) has no ``_clc`` route for
+    the cell: it runs the program without the suffix, which the test checks before it skips."""
     device, arch = _device_arch()
     M, K = 4096, 6
     sm_count = cb.sm_count_for(device)
@@ -3742,6 +3743,18 @@ def test_clc_program_matches_the_reference_and_its_static_program(pdl, monkeypat
         pytest.skip("the _clc cells are routed at 148 and 152 SMs")
     if not cb.generated_program_available(device, M, K, enable_pdl=pdl):
         pytest.skip("program not registered for this cell")
+    if not (
+        (sm_count == SM_COUNT and (M, K) in _CLC_CELLS[arch])
+        or (arch == "sm_103a" and sm_count == 152 and (M, K) in _ROUND_31_CLC_CELLS_152)
+    ):
+        # sm_100a at 152 SMs (GB200): no route table moves the cell to its _clc program, so it
+        # keeps the static program on its one-CTA-per-SM grid
+        plan = plan_route(arch, sm_count, M, K, pdl)
+        assert plan.kernel_key == _CLC_KEYS[K].removesuffix("_clc"), plan
+        assert plan.grid_x == sm_count and plan.fallback_from is None, plan
+        pytest.skip(
+            f"{arch} at {sm_count} SMs (GB200) routes the cell to its static program"
+        )
     inputs = _make_inputs(M, K)
     pristine = _clone(inputs)
     expected = _clone(inputs)

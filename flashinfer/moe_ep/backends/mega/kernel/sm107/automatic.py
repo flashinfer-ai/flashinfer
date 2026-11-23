@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     import torch
 
     from flashinfer.autotuner import TuningContext
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledSymmBuffer,
         TransformedBlockScaledWeights,
     )
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 def tuning_context() -> TuningContext:
     from flashinfer.autotuner import AutoTuner
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE,
         validate_context,
     )
@@ -51,7 +51,7 @@ def needs_selection(
 
 
 def tuning_identity(context: TuningContext) -> tuple:
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_measurement import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_measurement import (
         measurement_settings,
     )
 
@@ -144,7 +144,7 @@ def prepare_auto_configuration(
     if not select:
         record_prepared(state, context)
         return
-    from .....kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         KNOB_KEYS,
         sm107_candidates,
     )
@@ -189,7 +189,7 @@ def prepare_auto_configuration(
         record_prepared(state, context)
         return
     if winner is None and state.winner is not None:
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             _prepare_collectively,
         )
 
@@ -212,7 +212,7 @@ def prepare_auto_configuration(
 
 
 def ep_tuning_contract(backend, fleet_params):
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
 
     cfg = backend._resolved_config(fleet_params)
     return {
@@ -254,7 +254,7 @@ def ep_tuning_contract(backend, fleet_params):
 
 def ep_selected_config(backend, workspace):
     import dataclasses
-    from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
 
     return dataclasses.replace(
         backend._kernel_config,
@@ -266,8 +266,8 @@ def ep_selected_config(backend, workspace):
 def ep_force_tune(backend, workspace, tensors, weights, output):
     from flashinfer.autotuner import AutoTuner
     from .forward_tuning import ForwardExecution
-    from .....kernel_src.sm107.next_cutedsl_megamoe import sm107_candidates
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import sm107_candidates
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE,
         RubinTuningProtocol,
     )

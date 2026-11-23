@@ -10663,3 +10663,41 @@ def test_attention_ts_decode_large_grouped_nvfp4_grid(queries: int, page: int):
         seq_len_q=queries,
         page_size=page,
     )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(("seq_len_q", "num_qo_heads"), ((8, 128), (4, 256)))
+def test_attention_ts_decode_fp8_q128_streamed_swaps_causal(
+    monkeypatch, seq_len_q: int, num_qo_heads: int
+):
+    """FP8 Swaps Q128 streams Q32 score bands and masks only boundary tiles.
+
+    Unaligned causal lengths put per-row causal ends inside one K tile, so
+    both the masked and the skipped per-band branches run.
+    """
+    case = _make_decode_case(
+        kv_lens=(1000, 2055, 4099, 3001),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=8,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=32,
+        qkv_dtype=_FP8,
+        out_dtype=torch.bfloat16,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=921121,
+    )
+    policy = _exercise_explicit_profile_case(
+        monkeypatch,
+        case,
+        {
+            "use_keeps_mma_ab": False,
+            "tile_size_q": 128,
+            "tile_size_kv": 128,
+            "use_persistent_scheduler": False,
+        },
+    )
+    assert policy["mma_variant"] == "swaps_mma_ab"
+    assert (policy["tile_size_q"], policy["num_insts_kv"]) == (128, 1)

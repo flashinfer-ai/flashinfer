@@ -74,6 +74,56 @@ class SplitTrial:
         return self.selected, self.scores[self.selected]
 
 
+@pytest.mark.parametrize("hidden", [3072, 3584])
+@pytest.mark.parametrize("version", ["0.2.0", "0.3.0"])
+def test_auto_preflight_uses_loaded_nccl_ep_version(monkeypatch, hidden, version):
+    import sys
+    from types import ModuleType
+
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep import BootstrapConfig, FleetParams
+    from flashinfer.moe_ep.modes import auto_layer
+
+    device = torch.device("cuda", 0)
+
+    class Weights:
+        w13 = SimpleNamespace(
+            dtype=torch.bfloat16, device=device, ndim=3, shape=(2, 4, hidden)
+        )
+        w2 = SimpleNamespace(
+            dtype=torch.bfloat16, device=device, ndim=3, shape=(2, hidden, 2)
+        )
+
+    provider = ModuleType("nccl.ep")
+    provider.get_lib_version = lambda: version
+    package = ModuleType("nccl")
+    package.__path__ = []
+    package.ep = provider
+    monkeypatch.setitem(sys.modules, "nccl", package)
+    monkeypatch.setitem(sys.modules, "nccl.ep", provider)
+    monkeypatch.setattr(auto_layer, "ensure_moe_ep_cuda_device", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(auto_layer, "Collective", lambda _: LocalCollective())
+    monkeypatch.setattr(auto_layer, "UnquantizedMoEWeights", Weights)
+    monkeypatch.setattr(auto_layer, "validate_fleet_weights", lambda *args: None)
+    monkeypatch.setattr(moe_ep, "have_nccl_ep", lambda: True)
+    construct = Mock(side_effect=RuntimeError("reached split construction"))
+    monkeypatch.setattr(auto_layer, "MoEEpSplitLayer", construct)
+    expected = (
+        "reached split construction"
+        if version == "0.3.0"
+        else "No eligible EP candidate"
+    )
+    with pytest.raises((ValueError, RuntimeError), match=expected):
+        auto_layer.MoEEpAutoLayer(
+            BootstrapConfig(1, 0, auto_bootstrap=False),
+            FleetParams(2, 4, hidden),
+            Weights(),
+            AutoConfig((SplitConfig(comm="nccl_ep"),)),
+        )
+    assert construct.call_count == int(version == "0.3.0")
+
+
 @pytest.mark.parametrize("forced", [None, 0, 1])
 def test_explicit_candidates(forced):
     config = AutoConfig((MegaConfig(object()), SplitConfig()), candidate=forced)
@@ -533,7 +583,7 @@ def test_numerical_contract_covers_activation_recipe_and_combine(monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.automatic import (
         ep_tuning_contract,
     )
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledMoeConfig,
     )
     from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
@@ -1057,7 +1107,7 @@ def test_shared_stager_does_not_bootstrap_a_kernel_package():
                 )
                 staged = plan._stage(tensors)
                 assert (staged.topk_ids[1:] == -1).all()
-                assert "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" not in sys.modules
+                assert "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification" not in sys.modules
                 assert sys.modules["common"] is other
             """),
         ],

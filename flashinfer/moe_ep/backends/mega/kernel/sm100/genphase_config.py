@@ -87,7 +87,9 @@ class GenphaseConfigMixin(BlackwellEpTuningMixin):
 
     def _genphase_base_config(self, fleet_params):
         """Describe the EP workload before selecting performance knobs."""
-        from .....kernel_src.sm100.next_cutedsl_megamoe import Sm100GenphaseMoeConfig
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            Sm100GenphaseMoeConfig,
+        )
 
         k = self._config
         from .common.block_scaled_batch_invariant import (
@@ -117,7 +119,9 @@ class GenphaseConfigMixin(BlackwellEpTuningMixin):
         Automatic workspaces start from the capacity heuristic. Their v2
         selection uses the actual staged batch size during warmup or forward.
         """
-        from .....kernel_src.sm100.next_cutedsl_megamoe import resolve_genphase_knobs
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
+            resolve_genphase_knobs,
+        )
 
         try:
             base = self._genphase_base_config(fleet_params)
@@ -149,8 +153,8 @@ class GenphaseConfigMixin(BlackwellEpTuningMixin):
 
     def _check_genphase_selection(self, config):
         """Require identical configuration selection across EP ranks at allocation."""
-        # Selection is construction-time work; never inspect live routing on forward.
-        if self.ep_world_size > 1:
+        # Initial validation precedes bootstrap; workspace preparation checks again.
+        if self.ep_world_size > 1 and self._ep_comm_group is not None:
             import torch.distributed as dist
 
             proposal = dataclasses.asdict(config)

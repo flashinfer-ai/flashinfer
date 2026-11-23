@@ -90,6 +90,17 @@ from .support_spec import FIX_SCALE, Filters
 DRAW_SUPPORT_MODULE = "batch_invariant_sampling_draw_support"
 
 
+# PDL is the only runtime convenience argument of the truncated samplers' kernels (2026-11-19; the `griddepcontrol` instructions
+# are always emitted and inert without the launch attribute). Every other convenience dimension is compile-time, each for a
+# measured reason (the review of #9695): the INDEX GATHER as a runtime flag cost 50-90 registers on the 256-thread cluster picks
+# (the row base from a loaded index instead of the blockIdx-derived row: one CTA per SM fewer, 0.59-0.92x); the TEMPERATURE FORM
+# and the KEPT-SET LOG-PROBABILITY as runtime flags put the chain and the per-row scale into every logits kernel -- 122 -> 140-150
+# registers at the T256 C2 picks of 32769-65536 x 80-144 rows (0.6x), the `return_logprob` kernels 1.7-2.2x on B200, the plain
+# logits entry 2-8 % everywhere. The probability kernels have neither the temperature nor the kept chain: 2 variants per key
+# (the gather); the logits kernels 8. `return_logprob` adds the row-sum pass to the k-only / kept-shortcut forms and was never a
+# flag.
+
+
 class DrawSupportKernel:
     """The truncated draw for one ``Kp`` bucket (``N`` runtime): the input kind (logits / probabilities), the filter set
     (which of top-k / top-p / min-p are on, their order), the temperature form, with or without an index gather, the drawn
@@ -118,15 +129,21 @@ class DrawSupportKernel:
         assert early_finish in ("", "mass", "all")
         # the score form (``log_probs`` under the sampler's filters): the exact form's selection and kept mass, then the
         # given token's log-probabilities instead of a draw -- logits only, the kept-set value always, no stream, no gather
-        assert not score or (from_logits and return_kept_logprob and not has_indices), (
-            "the score form takes logits, returns the kept-set log-probability and gathers no source rows"
+        assert not score or (from_logits and not has_indices), (
+            "the score form takes logits (the kept-set log-probability is its output) and gathers no source rows"
         )
         self.score = score
+        self.has_indices, self.temp_rows = has_indices, temp_rows
+        self.return_kept_logprob = (
+            return_kept_logprob or score
+        )  # the score form's output is the kept-set value
         self.early_finish, self.study = early_finish, ""
-        self.return_kept_logprob = return_kept_logprob
         self.dtype, self.N, self.Kp, self.cfg = dtype, N, Kp, cfg
-        self.from_logits, self.filters, self.temp_rows = from_logits, filters, temp_rows
-        self.has_indices, self.return_logprob = has_indices, return_logprob
+        self.from_logits, self.filters, self.return_logprob = (
+            from_logits,
+            filters,
+            return_logprob,
+        )
         self.use_k, self.use_p, self.use_m = (
             filters.top_k is not None,
             filters.top_p is not None,
@@ -231,7 +248,7 @@ class DrawSupportKernel:
         M: Int64,
         Msrc: Int64,
         N: Int32,
-        enable_pdl: cutlass.Constexpr[bool],
+        enable_pdl: Int32,
         stream,
     ):
         k = self.kernel(
@@ -254,7 +271,6 @@ class DrawSupportKernel:
             M,
             Msrc,
             N,
-            enable_pdl,
             self._tv_layout(self.vec),
             (1, BLOCK),
         )
@@ -298,14 +314,12 @@ class DrawSupportKernel:
         M: Int64,
         Msrc: Int64,
         N: Int32,
-        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         fp = CuteF32
         bidx, _, _ = cute.arch.block_idx()
-        if enable_pdl:
-            cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # no effect unless the launch carried the PDL attribute (a runtime launch argument)
         W, C = self.W, self.C
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -322,8 +336,8 @@ class DrawSupportKernel:
         row = rg.to(Int64)
         row_ok = row < M
         row_c = _select(row_ok, row, M - 1)
-        # the source row (an index gather reads row indices[row])
-        src_ok = row_ok
+        # the source row (an index gather reads row indices[row]): a COMPILE-TIME variant -- see the module header
+        src_ok = row_ok  # the gather branch overrides it; a value before the staged regions below (the DSL needs one)
         if cutlass.const_expr(self.has_indices):
             src = mIdx[row_c]
             src_ok = (src >= 0) & (src < Msrc)
@@ -649,9 +663,9 @@ class DrawSupportKernel:
         else:
             tok = _select(first_tok >= Int32(0), first_tok, last_tok)
             s_ok = (mass > Float32(0.0)) & (mass < Float32(float("inf")))
-            valid = s_ok & (tok >= Int32(0))
-            if cutlass.const_expr(self.has_indices):
-                valid = valid & src_ok
+            valid = (
+                s_ok & (tok >= Int32(0)) & src_ok
+            )  # an index outside the source rows: an invalid output row
             token = _select(valid, tok, Int32(-1))
             lp = Float32(NAN)
             lpk = Float32(NAN)
@@ -680,8 +694,7 @@ class DrawSupportKernel:
                         if cutlass.const_expr(self.return_kept_logprob):
                             mLogpK[row] = lpk
         peers.finish()
-        if enable_pdl:
-            cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_launch_dependents()
 
 
 def _topk_threshold(k, rx, tid, lane, kk, peers, red):
@@ -860,13 +873,14 @@ def kernel_name(
     score: bool = False,
     count_list: Optional[bool] = None,
 ) -> str:
-    """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, temperature form, gather,
-    the two log-probabilities, pdl, the selection's placements, the score form)."""
+    """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, temperature form, the index
+    gather, the two log-probability outputs, the selection's placements, the score form); PDL is a runtime launch argument
+    (``enable_pdl`` is accepted and ignored)."""
     return jit.sanitize_symbol_name(
-        f"drawsup{'s' if score else ''}_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}_"
-        f"{'trow' if temp_rows else 'tconst'}{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}"
+        f"drawsup{'s' if score else ''}_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}"
+        f"_{'trow' if temp_rows else 'tconst'}{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}"
         f"{'_lpk' if return_kept_logprob else ''}"
-        f"_pdl{int(enable_pdl)}{f'_ef{early_finish}' if early_finish else ''}"
+        f"{f'_ef{early_finish}' if early_finish else ''}"
         f"{'' if count_list is None else ('_cl1' if count_list else '_cl0')}"
     )
 
@@ -886,30 +900,107 @@ def get_compiled_kernel(
     score: bool = False,
     count_list: Optional[bool] = None,
 ):
-    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, filter set,
-    temperature form, gather, the two log-probabilities, pdl, the placements, the score form); ``N``, ``M`` and the row
-    strides are runtime arguments."""
+    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, filter set, temperature
+    form, the index gather, the two log-probability outputs, the placements, the score form; the probability kernels have
+    neither the temperature nor the kept chain and key both False); ``N``, ``M``, the row strides and PDL are runtime
+    arguments (``enable_pdl`` is accepted and ignored here)."""
+    return _compile_bucket(
+        *_key(
+            dtype_str,
+            N,
+            cfg,
+            from_logits,
+            filters,
+            temp_rows,
+            has_indices,
+            return_logprob,
+            enable_pdl,
+            early_finish,
+            return_kept_logprob,
+            score,
+            count_list,
+        )
+    )
+
+
+def _key(
+    dtype_str,
+    N,
+    cfg,
+    from_logits,
+    filters,
+    temp_rows,
+    has_indices,
+    return_logprob,
+    enable_pdl,
+    early_finish="mass",
+    return_kept_logprob=False,
+    score=False,
+    count_list=None,
+):
+    """The compile key of the kernel serving ``N``: PDL is a runtime launch argument and leaves it; the probability kernels
+    have neither the temperature nor the kept chain, so those two dimensions are keyed False for them."""
     from .schedule import padded_blocks
 
-    return _compile_bucket(
+    return (
         dtype_str,
         padded_blocks(N),
         cfg,
         from_logits,
         filters,
-        temp_rows,
-        has_indices,
+        bool(temp_rows and from_logits),
+        bool(has_indices),
         return_logprob,
-        enable_pdl,
+        False,
         early_finish,
-        return_kept_logprob,
+        bool((return_kept_logprob or score) and from_logits),
         score,
         count_list,
     )
 
 
-@functools.cache
-def _compile_bucket(
+def precompile(
+    dtype_str: str,
+    N: int,
+    cfg: LSEConfig,
+    from_logits: bool,
+    filters: Filters,
+    temp_rows: bool,
+    has_indices: bool,
+    return_logprob: bool,
+    enable_pdl: bool,
+    early_finish: str = "mass",
+    return_kept_logprob: bool = False,
+    score: bool = False,
+    count_list: Optional[bool] = None,
+) -> None:
+    """Compile the kernel serving ``N`` into the on-disk cache without loading it, outside the op family's module lock
+    (:func:`jit.precompile`): what a precompile pool's worker calls. ``get_compiled_kernel`` holds the lock for the whole build
+    (concurrent processes missing the same kernel compile it once), so workers compiling different kernels of one family
+    through it would run serially."""
+    jit.precompile(
+        DRAW_SUPPORT_MODULE,
+        *_spec(
+            *_key(
+                dtype_str,
+                N,
+                cfg,
+                from_logits,
+                filters,
+                temp_rows,
+                has_indices,
+                return_logprob,
+                enable_pdl,
+                early_finish,
+                return_kept_logprob,
+                score,
+                count_list,
+            )
+        ),
+    )
+
+
+def _spec(
     dtype_str,
     Kp,
     cfg,
@@ -924,7 +1015,7 @@ def _compile_bucket(
     score=False,
     count_list=None,
 ):
-    """Compile, or load from the cache, the kernel of one Kp bucket and specialisation."""
+    """The cache object's name and the compile function of one Kp bucket and specialisation."""
     from ..fp_interface.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)
@@ -999,9 +1090,16 @@ def _compile_bucket(
             Int64(1),
             Int64(1),
             Int32(1),
-            enable_pdl,
+            Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
         )
 
-    return jit.build_and_load(DRAW_SUPPORT_MODULE, name, compile_fn)
+    return name, compile_fn
+
+
+@functools.cache
+def _compile_bucket(*key):
+    """Compile, or load from the cache, the kernel of one compile key (the serving path: the module lock is held for the
+    whole build)."""
+    return jit.build_and_load(DRAW_SUPPORT_MODULE, *_spec(*key))

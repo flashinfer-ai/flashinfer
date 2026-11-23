@@ -30,6 +30,13 @@ Every slot index must be unique and in range: a prefill checks it, a decode step
 host) does not: its kernel returns NaN rows for a sequence whose slot is outside the pool and writes nothing else for
 it, two sequences that name one slot in a step share its state (undefined rows for both), and its ``cu_seqlens`` are taken to be ``arange(N + 1)`` without being read. :func:`recurrent_kda_batch_invariant_reset` is the explicit reset of a recycled slot.
 
+Without ``initial_state`` the call is stateless (the form a trainer's forward pass takes): every sequence is whole and
+runs from the zero state through the pinned prefill kernel alone, also a sequence of one token, so no call shape is a
+decode step. The rows are the ones the pool calls return for the sequence (prefill, chunked prefill, decode); no state
+is read, written, kept or returned, and the rows carry no ``grad_fn``. ``ssm_state_indices`` and
+``output_final_state=True`` are refused with it. ``checkpoint_every_n_tokens=16`` makes it also write the state before
+every 16-token chunk of every sequence into ``state_checkpoints`` (bf16 or fp32), the series a backward reads.
+
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
 
@@ -192,6 +199,254 @@ def _pack(q, k, v, g, beta, H: int, HV: int) -> Tuple[torch.Tensor, ...]:
     return tuple(t if t.data_ptr() % 16 == 0 else t.clone() for t in rows)
 
 
+def _check_output(output: torch.Tensor, v: torch.Tensor) -> None:
+    if output.shape != v.shape or output.dtype != _IO or not output.is_contiguous():
+        raise unsupported(
+            CLASS,
+            "an output of another shape, dtype or layout than v",
+            "a contiguous bf16 [B, T, HV, 128] output",
+        )
+    if output.device != v.device:
+        raise unsupported(CLASS, "an output on another device", "the inputs' device")
+
+
+MAX_SEQUENCES = 65535
+
+_FIXED_LAYOUT: Dict[tuple, tuple] = {}
+
+
+def _fixed_layout(B, T, dev):
+    """Offsets, order and checkpoint starts of a ``[B, T]`` call, complete on the device before any stream sees them."""
+    key = (B, T, str(dev))
+    got = _FIXED_LAYOUT.get(key)
+    if got is None:
+        per = -(-T // CHUNK)
+        got = _FIXED_LAYOUT[key] = (
+            torch.arange(0, (B + 1) * T, T, dtype=torch.int64).to(dev),
+            torch.arange(B, dtype=torch.int32).to(dev),
+            torch.arange(0, (B + 1) * per, per, dtype=torch.int64).to(dev),
+        )
+    return got
+
+
+def _refuse_shared(buffer, others, what):
+    from ...kda_prefill import _storage_ranges_overlap
+
+    for t in others:
+        if t is not None and _storage_ranges_overlap(buffer, t):
+            raise unsupported(CLASS, what, "a buffer of its own")
+
+
+def _refuse_inference(buffer, name):
+    if buffer.is_inference() and not torch.is_inference_mode_enabled():
+        raise unsupported(
+            CLASS,
+            f"an inference tensor as {name} outside inference mode",
+            "a plain buffer, or the call inside torch.inference_mode()",
+        )
+
+
+def _checkpoints(state_checkpoints, checkpoint_cu_starts, lens, v, others, starts_dev):
+    """The caller's buffers for the state before every 16-token chunk of every sequence, checked against the lengths."""
+    HV, dev = v.shape[2], v.device
+    counts = [-(-n // CHUNK) for n in lens]
+    total = sum(counts)
+    ck = state_checkpoints
+    if ck is None:
+        ck = torch.empty(total, HV, HEAD_DIM, HEAD_DIM, dtype=_IO, device=dev)
+    elif (
+        ck.device != dev
+        or ck.dtype not in (_IO, torch.float32)
+        or ck.ndim != 4
+        or tuple(ck.shape[1:]) != (HV, HEAD_DIM, HEAD_DIM)
+        or ck.shape[0] < total
+        or not ck.is_contiguous()
+        or ck.data_ptr() % 16
+        or ck.requires_grad
+    ):
+        raise unsupported(
+            CLASS,
+            "state_checkpoints of another shape, dtype, layout, alignment or device, with too few rows, "
+            "or requiring grad",
+            f"a contiguous bf16 or fp32 [rows, {HV}, 128, 128] buffer with one row per started "
+            f"16-token chunk of every sequence ({total} here)",
+        )
+    else:
+        _refuse_inference(ck, "state_checkpoints")
+        _refuse_shared(
+            ck,
+            (*others, checkpoint_cu_starts),
+            "state_checkpoints that share memory with an input or the output",
+        )
+    starts = [0]
+    for c in counts:
+        starts.append(starts[-1] + c)
+    cs = checkpoint_cu_starts
+    if cs is None:
+        cs = starts_dev
+        if cs is None:
+            cs = torch.tensor(starts, dtype=torch.int64, device=dev)
+    elif (
+        cs.device != dev
+        or cs.dtype != torch.int64
+        or cs.ndim != 1
+        or not cs.is_contiguous()
+        or cs.tolist() != starts
+    ):
+        raise unsupported(
+            CLASS,
+            "checkpoint_cu_starts that are not the running count of 16-token chunks",
+            "a contiguous int64 [N + 1] CUDA tensor of cumulative ceil(length / 16), or None",
+        )
+    return ck, cs
+
+
+def _stateless(
+    rows,
+    A_log,
+    dt_bias,
+    lower_bound,
+    scale_f,
+    cu_seqlens,
+    output,
+    pool_args,
+    checkpoints=(None, None, 0),
+):
+    """The call without a pool: whole sequences from the zero state through the pinned prefill kernel, which then reads
+    and stores no state; rows only, written into ``output`` when given. A packed call is preceded by the kernel's own
+    launch that orders the sequences on the device, as in a pool prefill."""
+    from ... import kda_prefill_cute
+
+    q, k, v, g, beta = (t.detach() for t in rows)
+    dev = v.device
+    shape = v.shape
+    B, T, HV = shape[:3]
+    state_checkpoints, checkpoint_cu_starts, every = checkpoints
+    for name, value in pool_args.items():
+        if value is not None and not (isinstance(value, bool) and not value):
+            raise unsupported(
+                CLASS,
+                f"{name} without initial_state",
+                "an fp32 state pool the caller keeps, or none of the state arguments "
+                "(whole sequences from the zero state, rows only)",
+            )
+    count = B if cu_seqlens is None else cu_seqlens.numel() - 1
+    if count > MAX_SEQUENCES:
+        raise unsupported(
+            CLASS,
+            f"{count} sequences in one call without initial_state",
+            f"at most {MAX_SEQUENCES}",
+        )
+    inputs = (q, k, v, g, beta, A_log, dt_bias, cu_seqlens)
+    if output is not None:
+        _check_output(output, v)
+        if output.requires_grad:
+            raise unsupported(CLASS, "an output that requires grad", "a plain buffer")
+        _refuse_inference(output, "output")
+        _refuse_shared(
+            output,
+            (*inputs, checkpoint_cu_starts),
+            "an output that shares memory with an input",
+        )
+    with torch.cuda.device(dev):
+        capturing = torch.cuda.is_current_stream_capturing()
+    if capturing:
+        raise unsupported(
+            CLASS,
+            "a call without initial_state inside a CUDA graph capture",
+            "an eager call",
+        )
+    order = starts_dev = None
+    if cu_seqlens is not None:
+        offs = cu_seqlens.tolist()
+        if (
+            offs[0] != 0
+            or offs[-1] != T
+            or any(a >= b for a, b in zip(offs, offs[1:], strict=False))
+        ):
+            raise unsupported(
+                CLASS,
+                "cu_seqlens that are not increasing from 0 to the token count",
+                "nonempty sequences tiling the tokens",
+            )
+        lens = [b - a for a, b in zip(offs, offs[1:], strict=False)]
+        cu = cu_seqlens.to(torch.int64).contiguous()
+    else:
+        lens = None
+        cu, order, starts_dev = _fixed_layout(B, T, dev)
+    ck = cs = None
+    if every:
+        if every != CHUNK or not isinstance(every, int):
+            raise unsupported(
+                CLASS,
+                f"checkpoint_every_n_tokens={every!r}",
+                f"{CHUNK}, the class's chunk",
+            )
+        ck, cs = _checkpoints(
+            state_checkpoints,
+            checkpoint_cu_starts,
+            [T] * B if lens is None else lens,
+            v,
+            (*inputs, output),
+            starts_dev,
+        )
+    elif state_checkpoints is not None or checkpoint_cu_starts is not None:
+        raise unsupported(
+            CLASS,
+            "state_checkpoints or checkpoint_cu_starts without checkpoint_every_n_tokens",
+            f"checkpoint_every_n_tokens={CHUNK} with them",
+        )
+    q, k, v, g, beta = (
+        t.view(1, B * T, *t.shape[1:]) for t in _pack(q, k, v, g, beta, HV, HV)
+    )
+    aligned = output is not None and output.data_ptr() % 16 == 0
+    out = output if aligned else torch.empty(shape, dtype=_IO, device=dev)
+    kernel = kda_prefill_cute._get_compiled_cute_dsl_kda(
+        mode=ROUTE,
+        lower_bound=float(lower_bound),
+        state_dtype=torch.float32 if ck is None else ck.dtype,
+        has_state_in=False,
+        has_state_out=False,
+        has_state_ckpt=ck is not None,
+        has_state_indices=False,
+        has_checkpoint_state_indices=False,
+    )
+    ckpt_kwargs = {}
+    if ck is not None:
+        ckpt_kwargs = dict(
+            state_ckpt=ck,
+            checkpoint_cu_starts=cs,
+            checkpoint_state_indices=None,
+            ckpt_interval=CHUNK,
+        )
+    kernel(
+        q,
+        k,
+        v,
+        g,
+        A_log.detach().contiguous(),
+        dt_bias.detach().reshape(HV, HEAD_DIM).contiguous(),
+        beta,
+        cu,
+        None,
+        out.view(1, B * T, HV, HEAD_DIM),
+        None,
+        None,
+        torch.cuda.current_stream(dev).cuda_stream,
+        scale_f,
+        seq_order=order,
+        **ckpt_kwargs,
+    )
+    # the kernel wrote the caller's buffers behind autograd's back
+    if output is not None and out is not output:
+        output.copy_(out)
+    elif output is not None and not output.is_inference():
+        torch.autograd.graph.increment_version(output)
+    if state_checkpoints is not None and not ck.is_inference():
+        torch.autograd.graph.increment_version(ck)
+    return (out if output is None else output), ck
+
+
 def recurrent_kda_batch_invariant(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -213,7 +468,10 @@ def recurrent_kda_batch_invariant(
     beta_is_logit: bool,
     backend: str,
     refused: Dict[str, object],
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    state_checkpoints: Optional[torch.Tensor] = None,
+    checkpoint_cu_starts: Optional[torch.Tensor] = None,
+    checkpoint_every_n_tokens: int = 0,
+) -> Tuple[torch.Tensor, ...]:
     if backend != "auto":
         raise unsupported(
             CLASS,
@@ -242,6 +500,8 @@ def recurrent_kda_batch_invariant(
         if t.device != dev:
             raise unsupported(CLASS, "inputs on several devices", "one device")
     scale_f = HEAD_DIM**-0.5 if scale is None else float(scale)
+    if not math.isfinite(scale_f):
+        raise unsupported(CLASS, f"scale={scale!r}", "a finite scale")
 
     B, T = q.shape[:2]
     if B == 0 or T == 0:
@@ -269,24 +529,36 @@ def recurrent_kda_batch_invariant(
         decode = T == 1
 
     if initial_state is None:
-        raise unsupported(
-            CLASS,
-            "a call without initial_state",
-            "an fp32 state pool the caller keeps (the slot carries the sequence between calls)",
+        out, ck = _stateless(
+            (q, k, v, g, beta),
+            A_log,
+            dt_bias,
+            lower_bound,
+            scale_f,
+            cu_seqlens,
+            output,
+            dict(
+                ssm_state_indices=ssm_state_indices,
+                output_final_state=output_final_state,
+            ),
+            (state_checkpoints, checkpoint_cu_starts, checkpoint_every_n_tokens),
         )
+        return (out, None) if ck is None else (out, None, ck)
+    for name, value in (
+        ("state_checkpoints", state_checkpoints),
+        ("checkpoint_cu_starts", checkpoint_cu_starts),
+        ("checkpoint_every_n_tokens", checkpoint_every_n_tokens or None),
+    ):
+        if value is not None:
+            raise unsupported(
+                CLASS,
+                f"{name} with a state pool",
+                "the call without initial_state (whole sequences from the zero state)",
+            )
     _check_pool(initial_state, HV, dev)
     slot_ids = _slot_ids(ssm_state_indices, N, dev, int(initial_state.shape[0]))
     if output is not None:
-        if output.shape != v.shape or output.dtype != _IO or not output.is_contiguous():
-            raise unsupported(
-                CLASS,
-                "an output of another shape, dtype or layout than v",
-                "a contiguous bf16 [B, T, HV, 128] output",
-            )
-        if output.device != dev:
-            raise unsupported(
-                CLASS, "an output on another device", "the inputs' device"
-            )
+        _check_output(output, v)
         lo, hi = output.data_ptr(), initial_state.data_ptr()
         if lo < hi + initial_state.numel() * 4 and hi < lo + output.numel() * 2:
             raise unsupported(

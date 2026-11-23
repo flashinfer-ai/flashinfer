@@ -17,14 +17,10 @@ from flashinfer.cudnn import prefill as cudnn_prefill
 )
 def test_paged_gqa_auto_retained_capture(dtype, backend, return_lse, dim, capacity):
     """Physical token origins and explicit masks work on 9.24 without mixed forms."""
-    from packaging.version import Version
 
-    if dtype == torch.float16 and not cudnn_prefill._cudnn_supports_paged_fp16_auto():
-        pytest.skip("FP16 auto requires stable FE 1.33")
     cudnn = cudnn_prefill.cudnn
     if (
         cudnn.backend_version() < 92400
-        or Version(cudnn.__version__) < Version("1.33.0")
         or not cudnn_prefill._cudnn_supports_paged_gqa_auto(dim)
         or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
         or not cudnn_prefill.cudnn_frontend_frost_runtime_available()
