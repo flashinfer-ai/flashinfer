@@ -362,6 +362,35 @@ def test_ws2_specialized_dispatch_fallbacks_do_not_launch(fake_launcher):
     assert not fake_launcher.launches and not fake_launcher.refusals
 
 
+@pytest.mark.parametrize("aliasing", ["separate", "norm_out_is_input"])
+def test_ws2_specialized_staged_outputs_may_be_inference_tensors(
+    fake_launcher, aliasing
+):
+    """Misaligned outputs allocated under ``torch.inference_mode()`` and dispatched outside it
+    get the staged results (the copy-back runs under inference mode)."""
+    ws = _dispatch_workspace()
+    x0, r0, g0 = _inputs(4)
+    res, norm = _expected(x0, r0, g0)
+    with torch.inference_mode():
+        if aliasing == "separate":
+            x, r, g = x0.clone(), r0.clone(), g0.clone()
+            ro, no = (
+                _misaligned(torch.empty_like(x0)),
+                _misaligned(torch.empty_like(x0)),
+            )
+        else:
+            x, r, g = _misaligned(x0), _misaligned(r0), g0.clone()
+            ro, no = r, x
+    assert ro.is_inference() and no.is_inference()
+    before = ws2._allreduce_fusion_ws2_specialized_stats()["staged_launches"]
+    out = _dispatch(ws, x, r, g, ro, no)
+    assert out is no
+    assert (
+        ws2._allreduce_fusion_ws2_specialized_stats()["staged_launches"] == before + 1
+    )
+    assert torch.equal(ro, res) and torch.equal(no, norm)
+
+
 # ---------------------------------------------------------------------------
 # The creation votes on two simulated ranks (threads and an in-process allgather).
 # ---------------------------------------------------------------------------

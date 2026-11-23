@@ -849,8 +849,11 @@ def _launch_staged(
     )
     if status:  # fresh allocations of the caching allocator are aligned
         raise RuntimeError("specialized all-reduce fusion: staged tensors not aligned")
-    for target, scratch in staged:
-        target.copy_(scratch)
+    # Under inference mode, so that an output allocated under torch.inference_mode() accepts
+    # the in-place copy outside it (as the kernel's raw-pointer writes do).
+    with torch.inference_mode():
+        for target, scratch in staged:
+            target.copy_(scratch)
     _stats["staged_launches"] += 1
 
 
