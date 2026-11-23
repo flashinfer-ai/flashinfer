@@ -330,3 +330,111 @@ def test_empty_per_locality_domain_unwinds_on_failure(monkeypatch):
     with pytest.raises(RuntimeError, match="injected"):
         green_ctx.empty_per_locality_domain((1024,), torch.float32, dev)
     assert calls == {"unmap": n, "release": n, "free": 1}
+
+
+# 2 MiB part slices: the allocation granularity on the devices this runs on.
+@pytest.mark.parametrize(
+    "shape,dim", [((4, 4096, 1024), 1), ((4, 4096, 1024), -2), ((2, 2048, 1024), 0)]
+)
+def test_empty_split_by_locality_domain(shape, dim):
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    n = green_ctx.get_locality_domain_count(dev)
+    parts, full = green_ctx.empty_split_by_locality_domain(shape, dim, torch.uint8, dev)
+    d = dim % len(shape)
+    part_shape = (*shape[:d], shape[d] // n, *shape[d + 1 :])
+    assert full.shape == shape and full.is_contiguous()
+    assert parts.shape == (n, *part_shape)
+    for i in range(n):
+        assert parts[i].is_contiguous()
+    # Both views are the same memory: parts[i] is slice i of full along dim.
+    full.copy_(torch.randint(0, 256, shape, dtype=torch.uint8, device=dev))
+    for i in range(n):
+        assert torch.equal(parts[i], full.narrow(d, i * part_shape[d], part_shape[d]))
+    parts[0].fill_(7)
+    assert (full.narrow(d, 0, part_shape[d]) == 7).all()
+
+
+def test_empty_split_by_locality_domain_rejects_bad_split():
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    with pytest.raises(ValueError, match="granularity"):
+        green_ctx.empty_split_by_locality_domain((4, 64, 128), 1, torch.uint8, dev)
+    with pytest.raises(ValueError, match="does not split"):
+        green_ctx.empty_split_by_locality_domain((4, 4095, 1024), 1, torch.uint8, dev)
+    with pytest.raises(IndexError):
+        green_ctx.empty_split_by_locality_domain((4, 4096, 1024), 3, torch.uint8, dev)
+
+
+def test_empty_split_by_locality_domain_freed_with_both_views():
+    """The memory stays while either view lives and is released once both are freed."""
+    import gc
+
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    torch.cuda.set_device(0)
+    shape = (16, 16384, 1024)
+    # Load the fill kernel first so module loading is not counted as the allocation.
+    torch.zeros(1, dtype=torch.uint8, device=dev).fill_(3)
+    gc.collect()
+    torch.cuda.synchronize()
+    free0, _ = torch.cuda.mem_get_info(dev)
+    parts, full = green_ctx.empty_split_by_locality_domain(shape, 1, torch.uint8, dev)
+    full.fill_(3)
+    free1, _ = torch.cuda.mem_get_info(dev)
+    # Plain ints and bools only: pytest keeps an assert's operands alive in the frame.
+    nbytes = full.numel()
+    used = free0 - free1
+    assert nbytes <= used < 1.5 * nbytes  # one copy, not two
+    del full
+    gc.collect()
+    still_mapped = bool((parts == 3).all())  # through the other view
+    assert still_mapped
+    del parts
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()  # the comparison above went through the caching allocator
+    assert not green_ctx._deferred_releases
+    free2, _ = torch.cuda.mem_get_info(dev)
+    assert free2 >= free0 - (1 << 21)
+
+
+def test_empty_split_by_locality_domain_unwinds_on_failure(monkeypatch):
+    """A failing driver call after the mappings are made releases them before re-raising."""
+    dev = torch.device("cuda:0")
+    _need_locality_domains(dev)
+    real = green_ctx.driver
+    calls = {"unmap": 0, "release": 0, "free": 0}
+
+    class _Driver:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        @staticmethod
+        def cuMemSetAccess(*args):
+            raise RuntimeError("injected cuMemSetAccess failure")
+
+        @staticmethod
+        def cuMemUnmap(*args):
+            calls["unmap"] += 1
+            return real.cuMemUnmap(*args)
+
+        @staticmethod
+        def cuMemRelease(*args):
+            calls["release"] += 1
+            return real.cuMemRelease(*args)
+
+        @staticmethod
+        def cuMemAddressFree(*args):
+            calls["free"] += 1
+            return real.cuMemAddressFree(*args)
+
+    monkeypatch.setattr(green_ctx, "driver", _Driver())
+    n = green_ctx.get_locality_domain_count(dev)
+    experts = 3
+    with pytest.raises(RuntimeError, match="injected"):
+        green_ctx.empty_split_by_locality_domain(
+            (experts, 4096, 1024), 1, torch.uint8, dev
+        )
+    # Each of the n * experts slices is mapped into both views of one address range.
+    assert calls == {"unmap": 2 * n * experts, "release": n * experts, "free": 1}

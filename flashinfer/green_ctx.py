@@ -428,18 +428,54 @@ def _release_localized(dev_index: int, ptr: int, va_bytes: int, chunks) -> None:
     checkCudaErrors(driver.cuMemAddressFree(ptr, va_bytes))
 
 
+def _release_split(dev_index: int, ptr: int, va_bytes: int, maps) -> None:
+    torch.cuda.synchronize(dev_index)
+    for map_ptr, size in maps:
+        checkCudaErrors(driver.cuMemUnmap(map_ptr, size))
+    checkCudaErrors(driver.cuMemAddressFree(ptr, va_bytes))
+
+
 def _release_deferred() -> None:
     # A device synchronize during stream capture would invalidate the capture
     if torch.cuda.is_current_stream_capturing():
         return
     while _deferred_releases:
-        _release_localized(*_deferred_releases.pop())
+        release, args = _deferred_releases.pop()
+        release(*args)
 
 
 def _unmap_localized(dev_index: int, ptr: int, va_bytes: int, chunks) -> None:
     """Finalizer of an :func:`empty_per_locality_domain` tensor (runs from garbage collection)."""
-    _deferred_releases.append((dev_index, ptr, va_bytes, chunks))
+    _deferred_releases.append((_release_localized, (dev_index, ptr, va_bytes, chunks)))
     _release_deferred()
+
+
+def _unmap_split(dev_index: int, ptr: int, va_bytes: int, maps) -> None:
+    """Finalizer of :func:`empty_split_by_locality_domain` (once both views are freed)."""
+    _deferred_releases.append((_release_split, (dev_index, ptr, va_bytes, maps)))
+    _release_deferred()
+
+
+def _locality_domain_prop(cu_dev, domain: int):
+    prop = driver.CUmemAllocationProp()
+    prop.type = driver.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = (
+        driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN
+    )
+    prop.location.localized.deviceId = int(cu_dev)
+    prop.location.localized.localityDomainId = domain
+    return prop
+
+
+def _locality_domain_granularity(cu_dev) -> int:
+    return int(
+        checkCudaErrors(
+            driver.cuMemGetAllocationGranularity(
+                _locality_domain_prop(cu_dev, 0),
+                driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+            )
+        )
+    )
 
 
 @flashinfer_api
@@ -482,23 +518,9 @@ def empty_per_locality_domain(
     part_elems = math.prod(part_shape)
 
     def prop_for(domain: int):
-        prop = driver.CUmemAllocationProp()
-        prop.type = driver.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.location.type = (
-            driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN
-        )
-        prop.location.localized.deviceId = int(cu_dev)
-        prop.location.localized.localityDomainId = domain
-        return prop
+        return _locality_domain_prop(cu_dev, domain)
 
-    gran = int(
-        checkCudaErrors(
-            driver.cuMemGetAllocationGranularity(
-                prop_for(0),
-                driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
-            )
-        )
-    )
+    gran = _locality_domain_granularity(cu_dev)
     part_bytes = max(round_up(part_elems * elem, gran), gran)
     va_bytes = num_domains * part_bytes
     ptr = int(checkCudaErrors(driver.cuMemAddressReserve(va_bytes, 0, 0, 0)))
@@ -539,3 +561,106 @@ def empty_per_locality_domain(
     return torch.as_strided(
         flat, (num_domains, *part_shape), (part_bytes // elem, *reversed(inner))
     )
+
+
+@flashinfer_api
+def empty_split_by_locality_domain(
+    shape: Tuple[int, ...], dim: int, dtype: torch.dtype, dev: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    Allocate an uninitialized tensor of ``shape`` split along ``dim`` into one part per
+    locality domain, part ``i`` in domain ``i``'s memory, and return two contiguous views of
+    the same memory: ``full`` of shape ``shape``, and ``parts`` of shape
+    ``[num_domains, *shape]`` with ``shape[dim]`` divided by ``num_domains`` (``parts[i]`` is
+    part ``i``). No memory is duplicated.
+
+    Example: the per-domain weight shards of a localized MoE (``parts``, split along the rows
+    of every expert) and the full expert weights that other kernels read (``full``) can share
+    one copy.
+
+    Every ``shape[dim] / num_domains`` slice below the leading dims is one physical allocation
+    mapped into both views, so its size must be a multiple of the allocation granularity. The
+    memory is released when both views and all their views are freed, as for
+    :func:`empty_per_locality_domain`.
+
+    Args:
+        shape: Shape of the full tensor.
+        dim: Dimension to split; ``shape[dim]`` must be a multiple of the number of domains.
+        dtype: Element type.
+        dev: CUDA device with at least two locality domains.
+
+    Returns:
+        ``(parts, full)``.
+
+    Raises:
+        ValueError: ``shape[dim]`` does not split evenly, or a part slice is not a multiple
+            of the allocation granularity.
+    """
+    dev = _indexed(dev)
+    num_domains = get_locality_domain_count(dev)
+    if num_domains < 2:
+        raise RuntimeError(
+            f"{dev} exposes {num_domains} locality domain(s); "
+            "empty_split_by_locality_domain needs at least two"
+        )
+    shape = tuple(shape)
+    if not -len(shape) <= dim < len(shape):
+        raise IndexError(f"dim {dim} is out of range for shape {shape}")
+    dim %= len(shape)  # a negative dim counts from the end, as in torch
+    if shape[dim] % num_domains:
+        raise ValueError(
+            f"dim {dim} of {shape} does not split into {num_domains} locality domains"
+        )
+    cu_dev = get_cudevice(dev)
+    elem = torch.tensor([], dtype=dtype).element_size()
+    outer = math.prod(shape[:dim])
+    part_shape = (*shape[:dim], shape[dim] // num_domains, *shape[dim + 1 :])
+    chunk_bytes = shape[dim] // num_domains * math.prod(shape[dim + 1 :]) * elem
+    gran = _locality_domain_granularity(cu_dev)
+    if chunk_bytes % gran:
+        raise ValueError(
+            f"a {chunk_bytes}-byte part slice is not a multiple of the {gran}-byte "
+            "allocation granularity"
+        )
+    _release_deferred()
+    view_bytes = num_domains * outer * chunk_bytes
+    # One address range: parts in the first half, full in the second.
+    va_bytes = 2 * view_bytes
+    ptr = int(checkCudaErrors(driver.cuMemAddressReserve(va_bytes, 0, 0, 0)))
+    maps = []
+    try:
+        for d in range(num_domains):
+            for b in range(outer):
+                handle = checkCudaErrors(
+                    driver.cuMemCreate(chunk_bytes, _locality_domain_prop(cu_dev, d), 0)
+                )
+                try:
+                    # Slice (b, d): part-major in parts, in its place along dim in full.
+                    for offset in (
+                        (d * outer + b) * chunk_bytes,
+                        view_bytes + (b * num_domains + d) * chunk_bytes,
+                    ):
+                        checkCudaErrors(
+                            driver.cuMemMap(ptr + offset, chunk_bytes, 0, handle, 0)
+                        )
+                        maps.append((ptr + offset, chunk_bytes))
+                finally:
+                    # The mappings keep the memory alive until they are unmapped.
+                    checkCudaErrors(driver.cuMemRelease(handle))
+        access = driver.CUmemAccessDesc()
+        access.location.type = driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+        access.location.id = int(cu_dev)
+        access.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+        checkCudaErrors(driver.cuMemSetAccess(ptr, va_bytes, [access], 1))
+    except BaseException:
+        # unwind (e.g. out of memory): nothing has used the mapping yet
+        for map_ptr, size in maps:
+            driver.cuMemUnmap(map_ptr, size)
+        driver.cuMemAddressFree(ptr, va_bytes)
+        raise
+    # Both views share one storage, so the memory is released once both are freed.
+    owner = _LocalizedAllocation(ptr, va_bytes, "|u1")
+    weakref.finalize(owner, _unmap_split, dev.index, ptr, va_bytes, maps).atexit = False
+    flat = torch.as_tensor(owner, device=dev).view(dtype)
+    parts, full = flat.split(view_bytes // elem)
+    return parts.view(num_domains, *part_shape), full.view(shape)
