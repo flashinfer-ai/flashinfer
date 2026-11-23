@@ -358,7 +358,8 @@ def _moe_nvfp4_fingerprint(
     dimensions of :func:`_moe_class_terms` (the routing method with ``DeepSeekV3``'s groups, the activation with its scalars
     and gating) under the same bounds; ``arch`` (an architecture family, a compute capability or a device; the current CUDA
     device by default) selects the instruction class of each expert weight shape (the sm_107 K = 128 step on SM107 for the
-    unsplit shapes, the K = 64 step elsewhere): the architecture is a dimension of the class; ``intermediate`` the
+    unsplit shapes, the K = 64 step elsewhere): the architecture family is a dimension of the class (SM100 and SM103 are one
+    family); ``intermediate`` the
     intermediate's quantization class (``per_token`` / ``static``)."""
     from flashinfer.fused_moe.batch_invariant.api_fp4 import ALIGN_FP4, expert_classes
     from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import spec_fingerprint_nvfp4

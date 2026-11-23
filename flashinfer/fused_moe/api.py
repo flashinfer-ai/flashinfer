@@ -3630,7 +3630,7 @@ class BatchInvariantFp4Config:
     ``cvt_bf16(act(mul(g, s)) * mul(u, s))``, ``s = mul(alpha1[e], pts[token])``, the bf16 intermediate quantized per token
     by the same class, GEMM2 with ``cvt_bf16(mul(acc, mul(alpha2[e], pts2)))``, the slot-order combine. The instruction
     class of each expert weight shape is the dense 4-bit class rule's (the sm_107 K = 128 step on SM107, the K = 64 step
-    elsewhere), so the architecture is a dimension of ``fingerprint("fused_moe_nvfp4", ...)``. Both pairs' activation chains
+    elsewhere), so the architecture family is a dimension of ``fingerprint("fused_moe_nvfp4", ...)`` (SM100 and SM103 are one family). Both pairs' activation chains
     compute their exponential and divisions with the part's SFU (``ex2.approx.ftz`` / ``rcp.approx.ftz``): deterministic and
     batch-invariant per part, the bits a property of the part (the verification standard is in the mode's README); the ReLU
     family and PowLU have no such step and are the declared sequences.
@@ -3657,7 +3657,7 @@ class BatchInvariantFp4Config:
     (``mxfp4.quant``), GEMM1 as the dense MXFP4 GEMM class per expert with the bf16 class's chain on the raw accumulators (the
     block scales are applied inside the instruction), the bf16 intermediate quantized by the same class, GEMM2 with
     ``cvt_bf16(acc)``, the slot-order combine; the instruction class is the part's (the sm_107 K = 128 step on SM107), so the
-    architecture is a dimension of ``fingerprint("fused_moe_mxfp4", ...)``. Weights: the canonical bf16 layouts above,
+    architecture family is a dimension of ``fingerprint("fused_moe_mxfp4", ...)`` (SM100 and SM103 are one family). Weights: the canonical bf16 layouts above,
     quantized per expert by the MXFP4 quantizer (128x4 swizzled UE8M0 scales), ``H`` and ``I`` multiples of 32. Activations:
     bf16 rows as given, or packed fp4 ``uint8 [num_tokens, H / 2]`` with ``hidden_states_scale`` (the 128x4 swizzled scales of
     ``mxfp4_quantize(..., batch_invariant=True)`` or the linear ``[num_tokens, H / 32]`` layout) and no ``per_token_scale``
