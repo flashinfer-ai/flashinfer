@@ -72,7 +72,10 @@ every rank. Nothing per-rank decides the path: not whether optional outputs are 
 tensor contents and not pointer values. A contiguous view that is not 16-byte aligned (the
 kernel's bulk copies need 16 bytes) runs the same kernel through aligned copies on its rank
 (:func:`_launch_staged`) instead of falling back, since its peer's views may be aligned. A launch
-error raises instead of falling back.
+error raises instead of falling back. Likewise a failure local to one rank between the guard and
+the launch (running out of memory for an omitted output or an aligned copy) raises on that rank
+and leaves its peer waiting in the kernel, as in any collective; passing ``residual_out`` and
+``norm_out`` and keeping every tensor 16-byte aligned makes the call allocate nothing.
 
 The kernel waits for its predecessor before reading anything when launched with programmatic
 dependent launch (``launch_with_pdl=True``) and never triggers its dependents early. It launches on

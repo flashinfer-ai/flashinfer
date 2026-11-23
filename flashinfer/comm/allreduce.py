@@ -540,9 +540,12 @@ def create_allreduce_fusion_workspace(
         about 135.6 MB per rank at 5461 tokens. The ranks agree collectively at
         creation (compute capability, one node, free memory, JIT build, the
         kill switch): ``"auto"`` then falls back to the stock pick, while an
-        explicit ``"specialized"`` raises ``ValueError``, except that with
+        explicit ``"specialized"`` raises ``ValueError``, except that when the
+        vote rejects the kernel because of
         ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (set identically on every
-        rank) it returns a workspace whose calls all run the fallback.
+        rank) it returns a workspace whose calls all run the fallback; outside
+        the static envelope an explicit ``"specialized"`` raises before the
+        variable is read.
         ``"trtllm"`` and ``"mnnvl"`` never run a specialized kernel.
     world_size : int
         Number of ranks in the process group.
