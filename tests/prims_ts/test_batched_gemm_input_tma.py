@@ -649,23 +649,34 @@ def test_tiled_and_gather_completion_address(monkeypatch, local_address, operand
     from dataclasses import replace
 
     cfg = replace(_independent_pair(), dense_local_barrier=int(local_address))
-    barrier = object()
+    barrier, mapped, converted = object(), object(), object()
     calls = []
+    conversions = []
     monkeypatch.setattr(cga, "Int32", int)
     monkeypatch.setattr(cga.cute.arch, "make_warp_uniform", lambda x: x)
     monkeypatch.setattr(
-        cga.prims, "mapa", lambda ptr, rank: (calls.append(rank), ptr)[1]
+        cga.prims, "mapa", lambda ptr, rank: (calls.append((ptr, rank)), mapped)[1]
     )
-    monkeypatch.setattr(cga.prims, "cvta_to", lambda ptr, space: ptr)
+    monkeypatch.setattr(
+        cga.prims,
+        "cvta_to",
+        lambda ptr, space: (conversions.append((ptr, space)), converted)[1],
+    )
     for rank in range(8):
         monkeypatch.setattr(cga.cute.arch, "block_idx_in_cluster", lambda: rank)
         for gather in (False, True):
             calls.clear()
+            conversions.clear()
             result = python_body(cga.input_tma_barrier_address)(
                 cfg, operand, barrier, gather
             )
-            assert result is barrier
-            assert calls == ([rank & ~1] if gather or not local_address else [])
+            if gather or not local_address:
+                assert calls == [(barrier, rank & ~1)]
+                assert conversions == [(mapped, cga.prims.CvtaSpace.SHARED)]
+                assert result is converted
+            else:
+                assert not calls and not conversions
+                assert result is barrier
 
 
 @pytest.mark.parametrize(

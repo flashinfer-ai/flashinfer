@@ -221,3 +221,30 @@ def test_executable_rejects_descriptor_mode_change(monkeypatch, reencode):
     executable = runner.compile()
     runner.run(executable, io, None)
     assert calls[-1][-1] is (io["tma_desc_storage_dp"] if reencode else None)
+
+
+def test_executable_rejects_configuration_change_before_preparation(monkeypatch):
+    monkeypatch.delenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", raising=False)
+    io = _io()
+    preparations, launches = [], []
+    monkeypatch.setattr(runner, "_build_launch_io", lambda **kwargs: io)
+    monkeypatch.setattr(
+        runner.torch.cuda, "Stream", lambda: SimpleNamespace(cuda_stream=0)
+    )
+    monkeypatch.setattr(
+        runner, "_compile_for_launch", lambda *args: lambda *args: launches.append(args)
+    )
+    monkeypatch.setattr(
+        runner, "_prepare_tma_descriptors", lambda *args: preparations.append(args)
+    )
+    executable = runner.compile()
+    assert executable.cfg is io["cfg"]
+    io["cfg"] = replace(io["cfg"], fuse_operand_sf_loads=1)
+    assert io["cfg"] != executable.cfg
+    with pytest.raises(ValueError, match="compiled configuration"):
+        runner.run(executable, io, None)
+    assert not preparations and not launches
+
+    io["cfg"] = replace(executable.cfg)
+    runner.run(executable, io, None)
+    assert len(preparations) == len(launches) == 1

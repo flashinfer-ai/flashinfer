@@ -7725,6 +7725,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         return super()._cache_key_extras() + (
             bool(self.config.finalize.use_fused_finalize),
             self._weight_layout(),
+            get_compute_capability(self.device),
         )
 
     def _effective_fused_finalize(self, **overrides) -> bool:

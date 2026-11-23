@@ -1974,7 +1974,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         if fuse_finalize:
             from .finalize import zero_output_during_fc1
 
-            with zero_output_during_fc1(output):
+            with zero_output_during_fc1(output, read_input=hidden_states):
                 fc1_fn(*self._launch_args(fc1_io, stream))
         else:
             fc1_fn(*self._launch_args(fc1_io, stream))

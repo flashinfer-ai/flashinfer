@@ -27,6 +27,35 @@ from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
 from flashinfer.tllm_enums import WeightLayout
 
 
+@pytest.fixture(autouse=True)
+def mock_compute_capability(monkeypatch):
+    monkeypatch.setattr(
+        "flashinfer.fused_moe.runners.get_compute_capability", lambda device: (10, 7)
+    )
+
+
+@pytest.mark.cpu_only
+def test_prims_ts_tactic_cache_shares_only_with_same_architecture(monkeypatch):
+    capabilities = ((10, 0), (10, 3), (10, 7), (10, 7))
+    monkeypatch.setattr(
+        "flashinfer.fused_moe.runners.get_compute_capability",
+        lambda device: capabilities[device.index],
+    )
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=32, top_k=2),
+        quant=QuantConfig(QuantFormat.NVFP4, QuantFormat.NVFP4),
+        experts=ExpertConfig(intermediate_size=512),
+        backend=BackendOptions((PrimsTsConfig(),)),
+        execution=ExecutionConfig(enable_pdl=False),
+    )
+    runners = [PrimsTsRunner(config, torch.device("cuda", i)) for i in range(4)]
+    keys = [runner.get_cache_key_extras([]) for runner in runners]
+    assert len(set(keys)) == 3
+    assert keys[2] == keys[3]
+    assert hash(runners[2]) == hash(runners[3])
+    assert len({runner._cache_key_extras()[:-1] for runner in runners}) == 1
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("transition", ["preserve_rows", "deterministic"])
 @pytest.mark.parametrize(

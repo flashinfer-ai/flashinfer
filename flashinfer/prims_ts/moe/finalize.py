@@ -36,15 +36,34 @@ def _zero_output(output, stream):
     )
 
 
+def _overlapping_bytes(left, right):
+    if left.device != right.device or not left.numel() or not right.numel():
+        return False
+
+    def end(tensor):
+        extent = 1 + sum(
+            (n - 1) * s for n, s in zip(tensor.shape, tensor.stride(), strict=True)
+        )
+        return tensor.data_ptr() + extent * tensor.element_size()
+
+    return left.data_ptr() < end(right) and right.data_ptr() < end(left)
+
+
 @contextmanager
-def zero_output_during_fc1(output):
+def zero_output_during_fc1(output, *, read_input=None):
     """Fork zeroing alongside FC1 and join it before FC2, including graph capture.
 
     Each invocation owns its events. The output remains live until the auxiliary
     work rejoins the caller's stream, even if the FC1 launch raises. No tensor
     allocation or synchronization with the host is needed.
+    If output overlaps FC1's input, enqueue zeroing after FC1 on the caller
+    stream instead, so initialization cannot destroy unread activation bytes.
     """
     main = torch.cuda.current_stream(output.device)
+    if read_input is not None and _overlapping_bytes(output, read_input):
+        yield
+        _zero_output(output, main)
+        return
     auxiliary = _zero_stream(output.device)
     ready, done = torch.cuda.Event(), torch.cuda.Event()
     ready.record(main)

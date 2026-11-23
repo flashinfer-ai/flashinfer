@@ -1219,7 +1219,10 @@ class TestPrimsTsUnifiedGpu:
             assert torch.equal(major_k_out, prims_out)
 
 
-def test_prims_ts_tuning_cache_distinguishes_finalize_and_weight_layout():
+def test_prims_ts_tuning_cache_distinguishes_finalize_and_weight_layout(monkeypatch):
+    monkeypatch.setattr(
+        "flashinfer.fused_moe.runners.get_compute_capability", lambda device: (10, 7)
+    )
     keys, hashes = set(), set()
     for fused in (False, True):
         for layout in ("MajorK", "BlockMajorK"):
@@ -1244,6 +1247,9 @@ def test_prims_ts_unified_cache_tracks_effective_finalize_for_each_call(monkeypa
     from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
     from flashinfer.prims_ts.moe import runner as module
 
+    monkeypatch.setattr(
+        "flashinfer.fused_moe.runners.get_compute_capability", lambda device: (10, 7)
+    )
     monkeypatch.setattr(module, "_sm_arch_for_tensor", lambda tensor: 107)
     deterministic = False
     monkeypatch.setattr(

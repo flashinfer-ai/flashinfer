@@ -168,6 +168,8 @@ def _verify_repeated_tile_lifetimes(plan):
     unit = plan.output_unit
     for tile in range(5):
         issuing = set()
+        unpublished = set()
+        fenced = set()
         seen = []
         pending_reads = set()
         issued_reads = {}
@@ -207,11 +209,22 @@ def _verify_repeated_tile_lifetimes(plan):
                     ):
                         registers.add((action.fragment, word))
             elif action.op == op.STAGE:
-                assert not any(action.slot in group for group in queue)
+                assert action.slot not in issuing and not any(
+                    action.slot in group for group in queue
+                )
                 for word in range(plan.words_per_fragment):
                     registers.remove((action.fragment, word))
                 scratch[action.slot, action.fragment % unit] = (tile, action.fragment)
+                unpublished.add(action.slot)
+                fenced.discard(action.slot)
+            elif action.op == op.SHARED_FENCE:
+                fenced.update(unpublished)
+            elif action.op == op.BARRIER:
+                unpublished.difference_update(fenced)
+                fenced.clear()
             elif action.op == op.EMIT:
+                if not plan.finalize:
+                    assert action.slot not in unpublished
                 for f in range(action.fragment, action.fragment + unit):
                     assert scratch[action.slot, f % unit] == (tile, f)
                     seen.append(f)
@@ -248,6 +261,55 @@ def test_lifetime_audit_rejects_missing_final_commit():
                 actions=plan.actions[:last_commit] + plan.actions[last_commit + 1 :],
             )
         )
+
+
+def _plain_single_slot_plan():
+    Step = schedules.EpilogueStep
+    steps = (
+        (Step(load_fragments=8),)
+        + (
+            Step(stage_fragments=1),
+            Step(emit_fragments=1),
+        )
+        * 8
+        + (Step(release_tmem=True),)
+    )
+    return _step_config(steps, stages=1, finalize=False).preload_epilogue_plan
+
+
+def test_lifetime_audit_rejects_overwrite_before_commit():
+    plan = _plain_single_slot_plan()
+    _verify_repeated_tile_lifetimes(plan)
+    actions = list(plan.actions)
+    stage = next(
+        i
+        for i, a in enumerate(actions)
+        if a.op == schedules.EpilogueOp.STAGE and a.fragment == 1
+    )
+    overwrite = actions.pop(stage)
+    commit = next(
+        i for i, a in enumerate(actions) if a.op == schedules.EpilogueOp.COMMIT
+    )
+    actions.insert(commit, overwrite)
+    with pytest.raises(AssertionError):
+        _verify_repeated_tile_lifetimes(replace(plan, actions=tuple(actions)))
+
+
+@pytest.mark.parametrize(
+    "removed", [schedules.EpilogueOp.SHARED_FENCE, schedules.EpilogueOp.BARRIER]
+)
+def test_lifetime_audit_rejects_unpublished_plain_emit(removed):
+    plan = _plain_single_slot_plan()
+    _verify_repeated_tile_lifetimes(plan)
+    actions = list(plan.actions)
+    emit = next(i for i, a in enumerate(actions) if a.op == schedules.EpilogueOp.EMIT)
+    publication = max(i for i, a in enumerate(actions[:emit]) if a.op == removed)
+    assert publication > next(
+        i for i, a in enumerate(actions) if a.op == schedules.EpilogueOp.STAGE
+    )
+    actions.pop(publication)
+    with pytest.raises(AssertionError):
+        _verify_repeated_tile_lifetimes(replace(plan, actions=tuple(actions)))
 
 
 @pytest.mark.parametrize("warps", [4, 8])

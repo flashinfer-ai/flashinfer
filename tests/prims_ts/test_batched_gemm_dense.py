@@ -1334,6 +1334,7 @@ def test_split_tma_releases_all_and_only_pair_users(monkeypatch, dim_x, dim_y, w
                 )
             }
             assert mask == sum(1 << rank for rank in receivers)
+            assert count == (dim_x // 2 if weights else dim_y)
             for rank in receivers:
                 arrivals[rank] += 1
     assert arrivals == [

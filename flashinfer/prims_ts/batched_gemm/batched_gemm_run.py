@@ -91,6 +91,7 @@ from .batched_gemm_kernel import (
     prepare_gemm_descriptors,
 )
 from .batched_gemm_config import (
+    BatchedGemmConfig,
     BatchMode,
     CtaRasterOrder,
     RouteImpl,
@@ -4689,10 +4690,11 @@ def _build_launch_io(
 
 @dataclass
 class _BatchedGemmExecutable:
-    """A compiled BatchedGemm kernel plus the shape it was compiled for."""
+    """A compiled BatchedGemm kernel plus its shape and configuration."""
 
     compiled_fn: object
     shape: tuple
+    cfg: BatchedGemmConfig
     torch_stream: object = None
     reencode_tma: bool = False
 
@@ -4918,6 +4920,7 @@ def compile(**cfg) -> _BatchedGemmExecutable:  # noqa: A001
     return _BatchedGemmExecutable(
         compiled_fn=compiled_fn,
         shape=io["shape"],
+        cfg=io["cfg"],
         torch_stream=torch_stream,
         reencode_tma=io.get("_reencode_tma", False),
     )
@@ -4930,6 +4933,10 @@ def prepare_tensors(**cfg) -> dict:
 
 def run(executable: _BatchedGemmExecutable, tensors: dict, stream) -> None:
     """Launch the compiled kernel on ``stream`` with ``tensors``."""
+    if tensors["cfg"] != executable.cfg:
+        raise ValueError(
+            "prepared tensors configuration does not match the compiled configuration"
+        )
     if _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA") != executable.reencode_tma:
         raise ValueError("TMA descriptor mode changed; recompile the kernel before run")
     if tensors["shape"] != executable.shape:

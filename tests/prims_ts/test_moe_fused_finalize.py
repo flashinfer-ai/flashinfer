@@ -75,6 +75,7 @@ def test_fused_finalize_replay(
     hidden=1024,
     guard_output=False,
     router_weight_offset=0,
+    input_alias_offset=None,
 ):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Native BatchM finalization requires Rubin")
@@ -88,6 +89,8 @@ def test_fused_finalize_replay(
 
     build_io = runner.build_nvfp4_launch_io
     fc1_enabled = False
+    fused_launches = []
+    call_router_weights = None
 
     def with_epilogue(**kwargs):
         if kwargs["fc"] == "fc1" and fc1_enabled:
@@ -96,9 +99,10 @@ def test_fused_finalize_replay(
             if router_weight_dtype == torch.bfloat16 and kwargs["num_tokens"] == tokens:
                 # Aligned caller coefficients must retain the zero-copy path.
                 same_pointer = (
-                    kwargs["finalize_scales"].data_ptr() == router_weights.data_ptr()
+                    kwargs["finalize_scales"].data_ptr()
+                    == call_router_weights.data_ptr()
                 )
-                assert same_pointer == (router_weight_offset == 0)
+                assert same_pointer == (call_router_weights.data_ptr() % 16 == 0)
             kwargs["cfg"] = replace(
                 kwargs["cfg"],
                 dense_epilogue_warps=warps,
@@ -115,7 +119,10 @@ def test_fused_finalize_replay(
                 epilogue_tmem_release=release,
                 epilogue_steps=steps,
             )
-        return build_io(**kwargs)
+        io = build_io(**kwargs)
+        if kwargs["fc"] == "fc2" and kwargs["cfg"].fuse_moe_finalize:
+            fused_launches.append(kwargs["num_tokens"])
+        return io
 
     monkeypatch.setattr(runner, "build_nvfp4_launch_io", with_epilogue)
 
@@ -201,11 +208,13 @@ def test_fused_finalize_replay(
         weights["output2_scale_scalar"].mul_(1.03)
 
     def run(fused=True, **extra):
-        nonlocal fc1_enabled
+        nonlocal fc1_enabled, call_router_weights
         # FC1 step tests compare against the retained FC1 on every reference
         # run, including changed routes/scales and captured graph replay.
         fc1_enabled = fused and fc1_overrides is not None
-        return prims_ts_fp4_block_scale_moe(**kwargs, use_fused_finalize=fused, **extra)
+        options = {**kwargs, **extra}
+        call_router_weights = options["topk_weights"]
+        return prims_ts_fp4_block_scale_moe(**options, use_fused_finalize=fused)
 
     inputs_for(0)
     if guard_output:
@@ -220,8 +229,10 @@ def test_fused_finalize_replay(
     assert torch.isfinite(out).all() and out.abs().max() > 0
     assert (out.float() - reference.float()).norm() / reference.float().norm() < 0.015
     graph = torch.cuda.CUDAGraph()
+    before_capture = len(fused_launches)
     with torch.cuda.graph(graph):
         run(output=out)
+    assert len(fused_launches) == before_capture + 1
     for step in (1, 5):
         inputs_for(step)
         reference = run(False)[0]
@@ -262,9 +273,14 @@ def test_fused_finalize_replay(
         # Retain two captures and replay them on independent caller streams.
         # Both must keep their own zeroing dependencies and destination buffer.
         other_out = allocate_output()
+        other_weights = router_weights.clone() * 0.5
+        other_reference = run(False, topk_weights=other_weights)[0]
+        assert not torch.allclose(reference, other_reference)
         other_graph = torch.cuda.CUDAGraph()
+        before_capture = len(fused_launches)
         with torch.cuda.graph(other_graph):
-            run(output=other_out)
+            run(output=other_out, topk_weights=other_weights)
+        assert len(fused_launches) == before_capture + 1
         caller = torch.cuda.current_stream()
         streams = [torch.cuda.Stream(), torch.cuda.Stream()]
         for replay, target, worker in zip(
@@ -276,10 +292,44 @@ def test_fused_finalize_replay(
                 replay.replay()
         for worker in streams:
             caller.wait_stream(worker)
-        for target in (out, other_out):
+        for target, expected in zip(
+            (out, other_out), (reference, other_reference), strict=True
+        ):
             assert torch.isfinite(target).all()
             assert (
-                target.float() - reference.float()
+                target.float() - expected.float()
+            ).norm() / expected.float().norm() < 0.015
+
+    if input_alias_offset is not None:
+        backing = torch.full(
+            (tokens * hidden + 512,), 19.0, device="cuda", dtype=torch.bfloat16
+        )
+        guarded_outputs.append(backing)
+        aliased_out = backing[256:-256].view(tokens, hidden)
+        aliased_input = (
+            aliased_out.view(torch.uint8)
+            .flatten()[input_alias_offset : input_alias_offset + x.numel()]
+            .view_as(x)
+        )
+        aliased_input.copy_(x)
+        run(hidden_states=aliased_input, output=aliased_out)
+        torch.testing.assert_close(aliased_out, reference, rtol=0.015, atol=0.015)
+        aliased_input.copy_(x)
+        alias_graph = torch.cuda.CUDAGraph()
+        before_capture = len(fused_launches)
+        with torch.cuda.graph(alias_graph):
+            run(hidden_states=aliased_input, output=aliased_out)
+        assert len(fused_launches) == before_capture + 1
+        for step in (1, 3):
+            inputs_for(step)
+            reference = run(False)[0]
+            # FC2 overwrites its aliased input; restore it for every replay.
+            aliased_input.copy_(x)
+            alias_graph.replay()
+            torch.cuda.synchronize()
+            assert torch.isfinite(aliased_out).all()
+            assert (
+                aliased_out.float() - reference.float()
             ).norm() / reference.float().norm() < 0.015
 
     # Reuse compiled code at a different batch size after the captured work.
@@ -322,8 +372,10 @@ def test_fused_finalize_replay(
         )
         run()
         topk_graph = torch.cuda.CUDAGraph()
+        before_capture = len(fused_launches)
         with torch.cuda.graph(topk_graph):
             topk_output = run()[0]
+        assert len(fused_launches) == before_capture + 1
         logits[0, offset : offset + local].add_(0.5)
         reference = run(False)[0]
         topk_graph.replay()
@@ -426,6 +478,23 @@ def test_fused_finalize_router_weight_alignment_replay(monkeypatch, offset):
         router_weight_offset=offset,
     )
     assert seen
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("offset", [0, 32])
+def test_fused_finalize_aliased_input_replay(monkeypatch, offset):
+    test_fused_finalize_replay(
+        monkeypatch,
+        "BlockMajorK",
+        [1024, 0],
+        2,
+        1,
+        8,
+        0,
+        -1,
+        input_alias_offset=offset,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
