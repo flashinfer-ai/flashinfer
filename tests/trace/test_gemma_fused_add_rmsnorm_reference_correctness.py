@@ -17,7 +17,7 @@ def test_gemma_fused_add_rmsnorm_reference_correctness(shape_kwargs):
     """flashinfer.gemma_fused_add_rmsnorm kernel vs reference.
 
     Same in-place mutation pattern as fused_add_rmsnorm; reference returns
-    only the normalized output.
+    both declared outputs as ``(output, residual)``.
     """
     import flashinfer
     from flashinfer.trace.templates.norm import gemma_fused_add_rmsnorm_trace
@@ -28,13 +28,13 @@ def test_gemma_fused_add_rmsnorm_reference_correctness(shape_kwargs):
     x_api = inputs["input"].clone()
     res_api = inputs["residual"].clone()
     flashinfer.gemma_fused_add_rmsnorm(x_api, res_api, inputs["weight"], eps=1e-6)
-    ref_norm = gemma_fused_add_rmsnorm_trace.reference(
+    ref_norm, ref_residual = gemma_fused_add_rmsnorm_trace.reference(
         x_orig, res_orig, inputs["weight"]
     )
-    _assert_finite(x_api, res_api, ref_norm)
+    _assert_finite(x_api, res_api, ref_norm, ref_residual)
     _check(
         gemma_fused_add_rmsnorm_trace,
-        (ref_norm, res_orig + x_orig),
+        (ref_norm, ref_residual),
         (x_api, res_api),
         atol=1e-3,
         rtol=1e-3,
