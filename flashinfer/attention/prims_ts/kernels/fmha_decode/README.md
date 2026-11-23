@@ -51,7 +51,10 @@ automatic selection compares Keeps Q64 there, and FP8 K/V D512 is rejected
 at other ratios. Both run fixed Q with dense or causal masks, direct or with
 GMEM split-KV reduction (fused or separate kernel); cluster-SMEM reduction
 has no Keeps implementation, and the NVFP4 profile also excludes persistent
-scheduling. Other head ratios keep Swaps Q64 for D512.
+scheduling. NVFP4 K/V D512 at other head ratios runs on Swaps: up to 32 Q
+heads per KV head the planner chooses among the grouped Swaps Q8-Q64 tiles,
+and wider ratios take ungrouped Swaps Q16 (one- and eight-token decode at 80
+and 128 Q heads per KV head).
 
 Native SM107 targets use compact FP4 repacking for TMEM conversion and retain
 dense nibble pairs for SMEM conversion. Dense D256 one-instance Keeps profiles

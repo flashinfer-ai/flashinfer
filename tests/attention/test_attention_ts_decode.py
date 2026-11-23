@@ -10588,6 +10588,8 @@ def _resolve_d512_decode_policy(
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
     monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (10, 0))
+    # Split plans clamp the fanout to the device SM count.
+    monkeypatch.setattr(decode_module, "get_device_sm_count", lambda _device: 148)
     decode_module._resolve_decode_launch_spec.cache_clear()
     try:
         return decode_module._resolve_decode_launch_spec(
