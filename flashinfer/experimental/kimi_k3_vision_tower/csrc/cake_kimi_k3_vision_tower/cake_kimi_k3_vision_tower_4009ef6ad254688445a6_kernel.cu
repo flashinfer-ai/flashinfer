@@ -557,15 +557,25 @@ kernel_cake_kimi_k3_vision_tower_4009ef6ad254688445a6(const __grid_constant__ CU
                             int tbase = tb * 4096 + local_row * 32;
                             unsigned int rw[8];
                             uint32_t _epi_res_w_reg_0[4];
+#if defined(_MSC_VER)
+                            uint64_t _smem_raw_0[2];
+                            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_0[0]), "=l"(_smem_raw_0[1]) : "r"(epi_res_w_addr + (unsigned int)((tbase + tsw0 / 4) * 4)));
+#else
                             __int128_t _smem_raw_0;
                             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_0) : "r"(epi_res_w_addr + (unsigned int)((tbase + tsw0 / 4) * 4)));
+#endif
                             _epi_res_w_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_0)[0];
                             _epi_res_w_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_0)[1];
                             _epi_res_w_reg_0[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_0)[2];
                             _epi_res_w_reg_0[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_0)[3];
                             uint32_t _epi_res_w_reg_1[4];
+#if defined(_MSC_VER)
+                            uint64_t _smem_raw_1[2];
+                            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_1[0]), "=l"(_smem_raw_1[1]) : "r"(epi_res_w_addr + (unsigned int)((tbase + tsw1 / 4) * 4)));
+#else
                             __int128_t _smem_raw_1;
                             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_1) : "r"(epi_res_w_addr + (unsigned int)((tbase + tsw1 / 4) * 4)));
+#endif
                             _epi_res_w_reg_1[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_1)[0];
                             _epi_res_w_reg_1[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_1)[1];
                             _epi_res_w_reg_1[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_1)[2];
@@ -652,15 +662,25 @@ kernel_cake_kimi_k3_vision_tower_4009ef6ad254688445a6(const __grid_constant__ CU
                             int ptsw1 = (ptcb + 16 ^ (local_row & 7) << 4);
                             int ptbase = ptb * 4096 + local_row * 32;
                             uint32_t _epi_res_w_reg_2[4];
+#if defined(_MSC_VER)
+                            uint64_t _smem_raw_2[2];
+                            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_2[0]), "=l"(_smem_raw_2[1]) : "r"(epi_res_w_addr + (unsigned int)((ptbase + ptsw0 / 4) * 4)));
+#else
                             __int128_t _smem_raw_2;
                             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_2) : "r"(epi_res_w_addr + (unsigned int)((ptbase + ptsw0 / 4) * 4)));
+#endif
                             _epi_res_w_reg_2[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[0];
                             _epi_res_w_reg_2[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[1];
                             _epi_res_w_reg_2[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[2];
                             _epi_res_w_reg_2[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_2)[3];
                             uint32_t _epi_res_w_reg_3[4];
+#if defined(_MSC_VER)
+                            uint64_t _smem_raw_3[2];
+                            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_3[0]), "=l"(_smem_raw_3[1]) : "r"(epi_res_w_addr + (unsigned int)((ptbase + ptsw1 / 4) * 4)));
+#else
                             __int128_t _smem_raw_3;
                             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_3) : "r"(epi_res_w_addr + (unsigned int)((ptbase + ptsw1 / 4) * 4)));
+#endif
                             _epi_res_w_reg_3[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[0];
                             _epi_res_w_reg_3[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[1];
                             _epi_res_w_reg_3[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_3)[2];
@@ -804,15 +824,25 @@ kernel_cake_kimi_k3_vision_tower_4009ef6ad254688445a6(const __grid_constant__ CU
                             int tbase_1 = tb_1 * 4096 + local_row * 32;
                             unsigned int rw_1[8];
                             uint32_t _epi_res_w_reg_4[4];
+#if defined(_MSC_VER)
+                            uint64_t _smem_raw_5[2];
+                            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_5[0]), "=l"(_smem_raw_5[1]) : "r"(epi_res_w_addr + (unsigned int)((tbase_1 + tsw0_1 / 4) * 4)));
+#else
                             __int128_t _smem_raw_5;
                             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_5) : "r"(epi_res_w_addr + (unsigned int)((tbase_1 + tsw0_1 / 4) * 4)));
+#endif
                             _epi_res_w_reg_4[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[0];
                             _epi_res_w_reg_4[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[1];
                             _epi_res_w_reg_4[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[2];
                             _epi_res_w_reg_4[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_5)[3];
                             uint32_t _epi_res_w_reg_5[4];
+#if defined(_MSC_VER)
+                            uint64_t _smem_raw_6[2];
+                            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_6[0]), "=l"(_smem_raw_6[1]) : "r"(epi_res_w_addr + (unsigned int)((tbase_1 + tsw1_1 / 4) * 4)));
+#else
                             __int128_t _smem_raw_6;
                             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_6) : "r"(epi_res_w_addr + (unsigned int)((tbase_1 + tsw1_1 / 4) * 4)));
+#endif
                             _epi_res_w_reg_5[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[0];
                             _epi_res_w_reg_5[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[1];
                             _epi_res_w_reg_5[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_6)[2];
@@ -899,15 +929,25 @@ kernel_cake_kimi_k3_vision_tower_4009ef6ad254688445a6(const __grid_constant__ CU
                             int ptsw1_1 = (ptcb_2 + 16 ^ (local_row & 7) << 4);
                             int ptbase_1 = ptb_2 * 4096 + local_row * 32;
                             uint32_t _epi_res_w_reg_6[4];
+#if defined(_MSC_VER)
+                            uint64_t _smem_raw_7[2];
+                            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_7[0]), "=l"(_smem_raw_7[1]) : "r"(epi_res_w_addr + (unsigned int)((ptbase_1 + ptsw0_1 / 4) * 4)));
+#else
                             __int128_t _smem_raw_7;
                             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_7) : "r"(epi_res_w_addr + (unsigned int)((ptbase_1 + ptsw0_1 / 4) * 4)));
+#endif
                             _epi_res_w_reg_6[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[0];
                             _epi_res_w_reg_6[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[1];
                             _epi_res_w_reg_6[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[2];
                             _epi_res_w_reg_6[3] = reinterpret_cast<const uint32_t*>(&_smem_raw_7)[3];
                             uint32_t _epi_res_w_reg_7[4];
+#if defined(_MSC_VER)
+                            uint64_t _smem_raw_8[2];
+                            asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_8[0]), "=l"(_smem_raw_8[1]) : "r"(epi_res_w_addr + (unsigned int)((ptbase_1 + ptsw1_1 / 4) * 4)));
+#else
                             __int128_t _smem_raw_8;
                             asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_8) : "r"(epi_res_w_addr + (unsigned int)((ptbase_1 + ptsw1_1 / 4) * 4)));
+#endif
                             _epi_res_w_reg_7[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[0];
                             _epi_res_w_reg_7[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[1];
                             _epi_res_w_reg_7[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_8)[2];

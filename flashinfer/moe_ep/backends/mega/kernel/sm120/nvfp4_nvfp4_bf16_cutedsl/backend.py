@@ -24,7 +24,7 @@ from .weights import (
 
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
-    from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         TransformedWeights,
     )
 
@@ -59,7 +59,7 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         return "sm120_nvfp4_nvfp4_bf16_cutedsl"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
-        from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.comm import (
+        from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl.comm import (
             _no_dist,
         )
 
@@ -100,7 +100,7 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
             MegaMoESm120Nvfp4Config,
             allocate_workspace,
         )
@@ -150,7 +150,7 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         workspace: Any,
         compile_tokens_per_rank: int | None,
     ) -> None:
-        from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
             set_compile_tokens_per_rank,
         )
 
@@ -163,7 +163,7 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
-        from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel import stage_inputs
+        from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import stage_inputs
 
         compile_bucket = workspace._compile_bucket
         stage_inputs(
@@ -204,7 +204,7 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
             run_split_mega_moe,
         )
 

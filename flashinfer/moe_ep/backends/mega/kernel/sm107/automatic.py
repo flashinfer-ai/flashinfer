@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -11,7 +12,7 @@ if TYPE_CHECKING:
     import torch
 
     from flashinfer.autotuner import TuningContext
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledSymmBuffer,
         TransformedBlockScaledWeights,
     )
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
 
 def tuning_context() -> TuningContext:
     from flashinfer.autotuner import AutoTuner
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE,
         validate_context,
     )
@@ -50,7 +51,7 @@ def needs_selection(
 
 
 def tuning_identity(context: TuningContext) -> tuple:
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_measurement import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_measurement import (
         measurement_settings,
     )
 
@@ -143,7 +144,7 @@ def prepare_auto_configuration(
     if not select:
         record_prepared(state, context)
         return
-    from .....kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         KNOB_KEYS,
         sm107_candidates,
     )
@@ -153,9 +154,12 @@ def prepare_auto_configuration(
         state.initial_knobs = {name: getattr(cfg, name) for name in KNOB_KEYS}
     candidates = sm107_candidates(
         cfg.quant_kind,
+        batch_invariant=getattr(cfg, "batch_invariant", False),
         kernel_variant=cfg.kernel_variant,
         allow_in_kernel_fc2_reduce=backend._kernel_config.in_kernel_fc2_reduce
         and cfg.combine_dtype == "bf16",
+        combine_dedup=cfg.combine_dedup,
+        token_back_mode=cfg.token_back_mode,
     )
     from .forward_tuning import ForwardExecution
 
@@ -163,7 +167,11 @@ def prepare_auto_configuration(
         raise RuntimeError("Stage inputs before automatic Rubin tuning")
     tensors, quantize_input = inputs
     execution = ForwardExecution(
-        backend, tensors, quantize_input=quantize_input, output=output
+        backend,
+        tensors,
+        quantize_input=quantize_input,
+        output=output,
+        shared_weights=getattr(workspace, "_shared_weights", None),
     )
     winner = execution.tune(
         weights[0],
@@ -181,7 +189,7 @@ def prepare_auto_configuration(
         record_prepared(state, context)
         return
     if winner is None and state.winner is not None:
-        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.autotune import (
             _prepare_collectively,
         )
 
@@ -204,7 +212,7 @@ def prepare_auto_configuration(
 
 
 def ep_tuning_contract(backend, fleet_params):
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
 
     cfg = backend._resolved_config(fleet_params)
     return {
@@ -216,16 +224,37 @@ def ep_tuning_contract(backend, fleet_params):
         "gate_up_clamp": cfg.gate_up_clamp,
         "situ_beta": cfg.situ_beta,
         "situ_linear_beta": cfg.situ_linear_beta,
+        **({"use_tanh_sigmoid": True} if cfg.use_tanh_sigmoid else {}),
+        **(
+            {"epilogue_warpgroups": cfg.epilogue_warpgroups}
+            if cfg.epilogue_warpgroups != 1
+            else {}
+        ),
+        **(
+            {"shared_expert": dataclasses.asdict(cfg.shared_expert)}
+            if cfg.shared_expert is not None
+            else {}
+        ),
+        **({"combine_dedup": True} if cfg.combine_dedup else {}),
         "per_token_activation": False,
         "nvfp4_4over6": None,
         "apply_routing_weights_before_fc2": cfg.apply_routing_weights_before_fc2,
         "combine_dtype": cfg.combine_dtype,
+        **(
+            {
+                "batch_invariant_fingerprint": backend.batch_invariant_fingerprint(
+                    fleet_params
+                )
+            }
+            if getattr(cfg, "batch_invariant", False)
+            else {}
+        ),
     }
 
 
 def ep_selected_config(backend, workspace):
     import dataclasses
-    from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
 
     return dataclasses.replace(
         backend._kernel_config,
@@ -237,13 +266,22 @@ def ep_selected_config(backend, workspace):
 def ep_force_tune(backend, workspace, tensors, weights, output):
     from flashinfer.autotuner import AutoTuner
     from .forward_tuning import ForwardExecution
-    from .....kernel_src.sm107.next_cutedsl_megamoe import sm107_candidates
-    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import sm107_candidates
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE,
         RubinTuningProtocol,
     )
 
-    execution = ForwardExecution(backend, tensors, quantize_input=True, output=output)
+    from .shared_expert import bind_shared_weights
+
+    bind_shared_weights(workspace, weights)
+    execution = ForwardExecution(
+        backend,
+        tensors,
+        quantize_input=True,
+        output=output,
+        shared_weights=getattr(workspace, "_shared_weights", None),
+    )
     cfg = workspace.config
     backend.stage_inputs(tensors, workspace, quantize_input=True)
     AutoTuner.get().choose_with_protocol(
@@ -257,8 +295,11 @@ def ep_force_tune(backend, workspace, tensors, weights, output):
             candidates=sm107_candidates(
                 cfg.quant_kind,
                 kernel_variant=cfg.kernel_variant,
+                batch_invariant=getattr(cfg, "batch_invariant", False),
                 allow_in_kernel_fc2_reduce=backend._kernel_config.in_kernel_fc2_reduce
                 and cfg.combine_dtype == "bf16",
+                combine_dedup=cfg.combine_dedup,
+                token_back_mode=cfg.token_back_mode,
             ),
             process_group=backend.ep_comm_group if backend.ep_world_size > 1 else None,
             install_winner=True,
@@ -282,4 +323,5 @@ def ep_weight_pack(backend, weights):
             (weights.w13[:, intermediate:], weights.w13[:, :intermediate]), dim=1
         ),
         weights.w2,
+        shared_expert=getattr(weights, "shared_expert", None),
     )

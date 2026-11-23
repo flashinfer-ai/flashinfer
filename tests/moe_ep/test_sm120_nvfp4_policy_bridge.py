@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 import pytest
-from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
     bootstrap_paths,
 )
 
@@ -16,7 +16,7 @@ def test_ep8_frontend_native_policy_bridge(
     monkeypatch, model, topk, experts, sms, explicit_old
 ):
     bootstrap_paths()
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         runtime,
     )
     from moe_sm120_nvfp4_split.runtime import green_context
@@ -58,7 +58,7 @@ def test_ep8_frontend_native_policy_bridge(
 
 def _frontend(monkeypatch, *, world, topk, experts, hidden, intermediate, same, cross):
     bootstrap_paths()
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         runtime,
     )
     from moe_sm120_nvfp4_split.runtime import green_context
@@ -174,7 +174,7 @@ def _ep16_two_host_topology():
 
 def test_ep8_p2p_split_bucket_plan(monkeypatch):
     bootstrap_paths()
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         runtime,
     )
     from moe_sm120_nvfp4_split.runtime import green_context
@@ -210,7 +210,7 @@ def test_ep16_two_host_p2p_split_bucket_plan(monkeypatch):
     """The other host's GPUs are cross peers: EP16 over two hosts shadows them
     like a cross-NUMA EP8, following the EP16 anchors."""
     bootstrap_paths()
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         runtime,
     )
     from moe_sm120_nvfp4_split.runtime import green_context
@@ -237,7 +237,7 @@ def test_one_xnuma_fsplit_per_workspace(monkeypatch, selected, override, expecte
     """p2p_split buckets share cumulative commit words, so a workspace runs one
     forwarder split: the majority selection, ties to the larger value."""
     bootstrap_paths()
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         runtime,
     )
 

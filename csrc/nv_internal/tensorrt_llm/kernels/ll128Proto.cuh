@@ -20,7 +20,8 @@
 
 #include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
 
-namespace tensorrt_llm {
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels {
 
 class LL128Proto {
@@ -150,4 +151,5 @@ class LL128Proto {
 };
 
 }  // namespace kernels
-}  // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

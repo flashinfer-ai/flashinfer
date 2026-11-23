@@ -35,7 +35,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -802,6 +802,16 @@ CAKE_KDA_KERNEL_SYMBOL(float* __restrict__ ws_qd, CakeTensorMap const* ws_qd_tma
                         : "=r"(v_prefetch_bits[v_prefetch_reg_base]), "=r"(v_prefetch_bits[v_prefetch_reg_base + 1])
                         : "r"(v_ld_addr)
                         : "memory");
+                }
+                int chunk_tokens = seq_len_2 - chunk_idx_1 * 16;
+                if (chunk_tokens < 16) {
+                    uint32_t tail_lane;
+                    asm volatile("mov.u32 %0, %%laneid;" : "=r"(tail_lane));
+                    #pragma unroll
+                    for (int v_pair = 0; v_pair < 4; v_pair++) {
+                        int v_token = v_pair / 2 * 8 + (int)(tail_lane & 3) * 2;
+                        v_prefetch_bits[v_pair] = v_prefetch_bits[v_pair] & ((v_token + 1 < chunk_tokens) ? 4294967295u : ((v_token < chunk_tokens) ? 65535 : 0));
+                    }
                 }
                 mbarrier_wait(old_out_ready_addr + (compute_stage) * 8, _phase_old_out_ready);
                 float _tmem_load_3[8];

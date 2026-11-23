@@ -14,11 +14,11 @@ from flashinfer.moe_ep.backends.mega.kernel.sm120.nvfp4_nvfp4_bf16_cutedsl impor
     Sm120Nvfp4Nvfp4CutedslMegaKernelBackend,
     Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
-from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
     bootstrap_paths,
     select_graph_compile_bucket,
 )
-from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.weights import (
+from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl.weights import (
     interleave_gate_up_8,
     interleave_gate_up_16,
     scale_storage_size,
@@ -164,7 +164,7 @@ def test_production_modules_do_not_import_mega_runner() -> None:
     package = Path(__file__).parents[2] / "flashinfer" / "moe_ep"
     roots = (
         package / "backends" / "mega" / "kernel" / "sm120" / "nvfp4_nvfp4_bf16_cutedsl",
-        package / "kernel_src" / "sm120" / "nvfp4_split_cutedsl_megakernel" / "shim",
+        package / "shims" / "sm120" / "nvfp4_split_cutedsl",
     )
     offenders: list[str] = []
     for root in roots:
@@ -217,7 +217,7 @@ def test_rank_local_combine_heuristic_and_override(tokens, enabled) -> None:
 
 
 def test_caller_reset_advances_shared_epoch_without_clearing_ready_flags() -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.runtime import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl.runtime import (
         MegaMoESm120Nvfp4Frontend,
     )
 
@@ -250,7 +250,7 @@ def test_caller_reset_advances_shared_epoch_without_clearing_ready_flags() -> No
 def test_execution_allocation_synchronizes_only_new_storage(
     monkeypatch, reuse_storage
 ) -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         runtime,
     )
 
@@ -302,7 +302,7 @@ def test_execution_allocation_synchronizes_only_new_storage(
 
 
 def test_cold_execution_rejects_capture_before_synchronization(monkeypatch) -> None:
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         runtime,
     )
 
@@ -358,7 +358,7 @@ def test_frontend_passes_contract_and_gate_up_width(monkeypatch, contract):
     bootstrap_paths()
     from moe_sm120_nvfp4_split import api
     from moe_sm120_nvfp4_split.runtime import green_context
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         runtime,
     )
     from dataclasses import dataclass

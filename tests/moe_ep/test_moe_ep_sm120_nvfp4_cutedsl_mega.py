@@ -503,7 +503,7 @@ def test_sm120_nvfp4_fused_stage_matches_cuda_prequantized():
 
 @pytest.mark.arch_sm120
 def test_sm120_nvfp4_staging_bucket_shrink_grow_padding():
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         stage_inputs,
     )
 
@@ -547,7 +547,7 @@ def test_sm120_nvfp4_staging_bucket_shrink_grow_padding():
 @pytest.mark.parametrize("hidden,offset", [(4096, False), (1056, False), (4096, True)])
 def test_sm120_nvfp4_cuda_quantizer_boundary_parity(hidden, offset):
     from flashinfer import fp4_quantize
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         stage_inputs,
     )
 
@@ -610,7 +610,7 @@ def test_sm120_nvfp4_lazy_bucket_after_inflight_outer_graph() -> None:
     import torch.distributed as dist
 
     from flashinfer.moe_ep import MoEEpTensors
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.runtime import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl.runtime import (
         MegaMoESm120Nvfp4Frontend,
     )
 
@@ -748,7 +748,7 @@ def test_sm120_nvfp4_explicit_workspace_handles_and_output_view():
 @pytest.mark.arch_sm120
 def test_sm120_nvfp4_k3_skips_unrouted_slots() -> None:
     """K2 writes no combine row for a negative top-k slot; K3 must not read it."""
-    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         bootstrap_paths,
     )
 

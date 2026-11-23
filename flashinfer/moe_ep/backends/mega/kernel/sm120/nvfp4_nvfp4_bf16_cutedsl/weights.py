@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from ......weights import MoEWeightPack
 
 if TYPE_CHECKING:
-    from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         TransformedWeights,
     )
 
@@ -18,7 +18,7 @@ def preprocess_mega_weights(
     hidden_size: int,
     intermediate_size: int,
 ) -> "TransformedWeights":
-    from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         transform_weights,
     )
 
@@ -39,7 +39,7 @@ def validate_transformed_mega_weights(
     intermediate_size: int,
     local_experts: int,
 ) -> None:
-    from ......kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.nvfp4_split_cutedsl import (
         FP4_DTYPE,
         SCALE_DTYPE,
         scale_storage_size,

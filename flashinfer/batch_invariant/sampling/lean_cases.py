@@ -19,6 +19,13 @@ the maximum and the placements only). No ``native_decide``: the file adds nothin
 ``canon.apply_step``, a placement or the spec's chains that is not reflected in the Lean model makes ``lake build``
 fail; a regenerated file that differs from the committed one fails the device-free test, which needs no toolchain.
 
+The draw class ``sample.icdf.v1`` (``draw_spec.py`` vs ``Draw.lean``): per toy vocabulary of :data:`DRAW_NS` the total,
+the threshold and the inclusive prefixes of the probe elements of row 0 (the first element, the end of the first slot,
+the first elements of the second slot and of lane 1 -- a block bit, a lane bit -- and the last), pinned by kernel
+``decide`` for the vocabularies of :data:`DRAW_PIN_NS` (the weights are leaves, so the strings stay a few kilobytes) and
+printed for every one. The stream (``stream.py`` vs ``Stream.lean``): the blocks of the keys of :data:`STREAM_KEYS`
+decided against the Lean model and printed.
+
     python -m flashinfer.batch_invariant.sampling.lean_cases     # rewrite lean/BIKernels/SamplingCases.lean
 """
 
@@ -29,9 +36,11 @@ import os
 from typing import Dict, List, Tuple
 
 from .. import canon
+from . import draw_spec as dspec
 from . import schedule as ssched
 from . import spec as sspec
 from . import sterm as term
+from . import stream
 
 LEAN_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lean"
@@ -47,8 +56,34 @@ SUM_NS = (8, 64, 100, 300)
 PIN_NS = (8, 64, 100, 300)
 #: The vocabularies whose sum and output terms are pinned in Lean by ``decide +kernel``.
 PIN_SUM_NS = (8,)
-LSE_OUT_WHICH = ("probs0", "probsL", "logp0", "lse")
+LSE_OUT_WHICH = (
+    "probs0",
+    "probsL",
+    "logp0",
+    "logp0c",
+    "lse",
+)  # logp0c: the 16-bit output member's converted element
 LSE_KINDS = ("maxkernel", "maxspec", "sumkernel", "sumspec")
+#: The draw's toy vocabularies: one block (8, 40), two blocks (300: a block bit), four blocks (1000).
+DRAW_NS = [8, 40, 300, 1000]
+#: The vocabularies whose draw terms are pinned in Lean by ``decide +kernel``.
+DRAW_PIN_NS = (8, 40, 300)
+#: The support class's vocabularies (the pattern lists of `support_cases`); the first is also pinned by kernel `decide`.
+SUPPORT_NS = [40, 300]
+SUPPORT_PIN_NS = (40,)
+SUPPORT_KS = [1, 2, 3, 17]
+SUPPORT_PS = [0.0, 0.1, 0.5, 0.9, 0.999, 1.0]
+#: The stream's generated vectors, ``(seed, offset, block)``: a zero key, one key at three blocks, a negative seed (its
+#: 64-bit pattern), a large offset, the first block of the high counter word.
+STREAM_KEYS = [
+    (0, 0, 0),
+    (42, 7, 0),
+    (42, 7, 1),
+    (42, 7, 5),
+    (-1, 1 << 40, 0),
+    (1234, 7, 3),
+    ((1 << 63) - 1, 3, 1 << 32),
+]
 
 
 def lean_factor(radix: int, level: str) -> str:
@@ -159,10 +194,105 @@ def lse_out_cases() -> Tuple[Dict, ...]:
                     probs0=term.sexpr(o["probs"][0]),
                     probsL=term.sexpr(o["probs"][N - 1]),
                     logp0=term.sexpr(o["logprobs"][0]),
+                    logp0c=term.sexpr(o["logprobs_cvt"][0]),
                     lse=term.sexpr(o["lse"]),
                 )
             )
     return tuple(out)
+
+
+def draw_probe(N: int) -> List[int]:
+    """The probe elements of a vocabulary: the first, the end of the first slot, the first two of the second slot, the
+    ends of the first block, the first elements of lane 1 (a lane-bit node), the last."""
+    return sorted(
+        {0, 7, 8, 9, 255, 256, 257, 8 * 32, 8 * 32 + 9, N - 1} & set(range(N))
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def draw_cases() -> Tuple[Dict, ...]:
+    """Per vocabulary of :data:`DRAW_NS`: the total, the threshold and the inclusive prefixes of the probe elements of
+    row 0 (the probability form: the weights are the row's leaves)."""
+    out = []
+    for N in DRAW_NS:
+        sp = dspec.DrawSpec(N)
+        kb = ssched.padded_blocks(N).bit_length() - 1
+        out.append(
+            dict(
+                N=N,
+                kb=kb,
+                threshold=term.sexpr(sp.threshold(0)),
+                total=term.sexpr(sp.total(0)),
+                prefixes={i: term.sexpr(sp.prefix_incl(0, i)) for i in draw_probe(N)},
+            )
+        )
+    return tuple(out)
+
+
+def _support_weights(N: int):
+    """A weight row with ties (mod 97), zeros (every seventh) and a tied maximum."""
+    import torch
+
+    vals = [0.0 if i % 7 == 0 else ((i * 7919 + 13) % 97) / 97.0 for i in range(N)]
+    vals[1] = vals[2] = 1.5
+    return torch.tensor(vals, dtype=torch.float32)
+
+
+@functools.lru_cache(maxsize=None)
+def support_cases() -> Tuple[Dict, ...]:
+    """Per vocabulary of :data:`SUPPORT_NS`: the row's 31-bit patterns and fixed-point masses, the top-k thresholds for
+    several ``k`` and the top-p thresholds for several targets (patterns, from the Python reference), the kept index list
+    of one top-k mask, and the S-expressions of its mass tree and of the first kept element's renormalised probability."""
+    from . import support_reference as SR
+    from . import support_spec as SS
+    from .reference import row_sum
+
+    out = []
+    for N in SUPPORT_NS:
+        w = _support_weights(N)
+        pats = [SS.f32_pattern(float(x)) for x in w.tolist()]
+        S = row_sum(w, N)
+        scale = SS.fixed_scale(S)
+        q: Dict[int, int] = {}
+        for x, pt in zip(w.tolist(), pats, strict=True):
+            q.setdefault(pt, SS.fixed_weight(float(x), scale))
+
+        def pat_of(v):
+            return SS.INF_PATTERN if v == float("inf") else SS.f32_pattern(v)
+
+        ks = [
+            (k, pat_of(SR.top_k_threshold(w, k))) for k in SUPPORT_KS + [N // 2, N - 1]
+        ]
+        ps = [
+            (SS.fixed_target(pv), pat_of(SR.top_p_threshold(w, pv, S)))
+            for pv in SUPPORT_PS
+        ]
+        keep = SR.support_row(w, N, SS.Filters(top_k=N // 3))["mask"].tolist()  # type: ignore[attr-defined]
+        kb = ssched.padded_blocks(N).bit_length() - 1
+        kept_idx = [i for i, b in enumerate(keep) if b]
+        out.append(
+            dict(
+                N=N,
+                kb=kb,
+                pats=pats,
+                q=sorted(q.items()),
+                ks=ks,
+                ps=ps,
+                keep=kept_idx,
+                mass=term.sexpr(SS.mass_term(N, keep)),
+                renorm=term.sexpr(SS.renorm_term(N, keep, kept_idx[0])),
+                keptlogp=term.sexpr(SS.kept_logp_term(N, keep, kept_idx[0])),
+            )
+        )
+    return tuple(out)
+
+
+def stream_cases() -> Tuple[Tuple[int, int, int, Tuple[int, int, int, int]], ...]:
+    """``(seed, offset, block, words)`` of :data:`STREAM_KEYS`, the keys as their unsigned 64-bit patterns."""
+    return tuple(
+        (s & stream.MASK64, o & stream.MASK64, n, stream.block(s, o, n))
+        for s, o, n in STREAM_KEYS
+    )
 
 
 def render() -> str:
@@ -171,6 +301,9 @@ def render() -> str:
         "import BIKernels.Canon",
         "import BIKernels.QuantExport",
         "import BIKernels.Sampling",
+        "import BIKernels.Stream",
+        "import BIKernels.Draw",
+        "import BIKernels.SupportRow",
         "namespace BIK",
         "-- GENERATED by flashinfer/batch_invariant/sampling/lean_cases.py from the Python engine / spec; do not edit.",
         "set_option maxRecDepth 8192",
@@ -259,6 +392,9 @@ def render() -> str:
             f'theorem {tag}_logp0 : osexpr (Sampling.specLogp "bf16" {N} {kb} lseRow ({T}) 0) = {_with_refs(c["logp0"], refs)} := by decide +kernel'
         )
         L.append(
+            f'theorem {tag}_logp0c : osexpr (Sampling.specLogpCvt "bf16" {N} {kb} lseRow ({T}) 0) = {_with_refs(c["logp0c"], refs)} := by decide +kernel'
+        )
+        L.append(
             f'theorem {tag}_lse : osexpr (Sampling.specLse "bf16" {N} {kb} lseRow ({T})) = {_with_refs(c["lse"], refs)} := by decide +kernel'
         )
     L.append(
@@ -266,6 +402,104 @@ def render() -> str:
         + ", ".join(
             f"({c['N']}, {c['kb']}, {'true' if c['temp'] else 'false'})" for c in los
         )
+        + "]"
+    )
+    # ---- the draw (Draw.lean vs sampling/draw_spec.py)
+    L.append("")
+    L.append(
+        "/-! The draw `sample.icdf.v1` (`sampling/draw_spec.py` vs `Draw.lean`): the total, the threshold and the inclusive "
+        "prefixes of probe elements of row 0, node for node (the probability form: the weights are the row's leaves). The "
+        "string pins are decided in the kernel for the small vocabularies; every case is printed by the conformance "
+        "executable. -/"
+    )
+    L.append("def drawRow : Nat → Term := fun i => Term.x i")
+    dcs = draw_cases()
+    for c in dcs:
+        N, kb = c["N"], c["kb"]
+        tref = f"drawPy{N}_total"
+        L.append(f"def {tref} : String := {lean_str(c['total'])}")
+        if N not in DRAW_PIN_NS:
+            continue
+        L.append(
+            f"theorem draw{N}_total : osexpr (Draw.total {N} {kb} drawRow) = {tref} := by decide +kernel"
+        )
+        L.append(
+            f"theorem draw{N}_threshold : osexpr (Draw.threshold {N} {kb} drawRow) = {_with_refs(c['threshold'], [(c['total'], tref)])} := by decide +kernel"
+        )
+        for i, sx in c["prefixes"].items():
+            L.append(
+                f"theorem draw{N}_p{i} : osexpr (Draw.prefixIncl {N} {kb} drawRow {i}) = {lean_str(sx)} := by decide +kernel"
+            )
+    L.append(
+        "def drawCases : List (Nat × Nat × List Nat) := ["
+        + ", ".join(
+            f"({c['N']}, {c['kb']}, [{', '.join(str(i) for i in c['prefixes'])}])"
+            for c in dcs
+        )
+        + "]"
+    )
+    # ---- the support class (SupportRow.lean vs sampling/support_spec.py)
+    L.append("")
+    L.append(
+        "/-! The support class `support.row.v1` (`sampling/support_spec.py` vs `SupportRow.lean`): the threshold procedures on "
+        "concrete pattern lists against the Python reference (top-k for several k, top-p for several targets with the row's "
+        "fixed-point masses), pinned by kernel `decide` at the small vocabulary and printed by the conformance executable at "
+        "every one, with the kept mass tree and the renormalised probability of one mask. -/"
+    )
+    sucs = support_cases()
+    for c in sucs:
+        N = c["N"]
+        L.append(
+            f"def supPats{N} : List Nat := [{', '.join(str(p) for p in c['pats'])}]"
+        )
+        L.append(
+            f"def supQ{N} : List (Nat × Nat) := [{', '.join(f'({p}, {m})' for p, m in c['q'])}]"
+        )
+        L.append(f"def supQf{N} : Nat → Nat := fun p => (List.lookup p supQ{N}).getD 0")
+        L.append(
+            f"def supKs{N} : List Nat := [{', '.join(str(k) for k, _ in c['ks'])}]"
+        )
+        L.append(
+            f"def supTs{N} : List Nat := [{', '.join(str(tgt) for tgt, _ in c['ps'])}]"
+        )
+        L.append(
+            f"def supKeep{N} : List Nat := [{', '.join(str(i) for i in c['keep'])}]"
+        )
+        if N in SUPPORT_PIN_NS:
+            for k, pt in c["ks"]:
+                L.append(
+                    f"theorem sup{N}_k{k} : SupportRow.topK supPats{N} {k} = {pt} := by decide +kernel"
+                )
+            for i, (tgt, pt) in enumerate(c["ps"]):
+                L.append(
+                    f"theorem sup{N}_p{i} : SupportRow.topP supPats{N} supQf{N} {tgt} = {pt} := by decide +kernel"
+                )
+    L.append(
+        "def supCase : Nat → List Nat × (Nat → Nat) × List Nat × List Nat × List Nat"
+    )
+    for c in sucs:
+        N = c["N"]
+        L.append(f"  | {N} => (supPats{N}, supQf{N}, supKs{N}, supTs{N}, supKeep{N})")
+    L.append("  | _ => ([], fun _ => 0, [], [], [])")
+    L.append(
+        "def supportCases : List (Nat × Nat) := ["
+        + ", ".join(f"({c['N']}, {c['kb']})" for c in sucs)
+        + "]"
+    )
+    # ---- the stream (Stream.lean vs sampling/stream.py)
+    L.append("")
+    L.append(
+        "/-! The stream (`sampling/stream.py` vs `Stream.lean`): the blocks of a few keys, the Python specification's words "
+        "decided against the Lean model (the published Random123 / SplitMix64 vectors are decided in `Stream.lean` itself). -/"
+    )
+    scs = stream_cases()
+    for i, (s, o, n, w) in enumerate(scs):
+        L.append(
+            f"theorem stream{i} : Stream.block {s} {o} {n} = ⟨{w[0]}, {w[1]}, {w[2]}, {w[3]}⟩ := by decide"
+        )
+    L.append(
+        "def streamCases : List (UInt64 × UInt64 × UInt64) := ["
+        + ", ".join(f"({s}, {o}, {n})" for s, o, n, _ in scs)
         + "]"
     )
     L.append("end BIK")
@@ -276,7 +510,9 @@ def summary() -> str:
     lcs = lse_cases()
     return (
         f"sampling lean_cases coverage: placements={len(lcs)} (with sum={sum(c['with_sum'] for c in lcs)}) "
-        f"output cases={len(lse_out_cases()) * len(LSE_OUT_WHICH)}"
+        f"output cases={len(lse_out_cases()) * len(LSE_OUT_WHICH)} "
+        f"draw cases={sum(len(c['prefixes']) + 2 for c in draw_cases())} stream cases={len(stream_cases())} "
+        f"support cases={sum(len(c['ks']) + len(c['ps']) + 2 for c in support_cases())}"
     )
 
 

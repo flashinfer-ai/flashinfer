@@ -15,7 +15,7 @@ from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidat
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
         autotune_hopper_bf16_mega_moe,
         bf16_resolve_knobs,
         create_dummy_hopper_bf16_inputs,
@@ -80,6 +80,6 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
 
 
 def run_tuning(args) -> int:
-    from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
+    from flashinfer.moe_ep.shims.sm90 import cutedsl_megamoe as pkg
 
     return _run_tuning(args, tune_one, pkg=pkg)

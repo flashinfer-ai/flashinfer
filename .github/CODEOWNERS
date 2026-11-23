@@ -32,7 +32,7 @@ tests/msa_ops/                 @rmhaskarnvidia @saltyminty @yzh119 @nv-yunzheq @
 tests/cpu/msa_ops/             @rmhaskarnvidia @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── SDSA ──
-docs/design_docs/sdsa_indexer.md    @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
+docs/design_docs/sdsa.md            @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
 flashinfer/sdsa/                    @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
 flashinfer/trace/templates/sdsa.py  @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
 tests/sdsa/                         @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
@@ -138,23 +138,19 @@ tests/kda/           @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jing
 tests/cpu/kda/       @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── Autotuner ──
-flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
-tests/autotuner/         @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
-tests/cpu/autotuner/     @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
-
-# -- Test runner --
-scripts/test_sharding/      @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
-tests/test_sharding/        @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
+flashinfer/autotuner/    @qiching @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/autotuner/         @qiching @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/cpu/autotuner/     @qiching @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── Infra: CI, workflows, docker, build/release, test harness ──
 ci/                                              @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
+scripts/infra/                                   @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
+tests/infra/                                     @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 docker/                                          @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 .devcontainer/                                   @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 build_backend.py                                 @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 pytest.ini                                       @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
-tests/infra/                                     @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 tests/cpu/infra/                                 @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 flashinfer-jit-cache-provider/                   @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 flashinfer-cubin/                                @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
-tests/test_artifacts.py                          @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
 docs/installation.rst                            @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan

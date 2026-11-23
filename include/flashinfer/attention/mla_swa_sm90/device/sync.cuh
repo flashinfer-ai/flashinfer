@@ -1,5 +1,12 @@
 #pragma once
 
+__forceinline__ __device__ bool m16_terminal_page_is_masked(int page, int row_block, int sq,
+                                                            int cache_len, int window_size) {
+  const int pos = cache_len - sq + row_block / 4;
+  const int left = max(pos - window_size + 1, 0);
+  return left > page * 64 || pos + 1 < (page + 1) * 64;
+}
+
 __forceinline__ __device__ void role_barrier() { asm volatile("bar.sync 0;" ::: "memory"); }
 
 __forceinline__ __device__ void qk_warpgroup_barrier() {
@@ -28,6 +35,10 @@ __forceinline__ __device__ void m32_p0_p_free() { asm volatile("bar.sync 10, 512
 
 __forceinline__ __device__ void p1_wg_sync(int wg) {
   asm volatile("bar.sync %0, 128;" ::"r"(wg + 12) : "memory");
+}
+
+__forceinline__ __device__ void m16_dsm_wg_sync(int wg) {
+  asm volatile("bar.sync %0, 128;" ::"r"(wg + 11) : "memory");
 }
 
 __forceinline__ __device__ void p1_release(cutlass::arch::ClusterBarrier const& event, int peer) {

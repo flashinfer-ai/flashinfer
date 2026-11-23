@@ -17,10 +17,10 @@ _DEFAULT_TACTICS = {
     (1, 1): 0,
     (2, 1): 1,
     (4, 1): 2,
-    (8, 1): 3,
+    (8, 1): 6,
     (16, 1): 3,
     (1, 4): 2,
-    (2, 4): 3,
+    (2, 4): 6,
     (4, 4): 3,
     (8, 4): 4,
     (16, 4): 5,
@@ -222,10 +222,10 @@ class _Runner(TunableRunner):
         self.window_left = window_left
 
     def get_cache_key_extras(self, inputs):
-        return ("sm90-bf16-page64-fp32-v1", self.scale, self.window_left)
+        return ("sm90-bf16-page64-fp32-v2", self.scale, self.window_left)
 
     def get_valid_tactics(self, inputs, profile):
-        return list(range(6))
+        return list(range(7))
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         if do_preparation:
@@ -296,7 +296,7 @@ def batch_decode_with_kv_cache_mla_swa(
     torch.Tensor
         The supplied or newly allocated output. All split reductions retain
         FP32 until the final BF16 write. Use ``flashinfer.autotune(True)``
-        before capture to search the six tactics; otherwise a frozen LUT is used.
+        before capture to search the seven tactics; otherwise a frozen LUT is used.
     """
     if out is None:
         out = torch.empty(

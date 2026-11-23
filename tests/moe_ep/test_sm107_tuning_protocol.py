@@ -13,16 +13,14 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.moe_ep import BootstrapConfig, FleetParams, MoEEpTensors
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
     autotune as native,
     block_scaled,
     knob_cache,
     tuning_protocol,
 )
 from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
-    AutoTuningState,
-)
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_state import AutoTuningState
 
 
 def _stage_for_auto(workspace, num_tokens=4):
@@ -338,15 +336,25 @@ def test_foreign_records_are_filtered_before_kernel_validation(state, monkeypatc
     build.assert_called_once()
 
 
-def test_execution_storage_allocation_preserves_staged_state(state, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import comm
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+def test_execution_storage_allocation_preserves_staged_state(
+    state, monkeypatch, variant
+):
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import comm
 
     workspace = object.__new__(block_scaled.Sm107BlockScaledSymmBuffer)
     workspace.config = dataclasses.replace(
-        state.workspace.config, reduce_topk_in_kernel=True
+        state.workspace.config,
+        reduce_topk_in_kernel=True,
+        kernel_variant=variant,
+        cluster_shape_mn=(4, 1),
+        fallback_cluster_shape_mn=None,
+        fc2_use_bulk=True,
     )
+    workspace.device = torch.device("cpu")
     workspace.kernel = SimpleNamespace(
-        _device_workspace=SimpleNamespace(total_bytes=lambda kind: 128)
+        _device_workspace=SimpleNamespace(total_bytes=lambda kind: 128),
+        get_tmp_buffer_bytes=Mock(return_value=512),
     )
     workspace._routing_checks = {"routing": object()}
     workspace.note_staged_tokens(4)
@@ -354,6 +362,11 @@ def test_execution_storage_allocation_preserves_staged_state(state, monkeypatch)
     workspace.bind_scalars({"fc1_alpha": scalar})
     storage = Mock()
     storage.data_ptr.return_value = 128
+    storage.device = workspace.device
+    scratch = Mock()
+    scratch.data_ptr.return_value = 256
+    allocate_scratch = Mock(return_value=scratch)
+    monkeypatch.setattr(torch, "empty", allocate_scratch)
     monkeypatch.setattr(torch, "zeros", lambda *a, **k: storage)
     monkeypatch.setattr(comm, "sym_zeros", lambda *a, **k: storage)
     monkeypatch.setattr(comm, "compute_peer_offsets", lambda *a: (0, [0]))
@@ -361,12 +374,39 @@ def test_execution_storage_allocation_preserves_staged_state(state, monkeypatch)
     assert workspace._scalar_tensor("fc1_alpha") is scalar
     assert workspace._routing_checks
     assert workspace.staged_tokens() == 4
+    assert workspace.tmp_workspace is (scratch if variant == "inference" else None)
+    if variant == "inference":
+        allocate_scratch.assert_called_once_with(
+            (512,), dtype=torch.uint8, device=workspace.device
+        )
+    else:
+        allocate_scratch.assert_not_called()
+        workspace.kernel.get_tmp_buffer_bytes.assert_not_called()
+
+    monkeypatch.setattr(block_scaled, "_to_cute", lambda value, **kwargs: value)
+    monkeypatch.setattr(block_scaled, "_to_cute_ptr", lambda value: value)
+    monkeypatch.setattr(block_scaled, "_cu_stream", lambda value: value)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    workspace._peer_mapper = lambda: None
+    for name in ("x", "x_sf", "topk_idx", "topk_weights"):
+        setattr(workspace, name, storage)
+    weights = (storage, storage)
+    first = workspace._runtime_kwargs(weights, weights)
+    second = workspace._runtime_kwargs(weights, weights)
+    if variant == "inference":
+        assert first["tmp_buffer"] is second["tmp_buffer"] is scratch
+    else:
+        assert "tmp_buffer" not in first
+        assert "tmp_buffer" not in second
+    monkeypatch.setattr(comm, "free_sym_tensor", Mock())
+    workspace._release_execution_state()
+    assert workspace.tmp_workspace is None
 
 
 def test_cli_persists_managed_cache_by_default(state, monkeypatch, tmp_path):
     from flashinfer.moe_ep import tune
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     monkeypatch.setattr(package, "require_sm107_dsl", lambda: None)
@@ -471,7 +511,7 @@ def test_automatic_workspace_returns_to_initial_knobs(
     state, monkeypatch, tmp_path, fallback
 ):
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
     monkeypatch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
@@ -525,7 +565,7 @@ def test_automatic_workspace_returns_to_initial_knobs(
 
 def test_capture_cannot_accept_a_cache_change_without_selection(state, monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
     backend = SimpleNamespace(
@@ -580,6 +620,7 @@ def test_fixed_prepared_eager_execution_skips_collective_lookup(
     with monkeypatch.context() as patch:
         patch.setattr(torch.distributed, "all_gather_object", unexpected)
         patch.setattr(automatic, "needs_selection", unexpected)
+        patch.setattr(native, "_unique_candidates", unexpected)
         state.tuner.clear_cache()
         with unrelated_autotune_contexts():
             for _ in range(3):
@@ -603,7 +644,7 @@ def test_prepared_execution_respects_scoped_and_empty_contexts(
     state, monkeypatch, tmp_path, other_thread
 ):
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
     monkeypatch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
@@ -651,7 +692,7 @@ def test_replay_winner_invalidates_previous_tuning_identity(
 ):
     from flashinfer.autotune_cache import MeasurementPolicy
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
     monkeypatch.setattr(
@@ -952,9 +993,7 @@ def _subgroup_worker(rank, rendezvous):
                     ep_world_size=2,
                     ep_comm_group=group,
                 )
-                from flashinfer.moe_ep.kernel_src.sm107 import (
-                    next_cutedsl_megamoe as package,
-                )
+                from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
                 patch.setattr(package, "sm107_candidates", lambda *a, **k: [{}])
                 from flashinfer.moe_ep.backends.mega.kernel.sm107.forward_tuning import (

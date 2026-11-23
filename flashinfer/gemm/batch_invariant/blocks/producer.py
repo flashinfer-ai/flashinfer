@@ -70,12 +70,14 @@ def tma_producer_loop(
     tBsB: cute.Tensor,
     a_mcast_mask,
     b_mcast_mask,
-    chunks: cutlass.Constexpr = 1,
+    chunks=1,
+    cc: cutlass.Constexpr = False,
 ):
+    """``cc``: the in-CTA chunk fold (static); ``chunks`` is then its count, a runtime value (the operands' batch extent)."""
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
         coord = work_tile.tile_idx
-        if cutlass.const_expr(chunks == 1):
+        if cutlass.const_expr(not cc):
             # ((atom_v, rest_v), RestK): this tile's A rows / B columns, all k-tiles
             tAgA_slice = tAgA[(None, coord[0] // atom_thr_size, None, coord[2])]
             tBgB_slice = tBgB[(None, coord[1], None, coord[2])]
