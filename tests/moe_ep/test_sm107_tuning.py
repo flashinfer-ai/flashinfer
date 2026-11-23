@@ -9,10 +9,8 @@ from unittest import mock
 import pytest
 import torch
 
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-    Sm107BlockScaledMoeConfig,
-)
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import Sm107BlockScaledMoeConfig
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
     autotune,
     block_scaled,
     correctness,
@@ -80,7 +78,7 @@ def test_default_sweep_grid_uses_dedup_return_contract(monkeypatch):
 def test_cli_deduplicates_before_limiting_candidates(monkeypatch, variant, limit):
     from flashinfer.moe_ep.backends.mega.kernel import tuning as shared
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
 
     first, second = autotune.sm107_candidates(kernel_variant=variant)[:2]
     monkeypatch.setattr(
@@ -354,7 +352,7 @@ def fake_trials(monkeypatch):
         fail = False
 
         def __init__(self, cfg):
-            from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_state import (
                 AutoTuningState,
             )
 

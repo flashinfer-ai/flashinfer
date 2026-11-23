@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "../kernels/cute_prefill/prefill_nvfp4.cuh"
 #include "../kernels/dsv4_nvfp4/decode.cuh"
 #include "../kernels/dsv4_nvfp4/grouped_attention.cuh"
 #include "attention_params.cuh"
@@ -16,7 +17,8 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
   const auto& [q, cache, indices, mid_out, mid_lse, output, out_lse, topk_length, attn_sink,
                extra_cache, extra_indices, extra_topk_length, extra_topk, extra_page_size,
                extra_page_stride_bytes, num_tokens, sm_scale, page_size, page_stride_bytes,
-               lse_scale] = params;
+               lse_scale, mega] = params;
+  if (mega.output) return cudaErrorNotSupported;
   constexpr bool CAN_GROUP_HEADS = NUM_HEADS >= STREAMING_HEADS_PER_CTA;
   constexpr int GROUPED_H_BLOCKS =
       (NUM_HEADS + STREAMING_HEADS_PER_CTA - 1) / STREAMING_HEADS_PER_CTA;
@@ -80,19 +82,24 @@ cudaError_t launch_prefill(const Dsv4Nvfp4AttentionParams& params,
   const auto& [q, cache, indices, mid_out, mid_lse, output, out_lse, topk_length, attn_sink,
                extra_cache, extra_indices, extra_topk_length, extra_topk, extra_page_size,
                extra_page_stride_bytes, num_tokens, sm_scale, page_size, page_stride_bytes,
-               lse_scale] = params;
+               lse_scale, mega] = params;
   const int HEAD_BLOCKS = plan.head_blocks;
   constexpr size_t DYN_SMEM_BYTES = StreamingNVFP4Smem::SIZE;
-  auto kernel = sparse_mla_streaming_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE>;
-  auto status =
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES);
-  if (status != cudaSuccess) return status;
-  kernel<<<dim3(num_tokens, HEAD_BLOCKS), dim3(STREAMING_BLOCK_THREADS), DYN_SMEM_BYTES, stream>>>(
-      q, cache, indices, output, out_lse, nullptr, nullptr, attn_sink, topk_length, extra_cache,
-      extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride_bytes,
-      num_tokens, plan.scratch_split_stride, plan.cpb, sm_scale, page_size, page_stride_bytes,
-      plan.merge == execution::Merge::Direct, lse_scale);
-  return cudaGetLastError();
+  auto launch = [&](auto fused) {
+    constexpr bool Mega = decltype(fused)::value;
+    auto kernel =
+        sparse_mla_prefill_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE, Mega>;
+    auto status =
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES);
+    if (status != cudaSuccess) return status;
+    kernel<<<dim3(num_tokens, HEAD_BLOCKS), dim3(STREAMING_BLOCK_THREADS), DYN_SMEM_BYTES,
+             stream>>>(q, cache, indices, output, out_lse, attn_sink, topk_length, extra_cache,
+                       extra_indices, extra_topk_length, extra_topk, extra_page_size,
+                       extra_page_stride_bytes, num_tokens, sm_scale, page_size, page_stride_bytes,
+                       lse_scale, mega);
+    return cudaGetLastError();
+  };
+  return mega.output ? launch(std::true_type{}) : launch(std::false_type{});
 }
 
 }  // namespace flashinfer::sparse_mla_sm120::nvfp4
