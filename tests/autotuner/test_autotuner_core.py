@@ -3485,3 +3485,74 @@ def test_cute_dsl_runner_cache_tracks_split_workspace_geometry(
 
     key_small_workspace = _cute_dsl_runner_cache_extras(backend_type, 257, 800_000)
     assert key_257 != key_small_workspace
+
+
+def _clock_state(sm_mhz, throttle=0, sm_max_mhz=2062):
+    return {
+        "sm_mhz": sm_mhz,
+        "sm_max_mhz": sm_max_mhz,
+        "throttle": throttle,
+        "power_w": 500.0,
+    }
+
+
+def test_wait_for_boost_without_nvml(monkeypatch):
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    monkeypatch.setattr(autotuner_module, "_nvml_clock_state", lambda device: None)
+    assert autotuner_module._wait_for_boost(0, 1.0) == (0.0, None, True)
+
+
+def test_wait_for_boost_returns_once_the_clock_is_back_at_maximum(monkeypatch):
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    # Power-capped (SW power cap bit) first, then three polls at the maximum.
+    states = iter(
+        [_clock_state(2062), _clock_state(1270, 0x4)] + [_clock_state(2062)] * 50
+    )
+    monkeypatch.setattr(
+        autotuner_module, "_nvml_clock_state", lambda device: next(states)
+    )
+    waited, state, reached = autotuner_module._wait_for_boost(0, 5.0)
+    assert reached
+    assert state["sm_mhz"] == 2062
+    assert waited < 5.0
+
+
+def test_wait_for_boost_gives_up_after_the_timeout(monkeypatch):
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    monkeypatch.setattr(
+        autotuner_module,
+        "_nvml_clock_state",
+        lambda device: _clock_state(1270, 0x4),
+    )
+    waited, state, reached = autotuner_module._wait_for_boost(0, 0.05)
+    assert not reached
+    assert state["sm_mhz"] == 1270
+    assert waited >= 0.05
+
+
+def test_profile_log_appends_one_json_line_per_record(monkeypatch, tmp_path):
+    import json
+    import os
+
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    log = tmp_path / "profile.jsonl"
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_PROFILE_LOG", str(log))
+    autotuner_module._profile_log({"tactic": 1, "time_ms": 0.5})
+    autotuner_module._profile_log({"tactic": 2})
+    rows = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [row["tactic"] for row in rows] == [1, 2]
+    assert rows[0]["pid"] == os.getpid()
+    assert rows[0]["time_ms"] == 0.5
+
+
+def test_profile_log_is_off_by_default(monkeypatch, tmp_path):
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    monkeypatch.delenv("FLASHINFER_AUTOTUNER_PROFILE_LOG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    autotuner_module._profile_log({"tactic": 1})
+    assert list(tmp_path.iterdir()) == []

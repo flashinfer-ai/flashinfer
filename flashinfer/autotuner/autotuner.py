@@ -2028,6 +2028,109 @@ class _V2Local(threading.local):
     strict_replay: bool = False
 
 
+_NVML_THROTTLE_MASK = (
+    0x4 | 0x8 | 0x20 | 0x40 | 0x80 | 0x100
+)  # sw power cap, hw slowdown, sw thermal, hw thermal, hw power brake, display clocks
+_nvml_lock = threading.Lock()
+_nvml_handles: dict = {}
+
+
+def _nvml_handle(device):
+    """NVML handle of a torch CUDA device, or None if NVML is unavailable."""
+    try:
+        import pynvml
+
+        key = torch.device(device).index
+        if key is None:
+            key = torch.cuda.current_device()
+        with _nvml_lock:
+            if key not in _nvml_handles:
+                pynvml.nvmlInit()
+                uuid = str(torch.cuda.get_device_properties(key).uuid)
+                if not uuid.startswith("GPU-"):
+                    uuid = "GPU-" + uuid
+                _nvml_handles[key] = pynvml.nvmlDeviceGetHandleByUUID(uuid)
+            return _nvml_handles[key]
+    except Exception:
+        return None
+
+
+def _nvml_clock_state(device) -> dict | None:
+    """Current SM clock, its maximum, active clock-throttle reasons and power."""
+    handle = _nvml_handle(device)
+    if handle is None:
+        return None
+    try:
+        import pynvml
+
+        reasons_fn = (
+            getattr(
+                pynvml,
+                "nvmlDeviceGetCurrentClocksEventReasons",
+                None,
+            )
+            or pynvml.nvmlDeviceGetCurrentClocksThrottleReasons
+        )
+        return {
+            "sm_mhz": pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM),
+            "sm_max_mhz": pynvml.nvmlDeviceGetMaxClockInfo(
+                handle, pynvml.NVML_CLOCK_SM
+            ),
+            "throttle": int(reasons_fn(handle)),
+            "power_w": round(pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0, 1),
+        }
+    except Exception:
+        return None
+
+
+def _wait_for_boost(
+    device, timeout_s: float, tolerance_mhz: int = 15
+) -> tuple[float, dict | None, bool]:
+    """Idle until the SM clock is back at its maximum and nothing throttles it.
+
+    Under sustained load a GPU drops to its power-capped clock within a
+    fraction of a second and needs about 0.2 s of idle to recover, so a tactic
+    timed right after another one is slower than one timed after a pause.
+    The clock has to reach its maximum (within ``tolerance_mhz``, one clock
+    step) with no throttle reason for three polls in a row.
+    Returns the time waited, the last clock state (None without NVML) and
+    whether the boost clock was reached before the timeout.
+    """
+    import time
+
+    start = time.perf_counter()
+    state = _nvml_clock_state(device)
+    if state is None:
+        return 0.0, None, True
+    stable = 0
+    while time.perf_counter() - start < timeout_s:
+        state = _nvml_clock_state(device) or state
+        at_max = state["sm_mhz"] >= state["sm_max_mhz"] - tolerance_mhz
+        if at_max and not (state["throttle"] & _NVML_THROTTLE_MASK):
+            stable += 1
+            if stable >= 3:
+                return time.perf_counter() - start, state, True
+        else:
+            stable = 0
+        time.sleep(0.005)
+    return time.perf_counter() - start, state, False
+
+
+def _profile_log(record: dict) -> None:
+    """Append one JSON line per profiled tactic to $FLASHINFER_AUTOTUNER_PROFILE_LOG."""
+    path = os.environ.get("FLASHINFER_AUTOTUNER_PROFILE_LOG")
+    if not path:
+        return
+    import time
+
+    try:
+        record = {"pid": os.getpid(), "ts": round(time.time(), 3), **record}
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
 class AutoTuner:
     """AutoTuner for optimizing TensorRT-LLM operations.
 
@@ -2042,6 +2145,10 @@ class AutoTuner:
 
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
     _COLD_CHAIN_SAMPLE_BUDGET_MS = 10.0
+    # A cold-L2 chain that is so slow that the budget above allows fewer than
+    # this many samples is not timed as a chain: the launches are timed one by
+    # one with ``repeat`` samples instead (see ``cold_l2_profile``).
+    _COLD_CHAIN_MIN_SAMPLES = 3
     # Near-tie settling (autotune(tie_tolerance=...)); see _settle_near_ties.
     _TIE_MAX_CONTENDERS = 4
     _TIE_CONFIRM_ROUNDS = 2
@@ -3767,16 +3874,19 @@ class AutoTuner:
 
                         if runner_id is not None:
                             # At least one valid (runner, tactic) pair is found
+                            retime_fn = functools.partial(
+                                self._retime_candidate,
+                                runners,
+                                tensors,
+                                tuning_config,
+                                prepared_input_batches,
+                                kwargs,
+                            )
+                            if os.environ.get("FLASHINFER_AUTOTUNER_FINAL_ROUNDS"):
+                                self._final_rounds(measured, retime_fn)
                             winner = self._settle_near_ties(
                                 measured,
-                                functools.partial(
-                                    self._retime_candidate,
-                                    runners,
-                                    tensors,
-                                    tuning_config,
-                                    prepared_input_batches,
-                                    kwargs,
-                                ),
+                                retime_fn,
                                 self._tie_tolerance,
                             )
                             _, runner_id, tactic = measured[winner]
@@ -3964,6 +4074,58 @@ class AutoTuner:
             ),
             "candidates": len(others) + 1,
         }
+
+    def _final_rounds(
+        self,
+        measured: list[tuple[float, int, Any]],
+        retime: Callable[[int, Any], float],
+    ) -> None:
+        """Re-time the best candidates in interleaved rounds and keep the median.
+
+        One series per candidate is too noisy to rank candidates that differ by
+        a few percent: the same kernel was measured up to ~8% apart in one
+        sweep. After the sweep, the ``FLASHINFER_AUTOTUNER_FINAL_TOPK`` fastest
+        candidates (default 6) within ``FLASHINFER_AUTOTUNER_FINAL_TOL`` (default
+        0.10) of the fastest are timed again, ``FLASHINFER_AUTOTUNER_FINAL_ROUNDS``
+        times, one series each per round; the order alternates between rounds so
+        that drift favours no candidate. The median over the rounds replaces the
+        sweep time in ``measured``. Candidates that were not re-timed get at
+        least the slowest re-timed median, so they cannot win on a stale number.
+        A failed re-timing is inf; a contender with too few good rounds is inf.
+        """
+        rounds = int(os.environ["FLASHINFER_AUTOTUNER_FINAL_ROUNDS"])
+        topk = int(os.environ.get("FLASHINFER_AUTOTUNER_FINAL_TOPK", "6"))
+        tol = float(os.environ.get("FLASHINFER_AUTOTUNER_FINAL_TOL", "0.10"))
+        inf = float("inf")
+        finite = sorted(
+            (i for i, (t, _, _) in enumerate(measured) if t < inf),
+            key=lambda i: measured[i][0],
+        )
+        if rounds < 1 or len(finite) < 2:
+            return
+        best = measured[finite[0]][0]
+        contenders = [i for i in finite[:topk] if measured[i][0] <= best * (1.0 + tol)]
+        if len(contenders) < 2:
+            return
+        series: dict[int, list[float]] = {i: [] for i in contenders}
+        for round_idx in range(rounds):
+            order = contenders if round_idx % 2 == 0 else contenders[::-1]
+            for i in order:
+                _, runner_id, tactic = measured[i]
+                series[i].append(retime(runner_id, tactic))
+        settled: dict[int, float] = {}
+        for i in contenders:
+            good = [v for v in series[i] if v < inf]
+            settled[i] = statistics.median(good) if len(good) > rounds // 2 else inf
+        finite_settled = [v for v in settled.values() if v < inf]
+        if not finite_settled:
+            return
+        floor = max(finite_settled)
+        for i, (t, runner_id, tactic) in enumerate(measured):
+            if i in settled:
+                measured[i] = (settled[i], runner_id, tactic)
+            elif t < inf:
+                measured[i] = (max(t, floor), runner_id, tactic)
 
     def _settle_near_ties(
         self,
@@ -4494,6 +4656,79 @@ class AutoTuner:
             def _run_once(profile_inputs):
                 runner(profile_inputs, tactic=tactic, **kwargs)
 
+            if (
+                os.environ.get("FLASHINFER_AUTOTUNER_GRAPH_WAIT") == "1"
+                and graph is not None
+            ):
+                # One CUDA graph with exactly ``repeat`` blocks [wait for the
+                # boost clock on the device, L2 flush, stamp, kernel, stamp]:
+                # the clock wait and the timestamps run on the GPU, so neither
+                # the host nor the launch path is part of the measurement.
+                from ._graph_wait import measure_series
+
+                state0 = _nvml_clock_state(device)
+                max_mhz = (
+                    state0["sm_max_mhz"]
+                    if state0
+                    else int(
+                        os.environ.get("FLASHINFER_AUTOTUNER_GRAPH_WAIT_MAX_MHZ", "0")
+                    )
+                )
+                tol_mhz = int(
+                    os.environ.get("FLASHINFER_AUTOTUNER_BOOST_TOLERANCE_MHZ", "15")
+                )
+                timeout_ns = int(
+                    float(
+                        os.environ.get(
+                            "FLASHINFER_AUTOTUNER_GRAPH_WAIT_TIMEOUT_MS", "2000"
+                        )
+                    )
+                    * 1e6
+                )
+                samples_us, waits, retries, wait_ok, overhead_us = measure_series(
+                    _run_once,
+                    input_tensor_batches,
+                    l2_flush,
+                    num_samples,
+                    max(0, max_mhz - tol_mhz),
+                    timeout_ns,
+                )
+                result = statistics.median(samples_us) / 1e3
+                if os.environ.get("FLASHINFER_AUTOTUNER_PROFILE_LOG"):
+                    _profile_log(
+                        {
+                            "runner": type(runner).__name__,
+                            "tactic": str(tactic),
+                            "shapes": str(self._get_input_sizes(inputs)),
+                            "time_ms": result,
+                            "mode": "graph-wait",
+                            "launches_per_sample": 1,
+                            "samples": num_samples,
+                            "sample_ms": [round(x / 1e3, 6) for x in samples_us],
+                            "wait_us": [round(w[0] / 1e3, 1) for w in waits],
+                            "wait_mhz_min": min(w[1] for w in waits),
+                            "wait_ok": wait_ok,
+                            "series_retries": retries,
+                            "overhead_us": round(overhead_us, 3),
+                        }
+                    )
+                return result
+
+            wait_for_boost_s = (
+                float(os.environ.get("FLASHINFER_AUTOTUNER_BOOST_WAIT_MS", "0")) / 1e3
+            )
+            boost_tolerance_mhz = int(
+                os.environ.get("FLASHINFER_AUTOTUNER_BOOST_TOLERANCE_MHZ", "15")
+            )
+            boost_missed = 0
+            short_mode = os.environ.get(
+                "FLASHINFER_AUTOTUNER_SHORT_KERNEL_MODE", "chain"
+            )
+            exact_samples = os.environ.get("FLASHINFER_AUTOTUNER_EXACT_SAMPLES") == "1"
+            series_retries = 0
+            single_launch = False
+            chain_ms = None
+            eager = False
             captured_batches = (
                 input_tensor_batches if chain else input_tensor_batches[-1:]
             )
@@ -4511,15 +4746,42 @@ class AutoTuner:
                     warm_end.record(stream)
 
                 stream.synchronize()
+                requested_samples = num_samples
                 if chain:
                     chain_ms = max(warm_start.elapsed_time(warm_end), 1e-3)
-                    num_samples = max(
-                        1,
-                        min(
-                            num_samples,
-                            int(self._COLD_CHAIN_SAMPLE_BUDGET_MS // chain_ms),
-                        ),
+                    affordable = int(self._COLD_CHAIN_SAMPLE_BUDGET_MS // chain_ms)
+                    if exact_samples:
+                        # FLASHINFER_AUTOTUNER_EXACT_SAMPLES=1: take exactly
+                        # ``repeat`` samples whatever the chain costs. The time
+                        # budget only limits how long tuning takes; it must not
+                        # decide how many samples a candidate gets.
+                        pass
+                    elif affordable < min(num_samples, self._COLD_CHAIN_MIN_SAMPLES):
+                        # The chain is so long that the budget would leave us
+                        # with a single sample or two. A slow kernel does not
+                        # need a chain to hide its launch latency: time
+                        # ``repeat`` isolated launches instead.
+                        eager = True
+                    else:
+                        num_samples = max(1, min(num_samples, affordable))
+                sample_graph = graph
+                if chain and not eager and short_mode == "single":
+                    # Consecutive launches of a captured chain can overlap in
+                    # time, which inflates and splits the time of kernels that
+                    # occupy every SM. Time one launch per graph replay instead
+                    # (FLASHINFER_AUTOTUNER_SHORT_KERNEL_MODE=single).
+                    sample_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(sample_graph):
+                        _run_once(input_tensor_batches[-1])
+                    sample_graph.replay()
+                    stream.synchronize()
+                    single_launch = True
+                waited_s, clock_before = 0.0, _nvml_clock_state(device)
+                if wait_for_boost_s > 0:
+                    waited_s, clock_before, reached = _wait_for_boost(
+                        device, wait_for_boost_s, boost_tolerance_mhz
                     )
+                    boost_missed += 0 if reached else 1
                 starts = [
                     torch.cuda.Event(enable_timing=True) for _ in range(num_samples)
                 ]
@@ -4534,25 +4796,126 @@ class AutoTuner:
                 if delay_kernel_time_usec > 0:
                     delay_kernel(delay_kernel_time_usec)
 
-                for sample_idx in range(num_samples):
-                    l2_flush()
-                    starts[sample_idx].record(stream)
-                    if graph is not None:
-                        graph.replay()
-                    else:
-                        _run_once(
-                            input_tensor_batches[sample_idx % len(input_tensor_batches)]
-                        )
-                    ends[sample_idx].record(stream)
+                # Isolated launches of a slow kernel heat the GPU within a few
+                # samples, so the clock sags while the samples are taken. Wait
+                # for the boost clock again before every sample, not only
+                # before the first one (FLASHINFER_AUTOTUNER_BOOST_WAIT_EACH=0
+                # turns this off).
+                wait_each = (
+                    (exact_samples or eager or graph is None or single_launch)
+                    and wait_for_boost_s > 0
+                    and os.environ.get("FLASHINFER_AUTOTUNER_BOOST_WAIT_EACH", "1")
+                    != "0"
+                )
+                clock_each = []
+                import time as _time
 
-                # One synchronization after all samples keeps host overhead
-                # out of the per-invocation measurements.
-                stream.synchronize()
+                # With EXACT_SAMPLES, a series that ended with the clock below
+                # its maximum was throttled while it ran: its samples are
+                # dropped and the series is measured again (up to 3 times).
+                max_attempts = 3 if (exact_samples and wait_for_boost_s > 0) else 1
+                for attempt in range(max_attempts):
+                    if attempt > 0:
+                        series_retries += 1
+                        clock_each = []
+                        waited_now, _, reached = _wait_for_boost(
+                            device, wait_for_boost_s, boost_tolerance_mhz
+                        )
+                        boost_missed += 0 if reached else 1
+                        waited_s += waited_now
+                        if delay_kernel_time_usec > 0:
+                            delay_kernel(
+                                max(
+                                    delay_kernel_time_usec, self.stream_delay_micro_secs
+                                )
+                            )
+                    series_start = _time.perf_counter()
+                    for sample_idx in range(num_samples):
+                        if wait_each and sample_idx > 0:
+                            stream.synchronize()
+                            waited_now, state_now, reached = _wait_for_boost(
+                                device, wait_for_boost_s, boost_tolerance_mhz
+                            )
+                            boost_missed += 0 if reached else 1
+                            waited_s += waited_now
+                            if state_now is not None:
+                                clock_each.append(state_now["sm_mhz"])
+                            if delay_kernel_time_usec > 0:
+                                # Keep the GPU busy while the host enqueues the
+                                # sample: the host needs far more than a graph
+                                # delay (100 us) for a runner such as cuDNN's,
+                                # and an idle GPU would put that host time into
+                                # the measured interval.
+                                delay_kernel(
+                                    max(
+                                        delay_kernel_time_usec,
+                                        self.stream_delay_micro_secs,
+                                    )
+                                )
+                        l2_flush()
+                        starts[sample_idx].record(stream)
+                        if sample_graph is not None and not eager:
+                            sample_graph.replay()
+                        else:
+                            _run_once(
+                                input_tensor_batches[
+                                    sample_idx % len(input_tensor_batches)
+                                ]
+                            )
+                        ends[sample_idx].record(stream)
+
+                    # One synchronization after all samples keeps host overhead
+                    # out of the per-invocation measurements.
+                    stream.synchronize()
+                    series_s = _time.perf_counter() - series_start
+                    clock_after = _nvml_clock_state(device)
+                    throttled = (
+                        clock_after is not None
+                        and clock_after["sm_mhz"]
+                        < clock_after["sm_max_mhz"] - boost_tolerance_mhz
+                    )
+                    if not (throttled and attempt + 1 < max_attempts):
+                        break
 
             samples = [
                 start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)
             ]
-            return statistics.median(samples) / len(captured_batches)
+            per_launch = (
+                1
+                if (eager or graph is None or single_launch)
+                else len(captured_batches)
+            )
+            result = statistics.median(samples) / per_launch
+            if os.environ.get("FLASHINFER_AUTOTUNER_PROFILE_LOG"):
+                _profile_log(
+                    {
+                        "runner": type(runner).__name__,
+                        "tactic": str(tactic),
+                        "shapes": str(self._get_input_sizes(inputs)),
+                        "time_ms": result,
+                        "mode": (
+                            "eager"
+                            if (eager or graph is None)
+                            else ("single" if single_launch else "chain")
+                        ),
+                        "launches_per_sample": per_launch,
+                        "samples": num_samples,
+                        "requested_samples": requested_samples,
+                        "chain_ms": chain_ms,
+                        "budget_ms": self._COLD_CHAIN_SAMPLE_BUDGET_MS,
+                        "sample_ms": [round(x / per_launch, 5) for x in samples],
+                        "waited_ms": round(waited_s * 1e3, 1),
+                        "wait_each": wait_each,
+                        "boost_missed": boost_missed,
+                        "exact_samples": exact_samples,
+                        "series_retries": series_retries,
+                        "series_s": round(series_s, 4),
+                        "clock_before_each_sample": clock_each,
+                        "clock_before": clock_before,
+                        "clock_after": clock_after,
+                    }
+                )
+            return result
 
         def pure_profile(stream: torch.cuda.Stream, repeat: int) -> float:
             graph = torch.cuda.CUDAGraph()
