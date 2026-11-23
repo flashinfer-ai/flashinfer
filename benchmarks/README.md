@@ -46,6 +46,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mm_fp8` - Matrix multiplication with FP8 inputs using the trtllm-gen low-latency GEMM (Blackwell SM10.0+, small-M optimized, pre-shuffled weights).
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
+    - `mm_tf32` - Matrix multiplication with FP32 inputs and output, TF32 MMAs (CuTe DSL cluster split-K on SM100/SM103/SM107; cuBLAS on SM80+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - Batch-invariant mode: `--backends batch_invariant` runs on supported APIs with `batch_invariant=True` [Batch-invariant mode](#batch-invariant-mode).
 - MOE:
@@ -324,7 +325,7 @@ never on the batch size, the row's position in the batch or the kernel configura
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
-| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
+| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `mm_tf32`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
 | `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
 
 ### MOE Flags

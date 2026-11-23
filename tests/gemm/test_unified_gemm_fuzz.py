@@ -39,7 +39,7 @@ convention-compat fix) makes two previously-divergent APIs share a convention, m
 same conformance group and the test will *enforce* they now agree -- and the ledger entry's removal
 becomes the proof the convention was unified.
 
-STATUS: framework + 7 grounded adapters (bf16 mm+bmm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm /
+STATUS: framework + 8 grounded adapters (bf16 mm+bmm / tf32 mm / fp8 bmm incl e4m3+e5m2 / nvfp4 mm / mxfp4 mm /
 mxfp8 mm+bmm) + a standalone quantize-root fuzzer. This file REPLACES the earlier per-op
 ``test_mm_fp4_fuzz.py`` / ``test_bmm_fp8_fuzz.py`` (their logic + the #2440 quantize test are folded
 in here). Validated on A100/SM80, L40S/SM89, H100/SM90, B200/SM100. The mxfp8 adapters surfaced two
@@ -84,6 +84,7 @@ from flashinfer import (
     mm_bf16,
     mm_fp4,
     mm_mxfp8,
+    mm_tf32,
     mxfp4_quantize,
     mxfp8_dequantize_host,
     mxfp8_quantize,
@@ -223,6 +224,19 @@ def _run_bf16_mm(a, b, out, backend, cfg):
         out.copy_(o)
 
 
+# --- tf32 mm: fp32 in / fp32 out, TF32 MMAs. bf16 inputs are exact in TF32, so the bf16 snap
+# keeps the reference exact; the fp32 result is rounded to the harness's out dtype. ---------------
+def _run_tf32_mm(a, b, out, backend, cfg):
+    # The cuBLAS backend follows the caller's TF32 setting.
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        o = mm_tf32(a.float(), b.float().transpose(0, 1), backend=backend)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    out.copy_(o)
+
+
 # --- fp8 bmm: per-tensor A/B scales passed as separate args, no output scale -------------------
 def _run_fp8_bmm(a, b, out, backend, cfg):
     idt = cfg.fp8_idt or torch.float8_e4m3fn
@@ -353,6 +367,19 @@ _ADAPTERS = [
         run=_run_bf16_mm,
         deterministic=True,
         align=1,
+    ),
+    GemmAdapter(
+        key="mm_tf32",
+        op_shape="mm",
+        quant_mode="tf32",
+        backends=("cublas", "auto")
+        + (("cute-dsl",) if _CC in ((10, 0), (10, 3), (10, 7)) else ()),
+        convention={"a_scale": "none", "b_scale": "none", "global": "none"},
+        supported=lambda sm: sm >= 80,
+        run=_run_tf32_mm,
+        deterministic=True,
+        align=64,  # the cute-dsl kernel splits K into 2+ slices of 32+
+        min_dim=64,
     ),
     GemmAdapter(
         key="bmm_fp8",
@@ -730,6 +757,8 @@ _QMODE = {
     # Calibrated on SM100 (60-config sweep, observed max-ratio): bf16 .0027, fp8 .0092 (incl e5m2),
     # mxfp4 .0039, nvfp4 .053. atol_frac set ~3-5x that (extra margin on bf16/fp8 for cross-arch).
     "bf16": (_snap_bf16, 1.5e-2, 1.0e-2),
+    # bf16-grid inputs are exact in TF32 and the sum is fp32: same floor as bf16.
+    "tf32": (_snap_bf16, 1.5e-2, 1.0e-2),
     "fp8": (_snap_fp8, 4.0e-2, 5.0e-2),
     "mxfp8": (_snap_mxfp8, 4.0e-2, 5.0e-2),
     "nvfp4": (_snap_nvfp4, 1.2e-1, 1.0e-1),
