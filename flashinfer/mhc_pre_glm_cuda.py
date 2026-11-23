@@ -15,6 +15,11 @@ reference at the audited tolerance (atol 4e-3, rtol 1e-2, matched ratio
 >= 0.995, max-error cap 0.05) on GLM-5.3 workload statistics; fp32 weight
 structure below bf16/tf32 resolution is not preserved. Callers that need
 strict fp32 projection semantics should select ``backend="big-fuse"``.
+Automatic selection inherits this reduced-precision contract. Fixed-shape
+repeatability does not imply batch invariance: changing the token count can
+change the kernel, operand precision, split-K count and accumulation
+order, so a token's result can change across batches.
+
 CUDA graphs: the route is taken under capture only after the module was built
 eagerly (single fatbin, no per-shape JIT); dispatch is host-int based with no
 syncs, and the kernels use programmatic dependent launch on the current

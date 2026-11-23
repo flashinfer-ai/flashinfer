@@ -439,9 +439,15 @@ def mhc_pre(
           raises, with the reasons in the message
           (:data:`flashinfer.mhc_pre_glm_cuda.LAST_FALLBACK_REASONS`).
           Kill switch: ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``.
-        - ``"auto"``: purely a router — the specialized kernel when its
-          allowlist admits the call, else the big-fuse path, with identical
-          semantics either way.
+        - ``"auto"``: the specialized kernel when its allowlist admits the
+          call, otherwise the big-fuse path. When specialized is selected,
+          its reduced-precision numerics contract above applies. Select
+          ``"big-fuse"`` when fp32 projection semantics are required.
+
+        Fixed-shape repeatability does not imply batch invariance: changing
+        the token count can change the selected
+        kernel, operand precision, split-K count and accumulation order, so
+        a token's result can change when it is placed in a different batch.
 
     Returns
     -------
