@@ -34,7 +34,7 @@ from .mx_api import (
     mxfp4_quantize_batch_invariant,
 )
 from .nvfp4_schedule import BLOCK, QuantConfig, default_config, num_blocks
-from .nvfp4_spec import PER_TENSOR, PER_TOKEN, Variant
+from .nvfp4_spec import PER_TENSOR, PER_TOKEN, Recipe, Variant
 
 CLASS_NVFP4 = "nvfp4.quant"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
@@ -60,6 +60,38 @@ def _compiled_kernel(*key):
 
         _get_compiled_kernel = get_compiled_kernel
     return _get_compiled_kernel(*key)
+
+
+def recipe_of(nvfp4_4over6, cls: str) -> Optional[Recipe]:
+    """The 4over6 recipe of a call: ``None`` (the plain classes), a :class:`nvfp4_spec.Recipe`, or FlashInfer's resolved
+    ``NVFP44Over6Config`` by its fields (``err_mode`` an enum or a string, ``e4m3_max``, ``err_use_fast_math``). The
+    fast-math error evaluation (fp16 candidate decoding) is not a class and raises, as the fast-math quantization does."""
+    if nvfp4_4over6 is None:
+        return None
+    if isinstance(nvfp4_4over6, Recipe):
+        return nvfp4_4over6
+    if getattr(nvfp4_4over6, "err_use_fast_math", False):
+        raise unsupported(
+            cls,
+            "the 4over6 recipe with err_use_fast_math=True",
+            "err_use_fast_math=False: the exact error evaluation (fp16 candidate decoding is approximate arithmetic)",
+        )
+    mode = getattr(nvfp4_4over6, "err_mode", None)
+    if mode is None:
+        raise unsupported(
+            cls,
+            f"the 4over6 recipe object {nvfp4_4over6!r}",
+            "a Recipe or NVFP44Over6Config (err_mode, e4m3_max, err_use_fast_math)",
+        )
+    mode = str(getattr(mode, "name", mode)).lower()
+    e4m3_max = int(getattr(nvfp4_4over6, "e4m3_max", 448))
+    if mode not in ("mae", "mse") or e4m3_max not in (448, 256):
+        raise unsupported(
+            cls,
+            f"the 4over6 recipe {nvfp4_4over6!r}",
+            "err_mode MAE / MSE with e4m3_max 448 / 256",
+        )
+    return Recipe(mode, e4m3_max)
 
 
 def _scale_tensor(scale, ref: torch.Tensor) -> torch.Tensor:
@@ -93,6 +125,7 @@ def nvfp4_quantize_rows(
     config: Optional[QuantConfig] = None,
     enable_pdl: bool = False,
     sm_count: Optional[int] = None,
+    recipe: Optional[Recipe] = None,
 ):
     """Quantize ``a`` (bf16 / f16 / fp32, last dim ``K`` a multiple of 16) to NVFP4 (the fp32 input is the same class:
     the leaf is the fp32 value of the element after the exact widening, so the bf16 / f16 bits are unchanged).
@@ -101,8 +134,13 @@ def nvfp4_quantize_rows(
     layout ``layout`` names (``"128x4"``, ``"8x4"`` or ``"linear"``; padding bytes zero). With ``per_token=True`` a third
     tensor, the per-row fp32 scale, is returned and ``a_global_sf`` is the inverse base scale (TE: ``1 / (448 * 6)``);
     otherwise ``a_global_sf`` is the per-tensor global scale, an input (a host float or a 1-element fp32 device tensor).
-    Bitwise identical for every ``config`` in :func:`nvfp4_schedule.all_valid_configs`, for every batch composition,
-    every SM count and the three layouts."""
+    ``recipe`` (a :class:`nvfp4_spec.Recipe`): the 4over6 classes -- every block quantised with the scale that maps its
+    maximum to 6 and with 1.5x that scale, the candidate with the smaller reconstruction error (MAE or MSE) kept; the
+    global scale is then the one the recipe's ``e4m3_max`` implies. Their placements hold a whole block in one thread
+    (``config.elems_per_thread == 16``, every dispatcher pick; :func:`nvfp4_schedule.valid_configs_4over6`).
+
+    Bitwise identical for every ``config`` in :func:`nvfp4_schedule.all_valid_configs` (the 4over6 classes: the V16
+    subset), for every batch composition, every SM count and the three layouts."""
     if a.dtype not in _DTYPE_STR:
         raise ValueError(f"input dtype {a.dtype} not supported (bf16 / f16 / fp32)")
     layout = layout_of(layout)
@@ -110,7 +148,11 @@ def nvfp4_quantize_rows(
     num_blocks(K)
     x2 = _rows(a, K, "input")
     M = x2.shape[0]
-    variant: Variant = PER_TOKEN if per_token else PER_TENSOR
+    variant = (
+        Variant(per_token, recipe)
+        if recipe is not None
+        else (PER_TOKEN if per_token else PER_TENSOR)
+    )
     gs = _scale_tensor(a_global_sf, a)
     padded_M = padded_sf_rows(M, layout)
     nsf = sf_numel(M, K, BLOCK, layout)
@@ -128,7 +170,13 @@ def nvfp4_quantize_rows(
     elem_bytes = a.element_size()
     if config is None:
         config = default_config(
-            K, M, elem_bytes, per_token, sm_count or device_sm_count(a.device), layout
+            K,
+            M,
+            elem_bytes,
+            per_token,
+            sm_count or device_sm_count(a.device),
+            layout,
+            recipe=recipe,
         )
     else:
         config.validate(K, elem_bytes)
@@ -145,6 +193,9 @@ def nvfp4_quantize_rows(
     )
     kernel = _compiled_kernel(
         _DTYPE_STR[a.dtype], K, config, variant, bool(enable_pdl), layout
+    )
+    assert recipe is None or config.elems_per_thread == BLOCK, (
+        "a 4over6 config holds a whole block in one thread (elems_per_thread == 16)"
     )
     kernel(x2, fp4, sf, pts, gs, M, K, padded_M)
     if a.dim() != 2:
@@ -189,6 +240,9 @@ def nvfp4_quantize_batch_invariant(
     device, architecture; it never falls back."""
     cls = CLASS_NVFP4 + (".pertoken" if per_token_activation else "")
     check_device(a.device, cls, NVFP4_QUANT_ARCHS)
+    recipe = recipe_of(nvfp4_4over6, cls)
+    if recipe is not None:
+        cls = Variant(per_token_activation, recipe).class_name
     if a.dtype not in _DTYPE_STR:
         raise unsupported(cls, f"input dtype {a.dtype}", "bf16, f16 or fp32 inputs")
     if a.dim() < 1:
@@ -207,12 +261,6 @@ def nvfp4_quantize_batch_invariant(
             cls,
             f"sf_vec_size = {sf_vec_size}",
             f"sf_vec_size = {BLOCK} (one e4m3 scale per {BLOCK} elements)",
-        )
-    if nvfp4_4over6 is not None:
-        raise unsupported(
-            cls,
-            "an NVFP4 4over6 scale-candidate search",
-            "the plain NVFP4 recipe (nvfp4_4over6=None): a candidate search is another specification",
         )
     if expanded_idx_to_permuted_idx is not None:
         raise unsupported(
@@ -297,6 +345,7 @@ def nvfp4_quantize_batch_invariant(
         config=config,
         enable_pdl=bool(enable_pdl),
         sm_count=sm_count,
+        recipe=recipe,
     )
     fp4, sf = res[0], res[1].view(-1, pcols)
     if a.dim() != 2:
@@ -356,11 +405,11 @@ def fp4_quantize_batch_invariant(
             "sf_vec_size = 16 with e4m3 scales (the NVFP4 class) or sf_vec_size = 32 with UE8M0 scales (the MXFP4 class)",
         )
     cls = CLASS_NVFP4 if is_nvfp4 else CLASS_MXFP4
-    if nvfp4_4over6_config is not None:
+    if nvfp4_4over6_config is not None and is_mxfp4:
         raise unsupported(
             cls,
-            "an NVFP4 4over6 scale-candidate search",
-            "the plain NVFP4 recipe (nvfp4_4over6=None): a candidate search is another specification",
+            "a 4over6 recipe with MXFP4 (UE8M0 scales)",
+            "the 4over6 recipes with the NVFP4 class (e4m3 block scales, sf_vec_size = 16)",
         )
     if is_sf_swizzled_layout:
         layout = "8x4" if is_sf_8x4_layout else "128x4"
@@ -381,7 +430,7 @@ def fp4_quantize_batch_invariant(
         else:
             gs = global_scale
         codes, sf = nvfp4_quantize_batch_invariant(
-            x, gs, layout, enable_pdl=bool(enable_pdl)
+            x, gs, layout, enable_pdl=bool(enable_pdl), nvfp4_4over6=nvfp4_4over6_config
         )
     K = int(x.shape[-1])
     cols = (

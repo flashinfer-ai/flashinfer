@@ -2,7 +2,7 @@ import BIKernels.Canon
 import BIKernels.Semantics
 import BIKernels.Support
 /-!
-# NVFP4 quantization on the engine: classes `nvfp4.quant.te` and `nvfp4.quant.te.pertoken`
+# NVFP4 quantization on the engine: classes `nvfp4.quant.te`, `nvfp4.quant.te.pertoken` and the 4over6 classes
 
 Mirrors `quantization/nvfp4_spec.py` and `quantization/nvfp4_schedule.py`.
 
@@ -266,6 +266,237 @@ theorem rowamax_padded_bits {α : Type} (P : Prims α) (Good : α → Prop) (nb 
       exact habs _
     · simp only [hb, if_false, evalO]
       exact hGz
+
+/-! ## The 4over6 classes (docs/nvfp4_quant_scoping.md section 9 of the engine repository; `quantization/nvfp4_spec.py`: `Recipe`, `sf_candidate_values`,
+`recon`, `err_term`, `block_error`, `row_scale_chain_4over6`, `select_block`)
+
+Every block is quantised twice: with the scale that maps its maximum to 6 (`sfCand6`) and with 1.5x that scale
+(`sfCand4`); the candidate with the smaller reconstruction error over the block is kept. The error of a candidate is a
+register-level fold: a 16-step `add` chain from `+0` in element order over `|d_e - x_e|` (mae) or `(d_e - x_e)^2` (mse),
+where `d_e` is the element's reconstruction -- per tensor `mul(mul(q, sfd), div(1, gs))`, per token
+`div(mul(mul(q, sfd), ramax), 6 * e4m3Max)`. The selection `e4 < e6` (strict; a tie keeps 6) and the zero rule (a block
+with `amax = 0` gives the scale 0 and `+0` codes) are functions of the evaluated terms: `select4over6`. The error chain
+is one register factor in every plan (`Plan`: a fold digit is register-level), so its term is the same in every placement
+by construction; the config-invariance statement below carries the amax tree's invariance through the candidates and the
+chains and then through the selection (`block4over6_bits_equal`). -/
+
+def six : Term := .const "6.0"
+def onePointFive : Term := .const "1.5"
+def zeroT : Term := .const "0.0"
+
+/-- `spec.Recipe`: the error measure and the e4m3 clamp the global scale is built with (in the term of the per-token
+variant only: the reconstruction's denominator `6 * e4m3Max`). -/
+structure Recipe where
+  mse : Bool := false
+  e4m3Max : Nat := 448
+  deriving Repr, DecidableEq
+
+namespace Recipe
+def mae448 : Recipe := {}
+def mse448 : Recipe := { mse := true }
+def mae256 : Recipe := { e4m3Max := 256 }
+def mse256 : Recipe := { mse := true, e4m3Max := 256 }
+/-- `6 * e4m3Max` as Python prints the binary32 constant. -/
+def denom (r : Recipe) : Term := .const (if r.e4m3Max == 256 then "1536.0" else "2688.0")
+end Recipe
+
+/-- `sf6 = mul(div(amax, 6), gs)` (FlashInfer divides by 6 exactly here; the plain class multiplies by the rounded `1/6`). -/
+def sfCand6 (amax gs : Term) : Term := .mul (.div amax six) gs
+/-- `sf4 = mul(sf6, 1.5)`. -/
+def sfCand4 (amax gs : Term) : Term := .mul (sfCand6 amax gs) onePointFive
+
+/-- A candidate's `(sfd, inv)`: the e4m3 value of its scale and the encode scale (`invScale`). -/
+def candidate (amax gs : Term) (four : Bool) : Term × Term :=
+  let sfd := sfQuant (if four then sfCand4 amax gs else sfCand6 amax gs)
+  (sfd, invScale sfd gs)
+
+/-- The reconstruction of one quantised element (`spec.recon`). -/
+def recon (q sfd gs : Term) (ramax : Option Term) (r : Recipe) : Term :=
+  match ramax with
+  | none => .mul (.mul q sfd) (.div one gs)
+  | some ra => .div (.mul (.mul q sfd) ra) r.denom
+
+/-- The element's error: `fabs(add(d, neg(x)))` (mae) or the square of the difference (mse) (`spec.err_term`). -/
+def errTerm (r : Recipe) (d x : Term) : Term :=
+  let diff := Term.add d (.neg x)
+  if r.mse then .mul diff diff else .fabs diff
+
+/-- The block's error: the fold from `+0` in element order (`spec.block_error` = `Digit.reduce` of the `err` fold digit). -/
+def errChain (ts : List Term) : Term := ts.foldl (fun acc t => .add acc t) zeroT
+
+/-- The error of candidate `four` of block `b` (`QuantSpec.block(...)["e4" / "e6"]`). -/
+def blockErrTerms (r : Recipe) (row : Nat → Term) (b : Nat) (amax gs : Term) (ramax : Option Term) (four : Bool) : List Term :=
+  let c := candidate amax gs four
+  (List.range 16).map fun e => errTerm r (recon (quantElem (row (16 * b + e)) c.2) c.1 gs ramax r) (row (16 * b + e))
+
+def blockErr (r : Recipe) (row : Nat → Term) (b : Nat) (amax gs : Term) (ramax : Option Term) (four : Bool) : Term :=
+  errChain (blockErrTerms r row b amax gs ramax four)
+
+/-- The per-token 4over6 row scale: `rowScale` with the zero rule (`ramax = 0` gives `ges = 0`, `pts = 0`) as the opaque
+select `zsel` (`spec.row_scale_chain_4over6`). -/
+def rowScale4over6 (ramax gsInv : Term) : Term × Term :=
+  let p := rowScale ramax gsInv
+  (.opq2 "zsel" ramax p.1, .opq2 "zsel" ramax p.2)
+
+/-- The global scale of a 4over6 row (`QuantSpec.row_scale`): the input `gs` per tensor, the zero-ruled `ges` per token. -/
+def gs4over6 (perToken : Bool) (nb kb : Nat) (row : Nat → Term) : Option Term :=
+  if perToken then (rowAmax nb kb row).map (fun ra => (rowScale4over6 ra (.sym "gs_inv")).1) else some (.sym "gs")
+
+/-- The row amax the per-token reconstruction divides through (`none` per tensor). -/
+def ramax4over6 (perToken : Bool) (nb kb : Nat) (row : Nat → Term) : Option (Option Term) :=
+  if perToken then (rowAmax nb kb row).map some else some none
+
+/-- `QuantSpec.block(row, b)["sf4" / "sf6"]`. -/
+def spec4over6Sf (perToken : Bool) (nb kb : Nat) (row : Nat → Term) (b : Nat) (four : Bool) : Option Term :=
+  (gs4over6 perToken nb kb row).bind fun gs => (blockAmax row b).map fun a => (candidate a gs four).1
+
+/-- `QuantSpec.block(row, i / 16)["codes4" / "codes6"][i % 16]`. -/
+def spec4over6Code (perToken : Bool) (nb kb : Nat) (row : Nat → Term) (i : Nat) (four : Bool) : Option Term :=
+  (gs4over6 perToken nb kb row).bind fun gs => (blockAmax row (i / 16)).map fun a => quantElem (row i) (candidate a gs four).2
+
+/-- `QuantSpec.block(row, b)["e4" / "e6"]`. -/
+def spec4over6Err (r : Recipe) (perToken : Bool) (nb kb : Nat) (row : Nat → Term) (b : Nat) (four : Bool) : Option Term :=
+  (gs4over6 perToken nb kb row).bind fun gs => (ramax4over6 perToken nb kb row).bind fun ra =>
+    (blockAmax row b).map fun a => blockErr r row b a gs ra four
+
+/-- `QuantSpec.block(row, b)["t4" / "t6"]`: the 16 error terms the chain folds (the generated cases pin them one by one: the
+whole chain's string reaches 260 KB, beyond what the kernel's `decide` recursion can compare; the chain is `errChain` by
+definition and its full string is compared by `lake exe quantconformance`). Empty when the block is absent. -/
+def spec4over6ErrTerms (r : Recipe) (perToken : Bool) (nb kb : Nat) (row : Nat → Term) (b : Nat) (four : Bool) : List Term :=
+  ((gs4over6 perToken nb kb row).bind fun gs => (ramax4over6 perToken nb kb row).bind fun ra =>
+    (blockAmax row b).map fun a => blockErrTerms r row b a gs ra four).getD []
+
+/-- `QuantSpec.row_scale(row)[1]` of a per-token 4over6 class. -/
+def spec4over6Pts (nb kb : Nat) (row : Nat → Term) : Option Term :=
+  (rowAmax nb kb row).map fun ra => (rowScale4over6 ra (.sym "gs_inv")).2
+
+/-- `spec.select_block` on evaluated values: the zero rule, then the strict pick (`lt` and `isZero` are whatever the
+interpretation's order and zero test are: the statement needs only that they are functions). -/
+def select4over6 {α : Type} (lt : α → α → Bool) (isZero : α → Bool) (amax e4 e6 c4 c6 zero : α) : α :=
+  if isZero amax then zero else if lt e4 e6 then c4 else c6
+
+/-! ### Invariance through the 4over6 chains -/
+
+theorem sfCand6_equiv {a a' gs gs' : Term} (ha : Equiv a' a) (hg : Equiv gs' gs) : Equiv (sfCand6 a' gs') (sfCand6 a gs) :=
+  .mul_congr (.div_congr ha (.refl _)) hg
+
+theorem candidate_equiv {a a' gs gs' : Term} (ha : Equiv a' a) (hg : Equiv gs' gs) (four : Bool) :
+    Equiv (candidate a' gs' four).1 (candidate a gs four).1 ∧ Equiv (candidate a' gs' four).2 (candidate a gs four).2 := by
+  have hs : Equiv (sfQuant (if four then sfCand4 a' gs' else sfCand6 a' gs')) (sfQuant (if four then sfCand4 a gs else sfCand6 a gs)) := by
+    cases four
+    · exact .cvt_congr _ (sfCand6_equiv ha hg)
+    · exact .cvt_congr _ (.mul_congr (sfCand6_equiv ha hg) (.refl _))
+  exact ⟨hs, .fmin_congr (.div_congr (.refl _) (.mul_congr hs (.div_congr (.refl _) hg))) (.refl _)⟩
+
+theorem recon_equiv {q q' sfd sfd' gs gs' : Term} {ra ra' : Option Term} (hq : Equiv q' q) (hs : Equiv sfd' sfd) (hg : Equiv gs' gs)
+    (hr : ∀ x x', ra' = some x' → ra = some x → Equiv x' x) (hn : (ra' = none) ↔ (ra = none)) (r : Recipe) :
+    Equiv (recon q' sfd' gs' ra' r) (recon q sfd gs ra r) := by
+  cases h1 : ra' with
+  | none =>
+    have h2 : ra = none := hn.mp h1
+    simp only [recon, h1, h2]
+    exact .mul_congr (.mul_congr hq hs) (.div_congr (.refl _) hg)
+  | some x' =>
+    cases h2 : ra with
+    | none => exact absurd (hn.mpr h2) (by simp [h1])
+    | some x =>
+      simp only [recon, h1, h2]
+      exact .div_congr (.mul_congr (.mul_congr hq hs) (hr x x' h1 h2)) (.refl _)
+
+theorem errTerm_equiv {d d' : Term} (r : Recipe) (x : Term) (hd : Equiv d' d) : Equiv (errTerm r d' x) (errTerm r d x) := by
+  unfold errTerm
+  cases r.mse
+  · exact .fabs_congr (.add_congr hd (.refl _))
+  · exact .mul_congr (.add_congr hd (.refl _)) (.add_congr hd (.refl _))
+
+/-- The add chain over `List.map f l` is `Equiv` to the one over `List.map g l` when `f` and `g` are pointwise `Equiv`
+(the chain's association is the list's order, the same on both sides). -/
+theorem foldl_add_map_equiv (l : List Nat) (f g : Nat → Term) (acc acc' : Term) (hacc : Equiv acc' acc)
+    (h : ∀ x, Equiv (f x) (g x)) :
+    Equiv ((l.map f).foldl (fun a t => Term.add a t) acc') ((l.map g).foldl (fun a t => Term.add a t) acc) := by
+  induction l generalizing acc acc' with
+  | nil => exact hacc
+  | cons x xs ih =>
+    simp only [List.map, List.foldl]
+    exact ih _ _ (.add_congr hacc (h x))
+
+theorem blockErr_equiv (r : Recipe) (row : Nat → Term) (b : Nat) {a a' gs gs' : Term} {ra ra' : Option Term}
+    (ha : Equiv a' a) (hg : Equiv gs' gs) (hr : ∀ x x', ra' = some x' → ra = some x → Equiv x' x) (hn : (ra' = none) ↔ (ra = none))
+    (four : Bool) : Equiv (blockErr r row b a' gs' ra' four) (blockErr r row b a gs ra four) := by
+  unfold blockErr blockErrTerms errChain
+  apply foldl_add_map_equiv _ _ _ _ _ (.refl _)
+  intro e
+  have hc := candidate_equiv ha hg four
+  exact errTerm_equiv r _ (recon_equiv (.cvt_congr _ (.mul_congr (.refl _) hc.2)) hc.1 hg hr hn r)
+
+/-- The selection is a function of its evaluated inputs: equal inputs give equal outputs. -/
+theorem select4over6_congr {α : Type} (lt : α → α → Bool) (isZero : α → Bool) (zero : α)
+    {a a' e4 e4' e6 e6' c4 c4' c6 c6' : α}
+    (ha : a' = a) (h4 : e4' = e4) (h6 : e6' = e6) (hc4 : c4' = c4) (hc6 : c6' = c6) :
+    select4over6 lt isZero a' e4' e6' c4' c6' zero = select4over6 lt isZero a e4 e6 c4 c6 zero := by
+  subst ha h4 h6 hc4 hc6
+  rfl
+
+/-- **End-to-end, a 4over6 block with the global scale given (the per-tensor classes, or a per-token class once its row
+scale is fixed).** For every valid placement of the `elem` digit and every unit, the kernel's block amax exists and, under
+any commutative interpretation, evaluates to the spec's; so do both candidates' scales, both error chains and every
+candidate code (`eval_equiv` through the chains). -/
+theorem block4over6_evals_equal {α : Type} (P : Prims α) (r : Recipe) (row : Nat → Term) (b : Nat) (gs : Term)
+    (ps : List (List Factor)) (cs : List (List Bool)) (hp : PlacementOK [4] ps) (hc : CoordsOK (flatten ps) cs) :
+    ∃ a a', blockAmax row b = some a ∧ execC .fmaxc (flatten ps) (fun bs => some (leaf row (16 * b + bitsToNat bs))) cs = some a' ∧
+      eval P a' = eval P a ∧
+      (∀ four, eval P (blockErr r row b a' gs none four) = eval P (blockErr r row b a gs none four)) ∧
+      (∀ four, eval P (candidate a' gs four).1 = eval P (candidate a gs four).1) ∧
+      (∀ four e, eval P (quantElem (row (16 * b + e)) (candidate a' gs four).2)
+        = eval P (quantElem (row (16 * b + e)) (candidate a gs four).2)) := by
+  obtain ⟨a, ha⟩ := blockAmax_some row b
+  have h := block_amax_invariance row b ps cs hp hc
+  rw [ha] at h
+  obtain ⟨a', hk, he⟩ := OEquiv.some_right h
+  have hnone : ∀ x x', (none : Option Term) = some x' → (none : Option Term) = some x → Equiv x' x :=
+    fun _ _ h _ => by cases h
+  refine ⟨a, a', ha, hk, eval_equiv P he, fun four => eval_equiv P (blockErr_equiv r row b he (.refl gs) hnone Iff.rfl four),
+    fun four => eval_equiv P (candidate_equiv he (.refl gs) four).1, fun four e => ?_⟩
+  exact eval_equiv P (Equiv.cvt_congr "e2m1" (Equiv.mul_congr (.refl (row (16 * b + e))) (candidate_equiv he (.refl gs) four).2))
+
+/-- **The selected outputs are bitwise equal**: the scale byte and every code the kernel selects (`select4over6` on the
+evaluated amax, errors and candidates, with whatever order and zero test the interpretation uses) equal the spec's. -/
+theorem block4over6_bits_equal {α : Type} (P : Prims α) (lt : α → α → Bool) (isZero : α → Bool) (zero : α)
+    (r : Recipe) (row : Nat → Term) (b : Nat) (gs : Term) (ps : List (List Factor)) (cs : List (List Bool))
+    (hp : PlacementOK [4] ps) (hc : CoordsOK (flatten ps) cs) :
+    ∃ a a', blockAmax row b = some a ∧ execC .fmaxc (flatten ps) (fun bs => some (leaf row (16 * b + bitsToNat bs))) cs = some a' ∧
+      (select4over6 lt isZero (eval P a') (eval P (blockErr r row b a' gs none true)) (eval P (blockErr r row b a' gs none false))
+          (eval P (candidate a' gs true).1) (eval P (candidate a' gs false).1) zero
+        = select4over6 lt isZero (eval P a) (eval P (blockErr r row b a gs none true)) (eval P (blockErr r row b a gs none false))
+          (eval P (candidate a gs true).1) (eval P (candidate a gs false).1) zero) ∧
+      ∀ e, select4over6 lt isZero (eval P a') (eval P (blockErr r row b a' gs none true)) (eval P (blockErr r row b a' gs none false))
+          (eval P (quantElem (row (16 * b + e)) (candidate a' gs true).2)) (eval P (quantElem (row (16 * b + e)) (candidate a' gs false).2)) zero
+        = select4over6 lt isZero (eval P a) (eval P (blockErr r row b a gs none true)) (eval P (blockErr r row b a gs none false))
+          (eval P (quantElem (row (16 * b + e)) (candidate a gs true).2)) (eval P (quantElem (row (16 * b + e)) (candidate a gs false).2)) zero := by
+  obtain ⟨a, a', ha, hk, hA, hE, hS, hC⟩ := block4over6_evals_equal P r row b gs ps cs hp hc
+  exact ⟨a, a', ha, hk, select4over6_congr lt isZero zero hA (hE true) (hE false) (hS true) (hS false),
+    fun e => select4over6_congr lt isZero zero hA (hE true) (hE false) (hC true e) (hC false e)⟩
+
+/-- The per-token 4over6 row scale and output are `Equiv` to the spec's for every valid placement (the opaque select is a
+congruence). -/
+theorem rowScale4over6_equiv {r r' : Term} (h : Equiv r' r) (gsInv : Term) :
+    Equiv (rowScale4over6 r' gsInv).1 (rowScale4over6 r gsInv).1 ∧ Equiv (rowScale4over6 r' gsInv).2 (rowScale4over6 r gsInv).2 :=
+  ⟨.opq2_congr _ h (rowScale_equiv h gsInv).1, .opq2_congr _ h (rowScale_equiv h gsInv).2⟩
+
+theorem row4over6_outputs_invariant (nb kb : Nat) (row : Nat → Term) (ps : List (List Factor)) (cs : List (List Bool))
+    (hp : PlacementOK [4, kb] ps) (hc : CoordsOK (flatten ps) cs) (r : Term) (hr : rowAmax nb kb row = some r) :
+    ∃ r', execC .fmaxc (flatten ps) (rowLeaf nb row) cs = some r' ∧
+      Equiv (rowScale4over6 r' (.sym "gs_inv")).1 (rowScale4over6 r (.sym "gs_inv")).1 ∧
+      Equiv (rowScale4over6 r' (.sym "gs_inv")).2 (rowScale4over6 r (.sym "gs_inv")).2 := by
+  have h := row_amax_invariance nb kb row ps cs hp hc
+  rw [hr] at h
+  obtain ⟨r', hk, he⟩ := OEquiv.some_right h
+  exact ⟨r', hk, (rowScale4over6_equiv he _).1, (rowScale4over6_equiv he _).2⟩
+
+/-- The 4over6 classes are not the plain class: the candidate "6" scale differs from the plain scale as a term (an exact
+division by 6 against a multiplication by the rounded reciprocal), so the fingerprints separate; stated on one
+instance and decided by computation. -/
+theorem sfCand6_ne_sfValue : sfCand6 (.x 0) (.sym "gs") ≠ sfValue (.x 0) (.sym "gs") := by decide
 
 /-! ## The launch model: R1 / R2 by construction -/
 

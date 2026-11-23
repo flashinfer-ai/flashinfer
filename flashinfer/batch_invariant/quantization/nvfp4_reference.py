@@ -47,6 +47,12 @@ class ExactF32:
     )  # the probed sm_107 max.f32 rule (shared with the attention class)
     fabs = staticmethod(fp32.fabs)
     nzor = staticmethod(fp32.nzor)
+    neg = staticmethod(fp32.neg)
+
+    @staticmethod
+    def zsel(e, p):
+        """``ZSEL(e, p) = +0 if e == 0 else p`` on binary32 values (``-0 == 0`` is true, NaN compares false)."""
+        return 0.0 if e == 0 else p
 
     @staticmethod
     def cvt_out(a, fmt):
@@ -191,6 +197,19 @@ class TorchF32:
         )
 
     @staticmethod
+    def neg(a):
+        return -a
+
+    @staticmethod
+    def zsel(e, p):
+        """``ZSEL(e, p) = +0 if e == 0 else p`` elementwise (``-0 == 0`` selects too; NaN does not)."""
+        e, p = torch.broadcast_tensors(
+            torch.as_tensor(e, dtype=torch.float32),
+            torch.as_tensor(p, dtype=torch.float32),
+        )
+        return torch.where(e == 0, torch.zeros_like(p), p)
+
+    @staticmethod
     def cvt_out(a, fmt):
         if fmt == "e4m3":
             return e4m3_round(a)
@@ -259,11 +278,15 @@ def amax_ignoring_nan(v: torch.Tensor) -> torch.Tensor:
 
 
 def quantize_reference(
-    x: torch.Tensor, gs: Union[float, torch.Tensor], per_token: bool = False
+    x: torch.Tensor,
+    gs: Union[float, torch.Tensor],
+    per_token: bool = False,
+    recipe: Optional[S.Recipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """The spec for a whole (M, K) tensor, vectorised: ``(packed (M, K/2) uint8, sf 128x4 swizzled
     (padded_M, padded_cols) uint8, pts (M,) f32 | None)``. ``gs`` is the global scale (per-tensor) or
-    the inverse base scale ``gs_inv`` (per-token)."""
+    the inverse base scale ``gs_inv`` (per-token). ``recipe``: a 4over6 class -- both candidates, the two error
+    chains in index order, the selection and the zero rule (``S.select_block``), vectorised."""
     x = x.detach().cpu()
     M, K = x.shape
     nb = num_blocks(K)
@@ -274,31 +297,80 @@ def quantize_reference(
     )  # the canonical tree's value (max of non-negatives; a NaN operand is ignored)
     g = _scale_value(gs)
     pts = None
+    ramax = None
     if per_token:
         ramax = amax_ignoring_nan(amax)
-        ges, pts = S.row_scale_chain(fp, ramax, g)
+        if recipe is not None:
+            ges, pts = S.row_scale_chain_4over6(fp, ramax, g)
+        else:
+            ges, pts = S.row_scale_chain(fp, ramax, g)
         gsb = ges.view(M, 1)
     else:
         gsb = g
-    sf_d, inv = S.block_chain(fp, amax, gsb)  # (M, nb)
-    q = S.quant_elem(fp, xf, inv.unsqueeze(-1))  # (M, nb, 16) e2m1 values
+    if recipe is None:
+        sf_d, inv = S.block_chain(fp, amax, gsb)  # (M, nb)
+        q = S.quant_elem(fp, xf, inv.unsqueeze(-1))  # (M, nb, 16) e2m1 values
+    else:
+        sfd4, sfd6, inv4, inv6 = S.sf_candidates(fp, amax, gsb)  # (M, nb)
+        q4 = S.quant_elem(fp, xf, inv4.unsqueeze(-1))  # (M, nb, 16)
+        q6 = S.quant_elem(fp, xf, inv6.unsqueeze(-1))
+        gsb_e = torch.as_tensor(gsb, dtype=torch.float32)
+        gs_b = (
+            gsb_e.view(M, 1) if gsb_e.dim() else gsb_e
+        )  # (M, 1) per token, a scalar per tensor
+        ram_b = ramax.view(M, 1) if ramax is not None else None
+        ts4 = [
+            S.err_term(
+                fp,
+                S.recon(fp, q4[..., e], sfd4, gs_b, ram_b, recipe.e4m3_max),
+                xf[..., e],
+                recipe.err_mode,
+            )
+            for e in range(BLOCK)
+        ]
+        ts6 = [
+            S.err_term(
+                fp,
+                S.recon(fp, q6[..., e], sfd6, gs_b, ram_b, recipe.e4m3_max),
+                xf[..., e],
+                recipe.err_mode,
+            )
+            for e in range(BLOCK)
+        ]
+        e4, e6 = (
+            S.block_error(fp, ts4),
+            S.block_error(fp, ts6),
+        )  # (M, nb) each: the index-order chains
+        pick4 = e4 < e6
+        zero = amax == 0
+        sf_d = torch.where(zero, torch.zeros_like(sfd6), torch.where(pick4, sfd4, sfd6))
+        q = torch.where(
+            zero.unsqueeze(-1),
+            torch.zeros_like(q6),
+            torch.where(pick4.unsqueeze(-1), q4, q6),
+        )
     packed = pack_e2m1(e2m1_codes(q).view(M, K))
     sf = swizzle_sf_128x4(e4m3_bytes(sf_d), M, K)
     return packed, sf, pts
 
 
 def exact_rows(
-    x: torch.Tensor, gs: Union[float, torch.Tensor], rows, per_token: bool = False
+    x: torch.Tensor,
+    gs: Union[float, torch.Tensor],
+    rows,
+    per_token: bool = False,
+    recipe: Optional[S.Recipe] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """The symbolic spec evaluated with the exact backend for ``rows`` of ``x``: ``(packed (n, K/2),
-    sf (n, K/16) logical bytes, pts (n,) | None)``. Slow (Fractions); a few rows."""
+    sf (n, K/16) logical bytes, pts (n,) | None)``. Slow (Fractions); a few rows. ``recipe``: a 4over6 class --
+    the two error terms are evaluated and ``S.select_block`` applies the selection and the zero rule."""
     x = x.detach().cpu()
     M, K = x.shape
     nb = num_blocks(K)
-    spec = S.QuantSpec(K, S.Variant(per_token))
+    spec = S.QuantSpec(K, S.Variant(per_token, recipe))
     xf = x.to(torch.float32).double()
     g = float(_scale_value(gs))
-    syms = {"gs_inv" if per_token else "gs": fp32.to_f32(g)}
+    syms = {"gs_inv" if per_token else "gs": fp32.to_f32(g), "op:zsel": ExactF32.zsel}
     rows = list(rows)
     codes = torch.empty(len(rows), K, dtype=torch.uint8)
     sfs = torch.empty(len(rows), nb, dtype=torch.uint8)
@@ -308,10 +380,25 @@ def exact_rows(
         outs = spec.outputs(r)
         xr = xf[r].tolist()
         ev = lambda t: term.evaluate(t, lambda rr, ii: xr[ii], memo, syms)
-        for i, t in enumerate(outs["codes"]):
-            codes[n, i] = fp32.e2m1_code(ev(t))
-        for b, t in enumerate(outs["sf"]):
-            sfs[n, b] = fp32.e4m3_bits(ev(t))
+        if recipe is None:
+            for i, t in enumerate(outs["codes"]):
+                codes[n, i] = fp32.e2m1_code(ev(t))
+            for b, t in enumerate(outs["sf"]):
+                sfs[n, b] = fp32.e4m3_bits(ev(t))
+        else:
+            for b, blk in enumerate(outs["blocks"]):
+                evaluated = {
+                    "sf4": ev(blk["sf4"]),
+                    "sf6": ev(blk["sf6"]),
+                    "codes4": [ev(t) for t in blk["codes4"]],
+                    "codes6": [ev(t) for t in blk["codes6"]],
+                }
+                sf_v, code_vs = S.select_block(
+                    ev(blk["e4"]) < ev(blk["e6"]), ev(blk["amax"]) == 0, evaluated
+                )
+                sfs[n, b] = fp32.e4m3_bits(sf_v)
+                for e, v in enumerate(code_vs):
+                    codes[n, BLOCK * b + e] = fp32.e2m1_code(v)
         if pts is not None:
             pts[n] = ev(outs["pts"])
     return pack_e2m1(codes), sfs, pts

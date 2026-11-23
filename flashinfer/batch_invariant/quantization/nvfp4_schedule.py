@@ -362,6 +362,19 @@ def all_valid_configs(
     return out
 
 
+def valid_configs_4over6(
+    K: int, elem_bytes: int = 2, per_token: bool = False, max_threads: int = 512
+) -> List[QuantConfig]:
+    """The 4over6 classes' configuration space: the configs of :func:`all_valid_configs` that hold a whole block in one
+    thread (``elems_per_thread == 16``) -- the block's error sum is a register-level fold digit. The closed-form
+    dispatcher's picks are all members (it picks ``V = 16`` at every tier)."""
+    return [
+        c
+        for c in all_valid_configs(K, elem_bytes, per_token, max_threads)
+        if c.elems_per_thread == BLOCK
+    ]
+
+
 # -- the closed-form dispatcher (2026-10-30; fitted and graded against the CUPTI regret sweeps of both parts, Rubin NVL8 (SM107)
 # and B200 (SM100), by bench/bench_quant_regret.py + bench/grade_quant_dispatch.py; the measured table it replaces lived here). One function of (M, K, elem bytes, per_token, sm_count); the SM count enters only through CTA counts.
 #   Tile tier (per-tensor class only): the 128-row tile placement (16 warps streaming the tile's rows, scales staged in smem)
@@ -464,6 +477,55 @@ def closed_form_config(
     raise ValueError(f"no valid config for K={K}")
 
 
+# -- the 4over6 classes' dispatcher (2026-11-23). A 4over6 block is compute-bound (two candidate quantizations, two 16-step
+# error chains, 16 div.rn), so the plain rule's bytes-in-flight levers lose: the config searches on Rubin NVL8 (SM107) put one
+# block per lane with as many lanes as the row has blocks (up to 512 for BOTH classes; the per-token cap of 256 lifted) ahead of
+# every doubling by 1.2-1.5x, and the 128-row tile placement with one block per lane (never two) ahead of the row kernel only
+# at the largest problems (M x K >= 2^26: 16384 x 4096, 4096 x 16384 and up; 8192 x 4096 is the row kernel).
+TILE46_MIN_ELEMS = 1 << 26
+
+
+@functools.lru_cache(maxsize=65536)
+def closed_form_config_4over6(
+    K: int,
+    M: int,
+    elem_bytes: int = 2,
+    per_token: bool = False,
+    sm_count: int = DEFAULT_SM_COUNT,
+    layout: str = "128x4",
+) -> QuantConfig:
+    """The 4over6 classes' closed form; every pick is a member of ``valid_configs_4over6``; more SMs never pick fewer
+    CTAs. The tile tier writes the 128x4 layout: the other layouts take the row tier."""
+    Kbp = padded_blocks(K)
+    if not per_token and layout == "128x4" and M * K >= TILE46_MIN_ELEMS:
+        cfg = QuantConfig(
+            LANES, SF_ROW_TILE, 16, mode="tile", tile_warps=TILE_WARPS, tile_bpt=1
+        )
+        if (
+            cfg.is_valid(K, elem_bytes)
+            and num_blocks(K) % cfg.tile_blocks == 0
+            and -(-M // SF_ROW_TILE) * (num_blocks(K) // cfg.tile_blocks)
+            >= TILE_MIN_CTAS_PER_SM * sm_count
+        ):
+            return cfg
+    cfg = _row_cfg(
+        K, elem_bytes, 16, max(1, Kbp // ROW_LANES_MAX), lanes_max=ROW_LANES_MAX
+    )
+    if cfg is not None:
+        return cfg
+    for bpt in (
+        2,
+        4,
+        8,
+        16,
+        32,
+    ):  # the fragment bound leaves no one-block config (never on the supported K)
+        cfg = _row_cfg(K, elem_bytes, 16, bpt)
+        if cfg is not None:
+            return cfg
+    raise ValueError(f"no valid 4over6 config for K={K}")
+
+
 def default_config(
     K: int,
     M: int,
@@ -471,10 +533,16 @@ def default_config(
     per_token: bool = False,
     sm_count=None,
     layout: str = "128x4",
+    recipe=None,
 ) -> QuantConfig:
     """The dispatcher: the closed form above (no table, no autotuning), for the device's SM count (the caller passes it;
-    ``None`` = DEFAULT_SM_COUNT) and the scale-factor layout. It may depend on anything: every config it can return
-    computes the canonical dataflow, so the choice never changes bits (R3 over ``all_valid_configs``)."""
+    ``None`` = DEFAULT_SM_COUNT) and the scale-factor layout; ``recipe`` (a ``nvfp4_spec.Recipe``, not None): the 4over6
+    classes' closed form. It may depend on anything: every config it can return computes the canonical dataflow, so the
+    choice never changes bits (R3 over ``all_valid_configs`` / ``valid_configs_4over6``)."""
+    if recipe is not None:
+        return closed_form_config_4over6(
+            K, M, elem_bytes, per_token, sm_count or DEFAULT_SM_COUNT, layout
+        )
     return closed_form_config(
         K, M, elem_bytes, per_token, sm_count or DEFAULT_SM_COUNT, layout
     )
