@@ -32,7 +32,10 @@ _SOURCE_FORMATS = {
     "fp4_e8m0_k32": "fp4_e8m0_k32",
     "compressed_tensors": "compressed_tensors",
 }
-_E8M0_K32_BF16_MAX_SCALE_BYTE = 247
+# Largest E8M0 byte the BF16 W4A16 dequant represents without overflow:
+# exponent field e + 71 must stay <= 254 (see intrinsics
+# packed_dequant_e8m0x4_to_bfloat2x2).  Real checkpoints sit at ~100-130.
+_E8M0_K32_BF16_MAX_SCALE_BYTE = 183
 _E8M0_LOGICAL_TAIL_SCALE_N_ALIGNMENT = 64
 # Canonical W13 layout names are "w13"/"w31"; accept the physical FC1-half
 # spellings as aliases. Logical checkpoint order "w13" arrives up/gate and

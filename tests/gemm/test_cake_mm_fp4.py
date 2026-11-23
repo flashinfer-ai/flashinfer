@@ -20,7 +20,7 @@ import torch
 from flashinfer import SfLayout, mm_fp4, nvfp4_quantize
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
 from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import KERNELS
-from tests.test_helpers.cake_nvfp4_per_token import (
+from tests.quantization.test_helpers.cake_nvfp4_per_token import (
     VALIDATED_GEMM_FAMILIES,
     VALIDATED_OFF_MATRIX_FAMILY,
     required_kernel_keys,
@@ -704,7 +704,8 @@ def test_sf_ring_rows():
     # programs on the SF_RING_G8_CELLS ranges of their kind, with the plan's grid.  The
     # token counts next to a static range keep the plan's program, the chain keeps it on
     # the cells of the GEMM alone only, the other parts never take the ring, and the knob
-    # refuses other programs and architectures.
+    # refuses other programs and architectures.  The cells of SF_RING_MC42_CELLS run the
+    # multicast form (test_sf_ring_mc42_rows).
     arch = cb.SF_RING_ARCH
     sm_count = cb.MEASURED_SM_COUNT[arch]
 
@@ -729,6 +730,8 @@ def test_sf_ring_rows():
                     continue
                 clc += 1
                 for kind in ("gemm", "chain"):
+                    if _mc42_cell(kind, m, n, k):
+                        continue
                     run = runs(plan, kind)
                     assert run.kernel_key == plan.kernel_key + "_sfr", (kind, m, n, k)
                     assert (run.grid, run.num_tiles) == (plan.grid, plan.num_tiles)
@@ -739,6 +742,8 @@ def test_sf_ring_rows():
                 for m in (lo, (lo + hi) // 2, hi):
                     plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
                     assert plan.kernel_key in cb.SF_RING_G8_KEYS, (m, n, k)
+                    if _mc42_cell(kind, m, n, k):
+                        continue
                     run = runs(plan, kind)
                     assert run.kernel_key == plan.kernel_key + "_sfr", (kind, m, n, k)
                     assert (run.grid, run.num_tiles) == (plan.grid, plan.num_tiles)
@@ -775,7 +780,8 @@ def test_sf_ring_form_rows():
     # cell's form on the SF_RING_FORM_CELLS ranges of their kind (the plan's static
     # program without raster groups, or CLC program without or with raster groups of
     # 8); the token counts next to a range keep the plan's program, the chain keeps it
-    # on the cells of the GEMM alone only, and the other parts never take the ring.
+    # on the cells of the GEMM alone only, and the other parts never take the ring.  The
+    # cells of SF_RING_MC42_CELLS run the multicast form (test_sf_ring_mc42_rows).
     arch = cb.SF_RING_ARCH
     sm_count = cb.MEASURED_SM_COUNT[arch]
 
@@ -809,6 +815,8 @@ def test_sf_ring_form_rows():
                     for m in (lo, (lo + top) // 2, top):
                         plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
                         assert plan.kernel_key in cb.SF_RING_FORM_KEYS, (m, n, k)
+                        if _mc42_cell(kind, m, n, k):
+                            continue
                         run = runs(plan, kind)
                         assert run.kernel_key == ring_key(plan, form), (kind, m, n, k)
                         assert run.kernel_key.endswith("_sfr")
@@ -846,7 +854,90 @@ def test_sf_ring_form_rows():
                                 assert tactic is None or not tactic.get("sf_ring")
 
 
-def test_cake_is_registered_but_never_auto_selected():
+def _mc42_cell(kind, m, n, k):
+    """``M`` lies in a token range of the ``(K, N)`` cell of
+    ``SF_RING_MC42_CELLS[kind]``."""
+    ranges = cb.SF_RING_MC42_CELLS[kind].get((k, n), ())
+    return any(lo <= m <= hi for lo, hi in ranges)
+
+
+def test_sf_ring_mc42_rows():
+    # On sm_103a at 152 SMs the GEMM alone and the chain run the cluster-of-8 multicast
+    # form of the CLC ring program without raster groups (``_clc_sfr_mc42``) on the
+    # SF_RING_MC42_CELLS ranges of their kind, with the plan's tiles and the CLC grid
+    # (one CTA pair per tile).  The token counts next to a range keep their programs,
+    # the other parts never take the form, and the knob refuses odd tile counts and
+    # the programs other than the CLC ring program without raster groups.
+    arch = cb.SF_RING_ARCH
+    sm_count = cb.MEASURED_SM_COUNT[arch]
+    checked = 0
+    for kind, cells in cb.SF_RING_MC42_CELLS.items():
+        hook = cb.gemm_alone_tactic if kind == "gemm" else cb.chain_gemm_tactic
+        for (k, n), ranges in cells.items():
+            for (lo, hi), out_f16 in ((r, f) for r in ranges for f in (False, True)):
+                out = "f16" if out_f16 else "bf16"
+                key = f"gemm:m256_2cta_{out}_aL_bL_l2256b_clc_sfr_mc42"
+                for m in (lo, (lo + hi) // 2, hi):
+                    plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                    tactic = hook(plan)
+                    assert tactic is not None and tactic.get("mc42"), (kind, m, n, k)
+                    run = _registered(
+                        cb.gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=tactic),
+                        arch,
+                    )
+                    assert run.kernel_key == key, (kind, m, n, k)
+                    tiles = (run.tok_tiles, run.w_tiles)
+                    assert tiles == (plan.tok_tiles, plan.w_tiles)
+                    assert run.grid == 2 * run.num_tiles
+                    checked += 1
+                for m in (lo - 1, hi + 1):
+                    plan = cb.gemm_plan(m, n, k, out_f16, arch, sm_count)
+                    tactic = hook(plan)
+                    assert tactic is None or not tactic.get("mc42"), (kind, m, n, k)
+    assert checked
+    # The rows next to a range have odd token tile counts; every row between the
+    # (8192, 8192) ranges whose program the multicast form could take (a ring program
+    # with even token and weight tile counts) keeps its program without that form.
+    ring = cb.SF_RING_FORM_KEYS | cb.SF_RING_G8_KEYS | cb.SF_RING_CLC_KEYS
+    (_, end), (start, _) = cb.SF_RING_MC42_CELLS["gemm"][(8192, 8192)]
+    between = 0
+    for m, out_f16 in ((m, f) for m in range(end + 1, start) for f in (False, True)):
+        plan = cb.gemm_plan(m, 8192, 8192, out_f16, arch, sm_count)
+        if plan.kernel_key not in ring or plan.tok_tiles % 2 or plan.w_tiles % 2:
+            continue
+        for hook in (cb.gemm_alone_tactic, cb.chain_gemm_tactic):
+            tactic = hook(plan)
+            assert tactic is None or not tactic.get("mc42"), (hook, m)
+            if plan.kernel_key in cb.SF_RING_CLC_KEYS:
+                assert tactic is not None and tactic.get("sf_ring"), (hook, m)
+        between += 1
+    assert between
+    for other, other_sms in (("sm_103a", 148), ("sm_100a", 148), ("sm_100a", 152)):
+        for cells in cb.SF_RING_MC42_CELLS.values():
+            for (k, n), ranges in cells.items():
+                for m in (x for lo_hi in ranges for x in lo_hi):
+                    for out_f16 in (False, True):
+                        plan = cb.gemm_plan(m, n, k, out_f16, other, other_sms)
+                        for hook in (cb.gemm_alone_tactic, cb.chain_gemm_tactic):
+                            tactic = hook(plan)
+                            assert tactic is None or not tactic.get("mc42"), (other, m)
+    plan = cb.gemm_plan(2048, 8192, 8192, False, arch, sm_count)
+    mc42 = cb.gemm_alone_tactic(plan)
+    assert mc42 is not None and mc42.get("mc42")
+    # Odd token (M = 2049: 9 tiles) or weight (N = 8448: 33 tiles) tile counts.
+    for m, n in ((2049, 8192), (2048, 8448), (2049, 8448)):
+        with pytest.raises(ValueError, match="mc42"):
+            cb.gemm_plan(m, n, 8192, False, arch, sm_count, tactic=mc42)
+    for tactic in (
+        {**mc42, "sf_ring": False},
+        {**mc42, "raster_group": 16},
+        {**mc42, "sched": "static", "raster_group": 8},
+    ):
+        with pytest.raises(ValueError, match="mc42"):
+            cb.gemm_plan(2048, 8192, 8192, False, arch, sm_count, tactic=tactic)
+
+
+def test_cake_is_registered_as_experimental_backend():
     assert "cake" in mm_fp4.experimental_backends
     assert mm_fp4.is_backend_supported("cake", 100)
     assert mm_fp4.is_backend_supported("cake", 103)
@@ -1359,6 +1450,80 @@ def test_prepared_chain_runner_graph_replay_and_no_allocation():
         _assert_matches(out, ref)
 
 
+# Rows whose contiguous chain quantizer splits over a cluster on some architecture.
+@pytest.mark.parametrize(
+    "m,n,k",
+    [(8, 7168, 16384), (32, 7168, 18432), (2, 8192, 28672), (17, 8192, 8192)],
+)
+@pytest.mark.parametrize("fold", [False, True])
+def test_chain_reads_row_strided_activations_in_place(m, n, k, fold):
+    """The chain quantizes a row-strided view with one CTA per padded row and writes the
+    same quantized activation (padding included) and GEMM output as for the contiguous
+    copy, bit for bit."""
+    device = _require_program()
+    x, _, _, _, _, w_fp4, w_sf, gs_inv, w_scale = _operands(
+        m, n, k, torch.bfloat16, device, seed=900 + m
+    )
+    full = torch.zeros((m, k + 64), dtype=torch.bfloat16, device=device)
+    full[:, :k] = x
+    strided = full[:, :k]
+    assert not strided.is_contiguous()
+    out_scale = w_scale if fold else None
+    outs, plans = [], []
+    for activation in (strided, x):
+        ws = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+        for t in ws:
+            t.view(torch.uint8).fill_(0xFF)
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        runner = cb.prepare_nvfp4_per_token_chain(
+            activation,
+            gs_inv,
+            w_fp4.view(torch.uint8),
+            w_sf,
+            out,
+            ws,
+            out_scale=out_scale,
+        )
+        runner()
+        outs.append((*ws, out))
+        plans.append(runner.quantize.plan)
+    torch.cuda.synchronize()
+    for a, b in zip(*outs, strict=True):
+        assert torch.equal(
+            a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)
+        )
+    fp4, sf, scale, out = outs[0]
+    assert torch.isfinite(out).all()
+    ref = _dequantize(fp4, sf) @ _dequantize(w_fp4, w_sf).T
+    _assert_matches(out, ref * scale[:, None])
+    assert plans[0].cluster_split == 1
+
+
+@pytest.mark.parametrize("m,n,k", [(8, 7168, 16384), (8, 2112, 7168)])
+@pytest.mark.parametrize("kind", ["row_stride", "base", "contiguous_base"])
+def test_chain_rejects_rows_off_32_byte_boundaries(m, n, k, kind):
+    """The chain reads ``x`` in place at every launch, so it refuses a view whose
+    rows do not all start on 32-byte boundaries."""
+    device = _require_program()
+    x, _, _, _, _, w_fp4, w_sf, gs_inv, w_scale = _operands(
+        m, n, k, torch.bfloat16, device, seed=950 + m
+    )
+    if kind == "row_stride":  # row stride K + 8: every other row starts 16 bytes off
+        view = torch.zeros((m, k + 8), dtype=torch.bfloat16, device=device)[:, :k]
+    elif kind == "base":  # row stride K + 16, every row starts 16 bytes off
+        view = torch.zeros((m, k + 16), dtype=torch.bfloat16, device=device)[:, 8:-8]
+    else:  # contiguous, 16 bytes off
+        view = torch.zeros(m * k + 8, dtype=torch.bfloat16, device=device)[8:]
+        view = view.view(m, k)
+    view.copy_(x)
+    ws = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="32-byte boundaries"):
+        cb.prepare_nvfp4_per_token_chain(
+            view, gs_inv, w_fp4.view(torch.uint8), w_sf, out, ws, out_scale=w_scale
+        )
+
+
 @pytest.mark.parametrize(
     "m,n,k,out_dtype",
     [
@@ -1508,7 +1673,7 @@ def test_token_remainder_fold_matches_route(m, n, k, out_dtype):
     "m,n,k",
     [
         (6913, 7168, 16384),  # CLC program, the first row it serves
-        (8192, 8192, 8192),  # CLC program
+        (8192, 8192, 8192),  # CLC program, a multicast row of SF_RING_MC42_CELLS
         (1537, 7168, 18432),  # static program, the first row of its cell
         (2304, 8192, 28672),  # static program, the last row of its cell
         (7937, 1536, 7168),  # static program, a cell of the GEMM alone only
@@ -1518,7 +1683,8 @@ def test_sf_ring_matches_route(m, n, k, out_dtype):
     # Where the scale-factor ring rules take it, mm_fp4, the prepared GEMM and the
     # chain's GEMM run the ring program (``_sfr``), bitwise equal to the program of the
     # plan without the ring; the chain keeps the plan's program on a cell of the GEMM
-    # alone only.
+    # alone only. On a row of SF_RING_MC42_CELLS they run the ring program's
+    # cluster-of-8 multicast form (``_clc_sfr_mc42``), also bitwise equal to it.
     device = _require_program()
     out_f16 = out_dtype == torch.float16
     plan = cb.gemm_plan(m, n, k, out_f16, cb._device_arch(device), cb._sm_count(device))
@@ -1531,8 +1697,13 @@ def test_sf_ring_matches_route(m, n, k, out_dtype):
     a_u8, w_u8 = a_fp4.view(torch.uint8), w_fp4.view(torch.uint8)
     out = torch.full((m, n), float("nan"), dtype=out_dtype, device=device)
     runner = cb.prepare_mm_fp4_per_token(a_u8, a_sf, w_u8, w_sf, alpha, out)
-    assert runner.plan.kernel_key == plan.kernel_key + "_sfr"
-    assert runner.plan.grid == plan.grid
+    if alone.get("mc42"):
+        assert runner.plan.kernel_key == cb.gemm_kernel_key(alone, out_f16)
+        assert runner.plan.kernel_key.endswith("_clc_sfr_mc42")
+        assert runner.plan.grid == 2 * plan.num_tiles
+    else:
+        assert runner.plan.kernel_key == plan.kernel_key + "_sfr"
+        assert runner.plan.grid == plan.grid
     runner()
     plain = torch.full_like(out, float("nan"))
     cb.prepare_mm_fp4_per_token(
@@ -1561,7 +1732,11 @@ def test_sf_ring_matches_route(m, n, k, out_dtype):
         x, gs_inv, w_u8, w_sf, chained, ws, out_scale=w_scale
     )
     tactic = cb.chain_gemm_tactic(plan)
-    expected = plan.kernel_key + ("_sfr" if tactic.get("sf_ring") else "")
+    if tactic.get("mc42"):
+        expected = cb.gemm_kernel_key(tactic, out_f16)
+        assert expected.endswith("_clc_sfr_mc42")
+    else:
+        expected = plan.kernel_key + ("_sfr" if tactic.get("sf_ring") else "")
     assert chain.kernels[1] == expected
     chain()
     chain_plain = torch.full_like(out, float("nan"))
@@ -1640,6 +1815,68 @@ def test_sf_ring_form_matches_route(m, n, k, out_dtype):
     chain_plain = torch.full_like(out, float("nan"))
     cb.prepare_mm_fp4_per_token(
         ws.fp4, ws.sf, w_u8, w_sf, ws.scale, chain_plain, tactic=plan.tactic
+    )()
+    torch.cuda.synchronize()
+    assert torch.equal(chained, chain_plain)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m", [1793, 2048])
+@pytest.mark.parametrize("n,k", [(8192, 8192), (18432, 7168), (28672, 8192)])
+def test_sf_ring_mc42_matches_route(m, n, k, out_dtype):
+    # Where SF_RING_MC42_CELLS take the cluster-of-8 multicast form (the first row of
+    # each cell, whose last token tile holds one row, and the last row), mm_fp4, the
+    # prepared GEMM and the chain's GEMM run it, bitwise equal to the same tactic
+    # without the form (the CLC ring program without raster groups).
+    device = _require_program()
+    out_f16 = out_dtype == torch.float16
+    plan = cb.gemm_plan(m, n, k, out_f16, cb._device_arch(device), cb._sm_count(device))
+    alone = cb.gemm_alone_tactic(plan)
+    chain_tactic = cb.chain_gemm_tactic(plan)
+    if alone is None or not alone.get("mc42"):
+        pytest.skip(f"{plan.kernel_key}: no multicast ring cell on this part")
+    assert chain_tactic is not None and chain_tactic.get("mc42")
+    x, _, a_fp4, a_sf, alpha, w_fp4, w_sf, gs_inv, w_scale = _operands(
+        m, n, k, torch.bfloat16, device, seed=800 + m
+    )
+    a_u8, w_u8 = a_fp4.view(torch.uint8), w_fp4.view(torch.uint8)
+    out = torch.full((m, n), float("nan"), dtype=out_dtype, device=device)
+    runner = cb.prepare_mm_fp4_per_token(a_u8, a_sf, w_u8, w_sf, alpha, out)
+    assert runner.plan.kernel_key == cb.gemm_kernel_key(alone, out_f16)
+    assert runner.plan.kernel_key.endswith("_clc_sfr_mc42")
+    assert runner.plan.grid == 2 * plan.num_tiles
+    runner()
+    pair = {name: value for name, value in alone.items() if name != "mc42"}
+    plain = torch.full_like(out, float("nan"))
+    cb.prepare_mm_fp4_per_token(a_u8, a_sf, w_u8, w_sf, alpha, plain, tactic=pair)()
+    public = mm_fp4(
+        a_fp4,
+        w_fp4.T,
+        a_sf,
+        w_sf.T,
+        alpha,
+        out_dtype,
+        None,
+        block_size=16,
+        use_8x4_sf_layout=False,
+        backend="cake",
+        use_nvfp4=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, plain) and torch.equal(public, plain)
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(out, ref)
+    ws = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    chained = torch.full_like(out, float("nan"))
+    chain = cb.prepare_nvfp4_per_token_chain(
+        x, gs_inv, w_u8, w_sf, chained, ws, out_scale=w_scale
+    )
+    assert chain.kernels[1] == cb.gemm_kernel_key(chain_tactic, out_f16)
+    chain()
+    chain_pair = {name: value for name, value in chain_tactic.items() if name != "mc42"}
+    chain_plain = torch.full_like(out, float("nan"))
+    cb.prepare_mm_fp4_per_token(
+        ws.fp4, ws.sf, w_u8, w_sf, ws.scale, chain_plain, tactic=chain_pair
     )()
     torch.cuda.synchronize()
     assert torch.equal(chained, chain_plain)
@@ -1808,6 +2045,179 @@ def test_mm_fp4_cake_repeated_call_allocates_only_its_output():
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
     ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
     _assert_matches(out, ref)
+
+
+def test_stream_k_workspace_is_owned_by_the_current_stream():
+    # The stream-K tail's FP32 partials and generation flags belong to the current
+    # CUDA stream: launches on one stream are ordered and share them, launches on
+    # different streams are not ordered and get their own.
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    device = torch.device("cuda", torch.cuda.current_device())
+    # A slice count no plan uses, so these flags are first allocated here.
+    floats, flags, slices = 3 * 128 * 192, 96, 1009
+    contexts = [
+        torch.cuda.current_stream(device),
+        torch.cuda.Stream(device),
+        torch.cuda.Stream(device),
+    ]
+    buffers = []
+    for stream in contexts:
+        with torch.cuda.stream(stream):
+            ws, fl = cb._stream_k_workspace(device, floats, flags, slices)
+            # Smaller requests and an index-less device reuse the same storage.
+            again = cb._stream_k_workspace(
+                torch.device("cuda"), floats // 2, flags // 2, slices
+            )
+        assert ws.dtype == torch.float32 and fl.dtype == torch.uint32
+        assert ws.numel() >= floats and fl.numel() >= flags
+        assert again[0].data_ptr() == ws.data_ptr()
+        assert again[1].data_ptr() == fl.data_ptr()
+        buffers.append((ws, fl))
+    torch.cuda.synchronize()
+    for _, fl in buffers:
+        assert not fl.view(torch.int32).any(), "flags not zero on first allocation"
+    ptrs = [t.data_ptr() for pair in buffers for t in pair]
+    assert len(set(ptrs)) == len(ptrs), "streams share stream-K scratch"
+
+    # Grown flags restart from zero in new storage.
+    stream = contexts[1]
+    with torch.cuda.stream(stream):
+        _, fl = cb._stream_k_workspace(device, floats, flags, slices)
+        fl.view(torch.int32).fill_(7)
+        bigger = fl.numel() + 1
+        _, grown = cb._stream_k_workspace(device, floats, bigger, slices)
+    torch.cuda.synchronize()
+    assert grown.numel() >= bigger and grown.data_ptr() != fl.data_ptr()
+    assert not grown.view(torch.int32).any()
+
+
+# (m, n, k) rows whose default plan runs the stream-K tail of the static 2-CTA
+# schedule at some SM count; the test runs the first one this GPU plans with it.
+_STREAM_K_ROWS = (
+    (2048, 7168, 16384),
+    (2048, 7168, 18432),
+    (512, 8192, 28672),
+    (257, 8192, 28672),
+    (8192, 1536, 7168),
+)
+
+
+def _stream_k_row(device):
+    """The first :data:`_STREAM_K_ROWS` row whose mm_fp4 plan (default tactic, then
+    the GEMM-alone tactic, as :func:`cb._gemm_prepared`) keeps the stream-K tail."""
+    arch, sm_count = cb._device_arch(device), cb._sm_count(device)
+    for m, n, k in _STREAM_K_ROWS:
+        plan = cb.gemm_plan(m, n, k, False, arch, sm_count)
+        if (alone := cb.gemm_alone_tactic(plan)) is not None:
+            plan = cb.gemm_plan(m, n, k, False, arch, sm_count, tactic=alone)
+        if plan.stream_k:
+            return m, n, k
+    pytest.skip(f"no stream-K row on {arch} with {sm_count} SMs")
+
+
+@pytest.mark.timeout(600)
+def test_stream_k_launches_on_two_streams_match_serial_launches():
+    # Stream-K launches on two streams, not ordered with each other, each use their
+    # own partials and flags: every output equals the output of a launch alone.
+    device = _require_program()
+    m, n, k = _stream_k_row(device)
+    _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
+        m, n, k, torch.bfloat16, device, seed=700
+    )
+
+    def run(out):
+        return mm_fp4(
+            a_fp4, w_fp4.T, a_sf, w_sf.T, alpha, torch.bfloat16, out, backend="cake"
+        )
+
+    serial = run(torch.empty((m, n), dtype=torch.bfloat16, device=device))
+    again = run(torch.empty_like(serial))
+    torch.cuda.synchronize(device)
+    plan = cb._gemm_prepared(m, n, k, False, device.index)[0]
+    assert plan.stream_k, plan.kernel_key
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(serial, ref)
+    deterministic = torch.equal(serial, again)
+
+    iterations = 20
+    streams = (torch.cuda.Stream(device), torch.cuda.Stream(device))
+    outs = [torch.full_like(serial, float("nan")) for _ in range(2 * iterations)]
+    scratch = []
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            ws, fl = cb._stream_k_workspace(
+                device, plan.sk_workspace_floats, plan.sk_flag_words, plan.sk_slices
+            )
+        scratch += [ws.data_ptr(), fl.data_ptr()]
+    assert len(set(scratch)) == len(scratch), "streams share stream-K scratch"
+    # Alternate the streams without synchronising them, so their launches overlap.
+    for i in range(iterations):
+        for j, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                run(outs[2 * i + j])
+    torch.cuda.synchronize(device)
+
+    for index, out in enumerate(outs):
+        if deterministic:
+            assert torch.equal(out, serial), f"launch {index} (stream {index % 2})"
+        else:
+            _assert_matches(out, ref)
+
+
+@pytest.mark.timeout(600)
+def test_stream_k_graphs_replay_in_any_order():
+    # Graphs captured on one stream, with no eager launch on that stream before, each
+    # own zeroed stream-K flags: the graph captured second replays first and both
+    # replay concurrently on two streams, and every output equals an eager launch.
+    device = _require_program()
+    m, n, k = _stream_k_row(device)
+    _, _, a_fp4, a_sf, alpha, w_fp4, w_sf, _, _ = _operands(
+        m, n, k, torch.bfloat16, device, seed=701
+    )
+
+    def run(out):
+        return mm_fp4(
+            a_fp4, w_fp4.T, a_sf, w_sf.T, alpha, torch.bfloat16, out, backend="cake"
+        )
+
+    eager = run(torch.empty((m, n), dtype=torch.bfloat16, device=device))
+    again = run(torch.empty_like(eager))
+    torch.cuda.synchronize(device)
+    assert cb._gemm_prepared(m, n, k, False, device.index)[0].stream_k
+    ref = (_dequantize(a_fp4, a_sf) @ _dequantize(w_fp4, w_sf).T) * alpha[:, None]
+    _assert_matches(eager, ref)
+    deterministic = torch.equal(eager, again)
+
+    capture_stream = torch.cuda.Stream(device)
+    outs = [torch.full_like(eager, float("nan")) for _ in range(2)]
+    graphs = [torch.cuda.CUDAGraph() for _ in range(2)]
+    for graph, out in zip(graphs, outs, strict=True):
+        with torch.cuda.graph(graph, stream=capture_stream):
+            run(out)
+    torch.cuda.synchronize(device)
+
+    def check():
+        for index, out in enumerate(outs):
+            if deterministic:
+                assert torch.equal(out, eager), f"graph {index}"
+            else:
+                _assert_matches(out, ref)
+            out.fill_(float("nan"))
+
+    graphs[1].replay()
+    graphs[0].replay()
+    torch.cuda.synchronize(device)
+    check()
+    streams = (torch.cuda.Stream(device), torch.cuda.Stream(device))
+    for _ in range(10):
+        for graph, stream in zip(graphs, streams, strict=True):
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(stream):
+                graph.replay()
+        torch.cuda.synchronize(device)
+        check()
 
 
 def test_scalar_alpha_and_bad_layouts_are_rejected():

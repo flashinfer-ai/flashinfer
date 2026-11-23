@@ -348,9 +348,18 @@ def main():
         prepared = {name: prepare(mask, name, scale, q, k, v) for name in names}
         wrappers = {name: wrapper for name, (wrapper, _) in prepared.items()}
         inputs = {name: tensors for name, (_, tensors) in prepared.items()}
+        # The fa3 route of a GQA problem writes ``out`` as (kv heads * tokens, G, 128), the G query heads of a kv
+        # head side by side per token; the cake routes write (heads * tokens, 1, 128).  Both are compared as
+        # (heads, tokens, 128).
+        heads, tokens = q.shape[0], q.shape[1]
+        grouped = {name: name == "fa3" and args.gqa > 1 for name in wrappers}
         outputs = {
             name: torch.empty(
-                (q.shape[0] * q.shape[1], 1, 128), dtype=torch.bfloat16, device=q.device
+                (heads // args.gqa * tokens, args.gqa, 128)
+                if grouped[name]
+                else (heads * tokens, 1, 128),
+                dtype=torch.bfloat16,
+                device=q.device,
             )
             for name in wrappers
         }
@@ -366,7 +375,14 @@ def main():
             for _ in range(10):
                 call()
         torch.cuda.synchronize()
-        expected, actual = outputs[args.baseline], outputs[args.candidate]
+
+        def by_head(name):
+            out = outputs[name]
+            if grouped[name]:
+                out = out.view(heads // args.gqa, tokens, args.gqa, 128).transpose(1, 2)
+            return out.reshape(heads, tokens, 128)
+
+        expected, actual = by_head(args.baseline), by_head(args.candidate)
         max_error = float((actual.float() - expected.float()).abs().max())
         fp8_error = None
         if args.candidate in (FP8_ARM, "cake_fp8_replicated"):

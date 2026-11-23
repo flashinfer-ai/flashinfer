@@ -34,6 +34,7 @@ from flashinfer.jit.cake_minimax_h3_sm120_quant_varlen_attention import (
     ATTENTION_TAIL,
     KV_STATS,
     PREPROCESS_HEAD_MAJOR,
+    PREPROCESS_HEAD_MAJOR_BURST,
     PROGRAMS,
     QUANTIZE,
 )
@@ -44,6 +45,7 @@ NAMED = {
     "QUANTIZE": QUANTIZE,
     "ATTENTION": ATTENTION,
     "PREPROCESS_HEAD_MAJOR": PREPROCESS_HEAD_MAJOR,
+    "PREPROCESS_HEAD_MAJOR_BURST": PREPROCESS_HEAD_MAJOR_BURST,
     "ATTENTION_LEAD": ATTENTION_LEAD,
     "ATTENTION_TAIL": ATTENTION_TAIL,
 }
@@ -52,11 +54,14 @@ DYNAMIC_SMEM = {
     "QUANTIZE": 128,
     "ATTENTION": 82944,
     "PREPROCESS_HEAD_MAJOR": 33024,
+    "PREPROCESS_HEAD_MAJOR_BURST": 33024,
     "ATTENTION_LEAD": 82944,
     "ATTENTION_TAIL": 82944,
 }
 # One CTA of two 256-thread workers per SM for the producers, 256 threads for every other program.
-BLOCK = {name: 512 if name == "PREPROCESS_HEAD_MAJOR" else 256 for name in NAMED}
+BLOCK = {
+    name: 512 if name.startswith("PREPROCESS_HEAD_MAJOR") else 256 for name in NAMED
+}
 # The overlapped form's lead and tail attention are programmatic dependents of the launch before
 # them; the sequential launches and the producers start after every earlier launch of the stream.
 PDL = {"ATTENTION_LEAD", "ATTENTION_TAIL"}
@@ -140,14 +145,15 @@ HOST_ARGS = {
     "QUANTIZE": QUANTIZE_ARGS,
     "ATTENTION": ATTENTION_ARGS,
     "PREPROCESS_HEAD_MAJOR": PREPROCESS_HEAD_MAJOR_ARGS,
+    "PREPROCESS_HEAD_MAJOR_BURST": PREPROCESS_HEAD_MAJOR_ARGS,
     "ATTENTION_LEAD": ATTENTION_POLL_ARGS,
     "ATTENTION_TAIL": ATTENTION_POLL_ARGS,
 }
 
 
-def test_the_loader_publishes_the_six_programs() -> None:
+def test_the_loader_publishes_the_seven_programs() -> None:
     assert tuple(NAMED.values()) == PROGRAMS
-    assert len({program.name for program in PROGRAMS}) == 6
+    assert len({program.name for program in PROGRAMS}) == 7
     for identifier, program in NAMED.items():
         assert program.name.startswith("cake_minimax_h3_sm120_quant_varlen_attention_")
         assert program.operator_dir == "cake_minimax_h3_sm120_quant_varlen_attention"
@@ -270,46 +276,118 @@ def test_attention_grid_is_the_plan_grid() -> None:
 
 
 @pytest.mark.parametrize(
-    ("num_sms", "num_units", "expected"),
+    ("num_sms", "num_units", "facts", "expected"),
     [
-        (170, 1792, (138, 32, 32)),
-        (188, 1792, (156, 32, 32)),
-        (170, 16, (16, 64, 32)),
-        (188, 0, (1, 64, 32)),
-        (132, 1792, None),
+        # width 32 on 188 SMs: the burst producers on every SM
+        (188, 1792, None, (156, 188, 32)),
+        (188, 0, None, (1, 188, 32)),
+        # width 32 on 170 SMs: the default producers (two workers per CTA) over at most twice the
+        # width on the SMs the lead leaves
+        (170, 1792, None, (138, 32, 32)),
+        (170, 16, None, (16, 64, 32)),
+        # width 64 (a light plan: 4 x 1536 tokens): the producers (two workers per CTA) over at
+        # most twice the width on the SMs the lead leaves
+        (170, 1792, (6144, 4 * 1536 * 1536, 6144), (106, 64, 64)),
+        (188, 1792, (6144, 4 * 1536 * 1536, 6144), (124, 64, 64)),
+        (170, 16, (6144, 4 * 1536 * 1536, 6144), (16, 128, 64)),
+        (132, 1792, None, None),
     ],
 )
 def test_overlap_grids_take_one_producer_cta_per_free_sm(
-    num_sms, num_units, expected
+    num_sms, num_units, facts, expected
 ) -> None:
-    # (lead, producers, tail): the lead over the SMs the overlap width leaves, the producers (two
-    # workers per CTA) over at most twice the width on the SMs the lead leaves, the tail over the
-    # width
+    # (lead, producers, tail): the lead over the SMs the overlap width leaves, the tail over the
+    # width; the producers over every SM for width 32 on 188 SMs (the burst build), else over at
+    # most twice the width on the SMs the lead leaves
+    tokens, work, padded = facts or (None, None, None)
     grids = ops.minimax_h3_sm120_quant_varlen_attention_overlap_grids(
-        num_sms, num_units=num_units
+        num_sms,
+        num_units=num_units,
+        total_tokens=tokens,
+        work=work,
+        padded_tokens=padded,
     )
     assert grids == expected
     if grids is not None:
-        lead, producers, _tail = grids
-        assert lead + producers <= num_sms
+        lead, producers, tail = grids
+        if num_sms == 188 and tail == 32:
+            assert producers == num_sms
+        else:
+            assert lead + producers <= num_sms
     with pytest.raises(ValueError):
         ops.minimax_h3_sm120_quant_varlen_attention_overlap_grids(0, num_units=1)
+
+
+@pytest.mark.parametrize(
+    ("bounds", "num_sms", "width"),
+    [
+        # attention-weighted mean segment length (work / tokens) at most 1792 on 170 SMs and 2304 on
+        # 188 SMs: width 64
+        ((0, 1536, 3072, 4608, 6144), 170, 64),
+        ((0, 1536, 3072, 4608, 6144), 188, 64),
+        ((0, 1792, 3584, 5376, 7168), 170, 64),
+        ((0, 1793, 3586, 5379, 7172), 170, 32),
+        ((0, 2048, 4096), 188, 64),
+        ((0, 2048, 4096), 170, 32),
+        ((0, 2304, 4608), 188, 64),
+        ((0, 2305, 4610), 188, 32),
+        # a mean of at least 4096 over more than 16384 padded tokens: 64 on 170 SMs, 48 on 188 SMs
+        ((0, 8368, 16736, 25104, 33472), 170, 64),
+        ((0, 8368, 16736, 25104, 33472), 188, 48),
+        ((0, 4096, 8192, 12288, 16384, 20480), 188, 48),
+        ((0, 4095, 8190, 12285, 16380, 20475), 188, 32),
+        ((0, 16385), 188, 48),
+        # the rest keep the shipped width
+        ((0, 16384), 170, 32),
+        ((0, 257, 4567, 4824), 188, 32),
+        ((0, 4096), 170, 32),
+    ],
+)
+def test_overlap_width_follows_the_plan(bounds, num_sms, width) -> None:
+    plan = ops.MiniMaxH3VarlenPlan(bounds, 56, torch.device("cpu"), num_sms)
+    assert plan.overlap
+    grids = ops.minimax_h3_sm120_quant_varlen_attention_overlap_grids(
+        num_sms,
+        num_units=plan.num_units,
+        total_tokens=plan.total_tokens,
+        work=plan.work,
+        padded_tokens=plan.padded_tokens,
+    )
+    lead = max(1, min(num_sms - width, plan.num_units))
+    burst = num_sms == 188 and width == 32
+    producers = num_sms if burst else min(2 * width, num_sms - lead)
+    assert grids == (lead, producers, width)
+    expected = PREPROCESS_HEAD_MAJOR_BURST if burst else PREPROCESS_HEAD_MAJOR
+    assert ops.minimax_h3_sm120_quant_varlen_attention_programs(plan)[0] is expected
 
 
 @pytest.mark.parametrize(
     ("bounds", "heads", "num_sms", "overlap"),
     [
         # the band's edges: 2 x 2048 (2^23) and one 24576-token segment (24576^2)
-        ((0, 2048, 4096), 56, 170, True),
-        ((0, 2047, 4094), 56, 170, False),
-        ((0, 24576), 56, 188, True),
-        ((0, 24577), 56, 188, False),
-        ((0, 257, 4567, 4824), 56, 188, True),
-        ((0, 8368, 16736, 25104, 33472), 56, 170, True),
+        ((0, 2048, 4096), 56, 170, "default"),
+        ((0, 2047, 4094), 56, 170, None),
+        ((0, 24576), 56, 188, "default"),
+        ((0, 24577), 56, 188, "head_major"),
+        ((0, 257, 4567, 4824), 56, 188, "burst"),
+        ((0, 8368, 16736, 25104, 33472), 56, 170, "default"),
         # other head counts and SM counts keep the sequential launches
-        ((0, 257, 4567, 4824), 8, 170, False),
-        ((0, 257, 4567, 4824), 56, 132, False),
-        ((0, 0, 129, 129, 500), 56, 170, False),
+        ((0, 257, 4567, 4824), 8, 170, None),
+        ((0, 257, 4567, 4824), 56, 132, None),
+        ((0, 0, 129, 129, 500), 56, 170, None),
+        # above the band: 56 heads on 170 or 188 SMs take the head-major producers, other head and
+        # SM counts the statistics and quantizer launches
+        ((0, 33472), 56, 170, "head_major"),
+        ((0, 3000, 44000, 53000), 56, 188, "head_major"),
+        ((0, 24577), 8, 188, None),
+        ((0, 24577), 56, 132, None),
+        # past the token bound (65536 on 170 SMs, 98304 on 188 SMs) the statistics and quantizer
+        # launches again
+        ((0, 65536), 56, 170, "head_major"),
+        ((0, 65537), 56, 170, None),
+        ((0, 65537), 56, 188, "head_major"),
+        ((0, 98304), 56, 188, "head_major"),
+        ((0, 98305), 56, 188, None),
     ],
 )
 def test_the_overlapped_form_serves_the_overlap_band(
@@ -318,11 +396,19 @@ def test_the_overlapped_form_serves_the_overlap_band(
     plan = ops.MiniMaxH3VarlenPlan(bounds, heads, torch.device("cpu"), num_sms)
     lengths = [b - a for a, b in zip(bounds, bounds[1:], strict=False)]
     assert plan.work == sum(length * length for length in lengths)
-    assert plan.overlap is overlap
+    assert plan.overlap is (overlap not in (None, "head_major"))
+    assert plan.head_major is (overlap == "head_major")
     programs = ops.minimax_h3_sm120_quant_varlen_attention_programs(plan)
-    if overlap:
-        # launch order: producers (plain), lead attention, tail attention
-        assert programs == (PREPROCESS_HEAD_MAJOR, ATTENTION_LEAD, ATTENTION_TAIL)
+    if overlap == "head_major":
+        # the head-major producers over every SM, then the sequential attention
+        assert programs == (PREPROCESS_HEAD_MAJOR, ATTENTION)
+    elif overlap:
+        # launch order: producers (plain; the burst build for a plan of overlap width 32 on 188
+        # SMs), lead attention, tail attention
+        producers = (
+            PREPROCESS_HEAD_MAJOR_BURST if overlap == "burst" else PREPROCESS_HEAD_MAJOR
+        )
+        assert programs == (producers, ATTENTION_LEAD, ATTENTION_TAIL)
     else:
         assert programs == (KV_STATS, QUANTIZE, ATTENTION)
 
@@ -361,14 +447,16 @@ def test_overlapped_form_warms_up_once_outside_capture(monkeypatch) -> None:
     # call's head-control words; a call whose stream is capturing runs none.  The capture query
     # asks about the call's own device and stream.
     launches = []
-    monkeypatch.setattr(
-        ops,
-        "_overlap_entries",
-        lambda _target: tuple(
+    selected = []
+
+    def entries(target: str, burst: bool):
+        selected.append((target, burst))
+        return tuple(
             lambda *args, _slot=slot: launches.append((_slot, args))
             for slot in ("producers", "lead", "tail")
-        ),
-    )
+        )
+
+    monkeypatch.setattr(ops, "_overlap_entries", entries)
     monkeypatch.setattr(ops, "_OVERLAP_LOADED", set())
     queries = []
     capturing = [True]
@@ -385,7 +473,7 @@ def test_overlapped_form_warms_up_once_outside_capture(monkeypatch) -> None:
     # units, heads, 128-key blocks, log2-domain scale, head-control words
     attention_facts = (51, 56, 17, 0.25, "hctr")
 
-    def call() -> None:
+    def call(grids=(106, 64, 64)) -> None:
         ops._launch_overlapped(
             "sm_120a",
             1,
@@ -394,13 +482,13 @@ def test_overlapped_form_warms_up_once_outside_capture(monkeypatch) -> None:
             producer_facts,
             attention_tensors,
             attention_facts,
-            (138, 64, 32),
+            grids,
         )
 
     work = [
         ("producers", (*producer_tensors, *producer_facts, 64, 1, 1)),
-        ("lead", (*attention_tensors, *attention_facts, 138, 32, 138, 1, 1)),
-        ("tail", (*attention_tensors, *attention_facts, 138, 32, 32, 1, 1)),
+        ("lead", (*attention_tensors, *attention_facts, 106, 64, 106, 1, 1)),
+        ("tail", (*attention_tensors, *attention_facts, 106, 64, 64, 1, 1)),
     ]
     no_work = [
         ("producers", (*producer_tensors, 0, 2100, 2176, 1, 1, 0, 1, 1, 1)),
@@ -417,6 +505,82 @@ def test_overlapped_form_warms_up_once_outside_capture(monkeypatch) -> None:
     call()
     assert launches == work
     assert queries == [(1, 4321), (1, 4321)]
+    assert selected == [("sm_120a", False)] * 3
+    # the burst producers (188 SMs, a tail of 32) are a module of their own: their first eager
+    # call warms them up once more
+    launches.clear()
+    call((156, 188, 32))
+    burst_work = [
+        ("producers", (*producer_tensors, *producer_facts, 188, 1, 1)),
+        ("lead", (*attention_tensors, *attention_facts, 156, 32, 156, 1, 1)),
+        ("tail", (*attention_tensors, *attention_facts, 156, 32, 32, 1, 1)),
+    ]
+    assert launches == no_work + burst_work
+    assert selected[-1] == ("sm_120a", True)
+
+
+@pytest.mark.parametrize(
+    ("grids", "burst"),
+    [
+        # 188 SMs, width 32: the burst producers on every SM
+        ((156, 188, 32), True),
+        ((1, 188, 32), True),
+        # 170 SMs at width 32, and the light and long widths: the default producers
+        ((138, 32, 32), False),
+        ((16, 64, 32), False),
+        ((106, 64, 64), False),
+        ((124, 64, 64), False),
+        ((140, 48, 48), False),
+        ((140, 96, 48), False),
+    ],
+)
+def test_burst_route_follows_the_overlap_grids(monkeypatch, grids, burst) -> None:
+    # The route: the grids ``overlap_grids`` gives a plan of width 32 on 188 SMs launch
+    # PREPROCESS_HEAD_MAJOR_BURST over their producer grid (every SM); every other plan keeps
+    # PREPROCESS_HEAD_MAJOR.
+    selected = []
+    monkeypatch.setattr(
+        ops,
+        "_overlap_entries",
+        lambda target, b: selected.append(b) or (lambda *a: None,) * 3,
+    )
+    monkeypatch.setattr(ops, "_capturing", lambda *_: True)
+    ops._launch_overlapped(
+        "sm_120a",
+        0,
+        1,
+        (),
+        (5, 2100, 2176, 3, 56, 17),
+        (),
+        (51, 56, 17, 0.25, "h"),
+        grids,
+    )
+    assert selected == [burst]
+    assert ops._overlap_programs(burst)[0] is (
+        PREPROCESS_HEAD_MAJOR_BURST if burst else PREPROCESS_HEAD_MAJOR
+    )
+
+
+def test_burst_grids_need_the_tail_of_their_build() -> None:
+    # A producer grid above two workers' CTAs per tail CTA is the burst launch, valid only beside
+    # a tail of the burst build's P.
+    with pytest.raises(AssertionError):
+        ops._overlap_burst((140, 188, 48))
+    with pytest.raises(AssertionError):
+        ops._overlap_burst((106, 188, 64))
+
+
+def test_burst_build_stops_ctas_from_the_host_width() -> None:
+    # The burst build's P (its CTAs from bid P on stop early) is the host's width of the burst
+    # route: the device unit compares the CTA index with that literal; the default producers do
+    # not.
+    kernel = PREPROCESS_HEAD_MAJOR_BURST.source_paths()[0].read_text()
+    default = PREPROCESS_HEAD_MAJOR.source_paths()[0].read_text()
+    p = ops._OVERLAP_BURST_P
+    assert p == 32
+    assert ops._OVERLAP_BURST_WIDTH == {188: 32}
+    assert len(re.findall(rf"\bbid >= {p}\b", kernel)) == 2  # the two workers' claims
+    assert not re.search(r"\bbid >= ", default)
 
 
 def test_softmax_scale_log2_rounds_as_the_kernel_takes_it() -> None:

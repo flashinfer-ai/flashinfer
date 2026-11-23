@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -872,8 +872,8 @@ kernel_cake_grouped_fp8_fused_silu_quant_94fb4bd1033270edf3b4(const __grid_const
                         if (partial_stage == 4) { partial_stage = 0; _phase_partial_full ^= 1; }
                     }
                 }
-                unsigned int output_ab_stage = (consumer_ab_cursor + (unsigned int)k_blocks - 1) % 4;
-                consumer_ab_cursor = (consumer_ab_cursor + (unsigned int)k_blocks) % 4;
+                consumer_ab_cursor += (unsigned int)(k_blocks - 1);
+                unsigned int output_ab_stage = consumer_ab_cursor % 4;
                 int owns = 0;
                 if (row < my_rows) {
                     owns = 1;
@@ -1052,9 +1052,10 @@ kernel_cake_grouped_fp8_fused_silu_quant_94fb4bd1033270edf3b4(const __grid_const
                 asm volatile("barrier.sync 11, 256;" ::: "memory");
                 if (warp == 0) {
                     if (elect_sync()) {
-                        mbarrier_arrive(ab_free_addr + (output_ab_stage) * 8);
+                        mbarrier_arrive(ab_free_addr + (consumer_ab_cursor % 4) * 8);
                     }
                 }
+                consumer_ab_cursor += 1;
             }
             asm volatile("barrier.sync 9, 288;" ::: "memory");
             unsigned int _phase_producers_done_0 = 0;

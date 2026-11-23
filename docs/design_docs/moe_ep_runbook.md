@@ -72,7 +72,7 @@ every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
 `CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on B200). The
 root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
 activation-quant staging (`DataPreprocess` in
-`kernel_src/sm100/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
+`kernels/cutedsl_megamoe/pre_unification/src/inputs_process.py`), shared by every mega
 staging path — fixed by the upstream `50117315d` sync recorded in that drop's
 VENDOR.md, after which the pin was lifted. The vLLM e2e sections below keep
 their own separate **4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for
@@ -248,7 +248,7 @@ sweep has its own bench script,
 
 The SM120 MXFP4 x MXFP8 MegaMoE backend (`sm120_mxfp4_mxfp8_bf16_cake`: one
 Cake-generated parametric persistent kernel per deployment, JIT-compiled from
-`flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/`) has its own target,
+`flashinfer/moe_ep/shims/sm120/cake_mxfp4/`) has its own target,
 `bash tests/moe_ep/run_tests.sh mega_sm120_cake` (4 GPUs; `NPROC_CAKE_SM120=8`
 for a full host). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
 multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. The target is not part of `all`; PR CI runs only
@@ -278,7 +278,7 @@ graphs" in the kernel package README).
 A rank that stalls or dies mid-call for longer than the kernel's 600 s wait deadline
 makes the call fail on every rank with `CUDA error: unspecified launch failure`
 (device `trap`) instead of hanging; restart the processes (see the wait-deadline
-paragraph in `flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/README.md`).
+paragraph in `flashinfer/moe_ep/kernels/cake/mxfp4_megamoe_sm120/README.md`).
 On a single host, `all_gin` sends same-host pairs through NIC loopback; with RoCE ECN / DCQCN congestion control
 this can throttle large calls (a tail of 10-100 ms at EP4 / 8192 tokens per rank on our PCIe host, CNPs rising on
 the NICs).  Prefer an LSA table for same-host pairs there (`lsa_where_reachable`, `all_lsa`, or `"tuned"`).
@@ -295,7 +295,7 @@ and CUDA-graph replay. Supported geometry: `hidden % 256 == 0`,
 `intermediate % 128 == 0`, `top_k in {1, 2, 4, 6, 8}`, experts divisible by
 the world size; anything else raises `MoEEpConfigError` at init. The expert
 GEMMs ship as generated sources sealed by
-`kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_manifest.json`;
+`kernels/cake/bf16_megamoe_sm90/cake_sm90_bf16_megamoe_manifest.json`;
 the target runs the CPU frozen-sources guard
 (`tests/moe_ep/test_sm90_bf16_push_cake_frozen_sources.py`) first, and a
 hand-edited generated file fails the JIT loader closed (sha256 mismatch).
@@ -303,10 +303,11 @@ On the receiving rank the combine tail (wait for every source, fp32 top-k
 reduce, ack) runs as one fused kernel without a per-round combine-inbox fill;
 `FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL=0` selects the vendored three-kernel
 tail (bit-identical output) for A/B checks, and peers may mix the two. Dedup
-rounds of up to 512 tokens per rank dispatch through one cooperative kernel
+rounds below the grid-dispatch bound (513 tokens per rank, 512 at EP 8) by
+default dispatch through one cooperative kernel
 (count + reserve + store_publish, with the round opening and the receiver-side
-prefix folded in), larger dedup rounds through one grid-strided cooperative
-kernel over the co-resident blocks; `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
+prefix folded in), dedup rounds from the bound on through one grid-strided
+cooperative kernel over the co-resident blocks; `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
 plus `FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS=0` select the vendored
 dispatch kernels, which non-dedup pipes always use. The dispatch wire format is
 the vendored one in every combination.
@@ -323,9 +324,12 @@ None of them changes an output byte (the section tests compare them bitwise).
 | `per_route_publish_pdl` (`PER_ROUTE_PUBLISH_PDL`) | `True` | On the per-route wire, the combine publish is a programmatic dependent launch too. |
 | `fused_begin` (`FUSED_BEGIN`) | `2` | Round opening folded into the dispatch launch: 1 = tag bump and ack wait, 2 = also the receiver-side prefix. |
 | `fused_dispatch_max_tokens` (`FUSED_DISPATCH_MAX_TOKENS`) | `512` | Largest round (tokens per rank) of the fused dispatch kernel (at most 512). |
-| `grid_dispatch_min_tokens` (`GRID_DISPATCH_MIN_TOKENS`) | `513` | Smallest round of the grid-strided dispatch kernel; `0` = off. |
+| `grid_dispatch_min_tokens` (`GRID_DISPATCH_MIN_TOKENS`) | `512` at EP 8, `513` at other EP sizes | Smallest round of the grid-strided dispatch kernel; `0` = off. |
 | `compact_form`, `publish_form` (`COMPACT_FORM`, `PUBLISH_FORM`) | `1` | Latency-pipelined compact and load-hoisted pre-reduced publish; `0` = the one-row-per-block compact and the route-serial publish. |
 | `fc2_early_max_tokens` (`FC2_EARLY_MAX_TOKENS`) | `128` | Rounds with 1 to this many tokens on the rank start FC2 inside FC1's tail wave: FC1 releases a readiness counter per 128-row tile and FC2 claims the ready tiles (same tiles and per-tile instructions). Needs at most 1023 local experts and hidden and intermediate sizes of at least 256, otherwise off; `0` = off. Rank-local, so ranks may differ. |
+| `fc2_early_windows` (`FC2_EARLY_WINDOWS`) | `True` | Larger rounds of a measured shape also start FC2 inside FC1's tail wave when the rank's token count lies in the shape's window: hidden 7168, intermediate 2048, 256 experts, top-k 8 at EP 8 from 129 to 4096 tokens and at EP 4 from 129 to 1024 tokens; hidden 7168, intermediate 3072, 384 experts, top-k 6 at EP 8 from 513 to 1024 tokens. Other shapes keep the `fc2_early_max_tokens` window only. Needs the same conditions as `fc2_early_max_tokens`; same bits; rank-local. |
+| `wcx_max_tokens` (`WCX_MAX_TOKENS`) | `0` (off) | Opt-in. Early-start rounds with 1 to this many tokens on the rank (at most `128`) read lossless compressed copies of the expert weights (WCX) through the swap-AB FC1/FC2 pair: the weight rows are decoded in registers as the wgmma A operand and the token rows are the B operand; same products in the same order, same bits. The compressed copies are kept next to the bf16 weights, so each layer's expert memory on the rank grows by about 0.77x its bf16 expert bytes. A layer whose weights need more than 188 escape slots per stage, or whose hidden size is not a multiple of 512 or intermediate size not a multiple of 256, keeps the bf16 pair (warned once, counted by `wcx_fallback_layers()`). Needs the `fc2_early_max_tokens` window (otherwise off, and no copies are encoded). With WCX on, rounds in a measured shape's window `WCX_WINDOWS` also read the compressed copies through the swap-AB early-start pair: hidden 7168, intermediate 2048, 256 experts, top-k 8 at EP 2 from 129 to 1024 tokens; hidden 7168, intermediate 3072, 384 experts, top-k 6 at EP 8 from 129 to 512 tokens; hidden 4096, intermediate 2048, 256 experts, top-k 6 at EP 8 from 129 to 512 tokens (every expert of those rounds still fits one 128-row tile); other shapes and rounds keep the bf16 path. `0` encodes and builds nothing. Rank-local. |
+| `direct_place` (`DIRECT_PLACE`) | `True` at EP 8 and EP 4, `False` at other EP sizes | Grid-dispatch rounds store each token's first row for a rank straight into that rank's activation matrix (a symmetric buffer), so the compact copies only the token's later routes to the same rank. Effective only when every rank requests it and can run it (dedup dispatch, grid dispatch on, compact form `1`, at most 1024 (expert, rank) keys, a token capacity of at least both round bounds); a round is direct only when every rank dispatches it grid-strided with at least `direct_place_min_tokens` (`DIRECT_PLACE_MIN_TOKENS`) tokens: by default at EP 8 and EP 4 the larger of `513` and `ceil(2**25 / (top_k * hidden_size))` (the round's routes carry at least `2**25` elements: `586` at hidden 7168 / top-k 8, `781` at 7168 / 6, `1366` at 4096 / 6), else `513`. Same bits. |
 | `prefix_form` (`PREFIX_FORM`) | `1` | Receiver prefix inside the single-launch dispatches (`fused_begin` 2): `1` = the fused dispatch of rounds with `T * top_k <= 1024` and the grid dispatch compute the integer prefix sums with the whole block; `0` = one thread walks the (expert, source) keys in every dispatch. Same values; rank-local. |
 
 The combine wire (expert rank -> token owner) is selected by
@@ -389,7 +393,7 @@ Axes: `--scale-mode {per_tensor,blockwise,both}`, `--swap-ab`/`--no-swap-ab`
 M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
 for the full timing/mapping notes. Measured results, comparison caveats,
 and the reproduce recipe live in
-[`kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md).
+[`shims/sm90/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/shims/sm90/cutedsl_megamoe/TUNING.md).
 
 The native BF16 backend is benchmarked against the same-precision split
 baseline (NCCL-EP + CUTLASS BF16 fused MoE through the same `MoEEpLayer`)
@@ -430,7 +434,7 @@ tree's `4_5_2-perf-fix` flashinfer branch, on **nvidia-cutlass-dsl 4.5.2**
 below only as a parity *reference*: the mainloop workaround brings 4.5.2 to
 4.6.1 parity, so 4.5.2 is the runtime floor and versions below it are
 unsupported (4.5.0 fails at `cute.compile`) — see
-[`../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
+[`../../flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/shims/sm100/cutedsl_megamoe/TUNING.md).
 
 ### 1. Microbenchmark
 
@@ -575,7 +579,7 @@ env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated)
 ```bash
 W=$ROOT/moe_ep_benchmark/vllm_e2e
 # 1) hold a 4-GPU node; run every command through the container helper:
-JOBID=$(sbatch --parsable -A coreai_libraries_cudnn -p batch -N1 \
+JOBID=$(sbatch --parsable -A "$SLURM_ACCOUNT" -p batch -N1 \
     --ntasks-per-node=1 --time=04:00:00 -J fi.vllm_e2e.hold \
     --output=$W/logs/hold_%j.log --wrap "sleep 14400")
 # 2) one-time venv: vllm==0.25.1 + editable fi branch + patch_0251 (keeps
@@ -638,9 +642,29 @@ prefill chunks), per-role offline knob caches.
 
 ## Blackwell standard autotuning
 
-The `sm100_nvfp4_nvfp4_bf16_cutedsl_next` and
-`sm100_mxfp8_mxfp8_bf16_cutedsl_next` selectors support `knobs="auto"` through
-`autotune_v2()`. The legacy selectors retain their existing tuner. Standard
+`Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` selects standard inference
+with MXFP4 weights, MXFP8 E4M3 activations and BF16 output. Hidden and
+intermediate sizes must be multiples of 128. Supply canonical BF16 weights
+or packed E2M1 weights with unswizzled per-32 E8M0 scales; preprocessing
+packs the gate/up layout once at construction.
+
+With `MegaConfig.quantize_input=True`, eligible BF16 inputs use fused
+quantization and workspace staging. `quantize_input=False` takes E4M3 data
+and linear E8M0 scales, copies them into the workspace, and uses the shared
+route-staging kernel to convert IDs and scores and zero masked scores.
+Unsupported layouts or `FLASHINFER_MEGA_FUSED_STAGE=0` use Torch staging.
+As on the other Blackwell paths, callers supply valid routing values.
+This configuration supports default/fixed knobs and `knobs="auto"` below;
+offline tuning uses `--arch sm100 --implementation next --dtype mxfp4_mxfp8`.
+For GenPhase, use `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`
+with `kind="mxfp4_mxfp8"` and `kernel_variant="genphase"`.
+
+Run `tests/moe_ep/test_sm100_mxfp4_mxfp8.py` under `torchrun` for multirank
+weight, staging and shared-workspace graph-replay checks.
+
+The `sm100_nvfp4_nvfp4_bf16_cutedsl` and
+`sm100_mxfp8_mxfp8_bf16_cutedsl` selectors support `knobs="auto"` through
+`autotune_v2()`. The retained NVFP4 `_legacy` selector keeps its existing tuner. Standard
 `knobs=None` still uses built-in defaults; explicit dictionaries retain the
 legacy spelling and also accept the native dictionaries returned by
 `get_tuned_knobs()`. Pass those results to `create_workspace(..., knobs=knobs)`
@@ -671,9 +695,10 @@ because workspace capacity and actual staged tokens define these workloads.
 
 ## Blackwell GenPhase decoding (explicit opt-in)
 
-The existing SM100 MXFP8 config can select the independently owned GenPhase
-pipeline on SM100/SM103. Existing configurations keep `kernel_variant="inference"`,
-the legacy weight layout, workspace pool keys, knob cache and autotuner.
+The SM100 NVFP4 and MXFP8 configs select standard inference by default.
+Set `kernel_variant="genphase"` to use the GenPhase pipeline on SM100/SM103.
+Both variants use the `sources/` weight helpers, with separate workspace and
+tuning identities. The retained NVFP4 `_legacy` selector uses its own layout.
 
 ```python
 from flashinfer.moe_ep import (
@@ -698,10 +723,26 @@ layer.warmup(tensors)  # collective on every EP rank, before CUDA graph capture
 output = layer.forward(tensors)
 ```
 
-GenPhase supports MXFP8 E4M3, SwiGLU and separate BF16 reduction, with physical
-capacity at most 1024 tokens per rank. Hidden size must be a multiple of 128;
-intermediate size must be a multiple of 64. N128 supports CGA4; N64 supports
-CGA2 or CGA4. In-kernel FC2 reduction remains unsupported.
+GenPhase supports NVFP4, MXFP8 E4M3/E5M2 and mixed MXFP4 weights with MXFP8
+E4M3 activations (`kind="mxfp4_mxfp8"`). It uses standard SwiGLU and separate
+BF16 reduction, with physical capacity at most 1024 tokens per rank.
+
+| Format | Hidden alignment | Intermediate alignment | Gather4 geometries |
+| --- | --- | --- | --- |
+| MXFP8 E4M3/E5M2 | 128 | 64 | K128, N128/CGA4 or N64/CGA2/CGA4 |
+| NVFP4 | 64 | 32 | K256, N128/CGA4 |
+| MXFP4/MXFP8 | 128 | 128 | K128, N128/CGA4 or N64/CGA4 |
+
+NVFP4 uses `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` with
+`kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl"` and
+`kernel_variant="genphase"`. E4M3/E5M2 and mixed MXFP4/MXFP8 use the MXFP8
+config with `kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl"`. For example,
+set `kind="mxfp8_e5m2"` or `kind="mxfp4_mxfp8"` in the example above.
+Early and late routing weights are supported. In-kernel FC2 reduction,
+per-token FC1 scales, SiTU and custom finalization remain unsupported.
+`finalize_mode=AUTO` with `num_valid_tokens_tensor` requires persistent
+finalization and is rejected. Explicit `finalize_mode=DEFAULT` remains a
+static-capacity path, even when a live-token count tensor is supplied.
 
 With `knobs=None` (the default), GenPhase uses an exact cache match, otherwise a
 host-side estimate based on EP size, expert count, top-k, intermediate width,
@@ -787,51 +828,44 @@ retains the original grouped hint; a positive integer supplies a fixed hint.
 Legacy inference knob names are not accepted by GenPhase. The low-level
 `Sm100GenphaseMoeConfig` keeps its explicit N128/CGA4 defaults.
 
-`quantize_input=True` stages BF16 inputs with the fused MXFP8 quantizer;
-`False` accepts E4M3 activations and per-32 typed E8M0 scales in
-`MoEEpTensors.scales`. Routing accepts int32/int64 global expert IDs, with
+`quantize_input=True` stages BF16 inputs with the matching fused quantizer.
+`False` accepts the selected FP8 dtype with per-32 E8M0 scales, or packed
+NVFP4 with per-16 E4M3 scales in `MoEEpTensors.scales`. Mixed MXFP4/MXFP8
+uses E4M3 activations and per-32 E8M0 scales. NVFP4 retains the three
+per-expert global scales (`fc1_alpha`, `fc2_alpha`, `fc1_norm_const`). Routing accepts int32/int64 global expert IDs, with
 `-1` for masked slots, unique valid IDs per token and finite valid scores.
 As on the legacy SM100 path, callers provide valid routing; the backend checks
 metadata without scanning routing values on every forward.
 
 With `preprocess_weights=True`, canonical BF16 weights or canonical
-prequantized E4M3 weights plus E8M0 scales are converted to GenPhase's
-16-row gate/up stripes and physical K-major layout. Weight scales may use
-typed `torch.float8_e8m0fnu` or raw `torch.uint8` storage. The exported
+prequantized weights in the selected format are converted to GenPhase's
+16-row gate/up stripes and physical K-major layout. NVFP4 weight scales
+use E4M3; MXFP8 and MXFP4 weight scales use E8M0. The backend also accepts
+raw `torch.uint8` scale storage. The exported
 `preprocess_mxfp8_cutedsl_mega_weights(..., kernel_variant="genphase")` helper produces
 the same payload for `preprocess_weights=False` callers. Legacy transformed
 weights cannot be reused. GenPhase workspace pooling is isolated by pipeline
 and resolved configuration. Rubin source and frontend are independent.
 
-Native layer coverage is in the existing
-`test_moe_ep_mxfp8_cutedsl_mega_multirank.py::test_blackwell_genphase_layer_graph_and_weight_formats`
-test, runnable with `torchrun --nproc_per_node=<1|2|4> -m pytest`.
+Native dtype and layer coverage is in `test_sm100_genphase_dtypes.py`.
+Distributed route changes and graph replay are covered by
+`test_mega_cuda_graph_multirank.py::test_blackwell_genphase_dtype_graph`,
+runnable with `torchrun --nproc_per_node=<2|4> -m pytest`.
 
 ## Adding a new mega-kernel backend
 
-A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
-under `flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`. Kernel-team drops are
-vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
+A mega kernel owns communication and local MoE execution. Add its backend under
+`flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`.
+Place provider adaptation under `flashinfer/moe_ep/shims/<sm>/` and source
+implementations under `flashinfer/moe_ep/kernels/<owner>/`. See the
+[source layout](../../flashinfer/moe_ep/kernels/README.md) for the existing
+families and their independent source roots.
 
-- `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
-- `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
-  and BF16 (a fork of the same kernel repo)
-- `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
-  JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
-- `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
-  (sm_120/sm_121) swap-AB MXFP8 (another fork snapshot of the same repo)
-- `kernel_src/sm107/next_cutedsl_megamoe/` — Rubin SM107, the kernel repo's `next/`
-  block-scaled inference export; generic inference is integrated, with
-  GenPhase included for future integration (see its `VENDOR.md`)
-
-Each tree exposes its kernels through its own package public API (e.g. the
-sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
-trees duplicate the shared kernel-repo runtime (`common`, `src`, …) at their
-own drop revision and are **process-exclusive** — the top-level kernel module
-names collide, so each tree's `shim/_paths.py` refuses to bootstrap when the
-sibling tree's modules are already imported (a process runs on one
-architecture anyway). Use the existing `sm100_mxfp8_mxfp8_bf16_cutedsl` backend as the
-reference template.
+Backends call the shim package API. The shim imports provider sources, prepares
+weights and workspaces, and preserves its provider's compiler and communication
+contract. The combined CuTe DSL export uses full FI package namespaces so
+Blackwell, Rubin and Hopper can coexist without process-wide `common` or `src`
+aliases. Other drops retain the import contracts in their vendoring records.
 
 ### 1. Kernel + frontend (the "backend config" it links to)
 
@@ -887,12 +921,12 @@ def <name>_mega_moe(
 caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
-Add both functions under the owning tree's `shim/` — e.g.
-`kernel_src/sm100/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
-`nvfp4.py` / `mxfp8.py`), `kernel_src/sm90/pull_style_cutedsl_megakernel/shim/`
+Add both functions under the implementation's adapter package, for example
+`shims/sm100/cutedsl_megamoe/pre_unification/` for Blackwell kernels (alongside
+`nvfp4.py` / `mxfp8.py`), `shims/sm90/cutedsl_megamoe/`
 for Hopper — and re-export them from that package's `__init__.py` (or point at
-your own kernel module). Raw kernel sources live under the tree's `src/` — see
-the tree's `SKILL.md` for how to update that directory when the kernel team
+your own kernel module). Raw kernel sources live under `kernels/<owner>/`; see
+the source family's `SKILL.md` for how to update that directory when the kernel team
 ships a new drop. The kernel-specific tuning knobs
 (intermediate size, top_k, clamps, dtype `kind`, fast-math, reduce/dispatch
 flags) live on the **config** dataclass in step 2 and are threaded through to
@@ -1054,7 +1088,9 @@ Rules, in rough order of how easily they are violated:
   long as the state and every graph captured from it.
 - **`enable_timing` is off-limits under capture.** It synchronizes the device
   to read its CUDA events, which capture forbids. Time `g.replay()` instead
-  (`benchmarks/moe_ep/bench_moe_ep.py --cuda-graph` does exactly this).
+  (`benchmarks/moe_ep/bench_moe_ep_fleet.py --cuda-graph` does exactly this),
+  or set `stage_hook` to record external CUDA events around each stage and read
+  them after the replay (`benchmarks/moe_ep/bench_moe_ep.py`).
 - **All EP ranks must run the same sequence of eager calls and replays.**
   Ordinary collective discipline, but nixl_ep makes it sharper: its Buffer
   toggles a *host-side* double-buffer index (`buffer_idx ^= 1`) on every
@@ -1163,7 +1199,7 @@ CUDA 13 host with at least four supported GPUs is still required to execute
 these regressions; ordinary pytest collection skips them without `torchrun`.
 
 ```bash
-NPROC=4 BACKEND=both bash scripts/task_test_moe_ep_smoke.sh
+NPROC=4 BACKEND=both bash scripts/infra/task_test_moe_ep_smoke.sh
 ```
 
 To run just the layer graph tests (`--backend=nixl_ep` selects NIXL instead):

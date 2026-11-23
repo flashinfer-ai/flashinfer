@@ -273,7 +273,7 @@ size_t genericMxfp8GemmKernelLauncher(void* D, void const* A, void const* B, voi
                            std::string(cutlassGetStatusString(initStatus));                                    \
       throw std::runtime_error("[MXFP8 gemm Runner] " + errMsg);                                               \
     }                                                                                                          \
-    auto runStatus = gemm.run(args, workspace, stream, nullptr, /*enablePDL=*/true);                           \
+    auto runStatus = gemm.run(stream, nullptr, /*enablePDL=*/true);                                            \
     if (runStatus != cutlass::Status::kSuccess) {                                                              \
       std::string errMsg = "Failed to run cutlass MXFP8 gemm on sm100. Error: " +                              \
                            std::string(cutlassGetStatusString(runStatus));                                     \

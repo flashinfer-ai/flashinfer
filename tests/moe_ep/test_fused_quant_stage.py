@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification")
 
 
 def _require_blackwell():
@@ -57,7 +57,9 @@ def _make_buffers(quant_type: str, capacity: int, hidden: int, topk: int):
     # reset the tail-fill memo for this (possibly reused) address so the
     # fused path treats the dirty buffer as fully live.
     topk_idx = torch.full((capacity, topk), 7, dtype=torch.int64, device="cuda")
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        note_staged_tokens,
+    )
 
     note_staged_tokens(topk_idx, capacity)
     topk_weights = torch.zeros(capacity, topk, dtype=torch.float32, device="cuda")
@@ -119,7 +121,9 @@ def test_mxfp8_staging_alternates_legacy_and_genphase_routing(monkeypatch):
     """A compiled int64 stager cannot be reused for an int32 output ABI."""
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+        note_staged_tokens,
+    )
 
     _require_blackwell()
     hidden, topk, capacity = 384, 3, 68
@@ -148,7 +152,8 @@ def test_mxfp8_staging_alternates_legacy_and_genphase_routing(monkeypatch):
 @pytest.mark.parametrize(
     "device", ["cpu", pytest.param("cuda", marks=pytest.mark.arch_blackwell)]
 )
-def test_genphase_staging_mixed_input_formats(monkeypatch, device):
+@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+def test_genphase_staging_mixed_input_formats(monkeypatch, device, kind):
     """A prequantized batch must update the fused stager's shared tail memo."""
     from types import SimpleNamespace
     from unittest import mock
@@ -159,11 +164,11 @@ def test_genphase_staging_mixed_input_formats(monkeypatch, device):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
         stage_genphase_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         forget_staged_tokens,
         staged_tokens,
     )
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     if device == "cuda":
         _require_blackwell()
@@ -173,11 +178,13 @@ def test_genphase_staging_mixed_input_formats(monkeypatch, device):
     x = torch.randn(
         capacity, hidden, dtype=torch.bfloat16, device=device, generator=generator
     )
-    qx, sx = pkg.quantize_genphase_mxfp8(x, torch.float8_e4m3fn)
+    qx, sx = pkg.quantize_genphase_mxfp8(
+        x, torch.float8_e5m2 if kind == "mxfp8_e5m2" else torch.float8_e4m3fn
+    )
     ids = torch.arange(topk, device=device).expand(capacity, topk).contiguous()
     scores = torch.full((capacity, topk), 1 / topk, device=device)
     workspace = SimpleNamespace(
-        config=SimpleNamespace(hidden=hidden),
+        config=SimpleNamespace(hidden=hidden, sf_vec_size=32, quant_kind=kind),
         x=torch.zeros_like(qx),
         x_sf=torch.zeros(capacity, 128, dtype=torch.uint8, device=device).view(
             torch.float8_e8m0fnu
@@ -349,7 +356,7 @@ def test_zero_token_stage_masks_stale_rows(monkeypatch, quant_type):
     """
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
         fused_quant_stage,
         staged_tokens,
     )

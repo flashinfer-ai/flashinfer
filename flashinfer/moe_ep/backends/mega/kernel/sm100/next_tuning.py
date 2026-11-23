@@ -19,13 +19,13 @@ def tune_one(args, rank, world_size, max_tokens):
     """
     import torch
 
-    from .....kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
     from .....tensors import MoEEpTensors
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.kernel_helpers import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.kernel_helpers import (
         concatenate_block_scaled_weights,
     )
     from .mxfp8_mxfp8_bf16_cutedsl.staging import stage_genphase_inputs
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
         sm100_standard_candidates,
         sm100_schedule_candidates,
     )
@@ -38,7 +38,10 @@ def tune_one(args, rank, world_size, max_tokens):
         pkg.Sm100GenphaseMoeConfig if genphase else pkg.Sm100BlockScaledMoeConfig
     )
     options = (
-        {}
+        dict(
+            quant_kind=args.dtype,
+            apply_routing_weights_before_fc2=args.apply_routing_weights_before_fc2,
+        )
         if genphase
         else dict(
             quant_kind=args.dtype,
@@ -64,7 +67,9 @@ def tune_one(args, rank, world_size, max_tokens):
     sms = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
-    from .....kernel_src.sm100.next_cutedsl_megamoe.shim.knob_cache import resolve_knobs
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.knob_cache import (
+        resolve_knobs,
+    )
 
     constraints = None
     if args.sweep == "schedule":
@@ -73,6 +78,12 @@ def tune_one(args, rank, world_size, max_tokens):
             if args.base_knobs
             else resolve_knobs(cfg, sm_count=sms, live_tokens=live)[0]
         )
+        if "cluster_shape_mnk" in base:
+            raise ValueError(
+                "cluster_shape_mnk belongs to the retired legacy tuning schema. "
+                "Retune with native cluster_shape_mn=(M, N); renaming an old "
+                "cache entry does not make it compatible."
+            )
         base = {k: tuple(v) if isinstance(v, list) else v for k, v in base.items()}
         constraints = (
             {k: v for k, v in base.items() if k != "schedule_policy"}
@@ -84,10 +95,12 @@ def tune_one(args, rank, world_size, max_tokens):
             cfg, sm_count=sms, live_tokens=live, constraints=constraints
         )
         if genphase
-        else sm100_schedule_candidates(base, cfg)
-        if args.sweep == "schedule"
-        else sm100_standard_candidates(
-            cfg, allow_nondeterministic=args.allow_nondeterministic
+        else (
+            sm100_schedule_candidates(base, cfg)
+            if args.sweep == "schedule"
+            else sm100_standard_candidates(
+                cfg, allow_nondeterministic=args.allow_nondeterministic
+            )
         )
     )
     workspace_type = (
@@ -138,7 +151,7 @@ def tune_one(args, rank, world_size, max_tokens):
         )
         weights = torch.rand(live, args.topk, device="cuda", generator=generator) + 0.5
         tensors = MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=weights)
-        if genphase:
+        if genphase and args.dtype != "nvfp4":
             stage_genphase_inputs(tensors, workspace, quantize_input=True)
         else:
             from .nvfp4_nvfp4_bf16_cutedsl import staging as nvfp4_staging
@@ -203,18 +216,19 @@ def run_tuning(args):
         mxfp8_cutedsl_runtime_requirements,
         nvfp4_cutedsl_runtime_requirements,
     )
-    from .....kernel_src.sm100.next_cutedsl_megamoe import knob_cache_path
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import knob_cache_path
 
     from flashinfer import autotune_v2
     from flashinfer.autotuner import AutoTuner
 
     if args.kernel_variant == "genphase" and (
-        args.dtype != "mxfp8_e4m3"
-        or args.combine_dtype != "bf16"
+        args.combine_dtype != "bf16"
         or args.allow_nondeterministic
+        or not args.do_finalize
+        or args.activation != "swiglu"
     ):
         raise ValueError(
-            "Blackwell GenPhase requires MXFP8 E4M3, BF16 combine and deterministic reduction"
+            "Blackwell GenPhase requires SwiGLU and separate BF16 finalization"
         )
     rank, world_size = (
         int(os.environ.get("RANK", "0")),

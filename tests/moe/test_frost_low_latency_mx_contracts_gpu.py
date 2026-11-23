@@ -24,9 +24,9 @@ from tests.moe.test_frost_low_latency import _assert_near, _quant, _require_gpu
 from tests.moe.test_frost_low_latency_mx_activations import reference
 
 
-def _case(fmt, top_k, packed=True):
+def _case(fmt, top_k, packed=True, seed=8163):
     _require_gpu()
-    torch.manual_seed(8163)
+    torch.manual_seed(seed)
     e, t, h, i = 4, 2, 256, 96
     device = torch.device("cuda", torch.cuda.current_device())
 

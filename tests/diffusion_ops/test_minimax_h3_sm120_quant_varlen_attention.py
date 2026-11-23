@@ -68,13 +68,33 @@ CU_SEQLENS = [
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _minor = get_compute_capability(torch.device("cuda:0"))
-    return major == 12
+    return get_compute_capability(torch.device("cuda:0")) == (12, 0)
 
 
 requires_sm120 = pytest.mark.skipif(
-    not _supported(), reason="requires an SM120 (RTX 5090 / RTX PRO 6000 Blackwell) GPU"
+    not _supported(),
+    reason="generated programs require exact compute capability 12.0 (sm_120a)",
 )
+
+
+@pytest.mark.parametrize(
+    "cuda_available, capability, expected",
+    [
+        (False, (12, 0), False),
+        (True, (12, 0), True),
+        (True, (12, 1), False),
+        (True, (10, 0), False),
+    ],
+)
+def test_supported_requires_exact_sm120(
+    monkeypatch, cuda_available, capability, expected
+):
+    # The generated programs ship sm_120a only; Spark must not enter the numerical suite.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setitem(
+        _supported.__globals__, "get_compute_capability", lambda device: capability
+    )
+    assert _supported() is expected
 
 
 def synthetic_inputs(tokens: int, heads: int, seed: int, device: torch.device):
@@ -245,6 +265,17 @@ def test_minimax_h3_sm120_varlen_attention_fp8_workspace_reuse_is_bitwise() -> N
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_minimax_h3_sm120_varlen_attention_fp8_rejects_unsupported_device() -> None:
+    device = torch.device("cuda:0")
+    if get_compute_capability(device) == (12, 0):
+        pytest.skip("SM120 is supported; numerical tests cover this device")
+    q, k, v = synthetic_inputs(1, 1, seed=0, device=device)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    with pytest.raises(RuntimeError, match=r"requires exact compute capability 12\.0"):
+        minimax_h3_sm120_varlen_attention_fp8(q, k, v, cu, cu_seqlens_host=(0, 1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_minimax_h3_sm120_varlen_attention_fp8_rejects_bad_inputs() -> None:
     device = torch.device("cuda:0")
     q, k, v = synthetic_inputs(300, 4, seed=3, device=device)
@@ -400,8 +431,9 @@ def test_minimax_h3_sm120_varlen_attention_fp8_overlapped_form_is_bitwise_sequen
     fresh_caches, monkeypatch
 ) -> None:
     """A plan of the overlap band takes the overlapped form (the producers, the lead and the tail
-    attention), leaves the head-control words zero after every call and matches the sequential
-    launches bit for bit, its first call (with the programs' zero-work first run) included."""
+    attention; on 188 SMs at the overlap width 32 the producers' burst build on every SM), leaves the
+    head-control words zero after every call and matches the sequential launches bit for bit, its
+    first call (with the programs' zero-work first run) included."""
     device = torch.device("cuda:0")
     _skip_without_overlap(device)
     monkeypatch.setattr(fp8_ops, "_OVERLAP_LOADED", set())
@@ -411,8 +443,9 @@ def test_minimax_h3_sm120_varlen_attention_fp8_overlapped_form_is_bitwise_sequen
     )
     plan = fp8_ops._plan_at(OVERLAP_CU_SEQLENS, MINIMAX_H3_NUM_HEADS, device.index)
     assert plan.overlap
+    burst = fp8_ops._sm_count(device.index) == 188
     assert fp8_ops.minimax_h3_sm120_quant_varlen_attention_programs(plan) == (
-        fp8_ops.PREPROCESS_HEAD_MAJOR,
+        fp8_ops.PREPROCESS_HEAD_MAJOR_BURST if burst else fp8_ops.PREPROCESS_HEAD_MAJOR,
         fp8_ops.ATTENTION_LEAD,
         fp8_ops.ATTENTION_TAIL,
     )
@@ -431,6 +464,108 @@ def test_minimax_h3_sm120_varlen_attention_fp8_overlapped_form_is_bitwise_sequen
     for out in overlapped:
         assert torch.equal(out, sequential)
     _check(sequential, fp32_oracle(q, k, v, OVERLAP_CU_SEQLENS))
+
+
+# One segment of 24577 tokens: 56 heads just above the overlap band (24577^2 > 24576^2).
+HEAD_MAJOR_CU_SEQLENS = (0, 24577)
+
+
+@requires_sm120
+def test_minimax_h3_sm120_varlen_attention_fp8_head_major_sequential_is_bitwise(
+    fresh_caches, monkeypatch
+) -> None:
+    """A plan of 56 heads above the overlap band takes its pre-processing from the head-major
+    producers over every SM, then the attention; it leaves the head-control words zero (an
+    overlapped call on the same workspace set after it is unchanged) and matches the statistics and
+    quantizer launches bit for bit."""
+    device = torch.device("cuda:0")
+    _skip_without_overlap(device)
+    cu = torch.tensor(HEAD_MAJOR_CU_SEQLENS, dtype=torch.int32, device=device)
+    q, k, v = synthetic_inputs(
+        HEAD_MAJOR_CU_SEQLENS[-1], MINIMAX_H3_NUM_HEADS, seed=29, device=device
+    )
+    plan = fp8_ops._plan_at(HEAD_MAJOR_CU_SEQLENS, MINIMAX_H3_NUM_HEADS, device.index)
+    assert not plan.overlap and plan.head_major
+    assert fp8_ops.minimax_h3_sm120_quant_varlen_attention_programs(plan) == (
+        fp8_ops.PREPROCESS_HEAD_MAJOR,
+        fp8_ops.ATTENTION,
+    )
+    ocu, oinputs, oexpected = _overlap_case(device, (31,))
+
+    def call() -> torch.Tensor:
+        return minimax_h3_sm120_varlen_attention_fp8(
+            q, k, v, cu, cu_seqlens_host=HEAD_MAJOR_CU_SEQLENS
+        )
+
+    head_major = []
+    for _call in range(2):
+        head_major.append(call())
+        overlapped = _overlap_call(*oinputs[0], ocu)
+        _await((torch.cuda.current_stream(),), "head-major and overlapped calls")
+        assert torch.equal(overlapped, oexpected[0])
+    owner = (device.index, torch.cuda.current_stream().cuda_stream)
+    assert _control_words_are_zero([owner])
+    monkeypatch.setattr(fp8_ops, "_OVERLAP_WIDTH", {})
+    monkeypatch.setattr(fp8_ops, "_PLANS", OrderedDict())
+    monkeypatch.setattr(fp8_ops, "_STREAM_WORKSPACES", OrderedDict())
+    sequential = call()
+    torch.cuda.synchronize()
+    assert not fp8_ops._plan_at(
+        HEAD_MAJOR_CU_SEQLENS, MINIMAX_H3_NUM_HEADS, device.index
+    ).head_major
+    for out in head_major:
+        assert torch.equal(out, sequential)
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "cu_seqlens",
+    [
+        # a short attention-weighted mean segment length: the light overlap width
+        (0, 1536, 3072, 4608, 6144),
+        # a long mean over more than 16384 padded tokens: the long overlap width
+        (0, 8368, 16736, 25104, 33472),
+    ],
+)
+def test_minimax_h3_sm120_varlen_attention_fp8_overlap_widths_are_bitwise_sequential(
+    cu_seqlens, fresh_caches, monkeypatch
+) -> None:
+    """The plans whose overlap width is not the shipped 32 match the sequential launches bit for bit
+    and leave the head-control words zero."""
+    device = torch.device("cuda:0")
+    _skip_without_overlap(device)
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=23, device=device
+    )
+    plan = fp8_ops._plan_at(cu_seqlens, MINIMAX_H3_NUM_HEADS, device.index)
+    assert plan.overlap
+    grids = fp8_ops.minimax_h3_sm120_quant_varlen_attention_overlap_grids(
+        fp8_ops._sm_count(device.index),
+        num_units=plan.num_units,
+        total_tokens=plan.total_tokens,
+        work=plan.work,
+        padded_tokens=plan.padded_tokens,
+    )
+    assert grids[2] > 32
+
+    def call() -> torch.Tensor:
+        return minimax_h3_sm120_varlen_attention_fp8(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+
+    overlapped = [call() for _call in range(2)]
+    _await((torch.cuda.current_stream(),), "overlapped calls")
+    owner = (device.index, torch.cuda.current_stream().cuda_stream)
+    assert _control_words_are_zero([owner])
+    monkeypatch.setattr(fp8_ops, "_OVERLAP_WIDTH", {})
+    monkeypatch.setattr(fp8_ops, "_PLANS", OrderedDict())
+    monkeypatch.setattr(fp8_ops, "_STREAM_WORKSPACES", OrderedDict())
+    sequential = call()
+    torch.cuda.synchronize()
+    assert not fp8_ops._plan_at(cu_seqlens, MINIMAX_H3_NUM_HEADS, device.index).overlap
+    for out in overlapped:
+        assert torch.equal(out, sequential)
 
 
 @requires_sm120

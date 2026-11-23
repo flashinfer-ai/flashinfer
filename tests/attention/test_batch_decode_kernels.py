@@ -18,12 +18,12 @@ import math
 
 import pytest
 import torch
-from tests.test_helpers.jit_utils import (
+from tests.jit.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
-from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
-from tests.test_helpers.parametrize import (
+from tests.quantization.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.infra.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
@@ -1199,8 +1199,8 @@ def test_single_decode_torch_compile_cuda_graph():
     )
 
 
-@pytest.mark.parametrize("batch_size", [4, 8])
-@pytest.mark.parametrize("q_len_per_req", [2, 3])
+@pytest.mark.parametrize("batch_size", [4, 8, 64])
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 3])
 @pytest.mark.parametrize("num_kv_heads", [2, 8])
 @pytest.mark.parametrize("gqa_group_size", [4, 8])
 def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(

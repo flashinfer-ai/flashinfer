@@ -20,6 +20,8 @@ Exported Kernels:
   read-only state; legacy 16-deep flat ring)
 - gated_delta_rule_mtp_ucache_flush: fused verify+flush ucache kernel (32-slot
   rotating ring; folds the window into the checkpoint state)
+- gated_delta_rule_mtp_ucache_flush_umma_rubin: Rubin (sm_107a) build of the UMMA
+  backend of the flush kernel (also sm_100a), with an opt-in persistent kernel
 """
 
 try:
@@ -76,6 +78,18 @@ except (ImportError, RuntimeError):
     gated_delta_rule_mtp_ucache_flush_umma = None  # type: ignore
     flush_first_row_order = None  # type: ignore
 
+# Rubin (sm_107a) build of the UMMA kernel: same contract and results, Rubin tunings, a
+# persistent kernel for die-localized launches and uGPU buffers (ugpu_ucache_buffers: one launch
+# per die); also runs on sm_100a.
+try:
+    from .gdn_replay_mtp_umma_rubin import (
+        gated_delta_rule_mtp_ucache_flush_umma_rubin,
+        ugpu_ucache_buffers,
+    )
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache_flush_umma_rubin = None  # type: ignore
+    ugpu_ucache_buffers = None  # type: ignore
+
 try:
     from .gdn_prefix_materialize import gdn_prefix_materialize
 except (ImportError, RuntimeError):
@@ -106,11 +120,13 @@ except (ImportError, RuntimeError):
 
 try:
     from .blackwell import (
+        _chunk_gated_delta_rule_gdn_affine_split_sm100,
         _chunk_gated_delta_rule_gdn_cp_sm100,
         chunk_gated_delta_rule_sm100,
         cp_delta_rule_dsl_sm100,
     )
 except (ImportError, RuntimeError):
+    _chunk_gated_delta_rule_gdn_affine_split_sm100 = None  # type: ignore
     _chunk_gated_delta_rule_gdn_cp_sm100 = None  # type: ignore
     chunk_gated_delta_rule_sm100 = None  # type: ignore
     cp_delta_rule_dsl_sm100 = None  # type: ignore
@@ -138,6 +154,8 @@ __all__ = [
     "gated_delta_rule_mtp_ucache",
     "gated_delta_rule_mtp_ucache_flush",
     "gated_delta_rule_mtp_ucache_flush_umma",
+    "gated_delta_rule_mtp_ucache_flush_umma_rubin",
+    "ugpu_ucache_buffers",
     "flush_first_row_order",
     "gdn_prefix_materialize",
     "gated_delta_rule_mtp_wy_output_only",

@@ -73,9 +73,9 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     opening, count, reserve, store and, at ``fused_begin`` 2, the receiver
     prefix in one cooperative launch over the co-resident blocks), ahead of
     the fused small-round path.  ``None`` reads
-    ``FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS`` (default ``513``, the
-    rounds above the default fused bound; ``0`` = off).  It changes no stored
-    value.
+    ``FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS`` (default ``512`` at
+    EP size 8, else ``513``, the rounds above the default fused bound; ``0`` =
+    off).  It changes no stored value.
 
     ``compact_form`` and ``publish_form`` select kernel forms that write the
     same bytes: ``1`` runs the latency-pipelined compact (several rows in
@@ -100,6 +100,12 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     bits).  ``0`` disables it.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS`` (default ``128``).
 
+    ``fc2_early_windows`` also runs the FC2 early start in larger rounds whose
+    local token count lies in the measured window of the pipe's shape
+    (hidden size, intermediate size, total experts, top_k, EP size); shapes
+    without a window are unaffected.  Same bits.  ``None`` reads
+    ``FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_WINDOWS`` (default on).
+
     ``prefix_form`` selects how the single-launch dispatches compute the
     receiver-side prefix (``fused_begin`` 2): ``1`` lets the fused dispatch of
     rounds with ``T * top_k <= 1024`` and the grid dispatch compute it with the
@@ -107,6 +113,55 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     warp scan per source), ``0`` walks the keys with one thread in every
     dispatch.  Both store the same values.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM`` (default ``1``).
+
+    ``direct_place`` makes the grid dispatch store the first route of each token
+    to a rank (its carrier) straight into that rank's activation matrix, which
+    becomes a symmetric (peer-writable) buffer, at the row the compact would have
+    copied it to; the compact then copies only the later routes of the token to
+    the same rank.  It is effective only when every EP rank sets it and every
+    rank's pipe can run it (dedup dispatch, the grid dispatch and compact form
+    ``1`` on, at most 1024 (expert, rank) keys, ``max_tokens_per_rank`` at least
+    the grid-dispatch bound and ``direct_place_min_tokens``); otherwise the layer
+    keeps the inbox path and its regular activation matrix without an error.  A
+    round is placed directly only when every rank dispatches it through the grid
+    dispatch with at least ``direct_place_min_tokens`` local tokens; other rounds
+    take the inbox path.
+    It changes no stored value.  ``None`` reads
+    ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE`` (``0`` or ``1``; unset = on at EP
+    sizes 8 and 4, where it was measured faster, and off at the others) and
+    ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS`` (unset = at EP sizes 8
+    and 4 the larger of ``513`` and ``ceil(2**25 / (top_k * hidden_size))``, the
+    smallest round whose routes carry ``2**25`` elements: ``586`` at hidden 7168
+    and top-k 8, ``781`` at 7168 and 6, ``1366`` at 4096 and 6; at other EP sizes
+    ``513``, the grid-dispatch bound).
+
+    ``wcx_max_tokens`` (opt-in, default off) makes decode rounds with at most
+    that many local tokens (``0 < T <= wcx_max_tokens <= 128``) read lossless
+    compressed copies of the expert weights (WCX) through the swap-AB variant
+    of the FC2 early-start pair: fewer weight bytes per round, same products in
+    the same order, same bits.  It applies only in rounds that run the early
+    start of the decode window (``fc2_early_max_tokens`` > 0; otherwise off).
+    With WCX on, larger rounds of three measured shapes also read the copies
+    through the swap-AB early-start pair (the shape's window ``(lo, hi]`` of
+    local tokens in the runner's ``WCX_WINDOWS``, keyed by hidden size,
+    intermediate size, total experts, top_k and EP size): hidden 7168,
+    intermediate 2048, 256 experts, top-k 8 at EP 2 from 129 to 1024 tokens;
+    hidden 7168, intermediate 3072, 384 experts, top-k 6 at EP 8 from 129 to 512
+    tokens; hidden 4096, intermediate 2048, 256 experts, top-k 6 at EP 8 from 129
+    to 512 tokens.  Other shapes and rounds keep the bf16 path.  The compressed
+    copies are kept next to the bf16 weights (dual format): each MoE layer's
+    expert memory on a rank grows by about 0.77 x its bf16 expert bytes
+    (Gaussian weights; the exact figure depends on the weights' exponent
+    spread).  The copies are encoded only when WCX resolves on (with
+    ``fc2_early_max_tokens`` = 0, or a geometry without the early-start pair,
+    nothing is encoded).  A layer whose
+    weights need more than 188 escape slots in a stage, or whose geometry has
+    no WCX unit (``hidden_size % 512 != 0`` or ``intermediate_size % 256 != 0``),
+    keeps the bf16 pair (warned once).  Pre-transformed weights
+    (``preprocess_weights=False``) carry the copies only when built with
+    ``encode_sm90_cake_wcx``.  ``0`` disables it: nothing is encoded
+    or built.  ``None`` reads ``FLASHINFER_SM90_CAKE_BF16_WCX_MAX_TOKENS``
+    (default ``0``).
     """
 
     intermediate_size: int
@@ -128,3 +183,7 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     per_route_publish_pdl: bool | None = None
     fc2_early_max_tokens: int | None = None
     prefix_form: int | None = None
+    direct_place: bool | None = None
+    direct_place_min_tokens: int | None = None
+    fc2_early_windows: bool | None = None
+    wcx_max_tokens: int | None = None

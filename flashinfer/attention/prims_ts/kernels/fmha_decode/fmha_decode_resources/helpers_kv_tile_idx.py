@@ -82,6 +82,7 @@ def _runtime_configured_local_kv_tiles(
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
+    requested_splits=None,
 ) -> Int32:
     """Return the instruction-aligned local span for configured split capacity."""
     total_kv_tiles = _runtime_total_kv_tiles(
@@ -91,9 +92,20 @@ def _runtime_configured_local_kv_tiles(
         q_token_base,
     )
     num_insts_kv = Int32(cfg.num_insts_kv)
-    configured_splits = Int32(cfg.splits_kv if cfg.use_split_kv else 1)
+    configured_splits = (
+        Int32(cfg.splits_kv if cfg.use_split_kv else 1)
+        if requested_splits is None
+        else Int32(
+            requested_splits[0]
+            if isinstance(requested_splits, tuple)
+            else requested_splits
+        )
+    )
     tiles_per_group = configured_splits * num_insts_kv
-    num_groups = (total_kv_tiles + tiles_per_group - Int32(1)) // tiles_per_group
+    divisor = (
+        requested_splits[1] if isinstance(requested_splits, tuple) else tiles_per_group
+    )
+    num_groups = (total_kv_tiles + tiles_per_group - Int32(1)) // divisor
     return cute.math.max(num_groups * num_insts_kv, num_insts_kv)
 
 
@@ -163,21 +175,36 @@ def _runtime_effective_seq_len_kv(
     return cute.math.max(visible_k_end - skipped_tokens, Int32(0))
 
 
+def cta_caches_visible_kv_interval(cfg: FmhaDecodeConfig) -> bool:
+    """Return whether a Q CTA caches the keys all its rows see, per work tile.
+
+    Grouped per-row causal rows and sliding windows need the intersection of
+    several row intervals, computed once per work tile. Otherwise the single
+    right bound (``seq_len_kv`` or the uniform causal end) is already live in
+    the softmax and compared in key space per tile.
+    """
+    return cfg.uses_per_row_causal_mask or cfg.use_sliding_window_causal
+
+
+def cta_visible_kv_interval_words(cfg: FmhaDecodeConfig) -> int:
+    """Return the task-cache words of the cached interval: its end, then its
+    begin when a sliding window bounds it on the left."""
+    return 2 if cfg.use_sliding_window_causal else 1
+
+
 @cute.jit
-def _kv_tile_is_fully_unmasked_for_q_group(
+def cta_visible_kv_interval(
     cfg: FmhaDecodeConfig,
-    tile_offset_k: Int32,
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
-    tile_has_valid_scores: cutlass.Boolean,
-) -> cutlass.Boolean:
-    """Return whether a KV tile needs no score mask for any active Q row.
+) -> tuple[Int32, Int32]:
+    """Return the keys ``[begin, end)`` visible to every active row of one Q CTA.
 
-    Grouped causal rows expose an intersection bounded on the right by the
-    earliest Q token.  A sliding window also bounds it on the left by the
-    latest active Q token.  Tiles outside that intersection retain the exact
-    per-row boundary path.
+    Computed once per work tile (``DecodeGenTask.get_domain``) and read by
+    softmax from the task cache. Grouped causal rows are bounded on the right
+    by the earliest Q token, and a sliding window bounds them on the left by
+    the latest Q token. Tiles not wholly inside take the exact per-row path.
     """
     visible_k_begin = Int32(0)
     visible_k_end = seq_len_kv
@@ -205,11 +232,53 @@ def _kv_tile_is_fully_unmasked_for_q_group(
                 latest_causal_end - Int32(cfg.attention_window_size),
                 Int32(0),
             )
-    return tile_has_valid_scores and kv_tile_is_fully_visible(
-        tile_offset_k,
-        Int32(cfg.tile_size_kv),
-        visible_k_begin,
-        visible_k_end,
+    return visible_k_begin, visible_k_end
+
+
+def task_cache_visible_kv_interval_index(cfg: FmhaDecodeConfig) -> int:
+    """Return the task-cache slot of the cached interval's ``end`` word.
+
+    The interval words are appended after the stable task-cache words (and
+    the runtime split count), and only in softmax tasks of configs that
+    cache it.
+    """
+    return 11 if cfg.runtime_split_kv else 10
+
+
+@cute.jit
+def kv_tile_is_unmasked(
+    cfg: FmhaDecodeConfig,
+    stage_info: StageInfo,
+    tile_offset_k: Int32,
+    seq_len_kv: Int32,
+    seq_len_q: Int32,
+    q_token_base: Int32,
+) -> cutlass.Boolean:
+    """Return whether the K tile at ``tile_offset_k`` needs no score mask.
+
+    The tile must lie inside the keys every active row of the Q CTA sees.
+    Configs that cache that interval (``cta_caches_visible_kv_interval``) read
+    it from the task cache; a task without it masks every tile, which is
+    always exact. Other configs have one right bound and compute it here.
+    """
+    if cutlass.const_expr(cta_caches_visible_kv_interval(cfg)):
+        end_idx = task_cache_visible_kv_interval_index(cfg)
+        words = cta_visible_kv_interval_words(cfg)
+        if cutlass.const_expr(
+            stage_info.task_cache is None
+            or len(stage_info.task_cache) < end_idx + words
+        ):
+            return cutlass.Boolean(False)
+        visible_k_begin = Int32(0)
+        if cutlass.const_expr(words == 2):
+            visible_k_begin = Int32(stage_info.task_cache[end_idx + 1])
+        visible_k_end = Int32(stage_info.task_cache[end_idx])
+    else:
+        visible_k_begin, visible_k_end = cta_visible_kv_interval(
+            cfg, seq_len_kv, seq_len_q, q_token_base
+        )
+    return kv_tile_is_fully_visible(
+        tile_offset_k, Int32(cfg.tile_size_kv), visible_k_begin, visible_k_end
     )
 
 
@@ -219,6 +288,7 @@ def _runtime_active_splits_kv(
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
+    requested_splits=None,
 ) -> Int32:
     """Return the useful split prefix for one runtime Q/KV work item."""
     if cutlass.const_expr(not cfg.use_split_kv):
@@ -230,14 +300,31 @@ def _runtime_active_splits_kv(
         q_token_base,
     )
     local_kv_tiles = _runtime_configured_local_kv_tiles(
-        cfg,
-        seq_len_kv,
-        seq_len_q,
-        q_token_base,
+        cfg, seq_len_kv, seq_len_q, q_token_base, requested_splits=requested_splits
     )
     # Split ranges are instruction-group aligned. Only ranges intersecting the
     # valid K domain participate; remaining configured grid slots are padding.
+    if cutlass.const_expr(cfg.splits_kv == 2):
+        # The configured span covers at most two nonempty ranges. Comparisons
+        # recover their count without a divide by the runtime local span.
+        return Int32(total_kv_tiles > Int32(0)) + Int32(total_kv_tiles > local_kv_tiles)
     return (total_kv_tiles + local_kv_tiles - Int32(1)) // local_kv_tiles
+
+
+@cute.jit
+def runtime_split_kv_is_active(
+    cfg: FmhaDecodeConfig,
+    seq_len_kv: Int32,
+    seq_len_q: Int32,
+    q_token_base: Int32,
+    split_idx: Int32,
+) -> cutlass.Boolean:
+    """Test a split's first tile without dividing by its runtime local span."""
+    total_kv_tiles = _runtime_total_kv_tiles(cfg, seq_len_kv, seq_len_q, q_token_base)
+    local_kv_tiles = _runtime_configured_local_kv_tiles(
+        cfg, seq_len_kv, seq_len_q, q_token_base
+    )
+    return split_idx * local_kv_tiles < total_kv_tiles
 
 
 @cute.jit
@@ -246,10 +333,13 @@ def _runtime_execution_splits_kv(
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
+    requested_splits=None,
 ) -> Int32:
     """Return a nonzero producer/reduction fanout for a runtime-valid Q tile."""
     return cute.math.max(
-        _runtime_active_splits_kv(cfg, seq_len_kv, seq_len_q, q_token_base),
+        _runtime_active_splits_kv(
+            cfg, seq_len_kv, seq_len_q, q_token_base, requested_splits=requested_splits
+        ),
         Int32(1),
     )
 
@@ -306,6 +396,8 @@ def _static_split_kv_global_tile_idx(
 @cute.jit
 def _logical_cta_kv_idx(cfg: FmhaDecodeConfig, stage_info: StageInfo) -> Int32:
     """Resolve the split index from the Q-group-major launch coordinate."""
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        return Int32(cute.arch.block_idx()[0])
     if cutlass.const_expr(stage_info.work_tile is not None):
         q_group_cta_idx = Int32(stage_info.work_tile.tile_idx[0])
     else:
@@ -321,13 +413,11 @@ def _runtime_local_kv_tiles(
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
+    requested_splits=None,
 ) -> Int32:
     """Return local KV tiles assigned to one split CTA at runtime."""
     return _runtime_configured_local_kv_tiles(
-        cfg,
-        seq_len_kv,
-        seq_len_q,
-        q_token_base,
+        cfg, seq_len_kv, seq_len_q, q_token_base, requested_splits=requested_splits
     )
 
 
@@ -343,9 +433,23 @@ def _runtime_split_kv_global_tile_idx(
     """Map a runtime local tile index to a global split-KV tile index."""
     if cutlass.const_expr(not cfg.use_split_kv):
         return local_tile_idx
+    if cutlass.const_expr(cfg.runtime_split_kv):
+        # get_domain has already resolved the split's absolute window origin.
+        # Consumers need only add their local tile, without dividing by the
+        # launch count again for every K/V or score tile.
+        return (
+            Int32(_decode_gen_task_cache(stage_info)[_TASK_CACHE_KV_RAW_TILE_BASE])
+            - _num_skipped_kv_tiles(cfg, seq_len_kv, seq_len_q, q_token_base)
+            + local_tile_idx
+        )
     return (
         _logical_cta_kv_idx(cfg, stage_info)
-        * _runtime_local_kv_tiles(cfg, seq_len_kv, seq_len_q, q_token_base)
+        * _runtime_local_kv_tiles(
+            cfg,
+            seq_len_kv,
+            seq_len_q,
+            q_token_base,
+        )
         + local_tile_idx
     )
 
@@ -417,7 +521,9 @@ def resolve_keeps_tile_context(
     if cutlass.const_expr(cfg.uses_uniform_causal_mask):
         element_mask_end_idx = seq_len_kv - seq_len_q + q_token_base + Int32(1)
 
-    use_runtime_kv_domain = seqlens_kv is not None or cfg.uses_runtime_q_kv_union
+    use_runtime_kv_domain = seqlens_kv is not None or (
+        not cfg.fixed_seqlen or cfg.uses_runtime_q_kv_union
+    )
     if cutlass.const_expr(local_tile_idx is None):
         local_tile_idx = _softmax_tile_idx(cfg, stage_info, inst_id)
     if cutlass.const_expr(not use_runtime_kv_domain):
@@ -472,13 +578,8 @@ def resolve_keeps_tile_context(
         and (tile_offset_k < seq_len_kv)
         and not is_masked_final_wave
     )
-    tile_is_unmasked = _kv_tile_is_fully_unmasked_for_q_group(
-        cfg,
-        tile_offset_k,
-        seq_len_kv,
-        seq_len_q,
-        q_token_base,
-        tile_has_valid_scores,
+    tile_is_unmasked = tile_has_valid_scores and kv_tile_is_unmasked(
+        cfg, stage_info, tile_offset_k, seq_len_kv, seq_len_q, q_token_base
     )
     # Flattened SQ=1 QToken-KvBlock-Sparse-Attention routes use their compacted causal length as
     # seq_len_kv. At or above the 2048-token budget this marks all first

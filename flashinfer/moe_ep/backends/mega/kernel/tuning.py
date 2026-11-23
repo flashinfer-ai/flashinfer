@@ -139,7 +139,9 @@ def run_tuning(
     import torch
 
     if pkg is None:
-        from ....kernel_src.sm100 import cutedsl_megamoe as _default_pkg
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import (
+            pre_unification as _default_pkg,
+        )
 
         pkg = _default_pkg
 
