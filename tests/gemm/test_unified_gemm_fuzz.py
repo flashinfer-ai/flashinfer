@@ -91,7 +91,9 @@ from flashinfer import (
 )
 from flashinfer.autotuner import AutoTuner
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float, mxfp4_dequantize
-from flashinfer.utils import LibraryError, get_compute_capability, version_at_least
+from flashinfer.utils import LibraryError, get_compute_capability
+from flashinfer.cute_dsl import is_cute_dsl_available
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_mxfp8_dsl_supported
 
 try:
@@ -123,14 +125,19 @@ pytestmark = [
     pytest.mark.skipif(_SKIP is not None, reason=str(_SKIP)),
 ]
 _SM = _CC[0] * 10 + _CC[1]
-# These adapters already prepare the native 128x4 input/scale contract.
-_B12X_BACKENDS = (
-    ("b12x",)
-    if _SM in (120, 121)
-    and version_at_least(torch.version.cuda, "13.0")
-    and _b12x_mxfp8_dsl_supported()
-    else ()
-)
+
+
+def _b12x_backends(quant_mode):
+    # Match each backend's toolkit/DSL requirements; torch's build CUDA may differ.
+    if _SM not in (120, 121) or not is_cute_dsl_available():
+        return ()
+    min_cuda = "12.9" if quant_mode == "nvfp4" else "13.0"
+    if not is_cuda_version_at_least(min_cuda):
+        return ()
+    if quant_mode == "mxfp8" and not _b12x_mxfp8_dsl_supported():
+        return ()
+    return ("b12x",)
+
 
 # A clean rejection ("not supported on this shape/arch/dtype") must SKIP, never fail; a crash
 # (CUDA error / illegal access / device assert) is always a finding and re-raises.
@@ -367,7 +374,7 @@ _ADAPTERS = [
         key="mm_nvfp4",
         op_shape="mm",
         quant_mode="nvfp4",
-        backends=("cutlass", "cudnn", "auto") + _B12X_BACKENDS,
+        backends=("cutlass", "cudnn", "auto") + _b12x_backends("nvfp4"),
         convention={
             "a_scale": "block-16",
             "b_scale": "block-16",
@@ -383,7 +390,7 @@ _ADAPTERS = [
         key="mm_mxfp4",
         op_shape="mm",
         quant_mode="mxfp4",
-        backends=("cudnn", "auto") + _B12X_BACKENDS,
+        backends=("cudnn", "auto") + _b12x_backends("mxfp4"),
         convention={
             "a_scale": "block-32",
             "b_scale": "block-32",
@@ -410,7 +417,7 @@ _ADAPTERS = [
         key="mm_mxfp8",
         op_shape="mm",
         quant_mode="mxfp8",
-        backends=("cudnn", "cutlass", "auto") + _B12X_BACKENDS,
+        backends=("cudnn", "cutlass", "auto") + _b12x_backends("mxfp8"),
         convention={
             "a_scale": "block-32",
             "b_scale": "block-32",

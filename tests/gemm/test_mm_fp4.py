@@ -21,6 +21,7 @@ from flashinfer.utils import (
     LibraryError,
 )
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from tests.utils.test_helpers.pdl import late_store
 
 
@@ -335,11 +336,11 @@ def test_mm_fp4_b12x_output_row_alignment(
     m, n, out_dtype, backend, use_nvfp4, auto_tuning
 ):
     """Unaligned output rows must not use TMA, including cached FP4 tactics."""
+    min_cuda = "12.9" if use_nvfp4 else "13.0"
     if not (
-        is_sm12x_supported(torch.device("cuda"))
-        and version_at_least(torch.version.cuda, "13.0")
+        is_sm12x_supported(torch.device("cuda")) and is_cuda_version_at_least(min_cuda)
     ):
-        pytest.skip("b12x NVFP4/MXFP4 requires SM120/SM121 + CUDA 13+.")
+        pytest.skip(f"b12x FP4 requires SM120/SM121 + CUDA {min_cuda}+.")
 
     from flashinfer.gemm.gemm_base import _b12x_gemm_fp4_runner
 
@@ -347,8 +348,8 @@ def test_mm_fp4_b12x_output_row_alignment(
     runner = _b12x_gemm_fp4_runner(sm_major, sm_minor, True, out_dtype, use_nvfp4)
     torch.manual_seed(0)
     k = 256
-    # These bounded, lossless inputs accumulate exactly in FP32 at K=256;
-    # only the final output-dtype conversion rounds, so zero tolerance is valid.
+    # These bounded, lossless inputs accumulate exactly in FP32 at K=256,
+    # including whichever backend "auto" selects; only the output cast rounds.
     # Alternate store modes in one process: the compiled-kernel cache must
     # distinguish the aligned TMA path from the predicated global-store path.
     aligned_n = (n + 7) // 8 * 8
