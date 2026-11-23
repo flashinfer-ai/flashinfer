@@ -4,9 +4,10 @@
 
 The file couples the Lean model (``lean/BIKernels/MoENvfp4.lean``) to :mod:`.spec_nvfp4` node for node: per case a term
 the Python spec builds (:mod:`.mterm` S-expression) and the Lean expression that must print identically. The row scale,
-the GEMM2 chain and the GEMM1 chains of every gated and ungated activation with its parameter sets become theorems
-decided by ``decide +kernel`` when their S-expression is at most :data:`.lean_cases.THEOREM_MAX_BYTES`; the larger chains
-are compared through the ``moenvfp4conformance`` executable only (``tests/batch_invariant/test_moe_nvfp4_lean.py``).
+the GEMM2 chain, the GEMM1 chains of every gated and ungated activation with its parameter sets and the static class's
+blocks become theorems decided by ``decide +kernel`` when their S-expression is at most
+:data:`.lean_cases.THEOREM_MAX_BYTES`; the larger chains (PowLU's declared log / exp) are compared through the
+``moenvfp4conformance`` executable only (``tests/batch_invariant/test_moe_nvfp4_lean.py``).
 
     python -m flashinfer.fused_moe.batch_invariant.lean_cases_nvfp4     # rewrite lean/BIKernels/MoENvfp4Cases.lean
 """
@@ -17,7 +18,6 @@ import os
 from typing import List, Tuple
 
 from . import mterm as term
-from . import spec as S
 from . import spec_nvfp4 as Q
 from .lean_cases import (
     ACT_CASES,
@@ -108,51 +108,6 @@ def moe_nvfp4_cases() -> List[Tuple[str, str, str, bool]]:
         s_st.gemm2(),
         'MoENvfp4.staticGemm2T (.leaf "acc2" [0, 0]) (.leaf "alpha2" [0]) (.leaf "gs2" [0])',
     )
-    # the hardware-arithmetic classes (`moe.nvfp4.<act>.hw`): the chains with an exponential or a division, gated and
-    # ungated, and the static class's block on the hardware pre-values
-    for name, act, params in GLU_CASES:
-        if not S.hw_arith_applies(act, True):
-            continue
-        s_ = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, act=act, params=params, arith="hw")
-        assert s_.hw, (name, act)
-        chain(
-            f"gemm1_{name}_hw",
-            s_.gemm1(),
-            f"MoENvfp4.gluScaledHwT {lean_gact(act, params)} {_G} {_U} {_S1}",
-        )
-        s_s = Q.MoENvfp4Spec(
-            64,
-            32,
-            2,
-            8,
-            alg=alg,
-            act=act,
-            params=params,
-            intermediate="static",
-            arith="hw",
-        )
-        blk = s_s.gemm1_block(0, 0)
-        vals = ", ".join(
-            f'MoENvfp4.gluScaledHwPreT {lean_gact(act, params)} (.leaf "g" [0, {j}]) (.leaf "u" [0, {j}]) {_S1}'
-            for j in range(16)
-        )
-        chain(
-            f"static_sf_{name}_hw", blk["sf"], f"MoENvfp4.staticBlockSfT [{vals}] {gs2}"
-        )
-        chain(
-            f"static_code0_{name}_hw",
-            blk["codes"][0],
-            f"MoENvfp4.staticBlockCodeT [{vals}] {gs2} 0",
-        )
-    for name, act in ACT_CASES:
-        if not S.hw_arith_applies(act, False):
-            continue
-        s_ = Q.MoENvfp4Spec(64, 32, 2, 8, alg=alg, act=act, gated=False, arith="hw")
-        chain(
-            f"gemm1_{name}_hw",
-            s_.gemm1(),
-            f"MoENvfp4.actScaledHwT {_UACT[act]} {_U} {_S1}",
-        )
     return out
 
 

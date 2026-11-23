@@ -23,9 +23,9 @@ def chain_nodes_mx(chain: Mxfp4Chain) -> int:
     alg = term.TermAlgebra()
     g, u = alg.leaf("g", 0, 0), alg.leaf("u", 0, 0)
     if chain.pair:
-        t = S.glu_elem(alg, g, u, chain.act, chain.out_fmt, chain.params)
+        t = S.glu_elem(alg, g, u, chain.act, chain.out_fmt, chain.params, chain.hw)
     elif chain.kind == "act":
-        t = S.act_elem(alg, u, chain.act, chain.out_fmt, chain.params)
+        t = S.act_elem(alg, u, chain.act, chain.out_fmt, chain.params, chain.hw)
     else:
         t = alg.cvt_out(u, chain.out_fmt)
     return term.size(t)

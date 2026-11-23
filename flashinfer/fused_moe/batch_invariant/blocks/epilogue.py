@@ -84,7 +84,6 @@ from .. import spec_nvfp4 as Q
 from ..spec import (
     ACT_PARAMS,
     ACTS,
-    ARITHS,
     UNGATED_ACTS,
     act_elem,
     glu_elem,
@@ -250,15 +249,10 @@ class GroupedChain(GroupedEpilogueBlock):
     act: str = "silu"
     out_fmt: str = "bf16"
     params: Tuple[Optional[float], ...] = ()
-    #: the arithmetic of the chain's transcendental steps (``spec.ARITHS``): ``exact`` (the declared sequences) or ``hw``
-    #: (the hardware-arithmetic class: the part's ``ex2`` / ``rcp``; a class of its own for the chains that have them);
-    #: keyword-only, so the subclasses' positional fields keep their places
-    arith: str = dataclasses.field(default="exact", kw_only=True)
 
     def __post_init__(self):
         assert self.kind in KINDS and self.out_fmt in OUT_FMTS, self
         assert self.act in (UNGATED_ACTS if self.kind == "act" else ACTS), self
-        assert self.arith in ARITHS, self
         if self.kind == "glu" and self.out_fmt != "bf16":
             raise AssertionError("the gated chain converts to bf16 once")
         expected = len(ACT_PARAMS.get(self.act, ())) if self.kind == "glu" else 0
@@ -270,9 +264,9 @@ class GroupedChain(GroupedEpilogueBlock):
 
     @property
     def hw(self) -> bool:
-        """Whether this chain computes in the hardware arithmetic: requested, and the chain has an exponential or a
-        division (the other chains are the exact class under either request)."""
-        return self.arith == "hw" and hw_arith_applies(self.act, self.kind == "glu")
+        """Whether the chain's exponential and divisions run on the part's SFU: never for the bf16 classes (the declared
+        sequences); the fp4 chains override it (:func:`fp4_chain_hw`)."""
+        return False
 
     def elem(self, fp, acc, acc_gate, s=None, inv=None):
         """One output element, converted: the gated term of the (gate, up) accumulator pair, the ungated activation of
@@ -385,6 +379,12 @@ class Fp8Chain(GroupedEpilogueBlock):
 GEMM2_CHAIN = Fp8Chain("plain", "silu", "bf16", (), True)
 
 
+def fp4_chain_hw(chain: GroupedChain) -> bool:
+    """The fp4 classes' arithmetic: a gated or ungated chain with an exponential or a division computes them on the part's
+    SFU (``spec.hw_arith_applies``); a plain conversion never does."""
+    return chain.kind != "plain" and hw_arith_applies(chain.act, chain.kind == "glu")
+
+
 @dataclass(frozen=True)
 class W4A4Chain(GroupedChain):
     """A grouped chain of the NVFP4 classes: the bf16 class's chain with the W4A4 scale source ``scale`` (:data:`W4A4_SCALES`)
@@ -412,6 +412,10 @@ class W4A4Chain(GroupedChain):
     def at(self, in_fmt: str) -> "W4A4Chain":
         """The same chain on another instruction class."""
         return dataclasses.replace(self, in_fmt=in_fmt)
+
+    @property
+    def hw(self) -> bool:
+        return fp4_chain_hw(self)
 
     @property
     def static_quant(self) -> bool:
@@ -468,18 +472,14 @@ class W4A4Chain(GroupedChain):
             return GroupedChain.elem(self, fp, acc, acc_gate)
         if self.out_fmt == "nvfp4":
             if self.pair:
-                return Q.glu_scaled_pre(
-                    fp, acc_gate, acc, s, self.act, self.params, self.hw
-                )
-            return Q.act_scaled_pre(fp, acc, s, self.act, self.params, self.hw)
+                return Q.glu_scaled_pre(fp, acc_gate, acc, s, self.act, self.params)
+            return Q.act_scaled_pre(fp, acc, s, self.act, self.params)
         if self.pair:
             return Q.glu_scaled_elem(
-                fp, acc_gate, acc, s, self.act, self.out_fmt, self.params, self.hw
+                fp, acc_gate, acc, s, self.act, self.out_fmt, self.params
             )
         if self.kind == "act":
-            return Q.act_scaled_elem(
-                fp, acc, s, self.act, self.out_fmt, self.params, self.hw
-            )
+            return Q.act_scaled_elem(fp, acc, s, self.act, self.out_fmt, self.params)
         return Q.scaled_out_elem(fp, acc, s, self.out_fmt)
 
     def describe(self) -> str:
@@ -507,6 +507,10 @@ class Mxfp4Chain(GroupedChain):
     def at(self, in_fmt: str) -> "Mxfp4Chain":
         """The same chain on another instruction class."""
         return dataclasses.replace(self, in_fmt=in_fmt)
+
+    @property
+    def hw(self) -> bool:
+        return fp4_chain_hw(self)
 
     def describe(self) -> str:
         return "mxfp4_" + super().describe()
@@ -643,8 +647,8 @@ def bitcast_f32_to_i32(a):
 
 class MoeF32(CuteF32):
     """``CuteF32`` with the MoE chains' exact mantissa / exponent split of the declared log (``spec.log_term``): bit
-    operations on the binary32 pattern, no floating-point rounding; and the two SFU primitives of the hardware-arithmetic
-    classes (``ex2.approx.ftz`` / ``rcp.approx.ftz``, pinned as inline asm)."""
+    operations on the binary32 pattern, no floating-point rounding; and the two SFU primitives of the fp4 classes' chains
+    (``ex2.approx.ftz`` / ``rcp.approx.ftz``, pinned as inline asm)."""
 
     @staticmethod
     def ex2(a):

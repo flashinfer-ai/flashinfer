@@ -45,9 +45,12 @@ def test_generated_cases_are_current():
         "gemm2",
         "gemm1_swiglu",
         "gemm1_glu_gelu",
+        "gemm1_glu_situ_default",
         "gemm1_act_relu2",
         "gemm1_act_identity",
     } <= theorems
+    large = {"gemm1_glu_powlu_default", "gemm1_glu_powlu_limit"}
+    assert large <= set(names) and not (large & theorems)
     for name in theorems:
         assert f"theorem moe_mxfp4_{name} :" in committed
     for _name, sx, _, as_thm in cases:
