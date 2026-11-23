@@ -1605,6 +1605,13 @@ def single_prefill_with_kv_cache(
     if rope_theta is None:
         rope_theta = 1e4
     if custom_mask is not None and packed_custom_mask is None:
+        kv_len = k.shape[0] if kv_layout == "NHD" else k.shape[1]
+        expected_mask_shape = (q.shape[0], kv_len)
+        if tuple(custom_mask.shape) != expected_mask_shape:
+            raise ValueError(
+                "custom_mask must have shape "
+                f"{expected_mask_shape}, got {tuple(custom_mask.shape)}"
+            )
         # create packed custom mask from custom mask
         packed_custom_mask = packbits(
             custom_mask.contiguous().view(-1), bitorder="little"
