@@ -528,7 +528,7 @@ class JitSpecNvcc(JitSpec):
         for source in self.sources:
             is_cuda = source.suffix == ".cu"
             object_suffix = ".cuda.o" if is_cuda else ".o"
-            obj_name = source.with_suffix(object_suffix).name
+            obj_name = f"{source.parent.name}_{source.stem}{object_suffix}"
             object_paths.append(jit_dir / obj_name)
         return object_paths
 
@@ -843,6 +843,11 @@ def gen_jit_spec(
 
     if is_windows:
         cuda_cflags.append("--disable-warnings")
+        # The generated Cake host bindings use GNU __builtin_*_overflow, which the MSVC host lacks.
+        compat_header = (
+            jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer" / "windows_builtin_compat.h"
+        )
+        cuda_cflags.append(f'-include "{compat_header}"')
 
     if extra_cflags is not None:
         cflags += extra_cflags

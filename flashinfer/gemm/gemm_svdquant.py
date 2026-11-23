@@ -21,7 +21,7 @@ from typing import Callable, List, Literal, Optional, Tuple
 from packaging.version import Version
 import torch
 
-from ..api_logging import cake_auto_candidates_enabled, flashinfer_api
+from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -29,7 +29,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
-    get_autotune_process_group,
+    cake_auto_candidate_open,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
@@ -923,11 +923,7 @@ def _heuristic_func_nvfp4_svdquant(
     if (
         backends
         and "cake" in suitable_backends
-        and cake_auto_candidates_enabled()
-        and not (
-            get_autotune_process_group() is not None and AutoTuner.get().is_tuning_mode
-        )
-        and AutoTuner.get().may_select_runner_class(_CAKE_SVDQUANT_RUNNER)
+        and cake_auto_candidate_open(_CAKE_SVDQUANT_RUNNER)
     ):
         backends.append("cake")
     return backends

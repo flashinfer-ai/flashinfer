@@ -13,10 +13,7 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.moe_ep.backends.mega.kernel.sm107 import variant_selection as selection
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.core.tuning_state import AutoTuningState
-from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
-    block_scaled,
-    knob_cache,
-)
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import block_scaled, knob_cache
 
 
 CONFIGS = [
@@ -236,7 +233,7 @@ def test_captured_default_replacement_requires_pending_selection(protocol):
 
 
 def test_inner_skip_changes_selection_identity(protocol):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import (
         NAMESPACE as NATIVE_NAMESPACE,
     )
 
@@ -380,9 +377,7 @@ def test_compute_releases_staged_tensors(protocol, monkeypatch, phase):
 def test_prepared_eager_execution_does_not_poll_cache_or_peers(
     protocol, monkeypatch, winner
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
-        autotune as native,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import autotune as native
     from tests.moe_ep.sm107_test_utils import unrelated_autotune_contexts
 
     protocol, _ = protocol
@@ -444,7 +439,7 @@ def test_install_prepares_independent_storage_before_releasing_previous(
 
 @pytest.fixture
 def forward_sweep(protocol, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         autotune as native,
         correctness,
         tuning_measurement,
@@ -611,7 +606,7 @@ def forward_sweep(protocol, monkeypatch):
 def test_full_forward_sweep_selects_across_all_knobs(
     forward_sweep, output_view, variant, failure
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         autotune as native,
         tuning_protocol,
     )
@@ -694,8 +689,8 @@ def test_offline_variants_search_afresh_and_publish_without_installing(
 ):
     from flashinfer.moe_ep import tune
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as package
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         autotune as native,
         tuning_protocol,
     )
@@ -892,9 +887,7 @@ def _fixed_forward_tune(protocol, variant, candidates):
 def test_new_live_workload_searches_all_knobs(
     forward_sweep, monkeypatch, tmp_path, variant, cache
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
-        NAMESPACE,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import NAMESPACE
 
     state, tuner = forward_sweep, AutoTuner.get()
     protocol = state.protocol
@@ -969,9 +962,7 @@ def test_new_live_workload_searches_all_knobs(
 def test_new_capacity_search_preserves_persisted_replay_fallback(
     forward_sweep, monkeypatch, seed, live
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
-        NAMESPACE,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.tuning_protocol import NAMESPACE
 
     state, tuner = forward_sweep, AutoTuner.get()
     protocol = state.protocol
@@ -1060,7 +1051,7 @@ def test_new_capacity_search_preserves_persisted_replay_fallback(
 def test_inner_reuse_respects_rejection_and_tuning_controls(
     forward_sweep, monkeypatch, mode
 ):
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         autotune as native,
         tuning_protocol,
     )

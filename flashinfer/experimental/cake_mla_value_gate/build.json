@@ -69,7 +69,7 @@
       "path": "aot/cake_mla_value_gate_00ca8bb1c760493fa672_sm_100a.so",
       "sha256": {
         "csrc/cake_mla_value_gate_00ca8bb1c760493fa672_binding.cu": "b95903051eabb99fef1b7e9c2f73c19c89095e66ff1f04f2979abcfe4b101bbe",
-        "csrc/cake_mla_value_gate_00ca8bb1c760493fa672_kernel.cu": "2575dcf2b4fc204c8a795068428eb8eba2987d1f1624a5ed636a154334d66e8d"
+        "csrc/cake_mla_value_gate_00ca8bb1c760493fa672_kernel.cu": "7f2d70a38d281128ac19c5c92b39aafe53e4a7697df628157c1a0f862d5d3c3f"
       },
       "sources": [
         "csrc/cake_mla_value_gate_00ca8bb1c760493fa672_kernel.cu",
@@ -88,7 +88,7 @@
       "path": "aot/cake_mla_value_gate_00ca8bb1c760493fa672_sm_103a.so",
       "sha256": {
         "csrc/cake_mla_value_gate_00ca8bb1c760493fa672_binding.cu": "b95903051eabb99fef1b7e9c2f73c19c89095e66ff1f04f2979abcfe4b101bbe",
-        "csrc/cake_mla_value_gate_00ca8bb1c760493fa672_kernel.cu": "2575dcf2b4fc204c8a795068428eb8eba2987d1f1624a5ed636a154334d66e8d"
+        "csrc/cake_mla_value_gate_00ca8bb1c760493fa672_kernel.cu": "7f2d70a38d281128ac19c5c92b39aafe53e4a7697df628157c1a0f862d5d3c3f"
       },
       "sources": [
         "csrc/cake_mla_value_gate_00ca8bb1c760493fa672_kernel.cu",
@@ -107,7 +107,7 @@
       "path": "aot/cake_mla_value_gate_0df66a90a1dc776a3834_sm_100a.so",
       "sha256": {
         "csrc/cake_mla_value_gate_0df66a90a1dc776a3834_binding.cu": "36aa321da2886204e42b5ba0912dbf96bf707ca12bda1791304336b2a457be86",
-        "csrc/cake_mla_value_gate_0df66a90a1dc776a3834_kernel.cu": "7dbdbdb41daa042eb83b1f48b886434671efda20c551a621383054a9f0ba8c11"
+        "csrc/cake_mla_value_gate_0df66a90a1dc776a3834_kernel.cu": "8ebfed0dcaba5d6db9818d6485d4d323593cc3a6c322ba756d992b88a997a5e1"
       },
       "sources": [
         "csrc/cake_mla_value_gate_0df66a90a1dc776a3834_kernel.cu",
@@ -126,7 +126,7 @@
       "path": "aot/cake_mla_value_gate_0df66a90a1dc776a3834_sm_103a.so",
       "sha256": {
         "csrc/cake_mla_value_gate_0df66a90a1dc776a3834_binding.cu": "36aa321da2886204e42b5ba0912dbf96bf707ca12bda1791304336b2a457be86",
-        "csrc/cake_mla_value_gate_0df66a90a1dc776a3834_kernel.cu": "7dbdbdb41daa042eb83b1f48b886434671efda20c551a621383054a9f0ba8c11"
+        "csrc/cake_mla_value_gate_0df66a90a1dc776a3834_kernel.cu": "8ebfed0dcaba5d6db9818d6485d4d323593cc3a6c322ba756d992b88a997a5e1"
       },
       "sources": [
         "csrc/cake_mla_value_gate_0df66a90a1dc776a3834_kernel.cu",

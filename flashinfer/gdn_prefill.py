@@ -1600,6 +1600,7 @@ def chunk_gated_delta_rule(
     use_affine_split: bool = False,
     _affine_split_count: Optional[int] = None,
     batch_invariant: bool = False,
+    train_states: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -1973,7 +1974,15 @@ def chunk_gated_delta_rule(
         64 tokens per sequence. A new sequence in a slot must start with a
         prefill call or carry ``prefix_lens``. ``output_final_state=True``
         returns the pool (the states at the last chunk boundaries, not the
-        states after the last token); ``max_seqlen`` is not used. Requires ``backend="auto"``,
+        states after the last token); ``max_seqlen`` is not used. Without
+        ``initial_state`` the call is stateless (the form of a trainer's
+        forward pass): every sequence is whole and runs from the zero state,
+        its rows are bit for bit the rows the pool calls return for it, no
+        state is kept or returned, and ``state_indices``, ``prefix_lens``,
+        ``output_state`` and ``output_final_state=True`` are refused. The
+        rows carry no ``grad_fn``, also when an input requires grad: the
+        class has no backward (``train_states`` exports the state series one takes).
+        Requires ``backend="auto"``,
         ``use_cp="auto"``, ``gate_domain="log"`` with fp32 ``g`` and ``beta``,
         ``use_qk_l2norm_in_kernel=True``, bf16 ``q`` / ``k`` / ``v`` of head
         size 128, a v-head count that is a multiple of the q-head count and
@@ -1984,6 +1993,23 @@ def chunk_gated_delta_rule(
         instead of falling back.
         ``flashinfer.batch_invariant.fingerprint("chunk_gated_delta_rule")``
         names the class; see ``flashinfer/batch_invariant/README.md``.
+    train_states : torch.Tensor, optional
+        Keyword-only, with ``batch_invariant=True`` and no ``initial_state``:
+        an fp32 buffer ``[slots, HV, 128, 128]`` with at least
+        ``flashinfer.batch_invariant.gdn.training_state_slots(seq_lens)`` rows
+        that the stateless call fills with the state every 64-token chunk of
+        every sequence starts from (row order:
+        ``flashinfer.batch_invariant.gdn.training_state_rows(seq_lens)``; per
+        sequence the zero state, then the state after each 64 tokens short
+        of its end). It is the row layout cuDNN's GDN backward takes as
+        ``state_checkpoints`` at a 64-token cadence, and the one term a
+        backward pass cannot recompute from a chunk's own inputs without
+        re-running the state scan. A state is ``[HV, 128 (value), 128 (key)]``,
+        one per v head. The output rows are unchanged, and each
+        stored state is bit for bit the state the inference prefill of the
+        same prefix leaves in its pool. The buffer must be 16-byte aligned
+        and share no memory with a state pool (or the storage after one),
+        the output, an input or the offsets.
 
     Returns
     -------
@@ -2026,6 +2052,8 @@ def chunk_gated_delta_rule(
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if train_states is not None and not batch_invariant:
+        raise ValueError("train_states requires batch_invariant=True")
     if batch_invariant:
         from .batch_invariant.gdn.api import chunk_gated_delta_rule_batch_invariant
 
@@ -2045,6 +2073,7 @@ def chunk_gated_delta_rule(
             output_state=output_state,
             state_indices=state_indices,
             prefix_lens=prefix_lens,
+            train_states=train_states,
             gate_domain=gate_domain,
             backend=backend,
             use_cp=use_cp,

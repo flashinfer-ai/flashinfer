@@ -87,14 +87,6 @@ When a FlashInfer operation executes, the autotuner resolves the best
    environment variable is set and tuning mode is off).
 5. **Fallback tactic (−1)** — a safe default that every runner must implement.
 
-Outside tuning mode, a lookup whose bucket lies above every bucket tuned for
-the operation (same runners, cache-key extras and non-dynamic dimensions)
-repeats levels 1–4 at the largest tuned bucket before using the fallback, and
-logs this once at INFO.  The largest tuned bucket is taken from levels 1–3;
-bundled package configs (level 4) are not scanned for it.  This covers runtime
-sizes above the tuned range.  Lookups below or between tuned buckets still use
-the fallback, and replay coverage reports still count such a lookup as a miss.
-
 User-loaded file configs (level 2) are also consulted during tuning. A
 multi-runner tune can re-profile a loaded winner whose recorded coverage omits
 a current candidate. See `Cache Hit Behavior During Tuning`_.
@@ -197,6 +189,36 @@ coverage information, it profiles the eligible runners and saves the
 result with coverage. The SM107 MXFP8 low-M CuTe-DSL runner uses a distinct
 entry from the regular CuTe-DSL runner, so its first tune can miss an older
 entry.
+
+A runner whose tactic pool can change without changing its identity may
+override ``TunableRunner.get_tactic_cache_key(inputs)``. Return a cheap,
+hashable, cross-process-stable tuple, such as a catalog revision. It must
+change when newly available tactics need comparison, and must be invariant
+under profiling-input synthesis. Computing it must not build plans, enumerate
+tactics, or invoke nested tuning.
+
+``choose_one()`` checks this signature only during tuning, including for a
+single runner. A changed or previously unrecorded signature triggers a new
+comparison; an unchanged signature permits warm reuse without enumeration or
+profiling. The signature is stored in the existing candidate-coverage metadata
+in both JSON and managed caches. Frozensets in the signature are persisted in
+a canonical order; other values need a process-stable ``str()``. The stored
+signature is the one read before tactic enumeration, so a pool that changes
+during preparation is compared again on the next tune.
+Calls outside tuning, including CUDA Graph capture, remain lookup-only and can
+use an older valid winner until retuning. A capture inside ``autotune(True)``
+does check the signature, and a changed one fails there like any other tuning
+miss, because profiling cannot start during capture. Runners returning ``None``
+(the default) retain their existing behavior; this does not detect undeclared
+tactic-pool changes.
+
+``rank_tactics(k > 1)`` keeps its shortlists in memory for the process and
+stores each one with the signature read before enumeration. A shortlist is
+reused only when both the measurement policy and the signature match, so a
+compound runner that ranks each stage re-ranks a stage whose pool changed.
+As with ``choose_one()``, a shortlist miss during a CUDA Graph capture inside
+``autotune(True)`` fails instead of falling back, because profiling cannot
+start during capture; an unchanged shortlist is still returned.
 
 Caching in the Benchmark Harness
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -8,7 +8,7 @@ from typing import Literal
 
 @dataclass
 class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm90.pull_style_cutedsl_megakernel.hopper_fp8_mega_moe``.
+    """Kernel params for ``shims.sm90.cutedsl_megamoe.hopper_fp8_mega_moe``.
 
     ``intermediate_size`` is the post-SwiGLU width, matching the SM100 configs
     and SGLang.  The Hopper FP8 kernel's full FC1 gate+up width is derived

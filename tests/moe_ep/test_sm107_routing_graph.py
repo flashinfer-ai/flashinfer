@@ -21,7 +21,7 @@ def test_routing_graph_changes(monkeypatch, kind, early, family, capacity):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs as stage_nv,
     )
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     torch.manual_seed(6197)
@@ -141,7 +141,7 @@ def test_tail_reset_ownership_for_workspace(
 ):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Requires SM107")
-    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 
     pkg.require_sm107_dsl()
     pkg.bootstrap_paths()

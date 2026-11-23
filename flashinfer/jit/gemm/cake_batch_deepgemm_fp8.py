@@ -9,10 +9,11 @@ symbol and the id of its positional argument plan in ``ARG_PLANS``.  ``MODULES``
 names one JIT module per (program, architecture).  ``SERVING_PROGRAMS`` maps a
 packed-scale serving configuration to its program (a key qualified by an
 architecture, ``"sm_103a:<configuration>"`` or ``"sm_107a:<configuration>"``,
-takes precedence on that architecture).  ``DOMAIN_SERVING_PROGRAMS`` maps an
-sm_107a serving configuration to its locality-domain twin and
-``DOMAIN_SERVING_CELLS`` lists, per SM count, the (die class, expected_m class)
-cells routed to it.  ``DISPATCH_TABLES`` holds, per
+takes precedence on that architecture); its ``"sm_107a:pair_masked_*"`` keys
+name the masked pair programs that ``PAIR_SERVING_EXPECTED_M`` routes by
+expected_m.  ``DOMAIN_SERVING_PROGRAMS`` maps an sm_107a serving configuration
+to its locality-domain twin and ``DOMAIN_SERVING_CELLS`` lists, per SM count,
+the (die class, expected_m class) cells routed to it.  ``DISPATCH_TABLES`` holds, per
 architecture and SM count, the ordered first-match route chain of the Cake
 dispatcher, driven by the route table at the end of this module (``_ROUTES`` read
 by ``select``): every predicate, launch grid, argument binding and workspace shape
@@ -180,6 +181,23 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["buffer", "counters0"],
         ["buffer", "counters1"],
         ["param_array", "sm_table"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "plan9": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "SFA"],
+        ["buffer", "SFB"],
+        ["buffer", "masked_m"],
+        ["tma_buffer", "C"],
+        ["buffer", "C_rows"],
+        ["parameter", "G"],
+        ["parameter", "M"],
+        ["parameter", "N"],
+        ["parameter", "K"],
+        ["parameter", "fd_w"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -559,6 +577,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_107a"],
     },
+    "cake_batch_deepgemm_fp8_6a369701cc56c41c807e": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_6a369701cc56c41c807e",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6a369701cc56c41c807e_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6a369701cc56c41c807e_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan9",
+        "arches": ["sm_107a"],
+    },
     "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
         "sources": [
@@ -714,6 +744,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
         "arches": ["sm_100a"],
+    },
+    "cake_batch_deepgemm_fp8_9f058e338e8897f88147": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_9f058e338e8897f88147",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_9f058e338e8897f88147_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_9f058e338e8897f88147_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan9",
+        "arches": ["sm_107a"],
     },
     "cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2",
@@ -1362,6 +1404,10 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_107a",
         "program": "cake_batch_deepgemm_fp8_6371829fa379dd67c761",
     },
+    "cake_batch_deepgemm_fp8_6a369701cc56c41c807e_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_batch_deepgemm_fp8_6a369701cc56c41c807e",
+    },
     "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4",
@@ -1445,6 +1491,10 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_9b61544d1069fbfd8991_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_9b61544d1069fbfd8991",
+    },
+    "cake_batch_deepgemm_fp8_9f058e338e8897f88147_sm_107a": {
+        "arch": "sm_107a",
+        "program": "cake_batch_deepgemm_fp8_9f058e338e8897f88147",
     },
     "cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2_sm_100a": {
         "arch": "sm_100a",
@@ -1700,6 +1750,23 @@ SERVING_PROGRAMS: dict[str, str] = {
     "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_eeb77812570514381d69",
     "n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
     "sm_107a:n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_afcc5247e82d569b4b01",
+    # The masked pair programs (sm_107a only): weights-major CTA pairs, 512 or 256
+    # weight rows a pair tile, runtime in B, M, N and K; routed by expected_m
+    # (PAIR_SERVING_EXPECTED_M).
+    "sm_107a:pair_masked_n4096_k7168_w512": "cake_batch_deepgemm_fp8_9f058e338e8897f88147",
+    "sm_107a:pair_masked_n4096_k7168_w256": "cake_batch_deepgemm_fp8_6a369701cc56c41c807e",
+    "sm_107a:pair_masked_n7168_k2048_w512": "cake_batch_deepgemm_fp8_9f058e338e8897f88147",
+    "sm_107a:pair_masked_n7168_k2048_w256": "cake_batch_deepgemm_fp8_6a369701cc56c41c807e",
+}
+
+# The expected_m bounds of the masked pair programs, per measured SM count:
+# (low, high, homed_low).  A packed-scale serving problem with expected_m from
+# low (from homed_low when its b is homed by groups) runs the masked pair program:
+# the 256-row pair tile below high and the 512-row tile from high.  Below that
+# bound, and on any SM count not listed, the serving program of SERVING_PROGRAMS
+# (or its locality-domain twin) runs.
+PAIR_SERVING_EXPECTED_M: dict[int, tuple[int, int, int]] = {
+    212: (72, 320, 160),
 }
 
 # The locality-domain twins of sm_107a serving programs: one launch over both dies
