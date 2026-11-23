@@ -1283,7 +1283,8 @@ class BlockwiseGemmKernel:
 
                     # load scaleA/scaleB
                     cute.copy(tiled_copy_sfa, tAgSFA_k, tAsSFA_pipe, pred=tApSFA)
-                    cute.copy(tiled_copy_sfb, tBgSFB_k, tBsSFB_pipe, pred=tBpSFB)
+                    if lane_idx == 0:
+                        cute.copy(tiled_copy_sfb, tBgSFB_k, tBsSFB_pipe, pred=tBpSFB)
 
                     scale_pipeline.producer_commit(scale_producer_state)
 
