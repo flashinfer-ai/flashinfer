@@ -1455,6 +1455,9 @@ class GroupedQueryAttentionDecodePagedFp4:
             if cutlass.const_expr(not do_cga_red):
                 sO_final_nbar.arrive_and_wait()
                 cute.copy(tma_atom_o, sO_tma, gO_tma)
+                # The TMA store still reads sO; drain it before this warp exits.
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0)
 
         elif warpgroup_idx == conversion_warpgroup_id:
             mma_k_bits = mma_tile_k_vp * vp_dtype.width

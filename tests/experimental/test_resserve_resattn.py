@@ -268,6 +268,25 @@ def compile_decode_ptx(reduction, tmp_path, monkeypatch):
     return ptx_path.read_text()
 
 
+@pytest.mark.parametrize("reduction", ["none", "kernel"])
+def test_tma_output_stores_are_drained(reduction, tmp_path, monkeypatch):
+    ptx = compile_decode_ptx(reduction, tmp_path, monkeypatch)
+    store = r"\bcp\.async\.bulk\.tensor\.[^\s;]*\.global\.shared"
+    stores = list(re.finditer(store, ptx))
+    assert stores
+    for issued in stores:
+        tail = ptx[issued.end() :]
+        ret = re.search(r"\bret(?:\.uni)?\s*;", tail)
+        assert ret is not None
+        # A logical output copy can emit multiple stores in one bulk group.
+        assert re.search(
+            r"\bcp\.async\.bulk\.commit_group\s*;.*?"
+            r"\bcp\.async\.bulk\.wait_group\s+0\s*;",
+            tail[: ret.start()],
+            re.DOTALL,
+        )
+
+
 def test_cga_wait_acquires_peer_writes(tmp_path, monkeypatch):
     ptx = compile_decode_ptx("cga_sharded", tmp_path, monkeypatch)
     wait = ptx.index("mbarrier.try_wait.parity.relaxed.cluster")
