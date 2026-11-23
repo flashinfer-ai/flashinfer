@@ -110,7 +110,7 @@
       "path": "aot/cake_sm110_xqa_09a5cd2e68fb4fbe4ec9_sm_110a.so",
       "sha256": {
         "csrc/cake_sm110_xqa_09a5cd2e68fb4fbe4ec9_binding.cu": "2cb2f41ad0ffc0643b91b510f706221b7cff55bd2f1d3f8adec01c745e6f53f5",
-        "csrc/cake_sm110_xqa_09a5cd2e68fb4fbe4ec9_kernel.cu": "f5641c5ea6872b6f3465dd73033c55fc706e344b01cd1cab6638a21c1a324395"
+        "csrc/cake_sm110_xqa_09a5cd2e68fb4fbe4ec9_kernel.cu": "86f177e63bb2e0d850bfa6dfa7368054e9641a589f407763c1e303cc39be2054"
       },
       "sources": [
         "csrc/cake_sm110_xqa_09a5cd2e68fb4fbe4ec9_kernel.cu",
@@ -152,7 +152,7 @@
       "path": "aot/cake_sm110_xqa_1995576e11a89a71eacc_sm_110a.so",
       "sha256": {
         "csrc/cake_sm110_xqa_1995576e11a89a71eacc_binding.cu": "1db8751ab8467bc5d14056cf3f87a51ab798836bfc6638e6dd731bd7857ee54f",
-        "csrc/cake_sm110_xqa_1995576e11a89a71eacc_kernel.cu": "bb9b1d7be5d9480596b0be0e5ee1b2183eec2afb417124a73f09ee27ee5c8e46"
+        "csrc/cake_sm110_xqa_1995576e11a89a71eacc_kernel.cu": "c313cf4a53c2ce5881192a4c6d848a6572508113b61c2f9e036c049dba628a01"
       },
       "sources": [
         "csrc/cake_sm110_xqa_1995576e11a89a71eacc_kernel.cu",
@@ -656,7 +656,7 @@
       "path": "aot/cake_sm110_xqa_a4f5ce3e09448c9c190a_sm_110a.so",
       "sha256": {
         "csrc/cake_sm110_xqa_a4f5ce3e09448c9c190a_binding.cu": "6572810b9b7d81c215b0a189308866f35ce5698c51a460ada0da6831b0a4b119",
-        "csrc/cake_sm110_xqa_a4f5ce3e09448c9c190a_kernel.cu": "f692388fed1be6b14ed9044b08779c0d17df7f22c35ab4739c23f5854510f0e5"
+        "csrc/cake_sm110_xqa_a4f5ce3e09448c9c190a_kernel.cu": "c5d43c63783259fd4dc73a3f5f3e24a0d183896115d901388a7da7b0a9315373"
       },
       "sources": [
         "csrc/cake_sm110_xqa_a4f5ce3e09448c9c190a_kernel.cu",
@@ -782,7 +782,7 @@
       "path": "aot/cake_sm110_xqa_cd771bf9c866203bae1a_sm_110a.so",
       "sha256": {
         "csrc/cake_sm110_xqa_cd771bf9c866203bae1a_binding.cu": "534113f1c585f700efd19a8a0311d3de68cc728fadd05e21a0cb75a0ceada983",
-        "csrc/cake_sm110_xqa_cd771bf9c866203bae1a_kernel.cu": "fcc55ddbe9e746568691f26b3b330cb8898711540e221839a06260919d5d3d5c"
+        "csrc/cake_sm110_xqa_cd771bf9c866203bae1a_kernel.cu": "aaacc0031c893cd19f35b4d2b07860c46e43d7cc10d2047b9fcdb78eee6e3226"
       },
       "sources": [
         "csrc/cake_sm110_xqa_cd771bf9c866203bae1a_kernel.cu",

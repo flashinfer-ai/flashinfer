@@ -51,7 +51,9 @@ from ..autotuner import (
     DynamicTensorSpec,
     TunableRunner,
     TuningConfig,
+    cake_group_tuning,
 )
+from ..jit.core import logger
 from ..quantization.nvfp4_quantization_utils import (
     _UNSET,
     NVFP4_4OVER6_CODE_FROM_ENV,
@@ -99,6 +101,7 @@ from .api import (
     SwiGLUStep,
     # Unified config and pack types
     ActivationType,
+    CakeWarpDecodeConfig,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -911,6 +914,10 @@ class MoERunner(TunableRunner):
 # ---------------------------------------------------------------------------
 
 
+# Module-load failures of the default Cake warp-decode entry, by SM architecture.
+_DEFAULT_CAKE_LOAD_ERRORS: dict[int, Exception] = {}
+
+
 class CakeWarpDecodeRunner(MoERunner):
     """Exact-SM100/SM103 Cake runner for calibrated NVFP4 decode geometries.
 
@@ -974,7 +981,6 @@ class CakeWarpDecodeRunner(MoERunner):
         SiTU(gate_scale=4.0, linear_scale=25.0): ("gemm1_alpha", "gemm1_beta"),
     }
     _MAX_STREAM_WORKSPACES: ClassVar[int] = 64
-    _MAX_TOPK_VALIDATION_RECEIPTS: ClassVar[int] = 64
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -989,6 +995,8 @@ class CakeWarpDecodeRunner(MoERunner):
         major, minor = get_compute_capability(self.device)
         self._device_arch = major * 10 + minor
         self._module: Any = None
+        # The default entry's first-use load failure; the entry then stays out.
+        self._load_error: Exception | None = None
         self._workspace_cache: OrderedDict[
             tuple[int, tuple[int, int, int, int, int]],
             tuple[Any, torch.Tensor],
@@ -1004,9 +1012,6 @@ class CakeWarpDecodeRunner(MoERunner):
             tuple[int, int, tuple[int, int, int, int, int]],
             tuple[torch.Tensor, int],
         ] = {}
-        self._topk_validation_receipts: OrderedDict[
-            int, tuple[torch.Tensor, int, int | None, int]
-        ] = OrderedDict()
         # There is exactly one adaptive schedule. Exact runtime shapes are
         # profiled as-is, so the autotuner never synthesizes invalid expert ids.
         self.tuning_config = TuningConfig(use_cuda_graph=True)
@@ -1014,8 +1019,26 @@ class CakeWarpDecodeRunner(MoERunner):
     def _uses_clamped_swiglu(self) -> bool:
         return self.config.activation == SwiGLU(limit=10.0)
 
+    def _is_default_candidate(self) -> bool:
+        """Whether this runner serves the default backend list's Cake entry."""
+        return any(
+            isinstance(candidate, CakeWarpDecodeConfig) and candidate.default_candidate
+            for candidate in self.config.backend
+        )
+
     def _check_support(self) -> None:
         super()._check_support()
+        default_candidate = self._is_default_candidate()
+        if default_candidate:
+            from ..api_logging import cake_auto_candidates_enabled
+
+            # Read when MoELayer builds its runners: layers built while the
+            # switch is set have no automatic Cake candidate.
+            if not cake_auto_candidates_enabled():
+                raise NotImplementedError(
+                    "Automatic Cake candidates are disabled by "
+                    "FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1."
+                )
         if self._device_arch not in (100, 103):
             raise NotImplementedError(
                 "CakeWarpDecodeRunner requires exact SM100 or SM103, "
@@ -1025,7 +1048,14 @@ class CakeWarpDecodeRunner(MoERunner):
             raise NotImplementedError("Clamped E256 warp decode requires exact SM100.")
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("CakeWarpDecodeRunner requires do_finalize=True.")
-        if self.config.execution.enable_pdl is not True:
+        enable_pdl = self.config.execution.enable_pdl
+        if enable_pdl is None and default_candidate:
+            # The default entry keeps ExecutionConfig's automatic PDL meaning.
+            # An explicit Cake config still requires enable_pdl=True.
+            from ..utils import device_support_pdl
+
+            enable_pdl = device_support_pdl(self.device)
+        if enable_pdl is not True:
             raise NotImplementedError(
                 "CakeWarpDecodeRunner requires ExecutionConfig(enable_pdl=True)."
             )
@@ -1073,6 +1103,19 @@ class CakeWarpDecodeRunner(MoERunner):
             )
 
     def _build(self) -> None:
+        if self._is_default_candidate():
+            # Load on first use instead (see _require_built). A default-list
+            # layer whose weight pack has no "cake" view then never compiles or
+            # loads the Cake module.
+            return
+        self._module = self._load_module()
+
+    def _require_built(self) -> None:
+        super()._require_built()
+        if self._module is None:
+            self._module = self._load_module()
+
+    def _load_module(self) -> Any:
         from ..jit.cake_fused_moe_warp_decode import (
             get_cake_fused_moe_warp_decode_module,
         )
@@ -1087,11 +1130,132 @@ class CakeWarpDecodeRunner(MoERunner):
                 "CakeWarpDecodeRunner build requires exact SM100 or SM103, "
                 f"got SM{self._device_arch}."
             )
-        self._module = get_cake_fused_moe_warp_decode_module(target, device=self.device)
+        return get_cake_fused_moe_warp_decode_module(target, device=self.device)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
         return [-1]
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        if not self._is_default_candidate():
+            # An explicit Cake config keeps reporting unsupported inputs from
+            # pack_inputs.
+            return super()._accepts_shape(act)
+        # Repeat the cheap pack_inputs checks, so MoELayer skips the default
+        # entry for inputs it cannot serve instead of failing the whole call.
+        hidden_states = act.hidden_states_q
+        hidden_states_scale = act.hidden_states_scale
+        if (
+            hidden_states.ndim != 2
+            or hidden_states.dtype != torch.uint8
+            or not hidden_states.is_contiguous()
+            or not 1 <= hidden_states.shape[0] <= 32
+        ):
+            return False
+        num_tokens = int(hidden_states.shape[0])
+        hidden_size = int(hidden_states.shape[1]) * 2
+        routing = self.config.routing
+        intermediate_size = self.config.experts.intermediate_size
+        configuration = (
+            self.config.activation,
+            hidden_size,
+            intermediate_size,
+            routing.num_experts,
+            routing.top_k,
+        )
+        if configuration not in self._SUPPORTED_CONFIGURATIONS:
+            return False
+        if (
+            hidden_states_scale is None
+            or hidden_states_scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
+            or tuple(hidden_states_scale.shape) != (num_tokens, hidden_size // 16)
+            or not hidden_states_scale.is_contiguous()
+            or act.topk_ids is None
+            or act.topk_weights is None
+            or act.topk_weights.dtype != torch.bfloat16
+            or not act.topk_ids.is_contiguous()
+            or not act.topk_weights.is_contiguous()
+        ):
+            return False
+        # Group tuning requires every rank to tune the same runners, and this
+        # entry's eligibility depends on the rank-local token count.
+        if cake_group_tuning():
+            return False
+        geometry = (
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            routing.num_experts,
+            routing.top_k,
+        )
+        # Stream workspaces are never evicted. Leave the default entry out
+        # before that limit is reached instead of failing the call. One winner
+        # selection can add two stream workspaces: the caller stream and the
+        # timing warmup stream. A stream that already holds a workspace for
+        # this geometry adds at most the warmup stream's, so it stays eligible
+        # while one more workspace fits.
+        cached = len(self._workspace_cache)
+        if cached > self._MAX_STREAM_WORKSPACES - 2 and (
+            cached >= self._MAX_STREAM_WORKSPACES
+            or (self._stream_token(self._current_stream()), geometry)
+            not in self._workspace_cache
+        ):
+            return False
+        if self._is_current_stream_capturing() and not self._capture_ready(geometry):
+            return False
+        # The default entry loads its module on first use. A failed load leaves
+        # the entry out, so another eligible runner serves the call.
+        return self._module is not None or self._load_default_module()
+
+    def _load_default_module(self) -> bool:
+        """Load the default entry's module once; return whether it is loaded."""
+        if getattr(self, "_load_error", None) is not None:
+            return False
+        # One failed load per architecture leaves every layer's default entry
+        # out, so a model does not rebuild the failing module once per layer.
+        failed = _DEFAULT_CAKE_LOAD_ERRORS.get(self._device_arch)
+        if failed is not None:
+            self._load_error = failed
+            return False
+        try:
+            self._module = self._load_module()
+        except Exception as error:  # noqa: BLE001 - any load failure leaves the entry out
+            self._load_error = error
+            _DEFAULT_CAKE_LOAD_ERRORS[self._device_arch] = error
+            logger.warning(
+                "The default Cake warp-decode MoE entry is left out: its module "
+                "failed to load (%s: %s).",
+                type(error).__name__,
+                error,
+            )
+            return False
+        return True
+
+    def _capture_ready(self, geometry: tuple[int, int, int, int, int]) -> bool:
+        """Whether pack_inputs can serve this geometry during CUDA Graph capture.
+
+        Capture cannot allocate or prepare a workspace, so a prepared workspace
+        for this exact geometry must exist from an eager call.
+        """
+        cached = self._workspace_cache.get(
+            (self._stream_token(self._current_stream()), geometry)
+        )
+        candidates = (
+            [cached]
+            if cached is not None
+            else [
+                entry
+                for cached_key, entry in self._workspace_cache.items()
+                if cached_key[1] == geometry
+            ]
+        )
+        for _, workspace in candidates:
+            prepared = self._prepared_workspaces.get(
+                self._workspace_identity(workspace, geometry)
+            )
+            if prepared is not None and prepared[0] is workspace:
+                return True
+        return False
 
     @staticmethod
     def _workspace_identity(
@@ -1166,67 +1330,6 @@ class CakeWarpDecodeRunner(MoERunner):
     @staticmethod
     def _stream_token(stream: Any) -> int:
         return 0 if stream is None else int(stream.cuda_stream)
-
-    @staticmethod
-    def _topk_version(topk_ids: torch.Tensor) -> int | None:
-        try:
-            return int(topk_ids._version)
-        except RuntimeError:
-            # Inference tensors do not expose a version counter. Their receipt
-            # is therefore identity-only; callers retain the same obligation
-            # to keep graph-time mutations in range as on graph replay.
-            return None
-
-    def _validate_expert_id_range(
-        self, topk_ids: torch.Tensor, num_experts: int
-    ) -> None:
-        # The adaptive direct schedules use each ID as an expert-array/TMA
-        # coordinate. Validate while inputs are packed, never in the timed or
-        # captured launch path. CUDA Graph callers must keep later mutations in
-        # the same documented range.
-        if not torch.is_tensor(topk_ids):
-            return
-        cache_key = id(topk_ids)
-        data_ptr = topk_ids.data_ptr()
-        version = self._topk_version(topk_ids)
-        receipt = self._topk_validation_receipts.get(cache_key)
-        if (
-            receipt is not None
-            and receipt[0] is topk_ids
-            and receipt[1] == data_ptr
-            and receipt[2] == version
-            and receipt[3] == num_experts
-        ):
-            self._topk_validation_receipts.move_to_end(cache_key)
-            return
-        if self._is_current_stream_capturing():
-            raise RuntimeError(
-                "Cake warp decode topk_ids must be range-validated before CUDA "
-                "Graph capture; warm up this exact tensor version first."
-            )
-        in_range = torch.logical_and(topk_ids >= 0, topk_ids < num_experts).all()
-        if not bool(in_range.item()):
-            raise ValueError(
-                "CakeWarpDecodeRunner requires every topk_ids value to satisfy "
-                f"0 <= id < {num_experts}."
-            )
-        if (
-            cache_key not in self._topk_validation_receipts
-            and len(self._topk_validation_receipts)
-            >= self._MAX_TOPK_VALIDATION_RECEIPTS
-        ):
-            raise RuntimeError(
-                "Cake warp decode supports at most 64 live routing-validation "
-                "receipts; construct a new runner before validating another "
-                "topk_ids tensor."
-            )
-        self._topk_validation_receipts[cache_key] = (
-            topk_ids,
-            data_ptr,
-            version,
-            num_experts,
-        )
-        self._topk_validation_receipts.move_to_end(cache_key)
 
     def _cache_workspace_for_stream(
         self,
@@ -1462,7 +1565,9 @@ class CakeWarpDecodeRunner(MoERunner):
             allowed_weights_dtypes=(torch.bfloat16,),
             require_contiguous=True,
         )
-        self._validate_expert_id_range(act.topk_ids, routing.num_experts)
+        # Expert ids outside [0, num_experts) are dropped inside the kernels;
+        # the host never reads topk_ids, so capture and replay need no receipt.
+        topk_ids, topk_weights = act.topk_ids, act.topk_weights
         device = act.hidden_states_q.device
         if device != self.device:
             raise ValueError(
@@ -1593,8 +1698,8 @@ class CakeWarpDecodeRunner(MoERunner):
             workspace,
             act.hidden_states_q,
             act.hidden_states_scale,
-            act.topk_ids,
-            act.topk_weights,
+            topk_ids,
+            topk_weights,
             view["gemm1_weights"],
             view["gemm1_weights_scale"],
             view["gemm2_weights"],
@@ -5421,6 +5526,9 @@ class _TrtllmRunnerBase(MoERunner):
     _num_weight_rows: int
     _intermediate_size: int
     device: torch.device
+    # Whether packed FP4 weights may also come BlockMajorK,
+    # ``[experts, K_bytes / block, Mn, block]`` with 64- or 128-byte blocks.
+    accepts_block_major_k_fp4_weights: ClassVar[bool] = False
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -5544,12 +5652,22 @@ class _TrtllmRunnerBase(MoERunner):
                 self._intermediate_size // 2,
             ),
         }
-        for name, expected in expected_weights.items():
+        for name, (num_experts, mn, k_bytes) in expected_weights.items():
             tensor = view[name]
-            if tensor.dtype != torch.uint8 or tuple(tensor.shape) != expected:
+            shape = tuple(tensor.shape)
+            expected: tuple[int, ...] = (num_experts, mn, k_bytes)
+            if self.accepts_block_major_k_fp4_weights and tensor.dim() == 4:
+                block = shape[-1]
+                if block not in (64, 128) or k_bytes % block != 0:
+                    raise ValueError(
+                        f"{name} BlockMajorK blocks must be 64 or 128 bytes "
+                        f"dividing {k_bytes}, got {tensor.dtype} {shape}."
+                    )
+                expected = (num_experts, k_bytes // block, mn, block)
+            if tensor.dtype != torch.uint8 or shape != expected:
                 raise ValueError(
                     f"{name} must be packed uint8 with shape {expected}, got "
-                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                    f"{tensor.dtype} {shape}."
                 )
 
         for name, expected in (
@@ -7426,11 +7544,14 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     ``_TrtllmRunnerBase._build``. The middle GEMM is the Prims-TS CuTe-DSL
     batched path. Weight and activation layouts match the corresponding
     TRT-LLM prepare helpers, except DeepSeekFp8 weight payloads, which are
-    shuffled with epilogue tile 64.
+    shuffled with epilogue tile 64, and the BlockMajorK MXFP4×MXFP8 weights
+    of ``PrimsTsConfig.prepare_weights``. FP4 weights are accepted in either
+    layout.
     """
 
     backend_key = "prims_ts"
     supports_per_token_scale = True
+    accepts_block_major_k_fp4_weights = True
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
@@ -7585,10 +7706,15 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
         self._inner: Any = None
 
-    def _weight_layout(self) -> int:
+    def _weight_layout(self, view: Optional[dict] = None) -> int:
         from flashinfer.tllm_enums import WeightLayout
 
         if self._pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return int(WeightLayout.BlockMajorK)
+        # FP4 weights are MajorK [experts, Mn, K_bytes] or BlockMajorK
+        # [experts, K_bytes / block, Mn, block]; the rank tells them apart.
+        is_fp4 = self._pair[0] in (QuantFormat.NVFP4, QuantFormat.MXFP4)
+        if is_fp4 and view is not None and view["gemm1_weights"].dim() == 4:
             return int(WeightLayout.BlockMajorK)
         return int(WeightLayout.MajorK)
 
@@ -7665,7 +7791,33 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         # launch state of the call being tuned or launched, never from a
         # previous pack.
         if isinstance(launch_state, _TrtllmLaunchState) and self._inner is not None:
+            from flashinfer.tllm_enums import WeightLayout
+
             self._inner.set_cache_key_static_extras(**launch_state.static_kwargs)
+            # The weight layout follows the view, so the tactics are enumerated
+            # and launched for the weights of this call.
+            self._inner.weight_layout = WeightLayout(
+                launch_state.static_kwargs["weight_layout"]
+            )
+
+    def precompile_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        tactics: List[Any],
+        profile: Any,
+        **kwargs: Any,
+    ) -> bool:
+        """Compile the GEMMs of every tactic before the autotuner profiles them."""
+        self._require_built()
+        launch_state = kwargs.pop("launch_state", None)
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        if not isinstance(launch_state, _TrtllmLaunchState) or self._inner is None:
+            return False
+        self._sync_inner_static_extras(launch_state)
+        return self._inner.precompile_tactics(
+            inputs, tactics, profile, **launch_state.static_kwargs
+        )
 
     def forward(
         self,
@@ -7860,13 +8012,30 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
         routing_logits, routing_bias, topk_ids, expert_weights = self._pack_routing(act)
 
-        output = act.hidden_states_q.new_empty(
-            (
-                num_tokens,
-                hidden_size if self.config.finalize.do_finalize else 0,
-            ),
-            dtype=torch.bfloat16,
-        )
+        output = act.output if self.config.finalize.do_finalize else None
+        if output is None:
+            output = act.hidden_states_q.new_empty(
+                (
+                    num_tokens,
+                    hidden_size if self.config.finalize.do_finalize else 0,
+                ),
+                dtype=torch.bfloat16,
+            )
+        elif (
+            output.dtype != torch.bfloat16
+            or tuple(output.shape) != (num_tokens, hidden_size)
+            or not output.is_contiguous()
+            or output.device != act.hidden_states_q.device
+            # The finalize kernels store 16-byte vectors.
+            or output.data_ptr() % 16 != 0
+        ):
+            raise ValueError(
+                f"{type(self).__name__} output must be a contiguous, 16-byte "
+                f"aligned bfloat16 [{num_tokens}, {hidden_size}] tensor on "
+                f"{act.hidden_states_q.device}, got {output.dtype} "
+                f"{tuple(output.shape)} on {output.device} at "
+                f"{output.data_ptr():#x}."
+            )
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
@@ -7895,8 +8064,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             routed_scaling_factor=routing.routed_scaling_factor,
             routing_method_type=int(routing.method),
             use_shuffled_weight=True,
-            weight_layout=self._weight_layout(),
+            weight_layout=self._weight_layout(v),
             do_finalize=self.config.finalize.do_finalize,
+            zero_rows_without_local_expert=act.zero_rows_without_local_expert,
             enable_pdl=self._enable_pdl,
             activation_type=self._activation_type,
             norm_topk_prob=True,
@@ -8447,6 +8617,7 @@ class SM12xFp8Runner(MoERunner):
             topk_weights,
             self.config.routing.num_experts,
             workspace=workspace,
+            token_only=True,
         )
         self._fc1(
             a_q,
@@ -8457,6 +8628,7 @@ class SM12xFp8Runner(MoERunner):
             enable_pdl=enable_pdl,
             out_q=q1,
             out_sf=sf1,
+            token_map=token_map,
             **act_kwargs,
         )
         self._fc2(
@@ -8693,6 +8865,7 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             self.config.routing.num_experts,
             workspace=workspace,
             enable_pdl=enable_pdl,
+            token_only=True,
         )
         self._fc1(
             a_q,
@@ -8704,6 +8877,7 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             enable_pdl=enable_pdl,
             out_q=q1,
             out_sf=sf1,
+            token_map=token_map,
             **act_kwargs,
         )
         self._fc2(

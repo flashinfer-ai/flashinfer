@@ -2,7 +2,7 @@
 #
 # Reference Dockerfile for building FlashInfer with the moe_ep transport
 # backends enabled (the default): NIXL-EP is compiled from the in-tree git
-# submodule; NCCL-EP is the released `nccl-extensions>=0.1.0` wheel (a base
+# submodule; NCCL-EP is the released `nccl-extensions>=0.2.0` wheel (a base
 # dependency), which ships the `nccl.ep` API + bundled libnccl_ep.so (no
 # in-tree NCCL build). nccl.ep used to live in nccl4py; it moved out in
 # nccl4py 0.4.1 — nccl4py is still pulled in for `nccl.core.Communicator`.
@@ -120,7 +120,7 @@ ENV VIRTUAL_ENV=${VENV}
 # skips the EP build if it fails. With PATH=${VENV}/bin first, meson's
 # find_installation('python3') resolves to the venv python which has torch.
 RUN uv pip install --python ${VENV}/bin/python \
-        torch \
+        torch pip \
         setuptools packaging \
         'apache-tvm-ffi>=0.1.11,<0.2' \
         cython pybind11
@@ -173,13 +173,15 @@ WORKDIR ${FLASHINFER_SRC}
 # the submodule .git pointers reference the host superproject's .git/modules/
 # tree which isn't copied, and `git apply` in _apply_patches works on a plain
 # directory without a git repo.
-# The base deps pull the released `nccl-extensions>=0.1.0` wheel (NCCL-EP: the
+# The base deps pull the released `nccl-extensions>=0.2.0` wheel (NCCL-EP: the
 # `nccl.ep` API + bundled libnccl_ep.so) — no in-tree NCCL build. The build
 # hook builds NIXL-EP from the submodule by default.
+# Use pip for the outer install: the build hook can invoke uv against this
+# venv, which would wait for an outer uv install's environment lock.
 RUN BUILD_NVEP=${BUILD_NVEP} \
     BUILD_NCCL_EP=${BUILD_NCCL_EP} \
     BUILD_NIXL_EP=${BUILD_NIXL_EP} \
-    uv pip install --python ${VENV}/bin/python \
+    ${VENV}/bin/python -m pip install \
         --no-build-isolation -e ".[cu13]"
 
 # Smoke probe. Assertions fail the build if the EP backends weren't

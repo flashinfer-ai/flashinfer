@@ -14,7 +14,7 @@
 
 """Host geometry of the parametric Cake SM120 MegaMoE device source.
 
-The device source ``cake_sm120_megamoe_kernel.cuh`` (``kernel_src/sm120/cake_mxfp4_megamoe/src/``)
+The device source ``cake_sm120_megamoe_kernel.cuh`` (``kernels/cake/mxfp4_megamoe_sm120/``)
 is one CUDA source with compile-time parameters (EP world size, global expert count, top-k,
 max rows per rank, hidden size, intermediate size, shared expert on/off, SwiGLU clamp,
 return-codec overflow capacity, LSA copier count).  Every
@@ -86,7 +86,7 @@ class KernelParams:
         return self.experts // self.ranks
 
     def device_parameters(self) -> tuple[int, ...]:
-        """Values in the order of ``flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.DEVICE_PARAMETERS``."""
+        """Values in the order of ``flashinfer.moe_ep.shims.sm120.cake_mxfp4.DEVICE_PARAMETERS``."""
 
         return (
             self.ranks,
@@ -244,7 +244,7 @@ def _from_json(data: dict[str, Any]) -> _Geometry:
 
 @functools.cache
 def _geometry() -> _Geometry:
-    from ......kernel_src.sm120.cake_mxfp4_megamoe import read_geometry
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import read_geometry
 
     return _from_json(read_geometry())
 

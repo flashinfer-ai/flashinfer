@@ -13,10 +13,6 @@ KIMI_COMMIT = "6e8cfe94e9d6c92b184fb46700c72e9f66ccb884"
 KIMI_MANIFEST_SHA256 = (
     "6f4126d7c03f47f24b18c272348a3215e15df9dc257bfaa0bf564283ef69224c"
 )
-TRT_VERSION = "1.4.0rc3.dev202610300406"
-CONTAINER_DIGEST = (
-    "sha256:b0c501c715bf11dc098d886194560475936fb2e900994188fc734ba5aceff5b9"
-)
 KERNEL_ROOT = Path("tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe")
 HOST_SOURCE = Path("tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py")
 ENTRIES = (
@@ -236,7 +232,6 @@ def export(base, overlay, destination, check=False):
         "Kimi install manifest does not match the pinned revision",
     )
     manifest = json.loads(manifest_bytes)
-    require(manifest["trtllm_version"] == TRT_VERSION, "base version changed")
     source_map = {
         p.relative_to(base / KERNEL_ROOT).as_posix(): p.read_bytes()
         for p in (base / KERNEL_ROOT).rglob("*.py")
@@ -263,14 +258,12 @@ def export(base, overlay, destination, check=False):
     record = {
         "kimi_commit": KIMI_COMMIT,
         "kimi_manifest_sha256": KIMI_MANIFEST_SHA256,
-        "base_version": TRT_VERSION,
-        "base_container_digest": CONTAINER_DIGEST,
         "exporter_sha256": digest(Path(__file__).read_bytes()),
         "input_sha256": {name: digest(source_map[name]) for name in chosen},
         "host_overlay_sha256": digest((overlay / "overlay" / HOST_SOURCE).read_bytes()),
         "files": {name: digest(data) for name, data in sorted(outputs.items())},
     }
-    root = destination / "src"
+    root = destination
     if check:
         require(
             set(p.relative_to(root).as_posix() for p in root.rglob("*.py"))
@@ -312,7 +305,7 @@ def main():
         "--output",
         type=Path,
         default=Path(__file__).resolve().parents[1]
-        / "flashinfer/moe_ep/kernel_src/sm100/kimi-k3-megamoe",
+        / "flashinfer/moe_ep/kernels/kimi_k3",
     )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()

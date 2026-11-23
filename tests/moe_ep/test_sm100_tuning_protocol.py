@@ -15,11 +15,11 @@ from flashinfer.moe_ep import BootstrapConfig, FleetParams
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
 from flashinfer.moe_ep.core.tuning_state import AutoTuningState
-from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
     Sm100BlockScaledMoeConfig,
     Sm100GenphaseMoeConfig,
 )
-from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
     autotune as native,
     correctness,
     knob_cache,
@@ -249,7 +249,7 @@ def test_unsupported_bucket_controls_fail_before_launch(state, options):
 
 
 def test_measurement_defaults_and_explicit_policy(state):
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.measurement import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.measurement import (
         measurement_settings,
     )
 
@@ -389,7 +389,7 @@ def test_standard_getter_knobs_install_into_fixed_workspace_config(kind, finaliz
     cfg = cls(
         256,
         2,
-        kernel_name=f"sm100_{'nvfp4_nvfp4' if kind == 'nvfp4' else 'mxfp8_mxfp8'}_bf16_cutedsl_next",
+        kernel_name=f"sm100_{'nvfp4_nvfp4' if kind == 'nvfp4' else 'mxfp8_mxfp8'}_bf16_cutedsl",
         knobs="auto",
         finalize_mode=moe_ep.FinalizeMode[finalize_mode],
         **options,
@@ -406,7 +406,7 @@ def test_standard_getter_knobs_install_into_fixed_workspace_config(kind, finaliz
 
 def test_genphase_auto_ignores_fixed_profile_count(monkeypatch):
     from flashinfer import moe_ep
-    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
 
     cfg = moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         256, 3, kernel_variant="genphase", knobs="auto"
@@ -596,7 +596,7 @@ def test_cli_measurement_reuses_online_warmup_defaults(state):
 
 
 def test_native_cold_policy_has_one_call_per_flush(state):
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.measurement import (
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.measurement import (
         measurement_settings,
     )
 

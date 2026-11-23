@@ -1,0 +1,152 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+"""Bounded-memory, collective Torch oracle for offline qualification."""
+
+from __future__ import annotations
+
+import torch
+import torch.distributed as dist
+
+from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.kernel_helpers import (
+    compute_megamoe_reference_sm107_block_scaled,
+)
+
+
+def _launch_scalar(symm_buffer, name):
+    """The NVFP4 epilogue scalar tensor the next launch uses: the per-call tensor bound
+    with ``bind_scalars`` (the workspace tensor is then never written) or the
+    workspace's own tensor."""
+    get = getattr(symm_buffer, "_scalar_tensor", None)
+    if get is not None and getattr(symm_buffer, name, None) is not None:
+        return get(name)
+    return getattr(symm_buffer, name, None)
+
+
+def sampled_reference(
+    symm_buffer, l1, l2, num_tokens: int, *, process_group=None, sample_size=64
+):
+    """Reference evenly spaced rows including both ends, using actual staged bytes.
+
+    Each rank evaluates its local experts for one source rank at a time.
+    Communication and FP32 expert scratch are bounded by ``sample_size`` and
+    one expert, independent of the session's token capacity and expert count.
+    """
+    cfg = symm_buffer.config
+    count = min(sample_size, num_tokens)
+    indices = torch.linspace(0, max(num_tokens - 1, 0), count, device="cuda").long()
+    local = [
+        torch.zeros(
+            (sample_size, *t.shape[1:]), dtype=torch.uint8, device=t.device
+        ).view(t.dtype)
+        if t.element_size() == 1
+        else torch.zeros((sample_size, *t.shape[1:]), dtype=t.dtype, device=t.device)
+        for t in (
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+        )
+    ]
+    local[2].fill_(-1)
+    for source, target in zip(
+        (
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+        ),
+        local,
+        strict=False,
+    ):
+        if source.element_size() == 1:
+            target[:count].view(torch.uint8).copy_(source.view(torch.uint8)[indices])
+        else:
+            target[:count].copy_(source[indices])
+    expected = None
+    for source_rank in range(cfg.world_size):
+        payload = [t.clone() for t in local]
+        if cfg.world_size > 1:
+            global_source = (
+                dist.get_global_rank(process_group, source_rank)
+                if process_group is not None
+                else source_rank
+            )
+            for tensor in payload:
+                dist.broadcast(
+                    tensor.view(torch.uint8), src=global_source, group=process_group
+                )
+        partial = compute_megamoe_reference_sm107_block_scaled(
+            payload[0],
+            payload[1],
+            payload[2],
+            payload[3],
+            l1[0].permute(0, 2, 1),
+            l1[1],
+            l2[0].permute(0, 2, 1),
+            l2[1],
+            quant_kind=cfg.quant_kind,
+            combine_dtype=cfg.combine_dtype,
+            local_expert_offset=cfg.rank * cfg.experts_per_rank,
+            gate_up_clamp=(
+                abs(cfg.gate_up_clamp)
+                if cfg.batch_invariant and cfg.gate_up_clamp is not None
+                else cfg.gate_up_clamp
+            ),
+            apply_routing_weights_before_fc2=(cfg.apply_routing_weights_before_fc2),
+            weight_scales_are_swizzled=True,
+            return_fp32=True,
+            situ_beta=cfg.situ_beta,
+            situ_linear_beta=cfg.situ_linear_beta,
+            swiglu_alpha=getattr(cfg, "swiglu_alpha", None),
+            swiglu_beta=getattr(cfg, "swiglu_beta", None),
+            fc1_alpha=_launch_scalar(symm_buffer, "fc1_alpha"),
+            fc2_alpha=_launch_scalar(symm_buffer, "fc2_alpha"),
+            fc1_norm_const=_launch_scalar(symm_buffer, "fc1_norm_const"),
+        )
+        if cfg.world_size > 1:
+            dist.reduce(
+                partial, dst=global_source, op=dist.ReduceOp.SUM, group=process_group
+            )
+        if source_rank == cfg.rank:
+            expected = partial[:count]
+    if getattr(cfg, "shared_expert", None) is not None:
+        expected += _shared_reference(symm_buffer, indices).float()
+    return indices, expected.to(torch.bfloat16)
+
+
+def _shared_reference(symm_buffer, indices):
+    """Evaluate the replicated FFN locally on the routed oracle's sampled rows."""
+    cfg = symm_buffer.config
+    l1, l2 = symm_buffer._shared_weights
+    x = symm_buffer.shared_x
+    sf = symm_buffer.shared_x_sf_linear
+    shared_ids = torch.zeros((indices.numel(), 1), dtype=torch.int32, device=x.device)
+    return compute_megamoe_reference_sm107_block_scaled(
+        x.view(torch.uint8)[indices].view(x.dtype),
+        sf.view(torch.uint8)[indices].view(sf.dtype),
+        shared_ids,
+        torch.ones_like(shared_ids, dtype=torch.float32),
+        l1[0].permute(0, 2, 1),
+        l1[1],
+        l2[0].permute(0, 2, 1),
+        l2[1],
+        quant_kind=cfg.shared_expert.kind,
+        combine_dtype="bf16",
+        local_expert_offset=0,
+        gate_up_clamp=cfg.gate_up_clamp,
+        apply_routing_weights_before_fc2=False,
+        weight_scales_are_swizzled=True,
+        return_fp32=True,
+        situ_beta=cfg.situ_beta,
+        situ_linear_beta=cfg.situ_linear_beta,
+    ).to(torch.bfloat16)
+
+
+def output_error(output, indices, expected) -> float:
+    """Relative L2 on sampled rows; any nonfinite output is a failed result."""
+    if not bool(torch.isfinite(output).all()):
+        return float("inf")
+    actual = output[indices].float()
+    target = expected.float()
+    denominator = target.norm().clamp_min(1e-12)
+    return float((actual - target).norm() / denominator)
