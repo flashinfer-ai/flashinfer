@@ -3052,14 +3052,18 @@ def run(
         cu_seqlens,
     )
 
-    scalars = (float(scale), float(lower_bound), bool(safe_gate))
+    # The offsets' content is part of the key, not only the caller's tensor:
+    # the plan reads a canonical copy of that content, and once the offsets
+    # identity cache evicts the caller's tensor nothing keeps it alive, so its
+    # address can come back holding other boundaries.
+    scalars = (float(scale), float(lower_bound), bool(safe_gate), offsets.host)
     plan = _MEMO.fast_path(q.device, tensors, scalars, resources)
     if plan is None:
         key = _MEMO.identity(q.device, tensors, scalars, resources)
         # See ``PlanMemo.build_lock``: the miss path is not re-entrant, and
         # the two memo levels in front of it mean a warm caller never reaches it.
         with _MEMO.build_lock:
-            plan = _MEMO.get(key)
+            plan = _MEMO.get(key, resources)
             if plan is None:
                 plan = _build_plan(
                     q=q,
@@ -3124,11 +3128,11 @@ def _build_plan(
     else:
         if capturing() and cu_seqlens.dtype is not torch.int32:
             # Even a previously converted INT64 tensor is refused *without a
-            # workspace*: replay would reuse the canonical buffer without
-            # re-validating the source, so the two could drift apart with
-            # nothing to detect it.  With a workspace the canonical buffer is
-            # the workspace's own and replay copies into it, which is what
-            # makes INT64 packed capture supportable at all.
+            # workspace*.  Replay reads the backend's private canonical copy,
+            # never the caller's tensor (for INT32 offsets too), so offsets
+            # changed after capture are not seen; INT64 keeps the stricter
+            # rule it always had.  With a workspace the canonical buffer is
+            # the workspace's own, filled by the eager warmup.
             if resources is None or resources.cu_seqlens_i32 is None:
                 raise RuntimeError(
                     "CUDA graph capture of INT64 packed offsets needs an "
@@ -3169,7 +3173,9 @@ def _build_plan(
     if resources is not None:
         # Replay never re-enters Python, so everything the capture recorded has
         # to stay alive at its captured address for the workspace's lifetime.
-        resources.pin(
+        # This build rewrote the workspace's offsets, so it is now the only
+        # plan the workspace serves.
+        resources.adopt(
             plan,
             plan.compiled,
             plan.descriptors,

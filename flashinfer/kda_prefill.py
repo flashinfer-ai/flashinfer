@@ -27,7 +27,6 @@ import functools
 import heapq
 import math
 import threading
-import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -546,8 +545,10 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     device. Warm it by invoking that function eagerly with the exact tensors
     and capture stream, then synchronize that stream before capture. Packed
     offsets must retain their warmed values through capture and replay.
-    Inference tensors have no version counter, so their offsets are reread on
-    every eager call.
+    Inference tensors have no version counter, so the SM100-family backends
+    reread their offsets on every eager call. The SM120 backend keeps the
+    boundaries it last read instead; refilling such offsets in place needs a
+    new workspace or ``clear_kda_prefill_sm120_caches()``.
 
     The workspace owns optional final-state scratch, backend metadata, TMA
     descriptors, and schedule-specific scratch for the lifetime of the graph.
@@ -7146,7 +7147,23 @@ def _sm120_kda_prefill_warm_call(
     checked here and folded into the memo key.  A miss costs the flag checks
     and one memo probe; the full path then runs as it always has.
     """
-    if A_log is None or dt_bias is None or not q.is_cuda:
+    # Anything that is not a tensor is the cold path's to name; the probe below
+    # reads shapes and identities and would fail on it with an AttributeError.
+    # ``output`` is required as well: without one there is nothing a memo
+    # could have keyed the call on.
+    if not (
+        isinstance(q, torch.Tensor)
+        and isinstance(k, torch.Tensor)
+        and isinstance(v, torch.Tensor)
+        and isinstance(g, torch.Tensor)
+        and isinstance(beta, torch.Tensor)
+        and isinstance(A_log, torch.Tensor)
+        and isinstance(dt_bias, torch.Tensor)
+        and isinstance(output, torch.Tensor)
+        and (initial_state is None or isinstance(initial_state, torch.Tensor))
+        and (cu_seqlens is None or isinstance(cu_seqlens, torch.Tensor))
+        and q.is_cuda
+    ):
         return None
     index = q.device.index
     if index is None:
@@ -7244,43 +7261,6 @@ def _sm120_kda_prefill_is_eligible(**kwargs) -> bool:
 
     can_implement = kda_kernels.can_implement_kda_prefill_sm120
     return can_implement is not None and can_implement(**kwargs)
-
-
-#: ``[H * 128]`` -> ``[H, 128]`` views by source tensor, held weakly.  One
-#: entry per parameter tensor; a model has one ``dt_bias`` per KDA layer.
-_SM120_DT_BIAS_VIEWS: dict[int, tuple] = {}
-
-
-def _sm120_dt_bias_view(dt_bias: torch.Tensor, heads: int) -> torch.Tensor:
-    """The ``[H, 128]`` view of a rank-1 ``dt_bias``, the same object each time.
-
-    A view shares its source's storage, so its contents follow the source and
-    only the source's identity and layout can invalidate it; both are checked.
-    """
-    key = id(dt_bias)
-    cached = _SM120_DT_BIAS_VIEWS.get(key)
-    if cached is not None:
-        ref, view, data_ptr, numel = cached
-        if (
-            ref() is dt_bias
-            and view.shape[0] == heads
-            and dt_bias.data_ptr() == data_ptr
-            and dt_bias.numel() == numel
-        ):
-            return view
-        _SM120_DT_BIAS_VIEWS.pop(key, None)
-    view = dt_bias.view(heads, _FLASH_KDA_HEAD_DIM)
-
-    def _purge(_ref, _key=key):
-        _SM120_DT_BIAS_VIEWS.pop(_key, None)
-
-    _SM120_DT_BIAS_VIEWS[key] = (
-        weakref.ref(dt_bias, _purge),
-        view,
-        dt_bias.data_ptr(),
-        dt_bias.numel(),
-    )
-    return view
 
 
 def _sm120_prefill_resources(
@@ -7396,9 +7376,10 @@ def _run_sm120_kda_prefill(
     # ``[H * 128]`` adapts with a no-copy view; the backend's ABI is ``[H, 128]``.
     # The view is cached per source tensor: the backend memoizes on object
     # identity, and a view built here on every call is a new object every call,
-    # which turned every warm call into a plan rebuild.
+    # which turned every warm call into a plan rebuild.  The backend owns that
+    # cache, so clear_kda_prefill_sm120_caches() releases it with the rest.
     if dt_bias.ndim == 1:
-        dt_bias = _sm120_dt_bias_view(dt_bias, q.shape[2])
+        dt_bias = kda_kernels.sm120_dt_bias_heads_view(dt_bias, q.shape[2])
 
     if prefill_workspace is not None and prefill_workspace._captured:
         # Check the shared shell before creating its SM120 state: it may have

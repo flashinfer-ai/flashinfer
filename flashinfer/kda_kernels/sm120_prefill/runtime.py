@@ -530,6 +530,17 @@ class BoundedDeviceCache:
             self._evict(index)
         return value
 
+    def peek(self, device, key) -> Any:
+        """The value for ``key`` without a hit's side effects, or ``None``.
+
+        No LRU move, no hit count and no stream wait: for a probe that uses the
+        value only to find a plan already keyed on the current stream, whose
+        build waited on the entry's event on that stream.
+        """
+        with self._lock:
+            entry = self._bucket(self._index(device)).get(key)
+        return None if entry is None else entry.value
+
     def contains(self, device, key) -> bool:
         """Membership without touching LRU order, hit counts or streams.
 
@@ -758,6 +769,21 @@ _PINNED_STAGING_LOCK = threading.RLock()
 _CAPTURED_STAGING: list = []
 
 
+def persistent_empty(*size, **kwargs) -> torch.Tensor:
+    """``torch.empty`` for a buffer this backend keeps and writes again later.
+
+    Allocated outside inference mode.  A tensor made under
+    ``torch.inference_mode()`` refuses every in-place write once its caller
+    has left that mode ("Inplace update to inference tensor outside
+    InferenceMode"), and these buffers outlive the call that made them: a
+    process that warms the backend under inference mode and later calls it
+    outside would fail on the first reuse.  A normal tensor takes writes in
+    both modes.
+    """
+    with torch.inference_mode(False):
+        return torch.empty(*size, **kwargs)
+
+
 def upload_bytes(payload, device: torch.device) -> torch.Tensor:
     """Copy ``payload`` to ``device`` in a way a graph capture accepts."""
     size = len(payload)
@@ -770,7 +796,7 @@ def upload_bytes(payload, device: torch.device) -> torch.Tensor:
     with _PINNED_STAGING_LOCK:
         entry = _PINNED_STAGING.pop(size, None)
         if entry is None:
-            staging = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+            staging = persistent_empty(size, dtype=torch.uint8, pin_memory=True)
         else:
             staging, pending = entry
             if pending is not None:
@@ -1209,9 +1235,10 @@ def validate_inputs(
 # differ by is resolved before launch:
 #
 # * **fixed** ``[B, T, H, 128]`` becomes ``arange(0, (B + 1) * T, T)``;
-# * **packed varlen** validates the caller's ``cu_seqlens`` and, for INT64,
-#   converts it -- *after* the range check, never before.  Narrowing first and
-#   checking the narrowed value cannot detect the overflow it just caused.
+# * **packed varlen** validates the caller's ``cu_seqlens`` and copies it into
+#   a private INT32 buffer, converting INT64 -- *after* the range check, never
+#   before.  Narrowing first and checking the narrowed value cannot detect the
+#   overflow it just caused.
 #
 # Validation reads the offsets on the host, which synchronizes.  That is why
 # the result is cached on the source tensor's identity *and* version: a caller
@@ -1225,13 +1252,14 @@ def validate_inputs(
 class CanonicalOffsets:
     """A validated canonical INT32 ``cu_seqlens`` and what produced it.
 
-    ``canonical`` is the INT32 buffer the kernels read and ``source`` the
-    tensor it was derived from: the caller's own for INT32 offsets, the
-    private converted copy for INT64 ones.  A later tensor with equal content
-    resolves to the *same* record, so neither field is necessarily the tensor
-    a caller just passed.  The identity cache keeps each caller's own tensor
-    alive for as long as its entry exists, because that entry's key contains
-    the tensor's ``data_ptr`` and a recycled address would be a false hit.
+    ``canonical`` is the INT32 buffer the kernels read: for packed offsets a
+    private copy of the caller's, whatever its dtype, so no caller can rewrite
+    it.  ``source`` is the tensor it was derived from and, for packed offsets,
+    is that same copy.  A later tensor with equal content resolves to the
+    *same* record, so neither field is ever the tensor a caller just passed.
+    The identity cache keeps each caller's own tensor alive for as long as its
+    entry exists, because that entry's key contains the tensor's ``data_ptr``
+    and a recycled address would be a false hit.
     """
 
     key: tuple
@@ -1330,16 +1358,15 @@ def validate_packed_offsets(
         )
 
     # Equal content already canonicalized for an earlier tensor: reuse that
-    # record, canonical buffer included.  The plans built on it read the
-    # earlier buffer, whose values are by construction the ones just read.
+    # record, canonical buffer included.  The plans built on it read that
+    # buffer, so it is always a private copy, never the caller's tensor: a
+    # caller refilling its own offsets in place would otherwise change the
+    # boundaries under every plan keyed on the old content, including the
+    # plans of other tensors that still hold it.
     content_key = (device.type, device.index, tuple(host))
     record = _PACKED_CONTENT.get(device, content_key)
     if record is None:
-        canonical = (
-            cu_seqlens
-            if cu_seqlens.dtype is torch.int32
-            else cu_seqlens.to(torch.int32)
-        )
+        canonical = cu_seqlens.to(torch.int32, copy=True)
         record = CanonicalOffsets(
             key=content_key,
             source=canonical,
@@ -1355,6 +1382,28 @@ def validate_packed_offsets(
     # unrelated tensor would otherwise be a false hit.
     _PACKED_OFFSETS.put(device, key, record, (record.canonical, cu_seqlens))
     return record
+
+
+def peek_packed_offsets(cu_seqlens, total_tokens: int) -> Optional[CanonicalOffsets]:
+    """The record :func:`validate_packed_offsets` cached for this exact tensor.
+
+    ``None`` when there is none.  Never reads the device, validates or raises:
+    a lookup-only memo probe uses it to find the canonical copy its plans are
+    keyed on, and anything it cannot answer is the full path's to decide.
+    """
+    # What validation would refuse never matches: the key has no stride, so a
+    # strided view at a validated tensor's address would otherwise find its
+    # record.
+    if (
+        not isinstance(cu_seqlens, torch.Tensor)
+        or cu_seqlens.device.type != "cuda"
+        or cu_seqlens.dim() != 1
+        or not cu_seqlens.is_contiguous()
+    ):
+        return None
+    return _PACKED_OFFSETS.peek(
+        cu_seqlens.device, _packed_key(cu_seqlens, total_tokens)
+    )
 
 
 def fixed_offsets(batch: int, tokens: int, device) -> CanonicalOffsets:
@@ -1424,6 +1473,61 @@ def clear_offsets_caches() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The ``[H, 128]`` view of a flat ``dt_bias``.
+#
+# A model stores ``dt_bias`` as ``[H * 128]`` and the backend's ABI is
+# ``[H, 128]``.  The call memos recognise a tensor by object identity, so the
+# adapted view has to be the same object on every call, which means caching it.
+# ---------------------------------------------------------------------------
+
+#: ``id(source) -> (weakref(source), view, data_ptr, numel, stride)``.  The view comes
+#: from ``source.detach()``, which shares the storage and version counter but
+#: not the source object, so an entry never keeps its source alive: the weak
+#: reference fires when the caller drops the tensor, and the entry goes with it.
+#: A plain ``source.view(...)`` would hold the source through ``_base`` and pin
+#: every rank-1 ``dt_bias`` ever passed for the process lifetime.
+_DT_BIAS_VIEWS: dict[int, tuple] = {}
+
+
+def dt_bias_heads_view(dt_bias: torch.Tensor, heads: int) -> torch.Tensor:
+    """The ``[H, 128]`` view of a rank-1 ``dt_bias``, the same object each time.
+
+    The view shares its source's storage, so its contents follow the source and
+    only the source's identity and layout -- address, size and stride, any of
+    which ``.data`` or ``set_`` can replace -- can invalidate it; all are
+    checked.
+    """
+    key = id(dt_bias)
+    cached = _DT_BIAS_VIEWS.get(key)
+    if cached is not None:
+        ref, view, data_ptr, numel, stride = cached
+        if (
+            ref() is dt_bias
+            and view.shape[0] == heads
+            and dt_bias.data_ptr() == data_ptr
+            and dt_bias.numel() == numel
+            and dt_bias.stride() == stride
+        ):
+            return view
+        _DT_BIAS_VIEWS.pop(key, None)
+    view = dt_bias.detach().view(heads, DK)
+
+    def _purge(dead, _key=key):
+        entry = _DT_BIAS_VIEWS.get(_key)
+        if entry is not None and entry[0] is dead:
+            _DT_BIAS_VIEWS.pop(_key, None)
+
+    _DT_BIAS_VIEWS[key] = (
+        weakref.ref(dt_bias, _purge),
+        view,
+        dt_bias.data_ptr(),
+        dt_bias.numel(),
+        dt_bias.stride(),
+    )
+    return view
+
+
+# ---------------------------------------------------------------------------
 # The workspace resource slot.
 #
 # ``RecurrentKDAPrefillWorkspace`` is the only public workspace, and it is
@@ -1474,7 +1578,14 @@ class SM120PrefillResources:
     #: Stable final-state scratch for ``initial_state=None,
     #: output_final_state=True``, which cannot allocate during capture.
     state_scratch: Optional[torch.Tensor] = None
-    #: Descriptor storage and any other object a captured graph reads.
+    #: The plan this workspace's buffers currently belong to.  Every build for
+    #: a workspace rewrites the same offsets, chunk-table and scratch buffers,
+    #: so an older plan still held by a memo would replay against tables
+    #: written for another call's boundaries; :meth:`serves` makes it a miss.
+    plan: Any = None
+    #: What :attr:`plan` reads at a fixed address -- its descriptors, tables
+    #: and offsets -- held while it is this workspace's plan, which after a
+    #: capture is the workspace's lifetime.
     pins: tuple = ()
 
     #: What this workspace is bound to.  Set on first use and then immutable.
@@ -1505,9 +1616,20 @@ class SM120PrefillResources:
         self.stream_ptr = stream_ptr
         self.signature = signature
 
-    def pin(self, *objects) -> None:
-        """Hold strong references for the lifetime of this workspace."""
-        self.pins = self.pins + tuple(o for o in objects if o is not None)
+    def adopt(self, plan, *objects) -> None:
+        """Make ``plan`` the one this workspace serves, holding ``objects`` for it.
+
+        The previous plan and its pins are replaced, not added to.  An eager
+        caller that writes its inputs in place moves the versions the memos
+        key on, so it rebuilds on every call; accumulating would grow the pins,
+        and the device tables among them, without bound.
+        """
+        self.plan = plan
+        self.pins = (plan,) + tuple(o for o in objects if o is not None)
+
+    def serves(self, plan) -> bool:
+        """Whether a memoized ``plan`` may still run against this workspace."""
+        return plan is self.plan or plan is STATE_ONLY_PLAN
 
     def ensure_capacity(
         self, name: str, elements: int, dtype: torch.dtype
@@ -1525,7 +1647,7 @@ class SM120PrefillResources:
                 f"CUDA graph capture cannot grow the workspace's {name} buffer; "
                 f"warm it eagerly at this size first"
             )
-        grown = torch.empty(elements, dtype=dtype, device=self.device)
+        grown = persistent_empty(elements, dtype=dtype, device=self.device)
         setattr(self, name, grown)
         return grown
 
@@ -1690,6 +1812,7 @@ def clear_shared_caches() -> None:
     clear_offsets_caches()
     clear_flat_views()
     clear_pinned_staging()
+    _DT_BIAS_VIEWS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1790,6 +1913,8 @@ class PlanMemo:
         for tensor, version in zip(tensors, last_versions, strict=True):
             if tensor is not None and tensor_version(tensor) != version:
                 return None
+        if resources is not None and not resources.serves(plan):
+            return None
         return plan
 
     def remember(self, device, tensors, scalars: tuple, resources, plan) -> None:
@@ -1802,11 +1927,19 @@ class PlanMemo:
             plan,
         )
 
-    def get(self, key):
+    def get(self, key, resources=None):
+        """The plan remembered under ``key``, unless ``resources`` has moved on.
+
+        A workspace-bound entry is a miss once another plan has been built for
+        that workspace (:meth:`SM120PrefillResources.serves`).
+        """
         with self.build_lock:
             plan = self.plans.get(key)
-            if plan is not None:
-                self.plans.move_to_end(key)
+            if plan is None:
+                return None
+            if resources is not None and not resources.serves(plan):
+                return None
+            self.plans.move_to_end(key)
             return plan
 
     def remember_plan(self, key, plan) -> None:
@@ -1991,6 +2124,7 @@ __all__ = [
     "DESCRIPTOR_BYTES",
     "descriptor_cache_key",
     "DK",
+    "dt_bias_heads_view",
     "DV",
     "execute",
     "flat_view",
@@ -2005,6 +2139,8 @@ __all__ = [
     "max_grid_dims",
     "NO_VERSION",
     "NORM_FLOOR",
+    "peek_packed_offsets",
+    "persistent_empty",
     "PlanMemo",
     "PREFIX_FLOOR",
     "record_stream_once",

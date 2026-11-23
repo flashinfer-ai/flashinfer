@@ -774,3 +774,34 @@ def test_explicit_arch_names_the_module_and_meta():
     spec = JitSpecCuteDsl("some_op", "k", lambda: None, "sha", arch="sm_120a")
     assert spec.module_dir_name == "some_op_sm120a_cute_dsl"
     assert spec.expected_meta["arch"] == "sm120a"
+
+
+@pytest.mark.cpu_only
+def test_wrapper_forwards_explicit_arch(monkeypatch):
+    """``build_and_load_cute_dsl_kernel`` hands its ``arch`` to the spec.
+
+    The spec-level test above builds ``JitSpecCuteDsl`` directly, so it would
+    still pass if the wrapper dropped the argument.
+    """
+    from flashinfer.jit import cute_dsl_core
+
+    captured = {}
+
+    class RecordingSpec:
+        def __init__(
+            self, module_name, kernel_name, compile_fn, source_sha256, arch=None
+        ):
+            captured["arch"] = arch
+
+        def build_and_load(self):
+            return "loaded"
+
+    monkeypatch.setattr(cute_dsl_core, "JitSpecCuteDsl", RecordingSpec)
+    monkeypatch.setattr(cute_dsl_core, "cute_dsl_cache_disabled", lambda: False)
+    monkeypatch.setattr(cute_dsl_core, "_hash_source_files", lambda files: "sha")
+
+    result = cute_dsl_core.build_and_load_cute_dsl_kernel(
+        "some_op", "k", lambda: None, arch="sm_120a"
+    )
+    assert result == "loaded"
+    assert captured["arch"] == "sm_120a"

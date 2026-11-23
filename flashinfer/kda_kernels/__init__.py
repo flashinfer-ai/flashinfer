@@ -90,7 +90,7 @@ except (ImportError, RuntimeError):
 
 # SM120a ordinary multi-token prefill.  Optional in the same way as the CuTe DSL
 # decode backend above: a CPU-only import, an SM100 box or a missing CuTe DSL
-# leaves the three symbols ``None`` and the dispatcher falls through.
+# leaves the four symbols ``None`` and the dispatcher falls through.
 #
 # Only ImportError and RuntimeError are caught: any other exception from inside
 # the package is a defect in this repository, and swallowing it would disguise
@@ -104,6 +104,7 @@ try:
         clear_kda_prefill_sm120_caches,
         run_kda_prefill_sm120,
     )
+    from .sm120_prefill import dt_bias_heads_view as sm120_dt_bias_heads_view
 
     _has_kda_prefill_sm120 = True
 except (ImportError, RuntimeError) as _kda_sm120_error:  # pragma: no cover
@@ -112,6 +113,7 @@ except (ImportError, RuntimeError) as _kda_sm120_error:  # pragma: no cover
     can_implement_kda_prefill_sm120 = None  # type: ignore
     clear_kda_prefill_sm120_caches = None  # type: ignore
     run_kda_prefill_sm120 = None  # type: ignore
+    sm120_dt_bias_heads_view = None  # type: ignore
 
 __all__ = [
     "run_fused_kda_decode",

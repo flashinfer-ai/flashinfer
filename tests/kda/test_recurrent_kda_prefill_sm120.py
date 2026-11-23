@@ -970,6 +970,52 @@ def test_sm120_clear_pinned_staging_waits_for_pending_uploads():
         runtime._PINNED_STAGING.clear()
 
 
+def test_sm120_descriptor_staging_publishes_the_event_under_its_lock(monkeypatch):
+    """A descriptor-table upload records its slot's event before unlocking.
+
+    The table ring hands a slot out under its lock and waits on the slot's
+    event before refilling it.  Released between the checkout and the
+    event's publication, the lock lets a thread that wraps the ring find no
+    event, refill the slot under the pending DMA, and upload a table made of
+    two.  Asserted on the lock state when the event is recorded: the byte
+    comparison alone would pass on the racing version too.
+    """
+    _skip_if_not_sm120()
+    decomp = _sm120_prefill()._variant_module("decomp")
+    staging = decomp._DescriptorStaging()
+    held_at_record: list = []
+    held_at_publish: list = []
+    real_event = torch.cuda.Event
+
+    class CheckedEvents(list):
+        def __setitem__(self, index, value):
+            if value is not None:
+                held_at_publish.append(staging.lock.locked())
+            super().__setitem__(index, value)
+
+    staging.events = CheckedEvents(staging.events)
+
+    class CheckedEvent:
+        def __init__(self, *args, **kwargs):
+            self.inner = real_event(*args, **kwargs)
+
+        def record(self, stream=None):
+            held_at_record.append(staging.lock.locked())
+            self.inner.record(stream)
+
+        def synchronize(self):
+            self.inner.synchronize()
+
+    monkeypatch.setattr(torch.cuda, "Event", CheckedEvent)
+    storage = torch.empty(decomp.DESC_TABLE_BYTES, dtype=torch.uint8, device="cuda")
+    image = bytearray(i % 251 for i in range(decomp.DESC_TABLE_BYTES))
+    staging.upload(image, storage)
+    torch.cuda.synchronize()
+    assert held_at_record == [True]
+    assert held_at_publish == [True]
+    assert bytes(storage.cpu().tolist()) == bytes(image)
+
+
 def test_sm120_tma_alignment_constant_matches_the_runtime():
     """The adapter's alignment gate and the descriptor's must be one number.
 
@@ -1213,6 +1259,548 @@ def test_sm120_equal_offsets_in_a_new_tensor_keep_the_plan(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("variant", ["decomp", "fused"])
+@pytest.mark.parametrize("stateful", [False, True])
+def test_sm120_refilled_offsets_do_not_move_another_tensors_boundaries(
+    variant, stateful
+):
+    """Refilling one offsets tensor leaves a second tensor's boundaries alone.
+
+    Equal content resolves to one canonical record, and a later tensor with
+    that content reuses the record and the plans built on it.  Were the
+    record's canonical buffer the first caller's own tensor, refilling that
+    tensor in place would rewrite the boundaries the second tensor's call
+    reads.  Run outside ``inference_mode`` so the refill bumps the first
+    tensor's version, which is the case the identity cache can see.  For the
+    fused variant, which reads that canonical buffer, the stateless second
+    call is a memo hit and a fresh state per call takes the full path.  The
+    decomposed variant builds its tables from the host copy of the offsets
+    and is covered against a change that would make it read the buffer.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    inputs = _make_inputs_sm120(
+        seq_lens=[64, 64],
+        num_heads=4,
+        packed=True,
+        initial_state=stateful,
+        seed=SEED + 41,
+    )
+    first = inputs["cu_seqlens"]
+    second = first.clone()
+    refill = torch.tensor([0, 32, 128], dtype=first.dtype, device=first.device)
+    initial = inputs["initial_state"]
+    output = torch.empty_like(inputs["v"])
+
+    def run(offsets):
+        state = None if initial is None else initial.clone()
+        # The expected output for ``second`` equals the first call's, so a
+        # launch that did not happen must not pass on what is left in it.
+        output.fill_(float("nan"))
+        sm120_prefill.run_kda_prefill_sm120(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["g"],
+            beta=inputs["beta"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            lower_bound=-5.0,
+            initial_state=state,
+            final_state=state,
+            cu_seqlens=offsets,
+            output=output,
+            variant=variant,
+        )
+        torch.cuda.synchronize()
+        return output.clone(), state
+
+    def check(offsets, label):
+        expected_out, expected_state = _reference_kda_prefill(
+            dict(inputs, initial_state=initial, cu_seqlens=offsets.clone())
+        )
+        out, state = run(offsets)
+        _assert_elementwise(
+            out, expected_out, f"{label} output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+        if state is not None:
+            _assert_elementwise(
+                state,
+                expected_state,
+                f"{label} final_state",
+                rtol=STATE_RTOL,
+                atol=STATE_ATOL,
+            )
+
+    check(first, "first tensor")
+    first.copy_(refill)
+    check(second, "second tensor after the first was refilled")
+    check(first, "refilled first tensor")
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("variant", ["decomp", "fused"])
+def test_sm120_offsets_at_a_reused_address_get_their_own_boundaries(variant):
+    """A plan built for one offsets tensor is not replayed for another one.
+
+    Each variant memoizes its plans on the caller's tensors' identities, and
+    its plans no longer keep the caller's offsets alive: they read a private
+    copy, and only the offsets identity cache holds the caller's tensor, until
+    it evicts it.  After that another tensor can hold the same address with
+    other content and, without a version counter, the same identity.  Two views of one buffer stand in for that reuse, so it
+    does not depend on what the allocator hands out.
+    """
+    _skip_if_not_sm120()
+    from flashinfer.kda_kernels.sm120_prefill import runtime
+
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    inputs = _make_inputs_sm120(
+        seq_lens=[64, 64], num_heads=4, packed=True, seed=SEED + 61
+    )
+    output = torch.empty_like(inputs["v"])
+    block = torch.tensor([0, 64, 128], dtype=torch.int32, device="cuda")
+
+    def run(offsets):
+        sm120_prefill.run_kda_prefill_sm120(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["g"],
+            beta=inputs["beta"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            lower_bound=-5.0,
+            cu_seqlens=offsets,
+            output=output,
+            variant=variant,
+        )
+        torch.cuda.synchronize()
+
+    run(block[:3])
+    # What eviction from the identity cache does on its own, once the caller
+    # has dropped the tensor: nothing is left that knows its old content.
+    runtime._PACKED_OFFSETS.clear()
+    block.copy_(torch.tensor([0, 32, 128], dtype=torch.int32, device="cuda"))
+    second = block[:3]
+    expected, _ = _reference_kda_prefill(dict(inputs, cu_seqlens=second))
+    run(second)
+    _assert_elementwise(
+        output, expected, "reused-address output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("with_workspace", [False, True])
+def test_sm120_packed_layers_sharing_offsets_stay_on_the_warm_probe(
+    with_workspace, monkeypatch
+):
+    """Layers that share one packed ``cu_seqlens`` all take the warm probe.
+
+    A model hands the same offsets tensor to every layer.  Without a
+    workspace the memo keys packed calls on the backend's private copy of the
+    offsets, so the probe has to map the caller's tensor to that copy without
+    reading the device, or every layer but the previous one walks the full
+    eligibility check on every call.  With a workspace per layer the memo keys
+    on the caller's tensor itself.  Short sequences keep the no-workspace case
+    on the fused variant, whose plans live in the identity memo the probe reads.
+    """
+    _skip_if_not_sm120()
+    import flashinfer.kda_prefill as kda_prefill
+
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    assert sm120_prefill.choose_variant(2, 4, 64) == "fused"
+    cu_seqlens = None
+    layers = []
+    for index in range(2):
+        inputs = _make_inputs_sm120(
+            seq_lens=[64, 48], num_heads=4, packed=True, seed=SEED + 71 + index
+        )
+        if cu_seqlens is None:
+            cu_seqlens = inputs["cu_seqlens"]
+        inputs["cu_seqlens"] = cu_seqlens
+        expected, _ = _reference_kda_prefill(inputs)
+        workspace = (
+            kda_prefill.RecurrentKDAPrefillWorkspace(inputs["q"].device)
+            if with_workspace
+            else None
+        )
+        layers.append((inputs, expected, torch.empty_like(inputs["v"]), workspace))
+
+    def step(label):
+        for index, (inputs, expected, output, workspace) in enumerate(layers):
+            output.fill_(float("nan"))
+            _call(inputs, output=output, prefill_workspace=workspace)
+            torch.cuda.synchronize()
+            _assert_elementwise(
+                output,
+                expected,
+                f"{label} layer {index} output",
+                rtol=OUTPUT_RTOL,
+                atol=OUTPUT_ATOL,
+            )
+
+    step("cold")
+    walks: list = []
+    original = kda_prefill._sm120_kda_prefill_rejection_reason
+
+    def spy(*args, **kwargs):
+        walks.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kda_prefill, "_sm120_kda_prefill_rejection_reason", spy)
+    for call in range(3):
+        step(f"warm {call}")
+    assert len(walks) == 0, f"{len(walks)} warm layer calls missed the warm probe"
+
+
+@pytest.mark.parametrize("variant", ["decomp", "fused"])
+@pytest.mark.parametrize("warm_inference", [False, True])
+def test_sm120_workspace_follows_its_offsets_through_refills(variant, warm_inference):
+    """A workspace-bound call follows its offsets tensor through A -> B -> A.
+
+    A workspace's plans read the workspace's own offsets buffers, which every
+    build for it rewrites.  A refill the version counter sees has to rebuild,
+    and a return to earlier content must not replay the earlier plan against
+    the buffers the later build wrote.  With ``warm_inference`` the first build
+    -- and the buffers it allocates -- happens under ``inference_mode`` and the
+    refills outside it.  A second tensor with the old content is refused: the
+    workspace is bound to the first one's address.
+    """
+    _skip_if_not_sm120()
+    from flashinfer.kda_kernels.sm120_prefill.runtime import SM120PrefillResources
+
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    inputs = _make_inputs_sm120(
+        seq_lens=[64, 64], num_heads=4, packed=True, seed=SEED + 81
+    )
+    first = torch.tensor([0, 64, 128], dtype=torch.int32, device="cuda")
+    refill = torch.tensor([0, 32, 128], dtype=torch.int32, device="cuda")
+    output = torch.empty_like(inputs["v"])
+    workspace = SM120PrefillResources(device=inputs["q"].device)
+
+    def run(offsets):
+        sm120_prefill.run_kda_prefill_sm120(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["g"],
+            beta=inputs["beta"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            lower_bound=-5.0,
+            cu_seqlens=offsets,
+            output=output,
+            resources=workspace,
+            variant=variant,
+        )
+        torch.cuda.synchronize()
+
+    def check(label):
+        expected, _ = _reference_kda_prefill(dict(inputs, cu_seqlens=offsets.clone()))
+        _assert_elementwise(
+            output, expected, f"{label} output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+
+    offsets = first.clone()
+    with torch.inference_mode(warm_inference):
+        run(offsets)
+    check("A")
+    original = offsets.clone()
+    offsets.copy_(refill)
+    run(offsets)
+    check("A -> B")
+    offsets.copy_(original)
+    run(offsets)
+    check("A -> B -> A")
+    with pytest.raises(RuntimeError, match="call signature"):
+        run(original)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("variant", ["decomp", "fused"])
+def test_sm120_workspace_serves_only_the_plan_it_built_last(variant):
+    """A workspace never replays a plan that a later build for it overwrote.
+
+    Every build for a workspace rewrites the workspace's offsets and, for the
+    decomposed variant, its chunk tables.  A variant memo entry for an earlier
+    build is keyed on identity and offsets content, not on what the workspace
+    holds now, so a tensor at the same address with the earlier content --
+    once the identity cache has let the earlier tensor go -- would replay that
+    plan against the later build's tables.  Views of one buffer stand in for
+    the reused address, under ``inference_mode`` where no version tells the
+    calls apart.
+    """
+    _skip_if_not_sm120()
+    from flashinfer.kda_kernels.sm120_prefill import runtime
+
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    inputs = _make_inputs_sm120(
+        seq_lens=[64, 64], num_heads=4, packed=True, seed=SEED + 91
+    )
+    output = torch.empty_like(inputs["v"])
+    workspace = runtime.SM120PrefillResources(device=inputs["q"].device)
+    block = torch.zeros(3, dtype=torch.int32, device="cuda")
+
+    for label, content in (
+        ("A", [0, 64, 128]),
+        ("B", [0, 32, 128]),
+        ("A again", [0, 64, 128]),
+    ):
+        # What eviction from the identity cache does once a caller drops the
+        # tensor; the next view of the block is a new tensor at its address.
+        runtime._PACKED_OFFSETS.clear()
+        block.copy_(torch.tensor(content, dtype=torch.int32, device="cuda"))
+        offsets = block[:3]
+        expected, _ = _reference_kda_prefill(dict(inputs, cu_seqlens=offsets.clone()))
+        output.fill_(float("nan"))
+        sm120_prefill.run_kda_prefill_sm120(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["g"],
+            beta=inputs["beta"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            lower_bound=-5.0,
+            cu_seqlens=offsets,
+            output=output,
+            resources=workspace,
+            variant=variant,
+        )
+        torch.cuda.synchronize()
+        _assert_elementwise(
+            output, expected, f"{label} output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+
+
+@pytest.mark.parametrize("variant", ["decomp", "fused"])
+def test_sm120_workspace_keeps_one_plan_through_eager_rebuilds(variant, monkeypatch):
+    """Eager rebuilds for one workspace replace its pins instead of adding to them.
+
+    An in-place write to an input moves the version the memos key on, so an
+    eager caller that refills its buffers rebuilds the plan on every call.
+    Each build used to add its plan -- and, for the decomposed variant, a new
+    device descriptor table -- to the workspace's pins, which only grew.
+    """
+    _skip_if_not_sm120()
+    from flashinfer.kda_kernels.sm120_prefill.runtime import SM120PrefillResources
+
+    sm120_prefill = _sm120_prefill()
+    module = sm120_prefill._variant_module(variant)
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    builds: list = []
+    original = module._build_plan
+
+    def build_spy(*args, **kwargs):
+        builds.append(None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_build_plan", build_spy)
+
+    inputs = _make_inputs_sm120(
+        seq_lens=[64, 64], num_heads=4, packed=True, seed=SEED + 95
+    )
+    output = torch.empty_like(inputs["v"])
+    workspace = SM120PrefillResources(device=inputs["q"].device)
+    pins = []
+    for call in range(4):
+        if call:
+            refill = _make_inputs_sm120(
+                seq_lens=[64, 64], num_heads=4, packed=True, seed=SEED + 95 + call
+            )
+            inputs["q"].copy_(refill["q"])
+        expected, _ = _reference_kda_prefill(inputs)
+        sm120_prefill.run_kda_prefill_sm120(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["g"],
+            beta=inputs["beta"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            lower_bound=-5.0,
+            cu_seqlens=inputs["cu_seqlens"],
+            output=output,
+            resources=workspace,
+            variant=variant,
+        )
+        torch.cuda.synchronize()
+        _assert_elementwise(
+            output, expected, f"call {call} output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+        pins.append(len(workspace.pins))
+    assert len(builds) >= 2, "the in-place writes did not rebuild the plan"
+    assert pins == [pins[0]] * len(pins), f"the workspace pins grew: {pins}"
+
+
+@pytest.mark.parametrize("variant", ["decomp", "fused"])
+def test_sm120_backend_refuses_capture_without_a_workspace(variant, monkeypatch):
+    """A direct backend call refuses capture without a workspace, warm or not.
+
+    The public dispatcher already refuses it.  Below it, a warm shape-shared
+    plan would be recorded as it was last pointed and re-pointed by the next
+    eager call of its shape, and an identity entry's offsets copy belongs to an
+    evictable cache: either way replay would read memory the graph does not own.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    inputs = _make_inputs_sm120(
+        seq_lens=[64, 64], num_heads=4, packed=True, seed=SEED + 99
+    )
+    call = dict(
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        g=inputs["g"],
+        beta=inputs["beta"],
+        A_log=inputs["A_log"],
+        dt_bias=inputs["dt_bias"],
+        lower_bound=-5.0,
+        cu_seqlens=inputs["cu_seqlens"],
+        output=torch.empty_like(inputs["v"]),
+        variant=variant,
+    )
+    sm120_prefill.run_kda_prefill_sm120(**call)
+    torch.cuda.synchronize()
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert sm120_prefill.run_kda_prefill_sm120(**call, lookup_only=True) is None
+    with pytest.raises(RuntimeError, match="requires a workspace"):
+        sm120_prefill.run_kda_prefill_sm120(**call)
+
+
+def test_sm120_offsets_peek_declines_a_strided_alias():
+    """The warm probe's offsets lookup refuses what validation would refuse.
+
+    The identity key has no stride, so a strided view starting at a validated
+    tensor's address, with its shape and version, would otherwise be given
+    that tensor's boundaries.
+    """
+    _skip_if_not_sm120()
+    from flashinfer.kda_kernels.sm120_prefill import runtime
+
+    runtime.clear_offsets_caches()
+    block = torch.tensor([0, 4, 10, 0, 0, 0], dtype=torch.int32, device="cuda")
+    try:
+        record = runtime.validate_packed_offsets(block[:3], 10)
+        assert runtime.peek_packed_offsets(block[:3], 10) is record
+        assert runtime.peek_packed_offsets(block[0:6:2], 10) is None
+    finally:
+        runtime.clear_offsets_caches()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("name", ["output", "initial_state"])
+def test_sm120_warm_probe_declines_a_non_tensor_buffer(name):
+    """A non-tensor buffer reaches the named rejection on a warm memo too.
+
+    The probe builds an identity key once the memo holds any entry, so a
+    non-tensor ``output`` or ``initial_state`` has to be declined before it.
+    """
+    _skip_if_not_sm120()
+    from flashinfer import kda_prefill
+
+    inputs = _make_inputs_sm120(
+        seq_lens=[16], num_heads=4, packed=False, initial_state=True, seed=SEED
+    )
+    workspace = kda_prefill.RecurrentKDAPrefillWorkspace(inputs["q"].device)
+    output = torch.empty_like(inputs["v"])
+    _call(inputs, backend="cute-dsl", output=output, prefill_workspace=workspace)
+    overrides = {"output": torch.empty_like(inputs["v"]), name: [0.0]}
+    with pytest.raises(ValueError, match=f"{name} must be a contiguous CUDA"):
+        _call(inputs, backend="cute-dsl", **overrides)
+
+
+@pytest.mark.parametrize("variant", ["decomp", "fused"])
+def test_sm120_backend_warmed_under_inference_mode_serves_calls_outside_it(
+    variant, monkeypatch
+):
+    """Buffers the backend keeps across calls must accept writes in either mode.
+
+    The decomposed variant's per-plan descriptor tables and the pinned ring
+    that uploads them outlive the call that allocates them and are rewritten
+    by later ones.  Allocated under ``inference_mode`` they would be inference
+    tensors, which refuse every in-place write once the caller has left that
+    mode, so a process warmed under ``inference_mode`` -- a server -- and then
+    called outside it -- a training or evaluation loop -- would fail on the
+    first reuse.  Fresh inputs each call send the decomposed variant through
+    the re-point path, which rewrites the descriptor table through the pinned
+    ring; the fused variant uploads fresh buffers per plan and is the control.
+    The ring is process-wide, so the test starts from none: whichever earlier
+    test created it would otherwise decide which mode it was allocated in.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    decomp = sm120_prefill._variant_module("decomp")
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    monkeypatch.setattr(decomp, "_DESC_STAGING", {})
+    builds: list = []
+    repoints: list = []
+    original_build = decomp._build_plan
+    original_rebind = decomp.rebind
+
+    def build_spy(*args, **kwargs):
+        builds.append(None)
+        return original_build(*args, **kwargs)
+
+    def rebind_spy(*args, **kwargs):
+        repoints.append(None)
+        return original_rebind(*args, **kwargs)
+
+    monkeypatch.setattr(decomp, "_build_plan", build_spy)
+    monkeypatch.setattr(decomp, "rebind", rebind_spy)
+
+    for index, inference in enumerate((True, False, True)):
+        with torch.inference_mode(inference):
+            inputs = _make_inputs_sm120(
+                seq_lens=[64, 64],
+                num_heads=4,
+                packed=True,
+                initial_state=True,
+                seed=SEED + 51 + index,
+            )
+            expected_out, expected_state = _reference_kda_prefill(inputs)
+            out = torch.empty_like(inputs["v"])
+            state = inputs["initial_state"]
+            sm120_prefill.run_kda_prefill_sm120(
+                q=inputs["q"],
+                k=inputs["k"],
+                v=inputs["v"],
+                g=inputs["g"],
+                beta=inputs["beta"],
+                A_log=inputs["A_log"],
+                dt_bias=inputs["dt_bias"],
+                lower_bound=-5.0,
+                initial_state=state,
+                final_state=state,
+                cu_seqlens=inputs["cu_seqlens"],
+                output=out,
+                variant=variant,
+            )
+            torch.cuda.synchronize()
+        label = f"call {index} ({'inside' if inference else 'outside'} inference_mode)"
+        _assert_elementwise(
+            out, expected_out, f"{label} output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+        _assert_elementwise(
+            state,
+            expected_state,
+            f"{label} final_state",
+            rtol=STATE_RTOL,
+            atol=STATE_ATOL,
+        )
+    if variant == "decomp":
+        assert len(builds) == 1, f"the shape plan was built {len(builds)} times"
+        assert len(repoints) >= 2, "the later calls did not re-point the plan"
+        assert len(sm120_prefill._SHAPE_PLANS) == 1
+
+
 @torch.inference_mode()
 def test_sm120_public_warm_call_skips_the_eligibility_walk(monkeypatch):
     """A workspace-bound warm call skips the full eligibility walk.
@@ -1256,6 +1844,10 @@ def test_sm120_public_warm_call_skips_the_eligibility_walk(monkeypatch):
         )
 
     step("cold call")
+    # The dispatcher adapted the flat tensor through the backend's view cache.
+    from flashinfer.kda_kernels.sm120_prefill import runtime
+
+    assert id(flat_dt_bias) in runtime._DT_BIAS_VIEWS
     walks: list = []
     original = kda_prefill._sm120_kda_prefill_rejection_reason
 
@@ -1318,6 +1910,11 @@ def test_sm120_repointed_plan_launches_on_the_buffers_it_was_pointed_at():
         thread.start()
     for thread in threads:
         thread.join(timeout=300)
+    # ``join`` returns on its timeout too; a worker still blocked past it has
+    # not passed, and without this check the test would report success while
+    # it is still running.
+    alive = [index for index, thread in enumerate(threads) if thread.is_alive()]
+    assert not alive, f"workers still running after the join timeout: {alive}"
     assert not failures, failures
     assert len(sm120_prefill._SHAPE_PLANS) == 1, (
         "the two threads did not share one plan"
@@ -1552,6 +2149,21 @@ def test_sm120_warm_probe_preserves_shape_rejection(condition):
     inputs["dt_bias"] = inputs["dt_bias"].reshape(-1)
     with pytest.raises(ValueError, match=reason):
         _call(inputs, backend="cute-dsl", output=torch.empty_like(inputs["v"]))
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("name", ["k", "v", "g"])
+def test_sm120_warm_probe_declines_a_missing_input(name):
+    """A non-tensor input reaches the named rejection, not an AttributeError.
+
+    The warm probe reads shapes before any validation has run, so it has to
+    decline what is not a tensor and leave the message to the full path.
+    """
+    _skip_if_not_sm120()
+    inputs = _make_inputs_sm120(seq_lens=[16], num_heads=4, packed=False, seed=SEED)
+    inputs[name] = None
+    with pytest.raises(ValueError, match=f"{name} must be a contiguous CUDA"):
+        _call(inputs, backend="cute-dsl", output=torch.empty_like(inputs["q"]))
 
 
 @torch.inference_mode()
@@ -1812,6 +2424,67 @@ def test_recurrent_kda_prefill_sm120_variants_match_reference(variant, packed, s
         cu_seqlens=inputs["cu_seqlens"],
         output=out,
         variant=variant,
+    )
+
+    _assert_elementwise(out, expected_out, "output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+    _assert_elementwise(
+        state, expected_state, "final_state", rtol=STATE_RTOL, atol=STATE_ATOL
+    )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "seq_lens,num_heads,packed",
+    [([2057], 12, False), ([2048, 64], 6, True)],
+    ids=["fixed-T2057", "packed-2048-64"],
+)
+def test_recurrent_kda_prefill_sm120_decomp_cp_async_producer_matches_reference(
+    seq_lens, num_heads, packed
+):
+    """Long sequences reach the decomposed recurrence's ``cp.async`` producer.
+
+    The producer switches from TMA to ``cp.async`` only on a grid of at least
+    ``CP_ASYNC_MIN_CTAS`` CTAs and for a sequence of at least
+    ``CP_ASYNC_MIN_CHUNKS`` chunks, which no shorter case in this file reaches.
+    T=2057 ends in a partial chunk; ``[2048, 64]`` puts one sequence on each
+    side of the chunk threshold in a single launch, so both producers run.
+    """
+    _skip_if_not_sm120()
+    sm120_prefill = _sm120_prefill()
+    decomp = sm120_prefill._variant_module("decomp")
+
+    grid = decomp.recurrence_grid(len(seq_lens), num_heads)
+    chunks = [-(-length // decomp.BT) for length in seq_lens]
+    assert grid[0] * grid[1] >= decomp.CP_ASYNC_MIN_CTAS
+    assert max(chunks) >= decomp.CP_ASYNC_MIN_CHUNKS
+    if packed:
+        assert min(chunks) < decomp.CP_ASYNC_MIN_CHUNKS
+
+    inputs = _make_inputs_sm120(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=True,
+        seed=SEED,
+    )
+    expected_out, expected_state = _reference_kda_prefill(inputs)
+
+    out = torch.empty_like(inputs["v"])
+    state = inputs["initial_state"]
+    sm120_prefill.run_kda_prefill_sm120(
+        q=inputs["q"],
+        k=inputs["k"],
+        v=inputs["v"],
+        g=inputs["g"],
+        beta=inputs["beta"],
+        A_log=inputs["A_log"],
+        dt_bias=inputs["dt_bias"],
+        lower_bound=-5.0,
+        initial_state=state,
+        final_state=state,
+        cu_seqlens=inputs["cu_seqlens"],
+        output=out,
+        variant="decomp",
     )
 
     _assert_elementwise(out, expected_out, "output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
@@ -2234,6 +2907,109 @@ def test_recurrent_kda_prefill_sm120_graph_replay_matches_eager(
         rtol=STATE_RTOL,
         atol=STATE_ATOL,
     )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("variant", ["decomp", "fused"])
+@pytest.mark.parametrize("replay", [False, True], ids=["eager", "graph"])
+@pytest.mark.parametrize("write", ["in_place", "through_data"])
+def test_recurrent_kda_prefill_sm120_a_log_update_reaches_the_next_launch(
+    variant, replay, write, monkeypatch
+):
+    """An ``A_log`` update changes the decay of the very next launch.
+
+    ``A_log`` is a parameter that an optimizer step or a weight sync rewrites
+    in place.  A workspace-bound call launches from the identity memo without
+    re-pointing its plan: eagerly when the write is invisible to the version
+    counter, and on every replay of a graph captured from such a hit.  Two
+    such writes: an in-place op on an inference tensor, which has no counter,
+    and a write through ``.data`` -- a weight loader, an RL weight sync -- on a
+    tensor that has one but does not see it.  The launch itself therefore has
+    to derive the decay from ``A_log``.  Both variants are held to the
+    reference after the update.
+    """
+    _skip_if_not_sm120()
+    from flashinfer.kda_kernels.sm120_prefill.runtime import SM120PrefillResources
+
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    module = sm120_prefill._variant_module(variant)
+    builds: list = []
+    original_build = module._build_plan
+
+    def build_spy(*args, **kwargs):
+        builds.append(None)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_build_plan", build_spy)
+
+    inputs = _make_inputs_sm120(
+        seq_lens=[64, 64], num_heads=4, packed=False, initial_state=True, seed=SEED + 31
+    )
+    if write == "through_data":
+        # A parameter as a model holds it: made outside inference mode, so it
+        # carries a version counter.
+        with torch.inference_mode(False):
+            inputs["A_log"] = inputs["A_log"].clone()
+    initial = inputs["initial_state"].clone()
+    state = inputs["initial_state"]
+    output = torch.empty_like(inputs["v"])
+    workspace = SM120PrefillResources(device=inputs["q"].device)
+
+    def update():
+        a_log = inputs["A_log"]
+        if write == "in_place":
+            a_log.add_(1.0)
+            return
+        version = a_log._version
+        a_log.data.copy_(a_log + 1.0)
+        assert a_log._version == version, "the write was meant to bypass the counter"
+
+    def eager_call():
+        sm120_prefill.run_kda_prefill_sm120(
+            q=inputs["q"],
+            k=inputs["k"],
+            v=inputs["v"],
+            g=inputs["g"],
+            beta=inputs["beta"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            lower_bound=-5.0,
+            initial_state=state,
+            final_state=state,
+            output=output,
+            resources=workspace,
+            variant=variant,
+        )
+
+    if replay:
+        graph = _warm_and_capture(
+            inputs, workspace=workspace, output=output, state=state, variant=variant
+        )
+        launch = graph.replay
+    else:
+        launch = eager_call
+
+    for label in ("before the update", "after A_log += 1"):
+        if label != "before the update":
+            update()
+        state.copy_(initial)
+        expected_out, expected_state = _reference_kda_prefill(inputs)
+        state.copy_(initial)
+        launch()
+        torch.cuda.synchronize()
+        _assert_elementwise(
+            output, expected_out, f"{label} output", rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL
+        )
+        _assert_elementwise(
+            state,
+            expected_state,
+            f"{label} final_state",
+            rtol=STATE_RTOL,
+            atol=STATE_ATOL,
+        )
+    # The update has to reach a plan that is replayed, not rebuilt.
+    assert len(builds) == 1, f"the plan was built {len(builds)} times"
 
 
 @torch.inference_mode()
@@ -2702,3 +3478,43 @@ def test_sm120_runtime_packed_offsets_eviction_releases_the_source():
         assert sources[0]() is None
     finally:
         runtime.clear_offsets_caches()
+
+
+def test_sm120_dt_bias_view_cache_does_not_keep_its_source_alive():
+    """The cached ``[H, 128]`` view of a flat ``dt_bias`` cannot pin the source.
+
+    The view must be the same object on every call, so it is cached per source
+    tensor, and the entry is meant to go when the source does.  A plain
+    ``view`` holds its source through ``_base``, so that never happened: every
+    rank-1 ``dt_bias`` ever passed -- one per call for a caller that converts
+    with ``.float()`` -- stayed cached with its storage.
+    """
+    from flashinfer import kda_kernels
+    from flashinfer.kda_kernels.sm120_prefill import runtime
+
+    sm120_prefill = _sm120_prefill()
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    if kda_kernels.sm120_dt_bias_heads_view is not None:
+        # The dispatcher reaches the cache through this export.
+        assert kda_kernels.sm120_dt_bias_heads_view is runtime.dt_bias_heads_view
+    heads = 4
+    kept = torch.randn(heads * HEAD_DIM)
+    view = runtime.dt_bias_heads_view(kept, heads)
+    assert view.shape == (heads, HEAD_DIM)
+    assert runtime.dt_bias_heads_view(kept, heads) is view
+    kept.add_(1.0)
+    assert torch.equal(view.reshape(-1), kept)
+
+    dropped_refs = []
+    for _ in range(200):
+        dropped = torch.randn(heads * HEAD_DIM)
+        dropped_refs.append(weakref.ref(dropped))
+        runtime.dt_bias_heads_view(dropped, heads)
+    del dropped
+    gc.collect()
+    assert all(ref() is None for ref in dropped_refs)
+    assert len(runtime._DT_BIAS_VIEWS) == 1, "dropped sources are still cached"
+
+    sm120_prefill.clear_kda_prefill_sm120_caches()
+    assert not runtime._DT_BIAS_VIEWS
+    assert runtime.dt_bias_heads_view(kept, heads) is not view

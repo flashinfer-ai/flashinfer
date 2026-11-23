@@ -20,11 +20,12 @@ code and builds nothing.  The device modules are imported only once a call has
 been validated and a variant chosen, which is what makes
 ``import flashinfer`` free for a caller that never runs KDA prefill on SM120.
 
-Three names leave this package::
+Four names leave this package::
 
     can_implement_kda_prefill_sm120   fail-closed predicate, no side effects
     run_kda_prefill_sm120             the call
     clear_kda_prefill_sm120_caches    drop everything both variants hold
+    dt_bias_heads_view                the adapter's cached [H, 128] dt_bias view
 
 ``flashinfer/kda_prefill.py`` reaches them through
 :mod:`flashinfer.kda_kernels`, never by importing this package directly, and
@@ -65,6 +66,8 @@ from .runtime import (
     SM120PrefillResources,
     canonical_offsets,
     current_stream_ptr,
+    dt_bias_heads_view,
+    peek_packed_offsets,
     resource_cache_token,
     sm120a_available,
     is_exact_alias,
@@ -78,6 +81,7 @@ from .runtime import (
 __all__ = [
     "can_implement_kda_prefill_sm120",
     "clear_kda_prefill_sm120_caches",
+    "dt_bias_heads_view",
     "run_kda_prefill_sm120",
 ]
 
@@ -425,9 +429,11 @@ def run_kda_prefill_sm120(
 
     ``resources`` is the SM120 half of a caller-owned
     :class:`~flashinfer.kda_prefill.RecurrentKDAPrefillWorkspace`.  Passing one
-    is what makes CUDA graph capture possible: it gives the canonical metadata,
-    the scratch and the descriptors a lifetime that outlives this module's
-    caches, which replay needs because it never re-enters Python.
+    is what makes CUDA graph capture possible, and a capture without one is
+    refused: it gives the canonical metadata, the scratch and the descriptors a
+    lifetime that outlives this module's caches, which replay needs because it
+    never re-enters Python.  A workspace serves the plan it last built; each
+    build rewrites its tables, so an older plan for it is rebuilt, not replayed.
 
     ``lookup_only`` asks for the memoized plan and nothing else: a warm call
     is executed and returned, a miss returns ``None`` without validating,
@@ -439,14 +445,29 @@ def run_kda_prefill_sm120(
     contract depends on beyond these arguments, so a warm hit implies the
     caller validated an identical call.
 
-    A packed ``cu_seqlens`` is matched by *content* as well as identity: a
-    serving loop that allocates fresh offsets every scheduler step and passes
-    them to every layer keeps its plan across steps, at the price of one
-    device-to-host read per new offsets tensor -- the read the first call
-    would have made anyway.
+    Without a workspace, a packed ``cu_seqlens`` is matched by *content* as
+    well as identity: a serving loop that allocates fresh offsets every
+    scheduler step and passes them to every layer keeps its plan across steps,
+    at the price of one device-to-host read per new offsets tensor -- the read
+    the first call would have made anyway.  A workspace is bound to one
+    offsets tensor, and its plans are matched on that tensor and its version.
     """
     if variant not in VARIANTS:
         raise ValueError(f"variant must be one of {VARIANTS}, got {variant!r}")
+
+    if resources is None and q.is_cuda and torch.cuda.is_current_stream_capturing():
+        # The public dispatcher refuses this as well; a direct caller lands
+        # here.  Without a workspace a capture would record plans that belong
+        # to bounded caches: a shape-shared plan is re-pointed by the next
+        # eager call of its shape, and an identity entry's offsets copy can be
+        # evicted, so replay would read another call's buffers or freed memory.
+        if lookup_only:
+            return None
+        raise RuntimeError(
+            "CUDA graph capture of the SM120 KDA prefill backend requires a "
+            "workspace (resources=...): without one the graph would record "
+            "plans and buffers owned by evictable caches"
+        )
 
     if lookup_only and output is None:
         return None
@@ -473,7 +494,31 @@ def run_kda_prefill_sm120(
 
     resolved = _resolved_call(q.device, tensors, scalars, resources)
     if lookup_only and resolved is None:
-        return None
+        # Packed calls without a workspace are memoized on the private
+        # canonical copy of their offsets (see below), so a warm call with the
+        # caller's own tensor misses above whenever it is not the previous
+        # call -- every layer of a model but one.  The identity cache maps that
+        # tensor to its copy without a device read; a tensor it does not know
+        # is the full path's.
+        if (
+            resources is not None
+            or cu_seqlens is None
+            or q.dim() != 4
+            or q.shape[0] != 1
+        ):
+            return None
+        known = peek_packed_offsets(cu_seqlens, q.shape[1])
+        if known is None:
+            return None
+        resolved = _resolved_call(
+            q.device,
+            tensors,
+            scalars,
+            resources,
+            memo_tensors=tensors[:-1] + (known.canonical,),
+        )
+        if resolved is None:
+            return None
     memo_tensors = tensors
     offsets = None
     if resolved is None and cu_seqlens is not None and q.dim() == 4 and q.shape[0] == 1:
@@ -483,13 +528,19 @@ def run_kda_prefill_sm120(
         # Refused offsets are not an answer here; the full path below reports
         # them, and a lookup-only probe must not raise where eligibility would
         # have fallen back.
+        #
+        # Not with a workspace.  Its plans read the workspace's own offsets
+        # buffers, which every build for that workspace rewrites, so a plan
+        # found by content could replay against another build's boundaries.
+        # Keyed on the caller's tensor and its version instead, a refill misses
+        # and the rebuild rewrites the buffers.
         try:
             offsets = validate_packed_offsets(cu_seqlens, q.shape[1])
         except KDAPrefillValidationError:
             if lookup_only:
                 return None
             raise
-        if offsets.canonical is not cu_seqlens:
+        if resources is None and offsets.canonical is not cu_seqlens:
             memo_tensors = tensors[:-1] + (offsets.canonical,)
             resolved = _resolved_call(
                 q.device, tensors, scalars, resources, memo_tensors=memo_tensors
@@ -539,6 +590,13 @@ def run_kda_prefill_sm120(
                     return None
                 raise
             return out, final_state
+    if (
+        resolved is not None
+        and resources is not None
+        and not resources.serves(resolved[1])
+    ):
+        # A later build for this workspace rewrote the tables this plan reads.
+        resolved = None
     if resolved is not None:
         # The whole host path already ran for these exact tensors: replay the
         # plan it produced rather than walking eleven tensors again to find it.

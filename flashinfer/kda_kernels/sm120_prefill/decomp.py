@@ -64,7 +64,6 @@ fixed implementation choices shared by the host plan, device code and tests.
 from __future__ import annotations
 
 import threading
-import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -83,7 +82,6 @@ from .runtime import (
     capturing,
     check_flat_output_range,
     check_tma_base_alignment,
-    current_stream_ptr,
     DESCRIPTOR_BYTES,
     descriptor_cache_key,
     DK,
@@ -91,21 +89,19 @@ from .runtime import (
     execute,
     flat_view,
     GRAPH_PINS,
-    IdentityCache,
     INT32_MAX,
     is_exact_alias,
     KDAPrefillValidationError,
     LOG2_E,
     max_grid_dims,
-    NO_VERSION,
     NORM_FLOOR,
+    persistent_empty,
     PlanMemo,
     PREFIX_FLOOR,
     record_stream_once,
     require_sm120a,
     sm120a_compile_options,
     STATE_ONLY_PLAN,
-    tensor_version,
     TensorMapSpec,
     upload_bytes,
     _check_aliasing,
@@ -579,7 +575,7 @@ def clear_prepare_workspaces(device: torch.device | int | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sequence metadata, cached by contents and device of ``cu_seqlens``.
+# Sequence metadata: the chunk tables derived from ``cu_seqlens``.
 # ---------------------------------------------------------------------------
 
 
@@ -605,19 +601,6 @@ class ChunkMetadata:
         return (self.cu_seqlens, self.cu_chunks, self.chunk_to_seq)
 
 
-#: 64 entries per device and 64 MiB of device payload,
-#: whichever binds first.
-METADATA_MAX_ENTRIES = 64
-METADATA_MAX_BYTES = 64 * 1024 * 1024
-
-_META_CONTENT = BoundedDeviceCache(
-    "chunk-metadata",
-    max_entries=METADATA_MAX_ENTRIES,
-    max_bytes=METADATA_MAX_BYTES,
-)
-_META_IDENTITY = IdentityCache()
-
-
 def _build_metadata(host: list[int], device: torch.device) -> ChunkMetadata:
     lengths = [b - a for a, b in zip(host, host[1:], strict=False)]
     per_sequence = chunks_for_lengths(lengths)
@@ -641,11 +624,6 @@ def _build_metadata(host: list[int], device: torch.device) -> ChunkMetadata:
         total_chunks=cu[-1],
         sequence_count=len(per_sequence),
     )
-
-
-def clear_metadata_cache() -> None:
-    _META_CONTENT.clear()
-    _META_IDENTITY.clear()
 
 
 # ==========================================================================
@@ -691,18 +669,6 @@ def factor_slab_geometry(rows: int, heads: int, element_bytes: int = 2) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class TensorMapSet:
-    """One device buffer holding prepare's four descriptors, plus their addresses."""
-
-    storage: torch.Tensor
-    q: int
-    k: int
-    g: int
-    #: Kd, Qd and Ak share one descriptor over 3H planes; see _factor_map.
-    factor: int
-
-
 def _activation_map(t: torch.Tensor, total_tokens: int, heads: int, segment_elems: int):
     """Key-major ``(DK, T_total, H)`` view of token-strided ``[1, T, H, DK]``."""
     esz = t.element_size()
@@ -729,83 +695,6 @@ def _factor_map(ws_kd: torch.Tensor, rows: int, heads: int):
         base=ws_kd.data_ptr(),
         **factor_slab_geometry(rows, heads, ws_kd.element_size()),
     ).encode()
-
-
-#: Same event / LRU / lifetime contract as the recurrence cache: bounded, and a
-#: cross-stream hit waits on the upload event instead of racing it.
-_TENSOR_MAP_CACHE = BoundedDeviceCache(
-    "prepare-descriptors", max_entries=DESCRIPTOR_MAX_ENTRIES
-)
-
-
-def clear_prepare_descriptor_cache() -> None:
-    _TENSOR_MAP_CACHE.clear()
-
-
-def build_tensor_maps(
-    *,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    g: torch.Tensor,
-    ws_kd: torch.Tensor,
-    ws_qd: torch.Tensor,
-    ws_ak: torch.Tensor,
-    total_tokens: int,
-    total_chunks: int,
-    heads: int,
-) -> TensorMapSet:
-    """Build (and cache) prepare's descriptors.
-
-    Encoding the descriptors and copying them to the device costs far more than
-    a launch, so the set is cached on the tensor addresses and shape; a caller
-    that reuses its buffers hits after the first call.
-    """
-    rows = total_chunks * BT
-    # A 128-byte S128 segment is 32 FP32 or 64 BF16, so G's box follows its
-    # dtype; _encode already picks the TMA element type from it.
-    g_segment_elems = (
-        F32_SEGMENT_ELEMS if g.dtype is torch.float32 else BF16_SEGMENT_ELEMS
-    )
-    key = (
-        q.data_ptr(),
-        q.stride(),
-        k.data_ptr(),
-        k.stride(),
-        g.data_ptr(),
-        g.dtype,
-        ws_kd.data_ptr(),
-        ws_qd.data_ptr(),
-        ws_ak.data_ptr(),
-        total_tokens,
-        rows,
-        heads,
-    )
-    hit = _TENSOR_MAP_CACHE.get(q.device, key)
-    if hit is not None:
-        return hit
-
-    blobs = [
-        _activation_map(q, total_tokens, heads, BF16_SEGMENT_ELEMS),
-        _activation_map(k, total_tokens, heads, BF16_SEGMENT_ELEMS),
-        _activation_map(g, total_tokens, heads, g_segment_elems),
-        _factor_map(ws_kd, rows, heads),
-    ]
-    packed = bytearray()
-    for b in blobs:
-        packed += b
-    storage = upload_bytes(packed, q.device)
-    if storage.data_ptr() % 64 != 0:
-        raise RuntimeError("tensor map storage must be 64-byte aligned")
-
-    base = storage.data_ptr()
-    maps = TensorMapSet(
-        storage=storage,
-        q=base + 0 * DESCRIPTOR_BYTES,
-        k=base + 1 * DESCRIPTOR_BYTES,
-        g=base + 2 * DESCRIPTOR_BYTES,
-        factor=base + 3 * DESCRIPTOR_BYTES,
-    )
-    return _TENSOR_MAP_CACHE.put(q.device, key, maps, (storage,))
 
 
 # ---------------------------------------------------------------------------
@@ -1485,148 +1374,12 @@ def default_chunks_per_cta(device=None) -> int:
 # ---------------------------------------------------------------------------
 
 
-#: Destination buffer for ``exp2(A_log * log2e)``, one per ``(A_log, stream)``.
-#:
-#: This caches the *allocation*, not the computation.  Caching the result and
-#: skipping the arithmetic was tried and is wrong under ``torch.cuda.graph``: a
-#: cache hit during capture means the ``exp2`` is never recorded, so the graph
-#: reads a frozen buffer and a later in-place update to ``A_log`` -- an
-#: optimizer step -- replays with stale values and no error.  Writing into a
-#: reused buffer keeps the kernel in the stream, so capture records it and
-#: replay stays correct, while still avoiding the per-call allocation.
-_A_LOG_EXP: dict[tuple[int, int], tuple[weakref.ref, torch.Tensor, int]] = {}
-
-
-def _purge_for(key):
-    def _purge(_ref, _key=key):
-        _A_LOG_EXP.pop(_key, None)
-
-    return _purge
-
-
-def _a_log_exp_key(a_log: torch.Tensor) -> tuple[int, int]:
-    """Tensor identity plus the stream that will consume the writable buffer."""
-    stream = (
-        torch.cuda.current_stream(a_log.device).cuda_stream
-        if a_log.is_cuda and torch.cuda.is_available()
-        else 0
-    )
-    return id(a_log), stream
-
-
-def a_log_exp_for(
-    a_log: torch.Tensor,
-    log2e: float,
-    *,
-    out: torch.Tensor | None = None,
-    key: tuple[int, int] | None = None,
-) -> torch.Tensor:
-    """``exp2(a_log * log2e)`` in FP32, written into a reused buffer.
-
-    Keyed on a weak reference to ``a_log`` and on the current CUDA stream, so a
-    freed parameter drops its buffers and two streams never write the same
-    scratch concurrently.  ``out`` lets a cached launch plan refresh the exact
-    buffer whose pointer is baked into its argument tuple, even if the cache
-    was cleared or another plan replaced its entry.
-
-    ``key`` lets a caller that already knows its stream skip recomputing it.
-    :func:`_a_log_exp_key` asks the driver on every call, and neither half is
-    cheap: ``torch.cuda.current_stream()`` builds a Stream object through
-    several Python frames, and ``torch.cuda.is_available()`` reaches
-    ``os.getenv`` by way of nvml.  That host cost is exposed on shapes whose
-    kernels are too short to hide it.  A cached launch plan is pinned to one
-    stream and one ``A_log`` by construction, so for that caller the key is a
-    constant and belongs in the plan.
-    """
-    if key is None:
-        key = _a_log_exp_key(a_log)
-    cached = _A_LOG_EXP.get(key)
-    if cached is not None:
-        ref, buffer, version = cached
-        if ref() is a_log:
-            if out is None:
-                out = buffer
-            # `exp2(a_log * log2e)` is two dispatches and two kernels, mostly
-            # host overhead.  It only has to run when a_log has actually
-            # changed, and an optimizer step bumps the version counter.  A
-            # tensor with no counter -- anything created under inference_mode
-            # -- is rejected explicitly, so it recomputes rather than trusting
-            # an identity it cannot check.  The sentinel compares equal to
-            # itself, so testing it by value would not do that.
-            #
-            # Never skip inside a capture: the graph replays only what it
-            # recorded, so leaving exp2 out of it means a later parameter update
-            # is silently ignored on replay.
-            if (
-                out is buffer
-                and version is not NO_VERSION
-                and version == tensor_version(a_log)
-                and not capturing()
-            ):
-                return out
-        else:
-            _A_LOG_EXP.pop(key, None)
-
-    if out is None:
-        out = torch.empty_like(a_log, dtype=torch.float32)
-
-    torch.exp2(a_log.float() * log2e, out=out)
-    _A_LOG_EXP[key] = (
-        weakref.ref(a_log, _purge_for(key)),
-        out,
-        tensor_version(a_log),
-    )
-    return out
-
-
-def clear_launch_caches() -> None:
-    """Drop the ``A_log`` cache; for tests that assert on recomputation."""
-    _A_LOG_EXP.clear()
-
-
-@dataclass(frozen=True)
-class PreparePlan:
-    """Prepare's host-side work, done but not launched."""
-
-    tensor_maps: object
-    a_log_exp: torch.Tensor
-    grid_x: int
-
-
-def prepare_launch_plan(
-    *,
-    q,
-    k,
-    g,
-    A_log,
-    workspace,
-    total_tokens: int,
-    total_chunks: int,
-    heads: int,
-    config: PrepareConfig,
-) -> PreparePlan:
-    """Encode prepare's descriptors and derive its grid, without launching.
-
-    :func:`_build_plan` needs these before it can hand both kernels to one
-    compiled entry.  Everything here is cached on the buffer addresses, so a
-    steady-state call re-encodes nothing.
-    """
-
-    return PreparePlan(
-        tensor_maps=build_tensor_maps(
-            q=q,
-            k=k,
-            g=g,
-            ws_kd=workspace.kd,
-            ws_qd=workspace.qd,
-            ws_ak=workspace.ak,
-            total_tokens=total_tokens,
-            total_chunks=total_chunks,
-            heads=heads,
-        ),
-        a_log_exp=a_log_exp_for(A_log, LOG2_E),
-        grid_x=(total_chunks + config.chunks_per_cta - 1) // config.chunks_per_cta,
-    )
+# ``A_log`` reaches the prepare kernel as a raw address and the kernel takes
+# ``exp2(A_log * log2e)`` itself, as the fused variant does.  A host-side
+# ``exp2`` buffer would need a refresh decision per launch, and none is
+# right for every way a caller updates a parameter: a capture records only
+# what runs, an inference tensor has no version counter, and a write through
+# ``.data`` or a collective into the storage bumps none.
 
 
 # --------------------------------------------------------------------------
@@ -1912,7 +1665,7 @@ def prepare_kernel(
     # are read through their TMA descriptors only, and these three are indexed
     # element-wise, so a flat view over each address is all the kernel needs.
     gbeta = raw_tensor(cutlass.BFloat16, pbeta, 2)
-    ga_log_exp = raw_tensor(cutlass.Float32, palog, 4)
+    ga_log = raw_tensor(cutlass.Float32, palog, 4)
     gdt = raw_tensor(cutlass.Float32, pdt, 4)
     head = bidy
 
@@ -1987,7 +1740,13 @@ def prepare_kernel(
         my_chunks = cutlass.Int32(CPC)
 
     dt_value = cutlass.Float32(gdt[head * DK + tidx])
-    alog = cutlass.Float32(ga_log_exp[head])
+    # ``exp(A_log)`` from the parameter itself on every launch, so an update to
+    # it reaches the next launch or replay however it was written.
+    alog = cutlass.Float32(
+        cute.math.exp2(
+            cutlass.Float32(ga_log[head]) * cutlass.Float32(LOG2_E), fastmath=True
+        )
+    )
     row_in_warp = lane // 8
     lane_in_row = lane % 8
     my_token = warp_id * 4 + row_in_warp
@@ -2658,7 +2417,7 @@ class _DescriptorStaging:
 
     def __init__(self) -> None:
         self.slots = [
-            torch.empty(DESC_TABLE_BYTES, dtype=torch.uint8, pin_memory=True)
+            persistent_empty(DESC_TABLE_BYTES, dtype=torch.uint8, pin_memory=True)
             for _ in range(DESC_STAGING_SLOTS)
         ]
         self.events: list = [None] * DESC_STAGING_SLOTS
@@ -2666,6 +2425,9 @@ class _DescriptorStaging:
         self.lock = threading.Lock()
 
     def upload(self, image: bytearray, storage: torch.Tensor) -> None:
+        # One hold from checkout until the slot's event is published: released
+        # in between, a thread wrapping the ring to this slot would find no
+        # event to wait on and refill it under this upload's pending DMA.
         with self.lock:
             index = self.next
             self.next = (index + 1) % DESC_STAGING_SLOTS
@@ -2674,21 +2436,19 @@ class _DescriptorStaging:
                 pending.synchronize()
             slot = self.slots[index]
             self.events[index] = None
-        slot.copy_(torch.frombuffer(image, dtype=torch.uint8))
-        storage.copy_(slot, non_blocking=True)
-        if capturing():
-            # A captured H2D node reads its source at replay, so this slot can
-            # never be refilled: retire it from the ring for the process's
-            # lifetime and put a fresh one in its place.
-            with self.lock:
+            slot.copy_(torch.frombuffer(image, dtype=torch.uint8))
+            storage.copy_(slot, non_blocking=True)
+            if capturing():
+                # A captured H2D node reads its source at replay, so this slot
+                # can never be refilled: retire it from the ring for the
+                # process's lifetime and put a fresh one in its place.
                 _CAPTURED_TABLE_STAGING.append(slot)
-                self.slots[index] = torch.empty(
+                self.slots[index] = persistent_empty(
                     DESC_TABLE_BYTES, dtype=torch.uint8, pin_memory=True
                 )
-            return
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(storage.device))
-        with self.lock:
+                return
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(storage.device))
             self.events[index] = event
 
 
@@ -2750,7 +2510,8 @@ class DescriptorTable:
 
 
 def new_descriptor_table(device: torch.device, roles) -> DescriptorTable:
-    storage = torch.empty(DESC_TABLE_BYTES, dtype=torch.uint8, device=device)
+    # Rewritten by every re-point, possibly outside the mode it was made in.
+    storage = persistent_empty(DESC_TABLE_BYTES, dtype=torch.uint8, device=device)
     if storage.data_ptr() % 64:
         raise RuntimeError("tensor map storage must be 64-byte aligned")
     base = storage.data_ptr()
@@ -3409,7 +3170,7 @@ def recurrence_kernel(
 @cute.jit
 def _fwd_entry(
     # --- prepare inputs: raw addresses.  Q, K and G travel by descriptor
-    #     only; beta, exp2(A_log) and dt_bias are indexed element-wise.  Raw
+    #     only; beta, A_log and dt_bias are indexed element-wise.  Raw
     #     addresses rather than tensors so a plan can be re-pointed at new
     #     buffers per call without a DLPack conversion per tensor.
     pbeta: cutlass.Int64,
@@ -3557,25 +3318,21 @@ class FwdCall:
 
     Everything in ``args`` is either a scalar fixed by the shape or a device
     tensor whose address the caller keeps alive, so a repeated call with the
-    same buffers can skip the whole host path and go straight to ``run``.  The
-    one thing that must not be frozen is ``a_log_exp``: its *buffer* is reused
-    but its contents are recomputed per call, since ``A_log`` is a parameter an
-    optimizer updates between steps.  ``run`` therefore refreshes it and only
-    then launches; freezing it would make a captured graph replay stale
-    values (see ``_A_LOG_EXP``).
+    same buffers can skip the whole host path and go straight to ``run``.
+    ``A_log`` travels as an address like the activations, and the kernel takes
+    its ``exp2`` on every launch, so no host copy of a parameter can go stale;
+    the only host-derived inputs are the offsets' tables and grid, which the
+    memo keys on.
     """
 
     __slots__ = (
         "args",
         "compiled",
-        "a_log",
-        "a_log_exp",
         "launch_lock",
         "table",
         "ptr_slots",
         "geometry",
         "workspace",
-        "_a_log_key",
         "_keepalive",
     )
 
@@ -3583,8 +3340,6 @@ class FwdCall:
         self,
         args,
         compiled,
-        a_log,
-        a_log_exp,
         launch_lock,
         keepalive=(),
         table=None,
@@ -3601,16 +3356,7 @@ class FwdCall:
         self.geometry = geometry
         self.workspace = workspace
         self.compiled = compiled
-        self.a_log = a_log
-        self.a_log_exp = a_log_exp
         self.launch_lock = launch_lock
-        # This plan is pinned to one stream -- the ``PlanMemo`` keys on it, so
-        # a plan is never replayed from another stream -- and to
-        # one ``A_log``, which it holds a reference to.  Its ``_A_LOG_EXP`` key
-        # is therefore a constant; recomputing it per call is driver and
-        # ``os.getenv`` traffic that short shapes cannot hide (see
-        # :func:`a_log_exp_for`).
-        self._a_log_key = None if a_log is None else _a_log_exp_key(a_log)
         # The descriptor addresses in ``args`` are raw integers into buffers
         # owned by the descriptor caches.  Clearing one of those caches -- which
         # a test does deliberately, and eviction does on its own -- would free
@@ -3619,18 +3365,11 @@ class FwdCall:
         self._keepalive = keepalive
 
     def run(self) -> None:
-        # The lock spans the refresh plus the whole compiled host entry.  The
-        # latter returns only after prepare and recurrence have both been
-        # submitted, so another host thread cannot enqueue a prepare between
-        # this call's prepare and recurrence while sharing the workspace.
+        # The lock spans the whole compiled host entry, which returns only after
+        # prepare and recurrence have both been submitted, so another host
+        # thread cannot enqueue a prepare between this call's prepare and
+        # recurrence while sharing the workspace.
         with self.launch_lock:
-            # Callers that pass a pre-refreshed buffer without its source
-            # tensor still need the workspace lock; only the refresh is
-            # conditional.
-            if self.a_log is not None:
-                a_log_exp_for(
-                    self.a_log, LOG2_E, out=self.a_log_exp, key=self._a_log_key
-                )
             self.compiled(*self.args)
 
 
@@ -3638,7 +3377,7 @@ def launch_fwd(
     *,
     beta,
     v,
-    a_log_exp,
+    a_log,
     dt_bias,
     cu_seqlens,
     cu_chunks,
@@ -3659,7 +3398,6 @@ def launch_fwd(
     has_state_in,
     has_state_out,
     state_fp32,
-    a_log=None,
     build_only: bool = False,
     geometry=None,
 ):
@@ -3676,10 +3414,10 @@ def launch_fwd(
 
     # Raw addresses for the caller's activations, at fixed positions so a
     # re-point is an item assignment; views only for the plan's own buffers.
-    ptr_slots = {"beta": 0, "a_log_exp": 1, "dt_bias": 2, "out": 11, "v": 12}
+    ptr_slots = {"beta": 0, "a_log": 1, "dt_bias": 2, "out": 11, "v": 12}
     args = [
         cutlass.Int64(beta.data_ptr()),
-        cutlass.Int64(a_log_exp.data_ptr()),
+        cutlass.Int64(a_log.data_ptr()),
         cutlass.Int64(dt_bias.data_ptr()),
         flat_view(cu_seqlens),
         flat_view(cu_chunks),
@@ -3757,10 +3495,8 @@ def launch_fwd(
     call = FwdCall(
         args,
         compiled,
-        a_log,
-        a_log_exp,
         workspace.launch_lock,
-        keepalive=(table, workspace, a_log_exp),
+        keepalive=(table, workspace),
         table=table,
         ptr_slots=ptr_slots,
         geometry=geometry,
@@ -3811,10 +3547,7 @@ def clear_caches() -> None:
     """Drop every cache this variant owns."""
     _MEMO.clear()
     clear_prepare_workspaces()
-    clear_metadata_cache()
-    clear_prepare_descriptor_cache()
     clear_recurrence_descriptor_cache()
-    clear_launch_caches()
     clear_fwd_cache()
 
 
@@ -3970,7 +3703,11 @@ def run(
         cu_seqlens,
     )
 
-    scalars = (float(scale), float(lower_bound))
+    # The offsets' content is part of the key, not only the caller's tensor:
+    # the plan bakes in tables derived from that content, and once the offsets
+    # identity cache evicts the caller's tensor nothing keeps it alive, so its
+    # address can come back holding other boundaries.
+    scalars = (float(scale), float(lower_bound), offsets.host)
     plan = _MEMO.fast_path(q.device, tensors, scalars, resources)
     if plan is None:
         key = _MEMO.identity(q.device, tensors, scalars, resources)
@@ -3979,7 +3716,7 @@ def run(
         # arena, a descriptor cache and a DSL compiler session, and none of the
         # three tolerates it.
         with _MEMO.build_lock:
-            plan = _MEMO.get(key)
+            plan = _MEMO.get(key, resources)
             if plan is None:
                 plan = _build_plan(
                     q=q,
@@ -4081,10 +3818,10 @@ def rebind(
     The plan was built for tensors of exactly these shapes, strides and dtypes
     and for these offsets; only the addresses may differ, and only the
     address-bearing parts are redone: the descriptors of Q, K, G, V, out and
-    the states are re-encoded and the table uploaded on the launch stream, the
-    raw-address arguments are reassigned, and ``exp2(A_log)`` is taken from
-    its per-parameter buffer.  A call whose addresses already match the table
-    skips the encode and the upload.
+    the states are re-encoded and the table uploaded on the launch stream, and
+    the raw-address arguments -- beta, ``A_log``, ``dt_bias``, out and V -- are
+    reassigned.  A call whose addresses already match the table skips the
+    encode and the upload.
 
     What is re-checked here is what a change of address can break: TMA base
     alignment and the aliasing rules.  Shapes and dtypes are the caller's
@@ -4145,21 +3882,17 @@ def rebind(
         table.bound = addresses
 
     device = out.device
-    a_log_exp = a_log_exp_for(
-        A_log, LOG2_E, key=(id(A_log), current_stream_ptr(device))
-    )
-    plan.a_log_exp = a_log_exp
     slots = plan.ptr_slots
     args = plan.args
     args[slots["beta"]] = cutlass.Int64(pbeta.data_ptr())
-    args[slots["a_log_exp"]] = cutlass.Int64(a_log_exp.data_ptr())
+    args[slots["a_log"]] = cutlass.Int64(A_log.data_ptr())
     args[slots["dt_bias"]] = cutlass.Int64(dt_bias.data_ptr())
     args[slots["out"]] = cutlass.Int64(pout.data_ptr())
     args[slots["v"]] = cutlass.Int64(pv.data_ptr())
     # A no-op for buffers allocated on the launch stream; for any other, the
     # allocator now waits for this stream before recycling them.
     record_stream_once(
-        (pq, pk, pv, pg, pbeta, pout, dt_bias, initial_state, final_state, a_log_exp),
+        (pq, pk, pv, pg, pbeta, pout, A_log, dt_bias, initial_state, final_state),
         torch.cuda.current_stream(device),
     )
 
@@ -4302,7 +4035,6 @@ def _build_plan(
         0 if final_state is None else final_state.data_ptr(),
     )
 
-    a_log_exp = a_log_exp_for(A_log, LOG2_E)
     record_stream_once(
         (
             pv,
@@ -4323,13 +4055,10 @@ def _build_plan(
     # rather than per-token and therefore flat in T.
     rec_grid = recurrence_grid(sequences, heads)
     call = launch_fwd(
-        # ``a_log`` deliberately not passed: :func:`rebind` refreshes the
-        # exp2(A_log) buffer per call from its per-parameter cache, so the
-        # plan's own refresh would only repeat it.
         build_only=True,
         beta=pbeta,
         v=pv,
-        a_log_exp=a_log_exp,
+        a_log=A_log,
         dt_bias=dt_bias,
         cu_seqlens=meta.cu_seqlens,
         cu_chunks=meta.cu_chunks,
@@ -4357,13 +4086,14 @@ def _build_plan(
     if resources is not None:
         # Replay never re-enters Python, so everything the capture recorded has
         # to stay alive at its captured address for the workspace's lifetime.
-        resources.pin(
+        # This build rewrote the workspace's tables, so it is now the only plan
+        # the workspace serves.
+        resources.adopt(
             call,
             call.compiled,
             table,
             table.storage,
             workspace,
-            a_log_exp,
             meta,
             offsets,
             offsets.canonical,
