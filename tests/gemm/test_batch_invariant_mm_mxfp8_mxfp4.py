@@ -1508,6 +1508,27 @@ def test_the_two_instructions_are_two_classes():
 
 
 @needs_device
+def test_caller_output_aliasing_an_operand_is_refused_on_the_public_path():
+    """Only the entry's own fresh output skips the aliasing check: a caller's output over the activation's bytes is refused
+    through ``flashinfer.mm_mxfp8_mxfp4`` as through the direct entry."""
+    M, N, K = 16, 4096, 4096
+    a, sfa = adv_mx8(M, K, 181)
+    b, sfb = weight(N, K, 182)
+    ref = bits(mm(a, b, sfa, sfb))
+    buf = torch.empty(M * max(2 * N, K), dtype=torch.uint8, device="cuda")
+    alias_a = buf[: M * K].view(E4).view(M, K)
+    alias_out = buf[: 2 * M * N].view(torch.bfloat16).view(M, N)
+    for call in (flashinfer.mm_mxfp8_mxfp4, mm):
+        with pytest.raises(
+            bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+        ):
+            call(alias_a, b, sfa, sfb, None, torch.bfloat16, out=alias_out)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    assert flashinfer.mm_mxfp8_mxfp4(a, b, sfa, sfb, None, torch.bfloat16, out) is out
+    assert torch.equal(bits(out), ref)
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     a, sfa = adv_mx8(16, 4096, 121)
     b, sfb = weight(4096, 4096, 122)

@@ -20,14 +20,16 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_config import (
     Sm100_Bf16_Cutedsl_MegaMoeConfigBase,
 )
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import MegaMoEBf16Mxfp8Config
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+    MegaMoEBf16Mxfp8Config,
+)
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.autotune import (
     bf16_mxfp8_candidates,
 )
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16_mxfp8 import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.bf16_mxfp8 import (
     MegaMoEBf16Mxfp8Frontend,
 )
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.tuner import (
     default_knobs,
     is_valid_bf16_mxfp8,
 )
@@ -149,7 +151,7 @@ def test_mixed_frontend_rejects_unsupported_knobs():
 def test_mixed_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16_mxfp8
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import bf16_mxfp8
 
     def fake_zeros(shape, dtype):
         tensor = torch.zeros(shape, dtype=dtype)
@@ -182,7 +184,7 @@ def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
     """An ikr + dispatch-warp session must still accept pinned perf knobs."""
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16_mxfp8
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import bf16_mxfp8
 
     def fake_zeros(shape, dtype):
         tensor = torch.zeros(shape, dtype=dtype)
@@ -220,7 +222,7 @@ def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
 def test_mixed_factory_rejects_unpermitted_pinned_ikr(monkeypatch):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16_mxfp8
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import bf16_mxfp8
 
     monkeypatch.setattr(
         bf16_mxfp8, "sym_zeros", lambda shape, dtype: torch.zeros(shape, dtype=dtype)
@@ -255,7 +257,7 @@ def test_mixed_frontend_rejects_unpermitted_ikr_knobs():
 @pytest.mark.cpu_only
 @cuda_13_required
 def test_mixed_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import autotune
 
     frontend = MegaMoEBf16Mxfp8Frontend(_config())
     valid = default_knobs(8, dtype="bf16_mxfp8")

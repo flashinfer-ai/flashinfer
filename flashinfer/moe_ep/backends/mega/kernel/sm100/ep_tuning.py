@@ -113,7 +113,9 @@ class BlackwellEpTuningMixin:
         if hasattr(workspace, "_frontend"):
             knobs = _legacy_knobs(workspace._frontend.config)
         else:
-            from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import knob_keys
+            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning import (
+                knob_keys,
+            )
 
             knobs = {
                 name: getattr(workspace.config, name)
@@ -130,7 +132,9 @@ class BlackwellEpTuningMixin:
         name = type(frontend.config).__name__
         if name == "MegaMoEBf16Nvfp4Config":
             import torch
-            from .....cute_dsl.megamoe.bf16_nvfp4.frontend import MegaMoEBf16Nvfp4Inputs
+            from flashinfer.moe_ep.kernels.flashinfer.bf16_nvfp4.frontend import (
+                MegaMoEBf16Nvfp4Inputs,
+            )
 
             staging = workspace._staging_inputs
             n = workspace.num_max_tokens if staging is None else staging[0].shape[0]
@@ -155,12 +159,11 @@ class BlackwellEpTuningMixin:
                 )
             )
             return
-        from .....kernel_src.sm100 import cutedsl_megamoe as api
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import pre_unification as api
 
         launchers = {
             "MegaMoEBf16Config": api.bf16_mega_launch_thunk,
             "MegaMoENvfp4Config": api.nvfp4_mega_launch_thunk,
-            "MegaMoEMxfp8Config": api.mxfp8_mega_launch_thunk,
             "MegaMoEBf16Mxfp8Config": api.bf16_mxfp8_mega_launch_thunk,
         }
         launchers[name](*weights, workspace)
@@ -174,7 +177,7 @@ class BlackwellEpTuningMixin:
             return
         from flashinfer.autotuner import AutoTuner
         from .forward_tuning import ForwardExecution
-        from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning_protocol import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources.tuning_protocol import (
             NAMESPACE,
             BlackwellTuningProtocol,
         )

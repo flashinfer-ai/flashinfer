@@ -4,6 +4,7 @@ import io
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -18,7 +19,16 @@ sys.path.insert(0, str(CHECKS))
 import ai_test_scope as scope
 
 WORKFLOW_TEXT = (ROOT / ".github/workflows/ci-bot-commands.yml").read_text()
+NOTE_MARKER = "<!-- flashinfer-bot:ci-bot-commands-note -->"
 PR_WORKFLOW_TEXT = (ROOT / ".github/workflows/pr-test.yml").read_text()
+
+
+def job_block(name, workflow_text=PR_WORKFLOW_TEXT):
+    return re.split(
+        r"(?m)^  [\w-]+:\n",
+        workflow_text.split(f"\n  {name}:\n", 1)[1],
+        maxsplit=1,
+    )[0]
 
 
 def step_block(name, workflow_text=WORKFLOW_TEXT):
@@ -331,6 +341,113 @@ class BotWorkflowTests(unittest.TestCase):
                         f"authorized={str(authorized).lower()}\n", output.read_text()
                     )
 
+    def test_bot_account_runs_only_single_line_commands_without_lookups(self):
+        # Automation posts exactly one command line with the bot token. Other
+        # services post as the same account and echo outsider-controlled text,
+        # so any other shape must be refused without consulting the account's
+        # (admin) repository role.
+        cases = (
+            ("@flashinfer-bot run tests/attention/test_rope.py tests/moe", True),
+            ("@flashinfer-bot run all\r\n", True),
+            ("\n  @FlashInfer-Bot rerun failed  \n\n", True),
+            ("@flashinfer-bot stop", True),
+            # CI report quoting a test classname set by PR code.
+            (
+                "- `tests.attention.test_x\n@flashinfer-bot run all\n` - 1 failure",
+                False,
+            ),
+            # Reply quoting a whole multi-line comment.
+            (
+                "**Unknown Command**\n\nCommand `/bot status\n@flashinfer-bot run all\nthanks` is not recognized.",
+                False,
+            ),
+            # AI note with a model reason on its own line.
+            (
+                "**AI could not determine a test scope**\n\n@flashinfer-bot run all\n\nNo CI pipeline was started.",
+                False,
+            ),
+            ("@flashinfer-bot run all\n@flashinfer-bot stop", False),
+            ("please @flashinfer-bot run all", False),
+            ("@flashinfer-bot running", False),
+            ("", False),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            called = directory / "gh-called"
+            gh = directory / "gh"
+            # Any lookup is recorded; the bot path must never need one.
+            gh.write_text(
+                "#!" + sys.executable + "\nimport pathlib, sys\n"
+                f"pathlib.Path({str(called)!r}).touch()\n"
+                "print('admin')\n"
+            )
+            gh.chmod(0o755)
+            for body, authorized in cases:
+                for token in ("token", ""):
+                    with self.subTest(body=body, has_token=bool(token)):
+                        output = directory / "output"
+                        output.unlink(missing_ok=True)
+                        result = subprocess.run(
+                            [
+                                "bash",
+                                "-euo",
+                                "pipefail",
+                                "-c",
+                                step("Check permission"),
+                            ],
+                            env=dict(
+                                os.environ,
+                                PATH=str(directory) + ":" + os.environ["PATH"],
+                                GH_TOKEN=token,
+                                ORG="owner",
+                                TEAM="ci-users",
+                                ACTOR="flashinfer-bot",
+                                REPO="owner/repo",
+                                COMMENT_BODY=body,
+                                RUNNER_TEMP=str(directory),
+                                GITHUB_OUTPUT=str(output),
+                            ),
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(0, result.returncode, result.stderr)
+                        self.assertEqual(
+                            f"authorized={str(authorized).lower()}\n",
+                            output.read_text(),
+                        )
+                        self.assertFalse(called.exists())
+
+    def test_generated_notes_never_contain_a_live_command(self):
+        # Model text reaches the note's reason line. Repeated "@"s must not
+        # survive mention stripping as a fresh command at the start of a line.
+        for reason in (
+            "@@flashinfer-bot run all",
+            "@@@FlashInfer-Bot rerun",
+            "@flashinfer-bot stop",
+            "prefix @@flashinfer-bot run tests/moe",
+        ):
+            with self.subTest(reason=reason):
+                prose = scope._public_prose(reason)
+                self.assertNotRegex(prose, r"(?i)@flashinfer-bot")
+                note = scope.TargetSelection(
+                    [], outcome="needs_maintainer", reason=prose
+                ).note("a" * 40)
+                with tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / "output"
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", step("Parse command")],
+                        env=dict(
+                            os.environ,
+                            COMMENT_BODY=note,
+                            RUNNER_TEMP=directory,
+                            GITHUB_OUTPUT=str(output),
+                        ),
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertEqual("command=unknown\n", output.read_text())
+
     def test_parser_ignores_quoted_inline_fenced_and_prose_mentions(self):
         for body in (
             "> @flashinfer-bot run",
@@ -439,7 +556,11 @@ class BotWorkflowTests(unittest.TestCase):
         calls, _ = self.run_workflow(SCOPE_MODE="advisory")
         self.assertTrue(any(args[:2] == ["pr", "comment"] for args in calls))
         comment = next(args for args in calls if args[:2] == ["pr", "comment"])
-        self.assertIn("body=AI scope recommendation; review before running", comment)
+        body = next(arg for arg in comment if arg.startswith("body="))
+        self.assertTrue(
+            body.startswith("body=AI scope recommendation; review before running")
+        )
+        self.assertTrue(body.rstrip().endswith(NOTE_MARKER))
         self.assertFalse(any("/statuses/" in arg for args in calls for arg in args))
         self.assertFalse(any(args[:2] == ["pr", "edit"] for args in calls))
 
@@ -521,9 +642,40 @@ class BotWorkflowTests(unittest.TestCase):
         self.assertEqual("@flashinfer-bot run", command)
         self.assertTrue(any("--add-label" in args for args in calls))
 
-    def test_job_excludes_its_own_posting_account(self):
+    def test_job_runs_bot_commands_but_skips_its_own_marked_notes(self):
         job_guard = WORKFLOW_TEXT.split("    if: |\n", 1)[1].split("    runs-on:", 1)[0]
-        self.assertIn("github.event.comment.user.login != 'flashinfer-bot'", job_guard)
+        # The bot account's commands must reach the handler (automation that
+        # holds its token starts CI); only this job's own notes are skipped.
+        self.assertNotIn("user.login != 'flashinfer-bot'", job_guard)
+        self.assertIn(
+            "!(github.event.comment.user.login == 'flashinfer-bot' &&\n"
+            f"        contains(github.event.comment.body, '{NOTE_MARKER}'))",
+            job_guard,
+        )
+        handler = step("Handle @flashinfer-bot run")
+        self.assertIn(f"NOTE_MARKER='{NOTE_MARKER}'", handler)
+
+    def test_every_posted_note_carries_the_guard_marker(self):
+        for settings in (
+            {},
+            {"SCOPE_MODE": "advisory"},
+            {"SELECT_FAIL": "1", "FAIL_NOTE": "Rejected: bad path."},
+            {"SELECT_FAIL": "1", "FAIL_NOTE": ""},
+            {"HEAD_MOVED": "1"},
+            {"LABEL_ADD_FAIL": "1"},
+            {"SCOPE_MODE": "advisory", "COMMENT_FAIL": "1"},
+        ):
+            with self.subTest(**settings):
+                calls, _ = self.run_workflow(**settings)
+                comments = [args for args in calls if args[:2] == ["pr", "comment"]]
+                self.assertTrue(comments)
+                for comment in comments:
+                    body = next(arg for arg in comment if arg.startswith("body="))
+                    self.assertTrue(body.rstrip().endswith(NOTE_MARKER), body)
+        # Outside the run step the workflow posts reactions only, never comments.
+        handler = step_block("Handle @flashinfer-bot run")
+        rest = WORKFLOW_TEXT.replace(handler, "")
+        self.assertNotIn("pr comment", rest)
 
     def test_key_is_only_exposed_to_the_authorized_run_step(self):
         handler = step_block("Handle @flashinfer-bot run")
@@ -653,40 +805,156 @@ class MergeSnapshotWorkflowTests(unittest.TestCase):
         self.assertIn("snapshot_tree=" + self.tree, output)
         self.assertIn("checkout_sha=" + self.head, output)
 
-    def test_gpu_source_preparation_recovers_shallow_head_ancestry(self):
+    def test_source_preparation_recovers_shallow_head_ancestry(self):
+        for job in ("test", "spec-lint"):
+            job_text = job_block(job)
+            checkout = job_text.split("uses: actions/checkout@", 1)[1].split(
+                "\n      - ", 1
+            )[0]
+            # Submodules must come from the verified tree, not the unmerged head.
+            self.assertNotIn("submodules:", checkout)
+            for use_snapshot in (True, False):
+                with (
+                    self.subTest(job=job, snapshot=use_snapshot),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    clone = Path(directory) / "checkout"
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "--depth=1",
+                            "--branch=pr",
+                            self.repo.as_uri(),
+                            str(clone),
+                        ],
+                        check=True,
+                        capture_output=True,
+                    )
+                    result = subprocess.run(
+                        [
+                            "bash",
+                            "-euo",
+                            "pipefail",
+                            "-c",
+                            step("Prepare selected source and submodules", job_text),
+                        ],
+                        cwd=clone,
+                        env=dict(
+                            os.environ,
+                            SELECTED_BASE=self.base if use_snapshot else "",
+                            SELECTED_TREE=self.tree if use_snapshot else "",
+                        ),
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    expected = self.tree if use_snapshot else self.head + "^{tree}"
+                    expected_tree = subprocess.check_output(
+                        ["git", "rev-parse", expected], cwd=self.repo, text=True
+                    ).strip()
+                    tree = subprocess.check_output(
+                        ["git", "rev-parse", "HEAD^{tree}"], cwd=clone, text=True
+                    ).strip()
+                    self.assertEqual(expected_tree, tree)
+                    self.assertTrue((clone / "pr.txt").exists())
+                    self.assertEqual(
+                        "advanced base\n" if use_snapshot else "base\n",
+                        (clone / "base.txt").read_text(),
+                    )
+
+    def test_source_preparation_verifies_tree_before_initializing_submodules(self):
         with tempfile.TemporaryDirectory() as directory:
-            clone = Path(directory) / "checkout"
-            subprocess.run(
-                [
-                    "git",
-                    "clone",
-                    "--depth=1",
-                    "--branch=pr",
-                    self.repo.as_uri(),
-                    str(clone),
-                ],
-                check=True,
-                capture_output=True,
+            directory = Path(directory)
+            library = directory / "library"
+            library.mkdir()
+
+            def git(repo, *args):
+                return subprocess.check_output(
+                    ["git", "-C", str(repo), *args],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+
+            git(library, "init", "--initial-branch=main")
+            git(library, "config", "user.name", "CI Snapshot Test")
+            git(library, "config", "user.email", "snapshot@example.invalid")
+            (library / "version.txt").write_text("old\n")
+            git(library, "add", ".")
+            git(library, "commit", "-m", "old dependency")
+            source = directory / "source"
+            git(self.repo, "clone", self.repo.as_uri(), str(source))
+            git(source, "config", "user.name", "CI Snapshot Test")
+            git(source, "config", "user.email", "snapshot@example.invalid")
+            git(source, "checkout", "-B", "pr", self.head)
+            git(
+                source,
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(library),
+                "dependency",
             )
-            result = subprocess.run(
-                [
-                    "bash",
-                    "-euo",
-                    "pipefail",
-                    "-c",
-                    step("Prepare selected source and submodules", PR_WORKFLOW_TEXT),
-                ],
-                cwd=clone,
-                env=dict(os.environ, SELECTED_BASE=self.base, SELECTED_TREE=self.tree),
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(0, result.returncode, result.stderr)
-            tree = subprocess.check_output(
-                ["git", "rev-parse", "HEAD^{tree}"], cwd=clone, text=True
-            ).strip()
-            self.assertEqual(self.tree, tree)
-            self.assertTrue((clone / "pr.txt").exists())
+            git(source, "commit", "-am", "add dependency")
+            head = git(source, "rev-parse", "HEAD")
+            head_tree = git(source, "rev-parse", "HEAD^{tree}")
+            (library / "version.txt").write_text("new\n")
+            git(library, "commit", "-am", "new dependency")
+            revision = git(library, "rev-parse", "HEAD")
+            git(source, "checkout", "-b", "selected-base")
+            git(source / "dependency", "fetch", "origin")
+            git(source / "dependency", "checkout", revision)
+            git(source, "commit", "-am", "advance dependency")
+            base = git(source, "rev-parse", "HEAD")
+            tree = git(source, "rev-parse", "HEAD^{tree}")
+
+            for job in ("test", "spec-lint"):
+                for expected_tree in (tree, head_tree):
+                    with self.subTest(job=job, matching_tree=expected_tree == tree):
+                        clone = directory / f"{job}-{expected_tree}"
+                        git(
+                            source,
+                            "clone",
+                            "--depth=1",
+                            "--branch=pr",
+                            source.as_uri(),
+                            str(clone),
+                        )
+                        self.assertEqual(head, git(clone, "rev-parse", "HEAD"))
+                        result = subprocess.run(
+                            [
+                                "bash",
+                                "-euo",
+                                "pipefail",
+                                "-c",
+                                step(
+                                    "Prepare selected source and submodules",
+                                    job_block(job),
+                                ),
+                            ],
+                            cwd=clone,
+                            env=dict(
+                                os.environ,
+                                SELECTED_BASE=base,
+                                SELECTED_TREE=expected_tree,
+                                # Only this local fixture uses file:// submodules.
+                                GIT_ALLOW_PROTOCOL="file",
+                            ),
+                            capture_output=True,
+                            text=True,
+                        )
+                        if expected_tree == tree:
+                            self.assertEqual(0, result.returncode, result.stderr)
+                            self.assertEqual(
+                                revision, git(clone / "dependency", "rev-parse", "HEAD")
+                            )
+                            self.assertEqual(
+                                "new\n", (clone / "dependency/version.txt").read_text()
+                            )
+                        else:
+                            self.assertNotEqual(0, result.returncode)
+                            self.assertFalse((clone / "dependency/.git").exists())
 
     def test_stale_or_malformed_automatic_snapshots_fail_before_scheduling(self):
         correct = self.snapshot_description()

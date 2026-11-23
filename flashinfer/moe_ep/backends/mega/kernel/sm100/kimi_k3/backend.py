@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 
 def _shim():
-    from ......kernel_src.sm100 import _kimi_k3_megamoe
+    from flashinfer.moe_ep.shims.sm100 import kimi_k3 as _kimi_k3_megamoe
 
     return _kimi_k3_megamoe
 

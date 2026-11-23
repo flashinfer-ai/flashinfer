@@ -17,10 +17,10 @@ Toggled by ``use_2cta`` in the constructor:
                               cta_n ∈ [16, 256] step 16; each cluster of 2
                               CTAs jointly computes one (2*cta_m, cta_n) tile.
 
-Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 GEMM:
+Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 (or fp32) GEMM:
   A:  (M, K, L)  K-major,  bf16
   B:  (N, K, L)  K-major,  bf16
-  C:  (M, N, L)  M-major,  bf16
+  C:  (M, N, L)  M-major,  bf16 or fp32
 
 ## Warp specialization (8 warps, 256 threads/CTA; warp 3 idle)
   Warp 0     DMA_A   TMA-loads A tiles into sA[..., stage]
@@ -245,9 +245,12 @@ class TgvGemmCuteExtKernel:
         arch: str = "sm_100",
         # Store the tile into peer buffers instead of ``c``.
         peer_store: Optional[LamportPeerStoreConfig] = None,
+        # Only names the kernel; the epilogue casts to ``c``'s element type.
+        out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ):
         self.peer_store = peer_store
         self.acc_dtype = acc_dtype
+        self.out_dtype = out_dtype
         self.cta_m = cta_m
         self.cta_n = cta_n
         self.cta_k = cta_k
@@ -288,6 +291,16 @@ class TgvGemmCuteExtKernel:
             self.mma_tiler_mn = (cta_m, cta_n)
             self.cta_group = tcgen05.CtaGroup.ONE
             self.tma_op = cute_ext.OperationTypeEnum.SM90_TMA_LOAD
+
+    def __repr__(self) -> str:
+        # The generated kernel name embeds this, so profiles show the config.
+        return (
+            f"TgvGemmCuteExtKernel_cta{self.cta_m}x{self.cta_n}x{self.cta_k}"
+            f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
+            f"_bias{int(self.has_bias)}"
+            f"_out{self.out_dtype.__name__.lower()}"
+            f"{'' if self.peer_store is None else '_peer'}"
+        )
 
     @cute.experimental.jit
     def __call__(
@@ -1198,6 +1211,10 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float16: cutlass.Float16,
 }
+_TORCH_TO_CUTLASS_OUT_DTYPE = {
+    **_TORCH_TO_CUTLASS_DTYPE,
+    torch.float32: cutlass.Float32,
+}
 
 # Per-process cache mapping (dtype, config…) → compiled cute_ext callable.
 # We need to construct concrete cute.Tensors once and reuse the resulting
@@ -1234,7 +1251,12 @@ def _make_layout_tensor(
 
 
 def _make_compile_repr_tensors(
-    dtype: torch.dtype, has_bias: bool, a_leading: int, b_leading: int, c_leading: int
+    dtype: torch.dtype,
+    c_dtype: torch.dtype,
+    has_bias: bool,
+    a_leading: int,
+    b_leading: int,
+    c_leading: int,
 ):
     """Build representative tensors with strides matching the requested
     leading-dim pattern. After the A↔B swap, the cute_ext kernel sees:
@@ -1256,7 +1278,7 @@ def _make_compile_repr_tensors(
         (L, K, M), dtype, b_leading
     )  # kernel B shape (L, K, M_pt)
     C_t = _make_layout_tensor(
-        (L, N, M), dtype, c_leading
+        (L, N, M), c_dtype, c_leading
     )  # kernel C shape (L, N_pt, M_pt)
 
     a_ = from_dlpack(A_t, assumed_align=32).mark_layout_dynamic(leading_dim=a_leading)
@@ -1276,6 +1298,7 @@ def _make_compile_repr_tensors(
 
 def _get_compiled_cute_ext_kernel(
     dtype: torch.dtype,
+    c_dtype: torch.dtype,
     cta_m: int,
     cta_n: int,
     cta_k: int,
@@ -1299,6 +1322,7 @@ def _get_compiled_cute_ext_kernel(
     """
     key = (
         dtype,
+        c_dtype,
         cta_m,
         cta_n,
         cta_k,
@@ -1320,6 +1344,10 @@ def _get_compiled_cute_ext_kernel(
         raise ValueError(
             f"TGV cute_ext backend supports {list(_TORCH_TO_CUTLASS_DTYPE)}; got {dtype}."
         )
+    if c_dtype not in _TORCH_TO_CUTLASS_OUT_DTYPE:
+        raise ValueError(
+            f"TGV cute_ext output supports {list(_TORCH_TO_CUTLASS_OUT_DTYPE)}; got {c_dtype}."
+        )
 
     gemm = TgvGemmCuteExtKernel(
         acc_dtype=cutlass.Float32,
@@ -1332,10 +1360,12 @@ def _get_compiled_cute_ext_kernel(
         has_bias=has_bias,
         arch=arch,
         peer_store=peer_store,
+        out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
         dtype,
+        c_dtype,
         has_bias,
         a_leading,
         b_leading,
@@ -1500,6 +1530,7 @@ def run_tgv_cute_ext(
 
     compiled = _get_compiled_cute_ext_kernel(
         dtype=a.dtype,
+        c_dtype=out.dtype,
         cta_m=cta_m,
         cta_n=cta_n,
         cta_k=_TGV_CUTE_EXT_CTA_K,
