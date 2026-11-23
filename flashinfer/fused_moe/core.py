@@ -94,6 +94,7 @@ from .shared.inputs import (
     unpack_trtllm_moe_output as _unpack_trtllm_moe_output,
 )
 from .shared.validation import (
+    resolve_moe_act_sf_layout,
     validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
 )
 
@@ -107,7 +108,11 @@ from .prepare import (
     interleave_moe_weights_for_sm90_mixed_gemm as interleave_moe_weights_for_sm90_mixed_gemm,
 )
 from .prepare import W4A16_SM80_TACTICS, _w4a16_records_geometry
-from . import trtllm_gen_routing as tgr
+from .trtllm_gen_routing import (
+    _check_trtllm_gen_routing_supported,
+    _max_num_ctas_in_batch_dim,
+    get_trtllm_gen_routing_module,
+)
 from ..utils import (
     check_shape_dtype_device,
     device_support_pdl,
@@ -2658,14 +2663,14 @@ def _trtllm_routing_sm80(
     tile, so one gather gives its expert; without ``gather``, the slots, weights and each slot's
     expert."""
     method = RoutingMethodType(routing_method_type)
-    tgr._check_trtllm_gen_routing_supported(routing_logits, routing_bias, method, top_k)
+    _check_trtllm_gen_routing_supported(routing_logits, routing_bias, method, top_k)
     device, (tokens, experts) = routing_logits.device, routing_logits.shape
     k, all_experts = (n + num_fused_shared_experts for n in (top_k, experts))
-    ctas = tgr._max_num_ctas_in_batch_dim(tokens, k, all_experts, 1)
+    ctas = _max_num_ctas_in_batch_dim(tokens, k, all_experts, 1)
     i32 = functools.partial(torch.empty, dtype=torch.int32, device=device)
     slots, expert_of_slot = i32(tokens * k), i32(ctas)
     weights = torch.empty((tokens, k), dtype=torch.bfloat16, device=device)
-    tgr.get_trtllm_gen_routing_module().trtllm_gen_routing(
+    get_trtllm_gen_routing_module().trtllm_gen_routing(
         routing_logits, routing_bias, i32(tokens * k), weights, i32(max(2 * all_experts, 512)),
         i32(1), slots, i32(ctas), expert_of_slot, i32(ctas), i32(1), top_k,
         num_fused_shared_experts, n_group or 0, topk_group or 0, 0, experts,
@@ -2702,6 +2707,8 @@ def _trtllm_fp4_records_moe(
     the hidden size receives its leading columns. Per token ``fc2_input_out`` receives GEMM2's
     input as on SM100."""
     x, x_scale, pt = a["hidden_states"], a["hidden_states_scale"], a["per_token_scale"]
+    if x_scale is not None and "hidden_states_scale_layout" in a:  # as on SM100
+        resolve_moe_act_sf_layout(a["hidden_states_scale_layout"])
     s1, s_gate, s2 = (
         a[f"output{i}_scalar"] for i in ("1_scale", "1_scale_gate", "2_scale")
     )
@@ -2730,13 +2737,14 @@ def _trtllm_fp4_records_moe(
             out.shape[1] == hv if a["valid_hidden_size"] else 0 < out.shape[1] <= hidden
         )))
         or s_gate is None or s2 is None or ((w4a4 or fp8 and x_scale is None) and s1 is None)
+        or a.get("workspace_buffer") is not None
     ):  # fmt: skip
         raise NotImplementedError(
             "Below SM100 TRT-LLM FP4 runs on records: NVFP4 hidden states, BF16 ones (with an "
             "FP32 global scale for NVFP4 activations), per token NVFP4 activations, MXFP8 or FP8 "
             "ones (MXFP4 records), with the GEMM scalars; valid sizes multiples of 16 (MXFP8 and "
             "FP8: 32), the output [num_tokens, valid hidden] (without valid sizes at most hidden "
-            "wide: its leading columns)."
+            "wide: its leading columns); no workspace_buffer."
         )
     if fo is not None and (  # SM100's checks
         pt is None or a.get("_nfse") or a.get("routing_metadata") is not None or inter % 16

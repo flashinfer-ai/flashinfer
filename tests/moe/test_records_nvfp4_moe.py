@@ -202,8 +202,13 @@ def test_w4a4(recipe, gated, tokens):
         assert not torch.equal(cutlass(x, None), out)
     else:
         s1 = a2 * alpha1 if gated else a2.repeat(E)
-        for inp, scale in ((x, a1), (codes, sf.view(torch.float8_e4m3fn))):
+        lin = sf.view(torch.float8_e4m3fn)
+        for inp, scale in ((x, a1), (codes, lin)):
             outs.append(_trt(m, inp, scale, ids, weights, s1, alpha1, alpha2)[0])
+        args = (m, codes, lin, ids, weights, s1, alpha1, alpha2)
+        outs.append(_trt(*args, hidden_states_scale_layout=SfLayout.layout_linear)[0])
+        with pytest.raises(NotImplementedError, match="hidden_states_scale_layout"):
+            _trt(*args, hidden_states_scale_layout=SfLayout.layout_128x4)
         cute = cute_dsl_fused_moe(
             codes, sf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], alpha1, a2, m["w2"],
             m["r2"], alpha2, E, K, activation_type=m["act"].value,
@@ -443,6 +448,8 @@ def test_from_logits(tokens):
 
     replay = torch.empty(tokens, K, dtype=torch.int16, device="cuda")
     slots, gathered = run(), run(routing_replay_out=replay)
+    with pytest.raises(NotImplementedError, match="workspace_buffer"):
+        run(workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device="cuda"))
     torch.testing.assert_close(slots, gathered, atol=0, rtol=0)
     ids = torch.topk(logits, K).indices
     assert torch.equal(replay.long().sort(1).values, ids.sort(1).values)

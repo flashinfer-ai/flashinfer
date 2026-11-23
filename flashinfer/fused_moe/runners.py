@@ -9325,7 +9325,7 @@ class RecordsNvfp4Bf16Runner(MoERunner):
     weight_view_aliases: ClassVar[tuple[str, ...]] = ("records_nvfp4",)
     weight_view_keys: ClassVar[tuple[str, ...]] = (backend_key, *weight_view_aliases)
     # Pre-routed ids and weights either way, as FrostLowLatencyRunner's
-    supported_routing_modes = (
+    supported_routing_modes: tuple[RoutingInputMode, ...] = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     )
