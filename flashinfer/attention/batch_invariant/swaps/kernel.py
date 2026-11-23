@@ -115,8 +115,8 @@ class SwapsKernel:
             self.ragged,
             self.cap,
             causal=self.causal,
+            soft_cap=self.soft_cap,
         )
-        st.soft_cap = self.soft_cap
         self.st = st
         tma = SwapsTma(st, mQ, mK, mV)
 
