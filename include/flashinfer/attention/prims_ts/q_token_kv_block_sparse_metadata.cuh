@@ -273,14 +273,29 @@ __device__ __forceinline__ void ReleasePdlDependents(
 #endif
 }
 
-// Buckets of the balanced route order: one per KV128 tile count, longer
-// unions sharing the last bucket.
+// Buckets of the balanced route order: one per KV128 tile count. Unions of
+// 127 or more tiles (16K+ tokens) share the longest bucket, so the order is
+// longest first only up to that length; within a bucket it is arbitrary.
 constexpr int kQTokenKvBlockSparseRouteOrderBins = 128;
 
 // Shared-memory ints the route order needs for ``routes`` routes: bins, warp
 // sums plus a total, and a one-bit-per-route tail mask.
 __host__ __device__ constexpr int QTokenKvBlockSparseRouteOrderSmemInts(int routes) {
   return kQTokenKvBlockSparseRouteOrderBins + 33 + (routes + 31) / 32;
+}
+
+// Dynamic shared memory of a metadata launch of ``bytes`` that also writes
+// the route order: room for the tail mask when that fits the per-CTA limit,
+// else only bins and warp sums (WriteLongestFirstRouteOrder then orders every
+// route longest first).
+inline size_t QTokenKvBlockSparseRouteOrderLaunchBytes(size_t bytes, const int32_t* route_order,
+                                                       int64_t routes, int max_bytes) {
+  if (route_order == nullptr) return bytes;
+  const size_t order_bytes =
+      static_cast<size_t>(QTokenKvBlockSparseRouteOrderSmemInts(static_cast<int>(routes))) *
+      sizeof(int);
+  const size_t sort_bytes = (kQTokenKvBlockSparseRouteOrderBins + 33) * sizeof(int);
+  return std::max(bytes, order_bytes <= static_cast<size_t>(max_bytes) ? order_bytes : sort_bytes);
 }
 
 // Called by every CTA after its outputs. The CTA whose completion RMW returns
@@ -745,6 +760,7 @@ __global__ __launch_bounds__(
                                                                        shared.union_pages);
   }
   ReleasePdlDependents(params);
+  static_assert(sizeof(shared) >= (kQTokenKvBlockSparseRouteOrderBins + 33) * sizeof(int));
   WriteLongestFirstRouteOrder(params, reinterpret_cast<int*>(&shared),
                               static_cast<int>(sizeof(shared) / sizeof(int)));
 }
@@ -1729,12 +1745,8 @@ cudaError_t LaunchQTokenKvBlockSparseWideMetadataTyped(
   auto kernel = selected.entry_blocks > 0 ? entry_kernel
                 : selected.word_rank      ? map_kernel
                                           : walk_kernel;
-  const size_t smem_bytes =
-      params.route_order == nullptr
-          ? selected.bytes
-          : std::max<size_t>(
-                selected.bytes,
-                QTokenKvBlockSparseRouteOrderSmemInts(static_cast<int>(routes)) * sizeof(int));
+  const size_t smem_bytes = QTokenKvBlockSparseRouteOrderLaunchBytes(
+      selected.bytes, params.route_order, routes, state.max_dynamic_smem_bytes);
   kernel<<<routes, kThreads, smem_bytes, stream>>>(params);
   return cudaGetLastError();
 }
@@ -1805,12 +1817,8 @@ cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
     }
   }
   if (use_map) {
-    const size_t smem_bytes =
-        params.route_order == nullptr
-            ? selected.bytes
-            : std::max<size_t>(
-                  selected.bytes,
-                  QTokenKvBlockSparseRouteOrderSmemInts(static_cast<int>(routes)) * sizeof(int));
+    const size_t smem_bytes = QTokenKvBlockSparseRouteOrderLaunchBytes(
+        selected.bytes, params.route_order, routes, state.max_dynamic_smem_bytes);
     (selected.word_rank
          ? map_kernel
          : walk_kernel)<<<routes, kQTokenKvBlockSparseBitmapBlockThreads, smem_bytes, stream>>>(

@@ -4721,12 +4721,14 @@ def test_persistent_routes_run_longest_first(
     The metadata kernel's last CTA writes ``route_order`` (a permutation of
     the routes by descending KV128 tiles) and rearms its counter; attention
     maps CLC index i to ``route_order[i]``. Two requests with different
-    prefixes and per-query selection sizes give routes of different lengths;
-    every query of every route (including short tail routes) matches FP32,
-    and a second run reuses the rearmed counter. These 37 routes fit in one
-    wave, so the default (``None``) leaves the order off. Their K/V fits in
-    L2, so every route is ordered; the third run reorders only the 8 shortest
-    routes (as when K/V exceeds L2), and the others keep index order.
+    prefixes, and per-route selection windows (every query fills its required
+    indexer prefix), give routes of different lengths; every query of every
+    route (including short tail routes) matches FP32, and later runs reuse
+    the rearmed counter and rewrite the order (poisoned before each). These
+    37 routes fit in one wave, so the default (``None``) leaves the order
+    off. Their K/V fits in L2, so every route is ordered; the third run
+    reorders only the 8 shortest routes (as when K/V exceeds L2), and the
+    others keep index order.
     """
 
     num_qo_heads, num_kv_heads, group_size, block_size, page_size = 16, 1, 4, 4, 64
@@ -4788,15 +4790,17 @@ def test_persistent_routes_run_longest_first(
     blocks = torch.full((num_queries, block_topk), -1, dtype=torch.int32, device="cuda")
     for token in range(num_queries):
         bound = (int(positions[token]) + 1) // block_size
-        take = min(
-            bound,
-            int(
-                torch.randint(
-                    8, block_topk + 1, (1,), generator=generator, device="cuda"
-                )
-            ),
+        take = min(bound, block_topk)
+        # The queries of one route pick from the same recent window, whose
+        # width varies by route: overlap, and so the union, differs per route.
+        request = int(requests[token])
+        route = (token - (counts[0] if request else 0)) // group_size
+        window = min(bound, block_topk + (97 * route + 31 * request) % (3 * block_topk))
+        chosen = (
+            bound
+            - window
+            + torch.randperm(window, generator=generator, device="cuda")[:take]
         )
-        chosen = torch.randperm(bound, generator=generator, device="cuda")[:take]
         blocks[token, :take] = chosen.to(torch.int32)
     query = torch.randn(
         (num_queries, num_qo_heads, head_dim), generator=generator, device="cuda"
@@ -4874,6 +4878,9 @@ def test_persistent_routes_run_longest_first(
                 ),
             )
         output = torch.full_like(query, float("nan"))
+        if run:
+            # Poison the published order: a stale one fails the checks below.
+            wrapper._prepared_plan._metadata_plan.route_order.fill_(-1)
         wrapper.run(
             query,
             caches,

@@ -360,9 +360,9 @@ void Run(TensorView block_indices, TensorView block_table, Optional<TensorView> 
                    route_order.value().size(0) == geometry.groups &&
                    route_order.value().IsContiguous())
         << "route_order must be a contiguous [groups] tensor";
-    TVM_FFI_ICHECK(route_order_counter.value().ndim() >= 1 &&
+    TVM_FFI_ICHECK(route_order_counter.value().ndim() == 1 &&
                    route_order_counter.value().size(0) >= 1)
-        << "route_order_counter must hold one int32";
+        << "route_order_counter must be a nonempty one-dimensional tensor";
     route_order_ptr = static_cast<int32_t*>(route_order.value().data_ptr());
     route_order_counter_ptr = static_cast<int32_t*>(route_order_counter.value().data_ptr());
     TVM_FFI_ICHECK(route_order_tail_routes >= 0 &&

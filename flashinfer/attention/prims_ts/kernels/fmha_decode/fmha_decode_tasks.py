@@ -207,13 +207,16 @@ class PackedDecodeWorkQueue(WorkQueue):
         """Map CLC route index i to ``route_order[i]`` (longest first).
 
         The metadata grid stores the order right after its per-route lengths;
-        TaskManager reads it after the attention grid's dependency wait.
+        TaskManager reads it after the attention grid's dependency wait. A
+        failed CLC cancel (drained queue) leaves the decoded coordinates
+        undefined, so invalid tiles read entry 0 instead (no branch).
         """
         if cutlass.const_expr(self.cfg.uses_longest_first_route_order):
             q_group_idx, h_idx, route_idx = work_tile.tile_idx
+            valid = cutlass.Int32(work_tile.is_valid_tile)
             routes = cutlass.Int32(cute.arch.grid_dim()[2])
             route_idx = cutlass.Int32(
-                self.seqlens_kv[routes + cutlass.Int32(route_idx)]
+                self.seqlens_kv[routes + cutlass.Int32(route_idx) * valid]
             )
             return type(work_tile)(
                 (q_group_idx, h_idx, route_idx), work_tile.is_valid_tile

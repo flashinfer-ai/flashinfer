@@ -635,6 +635,10 @@ class QTokenKvBlockSparsePagedTSWrapper:
         two KV128 tiles (``max_seq_len_kv`` > 256); True enables it on every
         persistent launch; False keeps route order. Launches without the
         persistent scheduler (split-KV, single-wave static grids) ignore it.
+        Routes are ranked by whole KV128 tiles of their union; routes of 127
+        or more tiles (16K+ tokens) share the longest rank, so their order
+        among themselves, and which of them fall into a reordered final-wave
+        tail, is arbitrary.
 
         ``sm_scale`` and ``v_scale`` independently accept host floats or CUDA
         FP32 tensors of shape () or (1,). They establish the compiled argument kinds
@@ -1386,10 +1390,13 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     uses_split_kv = attention_layout.uses_split_kv
     # Persistent grouped launches take routes longest first: the metadata
     # writes their order right after seq_lens, where the attention work queue
-    # reads it (seq_lens + routes).
+    # reads it (seq_lens + routes). Split-KV and static grids read none.
     route_order_bytes = (
         metadata_rows * 4
-        if packed_query and group_size > 1 and pattern_heads == 1
+        if packed_query
+        and group_size > 1
+        and pattern_heads == 1
+        and spec.config.use_persistent_scheduler
         else 0
     )
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
@@ -2198,13 +2205,16 @@ def _prepare_q_token_kv_block_sparse_attention(
         # the others keep index order, so routes running at the same time stay
         # close in their request and keep reusing its K/V in L2.
         properties = torch.cuda.get_device_properties(query.device)
+        # Bytes per token over all KV heads: K/V (with their rows' scales when
+        # interleaved) plus separate NVFP4 scale tensors; pages lead each.
         kv_bytes = (
             int(block_table.shape[0])
             * max_seq_len_kv
             * sum(
-                cache[0].numel() * cache.element_size() // int(cache.shape[2])
-                for cache in (k_cache, v_cache)
+                tensor[0].numel() * tensor.element_size()
+                for tensor in (k_cache, v_cache, *(kv_scale_factors or ()))
             )
+            // int(k_cache.shape[2])
         )
         route_order_tail = (
             0
