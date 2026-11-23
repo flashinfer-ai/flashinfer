@@ -17,7 +17,7 @@ Host plan and loader glue of the Cake Gated DeltaProduct (GDP) kernels
 (``K = 128``, ``V = 64``, ``n <= 4`` Householder updates per token, FP32
 recurrence): the decode / MTP-verification programs (``role`` ``"decode"``;
 SM90 / SM100 / SM103 / SM107) and the chunked varlen prefill programs (``role``
-``"prefill"``; SM90).
+``"prefill"``; SM90 / SM100 / SM103).
 
 Every module below is one mechanically exported production build: a CUDA
 device translation unit plus a tvm-ffi binding compiled together for exactly
@@ -102,7 +102,13 @@ split: a long sequence runs as ``p`` independent items per head over the
 host's item table -- formal 9, ``output_slot_indices``; ``total_tiles`` = items
 -- and ``selected_prefill_module(..., split_items=True)`` names them; the
 facade takes them for the merged-class sequences of a call, which the split
-rules of record below always cut).
+rules of record below always cut).  Those are the SM90 programs.  On SM100 /
+SM103 the route holds the programs of the Blackwell body (``body``
+``prefill_bw_v6``): one launch serves every flag set (a ``flags`` word reads the
+initial state and stores the final state) over a host item table whose order
+places the work on the persistent CTAs; the BLACKWELL V6 LAUNCH PLAN below
+(``prefill_v6_plan``) builds the table and picks the build, which the
+``v6_launch`` select rule names (``selected_v6_module``).
 Every grid is computed from host integers; no tensor is read on the host.
 
 The program name ``cake_gdp_<20 hex>`` is the first twenty hex digits of the
@@ -128,7 +134,8 @@ store, ...; the split programs spell ``split_items`` too).
 from __future__ import annotations
 
 import functools
-from typing import Any, Sequence
+import itertools
+from typing import Any, NamedTuple, Sequence
 
 import torch
 import tvm_ffi
@@ -8868,6 +8875,410 @@ MODULES: dict[str, dict[str, Any]] = {
             "rounds_at_least": 5,
         },
     },
+    "cake_gdp_157b3ebf33cf7c928af5": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+vyh+vyp+bdiag+tailc",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": False,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": False,
+            "split_thr": -48.0,
+            "split_warmup": 8,
+            "stamps": "none",
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_157b3ebf33cf7c928af5",
+        "kernel_symbol": "kernel_cake_gdp_157b3ebf33cf7c928af5",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_157b3ebf33cf7c928af5",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": False,
+        },
+    },
+    "cake_gdp_68796be6ca9ae12f2e19": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+yh+yp+vyh+vyp+bdiag",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": True,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": True,
+            "split_thr": -14.43,
+            "split_warmup": 128,
+            "stamps": "none",
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_68796be6ca9ae12f2e19",
+        "kernel_symbol": "kernel_cake_gdp_68796be6ca9ae12f2e19",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_68796be6ca9ae12f2e19",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": True,
+        },
+    },
+    "cake_gdp_f108e105bd1ec635650f": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag+tailc",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": False,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": False,
+            "split_thr": -48.0,
+            "split_warmup": 8,
+            "stamps": "none",
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_f108e105bd1ec635650f",
+        "kernel_symbol": "kernel_cake_gdp_f108e105bd1ec635650f",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_f108e105bd1ec635650f",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": False,
+        },
+    },
+    "cake_gdp_88c5777dabbda5e1e5a8": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Omap"],
+            ["buffer", "tmap_ws"],
+            ["buffer", "gate"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "items"],
+            ["buffer", "initial_state"],
+            ["buffer", "output_state"],
+            ["parameter", "state_stride_slot"],
+            ["parameter", "scale"],
+            ["parameter", "num_items"],
+            ["parameter", "total_tokens"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_householder"],
+            ["parameter", "flags"],
+            ["buffer", "split_ws"],
+            ["parameter", "num_seqs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "body": "prefill_bw_v6",
+        "build": {
+            "align": "r2+ctr+tmaw+r3+r3w+qs+c6a+c7+c3+bfold+ord+iss+sa+nomask+bdiag",
+            "arm": "full",
+            "cg0": "lock",
+            "cp": False,
+            "csr": True,
+            "diet": "issuer_compact+roll_ah",
+            "dispatch": False,
+            "du_split_issue": False,
+            "fused": "m128",
+            "gate_tab": True,
+            "householders": 3,
+            "inverse": "c",
+            "iss_order": "m3m4",
+            "ostore": "tma",
+            "plan_guard": True,
+            "regs": None,
+            "scan": "iii",
+            "split_du": False,
+            "split_items": True,
+            "split_thr": -14.43,
+            "split_warmup": 128,
+            "stamps": "none",
+            "vsplit": False,
+            "with_beta": True,
+            "xh": False,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+        },
+        "kernel": "cake_gdp_88c5777dabbda5e1e5a8",
+        "kernel_symbol": "kernel_cake_gdp_88c5777dabbda5e1e5a8",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 223360,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_88c5777dabbda5e1e5a8",
+        "logical": {
+            "K": "k",
+            "O": "o",
+            "Omap": "o",
+            "Q": "q",
+            "V": "v",
+            "beta": "beta",
+            "cu_seqlens": "cu_seqlens",
+            "flags": "flags",
+            "gate": "gate",
+            "initial_state": "initial_state",
+            "items": "items",
+            "num_heads": "num_heads",
+            "num_householder": "num_householder",
+            "num_items": "num_items",
+            "num_seqs": "num_seqs",
+            "output_state": "output_state",
+            "scale": "scale",
+            "split_ws": "split_workspace",
+            "state_stride_slot": "state_stride_slot",
+            "tmap_ws": "tensormap_workspace",
+            "total_tokens": "total_tokens",
+        },
+        "role": "prefill",
+        "select_rule": {
+            "kind": "v6_launch",
+            "split_items": True,
+        },
+    },
 }
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_90a": {
@@ -8964,6 +9375,10 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_3425d6511e4eab4896cd",
             "cake_gdp_717ce3c684b41c37e673",
         ],
+        "prefill": [
+            "cake_gdp_157b3ebf33cf7c928af5",
+            "cake_gdp_68796be6ca9ae12f2e19",
+        ],
     },
     "sm_103a": {
         "decode_nh1": [
@@ -9018,6 +9433,10 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "decode_nh4": [
             "cake_gdp_3425d6511e4eab4896cd",
             "cake_gdp_717ce3c684b41c37e673",
+        ],
+        "prefill": [
+            "cake_gdp_f108e105bd1ec635650f",
+            "cake_gdp_88c5777dabbda5e1e5a8",
         ],
     },
     "sm_107a": {
@@ -9478,6 +9897,8 @@ PREFILL_LOGICAL_TENSORS = (
     "output_state",
     "tensormap_workspace",
     "ainv_workspace",
+    "items",
+    "split_workspace",
 )
 PREFILL_LOGICAL_SCALARS = (
     "initial_state_stride_slot",
@@ -9490,6 +9911,9 @@ PREFILL_LOGICAL_SCALARS = (
     "total_tiles",
     "metadata_i64_mask",
     "ainv_chunk_stride",
+    "state_stride_slot",
+    "num_items",
+    "flags",
 )
 
 
@@ -9508,11 +9932,14 @@ def prefill_route_modules(arch: str, route: str = PREFILL_ROUTE) -> tuple[str, .
 def prefill_route_applies(
     *, device_capability: Sequence[int], num_householder: int
 ) -> bool:
-    """Whether the verified export owns one prefill call (the single-pass route exists on the device)."""
+    """Whether the verified export owns one prefill call (the single-pass route exists on the device; on the
+    Blackwell body, a program built for ``num_householder``)."""
 
     arch = arch_for_capability(device_capability)
     if arch is None or int(num_householder) not in NUM_HOUSEHOLDER:
         return False
+    if arch in V6_ARCHES:
+        return int(num_householder) in v6_householders(arch)
     return bool(ROUTES.get(arch, {}).get(PREFILL_ROUTE))
 
 
@@ -9564,6 +9991,8 @@ def selected_prefill_module(
     for name in prefill_route_modules(arch, PREFILL_ROUTE):
         if body is not None and MODULES[name]["body"] != body:
             continue
+        if MODULES[name]["select_rule"].get("kind") != "prefill_flags":
+            continue  # the Blackwell body's programs: ``selected_v6_module``
         spelled = _prefill_flags(MODULES[name]["select_rule"])
         if all(
             spelled.get(flag, False) == value for flag, value in wanted.items()
@@ -9583,22 +10012,33 @@ def selected_prefill_module(
 # record the kernel is built and tested against: one text in every copy.
 PREFILL_SPLIT_FLAG = "split_items"
 
-# ---- SPLIT RULES OF RECORD (GDP prefill gate-saturation split, sm_90a; one text in every copy) ----
+# ---- SPLIT RULES OF RECORD (GDP prefill gate-saturation split, arch-keyed; one text in every copy) ----
 SPLIT_CHUNK_ROWS = 64  # expanded rows per chunk; chunks come in pairs of 128 rows
 SPLIT_MIN_CHUNKS = 24  # a sequence of fewer chunks is one item
 SPLIT_MAX = 48  # at most 48 cuts per (sequence, head); the device's forward scan runs at most this many steps
 SPLIT_WARMUP_MAX = 8  # a cut's warm-up runs at most 8 chunks from a zero seed
-SPLIT_LOG2_THRESHOLD = (
-    -24.0
-)  # a cut is saturated when the log2 gate decay over its warm-up is <= -24 (2^-24)
-SPLIT_SPAN_MIN = (
-    (24, 48),
-    (12, 24),
-    (0, 12),
-)  # (H above, least span in chunks): H > 24 -> 48, H > 12 -> 24, else 12
+# The log2 gate decay at or below which a cut's warm-up saturates it, per arch: sm_90a -24 (2^-24); Blackwell (sm_100a /
+# sm_103a) -48, a subset of the 2^-24 cuts (the V6 programs' BF16 state images need the deeper decay to keep
+# the split on / off within 1e-6 rel-L2; -32 did not)
+SPLIT_LOG2_THRESHOLD_ARCH = {"sm_90a": -24.0, "sm_100a": -48.0, "sm_103a": -48.0}
+# (H above, least span in chunks) per arch: sm_90a H > 24 -> 48, H > 12 -> 24, else 12; Blackwell (sm_100a / sm_103a)
+# H > 12 -> 48, else 12 (its chunk step is shorter, so an item needs more chunks to pay its fill and drain)
+SPLIT_SPAN_MIN_ARCH = {
+    "sm_90a": ((24, 48), (12, 24), (0, 12)),
+    "sm_100a": ((24, 48), (12, 48), (0, 12)),
+    "sm_103a": ((24, 48), (12, 48), (0, 12)),
+}
 SPLIT_COST_CHUNK = 12  # the cost model, in tenths of a chunk period: per chunk of an item (span + 1 chunks) ...
 SPLIT_COST_ITEM = 40  # ... and per item (seed, pipeline fill and drain, final store)
 SPLIT_MODES = ("auto", "exact")
+# V8-BAL: the balanced cut of a long Blackwell sequence. Its head-major chunk space (H heads of
+# ``split_align``-padded chunk counts) is cut into SPLIT_BAL_SLOTS[arch] slots of equal aligned length (the arch's SM
+# count, a constant: never the batch or the device); a slot crossing a head boundary is two items. A sequence takes it
+# iff its slot is at least SPLIT_BAL_MIN_SLOT chunks and shorter than one head (so a slot touches at most two heads),
+# a head holds at most SPLIT_MAX cuts (the device's forward scan reaches every cut), and its 2 S balanced rows are no
+# more than the H p items of its uniform cut on S SMs (the balanced cut never raises the sequence's item count).
+SPLIT_BAL_SLOTS = {"sm_100a": 148, "sm_103a": 152}
+SPLIT_BAL_MIN_SLOT = 96
 
 
 def split_sequence_bounds(
@@ -9622,12 +10062,26 @@ def split_align(n: int) -> int:
     return n if n % 2 == 0 else 2 * n
 
 
-def split_span_min(H: int) -> int:
-    """The least span of an item under ``H`` heads (SPLIT_SPAN_MIN): a wide batch keeps its items long."""
-    for h_above, span_min in SPLIT_SPAN_MIN:
+def split_span_min(H: int, arch: str = "sm_90a") -> int:
+    """The least span of an item under ``H`` heads on ``arch`` (SPLIT_SPAN_MIN_ARCH): a wide batch keeps its items
+    long."""
+    if arch not in SPLIT_SPAN_MIN_ARCH:
+        raise ValueError(f"arch is one of {tuple(SPLIT_SPAN_MIN_ARCH)}, got {arch!r}")
+    floors = SPLIT_SPAN_MIN_ARCH[arch]
+    for h_above, span_min in floors:
         if H > h_above:  # noqa: SIM300
             return span_min
-    return SPLIT_SPAN_MIN[-1][1]
+    return floors[-1][1]
+
+
+def split_log2_threshold(arch: str = "sm_90a") -> float:
+    """The saturation threshold of ``arch`` (SPLIT_LOG2_THRESHOLD_ARCH): the device's warm-up scan and the host model
+    decide every cut against it."""
+    if arch not in SPLIT_LOG2_THRESHOLD_ARCH:
+        raise ValueError(
+            f"arch is one of {tuple(SPLIT_LOG2_THRESHOLD_ARCH)}, got {arch!r}"
+        )
+    return SPLIT_LOG2_THRESHOLD_ARCH[arch]
 
 
 def split_span(chunks: int, p: int, n: int) -> int:
@@ -9637,23 +10091,28 @@ def split_span(chunks: int, p: int, n: int) -> int:
 
 
 def split_count(
-    chunks: int, H: int, n: int, sm_count: int, split_mode: str = "auto"
+    chunks: int,
+    H: int,
+    n: int,
+    sm_count: int,
+    split_mode: str = "auto",
+    arch: str = "sm_90a",
 ) -> tuple[int, int]:
     """``(p, span)`` of a sequence of ``chunks`` chunks under ``H`` heads with ``n`` householder steps on ``sm_count``
-    SMs: the item count and the cut spacing in chunks (cuts at ``j span``, ``j = 1 .. p - 1``; the last item is
-    shorter when ``p span > chunks``). ``(1, 0)`` for an empty sequence; ``(1, chunks)`` for ``"exact"`` or below
-    SPLIT_MIN_CHUNKS; else, over ``p = 1 .. SPLIT_MAX`` while the span is at least ``split_span_min(H)``, the ``p`` of
-    the least cost ``ceil(H p_eff / sm_count) ((span + 1) SPLIT_COST_CHUNK + SPLIT_COST_ITEM)`` (the waves of one
-    sequence's ``H p_eff`` items of ``span + 1`` chunks each, with a per-item cost; ``p_eff = ceil(chunks / span)``),
-    ties to the smaller ``p``. The rule reads the sequence's own chunk count and the shape constants only, never the
-    batch: a sequence splits the same alone and in any batch."""
+    SMs of ``arch``: the item count and the cut spacing in chunks (cuts at ``j span``, ``j = 1 .. p - 1``; the last
+    item is shorter when ``p span > chunks``). ``(1, 0)`` for an empty sequence; ``(1, chunks)`` for ``"exact"`` or
+    below SPLIT_MIN_CHUNKS; else, over ``p = 1 .. SPLIT_MAX`` while the span is at least ``split_span_min(H, arch)``,
+    the ``p`` of the least cost ``ceil(H p_eff / sm_count) ((span + 1) SPLIT_COST_CHUNK + SPLIT_COST_ITEM)`` (the
+    waves of one sequence's ``H p_eff`` items of ``span + 1`` chunks each, with a per-item cost; ``p_eff = ceil(chunks
+    / span)``), ties to the smaller ``p``. The rule reads the sequence's own chunk count and the shape constants
+    only, never the batch: a sequence splits the same alone and in any batch."""
     if split_mode not in SPLIT_MODES:
         raise ValueError(f"split_mode is one of {SPLIT_MODES}, got {split_mode!r}")
     if chunks <= 0:
         return 1, 0
     if split_mode == "exact" or chunks < SPLIT_MIN_CHUNKS:
         return 1, chunks
-    span_min = split_span_min(H)
+    span_min = split_span_min(H, arch)
     best = None
     for p in range(1, SPLIT_MAX + 1):
         span = chunks if p == 1 else split_span(chunks, p, n)
@@ -9674,6 +10133,7 @@ def split_table(
     sm_count: int,
     split_mode: str = "auto",
     total_tokens: int | None = None,
+    arch: str = "sm_90a",
 ) -> list[tuple[int, int, int, int]]:
     """The work items of a batch, the rows of the device's item table (formal 9 of the ``_split`` programs, four int32
     words each; ``total_tiles`` is the row count): per sequence in order, j-major (``j = 0`` of every head, then
@@ -9682,12 +10142,73 @@ def split_table(
     of ``N + 1`` integers; ``total_tokens`` defaults to its last entry."""
     raw = [int(x) for x in cu_seqlens]
     total = raw[-1] if total_tokens is None else int(total_tokens)
-    items = []  # type: ignore[var-annotated]
+    items = []
     for seq in range(len(raw) - 1):
         start, end = split_sequence_bounds(raw[seq], raw[seq + 1], total)
-        p, span = split_count(split_chunks(end - start, n), H, n, sm_count, split_mode)
+        chunks = split_chunks(end - start, n)
+        slot = split_bal_slot(chunks, H, n, split_mode, arch)
+        if slot:
+            items.extend(split_bal_rows(seq, chunks, H, n, slot, arch))
+            continue
+        p, span = split_count(chunks, H, n, sm_count, split_mode, arch)
         items.extend((seq, head, j * span, span) for j in range(p) for head in range(H))
     return items
+
+
+def split_bal_slot(
+    chunks: int, H: int, n: int, split_mode: str = "auto", arch: str = "sm_90a"
+) -> int:
+    """The V8-BAL slot of a sequence of ``chunks`` chunks under ``H`` heads on ``arch``: ``Q ceil(ceil(H C' / S) / Q)``
+    with ``Q = split_align(n)``, ``C' = Q ceil(chunks / Q)`` (the head's aligned length) and ``S =
+    SPLIT_BAL_SLOTS[arch]``; 0 (the uniform cut of ``split_count``) for ``"exact"``, an arch without slots, fewer than
+    SPLIT_MIN_CHUNKS chunks, a slot below SPLIT_BAL_MIN_SLOT or not shorter than ``C'``, more than SPLIT_MAX cuts in
+    a head (``C' > (SPLIT_MAX - 1) slot``), or more balanced rows ``2 S`` than the ``H p`` items of the uniform cut
+    ``split_count(chunks, H, n, S)``."""
+    if split_mode not in SPLIT_MODES:
+        raise ValueError(f"split_mode is one of {SPLIT_MODES}, got {split_mode!r}")
+    if (
+        split_mode == "exact"
+        or arch not in SPLIT_BAL_SLOTS
+        or chunks < SPLIT_MIN_CHUNKS
+    ):
+        return 0
+    align = split_align(n)
+    padded = align * (-(-chunks // align))
+    slot = align * (-(-(-(-(H * padded) // SPLIT_BAL_SLOTS[arch])) // align))  # noqa: B002
+    if not SPLIT_BAL_MIN_SLOT <= slot < padded <= (SPLIT_MAX - 1) * slot:
+        return 0
+    p, _span = split_count(chunks, H, n, SPLIT_BAL_SLOTS[arch], split_mode, arch)
+    return slot if 2 * SPLIT_BAL_SLOTS[arch] <= H * p else 0
+
+
+def split_bal_rows(
+    seq: int, chunks: int, H: int, n: int, slot: int, arch: str
+) -> list[tuple[int, int, int, int]]:
+    """The item rows of a V8-BAL sequence: ``2 S`` rows, ``S = SPLIT_BAL_SLOTS[arch]``. Slot ``k`` covers the
+    head-major chunks ``[k slot, (k + 1) slot)`` of ``H`` heads of ``C'`` chunks; its pieces are ``(seq, head, cut,
+    -slot)`` rows (a negative span marks the balanced grid: the device steps a forward scan to the next slot boundary
+    of the head-major space, ``slot`` apart), its piece that starts a head (cut 0) in row ``k`` and its other piece in
+    row ``S + k``, so every CTA runs its seed items before the owners that wait on them; an absent piece is a pad row
+    ``(seq, head, chunks, -slot)`` (no chunk, no store)."""
+    align = split_align(n)
+    padded = align * (-(-chunks // align))
+    slots = SPLIT_BAL_SLOTS[arch]
+    first, second = [], []
+    for k in range(slots):
+        lo, hi = k * slot, min((k + 1) * slot, H * padded)
+        pieces = []
+        while lo < hi:
+            head, cut = lo // padded, lo % padded
+            end = min(hi, (head + 1) * padded)
+            if cut < chunks:
+                pieces.append((seq, head, cut, -slot))
+            lo = end
+        pad = (seq, min(k * slot // padded, H - 1), chunks, -slot)
+        if len(pieces) == 2 and pieces[1][2] == 0:
+            pieces.reverse()
+        first.append(pieces[0] if pieces else pad)
+        second.append(pieces[1] if len(pieces) > 1 else pad)
+    return first + second
 
 
 # ---- END SPLIT RULES OF RECORD ----
@@ -9801,6 +10322,299 @@ def prefill_launch_plan(classes) -> list[tuple[str, list[int]]]:
 
 
 # ---- END BODY ROUTE OF RECORD ----
+
+
+# ---- BLACKWELL V6 LAUNCH PLAN (sm_100a / sm_103a prefill) ----
+# The Blackwell prefill body (``prefill_bw_v6``) runs persistent CTAs over a host item table of rows ``(sequence,
+# head, cut, span)``.  A call launches one of two builds of its arch: the ``split_items`` build over the chunk-unit
+# rows of ``split_table`` (when ``launch_split`` holds: some sequence is cut, or the batch holds an empty sequence,
+# whose state copy only the split build runs), else the block build over one block-unit row ``(seq, head, 0, ceil(len
+# / 64))`` per non-empty sequence and head, longest first, CTA ``b`` of a grid of ``G`` running rows ``b, b + G, ...``.
+# The split build runs per-CTA row lists (``inference_csr``: CTA ``b`` runs rows ``offsets[b] .. offsets[b + 1] - 1``,
+# its cut-0 rows first): the long sequences' rows stay where ``split_table`` spreads them and each short row goes to
+# a CTA with room under the current maximum modeled load, else to the least-loaded one.  The split rules read each
+# sequence alone and a short sequence is one row per head, so short sequences added to a long one never change its
+# cuts.  The grid is ``min(SM count, rows of the table)`` and never exceeds the SM count: one CTA fills an SM, so
+# every CTA of a launch is resident at once, which the split build's seed-done wait needs (an owner waits only on a
+# cut-0 row, which every CTA runs first and which waits on nothing).  Both builds read the planned sequence count and
+# offsets after the rows (``v6_item_words``) and, when they differ from the device offsets, run no item and write NaN
+# to ``o[0, 0, :2]`` (one 32-bit word) and final state ``[0, 0, 0, 0]``: a CUDA graph is valid only for the batch it
+# captured.  The builds are inference builds: their results agree with the exact recurrence within FlashInfer's
+# tolerance and may differ in the last bits with the composition of the batch.
+V6_ARCHES = ("sm_100a", "sm_103a")
+V6_BODY = "prefill_bw_v6"
+V6_SELECT_KIND = "v6_launch"
+V6_TENSORMAP_BYTES = 128  # one CUtensorMap slot per CTA (``tmap_ws``)
+V6_SPLIT_WS_PLACEHOLDER = (
+    16  # ``split_ws`` bytes of a build without the split, which never reads it
+)
+V6_FLAG_INITIAL_STATE = 1
+V6_FLAG_FINAL_STATE = 2
+
+
+# ---- INFERENCE PLACEMENT (inference split builds: host rule, no kernel change) ----
+# The V6 split build runs table row it on CTA it % grid, in table order. inference_placement re-lays a split_table
+# onto the grid: each CTA b gets the long sequences' rows b, b + grid, ... of the table (the V8-BAL slot pairing and
+# the uniform cut's j-major rounds stay as split_table spreads them), then each item of an unsplit sequence (one row per
+# head: a short or 1-token sequence, an empty sequence's copy) goes to the CTA of least modeled load, longest first, at
+# the end of the CTA's list, among the CTAs whose list is shorter than the rounds the table needs (the longest list
+# of long rows plus ceil(unsplit rows / grid): every pad row costs each CTA a decode). A CTA runs its cut-0 rows of
+# split sequences first (the seed-done flags: an owner waits only on a cut-0 row, which waits on nothing). The lists are laid out round-major, row r grid + b = the r-th row of
+# CTA b, with pad rows (seq, 0, chunks, INFERENCE_PAD_SPAN) of a non-empty sequence where a list is shorter: the
+# device echoes (chunks, 0) for a pad, runs no chunk and stores nothing. Every row of the table is kept, so the
+# results are bit for bit those of the split_table launch.
+INFERENCE_PAD_SPAN = -1
+INFERENCE_ITEM_COST = 3  # a row's modeled cost past its chunks, in chunk steps (decode, seed, state store)
+INFERENCE_WARMUP_COST = 2  # the modeled warm-up of a cut > 0 (the device decides it)
+
+
+def inference_row_cost(row, chunks: int, n: int) -> int:
+    """The modeled cost of split_table row ``row`` of a sequence of ``chunks`` chunks, in chunk steps."""
+    _seq, head, cut, span = row
+    if span < 0:
+        if cut >= chunks:
+            return 0
+        align = split_align(n)
+        padded = align * (-(-chunks // align))
+        at = head * padded + cut
+        end = min((at // -span + 1) * -span - head * padded, chunks)
+    else:
+        end = min(cut + span, chunks)
+    return (
+        max(end - cut, 0)
+        + INFERENCE_ITEM_COST
+        + (INFERENCE_WARMUP_COST if cut > 0 else 0)
+    )
+
+
+def inference_placement(
+    rows, cu_seqlens, n: int, grid: int, total_tokens: int | None = None
+):
+    """The placed table of the split_table ``rows`` of ``cu_seqlens`` on ``grid`` CTAs (the rule above)."""
+    raw = [int(x) for x in cu_seqlens]
+    total = raw[-1] if total_tokens is None else int(total_tokens)
+    chunks = [
+        split_chunks(e - s, n)
+        for s, e in (
+            split_sequence_bounds(raw[q], raw[q + 1], total)
+            for q in range(len(raw) - 1)
+        )
+    ]
+    per: dict[tuple[int, int], int] = {}
+    for seq, head, _cut, _span in rows:
+        per[(seq, head)] = per.get((seq, head), 0) + 1
+    split_seqs = {seq for (seq, _head), count in per.items() if count > 1}
+    long_rows = [r for r in rows if r[0] in split_seqs]
+    short_rows = [r for r in rows if r[0] not in split_seqs]
+    lists: list[list[tuple[int, int, int, int]]] = [[] for _ in range(grid)]
+    load = [0] * grid
+    for at, row in enumerate(long_rows):
+        lists[at % grid].append(row)
+        load[at % grid] += inference_row_cost(row, chunks[row[0]], n)
+    for b in range(grid):
+        lists[b].sort(
+            key=lambda r: 0 if r[2] == 0 else 1
+        )  # stable: cut-0 rows first, the rounds kept otherwise
+    cap = max((len(x) for x in lists), default=0) + -(-len(short_rows) // grid)
+    for row in sorted(
+        short_rows, key=lambda r: -inference_row_cost(r, chunks[r[0]], n)
+    ):
+        b = min(
+            (c for c in range(grid) if len(lists[c]) < cap), key=lambda c: (load[c], c)
+        )
+        lists[b].append(row)
+        load[b] += inference_row_cost(row, chunks[row[0]], n)
+    rounds = max((len(x) for x in lists), default=0)
+    pad_seq = next((q for q, c in enumerate(chunks) if c > 0), None)
+    placed = []
+    for r in range(rounds):
+        for b in range(grid):
+            if r < len(lists[b]):
+                placed.append(lists[b][r])
+            else:
+                assert pad_seq is not None, "a pad needs a non-empty sequence"
+                placed.append((pad_seq, 0, chunks[pad_seq], INFERENCE_PAD_SPAN))
+    return placed
+
+
+def inference_csr(rows, cu_seqlens, n: int, grid: int, total_tokens: int | None = None):
+    """ABI v2.2 (the ``csr`` build): the split_table ``rows`` of ``cu_seqlens`` as per-CTA lists on ``grid`` CTAs,
+    returned as the CTA-major table and its ``grid + 1`` offsets (CTA b runs rows ``offsets[b] .. offsets[b + 1] - 1``,
+    no pad rows). The long sequences' rows go as in :func:`inference_placement` (row ``at`` of them to CTA ``at %
+    grid``, each CTA's cut-0 rows first); then each unsplit sequence's row, longest first, to the least-loaded CTA
+    among those whose modeled load plus the row's cost stays within the current maximum (several 1-token rows stack on
+    an idle CTA), or, when none has room, to the least-loaded CTA of all."""
+    raw = [int(x) for x in cu_seqlens]
+    total = raw[-1] if total_tokens is None else int(total_tokens)
+    chunks = [
+        split_chunks(e - s, n)
+        for s, e in (
+            split_sequence_bounds(raw[q], raw[q + 1], total)
+            for q in range(len(raw) - 1)
+        )
+    ]
+    per: dict[tuple[int, int], int] = {}
+    for seq, head, _cut, _span in rows:
+        per[(seq, head)] = per.get((seq, head), 0) + 1
+    split_seqs = {seq for (seq, _head), count in per.items() if count > 1}
+    lists: list[list[tuple[int, int, int, int]]] = [[] for _ in range(grid)]
+    load = [0] * grid
+    for at, row in enumerate(r for r in rows if r[0] in split_seqs):
+        lists[at % grid].append(row)
+        load[at % grid] += inference_row_cost(row, chunks[row[0]], n)
+    for b in range(grid):
+        lists[b].sort(
+            key=lambda r: 0 if r[2] == 0 else 1
+        )  # stable: cut-0 rows first, the rounds kept otherwise
+    top = max(load, default=0)
+    short = sorted(
+        (r for r in rows if r[0] not in split_seqs),
+        key=lambda r: -inference_row_cost(r, chunks[r[0]], n),
+    )
+    for row in short:
+        cost = inference_row_cost(row, chunks[row[0]], n)
+        room = [b for b in range(grid) if load[b] + cost <= top]
+        b = min(room or range(grid), key=lambda c: (load[c], c))
+        lists[b].append(row)
+        load[b] += cost
+        top = max(top, load[b])
+    offsets = [0, *itertools.accumulate(len(x) for x in lists)]
+    return [r for x in lists for r in x], offsets
+
+
+# ---- END INFERENCE PLACEMENT ----
+
+
+def launch_split(rows: Sequence[tuple[int, int, int, int]], arch: str) -> bool:
+    """Whether the plan of ``arch`` launches the split build for its ``split_table`` rows: iff some (sequence, head)
+    has more than one row (a planned cut, or a V8-BAL row) or a row has span 0 (an empty sequence's copy, a path of
+    the split build only).  No Blackwell arch launches the split build for every plan."""
+
+    if arch not in V6_ARCHES:
+        raise ValueError(f"the Blackwell prefill plan covers {V6_ARCHES}, got {arch!r}")
+    seen = set()
+    for seq, head, _cut, span in rows:
+        if span <= 0 or (seq, head) in seen:
+            return True
+        seen.add((seq, head))
+    return False
+
+
+class V6Plan(NamedTuple):
+    """One launch of the Blackwell prefill body: the item ``rows`` in table order, the build (``split``: the
+    ``split_items`` build, else the block build), the persistent ``grid`` (at most the SM count) and, for the split
+    build, the ``grid + 1`` offsets of the CTAs' row lists (CTA ``b`` runs rows ``offsets[b] .. offsets[b + 1] - 1``)."""
+
+    rows: tuple[tuple[int, int, int, int], ...]
+    split: bool
+    grid: int
+    offsets: tuple[int, ...] | None = None
+
+
+def prefill_v6_plan(
+    cu_seqlens: Sequence[int],
+    *,
+    num_heads: int,
+    num_householder: int,
+    sm_count: int,
+    arch: str,
+    total_tokens: int | None = None,
+) -> V6Plan:
+    """The launch plan of the Blackwell prefill body for the host offsets ``cu_seqlens`` (``N + 1`` integers;
+    ``total_tokens`` defaults to the last) on a device of ``sm_count`` SMs (see the rule above)."""
+
+    if arch not in V6_ARCHES:
+        raise ValueError(f"the Blackwell prefill plan covers {V6_ARCHES}, got {arch!r}")
+    raw = [int(x) for x in cu_seqlens]
+    total = raw[-1] if total_tokens is None else int(total_tokens)
+    H, n, sm_count = int(num_heads), int(num_householder), int(sm_count)
+    if sm_count <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm_count}")
+    table = split_table(raw, n, H, sm_count, total_tokens=total, arch=arch)
+    if launch_split(table, arch):
+        grid = max(1, min(sm_count, len(table)))
+        rows, offsets = inference_csr(table, raw, n, grid, total_tokens=total)
+        # every CTA of the launch is resident at once (one CTA per SM): the seed-done wait of the split build needs it
+        assert 1 <= grid <= sm_count, (grid, sm_count)
+        return V6Plan(rows=tuple(rows), split=True, grid=grid, offsets=tuple(offsets))
+    rows = []
+    for seq in range(len(raw) - 1):
+        start, end = split_sequence_bounds(raw[seq], raw[seq + 1], total)
+        if blocks := -(-(end - start) // 64):
+            rows.extend((seq, head, 0, blocks) for head in range(H))
+    rows.sort(key=lambda row: (-row[3], row[0], row[1]))
+    grid = max(1, min(sm_count, len(rows)))
+    assert 1 <= grid <= sm_count, (grid, sm_count)
+    return V6Plan(rows=tuple(rows), split=False, grid=grid)
+
+
+def v6_item_words(
+    arch: str, plan: V6Plan, cu_seqlens: Sequence[int]
+) -> tuple[int, ...]:
+    """The int32 words of the ``items`` formal of the program ``plan`` selects on ``arch``: the rows (4 words each;
+    one zero row when there is none), then the CTAs' row offsets (a ``csr`` build), then the planned sequence count
+    ``N`` and the ``N + 1`` host offsets ``cu_seqlens`` the plan was made from (a ``plan_guard`` build).  The guarded
+    program compares those with the device offsets and, when they differ, runs no item and writes NaN to
+    ``o[0, 0, :2]`` (one 32-bit word) and, when it stores one, to final state ``[0, 0, 0, 0]``: a batch changed
+    after the plan fails loudly."""
+
+    build = MODULES[selected_v6_module(arch, plan)]["build"]
+    words = [int(w) for row in (plan.rows or ((0, 0, 0, 0),)) for w in row]
+    if build.get("csr"):
+        if plan.offsets is None:
+            raise ValueError("the csr build runs a plan with row offsets")
+        words.extend(int(o) for o in plan.offsets)
+    if build.get("plan_guard"):
+        cu = [int(c) for c in cu_seqlens]
+        words.extend((len(cu) - 1, *cu))
+    return tuple(words)
+
+
+def v6_route_builds(arch: str) -> dict[bool, str]:
+    """``split_items -> program`` of the Blackwell prefill body on ``arch``."""
+
+    builds: dict[bool, str] = {}
+    for name in ROUTES.get(arch, {}).get(PREFILL_ROUTE, ()):
+        record = MODULES[name]
+        if record["body"] != V6_BODY:
+            continue
+        rule = record["select_rule"]
+        if not isinstance(rule, dict) or rule.get("kind") != V6_SELECT_KIND:
+            raise ValueError(
+                f"not a Cake GDP Blackwell prefill selection rule: {rule!r}"
+            )
+        split = bool(rule["split_items"])
+        if split in builds:
+            raise ValueError(
+                f"two Blackwell prefill programs on {arch} with split_items={split}"
+            )
+        builds[split] = name
+    return builds
+
+
+def v6_householders(arch: str) -> set[int]:
+    """The ``num_householder`` values the Blackwell prefill programs of ``arch`` build for (the body reads ``n`` as
+    a build constant)."""
+
+    return {
+        int(MODULES[name]["build"]["householders"])
+        for name in v6_route_builds(arch).values()
+    }
+
+
+def selected_v6_module(arch: str, plan: V6Plan) -> str:
+    """The program of the Blackwell prefill body on ``arch`` that ``plan`` launches."""
+
+    builds = v6_route_builds(arch)
+    if plan.split not in builds:
+        raise ValueError(
+            f"no Blackwell prefill program on {arch} with split_items={plan.split}; "
+            f"the route ships {sorted(builds)}"
+        )
+    return builds[plan.split]
+
+
+# ---- END BLACKWELL V6 LAUNCH PLAN ----
 
 
 def prefill_split_table(
@@ -9959,6 +10773,7 @@ __all__ = [
     "F16_STATE_ALIGNMENT_BYTES",
     "HEAD_SIZE_K",
     "HEAD_SIZE_V",
+    "INFERENCE_PAD_SPAN",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
     "MODULES",
@@ -9975,9 +10790,15 @@ __all__ = [
     "STATE_ALIGNMENT_BYTES",
     "STATE_DTYPES",
     "STATE_STRIDE_ELEMENTS",
+    "V6Plan",
+    "V6_ARCHES",
+    "V6_BODY",
     "arch_for_capability",
     "device_arch",
+    "inference_placement",
+    "inference_row_cost",
     "launch_grid",
+    "launch_split",
     "library_name",
     "load",
     "max_num_tokens",
@@ -9988,6 +10809,7 @@ __all__ = [
     "prefill_route_applies",
     "prefill_route_modules",
     "prefill_split_table",
+    "prefill_v6_plan",
     "route_applies",
     "route_chunk_steps",
     "route_key",
@@ -9995,10 +10817,12 @@ __all__ = [
     "run_module",
     "selected_module",
     "selected_prefill_module",
+    "selected_v6_module",
     "sm_count",
     "specs_for_arch",
     "split_count",
     "split_table",
     "state_dtype_key",
     "supported_num_householder",
+    "v6_householders",
 ]

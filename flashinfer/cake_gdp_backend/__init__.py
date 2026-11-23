@@ -21,13 +21,14 @@ MTP-verification kernels behind :mod:`flashinfer.cake_gdp`
 (:func:`cake_gated_delta_product_mtp`; SM90 / SM100 / SM103 / SM107) and the chunked varlen
 prefill kernels behind
 ``flashinfer.gdp_prefill.chunk_gated_delta_product(..., backend="cake")``
-(:func:`cake_chunk_gated_delta_product`; SM90).  The stable,
+(:func:`cake_chunk_gated_delta_product`; SM90 / SM100 / SM103).  The stable,
 ``@flashinfer_api``-decorated entry points and the full user-facing
 documentation live in those modules; import them.
 """
 
 from __future__ import annotations
 
+import collections
 from typing import Optional, Union
 
 import torch
@@ -734,7 +735,13 @@ def cake_chunk_gated_delta_product(
 
     The body of ``flashinfer.gdp_prefill.chunk_gated_delta_product(..., backend="cake")``; see that function for
     the full documentation of the arguments and semantics.  Every check here reads shapes, dtypes, strides and
-    Python scalars only.  The launches follow the body route of record (``prefill_body_classes`` over the host
+    Python scalars only.  On SM100 / SM103 the call is one launch of the Blackwell body over the item table of
+    ``prefill_v6_plan`` (the split rules read each sequence alone, short sequences' rows go to the least-loaded
+    CTAs; ``num_householder=3``; ``g=None`` / ``beta=None`` filled with ones; a ``state_indices`` pool refused); the
+    plan is built from the host lengths, so a captured graph is valid only for the batch it captured (other lengths
+    need a new capture or an eager call; a replay over changed device offsets runs no item and writes NaN to
+    ``o[0, 0, :2]`` and, with a final state, ``output_state[0, 0, 0, 0]``); the rest of this paragraph is
+    SM90's.  The launches follow the body route of record (``prefill_body_classes`` over the host
     sequence lengths): every sequence is classed by its own chunk count, ``H``, ``n`` and the SM count -- the V6
     fork-order body for a sequence under ``ROUTE_MIN_CHUNKS_P3`` (384) chunks (an empty one included) and for a
     call reading no initial state and keeping no final state, the merged chunked body for a unit-gate / unit-beta
@@ -807,6 +814,14 @@ def cake_chunk_gated_delta_product(
     scale_value = 0.0 if scale is None else float(scale)
     output_final_state = bool(output_final_state)
     pool_mode = state_indices is not None
+    # SM100 / SM103: the Blackwell body (one launch for every flag set over a host item table); it addresses the
+    # state as one dense [N, H, 64, 128] record per sequence, so a slot pool is refused.
+    blackwell = arch in _loader.V6_ARCHES
+    if blackwell and pool_mode:
+        raise ValueError(
+            f"no exported Cake GDP prefill program on {arch} reads or writes a state_indices pool; pass dense "
+            "[num_seqs, H, 64, 128] initial_state / output_state tensors"
+        )
 
     # -- the model inputs
     q_in = _tma_operand(q, "q", shape=(T, H, K), device=device, dtype=io_dtype)
@@ -844,6 +859,13 @@ def cake_chunk_gated_delta_product(
             device=device,
             dtypes=(torch.float32, io_dtype),
         )
+    if blackwell and (unit_gates or unit_beta):
+        # The Blackwell body has no unit-gate / unit-beta build: the unit values are materialized (the same
+        # recurrence, one fill each).
+        if unit_gates:
+            gate = torch.ones((T, H), dtype=torch.float32, device=device)
+        if unit_beta:
+            beta_in = torch.ones((T * n, H), dtype=torch.float32, device=device)
     cu_in, cu_int64 = _int32_view(cu_seqlens)
     mask = _CU_SEQLENS_INT64 if cu_int64 else 0
 
@@ -989,31 +1011,55 @@ def cake_chunk_gated_delta_product(
     cu_cpu: tuple[int, ...] = tuple(int(x) for x in cu_seqlens_cpu.tolist())
     device_index = _device_index(device)
     sm_count = _loader.sm_count(device_index)
-    _run_single_pass(
-        arch,
-        device,
-        device_index,
-        sm_count,
-        q_in,
-        k_in,
-        v_in,
-        kernel_out,
-        gate,
-        beta_in,
-        cu_in,
-        mask,
-        slots,
-        initial_in,
-        output_in,
-        scale_value,
-        N,
-        T,
-        H,
-        n,
-        unit_gates,
-        unit_beta,
-        cu_cpu,
-    )
+    if blackwell:
+        _run_blackwell_v6(
+            arch,
+            device,
+            device_index,
+            sm_count,
+            q_in,
+            k_in,
+            v_in,
+            kernel_out,
+            gate,
+            beta_in,
+            cu_in,
+            mask,
+            initial_in,
+            output_in,
+            scale_value if scale_value != 0.0 else HEAD_SIZE_K**-0.5,
+            N,
+            T,
+            H,
+            n,
+            cu_cpu,
+        )
+    else:
+        _run_single_pass(
+            arch,
+            device,
+            device_index,
+            sm_count,
+            q_in,
+            k_in,
+            v_in,
+            kernel_out,
+            gate,
+            beta_in,
+            cu_in,
+            mask,
+            slots,
+            initial_in,
+            output_in,
+            scale_value,
+            N,
+            T,
+            H,
+            n,
+            unit_gates,
+            unit_beta,
+            cu_cpu,
+        )
 
     if user_out is not None:
         user_out.copy_(out)
@@ -1477,6 +1523,157 @@ def _run_two_classes(
         )
         if total_tokens:
             out.index_copy_(0, tok, o_b)
+
+
+# ---- the Blackwell prefill body (SM100 / SM103) ----
+
+# Item buffers on the device, by (device, content).  An eager call uploads a new table on a private copy stream and
+# waits for that copy alone (a few KB; the compute stream is not synchronized), then keeps the table in a small LRU;
+# a CUDA graph captured after an eager call of the same batch (the usual warm-up) reuses that complete table, so the
+# graph holds no copy node, and the table is then kept for the life of the process (the graph reads it at every
+# replay).  A table first seen during capture is copied in the graph from a pinned buffer kept as long.
+_ITEM_TABLES_EAGER: collections.OrderedDict[tuple[int, bytes], torch.Tensor] = (
+    collections.OrderedDict()
+)
+_ITEM_TABLES_EAGER_MAX = 64
+_ITEM_TABLES_CAPTURED: dict[tuple[int, bytes], torch.Tensor] = {}
+_CAPTURED_PINNED: dict[tuple[int, bytes], torch.Tensor] = {}
+_COPY_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _item_table(words: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """The int32 ``items`` buffer ``words`` (``v6_item_words``) on ``device`` (read only): a cached complete buffer,
+    else an upload from pinned host memory (a pageable copy would synchronize the compute stream, which CUDA Graph
+    capture refuses)."""
+
+    host = torch.tensor(words, dtype=torch.int32)
+    index = device.index or 0
+    key = (index, host.numpy().tobytes())
+    table = _ITEM_TABLES_CAPTURED.get(key)
+    if table is not None:
+        return table
+    if torch.cuda.is_current_stream_capturing():
+        table = _ITEM_TABLES_EAGER.pop(key, None)
+        if table is None:
+            pinned = _CAPTURED_PINNED.setdefault(key, host.pin_memory())
+            table = torch.empty((host.numel(),), dtype=torch.int32, device=device)
+            table.copy_(pinned, non_blocking=True)
+        _ITEM_TABLES_CAPTURED[key] = table
+        return table
+    table = _ITEM_TABLES_EAGER.get(key)
+    if table is not None:
+        _ITEM_TABLES_EAGER.move_to_end(key)
+        return table
+    table = torch.empty((host.numel(),), dtype=torch.int32, device=device)
+    copy = _COPY_STREAMS.setdefault(index, torch.cuda.Stream(device=device))
+    with torch.cuda.stream(copy):
+        table.copy_(host.pin_memory(), non_blocking=True)
+    copy.synchronize()  # the table is complete before any stream reads it
+    _ITEM_TABLES_EAGER[key] = table
+    if len(_ITEM_TABLES_EAGER) > _ITEM_TABLES_EAGER_MAX:
+        _ITEM_TABLES_EAGER.popitem(last=False)
+    return table
+
+
+def _run_blackwell_v6(
+    arch,
+    device,
+    device_index,
+    sm_count,
+    q_in,
+    k_in,
+    v_in,
+    out,
+    gate,
+    beta_in,
+    cu_in,
+    mask,
+    initial_in,
+    output_in,
+    scale_value,
+    N,
+    T,
+    H,
+    n,
+    cu_cpu,
+) -> None:
+    """One launch of the Blackwell prefill body over the item table of ``prefill_v6_plan``: the split build over the
+    per-CTA lists of the ``split_table`` rows, or the block build (see the BLACKWELL V6 LAUNCH PLAN of the registry).  Every input is prepared on the device or uploaded from pinned memory: the call issues no
+    synchronization and captures into a CUDA graph (the item table cached on the device after an eager call of
+    the same batch, the split build's workspace cleared in the graph, then the kernel)."""
+
+    if T == 0:
+        # Every sequence is empty: its final state is its initial state (the kernel wants a token).
+        if output_in is not None:
+            if initial_in is not None:
+                output_in.copy_(initial_in)
+            else:
+                output_in.zero_()
+        return
+    plan = _loader.prefill_v6_plan(
+        cu_cpu,
+        num_heads=H,
+        num_householder=n,
+        sm_count=sm_count,
+        arch=arch,
+        total_tokens=T,
+    )
+    name = _loader.selected_v6_module(arch, plan)
+    if mask & _CU_SEQLENS_INT64:
+        # the body reads int32 offsets: one small copy of the N + 1 entries
+        cu_in = cu_in.view(torch.int64).to(torch.int32)
+    # the rows, the CTAs' row offsets and the planned offsets the kernel checks against the device ``cu_seqlens``
+    items = _item_table(_loader.v6_item_words(arch, plan, cu_cpu), device)
+    if plan.split:
+        # the N x H seed-done flags (the kernel leaves them zero) and two plan-echo words per row, zero at launch
+        split_ws = torch.zeros(
+            (4 * (N * H + 2 * len(plan.rows)),), dtype=torch.uint8, device=device
+        )
+    else:
+        split_ws = torch.empty(
+            (_loader.V6_SPLIT_WS_PLACEHOLDER,), dtype=torch.uint8, device=device
+        )
+    flags = (_loader.V6_FLAG_INITIAL_STATE if initial_in is not None else 0) | (
+        _loader.V6_FLAG_FINAL_STATE if output_in is not None else 0
+    )
+    placeholder = None
+    if initial_in is None or output_in is None:
+        placeholder = torch.empty((1,), dtype=torch.float32, device=device)
+    values = {
+        "q": q_in,
+        "k": k_in,
+        "v": v_in,
+        "o": out,
+        "gate": gate,
+        "beta": beta_in,
+        "cu_seqlens": cu_in,
+        "items": items,
+        "initial_state": initial_in if initial_in is not None else placeholder,
+        "output_state": output_in if output_in is not None else placeholder,
+        "tensormap_workspace": torch.empty(
+            (plan.grid * _loader.V6_TENSORMAP_BYTES,), dtype=torch.uint8, device=device
+        ),
+        "split_workspace": split_ws,
+        "state_stride_slot": H * _STATE_ELEMENTS,
+        "scale": scale_value,
+        "num_items": len(plan.rows),
+        "total_tokens": T,
+        "num_heads": H,
+        "num_householder": n,
+        "flags": flags,
+        "num_seqs": N,
+    }
+    with torch.cuda.device(device):
+        _loader.run_module(
+            name,
+            values,
+            batch=N,
+            heads=H,
+            device_index=device_index,
+            # the plan's grid (min(SM count, grid) == grid)
+            tiles=plan.grid,
+            sm_count=sm_count,
+        )
 
 
 __all__ = [
