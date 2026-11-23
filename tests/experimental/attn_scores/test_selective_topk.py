@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from flashinfer.attn_scores import FP8MQATopKWrapper
-from tests.test_helpers.parametrize import parametrize_product
+from tests.infra.test_helpers.parametrize import parametrize_product
 
 
 def _selective_available():
@@ -3062,3 +3062,646 @@ for splits in (0, 2, 16):
         raise RuntimeError("invalid split count accepted")
 """
     subprocess.run([sys.executable, "-O", "-c", program], check=True)
+
+
+# ================================================================================================
+# Selective TopK at production prefill geometry (Q8192, model presets, long KV).
+#
+# The tests above use 64 query rows and at most 16K keys. The kernel policy in
+# ``kernels/selective_topk/prefill/api.py`` also branches on ``M >= 8192`` and on the
+# physical key count relative to TopK (4x, 8x, 16x, 32x, 64x, 128x, 256x ...), so most
+# production kernel variants are only reached by this section.
+#
+# Every case checks:
+#   * all rows: index range, uniqueness and -1 padding (vectorized);
+#   * sampled rows: the selected score multiset against an independent FP32 oracle
+#     (or the dtype-rounded / native-rounded oracle for low-precision modes);
+#   * error bits, CUDA graph replay after an input change, and repeated replays.
+#
+# ``--full`` runs every regime point (one physical key count per code path, plus the longest
+# context) in every precision mode, every key count that is not a multiple of 128 in the FP8
+# precision modes, adversarial score distributions that exercise exact recovery (K4), and
+# live steps shorter than the planned capacity. The regular run keeps the shortest and longest context and one
+# unaligned key count per model preset in FP8, one skewed distribution and one short live step.
+#
+# Select this section with -k production; leave it out with -k "not production".
+# ================================================================================================
+
+Q = 8192
+SAMPLED_ROWS = 48
+
+# name: (heads, top_k, compression ratio)
+PRESETS = {
+    "DS-V3.2": (64, 2048, 1),
+    "DS-V4-Flash": (64, 512, 4),
+    "DS-V4-Pro": (64, 1024, 4),
+    "GLM-5.3": (32, 2048, 1),
+    "GLM-5.3-Flash": (32, 512, 4),
+    "Qwen3.8-Flash-Next": (4, 512, 4),
+}
+
+# Physical key counts at Q8192: the smallest count of each distinct K1/K2/K3/K4 code path
+# (compile arguments without pure shape constants) selected on SM100 and SM103 for the
+# PRECISIONS below, plus the 1M-token context. With --full, every point in every precision
+# reaches all of those code paths. DS-V4-Flash 32768 and DS-V4-Pro 65536 / 131072 also sit
+# inside the length windows where the MXFP4 sampler changes its sample count at run time.
+# Regenerate the points by recording the stage compile arguments when the dispatch policy
+# changes.
+REGIME_KEYS = {
+    "DS-V3.2": [8192, 10240, 65536, 67584, 1048576],
+    "DS-V4-Flash": [
+        2048,
+        2560,
+        4608,
+        8704,
+        16384,
+        32768,
+        33280,
+        65536,
+        66048,
+        131072,
+        262144,
+    ],
+    "DS-V4-Pro": [2048, 3072, 9216, 16384, 32768, 65536, 66560, 131072, 132096, 262144],
+    "GLM-5.3": [
+        8192,
+        10240,
+        16384,
+        18432,
+        32768,
+        34816,
+        65536,
+        67584,
+        131072,
+        133120,
+        262144,
+        264192,
+        524288,
+        1048576,
+    ],
+    "GLM-5.3-Flash": [2048, 2560, 16384, 32768, 33280, 65536, 66048, 131072, 262144],
+    "Qwen3.8-Flash-Next": [2048, 2560, 16896, 32768, 65536, 131072, 262144],
+}
+
+# Physical key counts that are not a multiple of 128: a K buffer sized to the request rather
+# than to a planned capacity. The filters then read the K scale through a clamped index,
+# GLM-5.3 takes the unaligned form of its pair-query epilogue and the unrolled tile groups
+# hand over to the clamped tail. FP8 only: block-scaled K storage is a multiple of 256 rows
+# by contract. The regular run takes the first point of each preset.
+UNALIGNED_KEYS = {
+    "DS-V3.2": [12365, 65613, 1048499],
+    "DS-V4-Flash": [16461, 65613],
+    "DS-V4-Pro": [16461, 65613],
+    "GLM-5.3": [12365, 65613, 393293, 1048499],
+    "GLM-5.3-Flash": [33357, 65613],
+    "Qwen3.8-Flash-Next": [16973, 65613],
+}
+
+# (qkv_dtype, math_mode, logits_dtype, weights_dtype)
+FP8_DEFAULT = ("fp8", None, torch.float32, torch.float32)
+PRECISIONS = [
+    FP8_DEFAULT,
+    ("fp8", "relu_strict", torch.float32, torch.float32),
+    ("fp8", None, torch.float16, torch.float32),
+    ("fp8", "native_bf16", torch.bfloat16, torch.bfloat16),
+    ("fp8", "native_fp16", torch.float16, torch.bfloat16),
+    ("mxfp8", None, torch.float32, torch.float32),
+    ("mxfp8", "native_bf16", torch.bfloat16, torch.bfloat16),
+    ("mxfp4", None, torch.float32, torch.float32),
+    ("mxfp4", "native_bf16", torch.bfloat16, torch.bfloat16),
+]
+
+
+def _precision_id(p):
+    qkv, math, logits, weights = p
+    return f"{qkv}-{math or 'default'}-{str(logits)[6:]}-w{str(weights)[6:]}"
+
+
+def _cases(full):
+    cases = []
+    for model, keys in REGIME_KEYS.items():
+        for p in PRECISIONS if full else PRECISIONS[:1]:
+            for n in keys if full else (keys[0], keys[-1]):
+                suffix = "fp8" if p == FP8_DEFAULT else _precision_id(p)
+                cases.append(pytest.param(model, n, p, id=f"{model}-N{n}-{suffix}"))
+    for model, keys in UNALIGNED_KEYS.items():
+        for p in [p for p in PRECISIONS if p[0] == "fp8"] if full else PRECISIONS[:1]:
+            for n in keys if full else keys[:1]:
+                suffix = "fp8" if p == FP8_DEFAULT else _precision_id(p)
+                cases.append(
+                    pytest.param(model, n, p, id=f"{model}-N{n}-unaligned-{suffix}")
+                )
+    return cases
+
+
+_DISTRIBUTIONS = ["ramp", "ties", "constant", "negative", "hot"]
+
+
+def _distribution_cases(full):
+    if not full:
+        return [pytest.param("DS-V3.2", 65536, "ramp", id="DS-V3.2-N65536-ramp")]
+    cases = []
+    for model, keys in REGIME_KEYS.items():
+        n = keys[len(keys) // 2]
+        for dist in _DISTRIBUTIONS:
+            if model == "Qwen3.8-Flash-Next" and dist in ("ramp", "negative"):
+                continue  # Qwen fixes unit key scales and constant positive weights
+            cases.append(pytest.param(model, n, dist, id=f"{model}-N{n}-{dist}"))
+    return cases
+
+
+def _live_extent_cases(full):
+    if not full:
+        return [
+            pytest.param(
+                "DS-V3.2",
+                1048576,
+                5000,
+                65536,
+                id="DS-V3.2-N1048576-liveQ5000-liveKV65536",
+            )
+        ]
+    cases = []
+    for model, keys in REGIME_KEYS.items():
+        ratio = PRESETS[model][2]
+        for n, live_q, live_kv in (
+            (keys[-1], Q, max(Q, 65536)),
+            (keys[len(keys) // 2], 3001, max(3001, keys[len(keys) // 2] * ratio // 2)),
+        ):
+            cases.append(
+                pytest.param(
+                    model,
+                    n,
+                    live_q,
+                    live_kv,
+                    id=f"{model}-N{n}-liveQ{live_q}-liveKV{live_kv}",
+                )
+            )
+    return cases
+
+
+# Precisions of the supplied-rows test: the FP8, MXFP8 and MXFP4 kernel families, FP32 and native head math.
+SUPPLIED_PRECISIONS = [
+    PRECISIONS[0],
+    PRECISIONS[4],
+    PRECISIONS[5],
+    PRECISIONS[7],
+    PRECISIONS[8],
+]
+
+
+def _supplied_rows_cases(full):
+    cases = []
+
+    def add(model, n, p, live_q, tag=""):
+        suffix = "fp8" if p == FP8_DEFAULT else _precision_id(p)
+        cases.append(
+            pytest.param(
+                model, n, p, live_q, id=f"{model}-N{n}{tag}-{suffix}-liveQ{live_q}"
+            )
+        )
+
+    for model, keys in REGIME_KEYS.items():
+        if not full:
+            add(model, keys[-1], FP8_DEFAULT, 1000)
+            add(model, keys[len(keys) // 2], PRECISIONS[7], 4096)
+            continue
+        for p in SUPPLIED_PRECISIONS:
+            for n in keys:
+                add(model, n, p, 1000)
+        add(model, keys[len(keys) // 2], FP8_DEFAULT, 4096)
+        add(model, keys[len(keys) // 2], PRECISIONS[7], 4096)
+    if full:
+        for model, keys in UNALIGNED_KEYS.items():
+            for n in keys:
+                add(model, n, FP8_DEFAULT, 1000, "-unaligned")
+    return cases
+
+
+def pytest_generate_tests(metafunc):
+    full = bool(metafunc.config.getoption("--full", default=False))
+    if metafunc.function.__name__ == "test_selective_production_supplied_rows":
+        metafunc.parametrize("model,n,precision,live_q", _supplied_rows_cases(full))
+    if metafunc.function.__name__ == "test_selective_production_geometry":
+        metafunc.parametrize("model,n,precision", _cases(full))
+    elif metafunc.function.__name__ == "test_selective_production_score_distributions":
+        metafunc.parametrize("model,n,distribution", _distribution_cases(full))
+    elif metafunc.function.__name__ == "test_selective_production_live_extent":
+        metafunc.parametrize("model,n,live_q,live_kv", _live_extent_cases(full))
+
+
+def _require_device():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100 or SM103")
+    import importlib.util
+
+    if importlib.util.find_spec("cutlass") is None:
+        pytest.skip("requires CuTe DSL")
+
+
+def _block_scale(values, scale_bytes):
+    """values [..., 128] float, scale_bytes [..., 4] UE8M0 -> values * 2**(s-127) per 32."""
+    factor = torch.exp2(scale_bytes.float() - 127).repeat_interleave(32, dim=-1)
+    return values * factor
+
+
+class _Problem:
+    """Inputs, decoded FP32 operands and an independent per-row oracle."""
+
+    def __init__(
+        self, model, n, precision, distribution="signed", seed=0, live_q=Q, live_kv=None
+    ):
+        heads, top_k, ratio = PRESETS[model]
+        qkv, math, logits, wdtype = precision
+        self.model, self.heads, self.top_k, self.ratio = model, heads, top_k, ratio
+        # Capacity is n physical keys (n * ratio original tokens) and Q query rows; the plan
+        # may describe a shorter live context and fewer live query rows.
+        self.n, self.kv = n, n * ratio
+        self.live_q = live_q
+        self.live_kv = self.kv if live_kv is None else live_kv
+        assert self.live_q <= self.live_kv <= self.kv and 0 < self.live_q <= Q
+        self.qkv, self.math, self.logits, self.wdtype = qkv, math, logits, wdtype
+        self.qwen = model == "Qwen3.8-Flash-Next"
+        g = torch.Generator(device="cuda").manual_seed(seed + 7919 * n + heads)
+        dev = "cuda"
+        self.q_scale = None
+        if qkv == "mxfp4":
+            self.q = torch.randint(
+                0, 256, (Q, heads, 64), device=dev, dtype=torch.uint8, generator=g
+            )
+            self.k = torch.randint(
+                0, 256, (n, 64), device=dev, dtype=torch.uint8, generator=g
+            )
+            qsb = torch.randint(
+                125, 130, (Q, heads, 4), device=dev, dtype=torch.uint8, generator=g
+            )
+            self.k_scale = torch.randint(
+                125, 130, (n, 4), device=dev, dtype=torch.uint8, generator=g
+            )
+            self.q_scale = qsb
+            self.qf = _block_scale(_decode_fp4(self.q), qsb)
+            self.kf = _block_scale(_decode_fp4(self.k), self.k_scale)
+            self.kscale_f = torch.ones(n, device=dev)
+        else:
+            # Model-like magnitudes: E4M3 values ~N(0, 1), so native FP16 head sums stay finite.
+            q = torch.randn((Q, heads, 128), device=dev, generator=g)
+            k = torch.randn((n, 128), device=dev, generator=g)
+            if distribution == "ties":
+                k = k[torch.arange(n, device=dev) % 97]  # 97 distinct keys repeated
+            elif distribution == "constant":
+                k = k[:1].expand(n, 128).contiguous()  # every score in a row is equal
+            elif distribution == "hot":
+                k = k * 0.125
+                hot = torch.randint(0, n, (max(1, n // 4096),), device=dev, generator=g)
+                k[hot] *= 16.0  # a few keys dominate
+            self.q = q.to(torch.float8_e4m3fn)
+            self.k = k.to(torch.float8_e4m3fn)
+            if qkv == "mxfp8":
+                qsb = torch.randint(
+                    125, 130, (Q, heads, 4), device=dev, dtype=torch.uint8, generator=g
+                )
+                self.k_scale = torch.randint(
+                    125, 130, (n, 4), device=dev, dtype=torch.uint8, generator=g
+                )
+                if distribution in ("ties", "constant"):
+                    self.k_scale[:] = 127
+                self.q_scale = qsb
+                self.qf = _block_scale(self.q.float(), qsb)
+                self.kf = _block_scale(self.k.float(), self.k_scale)
+                self.kscale_f = torch.ones(n, device=dev)
+            else:
+                if distribution == "ramp":
+                    scale = torch.linspace(
+                        1e-3, 1.0, n, device=dev
+                    )  # late keys dominate
+                elif distribution in ("ties", "constant"):
+                    scale = torch.full((n,), 0.5, device=dev)
+                else:
+                    scale = torch.exp2(
+                        torch.randint(-3, 2, (n,), device=dev, generator=g).float()
+                    )
+                if self.qwen:
+                    scale = torch.ones(n, device=dev)
+                self.k_scale = scale
+                self.kscale_f = scale
+                self.qf, self.kf = self.q.float(), self.k.float()
+        if self.qwen:
+            w = torch.full((Q, heads), 128**-0.5, device=dev)
+        elif distribution == "negative":
+            w = -(torch.rand((Q, heads), device=dev, generator=g) + 0.01) * 0.1
+        else:
+            w = torch.randn((Q, heads), device=dev, generator=g) * 0.1
+        self.weights = w.to(wdtype)
+        rows = torch.arange(1, Q + 1, device=dev)
+        self.ends = torch.where(
+            rows <= self.live_q, (self.live_kv - self.live_q + rows) // ratio, 0
+        )
+        self.rows = self._sample_rows()
+        self.oracle_cache = {}
+
+    def _sample_rows(self):
+        g = torch.Generator().manual_seed(self.n)
+        live = self.live_q
+        picks = {0, 1, live // 2, live - 1} | set(
+            torch.randint(0, live, (SAMPLED_ROWS,), generator=g).tolist()
+        )
+        return sorted(picks)
+
+    def wrapper(self):
+        return FP8MQATopKWrapper(
+            backend="cutedsl",
+            num_heads=self.heads,
+            top_k=self.top_k,
+            compression_ratio=self.ratio,
+            max_context_length=self.kv,
+            max_chunk_size=Q,
+            max_batch_size=1,
+            num_keys=self.n,
+            device="cuda",
+            qkv_dtype=self.qkv,
+            math_mode=self.math,
+            logits_dtype=self.logits,
+            weights_dtype=self.wdtype,
+            model_config=self.model if self.qwen else None,
+        )
+
+    def run_kwargs(self):
+        return dict(k_scale=self.k_scale, q_scale=self.q_scale)
+
+    def oracle(self, row):
+        """Scores of one row in the comparison domain of the selected mode (cached)."""
+        if row not in self.oracle_cache:
+            self.oracle_cache[row] = self._oracle(row)
+        return self.oracle_cache[row]
+
+    def _oracle(self, row):
+        end = int(self.ends[row])
+        prev = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            dots = (self.qf[row] @ self.kf[:end].T).relu_()  # [H, end]
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev
+        w = self.weights[row].float()
+        scale = self.kscale_f[:end]
+        fp32 = (dots * w[:, None]).sum(0) * scale
+        # Magnitude of the summed terms bounds the rounding error of reordered sums.
+        mag = (dots * w.abs()[:, None]).sum(0) * scale.abs()
+        if self.math in ("native_bf16", "native_fp16"):
+            dt = self.logits
+            factor = 512 if (self.math == "native_fp16" and self.qkv == "fp8") else 1
+            rd = (dots / factor).to(dt).double()
+            rw = (w * factor).to(dt).double()
+            chains = [
+                torch.zeros(end, device="cuda", dtype=torch.float64) for _ in range(4)
+            ]
+            for h in range(self.heads):
+                i = h % 4
+                chains[i] = (rd[h] * rw[h] + chains[i]).to(dt).double()
+            left = (chains[0] + chains[2]).to(dt).double()
+            right = (chains[1] + chains[3]).to(dt).double()
+            return ((left + right).to(dt).float() * scale).to(dt).float(), mag
+        if self.logits != torch.float32:
+            return fp32.to(self.logits).float(), mag
+        return fp32, mag
+
+
+def _check_structure(selected, problem):
+    ends = problem.ends.long()
+    count = ends.clamp(max=problem.top_k)
+    live = torch.arange(problem.top_k, device="cuda")[None, :] < count[:, None]
+    idx = selected.long()
+    assert bool((((idx >= 0) & (idx < ends[:, None])) | ~live).all()), (
+        "index out of range"
+    )
+    assert bool((idx[~live] == -1).all()), "rows must be padded with -1"
+    ordered = torch.where(live, idx, torch.full_like(idx, -1)).sort(1).values
+    assert not bool(
+        ((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()
+    ), "duplicate"
+
+
+def _check_rows(selected, problem):
+    """Sampled rows: the selected set is a TopK of the oracle (ties may swap)."""
+    for row in problem.rows:
+        scores, mag = problem.oracle(row)
+        count = min(problem.top_k, scores.numel())
+        if count == 0:
+            continue  # no visible keys; the structural check covers the -1 row
+        idx = selected[row, :count].long()
+        picked = scores[idx].sort(descending=True).values
+        top = scores.topk(count)
+        best = top.values
+        if problem.logits == torch.float32:
+            torch.testing.assert_close(
+                picked, best, atol=1e-4, rtol=1e-4, msg=lambda m: f"row {row}: {m}"
+            )
+            continue
+        # Low-precision logits or native arithmetic: the oracle does not model the MMA
+        # dot-product order, so allow a few rounding steps of the summed-term magnitude at
+        # the boundary. Every pick must reach the k-th score within that margin, and every
+        # clearly larger score must be picked.
+        eps = {torch.float16: 2.0**-10, torch.bfloat16: 2.0**-7}[problem.logits]
+        native = problem.math in ("native_bf16", "native_fp16")
+        kth = best[-1]
+        tol = (4 if native else 2) * eps * float(
+            mag[top.indices].max() if native else kth.abs()
+        ) + 1e-6
+        assert bool((picked >= kth - tol).all()), (
+            f"row {row}: selection below the k-th score"
+        )
+        clearly = (scores > kth + tol).nonzero().flatten()
+        missing = ~torch.isin(clearly, idx)
+        assert not bool(missing.any()), (
+            f"row {row}: {int(missing.sum())} clearly larger keys missing"
+        )
+
+
+def _run_and_check(problem, *, replay_change=True, repeats=3):
+    op = problem.wrapper()
+    qo = torch.tensor([0, problem.live_q], device="cuda", dtype=torch.int32)
+    kv = torch.tensor([0, problem.live_kv], device="cuda", dtype=torch.int32)
+    op.prepare_pool(problem.k, k_scale=problem.k_scale)
+    op.plan(qo, kv)
+    eager = op.run(
+        problem.q, problem.weights, problem.k, **problem.run_kwargs()
+    ).clone()
+    torch.cuda.synchronize()
+    assert op.error.item() == 0 and op.repair_error.item() == 0
+    _check_structure(eager, problem)
+    _check_rows(eager, problem)
+    engine = getattr(op._capacity_plan, "_engine", None)
+    if engine is not None and hasattr(engine, "recovery_queue"):
+        # Diagnostic only (run with -s): K4 tasks and K2 candidate counts relative to TopK.
+        counts = engine.counts.float()
+        print(
+            f"[selective] {problem.model} N{problem.n} {problem.qkv}/{problem.math}: "
+            f"recovery_tasks={int(engine.recovery_queue[0])} "
+            f"candidates/topk median={float(counts.median()) / problem.top_k:.2f} "
+            f"min={float(counts.min()) / problem.top_k:.2f}"
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = op.run(problem.q, problem.weights, problem.k, **problem.run_kwargs())
+    # Every replay is again a valid TopK; ties at the boundary may swap between replays.
+    for _ in range(repeats):
+        replayed.fill_(-7)  # poison: a replay that skips any row is caught
+        graph.replay()
+        torch.cuda.synchronize()
+        assert op.error.item() == 0 and op.repair_error.item() == 0
+        _check_structure(replayed, problem)
+        _check_rows(replayed, problem)
+    if replay_change and not problem.qwen:
+        # New query payload and weights through the captured graph.
+        if problem.qkv == "mxfp4":
+            problem.q.bitwise_xor_(0x11)
+            problem.qf = _block_scale(_decode_fp4(problem.q), problem.q_scale)
+        else:
+            flipped = (-problem.q.float()).to(problem.q.dtype)
+            problem.q.copy_(flipped)
+            problem.qf = (
+                problem.q.float()
+                if problem.q_scale is None
+                else _block_scale(problem.q.float(), problem.q_scale)
+            )
+        problem.weights.mul_(-1)
+        problem.oracle_cache.clear()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert op.error.item() == 0 and op.repair_error.item() == 0
+        _check_structure(replayed, problem)
+        _check_rows(replayed, problem)
+    return op
+
+
+def test_selective_production_geometry(model, n, precision):
+    _require_device()
+    _run_and_check(_Problem(model, n, precision))
+
+
+def test_selective_production_score_distributions(model, n, distribution):
+    """Skewed, tied, constant, all-negative and heavy-hitter scores force exact recovery paths."""
+    _require_device()
+    _run_and_check(
+        _Problem(model, n, FP8_DEFAULT, distribution=distribution),
+        replay_change=False,
+        repeats=2,
+    )
+
+
+def test_selective_production_live_extent(model, n, live_q, live_kv):
+    """Capacity-planned kernels (chosen for n keys and Q rows) on a shorter live step.
+
+    Serving plans capacity for the longest context and the full chunk; a step may carry
+    fewer query rows (the last chunk) and a much shorter context. Rows beyond the live
+    query prefix must be -1; keys beyond the live context must never be selected.
+    """
+    _require_device()
+    _run_and_check(_Problem(model, n, FP8_DEFAULT, live_q=live_q, live_kv=live_kv))
+
+
+def test_selective_production_supplied_rows(model, n, precision, live_q):
+    """Steps that supply fewer Q rows than max_chunk_size on a wrapper planned for Q rows.
+
+    One TP rank's share of a chunk and the last chunk of a prompt supply fewer rows. The
+    kernels are then launched for the supplied rows only. The same wrapper alternates
+    between the full chunk and shorter steps, so each step also runs over the row state
+    another step shape left behind; one of the short steps goes through a CUDA graph.
+    """
+    import copy
+
+    _require_device()
+    problem = _Problem(model, n, precision, live_q=live_q)
+    op = problem.wrapper()
+    qo = torch.tensor([0, problem.live_q], device="cuda", dtype=torch.int32)
+    kv = torch.tensor([0, problem.live_kv], device="cuda", dtype=torch.int32)
+    op.prepare_pool(problem.k, k_scale=problem.k_scale)
+    q_scale = problem.q_scale
+
+    def step(supplied, capture=False):
+        op.plan(qo, kv, num_query_rows=supplied)
+        view = copy.copy(problem)
+        view.ends = problem.ends[:supplied]
+        kwargs = dict(
+            k_scale=problem.k_scale,
+            q_scale=None if q_scale is None else q_scale[:supplied],
+        )
+        args = (problem.q[:supplied], problem.weights[:supplied], problem.k)
+        selected = op.run(*args, **kwargs).clone()
+        torch.cuda.synchronize()
+        assert op.error.item() == 0 and op.repair_error.item() == 0
+        assert selected.shape == (supplied, problem.top_k)
+        engine = getattr(op._capacity_plan, "_engine", None)
+        if engine is not None and getattr(engine, "block_scores", None) is None:
+            # The launch follows the step: K3 has one CTA per row of its output argument.
+            k3_rows = {
+                arg.shape[0]
+                for arg in dict(engine.stages)["K3"].arguments.args
+                if isinstance(arg, torch.Tensor)
+                and arg.data_ptr() == engine.output.data_ptr()
+            }
+            assert k3_rows == {supplied}, (k3_rows, supplied)
+        _check_structure(selected, view)
+        _check_rows(selected, view)
+        if capture:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                replayed = op.run(*args, **kwargs)
+            for _ in range(2):
+                replayed.fill_(
+                    -7
+                )  # poison: a replay that skips any supplied row is caught
+                graph.replay()
+                torch.cuda.synchronize()
+                assert op.error.item() == 0 and op.repair_error.item() == 0
+                _check_structure(replayed, view)
+                _check_rows(replayed, view)
+
+    # live_q + 24: the supplied rows end inside a query block and leave inactive rows after the live prefix.
+    plan = getattr(op, "_capacity_plan", None)
+
+    def check_rows_past():
+        # Rows past the live prefix, launched or not: -1 and no candidates.
+        if plan is None or not plan._rows_bindable:
+            return
+        torch.cuda.synchronize()
+        assert bool((plan._selected[live_q:] == -1).all())
+        counts = getattr(plan._engine, "counts", None)
+        assert counts is None or bool((counts[live_q:] == 0).all())
+
+    for supplied, capture in (
+        (Q, False),
+        (live_q, True),
+        (min(Q, live_q + 24), False),
+        (Q, False),
+        (live_q, False),
+    ):
+        step(supplied, capture)
+        if supplied == Q:
+            check_rows_past()
+
+    if plan is None or not plan._rows_bindable:
+        return
+    # The same for the rows past the supplied ones, also after a retained graph that holds
+    # the plan of a longer step is replayed.
+    qo_full = torch.tensor([0, Q], device="cuda", dtype=torch.int32)
+    full_args = (problem.q, problem.weights, problem.k)
+    full_kwargs = dict(k_scale=problem.k_scale, q_scale=q_scale)
+    op.plan(qo_full, kv, num_query_rows=Q)
+    op.run(*full_args, **full_kwargs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op.plan(qo_full, kv, num_query_rows=Q)
+        op.run(*full_args, **full_kwargs)
+
+    step(live_q)
+    check_rows_past()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool((plan._selected[live_q:] != -1).any())
+    step(live_q)
+    check_rows_past()

@@ -58,6 +58,7 @@ def compile_filter(
     native_loop_unroll=8,
     native_broadcast_sum=False,
     enable_strict_interleave=False,
+    pair_unaligned=False,
 ):
     block_fp8 = qkv == "mxfp8"
     if block_fp8:
@@ -234,8 +235,18 @@ def compile_filter(
             attrs.update(
                 dsv4_direct_sync=True, dsv4_alias_kv=True, dsv4_aligned_k=aligned_k
             )
+        # DS-V4 H64 MXFP4 relu with FP32 logits (TRT-LLM's default DSV4 indexer on Blackwell): the 16-tile unrolled main loop is
+        # 1.003-1.009x at 128K-1M (B200, same TopK output); other modes keep the 4-tile loop.
         else:
-            attrs.update(dsv4_unroll=True, dsv4_packed_store=packed_store_enabled)
+            attrs.update(
+                dsv4_unroll=not (
+                    qkv == "mxfp4"
+                    and not block_fp8
+                    and dtype == cutlass.Float32
+                    and not (native_bf16 or native_fp16)
+                ),
+                dsv4_packed_store=packed_store_enabled,
+            )
     if (dsv4 or glm_prepare_sf) and qkv == "mxfp4":
         attrs.update(remove_online_sf_transpose=True)
     if dsv4 and qkv == "fp8":
@@ -298,7 +309,7 @@ def compile_filter(
             glm_pair_queries=True,
             q_stage_override=1,
             num_epi_subtiles=4,
-            dsv4_aligned_k=True,
+            dsv4_aligned_k=not pair_unaligned,
         )
     if (native_bf16 or native_fp16) and heads in (4, 32):
         attrs.pop("glm_full_tiles", None)
@@ -320,6 +331,18 @@ def compile_filter(
             dsv4_finite_integer=False,
         )
     weight_dtype = DTYPES[signature[4 if qkv == "mxfp4" else 3][0]]
+    # H4 FP8 epilogue: one TMEM load per warpgroup and tile plus register-cached weights (same arithmetic). B200 Qwen3.8-Flash-Next:
+    # relu_fast 1.05x at 256K / 1.08x at 1M, native_fp16 1.03x / 1.05x; native_bf16 is unchanged (1.00x) and keeps the old path.
+    # The rule looks at the filter chosen for FP32 weights. With BF16 weights the branch below also moves the packed-candidate
+    # H4 filter to this kernel; that combination keeps the generic epilogue (the fast path has not been validated with it).
+    h4_fast = (
+        qkv == "fp8"
+        and heads == 4
+        and not native_bf16
+        and GEMM.__module__.endswith(".fp8_safe_filter")
+    )
+    if h4_fast:
+        attrs.update(h4_fast=True)
     if weight_dtype == cutlass.BFloat16:
         if qkv == "fp8":
             from .fp8_safe_filter import FP8PrefillMQALogitsKernel as GEMM
@@ -350,6 +373,13 @@ def compile_filter(
             and not publish_blocks
         )
         attrs["num_sms"] = sms * persistent_grid_multiplier
+    # The unrolled main loop with compile-time TMEM stages pays off for the H64 epilogues and for the native low-precision H32
+    # epilogues; it is slower for the H32 FP32 epilogue, which keeps the per-tile loop. Its tile groups read the K scale without the
+    # index clamp (same values): the clamped form made ptxas spill uniform registers around every TMEM load in the H64 FP32 epilogue.
+    if GEMM.__module__.endswith(".fp8_safe_filter") and (
+        heads == 64 or (heads == 32 and (native_bf16 or native_fp16))
+    ):
+        attrs.update(static_main_loop=True)
     tensors = []
     for i, (d, shape) in enumerate(signature):
         dims = tuple(cute.sym_int() if x < 0 else x for x in shape)

@@ -191,7 +191,16 @@ class FP8PrefillMQALogitsKernel:
         self.sample_position_stride = (
             fixed_samples
             if self.fixed_persistent and num_heads == 32 and top_k == 512
-            else 1024
+            else (
+                4096
+                if (
+                    not self.fixed_persistent
+                    and num_heads == 32
+                    and top_k == 2048
+                    and not dsv4
+                )
+                else 1024
+            )
         )
 
         arch = BaseDSL._get_dsl().get_arch_enum()
@@ -383,7 +392,11 @@ class FP8PrefillMQALogitsKernel:
         self.num_kv_scale_tma_bytes = self.block_kv * self.head_dim + self.block_kv * 4
         self.num_q_tma_bytes = b_copy_size * atom_thr_size + w_copy_size
 
-        num_q_blocks = (num_q_tokens + self.block_q - 1) // self.block_q
+        # Schedule the query blocks of the rows the output view has: the engine binds the supplied rows of a step there.
+        # num_q_tokens stays the storage extent, which the row layouts are derived from.
+        num_q_blocks = (
+            min(num_q_tokens, output.shape[0]) + self.block_q - 1
+        ) // self.block_q
         num_ctas = num_q_blocks * self.splits
         if cutlass.const_expr(
             self.mode == "filter" or (self.mode == "sample" and self.persistent_sample)
@@ -2653,3 +2666,82 @@ from .native_lowp_math import native_fp8_pack_relu
 from .native_heads import head_zero, head_sum, native_head_fma4
 
 from .native_heads import native_weight_pair
+
+
+# ---- Grow FP8 K1 samples past the 1024 cap on long H32-K2048 rows (GLM) ----
+# The 1024 cap leaves ~2 expected top-k hits per row at 512*k keys, so the 6-sigma proposal keeps ~5.4*k
+# candidates (K2 publishes and K3 selects all of them) with a wide tail (the slab is sized 16-18*k).
+# Past 128*k keys these rows keep ~8 expected hits, as the H64 policy already does; the narrow candidate tail
+# (max ~6.6*k at 1M instead of ~14*k) lets api.py cap the candidate slab at 10*k. Only this FP8 sampler module
+# rebinds the names below; FP4/paged samplers, K2/K4 and DSV4 keep the shared policies. Output selection is
+# unchanged: thresholds only decide how many candidates survive; underfilled rows take exact recovery.
+from .policy_dsv4 import runtime_samples as _base_runtime_samples
+from .sample_count_policy import shape_sample_key as _base_shape_key
+from .policy_qwen import sample_hash_u32 as _sample_hash
+
+
+@cute.jit
+def runtime_samples(
+    length,
+    k: cutlass.Constexpr = 2048,
+    heads: cutlass.Constexpr = 64,
+    coverage: cutlass.Constexpr = 8,
+    dsv4: cutlass.Constexpr = False,
+):
+    samples = _base_runtime_samples(length, k, heads, coverage, dsv4)
+    if cutlass.const_expr(heads == 32 and k == 2048 and not dsv4):
+        if length > 128 * k:
+            samples = cutlass.Int32(2048)
+        if length > 256 * k:
+            samples = cutlass.Int32(4096)
+    return samples
+
+
+@cute.jit
+def block_samples(
+    qb,
+    ends,
+    nq,
+    bq: cutlass.Constexpr,
+    k: cutlass.Constexpr = 2048,
+    heads: cutlass.Constexpr = 64,
+    coverage: cutlass.Constexpr = 8,
+    dsv4: cutlass.Constexpr = False,
+    anchor_upper=0,
+):
+    length = ends[min(nq - 1, qb * bq + bq - 1)]
+    if cutlass.const_expr(dsv4 and k == 1024):
+        if anchor_upper > 0:
+            length = anchor_upper
+    return runtime_samples(length, k, heads, coverage, dsv4)
+
+
+@cute.jit
+def shape_sample_key(
+    sample_count: cutlass.Constexpr,
+    pos,
+    qb,
+    lower,
+    upper,
+    k: cutlass.Constexpr = 512,
+    heads: cutlass.Constexpr = 64,
+    coverage: cutlass.Constexpr = 8,
+    common: cutlass.Constexpr = False,
+):
+    if cutlass.const_expr(sample_count == 0 and heads == 32 and k == 2048):
+        width = max(1, upper - lower)
+        samples = runtime_samples(upper, k, heads, coverage)
+        shift = 31 - cutlass.Int32(cute.arch.clz(cutlass.Uint32(samples)))
+        h = _sample_hash(
+            pos, cutlass.Int32(0) if cutlass.const_expr(common and k == 2048) else qb
+        )
+        begin = cutlass.Int32((cutlass.Int64(pos) * cutlass.Int64(width)) >> shift)
+        finish = cutlass.Int32((cutlass.Int64(pos + 1) * cutlass.Int64(width)) >> shift)
+        offset = begin + cutlass.Int32(
+            (cutlass.Uint64(h) * cutlass.Uint64(max(1, finish - begin))) >> 32
+        )
+        return max(cutlass.Int32(0), min(upper - 1, lower + offset))
+    else:
+        return _base_shape_key(
+            sample_count, pos, qb, lower, upper, k, heads, coverage, common
+        )

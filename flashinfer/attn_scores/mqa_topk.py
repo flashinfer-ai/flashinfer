@@ -188,6 +188,9 @@ class FP8MQATopKWrapper:
             in original tokens for the single request.
         num_query_rows : int, optional
             Extent of the supplied Q storage. Defaults to ``max_chunk_size``.
+            The cutedsl stages are launched for this many rows, so a CUDA
+            graph captured from ``run`` belongs to the ``num_query_rows`` of
+            the step it was captured in.
         next_n : int, optional
             Assert that the request has exactly this many query rows.
         host_length_hints : tuple[torch.Tensor, torch.Tensor], optional

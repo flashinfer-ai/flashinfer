@@ -260,7 +260,11 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
             b_copy_size * atom_thr_size + sf_q_tma_bytes + w_copy_size
         )
 
-        num_q_blocks = (num_q_tokens + self.block_q - 1) // self.block_q
+        # Schedule the query blocks of the rows the output view has: the engine binds the supplied rows of a step there.
+        # num_q_tokens stays the storage extent, which the row layouts are derived from.
+        num_q_blocks = (
+            min(num_q_tokens, output.shape[0]) + self.block_q - 1
+        ) // self.block_q
         num_ctas = num_q_blocks * self.splits
         num_ctas = min(num_q_blocks, self.num_sms) * self.splits
 

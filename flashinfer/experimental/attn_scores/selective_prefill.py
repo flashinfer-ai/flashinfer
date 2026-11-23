@@ -175,6 +175,10 @@ class _CapacitySelectiveTopKPlan:
         self._capacity = capacity
         self._pool_bindings = {}
         self._engine = None
+        # Rows K1-K3 are launched for in this step, and whether the engines of this wrapper follow the step
+        # (see _bind_supplied_rows).
+        self._step_rows = max_chunk_size
+        self._rows_bindable = None
         self._step_prepared = False
         self._state = _SelectiveStepInputs(
             capacity,
@@ -434,7 +438,12 @@ class _CapacitySelectiveTopKPlan:
             )
 
         engine = copy.copy(self._template_engine)
-        engine.stages = [(name, bind_stage(stage)) for name, stage in engine.stages]
+        # The copy starts from the stages of max_chunk_size rows, whatever rows the template is bound to now.
+        capacity_stages = engine.__dict__.pop("_row_stages", {}).get(
+            self._capacity.max_chunk_size, engine.stages
+        )
+        engine.__dict__.pop("_bound_rows", None)
+        engine.stages = [(name, bind_stage(stage)) for name, stage in capacity_stages]
         if self._candidate_capacity:
             if engine.sample_bounds is not None:
                 engine.sample_bounds = tuple(
@@ -468,12 +477,91 @@ class _CapacitySelectiveTopKPlan:
             self._template_engine = self._template_keys = self._template_scales = None
             self._cache_protected_ranges()
 
+    def _bind_supplied_rows(self, engine):
+        """Launch K1-K3 for the Q rows this step supplies, not for max_chunk_size.
+
+        The stages are prepared for max_chunk_size rows. A step that supplies fewer
+        (one TP rank's share of a chunk, the last chunk of a prompt) would still
+        sample, load and select for every row slot. K1 and K2 schedule the query
+        blocks of the rows their output argument has and K3 launches one CTA per
+        output row, so binding a prefix view of the output there is the whole
+        change: storage, layouts and kernels stay those of max_chunk_size, and
+        rows past the view are neither written nor read (K4 takes its tasks from
+        the queue K3 fills). Engines that publish or consume candidate blocks keep
+        the full launch: their block stage reads every row.
+        """
+        capacity, rows = self._capacity.max_chunk_size, self._step_rows
+        bound = engine.__dict__.get("_bound_rows", capacity)
+        engine._bound_rows = rows
+        if self._rows_bindable is None:
+            self._rows_bindable = not (
+                self._candidate_capacity
+                or getattr(engine, "block_scores", None) is not None
+                or [name for name, _ in engine.stages] != ["K1", "K2", "K3", "K4"]
+            )
+        if not self._rows_bindable or bound == rows:
+            return
+        from dataclasses import replace
+        from cutlass import testing
+
+        cache = engine.__dict__.setdefault("_row_stages", {})
+        if not cache:
+            cache[capacity] = engine.stages
+        stages = cache.get(rows)
+        if stages is None:
+            output = engine.output
+            view = output[:rows]
+
+            def bind_stage(stage):
+                args = tuple(
+                    view if arg is output else arg for arg in stage.arguments.args
+                )
+                return replace(
+                    stage,
+                    arguments=testing.JitArguments(*args, **stage.arguments.kwargs),
+                )
+
+            stages = [
+                (name, bind_stage(stage) if name != "K4" else stage)
+                for name, stage in cache[capacity]
+            ]
+            if len(cache) > 8:
+                # A step shape is planned once and reused by every layer; keep a few and rebuild the rest.
+                cache.pop(next(key for key in cache if key != capacity))
+            cache[rows] = stages
+        engine.stages = stages
+
+    def _reset_rows_past(self, rows):
+        """Leave the rows no stage is launched for as a full launch leaves them.
+
+        A full launch writes -1 selections and zero candidate counts for the rows
+        past the live prefix. A step that supplies fewer rows than max_chunk_size
+        does not visit the rows past its own, so they are reset here when the step
+        is planned. Every such plan resets them: a CUDA graph that holds the plan
+        of a longer step can be replayed at any time, so the host cannot know
+        which of these rows were written since the last reset.
+        """
+        if rows >= self._capacity.max_chunk_size or self._rows_bindable is False:
+            return
+        self._selected[rows:].fill_(-1)
+        seen = set()
+        for engine in (
+            *self._engines.values(),
+            getattr(self, "_template_engine", None),
+        ):
+            counts = getattr(engine, "counts", None)
+            if counts is not None and counts.data_ptr() not in seen:
+                seen.add(counts.data_ptr())
+                counts[rows:].zero_()
+
     def _prepare_layer_inputs(self, keys, key=None, *, warmup=False):
         from ._topk_runtime import _current_stream
 
         if key is None:
             key = self._pool_key(keys)
-        self._engine = self._engines[key]
+        self._engine = engine = self._engines[key]
+        if getattr(engine, "_bound_rows", None) != self._step_rows:
+            self._bind_supplied_rows(engine)
         supplied = self._candidate_supplied and not warmup
         if self._candidate_capacity and self._engine.sample_bounds is not None:
             self._engine.stages[0] = (
@@ -672,7 +760,8 @@ class _CapacitySelectiveTopKPlan:
         """Refresh prefixes, map and schedules once for all serialized layers.
 
         num_query_rows is the supplied Q storage extent, not a device value.
-        It defaults to max_chunk_size. Each layer must supply that many rows;
+        It defaults to max_chunk_size. Each layer must supply that many rows,
+        and K1-K3 are launched for that many (a captured run belongs to it);
         the final device query prefix may be smaller, leaving inactive -1 rows.
         Status is cleared here and survives every layer until the next step.
         """
@@ -710,6 +799,10 @@ class _CapacitySelectiveTopKPlan:
                 self._check_caller_capture(capturing, "plan metadata refresh")
                 self._refresh_schedules()
                 self._check_caller_capture(capturing, "plan schedule refresh")
+            # A step without rows keeps the launch of max_chunk_size.
+            self._step_rows = num_query_rows or self._capacity.max_chunk_size
+            self._reset_rows_past(self._step_rows)
+            self._check_caller_capture(capturing, "plan row reset")
         self._supplied_rows = num_query_rows
         self._step_prepared = True
 

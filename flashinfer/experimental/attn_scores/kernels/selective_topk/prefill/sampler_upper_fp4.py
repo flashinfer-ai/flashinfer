@@ -578,7 +578,11 @@ class FP4PrefillMQALogitsKernel:
             b_copy_size * atom_thr_size + sf_q_tma_bytes + w_copy_size
         )
 
-        num_q_blocks = (num_q_tokens + self.block_q - 1) // self.block_q
+        # Schedule the query blocks of the rows the output view has: the engine binds the supplied rows of a step there.
+        # num_q_tokens stays the storage extent, which the row layouts are derived from.
+        num_q_blocks = (
+            min(num_q_tokens, output.shape[0]) + self.block_q - 1
+        ) // self.block_q
         num_ctas = num_q_blocks * self.splits
         if cutlass.const_expr(
             self.mode == "filter" or (self.mode == "sample" and self.persistent_sample)
@@ -891,6 +895,7 @@ class FP4PrefillMQALogitsKernel:
                     heads=self.num_heads,
                     coverage=4 if self.qsa_weights == 2 or self.num_heads == 32 else 8,
                     dsv4=self.dsv4,
+                    fp4=True,
                 )
             ) // 128
             current_kv_lo = cutlass.Int32(0)
@@ -1426,6 +1431,7 @@ class FP4PrefillMQALogitsKernel:
                             sample_upper,
                             self.top_k,
                             coverage=4,
+                            fp4=True,
                         )
                     cute.arch.sync_warp()
                 # Reuse one position per sampled key across its four copy lanes.
@@ -1506,6 +1512,7 @@ class FP4PrefillMQALogitsKernel:
                                     sample_upper,
                                     self.top_k,
                                     coverage=4,
+                                    fp4=True,
                                 )
                             if (not self.dsv4_bulk_positions) and lane % 4 == 0:
                                 sample_positions[
@@ -1523,6 +1530,7 @@ class FP4PrefillMQALogitsKernel:
                                 self.block_q,
                                 self.top_k,
                                 dsv4=self.dsv4,
+                                fp4=True,
                             )
                     source_fp4 = cute.recast_tensor(gather_kv, self.input_dtype)
                     src = cute.local_tile(
@@ -1600,6 +1608,7 @@ class FP4PrefillMQALogitsKernel:
                                     if self.qsa_weights == 2 or self.num_heads == 32
                                     else 8,
                                     dsv4=self.dsv4,
+                                    fp4=True,
                                 )
                             )
                             // 128
@@ -1669,6 +1678,7 @@ class FP4PrefillMQALogitsKernel:
                                     if cutlass.const_expr(self.pro_common_domain)
                                     else 0
                                 ),
+                                fp4=True,
                             )
                         ) // 128
 
@@ -1819,6 +1829,7 @@ class FP4PrefillMQALogitsKernel:
                                         if self.qsa_weights == 2 or self.num_heads == 32
                                         else 8,
                                         dsv4=self.dsv4,
+                                        fp4=True,
                                     )
                                 )
                                 // 128
@@ -1923,6 +1934,7 @@ class FP4PrefillMQALogitsKernel:
                                     self.block_q,
                                     self.top_k,
                                     dsv4=self.dsv4,
+                                    fp4=True,
                                 )
                         umma_ready = umma_pipeline_0.consumer_try_wait(
                             umma_cons_state_0
@@ -2080,6 +2092,7 @@ class FP4PrefillMQALogitsKernel:
                                     if cutlass.const_expr(self.pro_common_domain)
                                     else 0
                                 ),
+                                fp4=True,
                             )
                         )
                         rank = model_proposal_rank(
@@ -2199,6 +2212,7 @@ class FP4PrefillMQALogitsKernel:
                                 if self.qsa_weights == 2 or self.num_heads == 32
                                 else 8,
                                 dsv4=self.dsv4,
+                                fp4=True,
                             )
                         ) // 128
                     has_work = next_q_block_idx < num_q_blocks
@@ -2271,6 +2285,7 @@ class FP4PrefillMQALogitsKernel:
                                 self.block_q,
                                 self.top_k,
                                 dsv4=self.dsv4,
+                                fp4=True,
                             )
                         umma_pipeline_0.consumer_wait(umma_cons_state_0)
                         if cutlass.const_expr(self.num_heads in (4, 32)):
@@ -2520,6 +2535,7 @@ class FP4PrefillMQALogitsKernel:
                                     if cutlass.const_expr(self.pro_common_domain)
                                     else 0
                                 ),
+                                fp4=True,
                             )
                         )
                         rank = model_proposal_rank(
@@ -2715,6 +2731,7 @@ class FP4PrefillMQALogitsKernel:
                                 if self.qsa_weights == 2 or self.num_heads == 32
                                 else 8,
                                 dsv4=self.dsv4,
+                                fp4=True,
                             )
                         ) // 128
                     has_work = next_q_block_idx < num_q_blocks

@@ -433,7 +433,11 @@ class FP8PrefillMQALogitsKernel:
         self.num_kv_scale_tma_bytes = self.block_kv * self.head_dim
         self.num_q_tma_bytes = b_copy_size * atom_thr_size + w_copy_size
 
-        num_q_blocks = (num_q_tokens + self.block_q - 1) // self.block_q
+        # Schedule the query blocks of the rows the output view has: the engine binds the supplied rows of a step there.
+        # num_q_tokens stays the storage extent, which the row layouts are derived from.
+        num_q_blocks = (
+            min(num_q_tokens, output.shape[0]) + self.block_q - 1
+        ) // self.block_q
         num_ctas = num_q_blocks * self.splits
         if cutlass.const_expr(
             self.mode == "filter" or (self.mode == "sample" and self.persistent_sample)

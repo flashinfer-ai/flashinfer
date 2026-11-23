@@ -152,7 +152,8 @@ class ThrowawayTopK:
             if out is None
             else out
         )
-        self.counts = torch.empty((m,), device=q.device, dtype=torch.int32)
+        # Zero: a step that supplies fewer rows than m launches K1-K3 for those rows only, and the rest must read as empty.
+        self.counts = torch.zeros((m,), device=q.device, dtype=torch.int32)
         if (
             candidate_k_block_ids is not None
             or (_filter_config or {}).get("publish_blocks")
@@ -368,6 +369,17 @@ class ThrowawayTopK:
                 candidate_cols = max(candidate_cols, min(cols, 9 * top_k // 2))
         if heads in (32, 64) and top_k == 2048 and n <= 8 * top_k:
             candidate_cols = max(candidate_cols, min(cols, 3 * top_k))
+        # For FP8 top_k=2048 rows past 64*k, K1 keeps candidate tails narrow (H64 samples grow with length; H32
+        # grows past 128*k in sampler_upper_fp8): max ~5.5*k (H64) / ~6.6*k (H32) where the slab was 15-18*k
+        # (1.9-2.4 GiB at Q8192). Cap the per-row slab at 10*k; a row above it takes the existing exact recovery.
+        if (
+            self.qkv_dtype == "fp8"
+            and top_k == 2048
+            and heads in (32, 64)
+            and not dsv4
+            and n > 64 * top_k
+        ):
+            candidate_cols = min(candidate_cols, 10 * top_k)
         # A short physical domain fits in the candidate arena in full. Avoid
         # overflowing conservative thresholds when K is a large fraction of N.
         if n <= 4 * top_k:
@@ -916,6 +928,23 @@ class ThrowawayTopK:
         )
         self.shared_fp8_queries = shared_fp8_queries
         # Validated ends fit N; aligned N contains every complete 128-key tile.
+        # GLM H32 FP8 with FP32 logits: at Q >= 8192 the pair-query epilogue (two queries per thread, four TMEM
+        # sub-tiles) serves every n > 4*top_k, aligned or not (unaligned n clamps the K-scale index). 8*top_k < n <
+        # 32*top_k (16K-64K actual-length rows) used the default/short-tile epilogue: the pair path is 1.06-1.08x there
+        # (B200 GLM-5.3, same TopK output), and capacity-planned callers (n = capacity) already took it. The former
+        # long-row variant (default epilogue + integer-ReLU period from 256*top_k) spilled to local memory; B200 GLM-5.3
+        # Q8192 per layer: 1M 1.08x, 512K 1.08x, unaligned 1M 1.07x. Without the pair path (Q < 8192) the integer period
+        # is dropped for aligned n (no spill: Q4096/Q2048 1.03-1.06x) but kept for unaligned n, where the clamped scale
+        # load otherwise lands on the critical path (Q4096 1M: +11% cycles, long-scoreboard stalls on the scale multiply).
+        # All epilogues compute identical scores (same per-head FMA chains and head sum); only the publish order differs.
+        glm_pair = (
+            m >= 8192
+            and heads == 32
+            and top_k == 2048
+            and self.qkv_dtype == "fp8"
+            and logits_dtype == torch.float32
+            and n > 4 * top_k
+        )
         filt = compile_filter(
             self.qkv_dtype,
             top_k,
@@ -931,15 +960,8 @@ class ThrowawayTopK:
             safe,
             8,
             q8192_glm_dual_kv=q8192_glm_dual_kv,
-            q8192_pair_queries=(
-                m >= 8192
-                and heads == 32
-                and top_k == 2048
-                and self.qkv_dtype == "fp8"
-                and logits_dtype == torch.float32
-                and ((32 * top_k <= n <= 128 * top_k) or (4 * top_k < n <= 8 * top_k))
-                and n % 128 == 0
-            ),
+            q8192_pair_queries=glm_pair,
+            pair_unaligned=glm_pair and n % 128 != 0,
             q8192_flash_epi=(
                 m >= 8192
                 and heads == 32
@@ -1015,6 +1037,8 @@ class ThrowawayTopK:
             and top_k == 2048
             and logits_dtype == torch.float32
             and n >= 256 * top_k
+            and not glm_pair
+            and n % 128 != 0
             else 0,
             pdl=self.pdl,
             native_bf16=native_bf16,
@@ -1111,6 +1135,8 @@ class ThrowawayTopK:
             capacity_policy["bank_local"] = short_publisher
             capacity_policy["narrow_cache"] = publisher_narrow
             capacity_policy["producer_complete"] = parallel_blocks
+        # DS-V4-Flash (k=512) keeps the 256-thread K3 at every n: capacity-planned callers (n = 1M) otherwise run the
+        # 512-thread wide-cache K3 on short live rows (B200, K buffer = 1M tokens, MXFP4: 64K 1.022x, 128K 1.006x, 1M 1.000x; same output).
         selector = compile_selection(
             top_k,
             dtype,
@@ -1136,7 +1162,7 @@ class ThrowawayTopK:
                 and n <= 64 * top_k
             ),
             wide_cache=(
-                ((heads in (4, 32) or dsv4) and n >= 256 * top_k)
+                ((heads in (4, 32) or (dsv4 and top_k != 512)) and n >= 256 * top_k)
                 or (
                     dsv4
                     and top_k == 1024

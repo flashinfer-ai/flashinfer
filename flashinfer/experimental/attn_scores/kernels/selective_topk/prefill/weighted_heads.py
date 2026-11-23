@@ -16,7 +16,7 @@ from ..packed import add_packed_f32x2 as indexer_add_packed_f32x2
 import cutlass
 import cutlass.cute as cute
 from .native_heads import head_zero, head_sum, native_head_fma4, native_weight_pair
-from .native_lowp_math import native_pack_relu, native_fma
+from .native_lowp_math import native_pack_relu, native_fp8_pack_relu, native_fma
 from .integer_relu_fast import integer_relu4, finite_integer_relu4, mixed_integer_relu4
 
 
@@ -212,7 +212,14 @@ def weighted_partial_cached(
             positive = cute.max(x, zero, propagate_nan=True)
         if cutlass.const_expr(cache.element_type == cutlass.Uint32):
             for pair in cutlass.range_constexpr(2):
-                xx = native_pack_relu(native_dtype, x[2 * pair], x[2 * pair + 1])
+                # Packed caches hold native_weight_pair(..., fp8) values; FP8 FP16 scores take the
+                # matching 1/512 rebalance (for BF16 both pack helpers are the same instruction).
+                if cutlass.const_expr(fp8):
+                    xx = native_fp8_pack_relu(
+                        native_dtype, x[2 * pair], x[2 * pair + 1]
+                    )
+                else:
+                    xx = native_pack_relu(native_dtype, x[2 * pair], x[2 * pair + 1])
                 if cutlass.const_expr(offset + group * 4 + 2 * pair < cached):
                     ww = cache[
                         local_q * (cached // 2) + (offset + group * 4) // 2 + pair
@@ -223,6 +230,7 @@ def weighted_partial_cached(
                         slot * 32 + offset + group * 4 + 2 * pair,
                         stage,
                         native_dtype,
+                        fp8,
                     )
                 acc[pair] = native_fma(native_dtype, xx, ww, acc[pair])
         else:
@@ -311,8 +319,16 @@ def weighted_pair_partial_cached(
             positive1 = cute.max(x1, zero, propagate_nan=True)
         if cutlass.const_expr(cache.element_type == cutlass.Uint32):
             for pair in cutlass.range_constexpr(2):
-                xx0 = native_pack_relu(native_dtype, x0[2 * pair], x0[2 * pair + 1])
-                xx1 = native_pack_relu(native_dtype, x1[2 * pair], x1[2 * pair + 1])
+                if cutlass.const_expr(fp8):
+                    xx0 = native_fp8_pack_relu(
+                        native_dtype, x0[2 * pair], x0[2 * pair + 1]
+                    )
+                    xx1 = native_fp8_pack_relu(
+                        native_dtype, x1[2 * pair], x1[2 * pair + 1]
+                    )
+                else:
+                    xx0 = native_pack_relu(native_dtype, x0[2 * pair], x0[2 * pair + 1])
+                    xx1 = native_pack_relu(native_dtype, x1[2 * pair], x1[2 * pair + 1])
                 ww0 = cache[local_q * 16 + offset // 2 + group * 2 + pair]
                 ww1 = cache[(local_q + 1) * 16 + offset // 2 + group * 2 + pair]
                 acc0[pair] = native_fma(native_dtype, xx0, ww0, acc0[pair])

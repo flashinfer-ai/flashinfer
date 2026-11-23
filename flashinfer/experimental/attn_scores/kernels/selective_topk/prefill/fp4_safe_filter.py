@@ -281,7 +281,9 @@ class FP4PrefillMQALogitsKernel:
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
         self.weight_dtype = weight_dtype
-        self.packed_bf16_weights = weight_dtype == cutlass.BFloat16 and native_bf16
+        # Native head math caches packed weight pairs for H32 (as fp8_safe_filter and the H64 path do):
+        # one conversion per query instead of one per KV tile.
+        self.packed_native_weights = self.native_lowp
         self.cached_native_heads = 28
         self.weight_bytes = 2 if weight_dtype == cutlass.BFloat16 else 4
         # KV scales are already in UTCCP layout when enabled; Q scales are unaffected.
@@ -677,7 +679,11 @@ class FP4PrefillMQALogitsKernel:
             b_copy_size * atom_thr_size + sf_q_tma_bytes + w_copy_size
         )
 
-        num_q_blocks = (num_q_tokens + self.block_q - 1) // self.block_q
+        # Schedule the query blocks of the rows the output view has: the engine binds the supplied rows of a step there.
+        # num_q_tokens stays the storage extent, which the row layouts are derived from.
+        num_q_blocks = (
+            min(num_q_tokens, output.shape[0]) + self.block_q - 1
+        ) // self.block_q
         num_ctas = num_q_blocks * self.splits
         if cutlass.const_expr(
             self.mode == "filter" or (self.mode == "sample" and self.persistent_sample)
@@ -2716,10 +2722,10 @@ class FP4PrefillMQALogitsKernel:
                             glm_weights = cute.make_rmem_tensor(
                                 (
                                     queries_per_wg
-                                    * (32 // 2 if self.packed_bf16_weights else 32),
+                                    * (32 // 2 if self.packed_native_weights else 32),
                                 ),
                                 cutlass.Uint32
-                                if self.packed_bf16_weights
+                                if self.packed_native_weights
                                 else cutlass.Float32,
                             )
                         if cutlass.const_expr(self.qsa_weights == 1):
@@ -2747,14 +2753,14 @@ class FP4PrefillMQALogitsKernel:
                                 if tau_cache[local_q] != tau_cache[local_q]:
                                     tau_cache[local_q] = cutlass.Float32(float("inf"))
                             if cutlass.const_expr(self.num_heads == 32):
-                                if cutlass.const_expr(self.packed_bf16_weights):
+                                if cutlass.const_expr(self.packed_native_weights):
                                     for cached_h in cutlass.range_constexpr(32 // 2):
                                         glm_weights[local_q * (32 // 2) + cached_h] = (
                                             native_weight_pair(
                                                 sW,
                                                 slot * 32 + 2 * cached_h,
                                                 q_stage_local,
-                                                cutlass.BFloat16,
+                                                self.native_dtype,
                                             )
                                         )
                                 else:
@@ -4836,12 +4842,12 @@ class FP4PrefillMQALogitsKernel:
                                     queries_per_wg
                                     * (
                                         self.cached_native_heads // 2
-                                        if self.packed_bf16_weights
+                                        if self.packed_native_weights
                                         else 28
                                     ),
                                 ),
                                 cutlass.Uint32
-                                if self.packed_bf16_weights
+                                if self.packed_native_weights
                                 else cutlass.Float32,
                             )
                         if cutlass.const_expr(self.qsa_weights == 1):
@@ -4869,7 +4875,7 @@ class FP4PrefillMQALogitsKernel:
                                 if tau_cache[local_q] != tau_cache[local_q]:
                                     tau_cache[local_q] = cutlass.Float32(float("inf"))
                             if cutlass.const_expr(self.num_heads == 32):
-                                if cutlass.const_expr(self.packed_bf16_weights):
+                                if cutlass.const_expr(self.packed_native_weights):
                                     for cached_h in cutlass.range_constexpr(
                                         self.cached_native_heads // 2
                                     ):
@@ -4880,7 +4886,7 @@ class FP4PrefillMQALogitsKernel:
                                             sW,
                                             slot * 32 + 2 * cached_h,
                                             q_stage_local,
-                                            cutlass.BFloat16,
+                                            self.native_dtype,
                                         )
                                 else:
                                     for cached_h in cutlass.range_constexpr(28):

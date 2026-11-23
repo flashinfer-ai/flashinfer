@@ -15,9 +15,17 @@ class SelectivePrefillMetadata:
     monotone causal ends. Padding therefore needs the last live end, not a
     prefix scan. A separate launch makes all contract flags visible before any
     row is published; flags are overwritten on every layer and replay.
+    With validation, publish is a programmatic dependent launch: it loads its
+    row bound while validate runs and waits for validate's completion before it
+    reads any flag or writes a row, which hides the second launch's latency.
+    Validate itself must stay an ordinary launch: it then starts only after the
+    work that fills active/row_ends has completed, which is what makes
+    publish's reads ahead of its wait safe. pdl=False launches both normally.
     """
 
-    def __init__(self, heads, qwen, fast, block_scaled, check_ctas=256, top_k=512):
+    def __init__(
+        self, heads, qwen, fast, block_scaled, check_ctas=256, top_k=512, pdl=True
+    ):
         self.top_k = top_k
         self.heads = heads
         self.qwen = qwen
@@ -25,6 +33,8 @@ class SelectivePrefillMetadata:
         self.block_scaled = block_scaled
         self.check = qwen or fast
         self.check_ctas = check_ctas
+        # Without validate there is no predecessor in this module to depend on.
+        self.pdl = self.check and bool(pdl)
 
     @cute.jit
     def __call__(
@@ -43,13 +53,18 @@ class SelectivePrefillMetadata:
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(self.check):
+            # Not a dependent launch (see the class docstring): publish relies on it.
             self.validate(weights, scales, q_scales, active, physical_kv, flags).launch(
-                grid=(self.check_ctas, 1, 1), block=(256, 1, 1), stream=stream
+                grid=(self.check_ctas, 1, 1),
+                block=(256, 1, 1),
+                stream=stream,
+                use_pdl=False,
             )
         self.publish(active, row_ends, starts, ends, score_ends, flags, error).launch(
             grid=(cute.ceil_div(ends.shape[0], 32), 1, 1),
             block=(32, 1, 1),
             stream=stream,
+            use_pdl=self.pdl,
         )
 
     @cute.kernel
@@ -66,6 +81,8 @@ class SelectivePrefillMetadata:
         lane = tid % 32
         warp = tid // 32
         block, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_launch_dependents()
         bad = cutlass.Int32(0)
         # Eight warps per CTA cover live weights/scales without the long
         # strided loop of a single-warp CTA. Publish one flag per CTA.
@@ -133,6 +150,16 @@ class SelectivePrefillMetadata:
     ):
         lane, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.pdl):
+            # Validate is an ordinary launch, so everything that fills active/row_ends completed before it
+            # started and therefore before this kernel. Flags and the row outputs (still read by the
+            # previous layer's K4) are touched only after the wait.
+            pre_row = block * 32 + lane
+            pre_live = active[0]
+            pre_end = cutlass.Int32(0)
+            if pre_row < ends.shape[0]:
+                pre_end = cutlass.Int32(row_ends[min(pre_row, max(pre_live - 1, 0))])
+            cute.arch.griddepcontrol_wait()
         bad = cutlass.Int32(0)
         if cutlass.const_expr(self.check):
             for offset in cutlass.range_constexpr(cute.ceil_div(self.check_ctas, 32)):
@@ -142,8 +169,12 @@ class SelectivePrefillMetadata:
             bad = cute.arch.warp_redux_sync(bad, "max")
         row = block * 32 + lane
         if row < ends.shape[0]:
-            live = active[0]
-            end = row_ends[min(row, max(live - 1, 0))]
+            if cutlass.const_expr(self.pdl):
+                live = pre_live
+                end = pre_end
+            else:
+                live = active[0]
+                end = row_ends[min(row, max(live - 1, 0))]
             starts[row] = cutlass.Int32(0) if row < live or bad != 0 else end
             bound = end if bad == 0 else cutlass.Int32(0)
             ends[row] = bound
