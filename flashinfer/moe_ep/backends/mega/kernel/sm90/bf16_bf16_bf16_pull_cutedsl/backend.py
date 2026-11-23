@@ -147,7 +147,7 @@ class Sm90PullBf16MegaKernelBackend(MegaKernelBackend):
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         # Backend talks only to the pull_style_cutedsl_megakernel shim (never
         # src/ directly).
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
             get_symm_buffer_for_hopper_bf16_mega_moe,
         )
 
@@ -223,9 +223,7 @@ class Sm90PullBf16MegaKernelBackend(MegaKernelBackend):
         output: torch.Tensor | None,
     ) -> torch.Tensor:
         # Backend talks only to the pull_style_cutedsl_megakernel shim.
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-            hopper_bf16_mega_moe,
-        )
+        from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import hopper_bf16_mega_moe
 
         if output is not None:
             num_tokens = output.shape[0]
@@ -247,7 +245,7 @@ class Sm90PullBf16MegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
             # so the candidate sweep stays in lockstep (see shim/autotune_bf16.py).
-            from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
                 autotune_hopper_bf16_mega_moe,
             )
 

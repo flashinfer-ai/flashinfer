@@ -218,18 +218,22 @@ def test_facade_matches_the_backend_fp16(seeded: bool) -> None:
     assert not torch.equal(pool_facade, pool_before)
 
 
-# The Philox round count from which the runtime n = 3 snapshot_noise sibling serves a stochastic snapshot call.
-SNAPSHOT_NOISE_RUNTIME_ROUNDS = {"sm_100a": 10, "sm_103a": 10, "sm_107a": 16}
+# The Philox round count from which the runtime n = 3 snapshot_noise sibling serves a stochastic snapshot call
+# below 3 x SM state heads (within (3 x SM, 4 x SM] it serves from 11 on SM100 / SM103 and from 16 on SM107, and
+# above 124 x SM from 11 on SM107).
+SNAPSHOT_NOISE_RUNTIME_ROUNDS = {"sm_100a": 10, "sm_103a": 10, "sm_107a": 10}
 
 
-@pytest.mark.parametrize(("seeded", "rounds"), ((False, 0), (True, 10), (True, 16)))
+@pytest.mark.parametrize(
+    ("seeded", "rounds"), ((False, 0), (True, 5), (True, 9), (True, 10), (True, 16))
+)
 def test_facade_fp16_launch_class_picks_the_snapshot_noise_sibling(
     seeded: bool, rounds: int, monkeypatch
 ) -> None:
     """A facade call over an FP16 pool that stores per-token snapshots at T = 10 (the runtime program of three
     Householder updates) launches that program's ``snapshot_noise`` sibling when it rounds stochastically with at
-    least the architecture's round count (10 on SM100 / SM103, 16 on SM107), and the plain program below it or when
-    it rounds to nearest even; output and pool bits equal the backend's."""
+    least the architecture's round count (10 at these state heads, on every architecture), and the plain program
+    below it (5 and 9 rounds) or when it rounds to nearest even; output and pool bits equal the backend's."""
     capability = get_compute_capability(_device())
     if not loader.route_applies(
         device_capability=capability,

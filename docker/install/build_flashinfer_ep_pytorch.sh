@@ -14,9 +14,10 @@
 #   FI_NCCL_VERSION  nvidia-nccl-<cuXX> pin (default 2.30.7). FI_-prefixed
 #                 because NVIDIA base images export NCCL_VERSION as the Debian
 #                 package version (e.g. 2.28.3-1), which is not a valid pip pin.
-#   NCCL_EXT_SPEC nccl-extensions pin (default nccl-extensions[<cuXX>]==0.1.0).
+#   NCCL_EXT_SPEC nccl-extensions pin (default nccl-extensions[<cuXX>]==0.2.0,
+#                 containing NCCL EP 0.3).
 #                 nccl.ep lives here since it moved out of nccl4py (0.4.1).
-#   NCCL4PY_SPEC  nccl4py pin (default nccl4py[<cuXX>]==0.5.0); supplies
+#   NCCL4PY_SPEC  nccl4py pin (default nccl4py[<cuXX>]==0.6.0); supplies
 #                 nccl.core.Communicator in the same `nccl` namespace.
 #   FI_EP_PREWARM 1 runs the ~25-min trtllm fused-MoE JIT prewarm (default 0).
 #                 Set to 1 when baking container-save images for torchrun jobs
@@ -40,8 +41,8 @@ fi
 
 FI_SRC="${FI_SRC:-/host/flashinfer}"
 NCCL_VERSION="${FI_NCCL_VERSION:-2.30.7}"
-NCCL_EXT_SPEC="${NCCL_EXT_SPEC:-nccl-extensions[${CU}]==0.1.0}"
-NCCL4PY_SPEC="${NCCL4PY_SPEC:-nccl4py[${CU}]==0.5.0}"
+NCCL_EXT_SPEC="${NCCL_EXT_SPEC:-nccl-extensions[${CU}]==0.2.0}"
+NCCL4PY_SPEC="${NCCL4PY_SPEC:-nccl4py[${CU}]==0.6.0}"
 CUDA_CORE_VERSION="${CUDA_CORE_VERSION:-1.0.1}"
 CUDA_BINDINGS_VERSION="${CUDA_BINDINGS_VERSION:-13.2.0}"
 DEEPGEMM_SRC="${DEEPGEMM_SRC:-/tmp/DeepGEMM}"
@@ -52,10 +53,10 @@ python --version
 python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
 nvcc --version | grep release || true
 
-echo "== pin NCCL-EP runtime wheels to ep_bench's verified set =="
+echo "== pin NCCL EP 0.3 runtime wheels =="
 # PIP_CONSTRAINT= overrides the NVIDIA base image's constraint file (which pins
 # nvidia-nccl-<cuXX> to torch's 2.30.4) so we install the 2.30.7 that
-# nccl-extensions 0.1.0's libnccl_ep.so expects. --no-deps on the NCCL wheels
+# nccl-extensions 0.2.0's libnccl_ep.so supports. --no-deps on the NCCL wheels
 # keeps the base torch intact;
 # nccl.ep additionally imports cuda.core / cuda.bindings, installed explicitly at
 # ep_bench's exact versions (cuda-core 1.0.1, cuda-bindings 13.2.0).

@@ -127,7 +127,7 @@ class Bf16RankMajorCudaMegaKernelBackend(MegaKernelBackend):
         self._transformed_weights = transformed_weights
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.blackwell_bf16_rank_major import (
+        from flashinfer.moe_ep.kernels.flashinfer.bf16_rank_major import (
             BlackwellBf16RankMajorSession,
         )
 

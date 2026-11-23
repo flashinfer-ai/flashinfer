@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 from tests.moe_ep.test_sm107_block_scaled_contracts import _config, _workspace
 
 

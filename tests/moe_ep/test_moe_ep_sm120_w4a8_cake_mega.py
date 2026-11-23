@@ -161,9 +161,7 @@ def skip_unless_ep_launch() -> tuple[int, int]:
         pytest.skip(f"requires a torchrun launch with at least {MIN_WORLD_SIZE} ranks")
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-    from flashinfer.moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
-        cake_sm120_megamoe_available,
-    )
+    from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import cake_sm120_megamoe_available
     from flashinfer.utils import is_sm120a_supported
 
     if not is_sm120a_supported(torch.device("cuda")):

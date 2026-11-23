@@ -1,6 +1,7 @@
 # Adapted from https://github.com/pytorch/pytorch/blob/v2.7.0/torch/utils/cpp_extension.py
 
 import functools
+import hashlib
 import logging
 import os
 import platform
@@ -20,6 +21,10 @@ import torch
 from . import env as jit_env
 from .spdlog_patch import SPDLOG_FORMAT_HEADER, patch_bundled_format_h
 from ..compilation_context import CompilationContext
+
+# A Windows object path (``<jit dir>/<module>/<object>.cuda.o.d``) must stay under MAX_PATH (260) with room for
+# the ``.d`` suffix and the linker's longest sibling file names.
+_WINDOWS_OBJECT_PATH_BUDGET = 230
 
 is_windows = platform.system() == "Windows"
 logger = logging.getLogger(__name__)
@@ -662,6 +667,12 @@ def generate_ninja_build_for_op(
         object_suffix = ".cuda.o" if is_cuda else ".o"
         cmd = "cuda_compile" if is_cuda else "compile"
         obj_name = f"{source.parent.name}_{source.stem}{object_suffix}"
+        if is_windows and len(str(output_dir / obj_name)) > _WINDOWS_OBJECT_PATH_BUDGET:
+            # Module directories named after a 64-hex digest repeat the name in the object file name, which
+            # pushes the object (and its ``.d`` dependency file) past MAX_PATH. Keep a readable prefix and tell
+            # sources apart by a digest of the full source path; other objects keep their names.
+            tag = hashlib.sha256(str(source.resolve()).encode()).hexdigest()[:12]
+            obj_name = f"{source.stem[:32]}_{tag}{object_suffix}"
         obj = ninja_path((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {ninja_path(source.resolve())}")

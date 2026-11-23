@@ -52,7 +52,9 @@ to the read slot; a writeback to distinct write slots with one row skipping it
 slot.  A call kind and rounding form a launch class, and a program runs the
 classes it owns: a ``snapshot_noise`` sibling (the same body and variant,
 drawing a launch's random bits once) owns the stochastic snapshot calls of its
-cell and its plain program the other classes.  The test records the program
+cell, a ``draw_share`` sibling (the same body and variant, computing each draw
+once and sharing it by a lane shuffle) the stochastic calls of its cell, and
+their plain program the other classes.  The test records the program
 each call launches and the store paths it takes, and fails unless every
 program took every path of its classes and every class of a band is owned.  These calls use an FP16 pool with one
 guard slot on each side; after each call the slots it must not touch and both
@@ -1278,12 +1280,12 @@ def _fp16_store_paths(
     (b) distinct write slots with row 1 skipping its writeback (``B >= 2``, :func:`_holes`); (c) per-token snapshots
     with the holes of :func:`_holes` (``B >= 2``).  A call kind and rounding form a launch class; the program runs
     the classes it owns (:func:`_class_owner`: the first shape of :data:`PROGRAM_SHAPES` and round count that select
-    it), and every class it does not own must select a program with its twin key (its ``snapshot_noise`` sibling or
-    the sibling's plain program) on some shape.  Each call is checked by :func:`_run_fp16` (FP32 twin, rounding model
-    with the read slot's counter, every stored slot, untouched slots, guard slots), must launch ``name`` and leave
-    the slots its holes skip unchanged.  Returns the token counts run, one record per call (program launched, call
-    kind, ``T``, ``B``, ``H``, rounding, round count and the store paths of its slot tables, :func:`_store_paths`)
-    and the store paths of the owned call kinds per (rounding, ``T``)."""
+    it), and every class it does not own must select a program with its twin key (its sibling, ``snapshot_noise`` or
+    ``draw_share``, or the sibling's plain program) on some shape.  Each call is checked by :func:`_run_fp16` (FP32
+    twin, rounding model with the read slot's counter, every stored slot, untouched slots, guard slots), must launch
+    ``name`` and leave the slots its holes skip unchanged.  Returns the token counts run, one record per call
+    (program launched, call kind, ``T``, ``B``, ``H``, rounding, round count and the store paths of its slot tables,
+    :func:`_store_paths`) and the store paths of the owned call kinds per (rounding, ``T``)."""
     key = _twin_key(loader.MODULES[name])
     partners = [
         other
@@ -1388,8 +1390,7 @@ def _missing_store_paths(
 def _program_cases() -> list:
     """One (n, T, B, H) selecting each exported program of the local architecture, from the registry alone; an
     FP16-pool program is selected and launched over an FP16 pool, in the first launch class that selects it (round
-    to nearest without snapshots, else stochastic calls with snapshots: a ``snapshot_noise`` sibling owns those
-    only)."""
+    to nearest without snapshots, else stochastic calls with snapshots: a sibling owns stochastic calls only)."""
     if not _supported():
         return []
     arch = _arch()
@@ -1456,10 +1457,11 @@ def test_every_program_is_launched(
 ) -> None:
     """Every exported program of the local architecture is selected by some call of the domain and is correct.  An
     FP16-pool program runs every store path of the launch classes it owns (:func:`_fp16_store_paths`), at its ``T``
-    and at ``T = 1`` when one-token calls select it too; a class it does not own selects its ``snapshot_noise``
-    sibling or the sibling's plain program, whose own case runs it.  The test records the program each call launches
-    and the store paths of its slot tables, prints the coverage and fails unless the program took every path of its
-    classes (:func:`_required_store_paths`) in each rounding at each of those token counts."""
+    and at ``T = 1`` when one-token calls select it too; a class it does not own selects its sibling
+    (``snapshot_noise`` or ``draw_share``) or the sibling's plain program, whose own case runs it.  The test records
+    the program each call launches and the store paths of its slot tables, prints the coverage and fails unless the
+    program took every path of its classes (:func:`_required_store_paths`) in each rounding at each of those token
+    counts."""
     assert B > 0, f"no (B, H) of the domain selects {name}"
     if state_dtype != torch.float16:
         c = _make(
@@ -1487,7 +1489,7 @@ def test_every_program_is_launched(
 
 
 def test_fp16_store_paths_are_covered_per_twin_key() -> None:
-    """Per twin key on the local architecture (an FP16 program and its ``snapshot_noise`` sibling, when it has one),
+    """Per twin key on the local architecture (an FP16 program and its sibling, when it has one),
     every call kind of :func:`_fp16_store_paths` in both roundings at the programs' token count selects one of them on
     some shape, so the union of their cases of :func:`test_every_program_is_launched` runs every path of
     :func:`_required_store_paths` in both roundings."""
@@ -1505,16 +1507,14 @@ def test_fp16_store_paths_are_covered_per_twin_key() -> None:
         build = loader.MODULES[min(names)]["build"]
         n, l2 = build["num_householder"], build.get("use_qk_l2norm", True)
         (T,) = {tokens[name] for name in names}
-        flags = sorted(
-            bool(loader.MODULES[name]["build"].get("snapshot_noise")) for name in names
-        )
+        flags = sorted(_is_sibling(loader.MODULES[name]) for name in names)
         assert flags in ([False], [False, True]), (key, sorted(names))
         with_sibling += flags == [False, True]
         for kind, rounding in itertools.product(KIND_PATHS, ("rne", "sr")):
             assert any(
                 _class_owner(name, n, T, l2, kind, rounding) for name in sorted(names)
             ), (key, kind, rounding, sorted(names))
-    assert with_sibling > 0, "no FP16 program has a snapshot_noise sibling here"
+    assert with_sibling > 0, "no FP16 program has a sibling here"
 
 
 # ---------------------------------------------------------------------------
@@ -1550,8 +1550,9 @@ def _fp16_matrix() -> list:
     """Calls over an FP16 pool covering every FP16 body: the T = 1 bands (row partition, one-wave preload, l8r4,
     the many-wave program), static T = 4, 8 and 16 with writeback, distinct write slots, snapshots, holes (skipped
     snapshots, a skipped writeback: :func:`_holes`), the runtime programs of n = 1, 2, 3 and 4, the two
-    ``snapshot_noise`` siblings (stochastic calls with snapshots at T = 16 above 2 x SM and, from 10 rounds (16 on
-    SM107), on the runtime program of n = 3), a padded pool, padding rows and ``disable_state_update``."""
+    ``snapshot_noise`` siblings (stochastic calls with snapshots at T = 16 above 2 x SM and, on the runtime program of
+    n = 3, from 10 rounds outside (3 x SM, 4 x SM] and from 11 within it; on SM107 from 16 within it and from 11
+    above 124 x SM), a padded pool, padding rows and ``disable_state_update``."""
     rows = [
         # (n, T, H, B, options)
         (3, 1, 10, 16, {}),  # 160 state heads: the row partition
@@ -1571,8 +1572,8 @@ def _fp16_matrix() -> list:
         (3, 2, 6, 5, {"disable_state_update": True}),
         (1, 3, 6, 5, {}),
         (2, 9, 6, 3, {"scatter_tokens": True}),
-        # the runtime program of n = 3: its snapshot_noise sibling runs the snapshots of 10 rounds or more (16 or
-        # more on SM107)
+        # the runtime program of n = 3: its snapshot_noise sibling runs the snapshots of 10 rounds or more at
+        # these state heads (below 3 x SM)
         (3, 10, 6, 3, {"scatter_tokens": True}),
         (3, 13, 20, 16, {"scatter_tokens": True, "holes": True}),
         (4, 2, 6, 4, {"padding_row": True}),
@@ -1821,30 +1822,51 @@ def test_fp16_pool_is_refused_without_fp16_programs() -> None:
     assert _same_bits(c16.pool, c16.pool_before)
 
 
+# The build flags of an FP16 program's siblings: the snapshot-only shared noise and the shared draw.
+SIBLING_FLAGS = ("snapshot_noise", "draw_share")
+
+
+def _is_sibling(record: dict) -> bool:
+    """Whether a decode record is a sibling of an FP16 program (one of :data:`SIBLING_FLAGS` set)."""
+    return any(record["build"].get(flag) for flag in SIBLING_FLAGS)
+
+
 def _twin_key(record: dict) -> tuple:
-    """A decode record's identity without its pool dtype and its ``snapshot_noise`` flag: an FP16 record, its
-    ``snapshot_noise`` sibling and their FP32 twin share it."""
+    """A decode record's identity without its pool dtype and its sibling flags: an FP16 record, its siblings
+    (``snapshot_noise``, ``draw_share``) and their FP32 twin share it."""
     build = {
         k: v
         for k, v in record["build"].items()
-        if k not in ("state_dtype", "snapshot_noise")
+        if k not in ("state_dtype", *SIBLING_FLAGS)
     }
     return (record["body"], tuple(sorted(build.items())))
 
 
-# The launch-class keys a select cell of an FP16 record may carry, and the band a runtime program serves.
+# The launch-class keys a select cell of an FP16 record may carry, the wave keys of a cell (``_selects``), and the
+# band a runtime program serves.
 CLASS_KEYS = ("rounds_at_least", "rounds_at_most", "snapshot")
+WAVE_KEYS = (
+    "ctas_per_sm_above",
+    "ctas_per_sm_at_most",
+    "ctas_per_sm_at_least",
+    "ctas_per_sm_below",
+)
 WHOLE_BAND = {"above": 0, "at_most": None, "kind": "state_heads_between"}
 
 
-def _band_cells(rule) -> list:
-    """The cells of ``rule`` without their launch-class keys, each once, in order; ``None`` (a runtime program
-    without cells) is the whole band."""
+def _cells(rule) -> list:
+    """The cells of ``rule``: none for ``None``, else its one cell or its list."""
+    return [] if rule is None else rule if isinstance(rule, list) else [rule]
+
+
+def _band_cells(rule, dropped: tuple = ()) -> list:
+    """The cells of ``rule`` without their launch-class keys and the keys ``dropped``, each once, in order; ``None``
+    (a runtime program without cells) is the whole band."""
     cells: list = []
     for cell in (
         [WHOLE_BAND] if rule is None else rule if isinstance(rule, list) else [rule]
     ):
-        band = {k: v for k, v in cell.items() if k not in CLASS_KEYS}
+        band = {k: v for k, v in cell.items() if k not in (*CLASS_KEYS, *dropped)}
         if band not in cells:
             cells.append(band)
     return cells
@@ -1872,11 +1894,13 @@ def _restricted(rule, arches: list) -> object:
 
 def test_fp16_records_are_twins_of_the_fp32_records() -> None:
     """Every FP16-pool record ships on SM100 / SM103 / SM107 only, in the routes of its FP32 twin (same body and
-    build keywords but ``state_dtype`` and ``snapshot_noise``), with the twin's band on each of its architectures
-    (its cells there without their launch-class keys), the twin's grid rule and the seed and round-count
+    build keywords but ``state_dtype`` and the sibling flags), with the twin's band on each of its architectures
+    (its cells there without their launch-class keys and the wave keys the twin's band lacks, at which a program
+    and its sibling may part their launch classes), the twin's grid rule and the seed and round-count
     arguments.  Only FP16 cells carry launch-class keys; a ``snapshot_noise`` sibling's cells each admit stochastic
-    calls with snapshots only, and the sibling has a plain FP16 record of the same twin key in the same routes.  On
-    each of SM100, SM103 and SM107, every FP32 decode record of a route has its plain FP16 twin in that route,
+    calls with snapshots only, a ``draw_share`` sibling's stochastic calls only, and a sibling has a plain FP16
+    record of the same twin key in the same routes.
+    On each of SM100, SM103 and SM107, every FP32 decode record of a route has its plain FP16 twin in that route,
     delivered for that architecture, so an FP16 pool has a route wherever an FP32 pool has one.  For every probe and every launch class (round count 0 or
     5 to 16, with or without snapshots) the FP16 dispatch selects a program with the twin key of the FP32
     dispatch's program: the sibling exactly where one of the sibling's cells admits the call, else the plain twin."""
@@ -1893,7 +1917,7 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
         rule = record["select_rule"]
         cells = [] if rule is None else rule if isinstance(rule, list) else [rule]
         if "state_dtype" not in record["build"]:
-            assert "snapshot_noise" not in record["build"], name
+            assert not set(SIBLING_FLAGS) & set(record["build"]), name
             assert not any(set(CLASS_KEYS) & set(cell) for cell in cells), name
             continue
         assert record["build"]["state_dtype"] == "f16", name
@@ -1906,14 +1930,21 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
                 assert cell["snapshot"] is True, (name, cell)
                 assert cell["rounds_at_least"] >= pkg.PHILOX_ROUNDS_MIN, (name, cell)
             siblings.setdefault(other, []).append(name)
+        elif record["build"].get("draw_share"):
+            assert record["build"]["draw_share"] is True and cells, name
+            for cell in cells:
+                assert cell["rounds_at_least"] >= pkg.PHILOX_ROUNDS_MIN, (name, cell)
+            siblings.setdefault(other, []).append(name)
         else:
             assert other not in twins, (name, twins.get(other))
             twins[other] = name
         assert set(record["arches"]) <= set(twin["arches"]), name
         for arch in record["arches"]:
-            assert _band_cells(
-                _restricted(record["select_rule"], [arch])
-            ) == _band_cells(_restricted(twin["select_rule"], [arch])), (name, arch)
+            band = _restricted(twin["select_rule"], [arch])
+            spelled = {key for cell in _cells(band) for key in cell}
+            dropped = tuple(key for key in WAVE_KEYS if key not in spelled)
+            cells = _band_cells(_restricted(record["select_rule"], [arch]), dropped)
+            assert cells == _band_cells(band), (name, arch)
         assert record["grid_rule"] == twin["grid_rule"], name
         assert record["logical"]["rand_seed"] == "rand_seed", name
         assert record["logical"]["philox_rounds"] == "philox_rounds", name
@@ -1989,7 +2020,7 @@ def test_fp16_records_are_twins_of_the_fp32_records() -> None:
                                 philox_rounds=rounds,
                                 use_ssm_state_indices=snapshot,
                             ), (arch, key, T, state_heads, sms, rounds, snapshot)
-    assert siblings, "no snapshot_noise sibling in the registry"
+    assert siblings, "no sibling (snapshot_noise or draw_share) in the registry"
 
 
 def test_every_record_binds_the_logical_vocabulary() -> None:
@@ -2217,7 +2248,8 @@ def test_registry_records_reference_the_build_manifest() -> None:
 
 
 # Band edges and wave bounds of the route tables: B x HV probes for selected_module (those of the SM90 / SM100 /
-# SM103 parts, the domain of :data:`DEFAULT_PICKS_OF_RECORD`, then those of SM107).
+# SM103 parts, the domain of :data:`DEFAULT_PICKS_OF_RECORD`, then those of SM107 and the wave bounds of the runtime
+# n = 3 snapshot_noise cells: 3 x SM, 4 x SM and 124 x SM).
 _RECORD_STATE_HEAD_PROBES = (
     1,
     8,
@@ -2299,6 +2331,39 @@ _STATE_HEAD_PROBES = (
     13823,
     13824,
     13825,
+    # the wave bounds of the runtime n = 3 snapshot_noise sibling's cells (within (3 x sm, 4 x sm] it starts at 11
+    # rounds on SM100 / SM103 and at 16 on SM107): 3 x sm and +1 for every SM count of :data:`SM_COUNTS`, 4 x sm and
+    # +1 for 132 / 160 SMs (those of 148 / 152 / 212 / 216 SMs are above)
+    396,
+    397,
+    444,
+    445,
+    456,
+    457,
+    480,
+    481,
+    636,
+    637,
+    648,
+    649,
+    528,
+    529,
+    640,
+    641,
+    # the 124 x sm edge and +1 of the sibling's SM107 cells (above it, from 11 rounds instead of 10), for every SM
+    # count of :data:`SM_COUNTS`
+    16368,
+    16369,
+    18352,
+    18353,
+    18848,
+    18849,
+    19840,
+    19841,
+    26288,
+    26289,
+    26784,
+    26785,
 )
 
 
@@ -2365,8 +2430,8 @@ def test_route_tables_are_consistent() -> None:
                                 )
                                 for rounds, snapshot in classes
                             }
-                            # one body and variant per call: the classes of a call differ in the
-                            # snapshot_noise flag only
+                            # one body and variant per call: the classes of a call differ in a
+                            # sibling flag only
                             assert (
                                 len({_twin_key(loader.MODULES[name]) for name in picks})
                                 == 1
@@ -2428,8 +2493,9 @@ def test_default_launch_class_keeps_the_picks_of_record() -> None:
 def test_sm107a_selects_the_sm100a_programs() -> None:
     """sm_107a ships the decode programs, routes and bands of sm_100a: its decode routes are sm_100a's, and on every
     route, pool dtype, token count, SM count, probe and launch class it selects the program sm_100a selects, except
-    where the sm_107a cell of a ``snapshot_noise`` sibling admits fewer round counts: there it selects the
-    sibling's plain FP16 program (same body and variant)."""
+    where the sm_107a cells of a ``snapshot_noise`` sibling admit fewer round counts (the runtime n = 3 sibling's
+    within (3 x SM, 4 x SM] from 16 rounds, where sm_100a's take 11, and above 124 x SM from 11, where sm_100a's take
+    10): there it selects the sibling's plain FP16 program (same body and variant)."""
 
     def decode_routes(arch: str) -> dict:
         return {

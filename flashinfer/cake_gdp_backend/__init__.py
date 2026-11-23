@@ -504,7 +504,8 @@ def cake_gated_delta_product_mtp(
         use_qk_l2norm=use_qk_l2norm,
         state_dtype=state_dtype,
         # The launch class (host values, so a captured call keeps its program): an FP16 pool's round count and
-        # whether the call stores per-token snapshots pick a program's snapshot_noise sibling where it is faster.
+        # whether the call stores per-token snapshots pick a program's sibling (snapshot_noise or draw_share)
+        # where it is faster.
         philox_rounds=rounds,
         use_ssm_state_indices=bool(use_scatter),
     )

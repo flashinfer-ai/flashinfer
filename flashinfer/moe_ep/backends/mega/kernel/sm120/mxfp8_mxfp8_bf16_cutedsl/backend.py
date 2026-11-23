@@ -135,7 +135,7 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
             get_symm_buffer_for_sm120_mxfp8_mega_moe,
         )
 
@@ -210,7 +210,7 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         else:
             # Backend talks only to the swapab_cutedsl_megakernel shim
             # (never src/ directly).
-            from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+            from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
                 Mxfp8BlockSize,
                 ceil_div,
                 round_up,
@@ -248,7 +248,7 @@ class Sm120Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.sm120.swapab_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
             sm120_mxfp8_mega_moe,
         )
 

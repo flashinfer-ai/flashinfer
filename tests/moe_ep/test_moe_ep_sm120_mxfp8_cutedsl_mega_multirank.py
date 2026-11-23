@@ -5,7 +5,7 @@ Launched via torchrun:
 
 Requires Blackwell-consumer (sm_120/sm_121), >=4 GPUs, and CuTeDSL runtime
 deps (``nvidia-cutlass-dsl``, ``nvshmem4py``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.sm120.swapab_cutedsl_megakernel``.  The SM120
+``flashinfer.moe_ep.shims.sm120.swapab_cutedsl``.  The SM120
 tree is process-exclusive with the sm_100/sm_90 trees (shared top-level kernel
 module names), so run this file in its own torchrun process (see
 run_tests.sh ``run_mega_sm120``).
@@ -39,7 +39,7 @@ import pytest
 # This test verifies the mega path only through the swapab_cutedsl_megakernel
 # shim public API; it never imports the src/ kernel packages directly, so a
 # new src/ drop can't silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.sm120.swapab_cutedsl_megakernel")
+pytest.importorskip("flashinfer.moe_ep.shims.sm120.swapab_cutedsl")
 
 from .mega_oracle_compare import (  # noqa: E402
     _assert_mega_oracle_term_band_close,
@@ -190,7 +190,7 @@ def _reference_sm120_mxfp8_mega_moe_staged(
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.sm120.swapab_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
         get_symm_buffer_for_sm120_mxfp8_mega_moe,
         sm120_mxfp8_mega_moe,
     )
@@ -257,7 +257,7 @@ def _reference_sm120_mxfp8_mega_moe_prestaged(
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp8_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.sm120.swapab_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
         get_symm_buffer_for_sm120_mxfp8_mega_moe,
         sm120_mxfp8_mega_moe,
     )
@@ -406,7 +406,7 @@ def _run_mega_layer(
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.kernel_src.sm120.swapab_cutedsl_megakernel import (
+            from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
                 get_symm_buffer_for_sm120_mxfp8_mega_moe,
             )
 
@@ -716,7 +716,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm120.swapab_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.swapab_cutedsl import (
         compute_megamoe_reference_mxfp8,
         get_symm_buffer_for_sm120_mxfp8_mega_moe,
         sm120_mxfp8_mega_moe,
