@@ -113,6 +113,30 @@ def _mul_e2m1x4_e4m3x4(packed_fp4: Int32, packed_sf: Int32) -> Int32:
         )
 
 
+@cute.jit
+def _scale_e2m1x8_to_e4m3x8(packed_fp4: Int32, packed_sf: Int32):
+    """Scale eight dense-packed E2M1 values; return two E4M3 words in order.
+
+    ``packed_fp4`` holds values 0-7 in nibble order (byte k: value 2k low,
+    2k+1 high); every byte of ``packed_sf`` is the block's E4M3 scale. With the
+    packed multiply, the dense ``e2m1x4`` operand takes four consecutive
+    nibbles per 16-bit half, so each half is one multiply and the products are
+    already in order. Otherwise the padded form scales even and odd nibbles
+    separately and two byte permutes interleave them back.
+    """
+    if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
+        return cute.arch.inline_ptx(
+            "{ .reg .b16 lo, hi; mov.b32 {lo, hi}, {$r0}; "
+            "mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite {$w0}, lo, {$r1}; "
+            "mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite {$w1}, hi, {$r1}; }",
+            write_only_types=[Int32, Int32],
+            read_only_args=[packed_fp4, packed_sf],
+        )
+    even = _mul_e2m1x4_e4m3x4(packed_fp4, packed_sf)
+    odd = _mul_e2m1x4_e4m3x4(packed_fp4 >> Int32(4), packed_sf)
+    return byte_permute(even, odd, 0x5140), byte_permute(even, odd, 0x7362)
+
+
 def has_direct_bf16_fp4_fp8_cvt() -> bool:
     """Whether PTX converts E2M1x2 and E4M3x2 directly to BF16x2 (CUDA 13.2+)."""
     return cutlass.target_version(min_version="13.2")
@@ -555,12 +579,7 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
             for word_idx in cutlass.range_constexpr(4):
                 sf_scalar = block_scales[word_idx // 2]
                 if cutlass.const_expr(cfg.qk_dtype_bytes == 1):
-                    # Even and odd nibbles scale separately (E4M3 rounding),
-                    # then interleave back to natural order.
-                    even = _mul_e2m1x4_e4m3x4(words[word_idx], sf_scalar)
-                    odd = _mul_e2m1x4_e4m3x4(words[word_idx] >> Int32(4), sf_scalar)
-                    dst_regs.append(byte_permute(even, odd, 0x5140))
-                    dst_regs.append(byte_permute(even, odd, 0x7362))
+                    dst_regs.extend(_scale_e2m1x8_to_e4m3x8(words[word_idx], sf_scalar))
                 else:
                     dst_regs.extend(
                         scale_e2m1x8_packed_to_bf16x2x4(words[word_idx], sf_scalar)
@@ -707,15 +726,14 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
             dst_regs = []
             for word_idx in cutlass.range_constexpr(4):
                 sf_scalar = block_scales[word_idx // 2]
-                even = _mul_e2m1x4_e4m3x4(words[word_idx], sf_scalar)
-                odd = _mul_e2m1x4_e4m3x4(words[word_idx] >> Int32(4), sf_scalar)
                 if cutlass.const_expr(cfg.uses_permuted_packed_k_order):
                     # Q's head dim carries the same even/odd order.
-                    dst_regs.append(even)
-                    dst_regs.append(odd)
+                    dst_regs.append(_mul_e2m1x4_e4m3x4(words[word_idx], sf_scalar))
+                    dst_regs.append(
+                        _mul_e2m1x4_e4m3x4(words[word_idx] >> Int32(4), sf_scalar)
+                    )
                 else:
-                    dst_regs.append(byte_permute(even, odd, 0x5140))
-                    dst_regs.append(byte_permute(even, odd, 0x7362))
+                    dst_regs.extend(_scale_e2m1x8_to_e4m3x8(words[word_idx], sf_scalar))
             prims.tcgen05_st(
                 "32x32b",
                 prims.make_tmem_ptr(stage_addr + chunk * Int32(cols_per_chunk), Int32),
@@ -1723,13 +1741,9 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
                 )
                 out = []
                 for word_idx in cutlass.range_constexpr(4):
-                    sf = scales[word_idx // 2]
-                    # Low nibbles are the even head-dim values, high nibbles
-                    # the odd ones; interleave the two product words back.
-                    even = _mul_e2m1x4_e4m3x4(words[word_idx], sf)
-                    odd = _mul_e2m1x4_e4m3x4(words[word_idx] >> Int32(4), sf)
-                    out.append(byte_permute(even, odd, 0x5140))
-                    out.append(byte_permute(even, odd, 0x7362))
+                    out.extend(
+                        _scale_e2m1x8_to_e4m3x8(words[word_idx], scales[word_idx // 2])
+                    )
                 for seg in cutlass.range_constexpr(2):
                     seg_idx = Int32(chunk * 2 + seg)
                     st_shared_v4_b32(

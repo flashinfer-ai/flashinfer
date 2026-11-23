@@ -21,6 +21,7 @@ import inspect
 import math
 from types import SimpleNamespace
 from typing import Literal, Optional, Sequence
+import sys
 import warnings
 
 import pytest
@@ -4450,13 +4451,16 @@ def test_attention_ts_decode_nvfp4_d512_q8_groups_transformed_slots() -> None:
     assert cfg.raw_nvfp4_slice_bytes == cfg.tile_size_kv * 128 // 2
     assert cfg.permutes_nvfp4_v_rows
     assert 2 <= cfg.kv_stages <= 4
-    # Packed K keeps the converter's even-then-odd order; Q is permuted to
-    # match. Persistent schedules derive Q descriptors on several paths, so
-    # the permutation stays off there (both sides read the same property).
-    assert cfg.uses_permuted_packed_k_order
+    # The dense packed multiply keeps K in logical order. The even-then-odd
+    # order is opt-in; persistent schedules derive Q descriptors on several
+    # paths, so it stays off there (both sides read the same property).
+    assert not cfg.use_permuted_packed_k_order
+    assert config(use_permuted_packed_k_order=True).uses_permuted_packed_k_order
     persistent = config(use_persistent_scheduler=True)
-    assert persistent.use_permuted_packed_k_order
     assert not persistent.uses_permuted_packed_k_order
+    assert not config(
+        use_persistent_scheduler=True, use_permuted_packed_k_order=True
+    ).uses_permuted_packed_k_order
     # Fused slot issue needs a routed Q descriptor; schedules that derive Q
     # from q_ref keep per-stage issue.
     assert persistent.uses_fused_slot_mma_issue == (not persistent.uses_q_desc_ref)
@@ -4530,6 +4534,10 @@ def test_attention_ts_decode_nvfp4_d512_keeps_ring_depths_fit() -> None:
     cfg = config()
     assert cfg.keeps_o_uses_lane_panels and cfg.uses_stage_sliced_nvfp4_sf
     assert (cfg.transformed_kv_stages, cfg.transformed_v_stages) == (4, 3)
+    # K/V rows stay in logical order unless the even-then-odd order is opted in.
+    assert not (cfg.uses_permuted_packed_k_order or cfg.uses_permuted_packed_v_order)
+    opted = config(use_permuted_packed_k_order=True, use_permuted_packed_v_order=True)
+    assert opted.uses_permuted_packed_k_order and opted.uses_permuted_packed_v_order
     # An explicit V depth of zero shares the K depth; three slots each fit.
     shared = config(transformed_v_stages=0)
     assert (shared.transformed_kv_stages, shared.transformed_v_stages) == (3, 0)
@@ -10963,14 +10971,15 @@ def test_attention_ts_decode_large_tile_size_q(
             pages = case.block_tables[batch, : (length + page_size - 1) // page_size]
             keys = k_cache[pages.long()].transpose(1, 2).reshape(-1, 1, head_dim)
             keys = keys[:length]
+            # One-token decode stores Q as [batch, heads, dim].
             _, stats = _softmax_statistics_reference(
-                case.q[batch],
+                case.q[batch].reshape(seq_len_q, heads_q_per_kv, head_dim),
                 keys,
                 torch.zeros_like(keys, dtype=torch.float32),
                 scale=case.softmax_scale,
                 sinks=sinks,
             )
-            expected_lse.append(stats / math.log(2))
+            expected_lse.append((stats / math.log(2)).reshape(lse.shape[1:]))
         expected_lse = torch.stack(expected_lse)
 
     def run():
@@ -11002,6 +11011,50 @@ def test_attention_ts_decode_large_tile_size_q(
     _assert_case_correct(out, case)
     if check_lse:
         torch.testing.assert_close(lse, expected_lse, atol=0.015, rtol=0.002)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("use_keeps_mma_ab", "tile_size_q", "seq_len_q", "overrides"),
+    (
+        (False, 8, 1, {"use_permuted_packed_k_order": True}),
+        (
+            True,
+            64,
+            8,
+            {"use_permuted_packed_k_order": True, "use_permuted_packed_v_order": True},
+        ),
+    ),
+)
+def test_attention_ts_decode_nvfp4_d512_even_odd_order_opt_in(
+    monkeypatch, use_keeps_mma_ab, tile_size_q, seq_len_q, overrides
+) -> None:
+    """The opt-in even-then-odd K/V order (padded multiply) matches the reference."""
+    module = sys.modules[__name__]
+    original_make_decode_config = module.make_decode_config
+    resolved = []
+
+    def make_with_overrides(*args, **kwargs):
+        kwargs["args"] = {**kwargs["args"], **overrides}
+        cfg = original_make_decode_config(*args, **kwargs)
+        resolved.append(cfg)
+        return cfg
+
+    monkeypatch.setattr(module, "make_decode_config", make_with_overrides)
+    test_attention_ts_decode_large_tile_size_q(
+        monkeypatch,
+        head_dim=512,
+        tile_size_q=tile_size_q,
+        split_kv_mode="disabled",
+        heads_q_per_kv=8,
+        output_dtype=torch.bfloat16,
+        seq_len_kv=769,
+        seq_len_q=seq_len_q,
+        page_size=64,
+        use_keeps_mma_ab=use_keeps_mma_ab,
+    )
+    assert resolved and resolved[-1].uses_permuted_packed_k_order
+    assert resolved[-1].uses_permuted_packed_v_order == use_keeps_mma_ab
 
 
 @_REQUIRES_PRIMTS_GPU

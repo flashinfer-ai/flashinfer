@@ -898,14 +898,15 @@ class FmhaDecodeConfig:
     # barrier, one converter wait/release and one scale copy per tile
     # instead of per D128 slice. Requires use_packed_nvfp4_raw_payload.
     use_whole_tile_nvfp4_raw_stage: bool = False
-    # Packed K conversion produces each 8-value group as even values then odd
-    # values. Store K in that order and permute Q's head dim identically once
-    # per Q tile (QK^T reduces over the head dim), dropping two byte permutes
-    # per converted K word. Requires the packed payload and FP8 Q/K.
+    # Opt-in: convert packed K with the padded multiply, which yields each
+    # 8-value group as even values then odd values, store K in that order and
+    # permute Q's head dim identically once per Q tile (QK^T reduces over the
+    # head dim). The default dense packed multiply already returns values in
+    # order. Requires the packed payload and FP8 Q/K.
     use_permuted_packed_k_order: bool = False
-    # One-instance Keeps D512 only: the V converter writes even-then-odd FP8
-    # rows, so O columns come out permuted within groups of eight and the
-    # epilogue reads them back in logical order (no extra instructions).
+    # Opt-in, one-instance Keeps D512 only: the V converter writes the padded
+    # multiply's even-then-odd FP8 rows, so O columns come out permuted within
+    # groups of eight and the epilogue reads them back in logical order.
     use_permuted_packed_v_order: bool = False
     # One-instance Keeps D512 only: each raw D128 stage TMAs only the scale
     # columns it needs (K: the 16 B half row, V: its 32 B per 4-token group)
@@ -4817,11 +4818,9 @@ def _finalize_static_decode_config(
         _set_if_implicit(
             cfg, "use_whole_tile_nvfp4_raw_stage", packed_whole_tile, explicit_fields
         )
-        # Store packed K as even-then-odd values and permute Q to match:
-        # drops two byte permutes per converted K word (8-10% on B300).
-        _set_if_implicit(
-            cfg, "use_permuted_packed_k_order", packed_whole_tile, explicit_fields
-        )
+        # K stays in logical order: the dense packed multiply converts eight
+        # values with two instructions and no byte permutes, 2-3% faster on
+        # B200/B300 than the padded multiply with even-then-odd K and Q.
         # With a single converter group the MMA warp's per-D128-stage issue
         # blocks become critical; issuing each slot from one elected block
         # measured a further 2-3% on B200/B300.
@@ -4888,14 +4887,12 @@ def _finalize_static_decode_config(
             cfg.transformed_kv_stages = 2
         if cfg.keeps_o_uses_lane_panels:
             # D512 grouped Keeps (B300/B200, q_len 8, FlashInfer #9602):
-            # - Even-then-odd K/V rows drop the converter's byte interleave
-            #   (Q is permuted per load; O columns are restored for free).
+            # - The dense packed multiply converts K/V rows in logical order,
+            #   so neither Q nor O is permuted.
             # - Stage-sliced scale factors free 20 KiB of SMEM, which holds
             #   FP8 K/V rings of 4/3 slots (566 -> 464 us at B32 shared).
             # - Two loader warps: one issuing warp could not keep the raw
             #   rings full (82% busy at 32 TMAs per tile; 464 -> 432 us).
-            _set_if_implicit(cfg, "use_permuted_packed_k_order", True, explicit_fields)
-            _set_if_implicit(cfg, "use_permuted_packed_v_order", True, explicit_fields)
             _set_if_implicit(cfg, "use_stage_sliced_nvfp4_sf", True, explicit_fields)
             if cfg.uses_stage_sliced_nvfp4_sf:
                 # An explicit transformed_v_stages=0 shares the K depth: three

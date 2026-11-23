@@ -57,6 +57,7 @@ from .smem_resources import SmemKvResource, SmemKvTileResource
 from .tmem_transformed_kv import (
     _has_packed_e4m3_e2m1_mul,
     _mul_e2m1x4_e4m3x4,
+    _scale_e2m1x8_to_e4m3x8,
     broadcast_byte_const,
     byte_permute,
 )
@@ -197,14 +198,11 @@ def store_nvfp4_fp8_row_block(
         scale = broadcast_byte_const(scale_word, block % 4)
     for w in cutlass.range_constexpr(2):
         if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
-            even = _mul_e2m1x4_e4m3x4(packed_words[w], scale)
-            odd = _mul_e2m1x4_e4m3x4(packed_words[w] >> Int32(4), scale)
             if cutlass.const_expr(even_odd_order):
-                fp8_words.append(even)
-                fp8_words.append(odd)
+                fp8_words.append(_mul_e2m1x4_e4m3x4(packed_words[w], scale))
+                fp8_words.append(_mul_e2m1x4_e4m3x4(packed_words[w] >> Int32(4), scale))
             else:
-                fp8_words.append(byte_permute(even, odd, 0x5140))
-                fp8_words.append(byte_permute(even, odd, 0x7362))
+                fp8_words.extend(_scale_e2m1x8_to_e4m3x8(packed_words[w], scale))
         else:
             scale = (scale_word >> Int32((block % 4) * 8)) & Int32(255)
             converted = _cvt_e2m1_word_to_e4m3_words(packed_words[w], scale)
