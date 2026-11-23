@@ -3917,6 +3917,7 @@ def _build_trtllm_moe_namespace(module):
         hidden_states_scale_layout: Optional[int],
         nvfp4_4over6_code: int,
         output: Optional[torch.Tensor],
+        localized_sm_count: int = 0,
     ) -> Optional[int]:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[-1] * (
@@ -3960,7 +3961,7 @@ def _build_trtllm_moe_namespace(module):
             valid_hidden_size=valid_hidden_size,
             hidden_states_scale_layout=hidden_states_scale_layout,
             nvfp4_4over6_code=nvfp4_4over6_code,
-            localized_sm_count=0,
+            localized_sm_count=localized_sm_count,
         )
         tuner = AutoTuner.get()
         # Outside tuning mode choose_one is the call's own cache lookup; it never profiles.
@@ -3989,6 +3990,24 @@ def _build_trtllm_moe_namespace(module):
                     moe_runner.use_per_token_scaling,
                 )
             )
+            if localized_sm_count > 0:
+                # As the localized launch: the default tile if it can run localized, else the
+                # first tile that can.
+                tiles = [
+                    int(candidate[0])
+                    for candidate in moe_op.trtllm_get_valid_localized_moe_configs(
+                        top_k,
+                        moe_runner.hidden_size,
+                        intermediate_size,
+                        num_local_experts,
+                        num_experts,
+                        num_tokens,
+                        activation_type,
+                        localized_sm_count,
+                    )
+                ]
+                if tile_n not in tiles:
+                    tile_n = tiles[0] if tiles else -1
         return None if tile_n == -1 else tile_n
 
     @register_custom_op(
@@ -4053,8 +4072,6 @@ def _build_trtllm_moe_namespace(module):
     ) -> List[torch.Tensor]:
         localized_weights = list(localized_weights or [])
         localized_streams = list(localized_streams or [])
-        if localized_weights and routing_metadata is not None:
-            raise ValueError("localized_weights does not support routing_metadata")
         if routing_logits is None:
             assert topk_ids is not None, (
                 "either topk_ids or routing_logits must be provided."
@@ -4923,10 +4940,12 @@ def trtllm_fp4_block_scale_moe_routing_tile_n(
     hidden_states_scale_layout: Optional[SfLayout] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     output: Optional[torch.Tensor] = None,
+    localized_sm_count: Optional[int] = None,
 ) -> Optional[int]:
     """The tile_N :func:`trtllm_fp4_block_scale_routed_moe` runs with the same arguments:
     the autotuned tile if the tactic cache has one, else the default tile after the call's
     tile fallback. ``None`` when no tile can run, so route inside the call instead.
+    Pass the call's ``localized_sm_count`` when it runs localized.
 
     It only looks the cache up (inside a tuning context it returns the default tile,
     so tune the call without ``routing_metadata``). Only the shapes and dtypes of the
@@ -4954,6 +4973,7 @@ def trtllm_fp4_block_scale_moe_routing_tile_n(
         hidden_states_scale_layout,
         _trtllm_fp4_nvfp4_4over6_code(nvfp4_4over6, per_token_scale, hidden_states),
         output,
+        localized_sm_count or 0,
     )
 
 
@@ -8056,7 +8076,8 @@ def trtllm_fp4_block_scale_routed_moe(
     localized_weights : Optional[List[Dict[str, torch.Tensor]]]
         Per-locality-domain weight shards for uGPU localization; see
         :func:`trtllm_fp4_block_scale_moe`. Not supported with
-        ``routing_metadata`` or ``gemm1_lora_delta``.
+        ``gemm1_lora_delta``. With ``routing_metadata``, both domains run from
+        the same metadata.
     localized_streams : Optional[List[torch.cuda.Stream]]
         One stream per locality domain; see :func:`trtllm_fp4_block_scale_moe`.
     localized_sm_count : Optional[int]

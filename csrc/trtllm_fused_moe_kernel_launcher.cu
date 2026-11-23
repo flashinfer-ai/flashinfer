@@ -5661,8 +5661,15 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     prepared.bind(workspace, per_token_scales);
 
     cudaStream_t stream = get_stream(hidden_states.device());
-    moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
-                    enable_pdl);
+    if (localized_sm_count_ > 0) {
+      // Both domains read the same routing metadata; the other domains' scratch matches these.
+      workspace_fc1 = prepared.workspace_fc1;
+      workspace_fc2 = prepared.workspace_fc2;
+      run_localized(stream, enable_pdl);
+    } else {
+      moe_runner->run(*args, workspace, hidden_states.device().device_id, stream, moe_tactic,
+                      enable_pdl);
+    }
   }
 
   /** Return the launcher-owned finalized output handle used by the existing DA result ABI. */
@@ -6717,9 +6724,6 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
         << "Localized MoE does not support padded (valid) dimensions.";
     TVM_FFI_ICHECK(!workspace_buffer.has_value() && !query_workspace_size)
         << "Localized MoE does not support workspace_buffer.";
-    TVM_FFI_ICHECK(da_routing_metadata.empty() && da_body_workspace.empty() &&
-                   !is_da_body_preparation)
-        << "Localized MoE does not support routing metadata.";
   }
 
   // Determine supported tile sizes
