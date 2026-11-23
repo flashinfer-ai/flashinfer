@@ -4968,6 +4968,51 @@ def test_top_k_top_p_sampling_rejects_unaligned_input_as_stored(api, vocab_size,
 
 
 @pytest.mark.parametrize(
+    "api", ["top_k_top_p_sampling_from_logits", "top_k_top_p_sampling_from_probs"]
+)
+@pytest.mark.parametrize(
+    "dtype,rows,vocab_size,shift,reaches_clusters",
+    [
+        (torch.float32, 2, 65536, 0, True),
+        # base 4 bytes past a 16-byte boundary, enough for the radix kernel
+        (torch.float32, 1, 65537, 1, False),
+        # aligned base, but the second row starts 4 bytes past a 16-byte boundary
+        (torch.float32, 2, 65537, 0, False),
+        # base 4 bytes past an 8-byte boundary, enough for the radix kernel
+        (torch.float16, 1, 65537, 2, False),
+    ],
+)
+def test_top_k_first_routes_only_aligned_rows_to_clusters_top_k(
+    monkeypatch, api, dtype, rows, vocab_size, shift, reaches_clusters
+):
+    """The SM100 clusters top-k reads four elements at once from every row.
+
+    Its eligibility is forced and the kernel replaced by torch.topk, so the routing is
+    checked on any device: a base or a row unaligned for those loads must leave the
+    "top_k_first" fast path rather than reach the kernel.
+    """
+    calls = []
+
+    def clusters_top_k(input, k, output_values=False, out_dtype=torch.int32, pdl=False):
+        calls.append(input.shape)
+        values, indices = torch.topk(input, k, dim=-1)
+        return indices.to(out_dtype), values
+
+    monkeypatch.setattr(flashinfer.topk, "can_use_clusters_topk", lambda *_: True)
+    monkeypatch.setattr(flashinfer.topk, "topk_clusters_exact", clusters_top_k)
+    torch.manual_seed(42)
+    logits = torch.randn(rows, vocab_size, device="cuda:0")
+    is_logits = api == "top_k_top_p_sampling_from_logits"
+    x = (logits if is_logits else torch.softmax(logits, dim=-1)).to(dtype)
+    samples = getattr(flashinfer.sampling, api)(
+        _storage_offset_view(x, shift), 32, 0.9, deterministic=False, seed=7, offset=0
+    )
+    torch.cuda.synchronize()
+    assert samples.shape == (rows,)
+    assert len(calls) == int(reaches_clusters)
+
+
+@pytest.mark.parametrize(
     "api",
     [
         "top_p_sampling_from_probs",
