@@ -2973,6 +2973,92 @@ class B12xW4A16Config:
 
 
 @dataclass(frozen=True)
+class W4A16MxFp4LatentConfig:
+    """SM90-only specialized W4A16 MXFP4-weight latent-MoE backend.
+
+    Adapts :func:`flashinfer.fused_moe.w4a16_mxfp4_moe.w4a16_mxfp4_latent_routed_moe`
+    — one rank's routed-expert block of a latent MoE with mxfp4-g32 packed
+    weights (compressed-tensors convention: two e2m1 nibbles per uint8, LOW
+    nibble at the even K index, ue8m0 group-32 scales) and bf16 activations —
+    to :class:`MoELayer`. The kernel is a fixed-geometry specialist compiled
+    for exactly ``num_experts=56``, ``top_k=16``, hidden (latent) size 3584,
+    ``intermediate_size=3072``, and token counts in ``(0, 8192]``; any other
+    geometry is rejected by the runner, never served by a different kernel.
+
+    Routing is CONSUMED, not computed: only the pre-routed modes
+    (``PackedPrecomputed`` / ``UnpackedPrecomputed``) are supported, with
+    ``int32`` ``topk_ids`` and ``float32`` ``topk_weights`` consumed as-is
+    (``FromLogits`` is not supported — the kernel has no in-kernel router).
+    The only supported activation is the canonical ``SiTU()``
+    (``4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)`` with one bf16 rounding of the
+    activated intermediate); non-default SiTU scalars are rejected.
+    ``do_finalize=True`` is required.
+
+    Expert parallelism (EP) is NOT supported: ``local_expert_offset`` must be
+    0 and ``local_num_experts`` must equal ``num_experts``. The flat API's
+    global-expert-id / rank-partial-output semantics are reachable only
+    through the flat entry point, not through :class:`MoELayer`.
+
+    A DEFAULT backend candidate: ``supported()`` gates the arch (SM90) and
+    the runner gates the kernel's fixed contract, so a matching layer
+    reaches the kernel through ``backend=auto`` — timed by the cross-backend
+    autotune shootout as a first-class candidate — with no opt-in.
+
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (deprecated alias:
+    ``FLASHINFER_W4A16_MXFP4_LATENT_MOE=0``) excludes this runner before
+    winner lookup on each layer call. Another eligible runner can serve;
+    without one, the layer raises ``NotImplementedError``. For the eager
+    flat op, ``backend="auto"`` uses the reference implementation while
+    explicit ``backend="specialized"`` raises.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (90,)
+
+    @staticmethod
+    def prepare_weights(
+        w13_packed,
+        w13_scale,
+        w2_packed,
+        w2_scale,
+    ):
+        """Build the ``w4a16_mxfp4_latent`` weight view from checkpoint tensors.
+
+        The tensors are the flat op's own weight contract (already
+        mxfp4-pack-quantized in the compressed-tensors convention; fc1 rows
+        stack gate|up): ``w13_packed [E, 2I, L/2] uint8``,
+        ``w13_scale [E, 2I, L/32] uint8``, ``w2_packed [E, L, I/2] uint8``,
+        ``w2_scale [E, L, I/32] uint8``. No re-quantization or re-layout is
+        performed; the view stores contiguous references.
+
+        Register the result with
+        ``MoEWeightPack.prepare_for("w4a16_mxfp4_latent", ...)``.
+        """
+        tensors = {
+            "w13_packed": w13_packed,
+            "w13_scale": w13_scale,
+            "w2_packed": w2_packed,
+            "w2_scale": w2_scale,
+        }
+        for name, t in tensors.items():
+            if not isinstance(t, Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor, got {type(t)!r}.")
+            if t.dtype is not torch.uint8:
+                raise TypeError(
+                    f"{name} must be uint8 (mxfp4-g32 packing), got {t.dtype}."
+                )
+            if t.dim() != 3:
+                raise ValueError(
+                    f"{name} must be 3D [E_local, N, K-packed], got {t.dim()}D."
+                )
+        return {name: t.contiguous() for name, t in tensors.items()}
+
+    def __repr__(self) -> str:
+        return "W4A16MxFp4LatentConfig()"
+
+
+@dataclass(frozen=True)
 class CudnnFrostBf16Config:
     """Frost BF16 MoE on SM107 and SM120, with packed precomputed routing.
 
@@ -3632,6 +3718,7 @@ BackendConfigType = Union[
     B12xNvfp4Config,
     B12xW4A16Config,
     BatchInvariantFp8PerTensorConfig,
+    W4A16MxFp4LatentConfig,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3679,6 +3766,7 @@ ALL_BACKEND_CONFIGS = (
     B12xNvfp4Config,
     B12xW4A16Config,
     BatchInvariantFp8PerTensorConfig,
+    W4A16MxFp4LatentConfig,
 )
 
 
@@ -3732,6 +3820,11 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
+        # Specialized agent-generated kernels: first-class auto/autotune
+        # candidates on the layers they were optimized for (supported() and
+        # the runner gate arch + contract; out-of-domain configurations are
+        # rejected at layer construction and served by the other candidates).
+        W4A16MxFp4LatentConfig(),
         CuteDslConfig(),
         CuTileMxfp4Bf16Config(),
         CuTileFp8PerTensorBf16Config(),

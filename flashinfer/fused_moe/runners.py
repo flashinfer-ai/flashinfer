@@ -9778,6 +9778,243 @@ class B12xW4A16Runner(_B12xRunner):
     )
 
 
+class _W4A16LatentPackedInputs(list):
+    """Tensor-list ABI plus the weight view local to one latent-MoE call.
+
+    ``pack_inputs`` binds the prepared weight view to the object it returns
+    (the ``MoERunner`` per-call metadata convention), so interleaved
+    ``pack_inputs -> forward`` pairs cannot exchange weights. The autotuner's
+    profiling path synthesizes plain tensor lists; ``launch_kwargs_for``
+    carries the original packed call's view to those launches.
+    """
+
+    def __init__(self, inputs: List[torch.Tensor], *, weight_view) -> None:
+        super().__init__(inputs)
+        self.w4a16_latent_weight_view = weight_view
+
+
+class W4A16MxFp4LatentRunner(MoERunner):
+    """Unified SM90 adapter for the specialized W4A16 mxfp4 latent-MoE kernel.
+
+    Adapts the flat :func:`~flashinfer.fused_moe.w4a16_mxfp4_moe.
+    w4a16_mxfp4_latent_routed_moe` entry point to the :class:`MoELayer`
+    runner protocol. Every dispatch goes through the flat op with
+    ``backend="specialized"``, so its guards (argument consistency, 16-byte
+    alignment, CUDA-graph rules, the
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE`` kill switch, dispatch stats)
+    stay the single source of truth; this adapter re-encodes none of them.
+    Under the kill switch this runner reports itself ineligible
+    (``accepts`` → False) so the layer's winner selection never times a
+    disabled backend: explicit ``backend="specialized"`` raises when killed,
+    and the composable reference path belongs to the flat op (where killed
+    ``backend="auto"`` callers are still served), not to the layer.
+
+    The kernel is a fixed-geometry specialist; ``check_support`` pins the
+    config to it (``num_experts`` = E_local, ``top_k``, ``intermediate_size``
+    read from the flat module's constants) and ``_accepts_shape`` gates the
+    per-call hidden size and token envelope, so a pack the kernel cannot
+    serve never selects this runner. Expert parallelism is rejected: the
+    flat API's global-id / rank-partial semantics are not routable through
+    the layer.
+
+    The op has a single fixed tactic (``get_valid_tactics`` → ``[-1]``).
+    Only the flat ``backend="auto"`` form refuses tuning-mode calls (it must
+    not be enumerated into flat-path tactic tables); the explicit
+    ``backend="specialized"`` this runner dispatches runs under tuning mode,
+    so ``MoELayer``'s cross-backend shootout times the real fixed-tactic
+    dispatch with no tuner-state mutation.
+    """
+
+    backend_key = "w4a16_mxfp4_latent"
+    supported_routing_modes = (
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    )
+    supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.BF16),)
+    supported_activation_classes = (SiTU,)
+    supports_expert_parallelism = False
+    required_weight_keys: ClassVar[tuple[str, ...]] = (
+        "w13_packed",
+        "w13_scale",
+        "w2_packed",
+        "w2_scale",
+    )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.tuning_config = TuningConfig()
+        self._flat: Any = None
+
+    def _check_activation_parameters(self) -> None:
+        if (
+            isinstance(self.config.activation, SiTU)
+            and self.config.activation != SiTU()
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the canonical SiTU() "
+                f"scales (gate_scale=4, linear_scale=25, no clamp), got "
+                f"{self.config.activation!r}."
+            )
+
+    def _check_support(self) -> None:
+        super()._check_support()
+
+        from . import w4a16_mxfp4_moe as _flat
+
+        major, minor = get_compute_capability(self.device)
+        if (major, minor) != (9, 0):
+            raise RuntimeError(
+                f"{type(self).__name__} requires SM90, got SM{major}{minor}."
+            )
+        routing = self.config.routing
+        experts = self.config.experts
+        if routing.num_experts != _flat._E_LOCAL:
+            raise NotImplementedError(
+                f"{type(self).__name__} is compiled for exactly "
+                f"num_experts={_flat._E_LOCAL}, got {routing.num_experts}."
+            )
+        if routing.top_k != _flat._TOP_K:
+            raise NotImplementedError(
+                f"{type(self).__name__} is compiled for exactly "
+                f"top_k={_flat._TOP_K}, got {routing.top_k}."
+            )
+        if experts.intermediate_size != _flat._I:
+            raise NotImplementedError(
+                f"{type(self).__name__} is compiled for exactly "
+                f"intermediate_size={_flat._I}, got {experts.intermediate_size}."
+            )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires do_finalize=True."
+            )
+
+    def _build(self) -> None:
+        """Bind the flat module; the JIT kernel builds on first dispatch."""
+        from . import w4a16_mxfp4_moe as _flat
+
+        self._flat = _flat
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        if self._flat is None:
+            return False
+        if self._flat._killed():
+            # the kill switch disables the specialized kernel; a disabled
+            # backend is ineligible rather than a winner-selection candidate
+            # that raises (or, worse, times the composable reference path)
+            return False
+        hidden = act.hidden_states_q
+        return (
+            hidden.ndim == 2
+            and hidden.shape[1] == self._flat._L
+            and 0 < hidden.shape[0] <= self._flat._MAX_TOKENS
+        )
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        self._validate_pack_contract(act)
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self.required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        flat = self._flat
+        expected = {
+            "w13_packed": (flat._E_LOCAL, 2 * flat._I, flat._L // 2),
+            "w13_scale": (flat._E_LOCAL, 2 * flat._I, flat._L // flat._GROUP),
+            "w2_packed": (flat._E_LOCAL, flat._L, flat._I // 2),
+            "w2_scale": (flat._E_LOCAL, flat._L, flat._I // flat._GROUP),
+        }
+        for key, shape in expected.items():
+            t = view[key]
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(f"{self.backend_key} weight {key} must be a tensor.")
+            if tuple(t.shape) != shape or t.dtype is not torch.uint8:
+                raise ValueError(
+                    f"{self.backend_key} weight {key} must be uint8 {shape}, "
+                    f"got {t.dtype} {tuple(t.shape)} — off the kernel's fixed "
+                    "geometry. This runner never serves another kernel; "
+                    "prepare the view with "
+                    "W4A16MxFp4LatentConfig.prepare_weights."
+                )
+        hidden_states = act.hidden_states_q
+        if hidden_states.dtype != torch.bfloat16:
+            raise TypeError(
+                f"{self.backend_key} requires BF16 hidden_states, "
+                f"got {hidden_states.dtype}."
+            )
+        if hidden_states.device != self.device:
+            raise ValueError(
+                f"hidden_states is on {hidden_states.device}, expected {self.device}."
+            )
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != flat._L:
+            raise ValueError(
+                f"{self.backend_key} hidden_states must be "
+                f"[num_tokens, {flat._L}], got {tuple(hidden_states.shape)}."
+            )
+        _validate_prerouted_inputs(
+            act,
+            hidden_states.shape[0],
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32,),
+            require_contiguous=True,
+        )
+        return _W4A16LatentPackedInputs(
+            [hidden_states, act.topk_ids, act.topk_weights], weight_view=view
+        )
+
+    def launch_kwargs_for(self, inputs):
+        return {"w4a16_latent_weight_view": inputs.w4a16_latent_weight_view}
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError(f"{self.backend_key} supports only tactic -1.")
+        if len(inputs) != 3:
+            raise ValueError(
+                f"{self.backend_key} expects [hidden, topk_ids, topk_weights]."
+            )
+        view = getattr(inputs, "w4a16_latent_weight_view", None)
+        if view is None:
+            view = kwargs.get("w4a16_latent_weight_view")
+        if view is None:
+            raise RuntimeError(
+                "w4a16_mxfp4_latent forward requires packed inputs or the "
+                "original call's launch_kwargs_for(inputs)."
+            )
+        # The kernel module's own entry, with the backend named explicitly:
+        # only the flat "auto" form refuses tuning-mode calls (it has no
+        # tactic space to enumerate), so this runner needs no tuner-state
+        # games while MoELayer times it as a first-class candidate.
+        return self._flat.w4a16_mxfp4_latent_routed_moe(
+            inputs[0],
+            view["w13_packed"],
+            view["w13_scale"],
+            view["w2_packed"],
+            view["w2_scale"],
+            inputs[1],
+            inputs[2],
+            backend="specialized",
+        )
+
+
 # ---------------------------------------------------------------------------
 # cuDNN grouped-GEMM runners
 # ---------------------------------------------------------------------------

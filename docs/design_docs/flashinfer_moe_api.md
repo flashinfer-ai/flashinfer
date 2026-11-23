@@ -959,6 +959,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `ReLU2` |
 | `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MXINT4×BF16` | `SwiGLU` |
+| `w4a16_mxfp4_latent` | `W4A16MxFp4LatentConfig` | `MXFP4×BF16` | `SiTU` |
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
 
 For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
