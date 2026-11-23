@@ -126,6 +126,28 @@ hand-off between CTAs precedes either counter, and the helper goes straight to
 the refine. The end-of-round reduce
 resets every inbox word once the round's planners are done with it.
 
+Every route this rank receives is thus counted W times, once by each planner,
+on purpose. The processing order and the bases need every source's counts: an
+expert's load sums them, and source c's segment inside an expert starts after
+the segments of the sources before c in ring order. Planners that each counted
+one source would have to pass their count rows to one another through global
+memory, a release and an acquire among the W CTAs, before any of them could
+rank; counting every plane removes that hand-off from the plan's critical
+path. The duplicate work is cheap: its loads read this rank's own inbox within
+the poll that waits for the planes, its atomics are CTA-scope SMEM atomics, a
+thread counts its vectors as soon as they have landed, and the planners hold
+SMs that have no other work yet. The Fence dispatches, which serve larger
+batches, count each route once, on its source, and send count rows instead
+(see "Expert-id lists").
+
+Only the counts agree across planners. The value a route's SMEM atomic
+returns, its offset inside its (source, expert) segment, depends on the order
+in which the CTA's atomics run and differs between planners, so planner c
+keeps the offsets of source c's routes alone and is the only planner that
+scatters them. The offsets of one (c, expert) segment then all come from one
+CTA and are 0 to the segment's count minus one, each once; which route takes
+which offset varies from launch to launch and changes no output.
+
 ``topk_ready`` keeps its system-scope release, a one issued after the inbox
 stores, which the planner acquires after it has published. Planes observed
 through volatile loads order nothing, and this edge is what orders a rank's
@@ -5647,7 +5669,8 @@ class GenphaseTokenComm(KernelComponent):
         processing order and the data-row bases. Planner 0 alone publishes the
         sizes and the processing order with ``sizes_ready``, then the bases the
         refine reads; every planner scatters ``source_rank``'s routes and adds one
-        to ``metadata_ready``. No planner waits for another.
+        to ``metadata_ready``. Each planner counts every source itself, so no
+        planner waits for another (see "Sentinel top-k inbox").
 
         Placement inside a (source, expert) segment comes from SMEM atomics and
         varies from launch to launch. No output depends on it: a route's FC1 and
@@ -5771,12 +5794,17 @@ class GenphaseTokenComm(KernelComponent):
         loaded before the ids and polled in the same sweeps, so they have landed by
         the scatter, which finds them in the returned words after the id slots.
 
-        A local route counts itself with a shared-memory atomic on its (source,
-        expert) segment. Only ``source_rank``'s routes use the value it returns,
-        their offset inside the segment: the route's record keeps the offset and
-        the expert for the scatter, and a route this rank does not own is
-        recorded as -1. All atomics of a pass leave before any of their results
-        is used, so a thread waits for them once rather than once per route.
+        Every planner counts all W planes, so that each derives every source's
+        counts without a hand-off (see "Sentinel top-k inbox"). A local route
+        counts itself with a shared-memory atomic on its (source, expert)
+        segment. Only ``source_rank``'s routes use the value it returns, their
+        offset inside the segment: that value depends on the order of this CTA's
+        atomics and differs between planners, so a segment's offsets must all
+        come from the one planner that scatters it. The route's record keeps the
+        offset and the expert for the scatter, and a route this rank does not
+        own is recorded as -1. All atomics of a pass leave before any of their
+        results is used, so a thread waits for them once rather than once per
+        route.
         """
         threads = self.threads_per_cta
         buckets = self.local_expert_bucket_count
