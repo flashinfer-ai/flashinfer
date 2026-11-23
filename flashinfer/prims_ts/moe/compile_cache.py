@@ -30,7 +30,7 @@ import functools
 import hashlib
 import json
 import os
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +65,14 @@ def get_compile_options() -> str:
     return get_prims_ts_compile_options()
 
 
-_COMPILED_GEMM_CACHE: dict[tuple[str, str, str, int, str], Any] = {}
+@dataclass
+class _CompiledGemm:
+    kernel: Any
+    # Only code is shared. Descriptors and tensor owners stay with each IO.
+    prepare_descriptors: Any = None
+
+
+_COMPILED_GEMM_CACHE: dict[tuple[str, str, str, int, str], _CompiledGemm] = {}
 
 
 def clear_compiled_gemm_cache() -> None:
@@ -193,7 +200,7 @@ def _kernel_source_sha256() -> str | None:
 
 def _compile_or_load(
     cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any, device_index: int
-) -> Any:
+) -> _CompiledGemm:
     """Load the GEMM from the persistent module, compiling it on a miss."""
     import torch
 
@@ -213,9 +220,9 @@ def _compile_or_load(
         # Disk hits skip _compile_for_launch, but descriptors still belong to
         # this workspace. Prepare before naming the kernel so its signature
         # includes the descriptor pointer rather than an unprepared None.
-        _prepare_tma_descriptors(io, stream)
+        prepare = _prepare_tma_descriptors(io, stream)
         if cute_dsl_cache_disabled() or source_sha256 is None:
-            return compile_fn()
+            return _CompiledGemm(compile_fn(), prepare)
         spec = JitSpecCuteDsl(
             _DISK_MODULE_NAME,
             _disk_kernel_name(cfg_hash, fc1_or_fc2, io),
@@ -230,7 +237,7 @@ def _compile_or_load(
             # compiling concurrently.
             spec.compile_and_persist()
             kernel = spec.load()
-    return kernel
+    return _CompiledGemm(kernel, prepare)
 
 
 def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> Any:
@@ -241,6 +248,8 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> 
     ``cute.compile`` to establish argument types, but the generated kernel body
     does not depend on their values and they must not be part of the cache key.
     """
+
+    import torch
 
     device_index, compile_arch = _compile_target_key(io)
     key = (
@@ -255,12 +264,14 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> 
             _prepare_tma_descriptors,
         )
 
-        # Compiled code is shared, but prepared descriptors belong to each IO
-        # workspace. A cache hit can introduce new shard pointers or output
-        # strides; without preparing that IO, the generated host code receives
-        # a null descriptor-storage pointer.
-        _prepare_tma_descriptors(io, stream)
-        return _COMPILED_GEMM_CACHE[key]
+        # Fresh IO dictionaries still need descriptors for their addresses,
+        # but must not retrace/compile the preparation code on every forward.
+        compiled = _COMPILED_GEMM_CACHE[key]
+        with torch.cuda.device(device_index):
+            compiled.prepare_descriptors = _prepare_tma_descriptors(
+                io, stream, prepare=compiled.prepare_descriptors
+            )
+        return compiled.kernel
     compiled = _compile_or_load(cfg_hash, fc1_or_fc2, io, stream, device_index)
     _COMPILED_GEMM_CACHE[key] = compiled
-    return compiled
+    return compiled.kernel

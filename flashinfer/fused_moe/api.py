@@ -1213,6 +1213,9 @@ class PrimsTsConfig:
     use the separate path. ``nvfp4_weight_layout`` selects the physical NVFP4
     weight layout; pass the same value to :meth:`prepare_weights`. Both
     layouts share one shuffled weight set across decode and prefill tactics.
+    Manually prepared four-dimensional NVFP4 weight views require
+    ``PrimsTsConfig(nvfp4_weight_layout="BlockMajorK")``, including on
+    SM100/SM103; the NVFP4 layout is no longer inferred from tensor rank.
     """
 
     nvfp4_weight_layout: Literal["MajorK", "BlockMajorK"] = "MajorK"

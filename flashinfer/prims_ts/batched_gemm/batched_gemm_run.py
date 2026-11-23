@@ -4764,8 +4764,8 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
     )
 
 
-def _prepare_tma_descriptors(io: dict, stream) -> None:
-    """Own descriptors per IO workspace, rebuilding when its binding changes."""
+def _prepare_tma_descriptors(io: dict, stream, *, prepare=None):
+    """Bind workspace descriptors using an optional cached preparation executable."""
     from cutlass.cutlass_dsl import BaseDSL
     from cutlass.cute.runtime import make_ptr
 
@@ -4775,7 +4775,7 @@ def _prepare_tma_descriptors(io: dict, stream) -> None:
         io[name]._pointer for name in ("a_dp", "b_dp", "c0_dp", "sfa_dp", "sfb_dp")
     ) + (io["shape"], _c_row_stride(io), repr(io["cfg"]))
     if io.get("_tma_descriptor_key") == key:
-        return
+        return prepare
     # CUtensorMap is 128 bytes and requires 64-byte alignment. Keep its owner
     # in the same IO object as the device allocations it describes.
     storage = ctypes.create_string_buffer(7 * 128 + 63)
@@ -4784,17 +4784,22 @@ def _prepare_tma_descriptors(io: dict, stream) -> None:
         cutlass.Uint8, address, cutlass.AddressSpace.generic, assumed_align=64
     )
     preparation_io = dict(io, tma_desc_storage_dp=descriptor_ptr)
-    with task_scheduling_scope(), BaseDSL.enable_pyir():
-        args = _launch_arg_tuple(preparation_io, stream)
-        prepare = cute.compile(
-            prepare_gemm_descriptors, args, io["cfg"], options=_cute_compile_options()
-        )
+    args = _launch_arg_tuple(preparation_io, stream)
+    if prepare is None:
+        with task_scheduling_scope(), BaseDSL.enable_pyir():
+            prepare = cute.compile(
+                prepare_gemm_descriptors,
+                args,
+                io["cfg"],
+                options=_cute_compile_options(),
+            )
     prepare(args)
     io.update(
         tma_desc_storage_dp=descriptor_ptr,
         _tma_descriptor_storage=storage,
         _tma_descriptor_key=key,
     )
+    return prepare
 
 
 def _compile_for_launch(io: dict, stream) -> object:

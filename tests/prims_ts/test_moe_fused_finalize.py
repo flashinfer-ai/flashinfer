@@ -70,6 +70,7 @@ def test_fused_finalize_replay(
     ahead,
     steps=(),
     fc1_overrides=None,
+    router_weight_dtype=torch.bfloat16,
 ):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Native BatchM finalization requires Rubin")
@@ -137,7 +138,7 @@ def test_fused_finalize_replay(
         torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16), quant=quant
     )
     ids = torch.empty((tokens, top_k), device="cuda", dtype=torch.int32)
-    router_weights = torch.empty_like(ids, dtype=torch.bfloat16)
+    router_weights = torch.empty_like(ids, dtype=router_weight_dtype)
     out = torch.empty((tokens, hidden), device="cuda", dtype=torch.bfloat16)
     kwargs = dict(
         routing_logits=None,
@@ -294,6 +295,34 @@ def test_fused_finalize_replay(
         assert (
             topk_output.float() - reference.float()
         ).norm() / reference.float().norm() < 0.015
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_finalize_fp32_router_weights_replay(monkeypatch):
+    from flashinfer.prims_ts.moe import runner
+
+    build_io = runner.build_nvfp4_launch_io
+    finalize_dtypes = []
+
+    def record_finalize_dtype(**kwargs):
+        if kwargs["cfg"].fuse_moe_finalize:
+            finalize_dtypes.append(kwargs["finalize_scales"].dtype)
+        return build_io(**kwargs)
+
+    monkeypatch.setattr(runner, "build_nvfp4_launch_io", record_finalize_dtype)
+    test_fused_finalize_replay(
+        monkeypatch,
+        layout="BlockMajorK",
+        tactic=[1024, 0],
+        prefix=2,
+        stages=1,
+        warps=8,
+        release=0,
+        ahead=-1,
+        router_weight_dtype=torch.float32,
+    )
+    assert finalize_dtypes and set(finalize_dtypes) == {torch.bfloat16}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

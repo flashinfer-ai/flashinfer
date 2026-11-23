@@ -1224,6 +1224,7 @@ def _staged_routing_args(
             activation,
             norm_topk_prob,
             replay,
+            True,  # allocate_gemm2_output for the separate finalizer
         )
     elif precision == "mxfp8":
         args = (
@@ -1257,7 +1258,10 @@ def _native_staged_routing(case, device, tile: int, logits: torch.Tensor):
         case.precision, native._inner, packed, tile, logits
     )
     out = getattr(get_trtllm_moe_sm100_module().moe_op, name)(*args)
-    tensors = [t if isinstance(t, torch.Tensor) else torch.from_dlpack(t) for t in out]
+    tensors = [
+        t if t is None or isinstance(t, torch.Tensor) else torch.from_dlpack(t)
+        for t in out
+    ]
     _sync()
     (
         expert_weights,
