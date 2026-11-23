@@ -1961,7 +1961,7 @@ def test_poisoned_intermediates_do_not_reach_the_bits(pair, body, act):
 def test_instruction_classes_on_the_part(pair):
     """The part's default instruction class is the pair's rule (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere)
     and the op follows it; the K = 64 class stays reachable by name on every part and its op equals its own composition; on
-    SM107 the NVFP4 pair's two classes compute different fp32 folds of the same operands."""
+    SM107 the two classes compute different fp32 folds of the same operands."""
     from flashinfer.fused_moe.batch_invariant.api_fp4 import (
         F32_CHAIN,
         MX_F32_CHAIN,
@@ -1971,27 +1971,30 @@ def test_instruction_classes_on_the_part(pair):
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
 
     T, k, H, I, E = 96, 2, 1024, 512, 8
-    # per-element exponent spreads inside every row and weight: the scaled products differ in magnitude, so the fp32 folds of
-    # the two steps are not exact and separate (operands of one scale give exactly representable sums in either order)
+    # exponent spreads inside every row and weight, so the scaled products differ in magnitude and the fp32 folds of the two
+    # steps are not exact and separate: per element for the NVFP4 pair (its e4m3 block scales), per 32-element block for the
+    # MX pair (its ue8m0 block scale makes a block's products exact multiples of one unit, so only the spread between blocks
+    # makes the fold round)
     g = torch.Generator().manual_seed(8)
-    x = (
-        (
-            torch.randn(T, H, generator=g)
-            * torch.exp2(torch.randint(-10, 10, (T, H), generator=g).float())
+    if pair.scaled:
+        ex = torch.exp2(torch.randint(-10, 10, (T, H), generator=g).float())
+        ew1 = torch.exp2(torch.randint(-6, 7, (E, 2 * I, H), generator=g).float())
+    else:
+        ex = (
+            torch.exp2(torch.randint(-12, 12, (T, H // 32, 1), generator=g).float())
+            .expand(T, H // 32, 32)
+            .reshape(T, H)
         )
-        .to(torch.bfloat16)
-        .cuda()
-    )
+        ew1 = (
+            torch.exp2(
+                torch.randint(-8, 8, (E, 2 * I, H // 32, 1), generator=g).float()
+            )
+            .expand(E, 2 * I, H // 32, 32)
+            .reshape(E, 2 * I, H)
+        )
+    x = (torch.randn(T, H, generator=g) * ex).to(torch.bfloat16).cuda()
     logits = (torch.randn(T, E, generator=g) * 2).float().cuda()
-    w1 = (
-        (
-            torch.randn(E, 2 * I, H, generator=g)
-            * 0.05
-            * torch.exp2(torch.randint(-6, 7, (E, 2 * I, H), generator=g).float())
-        )
-        .to(torch.bfloat16)
-        .cuda()
-    )
+    w1 = (torch.randn(E, 2 * I, H, generator=g) * 0.05 * ew1).to(torch.bfloat16).cuda()
     w2 = (
         (
             torch.randn(E, H, I, generator=g)
@@ -2017,10 +2020,10 @@ def test_instruction_classes_on_the_part(pair):
             _quantized(x, check=False, pair=pair), ids, weights, W, chain, f
         )
         assert torch.equal(bits(got.cpu()), bits(ref)), f
-    if family != "sm_107" or not pair.scaled:
+    if family != "sm_107":
         return
-    # the NVFP4 pair's two steps fold the same operands in another order: the raw fp32 folds differ (the box form's permuted
-    # operands; the gather form keeps no permuted tensor); the MX pair's block scales keep its folds exact at this shape
+    # the two steps fold the same operands in another order: the raw fp32 folds differ (the box form's permuted operands; the
+    # gather form keeps no permuted tensor)
     _, im = fused_moe_fp4(x, ids, weights, W, return_intermediates=True, gather=False)
     accs = [
         grouped_gemm_fp4(
