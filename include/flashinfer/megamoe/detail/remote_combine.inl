@@ -15,7 +15,8 @@ constexpr bool kReturnRowCTA = kWeightTileBytes != 8704;
 
 const auto remote_wait_return = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
-    if (sm_idx == 0 and epilogue_thread_idx == 0) {
+    if ((kM4M8Stripe8ReturnLocalJoin ? (sm_idx < num_tokens && sm_idx < kNumSMs) : sm_idx == 0) &&
+        epilogue_thread_idx == 0) {
       comm::RemoteIO<kNumRemoteNodes> io(remote_links);
 #pragma unroll 1
       for (uint32_t j = 0; j < kNumRemoteNodes; ++j)
@@ -26,6 +27,12 @@ const auto remote_wait_return = [&]() {
       // the original pre-grid CTA barrier and GPU release/acquire grid.
       if (cute::elect_one_sync()) ptx::tma_store_wait<0>();
       __syncwarp();
+    }
+    if constexpr (kM4M8Stripe8ReturnLocalJoin) {
+      // Full TMA completion and this CTA join cover the cross-warp row ownership.
+      if (sm_idx < num_tokens && sm_idx < kNumSMs)
+        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+      return;
     }
     // M1 keeps every first-pass y store and return consumer in CTA0. Preserve the
     // flag wait and each warp's full TMA completion above; relay them across

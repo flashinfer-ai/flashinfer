@@ -1651,6 +1651,18 @@ if (warp_idx < kFirstDecodeWarp) {
   // dispatch may now safely clean workspace state.
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
+  // Keep each first-pass output and its return consumer in the same CTA.
+  constexpr bool kM4M8Stripe8ReturnLocalJoin =
+      kWeightTileBytes == 8448 && kNumSMs == 78 && kNumRanks == 16 && kNumNodes == 2 &&
+      kNumLocalRanks == 8 && kNumRemoteNodes == 1 && kNumExperts == 256 && kHidden == 4096 &&
+      kIntermediateHidden == 2048 && kNumTopk == 6 &&
+      (kNumMaxTokensPerRank == 4 || kNumMaxTokensPerRank == 8) && BLOCK_M == 8 && BLOCK_N == 256 &&
+      BLOCK_K == 128 && kNumStages == 6 && kNumExpertsPerWave == 16 && kNumThreads == 384 &&
+      kNumDispatchThreads == 64 && kNumEpilogueThreads == 256 && kNumEpilogueWarps == 8 &&
+      kNumDecodeThreads == 0 && kSwapABRequested && kUseRSOperand && kSingleActiveDispatchWarp &&
+      kUseMode2RowDecoder && kUseInterleavedScheduler && !kInKernelWeightCopy &&
+      kActivationClamp == 10.0f && kFastMath;
+
 #include <flashinfer/megamoe/detail/remote_combine.inl>
   // This node's slots first, then the rows that came back (the mirror duty ran
   // on the dispatch warps during the GEMM).
@@ -1659,7 +1671,7 @@ if (warp_idx < kFirstDecodeWarp) {
 // clang-format off
 #define FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES 1
 constexpr bool kLocalCombineStripe8 =
-    kWeightTileBytes == 8448 && kNumMaxTokensPerRank <= 2;
+    (kWeightTileBytes == 8448 && kNumMaxTokensPerRank <= 2) || kM4M8Stripe8ReturnLocalJoin;
 #include <flashinfer/megamoe/detail/combine_config.inl>
 #include <flashinfer/megamoe/detail/combine.inl>
 #undef FI_MEGAMOE_COMBINE_WITH_REMOTE_NODES
