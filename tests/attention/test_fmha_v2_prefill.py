@@ -2350,3 +2350,34 @@ def test_trtllm_fmha_v2_chunked_prefill_chunked_attention(
 
     rtol, atol = 1e-2, 1e-2
     torch.testing.assert_close(output.float(), output_ref.float(), rtol=rtol, atol=atol)
+
+
+def _gen_fmha_v2_sm120_sources_worker(_):
+    # Runs in a fresh (spawned) process whose FLASHINFER_WORKSPACE_BASE points
+    # at the shared workspace under test; this is the source-generation step
+    # every process performs on first use of the SM120 FMHAv2 module.
+    from flashinfer.jit.attention.modules import gen_trtllm_fmha_v2_sm120_module
+
+    try:
+        gen_trtllm_fmha_v2_sm120_module()
+    except Exception as e:  # report instead of raising across the pool
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+def test_fmha_v2_sm120_module_generation_concurrent(tmp_path, monkeypatch):
+    """Several processes generating the SM120 FMHAv2 sources at once must not
+    collide on the shared ``bin/print_traits.exe`` / ``generated/`` files."""
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("SM120 FMHAv2 module is only generated for SM12x")
+    import multiprocessing
+
+    num_processes = 4
+    for iteration in range(2):
+        monkeypatch.setenv(
+            "FLASHINFER_WORKSPACE_BASE", str(tmp_path / f"ws{iteration}")
+        )
+        with multiprocessing.get_context("spawn").Pool(num_processes) as pool:
+            errors = pool.map(_gen_fmha_v2_sm120_sources_worker, range(num_processes))
+        failed = [e for e in errors if e is not None]
+        assert not failed, f"iteration {iteration}: {failed}"

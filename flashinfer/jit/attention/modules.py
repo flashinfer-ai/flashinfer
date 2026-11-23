@@ -19,6 +19,7 @@ from typing import Any, List, Literal, Optional
 
 import jinja2
 import torch
+from filelock import FileLock
 
 from ..cpp_ext import is_windows
 from .. import env as jit_env
@@ -26,6 +27,7 @@ from ..core import (
     JitSpec,
     common_nvcc_flags,
     gen_jit_spec,
+    get_tmpdir,
     sm90a_nvcc_flags,
     current_compilation_context,
 )
@@ -2622,8 +2624,12 @@ def gen_trtllm_fmha_v2_sm120_module() -> JitSpec:
 
     fmha_v2_src_dir = jit_env.FLASHINFER_CSRC_DIR / "fmha_v2"
 
-    # Generate kernel source
-    enumerate_kernels(fmha_v2_src_dir, cached_ops)
+    # Generate kernel source. This rewrites files under cached_ops and builds and
+    # runs bin/print_traits.exe there, so concurrent first calls from several
+    # processes must not overlap. Take the module's build lock, so generation
+    # also cannot rewrite sources while another process is compiling them.
+    with FileLock(get_tmpdir() / f"{uri}.lock", thread_local=False):
+        enumerate_kernels(fmha_v2_src_dir, cached_ops)
 
     kernels = [
         "fmha_v2_flash_attention_bf16_64_128_S_q_k_v_192x128_sm120.cu",
