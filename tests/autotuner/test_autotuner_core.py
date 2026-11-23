@@ -518,6 +518,57 @@ def test_choose_one_inference_uses_cache_or_fallback():
     assert tactic == 2
 
 
+def test_choose_one_inference_records_cache_misses():
+    """An inference-time miss is counted per op and profile; a hit is not."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+    assert tuner.stats.cache_misses == 0
+
+    tuner.choose_one("dummy", [runner], config, inputs)
+    tuner.choose_one("dummy", [runner], config, inputs)
+    assert tuner.stats.cache_misses == 2
+    assert len(tuner.stats.cache_miss_config_collection["dummy"]) == 1
+
+    key = AutoTuner._get_cache_key("dummy", runner, (inputs[0].shape,), config)
+    tuner.profiling_cache[key] = (2, None)
+    tuner.choose_one("dummy", [runner], config, inputs)
+    assert tuner.stats.cache_misses == 2
+
+
+def test_choose_one_inference_warns_once_when_other_ops_have_tuned_data():
+    """Tuned data for another op, but none for this one: warn once per profile."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    config = TuningConfig()
+    other_key = AutoTuner._get_cache_key("other_op", runner, (inputs[0].shape,), config)
+    tuner.profiling_cache[other_key] = (1, None)
+
+    with patch.object(autotuner_module.logger, "warning") as warn:
+        tuner.choose_one("dummy", [runner], config, inputs)
+        tuner.choose_one("dummy", [runner], config, inputs)
+    assert warn.call_count == 1
+    message = warn.call_args.args[0]
+    assert "dummy" in message and "other_op" in message
+
+    other_inputs = [torch.empty((6, 8), dtype=torch.float32)]
+    with patch.object(autotuner_module.logger, "warning") as warn:
+        tuner.choose_one("dummy", [runner], config, other_inputs)
+    assert warn.call_count == 1  # another profile of the same op
+
+
+def test_choose_one_inference_is_silent_without_any_tuned_data():
+    """Users who never tune must not get a warning for every op they call."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    inputs = [torch.empty((4, 8), dtype=torch.float32)]
+    with patch.object(autotuner_module.logger, "warning") as warn:
+        tuner.choose_one("dummy", [runner], TuningConfig(), inputs)
+    assert warn.call_count == 0
+
+
 def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     """Tuning path should select lowest-profile-time tactic and cache result."""
     tuner = reset_autotuner()
