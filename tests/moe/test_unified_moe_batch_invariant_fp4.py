@@ -1961,7 +1961,7 @@ def test_poisoned_intermediates_do_not_reach_the_bits(pair, body, act):
 def test_instruction_classes_on_the_part(pair):
     """The part's default instruction class is the pair's rule (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere)
     and the op follows it; the K = 64 class stays reachable by name on every part and its op equals its own composition; on
-    SM107 the two classes compute different fp32 folds of the same operands."""
+    SM107 the NVFP4 pair's two classes compute different fp32 folds of the same operands."""
     from flashinfer.fused_moe.batch_invariant.api_fp4 import (
         F32_CHAIN,
         MX_F32_CHAIN,
@@ -2017,9 +2017,10 @@ def test_instruction_classes_on_the_part(pair):
             _quantized(x, check=False, pair=pair), ids, weights, W, chain, f
         )
         assert torch.equal(bits(got.cpu()), bits(ref)), f
-    if family != "sm_107":
+    if family != "sm_107" or not pair.scaled:
         return
-    # the box form's permuted operands (the gather form keeps no permuted tensor); the raw folds of the two classes differ
+    # the NVFP4 pair's two steps fold the same operands in another order: the raw fp32 folds differ (the box form's permuted
+    # operands; the gather form keeps no permuted tensor); the MX pair's block scales keep its folds exact at this shape
     _, im = fused_moe_fp4(x, ids, weights, W, return_intermediates=True, gather=False)
     accs = [
         grouped_gemm_fp4(
