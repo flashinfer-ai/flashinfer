@@ -1,13 +1,15 @@
 # SM120 MXFP4 × MXFP8 nosync MegaMoE
 
-`sm120_mxfp4_mxfp8_bf16_nosync` is a single-host expert-parallel MegaMoE kernel
+`sm120_mxfp4_mxfp8_bf16_nosync` is an expert-parallel MegaMoE kernel
 for SM120 (compute capability 12.0: RTX PRO 6000, RTX 6000D) aimed at decode-size
 batches, at most 128 tokens per rank. It takes MXFP4 (E2M1, UE8M0 per 32) expert
 weights and MXFP8 (E4M3, UE8M0 per 32) activations and returns BF16. One
 persistent kernel per layer exchanges the routes, dispatches tokens, runs FC1,
 clamped SwiGLU and FC2, pushes the partials back, and combines them. Ranks never
 wait on a barrier: each producer writes an epoch-tagged flag into the consumer's
-memory after its data, and the consumer polls its own memory.
+memory after its data, and the consumer polls its own memory. A group fits one
+host (up to 8 ranks) or spans hosts (up to 32 ranks, e.g. EP16 on two 8-GPU
+hosts, EP32 on four); the other hosts' ranks are reached over the NIC (NCCL GIN).
 
 It is normally used as a small-batch option of a layer that runs the cake or
 cutedsl SM120 MXFP4 backend: calls within `max_tokens_per_rank` tokens per rank
@@ -174,9 +176,13 @@ the same on both RTX 6000D hosts.
 ## Tests and benchmark
 
 ```bash
-# correctness; FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 adds the GIN tests (nic at EP 2/4/8, auto and cake's tables at EP8),
-# FLASHINFER_TEST_SM120_CUTEDSL=1 the cutedsl fallback (NVSHMEM; not on RTX 6000D)
+# correctness; FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 adds the GIN tests (nic at EP 2/4/8, auto and cake's tables at EP8,
+# the 32-rank build at EP8), FLASHINFER_TEST_SM120_CUTEDSL=1 the cutedsl fallback (NVSHMEM; not on RTX 6000D)
 pytest tests/moe_ep/test_moe_ep_sm120_w4a8_nosync_mega.py
+
+# across hosts (EP16 on two 8-GPU hosts; --nnodes 4 for EP32), on every host:
+FLASHINFER_TEST_MEGAMOE_SM120_MULTIHOST=1 torchrun --nnodes 2 --nproc-per-node 8 --rdzv-backend c10d \
+  --rdzv-endpoint <host0>:29500 -m pytest -x tests/moe_ep/test_moe_ep_sm120_w4a8_nosync_mega.py -k multihost
 
 # timing: one MoE layer per call, CUDA graph, cold L2, identical seeded routes across backends
 B="python benchmarks/bench_megamoe_mxfp4_sm120.py --ep 4 --shape flash --capacity 128 --tokens 1 2 8 16 32 64 128"
@@ -206,8 +212,12 @@ description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
 ## Limits and known gaps
 
 - Compute capability 12.0; `hidden % 256 == 0`, `hidden <= 7936`,
-  `intermediate_size % 256 == 0`; top-k ≤ 8; ≤ 256 local experts; ≤ 8 ranks; at
-  most 128 tokens per rank.
+  `intermediate_size % 256 == 0`; top-k ≤ 8; at most 128 tokens per rank; up to
+  8 ranks with ≤ 256 local experts, or 9–32 ranks with ≤ 64 local experts (a
+  second build of the kernel, `FLASHINFER_MEGAMOE_SM120_MAX_WORLD=32`, loaded for
+  groups of more than 8 ranks: its per-call bookkeeping in shared memory holds
+  ranks × local experts ≤ 2048). Across hosts every pair between hosts is a GIN
+  pair: `transport` must be `"auto"`, `"nic"` or a table (cake's by default).
 - When EP8 goes over the NIC across sockets (`"auto"` on the RTX PRO 6000 host
   and on the ConnectX-8-switch RTX 6000D host), cake can be faster at 128 tokens
   per rank (on RTX PRO 6000: 0.91× for DeepSeek-V4-Flash, 0.85× for GLM-5.3-Flash; on the ConnectX-8 host

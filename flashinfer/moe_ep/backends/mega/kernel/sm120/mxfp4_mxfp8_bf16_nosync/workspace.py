@@ -28,15 +28,24 @@ from typing import Any
 
 import torch
 
-# The kernel's counter block (sm120_mxfp4_mega_moe.cuh kCtrInts: per-call counters, per-expert and
-# per-tile counts, GIN signal totals; error word at 3) and its slot in the layout below.
-COUNTER_INTS = 1592
 ERROR_INDEX = 3
 EPOCH_INDEX = 5
 _CTR_SLOT = 14
 # GIN contexts (queue-pair sets): CTAs spread their puts over them; on RTX 6000D EP8 four beat one
 # (1.8 vs 2.5 ms at 128 tokens per rank) and sixteen added signal-poll cost at small batches.
 GIN_CONTEXTS = 4
+
+
+def counter_ints(wide: bool = False) -> int:
+    """The kernel's counter block (sm120_mxfp4_mega_moe.cuh kCtrInts: per-call counters, per-expert
+    and per-tile counts, GIN signal totals; error word at 3) in the default or the 32-rank build:
+    1592 or 4424 ints. The launcher checks the layout leaves this much room."""
+    max_world = 32 if wide else 8
+    max_local = 2048 // max_world
+    max_tiles = (
+        max_local + max_world * 128
+    )  # kMaxTiles: 128 tokens per rank, top-8, 8 per tile
+    return 8 + max_local + max_tiles + 2 * max_world + 4 * max_world
 
 
 def _align(value: int, alignment: int) -> int:
@@ -56,6 +65,7 @@ def buffer_layout(
     hidden: int,
     intermediate: int,
     gin: bool = False,
+    wide: bool = False,
 ) -> list[int]:
     """Byte offsets of the symmetric buffer, in the order the binding reads them:
     [total, x, x_sf, topk_idx, topk_weights, pool, recv_cnt, recv_flag, comb, comb_flag,
@@ -66,7 +76,7 @@ def buffer_layout(
     rank: the token row staged for and received from GIN ranks, the partials staged for and
     received from GIN ranks, the slot tables received from and staged for GIN ranks (both
     packed in the expert rank's (local expert, slot) order), and the packed row of each
-    (token, k)."""
+    (token, k)). ``wide``: the layout of the 32-rank kernel build (a larger counter block)."""
     epr = experts // ranks
     rows = (
         epr * ranks * capacity
@@ -86,7 +96,7 @@ def buffer_layout(
         ranks * 4,
         rows * intermediate,
         rows * (intermediate // 128) * 4,
-        COUNTER_INTS * 4,
+        counter_ints(wide) * 4,
         capacity * row_bytes if gin else 0,
         ranks * capacity * row_bytes if gin else 0,
         ranks * capacity * topk * hidden * 2 if gin else 0,
@@ -102,19 +112,29 @@ def buffer_layout(
     return [cursor, *offsets]
 
 
+def wide_build(world_size: int) -> bool:
+    """Groups of more than 8 ranks load the kernel build for up to 32 ranks."""
+    from .......jit.megamoe import SM120_MAX_WORLD
+
+    return world_size > SM120_MAX_WORLD
+
+
 @functools.cache
-def kernel_module(fast_math: bool, gin_type: int | None = None) -> Any:
-    """The kernel's JIT module: P2P only, or with GIN pairs for one NCCL GIN backend."""
+def kernel_module(
+    fast_math: bool, gin_type: int | None = None, wide: bool = False
+) -> Any:
+    """The kernel's JIT module: P2P only, or with GIN pairs for one NCCL GIN backend; ``wide``
+    for groups of 9 to 32 ranks."""
     from .......jit.megamoe import gen_megamoe_sm120_mxfp4_module
 
-    return gen_megamoe_sm120_mxfp4_module(fast_math, gin_type).build_and_load()
+    return gen_megamoe_sm120_mxfp4_module(fast_math, gin_type, wide).build_and_load()
 
 
 @functools.cache
-def _gin_session_module() -> Any:
+def _gin_session_module(wide: bool = False) -> Any:
     from .......jit.megamoe import gen_megamoe_sm120_gin_session_module
 
-    return gen_megamoe_sm120_gin_session_module().build_and_load()
+    return gen_megamoe_sm120_gin_session_module(wide).build_and_load()
 
 
 class _DeviceBytes:
@@ -180,6 +200,7 @@ class NosyncWorkspace:
             hidden,
             intermediate,
             gin=transport != "p2p",
+            wide=wide_build(world_size),
         )
         num_bytes = self.offsets[0]
         if world_size == 1:
@@ -196,7 +217,9 @@ class NosyncWorkspace:
             self.peer_ptrs = [int(p) for p in self._symm_handle.buffer_ptrs]
         else:
             self._init_nccl_window(num_bytes, transport)
-        self.module = kernel_module(fast_math, self._gin_type if self.gin else None)
+        self.module = kernel_module(
+            fast_math, self._gin_type if self.gin else None, wide_build(world_size)
+        )
         if world_size > 1:
             torch.distributed.barrier(group=group)
         torch.cuda.synchronize(self.device)
@@ -224,7 +247,7 @@ class NosyncWorkspace:
             raise RuntimeError(
                 "the NIC transport needs a ProcessGroupNCCL exposing _comm_ptr"
             )
-        session = _gin_session_module()
+        session = _gin_session_module(wide_build(ranks))
         handle = int(
             session.megamoe_sm120_gin_session_create(
                 int(backend._comm_ptr()), rank, ranks, num_bytes, GIN_CONTEXTS
@@ -314,7 +337,7 @@ class NosyncWorkspace:
         """The error word of the last call, 0 when every spin wait completed. A wait that times out
         (a rank that never entered the call) records its code here and the kernel exits instead of
         hanging; each call clears it on entry. Synchronizes with the device."""
-        ctr = self._view(_CTR_SLOT, (COUNTER_INTS,), torch.int32)
+        ctr = self._view(_CTR_SLOT, (EPOCH_INDEX + 1,), torch.int32)
         return int(ctr[ERROR_INDEX].item())
 
     def set_epoch(self, epoch: int) -> None:
@@ -322,7 +345,7 @@ class NosyncWorkspace:
         ranks wrote here. Tests use it to cross the epoch's wrap; every rank calls it between
         calls (no kernel in flight), then the EP group synchronizes."""
         value = (epoch + 2**31) % 2**32 - 2**31  # the int32 with these 32 bits
-        ctr = self._view(_CTR_SLOT, (COUNTER_INTS,), torch.int32)
+        ctr = self._view(_CTR_SLOT, (EPOCH_INDEX + 1,), torch.int32)
         ctr[EPOCH_INDEX] = value
         # recv_flag, comb_flag, route_flag: one int per source rank
         for slot in (7, 9, 11):

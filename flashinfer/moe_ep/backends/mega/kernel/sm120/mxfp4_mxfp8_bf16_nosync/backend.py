@@ -39,15 +39,18 @@ from .weights import (
     preprocess_mega_weights,
     validate_transformed_mega_weights,
 )
-from .workspace import NosyncWorkspace
+from .workspace import NosyncWorkspace, wide_build
 
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 KERNEL_NAME = "sm120_mxfp4_mxfp8_bf16_nosync"
-MAX_RANKS = 8
+# one host takes up to 8 ranks; larger groups (across hosts, the other hosts over GIN) load a build
+# for up to 32 ranks with room for 64 local experts per rank (workspace.wide_build)
+MAX_RANKS = 32
 MAX_TOP_K = 8
 MAX_LOCAL_EXPERTS = 256
+MAX_LOCAL_EXPERTS_WIDE = 64
 # the dispatch stages one MXFP8 row (hidden + hidden / 32 bytes) in 8 KB of shared memory
 MAX_HIDDEN = 7936
 
@@ -92,13 +95,14 @@ class Sm120Mxfp4Mxfp8NosyncMegaKernelBackend(MegaKernelBackend):
             alignment=256,
         )
         hidden = fleet_params.token_hidden_size
+        max_local = MAX_LOCAL_EXPERTS_WIDE if wide_build(world) else MAX_LOCAL_EXPERTS
         checks = (
-            (world <= MAX_RANKS, f"at most {MAX_RANKS} EP ranks (one host)"),
+            (world <= MAX_RANKS, f"at most {MAX_RANKS} EP ranks"),
             (config.top_k <= MAX_TOP_K, f"top_k at most {MAX_TOP_K}"),
             (config.top_k <= fleet_params.num_experts, "top_k at most num_experts"),
             (
-                fleet_params.num_experts // world <= MAX_LOCAL_EXPERTS,
-                f"at most {MAX_LOCAL_EXPERTS} experts per rank",
+                fleet_params.num_experts // world <= max_local,
+                f"at most {max_local} experts per rank with {world} ranks",
             ),
             (hidden <= MAX_HIDDEN, f"token_hidden_size at most {MAX_HIDDEN}"),
             (

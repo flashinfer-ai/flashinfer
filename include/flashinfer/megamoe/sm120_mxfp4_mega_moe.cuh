@@ -89,9 +89,16 @@ constexpr int kPfAhead = 128;
 constexpr size_t kPf0Bytes = size_t(64)
                              << 20;  // t=0 L2 prefetch budget over the locally known experts
 constexpr int kUnroll = 4;           // K64 steps in flight per warp
-constexpr int kMaxWorld = 8;         // ranks: one PCIe host
-constexpr int kMaxEl = 256;          // local experts per rank
-constexpr int kMaxTopk = 8;          // routes per token (pool metadata packs token * 8 + k)
+// ranks: the default build takes one PCIe host (8 GPUs); groups across hosts load a build with
+// FLASHINFER_MEGAMOE_SM120_MAX_WORLD=32 (jit/megamoe.py). Map::cnt keeps 2048 entries either way
+// (the static shared memory next to s_tile), so a 32-rank build takes 64 local experts per rank.
+#ifndef FLASHINFER_MEGAMOE_SM120_MAX_WORLD
+#define FLASHINFER_MEGAMOE_SM120_MAX_WORLD 8
+#endif
+constexpr int kMaxWorld = FLASHINFER_MEGAMOE_SM120_MAX_WORLD;
+static_assert(kMaxWorld == 8 || kMaxWorld == 32, "builds for up to 8 and up to 32 ranks");
+constexpr int kMaxEl = 2048 / kMaxWorld;  // local experts per rank: 256, or 64 in the 32-rank build
+constexpr int kMaxTopk = 8;               // routes per token (pool metadata packs token * 8 + k)
 constexpr uint64_t kSpinNs =
     30000000000ull;  // spin timeout: startup warm-ups can skew ranks by seconds
 

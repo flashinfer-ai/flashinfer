@@ -1,7 +1,8 @@
 // SM120 MXFP4 MegaMoE launch/binding. The symmetric buffer layout is computed by the nosync
 // backend's workspace.py (buffer_layout); `offsets` and `dims` carry it here. Built twice:
 // the P2P module, and with FLASHINFER_MEGAMOE_SM120_GIN=1 (NCCL Device API) for buffers with NIC
-// (GIN) pairs, whose NCCL window and device communicator come from megamoe_sm120_gin_session.cu.
+// (GIN) pairs, whose NCCL window and device communicator come from megamoe_sm120_gin_session.cu;
+// each of those again with FLASHINFER_MEGAMOE_SM120_MAX_WORLD=32 for groups of more than 8 ranks.
 #include <cuda_runtime.h>
 
 #include <flashinfer/megamoe/sm120_mxfp4_mega_moe.cuh>
@@ -84,10 +85,15 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
   const int experts = static_cast<int>(dims[0]), topk = static_cast<int>(dims[1]);
   const int hidden = static_cast<int>(dims[2]), inter = static_cast<int>(dims[3]);
   const int capacity = static_cast<int>(dims[4]);
-  TVM_FFI_ICHECK(world >= 1 && world <= s::kMaxWorld);
+  TVM_FFI_ICHECK(world >= 1 && world <= s::kMaxWorld)
+      << world << " ranks on a module built for at most " << s::kMaxWorld;
   TVM_FFI_ICHECK(rank_idx >= 0 && rank_idx < world);
   TVM_FFI_ICHECK(num_tokens >= 1 && num_tokens <= capacity);
   TVM_FFI_ICHECK_EQ(experts % world, 0);
+  TVM_FFI_ICHECK_GE(offsets[kOffCtr + 1] - offsets[kOffCtr], int64_t(s::kCtrInts) * 4)
+      << "the buffer layout's counter block is smaller than this build's";
+  TVM_FFI_ICHECK(experts / world <= s::kMaxEl)
+      << experts / world << " local experts on a module built for at most " << s::kMaxEl;
 
   s::Args a{};
   char* local = static_cast<char*>(symm_buffer.data_ptr());

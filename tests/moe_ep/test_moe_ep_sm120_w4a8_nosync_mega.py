@@ -213,15 +213,23 @@ def _worker(rank, args):
     )
 
     ep = args.ep
-    torch.cuda.set_device(rank)
+    device = rank if args.local_rank is None else args.local_rank
+    torch.cuda.set_device(device)
     torch.backends.cuda.matmul.allow_tf32 = False
     dist.init_process_group(
         "nccl",
         rank=rank,
         world_size=ep,
         timeout=datetime.timedelta(minutes=10),
-        device_id=torch.device("cuda", rank),
+        device_id=torch.device("cuda", device),
     )
+    if args.wide:  # the 32-rank build for a group that fits the default one
+        from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync import (
+            backend,
+            workspace,
+        )
+
+        backend.wide_build = workspace.wide_build = lambda world_size: True
     h, ih, experts, topk = args.hidden, args.intermediate, args.experts, args.topk
     epr = experts // ep
     generator = torch.Generator(device="cuda").manual_seed(7919 + rank)
@@ -389,6 +397,8 @@ def _args(**overrides):
         fallback="cake",
         default_knobs=False,
         epoch_start=None,
+        wide=False,
+        local_rank=None,
     )
     args.update(overrides)
     return argparse.Namespace(**args)
@@ -551,6 +561,53 @@ def test_sm120_nosync_auto_transport():
             uneven=True,
             tokens_per_expert=32,
         )
+    )
+
+
+@pytest.mark.parametrize("transport", ["p2p", "nic"])
+def test_sm120_nosync_wide_build(transport):
+    """The build for groups of 9 to 32 ranks, on one host: same results as the default build."""
+    if transport == "nic" and not _NIC:
+        pytest.skip("set FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 on a GIN-capable host")
+    if not _sm120_gpus(8):
+        pytest.skip("requires 8 SM120 GPUs")
+    _run(
+        _args(
+            ep=8,
+            routing="hot",
+            transport=transport,
+            tokens_per_expert=32,
+            wide=True,
+        )
+    )
+
+
+# Groups across hosts: run this test under torchrun on every host, e.g. two 8-GPU hosts:
+#   FLASHINFER_TEST_MEGAMOE_SM120_MULTIHOST=1 torchrun --nnodes 2 --nproc-per-node 8 \
+#     --rdzv-backend c10d --rdzv-endpoint <host0>:29500 -m pytest -x \
+#     tests/moe_ep/test_moe_ep_sm120_w4a8_nosync_mega.py -k multihost
+_MULTIHOST = os.environ.get("FLASHINFER_TEST_MEGAMOE_SM120_MULTIHOST") == "1"
+
+
+@pytest.mark.parametrize("routing", ["random", "hot", "empty", "invalid"])
+@pytest.mark.parametrize("cake_transport", ["all_gin", "lsa_where_reachable"])
+def test_sm120_nosync_multihost(routing, cake_transport):
+    """EP16 / EP32 across hosts (the 32-rank build), following cake's table: every pair over
+    GIN, or P2P where NCCL maps the pair within a host and GIN across; up to 128 tokens per
+    rank, across the switch point."""
+    if not _MULTIHOST or "LOCAL_RANK" not in os.environ:
+        pytest.skip("run under torchrun with FLASHINFER_TEST_MEGAMOE_SM120_MULTIHOST=1")
+    _worker(
+        int(os.environ["RANK"]),
+        _args(
+            ep=int(os.environ["WORLD_SIZE"]),
+            routing=routing,
+            repeats=3,
+            transport=None,
+            cake_transport=cake_transport,
+            tokens_per_expert=32,
+            local_rank=int(os.environ["LOCAL_RANK"]),
+        ),
     )
 
 
