@@ -4645,39 +4645,12 @@ def _check_workspace_and_graph(
     _assert_case_correct(explicit_out, case)
 
 
-@_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize("batch_size", [1, 4], ids=lambda value: f"b{value}")
-@pytest.mark.parametrize(
-    "seq_len_kv",
-    [128, 2048, 4096, 8192],
-    ids=lambda value: f"kv{value}",
-)
-@pytest.mark.parametrize(
-    "seq_len_q",
-    [1, 4, 8],
-    ids=lambda value: f"q{value}",
-)
-@pytest.mark.parametrize(
-    ("num_qo_heads", "num_kv_heads"),
-    [(32, 4)],
-    ids=["gqa32x4"],
-)
-@pytest.mark.parametrize(
-    "head_dim,page_size,qkv_dtype",
-    [
-        pytest.param(d, p, kind, id=f"d{d}-p{p}-{kind}")
-        for d in (64, 128, 256, 512)
-        for p in (16, 64)
-        for kind in (
-            "bf16q-fp8kv",
-            "bf16q-nvfp4kv",
-            "fp8q-nvfp4kv",
-            "fp8q-nvfp4kv-bf16o",
-        )
-        if not (d == 64 and p == 16 and "nvfp4" in kind)
-    ],
-)
-def test_attention_ts_decode_mixed_precision(
+_MixedPrecisionKind = Literal[
+    "bf16q-fp8kv", "bf16q-nvfp4kv", "fp8q-nvfp4kv", "fp8q-nvfp4kv-bf16o"
+]
+
+
+def run_mixed_precision_decode_case(
     batch_size: int,
     seq_len_kv: int,
     seq_len_q: int,
@@ -4685,10 +4658,13 @@ def test_attention_ts_decode_mixed_precision(
     num_kv_heads: int,
     head_dim: int,
     page_size: int,
-    qkv_dtype: Literal[
-        "bf16q-fp8kv", "bf16q-nvfp4kv", "fp8q-nvfp4kv", "fp8q-nvfp4kv-bf16o"
-    ],
+    qkv_dtype: _MixedPrecisionKind,
 ):
+    """Check one mixed-precision decode case on every public entry point.
+
+    Shared with test_attention_ts_decode_mixed_precision.py, which holds the
+    full grid in its own file so it gets its own CI time budget.
+    """
     dtype_dict = {
         "bf16q-fp8kv": (torch.bfloat16, _FP8, torch.bfloat16),
         "bf16q-nvfp4kv": (torch.bfloat16, torch.uint8, torch.bfloat16),
@@ -4804,7 +4780,7 @@ def test_attention_ts_decode_nvfp4_small_page_scale_fragments(
     FP8 Q with BF16 output selects here, must skip that padding.
     """
     assert page_size * head_dim // 16 < 128
-    test_attention_ts_decode_mixed_precision(
+    run_mixed_precision_decode_case(
         batch_size=8,
         seq_len_kv=2048,
         seq_len_q=8,
