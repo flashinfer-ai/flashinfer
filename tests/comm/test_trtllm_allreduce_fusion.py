@@ -1,5 +1,6 @@
 import multiprocessing as mp
 import socket
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -844,11 +845,15 @@ def _ws2_launch(
         )
         for rank in range(world_size)
     ]
-    for proc in procs:
-        proc.start()
-    deadline = time.monotonic() + timeout_s
+    # Only started processes are terminated and joined (one that never started cannot be
+    # joined); a start failure propagates after the ranks already started are stopped.
+    started = []
     failure = None
     try:
+        for proc in procs:
+            proc.start()
+            started.append(proc)
+        deadline = time.monotonic() + timeout_s
         while failure is None:
             codes = [proc.exitcode for proc in procs]
             failed = [(rank, code) for rank, code in enumerate(codes) if code]
@@ -862,15 +867,58 @@ def _ws2_launch(
             else:
                 time.sleep(0.2)
     finally:
-        for proc in procs:
+        for proc in started:
             if proc.is_alive():
                 proc.terminate()
-        for proc in procs:
+        for proc in started:
             proc.join(30)
             if proc.is_alive():
                 proc.kill()
                 proc.join(30)
     pytest.fail(failure)
+
+
+def test_ws2_launch_stops_started_ranks_when_a_start_fails(monkeypatch):
+    """GPU-free: when starting a later rank fails, the ranks already started are terminated
+    and joined, and the original error fails the test."""
+    events = []
+
+    class _Proc:
+        def __init__(self, target, args, name):
+            self.name = name
+            self.alive = False
+            self.exitcode = None
+
+        def start(self):
+            if self.name == "ws2-rank1":
+                raise OSError("injected start failure")
+            self.alive = True
+            events.append(("start", self.name))
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.alive = False
+            self.exitcode = -15
+            events.append(("terminate", self.name))
+
+        def kill(self):
+            events.append(("kill", self.name))
+
+        def join(self, timeout=None):
+            events.append(("join", self.name))
+
+    monkeypatch.setattr(
+        mp, "get_context", lambda method: SimpleNamespace(Process=_Proc)
+    )
+    with pytest.raises(OSError, match="injected start failure"):
+        _ws2_launch(lambda *args: None)
+    assert events == [
+        ("start", "ws2-rank0"),
+        ("terminate", "ws2-rank0"),
+        ("join", "ws2-rank0"),
+    ]
 
 
 def _ws2_setup(world_size, rank, distributed_init_port, gpu_offset):

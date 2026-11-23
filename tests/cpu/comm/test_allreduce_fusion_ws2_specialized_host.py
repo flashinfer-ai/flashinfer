@@ -20,7 +20,6 @@ dispatch path with a stand-in launcher (omitted outputs, misaligned views). The 
 are in ``tests/comm/test_trtllm_allreduce_fusion.py``.
 """
 
-import os
 import threading
 from types import SimpleNamespace
 
@@ -34,6 +33,12 @@ _HIDDEN = 6144
 # The workspace vLLM creates for this hidden size (64 MiB of bf16 per rank).
 _MAX_TOKENS = 5461
 _DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_kill_switch(monkeypatch):
+    """The tests set the kill switch themselves; an inherited value would reroute every call."""
+    monkeypatch.delenv(_DISABLE_ENV, raising=False)
 
 
 def _state(capacity=None, device_idx=0, handle=None):
@@ -51,7 +56,7 @@ def _state(capacity=None, device_idx=0, handle=None):
     )
 
 
-def test_ws2_specialized_guard_order():
+def test_ws2_specialized_guard_order(monkeypatch):
     """The allowlist content, the static creation envelope (no collective outside it) and the
     guard order (token count, semantics, shape/layout, device last)."""
     allowlist = ws2._load_allowlist()
@@ -86,11 +91,9 @@ def test_ws2_specialized_guard_order():
         no = torch.zeros_like(x) if no is given else no
         return ws2._reject_reason(state, x, r, ro, no, g, wb, fp32)
 
-    os.environ[_DISABLE_ENV] = "1"
-    try:
-        assert reason() == "kill_switch"
-    finally:
-        os.environ.pop(_DISABLE_ENV, None)
+    monkeypatch.setenv(_DISABLE_ENV, "1")
+    assert reason() == "kill_switch"
+    monkeypatch.delenv(_DISABLE_ENV)
     assert reason(state=None) == "no_state"
     for t_out in (allowlist.t_min - 1, allowlist.t_max + 1):
         if t_out >= 1:
@@ -348,17 +351,15 @@ def test_ws2_specialized_dispatch_stages_misaligned_views(
     assert torch.equal(t["ro"], res) and torch.equal(t["no"], norm)
 
 
-def test_ws2_specialized_dispatch_fallbacks_do_not_launch(fake_launcher):
+def test_ws2_specialized_dispatch_fallbacks_do_not_launch(fake_launcher, monkeypatch):
     """Calls the guard rejects reach no launch (the fallback backend serves them)."""
     ws = _dispatch_workspace()
     x, r, g = _inputs(3)
     assert ws2.try_dispatch(ws, x, r, None, None, g, 1e-6, 1.0, False, True) is None
     assert ws2.try_dispatch(ws, x, None, None, None, g, 1e-6, 1.0, True, True) is None
-    os.environ[_DISABLE_ENV] = "1"
-    try:
-        assert _dispatch(ws, x, r, g, None, None) is None
-    finally:
-        os.environ.pop(_DISABLE_ENV, None)
+    monkeypatch.setenv(_DISABLE_ENV, "1")
+    assert _dispatch(ws, x, r, g, None, None) is None
+    monkeypatch.delenv(_DISABLE_ENV)
     assert not fake_launcher.launches and not fake_launcher.refusals
 
 
