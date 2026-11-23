@@ -22,9 +22,17 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from ..const_tensor import const_fill
 from ..support import check_device, unsupported
 from .layout import padded_sf_cols, padded_sf_rows, sf_numel
-from .mx_api import _rows, device_sm_count, layout_of
+from .mx_api import (
+    CLASS_MXFP4,
+    _pdl_default,
+    _rows,
+    device_sm_count,
+    layout_of,
+    mxfp4_quantize_batch_invariant,
+)
 from .nvfp4_schedule import BLOCK, QuantConfig, default_config, num_blocks
 from .nvfp4_spec import PER_TENSOR, PER_TOKEN, Variant
 
@@ -40,13 +48,39 @@ _SHUFFLE_TILE_M = (
 _SHUFFLE_ROWS = 32  # the row blocks FlashInfer's shuffle permutes for that tile (``get_shuffle_block_size``)
 
 
+_get_compiled_kernel = None
+
+
+def _compiled_kernel(*key):
+    """``nvfp4_kernel.get_compiled_kernel`` imported on first use (the kernel module pulls in the CuTe DSL) and kept: an
+    import statement inside a function costs about half a microsecond per call."""
+    global _get_compiled_kernel
+    if _get_compiled_kernel is None:
+        from .nvfp4_kernel import get_compiled_kernel
+
+        _get_compiled_kernel = get_compiled_kernel
+    return _get_compiled_kernel(*key)
+
+
 def _scale_tensor(scale, ref: torch.Tensor) -> torch.Tensor:
-    """The global scale as a 1-element fp32 device tensor: a host float becomes a device fill (``torch.full``,
-    CUDA-graph capturable); a tensor on another device is copied to the input's device, as the operators' own paths
-    do (a copy is not capturable)."""
-    if not isinstance(scale, torch.Tensor):
-        return torch.full((1,), float(scale), dtype=torch.float32, device=ref.device)
-    return scale.to(device=ref.device, dtype=torch.float32).reshape(-1)[:1].contiguous()
+    """The global scale as a 1-element fp32 device tensor. A tensor already in that form on the input's device passes
+    through; another is converted as the operators' own paths do (a copy is not capturable). A host float is a cached
+    device constant (:func:`const_fill`: one fill per (device, value), ordered across streams; a fill kernel and an
+    allocation per call before)."""
+    if isinstance(scale, torch.Tensor):
+        if (
+            scale.dim() == 1
+            and scale.numel() == 1
+            and scale.dtype == torch.float32
+            and scale.device == ref.device
+        ):
+            return scale
+        return (
+            scale.to(device=ref.device, dtype=torch.float32)
+            .reshape(-1)[:1]
+            .contiguous()
+        )
+    return const_fill((1,), float(scale), torch.float32, ref.device)
 
 
 def nvfp4_quantize_rows(
@@ -69,8 +103,6 @@ def nvfp4_quantize_rows(
     otherwise ``a_global_sf`` is the per-tensor global scale, an input (a host float or a 1-element fp32 device tensor).
     Bitwise identical for every ``config`` in :func:`nvfp4_schedule.all_valid_configs`, for every batch composition,
     every SM count and the three layouts."""
-    from .nvfp4_kernel import get_compiled_kernel
-
     if a.dtype not in _DTYPE_STR:
         raise ValueError(f"input dtype {a.dtype} not supported (bf16 / f16 / fp32)")
     layout = layout_of(layout)
@@ -111,11 +143,12 @@ def nvfp4_quantize_rows(
     assert fp4.stride(0) % 8 == 0 or M == 1, (
         "fp4 row stride must be a multiple of 8 bytes"
     )
-    kernel = get_compiled_kernel(
+    kernel = _compiled_kernel(
         _DTYPE_STR[a.dtype], K, config, variant, bool(enable_pdl), layout
     )
     kernel(x2, fp4, sf, pts, gs, M, K, padded_M)
-    fp4 = fp4.view(*a.shape[:-1], K // 2)
+    if a.dim() != 2:
+        fp4 = fp4.view(*a.shape[:-1], K // 2)
     if per_token:
         return fp4, sf, pts
     return fp4, sf
@@ -154,8 +187,6 @@ def nvfp4_quantize_batch_invariant(
     an explicit 4over6 recipe (a scale-candidate search is another specification), ``expanded_idx_to_permuted_idx``
     (the MoE row map), ``out_scale`` (folded into the per-token scale by other backends), a layout outside the three,
     device, architecture; it never falls back."""
-    from ...utils import device_support_pdl
-
     cls = CLASS_NVFP4 + (".pertoken" if per_token_activation else "")
     check_device(a.device, cls, NVFP4_QUANT_ARCHS)
     if a.dtype not in _DTYPE_STR:
@@ -238,7 +269,7 @@ def nvfp4_quantize_batch_invariant(
         # need both; the copy is a placement, not numerics
         x2 = x2.clone(memory_format=torch.contiguous_format)
     if enable_pdl is None:
-        enable_pdl = device_support_pdl(a.device)
+        enable_pdl = _pdl_default(a.device)
     store_layout = "linear" if do_shuffle else layout
     M = x2.shape[0]
     if do_shuffle and M % _SHUFFLE_ROWS:
@@ -268,7 +299,8 @@ def nvfp4_quantize_batch_invariant(
         sm_count=sm_count,
     )
     fp4, sf = res[0], res[1].view(-1, pcols)
-    fp4 = fp4.view(*lead, K // 2)
+    if a.dim() != 2:
+        fp4 = fp4.view(*lead, K // 2)
     if do_shuffle:
         # FlashInfer's shuffled (TRT-LLM) weight layout: its own host permutations of the rows and of the linear-layout
         # scales, composed exactly as its backends compose them
@@ -314,8 +346,6 @@ def fp4_quantize_batch_invariant(
     entry point does; ``global_scale`` None is the scale 1.0; ``is_global_scale_inversed`` gives the class
     ``1 / global_scale`` by one correctly rounded fp32 division. Any other recipe, an fp8 input or a 4over6 recipe raises
     :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back."""
-    from ...utils import device_support_pdl
-    from .mx_api import CLASS_MXFP4, mxfp4_quantize_batch_invariant
 
     is_nvfp4 = sf_vec_size == BLOCK and not sf_use_ue8m0
     is_mxfp4 = sf_vec_size == 2 * BLOCK and sf_use_ue8m0
@@ -337,7 +367,7 @@ def fp4_quantize_batch_invariant(
     else:
         layout = "linear"
     if enable_pdl is None:
-        enable_pdl = device_support_pdl(input.device)
+        enable_pdl = _pdl_default(input.device)
     # The entry point quantizes a column-major input as the transpose of its row-major view (a placement).
     column_major = input.dim() >= 2 and input.stride(-2) == 1 and input.stride(-1) != 1
     x = input.transpose(-2, -1) if column_major else input

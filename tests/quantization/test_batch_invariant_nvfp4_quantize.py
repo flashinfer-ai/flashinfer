@@ -426,6 +426,61 @@ def test_zero_rows_and_unsupported_inputs():
 
 
 @needs_device
+def test_global_scale_forms_and_the_float_scale_cache():
+    """The global scale in every form the API takes -- a Python float, a 1-element fp32 device tensor (passed through as
+    it stands), a 0-d tensor, an fp64 tensor, a CPU tensor, a 1-element view of a wider tensor -- gives the same bits. A
+    Python float is a cached device constant (one fill per (device, value), :mod:`flashinfer.batch_invariant.const_tensor`):
+    a call on ANOTHER stream must not read it before the creating stream's fill has run (the entry carries its fill's event
+    and other streams wait on it, device side), and a CUDA-graph capture bypasses the cache (the fill is captured into the
+    graph) even when the value already has an entry."""
+    x = adversarial_inputs(130, 1024, torch.bfloat16, seed=7)
+    gs = _gs(x, False)
+    ref = _quantize(x, gs)
+    gs_t = torch.full((1,), gs, dtype=torch.float32, device="cuda")
+    wide = torch.tensor([gs, 0.0], dtype=torch.float32, device="cuda")
+    for form in (gs_t, gs_t[0], gs_t.double(), gs_t.cpu(), wide[:1]):
+        assert same_bits(_quantize(x, form), ref), form
+    # a value of this test's own: its first use as a float is on a busy stream, the second read from another stream
+    v = gs * (1.0 + 2.0**-12)
+    ref_v = _quantize(x, torch.full((1,), v, dtype=torch.float32, device="cuda"))
+    torch.cuda.synchronize()
+    a, b = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(a):
+        busy = torch.randn(8192, 8192, device="cuda")
+        for _ in range(
+            4
+        ):  # tens of milliseconds: the scale's fill queues behind it on this stream
+            busy = busy @ busy / 128.0
+        out_a = flashinfer.nvfp4_quantize(x, v, batch_invariant=True)
+    with torch.cuda.stream(b):  # the cached tensor, before the fill on stream a has run
+        out_b = flashinfer.nvfp4_quantize(x, v, batch_invariant=True)
+    torch.cuda.synchronize()
+    assert same_bits(tuple(t.cpu() for t in out_a), ref_v)
+    assert same_bits(tuple(t.cpu() for t in out_b), ref_v), (
+        "the second stream read the cached global scale before its fill"
+    )
+    del busy
+    # a graph captured with the float form, after the value has an entry: the capture fills its own tensor
+    w = gs * (1.0 + 2.0**-11)
+    ref_w = _quantize(x, torch.full((1,), w, dtype=torch.float32, device="cuda"))
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        outs = flashinfer.nvfp4_quantize(
+            x, w, batch_invariant=True
+        )  # creates the entry for w
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            outs = flashinfer.nvfp4_quantize(x, w, batch_invariant=True)
+    for _ in range(2):
+        for o in outs:
+            o.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert same_bits(tuple(o.cpu() for o in outs), ref_w)
+
+
+@needs_device
 def test_fp4_quantize_entry_point_runs_the_class():
     """``flashinfer.fp4_quantize(..., batch_invariant=True)``, the entry point behind ``nvfp4_quantize``, runs the per-tensor
     class with its own argument forms: the layout flags, ``global_scale`` None as the scale 1.0, ``is_global_scale_inversed``
