@@ -114,6 +114,18 @@ python wan/transformer_wan_flashinfer.py
 | `bmm_bf16` | `flashinfer.gemm.bmm_bf16` | `cudnn` (default), `cutlass`, `auto` | SM100+ (Blackwell) |
 | `mxfp8` | `flashinfer.gemm.mm_mxfp8` | `auto` (default), `cutlass`, `cute-dsl`, `trtllm` | SM100+ (Blackwell) |
 | `bmm_mxfp8` | `flashinfer.gemm.bmm_mxfp8` | `auto` (default), `cudnn`, `cutlass` | SM100+ (Blackwell) |
+| `unified_fp4` | `flashinfer.gemm.Linear` (NVFP4 x NVFP4) | `auto` (default), `cutlass`, `cute-dsl`, `trtllm`, `cudnn` | SM100+ (Blackwell) |
+| `unified_fp8` | `flashinfer.gemm.Linear` (per-tensor FP8) | `auto` (default), `cublas`, `cudnn`, `cutlass` | SM89+ |
+
+The `unified_fp4` / `unified_fp8` values route through the unified GEMM API
+(`flashinfer.gemm.Linear`, a `torch.nn.Linear` subclass that owns the
+quantized weight views, the backend selection and the bias add): with no
+suffix the library's `DEFAULT_GEMM_BACKENDS` order is used, and a suffix
+names a single backend candidate that never falls back to another. The
+library's `supported_backends()` is consulted at construction, so a layer no
+candidate can serve on the current GPU falls back to `torch` with a warning
+that lists each candidate's reason. Design and scope:
+[`docs/design_docs/flashinfer_gemm_api.md`](../../docs/design_docs/flashinfer_gemm_api.md).
 
 **`<base>-<kernel>` suffix syntax.** Each FlashInfer GEMM API that
 accepts a `backend` keyword can be steered from this example by
@@ -156,7 +168,7 @@ python wan/transformer_wan_flashinfer.py
 
 | Variable | Values | Meaning |
 |----------|--------|---------|
-| `FLASHINFER_GEMM_BACKEND` | `<base>` or `<base>-<kernel>` — base ∈ {`torch`, `bf16`, `fp8`, `fp8_sm90`, `bmm_fp8`, `fp8_groupwise`, `fp8_blockscaled`, `batch_deepgemm_fp8`, `fp4`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8`}; kernel suffix forwarded to the chosen API's `backend` kwarg (e.g. `fp4-cutlass`, `bf16-cutlass`, `mxfp8-cute-dsl`). | Selects the `FlashInferLinear` GEMM implementation. Unsupported backends fall back to `torch` with a warning. |
+| `FLASHINFER_GEMM_BACKEND` | `<base>` or `<base>-<kernel>` — base ∈ {`torch`, `bf16`, `fp8`, `fp8_sm90`, `bmm_fp8`, `fp8_groupwise`, `fp8_blockscaled`, `batch_deepgemm_fp8`, `fp4`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8`, `unified_fp4`, `unified_fp8`}; kernel suffix forwarded to the chosen API's `backend` kwarg (e.g. `fp4-cutlass`, `bf16-cutlass`, `mxfp8-cute-dsl`, `unified_fp4-cutlass`). | Selects the `FlashInferLinear` GEMM implementation. Unsupported backends fall back to `torch` with a warning. |
 | `FLASHINFER_ATTENTION_BACKEND` | `<base>` or `<base>-<kernel>` — base ∈ {`auto`, `single`, `cudnn`, `trtllm`, `torch`}; `-<kernel>` suffix on `single` is forwarded to `single_prefill_with_kv_cache`'s `backend` kwarg (`single-fa3`, `single-fa2`, `single-cudnn`, …). | Selects the FlashInfer attention path. `auto` uses `single_prefill_with_kv_cache` for `batch_size == 1` and `cudnn_batch_prefill_with_kv_cache` for `batch_size > 1`. |
 | `FLASHINFER_ONLINE_ACT_QUANT` | `1/0`, `true/false`, `yes/no`, `on/off` | Controls FP8/FP4-family activation scaling: online scale from the current tensor vs fixed default scale. Backends that ignore this flag: `torch`, `bf16`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8`. |
 | `FLASHINFER_USE_SKIP_SOFTMAX_SPARSE` | `1/0`, `true/false`, `yes/no`, `on/off` | Enables skip-softmax sparse attention when the GPU supports it; this forces the TRT-LLM attention path. |
