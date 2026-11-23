@@ -21,6 +21,8 @@
 #include <stdio.h>
 
 // Generated from the Weave binary wait-and-clear kernel.
+// Hand-edited after generation: the FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS guard in the
+// wait loop below is not in the generator output; re-apply it when regenerating.
 // The ring reuses the existing packed-add and monotonic handshake kernels.
 // Keep this generic load/store leaf defined for every build target so CUDA
 // emits its host launch stub. Protocol admission remains SM120-only at runtime.
