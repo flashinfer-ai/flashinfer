@@ -2178,9 +2178,7 @@ class AutoTuner:
         self._logged_cache_miss_oor: set[tuple[str, tuple[tuple[int, ...], ...]]] = (
             set()
         )
-        self._logged_cache_miss_no_op_data: set[
-            tuple[str, tuple[tuple[int, ...], ...]]
-        ] = set()
+        self._logged_cache_miss_no_op_data: set[str] = set()
         # Per-op memo of _has_tune_data's in-memory scan, valid for one value of
         # _dirty_seq (every winner publication bumps it; clear_cache resets it
         # and empties this memo).
@@ -3460,29 +3458,28 @@ class AutoTuner:
                         # keys; an op was never included in the tuning).
                         # Nothing is reported when no tuned data exists at
                         # all, the default for users who never tune.
-                        try:
-                            signature = self._find_nearest_profile(
-                                input_shapes, tuning_config
-                            )
-                        except Exception:
-                            signature = tuple(tuple(s) for s in input_shapes)
-                        warn_key = (custom_op, signature)
-                        if warn_key not in self._logged_cache_miss_no_op_data:
+                        # All shapes of an op miss for the same reason, so it is
+                        # reported once per op; every miss is counted in
+                        # ``stats.cache_misses`` / ``cache_miss_config_collection``.
+                        if custom_op not in self._logged_cache_miss_no_op_data:
                             tuned_ops = self._ops_with_tune_data()
                             if tuned_ops:
-                                self._logged_cache_miss_no_op_data.add(warn_key)
+                                self._logged_cache_miss_no_op_data.add(custom_op)
                                 shown = ", ".join(tuned_ops[:5])
                                 more = ", ..." if len(tuned_ops) > 5 else ""
                                 logger.warning(
                                     f"[AutoTuner]: No tuned config for "
-                                    f"{custom_op} input_shapes={input_shapes} "
-                                    f"although tuned data exists for other ops "
-                                    f"({shown}{more}); falling back to "
+                                    f"{custom_op} (first seen with "
+                                    f"input_shapes={input_shapes}) although tuned "
+                                    f"data exists for other ops ({shown}{more}); "
+                                    f"falling back to "
                                     f"runner={runners[0].__class__.__name__} "
                                     f"tactic=-1.  If a tuning cache was loaded, it "
                                     f"may have been made by a different FlashInfer "
                                     f"version (other op names or keys), or this op "
-                                    f"was not part of the tuning pass."
+                                    f"was not part of the tuning pass.  Other "
+                                    f"shapes of this op are not reported; see "
+                                    f"AutoTuner.stats.cache_miss_config_collection."
                                 )
                 return runner, tactic
 

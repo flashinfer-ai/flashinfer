@@ -538,7 +538,7 @@ def test_choose_one_inference_records_cache_misses():
 
 
 def test_choose_one_inference_warns_once_when_other_ops_have_tuned_data():
-    """Tuned data for another op, but none for this one: warn once per profile."""
+    """Tuned data for another op, but none for this one: warn once per op."""
     tuner = reset_autotuner()
     runner = DummyRunner()
     inputs = [torch.empty((4, 8), dtype=torch.float32)]
@@ -553,10 +553,18 @@ def test_choose_one_inference_warns_once_when_other_ops_have_tuned_data():
     message = warn.call_args.args[0]
     assert "dummy" in message and "other_op" in message
 
+    # Another shape of the same op is not reported again (it is counted).
     other_inputs = [torch.empty((6, 8), dtype=torch.float32)]
     with patch.object(autotuner_module.logger, "warning") as warn:
         tuner.choose_one("dummy", [runner], config, other_inputs)
-    assert warn.call_count == 1  # another profile of the same op
+    assert warn.call_count == 0
+    assert len(tuner.stats.cache_miss_config_collection["dummy"]) == 2
+
+    # Another op is reported once.
+    with patch.object(autotuner_module.logger, "warning") as warn:
+        tuner.choose_one("dummy2", [runner], config, inputs)
+        tuner.choose_one("dummy2", [runner], config, other_inputs)
+    assert warn.call_count == 1
 
 
 def test_choose_one_inference_is_silent_without_any_tuned_data():
