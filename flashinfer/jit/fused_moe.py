@@ -495,6 +495,8 @@ def trtllm_gen_fused_moe_build_inputs(
         jit_env.FLASHINFER_CSRC_DIR
         / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
         jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_small_token.cu",
+        jit_env.FLASHINFER_CSRC_DIR
         / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
         jit_env.FLASHINFER_CSRC_DIR
         / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
@@ -597,6 +599,8 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster_large.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_small_token.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
         ],

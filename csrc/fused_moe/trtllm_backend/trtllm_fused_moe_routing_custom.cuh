@@ -18,6 +18,8 @@
 //
 // Kernel inventory:
 //   1. routingIndicesBlockKernel      — single-block fused kernel (≤4 tokens)
+//  1b. routingIndicesDynBlockKernel   — dynamic-block fused kernel (≤16 tokens, ≤512 experts)
+//  1c. routingIndicesSmallTokenKernel — single-block, pair-map histogram (≤8 tokens, ≤512 experts)
 //   2. routingIndicesClusterKernel    — single-cluster fused kernel (≤256 tokens, SM90+)
 //   3. routingIndicesHistogramScoresKernel — TopK + histogram from raw scores
 //   4. routingIndicesCoopKernel       — cooperative histogram + offsets (defined in
@@ -38,15 +40,16 @@
 namespace moe::dev::routing {
 namespace routingCustom {
 
-#if (defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP) +   \
-     defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL) + \
-     defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE) + \
-     defined(FLASHINFER_ROUTING_CUSTOM_ENTRY)) != 1
+#if (defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP) +                                              \
+     defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_SMALL) +                                            \
+     defined(FLASHINFER_ROUTING_CUSTOM_CLUSTER_LARGE) + defined(FLASHINFER_ROUTING_CUSTOM_ENTRY) + \
+     defined(FLASHINFER_ROUTING_CUSTOM_SMALL_TOKEN)) != 1
 #error "Define exactly one FLASHINFER_ROUTING_CUSTOM_* translation-unit selector"
 #endif
 
 bool launchBlockKernel(Data const& data, void* stream);
 bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
+bool launchSmallTokenBlockKernel(Data const& data, void* stream);
 bool launchClusterKernelBlockDim256(Data const& data, void* stream);
 bool launchClusterKernelBlockDim512(Data const& data, void* stream);
 bool launchClusterKernelBlockDim1024(Data const& data, void* stream);
@@ -671,6 +674,305 @@ bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* strea
 }
 
 #endif  // defined(FLASHINFER_ROUTING_CUSTOM_BLOCK_GROUP)
+
+#if defined(FLASHINFER_ROUTING_CUSTOM_SMALL_TOKEN)
+
+// Warp-level inclusive prefix scan of one 32-bit value over the first Width (<= 32) lanes.
+template <int Width>
+__device__ __forceinline__ uint32_t warpInclusiveScan(uint32_t value, int32_t laneIdx) {
+#pragma unroll
+  for (int j = 1; j < Width; j *= 2) {
+    uint32_t const n = __shfl_up_sync(0xffffffff, value, j);
+    value = laneIdx >= j ? value + n : value;
+  }
+  return value;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// 1c. Small-token kernel — single block, raw-scores input, any policy, for at most
+//     getSmallTokenKernelMaxNumTokens() tokens (8 from the 256-expert tier up).
+//
+//     With <= 8 tokens there are at most 8 x topK (token, expert) pairs, so the histogram,
+//     the offsets and the permutation are built from the pairs instead of a
+//     [tokens x MaxNumExperts] table (routingIndicesBlockKernel: table init sweep, two
+//     cub::BlockScans, per-expert loops over the table).
+//
+//     - Prologue: each thread clears its expert's row of the byte map
+//       (expert -> position in each token's top-K, one byte per token, 0xFF = absent).
+//     - Phase A, one warp per token: the block kernel's preprocess -> TopK -> postprocess.
+//       Lane k writes k into byte t of its expert's row and the expert into slot (t, k) of
+//       the forward map.
+//     - Phase B, one thread per expert: one 64-bit load gives the expert's count. Tiles and
+//       padded rows are scanned as one packed value (warp scan, warp totals through smem).
+//     - Phase C: CTA tile maps and sizes from registers; the permutation runs one
+//       (token, k) pair per thread, offset-within-expert = number of earlier tokens in the
+//       expert's row (the block kernel's order).
+//
+//     Outputs match routingIndicesBlockKernel bit for bit, including the -1 sentinel for
+//     non-local experts, the -1 tile padding and the routing replay.
+//
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelParams::MaxNumExperts
+                                                                      : 1024)
+    routingIndicesSmallTokenKernel(KernelParams params) {
+  using OutputT = typename KernelParams::OutputT;
+  using InputT = typename KernelParams::InputT;
+  using ExpertSelect = typename KernelParams::ExpertSelectPolicy;
+  using BaseType = typename ExpertSelect::template BaseType<InputT>;
+  using PreProc = typename ExpertSelect::PreprocessPolicy;
+  using PostProc = typename ExpertSelect::PostprocessPolicy;
+
+  static constexpr int MaxNumExperts = KernelParams::MaxNumExperts;
+  static constexpr int MaxTopK = KernelParams::MaxNumTopExperts;
+  // Compiled only for the tiers run() can dispatch here. Wider tiers are empty stubs.
+  static constexpr bool Supported = MaxNumExperts <= SmallTokenKernelDispatchMaxNumExperts;
+  // SigmoidBias: stage the per-expert bias in shared memory (one expert per thread) so the
+  // preprocess reads it from there instead of MaxNumExperts / 32 global loads per lane.
+  // Only at the 512 tier, from B200 kernel times at 1 / 4 / 8 tokens, staged vs not:
+  // - 512 experts, topK 8: 4.67 / 4.82 / 5.84 us vs 5.07 / 5.11 / 6.21 us.
+  // - 384 experts: within 0.06 us either way.
+  // - 256 experts: 3.99 / 4.03 / 4.44 us vs 3.90 / 3.89 / 4.39 us.
+  static constexpr bool BiasCached =
+      MaxNumExperts > 384 && std::is_same_v<PreProc, SigmoidBiasPreprocess> &&
+      std::is_same_v<PostProc, ScaledSumNormalizePostprocess> && std::is_same_v<BaseType, float>;
+
+  if constexpr (Supported) {
+    static constexpr int NumThreadsBlock = MaxNumExperts;
+    static constexpr int NumWarpsBlock = NumThreadsBlock / WarpSize;
+    static constexpr int MaxNumTokens = getSmallTokenKernelMaxNumTokens(MaxNumExperts);
+    static constexpr int VecSize = MaxNumExperts / WarpSize;
+    // One byte per token slot, read and cleared as one 64-bit access per expert.
+    static constexpr int KIdxRowBytes = SmallTokenKernelMaxNumTokens;
+    static_assert(KIdxRowBytes == sizeof(uint2), "the row is cleared and read as one uint2");
+    static_assert(MaxNumExperts % WarpSize == 0, "the tier must be a whole number of warps");
+    static_assert(MaxTopK < 0xFF, "0xFF is the empty-slot marker of the byte map");
+    static_assert(NumWarpsBlock <= WarpSize, "the warp totals are scanned by one warp");
+    static_assert(MaxNumTokens * MaxTopK <= NumThreadsBlock, "one (token, k) pair per thread");
+    // Both scans carry (padded rows << 12 | tiles) in one 32-bit value.
+    // - tiles: at most 8 x 32 pairs, so the block total is < 4096.
+    // - padded rows: every exclusive prefix is < 256 pairs x tile <= 2^20 for tiles up to
+    //   4096 (run() checks the tile before dispatching here).
+    static constexpr int PackShift = 12;
+
+    __shared__ __align__(8) uint8_t smemKIdx[MaxNumExperts * KIdxRowBytes];
+    // Forward map (token, k) -> expert and the per-expert permuted-row offset.
+    __shared__ int16_t smemTopKExpert[MaxNumTokens * MaxTopK];
+    __shared__ int32_t smemExpertScan[MaxNumExperts];
+    __shared__ uint32_t smemWarpTotals[NumWarpsBlock];
+    __shared__ float smemBias[BiasCached ? MaxNumExperts : 1];
+
+    int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
+    int32_t const laneIdx = cutlass::arch::LaneId();
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<WarpSize>(block);
+
+    *reinterpret_cast<uint2*>(&smemKIdx[threadIdx.x * KIdxRowBytes]) =
+        make_uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
+    if constexpr (!BiasCached) {
+      __syncthreads();
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    // Same PDL points as routingIndicesBlockKernel: no global access before the wait, and
+    // dependents are released right after it (they wait on this grid before reading any
+    // routing output).
+    if (params.mUsePdl) {
+      cudaGridDependencySynchronize();
+      cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
+
+    if constexpr (BiasCached) {
+      // Staged after the wait (upstream stages it before): one barrier covers the row
+      // clear and the bias.
+      auto const& pre = params.mExpertSelectParams.mPreprocessParams;
+      if (static_cast<int32_t>(threadIdx.x) < params.mNumExperts) {
+        smemBias[threadIdx.x] = loadScalar(pre.ptrRoutingBias, threadIdx.x, pre.dtypeBias);
+      }
+      __syncthreads();
+    }
+
+    // ----- Phase A: one warp per token -----
+    if (warpIdx < params.mNumTokens) {
+      BaseType warpTopKScore[MaxTopK];
+      int32_t warpTopKExpertIdx[MaxTopK];
+      InputT const* scorePtr = params.mPtrScores + warpIdx * params.mNumExperts;
+      if constexpr (BiasCached) {
+        // TopKExpertSelect::apply with the bias read from shared memory: the same
+        // operations on the same values in the same order.
+        float const minScore = float{-INFINITY};
+        float score[VecSize];
+        int32_t idx[VecSize];
+#pragma unroll
+        for (int i = 0; i < VecSize; ++i) {
+          idx[i] = i * WarpSize + laneIdx;
+          score[i] = idx[i] < params.mNumExperts ? static_cast<float>(scorePtr[idx[i]]) : minScore;
+        }
+#pragma unroll
+        for (int i = 0; i < VecSize; ++i) {
+          float const s = sigmoid_accurate(score[i]);
+          float const bias = idx[i] < params.mNumExperts ? smemBias[idx[i]] : float{-INFINITY};
+          score[i] = s + bias;
+        }
+        topk::reduceTopK(warp, warpTopKScore, warpTopKExpertIdx, score, idx, minScore,
+                         params.mTopK);
+        PostProc::template applyWithScores<float, InputT, MaxTopK>(
+            warp, warpTopKScore, warpTopKExpertIdx, laneIdx, params.mTopK, scorePtr,
+            params.mExpertSelectParams.mPostprocessParams);
+      } else {
+        ExpertSelect::template apply<BaseType, InputT, VecSize, MaxTopK>(
+            warp, warpTopKScore, warpTopKExpertIdx, laneIdx, params.mNumExperts, params.mTopK,
+            scorePtr, params);
+      }
+      if (laneIdx < params.mTopK) {
+        smemKIdx[warpTopKExpertIdx[laneIdx] * KIdxRowBytes + warpIdx] =
+            static_cast<uint8_t>(laneIdx);
+        smemTopKExpert[warpIdx * MaxTopK + laneIdx] =
+            static_cast<int16_t>(warpTopKExpertIdx[laneIdx]);
+        if (params.mPtrTopKWeights != nullptr) {
+          params.mPtrTopKWeights[warpIdx * params.mTopK + laneIdx] =
+              OutputT{warpTopKScore[laneIdx]};
+        }
+        // Routing replay: selected expert ids, layout [num_tokens, topK].
+        if (params.mPtrRoutingReplayOut != nullptr) {
+          params.mPtrRoutingReplayOut[warpIdx * params.mTopK + laneIdx] =
+              static_cast<int16_t>(warpTopKExpertIdx[laneIdx]);
+        }
+      }
+    }
+    __syncthreads();
+
+    // ----- Phase B: one thread per expert -----
+    int32_t const expert = threadIdx.x;
+    int32_t const stridedLocalExperts = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+    int32_t const strideMask = (1 << params.mLocalExpertsStrideLog2) - 1;
+    auto const localExpIdx = expert - params.mLocalExpertsStartIdx;
+    bool const isLocal =
+        localExpIdx >= 0 && localExpIdx < stridedLocalExperts && (localExpIdx & strideMask) == 0;
+
+    // Byte t = position of the expert in token t's top-K, 0xFF if absent.
+    uint2 const kRow = *reinterpret_cast<uint2 const*>(&smemKIdx[expert * KIdxRowBytes]);
+    int32_t const count =
+        __popc(__vsetne4(kRow.x, 0xFFFFFFFFu)) + __popc(__vsetne4(kRow.y, 0xFFFFFFFFu));
+    // Non-local experts contribute no tiles and no permuted rows.
+    int32_t const localCount = isLocal ? count : 0;
+
+    int32_t numCta;
+    int32_t padded;
+    if (params.mIsPow2) {
+      numCta = divUpLog2<int32_t>(localCount, params.mPaddingLog2);
+      padded = divUpMulLog2<int32_t>(localCount, params.mPaddingLog2);
+    } else {
+      numCta = divUpTileN<int32_t>(localCount, params.mTileTokensDim);
+      padded = divUpMulTileN<int32_t>(localCount, params.mTileTokensDim);
+    }
+
+    // Block-wide exclusive scans of (numCta, padded) in expert order: warp inclusive scan,
+    // exchange the warp totals, then every warp scans the totals itself (one barrier).
+    uint32_t const packed =
+        (static_cast<uint32_t>(padded) << PackShift) | static_cast<uint32_t>(numCta);
+    uint32_t const inc = warpInclusiveScan<WarpSize>(packed, laneIdx);
+    if (laneIdx == WarpSize - 1) {
+      smemWarpTotals[warpIdx] = inc;
+    }
+    __syncthreads();
+
+    uint32_t const wt = warpInclusiveScan<NumWarpsBlock>(
+        laneIdx < NumWarpsBlock ? smemWarpTotals[laneIdx] : 0u, laneIdx);
+    uint32_t const blockTotal = __shfl_sync(0xffffffff, wt, NumWarpsBlock - 1);
+    uint32_t const warpPrefix = __shfl_sync(0xffffffff, wt, warpIdx > 0 ? warpIdx - 1 : 0);
+    uint32_t const exclusive = (warpIdx > 0 ? warpPrefix : 0u) + inc - packed;
+    int32_t const numNonExitingCtas = static_cast<int32_t>(blockTotal & ((1u << PackShift) - 1));
+    int32_t const ctaOffset = static_cast<int32_t>(exclusive & ((1u << PackShift) - 1));
+    smemExpertScan[expert] = static_cast<int32_t>(exclusive >> PackShift);
+
+    // ----- Phase C: CTA tile maps, sizes, permutation -----
+    if (isLocal) {
+      int32_t const mappedLocalIdx = localExpIdx >> params.mLocalExpertsStrideLog2;
+      for (int cta = 0; cta < numCta; ++cta) {
+        params.mPtrCtaIdxXyToBatchIdx[ctaOffset + cta] = mappedLocalIdx;
+        int32_t mnLimit1;
+        int32_t mnLimit2;
+        if (params.mIsPow2) {
+          mnLimit1 = mulLog2<int32_t>(ctaOffset + cta + 1, params.mPaddingLog2);
+          mnLimit2 = mulLog2<int32_t>(ctaOffset, params.mPaddingLog2) + localCount;
+        } else {
+          mnLimit1 = mulTileN<int32_t>(ctaOffset + cta + 1, params.mTileTokensDim);
+          mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + localCount;
+        }
+        params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+      }
+    }
+
+    if (threadIdx.x == 0) {
+      int32_t permutedIdxSize;
+      if (params.mIsPow2) {
+        permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+      } else {
+        permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+      }
+      params.mPtrPermutedIdxSize[0] = permutedIdxSize;
+      params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
+    }
+    __syncthreads();
+
+    // Permutation: one (token, k) pair per thread. Only the first MaxNumTokens tokens have
+    // forward-map slots (run() never dispatches more).
+    int32_t const numRoutedTokens =
+        params.mNumTokens < MaxNumTokens ? params.mNumTokens : MaxNumTokens;
+    int32_t const numPairs = numRoutedTokens * params.mTopK;
+    if (static_cast<int32_t>(threadIdx.x) < numPairs) {
+      int32_t const expandedIdx = threadIdx.x;
+      int32_t const tokenIdx = expandedIdx / params.mTopK;
+      int32_t const k = expandedIdx - tokenIdx * params.mTopK;
+      int32_t const pairExpert = smemTopKExpert[tokenIdx * MaxTopK + k];
+      auto const pairLocalIdx = pairExpert - params.mLocalExpertsStartIdx;
+      bool const pairIsLocal = pairLocalIdx >= 0 && pairLocalIdx < stridedLocalExperts &&
+                               (pairLocalIdx & strideMask) == 0;
+      uint2 const row = *reinterpret_cast<uint2 const*>(&smemKIdx[pairExpert * KIdxRowBytes]);
+      uint64_t const present = (static_cast<uint64_t>(__vsetne4(row.y, 0xFFFFFFFFu)) << 32) |
+                               static_cast<uint64_t>(__vsetne4(row.x, 0xFFFFFFFFu));
+      uint64_t const earlier = tokenIdx == 0 ? 0ull : (present & ((1ull << (8 * tokenIdx)) - 1));
+      int32_t const offsetWithinExpert = __popcll(earlier);
+      int32_t const permutedIdx =
+          pairIsLocal ? smemExpertScan[pairExpert] + offsetWithinExpert : int32_t{-1};
+      if (params.mPtrExpandedIdxToPermutedIdx != nullptr) {
+        params.mPtrExpandedIdxToPermutedIdx[expandedIdx] = permutedIdx;
+      }
+      if (params.mPtrPermutedIdxToExpandedIdx != nullptr && pairIsLocal) {
+        params.mPtrPermutedIdxToExpandedIdx[permutedIdx] = expandedIdx;
+      }
+      if (params.mPtrPermutedIdxToTokenIdx != nullptr && pairIsLocal) {
+        params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
+      }
+    }
+  } else {
+    // Unsupported instantiation, never launched (see run()).
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if (params.mUsePdl) {
+      cudaGridDependencySynchronize();
+      cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
+  }
+}
+
+// Returns whether a compiled tier covered the runtime (numExperts, topK) and the kernel
+// was actually launched (see launchBlockKernel). run() checks the shape before calling.
+bool launchSmallTokenBlockKernel(Data const& data, void* stream) {
+  // One thread per expert of the dispatched tier.
+  uint32_t const numThreadsBlock = static_cast<uint32_t>(queryDispatchedMaxExperts(data));
+  LAUNCH_ROUTING_CUSTOM(data, false, routingIndicesSmallTokenKernel, 1, numThreadsBlock,
+                        /*smemSize=*/0,  // No dynamic smem
+                        stream);
+  return queryPolicyHasCompiledTier(data);
+}
+
+#endif  // defined(FLASHINFER_ROUTING_CUSTOM_SMALL_TOKEN)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -1584,6 +1886,30 @@ void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThr
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Whether routingIndicesSmallTokenKernel serves this raw-scores shape.
+//
+// The rule is the kernel's structural bounds: every compiled tier up to 512 experts, up to
+// min(8, tier / 32) tokens. Upstream TensorRT-LLM keeps one cell (512 tier, one token,
+// sigmoid preprocess) on its cooperative block kernel. FlashInfer has no such kernel, and
+// here the small-token kernel is faster than the block (1-4 tokens) and dyn-block (5-8
+// tokens) kernels at every point measured.
+//
+// B200, kernel time (CUPTI) at 1 / 4 / 8 tokens, tile 8, block or dyn-block -> small-token:
+//   128 experts, topK 8, Renormalize:  3.78 / 3.96 / (dyn-block) -> 3.33 / 3.43 / - us
+//   160 experts, topK 8, Renormalize:  3.88 / 4.05 / (dyn-block) -> 3.45 / 3.52 / - us
+//   256 experts, topK 8, Renormalize:  4.06 / 4.28 / 5.18 -> 3.62 / 3.73 / 4.17 us
+//   256 experts, topK 8, SigmoidBias:  4.34 / 4.49 / 5.38 -> 3.91 / 3.88 / 4.39 us
+//   384 experts, topK 8, SigmoidBias:  4.87 / 5.11 / 6.07 -> 4.09 / 4.28 / 5.00 us
+//   512 experts, topK 8, SigmoidBias:  5.84 / 6.08 / 6.96 -> 4.67 / 4.82 / 5.84 us
+//   512 experts, topK 22, Renormalize: 5.94 / 6.15 / 8.21 -> 5.25 / 5.43 / 7.17 us
+//   512 experts, topK 32, Renormalize: 6.52 / 6.74 / 9.28 -> 5.83 / 6.02 / 8.25 us
+// The other policies (Default, TopK, SigmoidRenorm) at 256 experts and the 128-tier
+// policies gain the same 10-20%. Tiers above 512 are not compiled and were not measured.
+static bool prefersSmallTokenKernel(int32_t numTokens, int32_t dispatchedMaxExperts) {
+  return dispatchedMaxExperts <= SmallTokenKernelDispatchMaxNumExperts &&
+         numTokens <= getSmallTokenKernelMaxNumTokens(dispatchedMaxExperts);
+}
+
 void run(Data const& data, void* stream) {
   TVM_FFI_ICHECK(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr ||
                  data.mPtrTopKIds != nullptr)
@@ -1647,6 +1973,21 @@ void run(Data const& data, void* stream) {
   bool const useDynBlock = !useStaticBlock && data.mNumTokens <= DynBlockKernelMaxNumTokens &&
                            dispatchedMaxExperts <= DynBlockKernelMaxNumExperts;
   bool const useSingleBlock = useStaticBlock || useDynBlock;
+  // Small-token kernel, tried before the block / dyn-block kernels. Raw scores only:
+  // precomputed top-k (mPtrTopKIds / mPtrTopKPacked) returned through
+  // runPostTopKPipeline above.
+  // `FLASHINFER_ROUTING_SMALL_TOKEN=0` (or "off") restores the previous dispatch. Read once
+  // per process.
+  static bool const enableSmallToken = [] {
+    char const* raw = std::getenv("FLASHINFER_ROUTING_SMALL_TOKEN");
+    if (raw == nullptr) return true;
+    std::string v = raw;
+    return !(v == "0" || v == "off" || v == "OFF");
+  }();
+  // Other tile sizes overflow the kernel's packed scan and keep the previous dispatch.
+  bool const useSmallToken = enableSmallToken && useSingleBlock && data.mTileTokensDim >= 1 &&
+                             data.mTileTokensDim <= SmallTokenKernelMaxTileTokensDim &&
+                             prefersSmallTokenKernel(data.mNumTokens, dispatchedMaxExperts);
   bool const useSingleCluster =
       (smMajor >= 9) && (data.mNumTokens <= MaxNumTokensSingleClusterScores);
 
@@ -1784,7 +2125,14 @@ void run(Data const& data, void* stream) {
     return;
   }
 
-  if (useDynBlock) {
+  if (useSmallToken) {
+    bool const launched = launchSmallTokenBlockKernel(mutableData, stream);
+    FLASHINFER_CHECK(launched,
+                     "routingCustom::run: no compiled tier covers numExperts=", data.mNumExperts,
+                     " topK=", data.mTopK,
+                     " for the active routing policy (small-token path; see preceding warning). "
+                     "Add a matching Tier<E, K> to PolicyTraits in RoutingCustomPolicy.cuh.");
+  } else if (useDynBlock) {
     bool const launched = launchDynBlockKernel(mutableData, numThreadsHist, stream);
     FLASHINFER_CHECK(launched,
                      "routingCustom::run: no compiled tier covers numExperts=", data.mNumExperts,

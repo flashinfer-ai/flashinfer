@@ -33,7 +33,11 @@ Notes on test construction:
   than element-wise equality.
 """
 
+import os
+import subprocess
+import sys
 import zlib
+from pathlib import Path
 
 import pytest
 import torch
@@ -54,6 +58,7 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     routing_reference_renormalize_naive,
     routing_reference_sigmoid_renorm,
     routing_reference_topk,
+    routing_reference_topk_sigmoid,
 )
 
 # Weights come back bfloat16 (the routing dispatcher hard-codes its output
@@ -338,6 +343,232 @@ def test_llama4_routing(num_tokens, num_experts, tile_tokens_dim, logits_dtype):
         top_k,
         tile_tokens_dim,
     )
+
+
+# ---------------------------------------------------------------------------
+# Small-token kernel (routingIndicesSmallTokenKernel)
+#
+# routingCustom::run dispatches raw-logits calls to it by token count and by the
+# compiled (experts, top_k) tier the policy resolves to. See
+# prefersSmallTokenKernel() in trtllm_fused_moe_routing_custom.cuh.
+# The grid below crosses each policy with tokens 1..9 (9 is past the kernel's
+# capacity) and includes, per policy family, the first tier that declines.
+# ---------------------------------------------------------------------------
+
+
+def _small_token_reference(method, logits, bias, top_k, num_experts, tile):
+    """(permute_info, ref_scores) of the host oracle for `method`."""
+    if method == RoutingMethodType.DeepSeekV3:
+        return routing_reference_no_aux(logits, bias, top_k, 1, 1, 2.5, tile)
+    if method == RoutingMethodType.MiniMax2:
+        return routing_reference_minimax2(logits, bias, top_k, num_experts, tile, 2.5)
+    if method in (RoutingMethodType.SigmoidRenorm, RoutingMethodType.Sigmoid):
+        return routing_reference_sigmoid_renorm(
+            logits,
+            top_k,
+            num_experts,
+            tile,
+            norm_topk_prob=method == RoutingMethodType.SigmoidRenorm,
+        )
+    reference = {
+        RoutingMethodType.Default: routing_reference_default,
+        RoutingMethodType.Renormalize: routing_reference_renormalize,
+        RoutingMethodType.RenormalizeNaive: routing_reference_renormalize_naive,
+        RoutingMethodType.TopK: routing_reference_topk,
+        RoutingMethodType.TopKSigmoid: routing_reference_topk_sigmoid,
+    }[method]
+    return reference(logits, top_k, num_experts, tile)
+
+
+def _small_token_kwargs(method):
+    if method == RoutingMethodType.DeepSeekV3:
+        return dict(n_group=1, topk_group=1, routed_scaling_factor=2.5)
+    if method == RoutingMethodType.MiniMax2:
+        return dict(routed_scaling_factor=2.5)
+    return {}
+
+
+def _small_token_inputs(method, num_tokens, num_experts, top_k, hot_expert=None):
+    """float32 logits (tie-free beyond 256 experts) and the bias, if any."""
+    seed = stable_seed("small_token", int(method), num_tokens, num_experts, top_k)
+    logits = make_logits(num_tokens, num_experts, torch.float32, seed, hot_expert)
+    uses_bias = method in (RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2)
+    bias = make_bias(num_experts, torch.bfloat16, seed + 1) if uses_bias else None
+    return logits, bias
+
+
+_R = RoutingMethodType
+# (method, num_experts, top_k, tile_tokens_dim, hot_expert). The comment names the
+# compiled tier and the kernel's token capacity there (0: the tier declines).
+SMALL_TOKEN_CASES = [
+    # NoOp + Softmax
+    (_R.Renormalize, 128, 8, 256, None),  # <128, 8>, 4 tokens
+    (_R.Renormalize, 160, 8, 8, None),  # <160, 8>, 5 tokens
+    (_R.Renormalize, 256, 8, 8, None),  # <256, 8>, 8 tokens
+    (_R.Renormalize, 256, 8, 8, 3),  # hot expert: one full tile at 8 tokens
+    (_R.Renormalize, 256, 8, 2, 3),  # hot expert spans up to 4 tiles
+    (_R.Renormalize, 256, 16, 16, None),  # <256, 16>
+    (_R.Renormalize, 384, 8, 8, None),  # no 384 tier: <512, 8>
+    (_R.Renormalize, 512, 8, 32, None),  # <512, 8>
+    (_R.Renormalize, 512, 22, 8, None),  # <512, 22>
+    (_R.Renormalize, 512, 22, 8, 500),  # hot expert in the last warp
+    (_R.Renormalize, 512, 32, 8, None),  # <512, 32>
+    (_R.Renormalize, 576, 8, 8, None),  # <576, 8>: declines
+    (_R.RenormalizeNaive, 256, 8, 8, None),
+    # SigmoidBias + ScaledSumNormalize
+    (_R.DeepSeekV3, 128, 8, 8, None),  # <128, 8>, 4 tokens
+    (_R.DeepSeekV3, 160, 8, 8, None),  # no 160 tier: <256, 8>
+    (_R.DeepSeekV3, 256, 8, 8, None),  # <256, 8>
+    (_R.DeepSeekV3, 256, 8, 16, 3),
+    (_R.DeepSeekV3, 512, 8, 4, 3),  # hot expert: partial second tile
+    (_R.DeepSeekV3, 384, 8, 8, None),  # <384, 8>
+    (_R.DeepSeekV3, 512, 8, 8, None),  # <512, 8>
+    (_R.DeepSeekV3, 512, 22, 8, None),  # <512, 22>
+    (_R.DeepSeekV3, 576, 8, 8, None),  # <896, 16>: declines
+    (_R.MiniMax2, 256, 6, 8, None),
+    (_R.MiniMax2, 128, 16, 8, None),  # top_k falls through to <512, 22>
+    # Policies whose tiers stop at 256 experts
+    (_R.Default, 256, 8, 8, None),
+    (_R.TopK, 256, 8, 8, None),
+    (_R.SigmoidRenorm, 256, 8, 8, None),
+    (_R.Sigmoid, 128, 8, 8, None),
+    (_R.TopKSigmoid, 256, 8, 8, None),
+]
+
+
+def _small_token_id(case):
+    method, num_experts, top_k, tile, hot = case
+    hot_tag = "" if hot is None else f"_hot{hot}"
+    return f"{method.name}_E{num_experts}_k{top_k}_tile{tile}{hot_tag}"
+
+
+@pytest.mark.parametrize("num_tokens", range(1, 10))
+@pytest.mark.parametrize("case", SMALL_TOKEN_CASES, ids=_small_token_id)
+def test_small_token_kernel(case, num_tokens):
+    method, num_experts, top_k, tile, hot_expert = case
+    logits, bias = _small_token_inputs(
+        method, num_tokens, num_experts, top_k, hot_expert
+    )
+    run_and_check(
+        method,
+        lambda: _small_token_reference(method, logits, bias, top_k, num_experts, tile),
+        logits,
+        top_k,
+        tile,
+        routing_bias=bias,
+        **_small_token_kwargs(method),
+    )
+
+
+# (method, num_experts, top_k, tile_tokens_dim, local_expert_offset,
+# local_num_experts). DeepSeekV3 here is n_group=1, i.e. routingCustom.
+SMALL_TOKEN_EP_CASES = [
+    (_R.Renormalize, 256, 8, 8, 0, 64),
+    (_R.Renormalize, 256, 8, 8, 192, 64),
+    (_R.Renormalize, 512, 22, 16, 128, 128),
+    (_R.Renormalize, 160, 8, 8, 40, 40),
+    (_R.DeepSeekV3, 256, 8, 8, 64, 64),
+    (_R.DeepSeekV3, 512, 22, 8, 384, 128),
+]
+
+
+@pytest.mark.parametrize("num_tokens", range(1, 10))
+@pytest.mark.parametrize(
+    "case",
+    SMALL_TOKEN_EP_CASES,
+    ids=lambda c: f"{c[0].name}_E{c[1]}_k{c[2]}_off{c[4]}_n{c[5]}",
+)
+def test_small_token_kernel_ep_shard(case, num_tokens):
+    method, num_experts, top_k, tile, local_offset, local_count = case
+    logits, bias = _small_token_inputs(method, num_tokens, num_experts, top_k)
+    run_and_check_ep_shard(
+        method,
+        lambda: _small_token_reference(method, logits, bias, top_k, num_experts, tile),
+        logits,
+        top_k,
+        tile,
+        local_offset,
+        local_count,
+        routing_bias=bias,
+        **_small_token_kwargs(method),
+    )
+
+
+def _dump_small_token_outputs(path):
+    """Subprocess entry: route every small-token case and save the defined outputs."""
+    outputs = {}
+    # Tiers above 512 experts never reach the kernel, and their cluster kernels
+    # order tokens within an expert differently from run to run.
+    cases = [(c[:4], c[4], 0, None) for c in SMALL_TOKEN_CASES if c[1] <= 512]
+    cases += [(c[:4], None, c[4], c[5]) for c in SMALL_TOKEN_EP_CASES]
+    for (method, num_experts, top_k, tile), hot, local_offset, local_count in cases:
+        for num_tokens in range(1, 10):
+            logits, bias = _small_token_inputs(
+                method, num_tokens, num_experts, top_k, hot
+            )
+            r = trtllm_gen_routing(
+                logits,
+                bias,
+                method,
+                top_k,
+                tile_tokens_dim=tile,
+                local_expert_offset=local_offset,
+                local_num_experts=local_count,
+                **_small_token_kwargs(method),
+            )
+            padded = int(r.total_num_padded_tokens.item())
+            ctas = int(r.num_non_exiting_ctas.item())
+            key = (int(method), num_experts, top_k, tile, hot, local_offset, num_tokens)
+            # Entries past the padded size / tile count are allocation slack.
+            outputs[key] = {
+                "topk_weights": r.topk_weights.cpu(),
+                "expanded_idx_to_permuted_idx": r.expanded_idx_to_permuted_idx.cpu(),
+                "permuted_idx_to_token_idx": r.permuted_idx_to_token_idx[:padded].cpu(),
+                "cta_idx_xy_to_batch_idx": r.cta_idx_xy_to_batch_idx[:ctas].cpu(),
+                "cta_idx_xy_to_mn_limit": r.cta_idx_xy_to_mn_limit[:ctas].cpu(),
+                "padded": padded,
+                "ctas": ctas,
+            }
+    torch.save(outputs, path)
+
+
+def test_small_token_kill_switch_bitwise(tmp_path):
+    """FLASHINFER_ROUTING_SMALL_TOKEN=0 and =1 give bitwise-equal outputs.
+
+    The switch is read once per process, hence one subprocess per value.
+    Weights are compared bitwise too: the kernel runs the block kernels'
+    preprocess, TopK and postprocess operations in the same order.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    dumps = {}
+    for value in ("0", "1"):
+        path = tmp_path / f"switch_{value}.pt"
+        env = dict(os.environ, FLASHINFER_ROUTING_SMALL_TOKEN=value)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(repo_root)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        )
+        code = (
+            "from tests.moe.test_trtllm_gen_routing import _dump_small_token_outputs;"
+            f"_dump_small_token_outputs({str(path)!r})"
+        )
+        subprocess.run([sys.executable, "-c", code], check=True, cwd=repo_root, env=env)
+        dumps[value] = torch.load(path)
+
+    assert dumps["0"].keys() == dumps["1"].keys() and dumps["0"]
+    for key, off in dumps["0"].items():
+        on = dumps["1"][key]
+        for name, want in off.items():
+            got = on[name]
+            if isinstance(want, int):
+                assert got == want, f"{name} differs for {key}"
+            else:
+                # bf16 weights compare as raw bits.
+                same = (
+                    torch.equal(got.view(torch.int16), want.view(torch.int16))
+                    if want.dtype == torch.bfloat16
+                    else torch.equal(got, want)
+                )
+                assert same, f"{name} differs for {key}"
 
 
 @pytest.mark.parametrize(
@@ -681,6 +912,22 @@ def test_ep_shard_deepseekv3(
     "num_tokens,num_experts,top_k,tile_tokens_dim,routing_method,local_offset,local_count",
     [
         pytest.param(1, 16, 2, 8, RoutingMethodType.Renormalize, 0, 16, id="block"),
+        pytest.param(
+            6, 256, 8, 8, RoutingMethodType.Renormalize, 64, 128, id="small-token"
+        ),
+        pytest.param(
+            8, 512, 22, 32, RoutingMethodType.Renormalize, 0, 512, id="small-token-512"
+        ),
+        pytest.param(
+            7,
+            256,
+            8,
+            4,
+            RoutingMethodType.Renormalize,
+            64,
+            128,
+            id="small-token-multi-tile",
+        ),
         pytest.param(
             9, 128, 4, 32, RoutingMethodType.Renormalize, 32, 64, id="dynblock"
         ),
