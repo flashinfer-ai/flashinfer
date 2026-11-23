@@ -88,6 +88,15 @@ output_column_dict = {
         "tp_rank",
         "ep_size",
         "ep_rank",
+        # Mode-defining flags, appended so the columns before them keep their
+        # positions.
+        "routing_input",
+        "num_fused_shared_experts",
+        "valid_hidden_size",
+        "valid_intermediate_size",
+        "swiglu_alpha",
+        "swiglu_beta",
+        "gemm_bias",
     ],
     "allreduce_comm": [
         "num_tokens",
@@ -305,6 +314,9 @@ benchmark_apis = {
         "alphamoe_nvfp4_aligned_moe",
         "unified_nvfp4_moe",
         "bgmv_moe",
+        "trtllm_bf16_moe",
+        "trtllm_mxint4_block_scale_moe",
+        "moe_routing",
     ],
     # Uses each unified backend config's supported(arch) check followed by a
     # real runner construction/probe, like mm_fp4's runtime backend filtering.
@@ -774,9 +786,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["trtllm"],
-        "10.3": ["trtllm"],
-        "10.7": ["trtllm"],
+        # prims-ts follows _PRIMS_TS_ARCHS in flashinfer/prims_ts/moe/support.py;
+        # on 10.7 it also needs a CuTe DSL that can target SM107.
+        "10.0": ["trtllm", "prims-ts"],
+        "10.3": ["trtllm", "prims-ts"],
+        "10.7": ["trtllm", "prims-ts"],
         "12.0": [],
         "12.1": [],
     },
@@ -786,9 +800,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["trtllm"],
-        "10.3": ["trtllm"],
-        "10.7": ["trtllm"],
+        # prims-ts follows _PRIMS_TS_ARCHS in flashinfer/prims_ts/moe/support.py;
+        # on 10.7 it also needs a CuTe DSL that can target SM107.
+        "10.0": ["trtllm", "prims-ts"],
+        "10.3": ["trtllm", "prims-ts"],
+        "10.7": ["trtllm", "prims-ts"],
         "12.0": [],
         "12.1": [],
     },
@@ -798,9 +814,11 @@ routine_cc_to_supported_backends = {
         "8.6": [],
         "8.9": [],
         "9.0": [],
-        "10.0": ["trtllm"],
-        "10.3": ["trtllm"],
-        "10.7": ["trtllm"],
+        # prims-ts follows _PRIMS_TS_ARCHS in flashinfer/prims_ts/moe/support.py;
+        # on 10.7 it also needs a CuTe DSL that can target SM107.
+        "10.0": ["trtllm", "prims-ts"],
+        "10.3": ["trtllm", "prims-ts"],
+        "10.7": ["trtllm", "prims-ts"],
         "12.0": [],
         "12.1": [],
     },
@@ -808,11 +826,16 @@ routine_cc_to_supported_backends = {
         "7.5": [],
         "8.0": [],
         "8.6": [],
-        "8.9": [],
-        "9.0": [],
+        # 8.9/9.0/11.0 follow get_cutlass_fused_moe_module (sm89/sm90/sm100
+        # modules) and have not been run on hardware. --cutlass_variant nvfp4 is
+        # not built for 8.9/9.0 (_CUTLASS_NVFP4_ARCHS in flashinfer/fused_moe/api.py)
+        # and fails inside the library there.
+        "8.9": ["cutlass"],
+        "9.0": ["cutlass"],
         "10.0": ["cutlass"],
         "10.3": ["cutlass"],
         "10.7": ["cutlass"],
+        "11.0": ["cutlass"],
         "12.0": ["cutlass"],
         "12.1": ["cutlass"],
     },
@@ -860,6 +883,32 @@ routine_cc_to_supported_backends = {
         "10.0": ["unified"],
         "10.3": ["unified"],
         "10.7": ["unified"],
+    },
+    # BF16 / MxInt4 follow _TRTLLM_ROUTED_ARCHS in flashinfer/fused_moe/api.py.
+    "trtllm_bf16_moe": {
+        "10.0": ["trtllm", "prims-ts"],
+        "10.3": ["trtllm", "prims-ts"],
+        "10.7": ["trtllm", "prims-ts"],
+    },
+    "trtllm_mxint4_block_scale_moe": {
+        "10.0": ["trtllm"],
+        "10.3": ["trtllm"],
+        "10.7": ["trtllm"],
+    },
+    # Each backend follows its API's supported_compute_capability list
+    # (trtllm_gen_routing, fused_topk_deepseek's default backend, hash_topk).
+    # alphamoe (alphamoe_fused_router) runs only when named in --backends.
+    "moe_routing": {
+        "8.0": ["hash"],
+        "8.6": ["hash"],
+        "8.9": ["dsv3", "hash"],
+        "9.0": ["dsv3", "hash"],
+        "10.0": ["trtllm", "dsv3", "alphamoe", "hash"],
+        "10.3": ["trtllm", "dsv3", "alphamoe", "hash"],
+        "10.7": ["trtllm", "dsv3", "hash"],
+        "11.0": ["hash"],
+        "12.0": ["trtllm", "dsv3", "hash"],
+        "12.1": ["trtllm", "dsv3", "hash"],
     },
     # NORM
     "rmsnorm": {
