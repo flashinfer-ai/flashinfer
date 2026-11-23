@@ -20,6 +20,10 @@ from b12x.moe._shared.kernels.w4a16.prepare import PreparedTrellis256DenseWeight
 from ._tuning import TUNING, TrellisConfig, TrellisQuery
 
 _INTERNAL_C_TMPS = weakref.WeakValueDictionary()
+# Split-K reduction counters, one buffer per plan: the prepared weight's own
+# workspace is shared by every plan on that weight, so concurrent split-K plans
+# on different streams would otherwise interleave on the same counters.
+_INTERNAL_LOCKS = weakref.WeakValueDictionary()
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -170,6 +174,7 @@ class _TrellisExecutionState:
     grid_cap: int
     c_tmp_owner: tuple[object, ...] | None
     split_k_slices: int | None = None
+    locks: torch.Tensor | None = None
 
     def run(
         self,
@@ -224,6 +229,7 @@ class _TrellisExecutionState:
             output_f16=output_f16,
             hadamard_128=self.hadamard_128,
             split_k_slices=self.split_k_slices,
+            locks=self.locks,
         )
 
 
@@ -236,7 +242,14 @@ def plan(
     c_tmp=None,
     hadamard_128=None,
 ) -> Plan:
-    """Declare an exact-M Trellis plan; all code is loaded by the session."""
+    """Declare an exact-M Trellis plan; all code is loaded by the session.
+
+    A split-K plan (``allow_split_k=True``) owns its reduction counters, so
+    different plans may run concurrently on different streams, including plans
+    on the same weight. One plan runs one execution at a time, as its scratch is
+    per plan; a caller-provided ``c_tmp`` must not be shared by split-K plans
+    that run concurrently.
+    """
     if not isinstance(query, TrellisQuery):
         raise TypeError("Trellis plan requires TrellisQuery")
     if not isinstance(weight, PreparedTrellis256DenseWeight):
@@ -319,6 +332,17 @@ def plan(
                 else 0
             )
             persistent.append(PersistentMemory(owner, elements * 4, resident_nbytes))
+        if config.split_k_slices is not None:
+            owner = ("gemm.trellis_linear.locks", current_plan(), device.ordinal)
+            resident = _INTERNAL_LOCKS.get(owner)
+            resident_nbytes = (
+                resident.numel() * resident.element_size()
+                if resident is not None
+                else 0
+            )
+            persistent.append(
+                PersistentMemory(owner, weight.workspace.numel() * 4, resident_nbytes)
+            )
         lut_memory = _lut_memory(query, device)
         if lut_memory is not None:
             persistent.append(lut_memory)
@@ -373,6 +397,16 @@ def plan(
         else:
             scratch = c_tmp
         launch = _W4A16GemmLaunch(kernel=programs["gemm"], c_tmp=scratch)
+        locks = None
+        if config.split_k_slices is not None:
+            locks_owner = ("gemm.trellis_linear.locks", current_plan(), device.ordinal)
+            locks = _INTERNAL_LOCKS.get(locks_owner)
+            if locks is None or locks.numel() < weight.workspace.numel():
+                # Zeroed once; every complete split-K launch leaves them zero.
+                locks = torch.zeros(
+                    weight.workspace.numel(), dtype=torch.int32, device=resolved_device
+                )
+                _INTERNAL_LOCKS[locks_owner] = locks
         lut = (
             None
             if query.codebook == "mcg"
@@ -388,6 +422,7 @@ def plan(
             grid_cap=device.identity.sm_count * int(programs["gemm"].blocks_per_sm),
             c_tmp_owner=c_tmp_owner,
             split_k_slices=config.split_k_slices,
+            locks=locks,
         )
 
     return Plan(

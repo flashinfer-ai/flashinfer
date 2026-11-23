@@ -12969,6 +12969,7 @@ def _run_trellis256_dense_current_device(
     hadamard_128,
     stream: cuda.CUstream | None = None,
     split_k_slices: int | None = None,
+    locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one native EXL3 linear on the already-selected CUDA device.
 
@@ -12981,6 +12982,12 @@ def _run_trellis256_dense_current_device(
     ``schedule_whole_tiles=False``; the grid then holds that many CTAs per
     mn-tile (capped at ``grid_cap``) and the kernel's lock-ordered split-K
     finalize combines their partial sums in a fixed order.
+
+    A split-K launch also needs ``locks``: zero-initialized int32 counters, at
+    least as many as ``prepared_dense.workspace``, owned by one execution at a
+    time. Every complete launch leaves them zero. The weight's own workspace is
+    shared by every plan on that weight, so split-K never uses it: two launches
+    on different streams would otherwise interleave on the same counters.
     """
     if getattr(prepared_dense, "weight_layout", None) != "trellis_t256":
         raise ValueError("run_trellis256_dense requires prepared trellis_t256 weights")
@@ -13109,7 +13116,25 @@ def _run_trellis256_dense_current_device(
                 "split_k_slices requires a launch compiled with "
                 "schedule_whole_tiles=False"
             )
+        if locks is None:
+            raise ValueError(
+                "a split-K Trellis launch requires its own lock storage (locks)"
+            )
+        if (
+            locks.dtype != torch.int32
+            or locks.device != x.device
+            or not locks.is_contiguous()
+            or locks.numel() < prepared_dense.workspace.numel()
+            or locks.data_ptr() == prepared_dense.workspace.data_ptr()
+        ):
+            raise ValueError(
+                "split-K locks must be contiguous int32 on the input's device, "
+                f"hold at least {prepared_dense.workspace.numel()} counters and "
+                "not be the prepared weight's shared workspace"
+            )
         grid_x = min(int(grid_cap), mn_tiles * split_k_slices)
+    if split_k_slices is None and locks is not None:
+        raise ValueError("locks apply only to split-K launches")
     if trellis_codebook != "mcg" and execution_lut is None:
         raise ValueError("prepared Trellis decoder is missing its execution LUT")
     stream = current_cuda_stream() if stream is None else stream
@@ -13141,7 +13166,8 @@ def _run_trellis256_dense_current_device(
         dummy_i32,
         prepared_dense.global_scale,
         launch.c_tmp,
-        prepared_dense.workspace,
+        # Whole-tile launches never touch the lock slot.
+        prepared_dense.workspace if locks is None else locks,
         # MCG kernels never dereference the LUT ABI slot.
         dummy_i32 if trellis_codebook == "mcg" else execution_lut,
         m,
@@ -13192,6 +13218,7 @@ def run_trellis256_dense(
     output_f16: torch.Tensor | None = None,
     hadamard_128,
     split_k_slices: int | None = None,
+    locks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a session-materialized native or compact P24/P33 EXL3 linear."""
     if not isinstance(x, torch.Tensor) or not x.is_cuda:
@@ -13213,6 +13240,7 @@ def run_trellis256_dense(
             hadamard_128=hadamard_128,
             stream=None,
             split_k_slices=split_k_slices,
+            locks=locks,
         )
 
 

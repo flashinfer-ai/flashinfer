@@ -22,6 +22,7 @@ from b12x.moe._shared.kernels.activations import (
 from b12x.moe._shared.kernels.w4a16.kernel import (
     _trellis256_dense_launch_geometry,
     _trellis256_dense_split_k_slices,
+    run_trellis256_dense,
 )
 
 _MCG = np.uint64(0xCBAC1FED)
@@ -1008,3 +1009,111 @@ def test_dense_whole_tile_rows_do_not_depend_on_planned_m() -> None:
     torch.cuda.synchronize(device)
     for m, out in outputs.items():
         assert torch.equal(out, outputs[512][:m])
+
+
+def _split_k_pair(device):
+    """One weight, two split-K plans of the same M: the same lock slots."""
+    size_k, size_n = 4096, 1024
+    trellis = torch.randint(
+        -32768,
+        32767,
+        (size_k // 16, size_n // 16, 96),
+        dtype=torch.int16,
+        device=device,
+    )
+    weight = _mcg_weight(trellis, torch.bfloat16)
+    xs = [
+        (torch.randn((4, size_k), device=device) * 1.0e-2).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    c_tmps = [
+        torch.empty((1 << 20,), dtype=torch.float32, device=device) for _ in range(2)
+    ]
+    return weight, xs, c_tmps
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_split_k_plans_own_their_lock_counters() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    weight, xs, c_tmps = _split_k_pair(device)
+    with (
+        _prepared_trellis(
+            xs[0],
+            weight,
+            c_tmp=c_tmps[0],
+            hadamard_128=_identity_hadamard,
+            allow_split_k=True,
+        ) as (first, _, _),
+        _prepared_trellis(
+            xs[1],
+            weight,
+            c_tmp=c_tmps[1],
+            hadamard_128=_identity_hadamard,
+            allow_split_k=True,
+        ) as (second, _, _),
+        _prepared_trellis(
+            xs[0], weight, c_tmp=c_tmps[0], hadamard_128=_identity_hadamard
+        ) as (whole, _, _),
+    ):
+        states = [require_prepared(p, "gemm.trellis_linear") for p in (first, second)]
+        assert all(state.split_k_slices is not None for state in states)
+        pointers = {state.locks.data_ptr() for state in states}
+        assert len(pointers) == 2
+        assert weight.workspace.data_ptr() not in pointers
+        assert require_prepared(whole, "gemm.trellis_linear").locks is None
+        for plan, x in zip((first, second), xs):
+            trellis_linear.run(x, plan=plan)
+        torch.cuda.synchronize(device)
+        for state in states:
+            assert int(state.locks.abs().sum()) == 0
+
+        state = states[0]
+        common = {
+            "launch": state.launch,
+            "execution_lut": state.execution_lut,
+            "grid_cap": state.grid_cap,
+            "hadamard_128": state.hadamard_128,
+            "split_k_slices": state.split_k_slices,
+        }
+        with pytest.raises(ValueError, match="its own lock storage"):
+            run_trellis256_dense(xs[0], weight, **common)
+        with pytest.raises(ValueError, match="shared workspace"):
+            run_trellis256_dense(xs[0], weight, locks=weight.workspace, **common)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120/SM121 GPU")
+def test_concurrent_split_k_plans_on_one_weight_match_sequential() -> None:
+    """Two split-K plans of one weight on two streams: no shared lock counters."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    weight, xs, c_tmps = _split_k_pair(device)
+    with (
+        _prepared_trellis(
+            xs[0],
+            weight,
+            c_tmp=c_tmps[0],
+            hadamard_128=_identity_hadamard,
+            allow_split_k=True,
+        ) as (first, _, _),
+        _prepared_trellis(
+            xs[1],
+            weight,
+            c_tmp=c_tmps[1],
+            hadamard_128=_identity_hadamard,
+            allow_split_k=True,
+        ) as (second, _, _),
+    ):
+        plans = (first, second)
+        expected = [trellis_linear.run(x, plan=p).clone() for p, x in zip(plans, xs)]
+        torch.cuda.synchronize(device)
+        streams = [torch.cuda.Stream(device=device) for _ in plans]
+        for stream in streams:
+            stream.wait_stream(torch.cuda.current_stream(device))
+        results = [[], []]
+        for _ in range(32):
+            for index, (stream, plan, x) in enumerate(zip(streams, plans, xs)):
+                with torch.cuda.stream(stream):
+                    results[index].append(trellis_linear.run(x, plan=plan))
+        torch.cuda.synchronize(device)
+        for index in range(2):
+            for out in results[index]:
+                assert torch.equal(out, expected[index])
