@@ -218,6 +218,11 @@ description of [#8806](https://github.com/flashinfer-ai/flashinfer/pull/8806).
   groups of more than 8 ranks: its per-call bookkeeping in shared memory holds
   ranks × local experts ≤ 2048). Across hosts every pair between hosts is a GIN
   pair: `transport` must be `"auto"`, `"nic"` or a table (cake's by default).
+- Spanning hosts does not pay off at 1 token per rank: the cross-host round
+  trips dominate, and EP16 over two hosts is 33–88% slower per layer than EP8 on
+  one host at the same 1 token per rank (DeepSeek-V4.1-Flash and GLM-5.3-Flash,
+  random and balanced routing, RTX 6000D hosts with ConnectX-8 switches). From 8
+  tokens per rank, EP16 is faster with random routing (9–30%).
 - When EP8 goes over the NIC across sockets (`"auto"` on the RTX PRO 6000 host
   and on the ConnectX-8-switch RTX 6000D host), cake can be faster at 128 tokens
   per rank (on RTX PRO 6000: 0.91× for DeepSeek-V4-Flash, 0.85× for GLM-5.3-Flash; on the ConnectX-8 host

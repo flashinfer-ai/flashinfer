@@ -216,13 +216,14 @@ def _worker(rank, args):
     device = rank if args.local_rank is None else args.local_rank
     torch.cuda.set_device(device)
     torch.backends.cuda.matmul.allow_tf32 = False
-    dist.init_process_group(
-        "nccl",
-        rank=rank,
-        world_size=ep,
-        timeout=datetime.timedelta(minutes=10),
-        device_id=torch.device("cuda", device),
-    )
+    if not dist.is_initialized():  # under torchrun the group outlives each test
+        dist.init_process_group(
+            "nccl",
+            rank=rank,
+            world_size=ep,
+            timeout=datetime.timedelta(minutes=10),
+            device_id=torch.device("cuda", device),
+        )
     if args.wide:  # the 32-rank build for a group that fits the default one
         from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync import (
             backend,
@@ -369,7 +370,9 @@ def _worker(rank, args):
     alone.destroy()
     if prequantized is not None:
         prequantized.destroy()
-    dist.destroy_process_group()
+    dist.barrier()
+    if args.local_rank is None:
+        dist.destroy_process_group()
 
 
 def _run(args):
@@ -597,18 +600,21 @@ def test_sm120_nosync_multihost(routing, cake_transport):
     rank, across the switch point."""
     if not _MULTIHOST or "LOCAL_RANK" not in os.environ:
         pytest.skip("run under torchrun with FLASHINFER_TEST_MEGAMOE_SM120_MULTIHOST=1")
-    _worker(
-        int(os.environ["RANK"]),
-        _args(
-            ep=int(os.environ["WORLD_SIZE"]),
-            routing=routing,
-            repeats=3,
-            transport=None,
-            cake_transport=cake_transport,
-            tokens_per_expert=32,
-            local_rank=int(os.environ["LOCAL_RANK"]),
-        ),
+    ep = int(os.environ["WORLD_SIZE"])
+    args = _args(
+        ep=ep,
+        experts=16 * ep,  # 16 local experts: 256 at EP16, also divisible at EP24 / EP32
+        routing=routing,
+        repeats=3,
+        transport=None,
+        cake_transport=cake_transport,
+        tokens_per_expert=32,
+        local_rank=int(os.environ["LOCAL_RANK"]),
     )
+    if routing == "hot":
+        # cake hangs on hot routing at large calls: keep every call on the nosync kernel
+        args.tokens_per_expert = -(-args.capacity * ep * args.topk // args.experts)
+    _worker(int(os.environ["RANK"]), args)
 
 
 @pytest.mark.parametrize("cake_transport", ["all_gin", "lsa_where_reachable"])

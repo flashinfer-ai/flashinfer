@@ -8,6 +8,10 @@ then the timing events around `repeats` back-to-back calls; per round the time i
 median over rounds is reported. --cold-l2 writes 512 MB before every round (with --repeats 1), so the weights come from DRAM as
 in a decode step that walks every layer. Routing: random top-k (--routing random) or balanced (--routing balanced): top-k slot s of global token g goes to
 rank s % EP, local expert (g + 7 s) % E_local, so every rank gets floor or ceil of top-k / EP routes per token.
+--route-calls replays recorded routes instead: rank<r>.pt holds a list of (layer, rows of each rank, expert ids
+[rows, top-k]) per MoE call (e.g. a serving engine's decode steps), one timed call each; --rows n keeps each call's
+first n tokens per rank (the same routing at a smaller batch). Groups across hosts: run the command on every host with
+NODE_RANK (0 on the host of MASTER_ADDR) and --ep = hosts x GPUs per host.
 
     python benchmarks/bench_megamoe_mxfp4_sm120.py --ep 4 --shape flash --cold-l2 --repeats 1 --tokens 1 8 32 128
 """
@@ -116,7 +120,9 @@ def _moe_ep(args, h, ih, experts, topk, generator, raw):
         from flashinfer.moe_ep import NosyncOptions
 
         nosync = NosyncOptions(
-            transport=args.nosync_transport, tokens_per_item=args.tokens_per_item
+            transport=args.nosync_transport,
+            tokens_per_item=args.tokens_per_item,
+            max_tokens_per_expert=args.max_tokens_per_expert,
         )
     layer = MoEEpLayer(
         bootstrap=BootstrapConfig(
@@ -143,13 +149,31 @@ def _moe_ep(args, h, ih, experts, topk, generator, raw):
     return setup, layer.destroy
 
 
-def _worker(rank, args):
-    torch.cuda.set_device(rank)
+def _recorded_calls(args, rank, topk):
+    """(tokens per rank to compile for, expert ids) of each recorded call this rank replays."""
+    first, last = (int(v) for v in args.calls.split(":"))
+    calls = torch.load(os.path.join(args.route_calls, f"rank{rank}.pt"))[first:last]
+    items = []
+    for _, rows, ids in calls:
+        ids = ids.long().reshape(-1, topk)
+        m = max(rows)  # every rank compiles for the largest rank's rows
+        if args.rows:
+            ids, m = ids[: args.rows], min(m, args.rows)
+        items.append((m, ids.cuda()))
+    return items
+
+
+def _worker(local, args):
+    per_host = (
+        torch.cuda.device_count() if args.ep > torch.cuda.device_count() else args.ep
+    )
+    rank = int(os.environ.get("NODE_RANK", "0")) * per_host + local
+    torch.cuda.set_device(local)
     dist.init_process_group(
         "nccl",
         rank=rank,
         world_size=args.ep,
-        device_id=torch.device("cuda", rank),
+        device_id=torch.device("cuda", local),
         timeout=datetime.timedelta(minutes=15),
     )
     h, ih, experts, topk = SHAPES[args.shape]
@@ -177,9 +201,26 @@ def _worker(rank, args):
         else None
     )
     results = []
-    for m in args.tokens:
-        x = torch.randn(m, h, device="cuda", generator=generator, dtype=torch.bfloat16)
-        idx, weights = _routes(args, rank, m, experts, topk, generator)
+    if args.route_calls:
+        items = _recorded_calls(args, rank, topk)
+    else:
+        items = [(m, None) for m in args.tokens]
+    for m, recorded in items:
+        if recorded is None:
+            x = torch.randn(
+                m, h, device="cuda", generator=generator, dtype=torch.bfloat16
+            )
+            idx, weights = _routes(args, rank, m, experts, topk, generator)
+        else:
+            idx = recorded
+            weights = torch.full(idx.shape, 1.0 / topk, device="cuda")
+            x = torch.randn(
+                idx.shape[0],
+                h,
+                device="cuda",
+                generator=generator,
+                dtype=torch.bfloat16,
+            )
         if args.save_routing:  # for another backend's run on identical routes
             os.makedirs(args.save_routing, exist_ok=True)
             torch.save(
@@ -206,13 +247,28 @@ def _worker(rank, args):
             times.append(t.item())
         us = statistics.median(times)
         results.append({"tokens_per_rank": m, "us": us})
+        routing = (
+            "recorded"
+            if args.route_calls
+            else "saved"
+            if args.load_routing
+            else args.routing
+        )
         if rank == 0:
             print(
-                f"{args.backend} {args.shape} EP{args.ep} M={m} routing={'saved' if args.load_routing else args.routing} "
+                f"{args.backend} {args.shape} EP{args.ep} M={m} routing={routing} "
                 f"{'cold' if args.cold_l2 else 'warm'} L2: {us:.1f} us",
                 flush=True,
             )
         del graph
+    if rank == 0 and args.route_calls:
+        us = [r["us"] for r in results]
+        print(
+            f"{args.backend} {args.shape} EP{args.ep} recorded calls {args.calls}: mean "
+            f"{statistics.mean(us):.1f} median {statistics.median(us):.1f} min {min(us):.1f} "
+            f"max {max(us):.1f} us",
+            flush=True,
+        )
     if rank == 0 and args.output:
         with open(args.output, "w") as f:
             json.dump(
@@ -230,8 +286,23 @@ def _worker(rank, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ep", type=int, choices=[2, 4, 8], default=4)
+    parser.add_argument("--ep", type=int, choices=[2, 4, 8, 16, 24, 32], default=4)
     parser.add_argument("--shape", choices=sorted(SHAPES), default="flash")
+    parser.add_argument(
+        "--route-calls",
+        type=str,
+        default="",
+        help="directory of rank<r>.pt recorded routes (see the module docstring)",
+    )
+    parser.add_argument(
+        "--calls", type=str, default="0:40", help="first:last recorded call to replay"
+    )
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=0,
+        help="recorded calls: keep each call's first n tokens per rank (0: all)",
+    )
     parser.add_argument(
         "--tokens", type=int, nargs="+", default=[1, 2, 8, 16, 20, 32, 64]
     )
@@ -280,6 +351,12 @@ if __name__ == "__main__":
         help="nosync: force the work-item width (default: by routed rows per local expert)",
     )
     parser.add_argument(
+        "--max-tokens-per-expert",
+        type=int,
+        default=16,
+        help="nosync: NosyncOptions.max_tokens_per_expert (larger calls run the --fallback backend)",
+    )
+    parser.add_argument(
         "--nosync-transport",
         choices=["p2p", "nic", "auto"],
         default=None,
@@ -290,4 +367,6 @@ if __name__ == "__main__":
         parser.error("cold L2 timing requires --repeats 1")
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29651")
-    torch.multiprocessing.spawn(_worker, args=(args,), nprocs=args.ep)
+    torch.multiprocessing.spawn(
+        _worker, args=(args,), nprocs=min(args.ep, torch.cuda.device_count())
+    )
