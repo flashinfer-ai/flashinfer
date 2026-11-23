@@ -53,7 +53,7 @@ def _load_spdlog_patch():
 
 # moe_ep build infra. Both EP backends are ON BY DEFAULT since the moe_ep
 # runtime deps moved into the base dependencies (`pip install .` is enough):
-#   NCCL-EP  — provided by the `nccl-extensions>=0.1.0` wheel (a base dep
+#   NCCL-EP  — provided by the `nccl-extensions>=0.2.0` wheel (a base dep
 #              now); NO in-tree build. (nccl.ep used to ship in nccl4py;
 #              nccl4py 0.4.1 dropped it — see requirements.txt.)
 #   NIXL-EP  — built in-tree from 3rdparty/nixl (meson). Missing build deps
@@ -281,7 +281,7 @@ def _build_nixl_ep() -> None:
         str(build),
         str(src),
         "-Dbuild_nixl_ep=true",
-        # H100 + B200 + B300 native SASS; upstream also emits PTX for the
+        # SM90, SM100 and SM103 native SASS; upstream also emits PTX for the
         # highest listed arch (compute_103) for forward-compat. Option exists
         # since NIXL v1.2.0 (ai-dynamo/nixl#1639) — replaces the former
         # 0001-meson-add-blackwell-arches.patch overlay.
@@ -488,7 +488,7 @@ def _build_nccl_ep() -> None:
 
     # contrib/nccl_ep's Makefile refuses any gencode below sm_90 (see
     # 3rdparty/nccl/contrib/nccl_ep/Makefile:15). Override NVCC_GENCODE to only
-    # cover the EP-supported arches: sm_90 (H100), sm_100 (B200), sm_103 (B300).
+    # Cover the EP-supported architectures: sm_90, sm_100 and sm_103.
     nccl_ep_gencode = " ".join(
         [
             "-gencode=arch=compute_90,code=sm_90",
@@ -635,7 +635,7 @@ def _ensure_nixl_wheel() -> None:
 
 
 def _ensure_nccl_floor() -> None:
-    """Best-effort upgrade of nvidia-nccl-cu13 to the B200 EP floor (>=2.30.7).
+    """Best-effort upgrade of nvidia-nccl-cu13 to the NCCL EP floor (>=2.30.7).
 
     Deliberately NOT a base dependency: torch's cu13 wheels pin
     nvidia-nccl-cu13 EXACTLY (e.g. ==2.29.7), so declaring a >=2.30.7 floor
@@ -643,7 +643,7 @@ def _ensure_nccl_floor() -> None:
     backtracks to the CPU-only torch wheel. Installing here with --no-deps
     (mirroring the nixl-cu13 pattern) upgrades the wheel without ever
     entering the resolver. Failures only warn: torch's own NCCL is
-    sufficient everywhere except NCCL-EP group-create on B200, and
+    sufficient everywhere except NCCL-EP group creation, and
     moe_ep/_validators.py enforces the floor at runtime with an actionable
     error where it actually matters.
     """
@@ -667,7 +667,7 @@ def _ensure_nccl_floor() -> None:
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(
             f"[BUILD_NVEP] WARNING: could not install {wheel} ({e}). "
-            "NCCL-EP on B200 needs NCCL >= 2.30.7 (group-create fails on "
+            "NCCL-EP needs NCCL >= 2.30.7 (group-create fails on "
             "older releases); the runtime validator will raise there. "
             "Install manually if needed: pip install --no-deps "
             f"'{wheel}'"
@@ -984,15 +984,15 @@ def _build_nvep_if_enabled() -> None:
         )
 
     # NCCL-EP is not built from source — it is provided by the released
-    # `nccl-extensions` wheel (>=0.1.0, the `nccl.ep` API + bundled
+    # `nccl-extensions` wheel (>=0.2.0, the `nccl.ep` API + bundled
     # libnccl_ep.so), which is a base dependency now. So BUILD_NCCL_EP
     # requires no in-tree build step; we only note it here.
     if _BUILD_NCCL_EP:
         print(
-            "[BUILD_NVEP] NCCL-EP is provided by the nccl-extensions wheel (>=0.1.0), "
+            "[BUILD_NVEP] NCCL-EP is provided by the nccl-extensions wheel (>=0.2.0), "
             "a base dependency of flashinfer-python; no in-tree build."
         )
-        # torch's cu13 wheels pin nvidia-nccl-cu13 exactly (< the B200 EP
+        # torch's cu13 wheels pin nvidia-nccl-cu13 exactly (< the NCCL EP
         # floor), so upgrade it out-of-band; best-effort by design.
         _ensure_nccl_floor()
 

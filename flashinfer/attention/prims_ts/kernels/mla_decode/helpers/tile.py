@@ -20,9 +20,14 @@ from cutlass import Int32
 
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
+from ...mask import kv_tile_needs_right_mask
 from .context_parallel import local_kv_length
-from .layout import _TASK_CACHE_SEQ_LEN_KV, _TASK_CACHE_LOCAL_KV_TILES
-from .mask import MaskType, mask_visible_k_length
+from .layout import (
+    _TASK_CACHE_KV_VISIBLE_END,
+    _TASK_CACHE_LOCAL_KV_TILES,
+    _TASK_CACHE_SEQ_LEN_KV,
+)
+from .mask import MaskType, mask_visible_k_length, rows_have_distinct_kv_prefix
 from .query import (
     flat_query_row_state,
     query_batch_bounds,
@@ -426,6 +431,55 @@ def runtime_seq_len_kv_for_query_row(
         logical_q_idx,
         cu_seqlens_q,
         cp_rank,
+    )
+
+
+def cta_rows_have_distinct_kv_prefix(cfg: MlaConfig) -> bool:
+    """Return whether query rows of one 1CTA tile can see different K prefixes."""
+    return rows_have_distinct_kv_prefix(
+        cfg.mask_type, not cfg.fixed_seqlen, cfg.logical_seq_len_q
+    )
+
+
+@cute.jit
+def cta_visible_kv_end(
+    cfg: MlaConfig,
+    cache_seqs,
+    batch_idx,
+    cta_idx_q,
+    cu_seqlens_q=None,
+    cp_rank=0,
+):
+    """Return the keys ``[0, end)`` visible to every query row of one 1CTA tile.
+
+    Computed once per work tile (``MlaDecodeTask.get_domain``) for tiles whose
+    rows see different prefixes. Bottom-right causal prefixes, and their
+    rank-local counts under context parallelism, are nondecreasing in the flat
+    query row, so the tile's first row has the shortest prefix.
+    """
+    return runtime_seq_len_kv_for_query_row(
+        cfg,
+        cache_seqs,
+        batch_idx,
+        cta_idx_q,
+        Int32(0),
+        cu_seqlens_q,
+        cp_rank,
+    )
+
+
+@cute.jit
+def kv_tile_needs_mask(cfg: MlaConfig, task_cache, tile_offset_k, seq_len_kv):
+    """Return whether the K tile at ``tile_offset_k`` reaches past a visible key.
+
+    Rows with distinct prefixes test the work tile's cached common prefix
+    (``_TASK_CACHE_KV_VISIBLE_END``); otherwise every row sees ``seq_len_kv``.
+    """
+    visible_k_end = seq_len_kv
+    if cutlass.const_expr(cta_rows_have_distinct_kv_prefix(cfg)):
+        visible_k_end = Int32(task_cache[_TASK_CACHE_KV_VISIBLE_END])
+    return kv_tile_needs_right_mask(
+        tile_offset_k, Int32(cfg.tile_size_kv), visible_k_end
     )
 
 

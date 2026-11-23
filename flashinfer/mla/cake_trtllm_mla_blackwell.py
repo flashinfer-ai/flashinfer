@@ -29,14 +29,19 @@ limitations under the License.
 # the host-known geometries whose production route keys on them
 # (``exact_route_candidate``).
 #
-# The value-split, generic CLC and FP8 page-64 programs derive each query row's
-# request (``row // q_len``), causal KV length
+# The value-split, generic CLC, FP8 page-64 and split-KV programs derive each query
+# row's request (``row // q_len``), causal KV length
 # (``max(seq_lens[b] - q_len + row % q_len + 1, 0)``) and pages from the caller's
 # ``seq_lens`` and ``block_tables`` on the device, after their programmatic
 # dependency wait, so nothing about the request values is cached on the host; a
 # generic CLC launch of ``num_sms // 2 < rows <= 1024`` rows is preceded by a small
-# program that writes its longest-first work order.  Ragged value-split calls,
-# the exact-geometry and native split-KV programs and the generic tails read
+# program that writes its longest-first work order.  The split-KV program cuts each
+# row's KV tiles into ``num_split`` equal ranges (``plan_kv_split``, from host-known
+# sizes and the device only: up to 32 splits, 64 for one query row of long KV) and a
+# reducer program merges the partials in a fixed order; so does the FP8 page-64
+# reducer, whose two builds (``plan_fp8_reduce_ctas``) write the same bits.
+# Ragged value-split calls, the exact-geometry and native split-KV programs and
+# the generic tails read
 # per-row metadata (row -> request, causal KV length, page rows, work order) that
 # the host builds on the device with tensor ops (``_row_plan``).
 #
@@ -50,12 +55,18 @@ import math
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Literal, Optional, Union
+from typing import Any, Literal, NamedTuple, Optional, Union
 
 import torch
 
 from ..jit import env as jit_env
-from ..jit.core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from ..jit.core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+)
 from ..utils import log2e
 
 MODULES: dict[str, dict[str, Any]] = {
@@ -158,6 +169,31 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_26168a31cc8a607d8a15_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835_kernel.cu",
+        "compile_flags": ["--use_fast_math"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
 }
 FAMILIES: dict[str, dict[str, Any]] = {
     "cake_trtllm_mla_blackwell_family_3542f15da2f1ae0fc00c": {
@@ -244,11 +280,14 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_c465664ad1dad4f5",
             "-DCAKE_VARIANT_NS_0=variant_cake_trtllm_mla_blackwell_88179fe5ff3ecd4952de_sm_103a_24d3bb8e20ac",
             "-DCAKE_VARIANT_NS_1=variant_cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29_sm_103a_475cfbbf5b57",
+            "-DCAKE_VARIANT_NS_2=variant_cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835_sm_103a_475cfbbf5b57",
             "-DCAKE_PROGRAM_KERNEL_1=kernel_cake_trtllm_mla_blackwell_af1a9fc22424703e2072",
+            "-DCAKE_FP8_HEAD_REDUCE_MAX_ROWS=2",
         ],
         "dependencies": [
             "cake_trtllm_mla_blackwell_af1a9fc22424703e2072",
             "cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29",
+            "cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835",
         ],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_fp8_page64_pdl",
@@ -278,6 +317,18 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "dependencies": ["cake_trtllm_mla_blackwell_c5f637fcd75d965a649f"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_tail",
+    },
+    "cake_trtllm_mla_blackwell_family_737d83afed0e56250f2a": {
+        "arch": "sm_100a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_737d83afed0e56250f2a_binding.cu",
+        "dependencies": [
+            "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9",
+            "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
+            "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15",
+            "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc",
+        ],
+        "compile_flags": ["-std=c++17"],
+        "domain": "mla_bf16_splitkv",
     },
     "cake_trtllm_mla_blackwell_family_73c2aeebeee855cabb5c": {
         "arch": "sm_103a",
@@ -356,6 +407,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "dependencies": [
             "cake_trtllm_mla_blackwell_9b61e7b02cfb810aec3e",
             "cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29",
+            "cake_trtllm_mla_blackwell_3fe1f0c71bfd4d0f4835",
         ],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_fp8_page64_pdl",
@@ -366,6 +418,27 @@ FAMILIES: dict[str, dict[str, Any]] = {
         "dependencies": ["cake_trtllm_mla_blackwell_5e0f8dc7a9ea5462743e"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_fp8_p32_qk_l2",
+    },
+    "cake_trtllm_mla_blackwell_family_d5290af7ebbae835455a": {
+        "arch": "sm_103a",
+        "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_737d83afed0e56250f2a_binding.cu",
+        "binding_flags": [
+            "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_d5290af7ebbae835455a",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_01a8ed8aa21db44c",
+            "-DCAKE_VARIANT_NS_0=variant_cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9_sm_103a_32a1975e851a",
+            "-DCAKE_VARIANT_NS_1=variant_cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed_sm_103a_b314ebedc258",
+            "-DCAKE_VARIANT_NS_2=variant_cake_trtllm_mla_blackwell_26168a31cc8a607d8a15_sm_103a_b314ebedc258",
+            "-DCAKE_VARIANT_NS_3=variant_cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc_sm_103a_b314ebedc258",
+            "-DCAKE_SPLITKV_PREFETCH_ALL_MAX_ROWS=7",
+        ],
+        "dependencies": [
+            "cake_trtllm_mla_blackwell_fbf16857022e32d4d9a9",
+            "cake_trtllm_mla_blackwell_be9225dfb9d6e35904ed",
+            "cake_trtllm_mla_blackwell_26168a31cc8a607d8a15",
+            "cake_trtllm_mla_blackwell_7d583eccd1e76da0e7bc",
+        ],
+        "compile_flags": ["-std=c++17"],
+        "domain": "mla_bf16_splitkv",
     },
     "cake_trtllm_mla_blackwell_family_df126547928223b70b63": {
         "arch": "sm_103a",
@@ -436,6 +509,8 @@ ROUTES: dict[str, str] = {
     "mla_bf16_clc_order__sm_103a": "cake_trtllm_mla_blackwell_family_35f852e8fbf6c5633089",
     "mla_bf16_native_split8_pdl__sm_100a": "cake_trtllm_mla_blackwell_family_58aaa55b459e12fb35b8",
     "mla_bf16_native_split8_pdl__sm_103a": "cake_trtllm_mla_blackwell_family_3fa9fe12db6254809466",
+    "mla_bf16_splitkv__sm_100a": "cake_trtllm_mla_blackwell_family_737d83afed0e56250f2a",
+    "mla_bf16_splitkv__sm_103a": "cake_trtllm_mla_blackwell_family_d5290af7ebbae835455a",
     "mla_bf16_tail__sm_100a": "cake_trtllm_mla_blackwell_family_69765950411de111b0b4",
     "mla_bf16_tail__sm_103a": "cake_trtllm_mla_blackwell_family_6e7d2a25e57e51cfa70f",
     "mla_bf16_vhalf__sm_100a": "cake_trtllm_mla_blackwell_family_964aa840394fcd0656c0",
@@ -572,6 +647,29 @@ def launch_family(domain: str, arch: str, num_sms: int, work_items: int) -> str:
     return family_for(domain, arch, num_sms)
 
 
+def _uses_work_order(num_sms: int, total_q: int) -> bool:
+    """Whether a generic CLC launch of ``total_q`` rows takes the device work order:
+    more rows than one wave of clusters and at most ``_MAX_ORDERED_ROWS`` rows."""
+    return max(1, num_sms // _CLUSTER_SIZE) < total_q <= _MAX_ORDERED_ROWS
+
+
+def launch_families(
+    domain: str, arch: str, num_sms: int, total_q: int
+) -> tuple[str, ...]:
+    """The families a launch of ``total_q`` rows of ``domain`` runs, in launch order.
+
+    The attention family (``launch_family``), preceded by the longest-first order
+    family when the launched binding is the generic CLC binding and the launch
+    takes the device work order.
+    """
+    family = launch_family(domain, arch, num_sms, total_q)
+    if FAMILIES[family]["binding"] == _CLC_BINDING and _uses_work_order(
+        num_sms, total_q
+    ):
+        return (family_for(DOMAIN_BF16_CLC_ORDER, arch, num_sms), family)
+    return (family,)
+
+
 # --- Device facts (cached once per device index) ------------------------------------
 
 
@@ -606,6 +704,42 @@ _MAX_ORDERED_ROWS = 1024
 _ORDER_ROWS_PER_CTA = 64
 # Split-KV partials, KV-length reads and the row plans of recent request identities.
 _WORKSPACE_CACHE_CAPACITY = 32
+# Devices on which the split-KV program serves aligned BF16 decode, keyed by
+# (arch, SM count): the smallest max_seq_len and the largest query-row count
+# (batch * q_len) at which it measured faster than the value-split program it
+# replaces on that device.  The smallest max_seq_len is a tuning-bucket edge
+# (``_round_to_seq_len_bucket``), so every max_seq_len of a bucket selects one
+# domain.  A device that is not listed never selects it.  Change a range by
+# editing its entry below (the auto offer table's units must keep their domain;
+# its consistency test checks both edges of every listed max_seq_len bucket).
+_SPLITKV_RANGE: dict[tuple[str, int], tuple[int, int]] = {
+    # B200 and GB300: every measured cell of max_seq_len buckets 4096 to 16384
+    # (1 to 18 query rows, page 32 and 64, uniform, varied, padded and sink
+    # lengths) ran faster than the value-split program beyond noise; bucket 2048
+    # had slower cells up to its upper edge, so the range starts at bucket 4096.
+    # Measured with q_len 1 and 2 and KV lengths 4096, 8192 and 16384 only: other
+    # q_len values and KV lengths 2049 to 4095 are not measured yet.
+    ("sm_100a", 148): (2049, 18),
+    ("sm_103a", 152): (2049, 18),
+}
+# Most KV splits the split-KV reducers merge (the binding's CAKE_SPLITKV_MAX_SPLIT).
+_SPLITKV_MAX_SPLIT = 64
+# Most KV splits below the device's _SPLITKV_WIDE_MIN_SEQ_LEN or above
+# _SPLITKV_WIDE_MAX_ROWS query rows (the binding's CAKE_SPLITKV_NARROW_MAX_SPLIT).  At
+# 32 splits, one query row uses 32 of the 74 (B200) or 76 (GB300) resident clusters;
+# from the listed max_seq_len on, one query row measured faster at up to 64 splits.
+# Below it, and at two query rows (37 or 38 splits), rows much shorter than
+# max_seq_len measured slower than at 32 splits: each split of such a row holds one or
+# two KV tiles, or none.  On GB300 that held up to max_seq_len 65536 (rows of 8192 to
+# 16384 tokens), on B200 up to 32768.  A device that is not listed keeps 32 splits.
+# ``plan_kv_split`` compares the KV tiles of max_seq_len (a multiple of _KV_TILE
+# tokens) with the device's start.
+_SPLITKV_NARROW_MAX_SPLIT = 32
+_SPLITKV_WIDE_MIN_SEQ_LEN: dict[tuple[str, int], int] = {
+    ("sm_100a", 148): 65536,
+    ("sm_103a", 152): 131072,
+}
+_SPLITKV_WIDE_MAX_ROWS = 1
 
 DOMAIN_BF16_NATIVE_SPLIT8 = "mla_bf16_native_split8_pdl"
 DOMAIN_BF16_VQUARTER = "mla_bf16_vquarter"
@@ -617,6 +751,9 @@ DOMAIN_BF16_CLC_EXACT007826 = "mla_bf16_clc_exact007826"
 DOMAIN_BF16_CLC_ONE_WAVE = "mla_bf16_clc_one_wave"
 # Route domain of the program writing a generic CLC launch's longest-first work order.
 DOMAIN_BF16_CLC_ORDER = "mla_bf16_clc_order"
+# Stateless split-KV decode of long KV with few query rows: a mainloop deriving its
+# rows on the device and a reducer applying the sink and bmm2_scale.
+DOMAIN_BF16_SPLITKV = "mla_bf16_splitkv"
 _CLC_DOMAINS = (
     DOMAIN_BF16_CLC,
     DOMAIN_BF16_CLC_EXACT007790,
@@ -651,9 +788,11 @@ def _binding(name: str) -> str:
 # the generic CLC binding (also serving the exact-geometry routes of the sm_100a and
 # 152-SM sm_103a modules) and the FP8 page-64 binding take the caller's ``seq_lens``
 # and ``block_tables``; the value-split bindings (mapped to their value-split count)
-# take them too, plus the per-row metadata of a ragged call; every other aligned
-# binding takes the host-built row plan.
+# take them too, plus the per-row metadata of a ragged call; the split-KV binding
+# takes them (non-ragged only); every other aligned binding takes the host-built
+# row plan.
 _CLC_BINDING = _binding("df17a573e48e469242d2")
+_SPLITKV_BINDING = _binding("737d83afed0e56250f2a")
 _FP8_PAGE64_BINDING = _binding("c461bee2a4bb9454ff11")
 _VALUE_SPLIT_BINDINGS = {
     _binding("5b3d4b45f82fac17edbd"): 4,
@@ -780,21 +919,29 @@ def select_domain(
     table_width: int,
     kv_lens: Optional[tuple[int, ...]],
     num_sms: int,
+    arch: Optional[str] = None,
 ) -> str:
     """Pick the generated domain in the production dispatcher's order.
 
     ``kv_lens`` is required when ``exact_route_candidate`` holds for the geometry
     (the host read it once for this input identity); ``None`` otherwise, or under
     stream capture, where the runtime-shape domains serve the request.
+
+    ``arch`` (with ``num_sms``) names the device; the split-KV domain serves only
+    the devices ``_SPLITKV_RANGE`` lists, so a call without ``arch`` never selects
+    it.
     """
-    aligned = (
+    # Of the aligned programs only FP8 page 64 writes the LSE (base 2, from both
+    # its one-split producer and its reducer); every other one leaves LSE
+    # requests to the generic tail.
+    aligned_lse = (
         num_heads == _ALIGNED_HEADS
         and qk_dim == _ALIGNED_QK_DIM
         and value_dim == _ALIGNED_VALUE_DIM
         and topk == 0
         and uses_shared_paged_kv_idx
-        and not wants_lse
     )
+    aligned = aligned_lse and not wants_lse
     dims_match = (qk_nope_head_dim, value_dim, qk_dim - value_dim) == _ALIGNED_DIMS
     if dtype == torch.bfloat16 and aligned:
         if kv_lens is not None and dims_match and not ragged_query and not skip_softmax:
@@ -813,6 +960,12 @@ def select_domain(
                 tiles = [(length + _KV_TILE - 1) // _KV_TILE for length in rows]
                 if _pick_num_split(total_q, tiles, num_sms) == _NATIVE_SPLIT:
                     return DOMAIN_BF16_NATIVE_SPLIT8
+        if arch is not None and dims_match and not ragged_query and not skip_softmax:
+            # Long KV with few query rows: one wave of clusters splits each row's
+            # KV tiles.  Sinks, page 64, bmm2_scale != 1 and any q_len included.
+            limits = _SPLITKV_RANGE.get((arch, num_sms))
+            if limits is not None and max_seq_len >= limits[0] and total_q <= limits[1]:
+                return DOMAIN_BF16_SPLITKV
         resident = max(1, num_sms // _CLUSTER_SIZE)
         if enable_sink or total_q * 4 <= resident:
             return DOMAIN_BF16_VQUARTER
@@ -861,7 +1014,7 @@ def select_domain(
         return DOMAIN_FP8_P32
     if (
         dtype == torch.float8_e4m3fn
-        and aligned
+        and aligned_lse
         and page_size == 64
         and not ragged_query
         and not enable_sink
@@ -876,12 +1029,175 @@ def select_domain(
     return DOMAIN_BF16_TAIL if dtype == torch.bfloat16 else DOMAIN_FP8_TAIL
 
 
+# The reasons a request took a generic tail program in this process
+# (``_warn_generic_tail``): each is logged once.
+_TAIL_WARNED: set[str] = set()
+
+
+def generic_tail_reason(
+    *,
+    dtype: torch.dtype,
+    num_heads: int,
+    qk_dim: int,
+    value_dim: int,
+    qk_nope_head_dim: int,
+    page_size: int,
+    topk: int,
+    uses_shared_paged_kv_idx: bool,
+    ragged_query: bool,
+    enable_sink: bool,
+    skip_softmax: bool,
+    wants_lse: bool,
+) -> str:
+    """Why ``select_domain`` sends a request to a generic tail program: the
+    first request feature, in the dispatcher's order, that no aligned program
+    serves."""
+    if topk > 0:
+        return "sparse top-k"
+    if (
+        num_heads != _ALIGNED_HEADS
+        or qk_dim != _ALIGNED_QK_DIM
+        or value_dim != _ALIGNED_VALUE_DIM
+        or (qk_nope_head_dim, value_dim, qk_dim - value_dim) != _ALIGNED_DIMS
+    ):
+        dims = (qk_nope_head_dim, value_dim, qk_dim - value_dim)
+        return f"{num_heads} heads of dimensions {dims}"
+    if not uses_shared_paged_kv_idx:
+        return "separate K and V page indices"
+    if dtype == torch.bfloat16:
+        return "BF16 with LSE output" if wants_lse else "this BF16 configuration"
+    if page_size != 64:
+        return "FP8 with page size 32" + (" and LSE output" if wants_lse else "")
+    if enable_sink:
+        return "FP8 with sinks"
+    if ragged_query:
+        return "FP8 with a compact variable-length query"
+    if skip_softmax:
+        return "FP8 with skip-softmax"
+    return "this FP8 configuration"
+
+
+def _warn_generic_tail(reason: str) -> None:
+    """Log once per reason and process that an explicit ``backend="cake"`` call
+    runs a generic tail program."""
+    if reason in _TAIL_WARNED:
+        return
+    _TAIL_WARNED.add(reason)
+    logger.warning(
+        "[MLA] backend='cake' runs the generic tail program for %s: a scalar "
+        "reference program that takes milliseconds per call where the tuned "
+        "programs take microseconds. backend='auto' selects a tuned backend "
+        "for such requests. Logged once per reason.",
+        reason,
+    )
+
+
+# The FP8 page-64 split reducer has two builds that write the same O and LSE bits.  The
+# eight-head-slice build (the binding's CAKE_VARIANT_NS_1) runs at most 16 busy CTAs per
+# query row; the head build (CAKE_VARIANT_NS_2) spreads a row's 128 heads over up to
+# _FP8_HEAD_REDUCE_MAX_CTAS CTAs, each staging its partial rows (ceil(128 / CTAs) heads x
+# num_split splits, at most _FP8_HEAD_REDUCE_MAX_ITEMS) once in shared memory, with one CTA
+# per SM.  On B200 (sm_100a) and GB300 (sm_103a) the head build measured faster at one
+# and two query rows, where the slice build leaves most SMs idle, and slower at four
+# query rows (on GB300 from three); at one and two rows it is slower below about eight
+# splits per row, where each CTA has little to merge.
+# Most query rows the head build serves, per architecture (the binding's
+# CAKE_FP8_HEAD_REDUCE_MAX_ROWS: its default is the sm_100a value, the sm_103a module sets
+# its own); an unlisted architecture never takes the head build.
+_FP8_HEAD_REDUCE_MAX_ROWS: dict[str, int] = {"sm_100a": 2, "sm_103a": 2}
+# Fewest splits per query row (``num_split >= _FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW *
+# work_items``), most CTAs per query row and most staged partial rows per CTA of the head
+# build (the binding's CAKE_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW, _MAX_CTAS and _MAX_ITEMS).
+_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW = 8
+_FP8_HEAD_REDUCE_MAX_CTAS = 128
+_FP8_HEAD_REDUCE_MAX_ITEMS = 112
+
+
 def plan_num_split(work_items: int, max_seq_len: int, num_sms: int) -> int:
-    """Split-K factor of the FP8 page-64 producer from host-known sizes."""
+    """Split-K factor of the FP8 page-64 producer from host-known sizes.
+
+    At most one wave of clusters over all work items (``work_items * split <=
+    num_sms // 2``) and at most half the KV tiles of a ``max_seq_len`` row,
+    rounded up; at least one. One split launches the producer alone: its
+    ``num_split == 1`` path writes the normalized output and the LSE, so the
+    reducer does not run.
+    """
     max_tiles = max(1, (max_seq_len + _KV_TILE - 1) // _KV_TILE)
     cap = max(1, (max_tiles + 1) // 2)
     target = max(1, num_sms // max(1, work_items * _CLUSTER_SIZE))
-    return max(2, min(cap, target, max_tiles))
+    return min(cap, target)
+
+
+def fp8_head_reduce(work_items: int, num_split: int, num_ctas: int, arch: str) -> bool:
+    """Whether the FP8 page-64 binding launches the head build of the split
+    reducer for ``work_items`` query rows, ``num_split`` splits and ``num_ctas``
+    reducer CTAs per row: at most ``_FP8_HEAD_REDUCE_MAX_ROWS[arch]`` rows, at
+    least ``_FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW * work_items`` splits, 1 to
+    ``_FP8_HEAD_REDUCE_MAX_CTAS`` CTAs, and a CTA's partial rows
+    (``ceil(128 / num_ctas)`` heads x ``num_split`` splits) within
+    ``_FP8_HEAD_REDUCE_MAX_ITEMS``.  The binding makes the same test with its
+    module's compile definitions."""
+    return (
+        work_items <= _FP8_HEAD_REDUCE_MAX_ROWS.get(arch, 0)
+        and num_split >= _FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW * work_items
+        and 1 <= num_ctas <= _FP8_HEAD_REDUCE_MAX_CTAS
+        and -(-_ALIGNED_HEADS // num_ctas) * num_split <= _FP8_HEAD_REDUCE_MAX_ITEMS
+    )
+
+
+def plan_fp8_reduce_ctas(
+    work_items: int, num_split: int, num_sms: int, arch: str
+) -> int:
+    """Reducer CTA count (``num_reduce_ctas``) of an FP8 page-64 launch from
+    host-known sizes.
+
+    Where the binding launches the head build with it (``fp8_head_reduce``),
+    ``min(_FP8_HEAD_REDUCE_MAX_CTAS, num_sms // work_items)`` CTAs per query
+    row; otherwise the slice build's ``min(64, num_sms // work_items)``.  The
+    slice count is never above the head count, and fewer CTAs stage more
+    partial rows each, so the binding launches the slice build with it.
+    """
+    slice_ctas = min(64, max(1, (num_sms * 2) // max(1, work_items * 2)))
+    if (
+        work_items > _FP8_HEAD_REDUCE_MAX_ROWS.get(arch, 0)
+        or num_split < _FP8_HEAD_REDUCE_MIN_SPLIT_PER_ROW * work_items
+    ):
+        return slice_ctas
+    head_ctas = min(_FP8_HEAD_REDUCE_MAX_CTAS, max(1, num_sms // max(1, work_items)))
+    if fp8_head_reduce(work_items, num_split, head_ctas, arch):
+        return head_ctas
+    return slice_ctas
+
+
+def plan_kv_split(
+    total_q: int, max_seq_len: int, num_sms: int, arch: Optional[str] = None
+) -> int:
+    """KV split count of the split-KV program from host-known sizes.
+
+    At most one wave of clusters (``total_q * split <= num_sms // 2``) and at
+    most ``_SPLITKV_NARROW_MAX_SPLIT`` splits, or ``_SPLITKV_MAX_SPLIT`` for at
+    most ``_SPLITKV_WIDE_MAX_ROWS`` query rows whose ``max_seq_len`` KV tiles
+    hold at least the ``_SPLITKV_WIDE_MIN_SEQ_LEN`` tokens of the device
+    (``arch``, ``num_sms``; an unlisted device or ``arch=None`` keeps
+    ``_SPLITKV_NARROW_MAX_SPLIT``); then the smallest count with the same tiles
+    per split, so every split of a ``max_seq_len`` row holds equal work.  The
+    program cuts each row's own KV tiles into at most that many equal ranges on
+    the device; a row with fewer tiles than splits leaves its last splits
+    empty.  The count depends on
+    ``max_seq_len`` only through its KV tile count, which the ``backend="auto"``
+    decision memo keys on.
+    """
+    resident = max(1, num_sms // _CLUSTER_SIZE)
+    tiles = max(1, (max_seq_len + _KV_TILE - 1) // _KV_TILE)
+    wide_min = _SPLITKV_WIDE_MIN_SEQ_LEN.get((arch, num_sms))
+    wide = (
+        wide_min is not None
+        and total_q <= _SPLITKV_WIDE_MAX_ROWS
+        and tiles * _KV_TILE >= wide_min
+    )
+    cap = _SPLITKV_MAX_SPLIT if wide else _SPLITKV_NARROW_MAX_SPLIT
+    split = min(cap, max(1, resident // max(1, total_q)), tiles)
+    return -(-tiles // -(-tiles // split))
 
 
 def _workspace_peek(key: tuple[Any, ...]) -> Optional[dict[str, Any]]:
@@ -947,6 +1263,11 @@ def _fp8_lut(device: torch.device) -> torch.Tensor:
         device,
         torch.tensor(_e4m3_decode_table_values(), dtype=torch.float32, device=device),
     )
+
+
+def _scratch(key: tuple[Any, ...], build, stateless: bool) -> dict[str, Any]:
+    """Split-KV scratch: cached per shape, or allocated on the current stream per call."""
+    return build() if stateless else _workspace(key, build)
 
 
 def row_metadata(
@@ -1055,6 +1376,7 @@ def _row_plan(
     total_q: int,
     page_size: int,
     topk: int,
+    stateless: bool = False,
 ) -> dict[str, torch.Tensor]:
     """The per-row metadata a binding's kernels read, built once per input identity.
 
@@ -1063,8 +1385,8 @@ def _row_plan(
     KV length is positive there), ``"rows"`` the request and causal KV length of each
     row of a ragged value-split call, ``"tail"`` those of the generic tails with
     negative lengths clamped to zero (a padded row outputs zeros).  The value-split,
-    generic CLC and FP8 page-64 programs derive their rows on the device and take
-    no plan otherwise.
+    generic CLC, FP8 page-64 and split-KV programs derive their rows on the device
+    and take no plan otherwise.
 
     As in the production path, the rows are derived when a request's tensors
     (storage address, in-place version counter, shape and strides) first appear
@@ -1073,6 +1395,7 @@ def _row_plan(
     version counter and rebuild the plan; writes that bypass torch must pass
     fresh tensors.  Under stream capture a plan built before capture is reused;
     a new identity's metadata is recomputed inside the graph and not cached.
+    ``stateless`` rebuilds the plan on the current stream and caches nothing.
     """
 
     def build() -> dict[str, torch.Tensor]:
@@ -1106,6 +1429,8 @@ def _row_plan(
             )
         return state
 
+    if stateless:
+        return build()
     key = (
         "plan",
         layout,
@@ -1138,6 +1463,329 @@ def _work_order_buffer(device: torch.device, stream: int) -> torch.Tensor:
             )
             _WORK_ORDER_BUFFERS[key] = buffer
         return buffer
+
+
+# Kinds of ``DeviceRowLaunch``: the bindings that derive their rows on the device.
+_LAUNCH_CLC = 0
+_LAUNCH_VALUE_SPLIT = 1
+_LAUNCH_FP8_PAGE64 = 2
+_LAUNCH_SPLITKV = 3
+
+
+class DeviceRowLaunch(NamedTuple):
+    """The host-known part of a launch of a binding that derives its rows on the
+    device (generic CLC, value-split, FP8 page 64, split-KV): the families and
+    the scalar kernel arguments, a pure function of the request's sizes and
+    scales (``device_row_launch``). ``launch_device_rows`` adds the tensors,
+    the per-call scratch and the stream."""
+
+    kind: int
+    family: str
+    # Generic CLC: the longest-first order family when the launch takes the
+    # device work order, else ``None``.
+    order_family: Optional[str]
+    order_ctas: int
+    # The scalar arguments between the sink pointer (or, FP8 page 64 and
+    # split-KV, the partial statistics) and the per-call arguments.
+    args: tuple
+    num_heads: int
+    q_len: int
+    total_q: int
+    # Value split: 1 for page 64 (two 32-token halves per page), else 0.
+    page_shift: int
+    # FP8 page 64: (work items, split-K count) of the scratch; split-KV:
+    # (query rows, KV split count).
+    scratch: Optional[tuple]
+
+
+def device_row_launch(
+    domain: str,
+    family: str,
+    *,
+    arch: str,
+    num_sms: int,
+    num_heads: int,
+    has_sink: bool,
+    softmax_scale_log2: float,
+    bmm2: float,
+    total_q: int,
+    batch_size: int,
+    q_len: int,
+    table_width: int,
+    page_size: int,
+    max_seq_len: int,
+) -> Optional[DeviceRowLaunch]:
+    """The launch of ``family`` (serving ``domain``) when its binding derives
+    the rows on the device, else ``None`` (the binding reads a host-built row
+    plan). The branch order is the dispatcher's: the generic CLC, value-split
+    and split-KV bindings by binding, FP8 page 64 after the exact-length
+    domains."""
+    binding = FAMILIES[family]["binding"]
+    if binding == _CLC_BINDING:
+        # One persistent work item per query row (non-ragged, page 32).  A launch of
+        # more rows than one wave of clusters and at most _MAX_ORDERED_ROWS rows takes
+        # the longest-first order the order program writes right before it on this
+        # stream; every other launch keeps the launch order (null work order).
+        use_work_order = _uses_work_order(num_sms, total_q)
+        return DeviceRowLaunch(
+            kind=_LAUNCH_CLC,
+            family=family,
+            order_family=(
+                family_for(DOMAIN_BF16_CLC_ORDER, arch, num_sms)
+                if use_work_order
+                else None
+            ),
+            order_ctas=-(-total_q // _ORDER_ROWS_PER_CTA),
+            args=(
+                softmax_scale_log2,
+                bmm2,
+                total_q,
+                q_len,
+                table_width,
+                int(has_sink),
+                2 * q_len,
+                batch_size,
+            ),
+            num_heads=num_heads,
+            q_len=q_len,
+            total_q=total_q,
+            page_shift=0,
+            scratch=None,
+        )
+    if binding in _VALUE_SPLIT_BINDINGS:
+        # Pages are the caller's block_tables entries (page_shift: page 64 = two
+        # 32-token halves).
+        split = _VALUE_SPLIT_BINDINGS[binding]
+        work = total_q * split
+        resident = max(1, num_sms // _CLUSTER_SIZE)
+        return DeviceRowLaunch(
+            kind=_LAUNCH_VALUE_SPLIT,
+            family=family,
+            order_family=None,
+            order_ctas=0,
+            args=(
+                softmax_scale_log2,
+                bmm2,
+                work,
+                split,
+                table_width,
+                int(has_sink),
+                min(work, resident) * 2,
+                1,
+            ),
+            num_heads=num_heads,
+            q_len=q_len,
+            total_q=total_q,
+            page_shift=1 if page_size == 64 else 0,
+            scratch=None,
+        )
+    if binding == _SPLITKV_BINDING:
+        # The program derives each row's request, causal KV length and pages from
+        # seq_lens, q_len and block_tables on the device (non-ragged) and cuts the
+        # row's KV tiles into num_split ranges; the reducer applies the sink and
+        # bmm2_scale.  The split count, grid and scratch shape come from shapes,
+        # max_seq_len and the device facts alone.
+        num_split = plan_kv_split(total_q, int(max_seq_len), num_sms, arch)
+        resident = max(1, num_sms // _CLUSTER_SIZE)
+        return DeviceRowLaunch(
+            kind=_LAUNCH_SPLITKV,
+            family=family,
+            order_family=None,
+            order_ctas=0,
+            args=(
+                softmax_scale_log2,
+                bmm2,
+                num_split,
+                total_q,
+                q_len,
+                1 if page_size == 64 else 0,
+                table_width,
+                int(has_sink),
+                min(total_q * num_split, resident) * _CLUSTER_SIZE,
+            ),
+            num_heads=num_heads,
+            q_len=q_len,
+            total_q=total_q,
+            page_shift=1 if page_size == 64 else 0,
+            scratch=(total_q, num_split),
+        )
+    if (
+        binding == _FP8_PAGE64_BINDING
+        and domain != DOMAIN_BF16_NATIVE_SPLIT8
+        and domain not in _CLC_DOMAINS
+        and domain != DOMAIN_FP8_P32
+    ):
+        # The program derives each row's request, causal KV length and pages from
+        # seq_lens, q_len and block_tables (non-ragged).
+        work_items = total_q
+        num_split = plan_num_split(work_items, int(max_seq_len), num_sms)
+        reduce_ctas = plan_fp8_reduce_ctas(work_items, num_split, num_sms, arch)
+        return DeviceRowLaunch(
+            kind=_LAUNCH_FP8_PAGE64,
+            family=family,
+            order_family=None,
+            order_ctas=0,
+            args=(
+                softmax_scale_log2,
+                bmm2,
+                num_split,
+                work_items,
+                table_width,
+                reduce_ctas,
+                q_len,
+            ),
+            num_heads=num_heads,
+            q_len=q_len,
+            total_q=total_q,
+            page_shift=0,
+            scratch=(work_items, num_split),
+        )
+    return None
+
+
+def launch_device_rows(
+    launch: DeviceRowLaunch,
+    *,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    out: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    sink_arg: Optional[torch.Tensor],
+    device: torch.device,
+    stream: int,
+    stateless: bool,
+    row_batches: Optional[torch.Tensor] = None,
+    row_seq_lens: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+) -> None:
+    """Launch ``launch`` on ``stream``.
+
+    ``sink_arg`` is the sink tensor, or the placeholder the generic CLC and
+    value-split bindings take without a sink (the head prefix of the FP8 decode
+    table), or ``None`` for that placeholder. ``row_batches`` and
+    ``row_seq_lens`` are the per-row metadata of a ragged value-split call
+    (``None``: the program derives them from ``seq_lens`` and ``q_len``).
+    ``stateless`` allocates the work order and the FP8 split-K scratch on the
+    current stream per call; otherwise they are cached per stream and shape.
+    The split-KV scratch is allocated per call under stream capture too, so a
+    captured graph owns its scratch (a cached one could leave the LRU cache
+    while the graph still launches with it). ``lse`` is the caller's
+    contiguous FP32 LSE of the query rows (FP8 page 64 only), which the program
+    writes in base 2; ``None`` writes it to scratch.
+    """
+    run = get_cake_trtllm_mla_blackwell_family(launch.family).run
+    kind = launch.kind
+    if kind == _LAUNCH_SPLITKV:
+        total_q, num_split = launch.scratch
+        state = _scratch(
+            ("splitkv", device, total_q, num_split),
+            lambda: {
+                "partial_output": torch.empty(
+                    (total_q, _ALIGNED_HEADS, num_split, _ALIGNED_VALUE_DIM),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "partial_lse": torch.empty(
+                    (total_q, _ALIGNED_HEADS, num_split),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            },
+            stateless or torch.cuda.is_current_stream_capturing(),
+        )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM),
+            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            seq_lens,
+            block_tables,
+            sink_arg if sink_arg is not None else _fp8_lut(device)[: launch.num_heads],
+            state["partial_output"],
+            state["partial_lse"],
+            *launch.args,
+            stream,
+        )
+        return
+    if kind == _LAUNCH_FP8_PAGE64:
+        work_items, num_split = launch.scratch
+        state = _scratch(
+            ("fp8_page64", device, work_items, num_split),
+            lambda: {
+                "partial_output": torch.empty(
+                    (work_items, num_split, _ALIGNED_HEADS, _ALIGNED_VALUE_DIM),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                "partial_stats": torch.empty(
+                    (work_items, num_split, _ALIGNED_HEADS, 2),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "lse": torch.empty(
+                    (work_items, _ALIGNED_HEADS), dtype=torch.float32, device=device
+                ),
+            },
+            stateless,
+        )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
+            kv_cache.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            state["lse"] if lse is None else lse.reshape(-1, _ALIGNED_HEADS),
+            seq_lens,
+            block_tables.reshape(-1),
+            state["partial_output"],
+            state["partial_stats"],
+            *launch.args,
+            stream,
+        )
+        return
+    if kind == _LAUNCH_CLC:
+        work_order = seq_lens
+        if launch.order_family is not None:
+            work_order = (
+                torch.empty(2 * _MAX_ORDERED_ROWS, dtype=torch.int32, device=device)
+                if stateless
+                else _work_order_buffer(device, stream)
+            )
+            get_cake_trtllm_mla_blackwell_family(launch.order_family).run(
+                seq_lens,
+                work_order,
+                launch.q_len,
+                launch.total_q,
+                launch.order_ctas,
+                stream,
+            )
+        run(
+            query.reshape(-1, _ALIGNED_QK_DIM),
+            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+            out.reshape(-1, _ALIGNED_VALUE_DIM),
+            seq_lens,
+            block_tables,
+            sink_arg if sink_arg is not None else _fp8_lut(device)[: launch.num_heads],
+            *launch.args,
+            work_order,
+            int(launch.order_family is not None),
+            stream,
+        )
+        return
+    ragged = row_batches is not None
+    run(
+        query.reshape(-1, _ALIGNED_QK_DIM),
+        kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
+        out.reshape(-1, _ALIGNED_VALUE_DIM),
+        seq_lens,
+        block_tables,
+        sink_arg if sink_arg is not None else _fp8_lut(device)[: launch.num_heads],
+        *launch.args,
+        row_batches if ragged else seq_lens,
+        row_seq_lens if ragged else seq_lens,
+        int(ragged),
+        launch.q_len,
+        launch.page_shift,
+        stream,
+    )
 
 
 def _check_tensor(
@@ -1205,8 +1853,28 @@ def trtllm_mla_blackwell_decode(
     sparse_mla_top_k_lens: Optional[torch.Tensor],
     enable_dcp: bool,
     backend: Literal["cake"] = "cake",
+    stateless: bool = False,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """Dispatch the generated SM100a/SM103a MLA decode programs."""
+    """Dispatch the generated SM100a/SM103a MLA decode programs.
+
+    By default the host KV lengths and row plans are cached per input identity,
+    and the split-KV scratch per shape (see ``_row_plan``).  ``stateless=True``
+    reads ``seq_lens`` and ``block_tables`` only on the device.  It never reads
+    ``seq_lens`` on the host, so the exact-length programs (native split-KV,
+    exact-geometry CLC, FP8 page-32 producer) never serve it.  It caches no row
+    plan: a ragged value-split or tail call rebuilds its plan on the current
+    stream.  It allocates the split-KV scratch and the work order of a generic
+    CLC launch on the current stream per call, so graphs it is captured into
+    own their buffers.  On the value-split, generic CLC, FP8 page-64 and
+    split-KV programs it launches the same kernels as the default mode, so
+    in-place input updates and CUDA-graph replay with updated inputs stay
+    correct.  The split-KV program allocates its scratch per call under stream
+    capture in the default mode too.  Where
+    ``exact_route_candidate`` holds and the KV lengths select an exact-length
+    program in the default mode, the stateless mode launches the value-split,
+    split-KV or generic CLC program instead, so the two modes can run different
+    kernels on the same inputs.
+    """
     if backend != "cake":
         raise ValueError(f"backend must be 'cake', got {backend!r}")
     if not isinstance(query, torch.Tensor) or not query.is_cuda:
@@ -1348,13 +2016,28 @@ def trtllm_mla_blackwell_decode(
         batch_size=batch_size,
         q_len=q_len,
         table_width=table_width,
-        kv_lens=_host_kv_lens(seq_lens) if candidate else None,
+        kv_lens=_host_kv_lens(seq_lens) if candidate and not stateless else None,
         num_sms=num_sms,
+        arch=arch,
     )
+    if domain in (DOMAIN_BF16_TAIL, DOMAIN_FP8_TAIL):
+        _warn_generic_tail(
+            generic_tail_reason(
+                dtype=query.dtype,
+                num_heads=num_heads,
+                qk_dim=qk_dim,
+                value_dim=value_dim,
+                qk_nope_head_dim=int(qk_nope_head_dim),
+                page_size=page_size,
+                topk=topk,
+                uses_shared_paged_kv_idx=bool(uses_shared_paged_kv_idx),
+                ragged_query=ragged_query,
+                enable_sink=sink is not None,
+                skip_softmax=skip_softmax,
+                wants_lse=lse is not None,
+            )
+        )
     family = launch_family(domain, arch, num_sms, total_q)
-    # The launched binding, not the domain, decides the row inputs: the exact-geometry
-    # routes of the sm_100a and 152-SM sm_103a modules launch the generic CLC binding.
-    binding = FAMILIES[family]["binding"]
     stream = int(torch.cuda.current_stream(device).cuda_stream)
     run = get_cake_trtllm_mla_blackwell_family(family).run
     softmax_scale_log2 = bmm1 * log2e
@@ -1370,78 +2053,50 @@ def trtllm_mla_blackwell_decode(
             total_q=total_q,
             page_size=page_size,
             topk=topk,
+            stateless=stateless,
         )
 
-    if binding == _CLC_BINDING:
-        # One persistent work item per query row (non-ragged, page 32).  A launch of
-        # more rows than one wave of clusters and at most _MAX_ORDERED_ROWS rows takes
-        # the longest-first order the order program writes right before it on this
-        # stream; every other launch keeps the launch order (null work order).
-        use_work_order = max(1, num_sms // _CLUSTER_SIZE) < total_q <= _MAX_ORDERED_ROWS
-        work_order = seq_lens
-        if use_work_order:
-            work_order = _work_order_buffer(device, stream)
-            get_cake_trtllm_mla_blackwell_family(
-                family_for(DOMAIN_BF16_CLC_ORDER, arch, num_sms)
-            ).run(
-                seq_lens,
-                work_order,
-                q_len,
-                total_q,
-                -(-total_q // _ORDER_ROWS_PER_CTA),
-                stream,
-            )
-        run(
-            query.reshape(-1, _ALIGNED_QK_DIM),
-            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
-            out.reshape(-1, _ALIGNED_VALUE_DIM),
-            seq_lens,
-            block_tables,
-            sink if sink is not None else _fp8_lut(device)[:num_heads],
-            softmax_scale_log2,
-            bmm2,
-            total_q,
-            q_len,
-            table_width,
-            int(sink is not None),
-            2 * q_len,
-            batch_size,
-            work_order,
-            int(use_work_order),
-            stream,
-        )
-    elif binding in _VALUE_SPLIT_BINDINGS:
-        # A ragged call passes each row's request and causal KV length; otherwise the
-        # program derives them from seq_lens and q_len (null row arrays).  Pages are
-        # the caller's block_tables entries (page_shift: page 64 = two 32-token halves).
-        split = _VALUE_SPLIT_BINDINGS[binding]
-        work = total_q * split
-        resident = max(1, num_sms // _CLUSTER_SIZE)
-        row_batches = row_seq_lens = seq_lens
-        if ragged_query:
+    device_rows = device_row_launch(
+        domain,
+        family,
+        arch=arch,
+        num_sms=num_sms,
+        num_heads=num_heads,
+        has_sink=sink is not None,
+        softmax_scale_log2=softmax_scale_log2,
+        bmm2=bmm2,
+        total_q=total_q,
+        batch_size=batch_size,
+        q_len=q_len,
+        table_width=table_width,
+        page_size=page_size,
+        max_seq_len=int(max_seq_len),
+    )
+    if device_rows is not None:
+        # The launched binding, not the domain, decides the row inputs
+        # (``device_row_launch``): the exact-geometry routes of the sm_100a and
+        # 152-SM sm_103a modules launch the generic CLC binding. Generic CLC
+        # (non-ragged, page 32), value split, split-KV (non-ragged) and FP8 page
+        # 64 derive each row on the device; a ragged value-split call passes each
+        # row's request and causal KV length.
+        row_batches = row_seq_lens = None
+        if ragged_query and device_rows.kind == _LAUNCH_VALUE_SPLIT:
             plan = row_plan("rows")
             row_batches, row_seq_lens = plan["row_batches"], plan["row_seq_lens"]
-        run(
-            query.reshape(-1, _ALIGNED_QK_DIM),
-            kv_cache.reshape(-1, 32, _ALIGNED_QK_DIM),
-            out.reshape(-1, _ALIGNED_VALUE_DIM),
-            seq_lens,
-            block_tables,
-            sink if sink is not None else _fp8_lut(device)[:num_heads],
-            softmax_scale_log2,
-            bmm2,
-            work,
-            split,
-            table_width,
-            int(sink is not None),
-            min(work, resident) * 2,
-            1,
-            row_batches,
-            row_seq_lens,
-            int(ragged_query),
-            q_len,
-            1 if page_size == 64 else 0,
-            stream,
+        launch_device_rows(
+            device_rows,
+            query=query,
+            kv_cache=kv_cache,
+            out=out,
+            seq_lens=seq_lens,
+            block_tables=block_tables,
+            sink_arg=sink,
+            device=device,
+            stream=stream,
+            stateless=stateless,
+            row_batches=row_batches,
+            row_seq_lens=row_seq_lens,
+            lse=lse,
         )
     elif domain == DOMAIN_BF16_NATIVE_SPLIT8:
         plan = row_plan("table")
@@ -1449,7 +2104,7 @@ def trtllm_mla_blackwell_decode(
         resident = max(1, num_sms // _CLUSTER_SIZE)
         work = total_q * _NATIVE_SPLIT
         grid_x = min(work, resident) * _CLUSTER_SIZE
-        state = _workspace(
+        state = _scratch(
             ("native_split8", device, total_q),
             lambda: {
                 "partial_output": torch.empty(
@@ -1463,6 +2118,7 @@ def trtllm_mla_blackwell_decode(
                     device=device,
                 ),
             },
+            stateless,
         )
         run(
             query.reshape(-1, _ALIGNED_QK_DIM),
@@ -1508,7 +2164,7 @@ def trtllm_mla_blackwell_decode(
         )
     elif domain == DOMAIN_FP8_P32:
         reduction_groups = batch_size * _P32_HEAD_GROUPS * q_len
-        state = _workspace(
+        state = _scratch(
             ("fp8_p32", device, batch_size, q_len),
             lambda: {
                 # The producer's same-kernel reduction leaves every counter at zero.
@@ -1526,6 +2182,7 @@ def trtllm_mla_blackwell_decode(
                     device=device,
                 ),
             },
+            stateless,
         )
         run(
             query.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
@@ -1543,48 +2200,6 @@ def trtllm_mla_blackwell_decode(
             _P32_KV_CTAS,
             softmax_scale_log2,
             bmm2,
-            stream,
-        )
-    elif binding == _FP8_PAGE64_BINDING:
-        # The program derives each row's request, causal KV length and pages from
-        # seq_lens, q_len and block_tables (non-ragged).
-        work_items = total_q
-        num_split = plan_num_split(work_items, int(max_seq_len), num_sms)
-        reduce_ctas = min(64, max(1, (num_sms * 2) // max(1, work_items * 2)))
-        state = _workspace(
-            ("fp8_page64", device, work_items, num_split),
-            lambda: {
-                "partial_output": torch.empty(
-                    (work_items, num_split, _ALIGNED_HEADS, _ALIGNED_VALUE_DIM),
-                    dtype=torch.bfloat16,
-                    device=device,
-                ),
-                "partial_stats": torch.empty(
-                    (work_items, num_split, _ALIGNED_HEADS, 2),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                "lse": torch.empty(
-                    (work_items, _ALIGNED_HEADS), dtype=torch.float32, device=device
-                ),
-            },
-        )
-        run(
-            query.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
-            kv_cache.reshape(-1, _ALIGNED_QK_DIM).view(torch.uint8),
-            out.reshape(-1, _ALIGNED_VALUE_DIM),
-            state["lse"],
-            seq_lens,
-            block_tables.reshape(-1),
-            state["partial_output"],
-            state["partial_stats"],
-            softmax_scale_log2,
-            bmm2,
-            num_split,
-            work_items,
-            table_width,
-            reduce_ctas,
-            q_len,
             stream,
         )
     else:
@@ -1645,6 +2260,7 @@ __all__ = [
     "exact_route_candidate",
     "gen_cake_trtllm_mla_blackwell_family",
     "launch_family",
+    "plan_kv_split",
     "plan_num_split",
     "row_metadata",
     "select_domain",

@@ -14,7 +14,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm100.standard_cutedsl import (
     StandardMxfp8Mxfp4Backend,
 )
 from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
-from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import default_knobs
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import default_knobs
 
 # Explicit phase-interleave profile in the legacy knob dialect.
 PHASE_INTERLEAVE = dict(

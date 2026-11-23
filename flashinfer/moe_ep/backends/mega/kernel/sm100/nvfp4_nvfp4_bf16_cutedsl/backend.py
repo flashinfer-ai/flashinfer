@@ -66,18 +66,16 @@ def _cake_reducer_supported(k, fleet_params: FleetParams) -> bool:
     )
 
 
-@register_mega_kernel(
-    "sm100_nvfp4_nvfp4_bf16_cutedsl", deprecated_aliases=("nvfp4_cutedsl",)
-)
+@register_mega_kernel("sm100_nvfp4_nvfp4_bf16_cutedsl_legacy")
 class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
     supports_output_view = True
 
     def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
-        """Initialize legacy inference state and reject next-only GenPhase."""
+        """Initialize the retained legacy NVFP4 implementation."""
         super().__init__(config)
         if config.kernel_variant != "inference":
             raise MoEEpConfigError(
-                "NVFP4 GenPhase requires kernel_name='sm100_nvfp4_nvfp4_bf16_cutedsl_next'."
+                "NVFP4 GenPhase requires kernel_name='sm100_nvfp4_nvfp4_bf16_cutedsl'."
             )
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
         if config.batch_invariant:
@@ -104,7 +102,7 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
 
     @classmethod
     def kernel_name(cls) -> str:
-        return "sm100_nvfp4_nvfp4_bf16_cutedsl"
+        return "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
         return nvfp4_cutedsl_runtime_requirements(bootstrap)
@@ -174,7 +172,7 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
 
     supports_live_token_tuning = True
     _knob_cache_module = (
-        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+        "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.knob_cache"
     )
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
@@ -246,7 +244,9 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.sm100.cutedsl_megamoe import get_symm_buffer_for_mega_moe
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+            get_symm_buffer_for_mega_moe,
+        )
         from ..common.nvfp4_batch_invariant import nvfp4_batch_invariant_metadata
 
         k = self._kernel_config
@@ -372,8 +372,7 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
                 batch_invariant=self._kernel_config.batch_invariant,
             )
         else:
-            # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
-            from ......kernel_src.sm100.cutedsl_megamoe import (
+            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
                 Nvfp4BlockSize,
                 ceil_div,
                 round_up,
@@ -398,7 +397,9 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
             capacity = workspace.x.shape[0]
             if num_tokens < capacity:
                 workspace.topk_idx[num_tokens:capacity].fill_(-1)
-            from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+                note_staged_tokens,
+            )
 
             note_staged_tokens(workspace.topk_idx, num_tokens)
 
@@ -469,7 +470,9 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
     ) -> Any:
-        from ......kernel_src.sm100.cutedsl_megamoe import MegaMoENvfp4Inputs
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+            MegaMoENvfp4Inputs,
+        )
 
         return MegaMoENvfp4Inputs(
             activation=workspace.x,
@@ -537,7 +540,9 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.sm100.cutedsl_megamoe import staged_tokens
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+            staged_tokens,
+        )
 
         if self.supports_unfinalized_output:
             raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
@@ -561,7 +566,9 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
-            from ......kernel_src.sm100.cutedsl_megamoe import autotune_nvfp4_mega_moe
+            from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+                autotune_nvfp4_mega_moe,
+            )
 
             self._autotune_winner = autotune_nvfp4_mega_moe(
                 output,
@@ -623,7 +630,9 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        from ......kernel_src.sm100.cutedsl_megamoe import staged_tokens
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
+            staged_tokens,
+        )
 
         if not self.supports_unfinalized_output:
             raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
@@ -711,7 +720,7 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
         import sys
 
         quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
+            "flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification.quant_stage"
         )
         topk_idx = getattr(workspace, "topk_idx", None)
         if quant_stage is not None and topk_idx is not None:

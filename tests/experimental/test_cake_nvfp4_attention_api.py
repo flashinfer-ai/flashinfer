@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from flashinfer.prefill import nvfp4_attention_workspace_bytes, prepare_nvfp4_attention
+from tests.cake.test_helpers.cake_package import cake_package
 
 SUPPORTED = {(10, 0), (10, 3), (12, 0)}
 
@@ -33,6 +34,23 @@ def _skip_unless_supported():
         or tuple(torch.cuda.get_device_capability()) not in SUPPORTED
     ):
         pytest.skip("an SM100, SM103 or SM120 GPU is required")
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    cake_build = cake_package("nvfp4_attention", "cake_build")
+    loader = cake_package("nvfp4_attention", "cake_jit")
+    arch = loader.arch_for_capability(tuple(torch.cuda.get_device_capability()))
+    version = get_cuda_version()
+    local = (int(version.major), int(version.minor))
+    for name, entry in cake_build.libraries_by_name().items():
+        floor = tuple(map(int, entry["min_cuda"].split(".")))
+        if (
+            entry["arch"] == arch
+            and local < floor
+            and not cake_build.prebuilt_path(name).is_file()
+        ):
+            # The sm100_sm103 quantizer needs CUDA 13.0: ptxas 12.9 miscompiles
+            # its E2M1 decode.
+            pytest.skip(f"{name} needs CUDA {entry['min_cuda']} or newer")
 
 
 def _reference(q, k, v):

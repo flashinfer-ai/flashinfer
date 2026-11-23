@@ -42,6 +42,30 @@ Validate dispatch changes during CUDA graph replay. Indexed forward is not
 bitwise repeatable because index compaction can change accumulation order.
 On cuDNN Frontend 1.32, cover the bitmap boundary at 512/513 tokens.
 
+## Autotuner cache changes
+
+The autotuner cache file (`load_configs` / `save_configs` /
+`autotune(cache=...)`) is shared by independent processes: `save_configs`
+re-reads the file and merges this process's entries over the on-disk ones
+instead of overwriting the file. Any change that drops, invalidates, or
+rewrites cached entries must respect that:
+
+- Decide what to remove from disk at save time against the entry currently on
+  disk, not from a load-time snapshot; another writer may have re-tuned the
+  same key to a valid tactic since this process loaded the file.
+- `AutoTuner._invalidated_file_keys` is reserved for superseded-runner
+  invalidation and is removed from the file unconditionally. Do not reuse it
+  for a new reason; keep separate state and re-check the on-disk value.
+- Before touching shared `AutoTuner` state, read every consumer of the field
+  and note what each one assumes.
+- Add a two-writer regression in `tests/autotuner/` using two independent
+  `AutoTuner` instances (reset `AutoTuner._instance` between them): writer A
+  drops or invalidates a key, writer B re-tunes it to a permitted tactic and
+  saves, writer A enters `autotune(False, cache=<another path>)` and then saves
+  to the original path; writer B's entry must survive. See
+  `TestBlocklistCacheFiles` in `tests/autotuner/test_tactics_blocklist.py`.
+  These tests run on CPU with a stubbed `_profile_single_kernel`.
+
 ## Attention plan and CUDA Graph lifetime
 
 FlashInfer requires cuDNN Frontend >=1.33.0. Attention code can rely on its
@@ -203,8 +227,7 @@ serving/TTFT qualification. Neither FI admission nor execution forces an engine.
 
 With stable FE 1.33+, matching FP16 Q/KV/output uses the same paged admission
 regions as BF16 described above. All architecture, layout, length, paired-work,
-metadata and native width guards still apply. Earlier FE versions retain the
-existing FP16 route; BF16 admission is unchanged. This dtype transfer depends on
+metadata and native width guards still apply. This dtype transfer depends on
 FE's FP16 graph-declaration placement rules and uses the common backend/FROST
 graph contract, without selecting a particular engine.
 

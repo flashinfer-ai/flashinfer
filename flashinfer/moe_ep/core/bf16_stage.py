@@ -209,6 +209,12 @@ def fused_bf16_stage(
         compiled = _STAGERS.get(key)
         import cutlass.torch as cutlass_torch
 
+        # Torch reports every empty tensor as contiguous, even a strided view
+        # such as x[:, ::2]. Give empty planes a unit inner stride for DLPack.
+        tensors = tuple(
+            t.as_strided(t.shape, (max(t.shape[1], 1), 1)) if t.numel() == 0 else t
+            for t in tensors
+        )
         arguments = tuple(
             cutlass_torch.from_dlpack(
                 t, assumed_align=16 if i in (0, 3) else 1

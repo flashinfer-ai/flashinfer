@@ -320,7 +320,7 @@ def test_mxfp4_batch_invariant_persistent_live_count(early, monkeypatch):
 
 def _quantize(tensor, kind, *, weight=False):
     import torch
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         quantize_mxfp4_block32,
         quantize_mxfp8_block32,
     )
@@ -367,7 +367,7 @@ def test_mxfp4_batch_invariant_prequantized_batches(kind, provider, early, monke
 def _torch_reference(q, sf, ids, scores, packed, kind, early):
     """Canonical prepacked operands; no production weight transform or FC kernels."""
     import torch
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         scale_to_f32,
         unpack_fp4_to_f32,
     )

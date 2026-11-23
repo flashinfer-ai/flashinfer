@@ -8,7 +8,7 @@ from typing import Literal
 
 @dataclass
 class Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm120.swapab_cutedsl_megakernel.sm120_mxfp8_mega_moe``.
+    """Kernel params for ``shims.sm120.swapab_cutedsl.sm120_mxfp8_mega_moe``.
 
     ``intermediate_size`` is the post-SwiGLU width, matching the other trees
     and SGLang. The kernel's full FC1 gate+up width is derived internally as
