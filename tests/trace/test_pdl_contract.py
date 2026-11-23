@@ -62,7 +62,7 @@ class PdlApi:
     extra_inputs: Dict[str, Callable[[Dict[str, Any]], torch.Tensor]] = field(
         default_factory=dict
     )
-    # Optional parameters these calls require.
+    # Optional parameters every call passes.
     required: Tuple[str, ...] = ()
     # The GPUs it runs on, for APIs that do not raise BackendSupportedError
     # elsewhere. None: any GPU.
@@ -79,14 +79,17 @@ class PdlApi:
 
     @property
     def out_param(self):
-        return "out" if "out" in self.params else None
+        if "out" not in self.params:
+            return None
+        optional = self.params["out"].default is not inspect.Parameter.empty
+        return None if optional and "out" not in self.required else "out"
 
     def operands(self):
         """Tensor parameters, each with its declared PDL role."""
         return {
             p: "static" if p in self.api.pdl_static else "produced"
             for p, param in self.params.items()
-            if _takes_tensor(param.annotation) and p != self.out_param
+            if _takes_tensor(param.annotation) and p != "out"
         }
 
     def optional_operands(self):
@@ -143,6 +146,7 @@ _PDL_APIS = [
         # The backends whose docs say they honor pdl.
         variants=tuple({"backend": b} for b in ("tgv", "tinygemm", "cute-dsl")),
         extra_inputs={"bias": lambda inputs: _bias(inputs, ("b", 1))},
+        required=("out",),
     ),
     PdlApi(
         "mm_fp4",
@@ -151,6 +155,7 @@ _PDL_APIS = [
         axes=tuple(dict(M=m, N=2048, K=4096) for m in (8, 128)),
         variants=tuple({"backend": b} for b in ("cudnn", "cutlass", "cute-dsl")),
         extra_inputs={"alpha": _scale},
+        required=("out",),
         compute_capabilities=_FP4_QUANTIZE_CCS,
     ),
     *(
@@ -159,6 +164,7 @@ _PDL_APIS = [
             flashinfer.mm_bf16_fp4,
             template,
             axes=_LOW_M,
+            required=("out",),
         )
         for template in (
             gemm_templates.mm_bf16_fp4_cudnn_trace,
@@ -178,6 +184,7 @@ _PDL_APIS = [
         flashinfer.tgv_gemm_sm100,
         tgv_gemm_sm100_trace,
         axes=_LOW_M,
+        required=("out",),
         # Raises ValueError elsewhere.
         compute_capabilities=(100, 103, 107),
     ),
@@ -376,7 +383,7 @@ def test_pdl_contract_operands_match_declarations(spec):
         for name, d in spec.template.inputs.items()
         if isinstance(d, Tensor)
     }
-    assert tensors - {spec.out_param} <= operands
+    assert tensors - {"out"} <= operands
     assert spec.api.pdl_static <= operands
 
 
