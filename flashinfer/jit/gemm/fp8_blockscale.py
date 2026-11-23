@@ -55,3 +55,28 @@ def gen_fp8_blockscale_gemm_sm90_module(use_fast_build: bool = False) -> JitSpec
             / "cutlass_kernels",
         ],
     )
+
+
+def gen_fp8bs_gemm_decodem_sm90_module() -> JitSpec:
+    """JIT spec for the specialized SM90 decode-M fp8 block-scale dense GEMM
+    (agent-generated kernel behind fp8_blockscale_gemm_sm90's "specialized"
+    backend). Self-contained sources; tvm-ffi entries ``run`` and ``try_run``."""  # The framework-independent device code lives under
+    # include/flashinfer/gemm/fp8bs_gemm_decodem_sm90/ (on the default JIT
+    # include path); the csrc TUs below are the thin binding/launch TUs.
+    return gen_jit_spec(
+        "fp8bs_gemm_decodem_sm90",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "fp8bs_gemm_decodem_sm90.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "fp8bs_gemm_decodem_sm90_hmma.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "fp8bs_gemm_decodem_sm90_mwg.cu",
+        ],
+        extra_cuda_cflags=sm90a_nvcc_flags
+        + [
+            "-O3",
+            "--use_fast_math",
+            "-lineinfo",
+            "--extra-device-vectorization",
+        ],
+        extra_ldflags=["-lcuda"],
+        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+    )

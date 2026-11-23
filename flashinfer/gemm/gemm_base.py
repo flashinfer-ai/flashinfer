@@ -13685,6 +13685,8 @@ def fp8_blockscale_gemm_sm90(
     weight_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    *,
+    backend: Literal["auto", "specialized", "deepgemm"] = "auto",
 ) -> torch.Tensor:
     """
     Perform FP8 block-scaled GEMM with automatic swapAB optimization.
@@ -13714,6 +13716,29 @@ def fp8_blockscale_gemm_sm90(
         Output tensor of shape (M, N). If None, will be allocated.
     out_dtype : torch.dtype, optional
         Output data type. Default is torch.bfloat16.
+    backend : str
+        One of ``("auto", "specialized", "deepgemm")``, keyword-only.
+        ``"auto"`` (the default) is the stock route, except that it routes
+        to ``"specialized"`` — an SM90 decode-M kernel for the
+        BF16-activation / FP8-weight / 128x128-block-scale form with the
+        1x128 activation quantization fused in — only on that kernel's
+        packaged allowlist
+        (``flashinfer/fp8bs_gemm_decodem_sm90_dispatch.json``: M <= 24, the
+        measured decode envelope). ``"specialized"`` selects it explicitly;
+        a call it cannot serve raises ``NotImplementedError`` with the
+        refusal reason (also recorded in
+        ``flashinfer.gemm.fp8bs_decodem_sm90._fp8bs_decodem_stats()``) — an
+        explicitly selected backend never falls back; only ``"auto"`` routes
+        around a refusal.
+        ``"deepgemm"`` pins the stock DeepGEMM-backed route: an explicitly
+        selected backend is never silently swapped. Unknown names raise
+        ``ValueError``.
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) keeps
+        ``backend="auto"`` on the stock route; an explicit
+        ``backend="specialized"`` call under the switch raises
+        ``NotImplementedError`` (reason ``kill_switch``) rather than being
+        rerouted — the switch disables the kernel, it does not swap an
+        explicitly selected backend.
     Returns
     -------
     torch.Tensor
@@ -13760,6 +13785,18 @@ def fp8_blockscale_gemm_sm90(
     - Input scales only support per-token format: (M, K//128)
     - The function uses DeepGEMM backend with JIT compilation
     """
+    from .fp8bs_decodem_sm90 import (
+        FP8BS_GEMM_BACKENDS,
+        _fp8bs_decodem_try_dispatch,
+        _stats as _fp8bs_stats,
+    )
+
+    if backend not in FP8BS_GEMM_BACKENDS:
+        raise ValueError(
+            f"fp8_blockscale_gemm_sm90 supports backend in "
+            f"{FP8BS_GEMM_BACKENDS}, got {backend!r}; an explicitly "
+            "selected backend is never silently swapped"
+        )
     # Validate architecture support
     if not _match_sm_version(input.device, ["90", "90a"]):
         raise ValueError(
@@ -13880,6 +13917,20 @@ def fp8_blockscale_gemm_sm90(
                 f"Output dtype must be torch.bfloat16 or torch.float16, got {out_dtype}"
             )
         out = torch.empty(M, N, dtype=out_dtype, device=input.device)
+
+    # Specialized SM90 decode-M backend (fp8bs_gemm_decodem_sm90): serves
+    # the BF16-activation / FP8-weight / per-block-scale form at M <= 24 on
+    # its packaged allowlist; explicit "deepgemm" never reaches it, an
+    # "auto" call it cannot serve continues on the stock route below with
+    # the reason recorded, and an explicit "specialized" call it cannot
+    # serve raises (an explicitly selected backend never falls back).
+    if backend in ("auto", "specialized"):
+        res = _fp8bs_decodem_try_dispatch(
+            input, weight, input_scale, weight_scale, out, requested=backend
+        )
+        if res is not None:
+            return res
+    _fp8bs_stats["backend_dispatches"]["deepgemm"] += 1
 
     # Get the runner
     runner = get_fp8_blockscale_gemm_runner_sm90()
