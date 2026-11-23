@@ -12,9 +12,11 @@ NVFP4 activations. What is new is the epilogue arithmetic on the raw accumulator
 * `w4a4RowScale`: `s = mul(alpha_e, pts_row)`, the expert's alpha (the caller's `1 / global_scale[e]`, as given) times the
   row's per-token scale (the per-token quantizer's output), one `mul.rn` per (row, expert);
 * `gluScaledT`: GEMM1 of the gated classes, `cvt_bf16(glu_pre(mul(g, s), mul(u, s)))` -- the bf16 class's gated chain
-  (`gluT`, every activation `GAct` with its scalars) on the scaled accumulator pair;
+  (every activation `GAct` with its scalars) on the scaled accumulator pair, its exponential and divisions on the part's
+  SFU (`MoE.gluHwT`: `ex2Approx` / `rcpApprox`, opaque per-part functions; the chains without them -- PowLU, the ReLU
+  family -- are the declared sequences);
 * `actScaledT`: GEMM1 of the ungated classes, `cvt_bf16(act(mul(acc, s)))` -- the bf16 class's ungated chain (`UAct`) on
-  the scaled accumulator;
+  the scaled accumulator (`MoE.actElemHwT`);
 * `scaledOutT`: GEMM2, `cvt_bf16(mul(acc, s))`.
 
 The two per-token quantizations (of the input row and of the materialised bf16 intermediate) are the quantizer class's
@@ -29,49 +31,30 @@ open BIK.MoE
 /-- W4A4: `s = mul(alpha_e, pts_row)` (the expert's alpha as given times the token's per-token scale). -/
 def w4a4RowScale (alpha pts : MTerm) : MTerm := .mul alpha pts
 
-/-- GEMM1 of the gated W4A4 classes: `cvt_bf16(glu_pre(mul(g, s), mul(u, s)))` on the raw accumulators (`spec_nvfp4.glu_scaled_elem`). -/
-def gluScaledT (a : GAct) (g u s : MTerm) : MTerm := gluT a (.mul g s) (.mul u s)
+/-- GEMM1 of the gated W4A4 classes: `cvt_bf16(glu_pre(mul(g, s), mul(u, s)))` on the raw accumulators, the exponential and
+the divisions on the part's SFU (`spec_nvfp4.glu_scaled_elem`). -/
+def gluScaledT (a : GAct) (g u s : MTerm) : MTerm := gluHwT a (.mul g s) (.mul u s)
 
 /-- GEMM1 of the ungated W4A4 classes: `cvt_bf16(act(mul(acc, s)))` on the raw accumulator (`spec_nvfp4.act_scaled_elem`). -/
-def actScaledT (a : UAct) (acc s : MTerm) : MTerm := actElemT a (.mul acc s)
+def actScaledT (a : UAct) (acc s : MTerm) : MTerm := actElemHwT a (.mul acc s)
 
 /-- GEMM2 of the W4A4 classes: `cvt_bf16(mul(acc, s))` (`spec_nvfp4.scaled_out_elem`). -/
 def scaledOutT (acc s : MTerm) : MTerm := .cvt "bf16" (.mul acc s)
 
-/-! ### The hardware-arithmetic classes `moe.nvfp4.<act>.hw` (`spec_nvfp4` with `hw=True`): the same scaled accumulators
-through the chains of `MoE.gluHwT` / `MoE.actElemHwT` (the part's `ex2` / `rcp` in place of the declared exponential and
-divisions); GEMM2 and the row scale are the exact class's. -/
-
-/-- GEMM1 of the gated hardware classes: `cvt_bf16(glu_pre_hw(mul(g, s), mul(u, s)))`. -/
-def gluScaledHwT (a : GAct) (g u s : MTerm) : MTerm := gluHwT a (.mul g s) (.mul u s)
-
-/-- GEMM1 of the ungated hardware classes: `cvt_bf16(act_hw(mul(acc, s)))`. -/
-def actScaledHwT (a : UAct) (acc s : MTerm) : MTerm := actElemHwT a (.mul acc s)
-
-/-- The fp32 gated value of the hardware class before the static class's block quantization (`spec_nvfp4.glu_scaled_pre`
-with `hw=True`). -/
-def gluScaledHwPreT (a : GAct) (g u s : MTerm) : MTerm := gluPreHwT a (.mul g s) (.mul u s)
-
-/-- The fp32 ungated value of the hardware class before the block quantization. -/
-def actScaledHwPreT (a : UAct) (acc s : MTerm) : MTerm := ungatedHwT a (.mul acc s)
-
-theorem gluScaledHwT_is_gluHwT_of_scaled (a : GAct) (g u s : MTerm) :
-    gluScaledHwT a g u s = gluHwT a (.mul g s) (.mul u s) := rfl
-
-theorem actScaledHwT_is_actElemHwT_of_scaled (a : UAct) (acc s : MTerm) :
-    actScaledHwT a acc s = actElemHwT a (.mul acc s) := rfl
-
-/-- The chains without an exponential or a division are the exact class's under either arithmetic (the ReLU family). -/
-theorem actScaledHwT_relu2 (acc s : MTerm) : actScaledHwT .relu2 acc s = actScaledT .relu2 acc s := rfl
-
 /-- **The W4A4 GEMM1 chain is the bf16 class's chain on the scaled accumulators**: the scale enters once per accumulator,
-before any activation arithmetic; nothing of the bf16 chain is re-ordered. -/
-theorem gluScaledT_is_gluT_of_scaled (a : GAct) (g u s : MTerm) : gluScaledT a g u s = gluT a (.mul g s) (.mul u s) := rfl
+before any activation arithmetic; nothing of the chain is re-ordered. -/
+theorem gluScaledT_is_gluHwT_of_scaled (a : GAct) (g u s : MTerm) : gluScaledT a g u s = gluHwT a (.mul g s) (.mul u s) := rfl
 
-theorem actScaledT_is_actElemT_of_scaled (a : UAct) (acc s : MTerm) : actScaledT a acc s = actElemT a (.mul acc s) := rfl
+theorem actScaledT_is_actElemHwT_of_scaled (a : UAct) (acc s : MTerm) : actScaledT a acc s = actElemHwT a (.mul acc s) := rfl
 
-/-- The default SwiGLU class's GEMM1 is `swigluT` on the scaled pair. -/
-theorem gluScaledT_silu (g u s : MTerm) : gluScaledT .silu g u s = swigluT (.mul g s) (.mul u s) := rfl
+/-- The chains without an exponential or a division are the declared sequences: the ReLU family and PowLU. -/
+theorem actScaledT_relu2_exact (acc s : MTerm) : actScaledT .relu2 acc s = actElemT .relu2 (.mul acc s) := rfl
+
+theorem gluScaledT_powlu_exact (m : String) (l : Option String) (g u s : MTerm) :
+    gluScaledT (.powlu m l) g u s = gluT (.powlu m l) (.mul g s) (.mul u s) := rfl
+
+/-- The default SwiGLU class's GEMM1: the SFU SiLU of the scaled gate times the scaled up accumulator. -/
+theorem gluScaledT_silu (g u s : MTerm) : gluScaledT .silu g u s = .cvt "bf16" (.mul (siluHwT (.mul g s)) (.mul u s)) := rfl
 
 /-- **The row scale is one product**: with a unit per-token scale the chain's scale is the expert's alpha alone (the
 per-tensor pack of the TRTLLM backends enters the same chain). -/
@@ -118,11 +101,11 @@ def pairwiseMax (xs : List MTerm) : MTerm := pairwiseMaxFuel xs.length xs
 /-- The block amax of 16 values: the pairwise `fmaxc` tree over `fabs(x)`. -/
 def nvfp4BlockAmax (xs : List MTerm) : MTerm := pairwiseMax (xs.map MTerm.fabs)
 
-/-- The fp32 gated value of the W4A4 chain before any rounding: `glu_pre(mul(g, s), mul(u, s))`. -/
-def gluScaledPreT (a : GAct) (g u s : MTerm) : MTerm := gluPreT a (.mul g s) (.mul u s)
+/-- The fp32 gated value of the W4A4 chain before any rounding: `glu_pre(mul(g, s), mul(u, s))` (`spec_nvfp4.glu_scaled_pre`). -/
+def gluScaledPreT (a : GAct) (g u s : MTerm) : MTerm := gluPreHwT a (.mul g s) (.mul u s)
 
 /-- The fp32 ungated value before any rounding: `act(mul(acc, s))`. -/
-def actScaledPreT (a : UAct) (acc s : MTerm) : MTerm := ungatedT a (.mul acc s)
+def actScaledPreT (a : UAct) (acc s : MTerm) : MTerm := ungatedHwT a (.mul acc s)
 
 /-- The block's scale byte: the per-tensor chain on the block's 16 fp32 values with the expert's static scale. -/
 def staticBlockSfT (vals : List MTerm) (gs : MTerm) : MTerm := nvfp4SfQuant (nvfp4SfValue (nvfp4BlockAmax vals) gs)

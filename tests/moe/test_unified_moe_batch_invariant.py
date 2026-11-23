@@ -2905,7 +2905,7 @@ def test_route_plan_dual_equals_route_and_the_dual_plan(T, k, E):
     from flashinfer.fused_moe.batch_invariant import spec as S
 
     permute_plan_dual = pytest.importorskip(
-        "flashinfer.fused_moe.batch_invariant.api_nvfp4"
+        "flashinfer.fused_moe.batch_invariant.api_fp4"
     ).permute_plan_dual  # the block-scaled package: a later PR
 
     g = torch.Generator().manual_seed(T * 3 + E)

@@ -1,25 +1,12 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The NVFP4 MoE classes' grouped-GEMM dispatcher: the dense 4-bit GEMM class's ranking heuristic at the grouped launch's
-shape, as the bf16 classes' (:mod:`.schedule`, whose terms this module reuses).
-
-The grouped block-scaled GEMM is the dense NVFP4 class under a different scheduler (one segment of rows per expert, whole
-128-row scale-factor atoms per segment), so its records are ranked by the dense dispatcher's model
-(:func:`flashinfer.gemm.batch_invariant.heuristic.estimate_cycles` at the instruction class ``in_fmt``: the part's roofline
-with nominal constants, no measured tables) at the dense shape whose tiles, M tail and operand bytes are the grouped
-launch's: ``M`` = the rows of one active expert, ``N`` = the active experts' weight rows side by side (every group's tiles
-count, and the weights are read once per group). Two record spaces are ranked together, as the bf16 classes' dispatcher
-ranks them: the grouped records (the dense records at swizzle 1: no in-cluster split, no operand swap, no B-reuse tile, no
-in-CTA chunk fold) and the swapped records (:mod:`.blocks.swap`: the weights on the MMA's M side, 128 rows per CTA, the
-group's tokens a narrow N tile of 8 / 16 / 32 rows), which the dense model prices as a swapped decode record. The grouped
-launch's own terms on the dense estimate are the bf16 dispatcher's: the pair term (the cluster tile's dummy share), the
-swapped records' spill factor (the Poisson expectation of token tiles per active expert), the last tile's exposed epilogue
-chain (this class's chain term: the W4A4 gated chain, or the static class's chain plus its share of the block quantization;
-four epilogue warpgroups) and the token box's zero-fill past the group's rows at the packed fp4 element width, rounded to three
-significant digits so records the estimate cannot separate fall through to the structural raster and the enumeration order.
-Every record of either space is filtered by its body's acceptance. Numerics-neutral: every record of either space is
-canonical (the same bits), so the dispatcher may depend on anything; the ranked list is what the autotuner profiles under
-``batch_invariant``.
+"""The fp4 MoE classes' grouped-GEMM dispatcher (both pairs): the dense 4-bit GEMM class's ranking heuristic
+(:func:`flashinfer.gemm.batch_invariant.heuristic.estimate_cycles` at the pair's instruction class: the part's roofline with
+nominal constants, no measured tables) at the grouped launch's shape (``M`` = the rows of one active expert, ``N`` = the
+active experts' weight rows side by side), over the grouped records (the dense records at swizzle 1) and the swapped records
+(:mod:`.blocks.swap`) together, with the bf16 classes' launch terms (:func:`.schedule.record_cost`) and this class's chain
+term. Numerics-neutral: every record of either space computes the same bits, so the dispatcher may depend on anything; the
+ranked list is what the autotuner profiles. The mode's README ("Dispatcher") states the ranking.
 """
 
 from __future__ import annotations
@@ -35,7 +22,7 @@ from ...gemm.batch_invariant.generator import (
     Knobs,
     knob_product,
 )
-from .blocks.epilogue import GroupedEpilogueBlock, W4A4Chain
+from .blocks.epilogue import GroupedEpilogueBlock, Mxfp4Chain
 from .blocks.swap import swapped_knobs
 from .schedule import (  # noqa: F401  (re-exported)
     TOP_K,
@@ -87,12 +74,13 @@ def swapped_knobs_blockscaled() -> List[Knobs]:
 
 #: Records the fp4 runners hand the autotuner per GEMM: the ranked list's head (its raster twins included).
 TOP_K_FP4 = 6
-#: The average rows per active expert fill at most three quarters of the swapped token tile (an empirical margin).
+#: The structural rule's fill bound: the average rows per active expert fill at most three quarters of the swapped token
+#: tile (a declared empirical constant).
 SWAP_TILE_FILL = (3, 4)
-#: The narrowest swapped tile: the structural rule's pick (the bench's reference point; the ranking decides the dispatch).
+#: The structural rule's tile: the narrowest swapped tile (the ranking, not the rule, decides the dispatch).
 SWAP_TILES_DEFAULT = (8,)
-#: The gather form's token tile: the swapped record whose one-warp scale producer keeps a stage's row copies in flight; the
-#: wider tiles serialize them (the campaign's lever record).
+#: The gather form's token tile: the swapped record whose one-warp scale producer keeps a stage's row copies in flight (the
+#: wider tiles serialize them).
 GATHER_TILE_N = 8
 
 
@@ -107,9 +95,9 @@ def gather_form_rule(config1: Knobs, scatter_launch: bool) -> Knobs:
 
 
 def token_tile_default(rows: int) -> Optional[int]:
-    """The structural rule of the first campaign (kept as the benches' reference point, not the dispatch): the narrowest swapped
-    tile of ``SWAP_TILES_DEFAULT`` the average rows per active expert fill to at most ``SWAP_TILE_FILL``, ``None`` otherwise. The
-    dispatch ranks the swapped records with the grouped ones (:func:`rank_grouped_nvfp4`)."""
+    """The structural rule (a reference, not the dispatch): the narrowest swapped tile of ``SWAP_TILES_DEFAULT`` the average
+    rows per active expert fill to at most ``SWAP_TILE_FILL``, ``None`` otherwise; the dispatch ranks the swapped records with
+    the grouped ones (:func:`rank_grouped_fp4`)."""
     num, den = SWAP_TILE_FILL
     for tn in SWAP_TILES_DEFAULT:
         if rows * den <= tn * num:
@@ -117,22 +105,26 @@ def token_tile_default(rows: int) -> Optional[int]:
     return None
 
 
-def chain_nodes_nvfp4(chain) -> int:
+def chain_nodes_fp4(chain) -> int:
     """The node count of the chain's term per output element (the exposed epilogue's cost unit): the W4A4 gated / ungated chain on the
     row-scaled accumulators (``glu_scaled_elem`` / ``act_scaled_elem``), GEMM2's scaled conversion, or the static class's GEMM1 -- the
     fp32 gated value plus its share of the block's quantization (the block's scale and codes over its 16 outputs); the MXFP4
-    classes' chains by :func:`.schedule_mxfp4.chain_nodes_mx`."""
+    chains on the raw accumulators (no row scale, no block quantization) or GEMM2's conversion."""
     from . import mterm as term
+    from . import spec as S
     from . import spec_nvfp4 as Q
-    from .blocks.epilogue import Mxfp4Chain
 
-    if isinstance(chain, Mxfp4Chain):
-        from .schedule_mxfp4 import chain_nodes_mx
-
-        return chain_nodes_mx(chain)
     alg = term.TermAlgebra()
-    s = Q.w4a4_row_scale(alg, alg.leaf("alpha", 0), alg.leaf("pts"))
     g, u = alg.leaf("g", 0, 0), alg.leaf("u", 0, 0)
+    if isinstance(chain, Mxfp4Chain):
+        if chain.pair:
+            t = S.glu_elem(alg, g, u, chain.act, chain.out_fmt, chain.params, chain.hw)
+        elif chain.kind == "act":
+            t = S.act_elem(alg, u, chain.act, chain.out_fmt, chain.params, chain.hw)
+        else:
+            t = alg.cvt_out(u, chain.out_fmt)
+        return term.size(t)
+    s = Q.w4a4_row_scale(alg, alg.leaf("alpha", 0), alg.leaf("pts"))
     if chain.static_quant:
         # the block's DAG (the fp32 values, the amax tree, the scale, the codes) sized once and split over its outputs
         gs = alg.leaf("gs2", 0)
@@ -192,8 +184,13 @@ def _grouped(cfg: Knobs) -> Knobs:
     )
 
 
-def all_valid_configs_nvfp4(
-    N: int, K: int, E: int, chain: W4A4Chain, in_fmt: str = "nvfp4", clusters=None
+def all_valid_configs_fp4(
+    N: int,
+    K: int,
+    E: int,
+    chain: GroupedEpilogueBlock,
+    in_fmt: str = "nvfp4",
+    clusters=None,
 ) -> List[Knobs]:
     """The configuration space the grouped guarantee is claimed over, for an expert weight shape, a chain and an
     instruction class."""
@@ -208,8 +205,8 @@ def all_valid_configs_nvfp4(
     ]
 
 
-def all_valid_configs_nvfp4_swapped(
-    N: int, K: int, E: int, chain: W4A4Chain, in_fmt: str = "nvfp4"
+def all_valid_configs_fp4_swapped(
+    N: int, K: int, E: int, chain: GroupedEpilogueBlock, in_fmt: str = "nvfp4"
 ) -> List[Knobs]:
     """The swapped decode records the swapped body accepts for an expert weight shape, a chain and an instruction class (the
     dense packing); the guarantee is claimed over this space and the grouped space together."""
@@ -236,7 +233,7 @@ def gather_twins(swapped: List[Knobs]) -> List[Knobs]:
     return [dataclasses.replace(c, gather_a=True) for c in swapped if c.swap_ab]
 
 
-def rank_grouped_nvfp4(
+def rank_grouped_fp4(
     rows: int,
     N: int,
     K: int,
@@ -251,12 +248,11 @@ def rank_grouped_nvfp4(
     swap: Optional[bool] = None,
     gather: Optional[bool] = False,
 ) -> List[Knobs]:
-    """The ranked records (:func:`_rank_grouped_nvfp4`), memoised on the arguments: the ranking runs on the host at every call
-    of the op and of the layer, and enumerating and costing the space is milliseconds of Python per GEMM. ``gather``: the
+    """The ranked records (:func:`_rank_grouped_fp4`), memoised: the ranking runs on the host at every call. ``gather``: the
     swapped records' gather form (GEMM1) -- False excludes it (GEMM2, the default), True replaces the swapped records by their
     gather twins, None ranks both forms (the twin right after its record: the same cost, the form a placement)."""
     return list(
-        _rank_grouped_nvfp4(
+        _rank_grouped_fp4(
             rows,
             N,
             K,
@@ -275,7 +271,7 @@ def rank_grouped_nvfp4(
 
 
 @functools.lru_cache(maxsize=4096)
-def _rank_grouped_nvfp4(
+def _rank_grouped_fp4(
     rows: int,
     N: int,
     K: int,
@@ -290,17 +286,14 @@ def _rank_grouped_nvfp4(
     swap: Optional[bool],
     gather: Optional[bool] = False,
 ) -> Tuple[Knobs, ...]:
-    """The ranked records for one GEMM over both record spaces (the bf16 dispatcher's form, :func:`.schedule.rank_grouped`): the
-    grouped records the grouped body accepts for the weight shape, the chain and the instruction class (at a decode-sized ``rows``
-    the dense dispatcher's structural guard, `heuristic.decode_sane`, selects the candidates; a record whose M tile is taller than
-    the group's padded rows is excluded: the group scheduler's tiles never span groups) and the swapped records the swapped body
-    accepts (``swap``: None ranks them with the rest, True keeps only them, False excludes them), ordered by the shared contract's
-    cost (:func:`.schedule.record_cost` at this class's instruction class, with this class's chain term in nodes: the dense estimate
-    under the ranking's overrides times the pair and token-tile terms, the exposed epilogue chain, the token box's exposed zero fill
-    at the packed fp4 width and the body's per-launch fixed cost), rounded to three significant digits; the grouped scheduler's
-    structural raster first among twins, then the wider N tile among tied grouped records (fewer tiles: fewer per-tile costs),
-    ties in the spaces' enumeration order (the grouped records before the swapped ones, the narrower token tile first). Each of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the
-    list: distinct records, at most ``k``, never empty for an implementable shape."""
+    """The ranked records for one GEMM over both record spaces (the bf16 dispatcher's form, :func:`.schedule.rank_grouped`):
+    the grouped records the grouped body accepts (the dense dispatcher's structural guard at a decode-sized ``rows``; no M tile
+    taller than the group's padded rows: the group scheduler's tiles never span groups) and the swapped records the swapped
+    body accepts (``swap``: None ranks them with the rest, True keeps only them, False excludes them), ordered by
+    :func:`.schedule.record_cost` at this class's instruction class and chain term, rounded to three significant digits;
+    ties: the structural raster first among twins, the wider N tile among grouped records, then the enumeration order. Each
+    of the best ceil(k/2) records is followed by its raster twin, then the rank order fills the list: distinct records, at
+    most ``k``, never empty for an implementable shape."""
     from ...gemm.batch_invariant.heuristic import decode_sane
     from .blocks.compile import (
         can_implement_grouped_blockscaled as can_implement_grouped_nvfp4,
@@ -340,7 +333,7 @@ def _rank_grouped_nvfp4(
         swapped = twins if gather else swapped + twins
     space = dense + swapped
     guarded = [c for c in dense if decode_sane(c, rows, False)] or dense
-    nodes = chain_nodes_nvfp4(chain)
+    nodes = chain_nodes_fp4(chain)
 
     def key(i, c):
         # the shared contract's cost (`schedule.record_cost`) at this class's instruction class and chain term (a gather twin
@@ -403,15 +396,15 @@ def _rank_grouped_nvfp4(
     return tuple(out[:k])
 
 
-def default_configs_nvfp4(
+def default_configs_fp4(
     T: int,
     k: int,
     H: int,
     I: int,
     E: int,
     in_fmts: Tuple[str, str],
-    chain1: W4A4Chain,
-    chain2: W4A4Chain,
+    chain1: GroupedEpilogueBlock,
+    chain2: GroupedEpilogueBlock,
     sm_count: Optional[int] = None,
     family: Optional[str] = None,
     nominal: bool = False,
@@ -423,7 +416,7 @@ def default_configs_nvfp4(
     swapped records in their gather form -- excluded (False), forced (True) or ranked with the box form (None))."""
     rows, n_act = rows_per_expert(T, k, E), active_experts(T, k, E)
     n1 = 2 * I if chain1.pair else I
-    c1 = rank_grouped_nvfp4(
+    c1 = rank_grouped_fp4(
         rows,
         n1,
         H,
@@ -438,7 +431,7 @@ def default_configs_nvfp4(
         swap,
         gather,
     )
-    c2 = rank_grouped_nvfp4(
+    c2 = rank_grouped_fp4(
         rows, H, I, E, chain2, in_fmts[1], sm_count, family, 1, nominal, n_act, swap
     )
     if not c1 or not c2:

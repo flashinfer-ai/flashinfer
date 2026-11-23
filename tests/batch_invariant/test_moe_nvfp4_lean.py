@@ -53,12 +53,10 @@ def test_generated_cases_are_current():
     } <= theorems
     for name in theorems:
         assert f"theorem moe_nvfp4_{name} :" in committed
-    # the chains too large for a kernel theorem are conformance lines (the executable), never dropped
-    large = {
-        "gemm1_glu_situ_default",
-        "gemm1_glu_powlu_default",
-        "gemm1_glu_powlu_limit",
-    }
+    # the SiTU chains' SFU form is small enough for kernel theorems; the PowLU chains (the declared log / exp) are too
+    # large for one and are conformance lines (the executable), never dropped
+    assert {"gemm1_glu_situ_default", "gemm1_glu_situ_clamp"} <= theorems
+    large = {"gemm1_glu_powlu_default", "gemm1_glu_powlu_limit"}
     assert large <= set(names) and not (large & theorems)
     for _name, sx, _, as_thm in cases:
         assert as_thm == (len(sx) <= lean_cases.THEOREM_MAX_BYTES)

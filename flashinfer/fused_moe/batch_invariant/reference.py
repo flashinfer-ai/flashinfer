@@ -17,7 +17,22 @@ import torch
 
 from ...batch_invariant.fp_interface import exact as fp32
 from . import spec as S
-from .mterm import frexpe_f32, frexpm_f32, rowmax_f32, sfu_eval, sfu_tables
+from . import mterm
+from .mterm import frexpe_f32, frexpm_f32, rowmax_f32
+
+
+def sfu_tables():
+    """The part's SFU tables behind the fp4 classes' ``ex2`` / ``rcp``: the bound ones (:func:`.mterm.bind_sfu_tables`), else
+    the current CUDA device's, dumped once per process and bound."""
+    if mterm._SFU_TABLES is None:
+        import torch
+
+        from ...batch_invariant.fp_interface import sfu
+
+        if not torch.cuda.is_available():
+            return mterm.sfu_tables()  # the error names the binding
+        mterm.bind_sfu_tables(sfu.tables_for(torch.device("cuda")))
+    return mterm.sfu_tables()
 
 
 class ExactF32:
@@ -46,11 +61,11 @@ class ExactF32:
 
     @staticmethod
     def ex2(a: float) -> float:
-        return sfu_eval("ex2", a)
+        return sfu_tables().eval("ex2", a)
 
     @staticmethod
     def rcp(a: float) -> float:
-        return sfu_eval("rcp", a)
+        return sfu_tables().eval("rcp", a)
 
     @staticmethod
     def where_nan(x: float, a: float, b: float) -> float:
@@ -135,14 +150,14 @@ class TorchF32:
 
     @staticmethod
     def ex2(a: torch.Tensor) -> torch.Tensor:
-        """The bound part's ``ex2.approx.ftz`` (the hardware-arithmetic classes), from its tables."""
+        """The part's ``ex2.approx.ftz`` (the fp4 classes' exponential), from its tables."""
         from ...batch_invariant.fp_interface import sfu
 
         return sfu.ex2_hw(a.to(torch.float32), sfu_tables())
 
     @staticmethod
     def rcp(a: torch.Tensor) -> torch.Tensor:
-        """The bound part's ``rcp.approx.ftz``, from its tables."""
+        """The part's ``rcp.approx.ftz`` (the fp4 classes' reciprocal), from its tables."""
         from ...batch_invariant.fp_interface import sfu
 
         return sfu.rcp_hw(a.to(torch.float32), sfu_tables())

@@ -63,8 +63,8 @@ class TermAlgebra(_Base):
         return self._mk("fmax", a, b)
 
     def rcp(self, a: Term) -> Term:
-        """``rcp.approx.ftz.f32``: an opaque hardware primitive, deterministic per architecture (the hardware-arithmetic
-        classes' reciprocal; ``ex2`` is the base algebra's)."""
+        """``rcp.approx.ftz.f32``: an opaque hardware primitive, deterministic per architecture (the fp4 classes'
+        reciprocal; ``ex2`` is the base algebra's)."""
         return self._mk("rcp", a)
 
     def exp2i(self, k: Term) -> Term:
@@ -113,7 +113,7 @@ _SFU_TABLES = None
 
 def bind_sfu_tables(tables) -> None:
     """Bind the part's SFU tables (:class:`flashinfer.batch_invariant.fp_interface.sfu.SfuTables`) for the evaluation of the
-    hardware-arithmetic classes' ``ex2`` / ``rcp`` nodes (``None`` unbinds)."""
+    fp4 classes' ``ex2`` / ``rcp`` nodes (``None`` unbinds; unbound, the references take the current CUDA device's)."""
     global _SFU_TABLES
     _SFU_TABLES = tables
 
@@ -122,7 +122,7 @@ def sfu_tables():
     """The bound tables, or a clear error."""
     if _SFU_TABLES is None:
         raise RuntimeError(
-            "no SFU tables bound: the hardware-arithmetic classes evaluate on the part's tables "
+            "no SFU tables bound: the fp4 classes' ex2 / rcp evaluate on a part's tables "
             "(mterm.bind_sfu_tables(sfu.tables_for(device)))"
         )
     return _SFU_TABLES

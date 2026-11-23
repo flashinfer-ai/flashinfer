@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The two hardware special-function primitives of the hardware-arithmetic activation classes, and their CPU model.
+"""The two hardware special-function primitives of the fp4 MoE classes' activation chains, and their CPU model.
 
 ``ex2.approx.ftz.f32`` and ``rcp.approx.ftz.f32`` (MUFU.EX2 / MUFU.RCP) are deterministic functions of their binary32 input
 on one architecture, with results PTX leaves implementation-specific. The CPU model takes them as data: on each part the

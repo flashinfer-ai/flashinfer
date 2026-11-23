@@ -17,7 +17,6 @@ import os
 from typing import List, Tuple
 
 from . import mterm as term
-from . import spec as S
 from . import spec_mxfp4 as Q
 from .lean_cases import (
     ACT_CASES,
@@ -58,21 +57,6 @@ def moe_mxfp4_cases() -> List[Tuple[str, str, str, bool]]:
     for name, act in (("act_relu2", "relu2"),) + tuple(ACT_CASES):
         s_ = Q.MoEMxfp4Spec(64, 32, 2, 8, alg=alg, act=act, gated=False)
         chain(f"gemm1_{name}", s_.gemm1(), f"MoEMxfp4.mxActT {_UACT[act]} {_U}")
-    # the hardware-arithmetic classes (`moe.mxfp4.<act>.hw`): the chains with an exponential or a division
-    for name, act, params in GLU_CASES:
-        if not S.hw_arith_applies(act, True):
-            continue
-        s_ = Q.MoEMxfp4Spec(64, 32, 2, 8, alg=alg, act=act, params=params, arith="hw")
-        chain(
-            f"gemm1_{name}_hw",
-            s_.gemm1(),
-            f"MoEMxfp4.mxGluHwT {lean_gact(act, params)} {_G} {_U}",
-        )
-    for name, act in ACT_CASES:
-        if not S.hw_arith_applies(act, False):
-            continue
-        s_ = Q.MoEMxfp4Spec(64, 32, 2, 8, alg=alg, act=act, gated=False, arith="hw")
-        chain(f"gemm1_{name}_hw", s_.gemm1(), f"MoEMxfp4.mxActHwT {_UACT[act]} {_U}")
     return out
 
 

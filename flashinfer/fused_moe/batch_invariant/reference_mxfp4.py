@@ -23,15 +23,20 @@ def mx_gemm1_cpu(
     act: str = "silu",
     params: Sequence[Optional[float]] = (),
 ) -> torch.Tensor:
-    """The gated GEMM1 chain for whole rows: ``cvt_bf16(glu_pre(g, u))`` on the ``[rows, I]`` fp32 accumulators."""
-    return S.glu_elem(TorchF32, _f32(g), _f32(u), act, "bf16", params)
+    """The gated GEMM1 chain for whole rows: ``cvt_bf16(glu_pre(g, u))`` on the ``[rows, I]`` fp32 accumulators (the
+    exponential and the divisions on the part's SFU, from its tables)."""
+    return S.glu_elem(
+        TorchF32, _f32(g), _f32(u), act, "bf16", params, S.hw_arith_applies(act, True)
+    )
 
 
 def mx_act_cpu(
     acc: torch.Tensor, act: str = "relu2", params: Sequence[Optional[float]] = ()
 ) -> torch.Tensor:
     """The ungated GEMM1 chain for whole rows: ``cvt_bf16(act(acc))``."""
-    return S.act_elem(TorchF32, _f32(acc), act, "bf16", params)
+    return S.act_elem(
+        TorchF32, _f32(acc), act, "bf16", params, S.hw_arith_applies(act, False)
+    )
 
 
 def mx_gemm2_cpu(acc: torch.Tensor) -> torch.Tensor:

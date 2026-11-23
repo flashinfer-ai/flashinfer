@@ -69,20 +69,16 @@ EXP_COEFFS = tuple(
 )
 
 
-#: The arithmetic of a chain's transcendental steps: ``exact`` (the declared sequences below: correctly rounded binary32
-#: operations, reproduced bit for bit by the CPU) or ``hw`` (the hardware-arithmetic classes: ``ex2.approx.ftz`` for the
-#: exponential and ``rcp.approx.ftz`` for every division, each a deterministic function of the part; the CPU model holds
-#: the part's two functions as tables, :mod:`flashinfer.batch_invariant.fp_interface.sfu`).
-ARITHS = ("exact", "hw")
-#: The gated chains whose declared sequence has an exponential or a division: the hardware form exists for them (PowLU
-#: keeps the declared log / exp: no hardware form).
+#: The gated chains whose declared sequence has an exponential or a division: the fp4 MoE classes compute those steps with
+#: the part's ``ex2.approx.ftz`` / ``rcp.approx.ftz`` (``hw=True`` below; the CPU model holds the part's two functions as
+#: tables, :mod:`flashinfer.batch_invariant.fp_interface.sfu`). PowLU keeps the declared log / exp.
 HW_ACTS = ("silu", "gelu_tanh", "gelu", "swiglu_oai", "swiglu_step", "situ")
-#: The ungated chains with a hardware form.
+#: The ungated chains with an exponential or a division.
 HW_UNGATED_ACTS = ("silu", "gelu")
 
 
 def hw_arith_applies(act: str, gated: bool) -> bool:
-    """Whether the hardware arithmetic changes the chain ``act``: the chains with an exponential or a division."""
+    """Whether the chain ``act`` has an exponential or a division (the fp4 classes compute them in the hardware arithmetic)."""
     return act in (HW_ACTS if gated else HW_UNGATED_ACTS)
 
 
@@ -915,6 +911,9 @@ class MoESpec:
     """Symbolic view of the class ``moe.bf16.swiglu[H, I, k, E, method]`` for one token (``act`` in ``UNGATED_ACTS``:
     the ungated class ``moe.bf16.<act>``, GEMM1 on the single accumulator)."""
 
+    #: the chain's exponential and divisions on the part's SFU: the fp4 classes set it; the bf16 and fp8 classes are exact
+    hw: bool = False
+
     def __init__(
         self,
         H: int,
@@ -993,12 +992,14 @@ class MoESpec:
     def gemm1(self, r: int = 0, j: int = 0) -> Term:
         """The GEMM1 epilogue term of the class: the gated chain on the (gate, up) pair, or the ungated chain on the
         single accumulator (``u``)."""
-        hw = getattr(
-            self, "hw", False
-        )  # the hardware-arithmetic classes set it after the base construction
         if not self.gated:
             return act_elem(
-                self.alg, self.acc("u", r, j), self.act, self.out_fmt, self.params, hw
+                self.alg,
+                self.acc("u", r, j),
+                self.act,
+                self.out_fmt,
+                self.params,
+                self.hw,
             )
         return glu_elem(
             self.alg,
@@ -1007,7 +1008,7 @@ class MoESpec:
             self.act,
             self.out_fmt,
             self.params,
-            hw,
+            self.hw,
         )
 
     def combine(self, h: int = 0, selected: Optional[Sequence[int]] = None) -> Term:
