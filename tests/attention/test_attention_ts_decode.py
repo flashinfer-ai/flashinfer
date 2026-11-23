@@ -10024,7 +10024,7 @@ def test_attention_ts_decode_final_statistics(
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("packed", (False, True), ids=("uniform_q", "packed_q"))
 def test_attention_ts_decode_persistent_sinks_skip_inactive_requests(packed):
-    """Persistent sink tiles stay in step when live-Q requests have no KV."""
+    """Persistent sinks skip inactive requests in eager and graph replay."""
     from tests.attention.test_attention_ts_context import _softmax_statistics_reference
 
     # Two requests per SM exceed one CTA wave, so the planner persists.
@@ -10074,24 +10074,27 @@ def test_attention_ts_decode_persistent_sinks_skip_inactive_requests(packed):
     for request, length in inactive.items():
         lengths[request] = length
     out = torch.full_like(case.q, 8)
-    wrapper.run(
-        case.q,
-        (case.k_cache, case.v_cache),
-        lengths,
-        case.block_tables,
-        qo_indptr=offsets,
-        softmax_scale=case.softmax_scale,
-        output_scale=case.output_scale,
-        attention_sinks=sinks,
-        out=out,
-    )
 
-    expected = torch.full_like(out, 8, dtype=torch.float32)
+    def run(*, validate=True):
+        wrapper.run(
+            case.q,
+            (case.k_cache, case.v_cache),
+            lengths,
+            case.block_tables,
+            qo_indptr=offsets,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
+            attention_sinks=sinks,
+            out=out,
+            validate=validate,
+        )
+
+    run()
+
+    expected = torch.empty_like(out, dtype=torch.float32)
     pages_per_request = (nk + page_size - 1) // page_size
     bounds = offsets.tolist() if packed else None
     for request in range(num_requests):
-        if request in inactive:
-            continue
         rows = slice(bounds[request], bounds[request + 1]) if packed else request
         pages = case.block_tables[request, :pages_per_request].long()
         k, v = (
@@ -10102,7 +10105,41 @@ def test_attention_ts_decode_persistent_sinks_skip_inactive_requests(packed):
             case.q[rows], k, v, scale=case.softmax_scale, sinks=sinks
         )
         expected[rows] = ref * case.output_scale
-    torch.testing.assert_close(out.float(), expected, atol=0.02, rtol=0.05)
+
+    active_rows = torch.ones(out.shape[:-2], dtype=torch.bool, device=out.device)
+    for request in inactive:
+        rows = slice(bounds[request], bounds[request + 1]) if packed else request
+        active_rows[rows] = False
+
+    def check_output(has_inactive, sentinel):
+        rows = active_rows if has_inactive else slice(None)
+        torch.testing.assert_close(
+            out[rows].float(), expected[rows], atol=0.02, rtol=0.05
+        )
+        if has_inactive:
+            inactive_output = out[~active_rows]
+            torch.testing.assert_close(
+                inactive_output,
+                torch.full_like(inactive_output, sentinel),
+                rtol=0,
+                atol=0,
+            )
+
+    check_output(True, 8)
+
+    # The eager run warmed up this kernel. Replay the same graph while only
+    # device metadata changes: all active, mixed inactive, then all active.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(validate=False)
+    for inactive_requests, sentinel in (({}, 8), (inactive, 9), ({}, 10)):
+        lengths.fill_(nk)
+        for request, length in inactive_requests.items():
+            lengths[request] = length
+        # A new sentinel each time exposes stale output as well as wrong writes.
+        out.fill_(sentinel)
+        graph.replay()
+        check_output(bool(inactive_requests), sentinel)
 
 
 @pytest.mark.parametrize(
@@ -10663,3 +10700,41 @@ def test_attention_ts_decode_large_grouped_nvfp4_grid(queries: int, page: int):
         seq_len_q=queries,
         page_size=page,
     )
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(("seq_len_q", "num_qo_heads"), ((8, 128), (4, 256)))
+def test_attention_ts_decode_fp8_q128_streamed_swaps_causal(
+    monkeypatch, seq_len_q: int, num_qo_heads: int
+):
+    """FP8 Swaps Q128 streams Q32 score bands and masks only boundary tiles.
+
+    Unaligned causal lengths put per-row causal ends inside one K tile, so
+    both the masked and the skipped per-band branches run.
+    """
+    case = _make_decode_case(
+        kv_lens=(1000, 2055, 4099, 3001),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=8,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=32,
+        qkv_dtype=_FP8,
+        out_dtype=torch.bfloat16,
+        cache_form="tuple",
+        mask_type="causal",
+        device="cuda",
+        seed=921121,
+    )
+    policy = _exercise_explicit_profile_case(
+        monkeypatch,
+        case,
+        {
+            "use_keeps_mma_ab": False,
+            "tile_size_q": 128,
+            "tile_size_kv": 128,
+            "use_persistent_scheduler": False,
+        },
+    )
+    assert policy["mma_variant"] == "swaps_mma_ab"
+    assert (policy["tile_size_q"], policy["num_insts_kv"]) == (128, 1)

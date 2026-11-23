@@ -1065,7 +1065,7 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm120_module())
             # Imported here: the package import initializes flashinfer.moe_ep (every
             # MegaMoE backend), which builds without SM120 do not need.
-            from .moe_ep.kernel_src.sm120.cake_mxfp4_megamoe import (
+            from flashinfer.moe_ep.shims.sm120.cake_mxfp4 import (
                 cake_sm120_megamoe_available,
                 gen_cake_sm120_megamoe_aot_modules,
             )

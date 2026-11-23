@@ -48,26 +48,23 @@ def adapter(monkeypatch):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "version,ordered,decline",
+    "ordered,decline",
     [
-        ("1.29.0", False, None),
-        ("1.30.0", True, None),
-        ("1.30.0", True, "NotImplementedError"),
-        ("1.30.0", True, "cudnnGraphNotSupportedError"),
+        (False, None),
+        (True, None),
+        (True, "NotImplementedError"),
+        (True, "cudnnGraphNotSupportedError"),
     ],
 )
 @pytest.mark.parametrize("return_state", [False, True])
-def test_kda_state_update_survives_older_or_declining_frontend(
-    monkeypatch, adapter, version, ordered, decline, return_state
+def test_kda_state_update_with_supported_or_declined_overwrite(
+    monkeypatch, adapter, ordered, decline, return_state
 ):
-    monkeypatch.setattr(adapter.cudnn, "__version__", version)
     uid = adapter.UIDs
     rejected = []
 
     def create(family, q, k, v, g, beta, cu, out, **kwargs):
         overwrite = kwargs.get("overwrite_initial_state", False)
-        if version == "1.29.0" and overwrite:
-            raise AssertionError("overwrite was requested from an older frontend")
         if overwrite and decline is not None:
             rejected.append(True)
             error = (
@@ -146,8 +143,6 @@ def test_kda_state_update_survives_older_or_declining_frontend(
 
 @pytest.mark.cpu_only
 def test_kda_does_not_hide_an_unexpected_graph_build_failure(monkeypatch, adapter):
-    monkeypatch.setattr(adapter.cudnn, "__version__", "1.30.0")
-
     def invalid_graph(*args, **kwargs):
         raise ValueError("invalid graph descriptor")
 
@@ -214,20 +209,9 @@ def _pool_inputs():
 
 
 @pytest.mark.cpu_only
-def test_kda_pool_requires_new_frontend_before_any_state_write(monkeypatch, adapter):
-    monkeypatch.setattr(adapter.cudnn, "__version__", "1.30.0")
-    inputs = _pool_inputs()
-    before = inputs["initial_state"].clone()
-    with pytest.raises(RuntimeError, match="KDA state pools.*1.31"):
-        adapter.cudnn_recurrent_kda(**inputs)
-    torch.testing.assert_close(inputs["initial_state"], before)
-
-
-@pytest.mark.cpu_only
 def test_kda_pool_declining_plan_does_not_retry_with_compact_scratch(
     monkeypatch, adapter
 ):
-    monkeypatch.setattr(adapter.cudnn, "__version__", "1.31.0")
     calls = []
 
     def decline(*args, **kwargs):

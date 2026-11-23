@@ -21,7 +21,7 @@ from flashinfer.moe_ep import (
     Sm107SharedExpertWeights,
 )
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
 
 
@@ -128,7 +128,7 @@ def test_weight_pack_preserves_shared_ownership(prequantized):
 
 
 def test_feature_cache_entries_do_not_alias():
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import knob_cache
 
     key = dict(
         dtype="mxfp8_e4m3",
@@ -172,7 +172,7 @@ def test_shared_scale_override_requires_an_input():
 @pytest.mark.parametrize("situ", [False, True])
 def test_shared_reference_sampling_preserves_rows(kind, situ):
     from types import SimpleNamespace
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.correctness import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.correctness import (
         _shared_reference,
     )
 
@@ -230,9 +230,7 @@ def test_exported_native_feature_construction(
     kind, variant, dedup, shared, monkeypatch
 ):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
-        block_scaled,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import block_scaled
 
     monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda n: 8)
     cfg = _native_config(
@@ -254,9 +252,7 @@ def test_exported_native_feature_construction(
 @pytest.mark.parametrize("shared", [False, True])
 def test_genphase_shared_reducer_crosses_polled_limit(topk, shared, monkeypatch):
     pytest.importorskip("cutlass")
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
-        block_scaled,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import block_scaled
 
     monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda n: 8)
     cfg = _native_config(
@@ -707,9 +703,7 @@ def test_public_shared_and_dedup_graph_padded_scales(
 def test_public_shared_and_dedup_graph_tuning(ep_runtime, variant, dedup, monkeypatch):
     """Keep shared bindings through candidate trials and variant installation."""
     from flashinfer.autotuner import AutoTuner
-    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
-        autotune as native,
-    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import autotune as native
 
     candidates = pkg.sm107_candidates
 

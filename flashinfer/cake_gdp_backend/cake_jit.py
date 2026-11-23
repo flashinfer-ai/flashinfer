@@ -78,6 +78,11 @@ variant and band and stores the same bits.  Its cells admit the stochastic
 calls with snapshots of the measured cell, and its plain program's cells admit
 every other call of the band, so every call still selects exactly one program
 and an FP16 pool still runs the body and variant an FP32 pool would run.
+The FP16 row-partition program has a sibling built with ``draw_share``: each
+Philox draw of its store is computed once and shared by a lane shuffle, so it
+stores the same bits.  Its cell admits the stochastic calls of the band
+(``rounds_at_least``), and its plain program keeps the calls that round to
+nearest even (``rounds_at_most``).
 
 Prefill: the ``prefill`` route holds the single-pass programs of two kernel
 bodies: the V6 fork-order body (``body`` ``prefill_sm90_v6``: the plain, the
@@ -113,7 +118,7 @@ eight rows
 per head), ``num_householder`` (``n``),
 ``t_steps`` (a fixed token count compiled in; ``None`` for a runtime token
 count up to ``max_t_steps``), ``use_qk_l2norm``, on an FP16-pool record
-``state_dtype`` and on a sibling ``snapshot_noise``.  Prefill: the six flags
+``state_dtype`` and on a sibling ``snapshot_noise`` or ``draw_share``.  Prefill: the six flags
 ``use_initial_state``, ``use_state_indices``, ``store_final_state``,
 ``unit_gates``, ``unit_beta`` and ``segment_pass`` beside the defaults of the
 kernel's build signature (the I/O dtype ``bf16``, the WY solve arm, the O
@@ -6229,6 +6234,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "above": 0,
             "at_most": 160,
             "kind": "state_heads_between",
+            "rounds_at_most": 4,
         },
     },
     "cake_gdp_e1047159db983943d97b": {
@@ -6993,18 +6999,58 @@ MODULES: dict[str, dict[str, Any]] = {
             {
                 "above": 0,
                 "at_most": None,
+                "ctas_per_sm_at_most": 3,
                 "kind": "state_heads_between",
                 "rounds_at_least": 10,
                 "snapshot": True,
-                "arches": ["sm_100a", "sm_103a"],
             },
             {
                 "above": 0,
+                "arches": ["sm_100a", "sm_103a"],
                 "at_most": None,
+                "ctas_per_sm_above": 4,
+                "kind": "state_heads_between",
+                "rounds_at_least": 10,
+                "snapshot": True,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a"],
+                "at_most": None,
+                "ctas_per_sm_above": 3,
+                "ctas_per_sm_at_most": 4,
+                "kind": "state_heads_between",
+                "rounds_at_least": 11,
+                "snapshot": True,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 4,
+                "ctas_per_sm_at_most": 124,
+                "kind": "state_heads_between",
+                "rounds_at_least": 10,
+                "snapshot": True,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 3,
+                "ctas_per_sm_at_most": 4,
                 "kind": "state_heads_between",
                 "rounds_at_least": 16,
                 "snapshot": True,
+            },
+            {
+                "above": 0,
                 "arches": ["sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 124,
+                "kind": "state_heads_between",
+                "rounds_at_least": 11,
+                "snapshot": True,
             },
         ],
     },
@@ -7796,20 +7842,38 @@ MODULES: dict[str, dict[str, Any]] = {
                 "at_most": None,
                 "kind": "state_heads_between",
                 "rounds_at_most": 9,
-                "arches": ["sm_100a", "sm_103a"],
-            },
-            {
-                "above": 0,
-                "at_most": None,
-                "kind": "state_heads_between",
-                "rounds_at_most": 15,
-                "arches": ["sm_107a"],
             },
             {
                 "above": 0,
                 "at_most": None,
                 "kind": "state_heads_between",
                 "snapshot": False,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_100a", "sm_103a"],
+                "at_most": None,
+                "ctas_per_sm_above": 3,
+                "ctas_per_sm_at_most": 4,
+                "kind": "state_heads_between",
+                "rounds_at_most": 10,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 3,
+                "ctas_per_sm_at_most": 4,
+                "kind": "state_heads_between",
+                "rounds_at_most": 15,
+            },
+            {
+                "above": 0,
+                "arches": ["sm_107a"],
+                "at_most": None,
+                "ctas_per_sm_above": 124,
+                "kind": "state_heads_between",
+                "rounds_at_most": 10,
             },
         ],
     },
@@ -8645,6 +8709,165 @@ MODULES: dict[str, dict[str, Any]] = {
             "use_state_indices": True,
         },
     },
+    "cake_gdp_ff55032bc5fdf2697d77": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "q",
+            ],
+            [
+                "buffer",
+                "k",
+            ],
+            [
+                "buffer",
+                "v",
+            ],
+            [
+                "buffer",
+                "state",
+            ],
+            [
+                "buffer",
+                "A_log",
+            ],
+            [
+                "buffer",
+                "a",
+            ],
+            [
+                "buffer",
+                "dt_bias",
+            ],
+            [
+                "buffer",
+                "b",
+            ],
+            [
+                "buffer",
+                "out",
+            ],
+            [
+                "buffer",
+                "initial_state_indices",
+            ],
+            [
+                "buffer",
+                "output_state_indices",
+            ],
+            [
+                "buffer",
+                "ssm_state_indices",
+            ],
+            [
+                "buffer",
+                "rand_seed",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "num_tokens",
+            ],
+            [
+                "parameter",
+                "scale",
+            ],
+            [
+                "parameter",
+                "disable_state_update",
+            ],
+            [
+                "parameter",
+                "use_ssm_state_indices",
+            ],
+            [
+                "parameter",
+                "philox_rounds",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "body": "splitv",
+        "build": {
+            "draw_share": True,
+            "max_t_steps": 8,
+            "num_householder": 3,
+            "state_dtype": "f16",
+            "t_steps": 1,
+            "use_qk_l2norm": True,
+            "variant": "splitv8_tile8",
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_state": 8,
+            "kind": "state_heads",
+            "tile_v": 8,
+        },
+        "kernel": "cake_gdp_ff55032bc5fdf2697d77",
+        "kernel_symbol": "kernel_cake_gdp_ff55032bc5fdf2697d77",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 2304,
+            "use_pdl": False,
+        },
+        "library": "cake_gdp_ff55032bc5fdf2697d77",
+        "logical": {
+            "A_log": "A_log",
+            "a": "a",
+            "b": "b",
+            "disable_state_update": "disable_state_update",
+            "dt_bias": "dt_bias",
+            "heads": "heads",
+            "initial_state_indices": "initial_state_indices",
+            "k": "k",
+            "num_tokens": "num_tokens",
+            "out": "out",
+            "output_state_indices": "output_state_indices",
+            "philox_rounds": "philox_rounds",
+            "q": "q",
+            "rand_seed": "rand_seed",
+            "scale": "scale",
+            "ssm_state_indices": "ssm_state_indices",
+            "state": "state",
+            "use_ssm_state_indices": "use_ssm_state_indices",
+            "v": "v",
+        },
+        "role": "decode",
+        "select_rule": {
+            "above": 0,
+            "at_most": 160,
+            "kind": "state_heads_between",
+            "rounds_at_least": 5,
+        },
+    },
 }
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_90a": {
@@ -8735,6 +8958,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_f5d305e6f05978caca3c",
             "cake_gdp_b047f2f1a20630e6f36b",
             "cake_gdp_efdf403e0df822bfc83f",
+            "cake_gdp_ff55032bc5fdf2697d77",
         ],
         "decode_nh4": [
             "cake_gdp_3425d6511e4eab4896cd",
@@ -8789,6 +9013,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_f5d305e6f05978caca3c",
             "cake_gdp_b047f2f1a20630e6f36b",
             "cake_gdp_efdf403e0df822bfc83f",
+            "cake_gdp_ff55032bc5fdf2697d77",
         ],
         "decode_nh4": [
             "cake_gdp_3425d6511e4eab4896cd",
@@ -8843,6 +9068,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gdp_f5d305e6f05978caca3c",
             "cake_gdp_b047f2f1a20630e6f36b",
             "cake_gdp_efdf403e0df822bfc83f",
+            "cake_gdp_ff55032bc5fdf2697d77",
         ],
         "decode_nh4": [
             "cake_gdp_3425d6511e4eab4896cd",

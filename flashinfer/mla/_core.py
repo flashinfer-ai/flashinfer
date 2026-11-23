@@ -2852,14 +2852,16 @@ from ._batch_mla._wrapper import (
 _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 
 # Query rows (batch * q_len) up to which the Cake candidate is profiled and
-# runs. It keeps every generic CLC launch within the device work-order window.
-# The FP8 page-64 route allocates its split-K partials on every call (about
-# rows * num_split * 129 KiB, num_split 2 from 37 rows on), also inside every
-# captured graph, so FP8 stops at 128 rows (about 33 MiB). The BF16 split-KV
-# route allocates its partials on every call too, at most one wave of clusters
-# (rows * num_split <= num_sms // 2) of 128.5 KiB each, about 10 MiB. The other
-# routes the candidate takes allocate nothing per call but an 8 KiB work order.
-_CAKE_MLA_MAX_ROWS = 512
+# runs: the device work-order window (``_MAX_ORDERED_ROWS``, 1024 rows), so
+# every generic CLC launch of more rows than one wave of clusters takes the
+# longest-first order. The FP8 page-64 route allocates its split-K partials on
+# every call (about rows * num_split * 129 KiB; one split from 38 rows on, 39
+# on 152 SMs), also inside every captured graph, so FP8 stops at 128 rows
+# (about 16 MiB). The BF16 split-KV route allocates its partials on every call
+# too, at most one wave of clusters (rows * num_split <= num_sms // 2) of
+# 128.5 KiB each, about 10 MiB. The other routes the candidate takes allocate
+# nothing per call but an 8 KiB work order.
+_CAKE_MLA_MAX_ROWS = 1024
 _CAKE_MLA_FP8_MAX_ROWS = 128
 
 
@@ -2884,7 +2886,9 @@ _CAKE_MLA_FP8_MAX_ROWS = 128
 # edge).
 #
 # Devices, dtypes, page sizes, q_len values, max_seq_len buckets and batches
-# that are not listed never offer Cake. Requests with sinks are not offered.
+# that are not listed never offer Cake. Requests with sinks are offered only
+# for the units listed under a key with has_sinks True, measured with sinks
+# (BF16 only: FP8 with sinks takes the generic tail program).
 _CAKE_MLA_AUTO_OFFERS: Dict[
     Tuple[str, int, str, int, int, bool], Tuple[Tuple[str, int, int, int], ...]
 ] = {
@@ -2893,6 +2897,10 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_clc", 512, 128, 255),
         ("mla_bf16_clc", 1024, 128, 255),
         ("mla_bf16_clc", 2048, 128, 255),
+        ("mla_bf16_clc", 4096, 128, 255),
+        ("mla_bf16_splitkv", 4096, 1, 1),
+        ("mla_bf16_splitkv", 8192, 2, 7),
+        ("mla_bf16_splitkv", 16384, 1, 3),
         ("mla_bf16_vquarter", 128, 1, 15),
         ("mla_bf16_vquarter", 256, 1, 15),
         ("mla_bf16_vquarter", 512, 1, 15),
@@ -2901,26 +2909,41 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_clc", 512, 64, 127),
         ("mla_bf16_clc", 1024, 64, 127),
         ("mla_bf16_clc", 2048, 64, 255),
+        ("mla_bf16_clc", 4096, 64, 127),
+        ("mla_bf16_splitkv", 4096, 2, 3),
+        ("mla_bf16_splitkv", 8192, 1, 3),
+        ("mla_bf16_splitkv", 16384, 2, 3),
         ("mla_bf16_vquarter", 128, 1, 7),
         ("mla_bf16_vquarter", 256, 1, 7),
         ("mla_bf16_vquarter", 512, 1, 7),
     ),
     ("sm_100a", 148, "bfloat16", 64, 1, False): (
+        ("mla_bf16_splitkv", 4096, 1, 1),
+        ("mla_bf16_splitkv", 8192, 1, 3),
+        ("mla_bf16_splitkv", 16384, 1, 1),
         ("mla_bf16_vquarter", 128, 1, 15),
         ("mla_bf16_vquarter", 256, 1, 15),
         ("mla_bf16_vquarter", 512, 1, 15),
     ),
     ("sm_100a", 148, "bfloat16", 64, 2, False): (
+        ("mla_bf16_splitkv", 4096, 2, 3),
+        ("mla_bf16_splitkv", 8192, 1, 3),
+        ("mla_bf16_splitkv", 16384, 1, 3),
         ("mla_bf16_vquarter", 128, 1, 7),
         ("mla_bf16_vquarter", 256, 1, 7),
         ("mla_bf16_vquarter", 512, 1, 7),
     ),
     ("sm_100a", 148, "float8_e4m3fn", 64, 1, False): (
+        ("mla_fp8_page64_pdl", 128, 16, 63),
+        ("mla_fp8_page64_pdl", 256, 16, 63),
+        ("mla_fp8_page64_pdl", 1024, 32, 63),
         ("mla_fp8_page64_pdl", 2048, 16, 31),
         ("mla_fp8_page64_pdl", 4096, 16, 31),
         ("mla_fp8_page64_pdl", 8192, 16, 31),
     ),
     ("sm_100a", 148, "float8_e4m3fn", 64, 2, False): (
+        ("mla_fp8_page64_pdl", 128, 8, 31),
+        ("mla_fp8_page64_pdl", 256, 16, 31),
         ("mla_fp8_page64_pdl", 2048, 8, 15),
         ("mla_fp8_page64_pdl", 4096, 8, 15),
         ("mla_fp8_page64_pdl", 8192, 8, 15),
@@ -2930,6 +2953,10 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_clc", 1024, 128, 255),
         ("mla_bf16_clc", 2048, 128, 511),
         ("mla_bf16_clc", 4096, 128, 511),
+        ("mla_bf16_splitkv", 4096, 1, 1),
+        ("mla_bf16_splitkv", 8192, 2, 7),
+        ("mla_bf16_splitkv", 16384, 1, 1),
+        ("mla_bf16_splitkv", 16384, 4, 7),
         ("mla_bf16_vquarter", 128, 1, 15),
         ("mla_bf16_vquarter", 256, 1, 15),
         ("mla_bf16_vquarter", 512, 1, 15),
@@ -2939,26 +2966,45 @@ _CAKE_MLA_AUTO_OFFERS: Dict[
         ("mla_bf16_clc", 1024, 64, 127),
         ("mla_bf16_clc", 2048, 64, 255),
         ("mla_bf16_clc", 4096, 128, 255),
+        ("mla_bf16_splitkv", 4096, 2, 3),
+        ("mla_bf16_splitkv", 8192, 2, 3),
+        ("mla_bf16_splitkv", 16384, 2, 3),
+        ("mla_bf16_splitkv", 32768, 2, 3),
+        ("mla_bf16_splitkv", 65536, 2, 3),
         ("mla_bf16_vquarter", 128, 1, 7),
         ("mla_bf16_vquarter", 256, 1, 7),
         ("mla_bf16_vquarter", 512, 1, 7),
     ),
     ("sm_103a", 152, "bfloat16", 64, 1, False): (
+        ("mla_bf16_splitkv", 4096, 1, 1),
+        ("mla_bf16_splitkv", 8192, 4, 7),
+        ("mla_bf16_splitkv", 16384, 1, 1),
+        ("mla_bf16_splitkv", 16384, 4, 7),
         ("mla_bf16_vquarter", 128, 1, 15),
         ("mla_bf16_vquarter", 256, 1, 15),
         ("mla_bf16_vquarter", 512, 1, 15),
         ("mla_bf16_vquarter", 1024, 8, 15),
     ),
     ("sm_103a", 152, "bfloat16", 64, 2, False): (
+        ("mla_bf16_splitkv", 4096, 2, 3),
+        ("mla_bf16_splitkv", 8192, 2, 3),
+        ("mla_bf16_splitkv", 16384, 1, 3),
+        ("mla_bf16_splitkv", 32768, 2, 3),
+        ("mla_bf16_splitkv", 65536, 2, 3),
+        ("mla_bf16_splitkv", 131072, 2, 3),
         ("mla_bf16_vquarter", 128, 1, 7),
         ("mla_bf16_vquarter", 256, 1, 7),
         ("mla_bf16_vquarter", 512, 1, 7),
         ("mla_bf16_vquarter", 1024, 4, 7),
     ),
     ("sm_103a", 152, "float8_e4m3fn", 64, 1, False): (
+        ("mla_fp8_page64_pdl", 128, 16, 63),
+        ("mla_fp8_page64_pdl", 256, 16, 63),
         ("mla_fp8_page64_pdl", 2048, 16, 31),
     ),
     ("sm_103a", 152, "float8_e4m3fn", 64, 2, False): (
+        ("mla_fp8_page64_pdl", 128, 8, 31),
+        ("mla_fp8_page64_pdl", 256, 8, 31),
         ("mla_fp8_page64_pdl", 1024, 2, 3),
         ("mla_fp8_page64_pdl", 2048, 8, 15),
         ("mla_fp8_page64_pdl", 4096, 8, 15),
@@ -2981,8 +3027,6 @@ def _cake_mla_auto_offer_ranges(
 ) -> Tuple[Tuple[str, int, int], ...]:
     """The ``(domain, first batch, last batch)`` ranges ``_CAKE_MLA_AUTO_OFFERS``
     lists for this device, request configuration and max_seq_len bucket."""
-    if has_sinks:
-        return ()
     entries = _CAKE_MLA_AUTO_OFFERS.get(
         (arch, num_sms, _cake_mla_dtype_name(dtype), page_size, q_len, has_sinks),
         (),
@@ -3065,10 +3109,10 @@ def _cake_mla_table_memo() -> Dict[Any, Any]:
 
 
 # The results of ``_cake_mla_auto_batch_ranges`` per request configuration
-# ``(device index, dtype, page size, q_len, max_seq_len bucket)``: ``(offer
-# table, device facts function, {configuration: ranges})``, replaced as one tuple
-# when the table or the Cake module's ``_device_facts`` is another object
-# (tests patch both). A configuration seen before then pays one dict lookup
+# ``(device index, dtype, page size, q_len, has sinks, max_seq_len bucket)``:
+# ``(offer table, device facts function, {configuration: ranges})``, replaced
+# as one tuple when the table or the Cake module's ``_device_facts`` is another
+# object (tests patch both). A configuration seen before then pays one dict lookup
 # and two identity checks instead of the device facts and the table memo, also
 # when configurations alternate. Bounded like ``_CAKE_MLA_TABLE_MEMO``.
 _CAKE_MLA_RANGES_MEMO: List[Any] = [None]
@@ -3088,11 +3132,10 @@ def _cake_mla_auto_batch_ranges(
     SM100a/SM103a. A configuration's result is reused while the offer table
     and the Cake module's ``_device_facts`` are the same objects (the ranges
     read nothing else, and only the bucket of ``max_seq_len``, so every
-    ``max_seq_len`` of a bucket shares one entry)."""
-    if has_sinks:
-        return ()
+    ``max_seq_len`` of a bucket shares one entry). Requests with and without
+    sinks are separate configurations."""
     seq_bucket = _round_to_seq_len_bucket(max_seq_len)
-    configuration = (device_index, dtype, page_size, q_len, seq_bucket)
+    configuration = (device_index, dtype, page_size, q_len, has_sinks, seq_bucket)
     device_facts = _cake_mla_module()._device_facts
     table = _CAKE_MLA_AUTO_OFFERS
     memo = _CAKE_MLA_RANGES_MEMO[0]
@@ -3103,7 +3146,7 @@ def _cake_mla_auto_batch_ranges(
     else:
         memo = None
     ranges = _cake_mla_lookup_batch_ranges(
-        device_facts, device_index, dtype, page_size, q_len, seq_bucket
+        device_facts, device_index, dtype, page_size, q_len, seq_bucket, has_sinks
     )
     if _CAKE_MLA_AUTO_OFFERS is table:  # else replaced during the lookup
         if memo is None:
@@ -3122,9 +3165,10 @@ def _cake_mla_lookup_batch_ranges(
     page_size: int,
     q_len: int,
     seq_bucket: int,
+    has_sinks: bool = False,
 ) -> Tuple[Tuple[int, int], ...]:
-    """``_cake_mla_auto_batch_ranges`` without sinks for the ``max_seq_len``
-    bucket ``seq_bucket``, from the table memo."""
+    """``_cake_mla_auto_batch_ranges`` for the ``max_seq_len`` bucket
+    ``seq_bucket``, from the table memo."""
     if (device_facts, device_index) in _CAKE_MLA_NO_PROGRAM_DEVICES:
         return ()
     try:
@@ -3133,13 +3177,13 @@ def _cake_mla_lookup_batch_ranges(
         _CAKE_MLA_NO_PROGRAM_DEVICES.add((device_facts, device_index))
         return ()
     memo = _cake_mla_table_memo()
-    key = ("ranges", arch, num_sms, dtype, page_size, q_len, seq_bucket)
+    key = ("ranges", arch, num_sms, dtype, page_size, q_len, has_sinks, seq_bucket)
     ranges = memo.get(key)
     if ranges is None:
         ranges = tuple(
             (first, last)
             for _, first, last in _cake_mla_auto_offer_ranges(
-                arch, num_sms, dtype, page_size, q_len, False, seq_bucket
+                arch, num_sms, dtype, page_size, q_len, has_sinks, seq_bucket
             )
         )
         memo[key] = ranges
@@ -3417,18 +3461,8 @@ def _cake_mla_auto_candidate_reason(
     )
     if reason is not None:
         return reason
-    if sinks is not None:
-        sink = (
-            sinks[0] if isinstance(sinks, (list, tuple)) and len(sinks) == 1 else sinks
-        )
-        if not (
-            isinstance(sink, torch.Tensor)
-            and sink.device == query.device
-            and sink.dtype == torch.float32
-            and sink.is_contiguous()
-            and tuple(sink.shape) == (query.size(-2),)
-        ):
-            return _CAKE_MLA_SINK_REASON
+    if sinks is not None and not _cake_mla_sink_ok(sinks, query):
+        return _CAKE_MLA_SINK_REASON
     if not (
         query.is_contiguous()
         and kv_cache.is_contiguous()
@@ -3447,6 +3481,19 @@ _CAKE_MLA_SINK_REASON = "requires one contiguous FP32 sink value per head"
 _CAKE_MLA_CONTIGUITY_REASON = (
     "requires contiguous query, kv_cache, block_tables, seq_lens and out"
 )
+
+
+def _cake_mla_sink_ok(sinks: Any, query: torch.Tensor) -> bool:
+    """Whether ``sinks`` (not ``None``) is one contiguous FP32 tensor of one
+    value per head on the query's device, alone or in a list or tuple of one."""
+    sink = sinks[0] if isinstance(sinks, (list, tuple)) and len(sinks) == 1 else sinks
+    return (
+        isinstance(sink, torch.Tensor)
+        and sink.device == query.device
+        and sink.dtype == torch.float32
+        and sink.is_contiguous()
+        and tuple(sink.shape) == (query.size(-2),)
+    )
 
 
 def _cake_mla_auto_scalar_reason(
@@ -3821,11 +3868,10 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
         inputs: the launch ``trtllm_mla_blackwell_decode(..., stateless=True)``
         makes, resolved once (``DeviceRowLaunch``), or ``None`` when the route
         takes a program whose rows the host plans, or the device has no FP8
-        decode table yet. Only for a request without sinks."""
+        decode table yet. With sinks the launch applies a sink; the plan holds
+        no sink tensor (``forward`` passes the call's)."""
         cake = _cake_mla_module()
         query, block_tables = inputs[0], inputs[1]
-        if self.sinks is not None:
-            return None
         device = query.device
         lut = cake._FP8_LUTS.get(device)
         if lut is None:
@@ -3843,7 +3889,7 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
             arch=arch,
             num_sms=num_sms,
             num_heads=num_heads,
-            has_sink=False,
+            has_sink=self.sinks is not None,
             softmax_scale_log2=self._bmm1_scale * log2e,
             bmm2=self._bmm2_scale,
             total_q=total_q,
@@ -3996,8 +4042,10 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
             # The launch the second stage resolved for exactly these inputs
             # (their sizes and contiguity were checked for this call): the
             # kernels and arguments of the dispatcher's stateless mode, without
-            # re-deriving them.
+            # re-deriving them. The sink is the call's: in-place updates of its
+            # values reach a captured graph.
             launch, _, placeholder, device = plan
+            sink = _normalize_optional_mla_sink(self.sinks, "backend='auto'")
             _cake_mla_module().launch_device_rows(
                 launch,
                 query=query,
@@ -4005,7 +4053,7 @@ class _CakeTrtllmMlaBlackwellRunner(TunableRunner):
                 out=out,
                 seq_lens=seq_lens,
                 block_tables=block_tables,
-                sink_arg=placeholder,
+                sink_arg=placeholder if sink is None else sink,
                 device=device,
                 stream=torch._C._cuda_getCurrentRawStream(device.index),
                 stateless=True,
@@ -4749,14 +4797,16 @@ def _mla_cake_auto_memo_get(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     out: torch.Tensor,
+    sinks: Any = None,
 ) -> Optional[tuple]:
     """The memoized decision of this call, ``(first-stage runner index,
     first-stage tactic, cake)``, or ``None`` when the call selects: no entry,
     another tuner, offer table, split-KV device ranges or ``state`` (the call's
     ``_mla_cake_memo_state``, not ``None``), or a Cake decision whose families
-    are not ready. A Cake decision for tensors that are not all contiguous
-    runs the first stage's selection (``cake`` ``None``). Raises ``TypeError``
-    for an unhashable key."""
+    are not ready. A Cake decision for tensors that are not all contiguous, or
+    for sinks that are not one contiguous FP32 value per head on the query's
+    device, runs the first stage's selection (``cake`` ``None``), as the
+    eligibility check makes it. Raises ``TypeError`` for an unhashable key."""
     entry = _CAKE_MLA_AUTO_MEMO.get(memo_key)
     if (
         entry is None
@@ -4776,6 +4826,7 @@ def _mla_cake_auto_memo_get(
         and block_tables.is_contiguous()
         and seq_lens.is_contiguous()
         and out.is_contiguous()
+        and (sinks is None or _cake_mla_sink_ok(sinks, query))
     ):
         return decision[0], decision[1], None
     if not _cake_mla_families_ready(cake[1], query.device, cake[3]):
@@ -5497,7 +5548,13 @@ def _mla_with_kv_cache_impl(
         ``"sparse"``.
         ``"cake"`` explicitly selects the source-level Blackwell semantic
         dispatcher. It covers its qualified BF16/FP8 dense, sparse, compact-Q,
-        sink, LSE, and caller-owned-output envelope. An untuned ``"auto"`` call
+        sink, LSE, and caller-owned-output envelope. Requests its tuned
+        Blackwell programs do not serve (BF16 LSE output, FP8 with page size
+        32 outside one exact geometry, FP8 with sinks, head counts other than
+        128, sparse top-k) run a scalar
+        generic tail program that takes milliseconds per call; the first such
+        call per reason logs a warning. FP8 page-64 LSE output runs the tuned
+        FP8 page-64 program, at any ``max_seq_len``. An untuned ``"auto"`` call
         never selects it; under ``flashinfer.autotune(True)`` its dense
         Blackwell route can win a uniform-Q ``"auto"`` request (see Autotune
         below). ``"auto"``
@@ -5549,10 +5606,11 @@ def _mla_with_kv_cache_impl(
     return_lse_base : Optional[Literal["basee", "base2"]] = None
         Logarithm base of LSE values, including values written to a supplied
         ``lse`` buffer. Supported by ``trtllm-gen``, ``cute-dsl``, ``sparse`` and
-        the ``cake`` Kimi-K3 FP8 route. ``"basee"`` selects natural-log units and
+        both ``cake`` routes. ``"basee"`` selects natural-log units and
         ``"base2"`` selects base-2 units. ``None`` preserves each backend's
-        historical default: base-2 for ``trtllm-gen`` and ``sparse``, and
-        natural-log for monolithic ``cute-dsl`` and the ``cake`` Kimi-K3 route.
+        historical default: base-2 for ``trtllm-gen``, ``sparse`` and the
+        ``cake`` Blackwell route, and natural-log for monolithic ``cute-dsl``
+        and the ``cake`` Kimi-K3 route.
         Select an explicit base for stable units under
         ``backend="auto"``. This option does not enable LSE output; use
         ``return_lse=True`` to request it. Other values raise
@@ -5673,7 +5731,8 @@ def _mla_with_kv_cache_impl(
     (``_CAKE_MLA_AUTO_OFFERS``: device, dtype, page size, ``q_len``,
     ``max_seq_len`` bucket and batch range) lists, where Cake measured faster
     than the other candidates; elsewhere, and on devices the table does not
-    list, Cake is never offered. Requests with sinks are not offered. Outside
+    list, Cake is never offered. A request with sinks is offered only for the
+    units the table lists with sinks (BF16 only). Outside
     tuning the second stage runs only while the tuner holds a Cake result, and
     tuning under ``flashinfer.autotuner.set_autotune_process_group`` skips it.
     Cake is eligible only for dense requests its aligned programs serve with
@@ -5683,7 +5742,7 @@ def _mla_with_kv_cache_impl(
     tensors; never with sparse MLA, ``sparse_mla_top_k_lens``, skip-softmax,
     ``use_fp16_softmax``, DCP, a ``multi_ctas_kv_counter_buffer`` or LSE output.
     Its generic tail program and the Kimi-K3 FP8 Cake route never join. Cake
-    serves at most 512 query rows (``batch * q_len``; FP8 128) and is offered for
+    serves at most 1024 query rows (``batch * q_len``; FP8 128) and is offered for
     a tuning bucket only when every batch the bucket serves is listed and
     launches the programs of the profiled batch, so never for the largest
     bucket. An untuned call never selects Cake. Every Cake miss runs the first
@@ -6059,9 +6118,11 @@ def _mla_with_kv_cache_impl(
                             # Every argument the first stage's tuning config,
                             # the two stages' lookups and the Cake checks
                             # read, except the contiguity of the tensors and
-                            # the sinks (none: ``offered`` is empty with
-                            # sinks), and except the arguments the scalar
-                            # check above fixed; see the audit at
+                            # the sink tensor (whether there is one is
+                            # keyed: it selects the offer table's key, the
+                            # domain and the launch plan; the tensor is
+                            # checked on reuse), and except the arguments the
+                            # scalar check above fixed; see the audit at
                             # ``_CAKE_MLA_AUTO_MEMO``. Of ``max_seq_len`` only
                             # what the decision reads, so a caller varying it
                             # selects once per bucket, KV tile count and side
@@ -6098,6 +6159,7 @@ def _mla_with_kv_cache_impl(
                                 return_lse_base,
                                 cp_world,
                                 cp_rank,
+                                sinks is not None,
                             )
                             cake_decision = _mla_cake_auto_memo_get(
                                 tuner,
@@ -6108,6 +6170,7 @@ def _mla_with_kv_cache_impl(
                                 block_tables,
                                 seq_lens,
                                 out,
+                                sinks,
                             )
                         except TypeError:  # an unhashable argument
                             cake_memo_key = None
@@ -6522,7 +6585,7 @@ def _mla_with_kv_cache_impl(
             # (below) for everything else in its contract.
             from .cake_trtllm_mla_blackwell import trtllm_mla_blackwell_decode
 
-            return trtllm_mla_blackwell_decode(
+            result = trtllm_mla_blackwell_decode(
                 query=query,
                 kv_cache=kv_cache,
                 block_tables=block_tables,
@@ -6548,6 +6611,14 @@ def _mla_with_kv_cache_impl(
                 enable_dcp=enable_dcp,
                 backend="cake",
             )
+            # The Blackwell programs write base-2 LSE (log2 of the softmax
+            # denominator of the bmm1-scaled logits), also into a supplied
+            # ``lse``; natural-log units are converted in place.
+            if return_lse_base == "basee":
+                written = result[1] if return_lse else lse
+                if written is not None:
+                    written.mul_(1.0 / log2e)
+            return result
 
         # Cake-generated Kimi-K3 MLA over the FP8 paged latent cache (SM100 / SM103): dense
         # decode, packed variable-Q / MTP and incremental prefill; BF16 output, caller-owned

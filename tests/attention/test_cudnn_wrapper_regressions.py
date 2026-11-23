@@ -1042,8 +1042,6 @@ def test_paged_query_lengths_are_independent_of_storage_offsets(
 @pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_paged_auto_device_lengths_do_not_add_readback(dtype, metadata_device):
-    if dtype == torch.float16 and not prefill._cudnn_supports_paged_fp16_auto():
-        pytest.skip("FP16 auto requires stable FE 1.33")
     if (
         torch.cuda.get_device_capability() != (10, 0)
         or not prefill._cudnn_supports_paged_auto()
@@ -1405,8 +1403,6 @@ def test_prefill_scales_capture_replay(paged, scale_type, dtype):
 def test_paged_auto_preserves_runtime_scales(
     dtype, q_lengths, kv_lengths, expected_backend
 ):
-    if dtype == torch.float16 and not prefill._cudnn_supports_paged_fp16_auto():
-        pytest.skip("FP16 auto requires stable FE 1.33")
     if (
         torch.cuda.get_device_capability() != (10, 0)
         or not prefill._cudnn_supports_paged_auto()

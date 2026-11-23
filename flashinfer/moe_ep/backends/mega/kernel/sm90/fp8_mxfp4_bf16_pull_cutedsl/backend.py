@@ -74,7 +74,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
     _validate_forward_inputs = staticmethod(validate_sm90_mxfp4_forward_inputs)
 
     def _frontend_function(self, template: str):
-        from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
+        from flashinfer.moe_ep.shims.sm90 import cutedsl_megamoe as pkg
 
         return getattr(pkg, template.format(self._frontend_format))
 
