@@ -292,7 +292,7 @@ def run_dist_aware_tactic(
     routing_method_type: int,
     routed_scaling_factor: float | None,
     run_fixed_tactic: Callable[[Any], _ResultT],
-    finish_switch: Callable[[], _ResultT],
+    finish_switch: Callable[[Any], _ResultT],
 ) -> _ResultT:
     """Run the shared automatic DA lifecycle around one exact ordinary ABI."""
     # The adapter declares the only content-mutable inputs used by value-aware profiling and
@@ -398,11 +398,16 @@ def run_dist_aware_tactic(
         )
         if capture_result is None:
             return None
-        topology, conditional_node_handle = capture_result
+        topology, conditional_node_handle, auxiliary_outputs = capture_result
         state.record_topology(topology)
         from flashinfer.fused_moe.da_moe import DACaptureOutcome
 
-        return DACaptureOutcome(finish_switch(), topology, conditional_node_handle)
+        return DACaptureOutcome(
+            finish_switch(auxiliary_outputs),
+            topology,
+            conditional_node_handle,
+            () if auxiliary_outputs is None else auxiliary_outputs,
+        )
 
     return state.dispatch(
         bindings,
