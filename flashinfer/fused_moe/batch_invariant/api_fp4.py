@@ -899,22 +899,37 @@ _DUMMY_SF: Dict[str, torch.Tensor] = {}
 _UNIT: Dict[str, torch.Tensor] = {}
 
 
+def _const(cache: Dict, key, fill, device: torch.device) -> torch.Tensor:
+    """A constant operand of the kernels, cached per device: built on the host (``fill(cpu)``) and copied with a blocking copy,
+    so its bytes are on the device before the call returns and any stream may read it -- a captured call too (no node in the
+    graph). First met under CUDA graph capture it is a device fill (``fill(device)``): a graph-pool allocation whose fill runs
+    only at replay, so it serves that capture alone and is not cached (as the bf16 op's ``_const``)."""
+    t = cache.get(key)
+    if t is None:
+        if torch.cuda.is_current_stream_capturing():
+            return fill(device)
+        t = cache[key] = fill(torch.device("cpu")).to(device)
+    return t
+
+
 def _dummy_sf(device: torch.device) -> torch.Tensor:
     """A 512-byte placeholder for an unread scale-byte operand (one atom: the kernels' alignment assumption), per device."""
-    key = str(torch.device(device))
-    t = _DUMMY_SF.get(key)
-    if t is None:
-        t = _DUMMY_SF[key] = torch.zeros(512, dtype=torch.uint8, device=device)
-    return t
+    return _const(
+        _DUMMY_SF,
+        str(torch.device(device)),
+        lambda d: torch.zeros(512, dtype=torch.uint8, device=d),
+        device,
+    )
 
 
 def _placeholder(device: torch.device) -> torch.Tensor:
     """A one-element fp32 tensor for the scatter kernels' unread per-token-scale operands, per device (no fill per call)."""
-    key = str(torch.device(device))
-    t = _UNIT.get(key)
-    if t is None:
-        t = _UNIT[key] = torch.ones(1, dtype=torch.float32, device=device)
-    return t
+    return _const(
+        _UNIT,
+        str(torch.device(device)),
+        lambda d: torch.ones(1, dtype=torch.float32, device=d),
+        device,
+    )
 
 
 def route_plan_dual(
@@ -944,15 +959,17 @@ def route_plan_dual(
 
 
 def _gs_inv(gs_inv: Union[float, torch.Tensor], device: torch.device) -> torch.Tensor:
+    """The recipe's inverse base scale as a one-element fp32 tensor on ``device``: a tensor as given; a number from the
+    per-device cache (:func:`_const`: never a tensor first made under CUDA graph capture)."""
     if isinstance(gs_inv, torch.Tensor):
         return gs_inv.to(device=device, dtype=torch.float32).reshape(1)
-    key = (str(torch.device(device)), float(gs_inv))
-    t = _GS_INV.get(key)
-    if t is None:
-        t = _GS_INV[key] = torch.full(
-            (1,), float(gs_inv), dtype=torch.float32, device=device
-        )
-    return t
+    v = float(gs_inv)
+    return _const(
+        _GS_INV,
+        (str(torch.device(device)), v),
+        lambda d: torch.full((1,), v, dtype=torch.float32, device=d),
+        device,
+    )
 
 
 def quantize_activations(

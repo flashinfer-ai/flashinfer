@@ -1552,6 +1552,52 @@ def test_pdl_chain_alternating_inputs_give_each_call_its_own_bits(pair, body):
 
 
 @needs_device
+@pytest.mark.parametrize("which", ["nvfp4", "nvfp4_static", "mxfp4"])
+def test_op_constants_first_made_under_graph_capture_are_not_cached(which):
+    """The op's cached constants (the recipe's inverse base scale, the unread scale-byte and per-token placeholders) first
+    materialised while a CUDA graph is being captured are graph-pool allocations whose fill runs only at replay: they serve
+    that capture alone and are never cached, so an eager call after the capture and before any replay gives the bits of an
+    eager call before it, and the replay gives them too; through the layer, both pairs and the static class."""
+    from flashinfer.fused_moe.batch_invariant import api_fp4
+
+    T, k, H, I, E = 48, 4, 256, 128, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=61)
+    if which == "mxfp4":
+        layer, W = _layer(k, E, I, quant=_MX), _weights(w1, w2, quant=_MX)
+    elif which == "nvfp4":
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+    else:
+        layer = _layer(k, E, I, backend=BatchInvariantFp4Config(intermediate="static"))
+        W = MoEWeightPack({})
+        W.prepare_for(
+            KEY,
+            BatchInvariantFp4Config.prepare_weights(
+                w1, w2, activation=_SWIGLU, intermediate="static"
+            ),
+        )
+    act = _logits_pack(x, logits)
+    ref = bits(layer(act, W))  # eager: the compile, the winner, the constants cached
+    torch.cuda.synchronize()
+    caches = (api_fp4._GS_INV, api_fp4._DUMMY_SF, api_fp4._UNIT)
+    for c in caches:
+        c.clear()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            out_g = layer(act, W)
+    torch.cuda.synchronize()
+    assert not any(caches)  # nothing made under capture is served to later calls
+    out_e = layer(act, W)  # eager, before any replay
+    assert torch.equal(bits(out_e), ref)
+    out_g.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out_g), ref)
+    assert torch.equal(bits(layer(act, W)), ref)
+
+
+@needs_device
 @each_pair
 def test_packed_f32_weights_are_rounded_by_the_combine(pair):
     """The packed pre-routed form takes f32 weights that are not bf16 values and rounds them in the combine (the packed word's
