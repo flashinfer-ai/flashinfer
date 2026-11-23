@@ -2727,6 +2727,49 @@ def test_static_class_ladder(T, k, H, I, E, act, seed):
 
 
 @needs_device
+def test_prepared_static_scales_are_copies_of_the_callers_tensor():
+    """The static class's per-expert scales in the weight view are a copy of ``intermediate_scales`` (as the other prepared
+    tensors are): a caller's in-place change after ``prepare_weights`` changes neither the view (its scale and its reciprocal
+    stay the pair prepare formed) nor the output's bits."""
+    T, k, H, I, E = 32, 4, 256, 128, 8
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=91)
+    gs2 = torch.full((E,), 2.0, device="cuda")
+    view = BatchInvariantFp4Config.prepare_weights(
+        w1, w2, activation=_SWIGLU, intermediate="static", intermediate_scales=gs2
+    )
+    assert view["intermediate_scale"].data_ptr() != gs2.data_ptr()
+    assert torch.equal(view["intermediate_scale"], gs2) and torch.equal(
+        view["intermediate_inv_scale"], torch.full((E,), 0.5, device="cuda")
+    )
+    W = MoEWeightPack({})
+    W.prepare_for(KEY, view)
+    layer = _layer(k, E, I, backend=BatchInvariantFp4Config(intermediate="static"))
+    act = _logits_pack(x, logits)
+    ref = bits(layer(act, W))
+    gs2.fill_(0.25)
+    torch.cuda.synchronize()
+    assert torch.equal(view["intermediate_scale"], torch.full((E,), 2.0, device="cuda"))
+    assert torch.equal(bits(layer(act, W)), ref)
+    # the same values given afresh prepare the same view and bits; the changed values another class member's
+    view2 = BatchInvariantFp4Config.prepare_weights(
+        w1,
+        w2,
+        activation=_SWIGLU,
+        intermediate="static",
+        intermediate_scales=torch.full((E,), 2.0, device="cuda"),
+    )
+    W2 = MoEWeightPack({})
+    W2.prepare_for(KEY, view2)
+    assert torch.equal(bits(layer(act, W2)), ref)
+    view3 = BatchInvariantFp4Config.prepare_weights(
+        w1, w2, activation=_SWIGLU, intermediate="static", intermediate_scales=gs2
+    )
+    W3 = MoEWeightPack({})
+    W3.prepare_for(KEY, view3)
+    assert not torch.equal(bits(layer(act, W3)), ref)
+
+
+@needs_device
 def test_static_class_takes_any_positive_scale_and_unit_default():
     """The static scales are per-expert inputs (any positive value); the default is one, the open backends' unified-layer
     value."""

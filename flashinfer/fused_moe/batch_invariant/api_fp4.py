@@ -196,7 +196,8 @@ def check_shape_fp4(
 
 
 def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
-    """A per-expert vector of ``E`` multipliers as a contiguous fp32 ``[E]``: finite, positive, normal values (their
+    """A per-expert vector of ``E`` multipliers as a contiguous fp32 ``[E]``, a copy of the caller's values (the view's
+    tensors never alias the caller's: its reciprocal is formed once beside it): finite, positive, normal values (their
     reciprocals are factors of the class's chains); one element broadcasts to the experts."""
     v = torch.as_tensor(t, dtype=torch.float32, device=device)
     if v.numel() == 1:
@@ -205,7 +206,7 @@ def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
         raise ValueError(
             f"{NV_CLASS}: {name} must hold one fp32 multiplier per expert ({E}), got shape {tuple(v.shape)}"
         )
-    v = v.reshape(E).contiguous()
+    v = v.reshape(E).clone(memory_format=torch.contiguous_format)
     tiny = torch.finfo(torch.float32).tiny
     if not bool(torch.isfinite(v).all()) or not bool((v >= tiny).all()):
         raise ValueError(
