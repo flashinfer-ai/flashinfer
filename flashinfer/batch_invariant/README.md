@@ -261,10 +261,14 @@ its all-gather, NeMo RL re-runs its own autograd function on the saved logits fo
 forward alone and the frameworks own the adapter -- the one they already have, pointed at the class:
 
 ```python
-def _log_softmax_bi(input, dim, half_to_float):            # the aten::_log_softmax override of the trainers' modes
+def _log_softmax_bi(
+    input, dim, half_to_float
+):  # the aten::_log_softmax override of the trainers' modes
     assert dim in (-1, input.dim() - 1)
     out_dtype = torch.float32 if half_to_float else input.dtype
-    return flashinfer.sampling.log_softmax(input, batch_invariant=True, out_dtype=out_dtype)
+    return flashinfer.sampling.log_softmax(
+        input, batch_invariant=True, out_dtype=out_dtype
+    )
 ```
 
 The contract both sides must call with, written down because the frameworks disagree today (vLLM's `raw_logprobs` are
@@ -476,10 +480,19 @@ Without `initial_state` the same entry is a stateless call, the form a training 
 every one from the zero state, rows only.
 
 ```python
-out = torch.empty_like(v)          # once, reused every step
+out = torch.empty_like(v)  # once, reused every step
 flashinfer.chunk_gated_delta_rule(
-    q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out,
-    use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    cu_seqlens=cu,
+    cu_seqlens_cpu=offsets,
+    output=out,
+    use_qk_l2norm_in_kernel=True,
+    gate_domain="log",
+    batch_invariant=True,
 )
 ```
 
@@ -518,12 +531,26 @@ sequence starts from in a caller-owned buffer:
 ```python
 from flashinfer.batch_invariant.gdn import training_state_rows, training_state_slots
 
-states = torch.empty(training_state_slots(seq_lens), HV, 128, 128, device=v.device)   # fp32, once per layer
+states = torch.empty(
+    training_state_slots(seq_lens), HV, 128, 128, device=v.device
+)  # fp32, once per layer
 flashinfer.chunk_gated_delta_rule(
-    q, k, v, g, beta, cu_seqlens=cu, cu_seqlens_cpu=offsets, output=out, train_states=states,
-    use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    cu_seqlens=cu,
+    cu_seqlens_cpu=offsets,
+    output=out,
+    train_states=states,
+    use_qk_l2norm_in_kernel=True,
+    gate_domain="log",
+    batch_invariant=True,
 )
-rows = training_state_rows(seq_lens)   # rows[i][j]: the state chunk j of sequence i starts from (zero for j = 0)
+rows = training_state_rows(
+    seq_lens
+)  # rows[i][j]: the state chunk j of sequence i starts from (zero for j = 0)
 ```
 
 * A backward over the class's recurrence works from the inputs, the output gradient and, per 64-token chunk, the
@@ -634,10 +661,24 @@ Without `initial_state` the same entry is a stateless call, the form a training 
 one from the zero state, rows only.
 
 ```python
-out = torch.empty_like(v, memory_format=torch.contiguous_format)  # once, reused every step
+out = torch.empty_like(
+    v, memory_format=torch.contiguous_format
+)  # once, reused every step
 flashinfer.recurrent_kda(
-    q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0, cu_seqlens=cu, output=out,
-    use_gate_in_kernel=True, use_qk_l2norm_in_kernel=True, beta_is_logit=True, batch_invariant=True,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    A_log=A_log,
+    dt_bias=dt_bias,
+    lower_bound=-5.0,
+    cu_seqlens=cu,
+    output=out,
+    use_gate_in_kernel=True,
+    use_qk_l2norm_in_kernel=True,
+    beta_is_logit=True,
+    batch_invariant=True,
 )
 ```
 

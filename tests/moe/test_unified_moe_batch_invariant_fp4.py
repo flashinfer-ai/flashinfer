@@ -1268,6 +1268,114 @@ def test_both_packings_and_the_prequantized_pack_forms_give_the_bits(pair):
 
 @needs_device
 @each_pair
+def test_quantizer_scale_buffer_as_returned_at_row_counts_that_are_multiples_of_128(
+    pair,
+):
+    """The public quantizers (``nvfp4_quantize(..., per_token_activation=True, batch_invariant=True)``,
+    ``mxfp4_quantize(..., batch_invariant=True)``) return the 128x4 scale buffer 2-D, rows padded to 128 and columns to 4: at a
+    row count that is a multiple of 128 it has the linear layout's shape ``[T, H / block]``. Through the layer, the buffer as
+    returned and flattened both give the bf16-input path's bits under ``QuantConfig(swizzled_scale_factors=True)``, the linear
+    layout under ``swizzled_scale_factors=False``, at ``T`` in {127, 128, 129, 256, 384}; without the flag the shape names the
+    layout where it can (127, 129; the flat buffer everywhere) and the colliding shape is refused, by the layer and by the op,
+    which takes ``sf_layout`` instead."""
+    from flashinfer import mxfp4_quantize, nvfp4_quantize
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        TE_GS_INV,
+        fused_moe_fp4,
+        sf_layouts_collide,
+    )
+
+    k, H, I, E = 4, 512, 256, 16
+    base = _NVFP4_PTS if pair.scaled else _MX
+    layers = {
+        flag: _layer(
+            k, E, I, quant=dataclasses.replace(base, swizzled_scale_factors=flag)
+        )
+        for flag in (None, True, False)
+    }
+    plain = _layer(k, E, I, quant=_QUANT[pair])
+    mode = RoutingInputMode.UnpackedPrecomputed
+
+    def pack(q, scale, p, ids, weights):
+        return MoEActivationPack(
+            q, scale, topk_ids=ids, topk_weights=weights, routing_input_mode=mode, per_token_scale=p
+        )  # fmt: skip
+
+    for T in (127, 128, 129, 256, 384):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=T)
+        W_pack = _weights(w1, w2, quant=_QUANT[pair])
+        W = _weights_of(W_pack)
+        ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids, weights = ids.cuda(), weights.cuda()
+        ref = bits(plain(_routed_pack(x, ids, weights), W_pack))
+        if pair.scaled:
+            x4, sf, pts = nvfp4_quantize(
+                x, TE_GS_INV, per_token_activation=True, batch_invariant=True
+            )
+        else:
+            x4, sf = mxfp4_quantize(x, batch_invariant=True)
+            pts = None
+        assert sf.dim() == 2 and sf.shape[0] == -(-T // 128) * 128
+        flat = sf.reshape(-1)
+        linear = _unswizzle(pair, flat.cpu(), T, H).cuda()
+        assert tuple(linear.shape) == (T, H // pair.block)
+        collide = sf_layouts_collide(T, H, pair.block)
+        assert collide == (T % 128 == 0) and (
+            collide == (tuple(sf.shape) == tuple(linear.shape))
+        )
+        # the named layouts: the buffer as returned and flattened, the linear rows
+        for scale in (sf, flat):
+            assert torch.equal(
+                bits(layers[True](pack(x4, scale, pts, ids, weights), W_pack)), ref
+            ), T
+        assert torch.equal(
+            bits(layers[False](pack(x4, linear, pts, ids, weights), W_pack)), ref
+        ), T
+        # unnamed: the flat buffer always, the 2-D forms where the shape names the layout
+        assert torch.equal(
+            bits(layers[None](pack(x4, flat, pts, ids, weights), W_pack)), ref
+        ), T
+        op_pack = _pack(pair, x4, sf, pts)
+        if collide:
+            for scale in (sf, linear):
+                with pytest.raises(
+                    BatchInvariantUnsupportedError, match="swizzled_scale_factors"
+                ):
+                    layers[None](pack(x4, scale, pts, ids, weights), W_pack)
+            with pytest.raises(BatchInvariantUnsupportedError, match="sf_layout"):
+                fused_moe_fp4(op_pack, ids, weights, W)
+            with pytest.raises(BatchInvariantUnsupportedError, match="sf_layout"):
+                fused_moe_fp4(_pack(pair, x4, linear, pts), ids, weights, W)
+        else:
+            assert torch.equal(
+                bits(layers[None](pack(x4, sf, pts, ids, weights), W_pack)), ref
+            ), T
+            assert torch.equal(
+                bits(layers[None](pack(x4, linear, pts, ids, weights), W_pack)), ref
+            ), T
+            assert torch.equal(bits(fused_moe_fp4(op_pack, ids, weights, W)), ref), T
+        # the op with the layout named
+        assert torch.equal(
+            bits(fused_moe_fp4(op_pack, ids, weights, W, sf_layout="128x4")), ref
+        ), T
+        assert torch.equal(
+            bits(
+                fused_moe_fp4(
+                    _pack(pair, x4, linear, pts), ids, weights, W, sf_layout="linear"
+                )
+            ),
+            ref,
+        ), T
+        assert torch.equal(
+            bits(fused_moe_fp4(_pack(pair, x4, flat, pts), ids, weights, W)), ref
+        ), T
+    with pytest.raises(ValueError, match="sf_layout"):
+        fused_moe_fp4(_pack(pair, x4, flat, pts), ids, weights, W, sf_layout="rows")
+
+
+@needs_device
+@each_pair
 def test_swapped_gather_record_gives_the_box_forms_bits_on_every_pack_form(pair):
     """The swapped records' gather form (the body reads the token rows and their scale factors through the plan's map: no scatter
     launch, no permuted tensor) is a placement: the box form's bits for the bf16 input, the pre-quantized pack with the 128x4 and

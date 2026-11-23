@@ -545,6 +545,7 @@ def grouped_gemm_fp4(
     aux: Optional[torch.Tensor] = None,
     src: Optional[torch.Tensor] = None,
     k_div: int = 1,
+    sf_layout: Optional[str] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a4[p] @ w4[e(p)].T, ...)`` on the expert segments ``counts`` (int32 ``[E]``, group order = expert order),
     the block scales of both operands applied inside the instruction. Padded packing (default): ``a4 [rows, K/2]`` uint8 with
@@ -558,7 +559,8 @@ def grouped_gemm_fp4(
     rows past the live rows: ``DENSE_TAIL``). The gather record (``config.gather_a``): ``a4 [T, K/2]`` the unpermuted token
     rows, ``a_sf`` their scale factors (the flat 128x4 buffer of the ``T`` rows, or the linear ``[T, K/block]`` bytes), ``pts
     [T]`` (or one entry: the unit scale), ``src [>= Tk]`` int32 the plan's slot of every dense row (``src[p] // k_div`` its
-    token), ``out`` given (it sizes the dense rows); no permuted tensor, the same bits."""
+    token), ``out`` given (it sizes the dense rows); no permuted tensor, the same bits. ``sf_layout`` names the gather record's
+    scale layout where the shape does not (:func:`gather_sf_layout`)."""
     from .api import _check_grouped_chain, _check_grouped_operands, _grouped_out
     from .blocks.compile import (
         can_implement_grouped_blockscaled,
@@ -572,7 +574,7 @@ def grouped_gemm_fp4(
     if config.gather_a:
         return _grouped_gemm_fp4_gather(
             pair, a4, a_sf, w4, w_sf, counts, config, chain, in_fmt,
-            pts, alpha, out, out_sf, aux, src, k_div,
+            pts, alpha, out, out_sf, aux, src, k_div, sf_layout,
         )  # fmt: skip
     if src is not None:
         raise ValueError(f"{name}: src belongs to the gather record (config.gather_a)")
@@ -684,13 +686,44 @@ def grouped_gemm_fp4(
     return out
 
 
-def gather_sf_layout(a_sf: torch.Tensor, T: int, K: int, block: int = 16) -> str:
-    """The layout of a gather record's scale operand: the row-major linear bytes ``[T, K / block]`` or the flat 128x4 buffer."""
-    return (
-        "linear"
-        if a_sf.dim() == 2 and tuple(a_sf.shape) == (T, K // block)
-        else "128x4"
-    )
+#: The layouts of a pre-quantized input's scale factors: the 128x4 swizzled buffer of the mode's quantizers, the row-major bytes.
+SF_LAYOUTS = ("128x4", "linear")
+
+
+def sf_layouts_collide(T: int, K: int, block: int) -> bool:
+    """Whether the linear ``[T, K / block]`` layout and the 128x4 swizzled buffer of ``T`` rows have one shape: the quantizers
+    return the buffer as ``(rows padded to 128, scale columns padded to 4)``, so a tensor of that shape names no layout."""
+    return T % GROUP_ALIGN == 0 and (K // block) % 4 == 0
+
+
+def gather_sf_layout(
+    a_sf: torch.Tensor,
+    T: int,
+    K: int,
+    block: int = 16,
+    layout: Optional[str] = None,
+    cls: str = NV_CLASS,
+) -> str:
+    """The layout of a scale operand of ``T`` rows of ``K`` elements: ``layout`` names it (``"128x4"`` / ``"linear"``); otherwise
+    the shape does where it can -- a tensor that is not a 2-D ``[T, K / block]`` is the flat 128x4 buffer, a 2-D ``[T, K / block]``
+    tensor the linear layout, unless the swizzled buffer has that shape too (:func:`sf_layouts_collide`), which is refused: the
+    caller names the layout (``QuantConfig(swizzled_scale_factors=...)`` through the layer, ``sf_layout`` on the op) or flattens
+    the quantizer's buffer."""
+    if layout is not None:
+        if layout not in SF_LAYOUTS:
+            raise ValueError(f"sf_layout must be one of {SF_LAYOUTS}, not {layout!r}")
+        return layout
+    if a_sf.dim() != 2 or tuple(a_sf.shape) != (T, K // block):
+        return "128x4"
+    if sf_layouts_collide(T, K, block):
+        raise unsupported(
+            cls,
+            f"scale factors of shape {tuple(a_sf.shape)} for {T} rows without a named layout",
+            "the layout named by the caller: the quantizer's 128x4 buffer flattened, or QuantConfig(swizzled_scale_factors="
+            "True / False) through the layer and sf_layout='128x4' / 'linear' on the op (at a row count that is a multiple "
+            "of 128 the swizzled buffer and the linear layout have the same shape)",
+        )
+    return "linear"
 
 
 def gather_form_ok(K: int, sf_src: str, block: int = 16) -> bool:
@@ -700,7 +733,7 @@ def gather_form_ok(K: int, sf_src: str, block: int = 16) -> bool:
 
 
 def _grouped_gemm_fp4_gather(
-    pair, a4, a_sf, w4, w_sf, counts, config, chain, in_fmt, pts, alpha, out, out_sf, aux, src, k_div
+    pair, a4, a_sf, w4, w_sf, counts, config, chain, in_fmt, pts, alpha, out, out_sf, aux, src, k_div, sf_layout=None
 ) -> torch.Tensor:  # fmt: skip
     """The gather record of :func:`grouped_gemm_fp4` (its operand rules, the token rows in place of the permuted rows; the
     swapped body)."""
@@ -734,7 +767,7 @@ def _grouped_gemm_fp4_gather(
         raise ValueError(
             f"{name}: src must be a contiguous int32 [>= Tk] and k_div >= 1"
         )
-    sf_src = gather_sf_layout(a_sf, T, K, pair.block)
+    sf_src = gather_sf_layout(a_sf, T, K, pair.block, sf_layout, pair.cls)
     if a_sf.dtype != torch.uint8 or (
         sf_src == "128x4" and a_sf.numel() < pair.sf_numel(T, K)
     ):
@@ -1049,7 +1082,7 @@ def _part(device: torch.device) -> Tuple[int, str]:
 
 
 def _input(
-    w: MoEWeightsFp4, x, gs_inv, dev_hint=None
+    w: MoEWeightsFp4, x, gs_inv, dev_hint=None, sf_layout: Optional[str] = None
 ) -> Tuple[
     int,
     torch.device,
@@ -1063,7 +1096,8 @@ def _input(
     """The op's input forms: bf16 rows, or the pair's pre-quantized pack -- NVFP4 ``(x4, x_sf, x_pts or None)``, MXFP4 ``(x4,
     x_sf)``. Returns ``(T, device, x_rows, x4, x_sf, x_pts, sf_src, unit_pts)``: a bf16 input keeps its rows (``x4`` None where
     the dense path quantizes straight into the grouped layout); a pack's scale factors are the class's flat 128x4 buffer or the
-    row-major ``[T, H / block]`` bytes (``sf_src``); ``unit_pts``: the NVFP4 per-tensor pack without per-token scales."""
+    row-major ``[T, H / block]`` bytes (``sf_src``: ``sf_layout`` as given, else from the shape where it names one layout);
+    ``unit_pts``: the NVFP4 per-tensor pack without per-token scales."""
     pair, H = w.pair, w.hidden_size
     op = f"fused_moe_{pair.name}"
     if isinstance(x, torch.Tensor):
@@ -1087,7 +1121,7 @@ def _input(
         x4, x_sf = x[0], x[1]
         x_pts = None
     T = x4.shape[0]
-    sf_src = gather_sf_layout(x_sf, T, H, pair.block)
+    sf_src = gather_sf_layout(x_sf, T, H, pair.block, sf_layout, pair.cls)
     x_sf = x_sf.contiguous().reshape(-1)
     unit_pts = x_pts is None
     if (
@@ -1131,6 +1165,7 @@ def fused_moe_fp4(
     ] = None,
     round_scales: bool = False,
     gather: Optional[bool] = None,
+    sf_layout: Optional[str] = None,
 ):
     """The fp4 MoE FFN for pre-routed tokens: ``x`` bf16 ``[T, H]`` (quantized here by the pair's class; ``gs_inv`` the NVFP4
     recipe's inverse base scale) or the pair's quantized pack (NVFP4 ``(x4 [T, H/2] uint8, x_sf, x_pts [T] f32 or None: unit
@@ -1144,7 +1179,9 @@ def fused_moe_fp4(
     the dense path). ``plan``: the dense packing's precomputed plan, the outputs of :func:`route_plan_dual` after the ids and
     weights (one launch saved). ``gather``: GEMM1's swapped records in their gather form (the body reads the token rows through
     the plan's map: no scatter launch, no permuted tensor) -- False excludes it, True forces it, None (the default) applies the
-    structural rule (:func:`~.schedule_fp4.gather_form_rule`); an explicit ``config1`` selects the form itself (``gather_a``)."""
+    structural rule (:func:`~.schedule_fp4.gather_form_rule`); an explicit ``config1`` selects the form itself (``gather_a``).
+    ``sf_layout`` names a pack's scale layout (``"128x4"`` / ``"linear"``); without it the shape must name one
+    (:func:`gather_sf_layout`: a 2-D ``[T, H / block]`` tensor at a row count that is a multiple of 128 is refused)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import warps_per_row
     from .permute_nvfp4 import (
@@ -1160,7 +1197,9 @@ def fused_moe_fp4(
     if path not in PATHS:
         raise ValueError(f"{op}: path must be one of {PATHS}, not {path!r}")
     H, I, E = w.hidden_size, w.intermediate_size, w.num_experts
-    T, dev, x_rows, x4, x_sf, x_pts, sf_src, unit_pts = _input(w, x, gs_inv)
+    T, dev, x_rows, x4, x_sf, x_pts, sf_src, unit_pts = _input(
+        w, x, gs_inv, sf_layout=sf_layout
+    )
     k = token_selected_experts.shape[1]
     check_shape_fp4(pair, H, I, E, k, w.gated)
     if (
@@ -1347,7 +1386,7 @@ def fused_moe_fp4(
             grouped_gemm_fp4(
                 g_a, g_sf, w.w1, w.w1_sf, counts, config1, chain1, in1,
                 pts=g_pts, alpha=alpha1, out=a4, dense_a=True, rows_sf=Tk_sf, out_sf=a_sf_pad, aux=w.gs2,
-                src=g_src, k_div=k,
+                src=g_src, k_div=k, sf_layout=sf_src,
             )  # fmt: skip
             a_pts_pad = (
                 x_perm_pts  # GEMM2's row-scale operand is unread by the static chain
@@ -1358,7 +1397,7 @@ def fused_moe_fp4(
             a = torch.empty(Tk_a, I, dtype=torch.bfloat16, device=dev)
             grouped_gemm_fp4(
                 g_a, g_sf, w.w1, w.w1_sf, counts, config1, chain1, in1,
-                pts=g_pts, alpha=alpha1, out=a, dense_a=True, rows_sf=Tk_sf, src=g_src, k_div=k,
+                pts=g_pts, alpha=alpha1, out=a, dense_a=True, rows_sf=Tk_sf, src=g_src, k_div=k, sf_layout=sf_src,
             )  # fmt: skip
             # the class's second pass over the live rows: the codes stay dense; the scale factors (and the row scales) are
             # re-tiled to the padded positions for GEMM2's atom-aligned scale boxes (a byte move)
@@ -1521,5 +1560,8 @@ __all__ = [
     "quantize_rows_mx",
     "quantize_scatter_rows",
     "route_plan_dual",
+    "sf_layouts_collide",
+    "gather_sf_layout",
+    "SF_LAYOUTS",
     "sm_count_of",
 ]

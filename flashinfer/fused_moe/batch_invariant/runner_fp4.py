@@ -317,10 +317,16 @@ class BatchInvariantFp4Runner(MoERunner):
     def _activation_scales(
         self, act: MoEActivationPack, T: int, H: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """The pre-quantized pack's scale factors (the flat 128x4 swizzled buffer, or the linear ``[T, H/block]`` bytes, which
-        the op's scatter re-tiles itself) and, for the NVFP4 pair, its per-token scales (the layer's shared contract admits
-        them under ``QuantConfig(per_token_scale=True)``; the empty placeholder for a pack without them: unit scales, nothing
-        to fill)."""
+        """The pre-quantized pack's scale factors -- the 128x4 swizzled buffer of the mode's quantizer, returned flat, or the
+        linear ``[T, H/block]`` bytes, returned 2-D (the op's scatter re-tiles them itself): the rank names the layout to
+        ``forward`` -- and, for the NVFP4 pair, its per-token scales (the layer's shared contract admits them under
+        ``QuantConfig(per_token_scale=True)``; the empty placeholder for a pack without them: unit scales, nothing to fill).
+        The layout is ``QuantConfig(swizzled_scale_factors)``'s when set (``True``: the swizzled buffer, 2-D as the quantizer
+        returns it or flattened; ``False``: the linear layout); unset, the shape names it where it can, and a 2-D
+        ``[T, H/block]`` tensor at a row count that is a multiple of 128 (the quantizer's buffer has that shape too) is
+        refused (:func:`~.api_fp4.gather_sf_layout`)."""
+        from .api_fp4 import gather_sf_layout
+
         pair, cls = self.pair, self.pair.cls
         sf = act.hidden_states_scale
         if sf is None:
@@ -338,12 +344,19 @@ class BatchInvariantFp4Runner(MoERunner):
                 f"hidden_states_scale of dtype {sf.dtype}",
                 f"uint8 or {sf_dtype} scale bytes",
             )
-        if (
-            sf.ndim == 2
-            and tuple(sf.shape) == (T, H // pair.block)
-            and sf.is_contiguous()
-        ):
-            sf_flat = sf  # the linear layout: the op's scatter assembles the 128x4 atoms from the rows
+        flag = self.config.quant.swizzled_scale_factors
+        named = None if flag is None else ("128x4" if flag else "linear")
+        layout = gather_sf_layout(sf, T, H, pair.block, named, cls)
+        if layout == "linear":
+            if sf.ndim != 2 or tuple(sf.shape) != (T, H // pair.block):
+                raise unsupported(
+                    cls,
+                    f"hidden_states_scale of shape {tuple(sf.shape)} under QuantConfig(swizzled_scale_factors=False)",
+                    f"the linear [{T}, {H // pair.block}] layout",
+                )
+            sf_flat = (
+                sf.contiguous()
+            )  # the op's scatter assembles the 128x4 atoms from the rows
         elif sf.numel() >= pair.sf_numel(T, H) and (
             sf.is_contiguous() or (sf.ndim == 2 and sf.t().is_contiguous())
         ):
@@ -617,8 +630,9 @@ class BatchInvariantFp4Runner(MoERunner):
             w1a if pair.scaled else None, w2a if pair.scaled else None,
             self._intermediate, gs2 if static else None, inv2 if static else None,
         )  # fmt: skip
-        # a pre-quantized pack: the empty per-token placeholder means unit scales (the per-tensor pack), the 2-D scale tensor
-        # the linear layout; both are the op's own placements (no fill, no re-tiling launch)
+        # a pre-quantized pack: the empty per-token placeholder means unit scales (the per-tensor pack); the scale tensor's
+        # rank names its layout (flat: the 128x4 buffer, 2-D: the linear rows, as pack_inputs shaped it); both are the op's
+        # own placements (no fill, no re-tiling launch)
         if x.dtype == torch.bfloat16:
             xin: Any = x
         elif pair.scaled:
@@ -635,5 +649,8 @@ class BatchInvariantFp4Runner(MoERunner):
             config2=c2,
             plan=plan,
             round_scales=self._round_scales,
+            sf_layout=None
+            if x.dtype == torch.bfloat16
+            else ("linear" if sf.ndim == 2 else "128x4"),
         )
         return out
