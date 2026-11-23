@@ -43,7 +43,7 @@ try:
 except ImportError:  # older wheels: value is fixed by the GEP encoding ABI
     MLIR_DYNAMIC_INDEX = -(2**31)
 
-_BYVAL_RANK_LIMIT = 16  # struct<(array<16 x i64>)> == exactly 128B
+_BYVAL_RANK_LIMIT = 16             # struct<(array<16 x i64>)> == exactly 128B
 
 
 # TODO: Remove once the compiler is fixed. Workaround for the cuda-to-llvm bug, it just treats any kernel arg to tma_desc as long as it's marked `grid_constant + byval`
@@ -77,14 +77,10 @@ class SymBufferDeviceBase:
 
     def __extract_mlir_attributes__(self) -> list:
         if self.num_max_ranks <= _BYVAL_RANK_LIMIT:
-            return [
-                ir.DictAttr.get(
-                    {
-                        "cute_nvgpu.grid_constant": ir.UnitAttr.get(),
-                        "llvm.byval": ir.TypeAttr.get(_byval_struct_ty()),
-                    }
-                )
-            ]
+            return [ir.DictAttr.get({
+                "cute_nvgpu.grid_constant": ir.UnitAttr.get(),
+                "llvm.byval": ir.TypeAttr.get(_byval_struct_ty()),
+            })]
         return [ir.DictAttr.get({})]
 
     @cute.jit
@@ -113,9 +109,7 @@ class SymBufferDeviceBase:
         return local_ptr + off + byte_off
 
     @cute.jit
-    def ptr_map_to_rank(
-        self, ptr, dst_rank_idx: Int32, byte_align: Optional[int] = None
-    ):
+    def ptr_map_to_rank(self, ptr, dst_rank_idx: Int32, byte_align: Optional[int] = None):
         if cutlass.const_expr(ptr.memspace != AddressSpace.gmem):
             raise ValueError(
                 f"ptr_map_to_rank: source pointer must live in GMEM "
@@ -152,6 +146,12 @@ class SymBufferHost:
     offsets: tuple
     rank_idx: Int32
     num_max_ranks: cutlass.Constexpr[int]
+    # POC (multimem barrier): absolute multicast VA of nvlink_barrier_signal, or
+    # 0 when MEGA_MULTIMEM_BARRIER is off / NVLS unavailable. Rides as a plain
+    # trailing i64 scalar kernel arg (NOT on the byval device mapper, which must
+    # stay a single 128B grid_constant); the kernel reads it back as
+    # peer_rank_ptr_mapper_host.mc_base and routes it to nvlink_barrier.
+    mc_base: Int64 = Int64(0)
 
     @staticmethod
     def _as_int64(value) -> Int64:
@@ -168,7 +168,8 @@ class SymBufferHost:
         num_max_ranks = self.num_max_ranks
         if len(offsets) != num_max_ranks:
             raise ValueError(
-                f"len(offsets)={len(offsets)} must equal num_max_ranks={num_max_ranks}."
+                f"len(offsets)={len(offsets)} must equal "
+                f"num_max_ranks={num_max_ranks}."
             )
 
         if num_max_ranks <= _BYVAL_RANK_LIMIT:
@@ -177,28 +178,16 @@ class SymBufferHost:
             i64_ty = ir.Type.parse("i64")
             one = arith.constant(
                 value=ir.IntegerAttr.get(i64_ty, 1),
-                result=i64_ty,
-                loc=loc,
-                ip=ip,
+                result=i64_ty, loc=loc, ip=ip,
             )
             buf = llvm.alloca(
-                res=ptr_ty,
-                elem_type=st_ty,
-                array_size=one,
-                alignment=64,
-                loc=loc,
-                ip=ip,
+                res=ptr_ty, elem_type=st_ty, array_size=one,
+                alignment=64, loc=loc, ip=ip,
             )
             for i, off in enumerate(offsets):
                 slot = llvm.getelementptr(
-                    ptr_ty,
-                    buf,
-                    [],
-                    [i],
-                    i64_ty,
-                    no_wrap_flags="None",
-                    loc=loc,
-                    ip=ip,
+                    ptr_ty, buf, [], [i], i64_ty,
+                    no_wrap_flags="None", loc=loc, ip=ip,
                 )
                 llvm.store(self._as_int64(off).ir_value(), slot, loc=loc, ip=ip)
             return SymBufferDeviceBase(val=buf, num_max_ranks=num_max_ranks)
@@ -209,16 +198,10 @@ class SymBufferHost:
         for i, off in enumerate(offsets):
             idx = arith.constant(
                 value=ir.IntegerAttr.get(i32_ty, i),
-                result=i32_ty,
-                loc=loc,
-                ip=ip,
+                result=i32_ty, loc=loc, ip=ip,
             )
             vec = llvm.insertelement(
-                vec,
-                self._as_int64(off).ir_value(),
-                idx,
-                loc=loc,
-                ip=ip,
+                vec, self._as_int64(off).ir_value(), idx, loc=loc, ip=ip,
             )
         return SymBufferDeviceBase(val=vec, num_max_ranks=num_max_ranks)
 
@@ -240,10 +223,13 @@ class _SymBufferHostAdapter:
                 f"len(offsets)={len(tuple(arg.offsets))} must equal "
                 f"num_max_ranks={int(arg.num_max_ranks)}."
             )
+        # Layout: base, offsets..., rank_idx, mc_base (mc_base trails so the
+        # offsets/rank slicing below stays simple; see __new_from_mlir_values__).
         self._fields = (
             Int64(arg.base_addr),
             *(Int64(x) for x in arg.offsets),
             Int32(arg.rank_idx),
+            Int64(getattr(arg, "mc_base", 0)),
         )
 
     def __c_pointers__(self) -> list[Any]:
@@ -268,18 +254,22 @@ class _SymBufferHostAdapter:
         idx = 0
 
         base_n = len(get_mlir_types(self._fields[0]))
-        base_addr = new_from_mlir_values(self._fields[0], values[idx : idx + base_n])
+        base_addr = new_from_mlir_values(self._fields[0], values[idx:idx + base_n])
         idx += base_n
 
         offsets = []
-        for field in self._fields[1:-1]:
+        for field in self._fields[1:-2]:
             n = len(get_mlir_types(field))
-            offsets.append(new_from_mlir_values(field, values[idx : idx + n]))
+            offsets.append(new_from_mlir_values(field, values[idx:idx + n]))
             idx += n
 
-        rank_n = len(get_mlir_types(self._fields[-1]))
-        rank_idx = new_from_mlir_values(self._fields[-1], values[idx : idx + rank_n])
+        rank_n = len(get_mlir_types(self._fields[-2]))
+        rank_idx = new_from_mlir_values(self._fields[-2], values[idx:idx + rank_n])
         idx += rank_n
+
+        mc_n = len(get_mlir_types(self._fields[-1]))
+        mc_base = new_from_mlir_values(self._fields[-1], values[idx:idx + mc_n])
+        idx += mc_n
         if idx != len(values):
             raise ValueError(
                 f"SymBufferHost adapter consumed {idx} values, got {len(values)}"
@@ -290,4 +280,5 @@ class _SymBufferHostAdapter:
         object.__setattr__(obj, "offsets", tuple(offsets))
         object.__setattr__(obj, "rank_idx", rank_idx)
         object.__setattr__(obj, "num_max_ranks", self._arg.num_max_ranks)
+        object.__setattr__(obj, "mc_base", mc_base)
         return obj

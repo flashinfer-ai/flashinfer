@@ -18,7 +18,9 @@ constexpr auto use_custom_mask_d = {{ mask_mode_d }} == MaskMode::kCustom;
 // Not sure about the below declaration
 constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
 
-{% for cta_tile_q in [16, 64, 128] %}
+{# MSVC emits references for every DISPATCH_CTA_TILE_Q switch arm, so the Windows build
+   instantiates all four tiles; elsewhere only the tiles FA2DetermineCtaTileQ can select. #}
+{% for cta_tile_q in ([16, 32, 64, 128] if instantiate_all_cta_tiles else [16, 64, 128]) %}
 template cudaError_t BatchPODWithKVCacheTensorDispatched<
     {{ head_dim_qk }}, {{ head_dim_vo }}, POS_ENCODING_MODE,
     {{ use_fp16_qk_reduction }}, /*CTA_TILE_Q_P=*/{{cta_tile_q}}, {{ mask_mode_p }},

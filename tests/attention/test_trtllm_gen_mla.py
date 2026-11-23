@@ -1,6 +1,7 @@
 import inspect
 import math
 from types import SimpleNamespace
+from typing import Optional
 import random
 
 import pytest
@@ -12,6 +13,7 @@ from flashinfer.autotuner import autotune
 from flashinfer.mla import _core as core
 from flashinfer.mla import (
     MLALayerDimensions,
+    compact_query_mla_dimensions,
     deepseek_mla_dimensions,
     supported_mla_layer_dimensions,
     smaller_mla_dimensions,
@@ -1027,15 +1029,17 @@ def trtllm_mla_blackwell_reference(
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     softmax_scale: float,
+    page_size: int = 32,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     kv_flat = kv_cache.reshape(-1, 576)
     outputs = []
     for batch_index in range(query.shape[0]):
         seq_len = int(seq_lens[batch_index].item())
-        pages = block_tables[batch_index, : (seq_len + 31) // 32]
+        pages = block_tables[batch_index, : (seq_len + page_size - 1) // page_size]
         indices = (
-            pages[:, None] * 32
-            + torch.arange(32, device=query.device, dtype=torch.int32)[None, :]
+            pages[:, None] * page_size
+            + torch.arange(page_size, device=query.device, dtype=torch.int32)[None, :]
         ).reshape(-1)[:seq_len]
         batch_outputs = []
         for query_index in range(query.shape[1]):
@@ -1051,7 +1055,12 @@ def trtllm_mla_blackwell_reference(
                 query[batch_index, query_index, :, 512:].float(),
                 kv[:, 512:].float(),
             )
-            probabilities = F.softmax(logits * softmax_scale, dim=-1)
+            logits = logits * softmax_scale
+            if sinks is not None:
+                # The sink is one extra logit per head that takes probability
+                # mass but contributes no value.
+                logits = torch.cat([logits, sinks.float()[:, None]], dim=-1)
+            probabilities = F.softmax(logits, dim=-1)[:, : kv.shape[0]]
             batch_outputs.append(
                 torch.einsum("hk,kd->hd", probabilities, kv[:, :512].float())
             )
@@ -1516,6 +1525,31 @@ def test_trtllm_batch_decode_mla_sparse(
         qk_nope_head_dim,
         num_attn_heads,
         use_cum_seq_lens_q=False,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
+)
+def test_trtllm_batch_decode_mla_sparse_compact_query(
+    batch_size: int, dtype: torch.dtype
+):
+    """Compare BF16/FP8 compact-query sparse MLA against the reference."""
+    dimensions = compact_query_mla_dimensions
+    assert dimensions == core.MLAHeadDimensions(64, 64, 128, 512)
+    assert dimensions in core.supported_mla_head_dimensions
+    trtllm_batch_decode_mla_sparse(
+        batch_size=batch_size,
+        scale=1.0,
+        dtype=dtype,
+        q_len_per_request=1,
+        topk=2048,
+        is_varlen=True,
+        enable_pdl=False,
+        backend="trtllm-gen",
+        qk_nope_head_dim=dimensions.qk_nope_head_dim,
+        num_attn_heads=8,
     )
 
 
@@ -2019,6 +2053,42 @@ def test_trtllm_mla_blackwell_domain_selection(
     assert f"{domain}__sm_100a" in ROUTES and f"{domain}__sm_103a" in ROUTES
 
 
+@pytest.mark.parametrize(
+    ("domain", "arch", "num_sms", "work_items", "expected_route"),
+    [
+        ("mla_bf16_clc", "sm_100a", 148, 74, "mla_bf16_clc_one_wave__sm_100a__148"),
+        ("mla_bf16_clc", "sm_100a", 148, 75, "mla_bf16_clc__sm_100a"),
+        ("mla_bf16_clc", "sm_100a", 152, 76, "mla_bf16_clc__sm_100a"),
+        ("mla_bf16_clc", "sm_103a", 152, 76, "mla_bf16_clc_one_wave__sm_103a__152"),
+        ("mla_bf16_clc", "sm_103a", 152, 77, "mla_bf16_clc__sm_103a__152"),
+        ("mla_bf16_clc", "sm_103a", 148, 74, "mla_bf16_clc__sm_103a"),
+        (
+            "mla_bf16_clc_exact007790",
+            "sm_100a",
+            148,
+            1,
+            "mla_bf16_clc_exact007790__sm_100a",
+        ),
+        (
+            "mla_bf16_clc_exact007826",
+            "sm_103a",
+            152,
+            1,
+            "mla_bf16_clc_exact007826__sm_103a__152",
+        ),
+    ],
+)
+def test_trtllm_mla_blackwell_one_wave_clc_family(
+    domain: str, arch: str, num_sms: int, work_items: int, expected_route: str
+) -> None:
+    from flashinfer.mla.cake_trtllm_mla_blackwell import ROUTES, launch_family
+
+    # A generic CLC launch whose work items fit one wave of clusters takes the
+    # one-wave program where the device has one; every other launch keeps its
+    # domain's program.
+    assert launch_family(domain, arch, num_sms, work_items) == ROUTES[expected_route]
+
+
 def test_trtllm_mla_blackwell_rejects_non_scalar_or_nonfinite_scales() -> None:
     from flashinfer.mla.cake_trtllm_mla_blackwell import _normalize_scale
 
@@ -2159,11 +2229,19 @@ def test_trtllm_mla_blackwell_fp8_page64_empty_splits(kv_lens) -> None:
 
 
 @pytest.mark.parametrize(
-    "batch_size,q_len_per_request",
-    [(1, 4), (1, 8), (4, 2), (4, 4), (4, 8), (4, 16)],
+    "batch_size,q_len_per_request,page_size,enable_sink",
+    [
+        (1, 4, 32, False),
+        (1, 8, 32, False),
+        (4, 2, 32, False),
+        (4, 4, 32, False),
+        (4, 8, 32, False),
+        (4, 16, 32, False),
+        (1, 1, 64, True),
+    ],
 )
 def test_trtllm_mla_blackwell_bf16_dispatch(
-    batch_size: int, q_len_per_request: int
+    batch_size: int, q_len_per_request: int, page_size: int, enable_sink: bool
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("TRT-LLM MLA Blackwell requires CUDA")
@@ -2172,20 +2250,27 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
 
     device = torch.device("cuda")
     torch.manual_seed(42)
-    page_size = 32
     max_seq_len = 1024
     pages_per_sequence = max_seq_len // page_size
+    # Inputs of magnitude 0.5 give a peaked softmax, so a score read from the
+    # wrong keys moves the output well past the tolerance; near-uniform
+    # probabilities from small inputs would hide it.
     query = (
-        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.05
+        torch.randn(batch_size, q_len_per_request, 128, 576, device=device) * 0.5
     ).to(torch.bfloat16)
     kv_cache = (
         torch.randn(batch_size * pages_per_sequence, page_size, 576, device=device)
-        * 0.05
+        * 0.5
     ).to(torch.bfloat16)
     block_tables = torch.arange(
         batch_size * pages_per_sequence, dtype=torch.int32, device=device
     ).reshape(batch_size, pages_per_sequence)
     seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32, device=device)
+    sinks = (
+        torch.randn(128, dtype=torch.float32, device=device) * 2.0
+        if enable_sink
+        else None
+    )
     workspace = torch.empty(1, dtype=torch.uint8, device=device)
     bmm1_scale = 1.0 / (192**0.5)
 
@@ -2201,10 +2286,11 @@ def test_trtllm_mla_blackwell_bf16_dispatch(
         max_seq_len=max_seq_len,
         bmm1_scale=bmm1_scale,
         bmm2_scale=1.0,
+        sinks=[sinks] if enable_sink else None,
         backend="cake",
     )
     reference = trtllm_mla_blackwell_reference(
-        query, kv_cache, block_tables, seq_lens, bmm1_scale
+        query, kv_cache, block_tables, seq_lens, bmm1_scale, page_size, sinks
     )
     assert output.shape == (batch_size, q_len_per_request, 128, 512)
     torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
@@ -2686,13 +2772,70 @@ def test_functional_dispatch_cake_routes(functional_request, monkeypatch, family
     torch.testing.assert_close(result, torch.full_like(result, 7))
 
 
-def test_functional_dispatch_cake_kimi_rejects_lse(functional_request, monkeypatch):
+@pytest.mark.parametrize("caller_lse", [False, True])
+@pytest.mark.parametrize("lse_base", [None, "basee", "base2"])
+def test_functional_dispatch_cake_kimi_returns_lse(
+    functional_request, monkeypatch, lse_base, caller_lse
+):
+    import sys
+
+    case = functional_request
+    case.update(
+        backend="cake",
+        query=case["query"].to(torch.float8_e4m3fn),
+        kv_cache=case["kv_cache"].to(torch.float8_e4m3fn),
+        return_lse=True,
+        return_lse_base=lse_base,
+    )
+    user_lse = None
+    if caller_lse:
+        user_lse = torch.empty(
+            case["query"].shape[:-1], dtype=torch.float32, device="cuda"
+        )
+        case.update(lse=user_lse)
+    calls = []
+
+    def launch(*args, **kwargs):
+        calls.append((args, kwargs))
+        args[4].fill_(7)
+        kwargs["lse"].fill_(3)
+
     monkeypatch.setattr(
         core, "_cake_trtllm_mla_blackwell_supports", lambda *args: False
     )
-    with pytest.raises(ValueError, match="backend='cake' does not support return_lse"):
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.mla.cake_kimi_k3_mla",
+        SimpleNamespace(run_cake_kimi_k3_mla_fp8_paged_attention=launch),
+    )
+    out, lse = core.trtllm_batch_decode_with_kv_cache_mla(**case)
+    assert out is case["out"]
+    assert len(calls) == 1
+    kwargs = calls[0][1]
+    assert kwargs["lse"] is lse
+    if caller_lse:
+        assert lse is user_lse
+    assert kwargs["lse_base"] == ("2" if lse_base == "base2" else "e")
+    assert lse.dtype == torch.float32
+    assert lse.shape == case["query"].shape[:-1]
+    torch.testing.assert_close(out, torch.full_like(out, 7))
+    torch.testing.assert_close(lse, torch.full_like(lse, 3))
+
+
+def test_functional_dispatch_cake_kimi_rejects_pdl(functional_request, monkeypatch):
+    monkeypatch.setattr(
+        core, "_cake_trtllm_mla_blackwell_supports", lambda *args: False
+    )
+    with pytest.raises(ValueError, match="backend='cake' does not support enable_pdl"):
         core.trtllm_batch_decode_with_kv_cache_mla(
-            **{**functional_request, "backend": "cake", "return_lse": True}
+            **{
+                **functional_request,
+                "backend": "cake",
+                "query": functional_request["query"].to(torch.float8_e4m3fn),
+                "kv_cache": functional_request["kv_cache"].to(torch.float8_e4m3fn),
+                "return_lse": True,
+                "enable_pdl": True,
+            }
         )
 
 

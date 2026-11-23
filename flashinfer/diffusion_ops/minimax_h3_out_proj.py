@@ -70,8 +70,6 @@ NVFP4_SF_K_TILES = NVFP4_SF_COLS // 4  # 112 tiles per 128-row block
 MXFP8_O_SCALE_TILE_BYTES = _N_TILES * MXFP8_SF_K_TILES * 2 * _SF_TILE_BYTES
 NVFP4_O_SCALE_TILE_BYTES = _N_TILES * NVFP4_SF_K_TILES * 2 * _SF_TILE_BYTES
 
-_REFERENCE_CHUNK_ROWS = 1024
-
 
 @functools.lru_cache(maxsize=None)
 def _get_module(target: MiniMaxH3OutProjTarget):
@@ -219,78 +217,8 @@ def _scale_tiles(
 
 
 # --------------------------------------------------------------------------------------------
-# Layout helpers and pure-torch reference
+# Layout helpers
 # --------------------------------------------------------------------------------------------
-
-
-def minimax_h3_unpack_attn_out(attn_out: torch.Tensor) -> torch.Tensor:
-    r"""``[P, M, 56 // P, 128]`` receive layout -> the logical activation ``A`` ``[M, 7168]``
-    with ``A[m, h * 128 + d] = attn_out[h // (56 // P), m, h % (56 // P), d]`` (a copy; the
-    fused kernels never materialise it)."""
-    degree, rows = int(attn_out.shape[0]), int(attn_out.shape[1])
-    return (
-        attn_out.reshape(degree, rows, MINIMAX_H3_ATTN_DIM // degree)
-        .permute(1, 0, 2)
-        .reshape(rows, MINIMAX_H3_ATTN_DIM)
-    )
-
-
-def _gate_residual_epilogue(
-    o: torch.Tensor,
-    gate: torch.Tensor,
-    gate_index: torch.Tensor,
-    residual: torch.Tensor,
-) -> torch.Tensor:
-    gate_rows = int(gate.shape[0])
-    idx = gate_index.to(torch.int64)
-    valid = (idx >= 0) & (idx < gate_rows)
-    g = gate.index_select(0, idx.clamp(0, gate_rows - 1))
-    g = torch.where(valid[:, None], g, torch.zeros_like(g))
-    p = (g * o).to(torch.bfloat16)  # BF16 x BF16: FP32 product, one rounding
-    return (residual + p).to(torch.bfloat16)
-
-
-def _reference_from_operands(
-    a: torch.Tensor,
-    w: torch.Tensor,
-    gate: torch.Tensor,
-    gate_index: torch.Tensor,
-    residual: torch.Tensor,
-    alpha: Optional[float] = None,
-) -> torch.Tensor:
-    """``out = BF16(residual + BF16(gate[idx] * BF16(alpha * a @ w^T)))`` with an FP32 GEMM
-    (TF32 disabled) over any float-convertible operands ``a`` ``[M, K]`` / ``w`` ``[N, K]``."""
-    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
-    try:
-        w_t = w.float().t()
-        o = torch.empty(
-            (a.shape[0], MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=a.device
-        )
-        for r0 in range(0, a.shape[0], _REFERENCE_CHUNK_ROWS):
-            r1 = min(a.shape[0], r0 + _REFERENCE_CHUNK_ROWS)
-            h = a[r0:r1].float() @ w_t
-            if alpha is not None:
-                h = h * float(alpha)
-            o[r0:r1] = h.to(torch.bfloat16)
-        return _gate_residual_epilogue(o, gate, gate_index, residual)
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-
-
-def minimax_h3_out_proj_reference(
-    attn_out: torch.Tensor,
-    o_weight: torch.Tensor,
-    gate: torch.Tensor,
-    gate_index: torch.Tensor,
-    residual: torch.Tensor,
-) -> torch.Tensor:
-    r"""Pure-torch BF16 reference of :func:`minimax_h3_out_proj`: unpack the receive layout,
-    FP32 GEMM (TF32 disabled) rounded to BF16, indexed gate product rounded to BF16, residual sum
-    rounded to BF16."""
-    return _reference_from_operands(
-        minimax_h3_unpack_attn_out(attn_out), o_weight, gate, gate_index, residual
-    )
 
 
 def _weight_scale_tiles(sf_linear: torch.Tensor) -> torch.Tensor:
@@ -800,8 +728,6 @@ __all__ = [
     "minimax_h3_out_proj",
     "minimax_h3_out_proj_mxfp8",
     "minimax_h3_out_proj_nvfp4",
-    "minimax_h3_out_proj_reference",
-    "minimax_h3_unpack_attn_out",
     "mxfp8_activation_scale_workspace_bytes",
     "nvfp4_activation_scale_workspace_bytes",
     "prepare_minimax_h3_o_weight_mxfp8",

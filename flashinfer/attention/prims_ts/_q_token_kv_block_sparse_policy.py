@@ -41,6 +41,26 @@ class SparseLaunch:
         return self.tile_size_q >= 64
 
 
+# Widest SwapsMmaAb Q tile: more Q rows per KV head need a KeepsMmaAb recipe.
+MAX_SWAPS_TILE_SIZE_Q = 32
+
+
+def prefers_nvfp4_keeps(q_dtype_key: str, group_size: int, heads_q_per_kv: int) -> bool:
+    """Whether NVFP4 K/V should take the KeepsMmaAb transform target.
+
+    ``group_size * heads_q_per_kv`` Q rows share one KV head. Wider groups than
+    the widest Swaps Q tile need Keeps for either Q dtype. BF16 Q always takes
+    it: its full-D256 BF16 stages measured faster than the TMEM-transformed
+    Swaps recipe on GB300. FP8 Q takes it from five grouped tokens, where its
+    per-Q-row softmax measured faster than the Swaps recipe's per-K-row
+    softmax over transformed NVFP4.
+    """
+    wide_group = group_size * heads_q_per_kv > MAX_SWAPS_TILE_SIZE_Q
+    if q_dtype_key == "float8_e4m3fn":
+        return group_size >= 5 or wide_group
+    return q_dtype_key == "bfloat16"
+
+
 def select_sparse_launch(
     *,
     group_size: int,
@@ -52,11 +72,14 @@ def select_sparse_launch(
     route_kv_tokens: int,
     multi_processor_count: int,
     split_kv: bool = True,
+    prefer_keeps_mma_ab: bool = False,
 ) -> SparseLaunch:
     """Choose the smallest fitting dense Q recipe, then useful one-wave splits.
 
     G is already fixed by the caller. This function never changes it, queries
     the device, reads tensors, or applies a batch/context tuning table.
+    ``prefer_keeps_mma_ab`` takes the one-instance Keeps recipe for wide-head
+    groups even when the Swaps recipe would split KV.
     """
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
@@ -69,17 +92,18 @@ def select_sparse_launch(
     # capacity bound here; runtime masks the inactive split prefix. The G
     # recommendation below scores useful work with a shared-KV estimate.
     work_tokens = max(1, route_kv_tokens)
-    # D256 FP8 G1 requires the staged Keeps recipe. D64/D128 also have
+    # Wide-head FP8 G1 uses the qualified staged Keeps recipe. D64/D128 also have
     # qualified unstaged Swaps recipes.
     minimum_q = (
         64
-        if head_dim == 256 and q_dtype_key == "float8_e4m3fn" and group_size == 1
+        if head_dim in (192, 256) and q_dtype_key == "float8_e4m3fn" and group_size == 1
         else 8
     )
     candidates = enumerate_grouped_q_mma_candidates(
         heads_q_per_kv=heads_q_per_kv, seq_len_q=group_size
     )
 
+    # Choose the first Q tile covering the route group and minimum MMA rows.
     def recipe(minimum: int):
         return next(
             c
@@ -87,11 +111,23 @@ def select_sparse_launch(
             if c.tile_size_q >= minimum and c.q_tokens_per_cta >= group_size
         )
 
+    # Choose split fanout using KV instances per loop and a useful-work floor.
     def fanout(instances: int) -> int:
         maximum = MAX_SPLITS_KV
+        minimum_iterations = MIN_LOOP_ITERS_PER_SPLIT
         if group_size == 1:
+            # Staged FP8 Keeps has one KV tile per iteration, whereas Swaps
+            # has two. Preserve a two-tile work floor for FP8 in either recipe:
+            # one-tile splits spend more on partial-output reduction than they
+            # save in attention. Scale the cap with work, not a fixed split count.
+            minimum_tiles = (
+                max(2, instances) if q_dtype_key == "float8_e4m3fn" else instances
+            )
+            minimum_iterations = minimum_tiles // instances
             # A partial final iteration must not buy an otherwise empty split.
-            maximum = min(maximum, max(1, work_tokens // (TILE_SIZE_KV * instances)))
+            maximum = min(
+                maximum, max(1, work_tokens // (TILE_SIZE_KV * minimum_tiles))
+            )
         return select_splits_kv(
             seq_len_kv=work_tokens,
             batch_size=num_routes,
@@ -100,19 +136,20 @@ def select_sparse_launch(
             num_insts_kv=instances,
             service_capacity=multi_processor_count,
             max_splits_kv=maximum,
-            min_loop_iters_per_split=1 if group_size == 1 else MIN_LOOP_ITERS_PER_SPLIT,
+            min_loop_iters_per_split=minimum_iterations,
             split_kv=split_kv,
         )
 
     candidate = recipe(minimum_q)
-    instances = 1 if head_dim == 256 and candidate.variant == "keeps_mma_ab" else 2
+    instances = 1 if head_dim > 128 and candidate.variant == "keeps_mma_ab" else 2
     splits = fanout(instances)
-    # Other D256 FP8 groups may use Swaps only when split-KV is active.
+    # Other wide-head FP8 groups may use Swaps only when split-KV is active.
+    # A caller preferring Keeps (the NVFP4 Keeps transform target) takes it
+    # for either Q dtype.
     if (
-        head_dim == 256
-        and q_dtype_key == "float8_e4m3fn"
-        and splits == 1
+        head_dim in (192, 256)
         and candidate.tile_size_q < 64
+        and (prefer_keeps_mma_ab or (q_dtype_key == "float8_e4m3fn" and splits == 1))
     ):
         candidate = recipe(64)
         instances = 1
@@ -121,19 +158,42 @@ def select_sparse_launch(
         tile_size_q=candidate.tile_size_q,
         num_insts_kv=instances,
         splits_kv=splits,
-        head_dim_per_stage_kv=128 if head_dim == 256 else 0,
-        o_stages=1 if head_dim == 256 and candidate.variant == "keeps_mma_ab" else 2,
+        # Q128 amortizes a full D192 stage; narrower Q tiles retain D128
+        # bands. Full FP8 stages preserve the 128-byte swizzled planes while issuing
+        # PV at N256. BF16 and Swaps retain their existing D128 head bands.
+        head_dim_per_stage_kv=(
+            192
+            if head_dim == 192
+            and candidate.tile_size_q == 128
+            and q_dtype_key == "bfloat16"
+            else 256
+            if head_dim == 256
+            and q_dtype_key == "float8_e4m3fn"
+            and candidate.variant == "keeps_mma_ab"
+            else 128
+            if head_dim > 128
+            else 0
+        ),
+        o_stages=1 if head_dim > 128 and candidate.variant == "keeps_mma_ab" else 2,
+        # A caller that disables split-KV (packed prefill) plans each step's own
+        # route count. Taking the persistent scheduler for every count keeps one
+        # program per group size instead of a static/persistent pair keyed by
+        # whether a step happens to exceed one SM wave. Within one wave the two
+        # schedulers measure within about 1 us of each other.
         use_persistent_scheduler=(
             splits == 1
-            and _select_auto_launch_mode(
-                batch_size=num_routes,
-                num_heads_kv=num_kv_heads,
-                seq_len_kv=work_tokens,
-                tile_size_kv=TILE_SIZE_KV,
-                split_kv=False,
-                service_capacity=multi_processor_count,
+            and (
+                not split_kv
+                or _select_auto_launch_mode(
+                    batch_size=num_routes,
+                    num_heads_kv=num_kv_heads,
+                    seq_len_kv=work_tokens,
+                    tile_size_kv=TILE_SIZE_KV,
+                    split_kv=False,
+                    service_capacity=multi_processor_count,
+                )
+                == "persistent"
             )
-            == "persistent"
         ),
     )
 

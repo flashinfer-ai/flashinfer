@@ -34,19 +34,17 @@ from .utils import write_if_different
 
 CakeBGMVMoEDType = Literal["bfloat16", "float16"]
 CakeBGMVMoEArch = Literal["sm90a", "sm100a", "sm103a", "sm107a"]
-CakeBGMVMoESchedule = Literal[
-    "token_owned_t64",
-    "token_owned",
-    "token_owned_dual_col",
-]
+CakeBGMVMoESchedule = Literal["token_owned", "token_owned_dual_col"]
 
 CAKE_BGMV_MOE_HIDDEN_SIZES = (2688, 3072)
 CAKE_BGMV_MOE_DTYPES: tuple[CakeBGMVMoEDType, ...] = (
     "bfloat16",
     "float16",
 )
+# Schedule id 0 was the 64-lane token-owned expand: the selector never picked it
+# inside the specialized token window, so the kernel was removed and the
+# binding rejects the id.
 CAKE_BGMV_MOE_SCHEDULE_IDS: dict[CakeBGMVMoESchedule, int] = {
-    "token_owned_t64": 0,
     "token_owned": 1,
     "token_owned_dual_col": 2,
 }
@@ -76,6 +74,7 @@ CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN = 3 + CAKE_BGMV_MOE_ROUTE_INDEX_MAX_RO
 # split the hidden tiles over grid z when the pair x rank-block grid is small;
 # the last arrival reduces the partials in split order (deterministic) and
 # resets its counter, so the zeroed workspace is never memset again.
+# Only the per-route generic plans allocate it (``cake_bgmv_moe_route_index_numel``).
 CAKE_BGMV_MOE_SHRINK_RANK_TILE = 8
 CAKE_BGMV_MOE_SHRINK_TILE = 1024
 CAKE_BGMV_MOE_SHRINK_SPLIT_MAX = 8
@@ -85,15 +84,15 @@ CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS = 128
 # the pair x rank-tile grid is at most this many CTAs (one-wave launches are
 # latency-bound; the extra stage hides the cold-L2 HBM latency) and the
 # two-stage ring beyond it (at 1024 CTAs the depth is a coin flip per row and
-# the stage costs occupancy once the grid fills the machine).  Shrink forms: 0 two-stage prefill, 1 decode (4 pairs per CTA),
-# 2 three-stage prefill.
+# the stage costs occupancy once the grid fills the machine).  Shrink forms: 0 two-stage prefill,
+# 2 three-stage prefill (form 1, the retired four-pair decode kernel, is rejected by
+# the binding).
 CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS = 512
 # Lever 11d: on Blackwell the three-stage ring also wins at exactly one wave of
 # 1024 CTAs when the K loop is long (hidden >= 4096); SM90 keeps the CTA rule.
 CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MAX_CTAS = 1024
 CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MIN_HIDDEN = 4096
 CAKE_BGMV_MOE_SHRINK_FORM_PREFILL = 0
-CAKE_BGMV_MOE_SHRINK_FORM_DECODE = 1
 CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3 = 2
 CAKE_BGMV_MOE_SHRINK_SPLIT_PARTIAL_WORDS = (
     CAKE_BGMV_MOE_SHRINK_SPLIT_MAX * CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS * 64
@@ -303,11 +302,24 @@ def cake_bgmv_moe_route_index_words(num_tokens: int) -> int:
     )
 
 
-def cake_bgmv_moe_route_index_numel(num_tokens: int) -> int:
-    """int32 elements of the plan workspace (route index + hidden-split region)."""
+def cake_bgmv_moe_route_index_numel(
+    num_tokens: int,
+    variant: CakeBGMVMoEVariant = "generic",
+    grouped: bool = False,
+) -> int:
+    """int32 elements of the plan's route-index workspace.
 
+    Every plan holds the route index proper (header + per-token entries). Only
+    the per-route generic shrink forms append the hidden-split partials and
+    arrival counters; the specialized kernels and the grouped pipeline never
+    read that region, so their plans allocate the route index alone.
+    """
+
+    words = cake_bgmv_moe_route_index_words(num_tokens)
+    if variant == "specialized" or grouped:
+        return words
     return (
-        cake_bgmv_moe_route_index_words(num_tokens)
+        words
         + CAKE_BGMV_MOE_SHRINK_SPLIT_PARTIAL_WORDS
         + CAKE_BGMV_MOE_SHRINK_SPLIT_COUNTER_WORDS
     )
@@ -324,8 +336,9 @@ def select_cake_bgmv_moe_generic_shrink(
     Mirrors the Cake generator's ``select_generic_shrink_launch`` and
     ``select_generic_shrink_stages``: the 1-pair kernel beat the 4-pair decode
     kernel on every measured small-pair row once the partials moved to
-    registers, so the decode form (1) is never selected.  The prefill kernel
-    runs its three-stage ring (form 2) while the pair x rank-tile grid is at
+    registers, so the decode form (1) was retired and the binding rejects it.
+    The prefill kernel runs its three-stage ring (form 2) while the pair x
+    rank-tile grid is at
     most ``CAKE_BGMV_MOE_SHRINK_DEEP_RING_MAX_CTAS`` CTAs (on SM100/SM103 also
     up to ``CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MAX_CTAS`` CTAs when
     ``hidden_size >= CAKE_BGMV_MOE_SHRINK_DEEP_RING_BLACKWELL_MIN_HIDDEN``) and
@@ -391,16 +404,13 @@ class CakeBGMVMoEMetadata(NamedTuple):
     body: str
     shrink_decode_symbol: str
     shrink_prefill_symbol: str
-    token_t64_symbol: str
     token_symbol: str
     token_dual_col_symbol: str
 
 
 class CakeBGMVMoEGenericMetadata(NamedTuple):
     body: str
-    shrink_decode_symbol: str
     shrink_prefill_symbol: str
-    shrink_decode_pdl_symbol: str
     shrink_prefill_pdl_symbol: str
     shrink_prefill_s3_symbol: str
     shrink_prefill_s3_pdl_symbol: str
@@ -480,17 +490,22 @@ def _metadata(
 ) -> CakeBGMVMoEMetadata:
     _check_hidden_size(hidden_size)
     tag = _dtype_tag(dtype)
+    # One body per dtype serves both hidden sizes: the generated binding defines
+    # CAKE_BGMV_MOE_HIDDEN and the body pastes it into every kernel symbol. The
+    # compute-capability-10.7 records keep their own unfolded bodies.
     suffix = _body_suffix(arch, (dtype, hidden_size) in _SM107A_SPECIALIZED_BODIES)
+    body = (
+        f"cake_bgmv_moe_{tag}_h{hidden_size}{suffix}.cu"
+        if suffix
+        else f"cake_bgmv_moe_specialized_{tag}.cu"
+    )
     return CakeBGMVMoEMetadata(
-        body=f"cake_bgmv_moe_{tag}_h{hidden_size}{suffix}.cu",
+        body=body,
         shrink_decode_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_{tag}_h{hidden_size}_r32_p4_s3"
         ),
         shrink_prefill_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_{tag}_h{hidden_size}_r32_p1_s2"
-        ),
-        token_t64_symbol=(
-            f"kernel_flashinfer_bgmv_moe_expand_token_t64_{tag}_h{hidden_size}_r32"
         ),
         token_symbol=(
             f"kernel_flashinfer_bgmv_moe_expand_token_{tag}_h{hidden_size}_r32"
@@ -546,6 +561,17 @@ CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM: Dict[CakeBGMVMoEArch, int] = {
     "sm107a": 8,
 }
 CAKE_BGMV_MOE_PDL_EXPAND_COLS_NOMINAL = 128
+# Launch modes each target's generic bundle renders. The plain-launch forms
+# (mode 0: shrink without griddepcontrol, expand without the register
+# prefetch) are compiled for sm_90a only, where cake_bgmv_moe_pdl_mode
+# selects them on large expand grids; the other targets always launch with
+# PDL, so their bundles omit the plain forms and their binding rejects mode 0.
+CAKE_BGMV_MOE_PDL_MODES: Dict[CakeBGMVMoEArch, Tuple[int, ...]] = {
+    "sm90a": (0, 1, 2),
+    "sm100a": (1, 2),
+    "sm103a": (1, 2),
+    "sm107a": (1, 2),
+}
 
 
 def cake_bgmv_moe_pdl_mode(
@@ -615,20 +641,24 @@ def _generic_metadata(
 ) -> CakeBGMVMoEGenericMetadata:
     _check_generic_rank(rank)
     tag = _dtype_tag(dtype)
+    # Ranks 16, 32 and 64 share one body per dtype: the generated binding defines
+    # CAKE_BGMV_MOE_RANK and the body pastes it into every kernel symbol. Rank 8
+    # keeps its own body (one rank tile: the generator specialised its kernels).
+    # The compute-capability-10.7 record keeps its own unfolded body.
     suffix = _body_suffix(arch, (dtype, rank) in _SM107A_GENERIC_BODIES)
+    if suffix:
+        body = f"cake_bgmv_moe_generic_{tag}_r{rank}{suffix}.cu"
+    elif rank == 8:
+        body = f"cake_bgmv_moe_generic_{tag}_r8.cu"
+    else:
+        body = f"cake_bgmv_moe_generic_{tag}.cu"
     return CakeBGMVMoEGenericMetadata(
-        body=f"cake_bgmv_moe_generic_{tag}_r{rank}{suffix}.cu",
-        shrink_decode_symbol=(
-            f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p4_s3"
-        ),
+        body=body,
         shrink_prefill_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p1_s2"
         ),
         # PDL forms: griddepcontrol.launch_dependents (early/late by pdl_early);
         # selected by the binding together with the prefetch expand forms.
-        shrink_decode_pdl_symbol=(
-            f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p4_s3_pdl"
-        ),
         shrink_prefill_pdl_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p1_s2_pdl"
         ),
@@ -664,11 +694,23 @@ def _generic_metadata(
         group_hist_symbol=f"kernel_flashinfer_bgmv_moe_group_hist_{tag}_r{rank}",
         group_scan_symbol=f"kernel_flashinfer_bgmv_moe_group_scan_{tag}_r{rank}",
         group_scatter_symbol=f"kernel_flashinfer_bgmv_moe_group_scatter_{tag}_r{rank}",
-        shrink_grouped_symbol=f"kernel_flashinfer_bgmv_moe_shrink_grouped_{tag}_r{rank}",
-        # Lever 20k: one-rank-tile-per-CTA form (rank 8 has one rank tile: same kernel).
+        # The register-direct grouped shrink is rendered for fp16 only: the bf16 bundles always
+        # select a ring form (lever 3c on sm90a, lever 34 elsewhere), so their alias resolves to
+        # the ring kernel.
+        shrink_grouped_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_{tag}_r{rank}"
+            if tag == "bf16"
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_{tag}_r{rank}"
+        ),
+        # Lever 20k: the one-rank-tile-per-CTA direct form is not rendered (the host policy never
+        # selects one rank tile for the direct form); the alias resolves to the single-tile ring
+        # kernel (bf16; rank 8 has one rank tile: the ring kernel itself) or the direct kernel
+        # (fp16).
         shrink_grouped_single_symbol=(
-            f"kernel_flashinfer_bgmv_moe_shrink_grouped_single_{tag}_r{rank}"
-            if rank > 8
+            f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_single_{tag}_r{rank}"
+            if tag == "bf16" and rank > 8
+            else f"kernel_flashinfer_bgmv_moe_shrink_grouped_ring_{tag}_r{rank}"
+            if tag == "bf16"
             else f"kernel_flashinfer_bgmv_moe_shrink_grouped_{tag}_r{rank}"
         ),
         # Lever 3: cp.async operand-ring forms (the binding launches them when hidden spans more
@@ -739,7 +781,7 @@ def select_cake_bgmv_moe_schedule(
 
     The table was measured on B200 (SM100, 148 SMs); all targets share it;
     Rubin (SM107, 212 SMs) inherits it pending measurement.
-    Sweeping the three expand schedules over the serving shapes (hidden
+    Sweeping the expand schedules over the serving shapes (hidden
     2688/3072, 1..1024 tokens, BF16, CUPTI cold-L2) puts them within 1.2 % of
     each other on B200 and within 3.5 % on H100 (SM90), where
     ``token_owned_dual_col`` trails ``token_owned`` by about 3 % at 1024
@@ -751,8 +793,6 @@ def select_cake_bgmv_moe_schedule(
     if num_tokens <= 0:
         raise ValueError(f"num_tokens must be positive, got {num_tokens}")
 
-    if num_tokens in (1, 4, 8):
-        return "token_owned_t64"
     if hidden_size == 3072 and num_tokens in (512, 1024):
         return "token_owned_dual_col"
     if hidden_size == 2688 and num_tokens == 1024:
@@ -802,9 +842,12 @@ def get_cake_bgmv_moe_uri(
 
 
 def _binding_source(
-    metadata: CakeBGMVMoEMetadata, hidden_size: int, target: CakeBGMVMoEArchTarget
+    metadata: CakeBGMVMoEMetadata,
+    hidden_size: int,
+    dtype: CakeBGMVMoEDType,
+    target: CakeBGMVMoEArchTarget,
 ) -> str:
-    input_dtype = "dl_bfloat16" if "_bf16_" in metadata.body else "dl_float16"
+    input_dtype = "dl_bfloat16" if dtype == "bfloat16" else "dl_float16"
     major, minor = target.capability
     return f"""\
 /*
@@ -819,7 +862,6 @@ def _binding_source(
 #define CAKE_BGMV_MOE_CC_MINOR {minor}
 #define CAKE_BGMV_MOE_SHRINK_DECODE {metadata.shrink_decode_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL {metadata.shrink_prefill_symbol}
-#define CAKE_BGMV_MOE_EXPAND_TOKEN_T64 {metadata.token_t64_symbol}
 #define CAKE_BGMV_MOE_EXPAND_TOKEN {metadata.token_symbol}
 #define CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL {metadata.token_dual_col_symbol}
 
@@ -852,10 +894,11 @@ def _generic_merge_in_expand(metadata: CakeBGMVMoEGenericMetadata) -> bool:
 def _generic_binding_source(
     metadata: CakeBGMVMoEGenericMetadata,
     rank: int,
+    dtype: CakeBGMVMoEDType,
     target: CakeBGMVMoEArchTarget,
     merge_in_expand: Optional[bool] = None,
 ) -> str:
-    input_dtype = "dl_bfloat16" if "_bf16_" in metadata.body else "dl_float16"
+    input_dtype = "dl_bfloat16" if dtype == "bfloat16" else "dl_float16"
     major, minor = target.capability
     if merge_in_expand is None:
         merge_in_expand = _generic_merge_in_expand(metadata)
@@ -883,9 +926,7 @@ def _generic_binding_source(
 #define CAKE_BGMV_MOE_INPUT_DTYPE {input_dtype}
 #define CAKE_BGMV_MOE_CC_MAJOR {major}
 #define CAKE_BGMV_MOE_CC_MINOR {minor}
-#define CAKE_BGMV_MOE_SHRINK_DECODE {metadata.shrink_decode_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL {metadata.shrink_prefill_symbol}
-#define CAKE_BGMV_MOE_SHRINK_DECODE_PDL {metadata.shrink_decode_pdl_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL_PDL {metadata.shrink_prefill_pdl_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL_S3 {metadata.shrink_prefill_s3_symbol}
 #define CAKE_BGMV_MOE_SHRINK_PREFILL_S3_PDL {metadata.shrink_prefill_s3_pdl_symbol}
@@ -938,7 +979,7 @@ def gen_cake_bgmv_moe_generic_module(
 
     uri = get_cake_bgmv_moe_generic_uri(rank, dtype, arch)
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_bgmv_moe_generic_binding.cu"
-    write_if_different(binding, _generic_binding_source(metadata, rank, target))
+    write_if_different(binding, _generic_binding_source(metadata, rank, dtype, target))
     spec = gen_jit_spec(
         name=uri,
         sources=[binding],
@@ -995,7 +1036,7 @@ def gen_cake_bgmv_moe_module(
 
     uri = get_cake_bgmv_moe_uri(hidden_size, dtype, arch)
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_bgmv_moe_binding.cu"
-    write_if_different(binding, _binding_source(metadata, hidden_size, target))
+    write_if_different(binding, _binding_source(metadata, hidden_size, dtype, target))
     spec = gen_jit_spec(
         name=uri,
         sources=[binding],
@@ -1045,6 +1086,7 @@ __all__ = [
     "CAKE_BGMV_MOE_SCHEDULE_IDS",
     "CAKE_BGMV_MOE_SHRINK_SPLIT_MAX",
     "CAKE_BGMV_MOE_PDL_EXPAND_COLS_NOMINAL",
+    "CAKE_BGMV_MOE_PDL_MODES",
     "CAKE_BGMV_MOE_PDL_SMALL_EXPAND_CTAS_PER_SM",
     "CAKE_BGMV_MOE_SPECIALIZED_TOKEN_WINDOW",
     "cake_bgmv_moe_pdl_mode",

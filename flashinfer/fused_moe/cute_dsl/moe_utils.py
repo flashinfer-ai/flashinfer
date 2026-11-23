@@ -24,7 +24,21 @@ import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
 from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
-from ...utils import get_compute_capability
+from ...utils import check_shape_dtype_device, get_compute_capability
+
+
+# NVFP4 stores two E2M1 values per byte and one E4M3 scale per block.
+NVFP4_VALUES_PER_BYTE = 2
+NVFP4_BLOCK_SIZE = 16
+# MMA scale tiles contain 128 rows in four groups of 32, and four columns.
+NVFP4_SF_TILE_ROWS = 128
+NVFP4_SF_TILE_COLS = 4
+NVFP4_SF_ROW_GROUP_SIZE = 32
+
+PRE_FC2_DIM_ALIGNMENT = 128
+PRE_FC2_TILE_SIZE = 128
+PRE_FC2_MMA_SHAPE = (PRE_FC2_TILE_SIZE, PRE_FC2_TILE_SIZE)
+PRE_FC2_CLUSTER_SHAPE = (1, 1)
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -56,17 +70,35 @@ SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
     ActivationType.GegluTanh,
     ActivationType.Relu2,
+    ActivationType.ClampedRelu2,
 )
+
+# The SM90 and W4A16 epilogues have no ClampedRelu2 variant.
+SM90_CUTE_DSL_MOE_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.GegluTanh,
+    ActivationType.Relu2,
+)
+W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES = SM90_CUTE_DSL_MOE_ACTIVATION_TYPES
 
 
 def normalize_cute_dsl_moe_activation_type(
     activation_type: Union[int, ActivationType],
+    supported: Tuple[ActivationType, ...] = SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES,
+    backend: Optional[str] = None,
 ) -> Tuple[ActivationType, bool]:
+    """Normalize ``activation_type`` and return it with its gatedness.
+
+    ``supported`` narrows the accepted activations for a backend that
+    implements only a subset; ``backend`` names it in the error message.
+    """
     activation_type = normalize_activation_type(activation_type)
-    if activation_type not in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES:
-        expected = " or ".join(repr(t) for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES)
+    if activation_type not in supported:
+        expected = " or ".join(repr(t) for t in supported)
+        where = f" for {backend}" if backend else ""
         raise ValueError(
-            f"Unsupported activation_type {activation_type!r}; expected {expected}"
+            f"Unsupported activation_type {activation_type!r}{where}; "
+            f"expected {expected}"
         )
     return activation_type, is_gated_activation(activation_type)
 
@@ -104,6 +136,101 @@ def validate_cute_dsl_moe_situ_config(
     ):
         raise ValueError(
             "situ_linear_beta must be positive and finite in fp32 when set"
+        )
+
+
+def rubin_moe_cluster_covers_one_tile(
+    tile_size: int,
+    mma_tiler: Tuple[int, int, int],
+    mma_inst_shape: Tuple[int, int, int],
+    cluster_shape_mn: Tuple[int, int],
+) -> bool:
+    """Return whether a Rubin (SM107) MoE GEMM tactic maps one cluster to one
+    ``moe_sort`` routing tile along M.
+
+    ``moe_sort`` writes one metadata entry (expert index, M limit) per
+    ``tile_size``-row routing tile, for ``[0, num_non_exiting_tiles)`` only;
+    both Rubin GEMMs bound their metadata reads by that count. A CTA's routing
+    tile is its M tile coordinate divided by ``atom_cta_m``, the MMA CTA
+    group size along M (2 for the 2-CTA ``mma_inst_shape[0] == 256`` MMA,
+    else 1). With ``mma_tiler[0] == tile_size`` and ``cluster_shape_mn[0] ==
+    atom_cta_m`` every CTA of a cluster resolves to the same routing tile, so
+    the CTAs agree on whether the tile is valid and reach the cluster barrier
+    together: no rounding of the tile count and no initialization of the
+    metadata past the active prefix is needed. A cluster spanning several
+    routing tiles (``cluster_shape_mn[0] > atom_cta_m``) would need both, and
+    is not supported. Cluster N only multicasts A/SFA among CTAs of the same
+    routing tile and does not affect this property.
+    """
+    atom_cta_m = 2 if mma_inst_shape[0] == 256 else 1
+    return mma_tiler[0] == tile_size and cluster_shape_mn[0] == atom_cta_m
+
+
+def validate_cute_dsl_moe_clamped_relu2_config(
+    activation_type: ActivationType,
+    clamped_relu2_limit: Optional[torch.Tensor],
+    device: Optional[torch.device] = None,
+) -> None:
+    """Validate the ClampedRelu2 limit: a (1,) float32 tensor, as in
+    ``cutlass_fused_moe``, required with ClampedRelu2 and rejected otherwise."""
+    if activation_type == ActivationType.ClampedRelu2:
+        if clamped_relu2_limit is None:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires a one-element "
+                "clamped_relu2_limit tensor"
+            )
+        if clamped_relu2_limit.ndim != 1 or clamped_relu2_limit.numel() != 1:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires model-wide "
+                "clamped_relu2_limit with shape (1,), got "
+                f"{tuple(clamped_relu2_limit.shape)}"
+            )
+        check_shape_dtype_device(
+            clamped_relu2_limit,
+            (1,),
+            torch.float32,
+            device,
+            "ClampedRelu2 clamped_relu2_limit",
+        )
+    elif clamped_relu2_limit is not None:
+        raise ValueError(
+            "clamped_relu2_limit is supported only with ActivationType.ClampedRelu2"
+        )
+
+
+def validate_pre_fc2_options(
+    enabled: bool, *, per_token_scale: bool = False, localized_weights: bool = False
+) -> None:
+    """Reject per-call options that the pre-FC2 weighting path does not support."""
+    if enabled and per_token_scale:
+        raise ValueError("Pre-FC2 routing weighting does not support per_token_scale")
+    if enabled and localized_weights:
+        raise ValueError("Pre-FC2 routing weighting does not support localized weights")
+
+
+def validate_pre_fc2_routing(
+    enabled: bool,
+    quant_mode: str,
+    activation: ActivationType,
+    output_dtype: torch.dtype,
+    swap_ab: bool = False,
+    *,
+    per_token_scale: bool = False,
+    localized_weights: bool = False,
+) -> None:
+    """Reject modes that cannot preserve the pre-FC2 NVFP4 weighting contract."""
+    validate_pre_fc2_options(
+        enabled, per_token_scale=per_token_scale, localized_weights=localized_weights
+    )
+    if enabled and (
+        quant_mode != "w4a4"
+        or activation != ActivationType.ClampedRelu2
+        or output_dtype != torch.bfloat16
+        or swap_ab
+    ):
+        raise ValueError(
+            "routing_weights_before_fc2 requires W4A4, ClampedRelu2, "
+            "BF16 output, and swap_ab=False"
         )
 
 
@@ -243,22 +370,59 @@ def moe_permute(
         tile_size: Size of each tile for scheduling.
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
-        input_sf: Scale factors for input (required for FP4).
+        input_sf: Optional block scales for FP4 input.
                   Shape: [num_tokens, hidden_size // 16].
-        permuted_sf: Output scale factors for permuted data (required for FP4).
+        permuted_sf: Optional output block scales for permuted FP4 data.
                      Shape: [max_num_permuted_tokens, hidden_size // 16].
 
     Note:
-        - For FP4 inputs, input_sf and permuted_sf are required.
+        - For FP4 inputs, pass both input_sf and permuted_sf to permute the
+          scales too, or neither to permute only the packed values.
         - The permuted_sf output uses a swizzled layout for efficient TMA access.
     """
-    module = _get_moe_utils_module()
     dtype_suffix = _get_dtype_suffix(input.dtype)
 
     hidden_size = input.shape[-1]
     if dtype_suffix == "fp4":
         # For FP4, hidden_size is halved due to packing
-        hidden_size = hidden_size * 2
+        hidden_size = hidden_size * NVFP4_VALUES_PER_BYTE
+        if (input_sf is None) != (permuted_sf is None):
+            raise ValueError(
+                "FP4 permutation requires both input_sf and permuted_sf, or neither"
+            )
+    if dtype_suffix == "fp4" and input_sf is not None and permuted_sf is not None:
+        # Without scale buffers, only the packed values are permuted and the
+        # caller permutes the scales itself.
+        if (
+            hidden_size % (NVFP4_BLOCK_SIZE * NVFP4_SF_TILE_COLS)
+            or max_num_permuted_tokens % NVFP4_SF_TILE_ROWS
+        ):
+            raise ValueError(
+                "FP4 permutation requires K divisible by 64 and padded rows divisible by 128"
+            )
+        if input_sf.shape != (input.shape[0], hidden_size // NVFP4_BLOCK_SIZE):
+            raise ValueError("input_sf must have shape (tokens, K // 16)")
+        if permuted_sf.shape != (
+            max_num_permuted_tokens,
+            hidden_size // NVFP4_BLOCK_SIZE,
+        ):
+            raise ValueError("permuted_sf must have shape (padded rows, K // 16)")
+        if input_sf.dtype not in (
+            torch.uint8,
+            torch.float8_e4m3fn,
+        ) or permuted_sf.dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise TypeError("FP4 scales must be uint8 or float8_e4m3fn")
+        if any(
+            not t.is_contiguous() or t.device != input.device
+            for t in (input, permuted_output, input_sf, permuted_sf)
+        ):
+            raise ValueError(
+                "FP4 values and scales must be contiguous on the same device"
+            )
+
+    if max_num_permuted_tokens == 0:
+        return
+    module = _get_moe_utils_module()
 
     func_name = f"flashinfer_moe_permute_{dtype_suffix}"
     func = module[func_name]
@@ -684,8 +848,11 @@ def moe_sort(
     #
     # Entries outside the active prefix are intentionally uninitialized.
     # Routing writes [0, num_non_exiting_tiles), and both GEMMs consume exactly
-    # that count. Rubin multi-CTA tactics, which would require rounded/padded
-    # metadata entries, are rejected before moe_sort.
+    # that count. This also holds for Rubin 2-CTA and cluster_shape_n > 1
+    # tactics, whose clusters cover exactly one routing tile; tactics with a
+    # cluster spanning several routing tiles, which would require
+    # rounded/padded metadata entries, are rejected before moe_sort (see
+    # rubin_moe_cluster_covers_one_tile).
     if out_tile_idx_to_expert_idx is not None:
         tile_idx_to_expert_idx = out_tile_idx_to_expert_idx
     else:

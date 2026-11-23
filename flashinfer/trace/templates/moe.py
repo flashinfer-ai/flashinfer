@@ -20,12 +20,6 @@ from typing import Any, cast
 
 import torch
 
-from ...tllm_enums import (
-    ActivationType,
-    DEFAULT_SWIGLU_ALPHA,
-    DEFAULT_SWIGLU_BETA,
-    DEFAULT_SWIGLU_LIMIT,
-)
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 from ._init_helpers import fp8_block_quant_1d, fp8_block_quant_2d
 from .gemm import _unswizzle_batched_sf_128x4
@@ -1991,6 +1985,35 @@ def _trtllm_fp4_block_scale_moe_topk_routing_reference(
     )
 
 
+def _nvfp4_4over6_axis_value(kwargs: dict) -> int | None:
+    """Wire code of an explicit ``nvfp4_4over6=``; ``None`` when unset.
+
+    Unset is not resolved here: that would read the environment and make the
+    definition name depend on the process rather than on the call.
+    """
+    from flashinfer.quantization.nvfp4_quantization_utils import (  # noqa: PLC0415
+        _UNSET,
+        nvfp4_4over6_code,
+        resolve_nvfp4_4over6,
+    )
+
+    setting = kwargs.get("nvfp4_4over6", _UNSET)
+    if setting is _UNSET:
+        return None
+    return nvfp4_4over6_code(resolve_nvfp4_4over6(setting))
+
+
+def _nvfp4_4over6_axis() -> Const:
+    return Const(
+        description=(
+            "NVFP4 4over6 recipe as the nvfp4_4over6_code() wire code (0 = off); "
+            "absent when the call left nvfp4_4over6 unset."
+        ),
+        abbrev="r4o6",
+        extract=_nvfp4_4over6_axis_value,
+    )
+
+
 _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "seq_len": Var(description="Number of tokens."),
     "num_experts": Const(description="Total number of experts.", abbrev=""),
@@ -2022,6 +2045,7 @@ _FP4_STANDARD_AXES: dict[str, Var | Const] = {
     "activation_type": Const(
         description="Fused activation type; 10 selects SiTU.", abbrev="act"
     ),
+    "nvfp4_4over6": _nvfp4_4over6_axis(),
 }
 
 _FP4_STANDARD_INPUTS: dict[str, Tensor | Scalar] = {
@@ -2631,22 +2655,39 @@ def _moe_bf16_run_experts(
     activation_type=3,
     situ_beta=None,
     situ_linear_beta=None,
+    clamped_relu2_limit=None,
     use_shuffled_weight=True,
 ):
     """Un-quantized (bf16) MoE expert computation."""
     # Keep enum values local so the serialized reference needs only PyTorch.
-    swiglu, swiglu_step, geglu_tanh, relu2 = 3, 7, 8, 6
+    swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2 = 3, 7, 8, 6, 12
     activation_type = int(activation_type)
-    if situ_beta is not None or situ_linear_beta is not None:
-        from ...fused_moe.cute_dsl.moe_utils import (
-            validate_cute_dsl_moe_situ_config,
-        )
+    if situ_beta is None:
+        if situ_linear_beta is not None:
+            raise ValueError("situ_linear_beta requires situ_beta")
+    else:
+        if activation_type != swiglu:
+            raise ValueError("SiTU parameters require ActivationType.Swiglu")
 
-        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
-    if activation_type not in (swiglu, swiglu_step, geglu_tanh, relu2):
+        # Scalar checks must also reject values that overflow or underflow in FP32.
+        def positive_finite_fp32(value):
+            """Match the runtime validator after FP32 conversion."""
+            if not math.isfinite(value) or value <= 0:
+                return False
+            rounded = torch.tensor(value, dtype=torch.float32, device="cpu")
+            return bool(torch.isfinite(rounded) & (rounded > 0))
+
+        if not positive_finite_fp32(situ_beta):
+            raise ValueError("situ_beta must be positive and finite in fp32")
+        if situ_linear_beta is not None and not positive_finite_fp32(situ_linear_beta):
+            raise ValueError(
+                "situ_linear_beta must be positive and finite in fp32 when set"
+            )
+    if activation_type not in (swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2):
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
-            "expected 3 (SwiGLU), 7 (SwiGLUStep), 8 (GeGLUTanh), or 6 (ReLU2)"
+            "expected 3 (SwiGLU), 7 (SwiGLUStep), 8 (GeGLUTanh), "
+            "6 (ReLU2), or 12 (ClampedRelu2)"
         )
     if activation_type == swiglu_step:
         gemm1_weights = gemm1_weights.transpose(1, 2).flatten(2)
@@ -2673,7 +2714,12 @@ def _moe_bf16_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
-        if activation_type == relu2:
+        if activation_type == clamped_relu2:
+            if clamped_relu2_limit is None:
+                raise ValueError("ClampedRelu2 requires clamped_relu2_limit")
+            limit = clamped_relu2_limit.to(device=device, dtype=torch.float32)
+            act = torch.relu(limit * torch.tanh(G1 / limit)) ** 2
+        elif activation_type == relu2:
             act = torch.relu(G1) ** 2
         else:
             X1, X2 = G1[:, :I], G1[:, I:]
@@ -3220,6 +3266,7 @@ cutlass_fused_moe_trace = TraceTemplate(
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Const(abbrev="i"),
         "top_k": Const(abbrev="topk"),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "input": Tensor(
@@ -3785,6 +3832,7 @@ trtllm_fp4_block_scale_routed_moe_trace = TraceTemplate(
         "activation_type": Const(
             description="Fused activation type; 10 selects SiTU.", abbrev="act"
         ),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "gemm1_bias": _FP4_STANDARD_INPUTS["gemm1_bias"],
@@ -4080,29 +4128,34 @@ trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL MoE variants (precomputed routing, FP4 weights on SM100+)
+# CuteDSL MoE variants (precomputed routing, block-scaled weights on SM100+)
 # ---------------------------------------------------------------------------
 
 cute_dsl_fused_moe_trace = TraceTemplate(
     op_type="moe",
     name_prefix="cute_dsl_fused_moe",
     description=(
-        "CuteDSL fused MoE on SM100, SM103, or SM107 (W4A8 excludes SM107). "
-        "Runs W4A4, W4A8, or W4A16 with precomputed top-k routing."
+        "CuteDSL fused MoE on SM100, SM103, or SM107 (MX formats exclude SM107). "
+        "Runs W4A4, W4A8, W4A16, or MXFP8 with precomputed top-k routing."
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
+        "num_fc2_input_scales": Var(
+            description="One shared FC2 input scale or one per local expert."
+        ),
         "num_experts": Const(abbrev="", description="Total number of experts."),
         "top_k": Const(abbrev="topk"),
         "num_local_experts": Const(abbrev="e"),
         "hidden_size": Const(abbrev="h"),
         "intermediate_size": Var(description="MoE intermediate size (kwarg)."),
         "input_width": Var(
-            description="hidden_size // 2 for W4A4 or hidden_size for W4A8/W4A16."
+            description="hidden_size // 2 for W4A4; hidden_size for W4A8/W4A16/MXFP8."
         ),
-        "num_packed_hidden": Var(description="hidden_size // 2 (packed FP4)."),
+        "num_packed_hidden": Var(
+            description="hidden_size // 2 for FP4 weights; hidden_size for MXFP8."
+        ),
         "num_packed_intermediate": Var(
-            description="intermediate_size // 2 (packed FP4)."
+            description="intermediate_size // 2 for FP4 weights; intermediate_size for MXFP8."
         ),
         "num_fp4_hidden_blocks": Var(
             description="Scale-factor count along hidden_size (x_sf)."
@@ -4115,9 +4168,13 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             abbrev="", value=4, description="MMA SF atom inner-K count."
         ),
         "w1_sf_m_tiles": Var(description="ceil(gemm1_out_size / 128)."),
-        "w1_sf_k_tiles": Var(description="ceil(hidden_size / 128)."),
+        "w1_sf_k_tiles": Var(
+            description="ceil(hidden_size / 64) for NVFP4, / 128 for MX formats."
+        ),
         "w2_sf_m_tiles": Var(description="ceil(hidden_size / 128)."),
-        "w2_sf_k_tiles": Var(description="ceil(intermediate_size / 128)."),
+        "w2_sf_k_tiles": Var(
+            description="ceil(intermediate_size / 64) for NVFP4, / 128 for MX formats."
+        ),
         "gemm1_out_size": Const(
             abbrev="",
             description=(
@@ -4125,16 +4182,20 @@ cute_dsl_fused_moe_trace = TraceTemplate(
                 "intermediate_size for non-gated ReLU^2."
             ),
         ),
+        "nvfp4_4over6": _nvfp4_4over6_axis(),
     },
     inputs={
         "x": Tensor(
             ["num_tokens", "input_width"],
-            description="Packed W4A4, MXFP8 W4A8, or BF16 W4A16 input.",
+            description="Packed W4A4, E4M3 W4A8/MXFP8, or BF16 W4A16 input.",
         ),
         "x_sf": Tensor(
             ["num_tokens", "num_fp4_hidden_blocks"],
             optional=True,
-            description="Activation scales for W4A4/W4A8; omitted for W4A16.",
+            description=(
+                "Linear activation scales for W4A4/W4A8/MXFP8; omitted for W4A16. "
+                "W4A4 also accepts a trailing singleton dimension."
+            ),
         ),
         "token_selected_experts": Tensor(
             ["num_tokens", "top_k"],
@@ -4148,7 +4209,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         ),
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
-            description="Packed FP4 FC1 weights.",
+            description="Packed FP4 or homogeneous MXFP8 FC1 weights.",
         ),
         "w1_weight_sf": Tensor(
             [
@@ -4170,16 +4231,17 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             description="Per-expert FC1 global scale.",
         ),
         "fc2_input_scale": Tensor(
-            ["one"],
+            ["num_fc2_input_scales"],
             dtype="float32",
             optional=True,
             description=(
-                "Global scale for W4A4 FC2 input quantization; omitted for W4A8/W4A16."
+                "Global scale for W4A4 FC2 input quantization; omitted for "
+                "W4A8/W4A16/MXFP8."
             ),
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
-            description="Packed FP4 FC2 weights.",
+            description="Packed FP4 or homogeneous MXFP8 FC2 weights.",
         ),
         "w2_weight_sf": Tensor(
             [
@@ -4206,10 +4268,15 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             optional=True,
             description="Optional W4A4 per-token input row scale.",
         ),
+        "swap_ab": Scalar(
+            "bool",
+            optional=True,
+            description="Use the Blackwell activations-on-B kernel and weight layout.",
+        ),
         "quant_mode": Scalar(
             "string",
             optional=True,
-            description="Compute mode: 'w4a4', 'w4a8', or 'w4a16'.",
+            description="Compute mode: 'w4a4', 'w4a8', 'w4a16', or 'mxfp8'.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
@@ -4222,8 +4289,9 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             description=(
                 "GEMM1 activation type: ActivationType.Swiglu for gated "
                 "SwiGLU/OAI/SiTU, ActivationType.GegluTanh for "
-                "tanh-approximate GeGLU, or ActivationType.Relu2 for "
-                "non-gated ReLU^2. "
+                "tanh-approximate GeGLU, ActivationType.Relu2 for "
+                "non-gated ReLU^2, or ActivationType.ClampedRelu2 for "
+                "non-gated clamped ReLU^2. "
                 "Determines gemm1_out_size."
             ),
         ),
@@ -4251,6 +4319,25 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             "float32",
             optional=True,
             description="Optional SiTU up-branch tanh-clamp beta.",
+        ),
+        "use_fused_finalize": Scalar(
+            "bool",
+            optional=True,
+            description="Use BF16 atomic reduction; otherwise reduce expanded rows in FP32.",
+        ),
+        "routing_weights_before_fc2": Scalar(
+            "bool",
+            optional=True,
+            description="Apply routing weights before GEMM2-input NVFP4 quantization.",
+        ),
+        "clamped_relu2_limit": Tensor(
+            ["one"],
+            dtype="float32",
+            optional=True,
+            description=(
+                "ClampedRelu2 limit L, read at runtime; required with "
+                "ActivationType.ClampedRelu2 only."
+            ),
         ),
     },
     outputs={
@@ -4298,6 +4385,11 @@ _cute_dsl_wrapper_inputs["swiglu_limit"] = Scalar(
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )
+_cute_dsl_wrapper_inputs["swap_ab"] = Scalar(
+    "bool",
+    optional=True,
+    description="Kernel and weight layout set at wrapper __init__, not passed to run().",
+)
 _cute_dsl_wrapper_inputs["quant_mode"] = Scalar(
     "string",
     optional=True,
@@ -4310,6 +4402,22 @@ _cute_dsl_wrapper_inputs["situ_beta"] = Scalar(
 )
 _cute_dsl_wrapper_inputs["situ_linear_beta"] = Scalar(
     "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["use_fused_finalize"] = Scalar(
+    "bool",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["routing_weights_before_fc2"] = Scalar(
+    "bool",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["clamped_relu2_limit"] = Tensor(
+    ["one"],
+    dtype="float32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )
@@ -4938,6 +5046,37 @@ _b12x_wrapper_axes["top_k"] = Var(description="Experts per token.")
 
 
 @torch.no_grad()
+def _pre_fc2_nvfp4_qdq(hidden, global_scale):
+    """Apply standard block-16 NVFP4 QDQ with saturating round-to-nearest-even."""
+    nvfp4_block_size = 16
+    fp4_max = 6.0
+    fp8_scale_max = torch.finfo(torch.float8_e4m3fn).max
+    fp4_code_count = 8
+    blocks = hidden.float().reshape(hidden.shape[0], -1, nvfp4_block_size)
+    raw_scale = blocks.abs().amax(dim=-1) * (global_scale.reshape(()) / fp4_max)
+    scale = raw_scale.clamp(max=fp8_scale_max).to(torch.float8_e4m3fn).float()
+    normalized = blocks * torch.where(
+        scale > 0, global_scale.reshape(()) / scale, 0
+    ).unsqueeze(-1)
+    levels = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32, device=hidden.device
+    )
+    differences = (normalized.abs().clamp(max=fp4_max).unsqueeze(-1) - levels).abs()
+    nearest = differences.argmin(dim=-1)
+    # cvt.rn.satfinite.e2m1x2 resolves exact halfway cases to the even code.
+    codes = torch.arange(fp4_code_count, device=hidden.device)
+    even_ties = (differences == differences.amin(dim=-1, keepdim=True)) & (
+        codes % 2 == 0
+    )
+    even_code = torch.where(even_ties, codes, fp4_code_count).amin(dim=-1)
+    nearest = torch.where(even_code < fp4_code_count, even_code, nearest)
+    values = levels[nearest] * torch.where(normalized < 0, -1, 1)
+    return (values * scale.unsqueeze(-1)).reshape(hidden.shape)
+
+
+# Literal defaults mirror ActivationType.Swiglu and DEFAULT_SWIGLU_ALPHA/BETA
+# so exported source needs no FlashInfer globals; None leaves clamping disabled.
+@torch.no_grad()
 def _cute_dsl_fused_moe_reference(
     x,
     x_sf,
@@ -4952,27 +5091,138 @@ def _cute_dsl_fused_moe_reference(
     w2_alpha,
     num_experts,
     top_k,
-    activation_type=ActivationType.Swiglu.value,
-    swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
-    swiglu_beta=DEFAULT_SWIGLU_BETA,
-    swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+    activation_type=3,
+    swiglu_alpha=1.0,
+    swiglu_beta=0.0,
+    swiglu_limit=None,
     quant_mode="w4a4",
     situ_beta=None,
     situ_linear_beta=None,
+    clamped_relu2_limit=None,
+    routing_weights_before_fc2=False,
+    use_fused_finalize=True,
     per_token_scale=None,
+    local_expert_offset=0,
+    swap_ab=False,
     **_unused,
 ):
-    """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
+    """Reference for block-scaled MoE, including pre-FC2 weighted quantization."""
+    # Keep enum values local so the serialized reference has no enum dependency.
+    swiglu, swiglu_step, geglu_tanh, clamped_relu2 = 3, 7, 8, 12
+    fp4_values_per_byte = 2
+    nvfp4_block_size = 16
+    if routing_weights_before_fc2:
+        clamp = clamped_relu2_limit
+        if (
+            quant_mode.lower() not in ("w4a4", "nvfp4")
+            or int(activation_type) != clamped_relu2
+            or clamp is None
+            or per_token_scale is not None
+            or swap_ab
+        ):
+            raise ValueError("Pre-FC2 weighting reference requires soft-clamped W4A4")
+        if x.shape[0] == 0:
+            return torch.empty(
+                (0, w2_weight.shape[1]), dtype=torch.bfloat16, device=x.device
+            )
+
+        def logical_scales(sf, weight):
+            """Recover expert-major block scales from the grouped GEMM's MMA view."""
+            if sf.ndim == 6:
+                return (
+                    sf.permute(5, 2, 1, 0, 4, 3)
+                    .contiguous()
+                    .reshape(weight.shape[0], -1, sf.shape[4] * 4)[
+                        :,
+                        : weight.shape[1],
+                        : weight.shape[2] * fp4_values_per_byte // nvfp4_block_size,
+                    ]
+                )
+            return sf
+
+        activations = _dequantize_fp4_tensor(
+            x, x_sf.reshape(x.shape[0], -1).view(torch.float8_e4m3fn), False
+        )
+        W1 = _dequantize_fp4_tensor(
+            w1_weight,
+            logical_scales(w1_weight_sf, w1_weight).view(torch.float8_e4m3fn),
+            False,
+        )
+        W2 = _dequantize_fp4_tensor(
+            w2_weight,
+            logical_scales(w2_weight_sf, w2_weight).view(torch.float8_e4m3fn),
+            False,
+        )
+        output = torch.zeros_like(
+            activations, dtype=torch.float64 if use_fused_finalize else torch.float32
+        )
+        absolute_sum = torch.zeros_like(output) if use_fused_finalize else None
+        local_routes = (
+            torch.zeros((x.shape[0], 1), dtype=torch.float32, device=x.device)
+            if use_fused_finalize
+            else None
+        )
+        expanded = (
+            None
+            if use_fused_finalize
+            else torch.zeros(
+                (x.shape[0], top_k, w2_weight.shape[1]),
+                dtype=torch.bfloat16,
+                device=x.device,
+            )
+        )
+        offset = int(local_expert_offset)
+        for expert in range(w1_weight.shape[0]):
+            token, slot = (token_selected_experts == expert + offset).nonzero(
+                as_tuple=True
+            )
+            if token.numel() == 0:
+                continue
+            raw = (activations[token] @ W1[expert].T * w1_alpha[expert]).bfloat16()
+            intermediate = (clamp * torch.tanh(raw.float() / clamp)).bfloat16()
+            intermediate = intermediate.float().relu().square().bfloat16()
+            intermediate = (
+                intermediate.float() * token_final_scales[token, slot, None]
+            ).bfloat16()
+            scale = fc2_input_scale.reshape(-1)
+            scale = scale[expert : expert + 1] if scale.numel() > 1 else scale
+            quantized = _pre_fc2_nvfp4_qdq(intermediate, scale)
+            contribution = (quantized @ W2[expert].T * w2_alpha[expert]).bfloat16()
+            if use_fused_finalize:
+                output.index_add_(0, token, contribution.double())
+                absolute_sum.index_add_(0, token, contribution.double().abs())
+                local_routes.index_add_(
+                    0, token, torch.ones_like(token[:, None], dtype=torch.float32)
+                )
+            else:
+                expanded[token, slot] = contribution
+        if not use_fused_finalize:
+            # moe_unpermute accumulates in FP32 in top-k slot order, not expert order.
+            for slot in range(top_k):
+                output.add_(expanded[:, slot].float())
+        result = output.bfloat16()
+        if use_fused_finalize:
+            # BF16 atomic additions may arrive in any expert order. Carry a
+            # pointwise forward-error budget to the check without changing the
+            # reference's tensor shape or the serving API.
+            unit_roundoff = torch.finfo(torch.bfloat16).eps / 2
+            steps = (local_routes.double() - 1).clamp_min(0)
+            relative_bound = torch.pow(1 + unit_roundoff, steps) - 1
+            bound = relative_bound * absolute_sum.double()
+            bound += (result.double() - output).abs()
+            result._cute_dsl_bf16_reduction_bound = bound
+        return result
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
     quant_mode = quant_mode.lower()
     if quant_mode in ("nvfp4", "w4a4"):
         if x_sf is None:
             raise ValueError("x_sf is required when quant_mode='w4a4'")
+        x_sf = x_sf.view(torch.float8_e4m3fn).reshape(x.shape[0], x.shape[1] // 8)
         hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
-    elif quant_mode == "w4a8":
+    elif quant_mode in ("w4a8", "mxfp8"):
         if x_sf is None:
-            raise ValueError("x_sf is required when quant_mode='w4a8'")
+            raise ValueError(f"x_sf is required when quant_mode={quant_mode!r}")
         hs_deq = _dequantize_fp4_hidden_states(x, x_sf, is_weights_mxfp4=True)
     elif quant_mode == "w4a16":
         if x_sf is not None:
@@ -4980,25 +5230,45 @@ def _cute_dsl_fused_moe_reference(
         hs_deq = x.to(torch.float32)
     else:
         raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
-    is_mxfp4 = quant_mode == "w4a8"
-    if is_mxfp4:
+    is_mxfp = quant_mode in ("w4a8", "mxfp8")
+    sf_vec_size = 32 if is_mxfp else 16
+    # FP4 weights pack two values per byte; FP8 weights are unpacked.
+    weight_packing = 1 if quant_mode == "mxfp8" else 2
 
-        def mma_scales_to_logical(scales, rows, columns):
-            groups = scales.shape[5]
-            return (
-                scales.permute(5, 2, 1, 0, 4, 3)
-                .contiguous()
-                .reshape(groups, -1, scales.shape[4] * 4)[:, :rows, : columns // 32]
-            )
+    def mma_scales_to_logical(scales, weight):
+        # All CuTe DSL weight formats use the same 6D MMA scale layout.
+        scales = (
+            scales.permute(5, 2, 1, 0, 4, 3)
+            .contiguous()
+            .reshape(E_local, -1, scales.shape[4] * 4)
+        )
+        scales = scales[
+            :, : weight.shape[1], : weight.shape[2] * weight_packing // sf_vec_size
+        ]
+        return scales if is_mxfp else scales.view(torch.float8_e4m3fn)
 
-        w1_weight_sf = mma_scales_to_logical(
-            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * 2
+    w1_weight_sf = mma_scales_to_logical(w1_weight_sf, w1_weight)
+    w2_weight_sf = mma_scales_to_logical(w2_weight_sf, w2_weight)
+    if quant_mode == "mxfp8":
+        W1 = _dequantize_fp4_hidden_states(
+            w1_weight, w1_weight_sf, is_weights_mxfp4=True
         )
-        w2_weight_sf = mma_scales_to_logical(
-            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * 2
+        W2 = _dequantize_fp4_hidden_states(
+            w2_weight, w2_weight_sf, is_weights_mxfp4=True
         )
-    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
-    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
+    else:
+        W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp)
+        W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp)
+    # Literal enum values and layout sizes keep the exported reference standalone.
+    if int(activation_type) in (swiglu, swiglu_step, geglu_tanh):
+        swap_ab_gated_row_group_size = 16
+        gated_row_group_size = 64
+        group_size = swap_ab_gated_row_group_size if swap_ab else gated_row_group_size
+        W1 = (
+            W1.reshape(E_local, -1, 2, group_size, W1.shape[-1])
+            .transpose(1, 2)
+            .reshape(E_local, -1, W1.shape[-1])
+        )
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
     W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
@@ -5009,7 +5279,7 @@ def _cute_dsl_fused_moe_reference(
         W2,
         token_final_scales,
         token_selected_experts.to(torch.int64),
-        local_expert_offset=0,
+        local_expert_offset=local_expert_offset,
         E_global=int(num_experts),
         activation_type=activation_type,
         gemm1_alpha=swiglu_alpha,
@@ -5017,7 +5287,77 @@ def _cute_dsl_fused_moe_reference(
         gemm1_clamp_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        clamped_relu2_limit=clamped_relu2_limit,
     )
+
+
+cast(Any, _cute_dsl_fused_moe_reference)._trace_reference_dependencies = (
+    _unpack_fp4_e2m1,
+    _ue8m0_to_float32,
+    _decode_block_scales,
+    _dequantize_fp4_tensor,
+    _dequantize_fp4_hidden_states,
+    _moe_expert_param,
+    _moe_bf16_run_experts,
+    _pre_fc2_nvfp4_qdq,
+)
+
+
+def _cute_dsl_moe_check(reference_outputs, actual_outputs, **thresholds):
+    """Allow the pointwise BF16 reduction budget only on the weighted fused path."""
+    import torch
+    from flashinfer.trace import default_check
+    from flashinfer.trace.template import default_tolerances
+
+    def single_output(outputs):
+        """Unwrap one output while retaining its reference-only reduction metadata."""
+        if isinstance(outputs, dict):
+            return next(iter(outputs.values())) if len(outputs) == 1 else None
+        if isinstance(outputs, (list, tuple)):
+            return outputs[0] if len(outputs) == 1 else None
+        return outputs
+
+    if isinstance(reference_outputs, dict) or isinstance(actual_outputs, dict):
+        if not isinstance(reference_outputs, dict) or not isinstance(
+            actual_outputs, dict
+        ):
+            return False
+        if reference_outputs.keys() != actual_outputs.keys():
+            return False
+    ref, actual = single_output(reference_outputs), single_output(actual_outputs)
+    bound = getattr(ref, "_cute_dsl_bf16_reduction_bound", None)
+    if bound is None:
+        return default_check(reference_outputs, actual_outputs, **thresholds)
+    if not isinstance(actual, torch.Tensor) or ref.shape != actual.shape:
+        return False
+    if not (torch.isfinite(ref).all() and torch.isfinite(actual).all()):
+        return default_check(reference_outputs, actual_outputs, **thresholds)
+    if ref.numel() == 0:
+        return True
+    default_rtol, default_atol = default_tolerances(actual.dtype)
+    rtol = thresholds.get("rtol")
+    atol = thresholds.get("atol")
+    rtol = default_rtol if rtol is None else rtol
+    atol = default_atol if atol is None else atol
+    # A relative tolerance alone cannot handle cancellation of large routes.
+    close = (actual.double() - ref.double()).abs() <= (
+        bound + atol + rtol * ref.double().abs()
+    )
+    mismatch_pct = 100 * (1 - close.double().mean().item())
+    if mismatch_pct > thresholds.get("max_mismatch_pct", 0.0):
+        return False
+    # No default cosine threshold here: cancellation can make the ideal sum
+    # zero while a valid BF16 reduction is nonzero. Honor explicit requests.
+    min_cos_sim = thresholds.get("min_cos_sim")
+    if min_cos_sim is not None:
+        a, b = actual.double().flatten(), ref.double().flatten()
+        denominator = torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b)
+        cosine = (
+            (a @ b / denominator).item() if denominator else float(torch.equal(a, b))
+        )
+        if cosine < min_cos_sim:
+            return False
+    return True
 
 
 @torch.no_grad()
@@ -5203,6 +5543,8 @@ def _b12x_fused_moe_reference(
 
 cute_dsl_fused_moe_trace.reference = _cute_dsl_fused_moe_reference
 cute_dsl_moe_wrapper_run_trace.reference = _cute_dsl_fused_moe_reference
+cute_dsl_fused_moe_trace.check = _cute_dsl_moe_check
+cute_dsl_moe_wrapper_run_trace.check = _cute_dsl_moe_check
 b12x_fused_moe_trace.reference = _b12x_fused_moe_reference
 
 
@@ -5548,6 +5890,449 @@ cute_dsl_fused_moe_bf16_trace = TraceTemplate(
         ),
     },
     tags=["status:experimental", "backend:cute-dsl", "moe:sm90"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Two-way partitioned Prims-TS MoE
+# ---------------------------------------------------------------------------
+# Partitioned APIs consume two caller-owned prepared-weight shards rather than
+# one logical weight tensor.  Template dispatch keeps the physical MajorK and
+# BlockMajorK ranks, FP4 activation format, and partition strategy explicit so
+# distinct executable variants cannot overwrite one another's trace files.
+# The resources handle is deliberately omitted: streams and synchronization
+# events are execution context rather than benchmark inputs.
+
+_PRIMS_TS_PARTITION_STRATEGIES = ("tp_n_tp_n", "tp_n_tp_k")
+_PRIMS_TS_WEIGHT_LAYOUTS = {0: "major_k", 2: "block_major_k"}
+
+
+class _Nvfp4PartitionTraceTemplate(TraceTemplate):
+    """TraceTemplate whose logical H is twice packed NVFP4 activation storage."""
+
+    derived_axes = frozenset({"hidden_size"})
+
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def logical_hidden_size(kwargs):
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None or hidden_states.ndim < 2:
+                return None
+            return int(hidden_states.shape[1]) * 2
+
+        extractors["hidden_size"] = logical_hidden_size
+        return extractors
+
+
+def _partitioned_weight_axes(layout: str) -> dict[str, Const]:
+    common = {
+        "fc1_shard_rows": Const(
+            abbrev="", description="Physical prepared FC1 rows per partition."
+        ),
+        "fc2_shard_rows": Const(
+            abbrev="", description="Physical prepared FC2 rows per partition."
+        ),
+    }
+    if layout == "major_k":
+        return {
+            **common,
+            "fc1_storage_k": Const(
+                abbrev="", description="Physical prepared FC1 K storage."
+            ),
+            "fc2_storage_k": Const(
+                abbrev="", description="Physical prepared FC2 K storage."
+            ),
+        }
+    return {
+        **common,
+        "fc1_k_blocks": Const(abbrev="", description="Prepared FC1 K-block count."),
+        "fc1_block_elements": Const(
+            abbrev="", description="Prepared FC1 elements per K block."
+        ),
+        "fc2_k_blocks": Const(abbrev="", description="Prepared FC2 K-block count."),
+        "fc2_block_elements": Const(
+            abbrev="", description="Prepared FC2 elements per K block."
+        ),
+    }
+
+
+def _partitioned_weight_inputs(layout: str) -> dict[str, Tensor]:
+    if layout == "major_k":
+        fc1_shape = ["num_local_experts", "fc1_shard_rows", "fc1_storage_k"]
+        fc2_shape = ["num_local_experts", "fc2_shard_rows", "fc2_storage_k"]
+    else:
+        fc1_shape = [
+            "num_local_experts",
+            "fc1_k_blocks",
+            "fc1_shard_rows",
+            "fc1_block_elements",
+        ]
+        fc2_shape = [
+            "num_local_experts",
+            "fc2_k_blocks",
+            "fc2_shard_rows",
+            "fc2_block_elements",
+        ]
+    return {
+        f"gemm{fc}_weights_{partition}": Tensor(
+            fc1_shape if fc == 1 else fc2_shape,
+            param=f"gemm{fc}_weights",
+            tuple_idx=partition,
+            description=f"Prepared FC{fc} payload owned by partition {partition}.",
+        )
+        for fc in (1, 2)
+        for partition in (0, 1)
+    }
+
+
+def _partitioned_scale_shard_inputs(dtype: str) -> dict[str, Tensor]:
+    return {
+        f"gemm{fc}_weights_scale_{partition}": Tensor(
+            [f"fc{fc}_scale_storage"],
+            dtype=dtype,
+            param=f"gemm{fc}_weights_scale",
+            tuple_idx=partition,
+            description=(
+                f"Flattened prepared FC{fc} scale payload for partition {partition}."
+            ),
+        )
+        for fc in (1, 2)
+        for partition in (0, 1)
+    }
+
+
+def _partitioned_prefix(
+    base: str, strategy: str, layout: str, *, variant: str = ""
+) -> str:
+    # Preserve the concise names used by the checked-in MajorK TP-N/TP-K
+    # examples. Every other dispatch target receives an explicit suffix.
+    if strategy == "tp_n_tp_k" and layout == "major_k" and not variant:
+        return base
+    suffix = "_".join(part for part in (variant, strategy, layout) if part)
+    return f"{base}_{suffix}"
+
+
+def _make_partitioned_trace(
+    *,
+    kind: str,
+    strategy: str,
+    layout: str,
+    fp4_mode: str | None = None,
+) -> TraceTemplate:
+    base = f"prims_ts_{kind}_moe_partitioned"
+    variant = "" if fp4_mode in (None, "nvfp4") else fp4_mode
+    hidden_dims = (
+        ["seq_len", "hidden_storage_k"]
+        if fp4_mode == "nvfp4"
+        else ["seq_len", "hidden_size"]
+    )
+    axes: dict[str, Var | Const] = {
+        "seq_len": Var(description="Number of input tokens."),
+        "num_experts": Const(abbrev="", description="Total number of experts."),
+        "top_k": Const(abbrev="topk", description="Experts selected per token."),
+        "num_local_experts": Const(
+            abbrev="e", description="Experts resident on this rank."
+        ),
+        "hidden_size": Const(abbrev="h", description="Logical activation width."),
+        "intermediate_size": Const(abbrev="i", description="Logical FFN width."),
+        "partition_count": Const(
+            value=2,
+            abbrev="p",
+            description="Number of concurrent weight partitions.",
+        ),
+        **_partitioned_weight_axes(layout),
+    }
+    constraints = ["do_finalize == True"]
+    if fp4_mode == "nvfp4":
+        axes["hidden_storage_k"] = Const(
+            abbrev="", description="Packed NVFP4 activation bytes per token."
+        )
+        constraints.append("hidden_size == 2 * hidden_storage_k")
+    inputs: dict[str, Tensor | Scalar] = {
+        "routing_logits": Tensor(
+            ["seq_len", "num_experts"],
+            optional=True,
+            description="Optional routing logits; omitted for precomputed routing.",
+        ),
+        "routing_bias": Tensor(
+            ["num_experts"], optional=True, description="Optional routing bias."
+        ),
+        "topk_ids": Tensor(
+            ["seq_len", "top_k"],
+            dtype="int32",
+            optional=True,
+            description="Optional precomputed expert ids.",
+        ),
+        "hidden_states": Tensor(hidden_dims, description="Input hidden states."),
+        "num_experts": Scalar("int32", description="Total number of experts."),
+        "top_k": Scalar("int32", description="Experts selected per token."),
+        "n_group": Scalar("int32", optional=True, description="Expert routing groups."),
+        "topk_group": Scalar(
+            "int32", optional=True, description="Expert groups retained by routing."
+        ),
+        "intermediate_size": Scalar("int32", description="Logical FFN width."),
+        "local_expert_offset": Scalar(
+            "int32", description="First local expert in global expert space."
+        ),
+        "local_num_experts": Scalar(
+            "int32", description="Experts resident on this rank."
+        ),
+        "routed_scaling_factor": Scalar(
+            "float32", optional=True, description="Optional routing-weight scale."
+        ),
+        "routing_method_type": Scalar(
+            "int32", optional=True, description="RoutingMethodType value."
+        ),
+        "partition_strategy": Scalar(
+            "string", description="Two-way FC partition strategy."
+        ),
+        "weight_layout": Scalar("int32", optional=True),
+        "do_finalize": Scalar("bool", optional=True),
+        "enable_pdl": Scalar(
+            "bool",
+            optional=True,
+            description="Enable Programmatic Dependent Launch.",
+        ),
+        **_partitioned_weight_inputs(layout),
+    }
+    if kind in ("bf16", "fp8_block_scale", "fp4_block_scale"):
+        inputs.update(
+            {
+                "gemm1_alpha": Tensor(
+                    ["num_local_experts"],
+                    dtype="float32",
+                    optional=True,
+                    description="Optional per-expert SiTU or SwiGLU alpha.",
+                ),
+                "gemm1_beta": Tensor(
+                    ["num_local_experts"],
+                    dtype="float32",
+                    optional=True,
+                    description="Optional per-expert SiTU or SwiGLU beta.",
+                ),
+                "gemm1_clamp_limit": Tensor(
+                    ["num_local_experts"],
+                    dtype="float32",
+                    optional=True,
+                    description="Optional per-expert gated-activation clamp limit.",
+                ),
+            }
+        )
+    tags = [
+        "status:experimental",
+        "backend:prims-ts",
+        "partitioning:two-way",
+        f"partition-strategy:{strategy}",
+        f"weight-layout:{layout}",
+    ]
+    if kind == "bf16":
+        inputs["expert_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        description = "Two-way partitioned Prims-TS BF16 MoE."
+    elif kind == "fp8_per_tensor_scale":
+        inputs["expert_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        for name in (
+            "output1_scales_scalar",
+            "output1_scales_gate_scalar",
+            "output2_scales_scalar",
+        ):
+            inputs[name] = Tensor(
+                ["num_local_experts"], description="Per-expert output scale."
+            )
+        tags.append("quantization:float8_e4m3fn")
+        description = "Two-way partitioned Prims-TS FP8 per-tensor-scale MoE."
+    elif kind == "fp8_block_scale":
+        axes.update(
+            {
+                "hidden_scale_storage": Const(abbrev=""),
+                "fc1_scale_storage": Const(abbrev=""),
+                "fc2_scale_storage": Const(abbrev=""),
+            }
+        )
+        inputs["expert_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        inputs["hidden_states_scale"] = Tensor(
+            ["hidden_scale_storage"],
+            dtype="uint8",
+            description="Prepared MXFP8 activation-scale payload.",
+        )
+        inputs.update(_partitioned_scale_shard_inputs("uint8"))
+        tags.append("quantization:mxfp8")
+        description = "Two-way partitioned Prims-TS MXFP8 block-scale MoE."
+    else:
+        assert kind == "fp4_block_scale" and fp4_mode is not None
+        # The prepared FP4 weight-scale ABI uses byte-backed E4M3 tensors for
+        # both NVFP4 (K/16) and MXFP4 (K/32) scale factors.
+        scale_dtype = "float8_e4m3fn"
+        axes.update(
+            {
+                "hidden_scale_storage": Var(
+                    description="Optional activation-scale storage extent."
+                ),
+                "fc1_scale_storage": Const(abbrev=""),
+                "fc2_scale_storage": Const(abbrev=""),
+            }
+        )
+        inputs["topk_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        inputs["hidden_states_scale"] = Tensor(
+            ["hidden_scale_storage"],
+            dtype=scale_dtype,
+            optional=fp4_mode == "mxfp4_bf16",
+            description="Prepared activation-scale payload.",
+        )
+        inputs.update(_partitioned_scale_shard_inputs(scale_dtype))
+        for name in (
+            "output1_scale_scalar",
+            "output1_scale_gate_scalar",
+            "output2_scale_scalar",
+        ):
+            inputs[name] = Tensor(
+                ["num_local_experts"], description="Per-expert output scale."
+            )
+        tags.extend(["quantization:fp4-block-scale", f"activation-format:{fp4_mode}"])
+        description = f"Two-way partitioned Prims-TS {fp4_mode} FP4 MoE."
+
+    template_type = (
+        _Nvfp4PartitionTraceTemplate if fp4_mode == "nvfp4" else TraceTemplate
+    )
+    return template_type(
+        op_type="moe",
+        name_prefix=_partitioned_prefix(base, strategy, layout, variant=variant),
+        description=description,
+        axes=axes,
+        inputs=inputs,
+        outputs={
+            "output": Tensor(
+                ["seq_len", "hidden_size"],
+                dtype="bfloat16",
+                description="Finalized MoE output.",
+            )
+        },
+        constraints=constraints,
+        tags=tags,
+    )
+
+
+def _make_partitioned_trace_table(
+    kind: str, *, fp4_modes: tuple[str, ...] = ()
+) -> dict[tuple[str, str, str | None], TraceTemplate]:
+    modes: tuple[str | None, ...] = fp4_modes or (None,)
+    return {
+        (strategy, layout, mode): _make_partitioned_trace(
+            kind=kind,
+            strategy=strategy,
+            layout=layout,
+            fp4_mode=mode,
+        )
+        for strategy in _PRIMS_TS_PARTITION_STRATEGIES
+        for layout in _PRIMS_TS_WEIGHT_LAYOUTS.values()
+        for mode in modes
+    }
+
+
+_PRIMS_TS_BF16_PARTITION_TRACES = _make_partitioned_trace_table("bf16")
+_PRIMS_TS_FP4_PARTITION_TRACES = _make_partitioned_trace_table(
+    "fp4_block_scale",
+    fp4_modes=("nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"),
+)
+_PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES = _make_partitioned_trace_table(
+    "fp8_per_tensor_scale"
+)
+_PRIMS_TS_FP8_BLOCK_PARTITION_TRACES = _make_partitioned_trace_table("fp8_block_scale")
+
+# Stable names retained for direct imports and the checked-in representative
+# MajorK TP-N/TP-K examples.
+prims_ts_bf16_moe_partitioned_trace = _PRIMS_TS_BF16_PARTITION_TRACES[
+    ("tp_n_tp_k", "major_k", None)
+]
+prims_ts_fp4_block_scale_moe_partitioned_trace = _PRIMS_TS_FP4_PARTITION_TRACES[
+    ("tp_n_tp_k", "major_k", "nvfp4")
+]
+prims_ts_fp8_per_tensor_scale_moe_partitioned_trace = (
+    _PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES[("tp_n_tp_k", "major_k", None)]
+)
+prims_ts_fp8_block_scale_moe_partitioned_trace = _PRIMS_TS_FP8_BLOCK_PARTITION_TRACES[
+    ("tp_n_tp_k", "major_k", None)
+]
+
+
+def _partition_trace_layout_and_strategy(kwargs):
+    if not kwargs.get("do_finalize", True):
+        return None
+    strategy = kwargs.get("partition_strategy")
+    layout = _PRIMS_TS_WEIGHT_LAYOUTS.get(int(kwargs.get("weight_layout", 0)))
+    if strategy not in _PRIMS_TS_PARTITION_STRATEGIES or layout is None:
+        return None
+    return strategy, layout
+
+
+def prims_ts_bf16_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    return (
+        None if resolved is None else _PRIMS_TS_BF16_PARTITION_TRACES[(*resolved, None)]
+    )
+
+
+def prims_ts_fp4_block_scale_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    hidden_states = kwargs.get("hidden_states")
+    if resolved is None or hidden_states is None:
+        return None
+    if hidden_states.dtype == torch.uint8:
+        mode = "nvfp4"
+    elif hidden_states.dtype == torch.float8_e4m3fn:
+        mode = "mxfp4_mxfp8"
+    elif hidden_states.dtype == torch.bfloat16:
+        mode = "mxfp4_bf16"
+    else:
+        return None
+    return _PRIMS_TS_FP4_PARTITION_TRACES[(*resolved, mode)]
+
+
+def prims_ts_fp8_per_tensor_scale_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    return (
+        None
+        if resolved is None
+        else _PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES[(*resolved, None)]
+    )
+
+
+def prims_ts_fp8_block_scale_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    return (
+        None
+        if resolved is None
+        else _PRIMS_TS_FP8_BLOCK_PARTITION_TRACES[(*resolved, None)]
+    )
+
+
+prims_ts_bf16_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_BF16_PARTITION_TRACES.values()
+)
+prims_ts_fp4_block_scale_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_FP4_PARTITION_TRACES.values()
+)
+prims_ts_fp8_per_tensor_scale_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES.values()
+)
+prims_ts_fp8_block_scale_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_FP8_BLOCK_PARTITION_TRACES.values()
 )
 
 

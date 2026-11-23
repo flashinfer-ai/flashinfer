@@ -154,6 +154,8 @@ from .autotune import (
     nvfp4_candidates,
 )
 
+from .bf16_stage import fused_bf16_stage
+
 # Fused bf16 -> quant + routing staging (single-launch DataPreprocess).
 from .quant_stage import (
     forget_staged_tokens,
@@ -170,6 +172,7 @@ __all__ = [
     # paths
     "bootstrap_paths",
     # quant_stage
+    "fused_bf16_stage",
     "forget_staged_tokens",
     "fused_quant_stage",
     "fused_quant_stage_supported",

@@ -1,3 +1,4 @@
+from flashinfer.autotuner.protocol import TuningContext, TuningProtocol, TuningResult
 from flashinfer.autotuner.initializers import (
     autotuner_initializer_empty,
     autotuner_initializer_zeros,
@@ -25,6 +26,8 @@ from flashinfer.autotuner.autotuner import (
     _tactic_to_json,
     _tactic_to_json_hashable,
     autotune,
+    cake_auto_candidate_open,
+    cake_group_tuning,
     get_autotune_process_group,
     is_in_profile_measurement,
     make_bucket_mapper,
@@ -44,6 +47,9 @@ __all__ = [
     "StaticDim",
     "TunableRunner",
     "TuningConfig",
+    "TuningContext",
+    "TuningProtocol",
+    "TuningResult",
     "ValueProfileArena",
     "_METADATA_KEY",
     "_collect_metadata",
@@ -57,6 +63,8 @@ __all__ = [
     "autotuner_initializer_rand_scaled",
     "autotuner_initializer_randn",
     "autotuner_initializer_zeros",
+    "cake_auto_candidate_open",
+    "cake_group_tuning",
     "get_autotune_process_group",
     "is_in_profile_measurement",
     "make_bucket_mapper",

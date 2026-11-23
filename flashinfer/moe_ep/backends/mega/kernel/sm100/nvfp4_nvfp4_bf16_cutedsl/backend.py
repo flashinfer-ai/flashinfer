@@ -13,21 +13,31 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import nvfp4_cutedsl_runtime_requirements
 from ......core.validation.common import (
+    MoEEpConfigError,
     validate_mega_arch,
     validate_mega_fleet_params,
 )
 from ......weights import MoEWeightPack
+from ..ep_tuning import BlackwellEpTuningMixin
 from .config import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
-from .staging import stage_mega_moe_inputs, validate_nvfp4_forward_inputs
+from .staging import (
+    stage_mega_moe_inputs,
+    validate_fc1_activation_per_token_scale,
+    validate_nvfp4_forward_inputs,
+)
 from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
     validate_transformed_mega_weights,
+)
+
+from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+    batch_invariant_variant_kwargs,
 )
 
 if TYPE_CHECKING:
@@ -42,16 +52,39 @@ def _resolve_gate_up_clamp(
     return config.activation_clamp
 
 
+def _cake_reducer_supported(k, fleet_params: FleetParams) -> bool:
+    from flashinfer.jit.cake_megamoe_topk_reduce import supports_device
+
+    return (
+        fleet_params.max_tokens_per_rank in (256, 4096)
+        and fleet_params.token_hidden_size == 4096
+        and k.top_k == 6
+        and not k.enable_in_kernel_fc2_reduce
+        and k.combine_dtype == "bf16"
+        and k.apply_routing_weights_before_fc2
+        and supports_device()
+    )
+
+
 @register_mega_kernel(
     "sm100_nvfp4_nvfp4_bf16_cutedsl", deprecated_aliases=("nvfp4_cutedsl",)
 )
-class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
+class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
     supports_output_view = True
 
     def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
+        """Initialize legacy inference state and reject next-only GenPhase."""
         super().__init__(config)
+        if config.kernel_variant != "inference":
+            raise MoEEpConfigError(
+                "NVFP4 GenPhase requires kernel_name='sm100_nvfp4_nvfp4_bf16_cutedsl_next'."
+            )
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
-        self.supports_unfinalized_output = not config.do_finalize
+        if config.batch_invariant:
+            from ..common.nvfp4_batch_invariant import nvfp4_batch_invariant_arch
+
+            self._arithmetic_arch = nvfp4_batch_invariant_arch()
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._thunk_states: dict[tuple, tuple] = {}
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
@@ -82,6 +115,16 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         fleet_params: FleetParams,
     ) -> None:
         validate_mega_arch()
+        if self._kernel_config.batch_invariant:
+            from ..common.nvfp4_batch_invariant import (
+                nvfp4_batch_invariant_arch,
+                validate_nvfp4_batch_invariant,
+            )
+
+            self._arithmetic_arch = nvfp4_batch_invariant_arch()
+            validate_nvfp4_batch_invariant(
+                self._kernel_config, arch=self._arithmetic_arch
+            )
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
@@ -91,6 +134,16 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             # the binding bound is TMA row alignment, not the dg SF word.
             alignment=64,
         )
+        if (
+            self._kernel_config.finalize_mode is FinalizeMode.CAKE
+            and not self._cake_reducer_supported(fleet_params)
+        ):
+            raise ValueError(
+                "finalize_mode=CAKE requires a supported device, "
+                "max_tokens_per_rank in (256, 4096), hidden=4096, top_k=6, "
+                "enable_in_kernel_fc2_reduce=False, combine_dtype='bf16' and "
+                "apply_routing_weights_before_fc2=True."
+            )
 
     def preprocess_weights(
         self,
@@ -126,6 +179,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
         k = self._kernel_config
+        from ..common.nvfp4_batch_invariant import NVFP4_BATCH_INVARIANT_VERSION
+
         return dict(
             dtype="nvfp4",
             world_size=self.ep_world_size,
@@ -136,16 +191,67 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             max_tokens=fleet_params.max_tokens_per_rank,
             combine_dtype=k.combine_dtype,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            apply_topk_in_fc1=k.apply_topk_in_fc1,
-            defer_topk_reduce=not k.do_finalize
-            or self._uses_native_topk_reduce(fleet_params),
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            use_custom_finalize=self._finalize_mode(fleet_params)
+            in (FinalizeMode.NONE, FinalizeMode.CAKE),
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=NVFP4_BATCH_INVARIANT_VERSION
+            if k.batch_invariant
+            else None,
+            gate_up_clamp=_resolve_gate_up_clamp(k),
+            input_norm_const=k.input_norm_const,
+            **(batch_invariant_variant_kwargs(k) if k.batch_invariant else {}),
+        )
+
+    def _workspace_knobs(self, fleet_params):
+        from ..common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_default_knobs,
+            validate_nvfp4_batch_invariant,
+        )
+
+        selected = super()._workspace_knobs(fleet_params)
+        if not self._kernel_config.batch_invariant:
+            return selected
+        if selected is None:
+            selected = nvfp4_batch_invariant_default_knobs("legacy")
+            if self._kernel_config.combine_dtype != "bf16":
+                selected["token_back_mode"] = "reuse_dispatch_warps"
+        validate_nvfp4_batch_invariant(
+            self._kernel_config,
+            selected,
+            implementation="legacy",
+            arch=self._arithmetic_arch,
+        )
+        return selected
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_fingerprint,
+            validate_nvfp4_batch_invariant,
+        )
+
+        validate_nvfp4_batch_invariant(
+            self._kernel_config,
+            self._workspace_knobs(fleet_params),
+            arch=self._arithmetic_arch,
+        )
+        return nvfp4_batch_invariant_fingerprint(
+            self._kernel_config,
+            hidden=fleet_params.token_hidden_size,
+            num_experts=fleet_params.num_experts,
+            arch=self._arithmetic_arch,
+            public_inputs=True,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         from ......kernel_src.sm100.cutedsl_megamoe import get_symm_buffer_for_mega_moe
+        from ..common.nvfp4_batch_invariant import nvfp4_batch_invariant_metadata
 
         k = self._kernel_config
         fp = fleet_params
+        mode = self._finalize_mode(fleet_params)
         workspace = get_symm_buffer_for_mega_moe(
             fp.num_experts,
             fp.max_tokens_per_rank,
@@ -154,6 +260,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             2 * k.intermediate_size,
             self.ep_rank,
             self.ep_world_size,
+            **nvfp4_batch_invariant_metadata(k),
             gate_up_clamp=_resolve_gate_up_clamp(k),
             swiglu_alpha=k.swiglu_alpha,
             swiglu_beta=k.swiglu_beta,
@@ -161,18 +268,22 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             activation=k.activation,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
-            apply_topk_in_fc1=k.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            defer_topk_reduce=(
-                not k.do_finalize or self._uses_native_topk_reduce(fleet_params)
-            ),
+            use_custom_finalize=mode in (FinalizeMode.NONE, FinalizeMode.CAKE),
+            use_persistent_finalize_kernel=mode is FinalizeMode.PERSISTENT,
+            num_valid_tokens_tensor=k.num_valid_tokens_tensor,
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
+            enable_fc1_activation_per_token_scale=(
+                k.enable_fc1_activation_per_token_scale
+            ),
             knobs=self._workspace_knobs(fleet_params),
         )
-        if not k.do_finalize:
+        workspace._epilogue_default_ones = torch.ones_like(workspace.fc1_alpha)
+        if mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
                 fp.max_tokens_per_rank * k.top_k,
                 dtype=torch.int32,
@@ -180,28 +291,31 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             ).view(fp.max_tokens_per_rank, k.top_k)
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if k.apply_topk_in_fc1
-                else workspace.topk_weights
+                if workspace._frontend.config.apply_routing_weights_before_fc2
+                else (
+                    torch.empty_like(workspace.topk_weights)
+                    if k.batch_invariant
+                    else workspace.topk_weights
+                )
             )
         return workspace
 
-    def _uses_native_topk_reduce(self, fleet_params: FleetParams) -> bool:
-        """Whether this exact workspace can use the frozen Cake reducer.
-
-        The reducer is published for the datacenter-Blackwell targets that
-        also run this CuTeDSL megakernel (sm_100a on B200, sm_103a on B300).
-        """
-        from flashinfer.jit.cake_megamoe_topk_reduce import supports_device
-
+    def _finalize_mode(self, fleet_params: FleetParams) -> FinalizeMode:
         k = self._kernel_config
-        return (
-            supports_device()
-            and fleet_params.max_tokens_per_rank in (256, 4096)
-            and fleet_params.token_hidden_size == 4096
-            and k.top_k == 6
-            and not k.enable_in_kernel_fc2_reduce
-            and k.combine_dtype == "bf16"
-            and k.apply_topk_in_fc1
+        if k.finalize_mode is not FinalizeMode.AUTO:
+            return k.finalize_mode
+        if self._cake_reducer_supported(fleet_params):
+            return FinalizeMode.CAKE
+        if k.num_valid_tokens_tensor is not None:
+            return FinalizeMode.PERSISTENT
+        return FinalizeMode.DEFAULT
+
+    def _uses_native_topk_reduce(self, fleet_params: FleetParams) -> bool:
+        return self._finalize_mode(fleet_params) is FinalizeMode.CAKE
+
+    def _cake_reducer_supported(self, fleet_params: FleetParams) -> bool:
+        return not self._kernel_config.batch_invariant and _cake_reducer_supported(
+            self._kernel_config, fleet_params
         )
 
     def validate_forward(
@@ -220,6 +334,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             quantize_input=quantize_input,
             scales=t.scales,
         )
+        validate_fc1_activation_per_token_scale(
+            t.fc1_activation_per_token_scale,
+            num_tokens=t.hidden_states.shape[0],
+            enabled=self._kernel_config.enable_fc1_activation_per_token_scale,
+        )
 
     def stage_inputs(
         self,
@@ -229,6 +348,17 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         quantize_input: bool,
     ) -> None:
         num_tokens = t.hidden_states.shape[0]
+        # The layer runs validate_forward() only for the first forward of a
+        # workspace (later forwards are gated on a stable input signature that
+        # does not cover this optional tensor).  Presence and metadata of the
+        # per-token scale are per-forward facts -- a forward that omits it
+        # would otherwise silently reuse the previous batch's scales -- so
+        # re-check them here on every staging.  Metadata only; no device work.
+        validate_fc1_activation_per_token_scale(
+            t.fc1_activation_per_token_scale,
+            num_tokens=num_tokens,
+            enabled=self._kernel_config.enable_fc1_activation_per_token_scale,
+        )
         if quantize_input:
             stage_mega_moe_inputs(
                 t.hidden_states,
@@ -239,6 +369,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 norm_const=self._kernel_config.input_norm_const,
+                batch_invariant=self._kernel_config.batch_invariant,
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
@@ -273,14 +404,27 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
         destinations = []
         sources = []
-        for source, destination in (
-            (t.fc1_alpha, workspace.fc1_alpha),
-            (t.fc2_alpha, workspace.fc2_alpha),
-            (t.fc1_norm_const, workspace.fc1_norm_const),
-        ):
-            if source is not None:
+        for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+            source = getattr(t, name)
+            if source is None:
+                source = getattr(self._kernel_config, name)
+            destination = getattr(workspace, name)
+            if source is None:
+                source = workspace._epilogue_default_ones
+            if isinstance(source, (int, float)):
+                destination.fill_(source)
+            else:
+                # Workspace scalars own their storage; per-call overrides must
+                # never overwrite the caller's configuration defaults.
                 destinations.append(destination)
                 sources.append(source)
+        if t.fc1_activation_per_token_scale is not None:
+            # Validated above (shape (num_tokens,), fp32, enabled); only the live
+            # [:num_tokens] rows of the per-token plane are staged.  Strided
+            # sources are fine here: copy_ honours the source stride and the
+            # workspace plane is contiguous.
+            destinations.append(workspace.fc1_activation_per_token_scale[:num_tokens])
+            sources.append(t.fc1_activation_per_token_scale)
         if sources:
             # Workspace aliases preserve the ordering of the individual copies.
             if any(
@@ -306,7 +450,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 "MegaMoE workspace is not warmed for CUDA graph capture; "
                 "call layer.warmup(..., workspace=workspace) first"
             )
-        if frontend.config.defer_topk_reduce and not self.supports_unfinalized_output:
+        if frontend.config.use_custom_finalize and not self.supports_unfinalized_output:
             from flashinfer.jit.cake_megamoe_topk_reduce import (
                 is_cake_megamoe_topk_reduce_module_loaded,
             )
@@ -340,6 +484,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=workspace.fc2_alpha,
             fc1_norm_const=workspace.fc1_norm_const,
             output_activation=workspace.output_activation,
+            fc1_activation_per_token_scale=workspace.fc1_activation_per_token_scale,
+            num_valid_tokens=workspace.num_valid_tokens,
         )
 
     def _prepared_thunk_state(
@@ -394,7 +540,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from ......kernel_src.sm100.cutedsl_megamoe import staged_tokens
 
         if self.supports_unfinalized_output:
-            raise ValueError("do_finalize=False requires compute_unfinalized()")
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if output is not None:
             num_tokens = output.shape[0]
         else:
@@ -432,9 +578,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             # compute() re-attempts it (all ranks fail together, so lockstep holds).
             self._autotune_pending = False
         # Steady-state launch thunk: nvfp4_mega_moe re-validates, re-resolves
-        # the clamp, and rebuilds the 12-field inputs bundle on every call
-        # (~70us of loop-invariant host Python at 43 layers x 4 ranks — the
-        # measured arrival-skew generator; see vllm_e2e RUNS.md run 27/28).
+        # the clamp, and rebuilds the 12-field inputs bundle on every call.
         # Build once per (workspace, weights, compiled-session, STREAM) and
         # reuse. The stream is part of the key because the thunk's launch
         # kwargs bind it at build time — a graph capture runs on a capture
@@ -444,9 +588,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         state = self._prepared_thunk_state(workspace, transformed_weights)
         key, thunk, out_buf = state
         reducer_state = None
-        if workspace._frontend.config.defer_topk_reduce:
+        if workspace._frontend.config.use_custom_finalize:
             partials, workspace_root, _region = (
-                workspace._frontend.deferred_topk_reduce_workspace()
+                workspace._frontend.custom_finalize_workspace()
             )
             # Resolve/load the native module and borrowed view before the
             # upstream launch.  The terminal interval below must contain only
@@ -482,18 +626,29 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from ......kernel_src.sm100.cutedsl_megamoe import staged_tokens
 
         if not self.supports_unfinalized_output:
-            raise ValueError("compute_unfinalized() requires do_finalize=False")
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
         num_tokens = staged_tokens(workspace.topk_idx)
         if num_tokens is None:
             raise ValueError("compute_unfinalized() requires stage_inputs() first")
         _, thunk, _ = self._prepared_thunk_state(workspace, transformed_weights)
         partials, _workspace_root, _region = (
-            workspace._frontend.deferred_topk_reduce_workspace()
+            workspace._frontend.custom_finalize_workspace()
         )
         top_k, hidden = partials.shape[1:]
         gemm2_permuted = partials[:num_tokens].view(num_tokens * top_k, hidden)
         weights = workspace._unfinalized_weights[:num_tokens]
         expanded_idx_to_permuted_idx = workspace._unfinalized_route_map[:num_tokens]
+        if self._kernel_config.batch_invariant:
+            weights = workspace._unfinalized_weights[:num_tokens]
+            if self._kernel_config.apply_routing_weights_before_fc2:
+                weights.fill_(1.0)
+            else:
+                weights.copy_(workspace.topk_weights[:num_tokens])
+            weights.masked_fill_(
+                (workspace.topk_idx[:num_tokens] < 0)
+                | (workspace.topk_idx[:num_tokens] >= workspace.num_total_experts),
+                0,
+            )
         # The full-capacity communication launch is required even for T=0.
         thunk()
         return gemm2_permuted, weights, expanded_idx_to_permuted_idx
@@ -511,6 +666,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         fp = fleet_params
         return (
             "sm100_nvfp4_nvfp4_bf16_cutedsl",
+            k.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
@@ -526,14 +683,15 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             k.activation,
             k.situ_beta,
             k.situ_linear_beta,
-            k.apply_topk_in_fc1,
+            k.apply_routing_weights_before_fc2,
             k.enable_in_kernel_fc2_reduce,
-            k.do_finalize,
-            self._uses_native_topk_reduce(fleet_params),
+            self._finalize_mode(fleet_params),
+            epilogue_pool_key(k.num_valid_tokens_tensor),
             k.combine_dtype,
             epilogue_pool_key(k.fc1_alpha),
             epilogue_pool_key(k.fc2_alpha),
             epilogue_pool_key(k.fc1_norm_const),
+            k.enable_fc1_activation_per_token_scale,
             knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 

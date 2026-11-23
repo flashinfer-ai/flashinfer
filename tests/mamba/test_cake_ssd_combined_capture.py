@@ -279,7 +279,20 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
     else:
         family = "exactfused"
     mode = "batched" if form in ("batched", "chunk_parallel") else "varlen"
-    assert prepared.program_name == f"{family}_bf16_{mode}"
+    table_form = ""
+    if family == "exactone":
+        # SM107 picks the one-launch prologue form by the launch grid.
+        table_form = importlib.import_module(
+            "flashinfer.mamba.cake_ssd_combined"
+        ).exactone_table_variant(
+            capability=torch.cuda.get_device_capability(),
+            variant="",
+            state_dtype=torch.bfloat16,
+            grid=prepared.grid[0],
+        )
+    assert prepared.program_name == f"{family}_bf16_{mode}" + (
+        f"_{table_form}" if table_form else ""
+    )
     if family in ("exactfused", "exactone"):
         # The fused program is prepared only as a single launch (the
         # one-launch program always is).
@@ -665,7 +678,18 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert prepared.program_name == "exactfused_bf16_varlen"
     assert prepared.preprocess_grid == (0, 1, 1)
     assert prepared.workspace_key == module._WorkspaceKey(
-        None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, True, False, "never"
+        None,
+        1,
+        seqlen,
+        3,
+        3,
+        num_seqs,
+        torch.bfloat16,
+        False,
+        True,
+        False,
+        False,
+        "never",
     )
     assert loads == [("exactfused_bf16_varlen", arch)]
     assert runner._workspaces.get(prepared.workspace_key).prepared
@@ -714,7 +738,18 @@ def test_prepare_and_run_resolve_the_same_program_for_a_trusted_cumsum_without_g
     assert launch["main"]["seq_chunk_cumsum"] is table
     assert (
         module._WorkspaceKey(
-            None, 1, seqlen, 3, 3, num_seqs, torch.bfloat16, False, False, True, "never"
+            None,
+            1,
+            seqlen,
+            3,
+            3,
+            num_seqs,
+            torch.bfloat16,
+            False,
+            False,
+            True,
+            False,
+            "never",
         )
         in runner._workspaces
     )
@@ -1008,24 +1043,33 @@ def test_tail_route_precedes_the_noring_variant_without_gpu(monkeypatch, sm_coun
     the pair rule off, the same shape takes the variant function's answer on
     the balanced persistent grid, from ``prepare`` and ``run`` alike.  The
     two readings never coincide on a real shape (``noring`` is one-chunk
-    geometry, the pair rule needs 16 chunks), so each is forced here."""
+    geometry, the pair rule needs 16 chunks), so each is forced here.  The
+    ``_noring`` programs ship only where the variant rule can select them
+    (one-chunk items of the retained ``exact`` family, never the two-kernel
+    family), so the second arm takes the same 512-item x 16-chunk call in its
+    packed-varlen form and also forces the retained family."""
 
     module = _module()
     rule = module.tail_selected
-    for pair_rule, expected in (
-        (True, "exactpre_bf16_batched_tail"),
-        (False, "exactpre_bf16_batched_noring"),
+    for pair_rule, form, family, expected in (
+        (True, "batched", None, "exactpre_bf16_batched_tail"),
+        (False, "cu_seqlens", "exact", "exact_bf16_varlen_noring"),
     ):
         calls, loads = [], []
-        runner = _cpu_runner(module, monkeypatch, calls, loads)
+        varlen = form != "batched"
+        runner = _cpu_runner(module, monkeypatch, calls, loads, has_varlen=varlen)
         monkeypatch.setattr(module, "_sm_count", lambda _: sm_count)
         monkeypatch.setattr(module, "_exact_scan_variant", lambda **_: "noring")
+        if family is not None:
+            monkeypatch.setattr(
+                module, "two_kernel_family", lambda _family=family, **_: _family
+            )
         monkeypatch.setattr(
             module,
             "tail_selected",
             lambda _on=pair_rule, **kwargs: _on and rule(**kwargs),
         )
-        (x, dt, A, B, C), _ = _tail_call("batched")
+        (x, dt, A, B, C), kwargs = _tail_call(form)
         out = torch.empty_like(x)
         grid = (
             module._tail_grid_size(sm_count=sm_count)
@@ -1033,11 +1077,11 @@ def test_tail_route_precedes_the_noring_variant_without_gpu(monkeypatch, sm_coun
             else module._persistent_grid_size(total_work=512, sm_count=sm_count)
         )
 
-        prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, out=out)
+        prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, out=out, **kwargs)
 
         assert prepared.program_name == expected, (pair_rule, prepared.program_name)
         assert prepared.grid == (grid, 1, 1)
-        runner.run(x, dt, A, B, C, out=out)
+        runner.run(x, dt, A, B, C, out=out, **kwargs)
         name, launch = calls[-1]
         assert name == runner.last_program_name == prepared.program_name
         assert launch["main_grid"] == prepared.grid
@@ -1175,7 +1219,30 @@ def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
             assert runner._allocations_in_last_run == 0
         program = module._PROGRAMS[name]
         assert program.family == family, (arch, form, name)
-        assert program.variant == "" and program.cluster_dims == (1, 1, 1)
+        # SM107's one-launch program takes the prologue form of its grid,
+        # and its one-CTA-cluster twin where ``unit_cluster_variant`` admits
+        # the call (here the two-kernel ``exactpre`` program of the
+        # publishing form: 16 items).
+        table_form = module.unit_cluster_variant(
+            capability=module._ARCH_CAPABILITIES[arch],
+            family=family,
+            variant=(
+                module.exactone_table_variant(
+                    capability=module._ARCH_CAPABILITIES[arch],
+                    variant="",
+                    state_dtype=torch.bfloat16,
+                    grid=grid,
+                )
+                if family == "exactone"
+                else ""
+            ),
+            state_dtype=torch.bfloat16,
+            mode_varlen=True,
+            num_sequences=num_seqs,
+            nheads=8,
+            total_tokens=seqlen,
+        )
+        assert program.variant == table_form and program.cluster_dims == (1, 1, 1)
         assert not name.endswith("_tail")
         assert launch["main_grid"] == (grid, 1, 1) == (16, 1, 1)
         if family == "exactone":
@@ -1262,7 +1329,7 @@ def test_prepare_resolves_the_shape_without_launching_without_gpu(monkeypatch):
     assert prepared == module.PreparedSSDCombined(
         program_name="chunkpar_bf16_batched",
         workspace_key=module._WorkspaceKey(
-            None, 1, 256, 2, 2, 1, torch.bfloat16, False, False, False, "always"
+            None, 1, 256, 2, 2, 1, torch.bfloat16, False, False, False, False, "always"
         ),
         grid=(16, 1, 1),
         preprocess_grid=(2, 1, 1),
@@ -1472,7 +1539,16 @@ def test_public_prepare_delegates_to_the_cake_runner_without_gpu():
         "num_seqs",
         "cu_seqlens",
         "out",
+        "final_states",
+        "initial_state_slots",
+        "final_state_slots",
+        "initial_state_flags",
+        "null_slot_id",
+        "checkpoint_token_indices",
+        "checkpoint_state_slots",
+        "checkpoint_states",
     }
+    assert kwargs["null_slot_id"] == -1
     runner._backend = "cute"
     with pytest.raises(NotImplementedError, match="backend='cake'"):
         runner.prepare(x=x, dt=dt, A=A, B=B, C=C)

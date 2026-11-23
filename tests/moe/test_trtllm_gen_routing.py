@@ -67,10 +67,8 @@ def require_supported_gpu():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability == (10, 7):
-        pytest.skip("trtllm-gen routing is not implemented on SM107")
     if compute_capability[0] not in (10, 12):
-        pytest.skip("trtllm-gen routing requires SM100/SM103/SM120/SM121")
+        pytest.skip("trtllm-gen routing requires SM100/SM103/SM107/SM120/SM121")
 
 
 def stable_seed(*parts):
@@ -819,11 +817,7 @@ def test_routing_tile_padding(
             # Check selection without assuming the native top-k slot order.
             got_experts = torch.full_like(inverse, -1)
             local_experts = tile_experts[positions // tile_tokens_dim].long()
-            if routing_method == RoutingMethodType.Llama4 and num_tokens < 4:
-                # Llama4's warp path retains global expert indices in tiles.
-                got_experts[live] = local_experts
-            else:
-                got_experts[live] = local_experts + local_offset
+            got_experts[live] = local_experts + local_offset
             wanted = torch.where(selected_is_local, selected, -1)
             torch.testing.assert_close(
                 got_experts.view(num_tokens, top_k).sort(dim=-1).values,

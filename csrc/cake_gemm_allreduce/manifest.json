@@ -1,0 +1,269 @@
+{
+  "compile_flags": [
+    "--use_fast_math"
+  ],
+  "kernel_count": 12,
+  "kernel_symbols": [
+    "kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws2",
+    "kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws2",
+    "kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws2",
+    "kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws2",
+    "kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws4",
+    "kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws4",
+    "kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws4",
+    "kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws4",
+    "kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws8",
+    "kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws8",
+    "kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws8",
+    "kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws8"
+  ],
+  "kernels": [
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 126080,
+      "exchange": "oneshot",
+      "ring_stages": 6,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws2",
+      "token_tile": 16,
+      "world_size": 2
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 152704,
+      "exchange": "twoshot",
+      "ring_stages": 6,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws2",
+      "token_tile": 32,
+      "world_size": 2
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 206080,
+      "exchange": "twoshot",
+      "ring_stages": 6,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws2",
+      "token_tile": 64,
+      "world_size": 2
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 214528,
+      "exchange": "twoshot",
+      "ring_stages": 4,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws2",
+      "token_tile": 128,
+      "world_size": 2
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 126080,
+      "exchange": "oneshot",
+      "ring_stages": 6,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws4",
+      "token_tile": 16,
+      "world_size": 4
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 152704,
+      "exchange": "twoshot",
+      "ring_stages": 6,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws4",
+      "token_tile": 32,
+      "world_size": 4
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 206080,
+      "exchange": "twoshot",
+      "ring_stages": 6,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws4",
+      "token_tile": 64,
+      "world_size": 4
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 214528,
+      "exchange": "twoshot",
+      "ring_stages": 4,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws4",
+      "token_tile": 128,
+      "world_size": 4
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 126080,
+      "exchange": "oneshot",
+      "ring_stages": 6,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws8",
+      "token_tile": 16,
+      "world_size": 8
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 152704,
+      "exchange": "twoshot",
+      "ring_stages": 6,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws8",
+      "token_tile": 32,
+      "world_size": 8
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 206080,
+      "exchange": "twoshot",
+      "ring_stages": 6,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws8",
+      "token_tile": 64,
+      "world_size": 8
+    },
+    {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 214528,
+      "exchange": "twoshot",
+      "ring_stages": 4,
+      "symbol": "kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws8",
+      "token_tile": 128,
+      "world_size": 8
+    }
+  ],
+  "launch": {
+    "arguments": [
+      {
+        "box": [
+          64,
+          64,
+          2
+        ],
+        "comment": "[N, K] bf16, K contiguous; 3D (64, N, K/64), strides (K*2, 128) B, SWIZZLE_128B",
+        "kind": "tensor_map",
+        "name": "W",
+        "tensor": "w"
+      },
+      {
+        "box": [
+          64,
+          "token_tile",
+          2
+        ],
+        "comment": "[M, K] bf16; 3D (64, M, K/64), strides (K*2, 128) B, SWIZZLE_128B, rows above M read as zero (OOB fill)",
+        "kind": "tensor_map",
+        "name": "X",
+        "tensor": "x"
+      },
+      {
+        "comment": "[M, N] row-major",
+        "dtype": "bfloat16",
+        "kind": "pointer",
+        "name": "out"
+      },
+      {
+        "comment": "Lamport workspace multicast VA (FlashInfer MNNVL all-reduce workspace mc_ptr)",
+        "dtype": "bfloat16",
+        "kind": "pointer",
+        "name": "mcast_ptr"
+      },
+      {
+        "comment": "this rank's unicast mapping (uc_ptr_local)",
+        "dtype": "bfloat16",
+        "kind": "pointer",
+        "name": "local_unicast_ptr"
+      },
+      {
+        "comment": "device table of every rank's unicast pointer (uc_ptrs_dev)",
+        "dtype": "int64",
+        "kind": "pointer",
+        "name": "peer_ptrs"
+      },
+      {
+        "comment": "nine-word LamportFlags (buffer_flags)",
+        "dtype": "uint32",
+        "kind": "pointer",
+        "name": "buffer_flags"
+      },
+      {
+        "comment": "diagnostic timeline buffer; unused by the exported kernels, pass any valid device pointer",
+        "dtype": "uint64",
+        "kind": "pointer",
+        "name": "tl"
+      },
+      {
+        "comment": "M",
+        "dtype": "int32",
+        "kind": "scalar",
+        "name": "num_tokens"
+      },
+      {
+        "comment": "N",
+        "dtype": "int32",
+        "kind": "scalar",
+        "name": "out_ld"
+      },
+      {
+        "comment": "K / 128",
+        "dtype": "int32",
+        "kind": "scalar",
+        "name": "k_macros"
+      },
+      {
+        "dtype": "int32",
+        "kind": "scalar",
+        "name": "rank"
+      }
+    ],
+    "block_threads": 192,
+    "cluster": [
+      1,
+      1,
+      1
+    ],
+    "grid": [
+      "N / 64",
+      "ceil(M / token_tile)",
+      1
+    ],
+    "pdl": "griddepcontrol.wait before the activation loads (weights prefetched ahead of it); launch_dependents after the publish / scatter"
+  },
+  "operator": {
+    "description": "out[M, N] = allreduce_r(x_r[M, K] @ w_r[N, K]^T); bf16 in/out, fp32 accumulate, the local partial rounded to bf16 once, cross-rank sum in fixed rank order, one final rounding; bitwise identical out on every rank",
+    "dtypes": [
+      "bfloat16"
+    ],
+    "k_multiple": 128,
+    "n_multiple": 64,
+    "world_sizes": [
+      2,
+      4,
+      8
+    ]
+  },
+  "route": {
+    "comment": "pick the smallest token tile >= M (one-shot kernel for M <= 16, two-shot above); M > 128 uses the 128-token kernel with grid.y = ceil(M / 128)",
+    "oneshot_max_tokens": 16,
+    "token_tile_by_tokens": {
+      "128": 128,
+      "16": 16,
+      "32": 32,
+      "64": 64
+    }
+  },
+  "schema_version": 1,
+  "sources": {
+    "binding": "csrc/cake_gemm_allreduce/cake_gemm_allreduce_binding.cu",
+    "kernels": "csrc/cake_gemm_allreduce/cake_gemm_allreduce_kernels.cu"
+  },
+  "targets": [
+    "sm_100a",
+    "sm_103a"
+  ],
+  "tma_abi": "grid_constant",
+  "workspace": {
+    "flags_abi": "LamportFlags nine uint32 words: current, dirty, bytes_per_buffer, dirty_num_stages, bytes_to_clear[4], access_counter",
+    "kind": "flashinfer_mnnvl_allreduce_fusion",
+    "lamport_buffers": 3,
+    "required_bytes_per_buffer": {
+      "oneshot": "M * N * world_size * 2",
+      "twoshot": "2 * ceil(M / world_size) * world_size * N * 2"
+    }
+  }
+}

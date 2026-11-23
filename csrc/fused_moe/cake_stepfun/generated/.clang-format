@@ -1,4 +1,0 @@
-# Checksum-attested generated sources (static source-registry identities);
-# formatting them would break the receipts that bind them to the exporter.
-DisableFormat: true
-SortIncludes: Never

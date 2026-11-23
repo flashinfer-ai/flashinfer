@@ -69,7 +69,7 @@ def _config_from_args(
         in_kernel_fc2_reduce=args.in_kernel_fc2_reduce,
         token_back_mode=args.token_back_mode,
         combine_dtype=args.combine_dtype,
-        apply_topk_in_fc1=args.ref_compute_graph == "deepgemm",
+        apply_routing_weights_before_fc2=args.ref_compute_graph == "deepgemm",
         gate_up_clamp=args.gate_up_clamp,
         enable_iket=args.enable_iket,
     )

@@ -57,17 +57,23 @@ SMK_CELL_PAIRS = {"cute_smk_s2_p2_n2_m16_z8_bf16": (2, 2)}
 SMK_COMPONENT_BY_CELL = {cell: component for component, cell in SMK_CELLS.items()}
 
 
-# Planes completion-counter parameter per tiled smk split cell (mirror of the producer's ``SMK_ROUTE_FLAGS`` acq flag ->
-# ``smk_counter_param``): ``completion_u32`` for the ``_a1`` cells (wave 4 round 7), ``completion`` otherwise.
-# ``None`` = the cluster DSMEM-mailbox ``_x1_d1`` form (wave 4 round 8): no planes workspace and no counter,
-# the launch binds only the GEMM operands and the record's cluster dims (1, 1, 4) fix the cluster attribute (like ``_z4c``).
-# The init-registered mailbox-tx form ``_x1_d1_e2`` routed since H11 (round 11, R10-6) keeps this binding unchanged: same
-# operands, cluster dims, grid and dynamic SMEM (the tx registration is a device-side barrier attribute, not a host constant).
-SMK_CELL_COUNTER = {
-    "cute_smk_s1_m16_z4_bf16": None,
-    "cute_smk_s2_p2_n2_m16_z8_bf16": "completion_u32",
-    "cute_smk_s2_m32_z6_bf16": "completion_u32",
-}
+# Planes completion-counter bindings of the tiled smk split programs and their counter dtypes: ``completion_u32``
+# for the ``_a1`` programs, ``completion`` otherwise.  Each routed program's ``MODULES`` record decides (its
+# ``arg_plan``), so the PDL and non-PDL programs of one cell may reduce differently.  A program whose plan binds no
+# ``partials`` is a cluster form -- the DSMEM-mailbox ``_x1_d1`` S=4 programs, the reduce-scatter ``_r1`` (16, 2, 8)
+# PDL programs: no planes workspace and no counter, the launch binds only the GEMM operands and the record's cluster
+# dims fix the cluster attribute (like ``_z4c``).
+SMK_PLANES_COUNTERS = {"completion": torch.int32, "completion_u32": torch.uint32}
+
+
+def _smk_planes_counter(record: dict[str, Any]) -> Optional[str]:
+    """The completion-counter binding of a planes program's record, ``None`` when it binds no planes workspace."""
+
+    names = {name for kind, name in record["arg_plan"] if kind == "buffer"}
+    if "partials" not in names:
+        return None
+    (counter,) = names & SMK_PLANES_COUNTERS.keys()
+    return counter
 
 
 def _smk_cell_pairs(component: str) -> Tuple[int, int]:
@@ -545,7 +551,7 @@ def _route_plan(
     selection; ``_plan`` only binds the tensors (and the stream-private workspace) per call.
     """
 
-    from ..jit.blackwell_bf16_fp4 import ROUTES, cluster_dims
+    from ..jit.blackwell_bf16_fp4 import MODULES, ROUTES, cluster_dims
 
     specs = []
     for component, stage_alpha, pdl, flat_grid, grid in _select_route(
@@ -578,16 +584,14 @@ def _route_plan(
         elif (
             component in SMK_CELLS
             and SMK_CELLS[component][2] > 1
-            and SMK_CELL_COUNTER.get(component) is not None
+            and (counter_name := _smk_planes_counter(MODULES[module])) is not None
         ):
-            # ``_a1`` planes cells (every routed split cell since wave 4 round 7) take the u32 counter under
-            # ``completion_u32`` (producer rule ``smk_split_bindings`` / ``smk_counter_param``); plain cells keep ``completion``.
-            counter_name = SMK_CELL_COUNTER[component]
+            # The planes program binds the FP32 planes and the counter its record names.
             workspace = (
                 SMK_CELLS[component][2],
                 n,
                 counter_name,
-                torch.uint32 if counter_name == "completion_u32" else torch.int32,
+                SMK_PLANES_COUNTERS[counter_name],
             )
         elif (
             component in SMK_CUDNN_COMPONENTS
@@ -731,84 +735,123 @@ def _prepare_blackwell_bf16_fp4(
     raise ValueError(f"unknown source-built BF16 x FP4 backend {backend!r}")
 
 
-def _validate_alpha(alpha: Optional[torch.Tensor], a: torch.Tensor) -> None:
-    if alpha is None:
-        return
-    if alpha.device != a.device:
-        raise ValueError(
-            f"alpha must be on the same device as the GEMM inputs ({a.device}); "
-            f"got {alpha.device}"
-        )
-    if (
-        alpha.dtype != torch.float32
-        or tuple(alpha.shape) != (1,)
-        or not alpha.is_contiguous()
-    ):
-        raise ValueError(
-            "alpha must be a contiguous float32 tensor with shape (1,); "
-            f"got dtype={alpha.dtype}, shape={tuple(alpha.shape)}, "
-            f"contiguous={alpha.is_contiguous()}"
-        )
-
-
-def _validate_blackwell_native_layout(
+def _validate_blackwell_bf16_fp4(
     a: torch.Tensor,
     b: torch.Tensor,
     b_descale: torch.Tensor,
-) -> int:
-    if b.dim() != 2 or b.dtype != torch.uint8:
+    alpha: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor],
+    block_size: int,
+    backend: BlackwellBf16Fp4Backend,
+) -> Tuple[bool, int, int]:
+    """Validate the prepared ABI of one call and return ``(tiled, M, N)``.
+
+    The ``mm_bf16_fp4`` backend checker and :func:`_compute_blackwell_bf16_fp4`
+    both run this, so ``skip_check=True`` skips a duplicate run, not a check.
+    """
+
+    if a.dim() != 2 or a.dtype != torch.bfloat16:
         raise ValueError(
-            "blackwell-native expects b as contiguous uint8 [N, K/2]; "
-            f"got dtype={b.dtype}, shape={tuple(b.shape)}"
+            "source-built BF16 x FP4 GEMM expects a as bfloat16 [M, K]; "
+            f"got dtype={a.dtype}, shape={tuple(a.shape)}"
         )
-    n = int(b.shape[0])
-    k = int(b.shape[1]) * 2
-    expected_scale_shape = (n, k // 16)
-    if (
-        b_descale.dtype != torch.float8_e4m3fn
-        or tuple(b_descale.shape) != expected_scale_shape
+    k = int(a.shape[1])
+    if block_size != 16:
+        raise ValueError(
+            f"source-built BF16 x FP4 GEMM requires block_size=16 and K%16=0; "
+            f"got block_size={block_size}, K={k}"
+        )
+    if k % block_size != 0:
+        raise ValueError(f"K={k} must be a multiple of block_size={block_size}")
+    if backend == "blackwell-native":
+        tiled = False
+        if b.dim() != 2 or b.dtype != torch.uint8:
+            raise ValueError(
+                "blackwell-native expects the uint8 [N, K/2] weight returned by "
+                "prepare_bf16_fp4_weights(..., backend='blackwell-native')"
+            )
+        n = int(b.shape[0])
+        encoded_k = int(b.shape[1]) * 2
+        if k != encoded_k:
+            raise ValueError(f"a.shape[1]={k} but prepared b encodes K={encoded_k}")
+        if b_descale.dtype != torch.float8_e4m3fn or tuple(b_descale.shape) != (
+            n,
+            k // block_size,
+        ):
+            raise ValueError(
+                "blackwell-native expects linear float8_e4m3fn scales with shape "
+                f"{(n, k // block_size)}; got dtype={b_descale.dtype}, "
+                f"shape={tuple(b_descale.shape)}"
+            )
+        if out_dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                f"blackwell-native supports bfloat16 or float16 output; got {out_dtype}"
+            )
+    elif backend == "blackwell-tiled":
+        tiled = True
+        if b.dim() != 2 or b.dtype != torch.int32 or int(b.shape[1]) % 2 != 0:
+            raise ValueError(
+                "blackwell-tiled expects the int32 [K/16, N*2] weight returned by "
+                "prepare_bf16_fp4_weights(..., backend='blackwell-tiled')"
+            )
+        k_tiles = int(b.shape[0])
+        n = int(b.shape[1]) // 2
+        encoded_k = k_tiles * block_size
+        if k != encoded_k:
+            raise ValueError(f"a.shape[1]={k} but prepared b encodes K={encoded_k}")
+        if n % 64 != 0:
+            raise ValueError(
+                f"blackwell-tiled requires N to be a multiple of 64; got N={n}"
+            )
+        if b_descale.dtype != torch.uint8 or tuple(b_descale.shape) != (k_tiles, n):
+            raise ValueError(
+                "blackwell-tiled expects S0E5M3 uint8 scales with shape "
+                f"{(k_tiles, n)}; got dtype={b_descale.dtype}, "
+                f"shape={tuple(b_descale.shape)}"
+            )
+        if out_dtype != torch.bfloat16:
+            raise ValueError(
+                f"blackwell-tiled requires bfloat16 output; got {out_dtype}"
+            )
+    else:
+        raise ValueError(f"unknown source-built BF16 x FP4 backend {backend!r}")
+    if not b.is_contiguous() or not b_descale.is_contiguous():
+        raise ValueError(f"{backend} requires contiguous b and b_descale")
+    if b.device != a.device or b_descale.device != a.device:
+        raise ValueError("a, b, and b_descale must be on the same device")
+    m = int(a.shape[0])
+    if out is not None and (
+        tuple(out.shape) != (m, n)
+        or out.dtype != out_dtype
+        or out.device != a.device
+        or not out.is_contiguous()
     ):
         raise ValueError(
-            "blackwell-native expects linear float8_e4m3fn scales "
-            f"with shape {expected_scale_shape}; got dtype={b_descale.dtype}, "
-            f"shape={tuple(b_descale.shape)}"
+            "out must be contiguous, on the same device, and have shape/dtype "
+            f"{(m, n)}/{out_dtype}"
         )
-    if int(a.shape[1]) != k:
-        raise ValueError(
-            f"a.shape[1]={int(a.shape[1])} but b.shape={tuple(b.shape)} encodes K={k}"
-        )
-    return n
-
-
-def _validate_blackwell_tiled_layout(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    b_descale: torch.Tensor,
-) -> int:
-    if b.dim() != 2 or b.dtype != torch.int32 or int(b.shape[1]) % 2 != 0:
-        raise ValueError(
-            "blackwell-tiled expects b as contiguous int32 [K/16, N*2]; "
-            f"got dtype={b.dtype}, shape={tuple(b.shape)}"
-        )
-    k_tiles = int(b.shape[0])
-    n = int(b.shape[1]) // 2
-    k = k_tiles * 16
-    if n % 64 != 0:
-        raise ValueError(
-            f"blackwell-tiled requires N to be a multiple of 64; got N={n}"
-        )
-    expected_scale_shape = (k_tiles, n)
-    if b_descale.dtype != torch.uint8 or tuple(b_descale.shape) != expected_scale_shape:
-        raise ValueError(
-            "blackwell-tiled expects S0E5M3 uint8 scales "
-            f"with shape {expected_scale_shape}; got dtype={b_descale.dtype}, "
-            f"shape={tuple(b_descale.shape)}"
-        )
-    if int(a.shape[1]) != k:
-        raise ValueError(
-            f"a.shape[1]={int(a.shape[1])} but b.shape={tuple(b.shape)} encodes K={k}"
-        )
-    return n
+    if not a.is_contiguous():
+        raise ValueError("a, b, and b_descale must be contiguous")
+    if m <= 0 or n <= 0:
+        raise ValueError(f"M and N must be positive; got M={m}, N={n}")
+    if alpha is not None:
+        if alpha.device != a.device:
+            raise ValueError(
+                f"alpha must be on the same device as the GEMM inputs ({a.device}); "
+                f"got {alpha.device}"
+            )
+        if (
+            alpha.dtype != torch.float32
+            or tuple(alpha.shape) != (1,)
+            or not alpha.is_contiguous()
+        ):
+            raise ValueError(
+                "alpha must be a contiguous float32 tensor with shape (1,); "
+                f"got dtype={alpha.dtype}, shape={tuple(alpha.shape)}, "
+                f"contiguous={alpha.is_contiguous()}"
+            )
+    return tiled, m, n
 
 
 def _compute_blackwell_bf16_fp4(
@@ -825,57 +868,11 @@ def _compute_blackwell_bf16_fp4(
     """Validate the prepared ABI, select the route and launch the generated programs."""
 
     _require_blackwell_source_arch(a.device)
-    if a.dim() != 2 or a.dtype != torch.bfloat16:
-        raise ValueError(
-            "source-built BF16 x FP4 GEMM expects a as bfloat16 [M, K]; "
-            f"got dtype={a.dtype}, shape={tuple(a.shape)}"
-        )
-    if block_size != 16 or int(a.shape[1]) % block_size != 0:
-        raise ValueError(
-            f"source-built BF16 x FP4 GEMM requires block_size=16 and K%16=0; "
-            f"got block_size={block_size}, K={int(a.shape[1])}"
-        )
-    if not a.is_contiguous() or not b.is_contiguous() or not b_descale.is_contiguous():
-        raise ValueError("a, b, and b_descale must be contiguous")
-    if b.device != a.device or b_descale.device != a.device:
-        raise ValueError(
-            "a, b, and b_descale must be on the same device; got "
-            f"{a.device}, {b.device}, and {b_descale.device}"
-        )
-
-    if backend == "blackwell-native":
-        tiled = False
-        n = _validate_blackwell_native_layout(a, b, b_descale)
-        if out_dtype not in (torch.bfloat16, torch.float16):
-            raise ValueError(
-                f"blackwell-native supports bfloat16 or float16 output; got {out_dtype}"
-            )
-    elif backend == "blackwell-tiled":
-        tiled = True
-        n = _validate_blackwell_tiled_layout(a, b, b_descale)
-        if out_dtype != torch.bfloat16:
-            raise ValueError(
-                f"blackwell-tiled requires bfloat16 output; got {out_dtype}"
-            )
-    else:
-        raise ValueError(f"unknown source-built BF16 x FP4 backend {backend!r}")
-
-    m = int(a.shape[0])
-    if m <= 0 or n <= 0:
-        raise ValueError(f"M and N must be positive; got M={m}, N={n}")
+    tiled, m, n = _validate_blackwell_bf16_fp4(
+        a, b, b_descale, alpha, out_dtype, out, block_size, backend
+    )
     if out is None:
         out = torch.empty((m, n), device=a.device, dtype=out_dtype)
-    elif tuple(out.shape) != (m, n):
-        raise ValueError(f"out shape {tuple(out.shape)} != expected {(m, n)}")
-    elif out.dtype != out_dtype:
-        raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
-    elif out.device != a.device or not out.is_contiguous():
-        raise ValueError(
-            "out must be contiguous and on the same device as a; got "
-            f"device={out.device}, contiguous={out.is_contiguous()}"
-        )
-    _validate_alpha(alpha, a)
-
     _launch(
         _plan(a, b, b_descale, alpha, out, tiled=tiled, enable_pdl=bool(enable_pdl))
     )

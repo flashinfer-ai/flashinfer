@@ -101,8 +101,8 @@ class _PackedScaleDecode:
     @cute.jit
     def _clamp(self, value: Uint32) -> Uint32:
         if cutlass.const_expr(self.clamp):
-            if value > Uint32(247):
-                value = Uint32(247)
+            if value > Uint32(183):
+                value = Uint32(183)
         return value
 
     @cute.kernel

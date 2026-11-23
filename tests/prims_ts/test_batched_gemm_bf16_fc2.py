@@ -46,8 +46,7 @@ BF16_FC2_BASE = dict(
     tile_scheduler=0,
     act_kind=0,
     sf_layout_b=1,
-    cluster_m=1,
-    tile_m=128,
+    umma_cta_count=1,
     mma_m=128,
     mma_k=16,
     dtype_a=int(DType.BF16),
@@ -139,7 +138,7 @@ class TestScheduleValidation:
         )
 
     def test_validate_pdl_wait_for_num_non_exiting_ctas(self):
-        from cutlass.experimental.task_scheduling.resources import (
+        from flashinfer.prims_ts.batched_gemm.pdl_resources import (
             PdlLaunchBarrier,
             PdlWaitBarrier,
         )
@@ -159,7 +158,6 @@ class TestScheduleValidation:
             **uniform_pipeline_stage_overrides(4),
             use_pdl=1,
             use_early_exit=1,
-            do_pdl_wait_for_num_non_exiting_ctas=1,
             **BF16_FC2_BASE,
         )
 
@@ -179,51 +177,26 @@ class TestScheduleValidation:
             isinstance(resource, PdlLaunchBarrier) for resource in all_task_resources
         )
 
-    def test_validate_pdl_wait_for_num_non_exiting_ctas_requires_pdl(self):
+    @pytest.mark.parametrize(("pdl", "early_exit"), [(0, 1), (1, 0)])
+    def test_count_wait_is_only_required_for_pdl_early_exit(self, pdl, early_exit):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
         )
 
-        with pytest.raises(
-            ValueError,
-            match="do_pdl_wait_for_num_non_exiting_ctas requires use_pdl=1",
-        ):
-            build_batched_gemm_task_manager(
-                num_experts=1,
-                num_tokens=160,
-                top_k=1,
-                tile_n=16,
-                tile_k=128,
-                mma_n=16,
-                epi_tile_n=16,
-                **uniform_pipeline_stage_overrides(4),
-                use_early_exit=1,
-                do_pdl_wait_for_num_non_exiting_ctas=1,
-                **BF16_FC2_BASE,
-            )
-
-    def test_validate_pdl_wait_for_num_non_exiting_ctas_requires_early_exit(self):
-        from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
-            build_batched_gemm_task_manager,
+        task_manager = build_batched_gemm_task_manager(
+            num_experts=1,
+            num_tokens=160,
+            top_k=1,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
+            **uniform_pipeline_stage_overrides(4),
+            use_pdl=pdl,
+            use_early_exit=early_exit,
+            **BF16_FC2_BASE,
         )
-
-        with pytest.raises(
-            ValueError,
-            match="do_pdl_wait_for_num_non_exiting_ctas requires use_early_exit=1",
-        ):
-            build_batched_gemm_task_manager(
-                num_experts=1,
-                num_tokens=160,
-                top_k=1,
-                tile_n=16,
-                tile_k=128,
-                mma_n=16,
-                epi_tile_n=16,
-                **uniform_pipeline_stage_overrides(4),
-                use_pdl=1,
-                do_pdl_wait_for_num_non_exiting_ctas=1,
-                **BF16_FC2_BASE,
-            )
+        assert not task_manager._assume_pdl_wait_completed
 
 
 class TestBf16Fc2ReferenceCheck:
@@ -331,7 +304,6 @@ class TestBf16Fc2ReferenceCheck:
             **uniform_pipeline_stage_overrides(4),
             use_pdl=1,
             use_early_exit=1,
-            do_pdl_wait_for_num_non_exiting_ctas=1,
             **BF16_FC2_BASE,
         )
         assert result
@@ -416,7 +388,7 @@ class TestBf16Fc2Persistent:
 
     def test_validate_persistent_pdl_uses_split_barriers(self):
         from cutlass.experimental.task_scheduling.enums import ScheduleStage
-        from cutlass.experimental.task_scheduling.resources import (
+        from flashinfer.prims_ts.batched_gemm.pdl_resources import (
             PdlLaunchBarrier,
             PdlWaitBarrier,
         )
@@ -495,6 +467,35 @@ class TestBf16Fc2Persistent:
             epi_tile_n=16,
             **uniform_pipeline_stage_overrides(5),
             **self.PERSISTENT_CFG,
+        )
+        assert result
+
+    def test_persistent_tile16_mixed_cga(self):
+        """BF16 FC2 TMA pipelines with preferred and fallback CGAs."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            problem_n=4096,
+            tile_n=16,
+            tile_k=128,
+            mma_n=16,
+            epi_tile_n=16,
+            **uniform_pipeline_stage_overrides(5),
+            require_mixed_cga_runtime=True,
+            **{
+                **self.PERSISTENT_CFG,
+                "umma_cta_count": 2,
+                "mma_m": 256,
+                "cluster_dim_x": 4,
+                "cluster_dim_y": 2,
+                "fallback_cluster_dim_x": 2,
+                "fallback_cluster_dim_y": 1,
+            },
         )
         assert result
 
@@ -683,7 +684,7 @@ class TestBf16Fc2SwapAB:
 class TestBf16Fc2HighThroughput:
     HT_CFG = {
         **BF16_FC2_BASE,
-        "cluster_m": 2,
+        "umma_cta_count": 2,
         "mma_m": 256,
         "tile_scheduler": 1,
         "num_stages_tmem_acc": 2,
@@ -745,6 +746,61 @@ class TestBf16Fc2HighThroughput:
                 )
                 assert result
 
+    @pytest.mark.parametrize("tile_n", [128, 256])
+    def test_ht_batch_m_epi128_two_accumulator_stages(self, tile_n):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        cfg = {
+            **self.HT_CFG,
+            "use_shuffled_matrix": 1,
+            "use_tma_store": 1,
+            "cta_raster_order": 1,
+        }
+        assert reference_check(
+            num_experts=3,
+            num_tokens=769,
+            top_k=2,
+            problem_n=1024,
+            problem_k=512,
+            repeat_launches=3,
+            output_guard_elements=256,
+            tile_n=tile_n,
+            tile_k=64,
+            mma_n=tile_n,
+            epi_tile_n=128,
+            **uniform_pipeline_stage_overrides(4),
+            **cfg,
+        )
+
+    def test_ht_batch_m_bf16_max_tmem_overlap(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        cfg = {
+            **self.HT_CFG,
+            "num_stages_tmem_acc": 1,
+            "use_max_tmem_overlap": 1,
+            "use_tma_store": 1,
+        }
+        assert reference_check(
+            num_experts=3,
+            num_tokens=769,
+            top_k=2,
+            problem_n=1024,
+            problem_k=512,
+            repeat_launches=3,
+            output_guard_elements=256,
+            tile_n=256,
+            tile_k=64,
+            mma_n=256,
+            epi_tile_n=64,
+            **uniform_pipeline_stage_overrides(4),
+            **cfg,
+        )
+
     def test_ht_tile64_stages4_swap_ab(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -791,7 +847,7 @@ class TestBf16Fc2HighThroughput:
             del workspace
             gc.collect()
             torch.cuda.synchronize()
-            return 0.0
+            return 1.0
 
         monkeypatch.setattr(testing, "benchmark", direct_benchmark)
 

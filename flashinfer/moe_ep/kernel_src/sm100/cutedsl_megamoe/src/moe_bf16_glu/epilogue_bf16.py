@@ -11,6 +11,9 @@ import cutlass.utils as utils
 from common.megamoe_constants import Log2E
 from cutlass.cute.typing import Float32
 from moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue
+from flashinfer.moe_ep.batch_invariant.device import PackedF32
+from flashinfer.moe_ep.batch_invariant.spec import fc1_activation_accumulator
+from flashinfer.moe_ep.batch_invariant.activation_variants import activation_accumulator
 
 
 @cute.jit
@@ -34,13 +37,13 @@ def swiglu_act(
         ug = cute.arch.mul_packed_f32x2(
             (t_up[i], t_up[i + 1]),
             (t_gate[i], t_gate[i + 1]),
-            rnd="rn",
+            rnd='rn',
             ftz=False,
         )
         neg_g_log2e = cute.arch.mul_packed_f32x2(
             (t_gate[i], t_gate[i + 1]),
             (-Log2E, -Log2E),
-            rnd="rn",
+            rnd='rn',
             ftz=False,
         )
         one_plus_exp = cute.arch.add_packed_f32x2(
@@ -57,7 +60,7 @@ def swiglu_act(
         (
             t_swiglu[i],
             t_swiglu[i + 1],
-        ) = cute.arch.mul_packed_f32x2(ug, sigmoid_pair, rnd="rn", ftz=False)
+        ) = cute.arch.mul_packed_f32x2(ug, sigmoid_pair, rnd='rn', ftz=False)
         if cutlass.const_expr(prob is not None):
             (
                 t_swiglu[i],
@@ -65,10 +68,9 @@ def swiglu_act(
             ) = cute.arch.mul_packed_f32x2(
                 (t_swiglu[i], t_swiglu[i + 1]),
                 (prob, prob),
-                rnd="rn",
+                rnd='rn',
                 ftz=False,
             )
-
 
 # Gate/up interleave granularity on the fc1 feature axis: each subtile folds
 # one 32-col gate block with its adjacent 32-col up block into 32 downproj
@@ -80,7 +82,6 @@ Fc1CTMAStages = 1
 # =============================================================================
 # GluBf16Epilogue
 # =============================================================================
-
 
 class GluBf16Epilogue(GluMxfp8Epilogue):
     """BF16 specialisation of the fused fc1+fc2 GLU epilogue.
@@ -115,6 +116,7 @@ class GluBf16Epilogue(GluMxfp8Epilogue):
         generate_c: bool = False,
         use_stg_fc1: bool = False,
     ) -> None:
+        self._batch_invariant_host_clamp = glu_clamp
         super().__init__(
             mma_tiler_mnk=mma_tiler_mnk,
             cluster_shape_mn=cluster_shape_mn,
@@ -140,6 +142,10 @@ class GluBf16Epilogue(GluMxfp8Epilogue):
             generate_c=generate_c,
             use_stg_fc1=use_stg_fc1,
         )
+        # One FC1 N tile contains equal gate and up halves. Each warp stages
+        # its 32 token rows across exactly the resulting N/2 output columns.
+        # The MXFP8 parent retains its original fixed 128-column tile.
+        self._epi_tile = (self._epi_tile[0], mma_tiler_mnk[1] // 2)
 
         # BF16 stores the fc1 output as plain data: clear the scale-factor
         # state the parent ctor derived from the placeholder.
@@ -150,7 +156,7 @@ class GluBf16Epilogue(GluMxfp8Epilogue):
         self._num_sf_tmem_cols = 0
 
         # No overlapping accumulation: with zero SF TMEM columns the two acc
-        # stages tile TMEM back-to-back (2 x 256 = the full 512-col budget).
+        # stages tile TMEM back-to-back (2 x N, at most the 512-col budget).
         # The parent ctor currently hardcodes ``_overlapping_accum = True``
         # (its computed ``allow_overlap_acc`` value is shadowed), so passing
         # ``allow_overlap_acc=False`` above is not sufficient on its own.
@@ -158,6 +164,16 @@ class GluBf16Epilogue(GluMxfp8Epilogue):
         self._num_acc_pipeline_stages = self._num_acc_stage
         self._num_accumulator_tmem_cols = self._cta_tile_n * self._num_acc_stage
         self._iter_acc_early_release = 0
+        self._batch_invariant_chain = False
+        self._batch_invariant_clamp = None
+
+    def bind_batch_invariant_chain(self) -> None:
+        """Use the shared arithmetic spec, including its single clamp step."""
+        self._batch_invariant_chain = True
+        self._batch_invariant_clamp = self._batch_invariant_host_clamp
+        # The inherited FC1 subtile applies this clamp before calling our
+        # activation hook. The shared chain owns it in the invariant mode.
+        self.glu_clamp = None
 
     @cute.jit
     def _swiglu_act(
@@ -170,4 +186,27 @@ class GluBf16Epilogue(GluMxfp8Epilogue):
         """Bind the BF16-local SwiGLU: the ``(up x gate) x sigmoid``
         association order is part of the bit-exact contract with the host
         reference (``swiglu_fold_interleave``)."""
-        swiglu_act(t_swiglu, t_up, t_gate, prob)
+        if cutlass.const_expr(self._batch_invariant_chain):
+            weight = None
+            if cutlass.const_expr(prob is not None):
+                weight = (prob, prob)
+            for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
+                if cutlass.const_expr(getattr(self, "batch_invariant_activation", None) is not None):
+                    result = activation_accumulator(
+                        PackedF32,
+                        (t_gate[i], t_gate[i + 1]),
+                        (t_up[i], t_up[i + 1]),
+                        variant=self.batch_invariant_activation,
+                        weight=weight,
+                    )
+                else:
+                    result = fc1_activation_accumulator(
+                        PackedF32,
+                        (t_gate[i], t_gate[i + 1]),
+                        (t_up[i], t_up[i + 1]),
+                        weight=weight,
+                        clamp=self._batch_invariant_clamp,
+                    )
+                t_swiglu[i], t_swiglu[i + 1] = result
+        else:
+            swiglu_act(t_swiglu, t_up, t_gate, prob)

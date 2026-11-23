@@ -19,6 +19,7 @@
 #include <float.h>
 
 #include "flashinfer/exception.h"
+#include "flashinfer/math.cuh"
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
 #include "flashinfer/trtllm/common/cudaUtils.h"
 #include "flashinfer/trtllm/fmha/fmhaReduction.h"
@@ -298,8 +299,8 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
     // Update the sums with the attention sink value.
     if (attentionSinksPtr != nullptr) {
-      float attentionSinkVal =
-          exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+      float attentionSinkVal = exp2f(attentionSinksPtr[localHeadIdxO] * flashinfer::math::log2e_d -
+                                     maxVal * softmaxScaleLog2);
       // Multiply the attention sink value by 448.f if the MMA data type is e4m3 as the sum value
       // has also included the 448.f quantization scale.
       sumVal += IsE4m3Bmm ? attentionSinkVal * 448.f : attentionSinkVal;
@@ -309,7 +310,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     // splits seqLenKv across GPUs).
     if (storesSoftmaxStats && isValidRow && headDimIdx == 0) {
       // The softmaxScale.
-      float softmaxScale = (softmaxScaleLog2 * (1.f / M_LOG2E));
+      float softmaxScale = (softmaxScaleLog2 * (1.f / flashinfer::math::log2e_d));
       // The sumScale to unscale the 448.f quantization scale from P.
       float sumScale = IsE4m3Bmm ? (1.f / 448.f) : 1.f;
       // The final max and sum values.

@@ -14,18 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 import math
 from typing import Any, Optional, Tuple, Union
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import (
+    flashinfer_api,
+    require_experimental_auto_backends,
+    warn_experimental_backend_once,
+)
 from .trace.templates.attention import (
     block_sparse_attention_run_trace,
     variable_block_sparse_attention_run_trace,
 )
+from .trace.templates.qsa import qsa_sparse_paged_attention_trace
 from .decode import get_batch_decode_module
 from .prefill import _compute_page_mask_indptr, get_batch_prefill_module
+from .jit.qsa_sparse_paged import gen_qsa_sparse_paged_module
 from .quantization import segment_packbits
 from .utils import (
     MaskMode,
@@ -670,6 +677,12 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
+        if indptr is not None:
+            indptr = indptr.contiguous()
+        if indices is not None:
+            indices = indices.contiguous()
+
         if self._backend != "vsa_sm100_blk64" and (
             kv_splits is not None
             or use_clc is not None
@@ -1078,7 +1091,7 @@ class BlockSparseAttentionWrapper:
             self._vsa_v_scale = v_scale
             return
 
-        # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
+        # ---- VSA SM120 blk64 backend (persistent Cake program) --------------------
         if self._backend == "vsa_sm120_blk64":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
@@ -1116,8 +1129,15 @@ class BlockSparseAttentionWrapper:
 
             MB = M // R
             NB = N // C
-            # sm120 handles GQA natively via gqa_ratio; index is per QO head.
+            # The persistent Cake program reads each QO head's row of the
+            # selection (GQA heads map to their KV head in the kernel).
             H = num_qo_heads
+            from . import cake_vsa_sm120  # noqa: PLC0415
+
+            num_sms = torch.cuda.get_device_properties(
+                self.device
+            ).multi_processor_count
+            group_size = num_qo_heads // num_kv_heads
 
             if block_mask is not None:
                 if block_mask.shape != (H, MB, NB):
@@ -1125,8 +1145,8 @@ class BlockSparseAttentionWrapper:
                         f"block_mask must have shape (num_qo_heads={H}, MB={MB}, NB={NB}), "
                         f"got {tuple(block_mask.shape)}"
                     )
-                self._vsa_q2k_index, self._vsa_q2k_num = _block_mask_to_vsa_index(
-                    block_mask, self.device, non_blocking
+                self._vsa_sm120_plan = cake_vsa_sm120.plan_block_mask(
+                    block_mask, group_size, num_sms, self.device
                 )
             else:
                 if indptr is None or indices is None:
@@ -1134,8 +1154,8 @@ class BlockSparseAttentionWrapper:
                         "vsa_sm120_blk64 backend requires either block_mask or "
                         "(indptr, indices) to be provided."
                     )
-                self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
-                    indptr, indices, MB, NB, H, self.device, non_blocking
+                self._vsa_sm120_plan = cake_vsa_sm120.plan_bsr(
+                    indptr, indices, MB, H, NB, group_size, num_sms, self.device
                 )
 
             self.M = M
@@ -1312,6 +1332,7 @@ class BlockSparseAttentionWrapper:
                 args.append(False)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
+                args.append(False)  # fixed_uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -1522,19 +1543,15 @@ class BlockSparseAttentionWrapper:
                 self._vsa_sage_fp8_block_sparse_num,
             )
 
-        # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
+        # ---- VSA SM120 blk64 backend (persistent Cake program) --------------------
         if self._backend == "vsa_sm120_blk64":
-            from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import (
-                bsa_attn_sm120_blk64_fwd,
-            )  # noqa: PLC0415
+            from . import cake_vsa_sm120  # noqa: PLC0415
 
-            return _vsa_run_core(
-                bsa_attn_sm120_blk64_fwd,
+            return cake_vsa_sm120.run(
+                self._vsa_sm120_plan,
                 q,
                 k,
                 v,
-                self._vsa_q2k_index,
-                self._vsa_q2k_num,
                 self._sm_scale,
                 out,
                 lse,
@@ -1696,12 +1713,17 @@ class VariableBlockSparseAttentionWrapper:
             buffer should be the same as the device of the input tensors.
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3`` or the explicit
-            ``cake`` (generated Cake kernels; Hopper SM90 only: BF16 HND, head_dim 128,
-            equal Q/KV head counts, noncausal 64-token blocks, 1..64 selected KV blocks
-            per query block; small selections (at most 6 blocks per query block and a
-            grid that fits one wave) route to a one-CTA-per-query-block kernel with the
-            plan passed in the kernel parameter bank, everything else to the persistent
-            kernel).  ``cake_cute`` is accepted as an alias of ``cake`` (the name of
+            ``cake`` (generated Cake kernels; Hopper SM90 only: BF16 HND or Sage FP8
+            ``float8_e4m3fn`` HND with ``q_scale``/``k_scale``/``v_scale`` given to
+            :meth:`plan`, head_dim 128, ``num_qo_heads = g x num_kv_heads`` with ``g`` in
+            {1, 2, 4, 8} (``g > 1``: grouped-query attention on the kv-head-shaped block
+            mask, ``k``/``v`` and their scales per kv head; other ratios raise
+            ``ValueError``), noncausal 64-token blocks, 1..64 selected KV blocks per query
+            block; small selections (at most 6 blocks per query block and a grid that
+            fits one wave) route to a one-CTA-per-query-block kernel with the plan passed
+            in the kernel parameter bank, everything else to the persistent kernel; the
+            FP8 and GQA kernels are twins of the BF16 MHA ones on their plans).
+            ``cake_cute`` is accepted as an alias of ``cake`` (the name of
             its former CuTe DSL build).  Defaults to ``auto``. Automatic selection
             never selects ``cake``.  If set to ``auto``, the function will
             automatically choose the backend based on the device architecture and
@@ -1791,6 +1813,9 @@ class VariableBlockSparseAttentionWrapper:
         non_blocking: bool = True,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        q_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -1836,10 +1861,31 @@ class VariableBlockSparseAttentionWrapper:
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         q_data_type : Union[str, torch.dtype]
             Dtype of the query tensor.  Used to specialize the JIT-compiled kernel.
-            Defaults to ``"float16"``.
+            Defaults to ``"float16"``.  For ``backend="cake"``, ``torch.float8_e4m3fn``
+            selects the Sage FP8 kernels and requires the three scales below.
         kv_data_type : Optional[Union[str, torch.dtype]]
             Dtype of the key/value tensors.  When ``None``, defaults to
             ``q_data_type``.
+        q_scale : Optional[torch.Tensor]
+            ``backend="cake"`` Sage FP8 only: per-token FP32 query scales, shape
+            ``(1, num_qo_heads, MB * 64)``, contiguous on the wrapper's device.
+        k_scale : Optional[torch.Tensor]
+            ``backend="cake"`` Sage FP8 only: per-16-token FP32 key scales, shape
+            ``(1, num_kv_heads, ceil(NB * 64 / 16))``.
+        v_scale : Optional[torch.Tensor]
+            ``backend="cake"`` Sage FP8 only: per-channel FP32 value scales, shape
+            ``(num_kv_heads, head_dim)``.  The three scales are given together with
+            ``q_data_type=torch.float8_e4m3fn`` or not at all; they are bound by the plan
+            and read by every :meth:`run` (a caller that re-quantizes per forward writes
+            the same tensors in place), and :meth:`run` takes E4M3 ``q/k/v`` and
+            returns BF16.  :func:`flashinfer.cake_vsa_sm90.sage_fp8_quantize_sm90`
+            produces the four from BF16 HND tensors (``k``/``v`` with ``num_kv_heads``
+            heads).  ``backend="cake"`` accepts ``num_qo_heads = g x num_kv_heads`` with
+            ``g`` in {1, 2, 4, 8}: the block mask and the K/V scales are shaped by the kv
+            heads (above), ``q``/``q_scale`` and the output by the query heads, and query
+            head ``h`` attends kv head ``h // g``; another ratio raises ``ValueError``
+            and a ``num_qo_heads`` that is not a multiple of ``num_kv_heads`` is rejected
+            as for every backend.
 
 
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1855,6 +1901,14 @@ class VariableBlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = q_data_type
+
+        if self._backend != "cake" and (
+            q_scale is not None or k_scale is not None or v_scale is not None
+        ):
+            raise ValueError(
+                "q_scale/k_scale/v_scale are only supported for backend='cake' "
+                f"(Sage FP8 on SM90), got backend={self._backend!r}"
+            )
 
         if self._backend == "cake":
             from .cake_vsa_sm90 import create_plan
@@ -1877,9 +1931,14 @@ class VariableBlockSparseAttentionWrapper:
                 sm_scale=sm_scale,
                 q_data_type=q_data_type,
                 kv_data_type=kv_data_type,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
                 non_blocking=non_blocking,
             )
             self._sm_scale = self._cake_vsa_sm90_plan.sm_scale
+            # The FP8 route returns BF16 whatever the planned input dtype.
+            self._o_dtype = torch.bfloat16
             return
 
         if logits_soft_cap is None:
@@ -2047,6 +2106,7 @@ class VariableBlockSparseAttentionWrapper:
             args.append(False)  # disable_split_kv
             args.append(0)  # num_colocated_ctas
             args.append(0)  # uniform_q_len
+            args.append(False)  # fixed_uniform_q_len
         self._plan_info = self._cached_module.plan(
             *args,
         )
@@ -2124,7 +2184,8 @@ class VariableBlockSparseAttentionWrapper:
             For ``backend="cake"`` the output follows the same DPS ABI
             (``out`` is ``[H*M, 1, head_dim]``) and the return value is the HND view
             ``[H, M, head_dim]``; ``out`` must be contiguous and must not overlap
-            ``q``/``k``/``v``.
+            ``q``/``k``/``v``.  A Sage FP8 plan takes ``float8_e4m3fn`` ``q``/``k``/``v``
+            (the scales were bound by :meth:`plan`) and writes BF16.
         """
         if self._backend == "cake":
             if self._cake_vsa_sm90_plan is None:
@@ -2238,3 +2299,372 @@ class VariableBlockSparseAttentionWrapper:
             ).contiguous()
 
         return (out, lse) if return_lse else out
+
+
+_QSA_HEAD_DIM = 256
+_QSA_MAX_GROUP_SIZE = 16
+# kernel format code and tile tokens by cache dtype
+_QSA_FORMATS = {
+    torch.uint8: (0, 64),
+    torch.float8_e4m3fn: (1, 64),
+    torch.bfloat16: (2, 32),
+}
+
+
+@functools.cache
+def get_qsa_sparse_paged_module() -> Any:
+    return gen_qsa_sparse_paged_module().build_and_load()
+
+
+@functools.cache
+def _qsa_resident_ctas(device_index: int, kv_format: int) -> Tuple[int, int]:
+    """SM count and resident CTAs per SM."""
+    with torch.cuda.device(device_index):
+        ctas_per_sm = get_qsa_sparse_paged_module().ctas_per_sm(kv_format)
+    num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    return num_sms, ctas_per_sm
+
+
+def _qsa_num_splits(
+    num_rows: int,
+    num_kv_heads: int,
+    num_tiles: int,
+    kv_format: int,
+    resident: Tuple[int, int],
+) -> int:
+    num_sms, ctas_per_sm = resident
+    work = num_rows * num_kv_heads
+    if kv_format == 0:  # NVFP4 runs faster at two CTAs per SM, every split kept
+        return min(num_tiles, max(1, 2 * num_sms // work))
+    # Fill one wave of resident CTAs. BF16 runs faster at one CTA per SM until that
+    # leaves eight or more tiles per split.
+    splits = min(num_tiles, max(1, ctas_per_sm * num_sms // work))
+    if kv_format == 2:
+        one_per_sm = min(num_tiles, max(1, num_sms // work))
+        if math.ceil(num_tiles / one_per_sm) < 8:
+            splits = one_per_sm
+    # Then use the fewest splits with the same tiles per split.
+    return math.ceil(num_tiles / math.ceil(num_tiles / splits))
+
+
+def _qsa_check(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def _qsa_check_aligned(
+    tensor: torch.Tensor, name: str, num_bytes: int, stride: Tuple[int, ...]
+) -> None:
+    # The kernel moves rows in num_bytes vectors: base and every outer stride must be aligned,
+    # i.e. num_bytes divides the gcd of the base and the outer byte strides. stride is the
+    # tensor's strides, read once by the caller.
+    *outer, last = stride
+    if (
+        last != 1
+        or math.gcd(tensor.data_ptr(), tensor.element_size() * math.gcd(*outer))
+        % num_bytes
+    ):
+        raise ValueError(
+            f"{name} needs a contiguous last dim and {num_bytes}-byte aligned base and strides"
+        )
+
+
+def _qsa_sparse_paged_attention_default(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    use_prefill_config: bool,
+    out: Optional[torch.Tensor] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    *,
+    output_gate: torch.Tensor,
+    k_sf: Optional[torch.Tensor] = None,
+    v_sf: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    del (
+        use_prefill_config
+    )  # kept for the signature; the split rule does not depend on it
+    device = q.device
+    major = get_compute_capability(device)[0]
+    if major not in (8, 9):
+        raise RuntimeError(
+            f"QSA sparse paged attention supports SM80 through SM90, got SM{major}x"
+        )
+    _qsa_check(q.ndim == 3 and k_cache.ndim == 4, "q must be 3D and k_cache 4D")
+    num_rows, num_qo_heads, head_dim = q.shape
+    num_blocks, page_size, num_kv_heads, cache_dim = k_cache.shape
+    _qsa_check(q.dtype == torch.bfloat16, "q must be bfloat16")
+    _qsa_check(head_dim == _QSA_HEAD_DIM, f"head_dim must be {_QSA_HEAD_DIM}")
+    _qsa_check(
+        k_cache.dtype in _QSA_FORMATS,
+        "k_cache must be uint8 (NVFP4), float8_e4m3fn or bfloat16",
+    )
+    kv_format, tile_tokens = _QSA_FORMATS[k_cache.dtype]
+    nvfp4 = k_cache.dtype == torch.uint8
+    _qsa_check(
+        cache_dim == (head_dim // 2 if nvfp4 else head_dim),
+        "k_cache must hold head_dim / 2 packed bytes (uint8 is NVFP4; view an FP8 cache "
+        "as float8_e4m3fn) or head_dim values",
+    )
+    k_stride = k_cache.stride()
+    _qsa_check(
+        v_cache.shape == k_cache.shape
+        and v_cache.dtype == k_cache.dtype
+        and v_cache.stride() == k_stride,
+        "k_cache and v_cache must have the same dtype, shape and strides",
+    )
+    if nvfp4:
+        sf_shape = (num_blocks, page_size, num_kv_heads, head_dim // 16)
+        if not (
+            k_sf is not None
+            and v_sf is not None
+            and k_sf.dtype == torch.float8_e4m3fn
+            and k_sf.shape == sf_shape
+            and v_sf.shape == sf_shape
+            and v_sf.dtype == k_sf.dtype
+            and v_sf.stride() == k_sf.stride()
+        ):
+            raise ValueError(
+                f"k_sf and v_sf must be float8_e4m3fn views of shape {sf_shape} with the same strides"
+            )
+    else:
+        _qsa_check(
+            k_sf is None and v_sf is None, "k_sf and v_sf are only taken with NVFP4"
+        )
+    _qsa_check(num_blocks > 0 and page_size > 0, "k_cache must not be empty")
+    _qsa_check(
+        num_qo_heads % num_kv_heads == 0
+        and num_qo_heads // num_kv_heads <= _QSA_MAX_GROUP_SIZE,
+        f"num_qo_heads must be a multiple of num_kv_heads, at most {_QSA_MAX_GROUP_SIZE}x",
+    )
+    _qsa_check(
+        logical_indices.ndim == 2
+        and logical_indices.shape[0] == num_rows
+        and logical_indices.shape[1] >= 2
+        and logical_indices.dtype == torch.int32
+        and logical_indices.stride(1) == 1,
+        "logical_indices must be int32 [rows, selection_width + 1] with a contiguous last dim",
+    )
+    _qsa_check(
+        block_table.ndim == 2
+        and block_table.numel() > 0
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1,
+        "block_table must be a non-empty int32 2D tensor with a contiguous last dim",
+    )
+    _qsa_check(
+        token_to_req.shape == (num_rows,)
+        and token_to_req.dtype == torch.int32
+        and token_to_req.is_contiguous(),
+        "token_to_req must be contiguous int32 [rows]",
+    )
+    if k_cache.dtype == torch.bfloat16:
+        k_scale = v_scale = 1.0
+    _qsa_check(
+        k_scale is not None and v_scale is not None, "k_scale and v_scale are required"
+    )
+    _qsa_check(
+        output_gate.shape == q.shape
+        and output_gate.dtype == torch.bfloat16
+        and output_gate.is_contiguous(),
+        "output_gate must be contiguous bfloat16 with the shape of q",
+    )
+    if out is None:
+        out = torch.empty_like(q)
+    _qsa_check(
+        out.shape == q.shape and out.dtype == q.dtype,
+        "out must match q in shape and dtype",
+    )
+    tensors = (q, k_cache, v_cache, k_sf, v_sf, logical_indices, block_table)
+    _qsa_check(
+        all(
+            x is None or x.device == device
+            for x in (*tensors, token_to_req, output_gate, out)
+        ),
+        "all tensors must be on the same device",
+    )
+    # v_cache and v_sf share the dtype and strides of k_cache and k_sf.
+    _qsa_check_aligned(q, "q", 8, q.stride())
+    _qsa_check_aligned(k_cache, "k_cache", 16, k_stride)
+    _qsa_check_aligned(v_cache, "v_cache", 16, k_stride)
+    if nvfp4:
+        sf_stride = k_sf.stride()
+        _qsa_check_aligned(k_sf, "k_sf", 16, sf_stride)
+        _qsa_check_aligned(v_sf, "v_sf", 16, sf_stride)
+    _qsa_check_aligned(output_gate, "output_gate", 16, output_gate.stride())
+    _qsa_check_aligned(out, "out", 16, out.stride())
+    if num_rows == 0:
+        return out
+
+    num_tiles = math.ceil((logical_indices.shape[1] - 1) / tile_tokens)
+    num_splits = _qsa_num_splits(
+        num_rows,
+        num_kv_heads,
+        num_tiles,
+        kv_format,
+        _qsa_resident_ctas(device.index, kv_format),
+    )
+    get_qsa_sparse_paged_module().run(
+        q,
+        k_cache,
+        v_cache,
+        k_sf,
+        v_sf,
+        logical_indices,
+        block_table,
+        token_to_req,
+        output_gate,
+        out,
+        float(k_scale) * math.log2(math.e) / math.sqrt(head_dim),
+        float(v_scale),
+        kv_format,
+        num_splits,
+    )
+    return out
+
+
+def _qsa_auto_backend(device: torch.device) -> str:
+    """The route ``backend="auto"`` takes for an NVFP4 cache: ``"default"`` on compute capability
+    8.x and 9.0; ``"cake"`` on any other capability the Cake package exports a library for
+    (``cake_jit.ARCH_BY_CAPABILITY``: 10.0, 10.3, 10.7 and 12.0, capability-exact); ``"default"``
+    anywhere else, so the default implementation reports the device the way it always has (a
+    12.1 device included, until the package ships for it)."""
+    if device.type != "cuda":
+        return "default"
+    capability = get_compute_capability(device)
+    if capability[0] in (8, 9):
+        return "default"
+    from .experimental.cake_qsa_nvfp4.cake_jit import arch_for_capability
+
+    return "cake" if arch_for_capability(capability) is not None else "default"
+
+
+@flashinfer_api(trace=qsa_sparse_paged_attention_trace)
+def qsa_sparse_paged_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    use_prefill_config: bool,
+    out: Optional[torch.Tensor] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    *,
+    output_gate: torch.Tensor,
+    k_sf: Optional[torch.Tensor] = None,
+    v_sf: Optional[torch.Tensor] = None,
+    backend: str = "auto",
+) -> torch.Tensor:
+    r"""Gated sparse paged GQA attention over an NVFP4, FP8 or BF16 KV cache.
+
+    This is vLLM's ``qsa_sparse_paged_attention`` (Qwen QSA) contract: the same arguments in the
+    same order, plus the block scales ``k_sf`` / ``v_sf`` of an NVFP4 cache. The default
+    implementation runs every cache format on SM80 through SM90. NVFP4 on 10.0, 10.3, 10.7 and
+    12.0 is served by the experimental Cake backend (see ``backend``).
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        BF16 queries ``[rows, num_qo_heads, 256]``; ``num_qo_heads / num_kv_heads`` is 1 to 16.
+    k_cache, v_cache : torch.Tensor
+        ``[num_blocks, page_size, num_kv_heads, D]`` with ``D = 128`` packed E2M1 bytes (uint8,
+        NVFP4) or ``D = 256`` float8_e4m3fn or bfloat16 values. Any strides with a contiguous
+        last dim and 16-byte alignment, so NHD and HND (transposed) views both work.
+    logical_indices : torch.Tensor
+        int32 ``[rows, selection_width + 1]``: logical token indices of each row's selection;
+        the last column holds the row's valid-entry count. Entries that are negative, past the
+        block table, unmapped or past the cache are skipped (never read), and a row with no
+        valid entry is zero.
+    block_table : torch.Tensor
+        int32 ``[num_requests, max_blocks]`` mapping logical pages to cache blocks.
+    token_to_req : torch.Tensor
+        int32 ``[rows]`` request of each row.
+    use_prefill_config : bool
+        Accepted for signature compatibility; it does not change the result.
+    out : Optional[torch.Tensor]
+        Optional BF16 output with the shape of ``q``.
+    k_scale, v_scale : float
+        Global (NVFP4) or per-tensor (FP8) dequantization scales of K and V; required for those
+        caches and ignored for BF16.
+    output_gate : torch.Tensor
+        Contiguous BF16 gate with the shape of ``q``; the output is
+        ``bf16(attention) * sigmoid(output_gate)``, with the attention rounded to BF16 before
+        the FP32 gate.
+    k_sf, v_sf : Optional[torch.Tensor]
+        NVFP4 only: E4M3 block scales ``[num_blocks, page_size, num_kv_heads, 16]``, one per 16
+        dims. Data and scales use the layout that
+        ``nvfp4_quantize_append_paged_kv_cache_with_slot_mapping`` writes.
+    backend : str
+        ``"default"`` runs the default implementation (compute capability 8.x and 9.0).
+        ``"cake"`` runs the experimental Cake kernels of
+        :mod:`flashinfer.experimental.cake_qsa_nvfp4` (NVFP4 only, on the capabilities that
+        package exports a library for: 12.0 on the ``mma.sync`` programs; 10.0, 10.3 and 10.7
+        on the tcgen05 programs) and emits an ``ExperimentalWarning`` once. ``"auto"`` (the
+        default) selects ``"default"`` for every cache on 8.x and 9.0 and for FP8 and BF16
+        caches anywhere. For an NVFP4 cache on a capability the Cake package exports,
+        ``"auto"`` selects ``"cake"`` only when
+        ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set and raises ``RuntimeError``
+        otherwise; anywhere else it selects ``"default"``, which reports the unsupported
+        device. The Cake kernels' results agree with the default implementation within the
+        test tolerances but are not bit-identical to it. Any other value raises
+        ``ValueError``.
+
+    Returns
+    -------
+    torch.Tensor
+        ``out`` when given, otherwise a new tensor.
+    """
+    if backend == "auto":
+        # The Cake package takes NVFP4 caches only.
+        fp8_or_bf16 = k_cache.dtype in (torch.float8_e4m3fn, torch.bfloat16)
+        backend = "default" if fp8_or_bf16 else _qsa_auto_backend(q.device)
+        if backend == "cake":
+            require_experimental_auto_backends("qsa_sparse_paged_attention -> cake")
+            warn_experimental_backend_once(
+                "qsa_sparse_paged_attention", "cake", automatic=True
+            )
+    elif backend == "cake":
+        warn_experimental_backend_once("qsa_sparse_paged_attention", "cake")
+    if backend == "cake":
+        from .experimental.cake_qsa_nvfp4.cake_backend import (
+            qsa_sparse_paged_attention as run_cake,
+        )
+
+        return run_cake(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            use_prefill_config,
+            out,
+            k_scale,
+            v_scale,
+            output_gate=output_gate,
+            k_sf=k_sf,
+            v_sf=v_sf,
+        )
+    if backend != "default":
+        raise ValueError(f"unsupported qsa_sparse_paged_attention backend: {backend!r}")
+    return _qsa_sparse_paged_attention_default(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        use_prefill_config,
+        out,
+        k_scale,
+        v_scale,
+        output_gate=output_gate,
+        k_sf=k_sf,
+        v_sf=v_sf,
+    )

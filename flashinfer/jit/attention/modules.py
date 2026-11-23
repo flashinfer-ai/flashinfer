@@ -20,6 +20,7 @@ from typing import Any, List, Literal, Optional
 import jinja2
 import torch
 
+from ..cpp_ext import is_windows
 from .. import env as jit_env
 from ..core import (
     JitSpec,
@@ -41,6 +42,42 @@ from ..utils import (
 from .utils import _is_nvfp4_kv_dtype, generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
+
+_WINDOWS_URI_TOKENS = (
+    ("single_decode_with_kv_cache_dtype_q_", "sdkvcd_q_"),
+    ("batch_decode_with_kv_cache_dtype_q_", "bdkvcd_q_"),
+    ("batch_mla_attention_dtype_q_", "bmad_q_"),
+    ("single_prefill_with_kv_cache_dtype_q_", "spkvcd_q_"),
+    ("pod_with_kv_cache_dtype_q_", "pkvcd_q_"),
+    ("batch_prefill_with_attention_sink_kv_cache_dtype_q_", "bpaskvcd_q_"),
+    ("batch_prefill_with_kv_cache_dtype_q_", "bpkvcd_q_"),
+    ("batch_attention_with_kv_cache_dtype_q_", "bakvcd_q_"),
+    ("dtype_kv_", "kv_"),
+    ("dtype_o_", "o_"),
+    ("dtype_idx_", "idx_"),
+    ("head_dim_qk_", "qk_"),
+    ("head_dim_vo_", "vo_"),
+    ("head_dim_ckv_", "ckv_"),
+    ("head_dim_kpe_", "kpe_"),
+    ("head_dim_", "hd_"),
+    ("posenc_", "pe_"),
+    ("use_swa_", "swa_"),
+    ("use_logits_soft_cap_", "lc_"),
+    ("use_logits_cap_", "lc_"),
+    ("use_profiler_", "pr_"),
+    ("profiler_", "pr_"),
+)
+
+
+def _uri(name: str) -> str:
+    # Windows limits a path to 260 characters and the JIT cache repeats the module
+    # name inside its directory, so the long attention URIs are shortened there.
+    # Linux keeps the original names, so existing caches and tests are unchanged.
+    if not is_windows:
+        return name
+    for long, short in _WINDOWS_URI_TOKENS:
+        name = name.replace(long, short)
+    return name
 
 
 class _BatchMLAModuleProxy:
@@ -195,7 +232,7 @@ def get_single_decode_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> str:
-    return (
+    return _uri(
         f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -218,7 +255,7 @@ def get_batch_decode_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> str:
-    return (
+    return _uri(
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -241,7 +278,7 @@ def get_batch_mla_uri(
     head_dim_kpe: int,
     use_profiler: bool,
 ) -> str:
-    return (
+    return _uri(
         f"batch_mla_attention_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -360,8 +397,9 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> str:
-    return (
+    return _uri(
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -370,7 +408,9 @@ def get_single_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_token_head_sf" if use_token_head_sf else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -388,7 +428,7 @@ def get_pod_uri(
     use_sliding_window_d: bool,
     use_logits_soft_cap_d: bool,
 ) -> str:
-    return (
+    return _uri(
         f"pod_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -416,8 +456,9 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> str:
-    return (
+    return _uri(
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -427,7 +468,9 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_token_head_sf" if use_token_head_sf else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -442,7 +485,7 @@ def get_batch_prefill_attention_sink_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
 ) -> str:
-    return (
+    return _uri(
         f"batch_prefill_with_attention_sink_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -464,7 +507,7 @@ def get_batch_attention_uri(
     use_logits_soft_cap: bool,
     use_profiler: bool,
 ) -> str:
-    return (
+    return _uri(
         f"batch_attention_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -532,6 +575,7 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -544,6 +588,7 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -559,7 +604,9 @@ def gen_single_prefill_module(
             "maybe_k_cache_sf",
             "maybe_v_cache_sf",
         ]
-        additional_tensor_dtypes = ["uint8_t", "float", "uint8_t", "uint8_t"]
+        # FP8 token-head scale is a float32 tensor; NVFP4 (or no scale) is packed uint8.
+        sf_dtype = "float" if use_token_head_sf else "uint8_t"
+        additional_tensor_dtypes = ["uint8_t", "float", sf_dtype, sf_dtype]
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
@@ -613,6 +660,7 @@ def gen_single_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_token_head_sf=use_token_head_sf,
     )
 
 
@@ -695,7 +743,7 @@ def gen_batch_pod_module(
     use_sliding_window_d: bool,
     use_logits_soft_cap_d: bool,
 ) -> JitSpec:
-    uri = "batch_" + get_pod_uri(
+    uri = ("b" if is_windows else "batch_") + get_pod_uri(
         dtype_q,
         dtype_kv,
         dtype_o,
@@ -888,6 +936,7 @@ def gen_customize_batch_pod_module(
         kernel_inst_templ = jinja2.Template(f.read())
 
     kwargs = {
+        "instantiate_all_cta_tiles": is_windows,
         "additional_func_params": additional_func_params,
         "additional_params_decl": additional_params_decl,
         "additional_params_setter": additional_params_setter,
@@ -1008,6 +1057,7 @@ def _gen_batch_prefill_module(
     *,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode,
     module_surface: BatchPrefillModuleSurface,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     base_uri = get_batch_prefill_uri(
         backend,
@@ -1021,6 +1071,7 @@ def _gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf,
     )
     uri = _get_batch_prefill_module_uri(
         base_uri, backend, paged_kv_stride_mode, module_surface
@@ -1039,7 +1090,9 @@ def _gen_batch_prefill_module(
     )
 
     if backend == "fa2":
-        assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
+        assert not fp8_enabled or dtype_q == dtype_kv == torch.float8_e4m3fn, (
+            "fa2 takes an fp8 query only as e4m3 over an e4m3 KV cache"
+        )
         additional_tensor_names = [
             "maybe_custom_mask",
             "maybe_mask_indptr",
@@ -1050,6 +1103,8 @@ def _gen_batch_prefill_module(
             "maybe_k_cache_sf",
             "maybe_v_cache_sf",
         ]
+        # FP8 token-head scale is a float32 tensor; NVFP4 (or no scale) is packed uint8.
+        sf_dtype = "float" if use_token_head_sf else "uint8_t"
         additional_tensor_dtypes = [
             "uint8_t",
             "int32_t",
@@ -1057,8 +1112,8 @@ def _gen_batch_prefill_module(
             "uint32_t",
             "uint16_t",
             "uint16_t",
-            "uint8_t",
-            "uint8_t",
+            sf_dtype,
+            sf_dtype,
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
         additional_scalar_names = [
             "logits_soft_cap",
@@ -1125,6 +1180,7 @@ def _gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode=paged_kv_stride_mode,
         module_surface=module_surface,
     )
@@ -1142,6 +1198,7 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     """Generate the public full batch-prefill module with runtime stride dispatch."""
     return _gen_batch_prefill_module(
@@ -1156,6 +1213,7 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode="runtime",
         module_surface="full",
     )
@@ -1173,6 +1231,7 @@ def _gen_batch_prefill_primary_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     """Generate the internal full FA2 primary with equal-stride paged kernels."""
     return _gen_batch_prefill_module(
@@ -1187,6 +1246,7 @@ def _gen_batch_prefill_primary_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode="equal",
         module_surface="full",
     )
@@ -1204,6 +1264,7 @@ def _gen_batch_prefill_independent_full_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     """Generate the feasibility-only full FA2 independent-stride module."""
     return _gen_batch_prefill_module(
@@ -1218,6 +1279,7 @@ def _gen_batch_prefill_independent_full_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode="independent",
         module_surface="full",
     )
@@ -1235,6 +1297,7 @@ def _gen_batch_prefill_independent_paged_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     """Generate the internal paged-only FA2 independent-stride module."""
     return _gen_batch_prefill_module(
@@ -1249,6 +1312,7 @@ def _gen_batch_prefill_independent_paged_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_token_head_sf=use_token_head_sf,
         paged_kv_stride_mode="independent",
         module_surface="paged",
     )
@@ -1261,6 +1325,7 @@ def get_batch_prefill_bidirectional_ranges_spec(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
+    v_sf_swizzled: bool = False,
 ) -> dict:
     """The single source of truth for this variant's JIT contract.
 
@@ -1307,6 +1372,14 @@ def get_batch_prefill_bidirectional_ranges_spec(
     )
 
     packed_fp4_kv = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if v_sf_swizzled:
+        # V scale factors in the trtllm-gen per-page swizzle; only a packed
+        # NVFP4 cache has them.
+        if not packed_fp4_kv:
+            raise ValueError("v_sf_swizzled requires a packed NVFP4 KV cache.")
+        if head_dim_vo % 64:
+            raise ValueError("v_sf_swizzled requires head_dim_vo divisible by 64.")
+        uri += "_v_sf_swizzled"
 
     tensor_names: List[str] = ["bidirectional_ranges"]
     tensor_dtypes: List[str] = ["int32_t"]
@@ -1341,6 +1414,7 @@ def get_batch_prefill_bidirectional_ranges_spec(
             "use_sliding_window": False,
             "use_logits_soft_cap": False,
             "use_fp16_qk_reduction": False,
+            "v_sf_swizzled": v_sf_swizzled,
         },
     }
 
@@ -1371,6 +1445,7 @@ def gen_batch_prefill_bidirectional_ranges_module(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
+    v_sf_swizzled: bool = False,
 ) -> JitSpec:
     """Build the causal + bidirectional-ranges batch-prefill module.
 
@@ -1387,6 +1462,7 @@ def gen_batch_prefill_bidirectional_ranges_module(
         dtype_idx,
         head_dim_qk,
         head_dim_vo,
+        v_sf_swizzled,
     )
     return gen_customize_batch_prefill_module(
         spec["backend"],
@@ -1630,12 +1706,13 @@ def _append_nvfp4_sf_stride_setter(
     additional_params_setter: str,
     additional_tensor_names: List[str],
     params_expr: str = "params",
+    stride_func_name: str = "GetFP4ScaleStrides",
 ) -> str:
     stride_setters = []
     if "maybe_k_cache_sf" in additional_tensor_names:
         stride_setters.append(
             "if (maybe_k_cache_sf) { const auto& sf_tensor = maybe_k_cache_sf.value(); "
-            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"auto sf_strides = {stride_func_name}(sf_tensor, kv_layout); "
             f"{params_expr}.k_sf_stride_page = sf_strides.stride_page; "
             f"{params_expr}.k_sf_stride_n = sf_strides.stride_n; "
             f"{params_expr}.k_sf_stride_h = sf_strides.stride_h; }}"
@@ -1643,7 +1720,7 @@ def _append_nvfp4_sf_stride_setter(
     if "maybe_v_cache_sf" in additional_tensor_names:
         stride_setters.append(
             "if (maybe_v_cache_sf) { const auto& sf_tensor = maybe_v_cache_sf.value(); "
-            "auto sf_strides = GetFP4ScaleStrides(sf_tensor, kv_layout); "
+            f"auto sf_strides = {stride_func_name}(sf_tensor, kv_layout); "
             f"{params_expr}.v_sf_stride_page = sf_strides.stride_page; "
             f"{params_expr}.v_sf_stride_n = sf_strides.stride_n; "
             f"{params_expr}.v_sf_stride_h = sf_strides.stride_h; }}"
@@ -1764,6 +1841,7 @@ def gen_customize_single_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_token_head_sf: bool = False,
 ) -> JitSpec:
     kwargs = {
         "variant_decl": variant_decl,
@@ -1777,6 +1855,7 @@ def gen_customize_single_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_token_head_sf": str(use_token_head_sf).lower(),
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -2019,8 +2098,10 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_token_head_sf: bool = False,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
     module_surface: BatchPrefillModuleSurface = "full",
+    v_sf_swizzled: bool = False,
 ) -> JitSpec:
     _validate_batch_prefill_module_mode(backend, paged_kv_stride_mode, module_surface)
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
@@ -2033,6 +2114,18 @@ def gen_customize_batch_prefill_module(
         if missing_sf_tensors:
             raise ValueError(
                 "NVFP4 KV paged prefill JIT modules require scale-factor tensors "
+                f"{missing_sf_tensors}; pass maybe_k_cache_sf and maybe_v_cache_sf "
+                "as additional tensors."
+            )
+    if use_token_head_sf:
+        missing_sf_tensors = [
+            name
+            for name in ("maybe_k_cache_sf", "maybe_v_cache_sf")
+            if name not in additional_tensor_names
+        ]
+        if missing_sf_tensors:
+            raise ValueError(
+                "FP8 token-head-scale prefill JIT modules require scale-factor tensors "
                 f"{missing_sf_tensors}; pass maybe_k_cache_sf and maybe_v_cache_sf "
                 "as additional tensors."
             )
@@ -2051,7 +2144,9 @@ def gen_customize_batch_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_token_head_sf": str(use_token_head_sf).lower(),
         "paged_kv_stride_mode": paged_kv_stride_mode,
+        "instantiate_all_cta_tiles": is_windows,
         "same_kv_strides_values": {
             "runtime": ["true", "false"],
             "equal": ["true"],
@@ -2071,7 +2166,11 @@ def gen_customize_batch_prefill_module(
             )
         )
         additional_params_setter = _append_nvfp4_sf_stride_setter(
-            additional_params_setter, additional_tensor_names
+            additional_params_setter,
+            additional_tensor_names,
+            stride_func_name="GetFP8ScaleStrides"
+            if use_token_head_sf
+            else "GetFP4ScaleStrides",
         )
 
         with open(
@@ -2155,6 +2254,10 @@ def gen_customize_batch_prefill_module(
             # NVFP4 KV kernels need FLASHINFER_ENABLE_FP4_E2M1 (common flags) even
             # when the head_dim helper returns no arch-specific flags.
             extra_cuda_cflags = (extra_cuda_cflags or []) + common_nvcc_flags
+        if v_sf_swizzled:
+            extra_cuda_cflags = (extra_cuda_cflags or []) + [
+                "-DFLASHINFER_PAGED_V_SF_DESWIZZLE=1"
+            ]
         return gen_jit_spec(
             uri,
             source_paths,
@@ -2527,6 +2630,7 @@ def gen_trtllm_fmha_v2_sm120_module() -> JitSpec:
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_64x64_output_bf16_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_128x128_output_bf16_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_bf16_sm120.cu",
+        "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_256x256_output_bf16_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_output_fp16_sm120.cu",
         "fmha_v2_flash_attention_e4m3_fp32_64_64_S_q_k_v_192x128_sm120.cu",
     ]

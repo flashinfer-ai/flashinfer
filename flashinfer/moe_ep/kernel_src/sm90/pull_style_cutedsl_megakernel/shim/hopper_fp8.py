@@ -25,8 +25,6 @@ Hopper-specific deltas vs the SM100 MXFP8 frontend:
 
 from __future__ import annotations
 
-from ..src.moe_hopper_fp8.fused_comm_policy import FUSED_COMM_OPTIMIZATION_VERSION
-
 import dataclasses
 import os
 import warnings
@@ -35,6 +33,9 @@ from typing import Any, Callable, Dict, Literal, Optional, Tuple  # noqa: F401
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
+from ..src.moe_hopper_fp8.fused_comm_policy import FUSED_COMM_OPTIMIZATION_VERSION
 from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
@@ -45,6 +46,7 @@ from .comm import (
     resolve_gate_up_clamp,
     sym_zeros,
 )
+from .tuner import PULL_KNOB_DEFAULTS, validate_dispatch_pull
 
 _KIND_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.float8_e4m3fn,
@@ -73,6 +75,8 @@ _NONSWAP_TILE_M_CHOICES = (64,)
 _NONSWAP_TILE_N_CHOICES = (128, 256)
 _SWAPAB_TILE_M_CHOICES = (128, 256)
 _SWAPAB_TILE_N_CHOICES = (8, 16, 32, 64, 128)
+# Blockwise also takes N72/N80 with M=256: one task for an expert's 65-80 rows.
+_SWAPAB_BLOCKWISE_TILE_N_CHOICES = (8, 16, 32, 64, 72, 80, 128)
 
 # CGA shapes accepted by the drop's _validate_mma_tiler_and_cluster_shape
 # (both geometries).  Cluster K must stay 1; peers only cooperate through
@@ -104,6 +108,7 @@ def _kind_to_cutlass_dtype(kind: str):
     }[kind]
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class MegaMoEHopperFp8Config:
     """Compile-time / launch-time SM90 FP8 MegaMoE configuration.
@@ -159,7 +164,7 @@ class MegaMoEHopperFp8Config:
     # pre-reduced in fp32 on the expert rank and ONE row per contributing
     # rank crosses the wire (inbox keyed by rank instead of topk slot).
     # Requires token_back_mode="reuse_dispatch_warps" and
-    # apply_topk_in_fc1=True; COLLECTIVE (wire format) like dedup_dispatch.
+    # apply_routing_weights_before_fc2=True; COLLECTIVE like dedup_dispatch.
     grouped_token_back: bool = False
     # Combine wire format: "bf16" (default), or the per-32 e8m0 quantized
     # fp8 wires "32e4m3xe8m0" / "32e5m2xe8m0" (halved return bytes; the
@@ -176,6 +181,15 @@ class MegaMoEHopperFp8Config:
     # idle warps' slots otherwise cost 3 * hidden bytes of AB-stage SMEM per
     # CTA).  Output-invariant; False restores the 4-slot buffer for A/B.
     compact_pull_buffer: bool = True
+    # Dispatch-pull rows in flight per active dispatch warp (1 = the serial
+    # pull) and the per-pass rotation of the warp -> row assignment.
+    # Output-invariant tactic fields.  A batch > 1 keeps its rows in the idle
+    # slots of the 4-slot buffer (compact_pull_buffer=False) and needs
+    # epi_warps token-back without dedup_dispatch / grouped_token_back, with
+    # dispatch_pull_batch * active_dispatch_warps <= 4; rotation needs
+    # epi_warps token-back (see tuner.validate_dispatch_pull).
+    dispatch_pull_batch: int = 1
+    dispatch_pull_rotate: bool = False
     # FC1 store offload to the empty warp (S2G + fc1_done publish leave the
     # epilogue warps).  Self-gating: active only for non-swap non-ping-pong
     # kernels with register headroom for the store server; elsewhere it
@@ -212,7 +226,7 @@ class MegaMoEHopperFp8Config:
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
     # standalone TopkReduce; Form B (ikr) requires True.
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
 
@@ -310,15 +324,18 @@ class MegaMoEHopperFp8Config:
                     "grouped_token_back and in_kernel_fc2_reduce both "
                     "collapse the combine; enable only one."
                 )
-            if not self.apply_topk_in_fc1:
+            if not self.apply_routing_weights_before_fc2:
                 raise ValueError(
-                    "grouped_token_back requires apply_topk_in_fc1=True "
+                    "grouped_token_back requires "
+                    "apply_routing_weights_before_fc2=True "
                     "(the group pre-reduce is a plain sum)."
                 )
-        if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
+        if self.in_kernel_fc2_reduce and not self.apply_routing_weights_before_fc2:
             # Kernel invariant: the Form B REDG path collapses topk before a
             # separate reducer could apply routing weights.
-            raise ValueError("in_kernel_fc2_reduce requires apply_topk_in_fc1=True.")
+            raise ValueError(
+                "in_kernel_fc2_reduce requires apply_routing_weights_before_fc2=True."
+            )
         if not self.force_static_sched:
             raise ValueError(
                 "The Hopper FP8 v1 kernel only implements "
@@ -353,11 +370,26 @@ class MegaMoEHopperFp8Config:
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
                 )
         if self.swap_ab:
-            if m not in _SWAPAB_TILE_M_CHOICES or n not in _SWAPAB_TILE_N_CHOICES:
+            n_choices = (
+                _SWAPAB_BLOCKWISE_TILE_N_CHOICES
+                if self.blockwise
+                else _SWAPAB_TILE_N_CHOICES
+            )
+            if m not in _SWAPAB_TILE_M_CHOICES or n not in n_choices:
                 raise ValueError(
                     "swap-AB Hopper FP8 requires mma_tiler M in "
-                    f"{_SWAPAB_TILE_M_CHOICES} and N in {_SWAPAB_TILE_N_CHOICES}; "
+                    f"{_SWAPAB_TILE_M_CHOICES} and N in {n_choices}; "
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+                )
+            if n in (72, 80) and m != 256:
+                raise ValueError(
+                    "swap-AB Hopper FP8 token tiles N72/N80 require M=256; "
+                    f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+                )
+            if self.blockwise and n in (72, 80) and self.generate_c:
+                raise ValueError(
+                    "blockwise swap-AB Hopper FP8 token tiles N72/N80 require "
+                    "generate_c=False."
                 )
         else:
             if m not in _NONSWAP_TILE_M_CHOICES or n not in _NONSWAP_TILE_N_CHOICES:
@@ -404,6 +436,15 @@ class MegaMoEHopperFp8Config:
                 raise ValueError(
                     f"epi_flag_batch[{leg}] must be in [1, 32], got {val}."
                 )
+        validate_dispatch_pull(
+            compact_pull_buffer=self.compact_pull_buffer,
+            dispatch_pull_batch=self.dispatch_pull_batch,
+            dispatch_pull_rotate=self.dispatch_pull_rotate,
+            token_back_mode=self.resolved_token_back_mode,
+            dedup_dispatch=self.dedup_dispatch,
+            grouped_token_back=self.grouped_token_back,
+            active_dispatch_warps=self.active_dispatch_warps,
+        )
 
     @property
     def num_experts_per_rank(self) -> int:
@@ -496,11 +537,17 @@ class MegaMoEHopperFp8Frontend:
     def apply_knobs(self, knobs: Optional[dict]) -> None:
         """Apply tuner knobs (see :mod:`.tuner`) to the session config.
 
+        The dispatch-pull fields are tactic fields: a knob dict that omits
+        them selects ``PULL_KNOB_DEFAULTS``, so a tactic never inherits the
+        previous tactic's pull buffer, batch or rotation.
+
         Invalidates the compile cache when the effective config changes; the
         next ``run()``/``warmup()`` recompiles.  Used by :mod:`.autotune`.
         """
         from .tuner import with_knobs
 
+        if knobs is not None:
+            knobs = {**PULL_KNOB_DEFAULTS, **knobs}
         new_config = with_knobs(self.config, knobs)
         if new_config == self._config:
             return
@@ -708,14 +755,18 @@ class MegaMoEHopperFp8Frontend:
             c.in_kernel_fc2_reduce,
             c.resolved_token_back_mode,
             c.tail_split_pairs,
-            c.apply_topk_in_fc1,
+            c.apply_routing_weights_before_fc2,
             c.dedup_dispatch,
             c.grouped_token_back,
             c.combine_format,
             c.active_dispatch_warps,
+            c.compact_pull_buffer,
+            c.dispatch_pull_batch,
+            c.dispatch_pull_rotate,
             c.fc1_store_offload,
             c.fc1_early_done_publish,
             c.fold_producer_warps,
+            c.generate_c,
             self._gate_up_clamp,
             c.enable_iket,
         )
@@ -761,7 +812,6 @@ class MegaMoEHopperFp8Frontend:
 
         import cutlass.cute as cute
         import cutlass.utils as cutlass_utils
-
         from common.megamoe_constants import Fp8E8M0SfVecSize, SfPaddingBlock
         from moe_hopper_fp8.megamoe_kernel_fp8 import (
             Sm90MegaMoEFp8Kernel,
@@ -802,7 +852,10 @@ class MegaMoEHopperFp8Frontend:
             use_2cta_instrs=c.use_2cta_instrs,
             group_hint=group_hint,
             token_padding_block=token_padding_block,
-            sf_padding_block=SfPaddingBlock,
+            # The activation-SF TMA addresses token tile t of an expert as
+            # (expert SF base + t * N) // N: pad each expert to a multiple of
+            # the token tile (128 for every power-of-two tile, as before).
+            sf_padding_block=_round_up(SfPaddingBlock, token_padding_block),
             load_balance_mode=c.load_balance_mode,
             static_expert_shape=static_expert_shape,
             force_static_sched=c.force_static_sched,
@@ -819,7 +872,7 @@ class MegaMoEHopperFp8Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
-            apply_topk_in_fc1=c.apply_topk_in_fc1,
+            apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
             token_back_mode=c.resolved_token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
@@ -834,6 +887,8 @@ class MegaMoEHopperFp8Frontend:
             fold_producer_warps=c.fold_producer_warps,
             generate_c=c.generate_c,
             tail_split_pairs=c.tail_split_pairs,
+            dispatch_pull_batch=c.dispatch_pull_batch,
+            dispatch_pull_rotate=c.dispatch_pull_rotate,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -1378,6 +1433,7 @@ class MegaMoEHopperFp8SymmBuffer:
         return cached
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def resolve_hopper_fp8_mega_moe_config(
     num_total_experts: int,
     num_max_tokens: int,
@@ -1407,11 +1463,13 @@ def resolve_hopper_fp8_mega_moe_config(
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
     compact_pull_buffer: bool = True,
+    dispatch_pull_batch: Optional[int] = None,
+    dispatch_pull_rotate: Optional[bool] = None,
     fc1_store_offload: bool = True,
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
     generate_c: bool = False,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     # None = the heuristic table's per-bucket value (manual geometry: the
     # kernel default / FP8_TAIL_SPLIT override); an explicit bool wins.
@@ -1527,6 +1585,35 @@ def resolve_hopper_fp8_mega_moe_config(
         # silently switch it.
         knob_overrides.pop("grouped_token_back", None)
         knob_overrides.pop("combine_format", None)
+        # Dispatch pull: an explicit caller value wins over the tactic's.  When
+        # the caller's own layout rules out the tactic's batch or rotation
+        # (dispatch-side token-back, dedup_dispatch, more dispatch warps),
+        # the rest of the tactic applies with the serial, unrotated pull;
+        # the pull schedule never changes outputs.
+        if dispatch_pull_batch is not None:
+            knob_overrides.pop("dispatch_pull_batch", None)
+        if dispatch_pull_rotate is not None:
+            knob_overrides.pop("dispatch_pull_rotate", None)
+        if token_back_mode is not None:
+            caller_dispatch_token_back = token_back_mode != "epi_warps"
+        else:
+            caller_dispatch_token_back = token_back_by_dispatch
+        tactic_batch = knob_overrides.get("dispatch_pull_batch", 1)
+        if tactic_batch > 1 and (
+            caller_dispatch_token_back
+            or (dedup_dispatch and "dedup_dispatch" not in knob_overrides)
+            or (
+                "active_dispatch_warps" not in knob_overrides
+                and tactic_batch * active_dispatch_warps > 4
+            )
+        ):
+            knob_overrides["dispatch_pull_batch"] = 1
+        if caller_dispatch_token_back and knob_overrides.get("dispatch_pull_rotate"):
+            knob_overrides["dispatch_pull_rotate"] = False
+    if dispatch_pull_batch is not None and dispatch_pull_batch > 1:
+        # An explicit batch keeps its rows in the 4-slot pull buffer.
+        compact_pull_buffer = False
+        knob_overrides.pop("compact_pull_buffer", None)
 
     cfg = MegaMoEHopperFp8Config(
         rank=rank,
@@ -1552,11 +1639,13 @@ def resolve_hopper_fp8_mega_moe_config(
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
         compact_pull_buffer=compact_pull_buffer,
+        dispatch_pull_batch=1,
+        dispatch_pull_rotate=False,
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         generate_c=generate_c,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,
         tail_split_pairs=bool(tail_split_pairs),
@@ -1565,6 +1654,11 @@ def resolve_hopper_fp8_mega_moe_config(
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
     )
+    # Validate explicit pull settings together with the tactic's final layout.
+    if dispatch_pull_batch is not None:
+        knob_overrides["dispatch_pull_batch"] = dispatch_pull_batch
+    if dispatch_pull_rotate is not None:
+        knob_overrides["dispatch_pull_rotate"] = dispatch_pull_rotate
     if knob_overrides:
         # Non-geometry knobs from the cache/dict (token_back_mode,
         # load_balance_mode, flag_batch, epi_flag_batch, group_hint, ...).
@@ -1574,6 +1668,7 @@ def resolve_hopper_fp8_mega_moe_config(
     return cfg
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 def get_symm_buffer_for_hopper_fp8_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
@@ -1608,11 +1703,13 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
     compact_pull_buffer: bool = True,
+    dispatch_pull_batch: Optional[int] = None,
+    dispatch_pull_rotate: Optional[bool] = None,
     fc1_store_offload: bool = True,
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
     generate_c: bool = False,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     group_hint: Optional[int] = None,
     tail_split_pairs: Optional[bool] = None,
@@ -1643,6 +1740,10 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     a deprecated alias for ``gate_up_clamp``.
     ``intermediate`` is the post-SwiGLU width, matching the SM100 frontends
     and SGLang (the kernel's gate+up width is ``2 * intermediate``).
+    ``dispatch_pull_batch`` / ``dispatch_pull_rotate`` (output-invariant)
+    default to the resolved tactic's values, else the serial, unrotated pull;
+    an explicit value wins, and an explicit batch > 1 uses the 4-slot pull
+    buffer whatever ``compact_pull_buffer`` says.
 
     Expert weights are not allocated here; supply kernel-ready
     ``(weight, weight_sf, activation_dequant_scale, weight_dequant_scale)``
@@ -1674,11 +1775,13 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
         compact_pull_buffer=compact_pull_buffer,
+        dispatch_pull_batch=dispatch_pull_batch,
+        dispatch_pull_rotate=dispatch_pull_rotate,
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         generate_c=generate_c,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,
         tail_split_pairs=tail_split_pairs,

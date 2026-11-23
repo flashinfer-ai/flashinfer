@@ -131,7 +131,8 @@ def test_every_device_profile_resolves_a_measured_program(device):
         "general_s1",
         "general_s2",
         "n256",
-        "n256_rot",
+        "n256_lpt",
+        "swapped_lpt",
         "small",
         "small_2x8x3",
     }
@@ -140,19 +141,20 @@ def test_every_device_profile_resolves_a_measured_program(device):
 @pytest.mark.parametrize("device", sorted(_DEVICE_PROFILES))
 def test_fp32_accumulate_l2_geometry_takes_the_n256_schedule(device):
     """CPU-only: on the (5120, 2304) geometry FP32-accumulate prefers the N256 schedule on every
-    profile (BM240 is not in its chain) -- with the tail-balanced tile order first on the three-group
-    condition, the shipped order next; BF16 and FP32 keep BM240 on 152 SMs."""
+    profile (BM240 is not in its chain) -- with the LPT tile order first on the three-group
+    condition, the shipped order next; BF16 keeps BM240 on 152 SMs, FP32 keeps BM240 with the LPT
+    order on 152 SMs."""
     arch, sm_count = _DEVICE_PROFILES[device]
     candidates = _runtime.route_candidates(
         5120, 2304, [12288, 0, 6144], sm_count, "fp32", True
     )
-    assert candidates[:2] == ["n256_rot:fp32_acc", "n256:fp32_acc"]
+    assert candidates[:2] == ["n256_lpt:fp32_acc", "n256:fp32_acc"]
     assert "swapped:fp32_acc" not in candidates
     assert (
         _runtime.select_route(
             arch, 5120, 2304, [12288, 0, 6144], sm_count, "fp32", True
         )[0]
-        == "n256_rot:fp32_acc"
+        == "n256_lpt:fp32_acc"
     )
     assert (
         _runtime.route_key(5120, 2304, [9216, 7168], sm_count, "fp32", True)
@@ -165,7 +167,7 @@ def test_fp32_accumulate_l2_geometry_takes_the_n256_schedule(device):
         )
         assert (
             _runtime.route_key(5120, 2304, [16384, 0, 8192], sm_count, "fp32", False)
-            == "swapped:fp32"
+            == "swapped_lpt:fp32"
         )
 
 

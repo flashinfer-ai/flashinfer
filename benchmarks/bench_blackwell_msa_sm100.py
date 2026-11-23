@@ -21,7 +21,8 @@ activity (kernel, memcpy, or memset) launched by exactly one public API call.
 Each comparable row is first checked in another isolated process that invokes
 both public APIs on the same tensor objects. Correctness and performance use a
 stable serving portfolio below. Complete source-dispatch coverage is
-tracked separately by ``csrc/blackwell_msa/route_manifest.json``.
+tracked separately by the ``ROUTES`` table of ``flashinfer/jit/blackwell_msa.py`` and
+``tests/msa_ops/test_blackwell_msa_routes.py``.
 
 The pinned MiniMax public sparse-forward API supports BF16 and FP8 E4M3
 storage, but not FP16 input, so FP16 rows are reported explicitly as
@@ -360,8 +361,8 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
         tier="flashinfer_coverage",
         source="production_fp8_layout_complement",
         provenance=(
-            "csrc/blackwell_msa/route_manifest.json::"
-            "direct_m16_decode.bf16_query_fp8_kv_flat"
+            "flashinfer/jit/blackwell_msa.py::ROUTES"
+            "[decode_m16:bfloat16:float8_e4m3fn:flat:main]"
         ),
         selection_rationale=(
             "Complements the production paged FP8 decode row so the distinct "

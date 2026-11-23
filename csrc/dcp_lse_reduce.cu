@@ -8,6 +8,7 @@
 #include <climits>
 #include <cstdint>
 #include <flashinfer/comm/dcp_lse_reduce.cuh>
+#include <optional>
 #include <string>
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/NCCLSymmetricMemory.hpp>
@@ -38,7 +39,7 @@ void launch_fused_impl(const T* partial_o, const float* partial_lse, unsigned ch
                        size_t slot_out_bytes, size_t lse_region_window_offset,
                        size_t lse_region_local_offset, size_t slot_lse_bytes, at::Tensor& output,
                        int rank, int cp_size, int num_tokens, int max_tokens, int local_heads,
-                       int head_dim, cudaStream_t stream) {
+                       int head_dim, const bool* mask, cudaStream_t stream) {
   const size_t smem = static_cast<size_t>(cp_size) * sizeof(float);
   int blocks_per_sm = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -70,6 +71,7 @@ void launch_fused_impl(const T* partial_o, const float* partial_lse, unsigned ch
       &max_tokens,
       &local_heads,
       &head_dim,
+      &mask,
   };
   C10_CUDA_CHECK(
       cudaLaunchCooperativeKernel(reinterpret_cast<void*>(FusedKernel<T, BaseE, RowDistributed>),
@@ -82,7 +84,8 @@ void launch_fused(const T* partial_o, const float* partial_lse, unsigned char* w
                   size_t out_region_local_offset, size_t slot_out_bytes,
                   size_t lse_region_window_offset, size_t lse_region_local_offset,
                   size_t slot_lse_bytes, at::Tensor& output, int rank, int cp_size, int num_tokens,
-                  int max_tokens, int local_heads, int head_dim, cudaStream_t stream) {
+                  int max_tokens, int local_heads, int head_dim, const bool* mask,
+                  cudaStream_t stream) {
   // Small decode batches keep all rows for one destination in its owning
   // block, avoiding an extra grid synchronization. Once there are enough
   // rows to occupy the cooperative grid, distribute (destination, row) pairs
@@ -91,13 +94,13 @@ void launch_fused(const T* partial_o, const float* partial_lse, unsigned char* w
     launch_fused_impl<T, BaseE, true>(
         partial_o, partial_lse, workspace, window, signal_window_offset, out_region_window_offset,
         out_region_local_offset, slot_out_bytes, lse_region_window_offset, lse_region_local_offset,
-        slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens, local_heads, head_dim,
+        slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens, local_heads, head_dim, mask,
         stream);
   } else {
     launch_fused_impl<T, BaseE, false>(
         partial_o, partial_lse, workspace, window, signal_window_offset, out_region_window_offset,
         out_region_local_offset, slot_out_bytes, lse_region_window_offset, lse_region_local_offset,
-        slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens, local_heads, head_dim,
+        slot_lse_bytes, output, rank, cp_size, num_tokens, max_tokens, local_heads, head_dim, mask,
         stream);
   }
 }
@@ -106,7 +109,8 @@ void launch_fused(const T* partial_o, const float* partial_lse, unsigned char* w
 
 at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial_lse,
                           const at::Tensor& workspace, int64_t cp_rank, int64_t cp_size,
-                          bool is_lse_base_on_e, const std::string& group_name) {
+                          bool is_lse_base_on_e, const std::string& group_name,
+                          const std::optional<at::Tensor>& mask) {
 #ifdef NCCL_HAS_DEVCOMM
   TORCH_CHECK(partial_o.is_cuda(), "partial_o must be a CUDA tensor");
   TORCH_CHECK(partial_lse.is_cuda(), "partial_lse must be a CUDA tensor");
@@ -114,7 +118,8 @@ at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial
   TORCH_CHECK(partial_o.is_contiguous(), "partial_o must be contiguous");
   TORCH_CHECK(partial_lse.is_contiguous(), "partial_lse must be contiguous");
   TORCH_CHECK(workspace.is_contiguous(), "workspace must be contiguous");
-  TORCH_CHECK(partial_o.dim() >= 3, "partial_o must be at least 3-D [..., cp_size, head_dim]");
+  TORCH_CHECK(partial_o.dim() >= 3,
+              "partial_o must be at least 3-D [..., cp_size, heads, head_dim]");
   TORCH_CHECK(partial_lse.dim() == partial_o.dim() - 1,
               "partial_lse must have one fewer dimension than partial_o");
   TORCH_CHECK(partial_o.scalar_type() == at::kHalf || partial_o.scalar_type() == at::kBFloat16,
@@ -126,27 +131,42 @@ at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial
       "partial_o, partial_lse, and workspace must be on the same device");
   TORCH_CHECK(cp_size > 0 && cp_size <= kMaxRanks, "cp_size must be in [1, ", kMaxRanks, "]");
   TORCH_CHECK(cp_rank >= 0 && cp_rank < cp_size, "cp_rank must be in [0, cp_size)");
-  TORCH_CHECK(partial_o.size(-2) == cp_size,
-              "partial_o second-to-last dimension must equal cp_size");
-  TORCH_CHECK(partial_lse.size(-1) == cp_size, "partial_lse last dimension must equal cp_size");
-  for (int64_t i = 0; i < partial_lse.dim() - 1; ++i) {
+  TORCH_CHECK(partial_o.size(-3) == cp_size,
+              "partial_o third-to-last dimension must equal cp_size");
+  TORCH_CHECK(partial_lse.size(-2) == cp_size,
+              "partial_lse second-to-last dimension must equal cp_size");
+  for (int64_t i = 0; i < partial_lse.dim(); ++i) {
     TORCH_CHECK(partial_o.size(i) == partial_lse.size(i),
                 "partial_o and partial_lse leading dimensions must match");
   }
 
   const int64_t head_dim_i64 = partial_o.size(-1);
-  TORCH_CHECK(head_dim_i64 * partial_o.element_size() % 16 == 0,
+  TORCH_CHECK(head_dim_i64 > 0 && head_dim_i64 <= INT_MAX,
+              "head_dim must be positive and fit a kernel integer");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(partial_o.data_ptr()) % 16 == 0 &&
+                  head_dim_i64 * partial_o.element_size() % 16 == 0,
               "partial_o rows must be 16-byte aligned");
-
-  // Every point in the leading shape is an independent reduction entry. This
-  // handles [batch, heads, cp, dim], [rows, cp, dim], and additional batch
-  // dimensions without assigning semantics to any one leading axis.
-  constexpr int64_t local_heads_i64 = 1;
+  const int64_t local_heads_i64 = partial_o.size(-2);
+  TORCH_CHECK(local_heads_i64 > 0 && local_heads_i64 <= INT_MAX / cp_size,
+              "heads must be positive and fit kernel work indices");
   int64_t num_tokens_i64 = 1;
-  for (int64_t i = 0; i < partial_o.dim() - 2; ++i) {
+  for (int64_t i = 0; i < partial_o.dim() - 3; ++i) {
+    TORCH_CHECK(partial_o.size(i) > 0 &&
+                    num_tokens_i64 <= INT_MAX / cp_size / local_heads_i64 / partial_o.size(i),
+                "input leading dimensions must be positive and fit kernel work indices");
     num_tokens_i64 *= partial_o.size(i);
   }
-  TORCH_CHECK(num_tokens_i64 > 0, "zero-token inputs are not supported");
+  const bool* mask_ptr = nullptr;
+  if (mask.has_value()) {
+    const auto& mask_tensor = *mask;
+    TORCH_CHECK(partial_o.dim() == 4 && partial_lse.dim() == 3,
+                "mask requires 4-D partial_o and 3-D partial_lse");
+    TORCH_CHECK(mask_tensor.device() == partial_o.device() &&
+                    mask_tensor.scalar_type() == at::kBool && mask_tensor.dim() == 1 &&
+                    mask_tensor.size(0) == partial_o.size(0) && mask_tensor.is_contiguous(),
+                "mask must be contiguous CUDA bool [batch] on the input device");
+    mask_ptr = mask_tensor.data_ptr<bool>();
+  }
 
   auto symm_mem = c10d::symmetric_memory::rendezvous(workspace, group_name);
   TORCH_CHECK(symm_mem != nullptr,
@@ -216,7 +236,8 @@ at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial
   const size_t out_region_local_offset = payload_offset;
   const size_t lse_region_local_offset = out_region_local_offset + kNumSlots * slot_out_bytes;
 
-  std::vector<int64_t> output_shape(partial_o.sizes().begin(), partial_o.sizes().end() - 2);
+  std::vector<int64_t> output_shape(partial_o.sizes().begin(), partial_o.sizes().end() - 3);
+  output_shape.push_back(local_heads_i64);
   output_shape.push_back(head_dim_i64);
   at::Tensor output = at::empty(output_shape, partial_o.options());
 
@@ -227,14 +248,14 @@ at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial
                                  signal_window_offset, out_region_window_offset,
                                  out_region_local_offset, slot_out_bytes, lse_region_window_offset,
                                  lse_region_local_offset, slot_lse_bytes, output, cp_rank, cp_size,
-                                 num_tokens, max_tokens, local_heads, head_dim, stream);
+                                 num_tokens, max_tokens, local_heads, head_dim, mask_ptr, stream);
     } else {
       launch_fused<__half, false>(reinterpret_cast<const __half*>(partial_o.data_ptr()),
                                   partial_lse.data_ptr<float>(), workspace_ptr, window,
                                   signal_window_offset, out_region_window_offset,
                                   out_region_local_offset, slot_out_bytes, lse_region_window_offset,
                                   lse_region_local_offset, slot_lse_bytes, output, cp_rank, cp_size,
-                                  num_tokens, max_tokens, local_heads, head_dim, stream);
+                                  num_tokens, max_tokens, local_heads, head_dim, mask_ptr, stream);
     }
   } else {
     if (is_lse_base_on_e) {
@@ -243,14 +264,14 @@ at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial
           partial_lse.data_ptr<float>(), workspace_ptr, window, signal_window_offset,
           out_region_window_offset, out_region_local_offset, slot_out_bytes,
           lse_region_window_offset, lse_region_local_offset, slot_lse_bytes, output, cp_rank,
-          cp_size, num_tokens, max_tokens, local_heads, head_dim, stream);
+          cp_size, num_tokens, max_tokens, local_heads, head_dim, mask_ptr, stream);
     } else {
       launch_fused<__nv_bfloat16, false>(
           reinterpret_cast<const __nv_bfloat16*>(partial_o.data_ptr()),
           partial_lse.data_ptr<float>(), workspace_ptr, window, signal_window_offset,
           out_region_window_offset, out_region_local_offset, slot_out_bytes,
           lse_region_window_offset, lse_region_local_offset, slot_lse_bytes, output, cp_rank,
-          cp_size, num_tokens, max_tokens, local_heads, head_dim, stream);
+          cp_size, num_tokens, max_tokens, local_heads, head_dim, mask_ptr, stream);
     }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -266,7 +287,8 @@ at::Tensor dcp_lse_reduce(const at::Tensor& partial_o, const at::Tensor& partial
 TORCH_LIBRARY_FRAGMENT(flashinfer, m) {
   m.def(
       "decode_cp_a2a_lse_reduce(Tensor partial_o, Tensor partial_lse, Tensor(a!) workspace, "
-      "int cp_rank, int cp_size, bool is_lse_base_on_e, str group_name) -> Tensor");
+      "int cp_rank, int cp_size, bool is_lse_base_on_e, str group_name, "
+      "Tensor? mask=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(flashinfer, CUDA, m) {

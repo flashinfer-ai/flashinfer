@@ -19,9 +19,9 @@
 #include <cuda.h>
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
+#include "flashinfer/exception.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmGatedActOptions.h"
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/GemmOptions.h"
@@ -29,6 +29,23 @@
 
 namespace tensorrt_llm {
 namespace kernels {
+
+// Thrown by TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex when configs exist for the
+// problem shape but none of their cubins loads on this driver (GitHub #5322). A caller that can
+// serve the problem another way, such as the MoE launcher's tile fallback, catches this type;
+// every other failure of the runner is a plain flashinfer::Error.
+class NoLoadableKernelError : public flashinfer::Error {
+ public:
+  using flashinfer::Error::Error;
+};
+
+// Thrown by TrtllmGenBatchedGemmRunner::getValidConfigIndices when no config of the tile is valid
+// for the problem shape. The MoE launcher's tile fallback skips such a tile the same way it skips
+// a tile whose cubins do not load; code that catches flashinfer::Error still receives it.
+class NoValidConfigError : public flashinfer::Error {
+ public:
+  using flashinfer::Error::Error;
+};
 
 // Keep this in sync with the ActType in
 // cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
@@ -114,12 +131,17 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool usePerChannelScaling{false};
 };
 
-// Ordinal of the batched-GEMM configuration whose kernel function is named `functionName` (full
-// string comparison) in
-// the metainfo table this module was built with (the FC1 / FC2 coordinate space of the fused-MoE
-// factorized tactics), or -1 when the artifact has no such kernel. Defined in
-// trtllm_batched_gemm_runner.cu so that only that translation unit instantiates the table.
-[[nodiscard]] int64_t getBatchedGemmConfigIndexByName(std::string const& functionName);
+// One launch's share of a GEMM that is split across a GPU's locality domains (uGPU
+// localization). The launch writes its output columns into a slice of a wider shared buffer and
+// sizes its grid for the SMs of one domain. The default value is an ordinary launch.
+struct TrtllmGenBatchedGemmPartition {
+  // Full width of each output row, in post-activation elements; 0 keeps the contiguous layout.
+  int32_t outputRowWidth{0};
+  // First output column this launch writes, in post-activation elements.
+  int32_t outputColumnOffset{0};
+  // SMs available to the launch's stream; 0 uses the whole device.
+  int32_t smCount{0};
+};
 
 class TrtllmGenBatchedGemmRunner {
  public:
@@ -147,7 +169,7 @@ class TrtllmGenBatchedGemmRunner {
            int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
            int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
            int32_t configIndex, bool enable_pdl, int32_t validM = -1, int32_t validN = -1,
-           int32_t validK = -1);
+           int32_t validK = -1, TrtllmGenBatchedGemmPartition const& partition = {});
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
@@ -186,6 +208,10 @@ class TrtllmGenBatchedGemmRunner {
                                         std::vector<int32_t> const& batchedTokens,
                                         int32_t numTokens, int32_t numBatches,
                                         int32_t maxNumCtasInBatchDim) const;
+
+  // Whether the config can write a slice of a shared output (TMA stores, no output multicast or
+  // DeepSeek FP8) and fits a stream limited to smCount SMs.
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const;
 
  private:
   void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,

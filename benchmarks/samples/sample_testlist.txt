@@ -40,6 +40,16 @@
 # autotuned
 --routine mm_fp4 --m 512 --n 1024 --k 7168 --out_dtype bfloat16 --backends cudnn cutlass trtllm --use_128x4_sf_layout --use_nvfp4 --autotune --refcheck -vv --generate_repro_command
 
+## Batch-invariant GEMMs (batch_invariant=True; SM100 / SM103 / SM107). --refcheck also checks the batch_invariant backend bit for bit
+## against the same rows computed alone, in a sub-batch and under a permutation; --autotune profiles the class's top configurations.
+--routine mm_bf16 --m 1024 --n 4096 --k 4096 --out_dtype bfloat16 --backends cudnn cutlass batch_invariant --refcheck -vv --generate_repro_command --case_tag "mm_bf16_batch_invariant"
+--routine mm_bf16 --m 1024 --n 4096 --k 4096 --out_dtype bfloat16 --backends cudnn cutlass batch_invariant --autotune --refcheck -vv --generate_repro_command --case_tag "mm_bf16_batch_invariant_autotune"
+--routine bmm_fp8 --batch_size 1 --m 64 --n 4096 --k 4096 --input_dtype fp8_e4m3 --mat2_dtype fp8_e4m3 --out_dtype bfloat16 --backends cudnn cublas cutlass batch_invariant --refcheck -vv --generate_repro_command --case_tag "bmm_fp8_batch_invariant"
+--routine gemm_fp8_nt_groupwise --m 64 --n 4096 --k 7168 --mma_sm 1 --scale_major_mode MN --backends cutlass batch_invariant --refcheck -vv --generate_repro_command --case_tag "gemm_fp8_nt_groupwise_batch_invariant"
+--routine mm_mxfp8 --m 512 --n 4096 --k 4096 --out_dtype bfloat16 --backends cutlass batch_invariant --refcheck -vv --generate_repro_command --case_tag "mm_mxfp8_batch_invariant"
+--routine mm_fp4 --m 512 --n 4096 --k 4096 --out_dtype bfloat16 --backends cudnn cutlass batch_invariant --use_128x4_sf_layout --use_nvfp4 --refcheck -vv --generate_repro_command --case_tag "mm_fp4_nvfp4_batch_invariant"
+--routine mm_fp4 --m 512 --n 4096 --k 4096 --out_dtype bfloat16 --backends cudnn batch_invariant --use_128x4_sf_layout --refcheck -vv --generate_repro_command --case_tag "mm_fp4_mxfp4_batch_invariant"
+
 ## MoE
 --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 256 --top_k 8 --n_group 8 --topk_group 4 --routed_scaling_factor 2.5 --use_routing_bias --routing_method deepseek_v3 --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
 --routine trtllm_fp4_block_scale_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 1024 --num_experts 128 --top_k 8 --routing_method renormalize_naive --use_shuffled_weight -vv --generate_repro_command --case_tag "trtllm_moe_sample"
@@ -89,20 +99,6 @@
 # b12x NVFP4 MoE (Blackwell SM12.0/SM12.1 only; SwiGLU or ReLU2, bf16 input)
 --routine b12x_fused_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 2688 --num_experts 512 --top_k 22 -vv --generate_repro_command --case_tag "b12x_moe_swiglu"
 --routine b12x_fused_moe --num_tokens 1 --hidden_size 1024 --intermediate_size 2688 --num_experts 512 --top_k 22 --activation-type Relu2 -vv --generate_repro_command --case_tag "b12x_moe_relu2_decode"
-
-## MoE Communication (requires mpirun, e.g.: mpirun -np 8 python benchmarks/flashinfer_benchmark.py ...)
-# Basic A2A dispatch+combine without quantization
-#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 -vv --generate_repro_command --case_tag "moe_a2a_basic"
-# With FP8 per-tensor quantization
-#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype fp8 -vv --generate_repro_command --case_tag "moe_a2a_fp8"
-# With NVFP4 block-scale quantization
-#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype nvfp4 -vv --generate_repro_command --case_tag "moe_a2a_nvfp4"
-# With FP8 block-scale quantization
-#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype fp8_block_scale -vv --generate_repro_command --case_tag "moe_a2a_fp8_block_scale"
-# With real MoE kernel (NVFP4)
-#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype nvfp4 --real_math --intermediate_size 18432 --per_phase_timing -vv --generate_repro_command --case_tag "moe_a2a_nvfp4_real_math"
-# With real MoE kernel (FP8 block-scale)
-#--routine moe_a2a_dispatch_combine --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 --quant_dtype fp8_block_scale --real_math --intermediate_size 18432 --per_phase_timing -vv --generate_repro_command --case_tag "moe_a2a_fp8_bs_real_math"
 
 ## RMSNorm
 # Basic RMSNorm with 2D input shape
@@ -235,6 +231,13 @@
 # With PDL enabled
 --routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --enable_pdl -vv --generate_repro_command --case_tag "nvfp4_quantize_pdl"
 
+# Batch-invariant quantizers (batch_invariant=True; SM100 / SM103 / SM107). --refcheck also checks the batch_invariant backend's codes
+# and scales bit for bit against the same rows quantized alone, in a sub-batch and under a permutation. nvfp4_quantize compares its
+# backends bit for bit: run with FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1 so cuda / cute-dsl take the exact path the class computes.
+--routine mxfp8_quantize --m 1024 --k 4096 --input_dtype bfloat16 --backends cuda batch_invariant --refcheck -vv --generate_repro_command --case_tag "mxfp8_quantize_batch_invariant"
+--routine mxfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --backends cuda batch_invariant --refcheck -vv --generate_repro_command --case_tag "mxfp4_quantize_batch_invariant"
+--routine nvfp4_quantize --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 --sf_layout 128x4 --backends cuda batch_invariant --refcheck -vv --generate_repro_command --case_tag "nvfp4_quantize_batch_invariant"
+
 # NVFP4 Batched Quantization (Blackwell SM10.0+ only)
 --routine nvfp4_batched_quantize --batch_size 4 --m 1024 --k 4096 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_basic"
 --routine nvfp4_batched_quantize --batch_size 8 --m 2048 --k 8192 --input_dtype bfloat16 --global_scale 1.0 -vv --generate_repro_command --case_tag "nvfp4_batched_large"
@@ -244,6 +247,13 @@
 # Basic softmax with temperature
 --routine softmax --batch_size 32 --vocab_size 32000 --temperature 1.0 --input_dtype float32 -vv --generate_repro_command --case_tag "softmax_llama"
 --routine softmax --batch_size 64 --vocab_size 128256 --temperature 0.8 --input_dtype float32 -vv --generate_repro_command --case_tag "softmax_llama3_temp"
+
+# Batch-invariant softmax / log_softmax / log_probs (batch_invariant=True; SM100 / SM103 / SM107). --refcheck also checks the
+# batch_invariant backend bit for bit against the same rows computed alone, in a sub-batch and under a permutation.
+# log_softmax and log_probs have the batch-invariant class as their only kernel: batch_invariant is their only backend and the default.
+--routine softmax --batch_size 64 --vocab_size 128256 --temperature 1.0 --input_dtype bfloat16 --backends cuda batch_invariant --refcheck -vv --generate_repro_command --case_tag "softmax_batch_invariant"
+--routine log_softmax --batch_size 64 --vocab_size 128256 --temperature 1.0 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "log_softmax_batch_invariant"
+--routine log_probs --batch_size 64 --vocab_size 128256 --temperature 1.0 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "log_probs_batch_invariant"
 
 # Sampling from probabilities
 --routine sampling_from_probs --batch_size 32 --vocab_size 32000 -vv --generate_repro_command --case_tag "sampling_from_probs_llama"

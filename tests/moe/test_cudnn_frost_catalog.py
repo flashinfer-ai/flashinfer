@@ -164,7 +164,12 @@ def test_bf16_unmeasured_shapes_have_bounded_candidates(
     moe.runtime.clear_artifact_cache()
     try:
         first, second = moe._selected_kernels(17, 512, 768, 16, 4, "cpu", SwiGLU())
-        assert 1 <= len(first) <= heuristics.STAGE_BUDGET
+        grouped = tuple(k for k in first if not k.gathers_input)
+        gathered = tuple(k for k in first if k.gathers_input)
+        assert 1 <= len(grouped) <= heuristics.STAGE_BUDGET
+        assert len(gathered) <= heuristics.STAGE_BUDGET
+        if arch == "sm_107a":
+            assert gathered
         assert 1 <= len(second) <= heuristics.STAGE_BUDGET
         assert all(kernel.arch == arch for kernel in (*first, *second))
     finally:
@@ -240,13 +245,22 @@ def test_unmeasured_shapes_all_dtypes_and_activations_graph(
 
     with autotune():
         choices = runner.get_valid_tactics(inputs, None)
-    assert len(choices) <= 4
-    output = runner.forward(inputs, choices[0])
+    # Candidate bounds alone would also pass if all GATHER plans disappeared.
+    assert len(choices) <= 6
+    gathered = {
+        kernel.tactic for kernel in inputs.launch_state.first if kernel.gathers_input
+    }
+    gather_choices = [tactic for tactic in choices if tactic[1] in gathered]
+    assert gather_choices
     reference = _bf16_moe_reference(act, weights, activation)
-    assert (output.float() - reference.float()).norm() / reference.float().norm() < 0.01
+    for tactic in (choices[0], gather_choices[0]):
+        output = runner.forward(inputs, tactic)
+        assert (
+            output.float() - reference.float()
+        ).norm() / reference.float().norm() < 0.01
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        runner.forward(inputs, choices[0])
+        runner.forward(inputs, gather_choices[0])
     act.topk_ids.fill_(15)
     graph.replay()
     reference = _bf16_moe_reference(act, weights, activation)
