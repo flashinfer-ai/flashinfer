@@ -631,8 +631,9 @@ class QTokenKvBlockSparsePagedTSWrapper:
         packed routes on the persistent (CLC) scheduler: the metadata kernel
         orders routes by their K/V union and SMs take the longest first, so
         long routes do not extend the last wave. ``None`` (default) enables it
-        when the routes span more than one wave of SMs; True enables it on
-        every persistent launch; False keeps route order. Launches without the
+        when the routes span more than one wave of SMs and can read more than
+        two KV128 tiles (``max_seq_len_kv`` > 256); True enables it on every
+        persistent launch; False keeps route order. Launches without the
         persistent scheduler (split-KV, single-wave static grids) ignore it.
 
         ``sm_scale`` and ``v_scale`` independently accept host floats or CUDA
