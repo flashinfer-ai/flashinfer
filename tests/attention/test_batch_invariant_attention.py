@@ -723,7 +723,6 @@ def test_cache_key_covers_every_kernel_source():
         "attention/batch_invariant/swaps/kernel.py",
         "attention/batch_invariant/fixup.py",
         "attention/batch_invariant/lse.py",
-        "batch_invariant/sampling/cute_ext.py",
         "attention/batch_invariant/spec.py",
         "attention/batch_invariant/plan.py",
         "batch_invariant/canon.py",
@@ -733,6 +732,9 @@ def test_cache_key_covers_every_kernel_source():
     assert (
         "attention/batch_invariant/wrappers.py" not in srcs
     )  # the API module stays outside the closure
+    # no source of another kernel family: an edit there must not recompile the attention kernels
+    other = ("batch_invariant/sampling/", "batch_invariant/quantization/", "fused_moe/")
+    assert not [f for f in srcs if f.startswith(other)]
 
 
 def test_swaps_kernel_identity_carries_its_capacity():
