@@ -121,6 +121,8 @@ def test_config_activation_parameters() -> None:
         {"activation": "situ", "situ_beta": 4.0, "swiglu_limit": 7},
         {"swiglu_alpha": float("inf"), "swiglu_beta": 1.0},
         {"swiglu_alpha": 1.702, "swiglu_beta": float("nan")},
+        {"swiglu_alpha": 10**400, "swiglu_beta": 1.0},  # int past the float range
+        {"swiglu_alpha": 1e306, "swiglu_beta": 1.0},  # value * 1000 overflows
         {"situ_beta": 4.0, "situ_linear_beta": 25.0},
         {
             "activation": "situ",
@@ -1415,3 +1417,42 @@ def test_tuner_candidate_tables_are_feasible_and_distinct() -> None:
     assert [name for name, _ in candidate_tables(4, full, False)] == [
         "lsa_where_reachable"
     ]
+
+
+def test_geometry_errors_name_the_joint_limits() -> None:
+    """hidden 7680 with top-k > 9 and an uncovered 64-bit row pool fail with an explanation."""
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import (
+        cake_geometry as G,
+    )
+
+    def params(**kw):
+        base = dict(
+            ranks=4,
+            experts=256,
+            top_k=6,
+            max_rows=1024,
+            hidden=7168,
+            intermediate=2048,
+            shared_expert=False,
+        )
+        base.update(kw)
+        return G.KernelParams(**base)
+
+    G.resolve(params(top_k=9, hidden=7680), 0)
+    G.resolve(params(top_k=16, hidden=7168), 0)
+    with pytest.raises(G.GeometryError, match="top_k > 9 needs hidden_size <= 7168"):
+        G.resolve(params(top_k=10, hidden=7680), 0)
+    with pytest.raises(G.GeometryError, match="at most 16256 rows per rank") as error:
+        G.resolve(params(ranks=8, top_k=16, max_rows=16384, hidden=4096), 0)
+    assert "64-bit pool indices" in str(error.value)
+    G.resolve(params(ranks=8, top_k=16, max_rows=16256, hidden=4096), 0)
+
+
+def test_sm120_tuner_rejects_non_swiglu_activation(capsys) -> None:
+    from flashinfer.moe_ep import tune
+
+    for extra in (["--activation", "situ"], ["--situ-beta", "4"]):
+        argv = ["--dtype", "sm120_mxfp4_mxfp8", "--hidden", "4096", "--intermediate"]
+        argv += ["2048", "--num-experts", "256", "--topk", "6", "--max-tokens", "1024"]
+        assert tune.main([*argv, *extra]) == 2
+        assert "not supported with sm120_mxfp4_mxfp8" in capsys.readouterr().err

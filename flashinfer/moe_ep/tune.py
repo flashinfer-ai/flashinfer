@@ -159,7 +159,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=("swiglu", "situ"),
         default="swiglu",
         help="SM100 Standard or SM107 activation. SiTU requires --situ-beta "
-        "and also --situ-linear-beta on SM107.",
+        "and also --situ-linear-beta on SM107 (not for sm120_mxfp4_mxfp8).",
     )
     parser.add_argument("--situ-beta", type=float)
     parser.add_argument("--situ-linear-beta", type=float)
@@ -361,6 +361,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         if args.arch != "auto":
             print("sm120_mxfp4_mxfp8 requires --arch auto", file=sys.stderr)
+            return 2
+        if (
+            args.activation != "swiglu"
+            or args.situ_beta is not None
+            or args.situ_linear_beta is not None
+        ):
+            # the tuned transport table is keyed and measured on SwiGLU builds only
+            print(
+                "--activation / --situ-beta / --situ-linear-beta are not supported with "
+                "sm120_mxfp4_mxfp8 (its tuned table is measured on SwiGLU)",
+                file=sys.stderr,
+            )
             return 2
         tuner = importlib.import_module(
             ".backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_tuner", __package__

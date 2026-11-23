@@ -87,8 +87,12 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
     same guards the source enforces at compile time): EP world size 2..32,
     ``num_experts % world_size == 0``
     with at most 128 experts per rank and 1024 in total, ``hidden_size`` a multiple of
-    512 up to 7680, ``intermediate_size`` a multiple of 128, ``top_k`` from 1 to 16; the
-    kernel's row capacity is ``max_tokens_per_rank`` rounded up to 128 (at most 32640).
+    512 up to 7680, ``intermediate_size`` a multiple of 128, ``top_k`` from 1 to 16 (above 9
+    with ``hidden_size`` at most 7168); the kernel's row capacity is ``max_tokens_per_rank``
+    rounded up to 128 (at most 32640).  A routed row pool past 2**31 elements
+    (EP size x row capacity x ``top_k`` x ``hidden_size`` / 4) needs 64-bit indices, which the
+    generated source covers at 32 ranks and only in part at 4, 8 and 16 ranks;
+    ``validate_init`` then names the largest row capacity that builds.
     Above 16 EP ranks ``validate_init`` also compiles the device instances and rejects
     parameter sets whose build spills registers.
 
@@ -138,7 +142,7 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
       as the clamp, e.g. 7).
     * ``"situ"``: ``situ_beta * tanh(gate / situ_beta) * sigmoid(gate)`` times ``up``, or
       with ``situ_linear_beta`` times ``situ_linear_beta * tanh(up / situ_linear_beta)``
-      (Kimi-K3).  SiTU takes no clamp: pass ``swiglu_limit=0``.
+      (Kimi-K3).  SiTU takes no clamp: pass ``swiglu_limit=0``; ``situ_beta`` is required.
 
     The float parameters are compiled in 1/1000 steps: exact multiples of 0.001 up to
     1000, positive except ``swiglu_beta`` (>= 0).  The in-kernel shared expert uses the
@@ -172,16 +176,22 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
         """``(MOE_ACTIVATION, MOE_ACT_P0, MOE_ACT_P1)`` of the device build; validates the activation fields."""
 
         def milli(name: str, value: float | None, low: int = 1) -> int:
-            if (
-                value is None
-                or isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-            ):
-                raise ValueError(
-                    f"activation {self.activation!r} needs {name} (a finite number)"
+            try:
+                finite = (
+                    value is not None
+                    and not isinstance(value, bool)
+                    and isinstance(value, (int, float))
+                    and math.isfinite(value)
                 )
-            scaled = round(float(value) * 1000)
+                scaled = round(float(value) * 1000) if finite else 0
+            except (
+                OverflowError
+            ):  # an int past the float range, or value * 1000 overflowing
+                finite = False
+            if not finite:
+                raise ValueError(
+                    f"activation {self.activation!r} needs {name} (a finite number up to 1000)"
+                )
             if (
                 scaled < low
                 or scaled > 1_000_000

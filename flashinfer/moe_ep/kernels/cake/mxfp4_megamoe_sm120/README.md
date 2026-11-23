@@ -49,8 +49,8 @@ The device source is compiled per deployment with
 |---|---|---|
 | `MOE_RANKS` | EP world size | 2..32 (the generator-covered region; GPU-validated at 4, 8, 16; 32 compile-checked) |
 | `MOE_EXPERTS` | global routed experts (physical experts under EPLB) | `% MOE_RANKS == 0`, <= 128 per rank, <= 1024 |
-| `MOE_TOPK` | routed experts per token | 1..16 |
-| `MOE_MAX_ROWS` | tokens per rank per call (capacity) | multiple of 128, <= 32640 (the row fields of the signed 32-bit `active_rows` kernel argument) |
+| `MOE_TOPK` | routed experts per token | 1..16; above 9 needs `MOE_HIDDEN` <= 7168 (dispatch staging ring) |
+| `MOE_MAX_ROWS` | tokens per rank per call (capacity) | multiple of 128, <= 32640 (the row fields of the signed 32-bit `active_rows` kernel argument); a routed row pool past 2^31 elements (ranks x rows x top-k x hidden / 4) needs 64-bit pool indices, generated for 32 ranks and only in part for 4 / 8 / 16 ranks (the host geometry names the largest capacity that builds) |
 | `MOE_HIDDEN` | hidden size | multiple of 512, <= 7680 |
 | `MOE_INTERMEDIATE` | expert intermediate size | multiple of 128 |
 | `MOE_SHARED_EXPERT` | 1: one in-kernel FP8 e4m3 shared expert added to the output | 0 / 1 |
@@ -58,7 +58,7 @@ The device source is compiled per deployment with
 | `MOE_CODEC_OVF_BLOCKS` | raw-overflow capacity of the lossless BF16 return codec, in 64-value blocks per row (see below) | 16..256, default 16 |
 | `MOE_LSA_COPIERS` | copier CTAs of the copier instances (one per LSA destination of a rank) | 1..min(`MOE_RANKS` - 1, 16), default 1; set by the backend from the transport table |
 | `MOE_ACTIVATION` | gated activation after the clamp, routed and shared experts: 0 SwiGLU `silu(gate) * up`; 1 SwiGLU with `swiglu_alpha` / `swiglu_beta` `gate * sigmoid(alpha * gate) * (up + beta)`; 2 SiTU `beta * tanh(gate / beta) * sigmoid(gate) * up'`, `up' = lb * tanh(up / lb)` (`up' = up` when `lb = 0`) | 0 / 1 / 2, default 0 |
-| `MOE_ACT_P0` | activation parameter in 1/1000 units: `swiglu_alpha`, SiTU `beta` | 0 for SwiGLU, else 1..1000000 |
+| `MOE_ACT_P0` | activation parameter in 1/1000 units: `swiglu_alpha`, SiTU `beta` | 0 for SwiGLU, else 1..1000000 (the host config requires it for SiTU) |
 | `MOE_ACT_P1` | activation parameter in 1/1000 units: `swiglu_beta`, SiTU `lb` (`situ_linear_beta`; 0 = unset) | 0..1000000; 0 for plain SwiGLU |
 | `MOE_RETURN_CODEC` | wire format of the expert results: 0 lossless BF16 codec, 1 int8 codes with one BF16 scale per 64 values (see below) | 0 / 1, default 0 |
 
