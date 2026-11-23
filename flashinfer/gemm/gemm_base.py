@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 from collections import Counter, OrderedDict
+from contextvars import ContextVar
 import logging
 import os
 import struct
@@ -11547,6 +11548,17 @@ def bmm_fp8(
     return out
 
 
+class Sm12xGroupwiseShapeError(ValueError, RuntimeError):
+    """128-unaligned N rejected on sm120/sm121 (#9555).
+
+    Derives from ValueError so automatic backend selection catches it and
+    skips the cutlass backend, and from RuntimeError so explicit
+    ``backend="cutlass"`` callers see the same exception type the sm120
+    launcher raises for an unimplementable problem (the contract
+    ``test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises`` asserts).
+    """
+
+
 @supported_compute_capability([100, 103, 107, 120, 121])
 def _cutlass_gemm_fp8_nt_groupwise_requirement(
     a: torch.Tensor,
@@ -11563,6 +11575,15 @@ def _cutlass_gemm_fp8_nt_groupwise_requirement(
 ):
     if scale_major_mode is None:
         raise ValueError("scale_major_mode is required in CUTLASS")
+
+    # SM120/121: the stock CUTLASS groupwise kernel accepts 128-unaligned N
+    # but returns silently wrong output there (#9555). Reject it so the call
+    # fails loudly instead of computing garbage.
+    if is_sm12x_supported(a.device) and b.shape[0] % 128 != 0:
+        raise Sm12xGroupwiseShapeError(
+            "N must be a multiple of 128 for the cutlass fp8 groupwise "
+            f"backend on sm120/sm121 (got N={b.shape[0]}); see issue #9555"
+        )
 
     return True
 
@@ -11726,6 +11747,10 @@ def _heuristic_func_gemm_fp8_nt_groupwise(
     # "trtllm" takes a different scale layout and "cutile" is K-major only, so the
     # automatic choice is between the two backends that share the cutlass contract.
     heuristic_backends = []
+    if "specialized" in suitable_backends:
+        # allowlisted shape on SM120: the specialized kernels are the
+        # measured-fastest choice (and the correct one for unaligned N)
+        heuristic_backends.append("specialized")
     if (
         "cute-dsl" in suitable_backends
         and CUTE_DSL_AVAILABLE
@@ -11737,18 +11762,85 @@ def _heuristic_func_gemm_fp8_nt_groupwise(
         heuristic_backends.append("cute-dsl")
     if "cutlass" in suitable_backends:
         heuristic_backends.append("cutlass")
+    # Only on a miss: CUTLASS cannot serve the partial N tile (#9555).
+    # cuTile eligibility confirms the K-major mode and block granularity;
+    # do not launch cuTile or infer native admission from this fallback.
+    if (
+        not heuristic_backends
+        and "cutile" in suitable_backends
+        and b.shape == (64, 2048)
+        and 1
+        <= a.shape[0]
+        <= _groupwise_specialized_impl()._allowlist().get((64, 2048), 0)
+        and _groupwise_specialized_impl()._is_sm120_exactly(a.device)
+        and a.dtype == b.dtype == torch.float8_e4m3fn
+        and a_scale.dtype == b_scale.dtype == torch.float32
+        and a_scale.shape == (a.shape[0], 16)
+        and b_scale.shape == (1, 16)
+        and a.device == b.device == a_scale.device == b_scale.device
+        and (out is None or (out.device == a.device and out.shape == (a.shape[0], 64)))
+    ):
+        heuristic_backends.append("composable")
     return heuristic_backends
 
 
+@functools.cache
+def _groupwise_specialized_impl():
+    from . import specialized_fp8_blockwise_sm120
+
+    return specialized_fp8_blockwise_sm120
+
+
+@supported_compute_capability([120])
+def _specialized_gemm_fp8_nt_groupwise_requirement(*args, **kwargs):
+    return _groupwise_specialized_impl().check_specialized_requirement(*args, **kwargs)
+
+
+# Carry the heuristic's first eligible backend to the body of this auto call.
+# The decorator's suitable_auto_backends attribute is shared across callers.
+_groupwise_auto_choice = ContextVar("_groupwise_auto_choice", default=None)
+
+
+def _select_groupwise_auto_backend(*args, **kwargs):
+    choices = _heuristic_func_gemm_fp8_nt_groupwise(*args, **kwargs)
+    if choices:
+        _groupwise_auto_choice.set(choices[0])
+    return choices
+
+
+def _scope_groupwise_auto_choice(fn):
+    @functools.wraps(fn)
+    def scoped(*args, **kwargs):
+        # backend is the tenth positional parameter; its default is cutlass.
+        backend = args[9] if len(args) > 9 else kwargs.get("backend")
+        if backend != "auto":
+            return fn(*args, **kwargs)
+        token = _groupwise_auto_choice.set(None)
+        try:
+            # Even skip_check needs selection for auto. Use the bound-argument
+            # path so positional auto is selected too, and an empty list raises
+            # the decorator's normal error rather than reusing an old choice.
+            kwargs.pop("skip_check", None)
+            return fn(*args, **kwargs)
+        finally:
+            _groupwise_auto_choice.reset(token)
+
+    # Keep the decorator's live introspection attributes on the public API.
+    scoped.__dict__ = fn.__dict__
+    return scoped
+
+
+@_scope_groupwise_auto_choice
 @backend_requirement(
     {
+        "specialized": _specialized_gemm_fp8_nt_groupwise_requirement,
         "cutlass": _cutlass_gemm_fp8_nt_groupwise_requirement,
         "trtllm": _trtllm_gemm_fp8_nt_groupwise_requirement,
         "cutile": _cutile_gemm_fp8_nt_groupwise_requirement,
         "cute-dsl": _cute_dsl_gemm_fp8_nt_groupwise_requirement,
     },
     common_check=_check_gemm_fp8_nt_groupwise_problem_size,
-    heuristic_func=_heuristic_func_gemm_fp8_nt_groupwise,
+    heuristic_func=_select_groupwise_auto_backend,
 )
 @flashinfer_api(trace=gemm_fp8_nt_groupwise_trace)
 def gemm_fp8_nt_groupwise(
@@ -11761,7 +11853,9 @@ def gemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-    backend: Literal["cutlass", "trtllm", "cutile", "cute-dsl", "auto"] = "cutlass",
+    backend: Literal[
+        "cutlass", "trtllm", "cutile", "cute-dsl", "specialized", "auto"
+    ] = "cutlass",
     *,
     batch_invariant: bool = False,
 ) -> torch.Tensor:
@@ -11814,8 +11908,18 @@ def gemm_fp8_nt_groupwise(
         If out is not specified, we will create an output tensor with this dtype.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "trtllm", "cutile", "cute-dsl", "auto"]
+    backend: Literal["cutlass", "trtllm", "cutile", "cute-dsl", "specialized", "auto"]
         The backend to use for the operation. Defaults to ``"cutlass"``.
+
+        ``"specialized"`` (SM120 only) runs agent-generated shape-specialized
+        kernels for the fp8 1x128/128x128 blockwise decode shapes listed in
+        ``specialized_fp8_blockwise_sm120_allowlist.json``; a call it cannot
+        serve falls back to a composable torch path (dequant + matmul),
+        never to another fused backend. ``"auto"`` also routes to it on the
+        allowlisted shapes. If the native kernel declines the SM120 N=64
+        decode class, auto uses dequant + matmul because CUTLASS cannot serve
+        that N. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the
+        native specialized kernel.
 
         ``"auto"`` chooses between ``"cutlass"`` and ``"cute-dsl"``: on sm_107 it runs
         ``"cute-dsl"`` where that is faster (see ``_sm107_groupwise_prefers_cute_dsl``),
@@ -11877,11 +11981,8 @@ def gemm_fp8_nt_groupwise(
             backend,
         )
 
-    workspace_buffer = _get_stream_cache_buf(
-        "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
-    )
-
-    if out is None:
+    allocating_out = out is None
+    if allocating_out:
         out_dtype = out_dtype or torch.bfloat16
     else:
         out_dtype = out.dtype
@@ -11900,8 +12001,55 @@ def gemm_fp8_nt_groupwise(
             dtype=out_dtype,
         )
 
-    if backend == "auto":
-        backend = gemm_fp8_nt_groupwise.suitable_auto_backends[0]
+    auto_requested = backend == "auto"
+    if auto_requested:
+        backend = _groupwise_auto_choice.get()
+        if backend is None:
+            raise RuntimeError("Missing groupwise auto backend selection")
+        if backend == "composable":
+            return _groupwise_specialized_impl().run_composable_fallback(
+                a, b, a_scale, b_scale, out, scale_major_mode, scale_granularity_mnk
+            )
+
+    # "specialized": agent-generated shape-specialized SM120 kernels (see
+    # specialized_fp8_blockwise_sm120.py). Reached either explicitly or via
+    # "auto" through the backend_requirement heuristic (allowlisted shapes
+    # only). An explicitly selected OTHER backend never lands here; an
+    # explicit "specialized" the kernel cannot serve falls back to the
+    # composable torch path, never to another fused backend.
+    if backend == "specialized":
+        spec = _groupwise_specialized_impl()
+
+        # Auto checked all supplied tensors (and probed module availability).
+        # A fresh contiguous out has the admitted shape, device and dtype and
+        # cannot alias a live input. Its address was not known at admission.
+        admitted = auto_requested and (not allocating_out or out.data_ptr() % 4 == 0)
+        if admitted or spec.is_specialized_supported(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            scale_major_mode,
+            scale_granularity_mnk,
+            out,
+        ):
+            spec.run_specialized_gemm_fp8_blockwise(a, b, a_scale, b_scale, out)
+        else:
+            spec.run_composable_fallback(
+                a,
+                b,
+                a_scale,
+                b_scale,
+                out,
+                scale_major_mode,
+                scale_granularity_mnk,
+            )
+        return out
+
+    if backend in ("cutlass", "trtllm"):
+        workspace_buffer = _get_stream_cache_buf(
+            "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+        )
 
     if backend == "cutlass":
         if is_sm12x_supported(a.device):

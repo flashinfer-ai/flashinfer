@@ -1,0 +1,18 @@
+{
+  "op": "gemm_fp8_nt_groupwise",
+  "backends": ["specialized"],
+  "auto_route": {
+    "device": "sm_120",
+    "scale_granularity_mnk": [1, 128, 128],
+    "scale_major_mode": "K",
+    "out_dtype": "bfloat16",
+    "nk_to_m_max": {
+      "64x2048": 32,
+      "1024x2048": 32,
+      "2048x512": 32,
+      "2048x4096": 32,
+      "9216x2048": 16,
+      "12288x2048": 16
+    }
+  }
+}
