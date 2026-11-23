@@ -179,6 +179,26 @@ def test_sampling_masked_tiles_graph(vocab_size, sampling_type, mass, determinis
     torch.testing.assert_close(samples, positions.to(torch.int32), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("vocab_size", [4095, 4096, 4097, 16387])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_min_p_zero_mass_fallback_is_invalid(vocab_size, deterministic):
+    # An all-zero row has q == 0 and u == 0, so no slot can be selected and the
+    # kernel always takes its fallback. With min_p == 0 the old predicate
+    # (x >= pivot) admitted every zero-probability slot, so the fallback returned
+    # the last slot (d - 1) as a valid token. It must instead report no sample.
+    probs = torch.zeros(4, vocab_size, device="cuda")
+    samples, valid = flashinfer.sampling.min_p_sampling_from_probs(
+        probs,
+        min_p=0.0,
+        deterministic=deterministic,
+        seed=42,
+        offset=0,
+        return_valid=True,
+    )
+    assert not valid.any()
+    torch.testing.assert_close(samples, torch.zeros_like(samples), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("shape", [(1, 4096), (5, 129280), (230, 129280)])
 @pytest.mark.parametrize("per_row_temperature", [False, True])
 def test_softmax_low_temperature_normalization(shape, per_row_temperature):

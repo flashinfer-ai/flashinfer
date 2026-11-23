@@ -1195,10 +1195,12 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFro
       probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
 
+    // Require positive probability: with min_p == 0 pivot is 0, and admitting zero-probability
+    // slots would let the fallback return a token that top-k/top-p or vocab padding zeroed.
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                            DETERMINISTIC>(
-        i, d, [&](float x) { return x >= pivot; }, u, probs_vec, aggregate, last_valid_index,
-        &temp_storage);
+        i, d, [&](float x) { return x > 0.0f && x >= pivot; }, u, probs_vec, aggregate,
+        last_valid_index, &temp_storage);
     if (aggregate > u) {
       break;
     }
