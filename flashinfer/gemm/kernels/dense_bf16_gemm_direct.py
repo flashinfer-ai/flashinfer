@@ -22,6 +22,8 @@ from cutlass import const_expr
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
+from ...jit.cute_dsl_core import cute_dsl_disk_cached
+
 _VECTOR_WIDTH = 8
 _SUPPORTED_BLOCK_SIZES = (32, 64, 96, 128, 192, 256, 384)
 _SUPPORTED_OUTPUTS_PER_BLOCK = (1, 2, 4)
@@ -336,6 +338,7 @@ def _make_compile_repr_tensors(dtype, rows_per_block: int, n: int, k: int):
 
 
 @functools.cache
+@cute_dsl_disk_cached("gemm_bf16_direct", (__file__,), enable_tvm_ffi=False)
 def _get_compiled_direct_kernel(
     device_index: int,
     dtype,
