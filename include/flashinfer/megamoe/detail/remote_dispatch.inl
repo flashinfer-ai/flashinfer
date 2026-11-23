@@ -98,7 +98,7 @@ const auto remote_list_entry = [&](const uint32_t& token_topk_idx, const uint32_
   }
 };
 
-// SM 0, warp 0, after the index-pass grid sync. M1 can send the padded input
+// SM 0, warp 0, after the index-pass grid sync. Small batches can send the padded input
 // block and header in one put; other paths send rows before the signalled
 // scales, routing, weights, and header.
 const auto remote_send = [&]() {
@@ -114,9 +114,12 @@ const auto remote_send = [&]() {
       auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
       auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
       const uint32_t num_packed = *remote.packed_token_count(j);
-      const bool single_input_put = kWeightTileBytes == 8448 && kNumRanks == 16 && kNumNodes == 2 &&
-                                    kNumMaxTokensPerRank == 2 && num_tokens == 1 &&
-                                    num_packed == 1 && !io.is_lsa(j);
+      const bool single_input_put =
+          kWeightTileBytes == 8448 && kNumRanks == 16 && kNumNodes == 2 && num_packed > 0 &&
+          num_packed <= kNumMaxTokensPerRank && !io.is_lsa(j) &&
+          ((kNumMaxTokensPerRank == 2 && num_tokens == 1 && num_packed == 1) ||
+           ((kNumMaxTokensPerRank == 4 || kNumMaxTokensPerRank == 8) &&
+            num_tokens == kNumMaxTokensPerRank));
       if (num_packed > 0 && !single_input_put)
         io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
                     false, nullptr);

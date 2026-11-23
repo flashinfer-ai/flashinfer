@@ -70,11 +70,13 @@ def _same(y, expected, m, label):
 def _check_route_cycle(
     buffer, inputs, weights, reference_weights, global_scales, rank, local_experts
 ):
-    """Replay one graph as a persistent M1 buffer changes local and remote routes."""
+    """Replay one graph as a persistent buffer changes local and remote routes."""
     from flashinfer.megamoe import mxfp4_mega_moe
 
     x, sf, routing = inputs
-    columns = torch.arange(routing.shape[1], device=x.device)[None, :]
+    columns = torch.arange(routing.shape[1], device=x.device)[None, :].expand_as(
+        routing
+    )
     local = rank * local_experts + columns
     remote = (rank ^ (dist.get_world_size() // 2)) * local_experts + columns
     routes = (
@@ -249,7 +251,10 @@ def _worker(rank, args):
                 H,
             )
             if rank == 0:
-                print("M1 persistent-buffer route cycle passed", flush=True)
+                print(
+                    f"Persistent-buffer route cycle passed at {m} tokens per rank",
+                    flush=True,
+                )
             continue
         expected, counts_logical = _reference(
             x.float() * sf.repeat_interleave(128, dim=-1),
@@ -416,14 +421,14 @@ def _run(args):
         or local != 8
         or (args.hidden, args.intermediate, args.experts, args.topk)
         != (4096, 2048, 256, 6)
-        or args.capacity != 2
-        or args.tokens != [1]
+        or len(args.tokens) != 1
+        or (args.tokens[0], args.capacity) not in ((1, 2), (4, 4), (8, 8))
         or args.weight_storage != "mxfp4_compact"
         or args.slots != 0
     ):
         raise ValueError(
             "route-cycle requires two-host torchrun EP16, E256/H4096/I2048/top6, "
-            "compact weights, M1/cap2 and no replica slots"
+            "compact weights, M1/cap2, M4/cap4 or M8/cap8, and no replica slots"
         )
     if launched:
         _worker(int(os.environ["RANK"]), args)
@@ -559,6 +564,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--route-cycle",
         action="store_true",
-        help="check changing M1 routes through one EP16 compact buffer and captured graph",
+        help="check changing M1/M4/M8 routes through one EP16 compact buffer and captured graph",
     )
     _run(parser.parse_args())
