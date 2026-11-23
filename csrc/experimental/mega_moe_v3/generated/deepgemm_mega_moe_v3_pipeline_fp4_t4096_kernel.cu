@@ -5,7 +5,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -751,6 +751,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t4096(int* __restrict__ topk_idx_i32, f
                     }
                     mbarrier_wait(empty_addr + (a_stage) * 8, _phase_empty);
                     if (elect_sync()) {
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
                         if (task[0] == 1) {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 8192, (&A), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                             tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF1), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
@@ -2116,6 +2117,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_t4096(int* __restrict__ topk_idx_i32, f
             }
             asm volatile("barrier.sync 15, 256;" ::: "memory");
             asm volatile("barrier.sync 1, 384;" ::: "memory");
+            asm volatile("fence.proxy.async.global;" ::: "memory");
             unsigned int epi_warp_2 = warp - 8;
             unsigned int phase_1 = 0;
             unsigned int values[4];

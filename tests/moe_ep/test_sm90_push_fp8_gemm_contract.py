@@ -18,25 +18,20 @@ from flashinfer.testing import is_compute_sanitizer_active
 pytestmark = pytest.mark.usefixtures("isolated_deep_gemm_cache")
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_PACKAGE_NAME = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
+_PACKAGE_NAME = "flashinfer.moe_ep.shims.sm90.push_style_megamoe"
 _SOURCE_TREE_PACKAGE_ROOT = (
-    _PROJECT_ROOT
-    / "flashinfer"
-    / "moe_ep"
-    / "kernel_src"
-    / "sm90"
-    / "push_style_megamoe"
+    _PROJECT_ROOT / "flashinfer" / "moe_ep" / "shims" / "sm90" / "push_style_megamoe"
 )
 
 
 def _package_text(*parts: str) -> str:
-    source_tree = _SOURCE_TREE_PACKAGE_ROOT.joinpath(*parts)
-    if source_tree.is_file():
-        return source_tree.read_text(encoding="utf-8")
-
-    resource = importlib_resources.files(_PACKAGE_NAME)
-    for part in parts:
-        resource = resource / part
+    if parts[0] == "src":
+        package = "flashinfer.moe_ep.kernels.flashinfer.push_style_megamoe"
+    else:
+        package = _PACKAGE_NAME
+    resource = importlib_resources.files(package)
+    for part in parts[1:]:
+        resource = resource.joinpath(part)
     return resource.read_text(encoding="utf-8")
 
 
@@ -366,7 +361,7 @@ requires_sm90 = pytest.mark.skipif(
 
 
 def _create_runner():
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.gemm import (
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe.gemm import (
         create_sm90_push_fp8_moe_gemm_runner,
     )
 
@@ -672,7 +667,7 @@ def test_moe_gemm_invalid_offsets_trap(
     )
     code = f"""
 import torch
-from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.gemm import create_sm90_push_fp8_moe_gemm_runner
+from flashinfer.moe_ep.shims.sm90.push_style_megamoe.gemm import create_sm90_push_fp8_moe_gemm_runner
 device = torch.device("cuda", 0)
 groups, m, h, i = 2, 64, 256, 256
 runner = create_sm90_push_fp8_moe_gemm_runner()
@@ -733,7 +728,7 @@ runner.moe_gemm(d, a, b, offsets, 2 * i, h, sfa, sfb, False)
 """
     code = f"""
 import torch
-from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.gemm import create_sm90_push_fp8_moe_gemm_runner
+from flashinfer.moe_ep.shims.sm90.push_style_megamoe.gemm import create_sm90_push_fp8_moe_gemm_runner
 device = torch.device("cuda", 0)
 groups, m, h, i = 2, 64, 256, 256
 runner = create_sm90_push_fp8_moe_gemm_runner()

@@ -27,6 +27,20 @@ from ...tllm_enums import ActivationType, is_gated_activation, normalize_activat
 from ...utils import check_shape_dtype_device, get_compute_capability
 
 
+# NVFP4 stores two E2M1 values per byte and one E4M3 scale per block.
+NVFP4_VALUES_PER_BYTE = 2
+NVFP4_BLOCK_SIZE = 16
+# MMA scale tiles contain 128 rows in four groups of 32, and four columns.
+NVFP4_SF_TILE_ROWS = 128
+NVFP4_SF_TILE_COLS = 4
+NVFP4_SF_ROW_GROUP_SIZE = 32
+
+PRE_FC2_DIM_ALIGNMENT = 128
+PRE_FC2_TILE_SIZE = 128
+PRE_FC2_MMA_SHAPE = (PRE_FC2_TILE_SIZE, PRE_FC2_TILE_SIZE)
+PRE_FC2_CLUSTER_SHAPE = (1, 1)
+
+
 def _get_cuda_stream_ptr() -> int:
     """Get the current PyTorch CUDA stream pointer.
 
@@ -184,6 +198,42 @@ def validate_cute_dsl_moe_clamped_relu2_config(
         )
 
 
+def validate_pre_fc2_options(
+    enabled: bool, *, per_token_scale: bool = False, localized_weights: bool = False
+) -> None:
+    """Reject per-call options that the pre-FC2 weighting path does not support."""
+    if enabled and per_token_scale:
+        raise ValueError("Pre-FC2 routing weighting does not support per_token_scale")
+    if enabled and localized_weights:
+        raise ValueError("Pre-FC2 routing weighting does not support localized weights")
+
+
+def validate_pre_fc2_routing(
+    enabled: bool,
+    quant_mode: str,
+    activation: ActivationType,
+    output_dtype: torch.dtype,
+    swap_ab: bool = False,
+    *,
+    per_token_scale: bool = False,
+    localized_weights: bool = False,
+) -> None:
+    """Reject modes that cannot preserve the pre-FC2 NVFP4 weighting contract."""
+    validate_pre_fc2_options(
+        enabled, per_token_scale=per_token_scale, localized_weights=localized_weights
+    )
+    if enabled and (
+        quant_mode != "w4a4"
+        or activation != ActivationType.ClampedRelu2
+        or output_dtype != torch.bfloat16
+        or swap_ab
+    ):
+        raise ValueError(
+            "routing_weights_before_fc2 requires W4A4, ClampedRelu2, "
+            "BF16 output, and swap_ab=False"
+        )
+
+
 def get_max_num_tiles(
     num_tokens: int,
     top_k: int,
@@ -320,22 +370,59 @@ def moe_permute(
         tile_size: Size of each tile for scheduling.
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
-        input_sf: Scale factors for input (required for FP4).
+        input_sf: Optional block scales for FP4 input.
                   Shape: [num_tokens, hidden_size // 16].
-        permuted_sf: Output scale factors for permuted data (required for FP4).
+        permuted_sf: Optional output block scales for permuted FP4 data.
                      Shape: [max_num_permuted_tokens, hidden_size // 16].
 
     Note:
-        - For FP4 inputs, input_sf and permuted_sf are required.
+        - For FP4 inputs, pass both input_sf and permuted_sf to permute the
+          scales too, or neither to permute only the packed values.
         - The permuted_sf output uses a swizzled layout for efficient TMA access.
     """
-    module = _get_moe_utils_module()
     dtype_suffix = _get_dtype_suffix(input.dtype)
 
     hidden_size = input.shape[-1]
     if dtype_suffix == "fp4":
         # For FP4, hidden_size is halved due to packing
-        hidden_size = hidden_size * 2
+        hidden_size = hidden_size * NVFP4_VALUES_PER_BYTE
+        if (input_sf is None) != (permuted_sf is None):
+            raise ValueError(
+                "FP4 permutation requires both input_sf and permuted_sf, or neither"
+            )
+    if dtype_suffix == "fp4" and input_sf is not None and permuted_sf is not None:
+        # Without scale buffers, only the packed values are permuted and the
+        # caller permutes the scales itself.
+        if (
+            hidden_size % (NVFP4_BLOCK_SIZE * NVFP4_SF_TILE_COLS)
+            or max_num_permuted_tokens % NVFP4_SF_TILE_ROWS
+        ):
+            raise ValueError(
+                "FP4 permutation requires K divisible by 64 and padded rows divisible by 128"
+            )
+        if input_sf.shape != (input.shape[0], hidden_size // NVFP4_BLOCK_SIZE):
+            raise ValueError("input_sf must have shape (tokens, K // 16)")
+        if permuted_sf.shape != (
+            max_num_permuted_tokens,
+            hidden_size // NVFP4_BLOCK_SIZE,
+        ):
+            raise ValueError("permuted_sf must have shape (padded rows, K // 16)")
+        if input_sf.dtype not in (
+            torch.uint8,
+            torch.float8_e4m3fn,
+        ) or permuted_sf.dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise TypeError("FP4 scales must be uint8 or float8_e4m3fn")
+        if any(
+            not t.is_contiguous() or t.device != input.device
+            for t in (input, permuted_output, input_sf, permuted_sf)
+        ):
+            raise ValueError(
+                "FP4 values and scales must be contiguous on the same device"
+            )
+
+    if max_num_permuted_tokens == 0:
+        return
+    module = _get_moe_utils_module()
 
     func_name = f"flashinfer_moe_permute_{dtype_suffix}"
     func = module[func_name]

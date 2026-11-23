@@ -49,6 +49,9 @@ _TASK_CACHE_WARP_IDX = 2
 _TASK_CACHE_LANE_IDX = 3
 _TASK_CACHE_SEQ_LEN_KV = 4
 _TASK_CACHE_LOCAL_KV_TILES = 5
+# Keys ``[0, end)`` visible to every query row of the work tile
+# (``cta_visible_kv_end``). Softmax masks only K tiles reaching past it.
+_TASK_CACHE_KV_VISIBLE_END = 6
 
 
 def num_softmax_scale_groups(cfg: MlaConfig) -> int:

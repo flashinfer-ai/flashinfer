@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
-    from ......kernel_src.sm120.split_cutedsl_megakernel import TransformedWeights
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import TransformedWeights
 
 
 def preprocess_mega_weights(
@@ -21,7 +21,7 @@ def preprocess_mega_weights(
             "SM120 MXFP4 x MXFP8 requires pre-quantized packed E2M1 weights "
             "and both E8M0 scale planes"
         )
-    from ......kernel_src.sm120.split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import (
         transform_prequantized_weights,
     )
 
@@ -42,7 +42,7 @@ def validate_transformed_mega_weights(
     intermediate_size: int,
     local_experts: int,
 ) -> None:
-    from ......kernel_src.sm120.split_cutedsl_megakernel import (
+    from flashinfer.moe_ep.shims.sm120.split_cutedsl import (
         FP4_DTYPE,
         SCALE_DTYPE,
     )

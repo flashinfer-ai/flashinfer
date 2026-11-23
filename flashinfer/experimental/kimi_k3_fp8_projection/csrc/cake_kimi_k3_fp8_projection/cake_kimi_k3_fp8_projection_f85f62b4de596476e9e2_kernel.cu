@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -113,7 +113,7 @@ kernel_cake_kimi_k3_fp8_projection_f85f62b4de596476e9e2(__nv_bfloat16* __restric
     unsigned long long row_base = (unsigned long long)row_c * (unsigned long long)K;
     int m_tile = row_c / sf_rows;
     int row_in_tile = row_c - m_tile * sf_rows;
-    unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16 + (unsigned long long)(row_in_tile >> 5) * 4;
+    unsigned long long sf_row_base = (unsigned long long)m_tile * (unsigned long long)sf_k_sets * (unsigned long long)SF_TILE_BYTES + (unsigned long long)(row_in_tile & 31) * 16ull + (unsigned long long)(row_in_tile >> 5) * 4ull;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     float staged[16];
     #pragma unroll

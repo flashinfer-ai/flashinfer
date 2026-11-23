@@ -100,11 +100,16 @@ the same arguments and stream before capture.
 Input layout
 ~~~~~~~~~~~~
 
-Ordinary prefill with ``auto``, ``cute-dsl``, ``cake`` or ``small-bh`` accepts
-strided Q/K and packs them before selecting dense-only kernels. ``cudnn``
-retains supported strides. V, gates, state and output keep their existing
-layout requirements. Output alias checks use the original Q/K storage,
-and decode retains its existing layout contract.
+Ordinary prefill with ``auto``, ``cake`` or ``small-bh`` packs strided Q/K
+before backend selection. ``auto`` can select CuTe prefill with supported
+token-strided V. Explicit ``cute-dsl`` consumes supported Q/K/V token-strided
+views directly on SM100/SM103/SM107 and SM120, and packs Q/K layouts the kernel
+cannot read directly. ``cute-dsl-persistent`` requires supported Q/K/V
+token-strided views on SM100/SM103. V is never packed automatically and must
+meet the selected backend's layout requirements. ``cudnn`` retains its supported
+strides. Gates, state and output keep their existing layout requirements.
+Output alias checks use the original Q/K storage, and decode retains its
+existing layout contract.
 
 .. currentmodule:: flashinfer.kda
 
@@ -116,23 +121,37 @@ and decode retains its existing layout contract.
 Static PTX prefill on B300
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects four
-retained PTX programs from `NVlabs/kda (260927-kda-for-kda)
+``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects retained PTX
+programs originally imported from `NVlabs/kda (260927-kda-for-kda)
 <https://github.com/NVlabs/kda/tree/ea37ebaff74c88a2545751dcb8ea8ef6c6251b67/ptx>`_.
 The programs target SM103a (B300) and use persistent recurrence scheduling
 with exact FP32 state handoff between pieces. The default backend selection
 is unchanged.
 
-Install ``nvidia-cuda-nvcc>=13.2`` and ``apache-tvm-ffi>=0.1.12`` in addition
-to FlashInfer's regular dependencies. The retained PTX uses ISA 9.2. It is
-assembled once with ptxas >= 13.2 and embedded as a cubin, allowing execution
-with a CUDA 13 driver that cannot JIT PTX 9.2 directly. A C++17 host compiler
-and CUDA driver headers (provided by Triton) are needed for the FFI shims.
+Install ``apache-tvm-ffi>=0.1.12`` in addition to FlashInfer's regular
+dependencies. The retained PTX uses ISA 9.2. Drivers supporting CUDA 13.2 or
+newer JIT the PTX directly. Older CUDA 13 drivers use a cubin assembled with
+ptxas >= 13.2; install ``nvidia-cuda-nvcc>=13.2`` for this fallback. A C++17
+host compiler and CUDA driver headers (provided by Triton) are needed for
+the FFI shims.
 ``FLASHINFER_KDA_PTXAS`` selects the assembler;
 ``FLASHINFER_KDA_PTX_CACHE_DIR`` overrides the default FlashInfer JIT cubin
 cache directory. No build output is written into the installed package. This backend is
 JIT-only and is unavailable with ``FLASHINFER_DISABLE_JIT=1`` in a fresh
 process.
+
+The optimized schedules currently require a 148-SM B300, 8192 total tokens,
+64 or 96 heads, and exactly one of these sequence-length layouts:
+``[8192]``, ``[1300, 547, 2048, 963, 271, 3063]``, or ``[1024] * 8``.
+Other supported layouts use the original scheduler, including nearby layouts
+that differ by only one token or an additional sequence.
+
+The fixed-sequence split retains the full recurrence through affine state
+composition. State handoff buffers and final-state storage are FP32. The
+correction uses TF32 products with FP32 accumulation for state composition,
+and BF16 state operands with FP32 accumulation for tail-output correction.
+Its numerical contract is the validated reference tolerance; FP32 storage does
+not imply bitwise FP32 arithmetic throughout the composition.
 
 Supported inputs are contiguous CUDA BF16 ``q/k/v/g [1, T, H, 128]`` with
 ``T >= 32`` and ``H`` equal to 64 or 96, BF16 beta logits ``[1, T, H]``, FP32
@@ -184,6 +203,25 @@ includes per-shape latencies, correctness, trial medians and baseline identity.
         --flash-kda-source-dir /path/to/FlashKDA --output ptx-results.json
     pytest tests/kda/test_recurrent_kda_ptx.py
 
+Batch-invariant mode
+~~~~~~~~~~~~~~~~~~~~
+
+``recurrent_kda(..., batch_invariant=True)`` runs the batch-invariant class
+``kda.bf16.c16`` of :mod:`flashinfer.batch_invariant` for prefill, chunked
+prefill and decode on an fp32 state pool: every output row is the native
+SM100 / SM103 / SM107 chunked prefill kernel's, so a token's decode output is bit for
+bit its prefill output whatever the batch. Decode is one launch of a step
+kernel that computes the prefill's row from the boundary state and cached rows
+of the open 16-token chunk. The contract (fp32 pool addressed by
+``ssm_state_indices``, chunked prefill cut at multiples of 16 tokens, the
+supported arguments, CUDA graphs) is in ``flashinfer/batch_invariant/README.md``;
+``flashinfer.batch_invariant.fingerprint("recurrent_kda")`` names the class.
+Without ``initial_state`` the call is stateless (a trainer's forward pass):
+whole sequences from the zero state, the same rows, no state kept and no
+``grad_fn``. With ``checkpoint_every_n_tokens=16`` it also returns the state
+before every 16-token chunk (``state_checkpoints``), the series a backward
+such as the cuDNN frontend's KDA backward reads.
+
 .. _apikda_decode:
 
 flashinfer.kda_decode
@@ -204,6 +242,11 @@ Key-Driven Attention (KDA) decode API. The CuTe-DSL kernel lives under
 The public ``recurrent_kda`` API supports standard decode with one token per
 sequence (``T=1``) and packed speculative decode with two or more tokens per
 sequence (``T>=2``).
+
+The CuTe DSL decode kernels accept a BF16 or FP32 ``initial_state`` pool and read and
+write it in its own dtype. Any other dtype raises ``TypeError``. ``backend="cake"``
+and ``packed_kda_decode`` still require a BF16 state; the fused decode ops already
+accept BF16 or FP32.
 
 ``fused_kda_decode`` combines width-four causal convolution, one KDA update,
 and gated RMSNorm for ``T=1``. ``packed_fused_kda_decode`` extends the same
@@ -375,8 +418,14 @@ unsupported contracts. Decode retains the existing KDA decode routing.
 raise when its contract is unsupported.
 
 For multi-token prefill, ``backend="cute-dsl"`` selects a BT=16 CuTe DSL kernel.
-It supports contiguous BF16 Q, K, V, G, and beta with one shared head count and
-head dimension 128, the in-kernel lower-bound gate, fixed or packed-varlen
+It supports BF16 Q, K, V, G, and beta with one shared head count and
+head dimension 128. Q/K/V may use independent,
+non-overlapping token-row strides with contiguous head/features, 16-byte-aligned
+base pointers and token strides divisible by eight BF16 elements. Fixed batches
+must flatten without a copy (batch stride equals token count times token stride).
+Explicit ``backend="cute-dsl"`` consumes these views directly, including views
+into packed QKV storage; G, beta and output retain their contiguous layouts.
+It supports the in-kernel lower-bound gate, fixed or packed-varlen
 layout, BF16 recurrent state, explicit ``seq_order``, and the same checkpoint
 contract as Cake. ``checkpoint_cu_starts`` must always be int64. Packed
 ``cu_seqlens`` must be int64 during CUDA graph capture. The CuTe DSL schedule
@@ -612,9 +661,10 @@ refused rather than silently executed by another backend.
   against architecture-specific instructions;
 * input is ordinary multi-token prefill: fixed ``T > 1``, or packed input
   whose total token count exceeds its number of sequences;
-* Q, K, V and G are contiguous BF16 ``[B,T,H,128]`` tensors sharing one head
-  count, and beta is contiguous BF16 ``[B,T,H]``. GQA and ``V != K`` are not
-  supported;
+* Q, K, V and G are BF16 ``[B,T,H,128]`` tensors sharing one head count.
+  Q/K/V support the token-strided layout described above for ``cute-dsl``;
+  G and beta remain contiguous. Beta has shape ``[B,T,H]``.
+  GQA and ``V != K`` are not supported;
 * the output fits an INT32 extent: ``T_total * H * 128 <= 2**31 - 1``, which permits up to
   16,383 tokens at H=1024 and imposes no practical constraint at ordinary head counts. Larger is
   refused with the backend's own error, because the two things that stop there
@@ -747,8 +797,9 @@ Short-sequence tests additionally compare with an independent FP64 recurrence.
 This backend requires SM100 or SM103 with
 ``nvidia-cutlass-dsl>=4.7.0``. Its supported contract is:
 
-* contiguous, 16-byte-aligned BF16 Q/K/V/G ``[B,T,H,128]`` and beta
-  ``[B,T,H]``, with ``T > 1``, positive H divisible by eight and
+* BF16 Q/K/V ``[B,T,H,128]`` with the token-strided layout described above
+  for ``cute-dsl``; contiguous, 16-byte-aligned BF16 G ``[B,T,H,128]`` and
+  beta ``[B,T,H]``; ``T > 1``, positive H divisible by eight and
   ``B*T*H*128 < 2**31``;
 * contiguous FP32 ``A_log[H]`` and ``dt_bias[H*128]`` or ``dt_bias[H,128]``;
 * ``use_qk_l2norm_in_kernel=True``, ``use_gate_in_kernel=True``,
@@ -808,8 +859,8 @@ A fixed single sequence uses a BT32 front end and recurrent chain, with
 concurrent execution when the device has sufficient SMs; when its length is
 not divisible by 32, the final partial chunk continues on the fused kernel.
 Other inputs use a fused persistent BT64 kernel with a host-built work list.
-The work list is chosen per call from a cost model, independent of specific
-sequence lengths or SM counts: whole (sequence, head) chains packed by
+The work list is chosen per call from a cost model using the sequence lengths
+and available SM count: whole (sequence, head) chains packed by
 longest-processing-time, or equal-cost ranges that hand FP32 state between
 CTAs when that lowers the modelled makespan by at least 5%. TIRx is imported
 only when explicitly selecting this backend.

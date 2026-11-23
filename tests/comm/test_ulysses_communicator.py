@@ -26,7 +26,7 @@ import torch.distributed as dist
 from flashinfer.comm import UlyssesCommunicator, UlyssesWorkspace
 from flashinfer.comm.ulysses import missing_ulysses_pcie_dependencies
 from flashinfer.comm.ulysses_topology import UlyssesBackendError
-from tests.test_helpers.ulysses import (
+from tests.comm.test_helpers.ulysses import (
     forbid_ipc_and_jit,
     fresh_rendezvous_path,
     full_mesh,

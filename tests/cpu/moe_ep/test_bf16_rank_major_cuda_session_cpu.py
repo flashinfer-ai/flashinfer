@@ -20,7 +20,7 @@ import torch
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _SOURCE_TREE_PACKAGE_ROOT = (
-    _PROJECT_ROOT / "flashinfer" / "moe_ep" / "kernel_src" / "blackwell_bf16_rank_major"
+    _PROJECT_ROOT / "flashinfer/moe_ep/kernels/flashinfer/bf16_rank_major"
 )
 _SESSION_PATH = _SOURCE_TREE_PACKAGE_ROOT / "session.py"
 _SOURCE_NAME = "flashinfer_blackwell_moe_ep_layer_sm100.cu"
@@ -45,7 +45,7 @@ def _session_module():
     distribution = metadata.distribution("flashinfer-python")
     session_path = Path(
         distribution.locate_file(
-            "flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/session.py"
+            "flashinfer/moe_ep/kernels/flashinfer/bf16_rank_major/session.py"
         )
     )
     return load(session_path)
@@ -99,6 +99,16 @@ def _manifest(module, source: bytes) -> dict:
         "stages": stages,
         "kernel_symbols": [stage["symbol"] for stage in stages],
         "source_sha256": hashlib.sha256(source).hexdigest(),
+        "arch_stage_overrides": {
+            arch: {
+                name: {
+                    field: list(value) if field == "bindings" else value
+                    for field, value in fields.items()
+                }
+                for name, fields in overrides.items()
+            }
+            for arch, overrides in module._ARCH_STAGE_OVERRIDES.items()
+        },
     }
 
 
@@ -206,7 +216,7 @@ def test_package_data_declares_the_immutable_source_pair():
     if not pyproject_path.is_file():
         pytest.skip("pyproject.toml is only available in source-tree test runs")
     pyproject = pyproject_path.read_text(encoding="utf-8")
-    key = '"flashinfer.moe_ep.kernel_src.blackwell_bf16_rank_major" = ['
+    key = '"flashinfer.moe_ep.kernels.flashinfer.bf16_rank_major" = ['
     assert key in pyproject
     package_block = pyproject.split(key, maxsplit=1)[1].split("]", maxsplit=1)[0]
     assert '"*.md"' in package_block
@@ -281,6 +291,20 @@ def test_manifest_accepts_only_the_exact_host_contract(tmp_path, monkeypatch):
         (
             lambda manifest: manifest["stages"][0].update(dynamic_smem_bytes=-1),
             "invalid shared memory",
+        ),
+        (
+            lambda manifest: manifest.pop("arch_stage_overrides"),
+            "per-architecture stage overrides drifted",
+        ),
+        (
+            lambda manifest: manifest["arch_stage_overrides"]["sm_107a"].popitem(),
+            "per-architecture stage overrides drifted",
+        ),
+        (
+            lambda manifest: next(
+                iter(manifest["arch_stage_overrides"]["sm_107a"].values())
+            ).update(symbol="kernel_rank_major_unknown"),
+            "per-architecture stage overrides drifted",
         ),
     ),
 )
@@ -639,3 +663,50 @@ def test_workspace_pool_shares_session_and_refcounts_destroy(monkeypatch):
     workspace.destroy.assert_not_called()
     second.destroy(second_workspace)
     workspace.destroy.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_sm100a_stages_are_the_sm107a_stage_overrides():
+    module = _session_module()
+    manifest, _ = module._load_manifest()
+
+    # sm_100a runs the same overridden stages as sm_107a
+    assert (
+        manifest["arch_stage_overrides"]["sm_100a"]
+        == manifest["arch_stage_overrides"]["sm_107a"]
+    )
+    assert module._stages_for_arch(manifest, "sm_100a") == module._stages_for_arch(
+        manifest, "sm_107a"
+    )
+
+
+@pytest.mark.cpu_only
+def test_sm107a_stages_replace_only_the_overridden_fields():
+    module = _session_module()
+    manifest, _ = module._load_manifest()
+    stages = module._stages_for_arch(manifest, "sm_107a")
+    overrides = module._ARCH_STAGE_OVERRIDES["sm_107a"]
+
+    assert [stage["name"] for stage in stages] == list(module._STAGE_NAMES)
+    for stage, base in zip(stages, manifest["stages"], strict=True):
+        fields = overrides.get(stage["name"], {})
+        for field, value in base.items():
+            if field in fields:
+                expected = fields[field]
+                assert stage[field] == (
+                    list(expected) if field == "bindings" else expected
+                )
+            else:
+                assert stage[field] == value
+    assert overrides
+    by_name = {stage["name"]: stage for stage in stages}
+    if "stage_inputs" in overrides:
+        assert by_name["stage_inputs"]["symbol"] == "kernel_rank_major_stage_inputs_v2"
+        assert by_name["stage_inputs"]["bindings"][-1] == "route_codes_out"
+        assert by_name["input_arrive"]["symbol"] == "kernel_rank_major_input_arrive_v3"
+    if "local_unpermute" in overrides:
+        assert (
+            by_name["local_unpermute"]["symbol"]
+            == "kernel_rank_major_exact_unpermute_v11"
+        )
+        assert by_name["local_unpermute"]["bindings"][3] == "local_partials_peers"

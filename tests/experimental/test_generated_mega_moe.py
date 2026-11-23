@@ -1,5 +1,6 @@
 """Public packed-input MoE behavior, metadata and replay tests on SM100a and SM103a."""
 
+import ctypes
 import importlib.util
 from pathlib import Path
 
@@ -233,6 +234,17 @@ def check_single_kernel_graph(names):
     assert len(names) == 1, names
 
 
+class _EdgeData(ctypes.Structure):
+    """``CUgraphEdgeData`` of ``cuda.h``."""
+
+    _fields_ = (
+        ("from_port", ctypes.c_uint8),
+        ("to_port", ctypes.c_uint8),
+        ("type", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 5),
+    )
+
+
 def graph_edges(graph):
     """``(from, to, dependency type)`` of every edge of ``graph`` (kept, not
     yet instantiated) between kernel nodes, the ends named as in
@@ -240,30 +252,43 @@ def graph_edges(graph):
     name: a launch captured with the programmatic stream serialization
     attribute records a ``CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC`` edge from
     the kernel node before it on the stream; a plain launch records the
-    default full dependency."""
+    default full dependency.
+
+    The edges are read with ``cuGraphGetEdges_v2`` of the driver library
+    itself: cuda-bindings 13.0 to 13.2 return the edge data of
+    ``cuGraphGetEdges`` from a buffer they have already freed (cuda-python
+    issue #1804), so the types they report are whatever that memory holds."""
     driver = pytest.importorskip("cuda.bindings.driver")
-    raw = driver.CUgraph(graph.raw_cuda_graph())
-    # The edge-data form of the query: suffixed in cuda-bindings 12, the plain
-    # name in 13.
-    get_edges = getattr(driver, "cuGraphGetEdges_v2", None) or driver.cuGraphGetEdges
-    *_, count = checked(get_edges(raw, 0))
-    edges = checked(get_edges(raw, count))
-    assert len(edges) == 4, f"{get_edges.__name__} exposes no edge data: {edges!r}"
-    sources, targets, data, count = edges
+    get_edges = ctypes.CDLL("libcuda.so.1").cuGraphGetEdges_v2
+    get_edges.restype = ctypes.c_int
+    get_edges.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(_EdgeData),
+        ctypes.POINTER(ctypes.c_size_t),
+    )
+    raw = graph.raw_cuda_graph()
+    count = ctypes.c_size_t(0)
+    assert get_edges(raw, None, None, None, ctypes.byref(count)) == 0
+    total = count.value
+    sources = (ctypes.c_void_p * total)()
+    targets = (ctypes.c_void_p * total)()
+    data = (_EdgeData * total)()
+    assert get_edges(raw, sources, targets, data, ctypes.byref(count)) == 0
+    assert count.value == total, (count.value, total)
 
     def kernel_name(node):
-        params = checked(driver.cuGraphKernelNodeGetParams(node))
+        params = checked(driver.cuGraphKernelNodeGetParams(driver.CUgraphNode(node)))
         return checked(driver.cuFuncGetName(params.func)).decode()
 
     return [
         (
-            kernel_name(source),
-            kernel_name(target),
-            driver.CUgraphDependencyType(edge.type).name,
+            kernel_name(sources[i]),
+            kernel_name(targets[i]),
+            driver.CUgraphDependencyType(data[i].type).name,
         )
-        for source, target, edge in zip(
-            sources[:count], targets[:count], data[:count], strict=True
-        )
+        for i in range(total)
     ]
 
 
@@ -610,21 +635,86 @@ def test_tp_logical_padding_invariance(case, num_tokens):
     programs (640, 384). The output of the logical call, padded at
     preparation, equals bit for bit the output of the same call with weights
     pre-padded by the caller (zero rows and columns, scale 1.0), and so do
-    the two PyTorch references."""
+    the two PyTorch references. On a route stating ``w2_dense_k`` the logical
+    call binds the dense down-projection image (``K2 = w2_dense_k``) and the
+    pre-padded call the padded one (``K2`` the physical width): the same
+    program reads both, bit for bit alike. The dense image holds one zero row
+    past the weight rows, which the last row's final K step reads into."""
     inputs, xs = case_inputs(case, num_tokens)
-    physical = _v3_preparation.physical_intermediate(inputs["intermediate"])
-    assert physical != inputs["intermediate"]
+    logical = inputs["intermediate"]
+    physical = _v3_preparation.physical_intermediate(logical)
+    assert physical != logical
     padded = fixtures.pad_intermediate(inputs, physical)
     torch.testing.assert_close(
         model_reference(padded, xs), model_reference(inputs, xs), atol=0, rtol=0
     )
     plan = _v3_runtime.prepare_pipeline(inputs)
-    assert plan.stages[0].bindings["N1"] == 2 * physical
-    assert plan.stages[0].bindings["K2"] == physical
+    metadata = plan.route["metadata"]
+    dense = metadata.get("w2_logical_k") == logical and "w2_dense_k" in metadata
+    width = metadata["w2_dense_k"] if dense else physical
+    bindings = plan.stages[0].bindings
+    assert bindings["N1"] == 2 * physical
+    assert bindings["K2"] == width
+    assert tuple(bindings["B2"].shape) == (
+        inputs["num_experts"] * inputs["hidden"] + (1 if dense else 0),
+        width // 2,
+    )
     logical_output = run_once(plan)
-    del plan
+    del plan, bindings
     plan = _v3_runtime.prepare_pipeline(padded)
-    torch.testing.assert_close(run_once(plan), logical_output, atol=0, rtol=0)
+    assert plan.stages[0].bindings["K2"] == physical
+    padded_output = run_once(plan)
+    torch.testing.assert_close(padded_output, logical_output, atol=0, rtol=0)
+    assert torch.equal(
+        padded_output.view(torch.int16), logical_output.view(torch.int16)
+    )
+
+
+@pytest.mark.parametrize("num_tokens", (32, 128))
+@pytest.mark.parametrize("case", TP_CASES)
+def test_bind_prepared_refuses_mismatched_w2_image(case, num_tokens):
+    """A route stating ``w2_dense_k`` reads ``B2`` at the width ``K2`` names:
+    explicit bindings with the dense image under ``K2`` the physical width,
+    the padded image under ``K2 = w2_dense_k``, ``K2`` neither width, or a
+    dense image without its last (slack) row are refused; the dense and
+    padded bindings as preparation makes them bind."""
+    inputs, _ = case_inputs(case, num_tokens)
+    args = _v3_preparation.pipeline_route_args(inputs)
+    arch = _v3_runtime.device_arch(inputs["x_fp8_packed"].device)
+    route = _v3_runtime._route(arch, "pipeline", args)
+    if "w2_dense_k" not in route["metadata"]:
+        pytest.skip("this route states no dense W2 image")
+    _, num_sms = _v3_runtime._route_arch(route, inputs["x_fp8_packed"].device)
+    physical, dense_k = args["intermediate"], route["metadata"]["w2_dense_k"]
+    dense = _v3_preparation.prepare_pipeline_bindings(
+        inputs, num_sms, route_metadata=route["metadata"]
+    )
+    padded = _v3_preparation.prepare_pipeline_bindings(
+        fixtures.pad_intermediate(inputs, physical),
+        num_sms,
+        route_metadata=route["metadata"],
+    )
+    assert dense["bindings"]["K2"] == dense_k and padded["bindings"]["K2"] == physical
+
+    def bind(data, **changes):
+        return _v3_runtime.bind_prepared(
+            "pipeline",
+            args,
+            {"pipeline": dict(data["bindings"], **changes)},
+            data["output"],
+            reset_storage=data["reset_storage"],
+            reset_buffers=data["reset_buffers"],
+        )
+
+    bind(dense)
+    bind(padded)
+    for data, k2 in ((dense, physical), (padded, dense_k), (dense, physical - 32)):
+        with pytest.raises(ValueError, match="reads B2 at the width K2 names"):
+            bind(data, K2=k2)
+    weight_rows = args["num_experts"] * args["hidden"]
+    assert dense["bindings"]["B2"].shape[0] == weight_rows + 1
+    with pytest.raises(ValueError, match="one row past its"):
+        bind(dense, B2=dense["bindings"]["B2"][:weight_rows])
 
 
 @pytest.mark.parametrize("num_tokens", TP_EP_TOKENS)

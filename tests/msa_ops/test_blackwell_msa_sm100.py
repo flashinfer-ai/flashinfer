@@ -1646,7 +1646,7 @@ def test_uniform_fp8_two_split_eager_calls_are_one_kernel_on_one_counter():
     device = _current_device()
     from flashinfer.msa_ops import _blackwell_sm100 as backend
     from flashinfer.msa_ops import msa_sparse_decode_attention
-    from tests.test_helpers.cake_profiler import cuda_kernel_names
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
     seqlen_q = 8
     batch = _two_split_batch(backend, device, seqlen_q)
@@ -1677,7 +1677,7 @@ def test_uniform_fp8_two_split_eager_calls_are_one_kernel_on_one_counter():
 
     # Every CUDA activity of the window, read between sentinel kernels that
     # prove the session kept it whole (a session can lose its device records;
-    # see tests.test_helpers.cake_profiler).  When every session lost them, the
+    # see tests.cake.test_helpers.cake_profiler).  When every session lost them, the
     # outputs and counters of the last window are still checked before the
     # launch count is skipped.
     lost = None
@@ -1995,7 +1995,7 @@ def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
     device = _current_device()
     from flashinfer.msa_ops import _blackwell_sm100 as backend
     from flashinfer.msa_ops import msa_sparse_decode_attention
-    from tests.test_helpers.cake_profiler import cuda_kernel_names
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
     sets = [_union_inputs(device, batch=64, seed=181, use_workspace=False)]
     sets.append(_union_inputs(device, batch=128, seed=191, use_workspace=False))
@@ -2016,7 +2016,7 @@ def test_union_decode_eager_calls_without_a_workspace_are_one_kernel():
             outputs.append(run(sets[call % 2]))
 
     # Every CUDA activity of the window, read between sentinel kernels that
-    # prove the session kept it whole (tests.test_helpers.cake_profiler).  When
+    # prove the session kept it whole (tests.cake.test_helpers.cake_profiler).  When
     # every session lost them, the outputs and carriers of the last window are
     # still checked before the launch count is skipped.
     lost = None
@@ -2068,12 +2068,14 @@ def test_union_decode_carriers_created_on_one_stream_serve_another():
         _assert_lse_close(actual[1], expected[1])
 
 
-# Uniform FP8 prefill is served on one measured box (one request of one query
-# token over 64 Q heads and 4 KV heads, paged causal, a one-page table); the
-# calls just outside it -- two requests, two query tokens, a two-page table,
-# GQA 8, non-causal, an explicit ``q_offset`` (the derived value, passed), flat
-# K/V -- raise as every FP8-Q prefill call did before: the same exception type
-# and the same text.
+# Uniform FP8 prefill is served on measured shapes only (one request over 64 Q
+# heads and 4 KV heads, paged causal: one query token with a one-page table,
+# and on compute capability 10.3 also 146 query tokens with a two-page table);
+# the calls just outside them -- two requests, two or 147 query tokens, a
+# two-page table for one token, a three-page table for 146 tokens, GQA 8,
+# non-causal, an explicit ``q_offset`` (the derived value, passed), flat K/V --
+# raise as every FP8-Q prefill call did before: the same exception type and
+# the same text.
 @pytest.mark.parametrize(
     "change",
     [
@@ -2084,6 +2086,10 @@ def test_union_decode_carriers_created_on_one_stream_serve_another():
         {"causal": False},
         {"q_offset": [96]},
         {"kv_layout": "flat_varlen"},
+        {"q_lens": [146, 146], "kv_lens": [146, 146]},
+        {"q_lens": [147], "kv_lens": [147]},
+        {"q_lens": [146], "kv_lens": [300]},
+        {"q_lens": [146], "kv_lens": [146], "num_kv_heads": 8},
     ],
     ids=[
         "batch2",
@@ -2093,6 +2099,10 @@ def test_union_decode_carriers_created_on_one_stream_serve_another():
         "noncausal",
         "explicit-q-offset",
         "flat",
+        "q146-batch2",
+        "seqlen-q147",
+        "q146-page-width3",
+        "q146-gqa8",
     ],
 )
 def test_uniform_fp8_prefill_outside_its_box_is_declined(change):
@@ -2123,30 +2133,71 @@ def test_uniform_fp8_prefill_outside_its_box_is_declined(change):
     assert declined.type is NotImplementedError
 
 
+# The 146-token shape is served on compute capability 10.3 only; compute
+# capability 10.0 declines it with the same exception type and text.
+def test_uniform_fp8_prefill_q146_is_declined_on_sm100():
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_decode_attention
+    from flashinfer.utils import get_compute_capability
+
+    if get_compute_capability(device) != (10, 0):
+        pytest.skip("compute capability 10.3 serves the 146-token shape")
+    case = _attention_case(
+        "sparse_prefill",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        q_lens=[146],
+        kv_lens=[146],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=149,
+    )
+    inputs = _make_attention_inputs(case, device)
+    with pytest.raises(
+        NotImplementedError,
+        match="^uniform FP8 Q/K/V is supported only by sparse decode$",
+    ):
+        _invoke_attention(
+            inputs, None, msa_sparse_attention, msa_sparse_decode_attention
+        )
+
+
 # Inside the box the program converts the E4M3 Q to BF16 in its Q ingress (an
 # exact conversion) and otherwise runs as the BF16-Q program over the same FP8
 # cache (route prefill_union:bfloat16:float8_e4m3fn:paged:gqa0:any), so every
 # output equals, bit for bit, the call on ``q.to(torch.bfloat16)``.  Q is
 # scaled by 8 (exact in E4M3) so that the logits spread (standard deviation
 # about 0.9): the reference LSE of a zero Q then lies outside the LSE
-# tolerance, so the reference check sees Q as well.
+# tolerance, so the reference check sees Q as well.  The 146-token cases run
+# on compute capability 10.3, the only target that serves that shape.
 @pytest.mark.parametrize(
-    ("kv_len", "use_workspace", "cuda_graph", "temperature_scale", "seed"),
+    ("q_len", "kv_len", "use_workspace", "cuda_graph", "temperature_scale", "seed"),
     [
-        (97, True, False, 0.7, 103),
-        (128, False, False, 1.0, 107),
-        (1, True, True, 1.0, 109),
-        (128, True, True, 0.7, 113),
+        (1, 97, True, False, 0.7, 103),
+        (1, 128, False, False, 1.0, 107),
+        (1, 1, True, True, 1.0, 109),
+        (1, 128, True, True, 0.7, 113),
+        (146, 146, True, False, 0.7, 127),
+        (146, 256, False, False, 1.0, 131),
+        (146, 146, True, True, 1.0, 137),
+        (146, 200, True, True, 0.7, 139),
     ],
     ids=[
         "kv97-temperature",
         "kv128-no-workspace",
         "kv1-graph",
         "kv128-graph-temperature",
+        "q146-kv146-temperature",
+        "q146-kv256-no-workspace",
+        "q146-kv146-graph",
+        "q146-kv200-graph-temperature",
     ],
 )
 def test_uniform_fp8_prefill_box_is_the_bf16_q_call_bitwise(
-    kv_len, use_workspace, cuda_graph, temperature_scale, seed
+    q_len, kv_len, use_workspace, cuda_graph, temperature_scale, seed
 ):
     device = _require_supported_gpu()
     from flashinfer.msa_ops import (
@@ -2154,13 +2205,17 @@ def test_uniform_fp8_prefill_box_is_the_bf16_q_call_bitwise(
         msa_sparse_attention,
         msa_sparse_decode_attention,
     )
+    from flashinfer.utils import get_compute_capability
+
+    if q_len != 1 and get_compute_capability(device) != (10, 3):
+        pytest.skip("the 146-token shape is served on compute capability 10.3")
 
     case = _attention_case(
         "sparse_prefill",
         q_dtype=_FP8,
         kv_dtype=_FP8,
         kv_layout="paged",
-        q_lens=[1],
+        q_lens=[q_len],
         kv_lens=[kv_len],
         num_q_heads=64,
         num_kv_heads=4,

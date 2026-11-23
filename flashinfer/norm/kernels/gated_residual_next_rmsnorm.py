@@ -24,6 +24,7 @@ import cutlass.utils as cu_utils
 import torch
 from cutlass import Float32, Int32, const_expr
 
+from ...cute_dsl.utils import mbarrier_wait_acquire_cluster
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 H = 8192
@@ -87,7 +88,7 @@ def _row_sum4(v0, v1, v2, v3, buf, mbar, tidx, lane, warp, rank):
         if lane < CLUSTER_N:
             p = buf[(None, slot)].iterator
             _store4_remote(p, mbar, lane, w0, w1, w2, w3)
-        cute.arch.mbarrier_wait(mbar, 0)
+        mbarrier_wait_acquire_cluster(mbar, Int32(0))
         f = cute.make_fragment_like(buf[(None, lane)])
         cute.autovec_copy(buf[(None, lane)], f)
         x = f.load()

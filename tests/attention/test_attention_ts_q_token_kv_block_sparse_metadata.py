@@ -28,6 +28,7 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     _get_q_token_kv_block_sparse_metadata_output_shapes as get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes,
     _get_prims_ts_q_token_kv_block_sparse_workspace_layout,
     _prepare_q_token_kv_block_sparse_attention as prepare_prims_ts_q_token_kv_block_sparse_attention,
+    _validate_wide_metadata_fits,
     get_q_token_kv_block_sparse_workspace_size,
     q_token_kv_block_sparse_attention_with_paged_kv_cache,
 )
@@ -371,6 +372,8 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "q_dtype",
         "kv_dtype",
         "out_dtype",
+        "sm_scale",
+        "v_scale",
     )
     run_parameters = inspect.signature(QTokenKvBlockSparsePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -386,7 +389,11 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "sm_scale",
         "v_scale",
         "out",
+        "validate",
+        "kv_scale_factors",
     )
+    assert run_parameters["validate"].default is True
+    assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["token_to_request"].default is None
     assert run_parameters["query_positions"].default is None
 
@@ -957,11 +964,36 @@ def _reference(
 def _assert_metadata_matches(
     actual: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     expected: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    query_major_memberships: bool = False,
 ) -> None:
     """Compare the observable live route prefix of compact QToken-KvBlock-Sparse-Attention metadata."""
 
     actual_indices, actual_memberships, actual_seq_lens = actual
     expected_indices, expected_memberships, expected_seq_lens = expected
+    if query_major_memberships:
+        # Normalize private query bitplanes to the public per-page bytes.
+        planes = actual_memberships.reshape(actual_memberships.shape[0], -1, 8).to(
+            torch.int64
+        )
+        bits = torch.arange(32, device=actual_memberships.device)
+        queries = torch.arange(8, device=actual_memberships.device)
+        page_bytes = (
+            (((planes[..., None] >> bits) & 1) << queries[None, None, :, None])
+            .sum(2)
+            .to(torch.uint8)
+            .reshape(actual_memberships.shape[0], -1)
+        )
+        for row, length in enumerate(actual_seq_lens.cpu().tolist()):
+            pages = (length + 3) // 4
+            assert torch.all(page_bytes[row, pages : (pages + 31) // 32 * 32] == 0)
+        actual_indices = actual_indices[:, : expected_indices.shape[1]]
+        # Public membership words include padding when capacity is not /4.
+        actual_memberships = (
+            page_bytes[:, : expected_memberships.shape[1] * 4]
+            .contiguous()
+            .view(torch.int32)
+        )
     assert actual_indices.shape == expected_indices.shape
     assert actual_memberships.shape == expected_memberships.shape
     torch.testing.assert_close(actual_seq_lens, expected_seq_lens)
@@ -1294,6 +1326,110 @@ def test_q_token_kv_block_sparse_sort_union_wide_context_matches_reference(
         qo_indptr,
     )
     _assert_metadata_matches(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("group_size", "packed", "max_seq_len_kv"),
+    (
+        (16, False, 128 * 1024),
+        (32, True, 256 * 1024),
+        # The O(1) word-rank array would lower occupancy (G16) or not fit
+        # (G16 at 4M, G32 at 2M): the kernel walks the word summaries instead.
+        (16, False, 1024 * 1024 + 1),
+        (16, True, 4 * 1024 * 1024),
+        (32, False, 2 * 1024 * 1024),
+    ),
+)
+def test_wide_group_sort_union_long_context_matches_reference(
+    group_size: int,
+    packed: bool,
+    max_seq_len_kv: int,
+) -> None:
+    """G16/G32 bit-map unions over long prefixes match a host reference, plane by plane."""
+
+    try:
+        _validate_wide_metadata_fits(
+            group_size, max_seq_len_kv, 4, torch.cuda.current_device()
+        )
+    except ValueError as error:
+        pytest.skip(str(error))
+    (
+        blocks,
+        table,
+        requests,
+        positions,
+        storage_page_size,
+        qo_indptr,
+    ) = _make_wide_sort_union_case(group_size, packed, max_seq_len_kv)
+    outputs = tuple(
+        torch.full(shape, -7, dtype=torch.int32, device="cuda")
+        for shape in get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes(
+            blocks.shape[0],
+            blocks.shape[1],
+            group_size,
+            num_query_groups=2,
+        )
+    )
+    indices, memberships, seq_lens = build_prims_ts_q_token_kv_block_sparse_metadata(
+        blocks,
+        table,
+        requests,
+        positions,
+        group_size=group_size,
+        storage_page_size=storage_page_size,
+        max_seq_len_kv=max_seq_len_kv,
+        qo_indptr=qo_indptr,
+        out=outputs,
+    )
+    blocks_host = blocks.cpu()
+    table_host = table.cpu()
+    positions_host = positions.cpu()
+    requests_host = requests.cpu()
+    rows, block_topk = blocks_host.shape
+    route_offsets = (
+        [0, group_size, rows] if qo_indptr is None else qo_indptr.cpu().tolist()
+    )
+    planes = (group_size + 7) // 8
+    plane_bytes = memberships.shape[1] // planes * 4
+    membership_bytes = memberships.cpu().contiguous().view(torch.uint8)
+    indices_host = indices.cpu()
+    seq_lens_host = seq_lens.cpu()
+    subpages_per_storage_page = storage_page_size // 4
+    for group in range(2):
+        first_row, group_end = route_offsets[group], route_offsets[group + 1]
+        membership_by_block: dict[int, int] = {}
+        for q_index in range(group_end - first_row):
+            row = first_row + q_index
+            visible_tokens = int(positions_host[row]) + 1
+            complete_pages = min(visible_tokens // 4, block_topk)
+            for logical_block in blocks_host[row, :complete_pages].tolist():
+                if 0 <= logical_block < visible_tokens // 4:
+                    membership_by_block[logical_block] = membership_by_block.get(
+                        logical_block, 0
+                    ) | (1 << q_index)
+            if visible_tokens % 4:
+                tail_block = visible_tokens // 4
+                membership_by_block[tail_block] = membership_by_block.get(
+                    tail_block, 0
+                ) | (1 << q_index)
+        union = sorted(membership_by_block.items())
+        last_tail = (int(positions_host[group_end - 1]) + 1) % 4
+        tail_padding = 0 if last_tail == 0 else 4 - last_tail
+        assert int(seq_lens_host[group]) == max(len(union) * 4 - tail_padding, 1)
+        for rank, (logical_block, membership) in enumerate(union):
+            storage_page, token_offset = divmod(logical_block * 4, storage_page_size)
+            request = int(requests_host[first_row])
+            locator = (
+                int(table_host[request, storage_page]) * subpages_per_storage_page
+                + token_offset // 4
+            )
+            assert int(indices_host[group, rank]) == locator, (group, rank)
+            for plane in range(planes):
+                assert (
+                    int(membership_bytes[group, plane * plane_bytes + rank])
+                    == (membership >> (8 * plane)) & 0xFF
+                ), (group, rank, plane)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -1982,14 +2118,16 @@ def _run_private_q_token_kv_block_sparse_decode(
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize(
-    ("group_size", "segment_memberships", "expected_keeps"),
+    ("group_size", "num_qo_heads", "segment_memberships", "expected_keeps"),
     (
-        (2, (0b01, 0b10, 0b11, 0b01, 0b10), False),
-        (4, (0b0001, 0b0010, 0b0100, 0b1111, 0b1000), True),
+        (2, 8, (0b01, 0b10, 0b11, 0b01, 0b10), False),
+        (2, 12, (0b01, 0b10, 0b11, 0b01, 0b10), True),
+        (4, 12, (0b0001, 0b0010, 0b0100, 0b1111, 0b1000), True),
     ),
 )
 def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundaries(
     group_size: int,
+    num_qo_heads: int,
     segment_memberships: tuple[int, ...],
     expected_keeps: bool,
 ) -> None:
@@ -1998,14 +2136,15 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
     Every 32 page-four locators form one KV128 tile.  Using a different
     membership mask in each tile makes a split that restarts the membership
     pointer, or applies the locator stride to membership words, visibly route
-    pages to the wrong query.  Q2 covers the production SwapsMmaAb path and Q4
-    covers KeepsMmaAb; both resolve to a separate-reduction split-KV launch.
+    pages to the wrong query.  Eight-head Q2 (16 rows) covers the production
+    SwapsMmaAb path; twelve-head Q2 and Q4 (24 and 48 rows) cover KeepsMmaAb,
+    which D256 BF16 takes beyond 16 rows. All resolve to a separate-reduction
+    split-KV launch.
     """
 
     from flashinfer.attention.prims_ts import decode as decode_module
 
     batch_size = 1
-    num_qo_heads = 12
     num_kv_heads = 1
     head_dim = 256
     sparse_page_size = 4
@@ -2037,7 +2176,10 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
         False,
     )
     assert spec.config.use_keeps_mma_ab is expected_keeps
-    assert spec.config.tile_size_q == (64 if expected_keeps else 32)
+    # D256 takes SwapsMmaAb only up to 16 rows (Q8/Q16 tiles): on GB300 a Swaps
+    # Q32 tile measured 10-110% slower than the Keeps Q64 tile at every dtype
+    # (``SWAPS_MAX_ROWS_D256``), so 24 and 48 rows take Keeps Q64.
+    assert spec.config.tile_size_q == (64 if expected_keeps else 16)
     # The exact first-wave fanout is device-capacity dependent; this test only
     # requires a real multi-split launch to exercise split-local addressing.
     assert spec.config.splits_kv == spec.config.max_splits_kv
@@ -2280,6 +2422,7 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
             views.seq_lens,
         ),
         expected,
+        query_major_memberships=workspace_layout.query_major_memberships,
     )
     assert scratch.data_ptr() > q_token_kv_block_sparse_page_indices.data_ptr()
 
@@ -2912,27 +3055,15 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
         storage_page_size,
         group_size,
     )
-    actual_indices = views.q_token_kv_block_sparse_page_indices
-    actual_members = views.q_token_kv_block_sparse_page_memberships
-    if layout.query_major_memberships:
-        # Normalize the private representation for the independent semantic
-        # reference; do not reinterpret public metadata outputs as query words.
-        planes = actual_members.reshape(actual_members.shape[0], -1, 8).to(torch.int64)
-        bits = torch.arange(32, device="cuda")
-        queries = torch.arange(8, device="cuda")
-        page_bytes = (
-            (((planes[..., None] >> bits) & 1) << queries[None, None, :, None])
-            .sum(2)
-            .to(torch.uint8)
-            .reshape(actual_members.shape[0], -1)
-        )
-        for row, length in enumerate(views.seq_lens.cpu().tolist()):
-            pages = (length + 3) // 4
-            assert torch.all(page_bytes[row, pages : (pages + 31) // 32 * 32] == 0)
-        columns = expected[0].shape[1]
-        actual_indices = actual_indices[:, :columns]
-        actual_members = page_bytes[:, :columns].contiguous().view(torch.int32)
-    _assert_metadata_matches((actual_indices, actual_members, views.seq_lens), expected)
+    _assert_metadata_matches(
+        (
+            views.q_token_kv_block_sparse_page_indices,
+            views.q_token_kv_block_sparse_page_memberships,
+            views.seq_lens,
+        ),
+        expected,
+        query_major_memberships=layout.query_major_memberships,
+    )
 
     replacement_query = query.clone()
     replacement_blocks = blocks.clone()
@@ -3861,6 +3992,7 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
             ],
             raw_metadata[2],
         ),
+        query_major_memberships=unified_layout.query_major_memberships,
     )
     torch.testing.assert_close(
         _as_lower_level_decode_view(unified_output),
@@ -3887,6 +4019,17 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
         kv_dtype=k_cache.dtype,
         out_dtype=graph_output.dtype,
     )
+    with pytest.raises(RuntimeError, match="validate=True"):
+        graph_wrapper.run(
+            query,
+            (k_cache, v_cache),
+            table,
+            blocks,
+            requests,
+            positions,
+            out=graph_output,
+            validate=False,
+        )
     graph_wrapper.run(
         query,
         (k_cache, v_cache),
@@ -3906,6 +4049,7 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
             requests,
             positions,
             out=graph_output,
+            validate=False,
         )
     graph.replay()
     torch.cuda.synchronize()
@@ -4044,6 +4188,578 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
     )
 
 
+def _interleave_v_scale_factors(scales: torch.Tensor) -> torch.Tensor:
+    """Reorder ``[pages, Hkv, page_size, D/16]`` V scales into TRT-LLM's
+    four-token interleaved order."""
+
+    pages, heads, page_size, groups = scales.shape
+    return (
+        scales.reshape(pages, heads, page_size // 4, 4, 4, groups // 4)
+        .permute(0, 1, 2, 4, 5, 3)
+        .reshape(scales.shape)
+        .contiguous()
+    )
+
+
+def dequantize_nvfp4_reference(
+    payload: torch.Tensor, scales: torch.Tensor
+) -> torch.Tensor:
+    """Decode E2M1 bytes (even element in the low nibble) with per-16 E4M3 scales."""
+
+    lut = torch.tensor(
+        (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+        + (-0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0),
+        device=payload.device,
+    )
+    nibbles = torch.stack((payload & 0x0F, payload >> 4), dim=-1).flatten(-2)
+    return lut[nibbles.long()] * scales.float().repeat_interleave(16, dim=-1)
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize(
+    ("query_dtype", "interleaved_scales", "launch", "cache_layout", "geometry"),
+    (
+        (torch.bfloat16, True, "split", "flat", (4, 5)),
+        (torch.float8_e4m3fn, True, "split", "flat", (4, 5)),
+        (torch.float8_e4m3fn, False, "split", "flat", (4, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "flat", (4, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "page4", (4, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "block64", (4, 5)),
+        (torch.float8_e4m3fn, True, "split", "block8", (4, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "kv-pair", (4, 5)),
+        (torch.float8_e4m3fn, True, "split", "flat", (16, 4)),
+        (torch.float8_e4m3fn, True, "split", "flat", (16, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "flat", (16, 8)),
+        (torch.bfloat16, True, "split", "flat", (16, 4)),
+        (torch.bfloat16, True, "split", "flat", (16, 5)),
+        (torch.bfloat16, True, "full-wave", "flat", (16, 8)),
+        (torch.float8_e4m3fn, False, "split", "flat", (16, 4)),
+        (torch.float8_e4m3fn, False, "full-wave", "flat", (16, 8)),
+        (torch.bfloat16, False, "split", "flat", (16, 4)),
+        (torch.bfloat16, False, "split", "nhd-view", (16, 5)),
+        (torch.float8_e4m3fn, True, "split", "nhd-view", (16, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "block8-heads2", (4, 5)),
+        (torch.bfloat16, True, "split", "block8-heads2", (16, 4)),
+        (torch.float8_e4m3fn, True, "packed", "flat", (4, 1)),
+        (torch.float8_e4m3fn, True, "packed", "flat", (4, 4)),
+        (torch.float8_e4m3fn, True, "packed", "flat", (8, 4)),
+        (torch.float8_e4m3fn, False, "packed", "flat", (4, 4)),
+        (torch.float8_e4m3fn, True, "packed", "flat", (4, 5)),
+        (torch.bfloat16, True, "packed", "flat", (4, 4)),
+    ),
+    ids=(
+        "bf16-rows",
+        "fp8-rows",
+        "fp8-scale-tensors",
+        "fp8-rows-full-wave",
+        "fp8-rows-full-wave-page4",
+        "fp8-rows-full-wave-block64",
+        "fp8-rows-block8",
+        "fp8-rows-full-wave-kv-pair",
+        "fp8-rows-gqa16-g4",
+        "fp8-rows-gqa16-g5",
+        "fp8-rows-gqa16-g8-full-wave",
+        "bf16-rows-gqa16-g4",
+        "bf16-rows-gqa16-g5",
+        "bf16-rows-gqa16-g8-full-wave",
+        "fp8-scale-tensors-gqa16-g4",
+        "fp8-scale-tensors-gqa16-g8-full-wave",
+        "bf16-scale-tensors-gqa16-g4",
+        "bf16-scale-tensors-nhd-gqa16-g5",
+        "fp8-rows-nhd-gqa16-g5",
+        "fp8-rows-full-wave-block8-heads2",
+        "bf16-rows-block8-heads2-gqa16-g4",
+        "fp8-rows-packed-g1",
+        "fp8-rows-packed-g4",
+        "fp8-rows-packed-gqa8-g4",
+        "fp8-scale-tensors-packed-g4",
+        "fp8-rows-packed-g5",
+        "bf16-rows-packed-g4",
+    ),
+)
+def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
+    query_dtype: torch.dtype,
+    interleaved_scales: bool,
+    launch: str,
+    cache_layout: str,
+    geometry: tuple[int, int],
+) -> None:
+    """Attend packed NVFP4 K/V and compare with the dequantized cache.
+
+    BF16 Q runs the exact BF16 transform; FP8 Q rounds the transformed
+    operands to E4M3. Rows either interleave each token's scales after its
+    payload or pass separate scale tensors (V scales in TRT-LLM's 4-token
+    interleaved order). At four Q heads per KV head, G5 launches run the
+    Keeps recipe fed by the NVFP4 transform task (FP8 tiles for FP8 Q, BF16
+    tiles for BF16 Q), split along KV (``split``: two requests) or at one
+    wave (``full-wave``) of (request, KV head) tiles.
+
+    The Keeps raw ring loads four flat page-fragment rows per TMA gather4.
+    Other caches take one tiled copy per fragment: without flat rows
+    (``page4``: no storage subpages; ``kv-pair``: K/V views of one
+    ``[pages, 2, ...]`` tensor; ``nhd-view``: two KV heads stored token-major
+    and passed, like their scale tensors, as transposed HND views), with
+    fewer than four fragments per KV tile (``block64``), or with fragments
+    wider than one gather4 box (``block8``: 8 x 144 bytes; ``block8-heads2``
+    also checks the second KV head's coordinates). Separate scale tensors
+    stage 128-byte SW128 payload rows and a separate scale stage.
+
+    ``packed`` passes the same queries as packed ``[total_q, Hq, D]`` rows
+    with ``qo_indptr``: FP8 Q up to G4 with at most 16 Q rows per KV head runs
+    the TMEM-transformed Swaps recipe; FP8 G4 with 32 rows (eight Q heads per
+    KV head), FP8 G5 and BF16 Q run the Keeps transform.
+
+    ``geometry`` is (Q heads per KV head, G). Sixteen Q heads per KV head
+    give 64-128 Q rows per group, more than any Swaps Q tile holds, so G4
+    runs Keeps Q64 and G5/G8 run Keeps Q128 with the NVFP4 transform, which
+    writes E4M3 tiles for FP8 Q and exact BF16 tiles for BF16 Q.
+    """
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        get_max_active_clusters_for_cluster_size,
+    )
+
+    head_dim = 256
+    heads_q_per_kv, group_size = geometry
+    num_kv_heads = 2 if cache_layout in ("nhd-view", "block8-heads2") else 1
+    num_qo_heads = heads_q_per_kv * num_kv_heads
+    block_size, block_topk, page_size = {
+        "flat": (4, 64, 16),
+        "kv-pair": (4, 64, 16),
+        "nhd-view": (4, 64, 16),
+        "page4": (4, 64, 4),
+        "block64": (64, 8, 128),
+        "block8": (8, 32, 16),
+        "block8-heads2": (8, 32, 16),
+    }[cache_layout]
+    num_pages = 1536 // page_size
+    num_requests = {
+        "split": 2,
+        "packed": 2,
+        "full-wave": get_max_active_clusters_for_cluster_size(1),
+    }[launch]
+    generator = torch.Generator(device="cuda").manual_seed(2027)
+    positions = torch.arange(
+        1023, 1023 + group_size, dtype=torch.int64, device="cuda"
+    ).repeat(num_requests)
+    requests = torch.arange(
+        num_requests, dtype=torch.int32, device="cuda"
+    ).repeat_interleave(group_size)
+    # Each query token owns a distinct final block, as in the reference test.
+    blocks = torch.arange(block_topk, dtype=torch.int32, device="cuda").repeat(
+        num_requests * group_size, 1
+    )
+    blocks[:, -1] = (
+        torch.arange(
+            block_topk, block_topk + group_size, dtype=torch.int32, device="cuda"
+        )
+    ).repeat(num_requests)
+    # Requests share one shuffled page order and therefore one cache.
+    table = (
+        torch.randperm(num_pages, generator=generator, device="cuda")
+        .to(torch.int32)
+        .repeat(num_requests, 1)
+    )
+    shape = (num_pages, num_kv_heads, page_size)
+    payload = [
+        torch.randint(
+            0, 256, (*shape, head_dim // 2), generator=generator, device="cuda"
+        ).to(torch.uint8)
+        for _ in range(2)
+    ]
+    scales = [
+        (torch.rand((*shape, head_dim // 16), generator=generator, device="cuda") / 2)
+        .add(0.05)
+        .to(torch.float8_e4m3fn)
+        for _ in range(2)
+    ]
+    if interleaved_scales:
+        caches = tuple(
+            torch.cat((data, scale.view(torch.uint8)), dim=-1).contiguous()
+            for data, scale in zip(payload, scales, strict=True)
+        )
+        if cache_layout == "kv-pair":
+            pair = torch.stack(caches, dim=1)
+            caches = (pair[:, 0], pair[:, 1])
+        if cache_layout == "nhd-view":
+            caches = tuple(
+                cache.transpose(1, 2).contiguous().transpose(1, 2) for cache in caches
+            )
+        kv_scale_factors = None
+    else:
+        caches = tuple(payload)
+        kv_scale_factors = (scales[0], _interleave_v_scale_factors(scales[1]))
+        if cache_layout == "nhd-view":
+            caches, kv_scale_factors = (
+                tuple(
+                    tensor.transpose(1, 2).contiguous().transpose(1, 2)
+                    for tensor in tensors
+                )
+                for tensors in (caches, kv_scale_factors)
+            )
+    query = torch.randn(
+        (num_requests, 1, group_size, num_qo_heads, head_dim),
+        generator=generator,
+        device="cuda",
+    ).to(torch.bfloat16)
+    query = query.to(query_dtype)
+    run_query, qo_indptr = query, None
+    if launch == "packed":
+        run_query = query.reshape(num_requests * group_size, num_qo_heads, head_dim)
+        qo_indptr = torch.arange(
+            0,
+            num_requests * group_size + 1,
+            group_size,
+            dtype=torch.int32,
+            device="cuda",
+        )
+    output = torch.empty(run_query.shape, dtype=torch.bfloat16, device="cuda")
+    max_seq_len_kv = num_pages * page_size
+    workspace = torch.zeros(
+        get_q_token_kv_block_sparse_workspace_size(
+            run_query,
+            caches[0],
+            table,
+            block_topk=block_topk,
+            max_seq_len_kv=max_seq_len_kv,
+            out_dtype=output.dtype,
+            qo_indptr=qo_indptr,
+            group_size=group_size,
+            kv_block_size=block_size,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    q_token_kv_block_sparse_attention_with_paged_kv_cache(
+        run_query,
+        caches,
+        table,
+        blocks,
+        requests,
+        positions,
+        workspace,
+        max_seq_len_kv=max_seq_len_kv,
+        group_size=group_size,
+        kv_block_size=block_size,
+        out=output,
+        qo_indptr=qo_indptr,
+        kv_scale_factors=kv_scale_factors,
+    )
+    output = output.view(query.shape)
+
+    keys, values = (
+        dequantize_nvfp4_reference(data, scale)
+        for data, scale in zip(payload, scales, strict=True)
+    )
+    tolerance = 5e-2 if query_dtype == torch.float8_e4m3fn else 2e-2
+    for request in (0, num_requests - 1):
+        for group_idx in range(group_size):
+            token = request * group_size + group_idx
+            visible = int(positions[token]) + 1
+            selected = blocks[token, : min(visible // block_size, block_topk)].long()
+            token_ids = (
+                selected[:, None] * block_size + torch.arange(block_size, device="cuda")
+            ).flatten()
+            if visible % block_size:
+                token_ids = torch.cat(
+                    (
+                        token_ids,
+                        torch.arange(
+                            visible - visible % block_size, visible, device="cuda"
+                        ),
+                    )
+                )
+            pages = table[request, token_ids // page_size].long()
+            slots = token_ids % page_size
+            for kv_head in range(num_kv_heads):
+                heads = slice(kv_head * heads_q_per_kv, (kv_head + 1) * heads_q_per_kv)
+                scores = (
+                    query[request, 0, group_idx, heads].float()
+                    @ keys[pages, kv_head, slots].T
+                ) / head_dim**0.5
+                reference = (
+                    torch.softmax(scores, dim=-1) @ values[pages, kv_head, slots]
+                )
+                torch.testing.assert_close(
+                    output[request, 0, group_idx, heads].float(),
+                    reference,
+                    rtol=tolerance,
+                    atol=tolerance,
+                )
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize("split_kv", (True, False))
+@pytest.mark.parametrize(
+    ("kv_dtype", "head_dim"),
+    ((torch.bfloat16, 128), (torch.bfloat16, 256), (torch.uint8, 256)),
+    ids=("bf16-d128", "bf16-d256", "nvfp4-d256"),
+)
+@pytest.mark.parametrize(
+    (
+        "num_qo_heads",
+        "num_kv_heads",
+        "group_size",
+        "block_size",
+        "page_size",
+        "share_pattern",
+    ),
+    (
+        (4, 1, 16, 4, 64, True),
+        (4, 1, 32, 4, 64, True),
+        (16, 2, 16, 4, 64, True),
+        (2, 1, 32, 4, 64, True),
+        # One Q head per KV head: rows 16-63 of the Keeps Q64 tile are padding,
+        # read through the preloaded (4-token) and on-demand (8-token) paths.
+        (1, 1, 16, 4, 64, True),
+        (1, 1, 16, 8, 8, True),
+        # 32-token blocks on 4-token pages: 4-token fragments, one membership
+        # byte each, which G16/G32 support.
+        (4, 1, 16, 32, 4, True),
+        # Per-KV-head patterns: each head's planes stay inside its own row
+        # (Keeps Q64 and Q128 tiles).
+        (8, 2, 16, 4, 64, False),
+        (16, 2, 16, 4, 64, False),
+    ),
+)
+def test_wide_group_packed_attention_matches_reference(
+    num_qo_heads: int,
+    num_kv_heads: int,
+    group_size: int,
+    block_size: int,
+    page_size: int,
+    share_pattern: bool,
+    kv_dtype: torch.dtype,
+    head_dim: int,
+    split_kv: bool,
+) -> None:
+    """G16/G32 routes (two/four page-major membership planes) match FP32.
+
+    Every query of each route, including a short tail route, is compared.
+    Each query takes half of its blocks from a pool shared by the route and
+    half privately, so the memberships differ per query and per plane.
+    """
+
+    block_topk = 64 if block_size == 4 else 16
+    generator = torch.Generator(device="cuda").manual_seed(
+        group_size * 131 + num_qo_heads
+    )
+    prefix, num_queries = 1100, 3 * group_size + 5
+    seq_len = prefix + num_queries
+    num_pages = (seq_len + page_size - 1) // page_size
+    table = (
+        torch.randperm(num_pages, generator=generator, device="cuda")
+        .to(torch.int32)
+        .view(1, num_pages)
+    )
+    shape = (num_pages, num_kv_heads, page_size)
+    if kv_dtype == torch.bfloat16:
+        caches = tuple(
+            torch.randn((*shape, head_dim), generator=generator, device="cuda").to(
+                torch.bfloat16
+            )
+            for _ in range(2)
+        )
+        kv_scale_factors = None
+        keys, values = (cache.float() for cache in caches)
+    else:
+        caches = tuple(
+            torch.randint(
+                0, 256, (*shape, head_dim // 2), generator=generator, device="cuda"
+            ).to(torch.uint8)
+            for _ in range(2)
+        )
+        scales = [
+            (
+                torch.rand((*shape, head_dim // 16), generator=generator, device="cuda")
+                / 2
+            )
+            .add(0.05)
+            .to(torch.float8_e4m3fn)
+            for _ in range(2)
+        ]
+        kv_scale_factors = (scales[0], _interleave_v_scale_factors(scales[1]))
+        keys, values = (
+            dequantize_nvfp4_reference(data, scale)
+            for data, scale in zip(caches, scales, strict=True)
+        )
+    positions = torch.arange(prefix, seq_len, dtype=torch.int32, device="cuda")
+    # One selection per query and KV head; a shared pattern keeps head 0's.
+    blocks = torch.full(
+        (num_queries, num_kv_heads, block_topk), -1, dtype=torch.int32, device="cuda"
+    )
+    for kv_head in range(num_kv_heads):
+        pool = torch.randperm(prefix // block_size, generator=generator, device="cuda")[
+            : 2 * block_topk
+        ]
+        for token in range(num_queries):
+            bound = (int(positions[token]) + 1) // block_size
+            shared = pool[
+                torch.randperm(pool.numel(), generator=generator, device="cuda")[
+                    : block_topk // 2
+                ]
+            ]
+            private = torch.randperm(bound, generator=generator, device="cuda")
+            private = private[~torch.isin(private, shared)][
+                : block_topk - shared.numel()
+            ]
+            selected = torch.cat((shared, private))
+            blocks[token, kv_head, : selected.numel()] = selected.to(torch.int32)
+    if share_pattern:
+        blocks = blocks[:, :1].expand(-1, num_kv_heads, -1)
+    run_blocks = blocks[:, 0].contiguous() if share_pattern else blocks.contiguous()
+    query = torch.randn(
+        (num_queries, num_qo_heads, head_dim), generator=generator, device="cuda"
+    ).to(torch.bfloat16)
+    requests = torch.zeros(num_queries, dtype=torch.int32, device="cuda")
+    qo_indptr = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
+        torch.tensor([0, num_queries], dtype=torch.int32),
+        num_queries,
+        group_size=group_size,
+        device="cuda",
+    )
+    workspace = torch.zeros(
+        get_q_token_kv_block_sparse_workspace_size(
+            query,
+            caches[0],
+            table,
+            block_topk=block_topk,
+            max_seq_len_kv=seq_len,
+            out_dtype=torch.bfloat16,
+            qo_indptr=qo_indptr,
+            group_size=group_size,
+            kv_block_size=block_size,
+            split_kv=split_kv,
+            share_pattern_across_kv_heads=share_pattern,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        qo_indptr.numel() - 1,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        block_size,
+        page_size,
+        block_topk,
+        seq_len,
+        device="cuda",
+        workspace_buffer=workspace,
+        group_size=group_size,
+        packed_query=True,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=share_pattern,
+        q_dtype=torch.bfloat16,
+        kv_dtype=kv_dtype,
+        out_dtype=torch.bfloat16,
+    )
+    output = torch.empty_like(query)
+    wrapper.run(
+        query,
+        caches,
+        table,
+        run_blocks,
+        requests,
+        positions,
+        qo_indptr=qo_indptr,
+        out=output,
+        kv_scale_factors=kv_scale_factors,
+    )
+
+    keys, values = (
+        tensor[table[0].long()]
+        .permute(0, 2, 1, 3)
+        .reshape(num_pages * page_size, num_kv_heads, head_dim)
+        for tensor in (keys, values)
+    )
+    heads_q_per_kv = num_qo_heads // num_kv_heads
+    for token in range(num_queries):
+        visible = int(positions[token]) + 1
+        tail = torch.arange(visible - visible % block_size, visible, device="cuda")
+        for kv_head in range(num_kv_heads):
+            selected = blocks[token, kv_head]
+            live = selected[selected >= 0].long()
+            token_ids = torch.cat(
+                (
+                    (
+                        live[:, None] * block_size
+                        + torch.arange(block_size, device="cuda")
+                    ).flatten(),
+                    tail,
+                )
+            )
+            heads = slice(kv_head * heads_q_per_kv, (kv_head + 1) * heads_q_per_kv)
+            scores = query[token, heads].float() @ keys[token_ids, kv_head].T
+            reference = (scores / head_dim**0.5).softmax(-1) @ values[
+                token_ids, kv_head
+            ]
+            error = (output[token, heads].float() - reference).norm() / reference.norm()
+            assert error < 0.01, (token, token % group_size, kv_head, float(error))
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+def test_wide_group_rejects_metadata_map_beyond_shared_memory() -> None:
+    """G32 over a 64M-token model prefix has no metadata map that fits SMEM;
+    workspace sizing (and plan) rejects it instead of failing at run."""
+
+    page_size, max_seq_len_kv = 4096, 64 * 1024 * 1024
+    query = torch.empty((32, 4, 256), dtype=torch.bfloat16, device="cuda")
+    cache = torch.empty((1, 1, page_size, 256), dtype=torch.bfloat16, device="cuda")
+    table = torch.zeros(
+        (1, max_seq_len_kv // page_size), dtype=torch.int32, device="cuda"
+    )
+    qo_indptr = torch.tensor([0, 32], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="shared memory"):
+        get_q_token_kv_block_sparse_workspace_size(
+            query,
+            cache,
+            table,
+            block_topk=64,
+            max_seq_len_kv=max_seq_len_kv,
+            out_dtype=torch.bfloat16,
+            qo_indptr=qo_indptr,
+            group_size=32,
+            kv_block_size=4,
+        )
+
+
+def test_wide_group_suggestion_for_long_nvfp4_prefill() -> None:
+    """Long packed NVFP4 prefill takes a two/four-plane group where it pays:
+    4/1 heads over a 64K context (G16) or from an empty prefix (G32); 16/2
+    heads over 64K keep G8. Fixed-shape queries never get G16/G32, which
+    ``plan`` rejects for them."""
+
+    suggest = suggest_prims_ts_q_token_kv_block_sparse_group_size
+    packed = dict(nvfp4_kv=True, packed_query=True)
+    long_4_1 = suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=65536 + 4096, **packed)
+    fresh_4_1 = suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=4096, **packed)
+    long_16_2 = suggest(1, 2048, 2051, 16, 2, 148, seq_len_kv=65536 + 2048, **packed)
+    short = suggest(1, 4, 2051, 16, 2, 148, seq_len_kv=65536 + 4, **packed)
+    assert (long_4_1, fresh_4_1, long_16_2) == (16, 32, 8) and short <= 4
+    assert suggest(1, 4096, 2051, 4, 1, 148, seq_len_kv=4096, nvfp4_kv=True) <= 8
+
+
+def test_wide_group_suggestion_needs_small_blocks() -> None:
+    """Keeps lanes read four blocks per G16/G32 membership word, so blocks
+    wider than 16 tokens keep the suggestion at G8 or below."""
+
+    for block_size in (32, 64):
+        group_size = suggest_prims_ts_q_token_kv_block_sparse_group_size(
+            1,
+            4096,
+            2048 + block_size - 1,
+            4,
+            1,
+            148,
+            kv_block_size=block_size,
+            nvfp4_kv=True,
+            packed_query=True,
+        )
+        assert group_size <= 8
+
+
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize(
     ("dtype", "kv_heads", "share_pattern", "multi_wave"),
@@ -4054,6 +4770,7 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
     ]
     + [
         pytest.param(torch.float8_e4m3fn, 1, True, True, id="fp8-multi-wave-shared"),
+        pytest.param(torch.bfloat16, 1, True, True, id="bf16-multi-wave-shared"),
         pytest.param(torch.float8_e4m3fn, 2, False, True, id="fp8-multi-wave-per-head"),
     ],
 )
@@ -5007,3 +5724,188 @@ def test_sparse_d192_fp16_output(dtype):
     _check_current_block_budget_case(
         4, 192, False, 4128, 512, True, dtype, output_dtype=torch.float16
     )
+
+
+def _global_scale_qtoken_case(
+    scales, *, group_size=1, packed=False, split_kv=False, dtype=torch.bfloat16
+):
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    rows = 2 if packed else group_size
+    shape = (rows, 8, 128) if packed else (1, 1, rows, 8, 128)
+    q = (torch.randn(shape, device="cuda", generator=generator) * 0.5).to(dtype)
+    k = (torch.randn((2, 1, 16, 128), device="cuda", generator=generator) * 0.5).to(
+        dtype
+    )
+    v = torch.randn(k.shape, device="cuda", generator=generator).to(dtype)
+    table = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+    blocks = (
+        torch.arange(4, dtype=torch.int32, device="cuda").expand(rows, 4).contiguous()
+    )
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    positions = torch.arange(15, 15 + rows, dtype=torch.int64, device="cuda")
+    offsets = (
+        torch.arange(rows + 1, dtype=torch.int32, device="cuda") if packed else None
+    )
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    workspace = torch.empty(
+        get_q_token_kv_block_sparse_workspace_size(
+            q,
+            k,
+            table,
+            block_topk=4,
+            group_size=group_size,
+            max_seq_len_kv=32,
+            out_dtype=out.dtype,
+            split_kv=split_kv,
+            qo_indptr=offsets,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        rows if packed else 1,
+        8,
+        1,
+        128,
+        4,
+        16,
+        4,
+        32,
+        device=q.device,
+        workspace_buffer=workspace,
+        group_size=group_size,
+        packed_query=packed,
+        split_kv=split_kv,
+        q_dtype=dtype,
+        out_dtype=out.dtype,
+        sm_scale=scales[0],
+        v_scale=scales[1],
+    )
+
+    def run(**kwargs):
+        wrapper.run(
+            q,
+            (k, v),
+            table,
+            blocks,
+            requests,
+            positions,
+            qo_indptr=offsets,
+            out=out,
+            **kwargs,
+        )
+
+    def check(sm_scale, output_scale):
+        for row in range(rows):
+            length = 16 + row
+            keys = k[:, 0].reshape(-1, 128)[:length].float()
+            vals = v[:, 0].reshape(-1, 128)[:length].float()
+            scores = q.reshape(rows, 8, 128)[row].float() @ keys.T
+            if dtype == torch.float8_e4m3fn:
+                # One tile: round P to E4M3 while retaining the FP32 denominator.
+                scale = torch.tensor(sm_scale * math.log2(math.e), device="cuda")
+                maximum = scores.amax(-1, keepdim=True)
+                bias = torch.addcmul(
+                    torch.full_like(maximum, math.log2(448.0)), maximum, -scale
+                )
+                probabilities = torch.addcmul(bias, scores, scale).exp2()
+                weights = probabilities.to(dtype).float() / probabilities.sum(
+                    -1, keepdim=True
+                )
+                expected = weights @ vals * output_scale
+                torch.testing.assert_close(
+                    out.reshape(rows, 8, 128)[row].float(),
+                    expected,
+                    atol=0.01,
+                    rtol=0.03,
+                )
+            else:
+                expected = (scores * sm_scale).softmax(-1) @ vals * output_scale
+                torch.testing.assert_close(
+                    out.reshape(rows, 8, 128)[row].float(),
+                    expected,
+                    atol=0.02,
+                    rtol=0.05,
+                )
+
+    return wrapper, run, check, offsets, out
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+def test_qtoken_global_scales_graph_replay():
+    scale = torch.tensor(0.125, device="cuda")
+    _, run, check, _, _ = _global_scale_qtoken_case(
+        (scale, 0.75),
+        group_size=4,
+        dtype=torch.float8_e4m3fn,
+    )
+    run()
+    check(0.125, 0.75)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    scale.fill_(0.1875)
+    graph.replay()
+    check(0.1875, 0.75)
+    run(sm_scale=torch.tensor([0.0625], device="cuda"))
+    check(0.0625, 0.75)
+    run()
+    check(0.1875, 0.75)
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize("updated_scale", (0, 1), ids=("qk", "v"))
+def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale):
+    from tests.utils.test_helpers.pdl import late_store
+
+    values = (0.125, 0.75)
+    scales = tuple(torch.tensor(value, device="cuda") for value in values)
+    wrapper, run, check, _, _ = _global_scale_qtoken_case(scales)
+    run()
+    check(*values)
+    assert wrapper._prepared_plan._attention_plan._direct_q1_inputs
+    assert wrapper._prepared_plan._attention_plan._compiled_reducer is None
+    scale = scales[updated_scale]
+    changed = list(values)
+    changed[updated_scale] *= 1.5
+    late_store(scale, changed[updated_scale])
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        late_store(scale, changed[updated_scale])
+        run()
+    for _ in range(2):
+        scale.fill_(changed[updated_scale] * 4)
+        graph.replay()
+        check(*changed)
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+def test_qtoken_direct_q1_pdl_query_offsets():
+    from tests.utils.test_helpers.pdl import late_store
+
+    wrapper, run, check, offsets, out = _global_scale_qtoken_case(
+        (0.125, 0.75),
+        packed=True,
+        split_kv=True,
+    )
+    run()
+    check(0.125, 0.75)
+    assert wrapper._prepared_plan._attention_plan._direct_q1_inputs
+    late_store(offsets[2:], 2)
+    torch.cuda.synchronize()
+
+    def produce_and_run():
+        late_store(offsets[2:], 2)
+        run()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        produce_and_run()
+    for execute in (produce_and_run, graph.replay):
+        # A stale offset makes the second route empty, so an early read prunes it.
+        offsets[2:].fill_(1)
+        out.fill_(torch.nan)
+        execute()
+        check(0.125, 0.75)

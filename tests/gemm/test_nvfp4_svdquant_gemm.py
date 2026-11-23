@@ -52,7 +52,7 @@ from flashinfer.gemm.svdquant_sm120_routes import (
 from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.testing.svdq_model_shapes import MODEL_SHAPE_CASES
 from flashinfer.utils import device_support_pdl, get_compute_capability
-from tests.test_helpers.pdl import late_store
+from tests.utils.test_helpers.pdl import late_store
 
 # Shared references and public operators across backends.
 

@@ -5464,7 +5464,7 @@ def _launch_ugpu(
                 parts=n,
             )
             return
-        main = torch.cuda.current_stream()
+        main = torch.cuda.current_stream(q.device)
         if path == "streams":
             streams, sm_counts = _ugpu_plain_streams(q.device.index, n), [num_sms] * n
         else:
@@ -5532,7 +5532,7 @@ def ugpu_ucache_buffers(
 
     device = torch.device(device) if device is not None else torch.device("cuda")
     if device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
+        device = torch.device("cuda", gdn_device_target(device).device_index)
     n = _locality_domains(device.index)
     if n < 2:
         raise RuntimeError(

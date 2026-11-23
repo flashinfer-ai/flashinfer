@@ -61,6 +61,21 @@ BF16 x FP4 GEMM (W4A16)
     prepare_bf16_fp4_weights
     mm_bf16_fp4
 
+Gathered-row BF16 x FP4 GEMV (W4A16, SM120/121)
+-----------------------------------------------
+
+Per-token GEMV over NVFP4 rows picked by ``row_ids``, each result written to
+``out[m, out_col_offset + row_ids[m, j]]``; columns no slot names are left
+untouched.  Rows are row-major packed E2M1 with linear (unswizzled) E4M3 block
+scales, so any row can be read on its own.  Built for sparse speculative-decoding
+LM heads, where each draft token computes exact logits for a few thousand
+vocabulary rows chosen by ``flashinfer.top_k``.
+
+.. autosummary::
+    :toctree: ../generated
+
+    gemv_bf16_fp4_gather
+
 MXFP8 GEMM
 ----------
 
@@ -69,6 +84,14 @@ MXFP8 GEMM
 
     mm_mxfp8
     bmm_mxfp8
+
+MXFP8 x MXFP4 GEMM (MXFP4 weight, MXFP8 activation)
+----------------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_mxfp8_mxfp4
 
 FP8 GEMM
 --------
@@ -85,6 +108,17 @@ FP8 GEMM
     group_deepgemm_fp8_nt_groupwise
     batch_deepgemm_fp8_nt_groupwise
     fp8_blockscale_gemm_sm90
+
+16-bit x FP8 GEMM (FP8 weight, bf16 / fp16 activation)
+-------------------------------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_bf16_fp8
+    mm_bf16_fp8_workspace_bytes
+    mm_fp16_fp8
+    mm_fp16_fp8_workspace_bytes
 
 Low-latency TRT-LLM FP8 GEMM weight prep (also exported from ``flashinfer``):
 

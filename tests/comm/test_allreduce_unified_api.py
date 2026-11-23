@@ -23,7 +23,7 @@ from flashinfer.norm import rmsnorm
 from flashinfer.utils import is_confidential_compute
 
 # Test helpers
-from tests.test_helpers.comm import (
+from tests.comm.test_helpers.comm import (
     init_torch_distributed_from_mpi,
     cleanup_torch_distributed,
 )

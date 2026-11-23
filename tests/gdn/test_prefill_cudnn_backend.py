@@ -44,7 +44,7 @@ import torch.nn.functional as F
 
 from flashinfer.cudnn import cudnn_chunk_gated_delta_rule
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
-from tests.test_helpers.cudnn_linear_attention import (
+from tests.gdn.test_helpers.cudnn_linear_attention import (
     HEAD_DIM,
     assert_rel_close,
     assert_state_orientation,
@@ -588,10 +588,6 @@ def test_cudnn_backend_replays_under_cuda_graph_capture():
 @pytest.mark.parametrize("in_place", [False, True])
 @pytest.mark.parametrize("padding", [0, 96])
 def test_cudnn_backend_state_pool(state_dtype, in_place, padding):
-    import cudnn
-
-    if tuple(map(int, cudnn.__version__.split(".")[:2])) < (1, 31):
-        pytest.skip("state pools require cuDNN frontend 1.31+")
     heads = 8
     inputs = _make_inputs([65, 0, 127], heads, heads, heads, seed=3)
     row_size = heads * HEAD_DIM * HEAD_DIM
@@ -635,10 +631,6 @@ def test_cudnn_backend_state_pool(state_dtype, in_place, padding):
 
 
 def test_cudnn_state_pool_capture_rebinds_slots_without_host_sync():
-    import cudnn
-
-    if tuple(map(int, cudnn.__version__.split(".")[:2])) < (1, 31):
-        pytest.skip("state pools require cuDNN frontend 1.31+")
     inputs = _make_inputs([65, 127], 8, 8, 8, seed=19)
     pool = torch.randn(6, 8, HEAD_DIM, HEAD_DIM, device="cuda") * 0.01
     destination = torch.full_like(pool, 17)

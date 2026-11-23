@@ -14,7 +14,8 @@ generated Lean cases are the nominal parts' dispatch) and a few shape constants 
 the transaction efficiency of a row-major weight's narrow boxes, the multicast benefit, the shared-L2 fraction, the
 usable L2 fraction of the HBM traffic model, per-step and fixup floors, raster / swizzle / 2-CTA adjustments). Every
 constant is empirical and shared by all parts and formats; none is fitted per part. The format enters through its
-structure only: element width, MMA K step and the 8-bit kind's doubled instruction rate.
+structure only: the element width of each operand (the mixed classes stream a 4-bit weight against 8-bit activations;
+every traffic term counts an operand at its own width), MMA K step and the 8-bit kind's doubled instruction rate.
 """
 
 from __future__ import annotations
@@ -22,10 +23,17 @@ from __future__ import annotations
 import functools
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .generator import Knobs, enumerate_space
-from .spec import ELEM_BITS_OF, MMA_K_OF, MMA_RATE_OF
+from .spec import (
+    A_ELEM_BITS_OF,
+    B_ELEM_BITS_OF,
+    BLOCK_K,
+    FP8_BLOCKSCALE_FMTS,
+    MMA_K_OF,
+    MMA_RATE_OF,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +121,7 @@ def register_capacity(family: str, sm_count: int, size: int, clusters: int) -> N
     if cap.get(size) == clusters:
         return  # nothing the ranking depends on changed: the cached rankings stay
     cap[size] = clusters
-    rank.cache_clear()
+    clear_rank_cache()
 
 
 # the L2 sizes devices reported at run time, keyed like the capacities
@@ -136,7 +144,7 @@ def register_l2(family: str, sm_count: int, l2_bytes: float) -> None:
     if _QUERIED_L2.get((family, sm_count)) == float(l2_bytes):
         return  # unchanged: the cached rankings stay
     _QUERIED_L2[(family, sm_count)] = float(l2_bytes)
-    rank.cache_clear()
+    clear_rank_cache()
 
 
 # ----------------------------------------------------------------------------- the estimate
@@ -154,6 +162,7 @@ CONSTANTS: Dict[str, float] = dict(
     absorb=0.2,  # the fraction of the body's time during which refetched bytes stream without a stall
     step_floor=32.0,  # cycles per k-step no tile can beat
     fixup_floor=8000.0,  # cycles of the workspace split's fixup launch
+    fold_rate=10.0,  # bytes per cycle at which the in-cluster fold takes a partner CTA's fp32 partial tile through distributed shared memory, its barrier included
     raster_pow=0.05,  # the wrong raster: (tile-count imbalance) ** raster_pow
     raster_min=2.0,  # ... once the tile-count imbalance reaches this ratio
     overrun_pow=0.65,  # a swizzle group larger than its axis: (swizzle / tiles) ** overrun_pow
@@ -161,17 +170,28 @@ CONSTANTS: Dict[str, float] = dict(
     sw_gain=1.0,  # swizzle > 1 with many tiles in flight on both axes
     sw_partial=1.1,  # a swizzle that does not divide its axis (a partial last group)
     two_cta=0.9,  # the 2-CTA pair's shared B and halved per-CTA issue
+    promote_bytes_per_clk=256.0,  # the block-scale class's promotion pass: the CTA tile's fp32 partial through the promotion warps' TMEM
+    # loads and packed fmas, per block
+    promote_handoff_clk=256.0,  # the block-scale class's per-block hand-off: the dependent chain of the accumulator stage's mbarrier wake-up, the
+    # TMEM load round trip and the release the MMA warp observes; nominally two round trips of 128 cycles
+    promote_pair_clk=16.0,  # the 2-CTA pair's hand-off waits for the peer CTA's release across the cluster: the remote arrive's extra latency
 )
 
 DECODE_M = 64  # up to this many rows the candidates are the `decode_sane` subset
+TOKEN_BOX_ROWS = 128  # the rows of the token (A) TMA box: the CTA tile's M
 
 
-def decode_sane(k: Knobs, M: int, swapped: bool = False) -> bool:
+def decode_sane(
+    k: Knobs, M: int, swapped: bool = False, narrow_tiles: bool = False
+) -> bool:
     """The candidate guard at M <= DECODE_M (structural): 1-CTA tiles of N >= 32 in an N-cluster at swizzle 1; where the
     space has swapped decode records (``swapped``: the block-scaled classes), those records at swizzle 1 -- the narrow
     token tiles on the 1-CTA instruction, the 64-wide one on the 2-CTA pair once the tokens fill at least half of it --
-    and no dense record (one token tile holds every token, the weights stream through the 128-row operand). Records
-    outside the guard stay members of the space (the autotuner may still reach them)."""
+    and no dense record (one token tile holds every token, the weights stream through the 128-row operand). The dense
+    guard leaves out the 16-wide tile because its 16-byte B box wastes the TMA's transactions; ``narrow_tiles`` admits it
+    for the block-scale class, whose decode block is bounded by the per-block accumulator hand-off (`estimate_cycles`),
+    not by the box, so the narrowest tile that still fits the part in one wave streams the weight through the most CTAs.
+    Records outside the guard stay members of the space (the autotuner may still reach them)."""
     if M > DECODE_M:
         return True
     if swapped:
@@ -182,7 +202,7 @@ def decode_sane(k: Knobs, M: int, swapped: bool = False) -> bool:
         )
     return (
         (not k.use_2cta_instrs)
-        and k.tile_n >= 32
+        and k.tile_n >= (16 if narrow_tiles else 32)
         and k.cluster_m == 1
         and k.swizzle_size == 1
     )
@@ -203,6 +223,7 @@ def hbm_traffic(
     sw: int,
     rast: str,
     l2: float,
+    ea: Optional[float] = None,
 ) -> float:
     """HBM bytes of the launch under the persistent scheduler's tile order: raster along m walks M within a band of ``sw``
     cluster tiles along N (along n: mirrored), ``cap`` clusters per wave, ``items`` work items (the workspace split) each
@@ -210,12 +231,14 @@ def hbm_traffic(
     across waves a band's panels stay resident when they fit in ``l2`` beside one wave's share of the other operand, else
     they are fetched again every wave of the band, and the other operand is fetched once when the whole of it fits beside
     one band, else once per band (never more than once per wave). ``l2`` is the usable L2 in bytes; the cluster tile is
-    ``cl_rows`` x ``cl_cols`` and the grid ``ncl_m`` x ``ncl_n`` cluster tiles."""
+    ``cl_rows`` x ``cl_cols`` and the grid ``ncl_m`` x ``ncl_n`` cluster tiles. ``eb`` is the B operand's element width in
+    bytes and ``ea`` the A operand's (the same when not given: the one-format classes)."""
+    ea = eb if ea is None else ea
     kk = K / items
-    a_panel = cl_rows * kk * eb
+    a_panel = cl_rows * kk * ea
     b_panel = cl_cols * kk * eb
     a_all = (
-        M * kk * eb
+        M * kk * ea
     )  # the operands themselves (out-of-bounds boxes cost no HBM traffic)
     b_all = N * kk * eb
     waves_total = max(1, -(-(ncl_m * ncl_n) // cap))
@@ -272,7 +295,10 @@ def estimate_cycles(
     cm, cn = k.cluster_shape_mn
     group = 2 if k.use_2cta_instrs else 1
     rows = tm // group
-    eb = ELEM_BITS_OF[in_fmt] / 8.0
+    # the kernel-side operands' widths in bytes: the swapped decode record computes C^T with the weight as the kernel's A
+    ea, eb = A_ELEM_BITS_OF[in_fmt] / 8.0, B_ELEM_BITS_OF[in_fmt] / 8.0
+    if k.swap_ab:
+        ea, eb = eb, ea
     kk = MMA_K_OF[in_fmt]
     rate = (
         part.mma_flop_per_clk * MMA_RATE_OF[in_fmt]
@@ -291,7 +317,9 @@ def estimate_cycles(
     pad_m = -(-ctas_m // cm) * cm
     pad_n = -(-n_tiles // cn) * cn
     clusters = pad_m * pad_n // (cm * cn) * items
-    size = cm * cn
+    # the in-cluster split record puts its `cluster_k` chunk CTAs in one cluster per tile: the cluster the hardware
+    # co-schedules is that many times the (M, N) cluster, and every CTA of it streams its own K slice
+    size = cm * cn * k.cluster_k
     capacity = cap.get(size) or max(1, sms // size)
     waves = -(-clusters // capacity)
     ksteps = max(1.0, (K / (chunks if (ws or k.cluster_k > 1) else 1)) / kk)
@@ -313,13 +341,35 @@ def estimate_cycles(
     )
     if k.swap_ab:
         b_eff = 1.0  # the swapped record's narrow tile is the token tile, one per CTA for the whole K: no such cost is measured for it
-    a_bytes = rows * kk * eb / (cn ** p["mcast_pow"])
+    a_bytes = rows * kk * ea / (cn ** p["mcast_pow"])
     b_bytes = tn * kk * eb / (cm ** p["mcast_pow"]) / b_eff
     step = (
         max(mma_cycles, (a_bytes + b_bytes) / part.load_bytes_per_clk) + p["step_floor"]
     )
+    if in_fmt in FP8_BLOCKSCALE_FMTS:
+        # the block-scale class promotes every accumulator element of the CTA tile once per K block (two promotion warpgroups:
+        # a TMEM read and a packed fma per element pair) and ends every block in an accumulator hand-off: the promotion warps
+        # wait for the stage, load it, fold, fence and release it before the MMA warp may reuse it. The pass is one more
+        # per-k-step term next to the MMA and the operand traffic: a fixed hand-off chain (its latency does not shrink with
+        # the tile, so at decode every tile of one wave costs the same per block and the narrowest one-wave tile wins) plus
+        # the tile's bytes at the pass rate. In the 2-CTA pair the stage is released by both CTAs' promotion warps and the
+        # leader's MMA waits for the peer's arrive across the cluster, so the pair's chain is longer by that remote arrive.
+        handoff = p["promote_handoff_clk"] + (
+            p["promote_pair_clk"] if k.use_2cta_instrs else 0.0
+        )
+        promote = (handoff + rows * tn * 4.0 / p["promote_bytes_per_clk"]) / (
+            BLOCK_K // kk
+        )
+        step = (
+            max(
+                mma_cycles,
+                (a_bytes + b_bytes) / part.load_bytes_per_clk,
+                promote,
+            )
+            + p["step_floor"]
+        )
     body = waves * ksteps * step
-    active = ctas_m * n_tiles * items
+    active = ctas_m * n_tiles * items * k.cluster_k
     l2_total = (
         active
         * ksteps
@@ -328,6 +378,9 @@ def estimate_cycles(
     )
     body = max(body, l2_total)
     epi = waves * rows * tn * (4.0 if ws else out_bytes) / part.load_bytes_per_clk
+    if k.cluster_k > 1:
+        # the in-cluster fold: the owning CTA of every tile reads the other chunks' fp32 partial tiles from its partners
+        epi += waves * (k.cluster_k - 1) * rows * tn * 4.0 / p["fold_rate"]
     fix = (
         (M * N * (chunks * 4.0 + out_bytes)) / (part.hbm_bytes_per_clk * sms)
         + p["fixup_floor"]
@@ -349,8 +402,9 @@ def estimate_cycles(
         k.swizzle_size,
         k.raster_along,
         p["l2_resident"] * l2_for(family, sms, nominal),
+        ea,
     )
-    unique = (pm * K + K * pn) * eb + pm * pn * out_bytes
+    unique = (pm * K * ea + K * pn * eb) + pm * pn * out_bytes
     bw = part.hbm_bytes_per_clk * sms
     # the operands' own bytes bound the launch from below (overlapped with the body). The bytes the tile order fetches
     # again are hidden while the HBM is lightly loaded: a fraction `absorb` of the body's time streams them at no cost
@@ -384,7 +438,9 @@ def estimate_cycles(
             )
             if axis % sw:
                 t *= p["sw_partial"]
-    if k.use_2cta_instrs:
+    if k.use_2cta_instrs and in_fmt not in FP8_BLOCKSCALE_FMTS:
+        # the pair's halved per-CTA issue; not for the block-scale class, whose pair runs its promotion in lockstep (the
+        # accumulator hand-off above is pair-wide: the block cannot be shorter than either CTA's promotion pass)
         t *= p["two_cta"]
     return t
 
@@ -411,7 +467,21 @@ def rank(
     fam = family or "sm_107"
     space = enumerate_space(M, N, K, chunks=chunks, b_major=b_major, in_fmt=in_fmt)
     swapped = any(k.swap_ab for k in space)
-    guarded = [k for k in space if decode_sane(k, M, swapped)]
+    blockscale = in_fmt in FP8_BLOCKSCALE_FMTS
+    guarded = [k for k in space if decode_sane(k, M, swapped, blockscale)]
+    if blockscale and M <= TOKEN_BOX_ROWS // 4:
+        # the block-scale class at a few tokens: the 128-row token box is at least three quarters zero-fill, a TMA cost per
+        # block per CTA that the N-cluster's multicast issues once per cluster; the widest N-cluster shares it most, as long
+        # as its clusters still fit the part in one wave (the estimate's wave count would otherwise double)
+        cap4 = capacity_for(fam, sm_count, nominal).get(4) or max(
+            1, (sm_count or PART_TABLE[fam].sm_count) // 4
+        )
+        wide = [
+            k
+            for k in guarded
+            if k.cluster_n == 4 and ((N + k.tile_n - 1) // k.tile_n + 3) // 4 <= cap4
+        ]
+        guarded = wide or guarded
     space = guarded or space
     if not space:
         return ()
@@ -438,6 +508,27 @@ def rank(
     scored.sort(key=lambda t: (t[0], t[1]))
     out = tuple((k, float(t)) for t, _, k in scored)
     return out[:topk] if topk else out
+
+
+# the memos built on a ranking (`schedule.default_config`'s pick, `schedule.rank_topk`'s list) are cleared with it, so a
+# device's registered numbers invalidate them the way they invalidate the rankings
+_RANK_DEPENDENT_CACHES: List[Callable[[], None]] = []
+_rank_cache_clear = rank.cache_clear
+
+
+def clear_rank_cache() -> None:
+    """Forget every cached ranking and every memo built on one."""
+    _rank_cache_clear()
+    for clear in _RANK_DEPENDENT_CACHES:
+        clear()
+
+
+def on_rank_cache_clear(clear: Callable[[], None]) -> None:
+    """Register a memo's ``cache_clear`` to run whenever the rankings are forgotten (``rank.cache_clear()`` included)."""
+    _RANK_DEPENDENT_CACHES.append(clear)
+
+
+rank.cache_clear = clear_rank_cache  # type: ignore[method-assign]
 
 
 def best_record(

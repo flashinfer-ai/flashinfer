@@ -42,6 +42,49 @@ if not hasattr(cute.nvgpu, "OperandMajorMode"):
         cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
 
 
+def _primitives():
+    """``cutlass.experimental.primitives``, imported when a kernel first needs it.
+
+    The namespace exists from CuTe DSL 4.7; importing it here instead of at
+    module scope keeps ``flashinfer.cute_dsl`` importable on an older DSL.
+    """
+    try:
+        import cutlass.experimental.primitives as prims
+    except ImportError as e:
+        raise RuntimeError(
+            "mbarrier_wait_acquire_cluster needs CuTe DSL 4.7 or newer"
+        ) from e
+    return prims
+
+
+def _try_wait_parity_relaxed_cluster(mbar_ptr, phase):
+    prims = _primitives()
+    return prims.mbarrier_try_wait_parity(
+        mbar_ptr,
+        phase,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
+    )
+
+
+def _fence_acquire_sync_restrict():
+    prims = _primitives()
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
+
+
+@cute.jit
+def mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None:
+    """Wait at cluster scope on a barrier that a peer CTA's ``st.async`` completes.
+
+    A relaxed cluster-scope wait followed by an acquire fence restricted to
+    ``shared::cluster``: the acquire pattern of the PTX memory model without the
+    L1 invalidation an ``.acquire.cluster`` wait would cost.
+    """
+    while not _try_wait_parity_relaxed_cluster(mbar_ptr, phase):
+        pass
+    _fence_acquire_sync_restrict()
+
+
 def ceil_div(a: int, b: int) -> int:
     """Ceiling division."""
     return (a + b - 1) // b

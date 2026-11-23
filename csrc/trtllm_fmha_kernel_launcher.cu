@@ -359,20 +359,27 @@ void trtllm_paged_attention_launcher(
           is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
     }
     runner_params.mKernelType = FmhaKernelType::Context;
-    runner_params.mTileScheduler = TileScheduler::Persistent;
+    // On SM103 the persistent paged-context kernels can deadlock when one CTA processes more than
+    // one tile (grid > #SMs): compute-sanitizer synccheck reports "Missing wait" on the softmax
+    // warpgroup barriers at tile transitions, and serving workloads hang in this kernel. The
+    // static scheduler (one tile per CTA) selects the matching *StaticContext kernel, gives
+    // bit-identical outputs and has no measurable cost on real prefill batches. See #9700.
+    runner_params.mTileScheduler =
+        fmha_runner->smVersion() == kSM_103 ? TileScheduler::Static : TileScheduler::Persistent;
     runner_params.mMultiCtasKvMode = false;
 
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
 
-    // With two query tokens and small KV, context schedules one CTA per query head.
+    // With a few query tokens and small KV, context schedules one CTA per query head.
     // Grouping query tokens and heads in the generation kernel avoids those mostly
-    // empty tiles. Keep this choice within the measured SM103 BF16 shape and retain
-    // the context workspace contract (no split-KV scratch or counters are needed).
+    // empty tiles. Retain the context workspace contract (no split-KV scratch or
+    // counters are needed) and keep all query rows together in the initial tile.
     bool const use_tiny_gqa_generation =
-        fmha_runner->smVersion() == kSM_103 && q_data_type == DATA_TYPE_BF16 &&
-        kv_data_type == DATA_TYPE_BF16 && o_data_type == DATA_TYPE_BF16 && batch_size >= 4 &&
-        batch_size <= 256 && max_q_len == 2 && sum_seq_q == 2 * batch_size && max_kv_len >= 1 &&
+        fmha_runner->smVersion() == kSM_103 && q_data_type == kv_data_type &&
+        (q_data_type == DATA_TYPE_BF16 || q_data_type == DATA_TYPE_E4M3) &&
+        o_data_type == DATA_TYPE_BF16 && batch_size >= 4 && batch_size <= 256 && max_q_len >= 1 &&
+        max_q_len <= 3 && sum_seq_q == max_q_len * batch_size && max_kv_len >= 1 &&
         max_kv_len <= 32 && num_qo_heads == 16 && num_kv_heads == 1 && head_dim_qk == 128 &&
         head_dim_vo == 128 && page_size == 128 && q_stride_tokens == 16 * 128 &&
         q_stride_heads == 128 && kv_stride_keys_values == 128 && kv_stride_heads == 128 * 128 &&
@@ -384,7 +391,10 @@ void trtllm_paged_attention_launcher(
         !use_fp16_softmax && !uses_spcompress;
     if (use_tiny_gqa_generation) {
       runner_params.mKernelType = FmhaKernelType::Generation;
-      // Keep both query rows in one CTA, including a fully masked leading row.
+      // Keep the persistent scheduling this path was tuned with (#8736); the SM103 Static
+      // override above only targets the paged context kernels (#9700).
+      runner_params.mTileScheduler = TileScheduler::Persistent;
+      // Keep all query rows in one CTA, including fully masked leading rows.
       runner_params.mKeepGqaGenerationQueryTile = true;
       runner_params.cumSeqLensKvPtr = nullptr;
     }
