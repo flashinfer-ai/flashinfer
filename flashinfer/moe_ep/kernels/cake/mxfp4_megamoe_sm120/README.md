@@ -74,7 +74,8 @@ instantiation does not compile.
 **Return codec capacity.** Expert results return as 64-value BF16 blocks coded to 96 bytes
 (lossless delta code: sign, 4-bit exponent delta from the block maximum, 7-bit mantissa) or kept
 raw (128 bytes) in an overflow area behind each return chunk.  A block stays coded when its nonzero
-exponents span at most 14 binades; delta 15 codes an exponent field of 0 (+-0 and BF16 subnormals),
+exponents span at most 14 binades; an exponent field of 0 (+-0 and BF16 subnormals) is stored as the
+delta `min(block maximum exponent field, 15)`, which decodes back to exponent field 0,
 so exact zeros in an expert result (zeroed weight channels, very sparse intermediates) do not force a
 block raw.
 The area holds `rows x MOE_CODEC_OVF_BLOCKS` raw blocks; a chunk that needs more sets the
@@ -95,8 +96,9 @@ an expert result travels as a 2-byte header holding the BF16 scale `s = max(bf16
 nearest).  A row is `hidden_size * 66 / 64` bytes (5280 B at hidden 5120, against 7840 B coded
 plus overflow for the lossless codec); there is no overflow area, so `MOE_CODEC_OVF_BLOCKS`
 does not apply and the codec has no overflow failure mode.  The combine adds `q * s` (exact in
-FP32) in the same slot order as the lossless path, so the output differs from it only by the
-per-value coding error, at most `s / 2`.  The return wire carries about 33 % fewer bytes and the
+FP32) in the same slot order as the lossless path.  Each decoded contribution differs from its BF16
+value by at most `s / 2`; the sum over the slots and the final rounding to BF16 add their own error
+on top (one BF16 rounding step of the output, as on the lossless path).  The return wire carries about 33 % fewer bytes and the
 result windows shrink accordingly.
 
 **Wait deadline.** Every device-side wait of the kernel that can depend on another rank (GIN
