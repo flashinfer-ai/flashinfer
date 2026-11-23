@@ -259,7 +259,13 @@ class BatchInvariantFp4Runner(MoERunner):
         pair.check_shape(
             None, experts.intermediate_size, routing.num_experts, routing.top_k, a.gated
         )
-        self._method, self._grouped_other = routing_term(routing, cls)
+        # a routing term the from-logits mode has no class for (Llama4 beyond top-1, a group shape outside the rule) is
+        # refused at a from-logits call, not here: the pre-routed modes never consult it (the bf16 runner's rule)
+        self._logits_refusal: Optional[BatchInvariantUnsupportedError] = None
+        try:
+            self._method, self._grouped_other = routing_term(routing, cls)
+        except BatchInvariantUnsupportedError as e:
+            self._method, self._grouped_other, self._logits_refusal = None, False, e
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 cls,
@@ -477,6 +483,10 @@ class BatchInvariantFp4Runner(MoERunner):
                     "the groups with DeepSeekV3, or pre-routed ids",
                 )
             if self._method is None:
+                # the refusal deferred at construction (the pre-routed modes never consulted it), else no term
+                refusal = getattr(self, "_logits_refusal", None)
+                if refusal is not None:
+                    raise refusal
                 raise unsupported(
                     cls,
                     f"routing method {cfg.routing.method!r} from logits",

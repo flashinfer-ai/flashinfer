@@ -3212,6 +3212,44 @@ def test_misaligned_inputs_are_refused_with_the_alignment_named(pair):
 
 @needs_device
 @each_pair
+def test_prerouted_layer_builds_under_a_routing_term_the_logits_mode_refuses(pair):
+    """Llama4 with ``top_k = 4`` (the from-logits method is the top-1 rule) and a DeepSeekV3 group shape outside the rule
+    build on the fp4 backend as on the bf16 one: the pre-routed modes never consult the term, so both pre-routed forms give
+    the Renormalize-configured layer's bits on the same ids and bf16 weights, and the from-logits call raises the mode's error
+    naming the term."""
+    from flashinfer.batch_invariant import BatchInvariantUnsupportedError
+
+    T, k, H, I, E = 24, 4, 256, 128, 16
+    quant = _QUANT[pair]
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=9)
+    W = _weights(w1, w2, quant=quant)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wb = ids.cuda(), weights.cuda().to(torch.bfloat16)
+    ref = bits(_layer(k, E, I, quant=quant)(_routed_pack(x, ids, wb), W))
+    for method, kw, what in (
+        (RoutingMethodType.Llama4, {}, "top_k"),
+        (RoutingMethodType.DeepSeekV3, dict(n_group=3, topk_group=2), "n_group"),
+    ):
+        layer = MoELayer(
+            MoEConfig(
+                routing=RoutingConfig(num_experts=E, top_k=k, method=method, **kw),
+                quant=quant,
+                experts=ExpertConfig(intermediate_size=I),
+                backend=BackendOptions((BatchInvariantFp4Config(),)),
+                execution=ExecutionConfig(enable_pdl=False),
+            ),
+            device=torch.device("cuda"),
+        )
+        for packed in (False, True):
+            out = layer(_routed_pack(x, ids, wb, packed=packed), W)
+            assert torch.equal(bits(out), ref), (method, packed)
+        with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
+            layer(_logits_pack(x, logits), W)
+        assert what in str(excinfo.value) and pair.cls in str(excinfo.value)
+
+
+@needs_device
+@each_pair
 def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
     """A pre-routed expert id outside ``[0, E)`` (``-1``, ``E``, ``2^30``: a framework's dropped slot) is dropped by the op as
     by the bf16 one: the plan does not count it (``dest -1``, ``dest_pad -1``, ``pos_pad -1`` past the live rows), the scatter,
