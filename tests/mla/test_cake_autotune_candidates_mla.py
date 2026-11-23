@@ -5252,3 +5252,163 @@ def test_unoffered_calls_build_no_cake_runner(monkeypatch, clean_tuner):
         _decode(case)
     assert reasons and results
     assert len(core._CAKE_MLA_AUTO_MEMO) == 1
+
+
+# --- The FP8 page-64 head reducer through the memoized second stage ---
+
+# (FP8 page-64 query rows, max_seq_len) of the resolved-launch check: at one and
+# two query rows the head build of the split reducer serves B200 and GB300.
+_FP8_HEAD_LAUNCHES = ((1, 4096), (1, 32768), (2, 4096), (2, 32768))
+
+
+@pytest.mark.parametrize("bmm2_scale", [1.0, 0.5])
+@pytest.mark.parametrize("q_len", [1, 2])
+@pytest.mark.parametrize("facts", [("sm_100a", 148), ("sm_103a", 152)])
+def test_resolved_fp8_head_launch_matches_the_dispatcher(
+    monkeypatch, facts, q_len, bmm2_scale
+):
+    """At one and two FP8 page-64 query rows the launch the second stage
+    resolves once (``_launch_plan``) makes the same family call with the same
+    arguments as the stateless dispatcher, on both simulated devices; its split
+    count is ``plan_num_split``'s and its reducer CTA count
+    ``plan_fp8_reduce_ctas``'s, the head build's where ``fp8_head_reduce``
+    takes it. Nothing is built or launched; any CUDA device."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    arch, num_sms = facts
+    monkeypatch.setattr(cake_module, "_device_facts", lambda index: facts)
+    runs = _record_runs(monkeypatch)
+    device = torch.device("cuda", torch.cuda.current_device())
+    lut = cake_module._fp8_lut(device)
+    dtype, page_size = torch.float8_e4m3fn, 64
+    checked = heads = 0
+    for rows, max_seq_len in _FP8_HEAD_LAUNCHES:
+        if rows % q_len:
+            continue
+        batch_size = rows // q_len
+        width = -(-max_seq_len // page_size)
+        query = torch.empty(
+            batch_size, q_len, NUM_HEADS, QK_DIM, dtype=dtype, device=device
+        )
+        # Every page-table entry names page 0: a small pool suffices.
+        kv_cache = torch.empty(4, page_size, QK_DIM, dtype=dtype, device=device)
+        block_tables = torch.zeros(batch_size, width, dtype=torch.int32, device=device)
+        seq_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+        out = torch.empty(
+            batch_size, q_len, NUM_HEADS, LATENT, dtype=torch.bfloat16, device=device
+        )
+        inputs = [query, block_tables, seq_lens, out]
+        runner = _cpu_runner(
+            dtype,
+            page_size,
+            max_seq_len,
+            kv_cache=kv_cache,
+            bmm1_scale=1.0 / (192**0.5),
+            bmm2_scale=bmm2_scale,
+            sinks=None,
+        )
+        label = (facts, rows, q_len, max_seq_len, bmm2_scale)
+        domain = runner._domain(inputs, num_sms, arch=arch)
+        assert domain == cake_module.DOMAIN_FP8_PAGE64, label
+        plan = runner._launch_plan(inputs)
+        assert plan is not None, label
+        roles = {
+            query.data_ptr(): "query",
+            kv_cache.data_ptr(): "kv_cache",
+            block_tables.data_ptr(): "block_tables",
+            seq_lens.data_ptr(): "seq_lens",
+            out.data_ptr(): "out",
+            lut.data_ptr(): "fp8_table",
+        }
+        runs.clear()
+        runner._plan = plan
+        assert runner.forward(inputs) is out
+        resolved = _normalized_runs(runs, roles)
+        runs.clear()
+        runner._plan = None
+        runner.forward(inputs)
+        dispatched = _normalized_runs(runs, roles)
+        assert resolved == dispatched, label
+        [(name, values)] = resolved
+        assert name == cake_module.launch_family(domain, arch, num_sms, rows), label
+        # The scalars end with (num_split, work items, table width, reducer
+        # CTAs, q_len) and the stream.
+        num_split, reduce_ctas = values[-6], values[-3]
+        assert values[-5] == rows and values[-2] == q_len, label
+        assert num_split == cake_module.plan_num_split(rows, max_seq_len, num_sms)
+        assert reduce_ctas == cake_module.plan_fp8_reduce_ctas(
+            rows, num_split, num_sms, arch
+        ), label
+        head = cake_module.fp8_head_reduce(rows, num_split, reduce_ctas, arch)
+        if head:
+            assert reduce_ctas == min(128, num_sms // rows), label
+        assert head == (rows <= cake_module._FP8_HEAD_REDUCE_MAX_ROWS[arch]), label
+        checked += 1
+        heads += head
+    assert checked >= 2
+    if cake_module._FP8_HEAD_REDUCE_MAX_ROWS[arch] >= 2:
+        assert heads == checked
+
+
+# name: (FP8 page-64 query rows, max_seq_len)
+_FP8_HEAD_GEOMETRIES = {
+    "fp8_p64_rows1_kv4096": (1, 4096),
+    "fp8_p64_rows2_kv4096": (2, 4096),
+    "fp8_p64_rows2_kv32768": (2, 32768),
+}
+
+
+@pytest.mark.parametrize("q_len", [1, 2])
+@pytest.mark.parametrize("geometry", sorted(_FP8_HEAD_GEOMETRIES))
+def test_memoized_fp8_head_call_matches_explicit_cake_bitwise(
+    monkeypatch, clean_tuner, geometry, q_len
+):
+    """At one and two FP8 page-64 query rows a repeated call reuses the
+    memoized decision and its resolved launch, whose reducer CTA count is
+    ``plan_fp8_reduce_ctas``'s (the head build's where the device's rule takes
+    it); its output equals, bit for bit, the first call's, explicit
+    ``backend="cake"`` on the same values and the stateless dispatcher, with a
+    padded request where the call has two."""
+    _require_cake_arch()
+    rows, max_seq_len = _FP8_HEAD_GEOMETRIES[geometry]
+    if rows % q_len:
+        pytest.skip("the row count is not a multiple of q_len")
+    arch, num_sms = cake_module._device_facts(torch.cuda.current_device())
+    batch_size = rows // q_len
+    case = _make_case(
+        dtype=torch.float8_e4m3fn,
+        batch_size=batch_size,
+        q_len=q_len,
+        page_size=64,
+        max_seq_len=max_seq_len,
+    )
+    if batch_size >= 2:
+        _pad(case["seq_lens"], q_len)
+    selected = _force_cake(monkeypatch, case)
+    launches = _spy_cake_forward(monkeypatch)
+    results = _spy_stage_two(monkeypatch)
+    first = _decode(dict(case, out=_nan_out(case)))
+    looked_up = len(selected)
+    second = _decode(dict(case, out=_nan_out(case)))
+    third = _decode(dict(case, out=_nan_out(case)))
+    assert len(selected) == looked_up == 1
+    assert [_name(runner) for runner, _ in results] == ["cake"]
+    assert len(launches) == 3 and all(runner._plan is not None for runner in launches)
+    launch = launches[-1]._plan[0]
+    num_split = cake_module.plan_num_split(rows, max_seq_len, num_sms)
+    assert launch.scratch == (rows, num_split)
+    reduce_ctas = launch.args[5]
+    assert reduce_ctas == cake_module.plan_fp8_reduce_ctas(
+        rows, num_split, num_sms, arch
+    )
+    head_ctas = min(128, num_sms // rows)
+    if cake_module.fp8_head_reduce(rows, num_split, head_ctas, arch):
+        assert reduce_ctas == head_ctas
+    explicit = _explicit_cake(case, case["seq_lens"], case["block_tables"])
+    stateless = _stateless_cake(case)
+    torch.cuda.synchronize()
+    for label, output in (("second", second), ("third", third)):
+        assert torch.equal(output, first), label
+    assert torch.equal(first, explicit)
+    assert torch.equal(first, stateless)
+    _assert_live_and_padded(first, case, f"{geometry} q_len{q_len} memoized")
