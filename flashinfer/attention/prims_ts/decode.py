@@ -3526,6 +3526,7 @@ def suggest_q_token_kv_block_sparse_group_size(
     nvfp4_kv: bool = False,
     seq_len_kv: Optional[int] = None,
     packed_query: bool = False,
+    nvfp4_interleaved_kv: bool = False,
 ) -> int:
     """Suggest a QToken-KvBlock-Sparse-Attention group (G1-G8, G16 or G32).
 
@@ -3603,6 +3604,11 @@ def suggest_q_token_kv_block_sparse_group_size(
         are suggested only for NVFP4 K/V when True and ``kv_block_size`` is at
         most 16; ``plan`` rejects them for fixed-shape queries. Default False
         (G1-G8).
+    nvfp4_interleaved_kv : bool
+        Whether the NVFP4 K/V cache stores interleaved rows (payload and
+        scales in one row, ``kv_scale_factors=None`` at run) rather than
+        separate scale tensors; the two layouts have separate latency
+        constants. Default False. Used with ``nvfp4_kv=True`` only.
 
     Returns
     -------
@@ -3632,6 +3638,8 @@ def suggest_q_token_kv_block_sparse_group_size(
         raise TypeError("split_kv must be a bool")
     if not isinstance(packed_query, bool):
         raise TypeError("packed_query must be a bool")
+    if not isinstance(nvfp4_interleaved_kv, bool):
+        raise TypeError("nvfp4_interleaved_kv must be a bool")
     kv_tokens = (
         0 if seq_len_kv is None else _validate_positive_int(seq_len_kv, "seq_len_kv")
     )
@@ -3650,6 +3658,7 @@ def suggest_q_token_kv_block_sparse_group_size(
         nvfp4_kv=bool(nvfp4_kv),
         kv_tokens=kv_tokens,
         packed_query=packed_query,
+        nvfp4_interleaved_kv=nvfp4_interleaved_kv,
     )
 
 

@@ -4779,6 +4779,52 @@ def test_group_suggestion_caps_route_unions_at_causal_context() -> None:
     assert suggest(1, 4096, 2051, 16, 1, 152, seq_len_kv=4096, **packed) == 8
 
 
+def test_group_suggestion_follows_nvfp4_layout_and_wide_head_groups() -> None:
+    """Interleaved NVFP4 rows have their own latency constants.
+
+    GB300, 128/8 Q/KV heads, 1024 queries over a 64K prefix: separate scales
+    run G4 in 599 us (G8: 631 us), interleaved rows G8 in 619 us (G4: 645
+    us). With 32 Q heads per KV head, TileQ128 already forms at G4: 4096
+    queries over a 32K prefix take G4 (440/424 us separate/rows) over G2
+    (473/504 us), which a slower-growing union estimate preferred.
+    """
+
+    suggest = suggest_prims_ts_q_token_kv_block_sparse_group_size
+    packed = dict(nvfp4_kv=True, packed_query=True)
+    for interleaved, group_size in ((False, 4), (True, 8)):
+        assert (
+            suggest(
+                1,
+                1024,
+                2051,
+                128,
+                8,
+                152,
+                seq_len_kv=65536 + 1024,
+                nvfp4_interleaved_kv=interleaved,
+                **packed,
+            )
+            == group_size
+        )
+    for interleaved in (False, True):
+        assert (
+            suggest(
+                1,
+                4096,
+                2051,
+                32,
+                1,
+                152,
+                seq_len_kv=32768 + 4096,
+                nvfp4_interleaved_kv=interleaved,
+                **packed,
+            )
+            == 4
+        )
+    with pytest.raises(TypeError, match="nvfp4_interleaved_kv"):
+        suggest(1, 4, 2051, 16, 1, 152, nvfp4_interleaved_kv=1, **packed)
+
+
 def test_wide_group_suggestion_needs_small_blocks() -> None:
     """Keeps lanes read four blocks per G16/G32 membership word, so blocks
     wider than 16 tokens keep the suggestion at G8 or below."""
