@@ -1817,7 +1817,7 @@ def create_mma_task(
             smem_a_res.try_wait()
             if not has_routed_weights:
                 smem_b_res.try_wait()
-        elif has_cast_a:
+        elif has_cast_a and not has_proxy:
             smem_b_res.try_wait()
         elif not has_proxy and not has_tma_group:
             smem_a_res.try_wait()

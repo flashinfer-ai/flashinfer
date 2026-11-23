@@ -204,6 +204,20 @@ def _logical_token_capacity(
     return logical_capacity
 
 
+def _validate_finalize_output(output, *, num_tokens, hidden_size, device):
+    if (
+        output.shape != (num_tokens, hidden_size)
+        or output.dtype != torch.bfloat16
+        or not output.is_contiguous()
+        or output.device != device
+    ):
+        raise ValueError(
+            "finalize_output must be contiguous BF16 [tokens, hidden] on the input device"
+        )
+    if output.data_ptr() % 16:
+        raise ValueError("fc2 output buffer pointer must be 16-byte aligned")
+
+
 def _validate_c_output_layout(
     *,
     fc: Literal["fc1", "fc2"],
@@ -1032,15 +1046,12 @@ def build_nvfp4_launch_io(
             raise ValueError(
                 "fused FC2 requires output, router coefficients and expanded indices"
             )
-        if (
-            finalize_output.shape != (num_tokens, hidden_size)
-            or finalize_output.dtype != torch.bfloat16
-            or not finalize_output.is_contiguous()
-            or finalize_output.device != hidden_states.device
-        ):
-            raise ValueError(
-                "finalize_output must be contiguous BF16 [tokens, hidden] on the input device"
-            )
+        _validate_finalize_output(
+            finalize_output,
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            device=hidden_states.device,
+        )
         if (
             finalize_scales.shape != (num_tokens, top_k)
             or finalize_scales.dtype != torch.bfloat16

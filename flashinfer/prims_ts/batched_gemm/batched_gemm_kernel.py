@@ -270,6 +270,10 @@ def _group_ldgsts_a_sfa(cfg, smem_a, smem_sfa):
 
 
 def _relay_sources(cfg, smem_a, smem_b, smem_sfa, smem_sfb):
+    if cfg.has_cast_a:
+        # CastA owns A/SFA readiness and releases those stages independently.
+        # Its TMEM pipeline publishes cast readiness; only gathered B needs relay.
+        return [smem_b]
     sources = []
     if cfg.has_gather:
         sources = (

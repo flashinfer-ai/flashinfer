@@ -3218,7 +3218,7 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         cfg.num_load_sfb_warps = 0
         cfg.num_copy_sfa_warps = 0
         cfg.num_copy_sfb_warps = 0
-        cfg.num_sync_warps = 0
+        cfg.num_sync_warps = 1 if cfg.uses_ldgsts_relay else 0
         cfg.num_workid_warps = 1 if cfg.is_persistent else 0
 
         if cfg.has_gather:
@@ -3236,6 +3236,7 @@ def _compute_warp_layout(cfg: BatchedGemmConfig) -> None:
                     "load_b",
                     "load_a",
                     "load_sfa",
+                    "sync",
                     "mma",
                     "workid",
                 )

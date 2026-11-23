@@ -12,6 +12,8 @@ Legacy and overlap-window epilogues keep their existing schedules.
 from dataclasses import asdict, dataclass, replace
 from enum import IntEnum
 
+from .config_types import DType
+
 
 class SmemStaging(IntEnum):
     AUTO = 0
@@ -473,6 +475,8 @@ def compile_epilogue_steps(cfg):
             "epilogue_steps requires M128 fragments with independent TMA scratch; elementwise activation, bias, overlap and per-token scaling are unsupported"
         )
     gated = cfg.has_gated_epilogue
+    if not gated and cfg.dtype_c not in (int(DType.BF16), int(DType.FP16)):
+        raise ValueError("plain epilogue_steps requires BF16 or FP16 output")
     if gated and not (
         cfg.uses_non_swap_fp4_gated_tma_c_scratch
         and cfg.gated_weight_group_size == 1

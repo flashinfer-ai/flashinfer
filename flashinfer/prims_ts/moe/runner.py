@@ -86,6 +86,7 @@ from .tensor_adapter import (
     _block_scaled_sf_required_span,
     _fc1_out_hidden,
     _is_gated_activation,
+    _validate_finalize_output,
     _validate_swap_ab_cluster_span,
     build_bf16_launch_io,
     build_fp8_block_scale_launch_io,
@@ -1829,19 +1830,26 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         ) and supports_fused_finalize(fc2_cfg)
 
         # Reject unsupported views before routing or zeroing can modify output.
-        if fuse_finalize and output.data_ptr() % 16:
-            raise ValueError("fc2 output buffer pointer must be 16-byte aligned")
+        if fuse_finalize:
+            from .finalize import _overlapping_bytes
 
-        # A contiguous BF16 view may still start at an unaligned offset.
-        # Bind aligned coefficients before routing or output zeroing; aligned
-        # caller buffers retain their zero-copy path, including graph capture.
-        if (
-            fuse_finalize
-            and moe_inputs.expert_weights is not None
-            and moe_inputs.expert_weights.dtype == torch.bfloat16
-            and moe_inputs.expert_weights.data_ptr() % 16
-        ):
-            moe_inputs.expert_weights = moe_inputs.expert_weights.clone()
+            _validate_finalize_output(
+                output,
+                num_tokens=num_tokens,
+                hidden_size=self.hidden_size,
+                device=hidden_states.device,
+            )
+            # FC2 needs aligned coefficients that survive output zeroing.
+            # Disjoint aligned caller buffers retain the zero-copy path.
+            if (
+                moe_inputs.expert_weights is not None
+                and moe_inputs.expert_weights.dtype == torch.bfloat16
+                and (
+                    moe_inputs.expert_weights.data_ptr() % 16
+                    or _overlapping_bytes(output, moe_inputs.expert_weights)
+                )
+            ):
+                moe_inputs.expert_weights = moe_inputs.expert_weights.clone()
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)

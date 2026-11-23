@@ -1928,6 +1928,71 @@ def test_validation_rejects_bf16_kbox_tma_a_tile_k_not_multiple_of_64():
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("umma_cta_count", [1, 2])
+@pytest.mark.parametrize("route", ["TMA", "LDGSTS"])
+def test_casta_relay_has_dedicated_warp_and_only_waits_for_b(umma_cta_count, route):
+    from cutlass.experimental.task_scheduling.enums import ScheduleStage
+
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        BatchMode,
+        DType,
+        RouteImpl,
+        TileScheduler,
+        make_config,
+        validate_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        _build_schedule_validate,
+    )
+
+    cfg = make_config(
+        batch_mode=int(BatchMode.BATCH_N),
+        dtype_a=int(DType.MXE2M1),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        mma_m=128 * umma_cta_count,
+        mma_n=16,
+        mma_k=16,
+        tile_n=16,
+        tile_k=256,
+        epi_tile_n=16,
+        umma_cta_count=umma_cta_count,
+        route_act=int(getattr(RouteImpl, route)),
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        num_stages_a=3,
+        num_stages_b=3,
+        num_stages_smem_sfa=3,
+        num_stages_tmem_acc=2,
+        use_tma_store=1,
+        epilogue_regs=128,
+        cast_a_regs=160,
+    )
+    validate_config(cfg)
+    tasks, dependencies, _, _ = _build_schedule_validate(cfg, num_k_tiles=4)
+    occupied = set()
+    for task in tasks:
+        warps = set(range(task.warp_idx, task.warp_idx + task.num_warps))
+        assert not occupied & warps, task.name
+        occupied.update(warps)
+    relay = [task for task in tasks if task.name == "SyncTask"]
+    expected = int(umma_cta_count == 2 and route == "LDGSTS")
+    assert len(relay) == cfg.warp_layout.num_sync_warps == expected
+    if relay:
+        proxy = relay[0].dst_resources[0]
+        ready = [r for r in dependencies[proxy] if r.name != "WorkQueue"]
+        assert [resource.name for resource in ready] == ["SmemGather"]
+        cast = next(task for task in tasks if task.name == "CastATask")
+        # A/SFA can be recycled by CastA without waiting for the relay.
+        assert not set(ready) & set(cast.src_resources)
+        mma = next(task for task in tasks if task.name == "MmaTask0")
+        # The relay owns B's wait; MMA only consumes and releases it.
+        b_stages = [entry[1] for entry in mma.loop_schedule_list if entry[0] in ready]
+        assert ScheduleStage.ConsumerRelease in b_stages
+        assert ScheduleStage.ConsumerTryWait not in b_stages
+        assert ScheduleStage.ConsumerWait not in b_stages
+
+
+@pytest.mark.cpu_only
 def test_validation_rejects_casta_tile_k_not_256():
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,

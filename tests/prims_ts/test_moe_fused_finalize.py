@@ -87,6 +87,7 @@ def test_fused_finalize_replay(
     from flashinfer.tllm_enums import RoutingMethodType, WeightLayout
 
     from flashinfer.prims_ts.moe import runner
+    from flashinfer.prims_ts.moe.finalize import _overlapping_bytes
 
     build_io = runner.build_nvfp4_launch_io
     fc1_enabled = False
@@ -98,12 +99,17 @@ def test_fused_finalize_replay(
             kwargs["cfg"] = replace(kwargs["cfg"], **fc1_overrides)
         if kwargs["cfg"].fuse_moe_finalize:
             if router_weight_dtype == torch.bfloat16 and kwargs["num_tokens"] == tokens:
-                # Aligned caller coefficients must retain the zero-copy path.
+                # Disjoint aligned coefficients must retain the zero-copy path.
                 same_pointer = (
                     kwargs["finalize_scales"].data_ptr()
                     == call_router_weights.data_ptr()
                 )
-                assert same_pointer == (call_router_weights.data_ptr() % 16 == 0)
+                assert same_pointer == (
+                    call_router_weights.data_ptr() % 16 == 0
+                    and not _overlapping_bytes(
+                        call_router_weights, kwargs["finalize_output"]
+                    )
+                )
             kwargs["cfg"] = replace(
                 kwargs["cfg"],
                 dense_epilogue_warps=warps,
@@ -507,7 +513,9 @@ def test_fused_finalize_router_weight_alignment_replay(monkeypatch, offset):
 @pytest.mark.arch_rubin
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("offset", [0, 32])
-@pytest.mark.parametrize("input_name", ["hidden_states", "hidden_states_scale"])
+@pytest.mark.parametrize(
+    "input_name", ["hidden_states", "hidden_states_scale", "topk_weights"]
+)
 def test_fused_finalize_aliased_input_replay(monkeypatch, offset, input_name):
     test_fused_finalize_replay(
         monkeypatch,

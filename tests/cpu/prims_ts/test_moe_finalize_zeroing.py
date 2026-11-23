@@ -14,6 +14,67 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(
+    "view", ["shape", "dtype", "device", "strided", "misaligned", "valid", "one_row"]
+)
+def test_inner_runner_validates_output_before_cuda_work(monkeypatch, view):
+    from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+    from flashinfer.prims_ts.moe import runner
+
+    tokens, hidden = (1 if view == "one_row" else 8), 128
+    backing = torch.full((tokens, hidden * 2), 7, dtype=torch.bfloat16)
+    output = backing[:, :hidden] if view == "one_row" else backing[:, ::2]
+    if view == "shape":
+        output = backing
+    elif view == "dtype":
+        output = torch.empty((tokens, hidden), dtype=torch.float32)
+    elif view == "device":
+        output = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="meta")
+    elif view == "misaligned":
+        output = backing.flatten()[1 : 1 + tokens * hidden].view(tokens, hidden)
+    elif view == "valid":
+        output = backing.flatten()[: tokens * hidden].view(tokens, hidden)
+
+    inner = object.__new__(runner.PrimsTsNvfp4MoERunner)
+    inner.hidden_size = hidden
+    config = SimpleNamespace(kwargs={}, build=lambda: object())
+    pair = SimpleNamespace(
+        fc1=SimpleNamespace(cfg=config),
+        fc2=SimpleNamespace(cfg=config),
+        tile_n=512,
+        moe_config_index=0,
+    )
+    monkeypatch.setattr(inner, "_map_tactic", lambda *args: pair)
+    monkeypatch.setattr(
+        runner, "is_prims_ts_nvfp4_supported", lambda *a, **kw: (True, "")
+    )
+    monkeypatch.setattr(runner, "fused_finalize_requested", lambda *args: True)
+    monkeypatch.setattr(runner, "supports_fused_finalize", lambda *args: True)
+
+    def reached_cuda(**kwargs):
+        raise RuntimeError("output accepted before CUDA work")
+
+    monkeypatch.setattr(torch.cuda, "current_stream", reached_cuda)
+    inputs = MoeRunnerInputs(
+        output=output,
+        hidden_states=torch.empty((tokens, hidden // 2), dtype=torch.uint8),
+        routing_logits=None,
+        topk_ids=None,
+        expert_weights=None,
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+    if view in ("valid", "one_row"):
+        error, message = RuntimeError, "output accepted before CUDA work"
+    else:
+        error = ValueError
+        message = "16-byte aligned" if view == "misaligned" else "contiguous BF16"
+    with pytest.raises(error, match=message):
+        inner.forward(inputs.to_list())
+    assert torch.all(backing == 7)
+
+
+@pytest.mark.parametrize(
     "input_start,overlap", [(0, False), (64, True), (80, True), (128, False)]
 )
 def test_output_overlap_uses_byte_ranges(input_start, overlap):

@@ -155,6 +155,27 @@ def _step_config(steps, *, warps=8, stages=2, finalize=True):
     )
 
 
+@pytest.mark.parametrize("dtype", ["BF16", "FP16", "E4M3", "MXE4M3"])
+def test_explicit_plain_steps_require_16_bit_output(dtype):
+    from flashinfer.prims_ts.batched_gemm.config_types import DType
+
+    Step = schedules.EpilogueStep
+    steps = (
+        (Step(load_fragments=8),)
+        + (Step(stage_fragments=1), Step(emit_fragments=1)) * 8
+        + (Step(release_tmem=True),)
+    )
+    cfg = replace(
+        _step_config(steps, finalize=False),
+        dtype_c=int(getattr(DType, dtype)),
+    )
+    if dtype in ("BF16", "FP16"):
+        assert schedules.compile_epilogue_steps(cfg).actions
+    else:
+        with pytest.raises(ValueError, match="requires BF16 or FP16 output"):
+            schedules.compile_epilogue_steps(cfg)
+
+
 def _verify_repeated_tile_lifetimes(plan):
     """Adversarial model: asynchronous reads never finish unless waited on.
 
