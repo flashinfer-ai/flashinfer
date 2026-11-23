@@ -262,6 +262,16 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
   return b;
 }
 
+// Branchless 1-step Newton-Raphson refinement of `rcp.approx.ftz.f32`:
+// 0-ULP bit-identical to `__fdiv_rn(1.0f, a)` across all finite positive E4M3 scales
+// and normal-range FP32 scale products, avoiding full IEEE division latency.
+inline __device__ float reciprocal_nr_ftz(float a) {
+  float const sa = a > 0.0f ? a : 1.0f;
+  float r = reciprocal_approximate_ftz(sa);
+  r = __fmaf_rn(__fmaf_rn(-sa, r, 1.0f), r, r);
+  return a > 0.0f ? r : 0.0f;
+}
+
 __device__ __forceinline__ float mx_quantize_mul(float a, float b) {
   // MX quantization preserves FP32 subnormals, including when the caller is
   // compiled with -use_fast_math. Match the CuTe DSL scale/payload arithmetic.
@@ -496,8 +506,9 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
     // Match TE's encode scale: min(1 / (fp32(fp8(SFValue)) * (1 / SFScaleVal)), fp32_max).
-    outputScale =
-        vecMax != 0 ? fminf(__fdiv_rn(1.0f, SFValue * __fdiv_rn(1.0f, SFScaleVal)), FLT_MAX) : 0.0f;
+    outputScale = vecMax != 0
+                      ? fminf(reciprocal_nr_ftz(SFValue * reciprocal_nr_ftz(SFScaleVal)), FLT_MAX)
+                      : 0.0f;
   } else if constexpr (!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
@@ -555,8 +566,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     float outputScale4;
     float outputScale6;
     if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-      outputScale4 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue4, globalDecodeScale)), FLT_MAX);
-      outputScale6 = fminf(__fdiv_rn(1.0f, __fmul_rn(sfValue6, globalDecodeScale)), FLT_MAX);
+      outputScale4 = fminf(reciprocal_nr_ftz(__fmul_rn(sfValue4, globalDecodeScale)), FLT_MAX);
+      outputScale6 = fminf(reciprocal_nr_ftz(__fmul_rn(sfValue6, globalDecodeScale)), FLT_MAX);
     } else {
       outputScale4 = reciprocal_approximate_ftz(sfValue4 * globalDecodeScale);
       outputScale6 = reciprocal_approximate_ftz(sfValue6 * globalDecodeScale);
@@ -735,7 +746,7 @@ cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, flo
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
     // Match TE's encode scale: 1 / (fp32(fp8(SFValue)) * reciprocalSFScaleVal).
-    outputScale = vecMax != 0 ? __fdiv_rn(1.0f, SFValue * reciprocalSFScaleVal) : 0.0f;
+    outputScale = vecMax != 0 ? reciprocal_nr_ftz(SFValue * reciprocalSFScaleVal) : 0.0f;
   } else {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
