@@ -171,8 +171,8 @@ class BatchInvariantFp4Runner(MoERunner):
     )
     supported_activation_classes = _ACTIVATIONS
     supported_activation_classes_by_quant = {pair: _ACTIVATIONS for pair in PAIRS}
-    # the NVFP4 pair consumes a pre-quantized pack's per-token scale (the class's own ``pts``); the MX pair has none and
-    # refuses the flag at support
+    # the NVFP4 pair consumes a pre-quantized pack's per-token scale (the class's own ``pts``) under the layer's shared
+    # contract; the MX pair has none and refuses the flag at support
     supports_per_token_scale = True
     supports_expert_parallelism = False
 
@@ -314,25 +314,13 @@ class BatchInvariantFp4Runner(MoERunner):
     def _hidden_of(x: torch.Tensor) -> int:
         return int(x.shape[1]) if x.dtype == torch.bfloat16 else 2 * int(x.shape[1])
 
-    def _validate_pack_contract(self, act: MoEActivationPack) -> None:
-        """The routing mode must be one of the three; the NVFP4 pair consumes a pack's ``per_token_scale`` in every
-        configuration (the class is per-token by construction: no tactic depends on the scale's presence), so
-        ``QuantConfig.per_token_scale`` gates nothing there; the MX pair takes the layer's shared contract (a pack scale is
-        refused)."""
-        if self._pair is not None and not self._pair.scaled:
-            return super()._validate_pack_contract(act)
-        if act.routing_input_mode not in self.supported_routing_modes:
-            names = ", ".join(mode.name for mode in self.supported_routing_modes)
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support routing_input_mode={act.routing_input_mode!r}; supported: {names}."
-            )
-
     def _activation_scales(
         self, act: MoEActivationPack, T: int, H: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """The pre-quantized pack's scale factors (the flat 128x4 swizzled buffer, or the linear ``[T, H/block]`` bytes, which
-        the op's scatter re-tiles itself) and, for the NVFP4 pair, its per-token scales (the empty placeholder for a pack
-        without them: unit scales, nothing to fill)."""
+        the op's scatter re-tiles itself) and, for the NVFP4 pair, its per-token scales (the layer's shared contract admits
+        them under ``QuantConfig(per_token_scale=True)``; the empty placeholder for a pack without them: unit scales, nothing
+        to fill)."""
         pair, cls = self.pair, self.pair.cls
         sf = act.hidden_states_scale
         if sf is None:
