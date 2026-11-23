@@ -277,12 +277,15 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
             fc2_alpha=alpha2,
             fc1_norm_const=norm,
         )
+        # The legacy tuner below and the winner-knob check read the legacy
+        # frontend; the unsuffixed name selects the sources-backed kernel.
         config = _megakernel_config(
             problem,
             epilogue_via_config=True,
             apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             finalize_mode=FinalizeMode.NONE,
             knobs=None,
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
         )
     else:
         config_cls = (
@@ -313,7 +316,12 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
     reference_workspace = None
     reference_layer = None
     graph = None
+    failure_group = None
+    forward_failed = False
     try:
+        # Forward failures are shared on a CPU group: an NCCL collective would
+        # queue behind a peer launch that the failing rank never joined.
+        failure_group = dist.new_group(backend="gloo")
         if backend == "nvfp4":
             from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
                 tune_one,
@@ -445,7 +453,20 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
 
         for n in (9 if backend == "nvfp4" else 7, 0 if rank == 0 else 5, 0, 17):
             t = batch(n)
-            actual = forward(t)
+            error = None
+            try:
+                actual = forward(t)
+            except Exception as exc:
+                error = exc
+            # Exchange before any rank waits on its peers.
+            failed = [None] * world_size
+            dist.all_gather_object(failed, error is not None, group=failure_group)
+            if any(failed):
+                forward_failed = True
+                if error is not None:
+                    raise error
+                failing = [r for r, f in enumerate(failed) if f]
+                raise AssertionError(f"forward failed on rank(s) {failing}")
             torch.cuda.synchronize()
             dist.barrier()
             expected = reference_forward(t)
@@ -478,14 +499,19 @@ def test_external_weighted_reduction_live_rows_and_cuda_graph(
             dist.barrier()
             assert_close(captured_output, expected, t)
     finally:
-        torch.cuda.synchronize()
-        if graph is not None:
-            graph.reset()
-        if reference_workspace is not None:
-            reference_workspace.destroy()
-        if reference_layer is not None:
-            reference_layer.destroy()
-        layer.destroy()
+        # After a failed forward, peers may spin in a launch the failing rank
+        # never joined, so synchronization and collective teardown would hang.
+        if not forward_failed:
+            torch.cuda.synchronize()
+            if graph is not None:
+                graph.reset()
+            if reference_workspace is not None:
+                reference_workspace.destroy()
+            if reference_layer is not None:
+                reference_layer.destroy()
+            layer.destroy()
+        if failure_group is not None:
+            dist.destroy_process_group(failure_group)
 
 
 @pytest.mark.parametrize(

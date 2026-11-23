@@ -746,6 +746,8 @@ def test_release_drops_every_sealed_identity_a_definition_accumulated(
     ta.disable_apply()
     pk.load_packages(tmp_path / "second", [plain(tmp_path / "second", "second")])
     assert preloaded_entry(OPERATION, "first") and preloaded_entry(OPERATION, "second")
+    [(package, _)] = pk.installed_packages()  # the later load replaced the entry
+    assert package.solution["name"] == "second"
     # Routes go before entries: at every unregister the Definition is already
     # out of the mapping, so no call can find it enabled without its entry.
     still_enabled = []

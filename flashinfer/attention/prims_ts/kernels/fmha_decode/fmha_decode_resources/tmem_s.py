@@ -103,8 +103,9 @@ from .sage_scales import (
     sage_k_view,
 )
 from .helpers_kv_tile_idx import (
+    cta_caches_visible_kv_interval,
+    kv_tile_is_unmasked,
     resolve_keeps_tile_context,
-    _kv_tile_is_fully_unmasked_for_q_group,
     _load_runtime_seq_len_kv,
     _num_skipped_kv_tiles,
     _runtime_clamp_valid_tile_idx,
@@ -238,6 +239,18 @@ def swaps_score_load_chunks(q_repeats: int) -> tuple[tuple[int, int], ...]:
         chunks.append((start, size))
         start += size
     return tuple(chunks)
+
+
+def _swaps_band_row(q_band: int, scale_idx: int) -> int:
+    """Return the Q row (before the column-group offset) of a streamed Q32 band's scale."""
+    return q_band * 32 + (scale_idx // 2) * 8 + scale_idx % 2
+
+
+def _swaps_score_idx(scale_idx: int, k_group: int) -> int:
+    """Return a streamed Q32 band's score register for one scale row and K group."""
+    return (
+        (scale_idx // 2) * 4 + scale_idx % 2 + (k_group % 2) * 2 + (k_group // 2) * 16
+    )
 
 
 @dataclass(kw_only=True)
@@ -1690,6 +1703,12 @@ class TmemSResource(DecodeGenResourceBase):
         )
         tile_offset = tile * Int32(cfg.tile_size_kv)
         valid_tile = effective_tile < total_tiles and tile_offset < seq_len
+        # Only tiles not wholly inside the keys every row of the Q CTA sees
+        # need the per-row causal/tail mask; padded Q rows are masked on
+        # every tile.
+        kv_tile_masked = not kv_tile_is_unmasked(
+            cfg, stage_info, tile_offset, seq_len, self.seq_len_q, q_base
+        )
         base = self._softmax_loop_score_tmem_addr(stage_info)
         if stage_info.loop_offset == stage_info.loop_start:
             _init_softmax_scratch_u32(
@@ -1714,29 +1733,42 @@ class TmemSResource(DecodeGenResourceBase):
                 for idx in cutlass.range_constexpr(16):
                     scores[idx] = lo[idx]
                     scores[idx + 16] = hi[idx]
+            if kv_tile_masked:
+                # One masked pass per Q32 band; tiles inside the interval
+                # skip it. Names written in this runtime branch stay local.
+                for masked_scale_idx in cutlass.range_constexpr(8):
+                    masked_row = Int32(
+                        _swaps_band_row(q_band, masked_scale_idx)
+                    ) + col_group * Int32(2)
+                    masked_visible_end = seq_len
+                    if cutlass.const_expr(cfg.mask_type == CAUSAL):
+                        masked_token, _masked_head = _q_row_token_and_local_head(
+                            cfg, self.h_r, q_group, masked_row
+                        )
+                        masked_visible_end = (
+                            seq_len - self.seq_len_q + masked_token + Int32(1)
+                        )
+                    for masked_k_group in cutlass.range_constexpr(4):
+                        masked_k = (
+                            tile_offset
+                            + warp * Int32(32)
+                            + (lane >> Int32(2))
+                            + Int32(masked_k_group * 8)
+                        )
+                        if masked_k >= masked_visible_end:
+                            scores[
+                                _swaps_score_idx(masked_scale_idx, masked_k_group)
+                            ] = _neg_max_f32()
             maxima = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
             for scale_idx in cutlass.range_constexpr(8):
-                repeat = scale_idx // 2
-                pair = scale_idx % 2
-                row = Int32(q_band * 32 + repeat * 8 + pair) + col_group * Int32(2)
+                row = Int32(_swaps_band_row(q_band, scale_idx)) + col_group * Int32(2)
                 valid_row = _q_row_is_valid_for_seq(
                     cfg, self.h_r, q_group, row, self.seq_len_q
                 )
-                visible_end = seq_len
-                if cutlass.const_expr(cfg.mask_type == CAUSAL):
-                    token, _ = _q_row_token_and_local_head(cfg, self.h_r, q_group, row)
-                    visible_end = seq_len - self.seq_len_q + token + Int32(1)
                 for k_group in cutlass.range_constexpr(4):
-                    k = (
-                        tile_offset
-                        + warp * Int32(32)
-                        + (lane >> Int32(2))
-                        + Int32(k_group * 8)
-                    )
-                    idx = repeat * 4 + pair + (k_group % 2) * 2 + (k_group // 2) * 16
-                    if not valid_row or k >= visible_end:
-                        scores[idx] = _neg_max_f32()
-                idx = repeat * 4 + pair
+                    if not valid_row:
+                        scores[_swaps_score_idx(scale_idx, k_group)] = _neg_max_f32()
+                idx = _swaps_score_idx(scale_idx, 0)
                 val = cute.math.max(
                     cute.math.max(scores[idx], scores[idx + 2], ftz=True),
                     cute.math.max(scores[idx + 16], scores[idx + 18], ftz=True),
@@ -2085,7 +2117,8 @@ class TmemSResource(DecodeGenResourceBase):
         next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
         # Determine whether this tile crosses the active right endpoint or the
         # start of the causal sliding window. Dense full tiles skip per-element
-        # masking.
+        # masking. Grouped and sliding-window CTAs test the unmasked tile range
+        # cached once per work tile instead.
         if cutlass.const_expr(
             use_sparse or (cfg.uses_per_row_causal_mask and cfg.tile_size_q >= 48)
         ):
@@ -2097,6 +2130,10 @@ class TmemSResource(DecodeGenResourceBase):
             # bottleneck there (D128 Q48: 1.68 -> 1.58 ms on GB300); Q16/Q32
             # measured mixed (+/-6%) and keep the mask.
             should_apply_dense_mask = False
+        elif cutlass.const_expr(cta_caches_visible_kv_interval(cfg)):
+            should_apply_dense_mask = not kv_tile_is_unmasked(
+                cfg, stage_info, tile_offset_k, seq_len_kv, self.seq_len_q, q_token_base
+            )
         elif cutlass.const_expr(
             not use_runtime_kv_domain and not cfg.uses_uniform_causal_mask
         ):
@@ -2172,13 +2209,16 @@ class TmemSResource(DecodeGenResourceBase):
                     and not is_masked_final_wave
                 )
                 apply_per_row_causal_mask = cutlass.Boolean(
-                    not _kv_tile_is_fully_unmasked_for_q_group(
-                        cfg,
-                        tile_offset_k,
-                        seq_len_kv,
-                        self.seq_len_q,
-                        q_token_base,
-                        tile_has_valid_scores,
+                    not (
+                        tile_has_valid_scores
+                        and kv_tile_is_unmasked(
+                            cfg,
+                            stage_info,
+                            tile_offset_k,
+                            seq_len_kv,
+                            self.seq_len_q,
+                            q_token_base,
+                        )
                     )
                 )
             if apply_per_row_causal_mask:

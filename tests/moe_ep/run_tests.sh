@@ -395,6 +395,11 @@ for device in range(nproc):
     fi
     launch=(--nnodes="${nnodes}" --rdzv_backend=c10d
       --rdzv_endpoint="${RDZV_ENDPOINT}" --rdzv_id="${RDZV_ID:-bf16-rank-major}")
+    # Across nodes, NVSHMEM's default NVLS setup exhausts its internal teams
+    # ("No more teams available"). The ranks share one NVLink domain, so use
+    # the direct peer-memory path without NVLS or a remote transport.
+    export NVSHMEM_DISABLE_NVLS="${NVSHMEM_DISABLE_NVLS:-1}"
+    export NVSHMEM_REMOTE_TRANSPORT="${NVSHMEM_REMOTE_TRANSPORT:-none}"
   fi
   "${TORCHRUN}" "${launch[@]}" --nproc_per_node="${nproc}" \
     -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" \
