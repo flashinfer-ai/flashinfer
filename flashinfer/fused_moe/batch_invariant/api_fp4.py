@@ -1395,7 +1395,9 @@ def fused_moe_fp4(
             g_a, g_sf, g_pts = x_perm4, x_perm_sf, x_perm_pts
         g_src = src if gather1 else None
         a4 = torch.empty(Tk_a, I // 2, dtype=torch.uint8, device=dev)
-        a_sf_pad = torch.empty(pair.sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
+        # zero-filled: the writers (the static epilogue, the quantizers' re-tiling) store a row's real scale columns only, and
+        # GEMM2's scale boxes read the padded columns of a row's last 4-byte group against the zero-filled tail of its k-tile
+        a_sf_pad = torch.zeros(pair.sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
         a = a_sf = a_pts = a_pts_pad = None
         if static:
             # the static class: GEMM1's epilogue writes the intermediate's codes (dense rows) and scale bytes (the padded

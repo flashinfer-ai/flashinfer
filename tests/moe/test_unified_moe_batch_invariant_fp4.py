@@ -2111,6 +2111,58 @@ def test_poisoned_intermediates_do_not_reach_the_bits(pair, body, act):
 
 
 @needs_device
+@pytest.mark.parametrize("I", [32, 96, 160])
+@pytest.mark.parametrize("which", ["nvfp4_static", "nvfp4", "mxfp4"])
+def test_narrow_intermediate_scale_tails_under_a_poisoned_allocator(which, I):
+    """At ``I % 64 == 32`` the intermediate's scale rows end in a 4-byte group with two padded columns that no writer stores
+    (the static epilogue and the quantizers' re-tiling store a row's real columns), and GEMM2's scale boxes read them against
+    the zero-filled tail of the k-tile: with the caching allocator's blocks pre-filled with e4m3 / bf16 NaN patterns, the
+    output of each class through the layer is finite and equals a clean run's bits (the per-token classes also their
+    composition)."""
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    T, k, H, E = 64, 4, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=70 + I)
+    if which == "mxfp4":
+        pair = MXFP4
+        layer, W = _layer(k, E, I, quant=_MX), _weights(w1, w2, quant=_MX)
+    elif which == "nvfp4":
+        pair = NVFP4
+        layer, W = _layer(k, E, I), _weights(w1, w2)
+    else:
+        pair = NVFP4
+        layer = _layer(k, E, I, backend=BatchInvariantFp4Config(intermediate="static"))
+        W = MoEWeightPack({})
+        W.prepare_for(
+            KEY,
+            BatchInvariantFp4Config.prepare_weights(
+                w1, w2, activation=_SWIGLU, intermediate="static"
+            ),
+        )
+    act = _logits_pack(x, logits)
+    layer(act, W)  # the compile and the winner, outside the poisoned runs
+    _poison_allocator(0x00)
+    ref = layer(act, W)
+    assert torch.isfinite(ref.float()).all()
+    for byte in (0xFF, 0x7F):
+        _poison_allocator(byte)
+        out = layer(act, W)
+        assert torch.isfinite(out.float()).all(), (which, I, hex(byte))
+        assert torch.equal(bits(out), bits(ref)), (which, I, hex(byte))
+    if which != "nvfp4_static":
+        ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        comp = _reference_ffn(
+            _quantized(x, pair=pair),
+            ids.cuda(),
+            weights.cuda(),
+            _weights_of(W),
+            activation_of(_SWIGLU),
+            _weights_of(W).classes(_family()),
+        )
+        assert torch.equal(bits(ref.cpu()), bits(comp.cpu()))
+
+
+@needs_device
 @each_pair
 def test_instruction_classes_on_the_part(pair):
     """The part's default instruction class is the pair's rule (the sm_107 K = 128 step on SM107, the K = 64 step elsewhere)
