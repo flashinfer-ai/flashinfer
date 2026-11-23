@@ -13,13 +13,15 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import (
     Agent,
     CooperativeGroup,
-    NamedBarrier as nbar,
+    NamedBarrier as _NamedBarrier,
 )
 
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -39,6 +41,25 @@ from .qmul4 import (
 )
 
 mma_modes = (0, 1, 2)
+
+
+# Warp-specialized barriers are synced from different code sites, which the
+# aligned bar.sync does not allow, so use the unaligned sync and arrive forms.
+class _UnalignedNamedBarrier(_NamedBarrier):
+    arrive = _NamedBarrier.arrive_unaligned
+
+    @dsl_user_op
+    def arrive_and_wait(self, *, loc=None, ip=None):
+        nvvm.barrier_cta_sync(
+            Int32(self.barrier_id).ir_value(loc=loc, ip=ip),
+            thread_count=Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
+
+
+nbar = _UnalignedNamedBarrier
 
 
 def _operand_mk_layout(tiled_mma, stage_layout, shape, reference):

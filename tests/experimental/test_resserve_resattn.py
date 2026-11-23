@@ -306,3 +306,9 @@ def test_cga_wait_acquires_peer_writes(tmp_path, monkeypatch):
         "fence.acquire.sync_restrict::shared::cluster.cluster"
         in after_wait[: load.start()]
     )
+
+
+def test_warp_specialized_output_init_barrier(tmp_path, monkeypatch):
+    ptx = compile_decode_ptx("none", tmp_path, monkeypatch)
+    assert len(re.findall(r"\bbarrier(?:\.cta)?\.sync\s+14,", ptx)) == 2
+    assert not re.search(r"\b(?:bar\.sync|barrier(?:\.cta)?\.sync\.aligned)\s+14,", ptx)
