@@ -67,6 +67,71 @@ def _same(y, expected, m, label):
         _assert_close(y, expected, label)
 
 
+def _check_route_cycle(
+    buffer, inputs, weights, reference_weights, global_scales, rank, local_experts
+):
+    """Replay one graph as a persistent M1 buffer changes local and remote routes."""
+    from flashinfer.megamoe import mxfp4_mega_moe
+
+    x, sf, routing = inputs
+    columns = torch.arange(routing.shape[1], device=x.device)[None, :]
+    local = rank * local_experts + columns
+    remote = (rank ^ (dist.get_world_size() // 2)) * local_experts + columns
+    routes = (
+        ("remote", remote),
+        ("local", local),
+        ("masked", torch.full_like(local, -1)),
+        ("mixed", torch.where((columns & 1).bool(), remote, local)),
+        ("remote_again", remote),
+    )
+    y = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    stats = torch.zeros(local_experts, dtype=torch.int32, device=x.device)
+    run = functools.partial(
+        mxfp4_mega_moe,
+        y,
+        *weights,
+        buffer,
+        cumulative_local_expert_recv_stats=stats,
+        l1_global_scales=global_scales[0],
+        l2_global_scales=global_scales[1],
+    )
+    graph, first_remote = None, None
+    for name, idx in routes:
+        expected, counts = _reference(
+            x.float() * sf.repeat_interleave(128, dim=-1),
+            idx,
+            routing,
+            *reference_weights,
+            *global_scales,
+            rank,
+            local_experts,
+        )
+        buffer.stage(x, sf, idx, routing)
+        stats.zero_()
+        run()
+        torch.cuda.synchronize()
+        _assert_close(y, expected, ("route cycle reference", name))
+        assert torch.equal(stats.long(), counts), ("route cycle eager counts", name)
+        eager = y.clone()
+        if first_remote is None:
+            first_remote = eager
+        elif name == "remote_again":
+            assert torch.equal(y.view(torch.uint8), first_remote.view(torch.uint8))
+        if graph is None:
+            graph = torch.cuda.CUDAGraph()
+            dist.barrier()
+            torch.cuda.synchronize()
+            with torch.cuda.graph(graph):
+                stats.zero_()
+                run()
+        for _ in range(2):
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(y.view(torch.uint8), eager.view(torch.uint8)), name
+            assert torch.equal(stats.long(), counts), ("route cycle graph counts", name)
+    graph.reset()
+
+
 def _worker(rank, args):
     """Per-rank body: build both buffers, run identical inputs through each and compare."""
     local_rank = int(
@@ -173,6 +238,19 @@ def _worker(rank, args):
                 )
                 % H
             )
+        if args.route_cycle:
+            _check_route_cycle(
+                nodes_buffer,
+                (x, sf, routing),
+                (w1, w2),
+                (ref1, ref2),
+                (gs1, gs2),
+                rank,
+                H,
+            )
+            if rank == 0:
+                print("M1 persistent-buffer route cycle passed", flush=True)
+            continue
         expected, counts_logical = _reference(
             x.float() * sf.repeat_interleave(128, dim=-1),
             idx,
@@ -331,6 +409,22 @@ def _run(args):
             else [16, 64, 128, 256, 512, 1024]
         )
     args.tokens = resolve_tokens(args.tokens, args.token_scope, args.ep, args.capacity)
+    if args.route_cycle and (
+        not launched
+        or args.ep != 16
+        or args.nodes != 2
+        or local != 8
+        or (args.hidden, args.intermediate, args.experts, args.topk)
+        != (4096, 2048, 256, 6)
+        or args.capacity != 2
+        or args.tokens != [1]
+        or args.weight_storage != "mxfp4_compact"
+        or args.slots != 0
+    ):
+        raise ValueError(
+            "route-cycle requires two-host torchrun EP16, E256/H4096/I2048/top6, "
+            "compact weights, M1/cap2 and no replica slots"
+        )
     if launched:
         _worker(int(os.environ["RANK"]), args)
         return
@@ -358,6 +452,7 @@ def _namespace(ep, **overrides):
         gin_contexts=0,
         nodes=1,
         nodes_only=False,
+        route_cycle=False,
     )
     args.update(overrides)
     return argparse.Namespace(**args)
@@ -460,5 +555,10 @@ if __name__ == "__main__":
         "--nodes-only",
         action="store_true",
         help="skip the single-node pair (ranks on several hosts cannot share torch symmetric memory)",
+    )
+    parser.add_argument(
+        "--route-cycle",
+        action="store_true",
+        help="check changing M1 routes through one EP16 compact buffer and captured graph",
     )
     _run(parser.parse_args())

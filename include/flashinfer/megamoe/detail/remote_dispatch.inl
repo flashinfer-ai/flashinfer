@@ -98,13 +98,9 @@ const auto remote_list_entry = [&](const uint32_t& token_topk_idx, const uint32_
   }
 };
 
-// SM 0, warp 0, right after the index-pass grid sync (every SM's packed rows
-// and list entries are complete): two puts per remote node. The rows leave
-// first; the scales, routing, weights and the header (the per-expert counts
-// and the lists the index pass wrote in place) are adjacent in the layout and
-// leave as one put that carries the signal, which orders the rows put before
-// it on the same context. Fixed-stride lists let the index pass write the
-// header directly before count publication.
+// SM 0, warp 0, after the index-pass grid sync. M1 can send the padded input
+// block and header in one put; other paths send rows before the signalled
+// scales, routing, weights, and header.
 const auto remote_send = [&]() {
   if constexpr (kNumRemoteNodes > 0) {
     if (sm_idx != 0 or warp_idx != 0) return;
@@ -118,7 +114,10 @@ const auto remote_send = [&]() {
       auto* dst_block = static_cast<uint8_t*>(remote.inbox_input_block(at));
       auto* src_block = static_cast<uint8_t*>(remote.outbound_input_block(j));
       const uint32_t num_packed = *remote.packed_token_count(j);
-      if (num_packed > 0)
+      const bool single_input_put = kWeightTileBytes == 8448 && kNumRanks == 16 && kNumNodes == 2 &&
+                                    kNumMaxTokensPerRank == 2 && num_tokens == 1 &&
+                                    num_packed == 1 && !io.is_lsa(j);
+      if (num_packed > 0 && !single_input_put)
         io.put_warp(j, dst_block, src_block, static_cast<uint64_t>(num_packed) * kHidden, lane_idx,
                     false, nullptr);
       if (lane_idx == 0) remote.header_control(header)[0] = num_packed;
@@ -129,8 +128,13 @@ const auto remote_send = [&]() {
       // Scales, routing ids, weights (whole regions) and the header, contiguous.
       const uint64_t tail =
           static_cast<uint64_t>(remote.input_block_bytes) - sf_block_offset + remote.header_bytes();
-      io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset, tail, lane_idx, true,
-                  remote.inbox_flag(at));
+      if (single_input_put) {
+        const uint64_t bytes = remote.input_block_bytes + remote.header_bytes();
+        io.put_warp(j, dst_block, src_block, bytes, lane_idx, true, remote.inbox_flag(at));
+      } else {
+        io.put_warp(j, dst_block + sf_block_offset, src_block + sf_block_offset, tail, lane_idx,
+                    true, remote.inbox_flag(at));
+      }
     }
   }
 };

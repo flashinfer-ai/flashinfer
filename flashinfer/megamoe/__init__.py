@@ -370,7 +370,8 @@ class MegaMoESymmBuffer:
             FP32 activation scales with shape ``[tokens, hidden // 128]``.
         topk_idx : torch.Tensor
             INT64 global expert indices with shape ``[tokens, num_topk]``.
-            A value of -1 masks a route.
+            Use distinct expert IDs in ``[0, num_experts)`` per token;
+            -1 masks a route.
         topk_weights : torch.Tensor
             FP32 routing weights with shape ``[tokens, num_topk]``.
 
