@@ -145,6 +145,7 @@ def _compiled(
         compile_kernel,
         extra_key_files=[
             __file__,
+            str(Path(__file__).parents[2] / "cute_dsl" / "utils.py"),
             *(
                 str(Path(__file__).with_name(name))
                 for name in ("kernel_paged_decode.py", "qmul4.py")

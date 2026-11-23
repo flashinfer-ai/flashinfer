@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """ResServe grouped residue attention against decoded FP32 attention."""
 
+import re
+
 import pytest
 import torch
 
@@ -246,3 +248,33 @@ def test_long_decode_and_empty_splits(d, length, splits, monkeypatch):
     assert torch.all((out.float() - expected).abs() <= bound)
     eager = paged_decode_residue(*args, num_splits=splits)
     torch.testing.assert_close(out, eager, atol=0, rtol=0)
+
+
+def compile_decode_ptx(reduction, tmp_path, monkeypatch):
+    from cutlass import cute
+
+    from flashinfer.experimental.resserve_resattn import host
+
+    compile_kernel = cute.compile
+
+    def compile_with_ptx(*args, **kwargs):
+        kwargs["options"] += f" --keep-ptx --dump-dir {tmp_path}"
+        return compile_kernel(*args, **kwargs)
+
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
+    monkeypatch.setattr(cute, "compile", compile_with_ptx)
+    host._compiled.__wrapped__(12, 2, 128, reduction, 128)
+    (ptx_path,) = tmp_path.glob("*.ptx")
+    return ptx_path.read_text()
+
+
+def test_cga_wait_acquires_peer_writes(tmp_path, monkeypatch):
+    ptx = compile_decode_ptx("cga_sharded", tmp_path, monkeypatch)
+    wait = ptx.index("mbarrier.try_wait.parity.relaxed.cluster")
+    after_wait = ptx[wait:]
+    load = re.search(r"\bld\.shared\b", after_wait)
+    assert load is not None
+    assert (
+        "fence.acquire.sync_restrict::shared::cluster.cluster"
+        in after_wait[: load.start()]
+    )
