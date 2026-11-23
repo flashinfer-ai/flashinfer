@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 from collections import Counter, OrderedDict
+from contextvars import ContextVar
 import logging
 import os
 import struct
@@ -86,6 +87,11 @@ from .gemm_mm_fp4_cute_dsl import (
     precompile_mm_fp4_tactics,
 )
 from .gemm_mm_mxfp8_precompile import precompile_mm_mxfp8_tactics
+from .mxfp8_smallm_sm107 import (
+    SpecializedMxfp8SmallMRunner,
+    dispatch_mm_mxfp8_specialized,
+    specialized_mm_mxfp8_eligible,
+)
 from .gemm_mm_mxfp8_cute_dsl import (
     _b12x_gemm_mxfp8_requirement,
     _b12x_gemm_mxfp8_runner,
@@ -7411,6 +7417,25 @@ def get_cutlass_mxfp8_gemm_module(
         raise ValueError(f"Unsupported SM major version: {sm_major}")
 
 
+def _check_mm_mxfp8_tensor_devices(a, b, a_descale, b_descale, out):
+    device = a.device
+    if device.type != "cuda":
+        raise ValueError(f"a must be a CUDA tensor, got {device}.")
+    for name, tensor in (
+        ("b", b),
+        ("a_descale", a_descale),
+        ("b_descale", b_descale),
+    ):
+        if tensor.device != device:
+            raise ValueError(
+                f"{name} must be on the same CUDA device as a ({device}), got {tensor.device}."
+            )
+    if out is not None and out.device != device:
+        raise ValueError(
+            f"Output device mismatch. Expected {device}, got {out.device}."
+        )
+
+
 def _check_mm_mxfp8_problem_size(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -7422,7 +7447,7 @@ def _check_mm_mxfp8_problem_size(
     backend: Literal["cutlass", "cute-dsl", "trtllm", "auto"] = "auto",  # unused
     batch_invariant: bool = False,
 ) -> bool:
-    # Generic checks
+    _check_mm_mxfp8_tensor_devices(a, b, a_descale, b_descale, out)
     ## pre-check the input tensors and block scale tensors
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"mm_mxfp8 accepts 2d tensors, got {a.shape=} and {b.shape=}")
@@ -7516,10 +7541,6 @@ def _check_mm_mxfp8_problem_size(
         if out.shape != expected_shape:
             raise ValueError(
                 f"Output shape mismatch. Expected {expected_shape}, got {out.shape}."
-            )
-        if out.device != a.device:
-            raise ValueError(
-                f"Output device mismatch. Expected {a.device}, got {out.device}."
             )
         if out.dtype != out_dtype:
             raise ValueError(
@@ -8856,6 +8877,37 @@ def _cudnn_mm_mxfp8_runner():
     return CudnnMmMxfp8GemmRunner()
 
 
+# The kernel is SM107-only, so the checker gates "specialized" to CC 10.7
+# (the same pattern as the SM120 "specialized" mm_fp4 backend): explicit
+# backend="specialized" on any other arch raises the decorator's standard
+# unsupported-backend error, and auto resolution never lists it there. On
+# SM107 the dispatcher still owns the fine-grained gates (allowlist, scale
+# layout, alignment, kill switch) and refuses explicit calls it cannot serve
+# with the precise reason (NotImplementedError) — an explicitly selected
+# backend never falls back. The auto heuristic ranks "specialized" FIRST
+# exactly when the call is on the kernel's measured allowlist
+# (specialized_mm_mxfp8_eligible), so it is a default auto candidate and a
+# first-class autotune candidate there.
+@supported_compute_capability([107])
+def _specialized_mm_mxfp8_requirement(
+    a: torch.Tensor,  # unused
+    b: torch.Tensor,  # unused
+    a_descale: torch.Tensor,  # unused
+    b_descale: torch.Tensor,  # unused
+    out: Optional[torch.Tensor] = None,  # unused
+    out_dtype: torch.dtype = torch.bfloat16,  # unused
+    use_8x4_sf_layout: bool = True,  # unused
+    backend: str = "auto",  # unused
+    batch_invariant: bool = False,  # unused
+):
+    # The specialized backend is always selectable: an explicit call its
+    # kernel cannot serve (shape off the allowlist, non-SM107 device, kill
+    # switch, JIT failure) raises NotImplementedError inside mm_mxfp8 with
+    # the precise refusal reason — it never falls back to any other
+    # implementation.
+    return True
+
+
 def _heuristic_func_mm_mxfp8(
     suitable_backends: List[str],
     a: torch.Tensor,
@@ -8871,28 +8923,90 @@ def _heuristic_func_mm_mxfp8(
     if batch_invariant:
         # the batch-invariant class runs in place of the backends: their availability does not decide the call
         return ["batch_invariant"]
+    # The specialized SM107 small-M kernel ranks first exactly on its
+    # measured (M, N, K) allowlist (and the rest of its dispatch guards):
+    # there it is the default auto choice (untuned calls run the first
+    # suitable backend) AND a first-class autotune candidate (the tuner
+    # races it as itself against the stock backends below). Off the
+    # allowlist it is absent and the stock ranking is untouched.
+    specialized_first: List[str] = []
+    if "specialized" in suitable_backends and (
+        specialized_mm_mxfp8_eligible(
+            a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout
+        )
+        is None
+    ):
+        specialized_first = ["specialized"]
     # Prefer b12x where eligible.
     if "b12x" in suitable_backends:
         order = ["b12x", "cutlass"] + (["cudnn"] if CUDNN_AVAILABLE else [])
-        return [c for c in order if c in suitable_backends]
+        return specialized_first + [c for c in order if c in suitable_backends]
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
         major, minor = get_compute_capability(a.device)
         if (major, minor) != (10, 7):
-            return ["cutlass"]
-        # On SM107 untuned calls run CUTLASS; the autotuner also ranks CuTe-DSL and cuDNN.
-        return [c for c in ("cutlass", "cute-dsl", "cudnn") if c in suitable_backends]
+            return specialized_first + ["cutlass"]
+        # On SM107 untuned calls run the first suitable backend (the
+        # specialized kernel on its allowlist, CUTLASS otherwise); the
+        # autotuner ranks every listed candidate.
+        return specialized_first + [
+            c for c in ("cutlass", "cute-dsl", "cudnn") if c in suitable_backends
+        ]
     # fall back to cudnn (e.g. on SM12x when CUTLASS scale-layout
     # requirements are not met) when it is available.
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
-        return ["cudnn"]
+        return specialized_first + ["cudnn"]
     if CUTE_DSL_AVAILABLE and "cutedsl_low_latency" in suitable_backends:
-        return ["cutedsl_low_latency"]
-    return []
+        return specialized_first + ["cutedsl_low_latency"]
+    return specialized_first
 
 
+# Backends of mm_mxfp8, as plain strings. "specialized" is the agent-generated
+# SM107 small-M kernel (flashinfer/gemm/mxfp8_smallm_sm107.py): a default
+# auto/autotune candidate on its shape allowlist (ranked first by the
+# heuristic there), absent elsewhere.
+MM_MXFP8_BACKENDS = (
+    "auto",
+    "specialized",
+    "cutlass",
+    "cute-dsl",
+    "cutedsl_low_latency",
+    "trtllm",
+    "cudnn",
+    "b12x",
+)
+
+
+_mxfp8_auto_choice = ContextVar("mxfp8_auto_choice", default=None)
+
+
+def _scope_mxfp8_choice(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        requested = kwargs.get("backend", args[7] if len(args) > 7 else "auto")
+        if requested == "auto" and not kwargs.get("batch_invariant", False):
+            # Automatic dispatch needs candidates for this invocation, even
+            # when skip_check was requested. Explicit backends retain it.
+            kwargs["skip_check"] = False
+        token = _mxfp8_auto_choice.set(None)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _mxfp8_auto_choice.reset(token)
+
+    return wrapped
+
+
+def _resolve_mxfp8_choice(*args, **kwargs):
+    names = _heuristic_func_mm_mxfp8(*args, **kwargs)
+    _mxfp8_auto_choice.set(tuple(names))
+    return names
+
+
+@_scope_mxfp8_choice
 @backend_requirement(
     {
+        "specialized": _specialized_mm_mxfp8_requirement,
         "cutlass": _cutlass_gemm_mxfp8_requirement,
         "trtllm": _trtllm_gemm_mxfp8_requirement,
         "cute-dsl": _cute_dsl_gemm_mxfp8_requirement,
@@ -8901,7 +9015,7 @@ def _heuristic_func_mm_mxfp8(
         "b12x": _b12x_gemm_mxfp8_requirement,
     },
     common_check=_check_mm_mxfp8_problem_size,
-    heuristic_func=_heuristic_func_mm_mxfp8,  # result stored in mm_mxfp8.suitable_auto_backends
+    heuristic_func=_resolve_mxfp8_choice,
     bypass=_batch_invariant_requested,
 )
 @flashinfer_api(trace=mm_mxfp8_trace)
@@ -8914,7 +9028,14 @@ def mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"
+        "cutlass",
+        "cute-dsl",
+        "cutedsl_low_latency",
+        "trtllm",
+        "cudnn",
+        "b12x",
+        "specialized",
+        "auto",
     ] = "auto",
     *,
     batch_invariant: bool = False,
@@ -8956,7 +9077,7 @@ def mm_mxfp8(
     use_8x4_sf_layout: bool
         Whether the scale tensors for a are in 8x4 layout (vs 128x4).
 
-    backend: Literal["cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"]
+    backend: Literal["cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "specialized", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
         ``"auto"`` selects the CUTLASS backend when available and otherwise
         falls back to the cuDNN backend. On SM107, with CUTLASS available, the
@@ -8979,6 +9100,23 @@ def mm_mxfp8(
           ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
           layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/107/110/120/121.
+        - The ``"specialized"`` backend is an agent-generated SM107 small-M
+          kernel for decode-size shapes (bf16 out, 1D swizzled 128x4 scales).
+          It is a DEFAULT auto candidate on its exact measured (M, N, K)
+          allowlist (``flashinfer/mm_mxfp8_specialized_sm107_workloads.json``):
+          there the heuristic ranks it first (untuned ``"auto"`` runs it) and
+          the autotuner races it as a first-class candidate against the stock
+          SM107 backends, caching whichever wins per bucket; every other
+          shape keeps the stock ranking. An explicitly selected backend is
+          never silently swapped and never falls back: explicit
+          ``backend="specialized"`` that cannot serve a call (off-list shape,
+          kill switch, JIT failure) raises ``NotImplementedError`` with the
+          refusal reason, and on a non-SM107 device the backend checker
+          raises its standard unsupported-backend error; only ``"auto"``
+          routes around a refusal.
+          ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time)
+          disables the kernel: ``"auto"`` keeps the stock path, explicit
+          ``backend="specialized"`` raises.
 
     batch_invariant: bool
         ``True`` runs the batch-invariant MXFP8 GEMM class in place of the
@@ -9053,12 +9191,40 @@ def mm_mxfp8(
             dtype=out_dtype,
         )
 
+    # The "specialized" backend (agent-generated SM107 small-M kernel).
+    # Explicit backend="specialized" is served here: the kernel on its
+    # strict (M, N, K) allowlist of measured decode-size shapes; a call it
+    # cannot serve raises NotImplementedError with the refusal reason — an
+    # explicitly selected backend never falls back. Under backend="auto" the
+    # kernel is a DEFAULT candidate of the runner machinery below instead:
+    # the heuristic ranks it first exactly on its allowlist (untuned auto
+    # therefore runs it there, via the runners[0] fallback convention) and
+    # the autotuner races it as itself against the stock backends. An
+    # explicitly selected stock backend is never swapped.
+    # FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 disables the kernel (auto:
+    # stock path; explicit: raise). See flashinfer/gemm/mxfp8_smallm_sm107.py.
+    if backend == "specialized":
+        if dispatch_mm_mxfp8_specialized(
+            a,
+            b,
+            a_descale,
+            b_descale,
+            out,
+            out_dtype,
+            use_8x4_sf_layout,
+            explicit=True,
+        ):
+            return out
+
     workspace_buffer = _get_stream_cache_buf(
         "mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
     if backend == "auto":
-        backends = mm_mxfp8.suitable_auto_backends
+        choice = _mxfp8_auto_choice.get()
+        if not choice:
+            raise ValueError("No auto backend resolved for this mm_mxfp8 call")
+        backends = list(choice)
     else:
         backends = [backend]
 
@@ -9075,6 +9241,7 @@ def mm_mxfp8(
     ]
 
     backend_to_runner_factory = {
+        "specialized": lambda: SpecializedMxfp8SmallMRunner(use_8x4_sf_layout),
         "cutlass": lambda: get_cutlass_mxfp8_gemm_module(
             major
         ).cutlass_mxfp8_gemm_runner(),
@@ -9116,10 +9283,18 @@ def mm_mxfp8(
     # A cached warp split-K entry is keyed by M bucket, so it can come from an M the
     # kernel does not serve or carry a tactic illegal for this shape. Fall back to
     # the first runner's default, as the autotuner itself does.
-    if hasattr(runner, "is_tactic_compatible") and not (
-        runner.supports_inputs(inputs) and runner.is_tactic_compatible(inputs, tactic)
-    ):
-        runner, tactic = runners[0], -1
+    def accepts(r, t):
+        return (not hasattr(r, "supports_inputs") or r.supports_inputs(inputs)) and (
+            not hasattr(r, "is_tactic_compatible") or r.is_tactic_compatible(inputs, t)
+        )
+
+    if not any(r is runner for r in runners) or not accepts(runner, tactic):
+        for candidate in runners:
+            if accepts(candidate, -1):
+                runner, tactic = candidate, -1
+                break
+        else:
+            raise ValueError("No mm_mxfp8 runner accepts these inputs")
 
     runner(inputs=inputs, tactic=tactic)
     return out
@@ -11198,9 +11373,11 @@ _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
         ConstraintSpec(
             2,
             0,
-            lambda shapes: shapes[0][0]
-            * _mxfp8_swizzled_scale_len(
-                shapes[0][1], shapes[0][2], SfLayout.layout_128x4
+            lambda shapes: (
+                shapes[0][0]
+                * _mxfp8_swizzled_scale_len(
+                    shapes[0][1], shapes[0][2], SfLayout.layout_128x4
+                )
             ),
         ),
         ConstraintSpec(4, 1, lambda shapes: shapes[0][1]),
