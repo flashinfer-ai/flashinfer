@@ -20,7 +20,8 @@ else from flashinfer; ``test_cake_fp4_mla_decode_api.py`` tests the public
 ``flashinfer.mla.prepare_fp4_mla_decode`` route.  The cache and the query are
 written here in TensorRT-LLM's layout (E2M1 codes, E4M3 block scales in the
 128x4 swizzle, the NoPE scales shared by each 16-token x 16-channel tile, the
-RoPE as a base and a residual) from random latents; the reference is float64
+V-scale pool of those tile scales, the RoPE as a base and a residual) from
+random latents; the reference is float64
 attention over the dequantized bytes.  The probabilities are NVFP4 in the
 kernel, so the bound is on the per-row relative L2 error.
 """
@@ -37,6 +38,8 @@ pkg = cake_package("cake_fp4_mla_decode")
 PAGE = 128
 ROW_BYTES = 320
 SF_COLS = 40
+V_SF_COLS = PAGE // 16  # V-scale pool: one scale per 16-token block
+V_SF_PAGE_BYTES = 512 * V_SF_COLS
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 Q_GLOBAL_SCALE = 6.0 * 448.0 / 400.0
 KV_GLOBAL_SCALE = 6.0 * 448.0 / 30.0
@@ -55,13 +58,13 @@ def _device_or_skip() -> torch.device:
 # --------------------------------------------------------------------------- the writer
 
 
-def _sf_offset(row, col):
+def _sf_offset(row, col, cols=SF_COLS):
     return (
         col % 4
         + (col // 4) * 512
         + (row % 32) * 16
         + ((row % 128) // 32) * 4
-        + (row // 128) * 128 * SF_COLS
+        + (row // 128) * 128 * cols
     )
 
 
@@ -118,9 +121,15 @@ def _write_case(seed, heads, q_len, kv_lens, width, device):
     page_table = torch.zeros(batch, width, dtype=torch.int32)
     kv = torch.full((pages, PAGE, ROW_BYTES), POISON, dtype=torch.uint8)
     sf = torch.full((pages, PAGE * SF_COLS), POISON, dtype=torch.uint8)
+    vsf = torch.full((pages, V_SF_PAGE_BYTES), POISON, dtype=torch.uint8)
     offs = _sf_offset(
         torch.arange(PAGE)[:, None], torch.arange(SF_COLS)[None, :]
     )  # [128, 40]
+    # The V-scale pool's (channel d, block k) byte; blocks without a key stay
+    # stale, as the writer leaves them.
+    v_offs = _sf_offset(
+        torch.arange(512)[None, :], torch.arange(V_SF_COLS)[:, None], V_SF_COLS
+    )  # [8, 512]
     cursor = 0
     for b, n in enumerate(kv_lens):
         ids = perm[cursor : cursor + used[b]]
@@ -160,6 +169,10 @@ def _write_case(seed, heads, q_len, kv_lens, width, device):
             rows_sf[:tok] = cols
             n_rows = rows_sf.shape[0]
             sf[page, offs[:n_rows].reshape(-1)] = rows_sf.reshape(-1)
+            # Each channel's V scale is its block's NoPE tile scale.
+            vsf[page, v_offs[:blocks].reshape(-1)] = tile_sf.repeat_interleave(
+                16, 1
+            ).reshape(-1)
     rows = batch * q_len * heads
     q = (torch.randn(rows, 576, generator=gen, dtype=torch.float64) * 0.25).clamp(-1, 1)
     qn = q[:, :512]
@@ -184,6 +197,7 @@ def _write_case(seed, heads, q_len, kv_lens, width, device):
     return {
         "kv": kv.to(device),
         "sf": sf.to(device),
+        "vsf": vsf.to(device),
         "q_fp4": q_fp4.to(device),
         "q_sf": q_sf.to(device),
         "page_table": page_table.to(device),
@@ -254,6 +268,7 @@ def _run(decode, case, out, sm_scale):
     return decode(
         case["kv"],
         case["sf"],
+        case["vsf"],
         case["q_fp4"],
         case["q_sf"],
         case["page_table"],
@@ -371,6 +386,10 @@ def test_fp4_mla_decode_rejects_mismatched_tensors():
         _run(decode, case, out[:10], 0.1)
     with pytest.raises(ValueError, match="kv_cache"):
         _run(decode, dict(case, kv=case["kv"][:, :64]), out, 0.1)
+    with pytest.raises(ValueError, match="v_scale_cache"):
+        _run(decode, dict(case, vsf=case["vsf"][:, :2048]), out, 0.1)
+    with pytest.raises(ValueError, match="v_scale_cache"):
+        _run(decode, dict(case, vsf=case["vsf"][:-1]), out, 0.1)
 
 
 def test_short_build_gives_the_long_builds_bits_on_short_rows():

@@ -7638,8 +7638,9 @@ def prepare_fp4_mla_decode(
     Returns a runner for one bucket (``batch`` requests of ``q_len`` query
     tokens and ``num_heads`` heads, at most 128, over a page table
     ``page_table_width`` pages wide) on ``device``; calling it with the
-    layer's cache views, the step's prequantized query and scales, the page
-    table, the KV lengths and the FP32 global scales writes the caller-owned
+    layer's cache views (the KV pages, their K scales and the MLA V-scale
+    pool), the step's prequantized query and scales, the page table, the KV
+    lengths and the FP32 global scales writes the caller-owned
     BF16 output ``[batch * q_len * num_heads, 512]`` with no CUDA allocation.
     ``max_kv``, when given, bounds every KV length of every call of the
     runner (it selects the decode build, never the split count).

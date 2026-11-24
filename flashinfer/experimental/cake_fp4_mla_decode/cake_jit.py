@@ -21,12 +21,18 @@ Contract of the decode: the cache is TensorRT-LLM's ``fp4_mla`` layout, 128
 tokens per page, each token 320 bytes of E2M1 codes (512 NoPE channels, 64
 RoPE-base and 64 RoPE-residual channels, the even channel in the low nibble)
 with 40 E4M3 block scales per token in the 128x4 swizzle (5,120 bytes per
-page); the query is TensorRT-LLM's prequantized query, 320 bytes per
-``token * H + head`` row with its swizzled E4M3 scales; both carry an FP32
-global scale on the device.  ``S = sm_scale (qN.kN + (qRb + qRr).kRb +
-qRb.kRr) / (q_gs kv_gs)`` over the keys each query token sees (bottom-right
-causal), softmax, ``O = P V`` with V the NoPE channels of the same cache
-bytes; P is quantized to NVFP4 per 16 keys.  ``out`` is BF16 ``[rows, 512]``.
+page), and TensorRT-LLM's MLA V-scale pool (4,096 bytes per page: per NoPE
+channel, the K scale of the first token of each 16-token block); the query
+is TensorRT-LLM's prequantized query, 320 bytes per ``token * H + head`` row
+with its swizzled E4M3 scales; both carry an FP32 global scale on the
+device.  ``S = sm_scale (qN.kN + (qRb + qRr).kRb + qRb.kRr) / (q_gs kv_gs)``
+over the keys each query token sees (bottom-right causal), softmax, ``O = P
+V`` with V the NoPE channels of the same cache bytes, scaled by the V-scale
+pool; P is quantized to NVFP4 per 16 keys.  ``out`` is BF16 ``[rows, 512]``.
+
+The reducer launches with programmatic dependent launch (its records'
+``launch.use_pdl``): the decode releases it early and it waits for the
+decode grid before it reads the partials.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled once per
@@ -165,6 +171,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "q_len": "q_len",
             "q_sf": "q_sf",
             "sm_scale": "sm_scale",
+            "v_pool": "v_pool",
         },
         "module": "tart.mla_decode_trtllm_fp4_cache.sm100_sm103.fp4_mla_decode",
         "stage": "decode",
@@ -243,6 +250,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "q_len": "q_len",
             "q_sf": "q_sf",
             "sm_scale": "sm_scale",
+            "v_pool": "v_pool",
         },
         "module": "tart.mla_decode_trtllm_fp4_cache.sm100_sm103.fp4_mla_decode",
         "stage": "decode",
@@ -291,7 +299,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": False,
+            "use_pdl": True,
         },
         "library": "cake_fp4_mla_decode_384210a7aa131bb687ed",
         "logical": {
@@ -352,7 +360,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": False,
+            "use_pdl": True,
         },
         "library": "cake_fp4_mla_decode_8ee8a5d7f516f133be58",
         "logical": {
@@ -413,7 +421,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "cluster": (1, 1, 1),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": False,
+            "use_pdl": True,
         },
         "library": "cake_fp4_mla_decode_03890e366badc8e5325e",
         "logical": {
