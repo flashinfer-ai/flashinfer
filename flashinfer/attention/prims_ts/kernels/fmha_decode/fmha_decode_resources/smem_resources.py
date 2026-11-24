@@ -246,6 +246,39 @@ def cp_async_bulk_tensor_2d_gather4(
     )
 
 
+@cute.jit
+def _cp_async_bulk_tensor_2d_gather4_lane(
+    dst_mem: cutlass.Array,
+    tma_desc: cutlass.Pointer,
+    column: Int32,
+    rows: tuple[Int32, Int32, Int32, Int32],
+    mbar: cutlass.Array,
+    issue: cutlass.Boolean,
+) -> None:
+    """Issue one 2-D TMA gather4 copy from every lane whose ``issue`` is true.
+
+    The lane-parallel form of ``cp_async_bulk_tensor_2d_gather4``: each
+    issuing lane passes its own destination and four row coordinates.
+    """
+    r0, r1, r2, r3 = rows
+    cute.arch.inline_ptx(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile::gather4"
+        ".mbarrier::complete_tx::bytes "
+        "[{$r0}], [{$r1}, {{$r3}, {$r4}, {$r5}, {$r6}, {$r7}}], [{$r2}];",
+        read_only_args=[
+            dst_mem.data_ptr().toint(cutlass.Int32),
+            tma_desc.toint(cutlass.Int64),
+            mbar.data_ptr().toint(cutlass.Int32),
+            column,
+            r0,
+            r1,
+            r2,
+            r3,
+        ],
+        predicate=issue,
+    )
+
+
 def _kv_dtype_bytes_for_kind(
     cfg: Constexpr[FmhaDecodeConfig], kv_kind: Constexpr[int]
 ) -> int:
@@ -3463,7 +3496,38 @@ class SmemKvResource(DecodeGenResourceBase):
                         stage_info.barrier,
                         issue,
                     )
-                    if cutlass.const_expr(cfg.uses_nvfp4_scale_tensors):
+                    if cutlass.const_expr(cfg.uses_nvfp4_scale_gather4):
+                        # Lanes 4k..4k+3 hold four consecutive fragments of
+                        # the warp's share; lane 4k gathers their flat scale
+                        # rows (FmhaDecodeConfig.uses_nvfp4_scale_gather4).
+                        # A -1 locator decodes to page -1, so its row is
+                        # negative and the copy zero-fills it.
+                        subpages = (
+                            cfg.effective_storage_tokens_per_page
+                            // cfg.num_tokens_per_page
+                        )
+                        frag_shift = cfg.num_tokens_per_page.bit_length() - 1
+                        assert cfg.num_tokens_per_page == 1 << frag_shift
+                        sf_row = (
+                            physical_page * Int32(cfg.flat_nvfp4_scale_num_heads)
+                            + logical_h_k_idx
+                        ) * Int32(subpages) + (token_offset >> Int32(frag_shift))
+                        sf_rows = [sf_row]
+                        for j in cutlass.range_constexpr(1, 4):
+                            sf_rows.append(
+                                cute.arch.shuffle_sync(
+                                    sf_row, (lane + Int32(j)) & Int32(31)
+                                )
+                            )
+                        _cp_async_bulk_tensor_2d_gather4_lane(
+                            sf_stage_base.subview(page_frag * sf_page_elems),
+                            sf_desc,
+                            Int32(0),
+                            tuple(sf_rows),
+                            stage_info.barrier,
+                            issue & ((lane & Int32(3)) == Int32(0)),
+                        )
+                    elif cutlass.const_expr(cfg.uses_nvfp4_scale_tensors):
                         _cp_async_bulk_tensor_4d_shared_cta_global_lane(
                             sf_stage_base.subview(page_frag * sf_page_elems),
                             sf_desc,
@@ -3556,6 +3620,7 @@ class SmemKvResource(DecodeGenResourceBase):
                         # Scale factors for the same page use the same transaction
                         # barrier as the packed K/V payload, one box per fragment
                         # (see FmhaDecodeConfig.sf_tma_reshape_factor).
+                        assert not cfg.uses_nvfp4_scale_gather4
                         if cutlass.const_expr(cfg.uses_nvfp4_scale_tensors):
                             _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
                                 sf_stage_base.subview(page_frag * sf_page_elems),
