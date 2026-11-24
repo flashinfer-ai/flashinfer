@@ -964,9 +964,12 @@ python scripts/generate_moe_activation_matrix.py --write
 <!-- END GENERATED MOE ACTIVATION MATRIX -->
 
 The batch-invariant fp4 backend (`BatchInvariantFp4Config`) computes the exponential and the divisions of the typed activations
-above with the part's SFU (`ex2.approx` / `rcp.approx`): deterministic and batch-invariant per part, the bits
-architecture-specific; the ReLU family and `PowLU` are the declared sequences. The verification standard is in
-`flashinfer/batch_invariant/README.md`.
+above with the part's SFU (`ex2.approx` / `rcp.approx`): deterministic and batch-invariant per part, the bits a property of
+the architecture family (the fold's instruction class and the SFU tables; SM100 and SM103 are one family, SM107 another),
+so an output is not, in general, equal across families; the ReLU family and `PowLU` are the declared sequences with no SFU
+step. The tests pin the SFU tables' digest per part they run on; on a part without a pinned digest the digest test skips
+and reports the part's digest, and the classes run unchanged (deterministic and batch-invariant on that part). The
+verification standard is in `flashinfer/batch_invariant/README.md`.
 
 For the explicit SM100/SM103/SM107 low-token `frost_low_latency` backend, see the
 [usage, qualification and extension guide](../frost_low_latency_moe.md).
