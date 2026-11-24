@@ -2424,7 +2424,7 @@ def test_nvfp4_batched_quantize(
 ) -> None:
     """Test nvfp4_batched_quantize function."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -2467,7 +2467,7 @@ def test_scaled_fp4_grouped_quantize(
 ) -> None:
     """Test scaled_fp4_grouped_quantize function."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -2521,7 +2521,7 @@ def test_silu_and_mul_scaled_nvfp4_experts_quantize(
 ) -> None:
     """Test silu_and_mul_nvfp4_batched_quantize function."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     set_nvfp4_quant_env(nvfp4_4over6_config=nvfp4_4over6_config)
     torch.set_default_device(device)
     torch.manual_seed(seed)
@@ -2634,7 +2634,7 @@ def test_silu_and_mul_nvfp4_quantize(
 ) -> None:
     """Compare fused and unfused CuTe-DSL paths across layouts and scale-math modes."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     set_nvfp4_quant_env(disable_quant_fast_math=disable_fast_math)
@@ -2687,7 +2687,7 @@ def test_cute_dsl_nvfp4_quantize_resolves_recipe_on_empty_input():
     """Empty inputs must still validate the recipe (and reject fp8 + recipe)."""
     device = torch.device("cuda")
     if not _is_fp4_supported(device):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     from flashinfer.quantization.kernels.nvfp4_quantize import (
@@ -2741,7 +2741,7 @@ def test_silu_and_mul_nvfp4_quantize_4over6(
 ) -> None:
     """Compare fused and unfused CuTe-DSL paths with the 4over6 recipe."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     set_nvfp4_quant_env(nvfp4_4over6_config=nvfp4_4over6_config)
