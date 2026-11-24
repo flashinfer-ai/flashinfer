@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""TraceTemplates of the SDSA (Simplified DSA) indexer APIs in :mod:`flashinfer.sdsa`."""
+"""TraceTemplates of the SDSA (Simplified DSA) APIs in :mod:`flashinfer.sdsa`."""
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
@@ -235,5 +235,194 @@ top_k_from_candidates_trace = TraceTemplate(
     outputs={
         "top_keys": Tensor(["rows", "top_k"], dtype="int32", param="top_keys"),
     },
+    tags=["arch:sm100", "arch:sm103"],
+)
+
+token_sparse_kv_indices_trace = TraceTemplate(
+    op_type="sdsa_token_sparse_kv_indices",
+    axes={
+        "tokens": Var(description="Query tokens."),
+        "top_k": Const(description="Key positions per token, a multiple of 512."),
+        "requests": Var(description="Block-table rows."),
+        "blocks": Var(description="64-key blocks per request."),
+        "rows": Var(description="Attention requests, requests_per_token per token."),
+        "lists": Const(description="K slots, then V slots.", value=2),
+    },
+    inputs={
+        "positions": Tensor(["tokens", "top_k"]),
+        "requests": Tensor(["tokens"]),
+        "block_table": Tensor(["requests", "blocks"]),
+        "block_tables": Tensor(["rows", "lists", "top_k"]),
+        "seq_lens": Tensor(["rows"]),
+        "requests_per_token": Scalar("int32"),
+    },
+    outputs={
+        "block_tables": Tensor(
+            ["rows", "lists", "top_k"], dtype="int32", param="block_tables"
+        ),
+        "seq_lens": Tensor(["rows"], dtype="int32", param="seq_lens"),
+    },
+    description="Token-sparse attention's K/V slot lists from key positions.",
+)
+
+group_union_masks_trace = TraceTemplate(
+    op_type="sdsa_group_union_masks",
+    axes={
+        "tokens": Var(
+            description="Query tokens, in groups of consecutive tokens, all one size."
+        ),
+        "top_k": Const(description="Key positions per token, a multiple of 512."),
+        "groups": Var(description="Token groups, one union each."),
+        "requests": Var(description="Block-table rows."),
+        "blocks": Var(description="64-key blocks per request."),
+        "unions": Var(description="Union rows."),
+        "columns": Var(description="Union capacity in keys."),
+        "masks": Var(description="Mask rows."),
+        "words": Var(description="Mask words per row, 32 union columns each."),
+    },
+    inputs={
+        "positions": Tensor(["tokens", "top_k"]),
+        "query_rows": Tensor(["tokens"]),
+        "group_unions": Tensor(["groups"]),
+        "requests": Tensor(["groups"]),
+        "block_table": Tensor(["requests", "blocks"]),
+        "union": Tensor(["unions", "columns"]),
+        "union_sizes": Tensor(["unions"]),
+        "mask": Tensor(["masks", "words"]),
+        "num_keys": Scalar("int32"),
+    },
+    outputs={
+        "union": Tensor(["unions", "columns"], dtype="int32", param="union"),
+        "union_sizes": Tensor(["unions"], dtype="int32", param="union_sizes"),
+        "mask": Tensor(["masks", "words"], dtype="int32", param="mask"),
+    },
+    description="Each token group's union of keys as cache slots, and each token's bitmask over it.",
+)
+
+
+_NVFP4_KV_AXES: dict[str, Var | Const] = {
+    "pages": Var(description="KV cache pages."),
+    "heads": Const(value=1, description="KV heads; the cache is MQA."),
+    "page_size": Const(abbrev="ps", description="Tokens per page."),
+    "packed_dim": Const(abbrev="pd", description="Packed NVFP4 bytes per token."),
+    "scale_dim": Const(abbrev="sd", description="E4M3 block scales per token."),
+}
+_NVFP4_KV_INPUTS = {
+    "k": Tensor(
+        ["pages", "heads", "page_size", "packed_dim"],
+        param="paged_kv_cache",
+        tuple_idx=0,
+    ),
+    "v": Tensor(
+        ["pages", "heads", "page_size", "packed_dim"],
+        param="paged_kv_cache",
+        tuple_idx=1,
+    ),
+    "k_sf": Tensor(
+        ["pages", "heads", "page_size", "scale_dim"],
+        param="kv_cache_sf",
+        tuple_idx=0,
+    ),
+    "v_sf": Tensor(
+        ["pages", "heads", "page_size", "scale_dim"],
+        param="kv_cache_sf",
+        tuple_idx=1,
+    ),
+}
+_NVFP4_KV_OUTPUTS = {
+    "out": Tensor(
+        ["out_rows", "one", "one", "content_dim"], param="out", dtype_from="out"
+    ),
+    "block_tables": Tensor(
+        ["attention_rows", "sides", "top_k"], param="block_tables", dtype="int32"
+    ),
+    "seq_lens": Tensor(["attention_rows"], param="seq_lens", dtype="int32"),
+}
+_NVFP4_KV_CONSTRAINTS = [
+    "content_dim == packed_dim * 4",
+    "scale_dim * 8 == packed_dim",
+]
+
+gather_nvfp4_kv_cache_by_position_trace = TraceTemplate(
+    op_type="sdsa_gather_nvfp4_kv_cache_by_position",
+    axes={
+        **_NVFP4_KV_AXES,
+        "rows": Var(description="Query rows, each with top_k key positions."),
+        "top_k": Const(abbrev="k", description="Key positions per row."),
+        "requests": Var(description="Block-table rows."),
+        "blocks": Var(description="Pages per request in the block table."),
+        "out_rows": Var(description="FP8 workspace rows: rows * top_k or more."),
+        "one": Const(value=1, description="Unit axis of the attention workspace."),
+        "content_dim": Const(abbrev="cd", description="FP8 K then V values per token."),
+        "attention_rows": Var(
+            description="Attention requests: rows * requests_per_row or more."
+        ),
+        "sides": Const(value=2, description="K and V lists."),
+    },
+    inputs={
+        **_NVFP4_KV_INPUTS,
+        "positions": Tensor(["rows", "top_k"]),
+        "requests": Tensor(["rows"]),
+        "block_table": Tensor(["requests", "blocks"]),
+        "out": Tensor(["out_rows", "one", "one", "content_dim"]),
+        "block_tables": Tensor(["attention_rows", "sides", "top_k"]),
+        "seq_lens": Tensor(["attention_rows"]),
+        "lengths": Tensor(["rows"], optional=True),
+        "requests_per_row": Scalar("int32"),
+        "v_sf_swizzled": Scalar("bool"),
+    },
+    outputs=dict(_NVFP4_KV_OUTPUTS),
+    constraints=list(_NVFP4_KV_CONSTRAINTS),
+    description="Selected HND NVFP4 MQA tokens, from key positions, converted to normalized FP8 K/V with their K/V index lists.",
+    tags=["arch:sm100", "arch:sm103"],
+)
+
+compact_nvfp4_kv_cache_trace = TraceTemplate(
+    op_type="sdsa_compact_nvfp4_kv_cache",
+    axes={
+        **_NVFP4_KV_AXES,
+        "rows": Var(description="Query rows, each with top_k key positions."),
+        "top_k": Const(abbrev="k", description="Key positions per row."),
+        "groups": Var(
+            description="Row groups, each converting its selected keys once."
+        ),
+        "requests": Var(description="Block-table rows."),
+        "blocks": Var(description="Pages per request in the block table."),
+        "out_rows": Var(
+            description="FP8 workspace rows: the groups' regions and the zero row."
+        ),
+        "one": Const(value=1, description="Unit axis of the attention workspace."),
+        "content_dim": Const(abbrev="cd", description="FP8 K then V values per token."),
+        "attention_rows": Var(
+            description="Attention requests: rows * requests_per_row or more."
+        ),
+        "sides": Const(value=2, description="K and V lists."),
+        "scratch_words": Var(description="int32 scratch elements."),
+        "bitmap_words": Var(description="int32 key-bitmap elements."),
+    },
+    inputs={
+        **_NVFP4_KV_INPUTS,
+        "positions": Tensor(["rows", "top_k"]),
+        "row_groups": Tensor(["rows"]),
+        "group_requests": Tensor(["groups"]),
+        "block_table": Tensor(["requests", "blocks"]),
+        "group_offsets": Tensor(["groups"]),
+        "out": Tensor(["out_rows", "one", "one", "content_dim"]),
+        "block_tables": Tensor(["attention_rows", "sides", "top_k"]),
+        "seq_lens": Tensor(["attention_rows"]),
+        "scratch": Tensor(["scratch_words"]),
+        "bitmap": Tensor(["bitmap_words"]),
+        "group_dense": Tensor(["groups"], optional=True),
+        "lengths": Tensor(["rows"], optional=True),
+        "max_keys": Scalar("int32"),
+        "max_capacity": Scalar("int32"),
+        "zero_row": Scalar("int32"),
+        "group_base": Scalar("int32"),
+        "requests_per_row": Scalar("int32"),
+        "v_sf_swizzled": Scalar("bool"),
+    },
+    outputs=dict(_NVFP4_KV_OUTPUTS),
+    constraints=list(_NVFP4_KV_CONSTRAINTS),
+    description="Each row group's selected HND NVFP4 MQA tokens converted once to normalized FP8 K/V, and every row's K/V index lists into its group's region.",
     tags=["arch:sm100", "arch:sm103"],
 )

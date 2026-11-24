@@ -44,7 +44,10 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
-from flashinfer.gemm.kernels.epilogue_utils import epilogue_tma_store_with_alpha
+from flashinfer.gemm.kernels.epilogue_utils import (
+    epilogue_tma_store_mxfp8,
+    epilogue_tma_store_with_alpha,
+)
 import torch
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
@@ -916,6 +919,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         c_ld: cutlass.Int64 = cutlass.Int64(0),
+        sfc_ptr: Optional[cute.Pointer] = None,
+        sfc_row_pitch: cutlass.Int64 = cutlass.Int64(0),
+        sfc_batch_offset: cutlass.Int64 = cutlass.Int64(0),
+        a_ld: cutlass.Int64 = cutlass.Int64(0),
+        a_batch_stride: cutlass.Int64 = cutlass.Int64(0),
+        c_batch_stride: cutlass.Int64 = cutlass.Int64(0),
+        strided_ac: cutlass.Constexpr = False,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -940,6 +950,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
         :type epilogue_op: cutlass.Constexpr
+        :param sfc_ptr: Optional UE8M0 scale output. When set, C must be Float8E4M3FN and the epilogue writes
+            MXFP8: each 32-element block of a C row is scaled by a power of two (from the bf16-rounded
+            values, as mxfp8_quantize does) and its scale byte goes to FlashInfer's 128x4 swizzle of the 2-D
+            matrix that holds C, with row pitch ``sfc_row_pitch`` elements; batch l starts
+            ``sfc_batch_offset`` bytes after batch 0.
+        :param strided_ac: Take A's row and batch strides from ``a_ld`` / ``a_batch_stride`` and C's batch
+            stride from ``c_batch_stride`` (K-major A, row-major C only).
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
 
@@ -973,9 +990,22 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             c_out_layout = cute.make_layout(
                 (cute.assume(m, 32), n, l), stride=(1, actual_c_ld, n * actual_c_ld)
             )
+        if cutlass.const_expr(strided_ac):
+            assert self.a_major_mode == OperandMajorMode.K and self.c_layout == utils.LayoutEnum.ROW_MAJOR
+            a_layout = cute.make_layout((m, k, l), stride=(a_ld, 1, a_batch_stride))
+            c_out_layout = cute.make_layout((m, n, l), stride=(actual_c_ld, 1, c_batch_stride))
         a_tensor = cute.make_tensor(a_ptr, a_layout)
         b_tensor = cute.make_tensor(b_ptr, b_layout)
         c_tensor = cute.make_tensor(c_ptr, c_out_layout)
+        sfc_tensor = None
+        if cutlass.const_expr(sfc_ptr is not None):
+            assert self.c_layout == utils.LayoutEnum.ROW_MAJOR, "MXFP8 output needs a row-major C"
+            # FlashInfer's 128x4 swizzle: byte (r, c) -> (r/128)*pitch*4 + (c/128)*512 + (r%32)*16 + (r/32%4)*4 + c/32%4
+            sfc_layout = cute.make_layout(
+                ((32, 4, m // 128), (32, 4, n // 128), l),
+                stride=((16, 4, sfc_row_pitch * 4), (0, 1, 512), sfc_batch_offset),
+            )
+            sfc_tensor = cute.make_tensor(sfc_ptr, sfc_layout)
 
         # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
@@ -1235,6 +1265,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.tile_sched_params,
             epilogue_op,
             alpha,
+            sfc_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1279,11 +1310,15 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         is_a_mcast: bool,
         is_b_mcast: bool,
         alpha: cute.Tensor,
+        mSFC_mnl: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel implementation performing the Persistent batched GEMM computation.
         """
-        alpha_value = alpha[0].to(self.c_dtype)
+        if cutlass.const_expr(mSFC_mnl is not None):
+            alpha_value = alpha[0]
+        else:
+            alpha_value = alpha[0].to(self.c_dtype)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1441,6 +1476,13 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+        tCgSFC = None
+        if cutlass.const_expr(mSFC_mnl is not None):
+            # Scale bytes partitioned like C, so each epilogue thread's bytes line up with its accumulators
+            gSFC_mnl = cute.local_tile(
+                mSFC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+            )
+            tCgSFC = thr_mma.partition_C(gSFC_mnl)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1923,23 +1965,43 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
                 # flashinfer local fix (b53cfd6a7, not in TRT-LLM): apply alpha in
                 # Float32 before the c_dtype conversion to avoid fp16 overflow.
-                acc_consumer_state = epilogue_tma_store_with_alpha(
-                    self,
-                    tidx,
-                    warp_idx,
-                    tma_atom_c,
-                    tCtAcc,
-                    sC,
-                    tCgC,
-                    epi_tile,
-                    tile_sched.num_tiles_executed,
-                    epilogue_op,
-                    alpha_value,
-                    mma_tile_coord_mnl,
-                    acc_consumer_state,
-                    acc_pipeline,
-                    c_pipeline,
-                )
+                if cutlass.const_expr(mSFC_mnl is not None):
+                    acc_consumer_state = epilogue_tma_store_mxfp8(
+                        self,
+                        tidx,
+                        warp_idx,
+                        tma_atom_c,
+                        tCtAcc,
+                        sC,
+                        tCgC,
+                        tCgSFC,
+                        epi_tile,
+                        tile_sched.num_tiles_executed,
+                        epilogue_op,
+                        alpha_value,
+                        mma_tile_coord_mnl,
+                        acc_consumer_state,
+                        acc_pipeline,
+                        c_pipeline,
+                    )
+                else:
+                    acc_consumer_state = epilogue_tma_store_with_alpha(
+                        self,
+                        tidx,
+                        warp_idx,
+                        tma_atom_c,
+                        tCtAcc,
+                        sC,
+                        tCgC,
+                        epi_tile,
+                        tile_sched.num_tiles_executed,
+                        epilogue_op,
+                        alpha_value,
+                        mma_tile_coord_mnl,
+                        acc_consumer_state,
+                        acc_pipeline,
+                        c_pipeline,
+                    )
 
             c_pipeline.producer_tail()
 
@@ -1980,6 +2042,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
+        mSFC_mnl: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -2016,6 +2079,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             self.is_a_mcast,
             self.is_b_mcast,
             alpha,
+            mSFC_mnl,
         )
 
     @staticmethod
@@ -2080,6 +2144,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             cutlass.Float32,
             cutlass.Float16,
             cutlass.BFloat16,
+            cutlass.Float8E4M3FN,
         }:
             raise testing.CantImplementError(f"Unsupported output data type: {c_dtype}")
 

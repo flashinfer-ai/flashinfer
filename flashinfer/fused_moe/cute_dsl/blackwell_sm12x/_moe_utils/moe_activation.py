@@ -11,12 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Gated activation, the epilogue step every fc1_act arm runs on its two accumulators."""
+"""Unary and gated FC1 activation functors."""
 
 import cutlass
 import cutlass.cute as cute
 
 from .....tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA, ActivationType
+
+
+class ReLU2Activation:
+    @cute.jit
+    def __call__(self, acc):
+        for i in cutlass.range_constexpr(cute.size(acc)):
+            value = cute.math.max(acc[i], cutlass.Float32(0))
+            acc[i] = value * value
+        return acc
 
 
 class SwiGLUActivation:
@@ -29,9 +38,9 @@ class SwiGLUActivation:
         for i in cutlass.range_constexpr(cute.size(acc_u)):
             g, u = acc_g[i], acc_u[i]
             if cutlass.const_expr(self.swiglu_limit is not None):
-                g = cute.math.min(g, self.swiglu_limit)
-                u = cute.math.max(
-                    -self.swiglu_limit, cute.math.min(u, self.swiglu_limit)
+                g = cute.arch.fmin(g, self.swiglu_limit)
+                u = cute.arch.fmax(
+                    -self.swiglu_limit, cute.arch.fmin(u, self.swiglu_limit)
                 )
             sigmoid = cute.arch.rcp_approx(
                 1.0 + cute.math.exp(-g, fastmath=self.fastmath)

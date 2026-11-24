@@ -21,6 +21,13 @@ from ......core.validation.common import (
 )
 from ......weights import MoEWeightPack
 from ..validation import validate_routing_values, validate_unit_scalars
+from ..shared_expert import (
+    bind_shared_weights,
+    prepare_shared_weights,
+    validate_shared_weights,
+    stage_shared_inputs,
+    validate_shared_inputs,
+)
 from .config import Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig, Sm107Mxfp8Kind
 from .staging import stage_mega_moe_inputs, validate_sm107_forward_inputs
 from .weights import (
@@ -34,7 +41,7 @@ if TYPE_CHECKING:
         Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
     from ......tensors import MoEEpTensors
-    from ......kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.block_scaled import (
         Sm107BlockScaledSymmBuffer,
     )
     from ..mxfp8_mxfp4_bf16_cutedsl.config import (
@@ -57,6 +64,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     """Fused Rubin mxfp8 block-scaled inference MoE over the NVLink symmetric heap."""
 
     # compute(output=None) returns a view into the workspace.
+    supports_shared_expert = True
     supports_output_view = True
     supports_auto_workspaces = True
 
@@ -68,6 +76,31 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         super().__init__(config)
         self._kernel_config = config
+        self._arithmetic_arch = "sm_107"
+
+    def ep_weight_pack(self, weights):
+        from ..automatic import ep_weight_pack
+
+        return ep_weight_pack(self, weights)
+
+    def ep_selected_config(self, workspace):
+        from ..automatic import ep_selected_config
+
+        return ep_selected_config(self, workspace)
+
+    def ep_prepare_fixed(self, workspace, weights):
+        bind_shared_weights(workspace, weights)
+        workspace.prepare(*weights)
+
+    def ep_force_tune(self, workspace, tensors, weights, output):
+        from ..automatic import ep_force_tune
+
+        ep_force_tune(self, workspace, tensors, weights, output)
+
+    def ep_tuning_contract(self, fleet_params):
+        from ..automatic import ep_tuning_contract
+
+        return ep_tuning_contract(self, fleet_params)
 
     @classmethod
     def create(cls, config):
@@ -102,7 +135,13 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
         validate_mega_arch_sm107()
-        from ......kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
+        if getattr(self._kernel_config, "batch_invariant", False):
+            from ...sm100.common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
+            )
+
+            validate_block_scaled_batch_invariant(self._kernel_config, arch="sm_107")
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import require_sm107_dsl
 
         self._ensure_ep_bootstrap(bootstrap)
         self._resolved_config(fleet_params)
@@ -120,11 +159,14 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, weights: MoEWeightPack, fleet_params: FleetParams
     ) -> TransformedMegaWeights:
         # The MXFP4 subclass overrides both weight methods below.
-        return preprocess_mega_weights(
+        routed = preprocess_mega_weights(
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             kind=cast(Sm107Mxfp8Kind, self._kernel_config.kind),
+        )
+        return prepare_shared_weights(
+            self._kernel_config, weights, routed, fleet_params
         )
 
     def validate_transformed_weights(
@@ -133,6 +175,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:
+        transformed_weights = validate_shared_weights(
+            self._kernel_config, transformed_weights, fleet_params
+        )
         validate_transformed_mega_weights(
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
@@ -156,12 +201,14 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         )
 
     supports_live_token_tuning = True
-    _knob_cache_module = (
-        "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache"
-    )
+    _knob_cache_module = "flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.knob_cache"
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict:
         k = self._kernel_config
+        from ...sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_version,
+        )
+
         return dict(
             dtype=k.kind,
             world_size=self.ep_world_size,
@@ -177,7 +224,28 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             combine_dtype=k.combine_dtype,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
+            swiglu_alpha=getattr(k, "swiglu_alpha", None),
+            swiglu_beta=getattr(k, "swiglu_beta", None),
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
+            shared_expert=k.shared_expert,
+            combine_dedup=k.combine_dedup,
             gate_up_clamp=_resolve_gate_up_clamp(k),
+            batch_invariant=getattr(k, "batch_invariant", False),
+            batch_invariant_version=block_scaled_batch_invariant_version(k)
+            if getattr(k, "batch_invariant", False)
+            else None,
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not getattr(self._kernel_config, "batch_invariant", False):
+            return None
+        from ...sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_fingerprint,
+        )
+
+        return block_scaled_batch_invariant_fingerprint(
+            self._resolved_config(fleet_params), arch="sm_107"
         )
 
     def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
@@ -186,17 +254,45 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         return super().live_token_buckets(fleet_params)
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.sm107.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             Sm107BlockScaledSymmBuffer,
         )
 
-        return Sm107BlockScaledSymmBuffer(self._resolved_config(fleet_params))
+        return Sm107BlockScaledSymmBuffer(
+            self._resolved_config(fleet_params),
+            process_group=self.ep_comm_group if self.ep_world_size > 1 else None,
+        )
 
     def _knob_overrides(self, fleet_params: FleetParams) -> dict:
         """Resolve fixed overrides or the automatic workspace's initial heuristic."""
-        from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
+        if getattr(k, "batch_invariant", False):
+            from ...sm100.common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_default_knobs,
+                validate_block_scaled_batch_invariant,
+            )
+
+            selected = block_scaled_batch_invariant_default_knobs(
+                k,
+                "genphase" if k.kernel_variant == "genphase" else "standard",
+                arch="sm_107",
+            )
+            for name in selected:
+                configured = getattr(k, name, None)
+                if configured is not None:
+                    selected[name] = configured
+            if isinstance(k.knobs, dict):
+                selected.update(k.knobs)
+            elif k.knobs == "cache":
+                selected.update(self._workspace_knobs(fleet_params))
+            elif k.knobs not in (None, "auto"):
+                raise MoEEpConfigError(
+                    "knobs must be None, 'cache', 'auto', or a dictionary"
+                )
+            validate_block_scaled_batch_invariant(k, selected, arch="sm_107")
+            return selected
         if k.knobs is None:
             return {}
         if isinstance(k.knobs, dict):
@@ -208,15 +304,22 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 )
             return dict(k.knobs)
         if k.knobs == "auto":
-            from ......kernel_src.sm107.next_cutedsl_megamoe import default_knobs
+            from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import default_knobs
 
             # Cache selection must be collective before it affects allocation.
-            return default_knobs(
+            selected = default_knobs(
                 fleet_params.max_tokens_per_rank,
                 quant_kind=k.kind,
                 kernel_variant=k.kernel_variant,
                 combine_dtype=k.combine_dtype,
             )
+            if k.combine_dedup:
+                selected.update(
+                    fc2_use_bulk=True,
+                    token_back_mode=k.token_back_mode,
+                    reduce_topk_in_kernel=False,
+                )
+            return selected
         if k.knobs == "cache":
             knobs = self._workspace_knobs(fleet_params)
             assert knobs is not None
@@ -237,6 +340,9 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
+        validate_shared_inputs(
+            self._kernel_config, t, fleet_params, quantize_input=quantize_input
+        )
         validate_unit_scalars(t)
         validate_sm107_forward_inputs(
             t.hidden_states,
@@ -257,6 +363,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         BF16 inputs may fuse validation with quantization; prequantized inputs
         are validated before copying their payload and logical scale columns.
         """
+        stage_shared_inputs(t, workspace, quantize_input=quantize_input)
         if self._kernel_config.knobs == "auto":
             workspace._tuning_inputs = (t, quantize_input)
         if quantize_input:
@@ -271,6 +378,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 kind=self._kernel_config.kind,
                 num_experts=workspace.config.num_total_experts,
                 workspace=workspace,
+                **(
+                    {"batch_invariant": True}
+                    if getattr(self._kernel_config, "batch_invariant", False)
+                    else {}
+                ),
             )
             workspace.note_staged_tokens(staged)
             return
@@ -313,7 +425,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.sm107.next_cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
             sm107_block_scaled_mega_moe,
         )
 
@@ -328,6 +440,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
 
         from ..automatic import prepare_auto_configuration
 
+        bind_shared_weights(workspace, transformed_weights)
         prepare_auto_configuration(
             self, workspace, transformed_weights, output, num_tokens
         )
@@ -350,6 +463,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         fp = fleet_params
         return (
             self.kernel_name(),
+            getattr(k, "batch_invariant", False),
+            self.batch_invariant_fingerprint(fleet_params),
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
@@ -379,6 +494,10 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.cluster_shape_mn,
             k.fallback_cluster_shape_mn,
             k.max_sm_count,
+            k.use_tanh_sigmoid,
+            k.epilogue_warpgroups,
+            k.shared_expert,
+            k.combine_dedup,
             knobs_pool_key(self._knob_overrides(fleet_params)),
         )
 

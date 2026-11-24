@@ -7,7 +7,7 @@ import torch
 
 from flashinfer.moe_ep import BootstrapConfig, FleetParams
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as pkg
+from flashinfer.moe_ep.shims.sm107 import cutedsl_megamoe as pkg
 from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
 
 
@@ -52,15 +52,35 @@ def test_genphase_rejects_unsupported_geometry(overrides):
         _config(**overrides)
 
 
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
-def test_genphase_candidates_respect_fixed_geometry(kind):
+@pytest.mark.parametrize(
+    "kind", ["nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
+)
+def test_genphase_grid_order_and_fixed_geometry(kind):
     cfg = _config(quant_kind=kind)
     assert cfg.padded_tokens_per_rank == 4
     assert _config(max_tokens_per_rank=1024).padded_tokens_per_rank == 1024
     candidates = pkg.sm107_candidates(
         kind, kernel_variant="genphase", allow_in_kernel_fc2_reduce=True
     )
-    assert candidates
+    defaults = pkg.sm107_candidates(kind, kernel_variant="genphase")
+    has_n64 = kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
+    assert len(defaults) == (11 if has_n64 else 8)
+    assert len({tuple(sorted(c.items())) for c in defaults}) == len(defaults)
+    assert len(candidates) == (19 if has_n64 else 16)
+    assert [c for c in candidates if not c["reduce_topk_in_kernel"]] == defaults
+    assert [
+        dict(c, reduce_topk_in_kernel=False)
+        for c in candidates
+        if c["reduce_topk_in_kernel"]
+    ] == [c for c in defaults if c["mma_tiler_mnk"][1] != 64]
+    if has_n64:
+        assert defaults[0]["mma_tiler_mnk"] == (256, 64, 128)
+        assert defaults[0]["schedule_policy"] == ("grouped", None)
+        assert defaults[0]["work_id_mode"] == "grid_stride"
+    phase = defaults[1 if has_n64 else 0]
+    assert phase["mma_tiler_mnk"][1] == 128
+    assert phase["schedule_policy"] == ("phase_interleave", None)
+    assert phase["epi_flag_batches"] == (2, 4)
     assert all(pkg.is_valid_sm107(candidate, cfg) for candidate in candidates)
     assert all(candidate["fc2_use_bulk"] for candidate in candidates)
     assert all(
@@ -228,3 +248,30 @@ def test_cache_fallback_is_valid_for_each_runtime_option(kernel_variant, combine
         combine_dtype=combine_dtype,
     )
     _config(kernel_variant=kernel_variant, combine_dtype=combine_dtype, **knobs)
+
+
+@pytest.mark.parametrize("config_cls,backend_cls,name", _BACKENDS)
+def test_epilogue_options_use_distinct_workspaces(
+    config_cls, backend_cls, name, monkeypatch
+):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    fleet = FleetParams(num_experts=8, max_tokens_per_rank=128, token_hidden_size=384)
+    keys = []
+    for tanh, warpgroups in ((False, 1), (True, 1), (False, 2), (True, 2)):
+        backend = create_mega_kernel(
+            config_cls(
+                256,
+                3,
+                fc2_use_bulk=True,
+                use_tanh_sigmoid=tanh,
+                epilogue_warpgroups=warpgroups,
+            )
+        )
+        backend.bind_ep_bootstrap(BootstrapConfig(rank=0, world_size=1))
+        resolved = backend._resolved_config(fleet)
+        assert (resolved.use_tanh_sigmoid, resolved.epilogue_warpgroups) == (
+            tanh,
+            warpgroups,
+        )
+        keys.append(backend._workspace_pool_key(fleet))
+    assert len(set(keys)) == 4

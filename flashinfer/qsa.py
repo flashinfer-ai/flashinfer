@@ -7,7 +7,6 @@ import functools
 import importlib
 
 import torch
-from packaging.version import Version
 
 from .api_logging import flashinfer_api
 from .trace.templates.qsa import qsa_forward_trace, qsa_indexed_forward_trace
@@ -17,11 +16,6 @@ __all__ = ["qsa_forward", "qsa_indexed_forward"]
 
 @functools.cache
 def _cudnn_ops():
-    frontend = importlib.import_module("cudnn")
-    if Version(frontend.__version__) < Version("1.32.0"):
-        raise RuntimeError(
-            f"QSA requires nvidia-cudnn-frontend>=1.32.0; found {frontend.__version__}"
-        )
     return importlib.import_module("cudnn.ops")
 
 

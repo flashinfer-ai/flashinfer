@@ -1,6 +1,6 @@
 """The Cake Ulysses all-to-all package: its portfolio through the public communicator, and the package route.
 
-The backend assertions import the package only through :func:`tests.test_helpers.cake_package.cake_package`
+The backend assertions import the package only through :func:`tests.cake.test_helpers.cake_package.cake_package`
 (flashinfer-ai/flashinfer#6553); the multi-GPU portfolio runs through the public communicator so the public
 contract (caller-owned outputs, NCCL-equal results) is what is checked.
 """
@@ -24,7 +24,7 @@ from tests.comm.cake_ulysses_a2a_fixture import (
     shapes,
 )
 from tests.comm.test_ulysses_a2a import multi_process_parallel
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_ulysses")
 cake_build = cake_package("cake_ulysses", "cake_build")
@@ -42,6 +42,7 @@ def _correctness_worker(world_size, rank, port, nvlink_kernel):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         for shape in shapes(world_size):
@@ -95,6 +96,7 @@ def _registered_worker(world_size, rank, port):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         for index, shape in enumerate(shapes(world_size)):
@@ -203,6 +205,7 @@ def _unaligned_rank_worker(world_size, rank, port):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         for shape in shapes(world_size):
@@ -757,6 +760,7 @@ def _zone_worker(world_size, rank, port, op, other_dtypes):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         partner = _PARTNER[op]
@@ -839,6 +843,7 @@ def _zone_graph_worker(world_size, rank, port, op):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         partner = _PARTNER[op]
@@ -987,6 +992,7 @@ def _zone_unaligned_worker(world_size, rank, port, op):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         unaligned, step = 1, 2000
@@ -1167,6 +1173,7 @@ def _zone_sharing_worker(world_size, rank, port):
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=torch.device("cuda", rank),
     )
     try:
         step = 3000

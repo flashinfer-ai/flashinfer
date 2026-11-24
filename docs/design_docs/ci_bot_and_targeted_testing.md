@@ -116,10 +116,18 @@ be merged and exercised directly.
 **The handler uses the first unfenced command line.** Quoted replies, code fences,
 inline code and mentions embedded in prose do not issue commands. This also keeps
 the inline example command in an AI recommendation from starting another run.
-The job guard excludes comments by `flashinfer-bot`, the account used by
-`FLASHINFER_BOT_TOKEN`, before checkout and permission checks. Keep that guard in
-sync if the posting account changes. Generated replies retain copyable commands;
-model explanations and validation errors remove bot mentions without regard to case.
+Commands posted by `flashinfer-bot`, the account used by `FLASHINFER_BOT_TOKEN`,
+are authorized by that token, so automation holding it can start CI. Other
+services post as the same account and echo text an outsider controls: CI reports
+quote test names, replies quote the original comment, and AI notes quote model
+explanations. The permission step therefore admits the account only when the
+whole comment is one command line, the form automation posts, and never falls
+back to the account's repository role. The notes this handler posts end with the
+hidden marker `<!-- flashinfer-bot:ci-bot-commands-note -->`, and the job guard
+skips bot comments carrying it before checkout. Keep the guard, the marker and
+the account name in sync. Generated replies retain copyable commands; model
+explanations and validation errors remove bot mentions, including repeated `@`,
+without regard to case.
 
 **A narrowed run is not a full run.** The GPU lanes change name and the summary states the
 scope, but the required check reports success either way. Green on a narrowed run means
@@ -137,6 +145,40 @@ The two model calls request evidence files, then a structured decision:
 `needs_maintainer`. Non-target decisions require a rationale. A full-suite decision
 must cite broad impact supported by source and CI evidence; uncertainty or missing
 evidence is not a reason to run everything.
+
+The 300,000-character JSON context cap applies to both requests after credential
+redaction. Evidence is budgeted before the first request: retain changed-file
+metadata first, prefer changed tests and nearby files in the inventory, and omit
+whole patches or whole source bodies when they cannot fit. Omission counts are
+included in `omitted_evidence`, and unread source paths in `unavailable_evidence`.
+CI routing bodies stay complete. Eager file reads reserve space for the model's
+second-stage file requests, including retries of omitted `configuration_files`
+that exist in the pinned tree. Per-path omission records have a separate bounded
+allowance; excess records increment a count without consuming source space.
+A full-suite decision is downgraded to maintainer review if the PR description
+or changed-file metadata was incomplete, or the files response count differs
+from the captured PR count. Matching counts alone do not prove snapshot identity.
+
+The Actions log records each request stage, serialized size, section sizes, and
+omission counts without logging source contents or credentials. The internal
+daemon uses the same budgeting module, deployed separately.
+
+For an offline reproduction, save the PR and paginated files API responses as
+JSON and ensure the base and head histories are already in a local checkout:
+
+```bash
+python scripts/infra/pr_checks/replay_ai_scope.py \
+  --source-repo /path/to/flashinfer \
+  --pr-json /tmp/pr.json --files-json /tmp/files.json \
+  --base-sha <full-base-commit> \
+  --read-path tests/path/test_file.py
+```
+
+The replay runs the real selector with a fake model, reports both request sizes,
+and returns `needs_maintainer`; it does not assess coverage. No inference key or
+network access is used, and no PR code is imported. To replay the internal
+daemon, also pass `--internal-bot-root /path/to/ci-bot`,
+`--ci-repo /path/to/flashinfer-ci`, and `--ci-ref <CI-definition-commit>`.
 
 Focused or inconclusive results produce an advisory comment for developer review
 and an explicit run command. They publish no statuses and apply no labels, leaving

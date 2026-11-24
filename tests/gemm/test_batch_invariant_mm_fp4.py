@@ -421,7 +421,7 @@ def test_tactic_encoding_round_trips():
         for cfg in enumerate_space(M, N, K, chunks=C, b_major="k", in_fmt=fmt)[::37]:
             t = tuning.knobs_to_tactic(cfg)
             assert (
-                len(t) == 12
+                len(t) == 13
                 and tuning.knobs_from_tactic(t) == cfg
                 and tuning.knobs_from_tactic(list(t)) == cfg
             )
@@ -954,6 +954,57 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, nv):
 
 
 @needs_device
+def test_public_api_skips_backend_selection(monkeypatch):
+    """batch_invariant=True never runs a backend, so the @backend_requirement wrapper must not run the auto selection
+    for it (host cost only): a selecting call rewrites `mm_fp4.suitable_auto_backends`, a bypassed one leaves it."""
+    a, sfa, _ = adv_fp4(16, 4096, 131, True)
+    b, sfb, _ = weight(4096, 4096, 132, True)
+    sentinel = ["sentinel"]
+    # the wrapper creates the attribute at its first auto selection, so it may not exist yet
+    monkeypatch.setattr(
+        flashinfer.mm_fp4, "suitable_auto_backends", sentinel, raising=False
+    )
+    bi_mm(a, b, sfa, sfb, alpha_of(0.5), True)
+    assert flashinfer.mm_fp4.suitable_auto_backends is sentinel
+
+
+@needs_device
+@pytest.mark.parametrize("M,N,K", [(16, 4096, 4096), (37, 128, 8192)])
+def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
+    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
+    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
+    (only the entry's own fresh output skips the aliasing check)."""
+    nv = True
+    a, sfa, _ = adv_fp4(M, K, 181, nv)
+    b, sfb, _ = weight(N, K, 182, nv)
+    alpha = alpha_of(0.5)
+    ref = bits(direct(a, b, sfa, sfb, alpha, nv))
+    assert torch.equal(bits(bi_mm(a, b, sfa, sfb, alpha, nv)), ref)
+    out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    assert bi_mm(a, b, sfa, sfb, alpha, nv, out=out) is out
+    assert torch.equal(bits(out), ref)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        bi_mm(a, b, sfa, sfb, alpha, nv, out=out)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            bi_mm(a, b, sfa, sfb, alpha, nv, out=out)
+    torch.cuda.current_stream().wait_stream(s)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    buf = torch.empty(M * max(2 * N, K // 2), dtype=torch.uint8, device="cuda")
+    alias_a = buf[: M * K // 2].view(M, K // 2)
+    alias_out = buf[: 2 * M * N].view(torch.bfloat16).view(M, N)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        bi_mm(alias_a, b, sfa, sfb, alpha, nv, out=alias_out)
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     nv = True
     a, sfa, ra = adv_fp4(16, 4096, 121, nv)
@@ -963,8 +1014,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         flashinfer.mm_fp4(
             a, b, sfa, sfb, alpha, backend="cutlass", batch_invariant=True
         )
-    # the operator's own checks run first on the API path (dtypes, block sizes, the output dtype, a per-token alpha's
-    # length): the class's checks of the same inputs are reached through its entries
+    # the class's checks, reached through the API (which runs no backend checks for the flag) and through its entries
     auto = tuning.mm_fp4_batch_invariant_auto
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="8x4"):
         auto(a, b, sfa, sfb, alpha, torch.bfloat16, None, 16, True, "auto", True)
@@ -997,9 +1047,9 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         direct(a, b, sfa, sfb, alpha.half(), nv)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="float32 tensor alpha"):
         direct(a, b, sfa, sfb, 0.5, nv)
-    with pytest.raises(
-        ValueError
-    ):  # FlashInfer's own output-dtype contract, checked before the flag path
+    # the public API hands batch-invariant calls to the class without running the backend checks: the class's typed
+    # error (a ValueError, as before)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 or fp16 output"):
         bi_mm(a, b, sfa, sfb, alpha, nv, out_dtype=torch.float32)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="out"):
         direct(

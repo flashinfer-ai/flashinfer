@@ -313,6 +313,7 @@ def test_sealed_files_and_directories_must_not_be_symbolic_links(tmp_path, name)
         pk.verify_package(tmp_path, digest)
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo (POSIX)")
 @pytest.mark.parametrize("name", ["unsealed-sidecar", "bundle/unsealed-file"])
 def test_root_and_bundle_special_file_safety_checks_remain(tmp_path, name):
     """A special file (a FIFO) in the package root or bundle refuses."""
@@ -745,6 +746,8 @@ def test_release_drops_every_sealed_identity_a_definition_accumulated(
     ta.disable_apply()
     pk.load_packages(tmp_path / "second", [plain(tmp_path / "second", "second")])
     assert preloaded_entry(OPERATION, "first") and preloaded_entry(OPERATION, "second")
+    [(package, _)] = pk.installed_packages()  # the later load replaced the entry
+    assert package.solution["name"] == "second"
     # Routes go before entries: at every unregister the Definition is already
     # out of the mapping, so no call can find it enabled without its entry.
     still_enabled = []

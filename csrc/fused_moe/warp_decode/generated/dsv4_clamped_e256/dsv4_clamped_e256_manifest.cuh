@@ -251,11 +251,12 @@ struct Args_device_11 {
   int grid_n;
   int K_tiles;
   int* total_tiles;
+  int num_experts;
 };
 inline cudaError_t Submit_device_11(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_11*>(opaque);
   return SubmitExtendedKernel(config, kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100,
-      args.A, args.tmap_b_rows_1, args.tmap_b_rows_2, args.tmap_b_rows_3, args.tmap_b_rows_4, args.tmap_b_rows_5, args.tmap_b_rows_6, args.tmap_b_rows_7, args.tmap_b_rows_8, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles, args.total_tiles);
+      args.A, args.tmap_b_rows_1, args.tmap_b_rows_2, args.tmap_b_rows_3, args.tmap_b_rows_4, args.tmap_b_rows_5, args.tmap_b_rows_6, args.tmap_b_rows_7, args.tmap_b_rows_8, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles, args.total_tiles, args.num_experts);
 }
 
 struct Args_device_02 {
@@ -281,11 +282,12 @@ struct Args_device_02 {
   int grid_n;
   int K_tiles;
   int* route_order;
+  int num_experts;
 };
 inline cudaError_t Submit_device_02(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_02*>(opaque);
   return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready_expert_order,
-      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.route_order);
+      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.route_order, args.num_experts);
 }
 
 struct Args_device_01 {
@@ -312,11 +314,12 @@ struct Args_device_01 {
   int K_tiles;
   uint8_t* SFA_raw;
   uint8_t* C_raw;
+  int num_experts;
 };
 inline cudaError_t Submit_device_01(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_01*>(opaque);
   return SubmitExtendedKernel(config, kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100,
-      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.SFA_raw, args.C_raw);
+      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.SFA_raw, args.C_raw, args.num_experts);
 }
 
 struct Args_device_00 {
@@ -363,11 +366,12 @@ struct Args_device_06 {
   int grid_m;
   int grid_n;
   int K_tiles;
+  int num_experts;
 };
 inline cudaError_t Submit_device_06(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_06*>(opaque);
   return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready,
-      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.num_experts);
 }
 
 struct Args_device_04 {
@@ -377,11 +381,13 @@ struct Args_device_04 {
   int num_tokens;
   int route_stride;
   int M;
+  int* route_experts;
+  int num_experts;
 };
 inline cudaError_t Submit_device_04(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_04*>(opaque);
   return SubmitExtendedKernel(config, kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100,
-      args.route_outputs, args.route_weights, args.output, args.num_tokens, args.route_stride, args.M);
+      args.route_outputs, args.route_weights, args.output, args.num_tokens, args.route_stride, args.M, args.route_experts, args.num_experts);
 }
 
 struct Args_device_07 {
@@ -401,11 +407,12 @@ struct Args_device_07 {
   int grid_m;
   int grid_n;
   int K_tiles;
+  int num_experts;
 };
 inline cudaError_t Submit_device_07(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_07*>(opaque);
   return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe,
-      args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles);
+      args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles, args.num_experts);
 }
 
 struct Args_device_05 {
@@ -438,11 +445,13 @@ struct Args_device_03 {
   int num_tokens;
   int route_stride;
   int M;
+  int* route_experts;
+  int num_experts;
 };
 inline cudaError_t Submit_device_03(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_03*>(opaque);
   return SubmitExtendedKernel(config, kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100,
-      args.route_outputs, args.route_weights, args.route_slots, args.output, args.num_tokens, args.route_stride, args.M);
+      args.route_outputs, args.route_weights, args.route_slots, args.output, args.num_tokens, args.route_stride, args.M, args.route_experts, args.num_experts);
 }
 
 struct Args_device_08 {
@@ -472,11 +481,12 @@ struct Args_device_09 {
   int grid_n;
   int K_tiles;
   int* total_tiles;
+  int num_experts;
 };
 inline cudaError_t Submit_device_09(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_09*>(opaque);
   return SubmitExtendedKernel(config, kernel_dsv4_fc2_terminal_recycle_v21_sm100,
-      args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles, args.total_tiles);
+      args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles, args.total_tiles, args.num_experts);
 }
 
 struct Args_device_12 {
@@ -496,11 +506,12 @@ struct Args_device_12 {
   int grid_m;
   int grid_n;
   int K_tiles;
+  int num_experts;
 };
 inline cudaError_t Submit_device_12(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_12*>(opaque);
   return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe_loader_bypass_v23,
-      args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles);
+      args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles, args.num_experts);
 }
 
 struct Args_device_13 {
@@ -525,11 +536,12 @@ struct Args_device_13 {
   int grid_m;
   int grid_n;
   int K_tiles;
+  int num_experts;
 };
 inline cudaError_t Submit_device_13(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_13*>(opaque);
   return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready,
-      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles);
+      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.num_experts);
 }
 
 struct Args_device_14 {
@@ -555,11 +567,12 @@ struct Args_device_14 {
   int grid_n;
   int K_tiles;
   int* route_order;
+  int num_experts;
 };
 inline cudaError_t Submit_device_14(const cudaLaunchConfig_t* config, const void* opaque) {
   const auto& args = *static_cast<const Args_device_14*>(opaque);
   return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready_expert_order,
-      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.route_order);
+      args.A, args.B, args.SFA, args.SFB, args.C, args.SFC, args.route_map, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.scale_c, args.scale_gate, args.clamp_limit, args.act_alpha, args.act_beta, args.M_out, args.K, args.grid_m, args.grid_n, args.K_tiles, args.route_order, args.num_experts);
 }
 
 // The tile-N8 FC2 program kK512Stage5 on a clamped row: the route inventory's FC1 output (B), its scales (SFB)
@@ -573,7 +586,7 @@ inline cudaError_t SubmitTileN8Fc2(const cudaLaunchConfig_t* config, const void*
   const auto& args = *static_cast<const TileN8Fc2Args*>(opaque);
   return SubmitExtendedKernel(config, kernel_cake_warp_decode_4352a5beff13b20b2912,
       args.A, args.B, args.SFA, args.SFB, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_tiles,
-      args.work_counter, args.grid_m, args.max_tiles, args.K_tiles);
+      args.work_counter, args.grid_m, args.max_tiles, args.K_tiles, args.num_experts);
 }
 inline void VisitTileN8Fc2(const Invocation& inv, int64_t workspace_bytes, const TileN8Fc2Regions& regions,
                            int* tile_expert, int carveout, LaunchVisitor visitor, void* context) {
@@ -658,6 +671,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.grid_m = static_cast<int>(32);
     args_0.grid_n = static_cast<int>(6);
     args_0.K_tiles = static_cast<int>(8);
+    args_0.num_experts = static_cast<int>(256);
     Args_device_04 args_2{};
     args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 56320u));
     args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -665,6 +679,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.num_tokens = static_cast<int>(1);
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
+    args_2.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_2.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 6, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false,
@@ -738,6 +754,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.grid_m = static_cast<int>(32);
     args_0.grid_n = static_cast<int>(12);
     args_0.K_tiles = static_cast<int>(8);
+    args_0.num_experts = static_cast<int>(256);
     Args_device_04 args_2{};
     args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 111872u));
     args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -745,6 +762,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.num_tokens = static_cast<int>(2);
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
+    args_2.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_2.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 12, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false,
@@ -818,6 +837,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.grid_m = static_cast<int>(32);
     args_0.grid_n = static_cast<int>(18);
     args_0.K_tiles = static_cast<int>(8);
+    args_0.num_experts = static_cast<int>(256);
     Args_device_07 args_1{};
     {
       CUtensorMap encoded{};
@@ -895,6 +915,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.grid_m = static_cast<int>(32);
     args_1.grid_n = static_cast<int>(18);
     args_1.K_tiles = static_cast<int>(4);
+    args_1.num_experts = static_cast<int>(256);
     Args_device_04 args_2{};
     args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 167424u));
     args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -902,6 +923,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.num_tokens = static_cast<int>(3);
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
+    args_2.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_2.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready", dim3(32, 18, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false,
@@ -978,6 +1001,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.grid_m = static_cast<int>(32);
     args_0.grid_n = static_cast<int>(24);
     args_0.K_tiles = static_cast<int>(8);
+    args_0.num_experts = static_cast<int>(256);
     Args_device_07 args_1{};
     {
       CUtensorMap encoded{};
@@ -1055,6 +1079,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.grid_m = static_cast<int>(32);
     args_1.grid_n = static_cast<int>(24);
     args_1.K_tiles = static_cast<int>(4);
+    args_1.num_experts = static_cast<int>(256);
     Args_device_04 args_2{};
     args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 222720u));
     args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -1062,6 +1087,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.num_tokens = static_cast<int>(4);
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
+    args_2.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_2.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready", dim3(32, 24, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false,
@@ -1138,6 +1165,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.grid_m = static_cast<int>(32);
     args_0.grid_n = static_cast<int>(30);
     args_0.K_tiles = static_cast<int>(8);
+    args_0.num_experts = static_cast<int>(256);
     Args_device_07 args_1{};
     {
       CUtensorMap encoded{};
@@ -1215,6 +1243,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.grid_m = static_cast<int>(32);
     args_1.grid_n = static_cast<int>(30);
     args_1.K_tiles = static_cast<int>(4);
+    args_1.num_experts = static_cast<int>(256);
     Args_device_04 args_2{};
     args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 278272u));
     args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -1222,6 +1251,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.num_tokens = static_cast<int>(5);
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
+    args_2.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_2.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready", dim3(32, 30, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false,
@@ -1298,6 +1329,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.grid_m = static_cast<int>(32);
     args_0.grid_n = static_cast<int>(36);
     args_0.K_tiles = static_cast<int>(8);
+    args_0.num_experts = static_cast<int>(256);
     Args_device_07 args_1{};
     {
       CUtensorMap encoded{};
@@ -1375,6 +1407,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.grid_m = static_cast<int>(32);
     args_1.grid_n = static_cast<int>(36);
     args_1.K_tiles = static_cast<int>(4);
+    args_1.num_experts = static_cast<int>(256);
     Args_device_04 args_2{};
     args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 333824u));
     args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -1382,6 +1415,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.num_tokens = static_cast<int>(6);
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
+    args_2.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_2.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready", dim3(32, 36, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false,
@@ -1458,6 +1493,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_0.grid_m = static_cast<int>(32);
     args_0.grid_n = static_cast<int>(42);
     args_0.K_tiles = static_cast<int>(8);
+    args_0.num_experts = static_cast<int>(256);
     Args_device_07 args_1{};
     {
       CUtensorMap encoded{};
@@ -1535,6 +1571,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.grid_m = static_cast<int>(32);
     args_1.grid_n = static_cast<int>(42);
     args_1.K_tiles = static_cast<int>(4);
+    args_1.num_experts = static_cast<int>(256);
     Args_device_04 args_2{};
     args_2.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 389376u));
     args_2.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -1542,6 +1579,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.num_tokens = static_cast<int>(7);
     args_2.route_stride = static_cast<int>(32768);
     args_2.M = static_cast<int>(4096);
+    args_2.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_2.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_cooperative_init_mma_u2_ready", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       199040u, true, false, false,
@@ -1623,6 +1662,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.grid_n = static_cast<int>(48);
     args_1.K_tiles = static_cast<int>(8);
     args_1.route_order = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_07 args_2{};
     {
       CUtensorMap encoded{};
@@ -1700,6 +1740,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_2.grid_m = static_cast<int>(32);
     args_2.grid_n = static_cast<int>(48);
     args_2.K_tiles = static_cast<int>(4);
+    args_2.num_experts = static_cast<int>(256);
     Args_device_04 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 444928u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -1707,6 +1748,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(8);
     args_3.route_stride = static_cast<int>(32768);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_dsv4_t7_direct_route_order", dim3(1, 1, 1), dim3(64, 1, 1), dim3(1, 1, 1),
       128u, true, false, false,
@@ -1805,6 +1848,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 3328u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 500992u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -1813,6 +1857,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(9);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -1908,6 +1954,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 3584u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 556544u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -1916,6 +1963,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(10);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2011,6 +2060,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 612864u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2019,6 +2069,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(11);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2114,6 +2166,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 4608u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 668160u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2122,6 +2175,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(12);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2217,6 +2272,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 4864u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 723712u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2225,6 +2281,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(13);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2320,6 +2378,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5120u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 779264u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2328,6 +2387,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(14);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2423,6 +2484,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 834816u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2431,6 +2493,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(15);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2526,6 +2590,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5376u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 890112u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2534,6 +2599,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(16);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2629,6 +2696,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5632u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 945664u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2637,6 +2705,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(17);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2732,6 +2802,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 5888u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1001216u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2740,6 +2811,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(18);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2835,6 +2908,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 6144u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1056768u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2843,6 +2917,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(19);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -2938,6 +3014,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 6144u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1112064u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -2946,6 +3023,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(20);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3041,6 +3120,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 6400u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1167616u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3049,6 +3129,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(21);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3144,6 +3226,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 7424u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1223936u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3152,6 +3235,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(22);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3247,6 +3332,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 7680u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1279488u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3255,6 +3341,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(23);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3350,6 +3438,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 7680u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1334784u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3358,6 +3447,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(24);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3453,6 +3544,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 7936u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1390336u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3461,6 +3553,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(25);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3556,6 +3650,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8192u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1445888u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3564,6 +3659,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(26);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3659,6 +3756,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8448u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1501440u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3667,6 +3765,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(27);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3762,6 +3862,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8448u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1556736u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3770,6 +3871,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(28);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3865,6 +3968,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8704u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1612288u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3873,6 +3977,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(29);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -3968,6 +4074,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 8960u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1667840u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -3976,6 +4083,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(30);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -4071,6 +4180,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 9216u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1723392u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -4079,6 +4189,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(31);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,
@@ -4174,6 +4286,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.K_tiles = static_cast<int>(8);
     args_1.SFA_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(const_cast<void*>(inv.gemm1_weights_scale)) + 0));
     args_1.C_raw = reinterpret_cast<uint8_t*>((static_cast<uint8_t*>(inv.workspace) + 9216u));
+    args_1.num_experts = static_cast<int>(256);
     Args_device_03 args_3{};
     args_3.route_outputs = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(inv.workspace) + 1778688u));
     args_3.route_weights = reinterpret_cast<__nv_bfloat16*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_weights)) + 0));
@@ -4182,6 +4295,8 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_3.num_tokens = static_cast<int>(32);
     args_3.route_stride = static_cast<int>(4096);
     args_3.M = static_cast<int>(4096);
+    args_3.route_experts = reinterpret_cast<int*>((static_cast<uint8_t*>(const_cast<void*>(inv.topk_ids)) + 0));
+    args_3.num_experts = static_cast<int>(256);
     KernelLaunch launch_0{
       "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl", dim3(1, 1, 1), dim3(256, 1, 1), dim3(1, 1, 1),
       6272u, true, false, false,

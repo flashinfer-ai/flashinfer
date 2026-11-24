@@ -330,6 +330,12 @@ class _CutePeers(canon.Peers):
             cute.arch.cluster_wait()
 
 
+# PDL is a runtime launch argument of every kernel (2026-11-18): the `griddepcontrol` instructions are always emitted and inert
+# without the attribute. The temperature form STAYS a compile-time variant: folded as a runtime select, the plain kernels
+# inherited the per-row variant's cost (the host scale is a constant-bank operand in the plain kernel; the folded form loads the
+# dummy temperature and divides on the critical path before the sweep): +2-12 % on the plain softmax / log_probs cells on Rubin.
+
+
 class LSERowKernel:
     """``lse.row`` for one ``Kp`` bucket (``N`` is a runtime argument), one :class:`Mode` and one temperature form."""
 
@@ -346,19 +352,18 @@ class LSERowKernel:
             Kp * BLOCK
         )  # a representative N of this bucket: everything below depends on N only via Kp
         cfg.validate(N)
-        self.dtype, self.N, self.Kp, self.cfg, self.mode, self.temp_rows = (
-            dtype,
-            N,
-            Kp,
-            cfg,
-            mode,
-            temp_rows,
-        )
+        self.dtype, self.N, self.Kp, self.cfg, self.mode = dtype, N, Kp, cfg, mode
+        self.temp_rows = temp_rows
         # token ids per row the log-probability output is specialised for: 1 (one id, every thread forms it) or a
         # multiple of 32 (the lanes of warp 0 take the ids in turn; `K` at run time predicates the tail)
         assert k_slots == 1 or (k_slots > 0 and k_slots % LANES == 0), k_slots
         self.k_slots = k_slots
-        self.out_dtype = dtype if (mode.probs and not mode.probs_f32) else Float32
+        # the converted row outputs: the softmax in the input dtype, the 16-bit log-softmax member
+        self.out_dtype = (
+            dtype
+            if ((mode.probs and not mode.probs_f32) or mode.logprobs_cvt)
+            else Float32
+        )
         pl = cfg.placement(N)
         self.plan_max = canon.plan(max_reduction(N, None), pl)
         self.plan_sum = canon.plan(sum_reduction(N, None), pl)
@@ -413,7 +418,7 @@ class LSERowKernel:
         M: Int64,
         N: Int32,
         K: Int32,
-        enable_pdl: cutlass.Constexpr[bool],
+        enable_pdl: Int32,
         stream,
     ):
         k = self.kernel(
@@ -427,7 +432,6 @@ class LSERowKernel:
             M,
             N,
             K,
-            enable_pdl,
             self._tv_layout(self.vec),
             self._tv_layout(self.vec_out),
             (self.rows, BLOCK),
@@ -463,15 +467,13 @@ class LSERowKernel:
         M: Int64,
         N: Int32,
         K: Int32,
-        enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tv_layout_out: cute.Layout,
         tiler_mn: cute.Shape,
     ):
         fp = CuteF32
         bidx, _, _ = cute.arch.block_idx()
-        if enable_pdl:
-            cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # no effect unless the launch carried the PDL attribute (a runtime launch argument)
         W, rows = self.W, self.rows
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -631,17 +633,19 @@ class LSERowKernel:
                 cute.copy(atom_y, fy, gY, pred=pred_y)
 
         peers.finish()
-        if enable_pdl:
-            cute.arch.griddepcontrol_launch_dependents()
+        cute.arch.griddepcontrol_launch_dependents()
 
 
 def _row_outputs(k, loader, kk, fy, nm, c, inv_s, nlg, out_dtype, fp):
     """The output elements of block ``kk`` (plain Python at trace time): ``z`` recomputed identically from the kept /
-    re-read fragment, then the probability (converted to the output dtype) or the log-probability."""
+    re-read fragment, then the probability (converted to the output dtype) or the log-probability (fp32, or converted
+    once to the input dtype for the 16-bit output member)."""
     for e in range(V):
         z = shifted(fp, loader.x(kk, e), nm, c)
         if k.mode.probs:
             fy[e] = prob(fp, fp.ex2(z), inv_s).to(out_dtype)
+        elif k.mode.logprobs_cvt:
+            fy[e] = logp(fp, z, nlg).to(out_dtype)
         else:
             fy[e] = logp(fp, z, nlg)
 
@@ -655,8 +659,9 @@ def kernel_name(
     enable_pdl: bool,
     k_slots: int = 1,
 ) -> str:
+    # PDL is a runtime launch argument (enable_pdl is accepted and ignored): not in the name
     return jit.sanitize_symbol_name(
-        f"lse_{mode.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}_{'trow' if temp_rows else 'tconst'}_pdl{int(enable_pdl)}"
+        f"lse_{mode.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}_{'trow' if temp_rows else 'tconst'}"
         + (f"_k{k_slots}" if k_slots != 1 else "")
     )
 
@@ -664,6 +669,14 @@ def kernel_name(
 def k_slots_for(K: int) -> int:
     """The compile-time id slots per row serving ``K`` ids: 1, else the multiple of 32 at or above ``K``."""
     return 1 if K <= 1 else LANES * (-(-int(K) // LANES))
+
+
+def _key(dtype_str, N, cfg, mode, temp_rows, enable_pdl, k_slots=1):
+    """The compile key of the kernel serving ``N``: the Kp bucket, the config, the mode, the temperature form, the id slots
+    (PDL is a runtime launch argument: ``enable_pdl`` is accepted and ignored)."""
+    from .schedule import padded_blocks
+
+    return (dtype_str, padded_blocks(N), cfg, mode, bool(temp_rows), False, k_slots)
 
 
 def get_compiled_kernel(
@@ -675,17 +688,33 @@ def get_compiled_kernel(
     enable_pdl: bool,
     k_slots: int = 1,
 ):
-    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, mode, temperature form, pdl,
-    id slots); ``N``, ``M``, ``K`` and the row stride are runtime arguments."""
-    from .schedule import padded_blocks
-
+    """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, mode, temperature form, id slots);
+    ``N``, ``M``, ``K``, the row stride and PDL are runtime arguments (``enable_pdl`` is accepted and ignored)."""
     return _compile_bucket(
-        dtype_str, padded_blocks(N), cfg, mode, temp_rows, enable_pdl, k_slots
+        *_key(dtype_str, N, cfg, mode, temp_rows, enable_pdl, k_slots)
     )
 
 
-@functools.cache
-def _compile_bucket(
+def precompile(
+    dtype_str: str,
+    N: int,
+    cfg: LSEConfig,
+    mode: Mode,
+    temp_rows: bool,
+    enable_pdl: bool,
+    k_slots: int = 1,
+) -> None:
+    """Compile the kernel serving ``N`` into the on-disk cache without loading it, outside the op family's module lock
+    (:func:`jit.precompile`): what a precompile pool's worker calls. ``get_compiled_kernel`` holds the lock for the whole build
+    (concurrent processes missing the same kernel compile it once), so workers compiling different kernels of one family
+    through it would run serially."""
+    jit.precompile(
+        LSE_MODULE,
+        *_spec(*_key(dtype_str, N, cfg, mode, temp_rows, enable_pdl, k_slots)),
+    )
+
+
+def _spec(
     dtype_str: str,
     Kp: int,
     cfg: LSEConfig,
@@ -694,6 +723,7 @@ def _compile_bucket(
     enable_pdl: bool,
     k_slots: int = 1,
 ):
+    """The cache object's name and the compile function of one Kp bucket and specialisation."""
     from ..fp_interface.cute import get_cutlass_dtype
 
     dtype = get_cutlass_dtype(dtype_str)
@@ -748,9 +778,16 @@ def _compile_bucket(
             Int64(1),
             Int32(1),
             Int32(1),
-            enable_pdl,
+            Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
         )
 
-    return jit.build_and_load(LSE_MODULE, name, compile_fn)
+    return name, compile_fn
+
+
+@functools.cache
+def _compile_bucket(*key):
+    """Compile, or load from the cache, the kernel of one compile key (the serving path: the module lock is held for the
+    whole build)."""
+    return jit.build_and_load(LSE_MODULE, *_spec(*key))

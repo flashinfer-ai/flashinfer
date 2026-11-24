@@ -156,9 +156,7 @@ def _instruction_reference(
     import torch
     from tests.moe_ep._sm90_fp8_wgmma_reference import fma_add
 
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
-        _swiglu_pair_hw_match_cuda,
-    )
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import _swiglu_pair_hw_match_cuda
 
     ranks, tokens, width = hidden.shape
     w13, w2, sf13, sf2, g13, g2 = (t.flatten(0, 1) for t in raw)
@@ -291,9 +289,7 @@ def _require_sm90_ep4():
     assert int(os.environ.get("WORLD_SIZE", "1")) == WORLD_SIZE, (
         "launch this test with torchrun --nproc_per_node=4"
     )
-    pytest.importorskip(
-        "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel"
-    )
+    pytest.importorskip("flashinfer.moe_ep.shims.sm90.cutedsl_megamoe")
 
 
 def _factory_conversion_knobs():
@@ -559,9 +555,7 @@ def test_sm90_nvfp4_cached_fc1_schedule_switch_during_graph_capture(monkeypatch)
         ensure_moe_ep_cuda_device,
         preprocess_sm90_pull_nvfp4_mega_weights,
     )
-    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
-        hopper_nvfp4,
-    )
+    from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import hopper_nvfp4
 
     # Force a small automatic threshold; compiled schedules, workspace and
     # kernels remain real. The production threshold requires a large model.
