@@ -3996,3 +3996,78 @@ def test_gather_form_at_fewer_than_four_expanded_rows_equals_the_box_form(pair):
         assert torch.equal(bits(pts_layer(act, W_pack)), ref), (T, k)
 
 
+@needs_device
+@each_pair
+def test_explicit_gather_request_with_an_unsuitable_linear_layout_is_refused(pair):
+    """At ``H = 96`` a linear scale layout has six (NVFP4) or three (MXFP4) scale bytes per row, not whole 4-byte groups, so
+    the gather form cannot copy them: the dispatcher's own pick takes the box form (the bits of the 128x4 pack), while an
+    explicit request -- a gather record as ``config1``, or ``gather=True`` -- is refused with the mode's error naming the
+    rule instead of a silently changed record; the 128x4 pack takes the explicit record. Through the layer the runner hands
+    the op the pack's own records: no gather tactic for the linear layout at this ``H``, the box form's bits."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        fused_moe_fp4,
+        gather_form_ok,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_fp4 import (
+        default_configs_fp4,
+        gather_twins,
+        swapped_knobs_blockscaled,
+    )
+
+    quant = _QUANT[pair]
+    T, k, H, I, E = 5, 2, 96, 64, 8
+    assert not gather_form_ok(H, "linear", pair.block) and gather_form_ok(
+        H, "128x4", pair.block
+    )
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=96)
+    W_pack = _weights(w1, w2, quant=quant)
+    W = _weights_of(W_pack)
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    x4, sf, pts = _quantized(x, pair=pair)
+    sf_lin = _unswizzle(pair, sf, T, H).view(torch.uint8).reshape(T, H // pair.block)
+    pack128, packlin = _pack(pair, x4, sf, pts), _pack(pair, x4, sf_lin, pts)
+    ref = bits(fused_moe_fp4(pack128, ids, wts, W))
+    out, im = fused_moe_fp4(packlin, ids, wts, W, return_intermediates=True)
+    assert not im["config1"].gather_a and torch.equal(bits(out), ref)
+    rec = gather_twins(swapped_knobs_blockscaled())[0]
+    in1, in2 = W.classes(_family())
+    _, c2 = default_configs_fp4(
+        T, k, H, I, E, (in1, in2), W.chain1, W.chain2, 212, _family()
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="4-byte") as e:
+        fused_moe_fp4(packlin, ids, wts, W, config1=rec, config2=c2)
+    assert pair.cls in str(e.value) and "gather" in str(e.value)
+    # gather=True puts the swapped records in their gather form: a request where the ranking leads with one (the NVFP4 pair
+    # here), nothing where no swapped record implements this K (the MX pair), where the pick runs as ranked
+    c1g, _ = default_configs_fp4(
+        T, k, H, I, E, (in1, in2), W.chain1, W.chain2, 212, _family(), gather=True
+    )
+    if pair.scaled:
+        assert c1g.gather_a
+    if c1g.gather_a:
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="4-byte"):
+            fused_moe_fp4(packlin, ids, wts, W, gather=True)
+    else:
+        assert torch.equal(bits(fused_moe_fp4(packlin, ids, wts, W, gather=True)), ref)
+    out_rec, im = fused_moe_fp4(
+        pack128, ids, wts, W, config1=rec, config2=c2, return_intermediates=True
+    )
+    assert im["config1"].gather_a and torch.equal(bits(out_rec), ref)
+    base = _NVFP4_PTS if pair.scaled else _MX
+    mode = RoutingInputMode.UnpackedPrecomputed
+    for flag, scale in ((False, sf_lin), (True, sf)):
+        layer = _layer(
+            k, E, I, quant=dataclasses.replace(base, swizzled_scale_factors=flag)
+        )
+        act = MoEActivationPack(
+            x4, scale, topk_ids=ids, topk_weights=wts, routing_input_mode=mode, per_token_scale=pts
+        )  # fmt: skip
+        runner = layer.runners[0]
+        reachable = any(c.gather_a for c in runner._ranked(T, H, gather_form=True)[0])
+        tactics = runner.get_valid_tactics(runner.pack_inputs(act, W_pack), None)
+        # GEMM1's gather flag: the 128x4 pack's tactics alone carry it (where the ranking has a swapped record)
+        assert any(t[7] for t in tactics) == (flag and reachable)
+        assert torch.equal(bits(layer(act, W_pack)), ref), flag
+
+

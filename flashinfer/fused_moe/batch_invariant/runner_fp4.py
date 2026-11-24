@@ -577,10 +577,22 @@ class BatchInvariantFp4Runner(MoERunner):
         the MX pair (whose quantizer stores the class's layout); a bf16 NVFP4 input's quantizer scatters in its own pass."""
         return x.dtype != torch.bfloat16 or not self.pair.scaled
 
-    def _ranked(
-        self, T: int, H: int, scatter_launch: bool = False
-    ) -> Tuple[list, list]:
-        """The ranked records of both GEMMs (the tactic space's head); with ``scatter_launch`` GEMM1's list carries the
+    def _gather_form(self, x: torch.Tensor, sf: torch.Tensor) -> bool:
+        """Whether GEMM1's narrow swapped record takes its gather form for this pack: the box form would scatter in a launch
+        of its own (:meth:`_scatter_launch`) and the pack's scale layout admits the form (a linear layout's rows as whole
+        4-byte groups: :func:`~.api_fp4.gather_form_ok`; the 128x4 buffer always). The records handed to the op are then
+        the pack's own, so the op never has to fall back from a record the runner chose."""
+        from .api_fp4 import gather_form_ok
+
+        if not self._scatter_launch(x):
+            return False
+        linear = x.dtype != torch.bfloat16 and sf.ndim == 2
+        return gather_form_ok(
+            self._hidden_of(x), "linear" if linear else "128x4", self.pair.block
+        )
+
+    def _ranked(self, T: int, H: int, gather_form: bool = False) -> Tuple[list, list]:
+        """The ranked records of both GEMMs (the tactic space's head); with ``gather_form`` GEMM1's list carries the
         gather-form twin the structural rule places (:func:`~.schedule_fp4.gather_form_rule`)."""
         from .api_fp4 import MoEWeightsFp4
         from .schedule_fp4 import (
@@ -622,7 +634,7 @@ class BatchInvariantFp4Runner(MoERunner):
                 rows, n1, H, E, chain1, in1, sm_count, family, TOP_K_FP4, n_active=n_act
             )
         )
-        twins = [gather_form_rule(c, scatter_launch) for c in r1]
+        twins = [gather_form_rule(c, gather_form) for c in r1]
         r1 += [t for t in twins if t.gather_a and t not in r1]
         r2 = rank_grouped_fp4(
             rows, H, I, E, chain2, in2, sm_count, family, TOP_K_FP4, n_active=n_act
@@ -633,7 +645,7 @@ class BatchInvariantFp4Runner(MoERunner):
         self._require_built()
         x = inputs[_X]
         r1, r2 = self._ranked(
-            int(x.shape[0]), self._hidden_of(x), self._scatter_launch(x)
+            int(x.shape[0]), self._hidden_of(x), self._gather_form(x, inputs[_SF])
         )
         return [_tactic_fp4(c1, c2) for c1 in r1 for c2 in r2]
 
@@ -666,8 +678,9 @@ class BatchInvariantFp4Runner(MoERunner):
         if tactic == -1 or tactic is None:
             from .schedule_fp4 import gather_form_rule
 
-            r1, r2 = self._ranked(int(x.shape[0]), H, self._scatter_launch(x))
-            c1, c2 = gather_form_rule(r1[0], self._scatter_launch(x)), r2[0]
+            gather_form = self._gather_form(x, sf)
+            r1, r2 = self._ranked(int(x.shape[0]), H, gather_form)
+            c1, c2 = gather_form_rule(r1[0], gather_form), r2[0]
         else:
             c1, c2 = _configs_from_tactic_fp4(tuple(tactic))
         a = self._activation()

@@ -1289,6 +1289,9 @@ def fused_moe_fp4(
     gsi = _gs_inv(gs_inv, dev)
     if x_rows is not None and not fused_in:
         x4, x_sf, x_pts = pair.quantize(x_rows, gsi)
+    explicit1 = (
+        config1 is not None
+    )  # the caller's record (a gather record is a request for the form)
     if config1 is None or config2 is None:
         ranked1 = config1 is None
         c1, c2 = default_configs_fp4(
@@ -1322,7 +1325,15 @@ def fused_moe_fp4(
     if gather1 and not gather_form_ok(
         H, "128x4" if x_rows is not None else sf_src, pair.block
     ):
-        # the linear scale layout's rows are not whole 4-byte groups: the box form through the scatter
+        if explicit1 or gather:
+            # the caller asked for the gather form (a gather record, or gather=True): the layout's rule is reported
+            raise unsupported(
+                pair.cls,
+                f"the gather form with the linear scale layout at H = {H} ({H // pair.block} scale bytes per row)",
+                f"the linear layout's rows as whole 4-byte groups (H a multiple of {4 * pair.block}) or the 128x4 "
+                "layout for the gather form; the dispatcher's own pick takes the box form here",
+            )
+        # the dispatcher's pick: the box form through the scatter
         config1 = dataclasses.replace(config1, gather_a=False)
         gather1 = False
     if path != "dense" and plan is not None:
