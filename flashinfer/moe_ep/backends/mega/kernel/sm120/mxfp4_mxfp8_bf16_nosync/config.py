@@ -65,10 +65,11 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
     Set it explicitly after sweeping a deployment's shapes.
 
     ``dedup_replicated_inputs`` compacts the FC1 intermediate buffers from
-    ``world_size * capacity`` rows per expert to ``capacity`` rows. Enable it only when each
-    source token has a single leader rank, so every global expert receives at most ``capacity``
-    unique rows. Inputs and routing must be identical across ranks; their partial outputs still
-    require an all-reduce. Only P2P transport supports this layout; the default preserves the original.
+    ``world_size * capacity`` rows per expert to ``capacity`` rows. The P2P token pool likewise
+    stores ``capacity`` rows, indexed by the shared token index instead of ``(rank, token)``.
+    Enable it only when each token has a single leader rank and inputs/routing are identical
+    across ranks; their partial outputs still require an all-reduce. Only P2P transport supports
+    this layout; the default preserves the original.
     """
 
     intermediate_size: int

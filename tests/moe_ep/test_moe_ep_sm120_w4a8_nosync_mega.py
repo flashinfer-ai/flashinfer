@@ -846,8 +846,9 @@ def test_sm120_nosync_p2p_workspace_layout():
     rows = experts // ranks * capacity
     assert compact[13] - compact[12] == rows * intermediate
     assert compact[14] - compact[13] == rows * (intermediate // 128) * 4
-    assert compact[1:12] == offsets[1:12]
-    assert compact[0] == 28_825_344
+    assert compact[1:6] == offsets[1:6]
+    assert compact[6] - compact[5] == capacity * pool_row_bytes(hidden)
+    assert compact[0] == 24_080_128
 
 
 def test_sm120_nosync_dedup_layout_requires_p2p():

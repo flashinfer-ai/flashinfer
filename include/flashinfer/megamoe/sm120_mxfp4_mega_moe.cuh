@@ -120,7 +120,7 @@ constexpr int kSigRoute = 0, kSigDispatch = kMaxWorld, kSigComb = 2 * kMaxWorld,
               kGinSignals = 3 * kMaxWorld;
 
 struct Peers {
-  uint8_t* pool[kMaxWorld];        // [W][TCAP] P2P token rows of pool_row_bytes(H) (dest-owned)
+  uint8_t* pool[kMaxWorld];        // [dedup_replicated_inputs ? TCAP : W * TCAP] P2P token rows
   int* p2p_map[kMaxWorld];         // [W][EL][TCAP] source (token * 8 + k)
   int* recv_cnt[kMaxWorld];        // [W][EL]
   int* recv_flag[kMaxWorld];       // [W] epoch
@@ -657,7 +657,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
             s_rowk[warp] = -1;
           } else {
             const int dst = e / EL, el = e % EL;
-            s_rowk[warp] = a.rank * TCAP + t;
+            s_rowk[warp] = a.dedup_replicated_inputs ? t : a.rank * TCAP + t;
             s_dstk[warp] = dst;
 #if MEGAMOE_SM120_GIN_DEVICE
             if (!is_gin(a, dst))
@@ -947,7 +947,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
 #endif
           {
             const int meta = a.peers.p2p_map[a.rank][(w * EL + el) * TCAP + i];
-            xr[h] = pool + (size_t(w) * TCAP + meta / 8) * RX;
+            xr[h] = pool + (a.dedup_replicated_inputs ? meta / 8 : w * TCAP + meta / 8) * RX;
           }
           xs[h] = reinterpret_cast<const uint32_t*>(xr[h] + H);
         }

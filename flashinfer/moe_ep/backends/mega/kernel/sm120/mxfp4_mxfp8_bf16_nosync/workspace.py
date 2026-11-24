@@ -64,7 +64,8 @@ def buffer_layout(
     stage_slot, cidx]. Every region sits at the same offset on every rank; pool / recv_* /
     route* and the P2P slotmap are written by source ranks, comb by expert ranks;
     the remaining regions are local.
-    P2P sends one row per (source rank, source token); slotmap maps each local
+    P2P sends one row per (source rank, source token), or one row per unique
+    leader token for deduplicated replicated inputs; slotmap maps each local
     (source rank, expert, slot) to the source's (token, k).
     The remaining GIN regions serve GIN, which sends a token once per
     rank: the token row staged for and received from GIN ranks, the partials staged for and
@@ -72,7 +73,8 @@ def buffer_layout(
     packed in the expert rank's (local expert, slot) order), and the packed row of each
     (token, k)."""
     epr = experts // ranks
-    expert_rows = epr * (capacity if dedup_replicated_inputs else ranks * capacity)
+    pool_rows = capacity if dedup_replicated_inputs else ranks * capacity
+    expert_rows = epr * pool_rows
     row_bytes = pool_row_bytes(hidden)
     route_map_ints = experts * capacity
     sizes = (
@@ -80,7 +82,7 @@ def buffer_layout(
         capacity * (hidden // 32),
         capacity * topk * 8,
         capacity * topk * 4,
-        ranks * capacity * row_bytes,
+        pool_rows * row_bytes,
         ranks * epr * 4,
         ranks * 4,
         capacity * topk * hidden * 2,
