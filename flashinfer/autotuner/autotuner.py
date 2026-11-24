@@ -1686,15 +1686,17 @@ class AutoTunerStatistics:
 
     Attributes:
         cache_misses (int): Number of cache misses requiring fallback
-        cache_miss_config_collection (Dict[str, Set[OptimizationProfile]]): Collection of configs that caused cache misses
+        cache_miss_config_collection (Dict[str, Set[Tuple[Tuple[int, ...], ...]]]): Per op,
+            the input shapes of the inference-time cache misses, mapped to their
+            nearest tuning profile (the bucketed shapes the cache is keyed by)
         failed_profiling_count (Dict[str, int]): Number of failed profiling attempts per operation
         tuned_op_total_configs (Dict[str, int]): Total configurations tried per operation
         tuned_op_successful_configs (Dict[str, int]): Successful configurations per operation
     """
 
     cache_misses: int = 0
-    cache_miss_config_collection: dict[str, set[OptimizationProfile]] = field(
-        default_factory=dict[str, set[OptimizationProfile]]
+    cache_miss_config_collection: dict[str, set[tuple[tuple[int, ...], ...]]] = field(
+        default_factory=dict[str, set[tuple[tuple[int, ...], ...]]]
     )
     failed_profiling_count: dict[str, set[ProfilingCacheKey]] = field(
         default_factory=dict[str, set[ProfilingCacheKey]]
