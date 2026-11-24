@@ -635,6 +635,30 @@ def test_sm120_nosync_multihost(routing, cake_transport):
     _worker(int(os.environ["RANK"]), args)
 
 
+@pytest.mark.parametrize(
+    "hidden,intermediate,experts,topk",
+    [(5120, 2304, 384, 6), (4096, 2048, 288, 8)],
+    ids=["dsv41_flash", "glm53_flash"],
+)
+def test_sm120_nosync_multihost_model_shapes(hidden, intermediate, experts, topk):
+    """DeepSeek-V4.1-Flash and GLM-5.3-Flash routed experts across hosts (EP16 / EP32), P2P
+    where NCCL maps the pair within a host and GIN across."""
+    if not _MULTIHOST or "LOCAL_RANK" not in os.environ:
+        pytest.skip("run under torchrun with FLASHINFER_TEST_MEGAMOE_SM120_MULTIHOST=1")
+    args = _args(
+        ep=int(os.environ["WORLD_SIZE"]),
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+        tokens=[1, 16, 64, 128],
+        transport=None,
+        cake_transport="lsa_where_reachable",
+        local_rank=int(os.environ["LOCAL_RANK"]),
+    )
+    _worker(int(os.environ["RANK"]), args)
+
+
 @pytest.mark.parametrize("cake_transport", ["all_gin", "lsa_where_reachable"])
 def test_sm120_nosync_follows_cake_table(cake_transport):
     """transport=None: the nosync kernel takes the per-pair table the cake backend resolved
