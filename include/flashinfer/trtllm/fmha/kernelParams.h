@@ -761,6 +761,8 @@ struct KernelParams {
 
     // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout
     // (numTokensKvInPagedKv, headDimQk), whose row stride is the token stride of the cache.
+    // With INT_MAX rows the map would be in TMA's large allocation class, where a -1 index may
+    // load from anywhere in the 128 KiB after the base and fault past a smaller pool.
     // Token-sparse MQA (not MLA) flattens V the same way with its own base pointer. Its pages
     // hold one token, so the page strides are the row strides: K and V may be views of one row.
     if (options.isSparseMla()) {
@@ -770,8 +772,11 @@ struct KernelParams {
                        "Sparse MLA with a token stride of", options.kStrideKeysValues,
                        "must have a page stride of", pageStrideOfTokens, "but got",
                        options.kStrideBatch);
-      shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
-                                     static_cast<uint64_t>(INT_MAX)};
+      uint64_t const numRowsK =
+          options.mNumPagesInMemPool > 0
+              ? static_cast<uint64_t>(options.mNumPagesInMemPool) * options.mNumTokensPerPage
+              : static_cast<uint64_t>(INT_MAX);
+      shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), numRowsK};
       strideK =
           std::vector<uint64_t>{1, static_cast<uint64_t>(options.isMla() ? options.kStrideKeysValues
                                                                          : options.kStrideBatch)};
@@ -802,9 +807,11 @@ struct KernelParams {
                                                  options.isSparseMla() &&
                                                  options.slidingWindowKvPoolPtr != nullptr;
     if (useSparseMlaSlidingWindowKvPool) {
+      std::vector<uint64_t> const shapeKSlidingWindow{static_cast<uint64_t>(options.mHeadDimQk),
+                                                      static_cast<uint64_t>(INT_MAX)};
       params.tmaKSlidingWindowKvPool_ =
-          buildNdTmaDescriptor(options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK,
-                               const_cast<void*>(options.slidingWindowKvPoolPtr),
+          buildNdTmaDescriptor(options, kernelMeta.mDataTypeK, shapeKSlidingWindow, strideK,
+                               tileShapeK, const_cast<void*>(options.slidingWindowKvPoolPtr),
                                /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
     }
 

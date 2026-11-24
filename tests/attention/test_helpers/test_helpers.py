@@ -1,6 +1,8 @@
 import torch
 import functools
+import math
 import os
+from contextlib import contextmanager
 from flashinfer.utils import GPUArchitectureError
 import pytest
 import gc
@@ -148,3 +150,54 @@ def ref_single_prefill(q, k, v, causal=False):
         torch.isneginf(row_max), torch.full_like(row_max, float("-inf")), lse
     )
     return out.to(q.dtype), lse.t().to(torch.float32)
+
+
+@contextmanager
+def tensor_at_unmapped_boundary(shape, dtype):
+    """Place the last tensor byte immediately before an unmapped VMM page."""
+    from cuda.bindings import driver as cu
+
+    def check(result):
+        assert result[0] == cu.CUresult.CUDA_SUCCESS, result
+        return result[1] if len(result) > 1 else None
+
+    torch.cuda.init()
+    prop = cu.CUmemAllocationProp()
+    prop.type = cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = torch.cuda.current_device()
+    granularity = check(
+        cu.cuMemGetAllocationGranularity(
+            prop, cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
+        )
+    )
+    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    assert nbytes <= granularity
+    reservation = check(cu.cuMemAddressReserve(2 * granularity, granularity, 0, 0))
+    handle, mapped = None, False
+    try:
+        handle = check(cu.cuMemCreate(granularity, prop, 0))
+        check(cu.cuMemMap(reservation, granularity, 0, handle, 0))
+        mapped = True
+        access = cu.CUmemAccessDesc()
+        access.location = prop.location
+        access.flags = cu.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+        check(cu.cuMemSetAccess(reservation, granularity, [access], 1))
+
+        class Array:
+            __cuda_array_interface__ = {
+                "shape": (nbytes,),
+                "typestr": "|u1",
+                "data": (int(reservation) + granularity - nbytes, False),
+                "version": 3,
+            }
+
+        raw = torch.as_tensor(Array(), device="cuda")
+        yield raw.view(dtype).view(shape)
+        torch.cuda.synchronize()
+    finally:
+        if mapped:
+            check(cu.cuMemUnmap(reservation, granularity))
+        if handle is not None:
+            check(cu.cuMemRelease(handle))
+        check(cu.cuMemAddressFree(reservation, 2 * granularity))

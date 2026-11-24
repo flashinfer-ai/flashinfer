@@ -23,6 +23,7 @@ from flashinfer.utils import (
     get_device_sm_count,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
 )
+from tests.attention.test_helpers.test_helpers import tensor_at_unmapped_boundary
 
 global_workspace_buffer = None  # can.be empty initialized
 global_trtllm_gen_fmha_workspace_buffer = None
@@ -1616,6 +1617,43 @@ def test_trtllm_batch_decode_sparse_mla_rejects_padded_pages(token_stride):
         _run_sparse_mla_on_token_stride(
             token_stride, 64 * token_stride + 576, torch.bfloat16
         )
+
+
+@pytest.mark.parametrize("num_tokens", [14, 55])
+@pytest.mark.parametrize("num_heads", [16, 64])
+def test_trtllm_batch_decode_sparse_mla_small_kv_cache(num_tokens, num_heads):
+    """Sparse MLA with -1 indices must not load beyond a one-page KV cache."""
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("TRTLLM-GEN MLA only supports SM100 and SM103 GPUs")
+    torch.manual_seed(42)
+    page_size, head_dim, topk, dtype = 64, 576, 2048, torch.float8_e4m3fn
+    positions = torch.arange(num_tokens, dtype=torch.int32, device="cuda")
+    indices = positions[:, None] - torch.arange(topk, dtype=torch.int32, device="cuda")
+    indices[indices < 0] = -1
+    query = torch.randn(num_tokens, 1, num_heads, head_dim, device="cuda").to(dtype)
+    workspace = torch.zeros(workspace_size, dtype=torch.uint8, device="cuda")
+
+    def run(cache):
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=cache,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=indices.unsqueeze(1),
+            seq_lens=positions + 1,
+            max_seq_len=num_tokens,
+            sparse_mla_top_k=topk,
+            bmm1_scale=1.0 / math.sqrt(192),
+            backend="trtllm-gen",
+        )
+
+    with tensor_at_unmapped_boundary((1, 1, page_size, head_dim), dtype) as cache:
+        cache.copy_(torch.randn(cache.shape, device="cuda").to(dtype))
+        out = run(cache)
+        expected = run(cache.clone())
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 def test_trtllm_batch_decode_mla_sparse_cum_seq_lens_q():
