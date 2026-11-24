@@ -9565,7 +9565,7 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__(config, device)
         self._unit_scale: Optional[torch.Tensor] = None
-        self._alphas: tuple[tuple, List[torch.Tensor]] = ((), [])
+        self._alphas: tuple[tuple, List[torch.Tensor], tuple] = ((), [], ())
         # MXFP4 activations take CuTileMxfp4Runner's contract.
         self._mx4 = config.quant.activation is QuantFormat.MXFP4
         if self._mx4:
@@ -9625,19 +9625,20 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
         given = {} if self.config.quant.per_token_scale else view
         a1 = self._input_scale(given, "w1_input_global_scale")
         a2 = self._input_scale(given, "w2_input_global_scale")
-        # Inference tensors carry no version counter.
-        key = tuple(
-            (t.data_ptr(), 0 if t.is_inference() else t._version)
-            for t in (g1, a1, g2, a2)
-        )
-        if key != self._alphas[0]:
+        # Inference tensors carry no version counter: the alphas of the caller's are not
+        # cached (the unit scale is the runner's own, never written). The cache holds the
+        # scales it was keyed on, so no other tensor takes their addresses.
+        ts = (g1, a1, g2, a2)
+        cache = not any(t.is_inference() and t is not self._unit_scale for t in ts)
+        key = tuple((t.data_ptr(), 0 if t.is_inference() else t._version) for t in ts)
+        if not cache or key != self._alphas[0]:
             act, gate = self.config.activation, g1 / a1
             # GEMM2's input global scale, gated (but SiTU) times the gate's alpha
             s1 = gate * a2 if act.is_gated and not isinstance(act, SiTU) else a2
             alphas = [gate, g2 / a2, s1]
-            if torch.cuda.is_current_stream_capturing():
+            if not cache or torch.cuda.is_current_stream_capturing():
                 return [*alphas, a1]
-            self._alphas = (key, alphas)
+            self._alphas = (key, alphas, ts)
         return [*self._alphas[1], a1]
 
     def pack_inputs(
@@ -9768,7 +9769,10 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
                 True,
                 cfg.execution.enable_pdl,
                 experts.num_fused_shared_experts,
-                bool(experts.local_expert_offset) or not finalize,
+                bool(experts.local_expert_offset)
+                or (experts.local_num_experts or routing.num_experts)
+                != routing.num_experts
+                or not finalize,
             )
         mxfp8 = cfg.quant.activation is QuantFormat.MXFP8
         a = dict(

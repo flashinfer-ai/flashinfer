@@ -2387,6 +2387,9 @@ def _w4a16_moe_sm80(
     xf = 0 if ext is None else ext.x_fmt
     tokens, hidden = x.shape[0], (ext or _RecordsExt(0)).hidden(x)
     num_experts, top_k, m = r1.shape[0], topk_ids.shape[1], topk_ids.numel()
+    routed = tokens, top_k
+    if topk_ids.shape != routed or finalize and topk_weights.shape != routed:
+        raise ValueError("Routing ids and weights must be [num_tokens, top_k].")
     xt = out.dtype if codes and finalize else torch.bfloat16 if codes else x.dtype
     if xt not in (torch.bfloat16, torch.float16) or (finalize and out.dtype != xt):
         raise ValueError(f"Below SM100 the MoE runs BF16 or FP16 throughout, got {x.dtype} in, "
@@ -8245,9 +8248,12 @@ def trtllm_fp4_block_scale_moe(
         if activation_type >= ActivationType.InvalidType:  # TRT-LLM's launcher's range
             raise ValueError(f"Invalid activation type: {activation_type}")
         # Records look each slot's expert up as they route, unless the ids are replayed,
-        # local to an EP rank or returned unfinalized.
+        # local to an EP rank (records of fewer experts than routed) or returned unfinalized.
         gather = (
-            routing_replay_out is not None or local_expert_offset or not do_finalize
+            routing_replay_out is not None
+            or local_expert_offset
+            or gemm1_weights_scale.shape[0] != routing_logits.shape[1] + _nfse
+            or not do_finalize
         )
         ids, weights, *slot_experts = _trtllm_routing_sm80(
             routing_logits, routing_bias, routing_method_type, top_k, n_group, topk_group,

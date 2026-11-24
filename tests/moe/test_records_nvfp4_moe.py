@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import (
+    CuteDslMoEWrapper,
     SfLayout,
     block_scale_interleave,
     cute_dsl_fused_moe,
@@ -22,7 +23,7 @@ from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
 )
-from flashinfer.autotuner import autotune
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.fused_moe import core
 from flashinfer.fused_moe.core import _records_moe
 from flashinfer.fused_moe.prepare import W4A16_SM80_TACTICS
@@ -338,6 +339,23 @@ def test_expert_parallel(gated):
             torch.testing.assert_close(o, full, atol=0, rtol=0)
 
 
+def test_wrapper_tactics():
+    """Below SM100 the CuTe-DSL wrapper offers the records tactics its run takes (W4A4 those
+    of per token too)."""
+    m, tokens = _model(True), 37
+    x = torch.randn(tokens, H, device="cuda").bfloat16()
+    ids, weights = _routing(tokens)
+    args = (x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"])
+    args += (m["w2_g"],)
+    wrapper = CuteDslMoEWrapper(E, K, H, I, quant_mode="w4a16")
+    assert wrapper.get_valid_tactics() == list(W4A16_SM80_TACTICS)
+    ref = _reference(m, x.float(), ids, weights, lambda a: a.float())
+    for tactic in wrapper.get_valid_tactics():
+        _close(wrapper.run(*args, tactic=tactic), ref)
+    w4a4 = CuteDslMoEWrapper(E, K, H, I).get_valid_tactics()
+    assert w4a4 == list(W4A16_SM80_TACTICS[:4])
+
+
 def test_alltoall():
     """cutlass with enable_alltoall leaves the rows without a local expert as they were."""
     m = _model(True)
@@ -391,7 +409,8 @@ def test_valid_sizes(gated):
 @pytest.mark.parametrize("width", [H - 128, H - 2])
 def test_narrow_output(width):
     """Without valid sizes a narrower TRT-LLM output receives the leading columns, as on SM100;
-    a CuTe-DSL output of other rows or type is refused."""
+    an output, input or record one off 16 B, a CuTe-DSL output of other rows or type and routing of
+    other shapes (CuTe-DSL, TRT-LLM, cutlass) are refused."""
     m = _model(True)
     tokens = 37
     x = torch.randn(tokens, H, device="cuda").bfloat16()
@@ -401,13 +420,32 @@ def test_narrow_output(width):
     out = _trt(*args, output=buf[:, :width])[0]
     torch.testing.assert_close(out, _trt(*args)[0][:, :width], atol=0, rtol=0)
     assert out.data_ptr() == buf.data_ptr() and (buf[:, width:] == 7).all()
+    off = x.new_empty(tokens * H + 1)[1:].view(tokens, H)  # one element off 16 B
+    with pytest.raises(RuntimeError, match="16 B aligned"):
+        _trt(*args, output=off)
+    with pytest.raises(RuntimeError, match="act and records must be 16 B aligned"):
+        _trt(m, off.copy_(x), *args[2:])
+    r1 = m["r1"].new_empty(m["r1"].numel() + 1)[1:].view(m["r1"].shape).copy_(m["r1"])
+    with pytest.raises(RuntimeError, match="act and records must be 16 B aligned"):
+        _trt({**m, "r1": r1}, *args[1:])
+    scales = [m["r1"], m["w1_g"], m["r2"], m["w2_g"]]
+    with pytest.raises(ValueError, match="num_tokens, top_k"):
+        _trt(m, x, None, ids[1:], weights[1:], *args[5:])
+    with pytest.raises(ValueError, match="num_tokens, top_k"):
+        _cutlass(m, x, ids[1:], weights[1:], scales)
+
+    def cute(ids=ids, weights=weights, **kw):
+        return cute_dsl_fused_moe(
+            x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
+            m["w2_g"], E, K, quant_mode="w4a16", activation_type=m["act"].value, **kw,
+        )  # fmt: skip
+
     for bad in (x.new_empty(tokens + 1, H), x.new_empty(tokens, H, dtype=torch.half)):
         with pytest.raises(ValueError, match="moe_output"):
-            cute_dsl_fused_moe(
-                x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
-                m["w2_g"], E, K, quant_mode="w4a16", activation_type=m["act"].value,
-                moe_output=bad,
-            )  # fmt: skip
+            cute(moe_output=bad)
+    for bad in ((ids[1:], weights[1:]), (ids, weights[:, :1])):
+        with pytest.raises(ValueError, match="num_tokens, top_k"):
+            cute(*bad)
 
 
 def test_fc2_input_out():
@@ -486,6 +524,33 @@ def test_from_logits(tokens):
     assert torch.equal(replay.long().sort(1).values, ids.sort(1).values)
     weights = torch.gather(logits, 1, replay.long()).softmax(-1)
     _close(slots, _reference(m, x.float(), replay, weights, lambda a: a.float()), 2e-2)
+
+
+def test_from_logits_rank0(monkeypatch):
+    """EP rank 0 from logits at row tile 8 (where the records keep the slots): the other
+    rank's slots are left out of the sum, as with the gathered ids of a replay buffer."""
+    m, tokens, half = _model(True), 37, E // 2
+    x = torch.randn(tokens, H, device="cuda").bfloat16()
+    logits = torch.randn(tokens, E, device="cuda")
+    a1 = 448 * 6 / x.float().abs().amax().view(1)
+    a2 = torch.tensor([448 * 6 / 128.0], device="cuda")
+    codes, sf, _ = _quant(x, a1)
+    alpha1, alpha2 = m["w1_g"][:half] / a1, m["w2_g"][:half] / a2
+    tile8 = W4A16_SM80_TACTICS[0]
+    monkeypatch.setattr(AutoTuner, "choose_one", lambda self, *a: (None, tile8))
+
+    def run(lg=logits, **kw):
+        return trtllm_fp4_block_scale_moe(
+            lg, None, codes, sf.view(torch.float8_e4m3fn), m["w1"][:half],
+            m["r1"][:half], None, None, None, None, m["w2"][:half], m["r2"][:half], None,
+            a2 * alpha1, alpha1, alpha2, E, K, None, None, I, 0, half, None,
+            routing_method_type=RoutingMethodType.Renormalize.value, **kw,
+        )[0]  # fmt: skip
+
+    # The other rank's experts first: GEMM2's rows of this rank's left behind (token, k) order
+    run(logits.roll(half, 1))
+    replay = torch.empty(tokens, K, dtype=torch.int16, device="cuda")
+    torch.testing.assert_close(run(), run(routing_replay_out=replay), atol=0, rtol=0)
 
 
 def _mx_model(gated, split=False, seed=0):

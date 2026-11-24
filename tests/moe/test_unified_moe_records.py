@@ -17,9 +17,14 @@ from flashinfer.fused_moe import (
     QuantConfig,
     QuantFormat,
     RoutingConfig,
+    RoutingInputMode,
+    RoutingMethodType,
     SwiGLU,
 )
+from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe.api import RecordsMxfp4Config, RecordsNvfp4Config
+from flashinfer.fused_moe.core import _trtllm_routing_sm80
+from flashinfer.fused_moe.prepare import W4A16_SM80_TACTICS
 from flashinfer.quantization.fp4_quantization import mxfp4_quantize
 from flashinfer.tllm_enums import SfLayout
 from flashinfer.utils import get_compute_capability
@@ -116,7 +121,8 @@ def test_records_unified(case, tokens):
         topk_weights=weights,
         per_token_scale=pt,
     )
-    out = MoELayer(config, device=torch.device("cuda"))(act, pack)
+    layer = MoELayer(config, device=torch.device("cuda"))
+    out = layer(act, pack)
     # Tactics take GEMM1's output in FP32 or BF16 into GEMM2's quantized input, and the
     # codes that this flips cost up to 7e-2 under MXFP4's E8M0 scales: the closer reference.
     refs = [
@@ -126,3 +132,75 @@ def test_records_unified(case, tokens):
         for b in (True, False)
     ]
     _close(out, min(refs, key=lambda r: (out.float() - r).norm()))
+    if key == "records_nvfp4" and not per_token:  # an inference tensor updated in place
+        with torch.inference_mode():
+            view["w1_global_scale"] = g1 = view["w1_global_scale"].clone()
+            first = layer(act, pack)
+            g1.mul_(2)
+            fresh = MoELayer(config, device=torch.device("cuda"))(act, pack)
+            assert not torch.equal(fresh, first)
+            torch.testing.assert_close(layer(act, pack), fresh, atol=0, rtol=0)
+
+
+def test_records_unified_rank0(monkeypatch):
+    """EP rank 0 from logits at row tile 8 (where the records keep the slots): the full layer
+    on the same routing with the other rank's experts weighted 0."""
+    m, tokens, half = _model(True), 37, E // 2
+    x = torch.randn(tokens, H, device="cuda").bfloat16()
+    logits = torch.randn(tokens, E, device="cuda")
+    tile8 = W4A16_SM80_TACTICS[0]
+    monkeypatch.setattr(AutoTuner, "choose_one", lambda self, *a, **k: (None, tile8))
+    sf1, sf2 = (m[k].view(torch.float8_e4m3fn) for k in ("w1_sf", "w2_sf"))
+    a1 = 448 * 6 / x.float().abs().amax().view(1)
+    a2 = torch.tensor([448 * 6 / 128.0], device="cuda")
+
+    def layer(n, **experts):  # over the leading n experts
+        view = RecordsNvfp4Config().prepare_weights(
+            m["w1"][:n], sf1[:n], m["w1_g"][:n], m["w2"][:n], sf2[:n], m["w2_g"][:n],
+            num_local_experts=n, hidden_size=H, intermediate_size=I, activation=SwiGLU(),
+        )  # fmt: skip
+        view.update(w1_input_global_scale=a1, w2_input_global_scale=a2)
+        pack = MoEWeightPack()
+        pack.prepare_for("records_nvfp4", view)
+        config = MoEConfig(
+            routing=RoutingConfig(
+                num_experts=E, top_k=K, method=RoutingMethodType.Renormalize
+            ),
+            quant=QuantConfig(weight=F4[0], activation=F4[0]),
+            experts=ExpertConfig(intermediate_size=I, **experts),
+            activation=SwiGLU(),
+            backend=BackendOptions(candidates=(RecordsNvfp4Config(),)),
+            execution=ExecutionConfig(tune_max_num_tokens=tokens),
+        )
+        moe = MoELayer(config, device=torch.device("cuda"))
+        return lambda act: moe(act, pack)
+
+    def from_logits(lg):
+        return MoEActivationPack(
+            hidden_states_q=x,
+            hidden_states_scale=None,
+            routing_logits=lg,
+            routing_input_mode=RoutingInputMode.FromLogits,
+        )
+
+    rank0 = layer(half, local_num_experts=half)
+    rank0(from_logits(logits.roll(half, 1)))  # GEMM2's rows of the other rank's entries
+    out = rank0(from_logits(logits))
+    ids, w = _trtllm_routing_sm80(
+        logits,
+        None,
+        RoutingMethodType.Renormalize.value,
+        K,
+        None,
+        None,
+        None,
+        True,
+        None,
+    )
+    routed = MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        topk_ids=ids,
+        topk_weights=w * (ids < half),
+    )
+    torch.testing.assert_close(out, layer(E)(routed), atol=0, rtol=0)

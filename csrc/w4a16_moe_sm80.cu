@@ -1953,6 +1953,17 @@ int dev_attr() {  // attribute A of the current device, cached per device
 }
 int max_smem_optin() { return dev_attr<cudaDevAttrMaxSharedMemoryPerBlockOptin>(); }
 int max_smem_per_sm() { return dev_attr<cudaDevAttrMaxSharedMemoryPerMultiprocessor>(); }
+// Raise kern's dynamic shared memory limit to all the device allows: the limit is per kernel,
+// so a concurrent launch that needs less must not lower it under another's (as sampling.cuh).
+template <typename F>
+void raise_smem_limit(F kern, int max_smem) {
+  cudaFuncAttributes a{};
+  TVM_FFI_ICHECK(cudaFuncGetAttributes(&a, kern) == cudaSuccess &&
+                 cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      max_smem - static_cast<int>(a.sharedSizeBytes)) ==
+                     cudaSuccess)
+      << "cannot raise the shared memory limit";
+}
 
 template <auto K, int SMEM>
 int ctas_per_sm() {  // resident 256-thread CTAs per SM of kernel K at SMEM bytes, cached per device
@@ -2224,8 +2235,7 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
     const int dyn = d.ts ? std::max(one ? 0 : smem, 128) : one ? 0 : smem;
     auto run = [&](auto kern) {
       // the 48 KB default bounds dynamic plus static shared memory
-      if (!one && dyn + stat > 48 * 1024)
-        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, dyn);
+      if (!one && dyn + stat > 48 * 1024) raise_smem_limit(kern, max_smem);
       d.cta0 = 1;
       kern<<<1 + dq_ctas, nt, dyn, st>>>(ids, M, e, W, Q, m, m + 1, m + 1 + nb, rm, d);
     };
@@ -2275,8 +2285,7 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
   int* off = pc + static_cast<long>(nC) * e;
   const int sm_e = e * static_cast<int>(sizeof(int)), sm_p = (W + 1) * sm_e;
   auto big = [&](auto kern, int smem) {
-    if (smem > 48 * 1024 - 256)
-      cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (smem > 48 * 1024 - 256) raise_smem_limit(kern, max_smem);
   };
   big(prepx_count<0>, sm_e);
   const int sm_q = d.ts ? std::max(sm_e, 128) : sm_e;  // DQ 3: dequant_pt's 128 B
@@ -2357,6 +2366,9 @@ void w4a16_moe_sm80_gemm(
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
   CHECK_INPUT_AND_TYPE(act, kXdl);
   CHECK_INPUT_AND_TYPE(out, kXdl);
+  TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(act.data_ptr()) & 15) == 0 &&
+                 (reinterpret_cast<uintptr_t>(records.data_ptr()) & 15) == 0)
+      << "act and records must be 16 B aligned";
   TVM_FFI_ICHECK(N % kTileN == 0 && K % 16 == 0 && Nout % 8 == 0 && Nout <= N)
       << "W4A16 MoE GEMM: shape";
   TVM_FFI_ICHECK(row_tile == 8 || row_tile == 16 || row_tile == 32 || row_tile == 64 ||
@@ -2500,8 +2512,9 @@ void w4a16_moe_sm80_gemm(
     CHECK_INPUT_AND_TYPE(so, kXdl);
     CHECK_INPUT_AND_TYPE(ct, dl_int32);
     CHECK_DIM(2, so);
-    TVM_FFI_ICHECK(so.size(1) == Nout && Nout % 8 == 0)
-        << "sum_out must be [tokens, Nout], 8 | Nout";
+    TVM_FFI_ICHECK(so.size(1) == Nout && Nout % 8 == 0 &&
+                   (reinterpret_cast<uintptr_t>(so.data_ptr()) & 15) == 0)
+        << "sum_out must be [tokens, Nout], 8 | Nout, 16 B aligned";
     constexpr int kFinTopK = 4 * Cfg<8, 1>::kStageBytes / (kTileN * 2 + 8);  // fin_chunk's stage
     fuse = R == 8 && variant == kBase && so.size(0) * (Nout / 8) <= 256 && columns <= kFinCnt &&
            ct.numel() >= kFinCnt && top_k <= kFinTopK;
@@ -2701,7 +2714,8 @@ void w4a16_moe_sm80_finalize(TensorView y, TensorView topk_weights, TensorView t
   CHECK_INPUT_AND_TYPE(out, kXdl);
   CHECK_DIM(2, out);
   const int tokens = static_cast<int>(out.size(0)), H = static_cast<int>(out.size(1));
-  TVM_FFI_ICHECK(H % 8 == 0) << "hidden size must be a multiple of 8";
+  TVM_FFI_ICHECK(H % 8 == 0 && (reinterpret_cast<uintptr_t>(out.data_ptr()) & 15) == 0)
+      << "out must be 16 B aligned, its hidden size a multiple of 8";
   ffi::CUDADeviceGuard device_guard(out.device().device_id);
   const cudaStream_t st = get_stream(out.device());
   const int n = tokens * (H / 8);

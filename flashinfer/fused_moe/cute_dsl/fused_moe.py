@@ -1717,6 +1717,14 @@ class CuteDslMoEWrapper:
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
+        cuda = torch.cuda.is_available()
+        if cuda and torch.cuda.get_device_capability(self.device)[0] < 10:  # records
+            from ..core import _W4A16_SM80_PT_TACTICS
+            from ..prepare import W4A16_SM80_TACTICS
+
+            # W4A4 may run per token, on a subset of the tactics
+            pt = self.quant_mode == "w4a4"
+            return list(_W4A16_SM80_PT_TACTICS if pt else W4A16_SM80_TACTICS)
         if self.routing_weights_before_fc2:
             return [DEFAULT_BLACKWELL_MOE_TACTIC]
         if self.swap_ab and self.quant_mode != "w4a16":
@@ -2162,6 +2170,8 @@ def cute_dsl_fused_moe(
                 moe_output, shape, output_dtype, x.device, "moe_output"
             )
         ids = token_selected_experts
+        if ids.shape[1:] != (top_k,):  # the rows and weights: the records' checks
+            raise ValueError("token_selected_experts must be [num_tokens, top_k].")
         if local_expert_offset:  # local ids; the other ranks' are skipped
             ids = ids - local_expert_offset
         inputs = [x, ids, token_final_scales, w1_weight_sf, w1_alpha]
