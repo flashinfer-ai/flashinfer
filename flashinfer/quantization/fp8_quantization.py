@@ -1206,7 +1206,7 @@ def mxfp8_dequantize(
     else:
         scales = unswizzle_sf(scales, rows, k, 32, layout)
     blocks = input.cpu().view(torch.float8_e4m3fn).reshape(rows, k // 32, 32).float()
-    return blocks.mul_(scales.view(torch.float8_e8m0fnu).float().unsqueeze(-1)).reshape(
+    return (blocks * scales.view(torch.float8_e8m0fnu).float().unsqueeze(-1)).reshape(
         input.shape
     )
 
