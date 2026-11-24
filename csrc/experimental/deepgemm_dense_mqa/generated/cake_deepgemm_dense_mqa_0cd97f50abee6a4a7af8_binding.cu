@@ -326,6 +326,8 @@ void Run(TensorView a_Q, TensorView a_Q_scales_alias, TensorView a_KV, TensorVie
   check_same_device(a_cu_seq_len_k_end, a_Q, "cu_seq_len_k_end", "Q");
   TVM_FFI_CHECK((CheckedMul(CheckedMul(CDiv(CheckedAdd(static_cast<int64_t>(static_cast<int64_t>(a_seq_len)), 3LL), 4LL), 4LL), static_cast<int64_t>(static_cast<int64_t>(a_stride_logits))) <= 4294967296LL), ValueError)
       << KERNEL_NAME << ": requires (((CDiv((static_cast<int64_t>(static_cast<int64_t>(seq_len)) + 3), 4) * 4) * static_cast<int64_t>(static_cast<int64_t>(stride_logits))) <= 4294967296LL)";
+  TVM_FFI_CHECK((a_seq_len == 1LL), ValueError)
+      << KERNEL_NAME << ": requires (seq_len == 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

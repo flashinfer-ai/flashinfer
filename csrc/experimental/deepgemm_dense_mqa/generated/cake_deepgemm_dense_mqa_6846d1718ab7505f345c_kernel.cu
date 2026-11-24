@@ -49,21 +49,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_WORK_PREFIX_OFF 0
-#define SMEM_WORK_PREFIX_STAGE_BYTES 116184
-#define SMEM_WORK_PREFIX_STRIDE 116184
-#define SMEM_COST_PREFIX_OFF 116184
-#define SMEM_COST_PREFIX_STAGE_BYTES 116184
-#define SMEM_COST_PREFIX_STRIDE 116184
-#define SMEM_WARP_SUMS_OFF 232368
-#define SMEM_WARP_SUMS_STAGE_BYTES 64
-#define SMEM_WARP_SUMS_STRIDE 64
-#define SMEM_CARRY_OFF 232432
-#define SMEM_CARRY_STAGE_BYTES 8
-#define SMEM_CARRY_STRIDE 8
-#define SMEM_TOTAL 232448
-#define THREADS 256
 #ifndef SM_COUNT
 #error "SM_COUNT is a downstream specialization of this program; define it on the compile line"
 #endif
@@ -107,7 +92,7 @@ kernel_cake_deepgemm_dense_mqa_6846d1718ab7505f345c(unsigned int* __restrict__ S
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* work_prefix = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int work_prefix_addr = smem + 0;
     unsigned int* cost_prefix = reinterpret_cast<unsigned int*>(smem_raw + 116184);
@@ -132,7 +117,7 @@ kernel_cake_deepgemm_dense_mqa_6846d1718ab7505f345c(unsigned int* __restrict__ S
     #pragma unroll 1
     for (unsigned int qidx = (unsigned int)tid; qidx < q_bound; qidx += 256) {
         if (num_q_blocks > qidx) {
-            unsigned int start = 4294967295;
+            unsigned int start = 4294967295ll;
             unsigned int end = 0;
             #pragma unroll
             for (int qi = 0; qi < 4; qi++) {
@@ -149,7 +134,7 @@ kernel_cake_deepgemm_dense_mqa_6846d1718ab7505f345c(unsigned int* __restrict__ S
             Metadata[span_offset + qidx * 2] = base;
             Metadata[span_offset + qidx * 2 + 1] = splits;
             work_prefix[qidx] = splits;
-            cost_prefix[qidx] = splits + (unsigned int)(((splits == 0) ? 0 : 1));
+            cost_prefix[qidx] = splits + (unsigned int)((splits == 0) ? 0 : 1);
         }
     }
     __syncthreads();
@@ -161,7 +146,7 @@ kernel_cake_deepgemm_dense_mqa_6846d1718ab7505f345c(unsigned int* __restrict__ S
         unsigned int qidx_1 = block_base + (unsigned int)tid;
         unsigned long long value_1 = 0;
         if (qidx_1 < num_q_blocks) {
-            value_1 = ((unsigned long long)work_prefix[qidx_1] << 32) + (unsigned long long)cost_prefix[qidx_1];
+            value_1 = ((unsigned long long)work_prefix[qidx_1] << 32ull) + (unsigned long long)cost_prefix[qidx_1];
         }
         __syncthreads();
         unsigned long long previous_carry = carry[0];
@@ -178,18 +163,30 @@ kernel_cake_deepgemm_dense_mqa_6846d1718ab7505f345c(unsigned int* __restrict__ S
             { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 16, 32); if (lane >= 16) { _cta_scan_sum_prefix_0_ws += peer; } }
             if (lane == 31) { warp_sums[warp] = (uint64_t)_cta_scan_sum_prefix_0_ws; }
             __syncthreads();
-            const uint64_t _cta_scan_sum_prefix_0_wt = (lane < 8) ? (uint64_t)warp_sums[lane] : 0;
-            uint64_t _cta_scan_sum_prefix_0_wsum = _cta_scan_sum_prefix_0_wt;
-            { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 1, 32); if (lane >= 1) { _cta_scan_sum_prefix_0_wsum += peer; } }
-            { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 2, 32); if (lane >= 2) { _cta_scan_sum_prefix_0_wsum += peer; } }
-            { uint64_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 4, 32); if (lane >= 4) { _cta_scan_sum_prefix_0_wsum += peer; } }
-            _cta_scan_sum_total_0 = (uint64_t)__shfl_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 7);
-            const uint64_t _cta_scan_sum_prefix_0_before = __shfl_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum - _cta_scan_sum_prefix_0_wt, warp);
+            uint64_t _cta_scan_sum_prefix_0_before = 0;
+            uint64_t _cta_scan_sum_total_0_sum = 0;
+            { const uint64_t t = (uint64_t)warp_sums[0]; _cta_scan_sum_total_0_sum += t;
+              if (warp > 0) { _cta_scan_sum_prefix_0_before += t; } }
+            { const uint64_t t = (uint64_t)warp_sums[1]; _cta_scan_sum_total_0_sum += t;
+              if (warp > 1) { _cta_scan_sum_prefix_0_before += t; } }
+            { const uint64_t t = (uint64_t)warp_sums[2]; _cta_scan_sum_total_0_sum += t;
+              if (warp > 2) { _cta_scan_sum_prefix_0_before += t; } }
+            { const uint64_t t = (uint64_t)warp_sums[3]; _cta_scan_sum_total_0_sum += t;
+              if (warp > 3) { _cta_scan_sum_prefix_0_before += t; } }
+            { const uint64_t t = (uint64_t)warp_sums[4]; _cta_scan_sum_total_0_sum += t;
+              if (warp > 4) { _cta_scan_sum_prefix_0_before += t; } }
+            { const uint64_t t = (uint64_t)warp_sums[5]; _cta_scan_sum_total_0_sum += t;
+              if (warp > 5) { _cta_scan_sum_prefix_0_before += t; } }
+            { const uint64_t t = (uint64_t)warp_sums[6]; _cta_scan_sum_total_0_sum += t;
+              if (warp > 6) { _cta_scan_sum_prefix_0_before += t; } }
+            { const uint64_t t = (uint64_t)warp_sums[7]; _cta_scan_sum_total_0_sum += t;
+              if (warp > 7) { _cta_scan_sum_prefix_0_before += t; } }
+            _cta_scan_sum_total_0 = (uint64_t)_cta_scan_sum_total_0_sum;
             _cta_scan_sum_prefix_0 = (uint64_t)(_cta_scan_sum_prefix_0_ws - _cta_scan_sum_prefix_0_own + _cta_scan_sum_prefix_0_before);
         }
         unsigned long long scanned_1 = _cta_scan_sum_prefix_0 + value_1 + previous_carry;
         if (qidx_1 < num_q_blocks) {
-            work_prefix[qidx_1] = (unsigned int)(scanned_1 >> 32);
+            work_prefix[qidx_1] = (unsigned int)(scanned_1 >> 32ull);
             cost_prefix[qidx_1] = (unsigned int)scanned_1;
         }
         if (tid == 255) {

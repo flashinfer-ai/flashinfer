@@ -280,6 +280,10 @@ void Run(TensorView a_Q, TensorView a_KV, TensorView a_Weights, TensorView a_SF_
   check_same_device(a_cu_seq_len_k_end, a_Q, "cu_seq_len_k_end", "Q");
   check_contiguous(a_ScheduleMeta, "ScheduleMeta");
   check_same_device(a_ScheduleMeta, a_Q, "ScheduleMeta", "Q");
+  TVM_FFI_CHECK((a_num_q_blocks >= 1LL), ValueError)
+      << KERNEL_NAME << ": requires (num_q_blocks >= 1)";
+  TVM_FFI_CHECK((a_num_q_blocks <= 1024LL), ValueError)
+      << KERNEL_NAME << ": requires (num_q_blocks <= 1024)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

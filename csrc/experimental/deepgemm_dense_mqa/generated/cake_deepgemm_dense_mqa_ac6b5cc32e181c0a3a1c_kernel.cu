@@ -42,37 +42,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 384
-#define TMEM_TMEM_ACC_OFFSET 0
-#define NUM_Q_PIPE_STAGES 3
-#define NUM_KV_PIPE_STAGES 5
-#define NUM_TMEM_PIPE_STAGES 3
-#define SMEM_NEGINF_SCRATCH_OFF 220672
-#define SMEM_NEGINF_SCRATCH_STAGE_BYTES 4096
-#define SMEM_NEGINF_SCRATCH_STRIDE 4096
-#define SMEM_TS_WORDS_OFF 220672
-#define SMEM_TS_WORDS_STAGE_BYTES 24
-#define SMEM_TS_WORDS_STRIDE 24
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 16384
-#define SMEM_SMEM_Q_STRIDE 16384
-#define SMEM_SMEM_WEIGHTS_OFF 219136
-#define SMEM_SMEM_WEIGHTS_STAGE_BYTES 512
-#define SMEM_SMEM_WEIGHTS_STRIDE 512
-#define SMEM_SMEM_KV_OFF 50176
-#define SMEM_SMEM_KV_STAGE_BYTES 32768
-#define SMEM_SMEM_KV_STRIDE 33792
-#define SMEM_SMEM_KV_SCALES_OFF 82944
-#define SMEM_SMEM_KV_SCALES_STAGE_BYTES 1024
-#define SMEM_SMEM_KV_SCALES_STRIDE 33792
-#define SMEM_CANDIDATE_QUEUE_VALUES_OFF 153088
-#define SMEM_CANDIDATE_QUEUE_VALUES_STAGE_BYTES 8192
-#define SMEM_CANDIDATE_QUEUE_VALUES_STRIDE 8192
-#define SMEM_CANDIDATE_QUEUE_INDICES_OFF 161280
-#define SMEM_CANDIDATE_QUEUE_INDICES_STAGE_BYTES 8192
-#define SMEM_CANDIDATE_QUEUE_INDICES_STRIDE 8192
-#define SMEM_TOTAL 224768
 #define CANDIDATE_MODE 0
 #define FULL_Q_BLOCKS 0
 #ifndef SM_COUNT
@@ -198,7 +167,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -234,7 +203,7 @@ kernel_cake_deepgemm_dense_mqa_ac6b5cc32e181c0a3a1c(const __grid_constant__ CUte
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* neginf_scratch = reinterpret_cast<float*>(smem_raw + 220672);
     const int neginf_scratch_addr = smem + 220672;
     unsigned int* ts_words = reinterpret_cast<unsigned int*>(smem_raw + 220672);
@@ -251,6 +220,8 @@ kernel_cake_deepgemm_dense_mqa_ac6b5cc32e181c0a3a1c(const __grid_constant__ CUte
     const int candidate_queue_values_addr = smem + 153088;
     int* candidate_queue_indices = reinterpret_cast<int*>(smem_raw + 161280);
     const int candidate_queue_indices_addr = smem + 161280;
+
+    // Kernel setup ops
     if (tid == 0) {
         asm volatile("griddepcontrol.wait;" ::: "memory");
         unsigned int pf_row0 = bid * 2;
@@ -266,8 +237,7 @@ kernel_cake_deepgemm_dense_mqa_ac6b5cc32e181c0a3a1c(const __grid_constant__ CUte
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV))) : "memory"); }
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&KV_scales))) : "memory"); }
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 22 barriers)
-    // Mbarriers at smem_raw[0..176)
+    // Mbarrier init (22 barriers at smem_raw[0..176))
 
     if (warp == 9) {
         uint32_t leader = elect_sync();
@@ -320,10 +290,10 @@ kernel_cake_deepgemm_dense_mqa_ac6b5cc32e181c0a3a1c(const __grid_constant__ CUte
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_acc = taddr;
 
     // Kernel post-init ops
-    const int tmem_tmem_acc = taddr;
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (tid == 0) {
         unsigned int ft_row0 = bid * 2;
