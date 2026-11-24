@@ -19,6 +19,7 @@ from .....core.validation.common import (
     validate_mega_fleet_params,
 )
 from .....weights import PrequantizedMoEWeights
+from ..weight_validation import check_transformed_mega_weights_structure
 from .genphase_config import GenphaseConfigMixin
 
 from .common.activation_batch_invariant import batch_invariant_numerical_metadata
@@ -712,6 +713,22 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
 @register_mega_kernel("sm100_nvfp4_nvfp4_bf16_cutedsl")
 class StandardNvfp4Backend(_StandardBlockScaledBackend):
     quant_kind = "nvfp4"
+
+    def prepare_transformed_weights(self, transformed_weights, bootstrap, fleet_params):
+        check_transformed_mega_weights_structure(transformed_weights)
+        prepared = []
+        for leg in transformed_weights:
+            weight, scale = leg
+            # Older callers supplied E4M3 scales as byte views.
+            if isinstance(scale, torch.Tensor) and scale.dtype == torch.uint8:
+                leg = (weight, scale.view(torch.float8_e4m3fn))
+            prepared.append(leg)
+        fc1, fc2 = prepared
+        if fc1 is not transformed_weights[0] or fc2 is not transformed_weights[1]:
+            transformed_weights = (fc1, fc2)
+        return super().prepare_transformed_weights(
+            transformed_weights, bootstrap, fleet_params
+        )
 
     @classmethod
     def kernel_name(cls):
