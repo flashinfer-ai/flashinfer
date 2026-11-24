@@ -50,6 +50,7 @@ from ..api import (
     SwiGLUStep,
 )
 from ..runners import MoERunner, _validate_logits_inputs, _validate_prerouted_inputs
+from . import spec as S
 from .api_fp4 import MXFP4, NVFP4, Fp4Pair
 from .runner import MOE_BF16_ARCHS, _PackedInputs, routing_term
 
@@ -188,6 +189,11 @@ class BatchInvariantFp4Runner(MoERunner):
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
         self._scale: Optional[torch.Tensor] = None
+        # the routing term's state, set by _check_support (`_method` None: no from-logits class; a deferred refusal is
+        # raised at a from-logits call)
+        self._method: Optional[S.RoutingMethod] = None
+        self._grouped_other: bool = False
+        self._logits_refusal: Optional[BatchInvariantUnsupportedError] = None
         # the intermediate's class (`per_token` / `static`): the bound backend config's field
         cands = [c for c in config.backend if hasattr(c, "intermediate")]
         self._intermediate: str = cands[0].intermediate if cands else "per_token"
@@ -262,7 +268,7 @@ class BatchInvariantFp4Runner(MoERunner):
         )
         # a routing term the from-logits mode has no class for (Llama4 beyond top-1, a group shape outside the rule) is
         # refused at a from-logits call, not here: the pre-routed modes never consult it (the bf16 runner's rule)
-        self._logits_refusal: Optional[BatchInvariantUnsupportedError] = None
+        self._logits_refusal = None
         try:
             self._method, self._grouped_other = routing_term(routing, cls)
         except BatchInvariantUnsupportedError as e:
@@ -278,7 +284,7 @@ class BatchInvariantFp4Runner(MoERunner):
         from ...gemm.batch_invariant.api import part_of
 
         self._part = part_of(self.device)
-        method = getattr(self, "_method", None)
+        method = self._method
         if (
             method is not None
             and method.scaled
@@ -495,9 +501,8 @@ class BatchInvariantFp4Runner(MoERunner):
                 )
             if self._method is None:
                 # the refusal deferred at construction (the pre-routed modes never consulted it), else no term
-                refusal = getattr(self, "_logits_refusal", None)
-                if refusal is not None:
-                    raise refusal
+                if self._logits_refusal is not None:
+                    raise self._logits_refusal
                 raise unsupported(
                     cls,
                     f"routing method {cfg.routing.method!r} from logits",

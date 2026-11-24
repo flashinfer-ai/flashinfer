@@ -3763,3 +3763,23 @@ def test_shard_refusal_names_the_configured_pairs_class(pair):
     assert "does not serve" in str(e.value) and "expert-parallel" not in str(e.value)
 
 
+def test_runner_support_state_is_initialised_at_construction():
+    """The routing term's state (``_method``, ``_grouped_other``, ``_logits_refusal``) exists from construction, so no
+    reader needs a default; the layer's protocol still orders the support check before the build."""
+    import inspect
+
+    r = _runner(_NVFP4)
+    assert r._method is None and r._grouped_other is False
+    assert r._logits_refusal is None
+    assert {"_method", "_grouped_other", "_logits_refusal"} <= set(vars(r))
+    src = inspect.getsource(BatchInvariantFp4Runner)
+    assert "getattr(self, " not in src
+    with pytest.raises(RuntimeError):
+        r.build()
+    if _supported:
+        r.check_support()
+        assert r._method is not None and r._logits_refusal is None
+        r.build()
+        assert r._part is not None
+
+
