@@ -2244,6 +2244,7 @@ kernel_cake_mla_nvfp4_paged_decode_32a47bbfa05aebbc97c5(const __grid_constant__ 
                     " [%0], {%1};"
                     :: "r"(taddr + (unsigned int)lane_base_c + 351), "r"((q_words + 7)[0]));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile(
                     "{\n\t"
@@ -2365,6 +2366,7 @@ kernel_cake_mla_nvfp4_paged_decode_32a47bbfa05aebbc97c5(const __grid_constant__ 
                     "tcgen05.st.sync.aligned.32x32b.x1.b32"
                     " [%0], {%1};"
                     :: "r"(taddr + (unsigned int)lane_base_c + 412), "r"((k_words_1 + 7)[0]));
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(raw_empty_addr + (raw_c) * 8);
 #if __CUDA_ARCH__ == 1030
                 raw_c += 1;
@@ -2578,6 +2580,7 @@ kernel_cake_mla_nvfp4_paged_decode_32a47bbfa05aebbc97c5(const __grid_constant__ 
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
                         :: "r"(taddr + (unsigned int)lane_base_c + 412), "r"((k_words_3 + 7)[0]));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     mbarrier_arrive(raw_empty_addr + (raw_c) * 8);
 #if __CUDA_ARCH__ == 1030
                     raw_c += 1;
@@ -2852,6 +2855,7 @@ kernel_cake_mla_nvfp4_paged_decode_32a47bbfa05aebbc97c5(const __grid_constant__ 
                             "tcgen05.st.sync.aligned.32x32b.x1.b32"
                             " [%0], {%1};"
                             :: "r"(taddr + (unsigned int)lane_base_c + 412), "r"((k_words_5 + 7)[0]));
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive(raw_empty_addr + (raw_c) * 8);
 #if __CUDA_ARCH__ == 1030
                         raw_c += 1;
