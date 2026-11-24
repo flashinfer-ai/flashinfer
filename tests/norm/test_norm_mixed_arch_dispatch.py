@@ -261,6 +261,32 @@ class TestUseCudaNormDispatch:
         device = torch.device("cuda:0")
         assert _use_cuda_norm(device) is False
 
+    def test_captured_arch_probed_once(self, monkeypatch, mock_cuda_devices):
+        """The captured arch is probed once per probe, not on every norm call."""
+        import flashinfer.norm as norm_module
+
+        probes = []
+
+        def probe():
+            probes.append(None)
+            return "sm_89"
+
+        monkeypatch.setattr(norm_module, "_USE_CUDA_NORM", False)
+        monkeypatch.setattr(norm_module, "_cute_dsl_supports_arch", lambda m, n: True)
+        monkeypatch.setattr(norm_module, "_dsl_captured_arch", probe)
+
+        mock_cuda_devices([(8, 9)])
+
+        device = torch.device("cuda:0")
+        for _ in range(3):
+            assert _use_cuda_norm(device) is False
+        assert len(probes) == 1
+
+        # A different probe is asked again instead of being served the first
+        # probe's answer: sm_100a cannot run on the sm_89 device.
+        monkeypatch.setattr(norm_module, "_dsl_captured_arch", lambda: "sm_100a")
+        assert _use_cuda_norm(device) is True
+
 
 class TestMismatchedArchSubprocess:
     """End-to-end check that a mismatched captured arch falls back to CUDA JIT.
