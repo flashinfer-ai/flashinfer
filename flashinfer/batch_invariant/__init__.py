@@ -207,7 +207,7 @@ def _moe_class_terms(
     ``spec.RoutingMethod``; ``act`` an ``ActivationConfig`` of the layer (its scalars are the class's parameters),
     ``"swiglu"`` / ``"relu2"`` (the default gated / ungated chains), or a chain name of ``spec.ACTS`` / ``spec.UNGATED_ACTS``
     with ``params`` (and ``gated`` for the names in both tables). The receipt names a class some layer can build: the
-    runners' bounds and group rule apply here as ``ValueError``.
+    runners' bounds, group rule and Llama4 top-1 rule apply here as ``ValueError``.
     """
     # absolute on purpose: the JIT cache keys follow relative imports, and the MoE specification is not part of the GEMM
     # modules' closures
@@ -231,6 +231,12 @@ def _moe_class_terms(
                 f"the batch-invariant MoE classes do not implement routing method {method!r}"
             )
         rm = spec.METHOD_OF_FLASHINFER[method]
+        if method is RoutingMethodType.Llama4 and top_k != 1:
+            # the runner's rule (`runner.routing_term`): the method is the top-1 of the logits with its sigmoid as the weight
+            raise ValueError(
+                f"fingerprint({op!r}): Llama4 routing takes top_k = 1 (the top-1 of the logits with its sigmoid as the "
+                f"weight; TopKSigmoid for top_k {top_k})"
+            )
     elif isinstance(method, str):
         rm = spec.method_named(method)
     elif isinstance(method, spec.RoutingMethod):

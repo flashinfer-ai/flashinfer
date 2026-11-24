@@ -384,7 +384,8 @@ def test_fingerprint_dimensions_and_classes(pair):
     # the routing methods of the bf16 backend's surface are the class's as well: a method is part of the identifier; a
     # method the classes do not implement is refused
     assert (
-        bi.fingerprint(op, arch="sm_107", method=RoutingMethodType.Llama4, **dims) != fp
+        bi.fingerprint(op, arch="sm_107", method=RoutingMethodType.TopKSigmoid, **dims)
+        != fp
     )
     # the geometry is a dimension through the GEMM classes and the routing (the MX quantizer class is row-length free)
     assert (
@@ -3876,6 +3877,32 @@ def test_fingerprint_refuses_the_shapes_the_layer_refuses(pair):
         bi.fingerprint(op, H=2048, I=768, top_k=8, num_experts=128, arch="sm_107")
         == pins[pair.name]
     )
+
+
+def test_fingerprint_applies_the_runners_llama4_top1_rule():
+    """``fingerprint("fused_moe_<pair>", method="Llama4", top_k=k)`` applies the rule the runner applies to the routing
+    term (``routing_term``: Llama4 is the top-1 of the logits with its sigmoid as the weight, refused for another ``k``):
+    no receipt at ``top_k > 1`` for either fp4 class -- nor for the bf16 and fp8 classes, which share the rule -- and the
+    top-1 receipt is ``TopKSigmoid``'s at ``top_k = 1``."""
+    from flashinfer.fused_moe.batch_invariant.runner import routing_term
+
+    dims = dict(H=256, I=128, num_experts=16)
+    for op in ("fused_moe_nvfp4", "fused_moe_mxfp4", "fused_moe", "fused_moe_fp8"):
+        kw = dict(arch="sm_107") if op.endswith(("nvfp4", "mxfp4")) else {}
+        for method in ("Llama4", RoutingMethodType.Llama4):
+            with pytest.raises(ValueError, match="Llama4 routing takes top_k = 1"):
+                bi.fingerprint(op, top_k=2, method=method, **dims, **kw)
+        assert bi.fingerprint(
+            op, top_k=1, method="Llama4", **dims, **kw
+        ) == bi.fingerprint(op, top_k=1, method="TopKSigmoid", **dims, **kw)
+        assert bi.fingerprint(op, top_k=2, method="TopKSigmoid", **dims, **kw)
+    for cls in (NVFP4.cls, MXFP4.cls):
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="Llama4") as e:
+            routing_term(
+                RoutingConfig(num_experts=16, top_k=2, method=RoutingMethodType.Llama4),
+                cls,
+            )
+        assert cls in str(e.value)
 
 
 def test_tactic_and_plan_lengths_follow_the_record_and_plan_builders():

@@ -325,8 +325,9 @@ def test_fingerprint_dimensions_and_classes():
         "fused_moe_fp8", act=ReLU2(), **dims
     )
     assert (
-        bi.fingerprint("fused_moe_fp8", method=RoutingMethodType.Llama4, **dims) != fp
-    )  # the Llama4 (top-k sigmoid) routing term is a class dimension of its own
+        bi.fingerprint("fused_moe_fp8", method=RoutingMethodType.TopKSigmoid, **dims)
+        != fp
+    )  # the top-k sigmoid routing term (Llama4's at top_k = 1) is a class dimension of its own
     g84 = bi.fingerprint(
         "fused_moe_fp8",
         method=RoutingMethodType.DeepSeekV3,
