@@ -4199,7 +4199,10 @@ def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack(pair):
     """The pack is preallocated and filled one expert at a time: the bits of the whole-tensor path (the interleave of every
     expert, each quantized into its own buffers, stacked), and a peak memory beyond the inputs bounded by the pack plus a
     few experts' temporaries, below one full-size bf16 copy of the experts -- for contiguous weights and for a strided view
-    of them (one expert's slice is made contiguous at a time, never the full tensors), with the same bits."""
+    of them (one expert's slice is made contiguous at a time, never the full tensors), with the same bits; and through
+    ``prepare_weights`` for CPU-resident bf16 weights moved to the device, for fp32 weights on the device and for CPU fp32
+    weights (each expert's slice is moved and cast right before its quantization, never a full-size copy), with the bits
+    of the same-device bf16 path and the same bound."""
     from flashinfer.batch_invariant.quantization.nvfp4_api import nvfp4_quantize_rows
     from flashinfer.fused_moe.batch_invariant.api import interleave_fc1
     from flashinfer.fused_moe.batch_invariant.api_fp4 import (
@@ -4263,6 +4266,37 @@ def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack(pair):
         assert torch.equal(Ws.w1_alpha, W.w1_alpha)
         assert torch.equal(Ws.w2_alpha, W.w2_alpha)
     assert peak_s <= pack + 8 * expert, (peak_s, pack, expert)
+    # CPU-resident bf16 weights moved to the device, fp32 weights on the device, CPU fp32 weights: through the layer's
+    # preparation with the destination device, each expert's slice is moved and cast right before its quantization (a
+    # whole-tensor move or cast would exceed the bound), the same bits as the same-device bf16 path
+    assert (
+        2 * full > pack + 8 * expert
+    )  # an fp32 copy exceeds the bound as a bf16 one does
+    for name, a, b in (
+        ("cpu bf16", w1.cpu(), w2.cpu()),
+        ("fp32", w1.float(), w2.float()),
+        ("cpu fp32", w1.cpu().float(), w2.cpu().float()),
+    ):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        view = BatchInvariantFp4Config.prepare_weights(
+            a, b, quant=_QUANT[pair], device=torch.device("cuda")
+        )
+        torch.cuda.synchronize()
+        peak_d = torch.cuda.max_memory_allocated() - before
+        Wd = MoEWeightsFp4.from_view(view)
+        for t, u in (
+            (Wd.w1, W.w1),
+            (Wd.w1_sf, W.w1_sf),
+            (Wd.w2, W.w2),
+            (Wd.w2_sf, W.w2_sf),
+        ):
+            assert t.is_cuda and torch.equal(t, u), name
+        if pair.scaled:
+            assert torch.equal(Wd.w1_alpha, W.w1_alpha), name
+            assert torch.equal(Wd.w2_alpha, W.w2_alpha), name
+        assert peak_d <= pack + 8 * expert, (name, peak_d, pack, expert)
 
 
 @needs_device

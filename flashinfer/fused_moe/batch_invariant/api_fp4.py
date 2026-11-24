@@ -233,33 +233,53 @@ def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
     return v
 
 
-def fp4_global_scale(w: torch.Tensor) -> torch.Tensor:
-    """FlashInfer's per-tensor global scale of a weight: ``448 * 6 / amax(w)``, one for an all-zero tensor (the convention of
-    the package's weight preparation; a 1-element f32 tensor); a NaN amax (a NaN weight) propagates, so the validator of
-    the computed scales (:func:`fp4_global_scales`) refuses the expert."""
-    amax = w.detach().to(torch.float32).abs().amax().reshape(1)
+def _global_scale_of(amax: torch.Tensor) -> torch.Tensor:
+    """FlashInfer's per-tensor global scale from an amax: ``448 * 6 / amax``, one for a zero amax, a NaN amax propagated."""
     # the unit scale for the all-zero tensor alone: ``amax > 0`` would select it for a NaN amax too
     return torch.where(amax == 0, torch.ones_like(amax), E4M3_MAX * E2M1_MAX / amax).to(
         torch.float32
     )
 
 
-def fp4_global_scales(w: torch.Tensor, name: str) -> torch.Tensor:
-    """The per-expert global scales of the experts ``w [E, N, K]``: :func:`fp4_global_scale` of each expert (one expert's
-    fp32 magnitudes live at a time), as a contiguous fp32 ``[E]`` on the weights' device, under the rule of the caller's
-    scales (:func:`_scale_vector`): every scale finite, positive and normal, else the mode's error naming the weight and the
-    expert -- an expert whose amax is below ``448 * 6 / FLT_MAX`` has an infinite scale and a zero alpha, which would give
-    NaN rows where a block of its weights is all zero and a silent zero contribution otherwise."""
-    gs = torch.cat([fp4_global_scale(w[e]) for e in range(w.shape[0])])
+def fp4_global_scale(w: torch.Tensor) -> torch.Tensor:
+    """FlashInfer's per-tensor global scale of a weight: ``448 * 6 / amax(w)``, one for an all-zero tensor (the convention of
+    the package's weight preparation; a 1-element f32 tensor); a NaN amax (a NaN weight) propagates, so the validator of
+    the computed scales (:func:`fp4_global_scales`) refuses the expert."""
+    return _global_scale_of(w.detach().to(torch.float32).abs().amax().reshape(1))
+
+
+def fp4_global_scales(
+    w: torch.Tensor, name: str, device: Optional[torch.device] = None
+) -> torch.Tensor:
+    """The per-expert global scales of the experts ``w [E, N, K]``: :func:`fp4_global_scale` of each expert's bf16 values
+    (a wider dtype is rounded to bf16 first, as the quantizer sees it), as a contiguous fp32 ``[E]`` on ``device`` (the
+    weights' by default), under the rule of the caller's scales (:func:`_scale_vector`): every scale finite, positive and
+    normal, else the mode's error naming the weight and the expert -- an expert whose amax is below ``448 * 6 / FLT_MAX``
+    has an infinite scale and a zero alpha, which would give NaN rows where a block of its weights is all zero and a
+    silent zero contribution otherwise; a NaN weight gives a NaN scale. One expert's slice at a time is moved to ``device``
+    and cast, and its fp32 magnitudes live alone: never a full-size copy of the experts (CPU-resident and fp32 weights
+    included)."""
+    dev = w.device if device is None else torch.device(device)
+    amax = torch.stack(
+        [
+            w[e]
+            .detach()
+            .to(device=dev, dtype=torch.bfloat16)
+            .to(torch.float32)
+            .abs()
+            .amax()
+            for e in range(w.shape[0])
+        ]
+    )
+    gs = _global_scale_of(amax)
     tiny = torch.finfo(torch.float32).tiny
     bad = ~(torch.isfinite(gs) & (gs >= tiny))
     if bool(bad.any()):
         e = int(bad.nonzero()[0])
-        amax = float(w[e].detach().to(torch.float32).abs().amax())
         raise unsupported(
             NV_CLASS,
-            f"{name}: expert {e} with an amax of {amax:.3g} (its per-tensor global scale 448 * 6 / amax is not finite, "
-            "positive and normal)",
+            f"{name}: expert {e} with an amax of {float(amax[e]):.3g} (its per-tensor global scale 448 * 6 / amax is not "
+            "finite, positive and normal)",
             f"experts with an amax of at least {E4M3_MAX * E2M1_MAX / torch.finfo(torch.float32).max:.3g}, or "
             "caller-supplied global_scales",
         )
@@ -304,17 +324,21 @@ class MoEWeightsFp4:
         global_scales: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         intermediate: str = "per_token",
         intermediate_scales: Optional[torch.Tensor] = None,
+        device: Optional[torch.device] = None,
     ) -> "MoEWeightsFp4":
-        """Quantize bf16 experts (``fc1 [E, 2I, H]`` rows ``[up, gate]``, or ``[E, I, H]`` ungated; ``fc2 [E, H, I]``) with the
-        pair's quantizer class: NVFP4 per expert and GEMM at one per-tensor global scale (``global_scales = (gs1 [E], gs2
-        [E])``, or FlashInfer's ``448 * 6 / amax``), MXFP4 with one UE8M0 scale per 32 elements of a row. The gate / up
-        interleave is a row permutation applied before the quantization. ``act`` defaults to the class's default chain of the
-        gating. ``intermediate="static"`` selects the NVFP4 static class with the per-expert ``intermediate_scales [E]`` (f32
-        multipliers; default ones) and is refused for the MX pair. The per-expert global scales, the caller's or the computed
-        ones, are validated before any expert is quantized (finite, positive and normal: :func:`fp4_global_scales`). The
-        experts are quantized one at a time into the preallocated pack: the peak memory beyond the inputs is the fp4 pack
-        plus one expert's temporaries (its interleaved bf16 rows, the fp32 magnitudes of its amax; a strided view's expert
-        made contiguous), the bits those of each expert quantized alone."""
+        """Quantize the experts (``fc1 [E, 2I, H]`` rows ``[up, gate]``, or ``[E, I, H]`` ungated; ``fc2 [E, H, I]``; bf16, or
+        a wider floating dtype cast to bf16 one expert at a time) with the pair's quantizer class: NVFP4 per expert and GEMM
+        at one per-tensor global scale (``global_scales = (gs1 [E], gs2 [E])``, or FlashInfer's ``448 * 6 / amax``), MXFP4
+        with one UE8M0 scale per 32 elements of a row. The gate / up interleave is a row permutation applied before the
+        quantization. ``act`` defaults to the class's default chain of the gating. ``intermediate="static"`` selects the
+        NVFP4 static class with the per-expert ``intermediate_scales [E]`` (f32 multipliers; default ones) and is refused
+        for the MX pair. The pack lives on ``device`` (the weights' by default). The per-expert global scales, the
+        caller's or the computed ones, are validated before any expert is quantized (finite, positive and normal:
+        :func:`fp4_global_scales`). The experts are quantized one at a time into the preallocated pack, each expert's
+        slice moved to the pack's device and cast to bf16 right before its quantization (a same-device bf16 slice as it
+        is): the peak memory beyond the inputs is the fp4 pack plus one expert's temporaries (its moved or cast rows, its
+        interleaved bf16 rows, the fp32 magnitudes of its amax; a strided view's expert made contiguous) for CPU-resident
+        and fp32 inputs too, the bits those of each expert quantized alone."""
         from ...batch_invariant.quantization.nvfp4_api import nvfp4_quantize_rows
 
         if intermediate not in INTERMEDIATES:
@@ -346,13 +370,14 @@ class MoEWeightsFp4:
                 f"chain {act!r} takes parameters {S.ACT_PARAMS.get(act, ())}, got {key!r}"
             )
         if (
-            fc1.dtype != torch.bfloat16
-            or fc2.dtype != torch.bfloat16
+            not fc1.is_floating_point()
+            or not fc2.is_floating_point()
             or fc1.dim() != 3
             or fc2.dim() != 3
         ):
             raise TypeError(
-                "the fp4 MoE classes take bf16 expert weights fc1 [E, N1, H], fc2 [E, H, I]"
+                "the fp4 MoE classes take floating expert weights fc1 [E, N1, H], fc2 [E, H, I] (bf16, or cast to bf16 one "
+                "expert at a time)"
             )
         E, N1, H = fc1.shape
         I = N1 // 2 if gated else N1
@@ -361,25 +386,30 @@ class MoEWeightsFp4:
                 f"fc2 {tuple(fc2.shape)} does not match fc1 {tuple(fc1.shape)} (gated={gated})"
             )
         check_shape_fp4(pair, H, I, E, gated=gated)
-        dev = fc1.device
+        dev = fc1.device if device is None else torch.device(device)
         # the pack, preallocated and filled one expert at a time (the quantizer writes every byte of its expert's rows and
         # scale buffer; the global scale and the interleave are per expert, so the bits are those of the expert quantized
-        # alone): the peak beyond the inputs and the pack is one expert's temporaries -- its interleaved or contiguous bf16
-        # rows and the fp32 magnitudes of its amax -- never a full-size bf16 or fp32 copy of the experts (a strided view
-        # is made contiguous one expert at a time)
+        # alone): the peak beyond the inputs and the pack is one expert's temporaries -- its slice moved to the pack's
+        # device and cast to bf16, its interleaved or contiguous rows and the fp32 magnitudes of its amax -- never a
+        # full-size bf16 or fp32 copy of the experts (a strided view is made contiguous one expert at a time)
         w1 = torch.empty(E, N1, H // 2, dtype=torch.uint8, device=dev)
         w1_sf = torch.empty(E, pair.sf_numel(N1, H), dtype=torch.uint8, device=dev)
         w2 = torch.empty(E, H, I // 2, dtype=torch.uint8, device=dev)
         w2_sf = torch.empty(E, pair.sf_numel(H, I), dtype=torch.uint8, device=dev)
 
+        def expert(w: torch.Tensor, e: int) -> torch.Tensor:
+            """Expert ``e``'s slice on the pack's device as contiguous bf16, moved and cast right before its quantization
+            (a contiguous bf16 slice already there is returned as it is)."""
+            return w[e].to(device=dev, dtype=torch.bfloat16).contiguous()
+
         def fc1_rows(e: int) -> torch.Tensor:
             """Expert ``e``'s GEMM1 rows, contiguous: the gate / up interleave applied to this expert alone."""
             if interleaved or not gated:
-                return fc1[e].contiguous()
-            return interleave_fc1(fc1[e : e + 1])[0]
+                return expert(fc1, e)
+            return interleave_fc1(expert(fc1, e).unsqueeze(0))[0]
 
         def fc2_rows(e: int) -> torch.Tensor:
-            return fc2[e].contiguous()
+            return expert(fc2, e)
 
         if not pair.scaled:
             for e in range(E):
@@ -391,8 +421,8 @@ class MoEWeightsFp4:
             gs1_all = _scale_vector(global_scales[0], "global_scales[0]", E, dev)
             gs2_all = _scale_vector(global_scales[1], "global_scales[1]", E, dev)
         else:
-            gs1_all = fp4_global_scales(fc1, "w1 / fc1")
-            gs2_all = fp4_global_scales(fc2, "w2 / fc2")
+            gs1_all = fp4_global_scales(fc1, "w1 / fc1", dev)
+            gs2_all = fp4_global_scales(fc2, "w2 / fc2", dev)
         gs_inter = inv_inter = None
         if intermediate == "static":
             gs_inter = (

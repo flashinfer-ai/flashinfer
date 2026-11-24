@@ -3709,8 +3709,10 @@ class BatchInvariantFp4Config:
         elements of a row, the 128x4 swizzled layout; no global scale); the static class is not part of this pair. A supplied
         ``num_local_experts`` / ``hidden_size`` / ``intermediate_size`` must agree with the weights' geometry, and
         ``intermediate_scales`` need ``intermediate="static"``: a contradiction is refused with the mode's error before any
-        view is built. The experts are quantized one at a time into the preallocated pack: the peak memory beyond the
-        inputs is the fp4 pack plus one expert's temporaries (never a full-size bf16 or fp32 copy of the experts)."""
+        view is built. The experts are quantized one at a time into the preallocated pack on ``device`` (the weights' by
+        default), each expert's slice moved there and cast to bf16 right before its quantization: the peak memory beyond
+        the inputs is the fp4 pack plus one expert's temporaries for CPU-resident and fp32 weights too (never a full-size
+        bf16 or fp32 copy of the experts)."""
         from ..batch_invariant.support import unsupported
         from .batch_invariant.api_fp4 import MoEWeightsFp4
         from .batch_invariant.runner_fp4 import PAIRS
@@ -3741,17 +3743,17 @@ class BatchInvariantFp4Config:
                 f"intermediate_scales with intermediate={intermediate!r}",
                 "intermediate scales with intermediate='static' alone (the per-token class derives its scales from the rows)",
             )
-        w1 = w1.to(device=device) if device is not None else w1
-        w2 = w2.to(device=device) if device is not None else w2
+        # the move to the device and the cast to bf16 are per expert inside the preparation (no full-size copy here)
         return MoEWeightsFp4.prepare(
             PAIRS[pair],
-            w1.to(torch.bfloat16),
-            w2.to(torch.bfloat16),
+            w1,
+            w2,
             gated=chain.gated,
             act=chain.act,
             params=chain.params,
             intermediate=intermediate,
             intermediate_scales=intermediate_scales,
+            device=device,
         ).view()
 
     @staticmethod
