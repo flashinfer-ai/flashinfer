@@ -1449,7 +1449,24 @@ class GroupedQueryAttentionDecodePaged:
                                             page_size * self.headdim // 16,
                                             raw_bar + ci,
                                         )
-                                        desc[pk, ci] = page_id
+                                        # A physical page can be partially written. The
+                                        # converter must zero its tail before FP8 PV MMA.
+                                        logical_page = (
+                                            (s * kv_splits + kv_split_idx) * pages_s
+                                            + sk * pages_k
+                                            + pk
+                                        )
+                                        desc[pk, ci] = (
+                                            cutlass.min(
+                                                page_size,
+                                                cutlass.max(
+                                                    0, seqlen - logical_page * page_size
+                                                ),
+                                            )
+                                            if page_id >= 0
+                                            and page_id < packed_v.shape[0]
+                                            else 0
+                                        )
                                 with cute.arch.elect_one():
                                     desc[pages_k, ci] = stage_num
                                     desc[pages_k + 1, ci] = bar_addr
@@ -1498,8 +1515,7 @@ class GroupedQueryAttentionDecodePaged:
                         stage_idx = desc[pages_k, ci]
                         bar_addr = desc[pages_k + 1, ci]
                         for pk in cutlass.range_constexpr(pages_k):
-                            page_id = desc[pk, ci]
-                            valid = page_id >= 0 and page_id < packed_v.shape[0]
+                            live_tokens = desc[pk, ci]
                             data = cute.make_rmem_tensor(
                                 cute.make_layout(turns), cutlass.Uint64
                             )
@@ -1527,7 +1543,9 @@ class GroupedQueryAttentionDecodePaged:
                                     cute.make_layout(1),
                                 )[0]
                                 scales[turn] = cutlass.Uint32(
-                                    cutlass.Uint8(sf) if valid else cutlass.Uint8(0)
+                                    cutlass.Uint8(sf)
+                                    if token < live_tokens
+                                    else cutlass.Uint8(0)
                                 ) * cutlass.Uint32(0x01010101)
                             for turn in cutlass.range_constexpr(turns):
                                 linear = turn * warpgroup_threads + warpgroup_tidx
@@ -1807,9 +1825,14 @@ class GroupedQueryAttentionDecodePaged:
                                 is_oob_kv = mask_config.is_oob_kv(
                                     idx_q, idx_kv, prediction, seqlen
                                 )
-                                mask = -Float32.inf if is_oob_kv else Float32(0)
                                 masked_p = masked[None, p, sm]
-                                masked_p.store(masked_p.load() + mask)
+                                if cutlass.const_expr(packed_v is not None):
+                                    # Overwrite, not add: masked K can contain NaNs.
+                                    if is_oob_kv:
+                                        masked_p.fill(-Float32.inf)
+                                else:
+                                    mask = -Float32.inf if is_oob_kv else Float32(0)
+                                    masked_p.store(masked_p.load() + mask)
                         scores = masked.load().reshape((blk_tile_n, tiles_sm))
                     else:
                         scores = tSrS_s.load().reshape((blk_tile_n, tiles_sm))

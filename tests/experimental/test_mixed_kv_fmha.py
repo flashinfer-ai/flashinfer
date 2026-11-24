@@ -41,6 +41,58 @@ def _writer_scale_layout(logical):
     )
 
 
+@pytest.mark.parametrize("poison", ["key", "value_scale"])
+def test_bulk_decode_partial_page_graph(poison):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("requires SM103a bulk decode")
+    from flashinfer.attention.mixed_kv import paged_fp8_k_nvfp4_v_fmha
+
+    dev, fp8 = "cuda", torch.float8_e4m3fn
+    table = (torch.arange(40, device=dev, dtype=torch.int32) % 3).repeat(8, 1)
+    lens = torch.zeros(8, device=dev, dtype=torch.int32)
+    ptr = torch.ones(9, device=dev, dtype=torch.int32)
+    ptr[0] = 0
+    k = torch.zeros(3, 2, 64, 128, device=dev, dtype=fp8)
+    v = torch.full((3, 2, 64, 64), 0x22, device=dev, dtype=torch.uint8)
+    sf = torch.ones(3, 2, 64, 8, device=dev, dtype=fp8)
+    q = torch.ones(1, 8, 128, device=dev, dtype=fp8)
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+
+    def run():
+        return paged_fp8_k_nvfp4_v_fmha(
+            q,
+            k,
+            v,
+            sf,
+            table,
+            lens,
+            ptr,
+            max_q_len=1,
+            out=out,
+            qk_scale=0.125,
+            v_scale=1.0,
+        )
+
+    lens[0] = 64
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for length in (1, 63, 64, 65, 129):
+        page, last = divmod(length - 1, 64)
+        lens[0] = length
+        if poison == "key":
+            k.zero_()
+            k.view(torch.uint8)[page, :, last + 1 :] = 0x7F
+        else:
+            logical = torch.ones_like(sf, dtype=torch.float32)
+            logical[page, :, last + 1 :] = float("nan")
+            sf.copy_(_writer_scale_layout(logical.to(fp8)))
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(out, torch.ones_like(out), rtol=0.01, atol=0.003)
+
+
 @pytest.mark.parametrize("dim", [128, 256])
 def test_scale_addresses_match_writer_tiles(dim):
     groups = dim // 16
