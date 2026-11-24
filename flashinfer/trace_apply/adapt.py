@@ -60,16 +60,15 @@ def output_dests(template: Any) -> dict[str, str]:
 def _resolve_input(desc: Any, namespace: dict[str, Any]) -> Any:
     """Resolve one template input descriptor against the call namespace,
     handling tuple params (e.g. ``paged_kv_cache=(k, v)``)."""
+    from flashinfer.trace.template import _get_tuple_part  # noqa: PLC0415
+
     param = getattr(desc, "param", None) or None
     # param may be None when the json_key itself is the param; caller passes the
     # json_key fallback via the loop below.
     val = namespace.get(param) if param is not None else None
     tuple_idx = getattr(desc, "tuple_idx", None)
     if tuple_idx is not None and val is not None:
-        if isinstance(val, (tuple, list)) and len(val) > tuple_idx:
-            val = val[tuple_idx]
-        else:
-            val = None
+        val = _get_tuple_part(val, tuple_idx)
     return val
 
 

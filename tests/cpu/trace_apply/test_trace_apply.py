@@ -1324,7 +1324,8 @@ def test_enable_apply_paged_decode_combined_kv_cache(combined):
             assert got.data_ptr() == ref.data_ptr() and torch.equal(got, ref)
     if combined:
         # A lone K cache is not split on its page axis, and a 1-tuple has no V.
-        for cache in (k_cache, (k_cache,)):
+        # Nor is the 4-D page_size=1 form: its page axis depends on kv_layout.
+        for cache in (k_cache, (k_cache,), kv[:, :, 0]):
             candidate = adapt.build_candidate_kwargs(tmpl, {"paged_kv_cache": cache})
             assert "v_cache" not in candidate
 
