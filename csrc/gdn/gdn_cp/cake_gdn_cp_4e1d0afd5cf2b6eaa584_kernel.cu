@@ -364,6 +364,7 @@ kernel_cake_gdn_cp_4e1d0afd5cf2b6eaa584(const __grid_constant__ CUtensorMap loca
                         tmem_st_x32_f32(taddr + (unsigned int)tmem_row_base_2 + (unsigned int)(col_tile_3 * 32), values_1);
                     }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(mma_ready_full_addr);
                     __syncwarp();

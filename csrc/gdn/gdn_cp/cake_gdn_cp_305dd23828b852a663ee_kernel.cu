@@ -960,6 +960,7 @@ kernel_cake_gdn_cp_305dd23828b852a663ee(const __grid_constant__ CUtensorMap Q, c
                         v_frag_hi_cg1[v_word_cg1] = v_bits_cg1[2];
                         v_frag_hi_cg1[v_word_cg1 + 1] = v_bits_cg1[3];
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(cg1_acc_empty_addr);
