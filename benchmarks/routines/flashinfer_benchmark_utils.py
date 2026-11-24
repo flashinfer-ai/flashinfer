@@ -932,6 +932,22 @@ routine_cc_to_supported_backends = {
         "12.0": ["cutlass", "cudnn", "b12x", "auto"],
         "12.1": ["cutlass", "cudnn", "b12x", "auto"],
     },
+    # Guards: `_cute_dsl_mm_tf32_requirement` / `_cublas_mm_tf32_requirement`
+    # in flashinfer/gemm/gemm_base.py.
+    "mm_tf32": {
+        "7.5": [],
+        "8.0": ["cublas", "auto"],
+        "8.6": ["cublas", "auto"],
+        "8.7": ["cublas", "auto"],
+        "8.9": ["cublas", "auto"],
+        "9.0": ["cublas", "auto"],
+        "10.0": ["cute-dsl", "cublas", "auto"],
+        "10.3": ["cute-dsl", "cublas", "auto"],
+        "10.7": ["cute-dsl", "cublas", "auto"],
+        "11.0": ["cublas", "auto"],
+        "12.0": ["cublas", "auto"],
+        "12.1": ["cublas", "auto"],
+    },
     # Guards: the per-backend `_<backend>_mm_bf16_requirement` functions in
     # flashinfer/gemm/gemm_base.py (tinygemm is also on SM107).
     "mm_bf16": {
@@ -1062,6 +1078,7 @@ routine_cc_to_supported_backends = {
         "7.5": [],
         "8.0": ["cudnn"],
         "8.6": ["cudnn"],
+        "8.7": ["cudnn"],
         "8.9": ["cudnn"],
         "9.0": ["cudnn", "cutile"],
         "10.0": ["cudnn", "cutile"],

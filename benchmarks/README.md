@@ -620,6 +620,7 @@ Legend:
 | **bmm_mxfp8** |  |  |  |  |  | cudnn, auto | cudnn, auto | cudnn, cutlass, auto |
 | **mm_bf16_fp4** |  |  |  |  |  | cudnn, cute-dsl, blackwell-native, blackwell-tiled | cudnn, cute-dsl, blackwell-native, blackwell-tiled | cudnn, cute-dsl, cute-dsl-native |
 | **mm_bf16** |  | cudnn, cublaslt, auto | cudnn, cublaslt, auto | cudnn, cublaslt, auto | cudnn, cublaslt, tinygemm, cutile, auto | cudnn, cutlass, tgv, cublaslt, tinygemm, cutile, cute-dsl, auto, batch_invariant | cudnn, cutlass, tgv, cublaslt, tinygemm, cutile, cute-dsl, auto, batch_invariant | cudnn, cublaslt, tinygemm, cutile, auto |
+| **mm_tf32** |  | cublas, auto | cublas, auto | cublas, auto | cublas, auto | cute-dsl, cublas, auto | cute-dsl, cublas, auto | cublas, auto |
 | **bmm_bf16** |  | cudnn, auto | cudnn, auto | cudnn, auto | cudnn, cutile, auto | cudnn, cutlass, cutile, tgv, auto | cudnn, cutlass, cutile, tgv, auto | cudnn, cutile, auto |
 | **tinygemm_bf16** |  |  |  |  | tinygemm | tinygemm | tinygemm | tinygemm |
 | **router_gemm** |  |  |  |  | dsv3 | dsv3 | dsv3 |  |
@@ -692,12 +693,13 @@ GEMM routines on the compute capabilities the table above has no column for (8.7
 | **mm_bf16_fp4** |  | cudnn, cute-dsl | cudnn, cute-dsl | cudnn, cute-dsl, cute-dsl-native |
 | **mm_mxfp8** |  | cutlass, cute-dsl, cutedsl_low_latency, trtllm, cudnn, auto, batch_invariant | cutlass, cudnn, auto | cutlass, cudnn, b12x, auto |
 | **mm_bf16** | cudnn, cublaslt, auto | cudnn, cutlass, tgv, cublaslt, tinygemm, cutile, cute-dsl, auto, batch_invariant | cudnn, cublaslt, tinygemm, cutile, auto | cudnn, cublaslt, tinygemm, cutile, auto |
+| **mm_tf32** | cublas, auto | cute-dsl, cublas, auto | cublas, auto | cublas, auto |
 | **bmm_bf16** | cudnn, auto | cudnn, cutlass, cutile, tgv, auto | cudnn, cutile, auto | cudnn, cutile, auto |
 | **tinygemm_bf16** |  | tinygemm | tinygemm | tinygemm |
 | **router_gemm** |  | dsv3 |  |  |
 | **group_gemm_mxfp4_nt_groupwise** |  | cutlass |  | cutlass |
 | **masked_grouped_gemm** |  | deepgemm, cute-dsl | cutile | cutile |
-| **grouped_mm** |  | cudnn | cudnn, cutile | cudnn, cutile |
+| **grouped_mm** | cudnn | cudnn | cudnn, cutile | cudnn, cutile |
 | **mm_nvfp4_svdquant** |  | cutlass, auto |  | cute-dsl, cute-dsl-unfused, auto |
 | **fused_linear** |  | prims-ts |  |  |
 | **mm_mxfp8_mxfp4** |  | batch_invariant |  |  |

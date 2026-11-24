@@ -252,7 +252,7 @@ def parse_gemm_args(line, parser):
         choices=["linear", "swiglu", "qkv_qknorm_rope"],
         help=(
             "fused_linear: fused epilogue. swiglu halves N (interleaved gate/up); "
-            "qkv_qknorm_rope needs N % 384 == 0 (head_dim 128)."
+            "qkv_qknorm_rope needs N %% 384 == 0 (head_dim 128)."
         ),
     )
 
@@ -328,6 +328,11 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
     return x_scl_sat.to(dtype), scale.float().reciprocal()
 
 
+# Raised by a mistake in the benchmark's own closure, not by a backend that
+# rejects the problem: let them fail the line instead of dropping the backend.
+_BENCHMARK_BUG_ERRORS = (NameError, AttributeError, TypeError)
+
+
 def _log_dropped_backend(backend, e, reason):
     """A whitelisted backend that is dropped is always a [WARNING]: shape
     limits, missing kernels and compiler failures all raise ValueError, so
@@ -343,6 +348,8 @@ def _drop_failing_backends(backends, trial):
     for backend in list(backends):
         try:
             trial(backend)
+        except _BENCHMARK_BUG_ERRORS:
+            raise
         except Exception as e:
             _log_dropped_backend(backend, e, "does not support this configuration")
             backends.remove(backend)
@@ -791,14 +798,16 @@ def testGroupGemmFp8NtGroupwise(args):
         print(f"[VVERBOSE] {b_scale.shape = }")
         print(f"[VVERBOSE] {m_indptr.shape = }")
 
-    if "cute-dsl" in backends and group_size > 1 and m % 128 != 0:
-        # The contiguous kernel assigns one expert per 128-row tile and does not
-        # check the boundaries (validate_indices=False), so an unaligned group
-        # would silently use the wrong weights.
+    for backend in ("cute-dsl", "deepgemm"):
+        if backend not in backends or group_size == 1 or m % 128 == 0:
+            continue
+        # Both contiguous kernels assign one expert per 128-row tile and do not
+        # check the boundaries, so an unaligned group would silently use the
+        # wrong weights.
         print(
-            "[WARNING] cute-dsl needs expert boundaries on 128 rows (m % 128 == 0), removing cute-dsl from backends"
+            f"[WARNING] {backend} needs expert boundaries on 128 rows (m % 128 == 0), removing {backend} from backends"
         )
-        backends.remove("cute-dsl")
+        backends.remove(backend)
 
     def operands_for(backend):
         # The tensors each backend really reads, so CUDA-graph timing rotates
@@ -834,8 +843,8 @@ def testGroupGemmFp8NtGroupwise(args):
         else:
             raise ValueError(f"Unsupported backend: {backend}")
 
-    # Drop backends whose API rejects this problem (deepgemm / cute-dsl need
-    # 128-row aligned groups, cute-dsl a bfloat16 output, ...).
+    # Drop backends whose API rejects this problem (cute-dsl needs a bfloat16
+    # output, deepgemm a registered kernel for this shape, ...).
     backends = _drop_failing_backends(
         backends, lambda bk: run_backend(bk, *operands_for(bk))
     )
@@ -2891,7 +2900,9 @@ def _run_mm_tf32(args):
             f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
         )
 
-    backends = args.backends
+    backends = filter_backends_by_compute_capability(
+        args.backends, args.routine, device
+    )
     m, n, k = args.m, args.n, args.k
     use_pdl = getattr(args, "enable_pdl", False)
     is_cuda_graph_compatible = not args.no_cuda_graph
@@ -2919,7 +2930,7 @@ def _run_mm_tf32(args):
             run_backend(backend, a, b, use_pdl)
         except Exception as e:
             print(
-                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
+                f"[WARNING] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
             )
             backends_to_remove.append(backend)
     for backend in backends_to_remove:
@@ -3401,6 +3412,18 @@ def _cos_sim(reference, output):
     )
 
 
+def _min_group_cos_sim(reference, output, rows):
+    """Lowest per-group cosine similarity of a (sum(rows), N) output, so one
+    wrong group cannot hide behind the others."""
+    cos, start = None, 0
+    for r in rows:
+        if r > 0:
+            c = _cos_sim(reference[start : start + r], output[start : start + r])
+            cos = c if cos is None else torch.minimum(cos, c)
+        start += r
+    return cos
+
+
 def _bench_and_report(
     args,
     backends,
@@ -3683,7 +3706,10 @@ def testGroupGemmMxfp4NtGroupwise(args):
         if args.refcheck
         else None
     )
-    refchecks = {backend: (lambda o: _cos_sim(reference, o)) for backend in backends}
+    refchecks = {
+        backend: (lambda o: _min_group_cos_sim(reference, o, [m] * group_size))
+        for backend in backends
+    }
     problem_flops = 2 * group_size * m * n * k
     problem_bytes = (
         group_size * m * k  # fp8 A
@@ -3740,19 +3766,24 @@ def _make_masked_m(num_groups, expected_m, max_m, seed, device, align=1):
 
 
 def _masked_cos_sim(reference, output, masked_m):
-    """Cosine similarity over the valid rows of a (G, max_m, N) output."""
+    """Lowest per-group cosine similarity over the valid rows of a
+    (G, max_m, N) output."""
     rows = masked_m.tolist()
-    return _cos_sim(
+    return _min_group_cos_sim(
         torch.cat([reference[g, : rows[g]] for g in range(len(rows))]),
         torch.cat([output[g, : rows[g]] for g in range(len(rows))]),
+        rows,
     )
 
 
-def _cutile_block_scaled_operands(a_shape, b_shape, block_scale_type, device):
+def _cutile_block_scaled_operands(
+    a_shape, b_shape, block_scale_type, device, with_reference=True
+):
     """Random block-scaled operands in the cuTile 5D TMA scale layout plus their
     dequantized fp32 values, mirroring tests/gemm/test_{masked,ragged}_scaled_bmm_cutile.py.
     a_shape is (..., M, K) and b_shape (Q, N, K); returns
-    (a, b, a_scale, b_scale, a_dequant, b_dequant) with b_dequant (Q, N, K)."""
+    (a, b, a_scale, b_scale, a_dequant, b_dequant) with b_dequant (Q, N, K);
+    the dequantized pair is None without with_reference (timing-only runs)."""
     from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
 
     vec = 16 if block_scale_type == "nvfp4" else 32
@@ -3779,6 +3810,8 @@ def _cutile_block_scaled_operands(a_shape, b_shape, block_scale_type, device):
             mx = MXScaleTensor(raw)
             data, ref = mx.data, mx.to(torch.float32)
         data = data.reshape(*lead, mn // 128, k // vec // 4, 2, 256)
+        if not with_reference:
+            return data, None
         # unswizzle (mn_tiles, k_tiles, 32, 4, 4) -> (mn, k) for the reference
         ref = (
             ref.reshape(*lead, mn // 128, k // vec // 4, 32, 4, 4)
@@ -3792,6 +3825,8 @@ def _cutile_block_scaled_operands(a_shape, b_shape, block_scale_type, device):
     k = a_shape[-1]
     a_scale, a_scale_ref = make_scale(a_shape[:-2], a_shape[-2], k)
     b_scale, b_scale_ref = make_scale(b_shape[:-2], b_shape[-2], k)
+    if not with_reference:
+        return a, b, a_scale, b_scale, None, None
     a_dequant = a_ref.to(torch.float32) * a_scale_ref
     b_dequant = b_ref.to(torch.float32) * b_scale_ref
     return a, b, a_scale, b_scale, a_dequant, b_dequant
@@ -4019,7 +4054,7 @@ def testMaskedGroupedGemm(args):
                 run_fns[backend] = run_cutile_bf16
             elif backend == "cutile":
                 a_q, b_q, a_s, b_s, a_deq, b_deq = _cutile_block_scaled_operands(
-                    (G, max_m, k), (G, n, k), dtype, device
+                    (G, max_m, k), (G, n, k), dtype, device, args.refcheck
                 )
                 ref = (
                     torch.einsum("gmk,gnk->gmn", a_deq, b_deq)
@@ -4232,7 +4267,7 @@ def testGroupedMm(args):
                         "ragged_scaled_bmm needs 128-row aligned segments (m % 128 == 0)"
                     )
                 a_q, b_q, a_s, b_s, a_deq, b_deq = _cutile_block_scaled_operands(
-                    (total_m, k), (G, n, k), dtype, device
+                    (total_m, k), (G, n, k), dtype, device, args.refcheck
                 )
                 ref = (
                     torch.cat(
@@ -4250,7 +4285,7 @@ def testGroupedMm(args):
                     )
 
                 run_fns[backend] = run_ragged_scaled
-            refchecks[backend] = lambda o, ref=ref: _cos_sim(ref, o)
+            refchecks[backend] = lambda o, ref=ref: _min_group_cos_sim(ref, o, [m] * G)
         except Exception as e:
             _log_dropped_backend(
                 backend, e, "could not build inputs for this configuration"
@@ -4566,7 +4601,8 @@ def testFusedLinear(args):
     a_val = torch.randn(m, k, device=device, dtype=torch.bfloat16)
     w_val = (torch.randn(n, k, device=device) / np.sqrt(k)).to(torch.bfloat16)
     bias = (
-        torch.randn(n, device=device, dtype=torch.bfloat16) * 0.1 if args.bias else None
+        # Same magnitude as the GEMM result, so a dropped bias fails --refcheck.
+        torch.randn(n, device=device, dtype=torch.bfloat16) if args.bias else None
     )
     if dtype == "fp8_e4m3":
         # Per-token / per-channel scales (amax / 448), as serving stacks use.
