@@ -146,10 +146,14 @@ def chunk_gated_delta_product(
         captures into a CUDA graph when ``cu_seqlens_cpu`` is given).  On
         SM100 / SM103 one launch serves a mixed batch: the long sequences are
         planned as if alone and the short ones run on the least-loaded CTAs
-        after them.  On SM90 one launch serves a mixed batch too: one kernel
-        body is chosen for the whole batch by a modeled kernel time, and the
-        short sequences run in the same launch.  The results agree with any
-        other batch composition within rounding.  With
+        after them.  On SM90 one launch serves a mixed batch too: a long
+        sequence that fills the SMs (when that is the lighter launch) is cut
+        into one slot per SM, each piece after a cut starting from a zero
+        state a warm-up before it (a cut whose gates do not decay by
+        2^-14.43 within the warm-up is run through), and the short sequences
+        run in the same launch; any other batch runs one kernel body chosen
+        by a modeled kernel time.  The results agree with any other batch
+        composition within rounding and the dropped warm-up decay.  With
         ``cu_seqlens_cpu`` given, no device-to-host synchronization is issued
         (the split rule reads the host copy); without it the sequence offsets
         are copied to the host once.  On SM90 ``g=None`` runs the kernel's
@@ -181,8 +185,9 @@ def chunk_gated_delta_product(
         offsets computes nothing and writes NaN to ``output[0, 0, :2]`` (and to
         ``output_state[0, 0, 0, 0]`` when a dense float32 final state is
         stored; a pool or a bfloat16 / float16 state gets no marker, so the
-        state is left as it was), so the failure is visible.  SM90 has no such
-        check: the result of a replay over changed offsets is unspecified.
+        state is left as it was), so the failure is visible.  On SM90 the
+        split program has the same check; the other SM90 programs have none,
+        and the result of their replay over changed offsets is unspecified.
         The cuDNN backends read the lengths on the device and accept such a
         replay.
 

@@ -1069,10 +1069,18 @@ def cake_chunk_gated_delta_product(
     slots); the plan is built from the host lengths, so a captured graph is valid only for the batch it captured
     (other lengths need a new capture or an eager call; a replay over changed device offsets runs no item and writes
     NaN to ``o[0, 0, :2]`` and, with a dense FP32 final state, ``output_state[0, 0, 0, 0]``); the rest of this
-    paragraph is SM90's.  Every call is one Cake kernel launch of one body for the whole batch
-    (``prefill_batch_body`` over the host sequence lengths): the V6 fork-order body for a unit-free call without a merged-class sequence (the
-    body route of record: a sequence under ``ROUTE_MIN_CHUNKS_P3`` (384) chunks, or one whose split items are not
-    the cheaper) and for a call reading no initial state and keeping no final state; the merged chunked body for
+    paragraph is SM90's.  Every call is one Cake kernel launch for the whole batch.  A gated call with a
+    balanced sequence (a long sequence whose head-major chunks fill a slot per SM, ``prefill_v6_sm90_plan``) whose plan is the lighter
+    launch runs the V6 split program of its flags on one persistent CTA per SM over the rows of that plan: each
+    balanced sequence cut into slots at block heads (each piece past a cut starts from a zero state a warm-up before
+    it and writes its output from the cut, a cut whose gates do not decay within the warm-up being run through),
+    every other sequence one row per head, all in the same launch; that program compares the planned offsets with
+    ``cu_seqlens`` on the device and, on a replay over changed offsets, computes nothing and writes NaN to
+    ``o[0, 0, :2]`` (and to ``output_state[0, 0, 0, 0]`` when a final state is stored).  Any other call runs one
+    body for the whole batch (``prefill_batch_body`` over the host sequence lengths): the V6 fork-order body for a
+    unit-free call without a merged-class sequence (the body route of record: a sequence under
+    ``ROUTE_MIN_CHUNKS_P3`` (384) chunks, or one whose split items are not the cheaper) and for a call reading no
+    initial state and keeping no final state; the merged chunked body for
     a unit-gate / unit-beta call (its exact unit program); otherwise the body of the lesser modeled whole-batch
     kernel time (``prefill_batch_costs``: the most loaded persistent CTA under each body).  The V6 program of the
     call's flags runs over the ``N x H`` (sequence, head) tiles on ``min(SM count, N x H)`` persistent CTAs; the
@@ -1082,8 +1090,8 @@ def cake_chunk_gated_delta_product(
     memory into a device buffer cached by content (``_item_table``, shared with SM100 / SM103), so with
     ``cu_seqlens_cpu`` given the call captures into a CUDA graph; the body and the table are planned from the host
     lengths, so such a graph is valid only for the batch it captured (other lengths need a new capture or an eager
-    call; a replay over changed offsets is not supported and its result is unspecified, as SM90 has no plan
-    guard).  With ``cu_seqlens_cpu`` given, no device-to-host
+    call; outside the V6 split program a replay over changed offsets is not supported and its result is
+    unspecified).  With ``cu_seqlens_cpu`` given, no device-to-host
     synchronization is issued (the route reads the host copy); without it the sequence offsets are copied to the
     host once.  ``cu_seqlens_cpu`` is the host copy of ``cu_seqlens`` (a CPU int32 / int64 tensor of ``N + 1``
     entries, as vLLM keeps ``query_start_loc_cpu`` beside the device tensor); it is checked for its device, rank,
@@ -1443,13 +1451,15 @@ def _split_table(arch, cu_cpu, N, T, H, n, sm_count, unit_gates, unit_beta):
 
 
 class _Sm90Plan(NamedTuple):
-    """The launch of one sm_90a call: its body, and for the split program the flat int32 item words (four per item),
-    their bytes (the device-table cache key) and the item count."""
+    """The launch of one sm_90a call: its body, and for a split program the flat int32 item words, their bytes (the
+    device-table cache key) and the item count; ``v6_grid`` is the persistent grid of a V6 split program (0 for the
+    other programs, which run ``min(SM count, tiles)`` CTAs)."""
 
     body: str
     words: Optional[tuple[int, ...]]
     key: Optional[bytes]
     items: int
+    v6_grid: int = 0
 
 
 @functools.lru_cache(maxsize=256)
@@ -1464,10 +1474,27 @@ def _sm90_plan(
     unit_gates: bool,
     unit_beta: bool,
 ) -> _Sm90Plan:
-    """The body of the whole call (``prefill_batch_body`` over the host offsets) and, for the merged gated body, the
-    item table of the split rule over every sequence of the batch.  A pure function of its arguments, cached: a model
-    calls every layer with the same batch, and the plan is host arithmetic over the lengths."""
+    """The launch of the whole call.  A gated call whose ``prefill_v6_sm90_plan`` pays (``split``: a long sequence
+    whose head-major chunks fill a slot per SM, the plan's most loaded CTA lighter than the V6 program's) runs the
+    V6 split program over the rows of that plan, every sequence of the batch in the same launch.  Any other call
+    runs the body of ``prefill_batch_body`` over the host offsets: the V6 program over the ``N x H`` tiles, or, for
+    the merged gated body, its split program over the item table of the split rule of every sequence of the batch.
+    A pure function of its arguments, cached: a model calls every layer with the same batch, and the plan is host
+    arithmetic over the lengths."""
 
+    if not (unit_gates or unit_beta):
+        v6 = _loader.prefill_v6_sm90_plan(
+            cu_cpu, num_heads=H, num_householder=n, sm_count=sm_count, total_tokens=T
+        )
+        if v6.split:
+            words = _loader.v6_sm90_item_words(v6, cu_cpu)
+            return _Sm90Plan(
+                _loader.ROUTE_BODY_V6,
+                words,
+                array.array("i", words).tobytes(),
+                len(v6.rows),
+                v6.grid,
+            )
     body = _loader.prefill_batch_body(
         cu_cpu,
         n,
@@ -1520,11 +1547,13 @@ def _launch_prefill(
     n: int,
     tiles: int,
     mask: int,
+    grid: Optional[int] = None,
 ) -> None:
-    """One launch of the prefill program ``name`` over the 23 logical arguments of the prefill records; the
-    persistent grid of ``min(sm_count, tiles)`` CTAs sizes the tensor-map staging."""
+    """One launch of the prefill program ``name`` over the 23 logical arguments of the prefill records on ``grid``
+    persistent CTAs (default ``min(sm_count, tiles)``), which also sizes the tensor-map staging."""
 
-    grid = min(sm_count, tiles)
+    launch = tiles if grid is None else grid
+    grid = min(sm_count, tiles) if grid is None else grid
     values = {
         "q": q,
         "k": k,
@@ -1560,7 +1589,7 @@ def _launch_prefill(
             batch=num_seqs,
             heads=H,
             device_index=device_index,
-            tiles=tiles,
+            tiles=launch,
             sm_count=sm_count,
         )
 
@@ -1590,13 +1619,15 @@ def _run_single_pass(
     unit_beta,
     cu_cpu,
 ) -> None:
-    """The one launch of an sm_90a call: ``prefill_batch_body`` over the host offsets ``cu_cpu`` picks one body for
-    the whole batch -- the V6 program of the call's flags over the ``N x H`` tiles on ``min(SM count, N x H)``
-    persistent CTAs (every V6 program stores a final state; a call keeping none gets the discard record), or, for the
-    merged body, the exact unit program over those tiles or the split program of the flags over the items of the
-    split rule of every sequence of the batch (tiles = the items; short and empty sequences one item per head).  No
-    token is gathered or scattered.  The item table comes from pinned host memory into a cached device buffer
-    (``_item_table``), so the call issues no synchronization and captures into a CUDA graph."""
+    """The one launch of an sm_90a call (``_sm90_plan`` over the host offsets ``cu_cpu``): the V6 split program of the
+    call's flags over the rows of ``prefill_v6_sm90_plan`` on one CTA per SM when that plan pays; else the
+    body ``prefill_batch_body`` picks for the whole batch -- the V6 program of the call's flags over the ``N x H``
+    tiles on ``min(SM count, N x H)`` persistent CTAs, or, for the merged body, the exact unit program over those
+    tiles or the split program of the flags over the items of the split rule of every sequence of the batch (tiles =
+    the items; short and empty sequences one item per head).  Every V6 program stores a final state; a call keeping
+    none gets the discard record.  No token is gathered or scattered.  The item table comes from pinned host memory
+    into a cached device buffer (``_item_table``), so the call issues no synchronization and captures into a CUDA
+    graph."""
 
     use_indices = slots is not None
     store_final = output_in is not None
@@ -1638,6 +1669,7 @@ def _run_single_pass(
             store_final_state=True,
             unit_gates=False,
             unit_beta=False,
+            **({_loader.PREFILL_SPLIT_FLAG: True} if plan.v6_grid else {}),
         )
         if mask & _CU_SEQLENS_INT64:
             # Every V6 program reads int32 metadata only (the plain program is the body of record; the i64 select in the
@@ -1688,9 +1720,15 @@ def _run_single_pass(
             mask |= _INDICES_INT64
     else:
         slot_in = torch.empty((1,), dtype=torch.int32, device=device)
-    if plan.words is not None:
-        # The split program: formal 9 carries the item table, the tiles are the items; the A-inverse workspace holds
-        # the N x H seed-done flags and two plan-echo words per item, zero at launch.
+    if plan.v6_grid:
+        # The V6 split program: formal 9 carries the item table, the tiles are its rows; the A-inverse workspace
+        # holds the N x H seed-done flags, zero at launch (the kernel leaves them zero).
+        table_in = _item_table(plan.words, device, key=plan.key)
+        ainv_ws = torch.zeros((max(16, 4 * N * H),), dtype=torch.uint8, device=device)
+        tiles = plan.items
+    elif plan.words is not None:
+        # The merged split program: formal 9 carries the item table, the tiles are the items; the A-inverse workspace
+        # holds the N x H seed-done flags and two plan-echo words per item, zero at launch.
         table_in = _item_table(plan.words, device, key=plan.key)
         ainv_ws = torch.zeros(
             (4 * (N * H + 2 * plan.items),), dtype=torch.uint8, device=device
@@ -1726,6 +1764,7 @@ def _run_single_pass(
         n=n,
         tiles=tiles,
         mask=mask,
+        grid=plan.v6_grid or None,
     )
 
 

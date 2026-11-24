@@ -16,7 +16,8 @@ limitations under the License.
 CPU-only tests of the Cake Gated DeltaProduct (GDP) prefill body route of
 record (``cake_jit``, the BODY ROUTE OF RECORD block): the per-sequence choice
 between the V6 fork-order body and the merged chunked body, the launch plan of
-a batch, the sm_90a ``prefill`` registry and the identities of its records.
+a batch, the plan of the V6 warm-up split programs (the SM90 V6 WARM-UP SPLIT
+PLAN block), the sm_90a ``prefill`` registry and the identities of its records.
 The route is host arithmetic over Python integers: no GPU, no tensor, no
 device fixture.  ``test_cake_gdp_prefill.py`` runs the kernels.
 """
@@ -70,6 +71,12 @@ SPLIT_NAMES = (
     "cake_gdp_3220d37914678385a837",
     "cake_gdp_245414df8449fb1825a1",
     "cake_gdp_b81854850bf4b769295c",
+)
+# The warm-up split twins of the three V6 programs (the V6 body's ``split_items`` programs).
+V6_SPLIT_NAMES = (
+    "cake_gdp_5acbda2bd1002fd68a95",
+    "cake_gdp_edfb71d95c7a9c2a133d",
+    "cake_gdp_446ecf26f72f95aacf84",
 )
 # (use_initial_state, use_state_indices, store_final_state, unit_gates, unit_beta) per program group.
 V6_FLAGS = (
@@ -407,13 +414,160 @@ def test_one_token_sequences_cost_their_own_items() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The V6 warm-up split plan
+# ---------------------------------------------------------------------------
+
+# The balanced rows of the bench rows' long sequences on 132 SMs (H -> rows per long length; "C" the pair): a
+# bench row has these rows plus one whole-head row per head of each one-token sequence.
+BENCH_BALANCED_ROWS = {
+    10: {8192: 130, 16384: 134, 32768: 140, 65536: 141, "C": 280},
+    20: {8192: 140, 16384: 148, 32768: 150, 65536: 151, "C": 298},
+    40: {8192: 163, 16384: 167, 32768: 169, 65536: 171, "C": 339},
+    80: {8192: 203, 16384: 207, 32768: 210, 65536: 210, "C": 417},
+}
+
+
+def _v6_plan(lens: tuple[int, ...], H: int, n: int = N_HH, sm_count: int = SM_COUNT):
+    return loader.prefill_v6_sm90_plan(
+        _offsets(lens), num_heads=H, num_householder=n, sm_count=sm_count
+    )
+
+
+def _covers_every_chunk_once(lens, H, n, plan) -> None:
+    """The rows' head-major write ranges tile every (sequence, head)'s chunks exactly once: a balanced row writes
+    from its cut to the next cut of its (sequence, head) (or the end), a whole-head row its whole head."""
+    chunks = loader.v6_sm90_chunks(_offsets(lens), n)
+    cuts: dict[tuple[int, int], list[int]] = {}
+    for seq, head, cut, span in plan.rows:
+        cuts.setdefault((seq, head), []).append(cut)
+        if span >= 0:
+            assert cut == 0 and span == chunks[seq], (seq, head, cut, span)
+    assert set(cuts) == {(q, h) for q in range(len(lens)) for h in range(H)}
+    for (seq, head), at in cuts.items():
+        assert sorted(at) == sorted(set(at)) and min(at) == 0, (seq, head, at)
+        assert all(cut < max(chunks[seq], 1) for cut in at), (seq, head, at)
+
+
+@pytest.mark.parametrize("name,H,lens", BENCH_ROWS, ids=[row[0] for row in BENCH_ROWS])
+def test_v6_split_plan_of_the_bench_rows(
+    name: str, H: int, lens: tuple[int, ...]
+) -> None:
+    """Every bench row runs the V6 split program on 132 SMs: its long sequences balanced (the pinned row counts),
+    each one-token sequence one whole-head row per head, every CTA's list within the plan table, the rows
+    covering every chunk once, the plan lighter than the V6 program's tiles."""
+    plan = _v6_plan(lens, H)
+    assert plan.split and plan.grid == SM_COUNT, (name, plan.load, plan.serial_load)
+    assert plan.load < plan.serial_load
+    d = lens.count(1)
+    if name.startswith("C_"):
+        key = "C"
+    else:  # the long sequence of an A row (65536 - d tokens at L = 65536: the same chunks) or of a B row
+        key = min(BENCH_LENGTHS, key=lambda L: abs(L - max(lens)))
+    assert len(plan.rows) == BENCH_BALANCED_ROWS[H][key] + d * H, (name, len(plan.rows))
+    assert len(plan.offsets) == plan.grid + 1 and plan.offsets[-1] == len(plan.rows)
+    for b in range(plan.grid):
+        here = plan.rows[plan.offsets[b] : plan.offsets[b + 1]]
+        balanced = [row for row in here if row[3] < 0]
+        assert here[: len(balanced)] == tuple(balanced)  # the balanced rows lead
+        assert len(balanced) <= loader.V6_SM90_PLAN_ROWS
+    _covers_every_chunk_once(lens, H, N_HH, plan)
+
+
+def test_v6_split_long_rows_do_not_depend_on_the_batch() -> None:
+    """A balanced sequence's rows, and the CTA of each, are the same with any one-token or short sequences beside
+    it (the long sequence's output does not depend on them)."""
+    for H in (10, 40, 80):
+        alone = _v6_plan((65536,), H)
+        mine = [
+            (b, row[1:])
+            for b in range(alone.grid)
+            for row in alone.rows[alone.offsets[b] : alone.offsets[b + 1]]
+        ]
+        for lens in ((1,) * 15 + (65536,), (1, 300, 0, 65536)):
+            plan = _v6_plan(lens, H)
+            seq = len(lens) - 1
+            theirs = [
+                (b, row[1:])
+                for b in range(plan.grid)
+                for row in plan.rows[plan.offsets[b] : plan.offsets[b + 1]]
+                if row[0] == seq
+            ]
+            assert theirs == mine, (H, lens)
+
+
+@pytest.mark.parametrize(
+    "lens,H",
+    (
+        ((1024,) * 64, 10),
+        ((256,) * 64, 80),
+        ((1024,) * 16, 80),
+        ((1024,) * 16, 24),
+        ((300,) * 64, 10),
+        ((4096,) * 4, 10),
+        ((8192,), 3),
+        ((8192,), 1),
+        ((1,) * 64, 80),
+        ((0, 0), 10),
+    ),
+)
+def test_v6_split_is_not_taken_where_the_tiles_fill_the_sms(lens, H) -> None:
+    """Short-only batches, and batches whose (sequence, head) tiles already fill the SMs, keep the V6 program: no
+    sequence is balanced, or the plan's most loaded CTA is not lighter than the V6 program's (e.g. 64 x 1024 at
+    H = 10, 16 x 1024 at H = 80)."""
+    plan = _v6_plan(lens, H)
+    assert not plan.split, (lens, H, plan.load, plan.serial_load)
+
+
+def test_v6_split_item_words() -> None:
+    """The item words: four per row, the ``grid + 1`` offsets, then ``N`` and the planned ``cu_seqlens``."""
+    lens = (1, 0, 8192, 65)
+    plan = _v6_plan(lens, 10)
+    words = loader.v6_sm90_item_words(plan, _offsets(lens))
+    rows = len(plan.rows)
+    assert words[: 4 * rows] == tuple(w for row in plan.rows for w in row)
+    assert words[4 * rows : 4 * rows + plan.grid + 1] == plan.offsets
+    assert words[4 * rows + plan.grid + 1 :] == (len(lens), *_offsets(lens))
+
+
+def test_v6_split_plan_rules() -> None:
+    """The slot rule (at least V6_SM90_MIN_SLOT chunks, shorter than a head, a multiple of n), the cut-min rule (no
+    cut fewer than V6_SM90_CUT_MIN chunks after its head start), cut-0 rows first in every CTA list, at most
+    V6_SM90_PLAN_ROWS // 2 balanced sequences (the longest), and the serial load of the V6 tiles."""
+    for H, n, L in itertools.product(
+        (8, 10, 24, 40, 80), (1, 2, 3, 4), (6000, 8192, 32768)
+    ):
+        plan = _v6_plan((L,), H, n)
+        (chunks,) = loader.v6_sm90_chunks(_offsets((L,)), n)
+        slot = loader.v6_sm90_slot(chunks, H, n, SM_COUNT)
+        if not slot:
+            continue
+        assert loader.V6_SM90_MIN_SLOT <= slot < chunks + n and slot % n == 0
+        for b in range(plan.grid):
+            here = plan.rows[plan.offsets[b] : plan.offsets[b + 1]]
+            first = [r[2] == 0 for r in here]
+            assert first == sorted(first, reverse=True)
+        for _seq, _head, cut, span in plan.rows:
+            assert span == -slot and (cut == 0 or cut >= loader.V6_SM90_CUT_MIN)
+        _covers_every_chunk_once((L,), H, n, plan)
+    lens = (8192,) * 40
+    plan = _v6_plan(lens, 80)
+    balanced = {row[0] for row in plan.rows if row[3] < 0}
+    assert len(balanced) <= loader.V6_SM90_PLAN_ROWS // 2
+    assert (
+        loader.v6_sm90_serial_load([384, 1], 10, SM_COUNT)
+        == 384 + loader.V6_SM90_ROW_COST
+    )
+    assert loader.v6_sm90_serial_load([], 10, SM_COUNT) == 0
+
+
+# ---------------------------------------------------------------------------
 # The registry
 # ---------------------------------------------------------------------------
 
 
-def test_sm90_prefill_route_lists_the_eight_programs() -> None:
+def test_sm90_prefill_route_lists_the_eleven_programs() -> None:
     route = loader.ROUTES[ARCH][loader.PREFILL_ROUTE]
-    assert route == [*V6_NAMES, *UNIT_NAMES, *SPLIT_NAMES]
+    assert route == [*V6_NAMES, *UNIT_NAMES, *SPLIT_NAMES, *V6_SPLIT_NAMES]
     assert loader.prefill_route_modules(ARCH) == tuple(route)
     for name in V6_NAMES:
         assert loader.MODULES[name]["body"] == V6
@@ -427,6 +581,11 @@ def test_sm90_prefill_route_lists_the_eight_programs() -> None:
         record = loader.MODULES[name]
         assert record["body"] == P3
         assert record["build"][loader.PREFILL_SPLIT_FLAG] is True
+    for name in V6_SPLIT_NAMES:
+        record = loader.MODULES[name]
+        assert record["body"] == V6
+        assert record["build"][loader.PREFILL_SPLIT_FLAG] is True
+        assert record["build"]["csr"] is True and record["build"]["plan_guard"] is True
     # no other record of the prefill role is delivered for sm_90a
     assert {
         name
@@ -436,14 +595,17 @@ def test_sm90_prefill_route_lists_the_eight_programs() -> None:
 
 
 def test_selected_prefill_module_filters_by_body() -> None:
-    """The body filter resolves the three V6 flag sets, the two unit sets and the three split sets to their
-    records and refuses the removed merged exact programs with ``0 programs``; no body searches every body."""
+    """The body filter resolves the three V6 flag sets (exact and split), the two unit sets and the three merged split
+    sets to their records and refuses the removed merged exact programs with ``0 programs``; no body searches every
+    body."""
     for flags, name in zip(V6_FLAGS, V6_NAMES, strict=True):
         assert _select(V6, flags) == name
     for flags, name in zip(UNIT_FLAGS, UNIT_NAMES, strict=True):
         assert _select(P3, flags) == name
     for flags, name in zip(SPLIT_FLAGS, SPLIT_NAMES, strict=True):
         assert _select(P3, flags, **{loader.PREFILL_SPLIT_FLAG: True}) == name
+    for flags, name in zip(V6_FLAGS, V6_SPLIT_NAMES, strict=True):
+        assert _select(V6, flags, **{loader.PREFILL_SPLIT_FLAG: True}) == name
     for flags in REMOVED_FLAGS:
         with pytest.raises(ValueError, match="0 programs of the 'prefill' route"):
             _select(P3, flags)
@@ -460,8 +622,8 @@ def test_selected_prefill_module_filters_by_body() -> None:
     for flags in (*UNIT_FLAGS, (False, False, False, False, False)):
         with pytest.raises(ValueError, match="0 programs of the 'prefill' route"):
             _select(V6, flags)
-    with pytest.raises(ValueError, match="0 programs of the 'prefill' route"):
-        _select(V6, V6_FLAGS[0], **{loader.PREFILL_SPLIT_FLAG: True})
+        with pytest.raises(ValueError, match="0 programs of the 'prefill' route"):
+            _select(V6, flags, **{loader.PREFILL_SPLIT_FLAG: True})
 
 
 def test_v6_record_names_are_the_kernel_digests() -> None:
@@ -469,8 +631,9 @@ def test_v6_record_names_are_the_kernel_digests() -> None:
     library and symbol carry that name, the three names differ, and the build manifest lists each library for
     sm_90a."""
     libraries = cake_build.libraries_by_name()
-    assert len(set(V6_NAMES)) == len(V6_NAMES)
-    for name in V6_NAMES:
+    names = (*V6_NAMES, *V6_SPLIT_NAMES)
+    assert len(set(names)) == len(names)
+    for name in names:
         record = loader.MODULES[name]
         assert re.fullmatch(r"cake_gdp_[0-9a-f]{20}", name), name
         assert record["kernel"] == record["library"] == name
@@ -482,7 +645,8 @@ def test_v6_records_share_the_merged_launch_contract() -> None:
     """A V6 record launches 384 threads per CTA under the ``tiles`` grid rule and takes the merged body's 23
     formals in the merged body's order, so the backend binds one ``values`` dict for every launch."""
     merged = loader.MODULES[UNIT_NAMES[0]]
-    for name in V6_NAMES:
+    for name in (*V6_NAMES, *V6_SPLIT_NAMES):
+        split = name in V6_SPLIT_NAMES
         record = loader.MODULES[name]
         assert record["body"] == V6 and record["arches"] == [ARCH]
         assert record["launch"]["block"] == (384, 1, 1)
@@ -498,7 +662,11 @@ def test_v6_records_share_the_merged_launch_contract() -> None:
             - BLACKWELL_ONLY_LOGICAL
         )
         assert record["select_rule"]["kind"] == "prefill_flags"
-        assert set(record["select_rule"]) == {"kind", *loader.PREFILL_FLAGS}
+        assert set(record["select_rule"]) == {
+            "kind",
+            *loader.PREFILL_FLAGS,
+            *((loader.PREFILL_SPLIT_FLAG,) if split else ()),
+        }
         assert record["select_rule"]["store_final_state"] is True
         assert {flag: record["build"][flag] for flag in loader.PREFILL_FLAGS} == {
             flag: record["select_rule"][flag] for flag in loader.PREFILL_FLAGS
