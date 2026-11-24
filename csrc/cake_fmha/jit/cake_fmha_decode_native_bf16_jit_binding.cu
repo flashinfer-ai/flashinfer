@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <mutex>
 #include <string>
@@ -307,12 +308,25 @@ void cake_paged_attention_decode(
   CUtensorMap h_q = EncodeTmaQt(query);
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
+#ifdef CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES
+  // The exact B256 sink member takes its tensor maps by value: the launch copies these host
+  // descriptors, so the member leases no device slot.
+  CakeFmhaTensorMap d_q, d_k, d_v;
+  static_assert(sizeof(CakeFmhaTensorMap) == sizeof(CUtensorMap), "tensor map carrier size");
+  std::memcpy(&d_q, &h_q, sizeof(d_q));
+  std::memcpy(&d_k, &h_k, sizeof(d_k));
+  std::memcpy(&d_v, &h_v, sizeof(d_v));
+  CakeFmhaTensorMap const* p_q = &d_q;
+  CakeFmhaTensorMap const* p_k = &d_k;
+  CakeFmhaTensorMap const* p_v = &d_v;
+#else
   auto q_slot = TmaDeviceSlot(h_q, query.device().device_id, stream);
   auto k_slot = TmaDeviceSlot(h_k, query.device().device_id, stream);
   auto v_slot = TmaDeviceSlot(h_v, query.device().device_id, stream);
   auto const* p_q = reinterpret_cast<CakeFmhaTensorMap const*>(q_slot.pointer);
   auto const* p_k = reinterpret_cast<CakeFmhaTensorMap const*>(k_slot.pointer);
   auto const* p_v = reinterpret_cast<CakeFmhaTensorMap const*>(v_slot.pointer);
+#endif
 
   int64_t even_kv_blocks = (max_kv_len + 127) / 128;
   even_kv_blocks += even_kv_blocks % 2;
@@ -439,10 +453,18 @@ void cake_paged_attention_decode(
 #endif
   cudaError_t status = cake_fmha_launch_decode_native_bf16(
       p_q, p_k, p_v, static_cast<__nv_bfloat16*>(out.data_ptr()), lse_ptr, page_table,
-      causal_prefix, scale_ptr, sinks_ptr, max_pages_per_seq, static_cast<int>(max_kv_len),
+#ifdef CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES
+      // The exact B256 sink member reads each row's KV length and derives the causal prefix itself.
+      static_cast<int*>(seq_lens.data_ptr()),
+#else
+      causal_prefix,
+#endif
+      scale_ptr, sinks_ptr, max_pages_per_seq, static_cast<int>(max_kv_len),
       softmax_scale_log2, static_cast<int>(window_left), NUM_Q_HEADS, NUM_KV_HEADS, BATCH_SIZE,
       grid_x, grid_y, grid_z, stream);
+#ifndef CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES
   RecordTmaDeviceSlotUses({q_slot, k_slot, v_slot}, stream);
+#endif
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "Cake FMHA decode-native BF16 launch failed: " << cudaGetErrorString(status);
 

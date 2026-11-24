@@ -9,7 +9,7 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __nv_bfloat16* O_ptr, float* LSE_ptr, int* page_table, int* causal_seqlens_kv_global, float* scale_log2_ptr, float* sinks_ptr, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int window_left, int num_q_heads, int num_kv_heads, int batch_size);
+extern "C" __global__ void kernel_cake_fmha_decode_native_bf16(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ page_table, int* __restrict__ causal_seqlens_kv_global, float* __restrict__ scale_log2_ptr, float* __restrict__ bmm2_ptr, float* __restrict__ sinks_ptr, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int window_left, int num_q_heads, int num_kv_heads, int batch_size);
 
 extern "C" cudaError_t cake_fmha_launch_decode_native_bf16(
     CakeFmhaTensorMap const* Qt,
@@ -39,15 +39,18 @@ extern "C" cudaError_t cake_fmha_launch_decode_native_bf16(
     if (status != cudaSuccess) {
         return status;
     }
+    // The kernel takes the three tensor maps by value: each argument is the descriptor the caller points at.
+    float* bmm2_ptr = nullptr;  // read only by a device-scale build, which this member is not
     void* kernel_args[] = {
-        const_cast<void*>(reinterpret_cast<const void*>(&Qt)),
-        const_cast<void*>(reinterpret_cast<const void*>(&K)),
-        const_cast<void*>(reinterpret_cast<const void*>(&V)),
+        const_cast<void*>(reinterpret_cast<const void*>(Qt)),
+        const_cast<void*>(reinterpret_cast<const void*>(K)),
+        const_cast<void*>(reinterpret_cast<const void*>(V)),
         const_cast<void*>(reinterpret_cast<const void*>(&O_ptr)),
         const_cast<void*>(reinterpret_cast<const void*>(&LSE_ptr)),
         const_cast<void*>(reinterpret_cast<const void*>(&page_table)),
         const_cast<void*>(reinterpret_cast<const void*>(&causal_seqlens_kv_global)),
         const_cast<void*>(reinterpret_cast<const void*>(&scale_log2_ptr)),
+        const_cast<void*>(reinterpret_cast<const void*>(&bmm2_ptr)),
         const_cast<void*>(reinterpret_cast<const void*>(&sinks_ptr)),
         const_cast<void*>(reinterpret_cast<const void*>(&max_pages_per_seq)),
         const_cast<void*>(reinterpret_cast<const void*>(&max_local_seq_len)),
