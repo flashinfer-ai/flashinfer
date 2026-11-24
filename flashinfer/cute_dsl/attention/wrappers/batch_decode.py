@@ -610,7 +610,7 @@ def _get_compiled_paged_decode_kernel(
 
     threshold_p_fake = Float32(0.0) if use_threshold else None
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    packed_args = ()
+    packed_args: tuple[cute.Tensor, ...] = ()
     if mixed:
 
         def packed_fake(dtype, channels):
