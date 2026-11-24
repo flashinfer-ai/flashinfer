@@ -1361,8 +1361,12 @@ def test_quantizer_scale_buffer_as_returned_at_row_counts_that_are_multiples_of_
         ref = bits(plain(_routed_pack(x, ids, weights), W_pack))
         if pair.scaled:
             x4, sf, pts = nvfp4_quantize(
-                x, TE_GS_INV, per_token_activation=True, batch_invariant=True
-            )
+                x,
+                TE_GS_INV,
+                per_token_activation=True,
+                nvfp4_4over6=None,
+                batch_invariant=True,
+            )  # the recipe pinned: the environment's 4over6 setting is not this test's
         else:
             x4, sf = mxfp4_quantize(x, batch_invariant=True)
             pts = None
