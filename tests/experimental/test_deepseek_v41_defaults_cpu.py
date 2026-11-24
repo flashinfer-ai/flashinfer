@@ -1006,7 +1006,13 @@ def native_task():
         if isinstance(method, ast.FunctionDef):
             if method.name in {"init_variables", "make_task_cache", "get_domain"}:
                 assert not method.decorator_list
-            method.decorator_list = []
+            # Drop the DSL decorators. A property stays one, since its bound
+            # method would read as always true.
+            method.decorator_list = [
+                decorator
+                for decorator in method.decorator_list
+                if isinstance(decorator, ast.Name) and decorator.id == "property"
+            ]
 
     class HostTask:
         def __init__(self, *, warp_idx=0, domain=0):
@@ -1036,6 +1042,8 @@ def native_task():
             arch=SimpleNamespace(thread_idx=lambda: (147, 0, 0)),
         ),
         task_context_kwargs=context_kwargs,
+        # Every query row of a tile sees the same K prefix.
+        cta_rows_have_distinct_kv_prefix=lambda config: False,
         WARPGROUP_WARPS=4,
         WARP_LANES=32,
         WARP_LANE_SHIFT=5,
