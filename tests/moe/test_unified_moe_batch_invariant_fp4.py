@@ -3853,3 +3853,40 @@ def test_intermediate_scales_are_validated_before_the_reciprocal():
             )
 
 
+@needs_device
+@each_pair
+def test_weight_view_names_its_intermediate_class_and_a_view_without_it_is_declined(
+    pair,
+):
+    """``prepare_weights`` writes the intermediate's class into the view for both pairs (the MX pair's is the per-token
+    class alone); the runner's candidate filter requires the key -- a view without it is declined, never read as the
+    per-token class -- and the runner driven directly refuses it with the mode's error naming the key."""
+    T, k, H, I, E = 8, 2, 128, 64, 4
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=71)
+    view = BatchInvariantFp4Config.prepare_weights(
+        w1, w2, quant=_QUANT[pair], activation=_SWIGLU
+    )
+    assert view["intermediate"] == "per_token"
+    assert MoEWeightsFp4.prepare(pair, w1, w2).view()["intermediate"] == "per_token"
+    layer = _layer(k, E, I, quant=_QUANT[pair])
+    runner = layer.runners[0]
+    act = _logits_pack(x, logits)
+    pack = MoEWeightPack({})
+    pack.prepare_for(KEY, view)
+    assert runner.accepts(act, pack)
+    ref = bits(layer(act, pack))
+    stripped = MoEWeightPack({})
+    stripped.prepare_for(KEY, {kk: v for kk, v in view.items() if kk != "intermediate"})
+    assert not runner.accepts(act, stripped)
+    with pytest.raises(NotImplementedError):
+        layer(act, stripped)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="intermediate"):
+        runner.pack_inputs(act, stripped)
+    assert torch.equal(bits(layer(act, pack)), ref)
+    if pair.scaled:
+        static = BatchInvariantFp4Config.prepare_weights(
+            w1, w2, activation=_SWIGLU, intermediate="static"
+        )
+        assert static["intermediate"] == "static"
+
+

@@ -318,11 +318,13 @@ class BatchInvariantFp4Runner(MoERunner):
         """The layer's candidate filter: the shared rule (a view under the backend's key, the input geometry) and the view's
         intermediate class being this candidate's -- the two fp4 candidates of a layer share the view key, so a view prepared
         for the other class is the other candidate's pack and is declined here (the runner driven directly refuses it in
-        ``pack_inputs``); a view of another pair stays a refusal, since no candidate of the layer serves it."""
+        ``pack_inputs``); a view of another pair stays a refusal, since no candidate of the layer serves it. The view names
+        its class (``prepare_weights`` writes ``intermediate`` for both pairs); a view without the key is declined, never
+        read as the per-token class (``pack_inputs`` names the missing key)."""
         if not super().accepts(act, weights):
             return False
         view = weights.get_view(self.backend_key)
-        return str(view.get("intermediate", "per_token")) == self._intermediate
+        return view.get("intermediate") == self._intermediate
 
     def _accepts_shape(self, act: MoEActivationPack) -> bool:
         x = act.hidden_states_q
@@ -452,6 +454,12 @@ class BatchInvariantFp4Runner(MoERunner):
                 "weights prepared for another pair of the fp4 backend",
                 f"weights from BatchInvariantFp4Config.prepare_weights(..., quant=QuantConfig(weight={pair.name.upper()}, "
                 f"activation={pair.name.upper()}))",
+            )
+        if "intermediate" not in view:
+            raise unsupported(
+                cls,
+                "a weight view without its intermediate class (no `intermediate` key)",
+                "the view of BatchInvariantFp4Config.prepare_weights, which names the class for both pairs",
             )
         w = MoEWeightsFp4.from_view(view)
         if (

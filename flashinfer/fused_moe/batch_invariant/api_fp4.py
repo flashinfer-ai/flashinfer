@@ -455,7 +455,8 @@ class MoEWeightsFp4:
 
     def view(self) -> Dict[str, object]:
         """The weight view a :class:`flashinfer.fused_moe.MoEWeightPack` stores for the backend (``quant`` names the pair:
-        the pairs share the view key)."""
+        the pairs share the view key; ``intermediate`` names the intermediate's class for both pairs, the MX pair's being
+        the per-token class alone)."""
         v: Dict[str, object] = {
             "quant": self.pair.name,
             "gemm1_weights": self.w1,
@@ -467,12 +468,12 @@ class MoEWeightsFp4:
             "gated": self.gated,
             "act": self.act,
             "params": self.params,
+            "intermediate": self.intermediate,
         }
         if self.pair.scaled:
             v.update(
                 gemm1_alpha=self.w1_alpha,
                 gemm2_alpha=self.w2_alpha,
-                intermediate=self.intermediate,
                 intermediate_scale=self.gs2,
                 intermediate_inv_scale=self.inv2,
             )
