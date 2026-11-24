@@ -875,6 +875,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                             }
                             smem_v20[row_0 % 32 * 4 + row_0 / 32] = scale_word;
                         }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         __syncthreads();
                         if (tid == 0) {
                             int col_tile_0 = col_block * 4;
@@ -1125,6 +1126,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                             }
                             smem_v21[row_1 % 32 * 4 + row_1 / 32] = scale_word_1;
                         }
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         __syncthreads();
                         if (tid == 0) {
                             int col_tile_1 = col_block * 4 + 1;
@@ -1405,6 +1407,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                                 }
                                 smem_v20[row_2 % 32 * 4 + row_2 / 32] = scale_word_2;
                             }
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             __syncthreads();
                             if (tid == 0) {
                                 int col_tile_2 = col_block * 4 + 2;
@@ -1655,6 +1658,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                                 }
                                 smem_v21[row_3 % 32 * 4 + row_3 / 32] = scale_word_3;
                             }
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             __syncthreads();
                             if (tid == 0) {
                                 int col_tile_3 = col_block * 4 + 2 + 1;
@@ -1702,6 +1706,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                         unsigned int _atomic_fetch_add_64 = atomicAdd(&combine_next[0], 1);
                         flat_view_8[0] = (int)_atomic_fetch_add_64;
                     }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncthreads();
                     int task_1 = flat_view_8[0];
                     __syncthreads();
@@ -2561,6 +2566,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                                 }
                                 smem_v20[row_4_1 % 32 * 4 + row_4_1 / 32] = scale_word_4;
                             }
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             __syncthreads();
                             if (tid == 0) {
                                 int col_tile_4 = col_block_1 * 4;
@@ -2811,6 +2817,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                                 }
                                 smem_v21[row_5_1 % 32 * 4 + row_5_1 / 32] = scale_word_5;
                             }
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             __syncthreads();
                             if (tid == 0) {
                                 int col_tile_5 = col_block_1 * 4 + 1;
@@ -3092,6 +3099,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                                     }
                                     smem_v20[row_6_1 % 32 * 4 + row_6_1 / 32] = scale_word_6;
                                 }
+                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                 __syncthreads();
                                 if (tid == 0) {
                                     int col_tile_6 = col_block_1 * 4 + 2;
@@ -3342,6 +3350,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                                     }
                                     smem_v21[row_7 % 32 * 4 + row_7 / 32] = scale_word_7;
                                 }
+                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                 __syncthreads();
                                 if (tid == 0) {
                                     int col_tile_7 = col_block_1 * 4 + 2 + 1;
@@ -9359,10 +9368,10 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                                     }
                                     flat_view_2[out_base + row_11_1 % 32 * 4 + row_11_1 / 32] = scale_word_9;
                                 }
+                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                 __syncthreads();
                                 if (tid == 0) {
                                     int local_row = row_37 - macro_row_offset;
-                                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                     tma_store_2d((&hidden_q_store), col_37 * 128, local_row * 128, flat_view_addr_1 + (unsigned int)(slot * 32768));
                                     tma_store_3d((&hidden_sc_store), 0, 0, local_row * col_blocks_7 + col_37, flat_view_addr_2 + (unsigned int)(slot * 32768));
                                     tma_store_2d((&hidden_t_store), local_row * 128, col_37 * 128, flat_view_addr_3 + (unsigned int)(slot * 32768));
@@ -10388,6 +10397,7 @@ kernel_cake_mok_forward_mxfp8_clamped_multimacro(const __grid_constant__ CUtenso
                 unsigned int _atomic_fetch_add_533 = atomicAdd(&combine_next[0], 1);
                 flat_view_8[0] = (int)_atomic_fetch_add_533;
             }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
             int task_3 = flat_view_8[0];
             __syncthreads();

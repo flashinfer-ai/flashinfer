@@ -40,14 +40,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_PAYLOAD_OFF 1024
-#define SMEM_PAYLOAD_STAGE_BYTES 2048
-#define SMEM_PAYLOAD_STRIDE 2048
-#define SMEM_TOTAL 3072
-#define THREADS 1
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -109,7 +101,7 @@ __device__ __forceinline__ void cp_async_bulk_gmem2smem(
 
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void
+__global__ __launch_bounds__(1) void
 kernel_cake_mok_gather(int* __restrict__ local_routes, unsigned long long multicast_address, int rank, int numel)
 {
     const int tid = threadIdx.x;
@@ -133,12 +125,11 @@ kernel_cake_mok_gather(int* __restrict__ local_routes, unsigned long long multic
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
-    int* payload = reinterpret_cast<int*>(smem_raw + SMEM_PAYLOAD_OFF);
-    const int payload_addr = smem + SMEM_PAYLOAD_OFF;
+    // Prologue
+    int* payload = reinterpret_cast<int*>(smem_raw + 1024);
+    const int payload_addr = smem + 1024;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 1 barriers)
-    // Mbarriers at smem_raw[0..8)
+    // Mbarrier init (1 barriers at smem_raw[0..8))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -154,7 +145,7 @@ kernel_cake_mok_gather(int* __restrict__ local_routes, unsigned long long multic
     // === Task calls (declaration order) ===
     int offset = bid * 512;
     mbarrier_arrive_expect_tx(arrived_addr, 2048);
-    cp_async_bulk_gmem2smem(payload_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(local_routes) + ((unsigned long long)offset * (unsigned long long)4)), 2048, arrived_addr);
+    cp_async_bulk_gmem2smem(payload_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(local_routes) + (unsigned long long)offset * (unsigned long long)4), 2048, arrived_addr);
     mbarrier_wait(arrived_addr, 0);
     {
         void* _cpbulk_dst_0 = reinterpret_cast<void*>(reinterpret_cast<int*>(multicast_address) + (rank * numel + offset));

@@ -40,21 +40,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_HISTOGRAM_OFF 0
-#define SMEM_HISTOGRAM_STAGE_BYTES 1152
-#define SMEM_HISTOGRAM_STRIDE 1152
-#define SMEM_OWNER_BINS_OFF 0
-#define SMEM_OWNER_BINS_STAGE_BYTES 32
-#define SMEM_OWNER_BINS_STRIDE 32
-#define SMEM_TOTAL 1152
-#define THREADS 1024
-
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void
+__global__ __launch_bounds__(1024) void
 kernel_cake_mok_count_8_36(int* __restrict__ topk_all, int* __restrict__ counts, int local_tokens, int top_k, int rank)
 {
     const int tid = threadIdx.x;
@@ -76,9 +66,9 @@ kernel_cake_mok_count_8_36(int* __restrict__ topk_all, int* __restrict__ counts,
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
-    int* histogram = reinterpret_cast<int*>(smem_raw + SMEM_HISTOGRAM_OFF);
-    const int histogram_addr = smem + SMEM_HISTOGRAM_OFF;
+    // Prologue
+    int* histogram = reinterpret_cast<int*>(smem_raw + 0);
+    const int histogram_addr = smem + 0;
     int* owner_bins = reinterpret_cast<int*>(smem_static_raw + 0);
     const int owner_bins_addr = (int)(unsigned long long)__cvta_generic_to_shared(owner_bins);
 
