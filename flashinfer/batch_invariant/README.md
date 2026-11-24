@@ -100,9 +100,10 @@ launch over a permuted copy. Each is a placement of the class with its dischargi
 the gather form against the materialised path (`test_gather_form_of_the_op_equals_the_materialised_path`). The autotuner's
 tactics are the pairs of the top records of the two GEMMs; every pair computes the class. The persistent grid of a grouped GEMM
 is the same launch parameter as the dense one's. The fp4 MoE classes' dispatcher (`fused_moe/batch_invariant/schedule_fp4.py`) ranks the same way at the
-dense 4-bit class's instruction class with `M =` the rows of one active expert rounded up to the 128-row scale-factor atom (the
-grouped kernel computes whole atoms per group), and keeps only the records whose M tile fits that padded group: a taller
-tile computes padding the dense estimate does not price. At few rows per active expert the ranking is led by the swapped
+dense 4-bit class's instruction class: the ranking's input is the unpadded average rows per active expert (`record_cost` takes
+it with the active expert count), while the eligibility bound pads that row count to the 128-row scale-factor atom (the grouped
+kernel computes whole atoms per group) and keeps only the records whose M tile fits the padded group: a taller tile computes
+padding the dense estimate does not price. At few rows per active expert the ranking is led by the swapped
 decode body (`fused_moe/batch_invariant/blocks/swap.py`: the weights on the MMA's M side, the group's tokens a narrow
 N tile of 8 / 16 / 32 rows read from the dense packing, their scale factors gathered from the padded positions). The dispatch
 is `default_configs_fp4()`: the first record of each GEMM's ranked list, the swapped records ranked with the grouped ones;
