@@ -545,6 +545,78 @@ def test_prewiden_rejected_replan_keeps_previous_plan():
 
 
 @needs_cuda
+def test_prewiden_replan_rejects_kv_dtype_change():
+    q_len, kv_len, hq, hkv, d, page = 128, 1024, 8, 2, 256, 16
+    q, k, v, idx = _make_problem("HND", q_len, kv_len, hq, hkv, d, page)
+    n_pages = idx.numel()
+    args = _plan_args(q_len, kv_len, n_pages, hq, hkv, d, page)
+
+    # graph mode: the captured gather kernel is dispatched by KV dtype, so a
+    # dtype change must be rejected instead of replaying the wrong conversion
+    w = _graph_wrapper(n_pages, hq, hkv, d, page)
+    w.plan(paged_kv_indices=idx, kv_data_type=torch.float8_e4m3fn, **args)
+    with pytest.raises(ValueError, match="KV dtype"):
+        w.plan(paged_kv_indices=idx, kv_data_type=torch.float8_e5m2, **args)
+
+    # eager mode: a dtype change is allowed and uses the new conversion
+    k5 = k.to(torch.float8_e5m2)
+    v5 = v.to(torch.float8_e5m2)
+    k16 = k5.index_select(0, idx.long()).to(torch.bfloat16)
+    v16 = v5.index_select(0, idx.long()).to(torch.bfloat16)
+    compact = torch.arange(n_pages, dtype=torch.int32, device="cuda")
+    w_pw = _wrapper(
+        "HND", torch.float8_e4m3fn, True, q_len, kv_len, hq, hkv, d, page, idx
+    )
+    w_pw.plan(paged_kv_indices=idx, kv_data_type=torch.float8_e5m2, **args)
+    w_bf = _wrapper(
+        "HND", torch.bfloat16, False, q_len, kv_len, hq, hkv, d, page, compact
+    )
+    o1 = torch.empty(q_len, hq, d, dtype=torch.bfloat16, device="cuda")
+    o2 = torch.empty_like(o1)
+    w_pw.run(q, (k5, v5), k_scale=1.125, v_scale=0.875, out=o1)
+    w_bf.run(q, (k16, v16), k_scale=1.125, v_scale=0.875, out=o2)
+    torch.cuda.synchronize()
+    assert torch.equal(o1, o2)
+
+
+@needs_cuda
+def test_prewiden_workspace_size_matches_widened_module():
+    q_len, kv_len, hq, hkv, d, page = 64, 512, 8, 2, 256, 16
+    dev = torch.device("cuda")
+    _, _, _, idx = _make_problem("HND", q_len, kv_len, hq, hkv, d, page)
+    n_pages = idx.numel()
+    qo = torch.tensor([0, q_len], dtype=torch.int32, device=dev)
+    kvp = torch.tensor([0, n_pages], dtype=torch.int32, device=dev)
+    last = torch.tensor([kv_len - (n_pages - 1) * page], dtype=torch.int32, device=dev)
+
+    def size(prewiden, kv_dt):
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            torch.zeros(128 << 20, dtype=torch.uint8, device=dev),
+            "HND",
+            backend="fa2",
+            prewiden_fp8_kv=prewiden,
+        )
+        return w.workspace_size(
+            qo,
+            kvp,
+            idx,
+            last,
+            hq,
+            hkv,
+            d,
+            page,
+            causal=True,
+            q_data_type=torch.bfloat16,
+            kv_data_type=kv_dt,
+            o_data_type=torch.bfloat16,
+        )
+
+    # plan() sizes the widened 16-bit module, so the pre-widen wrapper must
+    # report the same workspace bytes as that module
+    assert size(True, torch.float8_e4m3fn) == size(False, torch.bfloat16)
+
+
+@needs_cuda
 def test_prewiden_plan_loads_module_for_cold_capture():
     q_len, kv_len, hq, hkv, d, page = 128, 1024, 8, 2, 256, 16
     q, k, v, idx = _make_problem("HND", q_len, kv_len, hq, hkv, d, page)

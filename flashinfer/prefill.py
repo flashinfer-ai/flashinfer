@@ -3881,6 +3881,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # plan() plans the widened 16-bit module when pre-widening is enabled;
+        # size that module so the returned bytes match what plan() requires.
+        prewiden_sizing = (
+            self._prewiden_fp8_kv
+            and self._jit_module is None
+            and kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and q_data_type in (torch.float16, torch.bfloat16)
+        )
+        if prewiden_sizing:
+            kv_data_type = q_data_type
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -3945,7 +3955,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             module = self._jit_module
         else:
-            if backend == "auto":
+            if prewiden_sizing:
+                # plan() pins the pre-widen path to FA2.
+                backend = "fa2"
+            elif backend == "auto":
                 backend = self._determine_auto_backend(
                     qo_indptr_host,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -4531,12 +4544,22 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 and self._pw_compact_indices.numel() == num_ref_pages
                 and self._pw_compact_indices.dtype == paged_kv_indptr.dtype
             )
-            if not shadows_compatible or not compact_compatible:
+            # The captured gather kernel is dispatched by KV dtype, so a replan
+            # that changes it would replay with the wrong conversion.
+            src_dtype_compatible = (
+                self._pw_src_dtype is None or self._pw_src_dtype == kv_data_type
+            )
+            if (
+                not shadows_compatible
+                or not compact_compatible
+                or not src_dtype_compatible
+            ):
                 if self.is_cuda_graph_enabled and self._pw_k_shadow is not None:
                     raise ValueError(
                         "prewiden_fp8_kv: a CUDA-graph replan must keep the "
-                        "referenced page count, per-page geometry, query dtype "
-                        "and index dtype so captured addresses stay valid"
+                        "referenced page count, per-page geometry, query dtype, "
+                        "index dtype and KV dtype so captured addresses and "
+                        "dtypes stay valid"
                     )
                 if not shadows_compatible:
                     self._pw_k_shadow = torch.empty(
