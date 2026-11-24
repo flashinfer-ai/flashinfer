@@ -47,6 +47,7 @@ def _call(layout: str, page_size: int, kv_dtype: torch.dtype, separate_kv: bool)
         # 832 tokens/page: vLLM's page size for hybrid attention/Mamba models.
         ("Q_PAGED_KV_NHD", False, 832, torch.bfloat16, "power-of-two page_size"),
         ("Q_PAGED_KV_NHD", False, 0, torch.bfloat16, "power-of-two page_size"),
+        ("Q_PAGED_KV_NHD", True, 0, torch.bfloat16, "non-empty k_cache/v_cache"),
         ("Q_PAGED_KV_HND", True, 1024, torch.float8_e4m3fn, "KV cache dtype"),
     ],
 )

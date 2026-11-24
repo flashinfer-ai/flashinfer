@@ -10269,6 +10269,13 @@ def _check_paged_kv_non_interleaved(
             "Non-interleaved paged KV requires contiguous k_cache/v_cache: the kernel "
             "derives strides from shapes, not tensor strides."
         )
+    # The offset check below divides by the block size, so an empty cache
+    # (zero pages, page_size, heads or head_dim) must fail here.
+    if k_cache.numel() == 0:
+        raise ValueError(
+            "Non-interleaved paged KV requires non-empty k_cache/v_cache; got "
+            f"shape {tuple(k_cache.shape)}."
+        )
     block_bytes = k_cache[0].numel() * k_cache.element_size()
     delta_bytes = v_cache.data_ptr() - k_cache.data_ptr()
     if delta_bytes <= 0 or delta_bytes % block_bytes != 0:
