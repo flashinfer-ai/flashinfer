@@ -3250,3 +3250,105 @@ def test_validation_rejects_plain_fp8_output_without_activation_side():
     )
     with pytest.raises(ValueError, match="Plain FP8 C output"):
         validate_config(cfg)
+
+
+def _locality_config(**overrides):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        BatchMode,
+        DType,
+        TileScheduler,
+        make_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.config_types import LocalitySplit
+
+    values = dict(
+        batch_mode=int(BatchMode.BATCH_N),
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        dtype_a=int(DType.BF16),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        mma_k=16,
+        tile_k=64,
+        tile_n=16,
+        use_early_exit=1,
+        use_clc_fast_drain=0,
+        locality_split=int(LocalitySplit.WEIGHTS_OUTPUT),
+    )
+    values.update(overrides)
+    return make_config(**values)
+
+
+@pytest.mark.cpu_only
+def test_locality_schedule_and_launch_grid_validate():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        compute_launch_grid,
+        validate_config,
+    )
+
+    cfg = _locality_config()
+    validate_config(cfg)
+    assert compute_launch_grid(
+        cfg,
+        problem_m=256,
+        problem_n=64,
+        early_exit_max_token_ctas=4,
+        num_persistent_clusters=5,
+    ) == (cfg.preferred_cluster_shape[0], cfg.preferred_cluster_shape[1], 5)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("problem_m", "problem_n"),
+    ((65536 * 16, 64), (256, 65536 * 16)),
+)
+def test_locality_launch_rejects_tile_indices_that_do_not_fit_u16(problem_m, problem_n):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        compute_launch_grid,
+    )
+
+    with pytest.raises(ValueError, match="packs M/N tile indices into 16 bits"):
+        compute_launch_grid(
+            _locality_config(),
+            problem_m=problem_m,
+            problem_n=problem_n,
+            early_exit_max_token_ctas=65536,
+            num_persistent_clusters=1,
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        ({"tile_scheduler": 0}, "persistent"),
+        ({"fallback_cluster_dim_x": 1, "fallback_cluster_dim_y": 1}, "flexible"),
+        ({"use_clc_fast_drain": 1}, "fast drain"),
+        ({"use_early_exit": 0}, "early exit"),
+    ),
+)
+def test_locality_schedule_rejects_incompatible_options(overrides, match):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+
+    with pytest.raises(ValueError, match=match):
+        validate_config(_locality_config(**overrides))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("route_field", "match"),
+    (("route_act", "route_act=NONE"), ("route_sfs_act", "sf_route=NONE")),
+)
+def test_locality_activation_split_rejects_routed_operands(route_field, match):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import validate_config
+    from flashinfer.prims_ts.batched_gemm.config_types import (
+        LocalitySplit,
+        RouteImpl,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        validate_config(
+            _locality_config(
+                locality_split=int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT),
+                **{route_field: int(RouteImpl.TMA)},
+            )
+        )

@@ -39,6 +39,18 @@ from cutlass.experimental.task_scheduling.resources import (
     WorkQueue,
 )
 
+try:
+    from cutlass.experimental.task_scheduling.enums import SKIPPABLE
+    from cutlass.experimental.task_scheduling.schedule_builder import (
+        ConditionalBlock,
+        DomainLoop,
+        Step,
+        WorkTileLoop,
+    )
+except ImportError:
+    # Flat-list Task runtimes (older CUTLASS DSL wheels) predate these nodes.
+    SKIPPABLE = ConditionalBlock = DomainLoop = Step = WorkTileLoop = None
+
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     ActKind,
     BatchMode,
@@ -63,6 +75,7 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
 from flashinfer.prims_ts.batched_gemm.tmem_c_resources import TmemCResource
 from flashinfer.prims_ts.batched_gemm.smem_misc_resources import (
     BatchedGemmWorkQueue,
+    LocalityBatchedGemmWorkQueue,
     ProxyClusterBarrierResource,
 )
 from flashinfer.prims_ts.batched_gemm.smem_sf_resources import (
@@ -525,6 +538,10 @@ class _DummyProxyResource(MemoryResource):
             default=cutlass.Int32(0),
         )
 
+    @producer_work()
+    def publish_smem_writes(self, stage_info):
+        pass
+
     @consumer_work_decorator(returns=consumer_stage_idx)
     def consumer_work(self, stage_info):
         pass
@@ -605,20 +622,146 @@ def test_fast_drain_work_queue_omits_smem_when_disabled(
     assert work_queue.get_smem_requirements() == []
 
 
-def _producer_aux_labels(schedule_list) -> list[str | None]:
+@dataclass(frozen=True)
+class _PlacedStep:
+    """One captured schedule step, independent of the Task representation.
+
+    ``phase`` is ``pre`` / ``post`` outside the work-tile loop; inside it (or
+    in a non-persistent body) ``head`` / ``tail`` precede / follow the K
+    domain loop and ``loop`` is inside it. ``prefetch_idx`` is the step's
+    ``prefetch_idx`` constexpr; flat-list Tasks only expose the call index,
+    which equals it for the prefetch drain steps.
+    """
+
+    memory_resource: object
+    schedule_stage: ScheduleStage
+    label: Optional[str]
+    prefetch_idx: Optional[int]
+    phase: str
+    skippable: bool
+
+
+def _is_flat_list_task(task) -> bool:
+    return hasattr(task, "head_schedule_list")
+
+
+def _nodes(nodes):
+    for node in nodes:
+        yield node
+        yield from _nodes(getattr(node, "body", ()))
+
+
+def _work_tile_loops(task) -> list:
+    return [n for n in _nodes(task.schedule.body) if isinstance(n, WorkTileLoop)]
+
+
+def _skip_predicates(task) -> list:
+    """The work-tile loop's ``skip_if``, one entry per work-tile loop."""
+    if _is_flat_list_task(task):
+        return [task.skip_if]
+    return [loop.skip_if for loop in _work_tile_loops(task)]
+
+
+def _k_loops(task) -> list[tuple]:
+    """``(start, step, unroll)`` of each K domain loop."""
+    if _is_flat_list_task(task):
+        return [(task.domain_start, task.step, task.unroll)]
     return [
-        label
-        for _resource, stage, _call_idx, *rest in schedule_list
-        for label in [rest[-1]]
-        if stage == ScheduleStage.ProducerAuxWork
+        (n.start, n.step, n.unroll)
+        for n in _nodes(task.schedule.body)
+        if isinstance(n, DomainLoop)
     ]
 
 
-def _all_producer_aux_labels(task) -> list[str | None]:
-    return (
-        _producer_aux_labels(task.head_schedule_list)
-        + _producer_aux_labels(task.loop_schedule_list)
-        + _producer_aux_labels(task.tail_schedule_list)
+def _flat_list_placed_steps(task) -> list[_PlacedStep]:
+    placed = []
+    for phase, entries, outer_slots, outer_phase, skippable_slots in (
+        (
+            "head",
+            task.head_schedule_list,
+            task.pre_work_loop_head_slots,
+            "pre",
+            task.skippable_head_slots,
+        ),
+        ("loop", task.loop_schedule_list, frozenset(), None, frozenset()),
+        (
+            "tail",
+            task.tail_schedule_list,
+            task.post_work_loop_tail_slots,
+            "post",
+            task.skippable_tail_slots,
+        ),
+    ):
+        for resource, stage, call_idx, *_, label in entries:
+            slot = (id(resource), stage, call_idx)
+            placed.append(
+                _PlacedStep(
+                    resource,
+                    stage,
+                    label,
+                    call_idx,
+                    outer_phase if slot in outer_slots else phase,
+                    slot in skippable_slots,
+                )
+            )
+    return placed
+
+
+def _tree_placed_steps(task) -> list[_PlacedStep]:
+    placed: list[_PlacedStep] = []
+
+    def walk(nodes, phase: str, skippable: bool) -> str:
+        for node in nodes:
+            if isinstance(node, Step):
+                placed.append(
+                    _PlacedStep(
+                        node.memory_resource,
+                        node.schedule_stage,
+                        node.label,
+                        node.constexpr_kwargs.get("prefetch_idx"),
+                        phase,
+                        skippable,
+                    )
+                )
+            elif isinstance(node, WorkTileLoop):
+                walk(node.body, "head", skippable)
+                phase = "post"
+            elif isinstance(node, DomainLoop):
+                walk(node.body, "loop", skippable)
+                if phase == "head":
+                    phase = "tail"
+            elif isinstance(node, ConditionalBlock):
+                phase = walk(node.body, phase, skippable or node.condition == SKIPPABLE)
+            else:
+                phase = walk(getattr(node, "body", ()), phase, skippable)
+        return phase
+
+    walk(task.schedule.body, "pre" if _work_tile_loops(task) else "head", False)
+    return placed
+
+
+def _steps(task, phase=None, *, resources=None, skippable=None) -> list[_PlacedStep]:
+    placed = (
+        _flat_list_placed_steps(task)
+        if _is_flat_list_task(task)
+        else _tree_placed_steps(task)
+    )
+    return [
+        p
+        for p in placed
+        if (phase is None or p.phase == phase)
+        and (
+            resources is None
+            or any(p.memory_resource is resource for resource in resources)
+        )
+        and (skippable is None or p.skippable == skippable)
+    ]
+
+
+def _has_step(steps, resource, stage) -> bool:
+    return any(
+        step.memory_resource is resource and step.schedule_stage == stage
+        for step in steps
     )
 
 
@@ -693,15 +836,30 @@ def _cfg(**overrides) -> SimpleNamespace:
         "padding_regs": 24,
         "use_early_exit": False,
         "weight_l2_evict_first": 0,
+        "uses_locality_split": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values, warp_layout=SimpleNamespace(**values))
 
 
 @pytest.mark.cpu_only
-def test_persistent_task_factories_build_captured_schedule_lists():
-    cfg = _cfg(use_early_exit=True)
-    work_queue = _work_queue()
+@pytest.mark.parametrize("localized", (False, True))
+def test_persistent_task_factories_build_captured_schedule_lists(localized):
+    cfg = _cfg(use_early_exit=True, uses_locality_split=localized)
+    if localized:
+        scheduler_config = TileSchedulerConfig(
+            tile_scheduler_type=TileSchedulerType.ClcDynamicPersistent,
+            tile_scheduler_params=None,
+        )
+        work_queue = LocalityBatchedGemmWorkQueue(
+            tile_scheduler_config=scheduler_config,
+            cfg=SimpleNamespace(use_early_exit=True, is_swap_ab=False),
+            locality_counter0_tensor=None,
+            locality_counter1_tensor=None,
+            name="WorkQueue",
+        )
+    else:
+        work_queue = _work_queue()
     work_throttle = _res("WorkThrottle")
     pdl_wait = PdlWaitBarrier(name="PdlWait")
     pdl_launch = PdlLaunchBarrier(name="PdlLaunch")
@@ -849,23 +1007,25 @@ def test_persistent_task_factories_build_captured_schedule_lists():
 
     assert len(tasks) == 17
     assert all(
-        task.head_schedule_list or task.loop_schedule_list or task.tail_schedule_list
-        for task in tasks
+        any(_steps(task, phase) for phase in ("head", "loop", "tail")) for task in tasks
     )
-    assert load_sfb.domain_start == 0
-    assert (id(pdl_wait), ScheduleStage.ConsumerWork, 0) in (
-        load_a.pre_work_loop_head_slots
+    assert [start for start, _, _ in _k_loops(load_sfb)] == [0]
+    assert _has_step(_steps(load_a, "pre"), pdl_wait, ScheduleStage.ConsumerWork)
+    assert _has_step(_steps(load_a, "post"), pdl_launch, ScheduleStage.ProducerWork)
+    expected_skip = (
+        LocalityBatchedGemmWorkQueue.should_skip_work_tile
+        if localized
+        else BatchedGemmWorkQueue.should_skip_work_tile
     )
-    assert (id(pdl_launch), ScheduleStage.ProducerWork, 0) in (
-        load_a.post_work_loop_tail_slots
-    )
-    assert all(
-        task.skip_if is BatchedGemmWorkQueue.should_skip_work_tile for task in tasks
-    )
-    assert load_a.skippable_head_slots
-    assert any(slot[0] == id(work_throttle) for slot in workid.skippable_tail_slots)
-    assert (id(work_queue), ScheduleStage.ConsumerWork, 0) not in (
-        load_a.skippable_tail_slots
+    skip_predicates = [_skip_predicates(task) for task in tasks]
+    assert all(len(predicates) == 1 for predicates in skip_predicates)
+    assert all(predicates[0] is expected_skip for predicates in skip_predicates)
+    assert _steps(load_a, "head", skippable=True)
+    assert _steps(workid, "tail", resources=[work_throttle], skippable=True)
+    assert not _has_step(
+        _steps(load_a, "tail", skippable=True),
+        work_queue,
+        ScheduleStage.ConsumerWork,
     )
 
 
@@ -881,9 +1041,8 @@ def test_persistent_task_factories_omit_skip_when_early_exit_disabled():
         num_k_tiles=5,
     )
 
-    assert load_a.skip_if is None
-    assert load_a.skippable_head_slots == frozenset()
-    assert load_a.skippable_tail_slots == frozenset()
+    assert _skip_predicates(load_a) == [None]
+    assert not _steps(load_a, skippable=True)
 
 
 @pytest.mark.cpu_only
@@ -899,8 +1058,7 @@ def test_mma_u2_uses_compiler_unroll_with_scalar_domain_step():
         num_k_tiles=12,
     )
 
-    assert mma.step == 1
-    assert mma.unroll == 2
+    assert _k_loops(mma) == [(1, 1, 2)]
 
 
 @pytest.mark.cpu_only
@@ -976,13 +1134,10 @@ def test_load_a_try_acquire_is_per_k_tile():
     )
 
     assert all(
-        stage != ScheduleStage.ProducerTryAcquire
-        for _, stage, *_ in load_a.head_schedule_list
+        step.schedule_stage != ScheduleStage.ProducerTryAcquire
+        for step in _steps(load_a, "head")
     )
-    assert any(
-        resource is smem_a and stage == ScheduleStage.ProducerTryAcquire
-        for resource, stage, *_ in load_a.loop_schedule_list
-    )
+    assert _has_step(_steps(load_a, "loop"), smem_a, ScheduleStage.ProducerTryAcquire)
 
 
 @pytest.mark.cpu_only
@@ -999,15 +1154,9 @@ def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook():
     )
 
     assert any(
-        resource is smem_sfa and stage == ScheduleStage.ProducerAuxWork
-        for resource, stage, *_ in load_sfa.loop_schedule_list
-    )
-    assert any(
-        resource is smem_sfa
-        and stage == ScheduleStage.ProducerAuxWork
-        and entry[-1] == "drain_loop"
-        for entry in load_sfa.loop_schedule_list
-        for resource, stage, *_ in [entry]
+        step.schedule_stage == ScheduleStage.ProducerAuxWork
+        and step.label == "drain_loop"
+        for step in _steps(load_sfa, "loop", resources=[smem_sfa])
     )
 
 
@@ -1173,7 +1322,9 @@ def test_fused_operand_sf_schedule_matches_high_throughput_warp_layout():
         _res("GmemSfB"),
         _res(
             "SmemSfB",
-            pipeline_config=SimpleNamespace(advance_on_acquire=True),
+            pipeline_config=SimpleNamespace(
+                advance_on_acquire=True, advance_on_wait=False
+            ),
             producer_commit_prefetch_depth=2,
         ),
         work_queue,
@@ -1221,8 +1372,15 @@ def test_fused_sf_copy_reserves_tmem_after_accumulator():
 def test_ts_async_umma_commit_uses_2sm_cluster_arrive():
     source = inspect.getsource(ts_pipeline.TSPipelineAsyncUmma.producer_commit)
 
-    assert "0xFEFFFFFF" in source
-    assert source.count("mbarrier.arrive.shared::cluster.b64") == 1
+    # 2-CTA UMMA producers arrive on the pair leader (even cluster rank).
+    # Older wheels clear the rank's low bit in the shared::cluster address
+    # with inline PTX; newer ones arrive on the leader rank through ``mapa``.
+    if "0xFEFFFFFF" in source:
+        assert source.count("mbarrier.arrive.shared::cluster.b64") == 1
+    else:
+        assert "CtaGroup.TWO" in source
+        assert "& cutlass.Int32(-2)" in source
+        assert "sync_object_full.arrive(state.index, leader_rank" in source
 
 
 @pytest.mark.cpu_only
@@ -1244,6 +1402,11 @@ def test_ldgsts_sf_wait_group_depth_matches_generated_throttle():
         name="SmemSfB",
     )
     assert res.cp_async_wait_group_depth == 2
+    assert [res._tail_cp_async_wait_group_depth(idx) for idx in range(3)] == [
+        2,
+        1,
+        0,
+    ]
 
     two_stage_cfg = make_config(
         umma_cta_count=2,
@@ -1292,36 +1455,19 @@ def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
     )
 
     head_stages = [
-        stage
-        for resource, stage, *_ in load_sfb.head_schedule_list
-        if resource is smem_sfb
+        step.schedule_stage for step in _steps(load_sfb, "head", resources=[smem_sfb])
     ]
-    loop_stages = [
-        stage
-        for resource, stage, *_ in load_sfb.loop_schedule_list
-        if resource is smem_sfb
-    ]
-    tail_stages = [
-        stage
-        for resource, stage, *_ in load_sfb.tail_schedule_list
-        if resource is smem_sfb
-    ]
+    loop_steps = _steps(load_sfb, "loop", resources=[smem_sfb])
+    tail_steps = _steps(load_sfb, "tail", resources=[smem_sfb])
 
     assert head_stages.count(ScheduleStage.ProducerWork) == 3
     assert ScheduleStage.ProducerCommit not in head_stages
-    loop_entries = [
-        entry for entry in load_sfb.loop_schedule_list if entry[0] is smem_sfb
-    ]
-    tail_entries = [
-        entry for entry in load_sfb.tail_schedule_list if entry[0] is smem_sfb
-    ]
-
-    assert loop_stages[:2] == [
+    assert [step.schedule_stage for step in loop_steps[:2]] == [
         ScheduleStage.ProducerWork,
         ScheduleStage.ProducerCommit,
     ]
-    assert loop_entries[0][-1] == "drain_loop"
-    assert tail_stages == [
+    assert loop_steps[0].label == "drain_loop"
+    assert [step.schedule_stage for step in tail_steps] == [
         ScheduleStage.ProducerWork,
         ScheduleStage.ProducerCommit,
         ScheduleStage.ProducerWork,
@@ -1329,15 +1475,19 @@ def test_ldgsts_sfb_advance_on_acquire_prefetches_head_and_drains_tail():
         ScheduleStage.ProducerWork,
         ScheduleStage.ProducerCommit,
     ]
-    assert [entry[-1] for entry in tail_entries[::2]] == ["drain_tail"] * 3
-    assert [entry[2] for entry in tail_entries[::2]] == [0, 1, 2]
+    assert [step.label for step in tail_steps[::2]] == ["drain_tail"] * 3
+    assert [step.prefetch_idx for step in tail_steps[::2]] == [
+        0,
+        1,
+        2,
+    ]
 
 
 @pytest.mark.cpu_only
 def test_ldgsts_sfa_prefetch_drains_tail_with_prefetch_ordinals():
     smem_sfa = _res(
         "SmemSfA",
-        pipeline_config=SimpleNamespace(advance_on_acquire=True),
+        pipeline_config=SimpleNamespace(advance_on_acquire=True, advance_on_wait=False),
         producer_commit_prefetch_depth=3,
     )
     load_sfa = create_load_sfa_task(
@@ -1348,12 +1498,14 @@ def test_ldgsts_sfa_prefetch_drains_tail_with_prefetch_ordinals():
         num_k_tiles=8,
     )
 
-    tail_entries = [
-        entry for entry in load_sfa.tail_schedule_list if entry[0] is smem_sfa
-    ]
+    tail_steps = _steps(load_sfa, "tail", resources=[smem_sfa])
 
-    assert [entry[-1] for entry in tail_entries[::2]] == ["drain_tail"] * 3
-    assert [entry[2] for entry in tail_entries[::2]] == [0, 1, 2]
+    assert [step.label for step in tail_steps[::2]] == ["drain_tail"] * 3
+    assert [step.prefetch_idx for step in tail_steps[::2]] == [
+        0,
+        1,
+        2,
+    ]
 
 
 @pytest.mark.cpu_only
@@ -1415,53 +1567,45 @@ def test_combined_tmem_sfab_delays_commit_and_smem_release():
         num_k_tiles=4,
     )
 
-    head_entries = [
-        entry
-        for entry in copy_sfab.head_schedule_list
-        if entry[0] in {smem_sfa, smem_sfb, tmem_sfab}
-        and entry[1] != ScheduleStage.ConsumerAuxWork
-        and entry[1] != ScheduleStage.ProducerAuxWork
-    ]
-    loop_entries = [
-        entry
-        for entry in copy_sfab.loop_schedule_list
-        if entry[0] in {smem_sfa, smem_sfb, tmem_sfab}
-        and entry[1] != ScheduleStage.ConsumerAuxWork
-        and entry[1] != ScheduleStage.ProducerAuxWork
-    ]
-    tail_entries = [
-        entry
-        for entry in copy_sfab.tail_schedule_list
-        if entry[0] in {smem_sfa, smem_sfb, tmem_sfab}
-        and entry[1] != ScheduleStage.ConsumerAuxWork
-        and entry[1] != ScheduleStage.ProducerAuxWork
-    ]
+    def non_aux_stages(phase):
+        return [
+            step.schedule_stage
+            for step in _steps(
+                copy_sfab, phase, resources=[smem_sfa, smem_sfb, tmem_sfab]
+            )
+            if step.schedule_stage
+            not in (ScheduleStage.ConsumerAuxWork, ScheduleStage.ProducerAuxWork)
+        ]
 
-    assert (tmem_sfab, ScheduleStage.ProducerCommit) not in [
-        (entry[0], entry[1]) for entry in head_entries
-    ]
-    assert [entry[1] for entry in head_entries[:4]] == [
+    head_stages = non_aux_stages("head")
+    loop_stages = non_aux_stages("loop")
+    tail_stages = non_aux_stages("tail")
+
+    assert not _has_step(
+        _steps(copy_sfab, "head"), tmem_sfab, ScheduleStage.ProducerCommit
+    )
+    assert head_stages[:4] == [
         ScheduleStage.ConsumerTryWait,
         ScheduleStage.ConsumerTryWait,
         ScheduleStage.ConsumerWait,
         ScheduleStage.ConsumerWait,
     ]
-    assert [entry[1] for entry in head_entries[-2:]] == [
+    assert head_stages[-2:] == [
         ScheduleStage.ProducerAcquire,
         ScheduleStage.ProducerWork,
     ]
-    assert [entry[1] for entry in loop_entries[:3]] == [
+    assert loop_stages[:3] == [
         ScheduleStage.ProducerCommit,
         ScheduleStage.ConsumerRelease,
         ScheduleStage.ConsumerRelease,
     ]
-    assert [entry[1] for entry in loop_entries[3:7]] == [
+    assert loop_stages[3:7] == [
         ScheduleStage.ConsumerTryWait,
         ScheduleStage.ConsumerTryWait,
         ScheduleStage.ConsumerWait,
         ScheduleStage.ConsumerWait,
     ]
-    assert [entry[1] for entry in tail_entries] == [
+    assert tail_stages == [
         ScheduleStage.ProducerCommit,
         ScheduleStage.ConsumerRelease,
         ScheduleStage.ConsumerRelease,

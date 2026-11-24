@@ -1188,6 +1188,8 @@ def _staged_routing_args(
             activation,
             norm_topk_prob,
             replay,
+            None,
+            None,
         )
     elif precision == "fp8":
         args = (
@@ -1205,6 +1207,8 @@ def _staged_routing_args(
             activation,
             norm_topk_prob,
             replay,
+            None,
+            None,
         )
     elif precision == "nvfp4":
         args = (
@@ -1224,6 +1228,8 @@ def _staged_routing_args(
             activation,
             norm_topk_prob,
             replay,
+            None,
+            None,
         )
     elif precision == "mxfp8":
         args = (
@@ -1241,6 +1247,8 @@ def _staged_routing_args(
             int(inner.fp8_quantization_type),
             norm_topk_prob,
             replay,
+            None,
+            None,
         )
     else:
         raise KeyError(precision)

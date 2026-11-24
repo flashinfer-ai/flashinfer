@@ -307,6 +307,71 @@ class MoePartitionResources:
             yield
 
 
+@dataclass(eq=False)
+class MoeLocalizedKernelResources:
+    """Locality pools and counters for single-kernel partition execution.
+
+    Routing zeroes the counters before FC1 may claim work. Eager launches are
+    ordered across caller streams: moving to a new stream makes it wait for the
+    previous one. A handle may also back any number of non-concurrent graph
+    captures. Concurrent use, including concurrent graph replays, requires
+    distinct handles.
+    """
+
+    device: torch.device | str | int | None = None
+    _launch_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
+    _bound_stream: torch.Stream | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    pools: Any = field(init=False, repr=False, compare=False)
+    domain_sm_counts: tuple[int, int] = field(init=False)
+    counters: tuple[torch.Tensor, torch.Tensor] = field(
+        init=False, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        from flashinfer.locality_domain import get_locality_domain_pools
+        from flashinfer.prims_ts.batched_gemm.locality_requirements import (
+            locality_domain_register_unsupported_reason,
+        )
+
+        reason = locality_domain_register_unsupported_reason(self.device)
+        if reason is not None:
+            raise RuntimeError(reason)
+        self.pools = get_locality_domain_pools(self.device)
+        self.device = self.pools.device
+        self.domain_sm_counts = self.pools.sm_counts
+        self.counters = (
+            self.pools.empty(0, (64,), torch.int32),
+            self.pools.empty(1, (64,), torch.int32),
+        )
+
+    @contextlib.contextmanager
+    def launch_guard(self, stream: torch.Stream):
+        """Serialize enqueue and order eager launches using the shared counters.
+
+        Routing zeroes and the GEMMs claim from the same counters, so two
+        launches using this handle must never overlap on the GPU.
+        """
+        with self._launch_lock:
+            if torch.device(stream.device) != self.device:
+                raise ValueError(
+                    f"caller stream must be on {self.device}, got {stream.device}"
+                )
+            if not torch.cuda.is_current_stream_capturing():
+                if self._bound_stream is not None and int(
+                    self._bound_stream.cuda_stream
+                ) != int(stream.cuda_stream):
+                    stream.wait_stream(self._bound_stream)
+                self._bound_stream = stream
+            yield
+
+
+MoePartitionHandle = MoePartitionResources | MoeLocalizedKernelResources
+
+
 class CudaForkJoin:
     """Reusable two-stream CUDA fork/join events.
 
@@ -785,7 +850,7 @@ def shard_prepared_moe_weights(
 
 
 def validate_partition_shape(
-    resources: MoePartitionResources,
+    resources: MoePartitionHandle,
     *,
     strategy: PartitionStrategy,
     fc1_weights: Sequence[torch.Tensor],
@@ -864,9 +929,12 @@ def validate_partition_shape(
             f"FC2 output rows must be {partition_alignment_elements}-element aligned"
         )
 
-    stream_device = torch.device(resources.streams[0].device)
-    if torch.device(resources.streams[1].device) != stream_device:
-        raise ValueError("Partition streams must be on the same device")
+    if isinstance(resources, MoeLocalizedKernelResources):
+        stream_device = torch.device(resources.device)
+    else:
+        stream_device = torch.device(resources.streams[0].device)
+        if torch.device(resources.streams[1].device) != stream_device:
+            raise ValueError("Partition streams must be on the same device")
     for partition_id in range(_PARTITION_COUNT):
         fc1_rows, fc2_rows, fc2_k = _partition_geometry(
             strategy,

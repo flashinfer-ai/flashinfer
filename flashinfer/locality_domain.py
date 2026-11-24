@@ -43,6 +43,41 @@ class _DomainPools:
     allocators: tuple[Any, Any]
 
 
+@dataclass(frozen=True, eq=False)
+class LocalityDomainPools:
+    """Locality-domain memory pools without green-context compute streams."""
+
+    device: torch.device
+    domain_count: int
+    sm_counts: tuple[int, int]
+    pools: tuple[Any, Any]
+    _module: Any = field(repr=False, compare=False)
+    _allocators: tuple[Any, Any] = field(repr=False, compare=False)
+
+    def empty(
+        self,
+        domain: int,
+        shape: Sequence[int],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if domain not in range(_DOMAIN_COUNT):
+            raise ValueError(f"locality domain must be 0 or 1, got {domain}")
+        try:
+            with _use_mem_pool()(self.pools[domain], device=self.device):
+                return torch.empty(tuple(shape), dtype=dtype, device=self.device)
+        except torch.OutOfMemoryError as exc:
+            detail = str(self._module.last_error())
+            suffix = f": {detail}" if detail else ""
+            raise LocalityDomainError(
+                f"allocation in CUDA locality domain {domain} failed{suffix}"
+            ) from exc
+
+    def pointer_domain(self, tensor: torch.Tensor) -> int:
+        if tensor.device != self.device:
+            raise ValueError(f"tensor must be on {self.device}, got {tensor.device}")
+        return int(self._module.pointer_domain(tensor.data_ptr()))
+
+
 @dataclass(frozen=True)
 class _LocalizedStreams:
     streams: tuple[torch.cuda.ExternalStream, torch.cuda.ExternalStream]
@@ -374,6 +409,57 @@ def get_localized_domains(
     return _get_localized_domains(resolved.index, split)
 
 
+@functools.cache
+def _get_locality_domain_pools(device_index: int) -> LocalityDomainPools:
+    module, _ = _load_locality_module(device_index)
+    domain_count = int(module.domain_count(device_index))
+    if domain_count < _DOMAIN_COUNT:
+        raise LocalityDomainError(
+            f"device {device_index} exposes only {domain_count} locality domains"
+        )
+    try:
+        sm_counts = tuple(int(v) for v in module.domain_sm_counts(device_index))
+    except Exception as exc:
+        raise LocalityDomainError(
+            f"failed to query locality-domain SM counts: {exc}"
+        ) from exc
+    if len(sm_counts) != _DOMAIN_COUNT:
+        raise LocalityDomainError(
+            "locality-domain SM count query returned invalid data"
+        )
+    pools = _domain_pools(device_index)
+    return LocalityDomainPools(
+        device=torch.device("cuda", device_index),
+        domain_count=domain_count,
+        sm_counts=cast(tuple[int, int], sm_counts),
+        pools=pools.pools,
+        _module=module,
+        _allocators=pools.allocators,
+    )
+
+
+def get_locality_domain_pools(
+    device: torch.device | str | int | None = None,
+) -> LocalityDomainPools:
+    """Return process-lifetime locality-domain pools without creating streams."""
+    resolved = _normalize_device(device)
+    assert resolved.index is not None
+    return _get_locality_domain_pools(resolved.index)
+
+
+def locality_domain_count(
+    device: torch.device | str | int | None = None,
+) -> int:
+    """Return the number of locality domains exposed by a CUDA device."""
+    resolved = _normalize_device(device)
+    assert resolved.index is not None
+    module, _ = _load_locality_module(resolved.index)
+    count = int(module.domain_count(resolved.index))
+    if count < 0:
+        raise LocalityDomainError("failed to query CUDA locality-domain count")
+    return count
+
+
 def locality_domain_unsupported_reason(
     device: torch.device | str | int | None = None,
     *,
@@ -390,8 +476,11 @@ def locality_domain_unsupported_reason(
 
 __all__ = [
     "LocalizedDomains",
+    "LocalityDomainPools",
     "LocalityDomainError",
     "SmSplit",
     "get_localized_domains",
+    "get_locality_domain_pools",
+    "locality_domain_count",
     "locality_domain_unsupported_reason",
 ]

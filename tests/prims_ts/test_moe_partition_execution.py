@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 import pytest
@@ -32,7 +32,10 @@ from flashinfer.fused_moe import (
     prims_ts_fp8_per_tensor_scale_moe_partitioned,
 )
 from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+from flashinfer.prims_ts.batched_gemm.config_types import LocalitySideSource
 from flashinfer.prims_ts.moe.partition import (
+    MoeLocalizedKernelResources,
+    MoePartitionHandle,
     MoePartitionResources,
     MoeShardedWeights,
     PreparedWeightLayout,
@@ -135,10 +138,11 @@ class _Workload:
     def partition(
         self,
         strategy: str,
-        streams: tuple[torch.Stream, torch.Stream],
+        streams: tuple[torch.Stream, torch.Stream] | None,
         alloc: Callable[[int, tuple[int, ...], torch.dtype], torch.Tensor]
         | None = None,
-    ) -> tuple[MoePartitionResources, str, MoeShardedWeights]:
+        resources: MoePartitionHandle | None = None,
+    ) -> tuple[MoePartitionHandle, str, MoeShardedWeights]:
         shards = shard_prepared_moe_weights(
             self.kwargs["gemm1_weights"],
             self.kwargs["gemm2_weights"],
@@ -151,7 +155,10 @@ class _Workload:
             fc2_scale=self.fc2_scale,
             alloc=alloc,
         )
-        return MoePartitionResources(streams=streams), strategy, shards
+        if resources is None:
+            assert streams is not None
+            resources = MoePartitionResources(streams=streams)
+        return resources, strategy, shards
 
 
 def _require_prims_ts(kind: str) -> None:
@@ -197,6 +204,28 @@ def _localized_partition_setup() -> tuple[
         pytest.skip(f"locality domains are unavailable: {reason}")
     domains = get_localized_domains(_DEVICE)
     return domains.streams, domains.empty, (domains,), domains.pointer_domain
+
+
+def _single_kernel_partition_setup() -> tuple[
+    MoeLocalizedKernelResources,
+    Callable[[int, tuple[int, ...], torch.dtype], torch.Tensor],
+    tuple[Any, ...],
+    Callable[[torch.Tensor], int],
+]:
+    from flashinfer.prims_ts.batched_gemm.locality_requirements import (
+        locality_domain_register_unsupported_reason,
+    )
+
+    reason = locality_domain_register_unsupported_reason(_DEVICE)
+    if reason is not None:
+        pytest.skip(reason)
+    resources = MoeLocalizedKernelResources(_DEVICE)
+    return (
+        resources,
+        resources.pools.empty,
+        (resources,),
+        resources.pools.pointer_domain,
+    )
 
 
 def _quantized_inputs(
@@ -815,13 +844,38 @@ def test_partitioned_call_rejects_non_sm107() -> None:
         )
 
 
+def test_single_kernel_launch_guard_orders_stream_switch() -> None:
+    resources, _, keepalive, _ = _single_kernel_partition_setup()
+    assert keepalive
+    first = torch.cuda.Stream(_DEVICE)
+    second = torch.cuda.Stream(_DEVICE)
+    with resources.launch_guard(first), torch.cuda.stream(first):
+        torch.cuda._sleep(1 << 30)
+    with resources.launch_guard(second):
+        switched = torch.cuda.Event()
+        switched.record(second)
+
+    assert not switched.query()
+    switched.synchronize()
+    assert first.query()
+
+
 @pytest.mark.parametrize("case", _EXECUTION_CASES)
-def test_partitioned_execution_matches_unpartitioned(case: _ExecutionCase) -> None:
+@pytest.mark.parametrize("execution", ("streams", "single_kernel"))
+def test_partitioned_execution_matches_unpartitioned(
+    case: _ExecutionCase, execution: str
+) -> None:
     workload = _prepare_workload(case.kind, case.num_tokens)
     workload.kwargs["enable_pdl"] = case.enable_pdl
-    streams, green_resources = _green_partition_streams()
-    assert green_resources  # Keep resources alive through execution.
-    partition = workload.partition(case.strategy, streams)
+    if execution == "single_kernel":
+        resources, alloc, keepalive, _ = _single_kernel_partition_setup()
+        partition = workload.partition(
+            case.strategy, None, alloc=alloc, resources=resources
+        )
+    else:
+        streams, keepalive = _green_partition_streams()
+        partition = workload.partition(case.strategy, streams)
+    assert keepalive
 
     with autotune(False):
         expected_result = workload.run(partition=None, do_finalize=case.do_finalize)
@@ -830,6 +884,9 @@ def test_partitioned_execution_matches_unpartitioned(case: _ExecutionCase) -> No
         expected_expert_weights = (
             expected_tensors[1].clone() if len(expected_tensors) >= 3 else None
         )
+        if execution == "single_kernel":
+            for counter_buffer in resources.counters:
+                counter_buffer.fill_(0x7FFFFFFF)
         actual_result = workload.run(partition=partition, do_finalize=case.do_finalize)
         actual_tensors = _result_tensors(actual_result)
         actual = _comparison_output(actual_tensors, case.num_tokens).clone()
@@ -844,6 +901,52 @@ def test_partitioned_execution_matches_unpartitioned(case: _ExecutionCase) -> No
         assert torch.equal(actual, expected)
     else:
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_single_kernel_forced_steal_matches_unpartitioned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flashinfer.prims_ts.moe import runner as runner_module
+
+    original = runner_module.with_locality_overrides
+
+    def force_side_zero(pair, *, split_fc2_activations):
+        localized = original(pair, split_fc2_activations=split_fc2_activations)
+
+        def update(gemm):
+            return replace(
+                gemm,
+                cfg=replace(
+                    gemm.cfg,
+                    kwargs={
+                        **gemm.cfg.kwargs,
+                        "locality_side_source": int(LocalitySideSource.ZERO),
+                    },
+                ),
+            )
+
+        return replace(
+            localized,
+            fc1=update(localized.fc1),
+            fc2=update(localized.fc2),
+        )
+
+    monkeypatch.setattr(runner_module, "with_locality_overrides", force_side_zero)
+    workload = _prepare_workload("bf16", 7)
+    workload.kwargs["enable_pdl"] = True
+    resources, alloc, keepalive, _ = _single_kernel_partition_setup()
+    partition = workload.partition("tp_n_tp_n", None, alloc=alloc, resources=resources)
+    assert keepalive
+
+    with autotune(False):
+        expected = _comparison_output(
+            _result_tensors(workload.run(partition=None, do_finalize=True)), 7
+        ).clone()
+        actual = _comparison_output(
+            _result_tensors(workload.run(partition=partition, do_finalize=True)), 7
+        ).clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize(
@@ -1018,40 +1121,113 @@ def test_partitioned_execution_with_localized_weights(kind: str, strategy: str) 
 
 
 @pytest.mark.parametrize(
-    ("strategy", "localized", "enable_pdl"),
+    ("strategy", "localized", "enable_pdl", "execution"),
     (
-        pytest.param("tp_n_tp_n", False, False, id="green-nn-no-pdl"),
-        pytest.param("tp_n_tp_k", False, False, id="green-nk-no-pdl"),
-        pytest.param("tp_n_tp_k", False, True, id="green-nk-pdl"),
-        pytest.param("tp_n_tp_n", True, True, id="localized-nn-pdl"),
+        pytest.param("tp_n_tp_n", False, False, "streams", id="green-nn-no-pdl"),
+        pytest.param("tp_n_tp_k", False, False, "streams", id="green-nk-no-pdl"),
+        pytest.param("tp_n_tp_k", False, True, "streams", id="green-nk-pdl"),
+        pytest.param("tp_n_tp_n", True, True, "streams", id="localized-nn-pdl"),
+        pytest.param(
+            "tp_n_tp_n", True, True, "single_kernel", id="single-kernel-nn-pdl"
+        ),
+        pytest.param(
+            "tp_n_tp_k", True, True, "single_kernel", id="single-kernel-nk-pdl"
+        ),
     ),
 )
 def test_partitioned_cuda_graph_replay_observes_changed_routing(
-    strategy: str, localized: bool, enable_pdl: bool
+    strategy: str, localized: bool, enable_pdl: bool, execution: str
 ) -> None:
     workload = _prepare_workload("bf16", 7)
     workload.kwargs["enable_pdl"] = enable_pdl
-    if localized:
+    if execution == "single_kernel":
+        localized_resources, alloc, keepalive, _ = _single_kernel_partition_setup()
+        streams = None
+    elif localized:
         streams, alloc, keepalive, _ = _localized_partition_setup()
+        localized_resources = None
     else:
         streams, green_resources = _green_partition_streams()
         alloc = None
         keepalive = green_resources
+        localized_resources = None
     assert keepalive  # Keep contexts and pools alive through graph replay.
-    partition = workload.partition(strategy, streams, alloc=alloc)
+    partition = workload.partition(
+        strategy, streams, alloc=alloc, resources=localized_resources
+    )
     partition_resources = partition[0]
-    fork_join = partition_resources.fork_join
+    fork_join = getattr(partition_resources, "fork_join", None)
     graph_output = torch.empty((7, _HIDDEN_SIZE), dtype=torch.bfloat16, device=_DEVICE)
     expected_output = torch.empty_like(graph_output)
 
     with autotune(False):
         workload.run(partition=partition, do_finalize=True, output=graph_output)
         torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
+        inspect_graph = False
+        if execution == "single_kernel":
+            try:
+                graph = torch.cuda.CUDAGraph(keep_graph=True)
+                inspect_graph = hasattr(graph, "raw_cuda_graph")
+            except TypeError:
+                graph = torch.cuda.CUDAGraph()
+        else:
+            graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = workload.run(
                 partition=partition, do_finalize=True, output=graph_output
             )
+        if inspect_graph:
+            driver = pytest.importorskip("cuda.bindings.driver")
+            raw = driver.CUgraph(graph.raw_cuda_graph())
+            _, _, count = driver.cuGraphGetNodes(raw)
+            _, nodes, count = driver.cuGraphGetNodes(raw, count)
+            names = []
+            node_types = []
+            named_nodes = {}
+            for node in nodes[:count]:
+                _, kind = driver.cuGraphNodeGetType(node)
+                node_types.append(kind)
+                if kind != driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+                    continue
+                _, params = driver.cuGraphKernelNodeGetParams(node)
+                _, name = driver.cuFuncGetName(params.func)
+                decoded = name.decode()
+                names.append(decoded)
+                named_nodes[int(node)] = decoded
+            assert driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_MEMSET not in node_types
+            assert not any("reset_locality" in name for name in names)
+            routing_nodes = {
+                node for node, name in named_nodes.items() if "routing" in name.lower()
+            }
+            assert routing_nodes
+            gemm_nodes = [
+                node
+                for node, name in named_nodes.items()
+                if "batched_gemm_kernel_bf16" in name
+            ]
+            assert len(gemm_nodes) == 2
+
+            get_edges = (
+                getattr(driver, "cuGraphGetEdges_v2", None) or driver.cuGraphGetEdges
+            )
+            *_, edge_count = get_edges(raw, 0)
+            edge_result = get_edges(raw, edge_count)
+            sources, targets, edge_count = (
+                edge_result[1],
+                edge_result[2],
+                edge_result[-1],
+            )
+            edges = {
+                (int(source), int(target))
+                for source, target in zip(
+                    sources[:edge_count], targets[:edge_count], strict=True
+                )
+            }
+            first, second = gemm_nodes
+            if (second, first) in edges:
+                first, second = second, first
+            assert (first, second) in edges
+            assert any((routing, first) in edges for routing in routing_nodes)
 
         workload.routing_logits.copy_(torch.flip(workload.routing_logits, dims=(1,)))
         expected = workload.run(
@@ -1060,7 +1236,10 @@ def test_partitioned_cuda_graph_replay_observes_changed_routing(
         if strategy == "tp_n_tp_k":
             different_shape = _prepare_workload("bf16", 11)
             different_partition = different_shape.partition(
-                strategy, streams, alloc=alloc
+                strategy,
+                streams,
+                alloc=alloc,
+                resources=localized_resources,
             )
             different_partition = (
                 partition_resources,
@@ -1072,7 +1251,7 @@ def test_partitioned_cuda_graph_replay_observes_changed_routing(
             )
         graph.replay()
     torch.cuda.synchronize()
-    assert partition_resources.fork_join is fork_join
+    assert getattr(partition_resources, "fork_join", None) is fork_join
 
     if strategy == "tp_n_tp_n":
         assert torch.equal(captured, expected)
@@ -1087,8 +1266,9 @@ def test_partitioned_cuda_graph_replay_observes_changed_routing(
         pytest.param("tp_n_tp_k", id="nk"),
     ),
 )
+@pytest.mark.parametrize("execution", ("streams", "single_kernel"))
 def test_partitioned_pdl_graph_replay_stress_changed_and_empty_local_routing(
-    strategy: str,
+    strategy: str, execution: str
 ) -> None:
     """Stress PDL graph replay while alternating local and remote-only routes."""
 
@@ -1101,9 +1281,13 @@ def test_partitioned_pdl_graph_replay_stress_changed_and_empty_local_routing(
             : workload.kwargs["local_num_experts"]
         ].contiguous()
 
-    streams, green_resources = _green_partition_streams()
-    assert green_resources  # Keep contexts alive through every replay.
-    partition = workload.partition(strategy, streams)
+    if execution == "single_kernel":
+        resources, alloc, keepalive, _ = _single_kernel_partition_setup()
+        partition = workload.partition(strategy, None, alloc=alloc, resources=resources)
+    else:
+        streams, keepalive = _green_partition_streams()
+        partition = workload.partition(strategy, streams)
+    assert keepalive
     graph_output = torch.empty(
         (num_tokens, _HIDDEN_SIZE), dtype=torch.bfloat16, device=_DEVICE
     )

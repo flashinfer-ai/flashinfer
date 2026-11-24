@@ -1325,6 +1325,33 @@ def _with_spec_overrides_pair(
     )
 
 
+def with_locality_overrides(
+    pair: PrimsTsGemmPair, *, split_fc2_activations: bool
+) -> PrimsTsGemmPair:
+    """Apply the scheduler settings required by single-kernel localization."""
+    from ..batched_gemm.config_types import LocalitySplit
+
+    pair = _with_spec_overrides_pair(
+        pair,
+        locality_split=int(LocalitySplit.WEIGHTS_OUTPUT),
+        use_clc_fast_drain=0,
+    )
+    if not split_fc2_activations:
+        return pair
+
+    fc2_kwargs = dict(pair.fc2.cfg.kwargs)
+    fc2_kwargs["locality_split"] = int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT)
+    return PrimsTsGemmPair(
+        tile_n=pair.tile_n,
+        moe_config_index=pair.moe_config_index,
+        fc1=pair.fc1,
+        fc2=PrimsTsMoeGemmConfig(
+            cfg=PrimsTsConfigSpec(kwargs=fc2_kwargs),
+            prims_ts_gemm_config_index=pair.fc2.prims_ts_gemm_config_index,
+        ),
+    )
+
+
 def _with_pdl_pair(pair: PrimsTsGemmPair, *, enable_pdl: bool) -> PrimsTsGemmPair:
     return PrimsTsGemmPair(
         tile_n=pair.tile_n,

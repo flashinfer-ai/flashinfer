@@ -151,7 +151,8 @@ class Runner {
            batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
            bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
            batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true,
-           int16_t* routing_replay_out = nullptr, bool enable_pdl = true);
+           int16_t* routing_replay_out = nullptr, bool enable_pdl = true,
+           int32_t* localityCounters0 = nullptr, int32_t* localityCounters1 = nullptr);
 
  private:
   friend class MoE::Runner;

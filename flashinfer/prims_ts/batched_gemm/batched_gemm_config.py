@@ -27,13 +27,10 @@ from cutlass.experimental import primitives as prims
 from flashinfer.tllm_enums import WeightLayout
 
 
-# `SmemSfLdgstsResource._tail_cp_async_wait_group` lowers the runtime
-# `cp.async.wait_group` drain for short K depths by hand-rolling one branch
-# per static `cp_async_wait_group_depth` value (depth 0/1/2).  Supporting
-# deeper prefetch windows would require either an exponentially larger
-# switch or a generic runtime helper, so cap the SFB LDGSTS
-# producer-commit prefetch window at this depth and reject anything
-# larger at resource construction time.
+# `SmemSfLdgstsResource.drain_loop` hand-rolls one `cp.async.wait_group`
+# branch per static `cp_async_wait_group_depth` value (depth 0/1/2), so cap
+# the SFB LDGSTS producer-commit prefetch window at this depth and reject
+# anything larger at resource construction time.
 MAX_PRODUCER_COMMIT_PREFETCH_DEPTH: int = 3
 
 
@@ -42,6 +39,8 @@ from .config_types import (
     RouteImpl,
     TileScheduler,
     CtaRasterOrder,
+    LocalitySplit,
+    LocalitySideSource,
     ActKind,
     BiasType,
     DType,
@@ -636,6 +635,20 @@ class BatchedGemmConfig:
 
     Needs a runtime ``num_non_exiting_ctas`` value; pairs with :attr:`use_pdl` and
     the required PDL wait before reading the active CTA count.
+    """
+
+    locality_split: int = int(LocalitySplit.OFF)
+    """Per-locality-domain operand split, as a :class:`LocalitySplit` value.
+
+    Locality scheduling always splits weights and outputs. The
+    ``WEIGHTS_ACTIVATIONS_OUTPUT`` mode also splits the activation operands.
+    """
+
+    locality_side_source: int = int(LocalitySideSource.DOMAIN)
+    """Source of the locality side used by the persistent scheduler.
+
+    ``DOMAIN`` is the production path. ``SMID_PARITY`` and ``ZERO`` are
+    deterministic test-only sources.
     """
 
     use_full_tmem_dealloc_barrier: int = 0
@@ -2165,6 +2178,16 @@ class BatchedGemmConfig:
         return self.tile_scheduler == int(TileScheduler.PERSISTENT)
 
     @property
+    def uses_locality_split(self) -> bool:
+        """Whether one launch schedules work for two locality domains."""
+        return self.locality_split != int(LocalitySplit.OFF)
+
+    @property
+    def splits_activation_operands(self) -> bool:
+        """Whether activation and activation-SF operands are split by side."""
+        return self.locality_split == int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT)
+
+    @property
     def raster_along_m(self) -> bool:
         """Whether the persistent CLC scheduler rasterizes along M."""
         return self.cta_raster_order == int(CtaRasterOrder.ALONG_M)
@@ -3180,6 +3203,41 @@ def validate_config(
         raise ValueError(
             f"tile_scheduler must be STATIC or PERSISTENT, got {cfg.tile_scheduler}"
         )
+
+    if cfg.locality_split not in (
+        int(LocalitySplit.OFF),
+        int(LocalitySplit.WEIGHTS_OUTPUT),
+        int(LocalitySplit.WEIGHTS_ACTIVATIONS_OUTPUT),
+    ):
+        raise ValueError(f"unsupported locality_split={cfg.locality_split}")
+    if cfg.locality_side_source not in (
+        int(LocalitySideSource.DOMAIN),
+        int(LocalitySideSource.SMID_PARITY),
+        int(LocalitySideSource.ZERO),
+    ):
+        raise ValueError(f"unsupported locality_side_source={cfg.locality_side_source}")
+    if cfg.uses_locality_split:
+        if not cfg.is_persistent:
+            raise ValueError("locality_split requires persistent scheduling")
+        if not cfg.is_swap_ab:
+            raise ValueError("locality_split requires the swap-A/B path")
+        if cfg.fallback_cluster_shape is not None:
+            raise ValueError("locality_split does not support flexible CGAs")
+        if cfg.use_clc_fast_drain:
+            raise ValueError("locality_split does not support CLC fast drain")
+        # Routing publishes both the active-CTA count and scheduler counters.
+        # Early-exit PDL ordering is the readiness contract for both values.
+        if not cfg.use_early_exit:
+            raise ValueError("locality_split requires early exit")
+        if cfg.splits_activation_operands:
+            if cfg.route_act != int(RouteImpl.NONE):
+                raise ValueError(
+                    "splitting activation operands requires route_act=NONE"
+                )
+            if cfg.sf_route != int(RouteImpl.NONE):
+                raise ValueError("splitting activation operands requires sf_route=NONE")
+        if cfg.use_deepseek_fp8:
+            raise ValueError("locality_split does not support DeepSeek FP8 scales")
 
     if cfg.cta_raster_order not in (
         int(CtaRasterOrder.ALONG_M),
@@ -4309,6 +4367,7 @@ def compute_launch_grid(
     problem_m: int,
     problem_n: int,
     early_exit_max_token_ctas: int,
+    num_persistent_clusters: int | None = None,
 ) -> tuple[int, int, int]:
     """Compute the CUDA grid used by the BatchedGemm host launcher."""
     num_tiles_m = (problem_m + cfg.tile_m - 1) // cfg.tile_m
@@ -4324,6 +4383,22 @@ def compute_launch_grid(
     cluster_m, cluster_n, _ = cfg.preferred_cluster_shape
     grid_m = ((launch_num_tiles_m + cluster_m - 1) // cluster_m) * cluster_m
     grid_n = ((launch_num_tiles_n + cluster_n - 1) // cluster_n) * cluster_n
+    if cfg.uses_locality_split:
+        if grid_m >= 2**16 or grid_n >= 2**16:
+            raise ValueError(
+                "locality_split packs M/N tile indices into 16 bits; "
+                f"rounded tile counts must be below 65536, got ({grid_m}, {grid_n})"
+            )
+        if num_persistent_clusters is None or num_persistent_clusters <= 0:
+            raise ValueError(
+                "locality_split requires a positive num_persistent_clusters"
+            )
+        clusters_per_side = grid_m * grid_n // (cluster_m * cluster_n)
+        return (
+            cluster_m,
+            cluster_n,
+            min(num_persistent_clusters, 2 * clusters_per_side),
+        )
     if cfg.is_persistent and not cfg.raster_along_m:
         return (
             cluster_m,
@@ -4339,6 +4414,7 @@ def validate_launch_grid(
     problem_m: int,
     problem_n: int,
     early_exit_max_token_ctas: int,
+    num_persistent_clusters: int | None = None,
 ) -> None:
     """Reject a BatchedGemm launch whose CUDA grid exceeds hardware limits."""
     grid = compute_launch_grid(
@@ -4346,6 +4422,7 @@ def validate_launch_grid(
         problem_m=problem_m,
         problem_n=problem_n,
         early_exit_max_token_ctas=early_exit_max_token_ctas,
+        num_persistent_clusters=num_persistent_clusters,
     )
     axis_names = ("x", "y", "z")
     for axis, value, limit in zip(axis_names, grid, CUDA_GRID_DIM_LIMITS, strict=True):

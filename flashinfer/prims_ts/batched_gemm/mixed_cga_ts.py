@@ -343,7 +343,7 @@ class CgaPipelineAsyncUmma(TSPipelineAsyncUmma):
     """Async-to-UMMA pipeline with an atom-relative UMMA release mask."""
 
     def producer_commit(self, state, *, loc=None, ip=None) -> None:
-        if (
+        if cutlass.const_expr(
             self.producer_op == pipeline.PipelineOp.AsyncThread
             and self.cta_group is cute.nvgpu.tcgen05.CtaGroup.TWO
         ):

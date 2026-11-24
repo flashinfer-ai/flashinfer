@@ -81,6 +81,26 @@ import torch
 import cutlass
 import cutlass.cute as cute
 
+
+@lru_cache(maxsize=None)
+def max_active_clusters(
+    device_index: int,
+    cluster_shape: tuple[int, int, int],
+) -> int:
+    """Return the cached active-cluster limit for one device and CGA shape."""
+    import cutlass.utils as cutlass_utils
+
+    cluster_size = math.prod(cluster_shape)
+    with torch.cuda.device(device_index):
+        result = int(cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size))
+    if result <= 0:
+        raise RuntimeError(
+            f"no active cluster supports cluster shape {cluster_shape} "
+            f"on CUDA device {device_index}"
+        )
+    return result
+
+
 from .batched_gemm_kernel import (
     build_batched_gemm_task_manager,
     gemm,
@@ -99,6 +119,7 @@ from .batched_gemm_config import (
     shuffled_matrix_row_indices,
     validate_launch_grid,
 )
+from .config_types import LocalitySideSource
 from .batched_gemm_quant import (
     kaiming_uniform_tensor as _kaiming_uniform_tensor,
     quantize_block_scaled as _quantize_block_scaled,
@@ -2087,6 +2108,7 @@ def reference_check(
     early_exit_max_token_ctas=0,
     token_capacity=None,
     input_device: str = "cuda",
+    num_persistent_clusters=None,
     **cfg_overrides,
 ):
     """Compile, launch the kernel, compare to a PyTorch reference.
@@ -2759,6 +2781,7 @@ def reference_check(
                 dtype=plain_output_dtype,
                 device=device,
             )
+            c_storage = c_torch
         sf_c_torch = torch.zeros((1,), dtype=torch.uint8, device=device)
     if cfg.has_bias_m:
         bias_logical_torch = (
@@ -3017,8 +3040,128 @@ def reference_check(
         "gemm1_clamp_limit_dp": gemm1_clamp_limit_dp,
         "shape": (M, N, K, L, total_tokens),
         "cfg": cfg,
+        "device": torch.cuda.current_device(),
         "launch_early_exit_max_token_ctas": launch_early_exit_max_token_ctas,
     }
+    locality_counters = None
+    side1_c_torch = None
+    side1_c_storage = None
+    side1_sf_c_torch = None
+    side1_output_scale = None
+    if cfg.uses_locality_split:
+        # Side 1 gets its own output buffer and weights whose output is a known
+        # multiple of side 0. Linear outputs negate the weights: -2x with
+        # doubled block scales, -1x for BF16. RELU2 is degree-2 homogeneous
+        # for positive scales, so it keeps the weights and doubles the block
+        # scales for 4x; that is the only non-gated activation the quantized
+        # output epilogues accept besides SILU, which has no such identity.
+        if cfg.has_bias_m:
+            raise ValueError("locality reference checks require an unbiased output")
+        if cfg.act_kind == int(ActKind.NONE):
+            side1_output_scale = -2.0 if cfg.has_scale_factor_a else -1.0
+        elif cfg.act_kind == int(ActKind.RELU2) and cfg.has_scale_factor_a:
+            side1_output_scale = 4.0
+        else:
+            raise ValueError(
+                "locality reference checks require a linear output, or RELU2 "
+                "with block-scaled weights"
+            )
+        if side1_output_scale > 0:
+            side1_kernel_a = kernel_a
+        elif cfg.dtype_a == int(DType.BF16):
+            side1_kernel_a = torch.neg(kernel_a)
+        elif _is_packed_e2m1_dtype(cfg.dtype_a):
+            side1_kernel_a = torch.bitwise_xor(kernel_a, 0x88)
+        elif cfg.dtype_a in (int(DType.MXE4M3), int(DType.E4M3)):
+            side1_kernel_a = torch.bitwise_xor(kernel_a, 0x80)
+        else:
+            raise ValueError(f"unsupported locality weight dtype {cfg.dtype_a}")
+        side1_sf_a = sf_a
+        if cfg.has_scale_factor_a:
+            sf_dtype = _sf_torch_dtype(cfg)
+            side1_sf_a = (
+                (sf_a.view(sf_dtype).float() * 2).to(sf_dtype).view(torch.uint8)
+            )
+        side1_kernel_b = (
+            kernel_b.clone() if cfg.splits_activation_operands else kernel_b
+        )
+        side1_c_storage = c_storage.clone()
+        if c_torch is not None:
+            side1_c_torch = side1_c_storage.as_strided(
+                c_torch.size(), c_torch.stride(), c_torch.storage_offset()
+            )
+        side1_sf_c_torch = sf_c_torch.clone()
+        locality_counters = torch.zeros(2, dtype=torch.int32, device=device)
+        if cfg.has_output_block_scaling or cfg.uses_fp8_output:
+            side1_c_dp = make_ptr(
+                c_dtype,
+                side1_c_storage[
+                    (
+                        c_partition_offset
+                        if cfg.uses_mxfp8_output_quant or cfg.uses_fp8_output
+                        else c_partition_offset // 2
+                    ) :
+                ].data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            )
+        else:
+            side1_c_dp = make_ptr(
+                _plain_output_cutlass_dtype(cfg),
+                side1_c_torch.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            )
+        ref_io.update(
+            side1_a_dp=make_ptr(
+                a_dtype,
+                side1_kernel_a.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            side1_b_dp=make_ptr(
+                b_dtype,
+                side1_kernel_b.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            side1_sfa_dp=make_ptr(
+                sf_ab_dtype,
+                side1_sf_a.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=32,
+            )
+            if cfg.has_scale_factor_a
+            else sfa_dp,
+            side1_sfb_dp=sfb_dp,
+            side1_c_dp=side1_c_dp,
+            side1_sf_c_dp=make_ptr(
+                sf_c_dtype,
+                side1_sf_c_torch.data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            side1_sf_c_m_offset=sf_c_m_offset,
+            locality_counter0_dp=make_ptr(
+                cutlass.Int32,
+                locality_counters[0:1].data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=4,
+            ),
+            locality_counter1_dp=make_ptr(
+                cutlass.Int32,
+                locality_counters[1:2].data_ptr(),
+                cutlass.AddressSpace.gmem,
+                assumed_align=4,
+            ),
+            num_persistent_clusters=(
+                max_active_clusters(
+                    torch.cuda.current_device(), cfg.preferred_cluster_shape
+                )
+                if num_persistent_clusters is None
+                else int(num_persistent_clusters)
+            ),
+        )
     print("Compiling kernel...")
     compiled_fn = _compile_for_launch(ref_io, stream)
     print("Launching kernel...")
@@ -3027,6 +3170,8 @@ def reference_check(
     outputs_deterministic = True
     scales_deterministic = True
     for _ in range(repeat_launches):
+        if locality_counters is not None:
+            locality_counters.zero_()
         compiled_fn(*_launch_arg_tuple(ref_io, stream))
         torch.cuda.synchronize()
         if repeat_launches > 1:
@@ -3095,33 +3240,34 @@ def reference_check(
                 "for both physical CGA shapes"
             )
         runtime_cga_shapes_ok = observed_both_shapes and has_multiwave_work
+    locality_sides_ok = True
     # Unload the per-check CUDA library at a deterministic point after the
     # launch is synchronized. Letting Python GC do this later can overlap
     # library unload with the next clustered persistent compile/launch.
     del compiled_fn
     gc.collect()
 
-    if cfg.has_output_block_scaling:
-        c_storage_offset = (
-            c_partition_offset
-            if cfg.uses_mxfp8_output_quant
-            else c_partition_offset // 2
-        )
-        if cfg.uses_mxfp8_output_quant:
-            c_logical = _dequantize_mxfp8_output(
-                c_storage[c_storage_offset:],
-                sf_c_torch,
-                output_m=logical_output_m,
-                n=logical_output_n,
-                is_swap_ab=cfg.is_swap_ab,
-                sf_layout_c=cfg.sf_layout_c,
-                pitch=c_pitch,
-                sf_c_m_offset=sf_c_m_offset,
+    def decode_output(storage, sf, plain):
+        if cfg.has_output_block_scaling:
+            storage_offset = (
+                c_partition_offset
+                if cfg.uses_mxfp8_output_quant
+                else c_partition_offset // 2
             )
-        else:
-            c_logical = _dequantize_fp4_output(
-                c_storage[c_storage_offset:],
-                sf_c_torch,
+            if cfg.uses_mxfp8_output_quant:
+                return _dequantize_mxfp8_output(
+                    storage[storage_offset:],
+                    sf,
+                    output_m=logical_output_m,
+                    n=logical_output_n,
+                    is_swap_ab=cfg.is_swap_ab,
+                    sf_layout_c=cfg.sf_layout_c,
+                    pitch=c_pitch,
+                    sf_c_m_offset=sf_c_m_offset,
+                )
+            return _dequantize_fp4_output(
+                storage[storage_offset:],
+                sf,
                 output_m=logical_output_m,
                 n=logical_output_n,
                 is_swap_ab=cfg.is_swap_ab,
@@ -3130,26 +3276,46 @@ def reference_check(
                 pitch=c_pitch,
                 sf_c_m_offset=sf_c_m_offset,
             )
-    elif cfg.has_deepseek_fp8_c_scale:
-        c_logical = _dequantize_dsfp8_output(
-            c_storage,
-            sf_c_torch,
-            output_m=logical_output_m,
-            n=logical_output_n,
-            is_swap_ab=cfg.is_swap_ab,
-            scale_stride=total_padded_tokens if cfg.is_swap_ab else None,
-            block=cfg.deepseek_fp8_block_size,
+        if cfg.has_deepseek_fp8_c_scale:
+            return _dequantize_dsfp8_output(
+                storage,
+                sf,
+                output_m=logical_output_m,
+                n=logical_output_n,
+                is_swap_ab=cfg.is_swap_ab,
+                scale_stride=total_padded_tokens if cfg.is_swap_ab else None,
+                block=cfg.deepseek_fp8_block_size,
+            )
+        if cfg.uses_fp8_output:
+            return _decode_fp8_output(
+                storage[c_partition_offset:],
+                output_m=logical_output_m,
+                n=logical_output_n,
+                is_swap_ab=cfg.is_swap_ab,
+                pitch=c_pitch,
+            )
+        return plain
+
+    c_logical = decode_output(c_storage, sf_c_torch, c_torch)
+    if side1_c_storage is not None:
+        assert side1_sf_c_torch is not None
+        side1_logical = decode_output(side1_c_storage, side1_sf_c_torch, side1_c_torch)
+        assert side1_output_scale is not None
+        finite = torch.isfinite(c_logical) & torch.isfinite(side1_logical)
+        same_mask = torch.equal(
+            torch.isfinite(c_logical), torch.isfinite(side1_logical)
         )
-    elif cfg.uses_fp8_output:
-        c_logical = _decode_fp8_output(
-            c_storage[c_partition_offset:],
-            output_m=logical_output_m,
-            n=logical_output_n,
-            is_swap_ab=cfg.is_swap_ab,
-            pitch=c_pitch,
+        locality_sides_ok = same_mask and torch.allclose(
+            side1_logical[finite],
+            side1_output_scale * c_logical[finite],
+            rtol=0.08 if (cfg.has_output_block_scaling or cfg.uses_fp8_output) else 0,
+            atol=0.25 if (cfg.has_output_block_scaling or cfg.uses_fp8_output) else 0,
         )
-    else:
-        c_logical = c_torch
+        if not locality_sides_ok:
+            print(
+                "FAIL: locality side-1 output does not match the expected "
+                f"{side1_output_scale:g}x side-0 output"
+            )
 
     print(f"Output shape: {c_logical.shape}")
     print(
@@ -3280,7 +3446,9 @@ def reference_check(
             reason="runtime CGA shape validation failed",
         )
 
-    if has_nan or has_inf:
+    # A side mismatch is reported after the reference is built, so the failure
+    # can say which side each element was computed from and stored to.
+    if locality_sides_ok and (has_nan or has_inf):
         print(f"FAIL: output has NaN={has_nan}, Inf={has_inf}")
         bad_mask = torch.isnan(c_active) | torch.isinf(c_active)
         bad_count = bad_mask.sum().item()
@@ -3709,6 +3877,29 @@ def reference_check(
         threshold = 0.75 + 0.35 * ref_max
     else:
         threshold = 0.75 + 0.05 * ref_max
+
+    if not locality_sides_ok:
+        ref_f = ref_active.float()
+
+        def _side_summary(output):
+            out_f = _active_routes(output).float()
+            unwritten = torch.isnan(out_f)
+            neg = ~unwritten & ((out_f + ref_f).abs() <= threshold)
+            pos = ~unwritten & ((out_f - ref_f).abs() <= threshold)
+            return (
+                f"written={int((~unwritten).sum())}/{out_f.numel()} "
+                f"+ref={int(pos.sum())} -ref={int(neg.sum())}"
+            )
+
+        print(f"Locality side 0: {_side_summary(c_logical)}")
+        print(f"Locality side 1: {_side_summary(side1_logical)}")
+        print(f"Locality counters after launch: {locality_counters.tolist()}")
+        return _return_diagnostics(
+            False,
+            nan_count=nan_count,
+            inf_count=inf_count,
+            reason="locality side-1 output does not match its own operands",
+        )
 
     if out_max == 0.0 and ref_max > 1e-5:
         print(
@@ -4540,6 +4731,16 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
         int(io.get("sf_c_m_offset", 0)),
+        io.get("side1_a_dp"),
+        io.get("side1_b_dp"),
+        io.get("side1_sfa_dp"),
+        io.get("side1_sfb_dp"),
+        io.get("side1_c_dp"),
+        io.get("side1_sf_c_dp"),
+        int(io.get("side1_sf_c_m_offset", 0)),
+        io.get("locality_counter0_dp"),
+        io.get("locality_counter1_dp"),
+        int(io.get("num_persistent_clusters", 0)),
         io["cfg"],
         stream,
     )
@@ -4570,6 +4771,7 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         problem_m=problem_m,
         problem_n=problem_n,
         early_exit_max_token_ctas=int(io["launch_early_exit_max_token_ctas"]),
+        num_persistent_clusters=io.get("num_persistent_clusters"),
     )
     return (
         io["a_dp"],
@@ -4597,6 +4799,16 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         io["launch_early_exit_max_token_ctas"],
         _c_row_stride(io),
         int(io.get("sf_c_m_offset", 0)),
+        io.get("side1_a_dp"),
+        io.get("side1_b_dp"),
+        io.get("side1_sfa_dp"),
+        io.get("side1_sfb_dp"),
+        io.get("side1_c_dp"),
+        io.get("side1_sf_c_dp"),
+        int(io.get("side1_sf_c_m_offset", 0)),
+        io.get("locality_counter0_dp"),
+        io.get("locality_counter1_dp"),
+        int(io.get("num_persistent_clusters", 0)),
         stream,
     )
 
@@ -4608,6 +4820,18 @@ def _compile_for_launch(io: dict, stream) -> object:
     :func:`benchmark`, and :func:`reference_check`.
     """
     from cutlass.cutlass_dsl import BaseDSL
+
+    cfg = io["cfg"]
+    if cfg.uses_locality_split and cfg.locality_side_source == int(
+        LocalitySideSource.DOMAIN
+    ):
+        from .locality_requirements import (
+            locality_domain_register_unsupported_reason,
+        )
+
+        reason = locality_domain_register_unsupported_reason(io.get("device"))
+        if reason is not None:
+            raise RuntimeError(reason)
 
     compile_entry = cute.compile
     if _generate_line_info_enabled():

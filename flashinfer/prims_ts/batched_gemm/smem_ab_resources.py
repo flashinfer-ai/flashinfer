@@ -107,6 +107,7 @@ class SmemAResource(MemoryResource):
     weight_tile_idx_view: Any = None
     weight_num_token_tiles_view: Any = None
     weight_l2_cache_hint: Any = None
+    side1_tma_a_desc: Any = None
     smem_buf: Any = None
     _alloc_a: Constexpr[Optional[SmemAllocation]] = None
     desc_a_mma_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -195,6 +196,11 @@ class SmemAResource(MemoryResource):
         stage_base = self.smem_buf.subview(
             self.cfg.num_bytes_a_per_stage * stage_info.stage_idx
         )
+        tma_a_desc = self.tma_a_desc
+        if cutlass.const_expr(self.cfg.uses_locality_split):
+            _, _, tile_side = stage_info.work_tile.tile_idx
+            if tile_side == Int32(1):
+                tma_a_desc = self.side1_tma_a_desc
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.uses_block_major_k_weight_a):
                 a_box_k = self.cfg.tile_k
@@ -215,7 +221,7 @@ class SmemAResource(MemoryResource):
                 for bi in cutlass.range_constexpr(self.cfg.tile_k // a_box_k):
                     self._tma_load(
                         stage_base.subview(bi * box_bytes),
-                        self.tma_a_desc,
+                        tma_a_desc,
                         self._coords_for_load(
                             coord_a_k + Int32(bi * a_box_k),
                             coord_a_mn,
@@ -227,7 +233,7 @@ class SmemAResource(MemoryResource):
             else:
                 self._tma_load(
                     stage_base,
-                    self.tma_a_desc,
+                    tma_a_desc,
                     self._coords_for_load(coord_a_k, coord_a_mn, coord_a_l, mn_limit),
                     stage_info.barrier,
                 )
@@ -381,6 +387,7 @@ class SmemBResource(MemoryResource):
 
     cfg: Constexpr[BatchedGemmConfig]
     tma_b_desc: Any = None
+    side1_tma_b_desc: Any = None
     smem_buf: Any = None
     _alloc_b: Constexpr[Optional[SmemAllocation]] = None
     desc_b_mma_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -454,6 +461,11 @@ class SmemBResource(MemoryResource):
         stage_base = self.smem_buf.subview(
             self.cfg.num_bytes_b_smem_per_stage * stage_info.stage_idx
         )
+        tma_b_desc = self.tma_b_desc
+        if cutlass.const_expr(self.cfg.splits_activation_operands):
+            _, _, tile_side = stage_info.work_tile.tile_idx
+            if tile_side == Int32(1):
+                tma_b_desc = self.side1_tma_b_desc
         if prims.elect_sync():
             if cutlass.const_expr(self.cfg.uses_block_major_k_weight_b):
                 b_box_k = self.cfg.tile_k
@@ -467,7 +479,7 @@ class SmemBResource(MemoryResource):
                 for bi in cutlass.range_constexpr(self.cfg.tile_k // b_box_k):
                     self._tma_load(
                         stage_base.subview(bi * box_bytes),
-                        self.tma_b_desc,
+                        tma_b_desc,
                         self._coords_for_load(
                             coord_b_k + Int32(bi * b_box_k),
                             coord_b_mn,
@@ -480,7 +492,7 @@ class SmemBResource(MemoryResource):
             else:
                 self._tma_load(
                     stage_base,
-                    self.tma_b_desc,
+                    tma_b_desc,
                     self._coords_for_load(
                         coord_b_k,
                         coord_b_mn,

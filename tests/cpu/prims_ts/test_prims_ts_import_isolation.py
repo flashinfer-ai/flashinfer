@@ -62,6 +62,13 @@ from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
 assert DType.BF16
 assert "cutlass.experimental.task_scheduling" not in sys.modules
 assert "cutlass.experimental.task_scheduling.resources" not in sys.modules
+
+from flashinfer.prims_ts.moe.partition import MoeLocalizedKernelResources
+from flashinfer.prims_ts.batched_gemm.locality_requirements import (
+    locality_domain_register_unsupported_reason,
+)
+assert MoeLocalizedKernelResources
+assert callable(locality_domain_register_unsupported_reason)
 """
     )
 

@@ -120,10 +120,14 @@ def test_staged_routing_ffi_signatures_take_optional_weights(name, expected_para
     signature = source[source.index("(", begin) + 1 : source.index(")", begin)]
     params = [param.strip() for param in signature.split(",")]
     names = [param.split()[-1] for param in params]
+    assert names[-2:] == [
+        "locality_counters_side0",
+        "locality_counters_side1",
+    ]
 
     start = names.index(expected_params[0])
     assert tuple(names[start : start + len(expected_params)]) == expected_params
-    assert names[-1] == "routing_replay_out"
+    assert names[-3] == "routing_replay_out"
     for param, param_name in zip(params, names, strict=True):
         if param_name in _STAGED_WEIGHT_PARAMS:
             assert param.startswith("Optional<TensorView> const&"), param
@@ -830,6 +834,46 @@ def test_tp_n_tp_k_materializes_local_compact_execution():
 
 
 @pytest.mark.cpu_only
+def test_tp_n_tp_k_aligns_compact_sf_partitions():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import SfLayout
+
+    runner = PrimsTsPartitionedBf16MoERunner(
+        None,
+        top_k=2,
+        num_local_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+        num_experts=8,
+        **_partition_runner_kwargs("tp_n_tp_k"),
+    )
+    fc1_cfg = SimpleNamespace(
+        dtype_c_bits=8,
+        has_output_block_scaling=True,
+        output_sf_block_size_c=16,
+        sf_layout_c=int(SfLayout.R8c4),
+    )
+    fc2_cfg = SimpleNamespace(dtype_c_bits=16, has_output_block_scaling=False)
+    # Three rows give an exact 12-byte span per partition.
+    gemm1_output_scale = torch.empty(4096, dtype=torch.uint8)
+
+    execution = runner._materialize_partition_execution(
+        partition=_partition_call_kwargs()["partition_resources"],
+        fc1_cfg=fc1_cfg,
+        fc2_cfg=fc2_cfg,
+        gemm1_output=torch.empty((3, 128), dtype=torch.uint8),
+        gemm2_output=torch.empty((3, 128), dtype=torch.bfloat16),
+        gemm1_output_scale=gemm1_output_scale,
+        local_fc1_width=64,
+        full_fc1_pitch=128,
+    )
+
+    assert tuple(scale.numel() for scale in execution.fc1_scales) == (12, 12)
+    assert tuple(scale.storage_offset() for scale in execution.fc1_scales) == (0, 16)
+    assert all(scale.data_ptr() % 16 == 0 for scale in execution.fc1_scales)
+    assert execution.fc2_activation_scales == execution.fc1_scales
+
+
+@pytest.mark.cpu_only
 def test_partitioned_runner_rejects_non_swap_ab_tactic():
     runner = PrimsTsBf16MoERunner(
         None,
@@ -1185,6 +1229,10 @@ def test_deepseek_staged_buffers_share_token_axis():
     )
     empty_indices = torch.empty(0, dtype=torch.int32, device=device)
     empty_weights = torch.empty(0, dtype=torch.bfloat16, device=device)
+    locality_counters = (
+        torch.full((64,), 0x7FFFFFFF, dtype=torch.int32, device=device),
+        torch.full((64,), 0x7FFFFFFF, dtype=torch.int32, device=device),
+    )
 
     routing_out = (
         get_trtllm_moe_sm100_module().moe_op.trtllm_moe_run_routing_fp8_block_scale(
@@ -1238,8 +1286,13 @@ def test_deepseek_staged_buffers_share_token_axis():
             int(Fp8QuantizationType.DeepSeekFp8),
             True,
             None,
+            *locality_counters,
         )
     )
+    torch.cuda.synchronize()
+    for counters in locality_counters:
+        assert counters[0].item() == 0
+        assert counters[32].item() == 0
     (
         _expert_weights,
         _expanded_idx_to_permuted_idx,
@@ -1332,6 +1385,8 @@ def test_unpartitioned_staged_routing_checks_full_weight_shape():
             [int(pair.tile_n), int(pair.moe_config_index)],
             int(ActivationType.Swiglu),
             True,
+            None,
+            None,
             None,
         )
 
