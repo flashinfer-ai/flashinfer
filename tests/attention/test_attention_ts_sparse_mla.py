@@ -1159,8 +1159,14 @@ def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
     wrapper = BatchSparseMLADecodePagedTSWrapper(workspace)
     with monkeypatch.context() as empty_cache:
         empty_cache.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
-        wrapper.plan(**args, compile=False)
-        assert not wrapper.is_kernel_cached()
+        discovery = BatchSparseMLADecodePagedTSWrapper()
+        allocations = torch.cuda.memory_stats(q.device)["allocation.all.allocated"]
+        discovery.plan(**args, compile=False)
+        assert (
+            torch.cuda.memory_stats(q.device)["allocation.all.allocated"] == allocations
+        )
+        assert discovery.workspace_size_bytes == size
+        assert not discovery.is_kernel_cached()
         assert not list(tmp_path.iterdir())
     _plan_with_deferred_compilation(wrapper, **args)
     assert wrapper.is_kernel_cached() == (not cute_dsl_core.cute_dsl_cache_disabled())
@@ -1180,8 +1186,9 @@ def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
     torch.testing.assert_close(next_lse, torch.zeros_like(next_lse), atol=0, rtol=0)
     torch.testing.assert_close(lse, first_lse, atol=0, rtol=0)
     short = BatchSparseMLADecodePagedTSWrapper(workspace[:-1])
-    with pytest.raises(ValueError, match="workspace"):
-        short.plan(**args)
+    for compile_kernel in (False, True):
+        with pytest.raises(ValueError, match="workspace"):
+            short.plan(**args, compile=compile_kernel)
     bad = indices.clone()
     bad[..., 0] = 2
     with pytest.raises(ValueError, match="outside pool"):
