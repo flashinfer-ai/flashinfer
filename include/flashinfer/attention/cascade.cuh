@@ -652,6 +652,7 @@ cudaError_t MergeStatesDispatched(DTypeIn* v, float* s, DTypeO* v_merged, float*
     uint32_t head_dim = HEAD_DIM;
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    static_assert(HEAD_DIM % vec_size == 0, "HEAD_DIM must be a multiple of the merge vec_size");
     if (num_index_sets >= seq_len) {
       constexpr uint32_t num_threads = 128;
       constexpr uint32_t bdy = num_threads / bdx;
@@ -697,6 +698,7 @@ cudaError_t AttentionSumDispatched(DTypeIn* v, DTypeO* v_sum, uint32_t num_index
     uint32_t head_dim = HEAD_DIM;
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    static_assert(HEAD_DIM % vec_size == 0, "HEAD_DIM must be a multiple of the merge vec_size");
     uint32_t bdy = num_heads;
     dim3 nblks(seq_len);
     dim3 nthrs(bdx, bdy);
@@ -732,6 +734,7 @@ cudaError_t VariableLengthMergeStatesDispatched(DTypeIn* v, float* s, IdType* in
     uint32_t head_dim = HEAD_DIM;
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    static_assert(HEAD_DIM % vec_size == 0, "HEAD_DIM must be a multiple of the merge vec_size");
     constexpr uint32_t num_threads = 128;
     constexpr uint32_t bdy = num_threads / bdx;
     constexpr uint32_t num_smem_stages = 4;
@@ -797,6 +800,7 @@ cudaError_t VariableLengthAttentionSumDispatched(DTypeIn* v, IdType* indptr, DTy
     uint32_t head_dim = HEAD_DIM;
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    static_assert(HEAD_DIM % vec_size == 0, "HEAD_DIM must be a multiple of the merge vec_size");
     constexpr uint32_t num_threads = 128;
     constexpr uint32_t bdy = num_threads / bdx;
     constexpr uint32_t num_smem_stages = 4;
