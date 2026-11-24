@@ -3487,72 +3487,189 @@ def test_cute_dsl_runner_cache_tracks_split_workspace_geometry(
     assert key_257 != key_small_workspace
 
 
-def _clock_state(sm_mhz, throttle=0, sm_max_mhz=2062):
-    return {
-        "sm_mhz": sm_mhz,
-        "sm_max_mhz": sm_max_mhz,
-        "throttle": throttle,
-        "power_w": 500.0,
-    }
+# ---------------------------------------------------------------------------
+# Full profiling (TuningConfig.full_profiling, mm_bf16(full=True))
+# ---------------------------------------------------------------------------
 
 
-def test_wait_for_boost_without_nvml(monkeypatch):
-    from flashinfer.autotuner import autotuner as autotuner_module
-
-    monkeypatch.setattr(autotuner_module, "_nvml_clock_state", lambda device: None)
-    assert autotuner_module._wait_for_boost(0, 1.0) == (0.0, None, True)
-
-
-def test_wait_for_boost_returns_once_the_clock_is_back_at_maximum(monkeypatch):
-    from flashinfer.autotuner import autotuner as autotuner_module
-
-    # Power-capped (SW power cap bit) first, then three polls at the maximum.
-    states = iter(
-        [_clock_state(2062), _clock_state(1270, 0x4)] + [_clock_state(2062)] * 50
+def _cold_chain_config(**overrides):
+    return TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
+        cold_chain_launches=8,
+        profile_arena_input_indices=(0,),
+        **overrides,
     )
+
+
+def test_full_profiling_policy_and_no_cold_chain():
+    ordinary = _cold_chain_config()
+    full = replace(ordinary, full_profiling=True)
+    assert ordinary.uses_cold_chain and not full.uses_cold_chain
+    # The ordinary policy is unchanged; the full one is told apart from it.
+    assert AutoTuner._profiling_policy(ordinary) == (
+        "cuda_graph_profile_replays",
+        1,
+        "l2_cache_policy",
+        "cold-chain:8",
+    )
+    assert AutoTuner._profiling_policy(full) == (
+        "cuda_graph_profile_replays",
+        1,
+        "l2_cache_policy",
+        "cold",
+        "full_profiling",
+        True,
+    )
+
+
+def _clock_states(monkeypatch, states):
+    it = iter(states)
+    last = [None]
+
+    def state(device):
+        last[0] = next(it, last[0])
+        return last[0]
+
+    monkeypatch.setattr(autotuner_module, "_nvml_sm_clock_state", state)
+
+
+def test_wait_for_sm_clock_without_nvml(monkeypatch):
+    _clock_states(monkeypatch, [None])
+    assert autotuner_module._wait_for_sm_clock(torch.device("cuda", 0), 1.0) is None
+
+
+def test_wait_for_sm_clock_returns_once_recovered(monkeypatch):
+    capped = (1270, 2062, 0x4)  # SW power cap
+    _clock_states(monkeypatch, [capped, capped, (2062, 2062, 0)])
+    assert autotuner_module._wait_for_sm_clock(torch.device("cuda", 0), 5.0) is True
+
+
+def test_wait_for_sm_clock_accepts_an_idle_gpu(monkeypatch):
+    _clock_states(monkeypatch, [(345, 2062, 0x1)])  # GPU idle, nothing limits it
+    assert autotuner_module._wait_for_sm_clock(torch.device("cuda", 0), 5.0) is True
+
+
+def test_wait_for_sm_clock_gives_up_after_the_timeout(monkeypatch):
+    _clock_states(monkeypatch, [(1270, 2062, 0x4)])
+    assert autotuner_module._wait_for_sm_clock(torch.device("cuda", 0), 0.02) is False
+
+
+def _tune(tuner, config, runner, inputs, tune_mode=True):
+    with autotune(tune_mode=tune_mode):
+        return tuner.choose_one("dummy_full", [runner], config, inputs)
+
+
+def test_full_profiling_cache(monkeypatch):
+    """An ordinary winner does not answer a full request; a full winner is
+    reused by the next full request and by ordinary lookup."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    ordinary = TuningConfig()
+    full = replace(ordinary, full_profiling=True)
+    times = {False: {0: 5.0, 1: 1.0, 2: 3.0}, True: {0: 5.0, 1: 3.0, 2: 1.0}}
+    profiled = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config, **kwargs):
+        profiled.append((tuning_config.full_profiling, tactic))
+        return times[tuning_config.full_profiling][tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    assert _tune(tuner, ordinary, runner, inputs)[1] == 1
+    assert profiled == [(False, 0), (False, 1), (False, 2)]
+    profiled.clear()
+
+    # The cached ordinary winner does not skip full tuning.
+    assert _tune(tuner, full, runner, inputs)[1] == 2
+    assert profiled == [(True, 0), (True, 1), (True, 2)]
+    profiled.clear()
+
+    # A second full request reuses the full winner, ordinary lookup serves it,
+    # and a full request outside autotune(True) only looks up.
+    assert _tune(tuner, full, runner, inputs)[1] == 2
+    assert _tune(tuner, ordinary, runner, inputs, tune_mode=False)[1] == 2
+    assert _tune(tuner, full, runner, inputs, tune_mode=False)[1] == 2
+    assert profiled == []
+
+
+def test_full_profiling_outside_autotune_does_not_profile(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    full = TuningConfig(full_profiling=True)
     monkeypatch.setattr(
-        autotuner_module, "_nvml_clock_state", lambda device: next(states)
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda *args, **kwargs: pytest.fail("profiled outside autotune(True)"),
     )
-    waited, state, reached = autotuner_module._wait_for_boost(0, 5.0)
-    assert reached
-    assert state["sm_mhz"] == 2062
-    assert waited < 5.0
+    assert _tune(tuner, full, runner, inputs, tune_mode=False) == (runner, -1)
 
 
-def test_wait_for_boost_gives_up_after_the_timeout(monkeypatch):
-    from flashinfer.autotuner import autotuner as autotuner_module
+def test_full_profiling_without_a_confirmed_clock_is_not_cached(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    full = TuningConfig(full_profiling=True)
+    profiled = []
 
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config, **kwargs):
+        profiled.append(tactic)
+        if tactic == 1:  # the clock never recovered before one sample
+            self._full_profiling_unconfirmed_samples += 1
+        return {0: 5.0, 1: 1.0, 2: 3.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with patch.object(autotuner_module.logger, "warning") as warn:
+        # The winner of the incomplete comparison serves this call ...
+        assert _tune(tuner, full, runner, inputs)[1] == 1
+    assert any("not cached" in str(c.args[0]) for c in warn.call_args_list)
+    # ... but is not cached: ordinary lookup falls back, full tuning reruns.
+    assert _tune(tuner, TuningConfig(), runner, inputs, tune_mode=False)[1] == -1
+    profiled.clear()
+    _tune(tuner, full, runner, inputs)
+    assert profiled == [0, 1, 2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_full_profiling_times_every_sample_after_a_clock_wait(
+    monkeypatch, use_cuda_graph
+):
+    class MatmulRunner(TunableRunner):
+        def get_valid_tactics(self, inputs, profile):
+            return [0]
+
+        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+            return inputs[0] @ inputs[0]
+
+    tuner = reset_autotuner()
+    a = torch.randn(256, 256, device="cuda")
+    replays = 2 if use_cuda_graph else 1
+    config = replace(
+        _cold_chain_config(profiling_repeat=7, cuda_graph_profile_replays=replays),
+        use_cuda_graph=use_cuda_graph,
+        full_profiling=True,
+    )
+    waits = []
     monkeypatch.setattr(
         autotuner_module,
-        "_nvml_clock_state",
-        lambda device: _clock_state(1270, 0x4),
+        "_wait_for_sm_clock",
+        lambda device, timeout_s: waits.append(timeout_s) or True,
     )
-    waited, state, reached = autotuner_module._wait_for_boost(0, 0.05)
-    assert not reached
-    assert state["sm_mhz"] == 1270
-    assert waited >= 0.05
+    # No cold-chain budget: all 7 x replays samples, each after its own wait.
+    before = tuner._full_profiling_unconfirmed_samples
+    assert tuner._profile_single_kernel(MatmulRunner(), [a], 0, config) > 0
+    assert len(waits) == 7 * replays
+    assert tuner._full_profiling_unconfirmed_samples == before
 
-
-def test_profile_log_appends_one_json_line_per_record(monkeypatch, tmp_path):
-    import json
-    import os
-
-    from flashinfer.autotuner import autotuner as autotuner_module
-
-    log = tmp_path / "profile.jsonl"
-    monkeypatch.setenv("FLASHINFER_AUTOTUNER_PROFILE_LOG", str(log))
-    autotuner_module._profile_log({"tactic": 1, "time_ms": 0.5})
-    autotuner_module._profile_log({"tactic": 2})
-    rows = [json.loads(line) for line in log.read_text().splitlines()]
-    assert [row["tactic"] for row in rows] == [1, 2]
-    assert rows[0]["pid"] == os.getpid()
-    assert rows[0]["time_ms"] == 0.5
-
-
-def test_profile_log_is_off_by_default(monkeypatch, tmp_path):
-    from flashinfer.autotuner import autotuner as autotuner_module
-
-    monkeypatch.delenv("FLASHINFER_AUTOTUNER_PROFILE_LOG", raising=False)
-    monkeypatch.chdir(tmp_path)
-    autotuner_module._profile_log({"tactic": 1})
-    assert list(tmp_path.iterdir()) == []
+    for clock in (False, None):  # timeout, NVML unavailable
+        monkeypatch.setattr(
+            autotuner_module,
+            "_wait_for_sm_clock",
+            lambda device, timeout_s, clock=clock: clock,
+        )
+        before = tuner._full_profiling_unconfirmed_samples
+        tuner._profile_single_kernel(MatmulRunner(), [a], 0, config)
+        assert tuner._full_profiling_unconfirmed_samples - before == 7 * replays

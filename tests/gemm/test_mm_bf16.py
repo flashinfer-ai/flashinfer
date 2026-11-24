@@ -818,5 +818,64 @@ def test_mm_bf16_pdl_tunes_under_its_own_op(monkeypatch):
     assert (custom_op, backend) == ("bf16_gemm_pdl", "tgv")
 
 
+def test_mm_bf16_full_tuning(monkeypatch):
+    """full=True tunes only inside autotune(True), with the full-profiling
+    config, reuses its result, and does not leak into bmm_bf16."""
+    _skip_unless_runnable("cublaslt")
+    import flashinfer.autotuner.autotuner as autotuner_module
+    from flashinfer import bmm_bf16
+
+    torch.manual_seed(0)
+    a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    configs = []
+    choose_one = AutoTuner.choose_one
+
+    def spy(self, custom_op, runners, tuning_config, inputs, **kwargs):
+        configs.append(tuning_config.full_profiling)
+        return choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
+
+    profiled = []
+    profile = AutoTuner._profile_single_kernel
+
+    def count(self, *args, **kwargs):
+        profiled.append(args[2])
+        return profile(self, *args, **kwargs)
+
+    waits = []
+    monkeypatch.setattr(AutoTuner, "choose_one", spy)
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", count)
+    monkeypatch.setattr(
+        autotuner_module,
+        "_wait_for_sm_clock",
+        lambda device, timeout_s: waits.append(device) or True,
+    )
+
+    # Outside autotune(True) the flag only looks up the cache.
+    mm_bf16(a, w.T, backend="cublaslt", full=True)
+    assert configs == [True] and profiled == []
+
+    with autotune(True):
+        out = mm_bf16(a, w.T, backend="cublaslt", full=True)
+    assert profiled and len(waits) >= len(profiled)
+    torch.testing.assert_close(out, F.linear(a, w), rtol=2e-2, atol=2e-1)
+
+    # The full result is reused by the next full call and by ordinary lookup.
+    tuned = len(profiled)
+    with autotune(True):
+        mm_bf16(a, w.T, backend="cublaslt", full=True)
+    mm_bf16(a, w.T, backend="cublaslt")
+    assert len(profiled) == tuned
+
+    # bmm_bf16 shares bf16_gemm_sm100 but never asks for full profiling.
+    configs.clear()
+    bmm_bf16(a.unsqueeze(0), w.T.unsqueeze(0), backend="tgv")
+    assert configs == [False]
+    tuner.clear_cache()
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
