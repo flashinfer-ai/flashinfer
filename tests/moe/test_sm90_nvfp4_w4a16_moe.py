@@ -27,6 +27,10 @@ intermediate = 4096, 32 local experts, top-8) and several other MoE layouts.
 from __future__ import annotations
 
 import math
+import os
+import subprocess
+import sys
+import textwrap
 from typing import Optional
 
 import pytest
@@ -407,6 +411,62 @@ def test_cuda_graph_replay_prefill_kernel(shape):
         torch.cuda.synchronize()
         assert torch.equal(out, run(packed, x, ids, w, **kw))
         assert_in_band(out, reference_moe(ckpt, x, ids, w))
+
+
+_PARTITION_SCRIPT = textwrap.dedent(
+    """
+    import sys
+    import torch
+    from flashinfer.green_ctx import split_device_green_ctx
+    sys.path.insert(0, sys.argv[1])
+    import test_sm90_nvfp4_w4a16_moe as t
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    streams, resources = split_device_green_ctx(dev, 1, 16)
+    H, I, E, top_k = t.SHAPES[4]
+    ckpt, packed = t.checkpoint(t.SHAPES[4])
+    ws = t.Sm90Nvfp4W4A16MoEWorkspace(dev, H, I)
+    ws.reserve_prefill(256)
+    x = torch.randn(700, H, device=dev).bfloat16()
+    ids, w = t.routing(700, E, top_k, "cuda", seed=41)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(streams[0]):
+        y = t.run(packed, x, ids, w, workspace=ws, prefill_min_tokens=1,
+                  prefill_chunk_tokens=256)
+        yd = t.run(packed, x, ids, w, workspace=ws, prefill_min_tokens=1 << 30)
+    streams[0].synchronize()
+    ref = t.reference_moe(ckpt, x, ids, w)
+    t.assert_in_band(y, ref)
+    t.assert_in_band(yd, ref)
+    print("partition SMs", resources[0].sm.smCount)
+    """
+)
+
+
+def test_kernels_complete_on_sm_partition():
+    """Both kernels launch one CTA per SM of the device. On a green-context SM
+    partition only part of that grid is resident at a time; the kernels must
+    still complete (no CTA may wait on work owned by a CTA that has not
+    started). Runs in a subprocess so a hang fails the test instead of the run."""
+    pytest.importorskip("cuda.bindings")
+    if torch.cuda.get_device_properties(0).multi_processor_count < 64:
+        pytest.skip("needs a device much larger than the 16-SM partition")
+    H, I, _, _ = SHAPES[4]
+    checkpoint(SHAPES[4])
+    Sm90Nvfp4W4A16MoEWorkspace(torch.device("cuda"), H, I)  # build the module here
+    torch.cuda.synchronize()
+    try:
+        res = subprocess.run(
+            [sys.executable, "-c", _PARTITION_SCRIPT, os.path.dirname(__file__)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("sm90_nvfp4_w4a16_moe did not complete on a 16-SM partition")
+    if res.returncode != 0 and "Failed to split device" in res.stderr:
+        pytest.skip("green contexts are not available")
+    assert res.returncode == 0, res.stderr[-4000:]
 
 
 def test_zero_tokens():
