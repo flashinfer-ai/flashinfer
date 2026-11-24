@@ -1219,12 +1219,6 @@ class PrimsTsConfig:
     prefill tactics.
     """
 
-    nvfp4_weight_layout: Literal["MajorK", "BlockMajorK"] = "MajorK"
-
-    def __post_init__(self) -> None:
-        if self.nvfp4_weight_layout not in ("MajorK", "BlockMajorK"):
-            raise ValueError("nvfp4_weight_layout must be MajorK or BlockMajorK.")
-
     @classmethod
     def supported(cls, arch: int) -> bool:
         return arch in _PRIMS_TS_ARCHS
@@ -1252,13 +1246,14 @@ class PrimsTsConfig:
         DeepSeekFp8, MXFP4×MXFP8 and BlockMajorK NVFP4, the same dictionary
         may also be registered for the matching TRT-LLM backend key. The
         Prims-TS backend also accepts the MajorK TRT-LLM MXFP4×MXFP8 view.
-        BlockMajorK converts the shuffled payload once at preparation time;
-        scales keep their existing layout. NVFP4 requires hidden and
-        intermediate sizes divisible by 256 and stores weights as
-        ``[E, K/256, N, 128]`` packed bytes.
+        NVFP4 defaults to 3D ``MajorK`` weights. Choosing ``BlockMajorK``
+        requires hidden and intermediate sizes divisible by 256. The packer
+        stores the shuffled payload as ``[E, K/256, N, 128]`` packed bytes
+        and keeps the existing scale layout.
         """
         pair = quant.pair
-        PrimsTsConfig(nvfp4_weight_layout=nvfp4_weight_layout)
+        if nvfp4_weight_layout not in ("MajorK", "BlockMajorK"):
+            raise ValueError("nvfp4_weight_layout must be MajorK or BlockMajorK.")
         if nvfp4_weight_layout == "BlockMajorK":
             if pair != (QuantFormat.NVFP4, QuantFormat.NVFP4):
                 raise ValueError("nvfp4_weight_layout applies only to NVFP4×NVFP4.")
@@ -1396,9 +1391,7 @@ class PrimsTsConfig:
         raise ValueError(f"Prims-TS activation preparation does not support {quant!r}.")
 
     def __repr__(self) -> str:
-        if self.nvfp4_weight_layout == "MajorK":
-            return "PrimsTsConfig()"
-        return f"PrimsTsConfig(nvfp4_weight_layout={self.nvfp4_weight_layout!r})"
+        return "PrimsTsConfig()"
 
 
 @dataclass(frozen=True)

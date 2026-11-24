@@ -36,7 +36,7 @@ def test_inner_runner_validates_output_before_cuda_work(monkeypatch, view):
 
     inner = object.__new__(runner.PrimsTsNvfp4MoERunner)
     inner.hidden_size = hidden
-    config = SimpleNamespace(kwargs={}, build=lambda: object())
+    config = SimpleNamespace(kwargs={}, build=lambda: SimpleNamespace(use_pdl=False))
     pair = SimpleNamespace(
         fc1=SimpleNamespace(cfg=config),
         fc2=SimpleNamespace(cfg=config),

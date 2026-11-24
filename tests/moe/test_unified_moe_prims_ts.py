@@ -188,12 +188,6 @@ class TestPrimsTsBackendOptions:
         cfg = PrimsTsConfig()
         assert repr(cfg) == "PrimsTsConfig()"
         assert eval(repr(cfg), vars(fused_moe)) == cfg
-        cfg = PrimsTsConfig(nvfp4_weight_layout="BlockMajorK")
-        assert eval(repr(cfg), vars(fused_moe)) == cfg
-
-    def test_invalid_weight_layout(self):
-        with pytest.raises(ValueError, match="nvfp4_weight_layout"):
-            PrimsTsConfig(nvfp4_weight_layout="unknown")
 
     def test_registered_and_opt_in(self):
         assert _BACKEND_RUNNERS[PrimsTsConfig] is PrimsTsRunner
@@ -201,9 +195,16 @@ class TestPrimsTsBackendOptions:
 
 
 class TestPrimsTsPrepare:
-    @pytest.mark.parametrize("quant,hidden", ((_BF16, 256), (_NVFP4, 128)))
-    def test_block_major_k_rejects_invalid_preparation(self, quant, hidden):
-        with pytest.raises(ValueError, match="NVFP4"):
+    @pytest.mark.parametrize(
+        "quant,hidden,layout,error",
+        [
+            (_BF16, 256, "BlockMajorK", "applies only to NVFP4"),
+            (_NVFP4, 128, "BlockMajorK", "divisible by 256"),
+            (_NVFP4, 256, "unknown", "nvfp4_weight_layout"),
+        ],
+    )
+    def test_rejects_invalid_weight_preparation(self, quant, hidden, layout, error):
+        with pytest.raises(ValueError, match=error):
             PrimsTsConfig.prepare_weights(
                 torch.empty(0),
                 torch.empty(0),
@@ -211,7 +212,7 @@ class TestPrimsTsPrepare:
                 num_local_experts=1,
                 hidden_size=hidden,
                 intermediate_size=256,
-                nvfp4_weight_layout="BlockMajorK",
+                nvfp4_weight_layout=layout,
             )
 
     @pytest.mark.parametrize(
@@ -1291,37 +1292,32 @@ def test_prims_ts_tuning_cache_distinguishes_finalize_and_weight_layout(monkeypa
     monkeypatch.setattr(
         "flashinfer.fused_moe.runners.get_compute_capability", lambda device: (10, 7)
     )
-    keys = {}
+    keys = set()
     for fused in (False, True):
-        for hint in ("MajorK", "BlockMajorK"):
-            cfg = _config(
-                backend=PrimsTsConfig(nvfp4_weight_layout=hint),
-                finalize=MoEFinalizeConfig(use_fused_finalize=fused),
-                execution=ExecutionConfig(enable_pdl=False),
+        cfg = _config(
+            finalize=MoEFinalizeConfig(use_fused_finalize=fused),
+            execution=ExecutionConfig(enable_pdl=False),
+        )
+        runner = PrimsTsRunner(cfg, torch.device("cpu"))
+        original_hash = hash(runner)
+        for layout, shape in (
+            (WeightLayout.MajorK, (32, 1024, 512)),
+            (WeightLayout.BlockMajorK, (32, 4, 1024, 128)),
+        ):
+            inferred = runner._weight_layout(
+                {"gemm1_weights": torch.empty(shape, device="meta", dtype=torch.uint8)}
             )
-            runner = PrimsTsRunner(cfg, torch.device("cpu"))
-            original_hash = hash(runner)
-            for layout, shape in (
-                (WeightLayout.MajorK, (32, 1024, 512)),
-                (WeightLayout.BlockMajorK, (32, 4, 1024, 128)),
-            ):
-                inferred = runner._weight_layout(
-                    {
-                        "gemm1_weights": torch.empty(
-                            shape, device="meta", dtype=torch.uint8
-                        )
-                    }
-                )
-                assert inferred == layout
-                inputs = _TrtllmPackedInputs(
-                    [],
-                    tuning_config=None,
-                    launch_state=_TrtllmLaunchState(dict(weight_layout=inferred)),
-                )
-                key = runner.get_cache_key_extras(inputs)
-                assert keys.setdefault((fused, layout), key) == key
-                assert hash(runner) == original_hash
-    assert len(set(keys.values())) == 4
+            assert inferred == layout
+            inputs = _TrtllmPackedInputs(
+                [],
+                tuning_config=None,
+                launch_state=_TrtllmLaunchState(dict(weight_layout=inferred)),
+            )
+            key = runner.get_cache_key_extras(inputs)
+            assert key != runner.get_cache_key_extras([])
+            keys.add(key)
+            assert hash(runner) == original_hash
+    assert len(keys) == 4
 
 
 def test_prims_ts_unified_cache_tracks_effective_finalize_for_each_call(monkeypatch):
@@ -1375,7 +1371,8 @@ def test_prims_ts_unified_cache_tracks_effective_finalize_for_each_call(monkeypa
         )
         == 16
     )
-    assert runner.get_cache_key_extras(list(packed)) == fused_key
+    bare_key = runner.get_cache_key_extras(list(packed))
+    assert "weight_layout" not in bare_key
     for overrides in (
         {"use_fused_finalize": False},
         {"do_finalize": False},
@@ -1390,7 +1387,7 @@ def test_prims_ts_unified_cache_tracks_effective_finalize_for_each_call(monkeypa
         ] == [[512, 0], [512, 1]]
         # Bare lists carry no call options and must not inherit mutable inner
         # state. Profiling retains the packed input's launch metadata instead.
-        assert runner.get_cache_key_extras(list(unfused)) == fused_key
+        assert runner.get_cache_key_extras(list(unfused)) == bare_key
         # A previously packed call must not inherit another call's options.
         assert runner.get_cache_key_extras(packed) == fused_key
     deterministic = True

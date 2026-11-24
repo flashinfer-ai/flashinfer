@@ -86,7 +86,6 @@ from .api import (
     _CUTILE_NVFP4_ARCHS,
     _CUTILE_W4A16_ARCHS,
     _PRIMS_TS_ARCHS,
-    PrimsTsConfig,
     # Typed activation values
     ActivationConfig,
     GELU,
@@ -7746,14 +7745,13 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             return ()
         state = self.launch_state_for(inputs)
         options = state.static_kwargs if isinstance(state, _TrtllmLaunchState) else {}
-        if not self._is_rubin_nvfp4():
-            return ("weight_layout", options["weight_layout"]) if options else ()
-        return (
-            "weight_layout",
-            options["weight_layout"] if options else self._weight_layout(),
-            "effective_fused_finalize",
-            self._effective_fused_finalize(**options),
-        )
+        extras: tuple = ("weight_layout", options["weight_layout"]) if options else ()
+        if self._is_rubin_nvfp4():
+            extras += (
+                "effective_fused_finalize",
+                self._effective_fused_finalize(**options),
+            )
+        return extras
 
     def _is_rubin_nvfp4(self) -> bool:
         return self._pair == (
@@ -7761,23 +7759,15 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             QuantFormat.NVFP4,
         ) and get_compute_capability(self.device) == (10, 7)
 
-    def _weight_layout(self, view: Optional[dict] = None) -> int:
+    def _weight_layout(self, view: dict) -> int:
         from flashinfer.tllm_enums import WeightLayout
 
         if self._pair == (QuantFormat.BF16, QuantFormat.BF16):
             return int(WeightLayout.BlockMajorK)
-        if view is None and self._is_rubin_nvfp4():
-            # A cache query without packed inputs only has the configured hint.
-            options = next(
-                (c for c in self.config.backend if isinstance(c, PrimsTsConfig)),
-                PrimsTsConfig(),
-            )
-            return int(getattr(WeightLayout, options.nvfp4_weight_layout))
         # FP4 weights are MajorK [experts, Mn, K_bytes] or BlockMajorK
         # [experts, K_bytes / block, Mn, block]; the rank tells them apart.
         if (
             self._pair[0] in (QuantFormat.NVFP4, QuantFormat.MXFP4)
-            and view is not None
             and view["gemm1_weights"].dim() == 4
         ):
             return int(WeightLayout.BlockMajorK)
