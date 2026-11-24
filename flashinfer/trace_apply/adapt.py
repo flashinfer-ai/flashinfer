@@ -79,6 +79,8 @@ def build_candidate_kwargs(template: Any, namespace: dict[str, Any]) -> dict[str
     flashinfer-bench solutions are written against the Definition's input names,
     so a Python-family candidate is invoked as ``solution(**build_candidate_kwargs)``.
     """
+    from flashinfer.trace.template import _get_tuple_part  # noqa: PLC0415
+
     out: dict[str, Any] = {}
     for json_key, desc in template.inputs.items():
         param = getattr(desc, "param", None) or json_key
@@ -87,9 +89,8 @@ def build_candidate_kwargs(template: Any, namespace: dict[str, Any]) -> dict[str
             continue
         tuple_idx = getattr(desc, "tuple_idx", None)
         if tuple_idx is not None:
-            if isinstance(val, (tuple, list)) and len(val) > tuple_idx:
-                val = val[tuple_idx]
-            else:
+            val = _get_tuple_part(val, tuple_idx)
+            if val is None:
                 continue
         out[json_key] = val
     return out
@@ -99,17 +100,15 @@ def ordered_input_values(template: Any, namespace: dict[str, Any]) -> list[Any]:
     """Input values in the template's declared order, ``None`` for absent inputs
     (positions preserved). Used to call C++/CUDA (TVM-FFI) solutions, which take
     positional, fixed-arity arguments."""
+    from flashinfer.trace.template import _get_tuple_part  # noqa: PLC0415
+
     out: list[Any] = []
     for json_key, desc in template.inputs.items():
         param = getattr(desc, "param", None) or json_key
         val = namespace.get(param)
         tuple_idx = getattr(desc, "tuple_idx", None)
         if tuple_idx is not None and val is not None:
-            val = (
-                val[tuple_idx]
-                if isinstance(val, (tuple, list)) and len(val) > tuple_idx
-                else None
-            )
+            val = _get_tuple_part(val, tuple_idx)
         out.append(val)
     return out
 
@@ -123,7 +122,7 @@ def extract_input_dtypes(
     Uses trace's own ``_dtype_str`` (imported) so the runtime dtype string is
     identical to the one stored in the definition by construction.
     """
-    from flashinfer.trace.template import Scalar, _dtype_str  # noqa: PLC0415
+    from flashinfer.trace.template import Scalar, _dtype_str, _get_tuple_part  # noqa: PLC0415
 
     out: dict[str, str] = {}
     for json_key, desc in template.inputs.items():
@@ -135,11 +134,7 @@ def extract_input_dtypes(
         val = namespace.get(param)
         tuple_idx = getattr(desc, "tuple_idx", None)
         if tuple_idx is not None and val is not None:
-            val = (
-                val[tuple_idx]
-                if isinstance(val, (tuple, list)) and len(val) > tuple_idx
-                else None
-            )
+            val = _get_tuple_part(val, tuple_idx)
         if isinstance(val, torch.Tensor):
             out[json_key] = _dtype_str(val.dtype)
     return frozenset(out.items())
@@ -201,6 +196,8 @@ def adapt_and_call(
       and DPS returns those destination buffers (``None`` for one not passed).
     Returns ``None`` for in-place APIs, else the (single or tuple) output value.
     """
+    from flashinfer.trace.template import _get_tuple_part  # noqa: PLC0415
+
     out_keys = _tensor_output_keys(template)
     return_outputs = getattr(template, "return_outputs", None)
     ret_keys = list(return_outputs) if return_outputs else out_keys
@@ -210,6 +207,9 @@ def adapt_and_call(
         if not param:
             return None
         b = namespace.get(param)
+        tuple_idx = getattr(template.outputs.get(json_key), "tuple_idx", None)
+        if tuple_idx is not None:
+            b = _get_tuple_part(b, tuple_idx)
         return b if isinstance(b, torch.Tensor) else None
 
     if dps:
