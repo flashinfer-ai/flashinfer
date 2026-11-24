@@ -3989,6 +3989,15 @@ def _create_cutlass_fp4_gemm_module(
                     tactics = [t for t in tactics if t not in stream_k]
                 return tactics
 
+            def get_tactic_cache_key(
+                self, inputs: List[torch.Tensor]
+            ) -> tuple[str, bool] | None:
+                if is_stream_k_tactic is None:
+                    return None
+                # The full pool also needs a signature to detect expansion from
+                # a restricted winner, even in a single-runner call.
+                return ("disable_stream_k", _stream_k_disabled())
+
             def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
                 # Checks a tactic read back from a saved autotune cache: it must be
                 # one of this module's configs, and not stream-K when that is off.
