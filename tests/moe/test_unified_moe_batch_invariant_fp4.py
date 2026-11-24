@@ -3940,3 +3940,59 @@ def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack(pair):
     assert peak <= pack + 8 * expert, (peak, pack, expert)
 
 
+@needs_device
+@each_pair
+def test_gather_form_at_fewer_than_four_expanded_rows_equals_the_box_form(pair):
+    """``T * top_k`` below four (one token at top-1 and top-2, two or three tokens at top-1): the gather form's index tensor
+    has fewer entries than the gather4 box has rows; the atom builds, the producer clamps every index to the group's last
+    row, and the bits are the box form's for every input form the rule routes to the gather form (a pre-quantized pack with
+    the 128x4 and with the linear scale layout, every MX input; NVFP4 also the per-tensor pack) and for the forced form,
+    through the op and through the layer (from logits, pre-routed, the pre-quantized pack)."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import fused_moe_fp4
+    from flashinfer.fused_moe.batch_invariant.schedule_fp4 import GATHER_TILE_N
+
+    quant = _QUANT[pair]
+    H, I, E = 256, 128, 8
+    for T, k in ((1, 1), (1, 2), (2, 1), (3, 1)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=100 + 10 * T + k)
+        W_pack = _weights(w1, w2, quant=quant)
+        W = _weights_of(W_pack)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids, wts = ids.cuda(), wts.cuda()
+        ref = bits(fused_moe_fp4(x, ids, wts, W, gather=False))
+        x4, sf, pts = _quantized(x, pair=pair)
+        sf_lin = (
+            _unswizzle(pair, sf, T, H).view(torch.uint8).reshape(T, H // pair.block)
+        )
+        forms = [x, _pack(pair, x4, sf, pts), _pack(pair, x4, sf_lin, pts)]
+        if pair.scaled:
+            forms += [(x4, sf, None), (x4, sf_lin, None)]
+        for xin in forms:
+            unit = pair.scaled and isinstance(xin, tuple) and xin[2] is None
+            r = bits(fused_moe_fp4(xin, ids, wts, W, gather=False)) if unit else ref
+            out, im = fused_moe_fp4(xin, ids, wts, W, return_intermediates=True)
+            c = im["config1"]
+            scatter_launch = isinstance(xin, tuple) or not pair.scaled
+            assert c.gather_a == (
+                scatter_launch and c.swap_ab and c.tile_n == GATHER_TILE_N
+            ), (T, k)
+            assert torch.equal(bits(out), r), (T, k)
+            out_g, im_g = fused_moe_fp4(
+                xin, ids, wts, W, gather=True, return_intermediates=True
+            )
+            assert im_g["config1"].gather_a and torch.equal(bits(out_g), r), (T, k)
+        layer = _layer(k, E, I, quant=quant)
+        assert torch.equal(bits(layer(_logits_pack(x, logits), W_pack)), ref), (T, k)
+        assert torch.equal(bits(layer(_routed_pack(x, ids, wts), W_pack)), ref), (T, k)
+        pts_layer = _layer(k, E, I, quant=_NVFP4_PTS) if pair.scaled else layer
+        act = MoEActivationPack(
+            x4,
+            sf,
+            topk_ids=ids,
+            topk_weights=wts,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+            per_token_scale=pts,
+        )
+        assert torch.equal(bits(pts_layer(act, W_pack)), ref), (T, k)
+
+
