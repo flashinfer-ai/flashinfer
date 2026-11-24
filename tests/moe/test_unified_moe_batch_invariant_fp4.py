@@ -3930,13 +3930,15 @@ def test_intermediate_scales_are_validated_before_the_reciprocal():
     )
     assert torch.equal(one["intermediate_scale"], torch.full((E,), 0.5, device="cuda"))
     if torch.cuda.device_count() > 1:
-        with pytest.raises(bi.BatchInvariantUnsupportedError, match="cuda:1"):
+        # a CUDA device other than the weights' (whichever device is current)
+        other = (w1.device.index + 1) % torch.cuda.device_count()
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match=f"cuda:{other}"):
             BatchInvariantFp4Config.prepare_weights(
                 w1,
                 w2,
                 activation=_SWIGLU,
                 intermediate="static",
-                intermediate_scales=gs2.to("cuda:1"),
+                intermediate_scales=gs2.to(f"cuda:{other}"),
             )
 
 
