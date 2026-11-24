@@ -235,8 +235,7 @@ def compile_filter(
             attrs.update(
                 dsv4_direct_sync=True, dsv4_alias_kv=True, dsv4_aligned_k=aligned_k
             )
-        # DS-V4 H64 MXFP4 relu with FP32 logits (TRT-LLM's default DSV4 indexer on Blackwell): the 16-tile unrolled main loop is
-        # 1.003-1.009x at 128K-1M (B200, same TopK output); other modes keep the 4-tile loop.
+        # Select the loop depth for the block-scaled FP32 epilogue.
         else:
             attrs.update(
                 dsv4_unroll=not (
@@ -331,10 +330,7 @@ def compile_filter(
             dsv4_finite_integer=False,
         )
     weight_dtype = DTYPES[signature[4 if qkv == "mxfp4" else 3][0]]
-    # H4 FP8 epilogue: one TMEM load per warpgroup and tile plus register-cached weights (same arithmetic). B200 Qwen3.8-Flash-Next:
-    # relu_fast 1.05x at 256K / 1.08x at 1M, native_fp16 1.03x / 1.05x; native_bf16 is unchanged (1.00x) and keeps the old path.
-    # The rule looks at the filter chosen for FP32 weights. With BF16 weights the branch below also moves the packed-candidate
-    # H4 filter to this kernel; that combination keeps the generic epilogue (the fast path has not been validated with it).
+    # Select the H4 epilogue before applying BF16 weight-storage overrides.
     h4_fast = (
         qkv == "fp8"
         and heads == 4
@@ -373,9 +369,7 @@ def compile_filter(
             and not publish_blocks
         )
         attrs["num_sms"] = sms * persistent_grid_multiplier
-    # The unrolled main loop with compile-time TMEM stages pays off for the H64 epilogues and for the native low-precision H32
-    # epilogues; it is slower for the H32 FP32 epilogue, which keeps the per-tile loop. Its tile groups read the K scale without the
-    # index clamp (same values): the clamped form made ptxas spill uniform registers around every TMEM load in the H64 FP32 epilogue.
+    # Unrolled groups require aligned K tiles for unclamped scale loads.
     if GEMM.__module__.endswith(".fp8_safe_filter") and (
         heads == 64 or (heads == 32 and (native_bf16 or native_fp16))
     ):

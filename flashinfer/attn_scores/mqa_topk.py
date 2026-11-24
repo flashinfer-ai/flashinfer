@@ -43,7 +43,8 @@ class FP8MQATopKWrapper:
 
     .. note::
        Kimi-K3.1-Pro and GLM-5.3 share H32/D128/K2048/ratio-1. Shape inference
-       selects GLM-5.3; pass ``model_config="Kimi-K3.1-Pro"`` for Kimi.
+       selects GLM-5.3. Naming Kimi selects a distinct policy only for
+       token-scaled FP8 with ``math_mode="relu_strict"``.
 
     .. note::
        ``logits_dtype`` defines score ordering, including conversion ties,
@@ -188,9 +189,10 @@ class FP8MQATopKWrapper:
             in original tokens for the single request.
         num_query_rows : int, optional
             Extent of the supplied Q storage. Defaults to ``max_chunk_size``.
-            The cutedsl stages are launched for this many rows, so a CUDA
-            graph captured from ``run`` belongs to the ``num_query_rows`` of
-            the step it was captured in.
+            Capture a separate run for each supplied row count. The live query
+            prefix may change on replay within that extent. Token-only
+            K1–K3 can limit their launch to those rows. Candidate publication
+            and consumption use the full prepared capacity.
         next_n : int, optional
             Assert that the request has exactly this many query rows.
         host_length_hints : tuple[torch.Tensor, torch.Tensor], optional
@@ -257,11 +259,12 @@ class FP8MQATopKWrapper:
             Blocks contain eight keys. The prefix has
             ``min(ceil(visible_keys / 8), 2048)`` entries, includes the latest
             visible block, and is followed by INT32_MAX padding. Every live
-            block must address the supplied K pool. These device-value
-            preconditions are the caller's responsibility. K1 rejects invalid active
-            rows with -1 output and repair_error bit 0x20. This bit remains set
-            across layers until the next plan() call. Publication from
-            ``publish_candidate_blocks=True`` produces this format.
+            block must address the supplied K pool. Use the candidate buffer
+            from ``input_buffers()`` or a buffer disjoint from plan storage and
+            bound inputs. The caller must satisfy these device-value preconditions.
+            K1 rejects invalid active rows with -1 output and sets repair_error
+            bit 0x20, which remains set across layers until the next plan() call.
+            A wrapper with ``publish_candidate_blocks=True`` produces this format.
 
         Returns
         -------

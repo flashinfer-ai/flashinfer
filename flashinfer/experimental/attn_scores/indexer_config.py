@@ -21,6 +21,8 @@ def resolve_model_config(heads, head_dim, top_k, compression_ratio, model_config
     particular, H4 inputs do not imply Qwen's constant weights.
     Qwen's numerical constraints apply only to an explicitly named model.
     Kimi shares GLM-5.3's shape and must be named to select its policy.
+    H32/D128/K512 infers DS-V4.1-Flash at ratio 2. At ratio 1, callers
+    must name DS-V4.1-Flash explicitly to select its candidate-layer policy.
     """
     config = (heads, head_dim, top_k, compression_ratio)
     if model_config == "DS-V4.1-Flash" and config in (

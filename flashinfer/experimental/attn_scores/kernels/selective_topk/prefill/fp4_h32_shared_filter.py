@@ -735,7 +735,7 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
         tCrB = tiled_mma.make_fragment_B(sQ)  # shared
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
-        # Staged acc (fp16_gemm_3 pattern): append UMMA stage dim
+        # Append the UMMA stage dimension to the accumulator layout.
         # shape: (*acc_shape, STAGE) — dynamic index on last dim reduces rank
         us = self.num_umma_stages
         cols = self.num_tmem_alloc_cols

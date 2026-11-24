@@ -230,10 +230,7 @@ class FP8PrefillMQALogitsKernel:
         )
         self.qsa_weights = qsa_weights
         self.qsa_unit_scale = qsa_unit_scale
-        # H4 epilogue without per-query overheads (identical arithmetic): with N=64 (16 queries per tile), one
-        # 16-column TMEM load per warpgroup and tile covers its four queries, as the N=128 path already does,
-        # instead of one 4-column load per query; per-query weights are cached in registers per Q block
-        # instead of being re-read from SMEM every tile.
+        # At H4, one 16-column TMEM load covers four queries. Cache their weights per Q block.
         self.h4_wide = (
             bool(h4_fast) and num_heads == 4 and umma_n // num_heads * num_heads == 64
         )
@@ -1383,9 +1380,8 @@ class FP8PrefillMQALogitsKernel:
                         q_stage_0 = q_cons_state_umma_0.index
 
                     if cutlass.const_expr(self._umma_group() > 0):
-                        # Lean UMMA path. A group of lcm(KV stages, TMEM stages) consecutive tiles of one Q block returns both rings to their
-                        # entry stage, so inside the group every stage index (smem/TMEM address, barrier slot) is a compile-time constant and the
-                        # scheduler runs once per group. The generic path below handles the remaining tiles and the Q-block changes.
+                        # Unroll complete groups that return both KV and TMEM rings to their entry stages.
+                        # Handle the tail and query-block transitions in the per-tile loop.
                         umma_step = NUM_MATH_WG * self.splits
                         umma_group = self._umma_group()
                         while (
@@ -2795,9 +2791,8 @@ class FP8PrefillMQALogitsKernel:
                         cutlass.Float32,
                     )
                     if cutlass.const_expr(self.num_heads == 4):
-                        # H4 publishes 8-16 queries per tile, so the per-query range test is a visible share of the
-                        # issue slots: start <= kv_pos < end  <=>  (u32)(kv_pos - start) < (u32)max(end - start, 0)
-                        # for non-negative int32 positions (one IADD + one unsigned ISETP instead of two ISETP + PLOP3).
+                        # For nonnegative int32 positions, unsigned (pos - start) < max(end - start, 0)
+                        # tests membership in the half-open interval [start, end).
                         len_cache = cute.make_rmem_tensor(
                             (self.block_q // (self.num_math_threads // 128),),
                             cutlass.Uint32,

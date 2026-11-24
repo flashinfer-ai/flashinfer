@@ -34,12 +34,7 @@ def runtime_samples(
     if cutlass.const_expr(dsv4):
         samples = qwen_samples(length, k, heads=4, coverage=4)
         if cutlass.const_expr(fp4):
-            # MXFP4 sampler: the halved count is kept only while it still expects >= 2.7 top-k hits
-            # (10*k*half >= 27*length). Below that, the rank margin mu+4.5*sqrt(mu)+1 widens the threshold
-            # (count/k ~ rank/mu: 4.7 at mu=2 vs 3.5 at mu=4) and the extra K3/K2 candidates cost more than the K1
-            # samples saved (B200, K buffer = 1M tokens, K1+K2+K3: DS-V4-Pro 196K/256K -29/-53 us, 393-524K -9..-10 us; DS-V4-Flash
-            # 96-128K -8..-16 us; same TopK). DS-V4-Flash keeps the halved count when the full one exceeds 256 samples
-            # (+256 samples cost 29 us of K1 against 12-17 us of K3). The FP8 sampler keeps the halved counts.
+            # Halve the MXFP4 sample count when enough TopK hits are expected to bound the candidate count.
             if cutlass.const_expr(k == 512):
                 if length <= 128 * k:
                     half = max(cutlass.Int32(128), samples // 2)
@@ -96,6 +91,7 @@ def individual_sample_key(
     k: cutlass.Constexpr = 2048,
     dsv4: cutlass.Constexpr = False,
     fp4: cutlass.Constexpr = False,
+    sample_count: cutlass.Constexpr = 0,
 ):
     if cutlass.const_expr(dsv4):
         first = qb * bq
@@ -103,7 +99,9 @@ def individual_sample_key(
         for token in cutlass.range_constexpr(1, bq):
             lower = min(lower, starts[min(nq - 1, first + token)])
         upper = ends[min(nq - 1, first + bq - 1)]
-        return dsv4_cached_sample_key(pos, qb, lower, upper, k, coverage=4, fp4=fp4)
+        return dsv4_cached_sample_key(
+            pos, qb, lower, upper, k, coverage=4, sample_count=sample_count, fp4=fp4
+        )
     else:
         return previous_key(pos, qb, starts, ends, nq, bq, k)
 

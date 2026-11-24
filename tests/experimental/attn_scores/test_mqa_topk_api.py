@@ -35,6 +35,21 @@ def benchmark():
 
 
 @pytest.mark.parametrize(
+    "model,explicit,expected",
+    [
+        (None, None, 1),
+        (None, 4, 4),
+        ("Kimi-K3.1-Pro", None, 1),
+        ("DS-V4.1-Flash", None, 2),
+        ("DS-V4.1-Flash", 1, 1),
+        ("DS-V4-Flash", None, 4),
+    ],
+)
+def test_benchmark_compression_ratio(benchmark, model, explicit, expected):
+    assert benchmark._compression_ratio(model, explicit) == expected
+
+
+@pytest.mark.parametrize(
     ("native_first", "failure"),
     [
         (155.81251525878906, None),

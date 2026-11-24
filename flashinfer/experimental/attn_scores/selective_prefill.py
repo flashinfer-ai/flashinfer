@@ -25,6 +25,8 @@ class _SelectiveStepInputs(_CapacityStepInputs):
         result = super().input_buffers()
         if getattr(self, "q_scale", None) is not None:
             result["q_scale"] = self.q_scale
+        if getattr(self, "candidate_blocks", None) is not None:
+            result["candidate_blocks"] = self.candidate_blocks
         return result
 
     def stage_payload(self, q, weights, copies=None):
@@ -65,8 +67,6 @@ class _CapacitySelectiveTopKPlan:
     ):
         if type(publish_candidate_blocks) is not bool:
             raise TypeError("publish_candidate_blocks must be bool")
-        if publish_candidate_blocks and max_chunk_size > 65535:
-            raise ValueError("candidate publication supports at most 65535 query rows")
         if num_heads not in (4, 32, 64) or head_dim != 128:
             raise ValueError("backend='cutedsl' supports H4/H32/H64 and head_dim=128")
         if max_batch_size != 1:
@@ -105,10 +105,13 @@ class _CapacitySelectiveTopKPlan:
             max_chunk_size,
             max_batch_size,
         )
-        if type(candidate_capacity) is not int or candidate_capacity not in (0, 2048):
+        if publish_candidate_blocks and max_chunk_size > 65535:
+            raise ValueError("candidate publication supports at most 65535 query rows")
+        if type(candidate_capacity) is not int:
+            raise TypeError("candidate_capacity must be an int")
+        if candidate_capacity not in (0, 2048):
             raise ValueError("candidate_capacity must be 0 or 2048")
         self._candidate_capacity = candidate_capacity
-        self._candidate_supplied = False
         # Consumer pools include both history and the current query chunk.
         key_limit = _MAX_POOLED_KEYS + (max_chunk_size if candidate_capacity else 0)
         physical = capacity.max_context_length // compression_ratio
@@ -219,6 +222,7 @@ class _CapacitySelectiveTopKPlan:
                 device=device,
                 dtype=torch.int32,
             )
+            self._state.candidate_blocks = self._candidate_input
             self._candidate_ends = torch.zeros_like(self._starts)
             self._candidate_lens = torch.zeros_like(self._starts)
             self._candidate_starts = torch.zeros_like(self._starts)
@@ -235,10 +239,7 @@ class _CapacitySelectiveTopKPlan:
         pass
 
     def input_buffers(self):
-        result = self._state.input_buffers()
-        if self._candidate_capacity:
-            result["candidate_blocks"] = self._candidate_input
-        return result
+        return self._state.input_buffers()
 
     def _cache_protected_ranges(self):
         from ._topk_runtime import _byte_range
@@ -259,6 +260,13 @@ class _CapacitySelectiveTopKPlan:
             else:
                 merged.append((begin, end))
         self._protected_ranges = tuple(merged)
+
+    def _overlaps_plan(self, bounds):
+        from bisect import bisect_left
+        from ._topk_runtime import _overlap
+
+        index = bisect_left(self._protected_ranges, (bounds[1],))
+        return index > 0 and _overlap(bounds, self._protected_ranges[index - 1])
 
     @staticmethod
     def _layout(tensor):
@@ -478,17 +486,8 @@ class _CapacitySelectiveTopKPlan:
             self._cache_protected_ranges()
 
     def _bind_supplied_rows(self, engine):
-        """Launch K1-K3 for the Q rows this step supplies, not for max_chunk_size.
-
-        The stages are prepared for max_chunk_size rows. A step that supplies fewer
-        (one TP rank's share of a chunk, the last chunk of a prompt) would still
-        sample, load and select for every row slot. K1 and K2 schedule the query
-        blocks of the rows their output argument has and K3 launches one CTA per
-        output row, so binding a prefix view of the output there is the whole
-        change: storage, layouts and kernels stay those of max_chunk_size, and
-        rows past the view are neither written nor read (K4 takes its tasks from
-        the queue K3 fills). Engines that publish or consume candidate blocks keep
-        the full launch: their block stage reads every row.
+        """Bind K1–K3 to the supplied output prefix. K4 reads the recovery queue.
+        Candidate publishers and consumers use all rows in the prepared capacity.
         """
         capacity, rows = self._capacity.max_chunk_size, self._step_rows
         bound = engine.__dict__.get("_bound_rows", capacity)
@@ -532,14 +531,8 @@ class _CapacitySelectiveTopKPlan:
         engine.stages = stages
 
     def _reset_rows_past(self, rows):
-        """Leave the rows no stage is launched for as a full launch leaves them.
-
-        A full launch writes -1 selections and zero candidate counts for the rows
-        past the live prefix. A step that supplies fewer rows than max_chunk_size
-        does not visit the rows past its own, so they are reset here when the step
-        is planned. Every such plan resets them: a CUDA graph that holds the plan
-        of a longer step can be replayed at any time, so the host cannot know
-        which of these rows were written since the last reset.
+        """Reset the unused output rows and counts on every short plan.
+        Replaying a graph captured for a longer step can overwrite the tail.
         """
         if rows >= self._capacity.max_chunk_size or self._rows_bindable is False:
             return
@@ -562,7 +555,7 @@ class _CapacitySelectiveTopKPlan:
         self._engine = engine = self._engines[key]
         if getattr(engine, "_bound_rows", None) != self._step_rows:
             self._bind_supplied_rows(engine)
-        supplied = self._candidate_supplied and not warmup
+        supplied = not warmup
         if self._candidate_capacity and self._engine.sample_bounds is not None:
             self._engine.stages[0] = (
                 "K1",
@@ -646,7 +639,15 @@ class _CapacitySelectiveTopKPlan:
         copies = self._state._payload_copies(q, weights)
         direct_candidates = None
         key = self._pool_key(kv_fused, k_scale)
-        if out is not None and isinstance(out, torch.Tensor):
+        if out is not None:
+            if (
+                not isinstance(out, torch.Tensor)
+                or out.device != self._state.device
+                or out.dtype != torch.int32
+                or out.shape != (q.shape[0], self.top_k)
+                or not out.is_contiguous()
+            ):
+                raise ValueError("out must be contiguous CUDA int32 [Q, top_k]")
             from ._topk_runtime import _byte_range, _overlap
 
             if _overlap(_byte_range(out), _byte_range(k_scale)):
@@ -697,6 +698,16 @@ class _CapacitySelectiveTopKPlan:
 
                 if _overlap(_byte_range(out), _byte_range(candidate_blocks)):
                     raise ValueError("out must not overlap candidate_blocks")
+            from ._topk_runtime import _byte_range
+
+            if (
+                candidate_blocks.numel()
+                and candidate_blocks.data_ptr() != self._candidate_input.data_ptr()
+                and self._overlaps_plan(_byte_range(candidate_blocks))
+            ):
+                raise ValueError(
+                    "candidate_blocks must not overlap plan storage or bound inputs"
+                )
             if (
                 key in self._engines
                 and getattr(self._engines[key], "direct_candidates", False)
@@ -705,8 +716,7 @@ class _CapacitySelectiveTopKPlan:
             ):
                 direct_candidates = candidate_blocks
             elif candidate_blocks.data_ptr() != self._candidate_input.data_ptr():
-                self._candidate_input[: q.shape[0]].copy_(candidate_blocks)
-            self._candidate_supplied = True
+                copies += ((self._candidate_input[: q.shape[0]], candidate_blocks),)
         elif candidate_blocks is not None:
             raise ValueError("candidate_blocks requires candidate_capacity=2048")
         return self._run_layer(
@@ -849,29 +859,17 @@ class _CapacitySelectiveTopKPlan:
         candidate_blocks=None,
     ):
         """Score a layer; consume/copy the shared output before the next layer."""
-        from bisect import bisect_left
         from ._topk_runtime import _byte_range, _overlap
 
         # Payload metadata checks precede allocation or staging. Output alias
         # checks below include the storage of a lazily prepared first pool.
         selected = self._selected[: q.shape[0]]
         if out is not None:
-            if (
-                not isinstance(out, torch.Tensor)
-                or out.device != self._state.device
-                or out.dtype != torch.int32
-                or out.shape != (q.shape[0], self.top_k)
-                or not out.is_contiguous()
-            ):
-                raise ValueError("out must be contiguous CUDA int32 [Q, top_k]")
             if out.data_ptr() != selected.data_ptr():
                 bounds = _byte_range(out)
                 # Static intervals are sorted and disjoint; only the nearest
                 # predecessor can overlap. Per-call inputs add three checks.
-                index = bisect_left(self._protected_ranges, (bounds[1],))
-                static_overlap = index > 0 and _overlap(
-                    bounds, self._protected_ranges[index - 1]
-                )
+                static_overlap = self._overlaps_plan(bounds)
                 inputs = tuple(
                     _byte_range(tensor)
                     for tensor in (q, weights, kv_fused)

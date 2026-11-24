@@ -253,13 +253,8 @@ def _packed_clamp_cursor(
 
 
 class GvrPackedClampWindowKernel:
-    """Register-resident BF16 TopK with a sampled histogram window.
-
-    Each CTA loads a full row. The window has 32 edge bins on each side;
-    ambiguous crossing bins use exact two-pass radix selection.
-    NaNs map to -inf, ties are unordered, and short rows are padded with -1.
-
-    Uses 512 threads, eight packed vectors per thread and 1024 histogram bins.
+    """Select BF16 TopK using a sampled histogram and exact radix selection at the cutoff.
+    NaNs map to -inf, ties are unordered and short rows are padded with -1.
     """
 
     def __init__(self, *, pdl: bool = False) -> None:

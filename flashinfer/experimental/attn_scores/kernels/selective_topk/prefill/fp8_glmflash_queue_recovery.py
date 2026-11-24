@@ -1026,10 +1026,7 @@ class FP8PrefillMQALogitsKernel:
             use_2cta_instrs,
         )
 
-        # ===== SCHEDULER STATE =====
-        # Grid-stride: each SM starts at q_block_idx = sm_idx and advances by num_sms.
-        # Math warp uses two-level loop: outer per-Q-block, inner per-KV-pair.
-        # TMA/UMMA warps keep flat loop.
+        # Math warps iterate KV pairs within each query block. TMA and UMMA use a flat schedule.
         q_block_idx = cutlass.Int32(sm_idx)
         kv_idx = cutlass.Int32(current_kv_lo)
         num_kv = current_num_kv
@@ -1463,10 +1460,7 @@ class FP8PrefillMQALogitsKernel:
 
                 tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
 
-                # Weight register cache. Total budget ~144 fp32 registers for
-                # w_cache: block_q=4 (N=256) fits 36 heads/token (the rest go
-                # through the SMEM path); block_q=2 (N=128) fits all 64 heads,
-                # eliminating SMEM weight reads from the hot loop entirely.
+                # Cache the weights that fit the register budget. Read remaining heads from shared memory.
                 if cutlass.const_expr(self.max_w_in_reg > 0):
                     MAX_NUM_W_IN_REG = self.max_w_in_reg
                 elif cutlass.const_expr(self.epi_dtype == cutlass.Float16):
@@ -1534,10 +1528,7 @@ class FP8PrefillMQALogitsKernel:
                                     )
                                     else 1.0
                                 )
-                            # Clamp to last real token for padding slots in a partial
-                            # Q block. Padded slots inherit its KV boundary and may
-                            # write to logits padding rows (beyond [:num_q_tokens]),
-                            # which are invisible to callers.
+                            # Padding slots inherit the last real query's KV bound and write only to padding rows.
                             token_idx = min(q_base + t_i, num_q_tokens - 1)
                             kv_start_cache[t_i] = mCuSeqLenKStart[token_idx]
                             kv_end_cache[t_i] = mCuSeqLenKEnd[token_idx]
@@ -2105,10 +2096,7 @@ class FP8PrefillMQALogitsKernel:
                                     )
                                     else 1.0
                                 )
-                            # Clamp to last real token for padding slots in a partial
-                            # Q block. Padded slots inherit its KV boundary and may
-                            # write to logits padding rows (beyond [:num_q_tokens]),
-                            # which are invisible to callers.
+                            # Padding slots inherit the last real query's KV bound and write only to padding rows.
                             token_idx = min(q_base + t_i, num_q_tokens - 1)
                             kv_start_cache[t_i] = mCuSeqLenKStart[token_idx]
                             kv_end_cache[t_i] = mCuSeqLenKEnd[token_idx]

@@ -146,10 +146,8 @@ class Crossing:
             self.bank_threads = 64
             self.cache_items = 16
             self.bank_cache = 1024
-        # Whole-warp fast path: a bank's entries are dense from offset 0, so when the warp's last lane still has all of
-        # its cache_items entries live, every lane does and the passes need no per-entry `offset<bank_count` branch
-        # (those branches cost ~20% of K3's issue slots: BSSY/BSYNC/BRA/ISETP per entry). Same entries, same order.
-        # The narrow-cache and wide-index layouts keep the per-entry path.
+        # Bank entries occupy a dense prefix. A warp whose last lane is in range
+        # can read the entire tile without per-entry bounds checks.
         self.full_warps = (
             precounted
             and not packed

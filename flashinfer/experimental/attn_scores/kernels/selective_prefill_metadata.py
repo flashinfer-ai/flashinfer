@@ -9,18 +9,9 @@ from cutlass.utils.smem_allocator import SmemAllocator
 
 
 class SelectivePrefillMetadata:
-    """Reduce live contract violations, then publish fail-closed row bounds.
-
-    Step validation already supplies a contiguous prefix of active rows and
-    monotone causal ends. Padding therefore needs the last live end, not a
-    prefix scan. A separate launch makes all contract flags visible before any
-    row is published; flags are overwritten on every layer and replay.
-    With validation, publish is a programmatic dependent launch: it loads its
-    row bound while validate runs and waits for validate's completion before it
-    reads any flag or writes a row, which hides the second launch's latency.
-    Validate itself must stay an ordinary launch: it then starts only after the
-    work that fills active/row_ends has completed, which is what makes
-    publish's reads ahead of its wait safe. pdl=False launches both normally.
+    """Validate the active prefix before publishing row bounds.
+    Validation launches normally so all input bounds are ready. With PDL, publication
+    may preload those bounds but must wait before reading flags or updating outputs.
     """
 
     def __init__(
@@ -151,9 +142,7 @@ class SelectivePrefillMetadata:
         lane, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         if cutlass.const_expr(self.pdl):
-            # Validate is an ordinary launch, so everything that fills active/row_ends completed before it
-            # started and therefore before this kernel. Flags and the row outputs (still read by the
-            # previous layer's K4) are touched only after the wait.
+            # Wait before reading validation flags or reusing row outputs still owned by K4.
             pre_row = block * 32 + lane
             pre_live = active[0]
             pre_end = cutlass.Int32(0)

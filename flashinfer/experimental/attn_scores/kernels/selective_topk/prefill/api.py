@@ -369,9 +369,7 @@ class ThrowawayTopK:
                 candidate_cols = max(candidate_cols, min(cols, 9 * top_k // 2))
         if heads in (32, 64) and top_k == 2048 and n <= 8 * top_k:
             candidate_cols = max(candidate_cols, min(cols, 3 * top_k))
-        # For FP8 top_k=2048 rows past 64*k, K1 keeps candidate tails narrow (H64 samples grow with length; H32
-        # grows past 128*k in sampler_upper_fp8): max ~5.5*k (H64) / ~6.6*k (H32) where the slab was 15-18*k
-        # (1.9-2.4 GiB at Q8192). Cap the per-row slab at 10*k; a row above it takes the existing exact recovery.
+        # Limit the FP8 candidate arena for long K2048 rows. K4 recovers rows that overflow.
         if (
             self.qkv_dtype == "fp8"
             and top_k == 2048
@@ -725,6 +723,7 @@ class ThrowawayTopK:
             ds41_sample_count, ds41_sample_sigma = 1024, 5.0
         separate_span_loops = short_publisher or bool(
             policy.get("ds41")
+            and policy.get("shared_kv_queries")
             and native_bf16
             and logits_dtype == torch.bfloat16
             and heads == 32
@@ -918,6 +917,7 @@ class ThrowawayTopK:
         # four-query and 128-key tiles keep this TMA view within live storage.
         shared_fp8_queries = (
             native_fp16
+            and logits_dtype == torch.float16
             and heads == 64
             and self.qkv_dtype == "fp8"
             and m >= 4 * sms
@@ -928,15 +928,7 @@ class ThrowawayTopK:
         )
         self.shared_fp8_queries = shared_fp8_queries
         # Validated ends fit N; aligned N contains every complete 128-key tile.
-        # GLM H32 FP8 with FP32 logits: at Q >= 8192 the pair-query epilogue (two queries per thread, four TMEM
-        # sub-tiles) serves every n > 4*top_k, aligned or not (unaligned n clamps the K-scale index). 8*top_k < n <
-        # 32*top_k (16K-64K actual-length rows) used the default/short-tile epilogue: the pair path is 1.06-1.08x there
-        # (B200 GLM-5.3, same TopK output), and capacity-planned callers (n = capacity) already took it. The former
-        # long-row variant (default epilogue + integer-ReLU period from 256*top_k) spilled to local memory; B200 GLM-5.3
-        # Q8192 per layer: 1M 1.08x, 512K 1.08x, unaligned 1M 1.07x. Without the pair path (Q < 8192) the integer period
-        # is dropped for aligned n (no spill: Q4096/Q2048 1.03-1.06x) but kept for unaligned n, where the clamped scale
-        # load otherwise lands on the critical path (Q4096 1M: +11% cycles, long-scoreboard stalls on the scale multiply).
-        # All epilogues compute identical scores (same per-head FMA chains and head sum); only the publish order differs.
+        # The pair-query epilogue clamps K-scale indices for a partial final tile.
         glm_pair = (
             m >= 8192
             and heads == 32
@@ -1135,8 +1127,7 @@ class ThrowawayTopK:
             capacity_policy["bank_local"] = short_publisher
             capacity_policy["narrow_cache"] = publisher_narrow
             capacity_policy["producer_complete"] = parallel_blocks
-        # DS-V4-Flash (k=512) keeps the 256-thread K3 at every n: capacity-planned callers (n = 1M) otherwise run the
-        # 512-thread wide-cache K3 on short live rows (B200, K buffer = 1M tokens, MXFP4: 64K 1.022x, 128K 1.006x, 1M 1.000x; same output).
+        # Use the smaller K3 CTA for K512 because live rows may be much shorter than capacity.
         selector = compile_selection(
             top_k,
             dtype,

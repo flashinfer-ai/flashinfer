@@ -172,10 +172,7 @@ class FP4PrefillMQALogitsKernel:
         self.epi_dtype = epi_dtype
         self.weight_dtype = weight_dtype
         self.weight_bytes = 2 if weight_dtype == cutlass.BFloat16 else 4
-        # When True, skip the in-kernel SMEM warp_transpose for KV SF; assume
-        # the host has pre-arranged GMEM SF into UTCCP chunk layout (block_kv=128
-        # = 1 UTCCP atom). Q SF transpose is NOT affected by this flag (deferred
-        # to a separate phase).
+        # Prepacked KV scales already use the UTCCP layout. Q scales still need a transpose.
         self.remove_online_sf_transpose = remove_online_sf_transpose
         # When True, defer per-t STG to register array and emit all STGs in
         # one contiguous LSU phase after the for-t loop (epilogue micro-opt).
@@ -240,10 +237,7 @@ class FP4PrefillMQALogitsKernel:
         self.b_major_mode = b_major
 
         self.mma_tiler = (*self.mma_tiler_mn, 1)
-        # Block-scaled MXF4 MMA. ab_dtype = Float4E2M1FN, sf_vec_size=32.
-        # Inst K is locked to 64 inside `MmaMXF4Op`; the helper picks
-        # SWIZZLE_64B for FP4 (head_dim/2 = 64 byte innermost).
-        # The helper accepts separate A/B dtypes for block-scaled MMA.
+        # MXF4 uses K=64 and one scale per 32 elements. Each D128 FP4 row occupies 64 bytes.
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             a_dtype,
             b_dtype,
@@ -344,10 +338,7 @@ class FP4PrefillMQALogitsKernel:
         ) * mma_inst_tile_k
         self.num_sfb_tmem_cols = (N_padded // sf_atom_mn) * mma_inst_tile_k
 
-        # Total TMEM = staged acc (per WG) + per-WG SFA + shared SFB (Q SF).
-        # SFA must be per-WG: each UMMA warp does its own UTCCP+MMA over its
-        # own KV block, so they must NOT share a single SFA TMEM region or
-        # they race on writes.
+        # Each UMMA warp writes its own KV scale region in TMEM. Both groups share Q scales.
         raw_total = (
             self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages
             + self.num_sfa_tmem_cols * self.num_groups
@@ -425,10 +416,7 @@ class FP4PrefillMQALogitsKernel:
         # type inference and TMA descriptors are correct.
         b = cute.recast_tensor(b, self.input_dtype)
 
-        # KV data view: [block_kv, head_dim, num_kv_blocks] FP4 elements
-        # (contiguous, no block_table indirection).
-        # Innermost stride 1 = consecutive FP4 elem = packed pair share a byte.
-        # Per-row stride = head_dim FP4 elem = head_dim/2 bytes.
+        # Contiguous KV uses FP4 element strides: two elements per byte.
         num_kv_blocks = num_kv_tokens // self.block_kv
         kv_layout = cute.make_layout(
             (self.block_kv, self.head_dim, num_kv_blocks),
@@ -495,10 +483,7 @@ class FP4PrefillMQALogitsKernel:
             self.w_smem_layout_staged.shape[:1],
         )
 
-        # TMA for SF KV — [block_kv, num_kv_blocks] int32, tile [block_kv].
-        # SMEM holds block_kv int32 SF per stage (= block_kv tokens).
-        # FLAT M-row-major; UMMA warp does an in-place SMEM
-        # transpose to chunk byte layout before issuing UTCCP.
+        # TMA loads one int32 of KV scales per token. UTCCP uses the transposed byte layout.
         self.sf_kv_smem_layout_staged = cute.make_layout(
             (self.block_kv, self.num_kv_stages)
         )
@@ -542,10 +527,7 @@ class FP4PrefillMQALogitsKernel:
         # Per KV block (FP4):
         #   block_kv * (head_dim/2) bytes data + block_kv * 4 bytes SF
         self.num_kv_sf_tma_bytes = self.block_kv * half_head_dim + self.block_kv * 4
-        # Q + SF_Q + Weights share barrier (Q-pipe). SF Q TMA descriptor tile
-        # covers N entries (see TMA atom construction above), so the actual
-        # GMEM→SMEM transfer is N int32 = self.N * 4 bytes. Barrier tx_count
-        # must match the real fetch.
+        # The Q pipeline barrier counts Q, weights and N packed int32 scale words.
         sf_q_tma_bytes = self.N * 4
         self.num_q_tma_bytes = (
             b_copy_size * atom_thr_size + sf_q_tma_bytes + w_copy_size
@@ -1124,10 +1106,7 @@ class FP4PrefillMQALogitsKernel:
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
 
-        # TMEM — only Math warps (8×32=256) + UMMA warps (2×32=64) = 320 threads
-        # TMA warps do NOT participate, so they can start TMA loads earlier.
-        # Math warp 0 is the allocator (like fp16_gemm_3's epilogue warp 0),
-        # because math warps are the last TMEM consumers (epilogue reads).
+        # Only math and UMMA warps join the TMEM barrier. Math warp 0 owns the allocation.
         tmem_alloc_num_threads = 320  # 10 warps: warp 0-7 (math) + warp 10-11 (umma)
         _tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=tmem_alloc_num_threads
@@ -1303,7 +1282,7 @@ class FP4PrefillMQALogitsKernel:
         tCrB = tiled_mma.make_fragment_B(sQ)  # shared
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
-        # Staged acc (fp16_gemm_3 pattern): append UMMA stage dim
+        # Append the UMMA stage dimension to the accumulator layout.
         # shape: (*acc_shape, STAGE) — dynamic index on last dim reduces rank
         us = self.num_umma_stages
         cols = self.num_tmem_alloc_cols
@@ -1326,10 +1305,7 @@ class FP4PrefillMQALogitsKernel:
             use_2cta_instrs,
         )
 
-        # ===== SCHEDULER STATE =====
-        # Grid-stride: each SM starts at q_block_idx = sm_idx and advances by
-        # num_sms. Math warps use a two-level loop: outer per-Q-block, inner
-        # per-KV-pair. TMA/UMMA warps keep the flat loop.
+        # Math warps iterate KV pairs within each query block. TMA and UMMA use a flat schedule.
         q_block_idx = cutlass.Int32(sm_idx)
         kv_idx = cutlass.Int32(current_kv_lo)
         num_kv = current_num_kv
@@ -1621,10 +1597,7 @@ class FP4PrefillMQALogitsKernel:
                     # Wait for Q pipeline when the Q block changes
                     if q_block_idx != q_block_idx_old:
                         if q_block_idx_old < num_q_blocks:
-                            # WAR closure: commit our own old-q MMAs. The
-                            # wait::st below covers only the s2t store;
-                            # mma -> cp is not a pipelined pair, so our MMAs
-                            # need commit -> mbarrier too (see pipeline def).
+                            # Commit outstanding MMAs before overwriting their scales. The store wait covers only UTCCP.
                             sfb_war_pipeline.producer_commit(sfb_war_prod_state)
                             q_cons_state_umma_0.advance()
                         q_pipeline.consumer_wait(q_cons_state_umma_0)
@@ -1646,9 +1619,7 @@ class FP4PrefillMQALogitsKernel:
                         if q_block_idx_old < num_q_blocks:
                             sfb_war_pipeline.consumer_wait(sfb_war_cons_state)
                             sfb_war_cons_state.advance()
-                        # UTCCP atom is UE8M0-typed; the int32 SMEM (4 packed
-                        # UE8M0 per int32) needs a recast for the s2t copy +
-                        # chunk layout (which counts UE8M0 cells, 4× int32).
+                        # Recast each packed int32 as four UE8M0 elements for the UTCCP copy.
                         sSF_Q_ue8m0 = cute.recast_tensor(sSF_Q, Float8E8M0FNU)
                         stage_off_ue8m0 = q_stage_0 * sSF_Q_ue8m0.layout.stride[1]
                         sSF_Q_chunk = cute.make_tensor(
@@ -1764,10 +1735,7 @@ class FP4PrefillMQALogitsKernel:
                     has_work = next_q_block_idx < num_q_blocks
 
         elif is_umma_warp_1:
-            # UMMA warp for group 1
-            # Explicitly waits on Q pipeline — critical because TMA warp 1
-            # only loads KV1, not Q. Without this wait, UMMA warp 1 can
-            # start GEMM before TMA warp 0 finishes loading Q into SMEM.
+            # Warp 0 loads Q for both groups, so group 1 also waits on the Q pipeline.
             cute.arch.warpgroup_reg_dealloc(self.store_registers)
 
             # TMEM: wait for umma_warp_0's allocation, retrieve pointer
@@ -1777,10 +1745,7 @@ class FP4PrefillMQALogitsKernel:
                 tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout
             )
 
-            # SF TMEM tensors. Group 1 owns SFA cols
-            # [sf_base + num_sfa_tmem_cols, sf_base + 2*num_sfa_tmem_cols).
-            # SFB is shared (Q SF); warp 0 issued the SFB UTCCP for Q and
-            # warp 1 must NOT re-issue (would double-write).
+            # Group 1 has private KV scale columns. Warp 0 writes the shared Q scale columns.
             sf_base_offset = (
                 self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages
             )
@@ -1838,10 +1803,7 @@ class FP4PrefillMQALogitsKernel:
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                     kv_stage_1 = kv_cons_state_umma_1.index
 
-                    # SF KV (group 1) transpose + UTCCP.
-                    # When remove_online_sf_transpose=True, the host has already
-                    # pre-arranged GMEM SF into UTCCP chunk layout, so the
-                    # in-kernel SMEM transpose (and its fence) can be skipped.
+                    # Transpose group 1 KV scales only when the input uses row-major layout.
                     if cutlass.const_expr(not self.remove_online_sf_transpose):
                         sf_kv_atoms_1 = self.block_kv // 128
                         for atom_idx in cutlass.range_constexpr(sf_kv_atoms_1):
@@ -1899,10 +1861,7 @@ class FP4PrefillMQALogitsKernel:
                     umma_pipeline_1.producer_commit(umma_prod_state_1)
                     umma_prod_state_1.advance()
 
-                    # Per-iter sync with umma_warp_0 — see umma_warp_0 for
-                    # rationale. Lock-steps the two UMMA warps every tile so
-                    # warp 0 cannot overwrite SFB while warp 1's MMA is still
-                    # reading it.
+                    # Synchronize both UMMA warps before warp 0 reuses the shared Q scales.
                     subset_barrier(barrier_id=2, number_of_threads=64)
 
                     # Scheduler advance (grid-stride)
@@ -2315,10 +2274,7 @@ class FP4PrefillMQALogitsKernel:
                                             )
                             # result reduction — packed path catches both
                             if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
-                                # Spelled out, not reduce(): the (S0+S2)+(S1+S3)
-                                # pairing lets both adds land in one packed HADD2,
-                                # then a second folds the halves -- 2 instructions,
-                                # and bit-exact.
+                                # Preserve the packed reduction order: (S0 + S2) + (S1 + S3).
                                 result_t = (ps[0] + ps[2]) + (ps[1] + ps[3])
                             else:
                                 # Preserve left-to-right accumulation. ReLU scaling is already folded
@@ -2825,10 +2781,7 @@ class FP4PrefillMQALogitsKernel:
                                             )
                             # result reduction
                             if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
-                                # Spelled out, not reduce(): the (S0+S2)+(S1+S3)
-                                # pairing lets both adds land in one packed HADD2,
-                                # then a second folds the halves -- 2 instructions,
-                                # and bit-exact.
+                                # Preserve the packed reduction order: (S0 + S2) + (S1 + S3).
                                 result_t = (ps[0] + ps[2]) + (ps[1] + ps[3])
                             else:
                                 # Preserve left-to-right accumulation. ReLU scaling is already folded

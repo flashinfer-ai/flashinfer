@@ -12,36 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compare full/public-GVR2 and selective QK-to-TopK graph replay.
+"""Compare full scoring plus GVR2 with selective TopK on identical seeded inputs.
 
-Examples (original-token contexts; ratio4 consumes synthetic precompressed KV)::
+Time step setup and per-layer CUDA graph replay separately. For L layers the cost
+is setup + L × layer. Each route settles before its timed block, with a five-second
+pause after each block. KV lengths count original tokens, including Q.
 
-    python benchmarks/bench_fp8_mqa_selective_logits.py --q 8192 --kv 8192 \
-        --num-heads 64 --top-k 512 --compression-ratio 4
+Examples::
+
+    python benchmarks/bench_fp8_mqa_selective_logits.py --q 8192 --kv 8192 --num-heads 64 --top-k 512 --compression-ratio 4
     python benchmarks/bench_fp8_mqa_selective_logits.py --summarize results/*.json
 
-Per-step setup runs once per forward pass and is shared by all indexer layers.
-Full builds row/group metadata and request IDs, gathers the page table, and
-computes the scorer schedule. Selective binds continuous K/scales and calls
-plan(): prefix copy, validation,
-row metadata, scorer schedules, and sampling-metadata refresh.
-
-Layer is one indexer TopK operation for one layer. Full calls
-fp8_paged_mqa_logits followed by top_k_varlen(backend="gvr_2"); selective calls
-run(), including sampling, candidate publication, selection, and exact repair.
-For L indexer layers, model cost per forward pass is per-step setup + L * layer;
-a standalone single call costs per-step setup + layer.
-
-This benchmark generates seeded inputs and measures separate per-step setup
-and layer CUDA graph pairs in an AxN-5s-BxN-5s sequence. Immediately before
-each timed block, its own route runs continuously for --settle-seconds (2s
-by default), so both orders measure sustained load after the idle pauses.
-Successful runs also print a validated Markdown report; --output
-remains raw JSON. The --summarize mode regenerates that report without importing
-Torch or using CUDA. Inputs must share one environment, GPU and schema;
-partial successful prefixes are labeled and duplicate cells are rejected.
-Use --max-context-length to reserve a fixed original-token capacity while
---kv sets the live context; omission sizes each route to its live context.
+Use --output to save raw JSON. The summary runs without PyTorch or CUDA.
 """
 
 from __future__ import annotations
@@ -348,14 +330,8 @@ def _record_event(call) -> float:
 def _paired_events(
     call_a, call_b, warmups: int, repeats: int, *, reverse=False, settle_seconds=2.0
 ):
-    """After warmup, run A×N, sleep 5s, B×N, sleep 5s on identical inputs.
-
-    Before each block, replay that block's route for the requested settling
-    duration and synchronize it. Each sample times one graph replay with its
-    own completed CUDA end event.
-    There is no deliberate sleep between samples in an arm. Synchronize before
-    each arm's pause, including the final B pause, and return both durations
-    separately from GPU latency. Host event/enqueue overhead remains between replays.
+    """Time one graph replay per CUDA event after settling each route.
+    Return host pause durations separately from the GPU timings.
     """
     if repeats <= 0:
         raise ValueError("paired measurement requires a positive repeat count")
@@ -506,22 +482,9 @@ def _model_quantize(rows, columns, *, generator, fp4):
 
 @dataclass(frozen=True)
 class _ReferenceGroups:
-    """Immutable host metadata for request-local full-score query grouping.
-
-    Use :meth:`build` to validate prefixes and construct the fields. Query
-    prefixes count real rows; token prefixes count original, uncompressed
-    tokens. All stored KV ends and ``physical_prefix`` use physical KV slots.
-    No device tensors, query payloads or page tables are allocated here.
-
-    ``rows`` contains ``(output_base, valid_queries, *physical_ends)`` for each
-    group, with zero ends in padded slots. ``group_ends`` and ``request_ids``
-    give each group's maximum physical end and originating request.
-    ``gather_rows`` maps flattened group slots to real input query rows;
-    padded slots repeat a valid row in that group and are identified by
-    ``invalid_queries`` so callers can zero their gathered Q/weights.
-    ``real_ends`` contains one physical end per real output row.
-    ``physical_prefix`` accumulates each request's floored physical length.
-    Empty-query requests produce no groups. Grouping never crosses a request.
+    """Group query rows within each request. KV ends and offsets count physical keys.
+    Each row descriptor holds the output base, valid query count and per-slot ends.
+    Padded slots gather a valid row with a zero end and are masked before scoring.
     """
 
     query_tile: int
@@ -538,22 +501,11 @@ class _ReferenceGroups:
 
     @classmethod
     def build(cls, q_prefix, token_prefix, ratio, query_tile):
-        """Build grouping metadata from cumulative host integer prefixes.
-
-        ``q_prefix`` and ``token_prefix`` must have the same batch-plus-one
-        length, start at zero and be nondecreasing. A request with Q queries
-        and L original KV tokens requires ``L >= Q``. For ratio 1 or 4, query
-        i's exclusive physical end is ``(L - Q + i + 1) // ratio``; physical
-        request lengths are floored before forming their cumulative prefix.
-
-        ``query_tile`` is a positive integer number of queries per group.
-        The last group of a request may contain padded slots, but output
-        bases and valid counts cover only real rows. Return an _ReferenceGroups
-        containing tuples independent of the input sequences; raise ValueError
-        for invalid prefix, ratio, grouping or row-encoding contracts.
+        """Build groups from query and original-token prefixes, padding each request separately.
+        Query i sees (L - Q + i + 1) // ratio physical keys for a request of L tokens.
         """
-        if type(ratio) is not int or ratio not in (1, 4):
-            raise ValueError("ratio must be 1 or 4")
+        if type(ratio) is not int or ratio not in (1, 2, 4):
+            raise ValueError("ratio must be 1, 2 or 4")
         if type(query_tile) is not int or query_tile <= 0:
             raise ValueError("positive integer query tile required")
         q_prefix, token_prefix = tuple(q_prefix), tuple(token_prefix)
@@ -607,16 +559,8 @@ class _ReferenceGroups:
 
 
 class _FullGVR:
-    """Public scorer/GVR composition with separate step and layer callables.
-
-    Uniform requests must divide evenly into the configured query tile. Q and
-    weights then use address-stable views, without cross-request grouping.
-    Query topology is fixed; every step derives physical row/group bounds and
-    request IDs from device prefixes, gathers the live map and refreshes the
-    public scorer schedule. Layer replay consumes those address-stable owners.
-
-    FP8 uses the public paged scorer and GVR. Block-scaled encodings use
-    a PyTorch FP32 dense scorer followed by GVR.
+    """Prepare page maps, row bounds and the schedule once per step.
+    Each layer replays the public paged FP8 scorer followed by GVR.
     """
 
     def __init__(
@@ -1004,6 +948,16 @@ def _check_reference(
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
     return maximum_error
+
+
+def _compression_ratio(model_config, explicit_ratio):
+    if explicit_ratio is not None:
+        return explicit_ratio
+    if model_config is None:
+        return 1
+    from flashinfer.experimental.attn_scores.indexer_config import MODEL_CONFIGS
+
+    return MODEL_CONFIGS[model_config][3]
 
 
 def _context_capacity(kv_len, max_context_length, compression_ratio):
@@ -1505,6 +1459,8 @@ def main() -> None:
             "GLM-5.3-Flash",
             "GLM-5.3",
             "Qwen3.8-Flash-Next",
+            "Kimi-K3.1-Pro",
+            "DS-V4.1-Flash",
         ),
         help="Synthetic model input contract, independent of the optional model configuration.",
     )
@@ -1517,6 +1473,8 @@ def main() -> None:
             "GLM-5.3-Flash",
             "GLM-5.3",
             "Qwen3.8-Flash-Next",
+            "Kimi-K3.1-Pro",
+            "DS-V4.1-Flash",
         ),
     )
     parser.add_argument(
@@ -1526,7 +1484,12 @@ def main() -> None:
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--top-k", type=int, choices=(512, 1024, 2048), default=512)
-    parser.add_argument("--compression-ratio", type=int, choices=(1, 4), default=1)
+    parser.add_argument(
+        "--compression-ratio",
+        type=int,
+        choices=(1, 2, 4),
+        help="Physical KV compression ratio. Defaults to the model-config ratio, or 1 without a model-config.",
+    )
     parser.add_argument("--full-query-tile", type=int)
     parser.add_argument("--kv", type=int, nargs="*", default=ROWS)
     parser.add_argument(
@@ -1556,10 +1519,11 @@ def main() -> None:
     if args.summarize is not None:
         print(render_summary(args.summarize))
         return
+    args.compression_ratio = _compression_ratio(
+        args.model_config, args.compression_ratio
+    )
     if args.q <= 0 or args.batch_size <= 0 or args.warmups < 0:
         raise ValueError("q and batch-size must be positive; warmups nonnegative")
-    if args.qkv_dtype == "mxfp4" and args.num_heads != 64:
-        raise ValueError("MXFP4 Full comparison requires H64")
     if args.batch_size != 1 or args.num_heads not in (4, 32, 64):
         raise ValueError("selective prefill requires batch size 1 and H4/H32/H64")
     if args.full_query_tile is not None and args.full_query_tile <= 0:

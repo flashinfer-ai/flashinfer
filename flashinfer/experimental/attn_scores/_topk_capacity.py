@@ -83,14 +83,8 @@ def _validate_step_shape(capacity, num_query_rows, next_n):
 
 @dataclass(frozen=True)
 class _TopKCapacity:
-    """Immutable host-side storage bounds for one TopK planning bucket.
-
-    Context lengths count original tokens; physical lengths are computed by
-    flooring each request separately at the selected compression ratio.
-    ``max_chunk_size`` bounds supplied Q storage across the entire step, while
-    ``max_batch_size`` bounds the number of requests. Fields are positive int32
-    values, with compression ratio 1, 2 or 4; bools are rejected.
-    Scorer specialization and device resource checks occur when building the chain.
+    """Host-side bounds for one planning bucket. Context lengths count original
+    tokens. Floor physical lengths per request. The chunk bounds all supplied Q rows.
     """
 
     num_heads: int
@@ -122,21 +116,9 @@ class _TopKCapacity:
 
 
 class _CapacityStepInputs:
-    """Own stable payload/prefix buffers and sanitized per-step row metadata.
-
-    ``stage_step`` and ``stage_payload`` check tensor metadata and aliases, then enqueue copies without
-    reading device values or synchronizing. It is capturable: the external
-    source addresses and supplied extents then belong to the caller's graph.
-    ``input_buffers`` exposes Q/weights/prefix storage for zero-copy staging;
-    callers still pass those views to plan/run
-    to publish their row/batch extents. The supplied Q extent is an upper bound,
-    not an equality constraint on the last query prefix; inactive rows remain -1
-    in the owning chain's output.
-
-    ``refresh`` validates prefixes and capacity before publishing sanitized
-    physical prefixes, row ends and owners. Metadata addresses remain stable.
-    Error bits 1, 2 and 4 identify invalid extents, prefixes and capacity.
-    Errors publish zero active rows and owner -1.
+    """Stage copies or bind caller inputs at stable addresses for graph replay.
+    The supplied Q extent bounds live rows. Refresh validates extents, prefixes
+    and capacity (bits 1, 2 and 4). Errors publish zero active rows and owner -1.
     """
 
     def __init__(

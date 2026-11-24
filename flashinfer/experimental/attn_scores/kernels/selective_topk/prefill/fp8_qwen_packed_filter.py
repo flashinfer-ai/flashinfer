@@ -1070,10 +1070,7 @@ class FP8PrefillMQALogitsKernel:
             use_2cta_instrs,
         )
 
-        # ===== SCHEDULER STATE =====
-        # Grid-stride: each SM starts at q_block_idx = sm_idx and advances by num_sms.
-        # Math warp uses two-level loop: outer per-Q-block, inner per-KV-pair.
-        # TMA/UMMA warps keep flat loop.
+        # Math warps iterate KV pairs within each query block. TMA and UMMA use a flat schedule.
         q_block_idx = cutlass.Int32(num_q_blocks - 1 - sm_idx)
         kv_idx = cutlass.Int32(current_kv_lo)
         num_kv = current_num_kv

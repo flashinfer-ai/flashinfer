@@ -977,10 +977,7 @@ class FP8PrefillMQALogitsKernel:
             use_2cta_instrs,
         )
 
-        # ===== SCHEDULER STATE =====
-        # Grid-stride: each SM starts at q_block_idx = sm_idx and advances by num_sms.
-        # Math warp uses two-level loop: outer per-Q-block, inner per-KV-pair.
-        # TMA/UMMA warps keep flat loop.
+        # Math warps iterate KV pairs within each query block. TMA and UMMA use a flat schedule.
         q_block_idx = cutlass.Int32(sm_idx)
         kv_idx = cutlass.Int32(current_kv_lo)
         num_kv = current_num_kv
@@ -2668,13 +2665,7 @@ from .native_heads import head_zero, head_sum, native_head_fma4
 from .native_heads import native_weight_pair
 
 
-# ---- Grow FP8 K1 samples past the 1024 cap on long H32-K2048 rows (GLM) ----
-# The 1024 cap leaves ~2 expected top-k hits per row at 512*k keys, so the 6-sigma proposal keeps ~5.4*k
-# candidates (K2 publishes and K3 selects all of them) with a wide tail (the slab is sized 16-18*k).
-# Past 128*k keys these rows keep ~8 expected hits, as the H64 policy already does; the narrow candidate tail
-# (max ~6.6*k at 1M instead of ~14*k) lets api.py cap the candidate slab at 10*k. Only this FP8 sampler module
-# rebinds the names below; FP4/paged samplers, K2/K4 and DSV4 keep the shared policies. Output selection is
-# unchanged: thresholds only decide how many candidates survive; underfilled rows take exact recovery.
+# Scale the H32 FP8 K2048 sample count with the visible key span.
 from .policy_dsv4 import runtime_samples as _base_runtime_samples
 from .sample_count_policy import shape_sample_key as _base_shape_key
 from .policy_qwen import sample_hash_u32 as _sample_hash

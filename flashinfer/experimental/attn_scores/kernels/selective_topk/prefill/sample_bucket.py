@@ -18,10 +18,7 @@ from cutlass._mlir.dialects import llvm
 
 @dsl_user_op
 def unsigned_bucket_index(distance, shift, *, loc=None, ip=None):
-    # Padding -inf can lie >2**31 ordered-key units below a tight positive
-    # range. The final 0..255 index is signed, but its clamp must be unsigned.
-    # CuTe 4.8 builtin min on Uint32 operands produced signed min in a reduced
-    # test; explicit PTX also makes the required behavior independent of that.
+    # The ordered-key distance from -inf padding can exceed INT32_MAX. Clamp it as unsigned.
     result = llvm.inline_asm(
         cutlass.Int32.mlir_type,
         [

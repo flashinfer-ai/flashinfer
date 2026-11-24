@@ -25,21 +25,13 @@ DTYPES = {
 
 
 class ThrowawayTopK:
-    """Four-stage prefill with exact top-k recovery.
+    """Four-stage prefill with exact TopK recovery. Ranking uses the requested logits
+    precision. Indices tied at the cutoff may vary.
 
-    QK dots use FP32 arithmetic. The explicit native_bf16/native_fp16 modes use
-    matching head arithmetic (FP8 FP16 rebalances QK/512 and weights*512).
-    The result is a valid top-k in the requested logits precision; ranking
-    before a monotone output conversion may select different tied indices.
-    Overflow candidates remain available to recovery. Bounds describe causal
-    prefill rows: ends must be nondecreasing, with 0 <= starts <= ends <= N.
-    Any score ends must also lie in [0, N]. FP8 key scales must cover N keys.
-    Raw callers must maintain these bounds on every run; replay does not
-    validate them on the host. The public wrapper constructs them in its plan.
-    Optional candidate_k_block_ids [M,2048] and candidate_valid_lens [M]
-    restrict scoring to per-query eight-token blocks and return logical IDs.
-    Candidate valid lengths are writable K1 scratch, not publisher-owned input.
-    Candidate bounds must start at zero for every active row.
+    Raw callers supply monotone causal ends, 0 <= starts <= ends <= N, score ends
+    in [0, N] and FP8 scales for all N keys on each replay. With candidate blocks,
+    active rows start at zero. Each block addresses eight keys. Candidate valid
+    lengths are writable K1 scratch. Returned indices address the source keys.
     """
 
     def __init__(
@@ -122,10 +114,16 @@ class ThrowawayTopK:
             model_config = resolve_model_config(
                 q.shape[1], 128, top_k, compression_ratio, model_config
             )
-        if (
-            candidate_k_block_ids is not None
-            or (_filter_config or {}).get("publish_blocks")
-        ) and _validate_numerics:
+        candidate_role = candidate_k_block_ids is not None or (_filter_config or {}).get(
+            "publish_blocks"
+        )
+        if candidate_role and model_config == "DS-V4.1-Flash":
+            if compression_ratio not in (None, 1):
+                raise ValueError(
+                    "DS-V4.1-Flash candidate layers require compression_ratio=1"
+                )
+            compression_ratio = 1
+        if candidate_role and _validate_numerics:
             if bool(((starts != 0) & (starts < ends)).any().item()):
                 raise ValueError(
                     "candidate publication and consumption require zero-based single-request bounds"
@@ -186,10 +184,10 @@ class ThrowawayTopK:
                 _filter_config = policy
             if model_config == "DS-V3.2" and q.shape[1] != 64:
                 raise ValueError("DS-V3.2 requires H64")
-            if model_config == "GLM-5.3" and (
-                phase != "prefill" or q.shape[1] != 32 or top_k != 2048
+            if model_config in ("GLM-5.3", "Kimi-K3.1-Pro") and (
+                q.shape[1] != 32 or top_k != 2048
             ):
-                raise ValueError("GLM-5.3 requires prefill H32/K2048")
+                raise ValueError(f"{model_config} requires prefill H32/K2048")
             if model_config in ("DS-V4-Flash", "DS-V4-Pro"):
                 expected_k = 1024 if model_config == "DS-V4-Pro" else 512
                 if phase != "prefill" or q.shape[1] != 64 or top_k != expected_k:

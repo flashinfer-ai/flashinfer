@@ -1373,7 +1373,7 @@ class FP4PrefillMQALogitsKernel:
         tCrB = tiled_mma.make_fragment_B(sQ)  # shared
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
-        # Staged acc (fp16_gemm_3 pattern): append UMMA stage dim
+        # Append the UMMA stage dimension to the accumulator layout.
         # shape: (*acc_shape, STAGE) — dynamic index on last dim reduces rank
         us = self.num_umma_stages
         cols = self.num_tmem_alloc_cols
@@ -1736,9 +1736,7 @@ class FP4PrefillMQALogitsKernel:
                         if q_block_idx_old < num_q_blocks:
                             sfb_war_pipeline.consumer_wait(sfb_war_cons_state)
                             sfb_war_cons_state.advance()
-                        # UTCCP atom is UE8M0-typed; the int32 SMEM (4 packed
-                        # UE8M0 per int32) needs a recast for the s2t copy +
-                        # chunk layout (which counts UE8M0 cells, 4× int32).
+                        # Recast each packed int32 as four UE8M0 elements for the UTCCP copy.
                         sSF_Q_ue8m0 = cute.recast_tensor(sSF_Q, Float8E8M0FNU)
                         stage_off_ue8m0 = q_stage_0 * sSF_Q_ue8m0.layout.stride[1]
                         sSF_Q_chunk = cute.make_tensor(

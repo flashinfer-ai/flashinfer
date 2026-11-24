@@ -127,7 +127,9 @@ class Float32BlockSelector:
         if row < out.shape[0]:
             first = starts[row] // 8
             out[row, 0] = first
-            lengths[row] = max(0, (ends[row] + 7) // 8 - first)
+            lengths[row] = (
+                (ends[row] + 7) // 8 - first if ends[row] > starts[row] else 0
+            )
 
     @cute.kernel
     def finish(self, ends, out, lengths, starts):
@@ -138,16 +140,24 @@ class Float32BlockSelector:
             cutlass.Uint32, cute.make_layout(256 * self.words)
         )
         prefix = smem.allocate_tensor(cutlass.Int32, cute.make_layout(8))
-        required = min(2048, max(0, (ends[row] + 7) // 8 - starts[row] // 8))
-        publication_sort(
-            row,
-            tid,
-            out,
-            bitmap,
-            prefix,
-            self.words,
-            (ends[row] - 1) // 8 if required > 0 else -1,
+        required = (
+            min(2048, (ends[row] + 7) // 8 - starts[row] // 8)
+            if ends[row] > starts[row]
+            else 0
         )
+        if required > 0:
+            publication_sort(
+                row,
+                tid,
+                out,
+                bitmap,
+                prefix,
+                self.words,
+                (ends[row] - 1) // 8,
+            )
+        else:
+            for i in cutlass.range(tid, out.shape[1], 256):
+                out[row, i] = 2147483647
         partial = ends[row] % 8
         if tid == 0:
             lengths[row] = required * 8 - (

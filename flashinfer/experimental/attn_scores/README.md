@@ -30,7 +30,9 @@ Other inputs with the same shape retain the general numerical contract.
 
 > [!NOTE]
 > Kimi-K3.1-Pro and GLM-5.3 share H32/D128/K2048/ratio-1. Shape inference
-> selects GLM-5.3; explicitly pass `model_config="Kimi-K3.1-Pro"` for Kimi.
+> selects GLM-5.3. Set `model_config="Kimi-K3.1-Pro"` for the Kimi-specific
+> token-scaled FP8 `relu_strict` policy. Other encoding and mode combinations
+> use the same policy as GLM-5.3.
 
 Construct the wrapper outside CUDA graph capture, plan each step and prepare
 every layer pool before capture. Calls sharing a wrapper must be serialized;
@@ -78,7 +80,8 @@ or a separate validation launch.
 Candidate contents and causal bounds may change between graph replays within
 the prepared capacities. `input_buffers()["candidate_blocks"]` exposes stable
 consumer storage. An aligned table of the prepared shape, dtype and device can
-also be supplied to `run` during capture; keep its storage alive for replay.
+also be supplied to `run` during capture. Keep it alive for replay and use
+storage separate from the consumer wrapper’s other buffers.
 Published buffers are shared across calls; consume or copy them before the next
 publisher call. Candidate selection returns request-local token indices, not
 positions in the candidate table.
@@ -90,7 +93,9 @@ It is not chosen by automatic routing; this API accepts `backend="cutedsl"`,
 not `backend="auto"`. It supports batch-1 prefill on SM100/SM103, H4/H32/H64,
 D128, TopK 512/1024/2048, and compression ratios 1, 2 or 4. The full-domain
 capacity limit is 1,048,576 keys after pooling; candidate consumption allows
-an additional max_chunk_size keys in the source pool.
+an additional `max_chunk_size` keys in the source pool. A table produced by this
+wrapper is limited to the publisher capacity. A consumer can also use an externally
+supplied table over a larger source pool.
 
 `next_n` optionally asserts an exact query-row count. `host_length_hints`
 provides optional host upper bounds and failures set error bit 2. Read `error`
@@ -99,39 +104,25 @@ set bit 16 in `repair_error`. Retired modules drain at `plan`, `prepare_pool`
 and `clear_pools`, except while the caller's stream is capturing. Do not call
 these methods while any other thread is in global capture.
 
-### Shared prefill pipeline
+### Workspace and capture
 
-Full-domain and candidate-domain inputs use `ThrowawayTopK` and the same
-prepared-stage executor. The public wrapper keeps its `candidate_blocks`
-argument; internally it passes `candidate_k_block_ids` (CUDA int32 `[Q, 2048]`)
-and `candidate_valid_lens` (int32 `[Q]`, measured in tokens). Omitting these
-inputs selects the full-domain path.
+Pools on the same wrapper share workspace. Serialize their calls. A captured
+`run` binds the supplied Q extent: capture another graph for a different
+`num_query_rows`. The live prefix can change within that extent. Keys tied at the
+TopK boundary may yield different indices with the same selected score multiset.
 
-The engine owns output, counts and backend workspace. Candidate kernels are
-prepared in `prefill/sparse/prepare.py`. Pools share scratch within one wrapper;
-only K/scales and their launch bindings differ. Calls must be serialized. There
-is no separate sparse engine or run loop. Candidate scoring, filtering,
-selection and recovery use CuTe DSL for all supported head reductions and
-FP32/BF16 weights. The typed path shares the sparse Tensor Core pipeline and
-specializes head reduction and score storage at compile time. Native BF16
-with BF16 weights retains its packed filtering path.
+A candidate consumer reserves 8 KiB per query row for the stable int32
+candidate table, including when a full aligned caller table is used directly.
+Its two largest additional buffers are:
 
-Execution uses CuTe DSL with TVM FFI. Both paths keep four logical stages:
-K1 sampling, K2 fused GEMM/filtering, K3 selection and K4 exact recovery. A stage
-may use multiple launches: the typed consumer computes its threshold after
-sampling, and consumer recovery separates scoring from selection. Publishers
-also select candidate blocks in K3. Raw consumers supply zero-based causal bounds and a writable
-`candidate_valid_lens` scratch buffer. K1 overwrites these lengths on each run;
-do not alias publisher-owned lengths. The wrapper manages this scratch.
+| Consumer path | Candidate storage per row | Recovery scores per row |
+| --- | ---: | ---: |
+| Packed native BF16 with BF16 weights | 8,224 × 4 bytes | 16,384 × 2 bytes |
+| Typed | 4,096 × 8 bytes | 16,384 × sizeof(score dtype) |
 
-`indexer_config.py` describes model shapes and compression ratios;
-`_selective_math_policy.py` validates numerical modes. Sampling counts, candidate
-banks, CTA grids and workspace layouts belong to the stage preparation code.
-
-Publication requires zero-based, single-request bounds. The wrapper rejects
-`max_batch_size != 1`; raw callers must keep each nonempty row's start at zero,
-including during graph replay.
-
+At 32,768 rows these two buffers together occupy about 2 GiB in the packed
+path and 3 GiB in the typed FP32 path. The staging table adds 256 MiB.
+These figures exclude samples, outputs, other scratch and allocator overhead.
 
 ## Publication workspace and bounds
 
