@@ -302,11 +302,18 @@ def _fp8_per_tensor_supported_tiles(*, use_per_token_sf_b: bool) -> tuple[int, .
 
 
 def _nvfp4_supported_tiles(
-    sm_arch: int, *, use_per_token_sf_b: bool
+    sm_arch: int,
+    *,
+    activation_type: int,
+    use_per_token_sf_b: bool,
+    fc1_has_bias: bool,
+    fc2_has_bias: bool,
 ) -> tuple[int, ...]:
     return (
         SUPPORTED_RUBIN_NVFP4_TILE_N
-        if sm_arch == 107 and not use_per_token_sf_b
+        if sm_arch == 107
+        and activation_type == int(ActivationType.Swiglu)
+        and not (use_per_token_sf_b or fc1_has_bias or fc2_has_bias)
         else SUPPORTED_NVFP4_TILE_N
     )
 
@@ -2089,7 +2096,11 @@ def valid_prims_ts_nvfp4_moe_tactics(
     tactics = _valid_json_moe_tactics(
         sm_arch=sm_arch,
         supported_tiles=_nvfp4_supported_tiles(
-            sm_arch, use_per_token_sf_b=use_per_token_sf_b
+            sm_arch,
+            activation_type=activation_type,
+            use_per_token_sf_b=use_per_token_sf_b,
+            fc1_has_bias=fc1_has_bias,
+            fc2_has_bias=fc2_has_bias,
         ),
         num_tokens=num_tokens,
         top_k=top_k,
@@ -2415,7 +2426,11 @@ def map_trtllm_nvfp4_moe_tactic(
     )
     sm_arch = _resolve_moe_sm_arch(sm_arch)
     if tile_n not in _nvfp4_supported_tiles(
-        sm_arch, use_per_token_sf_b=use_per_token_sf_b
+        sm_arch,
+        activation_type=activation_type,
+        use_per_token_sf_b=use_per_token_sf_b,
+        fc1_has_bias=fc1_has_bias,
+        fc2_has_bias=fc2_has_bias,
     ):
         raise ValueError(f"Unsupported Prims-TS NVFP4 tile_N={tile_n}")
     if moe_config_index < -1:

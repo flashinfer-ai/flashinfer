@@ -31,7 +31,7 @@ def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, requ
     compiled = []
     target = [(0, "sm100a")]
 
-    def fake_compile(cfg_hash, fc1_or_fc2, io, stream, device_index):
+    def fake_compile(cfg_hash, fc1_or_fc2, io, stream, device_index, *, reencode_tma):
         result = object()
         compiled.append((io, stream, result))
         return compile_cache._CompiledGemm(result)
@@ -173,7 +173,7 @@ def test_compiled_gemm_targets_the_launch_device(monkeypatch, request):
     from flashinfer.prims_ts.batched_gemm import batched_gemm_run
 
     monkeypatch.setattr(
-        batched_gemm_run, "_prepare_tma_descriptors", lambda io, stream: None
+        batched_gemm_run, "_prepare_tma_descriptors", lambda io, stream, **kw: None
     )
     # The launch tensors live on device 1 (SM103) while device 0 (SM100) is
     # current: the GEMM must be keyed, named, compiled and persisted for SM103.
@@ -237,6 +237,7 @@ def test_compiled_gemm_cache_prepares_new_workspace_on_cache_hit(monkeypatch, re
     compiled = []
     prepared = []
     current = [0]
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "0")
     preparer = object()
 
     @contextlib.contextmanager
@@ -247,16 +248,19 @@ def test_compiled_gemm_cache_prepares_new_workspace_on_cache_hit(monkeypatch, re
         finally:
             current[0] = previous
 
-    def prepare(io, stream, *, prepare=None):
+    def prepare(io, stream, *, reencode_tma, prepare=None):
+        assert reencode_tma is False
         assert current[0] == 1
         assert prepare is None or prepare is preparer
         io["descriptor_binding"] = io["binding"]
         prepared.append((io, stream))
         return preparer
 
-    def compile_for_launch(cfg_hash, fc1_or_fc2, io, stream, device_index):
+    def compile_for_launch(
+        cfg_hash, fc1_or_fc2, io, stream, device_index, *, reencode_tma
+    ):
         with device(device_index):
-            prepare(io, stream)
+            prepare(io, stream, reencode_tma=reencode_tma)
         fn = object()
         compiled.append(fn)
         return compile_cache._CompiledGemm(fn, preparer)
@@ -304,7 +308,8 @@ def test_disk_cache_prepares_each_workspace_before_keying(monkeypatch, disk_hit)
         finally:
             current[0] = previous
 
-    def prepare(io, stream):
+    def prepare(io, stream, *, reencode_tma):
+        assert reencode_tma is False
         assert current[0] == 1
         io["descriptor_binding"] = io["binding"]
         prepared.append((io["binding"], stream))
@@ -333,14 +338,18 @@ def test_disk_cache_prepares_each_workspace_before_keying(monkeypatch, disk_hit)
     monkeypatch.setattr(cute_dsl_core, "JitSpecCuteDsl", Spec)
     monkeypatch.setattr(batched_gemm_run, "_prepare_tma_descriptors", prepare)
     monkeypatch.setattr(
-        batched_gemm_run, "_compile_for_launch", lambda io, stream: kernel
+        batched_gemm_run,
+        "_compile_for_launch",
+        lambda io, stream, *, reencode_tma: kernel,
     )
 
     # Fresh IO objects simulate separate processes loading the same artifact.
     for binding in ("first shard", "second shard"):
         io = {"binding": binding}
         assert (
-            compile_cache._compile_or_load("cfg", "fc1", io, "stream", 1).kernel
+            compile_cache._compile_or_load(
+                "cfg", "fc1", io, "stream", 1, reencode_tma=False
+            ).kernel
             is kernel
         )
         assert io["descriptor_binding"] == binding
@@ -378,9 +387,10 @@ def test_descriptor_preparation_reuses_code_without_retaining_bindings(
         compilations.append(weakref.ref(prepared))
         return prepared
 
-    def compile_gemm(cfg_hash, stage, io, stream, device):
+    def compile_gemm(cfg_hash, stage, io, stream, device, *, reencode_tma):
         return compile_cache._CompiledGemm(
-            object(), runner._prepare_tma_descriptors(io, stream)
+            object(),
+            runner._prepare_tma_descriptors(io, stream, reencode_tma=reencode_tma),
         )
 
     monkeypatch.setattr(runner.cute, "compile", compile_prepare)

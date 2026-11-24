@@ -7727,6 +7727,42 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             extras += (self.config.finalize.use_fused_finalize,)
         return (*extras, get_compute_capability(self.device))
 
+    def legacy_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        """Older Blackwell entries used the base MoE key without architecture or layout."""
+        if get_compute_capability(self.device) in ((10, 0), (10, 3)):
+            return (super()._cache_key_extras(),)
+        return ()
+
+    def validate_cached_tactic(self, inputs, tactic) -> bool:
+        """Check launch compatibility, including tactics outside today's tuning shortlist."""
+        from .shared.inputs import MoeRunnerInputs
+
+        state = self.launch_state_for(inputs)
+        if not isinstance(state, _TrtllmLaunchState) or self._inner is None:
+            return False
+        try:
+            self._inner._check_tactic_geometry(
+                tactic, MoeRunnerInputs.from_list(inputs), state.static_kwargs
+            )
+        except (TypeError, ValueError, IndexError):
+            return False
+        return True
+
+    def validate_tactic(self, inputs, tactic) -> bool:
+        state = self.launch_state_for(inputs)
+        if isinstance(state, _TrtllmLaunchState) and self._expert_bias_key(
+            state.static_kwargs
+        ):
+            return self.validate_cached_tactic(inputs, tactic)
+        return True
+
+    def _expert_bias_key(self, options: Mapping[str, Any]) -> tuple:
+        fc1 = options.get("gemm1_bias") is not None
+        fc2 = options.get("gemm2_bias") is not None
+        if (fc1 or fc2) and self._is_rubin_nvfp4():
+            return ("expert_bias", fc1, fc2)
+        return ()
+
     def _effective_fused_finalize(self, **overrides) -> bool:
         """Resolve the call mode before packing with the execution predicate."""
         if not self._is_rubin_nvfp4():
@@ -7750,7 +7786,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             extras += (
                 "effective_fused_finalize",
                 self._effective_fused_finalize(**options),
-            )
+            ) + self._expert_bias_key(options)
         return extras
 
     def _is_rubin_nvfp4(self) -> bool:

@@ -1290,12 +1290,7 @@ class PrimsTsConfig:
                 permute_cache=permute_cache,
             )
             if nvfp4_weight_layout == "BlockMajorK":
-                from .core import convert_to_block_layout
-
-                for name in ("gemm1_weights", "gemm2_weights"):
-                    view[name] = torch.stack(
-                        [convert_to_block_layout(w, blockK=128) for w in view[name]]
-                    )
+                return _block_major_k_fp4_weights(view, block_bytes=128)
             return view
         if pair == (QuantFormat.BF16, QuantFormat.BF16):
             return TrtllmBf16Config.prepare_weights(

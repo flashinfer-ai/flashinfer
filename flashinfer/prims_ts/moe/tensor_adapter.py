@@ -204,7 +204,9 @@ def _logical_token_capacity(
     return logical_capacity
 
 
-def _validate_finalize_output(output, *, num_tokens, hidden_size, device):
+def _validate_finalize_output(
+    output, *, num_tokens, hidden_size, device, output2_scale_scalar=None
+):
     if (
         output.shape != (num_tokens, hidden_size)
         or output.dtype != torch.bfloat16
@@ -216,6 +218,11 @@ def _validate_finalize_output(output, *, num_tokens, hidden_size, device):
         )
     if output.data_ptr() % 16:
         raise ValueError("fc2 output buffer pointer must be 16-byte aligned")
+    if output2_scale_scalar is not None:
+        from .finalize import _overlapping_bytes
+
+        if _overlapping_bytes(output, output2_scale_scalar):
+            raise ValueError("finalize_output overlaps output2_scale_scalar")
 
 
 def _validate_c_output_layout(
@@ -1051,6 +1058,7 @@ def build_nvfp4_launch_io(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
             device=hidden_states.device,
+            output2_scale_scalar=output2_scale_scalar,
         )
         if (
             finalize_scales.shape != (num_tokens, top_k)

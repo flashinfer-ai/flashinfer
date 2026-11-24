@@ -1294,6 +1294,13 @@ class _PrimsTsMoERunnerMixin:
             elif cfg.is_rubin_nvfp4_batch_m:
                 _runtime_config(cfg, in_hidden, out_hidden=out_hidden)
 
+    def _check_tactic_geometry(self, tactic, moe_inputs, kwargs=None):
+        pair = self._map_tactic(tactic, moe_inputs, kwargs)
+        fc1_cfg, fc2_cfg = pair.fc1.cfg.build(), pair.fc2.cfg.build()
+        self._check_cga_tactic(fc1_cfg, fc2_cfg)
+        if self._is_partitioned:
+            self._check_partition_tactic(fc1_cfg, fc2_cfg)
+
     def _filter_partition_geometry_tactics(
         self, tactics: List[Any], inputs: List[torch.Tensor], cache_key: tuple
     ) -> List[Any]:
@@ -1313,12 +1320,7 @@ class _PrimsTsMoERunnerMixin:
         dropped = 0
         for tactic in tactics:
             try:
-                pair = self._map_tactic(tactic, moe_inputs)
-                fc1_cfg = pair.fc1.cfg.build()
-                fc2_cfg = pair.fc2.cfg.build()
-                self._check_cga_tactic(fc1_cfg, fc2_cfg)
-                if self._is_partitioned:
-                    self._check_partition_tactic(fc1_cfg, fc2_cfg)
+                self._check_tactic_geometry(tactic, moe_inputs)
             except ValueError as exc:
                 dropped += 1
                 logger.debug(
@@ -1844,9 +1846,10 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         fc2_cfg = pair.fc2.cfg.build()
         # Routing and finalization use the PDL mode resolved for both GEMMs.
         kwargs["enable_pdl"] = bool(fc1_cfg.use_pdl)
-        fuse_finalize = fused_finalize_requested(
-            self, kwargs
-        ) and supports_fused_finalize(fc2_cfg)
+        fuse_finalize = False
+        if fused_finalize_requested(self, kwargs) and supports_fused_finalize(fc2_cfg):
+            fc2_cfg = _fused_finalize_config(fc2_cfg)
+            fuse_finalize = bool(fc2_cfg.fuse_moe_finalize)
 
         # Reject unsupported views before routing or zeroing can modify output.
         if fuse_finalize:
@@ -1857,6 +1860,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 num_tokens=num_tokens,
                 hidden_size=self.hidden_size,
                 device=hidden_states.device,
+                output2_scale_scalar=kwargs.get("output2_scale_scalar"),
             )
             # FC2 needs aligned coefficients that survive output zeroing.
             # Disjoint aligned caller buffers retain the zero-copy path.
@@ -1943,8 +1947,6 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens,
             kwargs,
         )
-        if fuse_finalize:
-            fc2_cfg = _fused_finalize_config(fc2_cfg)
         if uses_per_token_scaling and not fc1_cfg.has_output_block_scaling:
             gemm1_output = torch.empty(
                 (int(gemm1_output.shape[0]), self.intermediate_size),

@@ -116,8 +116,7 @@ def test_staged_fp4_routing_outputs(
     assert ((expanded_to_permuted >= 0) & (expanded_to_permuted < outputs[6])).all()
     routed_tokens = outputs[2][expanded_to_permuted].long()
     torch.testing.assert_close(
-        torch.bincount(routed_tokens, minlength=num_tokens),
-        torch.full((num_tokens,), top_k, dtype=torch.int64, device=device),
+        routed_tokens, torch.arange(num_tokens, device=device).repeat_interleave(top_k)
     )
     assert outputs[7].dtype == (torch.bfloat16 if is_bf16 else torch.uint8)
     gemm2_output = outputs[8 if is_bf16 else 9]

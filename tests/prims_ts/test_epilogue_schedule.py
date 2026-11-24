@@ -247,7 +247,9 @@ def _verify_repeated_tile_lifetimes(plan):
                 fenced.clear()
                 reuse_needs_barrier.clear()
             elif action.op == op.EMIT:
-                if not plan.finalize:
+                if plan.thread_owns_scratch:
+                    assert action.slot not in unpublished or action.slot in fenced
+                else:
                     assert action.slot not in unpublished
                 for f in range(action.fragment, action.fragment + unit):
                     assert scratch[action.slot, f % unit] == (tile, f)
@@ -328,8 +330,16 @@ def test_lifetime_audit_rejects_overwrite_before_commit():
 @pytest.mark.parametrize(
     "removed", [schedules.EpilogueOp.SHARED_FENCE, schedules.EpilogueOp.BARRIER]
 )
-def test_lifetime_audit_rejects_unpublished_plain_emit(removed):
-    plan = _plain_single_slot_plan()
+@pytest.mark.parametrize("finalize", [False, True])
+def test_lifetime_audit_rejects_unpublished_emit(removed, finalize):
+    plan = (
+        _step_config(
+            schedules.epilogue_steps_for_prefix(0, finalize=True), warps=8
+        ).preload_epilogue_plan
+        if finalize
+        else _plain_single_slot_plan()
+    )
+    assert not plan.thread_owns_scratch
     _verify_repeated_tile_lifetimes(plan)
     actions = list(plan.actions)
     emit = next(i for i, a in enumerate(actions) if a.op == schedules.EpilogueOp.EMIT)
@@ -532,6 +542,16 @@ def test_moe_preserves_explicit_epilogue_resource_profile():
     selected = _fused_finalize_config(replace(cfg, fuse_moe_finalize=0))
     assert selected == cfg
     _verify_repeated_tile_lifetimes(selected.preload_epilogue_plan)
+
+
+def test_moe_keeps_separate_store_for_single_fragment_emits():
+    from flashinfer.prims_ts.moe.epilogue_policy import fused_finalize_config
+
+    cfg = _step_config(
+        schedules.epilogue_steps_for_prefix(0, finalize=False), finalize=False
+    )
+    assert not cfg.preload_epilogue_plan.finalize
+    assert fused_finalize_config(cfg) is cfg
 
 
 def test_search_register_budgets_have_distinct_configurations():

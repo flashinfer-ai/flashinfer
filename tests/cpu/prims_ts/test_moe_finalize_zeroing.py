@@ -14,7 +14,17 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(
-    "view", ["shape", "dtype", "device", "strided", "misaligned", "valid", "one_row"]
+    "view",
+    [
+        "shape",
+        "dtype",
+        "device",
+        "strided",
+        "misaligned",
+        "scale_alias",
+        "valid",
+        "one_row",
+    ],
 )
 def test_inner_runner_validates_output_before_cuda_work(monkeypatch, view):
     from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
@@ -31,7 +41,7 @@ def test_inner_runner_validates_output_before_cuda_work(monkeypatch, view):
         output = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="meta")
     elif view == "misaligned":
         output = backing.flatten()[1 : 1 + tokens * hidden].view(tokens, hidden)
-    elif view == "valid":
+    elif view in ("valid", "scale_alias"):
         output = backing.flatten()[: tokens * hidden].view(tokens, hidden)
 
     inner = object.__new__(runner.PrimsTsNvfp4MoERunner)
@@ -50,6 +60,12 @@ def test_inner_runner_validates_output_before_cuda_work(monkeypatch, view):
     monkeypatch.setattr(runner, "fused_finalize_requested", lambda *args: True)
     monkeypatch.setattr(runner, "supports_fused_finalize", lambda *args: True)
 
+    monkeypatch.setattr(
+        runner,
+        "_fused_finalize_config",
+        lambda cfg: SimpleNamespace(fuse_moe_finalize=True),
+    )
+
     def reached_cuda(**kwargs):
         raise RuntimeError("output accepted before CUDA work")
 
@@ -66,11 +82,16 @@ def test_inner_runner_validates_output_before_cuda_work(monkeypatch, view):
     )
     if view in ("valid", "one_row"):
         error, message = RuntimeError, "output accepted before CUDA work"
+    elif view == "scale_alias":
+        error, message = ValueError, "overlaps output2_scale_scalar"
     else:
         error = ValueError
         message = "16-byte aligned" if view == "misaligned" else "contiguous BF16"
     with pytest.raises(error, match=message):
-        inner.forward(inputs.to_list())
+        scale = (
+            output.view(torch.float32).flatten()[1:2] if view == "scale_alias" else None
+        )
+        inner.forward(inputs.to_list(), output2_scale_scalar=scale)
     assert torch.all(backing == 7)
 
 

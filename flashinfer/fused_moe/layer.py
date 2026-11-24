@@ -382,7 +382,7 @@ class MoELayer:
             )
 
         # Cross-backend winner cache, keyed by token-count bucket, routing
-        # mode, eligible runners, and Prims-TS layout/finalization modes.
+        # mode, eligible runners, and Prims-TS layout, bias, and finalization.
         # See the MoELayer reuse contract (CR4): the
         # fastest backend can differ across token-count buckets, so each bucket
         # caches its own winner; the mode qualifier keeps a winner tuned for
@@ -405,7 +405,7 @@ class MoELayer:
         Only runners that support this pack's ``routing_input_mode`` compete —
         not every backend has an in-kernel router — and the winner is cached
         per token-count bucket, routing mode, eligible runners, and effective
-        Prims-TS layout/finalization modes so repeated calls skip reselection.
+        Prims-TS layout, bias, and finalization mode. Repeated calls reuse the winner.
         Candidate pools containing Frost low-latency use exact token counts
         because their bounded tactics need not cover every row in a bucket.
 
@@ -453,7 +453,8 @@ class MoELayer:
         # fused-only tactics also depend on the effective finalization mode.
         prims_modes = tuple(
             (
-                runner._weight_layout(weight_pack.get_view(runner.backend_key)),
+                runner._weight_layout(view := weight_pack.get_view(runner.backend_key)),
+                runner._expert_bias_key(view),
                 runner._effective_fused_finalize(
                     zero_rows_without_local_expert=act_pack.zero_rows_without_local_expert
                 ),
@@ -463,6 +464,13 @@ class MoELayer:
         )
         winner_key = (bucket, mode, eligible, prims_modes)
         winner = self._winners.get(winner_key)
+        inputs = None
+        if winner is not None and isinstance(winner[0], PrimsTsRunner):
+            runner, tactic = winner
+            inputs = runner.pack_inputs(act_pack, weight_pack)
+            if not runner.validate_tactic(inputs, tactic):
+                winner = None
+                inputs = None
         if winner is None:
             winner = self._select_winner(act_pack, weight_pack, runners)
             self._winners[winner_key] = winner
@@ -472,7 +480,8 @@ class MoELayer:
             self._winners.move_to_end(winner_key)
         runner, tactic = winner
         self._last_winner_backend = runner.backend_key
-        inputs = runner.pack_inputs(act_pack, weight_pack)
+        if inputs is None:
+            inputs = runner.pack_inputs(act_pack, weight_pack)
         return runner.forward(
             inputs,
             tactic=tactic,

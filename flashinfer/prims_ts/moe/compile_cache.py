@@ -199,7 +199,13 @@ def _kernel_source_sha256() -> str | None:
 
 
 def _compile_or_load(
-    cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any, device_index: int
+    cfg_hash: str,
+    fc1_or_fc2: str,
+    io: dict,
+    stream: Any,
+    device_index: int,
+    *,
+    reencode_tma: bool,
 ) -> _CompiledGemm:
     """Load the GEMM from the persistent module, compiling it on a miss."""
     import torch
@@ -211,7 +217,7 @@ def _compile_or_load(
     )
 
     def compile_fn():
-        return _compile_for_launch(io, stream)
+        return _compile_for_launch(io, stream, reencode_tma=reencode_tma)
 
     source_sha256 = _kernel_source_sha256()
     # ``cute.compile``, the spec's module directory and metadata, and the
@@ -220,7 +226,7 @@ def _compile_or_load(
         # Disk hits skip _compile_for_launch, but descriptors still belong to
         # this workspace. Prepare before naming the kernel so its signature
         # includes the descriptor pointer rather than an unprepared None.
-        prepare = _prepare_tma_descriptors(io, stream)
+        prepare = _prepare_tma_descriptors(io, stream, reencode_tma=reencode_tma)
         if cute_dsl_cache_disabled() or source_sha256 is None:
             return _CompiledGemm(compile_fn(), prepare)
         spec = JitSpecCuteDsl(
@@ -278,9 +284,14 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> 
             return compiled.kernel
         with torch.cuda.device(device_index):
             compiled.prepare_descriptors = _prepare_tma_descriptors(
-                io, stream, prepare=compiled.prepare_descriptors
+                io,
+                stream,
+                prepare=compiled.prepare_descriptors,
+                reencode_tma=reencode_tma,
             )
         return compiled.kernel
-    compiled = _compile_or_load(cfg_hash, fc1_or_fc2, io, stream, device_index)
+    compiled = _compile_or_load(
+        cfg_hash, fc1_or_fc2, io, stream, device_index, reencode_tma=reencode_tma
+    )
     _COMPILED_GEMM_CACHE[key] = compiled
     return compiled.kernel

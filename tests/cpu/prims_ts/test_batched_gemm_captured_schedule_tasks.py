@@ -1025,11 +1025,17 @@ def test_ldgsts_sf_pipeline_configs_join_clustered_routed_producers(sm_arch):
     cfg = make_config(
         sm_arch=sm_arch,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         batch_mode=int(BatchMode.BATCH_M),
         transpose_mma_output=0,
+        sf_layout_b=int(SfLayout.R128c4),
         tile_n=128,
     )
+    validate_config(cfg)
     smem_sfa_cfg = _make_pipeline_configs(cfg)["smem_sfa"]
     assert smem_sfa_cfg.pipeline_type == PipelineType.AsyncUmma
     assert smem_sfa_cfg.umma_consumer_producer_op == producer_op
@@ -1041,11 +1047,15 @@ def test_ldgsts_sf_pipeline_configs_join_clustered_routed_producers(sm_arch):
     single_cta_cfg = make_config(
         sm_arch=sm_arch,
         umma_cta_count=1,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         batch_mode=int(BatchMode.BATCH_M),
         transpose_mma_output=0,
+        sf_layout_b=int(SfLayout.R128c4),
         tile_n=128,
     )
+    validate_config(single_cta_cfg)
     single_cta_sfa_cfg = _make_pipeline_configs(single_cta_cfg)["smem_sfa"]
     assert single_cta_sfa_cfg.umma_consumer_producer_op == pipeline.PipelineOp.AsyncLoad
     assert (
@@ -1056,12 +1066,17 @@ def test_ldgsts_sf_pipeline_configs_join_clustered_routed_producers(sm_arch):
     r128c4_sfb_cfg = make_config(
         sm_arch=sm_arch,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_scheduler=int(TileScheduler.PERSISTENT),
         tile_n=128,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
     )
+    validate_config(r128c4_sfb_cfg)
     smem_sfa_cfg = _make_pipeline_configs(r128c4_sfb_cfg)["smem_sfa"]
     smem_sfb_cfg = _make_pipeline_configs(r128c4_sfb_cfg)["smem_sfb"]
     assert r128c4_sfb_cfg.use_combined_sfab_copy
@@ -1082,9 +1097,14 @@ def test_ldgsts_sf_pipeline_configs_join_clustered_routed_producers(sm_arch):
     compact_cfg = make_config(
         sm_arch=sm_arch,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_n=64,
     )
+    validate_config(compact_cfg)
     smem_sfb_cfg = _make_pipeline_configs(compact_cfg)["smem_sfb"]
     assert compact_cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
     assert compact_cfg.smem_sfb_layout == int(SfLayout.R8c4)
@@ -1249,6 +1269,9 @@ def test_ldgsts_sf_relay_commits_without_prefetch_throttle():
     cfg = make_config(
         sm_arch=107,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
         num_stages_smem_sfb=6,
         route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
@@ -1257,6 +1280,7 @@ def test_ldgsts_sf_relay_commits_without_prefetch_throttle():
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
     )
+    validate_config(cfg)
     res = SmemSfLdgstsBResource(
         cfg=cfg,
         pipeline_config=_make_pipeline_configs(cfg)["smem_sfb"],
@@ -1269,13 +1293,18 @@ def test_ldgsts_sf_relay_commits_without_prefetch_throttle():
     two_stage_cfg = make_config(
         sm_arch=107,
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
         num_stages_smem_sfb=2,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_scheduler=int(TileScheduler.PERSISTENT),
         tile_n=128,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
     )
+    validate_config(two_stage_cfg)
     two_stage_res = SmemSfLdgstsBResource(
         cfg=two_stage_cfg,
         pipeline_config=_make_pipeline_configs(two_stage_cfg)["smem_sfb"],
@@ -1384,12 +1413,17 @@ def test_ldgsts_sfb_relay_ignores_host_prefetch_depth():
 def test_combined_tmem_sfab_uses_umma_producer_commit_pipeline():
     cfg = make_config(
         umma_cta_count=2,
+        mma_m=256,
+        mma_n=16,
+        tile_k=256,
+        route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         tile_scheduler=int(TileScheduler.PERSISTENT),
         tile_n=128,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
     )
+    validate_config(cfg)
     assert cfg.use_combined_sfab_copy
 
     tmem_sfab_cfg = _make_pipeline_configs(cfg)["tmem_sfab"]

@@ -78,11 +78,21 @@ def fused_finalize_overrides(tile_token: int) -> dict:
 
 
 def fused_finalize_config(cfg):
+    if cfg.epilogue_steps:
+        from ..batched_gemm.epilogue_schedule import compile_epilogue_steps
+
+        fused = cfg if cfg.fuse_moe_finalize else replace(cfg, fuse_moe_finalize=1)
+        try:
+            compile_epilogue_steps(fused)
+        except ValueError:
+            if cfg.fuse_moe_finalize:
+                raise
+            # A separate store can emit smaller units than a fused reduction.
+            compile_epilogue_steps(cfg)
+            return cfg
+        return fused
     if cfg.fuse_moe_finalize:
         return cfg
-    if cfg.epilogue_steps:
-        # Explicit plans already own their operand/scratch profile.
-        return replace(cfg, fuse_moe_finalize=1)
     return replace(cfg, **fused_finalize_overrides(cfg.tile_token))
 
 

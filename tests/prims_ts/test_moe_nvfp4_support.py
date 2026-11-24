@@ -134,7 +134,7 @@ def test_nvfp4_pdl_respects_caller_and_both_gemm_rows(
         config_mapper, "_resolve_moe_json_config_pair", resolve_with_pdl
     )
     pair = map_trtllm_nvfp4_moe_tactic(
-        [-1, -1],
+        [8, 0],
         sm_arch=107,
         num_tokens=32,
         top_k=2,

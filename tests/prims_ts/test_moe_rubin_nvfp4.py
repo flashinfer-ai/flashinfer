@@ -187,6 +187,40 @@ def test_rubin_nvfp4_batch_m_candidates(layout):
     assert wide.fc2.cfg.build().num_stages_workid == 1
 
 
+@pytest.mark.parametrize(
+    "activation", [a for a in ActivationType if a != ActivationType.Swiglu]
+)
+@pytest.mark.parametrize("tile", [512, 1024])
+def test_rubin_nvfp4_wide_tiles_require_swiglu(activation, tile):
+    from flashinfer.prims_ts.moe.config_mapper import map_trtllm_nvfp4_moe_tactic
+
+    with pytest.raises(ValueError, match=f"tile_N={tile}"):
+        map_trtllm_nvfp4_moe_tactic(
+            [tile, 0], sm_arch=107, activation_type=int(activation)
+        )
+
+
+def test_rubin_nvfp4_large_prefill_shortlists_tiles_for_activation():
+    from flashinfer.prims_ts.moe.config_mapper import (
+        map_trtllm_nvfp4_moe_tactic,
+        valid_prims_ts_nvfp4_moe_tactics,
+    )
+
+    shape = dict(sm_arch=107, num_tokens=16384, top_k=2, num_local_experts=32)
+    geglu = dict(shape, activation_type=int(ActivationType.Geglu))
+    tiles = valid_prims_ts_nvfp4_moe_tactics(**geglu)
+    pairs = [tactic for tactic in tiles if tactic[0] == 256]
+    assert pairs
+    assert all(tactic[0] <= 256 for tactic in tiles)
+    for tactic in pairs:
+        pair = map_trtllm_nvfp4_moe_tactic(tactic, **geglu)
+        assert pair.fc1.cfg.build().is_swap_ab and pair.fc2.cfg.build().is_swap_ab
+    assert {tile for tile, _ in valid_prims_ts_nvfp4_moe_tactics(**shape)} == {
+        512,
+        1024,
+    }
+
+
 @pytest.mark.parametrize("layout", (WeightLayout.MajorK, WeightLayout.BlockMajorK))
 @pytest.mark.parametrize("use_fused_finalize", (False, True))
 def test_rubin_nvfp4_large_prefill_per_token_tiles(layout, use_fused_finalize):

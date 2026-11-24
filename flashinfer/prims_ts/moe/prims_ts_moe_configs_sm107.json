@@ -534,7 +534,7 @@
             "num_load_b_warps": 8,
             "num_load_sfb_warps": 4,
             "mma_regs,load_regs,load_a_regs,load_b_regs,load_sf_regs,load_sfa_regs,load_sfb_regs,padding_regs,workid_regs,epilogue_regs": [
-                [96, 96, 96, 32, 88, 96, 40, 88, 96, 128]
+                [96, 96, 96, 32, 88, 96, 40, 48, 48, 128]
             ],
             "fuse_sf_copy_to_mma": true,
             "use_max_tmem_overlap": true,

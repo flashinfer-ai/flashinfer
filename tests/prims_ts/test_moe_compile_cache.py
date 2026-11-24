@@ -99,9 +99,9 @@ def test_compiled_gemms_are_reused_from_disk(monkeypatch, request, tmp_path):
     compiles = []
     compile_for_launch = batched_gemm_run._compile_for_launch
 
-    def counting_compile(io, stream):
+    def counting_compile(io, stream, **kwargs):
         compiles.append(io["cfg"])
-        return compile_for_launch(io, stream)
+        return compile_for_launch(io, stream, **kwargs)
 
     monkeypatch.setattr(batched_gemm_run, "_compile_for_launch", counting_compile)
     request.addfinalizer(compile_cache._COMPILED_GEMM_CACHE.clear)

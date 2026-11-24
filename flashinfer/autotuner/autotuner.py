@@ -2314,6 +2314,7 @@ class AutoTuner:
         custom_op: str,
         source: str,
         *,
+        legacy_key: bool = False,
         validation_profile: OptimizationProfile | None = None,
     ) -> bool:
         """Runner-contract revalidation of a cached (on-disk) tactic.
@@ -2329,15 +2330,20 @@ class AutoTuner:
         ``validate_tactic_for_profile(inputs, tactic, profile)``. This avoids
         checking a bucket's tactic against the original caller's row count.
         Other validators continue receiving the original inputs unchanged.
+        Legacy key aliases require a runner validator for the current inputs.
         """
         validate_profile = (
             getattr(runner, "validate_tactic_for_profile", None)
-            if validation_profile is not None
+            if validation_profile is not None and not legacy_key
             else None
         )
-        validate = getattr(runner, "validate_tactic", None)
+        validate = getattr(
+            runner,
+            "validate_cached_tactic" if legacy_key else "validate_tactic",
+            None,
+        )
         if validate_profile is None and validate is None:
-            return True
+            return not legacy_key
         try:
             ok = bool(
                 validate_profile(inputs, tactic, validation_profile)
@@ -2762,6 +2768,14 @@ class AutoTuner:
             rejections: list[str] | None = [] if report is not None else None
             requested_policy = self._profiling_policy(tuning_config)
             default_policy = self._default_profiling_policy(tuning_config)
+
+            def blocked(runner_name, tactic):
+                if not self._blocklist.is_blocked(custom_op, runner_name, tactic):
+                    return False
+                if rejections is not None and "blocklisted_tactic" not in rejections:
+                    rejections.append("blocklisted_tactic")
+                return True
+
             # 1. In-memory winners and provenance share the same partition.
             winners = self._winner_cache()
             winner_identity = self._winner_cache_identity()
@@ -2795,6 +2809,8 @@ class AutoTuner:
                             rejections.append("policy_mismatch")
                         continue
                     tactic, stored_profile = winners[cache_key]
+                    if blocked(type(r).__name__, tactic):
+                        continue
                     if not self._tactic_still_valid(
                         r,
                         inputs,
@@ -2831,14 +2847,34 @@ class AutoTuner:
                         )
                     return True, r_id, tactic, stored_profile
 
+            def persisted_keys():
+                for r_id, key in runner_keys:
+                    yield r_id, key, key
+                # Old keys are read-only replay aliases. New tuning and writes
+                # always use the architecture-qualified key.
+                if inputs is None or self.is_tuning_mode:
+                    return
+                for r_id, key in runner_keys:
+                    legacy = getattr(runners[r_id], "legacy_cache_key_extras", None)
+                    if (
+                        legacy is not None
+                        and key.file_key not in excluded_file_keys
+                        and (
+                            winner_identity is not None
+                            or key.file_key not in self._invalidated_file_keys
+                        )
+                    ):
+                        for extras in legacy(inputs):
+                            yield r_id, key, replace(key, extras=extras)
+
             # 2. User-loaded configs (from load_configs or autotune(cache=...)).
             #    Skipped wholesale when nothing was loaded, so the common
             #    serving path never builds a file_key string here.
             if (
                 self._file_configs or self._blocklisted_file_keys
             ) and not self._isolate_legacy_configs:
-                for r_id, cache_key in runner_keys:
-                    file_key = cache_key.file_key
+                for r_id, cache_key, stored_key in persisted_keys():
+                    file_key = stored_key.file_key
                     if file_key in excluded_file_keys:
                         continue
                     if file_key in self._file_configs:
@@ -2858,17 +2894,12 @@ class AutoTuner:
                             ):
                                 rejections.append("runner_mismatch")
                             continue
-                        if self._blocklist.is_blocked(custom_op, runner_name, tactic):
+                        if blocked(runner_name, tactic):
                             # The blocklist was loaded after this cache file
                             # (load_configs already drops listed entries).
                             self._drop_blocklisted_file_configs(
                                 "previously loaded cache files"
                             )
-                            if (
-                                rejections is not None
-                                and "blocklisted_tactic" not in rejections
-                            ):
-                                rejections.append("blocklisted_tactic")
                             continue
                         if not self._tactic_still_valid(
                             runners[r_id],
@@ -2876,6 +2907,7 @@ class AutoTuner:
                             tactic,
                             custom_op,
                             "config file",
+                            legacy_key=stored_key is not cache_key,
                             validation_profile=validation_profile,
                         ):
                             if (
@@ -2933,15 +2965,15 @@ class AutoTuner:
             managed_store = self._active_managed_store
             if managed_store is not None:
                 store_id = (str(managed_store.root), managed_store.env_hash)
-                for r_id, cache_key in runner_keys:
+                for r_id, cache_key, stored_key in persisted_keys():
                     # Warm path: memoise on the cheap hashable key_fields
                     # tuple, not the str() file_key, so steady-state serving
                     # rebuilds no string.  file_key is materialised only on a
                     # cold miss, to address the on-disk entry.
-                    memo_key = (*store_id, cache_key.key_fields)
+                    memo_key = (*store_id, stored_key.key_fields)
                     hit = self._managed_decoded.get(memo_key)
                     if hit is None:
-                        entry = managed_store._lookup_record(cache_key.file_key)
+                        entry = managed_store._lookup_record(stored_key.file_key)
                         if entry is not None:
                             hit = entry._replace(tactic=_json_to_tactic(entry.tactic))
                             self._managed_decoded[memo_key] = hit
@@ -2967,12 +2999,15 @@ class AutoTuner:
                         ):
                             rejections.append("runner_mismatch")
                         continue
+                    if blocked(runner_name, tactic):
+                        continue
                     if not self._tactic_still_valid(
                         runners[r_id],
                         inputs,
                         tactic,
                         custom_op,
                         "managed cache",
+                        legacy_key=stored_key is not cache_key,
                         validation_profile=validation_profile,
                     ):
                         if (
@@ -3027,20 +3062,23 @@ class AutoTuner:
                 and not self.is_tuning_mode
                 and not self._isolate_legacy_configs
             ):
-                for r_id, cache_key in runner_keys:
-                    if cache_key.file_key in excluded_file_keys or (
+                for r_id, cache_key, stored_key in persisted_keys():
+                    if stored_key.file_key in excluded_file_keys or (
                         winner_identity is None
-                        and cache_key.file_key in self._invalidated_file_keys
+                        and stored_key.file_key in self._invalidated_file_keys
                     ):
                         continue
-                    is_hit, _, file_tactic, _ = load_from_file(cache_key.file_key)
+                    is_hit, _, file_tactic, _ = load_from_file(stored_key.file_key)
                     if is_hit:
+                        if blocked(type(runners[r_id]).__name__, file_tactic):
+                            continue
                         if not self._tactic_still_valid(
                             runners[r_id],
                             inputs,
                             file_tactic,
                             custom_op,
                             "bundled config",
+                            legacy_key=stored_key is not cache_key,
                             validation_profile=validation_profile,
                         ):
                             if (

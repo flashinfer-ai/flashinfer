@@ -221,7 +221,11 @@ def test_fused_finalize_replay(
         fc1_enabled = fused and fc1_overrides is not None
         options = {**kwargs, **extra}
         call_router_weights = options["topk_weights"]
-        return prims_ts_fp4_block_scale_moe(**options, use_fused_finalize=fused)
+        before = len(fused_launches)
+        result = prims_ts_fp4_block_scale_moe(**options, use_fused_finalize=fused)
+        if not fused:
+            assert len(fused_launches) == before
+        return result
 
     inputs_for(0)
     if guard_output:
@@ -533,25 +537,64 @@ def test_fused_finalize_aliased_input_replay(monkeypatch, offset, input_name):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_zero_output_failure_cleanup():
-    from flashinfer.prims_ts.moe.finalize import zero_output_during_fc1
+@pytest.mark.parametrize(
+    "omit_join", [False, True], ids=["joined", "missing-join-control"]
+)
+def test_zero_output_failure_cleanup(monkeypatch, omit_join):
+    from cuda.bindings import driver
+    from flashinfer.cuda_utils import checkCudaErrors
+    from flashinfer.prims_ts.moe import finalize
 
-    caller = torch.cuda.current_stream()
-    worker = torch.cuda.Stream()
-    output = torch.empty(16 * 1024 * 1024, device="cuda", dtype=torch.bfloat16)
-    worker.wait_stream(caller)
-    allocated = torch.cuda.memory_allocated()
+    worker, release = torch.cuda.Stream(), torch.cuda.Stream()
     with torch.cuda.stream(worker):
-        for _ in range(3):
-            torch.cuda._sleep(10000)
-            output.fill_(float("nan"))
-            with (
-                pytest.raises(RuntimeError, match="launch failed"),
-                zero_output_during_fc1(output),
-            ):
-                raise RuntimeError("launch failed")
-            # Cleanup must join the outstanding memset before the next use.
-            output.add_(1)
-            assert torch.all(output == 1)
-    caller.wait_stream(worker)
-    assert torch.cuda.memory_allocated() == allocated
+        gate = torch.zeros(1, device="cuda", dtype=torch.int32)
+        output = torch.full((16,), float("nan"), device="cuda", dtype=torch.bfloat16)
+        auxiliary = finalize._zero_stream(output.device)
+        # Load the add and gate-release kernels before blocking a stream.
+        output.add_(1)
+        release.wait_stream(worker)
+        with torch.cuda.stream(release):
+            gate.fill_(1)
+        worker.wait_stream(release)
+        gate.zero_()
+        release.wait_stream(worker)
+        zero_output = finalize._zero_output
+        wait_event = torch.cuda.Stream.wait_event
+        joined = False
+
+        def gated_zero(output, stream):
+            checkCudaErrors(
+                driver.cuStreamWaitValue32(
+                    driver.CUstream(stream.cuda_stream), gate.data_ptr(), 1, 0
+                )
+            )
+            zero_output(output, stream)
+
+        def observe_wait(stream, event):
+            nonlocal joined
+            if stream == worker:
+                if omit_join:
+                    return
+                joined = True
+            return wait_event(stream, event)
+
+        allocated = torch.cuda.memory_allocated()
+        with monkeypatch.context() as patch:
+            patch.setattr(finalize, "_zero_output", gated_zero)
+            patch.setattr(torch.cuda.Stream, "wait_event", observe_wait)
+            try:
+                with (
+                    pytest.raises(RuntimeError, match="launch failed"),
+                    finalize.zero_output_during_fc1(output),
+                ):
+                    raise RuntimeError("launch failed")
+                output.add_(1)
+                if not joined:
+                    # Force the add to finish before the pending zero can start.
+                    release.wait_stream(worker)
+            finally:
+                with torch.cuda.stream(release):
+                    gate.fill_(1)
+        worker.wait_stream(auxiliary)
+        assert torch.all(output == (0 if omit_join else 1))
+        assert torch.cuda.memory_allocated() == allocated

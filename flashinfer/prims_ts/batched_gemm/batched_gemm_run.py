@@ -4886,7 +4886,7 @@ def _prepare_tma_descriptors(io: dict, stream, *, prepare=None, reencode_tma=Non
     return prepare
 
 
-def _compile_for_launch(io: dict, stream) -> object:
+def _compile_for_launch(io: dict, stream, *, reencode_tma=None) -> object:
     """Compile ``gemm`` for one launch IO on ``stream``; returns the compiled fn.
 
     The single ``cute.compile`` entry point, shared by :func:`compile`,
@@ -4894,7 +4894,7 @@ def _compile_for_launch(io: dict, stream) -> object:
     """
     from cutlass.cutlass_dsl import BaseDSL
 
-    _prepare_tma_descriptors(io, stream)
+    _prepare_tma_descriptors(io, stream, reencode_tma=reencode_tma)
     compile_entry = cute.compile
     if _generate_line_info_enabled():
         compile_entry = cute.compile[cute.GenerateLineInfo(True)]
@@ -5001,6 +5001,7 @@ def benchmark_compiled(
     use_cuda_graphs: bool = True,
     host_input_gen: bool = False,
     use_cupti: bool | None = None,
+    prepare_descriptors=None,
 ) -> float:
     """Time an already-compiled batched GEMM against one launch IO.
 
@@ -5028,6 +5029,7 @@ def benchmark_compiled(
     _io_keepalive = io["_keepalive"]
 
     def generate_tensors():
+        nonlocal prepare_descriptors
         output_factory = torch.empty if host_input_gen else torch.zeros
         if cfg.has_output_block_scaling or cfg.uses_fp8_output:
             c_buf = output_factory(
@@ -5077,7 +5079,12 @@ def benchmark_compiled(
             sf_c_buf = sf_c_torch
             sf_c_ptr = sf_c_dp
         workspace_io = dict(io, c0_dp=c_ptr, sf_c_dp=sf_c_ptr)
-        _prepare_tma_descriptors(workspace_io, stream)
+        prepare_descriptors = _prepare_tma_descriptors(
+            workspace_io,
+            stream,
+            prepare=prepare_descriptors,
+            reencode_tma=io.get("_reencode_tma"),
+        )
         args = testing.JitArguments(*_launch_arg_tuple(workspace_io, stream))
         args.add_to_scope([c_buf, sf_c_buf, workspace_io])
         return args
@@ -5215,7 +5222,8 @@ def benchmark(
         f"scheduler={'persistent' if cfg.is_persistent else 'static'}, "
         f"swap_ab={cfg.is_swap_ab}"
     )
-    compiled_fn = _compile_for_launch(io, stream)
+    prepare_descriptors = _prepare_tma_descriptors(io, stream)
+    compiled_fn = _compile_for_launch(io, stream, reencode_tma=io["_reencode_tma"])
     exec_time = benchmark_compiled(
         compiled_fn,
         io,
@@ -5226,6 +5234,7 @@ def benchmark(
         cuda_profiler_range=cuda_profiler_range,
         use_cuda_graphs=use_cuda_graphs,
         host_input_gen=input_device == "cpu",
+        prepare_descriptors=prepare_descriptors,
     )
     # Match the reference-check path: clustered persistent kernels are sensitive
     # to compiled CUDA library lifetime if unload overlaps the next compile or
