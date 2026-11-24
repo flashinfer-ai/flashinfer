@@ -2814,6 +2814,9 @@ def _trtllm_fp4_records_moe(
     if act in (ActivationType.Geglu, ActivationType.GegluTanh):
         if p["1_clamp_limit"] is not None:
             raise ValueError("Below SM100 GeGLU takes no gemm1_clamp_limit.")
+    if act == ActivationType.SwigluStep:  # its limit only, as on SM100
+        if p["1_alpha"] is not None or p["1_beta"] is not None:
+            raise ValueError("SwigluStep takes no gemm1_alpha or gemm1_beta.")
     if fo is not None:  # by (token, k) entry; skipped slots zero, as on SM100
         if experts < a["num_experts"] or a.get("routing_logits") is None:
             for t in fo:

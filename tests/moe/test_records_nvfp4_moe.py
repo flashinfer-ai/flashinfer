@@ -135,8 +135,9 @@ def _routing(tokens, top_k=K, experts=E, seed=1):
 
 def _trt(m, x, x_scale, ids, weights, s1, s_gate, s2, **kw):
     b1, b2 = kw.pop("gemm1_bias", None), kw.pop("gemm2_bias", None)
+    p1 = [kw.pop(f"gemm1_{k}", None) for k in ("alpha", "beta", "clamp_limit")]
     return trtllm_fp4_block_scale_routed_moe(
-        (ids, weights), None, x, x_scale, m["w1"], m["r1"], b1, None, None, None,
+        (ids, weights), None, x, x_scale, m["w1"], m["r1"], b1, *p1,
         m["w2"], m["r2"], b2, s1, s_gate, s2, kw.pop("num_experts", E), ids.shape[1],
         None, None, kw.pop("inter", I), kw.pop("offset", 0), kw.pop("local", m["r1"].shape[0]),
         None, activation_type=m["act"].value, **kw,
@@ -215,6 +216,13 @@ def test_w4a4(recipe, gated, tokens):
         outs.append(_trt(*args, hidden_states_scale_layout=SfLayout.layout_linear)[0])
         with pytest.raises(NotImplementedError, match="hidden_states_scale_layout"):
             _trt(*args, hidden_states_scale_layout=SfLayout.layout_128x4)
+        if gated:  # SwigluStep takes its limit only, as on SM100; unclamped, SwiGLU
+            step = {**m, "act": ActivationType.SwigluStep}
+            ones = torch.ones(E, device="cuda")
+            _close(_trt(step, *args[1:], gemm1_clamp_limit=ones * float("inf"))[0], ref)
+            for k in ("gemm1_alpha", "gemm1_beta"):
+                with pytest.raises(ValueError, match="SwigluStep"):
+                    _trt(step, *args[1:], **{k: ones})
         cute = cute_dsl_fused_moe(
             codes, sf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], alpha1, a2, m["w2"],
             m["r2"], alpha2, E, K, activation_type=m["act"].value,
