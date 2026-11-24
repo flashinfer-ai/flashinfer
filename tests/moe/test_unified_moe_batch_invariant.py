@@ -881,16 +881,21 @@ def test_swapped_body_waits_before_its_group_tables_under_every_trigger_placemen
 ):
     """The swapped body, box and gather forms alike, waits for the preceding grid before its group tables read the plan's
     counts (the wait precedes the tables in the kernel's source), so no trigger placement of the chain is excluded for it:
-    the builder accepts both forms under every placement."""
+    the builder accepts both forms under every placement. The body carries both trigger sites as the grouped body does:
+    the early one right after the wait and before the tables, the late one after the producer's tile loop."""
     import inspect
 
     from flashinfer.fused_moe.batch_invariant import pdl
+    from flashinfer.fused_moe.batch_invariant.blocks import swap
     from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
     from flashinfer.fused_moe.batch_invariant.schedule import swapped_knobs
 
     cfg = swapped_knobs()[0]
     src = inspect.getsource(SwappedGroupedGemm.kernel)
-    assert src.index("griddepcontrol_wait()") < src.index("build_group_tables")
+    wait, tables = src.index("griddepcontrol_wait()"), src.index("build_group_tables")
+    assert wait < src.index("pdl.trigger_early()") < tables
+    assert src.count("pdl.trigger_early()") == 1
+    assert "pdl.trigger_late()" in inspect.getsource(swap)
     assert not hasattr(pdl, "BOX_FORM_TRIGGERS")
     for placement in ("none", "late", "early"):
         monkeypatch.setattr(pdl, "TRIGGER", placement)

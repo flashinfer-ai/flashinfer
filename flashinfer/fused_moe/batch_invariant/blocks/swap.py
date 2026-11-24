@@ -745,7 +745,7 @@ class SwappedGroupedGemm:
         # programmatic dependent launch: every warp waits for the preceding grid before the group tables (the tables read
         # ``counts``, the predecessor chain's writes); the producer waits once more before its first read of the
         # predecessor's output (the token rows), the epilogue before its first store; the trigger placement is the chain's
-        # (``pdl.TRIGGER``).
+        # (``pdl.TRIGGER``: the early site right after the wait, the late site after the producer's tile loop).
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
@@ -857,6 +857,7 @@ class SwappedGroupedGemm:
         if cutlass.const_expr(bs):
             s_off_pad = storage.group_off_pad.get_tensor(cute.make_layout((MAX_E + 1,)))
         cute.arch.griddepcontrol_wait()  # the tables read the predecessor chain's counts
+        pdl.trigger_early()  # the early placement's site: right after the wait, as in the grouped body
         if cutlass.const_expr(bs):
             # the three tables in one scan on the scale-factor warp (idle until its first tile) while the allocator warp issues
             # the TMEM allocation: the two longest legs of the prologue overlap instead of running back to back
