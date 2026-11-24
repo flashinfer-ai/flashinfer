@@ -70,8 +70,10 @@ PAIRS: Dict[Tuple[QuantFormat, QuantFormat], Fp4Pair] = {
 _X, _SF, _PTS, _IDS, _W, _W1, _W1SF, _W1A, _W2, _W2SF, _W2A, _OUT, _GS2, _INV2 = range(
     14
 )
+#: Plan tensors after the ids and weights in the packed inputs (``route_plan_dual``'s outputs, appended by construction in
+#: ``pack_inputs``) and scalars per record in the tactic tuple (``_tactic_fp4``'s); both pinned to the builders by the suite.
 _PLAN_LEN = 5
-TACTIC_FIELDS = 8  # scalars per record in the tactic tuple
+TACTIC_FIELDS = 8
 
 #: The layer's typed activations, every one a class of either pair.
 _ACTIVATIONS = (
@@ -536,11 +538,11 @@ class BatchInvariantFp4Runner(MoERunner):
                 and T * k <= ROUTE_PLAN_MAX_SLOTS
                 and E <= MAX_E
             ):
-                # routing and the dense packing's dual plan in one launch (a placement: the same bits and integers)
-                ids, wts, counts, dest, src, dest_pad, pos_pad = route_plan_dual(
+                # routing and the dense packing's dual plan in one launch (a placement: the same bits and integers); the
+                # plan tensors follow the ids and weights as the builder returns them
+                ids, wts, *plan = route_plan_dual(
                     act.routing_logits, k, self._method, bias, scale
                 )
-                plan = [counts, dest, src, dest_pad, pos_pad]
             else:
                 ids, wts = route(act.routing_logits, k, self._method, bias, scale)
         else:

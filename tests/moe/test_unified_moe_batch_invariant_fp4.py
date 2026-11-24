@@ -3795,6 +3795,34 @@ def test_fingerprint_refuses_the_shapes_the_layer_refuses(pair):
     )
 
 
+def test_tactic_and_plan_lengths_follow_the_record_and_plan_builders():
+    """``TACTIC_FIELDS`` is the scalar count ``_tactic_fp4`` writes per record (its inverse round-trips both records, the
+    swapped and gather flags included) and ``_PLAN_LEN`` the number of plan tensors ``permute_plan_dual`` returns --
+    ``route_plan_dual``'s outputs after the ids and weights, which ``pack_inputs`` appends by construction and ``forward``
+    slices off."""
+    import typing
+
+    from flashinfer.fused_moe.batch_invariant import api_fp4, runner_fp4
+    from flashinfer.fused_moe.batch_invariant.schedule_fp4 import (
+        gather_twins,
+        grouped_knobs_blockscaled,
+        swapped_knobs_blockscaled,
+    )
+
+    dense, box = grouped_knobs_blockscaled()[0], swapped_knobs_blockscaled()[0]
+    gather = gather_twins([box])[0]
+    for c1, c2 in ((dense, dense), (box, dense), (gather, box)):
+        t = runner_fp4._tactic_fp4(c1, c2)
+        assert len(t) == 2 * runner_fp4.TACTIC_FIELDS
+        assert all(isinstance(v, (int, str)) for v in t)
+        assert runner_fp4._configs_from_tactic_fp4(t) == (c1, c2)
+    plan = typing.get_args(typing.get_type_hints(api_fp4.permute_plan_dual)["return"])
+    assert len(plan) == runner_fp4._PLAN_LEN
+    both = typing.get_args(typing.get_type_hints(api_fp4.route_plan_dual)["return"])
+    assert len(both) == 2 + runner_fp4._PLAN_LEN
+    assert api_fp4.route is api_fp4.__dict__["route"] and "route" in api_fp4.__all__
+
+
 def test_prepare_activations_follows_the_served_pairs_table(monkeypatch):
     """``BatchInvariantFp4Config.prepare_activations`` is the served pair's own form from the ``PAIRS`` table (both served
     pairs: bf16 rows as given, no scale), so a pair added to the table brings its form with it and an unserved pair is
