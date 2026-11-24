@@ -3798,7 +3798,7 @@ def test_topk_clusters_pdl_waits_before_reading(variant, seq_len):
         if variant == "page_table":
             expected = page_table.gather(1, ref_indices)
         else:
-            expected = ref_indices + offsets[:, None]
+            expected = ref_indices.to(offsets.dtype) + offsets[:, None]
         # The cluster kernel does not promise sorted output.
         expected = expected.sort(dim=-1).values
 
