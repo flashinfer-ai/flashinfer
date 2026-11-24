@@ -934,6 +934,17 @@ def _fc1_bitwise_case(
     _quantize(raw, scale2, weights, inverse, ids, 2, clamp, expected, expected_sf)
     del raw
 
+    # Caller-allocated outputs prefilled with bytes no valid row can hold, so a
+    # skipped store fails: every output value is >= 0, so no FP4 code has its
+    # sign bit set (0xFF holds two -6), and scales saturate at 448 (0x7E) while
+    # 0x7F is E4M3 NaN.
+    out = torch.full((rows, intermediate // 2), 0xFF, dtype=torch.uint8, device=gpu)
+    out_scale = torch.full(
+        (32, 4, rows // 128, 4, (intermediate + 63) // 64, 1),
+        0x7F,
+        dtype=torch.uint8,
+        device=gpu,
+    )
     actual, actual_sf = gather_gemm(
         a=x,
         b=inputs["w1_weight"],
@@ -950,14 +961,20 @@ def _fc1_bitwise_case(
         clamped_relu2_limit=clamp,
         routing_weights=weights.reshape(-1).float(),
         sm_count=sm_count,
+        out=out,
+        out_scale=out_scale,
         **common,
     )
+    assert actual.data_ptr() == out.data_ptr()
+    assert actual_sf.data_ptr() == out_scale.data_ptr()
     live_tiles = int(active.item())
     valid = torch.cat(
         [torch.arange(t * 128, int(limits[t]), device=gpu) for t in range(live_tiles)]
     )
     assert valid.numel() == int((inverse >= 0).sum())
     expected_scales = _linear_scales(expected_sf, valid, intermediate)
+    # The sentinels cannot match a valid row by coincidence.
+    assert not (expected[valid] & 0x88).any() and not (expected_scales == 0x7F).any()
     if regime == "saturating":
         # The fixture must reach the E4M3 maximum, 448 (code 0x7E).
         assert (expected_scales == 0x7E).any()
