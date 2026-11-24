@@ -41,6 +41,7 @@ def _decode(
     N: gl.constexpr,
     S: gl.constexpr,
     W: gl.constexpr,
+    BALANCED: gl.constexpr,
 ):
     split, head, req = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     tok = gl.load(PTR + req)
@@ -68,7 +69,11 @@ def _decode(
     )
     z = gl.full((16,), 0, gl.float32, layout=gl.constexpr(SliceLayout(1, L)))
     acc = gl.full((16, D), 0, gl.float32, layout=gl.constexpr(L))
-    for tile in range(split * chunk, gl.minimum(tiles, (split + 1) * chunk)):
+    start = tiles * split // S if BALANCED else split * chunk
+    end = (
+        tiles * (split + 1) // S if BALANCED else gl.minimum(tiles, (split + 1) * chunk)
+    )
+    for tile in range(start, end):
         r = gl.arange(0, N, layout=gl.constexpr(SliceLayout(1, L)))
         n = tile * N + r
         if PAGE % N == 0:
@@ -127,6 +132,12 @@ def _decode(
             acc * (vscale / gl.where(z > 0, z, 1.0))[:, None],
             row[:, None] < G,
         )
+    elif BALANCED:
+        # Keep vectors and softmax statistics contiguous for the parallel merge.
+        slab = (tok.to(gl.int64) * H + head * G + row) * S * (D + 2)
+        gl.store(TMP + slab[:, None] + split * D + x[None, :], acc, row[:, None] < G)
+        gl.store(TMP + slab + S * D + split, m, row < G)
+        gl.store(TMP + slab + S * (D + 1) + split, z, row < G)
     else:
         base = ((tok.to(gl.int64) * H + head * G + row) * S + split) * (D + 2)
         gl.store(TMP + base[:, None] + x[None, :], acc, row[:, None] < G)
@@ -144,17 +155,26 @@ def _merge_split(
     S: tl.constexpr,
     D: tl.constexpr,
     NREQ: tl.constexpr,
+    X: tl.constexpr,
+    BALANCED: tl.constexpr,
 ):
     t, h = tl.program_id(0), tl.program_id(1)
     if t >= tl.load(PTR + NREQ):
         return
-    base = ((t.to(tl.int64) * tl.num_programs(1) + h) * S + tl.arange(0, S)) * (D + 2)
-    m = tl.load(P + base + D)
-    denom = tl.load(P + base + D + 1)
+    slab = (t.to(tl.int64) * tl.num_programs(1) + h) * S * (D + 2)
+    split = tl.arange(0, S)
+    if BALANCED:
+        base = slab + split * D
+        m = tl.load(P + slab + S * D + split)
+        denom = tl.load(P + slab + S * (D + 1) + split)
+    else:
+        base = slab + split * (D + 2)
+        m = tl.load(P + base + D)
+        denom = tl.load(P + base + D + 1)
     max_m = tl.max(m, axis=0)
     w = tl.exp(m - tl.where(max_m == -float("inf"), 0.0, max_m))
     den = tl.sum(w * denom, axis=0)
-    d = tl.arange(0, D)
+    d = tl.program_id(2) * X + tl.arange(0, X)
     acc = tl.sum(tl.load(P + base[:, None] + d[None, :]) * w[:, None], axis=0)
     tl.store(
         OUT + t.to(tl.int64) * o_str[0] + h * o_str[1] + d,
@@ -168,6 +188,10 @@ def run_decode(q, k, v, sf, table, lens, ptr, out, scale, vscale):
     heads, d = q.shape[1:]
     hkv, page = k.shape[1:3]
     n, s, w = (32, 32, 2) if table.shape[1] <= 32 else (64, 128, 2)
+    balanced = table.shape[0] == 1 and table.shape[1] > 32
+    if balanced:
+        s = 256
+    x = 32 if balanced else d
     tmp = torch.empty(
         (q.shape[0], heads, s, d + 2), device=q.device, dtype=torch.float32
     )
@@ -198,11 +222,22 @@ def run_decode(q, k, v, sf, table, lens, ptr, out, scale, vscale):
             n,
             s,
             w,
+            balanced,
             num_warps=w,
             num_stages=1,
             ptx_version=94,
         )
-        _merge_split[(q.shape[0], heads)](
-            tmp, out, ptr, vscale, out.stride(), s, d, table.shape[0]
+        _merge_split[(q.shape[0], heads, d // x)](
+            tmp,
+            out,
+            ptr,
+            vscale,
+            out.stride(),
+            s,
+            d,
+            table.shape[0],
+            x,
+            balanced,
+            num_warps=2 if balanced else 4,
         )
     return out
