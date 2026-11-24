@@ -14,10 +14,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Tuple
 
-from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.activation import (
-    fc1_rows_per_intermediate,
-)
-
 from ......core.validation.common import MoEEpConfigError
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
 from ...weight_validation import (
@@ -60,6 +56,10 @@ def preprocess_mega_weights(
     activation: str = "swiglu",
 ) -> TransformedMegaWeights:
     """Canonical BF16 or prequantized MXFP8 weights -> SM107 kernel layout."""
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.activation import (
+        fc1_rows_per_intermediate,
+    )
+
     fc1_rows = fc1_rows_per_intermediate(activation)
     gated = fc1_rows == 2
     if isinstance(weights, PrequantizedMoEWeights):
@@ -120,6 +120,9 @@ def validate_transformed_mega_weights(
     from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         Mxfp8BlockSize,
         swizzled_flat_sf_size,
+    )
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe.activation import (
+        fc1_rows_per_intermediate,
     )
 
     check_transformed_mega_weights_structure(transformed)
