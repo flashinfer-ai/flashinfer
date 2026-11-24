@@ -749,7 +749,7 @@ def gather_sf_layout(
     ``[T, K / block]`` is the flat 128x4 buffer, a 2-D ``[T, K / block]`` tensor the linear layout, unless the swizzled buffer
     has that shape too (:func:`sf_layouts_collide`), which is refused: the caller names the layout
     (``QuantConfig(swizzled_scale_factors=...)`` through the layer, ``sf_layout`` on the op) or flattens the quantizer's
-    buffer."""
+    buffer. An empty pack (``T == 0``) is the 128x4 buffer of no rows: the two layouts are one empty buffer."""
     if layout is not None:
         if layout not in SF_LAYOUTS:
             raise ValueError(f"sf_layout must be one of {SF_LAYOUTS}, not {layout!r}")
@@ -763,7 +763,7 @@ def gather_sf_layout(
                 "sf_layout='linear' on the op)",
             )
         return layout
-    if a_sf.dim() != 2 or tuple(a_sf.shape) != (T, K // block):
+    if T == 0 or a_sf.dim() != 2 or tuple(a_sf.shape) != (T, K // block):
         return "128x4"
     if sf_layouts_collide(T, K, block):
         raise unsupported(

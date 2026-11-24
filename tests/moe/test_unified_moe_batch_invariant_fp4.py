@@ -4288,6 +4288,59 @@ def test_tuned_gather_winner_replayed_on_a_linear_pack_takes_the_box_form(pair):
     assert torch.equal(bits(layer2(actlin, W_pack)), ref)
 
 
+def test_empty_prequantized_pack_names_the_128x4_layout_and_gives_an_empty_output():
+    """At ``T = 0`` the linear ``[0, K / block]`` rows and the 128x4 buffer of no rows are one empty buffer, so the shape
+    rule returns the 128x4 layout before the collision rule (which holds at every multiple of 128, zero included); a named
+    layout keeps its shape check. On a device the op and the layer take an empty pre-quantized pack of either scale shape
+    (both pairs) and give the empty ``[0, H]`` output, as they take the flat empty buffer and empty bf16 rows."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        fused_moe_fp4,
+        gather_sf_layout,
+        sf_layouts_collide,
+    )
+
+    assert sf_layouts_collide(0, 512, 16)
+    for shape, block in (((0, 32), 16), ((0,), 16), ((0, 16), 32), ((0, 4, 8), 16)):
+        sf = torch.empty(*shape, dtype=torch.uint8)
+        assert gather_sf_layout(sf, 0, 512, block) == "128x4"
+        assert gather_sf_layout(sf, 0, 512, block, "128x4") == "128x4"
+    assert gather_sf_layout(torch.empty(0, 32, dtype=torch.uint8), 0, 512, 16, "linear") == "linear"  # fmt: skip
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="linear"):
+        gather_sf_layout(torch.empty(0, dtype=torch.uint8), 0, 512, 16, "linear")
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="named layout"):
+        gather_sf_layout(torch.empty(128, 32, dtype=torch.uint8), 128, 512, 16)
+    if not _supported:
+        return
+    k, H, I, E = 2, 512, 64, 8
+    for pair in (NVFP4, MXFP4):
+        quant = _NVFP4_PTS if pair.scaled else _MX
+        _, _, w1, w2 = _problem(4, k, H, I, E, seed=3)
+        W_pack = _weights(w1, w2, quant=quant)
+        W = _weights_of(W_pack)
+        x4 = torch.empty(0, H // 2, dtype=torch.uint8, device="cuda")
+        ids = torch.empty(0, k, dtype=torch.int32, device="cuda")
+        wts = torch.empty(0, k, dtype=torch.float32, device="cuda")
+        pts = (
+            torch.empty(0, dtype=torch.float32, device="cuda") if pair.scaled else None
+        )
+        for sf in (
+            torch.empty(0, H // pair.block, dtype=torch.uint8, device="cuda"),
+            torch.empty(0, dtype=torch.uint8, device="cuda"),
+        ):
+            out = fused_moe_fp4(_pack(pair, x4, sf, pts), ids, wts, W)
+            assert out.shape == (0, H) and out.dtype == torch.bfloat16
+            act = MoEActivationPack(
+                x4, sf, topk_ids=ids, topk_weights=wts, per_token_scale=pts,
+                routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+            )  # fmt: skip
+            assert _layer(k, E, I, quant=quant)(act, W_pack).shape == (0, H)
+        rows = MoEActivationPack(
+            torch.empty(0, H, dtype=torch.bfloat16, device="cuda"), None, topk_ids=ids, topk_weights=wts,
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        )  # fmt: skip
+        assert _layer(k, E, I, quant=quant)(rows, W_pack).shape == (0, H)
+
+
 @needs_device
 @each_pair
 def test_named_linear_scales_of_another_shape_are_refused(pair):
