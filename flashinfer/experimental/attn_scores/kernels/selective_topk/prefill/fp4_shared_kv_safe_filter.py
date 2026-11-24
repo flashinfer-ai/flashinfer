@@ -1958,6 +1958,10 @@ class FP4PrefillMQALogitsKernel(_BaseKernel):
                 has_work = next_q_block_idx < num_q_blocks
             if cutlass.const_expr(self.num_heads != 32):
                 tmem.relinquish_alloc_permit()
+            # Every math warp has issued and waited for its last tcgen05.ld before math
+            # warp 0 frees the columns (the per-stage empty arrives go to the UMMA warp
+            # only, which does not free).
+            subset_barrier(barrier_id=3, number_of_threads=self.num_math_threads)
             tmem.free(tmem_ptr)
 
         else:
