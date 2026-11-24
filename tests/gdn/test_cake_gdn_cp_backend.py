@@ -1214,33 +1214,15 @@ def test_paged_fixup_kernel_maps_row_splits_to_the_four_row_builds(
     assert gdn_cp._paged_fixup_kernel(fixup) == paged
 
 
-# The stage-4 routes still served by the older programs, which take no fast
-# divisors; every other stage-4 route takes both.
-_STAGE4_WITHOUT_DIVISORS = {
-    "sm_100a": set(),
-    "sm_103a": {
-        "cp_prefill_bf16",
-        "cp_prefill_equal_head",
-        "cp_prefill_equal_head_h32",
-        "cp_prefill_generic",
-        "cp_prefill_generic_bf16",
-    },
-    "sm_107a": {"cp_prefill_equal_head", "cp_prefill_generic"},
-}
-
-
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
-def test_prefill_divisors_follow_the_stage4_program(arch: str) -> None:
+def test_every_stage4_program_takes_the_fast_divisors(arch: str) -> None:
     names = sorted(k for k in gdn_cp_jit.KERNELS[arch] if k.startswith("cp_prefill"))
     assert {"cp_prefill", "cp_prefill_bf16", "cp_prefill_generic_bf16"} <= set(names)
-    assert _STAGE4_WITHOUT_DIVISORS[arch] <= set(names)
     for name in names:
-        expected = (
-            ()
-            if name in _STAGE4_WITHOUT_DIVISORS[arch]
-            else ("cp_chunk_len_fdd", "num_sab_heads_fdd")
-        )
-        assert gdn_cp._prefill_divisors(name, arch) == expected, (arch, name)
+        assert gdn_cp._prefill_divisors(name, arch) == (
+            "cp_chunk_len_fdd",
+            "num_sab_heads_fdd",
+        ), (arch, name)
 
 
 @pytest.mark.parametrize("divisors", [(), ("cp_chunk_len_fdd", "num_sab_heads_fdd")])
