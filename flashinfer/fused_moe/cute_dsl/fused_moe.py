@@ -2128,7 +2128,7 @@ def cute_dsl_fused_moe(
         w4a4, pt = quant_mode == "w4a4", per_token_scale is not None
         w4a8 = quant_mode == "w4a8"  # MXFP8 x, GEMM2's input MXFP8 as on SM100
         validate_pre_fc2_routing(
-            routing_weights_before_fc2, quant_mode, activation, output_dtype,
+            routing_weights_before_fc2, quant_mode, activation, output_dtype, swap_ab,
             per_token_scale=pt, localized_weights=localized_weights is not None,
         )  # fmt: skip
         x16 = (torch.bfloat16, torch.float16)
@@ -2139,6 +2139,10 @@ def cute_dsl_fused_moe(
             or (quant_mode == "w4a16" and x.dtype != output_dtype)
             or (x_sf is None or fc2_input_scale is None) == w4a4
             or (w4a8 and (x.dtype != torch.float8_e4m3fn or x_sf is None))
+            or (w4a8 and x_sf.dtype != torch.uint8)
+            or (w4a8 and x_sf.shape != (len(x), x.shape[1] // 32))  # as on SM100
+            or (w4a4 and x.dtype != torch.uint8)
+            or (w4a4 and x_sf.dtype not in (torch.float8_e4m3fn, torch.uint8))
             or (pt and not w4a4)
         ):
             raise NotImplementedError(
@@ -2154,7 +2158,9 @@ def cute_dsl_fused_moe(
         if moe_output is None:
             moe_output = x.new_empty(shape, dtype=output_dtype)
         else:
-            check_shape_dtype_device(moe_output, shape, None, None, "moe_output")
+            check_shape_dtype_device(
+                moe_output, shape, output_dtype, x.device, "moe_output"
+            )
         ids = token_selected_experts
         if local_expert_offset:  # local ids; the other ranks' are skipped
             ids = ids - local_expert_offset

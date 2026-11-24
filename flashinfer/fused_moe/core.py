@@ -1999,6 +1999,8 @@ def cutlass_fused_moe(
             or codes
             != (w4a4 and input.dtype == torch.uint8 or fp8 and use_mxfp8_act_scaling)
             or cluster_size != 1
+            or workspace_buffer is not None
+            or profile_ids is not None
             or use_wfp4afp8_humming
             and (
                 fp8
@@ -2011,7 +2013,8 @@ def cutlass_fused_moe(
                 "Below SM100 FP4 runs on records: NVFP4 with BF16 or FP16 input (or with "
                 "input_sf NVFP4), MXFP4 with MXFP8 (input_sf), FP8 per tensor or 16-bit input, and "
                 "output of BF16 or FP16 (16-bit input: that type); Humming-style MXFP4 16-bit "
-                "input, its third scale FP32, a scalar or [num_experts]."
+                "input, its third scale FP32, a scalar or [num_experts]"
+                "; no workspace_buffer or profile_ids."
             )
         act = ActivationType(activation_type)
         if act == ActivationType.InvalidType:  # as CUTLASS's dispatch
@@ -2730,6 +2733,9 @@ def _trtllm_fp4_records_moe(
     )
     if (
         (w4a4 != (nv or bf16_scale))
+        or x.dtype not in (torch.uint8, torch.bfloat16, torch.float8_e4m3fn)
+        or (nv and x_scale.dtype not in (torch.float8_e4m3fn, torch.uint8))
+        or (fp8 and x_scale is not None and x_scale.element_size() != 1)
         or (pt is not None and (
             not w4a4 or pt.dtype != torch.float32 or pt.numel() != tokens
             or not pt.is_contiguous()

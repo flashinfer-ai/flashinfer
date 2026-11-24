@@ -174,6 +174,10 @@ def test_w4a16(gated, tokens):
             _trt(bad, x, None, ids, weights, None, m["w1_g"], m["w2_g"])
         with pytest.raises(ValueError, match="activation type"):
             _cutlass({**m, "act": ActivationType.InvalidType}, x, ids, weights, scales)
+        ws = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
+        for kw in ({"workspace_buffer": ws}, {"profile_ids": [0, 0]}):  # not read
+            with pytest.raises(NotImplementedError, match="profile_ids"):
+                _cutlass(m, x, ids, weights, scales, **kw)
 
 
 @pytest.mark.parametrize("recipe", RECIPES, ids=nvfp4_4over6_cache_key)
@@ -223,11 +227,21 @@ def test_w4a4(recipe, gated, tokens):
             for k in ("gemm1_alpha", "gemm1_beta"):
                 with pytest.raises(ValueError, match="SwigluStep"):
                     _trt(step, *args[1:], **{k: ones})
-        cute = cute_dsl_fused_moe(
-            codes, sf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], alpha1, a2, m["w2"],
-            m["r2"], alpha2, E, K, activation_type=m["act"].value,
-        )  # fmt: skip
-        outs.append(cute)
+
+        def cute(inp, xsf=sf):
+            return cute_dsl_fused_moe(
+                inp, xsf.unsqueeze(-1), ids, weights, m["w1"], m["r1"], alpha1, a2, m["w2"],
+                m["r2"], alpha2, E, K, activation_type=m["act"].value,
+            )  # fmt: skip
+
+        outs.append(cute(codes))
+        i8, e5m2 = codes.view(torch.int8), sf.view(torch.float8_e5m2)  # other types
+        for bad in (
+            lambda: _trt(m, i8, *args[2:]), lambda: _trt(m, codes, e5m2, *args[3:]),
+            lambda: cute(i8), lambda: cute(codes, e5m2),
+        ):  # fmt: skip
+            with pytest.raises(NotImplementedError, match="records"):
+                bad()
     for o in outs:
         torch.testing.assert_close(o, out, atol=0, rtol=0)
 
@@ -377,7 +391,7 @@ def test_valid_sizes(gated):
 @pytest.mark.parametrize("width", [H - 128, H - 2])
 def test_narrow_output(width):
     """Without valid sizes a narrower TRT-LLM output receives the leading columns, as on SM100;
-    a CuTe-DSL output of other rows is refused."""
+    a CuTe-DSL output of other rows or type is refused."""
     m = _model(True)
     tokens = 37
     x = torch.randn(tokens, H, device="cuda").bfloat16()
@@ -387,12 +401,13 @@ def test_narrow_output(width):
     out = _trt(*args, output=buf[:, :width])[0]
     torch.testing.assert_close(out, _trt(*args)[0][:, :width], atol=0, rtol=0)
     assert out.data_ptr() == buf.data_ptr() and (buf[:, width:] == 7).all()
-    with pytest.raises(ValueError, match="moe_output"):
-        cute_dsl_fused_moe(
-            x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
-            m["w2_g"], E, K, quant_mode="w4a16", activation_type=m["act"].value,
-            moe_output=x.new_empty(tokens + 1, H),
-        )  # fmt: skip
+    for bad in (x.new_empty(tokens + 1, H), x.new_empty(tokens, H, dtype=torch.half)):
+        with pytest.raises(ValueError, match="moe_output"):
+            cute_dsl_fused_moe(
+                x, None, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
+                m["w2_g"], E, K, quant_mode="w4a16", activation_type=m["act"].value,
+                moe_output=bad,
+            )  # fmt: skip
 
 
 def test_fc2_input_out():
@@ -535,12 +550,18 @@ def test_mxfp4_mxfp8(gated, split, tokens):
         _cutlass(m, x8, ids, weights, scales, input_sf=block_scale_interleave(sf), **kw)
     ]
     outs.append(_trt(m, x8, sf, ids, weights, None, m["w1_g"], m["w2_g"])[0])
-    outs.append(cute_dsl_fused_moe(
-        x8, sf, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
-        m["w2_g"], E, K, quant_mode="w4a8", activation_type=m["act"].value,
-    ))  # fmt: skip
+
+    def cute(xsf):
+        return cute_dsl_fused_moe(
+            x8, xsf, ids, weights, m["w1"], m["r1"], m["w1_g"], None, m["w2"], m["r2"],
+            m["w2_g"], E, K, quant_mode="w4a8", activation_type=m["act"].value,
+        )  # fmt: skip
+
+    outs.append(cute(sf))
     for o in outs:
         torch.testing.assert_close(o, out, atol=0, rtol=0)
+    with pytest.raises(NotImplementedError, match="records"):  # [M, H/32] as on SM100
+        cute(sf.t().contiguous())
 
 
 @pytest.mark.parametrize("gated", [True, False])
