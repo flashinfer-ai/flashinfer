@@ -203,7 +203,7 @@
     },
     {
       "arch": "sm_120a",
-      "closure_sha256": "7194988ca869d674b89a998bab66bbb511e23c82dc8410f7e54dbfb9bd69f4aa",
+      "closure_sha256": "c397588be3dee0f912866e39aa93239f5bc7da1ed9f717e11ee63d827594f385",
       "entry": "run",
       "gencode": "-gencode=arch=compute_120a,code=sm_120a",
       "min_cuda": "12.8",
@@ -212,8 +212,8 @@
       "nvcc_flags_if": [],
       "path": "aot/cake_nvfp4_attention_94fb7e2f8ee5c56bd085_sm_120a.so",
       "sha256": {
-        "csrc/cake_nvfp4_attention_94fb7e2f8ee5c56bd085_binding.cu": "fdd0217ea24fff30afd9b13441bbf7c9f1734a7d5eea56871d333133d9b5d298",
-        "csrc/cake_nvfp4_attention_94fb7e2f8ee5c56bd085_kernel.cu": "9c26c3b17dd2cf90fb028a6cd2dd2c8c976e6d72555de9fffc7a1949cb8b18ae"
+        "csrc/cake_nvfp4_attention_94fb7e2f8ee5c56bd085_binding.cu": "abc22a3a4ea9ab8aa89055055a17cdb15c01c26bf3e912719932f2688e285ef1",
+        "csrc/cake_nvfp4_attention_94fb7e2f8ee5c56bd085_kernel.cu": "2dc8ec87fd423ca791a94144ed67f208ec6c02336fc34694d9fbc7baf26e6f9e"
       },
       "sources": [
         "csrc/cake_nvfp4_attention_94fb7e2f8ee5c56bd085_kernel.cu",
