@@ -346,6 +346,15 @@ def test_prims_fail_fast_for_unsupported_options():
         kv_data_type=k.dtype,
         o_data_type=torch.float16,
     )
+    for invalid in (
+        torch.ones((), device="cpu"),
+        torch.ones((), dtype=torch.float16, device="cuda"),
+        torch.ones(hq, device="cuda"),
+    ):
+        with pytest.raises(ValueError, match="q_scale must be a single float32 value"):
+            ragged_wrapper.run(q, k, v, q_scale=invalid)
+    with pytest.raises(ValueError, match="q_scale must be a single float32 value"):
+        ragged_wrapper.run(q, k[:0], v[:0], q_scale=torch.ones(hq, device="cuda"))
     ragged_wrapper._sinks = sinks
     with pytest.raises(NotImplementedError, match="does not support attention sinks"):
         ragged_wrapper.run(q, k, v)
@@ -603,3 +612,76 @@ def test_p_prescale_keeps_diffuse_tail(all_ones_v):
     rel_rms = (out.float() - ref).square().mean().sqrt() / ref.square().mean().sqrt()
     assert rel_rms.item() < 0.03
     torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("paged", [False, True], ids=["ragged", "paged"])
+@pytest.mark.parametrize("device_scales", ["q", "k", "v", "qkv"])
+def test_cuda_graph_replays_updated_fp8_scales(paged, device_scales):
+    hq, hkv, d, page_size = 4, 2, 32, 16
+
+    def offsets(*values):
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    q = _fp8((3, hq, d))
+    k, v = _fp8((page_size, hkv, d)), _fp8((page_size, hkv, d))
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+    plan = dict(
+        causal=True,
+        q_data_type=q.dtype,
+        kv_data_type=k.dtype,
+        o_data_type=torch.bfloat16,
+    )
+    if paged:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "HND", backend="cute-dsl-prims"
+        )
+        wrapper.plan(
+            offsets(0, 3),
+            offsets(0, 1),
+            offsets(0),
+            offsets(page_size),
+            hq,
+            hkv,
+            d,
+            page_size,
+            **plan,
+        )
+        inputs = (q, tuple(t.transpose(0, 1).unsqueeze(0).contiguous() for t in (k, v)))
+    else:
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            workspace, "NHD", backend="cute-dsl-prims"
+        )
+        wrapper.plan(offsets(0, 3), offsets(0, page_size), hq, hkv, d, **plan)
+        inputs = (q, k, v)
+    scales = {name + "_scale": 1.25 for name in "qkv"}
+    for name in device_scales:
+        # A one-element strided view still refers to the caller's scale buffer.
+        scales[name + "_scale"] = (
+            torch.ones(3, device="cuda")[1::2]
+            if name == "k"
+            else torch.ones((), device="cuda")
+        )
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    lse = torch.empty(q.shape[:2], device="cuda")
+    wrapper.run_return_lse(*inputs, **scales, out=out, lse=lse, enable_pdl=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run_return_lse(*inputs, **scales, out=out, lse=lse, enable_pdl=True)
+    previous = None
+    for values in ((0.5, 1.25, 2.0), (1.5, 2.0, 0.25)):
+        static_scales = {}
+        for (name, scale), value in zip(scales.items(), values, strict=True):
+            if isinstance(scale, torch.Tensor):
+                scale.fill_(value)
+                static_scales[name] = value
+            else:
+                static_scales[name] = scale
+        expected, expected_lse = wrapper.run_return_lse(
+            *inputs, **static_scales, enable_pdl=True
+        )
+        graph.replay()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+        if previous is not None:
+            assert not torch.equal(previous, out)
+        previous = out.clone()

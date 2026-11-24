@@ -5194,6 +5194,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Additional arguments for custom kernels.
         q_scale : Optional[Union[float, torch.Tensor]]
             The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+            The ``cute-dsl-prims`` backend also accepts single-element float32 CUDA
+            tensors for ``q_scale``, ``k_scale``, and ``v_scale``.
         k_scale : Optional[Union[float, torch.Tensor]]
             The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[Union[float, torch.Tensor]]
@@ -7499,6 +7501,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         *args,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        v_scale: Optional[Union[float, torch.Tensor]] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
@@ -7517,6 +7522,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         *args,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        v_scale: Optional[Union[float, torch.Tensor]] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
@@ -7535,9 +7543,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         *args,
-        q_scale: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        q_scale: Optional[Union[float, torch.Tensor]] = None,
+        k_scale: Optional[Union[float, torch.Tensor]] = None,
+        v_scale: Optional[Union[float, torch.Tensor]] = None,
         o_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
@@ -7567,11 +7575,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim_vo]``
         *args
             Additional arguments for the custom kernel.
-        q_scale: Optional[float]
+        q_scale: Optional[Union[float, torch.Tensor]]
             The calibration scale of fp8 query, if not provided, will be set to ``1.0``.
-        k_scale: Optional[float]
+            The ``cute-dsl-prims`` backend also accepts single-element float32 CUDA
+            tensors for ``q_scale``, ``k_scale``, and ``v_scale``.
+        k_scale: Optional[Union[float, torch.Tensor]]
             The calibration scale of fp8 or nvfp4 key, if not provided, will be set to ``1.0``.
-        v_scale: Optional[float]
+        v_scale: Optional[Union[float, torch.Tensor]]
             The calibration scale of fp8 or nvfp4 value, if not provided, will be set to ``1.0``.
         o_scale: Optional[float]
             The calibration scale of output, if not provided, will be set to ``1.0``.
