@@ -118,6 +118,14 @@ class Fp4Pair:
     ) -> None:
         check_shape_fp4(self, H, I, E, k, gated)
 
+    def prepare_activations(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """The layer's activation pack of the pair: bf16 rows as given and no scale, for both served pairs (the class
+        quantizes the rows inside the op: per token for NVFP4, per 32-element block for MXFP4). A pair whose activations
+        arrive quantized by the caller declares its own form here."""
+        return hidden_states.to(torch.bfloat16).contiguous(), None
+
     def quantize(
         self,
         x: torch.Tensor,

@@ -3708,3 +3708,29 @@ def test_fingerprint_refuses_the_shapes_the_layer_refuses(pair):
     )
 
 
+def test_prepare_activations_follows_the_served_pairs_table(monkeypatch):
+    """``BatchInvariantFp4Config.prepare_activations`` is the served pair's own form from the ``PAIRS`` table (both served
+    pairs: bf16 rows as given, no scale), so a pair added to the table brings its form with it and an unserved pair is
+    refused before the table is read."""
+    from flashinfer.fused_moe.batch_invariant import runner_fp4
+
+    x = torch.randn(3, 64)
+    for q in (None, _NVFP4, _MX):
+        out, sf = BatchInvariantFp4Config.prepare_activations(x, quant=q)
+        pair = runner_fp4.PAIRS[(q or _NVFP4).pair]
+        ref, ref_sf = pair.prepare_activations(x)
+        assert out.dtype == torch.bfloat16 and sf is None and ref_sf is None
+        assert torch.equal(out, ref)
+
+    class Fake:
+        def prepare_activations(self, hidden_states):
+            return ("fake", hidden_states)
+
+    monkeypatch.setitem(runner_fp4.PAIRS, _MX.pair, Fake())
+    assert BatchInvariantFp4Config.prepare_activations(x, quant=_MX)[0] == "fake"
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        BatchInvariantFp4Config.prepare_activations(
+            x, quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+        )
+
+

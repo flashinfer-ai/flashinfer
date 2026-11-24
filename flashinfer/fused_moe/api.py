@@ -3748,15 +3748,14 @@ class BatchInvariantFp4Config:
     def prepare_activations(
         hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """The activation pack of the pair ``quant`` selects (``None``: NVFP4 x NVFP4). Both pairs: bf16 activations as
-        given (no scale): the class's quantization (per token for NVFP4, per 32-element block for MXFP4) is part of the op."""
-        pair = _fp4_pair(quant)
-        if pair in (
-            (QuantFormat.NVFP4, QuantFormat.NVFP4),
-            (QuantFormat.MXFP4, QuantFormat.MXFP4),
-        ):
-            return hidden_states.to(torch.bfloat16).contiguous(), None
-        raise AssertionError(f"unreachable: {pair!r} passed _fp4_pair")
+        """The activation pack of the pair ``quant`` selects (``None``: NVFP4 x NVFP4), the pair's own form
+        (:meth:`~flashinfer.fused_moe.batch_invariant.api_fp4.Fp4Pair.prepare_activations`). Both served pairs: bf16
+        activations as given (no scale): the class's quantization (per token for NVFP4, per 32-element block for MXFP4) is
+        part of the op."""
+        from .batch_invariant.runner_fp4 import PAIRS
+
+        # the served pairs' table drives the form: an unserved pair was refused by _fp4_pair, a served one names its form
+        return PAIRS[_fp4_pair(quant)].prepare_activations(hidden_states)
 
     def __repr__(self) -> str:
         return (
