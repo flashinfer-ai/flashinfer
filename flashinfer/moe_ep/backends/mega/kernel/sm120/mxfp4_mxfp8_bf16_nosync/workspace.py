@@ -56,6 +56,7 @@ def buffer_layout(
     hidden: int,
     intermediate: int,
     gin: bool = False,
+    dedup_replicated_inputs: bool = False,
 ) -> list[int]:
     """Byte offsets of the symmetric buffer, in the order the binding reads them:
     [total, x, x_sf, topk_idx, topk_weights, pool, recv_cnt, recv_flag, comb, comb_flag,
@@ -71,7 +72,7 @@ def buffer_layout(
     packed in the expert rank's (local expert, slot) order), and the packed row of each
     (token, k)."""
     epr = experts // ranks
-    expert_rows = epr * ranks * capacity
+    expert_rows = epr * (capacity if dedup_replicated_inputs else ranks * capacity)
     row_bytes = pool_row_bytes(hidden)
     route_map_ints = experts * capacity
     sizes = (
@@ -148,6 +149,7 @@ class NosyncWorkspace:
         intermediate: int,
         transport: str | tuple[int, ...],
         fast_math: bool,
+        dedup_replicated_inputs: bool = False,
     ) -> None:
         if isinstance(transport, tuple):  # per-pair table (config.py): 1 P2P, 2 GIN
             if len(transport) != world_size * world_size:
@@ -163,6 +165,7 @@ class NosyncWorkspace:
         self.num_experts = num_experts
         self.capacity = capacity
         self.top_k = top_k
+        self.dedup_replicated_inputs = dedup_replicated_inputs
         self.hidden = hidden
         self.intermediate = intermediate
         self.device = torch.device("cuda", torch.cuda.current_device())
@@ -182,6 +185,7 @@ class NosyncWorkspace:
             hidden,
             intermediate,
             gin=transport != "p2p",
+            dedup_replicated_inputs=dedup_replicated_inputs,
         )
         num_bytes = self.offsets[0]
         if world_size == 1:
@@ -313,6 +317,7 @@ class NosyncWorkspace:
             weights.w13_gate_up_interleaved,
             weights.scale_layout == "canonical",
             weights.scale_layout == "deepgemm",
+            self.dedup_replicated_inputs,
         )
 
     def error(self) -> int:

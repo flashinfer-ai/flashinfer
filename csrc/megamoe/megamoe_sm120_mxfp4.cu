@@ -75,7 +75,7 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
                                int64_t num_tokens, double activation_clamp,
                                tvm::ffi::Array<int64_t> gin, int64_t tokens_per_item,
                                int64_t w13_gate_up_interleaved, int64_t scales_are_canonical,
-                               int64_t scales_are_deepgemm) {
+                               int64_t scales_are_deepgemm, int64_t dedup_replicated_inputs) {
   // dims: [num_experts, num_topk, hidden, intermediate_hidden, num_max_tokens_per_rank]
   // l1/l2_weights: packed E2M1 [EL][2I][H/2] / [EL][H][I/2], interleaved or canonical;
   // l1/l2_scales: UE8M0 words per 16-row block and K128, canonical per-row bytes,
@@ -161,6 +161,7 @@ void megamoe_sm120_mxfp4_fused(tvm::ffi::TensorView y, tvm::ffi::TensorView symm
   a.w13_gate_up_interleaved = w13_gate_up_interleaved != 0;
   a.scales_are_canonical = scales_are_canonical != 0;
   a.scales_are_deepgemm = scales_are_deepgemm != 0;
+  a.dedup_replicated_inputs = dedup_replicated_inputs != 0;
 
   ffi::CUDADeviceGuard device_guard(y.device().device_id);
   const int dev = y.device().device_id;

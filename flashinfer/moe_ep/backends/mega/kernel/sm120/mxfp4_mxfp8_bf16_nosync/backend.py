@@ -147,6 +147,7 @@ class Sm120Mxfp4Mxfp8NosyncMegaKernelBackend(MegaKernelBackend):
             intermediate=config.intermediate_size,
             transport=config.transport,
             fast_math=config.fast_math,
+            dedup_replicated_inputs=config.dedup_replicated_inputs,
         )
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
@@ -165,6 +166,7 @@ class Sm120Mxfp4Mxfp8NosyncMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             config.transport,
             config.fast_math,
+            config.dedup_replicated_inputs,
         )
 
     def validate_forward(

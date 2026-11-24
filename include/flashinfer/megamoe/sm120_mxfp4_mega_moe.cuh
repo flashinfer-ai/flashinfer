@@ -160,9 +160,9 @@ struct Args {
   const uint8_t* l1s;       // UE8M0 W13 scales in kernel, canonical or DeepGEMM MN-major layout
   const uint8_t* l2s;       // UE8M0 W2 scales in kernel, canonical or DeepGEMM MN-major layout
   size_t l1_stride, l2_stride, l1s_stride, l2s_stride;  // bytes per expert
-  uint8_t* inter;                                       // [EL][W*TCAP][I] e4m3 (local)
-  uint32_t* inter_s;                                    // [EL][W*TCAP][I/128]
-  int* ctr;                                             // kCtrInts
+  uint8_t* inter;              // [EL][dedup_replicated_inputs ? TCAP : W * TCAP][I] e4m3 (local)
+  uint32_t* inter_s;           // [EL][dedup_replicated_inputs ? TCAP : W * TCAP][I / 128]
+  int* ctr;                    // kCtrInts
   unsigned long long* stamps;  // optional [grid][16] globaltimer stamps (debug)
   Peers peers;
   Gin gin;
@@ -171,6 +171,7 @@ struct Args {
   bool w13_gate_up_interleaved = true;
   bool scales_are_canonical = false;
   bool scales_are_deepgemm = false;
+  bool dedup_replicated_inputs = false;
 };
 
 __device__ __forceinline__ int w13_row(int row, int intermediate) {
@@ -880,7 +881,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
     const int n1 = ntiles * nblk1, n2 = ntiles * nblk2;
     const uint8_t* pool = a.peers.pool[a.rank];
     const int g = lane / 4, c = lane % 4;
-    const int TOKE = W * TCAP;
+    const int TOKE = a.dedup_replicated_inputs ? TCAP : W * TCAP;
 
     bool first = true;
     while (true) {

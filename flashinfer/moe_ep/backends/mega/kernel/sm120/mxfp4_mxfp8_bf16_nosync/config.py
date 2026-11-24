@@ -63,6 +63,12 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
     16, 24 or 32). ``None`` picks 16 when this rank's routed rows per local expert
     (``tokens * top_k / local_experts``) reach 3, else 8 (measured with cold L2 on RTX 6000D).
     Set it explicitly after sweeping a deployment's shapes.
+
+    ``dedup_replicated_inputs`` compacts the FC1 intermediate buffers from
+    ``world_size * capacity`` rows per expert to ``capacity`` rows. Enable it only when each
+    source token has a single leader rank, so every global expert receives at most ``capacity``
+    unique rows. Inputs and routing must be identical across ranks; their partial outputs still
+    require an all-reduce. Only P2P transport supports this layout; the default preserves the original.
     """
 
     intermediate_size: int
@@ -72,6 +78,7 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
     transport: str | tuple[int, ...] = "p2p"
     tokens_per_item: int | None = None
     fast_math: bool = True
+    dedup_replicated_inputs: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.transport, (tuple, list)):
@@ -97,6 +104,8 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig:
                 f"transport must be one of {TRANSPORTS} or a per-pair table, "
                 f"got {self.transport!r}"
             )
+        if self.dedup_replicated_inputs and self.transport != "p2p":
+            raise ValueError("dedup_replicated_inputs requires P2P transport")
         if self.tokens_per_item is not None and (
             self.tokens_per_item not in TOKENS_PER_ITEM
         ):

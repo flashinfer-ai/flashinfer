@@ -454,7 +454,7 @@ def _check_borrowed_input_contract(pack, transformed, hidden, intermediate):
         )
 
 
-def _weight_layout_worker(rank, duplicate_destinations=False):
+def _weight_layout_worker(rank, duplicate_destinations=False, dedup_compact=False):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -482,7 +482,8 @@ def _weight_layout_worker(rank, duplicate_destinations=False):
     raw1, ref1 = _weights(experts // ep, 2 * intermediate, hidden, generator)
     raw2, ref2 = _weights(experts // ep, hidden, intermediate, generator)
     args = _args(ep=ep)
-    output = torch.empty(128, hidden, dtype=torch.bfloat16, device="cuda")
+    capacity = 16 if dedup_compact else 128
+    output = torch.empty(capacity, hidden, dtype=torch.bfloat16, device="cuda")
     for interleave, scale_layout in (
         (True, "kernel"),
         (False, "deepgemm"),
@@ -585,7 +586,7 @@ def _weight_layout_worker(rank, duplicate_destinations=False):
             ),
             fleet_params=FleetParams(
                 num_experts=experts,
-                max_tokens_per_rank=128,
+                max_tokens_per_rank=capacity,
                 token_hidden_size=hidden,
             ),
             weights=pack,
@@ -599,17 +600,115 @@ def _weight_layout_worker(rank, duplicate_destinations=False):
             ),
         )
         layer.warmup()
-        for bound in (1, 12, 128):
-            rows = (bound, 0, max(bound // 2, 1), 1)[rank % 4]
-            x = torch.randn(
-                rows, hidden, device="cuda", generator=generator, dtype=torch.bfloat16
+        dedup_layer = None
+        if dedup_compact:
+            dedup_layer = MoEEpLayer(
+                bootstrap=BootstrapConfig(
+                    world_size=ep,
+                    rank=rank,
+                    device=rank,
+                    process_group=dist.group.WORLD,
+                ),
+                fleet_params=FleetParams(
+                    num_experts=experts,
+                    max_tokens_per_rank=capacity,
+                    token_hidden_size=hidden,
+                ),
+                weights=pack,
+                backend=MegaConfig(
+                    megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig(
+                        intermediate_size=intermediate,
+                        top_k=topk,
+                        transport="p2p",
+                        dedup_replicated_inputs=True,
+                    ),
+                    quantize_input=True,
+                    preprocess_weights=False,
+                    transformed_weights=transformed,
+                ),
             )
-            ids, weights = _routing(args, rows, experts, topk, generator)
+            dedup_layer.warmup()
+        for bound in (1, 16) if dedup_compact else (1, 12, 128):
+            rows = (
+                bound if dedup_compact else (bound, 0, max(bound // 2, 1), 1)[rank % 4]
+            )
+            input_generator = (
+                torch.Generator(device="cuda").manual_seed(7919 + bound)
+                if dedup_compact
+                else generator
+            )
+            x = torch.randn(
+                rows,
+                hidden,
+                device="cuda",
+                generator=input_generator,
+                dtype=torch.bfloat16,
+            )
+            ids, weights = _routing(args, rows, experts, topk, input_generator)
+            if dedup_compact:
+                ids.copy_(torch.arange(topk, device=ids.device))
             if duplicate_destinations:
                 ids.copy_(
                     rank * (experts // ep) + torch.arange(topk, device=ids.device)
                 )
             t = MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=weights)
+            if dedup_compact:
+                owned = (
+                    torch.arange(rows, device=ids.device)
+                    .remainder(ep)
+                    .eq(rank)
+                    .unsqueeze(1)
+                )
+                compact_weights = weights.masked_fill(~owned, 0)
+                compact_t = MoEEpTensors(
+                    hidden_states=x,
+                    topk_ids=ids.masked_fill(~owned, -1),
+                    topk_weights=compact_weights,
+                )
+                partial = dedup_layer.forward(compact_t).clone()
+                expected = layer.forward(t).clone()
+                leader = owned.squeeze(1)
+                assert not partial[~leader].any()
+                assert torch.equal(partial[leader], expected[leader])
+                actual = partial.clone()
+                dist.all_reduce(actual)
+                assert torch.equal(actual, expected)
+
+                compact_output = torch.empty_like(output)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    dedup_layer.stage_inputs(compact_t, compile_tokens_per_rank=bound)
+                    dedup_layer.compute_staged(output=compact_output)
+                x.copy_(
+                    torch.randn(
+                        rows,
+                        hidden,
+                        device="cuda",
+                        generator=input_generator,
+                        dtype=torch.bfloat16,
+                    )
+                )
+                weights.copy_(
+                    torch.rand(rows, topk, device="cuda", generator=input_generator)
+                )
+                compact_weights.copy_(weights.masked_fill(~owned, 0))
+                expected = layer.forward(t).clone()
+                compact_output.zero_()
+                graph.replay()
+                torch.cuda.synchronize()
+                actual = compact_output[:rows].clone()
+                dist.all_reduce(actual)
+                assert torch.equal(actual, expected)
+                assert layer._kernel.protocol_error(layer._workspace) == 0
+                assert dedup_layer._kernel.protocol_error(dedup_layer._workspace) == 0
+                del graph
+                if rank == 0:
+                    print(
+                        f"PASS dedup compact layout={scale_layout} M={bound}: "
+                        "original and reduced partial outputs, graph replay exact",
+                        flush=True,
+                    )
+                continue
             layer.stage_inputs(t, compile_tokens_per_rank=bound)
             layer.compute_staged(output=output)
             torch.cuda.synchronize()
@@ -711,6 +810,8 @@ def _weight_layout_worker(rank, duplicate_destinations=False):
                 flush=True,
             )
         layer.destroy()
+        if dedup_layer is not None:
+            dedup_layer.destroy()
     dist.destroy_process_group()
 
 
@@ -733,6 +834,32 @@ def test_sm120_nosync_p2p_workspace_layout():
     assert gin_offsets[20] - gin_offsets[19] == (
         route_map_bytes + ranks * capacity * topk * 4
     )
+    compact = buffer_layout(
+        ranks,
+        experts,
+        capacity,
+        topk,
+        hidden,
+        intermediate,
+        dedup_replicated_inputs=True,
+    )
+    rows = experts // ranks * capacity
+    assert compact[13] - compact[12] == rows * intermediate
+    assert compact[14] - compact[13] == rows * (intermediate // 128) * 4
+    assert compact[1:12] == offsets[1:12]
+    assert compact[0] == 28_825_344
+
+
+def test_sm120_nosync_dedup_layout_requires_p2p():
+    from flashinfer.moe_ep import Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig
+
+    with pytest.raises(ValueError, match="requires P2P"):
+        Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig(
+            intermediate_size=256,
+            top_k=2,
+            transport="auto",
+            dedup_replicated_inputs=True,
+        )
 
 
 def test_sm120_nosync_p2p_shared_token_rows():
@@ -740,6 +867,15 @@ def test_sm120_nosync_p2p_shared_token_rows():
     if not _sm120_gpus(4):
         pytest.skip("requires 4 SM120 GPUs")
     torch.multiprocessing.spawn(_weight_layout_worker, args=(True,), nprocs=4)
+
+
+def test_sm120_nosync_dedup_compact_workspace():
+    """Unique TP leaders match the original layout exactly, including a full expert pool."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    torch.multiprocessing.spawn(
+        _weight_layout_worker, args=(False, True), nprocs=4, join=True
+    )
 
 
 def test_sm120_nosync_weight_layouts():
