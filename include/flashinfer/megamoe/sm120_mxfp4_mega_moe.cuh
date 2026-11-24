@@ -219,10 +219,10 @@ __device__ __forceinline__ int ld_acquire_gpu(const int* p) {
   asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
   return v;
 }
-// a peer's flag: every caller has fenced the data it publishes with __threadfence_system first, so
-// a plain store (a release store adds a second system fence: 1-3 us per flag on RTX 6000D)
-__device__ __forceinline__ void st_flag_sys(int* p, int v) {
-  *reinterpret_cast<volatile int*>(p) = v;
+// a peer's flag: the data it publishes may be written by other threads of the CTA (handed over by a
+// barrier), so the flag is a release store by the publishing thread itself
+__device__ __forceinline__ void st_release_sys(int* p, int v) {
+  asm volatile("st.release.sys.global.b32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 __device__ __forceinline__ void st_release_gpu(int* p, int v) {
   asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
@@ -309,6 +309,7 @@ __device__ __forceinline__ bool wait_peers(const Args& a, const int* flags, int 
       ok = wait_ge(flags + w, epoch, true);
   }
   ok = __all_sync(0xffffffffu, ok);
+  __syncwarp();  // orders every lane's acquire before lane 0's release (the vote does not)
   if (threadIdx.x == 0) {  // the release orders the error word before the local flag
     if (!ok) atomicExch(a.ctr + kCtrErr, err);
     st_release_gpu(local, epoch);
@@ -805,7 +806,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
                 ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigRoute + a.rank), 1});
       else
 #endif
-        st_flag_sys(a.peers.route_flag[dst] + a.rank, epoch);
+        st_release_sys(a.peers.route_flag[dst] + a.rank, epoch);
     }
     st_[8] = gtime();
   }
@@ -943,7 +944,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
   if (s_item) {  // last CTA out of the dispatch: every row of this rank is visible -> a thread per
                  // P2P rank flags it, then a thread per GIN rank puts its slot table and rows
     if (threadIdx.x < W && !is_gin(a, threadIdx.x))
-      st_flag_sys(a.peers.recv_flag[threadIdx.x] + a.rank, epoch);
+      st_release_sys(a.peers.recv_flag[threadIdx.x] + a.rank, epoch);
 #if MEGAMOE_SM120_GIN_DEVICE
     if (a.gin.mask) {
       // the routing counts staged for each GIN rank: this rank's routes there (its slot table
@@ -1269,7 +1270,10 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
         if (a.gin.mask) {  // the tile's last FC2 item puts its finished rows to GIN sources, one
                            // put per run of a GIN source
           __shared__ int s_last;
-          if (threadIdx.x == 0) s_last = atomicAdd(ctr + kCtrTile + tile_g, 1) == nblk2 - 1;
+          if (threadIdx.x == 0) {  // the fence acquires the slices other CTAs wrote (H > 128)
+            s_last = atomicAdd(ctr + kCtrTile + tile_g, 1) == nblk2 - 1;
+            if (s_last) __threadfence();
+          }
           __syncthreads();
           if (s_last && threadIdx.x < ntok && is_gin(a, s_tw[threadIdx.x]) &&
               (threadIdx.x == 0 || s_tw[threadIdx.x - 1] != s_tw[threadIdx.x])) {
@@ -1296,7 +1300,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
             gin_signal(a, w, ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigComb + a.rank), 1});
           else
 #endif
-            st_flag_sys(a.peers.comb_flag[w] + a.rank, epoch);
+            st_release_sys(a.peers.comb_flag[w] + a.rank, epoch);
           st_[15] = gtime();
         }
       }
@@ -1312,7 +1316,7 @@ __global__ void __launch_bounds__(kWarps * 32, 2) sm120_mega_moe_kernel(Args a) 
         gin_signal(a, w, ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigComb + a.rank), 1});
       else
 #endif
-        st_flag_sys(a.peers.comb_flag[w] + a.rank, epoch);
+        st_release_sys(a.peers.comb_flag[w] + a.rank, epoch);
     }
   }
 

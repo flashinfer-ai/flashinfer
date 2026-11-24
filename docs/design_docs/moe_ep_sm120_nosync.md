@@ -64,8 +64,7 @@ layer = MoEEpLayer(
   and cake are within 1.5%. **For the best performance,
   measure the switch point on the deployment and set `max_tokens_per_expert`
   yourself**: where the kernel stops winning depends on the model, the routing
-  and the interconnect (e.g. 12–24 tokens per expert for EP8 over the NIC, beyond
-  28 with every pair P2P), so no single value is best everywhere.
+  and the interconnect, so no single value is best everywhere.
 - `NosyncOptions` fields: `max_tokens_per_rank` (1–128) and
   `max_tokens_per_expert` (default 128), both the same on every rank;
   `transport` and `tokens_per_item` (below), and `top_k` / `swiglu_limit`, which
@@ -153,9 +152,9 @@ Reading the int64 ids where each phase needed them put up to top-k dependent
 memory latencies on the routing CTA's path (GLM-5.3-Flash EP8, 1 token per
 rank: routes sent at 8 µs instead of 3).
 
-**Synchronization and errors.** The data is fenced with `__threadfence_system`
-and the flag then written with a plain store (a release store adds a second
-system fence, 1–3 µs per flag), read with `ld.acquire.sys`; there are no remote
+**Synchronization and errors.** The data is fenced with `__threadfence_system`;
+after the barrier that hands it to the publishing thread, that thread writes
+the flag with `st.release.sys`, read with `ld.acquire.sys`; there are no remote
 atomics. For each wait on every rank (routes, rows, partials) one CTA's warp 0
 polls the peers' flags and GIN signals, a lane per rank, and republishes the
 epoch on a local word that the other CTAs wait on: with every CTA polling, the

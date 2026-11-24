@@ -872,7 +872,7 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument("--threshold", type=int, default=128)
-    parser.add_argument("--tokens-per-expert", type=int, default=16)
+    parser.add_argument("--tokens-per-expert", type=int, default=128)
     parser.add_argument("--fallback", choices=["cake", "cutedsl"], default="cake")
     parser.add_argument(
         "--routing", choices=["random", "hot", "empty", "invalid"], default="random"
@@ -885,4 +885,4 @@ if __name__ == "__main__":
     parser.add_argument("--uneven", action="store_true")
     parser.add_argument("--default-knobs", action="store_true")
     parser.add_argument("--epoch-start", type=int, default=None)
-    _run(parser.parse_args())
+    _run(_args(**vars(parser.parse_args())))  # worker-only fields keep _args defaults
