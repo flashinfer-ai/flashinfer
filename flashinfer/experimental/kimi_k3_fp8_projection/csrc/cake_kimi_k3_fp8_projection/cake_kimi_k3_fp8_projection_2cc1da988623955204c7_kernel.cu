@@ -318,7 +318,6 @@ kernel_cake_kimi_k3_fp8_projection_2cc1da988623955204c7(const __grid_constant__ 
             int num_cluster_tiles = m_tiles / CTA_GROUP * n_tiles;
             unsigned int load_stage = 0;
             unsigned int work_stage = 0;
-            int pdlb_wait = 1;
             unsigned int _phase_work_empty = 1;
             unsigned int _phase_mma_done_h0 = 1;
             unsigned int _phase_work_full = 0;
@@ -372,10 +371,7 @@ kernel_cake_kimi_k3_fp8_projection_2cc1da988623955204c7(const __grid_constant__ 
                         tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 60416 + 4096, (&B), 0, (b_row0 + 32) % 128, (b_row0 + 32) / 128 * (2 * num_k_iters) + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 60416 + 8192, (&B), 0, (b_row0 + 64) % 128, (b_row0 + 64) / 128 * (2 * num_k_iters) + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_sfb_all_addr + load_stage * 60416, (&SFB), 0, 0, sfb_tile_row + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                        if (pdlb_wait == 1) {
-                            asm volatile("griddepcontrol.wait;" ::: "memory");
-                            pdlb_wait = 0;
-                        }
+                        asm volatile("griddepcontrol.wait;" ::: "memory");
                         tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 60416, (&A), 0, off_m, k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_sfa_all_addr + load_stage * 60416, (&SFA), 0, 0, sfa_tile_row + k_group, ((tma_full_h0_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         asm volatile(
@@ -556,6 +552,7 @@ kernel_cake_kimi_k3_fp8_projection_2cc1da988623955204c7(const __grid_constant__ 
     // ---- Role: epilogue ----
     if (warp >= 2 && warp <= 9) {
         { // epilogue_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             int num_cluster_tiles_2 = m_tiles / CTA_GROUP * n_tiles;
             unsigned int work_stage_2 = 0;
             const int epi_warp = warp % 4;
