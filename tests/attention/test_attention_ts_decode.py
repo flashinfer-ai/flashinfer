@@ -10589,7 +10589,14 @@ def test_attention_ts_decode_nvfp4_resource_overrides(
 
 
 def _resolve_d512_decode_policy(
-    monkeypatch, *, batch_size, num_heads_q, seq_len_q, kv_dtype_key, max_kv_len
+    monkeypatch,
+    *,
+    batch_size,
+    num_heads_q,
+    seq_len_q,
+    kv_dtype_key,
+    max_kv_len,
+    return_spec=False,
 ):
     """Resolve the automatic D512 launch spec on a mocked 148-SM SM100 device."""
     from contextlib import nullcontext
@@ -10613,7 +10620,7 @@ def _resolve_d512_decode_policy(
     monkeypatch.setattr(decode_module, "get_device_sm_count", lambda _device: 148)
     decode_module._resolve_decode_launch_spec.cache_clear()
     try:
-        return decode_module._resolve_decode_launch_spec(
+        spec = decode_module._resolve_decode_launch_spec(
             0,
             batch_size,
             num_heads_q,
@@ -10630,29 +10637,40 @@ def _resolve_d512_decode_policy(
             "causal",
             False,
             -1,
-        ).config
+        )
+        return spec if return_spec else spec.config
     finally:
         decode_module._resolve_decode_launch_spec.cache_clear()
 
 
+@pytest.mark.parametrize("max_kv_len", (32768, 262144))
 @pytest.mark.parametrize("batch_size", (8, 16, 32))
 @pytest.mark.parametrize("kv_dtype_key", ("float4_e2m1fn", "float8_e4m3fn"))
 def test_attention_ts_decode_d512_q8_auto_selects_grouped_keeps(
-    monkeypatch, batch_size, kv_dtype_key
+    monkeypatch, batch_size, kv_dtype_key, max_kv_len
 ):
-    """Eight-token D512 decode at eight Q heads per KV head runs grouped Keeps Q64."""
-    cfg = _resolve_d512_decode_policy(
+    """Eight-token D512 decode at eight Q heads per KV head runs grouped Keeps Q64.
+
+    A long ``max_kv_len`` (plans made at the model context) keeps Keeps.
+    """
+    spec = _resolve_d512_decode_policy(
         monkeypatch,
         batch_size=batch_size,
         num_heads_q=32,
         seq_len_q=8,
         kv_dtype_key=kv_dtype_key,
-        max_kv_len=32768,
+        max_kv_len=max_kv_len,
+        return_spec=True,
     )
+    cfg = spec.config
     assert cfg.use_keeps_mma_ab
     assert cfg.groups_tokens_heads_q
     assert cfg.tile_size_q == 64
     assert not cfg.use_cluster_smem_reduction
+    if kv_dtype_key == "float4_e2m1fn" and max_kv_len == 262144:
+        # Long plans keep the multi-wave split fanout, not one-wave Keeps.
+        assert cfg.use_split_kv
+        assert spec.requested_splits == {8: 9, 16: 9, 32: 8}[batch_size]
     if cfg.use_split_kv:
         # D512 Keeps publishes partials for the standalone reducer, whose
         # tail is shorter than the in-kernel GMEM reduction.
