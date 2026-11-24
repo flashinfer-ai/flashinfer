@@ -227,12 +227,13 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
         // r_free: 3 barriers, init_count=2
         // init_ready: 1 barriers, init_count=4
         // m_ready: 2 barriers, init_count=2
-        // inp_ready: 1 barriers, init_count=4
+        // inp_ready: 1 barriers, init_count=128
         // snap_done: 2 barriers, init_count=4
         // tmem_dealloc_ready: 1 barriers, init_count=2
         // Warp-cooperative initialization in physical record order.
         uint32_t _mbarrier_init_count_0_0 = 2;
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(12), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(10), "r"((uint32_t)(128)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(9), "r"((uint32_t)(2)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(7), "r"((uint32_t)(4)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(6), "r"((uint32_t)(2)));
@@ -424,11 +425,9 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
                 }
                 tmem_st_x32_f32(m_base + dst_sel + 96, m_frag3);
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
-                __syncwarp();
-                if (elect_sync()) {
-                    asm volatile("tcgen05.fence::before_thread_sync;");
-                    mbarrier_arrive(inp_ready_addr);
-                }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;");
+                mbarrier_arrive(inp_ready_addr);
                 compute_stage += 1;
                 if (compute_stage == 3) { compute_stage = 0; _phase_r_full ^= 1; }
             }
