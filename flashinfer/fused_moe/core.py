@@ -8701,6 +8701,8 @@ def trtllm_fp4_block_scale_routed_moe(
         if activation_type >= ActivationType.InvalidType:  # TRT-LLM's launcher's range
             raise ValueError(f"Invalid activation type: {activation_type}")
         ids, weights = topk_ids_tensor, topk_weights
+        if ids.shape[1:] != (top_k,):  # as SM100's launcher
+            raise ValueError("topk_ids must be [num_tokens, top_k].")
         if weights is None:  # (expert id << 16) | BF16 weight
             weights, ids = ids.view(torch.bfloat16)[..., ::2].contiguous(), ids >> 16
         if _nfse:  # every token to the shared experts, weight 1

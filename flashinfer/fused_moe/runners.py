@@ -9413,6 +9413,12 @@ class RecordsNvfp4Bf16Runner(MoERunner):
                     f"{view[name]}, the layer's inputs {size}."
                 )
         gated = self.config.activation.is_gated
+        if view.get("gated", gated) != gated:  # gated records reorder FC1's rows
+            raise ValueError(
+                f"{self.backend_key}: the view's records are for a "
+                f"{'' if view['gated'] else 'non-'}gated activation, the layer's "
+                f"{type(self.config.activation).__name__} is {'' if gated else 'not '}gated."
+            )
         # A gated MXFP4 expert may scale its halves apart: [rows, 2], up then gate.
         halves = gated and self.config.quant.weight is QuantFormat.MXFP4
         bytes1 = _w4a16_records_geometry(inter * (1 + gated), hidden_size, gated)[3]
@@ -9749,12 +9755,14 @@ class RecordsNvfp4Runner(RecordsNvfp4Bf16Runner):
             from ..quantization.fp4_quantization import mxfp4_quantize
             from ..tllm_enums import SfLayout
 
-            xq, xsf = mxfp4_quantize(x, sfLayout=SfLayout.layout_linear)
             ext = _RecordsExt(
                 int(act.type), tuple(params), self._typed_scalars(), x_fmt=3, fq=2
             )
-            mx = [xq, ids, w, r1, s_gate, r2, s2, out, xsf.view(x.shape[0], -1)]
-            return _records_moe(mx, inter, act.is_gated, tune_max, tactic, ext=ext)
+            # mxfp4_quantize's CUDA backend copies x to the current device
+            with torch.cuda.device(x.device):
+                xq, xsf = mxfp4_quantize(x, sfLayout=SfLayout.layout_linear)
+                mx = [xq, ids, w, r1, s_gate, r2, s2, out, xsf.view(x.shape[0], -1)]
+                return _records_moe(mx, inter, act.is_gated, tune_max, tactic, ext=ext)
         slot_experts: List[torch.Tensor] = []
         if ids.is_floating_point():  # logits, routed as TRT-LLM's kernel does
             ids, w, *slot_experts = _trtllm_routing_sm80(

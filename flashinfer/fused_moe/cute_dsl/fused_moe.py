@@ -2193,6 +2193,9 @@ def cute_dsl_fused_moe(
             raise ValueError("token_selected_experts must be [num_tokens, top_k].")
         if local_expert_offset:  # local ids; the other ranks' are skipped
             ids = ids - local_expert_offset
+        local = num_experts if num_local_experts is None else num_local_experts
+        if {w1_weight_sf.shape[0], w2_weight_sf.shape[0]} != {local}:  # as on SM100
+            raise ValueError("num_local_experts must match the expert weights")
         inputs = [x, ids, token_final_scales, w1_weight_sf, w1_alpha]
         inputs += [w2_weight_sf, w2_alpha, moe_output]
         if w4a4:  # per token GEMM2 quantizes its rows under fc2_input_scale

@@ -119,7 +119,7 @@ def test_mxfp8_quantize_keeps_supported_cuda_dispatch(monkeypatch, capability, b
     monkeypatch.setattr(fp8_quantization, "get_mxfp8_quantization_sm100_module", loader)
 
     assert mxfp8_quantize(input, backend=backend, enable_pdl=False) == output
-    loader.assert_called_once_with({8: "80", 9: "90"}.get(capability[0], "100"))
+    loader.assert_called_once_with(*{8: ("80",), 9: ("90",)}.get(capability[0], ()))
     quantize.assert_called_once_with(
         input, fp8_quantization.SfLayout.layout_128x4, 32, False
     )
@@ -137,7 +137,7 @@ def test_mxfp8_quantize_keeps_cpu_host_dispatch(monkeypatch, backend):
     monkeypatch.setattr(
         fp8_quantization,
         "get_mxfp8_quantization_sm100_module",
-        lambda _: SimpleNamespace(mxfp8_quantize_sm100=quantize),
+        lambda: SimpleNamespace(mxfp8_quantize_sm100=quantize),
     )
 
     assert mxfp8_quantize(input, backend=backend, enable_pdl=False) == output

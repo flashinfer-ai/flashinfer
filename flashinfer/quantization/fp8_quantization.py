@@ -503,7 +503,7 @@ def mxfp8_quantize(
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
         # SM80 to SM90 convert to E2M1 and E4M3 in software in their own modules;
-        # SM100 and the host keep the module the other MXFP8 entry points load.
+        # SM100 and the host load the module as the other MXFP8 entry points do.
         major = get_compute_capability(input.device)[0] if input.is_cuda else 10
         module = (
             get_mxfp8_quantization_sm100_module()

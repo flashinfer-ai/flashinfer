@@ -2549,6 +2549,9 @@ def prepare_records_mxfp4_weights(
         if not gated:
             raise
         u1, a1 = _mxfp4_records_u5(w1, s1, 2)
+        # An all-zero half's records are zeros under any alpha: it takes the other's
+        nz = (w1.view(torch.uint8) & 0x77).view(experts, 2, -1).amax(-1).bool()
+        a1 = torch.where(nz, a1, a1.flip(-1))
         ratio = a1[:, 0] / a1[:, 1]  # the kernels scale the up half by it in FP32
         if not ((ratio > 0) & ratio.isfinite()).all():
             raise ValueError(

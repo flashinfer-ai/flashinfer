@@ -2967,6 +2967,7 @@ class RecordsNvfp4Bf16Config:
         )
         rows, device = num_local_experts, view["w1"].device
         sizes = {"hidden_size": hidden_size, "intermediate_size": intermediate_size}
+        sizes["gated"] = activation.is_gated
         return {**view, **_activation_param_view(activation, rows, device), **sizes}
 
     def __repr__(self) -> str:
@@ -3045,6 +3046,7 @@ class RecordsMxfp4Config:
         )
         rows, device = num_local_experts, view["w1"].device
         sizes = {"hidden_size": hidden_size, "intermediate_size": intermediate_size}
+        sizes["gated"] = activation.is_gated
         return {**view, **_activation_param_view(activation, rows, device), **sizes}
 
     def __repr__(self) -> str:
