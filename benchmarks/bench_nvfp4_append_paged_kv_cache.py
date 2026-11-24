@@ -22,11 +22,11 @@ alternate them a few times; each run prints one line per ``nnz``.
 ``--l2`` picks one L2 policy, applied the same way by both timers:
 
 * ``cold`` (default): no measured iteration finds its data in L2.  CUPTI
-  flushes L2 before each iteration; ``--no-cupti`` times CUDA-graph replays
-  that rotate over clones of every input and cache tensor.  When the cache is
-  too large to clone (``bench_gpu_time`` then skips rotation and the few
-  touched slots would stay in L2), ``--no-cupti`` uses CUDA events with an L2
-  flush before each launch instead.  This is the conservative bound.
+  flushes L2 before each iteration; ``--no-cupti`` times each launch with CUDA
+  events and also flushes L2 before it.  CUDA-graph rotation is not used for
+  cold timing: it sizes the clones by allocated bytes, but an append touches
+  only ``nnz`` slots, so those lines could stay in L2 across all clones.  This
+  is the conservative bound.
 * ``warm``: the same buffers every iteration, so they stay in L2.  In a decode
   step the K/V input was just written by the preceding kernels and is
   resident; only the cache lines being written are cold.
@@ -45,7 +45,7 @@ import numpy as np
 import torch
 
 from flashinfer.page import nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
-from flashinfer.testing.utils import bench_gpu_time, calculate_rotation_count
+from flashinfer.testing.utils import bench_gpu_time
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
 _CUPTI_MIN_MAJOR = 13  # the version bench_gpu_time requires before it uses CUPTI
@@ -109,13 +109,13 @@ def _inputs(args: argparse.Namespace, nnz: int) -> tuple[torch.Tensor, ...]:
     return k, v, slots, k_cache, v_cache, k_scales, v_scales, global_scale
 
 
-def _timer(args: argparse.Namespace, inputs: tuple[torch.Tensor, ...]) -> str:
+def _timer(args: argparse.Namespace) -> str:
     if not args.no_cupti:
         return "cupti"
-    if args.l2 == "cold" and calculate_rotation_count(list(inputs)) == 1:
-        # The tensors exceed 5x L2, so the CUDA-graph timer would not rotate
-        # them, and an append touching only nnz slots would find those lines in
-        # L2 on every replay.  Flush L2 before each launch instead.
+    if args.l2 == "cold":
+        # CUDA-graph rotation sizes its clones by allocated bytes, but an append
+        # touches only nnz slots, so those lines can stay in L2 across all
+        # clones.  Flush L2 before each launch instead.
         return "cuda-event"
     return "cuda-graph"
 
@@ -124,9 +124,7 @@ def _median_us(args: argparse.Namespace, nnz: int) -> tuple[str, float]:
     inputs = _inputs(args, nnz)
     _run(*inputs)  # JIT-compile and load the kernel outside the timed region
     torch.cuda.synchronize()
-    timer = _timer(args, inputs)
-    # The tensors go in as input_args so the CUDA-graph timer can rotate clones
-    # of them for a cold L2; CUPTI and the CUDA-event timer flush L2 instead.
+    timer = _timer(args)
     measurements = bench_gpu_time(
         _run,
         dry_run_time_ms=args.warmup_ms,
