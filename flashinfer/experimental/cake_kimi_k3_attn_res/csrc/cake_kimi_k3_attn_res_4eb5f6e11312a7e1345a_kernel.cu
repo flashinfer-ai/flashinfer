@@ -527,7 +527,7 @@ kernel_cake_kimi_k3_attn_res_4eb5f6e11312a7e1345a(__nv_bfloat16* __restrict__ ou
                                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values[_lp*2 + 2], values[_lp*2+1 + 2]));
                                             _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
                                         }
-                                        reinterpret_cast<int2*>(blocks + ((unsigned long long)token_1 * blocks_m_stride + 4 * blocks_k_stride + (unsigned long long)hidden_base_2))[0] = reinterpret_cast<int2*>(_packed_1)[0];
+                                        reinterpret_cast<int2*>(blocks + ((unsigned long long)token_1 * blocks_m_stride + 4ull * blocks_k_stride + (unsigned long long)hidden_base_2))[0] = reinterpret_cast<int2*>(_packed_1)[0];
                                     }
                                     #pragma unroll
                                     for (int pair_idx_3 = 0; pair_idx_3 < 2; pair_idx_3++) {
@@ -630,7 +630,7 @@ kernel_cake_kimi_k3_attn_res_4eb5f6e11312a7e1345a(__nv_bfloat16* __restrict__ ou
                                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(values_1[_lp*2 + 6], values_1[_lp*2+1 + 6]));
                                             _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
                                         }
-                                        reinterpret_cast<int4*>(blocks + ((unsigned long long)token_1 * blocks_m_stride + 4 * blocks_k_stride + (unsigned long long)hidden_base_3))[0] = reinterpret_cast<int4*>(_packed_3)[0];
+                                        reinterpret_cast<int4*>(blocks + ((unsigned long long)token_1 * blocks_m_stride + 4ull * blocks_k_stride + (unsigned long long)hidden_base_3))[0] = reinterpret_cast<int4*>(_packed_3)[0];
                                     }
                                     #pragma unroll
                                     for (int pair_idx_5 = 0; pair_idx_5 < 4; pair_idx_5++) {
