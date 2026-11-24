@@ -522,7 +522,12 @@ class MlaWorkQueue(WorkQueue):
                 self._linear_idx_from_tile(work_tile.tile_idx)
                 + cute.size(cute.arch.grid_dim())
             )
-        return MlaTsWorkTileInfo(work_tile.tile_idx, Boolean(False))
+        # The work-tile loop carries this tile, so keep the optional fields.
+        return MlaTsWorkTileInfo(
+            work_tile.tile_idx,
+            Boolean(False),
+            k_visible_end=work_tile.k_visible_end,
+        )
 
     @cute.jit
     def wrap_work_tile(self, work_tile):
