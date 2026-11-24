@@ -21,7 +21,7 @@ prefill request's shapes at reduced lengths: one-token sequences with a state
 ahead of a long fresh sequence, one long sequence with a state, two long
 sequences.  The call issues no synchronization when the host offsets are given,
 so it captures into a CUDA graph; graphs of different offsets replay
-independently.
+independently.  State pools and BF16 / FP16 state: ``test_cake_gdp_prefill_state.py``.
 """
 
 from __future__ import annotations
@@ -499,17 +499,6 @@ def test_empty_sequences():
     empty = _inputs([0, 0], 4, [1, 1], seed=10)
     out, state = _call(empty, "cake")
     assert out.shape[0] == 0 and torch.equal(state, empty["initial_state"])
-
-
-def test_a_state_pool_is_refused():
-    inputs = _inputs([64], 4, [1], seed=2)
-    with pytest.raises(ValueError, match="state_indices"):
-        _call(
-            inputs,
-            "cake",
-            state_indices=torch.zeros(1, dtype=torch.int32, device=_device()),
-            output_state=inputs["initial_state"],
-        )
 
 
 @pytest.mark.parametrize("n", [1, 2, 4])

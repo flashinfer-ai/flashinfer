@@ -221,16 +221,25 @@ def test_an_empty_sequence_takes_the_split_build(arch):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", sorted(SMS))
 def test_every_plan_names_a_shipped_program(arch):
-    """The registry's Blackwell route ships one program with and one without the split, both for n = 3; the
-    route refuses every other n."""
-    builds = loader.v6_route_builds(arch)
-    assert sorted(builds) == [False, True], f"{arch} ships {builds}"
+    """The registry's Blackwell route ships, per state form (the dense FP32 programs and the FP32, BF16 and FP16
+    pool programs), one program with and one without the split, all for n = 3; the route refuses every other n."""
+    forms = loader.v6_state_forms(arch)
+    assert forms == {("f32", False), ("f32", True), ("bf16", True), ("f16", True)}
     names = set(loader.ROUTES[arch][loader.PREFILL_ROUTE])
-    assert set(builds.values()) == names
+    shipped = set()
+    for state_dtype, pool in forms:
+        builds = loader.v6_route_builds(arch, state_dtype, pool)
+        assert sorted(builds) == [False, True], f"{arch} ships {builds}"
+        for split, name in builds.items():
+            assert loader.v6_state_form(name) == (state_dtype, pool)
+            assert loader.MODULES[name]["select_rule"]["split_items"] == split
+        shipped |= set(builds.values())
+    assert shipped == names
     for name in names:
         assert loader.MODULES[name]["body"] == loader.V6_BODY
         assert loader.MODULES[name]["arches"] == [arch]
     assert loader.v6_householders(arch) == {N_HH}
+    assert loader.v6_route_builds(arch) == loader.v6_route_builds(arch, "f32", False)
     capability = {"sm_100a": (10, 0), "sm_103a": (10, 3)}[arch]
     for n in (1, 2, 3, 4):
         assert loader.prefill_route_applies(
@@ -240,6 +249,54 @@ def test_every_plan_names_a_shipped_program(arch):
         plan = _plan(lengths, H, arch)
         name = loader.selected_v6_module(arch, plan)
         assert loader.MODULES[name]["select_rule"]["split_items"] == plan.split
+        for state_dtype, pool in forms:
+            name = loader.selected_v6_module(
+                arch, plan, state_dtype=state_dtype, pool=pool
+            )
+            assert loader.v6_state_form(name) == (state_dtype, pool)
+            assert loader.MODULES[name]["select_rule"]["split_items"] == plan.split
+    with pytest.raises(ValueError, match="state_dtype='bf16' and pool=False"):
+        loader.selected_v6_module(
+            arch, _plan([64], 4, arch), state_dtype="bf16", pool=False
+        )
+
+
+_POOL_KEYS = ("use_state_indices", "use_output_state_indices")
+_POOL_LOGICAL = (
+    "state_indices",
+    "output_state_indices",
+    "initial_state_stride_slot",
+    "output_state_stride_slot",
+)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", sorted(SMS))
+def test_the_pool_programs_are_twins_of_the_dense_programs(arch):
+    """Every pool program is the dense FP32 program of its split with both slot tables, and every BF16 / FP16
+    program the FP32 pool program of its split with its ``state_dtype``: the same build otherwise, the same launch.
+    The pool programs bind the slot tables and the slot strides; the 16-bit ones the seed and the round count."""
+    dense = loader.v6_route_builds(arch, "f32", False)
+    f32_pool = loader.v6_route_builds(arch, "f32", True)
+    for split in (False, True):
+        base = loader.MODULES[dense[split]]
+        pool = loader.MODULES[f32_pool[split]]
+        assert pool["build"] == {**base["build"], **{key: True for key in _POOL_KEYS}}
+        assert (
+            pool["launch"] == base["launch"] and pool["grid_rule"] == base["grid_rule"]
+        )
+        assert all(pool["logical"][name] == name for name in _POOL_LOGICAL)
+        assert not any(name in base["logical"] for name in _POOL_LOGICAL)
+        for state_dtype in ("bf16", "f16"):
+            low = loader.MODULES[loader.v6_route_builds(arch, state_dtype, True)[split]]
+            assert low["build"] == {**pool["build"], "state_dtype": state_dtype}
+            assert low["launch"] == pool["launch"]
+            assert low["logical"] == {
+                **pool["logical"],
+                "rand_seed": "rand_seed",
+                "philox_rounds": "philox_rounds",
+            }
+            assert low["arg_plan"][: len(pool["arg_plan"]) - 3] == pool["arg_plan"][:-3]
 
 
 @pytest.mark.cpu_only
