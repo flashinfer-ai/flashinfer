@@ -70,7 +70,7 @@ def _const_rows(device, dtype: torch.dtype, v, M: int) -> torch.Tensor:
     """The per-row tensor of a Python-scalar filter value, cached per (device, dtype, value, rows): the kernel only reads
     it, so one fill serves every call with that scalar (:mod:`flashinfer.batch_invariant.const_tensor`: the fill's event
     orders a reader on another stream, a CUDA-graph capture bypasses the cache, the cache is bounded)."""
-    return const_fill((M,), v, dtype, device)
+    return const_fill((M,), v, dtype, device, kind="sampler_rows")
 
 
 @functools.lru_cache(maxsize=None)

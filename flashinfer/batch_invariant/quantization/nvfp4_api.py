@@ -18,7 +18,7 @@ linear-layout bytes, as its backends do (a placement). Every unsupported input r
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple, Union
 
 import torch
 
@@ -48,7 +48,7 @@ _SHUFFLE_TILE_M = (
 _SHUFFLE_ROWS = 32  # the row blocks FlashInfer's shuffle permutes for that tile (``get_shuffle_block_size``)
 
 
-_get_compiled_kernel = None
+_get_compiled_kernel: Optional[Callable[..., Any]] = None
 
 
 def _compiled_kernel(*key):
@@ -80,7 +80,9 @@ def _scale_tensor(scale, ref: torch.Tensor) -> torch.Tensor:
             .reshape(-1)[:1]
             .contiguous()
         )
-    return const_fill((1,), float(scale), torch.float32, ref.device)
+    return const_fill(
+        (1,), float(scale), torch.float32, ref.device, kind="nvfp4_global_scale"
+    )
 
 
 def nvfp4_quantize_rows(
