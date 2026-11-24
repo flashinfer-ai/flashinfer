@@ -6,7 +6,7 @@ opt-in (it emits the standard `ExperimentalWarning` once); no environment variab
 API's `backend="auto"`, and nothing is registered for ahead-of-time compilation (JIT only, never in `flashinfer-jit-cache` /
 `flashinfer-cubin`).
 
-A SIBLING of the [Qwen 3.5 gated attention block](qwen_3_5_block.md): the same vendored cuDNN Frontend tree
+A SIBLING of the [Qwen 3.5 gated attention block](../qwen_3_5_block/README.md): the same vendored cuDNN Frontend tree
 (`../qwen_3_5_block/_cudnn_frost/`, ONE drop, ONE manifest, ONE re-vendor command), the same cache roots, the same capture rules; the
 geometry, the weights and the plan carry the sparse-attention indexer appended. The 3.5 package's dense block does not change.
 

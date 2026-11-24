@@ -79,6 +79,7 @@ High-Performance GPU Kernels for Inference
 Latest: [![GitHub Release](https://img.shields.io/github/v/release/flashinfer-ai/flashinfer)](https://github.com/flashinfer-ai/flashinfer/releases/latest)
 
 Notable updates:
+- [2026-11-24] FlashInfer reached [#10,000](https://github.com/flashinfer-ai/flashinfer/pull/10000) in its GitHub issue and pull request tracker.
 - [2025-10-08] Blackwell support added in [v0.4.0](https://github.com/flashinfer-ai/flashinfer/releases/tag/v0.4.0)
 - [2025-03-10] [Blog Post](https://flashinfer.ai/2025/03/10/sampling.html) Sorting-Free GPU Kernels for LLM Sampling, which explains the design of sampling kernels in FlashInfer.
 
