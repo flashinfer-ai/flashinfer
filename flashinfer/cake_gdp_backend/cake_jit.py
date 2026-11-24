@@ -11723,6 +11723,88 @@ def prefill_launch_plan(classes) -> list[tuple[str, list[int]]]:
 
 # ---- END BODY ROUTE OF RECORD ----
 
+# ---- BATCH BODY ROUTE (GDP prefill sm_90a: one body, one launch per call) ----
+# The backend runs a whole sm_90a call on ONE body in ONE launch; the per-sequence classes of the route of record only
+# decide whether the merged split body is a candidate (some sequence is merged-class).  The body is then the one of the
+# lesser modeled kernel time of the whole batch.  Both bodies run persistent CTAs that take their work strided (CTA
+# ``b`` of a grid of ``G`` runs work ``b, b + G, ...``) and a CTA's time is the sum of its chunk-steps, so the model
+# is the most loaded CTA: the V6 body over the ``N x H`` sequence-major tiles of each sequence's chunks, the merged
+# body over the ``split_table`` items (each item's chunks, plus ``ROUTE_WARMUP_CHUNKS`` for a cut past 0) on
+# ``min(sm_count, tiles)`` CTAs.  The step and base times are a fit of the H100 (132 SMs) kernel times
+# (2026-11-24: 88 workloads x two gate sets, each body forced on the whole batch; error within 3 %).
+ROUTE_BATCH_V6_STEP_NS = 2040  # one V6 chunk-step
+ROUTE_BATCH_V6_BASE_NS = 15000  # the V6 launch, seed and final store
+ROUTE_BATCH_P3_STEP_NS = 7570  # one merged-body chunk-step
+ROUTE_BATCH_P3_BASE_NS = 27000  # the merged launch, seed and final store
+
+
+def _most_loaded(loads: list[int], grid: int) -> int:
+    """The largest sum of ``loads[b::grid]`` over the ``grid`` CTAs (0 for no work)."""
+    if not loads:
+        return 0
+    return max(sum(loads[b::grid]) for b in range(grid))
+
+
+def prefill_batch_costs(
+    cu_seqlens,
+    n: int,
+    H: int,
+    sm_count: int,
+    total_tokens: int | None = None,
+) -> tuple[int, int]:
+    """The modeled kernel time of the whole batch under each body, ``(t_v6, t_p3)`` in nanoseconds: the base plus the
+    chunk-steps of the most loaded CTA at the body's step time (see the BATCH BODY ROUTE comment).  The merged body
+    runs the items of ``split_table`` (a sequence the rule leaves whole is one item per head)."""
+    chunks = route_chunk_steps(cu_seqlens, n, total_tokens)
+    tiles = [c for c in chunks for _ in range(H)]
+    if not tiles:
+        return 0, 0
+    t_v6 = ROUTE_BATCH_V6_BASE_NS + ROUTE_BATCH_V6_STEP_NS * _most_loaded(
+        tiles, min(sm_count, len(tiles))
+    )
+    items = [
+        min(span, chunks[seq] - cut) + (ROUTE_WARMUP_CHUNKS if cut > 0 else 0)
+        for seq, _head, cut, span in split_table(
+            cu_seqlens, n, H, sm_count, total_tokens=total_tokens
+        )
+    ]
+    t_p3 = ROUTE_BATCH_P3_BASE_NS + ROUTE_BATCH_P3_STEP_NS * _most_loaded(
+        items, min(sm_count, len(items))
+    )
+    return t_v6, t_p3
+
+
+def prefill_batch_body(
+    cu_seqlens,
+    n: int,
+    H: int,
+    sm_count: int,
+    *,
+    store_final_state: bool = True,
+    unit_gates: bool = False,
+    unit_beta: bool = False,
+    total_tokens: int | None = None,
+) -> str:
+    """The one body of a whole sm_90a call: ``ROUTE_BODY_P3`` for a unit-gate / unit-beta call (its exact unit
+    program), ``ROUTE_BODY_V6`` for a call without a final state and for a batch with no merged-class sequence (the
+    route of record), else the body of the lesser ``prefill_batch_costs`` (ties to V6).  A merged choice runs the
+    split program over ``split_table`` of the whole batch: every sequence, a short or empty one included, is in the
+    same launch (a sequence the rule leaves whole is one item per head, bitwise the merged single pass)."""
+    if unit_gates or unit_beta:
+        return ROUTE_BODY_P3
+    if not store_final_state:
+        return ROUTE_BODY_V6
+    classes = prefill_body_classes(
+        cu_seqlens, n, H, sm_count, store_final_state=True, total_tokens=total_tokens
+    )
+    if ROUTE_BODY_P3 not in classes:
+        return ROUTE_BODY_V6
+    t_v6, t_p3 = prefill_batch_costs(cu_seqlens, n, H, sm_count, total_tokens)
+    return ROUTE_BODY_P3 if t_p3 < t_v6 else ROUTE_BODY_V6
+
+
+# ---- END BATCH BODY ROUTE ----
+
 
 # ---- BLACKWELL V6 LAUNCH PLAN (sm_100a / sm_103a prefill) ----
 # The Blackwell prefill body (``prefill_bw_v6``) runs persistent CTAs over a host item table of rows ``(sequence,
@@ -12243,6 +12325,8 @@ __all__ = [
     "library_name",
     "load",
     "max_num_tokens",
+    "prefill_batch_body",
+    "prefill_batch_costs",
     "prefill_body_class",
     "prefill_body_classes",
     "prefill_body_costs",

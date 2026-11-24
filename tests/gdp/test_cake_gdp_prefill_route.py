@@ -284,6 +284,129 @@ def test_mixed_batch_of_record() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The batch body route: one body, one launch per sm_90a call
+# ---------------------------------------------------------------------------
+
+# The prefill bench workloads (H100, 132 SMs, n = 3, 2026-11-24): family A is d one-token sequences then one
+# long sequence (``min(L, 65536 - d)`` tokens), B one 65536-token sequence, C the pair (36864, 28672).  Measured with
+# each body forced on the whole batch, the merged split body is the faster kernel on every H10 / H20 row but C_H20
+# (4000 us merged vs 3562 us V6); V6 is the faster on every H40 / H80 row.
+BENCH_TOTAL = 65536
+BENCH_LENGTHS = (8192, 16384, 32768, 65536)
+BENCH_SHORT = (0, 1, 4, 8, 15)
+
+
+def _bench_rows() -> list[tuple[str, int, tuple[int, ...]]]:
+    rows = []
+    for H in (10, 20, 40, 80):
+        for L in BENCH_LENGTHS:
+            for d in BENCH_SHORT:
+                rows.append(
+                    (f"A_H{H}_L{L}_d{d}", H, (1,) * d + (min(L, BENCH_TOTAL - d),))
+                )
+        rows.append((f"B_H{H}", H, (BENCH_TOTAL,)))
+        rows.append((f"C_H{H}", H, (36864, 28672)))
+    return rows
+
+
+BENCH_ROWS = _bench_rows()
+
+
+def _bench_body(name: str, H: int) -> str:
+    return V6 if H >= 40 or name == "C_H20" else P3
+
+
+@pytest.mark.parametrize("name,H,lens", BENCH_ROWS, ids=[row[0] for row in BENCH_ROWS])
+def test_batch_body_of_the_bench_rows(name: str, H: int, lens: tuple[int, ...]) -> None:
+    """The one body of each bench row is its measured faster whole-batch kernel; a mixed row (d > 0) takes the body
+    of its d = 0 row, so the one-token sequences run in the long sequence's launch."""
+    body = loader.prefill_batch_body(_offsets(lens), N_HH, H, SM_COUNT)
+    assert body == _bench_body(name, H), (
+        name,
+        body,
+        loader.prefill_batch_costs(_offsets(lens), N_HH, H, SM_COUNT),
+    )
+
+
+def test_pinned_batch_costs() -> None:
+    """The modeled whole-batch kernel times in ns of one 65536-token sequence at H = 10 (the split rule's 13 items
+    of 240 chunks per head, a warm-up of 8 for the cut ones, against one V6 tile of 3072 chunks per head; measured
+    1905 us and 6222 us) and of the C pair at H = 20 (V6 runs the 1728-chunk tile; the merged body four items on a
+    CTA)."""
+    assert loader.prefill_batch_costs((0, 65536), N_HH, 10, SM_COUNT) == (
+        loader.ROUTE_BATCH_V6_BASE_NS + 3072 * loader.ROUTE_BATCH_V6_STEP_NS,
+        loader.ROUTE_BATCH_P3_BASE_NS + 248 * loader.ROUTE_BATCH_P3_STEP_NS,
+    )
+    t_v6, t_p3 = loader.prefill_batch_costs((0, 36864, 65536), N_HH, 20, SM_COUNT)
+    assert t_v6 == loader.ROUTE_BATCH_V6_BASE_NS + 1728 * loader.ROUTE_BATCH_V6_STEP_NS
+    assert t_v6 < t_p3
+    assert loader.prefill_batch_costs((0,), N_HH, 10, SM_COUNT) == (0, 0)
+
+
+@pytest.mark.parametrize("H", PERF_HEADS)
+@pytest.mark.parametrize("N,L", PERF_NL)
+def test_batch_body_of_the_performance_rows(H: int, N: int, L: int) -> None:
+    """A uniform performance row keeps the body of its sequences' class."""
+    body = P3 if (H, N, L) in MERGED_ROWS else V6
+    assert loader.prefill_batch_body(_offsets((L,) * N), N_HH, H, SM_COUNT) == body
+
+
+def test_batch_body_flags_and_candidacy() -> None:
+    """A unit call is merged at every length, a call keeping no state V6 at every length, and a batch with no
+    merged-class sequence is V6 whatever its size; the merged choice needs a merged-class sequence, which the split
+    rule cuts."""
+    for lens, H in ((MIXED_LENS, 10), ((1,) * 15 + (65521,), 20), ((300,) * 64, 10)):
+        cu = _offsets(lens)
+        assert loader.prefill_batch_body(cu, N_HH, H, SM_COUNT, unit_gates=True) == P3
+        assert loader.prefill_batch_body(cu, N_HH, H, SM_COUNT, unit_beta=True) == P3
+        assert (
+            loader.prefill_batch_body(cu, N_HH, H, SM_COUNT, store_final_state=False)
+            == V6
+        )
+    assert loader.prefill_batch_body(_offsets((300,) * 64), N_HH, 10, SM_COUNT) == V6
+    assert loader.prefill_batch_body(_offsets((0, 1, 0)), N_HH, 10, SM_COUNT) == V6
+    assert loader.prefill_batch_body(_offsets(MIXED_LENS), N_HH, 10, SM_COUNT) == P3
+    for chunks, H, n, sm_count in itertools.product(
+        (384, 768, 1536, 3072), HEADS, loader.NUM_HOUSEHOLDER, SM_COUNTS
+    ):
+        L = chunks * 64 // n
+        for lens in ((L,), (1, 1, L), (L, L)):
+            cu = _offsets(lens)
+            if loader.prefill_batch_body(cu, n, H, sm_count) == P3:
+                assert P3 in loader.prefill_body_classes(cu, n, H, sm_count)
+                assert (
+                    loader.prefill_split_table(
+                        cu, num_heads=H, num_householder=n, sm_count=sm_count
+                    )
+                    is not None
+                )
+
+
+def test_one_token_sequences_cost_their_own_items() -> None:
+    """In the merged body a one-token sequence is one item of two chunks per head (no cut, no warm-up): adding d of
+    them to a merged long sequence moves its modeled time by at most the ``ceil(d H / SM count)`` such items a CTA
+    takes."""
+    for H in (10, 20):
+        base = loader.prefill_batch_costs((0, 65536), N_HH, H, SM_COUNT)[1]
+        for d in BENCH_SHORT:
+            lens = (1,) * d + (65536 - d,)
+            assert {
+                (span, cut)
+                for seq, head, cut, span in loader.split_table(
+                    _offsets(lens), N_HH, H, SM_COUNT
+                )
+                if seq < d
+            } <= {(2, 0)}
+            t_p3 = loader.prefill_batch_costs(_offsets(lens), N_HH, H, SM_COUNT)[1]
+            per_cta = -(-(d * H) // SM_COUNT)
+            assert t_p3 - base <= per_cta * 2 * loader.ROUTE_BATCH_P3_STEP_NS, (
+                H,
+                d,
+                t_p3 - base,
+            )
+
+
+# ---------------------------------------------------------------------------
 # The registry
 # ---------------------------------------------------------------------------
 

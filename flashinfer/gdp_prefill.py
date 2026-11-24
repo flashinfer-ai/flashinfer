@@ -140,15 +140,16 @@ def chunk_gated_delta_product(
         stochastically with ``rand_seed``; pools and dense bfloat16 / float16
         state tensors may pad the slot stride (see ``state_indices``), a dense
         float32 ``output_state`` must be contiguous (a padded dense float32
-        ``initial_state`` is copied once).  On SM100 / SM103 one
-        Cake kernel launch per call; the split programs add a workspace clear
-        and the item-table upload (from pinned host memory, so the call
-        captures into a CUDA graph when ``cu_seqlens_cpu`` is given); on SM90
-        a batch mixing the two kernel bodies is one launch per body.  On
-        SM100 / SM103 one launch serves
-        a mixed batch: the long sequences are planned as if alone and the
-        short ones run on the least-loaded CTAs after them; the results
-        agree with any other batch composition within rounding.  With
+        ``initial_state`` is copied once).  One Cake kernel launch per call;
+        the split programs add a workspace clear and the item-table upload
+        (from pinned host memory into a cached device buffer, so the call
+        captures into a CUDA graph when ``cu_seqlens_cpu`` is given).  On
+        SM100 / SM103 one launch serves a mixed batch: the long sequences are
+        planned as if alone and the short ones run on the least-loaded CTAs
+        after them.  On SM90 one launch serves a mixed batch too: one kernel
+        body is chosen for the whole batch by a modeled kernel time, and the
+        short sequences run in the same launch.  The results agree with any
+        other batch composition within rounding.  With
         ``cu_seqlens_cpu`` given, no device-to-host synchronization is issued
         (the split rule reads the host copy); without it the sequence offsets
         are copied to the host once.  On SM90 ``g=None`` runs the kernel's
@@ -172,16 +173,18 @@ def chunk_gated_delta_product(
         Graph capture does not allow, so a graph-captured caller passes it.  It
         is checked for device, rank, length and dtype, never compared with
         ``cu_seqlens`` value by value.  The cuDNN backends accept and ignore it.
-        On SM100 / SM103 the Cake backend plans the launch from these host
-        lengths, so a CUDA graph it captures is valid only for the batch it
-        captured (the sequence offsets, ``N`` and ``T``): a batch with other
-        lengths needs a new capture or an eager call.  The kernel compares the
+        The Cake backend plans the launch from these host lengths, so a CUDA
+        graph it captures is valid only for the batch it captured (the
+        sequence offsets, ``N`` and ``T``): a batch with other lengths needs a
+        new capture or an eager call.  On SM100 / SM103 the kernel compares the
         planned offsets with ``cu_seqlens`` on the device; a replay over changed
         offsets computes nothing and writes NaN to ``output[0, 0, :2]`` (and to
         ``output_state[0, 0, 0, 0]`` when a dense float32 final state is
         stored; a pool or a bfloat16 / float16 state gets no marker, so the
-        state is left as it was), so the failure is visible.  The cuDNN
-        backends read the lengths on the device and accept such a replay.
+        state is left as it was), so the failure is visible.  SM90 has no such
+        check: the result of a replay over changed offsets is unspecified.
+        The cuDNN backends read the lengths on the device and accept such a
+        replay.
 
     state_indices : torch.Tensor, optional
         Contiguous int32 ``[num_seqs]`` slots in ``initial_state`` and

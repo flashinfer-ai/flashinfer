@@ -33,12 +33,13 @@ k L2 normalization, ``g = None`` / ``beta = None`` from a zero state (and the
 refusal of those calls with an initial state or a pool, which no exported SM90
 program serves), FP16 I/O, caller-provided output and state buffers, the scale
 values, the 18 prefill performance rows, empty batches, sequence independence,
-bitwise reproducibility, the body route of record (the V6 fork-order body for
-short sequences and for calls without a state, the merged body's unit and
-gate-saturation split programs for unit calls and long sequences; a mixed-class
-batch run as one launch per body over its own sequences, checked against the
-sequences alone), the launch count and one launch of every exported prefill
-program.  ``test_cake_gdp_prefill_route.py`` covers the route arithmetic and
+bitwise reproducibility, the batch body route (one body and one launch per
+call: the V6 fork-order body for short sequences and for calls without a state,
+the merged body's unit and gate-saturation split programs for unit calls and
+for batches whose long sequences make the split the faster whole-batch kernel,
+the short and empty sequences in the same launch; checked against the
+sequences alone), the launch count, CUDA Graph capture and replay of a mixed
+batch, and one launch of every exported prefill program.  ``test_cake_gdp_prefill_route.py`` covers the route arithmetic and
 the registry without a GPU.
 
 This suite exercises the backend package alone: it names the package once,
@@ -503,6 +504,27 @@ def _classes(c: Case) -> list[str]:
     )
 
 
+def _body(c: Case) -> str:
+    """The one body of the call ``c`` under the batch route on this device (``prefill_batch_body`` with the flags
+    the backend derives from the call, as ``_classes``)."""
+    stores = c.final or c.initial != "none" or c.unit_g or c.unit_beta
+    return loader.prefill_batch_body(
+        (0, *itertools.accumulate(c.lens)),
+        c.n,
+        c.H,
+        loader.sm_count(0),
+        store_final_state=stores,
+        unit_gates=c.unit_g,
+        unit_beta=c.unit_beta,
+        total_tokens=c.T,
+    )
+
+
+# A mixed bench row: four one-token sequences then one 8192-token sequence at H = 10, the merged split
+# body for the whole batch by a wide margin (one item per CTA of 38 merged steps against 384 V6 steps).
+BENCH_MIXED_LENS = (1, 1, 1, 1, 8192)
+
+
 # ---------------------------------------------------------------------------
 # Correctness matrix
 # ---------------------------------------------------------------------------
@@ -856,36 +878,45 @@ def test_sequences_are_independent() -> None:
 
 @pytest.mark.parametrize("initial", ("none", "given", "pool_disjoint", "pool_same"))
 @pytest.mark.parametrize("final", (True, False))
-def test_mixed_class_batch_matches_the_sequences_alone(
-    initial: str, final: bool
-) -> None:
-    """The mixed-class batch of record (two merged-class long sequences around a short and an empty V6-class
-    one), served by one launch per body over per-class gathered tokens, satisfies the FP64 reference, and every
-    sequence gives the same bits as alone (its output rows, its final state slot) while the pool rows of the other
-    sequences stay untouched; each class alone (its sequences as one batch) gives the same bits too.  The plain
-    call keeping no state is uniform V6-class by the route and runs the same comparison."""
+def test_mixed_batch_matches_the_sequences_alone(initial: str, final: bool) -> None:
+    """The mixed batch of record (two merged-class long sequences around a short and an empty V6-class one) is one
+    launch of one body for the whole batch -- the merged split body when a state is read or kept, the V6 body for
+    the plain call keeping none -- and satisfies the FP64 reference.  Every sequence, and the merged-class pair,
+    run alone gives the same bits as in the batch (its output rows, its final state slot) when the batch route
+    chooses the same body for it alone; a sequence whose own body differs (the short one in the merged launch) is
+    held to the reference only.  An empty sequence copies its initial state under either body, so it is always
+    compared bitwise.  The pool rows of the other sequences stay untouched."""
     c = Case(lens=MIXED_LENS, H=MIXED_H, n=3, initial=initial, final=final, seed=30)
     V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
     if final or initial != "none":
         assert _classes(c) == [P3, V6, V6, P3]
     else:
         assert _classes(c) == [V6] * c.N
+    body = _body(c)
     out, state = _run_and_check(c)
     device = _device()
-    # Every sequence alone, then every class alone (the sequences of one body as one batch: what the backend launches
-    # for the mixed batch): the same bits in both partitions.
-    by_body: dict[str, list[int]] = {}
-    for seq, body in enumerate(_classes(c)):
-        by_body.setdefault(body, []).append(seq)
+    sm_count = loader.sm_count(0)
+    stores = c.final or c.initial != "none"
     groups = [[seq] for seq in range(c.N)] + [
-        seqs for seqs in by_body.values() if len(seqs) > 1
+        [seq for seq, cls in enumerate(_classes(c)) if cls == P3]
     ]
     for group in groups:
+        if not group:
+            continue
+        lens = [c.offsets[seq + 1] - c.offsets[seq] for seq in group]
+        alone_body = loader.prefill_batch_body(
+            (0, *itertools.accumulate(lens)),
+            c.n,
+            c.H,
+            sm_count,
+            store_final_state=stores,
+        )
+        if alone_body != body and sum(lens):
+            continue  # another body alone: the FP64 reference above holds it
         rows = torch.cat(
             [torch.arange(c.offsets[seq], c.offsets[seq + 1]) for seq in group]
         ).to(device)
         rows_n = (rows[:, None] * c.n + torch.arange(c.n, device=device)).reshape(-1)
-        lens = [c.offsets[seq + 1] - c.offsets[seq] for seq in group]
         group_t = torch.tensor(group, device=device)
         kwargs = dict(
             num_householder=c.n,
@@ -935,16 +966,17 @@ def test_mixed_class_batch_matches_the_sequences_alone(
 
 
 @pytest.mark.parametrize("initial", ["given", "pool_disjoint"])
-def test_mixed_batch_whose_v6_class_is_only_empty_sequences(initial: str) -> None:
-    """Two merged-class long sequences around two empty ones: the V6 class has no token, so the backend launches it on
-    the one-row placeholders with ``total_tokens`` 0 (``_run_two_classes``); the empty sequences' final states are the
-    bitwise copies of their initial states (zeros from a zero record), the long sequences match the FP64 reference and
-    their output rows are the whole output."""
+def test_merged_batch_with_empty_sequences(initial: str) -> None:
+    """Two merged-class long sequences around two empty ones: one merged split launch over the four sequences (an
+    empty sequence is one item per head with no chunk); the empty sequences' final states are the bitwise copies of
+    their initial states (zeros from a zero record), the long sequences match the FP64 reference and their output
+    rows are the whole output."""
     c = Case(
         lens=(8192, 0, 0, 8192), H=MIXED_H, n=3, initial=initial, final=True, seed=31
     )
     V6, P3 = loader.ROUTE_BODY_V6, loader.ROUTE_BODY_P3
     assert _classes(c) == [P3, V6, V6, P3]
+    assert _body(c) == P3
     out, state = _run_and_check(c)
     assert out.shape[0] == c.offsets[-1]
     for seq in (1, 2):
@@ -976,12 +1008,13 @@ def _count_device_events(call) -> list[str]:
 
 def test_single_launch() -> None:
     """BF16 normalized inputs, FP32 gates, an initial state and a kept final state, the host copy of ``cu_seqlens``
-    given and a uniform V6-class batch: the call launches the kernel alone (no fill, cast, copy or plan kernel).
-    Without the host copy the call adds the one device-to-host copy of ``cu_seqlens``.  A uniform merged-class
-    batch adds the item table upload and the workspace zero before its one kernel.  The mixed-class batch of
-    record launches exactly two Cake kernels (the gather / scatter copies beside them)."""
+    given and a uniform V6 batch: the call launches the kernel alone (no fill, cast, copy or plan kernel).  Without
+    the host copy the call adds the one device-to-host copy of ``cu_seqlens``.  A uniform merged batch adds the
+    workspace zero before its one kernel (its item table is cached on the device after the first call).  A mixed
+    batch -- one-token sequences beside a merged long one, and the mixed batch of record -- is likewise one Cake
+    kernel: no second launch, no gather or scatter of its tokens, no copy."""
     c = _make(Case(lens=(400,) * 8, H=24, n=3, initial="given", cu_cpu=True, seed=26))
-    assert _classes(c) == [loader.ROUTE_BODY_V6] * c.N
+    assert _body(c) == loader.ROUTE_BODY_V6
     _check(c, *_run(c))  # warm-up
     names = _count_device_events(lambda: _run(c))
     assert len(names) == 1 and "cake_gdp" in names[0], names
@@ -989,21 +1022,64 @@ def test_single_launch() -> None:
     names_sync = _count_device_events(lambda: _run(c))
     assert [name for name in names_sync if "cake_gdp" in name] == names, names_sync
     assert sum("Memcpy" in name for name in names_sync) == 1, names_sync
-    s = _make(Case(lens=MERGED_LENS, H=10, n=3, initial="given", cu_cpu=True, seed=26))
-    assert _classes(s) == [loader.ROUTE_BODY_P3] * s.N
-    _check(s, *_run(s))  # warm-up
-    names_split = _count_device_events(lambda: _run(s))
-    kernels = [name for name in names_split if "cake_gdp" in name]
-    assert (
-        len(kernels) == 1 and names_split[-1] == kernels[0] and len(names_split) <= 3
-    ), names_split
-    m = _make(
-        Case(lens=MIXED_LENS, H=MIXED_H, n=3, initial="given", cu_cpu=True, seed=26)
+    for lens in (MERGED_LENS, BENCH_MIXED_LENS, MIXED_LENS):
+        m = _make(
+            Case(lens=lens, H=MIXED_H, n=3, initial="given", cu_cpu=True, seed=26)
+        )
+        assert _body(m) == loader.ROUTE_BODY_P3, lens
+        _check(m, *_run(m))  # warm-up
+        names_m = _count_device_events(lambda m=m: _run(m))
+        kernels = [name for name in names_m if "cake_gdp" in name]
+        assert len(kernels) == 1 and names_m[-1] == kernels[0], (lens, names_m)
+        assert len(names_m) <= 2 and not any("Memcpy" in name for name in names_m), (
+            lens,
+            names_m,
+        )
+
+
+def _capture(call, *, warm_up: bool):
+    """``call`` captured into a CUDA graph on a side stream (after two eager warm-up calls there, the usual
+    recipe, when ``warm_up``); the graph and the tensors the captured call returned (graph-pool memory, rewritten
+    by every replay)."""
+    stream = torch.cuda.Stream(device=_device())
+    stream.wait_stream(torch.cuda.current_stream(_device()))
+    with torch.cuda.stream(stream):
+        for _ in range(2 if warm_up else 0):
+            call()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        result = call()
+    torch.cuda.synchronize(_device())
+    return graph, result
+
+
+@pytest.mark.parametrize("warm", (True, False))
+def test_mixed_batch_captures_into_a_cuda_graph(warm: bool) -> None:
+    """A mixed bench batch at H = 10 (one-token sequences beside a merged long one; one merged split launch) with
+    the host copy of ``cu_seqlens`` captures into a CUDA graph -- after eager calls of the batch (its item table
+    cached on the device: the graph holds no copy) and as the first call of its batch (the program loaded by an
+    eager call of another batch; the table copied in the graph from pinned memory) -- and every replay rewrites the
+    eager call's bits (output rows and final states); the eager result satisfies the FP64 reference."""
+    other = _make(
+        Case(
+            lens=BENCH_MIXED_LENS, H=MIXED_H, n=3, initial="given", cu_cpu=True, seed=33
+        )
     )
-    assert set(_classes(m)) == set(loader.ROUTE_BODIES)
-    _check(m, *_run(m))  # warm-up
-    names_mixed = _count_device_events(lambda: _run(m))
-    assert sum("cake_gdp" in name for name in names_mixed) == 2, names_mixed
+    # loads the program; the batch below is new to the table cache when not warm
+    _run(other)
+    lens = BENCH_MIXED_LENS if warm else (1, 1, 1, 8191)
+    c = _make(Case(lens=lens, H=MIXED_H, n=3, initial="given", cu_cpu=True, seed=34))
+    assert _body(c) == loader.ROUTE_BODY_P3
+    graph, (g_out, g_state) = _capture(lambda: _run(c), warm_up=warm)
+    out, state = _run(c)
+    _check(c, out, state)
+    for _ in range(3):
+        g_out.zero_()
+        g_state.zero_()
+        graph.replay()
+        torch.cuda.synchronize(_device())
+        assert torch.equal(g_out, out) and torch.equal(g_state, state)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1139,7 @@ def test_every_prefill_program_is_launched(monkeypatch) -> None:
     ):
         c.seed = 28
         assert _classes(c) == [body] * c.N, (c.lens, c.initial, c.final)
+        assert _body(c) == body, (c.lens, c.initial, c.final)
         before = len(launched)
         _run_and_check(c)
         assert len(launched) == before + 1, launched  # a uniform batch is one launch
@@ -1090,8 +1167,9 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
     V6-class short batch runs the V6 program of its flags over ``N x H`` tiles without a table; a call without
     ``cu_seqlens_cpu`` synchronizes the copy and selects the same program with the same bits; an int64 host copy
     is accepted; a unit long batch runs its exact unit program and a long batch keeping no state the V6 plain
-    program, both over ``N x H`` tiles; the mixed-class batch of record is two recorded launches in plan order
-    (the merged body, then the V6 body) over its classes' own sequences, satisfying the FP64 reference;
+    program, both over ``N x H`` tiles; the mixed batch of record is one recorded launch of the merged split
+    program over the item table of the whole batch (every sequence, the short and the empty one included),
+    satisfying the FP64 reference;
     ``cu_seqlens_cpu`` is checked for device, rank, length and dtype."""
     seen: list[tuple[str, dict]] = []
     original = loader.run_module
@@ -1222,7 +1300,7 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
         store_final_state=True,
     )
     assert seen[-1][1]["tiles"] == plain.N * 3 and seen[-1][1]["slots"] == 1
-    # the mixed-class batch of record: two launches in plan order, each over its class's sequences alone
+    # the mixed batch of record: one launch of the merged split program over the items of the whole batch
     mixed = Case(
         lens=MIXED_LENS,
         H=MIXED_H,
@@ -1232,48 +1310,39 @@ def test_split_programs_follow_the_host_split_rule(monkeypatch) -> None:
         cu_cpu=True,
         seed=29,
     )
-    classes = _classes(mixed)
-    assert classes == [P3, V6, V6, P3]
-    assert loader.prefill_launch_plan(classes) == [(P3, [0, 3]), (V6, [1, 2])]
+    assert _classes(mixed) == [P3, V6, V6, P3]
+    assert _body(mixed) == P3
     before = len(seen)
     _run_and_check(mixed)
     launches = seen[before:]
-    assert [loader.MODULES[name]["body"] for name, _ in launches] == [P3, V6]
-    merged_offsets = (0, MIXED_LENS[0], MIXED_LENS[0] + MIXED_LENS[3])
     table = loader.prefill_split_table(
-        merged_offsets,
+        mixed.offsets,
         num_heads=MIXED_H,
         num_householder=3,
         sm_count=sm_count,
-        total_tokens=merged_offsets[-1],
+        total_tokens=mixed.T,
     )
-    assert table is not None and len(table) > 2 * MIXED_H
-    assert launches[0] == (
-        loader.selected_prefill_module(
-            arch,
-            body=P3,
-            use_initial_state=True,
-            use_state_indices=True,
-            store_final_state=True,
-            split_items=True,
-        ),
-        {
-            "tiles": len(table),
-            "slots": 4 * len(table),
-            "ws": 4 * (2 * MIXED_H + 2 * len(table)),
-            "num_seqs": 2,
-        },
+    assert table is not None and {seq for seq, head, cut, span in table} == set(
+        range(mixed.N)
     )
-    assert launches[1] == (
-        loader.selected_prefill_module(
-            arch,
-            body=V6,
-            use_initial_state=True,
-            use_state_indices=True,
-            store_final_state=True,
-        ),
-        {"tiles": 2 * MIXED_H, "slots": 2, "ws": 16, "num_seqs": 2},
-    )
+    assert launches == [
+        (
+            loader.selected_prefill_module(
+                arch,
+                body=P3,
+                use_initial_state=True,
+                use_state_indices=False,
+                store_final_state=True,
+                split_items=True,
+            ),
+            {
+                "tiles": len(table),
+                "slots": 4 * len(table),
+                "ws": 4 * (mixed.N * MIXED_H + 2 * len(table)),
+                "num_seqs": mixed.N,
+            },
+        )
+    ]
     c = _make(Case(lens=(129, 65), H=3, n=3, seed=29))
 
     def call(cu_seqlens_cpu):
@@ -1535,13 +1604,16 @@ def test_route_tables_are_consistent() -> None:
     )
     assert loader.PREFILL_LOGICAL_TENSORS[:4] == ("q", "k", "v", "o")
     # the logical names of the shared prefill vocabulary but the Blackwell body's own (its item table, workspace,
-    # flags word and counts)
+    # flags word and counts, and the pool programs' write slots, rounding seed and Philox rounds)
     blackwell_only = {
         "items",
         "split_workspace",
         "state_stride_slot",
         "num_items",
         "flags",
+        "output_state_indices",
+        "rand_seed",
+        "philox_rounds",
     }
     for name in (base, merged):
         assert (
