@@ -9405,20 +9405,20 @@ class RecordsNvfp4Bf16Runner(MoERunner):
         rows = experts.local_num_experts or self.config.routing.num_experts
         rows += experts.num_fused_shared_experts
         inter = experts.intermediate_size
-        # Records of other sizes may take as many bytes: the sizes the view was prepared for
-        for name, size in (("hidden_size", hidden_size), ("intermediate_size", inter)):
-            if view.get(name, size) != size:
-                raise ValueError(
-                    f"{self.backend_key}: the view's records are of {name} "
-                    f"{view[name]}, the layer's inputs {size}."
-                )
         gated = self.config.activation.is_gated
-        if view.get("gated", gated) != gated:  # gated records reorder FC1's rows
-            raise ValueError(
-                f"{self.backend_key}: the view's records are for a "
-                f"{'' if view['gated'] else 'non-'}gated activation, the layer's "
-                f"{type(self.config.activation).__name__} is {'' if gated else 'not '}gated."
-            )
+        # Records of other sizes may take as many bytes, and gated records reorder FC1's
+        # rows: the view must name what it was prepared for, as prepare_weights does
+        for name, want in (
+            ("hidden_size", hidden_size),
+            ("intermediate_size", inter),
+            ("gated", gated),
+        ):
+            if view.get(name) != want:
+                raise ValueError(
+                    f"{self.backend_key}: the view's records are for {name}="
+                    f"{view.get(name)}, the layer's is {want}; prepare the view "
+                    f"with the backend config's prepare_weights."
+                )
         # A gated MXFP4 expert may scale its halves apart: [rows, 2], up then gate.
         halves = gated and self.config.quant.weight is QuantFormat.MXFP4
         bytes1 = _w4a16_records_geometry(inter * (1 + gated), hidden_size, gated)[3]

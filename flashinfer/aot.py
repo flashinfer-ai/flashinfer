@@ -988,8 +988,10 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
-            jit_specs.append(gen_fp4_quantization_sm90_module())
-            jit_specs.append(gen_mxfp8_quantization_sm100_module("90"))
+            # The software conversions compile CUDA 12.8's E8M0 type, as on SM80
+            if get_cuda_version() >= Version("12.8"):
+                jit_specs.append(gen_fp4_quantization_sm90_module())
+                jit_specs.append(gen_mxfp8_quantization_sm100_module("90"))
             # The generic module only: the device-specific prebuilt-D variants are
             # selected at JIT time and must not follow the build host's GPU.
             jit_specs.append(gen_cutlass_fused_moe_sm90_module(enable_prebuilt_d=False))

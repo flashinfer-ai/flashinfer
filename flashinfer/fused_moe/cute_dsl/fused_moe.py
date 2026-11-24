@@ -1116,8 +1116,8 @@ class CuteDslMoEWrapper:
     overlap during capture and replay. Auto-tuning is supported via the `tactic`
     parameter or `autotune()` context.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
-    SM100 and SM103. SM80 to SM90 run the records path of :func:`cute_dsl_fused_moe`.
+    Supported architectures: SM100, SM103, and SM107. Of these, W4A8 and W8A8 are
+    limited to SM100 and SM103. SM80 to SM90 run the records path of :func:`cute_dsl_fused_moe`.
 
     Attributes:
         num_experts: Total number of experts.
@@ -1935,8 +1935,8 @@ def cute_dsl_fused_moe(
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
-    Supported architectures: SM100, SM103, and SM107. W4A8 and W8A8 are limited to
-    SM100 and SM103. SM80 to SM90 run W4A4 and W4A16 on the records of
+    Supported architectures: SM100, SM103, and SM107. Of these, W4A8 and W8A8 are
+    limited to SM100 and SM103. SM80 to SM90 run W4A4 and W4A16 on the records of
     :func:`prepare_records_nvfp4_weights` in ``w1_weight_sf`` and ``w2_weight_sf``, W4A8 on
     those of :func:`prepare_records_mxfp4_weights` (their global scales in the alphas).
     This is the simple functional API; for CUDA-graph support

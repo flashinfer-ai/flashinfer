@@ -598,9 +598,11 @@ void run(Data& data, void* stream) {
     if (useSingleCluster) {
       launchClusterKernel(data, numThreadsHist, stream);
     } else {
-      static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-      CoopLaunchSMCounts const coopLaunchSMCounts =
-          smMajor >= 9 ? getCoopLaunchSMCounts(smCount) : CoopLaunchSMCounts{};
+      CoopLaunchSMCounts coopLaunchSMCounts{};
+      if (smMajor >= 9) {
+        static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
+        coopLaunchSMCounts = getCoopLaunchSMCounts(smCount);
+      }
       int const numBlocksCoop = coopLaunchSMCounts.moeSms;
       int const maxTokensCoop = (numBlocksCoop * numThreadsHist * 64) / data.mTopK;
 

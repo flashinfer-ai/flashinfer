@@ -30,7 +30,7 @@ def direct_sm100_module(monkeypatch):
     return get_mxfp8_quantization_sm100_module.__wrapped__(), native
 
 
-@pytest.mark.parametrize("capability", [(7, 0), (7, 5)])
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0)])
 def test_mxfp8_sm100_direct_rejects_unsupported_cuda(
     monkeypatch, direct_sm100_module, capability
 ):
@@ -41,7 +41,7 @@ def test_mxfp8_sm100_direct_rejects_unsupported_cuda(
     monkeypatch.setattr(fp8_quantization, "device_support_pdl", pdl_query)
     with FakeTensorMode():
         input = torch.empty((1, 32), dtype=torch.bfloat16, device="cuda:0")
-        with pytest.raises(RuntimeError, match="requires SM80 or newer"):
+        with pytest.raises(RuntimeError, match="requires SM100 or newer"):
             module.mxfp8_quantize_sm100(input)
     capability_query.assert_called_once_with(input.device)
     pdl_query.assert_not_called()

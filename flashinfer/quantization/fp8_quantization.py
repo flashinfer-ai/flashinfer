@@ -162,13 +162,13 @@ def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     return padded_row * padded_column
 
 
-def _check_mxfp8_cuda_capability(device: torch.device) -> None:
-    """Reject pre-SM80 CUDA devices while allowing the CPU host path."""
+def _check_mxfp8_cuda_capability(device: torch.device, oldest: int = 8) -> None:
+    """Reject CUDA devices before SM{oldest}0 while allowing the CPU host path."""
     if device.type == "cuda":
         major, minor = get_compute_capability(device)
-        if major < 8:
+        if major < oldest:
             raise RuntimeError(
-                "mxfp8_quantize with backend='cuda' requires SM80 or newer, "
+                f"mxfp8_quantize with backend='cuda' requires SM{oldest}0 or newer, "
                 f"got SM{major}{minor}"
             )
 
@@ -225,7 +225,7 @@ def get_mxfp8_quantization_sm100_module(backend: str = "100"):
             )
             return out_val, out_sf
         else:
-            _check_mxfp8_cuda_capability(input.device)
+            _check_mxfp8_cuda_capability(input.device, int(backend) // 10)
             if enable_pdl is None:
                 enable_pdl = device_support_pdl(input.device)
             m = input.numel() // input.shape[-1]
