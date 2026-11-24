@@ -534,15 +534,18 @@ class Sm90Nvfp4W4A16MoEWorkspace:
         module = _get_module(self.hidden_size, self.intermediate_size, self._post_norm)
         slots = module.prefill_slots(chunk_tokens)
         kw = dict(dtype=torch.bfloat16, device=self.device)
-        self.xt = torch.empty((slots, self.hidden_size), **kw)
-        self.h = torch.empty((slots, self.intermediate_size), **kw)
-        self.maps = torch.empty(
+        # build the new reservation completely before replacing the current one, so a
+        # failed allocation leaves the workspace as it was
+        xt = torch.empty((slots, self.hidden_size), **kw)
+        h = torch.empty((slots, self.intermediate_size), **kw)
+        maps = torch.empty(
             module.prefill_map_bytes(), dtype=torch.uint8, device=self.device
         )
-        self.prefill_counters = torch.zeros(
+        counters = torch.zeros(
             module.prefill_counter_words(), dtype=torch.int32, device=self.device
         )
-        module.prefill_init(self.xt, self.h, self.maps)
+        module.prefill_init(xt, h, maps)
+        self.xt, self.h, self.maps, self.prefill_counters = xt, h, maps, counters
         self.prefill_chunk_tokens = chunk_tokens
 
 
