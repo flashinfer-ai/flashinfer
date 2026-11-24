@@ -2643,7 +2643,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "2cffdbabb6cbbb90b9909f6d6b34bb5ebee9d1b7e29acc73182a5a2170d8299a",
+      "closure_sha256": "fd60baf6bd91c856b90fa0e0589f5282d31532919a358b4d65b2af72f8416ce2",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -2653,7 +2653,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_sm_100a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_binding.cu": "df6338207511df29572e8d9af1e90cc0c768fa47ef8e60b50b1842e47895f98a",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_kernel.cu": "afe9c48c7524248e67568322f1470774995b74fa4ea9ec3db2239f9c0ddb5495"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_kernel.cu": "f2b95f79910ac76c30619ae144b04b0b6ce17fe50aad64ea81282ab5df880f9e"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_kernel.cu",
@@ -2662,7 +2662,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "4d64f5c185bc807ab6e9795a919350cd37f94f3b52259eef8ac377d869e70efe",
+      "closure_sha256": "2e74c9e78a56e6f324756f3b4069b5506c5c26e1ca3d36b724b5e32f012cf829",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -2672,7 +2672,7 @@
       "path": "aot/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_sm_103a.so",
       "sha256": {
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_binding.cu": "df6338207511df29572e8d9af1e90cc0c768fa47ef8e60b50b1842e47895f98a",
-        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_kernel.cu": "afe9c48c7524248e67568322f1470774995b74fa4ea9ec3db2239f9c0ddb5495"
+        "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_kernel.cu": "f2b95f79910ac76c30619ae144b04b0b6ce17fe50aad64ea81282ab5df880f9e"
       },
       "sources": [
         "csrc/cake_kimi_k3_vision_tower/cake_kimi_k3_vision_tower_abd5ffc8b81a49c667d0_kernel.cu",
