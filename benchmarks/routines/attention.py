@@ -1646,6 +1646,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if "trtllm-fmha-v2" in backends and is_nvfp4_kv:
         print("[INFO] trtllm-fmha-v2 backend does not support NVFP4. Skipping.")
         backends.remove("trtllm-fmha-v2")
+    if "trtllm-fmha-v2" in backends and (
+        kv_dtype != q_dtype or page_size & (page_size - 1)
+    ):
+        print(
+            "[INFO] trtllm-fmha-v2 backend needs kv_dtype == q_dtype and a "
+            "power-of-two page_size. Skipping."
+        )
+        backends.remove("trtllm-fmha-v2")
 
     if "cutlass" in backends:
         print("[INFO] CUTLASS backend does not support prefill. Skipping.")
