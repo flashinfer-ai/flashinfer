@@ -42,6 +42,7 @@ def _pcie_mesh(rank_order=None, world_size=8):
             numa_node=numa[rank],
             nic_name=f"mlx5_{rank_order[rank]}",
             gid_index=rank_order[rank] + 2,
+            gid_family="ipv4",
             peer_p2p={uuids[peer]: True for peer in range(world_size) if peer != rank},
             peer_nvlink={
                 uuids[peer]: False for peer in range(world_size) if peer != rank
@@ -482,16 +483,25 @@ def test_explicit_pcie_falls_back_when_gid_probe_fails():
     assert "RoCE GID probe failed on rank 3" in decision.reason
 
 
-def test_explicit_pcie_plans_rdma_over_ipv6_gids():
+@pytest.mark.parametrize(
+    ("route", "transport"), [("auto", "rdma"), ("rdma", "rdma"), ("hybrid", "hybrid")]
+)
+@pytest.mark.parametrize("pinned", [False, True])
+def test_explicit_pcie_plans_rdma_routes_over_ipv6_gids(route, transport, pinned):
+    # pinned: the documented remedy for a group mixing dual-stack and IPv6-only
+    # NICs, FLASHINFER_ULYSSES_PCIE_GID_INDICES naming an IPv6 entry per rank
     topos = _pcie_mesh()
+    selected = tuple(t.gid_index for t in topos)
     for topo in topos:
+        topo.route = route
         topo.gid_family = "ipv6"
+        topo.gid_indices_override = selected if pinned else None
 
     decision = decide_ulysses_backend("pcie", topos)
 
     assert decision.pcie_plan is not None
-    assert decision.pcie_plan.transport == "rdma"
-    assert decision.pcie_plan.gid_indices == tuple(t.gid_index for t in topos)
+    assert decision.pcie_plan.transport == transport
+    assert decision.pcie_plan.gid_indices == selected
 
 
 @pytest.mark.parametrize("route", ["rdma", "hybrid"])
