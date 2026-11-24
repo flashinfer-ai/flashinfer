@@ -131,7 +131,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(160, LAUNCH_MIN_BLOCKS) void
-kernel_cake_tinygemm2_wgmma_bf74a6e29ef5f665fd3b(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ bias, int M, int N, int K)
+kernel_cake_tinygemm2_wgmma_bf74a6e29ef5f665fd3b(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, __nv_bfloat16* out, __nv_bfloat16* bias, int M, int N, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

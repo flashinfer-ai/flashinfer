@@ -159,7 +159,7 @@ static_assert(3 * 16 * 8 <= kSmemWtOff, "mbarriers must fit below the weight rin
 // STAGES/4 ring passes per loader warp use the mbarrier phase bit.
 template <int STAGES, bool USE_PDL>
 __global__ __launch_bounds__(384, 1) void
-tinygemm2_kernel(__nv_bfloat16* __restrict__ output, __nv_bfloat16* __restrict__ bias, int M, int N, int K, __grid_constant__ TensorMapPack<2> const tma_params)
+tinygemm2_kernel(__nv_bfloat16* output, __nv_bfloat16* bias, int M, int N, int K, __grid_constant__ TensorMapPack<2> const tma_params)
 {
     static_assert(STAGES == 4 || STAGES == 8 || STAGES == 16, "ring depth must be 4, 8 or 16");
     constexpr int kRing = STAGES / 4;  // ring passes per loader warp
@@ -224,7 +224,8 @@ tinygemm2_kernel(__nv_bfloat16* __restrict__ output, __nv_bfloat16* __restrict__
             int mib_c = blockIdx.x * 16;
             int ni_c = blockIdx.y * 8;
             // The bias can be produced by the preceding kernel.  The activation
-            // loader's wait only orders that thread's TMA operations.
+            // loader's wait only orders that thread's TMA operations. The
+            // bias pointer must allow a coherent load in the PDL path.
             if constexpr (USE_PDL) {
                 asm volatile("griddepcontrol.wait;" ::: "memory");
             }
