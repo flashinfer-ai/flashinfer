@@ -1745,6 +1745,71 @@ def test_three_routing_modes_agree_and_runs_are_deterministic(pair):
 
 @needs_device
 @each_pair
+def test_graphs_captured_at_two_token_counts_and_two_routing_modes_replay_interleaved(
+    pair,
+):
+    """One layer, four CUDA graphs: captured at a decode and a mid token count, each from logits and from pre-routed
+    (unpacked) inputs, replayed interleaved twice with eager calls of every case between the rounds and once more back to
+    back. Every replay gives the eager bits of its own inputs (the graphs share the layer's compiled bodies, winners and
+    constant caches without interference), and the eager calls after the replays give them too."""
+    k, H, I, E = 4, 256, 128, 16
+    layer = _layer(k, E, I, quant=_QUANT[pair])
+    cases, W = {}, None
+    for name, T, seed in (("decode", 4, 21), ("mid", 200, 22)):
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=seed)
+        if W is None:
+            W = _weights(w1, w2, quant=_QUANT[pair])
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        cases[(name, "logits")] = _logits_pack(x, logits)
+        cases[(name, "routed")] = _routed_pack(x, ids.cuda(), wts.cuda())
+    ref = {
+        key: bits(layer(act, W)) for key, act in cases.items()
+    }  # eager: the compile, the winners, the constants
+    assert torch.equal(ref[("decode", "logits")], ref[("decode", "routed")])
+    assert torch.equal(ref[("mid", "logits")], ref[("mid", "routed")])
+    assert (
+        ref[("decode", "logits")].shape[0] == 4
+        and ref[("mid", "logits")].shape[0] == 200
+    )
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    graphs = {}
+    for key, act in cases.items():
+        with torch.cuda.stream(s):
+            layer(act, W)  # warm on the capture stream
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            out = layer(act, W)
+        torch.cuda.synchronize()
+        graphs[key] = (g, out)
+    order = [
+        ("decode", "logits"),
+        ("mid", "routed"),
+        ("mid", "logits"),
+        ("decode", "routed"),
+    ]
+    nan = float("nan")
+    for _ in range(2):
+        for key in order:
+            g, out = graphs[key]
+            out.fill_(nan)
+            g.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(bits(out), ref[key]), key
+        for key in reversed(order):  # eager calls between the rounds
+            assert torch.equal(bits(layer(cases[key], W)), ref[key]), key
+    for key in order:  # back to back, one synchronization
+        g, out = graphs[key]
+        out.fill_(nan)
+        g.replay()
+    torch.cuda.synchronize()
+    for key in order:
+        assert torch.equal(bits(graphs[key][1]), ref[key]), key
+
+
+@needs_device
+@each_pair
 def test_layer_fused_routing_at_small_t_matches_prerouted_routing(pair):
     """From logits at a small token count the runner routes and plans in one launch; the output equals the pre-routed modes'
     (the same ids and weights from ``route``) bit for bit, and the op given the fused plan equals the op planning itself."""
