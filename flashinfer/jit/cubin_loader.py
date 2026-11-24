@@ -71,13 +71,19 @@ def _log_error_response(response) -> None:
     )
 
 
+# How long a process waits for another process downloading the same artifact.
+# The slowest downloads seen in CI took about 3 minutes; this leaves headroom
+# while a holder that is stuck (not dead) still ends in an error, not a hang.
+DOWNLOAD_LOCK_TIMEOUT_SECONDS = 900.0
+
+
 def download_file(
     source: str,
     destination: str,
     retries: int = 4,
     delay: int = 5,
     timeout: int = 10,
-    lock_timeout: float = -1,
+    lock_timeout: float | None = None,
     session: "requests.Session | None" = None,
     *,
     expected_sha256: str | None = None,
@@ -93,9 +99,10 @@ def download_file(
     - retries (int): Number of retry attempts for URL downloads (default: 3).
     - delay (int): Initial delay in seconds for exponential backoff (default: 5).
     - timeout (int): Timeout for the HTTP request in seconds (default: 10).
-    - lock_timeout (float): Timeout in seconds for the file lock. The default
-      (-1) waits for the holder: a waiter that gives up first finds no file,
-      and a large artifact can take minutes to download.
+    - lock_timeout (float | None): Timeout in seconds for the file lock. None
+      uses DOWNLOAD_LOCK_TIMEOUT_SECONDS (900): long enough for a concurrent
+      download of a large artifact, bounded so a stuck holder cannot hang
+      the waiter. A negative value waits indefinitely.
     - expected_sha256 (str | None): Reuse a matching cached file after acquiring
       the lock. None preserves unconditional download/copy behavior.
 
@@ -108,6 +115,8 @@ def download_file(
     if session is None:
         session = requests.Session()
 
+    if lock_timeout is None:
+        lock_timeout = DOWNLOAD_LOCK_TIMEOUT_SECONDS
     lock_path = f"{destination}.lock"  # Lock file path
     lock = filelock.FileLock(lock_path, timeout=lock_timeout)
 
