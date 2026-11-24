@@ -76,6 +76,15 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
         if self._autotune_pending:
+            if (
+                config.dispatch_pull_batch is not None
+                or config.dispatch_pull_rotate is not None
+            ):
+                raise ValueError(
+                    "knobs='auto' is mutually exclusive with explicit "
+                    "dispatch_pull_batch / dispatch_pull_rotate; leave both "
+                    "unset to autotune the pull schedule."
+                )
             import warnings
 
             warnings.warn(
@@ -149,7 +158,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         )
 
     supports_live_token_tuning = True
-    _knob_cache_module = "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.knob_cache"
+    _knob_cache_module = "flashinfer.moe_ep.shims.sm90.cutedsl_megamoe.knob_cache"
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
         k = self._kernel_config
@@ -212,6 +221,8 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             "combine_format": k.combine_format,
             "active_dispatch_warps": k.active_dispatch_warps,
             "compact_pull_buffer": k.compact_pull_buffer,
+            "dispatch_pull_batch": k.dispatch_pull_batch,
+            "dispatch_pull_rotate": k.dispatch_pull_rotate,
             "fc1_store_offload": k.fc1_store_offload,
             "fc1_early_done_publish": k.fc1_early_done_publish,
             "fold_producer_warps": k.fold_producer_warps,
@@ -222,7 +233,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         # Backend talks only to the pull_style_cutedsl_megakernel shim (never
         # src/ directly).
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
             get_symm_buffer_for_hopper_fp8_mega_moe,
         )
 
@@ -275,9 +286,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             # Pre-staged fp8 + scales: byte-copy into the symmetric buffers.
             # Backend talks only to the pull_style_cutedsl_megakernel shim.
             if k.fp8_scale_mode == "blockwise":
-                from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-                    Fp8BlockScaleK,
-                )
+                from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import Fp8BlockScaleK
 
                 sf_cols = workspace.hidden // Fp8BlockScaleK
                 assert t.scales is not None
@@ -286,7 +295,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
                     t.scales[:num_tokens, :sf_cols].to(torch.float32)
                 )
             else:
-                from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+                from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
                     Fp8E8M0SfVecSize,
                     ceil_div,
                 )
@@ -320,9 +329,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         output: torch.Tensor | None,
     ) -> torch.Tensor:
         # Backend talks only to the pull_style_cutedsl_megakernel shim.
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-            hopper_fp8_mega_moe,
-        )
+        from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import hopper_fp8_mega_moe
 
         if output is not None:
             num_tokens = output.shape[0]
@@ -344,7 +351,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
             # so the candidate sweep stays in lockstep (see shim/autotune.py).
-            from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+            from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
                 autotune_hopper_fp8_mega_moe,
             )
 
@@ -399,7 +406,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         if self._kernel_config.knobs == "auto":
             # Autotuning mutates the frontend; keep these sessions unpooled.
             return None
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        from flashinfer.moe_ep.shims.sm90.cutedsl_megamoe import (
             _get_symm_buffer_for_hopper_fp8_mega_moe_from_resolved_config,
             resolve_hopper_fp8_mega_moe_config,
         )

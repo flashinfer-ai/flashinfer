@@ -59,16 +59,18 @@ def prepare_kimi_k3_fused_router(
     Parameters
     ----------
     logits : torch.Tensor
-        Contiguous float32 ``[num_tokens, 896]`` gate logits.
+        Contiguous, 16-byte aligned float32 ``[num_tokens, 896]`` gate logits.
     bias : torch.Tensor
-        Contiguous float32 ``[896]`` selection bias (selection only; it does
-        not enter the weights).
+        Contiguous, 16-byte aligned float32 ``[896]`` selection bias (selection
+        only; it does not enter the weights).
     block_m : int
         Route block alignment, 8 or 16.
     plan : Optional[KimiK3RoutePlan]
         Caller-owned outputs from
         :func:`flashinfer.fused_moe.allocate_kimi_k3_route_plan`; allocated
-        with worst-case capacity when omitted.
+        with worst-case capacity when omitted.  Its ``topk_ids``,
+        ``expert_counts``, ``expert_offsets`` and ``expert_scatter_offsets``
+        must be 16-byte aligned.
     backend : str
         Only ``"cake"`` is supported.
 

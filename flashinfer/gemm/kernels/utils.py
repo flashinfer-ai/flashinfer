@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import torch
+
 from flashinfer.utils import next_positive_power_of_2
 
 _SM100_MMA_TILER_MN_CANDIDATES = [
@@ -135,6 +137,7 @@ def _score_block_scaled_tactic(
     cluster_shape_mn,
     swap_ab,
     mma_inst_shape_m=None,
+    batch=1,
 ):
     """Score a block-scaled cute-dsl GEMM tactic (higher means better).
 
@@ -144,6 +147,8 @@ def _score_block_scaled_tactic(
 
     mma_inst_shape_m defaults to the tile M. SM107 mm_mxfp8 passes half the tile M
     for B-reuse, where each CTA issues two MMA instructions and so computes 256 rows.
+
+    batch counts independent (m, n) problems (bmm), each padded to whole tiles and clusters.
     """
     if m == 0 or n == 0:
         return 0.0
@@ -164,8 +169,10 @@ def _score_block_scaled_tactic(
     rows_per_cta = tile_m // cta_group
     ctas_m = m_tiles * cta_group
     # 2. Wave quantization effects: count waves over the real CTA grid
-    padded_ctas = ((ctas_m + cga_m - 1) // cga_m * cga_m) * (
-        (n_tiles + cga_n - 1) // cga_n * cga_n
+    padded_ctas = (
+        batch
+        * ((ctas_m + cga_m - 1) // cga_m * cga_m)
+        * ((n_tiles + cga_n - 1) // cga_n * cga_n)
     )
     num_waves = (padded_ctas + sm_count - 1) // sm_count
 
@@ -223,6 +230,30 @@ def _rank_mm_fp4_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tac
         )
 
     return sorted(valid_tactics, key=score, reverse=True)[:max_tactics]
+
+
+def _rank_mm_mxfp8_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tactics):
+    """Optional bounded search; keep all low-M split-K candidates.
+
+    The shared score was calibrated for FP4. MXFP8 uses the full search by
+    default until target-GPU comparisons establish a suitable candidate budget.
+    """
+    if max_tactics == 0 or len(valid_tactics) <= max_tactics:
+        return valid_tactics
+    split_k = [t for t in valid_tactics if t[-1] > 1]
+    persistent = [t for t in valid_tactics if t[-1] == 1]
+    if max_tactics < len(split_k) + 1:
+        raise ValueError(
+            "MXFP8 tactic budget must retain split-K and at least one persistent tactic"
+        )
+    ranked = sorted(
+        persistent,
+        key=lambda t: _score_block_scaled_tactic(
+            m, n, real_k, sm_count, t[0], t[1], t[2]
+        ),
+        reverse=True,
+    )
+    return ranked[: max_tactics - len(split_k)] + split_k
 
 
 def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
@@ -557,3 +588,32 @@ def _select_sm107_mm_mxfp8_cute_dsl_tactic(m, n, real_k, sm_count):
 
     bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
     return bucket_tactics[bucket]
+
+
+def validate_tf32_gemm_inputs(a, b, out=None) -> tuple[int, int, int]:
+    """Check ``a[M, K]`` row-major, ``b[K, N]`` column-major and (if given)
+    ``out[M, N]`` row-major FP32 tensors on one CUDA device; return ``(M, N, K)``."""
+    tensors = (a, b) if out is None else (a, b, out)
+    if any(not isinstance(t, torch.Tensor) for t in tensors):
+        raise ValueError("a, b and out must be torch tensors")
+    if any(t.ndim != 2 for t in tensors):
+        raise ValueError("TF32 split-K GEMM accepts only 2D tensors")
+    if a.device.type != "cuda" or any(t.device != a.device for t in tensors):
+        raise ValueError("all tensors must be on the same CUDA device")
+    if any(t.dtype != torch.float32 for t in tensors):
+        raise ValueError("a, b and out must be float32")
+    if not a.is_contiguous() or not b.t().is_contiguous():
+        raise ValueError("a must be row-major and b column-major")
+    if out is not None and not out.is_contiguous():
+        raise ValueError("out must be row-major")
+    if any(t.data_ptr() % 16 for t in tensors):
+        raise ValueError("a, b and out must be 16-byte aligned")
+    m, k = a.shape
+    if b.shape[0] != k:
+        raise ValueError(
+            f"incompatible shapes: a is {tuple(a.shape)}, b is {tuple(b.shape)}"
+        )
+    n = b.shape[1]
+    if out is not None and out.shape != (m, n):
+        raise ValueError(f"out must have shape {(m, n)}, got {tuple(out.shape)}")
+    return m, n, k

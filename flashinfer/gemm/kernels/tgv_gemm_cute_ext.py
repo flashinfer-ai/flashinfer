@@ -17,10 +17,10 @@ Toggled by ``use_2cta`` in the constructor:
                               cta_n ∈ [16, 256] step 16; each cluster of 2
                               CTAs jointly computes one (2*cta_m, cta_n) tile.
 
-Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 GEMM:
+Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 (or fp32) GEMM:
   A:  (M, K, L)  K-major,  bf16
   B:  (N, K, L)  K-major,  bf16
-  C:  (M, N, L)  M-major,  bf16
+  C:  (M, N, L)  M-major,  bf16 or fp32
 
 ## Warp specialization (8 warps, 256 threads/CTA; warp 3 idle)
   Warp 0     DMA_A   TMA-loads A tiles into sA[..., stage]
@@ -42,12 +42,19 @@ Computes `C = A @ B` for batched bf16 → fp32-accum → bf16 GEMM:
                     activations have landed).
   bar_mma_epilog    1 arrival   (MMA tcgen05.commit; "acc ready"; 2-CTA
                     multicasts to both CTAs).
-  bar_tmem_alloc    160 arrivals (32 MMA + 128 EPILOG); two-phase:
+  bar_tmem_alloc    160 arrivals (32 MMA + 128 EPILOG); two-phase (the MMA warp
+                    waits for phase 0 before its phase-1 arrival):
                       phase 0→1 = MMA finished alloc_tmem
                       phase 1→0 = EPILOG finished tcgen05.ld (safe to dealloc)
-                    Both 1-CTA and 2-CTA: the handshake is within-CTA only —
-                    2-CTA dealloc is per-CTA (each CTA owns its physical TMEM
-                    half; the cluster-shared accumulator is just a view).
+                    The handshake is within-CTA only. In 2-CTA mode, alloc,
+                    relinquish and dealloc are cta_group::2 collectives (one
+                    warp in each CTA of the pair); a cluster barrier at
+                    kernel exit keeps both CTAs resident until both finish.
+  bar_tmem_dealloc  2-CTA only (not allocated in 1-CTA). 32 arrivals from the
+                    PEER CTA's MMA warp (remote arrive on the peer's copy);
+                    each MMA warp waits on its own copy before the collective
+                    tcgen05.dealloc.cta_group::2, for which the PTX ISA
+                    requires both CTAs to synchronize their TMEM accesses.
 
 A 1-element Int32 SMEM slot (tmem_base_ptr) is written by alloc_tmem and read
 by retrieve_tmem_ptr in MMA + EPILOG.
@@ -114,6 +121,15 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.cute.nvgpu import tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 
+from .dense_bf16_gemm_sm100_splitk import _tcgen05_fence
+from .dense_bf16_gemm_warp_splitk import (
+    LamportPeerStoreConfig,
+    bind_peer_store_args,
+    make_lamport_peer_store_config,
+    split_peer_store_config,
+    store_tile_to_peers,
+)
+
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
 # 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
@@ -152,11 +168,45 @@ _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
     (128, 32, 6, True),  # 26
     (128, 64, 5, True),  # 27
     (128, 128, 4, True),  # 28
+    # SM107-only configs: the tiles above with the deepest A/B pipeline that
+    # fits the larger SM107 SMEM. Appended so tactic ids 0-28 keep their
+    # meaning on every arch.
+    (64, 8, 18, False),  # 29
+    (64, 16, 16, False),  # 30
+    (64, 32, 13, False),  # 31
+    (64, 64, 10, False),  # 32
+    (64, 128, 6, False),  # 33
+    (128, 8, 9, False),  # 34
+    (128, 16, 9, False),  # 35
+    (128, 32, 8, False),  # 36
+    (128, 64, 6, False),  # 37
+    (128, 128, 5, False),  # 38
+    (64, 16, 18, True),  # 39
+    (64, 32, 16, True),  # 40
+    (64, 64, 13, True),  # 41
+    (64, 128, 10, True),  # 42
+    (128, 16, 9, True),  # 43
+    (128, 32, 9, True),  # 44
+    (128, 64, 8, True),  # 45
+    (128, 128, 6, True),  # 46
 ]
+_TGV_CUTE_EXT_FIRST_SM107_TACTIC: int = 29
+
+
+def _is_sm107(device: torch.device) -> bool:
+    return torch.cuda.get_device_capability(device) == (10, 7)
 
 
 def get_tgv_cute_ext_tactic_num() -> int:
     return len(_TGV_CUTE_EXT_TACTIC_CONFIGS)
+
+
+def get_tgv_cute_ext_valid_tactics(device: torch.device) -> List[int]:
+    """Tactic ids runnable on ``device``: all of them on SM107, the ones
+    sized for the SM100 SMEM elsewhere."""
+    if _is_sm107(device):
+        return list(range(len(_TGV_CUTE_EXT_TACTIC_CONFIGS)))
+    return list(range(_TGV_CUTE_EXT_FIRST_SM107_TACTIC))
 
 
 def get_tgv_cute_ext_default_tactic() -> int:
@@ -192,8 +242,15 @@ class TgvGemmCuteExtKernel:
         pdl_launch: Optional[bool] = None,
         pdl_count: int = -1,
         has_bias: bool = False,
+        arch: str = "sm_100",
+        # Store the tile into peer buffers instead of ``c``.
+        peer_store: Optional[LamportPeerStoreConfig] = None,
+        # Only names the kernel; the epilogue casts to ``c``'s element type.
+        out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ):
+        self.peer_store = peer_store
         self.acc_dtype = acc_dtype
+        self.out_dtype = out_dtype
         self.cta_m = cta_m
         self.cta_n = cta_n
         self.cta_k = cta_k
@@ -207,6 +264,9 @@ class TgvGemmCuteExtKernel:
         # adds it to the accumulator before the bf16 cast. When False, all
         # bias-related code is elided via cutlass.const_expr.
         self.has_bias = has_bias
+        # Dynamic SMEM requested at launch: the capacity of ``arch``.
+        self.arch = arch
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
 
         # 1-CTA: cta_n ∈ [8, 256] step 8 (bf16 tcgen05.mma atom limit).
         # 2-CTA: cta_n ∈ [16, 256] step 16 (bf16 K-major cluster mma).
@@ -232,6 +292,16 @@ class TgvGemmCuteExtKernel:
             self.cta_group = tcgen05.CtaGroup.ONE
             self.tma_op = cute_ext.OperationTypeEnum.SM90_TMA_LOAD
 
+    def __repr__(self) -> str:
+        # The generated kernel name embeds this, so profiles show the config.
+        return (
+            f"TgvGemmCuteExtKernel_cta{self.cta_m}x{self.cta_n}x{self.cta_k}"
+            f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
+            f"_bias{int(self.has_bias)}"
+            f"_out{self.out_dtype.__name__.lower()}"
+            f"{'' if self.peer_store is None else '_peer'}"
+        )
+
     @cute.experimental.jit
     def __call__(
         self,
@@ -240,6 +310,7 @@ class TgvGemmCuteExtKernel:
         c: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         bias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
         stream: cuda.CUstream,
+        peer_args=None,
     ):
         # Each CTA processes one (CTA_M, CTA_N) output tile, no persistence.
         # Round the (M, N) tile counts up to a full cluster so 2-CTA launches
@@ -254,11 +325,11 @@ class TgvGemmCuteExtKernel:
             ),
             self.cluster_shape,
         )
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(a, b, c, bias, peer_args).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(self.smem_capacity),
             stream=stream,
             use_pdl=self.pdl_launch,
         )
@@ -270,6 +341,7 @@ class TgvGemmCuteExtKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
+        peer_args,
     ):
         """
         Device-side dispatcher: build MMA descriptor, allocate SMEM/TMEM/
@@ -405,6 +477,14 @@ class TgvGemmCuteExtKernel:
         bar_tmem_alloc_arr = cute_ext.allocate(
             cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
         )
+        # 2-CTA only: rendezvous of the two MMA warps before the collective
+        # TMEM dealloc. 1-CTA passes None and never touches it.
+        bar_tmem_dealloc = None
+        if cutlass.const_expr(self.use_2cta):
+            bar_tmem_dealloc_arr = cute_ext.allocate(
+                cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+            )
+            bar_tmem_dealloc = bar_tmem_dealloc_arr.iterator  # Pointer[Int64]
         # alloc_tmem writes the TMEM base address to this slot; both MMA and
         # EPILOG read it back via retrieve_tmem_ptr.
         tmem_base_arr = cute_ext.allocate(
@@ -434,6 +514,8 @@ class TgvGemmCuteExtKernel:
                 cute.arch.mbarrier_init(
                     bar_tmem_alloc, 32 + 128
                 )  # MMA + 4 EPILOG warps
+                if cutlass.const_expr(self.use_2cta):
+                    cute.arch.mbarrier_init(bar_tmem_dealloc, 32)  # peer CTA's MMA warp
 
         cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(self.use_2cta):
@@ -532,6 +614,8 @@ class TgvGemmCuteExtKernel:
                 bar_empty,
                 bar_mma_epilog,
                 bar_tmem_alloc,
+                bar_tmem_dealloc,
+                cta_rank_in_cluster,
                 tiled_mma,
                 sA,
                 sB,
@@ -541,6 +625,16 @@ class TgvGemmCuteExtKernel:
                 k_tile_count,
             )
         elif warp_idx >= 4:
+            # None compiles the peer-store epilogue out.
+            peer_store_operands = None
+            if cutlass.const_expr(self.peer_store is not None):
+                peer_store_operands = (
+                    sA,
+                    mC,
+                    work_tile_info.M_idx,
+                    work_tile_info.N_idx,
+                    peer_args,
+                )
             # Epilog tid is 128..255 in the CTA; offset to 0..127 for partition.
             epi_tid = tidx - 128
             self.epilog_warp(
@@ -554,7 +648,18 @@ class TgvGemmCuteExtKernel:
                 epi_tid,
                 c_dtype,
                 d_layout,
+                peer_store_operands=peer_store_operands,
             )
+
+        if cutlass.const_expr(self.use_2cta):
+            # Cluster exit barrier (sgl-project/sglang#32907). Neither CTA may
+            # exit while its peer still has peer-redirected arrives, multicast
+            # commits or the cta_group::2 TMEM dealloc targeting it; otherwise
+            # CUDBG_EXCEPTION_CLUSTER_BLOCK_NOT_PRESENT under PDL. Keep this
+            # after dealloc_tmem in both CTAs: the dealloc may block on the
+            # peer's, so a barrier between them on one side only can hang.
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
 
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.
@@ -624,11 +729,11 @@ class TgvGemmCuteExtKernel:
                 empty_phase = empty_phase ^ 1
 
             # PDL: launch dependent grid at pdl_count (default -1 = end).
-            if cutlass.const_expr(self.use_pdl):
+            if cutlass.const_expr(self.use_pdl and self.peer_store is None):
                 if k_tile == pdl_count:
                     cute.arch.griddepcontrol_launch_dependents()
 
-        if cutlass.const_expr(self.use_pdl):
+        if cutlass.const_expr(self.use_pdl and self.peer_store is None):
             cute.arch.griddepcontrol_launch_dependents()
 
         # producer tail: drain the remaining bar_empty arrivals from MMA so the
@@ -665,6 +770,10 @@ class TgvGemmCuteExtKernel:
         # is weights (already resident), so DMA_A doesn't need this.
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.peer_store is not None):
+                # A pre-pushed consumer reads the epoch at launch: release it only after
+                # this wait, once every earlier push-plane kernel has finished.
+                cute.arch.griddepcontrol_launch_dependents()
 
         # See dma_a_warp for empty_phase + fused arrive-and-expect-tx logic.
         empty_phase = cutlass.Int32(1)
@@ -725,6 +834,8 @@ class TgvGemmCuteExtKernel:
         bar_empty,  # Pointer[Int64], DMA_Stage entries
         bar_mma_epilog,  # Pointer[Int64], 1 entry
         bar_tmem_alloc,  # Pointer[Int64], 1 entry, 160-arrival
+        bar_tmem_dealloc,  # Pointer[Int64], 1 entry, 32-arrival (2-CTA only, else None)
+        cta_rank_in_cluster: cutlass.Int32,
         tiled_mma: cute.TiledMma,
         sA: cute.Tensor,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
         sB: cute.Tensor,  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
@@ -755,6 +866,7 @@ class TgvGemmCuteExtKernel:
         # 2-CTA: alloc/relinquish/dealloc are cluster-coherent (is_two_cta=True).
         num_tmem_cols = 256
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta)
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 0: 32 of 160
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta)
 
@@ -780,6 +892,7 @@ class TgvGemmCuteExtKernel:
             for k_tile in cutlass.range(k_tile_count, unroll=1):
                 stage = k_tile % DMA_Stage
                 cute.arch.mbarrier_wait(bar_full + stage, full_phase)
+                _tcgen05_fence(before=False)
 
                 # Inner-K loop: NumMma_K straight-line tcgen05.mma instructions.
                 # cute_ext.dot expects rank-3 operands in the MMA fragment
@@ -821,11 +934,28 @@ class TgvGemmCuteExtKernel:
 
         # ---- TMEM dealloc: wait for own EPILOG's tcgen05.ld to retire, free.
         # bar_tmem_alloc phase 1 fires after EPILOG's tcgen05.ld is observable
-        # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
-        # cross-CTA handshake) because each CTA owns its own physical TMEM
-        # half; the cluster-shared accumulator is just a logical view.
+        # (post fence_view_async_tmem_load). Each CTA waits only for its own
+        # EPILOG. In 2-CTA mode the dealloc pairs with the peer MMA warp's
+        # (cta_group::2 collective, rendezvous below); the exit barrier in
+        # kernel() keeps the peer resident until both are issued.
+        #
+        # The phase-1 arrival must not be made while phase 0 is still open:
+        # MMA does not otherwise wait for EPILOG's phase-0 arrivals, so the
+        # arrival would count toward phase 0, and the parity-1 wait could then
+        # pass before EPILOG has read TMEM. Same fix as #7443.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
+        if cutlass.const_expr(self.use_2cta):
+            # tcgen05.dealloc.cta_group::2 is collective: the PTX ISA requires the
+            # issuing warp and the peer CTA's warp to synchronize their TMEM
+            # accesses first. Rendezvous with the peer MMA warp, as
+            # cutlass.utils.TmemAllocator.free does.
+            cute.arch.mbarrier_arrive(bar_tmem_dealloc, cta_rank_in_cluster ^ 1)
+            cute.arch.mbarrier_wait(bar_tmem_dealloc, 0)
+        # tcgen05.fence::after_thread_sync: order the dealloc after the tcgen05
+        # work handed off through the waits above.
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
     # ====================================================================
@@ -844,12 +974,14 @@ class TgvGemmCuteExtKernel:
         epi_tid: cutlass.Int32,  # 0..127 within the 4 EPILOG warps
         c_dtype: cutlass.Constexpr,
         d_layout: cutlass.Constexpr,
+        peer_store_operands=None,  # (sA, mC, M_idx, N_idx, peer_args) for the peer-store epilogue
     ):
         # Sync with MMA's alloc_tmem (phase 0 of bar_tmem_alloc): 128 arrivals
         # from this warp + 32 from MMA = 160. tmem_base_ptr is uninitialized
         # before the wait clears.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        _tcgen05_fence(before=False)
 
         # Bind acc_layout to the TMEM ptr written by alloc_tmem.
         # acc_layout shape: ((Mma_M, Mma_N), NumMma_M, NumMma_N, AccStage)
@@ -968,14 +1100,17 @@ class TgvGemmCuteExtKernel:
             rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)  # accumulator ready
+        _tcgen05_fence(before=False)
 
         # TMEM → RMEM (one tcgen05.ld for the 64×8 tile).
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
 
-        # tcgen05.ld is async — fence makes the result visible to (a) the
-        # rAcc.load() below and (b) MMA's dealloc_tmem after we arrive
-        # on bar_tmem_alloc phase 1.
+        # tcgen05.ld is async — wait for it so the rAcc.load() below sees
+        # the result. tcgen05.fence::before_thread_sync then orders the
+        # retired load before MMA's dealloc_tmem, which follows our
+        # bar_tmem_alloc phase-1 arrival.
         cute.arch.fence_view_async_tmem_load()
+        _tcgen05_fence(before=True)
 
         # Phase 1 of bar_tmem_alloc: 128 from this warp + 32 from MMA = 160.
         # MMA's mbarrier_wait(bar_tmem_alloc, 1) clears and it dealloc's.
@@ -1009,7 +1144,21 @@ class TgvGemmCuteExtKernel:
         # stay untouched. So the C++ / vanilla-DSL kernels' explicit predicate
         # dance (make_identity_tensor + elem_less + basic_copy_if) isn't
         # needed; the explicit `predicated_tensor_origin` marker isn't either.
-        cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+        if cutlass.const_expr(self.peer_store is None):
+            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+        else:
+            assert self.cta_n <= self.cta_k  # the tile fits in one A stage
+            store_tile_to_peers(
+                bind_peer_store_args(self.peer_store, peer_store_operands[4]),
+                rD,
+                tiled_copy_t2r,
+                epi_tid,
+                d_layout,
+                self.acc_dtype,
+                *peer_store_operands[:4],
+                self.cta_m,
+                self.cta_n,
+            )
 
 
 # =====================================================================
@@ -1024,13 +1173,14 @@ def _bmm_no_bias(
     b: cute.Tensor,  # (L, K, N) from PyTorch (permuted)
     c: cute.Tensor,  # (L, M, N) from PyTorch (permuted)
     stream: cuda.CUstream,
+    peer_args=None,
 ):
     a = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
     b = cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0]))
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
     # Dummy bias aliasing C — never dereferenced when has_bias=False.
     bias = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2]))
-    gemm_op(a, b, c, bias, stream)
+    gemm_op(a, b, c, bias, stream, peer_args)
 
 
 @cute.experimental.jit
@@ -1061,6 +1211,10 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float16: cutlass.Float16,
 }
+_TORCH_TO_CUTLASS_OUT_DTYPE = {
+    **_TORCH_TO_CUTLASS_DTYPE,
+    torch.float32: cutlass.Float32,
+}
 
 # Per-process cache mapping (dtype, config…) → compiled cute_ext callable.
 # We need to construct concrete cute.Tensors once and reuse the resulting
@@ -1072,9 +1226,10 @@ _TGV_CUTE_EXT_COMPILE_CACHE: dict = {}
 def _detect_leading_dim(t: torch.Tensor) -> int:
     """Return the index of the stride-1 dim. Used by ``_to_cute_swap`` so the
     integration layer auto-adapts to whichever of K-major / MN-major the
-    caller hands us. Falls back to the innermost dim if no stride-1 dim
-    exists (shouldn't happen for well-formed tensors)."""
-    for i, s in enumerate(t.stride()):
+    caller hands us. Skips the batch dim 0, which also has stride 1 for a
+    1x1 matrix (M = N = 1). Falls back to the innermost dim if no stride-1
+    dim exists (shouldn't happen for well-formed tensors)."""
+    for i, s in enumerate(t.stride()[1:], start=1):
         if s == 1:
             return i
     return t.dim() - 1
@@ -1096,7 +1251,12 @@ def _make_layout_tensor(
 
 
 def _make_compile_repr_tensors(
-    dtype: torch.dtype, has_bias: bool, a_leading: int, b_leading: int, c_leading: int
+    dtype: torch.dtype,
+    c_dtype: torch.dtype,
+    has_bias: bool,
+    a_leading: int,
+    b_leading: int,
+    c_leading: int,
 ):
     """Build representative tensors with strides matching the requested
     leading-dim pattern. After the A↔B swap, the cute_ext kernel sees:
@@ -1118,7 +1278,7 @@ def _make_compile_repr_tensors(
         (L, K, M), dtype, b_leading
     )  # kernel B shape (L, K, M_pt)
     C_t = _make_layout_tensor(
-        (L, N, M), dtype, c_leading
+        (L, N, M), c_dtype, c_leading
     )  # kernel C shape (L, N_pt, M_pt)
 
     a_ = from_dlpack(A_t, assumed_align=32).mark_layout_dynamic(leading_dim=a_leading)
@@ -1138,6 +1298,7 @@ def _make_compile_repr_tensors(
 
 def _get_compiled_cute_ext_kernel(
     dtype: torch.dtype,
+    c_dtype: torch.dtype,
     cta_m: int,
     cta_n: int,
     cta_k: int,
@@ -1148,6 +1309,9 @@ def _get_compiled_cute_ext_kernel(
     a_leading: int,
     b_leading: int,
     c_leading: int,
+    arch: str = "sm_100",
+    peer_store: Optional[LamportPeerStoreConfig] = None,
+    peer_args=None,  # traced only, not part of the cache key
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
     config + layout pattern. Returns a callable with signature
@@ -1158,6 +1322,7 @@ def _get_compiled_cute_ext_kernel(
     """
     key = (
         dtype,
+        c_dtype,
         cta_m,
         cta_n,
         cta_k,
@@ -1168,6 +1333,8 @@ def _get_compiled_cute_ext_kernel(
         a_leading,
         b_leading,
         c_leading,
+        arch,
+        peer_store,
     )
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
@@ -1176,6 +1343,10 @@ def _get_compiled_cute_ext_kernel(
     if dtype not in _TORCH_TO_CUTLASS_DTYPE:
         raise ValueError(
             f"TGV cute_ext backend supports {list(_TORCH_TO_CUTLASS_DTYPE)}; got {dtype}."
+        )
+    if c_dtype not in _TORCH_TO_CUTLASS_OUT_DTYPE:
+        raise ValueError(
+            f"TGV cute_ext output supports {list(_TORCH_TO_CUTLASS_OUT_DTYPE)}; got {c_dtype}."
         )
 
     gemm = TgvGemmCuteExtKernel(
@@ -1187,10 +1358,14 @@ def _get_compiled_cute_ext_kernel(
         use_2cta=use_2cta,
         use_pdl=use_pdl,
         has_bias=has_bias,
+        arch=arch,
+        peer_store=peer_store,
+        out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
         dtype,
+        c_dtype,
         has_bias,
         a_leading,
         b_leading,
@@ -1201,7 +1376,8 @@ def _get_compiled_cute_ext_kernel(
     if has_bias:
         compiled = cute_ext.compile(_bmm_bias, gemm, a_, b_, c_, bias_, fake_stream)
     else:
-        compiled = cute_ext.compile(_bmm_no_bias, gemm, a_, b_, c_, fake_stream)
+        extra = () if peer_store is None else (peer_args,)
+        compiled = cute_ext.compile(_bmm_no_bias, gemm, a_, b_, c_, fake_stream, *extra)
 
     _TGV_CUTE_EXT_COMPILE_CACHE[key] = compiled
     return compiled
@@ -1287,6 +1463,31 @@ def _resolve_tactic(tactic: int) -> Tuple[int, int, int, bool]:
     return _TGV_CUTE_EXT_TACTIC_CONFIGS[tactic]
 
 
+def _validate_peer_store_tensors(a, b, out) -> tuple[int, int]:
+    """Check the peer-store operands; return ``(M, N)``."""
+    # Peer-store addressing has no batch index.
+    if a.dim() != 2 or b.dim() != 2 or out.dim() != 2:
+        raise ValueError("TGV peer store accepts only 2D a, b and out")
+    m, k = a.shape
+    n = b.shape[1]
+    if b.shape[0] != k or out.shape != (m, n):
+        raise ValueError(
+            f"expected a [M, K], b [K, N] and out [M, N]; got {tuple(a.shape)}, "
+            f"{tuple(b.shape)} and {tuple(out.shape)}"
+        )
+    if any(t.dtype != torch.bfloat16 for t in (a, b, out)):
+        raise ValueError("TGV peer store supports bfloat16 only")
+    if a.device.type != "cuda" or b.device != a.device or out.device != a.device:
+        raise ValueError("a, b and out must be on the same CUDA device")
+    # The epilogue stages the tile for a row-major output.
+    if not out.is_contiguous():
+        raise ValueError("TGV peer store needs a row-major out")
+    # The peer-store epilogue stores 16 B chunks (8 features), predicated against N.
+    if n % 8:
+        raise ValueError(f"N={n} must be a multiple of 8")
+    return m, n
+
+
 def run_tgv_cute_ext(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1294,6 +1495,7 @@ def run_tgv_cute_ext(
     out: torch.Tensor,
     pdl: bool,
     tactic: int,
+    peer_store: Optional[LamportPeerStoreConfig] = None,
 ) -> torch.Tensor:
     """Dispatch a single TGV cute_ext GEMM/BMM call.
 
@@ -1303,6 +1505,19 @@ def run_tgv_cute_ext(
     """
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     has_bias = bias is not None
+    peer_args = None
+    if peer_store is not None:
+        if has_bias:
+            raise ValueError("peer_store needs no bias")
+        m, n = _validate_peer_store_tensors(a, b, out)
+        # A config made for a smaller GEMM must not write past its slot.
+        if m * n * 2 > peer_store.slot_bytes:
+            raise ValueError(
+                f"slot_bytes={peer_store.slot_bytes} is below {m * n * 2} for M={m}, N={n}"
+            )
+        peer_store, peer_args = split_peer_store_config(peer_store)
+    if tactic >= _TGV_CUTE_EXT_FIRST_SM107_TACTIC and not _is_sm107(a.device):
+        raise ValueError(f"TGV cute_ext tactic {tactic} needs SM107 SMEM.")
 
     # Detect the input layout first so we can fetch (or compile) a variant
     # of the kernel specialized for it.
@@ -1315,6 +1530,7 @@ def run_tgv_cute_ext(
 
     compiled = _get_compiled_cute_ext_kernel(
         dtype=a.dtype,
+        c_dtype=out.dtype,
         cta_m=cta_m,
         cta_n=cta_n,
         cta_k=_TGV_CUTE_EXT_CTA_K,
@@ -1325,6 +1541,9 @@ def run_tgv_cute_ext(
         a_leading=a_leading,
         b_leading=b_leading,
         c_leading=c_leading,
+        arch="sm_107" if tactic >= _TGV_CUTE_EXT_FIRST_SM107_TACTIC else "sm_100",
+        peer_store=peer_store,
+        peer_args=peer_args,
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
@@ -1332,5 +1551,35 @@ def run_tgv_cute_ext(
     if has_bias:
         compiled(a_, b_, c_, bias_, stream)
     else:
-        compiled(a_, b_, c_, stream)
+        compiled(a_, b_, c_, stream, *([] if peer_args is None else [peer_args]))
     return out
+
+
+def run_tgv_cute_ext_peer_store(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    tactic: int,
+    *,
+    peer_ptrs=None,
+    multicast_ptr=None,
+    epoch_ptr: int,
+    slot_bytes: int,
+    rank: int,
+    world_size: int,
+    layout: str = "broadcast",
+) -> None:
+    """``run_tgv_cute_ext`` (2D, no bias) storing into peer buffers (``LamportPeerStoreConfig``); ``out`` is not written."""
+    m, n = _validate_peer_store_tensors(a, b, out)
+    peer_store = make_lamport_peer_store_config(
+        peer_ptrs=peer_ptrs,
+        multicast_ptr=multicast_ptr,
+        epoch_ptr=epoch_ptr,
+        slot_bytes=slot_bytes,
+        rank=rank,
+        world_size=world_size,
+        layout=layout,
+        m=m,
+        n=n,
+    )
+    run_tgv_cute_ext(a, b, None, out, pdl=True, tactic=tactic, peer_store=peer_store)

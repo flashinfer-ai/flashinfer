@@ -48,17 +48,6 @@
 #include "cake_sm110_xqa_kv_cache_list_page128.h"
 
 #include <math_constants.h>
-#define CAKE_SM110_XQA_NEED_MBARRIER_TRY_WAIT
-#define CAKE_SM110_XQA_NEED_MBARRIER_WAIT_HINT
-#define CAKE_SM110_XQA_NEED_MBARRIER_WAIT_TOKEN
-#define CAKE_SM110_XQA_NEED_TCGEN05_MMA_F16
-#define CAKE_SM110_XQA_NEED_INCR_SMEM_DESC_LO
-#define CAKE_SM110_XQA_NEED_ELECT_COMMIT
-#define CAKE_SM110_XQA_NEED_MBARRIER_ARRIVE
-#define CAKE_SM110_XQA_NEED_TMEM_ST_X16_F32
-#define CAKE_SM110_XQA_NEED_APPROX_RCP
-#define CAKE_SM110_XQA_NEED_TCGEN05_COMMIT_CG1_MULTICAST_LEADER
-#define CAKE_SM110_XQA_NEED_TMEM_LD_X16
 #include "cake_sm110_xqa_device_helpers.cuh"
 extern "C" {
 
@@ -1006,8 +995,13 @@ kernel_cake_sm110_xqa_a4f5ce3e09448c9c190a(const __grid_constant__ CUtensorMap Q
                     unsigned int ht = row_begin + r;
                     unsigned int orow = (request_offset + ht / 8) * q_heads + head_1 * 8 + ht % 8;
                     uint32_t _sstage_reg_0[4];
+#if defined(_MSC_VER)
+                    uint64_t _smem_raw_39[2];
+                    asm volatile("{ .reg .b128 b; ld.shared.b128 b, [%2]; mov.b128 {%0, %1}, b; }" : "=l"(_smem_raw_39[0]), "=l"(_smem_raw_39[1]) : "r"(sstage_addr + (r * 132 + lane * 4) * 4));
+#else
                     __int128_t _smem_raw_39;
                     asm volatile("ld.shared.b128 %0, [%1];" : "=q"(_smem_raw_39) : "r"(sstage_addr + (r * 132 + lane * 4) * 4));
+#endif
                     _sstage_reg_0[0] = reinterpret_cast<const uint32_t*>(&_smem_raw_39)[0];
                     _sstage_reg_0[1] = reinterpret_cast<const uint32_t*>(&_smem_raw_39)[1];
                     _sstage_reg_0[2] = reinterpret_cast<const uint32_t*>(&_smem_raw_39)[2];

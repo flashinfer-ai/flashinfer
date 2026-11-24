@@ -11,7 +11,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -82,7 +82,7 @@ kernel_cake_mok_rows_8_32(int* __restrict__ topk_all, int* __restrict__ counts, 
     int* prefix = reinterpret_cast<int*>(smem_static_raw + 0);
     const int prefix_addr = (int)(unsigned long long)__cvta_generic_to_shared(prefix);
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int rank_stride = local_tokens * top_k;
     int first_expert = rank * 32;
     int lane_1 = tid % 32;

@@ -11,7 +11,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -54,7 +54,7 @@ kernel_cake_mok_pad_64(int* __restrict__ counts, int* __restrict__ tokens_per_ex
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int total = 0;
     #pragma unroll 1
     for (int peer = 0; peer < WORLD_SIZE; peer++) {

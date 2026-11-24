@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import collections
 import functools
 import math
+import threading
 from typing import Optional
 
 import torch
@@ -294,6 +296,85 @@ def get_alphamoe_nvfp4_sm100_module():
     return gen_alphamoe_nvfp4_sm100_module().build_and_load()
 
 
+# The aligned entry's FP32 accumulators reused across eager calls, one per
+# (device index, CUDA stream handle), least recently used first. Each holds -0,
+# the FP32 additive identity, whenever no call on its stream is in flight: a
+# call adds every route into it, and its last launch, the drain, writes
+# out = bf16(accumulator + float32(out)) and stores -0 back, so an element no
+# route reaches keeps its BF16 value, including -0 (a NaN stays a NaN, but the
+# add may change its payload). The lock keeps one
+# call's launches together when several host threads share a stream.
+_ALIGNED_ACCUMULATORS: collections.OrderedDict[tuple[int, int], torch.Tensor] = (
+    collections.OrderedDict()
+)
+_ALIGNED_ACCUMULATOR_LOCK = threading.Lock()
+# The largest accumulator kept across calls, in FP32 elements (16 MiB); a
+# larger output takes a -0-filled temporary of the call.
+_ALIGNED_ACCUMULATOR_CACHE_ELEMENTS = 1 << 22
+# The most streams of one device that keep an accumulator, as many as
+# PyTorch's stream pool hands out per priority. A call on another stream
+# releases the least recently used one; the caching allocator reuses a
+# released buffer only for later allocations on its own stream, so the drain
+# still pending there finishes first.
+_ALIGNED_ACCUMULATOR_STREAMS = 32
+# cudaStreamPerThread: one handle names a different stream on each host
+# thread, so it cannot key a buffer shared across calls. A call on it takes a
+# per-call accumulator.
+_CUDA_STREAM_PER_THREAD = 2
+
+
+def _current_stream_capturing(device: torch.device) -> bool:
+    """Whether the current stream of ``device`` is capturing a CUDA graph."""
+    if device.index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
+def _aligned_accumulator(
+    out: torch.Tensor,
+) -> tuple[torch.Tensor, Optional[tuple[int, int]]]:
+    """A -0 FP32 accumulator shaped like ``out`` and its cache key.
+
+    Outside CUDA graph capture, an output of at most
+    ``_ALIGNED_ACCUMULATOR_CACHE_ELEMENTS`` elements on a stream other than
+    the per-thread default stream takes a view of the buffer cached for its
+    device and current stream, which grows (-0-filled on that stream) when a
+    call needs more elements. A device keeps buffers for at most
+    ``_ALIGNED_ACCUMULATOR_STREAMS`` streams and releases the least recently
+    used one. Under capture, on the per-thread default stream, or for a
+    larger output, the accumulator is a -0-filled temporary of the call (key
+    ``None``); under capture its storage belongs to the graph's memory pool
+    and each replay fills it, so no captured graph reads a buffer that eager
+    calls share. PyTorch's caching allocator keys its blocks by stream handle,
+    so it does not isolate concurrent host threads on the per-thread default
+    stream; that holds for every temporary tensor there, not only this one.
+    """
+    numel = out.numel()
+    stream = torch.cuda.current_stream(out.device).cuda_stream
+    if (
+        numel > _ALIGNED_ACCUMULATOR_CACHE_ELEMENTS
+        or stream == _CUDA_STREAM_PER_THREAD
+        or _current_stream_capturing(out.device)
+    ):
+        return (
+            torch.full(out.shape, -0.0, dtype=torch.float32, device=out.device),
+            None,
+        )
+    key = (out.device.index, stream)
+    buffer = _ALIGNED_ACCUMULATORS.get(key)
+    if buffer is None or buffer.numel() < numel:
+        buffer = torch.full((numel,), -0.0, dtype=torch.float32, device=out.device)
+        _ALIGNED_ACCUMULATORS[key] = buffer
+        _ALIGNED_ACCUMULATORS.move_to_end(key)
+        same_device = [held for held in _ALIGNED_ACCUMULATORS if held[0] == key[0]]
+        for stale in same_device[:-_ALIGNED_ACCUMULATOR_STREAMS]:
+            del _ALIGNED_ACCUMULATORS[stale]
+    else:
+        _ALIGNED_ACCUMULATORS.move_to_end(key)
+    return buffer[:numel].view(out.shape), key
+
+
 @torch.library.custom_op(
     "flashinfer::alphamoe_nvfp4_aligned_moe", mutates_args=("out",)
 )
@@ -318,33 +399,62 @@ def _alphamoe_nvfp4_aligned_moe_impl(
     w1_scale_prepared: Optional[torch.Tensor] = None,
     w2_scale_prepared: Optional[torch.Tensor] = None,
 ) -> None:
-    # Seed from the caller's output to preserve additive semantics. This
-    # temporary and both casts use the current stream; during graph capture
-    # its storage belongs to PyTorch's graph memory pool.
-    accumulator = out.to(torch.float32)
-    get_alphamoe_nvfp4_sm100_module().nvfp4_current_aligned_moe_op(
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm2_weights,
-        gemm2_weights_scale,
-        output1_scale_gate_scalar,
-        output1_scale_scalar,
-        output2_scale_scalar,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        topk_weights,
-        out,
-        accumulator,
-        top_k,
-        block_m,
-        routed_scaling_factor,
-        w1_scale_prepared,
-        w2_scale_prepared,
+    # Every route adds into an FP32 accumulator that starts at -0, the
+    # additive identity, and the drain adds the caller's output last: out =
+    # bf16(accumulator + float32(out)), one rounding, which keeps the additive
+    # semantics. The drain then stores -0 back, so a cached accumulator needs
+    # no fill before the next call (_aligned_accumulator). Both launches use
+    # the current stream. An output the drain kernel does not take (not a
+    # contiguous, 16-byte aligned 2D BF16 CUDA tensor of a multiple of eight
+    # elements) keeps the cast and the copy back, and the aligned op reports
+    # why it refuses it.
+    module = get_alphamoe_nvfp4_sm100_module()
+    drained = (
+        out.is_cuda
+        and out.dtype == torch.bfloat16
+        and out.dim() == 2
+        and out.is_contiguous()
+        and out.numel() % 8 == 0
+        and out.data_ptr() % 16 == 0
     )
-    out.copy_(accumulator)
+    with _ALIGNED_ACCUMULATOR_LOCK:
+        if drained:
+            accumulator, key = _aligned_accumulator(out)
+        else:
+            accumulator, key = out.to(torch.float32), None
+        try:
+            module.nvfp4_current_aligned_moe_op(
+                hidden_states,
+                hidden_states_scale,
+                gemm1_weights,
+                gemm1_weights_scale,
+                gemm2_weights,
+                gemm2_weights_scale,
+                output1_scale_gate_scalar,
+                output1_scale_scalar,
+                output2_scale_scalar,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                topk_weights,
+                out,
+                accumulator,
+                top_k,
+                block_m,
+                routed_scaling_factor,
+                w1_scale_prepared,
+                w2_scale_prepared,
+            )
+            if drained:
+                module.nvfp4_drain_accumulator_op(accumulator, out)
+            else:
+                out.copy_(accumulator)
+        except BaseException:
+            # A refused or failed call may leave partial sums: drop the buffer,
+            # so the next call on the stream starts from a fresh -0 fill.
+            if key is not None:
+                _ALIGNED_ACCUMULATORS.pop(key, None)
+            raise
 
 
 @torch.library.register_fake("flashinfer::alphamoe_nvfp4_aligned_moe")
@@ -397,11 +507,29 @@ def alphamoe_nvfp4_aligned_moe(
 ) -> None:
     r"""Run AlphaMoE NVFP4 gate/up, SwiGLU, requantization and down compute.
 
-    This SM100/SM103 operator consumes a pre-aligned routing plan. Contributions
-    accumulate in a temporary FP32 ``[M, K]`` buffer initialized from the
-    caller-owned BF16 ``out`` tensor, then convert back to ``out`` once. It does
-    not run expert selection. The temporary uses ``4 * M * K`` bytes and is
-    compatible with CUDA graph capture.
+    This SM100/SM103 operator consumes a pre-aligned routing plan. It does not
+    run expert selection. Contributions accumulate in an FP32 ``[M, K]``
+    accumulator that starts at negative zero, the additive identity; the last
+    launch adds it to the caller-owned BF16 ``out`` with one rounding,
+    ``out = bf16(accumulator + float32(out))``, and stores negative zero back.
+    An element no route reaches keeps its value, including ``-0``; a NaN stays
+    a NaN, but the add may change its payload.
+
+    Outside CUDA graph capture the accumulator is reused across calls: one
+    buffer per device and stream, sized by the largest output of at most
+    ``2**22`` elements seen there (``4 * M * K`` bytes), and negative zero
+    between calls. A device keeps buffers for its 32 most recently used
+    streams; a call on another stream releases the least recently used one.
+    Calls on one stream use it in stream order; calls on different streams use
+    different buffers. A larger output, or a call on the per-thread default
+    stream (``cudaStreamPerThread``), takes a per-call temporary of
+    ``4 * M * K`` bytes filled with negative zeros. PyTorch's caching
+    allocator keys its blocks by stream handle and does not isolate
+    concurrent host threads on ``cudaStreamPerThread``, as for any tensor
+    allocated there. Under CUDA graph capture every call
+    takes such a temporary from the graph's memory pool, filled by each
+    replay, so a captured graph shares no buffer with eager calls and may be
+    replayed on any stream.
 
     ``hidden_states``, ``gemm1_weights``, and ``gemm2_weights`` store two E2M1
     values per ``uint8`` byte, with the even logical value in the low nibble.
@@ -1465,14 +1593,25 @@ def _token_tile_scratch(device):
     return scratch
 
 
-def _token_tile_down_z(m, top_k):
-    """K-panel slices per output tile for the token-tile down kernel (measured on GB300).
+def _token_tile_down_z(m, top_k, device):
+    """K-panel slices per output tile for the token-tile down kernel.
 
-    z=6 wins only in the 4096-token band (M4096: 128.4 vs 135.7 us); the 1000-,
-    2048- and 8192-token rows are fastest at z=1.
+    The down kernel runs one persistent CTA per SM over ``tiles * z`` items of
+    ``K / 128 / z`` output panels: a larger z shortens the last wave and adds
+    per-item work. z=6 wins in the 4096-token band (M4096 on GB300: 128.4 vs
+    135.7 us). On sm_100 (B200), above 49152 pairs and up to five waves of full
+    128-row tiles (``5 * 128`` pairs per SM) z=3 wins (M8192: 216 vs 232 us);
+    past that the last wave is a small share and z=1 is fastest, as it is at
+    1000 and 2048 tokens. On sm_103 (GB300) the routed tiles of M8192 nearly
+    fill four waves, so z=3 only adds work there and the band keeps z=1.
     """
     pairs = m * top_k
-    return 6 if 16384 < pairs <= 49152 else 1
+    if pairs <= 49152:
+        return 6 if pairs > 16384 else 1
+    props = torch.cuda.get_device_properties(device)
+    if (props.major, props.minor) != (10, 0):
+        return 1
+    return 3 if pairs <= 5 * 128 * props.multi_processor_count else 1
 
 
 def _alphamoe_token_tile_routed(
@@ -1560,7 +1699,7 @@ def _alphamoe_token_tile_routed(
         top_k,
         routed_scaling_factor,
         pairs >= e * _TOKEN_TILE_ROWS,
-        _token_tile_down_z(m, top_k),
+        _token_tile_down_z(m, top_k, device),
         accumulate,
     )
 

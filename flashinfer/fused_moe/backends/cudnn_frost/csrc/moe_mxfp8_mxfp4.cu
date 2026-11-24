@@ -10,6 +10,7 @@
 #include <array>
 #include <limits>
 
+#include "gather.cuh"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Array;
@@ -130,10 +131,12 @@ __global__ void gather(const uint8_t* x, const uint8_t* input_sf, const int32_t*
 
 // Small batches compute stable routing and expert-local scale segments per CTA.
 // No CTA consumes metadata written by another CTA in this launch.
+template <bool GatherInput = false>
 __global__ void route_small(const uint8_t* x, const uint8_t* input_sf, const int32_t* ids,
                             int32_t* offsets, int32_t* sf_offsets, int32_t* mapping,
                             int32_t* row_experts, uint8_t* grouped, uint8_t* sf, float* scale,
-                            int rows, int hidden, int topk, int experts, bool swizzled) {
+                            int rows, int hidden, int topk, int experts, bool swizzled,
+                            int32_t* token_index = nullptr) {
   const int r = blockIdx.x;
   const bool active = r < rows;
   const int raw = active ? ids[r] : 0;
@@ -172,6 +175,7 @@ __global__ void route_small(const uint8_t* x, const uint8_t* input_sf, const int
     if (active) {
       mapping[r] = destination;
       row_experts[destination] = expert;
+      if constexpr (GatherInput) token_index[destination] = valid ? r / topk : -1;
     }
     if (r == 0) {
       offsets[experts] = rows;
@@ -181,7 +185,7 @@ __global__ void route_small(const uint8_t* x, const uint8_t* input_sf, const int
     }
   }
   __syncthreads();
-  if (active) {
+  if (active && !GatherInput) {
     auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 16);
     auto target = reinterpret_cast<int4*>(grouped) + int64_t(destination) * (hidden / 16);
     for (int h = threadIdx.x; h < hidden / 16; h += blockDim.x)
@@ -263,7 +267,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
                                 int64_t intermediate, int64_t experts, int64_t topk, int device,
                                 size_t scratch1, size_t scratch2, bool gated, Array<int64_t> tail1,
                                 Array<int64_t> tail2, bool swap1, bool swap2, bool swizzled,
-                                bool fma)
+                                bool fma, bool gather)
       : fc1_(std::move(fc1)),
         fc2_(std::move(fc2)),
         h_(hidden),
@@ -279,7 +283,8 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
         swap1_(swap1),
         swap2_(swap2),
         swizzled_(swizzled),
-        fma_(fma) {
+        fma_(fma),
+        gather_(gather) {
     quantized_ = fma_ || std::find(tail1_.begin(), tail1_.end(), 3) != tail1_.end();
   }
 
@@ -288,6 +293,11 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
     if (name == "workspace_size")
       return Function::FromTyped(
           [this](int64_t capacity) { return int64_t(layout(capacity).workspace_size); });
+    if (name == "gather_layout")
+      return Function::FromTyped([this](int64_t tokens) {
+        return Array<int64_t>{gather_ ? int64_t(layout(tokens).token_index) : -1,
+                              frost_gather::scale_pitch(h_ / 32)};
+      });
     if (name == "stage_layout")
       return Function::FromTyped([this](int64_t tokens) {
         TVM_FFI_ICHECK(!fma_) << "FMA runners do not materialize grouped stage inputs";
@@ -309,14 +319,14 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
             run(out, x, ids, scores, w1, w2, sf1, sf2, xsf, alpha1, alpha2, workspace, mode);
           });
     }
-    return Function(nullptr);
+    return std::nullopt;
   }
 
  private:
   struct Layout {
     int64_t rows, sf_rows;
     size_t x, mid, qmid, sf1, sf2, counts, offsets, sf_offsets, cursors, mapping, row_experts,
-        scale, scratch, workspace_size;
+        scale, scratch, token_index, workspace_size;
   };
 
   Layout layout(int64_t tokens) const {
@@ -340,7 +350,9 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
     result.x = reserve(fma_ ? 0 : result.rows * h_ * 2);
     result.mid = quantized_ ? 0 : reserve(result.rows * i_ * 2);
     result.qmid = reserve(result.rows * i_);
-    result.sf1 = reserve(fma_ ? 0 : result.sf_rows * h_ / 32);
+    result.sf1 = reserve(
+        fma_ ? 0
+             : (gather_ ? tokens * frost_gather::scale_pitch(h_ / 32) : result.sf_rows * h_ / 32));
     result.sf2 = reserve(result.sf_rows * i_ / 32);
     result.counts = reserve(fma_ ? 0 : e_ * 4);
     result.offsets = reserve(fma_ ? 0 : (e_ + 1) * 4);
@@ -350,19 +362,20 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
     result.row_experts = reserve(fma_ ? 0 : result.rows * 4);
     result.scale = reserve(fma_ ? 0 : 3 * sizeof(float));
     result.scratch = reserve(std::max(scratch1_, scratch2_));
+    result.token_index = reserve(gather_ ? result.rows * sizeof(int32_t) : 0);
     result.workspace_size = pos;
     return result;
   }
 
   Array<int64_t> problem(int64_t rows, int64_t sf_rows, int64_t n, int64_t k, bool swap, bool gated,
-                         bool quantized = false) const {
+                         bool quantized = false, int64_t source_rows = 0) const {
     Array<int64_t> shape;
     shape.reserve(quantized ? (gated ? 20 : 17) : (gated ? 17 : 14));
     for (int64_t value : {swap ? n : rows, swap ? rows : n, k, e_, e_}) shape.push_back(value);
     auto token = [&]() {
       shape.push_back(k);
       shape.push_back(1);
-      shape.push_back(rows * k);
+      shape.push_back((source_rows ? source_rows : rows) * k);
     };
     auto weight = [&]() {
       shape.push_back(k / 2);
@@ -441,7 +454,8 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
       checked(cudaGetLastError());
       return;
     }
-    const auto problem1 = problem(s_, sf_rows_, i_, h_, swap1_, gated_, quantized_);
+    const auto problem1 =
+        problem(s_, sf_rows_, i_, h_, swap1_, gated_, quantized_, gather_ ? t_ : 0);
     const auto problem2 = problem(s_, sf_rows_, h_, i_, swap2_, false);
     auto gx = reinterpret_cast<uint8_t*>(base + positions.x);
     auto mid = reinterpret_cast<__nv_bfloat16*>(base + positions.mid);
@@ -457,9 +471,15 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
     auto row_experts = reinterpret_cast<int32_t*>(base + positions.row_experts);
     auto scale = reinterpret_cast<float*>(base + positions.scale);
     auto scratch = reinterpret_cast<int64_t*>(base + positions.scratch);
+    auto input_index = reinterpret_cast<int32_t*>(base + positions.token_index);
     auto expert_ids = static_cast<int32_t*>(ids.data_ptr());
     if (mode < 2) {
-      if (s_ <= 512 && e_ <= 256) {
+      if (gather_ && s_ <= 512 && e_ <= 256) {
+        route_small<true><<<std::max(s_, e_), 128, 0, stream>>>(
+            static_cast<const uint8_t*>(x.data_ptr()), static_cast<const uint8_t*>(xsf.data_ptr()),
+            expert_ids, offsets, sf_offsets, mapping, row_experts, gx, sfx, scale, s_, h_, k_, e_,
+            swizzled_, input_index);
+      } else if (s_ <= 512 && e_ <= 256) {
         route_small<<<std::max(s_, e_), 128, 0, stream>>>(
             static_cast<const uint8_t*>(x.data_ptr()), static_cast<const uint8_t*>(xsf.data_ptr()),
             expert_ids, offsets, sf_offsets, mapping, row_experts, gx, sfx, scale, s_, h_, k_, e_,
@@ -469,15 +489,27 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
         histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
                                                                                  s_, e_);
         prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, sf_offsets, e_, scale);
-        gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-            static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()), expert_ids,
-            offsets, sf_offsets, cursors, mapping, row_experts, gx, sfx, s_, h_, k_, e_, swizzled_);
+        if (gather_) {
+          frost_gather::indices<<<std::min<int64_t>((s_ + 255) / 256, 4096), 256, 0, stream>>>(
+              expert_ids, cursors, mapping, input_index, row_experts, s_, k_, e_);
+        } else {
+          gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
+              static_cast<uint8_t*>(x.data_ptr()), static_cast<uint8_t*>(xsf.data_ptr()),
+              expert_ids, offsets, sf_offsets, cursors, mapping, row_experts, gx, sfx, s_, h_, k_,
+              e_, swizzled_);
+        }
+      }
+      if (gather_ && (swizzled_ || frost_gather::scale_pitch(h_ / 32) != h_ / 32)) {
+        const int pitch = frost_gather::scale_pitch(h_ / 32);
+        frost_gather::linear_scales<<<std::min<int64_t>((t_ * pitch / 4 + 255) / 256, 4096), 256, 0,
+                                      stream>>>(static_cast<const uint8_t*>(xsf.data_ptr()), sfx,
+                                                t_, h_ / 32, pitch, swizzled_);
       }
       checked(cudaGetLastError());
     }
 
-    int64_t xshape[]{s_, h_, 1}, mshape[]{s_, i_, 1};
-    int64_t xstride[]{h_, 1, s_ * h_}, mstride[]{i_, 1, s_ * i_};
+    int64_t xshape[]{gather_ ? t_ : s_, h_, 1}, mshape[]{s_, i_, 1};
+    int64_t xstride[]{h_, 1, (gather_ ? t_ : s_) * h_}, mstride[]{i_, 1, s_ * i_};
     int64_t w1shape[]{i_, h_ / 2, e_}, w1stride[]{h_ / 2, 1, (gated_ ? 2 : 1) * i_ * h_ / 2};
     int64_t w2shape[]{h_, i_ / 2, e_}, w2stride[]{i_ / 2, 1, h_ * i_ / 2};
     int64_t sf1shape[]{i_ * h_ / 32, 1, e_}, sf1stride[]{1, 1, sf1_expert_bytes};
@@ -490,10 +522,11 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
     int64_t group_shape[]{e_, 1, 1};
     DLTensor alpha_first{alpha1.data_ptr(), device_, 3, dl_float32, group_shape, scalar_stride, 0};
     DLTensor alpha_second{alpha2.data_ptr(), device_, 3, dl_float32, group_shape, scalar_stride, 0};
-    DLTensor tx{gx, device_, 3, dl_float8_e4m3fn, xshape, xstride, 0};
+    DLTensor tx{gather_ ? x.data_ptr() : gx, device_, 3, dl_float8_e4m3fn, xshape, xstride, 0};
     DLTensor tm{mid, device_, 3, dl_bfloat16, mshape, mstride, 0};
     DLTensor tqm{qm, device_, 3, dl_float8_e4m3fn, mshape, mstride, 0};
-    DLTensor ty{gy, device_, 3, dl_bfloat16, xshape, xstride, 0};
+    int64_t yshape[]{s_, h_, 1}, ystride[]{h_, 1, s_ * h_};
+    DLTensor ty{gy, device_, 3, dl_bfloat16, yshape, ystride, 0};
     DLTensor up{w1.data_ptr(), device_, 3, dl_fp4, w1shape, w1stride, 0};
     DLTensor gate = up;
     gate.data = static_cast<uint8_t*>(w1.data_ptr()) + (gated_ ? i_ * h_ / 2 : 0);
@@ -502,7 +535,16 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
     DLTensor sf_gate = sf_up;
     sf_gate.data = static_cast<uint8_t*>(sf1.data_ptr()) + sf1_gate_bytes;
     DLTensor sf_down{sf2.data_ptr(), device_, 3, dl_e8m0, sf2shape, sf2stride, 0};
-    DLTensor sf_x{sfx, device_, 3, dl_e8m0, sfxshape, sfxstride, 0};
+    const int64_t pitch = frost_gather::scale_pitch(h_ / 32);
+    int64_t linear_shape[]{t_, h_ / 32, 1}, linear_stride[]{pitch, 1, t_ * pitch};
+    void* input_sf = swizzled_ || pitch != h_ / 32 ? sfx : xsf.data_ptr();
+    DLTensor sf_x{gather_ ? input_sf : sfx,
+                  device_,
+                  3,
+                  dl_e8m0,
+                  gather_ ? linear_shape : sfxshape,
+                  gather_ ? linear_stride : sfxstride,
+                  0};
     DLTensor sf_mid{sfm, device_, 3, dl_e8m0, sfmshape, sfxstride, 0};
     DLTensor sf_out{sfm, device_, 3, dl_e8m0, sfoutshape, sfoutstride, 0};
     DLTensor first{offsets, device_, 1, dl_int32, eshape, unit, 0};
@@ -537,6 +579,10 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
     args[argc++] = problem1;
     args[argc++] = tensors[0];
     args[argc++] = tensors[1];
+    int64_t index_shape[]{s_};
+    DLTensor index_tensor{input_index, device_, 1, dl_int32, index_shape, unit, 0};
+    TensorView token_indices(&index_tensor);
+    if (gather_) args[argc++] = token_indices;
     for (int j = 0; j < (gated_ ? 3 : 2); ++j) args[argc++] = tensors[j + 2];
     for (int j = 0; j < (gated_ ? 3 : 2); ++j) args[argc++] = tensors[j + 5];
     for (auto slot : tail1_) args[argc++] = tensors[slot + 9];
@@ -593,13 +639,15 @@ class CudnnFrostMxfp8Mxfp4MoeRunner final : public tvm::ffi::ModuleObj {
   size_t scratch1_, scratch2_;
   bool gated_;
   Array<int64_t> tail1_, tail2_;
-  bool swap1_, swap2_, swizzled_, quantized_, fma_;
+  bool swap1_, swap2_, swizzled_, quantized_, fma_, gather_;
 };
 
+template <bool GatherInput>
 Module make_runner(Array<Function> fc1, Array<Function> fc2, int64_t hidden, int64_t intermediate,
                    int64_t experts, int64_t topk, int64_t device, int64_t scratch1,
                    int64_t scratch2, bool gated, Array<int64_t> tail1, Array<int64_t> tail2,
                    bool swap1, bool swap2, bool swizzled, bool fma) {
+  TVM_FFI_ICHECK(!GatherInput || !fma);
   constexpr int64_t max_dim = 1 << 20;
   TVM_FFI_ICHECK(hidden > 0 && hidden <= max_dim && intermediate > 0 && intermediate <= max_dim &&
                  experts > 0 && experts <= 1024 && topk > 0 && topk <= experts);
@@ -630,8 +678,10 @@ Module make_runner(Array<Function> fc1, Array<Function> fc2, int64_t hidden, int
   }
   return Module(tvm::ffi::make_object<CudnnFrostMxfp8Mxfp4MoeRunner>(
       std::move(fc1), std::move(fc2), hidden, intermediate, experts, topk, device, scratch1,
-      scratch2, gated, std::move(tail1), std::move(tail2), swap1, swap2, swizzled, fma));
+      scratch2, gated, std::move(tail1), std::move(tail2), swap1, swap2, swizzled, fma,
+      GatherInput));
 }
 }  // namespace
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_runner, make_runner);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_runner, make_runner<false>);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(make_gather_runner, make_runner<true>);

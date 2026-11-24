@@ -12,6 +12,7 @@ from .gemm_base import ragged_scaled_bmm as ragged_scaled_bmm
 from .gemm_base import mm_fp4 as mm_fp4
 from .gemm_base import mm_fp8 as mm_fp8
 from .gemm_base import mm_mxfp8 as mm_mxfp8
+from .gemm_base import mm_tf32 as mm_tf32
 from .gemm_base import tgv_gemm_sm100 as tgv_gemm_sm100
 from .gemm_base import group_gemm_mxfp4_nt_groupwise as group_gemm_mxfp4_nt_groupwise
 from .gemm_base import (
@@ -31,6 +32,14 @@ from .gemm_base import (
     group_gemm_fp8_nt_groupwise_contiguous as group_gemm_fp8_nt_groupwise_contiguous,
 )
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .gemm_bf16_fp8 import mm_bf16_fp8 as mm_bf16_fp8
+from .gemm_bf16_fp8 import (
+    mm_bf16_fp8_workspace_bytes as mm_bf16_fp8_workspace_bytes,
+)
+from .gemm_bf16_fp8 import mm_fp16_fp8 as mm_fp16_fp8
+from .gemm_bf16_fp8 import (
+    mm_fp16_fp8_workspace_bytes as mm_fp16_fp8_workspace_bytes,
+)
 from .cake_grouped_fp8_gemm import (
     PreparedGroupGemmFp8NtGroupwiseContiguous as PreparedGroupGemmFp8NtGroupwiseContiguous,
 )
@@ -67,6 +76,8 @@ from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
     prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
 )
+from .gemm_bf16_fp4_gather import gemv_bf16_fp4_gather as gemv_bf16_fp4_gather
+from .gemm_mxfp8_mxfp4 import mm_mxfp8_mxfp4 as mm_mxfp8_mxfp4
 
 from .gemm_svdquant import (
     mm_nvfp4_svdquant as mm_nvfp4_svdquant,
@@ -184,6 +195,7 @@ __all__ = (
         "mm_fp4",
         "mm_fp8",
         "mm_mxfp8",
+        "mm_tf32",
         "tgv_gemm_sm100",
         "group_gemm_mxfp4_nt_groupwise",
         "group_gemm_mxfp8_mxfp4_nt_groupwise",
@@ -213,6 +225,8 @@ __all__ = (
         "prepare_nvfp4_lora_adapter",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "gemv_bf16_fp4_gather",
+        "mm_mxfp8_mxfp4",
         "fp8_linear",
         "fp8_linear_swiglu",
         "fp8_qkv_qknorm_rope",
@@ -228,6 +242,10 @@ __all__ = (
         "mm_M1_16_K7168_N896",
         "mm_M1_16_K7168_N896_bf16",
         "tinygemm_bf16",
+        "mm_bf16_fp8",
+        "mm_bf16_fp8_workspace_bytes",
+        "mm_fp16_fp8",
+        "mm_fp16_fp8_workspace_bytes",
     ]
     + _cute_dsl_kernels
     + _cuda_tile_kernels

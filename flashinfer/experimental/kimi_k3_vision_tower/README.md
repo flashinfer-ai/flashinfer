@@ -17,7 +17,7 @@ sequence of generated tcgen05 programs:
 | `patch_embed` | `gemm:pos_sqxw:*` | `x = bf16(pixels[T, 588] @ Wpe^T) + pos_rows` (Conv2d 14x14/14 as a GEMM, bilinear-resized 64x64 positional table + sincos time rows) + handoff `xw = bf16(x * norm0[0])`, `stats = rowsumsq(x)` |
 | `layer_norm_qkv_rope` (x27) | `gemm:norm_qkv_rope:*_cs` | `q, k, v = RoPE2D(bf16((xw @ Wqkv^T) * rstd(x)))`: the RMSNorm weight applied on the activation side by the producer (`xw`), row `rstd` from the FP32 `stats` handoff, original `Wqkv`, interleaved-pair 2-D RoPE in the epilogue from the packed f16x2 `(cos, sin)` table of the plan (`pack_rope_table`; FP32 rotation), head-split outputs |
 | `layer_attention` (x27) | `attention:<layout>[:wide][:split]`, layout = `tiles2` / `tiles1` / `ring3` | packed-varlen noncausal attention per `grid_thw` segment, 12 heads x 128, FP32 softmax, one BF16 rounding; `ring3` = the one-tile layout with the shared-O three-deep score ring (`cake_backend.ring3_selected`: every one-tile row on SM100, 576..10764-token segments on SM103); `:wide` = the wide unit table with the next-unit prefetch on short rows (`unit_prefetch_selected`: T <= 1656 on SM100, T <= 2552 on SM103); `:split` = the KV-split build that writes the tail-round units' K/V parts as FP32 partials (`cake_backend.select_layout_and_split`) |
-| `layer_attention_merge` (x27, split rows only) | `attention_merge` | exact fixed-order merge of the K/V parts of every split unit (`softmax(m, l)` rescale in FP32, one BF16 rounding into `attn_out`); launched right after the attention kernel when the plan has `num_merge_units > 0` |
+| `layer_attention_merge` (x27, split rows only) | `attention_merge` | exact fixed-order merge of the K/V parts of every split unit (`softmax(m, l)` rescale in FP32, one BF16 rounding into `attn_out`); launched right after the attention kernel when the plan has `num_merge_units > 0`, on SM100 only (the SM103 split builds merge the parts in the kernel) |
 | `layer_out_proj` (x27) | `gemm:residual_wo_sqxw:*` | `x += bf16(a @ Wo^T)` + handoff `xw = bf16(x * norm1)`, `stats` |
 | `layer_norm_fc0_gelu` (x27) | `gemm:norm_gelu:*` | `f = bf16(gelu_tanh(bf16((xw @ Wfc0^T) * rstd(x))))`, original `Wfc0` |
 | `layer_fc1` (x26) / `layer_fc1_last` (x1) | `gemm:residual_fc1_sqxw:*` / `gemm:residual_fc1:*` | `x += bf16(f @ Wfc1^T)` + handoff `xw = bf16(x * norm0[l+1])`, `stats`; the last layer runs the plain form (the merge reads `x` directly) |
@@ -32,13 +32,32 @@ host selects per token count (`cake_backend.select_tile_config`, the Cake
 cluster for small `T`, the single-CTA 128x128 eight-warp tile `s_e8_pf` for
 the residual GEMMs while the pair grid underfills the machine (out-proj to
 6144 rows, FC1 to 2304), 256x256 / 256x128 2-CTA pair tiles above (the
-out-proj pair tile is the TMA-epilogue twin `m_tma1`); the residual / pos
+out-proj pair tile is the TMA-epilogue twin `m_tma1` up to 8191 rows and the
+256x256 eight-warp TMA-epilogue tile `l_e8_tma1x` from 8192 rows,
+`cake_backend.WO_PAIR_BANDS`; the FC1 forms take that tile with its half-N
+tail, `l_e8_tma1x_h`, at the token counts of `cake_backend.FC1_TMA_WINDOWS`);
+the residual / pos
 forms run their packed bf16x2-epilogue twins `*_p` / `*_pf` with the
 pre-mainloop residual prefetch, the QKV GEMM its packed-RoPE-table twins
 `*_cs`; the half-N tail twins `*_h` (`cake_backend.HALF_TWIN`,
 `half_tail_split`) run the tiles past the last full persistent round as
 half-width items whenever they fit one half-round with margin, bitwise
-identical per output element to the base tile); the attention unit layout
+identical per output element to the base tile; on the architectures of
+`cake_backend.WEIGHT_PF_LEAD_ARCHES` the PDL_EARLY QKV, FC0 and FC1 forms up
+to 256 rows run the `*_wpl` twin of their tile, which prefetches the weight
+boxes past the first ring fill into L2 before the grid-dependency wait (on
+`cake_backend.QKV_T576_ARCHES`, SM103, the QKV GEMM of a 576-token batch runs
+the same twin of its half-N tile, `s_cs_h_wpl`), and on
+those of `cake_backend.A_BOX_ARCHES` the merger GEMMs up to 64 merged rows run
+the `xs_ab` / `s_ab` twin, which loads a 64-row A box: same launch, same stored
+rows; on `cake_backend.READY_COUNTER_ARCHES` (SM103) a batch inside
+`cake_backend.READY_COUNTER_WINDOWS` (8192 tokens) whose schedule model lets a
+consumer start early (`cake_backend.ready_counter_edges`) runs the encoder's
+GEMM -> GEMM edges (FC1 -> next QKV, out-proj -> FC0, FC0 -> FC1) on the
+ready-counter twins `*_rc*`, which replace the grid-dependency wait of the A
+loads by per 128-row block counters, so a consumer's first items start while
+its producer finishes its last ones: same launch, same stored rows); the
+attention unit layout
 and the automatic tail split are chosen per `grid_thws` batch from the
 split-aware LPT makespans of both layouts
 (`cake_backend.select_layout_and_split`: the `units mod G` cheapest units of
@@ -53,11 +72,12 @@ lists every logical kernel the plan rule can select per architecture (the
 GEMM tile / PDL census, the attention-form census over single segments up to
 70016 tokens and the exported rows, the merge kernels).  The export registers
 the programs its rows launch: the 22 rows of the evaluation contract (the
-acceptance denominator) plus seven export-only *coverage* rows
+acceptance denominator) plus twelve export-only *coverage* rows
 (`COVERAGE_ROW_GRIDS`; validated bitwise against the source tower, not part
 of the acceptance geomean) that reach the keys no contract row exercises
-(half-N twins at token counts outside the rows, the plain two-tile form on
-SM100, the plain / split one-tile forms on SM103) -- so every reachable key is
+(for example half-N twins at token counts outside the rows, the out-proj
+`m_tma1` tile below 8192 rows, the plain two-tile form on SM100, the plain /
+split one-tile forms on SM103) -- so every reachable key is
 registered and `UNCOVERED_KERNEL_KEYS` is empty.  The check stays: a
 `grid_thws` batch whose plan resolves to an unregistered key raises
 `NotImplementedError` naming the missing keys -- it is never served by another
@@ -116,13 +136,17 @@ graph.replay()                                               # new pixel values 
 table, positional rows, the merge table, the attention segment plan, unit
 table and merge table, the tile selection and all workspaces incl. the FP32
 partial workspace of a split plan) and binds the 27 x 5 + 5 launches (27 x 6
-+ 5 on a split plan: the attention merge follows every attention launch);
++ 5 on an SM100 split plan: the attention merge follows every attention
+launch);
 `launch()` performs no
-allocation and no host synchronization. Pass a cached
+allocation and no host synchronization; when it raises between two launches
+(an interrupt or an error on the host), it first enqueues the zeroing of the
+ready counters of a counter-gated plan on the same stream, so the next forward
+starts from clear counters. Pass a cached
 `build_kimi_k3_vision_plan(...)` / `pos_emb_rows(...)` to skip the derivation.
 Per-stage launches for tests and profiling: `runner.stages[name]()`
-(`layer_attention` runs the attention kernel and, on a split plan, its merge;
-`layer_attention_merge` the merge alone).
+(`layer_attention` runs the attention kernel and, on an SM100 split plan, its
+merge; `layer_attention_merge` the merge alone).
 
 Correctness (tests in `tests/experimental/test_cake_kimi_k3_vision_tower.py`):
 every stage against the FP32 oracle of its operator on BF16 inputs at
@@ -133,32 +157,25 @@ allocation in `launch()`. Benchmark against the HF torch chain with the
 FlashInfer ragged BF16 attention route:
 `benchmarks/bench_cake_kimi_k3_vision_tower.py`.
 
-The generated sources under `csrc/cake_kimi_k3_vision_tower/` are Cake exporter
-output; the five attention sources described below and the shared host
-launcher are hand-folded pending exporter support. The export writes one
-kernel source and one host binding per program; the 76 bindings are one
-launcher, `cake_kimi_k3_vision_tower_launcher.cu`, plus the parameterised
-TMA-descriptor encoder `cake_kimi_k3_vision_tower_tma_encode.cuh`, whose text
-is selected by per-program compile definitions (kernel symbol, host-shim
-namespace, argument plan, dynamic shared memory, block and cluster extents,
-`B` TMA box, position-table map). `cake_jit.py` registers the programs in a
-form that is also hand-folded pending exporter support: one `_PROGRAMS` row
-per program (architectures, compile flags, argument plan), one `_LAUNCH` row
-per program (the launch values above; `launch_definitions(name)` composes the
-definitions), the five `ARG_PLANS`, and the `KERNELS` table both architectures
-share plus the per-architecture entries (4 SM103-only keys), expanded into
-`MODULES` / `KERNELS` at import. A program's JIT library is named after a
-content hash of its sources, architecture and compile flags (the launch
-definitions included), so this registry form rebuilds every program once and
-an edited source or launch value never reuses a cached library. One kernel
-source plus the shared launcher is one program, built for every architecture
-it lists (`MODULES[name]["arches"]`) with FlashInfer's exact `sm100a` /
-`sm103a` flag set of the device it runs on.
-The five attention forms both architectures share (`ring3`, `ring3:split`,
-`ring3:wide`, `tiles2`, `tiles2:wide`) are one source each with compile-time
-architecture arms (`#if __CUDA_ARCH__ == 1000`: SM100 text first, then the
-SM103 text, which drains the scores with `tcgen05.ld.red`), so their SM100
-build carries the SM103 kernel symbol; the plain one-tile / two-tile-split
-attention forms exist on SM103 only because the plan rule selects them there
-alone. On a device without a registered program the entry points raise
-`NotImplementedError`.
+The sources under `csrc/` are Cake exporter output (`.clang-format` disables
+formatting there so they stay byte-faithful to the export): one kernel source
+per program under `csrc/cake_kimi_k3_vision_tower/` (`*_kernel.cu`), the
+TVM-FFI launch bindings (`*_binding.cu`, 23 sources shared by the 81
+programs), the shared device header
+`cake_kimi_k3_vision_tower_device_common.cuh`, the device helper headers under
+`csrc/cake_device_helpers/` and `csrc/cake_ffi_checks.h`. `build.json` lists
+one library per program and architecture (its sources with their SHA-256,
+nvcc flags and the architecture's gencode); `cake_build.py` serves a library
+from `aot/` when a builder has compiled it from the manifest and otherwise
+builds it through FlashInfer's JIT from the same sources and flags.
+`cake_jit.py` registers the programs: one `_PROGRAMS` row per program
+(architectures, argument plan, launch values), the `ARG_PLANS`, and the
+`KERNELS` table both architectures share plus the per-architecture entries (4
+SM103-only keys), expanded into `MODULES` / `KERNELS` at import.
+A program built for both architectures whose SM100 and SM103 text differ is
+one source with compile-time architecture arms (`#if __CUDA_ARCH__ == 1000`:
+SM100 text first). The KV-split ring3 attention form is one program per
+architecture (its SM103 build merges the K/V parts in the kernel), and the
+plain one-tile / two-tile-split attention forms exist on SM103 only because
+the plan rule selects them there alone. On a device without a registered
+program the entry points raise `NotImplementedError`.

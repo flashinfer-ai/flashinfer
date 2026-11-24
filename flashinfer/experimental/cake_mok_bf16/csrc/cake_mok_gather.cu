@@ -11,7 +11,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -151,7 +151,7 @@ kernel_cake_mok_gather(int* __restrict__ local_routes, unsigned long long multic
 
     __syncthreads();
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int offset = bid * 512;
     mbarrier_arrive_expect_tx(arrived_addr, 2048);
     cp_async_bulk_gmem2smem(payload_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(local_routes) + ((unsigned long long)offset * (unsigned long long)4)), 2048, arrived_addr);

@@ -192,6 +192,16 @@ def parse_gdn_args(line, parser):
         "the batch).",
     )
     parser.add_argument(
+        "--use_cp",
+        type=str,
+        required=False,
+        default="auto",
+        choices=["auto", "true", "false"],
+        help="Prefill only: the use_cp argument of chunk_gated_delta_rule. "
+        "'auto' (default) lets FlashInfer decide; 'true' forces the "
+        "context-parallel route and 'false' the non-CP kernel.",
+    )
+    parser.add_argument(
         "--update_state",
         action="store_true",
         default=False,
@@ -216,14 +226,24 @@ def parse_gdn_args(line, parser):
         required=False,
         nargs="+",
         default=["flashinfer"],
-        choices=["flashinfer", "triton", "fla", "rubin", "rubin_ugpu"],
-        help="Kernel backends to benchmark. 'triton' is available for "
-        "decode/MTP; 'fla' (flash-linear-attention) for prefill; 'rubin' "
-        "(the Rubin-tuned T=1 kernel, SM107 only) for decode with bfloat16 "
-        "state; 'rubin_ugpu' is 'rubin' with uGPU localization (a "
-        "ugpu_state_pool: each die updates the half of every state in its own "
-        "memory). On decode, "
-        "'flashinfer' is the generic FlashInfer kernel.",
+        choices=[
+            "flashinfer",
+            "cute",
+            "cake_gdn",
+            "triton",
+            "fla",
+            "rubin",
+            "rubin_ugpu",
+        ],
+        help="Kernel backends to benchmark. 'flashinfer' is the public API with "
+        "its default backend='auto' (whatever FlashInfer dispatches to on this "
+        "GPU). Decode only: 'cute' pins the generic CuTe-DSL kernels "
+        "(backend='flashinfer'), 'cake_gdn' pins the Cake GDN kernels "
+        "(backend='cake_gdn'; SM100/SM103/SM107, bfloat16 inputs), 'rubin' the "
+        "Rubin-tuned T=1 bfloat16-state kernel (SM107), 'rubin_ugpu' is 'rubin' "
+        "with uGPU localization (a ugpu_state_pool: each die updates the half of "
+        "every state in its own memory). 'triton' is available for decode/MTP; "
+        "'fla' (flash-linear-attention) for prefill.",
     )
 
     args = parser.parse_args(line)
@@ -303,17 +323,27 @@ def parse_gdn_args(line, parser):
                 "The rubin / rubin_ugpu backends are only available for "
                 "gated_delta_rule_decode with --state_dtype bfloat16"
             )
+        if is_mtp and any(x in args.backends for x in ("cute", "cake_gdn")):
+            raise ValueError(
+                "The cute / cake_gdn backends are only available for "
+                "gated_delta_rule_decode"
+            )
+        if "cake_gdn" in args.backends and args.input_dtype != "bfloat16":
+            raise ValueError("The cake_gdn backend requires --input_dtype bfloat16")
 
     if is_prefill:
-        if any(x in args.backends for x in ("rubin", "rubin_ugpu")):
+        if any(x in args.backends for x in ("cute", "cake_gdn", "rubin", "rubin_ugpu")):
             raise ValueError(
-                "The rubin backend is only available for gated_delta_rule_decode"
+                "The cute / cake_gdn / rubin / rubin_ugpu backends are only "
+                "available for gated_delta_rule_decode"
             )
         if "triton" in args.backends:
             raise ValueError(
                 "The triton backend is only available for decode/MTP routines; "
                 "prefill supports flashinfer and fla"
             )
+    elif args.use_cp != "auto":
+        raise ValueError("--use_cp is only applicable to chunk_gated_delta_rule")
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -591,8 +621,13 @@ def _testGdnDecodeLike(args, seq_len):
         print(f"[VVERBOSE] {state_layout = }, {args.pool_mode = }")
         print(f"[VVERBOSE] {use_qk_l2norm = }, {state_writeback = }")
 
+    # Benchmark backend -> `backend=` of the public decode API. "flashinfer" is the
+    # API default, so this row tracks what FlashInfer dispatches to on this GPU.
+    api_backends = {"flashinfer": "auto", "cute": "flashinfer", "cake_gdn": "cake_gdn"}
+
     def run_backend(backend, state):
-        if backend == "flashinfer":
+        if backend in api_backends:
+            api_backend = api_backends[backend]
             if is_mtp:
                 if use_bf16_state:
                     # BF16 MTP path is reached through the pretranspose API
@@ -630,14 +665,24 @@ def _testGdnDecodeLike(args, seq_len):
                 )[0]
             if state_layout == "nontranspose":
                 return gated_delta_rule_decode(
-                    q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
+                    q,
+                    k,
+                    v,
+                    state,
+                    A_log,
+                    a,
+                    dt_bias,
+                    b,
+                    scale,
+                    output,
+                    use_qk_l2norm,
+                    backend=api_backend,
                 )[0]
             # BF16 state always goes through the pool path with pre-allocated
             # indices: the non-pool API path synthesizes an arange index
             # tensor per call, whose tiny kernel would pollute CUPTI timing.
-            # backend="flashinfer": the generic kernel, also on SM107 where
-            # "auto" would pick the Rubin-tuned one (see the "rubin" backend).
-            if pool_split or use_bf16_state:
+            # Cake GDN serves indexed pools only.
+            if pool_split or use_bf16_state or backend == "cake_gdn":
                 return gated_delta_rule_decode_pretranspose(
                     q,
                     k,
@@ -653,7 +698,7 @@ def _testGdnDecodeLike(args, seq_len):
                     initial_state=state,
                     initial_state_indices=initial_state_indices,
                     output_state_indices=output_state_indices,
-                    backend="flashinfer",
+                    backend=api_backend,
                 )[0]
             return gated_delta_rule_decode_pretranspose(
                 q,
@@ -667,7 +712,7 @@ def _testGdnDecodeLike(args, seq_len):
                 scale,
                 output,
                 use_qk_l2norm,
-                backend="flashinfer",
+                backend=api_backend,
             )[0]
         elif backend == "rubin_ugpu":
             # Rubin kernel with uGPU localization; refcheck passes a fresh copy of
@@ -920,6 +965,7 @@ def testChunkGatedDeltaRule(args):
     num_k_heads = args.num_k_heads
     num_v_heads = args.num_v_heads
     head_size = args.head_size
+    use_cp = {"auto": "auto", "true": True, "false": False}[args.use_cp]
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -1026,6 +1072,8 @@ def testChunkGatedDeltaRule(args):
                 False,  # use_qk_l2norm_in_kernel (k is pre-normalized)
                 output=output,
                 output_state=output_state,
+                use_cp=use_cp,
+                max_seqlen=s_qo if use_cp is True else None,
             )[0]
         elif backend == "fla":
             return fla_gdn(
@@ -1145,6 +1193,7 @@ def testChunkGatedDeltaRule(args):
                 cur_res["num_v_heads"] = num_v_heads
                 cur_res["head_size"] = head_size
                 cur_res["input_dtype"] = str(input_dtype)
+                cur_res["use_cp"] = args.use_cp
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res

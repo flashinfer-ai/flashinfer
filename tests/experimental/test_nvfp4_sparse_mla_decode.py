@@ -44,6 +44,7 @@ select_num_ctas = cuda_backend.select_num_ctas
 PARAMETERS = (
     "q",
     "kv",
+    "kv_nope",
     "indices",
     "out",
     "topk",
@@ -79,7 +80,7 @@ GB200_CAPACITY = {8: 15, 6: 23, 5: 28, 4: 36, 3: 46}
 # Both implementations of the operator; every kernel test runs against each.
 BACKENDS = ("cuda", "cake")
 # Cluster sizes a caller may force per backend, and the ones each rejects: the hand-written kernel serves
-# 3 to 8, the generated program 1 to 6 and 8 (7 is not a variant of the program: rejected, not re-planned).
+# 3 to 8, the generated programs 1 to 6 and 8 (7 is not a variant of the kernel: rejected, not re-planned).
 FORCED_CLUSTER_SIZES = {
     "cuda": (3, 4, 5, 6, 7, 8),
     "cake": cake_backend.CLUSTER_SIZES,
@@ -253,8 +254,8 @@ def test_invalid_configs(topk, num_ctas):
         (15, 8),
         (16, 6),
         (23, 6),
-        (24, 5),
-        (28, 5),
+        (24, 4),
+        (28, 4),
         (29, 4),
         (36, 4),
         (37, 3),
@@ -263,8 +264,10 @@ def test_invalid_configs(topk, num_ctas):
         (200, 2),
     ],
 )
-def test_cake_plan_picks_largest_one_wave_cluster(num_tokens, expected):
-    # Past the one-wave capacity of 3-CTA clusters the program falls back to its smallest split, 2 (several waves).
+def test_cake_plan_picks_the_least_work_per_cta_in_one_wave(num_tokens, expected):
+    # 2048 keys: 8 CTAs own 256 keys (4 half tiles), 6 own 342 (6), 5 own 410 and 4 own 512 (8 each, the fewer CTAs
+    # win the tie), 3 own 683 (12).  Past the one-wave capacity of 3-CTA clusters the plan falls back to its
+    # smallest split, 2 (several waves).
     assert (
         cake_backend.plan_ctas(
             num_tokens=num_tokens, topk=2048, capacity=GB200_CAPACITY
@@ -273,10 +276,30 @@ def test_cake_plan_picks_largest_one_wave_cluster(num_tokens, expected):
     )
 
 
-def test_cake_plan_needs_one_full_stage_per_cta():
-    # 512 keys = 16 stages: every split up to 8 keeps a full stage per CTA, so the one-wave rule alone decides
+@pytest.mark.parametrize(
+    "topk, num_tokens, expected",
+    [
+        (512, 15, 8),  # 64 keys per CTA: one half tile
+        (512, 20, 4),  # 6, 5 and 4 CTAs all own at most one tile: the fewest CTAs
+        (512, 40, 3),
+        (1024, 15, 8),
+        (1024, 20, 6),  # 171 keys (3 half tiles) against 205 or 256 (4)
+        (1024, 25, 4),
+        (1024, 40, 3),
+    ],
+)
+def test_cake_plan_of_the_shorter_top_k(topk, num_tokens, expected):
+    assert (
+        cake_backend.plan_ctas(
+            num_tokens=num_tokens, topk=topk, capacity=GB200_CAPACITY
+        )
+        == expected
+    )
+
+
+def test_cake_plan_gives_every_cta_32_keys():
     assert cake_backend.plan_ctas(num_tokens=1, topk=512, capacity=GB200_CAPACITY) == 8
-    # 64 keys = 2 stages: only the 2-CTA split keeps a full stage per CTA; 32 keys admit no split at all
+    # 64 keys: only the 2-CTA split keeps 32 keys per CTA; 32 keys admit no split at all
     assert cake_backend.plan_ctas(num_tokens=1, topk=64, capacity=GB200_CAPACITY) == 2
     assert cake_backend.plan_ctas(num_tokens=1, topk=32, capacity=GB200_CAPACITY) == 1
 
@@ -287,15 +310,14 @@ B200_CAPACITY = {8: 15, 6: 22, 5: 26, 4: 33, 3: 45, 2: 74}
 @pytest.mark.parametrize(
     "capacity", [GB200_CAPACITY, B200_CAPACITY], ids=["gb300_table", "b200_table"]
 )
-@pytest.mark.parametrize("topk", [64, 128, 512, 1024, 2048])
+@pytest.mark.parametrize("topk", [64, 128, 160, 512, 1000, 1024, 2048])
 def test_cake_plan_never_leaves_a_cta_empty(topk, capacity):
     for num_tokens in range(1, 129):
         num_ctas = cake_backend.plan_ctas(
             num_tokens=num_tokens, topk=topk, capacity=capacity
         )
         assert cake_backend.is_valid_split(topk, num_ctas), (num_tokens, num_ctas)
-    # 512 keys over 5 CTAs round to 128 per CTA and leave the fifth empty: 25 tokens take the 4-CTA split
-    assert cake_backend.plan_ctas(num_tokens=25, topk=512, capacity=capacity) == 4
+        assert num_ctas == 1 or topk // num_ctas >= cake_backend.MIN_PLAN_KEYS
 
 
 @pytest.mark.parametrize(
@@ -303,36 +325,58 @@ def test_cake_plan_never_leaves_a_cta_empty(topk, capacity):
     [
         (2048, 1, 2048),
         (2048, 2, 1024),
-        (2048, 3, 704),
+        (2048, 3, 683),
         (2048, 4, 512),
-        (2048, 5, 416),
-        (2048, 6, 352),
+        (2048, 5, 410),
+        (2048, 6, 342),
         (2048, 8, 256),
-        (1024, 3, 352),
+        (1024, 3, 342),
+        (512, 5, 103),
         (512, 8, 64),
+        (4096, 1, 4096),
     ],
 )
 def test_cake_keys_per_cta(topk, num_ctas, expected):
     assert cake_backend.keys_per_cta(topk, num_ctas) == expected
 
 
-def test_cake_keys_per_cta_fit_the_index_table():
-    assert cake_backend.keys_per_cta(4096, 2) == cake_backend.MAX_KEYS_PER_CTA
-    with pytest.raises(ValueError, match="index table"):
-        cake_backend.keys_per_cta(4096, 1)
+@pytest.mark.parametrize(
+    "keys, max_keys, cost",
+    [
+        (1, 64, 1),
+        (64, 64, 1),
+        (65, 128, 2),
+        (128, 128, 2),
+        (129, 192, 3),
+        (192, 192, 3),
+        (193, 256, 4),
+        (256, 256, 4),
+        (257, 0, 6),
+        (512, 0, 8),
+        (683, 0, 12),
+    ],
+)
+def test_cake_split_bounds_and_cost(keys, max_keys, cost):
+    # The program of a split is the smallest bound that holds its keys, the general one (0) past 256; its work
+    # counts 64-key halves up to 256 keys and whole 128-key tiles beyond.
+    assert (
+        cake_backend.program_max_keys(keys) == loader.program_max_keys(keys) == max_keys
+    )
+    assert cake_backend.split_cost(keys) == cost
 
 
 @pytest.mark.parametrize("num_ctas", cake_backend.CLUSTER_SIZES)
 def test_cake_admits_its_cluster_sizes(num_ctas):
     assert cake_backend.is_valid_split(2048, num_ctas)
     assert cake_backend.is_valid_split(1024, num_ctas)
+    assert cake_backend.is_valid_split(512, num_ctas)
 
 
 @pytest.mark.parametrize(
-    "topk, num_ctas", [(2048, 7), (2048, 0), (2048, 9), (4096, 1), (512, 5), (0, 1)]
+    "topk, num_ctas", [(2048, 7), (2048, 0), (2048, 9), (9, 6), (10, 8), (0, 1)]
 )
 def test_cake_rejects_splits(topk, num_ctas):
-    # 7 is not a variant of the program; 512 keys over 5 CTAs round to 128 per CTA and leave the fifth empty
+    # 7 is not a variant of the kernel; 9 keys over 6 CTAs (2 each) and 10 over 8 leave a CTA without keys
     assert not cake_backend.is_valid_split(topk, num_ctas)
 
 
@@ -349,29 +393,38 @@ def test_host_plan_of_the_records():
     assert loader.arch_for_capability((12, 0)) is None
     assert loader.arch_for_capability((10,)) is None
     assert loader.CLUSTER_SIZES == (1, 2, 3, 4, 5, 6, 8) == cake_backend.CLUSTER_SIZES
-    assert len(loader.MODULES) == len(loader.CLUSTER_SIZES)
+    assert loader.MAX_KEYS == (0, 64, 128, 192, 256) == cake_backend.MAX_KEYS
+    assert len(loader.MODULES) == len(loader.CLUSTER_SIZES) * len(loader.MAX_KEYS)
+    programs = {(c, m) for c in loader.CLUSTER_SIZES for m in loader.MAX_KEYS}
     for arch in loader.ARCHES:
+        assert loader.registered_programs(arch) == programs
         assert loader.registered_clusters(arch) == set(loader.CLUSTER_SIZES)
+    assert loader.registered_programs("sm_120a") == set()
     assert loader.registered_clusters("sm_120a") == set()
     for cluster in loader.CLUSTER_SIZES:
-        name = loader.record_for(cluster)
-        record = loader.MODULES[name]
-        assert record["cluster"] == cluster
-        for arch in loader.ARCHES:
-            assert loader.select_module(arch, cluster) == name
-            assert loader.library_name(name, arch) == f"{name}_{arch}"
-        with pytest.raises(RuntimeError, match="not delivered for sm_120a"):
-            loader.library_name(name, "sm_120a")
-        # The grid: one cluster of ``cluster`` CTAs per token, along the y axis.
-        assert loader.launch_grid(record, num_tokens=12) == (12, cluster, 1)
-        assert loader.launch_grid(record, num_tokens=1) == (1, cluster, 1)
+        for max_keys in loader.MAX_KEYS:
+            name = loader.record_for(cluster, max_keys)
+            record = loader.MODULES[name]
+            assert (record["cluster"], record["max_keys"]) == (cluster, max_keys)
+            # The program of a launch: its cluster size and the bound of its keys per CTA.
+            keys = max_keys or 2048
+            for arch in loader.ARCHES:
+                assert loader.select_module(arch, cluster, keys) == name
+                assert loader.library_name(name, arch) == f"{name}_{arch}"
+            with pytest.raises(RuntimeError, match="not delivered for sm_120a"):
+                loader.library_name(name, "sm_120a")
+            # The grid: one cluster of ``cluster`` CTAs per token, along the y axis.
+            assert loader.launch_grid(record, num_tokens=12) == (12, cluster, 1)
+            assert loader.launch_grid(record, num_tokens=1) == (1, cluster, 1)
     with pytest.raises(RuntimeError, match="delivers 0 programs of cluster size 7"):
-        loader.record_for(7)
+        loader.record_for(7, 0)
+    with pytest.raises(RuntimeError, match="split bound 96"):
+        loader.record_for(4, 96)
     with pytest.raises(NotImplementedError, match="cluster size 7"):
-        loader.select_module("sm_100a", 7)
+        loader.select_module("sm_100a", 7, 256)
     with pytest.raises(NotImplementedError, match="sm_120a"):
-        loader.select_module("sm_120a", 4)
-    record = loader.MODULES[loader.record_for(4)]
+        loader.select_module("sm_120a", 4, 512)
+    record = loader.MODULES[loader.record_for(4, 0)]
     with pytest.raises(ValueError, match="positive token count"):
         loader.launch_grid(record, num_tokens=0)
     with pytest.raises(
@@ -381,11 +434,14 @@ def test_host_plan_of_the_records():
             {"grid_rule": {"kind": "linear"}, "cluster": 4}, num_tokens=1
         )
     # The argument plan: ``main_kwargs`` by logical name, then the grid axes.
-    values = {key: object() for kind, key in record["arg_plan"] if kind != "grid"}
+    logical = record["logical"]
+    values = {
+        logical[key]: object() for kind, key in record["arg_plan"] if kind != "grid"
+    }
     args = loader.launch_args(record, values, (24, 4, 1))
     assert args[-3:] == (24, 4, 1)
     assert args[:-3] == tuple(
-        values[key] for kind, key in record["arg_plan"] if kind != "grid"
+        values[logical[key]] for kind, key in record["arg_plan"] if kind != "grid"
     )
     with pytest.raises(ValueError, match="needs logical argument 'topk'"):
         loader.launch_args(
@@ -410,7 +466,7 @@ def test_registry_records_reference_the_build_manifest():
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     referenced = set()
-    clusters = set()
+    programs = set()
     for name, record in loader.MODULES.items():
         assert record["library"] == record["kernel"] == name
         assert re.fullmatch(r"cake_nvfp4_sparse_mla_decode_[0-9a-f]{20}", name)
@@ -421,24 +477,23 @@ def test_registry_records_reference_the_build_manifest():
             record
         ), name
         assert list(record["arches"]) == list(loader.ARCHES), name
-        cluster = record["cluster"]
-        assert cluster in loader.CLUSTER_SIZES and cluster not in clusters, name
-        clusters.add(cluster)
-        assert record["build"] == {"cluster": cluster}
-        assert record["keys_per_stage"] == cake_backend.STAGE_KEYS
-        assert record["max_keys_per_cta"] == cake_backend.MAX_KEYS_PER_CTA
+        cluster, max_keys = record["cluster"], record["max_keys"]
+        assert cluster in loader.CLUSTER_SIZES and max_keys in loader.MAX_KEYS, name
+        assert (cluster, max_keys) not in programs, name
+        programs.add((cluster, max_keys))
+        assert record["build"] == {"cluster": cluster, "debug": 0, "max_keys": max_keys}
         launch = record["launch"]
         assert launch["cooperative"] is False and launch["use_pdl"] is False
         assert tuple(launch["block"]) == (cake_backend.THREADS, 1, 1)
         assert tuple(launch["cluster"]) == (1, cluster, 1)
-        assert launch["dynamic_smem_bytes"] == (
-            cake_backend.SMEM_BYTES if cluster == 1 else cake_backend.SMEM_BYTES_CLUSTER
-        )
+        assert 0 < launch["dynamic_smem_bytes"] <= 232448, name
         assert record["grid_rule"] == {"kind": "tokens_by_cluster"}
         assert record["workspace_rule"] is None
         parameters = [key for kind, key in record["arg_plan"] if kind != "grid"]
         assert tuple(parameters) == PARAMETERS
-        assert record["logical"] == {key: key for key in parameters}
+        assert record["logical"] == {
+            key: "kv_rows" if key == "kv_nope" else key for key in parameters
+        }
         assert [key for kind, key in record["arg_plan"] if kind == "grid"] == [
             "grid_x",
             "grid_y",
@@ -462,7 +517,7 @@ def test_registry_records_reference_the_build_manifest():
             assert re.fullmatch(r"[0-9a-f]{64}", entry["closure_sha256"])
             assert entry["nvcc_flags"] == ["--use_fast_math"], library
             assert re.fullmatch(r"\d+\.\d+", entry["min_cuda"]), library
-    assert clusters == set(loader.CLUSTER_SIZES)
+    assert programs == {(c, m) for c in loader.CLUSTER_SIZES for m in loader.MAX_KEYS}
     assert referenced == set(libraries)
     assert (package / "csrc" / "cake_ffi_checks.h").is_file()
 
@@ -535,7 +590,48 @@ def test_cake_runner_binds_the_forced_split(kv_cache):
     runner = cake_backend.prepare_nvfp4_sparse_mla_decode(
         q, kv_cache, idx, bmm1_scale=SM_SCALE, num_ctas_per_token=4
     )
-    assert (runner.num_ctas, runner.keys_per_cta, runner.grid) == (4, 512, (6, 4, 1))
+    assert (runner.num_ctas, runner.keys_per_cta, runner.max_keys, runner.grid) == (
+        4,
+        512,
+        0,
+        (6, 4, 1),
+    )
+    out = runner()
+    assert relative_error(out, reference(q, kv_cache, idx, SM_SCALE, 1.0)) < TOLERANCE
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "num_ctas, topk, max_keys",
+    [
+        (1, 64, 64),
+        (1, 128, 128),
+        (1, 160, 192),
+        (1, 256, 256),
+        (1, 512, 0),
+        (2, 96, 64),
+        (2, 384, 192),
+        (3, 512, 192),
+        (5, 1024, 256),
+        (8, 512, 64),
+        (8, 1024, 128),
+        (8, 1536, 192),
+        (8, 2048, 256),
+        (8, 4096, 0),
+    ],
+)
+def test_cake_programs_of_every_split_bound(kv_cache, num_ctas, topk, max_keys):
+    # Each split bound is its own program: a forced split selects the one of its keys per CTA.
+    _require_backend("cake", num_ctas)
+    q = make_query(5, seed=21)
+    idx = make_indices(5, topk, "scattered", seed=22)
+    runner = cake_backend.prepare_nvfp4_sparse_mla_decode(
+        q, kv_cache, idx, bmm1_scale=SM_SCALE, num_ctas_per_token=num_ctas
+    )
+    assert (runner.keys_per_cta, runner.max_keys) == (
+        cake_backend.keys_per_cta(topk, num_ctas),
+        max_keys,
+    )
     out = runner()
     assert relative_error(out, reference(q, kv_cache, idx, SM_SCALE, 1.0)) < TOLERANCE
 

@@ -24,7 +24,7 @@ bugs there. See [Kernel review](#kernel-review).
    present; correct architecture guards; and the code is actually testable.
 4. **Comments & docs.** Flag low-SNR / verbose comments — want concise, explain *why* not
    *what*. Short rationale for a non-obvious hot-path choice is high-SNR and wanted. Keep
-   `CLAUDE.md` / `.claude/skills/` docs in sync when touched.
+   `AGENTS.md` / `.claude/skills/` docs in sync when touched.
 5. **Design deviations.** Flag (don't silently accept or rewrite) coding style that deviates
    from surrounding code. Scale scrutiny by durability: **hard** on perf/kernel-selection
    logic, high-level interfaces, and widely-used ops; **lighter** on disposable model-specific
@@ -36,6 +36,10 @@ bugs there. See [Kernel review](#kernel-review).
    flag perf claims without numbers. The PR title/description normally become the commit
    title/message on (squash) merge and are relied on when bisecting — hold them to that
    standard.
+7. **Triggering CI.** When you start CI on a PR, scope it to the test paths the change
+   touches: `@flashinfer-bot run tests/<dir-or-file> [tests/...]` (public) / `/bot run tests/<dir-or-file> [tests/...]` (internal), whitespace-separated paths
+   under `tests/`. `run all` starts the full suite, which is expensive; it needs a reason
+   (final pre-merge check of a cross-cutting change), not habit.
 
 **Out of scope:** backwards-compatibility / API-breakage auditing — delegated to a GitHub
 pre-merge check that QA puts in and maintains, not code review.
@@ -51,6 +55,26 @@ unsafe shape/alignment assumptions.
   non-idiomatic — flag and ask.
 - **Tests complement, not replace.** A green suite is not a reason to skip reading the kernel;
   unverifiable-by-static-reading code is where tests/benchmarks/fuzzing are the backstop.
+
+## Resource lifetime and performance
+
+Apply these checks when designing or reviewing reuse, caching, or longer-lived
+resources. Examine what stays allocated alongside other work, as well as cleanup.
+
+- **Retained memory.** Measure CPU/GPU memory through compilation, profiling,
+  execution, and cleanup as applicable. Report per-worker and aggregate usage,
+  hardware/software versions, and measurement limitations.
+- **Cache growth.** Bound live resources across realistic key sequences,
+  devices, and concurrent sessions. A per-pool limit does not bound all pools.
+- **Allocation feedback.** Check whether allocations change later sizing or
+  keys. For example, workers reduce available memory; recalculating their count
+  must not accidentally create additional pools. State the sizing/reuse policy.
+- **Changing workloads.** Test mixed batch sizes, changing budgets, nesting,
+  failures, and separate sessions. Check reuse and live-resource bounds as well
+  as eventual cleanup.
+- **Latency and capacity.** Define end-to-end timing boundaries and check
+  headroom beside application allocations such as a vLLM KV cache. State when
+  an API benchmark does not cover full startup or application memory pressure.
 
 ## Effort calibration
 
@@ -74,6 +98,8 @@ criteria (see flashinfer/experimental/README.md). -->
 - [ ] Crash/OOB/overflow/allocation defects
 - [ ] API shape, naming, convention consistency; `include/` stays Torch-free
 - [ ] Tests cover new behavior/edge cases; refcheck for numerics
+- [ ] Resource reuse/lifetime changes cover retained memory, cache growth,
+      allocation feedback, mixed workloads, and application headroom
 - [ ] Comments concise/high-SNR; docs in sync
 - [ ] Style deviations flagged (esp. durable/high-leverage code)
 - [ ] Default PR template kept (not overwritten); perf-optimization PRs report observed

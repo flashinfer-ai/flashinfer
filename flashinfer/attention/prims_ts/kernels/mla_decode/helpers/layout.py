@@ -48,6 +48,10 @@ _TASK_CACHE_WARP_GRP_THREAD_IDX = 1
 _TASK_CACHE_WARP_IDX = 2
 _TASK_CACHE_LANE_IDX = 3
 _TASK_CACHE_SEQ_LEN_KV = 4
+_TASK_CACHE_LOCAL_KV_TILES = 5
+# Keys ``[0, end)`` visible to every query row of the work tile
+# (``cta_visible_kv_end``). Softmax masks only K tiles reaching past it.
+_TASK_CACHE_KV_VISIBLE_END = 6
 
 
 def num_softmax_scale_groups(cfg: MlaConfig) -> int:
@@ -291,6 +295,9 @@ def o_stage_tmem_col_offset(
     v_stage_idx: int,
 ):
     """Return the TMEM column offset for one O pipeline and V head-dim stage."""
+    if getattr(cfg, "ws_pv", False):
+        return o_stage_idx * Int32(256) + Int32((v_stage_idx // 2) * 128)
+
     if cfg.kernel_variant == "keeps_mma_ab" and cfg.head_dim_per_cta_v > 256:
         return (
             o_stage_idx * Int32(2 * cfg.tmem_o_buffer_cols)

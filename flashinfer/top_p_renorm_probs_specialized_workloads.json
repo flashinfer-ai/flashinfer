@@ -1,0 +1,24 @@
+{
+  "note": "Dispatch surface of the specialized top-p renorm kernel (flashinfer._top_p_renorm_specialized, behind flashinfer.sampling.top_p_renorm_probs): exact (batch_size, vocab_size) rows of float32 probabilities with a per-row float32 top_p tensor and is_deterministic=False, on compute capability 10.3. Every other call takes the stock AIR top-p path. The kernel itself is parametric in batch_size and vocab_size (one module, no per-shape compilation); this list only bounds where it is dispatched. Peaked rows whose nucleus lies entirely in entries >= 2^-8 can take the head-entry fast path. Rows whose nucleus extends below that threshold take the radix path.",
+  "fields": ["batch_size", "vocab_size"],
+  "compute_capability": [10, 3],
+  "workloads": [
+    [5, 154880],
+    [6, 154880],
+    [12, 154880],
+    [18, 154880],
+    [24, 154880],
+    [30, 154880],
+    [36, 154880],
+    [54, 154880],
+    [4, 248320],
+    [7, 248320],
+    [12, 248320],
+    [16, 248320],
+    [20, 248320],
+    [24, 248320],
+    [28, 248320],
+    [32, 248320],
+    [68, 248320]
+  ]
+}

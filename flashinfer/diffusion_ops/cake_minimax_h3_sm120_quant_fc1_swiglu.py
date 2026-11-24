@@ -24,7 +24,12 @@ from ..api_logging import flashinfer_api
 from ..jit.cake_minimax_h3_sm120_quant_fc1_swiglu import (
     gen_minimax_h3_sm120_quant_fc1_swiglu_module,
 )
-from ..utils import register_custom_op, register_fake_op, supported_compute_capability
+from ..utils import (
+    register_custom_op,
+    register_fake_op,
+    supported_compute_capability,
+)
+from .cake_minimax_h3_sm120_quant_gate import require_sm120
 
 # MiniMax-H3 video DiT block dimensions served by the generated kernels.
 MINIMAX_H3_HIDDEN = 5376
@@ -89,6 +94,7 @@ def _check_common(
 ) -> Tuple[int, torch.device]:
     rows = _check_rows(x)
     device = x.device
+    require_sm120(device, "FC1+SwiGLU")
     _require("x", x, torch.bfloat16, (rows, MINIMAX_H3_HIDDEN), device)
     _require(
         "x_norm_weight", x_norm_weight, torch.bfloat16, (MINIMAX_H3_HIDDEN,), device

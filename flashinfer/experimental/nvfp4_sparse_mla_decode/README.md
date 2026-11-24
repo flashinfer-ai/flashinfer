@@ -94,8 +94,8 @@ device at once, from `cudaOccupancyMaxActiveClusters`. On GB200 (152 SMs) that i
 5 up to 28, 4 up to 36 and 3 up to 46; on B300 (148 SMs) 8 up to 15, 6 up to 22, 5 up to 26, 4 up to 33 and 3 up to 45.
 
 Nsight Compute on a GB200 with 4-CTA clusters at 35 tokens: L1/shared 69 %, tensor pipe 24 %, DRAM 16 %. Shared-memory
-traffic bounds the kernel, 63 % of its wavefronts the f16 key tile (written once, read by QK and by PV). A tcgen05
-version that keeps keys in tensor memory is the natural successor.
+traffic bounds the kernel, 63 % of its wavefronts the f16 key tile (written once, read by QK and by PV). The tcgen05
+programs of `backend="cake"` (below) keep keys in tensor memory instead.
 
 ## Measurements
 
@@ -137,102 +137,139 @@ slower than this one): 15.6 against 17.0 us at 20 tokens, 17.8 against 17.3 at 2
   build with its debug timestamps removed: 2,160 instructions with identical encodings, 128 registers, no spills. The
   packaged tests have not run on a compute capability 10.0 device yet.
 
-## `backend="cake"` (generated program, experimental)
+## `backend="cake"` (generated tcgen05 programs, experimental)
 
-`flashinfer.mla.nvfp4_sparse_mla_decode(..., backend="cake")` serves the same operator, tensor ABI and `-1`
-semantics with a generated program of the same design family: one thread-block cluster of `C` CTAs per query
-token (grid `(T, C, 1)`, cluster `(1, C, 1)`, 448 threads: 8 math warps, 4 softmax warps, 2 loader warps), CTA
-`c` owning keys `[c * keys_per_cta, (c + 1) * keys_per_cta)` in 32-key stages. `C = 1` writes the normalized
-output directly; a cluster merges its fp32 partials `(O, m, l)` through distributed shared memory, rank `G % C`
-owning 8-dim output group `G`. By design every e2m1 x e4m3 product is formed exactly in f16, S and O accumulate
-in fp32 and P is f16; the acceptance run below confirms the tolerance of the tests.
+`flashinfer.mla.nvfp4_sparse_mla_decode(..., backend="cake")` serves the same operator, tensor ABI and `-1` semantics
+as `backend="cuda"`: e4m3 `[T, 16, 576]` queries, 352-byte `nvfp4_ds_mla` cache rows, int32 `[T, topk]` row ids with
+`-1` an empty slot, and a bf16 `[T, 16, 512]` output. A token whose slots are all empty writes zeros.
 
-- Cluster sizes 1, 2, 3, 4, 5, 6 and 8: one generated program per cluster size, delivered for sm_100a and
-  sm_103a and compiled per architecture (`cake_jit.MODULES`, one record per program).
-  `num_ctas_per_token=7` is rejected (`ValueError`), not re-planned.
-- Plan (`cake_backend.plan_ctas`): the largest of 8, 6, 5, 4, 3, 2 that gives every CTA a full 32-key stage and
-  leaves no CTA without keys (`is_valid_split`; 512 keys skip 5), whose `num_tokens` clusters are co-resident
-  in one wave (`cudaOccupancyMaxActiveClusters` through each program's `max_active_clusters` entry, queried once
-  per device), otherwise the smallest such split in several waves; 1 when no split qualifies.
-  `keys_per_cta = ceil(topk / C)` rounded up to a multiple of 32, at most 2048. A forced split that leaves a CTA
+The backend runs a family of generated kernels on the Blackwell tensor core (tcgen05) and its tensor memory (TMEM).
+One thread-block cluster of `C` CTAs serves one query token: grid `(T, C, 1)`, cluster `(1, C, 1)`, 512 threads
+(16 warps). CTA `c` owns keys `[c * keys_per_cta, (c + 1) * keys_per_cta)`, `keys_per_cta = ceil(topk / C)`, and
+walks them in 128-key tiles. Keys and output dims, not the 16 heads, fill the MMA's M dimension, so no MMA row is
+spent on padding: `S^T[key, head] = K . Q^T` (M = 128 keys, N = 16 heads) and `O^T[dim, head] += V^T . P^T`
+(M = 128 dims per block, N = 16). The 16 warps hold fixed roles:
+
+| count | role |
+|---|---|
+| 2 | issue TMA gather4 loads of the raw rows' e2m1 bytes into a 128-byte-swizzled ring (a `-1` row lands as zeros) |
+| 4 | copy tile 0's raw rows with `cp.async` (a cold gather4 lands about a microsecond later) |
+| 4 | layout, one thread per key: widen the e4m3 RoPE part to f16 in TMEM, lay out the block scale factors |
+| 1 | issue the K dequant and the QK MMAs |
+| 1 | issue the V dequant and the PV MMAs |
+| 4 | softmax: read S^T from TMEM (lane = key), reduce head maxima, write P^T, rescale O^T in TMEM when one grows |
+
+Both NoPE dequants run on the tensor core as block-scaled `kind::mxf4nvf4` products of the rows' raw e2m1 values
+`K_raw` with an e2m1 identity matrix `I`, exact in the fp32 accumulator. `K = K_raw . I`, with the rows' e4m3 block
+scales as scale_A, feeds a `kind::tf32` QK MMA with A = K in TMEM and B = Q^T; `V^T = I . K_raw^T` feeds the
+`kind::tf32` PV MMA. The RoPE part uses a `kind::f16` MMA.
+
+Every e2m1 x e4m3 product is exact in fp32 and the e4m3 query widens exactly. S and O accumulate in fp32 on the
+tensor core, the softmax runs in fp32 (base 2), and P is rounded once to f16, then widened exactly to the tf32 operand.
+
+With `C > 1`, every CTA pushes its fp32 O^T pieces and (m, l) through distributed shared memory (`st.async`) to the
+rank that owns each 8-dim output group, which merges the ranks in rank order; `C = 1` writes the normalized output
+directly. Either way the decode is one kernel with no workspace.
+
+- Programs: one per cluster size (1, 2, 3, 4, 5, 6, 8) and split bound. A launch whose CTAs own at most 64, 128, 192
+  or 256 keys runs the program built for that bound, and any larger split runs the general program: 7 x 5 = 35
+  programs, each delivered for `sm_100a` and `sm_103a` (70 `build.json` entries). A bounded program has a constant
+  tile count, so its loops unroll and no ring stage is reused, and its code, which every launch fetches cold, is a
+  third to a half smaller than the general program's. A half tile skips the second 64-key half of V. Cluster size 7
+  is not a variant: `num_ctas_per_token=7` is rejected with `ValueError`.
+- Plan (`cake_backend.plan_ctas`): the candidates are the sizes among 8, 6, 5, 4, 3, 2 that give every CTA at least
+  32 keys and leave no CTA without keys (`is_valid_split`) and whose `num_tokens` clusters are co-resident in one
+  wave (`cudaOccupancyMaxActiveClusters` through each program's `max_active_clusters` occupancy entry, queried once
+  per device). The plan takes the candidate with the least work per CTA (`split_cost`: 64-key halves of a 128-key
+  tile up to 256 keys per CTA, whole tiles above), then the one with the fewest CTAs. Without a one-wave candidate
+  it takes the smallest valid size in several waves, and 1 when no split qualifies. A forced split that leaves a CTA
   without keys is rejected.
-- Dynamic shared memory 192,256 bytes (`C = 1`) or 226,816 bytes (`C > 1`), the schedule's pool plus its mbarriers: one CTA per SM.
-- `cake_backend.prepare_nvfp4_sparse_mla_decode(...)` returns a runner that launches without allocation (CUDA
-  Graph safe); `cake_backend.generated_program_available(device)` reports whether the program is delivered for
-  the device. The tests and the benchmark skip the arm otherwise.
+- Dynamic shared memory per CTA: 218,880 bytes (`C = 1`) to 220,800 bytes (`C > 1`) for the general program and the
+  192- and 256-key programs; 96,000 bytes (`C = 1`) or 129,152 to 130,688 bytes (`C > 1`) for the 64- and 128-key
+  programs.
+- `cake_backend.prepare_nvfp4_sparse_mla_decode(...)` returns a runner that launches without allocation (CUDA Graph
+  safe); `cake_backend.generated_program_available(device)` reports whether the programs are delivered for the
+  device; the tests and the benchmark skip the arm otherwise.
 
 ### Package layout
 
-The generated backend is a self-contained package beside the hand-written kernel. `cake_jit.py` is the
-registry of the generated program: one `MODULES` record per cluster size carrying the host plan (the
-architectures it is delivered for, its launch record, the argument plan of its `run` entry, the
-`tokens_by_cluster` grid rule, the kernel-parameter to logical-argument map, the planner's stage constants and
-the name of its occupancy entry) and the loader glue (`record_for`, `select_module`, `launch_grid`,
-`launch_args`, `load`). What to compile is recorded once in `build.json`: per program, the kernel, binding and
-occupancy-query units under `csrc/cake_nvfp4_sparse_mla_decode/`, their digests and nvcc flags, one entry per
+`cake_jit.py` is the registry: one `MODULES` record per program carrying the host plan (the architectures it is
+delivered for, its source build keywords, its launch record, the argument plan of its `run` entry, the
+kernel-parameter to logical-argument map, `cluster` and `max_keys`, the `tokens_by_cluster` grid rule, the name of
+its occupancy entry and its workspace rule, `None`) and the loader glue (`program_max_keys`, `record_for`,
+`select_module`, `launch_grid`, `launch_args`, `load`). The kernel reads raw rows through a TMA gather map that the
+binding encodes from the `[rows, 352]` byte pool, passed as the logical argument `kv_rows` beside `kv` (the pool as
+int32 words). `build.json` records per program the kernel, binding and occupancy-query units under
+`csrc/cake_nvfp4_sparse_mla_decode/`, their digests and nvcc flags (`--use_fast_math` on every entry), one entry per
 (program, architecture). `cake_build.py` loads a prebuilt library from `aot/` when a builder compiled one and
-otherwise JIT-builds the manifest entry through FlashInfer from the same sources and flags.
-`scripts/check_cake_build_manifests.py` checks the manifest against the registry and the sources without
-importing the package. The hand-written `backend="cuda"` sources (`csrc/nvfp4_sparse_mla_decode.cu`,
-`.cuh`, `nvfp4_sparse_mla_decode_jit_binding.cu`) stay at the root of `csrc/`, compiled by `jit.py`.
+otherwise JIT-builds the manifest entry from the same sources and flags. `scripts/check_cake_build_manifests.py`
+checks the manifest against the registry and the sources without importing the package. The hand-written
+`backend="cuda"` sources stay at the root of `csrc/`, compiled by `jit.py`.
 
-Cold-L2 microseconds per launch, CUDA kernel (`backend="cuda"`) against the generated program (`backend="cake"`) on the
-same inputs, 16 heads, request-shaped indices (`suffix` rows: short contexts, the tail of every third token empty), eager
-launches timed from CUPTI activity records with the L2 flushed before every launch (100 ms warm-up and 1,000 ms per slot,
-six interleaved slots per arm, pooled median).  B200 (148 SMs): driver 580.82.07; GB300 (152 SMs): driver 580.159.03;
-torch 2.13.0a0 (CUDA 13.3) on both.  Ratio = cake / cuda; `-` marks a wave-boundary row that exists only on the other
-card's planner table.
-Geomean ratio B200 0.853 (39 rows), GB300 0.867 (40 rows); worst 0.930 (B200, the P row T = 5 K = 1024) / 0.933 (GB300, the P row T = 5 K = 1024); every gate row faster on both cards: True.  Relative error against the exact fp32 reference is 1.9e-3 to 3.5e-3 on every row for both backends.
+### Measured against `backend="cuda"`
+
+Microseconds per launch, `backend="cuda"` against `backend="cake"` on the same inputs, 16 heads. P rows cover T from
+5 to 45 at top-k 512, 1024 and 2048 without padding; W rows the wave-boundary token counts of each card's planner
+table at top-k 2048; S rows suffix padding at top-k 2048 (short contexts, the tail of every third token empty).
+
+Each launch is timed as its CUPTI kernel span, as in `flashinfer.testing.bench_gpu_time`, with a cold L2: the
+persisting L2 is reset and a buffer of twice the L2 size is flushed before every launch. Each arm runs 20 warm-up
+and 200 timed launches per group in 8 interleaved groups of alternating arm order; each value is the median over all
+samples. B200 (148 SMs, `sm_100a`): driver 580.82.07; GB300 (152 SMs, `sm_103a`): driver 580.159.03; CUDA 13.4 and
+torch 2.14.1+cu130 on both. Ratio = cake / cuda; `-` marks a wave-boundary row that exists only on the other card's
+planner table. Relative error against the exact fp32 reference is 1.9e-3 to 3.5e-3 on every row for both
+backends.
 
 | row | T | topk | padding | B200 cuda us | B200 cake us | B200 ratio | GB300 cuda us | GB300 cake us | GB300 ratio |
 |---|---|---|---|---|---|---|---|---|---|
-| P | 5 | 2048 | none | 13.34 | 12.26 | 0.918 | 12.70 | 11.55 | 0.909 |
-| P | 10 | 2048 | none | 13.82 | 12.67 | 0.917 | 12.96 | 11.78 | 0.909 |
-| P+W | 15 | 2048 | none | 14.43 | 13.18 | 0.914 | 13.34 | 12.16 | 0.911 |
-| P | 20 | 2048 | none | 17.41 | 15.74 | 0.904 | 16.13 | 14.59 | 0.905 |
-| P | 25 | 2048 | none | 19.78 | 17.73 | 0.896 | 18.11 | 16.29 | 0.899 |
-| P | 30 | 2048 | none | 22.62 | 20.35 | 0.900 | 20.77 | 18.66 | 0.898 |
-| P | 35 | 2048 | none | 28.64 | 24.22 | 0.846 | 20.99 | 18.88 | 0.899 |
-| P | 40 | 2048 | none | 28.99 | 24.54 | 0.847 | 26.66 | 23.55 | 0.884 |
-| P | 45 | 2048 | none | 29.34 | 24.83 | 0.846 | 26.78 | 23.71 | 0.885 |
-| P | 5 | 1024 | none | 9.54 | 8.86 | 0.930 | 9.06 | 8.45 | 0.933 |
-| P | 10 | 1024 | none | 9.98 | 9.22 | 0.923 | 9.38 | 8.67 | 0.925 |
-| P | 15 | 1024 | none | 10.37 | 9.60 | 0.926 | 9.79 | 9.02 | 0.922 |
-| P | 20 | 1024 | none | 12.42 | 11.26 | 0.907 | 11.62 | 10.59 | 0.912 |
-| P | 25 | 1024 | none | 13.82 | 12.32 | 0.891 | 12.77 | 11.42 | 0.895 |
-| P | 30 | 1024 | none | 14.78 | 13.22 | 0.894 | 13.70 | 12.26 | 0.895 |
-| P | 35 | 1024 | none | 17.70 | 15.10 | 0.854 | 13.89 | 12.45 | 0.896 |
-| P | 40 | 1024 | none | 18.02 | 15.36 | 0.853 | 16.64 | 14.72 | 0.885 |
-| P | 45 | 1024 | none | 18.21 | 15.52 | 0.852 | 16.80 | 14.85 | 0.884 |
-| P | 5 | 512 | none | 9.60 | 7.20 | 0.750 | 9.06 | 6.88 | 0.760 |
-| P | 10 | 512 | none | 9.79 | 7.52 | 0.768 | 9.31 | 7.04 | 0.756 |
-| P | 15 | 512 | none | 10.11 | 7.74 | 0.766 | 9.50 | 7.33 | 0.771 |
-| P | 20 | 512 | none | 10.34 | 8.58 | 0.830 | 9.79 | 8.16 | 0.833 |
-| P | 25 | 512 | none | 10.69 | 9.41 | 0.880 | 10.02 | 8.90 | 0.888 |
-| P | 30 | 512 | none | 10.75 | 9.63 | 0.896 | 10.11 | 9.12 | 0.902 |
-| P | 35 | 512 | none | 12.74 | 10.91 | 0.857 | 10.30 | 9.25 | 0.898 |
-| P | 40 | 512 | none | 13.02 | 11.10 | 0.853 | 12.16 | 10.72 | 0.882 |
-| P | 45 | 512 | none | 13.18 | 11.23 | 0.852 | 12.29 | 10.85 | 0.883 |
-| W | 16 | 2048 | none | 17.15 | 15.39 | 0.897 | 15.94 | 14.40 | 0.904 |
-| W | 22 | 2048 | none | 17.73 | 16.00 | 0.903 | - | - | - |
-| W | 23 | 2048 | none | 19.55 | 17.57 | 0.899 | 16.32 | 14.82 | 0.908 |
-| W | 24 | 2048 | none | - | - | - | 18.08 | 16.26 | 0.899 |
-| W | 26 | 2048 | none | 19.94 | 17.89 | 0.897 | - | - | - |
-| W | 27 | 2048 | none | 22.30 | 20.10 | 0.901 | - | - | - |
-| W | 28 | 2048 | none | - | - | - | 18.30 | 16.48 | 0.900 |
-| W | 29 | 2048 | none | - | - | - | 20.70 | 18.66 | 0.901 |
-| W | 33 | 2048 | none | 22.97 | 20.67 | 0.900 | - | - | - |
-| W | 34 | 2048 | none | 28.61 | 24.19 | 0.846 | - | - | - |
-| W | 36 | 2048 | none | - | - | - | 20.99 | 18.91 | 0.901 |
-| W | 37 | 2048 | none | - | - | - | 26.56 | 23.46 | 0.883 |
-| W | 46 | 2048 | none | 54.24 | 32.35 | 0.596 | 26.85 | 23.74 | 0.884 |
-| W | 47 | 2048 | none | - | - | - | 50.53 | 31.17 | 0.617 |
-| W | 64 | 2048 | none | 55.39 | 33.02 | 0.596 | 51.42 | 31.62 | 0.615 |
-| W | 128 | 2048 | none | 83.36 | 64.29 | 0.771 | 77.06 | 61.70 | 0.801 |
-| S | 20 | 2048 | suffix | 17.38 | 15.74 | 0.906 | 16.10 | 14.59 | 0.907 |
-| S | 45 | 2048 | suffix | 29.38 | 24.80 | 0.844 | 26.98 | 23.68 | 0.878 |
+| P | 5 | 2048 | none | 13.41 | 10.08 | 0.752 | 12.67 | 9.57 | 0.755 |
+| P | 10 | 2048 | none | 13.79 | 10.43 | 0.756 | 12.93 | 9.86 | 0.762 |
+| P | 15 | 2048 | none | 14.30 | 10.98 | 0.767 | 13.38 | 10.18 | 0.761 |
+| P | 20 | 2048 | none | 17.25 | 13.98 | 0.811 | 16.10 | 12.99 | 0.807 |
+| P | 25 | 2048 | none | 19.49 | 15.94 | 0.818 | 18.11 | 14.88 | 0.822 |
+| P | 30 | 2048 | none | 22.27 | 16.32 | 0.733 | 20.71 | 15.10 | 0.729 |
+| P | 35 | 2048 | none | 28.29 | 20.32 | 0.718 | 20.90 | 15.33 | 0.734 |
+| P | 40 | 2048 | none | 28.61 | 20.64 | 0.721 | 26.50 | 18.88 | 0.713 |
+| P | 45 | 2048 | none | 28.80 | 20.90 | 0.726 | 26.66 | 19.01 | 0.713 |
+| P | 5 | 1024 | none | 9.70 | 7.68 | 0.792 | 9.22 | 7.36 | 0.799 |
+| P | 10 | 1024 | none | 10.05 | 8.10 | 0.806 | 9.50 | 7.68 | 0.808 |
+| P | 15 | 1024 | none | 10.43 | 8.51 | 0.816 | 9.82 | 8.00 | 0.814 |
+| P | 20 | 1024 | none | 12.42 | 10.43 | 0.840 | 11.65 | 9.76 | 0.838 |
+| P | 25 | 1024 | none | 13.57 | 11.33 | 0.835 | 12.77 | 10.72 | 0.840 |
+| P | 30 | 1024 | none | 14.62 | 11.68 | 0.799 | 13.66 | 10.94 | 0.801 |
+| P | 35 | 1024 | none | 17.57 | 14.50 | 0.825 | 13.92 | 11.20 | 0.805 |
+| P | 40 | 1024 | none | 17.73 | 14.66 | 0.827 | 16.54 | 13.73 | 0.830 |
+| P | 45 | 1024 | none | 17.95 | 14.91 | 0.831 | 16.70 | 13.86 | 0.830 |
+| P | 5 | 512 | none | 9.60 | 6.85 | 0.713 | 9.18 | 6.53 | 0.711 |
+| P | 10 | 512 | none | 9.89 | 7.20 | 0.728 | 9.41 | 6.78 | 0.721 |
+| P | 15 | 512 | none | 10.08 | 7.52 | 0.746 | 9.54 | 7.10 | 0.745 |
+| P | 20 | 512 | none | 10.40 | 8.38 | 0.806 | 9.86 | 7.97 | 0.808 |
+| P | 25 | 512 | none | 10.62 | 8.54 | 0.804 | 10.05 | 8.13 | 0.809 |
+| P | 30 | 512 | none | 10.78 | 8.90 | 0.825 | 10.18 | 8.45 | 0.830 |
+| P | 35 | 512 | none | 12.77 | 10.59 | 0.829 | 10.30 | 8.45 | 0.820 |
+| P | 40 | 512 | none | 12.86 | 10.88 | 0.846 | 12.10 | 10.08 | 0.833 |
+| P | 45 | 512 | none | 13.09 | 11.04 | 0.844 | 12.32 | 10.34 | 0.839 |
+| W | 16 | 2048 | none | 16.99 | 13.89 | 0.817 | 15.90 | 13.06 | 0.821 |
+| W | 22 | 2048 | none | 17.44 | 14.40 | 0.826 | - | - | - |
+| W | 23 | 2048 | none | 19.36 | 16.03 | 0.828 | 16.29 | 13.28 | 0.815 |
+| W | 24 | 2048 | none | - | - | - | 18.08 | 14.94 | 0.827 |
+| W | 26 | 2048 | none | 19.62 | 16.22 | 0.827 | - | - | - |
+| W | 27 | 2048 | none | 22.14 | 16.32 | 0.737 | - | - | - |
+| W | 28 | 2048 | none | - | - | - | 18.24 | 15.14 | 0.830 |
+| W | 29 | 2048 | none | - | - | - | 20.67 | 15.14 | 0.732 |
+| W | 33 | 2048 | none | 22.53 | 16.54 | 0.734 | - | - | - |
+| W | 34 | 2048 | none | 28.22 | 20.26 | 0.718 | - | - | - |
+| W | 36 | 2048 | none | - | - | - | 20.99 | 15.46 | 0.736 |
+| W | 37 | 2048 | none | - | - | - | 26.40 | 18.78 | 0.711 |
+| W | 46 | 2048 | none | 54.34 | 24.61 | 0.453 | 26.69 | 19.10 | 0.716 |
+| W | 47 | 2048 | none | - | - | - | 50.43 | 22.85 | 0.453 |
+| W | 64 | 2048 | none | 54.88 | 25.41 | 0.463 | 51.20 | 23.26 | 0.454 |
+| W | 128 | 2048 | none | 82.50 | 48.80 | 0.592 | 76.61 | 44.77 | 0.584 |
+| S | 20 | 2048 | suffix | 17.09 | 14.05 | 0.822 | 16.03 | 13.12 | 0.818 |
+| S | 45 | 2048 | suffix | 28.77 | 20.74 | 0.721 | 26.82 | 18.94 | 0.706 |
 
-rows: union 45 (B200 39, GB300 40); worst ratio B200 0.930, GB300 0.933; geomean ratio B200 0.853, GB300 0.867
+Geomean ratio B200 0.759 (39 rows), GB300 0.756 (40 rows); largest ratio 0.846 (B200, the P row T = 40 topk = 512)
+/ 0.840 (GB300, the P row T = 25 topk = 1024); `backend="cake"` is faster on every row of both cards: True.
 
 Tracking: flashinfer-ai/flashinfer#5716 (DSA NVFP4 sparse MLA decode), tracker #4254.
 
@@ -241,4 +278,5 @@ Tracking: flashinfer-ai/flashinfer#5716 (DSA NVFP4 sparse MLA decode), tracker #
 1. Run the tests and the benchmark on B200/GB200 in CI.
 2. vLLM: let the FlashInfer sparse-MLA backend accept `nvfp4_ds_mla` and call this API. The vLLM PR that does both is
    [vllm-project/vllm#59342](https://github.com/vllm-project/vllm/pull/59342).
-3. Replace the `mma.sync` pipeline with tcgen05 once it is faster at the same shapes.
+3. The tcgen05 programs (`backend="cake"`) are faster than the `mma.sync` kernel at every measured shape on B200 and
+   GB300; the next step is to make `backend="cake"` the default once CI runs it.

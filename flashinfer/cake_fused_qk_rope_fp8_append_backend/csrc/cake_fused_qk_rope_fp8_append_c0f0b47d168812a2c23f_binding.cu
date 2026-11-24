@@ -37,6 +37,17 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CheckedAdd(int64_t a, int64_t b) {
+  int64_t sum;
+  if (__builtin_add_overflow(a, b, &sum)) NoInt64(a, "+", b);
+  return sum;
+}
+
 void Run(TensorView a_qkv, TensorView a_cos_sin, TensorView a_seq_lens, TensorView a_q_indptr, TensorView a_page_indices, TensorView a_q_norm_weight, TensorView a_k_norm_weight, TensorView a_k_scale, TensorView a_v_scale, TensorView a_q_scale_inv, TensorView a_out_q, TensorView a_key_cache, TensorView a_value_cache, TensorView a_out_k, TensorView a_out_v, TensorView a_q_scale, TensorView a_split_k_flag, int64_t a_num_rows, int64_t a_num_requests, int64_t a_num_q_heads, int64_t a_num_kv_heads, int64_t a_page_size, int64_t a_max_pages_per_request, int64_t a_max_seqlen, int64_t a_max_seqlen_aligned, int64_t a_quant_policy, int64_t a_norm_policy, bool a_is_prefill, bool a_has_out_kv, double a_upper_max, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_qkv.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
@@ -137,7 +148,7 @@ void Run(TensorView a_qkv, TensorView a_cos_sin, TensorView a_seq_lens, TensorVi
   check_same_device(a_q_scale, a_qkv, "q_scale", "qkv");
   check_contiguous(a_split_k_flag, "split_k_flag");
   check_same_device(a_split_k_flag, a_qkv, "split_k_flag", "qkv");
-  TVM_FFI_CHECK(((a_num_rows + a_num_requests) <= 65535), ValueError)
+  TVM_FFI_CHECK((CheckedAdd(a_num_rows, a_num_requests) <= 65535LL), ValueError)
       << KERNEL_NAME << ": requires ((num_rows + num_requests) <= 65535)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

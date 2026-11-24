@@ -13,6 +13,9 @@
 // limitations under the License.
 
 // clang-format off
+#ifndef CAKE_GDN_STATE_VEC_ALIGNED
+#define CAKE_GDN_STATE_VEC_ALIGNED 0
+#endif
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_gdn_device_common.cuh"
 
@@ -107,11 +110,22 @@
 #error "USE_STATE_INDICES is a downstream specialization of this program; define it on the compile line"
 #endif
 #define LAUNCH_MIN_BLOCKS 1
+#ifndef CAKE_GDN_METADATA_I64
+#define CAKE_GDN_METADATA_I64 0
+#endif
+#if CAKE_GDN_METADATA_I64
+#define CAKE_GDN_METADATA_I64_PARAM , int metadata_i64_mask
+#else
+#define CAKE_GDN_METADATA_I64_PARAM
+#endif
+#ifndef CAKE_GDN_KERNEL_SYMBOL
+#define CAKE_GDN_KERNEL_SYMBOL kernel_cake_gdn_aca17b009dc4ed830f7c
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
-kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, float* __restrict__ initial_state, float* __restrict__ output_state, float* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles)
+CAKE_GDN_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap O, float* __restrict__ gate, float* __restrict__ beta, int* __restrict__ cu_seqlens, int* __restrict__ state_indices, float* __restrict__ initial_state, float* __restrict__ output_state, float* __restrict__ checkpoint_state, int* __restrict__ cu_checkpoints, uint8_t* __restrict__ tensormap_workspace, long long initial_state_stride_slot, long long output_state_stride_slot, int checkpoint_every_n_tokens, float scale, int num_seqs, int total_tokens, int num_q_heads, int num_v_heads, int total_tiles CAKE_GDN_METADATA_I64_PARAM)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -365,8 +379,13 @@ kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx = ((NUM_O_HEADS_LOG2 >= 0) ? tile & (unsigned int)(num_o_heads - 1) : tile % (unsigned int)num_o_heads);
                 int qk_head_idx = ((IS_GQA != 0) ? head_idx : ((HEAD_GROUP_LOG2 >= 0) ? head_idx >> HEAD_GROUP_LOG2 : head_idx / (num_v_heads / num_q_heads)));
                 int v_head_idx = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx >> HEAD_GROUP_LOG2 : head_idx / (num_q_heads / num_v_heads)) : head_idx);
+#if CAKE_GDN_METADATA_I64
+                int raw_batch_start = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx] : cu_seqlens[batch_idx]);
+                int raw_batch_end = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx + 1)] : cu_seqlens[batch_idx + 1]);
+#else
                 int raw_batch_start = cu_seqlens[batch_idx];
                 int raw_batch_end = cu_seqlens[batch_idx + 1];
+#endif
                 int batch_start_floor = ((raw_batch_start > 0) ? raw_batch_start : 0);
                 int batch_start = ((batch_start_floor < total_tokens) ? batch_start_floor : total_tokens);
                 int batch_end_floor = ((raw_batch_end > batch_start) ? raw_batch_end : batch_start);
@@ -1343,8 +1362,13 @@ kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_1 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_1 & (unsigned int)(num_o_heads_1 - 1) : tile_1 % (unsigned int)num_o_heads_1);
                 int qk_head_idx_1 = ((IS_GQA != 0) ? head_idx_1 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_1 >> HEAD_GROUP_LOG2 : head_idx_1 / (num_v_heads / num_q_heads)));
                 int v_head_idx_1 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_1 >> HEAD_GROUP_LOG2 : head_idx_1 / (num_q_heads / num_v_heads)) : head_idx_1);
+#if CAKE_GDN_METADATA_I64
+                int raw_batch_start_1 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_1] : cu_seqlens[batch_idx_1]);
+                int raw_batch_end_1 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_1 + 1)] : cu_seqlens[batch_idx_1 + 1]);
+#else
                 int raw_batch_start_1 = cu_seqlens[batch_idx_1];
                 int raw_batch_end_1 = cu_seqlens[batch_idx_1 + 1];
+#endif
                 int batch_start_floor_1 = ((raw_batch_start_1 > 0) ? raw_batch_start_1 : 0);
                 int batch_start_1 = ((batch_start_floor_1 < total_tokens) ? batch_start_floor_1 : total_tokens);
                 int batch_end_floor_1 = ((raw_batch_end_1 > batch_start_1) ? raw_batch_end_1 : batch_start_1);
@@ -2019,6 +2043,9 @@ kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, cons
                     if (o_cg1_stage == 2) { o_cg1_stage = 0; o_cg1_phase ^= 1; }
                 }
                 if ((STORE_FINAL_STATE != 0 || ENABLE_CHECKPOINTS != 0) && num_chunks_b_1 > 0) {
+                    #if !CAKE_GDN_STATE_VEC_ALIGNED
+                    bool final_vec_ok = (STORE_FINAL_STATE == 0 || ((unsigned long long)output_state + (unsigned long long)output_state_head_base_cg1 * 4ull & 15ull) == 0ull);
+                    #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                     mbarrier_wait(kv_acc_full_addr, _phase_kv_acc_full_0);
                     _phase_kv_acc_full_0 ^= 1;
                     int warp_in_wg_3 = warp % 4;
@@ -2036,6 +2063,7 @@ kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, cons
                             : "=f"(_tmem_load_34[0]), "=f"(_tmem_load_34[1]), "=f"(_tmem_load_34[2]), "=f"(_tmem_load_34[3]), "=f"(_tmem_load_34[4]), "=f"(_tmem_load_34[5]), "=f"(_tmem_load_34[6]), "=f"(_tmem_load_34[7]), "=f"(_tmem_load_34[8]), "=f"(_tmem_load_34[9]), "=f"(_tmem_load_34[10]), "=f"(_tmem_load_34[11]), "=f"(_tmem_load_34[12]), "=f"(_tmem_load_34[13]), "=f"(_tmem_load_34[14]), "=f"(_tmem_load_34[15]), "=f"(_tmem_load_34[16]), "=f"(_tmem_load_34[17]), "=f"(_tmem_load_34[18]), "=f"(_tmem_load_34[19]), "=f"(_tmem_load_34[20]), "=f"(_tmem_load_34[21]), "=f"(_tmem_load_34[22]), "=f"(_tmem_load_34[23]), "=f"(_tmem_load_34[24]), "=f"(_tmem_load_34[25]), "=f"(_tmem_load_34[26]), "=f"(_tmem_load_34[27]), "=f"(_tmem_load_34[28]), "=f"(_tmem_load_34[29]), "=f"(_tmem_load_34[30]), "=f"(_tmem_load_34[31])
                             : "r"(final_state_addr_cg1));
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                        #if CAKE_GDN_STATE_VEC_ALIGNED
                         #pragma unroll
                         for (int state_vec_idx_cg1 = 0; state_vec_idx_cg1 < 8; state_vec_idx_cg1++) {
                             {
@@ -2047,6 +2075,34 @@ kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, cons
                                 }
                             }
                         }
+                        #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                        if (__builtin_expect(final_vec_ok, 1)) {
+                            #pragma unroll
+                            for (int state_vec_idx_cg1 = 0; state_vec_idx_cg1 < 8; state_vec_idx_cg1++) {
+                                {
+                                    long long final_state_vec_index_cg1 = state_base_idx_cg1 + (long long)(state_col_block_cg1 * 32) + (long long)(state_vec_idx_cg1 * 4);
+                                    {
+                                        asm volatile(
+                                            "st.global.L1::no_allocate.v4.f32 [%0], {%1, %2, %3, %4};"
+                                            :: "l"((output_state + final_state_vec_index_cg1) + 0), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 0]), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 1]), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 2]), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 3]) : "memory");
+                                    }
+                                }
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int state_vec_idx_cg1 = 0; state_vec_idx_cg1 < 8; state_vec_idx_cg1++) {
+                                {
+                                    long long final_state_vec_index_cg1 = state_base_idx_cg1 + (long long)(state_col_block_cg1 * 32) + (long long)(state_vec_idx_cg1 * 4);
+                                    {
+                                        *(reinterpret_cast<float*>(output_state + (final_state_vec_index_cg1)) + (0)) = _tmem_load_34[state_vec_idx_cg1 * 4 + 0];
+                                        *(reinterpret_cast<float*>(output_state + (final_state_vec_index_cg1 + 1ll)) + (0)) = _tmem_load_34[state_vec_idx_cg1 * 4 + 1];
+                                        *(reinterpret_cast<float*>(output_state + (final_state_vec_index_cg1 + 2ll)) + (0)) = _tmem_load_34[state_vec_idx_cg1 * 4 + 2];
+                                        *(reinterpret_cast<float*>(output_state + (final_state_vec_index_cg1 + 3ll)) + (0)) = _tmem_load_34[state_vec_idx_cg1 * 4 + 3];
+                                    }
+                                }
+                            }
+                        }
+                        #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                     }
                     mbarrier_arrive(kv_acc_empty_addr);
                 }
@@ -2095,8 +2151,13 @@ kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_2 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_2 & (unsigned int)(num_o_heads_2 - 1) : tile_2 % (unsigned int)num_o_heads_2);
                 int qk_head_idx_2 = ((IS_GQA != 0) ? head_idx_2 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2 >> HEAD_GROUP_LOG2 : head_idx_2 / (num_v_heads / num_q_heads)));
                 int v_head_idx_2 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_2 >> HEAD_GROUP_LOG2 : head_idx_2 / (num_q_heads / num_v_heads)) : head_idx_2);
+#if CAKE_GDN_METADATA_I64
+                int raw_batch_start_2 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_2] : cu_seqlens[batch_idx_2]);
+                int raw_batch_end_2 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_2 + 1)] : cu_seqlens[batch_idx_2 + 1]);
+#else
                 int raw_batch_start_2 = cu_seqlens[batch_idx_2];
                 int raw_batch_end_2 = cu_seqlens[batch_idx_2 + 1];
+#endif
                 int batch_start_floor_2 = ((raw_batch_start_2 > 0) ? raw_batch_start_2 : 0);
                 int batch_start_2 = ((batch_start_floor_2 < total_tokens) ? batch_start_floor_2 : total_tokens);
                 int batch_end_floor_2 = ((raw_batch_end_2 > batch_start_2) ? raw_batch_end_2 : batch_start_2);
@@ -2359,8 +2420,13 @@ kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_3 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_3 & (unsigned int)(num_o_heads_3 - 1) : tile_3 % (unsigned int)num_o_heads_3);
                 int qk_head_idx_3 = ((IS_GQA != 0) ? head_idx_3 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_3 >> HEAD_GROUP_LOG2 : head_idx_3 / (num_v_heads / num_q_heads)));
                 int v_head_idx_3 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_3 >> HEAD_GROUP_LOG2 : head_idx_3 / (num_q_heads / num_v_heads)) : head_idx_3);
+#if CAKE_GDN_METADATA_I64
+                int raw_batch_start_3 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_3] : cu_seqlens[batch_idx_3]);
+                int raw_batch_end_3 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_3 + 1)] : cu_seqlens[batch_idx_3 + 1]);
+#else
                 int raw_batch_start_3 = cu_seqlens[batch_idx_3];
                 int raw_batch_end_3 = cu_seqlens[batch_idx_3 + 1];
+#endif
                 int batch_start_floor_3 = ((raw_batch_start_3 > 0) ? raw_batch_start_3 : 0);
                 int batch_start_3 = ((batch_start_floor_3 < total_tokens) ? batch_start_floor_3 : total_tokens);
                 int batch_end_floor_3 = ((raw_batch_end_3 > batch_start_3) ? raw_batch_end_3 : batch_start_3);
@@ -2460,8 +2526,13 @@ kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_4 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_4 & (unsigned int)(num_o_heads_4 - 1) : tile_4 % (unsigned int)num_o_heads_4);
                 int qk_head_idx_4 = ((IS_GQA != 0) ? head_idx_4 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_4 >> HEAD_GROUP_LOG2 : head_idx_4 / (num_v_heads / num_q_heads)));
                 int v_head_idx_4 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_4 >> HEAD_GROUP_LOG2 : head_idx_4 / (num_q_heads / num_v_heads)) : head_idx_4);
+#if CAKE_GDN_METADATA_I64
+                int raw_batch_start_4 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_4] : cu_seqlens[batch_idx_4]);
+                int raw_batch_end_4 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_4 + 1)] : cu_seqlens[batch_idx_4 + 1]);
+#else
                 int raw_batch_start_4 = cu_seqlens[batch_idx_4];
                 int raw_batch_end_4 = cu_seqlens[batch_idx_4 + 1];
+#endif
                 int batch_start_floor_4 = ((raw_batch_start_4 > 0) ? raw_batch_start_4 : 0);
                 int batch_start_4 = ((batch_start_floor_4 < total_tokens) ? batch_start_floor_4 : total_tokens);
                 int batch_end_floor_4 = ((raw_batch_end_4 > batch_start_4) ? raw_batch_end_4 : batch_start_4);
@@ -2892,8 +2963,13 @@ kernel_cake_gdn_aca17b009dc4ed830f7c(const __grid_constant__ CUtensorMap Q, cons
                 int head_idx_5 = ((NUM_O_HEADS_LOG2 >= 0) ? tile_5 & (unsigned int)(num_o_heads_5 - 1) : tile_5 % (unsigned int)num_o_heads_5);
                 int qk_head_idx_5 = ((IS_GQA != 0) ? head_idx_5 : ((HEAD_GROUP_LOG2 >= 0) ? head_idx_5 >> HEAD_GROUP_LOG2 : head_idx_5 / (num_v_heads / num_q_heads)));
                 int v_head_idx_5 = ((IS_GQA != 0) ? ((HEAD_GROUP_LOG2 >= 0) ? head_idx_5 >> HEAD_GROUP_LOG2 : head_idx_5 / (num_q_heads / num_v_heads)) : head_idx_5);
+#if CAKE_GDN_METADATA_I64
+                int raw_batch_start_5 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)batch_idx_5] : cu_seqlens[batch_idx_5]);
+                int raw_batch_end_5 = (((metadata_i64_mask & 1) != 0) ? (int)reinterpret_cast<long long*>(cu_seqlens)[(int)(batch_idx_5 + 1)] : cu_seqlens[batch_idx_5 + 1]);
+#else
                 int raw_batch_start_5 = cu_seqlens[batch_idx_5];
                 int raw_batch_end_5 = cu_seqlens[batch_idx_5 + 1];
+#endif
                 int batch_start_floor_5 = ((raw_batch_start_5 > 0) ? raw_batch_start_5 : 0);
                 int batch_start_5 = ((batch_start_floor_5 < total_tokens) ? batch_start_floor_5 : total_tokens);
                 int batch_end_floor_5 = ((raw_batch_end_5 > batch_start_5) ? raw_batch_end_5 : batch_start_5);

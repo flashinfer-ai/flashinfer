@@ -1,0 +1,99 @@
+{
+  "cake_kda_bf16_03ea50d078dbf34830bb": {
+    "sha256": "e1c094a587afa93b7d1798b1296a96bce2f315823cad3b9707fc0629d0780a4e"
+  },
+  "cake_kda_bf16_14d1b3745aa9f0079482": {
+    "sha256": "3c6ec38f5c37741ca0c45edb95ba31f323560a1549c397e8906837ff75303b62"
+  },
+  "cake_kda_bf16_15be1db8a50ee4d9fd16": {
+    "sha256": "28387634c46598e8b31c1d2464240926822b60d5cb73bb9de1e398346d88ac7d"
+  },
+  "cake_kda_bf16_2064d4aca94aef841cf8": {
+    "sha256": "e99c97befcd2770a2815639f19926e80b9f7adb159f756dd6cd9eb1e910968e5"
+  },
+  "cake_kda_bf16_2b5f2c6b7cfc10ffa244": {
+    "sha256": "5db7566cc64bcf38f38b1a0eb0426290922d9e59225a32f29a3701a03e7fefbc"
+  },
+  "cake_kda_bf16_496bf5563f7746744ffe": {
+    "sha256": "11e03fcd9161b2c6c70551a668263959dfba823fa4d2bb8d381102bb15e9a3f9"
+  },
+  "cake_kda_bf16_4ab394a09c63f264d7bd": {
+    "sha256": "f57e6605d712dcfd219486b39e56f1cd5640023adbafbd2e39a3752eb046f339"
+  },
+  "cake_kda_bf16_50c0f288f4c8d7ca03a8": {
+    "sha256": "63c1651231f59552ed235031c96b14be022526f9effb10222e00c16ca550c7aa"
+  },
+  "cake_kda_bf16_5639519f5c942ed86e4f": {
+    "sha256": "5beef41f0ac338a413719d6d68b92129ba2779bf6507a296e0763313c857b764"
+  },
+  "cake_kda_bf16_5926ccfc26ae75ec8391": {
+    "sha256": "8961e3f4a6dd68c4811a624fa774e4bddfba696c7cf36a15897f3677429cd17d"
+  },
+  "cake_kda_bf16_5be344cbddc29563f1ee": {
+    "sha256": "eef5fb4d0cae5933dd379d30c55743993cb64482867b27a51910203f9276feff"
+  },
+  "cake_kda_bf16_73414b477c864609350c": {
+    "sha256": "a51f77c4da5b32be389e17f9c79e339421af99da9cf10b4d07482f65b1ce5103"
+  },
+  "cake_kda_bf16_7386cf449b08cfe77567": {
+    "sha256": "4cae440d7091899f5208bfbd6978bdaf44ff4918ce4f255e548acc91c1903757"
+  },
+  "cake_kda_bf16_82dff1c305abe6367034": {
+    "sha256": "5ed0f969f707c69079a36fa318e7a37302dfa9e0630c277e0ba32fa76818f328"
+  },
+  "cake_kda_bf16_893740628d53688ac269": {
+    "sha256": "e99797ba4f7037e7db3a821369d8579451f0972a9cad663f111db08c1f1d9853"
+  },
+  "cake_kda_bf16_8e9c0962021058a3005d": {
+    "sha256": "ddefaa4bc08587e6487dfb9a2e1723ef65a416dc50fec1c554add0414055da07"
+  },
+  "cake_kda_bf16_9556ac079590cd311172": {
+    "sha256": "9074df3ba2cc05d945175924edd2b9d208c2b6ba0a65453cca02b93af81bddea"
+  },
+  "cake_kda_bf16_acd84ad6d68fb21576b7": {
+    "sha256": "c05693cd4b571a53e18110b686b875fd28dc827b788a9861972db5cfb17b97b3"
+  },
+  "cake_kda_bf16_b52b37142605bb183504": {
+    "sha256": "febb3e68c325d1804beafbc59b35ba714dd08156e2fff51684a727ceeaa5690d"
+  },
+  "cake_kda_bf16_c410d3932af8bc84666e": {
+    "cuda_arch": 1030,
+    "sha256": "123b395593bc198300b2d05e40077251794799cc5c0e3926d95b877ba0135ce0"
+  },
+  "cake_kda_bf16_c528a0e1a9896ea82166": {
+    "sha256": "21a964610f0f05d86fb853060e61080c79d294829bec357cfcf287fdb0ce0564"
+  },
+  "cake_kda_bf16_c7c8fcf8dd88d37499d3": {
+    "sha256": "e5dc76ddb544c2340596849c9daac3acc89249c6531bf86d432cf5511cca9219"
+  },
+  "cake_kda_bf16_cb22ba3c5cee4d5fa5fd": {
+    "sha256": "0228eea86e1ac5397b81fb4844e9f78483158b940a53274085263a7782c6d4cc"
+  },
+  "cake_kda_bf16_d1ce1e4b43672482991c": {
+    "sha256": "ad602eb23335541309d1ad3984f04b6f4d2361bc9ee847a05dc847dd0d89edee"
+  },
+  "cake_kda_bf16_d22df3843e4ae69e26a7": {
+    "sha256": "cc7a67ffefad0bd8926cd9ab532ab70d31dd4474ed6a53b8eb807dd95b1e44db"
+  },
+  "cake_kda_bf16_db50c13c6d4aa462575c": {
+    "sha256": "b0a8ca42e635b3951ad138b3d100c9105cc34a53ffdd13e1c282f10c298e35d3"
+  },
+  "cake_kda_bf16_e3cd435a92ef7a053b72": {
+    "sha256": "c77feb7fb770acd761ae9813a55f7d5fffc2831a57e2633c54934d413e4416b8"
+  },
+  "cake_kda_bf16_eeb61146f150d9e0d825": {
+    "sha256": "23cdae86371732c68d3c5bc1827920fa052ccdb8a658fd7434a41280342b3be4"
+  },
+  "cake_kda_bf16_f66adfecf2022fc198b6": {
+    "sha256": "624e6ce57c962f4049df8f5f9b974c176741fc6334feb7126a7cdd3cb9515517"
+  },
+  "cake_kda_bf16_f74a288bb51b335a1ccf": {
+    "sha256": "30b46a9912f9b3afab3b523a07e617c68d248d59212aeb3a5d560e414cbedcd9"
+  },
+  "cake_kda_bf16_fb073f88984adc2962a9": {
+    "sha256": "fcf5b27370a3ccf71ecf269db55763205b17a45f7915be5924154bc71a4800a9"
+  },
+  "cake_kda_bf16_fc66c809d573029352f7": {
+    "sha256": "2afd96274ec3a4f934e965003e38597ab16e57532320f7cb30ce10b667be7257"
+  }
+}

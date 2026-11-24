@@ -11,7 +11,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -64,7 +64,7 @@ kernel_cake_mok_zero(uint16_t* __restrict__ gate, uint16_t* __restrict__ up, uin
     int expert = blockIdx.y;
     if (counts[expert] != 0) return;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     long long offset = (long long)expert * elements;
     #pragma unroll 1
     for (long long index = (long long)(bid * 256 + tid); index < elements; index += gridDim.x * 256) {

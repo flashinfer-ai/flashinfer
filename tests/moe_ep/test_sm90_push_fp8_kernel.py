@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from ._sm90_push_fp8_reference import dequant_weight_128x128, reference_moe
+from flashinfer.testing import is_compute_sanitizer_active
 
 pytestmark = pytest.mark.usefixtures("isolated_deep_gemm_cache")
 
@@ -125,7 +126,7 @@ def _build(
     hidden: int = HIDDEN,
     intermediate: int = INTERMEDIATE,
 ):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
         Sm90PushCombine,
         Sm90PushConfig,
         Sm90PushMoERunner,
@@ -275,7 +276,7 @@ def _assert_device_trap(result: subprocess.CompletedProcess[str], marker: str) -
 
 @requires_sm90
 def test_constructor_validation() -> None:
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
         Sm90PushCombine,
         Sm90PushConfig,
         Sm90PushPipe,
@@ -312,7 +313,7 @@ def test_constructor_validation() -> None:
 
 
 def test_weight_transform_validation() -> None:
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
         transform_weights_for_sm90_push,
     )
 
@@ -335,7 +336,7 @@ def test_weight_transform_validation() -> None:
 
 
 def test_weight_transform_interleave() -> None:
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
         transform_weights_for_sm90_push,
     )
 
@@ -735,11 +736,16 @@ def test_ep1_soak() -> None:
             pending.clear()
 
 
+@pytest.mark.skipif(
+    is_compute_sanitizer_active(),
+    reason="the test makes a kernel execute its `trap;` guard on purpose, "
+    "which compute-sanitizer reports as errors",
+)
 @requires_sm90
 def test_ep1_pool_overflow_traps() -> None:
     code = r"""
 import torch
-from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
+from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
     Sm90PushConfig, Sm90PushMoERunner, Sm90PushPipe, make_sm90_push_weights,
 )
 H, I, E, K, T = 512, 768, 4, 2, 64
@@ -768,11 +774,16 @@ print("UNEXPECTED-SURVIVAL")
     _assert_device_trap(result, "sm90_push: pool overflow")
 
 
+@pytest.mark.skipif(
+    is_compute_sanitizer_active(),
+    reason="the test makes a kernel execute its `trap;` guard on purpose, "
+    "which compute-sanitizer reports as errors",
+)
 @requires_sm90
 def test_ep1_wait_prefix_capacity_corruption_traps() -> None:
     code = r"""
 import torch
-from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import Sm90PushConfig, Sm90PushPipe
+from flashinfer.moe_ep.shims.sm90.push_style_megamoe import Sm90PushConfig, Sm90PushPipe
 
 H, E, K, T = 512, 4, 2, 4
 pipe = Sm90PushPipe(
@@ -801,6 +812,11 @@ print("UNEXPECTED-SURVIVAL")
     _assert_device_trap(result, "sm90_push: accumulated row count")
 
 
+@pytest.mark.skipif(
+    is_compute_sanitizer_active(),
+    reason="the test makes a kernel execute its `trap;` guard on purpose, "
+    "which compute-sanitizer reports as errors",
+)
 @requires_sm90
 @pytest.mark.parametrize(
     "case,marker",
@@ -829,7 +845,7 @@ ids[:, 0] = torch.arange(T, dtype=torch.int32, device=\"cuda\") % E
 
     code = f"""
 import torch
-from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
+from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
     Sm90PushConfig, Sm90PushMoERunner, Sm90PushPipe, make_sm90_push_weights,
 )
 H, I, E, K, T = 512, 768, 4, {top_k}, 32
@@ -872,9 +888,7 @@ def _dist_setup():
 
 
 def _full_transformed_weights(total_experts: int, device: torch.device):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
-        make_sm90_push_weights,
-    )
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import make_sm90_push_weights
 
     w13, w2 = _make_weights(total_experts, 7, device)
     return make_sm90_push_weights(w13, w2)
@@ -885,7 +899,7 @@ def _full_transformed_weights(total_experts: int, device: torch.device):
 def test_ep2_layout_fingerprint_mismatch_fails_fast(field: str) -> None:
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
+    from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
         Sm90PushConfig,
         Sm90PushPipe,
     )

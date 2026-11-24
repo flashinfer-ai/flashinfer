@@ -7,15 +7,25 @@ kernel and not a claimed historical FlashInfer performance baseline.
 
 ``--baseline vendored-cutedsl-matched`` (the default) selects the exact vendored
 implementation at
-``flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py``.
+``flashinfer/moe_ep/kernels/cutedsl_megamoe/pre_unification/moe_nvfp4_swapab/topk_reduce.py``.
 Both kernels process the same live ``T x 6 x 4096`` elements in this primary
 comparison. ``--baseline vendored-cutedsl-fixed-capacity`` separately measures
 the serving scenario where the old reducer processes a prefill-sized ``C=4096``
 workspace for a smaller live batch. That fixed-capacity result measures avoided
-workspace work, not an apples-to-apples kernel speedup. Preparation, zero-fill,
-and compilation remain outside timing. The vendored module is not a stable
-public API. Source drift, import failure, or compilation failure is fatal; the
-benchmark never substitutes the PyTorch path while labelling it CuTeDSL.
+workspace work, not an apples-to-apples kernel speedup.
+
+``--baseline rubin-cutedsl-matched`` selects the vendored SM107 (Rubin) MegaMoE
+reducer at
+``flashinfer/moe_ep/kernels/cutedsl_megamoe/sources/helpers/topk_reduce.py``
+on the same live ``T x 6 x 4096`` elements, called without routing scores or
+indices (an unweighted sum in increasing K, rounded once, as the native
+reducer). It needs a CuTe DSL that targets sm_107a natively and
+``CUTE_DSL_ARCH=sm_107a`` before Python starts.
+
+Preparation, zero-fill, and compilation remain outside timing. The vendored
+modules are not a stable public API. Source drift, import failure, or
+compilation failure is fatal; the benchmark never substitutes the PyTorch path
+while labelling it CuTeDSL.
 """
 
 from __future__ import annotations
@@ -52,17 +62,24 @@ _SHAPES = (
 _HIDDEN_SIZE = 4096
 _TOP_K = 6
 _GRID_CTAS_PER_TOKEN = 4
+_LEGACY_GRID_CTAS_PER_TOKEN = 8
 _LEGACY_BASELINE_CAPACITY = 4096
 _ATOL = 1e-2
 _RTOL = 1e-2
-_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py"
+_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernels/cutedsl_megamoe/pre_unification/moe_nvfp4_swapab/topk_reduce.py"
 _CUTEDSL_SOURCE_SHA256 = (
-    "d7d1fc2361c30dcd8a37269edda27e75953dadf396014e47a3c3cbd7a2551184"
+    "e874fa11c4859e2ab9974a0de585fa9600d394133739afaf895b67529fcbfe52"
+)
+_RUBIN_CUTEDSL_SOURCE = (
+    "flashinfer/moe_ep/kernels/cutedsl_megamoe/sources/helpers/topk_reduce.py"
+)
+_RUBIN_CUTEDSL_SOURCE_SHA256 = (
+    "d9d0012cda2a27086c2997556ef0183428a3c56add7cf537de2c2eac87f8e43f"
 )
 
 
 def _require_frozen_reducer_target() -> str:
-    """Return the frozen export arch (``sm_100a``/``sm_103a``) for this GPU."""
+    """Return the frozen export arch (``sm_100a``/``sm_103a``/``sm_107a``) for this GPU."""
     if not torch.cuda.is_available():
         raise RuntimeError("this benchmark requires CUDA")
     try:
@@ -70,7 +87,9 @@ def _require_frozen_reducer_target() -> str:
     except NotImplementedError as error:
         raise RuntimeError(str(error)) from None
     if not is_sm100a_supported(torch.device("cuda")):
-        raise RuntimeError("frozen reducer requires Blackwell with CUDA 12.8+")
+        raise RuntimeError(
+            "frozen reducer requires compute capability 10.x with CUDA 12.8+"
+        )
     return arch
 
 
@@ -145,13 +164,17 @@ def _make_vendored_cutedsl_runner(
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
 
-        from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim._paths import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification._paths import (
             bootstrap_paths,
         )
 
         bootstrap_paths()
-        from moe_nvfp4_swapab.topk_reduce import TopkReduce
-        from src.token_comm import CombineFormat
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.moe_nvfp4_swapab.topk_reduce import (
+            TopkReduce,
+        )
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.pre_unification.comm.token_comm import (
+            CombineFormat,
+        )
     except Exception as error:
         raise RuntimeError(
             f"vendored CuTeDSL baseline {_CUTEDSL_SOURCE} is unavailable; "
@@ -237,6 +260,78 @@ def _make_vendored_cutedsl_runner(
     return run, baseline_out
 
 
+def _make_rubin_cutedsl_runner(
+    partials: torch.Tensor,
+    out: torch.Tensor,
+    num_tokens: int,
+) -> tuple[Callable[[torch.Tensor, torch.Tensor], None], torch.Tensor]:
+    """Prepare the pinned SM107 CuTeDSL reducer on the live rows only."""
+
+    try:
+        import cuda.bindings.driver as cuda_driver
+        import cutlass
+        import cutlass.cute as cute
+        import cutlass.torch as cutlass_torch
+
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.helpers.topk_reduce import (
+            TopkReduce,
+        )
+        from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.quant_def import (
+            CombineFormat,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"vendored CuTeDSL baseline {_RUBIN_CUTEDSL_SOURCE} is unavailable; "
+            "no fallback was used"
+        ) from error
+
+    source_path = inspect.getsourcefile(TopkReduce)
+    if source_path is None:
+        raise RuntimeError(
+            f"cannot locate vendored CuTeDSL source {_RUBIN_CUTEDSL_SOURCE}"
+        )
+    actual_source_sha256 = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+    if actual_source_sha256 != _RUBIN_CUTEDSL_SOURCE_SHA256:
+        raise RuntimeError(
+            f"vendored CuTeDSL baseline {_RUBIN_CUTEDSL_SOURCE} changed: expected "
+            f"{_RUBIN_CUTEDSL_SOURCE_SHA256}, got {actual_source_sha256}"
+        )
+    baseline_partials = partials[:num_tokens]
+    baseline_out = out[:num_tokens]
+    partials_cute = cutlass_torch.from_dlpack(baseline_partials, assumed_align=16)
+    out_cute = cutlass_torch.from_dlpack(baseline_out, assumed_align=16)
+    kernel = TopkReduce(
+        _HIDDEN_SIZE,
+        _TOP_K,
+        CombineFormat(act_dtype=cutlass.BFloat16, scale_dtype=None, scale_block=None),
+    )
+    try:
+        compiled = cute.compile(
+            kernel,
+            combine_quant=partials_cute,
+            combine_sf=None,
+            reduced_output=out_cute,
+            topk_score=None,
+            stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"vendored CuTeDSL baseline {_RUBIN_CUTEDSL_SOURCE} failed to compile; "
+            "no fallback was used"
+        ) from error
+
+    def run(_partials: torch.Tensor, _out: torch.Tensor) -> None:
+        compiled(
+            combine_quant=partials_cute,
+            combine_sf=None,
+            reduced_output=out_cute,
+            topk_score=None,
+            stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
+        )
+
+    return run, baseline_out
+
+
 def _median_cupti_ms(
     runner: Callable[[torch.Tensor, torch.Tensor], None],
     partials: torch.Tensor,
@@ -263,13 +358,22 @@ def _comparison_plan(num_tokens: int, baseline: str) -> dict[str, Any]:
     """Define timed work once for both runner construction and JSON output."""
 
     native_io_bytes = num_tokens * (_TOP_K + 1) * _HIDDEN_SIZE * 2
+    baseline_ctas_per_token = (
+        _LEGACY_GRID_CTAS_PER_TOKEN
+        if baseline
+        in (
+            "vendored-cutedsl-matched",
+            "vendored-cutedsl-fixed-capacity",
+        )
+        else _GRID_CTAS_PER_TOKEN
+    )
     if baseline == "vendored-cutedsl-fixed-capacity":
         baseline_work_tokens = _LEGACY_BASELINE_CAPACITY
         comparison_kind = "legacy_fixed_capacity_serving_scenario"
         same_token_extent = num_tokens == baseline_work_tokens
         same_reduction_work: bool | None = same_token_extent
         baseline_tensor_extent: int | None = baseline_work_tokens
-    elif baseline == "vendored-cutedsl-matched":
+    elif baseline in ("vendored-cutedsl-matched", "rubin-cutedsl-matched"):
         baseline_work_tokens = num_tokens
         comparison_kind = "matched_work_kernel"
         same_token_extent = True
@@ -290,7 +394,7 @@ def _comparison_plan(num_tokens: int, baseline: str) -> dict[str, Any]:
         "same_reduction_work": same_reduction_work,
         "native_grid_ctas": _GRID_CTAS_PER_TOKEN * num_tokens,
         "baseline_grid_ctas": (
-            _GRID_CTAS_PER_TOKEN * baseline_work_tokens
+            baseline_ctas_per_token * baseline_work_tokens
             if baseline_work_tokens is not None
             else None
         ),
@@ -339,6 +443,12 @@ def _run_shape(
         baseline_runner = _make_ordered_pytorch_runner(num_tokens)
         baseline_validation_out = out
         baseline_source = "PyTorch eager: six ordered FP32 accumulations + BF16 store"
+    elif baseline == "rubin-cutedsl-matched":
+        baseline_label = "rubin_cutedsl_topk_reduce_matched_live_t"
+        baseline_runner, baseline_validation_out = _make_rubin_cutedsl_runner(
+            partials, out, num_tokens
+        )
+        baseline_source = _RUBIN_CUTEDSL_SOURCE
     elif baseline == "vendored-cutedsl-matched":
         baseline_label = "vendored_cutedsl_topk_reduce_matched_live_t"
         baseline_runner, baseline_validation_out = _make_vendored_cutedsl_runner(
@@ -366,7 +476,7 @@ def _run_shape(
     baseline_ms = _median_cupti_ms(
         baseline_runner, partials, out, dry_run_iters, repeat_iters
     )
-    if baseline == "vendored-cutedsl-matched":
+    if baseline in ("vendored-cutedsl-matched", "rubin-cutedsl-matched"):
         assert comparison_plan["same_reduction_work"]
     return {
         "num_tokens": num_tokens,
@@ -375,7 +485,11 @@ def _run_shape(
         "baseline_label": baseline_label,
         "baseline_source": baseline_source,
         "baseline_source_sha256": (
-            _CUTEDSL_SOURCE_SHA256 if baseline.startswith("vendored-cutedsl") else None
+            _RUBIN_CUTEDSL_SOURCE_SHA256
+            if baseline == "rubin-cutedsl-matched"
+            else _CUTEDSL_SOURCE_SHA256
+            if baseline.startswith("vendored-cutedsl")
+            else None
         ),
         "baseline_median_ms": baseline_ms,
         "baseline_over_native_latency_ratio": baseline_ms / native_ms,
@@ -390,6 +504,7 @@ def main() -> None:
         choices=(
             "vendored-cutedsl-matched",
             "vendored-cutedsl-fixed-capacity",
+            "rubin-cutedsl-matched",
             "ordered-pytorch",
         ),
         default="vendored-cutedsl-matched",

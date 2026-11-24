@@ -103,13 +103,22 @@ def _assert_near(actual, expected):
     )
 
 
-def _require_gpu():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
-        (10, 0),
-        (10, 3),
-        (10, 7),
+def _require_gpu(*, allow_sm120=False, allow_sm90=False, allow_sm80=False):
+    architectures = (
+        (
+            (10, 0),
+            (10, 3),
+            (10, 7),
+        )
+        + (((12, 0),) if allow_sm120 else ())
+        + (((9, 0),) if allow_sm90 else ())
+        + (((8, 0),) if allow_sm80 else ())
+    )
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability() not in architectures
     ):
-        pytest.skip("requires SM100/SM103/SM107")
+        pytest.skip(f"requires one of {architectures}")
     pytest.importorskip("cutlass")
     if Version(version("nvidia-cutlass-dsl")) < Version("4.8"):
         pytest.skip("requires nvidia-cutlass-dsl >= 4.8")

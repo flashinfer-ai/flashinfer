@@ -100,7 +100,7 @@ until **0.9**. **Trust git, not the docstring.**
 
 ## 4. TOOLING GAP — the largest deprecated surface is unmonitored
 
-`scripts/pr_checks/inspect_sources.py:107` `is_function_deprecated` scans **`tree.body` only —
+`scripts/infra/pr_checks/inspect_sources.py:107` `is_function_deprecated` scans **`tree.body` only —
 module-level functions**. Extending it to classes/methods yields zero *additional* detector hits, which
 means:
 

@@ -25,12 +25,21 @@ import enum
 
 
 class SageKTransport(enum.Enum):
-    """How the softmax obtains a K tile's ``sfK`` words."""
+    """Where the softmax reads a K tile's ``sfK`` words from.
 
-    # The softmax lanes load the words from the prepared buffer.
-    GLOBAL = "global"
-    # The load warp stages the words in the kernel's shared-memory ring.
-    RING = "ring"
+    The choice follows the number of words one K tile carries. The context
+    kernel reads them from global memory when a 128-token tile has at most 32
+    words (K blocks of four tokens or more) and stages the 128 words of
+    one-token blocks in shared memory (``sage_k_transport``). The decode
+    kernel stages every tile's words in shared memory, where its load warp
+    also gathers the atoms of block-sparse routes (``SageKScalesResource``).
+    """
+
+    # The softmax lanes load the words from the prepared buffer in global
+    # memory before the score wait.
+    GMEM = "gmem"
+    # The load warp stages the words in a shared-memory ring.
+    SMEM = "smem"
 
 
 class SageScoreScaling(enum.Enum):

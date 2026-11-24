@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 @deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclass
 class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm100.cutedsl_megamoe.nvfp4_mega_moe``.
+    """NVFP4 expert configuration for Blackwell.
 
     Expert weights must be NVFP4 at kernel launch; supply bf16 ``MoEWeightPack``
     and enable ``MegaConfig.preprocess_weights`` (default), or pass pre-quantized
@@ -26,11 +26,25 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     Set ``swiglu_alpha=1.702`` and ``swiglu_beta=1.0`` for MiniMax-M3:
     ``(up + beta) * gate * sigmoid(alpha * gate)``, after ``gate_up_clamp``.
     These are scalar activation constants, distinct from ``fc1_alpha``.
+
+    ``kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl"`` selects the standard
+    provider export. It accepts default or fixed ``knobs``, activation controls
+    and the finalization modes below. With ``knobs="auto"``, warm up inside
+    ``autotune_v2()`` before capture to select and prepare a configuration.
+    ``kernel_variant="genphase"`` selects decoding with separate BF16
+    finalization and a K256/N128/CGA4 Gather4 tile. It supports standard SwiGLU
+    and early or late routing weights, without per-token FC1 scales.
+
+    ``kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_legacy"`` retains the older
+    implementation and its tuning cache. Its knobs use the legacy scheduler
+    names; the sources-backed adapter translates equivalent controls and
+    rejects those without a native equivalent.
     """
 
     intermediate_size: int
     top_k: int
     kernel_name: str = "sm100_nvfp4_nvfp4_bf16_cutedsl"
+    batch_invariant: bool = field(default=False, kw_only=True)
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     activation: Literal["swiglu", "situ"] = "swiglu"
@@ -67,21 +81,39 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # dequantized fc1 output before the clamp / gated activation, so callers
     # that quantize ``x_t / s_t`` to NVFP4 recover the per-token range in-kernel.
     enable_fc1_activation_per_token_scale: bool = False
-    # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
-    # the token-count default heuristic entirely when set, e.g. a winner from the
-    # kernel repo's tester sweep. None -> tuner.default_knobs(num_max_tokens).
-    # "auto" -> online autotune at the first forward: collectively time the
-    # shim.autotune candidate set on the live problem and keep the winner
-    # (one cute.compile per candidate, paid once per session).
+    # None looks up compatible offline tuning, then falls back to the capacity
+    # heuristic; a dictionary supplies explicit knobs.
+    # "auto" searches inside autotune_v2() for the sources-backed implementation
+    # and on the first forward for the legacy implementation.
     knobs: dict | str | None = None
+    # GenPhase is available through the unsuffixed selector.
+    kernel_variant: Literal["inference", "genphase"] = field(
+        default="inference", kw_only=True
+    )
+    mma_tiler_mnk: tuple[int, int, int] | None = field(default=None, kw_only=True)
+    cluster_shape_mn: tuple[int, int] | None = field(default=None, kw_only=True)
+    schedule_policy: tuple[str, int | None] | None = field(default=None, kw_only=True)
     # Uniform per-layer SwiGLU constants; None/None keeps standard SwiGLU.
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
-    # NONE makes MoEEpMegaLayer.forward return per-route outputs for caller
-    # finalization; it requires fixed/offline-tuned knobs.
+    # NONE exposes per-route outputs through forward_unfinalized(). The legacy
+    # selector requires fixed/offline-tuned knobs for this mode.
     finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     def __post_init__(self) -> None:
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool.")
+        if self.batch_invariant:
+            from ..common.nvfp4_batch_invariant import validate_nvfp4_batch_invariant
+
+            if self.kernel_name not in (
+                "sm100_nvfp4_nvfp4_bf16_cutedsl",
+                "sm100_nvfp4_nvfp4_bf16_cutedsl_legacy",
+            ):
+                raise ValueError(
+                    "batch_invariant requires a specified NVFP4 CuTeDSL backend"
+                )
+            validate_nvfp4_batch_invariant(self, arch="sm_100")
         validate_finalize_mode(
             self.finalize_mode, tuple(FinalizeMode), self.num_valid_tokens_tensor
         )
@@ -91,7 +123,10 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
                     "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False "
                     "and combine_dtype='bf16'."
                 )
-            if self.knobs == "auto":
+            if (
+                self.knobs == "auto"
+                and self.kernel_name != "sm100_nvfp4_nvfp4_bf16_cutedsl"
+            ):
                 raise ValueError(
                     "finalize_mode=NONE requires fixed/offline-tuned knobs."
                 )
@@ -114,7 +149,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError(
                     "situ_linear_beta must be positive and finite when set."
                 )
-            if self.gate_up_clamp is not None or self.activation_clamp is not None:
+            if not self.batch_invariant and (
+                self.gate_up_clamp is not None or self.activation_clamp is not None
+            ):
                 raise ValueError("activation clamps are not supported with SiTU.")
         elif self.situ_beta is not None or self.situ_linear_beta is not None:
             raise ValueError("SiTU parameters require activation='situ'.")

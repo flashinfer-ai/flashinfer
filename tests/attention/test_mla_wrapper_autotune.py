@@ -1423,12 +1423,12 @@ def test_mtp_unsafe_plan_metadata_refuses_before_compile(mtp_adapter, monkeypatc
 
 @pytest.mark.parametrize("q_len,page_size", [(2, 64), (4, 128)])
 def test_mtp_large_kv_pool_high_pages_eager_and_graph(
-    case, monkeypatch, q_len, page_size
+    case, cuda_matmul_flags, q_len, page_size
 ):
     """A small request can address the final pages of a shared pool above 4 GiB."""
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("requires SM107")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     pool_bytes = 9 << 29  # 4.5 GiB of FP8, without initializing unused pages.
     if torch.cuda.mem_get_info()[0] < pool_bytes + (512 << 20):
         pytest.skip("requires 5 GiB of free GPU memory")
@@ -1524,6 +1524,57 @@ def test_mtp_large_kv_pool_high_pages_eager_and_graph(
     check(captured)
 
 
+@pytest.mark.parametrize("capture", [False, True])
+def test_mtp_prepared_kernel_reuses_split_buckets(monkeypatch, capture):
+    """Changing the split budget must reuse a warmed scalar kernel."""
+    pytest.importorskip("cutlass.utils.rubin_helpers")
+    from flashinfer.cute_dsl.attention.rubin_mtp import mla_decode
+
+    compiling = []
+
+    def compile_kernel(*args, **kwargs):
+        compiling.append(args[0])
+        return lambda *args: None
+
+    monkeypatch.setattr(mla_decode.cute, "compile", compile_kernel)
+    monkeypatch.setattr(mla_decode, "_check_compiler_compatibility", lambda: None)
+    monkeypatch.setattr(mla_decode, "get_num_sm", lambda device: 208)
+    monkeypatch.setattr(mla_decode, "get_compute_capability", lambda device: (10, 7))
+    monkeypatch.setattr(mla_decode, "cute_dsl_compile_arch", lambda *args: "sm_107a")
+    monkeypatch.setattr(mla_decode, "get_max_active_clusters", lambda size: 208 // size)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    options = dict(
+        device=torch.device("cuda:0"),
+        torch_dtype=torch.float8_e4m3fn,
+        torch_out_dtype=torch.float8_e4m3fn,
+        page_size=64,
+        batch_size=2,
+        num_heads=128,
+        seq_len_q=4,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        max_seq_len=32768,
+    )
+    mla_decode._get_compiled_mla_kernel.cache_clear()
+    try:
+        warm = mla_decode.prepare_cute_dsl_mla_decode(**options, num_kv_splits=3)
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capture)
+        for splits in (6, 13, 26, 32):
+            assert (
+                mla_decode.prepare_cute_dsl_mla_decode(**options, num_kv_splits=splits)
+                is warm
+            )
+        assert len(compiling) == 1
+        if capture:
+            # A genuinely new specialization still requires eager preparation.
+            with pytest.raises(RuntimeError, match="before CUDA graph capture"):
+                mla_decode.prepare_cute_dsl_mla_decode(
+                    **{**options, "page_size": 128}, num_kv_splits=3
+                )
+    finally:
+        mla_decode._get_compiled_mla_kernel.cache_clear()
+
+
 @pytest.mark.parametrize(
     "branch,q_len,page_size,scale,capacity",
     [
@@ -1540,7 +1591,7 @@ def test_mtp_large_kv_pool_high_pages_eager_and_graph(
     + [(None, q_len, 64, 1 / 24, 64) for q_len in (2, 4)],
 )
 def test_planned_fp8_split_tactics_and_graph_replay(
-    case, monkeypatch, branch, q_len, page_size, scale, capacity
+    case, monkeypatch, cuda_matmul_flags, branch, q_len, page_size, scale, capacity
 ):
     """Every admitted MTP tactic must handle live tails and fully masked rows.
 
@@ -1551,7 +1602,7 @@ def test_planned_fp8_split_tactics_and_graph_replay(
         pytest.skip("requires SM107")
     from flashinfer.cute_dsl.attention.rubin_mtp import kernel, mla_decode
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     if branch is not None:
         cls = kernel.RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo
         original = cls.__init__
@@ -1812,11 +1863,11 @@ def test_mtp_kv_indexing_rejects_unrepresentable_dimensions_or_strides(shape, st
     ],
 )
 def test_auto_rubin_mtp_planned_regions(
-    case, monkeypatch, graph, batch, q_len, page_size, kv_len, lse_mode
+    case, cuda_matmul_flags, graph, batch, q_len, page_size, kv_len, lse_mode
 ):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("requires SM107")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     pages = (kv_len + 127) // 128 * (128 // page_size)
     scale = 1 / 24
     case.update(

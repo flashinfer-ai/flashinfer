@@ -193,10 +193,13 @@ shapes and the global expert count; the local shard enters only through
 the padded row bound, so expert-parallel ranks that tune together profile
 identical sequences.
 
-Compiled kernels are reused within a process. Loading saved tuning results
-still requires compiling the selected kernels, so applications must warm
-relevant shapes and tactics before CUDA-graph capture or latency-sensitive
-serving.
+Each GEMM specialization (dtype, tactic, `top_k`, PDL, activation
+constants, resident cluster count) is compiled once per process as a
+TVM-FFI function, so a launch passes raw device addresses, dimensions and
+the stream handle without per-call pointer objects or argument
+marshalling. Loading saved tuning results still requires compiling the
+selected kernels, so applications must warm relevant shapes and tactics
+before CUDA-graph capture or latency-sensitive serving.
 
 ## 6. Weight layout and Python API
 

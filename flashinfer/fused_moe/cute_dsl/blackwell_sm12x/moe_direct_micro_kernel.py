@@ -69,6 +69,8 @@ _NUM_WARPS = 16
 _BLOCK_DIM = _NUM_WARPS * 32
 _K_PER_CTA = 16
 _MAX_DIRECT_K_SEGMENTS = 12
+# FC1 rows each warp computes per task are unrolled; cap the unroll.
+_MAX_FC1_ROWS_PER_WARP = 16
 _W4A16_PACKED_E4M3_SCALE_CACHE_VERSION = 1
 
 
@@ -94,6 +96,13 @@ def _fc1_chunks_for_m(m: int, n: int) -> int:
             return chunks
         chunks -= 1
     return 1
+
+
+def _balanced_grid(tasks: int, max_ctas: int) -> int:
+    """Fewest CTAs that still finish ``tasks`` in the fewest rounds."""
+    cap = max(1, min(int(max_ctas), tasks))
+    rounds = -(-tasks // cap)
+    return max(1, -(-tasks // rounds))
 
 
 @dataclass(frozen=True)
@@ -653,11 +662,13 @@ class MoEDirectMicroKernel:
         *,
         max_active_ctas: int | None = None,
         device: torch.device | None = None,
+        one_round_fc1: bool = False,
     ):
         cfg = _make_shape_config(
             m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated
         )
         num_fc1_chunks = _fc1_chunks_for_m(m, n)
+        one_round = False
         if max_active_ctas is None:
             max_active_ctas = min(get_num_sm(device), get_max_active_clusters(1))
         if (
@@ -691,6 +702,34 @@ class MoEDirectMicroKernel:
             # avoiding a second input quantization and task barriers.
             # Whole N64 chunks retain four independent Q1 block writers.
             num_fc1_chunks = _fc1_chunks_for_m(4, n)
+        elif (
+            one_round_fc1
+            and self.compile_time_phase == 0
+            and not self.w4a16_mode
+            and not self.a8_mx_mode
+            and not self.dynamic_down_scale
+        ):
+            # Every FC1 task re-stages its token's activations, so finish FC1
+            # in one round over the grid FC2 needs: as many chunks per (token,
+            # expert) pair as still fit, up to _MAX_FC1_ROWS_PER_WARP rows/warp.
+            one_round = True
+            fc2_grid = _balanced_grid(
+                cfg.k_dim // (_K_PER_CTA * 2)
+                if m == 1
+                else (m * cfg.k_dim) // (_K_PER_CTA * 4),
+                max_active_ctas,
+            )
+
+            def valid_chunks(chunks: int) -> bool:
+                return n % chunks == 0 and (n // chunks) % _BLOCK_SIZE == 0
+
+            num_fc1_chunks = max(1, n // (_MAX_FC1_ROWS_PER_WARP * _NUM_WARPS))
+            while num_fc1_chunks > 1 and not valid_chunks(num_fc1_chunks):
+                num_fc1_chunks -= 1
+            for chunks in range(n // _BLOCK_SIZE, num_fc1_chunks, -1):
+                if valid_chunks(chunks) and m * num_topk * chunks <= fc2_grid:
+                    num_fc1_chunks = chunks
+                    break
         if self.w4a16_mode and m == 1 and n <= 2048:
             # 4 rows/warp only helps the k_segments==8 aligned gated path (its
             # reg-hoist + dual-dot assume 4 rows). The k_segments==12 path is
@@ -735,6 +774,12 @@ class MoEDirectMicroKernel:
             # Likewise FC2 can expose every output-row task directly once
             # FC1 has completed in a prior launch.
             grid_x = max(1, fc2_tasks)
+        elif one_round:
+            # FC1 in one round when it fits; FC2 in its fewest rounds.
+            grid_x = max(
+                _balanced_grid(fc2_tasks, max_active_ctas),
+                min(fc1_tasks, int(max_active_ctas)),
+            )
         elif m in (1, 2):
             grid_x = max(1, min(int(max_active_ctas), max(fc1_tasks, fc2_tasks)))
         elif num_fc1_chunks < 16:
@@ -5110,6 +5155,7 @@ def build_direct_micro_kernel(
     swiglu_beta: float | None = None,
     max_active_ctas: int | None = None,
     device: torch.device | None = None,
+    one_round_fc1: bool = False,
 ) -> MoEDirectMicroKernel:
     """Construct and configure a direct micro kernel for one problem shape.
 
@@ -5141,7 +5187,14 @@ def build_direct_micro_kernel(
         swiglu_beta=swiglu_beta,
     )
     kernel.configure(
-        m, k, n, num_topk, weight_E, max_active_ctas=max_active_ctas, device=device
+        m,
+        k,
+        n,
+        num_topk,
+        weight_E,
+        max_active_ctas=max_active_ctas,
+        device=device,
+        one_round_fc1=one_round_fc1,
     )
     return kernel
 

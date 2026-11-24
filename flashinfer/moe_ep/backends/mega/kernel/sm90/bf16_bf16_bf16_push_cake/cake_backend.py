@@ -220,13 +220,118 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 f"{_NAME} launches on the current torch CUDA stream; BootstrapConfig.stream must be 0"
             )
-        from ......kernel_src.sm90.cake_bf16_megamoe import COMBINE_WIRES
+        from flashinfer.moe_ep.shims.sm90.cake_bf16 import COMBINE_WIRES
 
         if kcfg.combine_wire is not None and kcfg.combine_wire not in COMBINE_WIRES:
             raise MoEEpConfigError(
                 f"{_NAME} combine_wire must be one of {COMBINE_WIRES} or None, got "
                 f"{kcfg.combine_wire!r}"
             )
+        if kcfg.pdl is not None and not (
+            isinstance(kcfg.pdl, bool)
+            or (isinstance(kcfg.pdl, int) and 0 <= kcfg.pdl <= 31)
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} pdl must be a bool, an edge mask in [0, 31] or None, got {kcfg.pdl!r}"
+            )
+        if kcfg.pdl_late is not None and not isinstance(kcfg.pdl_late, bool):
+            raise MoEEpConfigError(
+                f"{_NAME} pdl_late must be a bool or None, got {kcfg.pdl_late!r}"
+            )
+        if kcfg.fused_begin is not None and kcfg.fused_begin not in (0, 1, 2):
+            raise MoEEpConfigError(
+                f"{_NAME} fused_begin must be 0, 1, 2 or None, got {kcfg.fused_begin!r}"
+            )
+        if kcfg.fused_dispatch_max_tokens is not None and not (
+            isinstance(kcfg.fused_dispatch_max_tokens, int)
+            and not isinstance(kcfg.fused_dispatch_max_tokens, bool)
+            and 1 <= kcfg.fused_dispatch_max_tokens <= 512
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} fused_dispatch_max_tokens must be an int in [1, 512] or None, got "
+                f"{kcfg.fused_dispatch_max_tokens!r}"
+            )
+        if kcfg.grid_dispatch_min_tokens is not None and not (
+            isinstance(kcfg.grid_dispatch_min_tokens, int)
+            and not isinstance(kcfg.grid_dispatch_min_tokens, bool)
+            and kcfg.grid_dispatch_min_tokens >= 0
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} grid_dispatch_min_tokens must be an int >= 0 or None, got "
+                f"{kcfg.grid_dispatch_min_tokens!r}"
+            )
+        for name in ("compact_form", "publish_form", "prefix_form"):
+            value = getattr(kcfg, name)
+            if value is not None and (isinstance(value, bool) or value not in (0, 1)):
+                raise MoEEpConfigError(
+                    f"{_NAME} {name} must be 0, 1 or None, got {value!r}"
+                )
+        if kcfg.per_route_publish_pdl is not None and not isinstance(
+            kcfg.per_route_publish_pdl, bool
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} per_route_publish_pdl must be a bool or None, got {kcfg.per_route_publish_pdl!r}"
+            )
+        if kcfg.fc2_early_windows is not None and not isinstance(
+            kcfg.fc2_early_windows, bool
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} fc2_early_windows must be a bool or None, got {kcfg.fc2_early_windows!r}"
+            )
+        if kcfg.fc2_early_max_tokens is not None and not (
+            isinstance(kcfg.fc2_early_max_tokens, int)
+            and not isinstance(kcfg.fc2_early_max_tokens, bool)
+            and kcfg.fc2_early_max_tokens >= 0
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} fc2_early_max_tokens must be an int >= 0 or None, got "
+                f"{kcfg.fc2_early_max_tokens!r}"
+            )
+        self._wcx_max_tokens()  # config field, else the environment: an int in [0, 128]
+        if kcfg.direct_place is not None and not isinstance(kcfg.direct_place, bool):
+            raise MoEEpConfigError(
+                f"{_NAME} direct_place must be a bool or None, got {kcfg.direct_place!r}"
+            )
+        if kcfg.direct_place_min_tokens is not None and not (
+            isinstance(kcfg.direct_place_min_tokens, int)
+            and not isinstance(kcfg.direct_place_min_tokens, bool)
+            and kcfg.direct_place_min_tokens >= 0
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} direct_place_min_tokens must be an int >= 0 or None, got "
+                f"{kcfg.direct_place_min_tokens!r}"
+            )
+
+    def _wcx_max_tokens(self) -> int:
+        """Requested WCX decode-round bound (config, else the environment; 0 = off)."""
+        from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_runner import (
+            validate_wcx_max_tokens,
+            wcx_max_tokens_default,
+        )
+
+        value = self._kernel_config.wcx_max_tokens
+        try:
+            return validate_wcx_max_tokens(
+                wcx_max_tokens_default() if value is None else value
+            )
+        except ValueError as exc:
+            raise MoEEpConfigError(
+                f"{_NAME} wcx_max_tokens (config field or environment): {exc}"
+            ) from exc
+
+    def _wcx_copies_needed(self, fleet_params: FleetParams) -> bool:
+        """True when the runner will resolve WCX on (wcx_max_tokens > 0, an
+        effective fc2_early_max_tokens > 0, an early-start geometry and a GEMM
+        with the WCX pair), so the layer needs the WCX copies."""
+        from flashinfer.moe_ep.shims.sm90.cake_bf16.cake_runner import wcx_resolves_on
+
+        return wcx_resolves_on(
+            wcx_max_tokens=self._wcx_max_tokens(),
+            fc2_early_max_tokens=self._kernel_config.fc2_early_max_tokens,
+            num_local_experts=fleet_params.num_experts // self.ep_world_size,
+            hidden_size=fleet_params.token_hidden_size,
+            intermediate_size=self._kernel_config.intermediate_size,
+        )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -236,6 +341,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             num_local_experts=fleet_params.num_experts // self.ep_world_size,
+            wcx=self._wcx_copies_needed(fleet_params),
         )
         self._transformed_weights = transformed
         return transformed
@@ -253,6 +359,15 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             hidden_size=fleet_params.token_hidden_size,
             num_local_experts=fleet_params.num_experts // self.ep_world_size,
         )
+        copies = getattr(transformed_weights, "wcx", None)
+        if copies is None and self._wcx_copies_needed(fleet_params):
+            warnings.warn(
+                f"{_NAME} WCX is on (wcx_max_tokens > 0 with the FC2 early-start pair) "
+                "but the transformed weights carry no WCX copies (attach them with "
+                "encode_sm90_cake_wcx); decode rounds keep the bf16 GEMMs",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self._transformed_weights = transformed_weights
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> _Sm90CakeBf16Workspace:
@@ -277,8 +392,8 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
     def _allocate_workspace_with_init_timeout(
         self, fleet_params: FleetParams, comm: Any, transformed_weights: Any
     ) -> _Sm90CakeBf16Workspace:
-        from ......kernel_src.sm90.cake_bf16_megamoe import Sm90CakeBf16MoERunner
-        from ......kernel_src.sm90.push_style_megamoe import (
+        from flashinfer.moe_ep.shims.sm90.cake_bf16 import Sm90CakeBf16MoERunner
+        from flashinfer.moe_ep.shims.sm90.push_style_megamoe import (
             Sm90PushCombine,
             Sm90PushConfig,
             Sm90PushPayload,
@@ -335,6 +450,20 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 transformed_weights,
                 clamp=None if kcfg.clamp_limit is None else float(kcfg.clamp_limit),
                 combine_wire=kcfg.combine_wire,
+                pdl=kcfg.pdl,
+                pdl_late=kcfg.pdl_late,
+                fused_begin=kcfg.fused_begin,
+                fused_dispatch_max_tokens=kcfg.fused_dispatch_max_tokens,
+                grid_dispatch_min_tokens=kcfg.grid_dispatch_min_tokens,
+                compact_form=kcfg.compact_form,
+                publish_form=kcfg.publish_form,
+                per_route_publish_pdl=kcfg.per_route_publish_pdl,
+                fc2_early_max_tokens=kcfg.fc2_early_max_tokens,
+                prefix_form=kcfg.prefix_form,
+                direct_place=kcfg.direct_place,
+                direct_place_min_tokens=kcfg.direct_place_min_tokens,
+                fc2_early_windows=kcfg.fc2_early_windows,
+                wcx_max_tokens=self._wcx_max_tokens(),
             )
         except Exception:
             pipe.destroy()
@@ -361,6 +490,20 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             None if kcfg.clamp_limit is None else float(kcfg.clamp_limit),
             kcfg.allow_unverified_p2p,
             kcfg.combine_wire,
+            kcfg.pdl,
+            kcfg.pdl_late,
+            kcfg.fused_begin,
+            kcfg.fused_dispatch_max_tokens,
+            kcfg.grid_dispatch_min_tokens,
+            kcfg.compact_form,
+            kcfg.publish_form,
+            kcfg.per_route_publish_pdl,
+            kcfg.fc2_early_max_tokens,
+            kcfg.prefix_form,
+            kcfg.direct_place,
+            kcfg.direct_place_min_tokens,
+            kcfg.fc2_early_windows,
+            self._wcx_max_tokens(),
             float(kcfg.init_timeout_s),
         )
 

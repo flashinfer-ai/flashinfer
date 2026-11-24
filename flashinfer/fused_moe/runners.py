@@ -51,7 +51,9 @@ from ..autotuner import (
     DynamicTensorSpec,
     TunableRunner,
     TuningConfig,
+    cake_group_tuning,
 )
+from ..jit.core import logger
 from ..quantization.nvfp4_quantization_utils import (
     _UNSET,
     NVFP4_4OVER6_CODE_FROM_ENV,
@@ -99,6 +101,8 @@ from .api import (
     SwiGLUStep,
     # Unified config and pack types
     ActivationType,
+    CakeWarpDecodeConfig,
+    CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -852,10 +856,7 @@ class MoERunner(TunableRunner):
             resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
         )
 
-    # Anything the profiled tensor shapes cannot reveal has to be listed here.
-    # One stable tuple feeds both __hash__ (in-memory) and the persisted key,
-    # which excludes runner_hash. Shapes already in the profile are omitted.
-
+    # Persisted key (no runner_hash), so rank-invariant; __hash__ adds the EP offset.
     def _cache_key_extras(self) -> tuple:
         """Return stable tactic inputs absent from profiled tensor shapes."""
         routing = self.config.routing
@@ -874,7 +875,6 @@ class MoERunner(TunableRunner):
             int(routing.top_k),
             int(routing.num_experts),
             int(local_num_experts),
-            int(experts.local_expert_offset),
             int(experts.intermediate_size),
             # S changes tactic enumeration but not profiled tensor shapes.
             int(experts.num_fused_shared_experts),
@@ -894,7 +894,10 @@ class MoERunner(TunableRunner):
         )
 
     def __hash__(self) -> int:
-        return hash(self._cache_key_extras())
+        # In-memory only: EP ranks must share persisted entries (#6082).
+        return hash(
+            (self._cache_key_extras(), int(self.config.experts.local_expert_offset))
+        )
 
     def _input_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         """Optional tactic-pool identity, stable for packed and profiling inputs."""
@@ -909,6 +912,10 @@ class MoERunner(TunableRunner):
 # ---------------------------------------------------------------------------
 # Cake exact-SM100/SM103 NVFP4 warp-decode runner
 # ---------------------------------------------------------------------------
+
+
+# Module-load failures of the default Cake warp-decode entry, by SM architecture.
+_DEFAULT_CAKE_LOAD_ERRORS: dict[int, Exception] = {}
 
 
 class CakeWarpDecodeRunner(MoERunner):
@@ -974,7 +981,6 @@ class CakeWarpDecodeRunner(MoERunner):
         SiTU(gate_scale=4.0, linear_scale=25.0): ("gemm1_alpha", "gemm1_beta"),
     }
     _MAX_STREAM_WORKSPACES: ClassVar[int] = 64
-    _MAX_TOPK_VALIDATION_RECEIPTS: ClassVar[int] = 64
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -989,6 +995,8 @@ class CakeWarpDecodeRunner(MoERunner):
         major, minor = get_compute_capability(self.device)
         self._device_arch = major * 10 + minor
         self._module: Any = None
+        # The default entry's first-use load failure; the entry then stays out.
+        self._load_error: Exception | None = None
         self._workspace_cache: OrderedDict[
             tuple[int, tuple[int, int, int, int, int]],
             tuple[Any, torch.Tensor],
@@ -1004,9 +1012,6 @@ class CakeWarpDecodeRunner(MoERunner):
             tuple[int, int, tuple[int, int, int, int, int]],
             tuple[torch.Tensor, int],
         ] = {}
-        self._topk_validation_receipts: OrderedDict[
-            int, tuple[torch.Tensor, int, int | None, int]
-        ] = OrderedDict()
         # There is exactly one adaptive schedule. Exact runtime shapes are
         # profiled as-is, so the autotuner never synthesizes invalid expert ids.
         self.tuning_config = TuningConfig(use_cuda_graph=True)
@@ -1014,8 +1019,26 @@ class CakeWarpDecodeRunner(MoERunner):
     def _uses_clamped_swiglu(self) -> bool:
         return self.config.activation == SwiGLU(limit=10.0)
 
+    def _is_default_candidate(self) -> bool:
+        """Whether this runner serves the default backend list's Cake entry."""
+        return any(
+            isinstance(candidate, CakeWarpDecodeConfig) and candidate.default_candidate
+            for candidate in self.config.backend
+        )
+
     def _check_support(self) -> None:
         super()._check_support()
+        default_candidate = self._is_default_candidate()
+        if default_candidate:
+            from ..api_logging import cake_auto_candidates_enabled
+
+            # Read when MoELayer builds its runners: layers built while the
+            # switch is set have no automatic Cake candidate.
+            if not cake_auto_candidates_enabled():
+                raise NotImplementedError(
+                    "Automatic Cake candidates are disabled by "
+                    "FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1."
+                )
         if self._device_arch not in (100, 103):
             raise NotImplementedError(
                 "CakeWarpDecodeRunner requires exact SM100 or SM103, "
@@ -1025,7 +1048,14 @@ class CakeWarpDecodeRunner(MoERunner):
             raise NotImplementedError("Clamped E256 warp decode requires exact SM100.")
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("CakeWarpDecodeRunner requires do_finalize=True.")
-        if self.config.execution.enable_pdl is not True:
+        enable_pdl = self.config.execution.enable_pdl
+        if enable_pdl is None and default_candidate:
+            # The default entry keeps ExecutionConfig's automatic PDL meaning.
+            # An explicit Cake config still requires enable_pdl=True.
+            from ..utils import device_support_pdl
+
+            enable_pdl = device_support_pdl(self.device)
+        if enable_pdl is not True:
             raise NotImplementedError(
                 "CakeWarpDecodeRunner requires ExecutionConfig(enable_pdl=True)."
             )
@@ -1073,6 +1103,19 @@ class CakeWarpDecodeRunner(MoERunner):
             )
 
     def _build(self) -> None:
+        if self._is_default_candidate():
+            # Load on first use instead (see _require_built). A default-list
+            # layer whose weight pack has no "cake" view then never compiles or
+            # loads the Cake module.
+            return
+        self._module = self._load_module()
+
+    def _require_built(self) -> None:
+        super()._require_built()
+        if self._module is None:
+            self._module = self._load_module()
+
+    def _load_module(self) -> Any:
         from ..jit.cake_fused_moe_warp_decode import (
             get_cake_fused_moe_warp_decode_module,
         )
@@ -1087,11 +1130,132 @@ class CakeWarpDecodeRunner(MoERunner):
                 "CakeWarpDecodeRunner build requires exact SM100 or SM103, "
                 f"got SM{self._device_arch}."
             )
-        self._module = get_cake_fused_moe_warp_decode_module(target, device=self.device)
+        return get_cake_fused_moe_warp_decode_module(target, device=self.device)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
         return [-1]
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        if not self._is_default_candidate():
+            # An explicit Cake config keeps reporting unsupported inputs from
+            # pack_inputs.
+            return super()._accepts_shape(act)
+        # Repeat the cheap pack_inputs checks, so MoELayer skips the default
+        # entry for inputs it cannot serve instead of failing the whole call.
+        hidden_states = act.hidden_states_q
+        hidden_states_scale = act.hidden_states_scale
+        if (
+            hidden_states.ndim != 2
+            or hidden_states.dtype != torch.uint8
+            or not hidden_states.is_contiguous()
+            or not 1 <= hidden_states.shape[0] <= 32
+        ):
+            return False
+        num_tokens = int(hidden_states.shape[0])
+        hidden_size = int(hidden_states.shape[1]) * 2
+        routing = self.config.routing
+        intermediate_size = self.config.experts.intermediate_size
+        configuration = (
+            self.config.activation,
+            hidden_size,
+            intermediate_size,
+            routing.num_experts,
+            routing.top_k,
+        )
+        if configuration not in self._SUPPORTED_CONFIGURATIONS:
+            return False
+        if (
+            hidden_states_scale is None
+            or hidden_states_scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
+            or tuple(hidden_states_scale.shape) != (num_tokens, hidden_size // 16)
+            or not hidden_states_scale.is_contiguous()
+            or act.topk_ids is None
+            or act.topk_weights is None
+            or act.topk_weights.dtype != torch.bfloat16
+            or not act.topk_ids.is_contiguous()
+            or not act.topk_weights.is_contiguous()
+        ):
+            return False
+        # Group tuning requires every rank to tune the same runners, and this
+        # entry's eligibility depends on the rank-local token count.
+        if cake_group_tuning():
+            return False
+        geometry = (
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            routing.num_experts,
+            routing.top_k,
+        )
+        # Stream workspaces are never evicted. Leave the default entry out
+        # before that limit is reached instead of failing the call. One winner
+        # selection can add two stream workspaces: the caller stream and the
+        # timing warmup stream. A stream that already holds a workspace for
+        # this geometry adds at most the warmup stream's, so it stays eligible
+        # while one more workspace fits.
+        cached = len(self._workspace_cache)
+        if cached > self._MAX_STREAM_WORKSPACES - 2 and (
+            cached >= self._MAX_STREAM_WORKSPACES
+            or (self._stream_token(self._current_stream()), geometry)
+            not in self._workspace_cache
+        ):
+            return False
+        if self._is_current_stream_capturing() and not self._capture_ready(geometry):
+            return False
+        # The default entry loads its module on first use. A failed load leaves
+        # the entry out, so another eligible runner serves the call.
+        return self._module is not None or self._load_default_module()
+
+    def _load_default_module(self) -> bool:
+        """Load the default entry's module once; return whether it is loaded."""
+        if getattr(self, "_load_error", None) is not None:
+            return False
+        # One failed load per architecture leaves every layer's default entry
+        # out, so a model does not rebuild the failing module once per layer.
+        failed = _DEFAULT_CAKE_LOAD_ERRORS.get(self._device_arch)
+        if failed is not None:
+            self._load_error = failed
+            return False
+        try:
+            self._module = self._load_module()
+        except Exception as error:  # noqa: BLE001 - any load failure leaves the entry out
+            self._load_error = error
+            _DEFAULT_CAKE_LOAD_ERRORS[self._device_arch] = error
+            logger.warning(
+                "The default Cake warp-decode MoE entry is left out: its module "
+                "failed to load (%s: %s).",
+                type(error).__name__,
+                error,
+            )
+            return False
+        return True
+
+    def _capture_ready(self, geometry: tuple[int, int, int, int, int]) -> bool:
+        """Whether pack_inputs can serve this geometry during CUDA Graph capture.
+
+        Capture cannot allocate or prepare a workspace, so a prepared workspace
+        for this exact geometry must exist from an eager call.
+        """
+        cached = self._workspace_cache.get(
+            (self._stream_token(self._current_stream()), geometry)
+        )
+        candidates = (
+            [cached]
+            if cached is not None
+            else [
+                entry
+                for cached_key, entry in self._workspace_cache.items()
+                if cached_key[1] == geometry
+            ]
+        )
+        for _, workspace in candidates:
+            prepared = self._prepared_workspaces.get(
+                self._workspace_identity(workspace, geometry)
+            )
+            if prepared is not None and prepared[0] is workspace:
+                return True
+        return False
 
     @staticmethod
     def _workspace_identity(
@@ -1166,67 +1330,6 @@ class CakeWarpDecodeRunner(MoERunner):
     @staticmethod
     def _stream_token(stream: Any) -> int:
         return 0 if stream is None else int(stream.cuda_stream)
-
-    @staticmethod
-    def _topk_version(topk_ids: torch.Tensor) -> int | None:
-        try:
-            return int(topk_ids._version)
-        except RuntimeError:
-            # Inference tensors do not expose a version counter. Their receipt
-            # is therefore identity-only; callers retain the same obligation
-            # to keep graph-time mutations in range as on graph replay.
-            return None
-
-    def _validate_expert_id_range(
-        self, topk_ids: torch.Tensor, num_experts: int
-    ) -> None:
-        # The adaptive direct schedules use each ID as an expert-array/TMA
-        # coordinate. Validate while inputs are packed, never in the timed or
-        # captured launch path. CUDA Graph callers must keep later mutations in
-        # the same documented range.
-        if not torch.is_tensor(topk_ids):
-            return
-        cache_key = id(topk_ids)
-        data_ptr = topk_ids.data_ptr()
-        version = self._topk_version(topk_ids)
-        receipt = self._topk_validation_receipts.get(cache_key)
-        if (
-            receipt is not None
-            and receipt[0] is topk_ids
-            and receipt[1] == data_ptr
-            and receipt[2] == version
-            and receipt[3] == num_experts
-        ):
-            self._topk_validation_receipts.move_to_end(cache_key)
-            return
-        if self._is_current_stream_capturing():
-            raise RuntimeError(
-                "Cake warp decode topk_ids must be range-validated before CUDA "
-                "Graph capture; warm up this exact tensor version first."
-            )
-        in_range = torch.logical_and(topk_ids >= 0, topk_ids < num_experts).all()
-        if not bool(in_range.item()):
-            raise ValueError(
-                "CakeWarpDecodeRunner requires every topk_ids value to satisfy "
-                f"0 <= id < {num_experts}."
-            )
-        if (
-            cache_key not in self._topk_validation_receipts
-            and len(self._topk_validation_receipts)
-            >= self._MAX_TOPK_VALIDATION_RECEIPTS
-        ):
-            raise RuntimeError(
-                "Cake warp decode supports at most 64 live routing-validation "
-                "receipts; construct a new runner before validating another "
-                "topk_ids tensor."
-            )
-        self._topk_validation_receipts[cache_key] = (
-            topk_ids,
-            data_ptr,
-            version,
-            num_experts,
-        )
-        self._topk_validation_receipts.move_to_end(cache_key)
 
     def _cache_workspace_for_stream(
         self,
@@ -1462,7 +1565,9 @@ class CakeWarpDecodeRunner(MoERunner):
             allowed_weights_dtypes=(torch.bfloat16,),
             require_contiguous=True,
         )
-        self._validate_expert_id_range(act.topk_ids, routing.num_experts)
+        # Expert ids outside [0, num_experts) are dropped inside the kernels;
+        # the host never reads topk_ids, so capture and replay need no receipt.
+        topk_ids, topk_weights = act.topk_ids, act.topk_weights
         device = act.hidden_states_q.device
         if device != self.device:
             raise ValueError(
@@ -1593,8 +1698,8 @@ class CakeWarpDecodeRunner(MoERunner):
             workspace,
             act.hidden_states_q,
             act.hidden_states_scale,
-            act.topk_ids,
-            act.topk_weights,
+            topk_ids,
+            topk_weights,
             view["gemm1_weights"],
             view["gemm1_weights_scale"],
             view["gemm2_weights"],
@@ -4968,16 +5073,42 @@ class CuteDslRunner(MoERunner):
     supported_quant_variants = (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.NVFP4, QuantFormat.BF16),
     )
-    supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        (QuantFormat.NVFP4, QuantFormat.BF16): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+    }
     # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
     # takes the recipe as an argument; _check_support() below narrows this to
     # the per-token path, the only one that runs that quantizer.
     supports_nvfp4_4over6 = True
 
+    @property
+    def swap_ab(self) -> bool:
+        candidates = [
+            backend
+            for backend in self.config.backend
+            if isinstance(backend, CuteDslConfig)
+        ]
+        if not candidates:
+            # Direct legacy runner construction has no backend-specific options.
+            return False
+        if len(candidates) != 1:
+            raise ValueError("CuteDslRunner requires one bound CuteDslConfig")
+        return candidates[0].swap_ab
+
     def _check_support(self) -> None:
         super()._check_support()
+        if self.swap_ab and hasattr(self, "device"):
+            from .prepare import _cute_dsl_gated_weight_group_size
+
+            _cute_dsl_gated_weight_group_size(self.device, self.swap_ab)
         if self.config.quant.swizzled_scale_factors is True:
             raise NotImplementedError(
                 f"{type(self).__name__} consumes only the linear activation "
@@ -5003,16 +5134,27 @@ class CuteDslRunner(MoERunner):
                 f"{self.config.quant.weight.name}×{self.config.quant.activation.name} "
                 "activation scales."
             )
-        mxfp4_mxfp8 = self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-        if mxfp4_mxfp8 and isinstance(self.config.activation, SiTU):
-            raise NotImplementedError("CuTe-DSL W4A8 does not support SiTU.")
-        if mxfp4_mxfp8 and not self.config.finalize.use_fused_finalize:
-            raise NotImplementedError("CuTe-DSL W4A8 requires fused finalize.")
-        if mxfp4_mxfp8 and hasattr(self, "device"):
+        # W4A8 (MXFP4 weights) and MXFP8 (MXFP8 weights) share the MXFP8
+        # activation path and its limits.
+        mxfp8_act = self.config.quant.pair in (
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        )
+        mode = (
+            "MXFP8"
+            if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
+            else "W4A8"
+        )
+        if mxfp8_act and not self.swap_ab:
+            if isinstance(self.config.activation, SiTU):
+                raise NotImplementedError(f"CuTe-DSL {mode} does not support SiTU.")
+            if not self.config.finalize.use_fused_finalize:
+                raise NotImplementedError(f"CuTe-DSL {mode} requires fused finalize.")
+        if mxfp8_act and hasattr(self, "device"):
             from ..utils import get_compute_capability
 
             if get_compute_capability(self.device) == (10, 7):
-                raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
+                raise NotImplementedError(f"CuTe-DSL {mode} does not support SM107.")
         if (
             isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
             and not self.config.quant.per_token_scale
@@ -5116,6 +5258,7 @@ class CuteDslRunner(MoERunner):
         if self.config.quant.pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
             (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
         ):
             self._inner = CuteDslFusedMoERunner(
                 forward_impl=_cute_dsl_fused_moe_impl,
@@ -5126,11 +5269,12 @@ class CuteDslRunner(MoERunner):
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
-                quant_mode=(
-                    "w4a8"
-                    if self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-                    else "w4a4"
-                ),
+                quant_mode={
+                    (QuantFormat.NVFP4, QuantFormat.NVFP4): "w4a4",
+                    (QuantFormat.MXFP4, QuantFormat.MXFP8): "w4a8",
+                    (QuantFormat.MXFP8, QuantFormat.MXFP8): "mxfp8",
+                }[self.config.quant.pair],
+                swap_ab=self.swap_ab,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
@@ -5141,6 +5285,7 @@ class CuteDslRunner(MoERunner):
                 local_expert_offset=experts.local_expert_offset,
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
+                swap_ab=self.swap_ab,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         else:
@@ -5165,10 +5310,13 @@ class CuteDslRunner(MoERunner):
         return self._inner.get_valid_tactics(inputs, profile)
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + (
+        extras = super()._cache_key_extras() + (
             bool(self._inner.use_fused_finalize),
             bool(self._inner.enable_pdl),
         )
+        if self.swap_ab:
+            extras += ("swap_ab",)
+        return extras
 
     def forward(
         self,
@@ -5218,6 +5366,16 @@ class CuteDslRunner(MoERunner):
                 f"{type(self.config.activation).__name__}; prepare the view with "
                 "the same typed activation."
             )
+        if self.config.activation.is_gated:
+            expected_group_size = 16 if self.swap_ab else 64
+            # Unannotated manual views use the original 64-row API contract.
+            group_size = v.get("gated_weight_group_size", 64)
+            if group_size != expected_group_size:
+                raise ValueError(
+                    f"CuteDslRunner: gated_weight_group_size={group_size} does "
+                    f"not match swap_ab={self.swap_ab}; prepare the weight view "
+                    "with the same swap_ab option."
+                )
 
         pair = self.config.quant.pair
         use_per_token_activation = bool(self.config.quant.per_token_scale)
@@ -5226,13 +5384,16 @@ class CuteDslRunner(MoERunner):
             in (
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
                 (QuantFormat.MXFP4, QuantFormat.MXFP8),
+                (QuantFormat.MXFP8, QuantFormat.MXFP8),
             )
             and not use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is None
         ):
-            is_mxfp4 = pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-            hidden_size = act.hidden_states_q.shape[1] * (1 if is_mxfp4 else 2)
+            # MXFP8 activations (W4A8 and MXFP8): one E4M3 byte per element and
+            # row-major E8M0 scales, no GEMM2 input scale.
+            mxfp8_act = pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
+            hidden_size = act.hidden_states_q.shape[1] * (1 if mxfp8_act else 2)
             moe_output = act.hidden_states_q.new_empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16
             )
@@ -5240,15 +5401,15 @@ class CuteDslRunner(MoERunner):
                 act.hidden_states_q,
                 (
                     act.hidden_states_scale
-                    if is_mxfp4
+                    if mxfp8_act
                     else act.hidden_states_scale.unsqueeze(-1)
-                ).view(torch.uint8 if is_mxfp4 else act.hidden_states_scale.dtype),
+                ).view(torch.uint8 if mxfp8_act else act.hidden_states_scale.dtype),
                 act.topk_ids,
                 act.topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
-                None if is_mxfp4 else v["fc2_input_scale"],
+                None if mxfp8_act else v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
@@ -5365,6 +5526,9 @@ class _TrtllmRunnerBase(MoERunner):
     _num_weight_rows: int
     _intermediate_size: int
     device: torch.device
+    # Whether packed FP4 weights may also come BlockMajorK,
+    # ``[experts, K_bytes / block, Mn, block]`` with 64- or 128-byte blocks.
+    accepts_block_major_k_fp4_weights: ClassVar[bool] = False
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -5488,12 +5652,22 @@ class _TrtllmRunnerBase(MoERunner):
                 self._intermediate_size // 2,
             ),
         }
-        for name, expected in expected_weights.items():
+        for name, (num_experts, mn, k_bytes) in expected_weights.items():
             tensor = view[name]
-            if tensor.dtype != torch.uint8 or tuple(tensor.shape) != expected:
+            shape = tuple(tensor.shape)
+            expected: tuple[int, ...] = (num_experts, mn, k_bytes)
+            if self.accepts_block_major_k_fp4_weights and tensor.dim() == 4:
+                block = shape[-1]
+                if block not in (64, 128) or k_bytes % block != 0:
+                    raise ValueError(
+                        f"{name} BlockMajorK blocks must be 64 or 128 bytes "
+                        f"dividing {k_bytes}, got {tensor.dtype} {shape}."
+                    )
+                expected = (num_experts, k_bytes // block, mn, block)
+            if tensor.dtype != torch.uint8 or shape != expected:
                 raise ValueError(
                     f"{name} must be packed uint8 with shape {expected}, got "
-                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                    f"{tensor.dtype} {shape}."
                 )
 
         for name, expected in (
@@ -7370,11 +7544,14 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     ``_TrtllmRunnerBase._build``. The middle GEMM is the Prims-TS CuTe-DSL
     batched path. Weight and activation layouts match the corresponding
     TRT-LLM prepare helpers, except DeepSeekFp8 weight payloads, which are
-    shuffled with epilogue tile 64.
+    shuffled with epilogue tile 64, and the BlockMajorK MXFP4×MXFP8 weights
+    of ``PrimsTsConfig.prepare_weights``. FP4 weights are accepted in either
+    layout.
     """
 
     backend_key = "prims_ts"
     supports_per_token_scale = True
+    accepts_block_major_k_fp4_weights = True
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
@@ -7393,13 +7570,34 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
-        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+            SwiGLU,
+            GeGLU,
+            SiTU,
+            ReLU2,
+            SiLU,
+        ),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (
+            SwiGLU,
+            GeGLU,
+            SiTU,
+            ReLU2,
+            SiLU,
+        ),
         (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
-        (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2),
-        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): (SwiGLU, ReLU2),
+        (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2, SiLU),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): (
+            SwiGLU,
+            ReLU2,
+            SiLU,
+        ),
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (
+            SwiGLU,
+            GeGLU,
+            ReLU2,
+            SiLU,
+        ),
     }
 
     def _check_support(self) -> None:
@@ -7508,10 +7706,15 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self._enable_pdl = enable_pdl
         self._inner: Any = None
 
-    def _weight_layout(self) -> int:
+    def _weight_layout(self, view: Optional[dict] = None) -> int:
         from flashinfer.tllm_enums import WeightLayout
 
         if self._pair == (QuantFormat.BF16, QuantFormat.BF16):
+            return int(WeightLayout.BlockMajorK)
+        # FP4 weights are MajorK [experts, Mn, K_bytes] or BlockMajorK
+        # [experts, K_bytes / block, Mn, block]; the rank tells them apart.
+        is_fp4 = self._pair[0] in (QuantFormat.NVFP4, QuantFormat.MXFP4)
+        if is_fp4 and view is not None and view["gemm1_weights"].dim() == 4:
             return int(WeightLayout.BlockMajorK)
         return int(WeightLayout.MajorK)
 
@@ -7588,7 +7791,33 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         # launch state of the call being tuned or launched, never from a
         # previous pack.
         if isinstance(launch_state, _TrtllmLaunchState) and self._inner is not None:
+            from flashinfer.tllm_enums import WeightLayout
+
             self._inner.set_cache_key_static_extras(**launch_state.static_kwargs)
+            # The weight layout follows the view, so the tactics are enumerated
+            # and launched for the weights of this call.
+            self._inner.weight_layout = WeightLayout(
+                launch_state.static_kwargs["weight_layout"]
+            )
+
+    def precompile_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        tactics: List[Any],
+        profile: Any,
+        **kwargs: Any,
+    ) -> bool:
+        """Compile the GEMMs of every tactic before the autotuner profiles them."""
+        self._require_built()
+        launch_state = kwargs.pop("launch_state", None)
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        if not isinstance(launch_state, _TrtllmLaunchState) or self._inner is None:
+            return False
+        self._sync_inner_static_extras(launch_state)
+        return self._inner.precompile_tactics(
+            inputs, tactics, profile, **launch_state.static_kwargs
+        )
 
     def forward(
         self,
@@ -7746,22 +7975,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
         per_token_scale = None
         if is_fp4:
+            # MXFP4xMXFP8 keeps the compact TRT-LLM UE8M0 row here;
+            # PrimsTsMxfp4Mxfp8MoERunner pads it to the GEMM's row stride.
             hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
-            if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
-                # TRT-LLM stores a compact linear UE8M0 row. The Prims-TS
-                # MXFP8 activation GEMM reads K-blocks rounded up to 16.
-                # Padding happens on every pack_inputs, including the hot
-                # forward path: one allocation, fill, and copy per call, so
-                # the public activation pack can stay the shared TRT-LLM layout.
-                from flashinfer.prims_ts.moe.runner import (
-                    _pad_mxfp8_linear_scale_for_prims,
-                )
-
-                hidden_states_scale = _pad_mxfp8_linear_scale_for_prims(
-                    hidden_states_scale,
-                    num_tokens=num_tokens,
-                    hidden_size=hidden_size,
-                ).view(torch.float8_e4m3fn)
             if is_nvfp4:
                 if self._per_token and act.per_token_scale is None:
                     raise RuntimeError(
@@ -7796,13 +8012,30 @@ class PrimsTsRunner(_TrtllmRunnerBase):
 
         routing_logits, routing_bias, topk_ids, expert_weights = self._pack_routing(act)
 
-        output = act.hidden_states_q.new_empty(
-            (
-                num_tokens,
-                hidden_size if self.config.finalize.do_finalize else 0,
-            ),
-            dtype=torch.bfloat16,
-        )
+        output = act.output if self.config.finalize.do_finalize else None
+        if output is None:
+            output = act.hidden_states_q.new_empty(
+                (
+                    num_tokens,
+                    hidden_size if self.config.finalize.do_finalize else 0,
+                ),
+                dtype=torch.bfloat16,
+            )
+        elif (
+            output.dtype != torch.bfloat16
+            or tuple(output.shape) != (num_tokens, hidden_size)
+            or not output.is_contiguous()
+            or output.device != act.hidden_states_q.device
+            # The finalize kernels store 16-byte vectors.
+            or output.data_ptr() % 16 != 0
+        ):
+            raise ValueError(
+                f"{type(self).__name__} output must be a contiguous, 16-byte "
+                f"aligned bfloat16 [{num_tokens}, {hidden_size}] tensor on "
+                f"{act.hidden_states_q.device}, got {output.dtype} "
+                f"{tuple(output.shape)} on {output.device} at "
+                f"{output.data_ptr():#x}."
+            )
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
@@ -7831,8 +8064,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             routed_scaling_factor=routing.routed_scaling_factor,
             routing_method_type=int(routing.method),
             use_shuffled_weight=True,
-            weight_layout=self._weight_layout(),
+            weight_layout=self._weight_layout(v),
             do_finalize=self.config.finalize.do_finalize,
+            zero_rows_without_local_expert=act.zero_rows_without_local_expert,
             enable_pdl=self._enable_pdl,
             activation_type=self._activation_type,
             norm_topk_prob=True,
@@ -8383,6 +8617,7 @@ class SM12xFp8Runner(MoERunner):
             topk_weights,
             self.config.routing.num_experts,
             workspace=workspace,
+            token_only=True,
         )
         self._fc1(
             a_q,
@@ -8393,6 +8628,7 @@ class SM12xFp8Runner(MoERunner):
             enable_pdl=enable_pdl,
             out_q=q1,
             out_sf=sf1,
+            token_map=token_map,
             **act_kwargs,
         )
         self._fc2(
@@ -8629,6 +8865,7 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             self.config.routing.num_experts,
             workspace=workspace,
             enable_pdl=enable_pdl,
+            token_only=True,
         )
         self._fc1(
             a_q,
@@ -8640,6 +8877,7 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             enable_pdl=enable_pdl,
             out_q=q1,
             out_sf=sf1,
+            token_map=token_map,
             **act_kwargs,
         )
         self._fc2(
@@ -8659,6 +8897,36 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
+def _sm12x_nvfp4_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
+    if isinstance(activation, ReLU2):
+        return {"activation": ActivationType.Relu2}
+    if isinstance(activation, SwiGLU):
+        default = SwiGLU()
+        if activation.alpha != default.alpha or activation.beta != default.beta:
+            raise NotImplementedError(
+                "SM12x NVFP4 supports only default SwiGLU alpha and beta."
+            )
+        return {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": (
+                None if activation.limit == default.limit else activation.limit
+            ),
+        }
+    if isinstance(activation, SiTU):
+        if activation.linear_scale is None or activation.clamp_limit is not None:
+            raise NotImplementedError(
+                "SM12x NVFP4 requires a finite SiTU linear scale and no clamp limit."
+            )
+        return {
+            "activation": ActivationType.Situ,
+            "situ_beta": activation.gate_scale,
+            "situ_linear_beta": activation.linear_scale,
+        }
+    raise NotImplementedError(
+        f"SM12x NVFP4 does not support {type(activation).__name__}."
+    )
+
+
 # SM12x NVFP4 x BF16 runner - shared cuTile NVFP4 weight view, fixed tactic
 # ---------------------------------------------------------------------------
 
@@ -8683,7 +8951,10 @@ class SM12xNvfp4Bf16Runner(MoERunner):
     weight_view_keys = (backend_key, *weight_view_aliases)
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
-    supported_activation_classes = (SwiGLU, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        ReLU2,
+    )
     supports_expert_parallelism = False
 
     def __init__(self, config: MoEConfig, device: torch.device):
@@ -8886,28 +9157,28 @@ class SM12xNvfp4Bf16Runner(MoERunner):
 
 
 class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
-    """CuTe-DSL W4A4 over the canonical NVFP4 weights shared with W4A16.
+    """Shape-aware CuTe-DSL W4A4 over canonical weights shared with W4A16.
 
     BF16 hidden states are quantized to NVFP4 inside the op with the per-layer
-    activation global scales of the weight view (default 1). Kernels are
-    specialized per token count, so calls are padded to the layer's hybrid
-    token bucket with expert id -1 rows, which the router drops.
+    activation global scales of the weight view (default 1). Default SwiGLU
+    and ReLU2 select between the monolithic and modular implementations on
+    188-SM devices. Non-default SwiGLU limits, SiTU and explicit PDL requests
+    use the modular operators. Calls retain hybrid token-bucket padding with
+    expert id -1 rows, which the router drops.
     """
 
     backend_key = "sm12x_nvfp4"
     weight_view_keys = (backend_key, "cutile_nvfp4")
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supported_activation_classes = (SwiGLU, SiTU, ReLU2)
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__(config, device)
         self._unit_scale: Optional[torch.Tensor] = None
+        self._native_workspaces: dict[tuple[int, int], tuple[Any, ...]] = {}
 
     def _check_activation_parameters(self) -> None:
-        activation = self.config.activation
-        if isinstance(activation, SwiGLU) and activation != SwiGLU():
-            raise NotImplementedError(
-                "SM12x NVFP4 supports only default SwiGLU alpha, beta and limit."
-            )
+        _sm12x_nvfp4_activation_kwargs(self.config.activation)
 
     def _check_support(self) -> None:
         MoERunner._check_support(self)
@@ -8932,12 +9203,23 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
             raise NotImplementedError(
                 f"SM12x NVFP4 requires intermediate_size % 64 == 0, got {inter}."
             )
+        if self.config.activation.is_gated and inter % 128 and self._requires_native():
+            raise NotImplementedError(
+                "SM12x NVFP4 modular gated activations require "
+                "intermediate_size % 128 == 0."
+            )
         if not self.config.activation.is_gated and inter < 128:
             raise NotImplementedError(
                 f"SM12x NVFP4 ReLU2 requires intermediate_size >= 128, got {inter}."
             )
 
     def _build(self) -> None:
+        from ..utils import get_device_sm_count
+        from .cute_dsl.blackwell_sm12x import (
+            moe_fp4_fc1_act_q1,
+            moe_fp4_fc2_finalize,
+            moe_fp4_q0_route_triton,
+        )
         from .cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
             allocate_workspace,
             run_moe_w4a4,
@@ -8945,6 +9227,154 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
 
         self._run = run_moe_w4a4
         self._allocate_workspace = allocate_workspace
+        self._fc1_module = moe_fp4_fc1_act_q1
+        self._fc2_module = moe_fp4_fc2_finalize
+        self._route_module = moe_fp4_q0_route_triton
+        self._num_sms = get_device_sm_count(self.device)
+
+    def _requires_native(self) -> bool:
+        activation = self.config.activation
+        return (
+            self.config.execution.enable_pdl is True
+            or isinstance(activation, SiTU)
+            or (isinstance(activation, SwiGLU) and activation != SwiGLU())
+        )
+
+    def _use_native(self, x: torch.Tensor, ids: torch.Tensor) -> bool:
+        if self._requires_native():
+            return True
+        activation = self.config.activation
+        inter = self.config.experts.intermediate_size
+        if activation.is_gated and inter % 128:
+            return False
+        if self._num_sms != 188:
+            return False
+        if isinstance(activation, ReLU2):
+            return True
+        experts = self.config.routing.num_experts
+        tile, _ = self._fc1_module.select_tactic(
+            total_rows=ids.numel(),
+            n=inter,
+            k=x.shape[1],
+            num_experts=experts,
+            num_sms=self._num_sms,
+        )
+        return tile[0] != 8 and (inter < 1024 or ids.numel() >= 96 * experts)
+
+    def _native_workspace(self, x: torch.Tensor, ids: torch.Tensor) -> tuple[Any, ...]:
+        key = tuple(x.shape)
+        scratch = self._native_workspaces.get(key)
+        if scratch is not None:
+            return scratch
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"{type(self).__name__} native workspace for token bucket "
+                f"{x.shape[0]} must be allocated before CUDA Graph capture; "
+                "warm this bucket first."
+            )
+        inter = self.config.experts.intermediate_size
+        experts = self.config.routing.num_experts
+        activation = _sm12x_nvfp4_activation_kwargs(self.config.activation)[
+            "activation"
+        ]
+        fc1_tile, gather = self._fc1_module.select_tactic(
+            total_rows=ids.numel(),
+            n=inter,
+            k=x.shape[1],
+            num_experts=experts,
+            num_sms=self._num_sms,
+            activation=activation,
+        )
+        fc2_tile = self._fc2_module.select_tile(
+            total_rows=ids.numel(),
+            n=x.shape[1],
+            k=inter,
+            num_experts=experts,
+            num_sms=self._num_sms,
+        )
+        if self._fc1_module.is_swapab(fc1_tile):
+            workspace = self._route_module.make_nvfp4_route_meta_workspace(
+                ids, experts, tile_m=fc1_tile[0]
+            )
+        elif gather:
+            workspace = self._route_module.make_nvfp4_route_meta_workspace(ids, experts)
+        else:
+            workspace = self._route_module.make_nvfp4_q0_route_workspace(
+                x, ids, experts
+            )
+        work = None
+        if self._fc2_module.is_swapab(fc2_tile):
+            if self._fc1_module.is_swapab(fc1_tile) and fc1_tile[0] == fc2_tile[0]:
+                work = (workspace.worklist, workspace.workcount)
+            else:
+                work = self._route_module.make_nvfp4_worklist_workspace(
+                    ids.numel(), experts, fc2_tile[0], self.device
+                )
+        q = torch.empty(
+            (ids.numel(), inter // 2), dtype=torch.uint8, device=self.device
+        )
+        sf = torch.zeros(
+            self._fc1_module.out_sf_shape(ids.numel(), inter, experts),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        scratch = (workspace, q, sf, fc1_tile, fc2_tile, work)
+        self._native_workspaces[key] = scratch
+        return scratch
+
+    def _forward_native(self, inputs: List[torch.Tensor]) -> None:
+        out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2 = inputs
+        with torch.cuda.device(x.device):
+            workspace, q, sf, fc1_tile, fc2_tile, work = self._native_workspace(x, ids)
+            enable_pdl = self.config.execution.enable_pdl is not False
+            out.zero_()
+            offsets, token_map, route_weights, q, sf = (
+                self._fc1_module.cute_dsl_sm12x_route_fc1_act_q1_nvfp4(
+                    x,
+                    ids,
+                    topk_weights,
+                    w1,
+                    s1,
+                    a1,
+                    g1,
+                    a2,
+                    tile=fc1_tile,
+                    workspace=workspace,
+                    enable_pdl=enable_pdl,
+                    out_q=q,
+                    out_sf=sf,
+                    **_sm12x_nvfp4_activation_kwargs(self.config.activation),
+                )
+            )
+            work_args = {}
+            if work is not None:
+                worklist, workcount = work
+                if worklist is not getattr(workspace, "worklist", None):
+                    self._route_module.build_nvfp4_worklist(
+                        offsets,
+                        worklist,
+                        workcount,
+                        fc2_tile[0],
+                        total_rows=ids.numel(),
+                    )
+                work_args = dict(worklist=worklist, workcount=workcount)
+            self._fc2_module.cute_dsl_sm12x_fc2_finalize_nvfp4(
+                q,
+                sf,
+                w2,
+                s2,
+                offsets,
+                token_map,
+                route_weights,
+                g2,
+                a2,
+                x.shape[0],
+                tile=fc2_tile,
+                tune=False,
+                enable_pdl=enable_pdl,
+                out=out,
+                **work_args,
+            )
 
     def _activation_global_scale(
         self, view: dict[str, torch.Tensor], key: str
@@ -9033,8 +9463,13 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
         if tactic != -1:
             raise ValueError(f"{type(self).__name__} supports only tactic -1.")
         out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2 = inputs
-        workspace = self._workspace(x.shape[0], x.shape[1])
-        self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2, out, workspace)
+        if self._use_native(x, ids):
+            self._forward_native(inputs)
+        else:
+            workspace = self._workspace(x.shape[0], x.shape[1])
+            self._run(
+                x, ids, topk_weights, w1, s1, g1, w2, s2, g2, a1, a2, out, workspace
+            )
         return out[: getattr(inputs, "num_tokens", out.shape[0])]
 
 
@@ -9453,9 +9888,10 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
 
     Every expert segment is padded to ``_segment_alignment`` rows; padding rows
     are computed but never read back. Stage buffers hold the token bucket's
-    worst-case row count and every stage covers all of it: cuDNN's grouped GEMM
-    takes segment starts only, so the last expert's segment runs to the end of
-    the buffer.
+    worst-case row count and every stage covers all of it: the cuDNN grouped
+    GEMM offsets (``_cudnn_moe_first_token_offset``: segment starts, or explicit
+    boundaries ending at the buffer's row count) run the last expert's segment
+    to the end of the buffer.
     """
 
     supported_routing_modes = (
@@ -10645,7 +11081,7 @@ class _GroupedGemmStageRunner(TunableRunner):
         return (*self.parent._cache_key_extras(), "stage", self.stage)
 
     def __hash__(self) -> int:
-        return hash(self.get_cache_key_extras([]))
+        return hash((hash(self.parent), "stage", self.stage))
 
 
 def __getattr__(name: str):

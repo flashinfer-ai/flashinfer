@@ -579,7 +579,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     non-lamport flag: kernel_flag_ptr[1] = 0;
     lamport flag: kernel_flag_ptr[2] = 0;
     lamport triple buffer offset: kernel_flag_ptr[3] = lamport_comm_size;
-    lamport clear size: kernel_flag_ptr[4] = 0;
+    lamport clear size in 16-bit units: kernel_flag_ptr[4] = 0;
     """
     # malloc cuda memory of int32_t * 5
     flag_ptr = cudart.cudaMalloc(5 * 4)
@@ -1242,7 +1242,9 @@ def trtllm_moe_finalize_allreduce_fusion(
         residual_in.numel() * residual_in.element_size() * world_size
     )
 
-    # Note: only one-shot is supported for moe allreduce fusion.
+    # The Lamport buffer must hold the one-shot layout (world_size copies of the token
+    # output). The trtllm backend is one-shot only; the cake backend's two-shot programs
+    # (world sizes 4 and 8) use a smaller part of the same buffer.
     if required_lamport_comm_size > MAX_COMM_SIZE:
         raise ValueError(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
