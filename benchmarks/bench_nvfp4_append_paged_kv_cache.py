@@ -15,14 +15,29 @@
 
 One decode-step write per row: ``nnz`` new tokens, each with ``num_kv_heads``
 K and V heads, quantized to NVFP4 and scattered to random slots of an NHD
-paged cache.  Timings are medians of CUDA-graph replays.  To compare two
-builds, run this script once per build in separate processes and alternate
-them a few times; each run prints one line per ``nnz``.
+paged cache.  Timings are medians of ``bench_gpu_time`` with CUDA graphs.  To
+compare two builds, run this script once per build in separate processes and
+alternate them a few times; each run prints one line per ``nnz``.
+
+``--l2`` picks one L2 policy, applied the same way by both timers:
+
+* ``cold`` (default): no measured iteration finds its data in L2.  CUPTI
+  flushes L2 before each iteration; ``--no-cupti`` times CUDA-graph replays
+  that rotate over clones of every input and cache tensor.  This is the
+  conservative bound.
+* ``warm``: the same buffers every iteration, so they stay in L2.  In a decode
+  step the K/V input was just written by the preceding kernels and is
+  resident; only the cache lines being written are cold.
+
+CUPTI (default) needs ``cupti-python>=13``; without it the script stops instead
+of letting ``bench_gpu_time`` fall back to another timer.  The header line
+names the timer and the L2 policy of the run.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 
 import numpy as np
 import torch
@@ -31,59 +46,102 @@ from flashinfer.page import nvfp4_quantize_append_paged_kv_cache_with_slot_mappi
 from flashinfer.testing.utils import bench_gpu_time
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+_CUPTI_MIN_MAJOR = 13  # the version bench_gpu_time requires before it uses CUPTI
 
 
-def _median_us(fn, warmup_ms: int, measure_ms: int, cupti: bool) -> float:
-    fn()
+def _require_cupti() -> None:
+    try:
+        from cupti import cupti  # noqa: F401
+
+        installed = importlib.metadata.version("cupti-python")
+    except (ImportError, importlib.metadata.PackageNotFoundError) as e:
+        raise SystemExit(
+            f"CUPTI timer unavailable ({e}). Install it with "
+            f"'pip install -U cupti-python>={_CUPTI_MIN_MAJOR}' or pass --no-cupti."
+        ) from e
+    if int(installed.split(".")[0]) < _CUPTI_MIN_MAJOR:
+        raise SystemExit(
+            f"cupti-python {installed} is too old; bench_gpu_time needs "
+            f">={_CUPTI_MIN_MAJOR}. Upgrade it or pass --no-cupti."
+        )
+
+
+def _run(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    slots: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> None:
+    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+        k,
+        v,
+        slots,
+        (k_cache, v_cache),
+        (k_scales, v_scales),
+        global_scale,
+        global_scale,
+        kv_layout="NHD",
+    )
+
+
+def _inputs(args: argparse.Namespace, nnz: int) -> tuple[torch.Tensor, ...]:
+    dtype = _DTYPES[args.dtype]
+    k = torch.randn((nnz, args.num_kv_heads, args.head_dim), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    num_slots = args.num_pages * args.page_size
+    slots = torch.randperm(num_slots, device="cuda", dtype=torch.int64)[:nnz]
+    cache_rows = (args.num_pages, args.page_size, args.num_kv_heads)
+    k_cache = torch.zeros(
+        (*cache_rows, args.head_dim // 2), device="cuda", dtype=torch.uint8
+    )
+    v_cache = torch.zeros_like(k_cache)
+    k_scales = torch.zeros(
+        (*cache_rows, args.head_dim // 16), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    v_scales = torch.zeros_like(k_scales)
+    global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    return k, v, slots, k_cache, v_cache, k_scales, v_scales, global_scale
+
+
+def _median_us(args: argparse.Namespace, nnz: int) -> float:
+    inputs = _inputs(args, nnz)
+    _run(*inputs)  # JIT-compile and load the kernel outside the timed region
     torch.cuda.synchronize()
+    # The tensors go in as input_args so the CUDA-graph timer can rotate clones
+    # of them for a cold L2; CUPTI flushes L2 instead.
     measurements = bench_gpu_time(
-        fn,
-        dry_run_time_ms=warmup_ms,
-        repeat_time_ms=measure_ms,
-        enable_cupti=cupti,
+        _run,
+        dry_run_time_ms=args.warmup_ms,
+        repeat_time_ms=args.measure_ms,
+        enable_cupti=not args.no_cupti,
         use_cuda_graph=True,
+        input_args=inputs,
+        cold_l2_cache=args.l2 == "cold",
     )
     return float(np.median(measurements)) * 1e3
 
 
-def _bench_one(args: argparse.Namespace, nnz: int) -> float:
-    dtype = _DTYPES[args.dtype]
-    shape = (nnz, args.num_kv_heads, args.head_dim)
-    k = torch.randn(shape, device="cuda", dtype=dtype)
-    v = torch.randn_like(k)
+def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    for name in ("num_kv_heads", "head_dim", "page_size", "num_pages", "measure_ms"):
+        if getattr(args, name) < 1:
+            flag = "--" + name.replace("_", "-")
+            parser.error(f"{flag} must be >= 1, got {getattr(args, name)}")
+    if args.warmup_ms < 0:
+        parser.error(f"--warmup-ms must be >= 0, got {args.warmup_ms}")
+    if args.head_dim % 16:
+        parser.error(f"--head-dim must be a multiple of 16, got {args.head_dim}")
     num_slots = args.num_pages * args.page_size
-    slots = torch.randperm(num_slots, device="cuda", dtype=torch.int64)[:nnz]
-    packed_shape = (
-        args.num_pages,
-        args.page_size,
-        args.num_kv_heads,
-        args.head_dim // 2,
-    )
-    scale_shape = (
-        args.num_pages,
-        args.page_size,
-        args.num_kv_heads,
-        args.head_dim // 16,
-    )
-    k_cache = torch.zeros(packed_shape, device="cuda", dtype=torch.uint8)
-    v_cache = torch.zeros_like(k_cache)
-    k_scales = torch.zeros(scale_shape, device="cuda", dtype=torch.float8_e4m3fn)
-    v_scales = torch.zeros_like(k_scales)
-    global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
-
-    def run() -> None:
-        nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
-            k,
-            v,
-            slots,
-            (k_cache, v_cache),
-            (k_scales, v_scales),
-            global_scale,
-            global_scale,
-            kv_layout="NHD",
+    bad = [nnz for nnz in args.nnz if not 1 <= nnz <= num_slots]
+    if bad:
+        parser.error(
+            f"--nnz must be in [1, num_pages * page_size = {num_slots}], got {bad}"
         )
-
-    return _median_us(run, args.warmup_ms, args.measure_ms, not args.no_cupti)
+    if not torch.cuda.is_available():
+        parser.error("needs a CUDA device")
 
 
 def main() -> None:
@@ -98,19 +156,32 @@ def main() -> None:
     parser.add_argument("--dtype", choices=sorted(_DTYPES), default="bfloat16")
     parser.add_argument("--warmup-ms", type=int, default=100)
     parser.add_argument("--measure-ms", type=int, default=1000)
-    parser.add_argument("--no-cupti", action="store_true")
+    parser.add_argument(
+        "--no-cupti",
+        action="store_true",
+        help="time CUDA-graph replays instead of CUPTI",
+    )
+    parser.add_argument(
+        "--l2",
+        choices=("cold", "warm"),
+        default="cold",
+        help="cold: no iteration finds its data in L2 (default); warm: buffers stay in L2",
+    )
     parser.add_argument("--label", default="", help="free text echoed on every row")
     args = parser.parse_args()
-    if args.head_dim % 16:
-        raise ValueError(f"head_dim must be a multiple of 16, got {args.head_dim}")
+    _check_args(parser, args)
+    if not args.no_cupti:
+        _require_cupti()
 
     torch.manual_seed(0)
+    timer = "cuda-graph" if args.no_cupti else "cupti"
     print(
         f"# {torch.cuda.get_device_name()} {args.dtype} heads={args.num_kv_heads} "
-        f"head_dim={args.head_dim} page_size={args.page_size} NHD"
+        f"head_dim={args.head_dim} page_size={args.page_size} "
+        f"num_pages={args.num_pages} NHD timer={timer} l2={args.l2}"
     )
     for nnz in args.nnz:
-        us = _bench_one(args, nnz)
+        us = _median_us(args, nnz)
         print(f"label={args.label} nnz={nnz} median_us={us:.4f}", flush=True)
 
 
