@@ -307,6 +307,60 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
     _assert_nvfp4_quantized_close(v_dequant[valid_slots], v_append[:nnz_kv][valid])
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("misaligned", ["input", "cache"])
+def test_nvfp4_quantize_append_paged_kv_cache_misaligned_matches_aligned(
+    dtype, misaligned
+):
+    # The kernel loads 16 B input vectors and stores 8 B packed vectors only when
+    # the pointers allow it; a one-element offset forces the scalar path, which
+    # must write the same bytes.
+    _skip_if_fp8_e4m3_scale_unsupported()
+
+    torch.manual_seed(0)
+    nnz_kv, num_kv_heads, head_dim, page_size, max_num_pages = 100, 8, 128, 16, 16
+    shape = (nnz_kv, num_kv_heads, head_dim)
+    k_append = torch.randn(shape, device="cuda:0", dtype=dtype)
+    v_append = torch.randn_like(k_append)
+    packed_shape = (max_num_pages, page_size, num_kv_heads, head_dim // 2)
+    scale_shape = (max_num_pages, page_size, num_kv_heads, head_dim // 16)
+    slot_mapping = torch.randperm(
+        max_num_pages * page_size, device="cuda:0", dtype=torch.int64
+    )[:nnz_kv]
+    scale = torch.ones(1, dtype=torch.float32, device="cuda:0")
+
+    def offset_view(t: torch.Tensor) -> torch.Tensor:
+        flat = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)
+        view = flat[1:].view(t.shape)
+        view.copy_(t)
+        return view
+
+    def append(k, v, k_cache, v_cache):
+        k_scales = torch.zeros(scale_shape, dtype=torch.float8_e4m3fn, device="cuda:0")
+        v_scales = torch.zeros_like(k_scales)
+        flashinfer.nvfp4_quantize_append_paged_kv_cache_with_slot_mapping(
+            k, v, slot_mapping, (k_cache, v_cache), (k_scales, v_scales), scale, scale
+        )
+        return k_cache, v_cache, k_scales, v_scales
+
+    def zero_cache():
+        return torch.zeros(packed_shape, dtype=torch.uint8, device="cuda:0")
+
+    expected = append(k_append, v_append, zero_cache(), zero_cache())
+    if misaligned == "input":
+        actual = append(
+            offset_view(k_append), offset_view(v_append), zero_cache(), zero_cache()
+        )
+    else:
+        actual = append(
+            k_append, v_append, offset_view(zero_cache()), offset_view(zero_cache())
+        )
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            got.view(torch.uint8), want.view(torch.uint8), rtol=0, atol=0
+        )
+
+
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_4over6():
     _skip_if_fp8_e4m3_scale_unsupported()
     torch.manual_seed(0)

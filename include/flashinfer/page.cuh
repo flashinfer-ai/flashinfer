@@ -314,13 +314,30 @@ template <typename DType, bool precise_rounding = false>
 __device__ __forceinline__ void nvfp4_append_quantize_block(
     const DType* __restrict__ input, const float global_scale, const size_t input_base,
     const uint32_t dim_base, uint8_t* __restrict__ packed_out, uint8_t* __restrict__ sf_out) {
+  // fp16/bf16 input that is 16 B aligned is read as two 16 B vectors; anything
+  // else takes the scalar loop.
+  const DType* src = input + input_base + dim_base;
   float values[16];
   float amax = 0.0f;
+  bool loaded = false;
+  if constexpr (sizeof(DType) == 2) {
+    if ((reinterpret_cast<uintptr_t>(src) & 15u) == 0u) {
+      vec_t<DType, 16> in_vec;
+      in_vec.load(src);
 #pragma unroll
-  for (uint32_t i = 0; i < 16; ++i) {
-    const float value = nvfp4_append_to_float(input[input_base + dim_base + i]);
-    values[i] = value;
-    amax = fmaxf(amax, fabsf(value));
+      for (uint32_t i = 0; i < 16; ++i) {
+        values[i] = nvfp4_append_to_float(in_vec[i]);
+        amax = fmaxf(amax, fabsf(values[i]));
+      }
+      loaded = true;
+    }
+  }
+  if (!loaded) {
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) {
+      values[i] = nvfp4_append_to_float(input[input_base + dim_base + i]);
+      amax = fmaxf(amax, fabsf(values[i]));
+    }
   }
 
   float sf_value = 0.0f;
@@ -357,11 +374,21 @@ __device__ __forceinline__ void nvfp4_append_quantize_block(
                                                      : (1.0f / (sf_rounded * global_scale)))
                                  : 0.0f;
 
+  // One 8 B store for the packed bytes when the output allows it.
+  vec_t<uint8_t, 8> out_vec;
 #pragma unroll
   for (uint32_t i = 0; i < 8; ++i) {
     const uint8_t lo = nvfp4_append_quantize_e2m1(values[i * 2] * output_scale);
     const uint8_t hi = nvfp4_append_quantize_e2m1(values[i * 2 + 1] * output_scale);
-    packed_out[i] = lo | (hi << 4);
+    out_vec[i] = lo | (hi << 4);
+  }
+  if ((reinterpret_cast<uintptr_t>(packed_out) & 7u) == 0u) {
+    out_vec.store(packed_out);
+  } else {
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      packed_out[i] = out_vec[i];
+    }
   }
 }
 
