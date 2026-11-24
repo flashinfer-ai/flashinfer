@@ -27,11 +27,15 @@ def paged_fp8_k_nvfp4_v_fmha(
     Callers own the device-resident int32 page table, valid sequence lengths
     and cumulative Q offsets, and supply a host upper bound on query length.
     qk_scale includes softmax and Q/K tensor scales; v_scale is the V tensor
-    scale. Output is written into the supplied BF16 tensor. No full-page
-    dequantization, TRTLLM cubins, or host reads of device metadata.
-    The specialized H128/P64 decode schedule uses graph-capturable
-    FP32 partial outputs for 8 to 256 sequence splits; it does not expand
-    the V cache. Scratch size in bytes is `4 * tokens * Hq * splits * (D + 2)`.
+    scale. Output is written into the supplied BF16 tensor. No expanded
+    global V cache, TRTLLM cubins, or host reads of device metadata.
+    On SM103a, the H128/P64 HND decoder can bulk-copy packed V and scales
+    into shared memory before FP8 MMA (CuTe DSL with CUDA 13 support).
+    This schedule is limited to 8-64 requests, 33-1024 page-table columns,
+    and 8/2 or 32/8 query/KV heads. Ragged Q/O packing and optional FP32
+    split reduction use graph-capturable scratch. Other shapes keep the
+    Triton implementations; their split decoder uses
+    `4 * tokens * Hq * splits * (D + 2)` bytes for FP32 partials.
 
     A single page with all V elements equal to one (E2M1 code 2 in both
     nibbles, unit block and tensor scales) produces ones for every query::
