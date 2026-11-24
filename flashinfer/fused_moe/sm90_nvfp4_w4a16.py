@@ -644,6 +644,9 @@ def _routing_inputs(
     """``[M, k]`` routing -> int32 / float32 ``[M, 8]`` (no copy for int32 / float32 k = 8)."""
     M, k = topk_ids.shape
     ids, w = topk_ids, topk_weights
+    if ids.dtype != torch.int32:
+        # narrowing wraps (2**32 -> 0): clamp first so ids outside [0, E) stay outside
+        ids = ids.clamp(-1, MAX_LOCAL_EXPERTS)
     if k < TOPK_SLOTS:
         ids = torch.nn.functional.pad(ids, (0, TOPK_SLOTS - k), value=-1)
         w = torch.nn.functional.pad(w, (0, TOPK_SLOTS - k), value=0.0)

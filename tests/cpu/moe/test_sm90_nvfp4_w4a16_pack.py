@@ -175,3 +175,22 @@ def test_auto_prefill_min_tokens_rejects_bad_fraction():
     for fraction in (0.0, 1.5):
         with pytest.raises(ValueError):
             w4a16.sm90_nvfp4_w4a16_moe_prefill_min_tokens(4096, 4096, 32, 8, fraction)
+
+
+def test_routing_inputs_keep_out_of_range_int64_ids_skipped():
+    """int64 ids are narrowed to int32 for the kernels; ids that would wrap into
+    [0, E) (e.g. 2**32 -> 0) must stay outside it."""
+    big = [2**32, 2**32 + 3, -(2**32), -(2**32) + 1, 2**31, -(2**31) - 1, 2**63 - 1]
+    ids = torch.tensor([big + [5], [0, 1, 2, 3, 31, 32, -1, 7]], dtype=torch.int64)
+    w = torch.rand(ids.shape)
+    out_ids, out_w = w4a16._routing_inputs(ids, w)
+    assert out_ids.dtype == torch.int32 and out_ids.is_contiguous()
+    assert torch.equal(out_w, w)
+    valid = (ids >= 0) & (ids < w4a16.MAX_LOCAL_EXPERTS)
+    assert torch.equal(out_ids[valid], ids[valid].int())
+    assert bool(((out_ids[~valid] < 0) | (out_ids[~valid] >= 32)).all())
+    # top-k < 8 is padded with skipped slots
+    out_ids, out_w = w4a16._routing_inputs(ids[:, :3], w[:, :3])
+    assert out_ids.shape == (2, 8) and bool((out_ids[:, 3:] == -1).all())
+    assert bool(((out_ids[0, :3] < 0) | (out_ids[0, :3] >= 32)).all())
+    assert bool((out_w[:, 3:] == 0).all())

@@ -225,12 +225,19 @@ def test_post_norm_matches_reference(shape, num_tokens):
 )
 @pytest.mark.parametrize("num_tokens", [1, 64, 513])
 def test_skipped_routes_and_int64_ids(shape, num_tokens):
-    """Routes to experts outside [0, E) contribute nothing; int64 ids and BF16 weights work."""
+    """Routes to experts outside [0, E) contribute nothing; int64 ids and BF16 weights
+    work. Skipped int64 ids include values that wrap into [0, E) when narrowed to
+    int32 (+-2**32 + e)."""
     ckpt, packed = checkpoint(shape)
     H, _, E, top_k = shape
     x = torch.randn(num_tokens, H, device="cuda").bfloat16()
     ids, w = routing(num_tokens, E, top_k, "cuda", seed=3, invalid=True)
-    y = run(packed, x, ids.long(), w.bfloat16())
+    ids = ids.long()
+    skipped = (ids < 0) | (ids >= E)
+    pos = torch.arange(ids.numel(), device=ids.device).view(ids.shape)
+    wrap = torch.where(ids < 0, -(2**32), 2**32) + pos % E
+    ids = torch.where(skipped & (pos % 2 == 0), wrap, ids)
+    y = run(packed, x, ids, w.bfloat16())
     assert_in_band(y, reference_moe(ckpt, x, ids, w.bfloat16()))
 
 
