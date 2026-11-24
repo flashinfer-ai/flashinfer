@@ -10500,7 +10500,7 @@ def trtllm_fmha_v2_prefill(
         page_size = k_cache.shape[1 if "NHD" in input_layout else 2]
         # The kernel maps tokens to pages with log2(page_size) and picks its
         # kernel from query.dtype only; both mismatches return wrong output.
-        if page_size & (page_size - 1):
+        if page_size <= 0 or page_size & (page_size - 1):
             raise ValueError(
                 f"{input_layout} requires a power-of-two page_size, got {page_size}."
             )
