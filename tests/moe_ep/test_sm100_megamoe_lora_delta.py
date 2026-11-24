@@ -1467,25 +1467,28 @@ def test_multirank_ep_lora_delta_and_snapshot_src_rank(monkeypatch):
         y, act, token_id, expert_offsets, src_rank = res
         ws = layer._ensure_workspace()
 
-        # Gather staged inputs from all ranks to verify local expert post-act snapshots against
-        # the exact (src_rank, src_token) pairs routed to this rank's local experts.
-        all_x = [torch.empty_like(ws.x[:num_tokens]) for _ in range(world)]
-        all_sf = [torch.empty_like(ws.x_sf[:num_tokens]) for _ in range(world)]
+        # Gather staged inputs from all ranks to verify finalized output and local expert
+        # post-act snapshots against the exact (src_rank, src_token) pairs routed to this rank.
+        # View FP8 / E8M0 tensors as uint8 for NCCL all_gather (float8_e8m0fnu is unsupported by NCCL).
+        local_x_u8 = ws.x[:num_tokens].contiguous().view(torch.uint8)
+        local_sf_u8 = ws.x_sf[:num_tokens].contiguous().view(torch.uint8)
+        all_x_u8 = [torch.empty_like(local_x_u8) for _ in range(world)]
+        all_sf_u8 = [torch.empty_like(local_sf_u8) for _ in range(world)]
         all_ids = [torch.empty_like(ws.topk_idx[:num_tokens]) for _ in range(world)]
         all_w = [torch.empty_like(ws.topk_weights[:num_tokens]) for _ in range(world)]
         all_d1 = [torch.empty_like(delta1) for _ in range(world)]
-        dist.all_gather(all_x, ws.x[:num_tokens])
-        dist.all_gather(all_sf, ws.x_sf[:num_tokens])
+        dist.all_gather(all_x_u8, local_x_u8)
+        dist.all_gather(all_sf_u8, local_sf_u8)
         dist.all_gather(all_ids, ws.topk_idx[:num_tokens])
         dist.all_gather(all_w, ws.topk_weights[:num_tokens])
         dist.all_gather(all_d1, delta1)
 
-        cat_x = torch.cat(all_x, dim=0)
-        cat_sf = torch.cat(all_sf, dim=0)
+        cat_x = torch.cat(all_x_u8, dim=0).view(ws.x.dtype)
+        cat_sf = torch.cat(all_sf_u8, dim=0).view(ws.x_sf.dtype)
         cat_ids = torch.cat(all_ids, dim=0)
         cat_w = torch.cat(all_w, dim=0)
         cat_d1 = torch.cat(all_d1, dim=0)
-        _, ref_post_act = compute_megamoe_reference_block_scaled(
+        ref_y_partial, ref_post_act = compute_megamoe_reference_block_scaled(
             cat_x,
             cat_sf,
             cat_ids,
@@ -1501,11 +1504,25 @@ def test_multirank_ep_lora_delta_and_snapshot_src_rank(monkeypatch):
             apply_routing_weights_before_fc2=ws.config.apply_routing_weights_before_fc2,
             num_tokens=world * num_tokens,
             weight_scales_are_swizzled=True,
+            return_fp32=True,
             gemm1_lora_delta=cat_d1,
             return_post_act=True,
         )
+        dist.all_reduce(ref_y_partial, op=dist.ReduceOp.SUM)
+        ref_y_rank = ref_y_partial[rank * num_tokens : (rank + 1) * num_tokens].to(
+            torch.bfloat16
+        )
+        out_err = output_error(y, torch.arange(num_tokens, device="cuda"), ref_y_rank)
+        assert out_err < 0.03, f"rank {rank} output rel L2 error {out_err:.4f} >= 0.03"
 
         offsets = expert_offsets.tolist()
+        r_cap = int(ws.kernel.max_tokens)
+        assert offsets[0] == 0
+        assert all(offsets[i] <= offsets[i + 1] for i in range(local_experts))
+        assert offsets[-1] <= r_cap
+        if offsets[-1] < r_cap:
+            assert (token_id[offsets[-1] :] == -1).all()
+            assert (src_rank[offsets[-1] :] == -1).all()
         for e in range(local_experts):
             slab_tokens = token_id[offsets[e] : offsets[e + 1]]
             slab_ranks = src_rank[offsets[e] : offsets[e + 1]]
