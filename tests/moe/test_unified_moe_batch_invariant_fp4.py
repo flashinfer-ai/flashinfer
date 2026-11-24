@@ -3590,3 +3590,61 @@ def test_sfu_eval_kernels_are_keyed_by_architecture_family(monkeypatch):
     assert "_kernel_key(which, x.device)" in inspect.getsource(sfu._eval)
 
 
+def test_static_block_evaluates_the_e2m1_conversion_on_every_backend():
+    """``static_block`` (the static class's GEMM1 block: the per-tensor quantizer's block chain and element chain on the fp32
+    gated values) evaluates on the exact scalar backend, the vectorised backend and the term evaluator, each carrying the
+    e2m1 conversion, and its scale byte and codes are the quantizer's own (the vectorised quantizer reference) on random
+    blocks spanning the exponents, with an all-zero block; the vectorised conversion equals the exact one on ties,
+    saturating magnitudes, sub-half magnitudes, signed zeros and NaN."""
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+    from flashinfer.batch_invariant.quantization.layout import sf_offset_128x4
+    from flashinfer.batch_invariant.quantization.nvfp4_reference import (
+        e2m1_codes,
+        pack_e2m1,
+        quantize_reference,
+    )
+    from flashinfer.fused_moe.batch_invariant import mterm
+    from flashinfer.fused_moe.batch_invariant.reference import ExactF32, TorchF32
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import static_block
+
+    g = torch.Generator().manual_seed(23)
+    n = 48
+    x = torch.randn(n, 16, generator=g) * torch.exp2(
+        torch.randint(-6, 8, (n, 1), generator=g).float()
+    )
+    x[1] = 0.0
+    for gs in (1.0, 2.0**-3, 448.0 * 6.0 / 1.5):
+        packed, sf, _ = quantize_reference(x, gs, per_token=False)
+        sf_flat = sf.reshape(-1)
+        for i in range(n):
+            vals = [float(v) for v in x[i]]
+            sf_d, codes = static_block(ExactF32, vals, fp32.to_f32(gs))
+            got = pack_e2m1(e2m1_codes(torch.tensor(codes, dtype=torch.float32)))
+            assert torch.equal(got.view(-1), packed[i].view(-1)), (gs, i)
+            byte = torch.tensor([sf_d]).to(torch.float8_e4m3fn).view(torch.uint8)
+            assert int(byte) == int(sf_flat[sf_offset_128x4(i, 0, 4)]), (gs, i)
+            alg = mterm.TermAlgebra()
+            t_sf, t_codes = static_block(
+                alg, [alg.const(v) for v in vals], alg.const(gs)
+            )
+            assert mterm.evaluate(t_sf) == sf_d
+            assert [mterm.evaluate(t) for t in t_codes] == codes
+            assert mterm.sexpr(t_codes[0]).startswith("(cvt e2m1 ")
+            sf_v, codes_v = static_block(
+                TorchF32, [x[i, j] for j in range(16)], TorchF32.const(gs)
+            )
+            assert float(sf_v) == sf_d and [float(c) for c in codes_v] == codes
+    edge = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0, 7.0, 1e30, float("inf"), 0.1]
+        + [0.49, 0.51, 0.0, -0.0, -0.25, -0.75, -2.5, -7.0, -1e30, float("nan")]
+    )
+    rnd = torch.randn(4096, generator=g) * torch.exp2(
+        torch.randint(-4, 4, (4096,), generator=g).float()
+    )
+    allv = torch.cat([edge, rnd])
+    vec = TorchF32.cvt_out(allv, "e2m1")
+    for v, r in zip(allv.tolist(), vec.tolist(), strict=True):
+        assert fp32.f32_bits(r) == fp32.f32_bits(fp32.to_e2m1(v)), v
+    assert fp32.to_e2m1(float("nan")) == 6.0 and fp32.to_e2m1(0.75) == 1.0
+
+

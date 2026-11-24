@@ -221,6 +221,10 @@ def evaluate(
             kind = A[1]
             if kind in ("e4m3", "e5m2"):
                 v = fp32.to_fp8(memo[A[0].uid], kind)
+            elif kind == "e2m1":
+                v = fp32.to_e2m1(
+                    memo[A[0].uid]
+                )  # the static class's codes (the quantizer's conversion)
             else:
                 fmt = {"f32": fp32.F32, "bf16": fp32.BF16, "f16": fp32.F16}[kind]
                 v = fp32.to_format(memo[A[0].uid], fmt)

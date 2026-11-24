@@ -75,6 +75,10 @@ class ExactF32:
     def cvt_out(a: float, fmt: str) -> float:
         if fmt in ("e4m3", "e5m2"):
             return fp32.to_fp8(a, fmt)
+        if fmt == "e2m1":
+            return fp32.to_e2m1(
+                a
+            )  # the static class's codes: the quantizer's conversion
         return fp32.to_format(
             a, {"bf16": fp32.BF16, "f16": fp32.F16, "f32": fp32.F32}[fmt]
         )
@@ -211,6 +215,11 @@ class TorchF32:
             return e4m3_round(a)
         if fmt == "e5m2":
             return e5m2_round(a)
+        if fmt == "e2m1":
+            # the vectorised cvt.rn.satfinite.e2m1 (values), validated against fp32.to_e2m1 by the quantization suite
+            from ...batch_invariant.quantization.nvfp4_reference import e2m1_round
+
+            return e2m1_round(a)
         return a.to(_TORCH_FMT[fmt])
 
 
