@@ -376,6 +376,39 @@ def test_prefill_graph_survives_reservation_growth():
     del junk
 
 
+@pytest.mark.parametrize(
+    "shape", [SHAPES[0], SHAPES[4]], ids=lambda s: "h{}_i{}".format(*s)
+)
+def test_cuda_graph_replay_prefill_kernel(shape):
+    """The large-batch kernel captured with a reserved workspace, over several
+    chunks (cursor carried between the launches, PDL between them), replayed
+    with new activations and routing."""
+    ckpt, packed = checkpoint(shape)
+    H, I, E, top_k = shape
+    num_tokens, chunk = 700, 256  # three launches per call
+    ws = Sm90Nvfp4W4A16MoEWorkspace(torch.device("cuda"), H, I)
+    ws.reserve_prefill(chunk)
+    kw = dict(workspace=ws, prefill_min_tokens=1, prefill_chunk_tokens=chunk)
+    x = torch.randn(num_tokens, H, device="cuda").bfloat16()
+    ids, w = routing(num_tokens, E, top_k, "cuda", seed=29, invalid=True)
+    out = torch.empty(num_tokens, H, device="cuda", dtype=torch.bfloat16)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(packed, x, ids, w, out=out, **kw)
+    assert ws.prefill_chunk_tokens == chunk
+    for seed in (31, 37, 37):
+        x.copy_(torch.randn(num_tokens, H, device="cuda").bfloat16())
+        new_ids, new_w = routing(num_tokens, E, top_k, "cuda", seed=seed, invalid=True)
+        ids.copy_(new_ids)
+        w.copy_(new_w)
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, run(packed, x, ids, w, **kw))
+        assert_in_band(out, reference_moe(ckpt, x, ids, w))
+
+
 def test_zero_tokens():
     _, packed = checkpoint(SHAPES[5])
     H = SHAPES[5][0]
