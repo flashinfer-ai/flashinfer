@@ -924,6 +924,33 @@ def _heuristic_func_mm_bf16(
     return heuristic_backends
 
 
+def _check_mm_bf16_full_tuning(
+    backend: str, batch_invariant: bool, tactic: Optional[int]
+) -> None:
+    """Reject mm_bf16(full=True) where it cannot mean v1 full tuning."""
+    if batch_invariant:
+        raise ValueError("full=True does not apply to batch_invariant=True.")
+    if tactic is not None:
+        raise ValueError("full=True does not apply to an explicit tactic.")
+    if backend == "cutile":
+        raise ValueError(
+            'full=True does not apply to backend="cutile", which is not autotuned.'
+        )
+    tuner = AutoTuner.get()
+    if tuner._in_v2_context:
+        raise ValueError(
+            "full=True is a mode of autotune(True) and is not supported inside "
+            "autotune_v2()."
+        )
+    if tuner.is_tuning_mode and tuner._active_managed_store is not None:
+        raise ValueError(
+            "full=True tuning would write its results into the managed autotune "
+            "cache that autotune_v2() left attached to this process (it cannot "
+            "be detached). Run full tuning in a process that has not used "
+            "autotune_v2() with persistent_cache=True."
+        )
+
+
 def _batch_invariant_requested(*args, **kwargs) -> bool:
     # ``batch_invariant`` is keyword-only in every GEMM API that has it. The batch-invariant class replaces the backends
     # (it never runs one) and validates every input itself with typed errors, so the backend checks and the auto
@@ -1063,9 +1090,13 @@ def mm_bf16(
         each after the SM clock has recovered (power-limited GPUs throttle
         under load, which otherwise favours the tactics timed after a pause).
         Slower to tune. The result is cached like an ordinary tuning result
-        and serves ordinary lookups; an ordinary cached result does not
-        satisfy a ``full=True`` call. Without ``autotune(True)`` it only looks
-        up the cache, like ``full=False``. Defaults to ``False``.
+        and serves ordinary lookups and ordinary tuning calls; an ordinary
+        cached result does not satisfy a ``full=True`` call. Without
+        ``autotune(True)`` it only looks up the cache, like ``full=False``.
+        Not supported with ``batch_invariant=True``, an explicit ``tactic``,
+        ``backend="cutile"``, inside ``autotune_v2()``, or for tuning while a
+        managed cache from ``autotune_v2()`` is attached (ValueError).
+        Defaults to ``False``.
 
     Returns
     -------
@@ -1109,6 +1140,9 @@ def mm_bf16(
     # None (accepted since #8032, shipped in 0.7.4rc1) behaves as False. The
     # requirement checkers already ran and treat None as falsy, like False.
     pdl = bool(pdl)
+
+    if full:
+        _check_mm_bf16_full_tuning(backend, batch_invariant, tactic)
 
     if batch_invariant:
         if tactic is not None:

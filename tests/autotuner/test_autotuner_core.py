@@ -3560,37 +3560,88 @@ def _tune(tuner, config, runner, inputs, tune_mode=True):
         return tuner.choose_one("dummy_full", [runner], config, inputs)
 
 
-def test_full_profiling_cache(monkeypatch):
-    """An ordinary winner does not answer a full request; a full winner is
-    reused by the next full request and by ordinary lookup."""
+def test_accepted_profiling_policies_are_asymmetric():
+    ordinary = _cold_chain_config()
+    full = replace(ordinary, full_profiling=True)
+    full_policy = AutoTuner._profiling_policy(full)
+    assert AutoTuner._accepted_profiling_policies(full) == (full_policy,)
+    accepted = AutoTuner._accepted_profiling_policies(ordinary)
+    assert accepted == (AutoTuner._profiling_policy(ordinary), full_policy)
+    # The full variant also changes the L2 policy (no cold chain): ignoring
+    # only the full_profiling marker would not match a full winner.
+    assert AutoTuner._profiling_policy(ordinary) + ("full_profiling", True) not in (
+        accepted
+    )
+
+
+def _full_cache_fixture(monkeypatch):
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1, 2))
     inputs = [torch.empty((16, 32), dtype=torch.float32)]
     ordinary = TuningConfig()
     full = replace(ordinary, full_profiling=True)
     times = {False: {0: 5.0, 1: 1.0, 2: 3.0}, True: {0: 5.0, 1: 3.0, 2: 1.0}}
-    profiled = []
+    profiled: list = []
 
     def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config, **kwargs):
         profiled.append((tuning_config.full_profiling, tactic))
         return times[tuning_config.full_profiling][tactic]
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    return tuner, runner, inputs, ordinary, full, profiled
+
+
+def test_full_profiling_cache_in_memory(monkeypatch):
+    """ordinary tuning -> full tuning -> ordinary warmup: the second step
+    profiles, the third takes the full winner without profiling."""
+    tuner, runner, inputs, ordinary, full, profiled = _full_cache_fixture(monkeypatch)
 
     assert _tune(tuner, ordinary, runner, inputs)[1] == 1
     assert profiled == [(False, 0), (False, 1), (False, 2)]
     profiled.clear()
 
-    # The cached ordinary winner does not skip full tuning.
+    # The cached ordinary winner is a miss for a full request.
     assert _tune(tuner, full, runner, inputs)[1] == 2
     assert profiled == [(True, 0), (True, 1), (True, 2)]
     profiled.clear()
 
-    # A second full request reuses the full winner, ordinary lookup serves it,
-    # and a full request outside autotune(True) only looks up.
+    # Ordinary warmup in autotune(True) takes the full winner (no retuning,
+    # no overwrite), as do full requests, ordinary lookup and a full request
+    # outside autotune(True).
+    assert _tune(tuner, ordinary, runner, inputs)[1] == 2
     assert _tune(tuner, full, runner, inputs)[1] == 2
     assert _tune(tuner, ordinary, runner, inputs, tune_mode=False)[1] == 2
     assert _tune(tuner, full, runner, inputs, tune_mode=False)[1] == 2
+    assert profiled == []
+
+
+def test_full_profiling_cache_from_v1_json(monkeypatch, tmp_path):
+    """The same asymmetry for winners loaded with load_configs."""
+    monkeypatch.setattr(autotuner_module, "_collect_metadata", lambda: {"gpu": "g"})
+    tuner, runner, inputs, ordinary, full, profiled = _full_cache_fixture(monkeypatch)
+    ordinary_file, full_file = tmp_path / "ordinary.json", tmp_path / "full.json"
+
+    _tune(tuner, ordinary, runner, inputs)
+    tuner.save_configs(str(ordinary_file))
+    _tune(tuner, full, runner, inputs)
+    tuner.save_configs(str(full_file))
+    saved = json.loads(full_file.read_text())
+    entry = next(v for k, v in saved.items() if not k.startswith("_"))
+    assert entry[2][-2:] == ["full_profiling", True]  # the stored policy
+
+    # An ordinary winner from a file is a miss for a full request.
+    reset_autotuner().load_configs(str(ordinary_file))
+    profiled.clear()
+    assert _tune(tuner, full, runner, inputs)[1] == 2
+    assert profiled == [(True, 0), (True, 1), (True, 2)]
+
+    # A full winner from a file serves ordinary warmup and full requests.
+    reset_autotuner().load_configs(str(full_file))
+    profiled.clear()
+    assert _tune(tuner, ordinary, runner, inputs)[1] == 2
+    assert _tune(tuner, full, runner, inputs)[1] == 2
+    assert _tune(tuner, ordinary, runner, inputs, tune_mode=False)[1] == 2
     assert profiled == []
 
 

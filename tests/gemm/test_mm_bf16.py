@@ -818,63 +818,120 @@ def test_mm_bf16_pdl_tunes_under_its_own_op(monkeypatch):
     assert (custom_op, backend) == ("bf16_gemm_pdl", "tgv")
 
 
-def test_mm_bf16_full_tuning(monkeypatch):
-    """full=True tunes only inside autotune(True), with the full-profiling
-    config, reuses its result, and does not leak into bmm_bf16."""
-    _skip_unless_runnable("cublaslt")
+def _spy_full_tuning(monkeypatch):
+    """Record (full_profiling, chosen tactic) per lookup and profiled tactics."""
     import flashinfer.autotuner.autotuner as autotuner_module
-    from flashinfer import bmm_bf16
 
-    torch.manual_seed(0)
-    a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16)
-    tuner = AutoTuner.get()
-    tuner.clear_cache()
-
-    configs = []
+    lookups: list = []
+    profiled: list = []
     choose_one = AutoTuner.choose_one
+    profile = AutoTuner._profile_single_kernel
 
     def spy(self, custom_op, runners, tuning_config, inputs, **kwargs):
-        configs.append(tuning_config.full_profiling)
-        return choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
-
-    profiled = []
-    profile = AutoTuner._profile_single_kernel
+        runner, tactic = choose_one(
+            self, custom_op, runners, tuning_config, inputs, **kwargs
+        )
+        lookups.append((tuning_config.full_profiling, type(runner).__name__, tactic))
+        return runner, tactic
 
     def count(self, *args, **kwargs):
         profiled.append(args[2])
         return profile(self, *args, **kwargs)
 
-    waits = []
     monkeypatch.setattr(AutoTuner, "choose_one", spy)
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", count)
+    # Do not depend on the clock of the test GPU.
     monkeypatch.setattr(
-        autotuner_module,
-        "_wait_for_sm_clock",
-        lambda device, timeout_s: waits.append(device) or True,
+        autotuner_module, "_wait_for_sm_clock", lambda device, timeout_s: True
     )
+    return lookups, profiled
 
-    # Outside autotune(True) the flag only looks up the cache.
+
+def test_mm_bf16_full_tuning(monkeypatch):
+    """ordinary tuning -> full tuning -> ordinary warmup: the full call
+    profiles again, the warmup reuses the full winner."""
+    _skip_unless_runnable("cublaslt")
+    torch.manual_seed(0)
+    a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(512, 1024, device="cuda", dtype=torch.bfloat16)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    lookups, profiled = _spy_full_tuning(monkeypatch)
+
+    # Outside autotune(True) full=True only looks up.
     mm_bf16(a, w.T, backend="cublaslt", full=True)
-    assert configs == [True] and profiled == []
+    assert lookups[-1][0] is True and profiled == []
+
+    with autotune(True):
+        mm_bf16(a, w.T, backend="cublaslt")
+    assert profiled
+    profiled.clear()
 
     with autotune(True):
         out = mm_bf16(a, w.T, backend="cublaslt", full=True)
-    assert profiled and len(waits) >= len(profiled)
+    assert profiled, "an ordinary winner must not satisfy full=True"
+    full_choice = lookups[-1][1:]
     torch.testing.assert_close(out, F.linear(a, w), rtol=2e-2, atol=2e-1)
+    profiled.clear()
 
-    # The full result is reused by the next full call and by ordinary lookup.
-    tuned = len(profiled)
     with autotune(True):
+        mm_bf16(a, w.T, backend="cublaslt")  # warmup: reuses the full winner
         mm_bf16(a, w.T, backend="cublaslt", full=True)
     mm_bf16(a, w.T, backend="cublaslt")
-    assert len(profiled) == tuned
-
-    # bmm_bf16 shares bf16_gemm_sm100 but never asks for full profiling.
-    configs.clear()
-    bmm_bf16(a.unsqueeze(0), w.T.unsqueeze(0), backend="tgv")
-    assert configs == [False]
+    assert profiled == []
+    assert [choice[1:] for choice in lookups[-3:]] == [full_choice] * 3
     tuner.clear_cache()
+
+
+def test_bmm_bf16_does_not_request_full_profiling(monkeypatch):
+    """bmm_bf16 shares bf16_gemm_sm100 with mm_bf16 but never asks for full."""
+    from flashinfer import bmm_bf16
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    cc = get_compute_capability(torch.device("cuda"))
+    if not bmm_bf16.is_backend_supported("tgv", cc[0] * 10 + cc[1]):
+        pytest.skip("bmm_bf16 TGV backend not supported on this GPU.")
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+    a = torch.randn(1, 64, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(1, 512, 1024, device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    lookups, _ = _spy_full_tuning(monkeypatch)
+    bmm_bf16(a, b, backend="tgv")
+    assert [full for full, *_ in lookups] == [False]
+
+
+def test_mm_bf16_full_rejects_unsupported(monkeypatch):
+    _skip_unless_runnable("cublaslt")
+    from flashinfer.autotune_cache import autotune_v2
+
+    a = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(256, 1024, device="cuda", dtype=torch.bfloat16).T
+    with pytest.raises(ValueError, match="batch_invariant"):
+        mm_bf16(a, b, backend="auto", batch_invariant=True, full=True)
+    cc = get_compute_capability(torch.device("cuda"))
+    cc_num = cc[0] * 10 + cc[1]
+    if mm_bf16.is_backend_supported("tgv", cc_num):
+        with pytest.raises(ValueError, match="explicit tactic"):
+            mm_bf16(a, b, backend="tgv", tactic=1, full=True)
+    if is_cuda_tile_available() and mm_bf16.is_backend_supported("cutile", cc_num):
+        with pytest.raises(ValueError, match="cutile"):
+            mm_bf16(a, b, backend="cutile", full=True)
+
+    with (
+        autotune_v2(persistent_cache=False),
+        pytest.raises(ValueError, match="autotune_v2"),
+    ):
+        mm_bf16(a, b, backend="cublaslt", full=True)
+
+    # A managed cache that autotune_v2() left attached: full tuning would write
+    # into it, a lookup would not.
+    monkeypatch.setattr(
+        AutoTuner, "_active_managed_store", property(lambda self: object())
+    )
+    with autotune(True), pytest.raises(ValueError, match="managed autotune cache"):
+        mm_bf16(a, b, backend="cublaslt", full=True)
+    monkeypatch.undo()
+    mm_bf16(a, b, backend="cublaslt", full=True)
 
 
 if __name__ == "__main__":

@@ -618,9 +618,10 @@ class TuningConfig:
             recovered. On a power-limited GPU the clock drops under load, so
             otherwise the tactics timed right after a pause run faster than
             the rest. Recorded as tuning provenance: an ordinary winner does
-            not answer a full-profiling request, while ordinary lookup does
-            use a full-profiling winner. A comparison in which the clock could
-            not be confirmed for some sample is not cached.
+            not answer a full-profiling request, while ordinary lookup and
+            ordinary tuning use a full-profiling winner of the same call (see
+            ``AutoTuner._accepted_profiling_policies``). A comparison in which
+            the clock could not be confirmed for some sample is not cached.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -2863,6 +2864,12 @@ class AutoTuner:
             check_memory_policy = require_profiling_policy or (
                 self.is_tuning_mode and self._active_managed_store is None
             )
+            # Serving lookups (no policy checks) do not pay for this.
+            accepted_policies = (
+                self._accepted_profiling_policies(tuning_config)
+                if check_memory_policy or self.is_tuning_mode
+                else ()
+            )
             runner_keys: list[tuple[int, ProfilingCacheKey]] = []
             for r_id, r in enumerate(runners):
                 cache_key = AutoTuner._get_cache_key(
@@ -2879,7 +2886,7 @@ class AutoTuner:
                         (winner_identity, cache_key),
                         default_policy if winner_identity is None else None,
                     )
-                    if check_memory_policy and cached_policy != requested_policy:
+                    if check_memory_policy and cached_policy not in accepted_policies:
                         if profiling_candidates is not None:
                             return False, 0, -1, None
                         if (
@@ -2939,7 +2946,7 @@ class AutoTuner:
                         if (
                             self.is_tuning_mode
                             and self._file_config_policies.get(file_key, default_policy)
-                            != requested_policy
+                            not in accepted_policies
                         ):
                             if profiling_candidates is not None:
                                 return False, 0, -1, None
@@ -5303,6 +5310,23 @@ class AutoTuner:
         if tuning_config.full_profiling:
             policy += ("full_profiling", True)
         return policy
+
+    @classmethod
+    def _accepted_profiling_policies(cls, tuning_config: TuningConfig) -> tuple:
+        """Stored policies a tuning-mode lookup with ``tuning_config`` accepts.
+
+        Reuse is asymmetric: an ordinary request also accepts the winner of a
+        full-profiling run of the same call (same overrides; its L2 policy and
+        sample count differ, so it is a policy of its own), so warmup neither
+        retunes nor overwrites it. A full request accepts only full winners.
+        """
+        policy = cls._profiling_policy(tuning_config)
+        if tuning_config.full_profiling:
+            return (policy,)
+        return (
+            policy,
+            cls._profiling_policy(replace(tuning_config, full_profiling=True)),
+        )
 
     @staticmethod
     def _default_profiling_policy(tuning_config: TuningConfig) -> tuple:
