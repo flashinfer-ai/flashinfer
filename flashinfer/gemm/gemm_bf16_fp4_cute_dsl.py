@@ -89,7 +89,10 @@ def _select_bf16_fp4_k_splits(
         # Split only the tile shapes that the tactic space pairs with splits.
         return 1
     tiles = -(-m // tile_m) * -(-n // tile_n)
-    if tiles * 3 > sm_count:
+    # For multi-row decode with a long K, halving the mainloop pays for the
+    # reduction launch even when the unsplit grid occupies half a wave.
+    max_tiles = sm_count // (2 if m > 1 and k >= 2048 else 3)
+    if tiles > max_tiles:
         return 1
     k_tiles = k // tile_k
     for splits in (8, 4, 2):

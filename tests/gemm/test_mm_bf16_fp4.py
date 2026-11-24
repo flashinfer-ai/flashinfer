@@ -487,7 +487,12 @@ def test_cute_dsl_fallback_k_splits_selector():
     # The pick never exceeds the K-tile count.
     assert pick(1, 512, 512, 188) == 4
     assert pick(1, 128, 128, 188) == 1
-    # Grids that already fill the GPU do not split.
+    # Multi-row, long-K decode can use two splits up to half a wave.
+    assert pick(8, 4096, 4096, 188) == 2
+    assert pick(8, 6016, 2048, 188) == 2  # 94 tiles on 188 SMs
+    assert pick(8, 6080, 2048, 188) == 1  # 95 tiles
+    assert pick(8, 4096, 1920, 188) == 1  # short K
+    # Single-row MMA keeps its conservative grid limit.
     assert pick(1, 2048, 2048, 48) == 1
     assert pick(1, 2048, 4096, 84) == 1
     assert pick(1, 4096, 512, 48) == 1
