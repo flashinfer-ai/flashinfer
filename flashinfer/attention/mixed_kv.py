@@ -29,8 +29,8 @@ def paged_fp8_k_nvfp4_v_fmha(
     qk_scale includes softmax and Q/K tensor scales; v_scale is the V tensor
     scale. Output is written into the supplied BF16 tensor. No full-page
     dequantization, TRTLLM cubins, or host reads of device metadata.
-    The short, low-batch H128/P64 decode schedule uses graph-capturable
-    FP32 partial outputs for 32, 128 or 256 sequence splits; it does not expand
+    The specialized H128/P64 decode schedule uses graph-capturable
+    FP32 partial outputs for 8 to 256 sequence splits; it does not expand
     the V cache. Scratch size in bytes is `4 * tokens * Hq * splits * (D + 2)`.
 
     A single page with all V elements equal to one (E2M1 code 2 in both

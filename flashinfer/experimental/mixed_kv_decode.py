@@ -191,6 +191,11 @@ def run_decode(q, k, v, sf, table, lens, ptr, out, scale, vscale):
     balanced = table.shape[0] == 1 and table.shape[1] > 32
     if balanced:
         s = 256
+    if table.shape[0] > 4:
+        if table.shape[1] <= 32:
+            n, s = (32, 32) if table.shape[0] <= 16 else (64, 8)
+        else:
+            s = 64 if table.shape[0] <= 32 else 32
     x = 32 if balanced else d
     tmp = torch.empty(
         (q.shape[0], heads, s, d + 2), device=q.device, dtype=torch.float32

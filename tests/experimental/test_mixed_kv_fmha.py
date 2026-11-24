@@ -148,7 +148,9 @@ def test_ragged_attention_and_graph_replay(d, group):
 
 
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
-@pytest.mark.parametrize(("width", "batch"), [(3, 4), (128, 4), (136, 1)])
+@pytest.mark.parametrize(
+    ("width", "batch"), [(3, 4), (128, 4), (136, 1), (3, 16), (160, 64)]
+)
 def test_short_decode_graph(layout, width, batch):
     from flashinfer.attention.mixed_kv import paged_fp8_k_nvfp4_v_fmha
 
@@ -175,7 +177,9 @@ def test_short_decode_graph(layout, width, batch):
     table = torch.tensor(
         [[6, 7, 9], [9, 1, 3], [7, 5, 2], [1, 0, 4]], device=dev, dtype=torch.int32
     )
-    table = table[:batch].repeat(1, (width + 2) // 3)[:, :width].contiguous()
+    table = table.repeat((batch + 3) // 4, (width + 2) // 3)[
+        :batch, :width
+    ].contiguous()
     states = (
         [([8192], [0, 1]), ([8703], [0, 1])]
         if batch == 1
@@ -184,6 +188,13 @@ def test_short_decode_graph(layout, width, batch):
             ([0, 66, 1, width * 64 - 39], [0, 0, 1, 2, 3]),
         ]
     )
+    if batch > 4:
+        pad = batch - 4
+        (l0, p0), (l1, p1) = states
+        states = [
+            (l0 + [0] * pad, p0 + [p0[-1]] * pad),
+            ([0] * pad + l1, [0] * pad + p1),
+        ]
     lengths, offsets = states[0]
     q = torch.randn((offsets[-1], 8, 128), device=dev).to(fp8)
     lens = torch.tensor(lengths, device=dev, dtype=torch.int32)

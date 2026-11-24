@@ -162,12 +162,14 @@ def run(q, k, v, sf, table, seq_lens, qo_indptr, max_q_len, out, qk_scale, v_sca
         raise ValueError(
             "nonempty queries require a positive launch bound and page table"
         )
-    # Short low-concurrency decode has too few CTAs when looping over K/V
-    # in a single tile. Use independent sequence splits and a narrow MMA.
+    # Split decode across the KV dimension rather than serializing a long
+    # request in one CTA. Limit dispatch to the measured GQA geometry.
     if (
         max_q_len == 1
-        and table.shape[0] <= 4
-        and table.shape[1] <= 512
+        and (
+            (table.shape[0] <= 4 and table.shape[1] <= 512)
+            or (table.shape[0] <= 64 and table.shape[1] <= 160)
+        )
         and hkv == 2
         and q.shape[1] == 8
         and d == 128
