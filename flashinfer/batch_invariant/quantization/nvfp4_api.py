@@ -269,8 +269,6 @@ def nvfp4_quantize_batch_invariant(
     recipe = recipe_of(nvfp4_4over6, cls)
     if recipe is not None:
         cls = Variant(per_token_activation, recipe).class_name
-        if per_token_activation:
-            _check_per_token_scale_pairing(a_global_sf, recipe)
     if a.dtype not in _DTYPE_STR:
         raise unsupported(cls, f"input dtype {a.dtype}", "bf16, f16 or fp32 inputs")
     if a.dim() < 1:
@@ -318,6 +316,10 @@ def nvfp4_quantize_batch_invariant(
                 f"a global scale of type {type(a_global_sf).__name__}",
                 "a float or a 1-element tensor",
             ) from None
+    if recipe is not None and per_token_activation:
+        _check_per_token_scale_pairing(
+            a_global_sf, recipe
+        )  # after the form checks: a malformed scale keeps its typed refusal
     try:
         layout = layout_of(sfLayout)
     except ValueError:

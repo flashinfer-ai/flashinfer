@@ -921,6 +921,16 @@ def test_4over6_zero_rule_and_unsupported_forms():
                 ),
                 batch_invariant=True,
             )
+    # a malformed scale keeps the typed refusal on the 4over6 path (the pairing check runs after the form checks)
+    for bad in (None, [1.0], "abc", 1.0 + 2.0j):
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            flashinfer.nvfp4_quantize(
+                x,
+                bad,
+                per_token_activation=True,
+                nvfp4_4over6=NVFP44Over6Config(err_use_fast_math=False),
+                batch_invariant=True,
+            )
     # a forced placement outside the 4over6 space (two lanes per block) is refused before any kernel is requested
     with pytest.raises(ValueError, match="4over6 placement"):
         nvfp4_quantize_rows(
