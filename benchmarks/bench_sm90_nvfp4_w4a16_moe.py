@@ -24,8 +24,10 @@ the experts the routing touches divided by that time, and the useful TFLOP/s.
 
 Optional baseline (``--baseline cutile``): FlashInfer's cuTile NVFP4-weight x
 BF16-activation backend through the unified ``MoELayer`` on the same
-checkpoint tensors (its own weight preparation; timing only, no numerical
-cross-check here; see tests/moe/test_sm90_nvfp4_w4a16_moe.py for accuracy).
+checkpoint tensors (its own weight preparation, gate / up halves passed in the
+up-first order it expects; timing only, no numerical cross-check here; see
+tests/moe/test_sm90_nvfp4_w4a16_moe.py for accuracy). Not available with
+``--post-norm``, which cuTile has no equivalent for.
 
 Examples::
 
@@ -86,7 +88,7 @@ def make_routing(M, E, k, mode, seed=0):
         scores = torch.rand(M, E, device="cuda", generator=g) * pop
     else:
         raise ValueError(mode)
-    w, ids = scores.topk(min(k, E), dim=-1)
+    w, ids = scores.topk(k, dim=-1)
     w = w / w.sum(-1, keepdim=True)
     return ids.to(torch.int32), w.float()
 
@@ -95,6 +97,16 @@ def touched_weight_bytes(ids, E, H, I):
     used = torch.unique(ids[(ids >= 0) & (ids < E)]).numel()
     per_expert = (H // 256) * (2 * I // 256) * 35840 + (I // 256) * (H // 256) * 35840
     return used * per_expert
+
+
+def to_up_first(w13, s13, gs13):
+    """Gate-first gated rows (ModelOpt, as passed to the SM90 kernel) -> the up-first
+    layout ``prepare_cutile_nvfp4_weights`` expects (it swaps the halves back)."""
+    w13 = torch.cat(w13.chunk(2, dim=1)[::-1], dim=1)
+    s13 = torch.cat(s13.chunk(2, dim=1)[::-1], dim=1)
+    if gs13.dim() == 2:
+        gs13 = gs13[:, [1, 0]]
+    return w13, s13, gs13
 
 
 def cutile_baseline(ckpt, H, I, E, k, max_tokens):
@@ -114,6 +126,7 @@ def cutile_baseline(ckpt, H, I, E, k, max_tokens):
     )
 
     w13, s13, gs13, w2, s2, gs2 = ckpt
+    w13, s13, gs13 = to_up_first(w13, s13, gs13)
     option = CuTileNvfp4Bf16Config()
     view = option.prepare_weights(
         w13,
@@ -172,6 +185,15 @@ def main():
     if not is_sm90a_supported(torch.device("cuda")):
         raise SystemExit("sm90_nvfp4_w4a16_moe needs an SM90 (sm_90a) GPU")
     H, I, E, k = a.hidden, a.intermediate, a.experts, a.top_k
+    if not 1 <= E <= 32:
+        p.error("--experts must be in [1, 32]")
+    if not 1 <= k <= min(E, 8):
+        p.error(f"--top-k must be in [1, min(experts, 8)] = [1, {min(E, 8)}]")
+    if a.post_norm and a.baseline == "cutile":
+        p.error(
+            "--post-norm has no cuTile equivalent (per-route RMSNorm before the top-k "
+            "sum); the comparison would time different operations"
+        )
     ckpt = make_checkpoint(H, I, E)
     packed = prepare_sm90_nvfp4_w4a16_weights(*ckpt)
     ws = get_sm90_nvfp4_w4a16_moe_workspace(torch.device("cuda"), H, I, a.post_norm)
