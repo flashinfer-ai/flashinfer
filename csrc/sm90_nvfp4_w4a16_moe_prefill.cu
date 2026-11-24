@@ -82,6 +82,31 @@ void encode_weight_map(CUtensorMap* m, const void* ptr, int64_t nblocks, int kbl
   TVM_FFI_ICHECK(res == CUDA_SUCCESS) << "cuTensorMapEncodeTiled (weights) failed: " << res;
 }
 
+// Global scales, the norm weight and the packed weights of `num_experts` experts
+// (the kernels read them as float32 / fixed-size blocks without bounds checks).
+void check_expert_params(const TensorView& w13, const TensorView& w13_scale,
+                         const TensorView& w13_up_scale, const TensorView& w2,
+                         const TensorView& w2_scale, const TensorView& norm_weight,
+                         int64_t num_experts) {
+  check_dtype(w13_scale, dl_float32, "w13_scale");
+  check_dtype(w13_up_scale, dl_float32, "w13_up_scale");
+  check_dtype(w2_scale, dl_float32, "w2_scale");
+  check_dtype(norm_weight, dl_float32, "norm_weight");
+  TVM_FFI_ICHECK(num_experts >= 1 && num_experts <= kMaxLocalExperts)
+      << "num_experts must be in [1, 32], got " << num_experts;
+  TVM_FFI_ICHECK(w13_scale.numel() >= num_experts && w13_up_scale.numel() >= num_experts &&
+                 w2_scale.numel() >= num_experts)
+      << "global scales must hold num_experts values";
+  if (kPN) {
+    TVM_FFI_ICHECK_GE(norm_weight.numel(), kH) << "norm_weight must hold hidden values";
+  }
+  const int64_t blocks = (int64_t)(kH / 256) * (2 * kI / 256);
+  TVM_FFI_ICHECK_GE(w13.numel(), num_experts * blocks * kWeightBlockBytes)
+      << "w13 must hold the packed gate / up blocks of num_experts experts";
+  TVM_FFI_ICHECK_GE(w2.numel(), num_experts * (blocks / 2) * kWeightBlockBytes)
+      << "w2 must hold the packed down blocks of num_experts experts";
+}
+
 int num_sms(int device) {
   int sms = 0;
   cudaError_t status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
@@ -146,6 +171,11 @@ void sm90_nvfp4_w4a16_moe_prefill_run(TensorView hidden_states, TensorView topk_
   check_dtype(out, dl_bfloat16, "out");
   check_dtype(recv, dl_bfloat16, "recv");
   check_dtype(counters, dl_int32, "counters");
+  check_dtype(xt, dl_bfloat16, "xt");
+  check_dtype(maps, dl_uint8, "maps");
+  check_dtype(rev, dl_int32, "rev");
+  check_dtype(unit_counts, dl_int32, "unit_counts");
+  check_expert_params(w13, w13_scale, w13_up_scale, w2, w2_scale, norm_weight, num_experts);
   for (const TensorView* t :
        {&hidden_states, &topk_ids, &topk_weights, &w13, &w13_scale, &w13_up_scale, &w2, &w2_scale,
         &norm_weight, &out, &recv, &xt, &maps, &rev, &unit_counts, &counters}) {
@@ -160,10 +190,11 @@ void sm90_nvfp4_w4a16_moe_prefill_run(TensorView hidden_states, TensorView topk_
       << "topk_weights must be [num_tokens, 8]";
   TVM_FFI_ICHECK(out.size(0) == M && out.size(1) == kH);
   TVM_FFI_ICHECK_GE(recv.numel(), (int64_t)kTopKSlots * M * kH) << "recv must hold [8, M, hidden]";
-  TVM_FFI_ICHECK(num_experts >= 1 && num_experts <= kMaxLocalExperts);
   TVM_FFI_ICHECK(chunk_tokens >= 128 && chunk_tokens % 128 == 0);
-  TVM_FFI_ICHECK_GE(xt.size(0), sm90_nvfp4_w4a16_moe_prefill_slots(chunk_tokens))
-      << "xt has fewer rows than the chunk needs";
+  TVM_FFI_ICHECK(xt.size(1) == kH && xt.size(0) >= sm90_nvfp4_w4a16_moe_prefill_slots(chunk_tokens))
+      << "xt must be [slots, hidden] with the rows the chunk needs";
+  TVM_FFI_ICHECK_GE(maps.numel(), (int64_t)(kNumMaps * sizeof(pf::Tmap)))
+      << "maps must come from prefill_init";
   TVM_FFI_ICHECK_GE(rev.numel(), (int64_t)(pf::NE + kTopKSlots) * M);
   TVM_FFI_ICHECK_GE(unit_counts.numel(), (M + 127) / 128 * 64);
   TVM_FFI_ICHECK_GE(counters.numel(), (int64_t)pf::kCounterWords);

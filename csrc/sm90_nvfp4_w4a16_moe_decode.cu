@@ -131,6 +131,31 @@ void dispatch(int M, F&& f) {
   }
 }
 
+// Global scales, the norm weight and the packed weights of `num_experts` experts
+// (the kernels read them as float32 / fixed-size blocks without bounds checks).
+void check_expert_params(const TensorView& w13, const TensorView& w13_scale,
+                         const TensorView& w13_up_scale, const TensorView& w2,
+                         const TensorView& w2_scale, const TensorView& norm_weight,
+                         int64_t num_experts) {
+  check_dtype(w13_scale, dl_float32, "w13_scale");
+  check_dtype(w13_up_scale, dl_float32, "w13_up_scale");
+  check_dtype(w2_scale, dl_float32, "w2_scale");
+  check_dtype(norm_weight, dl_float32, "norm_weight");
+  TVM_FFI_ICHECK(num_experts >= 1 && num_experts <= kMaxLocalExperts)
+      << "num_experts must be in [1, 32], got " << num_experts;
+  TVM_FFI_ICHECK(w13_scale.numel() >= num_experts && w13_up_scale.numel() >= num_experts &&
+                 w2_scale.numel() >= num_experts)
+      << "global scales must hold num_experts values";
+  if (kPN) {
+    TVM_FFI_ICHECK_GE(norm_weight.numel(), kH) << "norm_weight must hold hidden values";
+  }
+  const int64_t blocks = (int64_t)(kH / 256) * (2 * kI / 256);
+  TVM_FFI_ICHECK_GE(w13.numel(), num_experts * blocks * kWeightBlockBytes)
+      << "w13 must hold the packed gate / up blocks of num_experts experts";
+  TVM_FFI_ICHECK_GE(w2.numel(), num_experts * (blocks / 2) * kWeightBlockBytes)
+      << "w2 must hold the packed down blocks of num_experts experts";
+}
+
 int num_sms(int device) {
   int sms = 0;
   cudaError_t status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
@@ -169,6 +194,7 @@ void sm90_nvfp4_w4a16_moe_decode_run(TensorView hidden_states, TensorView topk_i
   check_dtype(w2, dl_uint8, "w2");
   check_dtype(out, dl_bfloat16, "out");
   check_dtype(counters, dl_int32, "counters");
+  check_expert_params(w13, w13_scale, w13_up_scale, w2, w2_scale, norm_weight, num_experts);
   for (const TensorView* t :
        {&hidden_states, &topk_ids, &topk_weights, &w13, &w13_scale, &w13_up_scale, &w2, &w2_scale,
         &norm_weight, &out, &buffer, &counters, &scratch}) {
@@ -182,8 +208,6 @@ void sm90_nvfp4_w4a16_moe_decode_run(TensorView hidden_states, TensorView topk_i
   TVM_FFI_ICHECK(topk_weights.size(0) == M && topk_weights.size(1) == kTopKSlots)
       << "topk_weights must be [num_tokens, 8]";
   TVM_FFI_ICHECK(out.size(0) == M && out.size(1) == kH) << "out must be [num_tokens, hidden]";
-  TVM_FFI_ICHECK(num_experts >= 1 && num_experts <= kMaxLocalExperts)
-      << "num_experts must be in [1, 32], got " << num_experts;
   TVM_FFI_ICHECK_GE(counters.numel(), dec::kCounterWords) << "counter workspace too small";
   if (M == 0) return;
   const int device = hidden_states.device().device_id;

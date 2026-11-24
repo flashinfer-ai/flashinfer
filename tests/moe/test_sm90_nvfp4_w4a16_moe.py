@@ -503,3 +503,41 @@ def test_rejects_bad_inputs():
         )
     with pytest.raises(ValueError):
         run(packed, x, ids, w, post_norm_weight=torch.ones(H + 1, device="cuda"))
+
+
+def test_launcher_checks_expert_params():
+    """Direct launcher calls reject global scales / norm weights of the wrong dtype
+    or size and packed weights with fewer experts than ``num_experts``."""
+    from flashinfer.fused_moe.sm90_nvfp4_w4a16 import _decode_buffer_bytes, _get_module
+
+    _, packed = checkpoint(SHAPES[5])
+    H, I, E, _ = SHAPES[5]
+    module = _get_module(H, I, False)
+    ws = Sm90Nvfp4W4A16MoEWorkspace(torch.device("cuda"), H, I)
+    x = torch.randn(4, H, device="cuda").bfloat16()
+    ids = torch.zeros(4, 8, dtype=torch.int32, device="cuda")
+    w = torch.full((4, 8), 0.125, device="cuda")
+    out = torch.empty_like(x)
+    buf = torch.empty(
+        _decode_buffer_bytes(H, I, False, 4), dtype=torch.uint8, device="cuda"
+    )
+    gs13, gs2 = packed.w13_global_scale, packed.w2_global_scale
+
+    def call(gate=gs13[0], up=gs13[1], down=gs2, nw=None, n=E):
+        nw = torch.empty(4, device="cuda") if nw is None else nw
+        module.decode_run(
+            x, ids, w, packed.w13, gate, up, packed.w2, down, nw, out, buf,
+            ws.decode_counters, ws.decode_scratch, n, 1e-6, False,
+        )  # fmt: skip
+
+    call()
+    torch.cuda.synchronize()
+    with pytest.raises(Exception, match="w2_scale"):
+        call(down=gs2.half())
+    with pytest.raises(Exception, match="norm_weight"):
+        call(nw=torch.empty(4, device="cuda", dtype=torch.bfloat16))
+    with pytest.raises(Exception, match="global scales"):
+        call(down=gs2[: E - 1].contiguous())
+    one = torch.ones(E + 1, device="cuda")
+    with pytest.raises(Exception, match="w13 must hold"):
+        call(gate=one, up=one, down=one, n=E + 1)
