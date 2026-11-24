@@ -22,7 +22,7 @@ def make_config(capacity, *, kind="nvfp4", knobs=None, **options):
         cls(
             intermediate_size=256,
             top_k=2,
-            kernel_name=f"sm100_{selector}_{selector}_bf16_cutedsl_next",
+            kernel_name=f"sm100_{selector}_{selector}_bf16_cutedsl",
             knobs=knobs,
             **kwargs,
             **options,

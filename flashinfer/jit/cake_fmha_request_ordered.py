@@ -444,14 +444,14 @@ def load_cake_fmha_request_ordered_module(name: str):
     """NVRTC-compile and load one SM103 program instantiation."""
 
     import torch
-    from tvm_ffi import cpp
+    from .inline_cubin import load_inline_with_cubin
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         raise RuntimeError("request-ordered Cake FMHA requires compute capability 10.3")
     spec = get_cake_fmha_request_ordered_module_spec(name)
     root = _source_root()
     cubin, build_directory = _cached_cubin(spec)
-    result = cpp.load_inline(
+    result = load_inline_with_cubin(
         build_directory.name,
         cpp_sources=spec.binding_path.read_text(encoding="utf-8"),
         embed_cubin={spec.module_ident: cubin},

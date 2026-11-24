@@ -56,7 +56,10 @@ from .helpers_common import (
 from .smem_resources import SmemKvResource, SmemKvTileResource
 from .tmem_transformed_kv import (
     _has_packed_e4m3_e2m1_mul,
-    _mul_e2m1x4_e4m3x4_bx,
+    _mul_e2m1x4_e4m3x4,
+    _scale_e2m1x8_to_e4m3x8,
+    broadcast_byte_const,
+    byte_permute,
 )
 
 
@@ -178,22 +181,37 @@ def store_nvfp4_fp8_row_block(
     word0: Int32,
     word1: Int32,
     scale_word: Int32,
+    even_odd_order: Constexpr[bool] = False,
 ) -> None:
-    """Convert sixteen packed FP4 values into one 16-byte swizzled FP8 block."""
+    """Convert sixteen packed FP4 values into one 16-byte swizzled FP8 block.
+
+    The packed multiply ignores each byte's high nibble, so a payload word
+    and the same word shifted right by four yield the even and the odd
+    values directly. ``even_odd_order`` stores each group of eight as
+    e0 e2 e4 e6 e1 e3 e5 e7 (the consumer permutes its other operand to
+    match) and skips the two interleaving byte permutes.
+    """
     fp8_words = []
     packed_words = (word0, word1)
+    scale = None
+    if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
+        scale = broadcast_byte_const(scale_word, block % 4)
     for w in cutlass.range_constexpr(2):
         if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
-            unpacked = unpack_e2m1x8_word(packed_words[w])
-            for part in cutlass.range_constexpr(2):
-                fp8_words.append(
-                    _mul_e2m1x4_e4m3x4_bx(unpacked[part], scale_word, block % 4)
-                )
+            if cutlass.const_expr(even_odd_order):
+                fp8_words.append(_mul_e2m1x4_e4m3x4(packed_words[w], scale))
+                fp8_words.append(_mul_e2m1x4_e4m3x4(packed_words[w] >> Int32(4), scale))
+            else:
+                fp8_words.extend(_scale_e2m1x8_to_e4m3x8(packed_words[w], scale))
         else:
             scale = (scale_word >> Int32((block % 4) * 8)) & Int32(255)
             converted = _cvt_e2m1_word_to_e4m3_words(packed_words[w], scale)
-            fp8_words.append(converted[0])
-            fp8_words.append(converted[1])
+            if cutlass.const_expr(even_odd_order):
+                fp8_words.append(byte_permute(converted[0], converted[1], 0x6420))
+                fp8_words.append(byte_permute(converted[0], converted[1], 0x7531))
+            else:
+                fp8_words.append(converted[0])
+                fp8_words.append(converted[1])
     (
         dst_words.data_ptr()
         + row * Int32(32)
@@ -488,11 +506,14 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
         src_base: cutlass.Array,
         src_sf_base: cutlass.Array,
         dst_base: cutlass.Array,
-        head_dim_stage_idx: Constexpr[int],
+        head_dim_stage_idx: Int32 | int,
         is_v: Constexpr[int],
         transform_thread_idx: Int32,
     ) -> None:
         """Convert one dense NVFP4 stage to 128B-swizzled FP8 K-major rows.
+
+        ``head_dim_stage_idx`` only selects the scale words, so the flattened
+        D512 converter loop may pass a run-time stage index.
 
         Thread t owns KV row t. Its packed row is 64 bytes (128 FP4 values)
         stored with the 64B TMA swizzle, so 16-byte chunk j sits at chunk
@@ -553,6 +574,11 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
                     packed_chunk[half * 2],
                     packed_chunk[half * 2 + 1],
                     scale_words[blk // 4],
+                    even_odd_order=(
+                        cfg.uses_permuted_packed_v_order
+                        if is_v
+                        else cfg.uses_permuted_packed_k_order
+                    ),
                 )
 
     @cute.jit
@@ -646,6 +672,61 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
                 )
 
         cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _transform_fast_runtime_stage(
+        self, stage_info: StageInfo, is_v: Constexpr[int], head_dim_stage_idx: Int32
+    ) -> None:
+        """Convert one one-instance raw stage selected at run time (fast path)."""
+        cfg = self.cfg
+        assert cfg.uses_fast_smem_nvfp4_transform and cfg.uses_dual_smem_transform
+        task_cache = _decode_gen_task_cache(stage_info)
+        warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        transform_thread_idx = warp_grp_thread_idx - Int32(
+            (cfg.transform_kv_warp_idx % 4) * 32
+        )
+        dst_base = self._smem_base_kv.subview(
+            stage_info.stage_idx
+            * (cfg.smem_transformed_kv_tile_bytes // cfg.qk_dtype_bytes)
+        )
+        src = self.src_smem_kv
+        if cutlass.const_expr(self.src_smem_kv is None):
+            src = self.src_smem_v0 if is_v else self.src_smem_k0
+        assert src is not None
+        src_stage_idx = src.state_src.consumer_work_stage
+        src_base = src._smem_base_kv.subview(src_stage_idx * cfg.smem_kv_tile_elements)
+        self._transform_nvfp4_rows(
+            src_base,
+            src._sf_stage_base(src_stage_idx),
+            dst_base,
+            head_dim_stage_idx,
+            is_v,
+            transform_thread_idx,
+        )
+        cute.arch.fence_view_async_shared()
+
+    @producer_work
+    @cute.jit
+    def transform_k0_loop_stage(self, stage_info: StageInfo) -> None:
+        """Convert K head-dimension stage ``n % stages`` of the flattened loop.
+
+        Mirrors ``TmemTransformedKvResource.transform_k0_loop_stage``: at four
+        head-dimension stages (D512) the dual converter's steady state runs
+        once per raw stage, selecting the stage at run time.
+        """
+        stages = self.cfg.num_head_dim_stages_kv
+        assert stages & (stages - 1) == 0, "stage decoding uses bit masks"
+        item = Int32(stage_info.loop_offset) - Int32(stage_info.loop_start)
+        self._transform_fast_runtime_stage(stage_info, 0, item & Int32(stages - 1))
+
+    @producer_work
+    @cute.jit
+    def transform_v0_loop_stage(self, stage_info: StageInfo) -> None:
+        """The V counterpart of :meth:`transform_k0_loop_stage`."""
+        stages = self.cfg.num_head_dim_stages_kv
+        assert stages & (stages - 1) == 0, "stage decoding uses bit masks"
+        item = Int32(stage_info.loop_offset) - Int32(stage_info.loop_start)
+        self._transform_fast_runtime_stage(stage_info, 1, item & Int32(stages - 1))
 
     @producer_work
     @cute.jit

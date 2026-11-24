@@ -8,7 +8,7 @@ wired for SM107.
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
     torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
-        --dtype nvfp4 --hidden 7168 --intermediate 2048 \
+        --dtype nvfp4 --implementation next --hidden 7168 --intermediate 2048 \
         --num-experts 256 --topk 8 --max-tokens 8 512 2048
 
 Hopper Humming MXFP4 fused (the scale ABI is selected automatically)::
@@ -382,15 +382,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 2
             backend = "mxfp4_mxfp4_bf16_cutedsl"
         elif args.dtype == "mxfp4_mxfp8":
-            if (
-                family == "sm100"
-                and args.kernel_variant != "genphase"
-                and args.implementation != "next"
-            ):
-                print(
-                    "SM100 MXFP4/MXFP8 requires --implementation next", file=sys.stderr
-                )
-                return 2
             backend = (
                 "mxfp8_mxfp4_bf16_cutedsl"
                 if family == "sm107"
@@ -409,8 +400,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("--kernel-variant auto requires SM107", file=sys.stderr)
         return 2
 
-    next_standard = args.implementation == "next"
-    if next_standard and (
+    requested_next = args.implementation == "next"
+    if requested_next and (
         family != "sm100"
         or args.dtype not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
     ):
@@ -419,6 +410,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr,
         )
         return 2
+    next_standard = requested_next or (
+        family == "sm100" and args.dtype in ("mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+    )
 
     if not args.do_finalize or (
         not args.apply_routing_weights_before_fc2
@@ -445,7 +439,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("--no-do-finalize requires --combine-dtype bf16", file=sys.stderr)
             return 2
 
-    if family != "sm107" and args.combine_dtype != "bf16" and args.dtype != "nvfp4":
+    if (
+        family != "sm107"
+        and args.combine_dtype != "bf16"
+        and args.dtype != "nvfp4"
+        and not next_standard
+    ):
         print("--combine-dtype requires SM100 NVFP4 or SM107", file=sys.stderr)
         return 2
     if args.kernel_variant == "genphase" and args.combine_dtype != "bf16":

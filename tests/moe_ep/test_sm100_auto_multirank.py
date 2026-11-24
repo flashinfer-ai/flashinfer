@@ -13,8 +13,8 @@ from flashinfer.autotune_cache import MeasurementPolicy, autotune_v2_reload
 from flashinfer.autotuner import AutoTuner
 from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.modes.mega_layer import MoEEpMegaLayer
-from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
-from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe import sources as pkg
+from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
     autotune as native,
     knob_cache,
     tuning_protocol,
@@ -31,14 +31,14 @@ def config(kind, variant, **options):
     )
     if kind == "nvfp4":
         return moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next", **common
+            kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl", **common
         )
     if kind == "mxfp4_mxfp8":
         return moe_ep.Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
     return moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         kind=kind,
         kernel_variant=variant,
-        kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"
+        kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl"
         if variant == "inference"
         else "sm100_mxfp8_mxfp8_bf16_cutedsl",
         **common,
@@ -72,27 +72,17 @@ def blackwell_bootstrap(request):
 
 @pytest.mark.arch_blackwell
 @pytest.mark.gpu_2
-def test_phase_interleave_fc1_readiness(blackwell_bootstrap, monkeypatch):
+def test_phase_interleave_fc1_readiness(blackwell_bootstrap):
     import cutlass.cute as cute
     from cutlass import Boolean, Int32
     from cutlass.cute.runtime import from_dlpack
 
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.kernel_src.schedulers import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.kernel_src.schedulers import (
         fc12_scheduler as scheduler,
     )
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.src.sources.kernel_src.schedulers.fc12_mapping import (
+    from flashinfer.moe_ep.kernels.cutedsl_megamoe.sources.kernel_src.schedulers.fc12_mapping import (
         create_phase_interleaved_fc12_mapping_state,
     )
-
-    spin_wait = scheduler.spin_wait
-
-    @cute.jit
-    def split_ready(pointer, condition):
-        # Model a stale peek on one CTA after the watermark is reached.
-        spin_wait(pointer, condition)
-        return cute.arch.block_idx()[0] != 0
-
-    monkeypatch.setattr(scheduler, "spin_peek", split_ready)
 
     @dataclasses.dataclass(frozen=True)
     class Probe:
@@ -139,15 +129,19 @@ def test_phase_interleave_fc1_readiness(blackwell_bootstrap, monkeypatch):
                 grid=(2, 1, 1), block=(32, 1, 1), cluster=(2, 1, 1)
             )
 
-    # The runtime stream has one tile, below the static watermark. Neither
-    # readiness path may mark FC1 exhausted before a uniform work claim.
+    # Exhaustion follows the runtime mapping, so both CTAs must agree even
+    # when the stream ends before the static claim watermark.
     counter = torch.tensor([8], device="cuda", dtype=torch.int32)
     tokens = torch.tensor([1], device="cuda", dtype=torch.int32)
     output = torch.full((2,), -1, device="cuda", dtype=torch.int32)
     args = [from_dlpack(t) for t in (counter, tokens, output)]
-    cute.compile(Probe(), *args)(*args)
-    torch.cuda.synchronize()
-    assert output.tolist() == [0, 0]
+    compiled = cute.compile(Probe(), *args)
+    for count, exhausted in ((1, 1), (4096, 0)):
+        tokens.fill_(count)
+        output.fill_(-1)
+        compiled(*args)
+        torch.cuda.synchronize()
+        assert output.tolist() == [exhausted, exhausted]
 
 
 @pytest.mark.arch_blackwell
@@ -361,9 +355,7 @@ def test_auto_unfinalized(kind, early, monkeypatch):
 def test_auto_nvfp4_n64_persistence_and_capture(
     blackwell_bootstrap, monkeypatch, tmp_path
 ):
-    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import (
-        tuning_protocol,
-    )
+    from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import tuning_protocol
 
     original = tuning_protocol.sm100_standard_candidates
 
