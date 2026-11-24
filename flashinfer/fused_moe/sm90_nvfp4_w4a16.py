@@ -344,6 +344,7 @@ def _as_scale_bytes(t: torch.Tensor, name: str) -> torch.Tensor:
     raise ValueError(f"{name} must be float8_e4m3fn (or its uint8 view), got {t.dtype}")
 
 
+@flashinfer_api
 @torch.no_grad()
 def prepare_sm90_nvfp4_w4a16_weights(
     w13_fp4: torch.Tensor,
@@ -452,13 +453,27 @@ def prepare_sm90_nvfp4_w4a16_weights(
     return Sm90Nvfp4W4A16Weights(w13, gs13_out.contiguous(), w2, gs2_out)
 
 
+@flashinfer_api
 @torch.no_grad()
 def dequantize_sm90_nvfp4_w4a16_weights(
     weights: Sm90Nvfp4W4A16Weights, expert: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """FP32 weights of one expert recovered from the packed format:
-    ``(w13 [2 * intermediate, hidden], w2 [hidden, intermediate])``. Intended for
-    tests and debugging."""
+    """FP32 weights of one expert recovered from the packed format. Intended for
+    tests and debugging.
+
+    Parameters
+    ----------
+    weights : Sm90Nvfp4W4A16Weights
+        Packed weights from :func:`prepare_sm90_nvfp4_w4a16_weights`.
+    expert : int
+        Local expert index.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(w13 [2 * intermediate, hidden], w2 [hidden, intermediate])`` float32,
+        gate rows before up rows.
+    """
     I = weights.intermediate_size
     c13, s13 = _unpack_matrix(weights.w13[expert], gate_up=True)
     c2, s2 = _unpack_matrix(weights.w2[expert], gate_up=False)
@@ -579,6 +594,7 @@ class Sm90Nvfp4W4A16MoEWorkspace:
 _DEFAULT_WORKSPACES: Dict[Tuple[int, int, int], Sm90Nvfp4W4A16MoEWorkspace] = {}
 
 
+@flashinfer_api
 def get_sm90_nvfp4_w4a16_moe_workspace(
     device: torch.device,
     hidden_size: int,
@@ -586,7 +602,25 @@ def get_sm90_nvfp4_w4a16_moe_workspace(
     post_norm: bool = False,
 ) -> Sm90Nvfp4W4A16MoEWorkspace:
     """The default workspace of a device and shape (shared by every call that
-    passes no ``workspace``; see :class:`Sm90Nvfp4W4A16MoEWorkspace`)."""
+    passes no ``workspace``; see :class:`Sm90Nvfp4W4A16MoEWorkspace`).
+
+    Parameters
+    ----------
+    device : torch.device
+        CUDA device of the calls.
+    hidden_size : int
+        Hidden size of the MoE layer.
+    intermediate_size : int
+        Intermediate size of one expert.
+    post_norm : bool
+        Whether the calls use ``post_norm_weight``. Selects the module that
+        answers the workspace size queries; the buffers are the same either way.
+
+    Returns
+    -------
+    Sm90Nvfp4W4A16MoEWorkspace
+        Created on first use (outside CUDA graph capture), then reused.
+    """
     device = torch.device(device)
     index = device.index if device.index is not None else torch.cuda.current_device()
     key = (index, hidden_size, intermediate_size)
@@ -617,6 +651,7 @@ def _decode_buffer_bytes(
 # ---------------------------------------------------------------------------
 
 
+@flashinfer_api
 def sm90_nvfp4_w4a16_moe_prefill_min_tokens(
     hidden_size: int,
     intermediate_size: int,
@@ -631,11 +666,27 @@ def sm90_nvfp4_w4a16_moe_prefill_min_tokens(
     the call carries enough work to fill the GPU; below that the small-batch
     kernel is faster. The result is at most ``DEFAULT_PREFILL_MIN_TOKENS``.
 
-    ``local_route_fraction`` is the expected share of routes that hit the local
-    experts. The default 1.0 assumes every route is local; under expert
-    parallelism, where routes to other ranks' experts are passed as skipped ids,
-    pass ``num_local_experts / num_global_experts`` (for balanced routing) and
-    give the result as ``prefill_min_tokens``.
+    Parameters
+    ----------
+    hidden_size : int
+        Hidden size of the MoE layer.
+    intermediate_size : int
+        Intermediate size of one expert.
+    num_local_experts : int
+        Experts held by the call (``w13.shape[0]``).
+    top_k : int
+        Routes per token.
+    local_route_fraction : float
+        Expected share of routes that hit the local experts. The default 1.0
+        assumes every route is local; under expert parallelism, where routes to
+        other ranks' experts are passed as skipped ids, pass
+        ``num_local_experts / num_global_experts`` (for balanced routing) and
+        give the result as ``prefill_min_tokens``.
+
+    Returns
+    -------
+    int
+        The token count from which the large-batch kernel runs.
     """
     if not 0.0 < local_route_fraction <= 1.0:
         raise ValueError("local_route_fraction must be in (0, 1]")
