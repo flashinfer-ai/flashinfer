@@ -38,7 +38,7 @@ from .mla import (
     trtllm_batch_decode_with_kv_cache_mla as trtllm_batch_decode_with_kv_cache_mla,
     xqa_batch_decode_with_kv_cache_mla as xqa_batch_decode_with_kv_cache_mla,
 )
-from .xqa import xqa, xqa_mla as xqa_mla
+from .xqa import _xqa_sm120_long_kv, xqa, xqa_mla as xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .cudnn.decode import CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE
 from .cudnn.utils import (
@@ -5666,6 +5666,7 @@ def xqa_batch_decode_with_kv_cache(
     # On SM120 partitions, long FP8 KV reads benefit from splitting each
     # (request, KV head) tile across CTAs even when the first wave is full.
     cta_budget = sm_count
+    run_xqa = xqa
     if (
         q_len_per_req == 1
         and 32768 <= max_seq_len <= 65536
@@ -5687,8 +5688,21 @@ def xqa_batch_decode_with_kv_cache(
             launch_sms = _smallm_launch_sm_count(query.device, sm_count)
             if launch_sms in (72, 80) and launch_sms < sm_count:
                 cta_budget = split_ctas
+                # The compact kernel hardcodes the element strides of the two
+                # HND views of a contiguous [pages, 2, 8, 16, 64] cache.
+                if (
+                    k_cache.shape == v_cache.shape
+                    and k_cache.shape[-1] == head_dim
+                    and k_cache.stride() == v_cache.stride() == (16384, 1024, 64, 1)
+                    and v_cache.dtype == k_cache.dtype
+                    and k_cache.device == v_cache.device == query.device == out.device
+                    and out.shape == query.shape
+                    and query.is_contiguous()
+                    and out.is_contiguous()
+                ):
+                    run_xqa = _xqa_sm120_long_kv
 
-    xqa(
+    run_xqa(
         query_new,
         k_cache,
         v_cache,

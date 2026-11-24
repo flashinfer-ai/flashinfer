@@ -61,6 +61,7 @@ def get_xqa_module(
         output_dtype,
         q_seq_len,
         use_ragged_q,
+        sm120_long_kv=False,
     )
 
 
@@ -75,6 +76,8 @@ def _get_xqa_module_cached(
     output_dtype: torch.dtype,
     q_seq_len: int,
     use_ragged_q: bool,
+    *,
+    sm120_long_kv: bool,
 ):
     spec = gen_xqa_module(
         input_dtype,
@@ -86,6 +89,7 @@ def _get_xqa_module_cached(
         output_dtype,
         q_seq_len,
         use_ragged_q,
+        _sm120_long_kv=sm120_long_kv,
     )
     # Reuse the JIT module URI so the two names can never drift apart.
     op_name = f"flashinfer::{spec.name}"
@@ -316,6 +320,61 @@ def xqa(
     - head_group_ratio from num_q_heads // num_kv_heads
     - max_seq_len from page_table.shape[-1] * page_size
     """
+    _xqa(
+        get_xqa_module,
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        output,
+        workspace_buffer,
+        semaphores,
+        num_kv_heads,
+        page_size,
+        sinks=sinks,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        sliding_win_size=sliding_win_size,
+        kv_layout=kv_layout,
+        sm_count=sm_count,
+        enable_pdl=enable_pdl,
+        rcp_out_scale=rcp_out_scale,
+        q_seq_len=q_seq_len,
+        mask=mask,
+        q_cu_seq_lens=q_cu_seq_lens,
+        k_sf_cache=k_sf_cache,
+        v_sf_cache=v_sf_cache,
+    )
+
+
+def _xqa(
+    get_module,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    output: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    semaphores: torch.Tensor,
+    num_kv_heads: int,
+    page_size: int,
+    *,
+    sinks: Optional[torch.Tensor],
+    q_scale: Union[float, torch.Tensor],
+    kv_scale: Union[float, torch.Tensor],
+    sliding_win_size: int,
+    kv_layout: str,
+    sm_count: Optional[int],
+    enable_pdl: Optional[bool],
+    rcp_out_scale: float,
+    q_seq_len: int,
+    mask: Optional[torch.Tensor],
+    q_cu_seq_lens: Optional[torch.Tensor],
+    k_sf_cache: Optional[torch.Tensor],
+    v_sf_cache: Optional[torch.Tensor],
+) -> None:
     # Handle optional parameters
     if sm_count is None:
         sm_count = get_device_sm_count(q.device)
@@ -384,9 +443,10 @@ def xqa(
             k_sf_cache = k_sf_cache.transpose(-3, -2)
         if v_sf_cache is not None:
             v_sf_cache = v_sf_cache.transpose(-3, -2)
+    sm_major, _ = get_compute_capability(q.device)
     if (
         k_cache.dtype == torch.float8_e4m3fn
-        and get_compute_capability(torch.device(device="cuda"))[0] == 9
+        and sm_major == 9
         and head_dim <= 256  # SM90 kernel does not support head_dim > 256
     ):
         run_sm90_fp8_mha = True
@@ -394,16 +454,14 @@ def xqa(
         run_sm90_fp8_mha = False
 
     if k_cache.dtype == torch.uint8:
-        assert get_compute_capability(torch.device(device="cuda"))[0] in [12], (
-            "XQA NVFP4 KV is only supported on SM12x GPUs"
-        )
+        assert sm_major == 12, "XQA NVFP4 KV is only supported on SM12x GPUs"
         assert k_sf_cache is not None, "K SF cache is required when NVFP4 KV is used"
         assert v_sf_cache is not None, "V SF cache is required when NVFP4 KV is used"
 
-    if get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12]:
+    if sm_major not in [9, 10, 12]:
         raise RuntimeError("XQA is only supported on SM90, SM100, SM120/SM121 GPUs")
 
-    xqa_module = get_xqa_module(
+    xqa_module = get_module(
         q.dtype,
         k_cache.dtype,
         page_size,
@@ -455,6 +513,12 @@ def xqa(
         q_cu_seq_lens,
         mask,
     )
+
+
+# Only the gated single-token decode path uses this build; ragged Q is impossible.
+_xqa_sm120_long_kv = functools.partial(
+    _xqa, functools.partial(_get_xqa_module_cached, sm120_long_kv=True)
+)
 
 
 @functools.cache
