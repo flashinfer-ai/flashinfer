@@ -23,15 +23,17 @@ alternate them a few times; each run prints one line per ``nnz``.
 
 * ``cold`` (default): no measured iteration finds its data in L2.  CUPTI
   flushes L2 before each iteration; ``--no-cupti`` times CUDA-graph replays
-  that rotate over clones of every input and cache tensor.  This is the
-  conservative bound.
+  that rotate over clones of every input and cache tensor.  When the cache is
+  too large to clone (``bench_gpu_time`` then skips rotation and the few
+  touched slots would stay in L2), ``--no-cupti`` uses CUDA events with an L2
+  flush before each launch instead.  This is the conservative bound.
 * ``warm``: the same buffers every iteration, so they stay in L2.  In a decode
   step the K/V input was just written by the preceding kernels and is
   resident; only the cache lines being written are cold.
 
 CUPTI (default) needs ``cupti-python>=13``; without it the script stops instead
 of letting ``bench_gpu_time`` fall back to another timer.  The header line
-names the timer and the L2 policy of the run.
+names the L2 policy of the run and every row names the timer it used.
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ import numpy as np
 import torch
 
 from flashinfer.page import nvfp4_quantize_append_paged_kv_cache_with_slot_mapping
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing.utils import bench_gpu_time, calculate_rotation_count
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
 _CUPTI_MIN_MAJOR = 13  # the version bench_gpu_time requires before it uses CUPTI
@@ -107,22 +109,34 @@ def _inputs(args: argparse.Namespace, nnz: int) -> tuple[torch.Tensor, ...]:
     return k, v, slots, k_cache, v_cache, k_scales, v_scales, global_scale
 
 
-def _median_us(args: argparse.Namespace, nnz: int) -> float:
+def _timer(args: argparse.Namespace, inputs: tuple[torch.Tensor, ...]) -> str:
+    if not args.no_cupti:
+        return "cupti"
+    if args.l2 == "cold" and calculate_rotation_count(list(inputs)) == 1:
+        # The tensors exceed 5x L2, so the CUDA-graph timer would not rotate
+        # them, and an append touching only nnz slots would find those lines in
+        # L2 on every replay.  Flush L2 before each launch instead.
+        return "cuda-event"
+    return "cuda-graph"
+
+
+def _median_us(args: argparse.Namespace, nnz: int) -> tuple[str, float]:
     inputs = _inputs(args, nnz)
     _run(*inputs)  # JIT-compile and load the kernel outside the timed region
     torch.cuda.synchronize()
+    timer = _timer(args, inputs)
     # The tensors go in as input_args so the CUDA-graph timer can rotate clones
-    # of them for a cold L2; CUPTI flushes L2 instead.
+    # of them for a cold L2; CUPTI and the CUDA-event timer flush L2 instead.
     measurements = bench_gpu_time(
         _run,
         dry_run_time_ms=args.warmup_ms,
         repeat_time_ms=args.measure_ms,
-        enable_cupti=not args.no_cupti,
-        use_cuda_graph=True,
+        enable_cupti=timer == "cupti",
+        use_cuda_graph=timer != "cuda-event",
         input_args=inputs,
         cold_l2_cache=args.l2 == "cold",
     )
-    return float(np.median(measurements)) * 1e3
+    return timer, float(np.median(measurements)) * 1e3
 
 
 def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -159,7 +173,8 @@ def main() -> None:
     parser.add_argument(
         "--no-cupti",
         action="store_true",
-        help="time CUDA-graph replays instead of CUPTI",
+        help="time CUDA-graph replays instead of CUPTI (CUDA events with an L2 "
+        "flush when --l2 cold and the cache is too large to rotate)",
     )
     parser.add_argument(
         "--l2",
@@ -174,15 +189,17 @@ def main() -> None:
         _require_cupti()
 
     torch.manual_seed(0)
-    timer = "cuda-graph" if args.no_cupti else "cupti"
     print(
         f"# {torch.cuda.get_device_name()} {args.dtype} heads={args.num_kv_heads} "
         f"head_dim={args.head_dim} page_size={args.page_size} "
-        f"num_pages={args.num_pages} NHD timer={timer} l2={args.l2}"
+        f"num_pages={args.num_pages} NHD l2={args.l2}"
     )
     for nnz in args.nnz:
-        us = _median_us(args, nnz)
-        print(f"label={args.label} nnz={nnz} median_us={us:.4f}", flush=True)
+        timer, us = _median_us(args, nnz)
+        print(
+            f"label={args.label} nnz={nnz} timer={timer} median_us={us:.4f}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
