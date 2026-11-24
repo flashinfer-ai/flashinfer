@@ -101,8 +101,48 @@ def test_wide_scale_range_is_rejected():
     H, I, E = 1024, 512, 1
     w13, s13, gs13, w2, s2, gs2 = _checkpoint(H, I, E)
     s2[0, 0, 0] = 0x01  # 2^-9: more than 224x below the largest scale of the matrix
-    with pytest.raises(ValueError, match="factor of 224"):
+    with pytest.raises(ValueError, match="at least 2"):
         w4a16.prepare_sm90_nvfp4_w4a16_weights(w13, s13, gs13, w2, s2, gs2)
+
+
+def _e4m3(*values):
+    return torch.tensor(values, dtype=torch.float32).to(torch.float8_e4m3fn)
+
+
+@pytest.mark.parametrize(
+    "hi,lo,ok",
+    [
+        (448.0, 2.0, True),  # span 224, largest already at the top
+        (
+            256.0,
+            1.25,
+            False,
+        ),  # span 204.8 < 224, but 1.25 stays below 2 (256 cannot double)
+        (256.0, 2.5, True),  # span 102.4
+        (3.5, 0.03125, True),  # span 112 after a shift by 2^7
+        (3.5, 0.015625, True),  # span 224 after a shift by 2^7 (448 and 2)
+        (240.0, 1.75, False),  # span 137: 240 cannot double, 1.75 stays below 2
+    ],
+)
+def test_scale_span_condition(hi, lo, ok):
+    """The documented rule: after the power-of-two shift that brings the largest block
+    scale into (224, 448], every nonzero block scale must be at least 2."""
+    sf = _e4m3(hi, lo, 0.0, hi).reshape(1, 4).view(torch.uint8)
+    _, factor, bad = w4a16._normalize_scales(sf, 1)
+    assert bad == (0 if ok else 1)
+    top = float(hi * factor[0])
+    assert 224.0 < top <= 448.0
+    H, I, E = 1024, 512, 1
+    w13, s13, gs13, w2, s2, gs2 = _checkpoint(H, I, E)
+    s2[0] = _e4m3(hi).view(torch.uint8)
+    s2[0, 0, 1] = _e4m3(lo).view(torch.uint8)[0]
+    if ok:
+        packed = w4a16.prepare_sm90_nvfp4_w4a16_weights(w13, s13, gs13, w2, s2, gs2)
+        _, r2 = w4a16.dequantize_sm90_nvfp4_w4a16_weights(packed, 0)
+        assert torch.equal(r2, _deq(w2[0], s2[0], gs2[0]))
+    else:
+        with pytest.raises(ValueError, match="at least 2"):
+            w4a16.prepare_sm90_nvfp4_w4a16_weights(w13, s13, gs13, w2, s2, gs2)
 
 
 def test_non_finite_scale_is_rejected():

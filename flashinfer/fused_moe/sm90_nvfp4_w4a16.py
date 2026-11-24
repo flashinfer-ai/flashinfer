@@ -36,8 +36,9 @@ Two kernels:
 
 Weights are repacked once by :func:`prepare_sm90_nvfp4_w4a16_weights` into the
 layout the in-register decoder reads. The repack is lossless; it requires the
-block scales of each (expert, gate / up / down) matrix to span at most a factor
-of 224 (see that function).
+nonzero block scales of each (expert, gate / up / down) matrix to span a limited
+range: always accepted up to a factor of 112, up to 224 depending on the largest
+scale (see that function).
 
 The kernels were adapted from gauravjain14/muse-okc-submissions (muse_moe_w4a16,
 Apache-2.0), which builds on vjeux/okc-2026 and alygg77/okc-muse-spark-kernels
@@ -383,12 +384,16 @@ def prepare_sm90_nvfp4_w4a16_weights(
     Notes
     -----
     The packed format stores block scales in 6 bits: E4M3 values 0 or in
-    ``[2, 448]``. Each (expert, gate / up / down) matrix is first multiplied by a
-    power of two that brings its largest block scale into ``[224, 448]`` (the
-    global scale is divided by the same power, so the weights are unchanged).
-    The repack is lossless when every nonzero block scale of a matrix is at
-    least ``1 / 224`` of the largest; otherwise this function raises
-    ``ValueError``. Block scales must be non-negative.
+    ``[2, 448]``. The block scales of each (expert, gate / up / down) matrix are
+    first multiplied by the largest power of two that keeps their maximum at
+    most 448, which brings it into ``(224, 448]`` (the global scale is divided
+    by the same power, so the weights are unchanged). The repack is lossless
+    when, after this shift, every nonzero block scale of the matrix is at least
+    2; otherwise this function raises ``ValueError``. This always holds when the
+    nonzero block scales of a matrix span at most a factor of 112, and for spans
+    up to 224 it depends on the largest scale: block scales 448 and 2 are
+    accepted, 256 and 1.25 (a span of 204.8) are not. Block scales must be
+    non-negative.
     """
     if w13_fp4.dtype != torch.uint8 or w2_fp4.dtype != torch.uint8:
         raise ValueError("w13_fp4 and w2_fp4 must be uint8 (packed E2M1 pairs)")
@@ -439,8 +444,10 @@ def prepare_sm90_nvfp4_w4a16_weights(
         gs2_out[e] = gs2[e].to(dev) / f2.to(dev)[0]
     if bad:
         raise ValueError(
-            "NVFP4 block scales span more than a factor of 224 within a matrix, which the "
-            "6-bit packed scales cannot hold losslessly: " + "; ".join(bad[:8])
+            "NVFP4 block scales span too wide a range within a matrix for the 6-bit "
+            "packed scales: after the power-of-two shift that brings the largest block "
+            "scale of a matrix into (224, 448], every nonzero block scale must be at "
+            "least 2. Block scales below that: " + "; ".join(bad[:8])
         )
     return Sm90Nvfp4W4A16Weights(w13, gs13_out.contiguous(), w2, gs2_out)
 

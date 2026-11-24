@@ -885,7 +885,8 @@ per shape (:func:`sm90_nvfp4_w4a16_moe_prefill_min_tokens`) unless
 multiple of 256 in ``[512, 8192]``.
 
 Weights are repacked once with :func:`prepare_sm90_nvfp4_w4a16_weights`
-(lossless when each matrix's nonzero block scales span at most a factor of 224).
+(lossless; it requires each matrix's nonzero block scales to span at most a
+factor of 112, or up to 224 depending on the largest scale: see that function).
 Create the workspace (:func:`get_sm90_nvfp4_w4a16_moe_workspace` or
 :class:`Sm90Nvfp4W4A16MoEWorkspace`) before CUDA graph capture.
 
