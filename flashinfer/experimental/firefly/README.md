@@ -4,8 +4,12 @@ This backend is experimental and may change or be removed without
 compatibility guarantees. Listing `FireflyNvfp4Config()` among the
 `MoEConfig` backend candidates (`flashinfer.fused_moe`) is the explicit
 opt-in and emits FlashInfer's experimental backend warning once. Firefly is
-never part of the default candidate list, so automatic selection never picks
-it. Tracking issue: pending.
+never part of the default candidate list: a `MoELayer` that does not list it
+never selects it. Once listed, it takes part in `MoELayer`'s selection like
+any listed backend: with other eligible candidates whose weight views are
+prepared, the layer times each one (CUDA graph replays) and keeps the fastest
+per input shape, which can be Firefly; the autotuner has a single tactic to
+choose for it. Tracking issue: pending.
 
 Firefly runs the routed experts of a MoE layer on datacenter Blackwell
 (SM100, SM103; tested on B200 only) from per-token or per-tensor NVFP4
@@ -28,8 +32,11 @@ batch size (from 1 token to `tune_max_num_tokens`).
 | Not supported | NVFP4 4over6, fused shared experts, `do_finalize=False`, in-kernel routing (`FromLogits`) |
 
 The intermediate (the activation's output, rounded to BF16) is quantized to
-NVFP4 with E4M3 block scales only (the second-level scale is 1), except for
-M <= 4 with 512 <= I <= 768, which uses a per-token scale as well.
+NVFP4 with E4M3 block scales only (the second-level scale is 1), except on the
+per-token direct path: M <= 4 with a gated activation, I = 512 or 768 and
+H >= 512 (512 <= I <= 768 and I % 256 == 0), which uses a per-token scale as
+well. Every other shape and batch size (e.g. M = 2 at H = 1024, I = 640) uses
+block scales only.
 
 The weight view is Firefly's own (gate/up rows interleaved per 8, block
 scales swizzled 128x4, one FP32 global scale per expert from its amax): build
@@ -72,8 +79,12 @@ per-token scale 1.
 
 One runner serves every batch size up to `tune_max_num_tokens` with one
 workspace and every layer of the same shape (the weights come with each
-call). The first call of a batch size compiles its kernels; call each batch
-size once before capturing a CUDA graph.
+call). The first call of a batch size compiles its kernels. Before capturing
+a CUDA graph, call (or let `MoELayer` prepare) each batch size with each
+routing-weight dtype the capture uses (FP32, BF16 or FP16 weights take
+separate kernels); for M <= 4 (the direct GEMMs) use the same weight tensors as
+the capture, since their TMA descriptors are built per weight tensor on first
+use, which a capture cannot do.
 
 ## Package layout
 

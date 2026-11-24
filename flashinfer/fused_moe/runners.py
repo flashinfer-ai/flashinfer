@@ -5542,6 +5542,12 @@ class FireflyNvfp4Runner(MoERunner):
         except ValueError as e:
             raise NotImplementedError(f"{type(self).__name__}: {e}") from None
 
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        # The hidden size comes with the pack: one that CuteMoE rejects
+        # (H % 256 != 0) drops this candidate before packing.
+        q = act.hidden_states_q
+        return q.ndim == 2 and q.shape[1] * 2 % 256 == 0
+
     def _build(self) -> None:
         from ..api_logging import warn_experimental_backend_once
         from ..experimental.firefly.weights import KernelWeights
@@ -5653,9 +5659,14 @@ class FireflyNvfp4Runner(MoERunner):
         q, sf, gs, ids, wts, *w, out = inputs
         moe = self._moe_for(q.shape[1] * 2)
         if do_preparation:
-            # Build the batch size's plan (compiling its kernels) without a launch.
+            # Build the batch size's plan (compiling its kernels) and the direct
+            # path's descriptors of these weights without a launch.
             if q.shape[0] > 0:
-                moe.plan(q.shape[0], wts.dtype)
+                moe.warmup(
+                    [q.shape[0]],
+                    weights_dtypes=(wts.dtype,),
+                    weights=self._kernel_weights(*w),
+                )
             return out
         return moe(
             q,

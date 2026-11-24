@@ -141,6 +141,15 @@ class SiTU:
 
     plain = False
 
+    def __post_init__(self):
+        # the kernels divide by the scales (rejected here, not at the first trace); linear_scale None: no clamp
+        for name in ("gate_scale", "linear_scale"):
+            v = getattr(self, name)
+            if (name == "gate_scale" or v is not None) and not (
+                isinstance(v, (int, float)) and math.isfinite(v) and v > 0
+            ):
+                raise ValueError(f"SiTU {name}={v!r}: a positive finite number")
+
     def apply(self, gate, up):
         gs = Float32(self.gate_scale)
         sig = _div_full(

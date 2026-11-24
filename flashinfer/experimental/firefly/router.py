@@ -197,6 +197,7 @@ class SelectExperts:
             if cutlass.const_expr(self.base):
                 mine = mine - self.base
             ok = (mine >= 0) & (mine < E)  # ids outside [0, E) are skipped
+            kept = Int32(1)  # 0: a route past eroute's list (below)
             if lane < T:
                 wv = load_route_weight(win_ptr, Int64(cta * T + lane), self.win_dtype)
                 wts[cta * T + lane] = Float32(cutlass.select_(ok, wv, Float32(0.0)))
@@ -218,22 +219,43 @@ class SelectExperts:
                         sem="relaxed",
                         scope="gpu",
                     )
-                    cute.arch.store(invp, rank)
                     if cutlass.const_expr(self.eroute):
-                        cute.arch.store(
-                            cute.make_ptr(
-                                Int32,
-                                eroute_ptr.toint()
-                                + (Int64(mine) * self.eroute + rank) * 4,
-                                GMEM,
-                                assumed_align=4,
-                            ),
-                            Int32(cta * T + lane),
-                        )
+                        # eroute lists up to self.eroute routes per expert (the bucket's tokens); more only come from
+                        # a token naming one expert in several slots: those ranks are dropped, skipped as an id
+                        # outside [0, E) (no row, weight 0), and the count taken back to the routes listed
+                        if rank < self.eroute:
+                            cute.arch.store(invp, rank)
+                            cute.arch.store(
+                                cute.make_ptr(
+                                    Int32,
+                                    eroute_ptr.toint()
+                                    + (Int64(mine) * self.eroute + rank) * 4,
+                                    GMEM,
+                                    assumed_align=4,
+                                ),
+                                Int32(cta * T + lane),
+                            )
+                        else:
+                            cute.arch.atomic_add(
+                                cute.make_ptr(
+                                    Int32,
+                                    partial_ptr.toint() + Int64(mine) * 4,
+                                    GMEM,
+                                    assumed_align=4,
+                                ),
+                                Int32(-1),
+                                sem="relaxed",
+                                scope="gpu",
+                            )
+                            cute.arch.store(invp, Int32(-1))
+                            wts[cta * T + lane] = Float32(0.0)
+                            kept = Int32(0)
+                    else:
+                        cute.arch.store(invp, rank)
                 else:
                     cute.arch.store(invp, Int32(-1))
             if cutlass.const_expr(self.zero_out):
-                ok0 = cute.arch.shuffle_sync(Int32(ok), 0)
+                ok0 = cute.arch.shuffle_sync(Int32(ok) & kept, 0)
                 if (
                     ok0 == 0
                 ):  # slot 0 skipped: no gather warp zeroes this token's output row

@@ -116,6 +116,7 @@ class ReduceRoutes:
         # (topk 1: the even chain alone)
         assert topk >= 1, f"topk {topk}"
         assert vec in (4, 8) and block == 32 * vec * num_warps and h % block == 0
+        assert h % 256 == 0, f"H {h}"  # the row offset's H / 256
         self.h, self.topk, self.block, self.num_warps = h, topk, block, num_warps
         self.inverse, self.launch_pdl, self.vec = inverse, launch_pdl, vec
         assert clear == 0 or launch_pdl, "the counts are zeroed after the wait"
@@ -191,7 +192,9 @@ class ReduceRoutes:
             wv = [w[first + s] for s in range(T)]
         for i in cutlass.range_constexpr(T):
             s = order[i]
-            addr = xb + Int64(rows[s] * H) * 2 + colb
+            # the row offset with a 32-bit multiply (a 64-bit one costs up to 1.5% at small M): rows * (H / 256)
+            # passes 2^31 only for a routed buffer over 2^31 * 512 bytes = 1 TiB (rows * H passed it at 4 GiB)
+            addr = xb + Int64(rows[s] * (H // 256)) * 512 + colb
             if cutlass.const_expr(wide):
                 words = cute.make_rmem_tensor((4,), Uint32)
                 words.store(

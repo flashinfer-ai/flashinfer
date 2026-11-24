@@ -751,15 +751,17 @@ class Plan:
                     elif isinstance(s, _V):
                         self._other.append((li, pos, s))
         else:
+            # the call-dependent arguments first (a direct descriptor lookup can raise, e.g. under a capture): nothing
+            # is replaced unless all of them succeed, so the arguments always match self._key
+            c = make_call() if self._other else None
+            other = [(li, pos, s.f(c)) for li, pos, s in self._other or ()]
             args = self._args
             for i, (a, b) in enumerate(zip(key, self._key, strict=False)):
                 if a != b:
                     for li, pos, dt, al in self._by_key[i]:
                         args[li][pos] = _ptr_at(a, dt, al)
-            if self._other:
-                c = make_call()
-                for li, pos, s in self._other:
-                    args[li][pos] = s.f(c)
+            for li, pos, v in other:
+                args[li][pos] = v
         self._key = key
         return self._args
 
@@ -884,7 +886,7 @@ class CuteMoE:
         d = self._dummy
         self._dc = _Call(*(d,) * 13, dummy=True)
         self._plans = {}
-        self._wok = set()  # the weights' addresses checked (_weights)
+        self._wok = set()  # the weights checked: addresses and layouts (_weights)
 
     # ------------------------------------------------------------------------------------------------------ geometry
 
@@ -1775,7 +1777,8 @@ class CuteMoE:
 
     def _weights(self, weights):
         """A call's ``KernelWeights`` (also from a weight view) and their addresses; checked (``weights.check_weights``)
-        the first time these addresses come: once per prepared weight set, not per call."""
+        the first time these tensors come (address, type, shape and strides: a view of the same storage with another
+        layout is checked again): once per prepared weight set, not per call."""
         if isinstance(weights, Mapping):  # weights.prepare_view / weight_view
             if weights.get("gated", self.gated) != self.gated:
                 raise ValueError(
@@ -1783,9 +1786,10 @@ class CuteMoE:
                 )
             weights = view_weights(weights)
         waddr = tuple([t.data_ptr() for t in weights])
-        if waddr not in self._wok:
+        wkey = (waddr, tuple([(t.dtype, t.shape, t.stride()) for t in weights]))
+        if wkey not in self._wok:
             check_weights(weights, self.E, self.H, self.I, self.gated, self.dev)
-            self._wok.add(waddr)
+            self._wok.add(wkey)
         return weights, waddr
 
     def __call__(

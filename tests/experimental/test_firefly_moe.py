@@ -762,3 +762,149 @@ def test_firefly_relu2_n_tail_wide_hidden(fused):
         )
         assert torch.isfinite(out).all()
         assert _rel_rmse(out, ref) < (0.0065 if fused else 0.005), f"M={m}"
+
+
+def test_firefly_situ_rejects_invalid_scales():
+    """SiTU scales must be positive and finite (linear_scale None: no clamp),
+    checked when the activation is built, not at the first kernel trace."""
+    from flashinfer.experimental.firefly.activation import parse
+
+    for spec in (
+        "situ:gate_scale=0",
+        "situ:gate_scale=-4",
+        "situ:gate_scale=inf",
+        "situ:linear_scale=0",
+        "situ:linear_scale=nan",
+    ):
+        with pytest.raises(ValueError):
+            parse(spec)
+    assert parse("situ:linear_scale=none").linear_scale is None
+
+
+def test_firefly_skips_unsupported_hidden_size():
+    """A pack whose hidden size Firefly cannot run (H % 256 != 0) drops the
+    candidate before packing: with no other candidate the layer reports that
+    no backend accepts the inputs."""
+    num_experts, top_k, hidden, inter, act = 16, 4, 1024, 512, SwiGLU()
+    _, pack, _, _ = _setup(num_experts, top_k, hidden, inter, act)
+    layer = _layer(num_experts, top_k, inter, act, 8)
+    m, h = 8, 1152
+    q = torch.zeros((m, h // 2), dtype=torch.uint8, device="cuda")
+    sf = torch.zeros((m, h // 16), dtype=torch.float8_e4m3fn, device="cuda")
+    gs = torch.ones(m, device="cuda")
+    ids = torch.arange(top_k, dtype=torch.int32, device="cuda").repeat(m, 1)
+    wts = torch.full((m, top_k), 0.25, device="cuda")
+    with pytest.raises(NotImplementedError):
+        layer(_act_pack(q, sf, gs, ids, wts), pack)
+
+
+def test_firefly_rechecks_weight_layout():
+    """A weight view whose tensor shares storage with a checked one but has
+    another layout is checked again (and rejected)."""
+    num_experts, top_k, hidden, inter, act = 16, 4, 1024, 512, SwiGLU()
+    g, pack, _, _ = _setup(num_experts, top_k, hidden, inter, act)
+    layer = _layer(num_experts, top_k, inter, act, 8)
+    _, q, sf, gs, ids, wts = _inputs(g, 8, hidden, num_experts, top_k)
+    layer(_act_pack(q, sf, gs, ids, wts), pack)
+    moe = layer.runners[0]._moes[hidden]
+    bad = dict(pack.get_view("firefly_nvfp4"))
+    bad["w1"] = bad["w1"].transpose(1, 2)
+    with pytest.raises(ValueError):
+        moe(q, sf, gs, bad, topk_ids=ids, topk_weights=wts)
+
+
+def test_firefly_failed_capture_keeps_arguments_consistent():
+    """A capture that fails on new weights' missing direct descriptors leaves
+    the plan's launch arguments matching the weights of its last call."""
+    num_experts, top_k, hidden, inter, act = 16, 4, 1024, 512, SwiGLU()
+    g, pack, w1, w2 = _setup(num_experts, top_k, hidden, inter, act)
+    _, pack_b, _, _ = _setup(num_experts, top_k, hidden, inter, act, seed=1)
+    layer = _layer(num_experts, top_k, inter, act, 8)
+    view, view_b = pack.get_view("firefly_nvfp4"), pack_b.get_view("firefly_nvfp4")
+    x_deq, q, sf, gs, ids, wts = _inputs(g, 2, hidden, num_experts, top_k)
+    layer(_act_pack(q, sf, gs, ids, wts), pack)  # M = 2: the direct GEMMs
+    moe = layer.runners[0]._moes[hidden]
+    _, q1, sf1, gs1, ids1, wts1 = _inputs(g, 1, hidden, num_experts, top_k)
+    moe(q1, sf1, gs1, view_b, topk_ids=ids1, topk_weights=wts1)  # B checked at M = 1
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError),
+        torch.cuda.graph(graph, stream=torch.cuda.Stream(q.device)),
+    ):
+        moe(q, sf, gs, view_b, topk_ids=ids, topk_weights=wts)
+    out = moe(q, sf, gs, view, topk_ids=ids, topk_weights=wts)
+    ref = _reference(
+        x_deq, ids, wts, w1, w2, act, inter, _mid_per_token(layer, 2, hidden)
+    )
+    assert _rel_rmse(out, ref) < 0.005
+
+
+def test_firefly_preparation_builds_direct_descriptors():
+    """The runner's preparation (no launch) also builds the direct GEMMs'
+    descriptors of the packed weights, so the batch size can be captured."""
+    num_experts, top_k, hidden, inter, act = 16, 4, 1024, 512, SwiGLU()
+    g, pack, w1, w2 = _setup(num_experts, top_k, hidden, inter, act)
+    layer = _layer(num_experts, top_k, inter, act, 8)
+    runner = layer.runners[0]
+    x_deq, q, sf, gs, ids, wts = _inputs(g, 2, hidden, num_experts, top_k)
+    inputs = runner.pack_inputs(_act_pack(q, sf, gs, ids, wts), pack)
+    runner.forward(inputs, do_preparation=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream(q.device)):
+        out = runner.forward(inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = _reference(
+        x_deq, ids, wts, w1, w2, act, inter, _mid_per_token(layer, 2, hidden)
+    )
+    assert _rel_rmse(out, ref) < 0.005
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
+def test_firefly_repeated_expert_ids_stay_in_bounds(fused):
+    """Tokens naming one expert in every slot (not a top-k, but accepted) on a
+    short batch that lists each expert's routes (block_m <= 32): the routes
+    past the list are dropped, nothing is written past it, the output is
+    finite and the next call is correct."""
+    num_experts, top_k, hidden, inter, act = 16, 4, 1024, 512, SwiGLU()
+    g, pack, w1, w2 = _setup(num_experts, top_k, hidden, inter, act)
+    layer = _layer(num_experts, top_k, inter, act, 64, fused=fused)
+    m = 64
+    x_deq, q, sf, gs, ids, wts = _inputs(g, m, hidden, num_experts, top_k)
+    rep = torch.full_like(ids, num_experts - 1)
+    out = layer(_act_pack(q, sf, gs, rep, wts), pack)
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+    out = layer(_act_pack(q, sf, gs, ids, wts), pack)
+    ref = _reference(
+        x_deq, ids, wts, w1, w2, act, inter, _mid_per_token(layer, m, hidden)
+    )
+    assert _rel_rmse(out, ref) < (0.0065 if fused else 0.005)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+def test_firefly_prepare_weights_on_device_other_than_current():
+    """prepare_weights(device=cuda:1) with cuda:0 current puts every tensor of
+    the view on cuda:1."""
+    num_experts, hidden, inter = 8, 1024, 512
+    dev = torch.device("cuda", 1)
+    gen = torch.Generator(device=dev).manual_seed(0)
+    w1 = (
+        torch.randn((num_experts, 2 * inter, hidden), generator=gen, device=dev) * 0.02
+    ).bfloat16()
+    w2 = (
+        torch.randn((num_experts, hidden, inter), generator=gen, device=dev) * 0.02
+    ).bfloat16()
+    with torch.cuda.device(0):
+        view = FireflyNvfp4Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=num_experts,
+            hidden_size=hidden,
+            intermediate_size=inter,
+            activation=SwiGLU(),
+            device=dev,
+        )
+    for name, t in view.items():
+        if isinstance(t, torch.Tensor):
+            assert t.device == dev, name

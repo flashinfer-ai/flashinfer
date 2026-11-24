@@ -2740,7 +2740,8 @@ class FireflyNvfp4Config:
     ``clamp_limit``, ReLU2. Expert parallelism; no NVFP4 4over6 recipe.
     Shapes: H % 256 == 0, I % 128 == 0, 1 <= top_k <= min(E, 32), E <= 1024.
     The GEMM2 input is quantized with block scales only (no per-token scale),
-    except at M <= 4 with 512 <= I <= 768, where it also gets one.
+    except on the per-token direct path, where it also gets one: M <= 4 with a
+    gated activation, I = 512 or 768 and H >= 512.
 
     The weight view differs from ``cute_dsl``'s: build it with
     :meth:`prepare_weights` and register it under ``"firefly_nvfp4"``. Never

@@ -24,6 +24,7 @@ Conventions: gate/up weights ``[E, 2I, H]`` with the gate rows (w1) first and th
 weights ``[E, H, I]``. Needs FlashInfer (quantization); the kernels do not.
 """
 
+from contextlib import nullcontext
 from typing import NamedTuple
 
 import torch
@@ -60,10 +61,15 @@ def quantize_expert_weights(
     weight_scale_2 = (1.0 / global_scale).to(torch.float32)
 
     weight = weight.contiguous()
-    pairs = [
-        nvfp4_quantize(expert, scale, sfLayout=SfLayout.layout_linear)
-        for expert, scale in zip(weight, global_scale, strict=True)
-    ]
+    # on the weights' GPU (the quantizer allocates on the current one); plain NVFP4 whatever the
+    # FLASHINFER_NVFP4_4OVER6 environment (None: off)
+    with torch.cuda.device(weight.device) if weight.is_cuda else nullcontext():
+        pairs = [
+            nvfp4_quantize(
+                expert, scale, sfLayout=SfLayout.layout_linear, nvfp4_4over6=None
+            )
+            for expert, scale in zip(weight, global_scale, strict=True)
+        ]
     return (
         torch.stack([q for q, _ in pairs]),
         torch.stack([sf.view(torch.float8_e4m3fn) for _, sf in pairs]),
