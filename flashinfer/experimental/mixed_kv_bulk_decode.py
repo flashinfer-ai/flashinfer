@@ -70,6 +70,14 @@ def supported(q, k, v, sf, table):
     )
 
 
+def _kv_splits(batch, kv_heads, table_width):
+    streams = batch * kv_heads
+    if table_width > 256:
+        # A small grid needs additional partitions to traverse long page lists.
+        return 8 if streams <= 16 else 4 if streams <= 32 else 2
+    return min(4, max(1, 144 // streams))
+
+
 def run(q, k, v, sf, table, lens, ptr, out, scale, vscale):
     from cutlass.cute.typing import Float32
     from flashinfer.cute_dsl.attention.wrappers.batch_decode import (
@@ -82,7 +90,7 @@ def run(q, k, v, sf, table, lens, ptr, out, scale, vscale):
     b, w = table.shape
     h, d = q.shape[1:]
     hk = k.shape[1]
-    s = 2 if w > 256 else min(4, max(1, 144 // (b * hk)))
+    s = _kv_splits(b, hk, w)
     mode = "none" if s == 1 else "kernel"
     kernel = _get_compiled_paged_decode_kernel(
         _torch_to_cutlass(q.dtype),
