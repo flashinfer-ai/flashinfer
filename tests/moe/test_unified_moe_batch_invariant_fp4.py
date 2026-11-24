@@ -4007,6 +4007,70 @@ def test_prepare_weights_quantizes_one_expert_at_a_time_into_the_pack(pair):
 
 
 @needs_device
+def test_computed_global_scale_that_is_not_finite_is_refused_naming_the_expert(
+    monkeypatch,
+):
+    """An expert whose amax is below ``448 * 6 / FLT_MAX`` has an infinite per-tensor global scale and a zero alpha: its
+    rows would give NaN for every token routed to it where a block of its weights is all zero, a silent zero otherwise.
+    ``prepare_weights`` applies the rule of the caller's scales to the computed ones -- finite, positive and normal -- and
+    refuses the pack with the mode's error naming the weight and the expert before any expert is quantized; normal weights
+    keep their bits, and caller-supplied scales keep their own rule."""
+    from flashinfer.batch_invariant.quantization import nvfp4_api
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import fp4_global_scales
+
+    E, I, H = 4, 64, 64
+    _, _, w1, w2 = _problem(8, 2, H, I, E, seed=37)
+    ref = BatchInvariantFp4Config.prepare_weights(w1, w2)
+    quantized = []
+    real = nvfp4_api.nvfp4_quantize_rows
+    monkeypatch.setattr(
+        nvfp4_api,
+        "nvfp4_quantize_rows",
+        lambda *a, **kw: quantized.append(a[0].shape) or real(*a, **kw),
+    )
+    bad = w1.clone()
+    bad[1].fill_(1e-37)
+    bad[1][:, :16].zero_()
+    assert bad[1, 0, 16] > 0  # a normal bf16 value whose 448 * 6 / amax overflows
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="w1.*expert 1") as e:
+        BatchInvariantFp4Config.prepare_weights(bad, w2)
+    assert NVFP4.cls in str(e.value) and not quantized
+    bad2 = w2.clone()
+    bad2[3].fill_(1e-37)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="w2.*expert 3"):
+        BatchInvariantFp4Config.prepare_weights(w1, bad2)
+    assert not quantized
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="expert 1"):
+        fp4_global_scales(bad, "w1")
+    assert torch.equal(
+        torch.reciprocal(fp4_global_scales(w1, "w1")), ref["gemm1_alpha"]
+    )
+    again = BatchInvariantFp4Config.prepare_weights(w1, w2)
+    assert len(quantized) == 2 * E
+    for key, v in ref.items():
+        if isinstance(v, torch.Tensor):
+            assert torch.equal(v, again[key]), key
+    # caller-supplied scales take their own rule (finite, positive, normal): the tiny expert quantizes at a unit scale;
+    # the computed scales handed back as the caller's give the computed pack's bits (every expert's, not the aligned ones')
+    W = MoEWeightsFp4.prepare(
+        NVFP4, bad, w2, global_scales=(torch.ones(E), torch.ones(E))
+    )
+    assert (
+        torch.all(torch.isfinite(W.w1_alpha))
+        and W.w1.shape == ref["gemm1_weights"].shape
+    )
+    same = MoEWeightsFp4.prepare(
+        NVFP4,
+        w1,
+        w2,
+        global_scales=(fp4_global_scales(w1, "w1"), fp4_global_scales(w2, "w2")),
+    ).view()
+    for key, v in ref.items():
+        if isinstance(v, torch.Tensor):
+            assert torch.equal(v, same[key]), key
+
+
+@needs_device
 @each_pair
 def test_gather_form_at_fewer_than_four_expanded_rows_equals_the_box_form(pair):
     """``T * top_k`` below four (one token at top-1 and top-2, two or three tokens at top-1): the gather form's index tensor
