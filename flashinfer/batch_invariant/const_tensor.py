@@ -63,12 +63,19 @@ def const_fill(
     entry = _CACHE.get(key)
     if entry is None:
         t = torch.full(shape, value, dtype=dtype, device=dev)
-        if _COUNTS.get(kind, 0) < _CACHE_MAX:
-            fill_done = torch.cuda.Event()
-            fill_done.record(torch.cuda.current_stream(dev))
-            _CACHE[key] = [t, fill_done]
+        if _COUNTS.get(kind, 0) >= _CACHE_MAX:
+            return t
+        fill_done = torch.cuda.Event()
+        fill_done.record(torch.cuda.current_stream(dev))
+        # one publication per key: two threads missing the same key together both reach this point, and a plain store
+        # would replace the first entry -- whose tensor a reader on another stream may already hold and which only the
+        # cache keeps alive (the allocator would hand its block to the first thread's stream while that reader's kernel
+        # runs). `setdefault` is atomic under the GIL: the loser takes the hit path on the winner's entry and drops its
+        # own tensor, never handed out (its fill is ordered on its own stream, so the block's reuse there is safe).
+        entry = _CACHE.setdefault(key, [t, fill_done])
+        if entry[0] is t:
             _COUNTS[kind] = _COUNTS.get(kind, 0) + 1
-        return t
+            return t
     t, fill_done = entry
     if fill_done is not None:
         if fill_done.query():

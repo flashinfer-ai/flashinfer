@@ -521,6 +521,49 @@ def test_float_scale_cache_keys_and_bound():
 
 
 @needs_device
+def test_float_scale_cache_single_publication():
+    """Threads missing the same key together publish ONE entry: every caller receives the same tensor object and the kind's
+    count moves by one (a second publication would replace the first entry and drop the cache reference that keeps the
+    first tensor alive for a reader on another stream; #9912's review)."""
+    import threading
+
+    CT = __import__("flashinfer.batch_invariant.const_tensor", fromlist=["const_fill"])
+    base = 2.0**-17
+    for rnd in range(20):
+        v = base * (1.0 + rnd * 2.0**-20)
+        n = 8
+        barrier = threading.Barrier(n)
+        got = [None] * n
+        before = CT._COUNTS.get("test_race", 0)
+
+        def worker(i):
+            s = torch.cuda.Stream()
+            with torch.cuda.stream(s):
+                barrier.wait()
+                got[i] = CT.const_fill((1,), v, torch.float32, "cuda", kind="test_race")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        torch.cuda.synchronize()
+        assert all(g is got[0] for g in got), (
+            f"round {rnd}: {len({id(g) for g in got})} tensors published for one key"
+        )
+        assert CT._COUNTS.get("test_race", 0) == before + 1, (
+            "the count moved by more than the one insert"
+        )
+        assert all(
+            float(g.item()) == float(torch.tensor(v, dtype=torch.float32)) for g in got
+        )
+    for k in [k for k in CT._CACHE if k[0].startswith("test_")]:
+        del CT._CACHE[k]
+    for k in [k for k in CT._COUNTS if k.startswith("test_")]:
+        del CT._COUNTS[k]
+
+
+@needs_device
 def test_fp4_quantize_entry_point_runs_the_class():
     """``flashinfer.fp4_quantize(..., batch_invariant=True)``, the entry point behind ``nvfp4_quantize``, runs the per-tensor
     class with its own argument forms: the layout flags, ``global_scale`` None as the scale 1.0, ``is_global_scale_inversed``
