@@ -3319,7 +3319,8 @@ def test_prerouted_layer_builds_under_a_routing_term_the_logits_mode_refuses(pai
     """Llama4 with ``top_k = 4`` (the from-logits method is the top-1 rule) and a DeepSeekV3 group shape outside the rule
     build on the fp4 backend as on the bf16 one: the pre-routed modes never consult the term, so both pre-routed forms give
     the Renormalize-configured layer's bits on the same ids and bf16 weights, and the from-logits call raises the mode's error
-    naming the term."""
+    naming the term -- a fresh exception at every call (the runner keeps the message, never an exception object with the
+    traceback and tensors of a ``pack_inputs`` frame)."""
     from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 
     T, k, H, I, E = 24, 4, 256, 128, 16
@@ -3349,6 +3350,13 @@ def test_prerouted_layer_builds_under_a_routing_term_the_logits_mode_refuses(pai
         with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
             layer(_logits_pack(x, logits), W)
         assert what in str(excinfo.value) and pair.cls in str(excinfo.value)
+        with pytest.raises(BatchInvariantUnsupportedError) as again:
+            layer(_logits_pack(x, logits), W)
+        assert again.value is not excinfo.value
+        assert str(again.value) == str(excinfo.value)
+        kept = layer.runners[0]._logits_refusal
+        assert isinstance(kept, tuple) and not isinstance(kept, BaseException)
+        assert all(not hasattr(a, "__traceback__") for a in kept)
 
 
 @needs_device

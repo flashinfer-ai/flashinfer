@@ -187,11 +187,11 @@ class BatchInvariantFp4Runner(MoERunner):
         self.tuning_config = TuningConfig(use_cuda_graph=True)
         self._part: Optional[Tuple[int, str]] = None
         self._scale: Optional[torch.Tensor] = None
-        # the routing term's state, set by _check_support (`_method` None: no from-logits class; a deferred refusal is
-        # raised at a from-logits call)
+        # the routing term's state, set by _check_support (`_method` None: no from-logits class; a deferred refusal's
+        # message, raised afresh at every from-logits call: no exception object, hence no traceback, is kept)
         self._method: Optional[S.RoutingMethod] = None
         self._grouped_other: bool = False
-        self._logits_refusal: Optional[BatchInvariantUnsupportedError] = None
+        self._logits_refusal: Optional[Tuple[Any, ...]] = None
         # the intermediate's class (`per_token` / `static`): the bound backend config's field
         cands = [c for c in config.backend if hasattr(c, "intermediate")]
         self._intermediate: str = cands[0].intermediate if cands else "per_token"
@@ -270,7 +270,8 @@ class BatchInvariantFp4Runner(MoERunner):
         try:
             self._method, self._grouped_other = routing_term(routing, cls)
         except BatchInvariantUnsupportedError as e:
-            self._method, self._grouped_other, self._logits_refusal = None, False, e
+            self._method, self._grouped_other = None, False
+            self._logits_refusal = tuple(e.args)
         if not cfg.finalize.do_finalize:
             raise unsupported(
                 cls,
@@ -510,7 +511,7 @@ class BatchInvariantFp4Runner(MoERunner):
             if self._method is None:
                 # the refusal deferred at construction (the pre-routed modes never consulted it), else no term
                 if self._logits_refusal is not None:
-                    raise self._logits_refusal
+                    raise BatchInvariantUnsupportedError(*self._logits_refusal)
                 raise unsupported(
                     cls,
                     f"routing method {cfg.routing.method!r} from logits",
