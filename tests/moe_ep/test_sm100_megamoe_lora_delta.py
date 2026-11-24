@@ -306,6 +306,7 @@ def _check_snapshot_and_output(
     *,
     num_experts: int,
     intermediate: int,
+    fc1_activation_per_token_scale: torch.Tensor | None = None,
     out_tol: float = 0.03,
     act_tol: float = 0.03,
 ):
@@ -346,6 +347,7 @@ def _check_snapshot_and_output(
         fc1_alpha=getattr(ws, "fc1_alpha", None),
         fc2_alpha=getattr(ws, "fc2_alpha", None),
         fc1_norm_const=getattr(ws, "fc1_norm_const", None),
+        fc1_activation_per_token_scale=fc1_activation_per_token_scale,
         gemm1_lora_delta=delta1,
         return_post_act=True,
     )
@@ -760,6 +762,8 @@ def test_lora_delta_cuda_graph_replay(monkeypatch):
         # Replay 1: original routes and delta.
         graph.replay()
         torch.cuda.synchronize()
+        ws = layer._ensure_workspace()
+        assert torch.equal(ws.topk_idx[:num_tokens], topk_ids)
         _check_snapshot_and_output(
             layer,
             captured,
@@ -780,6 +784,7 @@ def test_lora_delta_cuda_graph_replay(monkeypatch):
         graph.replay()
         torch.cuda.synchronize()
         assert tuple(tensor.data_ptr() for tensor in captured) == ptrs
+        assert torch.equal(ws.topk_idx[:num_tokens], topk_ids)
         _check_snapshot_and_output(
             layer,
             captured,
@@ -952,56 +957,17 @@ def test_nvfp4_lora_delta_with_per_token_scale_and_multi_subtile(monkeypatch):
         )
         layer.warmup(t)
         res = layer.forward(t)
-        ws = layer._ensure_workspace()
-        cfg = ws.config
-        ref_y, ref_post_act = compute_megamoe_reference_block_scaled(
-            ws.x,
-            ws.x_sf,
-            ws.topk_idx,
-            ws.topk_weights,
-            layer._transformed[0][0].permute(0, 2, 1),
-            layer._transformed[0][1],
-            layer._transformed[1][0].permute(0, 2, 1),
-            layer._transformed[1][1],
-            quant_kind=cfg.quant_kind,
-            combine_dtype=cfg.combine_dtype,
-            local_expert_offset=0,
-            gate_up_clamp=cfg.gate_up_clamp,
-            apply_routing_weights_before_fc2=cfg.apply_routing_weights_before_fc2,
-            num_tokens=num_tokens,
-            weight_scales_are_swizzled=True,
-            fc1_alpha=ws.fc1_alpha,
-            fc2_alpha=ws.fc2_alpha,
-            fc1_norm_const=ws.fc1_norm_const,
+        _check_snapshot_and_output(
+            layer,
+            res,
+            delta1,
+            num_tokens,
+            num_experts=num_experts,
+            intermediate=intermediate,
             fc1_activation_per_token_scale=pt_scale,
-            gemm1_lora_delta=delta1,
-            return_post_act=True,
+            out_tol=0.06,
+            act_tol=0.06,
         )
-        err = output_error(
-            res.output, torch.arange(num_tokens, device="cuda"), ref_y[:num_tokens]
-        )
-        assert err < 0.06, f"output rel L2 error {err:.4f} >= 0.06"
-        offsets = res.expert_offsets.tolist()
-        for e in range(num_experts):
-            slab_tokens = res.token_id[offsets[e] : offsets[e + 1]]
-            slab_ranks = res.src_rank[offsets[e] : offsets[e + 1]]
-            slab_act = res.act[offsets[e] : offsets[e + 1]]
-            valid_mask = slab_tokens >= 0
-            assert (slab_tokens[~valid_mask] == -1).all()
-            assert (slab_ranks[~valid_mask] == -1).all()
-            assert (slab_ranks[valid_mask] == 0).all()
-            valid_toks = slab_tokens[valid_mask].tolist()
-            ref_toks, ref_acts = ref_post_act[e]
-            assert sorted(valid_toks) == sorted(ref_toks.tolist())
-            ref_by_tok = {tok: ref_acts[i] for i, tok in enumerate(ref_toks.tolist())}
-            actual = slab_act[valid_mask].float()
-            expected = torch.stack([ref_by_tok[tok] for tok in valid_toks]).float()
-            act_err = float(
-                (actual - expected).norm() / expected.norm().clamp_min(1e-12)
-            )
-            assert act_err < 0.06, (
-                f"expert {e} post-act rel L2 error {act_err:.4f} >= 0.06"
-            )
     finally:
         layer.destroy()
 
@@ -1102,7 +1068,7 @@ def test_direct_kernel_lora_operand_validation():
             valid_off,
         )
 
-    # Short delta token rows.
+    # Short delta token rows (static vs static, and static vs dynamic topk_indices).
     short_delta = make_fake_compact_tensor(
         cutlass.BFloat16, (32, 2, 512), stride_order=(2, 1, 0), assumed_align=16
     )
@@ -1110,6 +1076,22 @@ def test_direct_kernel_lora_operand_validation():
         cute.compile(
             _check,
             valid_topk,
+            short_delta,
+            valid_snap,
+            valid_tok,
+            valid_rank,
+            valid_off,
+        )
+    dyn_topk = make_fake_compact_tensor(
+        cutlass.Int32,
+        (cute.sym_int64(divisibility=64), 2),
+        stride_order=(1, 0),
+        assumed_align=16,
+    )
+    with pytest.raises(ValueError, match="fc1_lora_delta has 32 token rows"):
+        cute.compile(
+            _check,
+            dyn_topk,
             short_delta,
             valid_snap,
             valid_tok,

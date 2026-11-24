@@ -807,12 +807,19 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
         def fake_tensor(dtype, shape, stride_order, dynamic_axes, alignment):
             extents = tuple(
-                sym_int64(divisibility=math.gcd(int(extent), 128)) if axis in dynamic_axes else int(extent)
+                extent
+                if not isinstance(extent, int)
+                else (
+                    sym_int64(divisibility=math.gcd(int(extent), 128))
+                    if axis in dynamic_axes
+                    else int(extent)
+                )
                 for axis, extent in enumerate(shape)
             )
             return make_fake_compact_tensor(dtype, extents, stride_order=stride_order, assumed_align=alignment)
 
         tokens = self.max_tokens_per_rank
+        sym_tokens = sym_int64(divisibility=math.gcd(int(tokens), 128))
         hidden = self.hidden_size
         intermediate_gateup = self.intermediate_gateup_size
         intermediate_downproj = intermediate_gateup // 2
@@ -834,7 +841,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 {0},
                 16,
             ),
-            topk_indices=fake_tensor(self.topk_index_dtype, (tokens, self.topk), (1, 0), {0}, 16),
+            topk_indices=fake_tensor(self.topk_index_dtype, (sym_tokens, self.topk), (1, 0), {0}, 16),
             topk_scores=fake_tensor(cutlass.Float32, (tokens, self.topk), (1, 0), {0}, 4),
             fc1_weight=fake_tensor(self.a_dtype, (experts, hidden, intermediate_gateup), (2, 0, 1), {0, 2}, 16),
             fc1_weight_sf=fake_tensor(self.sf_dtype, (experts, fc1_weight_sf_columns), (1, 0), {0}, 16),
@@ -893,9 +900,11 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc1_activation_per_token_scale=fake_tensor(cutlass.Float32, (tokens,), (0,), {0}, 4),
             )
         if self.fc1_lora_delta:
+            # Share ``sym_tokens`` with ``topk_indices`` so TVM-FFI rejects a delta whose
+            # leading row count differs from ``topk_indices`` before kernel launch.
             fake_arguments.update(
                 fc1_lora_delta=fake_tensor(
-                    cutlass.BFloat16, (tokens, self.topk, intermediate_gateup), (2, 1, 0), {0}, 16
+                    cutlass.BFloat16, (sym_tokens, self.topk, intermediate_gateup), (2, 1, 0), {0}, 16
                 ),
                 fc1_post_act_snapshot=fake_tensor(
                     cutlass.BFloat16, (self.max_tokens, intermediate_downproj), (1, 0), set(), 16
@@ -973,6 +982,10 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         token_rows = topk_indices.shape[0]
         if isinstance(delta_rows, int) and isinstance(token_rows, int) and delta_rows < token_rows:
             raise ValueError(f"fc1_lora_delta has {delta_rows} token rows but topk_indices has {token_rows}.")
+        if isinstance(delta_rows, int) and not isinstance(token_rows, int) and delta_rows < self.max_tokens_per_rank:
+            raise ValueError(
+                f"fc1_lora_delta has {delta_rows} token rows but max_tokens_per_rank is {self.max_tokens_per_rank}."
+            )
         if isinstance(fc1_lora_delta.shape[1], int) and fc1_lora_delta.shape[1] != self.topk:
             raise ValueError(f"fc1_lora_delta dim 1 must equal topk ({self.topk}), got {fc1_lora_delta.shape[1]}.")
         if (

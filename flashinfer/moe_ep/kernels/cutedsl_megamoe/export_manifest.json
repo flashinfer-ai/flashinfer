@@ -300,7 +300,7 @@
     "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue_dedup.py": "be70089905b217f391c85296f48929c72df1f1a33e2e18880611c2164f90737a",
     "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py": "92b63c05e8b3d96651ae29c8e885f3effc43f9ecb37d80f3d4f711d71795a07b",
     "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_mainloop.py": "2d10ed6911ec6ac8474c3a35ab97474b0901f6a8ec33a152b0c126b2d878db7a",
-    "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "834e28fc35ccf062942306dc0cba9a0e3815a87b77bf13f0960b32dfb17be1a9",
+    "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "2b66e2414a4e0828b09cc5bfef05412592232b7188db9774ef2abb427ee111e2",
     "sources/kernel_src/blackwell/inference/mega/dynamic_mainloop.py": "c1298916e9d2c0980b9f6a8c8f78b6c14ac85b87646f7fb049ba7a0fa45322a5",
     "sources/kernel_src/rubin/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "sources/kernel_src/rubin/inference/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",

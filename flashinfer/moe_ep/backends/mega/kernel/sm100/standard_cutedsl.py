@@ -679,8 +679,34 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
             if not is_cake_megamoe_topk_reduce_module_loaded():
                 raise RuntimeError("Warm up the terminal reducer before graph capture.")
 
-    def compute(self, workspace, transformed_weights, *, output):
+    def compute(
+        self, workspace, transformed_weights, *, output
+    ) -> torch.Tensor | MegaMoeLoraOutput:
         """Launch the prepared MoE and its selected BF16 finalization path."""
+        return self._compute_impl(
+            workspace,
+            transformed_weights,
+            output=output,
+            clone_lora_snapshot=True,
+        )
+
+    def _compute_for_tuning(self, workspace, transformed_weights, *, output) -> None:
+        """Launch during autotuning trials without cloning discarded LoRA snapshots."""
+        self._compute_impl(
+            workspace,
+            transformed_weights,
+            output=output,
+            clone_lora_snapshot=False,
+        )
+
+    def _compute_impl(
+        self,
+        workspace,
+        transformed_weights,
+        *,
+        output,
+        clone_lora_snapshot: bool,
+    ) -> torch.Tensor | MegaMoeLoraOutput:
         from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.sources import (
             sm100_block_scaled_mega_launch_thunk,
             sm100_block_scaled_mega_moe,
@@ -698,7 +724,7 @@ class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
         def _wrap_lora_output(y: torch.Tensor):
             if not getattr(workspace.config, "enable_fc1_lora_delta", False):
                 return y
-            if output is None:
+            if output is None or not clone_lora_snapshot:
                 return MegaMoeLoraOutput(
                     output=y,
                     act=workspace.fc1_post_act_snapshot,
