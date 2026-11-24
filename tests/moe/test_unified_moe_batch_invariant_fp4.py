@@ -3734,3 +3734,32 @@ def test_prepare_activations_follows_the_served_pairs_table(monkeypatch):
         )
 
 
+def _runner(quant, **experts) -> BatchInvariantFp4Runner:
+    return BatchInvariantFp4Runner(
+        MoEConfig(
+            routing=RoutingConfig(num_experts=8, top_k=2),
+            quant=quant,
+            experts=ExpertConfig(intermediate_size=64, **experts),
+            backend=BackendOptions((BatchInvariantFp4Config(),)),
+        ),
+        torch.device("cuda", 0),
+    )
+
+
+@each_pair
+def test_shard_refusal_names_the_configured_pairs_class(pair):
+    """An expert-parallel shard is refused by the runner's support check in the configured pair's class (the pair is known
+    at that point; no fallback name); an unserved pair is refused as such, before the shard rule."""
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as e:
+        _runner(
+            _QUANT[pair], local_expert_offset=4, local_num_experts=4
+        ).check_support()
+    msg = str(e.value)
+    assert pair.cls in msg and "expert-parallel" in msg
+    assert ("moe.mxfp4" if pair.scaled else "moe.nvfp4") not in msg
+    mixed = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as e:
+        _runner(mixed, local_expert_offset=4, local_num_experts=4).check_support()
+    assert "does not serve" in str(e.value) and "expert-parallel" not in str(e.value)
+
+

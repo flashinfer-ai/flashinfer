@@ -207,13 +207,14 @@ class BatchInvariantFp4Runner(MoERunner):
 
     def _check_experts(self) -> None:
         """The class's rule on the expert range: the EP form is not part of this backend, so a shard is refused in the
-        class's terms (before the layer's generic shard check)."""
+        class's terms (before the layer's generic shard check). The pair is known here: ``_check_support`` refuses an
+        unserved pair before this check, and the ``pair`` property refuses it again for a direct caller."""
         experts, routing = self.config.experts, self.config.routing
         if experts.local_expert_offset or (
             experts.local_num_experts not in (None, 0, routing.num_experts)
         ):
             raise unsupported(
-                self.pair.cls if self._pair is not None else "moe.nvfp4",
+                self.pair.cls,
                 "expert-parallel shards (local_expert_offset / local_num_experts)",
                 "the full expert set (the class's EP form is not part of this backend)",
             )
