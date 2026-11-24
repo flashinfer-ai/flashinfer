@@ -9,10 +9,14 @@ eligible immediately and streams weights while the payload is still on the wire.
 
 Three consequences of that split shape the kernel.
 
-Readiness is whole-rank. The communication component publishes four counters for
-its entire grid rather than one per token tile, so each consumer warp waits once
-before its work loop instead of per tile, and the FC12 extension runs with no FC1
-ready counter at all.
+Readiness is whole-rank except at FC1's gate. The communication component
+publishes the plan through counters for its entire grid (``sizes_ready``,
+``metadata_ready``, and under the whole-payload Fence push dispatch the payload
+counters), which each consumer warp waits on once before its work loop. TMA-B
+alone waits per tile: before every FC1 tile it acquires its expert's
+``fc1_sf_ready`` or, under the pull dispatch with ``pull_tile_ready``, its token
+tile's ``fc1_tile_ready``, and Gather-B issues the tile's rows only behind that
+gate. The FC12 extension's scheduler-side FC1 ready counter stays unused.
 
 There are no transfer warps into an expert pool: FC1 gathers straight from the
 dense received plane, and the FC2 epilogue warps push each route's partial into
@@ -34,8 +38,12 @@ dependents at entry, so the reduce launches on SMs as CTAs here retire and its
 poller CTAs poll their combine slots while FC2 is still running; its
 housekeeping CTAs wait for this grid, which has itself drained the
 communication grid, before they reset landing rows and clear the local counters
-this round used. No cross-rank barrier is needed: every peer-written region is a
-landing set whose bytes announce their own arrival.
+this round used. Under the Sentinel combine no cross-rank barrier is needed:
+every peer-written region is a landing set whose bytes, or under the Fence push
+dispatch the payload counters, announce its arrival. The counter (Fence) combine
+ends this kernel with one all-rank tail barrier instead (``tail_barrier``):
+after the grid's last FC2 store it publishes this rank's pushes, and leaving it
+means every peer's pushes into this rank have landed.
 
 Under the counter combine the top-k reduce can run in this kernel instead
 (``reduce_topk_in_kernel``): the FC2 epilogue adds each route's BF16 partial
@@ -3321,8 +3329,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         # per-expert scale-factor gate all address an expert. The row offsets it
         # also carries are already resolved and stay as they are.
         expert_order = self.token_comm.expert_order_tensor(self._device_workspace)
-        # No FC1 ready counter: readiness is published per rank, not per tile, and
-        # the waits below cover it once per warp.
+        # No scheduler-side FC1 ready counter: TMA-B gates every FC1 tile itself,
+        # on its expert's ``fc1_sf_ready`` or its token tile's ``fc1_tile_ready``
+        # (``run_tma_b`` below).
         kernel_extension = BlockScaledSwapAbFc12Extension(
             sf_vec_size=self.sf_vec_size,
             fc1_done_counter_pointer=fc1_done_counter.iterator,

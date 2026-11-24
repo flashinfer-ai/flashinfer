@@ -2,18 +2,37 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Genphase MegaMoE token communication.
 
-The design target is a single cross-rank round trip on the critical path. Both
-outbound transfers leave at kernel entry with no routing dependency:
+Every dispatch sends this rank's routing at kernel entry, with no routing
+dependency. The push dispatches (Sentinel, Fence push) send the payload at entry
+as well, so a single cross-rank transfer sits on their critical path; under the
+pull dispatch the target ranks fetch the payload once the routing has arrived:
 
-  exchange CTA c   sends every peer its routes among chunk c of this rank's
-                   top-k plane (Fence dispatches; see "Expert-id lists"), or
-                   this rank's whole plane to peer c (Sentinel dispatch)
-  pusher CTA p     sends a slice of this rank's tokens to every peer that wants them
+  exchange CTA c   writes this rank's whole top-k planes into peer c's inbox
+                   (Sentinel), or sends every peer its count row and its routes
+                   among chunk c of this rank's top-k plane (Fence dispatches;
+                   see "Expert-id lists")
+  pusher CTA p     sends a slice of this rank's tokens to every peer that wants
+                   them (push dispatches only)
 
-Everything after that is local: one helper CTA folds the received counts into
-per-expert sizes and prefixes, the exchange CTAs copy slices of the received
-lists into the index lists and leave, and the helper and the pushers converge on
-rewriting the received scale factors into the layout the block-scaled MMA wants.
+The rest runs on the target rank:
+
+  Sentinel     the exchange CTAs turn into planners that each count every
+               source's plane, rank the experts and scatter their own source's
+               routes into the index lists, then leave ("Sentinel top-k
+               inbox"); the helper and the pushers refine the landed rows,
+               verifying their bytes and rewriting their scale factors into the
+               layout the block-scaled MMA wants
+  Fence push   one helper CTA folds the received count rows into per-expert
+               sizes, the processing order and the row-space prefixes; the
+               exchange CTAs copy slices of the received lists into the index
+               lists and leave (under round gating the first
+               ``refine_exchange_ctas`` refine instead); the helper and the
+               pushers refine once the payload counters publish the rows
+  Fence pull   the helper folds as under the push, and the exchange and pusher
+               CTAs copy the lists; the helper and the pushers then walk this
+               rank's routes in processing order and fetch each row from its
+               source rank's staging, or with ``pull_warps`` the main kernel
+               fetches and this grid ends with the plan ("Pull dispatch")
 
 The exchange CTAs leave instead of joining that last phase because the dependent
 main kernel sizes its grid to fill the device: whatever this component holds comes
@@ -72,9 +91,12 @@ does: every word of the three inboxes holds the 0xFFFFFFFF init sentinel in
 both landing sets from allocation on, and no word sent into them takes that
 value (a score whose bits do travels as 0x7FFFFFFF). The helper and every
 index-copy CTA poll the count rows with relaxed system loads and run the same
-fold and ranking on them, ties by expert index, so they agree on the processing
-order without a hand-off. An index-copy CTA then derives where each (source,
-chunk, expert) segment starts in the lists and among the expert's routes, takes
+fold and ranking on them, which break ties the same way in every CTA (by expert
+index, except that the CTA-wide ranking of 33 to 64 local experts alternates the
+two halves of the local experts, 0, half, 1, half + 1, ...; see
+``_rank_by_counting_in_cta``), so they agree on the processing order without a
+hand-off. An index-copy CTA then derives where each (source, chunk, expert)
+segment starts in the lists and among the expert's routes, takes
 an equal slice of all list positions, polls each position's route and score
 words, writes the gather index, the routing record and the score, resets the
 words it read to the sentinel, and adds one to ``metadata_ready``. The helper
@@ -119,12 +141,15 @@ exchange CTA writes this rank's whole id and score planes into its peer's slab
 with volatile 16-byte vector stores. The exchange CTAs then turn into W
 replicated planners: each one polls every source's id plane, counts the routes
 per (source, expert) in SMEM and runs the same deterministic fold, processing
-order and row-space scans as every other planner. Planner 0 publishes the
-tables and ``sizes_ready``; every planner scatters the routes of the source it
-exchanged with and adds one to ``metadata_ready``, whose target is then W. No
-hand-off between CTAs precedes either counter, and the helper goes straight to
-the refine. The end-of-round reduce
-resets every inbox word once the round's planners are done with it.
+order and data-row scan as every other planner, which give it each expert's
+data-row base and its own source's segment base. Planner 0 publishes the sizes,
+the processing order and ``sizes_ready``, then the data-row, SF-row and
+refine-block bases; above 32 local experts it alone runs the SF-row and
+refine-block prefixes (``_plan_bases``). Every planner scatters the routes of
+the source it exchanged with and adds one to ``metadata_ready``, whose target is
+then W. No hand-off between CTAs precedes either counter, and the helper goes
+straight to the refine. The end-of-round reduce resets every inbox word once the
+round's planners are done with it.
 
 Every route this rank receives is thus counted W times, once by each planner,
 on purpose. The processing order and the bases need every source's counts: an
@@ -169,14 +194,16 @@ The warp streams the token's data row out of the source rank's staged
 activations through a ring of SMEM rows into the landing slot, and the row's
 lane loads the token's scale factors out of the source rank's staged scale
 factors and stores each word straight into its canonical atom. Once the stores
-have completed the warp adds the chunk's rows to the expert's ``fc1_sf_ready``,
-which then counts routes rather than refine blocks and certifies the expert's
-data rows as well as its scale factors. Experts become ready one after another
-in the order the main kernel processes them, from the end of the plan on: the
-rows claimed but not yet landed span only a few experts at a time. With
-``pull_tile_ready`` the rows count into their token tile's ``fc1_tile_ready``
-instead (a claim never crosses a tile), and each FC1 tile waits only for its
-own tile's routes. The first wave of claims, one per walking warp, otherwise
+have completed the warp adds the chunk's rows to their token tile's
+``fc1_tile_ready`` (``pull_tile_ready``, on by default; a claim never crosses a
+tile), which certifies the tile's data rows as well as its scale factors, and
+each FC1 tile waits only for its own tile's routes. Token tiles become ready one
+after another in the order the main kernel processes them, from the end of the
+plan on: the rows claimed but not yet landed span only a few experts at a time.
+An N64 token tile shares its scale-factor atom with the next tile, so there, or
+with ``pull_tile_ready`` off, the rows count into the expert's ``fc1_sf_ready``
+instead, which then counts routes rather than refine blocks and gates every FC1
+tile of the expert. The first wave of claims, one per walking warp, otherwise
 lands together: every warp keeps its claim's first rows in flight and the link
 serves them side by side. The experts starting within that wave are claimed
 ``pull_lead_chunk_rows`` routes at a time instead, few enough for a claim's rows
@@ -211,19 +238,20 @@ all of the launch's routes fit and zero otherwise, so a launch then runs one
 path throughout.
 
 The staged activations precede the source rank's communication grid in stream
-order, so its system-scope ``topk_ready`` releases cover them. An index-copy CTA
-acquires every source's ``topk_ready`` at system scope before its
-``metadata_ready`` add, and every walking CTA acquires ``metadata_ready``
-complete before its first fetch (or, without ``pull_acquire_in_copy``, every
-source's ``topk_ready`` itself), so every source's staging happens before the
-first fetch; a global proxy fence then orders that generic acquire before the
-bulk loads of the data rows, which read through the async proxy. The data rows land
-through the async proxy as well, so the warp fences again between their
-completion and its release of the count; the scale-factor stores precede that
-release in program order and through the warp barrier. A source rank restages
-only after its counter combine's tail barrier, which every rank enters only
-once its own communication grid, and with it every fetch it issued, has
-completed.
+order, so its system-scope ``topk_ready`` releases cover them. Under
+``pull_acquire_in_copy`` index-copy CTA i of C acquires the ``topk_ready`` of
+sources i, i + C, ... at system scope before its ``metadata_ready`` add, so the
+copiers between them acquire every source before ``metadata_ready`` completes,
+and every walking CTA acquires ``metadata_ready`` complete before its first
+fetch (without it, every walking CTA acquires every source's ``topk_ready``
+itself), so every source's staging happens before the first fetch; a global
+proxy fence then orders that generic acquire before the bulk loads of the data
+rows, which read through the async proxy. The data rows land through the async
+proxy as well, so the warp fences again between their completion and its
+release of the count; the scale-factor stores precede that release in program
+order and through the warp barrier. A source rank restages only after its
+counter combine's tail barrier, which every rank enters only once its own
+communication grid, and with it every fetch it issued, has completed.
 
 With ``pull_warps`` the main kernel fetches instead (``run_pull_warp``) and this
 grid ends with the plan: the exchange CTAs and the pusher CTAs copy the lists,
@@ -5002,11 +5030,12 @@ class GenphaseTokenComm(KernelComponent):
         """Bring every count row into SMEM, fold it into per-expert loads and rank them (Fence dispatches).
 
         The helper (``publish``) and every index-copy CTA run this on the same
-        rows. Ties resolve by expert index, so all of them settle on the
-        processing order the helper publishes. Leaves the rows in
-        ``helper_chunk_counts``, the loads in ``helper_totals`` and the order
-        in ``helper_expert_order`` and ``helper_expert_sizes_in_order``. Without
-        ``poll`` the rows are already in SMEM.
+        rows. Ties resolve the same way in all of them
+        (``_rank_experts_by_load``), so all of them settle on the processing
+        order the helper publishes. Leaves the rows in ``helper_chunk_counts``,
+        the loads in ``helper_totals`` and the order in ``helper_expert_order``
+        and ``helper_expert_sizes_in_order``. Without ``poll`` the rows are
+        already in SMEM.
         """
         chunk_counts = self._smem_workspace.tensor(
             self.helper_chunk_counts_region, smem_base
@@ -5087,9 +5116,11 @@ class GenphaseTokenComm(KernelComponent):
 
         ``replicated`` is for CTAs that each rank the same loads (the Sentinel
         planners, the Fence index copy): only the two SMEM outputs are written,
-        and every tie resolves by expert index, so all of them settle on the same
-        order. ``ordered_ties`` resolves ties by expert index while publishing,
-        for the CTA whose order replicated CTAs must reproduce.
+        and every tie resolves by a fixed key (the expert index, or the
+        alternating halves of ``_rank_by_counting_in_cta``), so all of them
+        settle on the same order. ``ordered_ties`` resolves ties by expert index
+        while publishing, for the CTA whose order replicated CTAs must
+        reproduce.
         """
         if cutlass.const_expr(self.ranks_experts_in_cta):
             self._rank_by_counting_in_cta(
@@ -6023,12 +6054,14 @@ class GenphaseTokenComm(KernelComponent):
     ) -> None:
         """Each expert's data-row base and ``source_rank``'s segment base in it, into SMEM.
 
-        Sources are laid out in ring order from this rank, as in
-        ``_publish_source_segment_bases``. With ``publishes`` the data-row,
-        SF-row and refine-block bases and the refine block total go out as well,
-        for the refine, which reads them once ``metadata_ready`` is complete. Up
-        to 32 buckets one warp scans both row spaces with shuffles; above, the
-        helper's CTA-wide scans run.
+        Sources are laid out in ring order from this rank
+        (``_store_plan_bases``), the order the Fence index copy gives the
+        segments as well. With ``publishes`` the data-row, SF-row and
+        refine-block bases and the refine block total go out as well, for the
+        refine, which reads them once ``metadata_ready`` is complete. Up to 32
+        buckets one warp scans both row spaces with shuffles in every planner;
+        above, every planner runs the helper's CTA-wide scan of the data rows,
+        and only the publishing one the SF-row and refine-block prefixes.
         """
         buckets = self.local_expert_bucket_count
         expert_sizes_in_order = self._smem_workspace.tensor(

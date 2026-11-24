@@ -169,13 +169,16 @@ FC1_TOKEN_POOL_MIN_EXPECTED_LOAD = 256
 # imbalance of real routing, at about a sixth of the pool sized for any routing.
 FC1_TOKEN_POOL_CAPACITY_FACTOR = 2
 
-# Token stages of the main kernel's split AB ring, per token tile N, where an
-# expert's expected load fits one token tile; the weight ring takes the rest of
-# the SMEM budget (9 weight stages at N128, 8 at N192, against 8 and 7 in one
-# shared ring). With one token tile per expert every weight byte is read once
-# from HBM, and the weight stream needs the deeper ring; once an expert has
-# several token tiles they re-read its weights from L2 and the token ring needs
-# its depth back. One token stage fewer still pays at these tiles, two do not.
+# Token stages of the main kernel's split AB ring, per token tile N, where the
+# largest expected expert (``largest_expected_expert_load``) fits one token tile;
+# the weight ring takes the rest of the SMEM budget (9 weight stages at N128, 8 at
+# N192, against 8 and 7 in one shared ring). With one token tile per expert every
+# weight byte is read once from HBM, and the weight stream needs the deeper ring;
+# once an expert has several token tiles they re-read its weights from L2 and the
+# token ring needs its depth back, so the main kernel keeps the shared ring there
+# (V4.1-Flash on eight GPUs runs N192 at 2048 and 4096 tokens per rank on the
+# shared 7-stage ring). One token stage fewer still pays at these tiles, two do
+# not.
 SPLIT_RING_TOKEN_STAGES = {128: 7, 192: 6}
 
 

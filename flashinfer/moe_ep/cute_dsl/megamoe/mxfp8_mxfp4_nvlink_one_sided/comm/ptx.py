@@ -4,12 +4,14 @@
 
 Landing rows are armed with a sentinel the payload never takes; receivers poll the
 data itself. The dispatch payload (E4M3 data and UE8M0 scales) uses the byte
-sentinel ``0xFF``: senders rewrite any ``0xFF`` byte (a NaN) to ``0x7F`` (data) or
-``0xFE`` (scales) before pushing, so a row has arrived exactly when none of its bytes
-is ``0xFF``. A byte is written atomically by any writer, so the test is tear-proof
-for LSU and bulk pushes alike. BF16 combine partials use the word sentinel
-``0xFFFFFFFF``: writers rewrite every ``0xFFFF`` lane to ``0x7FFF`` and push with
-32-bit-element vector stores, whose elements are single-copy atomic.
+sentinel ``0xFF``: staging rewrites any ``0xFF`` byte (a NaN) to ``0x7F`` (data) or
+``0xFE`` (scales) before the payload is pushed, so a row has arrived exactly when none
+of its bytes is ``0xFF`` (``canonicalize_e4m3_word`` and ``canonicalize_ue8m0_word``
+are the same rewrite per word; no kernel calls them). A byte is written atomically by
+any writer, so the test is tear-proof for LSU and bulk pushes alike. BF16 combine
+partials use the word sentinel ``0xFFFFFFFF``: writers rewrite every ``0xFFFF`` lane
+to ``0x7FFF`` and push with 32-bit-element vector stores, whose elements are
+single-copy atomic.
 
 Remote pushes and polls use ``.volatile`` accesses (``.relaxed.sys`` semantics), so a
 poll racing with a push is a defined race and the loaded words are used directly;

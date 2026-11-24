@@ -129,8 +129,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(KernelComponent):
     # Rows of FC2's token box when TMA-B loads only a tile's live rows (see
     # ``fc2_b_live_rows``): one 16-row box is two 128-byte swizzle atoms.
     fc2_b_row_box: ClassVar[int] = 16
-    # Fixed rather than configurable: the four-way gather split of §5 is the point
-    # of this kernel, and cluster N carries no tokens under swap-AB.
+    # Default for a descriptor without ``cluster_shape_mn``. ``__init__`` takes the
+    # descriptor's shape, which the mega kernel always forwards (the frontend's
+    # default is (2, 1)); the mainloop accepts (2, 1) and (4, 1), and cluster N
+    # stays 1 under swap-AB.
     cluster_shape_mn: ClassVar[Tuple[int, int]] = (4, 1)
     # Blackwell uses its native 1x block-scaled instruction K.
     mma_k_mode: ClassVar[str] = "1x"
