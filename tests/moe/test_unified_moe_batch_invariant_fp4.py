@@ -3210,6 +3210,34 @@ def _guards_untouched(
     return bool((big[:guard] == byte).all()) and bool((big[-guard:] == byte).all())
 
 
+def _sf_live_bytes(rows_sf: int, K: int, block: int, live_rows: torch.Tensor):
+    """The bytes of a flat 128x4 scale buffer of ``rows_sf`` rows of ``K`` elements that a writer of the rows ``live_rows``
+    may touch: those rows' whole 4-byte column groups (the writers store a row's scales in 4-byte groups); every other byte
+    of the buffer is outside the live positions."""
+    from flashinfer.batch_invariant.quantization.layout import (
+        SF_COL_TILE,
+        SF_ROW_TILE,
+        padded_sf_cols,
+        sf_numel,
+    )
+
+    pc = padded_sf_cols(K, block, "128x4")
+    rows = live_rows.view(-1, 1).long()
+    cols = torch.arange(pc, device=live_rows.device).view(1, -1)
+    off = (
+        (cols % SF_COL_TILE)
+        + (cols // SF_COL_TILE) * (SF_ROW_TILE * SF_COL_TILE)
+        + (rows % 32) * 16
+        + ((rows % SF_ROW_TILE) // 32) * 4
+        + (rows // SF_ROW_TILE) * (SF_ROW_TILE * pc)
+    )
+    mask = torch.zeros(
+        sf_numel(rows_sf, K, block, "128x4"), dtype=torch.bool, device=live_rows.device
+    )
+    mask[off.reshape(-1)] = True
+    return mask
+
+
 # ----------------------------------------------------------------------------- dropped slots
 
 
@@ -3379,6 +3407,18 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
         live_pad[pos_pad[:n_valid].long()] = True
         wpr = warps_per_row(Tk, H // 32, sm_count)
         tok = (src[:n_valid] // k).long()
+        # the scale buffers' writable bytes: the live padded rows' whole column groups (every other byte keeps the sentinel)
+        live_rows = pos_pad[:n_valid]
+        wr_h = _sf_live_bytes(Tk_sf, H, pair.block, live_rows)
+        wr_i = _sf_live_bytes(Tk_sf, I, pair.block, live_rows)
+        sf_rows = _unswizzle(pair, sf, T, H)  # the tokens' scale rows [T, H / block]
+
+        def live_scales_ok(buf, K, rows_src) -> bool:
+            """The live rows of the padded buffer ``buf`` hold the source rows ``rows_src`` (unswizzled)."""
+            return torch.equal(
+                _unswizzle(pair, buf, Tk_sf, K)[live_rows.long()], rows_src
+            )
+
         if not pair.scaled:
             unit = _placeholder(x.device)
             x_perm4, big4 = _guarded(Tk_a * (H // 2))
@@ -3403,6 +3443,8 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
                 (x_perm4[n_valid:] == 0xAB).all()
             )  # the dropped slots' rows and the tail: never written
             assert torch.equal(x_perm4[:n_valid], x4[tok])
+            assert bool((x_perm_sf[~wr_h] == 0xAB).all())
+            assert live_scales_ok(x_perm_sf, H, sf_rows[tok])
             # the intermediate's scale re-tiling writes the live positions alone
             a_sf_q = torch.randint(
                 0, 255, (pair.sf_numel(Tk, I),), dtype=torch.uint8, device="cuda"
@@ -3413,6 +3455,8 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
             )
             torch.cuda.synchronize()
             assert _guards_untouched(big_s)
+            assert bool((a_sf_s[~wr_i] == 0xAB).all())
+            assert live_scales_ok(a_sf_s, I, _unswizzle(pair, a_sf_q, Tk, I)[:n_valid])
         else:
             for fused in (False, True):
                 x_perm4, big4 = _guarded(Tk_a * (H // 2))
@@ -3452,6 +3496,8 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
                     fused
                 )  # the dropped slots' rows and the tail: never written
                 assert torch.equal(x_perm4[:n_valid], x4[tok]), fused
+                assert bool((x_perm_sf[~wr_h] == 0xAB).all()), fused
+                assert live_scales_ok(x_perm_sf, H, sf_rows[tok]), fused
                 assert bool(
                     (
                         x_perm_pts.view(torch.uint8).view(Tk_sf, 4)[~live_pad] == 0xAB
@@ -3485,7 +3531,9 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
             assert bool(
                 (a_pts_m.view(torch.uint8).view(Tk_sf, 4)[~live_pad] == 0xAB).all()
             )
+            assert bool((a_sf_m[~wr_i] == 0xAB).all())
             a4_q, a_sf_q, a_pts_q = quantize_activations(a, gsi)
+            assert live_scales_ok(a_sf_m, I, _unswizzle(pair, a_sf_q, Tk, I)[:n_valid])
             assert torch.equal(
                 a4_m.view(Tk, I // 2), a4_q
             )  # the codes stay in place for every row, mapped or not
@@ -3496,6 +3544,7 @@ def test_pre_routed_ids_outside_the_expert_range_are_dropped_slots(pair):
             )
             torch.cuda.synchronize()
             assert _guards_untouched(big_s) and _guards_untouched(big_p)
+            assert bool((a_sf_s[~wr_i] == 0xAB).all())
             assert torch.equal(a_pts_s[live_pad], a_pts_m[live_pad]) and bool(
                 (a_pts_s.view(torch.uint8).view(Tk_sf, 4)[~live_pad] == 0xAB).all()
             )
