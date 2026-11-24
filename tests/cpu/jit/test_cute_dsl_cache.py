@@ -33,6 +33,7 @@ pattern for their own name functions.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 import inspect
 import multiprocessing
 from pathlib import Path
@@ -540,7 +541,7 @@ def test_compiler_options_are_isolated_between_threads(cute_dsl_cache):
             assert entered.wait(timeout=10)
             second = pool.submit(second_build)
             assert attempted.wait(timeout=10)
-            with pytest.raises(TimeoutError):
+            with pytest.raises(FuturesTimeoutError):
                 second.result(timeout=0.1)
         finally:
             release.set()

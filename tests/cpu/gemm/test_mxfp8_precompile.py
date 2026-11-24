@@ -10,6 +10,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -191,12 +192,8 @@ def test_worker_builds_fp8_persistent_and_splitk_contract(monkeypatch, tactic):
         "_make_blockscaled_gemm_compile_fn",
         lambda gemm, **kw: compiled.append(kw),
     )
-    monkeypatch.setattr(
-        cute_dsl_core.JitSpecCuteDsl, "is_compiled", property(lambda self: False)
-    )
-    monkeypatch.setattr(
-        cute_dsl_core.JitSpecCuteDsl, "compile_and_persist", lambda self: None
-    )
+    persist = Mock()
+    monkeypatch.setattr(cute_dsl_core.JitSpecCuteDsl, "compile_and_persist", persist)
     monkeypatch.setenv("CUTE_DSL_ARCH", "sm_103a")
     tile, cluster, swap, prefetch, slices = tactic
     payload = dict(
@@ -212,6 +209,7 @@ def test_worker_builds_fp8_persistent_and_splitk_contract(monkeypatch, tactic):
         source_sha256="test",
     )
     assert precompile._mm_mxfp8_precompile_worker(payload) == ("test", None)
+    persist.assert_called_once_with(force=False)
     expected = (
         ("splitk", (32, tile, slices, True))
         if slices > 1
