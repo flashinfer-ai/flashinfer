@@ -804,9 +804,11 @@ DEVI void list_unit(const Params& p, int u, int ctid, int* hist) {
     red_release(p.ctr + (p.cl ? C_CDONE : C_LDONE), 1);
   }
 }
-// sk >= 0: this warp's static first row (rows [0, 2 grid) belong to the helper warps)
+// Every gather row is claimed from C_GQUEUE, so the rows (and the G1 items waiting on
+// them) never depend on a CTA that is not resident: the kernel completes with any
+// subset of its CTAs resident (SM partitions, MPS limits, other work on the device).
 template <class S>
-DEVI void helper_gather(const Params& p, const Plan& pl, int lane, int sk) {
+DEVI void helper_gather(const Params& p, const Plan& pl, int lane) {
   if (lane == 0) wait_geq(p.ctr + (p.cl ? C_CDONE : C_LDONE), p.cl ? pl.u1 - pl.u0 : pl.nlu);
   __syncwarp();
   const int c = lane & 7, lo = 8 * (lane >> 3);
@@ -819,7 +821,7 @@ DEVI void helper_gather(const Params& p, const Plan& pl, int lane, int sk) {
   auto claim_k = [&] {
     int k = 0;
     if (lane == 0) k = atomicAdd(p.ctr + C_GQUEUE, 1);
-    return shfl(k, 0) + 2 * gridDim.x;
+    return shfl(k, 0);
   };
   // asm volatile keeps the next route's load ahead of this row's data loads
   auto route = [&](int x) {
@@ -831,7 +833,7 @@ DEVI void helper_gather(const Params& p, const Plan& pl, int lane, int sk) {
     return r;
   };
   constexpr int kCh = S::kHidden / 256;  // 32-lane x 16-byte chunks per row
-  int x = locate(sk >= 0 ? sk : claim_k()), tj = route(x);
+  int x = locate(claim_k()), tj = route(x);
   while (x != END) {
     const int e = x >> 20, t = tj >> 3;
     const int le = lane < TOPK ? __ldcg(p.ids + 8 * t + lane) : -1;
@@ -872,7 +874,7 @@ DEVI void helper_gather(const Params& p, const Plan& pl, int lane, int sk) {
 template <class S>
 DEVI void helper(const Params& p, const Plan& pl, u32 bars, int lane, bool first) {
   if (first) mbar_wait(bars + B_PL, 0);
-  helper_gather<S>(p, pl, lane, first ? 2 * blockIdx.x + (threadIdx.x >> 5) - 2 : -1);
+  helper_gather<S>(p, pl, lane);
 }
 
 template <class S>
