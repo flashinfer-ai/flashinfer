@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
+#include <cuda/atomic>
 #include <flashinfer/fastdiv.cuh>
 #include <type_traits>
 #include <unordered_map>
@@ -105,6 +106,14 @@ struct QTokenKvBlockSparseTouchedMetadataParams {
   // Nonzero for request-aligned fixed Q; query_positions then stores KV lengths.
   // Rows map to (request, query offset) with this precomputed divisor.
   uint_fastdiv fixed_query_len;
+  // Optional longest-first dispatch order for persistent attention: [routes]
+  // route IDs by descending KV128 tiles, written by the last CTA to finish,
+  // and its completion counter (zero between launches). Null disables both.
+  int32_t* route_order;
+  int32_t* route_order_counter;
+  // Shortest routes ordered last, longest first (two SM waves); the others
+  // keep index order.
+  int32_t route_order_tail;
 };
 
 namespace detail {
@@ -262,6 +271,136 @@ __device__ __forceinline__ void ReleasePdlDependents(
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
 #endif
+}
+
+// Buckets of the balanced route order: one per KV128 tile count. Unions of
+// 127 or more tiles (16K+ tokens) share the longest bucket, so the order is
+// longest first only up to that length; within a bucket it is arbitrary.
+constexpr int kQTokenKvBlockSparseRouteOrderBins = 128;
+
+// Shared-memory ints the route order needs for ``routes`` routes: bins, warp
+// sums plus a total, and a one-bit-per-route tail mask.
+__host__ __device__ constexpr int QTokenKvBlockSparseRouteOrderSmemInts(int routes) {
+  return kQTokenKvBlockSparseRouteOrderBins + 33 + (routes + 31) / 32;
+}
+
+// Dynamic shared memory of a metadata launch of ``bytes`` that also writes
+// the route order: room for the tail mask when that fits the per-CTA limit,
+// else only bins and warp sums (WriteLongestFirstRouteOrder then orders every
+// route longest first).
+inline size_t QTokenKvBlockSparseRouteOrderLaunchBytes(size_t bytes, const int32_t* route_order,
+                                                       int64_t routes, int max_bytes) {
+  if (route_order == nullptr) return bytes;
+  const size_t order_bytes =
+      static_cast<size_t>(QTokenKvBlockSparseRouteOrderSmemInts(static_cast<int>(routes))) *
+      sizeof(int);
+  const size_t sort_bytes = (kQTokenKvBlockSparseRouteOrderBins + 33) * sizeof(int);
+  return std::max(bytes, order_bytes <= static_cast<size_t>(max_bytes) ? order_bytes : sort_bytes);
+}
+
+// Called by every CTA after its outputs. The CTA whose completion RMW returns
+// routes - 1 writes route_order and rearms the counter. Persistent attention
+// takes routes in that order: the ``route_order_tail`` shortest routes come
+// last, longest first, so the final waves drain evenly; all other routes keep
+// their index order, so concurrently running routes stay close in the
+// request (L2 reuse of their K/V). ``smem`` holds ``smem_ints`` ints the CTA
+// no longer uses; with fewer than the tail mask needs, every route takes its
+// longest-first slot. Slots within one tile bucket follow atomic arrival; the
+// order is always a permutation of the routes.
+template <typename PositionType>
+__device__ __forceinline__ void WriteLongestFirstRouteOrder(
+    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params, int* smem,
+    int smem_ints) {
+  constexpr int kBins = kQTokenKvBlockSparseRouteOrderBins;
+  if (params.route_order == nullptr) return;
+  const int routes = static_cast<int>(gridDim.x);
+  int last = 0;
+  if (threadIdx.x == 0) {
+    // Release publishes this CTA's seq_lens; the last CTA acquires all others.
+    cuda::atomic_ref<int, cuda::thread_scope_device> done(*params.route_order_counter);
+    last = done.fetch_add(1, cuda::memory_order_acq_rel) == routes - 1;
+  }
+  if (!__syncthreads_or(last)) return;
+  const bool keep_index_order = smem_ints >= QTokenKvBlockSparseRouteOrderSmemInts(routes);
+  const int tail_start = keep_index_order ? routes - min(params.route_order_tail, routes) : 0;
+  int* bins = smem;
+  int* warp_sums = smem + kBins;
+  unsigned* tail_mask = reinterpret_cast<unsigned*>(smem + kBins + 33);
+  auto bin = [&](int route) {
+    const int tiles = (__ldcg(params.seq_lens + route) + 127) >> 7;
+    return kBins - 1 - min(tiles, kBins - 1);  // bin 0 holds the longest routes
+  };
+  for (int b = threadIdx.x; b < kBins; b += blockDim.x) bins[b] = 0;
+  if (keep_index_order) {
+    for (int w = threadIdx.x; w < (routes + 31) / 32; w += blockDim.x) tail_mask[w] = 0;
+  }
+  __syncthreads();
+  for (int r = threadIdx.x; r < routes; r += blockDim.x) atomicAdd(bins + bin(r), 1);
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  if (warp == 0) {
+    // Exclusive scan of the bin counts: each lane owns kBins / 32 bins.
+    int counts[kBins / 32];
+    int sum = 0;
+#pragma unroll
+    for (int i = 0; i < kBins / 32; ++i) {
+      counts[i] = bins[lane * (kBins / 32) + i];
+      sum += counts[i];
+    }
+    int inclusive = sum;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      const int lower = __shfl_up_sync(0xffffffffu, inclusive, d);
+      if (lane >= d) inclusive += lower;
+    }
+    int start = inclusive - sum;
+#pragma unroll
+    for (int i = 0; i < kBins / 32; ++i) {
+      bins[lane * (kBins / 32) + i] = start;
+      start += counts[i];
+    }
+  }
+  __syncthreads();
+  // Longest-first slots; the tail keeps them, the rest is compacted below.
+  for (int r = threadIdx.x; r < routes; r += blockDim.x) {
+    const int slot = atomicAdd(bins + bin(r), 1);
+    if (slot >= tail_start) {
+      params.route_order[slot] = r;
+      if (keep_index_order) atomicOr(tail_mask + (r >> 5), 1u << (r & 31));
+    }
+  }
+  if (tail_start > 0) {
+    // Stable compaction of the non-tail routes into [0, tail_start).
+    __syncthreads();
+    const int warps = static_cast<int>(blockDim.x) >> 5;
+    int base = 0;
+    for (int chunk = 0; chunk < routes; chunk += blockDim.x) {
+      const int r = chunk + static_cast<int>(threadIdx.x);
+      const bool keep = r < routes && !((tail_mask[r >> 5] >> (r & 31)) & 1u);
+      const unsigned ballot = __ballot_sync(0xffffffffu, keep);
+      if (lane == 0) warp_sums[warp] = __popc(ballot);
+      __syncthreads();
+      if (warp == 0) {
+        const int count = lane < warps ? warp_sums[lane] : 0;
+        int inclusive = count;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+          const int lower = __shfl_up_sync(0xffffffffu, inclusive, d);
+          if (lane >= d) inclusive += lower;
+        }
+        if (lane < warps) warp_sums[lane] = inclusive - count;
+        if (lane == 31) warp_sums[32] = inclusive;
+      }
+      __syncthreads();
+      if (keep) {
+        params.route_order[base + warp_sums[warp] + __popc(ballot & ((1u << lane) - 1u))] = r;
+      }
+      base += warp_sums[32];
+      __syncthreads();
+    }
+  }
+  if (threadIdx.x == 0) *params.route_order_counter = 0;
 }
 
 template <typename PositionType>
@@ -621,6 +760,9 @@ __global__ __launch_bounds__(
                                                                        shared.union_pages);
   }
   ReleasePdlDependents(params);
+  static_assert(sizeof(shared) >= (kQTokenKvBlockSparseRouteOrderBins + 33) * sizeof(int));
+  WriteLongestFirstRouteOrder(params, reinterpret_cast<int*>(&shared),
+                              static_cast<int>(sizeof(shared) / sizeof(int)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1502,6 +1644,10 @@ __global__ void __launch_bounds__(QTokenKvBlockSparseBitmapThreads<GroupSize>(),
                                                                        shared.union_pages);
   }
   ReleasePdlDependents(params);
+  uint32_t dynamic_smem_bytes;
+  asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dynamic_smem_bytes));
+  WriteLongestFirstRouteOrder(params, reinterpret_cast<int*>(q_token_kv_block_sparse_map_smem),
+                              static_cast<int>(dynamic_smem_bytes / sizeof(int)));
 }
 
 // Cached per host thread, device, and kernel specialization: no shared mutable
@@ -1599,7 +1745,9 @@ cudaError_t LaunchQTokenKvBlockSparseWideMetadataTyped(
   auto kernel = selected.entry_blocks > 0 ? entry_kernel
                 : selected.word_rank      ? map_kernel
                                           : walk_kernel;
-  kernel<<<routes, kThreads, selected.bytes, stream>>>(params);
+  const size_t smem_bytes = QTokenKvBlockSparseRouteOrderLaunchBytes(
+      selected.bytes, params.route_order, routes, state.max_dynamic_smem_bytes);
+  kernel<<<routes, kThreads, smem_bytes, stream>>>(params);
   return cudaGetLastError();
 }
 
@@ -1669,9 +1817,11 @@ cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
     }
   }
   if (use_map) {
+    const size_t smem_bytes = QTokenKvBlockSparseRouteOrderLaunchBytes(
+        selected.bytes, params.route_order, routes, state.max_dynamic_smem_bytes);
     (selected.word_rank
          ? map_kernel
-         : walk_kernel)<<<routes, kQTokenKvBlockSparseBitmapBlockThreads, selected.bytes, stream>>>(
+         : walk_kernel)<<<routes, kQTokenKvBlockSparseBitmapBlockThreads, smem_bytes, stream>>>(
         params);
   } else {
     sort_kernel<<<routes, kSortBlockThreads, 0, stream>>>(params);

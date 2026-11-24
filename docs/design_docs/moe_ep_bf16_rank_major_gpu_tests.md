@@ -28,6 +28,13 @@ bash tests/moe_ep/run_tests.sh bf16-rank-major
 NNODES=2 RDZV_ENDPOINT=node0:29500 bash tests/moe_ep/run_tests.sh bf16-rank-major
 ```
 
+With `NNODES` above 1, the target sets `NVSHMEM_DISABLE_NVLS=1` and
+`NVSHMEM_REMOTE_TRANSPORT=none` unless they are already set. Across two VR
+NVL72 nodes, NVSHMEM's default NVLS setup fails with `No more teams
+available`; the ranks share one NVLink domain, so the direct peer-memory path
+needs neither NVLS nor a remote transport. Export both on every rank when you
+launch the two nodes with `torchrun` directly.
+
 Direct invocation on the required hardware:
 
 ```bash

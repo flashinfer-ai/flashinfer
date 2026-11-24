@@ -16,6 +16,14 @@ BF16 GEMM
     mm_bf16
     bmm_bf16
 
+TF32 GEMM
+---------
+
+.. autosummary::
+    :toctree: ../generated
+
+    mm_tf32
+
 FP4 GEMM
 --------
 
@@ -84,6 +92,16 @@ MXFP8 GEMM
 
     mm_mxfp8
     bmm_mxfp8
+
+``mm_mxfp8`` carries a ``"specialized"`` backend: an agent-generated SM107
+small-M kernel that ``backend="auto"`` selects only on its measured (M, N, K)
+allowlist (``flashinfer/mm_mxfp8_specialized_sm107_workloads.json``). An
+explicitly selected backend is never silently swapped and never falls back;
+explicit ``backend="specialized"`` that cannot serve a call raises
+``NotImplementedError`` with the refusal reason.
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time) disables the
+kernel: ``"auto"`` keeps the stock path, explicit ``backend="specialized"``
+raises.
 
 MXFP8 x MXFP4 GEMM (MXFP4 weight, MXFP8 activation)
 ----------------------------------------------------
