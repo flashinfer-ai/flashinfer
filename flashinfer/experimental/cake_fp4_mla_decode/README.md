@@ -20,8 +20,8 @@ decode = prepare_fp4_mla_decode(
     backend="cake",
 )
 decode(
-    kv_cache, kv_scale_cache, q_fp4, q_scale, page_table, kv_lens,
-    q_global_scale, kv_global_scale, out, sm_scale=sm_scale,
+    kv_cache, kv_scale_cache, v_scale_cache, q_fp4, q_scale, page_table,
+    kv_lens, q_global_scale, kv_global_scale, out, sm_scale=sm_scale,
 )
 ```
 
@@ -38,12 +38,17 @@ host, so one runner serves every CUDA Graph replay of its bucket while
 
 The runner takes TensorRT-LLM's per-layer views as they are: `kv_cache`
 (`[pages, ...]`, 40,960 bytes per page), `kv_scale_cache` (`[pages, ...]`,
-5,120 bytes per page), the prequantized query `q_fp4` (`[rows, 320]`, rows
+5,120 bytes per page), `v_scale_cache` (the MLA V-scale pool, `[pages, ...]`,
+4,096 bytes per page: per latent dim, the K scale of the first token of each
+16-token block), the prequantized query `q_fp4` (`[rows, 320]`, rows
 `token * H + head`) and its swizzled scales `q_scale`, the int32 page table
 `[B, W]`, the int32 KV lengths (each including the step's query tokens; query
 token `t` of `q_len` sees `kv_len - (q_len - 1 - t)` keys) and the FP32
-global scales on the device. The V scales come from the K scales of the same
-tokens; the V-scale pool is not read.
+global scales on the device. The scale pools have no padding between pages
+(page strides of 5,120 and 4,096 bytes) and use the page ids of `kv_cache`.
+The decode loads the V scales from the V-scale pool. The split-KV reducer
+launches with programmatic dependent launch: its blocks start while the
+decode finishes and wait for the decode's results.
 
 Supported GPUs: SM100 (`sm_100a`) and SM103 (`sm_103a`).
 

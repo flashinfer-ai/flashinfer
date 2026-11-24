@@ -100,6 +100,11 @@ void Run(TensorView a_partial_O, TensorView a_partial_max, TensorView a_partial_
   config.blockDim = dim3(256, 1, 1);
   config.dynamicSmemBytes = 0;
   config.stream = stream;
+  cudaLaunchAttribute attrs[1] = {};
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attrs;
+  config.numAttrs = 1;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_fp4_mla_decode_384210a7aa131bb687ed), kernel_args),
             "cudaLaunchKernelExC");
 }

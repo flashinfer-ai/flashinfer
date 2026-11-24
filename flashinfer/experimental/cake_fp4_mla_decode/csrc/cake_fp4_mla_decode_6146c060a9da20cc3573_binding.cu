@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset);
+extern "C" __global__ void kernel_cake_fp4_mla_decode_6146c060a9da20cc3573(const __grid_constant__ CUtensorMap kv_k, const __grid_constant__ CUtensorMap kv_v, unsigned int* __restrict__ kv_sf, unsigned int* __restrict__ v_pool, unsigned int* __restrict__ q, unsigned int* __restrict__ q_sf, int* __restrict__ page_table, int* __restrict__ kv_lens, float* __restrict__ q_gs, float* __restrict__ kv_gs, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, float sm_scale, int num_heads, int q_len, int num_split, int page_stride, int page_offset, const __grid_constant__ CUtensorMap ksf_map, const __grid_constant__ CUtensorMap vsf_map);
 
 namespace cake_binding_kernel_cake_fp4_mla_decode_6146c060a9da20cc3573 {
 
@@ -60,6 +60,21 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   int64_t product = 1;
   for (int axis = 0; axis < t.ndim() - trailing; ++axis) product *= t.size(axis);
   return product;
+}
+
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CDiv(int64_t a, int64_t b) {
+  if (b == 0 || (a == INT64_MIN && b == -1)) NoInt64(a, "/", b);
+  return a / b;
+}
+
+int64_t CMod(int64_t a, int64_t b) {
+  if (b == 0) NoInt64(a, "%", b);
+  return b == -1 ? 0 : a % b;
 }
 
 cuuint64_t Extent(int64_t value, const char* descriptor) {
@@ -142,7 +157,69 @@ CUtensorMap EncodeTma_kv_v(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_kv_k, TensorView a_kv_v, TensorView a_kv_sf, TensorView a_q, TensorView a_q_sf, TensorView a_page_table, TensorView a_kv_lens, TensorView a_q_gs, TensorView a_kv_gs, TensorView a_out, TensorView a_partial_O, TensorView a_partial_max, TensorView a_partial_sum, double a_sm_scale, int64_t a_num_heads, int64_t a_q_len, int64_t a_num_split, int64_t a_page_stride, int64_t a_page_offset, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+CUtensorMap EncodeTma_ksf_map(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 1, ValueError)
+      << KERNEL_NAME << ": descriptor 'ksf_map' takes a source of at least 1 dims, got " << t.ndim();
+  CheckUnitInnerStride(t, "ksf_map");
+  int64_t d1 = t.size(-1);
+  TVM_FFI_CHECK((CMod(d1, 1280LL) == 0LL), ValueError)
+      << KERNEL_NAME << ": descriptor 'ksf_map' requires (CMod(d1, 1280) == 0)";
+  cuuint64_t global_dim[5] = {Extent(4LL, "ksf_map"), Extent(8LL, "ksf_map"), Extent(10LL, "ksf_map"), Extent(4LL, "ksf_map"), Extent(CDiv(d1, 1280LL), "ksf_map")};
+  cuuint64_t global_strides[4] = {Stride(16LL, "ksf_map"), Stride(512LL, "ksf_map"), Stride(128LL, "ksf_map"), Stride(5120LL, "ksf_map")};
+  cuuint32_t box_dim[5] = {4u, 8u, 10u, 4u, 1u};
+  cuuint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
+  const bool allow_oob_box[5] = {false, false, false, false, false};
+  for (int axis = 0; axis < 5; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'ksf_map' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
+  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0 && global_strides[3] % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the strides of descriptor 'ksf_map' must be multiples of 16 bytes";
+  void* address = DataPtr(t);
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the address of descriptor 'ksf_map' must be 16-byte aligned";
+  CUtensorMap map{};
+  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT32, 5, address, global_dim, global_strides,
+                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+          "cuTensorMapEncodeTiled of ksf_map");
+  return map;
+}
+
+CUtensorMap EncodeTma_vsf_map(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 1, ValueError)
+      << KERNEL_NAME << ": descriptor 'vsf_map' takes a source of at least 1 dims, got " << t.ndim();
+  CheckUnitInnerStride(t, "vsf_map");
+  int64_t d1 = t.size(-1);
+  TVM_FFI_CHECK((CMod(d1, 1024LL) == 0LL), ValueError)
+      << KERNEL_NAME << ": descriptor 'vsf_map' requires (CMod(d1, 1024) == 0)";
+  cuuint64_t global_dim[5] = {Extent(128LL, "vsf_map"), Extent(2LL, "vsf_map"), Extent(2LL, "vsf_map"), Extent(2LL, "vsf_map"), Extent(CDiv(d1, 1024LL), "vsf_map")};
+  cuuint64_t global_strides[4] = {Stride(1024LL, "vsf_map"), Stride(512LL, "vsf_map"), Stride(2048LL, "vsf_map"), Stride(4096LL, "vsf_map")};
+  cuuint32_t box_dim[5] = {128u, 2u, 2u, 2u, 1u};
+  cuuint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
+  const bool allow_oob_box[5] = {false, false, false, false, false};
+  for (int axis = 0; axis < 5; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'vsf_map' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
+  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0 && global_strides[3] % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the strides of descriptor 'vsf_map' must be multiples of 16 bytes";
+  void* address = DataPtr(t);
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the address of descriptor 'vsf_map' must be 16-byte aligned";
+  CUtensorMap map{};
+  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_UINT32, 5, address, global_dim, global_strides,
+                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+          "cuTensorMapEncodeTiled of vsf_map");
+  return map;
+}
+
+void Run(TensorView a_kv_k, TensorView a_kv_v, TensorView a_kv_sf, TensorView a_v_pool, TensorView a_q, TensorView a_q_sf, TensorView a_page_table, TensorView a_kv_lens, TensorView a_q_gs, TensorView a_kv_gs, TensorView a_out, TensorView a_partial_O, TensorView a_partial_max, TensorView a_partial_sum, double a_sm_scale, int64_t a_num_heads, int64_t a_q_len, int64_t a_num_split, int64_t a_page_stride, int64_t a_page_offset, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_kv_k.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_kv_k, "kv_k");
@@ -151,6 +228,8 @@ void Run(TensorView a_kv_k, TensorView a_kv_v, TensorView a_kv_sf, TensorView a_
   check_dtype(a_kv_v, DLDataType{kDLUInt, 8, 1}, "kv_v");
   check_cuda_tensor(a_kv_sf, "kv_sf");
   check_dtype(a_kv_sf, DLDataType{kDLUInt, 32, 1}, "kv_sf");
+  check_cuda_tensor(a_v_pool, "v_pool");
+  check_dtype(a_v_pool, DLDataType{kDLUInt, 32, 1}, "v_pool");
   check_cuda_tensor(a_q, "q");
   check_dtype(a_q, DLDataType{kDLUInt, 32, 1}, "q");
   check_cuda_tensor(a_q_sf, "q_sf");
@@ -189,6 +268,8 @@ void Run(TensorView a_kv_k, TensorView a_kv_v, TensorView a_kv_sf, TensorView a_
   check_same_device(a_kv_v, a_kv_k, "kv_v", "kv_k");
   check_contiguous(a_kv_sf, "kv_sf");
   check_same_device(a_kv_sf, a_kv_k, "kv_sf", "kv_k");
+  check_contiguous(a_v_pool, "v_pool");
+  check_same_device(a_v_pool, a_kv_k, "v_pool", "kv_k");
   check_contiguous(a_q, "q");
   check_same_device(a_q, a_kv_k, "q", "kv_k");
   check_contiguous(a_q_sf, "q_sf");
@@ -233,13 +314,14 @@ void Run(TensorView a_kv_k, TensorView a_kv_v, TensorView a_kv_sf, TensorView a_
     const uint64_t device_bit = dev.device_id < 64 ? uint64_t{1} << dev.device_id : uint64_t{0};
     if (device_bit == 0 || (prepared_devices & device_bit) == 0) {
       CheckCuda(cudaSetDevice(dev.device_id), "cudaSetDevice");
-      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_fp4_mla_decode_6146c060a9da20cc3573), cudaFuncAttributeMaxDynamicSharedMemorySize, 117760), "cudaFuncSetAttribute");
+      CheckCuda(cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_cake_fp4_mla_decode_6146c060a9da20cc3573), cudaFuncAttributeMaxDynamicSharedMemorySize, 165888), "cudaFuncSetAttribute");
       prepared_devices |= device_bit;
     }
   }
   CUtensorMap v_kv_k = EncodeTma_kv_k(a_kv_k);
   CUtensorMap v_kv_v = EncodeTma_kv_v(a_kv_v);
   void* v_kv_sf = DataPtr(a_kv_sf);
+  void* v_v_pool = DataPtr(a_v_pool);
   void* v_q = DataPtr(a_q);
   void* v_q_sf = DataPtr(a_q_sf);
   void* v_page_table = DataPtr(a_page_table);
@@ -256,11 +338,13 @@ void Run(TensorView a_kv_k, TensorView a_kv_v, TensorView a_kv_sf, TensorView a_
   int32_t v_num_split = static_cast<int32_t>(a_num_split);
   int32_t v_page_stride = static_cast<int32_t>(a_page_stride);
   int32_t v_page_offset = static_cast<int32_t>(a_page_offset);
-  void* kernel_args[] = {&v_kv_k, &v_kv_v, &v_kv_sf, &v_q, &v_q_sf, &v_page_table, &v_kv_lens, &v_q_gs, &v_kv_gs, &v_out, &v_partial_O, &v_partial_max, &v_partial_sum, &v_sm_scale, &v_num_heads, &v_q_len, &v_num_split, &v_page_stride, &v_page_offset};
+  CUtensorMap v_ksf_map = EncodeTma_ksf_map(a_kv_sf);
+  CUtensorMap v_vsf_map = EncodeTma_vsf_map(a_v_pool);
+  void* kernel_args[] = {&v_kv_k, &v_kv_v, &v_kv_sf, &v_v_pool, &v_q, &v_q_sf, &v_page_table, &v_kv_lens, &v_q_gs, &v_kv_gs, &v_out, &v_partial_O, &v_partial_max, &v_partial_sum, &v_sm_scale, &v_num_heads, &v_q_len, &v_num_split, &v_page_stride, &v_page_offset, &v_ksf_map, &v_vsf_map};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
-  config.blockDim = dim3(448, 1, 1);
-  config.dynamicSmemBytes = 117760;
+  config.blockDim = dim3(480, 1, 1);
+  config.dynamicSmemBytes = 165888;
   config.stream = stream;
   cudaLaunchAttribute attrs[2] = {};
   attrs[0].id = cudaLaunchAttributeClusterDimension;

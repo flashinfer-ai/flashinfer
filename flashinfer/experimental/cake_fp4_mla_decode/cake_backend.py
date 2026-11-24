@@ -48,6 +48,7 @@ PAGE_TOKENS = 128
 TOKEN_BYTES = 320  # 640 E2M1 channels: NoPE 512, RoPE base 64, RoPE residual 64
 KV_PAGE_BYTES = PAGE_TOKENS * TOKEN_BYTES  # 40,960
 SF_PAGE_BYTES = PAGE_TOKENS * 40  # 5,120: 40 E4M3 scales per token
+V_SCALE_PAGE_BYTES = 4096  # the V-scale pool: 512 latent dims x 8 blocks of 16 tokens
 Q_SF_BLOCK_BYTES = 128 * 40  # scales of 128 query rows
 MAX_HEADS = 128
 MAX_SPLITS = 16
@@ -247,6 +248,7 @@ class Fp4MlaDecodeRunner:
         self,
         kv_cache: torch.Tensor,
         kv_scale_cache: torch.Tensor,
+        v_scale_cache: torch.Tensor,
         q_fp4: torch.Tensor,
         q_scale: torch.Tensor,
         page_table: torch.Tensor,
@@ -263,7 +265,11 @@ class Fp4MlaDecodeRunner:
         contiguous bytes per page (TensorRT-LLM's per-layer view; any page
         stride that is a multiple of 16 bytes).  ``kv_scale_cache``: the
         layer's K scales, E4M3 ``[pages, ...]`` of 5,120 contiguous bytes per
-        page at a page stride of 5,120 bytes.  ``q_fp4``: uint8
+        page at a page stride of 5,120 bytes.  ``v_scale_cache``: the layer's
+        V scales (TensorRT-LLM's MLA V-scale pool: per latent dim, the K scale
+        of the first token of each 16-token block), E4M3 ``[pages,
+        ...]`` of 4,096 contiguous bytes per page at a page stride of 4,096
+        bytes, with the page ids of ``kv_cache``.  ``q_fp4``: uint8
         ``[rows_cap, 320]`` contiguous, rows ``(b q_len + t) H + h``;
         ``q_scale``: its swizzled E4M3 scales, contiguous, at least
         ``ceil(rows / 128) * 5120`` bytes.  ``page_table``: int32 ``[B, W]``
@@ -285,10 +291,21 @@ class Fp4MlaDecodeRunner:
             raise ValueError(
                 f"kv_scale_cache: page stride {sf_page_stride} B, expected {SF_PAGE_BYTES}"
             )
+        vsf, vsf_page_stride = _page_view(
+            v_scale_cache, V_SCALE_PAGE_BYTES, "v_scale_cache"
+        )
+        if vsf_page_stride != V_SCALE_PAGE_BYTES:
+            raise ValueError(
+                f"v_scale_cache: page stride {vsf_page_stride} B, expected {V_SCALE_PAGE_BYTES}"
+            )
         pages = kv.shape[0]
         if sf.shape[0] < pages:
             raise ValueError(
                 f"kv_scale_cache holds {sf.shape[0]} pages, fewer than kv_cache's {pages}"
+            )
+        if vsf.shape[0] < pages:
+            raise ValueError(
+                f"v_scale_cache holds {vsf.shape[0]} pages, fewer than kv_cache's {pages}"
             )
         if q_fp4.dtype not in _U8 or q_fp4.dim() != 2 or q_fp4.shape[1] != TOKEN_BYTES:
             raise ValueError(
@@ -334,6 +351,7 @@ class Fp4MlaDecodeRunner:
         tensors = (
             kv,
             sf,
+            vsf,
             q_fp4,
             q_scale,
             page_table,
@@ -352,6 +370,7 @@ class Fp4MlaDecodeRunner:
             "kv_k": kv_pages,
             "kv_v": kv_pages,
             "kv_sf": sf.reshape(-1).view(torch.int32).view(torch.uint32),
+            "v_pool": vsf.reshape(-1).view(torch.int32).view(torch.uint32),
             "q": q_fp4.view(torch.uint8)[: p.rows].view(torch.int32).view(torch.uint32),
             "q_sf": q_scale.view(torch.uint8)
             .reshape(-1)[:need]
