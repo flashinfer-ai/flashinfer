@@ -841,6 +841,22 @@ def sm90_nvfp4_w4a16_moe(
     large-batch call, is a fixed sequence of launches whose buffers are taken
     from the PyTorch allocator, so it can be captured in a CUDA graph once the
     workspace exists.
+
+    Memory: besides the workspace, every large-batch call allocates the
+    per-route down rows ``[8, num_tokens, hidden]`` BF16 (``16 * num_tokens *
+    hidden`` bytes, about 1 GiB at 16384 tokens and hidden 4096) and small
+    routing buffers. They are sized by the whole call, not by
+    ``prefill_chunk_tokens``; split very large batches to bound them.
+
+    Reproducibility: each kernel is deterministic (the same inputs give the
+    same bits), but outputs are not batch-invariant. The two kernels round the
+    down projection differently (the large-batch kernel stores every route's
+    down row in BF16 before the top-k sum, the small-batch kernel keeps the
+    rows of K-split tiles in FP32), so the switch at ``prefill_min_tokens``
+    changes the result bits, and which tiles the small-batch kernel splits
+    also depends on the batch. A token's output can therefore differ in the
+    last bits between batches of different sizes or composition; pass a fixed
+    ``prefill_min_tokens`` to at least keep one kernel.
     """
     H, I, E = hidden_states.shape[1], w13.shape[2] * 128, w13.shape[0]
     M = hidden_states.shape[0]
