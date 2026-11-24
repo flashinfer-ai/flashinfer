@@ -3610,8 +3610,9 @@ def _fp4_pair(quant: Optional["QuantConfig"]) -> Tuple[QuantFormat, QuantFormat]
 @dataclass(frozen=True)
 class BatchInvariantFp4Config:
     """The batch-invariant fp4 MoE backend of the unified layer: one backend for the 4-bit-weight quantization pairs, grouped
-    as :class:`TrtllmFp4Config` groups them, ``QuantConfig(weight=..., activation=...)`` selecting the pair (``quant=None``
-    in ``prepare_weights`` / ``prepare_activations`` is NVFP4 x NVFP4). The pairs served, on SM100 / SM103 / SM107, one class
+    as :class:`TrtllmFp4Config` groups them, ``QuantConfig(weight=..., activation=...)`` selecting the pair: ``quant``
+    defaults to the NVFP4 x NVFP4 pair in ``prepare_weights`` / ``prepare_activations`` (``quant=None``), and the MXFP4 x
+    MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP4)``). The pairs served, on SM100 / SM103 / SM107, one class
     per typed activation and parameter set as the bf16 backend, documented in ``flashinfer/batch_invariant/README.md``:
     NVFP4 x NVFP4, the W4A4 classes ``moe.nvfp4.<act>`` (NVFP4 experts with one per-tensor global scale per expert and GEMM,
     per-token NVFP4 activations), and MXFP4 x MXFP4, the classes ``moe.mxfp4.<act>`` (MXFP4 experts and MXFP4 activations,
@@ -3697,8 +3698,10 @@ class BatchInvariantFp4Config:
         intermediate: str = "per_token",
         intermediate_scales: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """The backend's weight view for the pair ``quant`` selects (``None``: NVFP4 x NVFP4), to register under
-        ``BatchInvariantFp4Runner.backend_key``; the activation's chain is part of the view (``activation`` defaults to
+        """The backend's weight view for the pair ``quant`` selects, to register under
+        ``BatchInvariantFp4Runner.backend_key``: ``quant`` defaults to the NVFP4 x NVFP4 pair (``None``), and the MXFP4 x
+        MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP4)``; a pack prepared
+        for one pair is refused by a layer configured for the other); the activation's chain is part of the view (``activation`` defaults to
         ``SwiGLU()``). NVFP4 x NVFP4: every expert quantized to NVFP4 with its own per-tensor global scale (the gate / up
         rows interleaved first for a gated activation), the 128x4 swizzled block scales and the alphas
         (``1 / global scale``); ``intermediate`` / ``intermediate_scales`` select the static-intermediate class and its
@@ -3755,8 +3758,10 @@ class BatchInvariantFp4Config:
     def prepare_activations(
         hidden_states: torch.Tensor, *, quant: Optional["QuantConfig"] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """The activation pack of the pair ``quant`` selects (``None``: NVFP4 x NVFP4), the pair's own form
-        (:meth:`~flashinfer.fused_moe.batch_invariant.api_fp4.Fp4Pair.prepare_activations`). Both served pairs: bf16
+        """The activation pack of the pair ``quant`` selects, the pair's own form
+        (:meth:`~flashinfer.fused_moe.batch_invariant.api_fp4.Fp4Pair.prepare_activations`): ``quant`` defaults to the
+        NVFP4 x NVFP4 pair (``None``), and the MXFP4 x MXFP4 pair must be named (``QuantConfig(weight=QuantFormat.MXFP4,
+        activation=QuantFormat.MXFP4)``). Both served pairs: bf16
         activations as given (no scale): the class's quantization (per token for NVFP4, per 32-element block for MXFP4) is
         part of the op."""
         from .batch_invariant.runner_fp4 import PAIRS
