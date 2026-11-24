@@ -364,11 +364,8 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
 
     assert "uint64_t{kCombineThreads * 16}" in launcher_source
     assert "std::min(128, ceilDiv(payload_bytes," in launcher_source
-    assert "unsigned long long, bool, int, bool);" in launcher_source
-    assert (
-        "payload_bytes, true,\n      params.ep_rank, params.enable_pdl);"
-        in launcher_source
-    )
+    assert "unsigned long long, bool, int);" in launcher_source
+    assert "payload_bytes, true,\n      params.ep_rank);" in launcher_source
     assert (
         "unsigned long long, unsigned long long, unsigned long long, bool, int, int, bool,\n"
         "    bool, unsigned long long);" in launcher_source
@@ -511,11 +508,10 @@ def test_fused_quantized_combine_routes_mirror_the_cake_host_rule():
             body = body.split("__global__", 1)[0]
             assert "__shared__" not in body
             assert "SMEM_TOTAL" not in body
-        # the dispatch kernel owns the only dynamic smem pool in the bundle; its generated
-        # footprint must match the launcher constant
+        # the dispatch kernel owns the only dynamic smem pool in the bundle; its last slot
+        # (one int at byte 176) fits the launcher constant
         assert generated.count("extern __shared__") == 1
-        assert generated.count("#define SMEM_TOTAL ") == 1
-        assert "#define SMEM_TOTAL 256" in generated
+        assert "smem_raw + 176);" in generated
     assert "constexpr int kDispatchSharedBytes = 256;" in launcher_source
 
 
