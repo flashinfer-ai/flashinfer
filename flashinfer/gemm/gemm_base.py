@@ -3037,6 +3037,25 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
                 return (cap,)
             return (cap, str(inputs[4].dtype))
 
+        def validate_tactic(self, inputs: List[torch.Tensor], tactic: Any) -> bool:
+            """Whether a tactic loaded from the autotuner cache can run here.
+
+            A cache entry can match the key and still carry an id this device
+            or implementation does not have (an SM107-only tile on SM100, a
+            table that changed between FlashInfer versions); it would reach
+            forward() and raise. The ids are the ones get_valid_tactics() offers
+            for the implementation forward() will pick, so nothing is compiled
+            or launched on the cute_ext path. Explicit
+            ``mm_bf16(backend="tgv", tactic=...)`` calls do not come here and
+            still raise ValueError for an unknown id.
+            """
+            if isinstance(tactic, bool) or not isinstance(tactic, int):
+                return False
+            if tactic == -1:
+                return True
+            no_profile = OptimizationProfile(shapes=[], tensor_initializers=[])
+            return tactic in self.get_valid_tactics(inputs, no_profile)
+
         def forward(
             self,
             inputs: List[torch.Tensor],

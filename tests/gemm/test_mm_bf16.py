@@ -314,6 +314,110 @@ def test_mm_bf16_tgv_tactic_rejects():
         mm_bf16(a, b, out_dtype=torch.float16, backend="tgv")
 
 
+def test_tgv_runner_validates_cached_tactics(monkeypatch):
+    """validate_tactic accepts exactly the ids get_valid_tactics offers on the arch."""
+    _skip_unless_runnable("tgv")
+    from flashinfer.gemm.gemm_base import _tgv_gemm_runner
+    from flashinfer.gemm.kernels import tgv_gemm_cute_ext
+
+    runner = _tgv_gemm_runner(torch.bfloat16, True)
+    a = torch.randn(8, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(256, 1024, device="cuda", dtype=torch.bfloat16).T
+    out = torch.empty(8, 256, device="cuda", dtype=torch.bfloat16)
+    inputs = [a, b, None, False, out]
+    first_sm107 = tgv_gemm_cute_ext._TGV_CUTE_EXT_FIRST_SM107_TACTIC
+    num_tactics = tgv_gemm_cute_ext.get_tgv_cute_ext_tactic_num()
+    assert first_sm107 < num_tactics
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
+    assert runner.validate_tactic(inputs, -1)
+    assert runner.validate_tactic(inputs, 0)
+    assert runner.validate_tactic(inputs, first_sm107 - 1)
+    assert not runner.validate_tactic(inputs, first_sm107)  # SM107 only
+    assert not runner.validate_tactic(inputs, num_tactics)
+    assert not runner.validate_tactic(inputs, [0, 1])
+    assert not runner.validate_tactic(inputs, True)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
+    assert runner.validate_tactic(inputs, first_sm107)
+    assert runner.validate_tactic(inputs, num_tactics - 1)
+    assert not runner.validate_tactic(inputs, num_tactics)
+
+
+def test_mm_bf16_tgv_cached_tactic_is_revalidated(monkeypatch, tmp_path):
+    """A cache entry whose key matches but whose TGV tactic does not exist on
+    this GPU is a cache miss (fallback tactic), not a ValueError at run time."""
+    _skip_unless_runnable("tgv")
+    import json
+    from unittest.mock import patch
+
+    from flashinfer.autotuner import autotuner as autotuner_module
+    from flashinfer.gemm.kernels import tgv_gemm_cute_ext
+
+    torch.manual_seed(0)
+    a = torch.randn(16, 1024, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(256, 1024, device="cuda", dtype=torch.bfloat16)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+
+    # The cache key of this call, as the autotuner builds it.
+    seen: dict = {}
+    choose_one = AutoTuner.choose_one
+
+    def spy(self, custom_op, runners, tuning_config, inputs, **kwargs):
+        seen.update(op=custom_op, runner=runners[0], config=tuning_config)
+        seen["inputs"] = inputs
+        return choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "choose_one", spy)
+    with autotune(False):
+        mm_bf16(a, w.T, None, True, backend="tgv")
+    runner, inputs = seen["runner"], seen["inputs"]
+    assert type(runner).__name__ == "TGVRunner"
+    key = AutoTuner._get_cache_key(
+        seen["op"],
+        runner,
+        tuner._get_input_sizes(inputs),
+        seen["config"],
+        runner.get_cache_key_extras(inputs),
+    ).file_key
+
+    run = tgv_gemm_cute_ext.run_tgv_cute_ext
+    ran: list = []
+
+    def record(*args):
+        ran.append(args[-1])
+        return run(*args)
+
+    monkeypatch.setattr(tgv_gemm_cute_ext, "run_tgv_cute_ext", record)
+
+    def run_with_cached_tactic(tactic):
+        path = tmp_path / f"tactic_{tactic}.json"
+        path.write_text(json.dumps({key: ["TGVRunner", tactic]}))
+        tuner.clear_cache()
+        tuner._logged_invalid_tactic.clear()
+        ran.clear()
+        with (
+            patch.object(autotuner_module.logger, "warning") as warn,
+            autotune(False, cache=str(path)),
+        ):
+            mm_bf16(a, w.T, None, True, backend="tgv")
+        warnings = [str(c.args[0]) for c in warn.call_args_list]
+        return ran[:], any("failed revalidation" in m for m in warnings)
+
+    valid = tgv_gemm_cute_ext.get_tgv_cute_ext_valid_tactics(a.device)
+    default = tgv_gemm_cute_ext.get_tgv_cute_ext_default_tactic()
+    hit = next(t for t in valid if t != default)
+    assert run_with_cached_tactic(hit) == ([hit], False)
+
+    num_tactics = tgv_gemm_cute_ext.get_tgv_cute_ext_tactic_num()
+    assert run_with_cached_tactic(num_tactics) == ([default], True)
+    first_sm107 = tgv_gemm_cute_ext._TGV_CUTE_EXT_FIRST_SM107_TACTIC
+    if first_sm107 not in valid:  # SM107-only id on another arch
+        assert run_with_cached_tactic(first_sm107) == ([default], True)
+    tuner.clear_cache()
+
+
 def test_tgv_cute_ext_kernel_name():
     """Profiles name the TGV kernel after its config, through ``__repr__``."""
     _skip_unless_runnable("tgv")
