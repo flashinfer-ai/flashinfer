@@ -19,7 +19,7 @@ from flashinfer.comm.ulysses_topology import (
     UlyssesRankTopology,
     _parse_pcie_gid_indices_override,
     _probe_pcie_route,
-    _probe_rocev2_ipv4_gid,
+    _probe_rocev2_gid,
     decide_ulysses_backend,
     probe_ulysses_rank_topology,
     resolve_ulysses_backend,
@@ -102,7 +102,8 @@ def test_gid_indices_override_accepts_per_rank_counts(monkeypatch, value):
 
 
 def test_gid_probe_selects_lowest_usable_entry(tmp_path):
-    _write_gid_entry(tmp_path, "mlx5_0", 0, gid="2001:db8::1")  # not IPv4-mapped
+    # a routable IPv6 entry below the IPv4 ones: IPv4 is still preferred
+    _write_gid_entry(tmp_path, "mlx5_0", 0, gid="2001:db8::1")
     _write_gid_entry(tmp_path, "mlx5_0", 1, gid_type="IB/RoCE v1")
     _write_gid_entry(tmp_path, "mlx5_0", 5, gid="::ffff:0.0.0.0")  # unspecified
     _write_gid_entry(
@@ -110,23 +111,71 @@ def test_gid_probe_selects_lowest_usable_entry(tmp_path):
     )
     _write_gid_entry(tmp_path, "mlx5_0", 10, gid="::ffff:10.0.0.10")
 
-    assert _probe_rocev2_ipv4_gid("mlx5_0", sysfs_root=tmp_path) == 3
+    assert _probe_rocev2_gid("mlx5_0", sysfs_root=tmp_path) == (3, "ipv4")
 
 
-def test_gid_probe_raises_when_no_entry_is_usable(tmp_path):
-    _write_gid_entry(tmp_path, "mlx5_0", 0, gid="2001:db8::1")
-    _write_gid_entry(tmp_path, "mlx5_0", 1, gid_type="IB/RoCE v1")
+def _write_ipv6_only_gid_table(sysfs_root, nic_name="mlx5_0"):
+    # The layout an IPv6-only RoCE NIC reports: MAC-derived link-local default
+    # GIDs at 0/1 and a unique-local address at 2/3, each as RoCE v1 then v2.
+    link_local = "fe80:0000:0000:0000:b65c:b5ff:fe1e:4932"
+    unique_local = "fdbb:dc61:0001:0000:0000:0000:0000:0014"
+    _write_gid_entry(sysfs_root, nic_name, 0, gid=link_local, gid_type="IB/RoCE v1")
+    _write_gid_entry(sysfs_root, nic_name, 1, gid=link_local)
+    _write_gid_entry(sysfs_root, nic_name, 2, gid=unique_local, gid_type="IB/RoCE v1")
+    _write_gid_entry(sysfs_root, nic_name, 3, gid=unique_local)
 
-    with pytest.raises(RuntimeError, match="no usable IPv4 RoCE v2 GID"):
-        _probe_rocev2_ipv4_gid("mlx5_0", sysfs_root=tmp_path)
+
+def test_gid_probe_selects_routable_ipv6_on_ipv6_only_nic(tmp_path):
+    _write_ipv6_only_gid_table(tmp_path)
+
+    assert _probe_rocev2_gid("mlx5_0", sysfs_root=tmp_path) == (3, "ipv6")
+
+
+def test_gid_probe_prefers_ipv4_on_dual_stack_nic(tmp_path):
+    _write_ipv6_only_gid_table(tmp_path)
+    _write_gid_entry(tmp_path, "mlx5_0", 5, gid="::ffff:10.0.0.5")
+
+    assert _probe_rocev2_gid("mlx5_0", sysfs_root=tmp_path) == (5, "ipv4")
+
+
+def test_gid_probe_override_can_select_ipv6_on_dual_stack_nic(tmp_path):
+    _write_ipv6_only_gid_table(tmp_path)
+    _write_gid_entry(tmp_path, "mlx5_0", 5, gid="::ffff:10.0.0.5")
+
+    assert _probe_rocev2_gid("mlx5_0", requested_index=3, sysfs_root=tmp_path) == (
+        3,
+        "ipv6",
+    )
+
+
+@pytest.mark.parametrize(
+    "gid",
+    [
+        "fe80::1",  # link-local, lower edge of fe80::/10
+        "febf::1",  # link-local, upper edge of fe80::/10
+        "::",  # unspecified (an empty GID table slot)
+        "::1",  # loopback
+        "ff02::1",  # multicast
+        "::ffff:0.0.0.0",  # unspecified IPv4-mapped
+    ],
+)
+def test_gid_probe_raises_when_no_entry_is_usable(tmp_path, gid):
+    _write_gid_entry(tmp_path, "mlx5_0", 0, gid=gid)
+    _write_gid_entry(
+        tmp_path, "mlx5_0", 1, gid="::ffff:10.0.0.1", gid_type="IB/RoCE v1"
+    )
+
+    with pytest.raises(RuntimeError, match="no usable RoCE v2 GID"):
+        _probe_rocev2_gid("mlx5_0", sysfs_root=tmp_path)
 
 
 def test_gid_probe_override_selects_one_of_multiple_candidates(tmp_path):
     _write_gid_entry(tmp_path, "mlx5_0", 2, gid="::ffff:10.0.0.2")
     _write_gid_entry(tmp_path, "mlx5_0", 10, gid="::ffff:10.0.0.10")
 
-    assert (
-        _probe_rocev2_ipv4_gid("mlx5_0", requested_index=10, sysfs_root=tmp_path) == 10
+    assert _probe_rocev2_gid("mlx5_0", requested_index=10, sysfs_root=tmp_path) == (
+        10,
+        "ipv4",
     )
 
 
@@ -136,9 +185,16 @@ def test_gid_probe_override_cannot_force_invalid_entry(tmp_path, requested_index
     _write_gid_entry(tmp_path, "mlx5_0", 1, gid_type="IB/RoCE v1")
 
     with pytest.raises(RuntimeError, match=f"selects index {requested_index}"):
-        _probe_rocev2_ipv4_gid(
+        _probe_rocev2_gid(
             "mlx5_0", requested_index=requested_index, sysfs_root=tmp_path
         )
+
+
+def test_gid_probe_override_cannot_force_link_local_ipv6(tmp_path):
+    _write_ipv6_only_gid_table(tmp_path)
+
+    with pytest.raises(RuntimeError, match=r"selects index 1 .*usable: \[3\]"):
+        _probe_rocev2_gid("mlx5_0", requested_index=1, sysfs_root=tmp_path)
 
 
 # ---- PCIe NIC routing (FLASHINFER_ULYSSES_PCIE_NICS) ------------------------
@@ -424,6 +480,37 @@ def test_explicit_pcie_falls_back_when_gid_probe_fails():
     assert decision.pcie_plan.transport == "p2p"
     assert decision.pcie_plan.gid_indices == ()
     assert "RoCE GID probe failed on rank 3" in decision.reason
+
+
+def test_explicit_pcie_plans_rdma_over_ipv6_gids():
+    topos = _pcie_mesh()
+    for topo in topos:
+        topo.gid_family = "ipv6"
+
+    decision = decide_ulysses_backend("pcie", topos)
+
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "rdma"
+    assert decision.pcie_plan.gid_indices == tuple(t.gid_index for t in topos)
+
+
+@pytest.mark.parametrize("route", ["rdma", "hybrid"])
+def test_explicit_pcie_falls_back_on_mixed_gid_families(route):
+    # Each rank prefers IPv4 independently, so a group mixing dual-stack and
+    # IPv6-only NICs selects both families; no QP can join them.
+    topos = _pcie_mesh()
+    for topo in topos:
+        topo.route = route
+        topo.gid_family = "ipv4"
+    topos[5].gid_family = "ipv6"
+
+    decision = decide_ulysses_backend("pcie", topos)
+
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert decision.pcie_plan.gid_indices == ()
+    assert "different address families" in decision.reason
+    assert "FLASHINFER_ULYSSES_PCIE_GID_INDICES" in decision.reason
 
 
 def test_explicit_pcie_falls_back_on_inconsistent_gid_overrides():

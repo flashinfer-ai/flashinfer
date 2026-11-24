@@ -14,7 +14,7 @@ Why copy engines rather than SM stores: the fused-transpose kernel behind `backe
 |---|---|
 | Hosts / ranks | One host; world size 1, 2, 4, or 8 |
 | Routes | ws 1: identity (no JIT, no transport); ws 2: all-pairs CUDA P2P; ws 4/8: all-RDMA preferred, all-P2P fallback; `FLASHINFER_ULYSSES_PCIE_ROUTE` forces p2p or rdma at ws 2/4/8, or the 4+4 NUMA hybrid at ws 8; full-group CUDA P2P required on every route |
-| RDMA route requirements | One mlx5 device per rank with DEVX, RC QP, UMR, an active IPv4 RoCE v2 GID, GPUDirect RDMA; batch size 1, and head-row pitch `H * D * element_size <= 65,535` bytes for the two head-axis transforms (`exchange_chunks` registers no MKey, so no stride bounds it); hybrid additionally needs the 4+4 NUMA split |
+| RDMA route requirements | One mlx5 device per rank with DEVX, RC QP, UMR, an active routable RoCE v2 GID (IPv4-mapped, or IPv6 outside `fe80::/10`; one address family across the group), GPUDirect RDMA; batch size 1, and head-row pitch `H * D * element_size <= 65,535` bytes for the two head-axis transforms (`exchange_chunks` registers no MKey, so no stride bounds it); hybrid additionally needs the 4+4 NUMA split |
 | Build requirements | rdma-core >= 36 (libibverbs and libmlx5 headers/libraries) and the CUDA driver library, on every route including all-P2P |
 | Transforms | `scatter_heads` / `gather_heads` interleave the head axis; `exchange_chunks` takes `[1, 1, world_size, chunk]` to the same shape (`all_to_all_single` over an already-packed payload) and interleaves nothing |
 | Input | Contiguous 4-D CUDA tensor with a 1-, 2- or 4-byte element type (FP16/BF16/FP32, FP8, INT8/UINT8); any batch size on the all-P2P route |
@@ -26,7 +26,7 @@ Full-group CUDA P2P is required even on the RDMA routes because every exchange's
 
 All routes share one translation unit, so the JIT compile/link needs the libibverbs and libmlx5 headers/libraries and the CUDA driver library (`-lcuda`) even when topology selects all-P2P; runtime verbs requirements apply only to the RDMA routes. The transport calls `ibv_query_gid_ex` (rdma-core 35.0), `ibv_reg_dmabuf_mr` and the interleaved-MKey `mlx5dv_wr_mkey_configure` / `mlx5dv_wr_set_mkey_layout_interleaved` family (rdma-core 33.0), so build against rdma-core >= 36; the reference node runs 39.0. `missing_ulysses_pcie_dependencies()` checks for the shared libraries and required headers; an older rdma-core can still surface as a JIT compile or link failure naming the missing symbol.
 
-Topology probing selects one GID index per rank and native initialization revalidates it (port active, RoCE v2, IPv4-mapped) before creating QPs. A forced backend raises collectively when no route is available.
+Topology probing selects one GID index per rank and native initialization revalidates it (port active, RoCE v2, routable address) before creating QPs. A routable address is a non-zero IPv4-mapped GID or an IPv6 GID other than unspecified, loopback, multicast and link-local: every RoCE port carries a MAC-derived `fe80::/10` default GID even with no IP configured, and it does not cross an L3 hop such as the spine between rails. Unique-local (`fc00::/7`) GIDs are accepted. Each rank prefers its lowest IPv4-mapped entry, so a dual-stack NIC keeps the IPv4 choice, and falls back to its lowest routable IPv6 entry on an IPv6-only NIC. One RoCE v2 header carries both GIDs, so the planner refuses the RDMA routes when ranks end up with different address families, and the connection step re-checks every peer's published GID. A forced backend raises collectively when no route is available.
 
 ## Device and lifecycle
 
@@ -89,7 +89,7 @@ The all-P2P route replays correctly because the barrier advances its epoch in de
 
 - `FLASHINFER_ULYSSES_PCIE_ROUTE`: `auto` (default: world sizes 4 and 8 prefer all-RDMA — from 4 ranks up, all-P2P crosses host bridges and measured well below the RDMA route on the reference node, while 2 ranks share a PCIe switch and P2P wins), `p2p` (force all-P2P), `rdma` (force all-RDMA at any multi-rank world size), or `hybrid` (force the eight-rank 4+4 NUMA hybrid). A forced RDMA route falls back to all-P2P with a `RuntimeWarning` when its requirements are not met.
 - `FLASHINFER_ULYSSES_PCIE_NICS`: comma-separated mlx5 device names, one per rank in rank order; overrides automatic PCI-distance NIC routing.
-- `FLASHINFER_ULYSSES_PCIE_GID_INDICES`: comma-separated GID table indices, one per rank in rank order; chooses among usable IPv4 RoCE v2 entries when a NIC has several.
+- `FLASHINFER_ULYSSES_PCIE_GID_INDICES`: comma-separated GID table indices, one per rank in rank order; chooses among usable RoCE v2 entries (IPv4-mapped or routable IPv6) when a NIC has several, for example to pin every rank to IPv6 on a group that mixes dual-stack and IPv6-only NICs.
 
 Every rank must set them identically.
 
