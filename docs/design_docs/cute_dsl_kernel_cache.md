@@ -27,14 +27,14 @@ build_and_load()                     JitSpec ABC — shared policy, written once
   try_load() ────── hit ────────────►  return cached kernel        (fast path)
       │ miss
       ▼
+  FLASHINFER_DISABLE_JIT set? ─ yes ►  raise MissingJITCacheError
+      │ no
+      ▼
   FileLock(lock_path)                cross-process lock
       │
       ▼
   try_load() ────── hit ────────────►  return   (another process just built it)
       │ miss
-      ▼
-  FLASHINFER_DISABLE_JIT set? ─ yes ►  raise MissingJITCacheError
-      │ no
       ▼
   build()                            backend-specific compile:
       │                                nvcc: write_ninja + ninja  (host toolchain)

@@ -605,8 +605,8 @@ def test_same_kernel_lock_is_held_until_publication(cute_dsl_cache, monkeypatch)
         builds.append(1)
         return _ExportedKernel(b"kernel")
 
-    def spec():
-        return cache.JitSpecCuteDsl("shared", "same", compile_kernel, "source")
+    def spec(kernel_name="same"):
+        return cache.JitSpecCuteDsl("shared", kernel_name, compile_kernel, "source")
 
     first_spec = spec()
     export = first_spec._export_object
@@ -645,11 +645,15 @@ def test_same_kernel_lock_is_held_until_publication(cute_dsl_cache, monkeypatch)
     spec().compile_and_persist()
     assert len(builds) == 2  # Explicit unconditional rebuild.
 
-    # A hot immutable cache needs no writable lock directory.
+    # A read-only deployment can load a cached sibling after a miss.
     monkeypatch.setattr(
-        cache, "get_tmpdir", lambda: pytest.fail("read-only cache hit requested a lock")
+        cache, "get_tmpdir", lambda: pytest.fail("read-only cache requested a lock")
     )
     monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+    missing = spec("missing")
+    with pytest.raises(cache.MissingJITCacheError) as exc:
+        missing.build_and_load()
+    assert exc.value.spec is missing
     assert spec().is_compiled and spec().build_and_load() == b"kernel"
 
 

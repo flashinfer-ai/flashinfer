@@ -375,20 +375,20 @@ class JitSpec(abc.ABC):
         if cached is not None:
             return cached
 
+        if os.environ.get("FLASHINFER_DISABLE_JIT"):
+            raise MissingJITCacheError(
+                "JIT compilation is disabled via FLASHINFER_DISABLE_JIT "
+                "environment variable, but the required module is not "
+                "found in the JIT cache. Please add the missing module "
+                "to the JIT cache build configuration.",
+                spec=self,
+            )
+
         with FileLock(self.lock_path, thread_local=False):
             # Another process may have built the artifact while we waited.
             cached = self.try_load()
             if cached is not None:
                 return cached
-
-            if os.environ.get("FLASHINFER_DISABLE_JIT"):
-                raise MissingJITCacheError(
-                    "JIT compilation is disabled via FLASHINFER_DISABLE_JIT "
-                    "environment variable, but the required module is not "
-                    "found in the JIT cache. Please add the missing module "
-                    "to the JIT cache build configuration.",
-                    spec=self,
-                )
 
             self._timed_build()
             return self.load()
