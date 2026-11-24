@@ -5663,6 +5663,31 @@ def xqa_batch_decode_with_kv_cache(
         out = torch.empty_like(out_shape_ref)
     out_new = out if q_cu_seq_lens is not None else out.unsqueeze(1)
 
+    # On SM120 partitions, long FP8 KV reads benefit from splitting each
+    # (request, KV head) tile across CTAs even when the first wave is full.
+    cta_budget = sm_count
+    if (
+        q_len_per_req == 1
+        and 32768 <= max_seq_len <= 65536
+        and window_left == -1
+        and kv_layout == "HND"
+        and page_size == 16
+        and num_kv_heads == 8
+        and query.shape == (32, 64, 64)
+        and query.dtype == out.dtype == torch.bfloat16
+        and k_cache.dtype == torch.float8_e4m3fn
+        and get_compute_capability(query.device) == (12, 0)
+    ):
+        from .cake_fmha import _smallm_launch_sm_count
+
+        split_ctas = 5 * query.shape[0] * num_kv_heads
+        # Each split stores BF16 partials for eight 64-element heads and two
+        # padded FP32 reduction rows. Reserve 2 KiB per CTA including alignment.
+        if scratch.numel() >= split_ctas * 2048:
+            launch_sms = _smallm_launch_sm_count(query.device, sm_count)
+            if launch_sms in (72, 80) and launch_sms < sm_count:
+                cta_budget = split_ctas
+
     xqa(
         query_new,
         k_cache,
@@ -5681,7 +5706,7 @@ def xqa_batch_decode_with_kv_cache(
         kv_scale=kv_scale_value,
         sliding_win_size=window_left + 1 if window_left >= 0 else 0,
         kv_layout=kv_layout,
-        sm_count=sm_count,
+        sm_count=cta_budget,
         enable_pdl=enable_pdl,
         rcp_out_scale=1.0 / o_scale,
         q_seq_len=q_len_per_req,
