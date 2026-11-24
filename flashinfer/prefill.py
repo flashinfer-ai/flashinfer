@@ -3589,7 +3589,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._cudnn_prepared = None
         self._cudnn_prepared_cache.clear()
         self._int_workspace_buffer = int_workspace_buffer
-        for ev in self._pin_memory_copy_events:
+        # Wait for in-flight copies from the old pinned buffers. A wrapper made
+        # without __init__ has no events yet.
+        for ev in getattr(self, "_pin_memory_copy_events", ()):
             if not ev.query():
                 ev.synchronize()
         self._pin_memory_int_workspace_buffers = [
@@ -3601,10 +3603,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             for _ in range(2)
         ]
-        with torch.cuda.device(self.device):
-            self._pin_memory_copy_events = [
-                torch.cuda.Event(enable_timing=False) for _ in range(2)
-            ]
+        # The events from __init__ stay valid: the device does not change here.
         self._pin_buffer_idx = 0
         self._pin_memory_int_workspace_buffer = self._pin_memory_int_workspace_buffers[
             0
@@ -6379,7 +6378,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._cudnn_prepared = None
         self._cudnn_prepared_cache.clear()
         self._int_workspace_buffer = int_workspace_buffer
-        for ev in self._pin_memory_copy_events:
+        # Wait for in-flight copies from the old pinned buffers. A wrapper made
+        # without __init__ has no events yet.
+        for ev in getattr(self, "_pin_memory_copy_events", ()):
             if not ev.query():
                 ev.synchronize()
         self._pin_memory_int_workspace_buffers = [
@@ -6391,10 +6392,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             for _ in range(2)
         ]
-        with torch.cuda.device(self.device):
-            self._pin_memory_copy_events = [
-                torch.cuda.Event(enable_timing=False) for _ in range(2)
-            ]
+        # The events from __init__ stay valid: the device does not change here.
         self._pin_buffer_idx = 0
         self._pin_memory_int_workspace_buffer = self._pin_memory_int_workspace_buffers[
             0
