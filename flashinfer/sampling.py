@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from typing import Optional, Tuple, Union
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
 from .topk import _get_row_states_buffer
@@ -3170,3 +3170,92 @@ def chain_speculative_sampling(
         offset,
     )
     return output_token_ids, output_accepted_token_num, output_emitted_draft_token_num
+
+
+@flashinfer_experimental_api(feature="Softcap sampling with row statistics")
+def softcap_sample_with_stats(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    seed: Union[int, torch.Tensor],
+    softcap: float,
+    *,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    backend: str = "cute-dsl",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Fused final-logit softcap, softmax statistics and Gumbel-max sampling of every row.
+
+    Built for diffusion-LM decoding (e.g. DiffusionGemma), which samples every canvas position
+    of every request each step and feeds the probabilities into a self-conditioning matmul.
+    For each row ``r`` of ``logits`` (``R`` rows, ``V = 262144`` columns), with
+    ``t = temperature[r // (R // temperature.numel())]`` and all math in FP32:
+
+    1. ``x = tanh(logits[r] / softcap) * softcap``.
+    2. ``argmax[r]``: the argmax of ``x``; ties go to the lowest index.
+    3. ``probs[r] = bf16(softmax(x / t))``, rounded to BF16 once.
+    4. ``entropy[r]``: the entropy (in nats) of ``softmax(x / t)``.
+    5. ``sample[r] = argmax(x * inv + g)`` with ``inv = 1 / max(t, 1e-10)``: a Gumbel-max
+       draw from ``softmax(x / t)``; ties go to the lowest index, and for ``t == 0`` the
+       noise is off, so ``sample[r] == argmax[r]``.
+
+    The Gumbel noise is ``g = -log(-log(max(u, 1e-20)))``, where ``u`` comes from
+    Philox4x32-10 with key ``(seed, 0)``. One Philox call serves four consecutive columns:
+    column ``c`` of row ``r`` uses output word ``(r * V + c) & 3`` of the call at counter
+    ``((r * V + c) >> 2, 0, 0, 0)``. Each word is turned into a uniform the way Triton's
+    ``tl.uint_to_uniform_float`` does it. The stream is
+    ``tl.philox(seed, (r * V + c) >> 2, 0, 0, 0)``, so a Triton kernel can reproduce it.
+
+    The kernel uses fast-math (``tanh.approx``, ``ex2.approx``, ``lg2.approx``) and fixed-order
+    reductions: results are bitwise reproducible for the same inputs and launch configuration.
+    Compared with a direct FP32 evaluation they agree to within two BF16 ulps per probability,
+    about 5e-4 in entropy, and on ``argmax`` / ``sample`` except at FP32 near-ties.
+
+    Parameters
+    ----------
+    logits : torch.Tensor
+        Contiguous, 16-byte aligned BF16 ``[R, 262144]`` with ``1 <= R <= 65535``.
+    temperature : torch.Tensor
+        Contiguous FP32 ``[N]`` with ``N`` dividing ``R``: rows ``[i * R / N, (i + 1) * R / N)``
+        use ``temperature[i]`` (``N = R`` gives one temperature per row). Values must be finite
+        and non-negative.
+    seed : Union[int, torch.Tensor]
+        Philox key: an ``int`` in ``[0, 2**32)``, or an int64 CUDA tensor whose element 0 is
+        read on the device (its low 32 bits are the key), which makes a CUDA-graph replay draw
+        fresh noise after the tensor is updated in place.
+    softcap : float
+        The softcap ``c`` in ``[2**-16, 64]`` (Gemma uses 30).
+    out : Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+        Preallocated contiguous ``(argmax int64 [R], sample int64 [R], entropy float32 [R],
+        probs bfloat16 [R, 262144])`` (probs 16-byte aligned). Allocated when ``None``.
+    backend : str
+        Only ``"cute-dsl"`` (SM90, H100 / H200) is supported.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(argmax, sample, entropy, probs)``.
+
+    Notes
+    -----
+    The launches run on the current CUDA stream without host synchronization and may be
+    captured in a CUDA graph. The main kernel is a cooperative launch of one 1024-thread CTA
+    per SM (up to 8 * floor(#SMs / 8) CTAs) and exchanges row partials through a small
+    per-(device, stream) workspace that every launch leaves zeroed. Calls on one stream are
+    ordered and share it. Concurrent calls on different streams each get their own.
+    See ``flashinfer/experimental/softcap_sample_with_stats/README.md``.
+    """
+    if backend != "cute-dsl":
+        raise ValueError("softcap_sample_with_stats supports backend='cute-dsl'")
+    from .experimental.softcap_sample_with_stats import check_inputs, run
+
+    check_inputs(logits, temperature, seed, softcap, out)
+    if out is None:
+        rows, vocab = logits.shape
+        dev = logits.device
+        out = (
+            torch.empty(rows, dtype=torch.int64, device=dev),
+            torch.empty(rows, dtype=torch.int64, device=dev),
+            torch.empty(rows, dtype=torch.float32, device=dev),
+            torch.empty(rows, vocab, dtype=torch.bfloat16, device=dev),
+        )
+    run(logits, temperature, seed, softcap, *out)
+    return tuple(out)

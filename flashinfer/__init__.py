@@ -379,6 +379,7 @@ from .sampling import log_softmax as log_softmax
 from .sampling import sampling_from_logits as sampling_from_logits
 from .sampling import sampling_from_probs as sampling_from_probs
 from .sampling import softmax as softmax
+from .sampling import softcap_sample_with_stats as softcap_sample_with_stats
 from .sampling import top_k_mask_logits as top_k_mask_logits
 from .sampling import top_k_renorm_probs as top_k_renorm_probs
 from .sampling import top_k_sampling_from_probs as top_k_sampling_from_probs

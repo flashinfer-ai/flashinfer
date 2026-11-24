@@ -84,6 +84,7 @@ exclude = [
 [tool.setuptools.package-data]
 "flashinfer.cute_dsl.attention.fmha.rubin_gqa" = ["LICENSE"]
 "flashinfer.experimental.hc_sum_sm100" = ["csrc/**", "README.md", "SOURCES.md"]
+"flashinfer.experimental.softcap_sample_with_stats" = ["README.md"]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
