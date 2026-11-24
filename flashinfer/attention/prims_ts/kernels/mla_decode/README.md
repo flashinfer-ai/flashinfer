@@ -95,9 +95,10 @@ while keeping at least two KV tiles per split. Larger grids use the persistent
 reuse schedule. The resource layout therefore does not fall back to duplicated
 conversion just because the planned row count is small.
 
-Persistent 2CTA launches use up to the physical cluster limit. The
+Static persistent 2CTA launches use up to the physical cluster limit. The
 compilation key retains that limit, so different row buckets that choose
-the same profile reuse one compiled kernel.
+the same profile reuse one compiled kernel. BF16 persistent 2CTA uses CLC
+and sizes the launch grid to the logical work, which can exceed that limit.
 
 Routine task-builder HEAD/LOOP overlap and unused-routing advisories are quiet
 by default. Set `FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` before a cold build to display
