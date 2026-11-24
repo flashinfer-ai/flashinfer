@@ -346,7 +346,7 @@ def test_other_devices_are_refused_naming_the_exported_architectures(
     monkeypatch,
 ) -> None:
     """``backend="cake"`` on a device without an exported prefill route: ``ValueError`` names the capabilities and
-    architectures the kernel is exported for (SM90) and nothing is launched."""
+    architectures the kernel is exported for (SM90, SM100, SM103) and nothing is launched."""
     inputs = _inputs(
         3, (129, 65), 2, torch.Generator(device=_device()).manual_seed(SEED)
     )
@@ -354,7 +354,7 @@ def test_other_devices_are_refused_naming_the_exported_architectures(
     monkeypatch.setattr(
         loader, "run_module", lambda name, values, **kwargs: launched.append(name)
     )
-    for capability in ((10, 0), (10, 3), (12, 0), (8, 0)):
+    for capability in ((12, 0), (8, 0)):
         monkeypatch.setattr(
             torch.cuda, "get_device_capability", lambda device=None, cap=capability: cap
         )
@@ -367,6 +367,8 @@ def test_other_devices_are_refused_naming_the_exported_architectures(
             str(capability) in str(info.value)
             and "(9, 0)" in str(info.value)
             and "sm_90a" in str(info.value)
+            and "(10, 0)" in str(info.value)
+            and "sm_103a" in str(info.value)
         )
     assert not launched
 

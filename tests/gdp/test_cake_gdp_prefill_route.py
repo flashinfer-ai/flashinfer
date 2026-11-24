@@ -45,6 +45,14 @@ PERF_HEADS = (80, 10, 24)
 PERF_NL = ((1, 1024), (1, 8192), (1, 32768), (4, 4096), (16, 1024), (64, 256))
 MERGED_ROWS = {(10, 1, 8192), (10, 1, 32768), (24, 1, 8192), (24, 1, 32768)}
 HEADS = (1, 2, 3, 6, 10, 12, 20, 24, 40, 80)
+# The logical names only the Blackwell body's records take (its item table, workspace, flags word and counts).
+BLACKWELL_ONLY_LOGICAL = {
+    "items",
+    "split_workspace",
+    "state_stride_slot",
+    "num_items",
+    "flags",
+}
 SM_COUNTS = (132, 114, 148, 152)
 # The sm_90a prefill route: the three V6 programs (plain, initial state, initial state + slot pool), the two unit
 # programs and the three split programs of the merged body, in route order.
@@ -354,9 +362,14 @@ def test_v6_records_share_the_merged_launch_contract() -> None:
         assert record["grid_rule"] == {"kind": "tiles"}
         assert record["arg_plan"] == merged["arg_plan"]
         assert record["logical"] == merged["logical"]
-        assert set(record["logical"].values()) == set(
-            loader.PREFILL_LOGICAL_TENSORS
-        ) | set(loader.PREFILL_LOGICAL_SCALARS)
+        assert (
+            set(record["logical"].values())
+            == (
+                set(loader.PREFILL_LOGICAL_TENSORS)
+                | set(loader.PREFILL_LOGICAL_SCALARS)
+            )
+            - BLACKWELL_ONLY_LOGICAL
+        )
         assert record["select_rule"]["kind"] == "prefill_flags"
         assert set(record["select_rule"]) == {"kind", *loader.PREFILL_FLAGS}
         assert record["select_rule"]["store_final_state"] is True
