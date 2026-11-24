@@ -76,11 +76,16 @@ def _first_buildable_pair(mapper, tile_n, **kwargs):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm_arch", [100, 107])
+@pytest.mark.parametrize(
+    "sm_arch, padding_regs, sync_regs, cta_warps",
+    [(100, 88, 48, 20), (103, 88, 48, 20), (107, 80, 88, 24)],
+)
 @pytest.mark.parametrize(
     "mapper", [map_trtllm_mxfp4_mxfp8_moe_tactic, map_trtllm_mxfp8_mxfp8_moe_tactic]
 )
-def test_mxfp_mapper_supports_tile256(mapper, sm_arch):
+def test_mxfp_mapper_supports_tile256(
+    mapper, sm_arch, padding_regs, sync_regs, cta_warps
+):
     pair = mapper(
         [256, 0],
         sm_arch=sm_arch,
@@ -97,10 +102,13 @@ def test_mxfp_mapper_supports_tile256(mapper, sm_arch):
     assert fc2.tile_n == 256
     assert fc1.uses_mxfp8_output_quant
     assert not fc2.has_output_block_scaling
-    # The last control warp group donates enough registers to admit the
-    # epilogue without exhausting the CTA's initial register allocation.
-    assert fc1.padding_regs == fc1.workid_regs == 80
-    assert fc1.sync_regs == fc1.mma_regs == 88
+    # Blackwell's SFB loaders publish completion directly. Rubin adds a
+    # relay warp, moving the work scheduler into a new warp group.
+    assert fc1.padding_regs == fc1.workid_regs == padding_regs
+    assert fc1.sync_regs == sync_regs
+    assert fc1.mma_regs == 88
+    assert fc1.warp_layout.num_sync_warps == int(sm_arch == 107)
+    assert fc1.warp_layout.threads_per_cta == cta_warps * 32
 
 
 @pytest.mark.cpu_only

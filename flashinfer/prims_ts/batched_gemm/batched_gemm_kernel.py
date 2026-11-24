@@ -950,6 +950,10 @@ def _make_pipeline_configs(cfg):
         ) * 32
         gather_producer_op = pipeline.PipelineOp.AsyncLoad
         gather_advance_on_acquire = False
+        if not cfg.is_rubin and cfg.fuse_operand_sf_loads:
+            gather_producer_threads *= cfg.umma_cta_count
+            gather_producer_op = pipeline.PipelineOp.AsyncThread
+            gather_advance_on_acquire = True
         gather_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
             num_stages=cfg.num_stages_b if cfg.is_swap_ab else cfg.num_stages_a,
             producer_group=pipeline.CooperativeGroup(
@@ -1004,6 +1008,11 @@ def _make_pipeline_configs(cfg):
             ldgsts_sfb_producer_warps = max(1, cfg.warp_layout.num_load_sfb_warps)
             ldgsts_sfa_producer_threads = ldgsts_sfa_producer_warps * 32
             ldgsts_sfa_producer_op = pipeline.PipelineOp.AsyncLoad
+            if not cfg.is_rubin and cfg.uses_two_cta_mma and not cfg.is_swap_ab:
+                # Blackwell drains copies in the loader, then joins both CTAs
+                # at the atom leader without a separate SF relay warp.
+                ldgsts_sfa_producer_threads *= cfg.umma_cta_count
+                ldgsts_sfa_producer_op = pipeline.PipelineOp.AsyncThread
             ldgsts_sfa_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
                 num_stages=cfg.num_stages_smem_sfa,
                 producer_group=pipeline.CooperativeGroup(
@@ -1048,6 +1057,15 @@ def _make_pipeline_configs(cfg):
                 sfb_producer_threads = ldgsts_sfb_producer_warps * 32
                 sfb_producer_op = pipeline.PipelineOp.AsyncLoad
                 sfb_advance_on_acquire = False
+                if (
+                    not cfg.is_rubin
+                    and cfg.uses_two_cta_mma
+                    and cfg.is_swap_ab
+                    and cfg.tile_n >= 128
+                ):
+                    sfb_producer_threads *= cfg.umma_cta_count
+                    sfb_producer_op = pipeline.PipelineOp.AsyncThread
+                    sfb_advance_on_acquire = True
                 ldgsts_sfb_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
                     num_stages=cfg.num_stages_smem_sfb,
                     producer_group=pipeline.CooperativeGroup(

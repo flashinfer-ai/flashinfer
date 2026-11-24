@@ -2839,9 +2839,10 @@ class BatchedGemmConfig:
 
     @property
     def uses_ldgsts_sf_relay(self) -> bool:
-        """Forward CTA-local SF copy completion to the two-CTA consumer."""
+        """Forward Rubin's CTA-local SF completion to the two-CTA consumer."""
         return bool(
-            self.uses_two_cta_mma
+            self.is_rubin
+            and self.uses_two_cta_mma
             and self.has_input_block_scaling
             and self.has_routed_sfs
             and self.uses_ldgsts_routed_sfs
@@ -2850,7 +2851,11 @@ class BatchedGemmConfig:
     @property
     def uses_ldgsts_relay(self) -> bool:
         return bool(
-            self.uses_two_cta_mma and (self.has_gather or self.uses_ldgsts_sf_relay)
+            self.uses_two_cta_mma
+            and (
+                (self.has_gather and (self.is_rubin or not self.fuse_operand_sf_loads))
+                or self.uses_ldgsts_sf_relay
+            )
         )
 
     @property

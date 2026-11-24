@@ -1104,8 +1104,6 @@ def _json_config_kwargs(
     copy_sf_regs = int(options.get("copy_sf_regs", load_regs))
     padding_regs = int(options.get("padding_regs", load_regs))
     workid_regs = int(options.get("workid_regs", load_regs))
-    # The LDGSTS relay shares the control warp group with MMA and loaders.
-    sync_regs = int(options.get("sync_regs", load_regs))
     epilogue_regs = int(options.get("epilogue_regs", 160))
     load_a_regs = int(options.get("load_a_regs", 0))
     load_b_regs = int(options.get("load_b_regs", 0))
@@ -1203,7 +1201,6 @@ def _json_config_kwargs(
         "copy_sf_regs": copy_sf_regs,
         "padding_regs": padding_regs,
         "workid_regs": workid_regs,
-        "sync_regs": sync_regs,
     }
     if "num_stages_workid" in options:
         kwargs["num_stages_workid"] = int(options["num_stages_workid"])
@@ -1259,6 +1256,10 @@ def _json_config_kwargs(
         kwargs["num_load_sfa_warps"] = int(options["num_load_sfa_warps"])
     if "num_load_sfb_warps" in options:
         kwargs["num_load_sfb_warps"] = int(options["num_load_sfb_warps"])
+    # The Rubin relay shares a warp group with the loaders. Other targets
+    # inherit BatchedGemmConfig's sync budget when the JSON omits it.
+    if sm_arch == 107:
+        kwargs["sync_regs"] = load_regs
     for key in _RUBIN_JSON_INT_OPTIONS & options.keys():
         kwargs[key] = int(options[key])
     if "epilogue_steps" in options:

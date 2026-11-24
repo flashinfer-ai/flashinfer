@@ -1146,15 +1146,20 @@ def test_validation_accepts_safe_fused_operand_sf_pipeline():
 
 
 @pytest.mark.cpu_only
-def test_fused_operand_sf_relay_accepts_short_operand_rings():
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_fused_operand_sf_short_operand_rings(sm_arch):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         _ldgsts_sfb_producer_commit_prefetch_depth,
         validate_config,
     )
 
     cfg = _fused_operand_sf_config(
-        num_stages_a=1, num_stages_b=1, num_stages_smem_sfb=4
+        sm_arch=sm_arch, num_stages_a=1, num_stages_b=1, num_stages_smem_sfb=4
     )
+    if sm_arch != 107:
+        with pytest.raises(ValueError, match="delayed SFB commit depth"):
+            validate_config(cfg)
+        return
     validate_config(cfg)
     # Completion barriers replace delayed cp.async group commits, so SFB's
     # deeper ring does not require spare operand stages for forward progress.

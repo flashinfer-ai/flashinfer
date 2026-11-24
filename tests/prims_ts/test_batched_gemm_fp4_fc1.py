@@ -209,7 +209,8 @@ class TestFp4Fc1Validation:
             **FP4_FC1_LL,
         )
 
-    def test_implicit_routed_sfb_warp_layout_matches_generated_k512(self):
+    @pytest.mark.parametrize("sm_arch", [100, 103, 107])
+    def test_implicit_routed_sfb_warp_layout_matches_generated_k512(self, sm_arch):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
             ActKind,
             BatchMode,
@@ -220,6 +221,7 @@ class TestFp4Fc1Validation:
         )
 
         common = dict(
+            sm_arch=sm_arch,
             batch_mode=int(BatchMode.BATCH_N),
             transpose_mma_output=1,
             route_act=int(RouteImpl.TMA),
@@ -247,9 +249,9 @@ class TestFp4Fc1Validation:
         compute_warp_layout(tile16)
         assert tile16.warp_layout.num_load_b_warps == 2
         assert tile16.warp_layout.num_load_sfb_warps == 4
-        # The two-CTA LDGSTS relay occupies the former padding slot.
-        assert tile16.warp_layout.num_sync_warps == 1
-        assert tile16.warp_layout.num_padding_warps == 0
+        # Rubin's two-CTA SF relay occupies Blackwell's padding slot.
+        assert tile16.warp_layout.num_sync_warps == int(sm_arch == 107)
+        assert tile16.warp_layout.num_padding_warps == int(sm_arch != 107)
         assert tile16.warp_layout.threads_per_cta == 20 * 32
 
     def test_batch_m_shuffled_matrix_requires_complete_shuffle_fragment(self):
