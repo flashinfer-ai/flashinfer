@@ -41,11 +41,10 @@ count is intentionally stale. ``max_blocks_per_row`` is the plan-declared
 semantic BSR-block limit, which remains distinct from packed-route capacity.
 
 A prepare launched with ``use_pdl`` is a programmatic dependent of the grid
-launched immediately before it on the same stream, a Sage plan's scale
-prepare, whose output the routes never read. Its CTAs may start while that
-grid drains; each acquires the grid after its last store, so the prepare's
-completion implies the producer's completion and memory visibility for the
-attention launch that follows in stream order and reads both.
+launched immediately before it on the same stream. Each CTA acquires that
+grid before its first global read or write, so the routing inputs and the
+route workspace an earlier attention launch may still read are ordered, and
+releases the PDL-launched attention after its last route store.
 """
 
 from dataclasses import dataclass
@@ -947,16 +946,25 @@ def _allocate_warp_words(
 
 
 @cute.jit
-def _acquire_pdl_producer(use_pdl: cutlass.Constexpr[bool]) -> None:
-    """Acquire the preceding grid of a programmatic dependent launch before exit.
-
-    The routes depend on nothing that grid writes, so the prepare stores its
-    records first and acquires last; a prepare launched without ``use_pdl``
-    has no dependency to acquire.
-    """
+def _wait_for_pdl_producer(use_pdl: cutlass.Constexpr[bool]) -> None:
+    """Acquire the preceding grid before the first global access."""
 
     if cutlass.const_expr(use_pdl):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+
+
+@cute.jit
+def _release_pdl_dependents(use_pdl: cutlass.Constexpr[bool]) -> None:
+    """Release the following PDL grid after the CTA's last route store.
+
+    Each warp stores its own row, and a CTA's first ``launch_dependents``
+    is the one that counts, so the barrier holds the release until every
+    warp of the CTA has stored its row.
+    """
+
+    if cutlass.const_expr(use_pdl):
+        cute.arch.sync_threads()
+        prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
 
 class _PrepareRoutesBase:
@@ -965,8 +973,8 @@ class _PrepareRoutesBase:
     ``num_pattern_heads`` is the head axis of the BSR or bitmask inputs, one
     when every KV head shares a pattern, and sizes the route rows. ``use_pdl``
     launches the prepare as a programmatic dependent of the grid launched
-    immediately before it on the same stream and acquires that grid before
-    the kernel exits.
+    immediately before it on the same stream, acquires that grid before its
+    first global access, and releases the following grid after its stores.
     """
 
     def __init__(
@@ -1098,6 +1106,7 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
         record_stage = _allocate_warp_words(
             SmemAllocator(), self.cfg.record_stage_words, warp_idx
         )
+        _wait_for_pdl_producer(self.use_pdl)
 
         row_route_span_begin, row_route_span_end = _load_row_route_span(
             row_route_offsets,
@@ -1226,7 +1235,7 @@ class _PrepareBsrRoutes(_PrepareRoutesBase):
 
         if lane_idx == cutlass.Int32(0) and row_is_valid:
             route_workspace[linear_row_idx] = total_route_count
-        _acquire_pdl_producer(self.use_pdl)
+        _release_pdl_dependents(self.use_pdl)
 
 
 class _PrepareBitmaskRoutes(_PrepareRoutesBase):
@@ -1312,6 +1321,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
         selected_blocks = _allocate_warp_words(
             smem, self.cfg.selected_block_list_words, warp_idx
         )
+        _wait_for_pdl_producer(self.use_pdl)
 
         row_route_span_begin, row_route_span_end = _load_row_route_span(
             row_route_offsets,
@@ -1407,7 +1417,7 @@ class _PrepareBitmaskRoutes(_PrepareRoutesBase):
 
         if lane_idx == cutlass.Int32(0) and row_is_valid:
             route_workspace[linear_row_idx] = total_route_count
-        _acquire_pdl_producer(self.use_pdl)
+        _release_pdl_dependents(self.use_pdl)
 
 
 __all__ = ["_PrepareBitmaskRoutes", "_PrepareBsrRoutes"]

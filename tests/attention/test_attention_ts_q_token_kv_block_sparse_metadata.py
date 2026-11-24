@@ -374,6 +374,7 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "out_dtype",
         "sm_scale",
         "v_scale",
+        "enable_pdl",
     )
     run_parameters = inspect.signature(QTokenKvBlockSparsePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -546,6 +547,49 @@ def test_q_token_kv_block_sparse_block_size_must_be_integer(
             8,
             4,
             sparse_block_size=sparse_block_size,  # type: ignore[arg-type]
+        )
+
+
+def test_q_token_kv_block_sparse_metadata_grids_launch_under_enable_pdl() -> None:
+    """Every metadata grid, including each bitmap instantiation (word rank,
+    summary walk, entry map), waits for the preceding grid at entry and is
+    launched through the PDL launcher rather than a plain <<<>>> launch."""
+    import pathlib
+    import re
+
+    header = (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "include/flashinfer/attention/prims_ts/q_token_kv_block_sparse_metadata.cuh"
+    ).read_text()
+    kernels = re.findall(r"__global__[^{]*\{\s*\n\s*(\S+)", header)
+    assert len(kernels) == 3
+    assert all(first == "WaitForPdlPrimary(params);" for first in kernels)
+    assert "<<<" not in header
+    assert header.count("LaunchQTokenKvBlockSparseMetadataKernel<PositionType>(") == 4
+
+
+@pytest.mark.parametrize("enable_pdl", (1, "yes"))
+def test_q_token_kv_block_sparse_metadata_validates_enable_pdl_without_routes(
+    monkeypatch: pytest.MonkeyPatch, enable_pdl: object
+) -> None:
+    """A metadata build with no route still rejects a non-bool ``enable_pdl``."""
+    from flashinfer.attention.prims_ts import q_token_kv_block_sparse_metadata
+
+    # CPU tensors stand in for CUDA ones; the tensor checks are not under test.
+    monkeypatch.setattr(
+        q_token_kv_block_sparse_metadata, "_validate_inputs", lambda *_args: None
+    )
+    no_rows = torch.empty(0, dtype=torch.int32)
+    with pytest.raises(TypeError, match="enable_pdl must be a bool or None"):
+        build_prims_ts_q_token_kv_block_sparse_metadata(
+            no_rows.view(0, 2),
+            torch.zeros((1, 4), dtype=torch.int32),
+            no_rows,
+            no_rows,
+            group_size=1,
+            storage_page_size=4,
+            max_seq_len_kv=16,
+            enable_pdl=enable_pdl,  # type: ignore[arg-type]
         )
 
 
@@ -3386,7 +3430,6 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
     assert spec.config.tile_size_kv == 128
     assert spec.config.splits_kv == spec.config.max_splits_kv == 8
     assert spec.config.use_separate_reduction_kernel
-    assert spec.config.use_parallel_separate_reduction_pdl
     assert spec.config.use_pdl
 
     standalone_spec = decode_module._resolve_decode_launch_spec(
@@ -3787,7 +3830,7 @@ def test_prepared_q_token_kv_block_sparse_fp8_grouped_tp4_bs256_cuda_graph(
         out=prepared_output,
         max_seq_len_kv=max_storage_pages * storage_page_size,
     )
-    assert plan._metadata_plan.release_attention_pdl is True
+    assert plan._metadata_plan.enable_pdl is True
 
     def run() -> None:
         plan.run(

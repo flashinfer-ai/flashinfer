@@ -44,3 +44,7 @@ class PrimsTsGemmConfig:
     use_tma_store: bool = False
     # Store Q, K, V as three contiguous [M, N/3] sections.
     separate_qkv_output: bool = False
+    # Programmatic dependent launch. Decides the launch attribute, the
+    # in-kernel grid-dependency waits and launch_dependents together; False
+    # emits none of them. True is the launch this kernel always used.
+    enable_pdl: bool = True

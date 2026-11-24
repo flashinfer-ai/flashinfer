@@ -2873,9 +2873,63 @@ def _release_decode_dependents(
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
 ) -> None:
     """Uniformly release a following PDL grid after one CTA's true tail."""
-    if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
+    if cutlass.const_expr(cfg.use_pdl):
         prims.barrier_cta_sync(14)
         prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
+
+def _q_seq_bounds_reads_memory(
+    cfg: FmhaDecodeConfig,
+    cu_seqlens_q: cute.Pointer | UniformQueryOffsets | None,
+) -> bool:
+    """Whether ``_q_seq_bounds`` loads ``cu_seqlens_q`` from global memory.
+
+    This is the compile-time dispatch of ``_q_seq_bounds``: affine
+    ``UniformQueryOffsets`` and fixed-Q configs compute the bounds without a
+    load; packed offsets are read from memory.
+    """
+    return cfg.use_variable_seqlens_q and not isinstance(
+        cu_seqlens_q, UniformQueryOffsets
+    )
+
+
+def _decode_acquires_at_entry(
+    cfg: FmhaDecodeConfig,
+    cu_seqlens_q: cute.Pointer | UniformQueryOffsets | None,
+    kv_len_prunes_q_tiles: bool,
+) -> bool:
+    """Whether a nonpersistent decode CTA acquires the preceding grid at entry.
+
+    Under PDL the tile predicate reads ``cu_seqlens_q`` and, where KV lengths
+    prune Q tiles, ``seq_lens``; the preceding grid may write both, so a launch
+    whose predicate reads either acquires before it. Every other launch
+    acquires later, which lets its resource setup overlap the preceding grid.
+    """
+    return bool(cfg.use_pdl) and (
+        _q_seq_bounds_reads_memory(cfg, cu_seqlens_q) or kv_len_prunes_q_tiles
+    )
+
+
+def _decode_defers_split_pruning(
+    cfg: FmhaDecodeConfig,
+    cu_seqlens_q: cute.Pointer | UniformQueryOffsets | None,
+    kv_len_prunes_q_tiles: bool,
+    reads_runtime_seqlens_kv: bool,
+) -> bool:
+    """Whether a split launch prunes its runtime split prefix after the acquire.
+
+    Split pruning reads the runtime KV length. A launch that already acquired at
+    entry prunes before it initializes resources; one that did not (the QToken
+    route, whose metadata lengths never empty a Q tile) sends every configured
+    split through resource initialization and prunes after the acquire in
+    ``_run_decode_gen_active``.
+    """
+    return (
+        bool(cfg.use_pdl)
+        and bool(cfg.use_split_kv)
+        and reads_runtime_seqlens_kv
+        and not _decode_acquires_at_entry(cfg, cu_seqlens_q, kv_len_prunes_q_tiles)
+    )
 
 
 @cute.jit
@@ -3058,6 +3112,10 @@ def _run_decode_gen_active(
         and g_sparse_row_route_offsets is not None
         and g_sparse_row_route_counts is not None
     ):
+        if cutlass.const_expr(cfg.use_pdl):
+            # The route prepare launched just before attention writes this
+            # header; acquire it first.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         sparse_row_route_begin, sparse_route_count = _prefetch_prepared_sparse_row(
             cfg,
             g_sparse_row_route_offsets,
@@ -3185,17 +3243,20 @@ def _run_decode_gen_active(
         prims.barrier_cluster_arrive_relaxed()
         prims.barrier_cluster_wait()
     if cutlass.const_expr(cfg.use_pdl):
-        # Delay the acquire until every CTA-local pipeline barrier and
-        # SMEM/TMEM resource is initialized, but keep it before TaskManager
-        # resolves any value published by the preceding producer grid.
+        # The resource setup above (barriers, SMEM, TMEM, grid-constant
+        # TensorMap prefetch) touches no global memory and overlaps the
+        # preceding grid unless the CTA already acquired it: at kernel entry
+        # for query offsets or lengths, or before the block-sparse row header
+        # read above. Acquire that grid before TaskManager reads any input it
+        # may write; a repeated wait returns once the predecessor completed.
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
     if cutlass.const_expr(defer_runtime_split_pruning):
-        # A split launch cannot read its producer-owned sequence length until
-        # the dependency above is acquired. Every physical split CTA
-        # initializes the same static task resources first; only the useful
-        # runtime prefix enters TaskManager. Pruned CTAs take the equivalent
-        # TMEM teardown and dependent-release helpers, then retire before the
-        # straight-line task graph.
+        # A split launch that did not acquire at entry cannot read its
+        # producer-owned sequence length before the acquire above. Every
+        # physical split CTA initializes the same static task resources first;
+        # only the useful runtime prefix enters TaskManager. Pruned CTAs take
+        # the equivalent TMEM teardown and dependent-release helpers, then
+        # retire before the straight-line task graph.
         runtime_seq_len_kv = g_s_k
         if cutlass.const_expr(
             use_variable_seqlens_kv
@@ -3230,8 +3291,9 @@ def _run_decode_gen_active(
             Int32(tmem_alloc_cols),
             cfg,
         )
-    # Scales are first consumed by the task bodies. Bind their device values
-    # after the producer acquire so resource initialization can overlap it.
+    # The preceding grid may write device scales, which the task bodies
+    # consume first. Load them after the acquire above and bind them to the
+    # resources, which hold unit placeholders until here.
     if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Pointer)):
         scale_softmax_log2 = cute.make_tensor(
             softmax_scale_operand, cute.make_layout(1)
@@ -3299,7 +3361,6 @@ def _signal_padded_pdl_producer(cfg: cutlass.Constexpr[FmhaDecodeConfig]) -> Non
         # This CTA has no task resources or producer-owned work, but it must
         # acquire the incoming dependency before retiring.
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-    if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
         prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
 
@@ -3605,26 +3666,24 @@ def decode_gen_kernel(
     # CTAs initialize their resources while the metadata grid runs and
     # acquire it before TaskManager reads any metadata. Direct G1 lengths come
     # from the raw inputs and keep the check.
-    kv_len_prunes_q_tiles = (
-        use_variable_seqlens_kv
-        or (use_native_paged_kv and not use_static_native_seqlens_kv)
-    ) and not (
+    reads_runtime_seqlens_kv = use_variable_seqlens_kv or (
+        use_native_paged_kv and not use_static_native_seqlens_kv
+    )
+    kv_len_prunes_q_tiles = reads_runtime_seqlens_kv and not (
         cfg.use_q_token_kv_block_sparse_route
         and not isinstance(g_page_idx_kv, DirectSparseMetadataView)
     )
     if cutlass.const_expr(not cfg.use_persistent_scheduler):
         if cutlass.const_expr(
-            cfg.use_pdl
-            and (
-                (
-                    cfg.use_variable_seqlens_q
-                    and not isinstance(g_cu_seqlens_q, UniformQueryOffsets)
-                )
-                or kv_len_prunes_q_tiles
-            )
+            _decode_acquires_at_entry(cfg, g_cu_seqlens_q, kv_len_prunes_q_tiles)
         ):
-            # Static tile pruning reads producer-owned Q/KV metadata here;
-            # persistent schedules defer those reads until TaskManager runs.
+            # The preceding grid may write cu_seqlens_q and seq_lens: acquire
+            # it before the tile predicate and split pruning read them. A
+            # launch that reads neither acquires in _run_decode_gen_active,
+            # before a block-sparse row header read or otherwise after its
+            # local resources are initialized (pruning its split prefix after
+            # that acquire), or in _signal_padded_pdl_producer when it has no
+            # work.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(cfg.use_variable_seqlens_q):
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
@@ -3690,10 +3749,15 @@ def decode_gen_kernel(
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
             )
-        elif cutlass.const_expr(cfg.use_split_kv and cfg.use_pdl):
-            # The immediately preceding grid may produce seq_lens. Send every
-            # configured split through resource initialization and defer
-            # useful-prefix pruning until after the PDL acquire.
+        elif cutlass.const_expr(
+            _decode_defers_split_pruning(
+                cfg, g_cu_seqlens_q, kv_len_prunes_q_tiles, reads_runtime_seqlens_kv
+            )
+        ):
+            # This launch did not acquire at entry, and its split pruning reads
+            # a KV length the preceding grid may write. Send every configured
+            # split through resource initialization and prune the useful prefix
+            # after the PDL acquire in _run_decode_gen_active.
             _run_decode_gen_active(
                 tma_desc_q,
                 tma_desc_k,
@@ -3865,6 +3929,10 @@ def fmha_decode_launch(
     ``sage_scales_iter`` is used only by a Sage attention config, which takes
     its Q, K and V scales from the prepared scales (``_SageScaleLayout``).
     """
+    if cutlass.const_expr(cfg.use_pdl and not cfg.supports_pdl):
+        raise ValueError(
+            "split PDL requires nonpersistent attention with a standalone GMEM reducer"
+        )
     log2_e = math.log2(math.e)
     softmax_scale_operand = softmax_scale
     if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
@@ -4430,9 +4498,12 @@ def fmha_decode_launch(
                 min_blocks_per_mp=_decode_min_blocks_per_mp(
                     cfg, None if seq_len_kv is None else effective_seq_len_kv
                 ),
-                # PDL-capable attention initializes all local task resources before
-                # acquiring its immediately preceding producer. Split attention also
-                # defers runtime prefix pruning until after that acquire.
+                # Under PDL every CTA acquires the preceding grid before its
+                # first read of memory that grid may write: at kernel entry
+                # when the tile predicate reads cu_seqlens_q or seq_lens,
+                # before a block-sparse row header read, otherwise after its
+                # local task resources are initialized. Pruned and padded CTAs
+                # acquire before they retire.
                 use_pdl=cfg.use_pdl,
             )
 
@@ -4475,6 +4546,10 @@ def fmha_block_sparse_launch(
         raise ValueError("fmha_block_sparse_launch requires block-sparse config")
     if cutlass.const_expr(cfg.use_block_sparse_proxy_routes and cfg.use_paged_kv):
         raise ValueError("block-sparse proxy routes require contiguous K/V")
+    if cutlass.const_expr(cfg.use_pdl and not cfg.supports_pdl):
+        raise ValueError(
+            "split PDL requires nonpersistent attention with a standalone GMEM reducer"
+        )
 
     softmax_scale_operand = softmax_scale
     if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
@@ -4747,5 +4822,5 @@ def fmha_block_sparse_launch(
         # Reuse dense decode's entry-occupancy contract, including the long
         # KV256 profiles that execute dynamic register reallocation.
         min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, seq_len_kv),
-        use_pdl=False,
+        use_pdl=cfg.use_pdl,
     )

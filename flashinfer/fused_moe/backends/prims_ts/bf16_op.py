@@ -52,9 +52,9 @@ from flashinfer.trace.templates.moe import (
 )
 from flashinfer.utils import (
     check_shape_dtype_device,
-    device_support_pdl,
     register_custom_op,
     register_fake_op,
+    resolve_enable_pdl,
 )
 
 
@@ -117,8 +117,7 @@ def prims_ts_bf16_moe_op(
         local_num_experts,
         hidden_states.device,
     )
-    if enable_pdl is None:
-        enable_pdl = device_support_pdl(hidden_states.device)
+    enable_pdl = resolve_enable_pdl(enable_pdl, hidden_states.device)
 
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[-1]
@@ -450,7 +449,8 @@ def prims_ts_bf16_moe_partitioned(
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
-        Enable Programmatic Dependent Launch when supported.
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
     activation_type : int
@@ -530,7 +530,7 @@ def prims_ts_bf16_moe(
     use_shuffled_weight: bool = True,
     weight_layout: int = WeightLayout.MajorK,
     do_finalize: bool = True,
-    enable_pdl: bool = True,
+    enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
@@ -542,7 +542,10 @@ def prims_ts_bf16_moe(
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""BF16 MoE using the Prims-TS batched GEMM backend on SM100/SM103/SM107.
 
-    Same arguments and return value as :func:`~flashinfer.fused_moe.trtllm_bf16_moe`.
+    Takes the arguments of :func:`~flashinfer.fused_moe.trtllm_bf16_moe` in the
+    same order and returns the same value. Two defaults differ: ``enable_pdl``
+    is ``None``, which enables PDL on devices that support it, and
+    ``weight_layout`` is ``WeightLayout.MajorK``.
 
     Parameters
     ----------
@@ -580,8 +583,9 @@ def prims_ts_bf16_moe(
         Weight layout enum value (default ``MajorK``).
     do_finalize : bool
         If ``True``, return the finalized MoE output.
-    enable_pdl : bool
-        Enable Programmatic Dependent Launch when supported.
+    enable_pdl : Optional[bool]
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     tune_max_num_tokens : int
         Autotune token-bucket upper bound (default ``8192``).
     activation_type : int
@@ -657,7 +661,7 @@ def prims_ts_bf16_routed_moe(
     use_shuffled_weight: bool = True,
     weight_layout: int = WeightLayout.MajorK,
     do_finalize: bool = True,
-    enable_pdl: bool = True,
+    enable_pdl: Optional[bool] = None,
     gemm1_lora_delta: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
@@ -669,8 +673,10 @@ def prims_ts_bf16_routed_moe(
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""BF16 Prims-TS MoE with precomputed packed or unpacked routing.
 
-    Same arguments and return value as
-    :func:`~flashinfer.fused_moe.trtllm_bf16_routed_moe`.
+    Takes the arguments of :func:`~flashinfer.fused_moe.trtllm_bf16_routed_moe`
+    in the same order and returns the same value. Two defaults differ:
+    ``enable_pdl`` is ``None``, which enables PDL on devices that support it,
+    and ``weight_layout`` is ``WeightLayout.MajorK``.
 
     Parameters
     ----------
@@ -707,8 +713,9 @@ def prims_ts_bf16_routed_moe(
         Weight layout enum value (default ``MajorK``).
     do_finalize : bool
         If ``True``, return the finalized MoE output.
-    enable_pdl : bool
-        Enable Programmatic Dependent Launch when supported.
+    enable_pdl : Optional[bool]
+        Launch with programmatic dependent launch (PDL). ``None`` (default)
+        enables it on devices that support PDL.
     gemm1_lora_delta : Optional[torch.Tensor]
         Optional MoE LoRA delta applied before the gated activation.
     tune_max_num_tokens : int

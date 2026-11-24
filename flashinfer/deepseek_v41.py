@@ -21,6 +21,7 @@ _PRIMS_TS_ONLY_KEYWORDS = frozenset(
         "bmm2_scale",
         "sinks",
         "kv_layout",
+        "enable_pdl",
     )
 )
 
@@ -70,7 +71,7 @@ def deepseek_v41_decode(*args, backend="cute-dsl", **kwargs):
             query, swa_kv_cache, workspace_buffer, sparse_indices=None,
             compressed_kv_cache=None, sparse_topk_lens=None, seq_lens=None,
             out=None, bmm1_scale=1.0, bmm2_scale=1.0, sinks=None,
-            kv_layout="HND", backend="prims-ts",
+            kv_layout="HND", *, enable_pdl=None, backend="prims-ts",
         )
 
     Prims-TS requires E4M3 Q ``[B,1,64,512]``, typed E4M3 SWA width512,
@@ -116,7 +117,9 @@ def deepseek_v41_decode(*args, backend="cute-dsl", **kwargs):
     bundled CUDA13 compiler supporting the device's compile target. Its
     Keep-AB/M64/BK128/retained-KV8 schedule, persistent above one wave, jointly
     attends SWA/main with inline metadata and sinks: one finalizing kernel, or for
-    small batches with K >= 192 KV splits merged by one PDL-chained reducer.
+    small batches with K >= 192 KV splits merged by one reducer. ``enable_pdl``
+    (default ``None``: on where the device supports PDL) decides whether the
+    attention kernel and the reducer launch with programmatic dependent launch.
     Workspace contains private LSE, a K0 dummy and those split partials, not
     sanitized metadata.
     Capture requires caller out/workspace and eager warmup; keep addresses
@@ -148,7 +151,8 @@ def deepseek_v41_window_decode(*args, backend="cute-dsl", **kwargs):
     signature and returns ``(out, lse, plan)``. Explicit ``backend="prims-ts"``
     accepts ``(query, swa_kv_cache, workspace_buffer, sparse_indices=None,
     sparse_topk_lens=None, seq_lens=None, out=None, bmm1_scale=1.0,
-    bmm2_scale=1.0, sinks=None, kv_layout="HND")`` and returns only output.
+    bmm2_scale=1.0, sinks=None, kv_layout="HND", *, enable_pdl=None)`` and returns
+    only output.
     Native indices are int32[B,128] and topk lengths are int32[B] with128.
     See :func:`deepseek_v41_decode` for ownership, layout and scaling.
     """
