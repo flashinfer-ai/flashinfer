@@ -258,7 +258,7 @@ def test_fp4_quantization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl":
         if not _is_cute_dsl_available():
             pytest.skip("CuTe-DSL not available")
@@ -306,7 +306,7 @@ def test_fp4_quantize_zero_rows(sf_use_ue8m0, is_swizzled, device):
     cudaErrorInvalidValue that the next CUDA call then reports.
     """
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     n = 64
     sf_vec_size = 32 if sf_use_ue8m0 else 16
     x = torch.empty((0, n), dtype=torch.bfloat16, device=device)
@@ -335,7 +335,7 @@ def test_scale_swizzling(
     device: str,
 ) -> None:
     if not _is_fp4_supported(torch.device("cuda")):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     torch.set_default_device(device)
@@ -377,7 +377,7 @@ def test_block_scale_interleave(
 ) -> None:
     """Test the block_scale_interleave function directly."""
     if not _is_fp4_supported(torch.device("cuda")):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -428,7 +428,7 @@ def test_e2m1_dequantization(
 ) -> None:
     """Test roundtrip: fp4_quantize -> e2m1_and_ufp8sf_scale_to_float."""
     if not _is_fp4_supported(torch.device("cuda")):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     torch.set_default_device(device)
@@ -621,7 +621,7 @@ def test_mxfp4_quantize_roundtrip(
 ) -> None:
     """Test MXFP4 quantization roundtrip for both backends."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -663,7 +663,7 @@ def test_mxfp4_quantize_backend_parity(
 ) -> None:
     """Test that CUDA and CuTe-DSL backends produce matching results."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -721,7 +721,7 @@ def test_mxfp4_quantize_layout(
 ) -> None:
     """Test MXFP4 quantize/dequantize with the requested scale layout."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("MXFP4 requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("MXFP4 requires compute capability >= 8 and CUDA >= 12.8")
 
     torch.manual_seed(42)
     # Exercise row padding (127 -> 128) and SF-column padding (96 / 32 = 3 -> 4).
@@ -748,7 +748,7 @@ def test_mxfp4_quantize_layout_backend_parity(
     Uses the low-level fp4_quantize API to verify underlying backend agreement.
     """
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1013,7 +1013,7 @@ def test_nvfp4_quantize_te_reference(
 ) -> None:
     """NVFP4 quantization should match the Python reference bitwise."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1112,7 +1112,7 @@ def test_nvfp4_quantize_zero_scale_boundary(
 ) -> None:
     """Preserve the E4M3 zero midpoint in ordinary and TMA quantization paths."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     set_nvfp4_quant_env(disable_quant_fast_math=False)
 
     m, n = shape
@@ -1178,7 +1178,7 @@ def test_nvfp4_quantize_roundtrip(
 ) -> None:
     """Test NVFP4 quantization roundtrip for both backends and layouts."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1266,7 +1266,7 @@ def test_nvfp4_quantize_per_token_out_scale_fold(
     128 rows are padding.
     """
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1326,7 +1326,7 @@ def test_nvfp4_quantize_per_token_cute_dsl_wide_rows(
     per-token kernel (fp4 bytes, block scales including padding, per-token
     scales) for every row width the kernel specialises on."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1450,7 +1450,7 @@ def test_nvfp4_quantize_recipes_coexist_in_one_process(
       binary for recipe #1 on the second call.
     """
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     _assert_env_does_not_enable_4over6()
@@ -1506,7 +1506,7 @@ def test_nvfp4_quantize_explicit_recipe_matches_te_reference(
     so any 4over6 behaviour observed here came from the parameter.
     """
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1577,7 +1577,7 @@ def test_nvfp4_quantize_config_equals_env(
     sweeps dtype against the reference.
     """
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1649,7 +1649,7 @@ def test_nvfp4_quantize_setting_overrides_env(
     and an unset environment cannot turn an explicit recipe off.
     """
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1715,7 +1715,7 @@ def test_nvfp4_quantize_per_token_scale_recipe_mismatch_raises(
     exception would be a breaking change in a backwards-compatible PR.
     """
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1782,7 +1782,7 @@ def test_nvfp4_quantize_backend_parity(
 ) -> None:
     """Test backend parity and both CuTe-DSL global-scale input forms."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1889,7 +1889,7 @@ def test_nvfp4_quantize_backend_parity(
 def test_nvfp4_quantize_cute_dsl_device_scale_cuda_graph(device: str) -> None:
     """Device-side global scales must not introduce a host sync during capture."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -1938,7 +1938,7 @@ def test_nvfp4_quantize_fp8_input_cute_dsl(
 ) -> None:
     """Test CuTe-DSL NVFP4 quantization with FP8 E4M3 input."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -2008,7 +2008,7 @@ def test_nvfp4_quantize_fp8_backend_parity(
 ) -> None:
     """Test FP8 backend parity and both CuTe-DSL global-scale input forms."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
@@ -2122,7 +2122,7 @@ def test_nvfp4_quantize_tma_matches_non_tma(
     device: str,
 ) -> None:
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -2138,7 +2138,7 @@ def test_nvfp4_quantize_4over6_tma_matches_non_tma(
     device: str,
 ) -> None:
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -2156,7 +2156,7 @@ def test_nvfp4_batched_quantize_fp8_tma_matches_non_tma(
     device: str,
 ) -> None:
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -2214,7 +2214,7 @@ def test_nvfp4_quantize_tma_backend_parity(
 ) -> None:
     """Test TMA backend parity and both CuTe-DSL global-scale input forms."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     if get_compute_capability(torch.device(device))[0] < 9:
@@ -2291,7 +2291,7 @@ def test_nvfp4_quantize_tma_scale_stays_in_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
 
     torch.set_default_device(device)
     torch.manual_seed(42)
@@ -2340,7 +2340,7 @@ def test_nvfp4_quantize_tma_scale_stays_in_buffer(
 def test_nvfp4_quantize_tma_oob_rows(device: str) -> None:
     """Verify partial and fully-OOB rows for M padded from 8193 to 8320."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     if get_compute_capability(torch.device(device))[0] < 9:
@@ -2796,7 +2796,7 @@ def test_nvfp4_quantize_global_scale_dtype_regression(m: int, scale_dtype: torch
     """
     device = torch.device("cuda")
     if not _is_fp4_supported(device):
-        pytest.skip("Nvfp4 requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 requires compute capability >= 8 and CUDA >= 12.8")
     torch.manual_seed(0)
     k = 2048
     x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 5
@@ -2840,7 +2840,7 @@ def test_nvfp4_quantize_global_scale_dtype_regression(m: int, scale_dtype: torch
 def test_nvfp4_quantize_pdl_waits_for_global_scale(dtype, shape):
     device = torch.device("cuda:0")
     if not _is_fp4_supported(device):
-        pytest.skip("Nvfp4 requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 requires compute capability >= 8 and CUDA >= 12.8")
     if not device_support_pdl(device):
         pytest.skip("PDL not supported on this device")
     torch.manual_seed(0)

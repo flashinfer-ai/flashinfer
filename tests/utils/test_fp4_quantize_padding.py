@@ -61,7 +61,7 @@ def test_fp4_quantize_unaligned_m_non_swizzled(
 ) -> None:
     """Regression test: fp4_quantize with M not a multiple of 16 for linear SF."""
     if not _is_fp4_supported(torch.device(device)):
-        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+        pytest.skip("Nvfp4 Requires compute capability >= 8 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     monkeypatch.setenv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "0")
