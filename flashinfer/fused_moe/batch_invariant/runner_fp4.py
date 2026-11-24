@@ -21,6 +21,7 @@ raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instea
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -678,6 +679,10 @@ class BatchInvariantFp4Runner(MoERunner):
             c1, c2 = gather_form_rule(r1[0], gather_form), r2[0]
         else:
             c1, c2 = _configs_from_tactic_fp4(tuple(tactic))
+            if c1.gather_a and not self._gather_form(x, sf):
+                # a tuned winner replayed on a pack whose scale layout the gather form cannot copy (the layer keys its
+                # winners by token bucket, not by layout): the record's box form, a placement of the same bits
+                c1 = dataclasses.replace(c1, gather_a=False)
         a = self._activation()
         static = pair.scaled and self._intermediate == "static"
         w = MoEWeightsFp4(

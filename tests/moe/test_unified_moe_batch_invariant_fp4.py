@@ -4139,6 +4139,71 @@ def test_explicit_gather_request_with_an_unsuitable_linear_layout_is_refused(pai
 
 @needs_device
 @each_pair
+def test_tuned_gather_winner_replayed_on_a_linear_pack_takes_the_box_form(pair):
+    """The layer keys a tuned winner by token bucket, routing mode and candidates, not by the pack's scale layout: a winner
+    tuned on the 128x4 pack at ``H = 96`` carries GEMM1's gather record, which the linear layout's six (NVFP4) or three
+    (MXFP4) scale bytes per row cannot feed, so its replay on a linear pack of the same layer takes the record's box form
+    (a placement: the same bits), never the op's refusal; tuned on the linear pack first, the box winner replays on the
+    128x4 pack. Every gather tactic of the 128x4 pack replayed directly on the linear pack gives the bits of a fresh layer."""
+    from flashinfer.autotuner import autotune
+    from flashinfer.fused_moe.batch_invariant.runner_fp4 import (
+        _configs_from_tactic_fp4,
+    )
+
+    T, k, H, I, E = 5, 2, 96, 64, 8
+    quant = _NVFP4_PTS if pair.scaled else _MX
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=97)
+    W_pack = _weights(w1, w2, quant=quant)
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    x4, sf, pts = _quantized(x, pair=pair)
+    sf_lin = _unswizzle(pair, sf, T, H).view(torch.uint8).reshape(T, H // pair.block)
+    mode = RoutingInputMode.UnpackedPrecomputed
+
+    def act(scale):
+        return MoEActivationPack(
+            x4, scale, topk_ids=ids, topk_weights=wts, routing_input_mode=mode, per_token_scale=pts
+        )  # fmt: skip
+
+    act128, actlin = act(sf), act(sf_lin.contiguous())
+    ref = bits(_layer(k, E, I, quant=quant)(actlin, W_pack))
+    assert torch.equal(bits(_layer(k, E, I, quant=quant)(act128, W_pack)), ref)
+    layer = _layer(k, E, I, quant=quant)
+    runner = layer.runners[0]
+    tactics = runner.get_valid_tactics(runner.pack_inputs(act128, W_pack), None)
+    gather = [t for t in tactics if t[7]]
+    assert bool(gather) == any(
+        c.gather_a for c in runner._ranked(T, H, gather_form=True)[0]
+    )
+    assert not any(
+        t[7] for t in runner.get_valid_tactics(runner.pack_inputs(actlin, W_pack), None)
+    )
+    for t in gather:
+        out = runner.forward(runner.pack_inputs(actlin, W_pack), tactic=t)
+        assert torch.equal(bits(out), ref), t
+    # tuned on the 128x4 pack: the cached winner (pinned to a gather record where the ranking has one; the autotuner's own
+    # pick is timing's) replays on the linear pack of the same layer
+    with autotune(True):
+        assert torch.equal(bits(layer(act128, W_pack)), ref)
+    (key, (winner, tactic)), *rest = layer._winners.items()
+    assert winner is runner and not rest
+    if gather:
+        layer._winners[key] = (runner, gather[0])
+        assert _configs_from_tactic_fp4(gather[0])[0].gather_a
+    assert torch.equal(bits(layer(actlin, W_pack)), ref)
+    assert torch.equal(bits(layer(act128, W_pack)), ref)
+    # the reverse order: the box winner of the linear pack replays on the 128x4 pack
+    layer2 = _layer(k, E, I, quant=quant)
+    with autotune(True):
+        assert torch.equal(bits(layer2(actlin, W_pack)), ref)
+    ((_, (_, tactic)),) = layer2._winners.items()
+    assert not _configs_from_tactic_fp4(tactic)[0].gather_a
+    assert torch.equal(bits(layer2(act128, W_pack)), ref)
+    assert torch.equal(bits(layer2(actlin, W_pack)), ref)
+
+
+@needs_device
+@each_pair
 def test_named_linear_scales_of_another_shape_are_refused(pair):
     """A scale tensor named linear (``sf_layout="linear"`` on the op, ``QuantConfig(swizzled_scale_factors=False)`` through
     the layer) must have the linear ``[T, H / block]`` shape: a one-byte tensor, the flat 128x4 buffer and rows of another
