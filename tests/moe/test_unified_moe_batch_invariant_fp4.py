@@ -4185,6 +4185,29 @@ def test_named_linear_scales_of_another_shape_are_refused(pair):
 
 
 @needs_device
+def test_op_constants_are_cached_per_indexed_device():
+    """The op's constants (the unread scale-byte atom, the unit per-token scale, the recipe's inverse base scale) are cached
+    by the indexed device: the unindexed ``"cuda"`` and the current device's ``"cuda:N"`` share one entry, so no spelling of
+    the device duplicates an allocation."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        TE_GS_INV,
+        _dummy_sf,
+        _gs_inv,
+        _placeholder,
+    )
+
+    cur = torch.device("cuda", torch.cuda.current_device())
+    for const in (_dummy_sf, _placeholder):
+        t = const("cuda")
+        assert (
+            t is const(cur) is const(torch.device("cuda")) is const(f"cuda:{cur.index}")
+        )
+        assert t.device == cur
+    t = _gs_inv(TE_GS_INV, "cuda")
+    assert t is _gs_inv(TE_GS_INV, cur) and t.device == cur
+
+
+@needs_device
 @pytest.mark.parametrize("which", ["nvfp4", "mxfp4", "static"])
 def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which):
     """A layer whose first forward runs under CUDA-graph capture (its constants are then device fills of that capture:

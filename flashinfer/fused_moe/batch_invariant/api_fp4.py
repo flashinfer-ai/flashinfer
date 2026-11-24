@@ -928,6 +928,15 @@ _DUMMY_SF: Dict[str, torch.Tensor] = {}
 _UNIT: Dict[str, torch.Tensor] = {}
 
 
+def _device_key(device) -> str:
+    """The constant caches' key for a device: its indexed form, so ``"cuda"`` and the current device's ``"cuda:N"`` share one
+    entry."""
+    d = torch.device(device)
+    if d.type == "cuda" and d.index is None:
+        d = torch.device("cuda", torch.cuda.current_device())
+    return str(d)
+
+
 def _const(cache: Dict, key, fill, device: torch.device) -> torch.Tensor:
     """A constant operand of the kernels, cached per device: built on the host (``fill(cpu)``) and copied with a blocking copy,
     so its bytes are on the device before the call returns and any stream may read it -- a captured call too (no node in the
@@ -945,7 +954,7 @@ def _dummy_sf(device: torch.device) -> torch.Tensor:
     """A 512-byte placeholder for an unread scale-byte operand (one atom: the kernels' alignment assumption), per device."""
     return _const(
         _DUMMY_SF,
-        str(torch.device(device)),
+        _device_key(device),
         lambda d: torch.zeros(512, dtype=torch.uint8, device=d),
         device,
     )
@@ -955,7 +964,7 @@ def _placeholder(device: torch.device) -> torch.Tensor:
     """A one-element fp32 tensor for the scatter kernels' unread per-token-scale operands, per device (no fill per call)."""
     return _const(
         _UNIT,
-        str(torch.device(device)),
+        _device_key(device),
         lambda d: torch.ones(1, dtype=torch.float32, device=d),
         device,
     )
@@ -995,7 +1004,7 @@ def _gs_inv(gs_inv: Union[float, torch.Tensor], device: torch.device) -> torch.T
     v = float(gs_inv)
     return _const(
         _GS_INV,
-        (str(torch.device(device)), v),
+        (_device_key(device), v),
         lambda d: torch.full((1,), v, dtype=torch.float32, device=d),
         device,
     )
