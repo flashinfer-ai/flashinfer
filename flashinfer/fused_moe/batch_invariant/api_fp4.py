@@ -204,21 +204,32 @@ def check_shape_fp4(
 
 
 def _scale_vector(t, name: str, E: int, device: torch.device) -> torch.Tensor:
-    """A per-expert vector of ``E`` multipliers as a contiguous fp32 ``[E]``, a copy of the caller's values (the view's
-    tensors never alias the caller's: its reciprocal is formed once beside it): finite, positive, normal values (their
-    reciprocals are factors of the class's chains); one element broadcasts to the experts."""
-    v = torch.as_tensor(t, dtype=torch.float32, device=device)
-    if v.numel() == 1:
-        v = v.reshape(1).expand(E)
-    if v.numel() != E:
-        raise ValueError(
-            f"{NV_CLASS}: {name} must hold one fp32 multiplier per expert ({E}), got shape {tuple(v.shape)}"
-        )
-    v = v.reshape(E).clone(memory_format=torch.contiguous_format)
+    """A per-expert vector of ``E`` multipliers as a contiguous fp32 ``[E]`` on ``device``, a copy of the caller's values
+    (the view's tensors never alias the caller's: its reciprocal is formed once beside it). The rule, checked before the
+    reciprocal with the mode's error: a floating tensor (or Python numbers) of shape ``[E]`` -- one element broadcasts to
+    the experts -- on the weights' device or the host, every value finite, positive and normal (their reciprocals are
+    factors of the class's chains)."""
+    limit = (
+        f"{name}: finite positive normal floating multipliers of shape [{E}] (one per expert; one element broadcasts) "
+        f"on the weights' device or the host"
+    )
+    if isinstance(t, torch.Tensor):
+        if not t.is_floating_point():
+            raise unsupported(NV_CLASS, f"{name} of dtype {t.dtype}", limit)
+        if t.device.type != "cpu" and t.device != torch.device(device):
+            raise unsupported(
+                NV_CLASS, f"{name} on {t.device} with weights on {device}", limit
+            )
+    v = torch.as_tensor(t, dtype=torch.float32)
+    if tuple(v.shape) not in ((), (1,), (E,)):
+        raise unsupported(NV_CLASS, f"{name} of shape {tuple(v.shape)}", limit)
+    v = v.reshape(-1).expand(E).to(device).clone(memory_format=torch.contiguous_format)
     tiny = torch.finfo(torch.float32).tiny
     if not bool(torch.isfinite(v).all()) or not bool((v >= tiny).all()):
-        raise ValueError(
-            f"{NV_CLASS}: {name} must be finite positive normal fp32 multipliers (at least {tiny:.4g})"
+        raise unsupported(
+            NV_CLASS,
+            f"{name} with a value that is not finite, positive and normal (at least {tiny:.4g})",
+            limit,
         )
     return v
 

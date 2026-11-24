@@ -3783,3 +3783,73 @@ def test_runner_support_state_is_initialised_at_construction():
         assert r._part is not None
 
 
+def test_intermediate_scales_are_validated_before_the_reciprocal():
+    """The static class's ``intermediate_scales`` (and the per-expert ``global_scales``): a floating tensor of shape ``[E]``
+    (one element broadcasts) on the weights' device or the host, every value finite, positive and normal, checked with the
+    mode's error naming the argument before the reciprocal is formed and before any expert is quantized: an integer
+    tensor, a wrong shape, zero, a negative, a subnormal, inf and NaN are refused; the valid forms give the view (on a
+    device), a scale on another CUDA device is refused where there is one."""
+    E, I, H = 4, 32, 64
+    g = torch.Generator().manual_seed(44)
+    w1 = torch.randn(E, 2 * I, H, generator=g).to(torch.bfloat16)
+    w2 = torch.randn(E, H, I, generator=g).to(torch.bfloat16)
+    bad = (
+        torch.ones(E, dtype=torch.int32),
+        torch.ones(E, 1),
+        torch.ones(E + 1),
+        torch.ones(2),
+        torch.zeros(E),
+        -torch.ones(E),
+        torch.full((E,), 1e-40),
+        torch.full((E,), float("inf")),
+        torch.tensor([1.0, float("nan"), 1.0, 1.0]),
+    )
+    for s in bad:
+        with pytest.raises(
+            bi.BatchInvariantUnsupportedError, match="intermediate_scales"
+        ) as e:
+            BatchInvariantFp4Config.prepare_weights(
+                w1, w2, activation=_SWIGLU, intermediate="static", intermediate_scales=s
+            )
+        assert NVFP4.cls in str(e.value)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match=r"global_scales\[1\]"):
+        MoEWeightsFp4.prepare(NVFP4, w1, w2, global_scales=(torch.ones(E), bad[4]))
+    if not _supported:
+        return
+    w1, w2 = w1.cuda(), w2.cuda()
+    gs2 = torch.exp2(torch.randint(-2, 3, (E,), generator=g).float())
+    ref = BatchInvariantFp4Config.prepare_weights(
+        w1,
+        w2,
+        activation=_SWIGLU,
+        intermediate="static",
+        intermediate_scales=gs2.cuda(),
+    )
+    assert torch.equal(ref["intermediate_scale"], gs2.cuda()) and torch.equal(
+        ref["intermediate_inv_scale"], torch.reciprocal(gs2.cuda())
+    )
+    for s in (gs2, gs2.double(), gs2.cuda().double(), gs2.tolist()):
+        view = BatchInvariantFp4Config.prepare_weights(
+            w1, w2, activation=_SWIGLU, intermediate="static", intermediate_scales=s
+        )
+        assert torch.equal(view["intermediate_scale"], ref["intermediate_scale"])
+        assert torch.equal(view["gemm2_weights"], ref["gemm2_weights"])
+    one = BatchInvariantFp4Config.prepare_weights(
+        w1,
+        w2,
+        activation=_SWIGLU,
+        intermediate="static",
+        intermediate_scales=torch.tensor([0.5]),
+    )
+    assert torch.equal(one["intermediate_scale"], torch.full((E,), 0.5, device="cuda"))
+    if torch.cuda.device_count() > 1:
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="cuda:1"):
+            BatchInvariantFp4Config.prepare_weights(
+                w1,
+                w2,
+                activation=_SWIGLU,
+                intermediate="static",
+                intermediate_scales=gs2.to("cuda:1"),
+            )
+
+
