@@ -724,7 +724,8 @@ class GluMxfp8Epilogue(_BaseGluMxfp8Epilogue):
             # Drain fc1 TMA/STG stores before publishing the fc1-done counter.
             if cur_was_linear1:
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.cp_async_bulk_wait_group(0)
+                cute.arch.fence_proxy("async")
                 cute.arch.fence_acq_rel_gpu()
 
             task_tile_boundary_bar.arrive_and_wait()

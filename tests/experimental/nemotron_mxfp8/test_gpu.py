@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """GB300 numerical, poisoned-slot and changed-route graph regression checks."""
 
 import unittest
@@ -108,6 +110,24 @@ class NativeNemotronTest(unittest.TestCase):
             self.assertLessEqual(local_error.item(), 0.01)
         torch.testing.assert_close(plan.run(x, ids, probs), out, rtol=0, atol=0)
         eager = out.clone()
+        # Rebinding the same tensor must invalidate its cached CuTe pointer.
+        original = x.detach()
+        replacement = x.clone().mul_(0.5)
+        rebound = sum(
+            reference(replacement, expert) * probs[:, slot, None]
+            for slot, expert in enumerate((0, 127))
+        )
+        x.set_(replacement)
+        plan.run(x, ids, probs, out=out)
+        self.assertLessEqual(((out - rebound).norm() / rebound.norm()).item(), 0.015)
+        x.set_(original)
+        setup_stream = torch.cuda.current_stream()
+        execution_stream = torch.cuda.Stream()
+        execution_stream.wait_stream(setup_stream)
+        with torch.cuda.stream(execution_stream):
+            plan.run(x, ids, probs, out=out)
+        setup_stream.wait_stream(execution_stream)
+        torch.testing.assert_close(out, eager, rtol=0, atol=0)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             plan.run(x, ids, probs, out=out)

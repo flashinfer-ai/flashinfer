@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """CPU checks for validation and launch ordering; runnable without CUDA imports."""
 
 import importlib.util

@@ -289,7 +289,9 @@ class LocalExpertPlan:
         Inputs have exactly the prepared bucket capacity. Use ID -1 for padding;
         other global IDs must be in [0, 512). Output is contiguous FP32 [T, H].
         Omitting `out` allocates an FP32 output. Values are not scanned on the host.
-        Input/output storage must not overlap.
+        Input/output storage must not overlap. When switching streams after
+        setup or a run, the caller must wait for the previous stream before
+        running or capturing. Separate plans must not execute concurrently.
         """
         if self._closed:
             raise RuntimeError("Nemotron plan is closed")
@@ -317,10 +319,10 @@ class LocalExpertPlan:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         key = hidden_states.data_ptr()
         entry = self._input_view
-        if entry is not None and entry[0].data_ptr() != key:
+        if entry is not None and entry[2] != key:
             entry = None
         if entry is None:
-            entry = (hidden_states, _cute(hidden_states))
+            entry = (hidden_states, _cute(hidden_states), key)
             self._input_view = entry
         route_mask(
             expert_ids,

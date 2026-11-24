@@ -39,8 +39,14 @@ Invalid contribution slots may contain stale data; assembly masks their loads.
 The plan runs on the current stream. Warm before capture; keep plans, packed
 weights and graph inputs/outputs alive until graphs are destroyed and queued
 work completes. Separate buckets require separate plans. Packed weights may be
-shared but must not be mutated. A plan cannot run concurrently on multiple
-streams. `close()` releases storage without synchronizing.
+shared but must not be mutated. Setup enqueues initialization and warmup on the
+current stream. Before running or capturing on another stream, the caller must
+order it after setup and any previous run, for example with
+`execution_stream.wait_stream(setup_stream)`. A plan cannot run concurrently on
+multiple streams. Separate plans on the same device must also execute serially:
+the persistent grids use a device-wide software barrier requiring residency.
+This restriction concerns concurrent expert plans, not independent mixer work.
+`close()` releases storage without synchronizing.
 
 ## Computation
 

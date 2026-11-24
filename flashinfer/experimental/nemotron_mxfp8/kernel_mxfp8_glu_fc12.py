@@ -1344,6 +1344,8 @@ class Sm100ClampedRelu2Mxfp8Fc12Kernel(_BaseFc12Kernel):
                         token_comm_args,
                         work_tile_info,
                     )
+                    # Dispatch scales use generic stores; TMA reads the async proxy.
+                    cute.arch.fence_proxy("async.global")
 
                     k_tile_cnt = k_tile_cnt_fc1
                     real_a, desc_ptr_a = ext.get_gmem_tensor(
