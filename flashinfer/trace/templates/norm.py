@@ -1081,16 +1081,18 @@ def _add_rmsnorm_fp4quant_reference(
     global_scale=None,
     eps: float = 1e-6,
     block_size: int = 16,
+    weight_bias: float = 0.0,
     **_unused,
 ):
     """Reference for cute_dsl.add_rmsnorm_fp4quant: residual+input then
     RMSNorm+FP4 quantize. Mutates ``residual`` in-place to hold
-    (input + residual) — matching the kernel's prenorm semantics."""
+    (input + residual) — matching the kernel's prenorm semantics.
+    ``weight_bias`` is added to the fp32 weight, as in the kernel."""
     pre = input.to(torch.float32) + residual.to(torch.float32)
     residual.copy_(pre.to(residual.dtype))
     return _rmsnorm_fp4quant_reference(
         pre,
-        weight,
+        weight.to(torch.float32) + float(weight_bias),
         y_fp4=y_fp4,
         block_scale=block_scale,
         global_scale=global_scale,
@@ -1275,6 +1277,11 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
         ),
         "eps": Scalar("float32", optional=True),
         "block_size": Scalar("int32", optional=True),
+        "weight_bias": Scalar(
+            "float32",
+            optional=True,
+            description="Added to weight in fp32; 1.0 gives Gemma-style (1 + w).",
+        ),
     },
     outputs=_RMSNORM_FP4_OUTPUTS,
     tags=["status:verified", "fused", "quantize:fp4"],
