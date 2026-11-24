@@ -13,7 +13,7 @@ Inputs bf16 / f16 / fp32 (one class per format: the 16-bit inputs are exact wide
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 
@@ -73,8 +73,8 @@ def device_sm_count(device) -> int:
     return _sm_count_cache[key]
 
 
-_get_compiled_kernel = None
-_device_support_pdl = None
+_get_compiled_kernel: Optional[Callable[..., Any]] = None
+_device_support_pdl: Optional[Callable[[torch.device], bool]] = None
 
 
 def _compiled_kernel(*key):
@@ -99,7 +99,7 @@ def _pdl_default(device) -> bool:
 
 
 def _rows(t: torch.Tensor, K: int, name: str) -> torch.Tensor:
-    if t.dim() == 2 and t.stride(1) == 1:
+    if t.dim() == 2 and t.stride(1) == 1 and t.shape[1] == K:
         return t  # already the kernel's (rows, K) form: no view, no check to repeat
     try:
         t2 = t.view(-1, K)

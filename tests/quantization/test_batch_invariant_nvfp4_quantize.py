@@ -484,6 +484,46 @@ def test_global_scale_forms_and_the_float_scale_cache():
 
 
 @needs_device
+def test_float_scale_cache_keys_and_bound():
+    """The cached float scale is keyed by the value's bits: ``+0.0`` and ``-0.0`` are different tensors (each the bits of
+    the tensor-scale path with the same signed zero; ``0.0 == -0.0`` as a dict key would make the result depend on which
+    was filled first), a NaN is one entry (a NaN never equals itself as a key), and the bound is per user of the cache:
+    exhausting the quantizer's own bound leaves another user's entries cacheable. A 2-D buffer of another width (the same
+    element count) is viewed to the kernel's rows, not passed through."""
+    from flashinfer.batch_invariant import const_tensor as CT
+    from flashinfer.batch_invariant.quantization.mx_api import _rows
+
+    x = adversarial_inputs(37, 256, torch.bfloat16, seed=11)
+    for z in (0.0, -0.0):
+        zt = torch.tensor([z], dtype=torch.float32, device="cuda")
+        assert same_bits(_quantize(x, z), _quantize(x, zt)), z
+    assert not same_bits(_quantize(x, 0.0), _quantize(x, -0.0))
+    p = CT.const_fill((1,), 0.0, torch.float32, "cuda", kind="test_keys")
+    n = CT.const_fill((1,), -0.0, torch.float32, "cuda", kind="test_keys")
+    assert p is not n and not torch.signbit(p).item() and torch.signbit(n).item()
+    nan1 = CT.const_fill((1,), float("nan"), torch.float32, "cuda", kind="test_keys")
+    nan2 = CT.const_fill((1,), float("nan"), torch.float32, "cuda", kind="test_keys")
+    assert nan1 is nan2 and torch.isnan(nan1).item()
+    for i in range(CT._CACHE_MAX + 8):
+        CT.const_fill(
+            (1,), 1.0 + i * 2.0**-20, torch.float32, "cuda", kind="test_bound"
+        )
+    assert CT._COUNTS["test_bound"] == CT._CACHE_MAX
+    extra = 7.0
+    a = CT.const_fill((1,), extra, torch.float32, "cuda", kind="test_bound")
+    b = CT.const_fill((1,), extra, torch.float32, "cuda", kind="test_bound")
+    assert a is not b, "past its bound a kind fills a fresh tensor per call"
+    other = CT.const_fill((1,), extra, torch.float32, "cuda", kind="test_other")
+    assert CT.const_fill((1,), extra, torch.float32, "cuda", kind="test_other") is other
+    for k in [k for k in CT._CACHE if k[0].startswith("test_")]:
+        del CT._CACHE[k]
+    for k in [k for k in CT._COUNTS if k.startswith("test_")]:
+        del CT._COUNTS[k]
+    t = torch.empty(16, 512, device="cuda")
+    assert _rows(t, 256, "t").shape == (32, 256) and _rows(t, 512, "t") is t
+
+
+@needs_device
 def test_fp4_quantize_entry_point_runs_the_class():
     """``flashinfer.fp4_quantize(..., batch_invariant=True)``, the entry point behind ``nvfp4_quantize``, runs the per-tensor
     class with its own argument forms: the layout flags, ``global_scale`` None as the scale 1.0, ``is_global_scale_inversed``

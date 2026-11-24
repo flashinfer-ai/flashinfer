@@ -14,15 +14,30 @@ cannot be waited on inside it). The cache is bounded; past the bound a call fill
 
 from __future__ import annotations
 
+import struct
 from typing import Dict, Tuple
 
 import torch
 
 __all__ = ["const_fill"]
 
-#: (device, dtype, value, shape) -> [tensor, fill event or None once the fill is known complete]
+#: (kind, device, dtype, value key, shape) -> [tensor, fill event or None once the fill is known complete]
 _CACHE: Dict[tuple, list] = {}
+#: entries per ``kind`` (one user of the cache, e.g. the NVFP4 global scale or the samplers' per-row filters): past the bound
+#: a call of that kind fills a fresh tensor; another kind's entries are unaffected
 _CACHE_MAX = 256
+_COUNTS: Dict[str, int] = {}
+
+
+def _value_key(value):
+    """A Python float by its IEEE-754 bits -- ``+0.0`` and ``-0.0`` are different tensors (``0.0 == -0.0`` would share a
+    dict key and the result would depend on which was filled first), and a NaN is one entry instead of a new one per call
+    (``nan != nan`` never finds its own key); an int (or bool) by its value."""
+    if isinstance(value, float):
+        return ("f", struct.pack("<d", value))
+    if isinstance(value, (bool, int)):
+        return ("i", int(value))
+    return ("o", value)
 
 
 def _capturing(dev: torch.device) -> bool:
@@ -32,22 +47,27 @@ def _capturing(dev: torch.device) -> bool:
     return torch.cuda.is_current_stream_capturing()
 
 
-def const_fill(shape: Tuple[int, ...], value, dtype: torch.dtype, device) -> torch.Tensor:
-    """The tensor ``torch.full(shape, value, dtype=dtype, device=device)``, cached per (device, dtype, value, shape) and
-    ordered across streams (module docstring). The caller must only read it."""
+def const_fill(
+    shape: Tuple[int, ...], value, dtype: torch.dtype, device, kind: str = "const"
+) -> torch.Tensor:
+    """The tensor ``torch.full(shape, value, dtype=dtype, device=device)``, cached per (kind, device, dtype, value, shape)
+    and ordered across streams (module docstring); ``kind`` names the user, each with its own bound. The caller must only
+    read it. Entries are never evicted: a tensor handed out may still be read by a kernel in flight on another stream,
+    and the bound-and-fallback keeps every such tensor alive."""
     dev = torch.device(device)
     if dev.index is None:
         dev = torch.device(dev.type, torch.cuda.current_device())
     if _capturing(dev):
         return torch.full(shape, value, dtype=dtype, device=dev)
-    key = (dev, dtype, value, shape)
+    key = (kind, dev, dtype, _value_key(value), shape)
     entry = _CACHE.get(key)
     if entry is None:
         t = torch.full(shape, value, dtype=dtype, device=dev)
-        if len(_CACHE) < _CACHE_MAX:
+        if _COUNTS.get(kind, 0) < _CACHE_MAX:
             fill_done = torch.cuda.Event()
             fill_done.record(torch.cuda.current_stream(dev))
             _CACHE[key] = [t, fill_done]
+            _COUNTS[kind] = _COUNTS.get(kind, 0) + 1
         return t
     t, fill_done = entry
     if fill_done is not None:
