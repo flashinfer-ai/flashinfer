@@ -621,7 +621,8 @@ class TuningConfig:
             not answer a full-profiling request, while ordinary lookup and
             ordinary tuning use a full-profiling winner of the same call (see
             ``AutoTuner._accepted_profiling_policies``). A comparison in which
-            the clock could not be confirmed for some sample is not cached.
+            the clock could not be confirmed for some sample (on any rank of
+            the autotune process group) is not cached.
     """
 
     dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = ()
@@ -3898,18 +3899,38 @@ class AutoTuner:
                                 self._full_profiling_unconfirmed_samples
                                 - unconfirmed_before
                             )
-                            if unconfirmed:
+                            group_unconfirmed = bool(unconfirmed)
+                            if (
+                                tuning_config.full_profiling
+                                and _tune_process_group is not None
+                            ):
+                                # The timings are group means, so a sample
+                                # without a confirmed clock on any rank went
+                                # into this winner: decide on caching together.
+                                # Every rank gets here once per profile with a
+                                # winner (same all-reduced timings).
+                                status, _ = _tuning_group_agreement(
+                                    ("full_profiling_clock", custom_op, _step),
+                                    (),
+                                    int(group_unconfirmed),
+                                )
+                                group_unconfirmed = status > 0
+                            if group_unconfirmed:
+                                where = (
+                                    f"before {unconfirmed} sample(s) on this rank"
+                                    if unconfirmed
+                                    else "on another rank of the tuning group"
+                                )
                                 logger.warning(
                                     f"[Autotuner]: Full profiling of {custom_op} "
                                     f"for {p.get_opt_shapes()}: the SM clock "
-                                    f"could not be confirmed as recovered "
-                                    f"before {unconfirmed} sample(s) (NVML "
-                                    f"unavailable, or still limited after "
+                                    f"could not be confirmed as recovered {where} "
+                                    f"(NVML unavailable, or still limited after "
                                     f"{self._FULL_PROFILING_CLOCK_TIMEOUT_S} s). "
                                     f"The winner is used for this call but is "
                                     f"not cached as a full-profiling result."
                                 )
-                            if unconfirmed or (
+                            if group_unconfirmed or (
                                 profiling_candidates is not None
                                 and not comparison_complete
                             ):
