@@ -1388,14 +1388,16 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
     attention_scratch_bytes = attention_layout.total_bytes
     uses_split_kv = attention_layout.uses_split_kv
-    # Persistent grouped launches take routes longest first: the metadata
-    # writes their order right after seq_lens, where the attention work queue
-    # reads it (seq_lens + routes). Split-KV and static grids read none.
+    # Persistent grouped launches that share one pattern across KV heads take
+    # routes longest first: the metadata writes their order right after
+    # seq_lens, where the attention work queue reads it (seq_lens + routes).
+    # Split-KV and static grids, and per-head patterns (even with one KV
+    # head), read none; the same config properties gate the planner.
     route_order_bytes = (
         metadata_rows * 4
         if packed_query
         and group_size > 1
-        and pattern_heads == 1
+        and spec.config.shares_sparse_pattern
         and spec.config.use_persistent_scheduler
         else 0
     )

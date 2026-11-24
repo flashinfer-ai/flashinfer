@@ -28,6 +28,7 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     _build_q_token_kv_block_sparse_metadata as build_prims_ts_q_token_kv_block_sparse_metadata,
     _get_q_token_kv_block_sparse_metadata_output_shapes as get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes,
     _get_prims_ts_q_token_kv_block_sparse_workspace_layout,
+    _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors,
     _prepare_q_token_kv_block_sparse_attention as prepare_prims_ts_q_token_kv_block_sparse_attention,
     _validate_wide_metadata_fits,
     get_q_token_kv_block_sparse_workspace_size,
@@ -4830,6 +4831,23 @@ def test_persistent_routes_run_longest_first(
         dtype=torch.uint8,
         device="cuda",
     )
+    # Only shared patterns take the order, so per-head patterns reserve no
+    # route-order region, even with one KV head.
+    for share, route_order_bytes in ((True, 4 * (qo_indptr.numel() - 1)), (False, 0)):
+        layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
+            query,
+            caches[0],
+            table,
+            block_topk,
+            max_seq_len_kv=max(seq_lens),
+            out_dtype=torch.bfloat16,
+            qo_indptr=qo_indptr,
+            group_size=group_size,
+            sparse_block_size=block_size,
+            split_kv=False,
+            share_pattern_across_kv_heads=share,
+        )
+        assert layout.route_order_bytes == route_order_bytes, share
 
     def plan(balanced_scheduler):
         wrapper = QTokenKvBlockSparsePagedTSWrapper()
