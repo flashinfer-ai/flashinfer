@@ -229,8 +229,8 @@ def test_records_unified_rank0(monkeypatch):
 
 
 def test_records_unified_graph():
-    """A captured graph computes the GEMM scalars from its view's scales as it replays: another
-    view's cached ones do not reach it, a scale updated in place does, as on SM100."""
+    """A captured graph reads its view's scales on every replay: an eager call on another view in
+    between doesn't reach it, and a scale updated in place does, as on SM100."""
     m, tokens = _model(True), 37
     x = torch.randn(tokens, H, device="cuda").bfloat16()
     ids, weights = _routing(tokens)
@@ -257,11 +257,11 @@ def test_records_unified_graph():
     act = MoEActivationPack(
         hidden_states_q=x, hidden_states_scale=None, topk_ids=ids, topk_weights=weights
     )
-    ref = layer(act, packs[0])  # caches the first view's scalars
+    ref = layer(act, packs[0])
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = layer(act, packs[0])
-    layer(act, packs[1])  # the second view's replace them; their memory is taken again
+    layer(act, packs[1])  # the second view, then the memory it freed taken again
     junk = [torch.full((E,), float("nan"), device="cuda") for _ in range(16)]
     graph.replay()
     torch.testing.assert_close(out, ref, atol=0, rtol=0)
