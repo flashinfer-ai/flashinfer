@@ -4549,6 +4549,107 @@ def test_empty_prequantized_pack_names_the_128x4_layout_and_gives_an_empty_outpu
 
 @needs_device
 @each_pair
+def test_prequantized_128x4_buffers_carry_zero_pad_columns(pair):
+    """The pre-quantized pack's contract on the 128x4 scale buffer: its pad columns -- present where a row's scale columns
+    are not a multiple of 4 (``H`` not a multiple of 64 for NVFP4, of 128 for MXFP4; shapes no other FlashInfer MoE backend
+    accepts) -- are zero, as every FlashInfer quantizer writes them: the mode's quantizers and the standard
+    ``nvfp4_quantize`` / ``mxfp4_quantize`` kernels at the same layout, for every live row (the pad bytes located by the
+    128x4 layout). No kernel reads the contract: the scatter and the gather copy a row's last 4-byte group as given, so a
+    standard quantizer's pack runs through the op and the layer -- the mode's pack's bits where its codes and scales agree,
+    finite otherwise. The contract is stated where the pack is documented."""
+    import pathlib
+
+    from flashinfer import mxfp4_quantize, nvfp4_quantize
+    from flashinfer.batch_invariant.quantization.layout import (
+        SF_COL_TILE,
+        num_blocks,
+        padded_sf_cols,
+        sf_offset_128x4,
+    )
+    from flashinfer.batch_invariant.quantization.nvfp4_api import nvfp4_quantize_rows
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import (
+        TE_GS_INV,
+        fused_moe_fp4,
+        quantize_activations,
+        quantize_rows_mx,
+    )
+    from flashinfer.tllm_enums import SfLayout
+
+    readme = (pathlib.Path(bi.__file__).parent / "README.md").read_text()
+    rows = [
+        line
+        for line in readme.splitlines()
+        if line.startswith("| `MoELayer` with `BatchInvariantFp4Config`")
+    ]
+    assert len(rows) == 2 and all("pad columns" in r and "are zero" in r for r in rows)
+    assert "pad columns are zero" in fused_moe_fp4.__doc__
+    assert "pad columns zero" in BatchInvariantFp4Config.__doc__
+    T, k, I, E = 37, 2, 64, 8
+    mode = RoutingInputMode.UnpackedPrecomputed
+    for H in (96,) if pair.scaled else (96, 160):
+        nb, pc = num_blocks(H, pair.block), padded_sf_cols(H, pair.block, "128x4")
+        assert nb % SF_COL_TILE and pc > nb  # pad columns exist at this H
+        pad = torch.tensor(
+            [sf_offset_128x4(t, c, pc) for t in range(T) for c in range(nb, pc)],
+            device="cuda",
+        )
+        x, logits, w1, w2 = _problem(T, k, H, I, E, seed=160 + H)
+        W_pack = _weights(w1, w2, quant=_QUANT[pair])
+        W = _weights_of(W_pack)
+        ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+        ids, wts = ids.cuda(), wts.cuda()
+        u8 = lambda t: t.view(torch.uint8)  # noqa: E731
+        # (name, codes, flat scale bytes, per-token scales, the mode's twin pack to compare with)
+        if pair.scaled:
+            x4, sf, pts = quantize_activations(x)
+            q_s, sf_s, pts_s = nvfp4_quantize(
+                x, TE_GS_INV, SfLayout.layout_128x4, per_token_activation=True, nvfp4_4over6=None
+            )  # fmt: skip
+            x4t, sft = nvfp4_quantize_rows(x, 1.0, "128x4")
+            one = torch.ones(1, dtype=torch.float32, device="cuda")
+            q_t, sf_t = nvfp4_quantize(x, one, SfLayout.layout_128x4)
+            packs = [
+                ("mode per-token", x4, sf, pts, None),
+                ("standard per-token", u8(q_s), u8(sf_s).reshape(-1), pts_s.float(), "mode per-token"),
+                ("mode per-tensor", x4t, sft.reshape(-1), None, None),
+                ("standard per-tensor", u8(q_t), u8(sf_t).reshape(-1), None, "mode per-tensor"),
+            ]  # fmt: skip
+        else:
+            x4, sf = quantize_rows_mx(x)
+            q_s, sf_s = mxfp4_quantize(x, sfLayout=SfLayout.layout_128x4)
+            packs = [
+                ("mode", x4, sf, None, None),
+                ("standard", u8(q_s), u8(sf_s).reshape(-1), None, "mode"),
+            ]
+        outs, raw = {}, {}
+        for name, x4_, sf_, pts_, twin in packs:
+            n = pair.sf_numel(T, H)
+            assert sf_.numel() >= n and tuple(x4_.shape) == (T, H // 2), name
+            assert torch.all(sf_[pad] == 0), (name, H)
+            out = fused_moe_fp4(_pack(pair, x4_, sf_, pts_), ids, wts, W)
+            assert torch.isfinite(out).all(), name
+            quant = (_NVFP4_PTS if pts_ is not None else _NVFP4) if pair.scaled else _MX
+            act = MoEActivationPack(
+                x4_, sf_, topk_ids=ids, topk_weights=wts, routing_input_mode=mode, per_token_scale=pts_
+            )  # fmt: skip
+            assert torch.equal(
+                bits(_layer(k, E, I, quant=quant)(act, W_pack)), bits(out)
+            )
+            outs[name] = bits(out)
+            raw[name] = (x4_, sf_[:n], None if pts_ is None else bits(pts_))
+            if twin is not None:
+                a, b = raw[name], raw[twin]
+                same = (
+                    torch.equal(a[0], b[0])
+                    and torch.equal(a[1], b[1])
+                    and (a[2] is None or torch.equal(a[2], b[2]))
+                )
+                if same:
+                    assert torch.equal(outs[name], outs[twin]), (name, H)
+
+
+@needs_device
+@each_pair
 def test_named_linear_scales_of_another_shape_are_refused(pair):
     """A scale tensor named linear (``sf_layout="linear"`` on the op, ``QuantConfig(swizzled_scale_factors=False)`` through
     the layer) must have the linear ``[T, H / block]`` shape: a one-byte tensor, the flat 128x4 buffer and rows of another
