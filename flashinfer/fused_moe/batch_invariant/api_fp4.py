@@ -723,14 +723,24 @@ def gather_sf_layout(
     layout: Optional[str] = None,
     cls: str = NV_CLASS,
 ) -> str:
-    """The layout of a scale operand of ``T`` rows of ``K`` elements: ``layout`` names it (``"128x4"`` / ``"linear"``); otherwise
-    the shape does where it can -- a tensor that is not a 2-D ``[T, K / block]`` is the flat 128x4 buffer, a 2-D ``[T, K / block]``
-    tensor the linear layout, unless the swizzled buffer has that shape too (:func:`sf_layouts_collide`), which is refused: the
-    caller names the layout (``QuantConfig(swizzled_scale_factors=...)`` through the layer, ``sf_layout`` on the op) or flattens
-    the quantizer's buffer."""
+    """The layout of a scale operand of ``T`` rows of ``K`` elements: ``layout`` names it (``"128x4"`` / ``"linear"``, a tensor
+    named linear with another shape refused); otherwise the shape does where it can -- a tensor that is not a 2-D
+    ``[T, K / block]`` is the flat 128x4 buffer, a 2-D ``[T, K / block]`` tensor the linear layout, unless the swizzled buffer
+    has that shape too (:func:`sf_layouts_collide`), which is refused: the caller names the layout
+    (``QuantConfig(swizzled_scale_factors=...)`` through the layer, ``sf_layout`` on the op) or flattens the quantizer's
+    buffer."""
     if layout is not None:
         if layout not in SF_LAYOUTS:
             raise ValueError(f"sf_layout must be one of {SF_LAYOUTS}, not {layout!r}")
+        if layout == "linear" and (
+            a_sf.dim() != 2 or tuple(a_sf.shape) != (T, K // block)
+        ):
+            raise unsupported(
+                cls,
+                f"scale factors of shape {tuple(a_sf.shape)} for {T} rows named linear",
+                f"the linear [{T}, {K // block}] layout (QuantConfig(swizzled_scale_factors=False) through the layer, "
+                "sf_layout='linear' on the op)",
+            )
         return layout
     if a_sf.dim() != 2 or tuple(a_sf.shape) != (T, K // block):
         return "128x4"

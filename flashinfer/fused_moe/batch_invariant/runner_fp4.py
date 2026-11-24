@@ -370,14 +370,9 @@ class BatchInvariantFp4Runner(MoERunner):
             )
         flag = self.config.quant.swizzled_scale_factors
         named = None if flag is None else ("128x4" if flag else "linear")
+        # the one layout rule; a tensor named linear with another shape is refused there
         layout = gather_sf_layout(sf, T, H, pair.block, named, cls)
         if layout == "linear":
-            if sf.ndim != 2 or tuple(sf.shape) != (T, H // pair.block):
-                raise unsupported(
-                    cls,
-                    f"hidden_states_scale of shape {tuple(sf.shape)} under QuantConfig(swizzled_scale_factors=False)",
-                    f"the linear [{T}, {H // pair.block}] layout",
-                )
             sf_flat = (
                 sf.contiguous()
             )  # the op's scatter assembles the 128x4 atoms from the rows

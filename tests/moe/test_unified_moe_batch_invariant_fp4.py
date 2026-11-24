@@ -4121,6 +4121,66 @@ def test_explicit_gather_request_with_an_unsuitable_linear_layout_is_refused(pai
 
 
 @needs_device
+@each_pair
+def test_named_linear_scales_of_another_shape_are_refused(pair):
+    """A scale tensor named linear (``sf_layout="linear"`` on the op, ``QuantConfig(swizzled_scale_factors=False)`` through
+    the layer) must have the linear ``[T, H / block]`` shape: a one-byte tensor, the flat 128x4 buffer and rows of another
+    column count are refused with the mode's error naming the layout before any kernel, on every form of the op and through
+    the layer, instead of reaching the kernels as rows; the linear rows and the 128x4 buffer run as before."""
+    from flashinfer.fused_moe.batch_invariant.api_fp4 import fused_moe_fp4
+
+    T, k, H, I, E = 2, 2, 128, 64, 4
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=734)
+    W_pack = _weights(w1, w2, quant=_QUANT[pair])
+    W = _weights_of(W_pack)
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    x4, sf, pts = _quantized(x, pair=pair)
+    cols = H // pair.block
+    sf_lin = _unswizzle(pair, sf, T, H).view(torch.uint8).reshape(T, cols)
+    ref = bits(fused_moe_fp4(_pack(pair, x4, sf, pts), ids, wts, W))
+    assert torch.equal(
+        bits(
+            fused_moe_fp4(_pack(pair, x4, sf_lin, pts), ids, wts, W, sf_layout="linear")
+        ),
+        ref,
+    )
+    wrong = (
+        torch.zeros(1, dtype=torch.uint8, device="cuda"),
+        sf.reshape(-1),
+        sf_lin[:, : cols - 1].contiguous(),
+        torch.zeros(T, cols + 4, dtype=torch.uint8, device="cuda"),
+    )
+    for bad in wrong:
+        for gather in (None, False, True):
+            with pytest.raises(bi.BatchInvariantUnsupportedError, match="linear") as e:
+                fused_moe_fp4(
+                    _pack(pair, x4, bad, pts),
+                    ids,
+                    wts,
+                    W,
+                    sf_layout="linear",
+                    gather=gather,
+                )
+            assert pair.cls in str(e.value) and str(tuple(bad.shape)) in str(e.value)
+    base = _NVFP4_PTS if pair.scaled else _MX
+    layer = _layer(
+        k, E, I, quant=dataclasses.replace(base, swizzled_scale_factors=False)
+    )
+    mode = RoutingInputMode.UnpackedPrecomputed
+
+    def pack(scale):
+        return MoEActivationPack(
+            x4, scale, topk_ids=ids, topk_weights=wts, routing_input_mode=mode, per_token_scale=pts
+        )  # fmt: skip
+
+    for bad in wrong:
+        with pytest.raises(bi.BatchInvariantUnsupportedError, match="linear"):
+            layer(pack(bad), W_pack)
+    assert torch.equal(bits(layer(pack(sf_lin), W_pack)), ref)
+
+
+@needs_device
 @pytest.mark.parametrize("which", ["nvfp4", "mxfp4", "static"])
 def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which):
     """A layer whose first forward runs under CUDA-graph capture (its constants are then device fills of that capture:
