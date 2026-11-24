@@ -38,6 +38,7 @@ from .api_logging import (
 from .jit.spdlog import gen_spdlog_module
 
 logger = logging.getLogger(__name__)
+_get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
 class PosEncodingMode(Enum):
@@ -1048,6 +1049,74 @@ def _get_trtllm_gen_multi_ctas_kv_counter_buffer(
         batch_size, num_qo_heads, sm_count
     )
     return torch.zeros(counter_bytes, dtype=torch.uint8, device=device)
+
+
+def _get_trtllm_gen_workspace_counter_buffer(
+    workspace_buffer: torch.Tensor,
+    batch_size: int,
+    num_qo_heads: int,
+    sm_count: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Reuse zero-once counters owned by the caller's workspace tensor.
+
+    Workspace users must serialize their launches, including graph replay, as
+    they already do for the native scratch storage. Retain replaced counters
+    because older captured graphs can still reference them.
+    """
+    state_attr = "_flashinfer_trtllm_gen_multi_ctas_kv_counter_buffers"
+    allocation_stream_attr = "_flashinfer_trtllm_gen_counter_allocation_stream"
+    counters = getattr(workspace_buffer, state_attr, None)
+    required_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    if counters:
+        counter = counters[-1]
+        if counter.device == device:
+            if counter.numel() >= required_bytes:
+                stream = None
+                if (
+                    _get_current_raw_stream is not None
+                    and isinstance(device, torch.device)
+                    and device.type == "cuda"
+                    and device.index is not None
+                    and torch.cuda.is_initialized()
+                ):
+                    # Read the thread-current stream without constructing a
+                    # Stream object on the usual allocation-stream path.
+                    stream_ptr = _get_current_raw_stream(device.index)
+                else:
+                    stream = torch.cuda.current_stream(device)
+                    stream_ptr = stream.cuda_stream
+                if stream_ptr != getattr(counter, allocation_stream_attr, None):
+                    # Other streams can outlive the workspace owner. Preserve
+                    # their registration, including capture bookkeeping.
+                    if stream is None:
+                        stream = torch.cuda.current_stream(device)
+                    counter.record_stream(stream)
+                return counter
+            # Retain old graph pointers without accumulating an allocation for
+            # every small batch increase. All retained capacities sum to less
+            # than twice the newest capacity on this workspace's device.
+            required_bytes = max(required_bytes, 2 * counter.numel())
+
+    counter = torch.zeros(required_bytes, dtype=torch.uint8, device=device)
+    with torch.cuda.device(device):
+        capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing:
+        setattr(
+            counter,
+            allocation_stream_attr,
+            torch.cuda.current_stream(device).cuda_stream,
+        )
+        if counters is None:
+            counters = []
+            setattr(workspace_buffer, state_attr, counters)
+        counters.append(counter)
+    # During capture, zeros() records initialization without executing it. Do
+    # not publish that buffer for an eager call or another graph to reuse before
+    # initialization. A warmup outside capture enables the zero-free path.
+    return counter
 
 
 def _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(

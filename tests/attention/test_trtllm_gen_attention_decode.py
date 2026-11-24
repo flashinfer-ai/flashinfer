@@ -4,6 +4,8 @@ import os
 import re
 import subprocess
 import sys
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from typing import Union
 
 import pytest
@@ -27,6 +29,7 @@ from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 import flashinfer
 from flashinfer.utils import (
     FP4Tensor,
+    _get_trtllm_gen_workspace_counter_buffer,
     ceil_div,
     get_compute_capability,
     get_device_sm_count,
@@ -51,6 +54,7 @@ workspace_size = 256 * 1024 * 1024
 
 # Size of the guard region we zero past the softmax slab.
 TRTLLM_GEN_WORKSPACE_CHECK_BYTES = 1 * 1024 * 1024
+_WORKSPACE_COUNTERS_ATTR = "_flashinfer_trtllm_gen_multi_ctas_kv_counter_buffers"
 
 
 def _trtllm_gen_softmax_slab_bytes(
@@ -1045,44 +1049,82 @@ def _test_trtllm_batch_decode(
         assert multi_ctas_kv_counter_buffer is not None
         assert torch.count_nonzero(multi_ctas_kv_counter_buffer).item() == 0
         reused_out = torch.empty_like(output)
-        reused_output = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            q_input,
-            kv_cache_arg,
-            workspace_buffer,
-            page_table_kernel,
-            seq_lens.to(GPU_DEVICE),
-            torch.max(seq_lens).item(),
-            bmm1_scale,
-            bmm2_scale,
-            window_left,
-            out=reused_out,
-            out_dtype=out_dtype,
-            o_sf_scale=o_sf_scale,
-            o_sf_vec_size=o_sf_vec_size,
-            sinks=(sink if enable_sink else None),
-            kv_layout=kv_layout,
-            enable_pdl=enable_pdl,
-            backend=backend,
-            q_len_per_req=q_len_per_req,
-            o_scale=o_scale,
-            mask=mask,
-            max_q_len=max_q_len if max_q_len is not None else None,
-            cum_seq_lens_q=q_indptr if max_q_len is not None else None,
-            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-            kv_cache_sf=kv_cache_sf_kernel,
-            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-            bmm1_scale_log2=bmm1_scale_log2,
-            multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
-        )
-        assert reused_output.data_ptr() == reused_out.data_ptr()
-        assert torch.count_nonzero(multi_ctas_kv_counter_buffer).item() == 0
-        assert_close_with_mismatch_tolerance(
-            reused_output.float() * o_scale,
-            output.float() * o_scale,
-            rtol=rtol,
-            atol=atol,
-            max_mismatched_elements=max_mismatched_elements,
-        )
+
+        def run_with_counter(counter):
+            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                q_input,
+                kv_cache_arg,
+                workspace_buffer,
+                page_table_kernel,
+                seq_lens.to(GPU_DEVICE),
+                torch.max(seq_lens).item(),
+                bmm1_scale,
+                bmm2_scale,
+                window_left,
+                out=reused_out,
+                out_dtype=out_dtype,
+                o_sf_scale=o_sf_scale,
+                o_sf_vec_size=o_sf_vec_size,
+                sinks=(sink if enable_sink else None),
+                kv_layout=kv_layout,
+                enable_pdl=enable_pdl,
+                backend=backend,
+                q_len_per_req=q_len_per_req,
+                o_scale=o_scale,
+                mask=mask,
+                max_q_len=max_q_len if max_q_len is not None else None,
+                cum_seq_lens_q=q_indptr if max_q_len is not None else None,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                kv_cache_sf=kv_cache_sf_kernel,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                bmm1_scale_log2=bmm1_scale_log2,
+                multi_ctas_kv_counter_buffer=counter,
+            )
+
+        cached = None
+        for counter in (
+            multi_ctas_kv_counter_buffer,
+            None,
+            None,
+            multi_ctas_kv_counter_buffer,
+        ):
+            before = tuple(getattr(workspace_buffer, _WORKSPACE_COUNTERS_ATTR, ()))
+            reused_output = run_with_counter(counter)
+            assert reused_output.data_ptr() == reused_out.data_ptr()
+            assert_close_with_mismatch_tolerance(
+                reused_output.float() * o_scale,
+                output.float() * o_scale,
+                rtol=rtol,
+                atol=atol,
+                max_mismatched_elements=max_mismatched_elements,
+            )
+            current = getattr(workspace_buffer, _WORKSPACE_COUNTERS_ATTR, ())
+            if counter is None:
+                if cached is not None:
+                    assert current[-1] is cached
+                cached = current[-1]
+            else:
+                assert len(current) == len(before)
+                assert all(a is b for a, b in zip(current, before, strict=True))
+                assert torch.count_nonzero(counter).item() == 0
+        assert torch.count_nonzero(cached).item() == 0
+
+        # A populated default cache must not bypass explicit-buffer validation.
+        for invalid, message in (
+            (torch.empty(4, device=GPU_DEVICE, dtype=torch.uint8), "too small"),
+            (
+                torch.empty_like(multi_ctas_kv_counter_buffer, device="cpu"),
+                "same device",
+            ),
+            (
+                torch.empty(counter_bytes * 2, device=GPU_DEVICE, dtype=torch.uint8)[
+                    ::2
+                ],
+                "contiguous",
+            ),
+        ):
+            with pytest.raises(ValueError, match=message):
+                run_with_counter(invalid)
 
     # NVFP4 KV cache: use cosine similarity instead of element-wise comparison.
     # Cosine similarity is scale-invariant, which is important because the
@@ -1663,6 +1705,156 @@ def test_trtllm_batch_decode_gpt_oss_counter_reuse():
         uses_shared_paged_kv_idx=True,
         reuse_multi_ctas_kv_counter_buffer=True,
     )
+
+
+@pytest.mark.parametrize(
+    "stream_lookup", ["raw", "fallback", "missing_metadata", "growth"]
+)
+def test_trtllm_workspace_counter_release_after_stream_handoff(
+    monkeypatch, stream_lookup
+):
+    # Isolate allocator lifetime from the native semaphore kernel: a read of
+    # the counter is sufficient, and probes never overwrite recycled storage.
+    device = torch.device("cuda", torch.cuda.current_device())
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    torch.cuda._sleep(1)
+    torch.zeros(16, device=device, dtype=torch.uint8).sum()
+    torch.cuda.synchronize()
+    if stream_lookup == "fallback":
+        monkeypatch.setattr(flashinfer.utils, "_get_current_raw_stream", None)
+    allocation_stream = torch.cuda.Stream()
+    use_stream = (
+        torch.cuda.current_stream()
+        if stream_lookup == "missing_metadata"
+        else torch.cuda.Stream()
+    )
+    batch = 1
+    with torch.cuda.stream(use_stream):
+        workspace = torch.zeros(4096, device=device, dtype=torch.uint8)
+        if stream_lookup == "growth":
+            # Grow on A after allocating on B: the larger counter must keep
+            # its own origin, not inherit the old allocation's stream.
+            initial_size = _get_trtllm_gen_workspace_counter_buffer(
+                workspace, 1, 16, sm_count, device
+            ).numel()
+            batch = initial_size // (4 * 16) + 1
+    allocation_stream.wait_stream(use_stream)
+    with torch.cuda.stream(allocation_stream):
+        counter = _get_trtllm_gen_workspace_counter_buffer(
+            workspace, batch, 16, sm_count, device
+        )
+    pointer, size = counter.data_ptr(), counter.numel()
+    counter_ref = weakref.ref(counter)
+    if stream_lookup == "missing_metadata":
+        # An unknown origin must not be mistaken for the default stream (0).
+        delattr(counter, "_flashinfer_trtllm_gen_counter_allocation_stream")
+    use_stream.wait_stream(allocation_stream)
+    read_ready, complete = torch.cuda.Event(), torch.cuda.Event()
+
+    def enqueue_read():
+        with torch.cuda.stream(use_stream):
+            reused = _get_trtllm_gen_workspace_counter_buffer(
+                workspace, batch, 16, sm_count, device
+            )
+            assert reused.data_ptr() == pointer
+            # Bounded GPU work creates a pending-use window. Events below verify
+            # that the read has not started when allocator reuse is inspected.
+            torch.cuda._sleep(500_000_000)
+            read_ready.record()
+            observed = reused.sum()
+            complete.record()
+            return observed
+
+    if stream_lookup == "raw":
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            observed = executor.submit(enqueue_read).result()
+    else:
+        observed = enqueue_read()
+    del counter
+    workspace = None
+
+    probes = []
+    pending_probes = 0
+    reused_while_pending = False
+    with torch.cuda.stream(allocation_stream):
+        for _ in range(64):
+            if read_ready.query():
+                break
+            probe = torch.empty(size, device=device, dtype=torch.uint8)
+            probes.append(probe)
+            if not read_ready.query():
+                pending_probes += 1
+                if probe.data_ptr() == pointer:
+                    reused_while_pending = True
+                    break
+    # Complete the harmless read before any assertion or probe release.
+    complete.synchronize()
+    assert counter_ref() is None
+    assert pending_probes > 0, "allocator probes missed the pending-read window"
+    assert not reused_while_pending, "cached counter storage reused before pending read"
+    assert observed.item() == 0
+
+
+def test_trtllm_workspace_counter_graph_ownership_and_growth():
+    device = torch.device(GPU_DEVICE)
+    sm_count = get_device_sm_count(device)
+    owners = [torch.empty(1, device=device) for _ in range(2)]
+    graphs, outputs, refs, sizes = [], [], [], []
+    for value, owner in enumerate(owners, start=1):
+        counter = _get_trtllm_gen_workspace_counter_buffer(
+            owner, 1, 16, sm_count, device
+        )
+        counter.fill_(value)
+        counter.sum()  # Warm up the harmless read before capture.
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = counter.sum()
+        graphs.append(graph)
+        outputs.append(output)
+        refs.append(weakref.ref(counter))
+        sizes.append(counter.numel())
+        del counter
+
+    # Keep each graph's original allocation alive when one workspace grows.
+    grown = _get_trtllm_gen_workspace_counter_buffer(
+        owners[0], sizes[0] // (4 * 16) + 1, 16, sm_count, device
+    )
+    assert grown.numel() > sizes[0]
+    assert all(ref() is not None for ref in refs)
+    assert refs[0]().data_ptr() != refs[1]().data_ptr()
+    assert grown.data_ptr() != refs[0]().data_ptr()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for graph, stream in zip(graphs, streams, strict=True):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph.replay()
+    for stream in streams:
+        torch.cuda.current_stream().wait_stream(stream)
+    for value, (output, size) in enumerate(zip(outputs, sizes, strict=True), start=1):
+        assert output.item() == value * size
+
+
+def test_trtllm_workspace_counter_capture_first_isolation():
+    device = torch.device(GPU_DEVICE)
+    sm_count = get_device_sm_count(device)
+    owner = torch.empty(1, device=device)
+    torch.zeros(16, device=device, dtype=torch.uint8).sum()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _get_trtllm_gen_workspace_counter_buffer(
+            owner, 1, 16, sm_count, device
+        )
+        observed = captured.sum()
+    # The capture's zero has not executed; eager use needs its own initialized storage.
+    eager = _get_trtllm_gen_workspace_counter_buffer(owner, 1, 16, sm_count, device)
+    assert eager.data_ptr() != captured.data_ptr()
+    assert torch.count_nonzero(eager).item() == 0
+    eager.fill_(7)
+    graph.replay()
+    assert observed.item() == 0
+    assert torch.all(eager == 7).item()
 
 
 # Keep a normal-softmax case for every sampled mixed-dtype configuration.
