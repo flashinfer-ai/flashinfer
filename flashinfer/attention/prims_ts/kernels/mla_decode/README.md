@@ -95,9 +95,9 @@ while keeping at least two KV tiles per split. Larger grids use the persistent
 reuse schedule. The resource layout therefore does not fall back to duplicated
 conversion just because the planned row count is small.
 
-Quantized persistent 2CTA launches balance their waves using live tensor
-extents. The compilation key retains the physical SM limit, so different
-row buckets that choose the same profile reuse one compiled kernel.
+Persistent 2CTA launches use up to the physical cluster limit. The
+compilation key retains that limit, so different row buckets that choose
+the same profile reuse one compiled kernel.
 
 Routine task-builder HEAD/LOOP overlap and unused-routing advisories are quiet
 by default. Set `FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` before a cold build to display
