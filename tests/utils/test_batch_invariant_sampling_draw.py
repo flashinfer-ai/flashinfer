@@ -488,8 +488,8 @@ def test_draw_ir_uses_only_declared_forms(
 ):
     """Compile one kernel per code path with no GPU visible and check the PTX: `.rn` arithmetic only, `ex2.approx`
     iff logits and `lg2.approx` iff the token's log-probability, no division except the per-row temperature's (the draw
-    never divides), the stream's `cvt.rn.f32.u32` and Philox multiplies, the cluster forms only in cluster members, no
-    fast-math anywhere."""
+    never divides), the stream's `cvt.rn.f32.u32` and Philox multiplies, the cluster forms only in cluster members,
+    `griddepcontrol` in every kernel (PDL is a runtime launch argument), no fast-math anywhere."""
     pytest.importorskip("cutlass")
     code = (
         "from flashinfer.batch_invariant.sampling.schedule import LSEConfig\n"
@@ -508,6 +508,7 @@ def test_draw_ir_uses_only_declared_forms(
     assert ptx.count("div.rn.f32") == (
         1 if trow else 0
     )  # LOG2E / T_row only: the draw never divides
+    assert "griddepcontrol.wait" in ptx and "griddepcontrol.launch_dependents" in ptx
     assert "cvt.rn.f32.u32" in ptx and ("mul.wide.u32" in ptx or "mul.hi.u32" in ptx)
     Cc = cfg[4] if len(cfg) > 4 else 1
     assert ("barrier.cluster" in ptx) == (Cc > 1) and (
@@ -521,7 +522,7 @@ def test_draw_ir_uses_only_declared_forms(
 _WORKER_CODE = r"""
 import ast, sys
 from flashinfer.batch_invariant.sampling.schedule import LSEConfig
-from flashinfer.batch_invariant.sampling.draw_kernel import get_compiled_kernel
+from flashinfer.batch_invariant.sampling.draw_kernel import precompile
 from flashinfer.batch_invariant.sampling.stream_kernel import get_stream_words_kernel
 bad = []
 for s in ast.literal_eval(sys.argv[1]):
@@ -530,7 +531,7 @@ for s in ast.literal_eval(sys.argv[1]):
             get_stream_words_kernel()
         else:
             ds, N, cfg, from_logits, trow, idx, lp, pdl = s
-            get_compiled_kernel(ds, N, LSEConfig(*cfg), from_logits, trow, idx, lp, pdl)
+            precompile(ds, N, LSEConfig(*cfg), from_logits, trow, idx, lp, pdl)   # outside the module lock
     except Exception as e:  # noqa: BLE001
         bad.append((s, repr(e)[:300]))
 print("BAD", repr(bad))
@@ -599,6 +600,8 @@ def _suite_specs(sm):
             t = _cfg_tuple(DS.draw_config(N, M, 2, smc))
             specs.append(("bf16", N, t, False, False, False, False, _PDL))
             specs.append(("bf16", N, t, True, False, False, False, _PDL))
+    # PDL is a runtime launch argument: one spec per kernel
+    specs = [s if s == "stream" else (*s[:7], False) for s in specs]
     return list(dict.fromkeys(specs))
 
 

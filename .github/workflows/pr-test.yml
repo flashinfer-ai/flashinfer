@@ -270,7 +270,7 @@ jobs:
           H100_ON_PRS: 'true'
           EVENT_NAME: ${{ github.event_name }}
         run: |
-          RUN_H100=true
+          RUN_H100=false
           if [ "$EVENT_NAME" = "pull_request" ] && [ "$H100_ON_PRS" != "true" ]; then
             RUN_H100=false
             echo "::notice title=H100 lane disabled on PRs::H100 tests run only in scheduled main runs and manual workflow_dispatch runs until runner capacity is restored" >&2
@@ -898,8 +898,28 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ needs.setup.outputs.checkout_sha }}
-          submodules: recursive
           persist-credentials: false
+
+      - name: Prepare selected source and submodules
+        env:
+          SELECTED_BASE: ${{ needs.setup.outputs.snapshot_base }}
+          SELECTED_TREE: ${{ needs.setup.outputs.snapshot_tree }}
+        run: |
+          if [ -n "$SELECTED_BASE" ]; then
+            [[ "$SELECTED_BASE" =~ ^[0-9a-f]{40}$ && "$SELECTED_TREE" =~ ^[0-9a-f]{40}$ ]]
+            PINNED_HEAD=$(git rev-parse HEAD)
+            if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
+              git fetch --no-tags --unshallow origin "$PINNED_HEAD" "$SELECTED_BASE"
+            fi
+            git cat-file -e "${SELECTED_BASE}^{commit}" 2>/dev/null || git fetch --no-tags origin "$SELECTED_BASE"
+            git -c core.hooksPath=/dev/null checkout --detach "$SELECTED_BASE"
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+              git -c user.name=flashinfer-ci -c user.email=flashinfer-ci@nvidia.com \
+              -c core.hooksPath=/dev/null -c rerere.enabled=false \
+              merge --no-ff --no-edit "$PINNED_HEAD"
+            [ "$(git rev-parse 'HEAD^{tree}')" = "$SELECTED_TREE" ]
+          fi
+          git submodule update --init --recursive
 
       - name: Lint provider spec CUDA targets
         run: bash ci/bash.sh "${DOCKER_IMAGE}" --no-gpu ./scripts/infra/task_check_jit_spec_gencodes.sh

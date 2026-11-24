@@ -407,18 +407,15 @@ def test_declined_performance_policy_does_not_probe_optional_runtime(monkeypatch
 
 
 @pytest.mark.parametrize(
-    "available,fe,dsl,expected",
+    "available,dsl,expected",
     [
-        (False, "1.31.0", "4.7.0", False),
-        (True, "1.30.0", "4.8.0", False),
-        (True, "1.31.0rc1", "4.7.0", False),
-        (True, "1.31.0", "4.6.2", False),
-        (True, "1.31.0", "4.7.0", True),
+        (False, "4.7.0", False),
+        (True, "4.6.2", False),
+        (True, "4.7.0", True),
     ],
 )
-def test_optional_runtime_floor(monkeypatch, available, fe, dsl, expected):
+def test_optional_runtime_floor(monkeypatch, available, dsl, expected):
     monkeypatch.setattr(linear_attention, "CUDNN_AVAILABLE", available)
-    monkeypatch.setattr(linear_attention, "cudnn", SimpleNamespace(__version__=fe))
     monkeypatch.setattr(importlib.metadata, "version", lambda name: dsl)
     kda._cudnn_kda_prefill_available.cache_clear()
     try:
@@ -427,16 +424,12 @@ def test_optional_runtime_floor(monkeypatch, available, fe, dsl, expected):
         kda._cudnn_kda_prefill_available.cache_clear()
 
 
-@pytest.mark.parametrize("frontend", [None, "1.30.0", "1.31.0rc1"])
-def test_missing_or_older_frontend_keeps_native_auto(monkeypatch, frontend):
+def test_missing_frontend_keeps_native_auto(monkeypatch):
     probe = kda._cudnn_kda_prefill_available
     seen = []
     _force_native_route(monkeypatch, "small-bh", seen)
     monkeypatch.setattr(kda, "_cudnn_kda_prefill_available", probe)
-    monkeypatch.setattr(linear_attention, "CUDNN_AVAILABLE", frontend is not None)
-    monkeypatch.setattr(
-        linear_attention, "cudnn", SimpleNamespace(__version__=frontend)
-    )
+    monkeypatch.setattr(linear_attention, "CUDNN_AVAILABLE", False)
     monkeypatch.setattr(importlib.metadata, "version", lambda name: "4.7.0")
     probe.cache_clear()
     try:

@@ -112,7 +112,7 @@ def _profile_case(rank, case, use_graph):
                 operation()
 
     @contextlib.contextmanager
-    def capture(graph):
+    def capture(graph, pool=None):
         assert trace.initialized or tuner._cupti_disabled or case == "events"
         captured.append(graph)
         try:
@@ -142,6 +142,9 @@ def _profile_case(rank, case, use_graph):
             "stream": lambda stream: contextlib.nullcontext(),
             "CUDAGraph": Graph,
             "graph": capture,
+            # Profiling captures share one pool per device (profile_graph_pool).
+            "current_device": lambda: 0,
+            "graph_pool_handle": lambda: (0, 0),
             "Event": Event,
         }.items():
             stack.enter_context(patch.object(torch.cuda, name, value))

@@ -47,6 +47,8 @@ from ..helpers.schedule import (
 )
 from ..helpers.stage import MlaStage
 from ..helpers.tile import (
+    cta_rows_have_distinct_kv_prefix,
+    cta_visible_kv_end,
     runtime_split_count,
     runtime_base_seq_len_kv,
     runtime_local_kv_tiles,
@@ -63,6 +65,7 @@ class MlaDecodeTask(Task):
         self.runtime_split_kv = kwargs.pop("runtime_split_kv", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
         self.cu_seqlens_q = kwargs.pop("cu_seqlens_q", None)
+        self.cp_rank = kwargs.pop("cp_rank", 0)
         self.domain_bias = kwargs.pop("domain_bias", 0)
         super().__init__(**kwargs)
         self._tmem_base_offset = Int32(0)
@@ -71,7 +74,18 @@ class MlaDecodeTask(Task):
         self._lane_idx = Int32(0)
         self._seq_len_kv = Int32(0)
         self._local_kv_tiles = Int32(1)
+        if self.caches_visible_kv_end:
+            # An empty prefix masks every tile, which is always exact.
+            self._kv_visible_end = Int32(0)
         self._runtime_body_active = None
+
+    @property
+    def caches_visible_kv_end(self) -> bool:
+        """Return whether this task caches the keys every row of a tile sees.
+
+        Only tiles whose rows see different K prefixes need it.
+        """
+        return self.cfg is not None and cta_rows_have_distinct_kv_prefix(self.cfg)
 
     @cute.jit
     def run_body(self, context=None):
@@ -136,7 +150,7 @@ class MlaDecodeTask(Task):
             self._lane_idx,
             self._seq_len_kv,
             self._local_kv_tiles,
-            Int32(0),
+            self._kv_visible_end if self.caches_visible_kv_end else Int32(0),
             Int32(0),
         )
 
@@ -197,7 +211,18 @@ class MlaDecodeTask(Task):
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
+            cp_rank=self.cp_rank,
         )
+        # Softmax masks only K tiles reaching past the keys every row sees.
+        if self.caches_visible_kv_end:
+            self._kv_visible_end = cta_visible_kv_end(
+                self.cfg,
+                self.seqlens_kv,
+                batch_idx,
+                cta_idx_q,
+                self.cu_seqlens_q,
+                self.cp_rank,
+            )
         if self.cfg.fixed_sparse_kv_tiles > 0:
             return Int32(self.domain_bias)
         total_kv_tiles = runtime_local_kv_tiles(

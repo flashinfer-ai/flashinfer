@@ -27,7 +27,7 @@ def stage_mega_moe_inputs(
     ``input_norm_const * hidden_states``; fc1_alpha must compensate for this
     normalization and any weight normalization. Returns the staged token count.
     """
-    from ......kernel_src.sm107.next_cutedsl_megamoe import (
+    from flashinfer.moe_ep.shims.sm107.cutedsl_megamoe import (
         Nvfp4BlockSize,
         ceil_div,
         quantize_nvfp4_block16,
@@ -87,7 +87,7 @@ def stage_mega_moe_inputs(
         )
 
     if fused_stage:
-        from ......kernel_src.sm100.cutedsl_megamoe import (
+        from flashinfer.moe_ep.shims.sm100.cutedsl_megamoe.pre_unification import (
             fused_quant_stage,
             note_staged_tokens,
         )

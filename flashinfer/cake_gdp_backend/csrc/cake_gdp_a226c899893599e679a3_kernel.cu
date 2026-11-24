@@ -18,7 +18,7 @@ typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
+#if defined(__CUDACC_RTC__) || defined(_MSC_VER)
 typedef unsigned long long uint64_t;
 #else
 typedef unsigned long      uint64_t;
@@ -156,7 +156,8 @@ kernel_cake_gdp_a226c899893599e679a3(__nv_bfloat16* __restrict__ q, __nv_bfloat1
     int steps = 18;
     float r_q[4];
     float r_k[4];
-#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
+#if __CUDA_ARCH__ == 1030
+#else
     float bk[16];
     float bv[8];
     float bb[4];
@@ -363,8 +364,7 @@ kernel_cake_gdp_a226c899893599e679a3(__nv_bfloat16* __restrict__ q, __nv_bfloat1
             S[60 + 2] = _v4.z;
             S[60 + 3] = _v4.w;
         }
-#if __CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1000
-#else
+#if __CUDA_ARCH__ == 1030
         float bk[16];
         float bv[8];
         float bb[4];

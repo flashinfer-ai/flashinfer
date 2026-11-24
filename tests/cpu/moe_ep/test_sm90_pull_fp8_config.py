@@ -3,7 +3,7 @@
 No GPU / no kernel compile: config dataclass defaults, registry resolution via
 ``create_mega_kernel``, public re-exports, and runtime-requirement plumbing.
 
-Deliberately does NOT import ``flashinfer.moe_ep.kernel_src.sm90.*``: the SM90
+Deliberately does NOT import ``flashinfer.moe_ep.shims.sm90.*``: the SM90
 and SM100 kernel trees share top-level module names and are mutually exclusive
 per process, and the ``unit`` run_tests.sh target collects this file in the
 same pytest process as SM100-importing tests.  Shim-level validation coverage
@@ -54,7 +54,7 @@ class TestSm90PullFp8Config:
         assert cfg.fc1_activation_dequant_scale == 1.0
         assert cfg.fc2_activation_dequant_scale == 1.0
         # Tuner surface: knobs=None resolves the knob cache, then the
-        # heuristic table (see kernel_src sm90 shim/tuner.py).
+        # heuristic table (see shims/sm90/cutedsl_megamoe/tuner.py).
         assert cfg.knobs is None
 
     @pytest.mark.cpu_only

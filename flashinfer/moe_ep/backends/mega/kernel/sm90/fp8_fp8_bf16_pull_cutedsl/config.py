@@ -8,7 +8,7 @@ from typing import Literal
 
 @dataclass
 class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm90.pull_style_cutedsl_megakernel.hopper_fp8_mega_moe``.
+    """Kernel params for ``shims.sm90.cutedsl_megamoe.hopper_fp8_mega_moe``.
 
     ``intermediate_size`` is the post-SwiGLU width, matching the SM100 configs
     and SGLang.  The Hopper FP8 kernel's full FC1 gate+up width is derived
@@ -20,7 +20,7 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
       one per expert weight (legacy E8M0 SF wire is dispatched but unused by
       the GEMM dequantization).
     * ``blockwise``: DeepGEMM-style fp32 block scales — per token/128-block
-      for activations, per 128x128 block for weights.
+      for activations, per 128x128 block for weights. Requires MMA tile K=128.
 
     ``fc1_activation_dequant_scale`` / ``fc2_activation_dequant_scale`` are
     the per-tensor-mode static calibration scalars (dequant convention:

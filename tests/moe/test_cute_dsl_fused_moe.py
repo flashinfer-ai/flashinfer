@@ -6022,3 +6022,437 @@ def test_cute_dsl_pinned_recipe_matches_env(
         assert not torch.equal(env_on[leg], env_off[leg])
         assert torch.equal(pinned_under_env_off[leg], env_on[leg])
         assert torch.equal(none_under_env_on[leg], env_off[leg])
+
+
+def _place_in_domain(domains, domain: int, tensor: torch.Tensor) -> torch.Tensor:
+    """Copy a (possibly strided) tensor into one locality domain's memory, same layout."""
+    numel = tensor.untyped_storage().nbytes() // tensor.element_size()
+    base = domains.empty(domain, (numel,), tensor.dtype)
+    placed = base.as_strided(tensor.shape, tensor.stride(), tensor.storage_offset())
+    placed.copy_(tensor)
+    return placed
+
+
+def _mxfp8_intermediate_split_problem(
+    domains, num_tokens, hidden_size, intermediate_size, num_experts, top_k
+):
+    """Full-width MXFP8 weights and the two intermediate-half shards, each in its domain."""
+    from flashinfer import mxfp8_quantize
+    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat, ReLU2
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    w1 = (
+        torch.randn(
+            num_experts,
+            intermediate_size,
+            hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 4
+    )
+    w2 = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 4
+    )
+
+    def prepare(fc1, fc2, inter):
+        return CuteDslConfig.prepare_weights(
+            fc1,
+            fc2,
+            quant=QuantConfig(QuantFormat.MXFP8, QuantFormat.MXFP8),
+            activation=ReLU2(),
+            swap_ab=False,
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=inter,
+        )
+
+    full = prepare(w1, w2, intermediate_size)
+    half = intermediate_size // 2
+    shards = []
+    for d in range(2):
+        # MXFP8 scales cover 32 elements along K, so FC1 rows and FC2 K columns split at a
+        # multiple of 128 quantize exactly as the matching part of the full-width weights.
+        shard = prepare(
+            w1[:, d * half : (d + 1) * half].contiguous(),
+            w2[:, :, d * half : (d + 1) * half].contiguous(),
+            half,
+        )
+        shards.append(
+            {
+                key: _place_in_domain(domains, d, shard[key])
+                for key in ("w1_weight", "w1_weight_sf", "w2_weight", "w2_weight_sf")
+            }
+        )
+
+    def routed_inputs(seed):
+        torch.manual_seed(seed)
+        x_bf16 = (
+            torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+            / 2
+        )
+        x, x_sf = mxfp8_quantize(
+            x_bf16, is_sf_swizzled_layout=False, alignment=128, backend="cuda"
+        )
+        experts = (
+            torch.rand(num_tokens, num_experts, device=device)
+            .topk(top_k, dim=1)
+            .indices.to(torch.int32)
+        )
+        scales = torch.softmax(torch.randn(num_tokens, top_k, device=device), dim=1)
+        return dict(
+            x=x,
+            x_sf=x_sf.view(torch.uint8).reshape(num_tokens, hidden_size // 32),
+            token_selected_experts=experts.contiguous(),
+            token_final_scales=scales.contiguous(),
+        )
+
+    return full, shards, routed_inputs, (w1, w2)
+
+
+def _private_fc1_buffers(domains, num_tokens, top_k, num_experts, width):
+    """Per-domain persistent FC1 output buffers sized for any routing tile size."""
+    from flashinfer.fused_moe.cute_dsl.moe_utils import get_max_num_permuted_tokens
+    from flashinfer.fused_moe.cute_dsl.tuner import VALID_TILE_SIZES
+
+    rows = max(
+        get_max_num_permuted_tokens(num_tokens, top_k, num_experts, tile)
+        for tile in VALID_TILE_SIZES
+    )
+    rows = -(-rows // 128) * 128
+    outs, scales = [], []
+    for d in range(2):
+        outs.append(domains.empty(d, (rows, width), torch.float8_e4m3fn))
+        scale = domains.empty(d, (32, 4, rows // 128, 4, width // 128, 1), torch.uint8)
+        scale.zero_()
+        scales.append(scale)
+    return {"gemm1_out": outs, "gemm1_out_scale": scales}
+
+
+def _mxfp8_round_trip(t: torch.Tensor) -> torch.Tensor:
+    """BF16 tensor rounded through MXFP8 (E4M3, one E8M0 scale per 32 along K)."""
+    from flashinfer import mxfp8_quantize
+
+    k = t.shape[-1]
+    q, sf = mxfp8_quantize(
+        t.reshape(-1, k).contiguous(), is_sf_swizzled_layout=False, backend="cuda"
+    )
+    scale = torch.exp2(sf.view(torch.uint8).reshape(-1, k // 32).float() - 127)
+    return (q.float().reshape(-1, k // 32, 32) * scale[..., None]).reshape(t.shape)
+
+
+def _mxfp8_relu2_moe_reference(inputs, w1, w2, alphas, activation):
+    """FP32 non-gated MoE on the dequantized MXFP8 operands.
+
+    ``activation`` maps the FC1 output; the kernel's MXFP8 requantization of the
+    intermediate is not modeled.
+    """
+    num_tokens, hidden_size = inputs["x"].shape
+    x_scale = torch.exp2(inputs["x_sf"].float() - 127)
+    x = (
+        inputs["x"].float().reshape(num_tokens, hidden_size // 32, 32)
+        * x_scale[..., None]
+    ).reshape(num_tokens, hidden_size)
+    experts = inputs["token_selected_experts"]
+    out = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device=x.device)
+    for e in experts.unique().tolist():
+        tokens, slots = (experts == e).nonzero(as_tuple=True)
+        h = (x[tokens] @ w1[e].T) * alphas[0][e]
+        y = (activation(h) @ w2[e].T) * alphas[1][e]
+        out.index_add_(0, tokens, y * inputs["token_final_scales"][tokens, slots, None])
+    return out
+
+
+def _assert_close_to_full_width(localized, full, fc2_accumulator, top_k):
+    """Both dies' K halves sum to the full-width FC2 up to rounding and atomic order."""
+    assert localized.shape == full.shape and localized.dtype == full.dtype
+    assert torch.isfinite(localized).all()
+    diff = (localized.float() - full.float()).abs()
+    scale = full.float().abs().amax().clamp_min(1e-6)
+    # The full-width reference adds top_k BF16-rounded contributions per output with
+    # atomics; "float32" rounds the localized sum once, "output" also rounds each
+    # die's partial sum.
+    if fc2_accumulator == "float32":
+        bound = 2**-7 if top_k == 1 else 2**-6
+    else:
+        bound = 2**-5
+    assert (diff.amax() / scale).item() <= bound, (diff.amax() / scale).item()
+    assert (diff.mean() / scale).item() <= bound / 16, (diff.mean() / scale).item()
+
+
+@cute_dsl_available
+@pytest.mark.skipif(not is_sm107(), reason="locality domains are Rubin (SM107) only")
+@pytest.mark.parametrize("activation", ["relu2", "clamped-relu2"])
+@pytest.mark.parametrize("fc2_accumulator", ["float32", "output"])
+@pytest.mark.parametrize("output_memset", ["overlap_fc1", "before_fork"])
+@pytest.mark.parametrize(
+    "num_tokens,hidden_size,intermediate_size,num_experts,top_k",
+    [(128, 256, 512, 8, 1), (515, 1024, 2048, 32, 8)],
+)
+def test_localized_mxfp8_intermediate_split_matches_full_width(
+    activation,
+    fc2_accumulator,
+    output_memset,
+    num_tokens,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+    top_k,
+):
+    """MXFP8 intermediate split + add (fc2_split="k") against the full-width kernel.
+
+    Each locality domain holds half of every expert's FC1 rows and the matching FC2
+    reduction columns in its own memory, and both add their partial sums into the
+    output. The full-width weights handed to the localized call have released storage,
+    so the localized path may not read them. With caller-provided FC1 buffers the call
+    is captured in a CUDA graph and replayed on new inputs and routing.
+    """
+    from flashinfer import cute_dsl_fused_moe
+    from flashinfer.locality_domain import (
+        get_localized_domains,
+        locality_domain_unsupported_reason,
+    )
+
+    if not hasattr(torch.cuda, "execute_on_streams"):
+        pytest.skip("Localized execution requires torch.cuda.execute_on_streams")
+    reason = locality_domain_unsupported_reason("cuda:0")
+    if reason is not None:
+        pytest.skip(f"CUDA locality domains are unavailable: {reason}")
+    domains = get_localized_domains("cuda:0")
+    full, shards, routed_inputs, (w1, w2) = _mxfp8_intermediate_split_problem(
+        domains, num_tokens, hidden_size, intermediate_size, num_experts, top_k
+    )
+    if activation == "clamped-relu2":
+        activation_kwargs = dict(
+            activation_type=ActivationType.ClampedRelu2,
+            clamped_relu2_limit=torch.tensor(
+                [0.25], dtype=torch.float32, device="cuda"
+            ),
+        )
+    else:
+        activation_kwargs = dict(activation_type=ActivationType.Relu2)
+    common = dict(
+        w1_alpha=full["w1_alpha"],
+        w2_alpha=full["w2_alpha"],
+        fc2_input_scale=None,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        output_dtype=torch.bfloat16,
+        quant_mode="mxfp8",
+        **activation_kwargs,
+    )
+    full_weights = {
+        key: full[key]
+        for key in ("w1_weight", "w1_weight_sf", "w2_weight", "w2_weight_sf")
+    }
+    placeholders = {}
+    for key, tensor in full_weights.items():
+        placeholder = tensor.clone()
+        placeholder.untyped_storage().resize_(0)
+        placeholders[key] = placeholder
+    options = {
+        "fc2_split": "k",
+        "fc2_accumulator": fc2_accumulator,
+        "output_memset": output_memset,
+    }
+    localized_kwargs = dict(
+        localized_weights=shards,
+        localized_streams=list(domains.streams),
+        localized_sm_count=int(domains.sm_counts[0]),
+    )
+
+    inputs = routed_inputs(1)
+    reference = cute_dsl_fused_moe(**inputs, **full_weights, **common)
+    localized = cute_dsl_fused_moe(
+        **inputs,
+        **placeholders,
+        **common,
+        **localized_kwargs,
+        localized_options=options,
+    )
+    torch.cuda.synchronize()
+    _assert_close_to_full_width(localized, reference, fc2_accumulator, top_k)
+
+    # The full-width kernel shares the FC1 epilogue, so also check both outputs
+    # against an independent FP32 reference: relu(h)^2, or relu(L * tanh(h / L))^2
+    # for ClampedRelu2, which must be clearly closer than a hard clamp
+    # min(relu(h), L)^2.
+    limit = 0.25
+
+    def relu2(h):
+        return torch.relu(h).square()
+
+    def tanh_clamp(h):
+        return torch.relu(limit * torch.tanh(h / limit)).square()
+
+    def hard_clamp(h):
+        return torch.relu(h).clamp(max=limit).square()
+
+    expected_act, other_act = (
+        (tanh_clamp, hard_clamp)
+        if activation == "clamped-relu2"
+        else (relu2, tanh_clamp)
+    )
+    w1_ref, w2_ref = _mxfp8_round_trip(w1), _mxfp8_round_trip(w2)
+    alphas = (full["w1_alpha"].float().view(-1), full["w2_alpha"].float().view(-1))
+    expected = _mxfp8_relu2_moe_reference(inputs, w1_ref, w2_ref, alphas, expected_act)
+    other = _mxfp8_relu2_moe_reference(inputs, w1_ref, w2_ref, alphas, other_act)
+    norm = expected.abs().mean()
+    for out in (reference, localized):
+        error = ((out.float() - expected).abs().mean() / norm).item()
+        other_error = ((out.float() - other).abs().mean() / norm).item()
+        assert error <= 0.05, error
+        assert error < 0.25 * other_error, (error, other_error)
+
+    # A caller-provided output buffer must match the output shape and dtype.
+    for bad_output, exception in (
+        (
+            torch.empty(
+                num_tokens, 2 * hidden_size, dtype=torch.bfloat16, device="cuda"
+            ),
+            ValueError,
+        ),
+        (
+            torch.empty(num_tokens, hidden_size, dtype=torch.float16, device="cuda"),
+            TypeError,
+        ),
+    ):
+        with pytest.raises(exception, match="moe_output must"):
+            cute_dsl_fused_moe(
+                **inputs,
+                **placeholders,
+                **common,
+                **localized_kwargs,
+                localized_options=options,
+                moe_output=bad_output,
+            )
+
+    # Persistent per-domain FC1 buffers make the call capturable; replay on new data.
+    buffers = _private_fc1_buffers(
+        domains, num_tokens, top_k, num_experts, intermediate_size // 2
+    )
+    static = routed_inputs(1)
+    moe_output = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
+    graph_kwargs = dict(
+        **static,
+        **placeholders,
+        **common,
+        **localized_kwargs,
+        localized_options={**options, **buffers},
+        moe_output=moe_output,
+    )
+    cute_dsl_fused_moe(**graph_kwargs)  # warm up compilation outside the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cute_dsl_fused_moe(**graph_kwargs)
+    for seed in (2, 3):
+        fresh = routed_inputs(seed)
+        for key, tensor in fresh.items():
+            static[key].copy_(tensor)
+        moe_output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_close_to_full_width(
+            moe_output,
+            cute_dsl_fused_moe(**fresh, **full_weights, **common),
+            fc2_accumulator,
+            top_k,
+        )
+    for d, out in enumerate(buffers["gemm1_out"]):
+        assert domains.pointer_domain(out) == d
+
+
+@cute_dsl_available
+@pytest.mark.skipif(
+    not is_sm100_family(), reason="MXFP8 CuTe-DSL MoE needs SM100/SM103/SM107"
+)
+@pytest.mark.parametrize(
+    "activation", [ActivationType.Relu2, ActivationType.ClampedRelu2]
+)
+def test_mxfp8_clamped_relu2_tanh_approx_only_on_sm107(monkeypatch, activation):
+    """The tanh.approx.f32 ClampedRelu2 clamp is compiled for MXFP8 ClampedRelu2 on
+    SM107 only; SM100/SM103 and every other activation keep the sigmoid-based clamp."""
+    from flashinfer import cute_dsl_fused_moe, mxfp8_quantize
+    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat, ReLU2
+    from flashinfer.fused_moe.cute_dsl import (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion as fc1,
+    )
+
+    torch.manual_seed(0)
+    num_tokens, hidden, inter, num_experts, top_k = 64, 256, 512, 8, 2
+    w1 = torch.randn(num_experts, inter, hidden, device="cuda", dtype=torch.bfloat16)
+    w2 = torch.randn(num_experts, hidden, inter, device="cuda", dtype=torch.bfloat16)
+    weights = CuteDslConfig.prepare_weights(
+        w1 / 4,
+        w2 / 4,
+        quant=QuantConfig(QuantFormat.MXFP8, QuantFormat.MXFP8),
+        activation=ReLU2(),
+        swap_ab=False,
+        num_local_experts=num_experts,
+        hidden_size=hidden,
+        intermediate_size=inter,
+    )
+    x, x_sf = mxfp8_quantize(
+        torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16) / 2,
+        is_sf_swizzled_layout=False,
+        alignment=128,
+        backend="cuda",
+    )
+    experts = (
+        torch.rand(num_tokens, num_experts, device="cuda")
+        .topk(top_k, dim=1)
+        .indices.to(torch.int32)
+    )
+    scales = torch.softmax(torch.randn(num_tokens, top_k, device="cuda"), dim=1)
+    limit = (
+        {"clamped_relu2_limit": torch.tensor([0.25], device="cuda")}
+        if activation == ActivationType.ClampedRelu2
+        else {}
+    )
+    # A private cache makes this call construct its own FC1 kernel.
+    monkeypatch.setattr(fc1, "_gather_kernel_cache", {})
+    kernel_cls = fc1.BlockScaledContiguousGatherGroupedGemmKernel
+    kernel_init = kernel_cls.__init__
+    tanh_approx = []
+
+    def recording_init(self, *args, **kwargs):
+        tanh_approx.append(kwargs.get("clamped_relu2_tanh_approx", False))
+        kernel_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(kernel_cls, "__init__", recording_init)
+    out = cute_dsl_fused_moe(
+        x=x,
+        x_sf=x_sf.view(torch.uint8).reshape(num_tokens, hidden // 32),
+        token_selected_experts=experts,
+        token_final_scales=scales.contiguous(),
+        w1_weight=weights["w1_weight"],
+        w1_weight_sf=weights["w1_weight_sf"],
+        w1_alpha=weights["w1_alpha"],
+        fc2_input_scale=None,
+        w2_weight=weights["w2_weight"],
+        w2_weight_sf=weights["w2_weight_sf"],
+        w2_alpha=weights["w2_alpha"],
+        num_experts=num_experts,
+        top_k=top_k,
+        output_dtype=torch.bfloat16,
+        quant_mode="mxfp8",
+        activation_type=activation,
+        **limit,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+    expected = is_sm107() and activation == ActivationType.ClampedRelu2
+    assert tanh_approx, "FC1 kernel was not constructed"
+    assert all(flag == expected for flag in tanh_approx), tanh_approx
