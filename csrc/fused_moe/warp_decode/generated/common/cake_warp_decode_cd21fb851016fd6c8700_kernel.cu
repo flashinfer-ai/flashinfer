@@ -615,6 +615,7 @@ kernel_cake_warp_decode_cd21fb851016fd6c8700(const __grid_constant__ CUtensorMap
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
                         :: "r"(tmem_sfb + (unsigned int)(tmem_lane_base << 16) + stage * 16 + 12 + 0), "r"(word[0]));
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
