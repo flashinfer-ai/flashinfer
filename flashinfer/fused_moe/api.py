@@ -3622,9 +3622,12 @@ class BatchInvariantFp4Config:
     ``fingerprint("fused_moe_mxfp4", ...)``); the weight view carries its pair, and a pack prepared for one pair is refused by a
     layer configured for the other.
 
-    The guarantee, the routing input modes, the finalize contract and the error contract are the bf16 backend's
-    (:class:`BatchInvariantBf16Config`): a token's output bits depend on its own row, its ``top_k`` experts and routing weights
-    and the expert weights only; the backend never falls back and is not a default candidate. The dataflow of the NVFP4 pair
+    The guarantee, the routing input modes and the error contract are the bf16 backend's (:class:`BatchInvariantBf16Config`):
+    a token's output bits depend on its own row, its ``top_k`` experts and routing weights and the expert weights only; the
+    backend never falls back and is not a default candidate. Unlike the bf16 backend it serves the finalized output alone
+    (``do_finalize=True``: the slot-order combine is part of the class; ``do_finalize=False`` is refused) and the full expert
+    set (no expert-parallel shards: ``local_expert_offset`` / ``local_num_experts`` naming a shard are refused). The
+    dataflow of the NVFP4 pair
     (the proofs are the ``MoENvfp4`` Lean module of the mode): the input row quantized per token by the mode's NVFP4
     quantizer (TransformerEngine's recipe), GEMM1 as the dense NVFP4 GEMM class per expert with the chain
     ``cvt_bf16(act(mul(g, s)) * mul(u, s))``, ``s = mul(alpha1[e], pts[token])``, the bf16 intermediate quantized per token

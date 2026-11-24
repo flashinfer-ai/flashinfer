@@ -3,7 +3,7 @@
 """The Lean coupling of the MXFP4 MoE classes (``flashinfer/batch_invariant/lean/``: ``MoEMxfp4.lean`` and the generated
 ``MoEMxfp4Cases.lean``).
 
-Device-free (every CI job): the committed ``MoEMxfp4Cases.lean`` is byte for byte what the Python spec emits, so a change
+Device-free (the CI jobs that collect this module): the committed ``MoEMxfp4Cases.lean`` is byte for byte what the Python spec emits, so a change
 to the chains (a gated or ungated activation on the raw accumulators, GEMM2's conversion) that was not propagated to the
 Lean cases fails here without a toolchain. With ``lake`` installed: ``lake build`` elaborates the model and the generated
 cases (kernel ``decide`` throughout: the cases add nothing to the axiom policy), ``lake exe moemxfp4conformance`` prints
