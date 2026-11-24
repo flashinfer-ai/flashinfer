@@ -621,8 +621,26 @@ class _PrimsTsMoERunnerMixin:
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
+        is_rubin = _sm_arch_for_tensor(moe_inputs.hidden_states) == 107
+        mode_extras = ()
+        static_extras = self._cache_key_static_extras
+        # Preserve persisted Blackwell tactics. Only the Rubin catalog uses
+        # deterministic execution and finalize options to select its epilogue.
+        if is_rubin:
+            mode_extras = (
+                ("deterministic", torch.are_deterministic_algorithms_enabled()),
+            )
+        else:
+            finalize_keys = {
+                "do_finalize",
+                "zero_rows_without_local_expert",
+                "use_fused_finalize",
+            }
+            static_extras = tuple(
+                item for item in static_extras if item[0] not in finalize_keys
+            )
         return (
-            ("prims_ts_moe_config_version", 14),
+            ("prims_ts_moe_config_version", 14 if is_rubin else 11),
             ("top_k", int(self.top_k)),
             ("num_local_experts", int(self.num_local_experts)),
             ("num_experts", int(self.num_experts)),
@@ -634,7 +652,7 @@ class _PrimsTsMoERunnerMixin:
             ("activation_type", int(self.activation_type)),
             ("weight_layout", int(self.weight_layout)),
             ("use_per_token_scaling", bool(self.use_per_token_scaling)),
-            ("deterministic", torch.are_deterministic_algorithms_enabled()),
+            *mode_extras,
             ("partition_strategy", self._partition_strategy or ""),
             ("partition_topology", self._partition_topology),
             ("partition_fc1_layout", self._partition_fc1_layout),
@@ -649,7 +667,7 @@ class _PrimsTsMoERunnerMixin:
                 "expert_weights",
                 moe_inputs.expert_weights is not None,
             ),
-            *getattr(self, "_cache_key_static_extras", ()),
+            *static_extras,
         )
 
     @property
@@ -1701,7 +1719,8 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     if uses_per_token_scaling
                     else int(extras.get("per_token_sf_dtype", 1))
                 ),
-                use_fused_finalize=fused_finalize_requested(self, kwargs),
+                use_fused_finalize=common["sm_arch"] == 107
+                and fused_finalize_requested(self, kwargs),
             )
         )
 
@@ -1740,7 +1759,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             else 1
         )
         gemm_config_flags = _gemm_config_flags_from_static_extras(self)
-        use_fused_finalize = fused_finalize_requested(self)
+        use_fused_finalize = sm_arch == 107 and fused_finalize_requested(self)
         instance_key = (
             self.dtype_act,
             self.dtype_weights,
@@ -1818,13 +1837,10 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 f"Config not supported by Prims-TS NVFP4 kernel ({reason})"
             )
 
-        if pair.fc1.cfg.kwargs.get("routed_native_sfa", 0):
-            # Native Rubin GEMMs use ordinary stream ordering. Routing and
-            # finalize must follow the same policy, including graph replay.
-            kwargs = {**kwargs, "enable_pdl": False}
-
         fc1_cfg = pair.fc1.cfg.build()
         fc2_cfg = pair.fc2.cfg.build()
+        # Routing and finalization use the PDL mode resolved for both GEMMs.
+        kwargs["enable_pdl"] = bool(fc1_cfg.use_pdl)
         fuse_finalize = fused_finalize_requested(
             self, kwargs
         ) and supports_fused_finalize(fc2_cfg)
@@ -1854,7 +1870,12 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
         topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
-        routing_out = self.moe_op.trtllm_moe_run_routing_fp4_nvfp4(
+        run_routing = (
+            self.moe_op.trtllm_moe_run_routing_fp4_nvfp4_fused_finalize
+            if fuse_finalize
+            else self.moe_op.trtllm_moe_run_routing_fp4_nvfp4
+        )
+        routing_out = run_routing(
             moe_inputs.routing_logits,
             kwargs["routing_bias"],
             topk_ids,
@@ -1883,8 +1904,9 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             int(self.activation_type),
             kwargs.get("norm_topk_prob", True),
             kwargs.get("routing_replay_out"),
-            not fuse_finalize,
         )
+        routing_tensors = _torch_views_of_ffi_tensors(routing_out)
+        permuted_idx_to_expanded_idx = routing_tensors.pop() if fuse_finalize else None
 
         (
             expert_weights,
@@ -1897,8 +1919,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm1_output,
             gemm1_output_scale,
             gemm2_output,
-            permuted_idx_to_expanded_idx,
-        ) = _torch_views_of_ffi_tensors(routing_out)
+        ) = routing_tensors
         expert_weights = _select_expert_weights(moe_inputs, expert_weights, kwargs)
         if (
             moe_inputs.routing_logits is not None

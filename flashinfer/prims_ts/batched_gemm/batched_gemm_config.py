@@ -2849,11 +2849,25 @@ class BatchedGemmConfig:
         )
 
     @property
+    def casta_gather_joins_ctas(self) -> bool:
+        """Blackwell CastA has no spare relay warp; both gather CTAs signal the leader."""
+        return (
+            not self.is_rubin
+            and self.has_cast_a
+            and self.has_gather
+            and self.uses_two_cta_mma
+        )
+
+    @property
     def uses_ldgsts_relay(self) -> bool:
         return bool(
             self.uses_two_cta_mma
             and (
-                (self.has_gather and (self.is_rubin or not self.fuse_operand_sf_loads))
+                (
+                    self.has_gather
+                    and not self.casta_gather_joins_ctas
+                    and (self.is_rubin or not self.fuse_operand_sf_loads)
+                )
                 or self.uses_ldgsts_sf_relay
             )
         )

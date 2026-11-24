@@ -53,7 +53,56 @@ def test_prims_ts_tactic_cache_shares_only_with_same_architecture(monkeypatch):
     assert len(set(keys)) == 3
     assert keys[2] == keys[3]
     assert hash(runners[2]) == hash(runners[3])
-    assert len({runner._cache_key_extras()[:-1] for runner in runners}) == 1
+    assert runners[0]._cache_key_extras()[:-1] == runners[1]._cache_key_extras()[:-1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("minor", (0, 3, 7))
+def test_layer_reselects_for_the_prepared_weight_layout(monkeypatch, minor):
+    monkeypatch.setattr(
+        "flashinfer.fused_moe.runners.get_compute_capability", lambda _: (10, minor)
+    )
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=8, top_k=2),
+        quant=QuantConfig(QuantFormat.NVFP4, QuantFormat.NVFP4),
+        experts=ExpertConfig(intermediate_size=512),
+        backend=BackendOptions((PrimsTsConfig(),)),
+        execution=ExecutionConfig(enable_pdl=False),
+    )
+    runner = PrimsTsRunner(config, torch.device("cpu"))
+    layer = MoELayer.__new__(MoELayer)
+    layer.config, layer.runners, layer._winners = config, [runner], OrderedDict()
+    act = MoEActivationPack(
+        hidden_states_q=torch.empty(1, 512, device="meta", dtype=torch.uint8),
+        hidden_states_scale=torch.empty(1, 64, device="meta", dtype=torch.uint8),
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=torch.empty(1, 8, device="meta"),
+    )
+    monkeypatch.setattr(runner, "pack_inputs", lambda act, weights: [])
+    monkeypatch.setattr(runner, "forward", lambda inputs, tactic, **kw: tactic)
+    monkeypatch.setattr(
+        layer,
+        "_select_winner",
+        lambda act, weights, runners: (
+            runner,
+            runner._weight_layout(weights.get_view("prims_ts")),
+        ),
+    )
+    for block in (False, True, False):
+        shape = (8, 4, 1024, 128) if block else (8, 1024, 512)
+        weights = MoEWeightPack(
+            {
+                "prims_ts": {
+                    "gemm1_weights": torch.empty(
+                        shape, device="meta", dtype=torch.uint8
+                    )
+                }
+            }
+        )
+        assert layer(act, weights) == (
+            WeightLayout.BlockMajorK if block else WeightLayout.MajorK
+        )
+    assert len(layer._winners) == 2
 
 
 @pytest.mark.cpu_only
@@ -102,7 +151,15 @@ def test_layer_winner_cache_tracks_effective_finalize(
         routing_logits=torch.empty(8192, 32, device="meta"),
         output=torch.empty(8192, 1024, device="meta", dtype=torch.bfloat16),
     )
-    weights = MoEWeightPack({"prims_ts": {}})
+    weights = MoEWeightPack(
+        {
+            "prims_ts": {
+                "gemm1_weights": torch.empty(
+                    (32, 1024, 512), device="meta", dtype=torch.uint8
+                )
+            }
+        }
+    )
     packed_calls, selected, launched = [], [], []
 
     def pack(act, weights):
@@ -207,15 +264,21 @@ def test_profile_cache_keeps_candidate_options_across_interleaved_forward(
     inner.set_cache_key_static_extras = lambda **kw: setattr(
         inner, "_cache_key_static_extras", tuple(kw.items())
     )
-    inner.get_valid_tactics = lambda *args: [
-        [512, 14 if fused_finalize_requested(inner) else 0]
-    ]
+
+    def valid_tactics(*args):
+        assert inner.weight_layout == WeightLayout.BlockMajorK
+        return [[512, 14 if fused_finalize_requested(inner) else 0]]
+
+    inner.get_valid_tactics = valid_tactics
     runner._inner = inner
     monkeypatch.setattr(runner, "_require_built", lambda: None)
     monkeypatch.setattr(runner, "_forward_inner", lambda *args: None)
     monkeypatch.setattr(runner, "precompile_tactics", lambda *args, **kwargs: False)
     state = _TrtllmLaunchState(
-        dict(weight_layout=0, zero_rows_without_local_expert=fused)
+        dict(
+            weight_layout=int(WeightLayout.BlockMajorK),
+            zero_rows_without_local_expert=fused,
+        )
     )
     # Also interleave after the hook binds A but before tactic enumeration.
     tuning = runner._bind_tuning_config(
@@ -227,7 +290,9 @@ def test_profile_cache_keeps_candidate_options_across_interleaved_forward(
     inputs = _TrtllmPackedInputs(
         [torch.zeros(4, 8)], tuning_config=tuning, launch_state=state
     )
-    other = inputs.with_launch_overrides(zero_rows_without_local_expert=not fused)
+    other = inputs.with_launch_overrides(
+        weight_layout=int(WeightLayout.MajorK), zero_rows_without_local_expert=not fused
+    )
     tuner = AutoTuner.get()
     monkeypatch.setattr(
         tuner, "_prepare_input_tensors", lambda profile, inputs: list(inputs)

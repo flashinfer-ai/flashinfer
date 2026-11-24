@@ -907,8 +907,11 @@ class SmemGatherResource(MemoryResource):
                             read_only_args=[smem_ptr.data_ptr(), gmem_ptr],
                         )
 
-        # The following producer_commit uses cp.async.mbarrier.arrive for all
-        # LDGSTS activation gathers.
+        if cutlass.const_expr(self.cfg.casta_gather_joins_ctas):
+            # Each CTA loads half of B. Complete this thread's local copies
+            # before producer_commit signals the MMA leader's full barrier.
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
 
     @consumer_work(returns=(desc_a_mma_base, smem_a_stage_ptr))
     @cute.jit

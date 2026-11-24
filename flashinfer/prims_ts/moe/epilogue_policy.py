@@ -1,7 +1,7 @@
 # Copyright (c) 2026 FlashInfer contributors.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-side epilogue shortlist for native Rubin NVFP4 MoE tuning.
+"""Host-side epilogue shortlist for Rubin non-swap-AB NVFP4 MoE tuning.
 
 Policy zero retains both epilogues. Together the eight policies form the
 Cartesian product of two FC1 and four fused-FC2 choices. Policy order is part
@@ -87,7 +87,7 @@ def fused_finalize_config(cfg):
 
 
 def nvfp4_epilogue_overrides(policy_index: int) -> tuple[dict, dict]:
-    """Return FC1/FC2 overrides for the validated native 512-row profile."""
+    """Return FC1/FC2 overrides for the Rubin non-swap-AB 512-row profile."""
     from ..batched_gemm.epilogue_schedule import (
         epilogue_steps_for_prefix,
         fc1_streaming_steps,

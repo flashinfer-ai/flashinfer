@@ -47,7 +47,7 @@ def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, requ
     compile_cache._COMPILED_GEMM_CACHE.clear()
     request.addfinalizer(compile_cache._COMPILED_GEMM_CACHE.clear)
 
-    io = {"cfg": object()}
+    io = {"cfg": SimpleNamespace(is_rubin=False)}
     first = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
     assert compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream") is first
 
@@ -57,14 +57,17 @@ def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, requ
     third = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
 
     monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "1")
-    reencoded = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
-    assert reencoded is not third
-    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "0")
     assert compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream") is third
+
+    target[0] = (1, "sm107a")
+    io["cfg"] = SimpleNamespace(is_rubin=True)
+    reencoded = compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream")
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", "0")
+    assert compile_cache.get_compiled_gemm("cfg", "fc1", io, "stream") is not reencoded
 
     assert first is not second
     assert second is not third
-    assert len(compiled) == 4
+    assert len(compiled) == 5
 
 
 def _fake_launch_io(address: int = 1 << 20, *, align: int = 16, shape=None) -> dict:
@@ -107,7 +110,7 @@ def _fake_launch_io(address: int = 1 << 20, *, align: int = 16, shape=None) -> d
     io["shape"] = shape or (4608, 1024, 5120, 48, 128)
     io["launch_early_exit_max_token_ctas"] = 96
     io["c_row_stride"] = io["shape"][0]
-    io["cfg"] = SimpleNamespace(fused_finalize_top_k=0)
+    io["cfg"] = SimpleNamespace(fused_finalize_top_k=0, is_rubin=True)
     io["tma_desc_storage_dp"] = make_ptr(
         cutlass.Uint8,
         address + 8192,
@@ -265,8 +268,8 @@ def test_compiled_gemm_cache_prepares_new_workspace_on_cache_hit(monkeypatch, re
     compile_cache.clear_compiled_gemm_cache()
     request.addfinalizer(compile_cache.clear_compiled_gemm_cache)
 
-    first_io = {"binding": "first shard"}
-    second_io = {"binding": "second shard"}
+    first_io = {"cfg": SimpleNamespace(is_rubin=True), "binding": "first shard"}
+    second_io = {"cfg": SimpleNamespace(is_rubin=True), "binding": "second shard"}
     first = compile_cache.get_compiled_gemm("cfg", "fc1", first_io, "first stream")
     second = compile_cache.get_compiled_gemm("cfg", "fc1", second_io, "second stream")
     assert first is second
@@ -347,9 +350,8 @@ def test_disk_cache_prepares_each_workspace_before_keying(monkeypatch, disk_hit)
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm_arch", [100, 103, 107])
 def test_descriptor_preparation_reuses_code_without_retaining_bindings(
-    monkeypatch, request, sm_arch
+    monkeypatch, request
 ):
     from cutlass.cutlass_dsl import BaseDSL
     from flashinfer.prims_ts.batched_gemm import batched_gemm_run as runner
@@ -358,9 +360,7 @@ def test_descriptor_preparation_reuses_code_without_retaining_bindings(
     monkeypatch.delenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", raising=False)
     monkeypatch.setattr(BaseDSL, "enable_pyir", contextlib.nullcontext)
     monkeypatch.setattr(torch.cuda, "device", lambda _: contextlib.nullcontext())
-    monkeypatch.setattr(
-        compile_cache, "_compile_target_key", lambda io: (0, f"sm{sm_arch}a")
-    )
+    monkeypatch.setattr(compile_cache, "_compile_target_key", lambda io: (0, "sm107a"))
     compile_cache.clear_compiled_gemm_cache()
     request.addfinalizer(compile_cache.clear_compiled_gemm_cache)
     compilations, bindings, owners = [], [], []
@@ -385,7 +385,7 @@ def test_descriptor_preparation_reuses_code_without_retaining_bindings(
 
     monkeypatch.setattr(runner.cute, "compile", compile_prepare)
     monkeypatch.setattr(compile_cache, "_compile_or_load", compile_gemm)
-    cfg = make_config(sm_arch=sm_arch)
+    cfg = make_config(sm_arch=107)
     for index in range(4):
         io = _fake_launch_io(
             (index + 1) << 20, shape=(256, 512 * (index + 1), 256, 2, 128)

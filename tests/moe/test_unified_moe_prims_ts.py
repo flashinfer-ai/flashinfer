@@ -215,26 +215,92 @@ class TestPrimsTsPrepare:
             )
 
     @pytest.mark.parametrize(
-        "layout,shape",
+        "fc1_shape,fc2_shape,error",
         [
-            ("BlockMajorK", (32, 1024, 512)),
-            ("MajorK", (32, 4, 1024, 128)),
+            ((32, 1024, 512), (32, 2, 1024, 128), "same layout"),
+            ((32, 4, 1024, 128), (32, 1024, 256), "same layout"),
+            ((32, 8, 1024, 64), (32, 2, 1024, 128), "gemm1_weights.*128-byte"),
+            ((32, 4, 1024, 128), (32, 4, 1024, 64), "gemm2_weights.*128-byte"),
         ],
     )
-    def test_nvfp4_rejects_mismatched_weight_storage(self, layout, shape):
+    def test_rubin_rejects_invalid_nvfp4_storage(
+        self, monkeypatch, fc1_shape, fc2_shape, error
+    ):
+        monkeypatch.setattr(
+            "flashinfer.fused_moe.runners.get_compute_capability", lambda _: (10, 7)
+        )
         runner = PrimsTsRunner(
-            _config(
-                backend=PrimsTsConfig(nvfp4_weight_layout=layout),
-                execution=ExecutionConfig(enable_pdl=False),
-            ),
+            _config(execution=ExecutionConfig(enable_pdl=False)),
             torch.device("cpu"),
         )
-        with pytest.raises(ValueError, match=f"{layout} shape"):
+        with pytest.raises(ValueError, match=error):
             runner._validate_fp4_tensors(
                 None,
-                {"gemm1_weights": torch.empty(shape, dtype=torch.uint8)},
+                {
+                    "gemm1_weights": torch.empty(
+                        fc1_shape, device="meta", dtype=torch.uint8
+                    ),
+                    "gemm2_weights": torch.empty(
+                        fc2_shape, device="meta", dtype=torch.uint8
+                    ),
+                },
                 1024,
             )
+
+    @pytest.mark.parametrize("minor", (0, 3, 7))
+    @pytest.mark.parametrize(
+        "block", (None, 64, 128), ids=("MajorK", "block64", "block128")
+    )
+    def test_infers_nvfp4_layout(self, monkeypatch, minor, block):
+        monkeypatch.setattr(
+            "flashinfer.fused_moe.runners.get_compute_capability", lambda _: (10, minor)
+        )
+        runner = PrimsTsRunner(
+            _config(execution=ExecutionConfig(enable_pdl=False)), torch.device("cpu")
+        )
+
+        def weight(rows, k):
+            shape = (
+                (32, rows, k // 2)
+                if block is None
+                else (32, k // (2 * block), rows, block)
+            )
+            return torch.empty(shape, device="meta", dtype=torch.uint8)
+
+        act = MoEActivationPack(
+            topk_ids=torch.empty((4, 2), device="meta", dtype=torch.int32),
+            topk_weights=torch.empty((4, 2), device="meta", dtype=torch.float32),
+            hidden_states_q=torch.empty((4, 512), device="meta", dtype=torch.uint8),
+            hidden_states_scale=torch.empty(
+                (4, 64), device="meta", dtype=torch.float8_e4m3fn
+            ),
+        )
+        view = dict(
+            gemm1_weights=weight(1024, 1024),
+            gemm2_weights=weight(1024, 512),
+            gemm1_weights_scale=torch.empty(
+                (32, 1024, 64), device="meta", dtype=torch.float8_e4m3fn
+            ),
+            gemm2_weights_scale=torch.empty(
+                (32, 1024, 32), device="meta", dtype=torch.float8_e4m3fn
+            ),
+        )
+        if minor == 7 and block == 64:
+            with pytest.raises(ValueError, match="128-byte K blocks"):
+                runner._validate_fp4_tensors(act, view, 1024)
+            return
+        assert runner._validate_fp4_tensors(act, view, 1024) is act.hidden_states_scale
+        assert runner._weight_layout(view) == (
+            WeightLayout.MajorK if block is None else WeightLayout.BlockMajorK
+        )
+        if minor != 7:
+            assert not runner._effective_fused_finalize()
+        elif block == 128:
+            view["gemm2_weights"] = (
+                view["gemm2_weights"].transpose(1, 2).contiguous().transpose(1, 2)
+            )
+            with pytest.raises(ValueError, match="gemm2_weights.*contiguous"):
+                runner._validate_fp4_tensors(act, view, 1024)
 
     def test_prepare_weights_rejects_unsupported_pairs(self):
         with pytest.raises(ValueError, match="does not support"):
@@ -1220,25 +1286,42 @@ class TestPrimsTsUnifiedGpu:
 
 
 def test_prims_ts_tuning_cache_distinguishes_finalize_and_weight_layout(monkeypatch):
+    from flashinfer.fused_moe.runners import _TrtllmLaunchState, _TrtllmPackedInputs
+
     monkeypatch.setattr(
         "flashinfer.fused_moe.runners.get_compute_capability", lambda device: (10, 7)
     )
-    keys, hashes = set(), set()
+    keys = {}
     for fused in (False, True):
-        for layout in ("MajorK", "BlockMajorK"):
+        for hint in ("MajorK", "BlockMajorK"):
             cfg = _config(
-                backend=PrimsTsConfig(nvfp4_weight_layout=layout),
+                backend=PrimsTsConfig(nvfp4_weight_layout=hint),
                 finalize=MoEFinalizeConfig(use_fused_finalize=fused),
                 execution=ExecutionConfig(enable_pdl=False),
             )
             runner = PrimsTsRunner(cfg, torch.device("cpu"))
-            key = runner.get_cache_key_extras([])
-            assert key == runner._cache_key_extras() + runner._input_cache_key_extras(
-                []
-            )
-            keys.add(key)
-            hashes.add(hash(runner))
-    assert len(keys) == len(hashes) == 4
+            original_hash = hash(runner)
+            for layout, shape in (
+                (WeightLayout.MajorK, (32, 1024, 512)),
+                (WeightLayout.BlockMajorK, (32, 4, 1024, 128)),
+            ):
+                inferred = runner._weight_layout(
+                    {
+                        "gemm1_weights": torch.empty(
+                            shape, device="meta", dtype=torch.uint8
+                        )
+                    }
+                )
+                assert inferred == layout
+                inputs = _TrtllmPackedInputs(
+                    [],
+                    tuning_config=None,
+                    launch_state=_TrtllmLaunchState(dict(weight_layout=inferred)),
+                )
+                key = runner.get_cache_key_extras(inputs)
+                assert keys.setdefault((fused, layout), key) == key
+                assert hash(runner) == original_hash
+    assert len(set(keys.values())) == 4
 
 
 def test_prims_ts_unified_cache_tracks_effective_finalize_for_each_call(monkeypatch):

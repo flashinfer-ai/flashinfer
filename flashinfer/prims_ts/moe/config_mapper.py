@@ -688,7 +688,7 @@ def _expanded_prims_ts_json_configs_for_arch(
         if str(cfg.options.get("tile_scheduler", "static")).lower() != "persistent":
             continue
         if cfg.options.get("dense_m_repeats", 1) == 2:
-            # These native Rubin pipelines have their own validated schedule.
+            # Rubin non-swap-AB 512/1024 tactics have their own validated schedule.
             continue
         options = {
             **cfg.options,
@@ -1408,9 +1408,11 @@ def _with_spec_overrides_pair(
 
 
 def _with_pdl_pair(pair: PrimsTsGemmPair, *, enable_pdl: bool) -> PrimsTsGemmPair:
-    # Native routed Rubin loaders do not implement PDL. The MoE runner also
-    # disables PDL on routing/finalize for this pair, preserving stream order.
-    enable_pdl = enable_pdl and not pair.fc1.cfg.kwargs.get("routed_native_sfa", 0)
+    # An omitted use_pdl follows the caller. Either GEMM can opt the pair out,
+    # as the Rubin non-swap-AB 512/1024 tactics do.
+    enable_pdl = enable_pdl and all(
+        gemm.cfg.kwargs.get("use_pdl", True) for gemm in (pair.fc1, pair.fc2)
+    )
     return PrimsTsGemmPair(
         tile_n=pair.tile_n,
         moe_config_index=pair.moe_config_index,
@@ -1743,6 +1745,37 @@ def _make_default_json_moe_config_pair(
         per_token_sf_dtype=per_token_sf_dtype,
         weight_layout=weight_layout,
     )
+
+    def make_pair(moe_config_index: int) -> PrimsTsGemmPair | None:
+        return _make_json_moe_config_pair(
+            sm_arch=sm_arch,
+            tile_n=tile_n,
+            moe_config_index=moe_config_index,
+            activation_type=activation_type,
+            dtype_a=dtype_a,
+            dtype_b=dtype_b,
+            fc1_dtype_c=fc1_dtype_c,
+            fc2_dtype_c=fc2_dtype_c,
+            dtype_label=dtype_label,
+            fc1_has_bias=fc1_has_bias,
+            fc2_has_bias=fc2_has_bias,
+            use_deepseek_fp8=use_deepseek_fp8,
+            fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
+            fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
+            fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
+            fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
+            per_token_sf_dtype=per_token_sf_dtype,
+            weight_layout=weight_layout,
+            has_gemm1_alpha=has_gemm1_alpha,
+            has_gemm1_beta=has_gemm1_beta,
+            has_gemm1_clamp_limit=has_gemm1_clamp_limit,
+            enable_pdl=enable_pdl,
+            deepseek_fp8_block_size=deepseek_fp8_block_size,
+        )
+
+    if sm_arch != 107:
+        return make_pair(preferred_index)
+
     # JSON compatibility alone does not establish a runnable schedule. In
     # particular, legacy rows may have incompatible warp-group register
     # budgets. Try the preferred pair, then remaining stable tactic IDs;
@@ -1757,31 +1790,7 @@ def _make_default_json_moe_config_pair(
     ]
     for moe_config_index in candidate_indices:
         try:
-            pair = _make_json_moe_config_pair(
-                sm_arch=sm_arch,
-                tile_n=tile_n,
-                moe_config_index=moe_config_index,
-                activation_type=activation_type,
-                dtype_a=dtype_a,
-                dtype_b=dtype_b,
-                fc1_dtype_c=fc1_dtype_c,
-                fc2_dtype_c=fc2_dtype_c,
-                dtype_label=dtype_label,
-                fc1_has_bias=fc1_has_bias,
-                fc2_has_bias=fc2_has_bias,
-                use_deepseek_fp8=use_deepseek_fp8,
-                fc1_use_per_token_sf_a=fc1_use_per_token_sf_a,
-                fc2_use_per_token_sf_a=fc2_use_per_token_sf_a,
-                fc1_use_per_token_sf_b=fc1_use_per_token_sf_b,
-                fc2_use_per_token_sf_b=fc2_use_per_token_sf_b,
-                per_token_sf_dtype=per_token_sf_dtype,
-                weight_layout=weight_layout,
-                has_gemm1_alpha=has_gemm1_alpha,
-                has_gemm1_beta=has_gemm1_beta,
-                has_gemm1_clamp_limit=has_gemm1_clamp_limit,
-                enable_pdl=enable_pdl,
-                deepseek_fp8_block_size=deepseek_fp8_block_size,
-            )
+            pair = make_pair(moe_config_index)
             if pair is None:
                 continue
             _ensure_pair_buildable(
@@ -2396,8 +2405,8 @@ def map_trtllm_nvfp4_moe_tactic(
         top_k=top_k,
         num_local_experts=num_local_experts,
         num_experts=num_experts,
-        # Keep the untuned default on the general-purpose swapAB path. The
-        # native Batch-M profiles are selected explicitly or by autotuning.
+        # Keep the untuned default on the general-purpose swap-AB path. Rubin
+        # non-swap-AB 512/1024 tactics are selected explicitly or by autotuning.
         supported_tiles=SUPPORTED_NVFP4_TILE_N,
     )
     if tile_n not in _nvfp4_supported_tiles(sm_arch):

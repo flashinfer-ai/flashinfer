@@ -950,10 +950,12 @@ def _make_pipeline_configs(cfg):
         ) * 32
         gather_producer_op = pipeline.PipelineOp.AsyncLoad
         gather_advance_on_acquire = False
-        if not cfg.is_rubin and cfg.fuse_operand_sf_loads:
+        if (
+            not cfg.is_rubin and cfg.fuse_operand_sf_loads
+        ) or cfg.casta_gather_joins_ctas:
             gather_producer_threads *= cfg.umma_cta_count
             gather_producer_op = pipeline.PipelineOp.AsyncThread
-            gather_advance_on_acquire = True
+            gather_advance_on_acquire = bool(cfg.fuse_operand_sf_loads)
         gather_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
             num_stages=cfg.num_stages_b if cfg.is_swap_ab else cfg.num_stages_a,
             producer_group=pipeline.CooperativeGroup(
@@ -2095,8 +2097,8 @@ def _batched_gemm_kernel_bf16_body(
     gemm1_alpha_tensor: cute.Tensor,
     gemm1_beta_tensor: cute.Tensor,
     gemm1_clamp_limit_tensor: cute.Tensor,
-    finalize_scale_tensor: cute.Tensor,
-    finalize_route_tensor: cute.Tensor,
+    finalize_scale_tensor: cute.Tensor | None,
+    finalize_route_tensor: cute.Tensor | None,
     per_token_sf_a_tensor: cute.Tensor,
     per_token_sf_b_tensor: cute.Tensor,
     tile_idx_tensor: cute.Tensor,
@@ -2297,8 +2299,8 @@ def _batched_gemm_kernel_bf16_body_impl(
     gemm1_alpha_tensor: cute.Tensor,
     gemm1_beta_tensor: cute.Tensor,
     gemm1_clamp_limit_tensor: cute.Tensor,
-    finalize_scale_tensor: cute.Tensor,
-    finalize_route_tensor: cute.Tensor,
+    finalize_scale_tensor: cute.Tensor | None,
+    finalize_route_tensor: cute.Tensor | None,
     per_token_sf_a_tensor: cute.Tensor,
     per_token_sf_b_tensor: cute.Tensor,
     tile_idx_tensor: cute.Tensor,
@@ -3693,8 +3695,8 @@ def batched_gemm_kernel_bf16(
     gemm1_alpha_tensor: cute.Tensor,
     gemm1_beta_tensor: cute.Tensor,
     gemm1_clamp_limit_tensor: cute.Tensor,
-    finalize_scale_tensor: cute.Tensor,
-    finalize_route_tensor: cute.Tensor,
+    finalize_scale_tensor: cute.Tensor | None,
+    finalize_route_tensor: cute.Tensor | None,
     per_token_sf_a_tensor: cute.Tensor,
     per_token_sf_b_tensor: cute.Tensor,
     tile_idx_tensor: cute.Tensor,
@@ -4645,12 +4647,16 @@ def gemm(
 
     # Coefficients are scalar-indexed through the expanded route ID. Their
     # token/top-k extent is validated by the host adapter.
-    finalize_route_tensor = cute.make_tensor(
-        finalize_route_raw_ptr, cute.make_layout((m if cfg.fuse_moe_finalize else 1,))
-    )
-    finalize_scale_tensor = cute.make_tensor(
-        finalize_scale_raw_ptr, cute.make_layout((1,))
-    )
+    finalize_route_tensor = None
+    finalize_scale_tensor = None
+    if cutlass.const_expr(cfg.is_rubin):
+        finalize_route_tensor = cute.make_tensor(
+            finalize_route_raw_ptr,
+            cute.make_layout((m if cfg.fuse_moe_finalize else 1,)),
+        )
+        finalize_scale_tensor = cute.make_tensor(
+            finalize_scale_raw_ptr, cute.make_layout((1,))
+        )
 
     if cutlass.const_expr(cfg.per_token_sf_dtype == int(DType.BF16)):
         per_token_sf_dtype = cutlass.BFloat16

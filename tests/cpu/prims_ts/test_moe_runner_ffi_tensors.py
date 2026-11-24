@@ -123,11 +123,7 @@ def test_staged_routing_ffi_signatures_take_optional_weights(name, expected_para
 
     start = names.index(expected_params[0])
     assert tuple(names[start : start + len(expected_params)]) == expected_params
-    assert names[-1] == (
-        "allocate_gemm2_output"
-        if name == "trtllm_moe_run_routing_fp4_nvfp4"
-        else "routing_replay_out"
-    )
+    assert names[-1] == "routing_replay_out"
     for param, param_name in zip(params, names, strict=True):
         if param_name in _STAGED_WEIGHT_PARAMS:
             assert param.startswith("Optional<TensorView> const&"), param
@@ -1786,7 +1782,9 @@ def test_select_expert_weights_ignores_1d_autotune_placeholder():
 
 
 @pytest.mark.cpu_only
-def test_nvfp4_finalize_modes_have_distinct_tuning_keys(monkeypatch):
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_nvfp4_finalize_modes_only_affect_rubin_tuning_keys(monkeypatch, sm_arch):
+    monkeypatch.setattr(runner_module, "_sm_arch_for_tensor", lambda _: sm_arch)
     runner = runner_module.PrimsTsNvfp4MoERunner(
         None, top_k=2, num_local_experts=8, hidden_size=1024, intermediate_size=512
     )
@@ -1816,4 +1814,7 @@ def test_nvfp4_finalize_modes_have_distinct_tuning_keys(monkeypatch):
             do_finalize=do_finalize, use_fused_finalize=use_fused_finalize
         )
         keys.append(runner.get_cache_key_extras(inputs))
-    assert len(set(keys)) == len(keys)
+    assert len(set(keys)) == (len(keys) if sm_arch == 107 else 1)
+    assert dict(keys[0])["prims_ts_moe_config_version"] == (
+        14 if sm_arch == 107 else 11
+    )

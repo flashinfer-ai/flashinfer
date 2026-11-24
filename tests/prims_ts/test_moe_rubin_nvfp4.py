@@ -19,9 +19,8 @@ from flashinfer.tllm_enums import ActivationType, WeightLayout
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("layout", ("MajorK", "BlockMajorK"))
-def test_rubin_unified_moe_shared_weights(monkeypatch, layout):
-    """One weight pack serves decode and every native prefill pair."""
+def test_rubin_unified_moe_shared_weights(monkeypatch):
+    """One layer can use either weight pack across decode and native prefill."""
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("Native Batch-M MoE requires Rubin")
     from flashinfer.autotuner import AutoTuner
@@ -43,22 +42,29 @@ def test_rubin_unified_moe_shared_weights(monkeypatch, layout):
     torch.manual_seed(31)
     experts, hidden, intermediate, top_k = 8, 1024, 512, 2
     quant = QuantConfig(QuantFormat.NVFP4, QuantFormat.NVFP4)
-    backend = PrimsTsConfig(nvfp4_weight_layout=layout)
-    view = backend.prepare_weights(
+    backend = PrimsTsConfig()
+    w1 = (
         torch.randn(
             experts, 2 * intermediate, hidden, device="cuda", dtype=torch.bfloat16
         )
-        / hidden**0.5,
-        torch.randn(experts, hidden, intermediate, device="cuda", dtype=torch.bfloat16)
-        / intermediate**0.5,
-        quant=quant,
-        num_local_experts=experts,
-        hidden_size=hidden,
-        intermediate_size=intermediate,
-        nvfp4_weight_layout=layout,
+        / hidden**0.5
     )
-    weights = MoEWeightPack()
-    weights.prepare_for("prims_ts", view)
+    w2 = (
+        torch.randn(experts, hidden, intermediate, device="cuda", dtype=torch.bfloat16)
+        / intermediate**0.5
+    )
+    weights = {}
+    for layout in (WeightLayout.MajorK, WeightLayout.BlockMajorK):
+        view = backend.prepare_weights(
+            w1,
+            w2,
+            quant=quant,
+            num_local_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            nvfp4_weight_layout=layout.name,
+        )
+        weights[layout] = MoEWeightPack({"prims_ts": view})
     config = MoEConfig(
         routing=RoutingConfig(
             num_experts=experts, top_k=top_k, method=RoutingMethodType.Renormalize
@@ -74,21 +80,17 @@ def test_rubin_unified_moe_shared_weights(monkeypatch, layout):
         "choose_one",
         lambda custom_op, runners, tuning_config, inputs, **kw: (runners[0], selected),
     )
-    pointers = []
     forward = PrimsTsNvfp4MoERunner.forward
 
     def track(runner, inputs, tactic=-1, **kwargs):
-        pointers.append(
-            tuple(
-                kwargs[k].data_ptr()
-                for k in (
-                    "gemm1_weights",
-                    "gemm1_weights_scale",
-                    "gemm2_weights",
-                    "gemm2_weights_scale",
-                )
-            )
-        )
+        view = weights[runner.weight_layout].get_view("prims_ts")
+        for name in (
+            "gemm1_weights",
+            "gemm1_weights_scale",
+            "gemm2_weights",
+            "gemm2_weights_scale",
+        ):
+            assert kwargs[name].data_ptr() == view[name].data_ptr()
         return forward(runner, inputs, tactic=tactic, **kwargs)
 
     monkeypatch.setattr(PrimsTsNvfp4MoERunner, "forward", track)
@@ -106,26 +108,35 @@ def test_rubin_unified_moe_shared_weights(monkeypatch, layout):
             ),
         )
         selected = [-1, -1]
-        baseline = MoELayer(config)(act, weights).clone()
+        layer = MoELayer(config)
+        baseline = layer(act, weights[WeightLayout.MajorK]).clone()
+        blocked = layer(act, weights[WeightLayout.BlockMajorK])
+        assert (
+            blocked.float() - baseline.float()
+        ).norm() / baseline.float().norm() < 0.01
         if tokens == 32:
             continue
         for tactic in ([512, 0], [512, 1], [1024, 0]):
             selected = tactic
             layer = MoELayer(config)
-            actual = layer(act, weights)
-            assert torch.isfinite(actual).all()
-            assert (actual - baseline).norm() / baseline.norm() < 0.12
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                captured = layer(act, weights)
+            captures = []
+            for pack in weights.values():
+                actual = layer(act, pack)
+                assert torch.isfinite(actual).all()
+                assert (actual - baseline).norm() / baseline.norm() < 0.12
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = layer(act, pack)
+                captures.append((graph, captured, actual))
             for _ in range(5):
-                graph.replay()
+                for graph, _, _ in captures:
+                    graph.replay()
             torch.cuda.synchronize()
-            assert torch.isfinite(captured).all()
-            assert (
-                captured.float() - actual.float()
-            ).norm() / actual.float().norm() < 0.01
-    assert len(set(pointers)) == 1
+            for _, captured, actual in captures:
+                assert torch.isfinite(captured).all()
+                assert (
+                    captured.float() - actual.float()
+                ).norm() / actual.float().norm() < 0.01
 
 
 @pytest.mark.parametrize("layout", (WeightLayout.MajorK, WeightLayout.BlockMajorK))

@@ -248,8 +248,9 @@ def prims_ts_fp4_block_scale_moe(
         Number of fused shared experts (default ``None`` / ``0``).
 
     use_fused_finalize : bool
-        Fuse router weighting and BF16 atomic reduction into supported native
-        Rubin FC2 epilogues (default ``True``). Reduction order is unspecified.
+        Fuse router weighting and BF16 atomic reduction into the FC2 epilogue
+        of Rubin non-swap-AB 512/1024 tactics (default ``True``). Reduction
+        order is unspecified.
         Fusion is disabled for other tactics, ``do_finalize=False``,
         or when PyTorch deterministic algorithms are enabled.
 
@@ -923,8 +924,8 @@ def prims_ts_fp4_block_scale_routed_moe(
         Autotune token-bucket upper bound (default ``8192``).
 
     use_fused_finalize : bool
-        Fuse supported native Rubin FC2 finalization (default ``True``), with
-        the same BF16 atomic reduction and fallback rules as the flat API.
+        Fuse FC2 finalization for Rubin non-swap-AB 512/1024 tactics (default
+        ``True``) with the same BF16 atomic reduction and fallback rules as the flat API.
 
     Returns
     -------

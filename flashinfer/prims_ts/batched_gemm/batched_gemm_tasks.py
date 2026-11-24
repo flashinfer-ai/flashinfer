@@ -1063,7 +1063,7 @@ def create_load_sfa_task(
         cfg.has_routed_sfs
         and cfg.uses_ldgsts_routed_sfs
         and hasattr(smem_sfa, "drain_loop")
-        and not getattr(smem_sfa, "uses_async_load_pipeline", False)
+        and not (cfg.is_rubin and getattr(smem_sfa, "uses_async_load_pipeline", False))
     )
     prefetch_depth = _producer_commit_prefetch_depth(smem_sfa)
 
@@ -1166,7 +1166,7 @@ def create_load_sfb_task(
         cfg.has_routed_sfs
         and cfg.uses_ldgsts_routed_sfs
         and hasattr(smem_sfb, "drain_loop")
-        and not getattr(smem_sfb, "uses_async_load_pipeline", False)
+        and not (cfg.is_rubin and getattr(smem_sfb, "uses_async_load_pipeline", False))
     )
     prefetch_depth = _producer_commit_prefetch_depth(smem_sfb)
 

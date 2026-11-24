@@ -105,6 +105,50 @@ def test_nvfp4_moe_pair_derives_skip_early_exit_pdl(enable_pdl):
     assert fc2["skip_early_exit_pdl"] == int(enable_pdl)
 
 
+@pytest.mark.parametrize(
+    "requested,fc1_pdl,fc2_pdl,expected",
+    [
+        (True, None, None, True),
+        (True, False, None, False),
+        (True, None, False, False),
+        (False, True, True, False),
+    ],
+)
+def test_nvfp4_pdl_respects_caller_and_both_gemm_rows(
+    monkeypatch, requested, fc1_pdl, fc2_pdl, expected
+):
+    from flashinfer.prims_ts.moe import config_mapper
+
+    resolve = config_mapper._resolve_moe_json_config_pair
+
+    def resolve_with_pdl(*args, **kwargs):
+        rows = resolve(*args, **kwargs)
+        return tuple(
+            row
+            if pdl is None
+            else replace(row, options={**row.options, "use_pdl": pdl})
+            for row, pdl in zip(rows, (fc1_pdl, fc2_pdl), strict=True)
+        )
+
+    monkeypatch.setattr(
+        config_mapper, "_resolve_moe_json_config_pair", resolve_with_pdl
+    )
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [-1, -1],
+        sm_arch=107,
+        num_tokens=32,
+        top_k=2,
+        num_local_experts=8,
+        enable_pdl=requested,
+    )
+    for gemm in (pair.fc1, pair.fc2):
+        cfg = gemm.cfg.build()
+        assert cfg.is_swap_ab
+        assert bool(cfg.use_pdl) == expected
+        if not expected:
+            assert not cfg.skip_early_exit_pdl
+
+
 def test_fc2_without_early_exit_does_not_skip_pdl_wait():
     overrides = _pdl_overrides(
         {"use_early_exit": 0},

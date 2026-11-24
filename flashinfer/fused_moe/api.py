@@ -1206,16 +1206,17 @@ class PrimsTsConfig:
     shuffles the weight payloads (epilogue tile 64); do not register that
     dictionary under ``"trtllm_fp8_block"``.
 
-    GEMMs use Prims-TS and routing uses TRT-LLM Gen. Native Rubin NVFP4
-    prefill can fuse finalize into FC2 using BF16 atomic reductions. Set
+    GEMMs use Prims-TS and routing uses TRT-LLM Gen. Rubin NVFP4 swap-AB
+    tactics use token tiles of 8, 16, 32, 64, 128, or 256 rows and follow
+    the caller's PDL setting. Rubin non-swap-AB tactics use 512 or 1024 rows,
+    disable PDL, and can fuse finalize into FC2 using BF16 atomic reductions. Set
     ``MoEFinalizeConfig(use_fused_finalize=False)`` for the separate FP32
     finalizer; deterministic PyTorch execution and unsupported tactics also
-    use the separate path. ``nvfp4_weight_layout`` selects the physical NVFP4
-    weight layout; pass the same value to :meth:`prepare_weights`. Both
-    layouts share one shuffled weight set across decode and prefill tactics.
-    Manually prepared four-dimensional NVFP4 weight views require
-    ``PrimsTsConfig(nvfp4_weight_layout="BlockMajorK")``, including on
-    SM100/SM103; the NVFP4 layout is no longer inferred from tensor rank.
+    use the separate path. Pass ``nvfp4_weight_layout`` to :meth:`prepare_weights`
+    to choose how to pack NVFP4 weights. On SM100, SM103, and SM107, the
+    runner infers ``MajorK`` from 3D weights and ``BlockMajorK`` from 4D
+    weights. Both layouts share one shuffled weight set across decode and
+    prefill tactics.
     """
 
     nvfp4_weight_layout: Literal["MajorK", "BlockMajorK"] = "MajorK"

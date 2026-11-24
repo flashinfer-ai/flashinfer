@@ -12,24 +12,34 @@ from flashinfer.utils import get_compute_capability
 
 
 @pytest.mark.parametrize(
-    "format_name,allocate_gemm2_output,expected_length",
+    "format_name,allocate_gemm2_output,expected_length,tile",
     [
-        pytest.param("nvfp4", True, 11, id="nvfp4-unfused"),
-        pytest.param("nvfp4", False, 11, id="nvfp4-fused"),
-        pytest.param("mxfp4_mxfp8", True, 10, id="mxfp4-mxfp8"),
-        pytest.param("mxfp4_bf16", True, 9, id="mxfp4-bf16"),
+        pytest.param("nvfp4", True, 10, 128, id="nvfp4-unfused"),
+        pytest.param("nvfp4", True, 10, -1, id="nvfp4-unfused-default-tile"),
+        pytest.param("nvfp4", True, 10, 512, id="nvfp4-unfused-tile512"),
+        pytest.param("nvfp4", True, 10, 1024, id="nvfp4-unfused-tile1024"),
+        pytest.param("nvfp4", False, 11, 128, id="nvfp4-fused"),
+        pytest.param("nvfp4", False, 11, -1, id="nvfp4-fused-default-tile"),
+        pytest.param("nvfp4", False, 11, 512, id="nvfp4-fused-tile512"),
+        pytest.param("nvfp4", False, 11, 1024, id="nvfp4-fused-tile1024"),
+        pytest.param("mxfp4_mxfp8", True, 10, 128, id="mxfp4-mxfp8"),
+        pytest.param("mxfp4_bf16", True, 9, 128, id="mxfp4-bf16"),
     ],
 )
 def test_staged_fp4_routing_outputs(
-    format_name, allocate_gemm2_output, expected_length
+    format_name, allocate_gemm2_output, expected_length, tile
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
-    if get_compute_capability(device)[0] != 10:
+    capability = get_compute_capability(device)
+    if capability[0] != 10:
         pytest.skip("Staged FP4 MoE requires an SM100-family GPU")
+    if tile in (512, 1024) and capability != (10, 7):
+        pytest.skip("Wide NVFP4 routing tiles require SM107")
 
-    num_tokens, hidden_size, intermediate_size, num_experts, top_k = 17, 1024, 512, 8, 2
+    num_tokens = 17 if tile == 128 else 4096
+    hidden_size, intermediate_size, num_experts, top_k = 1024, 512, 8, 2
     is_nvfp4 = format_name == "nvfp4"
     is_bf16 = format_name == "mxfp4_bf16"
     dtype = (
@@ -52,7 +62,10 @@ def test_staged_fp4_routing_outputs(
     if not is_bf16:
         args.append(
             torch.ones(
-                (128, hidden_size // (16 if is_nvfp4 else 32)),
+                (
+                    ((num_tokens + 127) // 128) * 128,
+                    hidden_size // (16 if is_nvfp4 else 32),
+                ),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
@@ -75,19 +88,27 @@ def test_staged_fp4_routing_outputs(
             None,
             int(RoutingMethodType.Renormalize),
             False,
-            [128, 0],
+            [tile, 0],
             int(WeightLayout.MajorK),
             int(ActivationType.Swiglu),
             True,
             None,
         ]
     )
-    if is_nvfp4:
-        args.append(allocate_gemm2_output)
     moe_op = get_trtllm_moe_sm100_module().moe_op
-    outputs = getattr(moe_op, f"trtllm_moe_run_routing_fp4_{format_name}")(*args)
+    name = f"trtllm_moe_run_routing_fp4_{format_name}"
+    if not allocate_gemm2_output:
+        name += "_fused_finalize"
+    outputs = getattr(moe_op, name)(*args)
     assert len(outputs) == expected_length
     outputs = [torch.from_dlpack(t) if t is not None else None for t in outputs]
+
+    if num_tokens == 4096:
+        # Each expert receives exactly 1024 routes, so the CTA count reveals
+        # the tile actually used by the router for both finalization modes.
+        default_tile = 512 if capability == (10, 7) else 128
+        expected_tile = default_tile if tile == -1 else tile
+        assert int(outputs[5].flatten()[0]) == num_tokens * top_k // expected_tile
 
     expanded_to_permuted = outputs[1].long()
     assert expanded_to_permuted.numel() == num_tokens * top_k
@@ -103,12 +124,9 @@ def test_staged_fp4_routing_outputs(
     assert gemm2_output.dtype == torch.bfloat16
     assert gemm2_output.shape[1] == hidden_size
     assert (gemm2_output.numel() > 0) == allocate_gemm2_output
-    if is_nvfp4:
-        if allocate_gemm2_output:
-            assert outputs[10] is None
-        else:
-            assert outputs[10].dtype == torch.int32
-            torch.testing.assert_close(
-                outputs[10][expanded_to_permuted],
-                torch.arange(num_tokens * top_k, dtype=torch.int32, device=device),
-            )
+    if not allocate_gemm2_output:
+        assert outputs[10].dtype == torch.int32
+        torch.testing.assert_close(
+            outputs[10][expanded_to_permuted],
+            torch.arange(num_tokens * top_k, dtype=torch.int32, device=device),
+        )

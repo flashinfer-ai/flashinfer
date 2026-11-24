@@ -1935,7 +1935,8 @@ def test_validation_rejects_bf16_kbox_tma_a_tile_k_not_multiple_of_64():
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("umma_cta_count", [1, 2])
 @pytest.mark.parametrize("route", ["TMA", "LDGSTS"])
-def test_casta_relay_has_dedicated_warp_and_only_waits_for_b(umma_cta_count, route):
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_casta_gather_readiness_matches_architecture(sm_arch, umma_cta_count, route):
     from cutlass.experimental.task_scheduling.enums import ScheduleStage
 
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -1948,9 +1949,11 @@ def test_casta_relay_has_dedicated_warp_and_only_waits_for_b(umma_cta_count, rou
     )
     from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
         _build_schedule_validate,
+        _make_pipeline_configs,
     )
 
     cfg = make_config(
+        sm_arch=sm_arch,
         batch_mode=int(BatchMode.BATCH_N),
         dtype_a=int(DType.MXE2M1),
         dtype_b=int(DType.BF16),
@@ -1980,7 +1983,15 @@ def test_casta_relay_has_dedicated_warp_and_only_waits_for_b(umma_cta_count, rou
         assert not occupied & warps, task.name
         occupied.update(warps)
     relay = [task for task in tasks if task.name == "SyncTask"]
-    expected = int(umma_cta_count == 2 and route == "LDGSTS")
+    two_cta_gather = umma_cta_count == 2 and route == "LDGSTS"
+    expected = int(sm_arch == 107 and two_cta_gather)
+    if sm_arch in (100, 103) and two_cta_gather:
+        from cutlass import pipeline
+
+        gather = _make_pipeline_configs(cfg)["smem_gather"]
+        assert gather.umma_consumer_producer_op == pipeline.PipelineOp.AsyncThread
+        assert gather.producer_group.size == 2 * 32 * cfg.warp_layout.num_load_b_warps
+        assert cfg.warp_layout.mma_warp_idx == 14
     assert len(relay) == cfg.warp_layout.num_sync_warps == expected
     if relay:
         proxy = relay[0].dst_resources[0]

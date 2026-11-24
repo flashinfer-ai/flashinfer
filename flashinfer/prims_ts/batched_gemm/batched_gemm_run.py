@@ -4713,6 +4713,8 @@ def _fused_finalize_args(io: dict) -> tuple:
 
 def _native_finalize_args(io: dict) -> tuple:
     """Native finalization requires the MoE caller's routing buffers."""
+    if not io["cfg"].is_rubin:
+        return None, None
     names = ("finalize_scale_dp", "finalize_route_dp")
     if getattr(io["cfg"], "fuse_moe_finalize", False):
         missing = [name for name in names if io.get(name) is None]
@@ -4837,13 +4839,18 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
     )
 
 
+def _reencode_tma_on_launch(cfg: BatchedGemmConfig) -> bool:
+    # Blackwell encodes tensor maps from the current launch arguments.
+    return not cfg.is_rubin or _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA")
+
+
 def _prepare_tma_descriptors(io: dict, stream, *, prepare=None, reencode_tma=None):
     """Bind descriptors in the supplied mode, or resolve it from the environment."""
     from cutlass.cutlass_dsl import BaseDSL
     from cutlass.cute.runtime import make_ptr
 
     if reencode_tma is None:
-        reencode_tma = _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA")
+        reencode_tma = _reencode_tma_on_launch(io["cfg"])
     if reencode_tma:
         io["_reencode_tma"] = True
         return
@@ -4939,7 +4946,7 @@ def run(executable: _BatchedGemmExecutable, tensors: dict, stream) -> None:
         raise ValueError(
             "prepared tensors configuration does not match the compiled configuration"
         )
-    if _env_flag_enabled("FLASHINFER_PRIMS_TS_REENCODE_TMA") != executable.reencode_tma:
+    if _reencode_tma_on_launch(executable.cfg) != executable.reencode_tma:
         raise ValueError("TMA descriptor mode changed; recompile the kernel before run")
     if tensors["shape"] != executable.shape:
         raise ValueError(

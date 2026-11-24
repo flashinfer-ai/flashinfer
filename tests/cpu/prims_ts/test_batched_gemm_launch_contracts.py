@@ -33,6 +33,23 @@ def _io(**options):
     return io
 
 
+@pytest.mark.parametrize("sm_arch", [100, 103])
+@pytest.mark.parametrize("flag", [None, "0", "1"])
+def test_blackwell_encodes_descriptors_at_launch(monkeypatch, sm_arch, flag):
+    if flag is None:
+        monkeypatch.delenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", raising=False)
+    else:
+        monkeypatch.setenv("FLASHINFER_PRIMS_TS_REENCODE_TMA", flag)
+    io = _fake_launch_io()
+    io["cfg"] = make_config(sm_arch=sm_arch)
+    assert runner._prepare_tma_descriptors(io, None) is None
+    assert runner._compile_arg_tuple(io, None)[23:25] == (None, None)
+    assert runner._launch_arg_tuple(io, None)[23:25] == (None, None)
+    assert runner._compile_arg_tuple(io, None)[-2] is None
+    assert runner._launch_arg_tuple(io, None)[-1] is None
+    assert "_tma_descriptor_storage" not in io
+
+
 @pytest.mark.parametrize(
     "builder", [runner._compile_arg_tuple, runner._launch_arg_tuple]
 )

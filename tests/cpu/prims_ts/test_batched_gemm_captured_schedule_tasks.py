@@ -640,6 +640,7 @@ def _cfg(**overrides) -> SimpleNamespace:
         "load_b_task_regs": 24,
         "load_b_regs": 24,
         "sync_regs": 24,
+        "is_rubin": False,
         "has_routed_sfs": True,
         "uses_ldgsts_routed_sfs": True,
         "uses_tma_routed_sfs": False,
@@ -997,29 +998,21 @@ def test_load_a_try_acquire_is_per_k_tile():
 
 
 @pytest.mark.cpu_only
-def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook():
-    cfg = _cfg(use_early_exit=False, uses_two_cta_mma=False)
-    work_queue = _work_queue()
+@pytest.mark.parametrize("sm_arch", [100, 103, 107])
+def test_non_cluster_routed_sf_ldgsts_schedules_pre_commit_hook(sm_arch):
+    cfg = _cfg(use_early_exit=False, uses_two_cta_mma=False, is_rubin=sm_arch == 107)
     smem_sfa = _res("SmemSfA")
+    smem_sfa.uses_async_load_pipeline = True
     load_sfa = create_load_sfa_task(
-        cfg,
-        _res("GmemSfA"),
-        smem_sfa,
-        work_queue,
-        num_k_tiles=5,
+        cfg, _res("GmemSfA"), smem_sfa, _work_queue(), num_k_tiles=5
     )
-
-    assert any(
-        resource is smem_sfa and stage == ScheduleStage.ProducerAuxWork
-        for resource, stage, *_ in load_sfa.loop_schedule_list
-    )
-    assert any(
-        resource is smem_sfa
-        and stage == ScheduleStage.ProducerAuxWork
+    has_drain = any(
+        entry[0] is smem_sfa
+        and entry[1] == ScheduleStage.ProducerAuxWork
         and entry[-1] == "drain_loop"
         for entry in load_sfa.loop_schedule_list
-        for resource, stage, *_ in [entry]
     )
+    assert has_drain == (sm_arch in (100, 103))
 
 
 @pytest.mark.cpu_only
