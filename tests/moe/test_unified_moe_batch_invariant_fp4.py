@@ -4479,12 +4479,17 @@ def test_op_constants_are_cached_per_indexed_device():
 
 @needs_device
 @pytest.mark.parametrize("which", ["nvfp4", "mxfp4", "static"])
-def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which):
-    """A layer whose first forward runs under CUDA-graph capture (its constants are then device fills of that capture:
-    ``_scale_tensor`` / ``_const``), captured twice, both graphs replayed, then an eager call; a layer constructed inside a
-    capture (its runner built there, the routed scale a per-call fill) and forwarded in it; and a layer used eagerly first
-    and then captured: every output equals the eager bits of a layer that never saw a capture, under the DeepSeekV3 method
-    with a routed scaling factor and a bias (the scale constant in play), both pairs and the static class."""
+def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which, monkeypatch):
+    """A layer whose first forward runs under CUDA-graph capture with the op's and the runner's constant caches empty
+    (isolated from the eager reference's warm caches, so every constant of that capture is a device fill of its own:
+    ``_scale_tensor`` / ``_const``), captured twice: the caches stay empty after both captures, the second graph replays
+    before the first, an eager call then fills the caches once per device and both graphs replay again; a layer
+    constructed inside a capture (its runner built there, the routed scale a per-call fill) and forwarded in it, its scale
+    unset and the caches empty after the capture, before any replay; and the warm-cache control: a layer used eagerly
+    first, then captured. Every output equals the eager bits of a layer that never saw a capture, under the DeepSeekV3
+    method with a routed scaling factor and a bias (the scale constant in play), both pairs and the static class."""
+    from flashinfer.fused_moe.batch_invariant import api_fp4, runner_fp4
+
     T, k, H, I, E = 48, 4, 256, 128, 16
     x, logits, w1, w2 = _problem(T, k, H, I, E, seed=91)
     bias = (
@@ -4525,10 +4530,36 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which):
     else:
         W = _weights(w1, w2, quant=quant)
     act = _logits_pack(x, logits, bias)
-    ref = bits(make()(act, W))  # eager, never captured: the compile, the bits
+    ref = bits(
+        make()(act, W)
+    )  # eager, never captured: the compile, the bits; the module caches warm
     torch.cuda.synchronize()
     nan = float("nan")
     s = torch.cuda.Stream()
+    # the op's constant caches and the runner's placeholder cache, warm from the reference; the constants an eager call of
+    # this class caches (the unread scale-byte atom is the static class's GEMM2's alone)
+    caches = (
+        (api_fp4, "_GS_INV"),
+        (api_fp4, "_DUMMY_SF"),
+        (api_fp4, "_UNIT"),
+        (runner_fp4, "_NO_SCALES"),
+    )
+    warm = {
+        name: getattr(mod, name)
+        for _, name in caches
+        for mod in (api_fp4, runner_fp4)
+        if hasattr(mod, name)
+    }
+    op_caches = ("_GS_INV", "_DUMMY_SF", "_UNIT")
+    filled = {"_GS_INV", "_UNIT"} | ({"_DUMMY_SF"} if which == "static" else set())
+    assert all(warm[name] for name in filled)
+
+    def isolate():
+        for mod, name in caches:
+            monkeypatch.setattr(mod, name, {})
+
+    def op_caches_empty() -> bool:
+        return all(not getattr(api_fp4, name) for name in op_caches)
 
     def captured(layer):
         g = torch.cuda.CUDAGraph()
@@ -4537,37 +4568,49 @@ def test_runner_first_used_under_graph_capture_gives_the_eager_bits(which):
         torch.cuda.synchronize()
         return g, out
 
-    # (1) first used under capture: two captures, both replayed, an eager call after
+    # (1) first used under capture with empty caches: two captures, nothing cached by either, the second replayed before
+    # the first, an eager call (which caches the constants once per device), both replayed again
+    isolate()
     fresh = make()
     graphs = [captured(fresh) for _ in range(2)]
-    for g, out in graphs:
+    assert op_caches_empty()
+    for g, out in reversed(graphs):
         out.fill_(nan)
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(bits(out), ref)
     assert torch.equal(bits(fresh(act, W)), ref)
+    assert {name for name in op_caches if getattr(api_fp4, name)} == filled
+    assert all(len(getattr(api_fp4, name)) == 1 for name in filled)
     for g, out in graphs:
         out.fill_(nan)
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(bits(out), ref)
-    # (2) constructed and first forwarded inside one capture
+    # (2) constructed and first forwarded inside one capture: the runner's scale unset and the caches empty after the
+    # capture, before any replay (a replay would fill a wrongly cached capture-pool constant)
+    isolate()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
         inside = make()
         out = inside(act, W)
     torch.cuda.synchronize()
+    assert inside.runners[0]._scale is None and op_caches_empty()
     out.fill_(nan)
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(bits(out), ref)
+    assert inside.runners[0]._scale is None and op_caches_empty()
     assert torch.equal(bits(inside(act, W)), ref)
-    # (3) used eagerly, then captured
-    warm = make()
-    assert torch.equal(bits(warm(act, W)), ref)
-    g, out = captured(warm)
+    assert inside.runners[0]._scale is not None and not op_caches_empty()
+    # (3) the control: used eagerly with the warm caches, then captured
+    for mod, name in caches:
+        monkeypatch.setattr(mod, name, warm[name])
+    warm_layer = make()
+    assert torch.equal(bits(warm_layer(act, W)), ref)
+    g, out = captured(warm_layer)
     out.fill_(nan)
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(bits(out), ref)
-    assert torch.equal(bits(warm(act, W)), ref)
+    assert torch.equal(bits(warm_layer(act, W)), ref)
