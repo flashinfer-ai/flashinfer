@@ -42,6 +42,7 @@ def _decode(
     S: gl.constexpr,
     W: gl.constexpr,
     BALANCED: gl.constexpr,
+    SINGLE: gl.constexpr,
 ):
     split, head, req = gl.program_id(0), gl.program_id(1), gl.program_id(2)
     tok = gl.load(PTR + req)
@@ -49,6 +50,8 @@ def _decode(
         return
     length = gl.load(LENS + req)
     tiles = gl.cdiv(length, N)
+    if SINGLE and split >= tiles:
+        return
     chunk = gl.cdiv(tiles, S)
     L: gl.constexpr = BlockedLayout([1, 4], [4, 8], [W, 1], [1, 0])
     M: gl.constexpr = NVMMADistributedLayout(
@@ -73,7 +76,8 @@ def _decode(
     end = (
         tiles * (split + 1) // S if BALANCED else gl.minimum(tiles, (split + 1) * chunk)
     )
-    for tile in range(start, end):
+    for i in range(0 if SINGLE else start, 1 if SINGLE else end):
+        tile = split if SINGLE else i
         r = gl.arange(0, N, layout=gl.constexpr(SliceLayout(1, L)))
         n = tile * N + r
         if PAGE % N == 0:
@@ -150,6 +154,7 @@ def _merge_split(
     P,
     OUT,
     PTR,
+    LENS,
     v_scale,
     o_str: tl.constexpr,
     S: tl.constexpr,
@@ -157,13 +162,25 @@ def _merge_split(
     NREQ: tl.constexpr,
     X: tl.constexpr,
     BALANCED: tl.constexpr,
+    N: tl.constexpr,
+    SINGLE: tl.constexpr,
 ):
     t, h = tl.program_id(0), tl.program_id(1)
-    if t >= tl.load(PTR + NREQ):
+    if SINGLE:
+        req = t
+        t = tl.load(PTR + req)
+        if t == tl.load(PTR + req + 1):
+            return
+        live = tl.cdiv(tl.load(LENS + req), N)
+    elif t >= tl.load(PTR + NREQ):
         return
     slab = (t.to(tl.int64) * tl.num_programs(1) + h) * S * (D + 2)
     split = tl.arange(0, S)
-    if BALANCED:
+    if SINGLE:
+        base = slab + split * D
+        m = tl.load(P + slab + S * D + split, split < live, other=-float("inf"))
+        denom = tl.load(P + slab + S * (D + 1) + split, split < live, other=0.0)
+    elif BALANCED:
         base = slab + split * D
         m = tl.load(P + slab + S * D + split)
         denom = tl.load(P + slab + S * (D + 1) + split)
@@ -175,7 +192,11 @@ def _merge_split(
     w = tl.exp(m - tl.where(max_m == -float("inf"), 0.0, max_m))
     den = tl.sum(w * denom, axis=0)
     d = tl.program_id(2) * X + tl.arange(0, X)
-    acc = tl.sum(tl.load(P + base[:, None] + d[None, :]) * w[:, None], axis=0)
+    addr = P + base[:, None] + d[None, :]
+    partial = (
+        tl.load(addr, split[:, None] < live, other=0.0) if SINGLE else tl.load(addr)
+    )
+    acc = tl.sum(partial * w[:, None], axis=0)
     tl.store(
         OUT + t.to(tl.int64) * o_str[0] + h * o_str[1] + d,
         acc * v_scale / tl.where(den > 0, den, 1.0),
@@ -191,6 +212,12 @@ def run_decode(q, k, v, sf, table, lens, ptr, out, scale, vscale):
     balanced = table.shape[0] == 1 and table.shape[1] > 32
     if balanced:
         s = 256
+    # P64: allocating one split per possible page removes the producer loop.
+    # Live lengths remain on the GPU and may change on every graph replay.
+    single = table.shape[0] <= 4 and 32 < table.shape[1] <= 160
+    if single:
+        balanced = True
+        s = triton.next_power_of_2(table.shape[1])
     if table.shape[0] > 4:
         if table.shape[1] <= 32:
             n, s = (32, 32) if table.shape[0] <= 16 else (64, 8)
@@ -228,14 +255,16 @@ def run_decode(q, k, v, sf, table, lens, ptr, out, scale, vscale):
             s,
             w,
             balanced,
+            single,
             num_warps=w,
             num_stages=1,
             ptx_version=94,
         )
-        _merge_split[(q.shape[0], heads, d // x)](
+        _merge_split[(table.shape[0] if single else q.shape[0], heads, d // x)](
             tmp,
             out,
             ptr,
+            lens,
             vscale,
             out.stride(),
             s,
@@ -243,6 +272,8 @@ def run_decode(q, k, v, sf, table, lens, ptr, out, scale, vscale):
             table.shape[0],
             x,
             balanced,
+            n,
+            single,
             num_warps=2 if balanced else 4,
         )
     return out

@@ -149,7 +149,7 @@ def test_ragged_attention_and_graph_replay(d, group):
 
 @pytest.mark.parametrize("layout", ["HND", "NHD"])
 @pytest.mark.parametrize(
-    ("width", "batch"), [(3, 4), (128, 4), (136, 1), (3, 16), (160, 64)]
+    ("width", "batch"), [(3, 4), (160, 4), (136, 1), (3, 16), (160, 64)]
 )
 def test_short_decode_graph(layout, width, batch):
     from flashinfer.attention.mixed_kv import paged_fp8_k_nvfp4_v_fmha
