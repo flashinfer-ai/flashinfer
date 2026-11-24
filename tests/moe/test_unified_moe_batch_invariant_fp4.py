@@ -2202,12 +2202,15 @@ def test_poisoned_intermediates_do_not_reach_the_bits(pair, body, act):
 @needs_device
 @pytest.mark.parametrize("I", [32, 96, 160])
 @pytest.mark.parametrize("which", ["nvfp4_static", "nvfp4", "mxfp4"])
-def test_narrow_intermediate_scale_tails_under_a_poisoned_allocator(which, I):
+def test_narrow_intermediate_scale_tails_under_a_poisoned_allocator(
+    which, I, monkeypatch
+):
     """At ``I % 64 == 32`` the intermediate's scale rows end in a 4-byte group with two padded columns that no writer stores
     (the static epilogue and the quantizers' re-tiling store a row's real columns), and GEMM2's scale boxes read them against
     the zero-filled tail of the k-tile: with the caching allocator's blocks pre-filled with e4m3 / bf16 NaN patterns, the
     output of each class through the layer is finite and equals a clean run's bits (the per-token classes also their
-    composition)."""
+    composition); every ``torch.empty`` of the poisoned runs is filled with the pattern as well, so the check does not
+    depend on which blocks the allocator hands out."""
     from flashinfer.fused_moe.batch_invariant.spec import activation_of
 
     T, k, H, E = 64, 4, 256, 16
@@ -2233,6 +2236,16 @@ def test_narrow_intermediate_scale_tails_under_a_poisoned_allocator(which, I):
     _poison_allocator(0x00)
     ref = layer(act, W)
     assert torch.isfinite(ref.float()).all()
+    empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        # every uninitialised device allocation of the run starts with the byte, whichever block the allocator hands out
+        t = empty(*args, **kwargs)
+        if t.is_cuda and t.numel():
+            t.flatten().view(torch.uint8).fill_(byte)
+        return t
+
+    monkeypatch.setattr(torch, "empty", poisoned_empty)
     for byte in (0xFF, 0x7F):
         _poison_allocator(byte)
         out = layer(act, W)
