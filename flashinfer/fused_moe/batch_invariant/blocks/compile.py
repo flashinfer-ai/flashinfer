@@ -397,13 +397,20 @@ def swapped_kernel_name(
 ) -> str:
     """``swapped_<format>_<chain>_<record>[_gather][_sflin]``: the swapped record (its weight and token tiles) names the object
     beside the chain; the bf16 gather form (the token box gathered from the unpermuted rows) appends ``_gather`` (the
-    block-scaled gather record carries its own suffix), the linear scale source ``_sflin``."""
+    block-scaled gather record carries its own suffix), the linear scale source ``_sflin``. The scale source is the gather
+    form's: the box form reads the 128x4 buffer alone, so ``sf_src="linear"`` with a box record is refused (two objects
+    under one name otherwise)."""
     chain = as_chain(chain, out_fmt)
+    if sf_src == "linear" and not (gather or cfg.gather_a):
+        raise ValueError(
+            "sf_src='linear' is the gather form's scale source (gather=True or a record with gather_a); the box form "
+            "reads the 128x4 scale buffer"
+        )
     knobs = dataclasses.replace(cfg, grid_clusters=0)
     return jit.sanitize_symbol_name(
         f"swapped_{fmt_tag(chain.in_fmt)}_{chain.describe()}_{knobs.describe()}"
         + ("_gather" if gather else "")
-        + ("_sflin" if (gather or cfg.gather_a) and sf_src == "linear" else "")
+        + ("_sflin" if sf_src == "linear" else "")
         + (
             f"_e{_swap_epi_wgs(knobs.tile_n)}"
             if _swap_epi_wgs(knobs.tile_n) > 1
@@ -610,10 +617,11 @@ def get_compiled_swapped(
     chain = as_chain(chain, out_fmt)
     assert is_swapped_record(cfg, chain.in_fmt), (cfg, chain.in_fmt)
     assert sf_src in ("128x4", "linear"), sf_src
+    name = swapped_kernel_name(
+        cfg, chain, gather=gather, sf_src=sf_src
+    )  # refuses the box form with the linear source
     return jit.build_and_load(
-        MODULE,
-        swapped_kernel_name(cfg, chain, gather=gather, sf_src=sf_src),
-        compile_swapped_fn(cfg, chain, gather, sf_src),
+        MODULE, name, compile_swapped_fn(cfg, chain, gather, sf_src)
     )
 
 

@@ -3648,3 +3648,37 @@ def test_static_block_evaluates_the_e2m1_conversion_on_every_backend():
     assert fp32.to_e2m1(float("nan")) == 6.0 and fp32.to_e2m1(0.75) == 1.0
 
 
+def test_linear_scale_source_names_the_gather_objects_and_is_refused_for_the_box_form():
+    """The swapped body's scale source: the linear layout is the gather form's (``_sflin`` in the object name, another object
+    than the 128x4 one); a box record with ``sf_src="linear"`` is refused by the name and by the compile entry before any
+    build, so two bodies never share one cache name."""
+    from flashinfer.fused_moe.batch_invariant.blocks.compile import (
+        get_compiled_swapped,
+        swapped_kernel_name,
+    )
+    from flashinfer.fused_moe.batch_invariant.blocks.epilogue import (
+        Mxfp4Chain,
+        W4A4Chain,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_fp4 import (
+        gather_twins,
+        swapped_knobs_blockscaled,
+    )
+
+    box = swapped_knobs_blockscaled()[0]
+    gather = gather_twins([box])[0]
+    assert gather.gather_a and not box.gather_a
+    for chain in (
+        W4A4Chain("glu", "silu", "bf16", (), "w4a4").at("nvfp4"),
+        Mxfp4Chain("glu", "silu", "bf16", ()).at("mxfp4"),
+    ):
+        n128 = swapped_kernel_name(gather, chain)
+        nlin = swapped_kernel_name(gather, chain, sf_src="linear")
+        assert "_sflin" in nlin and "_sflin" not in n128 and nlin != n128
+        assert swapped_kernel_name(box, chain) not in (n128, nlin)
+        with pytest.raises(ValueError, match="gather"):
+            swapped_kernel_name(box, chain, sf_src="linear")
+        with pytest.raises(ValueError, match="gather"):
+            get_compiled_swapped(box, chain, sf_src="linear")
+
+
