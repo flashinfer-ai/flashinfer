@@ -1,7 +1,9 @@
 # Nightly early warning for the size of the flashinfer-python files on PyPI.
 #
-# PyPI rejects files above the project's per-file limit (300 MiB for
-# flashinfer-python), and a release that crosses it fails only at upload time.
+# PyPI rejects files above the project's per-file limit: 300 MiB for
+# flashinfer-python, which we requested from PyPI (the default is 100 MiB; see
+# docs/development/jit_and_build.md, "PyPI file size limit"). A release that
+# crosses it fails only at upload time.
 # This builds, from main, the same two files release.yml uploads (the sdist and
 # the wheel with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1) and posts to
 # #swdl-flashinfer-ci every night the largest one is at or above 250 MiB, so

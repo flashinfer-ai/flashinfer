@@ -2,7 +2,9 @@
 """Warn in Slack before the flashinfer-python PyPI files reach the size limit.
 
 PyPI rejects any file larger than the project's per-file limit, and a release
-that hits it fails at upload time. `.github/workflows/pypi-package-size.yml`
+that hits it fails at upload time. The default limit is 100 MiB; PyPI raised
+flashinfer-python's to 300 MiB at our request (docs/development/jit_and_build.md,
+"PyPI file size limit"). `.github/workflows/pypi-package-size.yml`
 builds the files `release.yml` uploads (the sdist and the wheel built with
 FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1) from main every night and runs
 this script on them. When the largest file reaches the warning threshold it

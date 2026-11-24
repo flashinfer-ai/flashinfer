@@ -265,6 +265,21 @@ experimental-source exclusion with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCE
 in release builds, except the two HC JIT sources in `_EXPERIMENTAL_SOURCES_KEEP`.
 It regenerates RECORD. See `tests/cpu/infra/test_build_backend_slim_wheel.py`.
 
+### PyPI file size limit
+
+PyPI rejects any uploaded file above its project's per-file limit. The default
+is 100 MiB; we requested a higher limit from PyPI, and `flashinfer-python` is
+allowed files up to 300 MiB. Projects that have not been granted an increase,
+including forks published under another name, keep the 100 MiB default.
+
+A release that crosses the limit fails only at the `twine upload` step of
+`release.yml`. `.github/workflows/pypi-package-size.yml` builds the sdist and
+wheel that `release.yml` uploads from `main` every night, and
+`scripts/infra/check_pypi_package_size.py` posts to #swdl-flashinfer-ci each
+night the largest file is 250 MiB or more, leaving room to shrink the package
+before the limit is reached. Excluding experimental sources and slimming
+vendored trees (above) are the existing size reductions.
+
 ## Bindings and dependencies
 
 Export framework-independent functions with
