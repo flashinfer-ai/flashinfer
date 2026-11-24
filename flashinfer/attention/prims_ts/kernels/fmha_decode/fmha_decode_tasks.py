@@ -403,6 +403,13 @@ def _issue_score_seed(
         tmem_s.seed_scores_loop()
 
 
+def _transformed_kv_slot_stages(cfg: FmhaDecodeConfig) -> int:
+    """Head-dim stages per transformed TMEM ring slot (1 for other K/V rings)."""
+    if cfg.store_transformed_kv_in_tmem:
+        return cfg.transformed_kv_hd_stages_per_slot
+    return 1
+
+
 def _consume_staged_qk_mma(
     smem_kv: MemoryResource,
     tmem_s: MemoryResource,
@@ -421,20 +428,32 @@ def _consume_staged_qk_mma(
     """
     tmem_s.acquire()
     _issue_score_seed(tmem_s, section, cfg)
-    for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+    # One transformed ring slot may hold several head-dim stages: wait and
+    # release once per slot (see transformed_kv_hd_stages_per_slot).
+    slot_stages = _transformed_kv_slot_stages(cfg)
+    if cfg.uses_fused_slot_mma_issue:
         smem_kv.wait()
         kv_desc = getattr(smem_kv, k_desc_label)()
-        if cfg.uses_q_desc_ref:
-            getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
-                kv_desc=kv_desc,
-                head_dim_stage_idx=head_dim_stage_idx,
-            )
-        else:
-            getattr(tmem_s, qk_mma_label)(
-                q_desc=q_desc,
-                kv_desc=kv_desc,
-                head_dim_stage_idx=head_dim_stage_idx,
-            )
+        getattr(tmem_s, f"{qk_mma_label}_slot")(q_desc=q_desc, kv_desc=kv_desc)
+        smem_kv.release()
+        tmem_s.commit()
+        return
+    for slot_idx in range(cfg.num_head_dim_stages_kv // slot_stages):
+        smem_kv.wait()
+        kv_desc = getattr(smem_kv, k_desc_label)()
+        for sub_stage in range(slot_stages):
+            head_dim_stage_idx = slot_idx * slot_stages + sub_stage
+            if cfg.uses_q_desc_ref:
+                getattr(tmem_s, f"{qk_mma_label}_from_q_ref")(
+                    kv_desc=kv_desc,
+                    head_dim_stage_idx=head_dim_stage_idx,
+                )
+            else:
+                getattr(tmem_s, qk_mma_label)(
+                    q_desc=q_desc,
+                    kv_desc=kv_desc,
+                    head_dim_stage_idx=head_dim_stage_idx,
+                )
         smem_kv.release()
     tmem_s.commit()
 
@@ -500,19 +519,29 @@ def _consume_staged_pv_mma(
     p_desc = p_desc_0 if p_desc_idx == KV_INST0 else p_desc_1
     p_tmem_addr = p_tmem_addr_0 if p_desc_idx == KV_INST0 else p_tmem_addr_1
     tmem_o.acquire()
-    for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+    slot_stages = _transformed_kv_slot_stages(cfg)
+    if cfg.uses_fused_slot_mma_issue:
         smem_kv.wait()
         v_desc = getattr(smem_kv, v_desc_label)()
-        getattr(tmem_o, vp_mma_label)(
-            v_desc_0=v_desc,
-            v_desc_1=v_desc,
-            p_desc_0=p_desc,
-            p_desc_1=p_desc,
-            p_tmem_addr_0=p_tmem_addr,
-            p_tmem_addr_1=p_tmem_addr,
-            inst_idx=p_desc_idx,
-            head_dim_stage_idx=head_dim_stage_idx,
-        )
+        getattr(tmem_o, f"{vp_mma_label}_slot")(v_desc=v_desc, p_desc=p_desc)
+        smem_kv.release()
+        tmem_o.commit()
+        tmem_p.release()
+        return
+    for slot_idx in range(cfg.num_head_dim_stages_kv // slot_stages):
+        smem_kv.wait()
+        v_desc = getattr(smem_kv, v_desc_label)()
+        for sub_stage in range(slot_stages):
+            getattr(tmem_o, vp_mma_label)(
+                v_desc_0=v_desc,
+                v_desc_1=v_desc,
+                p_desc_0=p_desc,
+                p_desc_1=p_desc,
+                p_tmem_addr_0=p_tmem_addr,
+                p_tmem_addr_1=p_tmem_addr,
+                inst_idx=p_desc_idx,
+                head_dim_stage_idx=slot_idx * slot_stages + sub_stage,
+            )
         smem_kv.release()
     tmem_o.commit()
     tmem_p.release()
@@ -3172,22 +3201,29 @@ def create_transform_kv_task(
                 # One raw stage holds every head-dim slice: convert all of
                 # them before returning it to the loader.
                 source.wait()
-                for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+                slot_stages = cfg.transformed_kv_hd_stages_per_slot
+                for slot_idx in range(cfg.num_head_dim_stages_kv // slot_stages):
                     smem_transformed_kv.acquire()
-                    getattr(smem_transformed_kv, label)(
-                        head_dim_stage_idx=head_dim_stage_idx
-                    )
+                    for sub_stage in range(slot_stages):
+                        getattr(smem_transformed_kv, label)(
+                            head_dim_stage_idx=slot_idx * slot_stages + sub_stage
+                        )
                     smem_transformed_kv.commit()
                 source.release()
                 return
-            for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+            # One ring slot covers slot_stages head-dim stages: acquire and
+            # commit once per slot; raw stages are still waited and released
+            # one head-dim stage at a time.
+            slot_stages = cfg.transformed_kv_hd_stages_per_slot
+            for slot_idx in range(cfg.num_head_dim_stages_kv // slot_stages):
                 smem_transformed_kv.acquire()
-                source.wait()
-                getattr(smem_transformed_kv, label)(
-                    head_dim_stage_idx=head_dim_stage_idx
-                )
+                for sub_stage in range(slot_stages):
+                    source.wait()
+                    getattr(smem_transformed_kv, label)(
+                        head_dim_stage_idx=slot_idx * slot_stages + sub_stage
+                    )
+                    source.release()
                 smem_transformed_kv.commit()
-                source.release()
 
         for label in head_labels:
             transform_one(label)

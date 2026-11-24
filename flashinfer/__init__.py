@@ -240,6 +240,7 @@ from .gemm import mm_mxfp8 as mm_mxfp8
 from .gemm import mm_mxfp8_mxfp4 as mm_mxfp8_mxfp4
 from .gemm import mm_nvfp4_lora as mm_nvfp4_lora
 from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
+from .gemm import mm_tf32 as mm_tf32
 from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
 from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
 from .gemm import prepare_nvfp4_lora_adapter as prepare_nvfp4_lora_adapter

@@ -21,6 +21,7 @@ import inspect
 import math
 from types import SimpleNamespace
 from typing import Literal, Optional, Sequence
+import sys
 import warnings
 
 import pytest
@@ -4391,15 +4392,186 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
     assert cfg.head_dim_kv_stage == 128
     assert cfg.smem_kv_sf_bytes_per_token == headdim // 16
     assert cfg.smem_kv_sf_tile_bytes == cfg.tile_size_kv * headdim // 16
-    assert cfg.smem_kv_storage_tile_bytes == 2 * cfg.smem_kv_tile_bytes
+    # The unpacking B4X16_P64 layout pads every FP4 value to a byte; the
+    # packed payload (dense D512 Q8 default) stores the transferred bytes.
+    assert (
+        cfg.smem_kv_storage_tile_bytes
+        == (1 if cfg.use_packed_nvfp4_raw_payload else 2) * cfg.smem_kv_tile_bytes
+    )
     assert "tmemTransformedKv" in resources
     assert "smemTransformedKv" not in resources
     transformed = resources["tmemTransformedKv"]
+    # transformed_kv_stages counts ring slots; a slot holds
+    # transformed_kv_hd_stages_per_slot head-dim stages.
+    assert cfg.tmem_transformed_kv_slot_cols == (
+        cfg.tmem_transformed_kv_stage_cols * cfg.transformed_kv_hd_stages_per_slot
+    )
     assert transformed._alloc.num_columns == (
-        cfg.tmem_transformed_kv_stage_cols * cfg.transformed_kv_stages
+        cfg.tmem_transformed_kv_slot_cols * cfg.transformed_kv_stages
     )
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+def test_attention_ts_decode_nvfp4_d512_q8_groups_transformed_slots() -> None:
+    """Dense D512 Swaps Q8 NVFP4 converts with two warp groups into one TMEM
+    slot per K/V tile; other profiles keep per-head-dim-stage slots."""
+
+    def config(**overrides):
+        return make_decode_config(
+            headdim=512,
+            args=overrides or None,
+            seq_len_q=1,
+            seq_len_kv=32768,
+            batch_size=32,
+            num_heads_q=32,
+            num_heads_kv=4,
+            qkv_dtype=Float8E4M3FN,
+            kv_dtype=Float4E2M1FN,
+            o_dtype=Float16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=64,
+            auto_tuner=False,
+        )
+
+    cfg = config()
+    assert cfg.tile_size_q == 8 and cfg.store_transformed_kv_in_tmem
+    # Whole-tile packed stages use one converter group (see the policy).
+    assert (cfg.transform_kv_warp_idx, cfg.transform_kv_num_warps) == (16, 4)
+    assert cfg.uses_fused_slot_mma_issue
+    assert cfg.transformed_kv_hd_stages_per_slot == cfg.num_head_dim_stages_kv == 4
+    assert cfg.tmem_transformed_kv_slot_cols == 4 * cfg.tmem_transformed_kv_stage_cols
+    assert cfg.transformed_kv_stages >= 2
+    assert cfg.tmem_total_cols <= 512
+    # Whole-tile packed raw stages: one raw stage per K or V tile holding all
+    # four packed D128 slices plus the scale rows once.
+    assert cfg.use_packed_nvfp4_raw_payload and cfg.use_whole_tile_nvfp4_raw_stage
+    assert cfg.num_raw_kv_head_dim_stages == 1
+    assert cfg.smem_kv_tile_bytes == cfg.tile_size_kv * 512 // 2
+    assert cfg.raw_nvfp4_slice_bytes == cfg.tile_size_kv * 128 // 2
+    assert cfg.permutes_nvfp4_v_rows
+    assert 2 <= cfg.kv_stages <= 4
+    # The dense packed multiply keeps K in logical order. The even-then-odd
+    # order is opt-in; persistent schedules derive Q descriptors on several
+    # paths, so it stays off there (both sides read the same property).
+    assert not cfg.use_permuted_packed_k_order
+    assert config(use_permuted_packed_k_order=True).uses_permuted_packed_k_order
+    persistent = config(use_persistent_scheduler=True)
+    assert not persistent.uses_permuted_packed_k_order
+    assert not config(
+        use_persistent_scheduler=True, use_permuted_packed_k_order=True
+    ).uses_permuted_packed_k_order
+    # Fused slot issue needs a routed Q descriptor; schedules that derive Q
+    # from q_ref keep per-stage issue.
+    assert persistent.uses_fused_slot_mma_issue == (not persistent.uses_q_desc_ref)
+    # Explicit two-group override still resolves (the edit 1 layout).
+    assert config(transform_kv_num_warps=8).transform_kv_num_warps == 8
+    resources, smem_allocator, tmem_allocator = _build_decode_resources(cfg)
+    assert resources["tmemTransformedKv"]._alloc.num_columns == (
+        cfg.tmem_transformed_kv_slot_cols * cfg.transformed_kv_stages
+    )
+    assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
+    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+    # Explicit per-stage slots remain available.
+    assert (
+        config(transformed_kv_hd_stages_per_slot=1).transformed_kv_hd_stages_per_slot
+        == 1
+    )
+    # An explicit ring depth keeps counting head-dim stages, as before slots
+    # were grouped, and stays within the TMEM budget.
+    for depth in (4, 8):
+        pinned = config(transformed_kv_stages=depth)
+        assert pinned.transformed_kv_stages == depth
+        assert pinned.transformed_kv_hd_stages_per_slot == 1
+        assert pinned.tmem_total_cols <= 512
+    # The packed/whole-tile defaults belong to the TMEM converter; an explicit
+    # SMEM converter keeps one four-warp group and per-stage staging.
+    smem = config(store_transformed_kv_in_tmem=False)
+    assert not smem.store_transformed_kv_in_tmem
+    assert (smem.transform_kv_warp_idx, smem.transform_kv_num_warps) == (4, 4)
+    assert smem.transformed_kv_hd_stages_per_slot == 1
+    assert not (
+        smem.use_packed_nvfp4_raw_payload
+        or smem.use_whole_tile_nvfp4_raw_stage
+        or smem.use_permuted_packed_k_order
+        or smem.use_fused_slot_mma_issue
+    )
+    # Grouping must divide the head-dim stages.
+    with pytest.raises(ValueError, match="transformed_kv_hd_stages_per_slot"):
+        config(transformed_kv_hd_stages_per_slot=3)
+
+
+def test_attention_ts_decode_nvfp4_d512_keeps_ring_depths_fit() -> None:
+    """D512 grouped Keeps NVFP4 converted-ring depths and raw depth fit SMEM."""
+
+    def config(**overrides):
+        return make_decode_config(
+            headdim=512,
+            args={
+                "use_keeps_mma_ab": True,
+                "groups_tokens_heads_q": True,
+                "tile_size_q": 64,
+                "use_persistent_scheduler": False,
+                **overrides,
+            },
+            seq_len_q=8,
+            seq_len_kv=32768,
+            batch_size=8,
+            num_heads_q=32,
+            num_heads_kv=4,
+            q_dtype=Float8E4M3FN,
+            k_dtype=Float4E2M1FN,
+            v_dtype=Float4E2M1FN,
+            o_dtype=BFloat16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=64,
+            mask_type="causal",
+            split_kv_mode="disabled",
+            auto_tuner=False,
+        )
+
+    cfg = config()
+    assert cfg.keeps_o_uses_lane_panels and cfg.uses_stage_sliced_nvfp4_sf
+    assert (cfg.transformed_kv_stages, cfg.transformed_v_stages) == (4, 3)
+    # K/V rows stay in logical order unless the even-then-odd order is opted in.
+    assert not (cfg.uses_permuted_packed_k_order or cfg.uses_permuted_packed_v_order)
+    opted = config(use_permuted_packed_k_order=True, use_permuted_packed_v_order=True)
+    assert opted.uses_permuted_packed_k_order and opted.uses_permuted_packed_v_order
+    # An explicit V depth of zero shares the K depth; three slots each fit.
+    shared = config(transformed_v_stages=0)
+    assert (shared.transformed_kv_stages, shared.transformed_v_stages) == (3, 0)
+    # The inferred raw depth reserves both converted rings and keeps complete
+    # head-dim rounds, so an explicit launch at that depth still fits.
+    raw_stages = cfg.infer_kv_stages(cap_kv_staging=False)
+    assert raw_stages % (2 * cfg.num_head_dim_stages_kv) == 0
+    for checked in (cfg, shared, config(kv_stages=raw_stages)):
+        _, smem_allocator, _ = _build_decode_resources(checked)
+        _assert_decode_smem_within_capacity(checked, smem_allocator)
+
+
+def test_attention_ts_decode_whole_tile_nvfp4_stage_requires_full_slices() -> None:
+    """Whole-tile NVFP4 staging copies full D128 slices, so D192 is rejected."""
+    with pytest.raises(ValueError, match="use_whole_tile_nvfp4_raw_stage"):
+        make_decode_config(
+            headdim=192,
+            args={
+                "head_dim_per_stage_kv": 128,
+                "use_packed_nvfp4_raw_payload": True,
+                "use_whole_tile_nvfp4_raw_stage": True,
+            },
+            seq_len_q=1,
+            seq_len_kv=4096,
+            batch_size=4,
+            num_heads_q=8,
+            num_heads_kv=1,
+            qkv_dtype=Float8E4M3FN,
+            kv_dtype=Float4E2M1FN,
+            o_dtype=Float16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=8,
+            auto_tuner=False,
+        )
 
 
 @pytest.mark.parametrize(
@@ -4645,39 +4817,12 @@ def _check_workspace_and_graph(
     _assert_case_correct(explicit_out, case)
 
 
-@_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize("batch_size", [1, 4], ids=lambda value: f"b{value}")
-@pytest.mark.parametrize(
-    "seq_len_kv",
-    [128, 2048, 4096, 8192],
-    ids=lambda value: f"kv{value}",
-)
-@pytest.mark.parametrize(
-    "seq_len_q",
-    [1, 4, 8],
-    ids=lambda value: f"q{value}",
-)
-@pytest.mark.parametrize(
-    ("num_qo_heads", "num_kv_heads"),
-    [(32, 4)],
-    ids=["gqa32x4"],
-)
-@pytest.mark.parametrize(
-    "head_dim,page_size,qkv_dtype",
-    [
-        pytest.param(d, p, kind, id=f"d{d}-p{p}-{kind}")
-        for d in (64, 128, 256, 512)
-        for p in (16, 64)
-        for kind in (
-            "bf16q-fp8kv",
-            "bf16q-nvfp4kv",
-            "fp8q-nvfp4kv",
-            "fp8q-nvfp4kv-bf16o",
-        )
-        if not (d == 64 and p == 16 and "nvfp4" in kind)
-    ],
-)
-def test_attention_ts_decode_mixed_precision(
+_MixedPrecisionKind = Literal[
+    "bf16q-fp8kv", "bf16q-nvfp4kv", "fp8q-nvfp4kv", "fp8q-nvfp4kv-bf16o"
+]
+
+
+def run_mixed_precision_decode_case(
     batch_size: int,
     seq_len_kv: int,
     seq_len_q: int,
@@ -4685,10 +4830,13 @@ def test_attention_ts_decode_mixed_precision(
     num_kv_heads: int,
     head_dim: int,
     page_size: int,
-    qkv_dtype: Literal[
-        "bf16q-fp8kv", "bf16q-nvfp4kv", "fp8q-nvfp4kv", "fp8q-nvfp4kv-bf16o"
-    ],
+    qkv_dtype: _MixedPrecisionKind,
 ):
+    """Check one mixed-precision decode case on every public entry point.
+
+    Shared with test_attention_ts_decode_mixed_precision.py, which holds the
+    full grid in its own file so it gets its own CI time budget.
+    """
     dtype_dict = {
         "bf16q-fp8kv": (torch.bfloat16, _FP8, torch.bfloat16),
         "bf16q-nvfp4kv": (torch.bfloat16, torch.uint8, torch.bfloat16),
@@ -4804,7 +4952,7 @@ def test_attention_ts_decode_nvfp4_small_page_scale_fragments(
     FP8 Q with BF16 output selects here, must skip that padding.
     """
     assert page_size * head_dim // 16 < 128
-    test_attention_ts_decode_mixed_precision(
+    run_mixed_precision_decode_case(
         batch_size=8,
         seq_len_kv=2048,
         seq_len_q=8,
@@ -10024,7 +10172,7 @@ def test_attention_ts_decode_final_statistics(
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("packed", (False, True), ids=("uniform_q", "packed_q"))
 def test_attention_ts_decode_persistent_sinks_skip_inactive_requests(packed):
-    """Persistent sink tiles stay in step when live-Q requests have no KV."""
+    """Persistent sinks skip inactive requests in eager and graph replay."""
     from tests.attention.test_attention_ts_context import _softmax_statistics_reference
 
     # Two requests per SM exceed one CTA wave, so the planner persists.
@@ -10074,24 +10222,27 @@ def test_attention_ts_decode_persistent_sinks_skip_inactive_requests(packed):
     for request, length in inactive.items():
         lengths[request] = length
     out = torch.full_like(case.q, 8)
-    wrapper.run(
-        case.q,
-        (case.k_cache, case.v_cache),
-        lengths,
-        case.block_tables,
-        qo_indptr=offsets,
-        softmax_scale=case.softmax_scale,
-        output_scale=case.output_scale,
-        attention_sinks=sinks,
-        out=out,
-    )
 
-    expected = torch.full_like(out, 8, dtype=torch.float32)
+    def run(*, validate=True):
+        wrapper.run(
+            case.q,
+            (case.k_cache, case.v_cache),
+            lengths,
+            case.block_tables,
+            qo_indptr=offsets,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
+            attention_sinks=sinks,
+            out=out,
+            validate=validate,
+        )
+
+    run()
+
+    expected = torch.empty_like(out, dtype=torch.float32)
     pages_per_request = (nk + page_size - 1) // page_size
     bounds = offsets.tolist() if packed else None
     for request in range(num_requests):
-        if request in inactive:
-            continue
         rows = slice(bounds[request], bounds[request + 1]) if packed else request
         pages = case.block_tables[request, :pages_per_request].long()
         k, v = (
@@ -10102,7 +10253,41 @@ def test_attention_ts_decode_persistent_sinks_skip_inactive_requests(packed):
             case.q[rows], k, v, scale=case.softmax_scale, sinks=sinks
         )
         expected[rows] = ref * case.output_scale
-    torch.testing.assert_close(out.float(), expected, atol=0.02, rtol=0.05)
+
+    active_rows = torch.ones(out.shape[:-2], dtype=torch.bool, device=out.device)
+    for request in inactive:
+        rows = slice(bounds[request], bounds[request + 1]) if packed else request
+        active_rows[rows] = False
+
+    def check_output(has_inactive, sentinel):
+        rows = active_rows if has_inactive else slice(None)
+        torch.testing.assert_close(
+            out[rows].float(), expected[rows], atol=0.02, rtol=0.05
+        )
+        if has_inactive:
+            inactive_output = out[~active_rows]
+            torch.testing.assert_close(
+                inactive_output,
+                torch.full_like(inactive_output, sentinel),
+                rtol=0,
+                atol=0,
+            )
+
+    check_output(True, 8)
+
+    # The eager run warmed up this kernel. Replay the same graph while only
+    # device metadata changes: all active, mixed inactive, then all active.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(validate=False)
+    for inactive_requests, sentinel in (({}, 8), (inactive, 9), ({}, 10)):
+        lengths.fill_(nk)
+        for request, length in inactive_requests.items():
+            lengths[request] = length
+        # A new sentinel each time exposes stale output as well as wrong writes.
+        out.fill_(sentinel)
+        graph.replay()
+        check_output(bool(inactive_requests), sentinel)
 
 
 @pytest.mark.parametrize(
@@ -10403,6 +10588,195 @@ def test_attention_ts_decode_nvfp4_resource_overrides(
                 assert cfg.transformed_kv_stages == requested
 
 
+def _resolve_d512_decode_policy(
+    monkeypatch, *, batch_size, num_heads_q, seq_len_q, kv_dtype_key, max_kv_len
+):
+    """Resolve the automatic D512 launch spec on a mocked 148-SM SM100 device."""
+    from contextlib import nullcontext
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 148 // cluster_size,
+    )
+
+    class _B200Hardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return 148
+
+    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _B200Hardware)
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (10, 0))
+    # Split plans clamp the fanout to the device SM count.
+    monkeypatch.setattr(decode_module, "get_device_sm_count", lambda _device: 148)
+    decode_module._resolve_decode_launch_spec.cache_clear()
+    try:
+        return decode_module._resolve_decode_launch_spec(
+            0,
+            batch_size,
+            num_heads_q,
+            4,
+            512,
+            64,
+            max_kv_len,
+            seq_len_q,
+            "float8_e4m3fn",
+            kv_dtype_key,
+            kv_dtype_key,
+            "bfloat16",
+            "HND",
+            "causal",
+            False,
+            -1,
+        ).config
+    finally:
+        decode_module._resolve_decode_launch_spec.cache_clear()
+
+
+@pytest.mark.parametrize("batch_size", (8, 16, 32))
+@pytest.mark.parametrize("kv_dtype_key", ("float4_e2m1fn", "float8_e4m3fn"))
+def test_attention_ts_decode_d512_q8_auto_selects_grouped_keeps(
+    monkeypatch, batch_size, kv_dtype_key
+):
+    """Eight-token D512 decode at eight Q heads per KV head runs grouped Keeps Q64."""
+    cfg = _resolve_d512_decode_policy(
+        monkeypatch,
+        batch_size=batch_size,
+        num_heads_q=32,
+        seq_len_q=8,
+        kv_dtype_key=kv_dtype_key,
+        max_kv_len=32768,
+    )
+    assert cfg.use_keeps_mma_ab
+    assert cfg.groups_tokens_heads_q
+    assert cfg.tile_size_q == 64
+    assert not cfg.use_cluster_smem_reduction
+    if cfg.use_split_kv:
+        # D512 Keeps publishes partials for the standalone reducer, whose
+        # tail is shorter than the in-kernel GMEM reduction.
+        assert cfg.use_separate_reduction_kernel
+
+
+def test_attention_ts_decode_d512_keeps_policy_scope(monkeypatch):
+    """D512 Keeps stays limited to the qualified head ratio and token counts."""
+    wide = _resolve_d512_decode_policy(
+        monkeypatch,
+        batch_size=16,
+        num_heads_q=64,
+        seq_len_q=8,
+        kv_dtype_key="float4_e2m1fn",
+        max_kv_len=32768,
+    )
+    assert not wide.use_keeps_mma_ab
+    # Ratios above 32 take the wide-head fallback, which also stays off D512
+    # grouped Keeps.
+    wider = _resolve_d512_decode_policy(
+        monkeypatch,
+        batch_size=4,
+        num_heads_q=160,
+        seq_len_q=8,
+        kv_dtype_key="float4_e2m1fn",
+        max_kv_len=32768,
+    )
+    assert not (wider.use_keeps_mma_ab and wider.groups_tokens_heads_q)
+    single = _resolve_d512_decode_policy(
+        monkeypatch,
+        batch_size=32,
+        num_heads_q=32,
+        seq_len_q=1,
+        kv_dtype_key="float4_e2m1fn",
+        max_kv_len=32768,
+    )
+    assert not single.use_keeps_mma_ab
+    assert single.tile_size_q == 8
+    with pytest.raises(ValueError, match="PrimTS head_dim=512"):
+        _resolve_d512_decode_policy(
+            monkeypatch,
+            batch_size=16,
+            num_heads_q=64,
+            seq_len_q=8,
+            kv_dtype_key="float8_e4m3fn",
+            max_kv_len=32768,
+        )
+
+
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("kv_lens", "seq_len_q", "mask_type", "out_dtype"),
+    (
+        ((8192, 4100), 8, "causal", torch.bfloat16),
+        ((3000,) * 16, 8, "dense", torch.bfloat16),
+        ((4097, 1025, 520), 5, "causal", torch.float16),
+    ),
+)
+def test_attention_ts_decode_d512_fp8_kv_grouped_keeps(
+    kv_lens, seq_len_q, mask_type, out_dtype
+):
+    """Stored FP8 K/V D512 grouped Keeps matches the reference, including LSE."""
+    from tests.attention.test_attention_ts_context import (
+        _softmax_statistics_reference,
+    )
+
+    case = _make_decode_case(
+        kv_lens=kv_lens,
+        num_qo_heads=32,
+        num_kv_heads=4,
+        head_dim=512,
+        seq_len_q=seq_len_q,
+        page_size=64,
+        qkv_dtype=_FP8,
+        out_dtype=out_dtype,
+        cache_form="tuple",
+        mask_type=mask_type,
+        device="cuda",
+        seed=9602,
+    )
+    wrapper = _plan_case(case, max_kv_len=max(kv_lens), lse_mode="base2")
+    policy = dict(wrapper._policy)
+    assert policy["mma_variant"] == "keeps_mma_ab"
+    assert int(policy["tile_size_q"]) == 64
+    # The FP8 oracle models P quantization per split and per K/V instance
+    # stream, so build it from the planned partition.
+    case = _with_reference(
+        case,
+        splits_kv=wrapper._plan_state.requested_splits,
+        num_insts_kv=int(policy["num_insts_kv"]),
+        q_tokens_per_cta=int(policy["tile_size_q"]) // 8,
+    )
+    lse = torch.full(case.q.shape[:-1], torch.nan, device="cuda")
+    out = torch.empty_like(case.q, dtype=out_dtype)
+    wrapper.run(
+        case.q,
+        case.paged_kv_cache,
+        case.seq_lens_kv,
+        case.block_tables,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
+        out=out,
+        lse=lse,
+    )
+    _assert_case_correct(out, case)
+
+    # Base-2 LSE of the scaled scores per (request, token, Q head); causal rows
+    # see the prefix that ends at their own position.
+    for batch, length in enumerate(kv_lens):
+        pages = case.block_tables[batch, : (length + 63) // 64].long()
+        keys = case.k_cache[pages].transpose(1, 2).reshape(-1, 4, 512)[:length]
+        _, stats = _softmax_statistics_reference(
+            case.q[batch],
+            keys,
+            torch.zeros_like(keys, dtype=torch.float32),
+            scale=case.softmax_scale,
+            sinks=torch.full((32,), -torch.inf, device="cuda"),
+            causal=mask_type == "causal",
+        )
+        torch.testing.assert_close(
+            lse[batch], stats / math.log(2), atol=2e-2, rtol=2e-3
+        )
+
+
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
     "head_dim,tile_size_q,seq_len_q,seq_len_kv,heads_q_per_kv,output_dtype,split_kv_mode,page_size,use_keeps_mma_ab",
@@ -10468,6 +10842,43 @@ def test_attention_ts_decode_nvfp4_resource_overrides(
         ),
         (256, 64, 8, 769, 8, torch.bfloat16, "disabled", 64, True),
         (256, 64, 7, 8193, 16, torch.float16, "gmem_reduction", 32, True),
+        # D512 Keeps Q64: O head-dim stages 2/3 in TMEM lanes 16-31.
+        (512, 64, 8, 769, 8, torch.bfloat16, "disabled", 64, True),
+        (512, 64, 5, 769, 8, torch.float16, "disabled", 64, True),
+        (512, 64, 8, 8193, 8, torch.bfloat16, "gmem_reduction", 64, True),
+        (
+            512,
+            64,
+            8,
+            8193,
+            8,
+            torch.bfloat16,
+            "gmem_reduction_with_separate_kernel",
+            64,
+            True,
+        ),
+        (
+            512,
+            64,
+            5,
+            8193,
+            8,
+            torch.float16,
+            "gmem_reduction_with_separate_kernel",
+            64,
+            True,
+        ),
+        (
+            512,
+            64,
+            12,
+            8193,
+            8,
+            torch.bfloat16,
+            "gmem_reduction_with_separate_kernel",
+            64,
+            True,
+        ),
     ),
 )
 def test_attention_ts_decode_large_tile_size_q(
@@ -10573,14 +10984,15 @@ def test_attention_ts_decode_large_tile_size_q(
             pages = case.block_tables[batch, : (length + page_size - 1) // page_size]
             keys = k_cache[pages.long()].transpose(1, 2).reshape(-1, 1, head_dim)
             keys = keys[:length]
+            # One-token decode stores Q as [batch, heads, dim].
             _, stats = _softmax_statistics_reference(
-                case.q[batch],
+                case.q[batch].reshape(seq_len_q, heads_q_per_kv, head_dim),
                 keys,
                 torch.zeros_like(keys, dtype=torch.float32),
                 scale=case.softmax_scale,
                 sinks=sinks,
             )
-            expected_lse.append(stats / math.log(2))
+            expected_lse.append((stats / math.log(2)).reshape(lse.shape[1:]))
         expected_lse = torch.stack(expected_lse)
 
     def run():
@@ -10612,6 +11024,50 @@ def test_attention_ts_decode_large_tile_size_q(
     _assert_case_correct(out, case)
     if check_lse:
         torch.testing.assert_close(lse, expected_lse, atol=0.015, rtol=0.002)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("use_keeps_mma_ab", "tile_size_q", "seq_len_q", "overrides"),
+    (
+        (False, 8, 1, {"use_permuted_packed_k_order": True}),
+        (
+            True,
+            64,
+            8,
+            {"use_permuted_packed_k_order": True, "use_permuted_packed_v_order": True},
+        ),
+    ),
+)
+def test_attention_ts_decode_nvfp4_d512_even_odd_order_opt_in(
+    monkeypatch, use_keeps_mma_ab, tile_size_q, seq_len_q, overrides
+) -> None:
+    """The opt-in even-then-odd K/V order (padded multiply) matches the reference."""
+    module = sys.modules[__name__]
+    original_make_decode_config = module.make_decode_config
+    resolved = []
+
+    def make_with_overrides(*args, **kwargs):
+        kwargs["args"] = {**kwargs["args"], **overrides}
+        cfg = original_make_decode_config(*args, **kwargs)
+        resolved.append(cfg)
+        return cfg
+
+    monkeypatch.setattr(module, "make_decode_config", make_with_overrides)
+    test_attention_ts_decode_large_tile_size_q(
+        monkeypatch,
+        head_dim=512,
+        tile_size_q=tile_size_q,
+        split_kv_mode="disabled",
+        heads_q_per_kv=8,
+        output_dtype=torch.bfloat16,
+        seq_len_kv=769,
+        seq_len_q=seq_len_q,
+        page_size=64,
+        use_keeps_mma_ab=use_keeps_mma_ab,
+    )
+    assert resolved and resolved[-1].uses_permuted_packed_k_order
+    assert resolved[-1].uses_permuted_packed_v_order == use_keeps_mma_ab
 
 
 @_REQUIRES_PRIMTS_GPU
